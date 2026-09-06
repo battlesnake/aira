@@ -437,6 +437,29 @@ func readWorkerSupervisorMemory(path string) (current, reclaimable int64, ok boo
 // stopping while queued on the outer scope's lock — the caller returns without
 // writing anything, mirroring workerAdmitConnection's own peer-gone paths.
 func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest) (WorkerAdmitResponse, bool) {
+	// AIRA-121 gate condition C1. FIRST, before every other gate: in ci-shim mode
+	// there is no outer cgroup scope, so there is nothing to nest a worker
+	// sub-scope inside and no reading of one to gate on.
+	//
+	// The answer is state=UNAVAILABLE / class=ADMISSION-UNUSABLE, and the choice
+	// of both is load-bearing. The plan proposed state=unevaluated; that carries
+	// class=contended, which supervisor.py maps to the RETRIABLE WorkerAdmitDenied
+	// and _wait_for_admission_or_disable retries indefinitely against a daemon
+	// that is reachable and will never grant -- i.e. the suite would HANG rather
+	// than fall back. This pair maps to WorkerAdmitUnavailable, which fires
+	// _disable_daemon exactly once and runs the whole suite on the bare-fork pool
+	// with one honest warning.
+	//
+	// AIRA-123 is what turns this into a ledger-only advisory GRANT; until then
+	// the honest answer is that this backend cannot function here.
+	if s.shimMode() {
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateUnavailable,
+			Class:  runner.WorkerAdmitClassAdmissionUnusable,
+			Reason: runner.WorkerAdmitReasonCIShimNoSubScope,
+			Detail: "ci-shim mode has no cgroup scope to nest a worker sub-scope under",
+		}, true
+	}
 	// AIRA-101, the slice-exclusivity gate. FIRST, before any cgroupfs read and
 	// before both the outer-scope lock and the CPU-slots gate: it is a pure
 	// in-memory map lookup, and taking it here means it adds no lock nesting to
@@ -455,10 +478,7 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 			Reason: runner.WorkerAdmitReasonSliceExclusive,
 		}, true
 	}
-	readMemory := s.admitReadMemory
-	if readMemory == nil {
-		readMemory = readSliceMemory
-	}
+	readMemory := s.memoryReader()
 	used, outerMax, reclaimable, ok, reason := readMemory(req.outerScope)
 	if !ok {
 		// readSliceMemory reports "unbounded" when the outer scope's own
@@ -937,7 +957,11 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		if response, proceed = s.evaluateWorkerAdmit(peerCtx, req); !proceed {
 			return
 		}
-		if response.State == runner.WorkerAdmitStateGranted || response.State == runner.WorkerAdmitStateUnevaluated {
+		// AIRA-121: Unavailable joins the break set. It is a TERMINAL daemon-side
+		// verdict -- "this backend cannot function in this mode" -- and polling it
+		// would burn the caller's whole max_wait before answering the same thing.
+		if response.State == runner.WorkerAdmitStateGranted || response.State == runner.WorkerAdmitStateUnevaluated ||
+			response.State == runner.WorkerAdmitStateUnavailable {
 			break
 		}
 		// AIRA-42: this was `strings.HasPrefix(response.Reason, "reject:")`

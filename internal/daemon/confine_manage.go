@@ -103,14 +103,19 @@ func (s *Server) releaseActiveConfine(path, scopeID string) {
 
 func (s *Server) resolveConfineManagementPath(slice string) (string, error) {
 	slice = strings.TrimSpace(slice)
+	// AIRA-121 gate condition C2. In shim mode BOTH branches below are wrong:
+	// ResolveConfineManagementSlice resolves the REAL aira.slice cgroup (it does
+	// not go through the admitResolveSlice seam at all), so `--list` would key its
+	// registry lookup and its reserve summary on a queue nothing writes to. The
+	// sentinel is the one queue there is.
+	if s.shimMode() {
+		return runner.ShimConfineSlice, nil
+	}
 	if slice == "" {
 		_, path, err := runner.ResolveConfineManagementSlice("")
 		return path, err
 	}
-	resolve := s.admitResolveSlice
-	if resolve == nil {
-		resolve = resolveAdmitSlicePath
-	}
+	resolve := s.sliceResolver()
 	path, ok, reason := resolve(slice)
 	if !ok {
 		if reason == "" {
@@ -133,17 +138,25 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 	registry := s.activeConfines(path)
 	switch core.CanonicalVerb(request.Verb) {
 	case "confine-list":
-		result, listErr := runner.ListConfines(ctx, path, registry)
-		if listErr != nil {
-			return confineManagementError(listErr)
+		// AIRA-121 gate condition C2. Shim mode renders its rows from the daemon's
+		// own granted-waiter registry and NEVER calls ListConfines: that function
+		// os.ReadDir's the slice cgroup directory, so against the sentinel every
+		// `--list` would answer UNEVALUATED / E_CONFINE_UNAVAILABLE -- an operator
+		// surface that never works at all.
+		var result runner.ConfineListResult
+		if s.shimMode() {
+			result = runner.ShimConfineList(registry)
+		} else {
+			listed, listErr := runner.ListConfines(ctx, path, registry)
+			if listErr != nil {
+				return confineManagementError(listErr)
+			}
+			result = listed
 		}
 		if result.Verdict == "unevaluated" {
 			return core.Response{OK: true, Code: "UNEVALUATED", Data: result, Exit: 3}
 		}
-		readMemory := s.admitReadMemory
-		if readMemory == nil {
-			readMemory = readSliceMemory
-		}
+		readMemory := s.memoryReader()
 		_, maximum, _, ok, _ := readMemory(path)
 		if ok {
 			// AIRA-103. A CAPACITY question -- "what would one more job face" --
@@ -227,6 +240,14 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				CapAggregateKnown: snapshot.capAggregateKnown,
 				CapBoundBytes:     s.oversubscriptionLimit(ceilingMaximum),
 			}
+			// AIRA-121. The advisory wording travels on the SAME line as the
+			// numbers it qualifies. Without it a shim reserve summary is
+			// byte-identical to a real slice's and presents an advisory budget as
+			// an enforced ceiling.
+			if s.shimMode() {
+				result.SliceReserve.Containment = string(runner.ConfineContainmentAdvisory)
+				result.SliceReserve.BudgetSource = s.shimBudget.Source
+			}
 			// AIRA-101, from the SAME snapshot, so the exclusive holder and the
 			// counts above can never describe different instants. Left nil when
 			// nothing is exclusive: a positive "none", never an unevaluated reading.
@@ -248,6 +269,14 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 	case "confine-kill":
 		selector := stringArg(request.Args, "selector")
 		steal, _ := request.Args["steal"].(bool)
+		if s.shimMode() {
+			// Never a fabricated "killed". cgroup.kill is the only mechanism that
+			// reaches a job's whole subtree atomically, and shim mode has no cgroup
+			// at all, so the honest answer is a refusal that names the supervisor PID
+			// to signal -- that supervisor forwards to the job's process GROUP.
+			_, killErr := runner.ShimConfineKill(selector, callerOwner, steal, registry)
+			return confineManagementError(killErr)
+		}
 		result, killErr := runner.KillConfine(ctx, path, selector, callerOwner, steal, registry)
 		if killErr != nil {
 			return confineManagementError(killErr)

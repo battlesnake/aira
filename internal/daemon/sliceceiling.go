@@ -775,11 +775,7 @@ func sliceCeilingEffectiveMaximum(snapshot sliceCeilingSnapshot, maximum int64) 
 func realSliceCeilingDeps(s *Server, policy sliceCeilingPolicy) sliceCeilingDeps {
 	return sliceCeilingDeps{
 		resolveSlice: func() (string, bool, string) {
-			resolve := s.admitResolveSlice
-			if resolve == nil {
-				resolve = resolveAdmitSlicePath
-			}
-			return resolve(runner.DefaultConfineSlice)
+			return s.sliceResolver()(runner.DefaultConfineSlice)
 		},
 		readSliceParts:   readSliceCeilingParts,
 		readSliceCurrent: readSliceCeilingCurrent,

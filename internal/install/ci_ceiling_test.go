@@ -71,7 +71,11 @@ func TestInstallCIArgumentShapeAndMutualExclusion(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"--ci=yes"}, "does not take a value"},
+		// AIRA-121 gave --ci an OPTIONAL value, so "does not take a value" is no
+		// longer the right refusal — but an UNRECOGNISED value must still be
+		// refused, and refused by naming the two that are accepted rather than
+		// silently falling back to the bare flag's meaning.
+		{[]string{"--ci=yes"}, "--ci must be given bare, or as --ci=shim or --ci=auto"},
 		{[]string{"--ci", "--ci"}, "may occur once"},
 		{[]string{"--status", "--ci"}, "--status cannot be combined with mutation options"},
 	} {

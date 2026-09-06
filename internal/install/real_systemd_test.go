@@ -30,6 +30,12 @@ func TestMain(m *testing.M) {
 			os.Exit(RunSliceAnchor())
 		case "__confine-setup":
 			os.Exit(runner.RunConfineSetup(os.Args[2:], os.Stderr))
+		case "__shim-entrypoint":
+			// AIRA-121 test (i). Stands in for a container ENTRYPOINT: start the
+			// shim daemon through the production spawn, run a trivial workload,
+			// exit. The whole question is whether the container can exit while the
+			// daemon keeps running, so this helper must use the real spawn.
+			os.Exit(runShimEntrypointHelper(os.Args[2:]))
 		case "daemon":
 			if len(os.Args) > 2 && os.Args[2] == "serve" {
 				paths, err := daemon.PathsFromEnv()

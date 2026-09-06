@@ -155,7 +155,14 @@ type Server struct {
 	// readWorkerSupervisorMemory.
 	admitReadWorkerSupervisorMemory func(string) (int64, int64, bool, string)
 	admitConfineScan                func(string) (runner.ConfineListResult, error)
-	admitConfineScanInterval        time.Duration
+	// AIRA-121. confineMode is runner.ConfineModeReal or ConfineModeShim, and
+	// shimBudget is the recorded container RAM budget the ledger admits against
+	// in shim mode. Both are resolved once, in Serve, from the durable
+	// install-mode record (see resolveDaemonConfineMode) so that EVERY daemon
+	// launch path in a shim-installed home yields a shim daemon.
+	confineMode              string
+	shimBudget               shimBudget
+	admitConfineScanInterval time.Duration
 	// workerScopeScan / workerScopeCreate are the worker-admit ledger's two
 	// cgroupfs seams (AIRA-39). Production uses scanWorkerScopeChildren and
 	// runner.CreateWorkerScope; tests substitute fakes so the ledger's
@@ -196,11 +203,8 @@ func NewServer(paths Paths) *Server {
 		projectUses: map[string]int{},
 		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
-		admitFreezeMaxHold: defaultAdmitFreezeMaxHold,
-		admitQueues:        map[string]*sliceQueue{},
-		admitConfineScan: func(path string) (runner.ConfineListResult, error) {
-			return runner.ListConfines(context.Background(), path, nil)
-		},
+		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
+		admitQueues:                  map[string]*sliceQueue{},
 		admitConfineScanInterval:     admitConfineScanIntervalDefault,
 		workerScopeScanInterval:      workerScopeScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
@@ -225,6 +229,10 @@ func NewServer(paths Paths) *Server {
 		cpuSlotsScan:                 scanSliceWorkerScopes,
 	}
 	server.projectCond = sync.NewCond(&server.mu)
+	// One scan entry point, mode-aware (AIRA-121). Assigned after the literal
+	// because it closes over the server it belongs to.
+	server.admitConfineScan = server.confineScan
+	server.confineMode = runner.ConfineModeReal
 	return server
 }
 
@@ -264,6 +272,43 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	steerMode, steerInterval, err := oomSteerConfigFromEnv()
 	if err != nil {
 		return err
+	}
+	// AIRA-121. THE mode decision for this daemon process, taken from the durable
+	// install-mode record (or the test/override environment) rather than inherited
+	// from whoever launched it -- see resolveDaemonConfineMode for why that
+	// distinction is load-bearing.
+	confineMode, budget, err := resolveDaemonConfineMode(s.Paths)
+	if err != nil {
+		return err
+	}
+	s.confineMode, s.shimBudget = confineMode, budget
+	if s.shimMode() {
+		// AIRA-121 gate condition C12. EVERY cgroup-walking loop is switched off in
+		// shim mode, enumerated rather than assumed:
+		//
+		//   watchdog        - kills uncapped heavy processes on MemAvailable
+		//                     pressure read from a /proc that is the HOST's inside a
+		//                     container. It would be judging the wrong machine.
+		//   slice ceiling   - reduces the capacity of a cgroup slice that does not
+		//                     exist; sliceceiling's own resolve would fail every pass.
+		//   oom steerer     - writes oom_score_adj into confine SCOPES. There are none.
+		//   scope reaper    - AIRA-72's orphaned-scope sweep (runScopeReaper) walks the
+		//                     slice directory every 5 minutes. Against the sentinel it
+		//                     would log a failure per pass forever. Interval 0 parks the
+		//                     loop on ctx.Done, which also parks the stale-lease sweep
+		//                     it shares a pass with -- correct rather than merely
+		//                     convenient, since that sweep's release gate is a proof of
+		//                     cgroup emptiness it can never obtain here.
+		//
+		// The admission confine scan is NOT in this list: it stays live and returns
+		// a true empty result (Server.confineScan), because the ledger's accounting
+		// pass legitimately runs and legitimately finds no scopes.
+		watchdogMode = watchdogOff
+		sliceCeilingMode = sliceCeilingOff
+		steerMode = oomSteerOff
+		scopeReapInterval = 0
+		log.Printf("aira daemon: ci-shim mode: advisory RAM ledger only (budget %d bytes from %s); watchdog, slice ceiling, oom steering and the scope reaper are off -- there are no cgroup scopes to act on",
+			budget.Bytes, budget.Source)
 	}
 	watchPollInterval, err := watchPollIntervalFromEnv()
 	if err != nil {

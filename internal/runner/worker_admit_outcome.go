@@ -148,6 +148,16 @@ const (
 	WorkerAdmitReasonWorkerScopeIDCollision    = "worker-scope-id-collision"
 	WorkerAdmitReasonAdmitSlotsSaturated       = "admit-slots-saturated"
 	WorkerAdmitReasonSaturated                 = "saturated"
+	// AIRA-121. ci-shim mode: worker-admit places each forked worker in its OWN
+	// cgroup sub-scope nested under the outer job's scope, and in shim mode there
+	// is no outer scope and no cgroup to nest under. Classed
+	// admission-unusable, NOT contended, and that distinction is the whole
+	// correctness of it: a contended denial is retriable, so supervisor.py's
+	// _wait_for_admission_or_disable would poll a shim daemon FOREVER ("a daemon
+	// that stays reachable but saturated forever means the run genuinely waits
+	// forever"). admission-unusable maps to WorkerAdmitUnavailable, which fires
+	// _disable_daemon once and runs the suite on the bare-fork fallback pool.
+	WorkerAdmitReasonCIShimNoSubScope = "ci-shim-no-sub-scope"
 	// AIRA-64. cpu-slots-saturated is the machine-wide CPU-concurrency bound
 	// declining one more worker; admit-locks-busy is a SPECULATIVE request
 	// (max_wait_ms == 0) refusing to wait on a lock another job holds. Both are

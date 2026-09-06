@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-121","project":"aira","title":"aira install/confine: ci-shim mode for systemd/cgroup-unavailable containers (GCP Batch, similar CI/batch containers)","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-121","to":"AIRA-123"}]}
+{"schema":1,"id":"AIRA-121","project":"aira","title":"aira install/confine: ci-shim mode for systemd/cgroup-unavailable containers (GCP Batch, similar CI/batch containers)","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-121","to":"AIRA-123"}]}
 ---
 Requested directly by the owner, 2026-09-06, as a follow-up question on AIRA-120.
 
@@ -205,3 +205,122 @@ no running daemon/systemd present, and the separate start-time step is what
 actually launches the shim daemon; (i) a shim-mode container run where the
 daemon is left running in the background exits promptly when the workload
 process exits, not blocked on the daemon.
+
+## Resolution (in-review)
+
+Built on `aira121-ci-shim-mode`. Plan:
+`docs/superpowers/plans/2026-09-06-aira121-ci-shim-mode-plan.md`, published as
+**v2** with all twelve gate conditions folded in (section 12 tabulates each
+condition against the section it changed).
+
+### The nine numbered requirements
+
+1. **Capability probe + explicit mode.** `internal/install/capability.go`:
+   `ProbeCapability` records systemd reachability, the unified cgroup, this
+   process's own cgroup and its `memory.max`, and MemTotal — each as an
+   established fact or an explicit `unevaluated: <reason>`. The mode decision
+   reads exactly one field. `--ci` keeps AIRA-120's meaning unchanged, `--ci=shim`
+   forces, `--ci=auto` opts in to host-dependence; there is no path through
+   `install` that does not PRINT the resolved mode, its budget and its
+   containment. The decision is recorded durably in
+   `<state-home>/aira/install-mode.json`.
+2. **No cgroup step attempted.** `confineShim`
+   (`internal/runner/confine_shim_linux.go`) is entered from `confineWithDeps`
+   after identity normalisation and BEFORE slice resolution — above every
+   function that issues a cgroup syscall — so "skipped entirely up front" is
+   structural, not a promise. The test harness makes every cgroup seam PANIC if
+   called.
+3. **Advisory-only ledger, reported honestly.** The existing `sliceQueue` IS the
+   ledger; shim mode re-sources its three injectable seams
+   (`internal/daemon/shim.go`). No new ledger data structure, and the AIRA-67
+   per-signature estimator is reused by not editing it. A new always-rendered
+   `containment=` facet carries
+   `advisory(ci-shim,no-cgroup,no-kill-backstop)` vs `enforced` vs `unevaluated`,
+   through the single `FormatConfineStatus` projection; `--list`'s reserve
+   summary carries the same wording on the same line as the numbers.
+4. **Budget source.** Declared (`--memory-max`) → container `memory.max` →
+   `/proc/meminfo` MemTotal → **install fails**. The container's own limit is
+   preferred over MemAvailable because `/proc/meminfo` is not namespaced; the
+   reasoning is documented at `resolveShimBudget`.
+5. **aitest's fallback needs no changes, proven.** Two new tests in
+   `internal/pylib/aitest/test_supervisor.py` drive the exact wire answers a shim
+   install produces and assert the fallback pool ran.
+6. **Resource flags accepted, never rejected.** `parseConfineArgs` and
+   `ConfineRequest` are untouched, and the shim branch sits BELOW both the parser
+   and `ResolveConfineReserve`, so a shim-specific rejection has nowhere to live.
+   `--memory-max`/`--memory-reserve` stay LIVE as ledger declarations and are
+   inert only as cgroup writes.
+7. **`AIRA_AITEST_LIB` not exported (INTERIM).** Gated by the one named predicate
+   `runner.AitestBackendCanFunction`, which is the single line AIRA-123 flips. In
+   shim mode the child's environment is actively STRIPPED of every
+   `AIRA_AITEST_*`, and `AIRA_CONFINE_SCOPE_ID` is not published either.
+8. **Process-group signals.** `Setpgid` on the shim launch plus
+   `confineCommand.signal`, so `forwardConfineSignals` carries no mode branch at
+   all. The setsid/double-fork escape is documented in the code, the SKILL text
+   and the plan, and asserted by a NEGATIVE test.
+9. **Build/start split.** `--stage=build|start`, defaulting to both. The build
+   stage places bytes only; the start stage is the only thing that starts or
+   contacts anything. The shim daemon is spawned setsid, with `/dev/null` stdin
+   and a LOG FILE (never an inherited pipe) for stdout/stderr, `Release()`d and
+   never waited on.
+
+### The twelve gate conditions
+
+- **C1** worker-admit answers `state=unavailable`/`class=admission-unusable`
+  (not `unevaluated`, which is retriable and would make the aitest supervisor
+  wait forever); `WorkerAdmitStateUnavailable` added to the poll loop's break
+  set; `aitest-bootstrap` refuses in shim mode so `_disable_daemon` fires at
+  bootstrap. Test (d) asserts the fallback pool ran and is bounded by a deadline.
+- **C2** `resolveConfineManagementPath` returns the sentinel in shim mode;
+  `runner.ShimConfineList` renders `--list` from the granted-waiter registry with
+  the advisory wording; `runner.ShimConfineKill` REFUSES and names the supervisor
+  PID to signal (ownership guard first, so no PID leaks); SKILL text updated.
+- **C3** the mode decision precedes the euid branch, so a root shim install never
+  reaches `runRootInstall`; `--stage=build` never reaches
+  `installSystemDropins`/`enable-linger` in any mode; `reexecRequestFor` forwards
+  `--ci=<value>` and `--stage=<value>`.
+- **C4** new socket-based `waitShimDaemonReachable` over `daemon.Status`
+  (`waitDaemonReachable` is pure `systemctl --user show`); the "≤10s" figure is
+  corrected in the plan.
+- **C5** `resolveDaemonConfineMode` reads `install-mode.json` in `Serve`, so the
+  dispatcher spawn and a hand-run `daemon serve` also yield a shim daemon; env
+  retained only as a validated override seam. A shim job whose daemon is down
+  runs with `admission=unevaluated` on the trailer, and that is asserted.
+- **C6** `--exclusive` refused in `admitConnection` before enqueue;
+  `liveScopesKnown` untouched; the test asserts no scan-failure state is armed.
+- **C7** an injectable `lookPath` seam establishes absence BEFORE the run, and
+  the run is classified on its ANSWER not its exit status (so `degraded` is
+  correctly reachable); unit tests for systemctl-absent, timeout-absent and
+  D-Bus-failure.
+- **C8** `--memory-max` accepted under `--ci=shim` as the declared budget
+  (`shim_budget_source=declared`), refused under `--ci=auto`; residual 6
+  corrected.
+- **C9** shim `onSignal` delivers to the group synchronously, THEN starts the
+  grace, THEN escalates; no group signal after `cmd.Wait()`. Test (g) case 1 uses
+  a grandchild whose SIGTERM handler takes measurable time.
+- **C10** `ru_maxrss` feedback DROPPED; `peak-rss=unevaluated` in shim mode,
+  recorded as residual 2.
+- **C11** record at `<state-home>/aira/install-mode.json`, beside `state.db`.
+- **C12** watchdog, slice ceiling, oom steerer AND the AIRA-72 scope reaper (with
+  the stale-lease sweep it shares a pass with) are all off in shim mode,
+  enumerated in `Serve`; the admission confine scan stays live and returns an
+  honest empty success, so the log carries no periodic scan-failure noise.
+
+### Found during the build, and fixed
+
+A shim job whose descendant setsid's out of the process group would have HUNG the
+supervisor at `cmd.Wait()`: `os/exec` bridges a non-file writer through a pipe
+whose copy goroutine `Wait` joins, and the escaped descendant holds its write end
+forever. The real path never sees this because `cgroup.kill` removes the escapee.
+Shim mode now owns those pipes itself (`shimChildStream`) so the copier is
+abandonable and the supervisor reports the job's real outcome and exits.
+
+### Deliberate deferral, reported rather than silently taken
+
+`aira run` is NOT supported in shim mode: it refuses with
+`E_RUN_SCOPE_UNAVAILABLE` naming `aira confine`, and the follow-up is
+**AIRA-129**. The plan's section 5.7 recorded this fork as a decision point; it
+was taken because `Runner.Launch`'s ledger/telemetry/PTY/detach surface is all
+keyed on a real scope and the deployment shape this ticket targets does not use
+it. Ticket test (a) therefore covers `confine` only.
+

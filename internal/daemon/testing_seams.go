@@ -71,3 +71,17 @@ func (s *Server) SetAdmitReadWorkerSupervisorMemoryForTest(fn func(string) (int6
 func (s *Server) SetWorkerAdmitHeadroomForTest(value int64) {
 	s.workerAdmitHeadroom = value
 }
+
+// SetConfineShimModeForTest puts this server into AIRA-121's ci-shim mode
+// without an install-mode record on disk, for unit tests that construct a Server
+// with NewServer and never call Serve (which is where production resolves the
+// mode from the durable record).
+//
+// It sets the mode ONLY. The three re-sourced seams are resolved lazily at each
+// point of use (sliceResolver, memoryReader, confineScan), so a test may still
+// override any of them afterwards and its override wins — which is what lets a
+// ledger test inject a small synthetic budget without a container cgroup.
+func (s *Server) SetConfineShimModeForTest(budgetBytes int64, source, cgroupPath string) {
+	s.confineMode = runner.ConfineModeShim
+	s.shimBudget = shimBudget{Bytes: budgetBytes, Source: source, CgroupPath: cgroupPath}
+}

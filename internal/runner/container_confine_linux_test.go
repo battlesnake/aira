@@ -440,14 +440,19 @@ func TestContainerLaunchAdvisories(t *testing.T) {
 // the shared trailer cannot be ratified by the test that is supposed to catch it.
 func TestFormatConfineStatusUnchangedWithoutContainer(t *testing.T) {
 	status := ConfineStatus{
-		Slice: "aira.slice", Cap: ConfineCapEnforced, CapBytes: 64 << 30,
+		Slice: "aira.slice", Containment: ConfineContainmentEnforced,
+		Cap: ConfineCapEnforced, CapBytes: 64 << 30,
 		ReserveBytes: 2 << 30, ReserveBasis: "pinned:client",
 		AdmissionState: "immediate", Scope: ConfineScopePlaced,
 		ScopeIntegrity: ScopeContained, OOMGroup: ConfineOOMGroupSet,
 		Priorities: ConfinePrioritiesApplied, CPUWeight: ConfineCPUWeightAging,
 		TerminatedBy: ConfineTerminatedNormal,
 	}
-	const base = "confine: slice=aira.slice cap=enforced(64G) reserve=2G reserve-basis=pinned:client " +
+	// AIRA-121 inserted `containment=` immediately after the slice, on the same
+	// always-rendered discipline as terminated-by and scope-swap.max: a trailer
+	// silent about WHAT KIND of containment it had cannot be told apart from a
+	// ci-shim job that had none at all.
+	const base = "confine: slice=aira.slice containment=enforced cap=enforced(64G) reserve=2G reserve-basis=pinned:client " +
 		"admission=immediate scope=placed scope-integrity=contained oom.group=set priorities=applied " +
 		// AIRA-110's scope-swap.max renders on EVERY trailer, on the same
 		// always-rendered discipline as terminated-by: a trailer silent about swap

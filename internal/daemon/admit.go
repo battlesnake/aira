@@ -1659,19 +1659,35 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitError(conn, admitErrorCode(err), err.Error())
 		return
 	}
-	resolve := s.admitResolveSlice
-	if resolve == nil {
-		resolve = resolveAdmitSlicePath
+	// AIRA-121 gate condition C6. --exclusive is refused HERE, before the request
+	// is ever queued, and that placement is the whole mechanism.
+	//
+	// In shim mode the confine scan honestly reports an empty slice (there are no
+	// cgroup scopes), and sliceProvablyEmpty would therefore grant exclusivity to
+	// an UNCONFINED job on the strength of an emptiness that says nothing about
+	// what else is running in this container. The plan proposed forcing
+	// liveScopesKnown false instead; that is not buildable through the scan seam --
+	// the only way a scan leaves liveness unknown is a Verdict=unevaluated result,
+	// which the evaluator converts to a scan ERROR, logs as "confine reserve scan
+	// failed", and uses to arm the exclusive abort anchor. Refusing up front makes
+	// liveScopesKnown's value irrelevant, because sliceProvablyEmpty's only reader
+	// is the exclusive drain gate.
+	//
+	// CodeAdmitExclusiveUnestablished is reused rather than a new code minted: its
+	// established meaning -- "an empty slice could not be established" -- is
+	// exactly, literally true here.
+	if s.shimMode() && request.exclusive {
+		s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
+			CodeAdmitExclusiveUnestablished+": ci-shim mode has no cgroup scopes, so an empty slice cannot be established and exclusivity cannot be granted; run the benchmark on a real-slice install")
+		return
 	}
+	resolve := s.sliceResolver()
 	path, ok, reason := resolve(request.slice)
 	if !ok {
 		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason})
 		return
 	}
-	readMemory := s.admitReadMemory
-	if readMemory == nil {
-		readMemory = readSliceMemory
-	}
+	readMemory := s.memoryReader()
 	_, maximum, _, ok, reason := readMemory(path)
 	if !ok {
 		// The daemon answered; only the slice's live usage was unreadable. Report
@@ -2138,10 +2154,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queue.capAggregate, queue.capAggregateKnown = s.aggregateScopeCap(queue, scanResult.Scopes, present, held)
 		}
 	}
-	readMemory := s.admitReadMemory
-	if readMemory == nil {
-		readMemory = readSliceMemory
-	}
+	readMemory := s.memoryReader()
 	current, maximum, reclaimable, ok, _ := readMemory(queue.path)
 	if !ok {
 		// Fail CLOSED: without a slice-memory read the ceiling cannot be

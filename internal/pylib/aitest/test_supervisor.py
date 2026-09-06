@@ -21,6 +21,7 @@ from aitest.supervisor import (
     WorkerAdmitUnavailable,
     WorkerPlacementFailed,
 )
+from aitest.supervisor import _OUTCOME_CLASS_EXCEPTIONS, _parse_worker_admit_outcome
 from aitest.worker import _EVENT_LINE_PREFIX, _tag_tuples, run_one
 
 
@@ -3315,3 +3316,81 @@ def test_worker_death_falls_back_to_the_generic_reason_rather_than_guessing(tmp_
         assert reason == (
             "worker 4321 stopped reporting while running it, and the one retry did too"
         ), "%s must not produce a fabricated OOM diagnosis, got %r" % (name, reason)
+
+
+def test_ci_shim_mode_runs_the_whole_suite_on_the_fallback_pool(tmp_path, monkeypatch, pytester, capsys):
+    """AIRA-121 ticket test (d), and the correction gate condition C1 forced.
+
+    In ci-shim mode there is no cgroup, so aitest-bootstrap fails cleanly and
+    worker-admit answers state=unavailable class=admission-unusable. Both must
+    resolve to _disable_daemon and the bare-fork fallback pool, with ONE honest
+    warning and every test still reported.
+
+    THE COUNTEREXAMPLE THIS PINS is the plan's original design: a shim daemon
+    answering state=unevaluated carries class=contended, which is RETRIABLE, so
+    _wait_for_admission_or_disable would poll a reachable-but-never-granting
+    daemon forever -- "a daemon that stays reachable but saturated forever means
+    the run genuinely waits forever". The suite would HANG rather than fall back.
+
+    The DEADLINE is therefore load-bearing and not decoration: an infinite-wait
+    regression must FAIL this test rather than hang it, so the whole run is
+    bounded by a wall-clock budget and a run that exceeds it is a failure.
+    """
+    bootstrap = _write_stub(tmp_path / "bootstrap-shim", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: ci-shim mode has no cgroup scope to bootstrap an aitest supervisor into\\n")
+sys.exit(4)
+""")
+    admit = _write_stub(tmp_path / "worker-admit-shim", """
+import sys
+print("aira-worker-admit state=unavailable class=admission-unusable reason=ci-shim-no-sub-scope")
+sys.stdout.flush()
+sys.exit(4)
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+
+        def test_three():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.bootstrap()
+    supervisor.collect(items)
+
+    deadline = time.monotonic() + 60.0
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+    assert time.monotonic() < deadline, (
+        "the ci-shim run did not finish inside its budget: a worker-admit answer "
+        "classed contended is retriable and makes this wait forever"
+    )
+
+    assert len(results) == 3
+    assert all(outcome == "passed" for outcome in results.values()), results
+    assert supervisor.daemon_available is False, (
+        "ci-shim must DISABLE daemon-backed admission and run the bare-fork pool, "
+        "not keep retrying a daemon that structurally cannot grant"
+    )
+    stderr = capsys.readouterr().err
+    assert stderr.count("aira aitest:") == 1, (
+        "exactly one honest fallback warning, never one per worker: %r" % stderr
+    )
+
+
+def test_ci_shim_worker_admit_answer_maps_to_unavailable_not_denied():
+    """The exact wire answer the ci-shim daemon emits must classify as
+    WorkerAdmitUnavailable (terminal, fires _disable_daemon), never as
+    WorkerAdmitDenied (retriable, polls forever)."""
+    fields = _parse_worker_admit_outcome(
+        "aira-worker-admit state=unavailable class=admission-unusable reason=ci-shim-no-sub-scope"
+    )
+    assert fields["state"] == "unavailable"
+    assert _OUTCOME_CLASS_EXCEPTIONS[fields["class"]] is WorkerAdmitUnavailable
+    assert _OUTCOME_CLASS_EXCEPTIONS[fields["class"]] is not WorkerAdmitDenied

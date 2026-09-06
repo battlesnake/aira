@@ -1,6 +1,8 @@
 # AIRA-121 — `install --ci=shim`: honest degradation for systemd/cgroup-unavailable containers
 
-Status: **v1**, for plan review
+Status: **v2**, gate conditions C1-C12 folded in (gate verdict on v1:
+GATE-PASS-WITH-CONDITIONS). Every corrected section is marked **[C<n>]** and the
+full list of what changed is section 12.
 Ticket: `.aira/tickets/AIRA-121.md` (nine numbered requirements; 1–5 original
 scoping, 6–9 consumer-verified by peer session `deploy`)
 Branch: `aira121-ci-shim-mode` off `origin/master` `568b6e8` (AIRA-120 landed;
@@ -95,14 +97,31 @@ is nothing the other three facts could add to the *decision*; they are recorded
 because they are what an operator needs to understand the decision, and because
 `OwnCgroupMemoryMax` and `MemTotalBytes` feed the budget resolution in §4.2.
 
-Probe mechanism for the decisive field: `d.run(timeoutArgv("systemctl", "--user",
-"is-system-running"))`, wrapped in the existing `timeoutArgv` helper so a hung
-D-Bus cannot hang a `docker build`. Its *exit code is ignored* — `degraded` and
-`running` and `starting` are all "reachable"; what matters is whether the user
-manager answered at all. `exec: "systemctl": executable file not found` →
-`absent`; any other failure → `unreachable: <err>`, distinguished in the report.
-Both resolve to shim under `--ci=auto` (§2.2), because neither can run the real
-install — but the *reason* is never lost.
+**[C7] Probe mechanism, corrected.** v1 proposed classifying absence off the
+run's error text. That cannot work: `timeoutArgv` wraps every command as
+`timeout 10s <cmd>`, so a missing `systemctl` surfaces as `timeout` exiting 127,
+never as `exec: "systemctl": executable file not found` — and in a distroless
+image `timeout` itself is missing, producing `exec.ErrNotFound` on the wrapper.
+Neither is distinguishable from a live systemd that answered badly.
+
+Absence is therefore established BEFORE the run, through a new injectable
+`lookPath` seam on `installDeps`, in this order:
+
+1. `timeout` absent → `unevaluated: timeout(1) is absent, so the systemd probe
+   cannot be bounded and is not run`. The probe is NOT run: a hung D-Bus must
+   never hang a `docker build`.
+2. `systemctl` absent → `absent`.
+3. Otherwise run `d.run(timeoutArgv("systemctl", "--user", "is-system-running"))`
+   and classify on the ANSWER, never the exit status: `running`, `degraded`,
+   `starting`, `initializing`, `maintenance`, `stopping`, `offline` all mean
+   `reachable` (`degraded` and `starting` both exit non-zero and are live
+   managers). Anything else → `unreachable: <detail>`.
+
+Only `reachable` resolves to the real path under `--ci=auto`; every other value
+resolves to shim, and the *reason* is never lost. Three unit tests pin the three
+cases the gate condition names — systemctl absent, timeout absent, systemctl
+present with a D-Bus failure — plus the degraded case, which is the one an
+exit-status classifier would get wrong on a healthy desktop.
 
 **Deliberately not probed: an actual cgroup `mkdir`.** A write probe would be
 the only conclusive test of delegation, but it is intrusive (it creates a
@@ -135,15 +154,24 @@ would also retroactively change a flag that landed three commits ago. So bare
 **both** paths print the resolved mode (§3.4). An operator who wants
 host-dependence asks for it by name.
 
-`--ci=shim` inherits AIRA-120's mutual exclusion with `--memory-max`? **No** —
-and this is a decision, not an oversight. In shim mode `--memory-max` does not
-size a slice unit (there is no unit); it would size the *ledger budget*. Rather
-than overload one flag with two meanings, `--ci=shim` **refuses** `--memory-max`
-with a message naming the shim budget source instead:
-`E_INSTALL_ARGUMENT_INVALID: --memory-max sizes the aira.slice unit, which
-ci-shim mode does not create; the shim ledger budget is read from the
-container's own cgroup memory.max or MemTotal (see --status)`. One meaning per
-flag; no silent winner.
+**[C8] `--ci=shim` ACCEPTS `--memory-max`, as the declared ledger budget.** v1
+refused it on a "one meaning per flag" argument. That argument was wrong on its
+own terms: on the real path the slice's `MemoryMax` IS the admission ceiling the
+daemon reads, so `--memory-max` meaning "the ledger ceiling" in shim mode is the
+SAME meaning, not a second one.
+
+It is also required in practice. The `meminfo-memtotal` fallback over-books
+whenever a node runs more than one container without a per-container
+`memory.max` — GCP Batch with `taskCountPerNode > 1` is exactly that shape — and
+there is then no other way to tell AIRA what this task's share is. Recorded as
+`shim_budget_source=declared` and printed as such (`--status`, and every install
+report).
+
+`--ci=auto` with `--memory-max` IS still refused: auto may resolve to the real
+path, where `--memory-max` and the MemAvailable snapshot genuinely conflict, and
+which of the two applied would then depend on the host — the exact
+silently-different-boxes shape requirement 1 forbids. Bare `--ci` keeps
+AIRA-120's refusal unchanged.
 
 ---
 
@@ -164,8 +192,44 @@ New flag `--stage=build|start` on `aira install`, defaulting to **both, in
 order** — so today's `aira install` is byte-for-byte today's behaviour and no
 existing caller changes.
 
-`runUserInstall` is refactored into three parts, and the refactor is the bulk of
-the install-side diff:
+**[C3] Corrected shape.** v1 proposed splitting `runUserInstall` into
+`planInstall`/`applyInstallBuild`/`applyInstallStart`. That was rejected in
+build as a needless restructure of a 300-line function whose step ORDER is
+load-bearing (the daemon unit is published only after the incumbent is stopped,
+so the stop happens under the old unit). The split as built is a STAGE GATE at
+the one point in that order where the function stops placing bytes and starts
+contacting things:
+
+- everything above the gate — read installed units, compute limits, render,
+  take the install lock, publish the slice and anchor units, publish the daemon
+  unit, write `install-mode.json` — is the BUILD stage, and `--stage=build`
+  returns there;
+- everything below — `daemon-reload`, `enable --now`, delegation, the incumbent
+  stop, `enable --now` on the daemon unit, linger, the reachability wait — is
+  the START stage.
+
+`--stage=start` and the combined default run the whole function in its ORIGINAL
+order; the publishes are idempotent (`publishManagedUnit` compares content), so
+re-running them costs a comparison and changes nothing. That is a deliberate
+trade: correctness of the existing ordering over a tidier factoring.
+
+**[C3] The root case, which is the `docker build` default.** `runInstall`
+branches on `geteuid()==0` into `runRootInstall`, which requires
+`validateSudoIdentity` (SUDO_USER), a `/run/user/<uid>` session directory owned
+by that user, `/etc` drop-ins and `loginctl enable-linger` — every one of which
+fails in a `docker build` RUN layer and in a root-running Batch container. So
+**the MODE decision now happens BEFORE the euid branch**: a shim install never
+reaches `runRootInstall`, never re-execs, and installs for the CURRENT user's
+own `HOME` with no session check, no drop-ins and no linger. That is correct
+rather than merely expedient — there is no second user to install on behalf of,
+and nothing in a shim install needs privilege.
+
+Independently, `--stage=build` never reaches `installSystemDropins` or
+`enable-linger` IN ANY MODE (`runRootInstall` gates both on the stage), and
+`reexecRequestFor` forwards `--ci=<value>` and `--stage=<value>` rather than a
+bare `--ci`.
+
+For reference, the shape v1 described (not built):
 
 ```go
 // Pure-ish: reads state, resolves modes, computes limits, renders units.
@@ -197,8 +261,11 @@ AIRA-106's under-lock re-resolve of the daemon modes moves into
 
 ### 3.3 The recorded plan: `install-mode.json`
 
-Written by the build stage, at `<Paths.StateHome>/install-mode.json`, mode
-`0600`, atomically (temp + rename in the same directory):
+**[C11]** Written by the build stage at `<Paths.StateHome>/aira/install-mode.json`
+— inside the AIRA state DIRECTORY, beside `state.db`, NOT at the root of the
+state home. `Paths.StateHome` is the XDG state home and is shared with every
+other application on the box. Mode `0600`, atomically (temp + rename in the same
+directory):
 
 ```json
 {
@@ -226,10 +293,20 @@ makes it impossible for them to disagree about the mode:
    stage must never *re-resolve* a mode the build stage already resolved: that is
    the "two boxes silently different" failure with the two boxes being the same
    box at two points in time.
-2. The daemon — via the start stage, which transcribes the budget into the
-   daemon child's environment (§3.5). The daemon does **not** read the file
-   itself; it stays configured exactly the way every other daemon subsystem is
-   (§4.1).
+2. **[C5]** The daemon — which reads THIS FILE ITSELF. v1 had the daemon
+   configured only from the environment the start stage transcribed. That is
+   unsound: two other daemon launch paths exist and neither goes through the
+   start stage — `cmd/aira/dispatcher.go`'s `spawnDaemon` fires
+   `/proc/self/exe daemon` whenever a daemon-routed verb finds no socket, and an
+   operator can run `aira daemon serve` by hand or a supervisor can restart it.
+   Either would produce a REAL-mode daemon in a shim-installed home; against
+   such a daemon a shim client's `ci-shim` slice fails `admitResolveSlice`,
+   `Runner.admit` falls through to `resolveSlicePath("ci-shim")` →
+   `state=unevaluated`, and **the job launches ungated**. So
+   `resolveDaemonConfineMode` reads the record in `Serve`, and the
+   `AIRA_DAEMON_CONFINE_MODE` / `AIRA_DAEMON_SHIM_*` variables are retained
+   ONLY as the test/override seam (validated with the established
+   `E_CONFIG_INVALID` idiom, never silently ignored).
 3. `aira confine` / `aira run` — read it once per process, cached, to resolve
    their own mode (§5.1). **Absent → real mode**, so every existing installed
    box is untouched.
@@ -275,18 +352,39 @@ these two lines.
   `AIRA_DAEMON_CONFINE_MODE=shim`, `AIRA_DAEMON_SHIM_BUDGET_BYTES`,
   `AIRA_DAEMON_SHIM_BUDGET_SOURCE`, `AIRA_DAEMON_SHIM_CGROUP_PATH`, and
   `AIRA_DAEMON_WATCHDOG_MODE=off` + `AIRA_DAEMON_SLICE_CEILING_MODE=off` +
-  `AIRA_DAEMON_OOM_STEER_MODE=off` (all three are machine-wide cgroup/PSI
-  mechanisms that would either be inert or misfire against a host's numbers seen
-  through a container's `/proc`; forcing them off is honest, not conservative).
+  `AIRA_DAEMON_OOM_STEER_MODE=off`.
+
+  **[C12] The full enumeration, which v1 left incomplete.** `Serve` forces every
+  cgroup-walking loop off in shim mode, and the environment above only makes the
+  same intent visible in `ps`:
+
+  | Loop | Why it is off in shim mode |
+  |---|---|
+  | watchdog | Kills uncapped heavy processes on MemAvailable pressure read from a `/proc` that is the HOST's inside a container: it would be judging the wrong machine. |
+  | slice ceiling | Reduces the capacity of a cgroup slice that does not exist; its own resolve would fail every pass. |
+  | oom steerer | Writes `oom_score_adj` into confine SCOPES. There are none. |
+  | **scope reaper (AIRA-72, `runScopeReaper`)** | Walks the slice directory every 5 minutes for orphaned `.aira-CONFINE-*` scopes. Against the sentinel it would log a failure per pass forever. `scopeReapInterval = 0` parks the loop on `ctx.Done` — which also parks the stale-lease sweep it shares a pass with, correctly rather than merely conveniently, since that sweep's release gate is a proof of cgroup emptiness it can never obtain here. |
+
+  The admission confine scan is deliberately NOT in this list: it stays live and
+  returns a true empty result, because the ledger's accounting pass legitimately
+  runs and legitimately finds no scopes. The daemon log therefore carries no
+  periodic "scan failed" noise against the sentinel path.
 - `cmd.Start()`, then **`cmd.Process.Release()` and no `cmd.Wait()`**. The
   installer process exits immediately; the daemon is reparented to the
   container's init. Reaping it when PID 1 exits is init's job and is explicitly
   out of scope per the ticket; *not being waited on while the container runs* is
   in scope and is exactly what `Release()` + no-`Wait` + no-inherited-pipe give.
-- Then a **bounded readiness wait on the socket**, reusing `waitDaemonReachable`
-  (≤10s). This waits on a *socket*, never on the process. If it never comes up,
-  the start stage reports it and exits non-zero — a container whose ledger is
-  dead should fail loudly at start rather than silently run every job ungated.
+- **[C4]** Then a **bounded readiness wait on the socket** — a NEW
+  `waitShimDaemonReachable`, not `waitDaemonReachable`. The latter cannot be
+  reused: `verifyDaemonReachable` is implemented entirely through
+  `systemctl --user show -p ActiveState/SubState/MainPID`, and there is no
+  systemd here (its budget is also 5s, not the ≤10s v1 stated). The shim wait
+  polls `daemon.Status(paths)` — the same lock-and-socket evidence every client
+  uses — for `shimDaemonReadyTimeout` (10s, chosen because a cold container's
+  first daemon start also opens and migrates the SQLite state). It waits on a
+  SOCKET, never on the process. If the daemon never comes up the start stage
+  reports it and exits non-zero: a container whose ledger is dead should fail
+  loudly at start rather than silently run every job ungated.
 
 ---
 
@@ -402,15 +500,27 @@ as a fact, not a workaround:
 1. **`adopted` / `adoptedJobs` = 0 from a *successful* scan.** There are no
    cgroup scopes, so zero adopted reserve is the true reading, not a failed one.
    The shim scanner returns an empty `ConfineListResult` with `err == nil`.
-2. **`liveScopesKnown` must be FALSE, and `--exclusive` is refused.** With a
-   successful empty scan, `sliceProvablyEmpty` would return true and grant
-   exclusivity on fabricated emptiness — an *unconfined* job would be told it
-   was running alone. So the shim scanner marks liveness unknown, and
-   `admitConnection` refuses an exclusive request in shim mode with the existing
-   `CodeAdmitExclusiveUnestablished` plus a shim-specific reason. That code's
+2. **[C6] `--exclusive` is refused in `admitConnection`, before the request is
+   queued. `liveScopesKnown` is left alone.** With a successful empty scan,
+   `sliceProvablyEmpty` would return true and grant exclusivity on fabricated
+   emptiness — an *unconfined* job told it was running alone.
+
+   v1 proposed making the shim scanner "mark liveness unknown". That is not
+   buildable through the seam: the scan loop sets `queue.liveScopesKnown = true`
+   on ANY successful scan, `ConfineListResult` has no liveness-unknown field, and
+   the only way a scan leaves liveness unknown is `Verdict=unevaluated` — which
+   the evaluator converts to `scanErr`, logs as `confine reserve scan failed`,
+   sets `adoptedScanFailed`, and uses to arm the exclusive abort anchor. That is
+   a fabricated failure with real side effects, not the intended semantics.
+
+   ONE mechanism instead: `admitConnection` refuses an exclusive request in shim
+   mode up front, with the existing `CodeAdmitExclusiveUnestablished` (whose
    established meaning — "an empty slice could not be established" — is exactly,
-   literally true here, so no new error code is minted (one vocabulary per
-   primitive, per CLAUDE.md).
+   literally true here, so no new code is minted). `liveScopesKnown`'s value is
+   then irrelevant, because `sliceProvablyEmpty`'s only readers are the
+   exclusive drain gate. The regression test asserts the refusal AND that the
+   scan pass afterwards left `adoptedScanFailed` false and the abort anchor
+   unarmed.
 3. **`capAggregateKnown` = false.** AIRA-114's over-subscription bound sums
    per-scope `memory.max` values; there are no scopes and no caps, so the sum
    cannot be established. Its documented direction is **fail-open** — an unknown
@@ -429,11 +539,32 @@ as a fact, not a workaround:
 
 ### 4.5 `worker-admit` in shim mode
 
-`workerAdmitConnection` answers `{state: "unevaluated", reason: "ci-shim: no
-cgroup sub-scope is available"}` — the same response shape it already produces
-for an unreadable slice, which aitest's existing daemon-down/no-grant fallback
-already consumes. No aitest change, and AIRA-123's job becomes "turn this one
-`unevaluated` into a ledger-only advisory grant", which is a small, local edit.
+**[C1] `evaluateWorkerAdmit` answers `state=unavailable`,
+`class=admission-unusable`, `reason=ci-shim-no-sub-scope`, first, before every
+other gate.**
+
+v1 proposed `state=unevaluated`. That would HANG aitest, not trigger its
+fallback. `unevaluated` carries `class=contended`, which
+`internal/pylib/aitest/supervisor.py` maps to the RETRIABLE `WorkerAdmitDenied`,
+and `_wait_for_admission_or_disable` retries it INDEFINITELY — "a daemon that
+stays reachable but saturated forever means the run genuinely waits forever". A
+shim daemon answering `unevaluated` is exactly such a daemon.
+
+`WorkerAdmitStateUnavailable` / `WorkerAdmitClassAdmissionUnusable` already
+exist (they carry the outer-scope-unbounded verdict) and map to
+`WorkerAdmitUnavailable` → `_disable_daemon` → the one-warning bare-fork pool.
+`WorkerAdmitStateUnavailable` is also added to the poll loop's break set in
+`workerAdmitConnection`: it is a terminal daemon-side verdict, and polling it
+would burn the caller's whole `max_wait` before answering the same thing.
+
+`aitest-bootstrap` must fail cleanly for the same reason, and does: the verb
+refuses in shim mode with `E_CONFINE_UNAVAILABLE` before its self-discovery
+fallback, so `_disable_daemon` fires at BOOTSTRAP rather than the supervisor
+nominating whatever cgroup the container happens to live in as its "outer scope"
+and failing much later in a way that reads as a broken install.
+
+AIRA-123's job becomes "turn this one terminal answer into a ledger-only
+advisory grant", which is still a small, local edit.
 
 ---
 
@@ -490,22 +621,26 @@ Because the branch is above slice resolution, **no cgroup syscall is issued at
 all** in shim mode — which is what makes test (a) checkable by counting syscalls
 rather than by reading log text.
 
-### 5.3 Peak-RSS feedback in shim mode
+### 5.3 Peak-RSS feedback in shim mode — **[C10] dropped, and recorded as a residual**
 
-`readCgroupUsage` reads the scope's `memory.peak`; there is none. Without a
-replacement the AIRA-67 estimator would never learn and would sit on the
-machine-wide prior forever, which would make requirement 3's "reusing the
-existing estimator" hollow.
+`readCgroupUsage` reads the scope's `memory.peak`; there is none. v1 proposed
+substituting `wait4`'s `ru_maxrss` "with a distinct provenance marker".
 
-Replacement: `wait4`'s `ru_maxrss` for the direct child, taken from
-`cmd.ProcessState.SysUsage()`, reported through the unchanged `reportPeak` with
-a **distinct provenance marker** so a shim-derived sample is never confused with
-a cgroup-derived one. Its limit is stated rather than glossed: `ru_maxrss` is the
-maximum RSS of the child **and its reaped descendants**, not a
-simultaneous-total like `memory.peak`, so a job whose peak comes from many
-concurrent children is under-measured. That is an under-estimate in the
-permissive direction, so it is recorded in the residuals and surfaced in the
-provenance rather than presented as equivalent.
+There is no such marker. The confine-report wire frame carries only
+signature/oom/peak_rss, and the `runs` projection has no provenance column, so
+that would have been an unscoped wire + schema change absent from §9's own file
+list. And an UNMARKED `ru_maxrss` sample must never enter the cgroup-derived
+history: `ru_maxrss` is the maximum RSS of the direct child and its REAPED
+descendants, not a simultaneous total like `memory.peak`, so a job whose peak
+comes from many concurrent children is under-measured — in the PERMISSIVE
+direction, which is the one that matters.
+
+So shim mode reports **no** peak at all: `reportPeak` is not called, and the
+trailer reads `peak-rss=unevaluated`. Under the architectural-simplicity rule
+this is the right trade, and the cost is small in the deployment shape this
+ticket targets: a fresh Batch container starts with an EMPTY history, so the
+estimator would not have learned anything usable within one container's life
+either way. Recorded as residual 2.
 
 ### 5.4 The flag surface stays exactly as it is (requirement 6)
 
@@ -604,6 +739,31 @@ narrower than it was originally framed but real.
   constant `waitEmpty` already uses — reused, not a new tunable) for the group to
   exit, then `unix.Kill(-pgid, SIGKILL)`.
 
+**[C9] The ORDER inside `onSignal`, which must NOT copy the real path's shape.**
+On the real path `onSignal` calls `cleanup()` — `scope.Kill`, i.e.
+`cgroup.kill`/SIGKILL — BEFORE `forwardConfineSignals` delivers the received
+signal, so the forwarded SIGTERM lands on an already-dead child. Copying that
+here would make this whole requirement's claim false: the grace would elapse
+against processes that never got the chance to run a handler.
+
+Required order in shim mode, and what is built:
+
+1. deliver the received signal to the process group SYNCHRONOUSLY inside
+   `onSignal` (the forwarder's own delivery immediately afterwards is a harmless
+   duplicate);
+2. then start the 2s grace;
+3. then `SIGKILL` the group.
+
+The grace can never elapse before the SIGTERM is sent, because the send precedes
+the sleep in program order. And no group signal is issued after `cmd.Wait()` has
+returned: `confineCommand.markReaped()` is called on the very next statement
+after the wait, and `signal()` is a no-op past it, so a recycled pgid can never
+be signalled.
+
+Test (g) case 1 uses a grandchild whose SIGTERM handler takes MEASURABLE TIME
+(0.3s) before writing its marker, so a SIGKILL-first bug fails it. A handler that
+returned instantly would pass either way.
+
 **Two correctness details that must be in the implementation and in review.**
 
 1. `Setpgid` puts the child *outside* the supervisor's process group. A terminal
@@ -638,34 +798,79 @@ using the **shared** `shimLaunchAttrs` + group-signal helpers from §5.6, with i
 cgroup-derived telemetry facets reporting their established unevaluated values
 and the same `containment: advisory` projection.
 
-**Recorded decision point, not a silent trim.** `run` carries a much larger
-surface than `confine` (project ledger, telemetry, PTY, `--detach`). If
-integration proves to need more than the shared helper, `run` is deferred to a
-follow-up ticket and this change ships confine-only — and that fork is written
-down in the ticket resolution and reported to the owner, never quietly taken.
+**The fork was TAKEN, and this is the record of it.** `run` carries a much larger
+surface than `confine` — project ledger, telemetry, PTY, `--detach`, per-run
+scope caps, the AIRA-20 descendant-escape attestation, all keyed on a real cgroup
+scope. Fitting the shim launch through it is a separate piece of work, and the
+deployment shape this ticket exists for (a Batch container running
+`aira confine -- make ...`) does not use it.
+
+So `Runner.Launch` REFUSES in shim mode, at the top, with
+`E_RUN_SCOPE_UNAVAILABLE` naming `aira confine` as the shim-capable verb —
+rather than silently attempting a scope creation that fails deep inside the
+launch AFTER the ledger has been written to. The follow-up is **AIRA-129**, and
+it is named in the refusal itself. Reported in the ticket resolution, never
+quietly taken.
 
 ---
 
 ## 6. Honest reporting: the `containment` facet (requirement 3)
 
-One new field on `ConfineStatus`, with exactly **two** values, both always
-established, so it can never render as a fake zero or an absent facet:
+One new field on `ConfineStatus`, with **three** values — not the two v1
+proposed. v1's argument was that both are always established; that is untrue for
+a launch that aborted before the finite-cap gate ran, and rendering `enforced`
+for such a status would be a fabricated containment claim, the single most
+misleading value this trailer could carry.
 
 ```go
 type ConfineContainment string
 
 const (
-    ConfineContainmentEnforced ConfineContainment = "enforced" // per-job cgroup scope + cgroup.kill
-    ConfineContainmentAdvisory ConfineContainment = "advisory" // ci-shim: ledger admission only
+    ConfineContainmentEnforced    ConfineContainment = "enforced"
+    ConfineContainmentAdvisory    ConfineContainment = "advisory(ci-shim,no-cgroup,no-kill-backstop)"
+    ConfineContainmentUnevaluated ConfineContainment = "unevaluated"
 )
 ```
 
+The advisory value spells out all three absences because `advisory` alone reads
+as a weaker flavour of the same guarantee. `enforced` is set at exactly one
+point — after the finite-cap gate passed, the scope exists and
+`memory.oom.group` is set — so all three legs of the claim are established facts
+when it is made.
+
 `FormatConfineStatus` — already the single operator-facing projection — renders
-`containment=enforced` or
-`containment=advisory(ci-shim,no-cgroup,no-kill-backstop)`. Because it is one
-projection, the foreground trailer, `confine --list`, `confine --status`, the
-AIRA-22 detached-job record and the TUI all get it without further work, which
-is what makes them impossible to drift apart. That is test (c).
+the facet on EVERY trailer, on the same always-rendered discipline as
+`terminated-by` and `scope-swap.max`. Because it is one projection, the
+foreground trailer, `confine --status`, the AIRA-22 detached-job record and the
+TUI all get it without further work.
+
+**[C2] `confine --list` and `--kill` do NOT come for free, contrary to v1.**
+`Server.confineManagement` calls `runner.ListConfines` directly — not through the
+`admitConfineScan` seam — and `resolveConfineManagementPath("")` calls
+`runner.ResolveConfineManagementSlice`, which resolves the REAL `aira.slice`
+cgroup. In shim mode `--list` would `os.ReadDir` a path that does not exist and
+answer `UNEVALUATED`/`E_CONFINE_UNAVAILABLE` on every invocation, and `--kill`
+(cgroup.kill-based) could not work at all. Both are fixed explicitly:
+
+- **`--list`**: `resolveConfineManagementPath` returns the sentinel in shim
+  mode, and the list is rendered by a new `runner.ShimConfineList(registry)`
+  that skips the cgroup `ReadDir` entirely and builds rows from the daemon's
+  granted-waiter registry through the existing `mergeConfineRegistry` (moved to
+  a portable file). Every row is `Pending` with populated/rss/cap named
+  unevaluated — there is no cgroup to read them from, and zeros would state that
+  the jobs are idle and uncapped. The reserve summary line carries
+  `[containment: advisory(...); advisory budget from <source>]`, on the SAME
+  line as the numbers it qualifies, because the number and the strength of the
+  guarantee behind it must never be readable apart.
+- **`--kill`**: an HONEST REFUSAL, never a fabricated "killed" and never a
+  best-effort signal called one. `runner.ShimConfineKill` resolves the selector
+  through the same matching and ownership rules the real path applies, then
+  refuses with `U_CONFINE_KILL_UNCONFIRMED` and NAMES THE SUPERVISOR PID to
+  signal (`kill <pid>`), whose forwarder does the group kill. The ownership
+  guard runs BEFORE the pid is disclosed, so a refusal cannot leak another
+  session's supervisor pid.
+- **The SKILL text**, which today says `confine --kill` is THE way to stop a
+  job, states the shim behaviour explicitly.
 
 Every cgroup-derived facet keeps its **existing** unevaluated value in shim mode
 rather than gaining a new spelling — one vocabulary per primitive:
@@ -683,9 +888,8 @@ rather than gaining a new spelling — one vocabulary per primitive:
 | `Priorities` | `ConfinePrioritiesApplied` when applied | `nice`/`ionice` genuinely work without cgroups — a real fact, kept |
 | `Admission` / `ReserveBytes` / `ReserveBasis` | fully meaningful | The ledger admission really happened |
 
-`confine --list`'s existing `slice reserve: <granted>/<ceiling> across N job(s)`
-summary line gains the mode: `slice reserve: … (ci-shim advisory budget from
-container cgroup memory.max)`.
+`ConfineSliceReserve` gains `Containment` and `BudgetSource`, both empty in real
+mode so every existing summary line is byte-identical.
 
 This follows the project's own established idiom for this class of trade-off —
 aitest's "mark unevaluated rather than run unconfined silently" — rather than
@@ -725,8 +929,8 @@ recorded in the test's own doc comment. Heavy commands run under
 |---|---|---|---|
 | **a** | Probe forced to fail → shim mode; plain-process daemon; confine/run succeed with **no cgroup scope created** | `internal/install/ci_shim_mode_test.go`, `internal/runner/confine_shim_linux_test.go` | Injected `installDeps.run` fails `systemctl --user`; asserts `mode=="ci-shim"` in `install-mode.json`, that **no** systemd argv was ever run (the fake records every `d.run`), and — the load-bearing half — that the confine launch issued **zero** `mkdir`/`openat` against any cgroup path, via a `confineDeps` whose `newBackend` **panics if called**. A "we attempted and it failed gracefully" implementation therefore fails the test, which is exactly requirement 2's distinction. |
 | **b** | Ledger gates admission: job 2 queues while job 1 has booked the budget, and is admitted when job 1 completes | `internal/daemon/shim_ledger_test.go` | Real `Server` with `confineMode=shim` and a small injected budget; job 1 pins a reserve covering it; job 2's `grantedCh` must **not** close within the poll window (asserted by a timed negative), then must close after job 1's release. The negative half is what fails against a no-op ledger; a wrong implementation that admits everything passes only the positive half. |
-| **c** | `--list`/`--status` report advisory containment, distinguishably from the real-slice case | `internal/runner/confine_status_test.go` | Table over `FormatConfineStatus`: shim status must contain `containment=advisory` **and** must not contain `cap=enforced`; the real status must contain `containment=enforced`. Plus an assertion that `CapBytes==0` in shim mode even when a budget is configured — the specific fabrication §6 forbids. |
-| **d** | A real aitest suite completes in shim mode end-to-end | `internal/pylib/pytest_aitest_shim_e2e_test.go` + `internal/pylib/aitest/test_supervisor.py` | Runs a real pytest suite against a shim-mode daemon whose `worker-admit` answers `unevaluated`; asserts exit 0, **all** tests collected and reported, exactly **one** fallback warning, and **no** `admit` subprocess placement — mirroring the existing `test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subprocess`, which is the proof it is a real end-to-end run and not a stub. |
+| **c** | `--list`/`--status` report advisory containment, distinguishably from the real-slice case | `internal/runner/confine_shim_linux_test.go`, `internal/daemon/shim_test.go` | **[C2] Rewritten on the corrected mechanism.** Two halves. (1) `FormatConfineStatus`: the shim status must contain `containment=advisory(ci-shim,no-cgroup,no-kill-backstop)` and must NOT contain `cap=enforced`; the real one must contain `containment=enforced`; an UNSET facet must read `unevaluated`, never enforced. Plus `CapBytes==0` in shim mode even with a budget configured — the fabrication §6 forbids. (2) Against a real shim `Server`: `confine-list` must answer OK (not UNEVALUATED, which is what the uncorrected `ListConfines` path would return), must render the granted waiter's row from the registry, and its reserve summary must carry the advisory containment and budget source. `confine-kill` must FAIL with `U_CONFINE_KILL_UNCONFIRMED` and name a pid to signal — a fabricated `killed` fails it. |
+| **d** | A real aitest suite completes in shim mode end-to-end | `internal/pylib/aitest/test_supervisor.py` | **[C1] Rewritten on the corrected mechanism, and BOUNDED.** The stubs are the exact wire answers a shim install produces: `aitest-bootstrap` exits non-zero, and `worker-admit` prints `state=unavailable class=admission-unusable reason=ci-shim-no-sub-scope`. Asserts the FALLBACK POOL RAN — `daemon_available is False`, every collected test reported `passed`, exactly ONE `aira aitest:` line — and the whole run is bounded by a 60s wall-clock deadline that the test FAILS on. The deadline is the load-bearing part: v1's `state=unevaluated` design carries `class=contended`, which is retriable, so `_wait_for_admission_or_disable` would poll forever and an infinite-wait regression must fail rather than hang. A second test pins the classification directly: that exact outcome line must map to `WorkerAdmitUnavailable` and NOT to `WorkerAdmitDenied`. |
 | **e** | `--memory-max/--memory-reserve/--delegate-ram` all parse and run in shim mode | `internal/runner/confine_shim_linux_test.go` | Runs the consumer's literal invocation shape (`--memory-max 32G --memory-reserve 512M -- <helper>`) end to end in shim mode and asserts exit 0. Second assertion, the one that catches a lazy "ignore them all": `--memory-max 32G` without `--delegate-ram` must produce a **ledger charge of 32G** (read off the admit request), proving the flag is live-as-a-declaration per §5.4, not discarded. |
 | **f** | Shim `--delegate-ram` does **not** set `AIRA_AITEST_LIB` in the child env | `internal/runner/confine_shim_env_test.go` | The child is a helper that dumps `os.Environ()` to a file; the test asserts the **actual child environment** has no `AIRA_AITEST_*` key. Includes an inheritance case: the supervisor is given a live `AIRA_AITEST_LIB` in its own env and the child must still not have it (proves the *strip*, not merely the not-set). Ticket-mandated: never inspect the flag path alone. |
 | **g** | Group signal reaches a grandchild; documented exception for a detached descendant | `internal/runner/confine_shim_signal_linux_test.go` | Child forks a grandchild that writes a marker file on SIGTERM; the test signals the **confine supervisor** and asserts the grandchild's marker appears. Fails against today's single-PID `child.Signal`, which is the required counterexample. Second, **negative** case: a grandchild that `setsid()`s first must **not** receive it — the escape is asserted, matching the documented exception rather than hiding it. Third: SIGKILL escalation fires after the grace when the group ignores SIGTERM. |
@@ -776,7 +980,10 @@ AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1
 | `internal/daemon/admit.go` | shim `--exclusive` refusal; `liveScopesKnown`/`capAggregateKnown` in shim mode |
 | `internal/daemon/worker_admit.go` | shim `unevaluated` response |
 | `internal/core/skill.go` | shim-mode text: advisory containment, the setsid exception, `AIRA_AITEST_LIB` interim |
-| `cmd/aira/main.go` | `confine --list` summary line gains the mode. **`parseConfineArgs` untouched** (requirement 6). |
+| `cmd/aira/main.go` | `confine --list` summary line gains the containment/budget-source qualifier; `aitest-bootstrap` refuses in shim mode (**[C1]**). **`parseConfineArgs` untouched** (requirement 6). |
+| `internal/runner/confine_shim_manage.go` | **new [C2]** — `ShimConfineList`, `ShimConfineKill`, and `mergeConfineRegistry` moved here from the Linux-only scan file so the shim list path compiles on every platform the daemon does. |
+| `internal/runner/worker_admit_outcome.go` | **[C1]** the `ci-shim-no-sub-scope` reason token. |
+| `internal/pylib/aitest/test_supervisor.py` | **[C1]** ticket test (d), rewritten on the corrected wire answers and bounded by a deadline. |
 
 ---
 
@@ -786,10 +993,14 @@ AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1
    in-flight jobs finish (§4.4 item 4). AIRA-74's reconstruction has nothing to
    reconstruct from. Accepted; advisory guarantee; no second persistence
    mechanism.
-2. **`ru_maxrss` under-measures a many-concurrent-children job** relative to
-   `memory.peak` (§5.3), so the AIRA-67 estimator learns a permissive number in
-   shim mode. Surfaced through a distinct provenance marker rather than blended
-   with cgroup-derived samples.
+2. **[C10] No peak-RSS feedback at all in shim mode** (§5.3), so the AIRA-67
+   estimator never learns from a shim run and every unpinned shim job falls back
+   to the machine-wide prior. Accepted rather than fixed with `ru_maxrss`, which
+   would have needed a wire field, a schema column and estimator handling for
+   shim samples — and which under-measures a many-concurrent-children job in the
+   permissive direction. A fresh Batch container has an empty history anyway, so
+   the estimator would not have learned anything usable within one container's
+   life. `peak-rss` reads `unevaluated`.
 3. **A `setsid`/double-forked descendant escapes the group signal** (§5.6). No
    non-cgroup mechanism reaches it. Documented in three places and asserted by a
    negative test.
@@ -797,13 +1008,18 @@ AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1
    killed; on a single-tenant CI box that costs one job rerun rather than
    collateral damage to a shared session — the owner's own framing via `deploy`,
    and the reason advisory admission is worth having.
-5. **`aira run` may prove larger than the shared helper** (§5.7). Explicit
-   decision point: defer `run` to a follow-up and ship confine-only, reported,
-   never silently trimmed.
-6. **`/proc/meminfo` in the `meminfo-memtotal` fallback is host-wide** on most
-   runtimes. That fallback is only reached when the container declares no
-   memory limit — in which case the machine genuinely is the budget — but it is
-   recorded as the weaker source and printed as such.
+5. **`aira run` is NOT supported in shim mode** (§5.7). The fork was taken: it
+   refuses with `E_RUN_SCOPE_UNAVAILABLE` naming `aira confine`, and the
+   follow-up is AIRA-129. Reported, never silently trimmed.
+6. **[C8, corrected] `/proc/meminfo` in the `meminfo-memtotal` fallback is
+   host-wide** on most runtimes. v1 said this fallback "is only reached when the
+   container declares no memory limit — in which case the machine genuinely is
+   the budget". **That is wrong** whenever a node runs more than one container
+   without a per-container `memory.max`: GCP Batch with `taskCountPerNode > 1`
+   is exactly that shape, and there every task would book against the WHOLE
+   node. The answer is `--memory-max` at install, which records
+   `shim_budget_source=declared`; the fallback stays as the last resort, is
+   recorded as the weaker source, and is printed as such.
 
 ---
 
@@ -821,3 +1037,26 @@ AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1
 - Every weakening relative to the real slice is named at the point of use, in
   the project's existing unevaluated/advisory vocabulary, so nothing claims a
   containment guarantee it does not have.
+
+---
+
+## 12. v2 changelog — the gate conditions, and what each one changed
+
+v1 was gated GATE-PASS-WITH-CONDITIONS. Every condition below is folded into the
+section named beside it; this table exists so a build review can check the fold
+rather than re-derive it.
+
+| # | What v1 got wrong | What v2 says instead | Section |
+|---|---|---|---|
+| C1 | `worker-admit` answering `state=unevaluated` would HANG aitest, not fall it back: that carries `class=contended`, which supervisor.py retries indefinitely. | `state=unavailable` / `class=admission-unusable`, added to the poll loop's break set; `aitest-bootstrap` refuses in shim mode too, so `_disable_daemon` fires at bootstrap. Test (d) asserts the fallback POOL ran and is bounded by a deadline. | §4.5, §7, test (d) |
+| C2 | The claim that `--list`/`--kill` get the containment facet "without further work" was false — `confineManagement` calls `ListConfines` and the real slice resolver directly. | A shim `--list` rendered from the granted-waiter registry with the advisory wording on the reserve line; an honest `--kill` refusal naming the supervisor PID; SKILL text corrected. | §6, test (c) |
+| C3 | Root / `docker build` handling was missing entirely, and `reexecRequestFor` forwarded only a bare `--ci`. | The mode decision precedes the euid branch; a root shim install uses the current user's own HOME with no session check, no `/etc`, no linger; `--stage=build` never reaches dropins/linger in any mode; the re-exec forwards `--ci=<value>` and `--stage=<value>`. | §3.2 |
+| C4 | `waitDaemonReachable` cannot be reused (it is pure `systemctl --user show`), and "≤10s" misstated its 5s budget. | A new socket-based `waitShimDaemonReachable` over `daemon.Status`, bounded at 10s, non-zero exit on failure. | §3.5 |
+| C5 | The daemon learned its mode only from transcribed env, so the dispatcher spawn and a manual `daemon serve` would produce a REAL daemon in a shim home — and a shim job would then launch UNGATED. | `daemon serve` reads `install-mode.json` itself; env retained only as the test/override seam. Also stated: a shim job whose daemon is down runs with `admission=unevaluated` on the trailer. | §3.3, §5.2 |
+| C6 | "Make the shim scan leave `liveScopesKnown` false" is not buildable through the seam; it would fabricate a scan failure with real side effects. | `--exclusive` refused in `admitConnection` before enqueue; `liveScopesKnown` untouched; the test asserts no scan-failure log line and no armed abort anchor. | §4.4 item 2 |
+| C7 | Classifying probe absence off the run's error cannot work behind `timeout 10s`. | An injectable `lookPath` seam checked before the run, and classification on the ANSWER not the exit status; unit tests for systemctl-absent, timeout-absent, and D-Bus-failure. | §2.1 |
+| C8 | `--memory-max` refused under `--ci=shim`, and residual 6 wrongly said the MemTotal fallback means "the machine genuinely is the budget". | `--memory-max` accepted as the declared ledger budget (`shim_budget_source=declared`), refused only under `--ci=auto`; residual 6 corrected. | §2.2, residual 6 |
+| C9 | The shim `onSignal` would have copied the real path's kill-then-forward order, so the grace would elapse against already-dead processes. | Deliver the signal to the group synchronously, THEN grace, THEN SIGKILL; no group signal after `cmd.Wait()`. Test (g) case 1 uses a slow SIGTERM handler. | §5.6, test (g) |
+| C10 | `ru_maxrss` "with a distinct provenance marker" is an unscoped wire + schema change, and an unmarked sample would poison the cgroup-derived history. | Dropped for this ticket: no peak is reported in shim mode, `peak-rss=unevaluated`, recorded as residual 2. | §5.3, residual 2 |
+| C11 | `install-mode.json` at `<StateHome>/install-mode.json` — but `StateHome` is the shared XDG state home. | `<StateHome>/aira/install-mode.json`, beside `state.db`. | §3.3 |
+| C12 | Only watchdog/ceiling/oom-steer were named as off. | The AIRA-72 scope reaper and the stale-lease sweep it shares a pass with are off too, enumerated in a table, with a note on why the admission confine scan stays live. | §3.5 |

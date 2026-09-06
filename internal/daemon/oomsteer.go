@@ -380,11 +380,7 @@ func (s *Server) runOOMSteer(ctx context.Context, mode oomSteerMode, interval ti
 func realOOMSteerDeps(s *Server) oomSteerDeps {
 	return oomSteerDeps{
 		resolveSlice: func() (string, bool, string) {
-			resolve := s.admitResolveSlice
-			if resolve == nil {
-				resolve = resolveAdmitSlicePath
-			}
-			return resolve(runner.DefaultConfineSlice)
+			return s.sliceResolver()(runner.DefaultConfineSlice)
 		},
 		readSliceParts:   readSliceCeilingParts,
 		readScopeCurrent: readSliceCeilingCurrent,

@@ -235,6 +235,22 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if len(req.Argv) == 0 || req.Argv[0] == "" {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("target argv is empty"))
 	}
+	// AIRA-121, and this is a RECORDED DECISION rather than an oversight (plan
+	// section 5.7, residual 5). `aira run` carries a far larger surface than
+	// `aira confine` -- the project ledger, telemetry, PTY, --detach, per-run
+	// scope caps, the descendant-escape attestation -- all of it keyed on a real
+	// cgroup scope. Fitting the shim launch through it is a separate piece of
+	// work, and the deployment shape this ticket exists for (a GCP Batch
+	// container running `aira confine -- make ...`) does not use it.
+	//
+	// So `run` REFUSES in shim mode rather than silently attempting a scope
+	// creation that will fail with E_RUN_SCOPE_UNAVAILABLE deep inside the launch,
+	// after the ledger has already been written to. Refusing here is the honest
+	// degradation the ticket asks for; the follow-up is tracked as AIRA-129.
+	if ResolveConfineMode() == ConfineModeShim {
+		return nil, launchErr("E_RUN_SCOPE_UNAVAILABLE", errors.New(
+			"ci-shim mode has no cgroup scope for a project run; use `aira confine -- <argv>`, which has an advisory ci-shim path (AIRA-129 tracks `aira run` support)"))
+	}
 	if err := validateScopeMemoryCap(req.ScopeMemoryMax, req.ScopeMemoryHigh); err != nil {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", err)
 	}
