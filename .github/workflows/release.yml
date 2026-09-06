@@ -2,7 +2,7 @@ name: Release
 
 # Triggered on version tags matching ^v\d+(\.\d+)?$ — e.g. v0, v0.1, v1, v1.2
 # (two-part max; v1.2.3 does NOT match). Pushing such a tag builds a static
-# linux/amd64 binary and publishes it as a GitHub Release.
+# linux/amd64 + linux/arm64 binary pair and publishes them as a GitHub Release.
 on:
   push:
     tags:
@@ -16,6 +16,9 @@ jobs:
   release:
     name: build + publish release
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
 
@@ -25,26 +28,55 @@ jobs:
           cache: true
 
       # AIRA is a single static, cgo-free Go binary (Linux-only: cgroups,
-      # systemd, aira.slice). CGO_ENABLED=0 yields a fully static ELF;
-      # -trimpath strips local paths (reproducible, no path leakage);
-      # -ldflags "-s -w" strips debug info for a smaller artifact.
-      - name: Build static linux/amd64 binary
+      # systemd, aira.slice). CGO_ENABLED=0 yields a fully static ELF (both
+      # architectures cross-compile cleanly from this amd64 runner since
+      # there is no cgo to cross-link); -trimpath strips local paths
+      # (reproducible, no path leakage); -ldflags "-s -w" strips debug info
+      # for a smaller artifact.
+      - name: Build static linux/${{ matrix.goarch }} binary
         env:
           CGO_ENABLED: "0"
           GOOS: linux
-          GOARCH: amd64
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          go build -trimpath -ldflags "-s -w" -o aira-linux-amd64 ./cmd/aira
-          sha256sum aira-linux-amd64 | tee aira-linux-amd64.sha256
-          file aira-linux-amd64
+          out="aira-linux-${{ matrix.goarch }}"
+          go build -trimpath -ldflags "-s -w" -o "$out" ./cmd/aira
+          sha256sum "$out" | tee "$out.sha256"
+          file "$out"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aira-linux-${{ matrix.goarch }}
+          path: |
+            aira-linux-${{ matrix.goarch }}
+            aira-linux-${{ matrix.goarch }}.sha256
+          retention-days: 1
+
+  publish:
+    name: publish GitHub release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          ls -la dist
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            aira-linux-amd64 \
-            aira-linux-amd64.sha256 \
+            dist/aira-linux-amd64 \
+            dist/aira-linux-amd64.sha256 \
+            dist/aira-linux-arm64 \
+            dist/aira-linux-arm64.sha256 \
             README.md
