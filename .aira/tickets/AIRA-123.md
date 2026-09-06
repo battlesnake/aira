@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-123","project":"aira","title":"aitest worker-admit: degrade to ledger-only admission when no cgroup sub-scope is available","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","ci"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-123","project":"aira","title":"aitest worker-admit: degrade to ledger-only admission when no cgroup sub-scope is available","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","ci"],"hold":false,"relations":[]}
 ---
 Requested by the owner via peer session 'deploy', 2026-09-06, correcting AIRA-121's
 requirement 7 before it was built.
@@ -72,12 +72,19 @@ worker-admit with no cgroup -- is worse than plain xdist), but is a deliberate
 DEFERRAL pending this ticket, not the intended end state. Do not let a future
 reader treat requirement 7 as case-closed.
 
-## Resolution (in-review)
+## Resolution (done — PR #73 merged as `585c686`, 2026-09-06)
 
-Built on `aira121-ci-shim-mode` (PR #72), which is where ci-shim mode and the
-job-level ledger live and which is NOT yet on master; this branch is stacked on
-it. Plan:
+Built on ci-shim mode and the job-level ledger from AIRA-121 (PR #72, merged
+as `8f134ee`); this branch was originally stacked on that PR and was rebased
+onto master once it landed. Plan:
 `docs/superpowers/plans/2026-09-06-aira123-worker-admit-ledger-only-plan.md`.
+
+Final build-review (Fable, adversarial): build/vet/real-cgroup test all exit 0
+from a clean detached worktree at `b315bf4`; mutation probes confirmed the
+load-bearing tests are non-porous (no-op ledger booking, reverted
+`fork_worker` None guard, dropped backend-mismatch check, re-enabled shim
+strip of `AIRA_AITEST_LIB`, renamed `containment` wire key — each fails its
+own test). Accepted coverage gaps stand as recorded in the plan.
 
 ### What was built, against each requirement
 
