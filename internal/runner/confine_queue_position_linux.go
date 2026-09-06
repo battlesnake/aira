@@ -46,7 +46,12 @@ type confineQueuePosition struct {
 	// round trip, no new verb -- and empty whenever the daemon did not report
 	// it (older daemon, subsystem off, or ceiling unevaluated).
 	ceilingThrottled bool
-	memAvailable     int64
+	// ceilingBasis (AIRA-106) is which policy term reduced the ceiling:
+	// "system-pressure" or "machine-reserve". They are different facts about the
+	// world and a launcher told the wrong one goes looking for the wrong cause,
+	// so an unrecognised or absent basis names NEITHER.
+	ceilingBasis string
+	memAvailable int64
 }
 
 // confineQueueProbeTimeout bounds one probe. It is deliberately far shorter
@@ -138,9 +143,26 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// looking for the wrong cause.
 	pressure := ""
 	if position.ceilingThrottled {
-		pressure = ", slice ceiling reduced by memory used outside the slice"
-		if position.memAvailable > 0 {
-			pressure += " (system MemAvailable " + FormatConfineBytes(position.memAvailable) + ")"
+		// AIRA-106. The cause is named from the basis, never assumed. Before it,
+		// this line asserted external memory pressure for every reduced ceiling;
+		// the static machine-reserve term makes that false on an idle box.
+		// The basis names WHICH POLICY TERM bound the ceiling, which is what the
+		// daemon actually established. It is deliberately not restated as a fact
+		// about the machine: the dynamic term can bind on a perfectly idle box if
+		// the configured free-memory reserve is large, so "reduced by memory used
+		// outside the slice" would be an assertion the comparison does not support.
+		// The MemAvailable figure beside it is what lets a launcher tell an idle
+		// machine from a loaded one.
+		switch position.ceilingBasis {
+		case "system-pressure":
+			pressure = ", slice ceiling reduced to keep the configured system free-memory reserve"
+			if position.memAvailable > 0 {
+				pressure += " (system MemAvailable " + FormatConfineBytes(position.memAvailable) + ")"
+			}
+		case "machine-reserve":
+			pressure = ", slice ceiling reduced to keep the configured share of this machine outside the slice"
+		default:
+			pressure = ", slice ceiling reduced below the configured ceiling"
 		}
 	}
 	if position.position <= 0 || position.queued < position.position {
@@ -285,7 +307,13 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	// still applied, so it is still reported -- but its MemAvailable figure is up
 	// to a TTL old, so the figure is dropped and only the fact is stated.
 	exclusive.ceilingThrottled = reserve.CeilingMode == "enforce" && reserve.CeilingState == "throttled"
-	if exclusive.ceilingThrottled && !reserve.CeilingHeld && reserve.MemAvailableBytes > 0 {
+	exclusive.ceilingBasis = reserve.CeilingBasis
+	// AIRA-106. The MemAvailable figure is reported only when system pressure is
+	// what actually reduced the ceiling. Under the static machine-reserve term
+	// MemAvailable is not the cause, and printing it beside the wait would invite
+	// exactly the wrong diagnosis.
+	if exclusive.ceilingThrottled && exclusive.ceilingBasis == "system-pressure" &&
+		!reserve.CeilingHeld && reserve.MemAvailableBytes > 0 {
 		exclusive.memAvailable = reserve.MemAvailableBytes
 	}
 	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead

@@ -163,6 +163,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// the renderer prints nothing rather than a fabricated state.
 				CeilingMode:        string(ceiling.Mode),
 				CeilingState:       ceiling.State,
+				CeilingBasis:       ceiling.Basis,
 				CeilingReason:      ceiling.Reason,
 				CeilingHeld:        ceiling.Held,
 				CeilingStaticBytes: ceiling.StaticMax,

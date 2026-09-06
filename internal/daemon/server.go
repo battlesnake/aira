@@ -228,7 +228,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	sliceCeilingMode, sliceCeilingInterval, err := sliceCeilingConfigFromEnv()
+	sliceCeilingMode, sliceCeilingInterval, sliceCeilingPolicyFromEnv, err := sliceCeilingConfigFromEnv()
 	if err != nil {
 		return err
 	}
@@ -388,16 +388,22 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	sliceCeilingDone := make(chan struct{})
 	sliceCeilingRuntimeDeps := sliceCeilingDeps{}
 	if sliceCeilingMode != sliceCeilingOff {
-		memTotal, memTotalOK := readMemTotal()
-		if !memTotalOK {
-			// The reserve is a fraction of MemTotal, so an unreadable MemTotal
-			// leaves it unestablished. Refuse to run rather than silently
-			// substitute a value: an over-large reserve would throttle a healthy
-			// machine, which is a capacity decision nobody made.
-			log.Printf("aira daemon: slice ceiling disabled: MemTotal unreadable, so the system reserve cannot be established")
+		// AIRA-106. MemTotal is read ONCE, here: the static "leave this much on
+		// the table" term is derived from it and does not change, which is what
+		// lets the damping window carry only the pressure term.
+		policy := sliceCeilingPolicyFromEnv
+		policy.memTotal, _ = readMemTotal()
+		if refusal := policy.refusal(); refusal != "" {
+			// Refuse rather than silently substitute or clamp. An unreadable
+			// MemTotal leaves the static term unestablished; an unusable pair of
+			// parameters would freeze admission or target a state inside the
+			// watchdog's kill band. Either way it is a capacity decision nobody
+			// made, and "off" is exactly today's behaviour, so parking with the
+			// numbers named is the honest answer.
+			log.Printf("aira daemon: slice ceiling disabled: %s", refusal)
 			sliceCeilingMode = sliceCeilingOff
 		} else {
-			sliceCeilingRuntimeDeps = realSliceCeilingDeps(s, clampSliceCeilingReserve(memTotal))
+			sliceCeilingRuntimeDeps = realSliceCeilingDeps(s, policy)
 			sliceCeilingRuntimeDeps.ttl = sliceCeilingTTLFor(sliceCeilingInterval)
 		}
 	}

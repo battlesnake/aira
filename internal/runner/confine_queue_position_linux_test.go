@@ -264,19 +264,36 @@ func TestConfineQueueNoteReportsAReducedCeilingOnlyWhenEnforced(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		mode, state  string
+		basis        string
 		memAvailable int64
 		want         string
 		absent       string
 	}{
 		{
-			name: "enforced-throttle", mode: "enforce", state: "throttled", memAvailable: 6 << 30,
-			want: "slice ceiling reduced by memory used outside the slice (system MemAvailable 6G)",
+			name: "enforced-throttle", mode: "enforce", state: "throttled", basis: "system-pressure", memAvailable: 6 << 30,
+			want: "slice ceiling reduced to keep the configured system free-memory reserve (system MemAvailable 6G)",
 		},
 		{
-			name: "enforced-throttle-without-a-reading", mode: "enforce", state: "throttled",
-			want: "slice ceiling reduced by memory used outside the slice,", absent: "MemAvailable",
+			name: "enforced-throttle-without-a-reading", mode: "enforce", state: "throttled", basis: "system-pressure",
+			want: "slice ceiling reduced to keep the configured system free-memory reserve,", absent: "MemAvailable",
 		},
-		{name: "observe-applies-nothing", mode: "observe", state: "throttled", memAvailable: 6 << 30, absent: "slice ceiling"},
+		{
+			// AIRA-106. The STATIC machine-reserve term reduced this ceiling.
+			// Naming pressure here would send a blocked launcher looking for memory
+			// nothing is using, and printing the MemAvailable figure beside it would
+			// invite exactly that diagnosis -- so the figure is withheld, since it is
+			// not the cause.
+			name: "enforced-throttle-by-the-machine-reserve", mode: "enforce", state: "throttled",
+			basis: "machine-reserve", memAvailable: 40 << 30,
+			want:   "slice ceiling reduced to keep the configured share of this machine outside the slice",
+			absent: "MemAvailable",
+		},
+		{
+			// An absent or unrecognised basis names NEITHER cause.
+			name: "enforced-throttle-without-a-basis", mode: "enforce", state: "throttled", memAvailable: 6 << 30,
+			want: "slice ceiling reduced below the configured ceiling", absent: "free-memory reserve",
+		},
+		{name: "observe-applies-nothing", mode: "observe", state: "throttled", basis: "system-pressure", memAvailable: 6 << 30, absent: "slice ceiling"},
 		{name: "unevaluated", mode: "enforce", state: "unevaluated", absent: "slice ceiling"},
 		{name: "subsystem-off", absent: "slice ceiling"},
 	} {
@@ -284,7 +301,8 @@ func TestConfineQueueNoteReportsAReducedCeilingOnlyWhenEnforced(t *testing.T) {
 			socket, _ := fakeConfineListDaemon(t, func(map[string]any) runnerAdmitResponseFrame {
 				return confineListReply(t, &ConfineSliceReserve{
 					Queued: 3, QueuePosition: 2, QueuedAheadBytes: 2 << 30,
-					CeilingMode: test.mode, CeilingState: test.state, MemAvailableBytes: test.memAvailable,
+					CeilingMode: test.mode, CeilingState: test.state, CeilingBasis: test.basis,
+					MemAvailableBytes: test.memAvailable,
 				})
 			})
 			request := ConfineRequest{AdmitSocketPath: socket, ScopeID: "CONFINE-job-5101-abc@session-a", Owner: "session-a"}

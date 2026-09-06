@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"aira/internal/runner"
 )
 
 type Paths struct {
@@ -148,27 +150,58 @@ func sliceCeilingModeFromEnv() (sliceCeilingMode, error) {
 	}
 }
 
-// sliceCeilingConfigFromEnv reads BOTH settings, and reads the interval only
-// when the subsystem is actually wanted.
+// sliceCeilingConfigFromEnv reads EVERY slice-ceiling setting, and reads all but
+// the mode only when the subsystem is actually wanted.
 //
 // That ordering is the whole point. This ships default-OFF, and the safety claim
 // made for it is that off is EXACTLY today's behaviour. Validating the interval
 // unconditionally broke that claim: a typo in AIRA_DAEMON_SLICE_CEILING_INTERVAL
 // would refuse to start the daemon even with the mode off. A deliberate
 // divergence from the watchdog's own pair, which parses both unconditionally.
-func sliceCeilingConfigFromEnv() (sliceCeilingMode, time.Duration, error) {
+// AIRA-106's two sizing variables follow the same rule.
+//
+// The returned policy carries MemTotal=0: only the caller can read MemTotal, and
+// it is the caller that decides whether the resulting policy is usable on this
+// machine (sliceCeilingPolicy.refusal).
+func sliceCeilingConfigFromEnv() (sliceCeilingMode, time.Duration, sliceCeilingPolicy, error) {
+	policy := sliceCeilingPolicy{reserveMax: sliceCeilingReserveMaxDefault, freeMin: sliceCeilingFreeMinDefault}
 	mode, err := sliceCeilingModeFromEnv()
 	if err != nil {
-		return "", 0, err
+		return "", 0, policy, err
 	}
 	if mode == sliceCeilingOff {
-		return mode, defaultSliceCeilingInterval, nil
+		return mode, defaultSliceCeilingInterval, policy, nil
 	}
 	interval, err := sliceCeilingIntervalFromEnv()
 	if err != nil {
-		return "", 0, err
+		return "", 0, policy, err
 	}
-	return mode, interval, nil
+	if policy.reserveMax, err = sliceCeilingSizeFromEnv(
+		"AIRA_DAEMON_SLICE_CEILING_RESERVE_MAX", sliceCeilingReserveMaxDefault); err != nil {
+		return "", 0, policy, err
+	}
+	if policy.freeMin, err = sliceCeilingSizeFromEnv(
+		"AIRA_DAEMON_SLICE_CEILING_FREE_MIN", sliceCeilingFreeMinDefault); err != nil {
+		return "", 0, policy, err
+	}
+	return mode, interval, policy, nil
+}
+
+// sliceCeilingSizeFromEnv parses one of AIRA-106's two sizing parameters through
+// the SHARED portable size parser (runner.ParseMemorySize), so "16G", "16GB",
+// "16GiB" and a bare byte count all mean the same thing here as they do on
+// `aira confine --memory-max`. A negative value is impossible through that parser
+// (it accepts no sign) but is rejected anyway rather than trusted.
+func sliceCeilingSizeFromEnv(name string, fallback int64) (int64, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	size, err := runner.ParseMemorySize(value)
+	if err != nil || size < 0 {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: %s must be a non-negative byte size such as 16G", name)
+	}
+	return size, nil
 }
 
 func sliceCeilingIntervalFromEnv() (time.Duration, error) {

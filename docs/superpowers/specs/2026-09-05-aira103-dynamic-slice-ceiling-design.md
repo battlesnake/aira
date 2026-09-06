@@ -8,6 +8,20 @@ actuator deviation in the ticket Resolution SUFFICES FOR THE BUILD, but the
 deviation and §3.1's consequence must be put to the owner before any live
 `enforce` flip.
 Ticket: `.aira/tickets/AIRA-103.md`
+
+> **SUPERSEDED IN PART by AIRA-106**
+> (`docs/superpowers/specs/2026-09-06-aira106-two-parameter-slice-ceiling-design.md`).
+> The ACTUATOR and the SIGNAL below are current and unchanged. What is superseded
+> is §3's reserve derivation: `sliceCeilingSystemReserve = min(MemTotal/4, 16 GiB)`
+> no longer exists, and with it the invariant that the throttle's target state
+> coincides with `watchdogRecoverMemAvailable`. The published ceiling is now
+> `min(MemTotal − reserveMax, affordable − freeMin)` with the owner's own
+> 16 GiB / 8 GiB defaults, both environment-configurable; `freeMin` sits on the
+> watchdog's KILL threshold rather than its recover threshold, which AIRA-106 §2.5
+> states, bounds and puts to the owner. §3.1's ≈38 GiB figure is likewise
+> superseded (≈47 GiB measured under the new formula). Everything else here —
+> Findings A–C, the no-write decision, the torn-read guard, `sliceAnon`, the
+> damping, the TTL hold, the `unevaluated` contract — stands as written.
 Related: AIRA-91 Part B (owner decision this implements), AIRA-16 half (2)
 (the *slice-internal* pressure trigger, still open and deliberately untouched),
 AIRA-29 (dynamic reserve — complementary), AIRA-102 (one motivating external
