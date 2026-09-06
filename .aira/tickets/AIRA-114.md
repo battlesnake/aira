@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-114","project":"aira","title":"Bound the aggregate over-subscription factor (sum of scope memory.max vs the slice ceiling)","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","oom","shared-slice","deferred-from-aira29"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-114","project":"aira","title":"Bound the aggregate over-subscription factor (sum of scope memory.max vs the slice ceiling)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","shared-slice"],"hold":false,"relations":[]}
 ---
 Deferred from AIRA-29 (dynamic reserve), reasoning in
 `docs/superpowers/specs/2026-09-06-aira29-dynamic-reserve-plan.md` §3.5 and residual §4e.

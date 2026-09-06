@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-115","project":"aira","title":"confine-reserve defaults its slice instead of inheriting the parent job's, mis-attributing sub-reservations","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","confine-reserve","accounting"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-115","project":"aira","title":"confine-reserve defaults its slice instead of inheriting the parent job's, mis-attributing sub-reservations","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["accounting","admission","confine","confine-reserve"],"hold":false,"relations":[]}
 ---
 Found during the AIRA-29 adversarial build review (Sol), then ground-checked in the source.
 PRE-EXISTING; AIRA-29 neither introduced nor worsened it, but it is now written down.

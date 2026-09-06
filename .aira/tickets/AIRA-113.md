@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-113","project":"aira","title":"Dynamic per-scope oom_score_adj steering for the residual aggregate-full slice OOM","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","oom","scheduler","deferred-from-aira29"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-113","project":"aira","title":"Dynamic per-scope oom_score_adj steering for the residual aggregate-full slice OOM","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","scheduler"],"hold":false,"relations":[]}
 ---
 Deferred from AIRA-29 (dynamic reserve), with reasoning recorded in
 `docs/superpowers/specs/2026-09-06-aira29-dynamic-reserve-plan.md` §3.6 and endorsed at P2

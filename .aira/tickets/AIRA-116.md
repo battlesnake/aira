@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-116","project":"aira","title":"No test proves Serve applies any of the daemon's parsed env settings","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["daemon","config","test-coverage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-116","project":"aira","title":"No test proves Serve applies any of the daemon's parsed env settings","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["config","daemon","test-coverage"],"hold":false,"relations":[]}
 ---
 Found during the AIRA-29 adversarial build review (Sol), then ground-checked. PRE-EXISTING and
 shared by every env setting the daemon parses, not specific to AIRA-29.
