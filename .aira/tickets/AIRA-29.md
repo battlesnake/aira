@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-29","project":"aira","title":"Dynamic reserve: charge admission by live memory.current + headroom (track-actual), fill the slice to real capacity","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","oom","scheduler","shared-slice","utilisation"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-29","project":"aira","title":"Dynamic reserve: charge admission by live memory.current + headroom (track-actual), fill the slice to real capacity","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","oom","scheduler","shared-slice","utilisation"],"hold":false,"relations":[]}
 ---
 Owner pivot 2026-09-01 (utilisation): the reservation model over-provisions and wastes the machine. MEASURED LIVE: a non-delegate `aira confine -- make merge-gate` reserved 33.6G (reserve-basis=estimate:p90-prior, airtight) while using 2.6G RSS for 62min; slice ledger 39.4G granted / 63.2G ceiling while physical aira.slice memory.current was only 15.4G/64G — so admission blocks new jobs though ~48G RAM + most CPU sit idle (FASTEST_XDIST_WORKERS=8 → 8/16 cores → "half busy, half idle"). ROOT: admission reserves the ESTIMATED PEAK and holds it for the whole job LIFETIME; peaks are brief + rarely coincide, so the ledger saturates long before physical RAM does.
 
@@ -19,7 +19,13 @@ SUPERSEDES AIRA-28 Approach A (airtight whole-suite charge — built on branch a
 
 ## Resolution
 
-**Built and merged 2026-09-06.** Branch `aira29-dynamic-reserve-v2` off master `f1f699a`.
+**Built and merged 2026-09-06.** PR https://github.com/battlesnake/aira/pull/60, merge commit
+`16f2967`, branch `aira29-dynamic-reserve-v2`. Rebased five times during the build as master
+moved under it (AIRA-108, AIRA-35, AIRA-73, AIRA-106 and several ticket-only commits landed
+mid-flight); one real conflict in `admit.go` against AIRA-108, resolved by hand — a naive
+keep-both would have double-counted `reservationBytes`. The merged artifact was re-verified
+independently rather than trusted: `internal/daemon/admit.go` on `origin/master` is
+byte-identical to the tree these exit codes were measured on.
 Plan: `docs/superpowers/specs/2026-09-06-aira29-dynamic-reserve-plan.md` (v8) — re-based
 from scratch on current source, **superseding the banked v3** (`aira29-dynamic-reserve` @
 `388cfb0`) rather than resuming it: v3's §3.5 per-scope `memory.high` re-writer is
