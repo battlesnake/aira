@@ -2639,3 +2639,50 @@ func TestConfineDelegateRAMDeliversNoLegacyGovernorCoordinates(t *testing.T) {
 		t.Fatal("AIRA_AITEST_LIB absent: the same edit must not take the aitest coordinates with it")
 	}
 }
+
+// TestConfineChildReceivesTheResolvedSlice is the behaviour half of AIRA-115.
+// The scope id alone was never enough for `aira confine-reserve` running inside
+// the job: it identified WHICH job the sub-reservation belonged to but not WHERE
+// that job lives, so the reserve defaulted its slice to aira.slice and charged a
+// slice whose cgroup does not hold that memory.
+//
+// The exported value is the RESOLVED slice PATH, not the name the caller typed
+// ("finite.slice" here resolves to "/fake/finite.slice"). That distinction is
+// the point: it is the same value admitConfine keys the job's own admission on,
+// so the sub-reservation lands in its parent's daemon queue rather than in
+// whatever a bare name re-resolves to from the DAEMON's own cgroup ancestry.
+//
+// The stale inherited values in Env are what make this an upsert assertion: a
+// nested confine must publish ITS slice, not carry its grandparent's through.
+// The AIRA_CONFINE_SCOPE_ID assertion is the anti-porosity witness — an empty
+// child environment would satisfy a slice-only check for the wrong reason.
+//
+// verifies: AIRA-115
+func TestConfineChildReceivesTheResolvedSlice(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	scope := &confineFakeScope{}
+	var stdout bytes.Buffer
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Name: "pytest",
+		Env: []string{
+			"PATH=" + os.Getenv("PATH"),
+			"AIRA_CONFINE_SLICE=/stale/grandparent.slice",
+			"AIRA_CONFINE_SCOPE_ID=stale-scope",
+		},
+		Argv:     reportChildEnv("AIRA_CONFINE_SLICE", "AIRA_CONFINE_SCOPE_ID"),
+		SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
+	}, confineUnitDeps(scope))
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	fields := strings.Split(stdout.String(), "|")
+	if len(fields) != 2 {
+		t.Fatalf("child environment report=%q", stdout.String())
+	}
+	if fields[0] != "/fake/finite.slice" {
+		t.Fatalf("AIRA_CONFINE_SLICE=%q, want the resolved slice path /fake/finite.slice (confine-reserve inside this job has no other way to learn where it runs)", fields[0])
+	}
+	if fields[1] == "" || fields[1] == "stale-scope" {
+		t.Fatalf("AIRA_CONFINE_SCOPE_ID=%q: the confine child environment was not populated, so the slice assertion above proves nothing", fields[1])
+	}
+}

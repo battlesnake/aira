@@ -245,3 +245,179 @@ func TestConfineReserveTooLargeClampsAndReadmitsPinned(t *testing.T) {
 	}
 	_ = reservation.Close()
 }
+
+// reserveAdmitCapture stands up a real unix admit socket (the path
+// ConfineReserve itself takes, since it builds its own Runner and has no dial
+// seam) and records the args of the first admit frame it is sent, then grants.
+func reserveAdmitCapture(t *testing.T) (socket string, args func() map[string]any, dials func() int64) {
+	t.Helper()
+	socket = filepath.Join(t.TempDir(), "admit.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	var captured atomic.Value
+	var accepted atomic.Int64
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			accepted.Add(1)
+			go func() {
+				defer conn.Close()
+				var frame runnerAdmitRequestFrame
+				if readRunnerAdmitFrame(conn, &frame) != nil {
+					return
+				}
+				captured.Store(frame.Request.Args)
+				data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: 40, Basis: "pinned:client"})
+				_ = writeRunnerAdmitFrame(conn, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+				var one [1]byte
+				_, _ = conn.Read(one[:])
+			}()
+		}
+	}()
+	return socket, func() map[string]any {
+		value, _ := captured.Load().(map[string]any)
+		return value
+	}, func() int64 { return accepted.Load() }
+}
+
+// TestConfineReserveChargesTheInheritedParentSlice is AIRA-115's regression
+// test. `confineReserve` inherited the parent job's SCOPE ID from the
+// environment but defaulted its SLICE to DefaultConfineSlice independently, so
+// a job confined to any other slice had its per-test sub-reservations booked
+// against aira.slice: the reserving slice over-charged for memory it does not
+// host (healthy jobs there wait behind a phantom reservation), the hosting slice
+// under-counted.
+//
+// RED against the old `if request.Slice == "" { request.Slice =
+// DefaultConfineSlice }`: the wire slice was "aira.slice", not the parent's.
+//
+// The parent_scope_id assertion is the anti-porosity guard, not decoration. It
+// is what proves the two halves of the same fact now travel together — a fix
+// that inherited the slice but dropped the scope-id marker would break the
+// AIRA-101 drain-convergence carve-out, and a test that only looked at the slice
+// could not see it. It also proves the frame was actually populated.
+//
+// verifies: AIRA-115
+func TestConfineReserveChargesTheInheritedParentSlice(t *testing.T) {
+	socket, args, _ := reserveAdmitCapture(t)
+	parent := confineScopeID("pytest", "", true)
+	t.Setenv("AIRA_CONFINE_SCOPE_ID", parent)
+	t.Setenv("AIRA_CONFINE_SLICE", "/sys/fs/cgroup/user.slice/custom.slice")
+
+	reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
+		AdmitSocketPath: socket, Bytes: 40, Pinned: true,
+		Signature: "pytest:test_example.py::test_case", MaxWait: 5 * time.Second,
+	})
+	if err != nil || reservation == nil {
+		t.Fatalf("reservation=%+v err=%v", reservation, err)
+	}
+	defer reservation.Close()
+	got := args()
+	if got["slice"] != "/sys/fs/cgroup/user.slice/custom.slice" {
+		t.Fatalf("admit slice=%v, want the parent job's resolved slice (charging %q mis-attributes the reservation to a slice that does not host it)",
+			got["slice"], DefaultConfineSlice)
+	}
+	if got["parent_scope_id"] != parent {
+		t.Fatalf("admit parent_scope_id=%v, want %q: the sub-reservation marker and the slice must travel together", got["parent_scope_id"], parent)
+	}
+}
+
+// TestConfineReserveOutsideAConfineJobKeepsTheDefaultSlice is the false-fail
+// direction of the same fix: an UNCONFINED caller (no inherited scope id, no
+// inherited slice) still gets DefaultConfineSlice, which is what that default
+// was always actually for. Without this, "inherit or refuse" could be
+// over-applied into refusing every standalone `aira confine-reserve`.
+//
+// verifies: AIRA-115
+func TestConfineReserveOutsideAConfineJobKeepsTheDefaultSlice(t *testing.T) {
+	socket, args, _ := reserveAdmitCapture(t)
+	// Emptied rather than assumed absent: the suite itself runs inside `aira
+	// confine`, which now exports both.
+	t.Setenv("AIRA_CONFINE_SCOPE_ID", "")
+	t.Setenv("AIRA_CONFINE_SLICE", "")
+
+	reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
+		AdmitSocketPath: socket, Bytes: 40, Pinned: true,
+		Signature: "pytest:standalone", MaxWait: 5 * time.Second,
+	})
+	if err != nil || reservation == nil {
+		t.Fatalf("reservation=%+v err=%v", reservation, err)
+	}
+	defer reservation.Close()
+	if got := args(); got["slice"] != DefaultConfineSlice {
+		t.Fatalf("admit slice=%v, want %q for an unconfined caller", got["slice"], DefaultConfineSlice)
+	}
+}
+
+// TestConfineReserveExplicitSliceOverridesTheInheritedOne pins the precedence:
+// AIRA-58 forbids silently SUBSTITUTING for a caller's declared value, so an
+// explicit --slice still wins over the inherited one. Inheritance fills the gap
+// where the caller said nothing; it does not overrule what they said.
+//
+// verifies: AIRA-115
+func TestConfineReserveExplicitSliceOverridesTheInheritedOne(t *testing.T) {
+	socket, args, _ := reserveAdmitCapture(t)
+	t.Setenv("AIRA_CONFINE_SCOPE_ID", confineScopeID("pytest", "", true))
+	t.Setenv("AIRA_CONFINE_SLICE", "/sys/fs/cgroup/user.slice/inherited.slice")
+
+	reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
+		Slice: "explicit.slice", AdmitSocketPath: socket, Bytes: 40, Pinned: true,
+		Signature: "pytest:explicit", MaxWait: 5 * time.Second,
+	})
+	if err != nil || reservation == nil {
+		t.Fatalf("reservation=%+v err=%v", reservation, err)
+	}
+	defer reservation.Close()
+	if got := args(); got["slice"] != "explicit.slice" {
+		t.Fatalf("admit slice=%v, want the explicitly declared slice", got["slice"])
+	}
+}
+
+// TestConfineReserveRefusesRatherThanDefaultUnderAParentScope is the AIRA-58
+// half of AIRA-115: a scope id present with no usable slice means the
+// environment is asserting this reservation belongs to a running job while
+// withholding where that job lives. Defaulting there is exactly the silent
+// mis-attribution being removed, so it is refused BEFORE any dial — the caller
+// then fails open and the test runs unreserved, which under-counts one slice
+// rather than over-charging an unrelated one.
+//
+// The zero-dial assertion is what makes this more than an error-string test: a
+// refusal issued after the daemon had already been asked would have charged the
+// wrong slice anyway.
+//
+// verifies: AIRA-115
+func TestConfineReserveRefusesRatherThanDefaultUnderAParentScope(t *testing.T) {
+	socket, _, dials := reserveAdmitCapture(t)
+	parent := confineScopeID("pytest", "", true)
+	t.Setenv("AIRA_CONFINE_SCOPE_ID", parent)
+	// A ".." component is exactly as unusable as absence: both slice resolvers
+	// refuse one, so InheritedConfineSlice discards it rather than forwarding it.
+	for name, slice := range map[string]string{"absent": "", "unusable": "../escape.slice"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("AIRA_CONFINE_SLICE", slice)
+			before := dials()
+			reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
+				AdmitSocketPath: socket, Bytes: 40, Pinned: true,
+				Signature: "pytest:orphan-slice", MaxWait: 5 * time.Second,
+			})
+			if err == nil || reservation != nil {
+				if reservation != nil {
+					_ = reservation.Close()
+				}
+				t.Fatalf("reservation=%+v err=%v, want a refusal rather than a default-slice charge", reservation, err)
+			}
+			if !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE") || !strings.Contains(err.Error(), parent) {
+				t.Fatalf("err=%v, want E_CONFINE_UNAVAILABLE naming the inherited scope %q", err, parent)
+			}
+			if after := dials(); after != before {
+				t.Fatalf("daemon was dialled %d time(s) before refusing", after-before)
+			}
+		})
+	}
+}

@@ -97,12 +97,17 @@ func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics i
 // inside a still-running pre-deletion job can still inherit a live AIRA_PY_LIB
 // pointing at an extant extraction directory, and carrying that into a conftest
 // that guards on it is a stale-plugin import path. Stripping costs nine map
-// entries; not stripping costs a silent resurrection. AIRA_CONFINE_SCOPE_ID is
-// the one key here that is both stripped and re-exported (see
-// AppendConfineChildEnvironment) because runner.InheritedConfineScopeID reads it
-// to attach a confine-reserve sub-reservation to its parent job.
+// entries; not stripping costs a silent resurrection. AIRA_CONFINE_SCOPE_ID and
+// AIRA_CONFINE_SLICE are the two keys here that are both stripped and
+// re-exported (see AppendConfineChildEnvironment), because
+// runner.InheritedConfineScopeID and runner.InheritedConfineSlice read them to
+// attach a confine-reserve sub-reservation to its parent job AND to the slice
+// that job actually runs in. Both are stripped first for the same reason: a
+// nested launch that inherited its grandparent's coordinates unchanged would
+// charge the wrong scope and the wrong slice.
 var coordinationEnvironmentKeys = map[string]struct{}{
 	"AIRA_CONFINE_SCOPE_ID": {},
+	"AIRA_CONFINE_SLICE":    {},
 
 	// Retired by AIRA-33: stripped, never set.
 	"AIRA_PY_LIB":                   {},
@@ -138,8 +143,18 @@ func StripCoordinationEnvironment(env []string) []string {
 	return result
 }
 
-// AppendConfineChildEnvironment publishes the confine scope id to a confined
-// child, having first stripped every inherited launch coordinate.
+// AppendConfineChildEnvironment publishes the confine scope id and the RESOLVED
+// slice of the job to a confined child, having first stripped every inherited
+// launch coordinate.
+//
+// AIRA-115. The slice travels with the scope id because the two are one fact
+// split in half: `aira confine-reserve` running inside the job identifies itself
+// as a sub-reservation of that scope id, but used to let its slice DEFAULT to
+// aira.slice. A job confined to any other slice therefore had its per-test
+// sub-reservations charged to a slice whose cgroup does not hold that memory,
+// while the slice that does hold it never saw them. Exporting the resolved slice
+// (the same value the job's own admission was keyed on, so the sub-reservation
+// lands in exactly its parent's daemon queue) is what closes that split.
 //
 // Until AIRA-33 this also armed the aira_xdist_governor plugin on a
 // --delegate-ram launch (extracting the sidecar, exporting AIRA_PY_LIB and the
@@ -151,12 +166,20 @@ func StripCoordinationEnvironment(env []string) []string {
 // id used to be exported only if the (now deleted) sidecar extraction succeeded
 // AND a RuntimeDir was supplied. Neither gate has anything to do with the scope
 // id, so both are gone and it now exports whenever there is one.
-func AppendConfineChildEnvironment(env []string, scopeID string) []string {
+func AppendConfineChildEnvironment(env []string, scopeID, slice string) []string {
 	result := StripCoordinationEnvironment(env)
-	if scopeID == "" {
-		return result
+	if scopeID != "" {
+		result = upsertChildEnv(result, "AIRA_CONFINE_SCOPE_ID", scopeID)
 	}
-	return upsertChildEnv(result, "AIRA_CONFINE_SCOPE_ID", scopeID)
+	// Exported independently of the scope id rather than only alongside it: the
+	// slice is the correct charge for any reservation taken from inside this job,
+	// whether or not a scope id was minted. The reverse pairing is the one that
+	// must never happen — a scope id with no slice is what confineReserve refuses
+	// rather than silently defaulting (AIRA-58's rule, AIRA-115's bug).
+	if slice != "" {
+		result = upsertChildEnv(result, "AIRA_CONFINE_SLICE", slice)
+	}
+	return result
 }
 
 func upsertChildEnv(env []string, key, value string) []string {

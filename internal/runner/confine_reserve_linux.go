@@ -14,9 +14,11 @@ func confineReserve(ctx context.Context, request ConfineReserveRequest) (*Confin
 	if err := validateConfineReserveRequest(request); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(request.Slice) == "" {
-		request.Slice = DefaultConfineSlice
+	slice, err := resolveConfineReserveSlice(request.Slice)
+	if err != nil {
+		return nil, err
 	}
+	request.Slice = slice
 	if request.MaxWait == 0 {
 		request.MaxWait = DefaultConfineReserveMaxWait
 	}
@@ -26,6 +28,47 @@ func confineReserve(ctx context.Context, request ConfineReserveRequest) (*Confin
 		clock: systemClock{}, admitSocketPath: request.AdmitSocketPath,
 	}
 	return confineReserveWithRunner(ctx, request, r)
+}
+
+// resolveConfineReserveSlice decides which slice a reservation is CHARGED to.
+//
+// AIRA-115. This used to be `if request.Slice == "" { request.Slice =
+// DefaultConfineSlice }` — the scope id was inherited from the parent confine
+// job but the slice was defaulted independently, so a job confined to a
+// non-default slice had its per-test sub-reservations booked against aira.slice.
+// The reserving slice was then over-charged for memory it does not host (healthy
+// jobs there wait behind a phantom reservation), while the hosting slice
+// under-counted. The two halves of one fact must travel together.
+//
+// Precedence, and why:
+//
+//  1. An EXPLICIT --slice wins. AIRA-58 is about never silently SUBSTITUTING for
+//     a caller's declared value; a caller who names a slice gets that slice.
+//  2. Otherwise the parent job's resolved slice, if this process is running
+//     inside one.
+//  3. Otherwise DefaultConfineSlice — the unconfined caller, which is what the
+//     default was always actually for.
+//
+// The refusal is the AIRA-58 rule applied to the one remaining gap: if a parent
+// scope id IS present but its slice cannot be established, the environment is
+// telling us this reservation belongs to a running job while withholding where
+// that job lives. Defaulting there is precisely the silent mis-attribution this
+// change removes, so it is refused instead. E_CONFINE_UNAVAILABLE, because
+// callers treat that as fail-open: the test then runs UNRESERVED, which
+// under-counts a slice rather than over-charging an unrelated one.
+func resolveConfineReserveSlice(requested string) (string, error) {
+	if slice := strings.TrimSpace(requested); slice != "" {
+		return slice, nil
+	}
+	if inherited := InheritedConfineSlice(); inherited != "" {
+		return inherited, nil
+	}
+	if parent := InheritedConfineScopeID(); parent != "" {
+		return "", fmt.Errorf(
+			"E_CONFINE_UNAVAILABLE: confine scope %s is inherited but its slice is absent or unusable; refusing to charge the default slice %s",
+			parent, DefaultConfineSlice)
+	}
+	return DefaultConfineSlice, nil
 }
 
 func confineReserveWithRunner(ctx context.Context, request ConfineReserveRequest, r *Runner) (*ConfineReservation, error) {
