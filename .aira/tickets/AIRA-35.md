@@ -158,6 +158,17 @@ negative control.
 | `aira confine -- go test -race ./internal/runner/ ./internal/pylib/...` | **0** |
 | `aira confine -- go test -race ./internal/daemon/` | **1** -- three `TestSliceCeilingRealCgroup*` failures, PRE-EXISTING on pristine `origin/master` (filed as AIRA-117, not caused here) |
 
+Recorded rather than smoothed over: on the final rebase (onto AIRA-108's merge)
+the first full `go test ./...` exited **1** on
+`TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks`
+(`U_CONFINE_NOT_LAUNCHED: ... has nothing to kill yet; retry`) -- a launch/kill
+race in `cmd/aira`, a file this change does not touch, on a box then running ten
+concurrent sessions plus this suite. It passed 3/3 in isolation and the whole
+`cmd/aira` package passed 2/2 (70 s, 60 s), and the re-run of the full suite on
+the identical tree exited **0**. Treated as a load flake, not as a green run:
+the exit-1 happened and is written down here rather than being replaced by the
+later 0.
+
 ### How each open question in the ticket was resolved
 
 1. *Narrow the `memory.high`/`memory.max` gap (e.g. 95%)?* **Rejected on
