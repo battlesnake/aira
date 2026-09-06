@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-107","project":"aira","title":"Re-bucket the eleven E_ codes AIRA-87 catalogued at the default exit 1","status":"in-review","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-107","project":"aira","title":"Re-bucket the eleven E_ codes AIRA-87 catalogued at the default exit 1","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
 ---
 Filed per AIRA-99 item 3, explicitly carved off from that ticket's mechanical
 fixes as a separate owner decision, not to be actioned by the same agent.
@@ -218,10 +218,21 @@ what the P1 above fixes.
   future move of one of those surfaces as "the reasoning recorded in codes.go no
   longer holds" rather than leaving a pin at a number whose justification has
   quietly evaporated. It was run against master's `codes.go` during review and
-  failed on the eleven, so the pin itself is not porous.
+  failed on the seven codes that moved plus the missing
+  `E_COMMAND_COUNTER_CORRUPT` entry (the four decided *at* 1 coincide with
+  master and cannot fail there), so the pin itself is not porous.
 
 ### Verification (exact exit codes, full output read)
 
 - `aira confine -- go build ./...` — exit 0
 - `aira confine -- go vet ./...` — exit 0
 - `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0
+
+### Merge record
+
+Merged via PR #67 as merge commit `f77ce7b9b2157cb8c84b467ae6860cb3dea71eea`
+(2026-09-06). Independent build-review re-ran build/vet/full suite from a
+clean worktree (exit 0/0/0, 14 packages `ok`) and confirmed all three new
+tests go red against their respective reverts: the codes pin against master's
+`codes.go`, the counter test against master's `store/command.go`, and the
+core finding-only test with the divergence pair set to 4.
