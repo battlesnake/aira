@@ -100,9 +100,26 @@ actually does today):
    breaks on first run, exactly the `if CI` branching this ticket exists to
    avoid. Requirement 7 below is the one exception: `--delegate-ram`'s flag
    parsing stays accepted, but one of its current SIDE EFFECTS must not fire.
-7. **INTERIM ONLY (superseded design correction below) — do NOT export
-   `AIRA_AITEST_LIB` when `--delegate-ram` runs in shim mode**, as the
-   behaviour to ship in THIS ticket, pending AIRA-123. This is a deliberate,
+7. **SUPERSEDED BY AIRA-123 — the rule is now CONDITIONAL and the condition is
+   MET, so `--delegate-ram` in shim mode DOES export `AIRA_AITEST_LIB`.**
+   AIRA-123 landed the degraded ledger-only `worker-admit` this requirement was
+   waiting for: per-worker admission functions in shim mode against the same
+   in-daemon RAM budget, with no cgroup sub-scope, reported as
+   `containment=advisory(ci-shim,no-cgroup,no-kill-backstop)` on every grant and
+   as `admission=ledger-only` from `aitest-bootstrap`. The one gate,
+   `runner.AitestBackendCanFunction`, now returns the BACKEND name alongside its
+   verdict and is true for ci-shim; `AIRA_AITEST_OUTER_SCOPE` is still not
+   published, because there is no outer cgroup scope to name. The
+   non-delegate arm keeps this requirement's unconditional STRIP of inherited
+   `AIRA_AITEST_*`, which was always a separate concern (stale-coordinate
+   resurrection) and is unchanged. Ticket test (f) is inverted accordingly:
+   `TestShimConfineDelegateRAMPublishesTheAitestCoordinatesButNoScope` and
+   `TestShimConfineWithoutDelegateRAMStillStripsEveryAitestCoordinate`, both
+   still proving it from the ACTUAL CHILD ENVIRONMENT rather than the
+   flag-parsing path. The interim reasoning is preserved below for the record.
+
+   INTERIM (shipped in this ticket, now replaced) — do NOT export
+   `AIRA_AITEST_LIB` when `--delegate-ram` runs in shim mode, pending AIRA-123. This is a deliberate,
    explicit deferral, not the intended final answer -- do not read it as
    "aitest never gets RAM-aware concurrency in shim mode." The owner (via
    `deploy`) corrected the original framing: it conflated cgroups'

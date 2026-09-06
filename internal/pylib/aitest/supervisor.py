@@ -359,7 +359,52 @@ _OUTCOME_CLASS_EXCEPTIONS = {
 # AIRA-35 removed memory_high from this contract along with the memory.high
 # write it named: a required wire field named after a cgroup control the daemon
 # deliberately no longer writes would be a lie in the protocol.
-_OUTCOME_GRANT_FIELDS = ("scope", "worker_id", "memory_max")
+#
+# AIRA-123 made `containment` required on every granted line and made it decide
+# which of the remaining keys are required, permitted and FORBIDDEN. The
+# forbidden half is the load-bearing half: a ledger-only grant that carried a
+# scope path would be read as the real thing by every reader that looks at
+# `scope` first -- which is all of them, since that is what the field was for.
+#
+# An ABSENT containment token is a contract violation, never a default. Making
+# absence mean "enforced" would be the same defect one level up: the strong
+# claim must be stated, never inferred from silence.
+_OUTCOME_CONTAINMENTS = frozenset((
+    "enforced",
+    "advisory(ci-shim,no-cgroup,no-kill-backstop)",
+))
+
+# Which grade requires which coordinates. Mirrors Go's
+# workerAdmitGrantShapeProblem (internal/runner/worker_admit_outcome.go), whose
+# renderer refuses to produce a line these rules would reject.
+_OUTCOME_GRANT_REQUIRED = {
+    "enforced": ("scope", "worker_id", "memory_max"),
+    "advisory(ci-shim,no-cgroup,no-kill-backstop)": ("worker_id", "reserved"),
+}
+_OUTCOME_GRANT_FORBIDDEN = {
+    "enforced": ("reserved",),
+    "advisory(ci-shim,no-cgroup,no-kill-backstop)": ("scope", "memory_max"),
+}
+_OUTCOME_GRANT_POSITIVE_INTS = {
+    "enforced": ("memory_max",),
+    "advisory(ci-shim,no-cgroup,no-kill-backstop)": ("reserved",),
+}
+
+# The aitest ADMISSION BACKEND grades, reported once by the `aitest-bootstrap`
+# verb and pinned against Go's runner.AitestAdmission* catalogue.
+_ADMISSION_SUB_SCOPE = "cgroup-sub-scope"
+_ADMISSION_LEDGER_ONLY = "ledger-only"
+_ADMISSION_GRADES = frozenset((
+    "cgroup-sub-scope",
+    "ledger-only",
+))
+
+# The one mapping from a per-grant containment grade to the backend grade that
+# must have produced it. Mirrors runner.AitestAdmissionForContainment.
+_ADMISSION_FOR_CONTAINMENT = {
+    "enforced": _ADMISSION_SUB_SCOPE,
+    "advisory(ci-shim,no-cgroup,no-kill-backstop)": _ADMISSION_LEDGER_ONLY,
+}
 
 
 def _describe_outcome(fields, diagnostic=""):
@@ -538,6 +583,19 @@ class Supervisor:
         self.attempts = {}  # nodeid -> attempt count (Task 15's retry-once rule)
         self.outer_scope = None
         self.supervisor_scope = None
+        # AIRA-123. Which per-worker admission backend this run is using.
+        # bootstrap() sets it from the verb's own `admission=` token and refuses
+        # to start without one, so this initial value is only ever what a
+        # supervisor that has NOT bootstrapped believes.
+        #
+        # It is the ENFORCED backend deliberately, and the direction is the
+        # whole point: this value decides which grants are ACCEPTED, so
+        # believing "enforced" means an advisory grant arriving here is REFUSED
+        # as a contract violation. The opposite default would accept an advisory
+        # grant into a run that never learned it was advisory -- containment
+        # silently downgraded, which is the one outcome this ticket must make
+        # impossible.
+        self.admission_mode = _ADMISSION_SUB_SCOPE
         self.daemon_available = True
         self.max_workers_fallback = max(1, int(os.environ.get("AIRA_AITEST_MAX_WORKERS_FALLBACK", "1")))
         self._fallback_warned = False
@@ -577,13 +635,41 @@ class Supervisor:
         if result.returncode != 0:
             self._disable_daemon((result.stderr or "").strip() or "aitest-bootstrap failed")
             return
+        admission = None
         for token in result.stdout.split():
             if token.startswith("outer="):
                 self.outer_scope = token[len("outer="):]
             elif token.startswith("supervisor_scope="):
                 self.supervisor_scope = token[len("supervisor_scope="):]
+            elif token.startswith("admission="):
+                admission = token[len("admission="):]
         if not self.outer_scope:
             self._disable_daemon("aitest-bootstrap did not report an outer scope")
+            return
+        # AIRA-123. The backend grade is REQUIRED and is not defaulted. A
+        # bootstrap that does not state one is out of lockstep with this
+        # supervisor, and guessing "cgroup-sub-scope" would be the unsafe guess:
+        # this run would then expect enforced grants, and an advisory grant would
+        # be refused as a mismatch far later, mid-suite. Disabling daemon-backed
+        # admission with one honest warning is the same disposition every other
+        # bootstrap failure already takes.
+        if admission not in _ADMISSION_GRADES:
+            self._disable_daemon(
+                "aitest-bootstrap reported admission=%r, which is not in this supervisor's "
+                "catalogue (bootstrap and supervisor are out of lockstep)" % (admission,)
+            )
+            return
+        self.admission_mode = admission
+        if admission == _ADMISSION_LEDGER_ONLY:
+            # Said ONCE, on the run's own output, exactly like the swap-cap and
+            # cpu-slots notices: a governance mechanism that is weaker than it
+            # looks must never be silent about it on the run it governs.
+            sys.stderr.write(
+                "aira aitest: per-worker admission is LEDGER-ONLY (advisory): every worker is "
+                "admitted against the container's RAM budget, but there is NO cgroup sub-scope, "
+                "no memory.max, no kill backstop and no memory-watermark recycling -- a worker "
+                "that exceeds what it declared is not killed\n"
+            )
 
     def _disable_daemon(self, reason):
         self.daemon_available = False
@@ -769,23 +855,8 @@ class Supervisor:
             raise _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](
                 _describe_outcome(outcome, diagnostic)
             )
-        grant = {key: outcome[key] for key in _OUTCOME_GRANT_FIELDS if key in outcome}
-        missing = [key for key in _OUTCOME_GRANT_FIELDS if key not in grant]
-        malformed = None
-        if missing:
-            malformed = "missing required field%s: %s" % (
-                "s" if len(missing) != 1 else "", ", ".join(missing)
-            )
-        else:
-            for key in ("memory_max",):
-                try:
-                    value = int(grant[key])
-                except ValueError as exc:
-                    malformed = "%s must be a positive integer (got %r: %s)" % (key, grant[key], exc)
-                    break
-                if value <= 0:
-                    malformed = "%s must be a positive integer (got %r)" % (key, grant[key])
-                    break
+        containment = outcome.get("containment")
+        grant, malformed = self._validate_grant(outcome, containment)
         if malformed is not None:
             # A granted outcome line missing (or corrupting) its placement
             # fields is the relay and this supervisor disagreeing about the
@@ -847,6 +918,72 @@ class Supervisor:
         self._note_cpu_slots_state(outcome.get("cpu_slots", ""))
         self._note_swap_cap_state(outcome.get("swap_cap", ""))
         return grant, process
+
+    def _validate_grant(self, outcome, containment):
+        """Return (grant, malformed_reason). malformed_reason is None exactly
+        when the grant is usable.
+
+        AIRA-123. The grade decides the shape, in BOTH directions -- required
+        keys and FORBIDDEN keys -- and must agree with the backend this run
+        bootstrapped into. Every rejection becomes a
+        WorkerAdmitContractViolation at the call site: terminal and loud, never
+        a silent fallback to unconfined, because a grant this side cannot
+        understand is the two ends of the channel disagreeing and the Go
+        renderer refuses to PRODUCE any line these rules reject.
+
+        A REJECTED grant still comes back as a best-effort dict rather than
+        None, because the caller's cleanup needs `scope` out of it: a malformed
+        line can still name a real, already-created cgroup, and AIRA-39 made
+        removing it load-bearing (a scope left behind keeps charging the run's
+        budget). It carries `scope` only where a scope could legitimately exist
+        -- never for an advisory grant, whose whole claim is that there is no
+        cgroup, and which must not be able to talk this supervisor into rmdir'ing
+        a path it named anyway.
+
+        `grant["scope"]` is None for a ledger-only grant rather than absent, so
+        every existing consumer (spawn_worker's fork, _retire_worker's cleanup,
+        _forget_worker_scope's rmdir) sees an explicit "there is no scope"
+        instead of a KeyError or, worse, a stale value.
+        """
+        if containment not in _OUTCOME_CONTAINMENTS:
+            # Unknown or absent grade: no shape rules apply, so `scope` is
+            # passed through for cleanup exactly as the pre-AIRA-123 parser did.
+            return {"scope": outcome.get("scope")}, (
+                "containment %r is not in this supervisor's catalogue; an absent or "
+                "unrecognised grade must never be read as enforced" % (containment,)
+            )
+        enforced = containment == "enforced"
+        grant = {key: outcome[key] for key in _OUTCOME_GRANT_REQUIRED[containment] if key in outcome}
+        grant["containment"] = containment
+        grant["scope"] = outcome.get("scope") if enforced else None
+        expected_backend = _ADMISSION_FOR_CONTAINMENT[containment]
+        if expected_backend != self.admission_mode:
+            # The bootstrap said one backend and the daemon granted from
+            # another: two processes that disagree about what this box is.
+            # Neither answer can be trusted, so this is a contract violation
+            # rather than something to reconcile silently.
+            return grant, (
+                "grant containment %r implies the %r backend, but this run bootstrapped "
+                "into %r" % (containment, expected_backend, self.admission_mode)
+            )
+        forbidden = [key for key in _OUTCOME_GRANT_FORBIDDEN[containment] if key in outcome]
+        if forbidden:
+            return grant, (
+                "containment %r must not carry %s" % (containment, ", ".join(sorted(forbidden)))
+            )
+        missing = [key for key in _OUTCOME_GRANT_REQUIRED[containment] if key not in outcome]
+        if missing:
+            return grant, "missing required field%s: %s" % (
+                "s" if len(missing) != 1 else "", ", ".join(missing)
+            )
+        for key in _OUTCOME_GRANT_POSITIVE_INTS[containment]:
+            try:
+                value = int(grant[key])
+            except ValueError as exc:
+                return grant, "%s must be a positive integer (got %r: %s)" % (key, grant[key], exc)
+            if value <= 0:
+                return grant, "%s must be a positive integer (got %r)" % (key, grant[key])
+        return grant, None
 
     def _note_cpu_slots_state(self, state):
         """AIRA-64. Say ONCE, on this run's own output, when the daemon could
@@ -1034,9 +1171,21 @@ class Supervisor:
         guarded the same way inside fork_worker, Task 12, since it can
         raise before this function's own try even starts.)"""
         grant, admit_process = self.acquire_worker(estimated_bytes, max_wait=max_wait)
+        # AIRA-123. None here is a LEDGER-ONLY grant: the daemon really admitted
+        # this worker against the container's RAM budget, there is simply no
+        # cgroup sub-scope to place it in. Every cgroup-dependent step below is
+        # skipped for it -- place_self's cgroup.procs write (inside fork_worker),
+        # the placement ack that exists solely to PROVE that write happened, and
+        # _should_recycle's memory.current/memory.max watermark read (inside
+        # run_worker_loop) -- while everything else, admission included, is
+        # unchanged. That last clause is the difference from
+        # _spawn_fallback_worker, which skips the same steps but is also
+        # completely UNGOVERNED and is only ever reached when the daemon itself
+        # is unreachable.
+        scope = grant["scope"]
         dispatch_read, dispatch_write = os.pipe()
         result_read, result_write = os.pipe()
-        pid, in_child = fork_worker(grant["scope"])
+        pid, in_child = fork_worker(scope)
         if in_child:
             try:
                 self._child_close_other_workers_fds()
@@ -1054,9 +1203,10 @@ class Supervisor:
                 # the result pipe lets the parent (below) tell "placed
                 # fine, died/recycled later" apart from "never even got
                 # placed" for its crash-handling logic (spec 4).
-                pipe_out.write(self._PLACED_LINE + "\n")
-                pipe_out.flush()
-                run_worker_loop(grant["scope"], self.items_by_nodeid, pipe_in, pipe_out)
+                if scope is not None:
+                    pipe_out.write(self._PLACED_LINE + "\n")
+                    pipe_out.flush()
+                run_worker_loop(scope, self.items_by_nodeid, pipe_in, pipe_out)
             except BaseException:
                 _exit_child(70)
             _exit_child(0)
@@ -1071,6 +1221,48 @@ class Supervisor:
         # select()-on-the-wrapped-object check cannot see bytes already
         # sitting in the wrapper's own buffer rather than the pipe.
         state = {"result_fd": result_read, "read_buffer": b"", "result_eof": False}
+        if scope is not None:
+            self._await_placement_ack(pid, grant, admit_process, state, result_read, dispatch_write)
+        # AIRA-123. A LEDGER-ONLY worker has no ack, and skipping it is the
+        # honest choice rather than a shortcut. The ack exists to PROVE the
+        # child joined its granted cgroup (spawn_worker's own comment: "reaching
+        # this line already IS the placement proof"); with no cgroup there is
+        # nothing to prove, and inventing an "I started" handshake here would
+        # give the two paths a shared failure surface whose only real meaning --
+        # WorkerPlacementFailed, i.e. "the local cgroup mechanism is broken" and
+        # therefore strip containment for the rest of the run -- would be a
+        # diagnosis this mode cannot support. A ledger-only child that dies at
+        # startup is handled where every other mid-run death already is
+        # (_handle_worker_exit), exactly as the daemon-down fallback pool's
+        # children are.
+        os.set_blocking(result_read, False)
+        state.update({
+            "grant": grant,
+            "admit_process": admit_process,
+            "dispatch_write": os.fdopen(dispatch_write, "w"),
+            "in_flight": None,
+            # Opened only now, on the path where this worker is actually going
+            # to be registered: every failure branch above has already reaped
+            # the child, and a pidfd for a reaped pid is either invalid or --
+            # worse -- refers to whatever process later reuses that pid. The
+            # guarantee here is precisely that NOTHING HAS REAPED this one, so
+            # its pid cannot be reused underneath us; it is deliberately not a
+            # claim that the child is still running (the ack proves it was
+            # alive when it wrote, and it may be a zombie by now, which
+            # pidfd_open handles).
+            "pidfd": self._open_pidfd(pid),
+        })
+        self.workers[pid] = state
+        return pid
+
+    def _await_placement_ack(self, pid, grant, admit_process, state, result_read, dispatch_write):
+        """Block until the forked child confirms it joined its granted cgroup
+        scope, or fail. Extracted from spawn_worker unchanged (AIRA-123) so the
+        ledger-only path, which has no cgroup and therefore nothing to confirm,
+        can skip it without duplicating the surrounding fd bookkeeping.
+
+        Raises WorkerAdmitDenied (transient, containment preserved) or
+        WorkerPlacementFailed (the local cgroup mechanism is broken)."""
         # AIRA-92: BOUNDED (Sol plan-review, P0). EOF alone covered only a child
         # that DIED before acking; a child alive but wedged before its ack held
         # this untimed read -- and therefore the whole single-threaded dispatch
@@ -1129,25 +1321,7 @@ class Supervisor:
                     "for worker %d" % pid
                 )
             raise WorkerPlacementFailed("worker %d exited before confirming cgroup placement" % pid)
-        os.set_blocking(result_read, False)
-        state.update({
-            "grant": grant,
-            "admit_process": admit_process,
-            "dispatch_write": os.fdopen(dispatch_write, "w"),
-            "in_flight": None,
-            # Opened only now, on the path where this worker is actually going
-            # to be registered: every failure branch above has already reaped
-            # the child, and a pidfd for a reaped pid is either invalid or --
-            # worse -- refers to whatever process later reuses that pid. The
-            # guarantee here is precisely that NOTHING HAS REAPED this one, so
-            # its pid cannot be reused underneath us; it is deliberately not a
-            # claim that the child is still running (the ack proves it was
-            # alive when it wrote, and it may be a zombie by now, which
-            # pidfd_open handles).
-            "pidfd": self._open_pidfd(pid),
-        })
-        self.workers[pid] = state
-        return pid
+
 
     def _spawn_fallback_worker(self):
         """No admission, no cgroup placement -- reuses worker.py's own

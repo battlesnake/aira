@@ -225,7 +225,7 @@ def test_acquire_worker_surfaces_cpu_slots_from_a_real_outcome_line(tmp_path, mo
 
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-cpu-unevaluated",
-        "aira-worker-admit state=granted class=granted "
+        "aira-worker-admit state=granted class=granted containment=enforced "
         "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400 "
         "cpu_slots=unevaluated",
         hold_stdin=True, exit_code=0,

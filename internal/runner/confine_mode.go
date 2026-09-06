@@ -250,6 +250,14 @@ func resolveConfineModeUncached() string {
 	return ConfineModeReal
 }
 
+// ResetConfineModeCacheForTest forces the next ResolveConfineMode to re-read the
+// durable record. TEST-ONLY, and exported only because the mode is consumed
+// outside this package -- cmd/aira's aitest-bootstrap verb branches on it, and a
+// test of that branch has no other way to install a mode. Production resolves
+// its mode once, because the record is written at image-build time and cannot
+// change under a running job.
+func ResetConfineModeCacheForTest() { resetConfineModeCache() }
+
 // resetConfineModeCache re-reads the record. Test-only: the production process
 // resolves its mode once, because the record is written at image-build time and
 // cannot change under a running job.

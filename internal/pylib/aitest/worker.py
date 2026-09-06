@@ -265,8 +265,18 @@ def _should_recycle(scope_path, started_at, completed_count):
     if completed_count >= max_tests:
         return True
     if scope_path is None:
-        # Daemon-down fallback mode (Task 16): no granted cgroup scope to
-        # watermark-check; time/count bounds above still apply.
+        # No granted cgroup scope to watermark-check; the time/count bounds
+        # above still apply, exactly as they do on every other path.
+        #
+        # TWO modes reach this, and the difference is worth stating because it
+        # is the whole of AIRA-123: the daemon-down fallback (Task 16), which is
+        # ungoverned, and ci-shim ledger-only admission, where the daemon DID
+        # admit this worker against the container's RAM budget and only the
+        # cgroup is missing. Neither can read memory.current, so neither gets
+        # watermark recycling -- and in ledger-only mode that is the concrete
+        # cost of having no cgroup, not an oversight: a worker growing past its
+        # declared reservation is neither recycled here nor killed by a
+        # backstop, and the container's own OOM killer is what is left.
         return False
     watermark_pct = _env_float(
         "AIRA_AITEST_WORKER_MEMORY_WATERMARK_PCT", _DEFAULT_MEMORY_WATERMARK_PCT
@@ -287,7 +297,18 @@ def _should_recycle(scope_path, started_at, completed_count):
 
 def fork_worker(scope_path):
     """Forks. In the child, places itself into scope_path's cgroup before
-    returning. Returns (pid, in_child: bool).
+    returning, UNLESS scope_path is None. Returns (pid, in_child: bool).
+
+    scope_path is None in the two modes that have no cgroup to place into,
+    and they are NOT the same thing: the daemon-down fallback (no admission
+    at all, fully ungoverned) and AIRA-123's ci-shim ledger-only admission
+    (the daemon really did admit this worker against the container's RAM
+    budget; only the kernel-enforced sub-scope is missing). This function
+    cannot tell them apart and does not need to -- what it needs is that
+    "no scope" is a representable, first-class input here rather than a
+    None crashing its way into place_self and being reported as a placement
+    FAILURE, which is what it did before AIRA-123 and which would strip
+    containment for the whole run.
 
     DELIBERATE DEVIATION from confine's own placement, worth naming
     explicitly rather than letting it slide: aira confine places a NEW
@@ -382,7 +403,8 @@ def fork_worker(scope_path):
     pid = os.fork()
     if pid == 0:
         try:
-            place_self(scope_path)
+            if scope_path is not None:
+                place_self(scope_path)
         except BaseException:
             _exit_child(70)
         return 0, True

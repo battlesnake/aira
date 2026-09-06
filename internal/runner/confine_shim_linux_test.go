@@ -140,26 +140,89 @@ func TestShimConfineAcceptsDelegateRAM(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-121 requirement 7, ticket test (f)
+// verifies: AIRA-123 (superseding AIRA-121 requirement 7 / ticket test (f))
 //
-// Proven by inspecting the ACTUAL CHILD ENVIRONMENT, never the flag-parsing path
-// — which is what the ticket demands, because the whole failure mode is a
-// variable reaching a conftest.py that reads nothing but its presence.
+// Proven by inspecting the ACTUAL CHILD ENVIRONMENT, never the flag-parsing
+// path -- which is what the original ticket demanded and what still matters,
+// because the whole mechanism is a variable reaching a conftest.py that reads
+// nothing but its presence.
 //
-// The inheritance half is the load-bearing one: the supervisor is given a LIVE
-// AIRA_AITEST_LIB in its own environment, and the child must still not have it.
-// That proves the STRIP, not merely the absence of an append — a shim confine
-// nested inside an outer aitest-enabled process must not hand its child stale
-// coordinates pointing at the outer job's extraction directory.
-func TestShimConfineDelegateRAMStripsAitestCoordinatesFromTheChildEnvironment(t *testing.T) {
+// THE RULE INVERTED. AIRA-121 withheld AIRA_AITEST_LIB in shim mode because
+// worker-admit could only mean "nest a kernel-enforced cgroup sub-scope" and
+// nothing could nest one. AIRA-123 gave worker-admit a ledger-only admission
+// mode that genuinely functions with no cgroup, so the coordinates ARE
+// published on a --delegate-ram launch: withholding them falls the consumer
+// through to plain pytest-xdist, where per-worker RAM is invisible to everything
+// and nothing prevents over-subscription at all.
+//
+// The two negative assertions carry the honesty half. AIRA_AITEST_OUTER_SCOPE
+// must NOT be published -- there is no outer cgroup scope, and inventing one
+// would be the first place this mode pretended to have a cgroup -- and
+// AIRA_CONFINE_SCOPE_ID must not be either.
+func TestShimConfineDelegateRAMPublishesTheAitestCoordinatesButNoScope(t *testing.T) {
 	dir := t.TempDir()
 	dump := filepath.Join(dir, "child-env")
 	deps := shimUnitDeps()
 	request := ConfineRequest{
 		Argv:     []string{"/bin/sh", "-c", "env > " + dump},
 		SelfPath: os.Args[0], Stderr: io.Discard, Stdout: io.Discard,
+		RuntimeDir:  t.TempDir(),
 		DelegateRAM: true, MemoryReserve: 512 << 20, MemoryReservePinned: true,
-		// The supervisor's OWN environment carries live coordinates.
+		// The supervisor's OWN environment carries stale coordinates, so what
+		// the child ends up with must be freshly published rather than inherited.
+		Env: append(os.Environ(),
+			"AIRA_AITEST_LIB=/some/outer/extraction/dir",
+			"AIRA_AITEST_OUTER_SCOPE=/sys/fs/cgroup/aira.slice/.aira-CONFINE-x"),
+	}
+	if _, err := confineWithDeps(context.Background(), request, deps); err != nil {
+		t.Fatalf("shim confine err=%v", err)
+	}
+	data, err := os.ReadFile(dump)
+	if err != nil {
+		t.Fatalf("read child environment: %v", err)
+	}
+	child := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			child[key] = value
+		}
+	}
+	lib := child["AIRA_AITEST_LIB"]
+	if lib == "" {
+		t.Fatal("child environment carries no AIRA_AITEST_LIB; the ledger-only backend functions in ci-shim mode, so a --delegate-ram launch must activate aitest rather than fall through to RAM-blind xdist")
+	}
+	if lib == "/some/outer/extraction/dir" {
+		t.Fatalf("AIRA_AITEST_LIB=%q was INHERITED, not published: a stale extraction directory from an outer job is exactly the coordinate resurrection the strip exists to prevent", lib)
+	}
+	for _, key := range []string{"AIRA_AITEST_WORKER_ADMIT_CMD", "AIRA_AITEST_BOOTSTRAP_CMD"} {
+		if child[key] == "" {
+			t.Fatalf("child environment carries no %s; the coordinates are published as a set or not at all", key)
+		}
+	}
+	if scope, present := child["AIRA_AITEST_OUTER_SCOPE"]; present {
+		t.Fatalf("child environment carries AIRA_AITEST_OUTER_SCOPE=%q; there is no outer cgroup scope in ci-shim mode and publishing one -- inherited or invented -- is the first place this mode would pretend otherwise", scope)
+	}
+	if id := child["AIRA_CONFINE_SCOPE_ID"]; id != "" {
+		t.Fatalf("child environment carries AIRA_CONFINE_SCOPE_ID=%q; there is no scope in ci-shim mode", id)
+	}
+}
+
+// verifies: AIRA-123
+//
+// The NON-delegate arm keeps AIRA-121's unconditional STRIP, unchanged and for
+// the unchanged reason: a shim confine nested inside an outer aitest-enabled
+// process must not hand its child stale coordinates pointing at the outer job's
+// extraction directory and relay binary.
+func TestShimConfineWithoutDelegateRAMStillStripsEveryAitestCoordinate(t *testing.T) {
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "child-env")
+	deps := shimUnitDeps()
+	request := ConfineRequest{
+		Argv:     []string{"/bin/sh", "-c", "env > " + dump},
+		SelfPath: os.Args[0], Stderr: io.Discard, Stdout: io.Discard,
+		RuntimeDir:    t.TempDir(),
+		MemoryReserve: 512 << 20, MemoryReservePinned: true,
 		Env: append(os.Environ(),
 			"AIRA_AITEST_LIB=/some/outer/extraction/dir",
 			"AIRA_AITEST_BOOTSTRAP_CMD=/usr/bin/aira",
@@ -174,10 +237,7 @@ func TestShimConfineDelegateRAMStripsAitestCoordinatesFromTheChildEnvironment(t 
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, "AIRA_AITEST_") {
-			t.Fatalf("child environment carries %q; ci-shim must strip every aitest coordinate, not merely skip appending one", line)
-		}
-		if strings.HasPrefix(line, "AIRA_CONFINE_SCOPE_ID=") && strings.TrimPrefix(line, "AIRA_CONFINE_SCOPE_ID=") != "" {
-			t.Fatalf("child environment carries %q; there is no scope in ci-shim mode", line)
+			t.Fatalf("child environment carries %q; a non-delegate launch must strip every aitest coordinate, not merely skip appending one", line)
 		}
 	}
 }

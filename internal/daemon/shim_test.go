@@ -149,33 +149,19 @@ func TestShimRefusesExclusiveWithoutFailingTheConfineScan(t *testing.T) {
 	t.Fatal("the evaluator never ran a scan pass")
 }
 
-// verifies: AIRA-121 gate condition C1
+// AIRA-121 gate condition C1's test lived here and asserted that shim-mode
+// worker-admit answers UNAVAILABLE / ADMISSION-UNUSABLE. AIRA-123 SUPERSEDED
+// that verdict: worker-admit now makes a real ledger-only admission decision in
+// ci-shim mode, so the test moved to worker_admit_shim_test.go and asserts a
+// GRANT instead.
 //
-// worker-admit answers UNAVAILABLE / ADMISSION-UNUSABLE, which supervisor.py
-// maps to WorkerAdmitUnavailable -> _disable_daemon -> the bare-fork pool.
-//
-// The counterexample is the plan's own original design: state=unevaluated
-// carries class=contended, which is RETRIABLE, and
-// _wait_for_admission_or_disable would poll a reachable-but-never-granting
-// daemon forever. This test fails against that pair.
-func TestShimWorkerAdmitIsTerminalAndUnusableNotRetriable(t *testing.T) {
-	server := shimTestServer(t, 1<<30)
-	response, proceed := server.evaluateWorkerAdmit(t.Context(), workerAdmitRequest{outerScope: "/whatever"})
-	if !proceed {
-		t.Fatal("evaluateWorkerAdmit abandoned the request")
-	}
-	if response.State != runner.WorkerAdmitStateUnavailable {
-		t.Fatalf("state=%q, want %q; anything retriable makes the aitest supervisor wait forever",
-			response.State, runner.WorkerAdmitStateUnavailable)
-	}
-	if response.Class != runner.WorkerAdmitClassAdmissionUnusable {
-		t.Fatalf("class=%q, want %q; contended is retriable and would hang the suite",
-			response.Class, runner.WorkerAdmitClassAdmissionUnusable)
-	}
-	if response.Class == runner.WorkerAdmitClassContended {
-		t.Fatal("a contended class here is the exact hang gate condition C1 names")
-	}
-}
+// The gate condition's actual reasoning survives there rather than being
+// deleted, because it was right about the thing it was about: a shim-mode
+// answer that is retriable-but-never-granting hangs the suite forever, so the
+// only remaining terminal shim verdict (confine-mode-mismatch, where the client
+// and daemon read different install-mode records and no amount of waiting can
+// reconcile them) is classed admission-unusable for exactly the C1 reason, and
+// TestWorkerAdmitRefusesAConfineModeMismatchInBothDirections pins it.
 
 // verifies: AIRA-121 gate condition C2
 //

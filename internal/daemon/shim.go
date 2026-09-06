@@ -35,6 +35,17 @@ type shimBudget struct {
 
 func (s *Server) shimMode() bool { return s.confineMode == runner.ConfineModeShim }
 
+// confineModeName renders this daemon's mode for a diagnostic. A Server that
+// never went through Serve (a unit test constructing one directly) has an empty
+// mode; it is reported as `real-slice`, which is what NewServer sets and what
+// every already-installed box is.
+func (s *Server) confineModeName() string {
+	if s.confineMode == "" {
+		return runner.ConfineModeReal
+	}
+	return s.confineMode
+}
+
 // sliceResolver returns the slice-path resolver for this daemon's mode. Every
 // caller goes through it rather than through `if s.admitResolveSlice == nil`, so
 // there is exactly one place where "which resolver does this mode use" is

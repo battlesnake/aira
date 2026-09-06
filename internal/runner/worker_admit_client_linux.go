@@ -35,6 +35,14 @@ type WorkerAdmitLease struct {
 	WorkerID  string
 	ScopePath string
 	MemoryMax int64
+	// Containment (AIRA-123) is WorkerAdmitContainmentEnforced or
+	// WorkerAdmitContainmentAdvisory. It is NOT diagnostic: it decides whether
+	// ScopePath/MemoryMax mean anything at all, and a lease whose containment
+	// this client does not recognise never reaches a caller.
+	Containment string
+	// Reserved (AIRA-123) is the advisory grant's booked reservation. Positive
+	// exactly when Containment is advisory.
+	Reserved int64
 	// SwapCap (AIRA-35) carries the daemon's proof about whether this worker's
 	// swap could be bounded -- see runner.WorkerAdmitSwapCap* and
 	// CreateWorkerScope. It replaces MemoryHigh, which AIRA-35 retired along
@@ -64,15 +72,17 @@ type WorkerAdmitClientRequest struct {
 }
 
 type workerAdmitGrant struct {
-	State     string `json:"state"`
-	Class     string `json:"class"`
-	Reason    string `json:"reason,omitempty"`
-	Detail    string `json:"detail,omitempty"`
-	WorkerID  string `json:"worker_id,omitempty"`
-	ScopePath string `json:"scope_path,omitempty"`
-	MemoryMax int64  `json:"memory_max,omitempty"`
-	SwapCap   string `json:"swap_cap,omitempty"`
-	CPUSlots  string `json:"cpu_slots,omitempty"`
+	State       string `json:"state"`
+	Class       string `json:"class"`
+	Reason      string `json:"reason,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	WorkerID    string `json:"worker_id,omitempty"`
+	ScopePath   string `json:"scope_path,omitempty"`
+	MemoryMax   int64  `json:"memory_max,omitempty"`
+	Containment string `json:"containment,omitempty"`
+	Reserved    int64  `json:"reserved,omitempty"`
+	SwapCap     string `json:"swap_cap,omitempty"`
+	CPUSlots    string `json:"cpu_slots,omitempty"`
 }
 
 // RequestWorkerAdmit dials the daemon and sends one worker-admit request,
@@ -196,7 +206,8 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		Lease: &WorkerAdmitLease{
 			WorkerID: grant.WorkerID, ScopePath: grant.ScopePath,
 			MemoryMax: grant.MemoryMax, SwapCap: grant.SwapCap,
-			CPUSlots: grant.CPUSlots, conn: conn,
+			CPUSlots: grant.CPUSlots, Containment: grant.Containment,
+			Reserved: grant.Reserved, conn: conn,
 		},
 	}
 }
@@ -226,9 +237,12 @@ func classifyWorkerAdmitDialFailure(err error) WorkerAdmitOutcome {
 }
 
 // workerAdmitGrantProblem states why a granted payload is unusable, or "" if
-// it is fine. It enforces exactly the invariants every consumer of a grant
-// depends on: a worker id and scope path to place into, both limits positive,
-// and a positive memory_max.
+// it is fine. AIRA-123 moved the rules themselves into
+// workerAdmitGrantShapeProblem, which the OUTCOME RENDERER also calls, so this
+// client and every producer enforce one definition of a well-formed grant
+// rather than two that can drift. What it enforces is unchanged in substance
+// for an enforced grant (a worker id, a scope path to place into, a positive
+// memory_max) and adds the advisory grade's mirror rules.
 //
 // AIRA-35 removed the two memory_high checks that used to live here (positive,
 // and strictly below memory_max) together with the memory.high write they
@@ -242,16 +256,10 @@ func classifyWorkerAdmitDialFailure(err error) WorkerAdmitOutcome {
 // report is contract-violation (terminal, loud) rather than any class that
 // blames a local mechanism or strips containment.
 func workerAdmitGrantProblem(grant workerAdmitGrant) string {
-	switch {
-	case grant.WorkerID == "":
-		return "granted outcome carries no worker_id"
-	case grant.ScopePath == "":
-		return "granted outcome carries no scope_path"
-	case grant.MemoryMax <= 0:
-		return "granted outcome memory_max must be positive, got " + strconv.FormatInt(grant.MemoryMax, 10)
-	default:
-		return ""
-	}
+	return workerAdmitGrantShapeProblem(WorkerAdmitGrantFields{
+		ScopePath: grant.ScopePath, WorkerID: grant.WorkerID, MemoryMax: grant.MemoryMax,
+		Containment: grant.Containment, Reserved: grant.Reserved,
+	})
 }
 
 // classifyWorkerAdmitReadFailure sorts a failed response read by TYPE, never

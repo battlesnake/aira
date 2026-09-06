@@ -1293,18 +1293,36 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 		_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: --supervisor-pid must be a positive integer")
 		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
-	// AIRA-121 gate condition C1. aitest-bootstrap relocates the supervisor into
-	// a child scope of the job's OUTER cgroup scope so that scope can delegate
-	// controllers to worker children. In ci-shim mode there is no outer scope and
-	// no cgroup to relocate within, so this must fail CLEANLY and immediately:
-	// supervisor.py's bootstrap() calls _disable_daemon on a non-zero exit, which
-	// is exactly the one-warning bare-fork fallback this mode wants. Reaching
-	// CurrentCgroupPath's self-discovery below would instead nominate whatever
+	// AIRA-121 gate condition C1, as AMENDED by AIRA-123. aitest-bootstrap
+	// relocates the supervisor into a child scope of the job's OUTER cgroup scope
+	// so that scope can delegate controllers to worker children. In ci-shim mode
+	// there is no outer scope and no cgroup to relocate within, so this must not
+	// reach CurrentCgroupPath's self-discovery below: that would nominate whatever
 	// cgroup the container happens to live in as "outer" and then fail far later,
-	// in a place that reads as a broken install rather than a designed degradation.
+	// in a place that reads as a broken install rather than a designed
+	// degradation. AIRA-121 shipped that guard as a clean, immediate FAILURE
+	// (supervisor.py's bootstrap() calls _disable_daemon on a non-zero exit,
+	// dropping the suite to its one-warning bare-fork pool); AIRA-123 replaces the
+	// failure with an honest degraded SUCCESS, for the reason stated inside the
+	// branch. Only the disposition changed -- the "do not self-discover" reasoning
+	// is unchanged and still the reason this branch exists at all.
 	if runner.ResolveConfineMode() == runner.ConfineModeShim {
-		_, _ = fmt.Fprintln(stderr, "E_CONFINE_UNAVAILABLE: ci-shim mode has no cgroup scope to bootstrap an aitest supervisor into; aitest runs on its unconfined fallback pool here")
-		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
+		// AIRA-123. There is still nothing to relocate into -- the reasoning
+		// above stands -- but a clean FAILURE is no longer the right answer,
+		// because worker-admit can now make a real ledger-only admission decision
+		// with no cgroup at all. Failing here would call _disable_daemon and drop
+		// the whole suite to its ungoverned bare-fork pool, which is exactly the
+		// value AIRA-123 exists to recover.
+		//
+		// So this reports SUCCESS with two honest facts and no third: the outer
+		// "scope" is the ci-shim sentinel (not a path, and the daemon refuses to
+		// treat it as one), and the admission grade is ledger-only. NO
+		// supervisor_scope token is emitted, deliberately -- there is no such
+		// cgroup, and supervisor.py's _cleanup_supervisor_scope correctly does
+		// nothing when it is absent rather than rmdir'ing something invented.
+		_, _ = fmt.Fprintf(stdout, "outer=%s admission=%s\n", runner.ShimConfineSlice, runner.AitestAdmissionLedgerOnly)
+		_, _ = fmt.Fprintln(stderr, "aira aitest: ci-shim mode -- per-worker admission is LEDGER-ONLY (advisory): workers are admitted against the container's RAM budget, but there is no cgroup sub-scope, no memory.max and no kill backstop")
+		return 0
 	}
 	// AIRA_AITEST_OUTER_SCOPE is the launcher's own scope.Reference(), injected
 	// by AppendAitestChildEnvironment. Prefer it over self-discovery (AIRA-44):
@@ -1347,7 +1365,12 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 		_, _ = fmt.Fprintln(stderr, err)
 		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
-	_, _ = fmt.Fprintf(stdout, "bootstrapped outer=%s supervisor_scope=%s\n", outer, supervisorScope)
+	// AIRA-123: `admission=` is stated on BOTH bootstrap paths. Emitting it only
+	// on the degraded one would make its ABSENCE the claim that per-worker cgroup
+	// sub-scopes are in play, which is the same "absence reads as the strong
+	// guarantee" shape the containment token on the grant line exists to close.
+	_, _ = fmt.Fprintf(stdout, "bootstrapped outer=%s supervisor_scope=%s admission=%s\n",
+		outer, supervisorScope, runner.AitestAdmissionSubScope)
 	return 0
 }
 
@@ -1475,10 +1498,17 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	// created and the supervisor may already have been told about would trade a
 	// loud, retriable over-charge for a silent unconfined run.
 	lease := outcome.Lease
+	// AIRA-123: the grade and its coordinates are relayed together and
+	// unchanged. This relay does not derive containment, does not default it,
+	// and does not decide which coordinates a grade may carry -- the daemon
+	// stated it and WorkerAdmitOutcomeLine refuses any combination that
+	// contradicts itself, so a malformed grant fails loudly here rather than
+	// reaching a supervisor that would read it as enforced.
 	grantFields := &runner.WorkerAdmitGrantFields{
 		ScopePath: lease.ScopePath, WorkerID: lease.WorkerID,
 		MemoryMax: lease.MemoryMax, SwapCap: lease.SwapCap,
-		CPUSlots: lease.CPUSlots,
+		CPUSlots: lease.CPUSlots, Containment: lease.Containment,
+		Reserved: lease.Reserved,
 	}
 	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {
 		_ = lease.Close()

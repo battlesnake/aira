@@ -34,7 +34,7 @@ def _write_stub(path, body):
 def test_bootstrap_parses_outer_scope_on_success(tmp_path, monkeypatch):
     stub = _write_stub(tmp_path / "bootstrap-ok", """
 import sys
-print("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor")
+print("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", stub)
@@ -95,7 +95,7 @@ def _outcome_line(state, klass, reason="", detail=""):
 def test_acquire_worker_parses_grant_and_holds_process(tmp_path, monkeypatch):
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-ok",
-        "aira-worker-admit state=granted class=granted "
+        "aira-worker-admit state=granted class=granted containment=enforced "
         "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400",
         hold_stdin=True, exit_code=0,
     )
@@ -103,7 +103,10 @@ def test_acquire_worker_parses_grant_and_holds_process(tmp_path, monkeypatch):
     supervisor.outer_scope = "/outer"
     grant, process = supervisor.acquire_worker(400)
     try:
-        assert grant == {"scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400"}
+        assert grant == {
+            "scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400",
+            "containment": "enforced",
+        }
     finally:
         process.stdin.close()
         process.wait(timeout=5)
@@ -120,7 +123,7 @@ def test_acquire_worker_accepts_a_grant_still_carrying_the_retired_memory_high(t
     suite. The extra key is simply ignored, exactly as any unknown key is."""
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-stale-memory-high",
-        "aira-worker-admit state=granted class=granted "
+        "aira-worker-admit state=granted class=granted containment=enforced "
         "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400 memory_high=320",
         hold_stdin=True, exit_code=0,
     )
@@ -128,7 +131,10 @@ def test_acquire_worker_accepts_a_grant_still_carrying_the_retired_memory_high(t
     supervisor.outer_scope = "/outer"
     grant, process = supervisor.acquire_worker(400)
     try:
-        assert grant == {"scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400"}
+        assert grant == {
+            "scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400",
+            "containment": "enforced",
+        }
     finally:
         process.stdin.close()
         process.wait(timeout=5)
@@ -136,7 +142,7 @@ def test_acquire_worker_accepts_a_grant_still_carrying_the_retired_memory_high(t
 
 def _acquire_with_swap_cap(tmp_path, monkeypatch, name, token, supervisor=None):
     line = (
-        "aira-worker-admit state=granted class=granted "
+        "aira-worker-admit state=granted class=granted containment=enforced "
         "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400"
     )
     if token:
@@ -343,7 +349,7 @@ def test_acquire_worker_detail_cannot_forge_a_grant(tmp_path, monkeypatch):
     """`detail` is free text and is query-escaped on the wire. A detail whose
     plaintext spells out a grant must not be able to inject fields: if the
     escaping or the parser regressed, this would return a grant for /evil."""
-    hostile = "state=granted class=granted scope=/evil worker_id=9 memory_max=1"
+    hostile = "state=granted class=granted containment=enforced scope=/evil worker_id=9 memory_max=1"
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-hostile-detail",
         _outcome_line("denied", "contended", "insufficient-headroom", hostile),
@@ -387,7 +393,7 @@ def test_acquire_worker_removes_the_granted_scope_dir_on_malformed_grant(tmp_pat
     scope_dir.mkdir()
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-malformed-real-scope",
-        "aira-worker-admit state=granted class=granted scope=%s worker_id=1 "
+        "aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 "
         "memory_max=notanumber" % urllib.parse.quote_plus(str(scope_dir)),
         exit_code=0,
     )
@@ -412,7 +418,7 @@ def test_acquire_worker_releases_malformed_grant_missing_required_field(tmp_path
     stub = _write_stub(tmp_path / "worker-admit-missing-memory-max", f"""
 import os, sys
 open({str(pid_path)!r}, "w").write(str(os.getpid()))
-print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1")
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%2Fouter%2F.aira-worker-1 worker_id=1")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -433,7 +439,7 @@ def test_acquire_worker_releases_malformed_grant_invalid_memory_limit(tmp_path, 
     stub = _write_stub(tmp_path / "worker-admit-invalid-memory-max", f"""
 import os, sys
 open({str(pid_path)!r}, "w").write(str(os.getpid()))
-print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=notanumber")
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=notanumber")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -466,7 +472,7 @@ def test_acquire_worker_malformed_grant_does_not_deadlock_on_a_relay_holding_std
     whole suite."""
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-malformed-grant-holds-stdin",
-        "aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 "
+        "aira-worker-admit state=granted class=granted containment=enforced scope=%2Fouter%2F.aira-worker-1 "
         "worker_id=1 memory_max=notanumber",
         hold_stdin=True, exit_code=0,
     )
@@ -508,7 +514,7 @@ def test_recycle_after_max_tests_respawns_a_fresh_worker(tmp_path, monkeypatch, 
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit_calls = tmp_path / "admit-calls"
@@ -517,7 +523,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -562,7 +568,7 @@ def test_recycle_with_two_concurrent_workers_does_not_hang_on_retirement(tmp_pat
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit_calls = tmp_path / "admit-calls-2"
@@ -571,7 +577,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -630,7 +636,7 @@ def test_spawn_worker_child_closes_its_admit_stderr_fd(tmp_path, monkeypatch):
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 try:
@@ -765,14 +771,14 @@ def test_crash_mid_test_requeues_once_then_reports_unevaluated(tmp_path, monkeyp
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -804,14 +810,14 @@ def test_crash_on_one_worker_does_not_corrupt_sibling_worker_results(tmp_path, m
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1105,7 +1111,7 @@ def test_persistent_denial_at_last_worker_retirement_never_ends_run_early(tmp_pa
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     denial_state = tmp_path / "denials-remaining"
@@ -1127,7 +1133,7 @@ if calls > 1:
         sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d-%d" % (os.getpid(), calls))
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, calls))
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, calls))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1193,12 +1199,12 @@ def test_malformed_worker_grant_is_terminal_without_losing_collected_results(tmp
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit-malformed", """
 import sys
-print("aira-worker-admit state=granted class=granted scope=/outer/.aira-worker-1 worker_id=1")
+print("aira-worker-admit state=granted class=granted containment=enforced scope=/outer/.aira-worker-1 worker_id=1")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -1240,7 +1246,7 @@ def test_worker_admit_denied_does_not_disable_daemon_and_still_completes(tmp_pat
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     denial_state = tmp_path / "denials-remaining"
@@ -1255,7 +1261,7 @@ if remaining > 0:
     sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1307,7 +1313,7 @@ def test_request_too_large_at_last_worker_replacement_marks_queue_unevaluated(tm
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     call_state = tmp_path / "admit-calls"
@@ -1320,7 +1326,7 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+    print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 elif count == 1:
@@ -1368,7 +1374,7 @@ def test_worker_admit_request_too_large_marks_queue_unevaluated_without_disablin
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", """
@@ -1415,7 +1421,7 @@ def test_persistent_denial_never_disables_daemon_or_falls_back(tmp_path, monkeyp
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     denial_state = tmp_path / "denials-remaining"
@@ -1430,7 +1436,7 @@ if remaining > 0:
     sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1464,14 +1470,14 @@ def test_dispatch_handles_parametrized_nodeid_containing_a_space(tmp_path, monke
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1567,7 +1573,7 @@ def test_fallback_worker_count_capped_at_pool_size_not_added_on_top(tmp_path, mo
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit_state = tmp_path / "admit-count"
@@ -1580,7 +1586,7 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+    print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
@@ -1646,7 +1652,7 @@ def test_startup_never_admits_more_workers_than_there_is_queued_work(tmp_path, m
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit_calls = tmp_path / "admit-calls"
@@ -1655,7 +1661,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1685,7 +1691,7 @@ def test_startup_admits_one_worker_per_queued_test_up_to_the_pool_size(tmp_path,
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit_calls = tmp_path / "admit-calls"
@@ -1694,7 +1700,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -2066,14 +2072,14 @@ def test_drain_worker_discards_staged_events_on_a_crash_before_the_result_line(t
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -2123,14 +2129,14 @@ def test_run_synthesizes_and_replays_an_honest_report_for_a_twice_crashed_nodeid
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -2174,7 +2180,7 @@ def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_q
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     call_state = tmp_path / "admit-calls"
@@ -2187,7 +2193,7 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+    print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
@@ -2431,7 +2437,7 @@ def test_unresponsive_admit_relay_does_not_wedge_the_whole_pool(tmp_path, monkey
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     counter = tmp_path / "admit-calls"
@@ -2451,7 +2457,7 @@ if n == 3:
     time.sleep(600)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -3172,14 +3178,14 @@ def test_worker_killed_behind_a_forked_grandchild_is_detected_and_the_run_finish
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
 sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -3318,35 +3324,49 @@ def test_worker_death_falls_back_to_the_generic_reason_rather_than_guessing(tmp_
         ), "%s must not produce a fabricated OOM diagnosis, got %r" % (name, reason)
 
 
-def test_ci_shim_mode_runs_the_whole_suite_on_the_fallback_pool(tmp_path, monkeypatch, pytester, capsys):
-    """AIRA-121 ticket test (d), and the correction gate condition C1 forced.
+# The advisory containment grade as it appears ON THE WIRE: query-escaped, since
+# WorkerAdmitOutcomeLine escapes every value. Written once here so a stub cannot
+# quietly hand the parser a differently-escaped spelling that happens to work.
+_ADVISORY_TOKEN = urllib.parse.quote_plus("advisory(ci-shim,no-cgroup,no-kill-backstop)")
 
-    In ci-shim mode there is no cgroup, so aitest-bootstrap fails cleanly and
-    worker-admit answers state=unavailable class=admission-unusable. Both must
-    resolve to _disable_daemon and the bare-fork fallback pool, with ONE honest
-    warning and every test still reported.
 
-    THE COUNTEREXAMPLE THIS PINS is the plan's original design: a shim daemon
-    answering state=unevaluated carries class=contended, which is RETRIABLE, so
-    _wait_for_admission_or_disable would poll a reachable-but-never-granting
-    daemon forever -- "a daemon that stays reachable but saturated forever means
-    the run genuinely waits forever". The suite would HANG rather than fall back.
+def test_ci_shim_ledger_only_admission_governs_the_whole_suite_without_a_cgroup(
+    tmp_path, monkeypatch, pytester, capsys
+):
+    """AIRA-123, the headline behaviour end to end.
 
-    The DEADLINE is therefore load-bearing and not decoration: an infinite-wait
-    regression must FAIL this test rather than hang it, so the whole run is
-    bounded by a wall-clock budget and a run that exceeds it is a failure.
+    In ci-shim mode aitest-bootstrap SUCCEEDS with admission=ledger-only and no
+    supervisor_scope, and every worker is admitted by a real daemon-side ledger
+    grant that carries containment=advisory and no cgroup coordinates. The run
+    must therefore stay DAEMON-BACKED -- daemon_available True, every worker
+    admitted -- while skipping every cgroup-dependent step.
+
+    THE COUNTEREXAMPLE THIS PINS is AIRA-121's shipped behaviour, which this
+    ticket supersedes: a bootstrap that fails and a worker-admit that answers
+    admission-unusable both call _disable_daemon and drop the whole suite to the
+    UNGOVERNED bare-fork pool. That implementation passes "all three tests
+    passed" and fails `daemon_available is True` and the admitted-worker count.
+
+    The relay counts its own invocations into a file, so "workers were really
+    admitted" is proved by the admission path having RUN, not inferred from the
+    suite merely finishing -- a fallback pool finishes too.
     """
-    bootstrap = _write_stub(tmp_path / "bootstrap-shim", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: ci-shim mode has no cgroup scope to bootstrap an aitest supervisor into\\n")
-sys.exit(4)
+    admits = tmp_path / "admit-count"
+    bootstrap = _write_stub(tmp_path / "bootstrap-ledger", """
+print("outer=ci-shim admission=ledger-only")
 """)
-    admit = _write_stub(tmp_path / "worker-admit-shim", """
-import sys
-print("aira-worker-admit state=unavailable class=admission-unusable reason=ci-shim-no-sub-scope")
+    admit = _write_stub(tmp_path / "worker-admit-ledger", """
+import os, sys
+assert "--outer-scope" in sys.argv, sys.argv
+scope = sys.argv[sys.argv.index("--outer-scope") + 1]
+assert scope == "ci-shim", "the relay must be asked about the ci-shim sentinel, got " + repr(scope)
+with open({counter!r}, "a") as handle:
+    handle.write("1\\n")
+print("aira-worker-admit state=granted class=granted containment=" + {advisory!r} +
+      " worker_id=" + str(os.getpid()) + " reserved=104857600 cpu_slots=unevaluated")
 sys.stdout.flush()
-sys.exit(4)
-""")
+sys.stdin.read()
+""".format(counter=str(admits), advisory=_ADVISORY_TOKEN))
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
@@ -3363,34 +3383,261 @@ sys.exit(4)
     """)
     supervisor = Supervisor()
     supervisor.bootstrap()
+    assert supervisor.admission_mode == "ledger-only"
+    assert supervisor.outer_scope == "ci-shim"
+    assert supervisor.supervisor_scope is None, (
+        "ci-shim has no supervisor cgroup and must not name one"
+    )
     supervisor.collect(items)
 
     deadline = time.monotonic() + 60.0
     results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
-    assert time.monotonic() < deadline, (
-        "the ci-shim run did not finish inside its budget: a worker-admit answer "
-        "classed contended is retriable and makes this wait forever"
-    )
+    assert time.monotonic() < deadline, "the ledger-only run did not finish inside its budget"
 
     assert len(results) == 3
     assert all(outcome == "passed" for outcome in results.values()), results
-    assert supervisor.daemon_available is False, (
-        "ci-shim must DISABLE daemon-backed admission and run the bare-fork pool, "
-        "not keep retrying a daemon that structurally cannot grant"
+    assert supervisor.daemon_available is True, (
+        "ledger-only admission FUNCTIONS: disabling the daemon here throws away the "
+        "whole point of AIRA-123 and runs the suite ungoverned"
+    )
+    assert admits.exists() and admits.read_text().count("1") >= 1, (
+        "no worker was ever admitted through the relay: the suite ran on the "
+        "fallback pool, which is exactly the outcome this ticket replaces"
     )
     stderr = capsys.readouterr().err
-    assert stderr.count("aira aitest:") == 1, (
-        "exactly one honest fallback warning, never one per worker: %r" % stderr
+    assert "LEDGER-ONLY" in stderr and "no kill backstop" in stderr, (
+        "the run must be told ONCE that its governance is admission-only: %r" % stderr
+    )
+    assert "falling back to n_workers" not in stderr, (
+        "the unconfined-fallback warning must not fire: %r" % stderr
     )
 
 
-def test_ci_shim_worker_admit_answer_maps_to_unavailable_not_denied():
-    """The exact wire answer the ci-shim daemon emits must classify as
-    WorkerAdmitUnavailable (terminal, fires _disable_daemon), never as
-    WorkerAdmitDenied (retriable, polls forever)."""
-    fields = _parse_worker_admit_outcome(
-        "aira-worker-admit state=unavailable class=admission-unusable reason=ci-shim-no-sub-scope"
+def test_ci_shim_grant_carries_no_scope_and_skips_every_cgroup_step(tmp_path, monkeypatch):
+    """The advisory grant parses into an explicit `scope: None`, which is what
+    makes spawn_worker skip place_self, the placement ack and the memory
+    watermark while still holding the admit lease."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-advisory",
+        "aira-worker-admit state=granted class=granted "
+        "containment=advisory%28ci-shim%2Cno-cgroup%2Cno-kill-backstop%29 "
+        "worker_id=7 reserved=104857600",
+        hold_stdin=True, exit_code=0,
     )
-    assert fields["state"] == "unavailable"
-    assert _OUTCOME_CLASS_EXCEPTIONS[fields["class"]] is WorkerAdmitUnavailable
-    assert _OUTCOME_CLASS_EXCEPTIONS[fields["class"]] is not WorkerAdmitDenied
+    supervisor = Supervisor()
+    supervisor.outer_scope = "ci-shim"
+    supervisor.admission_mode = "ledger-only"
+    grant, process = supervisor.acquire_worker(400)
+    try:
+        assert grant["scope"] is None, (
+            "a ledger-only grant must present an explicit absence of scope, not a "
+            "missing key and never a path: %r" % grant
+        )
+        assert grant["containment"] == "advisory(ci-shim,no-cgroup,no-kill-backstop)"
+        assert grant["reserved"] == "104857600"
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+
+
+def test_a_grant_whose_grade_disagrees_with_the_bootstrapped_backend_is_refused(tmp_path, monkeypatch):
+    """BOTH directions, and the second is the safety-critical one.
+
+    A run that bootstrapped into the enforced cgroup backend receiving an
+    ADVISORY grant is containment being silently downgraded mid-suite -- the one
+    outcome AIRA-123's honesty requirement must make impossible. It is refused as
+    a WorkerAdmitContractViolation: terminal and loud, never a silent fallback.
+    """
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-advisory-to-enforced-run",
+        "aira-worker-admit state=granted class=granted "
+        "containment=advisory%28ci-shim%2Cno-cgroup%2Cno-kill-backstop%29 "
+        "worker_id=7 reserved=104857600",
+        exit_code=0,
+    )
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    assert supervisor.admission_mode == "cgroup-sub-scope", (
+        "a supervisor that has not bootstrapped must expect the ENFORCED backend: "
+        "the opposite default would accept an advisory grant into a run that never "
+        "learned it was advisory"
+    )
+    with pytest.raises(WorkerAdmitContractViolation):
+        supervisor.acquire_worker(400)
+
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-enforced-to-ledger-run",
+        "aira-worker-admit state=granted class=granted containment=enforced "
+        "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400",
+        exit_code=0,
+    )
+    ledger_run = Supervisor()
+    ledger_run.outer_scope = "ci-shim"
+    ledger_run.admission_mode = "ledger-only"
+    with pytest.raises(WorkerAdmitContractViolation):
+        ledger_run.acquire_worker(400)
+
+
+def test_a_grant_with_no_containment_grade_is_refused(tmp_path, monkeypatch):
+    """An ABSENT grade must never be read as enforced. This is the shape every
+    pre-AIRA-123 daemon emits, and treating its silence as the strong claim is
+    precisely the reading the token exists to prevent."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-no-grade",
+        "aira-worker-admit state=granted class=granted "
+        "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400",
+        exit_code=0,
+    )
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    with pytest.raises(WorkerAdmitContractViolation):
+        supervisor.acquire_worker(400)
+
+
+def test_an_advisory_grant_naming_a_cgroup_scope_is_refused(tmp_path, monkeypatch):
+    """The forbidden-key half. A ledger-only grant that also named a scope would
+    be read as placed by every consumer that tests `scope` first -- which is all
+    of them, since that is what the field was for."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-advisory-with-scope",
+        "aira-worker-admit state=granted class=granted "
+        "containment=advisory%28ci-shim%2Cno-cgroup%2Cno-kill-backstop%29 "
+        "scope=%2Fouter%2F.aira-worker-1 worker_id=7 reserved=104857600",
+        exit_code=0,
+    )
+    supervisor = Supervisor()
+    supervisor.outer_scope = "ci-shim"
+    supervisor.admission_mode = "ledger-only"
+    with pytest.raises(WorkerAdmitContractViolation):
+        supervisor.acquire_worker(400)
+
+
+def test_bootstrap_without_an_admission_grade_disables_the_daemon(tmp_path, monkeypatch, capsys):
+    """The backend grade is required, never defaulted. A bootstrap that does not
+    state one is out of lockstep with this supervisor, and guessing the enforced
+    backend would surface as a mismatch far later, mid-suite."""
+    bootstrap = _write_stub(tmp_path / "bootstrap-no-grade", """
+print("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor")
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    supervisor = Supervisor()
+    supervisor.bootstrap()
+    assert supervisor.daemon_available is False
+    assert "out of lockstep" in capsys.readouterr().err
+
+
+def test_ci_shim_worker_registers_with_no_placement_handshake(tmp_path, monkeypatch, pytester):
+    """A ledger-only worker registers WITHOUT any placement handshake.
+
+    Named for what it proves, and no more (build-review: it previously claimed a
+    startup death it never exercised -- that case is the test directly below).
+    There is no cgroup to join in ledger-only mode, so there is nothing for an
+    ack to confirm; keeping the ack would give this path a failure surface whose
+    only meaning is WorkerPlacementFailed, "the local cgroup mechanism is
+    broken", which strips containment for the rest of the run.
+
+    Non-porous: against the shipped pre-AIRA-123 behaviour this fails at
+    spawn_worker, which calls place_self(None) and raises WorkerPlacementFailed
+    before any assertion below is reached.
+    """
+    admit = _write_stub(tmp_path / "worker-admit-ledger-die", """
+import os, sys
+print("aira-worker-admit state=granted class=granted containment=" + {advisory!r} +
+      " worker_id=" + str(os.getpid()) + " reserved=104857600")
+sys.stdout.flush()
+sys.stdin.read()
+""".format(advisory=_ADVISORY_TOKEN))
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "ci-shim"
+    supervisor.admission_mode = "ledger-only"
+    supervisor.collect(items)
+    pid = supervisor.spawn_worker(100 * (1 << 20))
+    assert pid in supervisor.workers, (
+        "a ledger-only worker must register without any placement handshake"
+    )
+    assert supervisor.workers[pid]["grant"]["scope"] is None
+    assert supervisor.daemon_available is True
+    for state in list(supervisor.workers.values()):
+        state["dispatch_write"].write("__stop__\n")
+        state["dispatch_write"].flush()
+    for worker_pid, state in list(supervisor.workers.items()):
+        supervisor._retire_worker(worker_pid, state)
+
+
+def test_ci_shim_worker_killed_before_any_result_takes_the_mid_run_death_path(
+    tmp_path, monkeypatch, pytester
+):
+    """A ledger-only worker that dies before reporting anything is handled where
+    every other mid-run death is, with a REAL SIGKILL of a REAL forked worker.
+
+    This is the case the test above used to claim and never exercised
+    (build-review). It is not a formality: a scope-less grant reaches
+    _describe_worker_death and _forget_worker_scope on this path, and both read
+    grant["scope"] -- so an implementation that assumed a scope is always a path
+    raises TypeError out of the dispatch loop instead of retiring the worker.
+    The assertions pin the whole disposition: retired, no WorkerPlacementFailed,
+    containment NOT stripped for the rest of the run (daemon_available stays
+    True, which is what WorkerPlacementFailed's _replace_worker path would
+    destroy), the undispatched nodeid still queued, and a replacement asked for.
+    _describe_worker_death is not asserted on beyond running without raising --
+    it is reached with scope=None, which is the TypeError above.
+
+    _replace_worker is stubbed so the spawned replacement does not outlive the
+    test; whether it is CALLED is itself part of what a mid-run death means.
+    """
+    admit = _write_stub(tmp_path / "worker-admit-ledger-killed", """
+import os, sys
+print("aira-worker-admit state=granted class=granted containment=" + {advisory!r} +
+      " worker_id=" + str(os.getpid()) + " reserved=104857600")
+sys.stdout.flush()
+sys.stdin.read()
+""".format(advisory=_ADVISORY_TOKEN))
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "ci-shim"
+    supervisor.admission_mode = "ledger-only"
+    supervisor.collect(items)
+    pid = supervisor.spawn_worker(100 * (1 << 20))
+    state = supervisor.workers[pid]
+    assert state["grant"]["scope"] is None
+
+    replacements = []
+    supervisor._replace_worker = lambda: replacements.append(True)
+
+    # Nothing has been dispatched, so in_flight is None: this worker died before
+    # producing any result at all.
+    assert state["in_flight"] is None
+    os.kill(pid, signal.SIGKILL)
+    watched = [fd for fd in (state["result_fd"], state.get("pidfd")) if fd is not None]
+    deadline = time.monotonic() + 10
+    ready = []
+    while not ready and time.monotonic() < deadline:
+        ready, _, _ = select.select(watched, [], [], 0.1)
+    assert ready, "the killed worker's death was never observable on its own fds"
+
+    supervisor._service_ready_workers(
+        ready,
+        {state["result_fd"]: (pid, state)},
+        {state["pidfd"]: (pid, state)} if state.get("pidfd") is not None else {},
+    )
+
+    assert pid not in supervisor.workers, "a dead ledger-only worker must be retired"
+    assert supervisor.daemon_available is True, (
+        "a ledger-only worker's death is not evidence that admission is unusable; "
+        "stripping containment here would ungovern the rest of the suite"
+    )
+    assert supervisor.results == {}, "no nodeid was in flight, so nothing may be recorded"
+    assert len(supervisor.queue) == 1, (
+        "the collected nodeid was never dispatched, so it must still be queued -- "
+        "neither consumed by this death nor requeued twice"
+    )
+    assert replacements == [True], "a mid-run death asks for a replacement worker"

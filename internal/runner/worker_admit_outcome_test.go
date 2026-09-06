@@ -27,7 +27,7 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 				Reason: WorkerAdmitReasonUnknownDaemonOutcome,
 				// A hostile detail: if the renderer did not escape it, this
 				// would forge a grant on the far side.
-				Detail: "state=granted class=granted scope=/evil worker_id=9\nmemory_max=1 memory_high=1 100% =",
+				Detail: "state=granted class=granted containment=enforced scope=/evil worker_id=9\nmemory_max=1 memory_high=1 100% =",
 			},
 		},
 		{
@@ -55,10 +55,39 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 			},
 			grant: &WorkerAdmitGrantFields{
 				ScopePath: "/sys/fs/cgroup/a b/.aira-worker-1", WorkerID: "1",
-				MemoryMax: 400 << 20,
+				MemoryMax: 400 << 20, Containment: WorkerAdmitContainmentEnforced,
 			},
 		},
 	}
+	// AIRA-123: the advisory grade round-trips too, and carries a DIFFERENT set
+	// of keys. Its token count is asserted separately below because the shared
+	// wantTokens arithmetic above is written for the enforced shape.
+	t.Run("granted ledger-only with no placement fields", func(t *testing.T) {
+		line, err := WorkerAdmitOutcomeLine(
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{
+				WorkerID: "7", Containment: WorkerAdmitContainmentAdvisory, Reserved: 400 << 20,
+			})
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		fields, err := ParseWorkerAdmitOutcomeLine(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if fields["containment"] != WorkerAdmitContainmentAdvisory || fields["reserved"] != "419430400" {
+			t.Fatalf("advisory grade or reservation lost: %v", fields)
+		}
+		// ABSENCE, not emptiness. `scope=` with an empty value would still be a
+		// scope key to every reader that tests for presence -- which is how a
+		// ledger-only grant would come to be read as a placed one.
+		if _, present := fields["scope"]; present {
+			t.Fatalf("a ledger-only grant must carry NO scope key at all: %q", line)
+		}
+		if _, present := fields["memory_max"]; present {
+			t.Fatalf("a ledger-only grant must carry NO memory_max key at all: %q", line)
+		}
+	})
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			line, err := WorkerAdmitOutcomeLine(test.outcome, test.grant)
@@ -87,12 +116,14 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 				}
 			}
 			if test.grant != nil {
-				// scope, worker_id, memory_max — the three keys the supervisor
-				// REQUIRES. AIRA-35 removed memory_high from that set; swap_cap
-				// and cpu_slots are optional and empty in this fixture, so a
-				// renderer that started emitting either unconditionally would
-				// break this count rather than slipping through.
-				wantTokens += 3
+				// containment, worker_id, scope, memory_max — the four keys an
+				// ENFORCED grant carries. AIRA-35 removed memory_high from the
+				// set; AIRA-123 added containment (required on every grade) and
+				// `reserved` (advisory only, so absent here). swap_cap and
+				// cpu_slots are optional and empty in this fixture, so a renderer
+				// that started emitting either unconditionally would break this
+				// count rather than slipping through.
+				wantTokens += 4
 			}
 			if got := len(strings.Fields(line)); got != wantTokens {
 				t.Fatalf("line split into %d tokens, want %d — free text broke tokenisation: %q",
@@ -132,7 +163,10 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 // distinction and turn silence into a claim.
 func TestWorkerAdmitOutcomeLineCarriesCPUSlots(t *testing.T) {
 	granted := WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted}
-	base := WorkerAdmitGrantFields{ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400}
+	base := WorkerAdmitGrantFields{
+		ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400,
+		Containment: WorkerAdmitContainmentEnforced,
+	}
 
 	for _, state := range []string{WorkerAdmitCPUSlotsOK, WorkerAdmitCPUSlotsUnevaluated} {
 		grant := base
@@ -185,7 +219,10 @@ func TestWorkerAdmitOutcomeLineCarriesCPUSlots(t *testing.T) {
 // this field exists to prevent -- so it gets the same treatment.
 func TestWorkerAdmitOutcomeLineCarriesSwapCap(t *testing.T) {
 	granted := WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted}
-	base := WorkerAdmitGrantFields{ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400}
+	base := WorkerAdmitGrantFields{
+		ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400,
+		Containment: WorkerAdmitContainmentEnforced,
+	}
 
 	for _, state := range []string{
 		WorkerAdmitSwapCapEnforced, WorkerAdmitSwapCapNotApplicable, WorkerAdmitSwapCapUnavailable,
@@ -245,6 +282,55 @@ func TestWorkerAdmitOutcomeLineRefusesInconsistentOutcomes(t *testing.T) {
 			"state granted but class not",
 			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassContended},
 			&WorkerAdmitGrantFields{},
+		},
+		// AIRA-123: the containment grade is required and its coordinates are
+		// checked in BOTH directions. Each row below is a shape a producer
+		// could plausibly emit and a consumer would then read as the wrong
+		// grade -- which is the whole failure this ticket must make
+		// unrepresentable.
+		{
+			"granted with no containment grade at all",
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400},
+		},
+		{
+			"granted with an uncatalogued containment grade",
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{ScopePath: "/o/.aira-worker-1", WorkerID: "1", MemoryMax: 400, Containment: "sort-of"},
+		},
+		{
+			"advisory grant naming a cgroup scope",
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{
+				ScopePath: "/outer/.aira-worker-1", WorkerID: "1",
+				Containment: WorkerAdmitContainmentAdvisory, Reserved: 400,
+			},
+		},
+		{
+			"advisory grant reporting a memory_max nothing enforces",
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{
+				WorkerID: "1", MemoryMax: 400,
+				Containment: WorkerAdmitContainmentAdvisory, Reserved: 400,
+			},
+		},
+		{
+			"advisory grant with no reservation",
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{WorkerID: "1", Containment: WorkerAdmitContainmentAdvisory},
+		},
+		{
+			"enforced grant with no scope path",
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{WorkerID: "1", MemoryMax: 400, Containment: WorkerAdmitContainmentEnforced},
+		},
+		{
+			"enforced grant also carrying an advisory reservation",
+			WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted},
+			&WorkerAdmitGrantFields{
+				ScopePath: "/o/.aira-worker-1", WorkerID: "1", MemoryMax: 400,
+				Containment: WorkerAdmitContainmentEnforced, Reserved: 400,
+			},
 		},
 		{
 			"class granted but state not",
