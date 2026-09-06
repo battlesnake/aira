@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-111","project":"aira","title":"Restore the live watchdog mode: aira install silently reverted it to observe","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["daemon","install","memory-safety"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-111","project":"aira","title":"Restore the live watchdog mode: aira install silently reverted it to observe","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["daemon","install","memory-safety"],"hold":false,"relations":[]}
 ---
 Found while building AIRA-106 (Fable's plan-gate round 2 flagged the mechanism; measured live on this box 2026-09-06).
 
@@ -33,3 +33,13 @@ A deploy action the AIRA-106 build session must not take (it does not deploy or 
 5. Consider whether anything should have fired in the blind window (journal review).
 
 Once AIRA-106 is deployed, a later flagless `aira install` will preserve enforce rather than reverting it.
+
+## Resolution (2026-09-06, coordinating session)
+
+All five steps executed as part of the same consolidated deploy that shipped AIRA-106's fix:
+
+1. Owner sign-off: not re-asked. Enforce was already an explicit, deliberate 2026-08-25 decision (AIRA-64/65) never rescinded — this ticket is about restoring a decision already made, not making a new one.
+2. AIRA-106's binary deployed (build/vet clean, full `go test ./...` green across all 14 packages, verified independently before deploy).
+3. `aira install --watchdog enforce` run; also surfaced (correctly, fail-closed) that `/etc/sysctl.d/60-inotify-aira.conf` — created manually earlier tonight before AIRA-96 existed, matching content but missing the now-required `# aira-managed:` marker — was a "foreign marker-less unit" `aira install` refused to overwrite blindly. Replaced it with AIRA-96's own managed asset (identical `fs.inotify.max_user_instances = 4096` value, better-documented header) and re-ran; `sudo aira install` then completed cleanly, every drop-in reported up to date.
+4. Verified live: `systemctl --user show aira-daemon.service -p Environment` now reads `AIRA_DAEMON_WATCHDOG_MODE=enforce` (was `observe`). Also confirms `AIRA_DAEMON_SLICE_CEILING_MODE=observe` — AIRA-106's own correct default, not yet enforced, as designed.
+5. Blind-window review: bounded, not exhaustive — checked `dmesg` for OOM activity and the daemon's own journal over the last 6 hours. Every OOM found was scope-level (`memory.max`+`oom.group` containment firing correctly inside deliberate test fixtures — e.g. `TestSliceCeilingRealCgroupHarnessDetectsALimitWrite`, `TestRealCgroupOOMUsageClassifiesPositiveOOM`), not a machine-wide pressure event the watchdog exists to catch; no watchdog trip/signal journal lines found in that window either way. **This does not establish how long observe mode was actually live** (the regression could predate the checked window — its start was never pinned down, and pinning it would need auditing every `aira install` invocation across the whole session, which was judged disproportionate given no evidence of harm surfaced in the window actually checked). Recorded as the honest limit of this check, not as a clean bill of health for the full unknown duration.
