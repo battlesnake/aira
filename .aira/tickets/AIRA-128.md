@@ -1,16 +1,31 @@
 ---
-{"schema":1,"id":"AIRA-128","project":"aira","title":"aira confine's default reservation estimate under-provisions heavy workloads (test-lite), producing phantom OOM-kill failures","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","estimator","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-128","project":"aira","title":"aira confine's default reservation estimate under-provisions the standalone `make test-lite` signature, producing phantom OOM-kill failures","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","estimator","honesty"],"hold":false,"relations":[]}
 ---
 Reported by peer session 'speed' relaying peer 'money's' evidence, 2026-09-06 (landing
-their #1199). Money's own numbers, quoted directly:
+their #1199), NARROWED by speed's own follow-up correction the same day. Money's own numbers,
+quoted directly:
 
-- Default `aira confine -- make merge-gate` (test-lite leg): **371 failed / exit 0** — verified
-  fake: the leg's real peak is ~3.3GB (targeted subset) or more (full), while the default estimate
-  caps it around ~1.26GB, so tests+workers get OOM-killed mid-run and the leg reports mass phantom
-  failures rather than the run being honestly flagged as OOM'd/unevaluated.
+- Default `aira confine -- make test-lite` run **STANDALONE** (its own command signature, keyed
+  to its own ~1.26GB estimate): **371 failed / exit 0** — verified fake: the leg's real peak is
+  ~3.3GB (targeted subset) or more (full), so tests+workers get OOM-killed mid-run and the leg
+  reports mass phantom failures rather than the run being honestly flagged as OOM'd/unevaluated.
 - Re-run at `aira confine --memory-max 16G`: **5900 passed / 1 failed** (the 1 was an unrelated
   pre-existing base-red, now cleared).
 - The narrower/targeted affected surface at `--memory-max 8G`: **555/0**.
+
+**SCOPE CORRECTION (speed, same day, with live evidence):** the original report over-generalised
+to "every merge-gate run." It does NOT. `make merge-gate` keys to its OWN, separately-estimated,
+CORRECTLY-SIZED signature (~38-41GB, reserve-basis estimate:max=38GB n=20), and test-lite's leg
+runs INSIDE that outer confine scope via plain xdist, with NO nested confine call of its own — so
+inside merge-gate it inherits the full ~41GB budget, not the standalone 1.26GB one, and does not
+OOM there. Speed's own gate run (BL-969) was live proof: 24GB→37GB under a 41GB scope, healthy.
+Speed has RETRACTED their earlier directive to pin `--memory-max 16G` on their merge-gate agent —
+doing so would have shrunk the correctly-provisioned ~41GB merge-gate scope down to 16GB and could
+have OOM'd the full engine leg instead, a worse regression than the one being fixed. **Do NOT
+touch merge-gate's own estimate — it is correct.** This ticket's actual, narrower target is the
+STANDALONE `aira confine -- make test-lite` command's own signature/estimate only — i.e. whatever
+a developer or a differently-configured CI leg runs when it invokes test-lite directly rather than
+through merge-gate's outer scope.
 
 Speed's framing: 'same PSI-OOM class as the earlier 44-phantom incident' — a precedent in their own
 history for this failure shape, not (as far as I can find) an AIRA ticket already covering this
@@ -19,13 +34,14 @@ counted against a per-test timeout — not this estimate-too-low-for-the-workloa
 
 ## Why this is serious, not just a nuisance
 
-This hits EVERY merge-gate run using the default estimate for this workload class. Worse than a
-simple failure: 371 failures under exit 0 can either waste a whole gate run investigating fake
-failures, or — the real danger — MASK a genuine failure hiding among the fakes. This is exactly the
-class of thing AIRA's own honesty rule exists to prevent ("a check that cannot establish its result
-reports unevaluated, never a fake pass or zero") — here inverted: a check that could not establish
-its result (because its own execution environment killed it) is reporting a fake FAIL, which is
-just as dishonest as a fake pass and arguably worse (it looks like real, actionable signal).
+Even narrowed to the standalone signature, this hits every direct `aira confine -- make test-lite`
+invocation. Worse than a simple failure: 371 failures under exit 0 can either waste a whole run
+investigating fake failures, or — the real danger — MASK a genuine failure hiding among the fakes.
+This is exactly the class of thing AIRA's own honesty rule exists to prevent ("a check that cannot
+establish its result reports unevaluated, never a fake pass or zero") — here inverted: a check that
+could not establish its result (because its own execution environment killed it) is reporting a
+fake FAIL, which is just as dishonest as a fake pass and arguably worse (it looks like real,
+actionable signal).
 
 ## Investigation started here, not finished — hand-off notes for whoever builds this
 
@@ -72,10 +88,13 @@ signature. Open questions to resolve before designing a fix, not to be assumed e
   (don't build new estimation machinery for a system that already self-heals).
 - If (2) is confirmed (attribution gap): fix the specific attribution path, scoped narrowly to
   whatever nesting/timing hides the OOM from ConfinePeakHistory.
-- Speed's suggested workaround (pin an explicit `--memory-max` floor on the test-lite target) is a
-  CONSUMER-repo change (merge_gate.sh / the test-lite Makefile target), not an AIRA-side fix, and is
-  explicitly out of this ticket's scope -- coordinate with peer session 'speed' (who sequences
-  gate-machinery edits) if that workaround is what ships short-term while this ticket is open.
+- Speed's originally-suggested workaround (pin an explicit `--memory-max` floor) is RETRACTED for
+  merge-gate itself -- merge-gate's own ~41GB estimate is correct and must not be touched; pinning
+  16G there would shrink a correctly-sized scope and could OOM the full engine leg instead. A
+  `--memory-max` floor remains a legitimate consumer-side workaround ONLY for a direct standalone
+  `aira confine -- make test-lite` invocation specifically, and would still be a CONSUMER-repo
+  change (whatever Makefile target runs test-lite standalone), not an AIRA-side fix -- coordinate
+  with peer session 'speed' (who sequences gate-machinery edits) if that ships short-term.
 
 ## Tests
 
