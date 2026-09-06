@@ -121,7 +121,13 @@ func nextCommandNumbers(ctx context.Context, conn *sql.Conn, project string) (in
 		return 0, 0, err
 	}
 	if number < 1 || sequence < 1 {
-		return 0, 0, errors.New(domain.CommandCodeInvalid + ": command event counter is invalid")
+		// Not E_COMMAND_INVALID (AIRA-107): that code is the caller-facing
+		// "your command-language program is malformed" answer, catalogued at
+		// exit 2, and nothing about this failure is the caller's request. The
+		// counter row is state AIRA itself wrote and can no longer trust, so it
+		// is an infrastructure failure (exit 4) and must not send an agent off
+		// to fix an argument that was fine.
+		return 0, 0, errors.New("E_COMMAND_COUNTER_CORRUPT: command event counter is invalid")
 	}
 	if _, err := conn.ExecContext(ctx, `UPDATE command_event_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
 		return 0, 0, err

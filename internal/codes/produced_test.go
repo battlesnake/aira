@@ -217,24 +217,43 @@ func TestCataloguedExitsFollowThePrefixConvention(t *testing.T) {
 // explicit table. It is deliberately exhaustive over AIRA-107's list rather than
 // a spot check, and it asserts both directions of the split within each family —
 // E_ADMIT_TOO_LARGE at 2 against E_ADMIT_SATURATED at 4, E_RANT_REDACTED at 2
-// against E_RANT_REDACTION_INCOMPLETE at 4, E_RUN_TELEMETRY_CONFLICT at 2
-// against E_RUN_USAGE_READ at 4 — because a lazy "move them all to 4" would pass
-// a one-sided check while destroying the distinction the buckets exist to carry.
+// against E_RANT_REDACTION_INCOMPLETE at 4 — because a lazy "move them all to 4"
+// would pass a one-sided check while destroying the distinction the buckets
+// exist to carry.
+//
+// Four of the eleven are decided AT 1. An earlier draft of this test rejected any
+// pin equal to ExitForCode's default on the theory that such a pin "proves
+// nothing", and that rule was wrong in a way worth recording: it encoded "every
+// one of the eleven must LEAVE 1" when the requirement is "every one must be
+// DECIDED". For the two index-divergence codes 1 is not merely defensible, it is
+// the only honest value — they are finding-only codes whose process exit is the
+// check verdict's (see codes.go and
+// core.TestFindingOnlyCodesExitAsTheirCheckVerdictDoes) — so the assertion made
+// the correct answer inexpressible without editing the test's own premise. A test
+// that forbids the right answer is worse than no test. The pin below plus the
+// reasoning at each catalogue entry is the record of the decision; the number
+// coinciding with the default for four of them is not evidence of anything.
 func TestRebucketedCodesFollowTheKindConvention(t *testing.T) {
-	// AIRA-107's decision, code by code. 2 = the request was bad; 4 = internal or
+	// AIRA-107's decision, code by code. 1 = a well-formed request some durable
+	// state refuses, or a failing check; 2 = the request was bad; 4 = internal or
 	// infrastructure failure.
 	want := map[string]int{
 		"E_ADMIT_SATURATED":           4,
 		"E_ADMIT_TOO_LARGE":           2,
 		"E_COMMAND_INVALID":           2,
-		"E_FINDING_INDEX_DIVERGENCE":  4,
-		"E_RELATION_INDEX_DIVERGENCE": 4,
-		"E_GATE_EXISTS":               2,
+		"E_FINDING_INDEX_DIVERGENCE":  1,
+		"E_RELATION_INDEX_DIVERGENCE": 1,
+		"E_GATE_EXISTS":               1,
 		"E_RANT_REDACTED":             2,
 		"E_RANT_REDACTION_INCOMPLETE": 4,
 		"E_RUN_RECONCILE_REQUIRED":    4,
-		"E_RUN_TELEMETRY_CONFLICT":    2,
-		"E_RUN_USAGE_READ":            4,
+		"E_RUN_TELEMETRY_CONFLICT":    1,
+		"E_RUN_USAGE_READ":            2,
+		// Not one of AIRA-87's eleven: AIRA-107 minted it when deciding
+		// E_COMMAND_INVALID's bucket, because that code had a second emitter
+		// (store.nextCommandNumbers) for which 2 would have been a misdiagnosis.
+		// Pinned here so the split cannot quietly collapse back.
+		"E_COMMAND_COUNTER_CORRUPT": 4,
 	}
 	for code, exit := range want {
 		catalogued, ok := ExitCodes[code]
@@ -248,24 +267,24 @@ func TestRebucketedCodesFollowTheKindConvention(t *testing.T) {
 		if got := ExitForCode(code); got != exit {
 			t.Errorf("ExitForCode(%s)=%d, want %d", code, got, exit)
 		}
-		if exit == ExitForCode("E_CODE_NOT_IN_MAP_SENTINEL") {
-			t.Errorf("%s is pinned at the ExitForCode default; AIRA-107 exists precisely to take these codes off the default, so a pin at that value proves nothing", code)
-		}
 	}
 
 	// The neighbours each decision was argued from. If one of these moves, the
 	// reasoning recorded in codes.go stops holding and the pin above becomes an
 	// arbitrary number rather than a family alignment.
 	family := map[string]int{
-		"E_ADMIT_WAIT_TOO_LONG":    2, // E_ADMIT_TOO_LARGE is the same bad-request kind.
-		"E_DAEMON_BUSY":            4, // E_ADMIT_SATURATED is the same capacity-exhaustion kind.
-		"E_ALREADY_INITIALIZED":    2, // E_GATE_EXISTS is the same already-exists refusal.
-		"E_RECONCILE_REQUIRED":     4, // E_RUN_RECONCILE_REQUIRED is its runner analogue.
-		"U_RUN_RECONCILE_REQUIRED": 3, // ...and the unevaluated twin stays at 3.
-		"E_JOURNAL_CORRUPT":        4, // The index-divergence pair is this store-integrity kind.
-		"E_RUN_CAPTURE_FAILED":     4, // E_RUN_USAGE_READ is the same I/O-read failure.
-		"E_RANT_INVALID":           2, // E_RANT_REDACTED is the same bad-request kind.
-		"E_RECEIPT_IO":             4, // E_RANT_REDACTION_INCOMPLETE is the same store-I/O kind.
+		"E_ADMIT_WAIT_TOO_LONG":     2, // E_ADMIT_TOO_LARGE is the same bad-request kind.
+		"E_DAEMON_BUSY":             4, // E_ADMIT_SATURATED is the same capacity-exhaustion kind.
+		"E_RELATION_EXISTS":         1, // E_GATE_EXISTS is the same already-exists state refusal.
+		"E_WRITE_CONFLICT":          1, // ...and E_RUN_TELEMETRY_CONFLICT is the same state conflict.
+		"E_RECONCILE_REQUIRED":      4, // E_RUN_RECONCILE_REQUIRED is its runner analogue.
+		"U_RUN_RECONCILE_REQUIRED":  3, // ...and the unevaluated twin stays at 3.
+		"E_RELATION_TARGET_MISSING": 1, // The index-divergence pair is this check-finding kind.
+		"E_DUPLICATE_ID":            1, // ...as is this one.
+		"E_RUN_ARGUMENT_INVALID":    2, // E_RUN_USAGE_READ shares its --usage wiring switch.
+		"E_RANT_INVALID":            2, // E_RANT_REDACTED is the same bad-request kind.
+		"E_RECEIPT_IO":              4, // E_RANT_REDACTION_INCOMPLETE is the same store-I/O kind.
+		"E_DB_CORRUPT":              4, // E_COMMAND_COUNTER_CORRUPT is the same store-integrity kind.
 	}
 	for code, exit := range family {
 		if got := ExitForCode(code); got != exit {

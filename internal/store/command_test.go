@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/codes"
 	"aira/internal/domain"
 	"aira/internal/gitcontext"
 )
@@ -258,3 +259,44 @@ func TestCommandRetentionDefaultsAndValidation(t *testing.T) {
 }
 
 var _ = sql.ErrNoRows
+
+// verifies: AIRA-107 — the corrupt persisted-counter path must not answer with
+// the caller-facing E_COMMAND_INVALID.
+//
+// nextCommandNumbers guards an invariant on state AIRA itself wrote: the
+// command_event_counter row's next_number and next_seq are monotonic and start
+// at 1. It used to report a violation as E_COMMAND_INVALID, which was harmless
+// while that code sat at ExitForCode's default (1) and stopped being harmless
+// the moment AIRA-107 decided E_COMMAND_INVALID at 2, because 2 means "the
+// request was bad" and tells an agent to go and fix an argv that was perfectly
+// fine. So the two emitters were split: E_COMMAND_INVALID keeps the argument
+// errors CommandEventInput.Validate raises, and this store-integrity failure
+// gets E_COMMAND_COUNTER_CORRUPT at 4.
+//
+// The test asserts the exit bucket and not just the code string, because the
+// bucket is the thing that was wrong and a code rename alone would not fix it.
+func TestCorruptCommandCounterIsAnInfrastructureFailureNotABadRequest(t *testing.T) {
+	s := testStore(t, t.TempDir(), filepath.Join(t.TempDir(), "common"), t.TempDir())
+	input := commandInput("go test", domain.CommandKeyProgramSubcommand, domain.CommandExited, commandPtr(0), commandPtr(1))
+	if _, err := s.AddCommandEvent(context.Background(), input); err != nil {
+		t.Fatalf("seed command event: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE command_event_counter SET next_number=0 WHERE project_id=?`, s.projectID); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.AddCommandEvent(context.Background(), input)
+	if err == nil {
+		t.Fatal("a corrupt command-event counter was accepted")
+	}
+	code := ErrorCode(err)
+	if code != "E_COMMAND_COUNTER_CORRUPT" {
+		t.Fatalf("corrupt counter reported %q (%v); E_COMMAND_INVALID here would blame the caller's request for AIRA's own broken state", code, err)
+	}
+	if exit := codes.ExitForCode(code); exit != 4 {
+		t.Fatalf("%s exits %d, want 4: a counter row AIRA wrote and can no longer trust is an infrastructure failure, not a bad request (2) and not a plain operation failure (1)", code, exit)
+	}
+	if exit := codes.ExitForCode("E_COMMAND_INVALID"); exit != 2 {
+		t.Fatalf("E_COMMAND_INVALID exits %d, want 2: this split exists because that code is the argument-error answer", exit)
+	}
+}
