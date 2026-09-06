@@ -109,15 +109,20 @@ func resolveInstallMode(d installDeps, opts installOpts) (string, CapabilityRepo
 // checkedAvailable rather than baked into the ceiling. Same primitive, different
 // environment, different correct answer.
 //
-// Both of the first two sources are also floored at minimumCeilingGiB, mirroring
-// the real --ci path's own resolveCIMemoryMax refusal (round-3 review finding
-// F4). The daemon's admission headroom is 2GiB base plus 64MiB per queued job
+// ALL THREE budget sources are floored at minimumCeilingGiB, mirroring the real
+// --ci path's own resolveCIMemoryMax refusal (round-3 review finding F4, plus
+// AIRA-130 for the MemTotal source round 4 left un-floored). The daemon's
+// admission headroom is 2GiB base plus 64MiB per queued job
 // (internal/daemon/admit.go); checkedAvailable answers a bare 0 whenever a
 // budget is at or below roughly that headroom, so a budget below the floor does
 // not merely admit smaller jobs, it admits NOTHING, ever, for the container's
 // whole life -- an entirely ordinary CI/k8s-Job container size away. Refusing it
 // here is one loud failure in one place, exactly like the "nothing readable"
-// case just above, rather than a silent per-job wedge discovered later.
+// case just above, rather than a silent per-job wedge discovered later. The
+// MemTotal source is no exception: a 2GiB-class host (e2-small, t3.small) with
+// an unbounded container memory.max reaches it and produces exactly the same
+// permanently wedged ledger, and the real --ci path floors ITS host-wide source
+// (MemAvailable) identically.
 func resolveShimBudget(d installDeps, opts installOpts, report CapabilityReport) (int64, string, string, error) {
 	if opts.memoryMax != "" {
 		bytes, err := sizeBytes(opts.memoryMax)
@@ -142,6 +147,11 @@ func resolveShimBudget(d installDeps, opts installOpts, report CapabilityReport)
 		}
 	}
 	if report.MemTotalBytes > 0 {
+		if report.MemTotalBytes < int64(minimumCeilingGiB)<<30 {
+			return 0, "", "", unavailable(fmt.Errorf(
+				"ci-shim: /proc/meminfo MemTotal is %s, below the %dG ci-shim ledger floor; the daemon's admission headroom (2GiB base + 64MiB per job) would leave nothing to grant and every job would wedge at E_ADMIT_TOO_LARGE forever -- this host is smaller than the floor, so pass an explicit --memory-max only if this container really does have that much to spend",
+				formatCeilingBytes(report.MemTotalBytes), minimumCeilingGiB))
+		}
 		return report.MemTotalBytes, runner.ShimBudgetSourceMemTotal, "", nil
 	}
 	return 0, "", "", unavailable(errors.New(
