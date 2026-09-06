@@ -395,6 +395,99 @@ func TestShimInstallFailsWhenNoBudgetCanBeEstablished(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-121 review round 3, finding F4
+//
+// A DECLARED --memory-max budget below the 4G floor is REFUSED at install,
+// mirroring resolveCIMemoryMax's real-path refusal (install.go:1215-1218). The
+// daemon's admission headroom is 2GiB base + 64MiB/job
+// (internal/daemon/admit.go); a budget at or below roughly that headroom makes
+// checkedAvailable answer 0 for EVERY job, forever -- an entirely ordinary
+// CI/k8s-Job container size (2GiB), not an exotic misconfiguration. Failing
+// loudly here beats a shim that installs cleanly, prints a healthy-looking
+// "advisory admission ledger active" message, and then wedges every job with
+// E_ADMIT_TOO_LARGE cap_minus_headroom=0 for its whole life.
+//
+// Counterexample this fails against: the pre-fix resolveShimBudget, which
+// applied sizeBytes' floor=false path and accepted any positive declared size.
+func TestShimInstallRefusesADeclaredBudgetBelowTheFloor(t *testing.T) {
+	d, state := newFakeInstall(t)
+	d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+	d.readFile = shimProcReader(nil)
+	d.spawnShimDaemon = func(shimDaemonSpec) error {
+		t.Fatal("started an ungated shim daemon under a sub-floor budget")
+		return nil
+	}
+
+	err := runInstall(d, installOpts{ciValue: "shim", memoryMax: "2G", stage: installStageBuild})
+	if err == nil || !strings.Contains(err.Error(), CodeUnavailable) {
+		t.Fatalf("err=%v, want a %s refusal for a 2G declared budget", err, CodeUnavailable)
+	}
+	if !strings.Contains(err.Error(), "2.00GiB") || !strings.Contains(err.Error(), "4G") {
+		t.Fatalf("refusal %q does not name both the offending value and the floor", err)
+	}
+}
+
+// verifies: AIRA-121 review round 3, finding F4
+//
+// The SAME floor applies to a budget read from the container's OWN cgroup
+// memory.max (source=cgroup-memory-max), not only to a declared --memory-max --
+// the ceiling is unusable either way. The message names the container's own
+// limit and points at --memory-max as the workaround, since an operator may
+// not directly control how the surrounding container runtime sized this
+// container's own cgroup.
+func TestShimInstallRefusesACgroupDerivedBudgetBelowTheFloor(t *testing.T) {
+	d, state := newFakeInstall(t)
+	d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+	d.readFile = shimProcReader(map[string][]byte{
+		filepath.Join(cgroupRoot, "memory.max"): []byte("2147483648\n"), // exactly 2GiB
+	})
+	d.spawnShimDaemon = func(shimDaemonSpec) error {
+		t.Fatal("started an ungated shim daemon under a sub-floor budget")
+		return nil
+	}
+
+	err := runInstall(d, installOpts{ciValue: "shim", stage: installStageBuild})
+	if err == nil || !strings.Contains(err.Error(), CodeUnavailable) {
+		t.Fatalf("err=%v, want a %s refusal for a 2GiB container memory.max", err, CodeUnavailable)
+	}
+	if !strings.Contains(err.Error(), "2.00GiB") || !strings.Contains(err.Error(), "4G") || !strings.Contains(err.Error(), "--memory-max") {
+		t.Fatalf("refusal %q does not name the container's own limit, the floor, and the --memory-max workaround", err)
+	}
+}
+
+// verifies: AIRA-121 review round 3, finding F4
+//
+// A budget AT the floor (exactly 4G) is accepted from either source: the fix
+// must refuse below the floor, never AT it.
+func TestShimInstallAcceptsABudgetExactlyAtTheFloor(t *testing.T) {
+	t.Run("declared", func(t *testing.T) {
+		d, state := newFakeInstall(t)
+		d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+		d.readFile = shimProcReader(nil)
+		d.spawnShimDaemon = func(shimDaemonSpec) error { return nil }
+		if err := runInstall(d, installOpts{ciValue: "shim", memoryMax: "4G", stage: installStageBuild}); err != nil {
+			t.Fatalf("a 4G declared budget was refused: %v", err)
+		}
+		if record := readShimRecord(t, d); record.ShimBudgetBytes != 4<<30 {
+			t.Fatalf("budget=%d, want exactly the 4G floor", record.ShimBudgetBytes)
+		}
+	})
+	t.Run("cgroup-derived", func(t *testing.T) {
+		d, state := newFakeInstall(t)
+		d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+		d.readFile = shimProcReader(map[string][]byte{
+			filepath.Join(cgroupRoot, "memory.max"): []byte("4294967296\n"), // exactly 4GiB
+		})
+		d.spawnShimDaemon = func(shimDaemonSpec) error { return nil }
+		if err := runInstall(d, installOpts{ciValue: "shim", stage: installStageBuild}); err != nil {
+			t.Fatalf("a 4GiB container memory.max was refused: %v", err)
+		}
+		if record := readShimRecord(t, d); record.ShimBudgetBytes != 4<<30 {
+			t.Fatalf("budget=%d, want exactly the 4GiB floor", record.ShimBudgetBytes)
+		}
+	})
+}
+
 // verifies: AIRA-121 gate condition C3
 //
 // The privileged leg forwards the --ci VALUE and the --stage value. Forwarding a

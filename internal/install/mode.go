@@ -108,16 +108,36 @@ func resolveInstallMode(d installDeps, opts installOpts) (string, CapabilityRepo
 // limit and CURRENT usage is subtracted at admission time by the existing
 // checkedAvailable rather than baked into the ceiling. Same primitive, different
 // environment, different correct answer.
+//
+// Both of the first two sources are also floored at minimumCeilingGiB, mirroring
+// the real --ci path's own resolveCIMemoryMax refusal (round-3 review finding
+// F4). The daemon's admission headroom is 2GiB base plus 64MiB per queued job
+// (internal/daemon/admit.go); checkedAvailable answers a bare 0 whenever a
+// budget is at or below roughly that headroom, so a budget below the floor does
+// not merely admit smaller jobs, it admits NOTHING, ever, for the container's
+// whole life -- an entirely ordinary CI/k8s-Job container size away. Refusing it
+// here is one loud failure in one place, exactly like the "nothing readable"
+// case just above, rather than a silent per-job wedge discovered later.
 func resolveShimBudget(d installDeps, opts installOpts, report CapabilityReport) (int64, string, string, error) {
 	if opts.memoryMax != "" {
 		bytes, err := sizeBytes(opts.memoryMax)
 		if err != nil || bytes <= 0 {
 			return 0, "", "", argumentInvalid(fmt.Sprintf("--memory-max %q is not a usable size for the ci-shim ledger budget", opts.memoryMax))
 		}
+		if bytes < int64(minimumCeilingGiB)<<30 {
+			return 0, "", "", unavailable(fmt.Errorf(
+				"--ci=shim: --memory-max %s is below the %dG ci-shim ledger floor; the daemon's admission headroom (2GiB base + 64MiB per job) would leave nothing to grant and every job would wedge at E_ADMIT_TOO_LARGE forever -- pass a larger --memory-max",
+				formatCeilingBytes(bytes), minimumCeilingGiB))
+		}
 		return bytes, runner.ShimBudgetSourceDeclared, ownCgroupDir(d.cgroupRoot, report.OwnCgroupPath), nil
 	}
 	if value := strings.TrimSpace(report.OwnCgroupMemoryMax); value != "" && value != "max" && !strings.HasPrefix(value, systemdUnevaluated) {
 		if bytes, err := strconv.ParseInt(value, 10, 64); err == nil && bytes > 0 {
+			if bytes < int64(minimumCeilingGiB)<<30 {
+				return 0, "", "", unavailable(fmt.Errorf(
+					"ci-shim: this container's own cgroup memory.max is %s, below the %dG ci-shim ledger floor; the daemon's admission headroom (2GiB base + 64MiB per job) would leave nothing to grant and every job would wedge at E_ADMIT_TOO_LARGE forever -- this container's own cgroup sizing may not be yours to change, so pass an explicit --memory-max instead",
+					formatCeilingBytes(bytes), minimumCeilingGiB))
+			}
 			return bytes, runner.ShimBudgetSourceCgroupMemoryMax, ownCgroupDir(d.cgroupRoot, report.OwnCgroupPath), nil
 		}
 	}

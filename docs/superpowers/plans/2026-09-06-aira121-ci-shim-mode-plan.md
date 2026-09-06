@@ -468,7 +468,10 @@ func (s *Server) readShimMemory(string) (cur, max, reclaimable int64, ok bool, r
 
 The `path` argument is ignored (it is the `"ci-shim"` sentinel). Behaviour is
 selected by **whether a cgroup was recorded**, NOT by which source the budget
-came from (build-review correction, finding F1 — see the note below):
+came from (build-review correction, finding F1 — see the note below). **This
+routing was refined again in round 3 (finding F3) — see the second note below;
+the bullets here now describe the shipped, post-F3 behaviour, not the
+intermediate F1-only shape:**
 
 - **A recorded `shim_cgroup_path` whose `memory.current` reads**: delegate to
   `readSliceMemoryUsage` on it. That already parses `memory.current`,
@@ -478,11 +481,20 @@ came from (build-review correction, finding F1 — see the note below):
   never a raise, so a runtime that widened the container's limit after install
   cannot silently widen the ledger. A cgroup whose `memory.max` is `max`
   contributes no bound and the budget stands alone.
-- **No recorded cgroup, or no readable `memory.current`**: `current = MemTotal -
-  MemAvailable`, `reclaimable = 0`,
-  `max = s.shimBudget.Bytes`. `reclaimable` is deliberately zero: MemAvailable
-  already credits reclaimable page cache, so applying AIRA-21's discount on top
-  would double-count it in the permissive direction.
+- **No recorded cgroup, or no readable `memory.current`, AND the budget's own
+  source is host-wide (`shim_budget_source=meminfo-memtotal`)**: `current =
+  MemTotal - MemAvailable`, `reclaimable = 0`, `max = s.shimBudget.Bytes`.
+  `reclaimable` is deliberately zero: MemAvailable already credits reclaimable
+  page cache, so applying AIRA-21's discount on top would double-count it in
+  the permissive direction. Host-wide `current` paired with a host-wide budget
+  is the same scope on both sides of `checkedAvailable` — the original AIRA-120
+  shape, which already worked end to end.
+- **No recorded cgroup, or no readable `memory.current`, AND the budget is
+  CONTAINER-scoped (`declared` or `cgroup-memory-max`)**: `current = 0,
+  reclaimable = 0` — booked-reserve-only. `max` stays `s.shimBudget.Bytes`.
+  This is the F3 fix: pairing a container-scoped ceiling with a host-wide
+  `current` (see the F3 note below) is what made the ticket's own headline
+  cgroup-v1-only targets inoperable.
 - **Neither reading available**: `ok = false`. The existing behaviour then
   applies verbatim — fail **closed**, waiters stay queued, each waiter's own
   `maxWait` still fires `E_ADMIT_SATURATED`. Identical honesty to the real path,
@@ -502,6 +514,30 @@ whole life — fail-closed, but inoperable, and reading as misconfiguration.
 `readSliceMemory` is now the unbounded REFUSAL wrapped around
 `readSliceMemoryUsage`, which reports `limit == 0` for `max` and leaves the
 judgement to its caller; the real path's behaviour is unchanged and asserted.
+
+**Why the routing was refined a second time, onto the budget's own Source, not
+merely cgroup-path presence (build-review correction, finding F3).** F1's fix
+routed on "was a cgroup recorded" alone: no recorded cgroup (or an unreadable
+one) fell through to the host-wide meminfo fall-back regardless of what kind of
+budget it was being paired with. That is right when the budget is ITSELF
+host-wide (`meminfo-memtotal`) but wrong for a CONTAINER-scoped budget
+(`declared` or `cgroup-memory-max`) with no own-cgroup reading — the documented
+cgroup-v1-only targets this ticket names (Amazon Linux 2 / legacy Fargate for
+AWS Batch). There, host-wide `MemTotal - MemAvailable` routinely dwarfs the
+small per-container budget on a busy multi-tenant node, `checkedAvailable`'s
+`charge = max(current, outstanding)` pinned to that inflated `current`,
+`available` collapsed to 0, and every job in the container answered
+`E_ADMIT_TOO_LARGE cap_minus_headroom=0` for the container's entire life —
+fail-closed, but silently and permanently inoperable rather than a transient
+contention wait. `readShimMemory` now checks the budget's own `Source` as well
+as cgroup-path presence: only a host-wide budget reaches the meminfo
+computation; a container-scoped budget with no own-cgroup reading instead
+reports `current=0, reclaimable=0` (booked-reserve-only), so `checkedAvailable`
+gates purely on what this ledger itself has granted. An install-time refusal
+was considered and rejected as the fix for this case specifically, because it
+would turn away exactly the cgroup-v1-only targets the ticket names; that
+refusal direction was instead applied one layer up, at a fixed byte floor
+regardless of scope — see finding F4 in the ticket's round-4 resolution notes.
 
 Everything downstream is untouched: `admitEffectiveMaximum`,
 `admitSliceHeadroom` (base + per-job headroom still applies — same
@@ -1043,6 +1079,17 @@ AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1
    node. The answer is `--memory-max` at install, which records
    `shim_budget_source=declared`; the fallback stays as the last resort, is
    recorded as the weaker source, and is printed as such.
+7. **[round-4, finding F4] On a container sized exactly at the new 4GiB shim
+   ledger floor, an UNPINNED first job also gets `E_ADMIT_TOO_LARGE`.** The
+   default no-history admission reserve is itself 4GiB
+   (`runner.DefaultConfineMemoryReserve`, `internal/runner/confine.go:19` — "a
+   conservative #50 no-history fallback"), so a job with no `--memory-reserve`
+   and no per-project peak-RSS history requests that much, and the daemon's
+   headroom (2GiB base + 64MiB/job) leaves nothing above a 4GiB ceiling to grant
+   it. Accepted: this is exact parity with a real 4GiB `--ci` slice, which
+   refuses the identical unpinned request the identical way, and the ticket's
+   own consumer invocation already pins `--memory-reserve 512M` on every job, so
+   it is not hit in practice — worth documenting rather than leaving implicit.
 
 ---
 

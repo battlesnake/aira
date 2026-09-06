@@ -496,3 +496,90 @@ Build `aira confine -- go build ./...`, vet `aira confine -- go vet ./...`,
 and the full suite `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1`
 all green (exit 0) after this round's changes.
 
+### Build-review round 4 — the BLOCK on PR #72, and what changed
+
+**F4 — the shim budget floor did not mirror the real path's, so an entirely
+ordinary container size wedged every job forever.** `resolveShimBudget`
+(`internal/install/mode.go`) applied NO floor to either of its first two
+sources: the declared path went through `sizeBytes` → `validateSize(...,
+floor=false)`, and the cgroup-derived path parsed any positive `memory.max`.
+The real (non-shim) `--ci` path floors `MemoryMax` at 4GiB specifically to
+avoid this (`minimumCeilingGiB=4`, `resolveCIMemoryMax`,
+`internal/install/install.go`), but the shipped shim path mirrored only the
+unevaluated-MemAvailable half of that refusal, not the floor half — exactly
+what the plan's own §4.2 said should happen ("mirrors AIRA-120's
+`resolveCIMemoryMax` refusal ... failing at install is one loud failure in one
+place, versus a per-job wedge later").
+
+The daemon's admission headroom is 2GiB base + 64MiB/job
+(`admitSliceHeadroomBaseDefault`/`admitSliceHeadroomSupervisorDefault`,
+`internal/daemon/admit.go`); `checkedAvailable` answers a bare 0 whenever
+`maximum <= headroom`. So any declared or cgroup-derived budget at or below
+roughly 2GiB — an entirely ordinary CI/k8s-Job container size, needing no
+unusual operator input — installed cleanly, printed a healthy-looking "shim
+ledger budget: 2.00GiB ... advisory admission ledger active" message, and then
+refused EVERY job forever with `E_ADMIT_TOO_LARGE cap_minus_headroom=0`.
+Fail-closed, never a false pass, but silently and permanently inoperable —
+the same shape of bug as F3, one layer up.
+
+**Fix.** `resolveShimBudget` now refuses any declared or cgroup-derived budget
+below the existing `minimumCeilingGiB` (4GiB) constant, in the same
+`E_INSTALL_UNAVAILABLE` refusal class `resolveCIMemoryMax` uses for its own
+floor refusal (not `E_INSTALL_ARGUMENT_INVALID`, even for the declared-budget
+case, per the reviewer's own framing of this as an environment-usability
+refusal rather than a malformed-argument one). Each message names the
+offending value and the floor; the cgroup-derived message additionally points
+at `--memory-max` as the workaround, since an operator does not always control
+how the surrounding container runtime sized the container's own cgroup. The
+weakest source, the `meminfo-memtotal` fallback, is deliberately NOT floored
+here — it already reports the whole host's memory, which is essentially never
+below 4GiB, and flooring it was not asked for by the finding.
+
+Tests (`internal/install/ci_shim_mode_test.go`):
+`TestShimInstallRefusesADeclaredBudgetBelowTheFloor` and
+`TestShimInstallRefusesACgroupDerivedBudgetBelowTheFloor` (both confirmed to
+FAIL against the pre-fix `resolveShimBudget`, which accepted a 2GiB budget from
+either source with no error), and
+`TestShimInstallAcceptsABudgetExactlyAtTheFloor` (both sources, at exactly
+4GiB, must still install — the fix refuses BELOW the floor, never AT it).
+
+**The F3 tests adjusted to stay realistic.** The round-3 tests
+`TestReadShimMemoryReportsBookedReserveOnlyForADeclaredBudgetWithNoOwnCgroup`
+and `TestReadShimMemoryReportsBookedReserveOnlyWhenTheRecordedCgroupHasNoMemoryController`
+(`internal/daemon/shim_test.go`) used a 2GiB budget and called `readShimMemory`
+and `checkedAvailable` directly with `headroom=0`, bypassing install and the
+real evaluator's production headroom entirely — which is exactly why they kept
+passing even though, after this fix, a 2GiB budget can no longer be installed
+at all. Both are bumped to an 8GiB budget (above the new floor, and matching
+the reviewer's own reproduction's choice of value) so they continue to test a
+realistic post-fix scenario rather than a smaller instance of the same gap;
+their assertions and the injected host-wide usage (64GiB total / 8GiB
+available) are otherwise unchanged, since the property under test — a
+container-scoped budget must not be zeroed by unrelated host-wide usage — does
+not depend on the budget's exact size.
+
+**Plan doc corrected.** §4.3 of
+`docs/superpowers/plans/2026-09-06-aira121-ci-shim-mode-plan.md` still
+described the PRE-F3 routing ("selected by whether a cgroup was recorded, NOT
+by which source the budget came from") without ever recording F3's own
+routing correction (onto the budget's Source, not merely cgroup-path
+presence) — round 1's F1 correction had been folded in, F3's was not. Added a
+matching correction note in the same place and style as the F1 one, and
+updated the bulleted behaviour list to describe the shipped post-F3 routing.
+Residual 7 added to plan §10 for the one-sentence note below.
+
+**Non-blocking note, taken.** On a container sized exactly at the new 4GiB
+floor, an UNPINNED first job (no `--memory-reserve`, no per-project peak-RSS
+history) also gets `E_ADMIT_TOO_LARGE`: the no-history default reserve is
+itself 4GiB (`runner.DefaultConfineMemoryReserve`,
+`internal/runner/confine.go:19`), leaving nothing above the ceiling once
+headroom is subtracted. Accepted rather than fixed — it is exact parity with a
+real 4GiB `--ci` slice, which refuses the identical unpinned request the
+identical way, and the ticket's own consumer invocation already pins
+`--memory-reserve 512M` on every job. Documented as plan §10 residual 7 rather
+than left implicit.
+
+Build `aira confine -- go build ./...`, vet `aira confine -- go vet ./...`,
+and the full suite `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1`
+all green (exit 0) after this round's changes.
+

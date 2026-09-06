@@ -355,14 +355,20 @@ func TestReadShimMemoryFallsBackToMeminfoWithNoOwnCgroup(t *testing.T) {
 // Counterexample this fails against: the OLD readShimMemory, which routed on
 // "is there a cgroup path" alone and fell through to
 // current=MemTotal-MemAvailable regardless of the budget's own source. Here
-// the injected host usage (56GiB) vastly exceeds the declared 2GiB container
+// the injected host usage (56GiB) vastly exceeds the declared 8GiB container
 // budget, so the old code's current=56GiB makes checkedAvailable(...)==0.
+//
+// The budget is 8GiB, not the review round-3 finding's original 2GiB: round-4
+// (finding F4) added an install-time 4GiB floor on every declared/cgroup-derived
+// shim budget, so a 2GiB budget is no longer an installable value at all and
+// would no longer be a realistic fixture for this unit-level test of
+// readShimMemory's routing, which bypasses install and calls the seam directly.
 func TestReadShimMemoryReportsBookedReserveOnlyForADeclaredBudgetWithNoOwnCgroup(t *testing.T) {
-	const budget = int64(2) << 30 // 2 GiB declared container budget
+	const budget = int64(8) << 30 // 8 GiB declared container budget, above the F4 floor
 	server := NewServer(Paths{})
 	server.SetConfineShimModeForTest(budget, runner.ShimBudgetSourceDeclared, "")
 	// A busy multi-tenant host: 64GiB total, only 8GiB free -- 56GiB "in use"
-	// host-wide, dwarfing the 2GiB container budget many times over.
+	// host-wide, still dwarfing the 8GiB container budget several times over.
 	server.SetShimMeminfoForTest(
 		func() (int64, bool) { return 64 << 30, true },
 		func() (int64, bool, string) { return 8 << 30, true, "" },
@@ -388,9 +394,11 @@ func TestReadShimMemoryReportsBookedReserveOnlyForADeclaredBudgetWithNoOwnCgroup
 // recorded but its usage is unreadable -- the cgroup-v1-only host shape where
 // the probe found a cgroup directory with no memory controller file in it --
 // not only when CgroupPath is empty outright.
+//
+// Budget bumped to 8GiB for the same F4-floor reason as the sibling test above.
 func TestReadShimMemoryReportsBookedReserveOnlyWhenTheRecordedCgroupHasNoMemoryController(t *testing.T) {
-	const budget = int64(2) << 30
-	dir := t.TempDir() // no memory.current file: simulates a v1-only cgroup dir
+	const budget = int64(8) << 30 // above the F4 4GiB install-time floor
+	dir := t.TempDir()            // no memory.current file: simulates a v1-only cgroup dir
 	server := NewServer(Paths{})
 	server.SetConfineShimModeForTest(budget, runner.ShimBudgetSourceCgroupMemoryMax, dir)
 	server.SetShimMeminfoForTest(
