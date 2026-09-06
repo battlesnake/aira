@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	"aira/internal/codes"
@@ -80,5 +81,19 @@ func TestInstallParseArgsEntryAcceptsDocumentedFlags(t *testing.T) {
 		if options[key] != want {
 			t.Fatalf("option %s=%q, want %q", key, options[key], want)
 		}
+	}
+}
+
+// AIRA-120. --ci is a valueless flag on the CLI face too. The install verb is
+// intercepted before the dispatcher, so the real refusal of --ci with
+// --memory-max lives in the install parser; this pins only that the CLI face
+// does not reject the flag before it can get there.
+func TestInstallParseArgsAcceptsCIAsAValuelessFlag(t *testing.T) {
+	positionals, options, err := parseArgs("install", []string{"--ci", "--dry-run"})
+	if err != nil || len(positionals) != 0 || options["ci"] != "true" || options["dry-run"] != "true" {
+		t.Fatalf("positionals=%q options=%q err=%v", positionals, options, err)
+	}
+	if _, _, err := parseArgs("install", []string{"--ci=32G"}); err == nil || !strings.Contains(err.Error(), "does not take a value") {
+		t.Fatalf("--ci=32G err=%v, want a valueless-flag refusal", err)
 	}
 }

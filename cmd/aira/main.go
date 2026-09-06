@@ -709,7 +709,7 @@ func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, err
 			return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s may occur once", name)
 		}
 		switch name {
-		case "allow-overcommit", "dry-run", "status":
+		case "allow-overcommit", "dry-run", "status", "ci":
 			if hasValue {
 				return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s does not take a value", name)
 			}
