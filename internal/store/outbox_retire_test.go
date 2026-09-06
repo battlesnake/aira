@@ -255,6 +255,31 @@ func TestClassifyPendingIntentMatchesReconcile(t *testing.T) {
 			t.Fatalf("reconcile did not replay the intended bytes, file=%q", written)
 		}
 	})
+	t.Run("reconcile finalises a receipt-only intent", func(t *testing.T) {
+		f := newRetireFixture(t)
+		ctx := context.Background()
+		if _, err := f.store.db.ExecContext(ctx, `UPDATE outbox SET intended_bytes=NULL WHERE project_id=? AND seq=?`,
+			f.store.projectID, f.seq); err != nil {
+			t.Fatal(err)
+		}
+		// And an empty-path row of the kind lease events park, which reconcile
+		// selects project-wide and must also finalise without reading any file.
+		if _, err := f.store.db.ExecContext(ctx, `INSERT INTO outbox(project_id,seq,worktree_id,path,verb,precondition_digest,intended_digest,intended_bytes)
+			VALUES(?,?,?,'','lease.claim','','',NULL)`, f.store.projectID, f.seq+500, f.store.worktreeID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.db.ExecContext(ctx, `INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest)
+			VALUES(?,?,'2026-01-01T00:00:00Z','aira','lease.claim','',?)`,
+			f.store.projectID, f.seq+500, digestBytes([]byte("lease.claim\x00"))); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.reconcile(ctx); err != nil {
+			t.Fatalf("reconcile = %v, want nil", err)
+		}
+		if got := f.pendingCount(t); got != 0 {
+			t.Fatalf("pending=%d, want 0 — reconcile must finalise every receipt-only intent", got)
+		}
+	})
 	t.Run("reconcile conflicts on a third party", func(t *testing.T) {
 		f := newRetireFixture(t)
 		if err := f.store.reconcile(context.Background()); !errors.Is(err, ErrWriteConflict) {
@@ -528,7 +553,7 @@ func TestRetireCannotRaceAConcurrentMaterialise(t *testing.T) {
 		t.Fatalf("the racing materialise failed: %v", writerErr)
 	}
 
-	if err := <-retireDone; ErrorCode(err) != "E_INTENT_NOT_PENDING" {
+	if err := receiveWithin(t, retireDone, "retire"); ErrorCode(err) != "E_INTENT_NOT_PENDING" {
 		t.Fatalf("retire = %v (code %s), want E_INTENT_NOT_PENDING", err, ErrorCode(err))
 	}
 	written, err := os.ReadFile(path)
@@ -1102,10 +1127,20 @@ func TestRetireHoldsTheFindingLockAgainstAConcurrentReconcile(t *testing.T) {
 	<-inside
 
 	retireDone := make(chan error, 1)
+	retireStarted := make(chan struct{})
+	retirer.afterRetireResolve = func(EventKey) { close(retireStarted) }
 	go func() {
 		_, err := retirer.RetireIntent(ctx, fmt.Sprint(intent.Seq))
 		retireDone <- err
 	}()
+	// Without this handshake the 2s window below could elapse before the
+	// goroutine had even resolved its selector, and a missing lock would go
+	// unnoticed on a loaded scheduler.
+	select {
+	case <-retireStarted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the retire goroutine never reached its resolve seam")
+	}
 
 	// The load-bearing assertion is the FINAL state, not the timing: while the
 	// lock is held the retire cannot run, so it deletes the finding this
@@ -1122,10 +1157,10 @@ func TestRetireHoldsTheFindingLockAgainstAConcurrentReconcile(t *testing.T) {
 	case <-time.After(2 * time.Second):
 	}
 	close(release)
-	if err := <-reconcileDone; !errors.Is(err, ErrWriteConflict) {
+	if err := receiveWithin(t, reconcileDone, "reconcile"); !errors.Is(err, ErrWriteConflict) {
 		t.Fatalf("reconcile = %v, want ErrWriteConflict", err)
 	}
-	if err := <-retireDone; err != nil {
+	if err := receiveWithin(t, retireDone, "retire"); err != nil {
 		t.Fatalf("retire after the reconcile finished: %v", err)
 	}
 	if hasFindingKey(t, retirer, reconcileFindingKey(retirer.worktreeID, intent.Seq)) {
@@ -1313,5 +1348,97 @@ func removeDatabase(t *testing.T, state string) {
 		if err := os.Remove(filepath.Join(state, "state.db"+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
+	}
+}
+
+// receiveWithin bounds a channel receive so a regression that deadlocks fails
+// with a named error instead of hanging the package until the go test timeout.
+func receiveWithin(t *testing.T, ch <-chan error, what string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(60 * time.Second):
+		t.Fatalf("%s never completed", what)
+		return nil
+	}
+}
+
+// TestRetiringAnAllocationWhoseFileValidlyClaimsTheIDIsAnAcceptedGap pins a
+// residue the AIRA-73 build review found, so it is executable rather than prose.
+//
+// If the third party who took the path wrote a file that is itself a VALID
+// entity claiming the very ID being allocated, the retire still succeeds and
+// records `allocations.state='retired'` — even though that ID now demonstrably
+// resolves to a live ticket. The record is stale.
+//
+// It is accepted rather than fixed, deliberately:
+//
+//   - REFUSING the retire here (the reviewer's proposed fix) would leave the
+//     path in E_PATH_INTENT_BUSY and `eject` in E_EJECT_UNVERIFIED forever,
+//     with no built alternative — reintroducing exactly the permanent wedge
+//     this verb exists to remove, in the one case where the operator's content
+//     is already correct.
+//   - Recording `recovered` instead of `retired` would be honest in the live
+//     database but would not survive a database loss: Rebuild reconstructs the
+//     state from the receipt (`allocated`) and then applies the journal's
+//     retire replay, so keeping it would need new rebuild machinery for a
+//     residue with no observable consequence.
+//
+// The residue really is unobservable through every face: `check` skips retired
+// allocations, the ticket itself is still scanned, indexed and readable, the ID
+// can never be reallocated, and no face renders `allocations.state`. This test
+// asserts all of that, so the day the residue starts to matter, it fails.
+//
+// Same shape as the test this build replaced: when force-materialise is built
+// (the real resolution for this case), this test must be changed deliberately.
+func TestRetiringAnAllocationWhoseFileValidlyClaimsTheIDIsAnAcceptedGap(t *testing.T) {
+	f := newAllocationFixture(t, true)
+	ctx := context.Background()
+
+	valid, err := domain.RenderTicket(domain.Ticket{
+		Schema: 1, ID: f.intent.AllocationID, Project: "aira", Title: "the third party's own ticket",
+		Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2,
+		Labels: []string{}, Relations: []domain.Relation{},
+	}, "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.intent.Path, valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := f.store.RetireIntent(ctx, fmt.Sprint(f.intent.Seq)); err != nil {
+		t.Fatalf("retire = %v; refusing here would re-wedge the path, so it must succeed", err)
+	}
+	// The stale half of the record, pinned.
+	if got := allocationState(t, f.store, f.intent.AllocationID); got != "retired" {
+		t.Fatalf("allocation state = %q, want retired — this test no longer pins the gap it claims to", got)
+	}
+
+	// Every consequence that would make the residue matter is asserted absent.
+	if err := f.store.Rebuild(ctx); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	record, err := f.store.Get(f.intent.AllocationID)
+	if err != nil {
+		t.Fatalf("the ID must still resolve to a live ticket: %v", err)
+	}
+	if record.Ticket.Title != "the third party's own ticket" {
+		t.Fatalf("indexed ticket = %q", record.Ticket.Title)
+	}
+	report, err := f.store.Check(ctx)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if report.Dimensions["allocated-id-file"] == "fail" {
+		t.Fatalf("check fails after the retire: %+v", report.Findings)
+	}
+	next, err := f.store.AllocateID(ctx, "AIRA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == f.intent.AllocationID {
+		t.Fatalf("%s was reallocated", next)
 	}
 }

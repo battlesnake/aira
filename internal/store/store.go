@@ -2914,6 +2914,17 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			// allocated -> retired only. A forged or corrupt frame can therefore
 			// never silence a materialised allocation's E_ID_UNRESOLVED, which
 			// an unnarrowed UPDATE would let it do.
+			//
+			// ACCEPTED GAP: this does not make a retirement unforgeable. The
+			// journal digest is unkeyed (see allocationEventDigest), so anyone
+			// who can write journal.jsonl can synthesise a well-formed
+			// intent.retire frame and retire an allocation that is still
+			// genuinely unresolved, hiding one E_ID_UNRESOLVED. That is the same
+			// limitation every journal-replayed fact already carries — the same
+			// writer could forge an id.allocate — and closing it needs a keyed
+			// digest, which is a whole-journal design decision, not this verb's.
+			// The narrowing above is what keeps the blast radius to unresolved
+			// allocations only.
 			if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='retired'
 				WHERE project_id=? AND prefix=? AND number=? AND state='allocated'`,
 				s.projectID, prefix, number); err != nil {

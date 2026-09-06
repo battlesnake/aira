@@ -194,6 +194,16 @@ func (s *Store) RetireIntent(ctx context.Context, selector string) (RetireResult
 	// materialised, taking the DB only at the end — so a database transaction
 	// alone does NOT exclude a writer that is mid-materialisation, and without
 	// this lock a retire could delete a row whose file had just been written.
+	//
+	// The flock coordinates AIRA writers only. A non-cooperative editor can
+	// still change the file between this classification and the commit, exactly
+	// as it can between materialiseIntent's digest check and its rename
+	// (documented there). The failure mode is bounded and benign in the
+	// direction that matters: such a writer can only turn a conflict into
+	// something reconcile would have completed, and the outcome is then a
+	// retired intent whose bytes the operator can still recover from git —
+	// never a silent overwrite of the third party's file, because retire never
+	// writes the working tree at all.
 	pathLock, err := acquireLock(s.pathLockFor(row.WorktreeID, row.Path))
 	if err != nil {
 		return RetireResult{}, err
