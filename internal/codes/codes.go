@@ -30,10 +30,14 @@
 // can never serve it). E_RELATION_EXISTS, E_LEASE_HELD, E_WRITE_CONFLICT,
 // E_PREFIX_OWNERSHIP_CONFLICT, E_TRANSITION_INVALID and E_INTENT_NOT_PENDING are
 // the 1 side; E_NOT_FOUND, E_SELECTOR_INVALID and the E_*_ARGUMENT_INVALID
-// family are the 2 side. Two entries predate the rule and sit on the other side
-// of it — E_ALREADY_INITIALIZED (2) and E_RANT_IDEMPOTENCY_CONFLICT (2) are both
-// state conflicts by this reading — and AIRA-125 tracks reconciling them; they
-// are precedents the catalogue tolerates, not ones it follows.
+// family are the 2 side. Two entries predated the rule and sat on the other side
+// of it — E_ALREADY_INITIALIZED and E_RANT_IDEMPOTENCY_CONFLICT, both catalogued
+// at 2 before the rule was written down, and both state conflicts by it.
+// AIRA-125 moved both to 1 rather than record an exception at either, because an
+// exception is what the next author would cite: two entries pointing away from
+// the stated rule is exactly the ambiguity that left AIRA-87's eleven undecided.
+// The catalogue now has no 1-versus-2 counter-example in either direction, and
+// TestStateConflictCodesExitOne in produced_test.go pins that.
 //
 // A code's bucket is a published contract, so choosing one is a decision to be
 // made deliberately rather than by falling through ExitForCode's default.
@@ -57,7 +61,21 @@ var ExitCodes = map[string]int{
 	"E_ID_INVALID": 2, "E_SELECTOR_INVALID": 2, "E_NOT_FOUND": 2,
 	"E_SELECTOR_AMBIGUOUS": 2, "E_UNKNOWN_VERB": 2,
 	"E_NOT_ADOPTED": 2, "E_NO_PROJECT": 2,
-	"E_ALREADY_INITIALIZED": 2,
+	// AIRA-125 moved this from 2 to 1. Both emitters refuse a well-formed request
+	// because durable state already holds the record `init` would create:
+	// app.Init finds .aira/config on disk (app/project.go:422) and
+	// store.PreflightAdoption finds a projects row for this project
+	// (store/lifecycle.go:162). Remove the config, or eject the project, and the
+	// identical request succeeds — which is the 1 side of the rule in the package
+	// comment, and the same already-exists shape as E_RELATION_EXISTS,
+	// E_GATE_EXISTS and E_PREFIX_OWNERSHIP_CONFLICT (all 1). The counter-argument
+	// AIRA-125 considered and rejected is that `init` is the bootstrap surface,
+	// below any record, so a caller that has not initialised has nothing to
+	// observe; that is true of the surface but not of this refusal, which only
+	// happens when the record does exist and the caller can observe it. Carving a
+	// one-off exception to keep it at 2 would leave the counter-example the ticket
+	// exists to remove, so consistency with the rule wins.
+	"E_ALREADY_INITIALIZED": 1,
 	"E_GLOB_INVALID":        2,
 	"E_DAEMON_UNAVAILABLE":  4, "E_DAEMON_BUSY": 4, "E_DAEMON_TIMEOUT": 3,
 	"E_DAEMON_PROJECT_INVALID": 2, "E_DAEMON_PROTOCOL": 2, "E_DAEMON_INTERNAL": 4,
@@ -71,7 +89,18 @@ var ExitCodes = map[string]int{
 	"E_COMPUTE_INVALID":     2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
 	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
-	"E_RANT_INVALID": 2, "E_RANT_TOO_LARGE": 2, "E_RANT_IDEMPOTENCY_CONFLICT": 2, "E_RANT_REF_INVALID": 2,
+	"E_RANT_INVALID": 2, "E_RANT_TOO_LARGE": 2, "E_RANT_REF_INVALID": 2,
+	// AIRA-125 moved this from 2 to 1, splitting it off the E_RANT_* bad-request
+	// family above. Its neighbours there reject what the caller wrote — a body that
+	// fails validation, one over the size bound, a malformed ref — and no state
+	// change makes any of those requests succeed as written. This one is different
+	// in kind: the request is well formed, and it is refused only because a stored
+	// rant already claims that idempotency key with different input
+	// (store/rant.go:66). The key is the caller's to choose, so a replay against
+	// fresh input succeeds and the stored row is observable state. That is the
+	// 1 side of the rule in the package comment, and the same shape as
+	// E_WRITE_CONFLICT and E_RUN_TELEMETRY_CONFLICT.
+	"E_RANT_IDEMPOTENCY_CONFLICT": 1,
 	// AIRA-107 split the redaction pair, which AIRA-87 had left together at the
 	// default. E_RANT_REDACTED refuses an operation on a rant whose body is gone:
 	// the caller named a target that cannot serve the request, which is the same
@@ -167,8 +196,8 @@ var ExitCodes = map[string]int{
 	// the supervisor-lease triple below, which splits CONFLICT: 1 /
 	// LEASE_INVALID: 2 / LEASE_FAILED: 4, and again at E_LEASE_HELD,
 	// E_WRITE_CONFLICT, E_RELATION_EXISTS and E_PREFIX_OWNERSHIP_CONFLICT (all 1).
-	// E_RANT_IDEMPOTENCY_CONFLICT (2) is the lone precedent the other way and is
-	// the one AIRA-125 exists to reconcile, so it is not followed here.
+	// E_RANT_IDEMPOTENCY_CONFLICT was the lone precedent the other way when this
+	// was decided; AIRA-125 moved it to 1, so the alignment is now unanimous.
 	//
 	// E_RUN_USAGE_READ is a warning-only code and is bucketed on that basis. Its
 	// single emitter (core/run_wiring.go:374) sets a wiring warning that lands in
@@ -295,11 +324,10 @@ var ExitCodes = map[string]int{
 	// matching the existing E_RELATION_EXISTS"
 	// (docs/plans/2026-09-03-aira53-54-gate-honesty-plan.md:188), so 1 here is the
 	// committed intent rather than a fresh guess — it only ever *looked* undecided
-	// because AIRA-87 catalogued it at a default that happened to equal it. The
-	// 2-precedent is E_ALREADY_INITIALIZED, and it is deliberately not followed: it
-	// is the project bootstrap surface, a level above any record, and AIRA-125
-	// tracks whether it belongs at 2 at all. Following it here would also
-	// contradict E_RUN_TELEMETRY_CONFLICT's 1 in this same catalogue.
+	// because AIRA-87 catalogued it at a default that happened to equal it. The one
+	// 2-precedent then available was E_ALREADY_INITIALIZED, and it was deliberately
+	// not followed here; AIRA-125 has since moved that code to 1 for the same
+	// reason, so the two now agree.
 	"E_GATE_EXISTS": 1, "U_GATE_SET_EMPTY": 3,
 	"E_GATE_ATTESTATION_INVALID": 2,
 	"E_GATE_FAILED":              1, "E_GATE_RATCHET_REGRESSED": 1, "E_GATE_CANARY_DID_NOT_FIRE": 1,

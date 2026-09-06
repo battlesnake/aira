@@ -83,8 +83,15 @@ func TestCancelledCheckProducesRuntimeUnevaluatedExitThree(t *testing.T) {
 	}
 }
 
-func TestAlreadyInitializedUsesInvalidInvocationExitCode(t *testing.T) {
-	if got := codes.ExitForCode("E_ALREADY_INITIALIZED"); got != 2 {
-		t.Fatalf("already initialized exit=%d, want 2", got)
+// verifies: AIRA-125 — `aira init` against an already-initialised project exits
+// 1, not 2. The assertion here previously read that refusal as an invalid
+// invocation, which it is not: the invocation is well formed, and it is refused
+// only because durable state (the .aira/config file, or the projects row) already
+// holds what init would create — the 1 side of the catalogue's 1-versus-2 rule.
+// The bucket itself is pinned in codes.TestStateConflictCodesExitOne; this keeps
+// the core face's own view of it from drifting away from that.
+func TestAlreadyInitializedUsesStateConflictExitCode(t *testing.T) {
+	if got := codes.ExitForCode("E_ALREADY_INITIALIZED"); got != 1 {
+		t.Fatalf("already initialized exit=%d, want 1", got)
 	}
 }
