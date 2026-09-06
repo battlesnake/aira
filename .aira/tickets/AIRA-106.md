@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-106","project":"aira","title":"Dynamic slice ceiling: replace single-headroom formula with min(TotalRAM-reserveMax, usage+(MemAvailable-freeMin))","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-111","to":"AIRA-106"}]}
+{"schema":1,"id":"AIRA-106","project":"aira","title":"Dynamic slice ceiling: replace single-headroom formula with min(TotalRAM-reserveMax, usage+(MemAvailable-freeMin))","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-111","to":"AIRA-106"},{"kind":"relates","from":"AIRA-112","to":"AIRA-106"}]}
 ---
 Owner decision (2026-09-05), replacing AIRA-103's own headroom formula with a better-specified one, as part of closing AIRA-91 Part B.
 
@@ -81,6 +81,10 @@ sliceAnon 11.57 GiB · affordable 55.48 GiB
 | `aira confine -- go test ./...` (full suite) | **0** |
 | `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/daemon/ -run SliceCeilingRealCgroup` | **0** (5 tests PASS, none skipped) |
 
+All four re-run to **0** after rebasing onto `origin/master` (two `internal/install/install.go` conflicts with AIRA-96's inotify work, resolved by keeping both sides).
+
+One full-suite run during the rebase verification hit `TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration` (`internal/runner`, "unverified despite positive running observation"). It is **not** this change: it reproduces on a clean `origin/master` worktree with no local changes (`-count=20` → FAIL), and this branch touches nothing in the scope-membership sampler. It is the documented sub-2ms scope-integrity sampling gap — the job under test is `/bin/sh -c printf ok`, too short-lived for the sampler to take one in-scope observation. Filed as **AIRA-112** with the clean-master reproduction rather than re-run until green and forgotten.
+
 ### Non-porosity, verified by running each load-bearing test against a wrong implementation
 
 | wrong implementation | tests that went RED |
@@ -119,4 +123,5 @@ sliceAnon 11.57 GiB · affordable 55.48 GiB
 ### Open items handed on
 
 - **AIRA-111** — the live `aira-daemon.service` declares `AIRA_DAEMON_WATCHDOG_MODE=observe` while the project record says the watchdog was flipped to `enforce` on 2026-08-25, consistent with a later `aira install` having reverted it through the defect fixed here. The machine's sole live memory killer has been observing, not enforcing. This session does not deploy or restart services, so restoring it is AIRA-111.
+- **AIRA-112** — a pre-existing intermittent failure in `TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration`, reproduced on clean `origin/master`. It reddens a full-suite run for a reason unrelated to whatever change is under test, which trains people to re-run rather than read.
 - **Accepted gap:** `computeMemoryLimits` still preserves `MemoryMax` from content read before the install lock. AIRA-106 closes that window for the two mode options; closing it for the memory sizing means restructuring `runUserInstall`. Recorded in the design doc §9 rather than half-done.
