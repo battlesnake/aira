@@ -238,7 +238,17 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		return result, confineUnavailable(sliceName, fmt.Errorf("bridge job stderr: %w", err))
 	}
 	defer drainStderr(0)
-	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), "")
+	// AIRA-115. BOTH coordinates are withheld, and the empty slice is as
+	// deliberate as the empty scope id below: shim mode has no cgroup at all, so
+	// there is no resolved slice path this job's memory is actually held in.
+	// Publishing sliceName here would hand a confine-reserve helper a slice NAME
+	// where the real path publishes a resolved PATH, i.e. a coordinate of a
+	// different kind naming a cgroup that does not exist in this container.
+	// Withheld together, so InheritedConfineScopeID and InheritedConfineSlice both
+	// find nothing and resolveConfineReserveSlice takes its unconfined branch
+	// rather than its refusal branch -- the refusal is for a scope id present
+	// WITHOUT a slice, which this path can never produce.
+	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), "", "")
 	// Requirement 7, AS AIRA-123 SETTLED IT. AitestBackendCanFunction is still
 	// the ONE gate, and it is now TRUE in shim mode: worker-admit makes a real
 	// ledger-only admission decision here (advisory, no cgroup, no kill

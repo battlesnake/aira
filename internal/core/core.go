@@ -1730,7 +1730,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("bytes", true, false, "Pinned byte reservation (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			boolSpec("pinned", true, false, "Require the v1 pinned estimate path"),
 			stringSpec("signature", true, false, "Per-test resource signature"),
-			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			// AIRA-115: aira.slice is the default only for an UNCONFINED caller.
+			// Inside a confine job the reservation is charged to THAT job's slice, so
+			// a per-test sub-reservation can no longer be booked against a slice whose
+			// cgroup does not hold the memory.
+			stringSpec("slice", false, false, "Machine-wide cgroup slice (default: the enclosing confine job's slice, else aira.slice)"),
 			// AIRA-108: say what the bound is ON. It bounds the ADMISSION WAIT and
 			// nothing else; once granted, the helper holds its reservation until
 			// stdin closes, which for the per-test governor is the whole life of the
