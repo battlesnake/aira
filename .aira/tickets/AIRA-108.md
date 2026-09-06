@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-108","project":"aira","title":"confine-reserve --pinned --max-wait not honoured: 52min hang past a 300s declared bound, 51.6GB free","status":"in-review","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","dogfood"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-108","project":"aira","title":"confine-reserve --pinned --max-wait not honoured: 52min hang past a 300s declared bound, 51.6GB free","status":"done","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","dogfood"],"hold":false,"relations":[]}
 ---
 Reported by peer session `split` (fastest-ee, `make test-engine`), 2026-09-06.
 
