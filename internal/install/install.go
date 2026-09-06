@@ -44,6 +44,18 @@ const (
 	// never change what the machine does.
 	defaultDaemonSubsystemMode = "observe"
 	defaultWatchdogInterval    = 2 * time.Second
+
+	// minimumCeilingGiB is the MemoryMax floor validateSize enforces. Named so
+	// that --ci, which must refuse a snapshot it cannot express, refers to the
+	// same number rather than restating it.
+	minimumCeilingGiB = 4
+
+	// The two values the `# aira-ceiling-source:` marker can carry, recorded in
+	// the rendered slice unit so `--status` can say WHERE the number came from.
+	// The marker is a systemd COMMENT: it records provenance and can never
+	// influence what systemd or the kernel does with the cap (AIRA-120).
+	ceilingSourceStatic = "static"
+	ceilingSourceCI     = "ci-memavailable"
 )
 
 var (
@@ -51,6 +63,19 @@ var (
 	installedMemoryMaxRE      = regexp.MustCompile(`(?m)^MemoryMax=(.*)$`)
 	installedMemoryHighRE     = regexp.MustCompile(`(?m)^MemoryHigh=(.*)$`)
 	inotifyMaxUserInstancesRE = regexp.MustCompile(`(?m)^fs\.inotify\.max_user_instances\s*=\s*([0-9]+)\s*$`)
+	// AIRA-120. The ceiling-source marker in the managed slice unit, read back so
+	// that an install which does NOT re-decide the cap (no --ci, no --memory-max —
+	// the cap is preserved by computeMemoryLimits) preserves its PROVENANCE too.
+	// Without that, a bare `aira install` on a CI box would keep the --ci number
+	// while relabelling it "static", which is exactly the indistinguishable bare
+	// number the ticket asks --status to stop printing.
+	installedCeilingSourceRE = regexp.MustCompile(`(?m)^# aira-ceiling-source: (.*)$`)
+	// A recorded marker is echoed into a freshly rendered unit, so it is
+	// constrained to a conservative single-line character set. A hand-edited or
+	// newer-vocabulary value is IGNORED (falls back to "static") rather than
+	// propagated — the same rule resolveDaemonModes applies to an unrecognised
+	// installed mode.
+	ceilingSourceSafeRE = regexp.MustCompile(`^[A-Za-z0-9 :=+._-]{1,200}$`)
 	// AIRA-106. Read an installed daemon unit's own settings back, so an OMITTED
 	// option preserves them instead of resetting them — the MemoryMax precedent
 	// above, applied to the two daemon subsystem modes and the watchdog interval.
@@ -100,6 +125,21 @@ type installOpts struct {
 	watchdog         string
 	watchdogInterval time.Duration
 	sliceCeiling     string
+
+	// AIRA-120. --ci: size the slice's STATIC ceiling to MemAvailable as measured
+	// once, right now, with ZERO headroom subtracted, for a box dedicated entirely
+	// to AIRA-confined jobs. It is not a second ceiling mechanism and not a
+	// dynamic one: resolveCIMemoryMax turns the snapshot into the very same `<N>G`
+	// string an operator could have typed after --memory-max, and everything
+	// downstream of that assignment is the existing static path unchanged. The two
+	// flags are mutually exclusive (parseInstallArgs), so `ci` set means memoryMax
+	// was NOT given by the operator.
+	ci bool
+	// ciBytes/ciAt are the snapshot itself, filled in by resolveCIMemoryMax and
+	// carried only so the provenance marker and the operator-facing report can
+	// state the measured value and when it was measured.
+	ciBytes int64
+	ciAt    time.Time
 }
 
 // AIRA-106. An ABSENT daemon-mode option is now the ZERO VALUE all the way from
@@ -175,6 +215,11 @@ type installDeps struct {
 	daemonStatus func(daemon.Paths) daemon.StatusInfo
 	daemonStop   func(daemon.Paths) error
 	sleep        func(time.Duration)
+	// readMemAvailable is THE MemAvailable reader (daemon.ReadMemAvailable, the
+	// same one the watchdog and the AIRA-103/106 effective ceiling use), crossing
+	// the seam so --ci's snapshot can be injected in tests instead of depending on
+	// the real state of the machine running them.
+	readMemAvailable func() (int64, bool, string)
 
 	sliceUnit  string
 	anchorUnit string
@@ -258,7 +303,8 @@ func realInstallDeps() installDeps {
 		unlinkat: unix.Unlinkat, flock: unix.Flock,
 		logf:        func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
 		daemonPaths: daemon.PathsFromEnv, daemonStatus: daemon.Status, daemonStop: daemon.Stop, sleep: time.Sleep,
-		sliceUnit: defaultSliceUnit, anchorUnit: defaultAnchorUnit, daemonUnit: defaultDaemonUnit,
+		readMemAvailable: daemon.ReadMemAvailable,
+		sliceUnit:        defaultSliceUnit, anchorUnit: defaultAnchorUnit, daemonUnit: defaultDaemonUnit,
 		cgroupRoot: cgroupRoot, etcRoot: defaultEtcRoot,
 	}
 }
@@ -305,7 +351,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 		}
 		seen[name] = true
 		switch name {
-		case "allow-overcommit", "dry-run", "status":
+		case "allow-overcommit", "dry-run", "status", "ci":
 			if hasValue {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s does not take a value", name))
 			}
@@ -316,6 +362,8 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				opts.dryRun = true
 			case "status":
 				opts.status = true
+			case "ci":
+				opts.ci = true
 			}
 		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling":
 			if !hasValue {
@@ -354,7 +402,15 @@ func parseInstallArgs(args []string) (installOpts, error) {
 			return opts, argumentInvalid(fmt.Sprintf("unknown option --%s", name))
 		}
 	}
-	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun ||
+	// AIRA-120. --ci and --memory-max both DECIDE the static ceiling, so one of
+	// them would have to silently win. Refuse instead: on a CI box the difference
+	// between "everything free right now" and a number someone typed is the whole
+	// point of the flag, and quietly discarding either one is the kind of
+	// indistinguishable outcome this ticket exists to remove.
+	if opts.ci && opts.memoryMax != "" {
+		return opts, argumentInvalid("--ci and --memory-max are mutually exclusive: --ci sizes MemoryMax from a MemAvailable snapshot, so an explicit MemoryMax cannot also apply")
+	}
+	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || opts.ci ||
 		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
 	}
@@ -572,6 +628,14 @@ func reexecRequestFor(executable string, target installTarget, opts installOpts)
 	if opts.memoryHigh != "" {
 		args = append(args, "--memory-high", opts.memoryHigh)
 	}
+	// AIRA-120. Forward the FLAG, never a resolved value: the root leg does no
+	// sizing at all, and the unprivileged re-exec — the leg that actually renders
+	// and publishes the unit — takes the one snapshot. Resolving here as well
+	// would measure MemAvailable twice and record a value the unit was not
+	// rendered from.
+	if opts.ci {
+		args = append(args, "--ci")
+	}
 	// AIRA-106. Each daemon-mode option is forwarded ONLY when it was given
 	// explicitly. Forwarding them unconditionally (as this did) meant the
 	// re-exec'd unprivileged process always saw an explicit flag, so the
@@ -656,6 +720,20 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		}
 	}
 
+	// AIRA-120. --ci resolves ONCE, here, into opts.memoryMax — i.e. into the
+	// argument an operator would otherwise have typed. It is placed before the
+	// meminfo/default block deliberately: from this line on, a --ci install and an
+	// `aira install --memory-max <that value>` install are the same code path with
+	// the same inputs, which is what makes "no --ci-specific branching" a
+	// structural fact rather than a promise. --ci also OVERRIDES an installed
+	// MemoryMax, exactly as an explicit --memory-max does.
+	if opts.ci {
+		var ciErr error
+		if opts.memoryMax, opts.ciBytes, opts.ciAt, ciErr = resolveCIMemoryMax(d); ciErr != nil {
+			return ciErr
+		}
+	}
+
 	meminfo, memErr := d.readFile("/proc/meminfo")
 	// The ⅔-MemTotal default is only consulted when no --memory-max was given and
 	// no value is already on disk. In that case an unreadable OR malformed
@@ -704,7 +782,8 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		return overcommitError()
 	}
 	accepted := opts.allowOvercommit || recorded
-	slice, anchor, err := renderUnits(d.sliceUnit, d.anchorUnit, executable, maximum, high, accepted)
+	ceilingSource := ceilingSourceFor(opts, string(installed))
+	slice, anchor, err := renderUnits(d.sliceUnit, d.anchorUnit, executable, maximum, high, accepted, ceilingSource)
 	if err != nil {
 		return argumentInvalid(err.Error())
 	}
@@ -721,6 +800,10 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		d.logf("--- %s ---\n%s", d.sliceUnit, strings.TrimSuffix(slice, "\n"))
 		d.logf("--- %s ---\n%s", d.anchorUnit, strings.TrimSuffix(anchor, "\n"))
 		d.logf("--- %s ---\n%s", d.daemonUnit, strings.TrimSuffix(daemonUnit, "\n"))
+		// AIRA-120: say where the number came from, not just what it is. A bare
+		// MemoryMax is indistinguishable between a --ci free-RAM snapshot and a
+		// hand-chosen cap, and on a CI box that distinction is the whole flag.
+		d.logf("planned: %s MemoryMax=%s MemoryHigh=%s; ceiling source: %s", d.sliceUnit, maximum, high, describeCeilingSource(ceilingSource))
 		d.logf("planned: create %s; atomically update managed units", unitDir)
 		d.logf("planned: systemctl --user daemon-reload")
 		d.logf("planned: systemctl --user enable --now %s", d.anchorUnit)
@@ -923,6 +1006,7 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		d.logf("warning: run 'sudo aira install' to apply the /etc oomd + delegation + sysctl drop-ins")
 	}
 	d.logf("installed: %s MemoryMax=%s MemoryHigh=%s; anchor active; memory delegation: %s; %s active, running, and MainPID-tied", d.sliceUnit, maximum, high, enforcement, d.daemonUnit)
+	d.logf("slice ceiling source: %s", describeCeilingSource(ceilingSource))
 	return nil
 }
 
@@ -964,6 +1048,109 @@ func installHome(d installDeps) (string, error) {
 		return "", unavailable(fmt.Errorf("resolve HOME: %w", err))
 	}
 	return absolute, nil
+}
+
+// resolveCIMemoryMax takes AIRA-120's one-time free-RAM snapshot and turns it
+// into exactly the `<N>G` string an operator could have typed after
+// --memory-max. Everything past the returned value is the existing static
+// ceiling path, untouched: there is no --ci ceiling mechanism, no continuously
+// tracked value, and nothing downstream that can tell the two apart.
+//
+// ZERO headroom is subtracted, deliberately (the box is dedicated to confined
+// jobs, so the desktop-protection margin the default cap leaves has nothing to
+// protect). The one reduction is the floor to whole GiB, which is FORMAT
+// quantisation — the managed unit's MemoryMax is `^[0-9]+G$` and always has
+// been — not a headroom policy; it costs at most 1 GiB and cannot round UP into
+// memory the machine does not have.
+//
+// Two failures are refusals, never a guess. An unestablished MemAvailable is an
+// environment fact this install cannot measure (E_INSTALL_UNAVAILABLE, the same
+// class as the unreadable-meminfo default path), and a snapshot below the 4G
+// MemoryMax floor cannot be expressed as a legal cap at all — reporting the
+// measured value beats emitting a cap that fails validateSize with a message
+// that never mentions the machine's free RAM.
+func resolveCIMemoryMax(d installDeps) (string, int64, time.Time, error) {
+	available, ok, reason := d.readMemAvailable()
+	if !ok {
+		return "", 0, time.Time{}, unavailable(fmt.Errorf("--ci: MemAvailable is unevaluated (%s); cannot size the slice ceiling from free RAM", reason))
+	}
+	at := d.now().UTC()
+	gib := available >> 30
+	if gib < minimumCeilingGiB {
+		return "", 0, time.Time{}, unavailable(fmt.Errorf(
+			"--ci: MemAvailable is %s, below the %dG MemoryMax floor; free memory on this host or pass an explicit --memory-max",
+			formatCeilingBytes(available), minimumCeilingGiB))
+	}
+	return fmt.Sprintf("%dG", gib), available, at, nil
+}
+
+// ceilingSourceFor decides the provenance marker the rendered slice unit
+// carries. It mirrors computeMemoryLimits' own precedence exactly, which is what
+// keeps the marker HONEST rather than merely present: --ci decides the cap and
+// records the snapshot; an explicit --memory-max decides it and records
+// "static"; and when neither is given the cap is whatever the installed unit
+// already declares, so the installed provenance is preserved with it.
+func ceilingSourceFor(opts installOpts, installed string) string {
+	switch {
+	case opts.ci:
+		return fmt.Sprintf("%s bytes=%d at=%s", ceilingSourceCI, opts.ciBytes, opts.ciAt.UTC().Format(time.RFC3339))
+	case opts.memoryMax != "":
+		return ceilingSourceStatic
+	}
+	recorded := strings.TrimSpace(parseInstalledValue(installed, installedCeilingSourceRE))
+	if recorded == "" || !ceilingSourceSafeRE.MatchString(recorded) {
+		return ceilingSourceStatic
+	}
+	return recorded
+}
+
+// describeCeilingSource renders a recorded marker for an operator. An absent
+// marker is UNEVALUATED (a unit written before AIRA-120 records nothing, and
+// claiming "static" for it would be a fabricated fact), and an unrecognised one
+// says so rather than being paraphrased.
+func describeCeilingSource(recorded string) string {
+	recorded = strings.TrimSpace(recorded)
+	kind, rest, _ := strings.Cut(recorded, " ")
+	switch {
+	case recorded == "":
+		return "unevaluated (the installed unit records no ceiling source)"
+	case recorded == ceilingSourceStatic:
+		return "static (--memory-max, the previously installed value, or the MemTotal-derived default)"
+	case kind == ceilingSourceCI:
+		measured, at, ok := parseCISource(rest)
+		if !ok {
+			return "--ci MemAvailable snapshot (recorded value unevaluated: " + recorded + ")"
+		}
+		return fmt.Sprintf("--ci MemAvailable snapshot: %s measured at %s, zero headroom subtracted", formatCeilingBytes(measured), at)
+	default:
+		return "unrecognised (" + recorded + ")"
+	}
+}
+
+// parseCISource reads back the `bytes=<N> at=<RFC3339>` tail this file writes.
+// It is strict: a marker it cannot parse reports unevaluated rather than a
+// partially-invented measurement.
+func parseCISource(rest string) (int64, string, bool) {
+	fields := strings.Fields(rest)
+	if len(fields) != 2 || !strings.HasPrefix(fields[0], "bytes=") || !strings.HasPrefix(fields[1], "at=") {
+		return 0, "", false
+	}
+	measured, err := strconv.ParseInt(strings.TrimPrefix(fields[0], "bytes="), 10, 64)
+	if err != nil || measured <= 0 {
+		return 0, "", false
+	}
+	at := strings.TrimPrefix(fields[1], "at=")
+	if _, err := time.Parse(time.RFC3339, at); err != nil {
+		return 0, "", false
+	}
+	return measured, at, true
+}
+
+// formatCeilingBytes prints a measured byte count the way the rest of AIRA
+// prints memory facts: exact enough to check against /proc/meminfo, readable
+// enough to compare with the cap beside it.
+func formatCeilingBytes(value int64) string {
+	return fmt.Sprintf("%.2fGiB (%d bytes)", float64(value)/float64(int64(1)<<30), value)
 }
 
 func computeMemoryLimits(maximumArg, highArg, installed string, memTotalKB int64) (string, string, error) {
@@ -1013,8 +1200,8 @@ func validateSize(value, label string, floor bool) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%s %q: %w", label, value, err)
 	}
-	if floor && n < 4 {
-		return 0, fmt.Errorf("%s %s is below the 4G floor", label, value)
+	if floor && n < minimumCeilingGiB {
+		return 0, fmt.Errorf("%s %s is below the %dG floor", label, value, minimumCeilingGiB)
 	}
 	return n, nil
 }
@@ -1060,7 +1247,14 @@ func parseMemTotalKB(data []byte) int64 {
 	return 0
 }
 
-func renderUnits(sliceUnit, anchorUnit, executable, maximum, high string, accepted bool) (string, string, error) {
+// renderUnits renders the managed slice and anchor units. ceilingSource is the
+// AIRA-120 provenance marker: a systemd COMMENT line, so it records where
+// MemoryMax came from without being able to change anything systemd or the
+// kernel does with it. That is why a --ci install and the equivalent explicit
+// --memory-max install render byte-identical units apart from this one comment,
+// and why admission — which reads the live cgroup memory.max — cannot branch on
+// the difference.
+func renderUnits(sliceUnit, anchorUnit, executable, maximum, high string, accepted bool, ceilingSource string) (string, string, error) {
 	if strings.ContainsAny(sliceUnit+anchorUnit, "\r\n/") {
 		return "", "", errors.New("unit names contain an invalid character")
 	}
@@ -1082,11 +1276,18 @@ func renderUnits(sliceUnit, anchorUnit, executable, maximum, high string, accept
 	if accepted {
 		acceptance = "yes"
 	}
+	if ceilingSource == "" {
+		ceilingSource = ceilingSourceStatic
+	}
+	if !ceilingSourceSafeRE.MatchString(ceilingSource) {
+		return "", "", fmt.Errorf("ceiling source %q is not a single safe marker line", ceilingSource)
+	}
 	slice := string(sliceTemplate)
 	slice = strings.ReplaceAll(slice, "@SLICEUNIT@", sliceUnit)
 	slice = strings.ReplaceAll(slice, "@MEMMAX@", maximum)
 	slice = strings.ReplaceAll(slice, "@MEMHIGH@", high)
 	slice = strings.ReplaceAll(slice, "@OVERCOMMIT@", acceptance)
+	slice = strings.ReplaceAll(slice, "@CEILINGSOURCE@", ceilingSource)
 	anchor := string(anchorTemplate)
 	anchor = strings.ReplaceAll(anchor, "@ANCHORUNIT@", anchorUnit)
 	anchor = strings.ReplaceAll(anchor, "@SLICEUNIT@", sliceUnit)
@@ -1850,6 +2051,11 @@ func runStatus(d installDeps) error {
 	statusLiveProperty(d, d.sliceUnit, "MemoryHigh")
 
 	maximum, _ := parseInstalledMemoryMax(string(content))
+	// AIRA-120. Where the ceiling came from, beside what it is. Read only from the
+	// managed unit that actually declares the cap, so a unit AIRA did not write
+	// (or one written before this marker existed) reports unevaluated rather than
+	// an invented "static".
+	d.logf("slice ceiling source: %s", describeCeilingSource(parseInstalledValue(string(content), installedCeilingSourceRE)))
 	d.logf("memory delegation: %s", memoryEnforcementState(d, uid, maximum))
 	if systemDropinsHealthy(d, uid) {
 		d.logf("oomd + delegation + sysctl drop-ins: up to date")

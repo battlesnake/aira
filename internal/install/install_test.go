@@ -53,7 +53,7 @@ func TestComputeMemoryLimitsPrecedenceAndValidation(t *testing.T) {
 }
 
 func TestRenderUnitsSubstitutesAndMarksFirstLine(t *testing.T) {
-	slice, anchor, err := renderUnits("test.slice", "test-anchor.service", "/opt/aira", "16G", "14G", true)
+	slice, anchor, err := renderUnits("test.slice", "test-anchor.service", "/opt/aira", "16G", "14G", true, ceilingSourceStatic)
 	if err != nil {
 		t.Fatal(err)
 	}

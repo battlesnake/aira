@@ -147,6 +147,18 @@ func readMemAvailable() (int64, bool, string) {
 	return parseMemAvailable(data)
 }
 
+// ReadMemAvailable exposes THE MemAvailable reader — the same one the memory
+// watchdog and AIRA-103/106's effective-ceiling computation already use — to the
+// other packages that need the same "how much RAM can a new allocation actually
+// get" fact. Today that is `aira install --ci` (AIRA-120), which snapshots it
+// once at install time to size the static slice ceiling.
+//
+// It is deliberately a thin wrapper over readMemAvailable rather than a second
+// reader: the /proc/meminfo parse, the kB-unit check, and the
+// established/unevaluated contract (ok=false plus a reason, never a fabricated
+// zero) all stay in exactly one place.
+func ReadMemAvailable() (int64, bool, string) { return readMemAvailable() }
+
 func parseMemAvailable(data []byte) (int64, bool, string) {
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)

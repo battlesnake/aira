@@ -1773,8 +1773,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// AIRA-62 and were simply never described.) Omitting a mode flag PRESERVES
 		// whatever the installed unit declares rather than resetting it, which is
 		// why each description says so.
-		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
+		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
 			stringSpec("memory_max", false, false, "aira.slice MemoryMax (<N>G)"),
+			boolSpec("ci", false, false, "Dedicated CI worker: size MemoryMax from a one-time MemAvailable snapshot with zero headroom; refuses with --memory-max"),
 			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
 			stringSpec("watchdog", false, false, "Memory-watchdog mode; omitted keeps the installed value", "off", "observe", "enforce"),
 			stringSpec("watchdog_interval", false, false, "Memory-watchdog sample interval in [1s,30s); omitted keeps the installed value"),
@@ -1785,6 +1786,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
 			_ = stringArg(args, "memory_max")
+			_ = boolArg(args, "ci")
 			_ = stringArg(args, "memory_high")
 			_ = stringArg(args, "watchdog")
 			_ = stringArg(args, "watchdog_interval")
