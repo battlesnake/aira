@@ -16,6 +16,7 @@ import (
 	"aira/internal/runner"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 // AIRA-127 viewmodel tests. Deliberately NOT terminal-rendering or
@@ -86,11 +87,11 @@ func TestTopViewModelHoldsSlotAndColourAcrossTicks(t *testing.T) {
 			topTestRecord("CONFINE-alpha-101-aa", "alpha", 3*gib, 2*gib),
 			topTestRecord("CONFINE-bravo-102-bb", "bravo", 6*gib, 5*gib)),
 	}
-	var slots []string
+	var state topTick
 	var firstSlots, firstColours map[string]string
 	for index, tick := range ticks {
 		var model panelModel
-		model, slots = topViewModel(slots, tick)
+		model, state = topViewModel(state, tick)
 		gotSlots, gotColours := topRowSlots(model), topRowColours(model)
 		if index == 0 {
 			firstSlots, firstColours = gotSlots, gotColours
@@ -119,7 +120,7 @@ func TestTopViewModelHoldsSlotAndColourAcrossTicks(t *testing.T) {
 func TestTopViewModelRowAndBarRegionShareAColour(t *testing.T) {
 	uncapped := "max"
 	frame := topTestFrame()
-	model, _ := topViewModel(nil, topTestListing(frame,
+	model, _ := topViewModel(topTick{}, topTestListing(frame,
 		topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, 1*gib),
 		// A scope with no width: it has a row but no bar region, which shifts every
 		// later region's index away from its row's index.
@@ -152,13 +153,13 @@ func TestTopViewModelRowAndBarRegionShareAColour(t *testing.T) {
 // non-porous: an implementation that rebuilds the table from the daemon's sorted
 // listing each tick gives the newcomer slot 0 and pushes both incumbents down.
 func TestTopViewModelAppendsANewAdmissionWithoutMovingExistingSlots(t *testing.T) {
-	first, slots := topViewModel(nil, topTestListing(topTestFrame(),
+	first, state := topViewModel(topTick{}, topTestListing(topTestFrame(),
 		topTestRecord("CONFINE-mike-101-aa", "mike", 2*gib, 1*gib),
 		topTestRecord("CONFINE-november-102-bb", "november", 3*gib, 2*gib)))
 	before := topRowSlots(first)
 	beforeColours := topRowColours(first)
 
-	second, slots := topViewModel(slots, topTestListing(topTestFrame(),
+	second, state := topViewModel(state, topTestListing(topTestFrame(),
 		topTestRecord("CONFINE-aaron-103-cc", "aaron", 4*gib, 3*gib),
 		topTestRecord("CONFINE-mike-101-aa", "mike", 2*gib, 1*gib),
 		topTestRecord("CONFINE-november-102-bb", "november", 3*gib, 2*gib)))
@@ -176,8 +177,8 @@ func TestTopViewModelAppendsANewAdmissionWithoutMovingExistingSlots(t *testing.T
 	if after["CONFINE-aaron-103-cc"] != "2" {
 		t.Fatalf("new admission took slot %s, want the appended slot 2", after["CONFINE-aaron-103-cc"])
 	}
-	if want := []string{"CONFINE-mike-101-aa", "CONFINE-november-102-bb", "CONFINE-aaron-103-cc"}; !reflect.DeepEqual(slots, want) {
-		t.Fatalf("slot table=%v, want %v", slots, want)
+	if want := []string{"CONFINE-mike-101-aa", "CONFINE-november-102-bb", "CONFINE-aaron-103-cc"}; !reflect.DeepEqual(state.Slots, want) {
+		t.Fatalf("slot table=%v, want %v", state.Slots, want)
 	}
 }
 
@@ -192,22 +193,22 @@ func TestTopViewModelFreesAnExitedSlotForALaterAdmissionOnly(t *testing.T) {
 	bravo := topTestRecord("CONFINE-bravo-102-bb", "bravo", 3*gib, 2*gib)
 	charlie := topTestRecord("CONFINE-charlie-103-cc", "charlie", 4*gib, 3*gib)
 
-	_, slots := topViewModel(nil, topTestListing(topTestFrame(), alpha, bravo, charlie))
-	if want := []string{"CONFINE-alpha-101-aa", "CONFINE-bravo-102-bb", "CONFINE-charlie-103-cc"}; !reflect.DeepEqual(slots, want) {
-		t.Fatalf("initial slot table=%v, want %v", slots, want)
+	_, state := topViewModel(topTick{}, topTestListing(topTestFrame(), alpha, bravo, charlie))
+	if want := []string{"CONFINE-alpha-101-aa", "CONFINE-bravo-102-bb", "CONFINE-charlie-103-cc"}; !reflect.DeepEqual(state.Slots, want) {
+		t.Fatalf("initial slot table=%v, want %v", state.Slots, want)
 	}
 
-	exited, slots := topViewModel(slots, topTestListing(topTestFrame(), alpha, charlie))
+	exited, state := topViewModel(state, topTestListing(topTestFrame(), alpha, charlie))
 	held := topRowSlots(exited)
 	if held["CONFINE-alpha-101-aa"] != "0" || held["CONFINE-charlie-103-cc"] != "2" {
 		t.Fatalf("after bravo exited slots=%v, want alpha=0 charlie=2 (no reflow)", held)
 	}
-	if want := []string{"CONFINE-alpha-101-aa", topSlotFree, "CONFINE-charlie-103-cc"}; !reflect.DeepEqual(slots, want) {
-		t.Fatalf("slot table after exit=%v, want a hole at 1: %v", slots, want)
+	if want := []string{"CONFINE-alpha-101-aa", topSlotFree, "CONFINE-charlie-103-cc"}; !reflect.DeepEqual(state.Slots, want) {
+		t.Fatalf("slot table after exit=%v, want a hole at 1: %v", state.Slots, want)
 	}
 
 	delta := topTestRecord("CONFINE-delta-104-dd", "delta", 5*gib, 4*gib)
-	reused, slots := topViewModel(slots, topTestListing(topTestFrame(), alpha, charlie, delta))
+	reused, state := topViewModel(state, topTestListing(topTestFrame(), alpha, charlie, delta))
 	after := topRowSlots(reused)
 	if after["CONFINE-alpha-101-aa"] != "0" || after["CONFINE-charlie-103-cc"] != "2" {
 		t.Fatalf("survivors moved on the later admission: %v", after)
@@ -215,8 +216,8 @@ func TestTopViewModelFreesAnExitedSlotForALaterAdmissionOnly(t *testing.T) {
 	if after["CONFINE-delta-104-dd"] != "1" {
 		t.Fatalf("later admission took slot %s, want the freed slot 1", after["CONFINE-delta-104-dd"])
 	}
-	if want := []string{"CONFINE-alpha-101-aa", "CONFINE-delta-104-dd", "CONFINE-charlie-103-cc"}; !reflect.DeepEqual(slots, want) {
-		t.Fatalf("slot table after reuse=%v, want %v", slots, want)
+	if want := []string{"CONFINE-alpha-101-aa", "CONFINE-delta-104-dd", "CONFINE-charlie-103-cc"}; !reflect.DeepEqual(state.Slots, want) {
+		t.Fatalf("slot table after reuse=%v, want %v", state.Slots, want)
 	}
 	// The rows are emitted in SLOT order, not in the daemon's id order, or the
 	// bar's stack and the list would disagree about which region is which row.
@@ -334,22 +335,22 @@ func TestTopViewModelBarGeometry(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			model, _ := topViewModel(nil, topTestListing(testCase.reserve, testCase.records...))
+			model, _ := topViewModel(topTick{}, topTestListing(testCase.reserve, testCase.records...))
 			bar := model.Bar
 			if bar == nil || !bar.Evaluated {
 				t.Fatalf("bar=%+v, want an evaluated bar", bar)
 			}
-			if bar.TotalBytes != testCase.reserve.SystemMemTotalBytes {
-				t.Fatalf("total=%d, want %d", bar.TotalBytes, testCase.reserve.SystemMemTotalBytes)
+			if bar.Total != testCase.reserve.SystemMemTotalBytes {
+				t.Fatalf("total=%d, want %d", bar.Total, testCase.reserve.SystemMemTotalBytes)
 			}
-			if bar.ClaimedBytes != testCase.wantClaimed {
-				t.Fatalf("claimed=%d, want %d", bar.ClaimedBytes, testCase.wantClaimed)
+			if bar.Claimed != testCase.wantClaimed {
+				t.Fatalf("claimed=%d, want %d", bar.Claimed, testCase.wantClaimed)
 			}
-			if bar.OutsideKnown != testCase.wantOutsideKnown || bar.OutsideBytes != testCase.wantOutside {
-				t.Fatalf("outside=%d known=%v, want %d known=%v", bar.OutsideBytes, bar.OutsideKnown, testCase.wantOutside, testCase.wantOutsideKnown)
+			if bar.OutsideKnown != testCase.wantOutsideKnown || bar.Outside != testCase.wantOutside {
+				t.Fatalf("outside=%d known=%v, want %d known=%v", bar.Outside, bar.OutsideKnown, testCase.wantOutside, testCase.wantOutsideKnown)
 			}
-			if bar.FreeBytes != testCase.wantFree {
-				t.Fatalf("free=%d, want %d", bar.FreeBytes, testCase.wantFree)
+			if bar.Free != testCase.wantFree {
+				t.Fatalf("free=%d, want %d", bar.Free, testCase.wantFree)
 			}
 			if bar.Overcommitted != testCase.wantOvercommit {
 				t.Fatalf("overcommitted=%v, want %v", bar.Overcommitted, testCase.wantOvercommit)
@@ -359,18 +360,18 @@ func TestTopViewModelBarGeometry(t *testing.T) {
 			}
 			for index, want := range testCase.wantRegions {
 				got := bar.Regions[index]
-				if got.Kind != want.kind || got.StartBytes != want.startBytes || got.Bytes != want.bytes {
+				if got.Kind != want.kind || got.Start != want.startBytes || got.Size != want.bytes {
 					t.Fatalf("region %d = %+v, want kind=%d start=%d bytes=%d", index, got, want.kind, want.startBytes, want.bytes)
 				}
-				startCol := topBarColumn(got.StartBytes, bar.TotalBytes, testCase.width)
-				endCol := topBarColumn(got.StartBytes+got.Bytes, bar.TotalBytes, testCase.width)
+				startCol := topBarColumn(got.Start, bar.Total, testCase.width)
+				endCol := topBarColumn(got.Start+got.Size, bar.Total, testCase.width)
 				if startCol != want.startCol || endCol != want.endCol {
 					t.Fatalf("region %d columns=[%d,%d), want [%d,%d)", index, startCol, endCol, want.startCol, want.endCol)
 				}
 			}
 			gotMarkers := make(map[string]int64, len(bar.Markers))
 			for _, marker := range bar.Markers {
-				gotMarkers[marker.Name] = marker.Bytes
+				gotMarkers[marker.Name] = marker.At
 			}
 			if !reflect.DeepEqual(gotMarkers, testCase.wantMarkers) {
 				t.Fatalf("markers=%v, want %v", gotMarkers, testCase.wantMarkers)
@@ -414,7 +415,7 @@ func TestTopViewModelRefusesToDrawAnUnevaluatedBar(t *testing.T) {
 			SystemMemTotalBytes: 64 * gib, Containment: string(runner.ConfineContainmentAdvisory)})},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			model, _ := topViewModel(nil, testCase.listing)
+			model, _ := topViewModel(topTick{}, testCase.listing)
 			if model.Bar == nil || model.Bar.Evaluated {
 				t.Fatalf("bar=%+v, want an unevaluated bar", model.Bar)
 			}
@@ -432,12 +433,12 @@ func TestTopViewModelRefusesToDrawAnUnevaluatedBar(t *testing.T) {
 // not evidence that anything exited, and freeing on it would recolour the whole
 // view and then recolour it back.
 func TestTopViewModelCarriesSlotsThroughAnUnevaluatedListing(t *testing.T) {
-	_, slots := topViewModel(nil, topTestListing(topTestFrame(),
+	_, state := topViewModel(topTick{}, topTestListing(topTestFrame(),
 		topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib),
 		topTestRecord("CONFINE-bravo-102-bb", "bravo", 3*gib, gib)))
-	model, after := topViewModel(slots, runner.ConfineListResult{Verdict: "unevaluated", Reason: "read-error"})
-	if !reflect.DeepEqual(after, slots) {
-		t.Fatalf("slots after an unevaluated listing=%v, want them carried forward %v", after, slots)
+	model, after := topViewModel(state, runner.ConfineListResult{Verdict: "unevaluated", Reason: "read-error"})
+	if !reflect.DeepEqual(after, state) {
+		t.Fatalf("state after an unevaluated listing=%+v, want it carried forward %+v", after, state)
 	}
 	if model.Bar == nil || model.Bar.Evaluated || model.Footer == "" {
 		t.Fatalf("model=%+v, want an unevaluated bar and a stated footer", model)
@@ -604,7 +605,7 @@ func TestTopControllerMalformedFetchKeepsTheLastModelAndSlots(t *testing.T) {
 	state, _ = requestPanelRefresh(state, viewTop)
 	listing := topTestListing(topTestFrame(), topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib))
 	state, _ = onTUIFetchResult(state, fetchResult{View: viewTop, Generation: state.Panels[viewTop].InFlightGeneration, Top: &listing})
-	before, slots := state.Panels[viewTop].Model, append([]string(nil), state.TopSlots...)
+	before, tick := state.Panels[viewTop].Model, cloneTopTick(state.Top)
 
 	state, _ = requestPanelRefresh(state, viewTop)
 	state, _ = onTUIFetchResult(state, fetchResult{View: viewTop, Generation: state.Panels[viewTop].InFlightGeneration})
@@ -612,8 +613,8 @@ func TestTopControllerMalformedFetchKeepsTheLastModelAndSlots(t *testing.T) {
 	if panel.Status != panelError || panel.ErrorCode != tuiDecodeError {
 		t.Fatalf("panel=%+v, want an error naming %s", panel, tuiDecodeError)
 	}
-	if !reflect.DeepEqual(panel.Model.Rows, before.Rows) || !reflect.DeepEqual(state.TopSlots, slots) {
-		t.Fatalf("a malformed fetch discarded the last model/slots: rows=%+v slots=%v", panel.Model.Rows, state.TopSlots)
+	if !reflect.DeepEqual(panel.Model.Rows, before.Rows) || !reflect.DeepEqual(state.Top, tick) {
+		t.Fatalf("a malformed fetch discarded the last model/state: rows=%+v state=%+v", panel.Model.Rows, state.Top)
 	}
 }
 
@@ -761,21 +762,31 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 // whole ticket is that the OLD columns had to GO, and a widening-only change
 // would satisfy any weaker assertion.
 //
+// AIRA-137 adds RAM and CPU CORES between RESERVATION and COMMAND, so the exact
+// list is asserted with them in place; COMMAND stays LAST, which is the property
+// the width behaviour above depends on.
+//
 // verifies: AIRA-135
+// verifies: AIRA-137
 func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	command := "go test ./... -count=1"
 	record := topTestRecord("CONFINE-heavy-suite-31415-9f3ac1de@session-9f3ac1de", "heavy-suite", 42160*(1<<20), 9*gib)
 	record.Command = &command
-	model, _ := topViewModel(nil, topTestListing(topTestFrame(), record))
+	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), record))
 
-	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "COMMAND"}
+	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}
 	if !reflect.DeepEqual(model.Headers, wantHeaders) {
 		t.Fatalf("headers=%v, want %v", model.Headers, wantHeaders)
+	}
+	if model.Headers[len(model.Headers)-1] != "COMMAND" {
+		t.Fatalf("COMMAND is not the last column: %v", model.Headers)
 	}
 	if len(model.Rows) != 1 {
 		t.Fatalf("rows=%+v, want one", model.Rows)
 	}
-	wantCells := []string{"0", "heavy-suite", "4242", "yes", "42160M", command}
+	// RAM is the record's live memory.current (9 GiB), and CPU is unevaluated on
+	// this single tick because a rate needs two samples.
+	wantCells := []string{"0", "heavy-suite", "4242", "yes", "42160M", "9216M", "unevaluated", command}
 	if !reflect.DeepEqual(model.Rows[0].Cells, wantCells) {
 		t.Fatalf("cells=%v, want %v", model.Rows[0].Cells, wantCells)
 	}
@@ -873,17 +884,17 @@ func TestTopBarRegionSplitsUsedFromReservedButUnused(t *testing.T) {
 			// A second scope AFTER it, to pin that the split cannot move the next
 			// region's start or steal its columns.
 			next := topTestRecord("CONFINE-bravo-102-bb", "bravo", 4*gib, 1*gib)
-			model, _ := topViewModel(nil, topTestListing(frame, record, next))
+			model, _ := topViewModel(topTick{}, topTestListing(frame, record, next))
 			region := model.Bar.Regions[0]
-			if region.Bytes != testCase.reserved || region.StartBytes != 0 {
+			if region.Size != testCase.reserved || region.Start != 0 {
 				t.Fatalf("region=%+v, want the whole reservation from 0", region)
 			}
-			if region.UsedKnown != testCase.wantKnown || region.UsedBytes != testCase.wantUsed {
+			if region.UsedKnown != testCase.wantKnown || region.Used != testCase.wantUsed {
 				t.Fatalf("region used=%d known=%v, want %d known=%v",
-					region.UsedBytes, region.UsedKnown, testCase.wantUsed, testCase.wantKnown)
+					region.Used, region.UsedKnown, testCase.wantUsed, testCase.wantKnown)
 			}
-			if after := model.Bar.Regions[1]; after.StartBytes != testCase.reserved {
-				t.Fatalf("next region starts at %d, want %d; the split moved it", after.StartBytes, testCase.reserved)
+			if after := model.Bar.Regions[1]; after.Start != testCase.reserved {
+				t.Fatalf("next region starts at %d, want %d; the split moved it", after.Start, testCase.reserved)
 			}
 
 			cells := topBarCells(model.Bar, width)
@@ -934,7 +945,7 @@ func TestTopBarNonScopeRegionsAreNeverSplit(t *testing.T) {
 		SliceMaxBytes: 32 * gib, SliceHighState: runner.ConfineSliceHighNone,
 		ReservationJobs: 3, ReservationBytes: 2 * gib,
 	}
-	model, _ := topViewModel(nil, topTestListing(frame,
+	model, _ := topViewModel(topTick{}, topTestListing(frame,
 		topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)))
 	for _, region := range model.Bar.Regions {
 		if region.Kind == topRegionScope {
@@ -993,7 +1004,7 @@ func int64Pointer(value int64) *int64 { return &value }
 // verifies: AIRA-135
 func TestTopShadeLegendAppearsOnlyWhenASplitIsDrawn(t *testing.T) {
 	frame := topTestFrame()
-	split, _ := topViewModel(nil, topTestListing(frame,
+	split, _ := topViewModel(topTick{}, topTestListing(frame,
 		topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)))
 	if got := topShadeLegend(split.Bar); got == "" {
 		t.Fatalf("a drawn split carried no key: %+v", split.Bar.Regions)
@@ -1001,11 +1012,512 @@ func TestTopShadeLegendAppearsOnlyWhenASplitIsDrawn(t *testing.T) {
 	// Usage unevaluated for every drawn scope: one undivided shade, no key.
 	unknown := topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 0)
 	unknown.RSSBytes = nil
-	undivided, _ := topViewModel(nil, topTestListing(frame, unknown))
+	undivided, _ := topViewModel(topTick{}, topTestListing(frame, unknown))
 	if got := topShadeLegend(undivided.Bar); got != "" {
 		t.Fatalf("an undivided bar carried the split key %q", got)
 	}
 	if got := topShadeLegend(nil); got != "" {
 		t.Fatalf("a nil bar carried the split key %q", got)
+	}
+}
+
+// AIRA-137 viewmodel tests. Same convention as AIRA-127/135 above: pure model
+// assertions, no terminal, no golden screenshot.
+//
+// verifies: AIRA-137
+
+// topTestCPUBase is an arbitrary but fixed sample instant. Tests move forward
+// from it by an explicit interval, so no assertion here depends on a real clock.
+const topTestCPUBase = int64(1_700_000_000_000_000_000)
+
+// topTestCPUFrame is topTestFrame plus an established CPU frame.
+func topTestCPUFrame(sampleNano, systemUsec, sliceUsec int64, cores int) *runner.ConfineSliceReserve {
+	frame := topTestFrame()
+	frame.CPUSampleUnixNano = sampleNano
+	frame.SystemCPUUsageUsec, frame.SystemCPUKnown = systemUsec, true
+	frame.SliceCPUUsageUsec, frame.SliceCPUKnown = sliceUsec, true
+	frame.CPUCores = cores
+	return frame
+}
+
+func topTestCPURecord(scopeID, name string, capBytes, rss, cpuUsec int64) runner.ConfineRecord {
+	record := topTestRecord(scopeID, name, capBytes, rss)
+	usec := cpuUsec
+	record.CPUUsageUsec = &usec
+	return record
+}
+
+// topRowCells maps scope id to one column's cell, by header name, so a test does
+// not have to encode the column ORDER a different test already owns.
+func topRowCells(t *testing.T, model panelModel, header string) map[string]string {
+	t.Helper()
+	column := -1
+	for index, name := range model.Headers {
+		if name == header {
+			column = index
+		}
+	}
+	if column < 0 {
+		t.Fatalf("no %s column in %v", header, model.Headers)
+	}
+	cells := make(map[string]string, len(model.Rows))
+	for _, row := range model.Rows {
+		cells[row.ID] = row.Cells[column]
+	}
+	return cells
+}
+
+// (a) CPU is a RATE. The tick a scope first appears has no previous counter to
+// difference against, so it has NO rate — not a zero, and not a full core. The
+// next tick, given two real (counter, timestamp) samples, has a real number.
+//
+// Non-porous in both directions: an implementation that fabricated zero on the
+// first tick fails the "unevaluated" assertion, and one that never established a
+// rate at all fails the second tick's exact value. The value itself is chosen so
+// a wrong denominator cannot coincide with it: 0.5 core over one second is
+// 500000 usec, which differs from the raw counter, from the counter difference,
+// and from any percent-of-machine reading (16 cores here).
+func TestTopViewModelCPURateIsUnevaluatedOnTheFirstTickAndRealOnTheNext(t *testing.T) {
+	first, state := topViewModel(topTick{}, topTestListing(
+		topTestCPUFrame(topTestCPUBase, 10_000_000, 4_000_000, 16),
+		topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 4*gib, gib, 1_000_000)))
+	if got := topRowCells(t, first, "CPU CORES")["CONFINE-alpha-101-aa"]; got != "unevaluated" {
+		t.Fatalf("first-tick CPU cell=%q, want unevaluated", got)
+	}
+	if first.CPUBar == nil || first.CPUBar.Evaluated || first.CPUBar.Reason == "" {
+		t.Fatalf("first-tick CPU bar=%+v, want unevaluated with a stated reason", first.CPUBar)
+	}
+
+	second, _ := topViewModel(state, topTestListing(
+		topTestCPUFrame(topTestCPUBase+int64(time.Second), 12_000_000, 5_000_000, 16),
+		topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 4*gib, gib, 1_500_000)))
+	if got := topRowCells(t, second, "CPU CORES")["CONFINE-alpha-101-aa"]; got != "0.50" {
+		t.Fatalf("second-tick CPU cell=%q, want 0.50 cores", got)
+	}
+	bar := second.CPUBar
+	if bar == nil || !bar.Evaluated {
+		t.Fatalf("second-tick CPU bar=%+v, want an evaluated bar", bar)
+	}
+	if bar.Total != 16*topCPUMicroCores {
+		t.Fatalf("CPU bar total=%d, want core count x one core", bar.Total)
+	}
+	// slice 1.0 core, of which 0.5 is alpha's: the unscoped remainder is the rest.
+	if bar.Claimed != topCPUMicroCores {
+		t.Fatalf("CPU bar claimed=%d, want the slice's whole 1.00 cores", bar.Claimed)
+	}
+	// system 2.0 cores minus the slice's 1.0.
+	if !bar.OutsideKnown || bar.Outside != topCPUMicroCores {
+		t.Fatalf("CPU bar outside=%d known=%v, want 1.00 cores established", bar.Outside, bar.OutsideKnown)
+	}
+}
+
+// (b) A counter that reads LOWER than its own previous sample is UNEVALUATED.
+// Not a negative rate, and — the direction that actually matters — not clamped
+// to zero: clamping renders a cgroup counter reset, a reused scope id, or an
+// accounting anomaly as a peacefully idle job, which hides the very thing the
+// reading exists to surface.
+func TestTopViewModelCPUCounterRegressionIsUnevaluatedNotClampedToZero(t *testing.T) {
+	_, state := topViewModel(topTick{}, topTestListing(
+		topTestCPUFrame(topTestCPUBase, 10_000_000, 4_000_000, 16),
+		topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 4*gib, gib, 9_000_000)))
+	// Every counter goes BACKWARDS: the scope's, the slice's and the machine's.
+	regressed, _ := topViewModel(state, topTestListing(
+		topTestCPUFrame(topTestCPUBase+int64(time.Second), 9_000_000, 3_000_000, 16),
+		topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 4*gib, gib, 8_000_000)))
+	got := topRowCells(t, regressed, "CPU CORES")["CONFINE-alpha-101-aa"]
+	if got != "unevaluated" {
+		t.Fatalf("CPU cell after a counter regression=%q, want unevaluated (0.00 would read as idle)", got)
+	}
+	bar := regressed.CPUBar
+	if bar == nil || !bar.Evaluated {
+		t.Fatalf("CPU bar=%+v, want it still evaluated: the interval and core count are fine", bar)
+	}
+	// The regressed scope is not drawn, is COUNTED as undrawn, and the regressed
+	// system counter leaves the grey unestablished rather than a fabricated zero.
+	for _, region := range bar.Regions {
+		if region.Kind == topRegionScope {
+			t.Fatalf("a regressed counter was drawn as a region: %+v", region)
+		}
+	}
+	if bar.OutsideKnown {
+		t.Fatalf("outside=%d known, want unevaluated from a regressed system counter", bar.Outside)
+	}
+	if len(bar.Notes) == 0 {
+		t.Fatalf("bar notes=%v, want the undrawn scope named", bar.Notes)
+	}
+}
+
+// (c) An interval that is implausibly small, or stale, yields NO rate anywhere —
+// never a divide-by-near-zero spike, and never a minutes-long average presented
+// as current load.
+//
+// The small-interval case is non-porous by construction: 4000 usec of CPU over
+// 1 ms of wall clock is FOUR cores if divided naively, a perfectly plausible
+// number on this 16-core fixture, so nothing but the guard rejects it.
+func TestTopViewModelCPURateIsUnevaluatedForAnUnusableInterval(t *testing.T) {
+	cases := []struct {
+		name    string
+		elapsed time.Duration
+	}{
+		{"back-to-back-ticks", time.Millisecond},
+		{"clock-stepped-backwards", -time.Second},
+		{"sample-too-stale-to-be-current", 10 * time.Minute},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, state := topViewModel(topTick{}, topTestListing(
+				topTestCPUFrame(topTestCPUBase, 10_000_000, 4_000_000, 16),
+				topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 4*gib, gib, 1_000_000)))
+			next, _ := topViewModel(state, topTestListing(
+				topTestCPUFrame(topTestCPUBase+int64(testCase.elapsed), 10_004_000, 4_004_000, 16),
+				topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 4*gib, gib, 1_004_000)))
+			if got := topRowCells(t, next, "CPU CORES")["CONFINE-alpha-101-aa"]; got != "unevaluated" {
+				t.Fatalf("CPU cell over a %s interval=%q, want unevaluated", testCase.elapsed, got)
+			}
+			bar := next.CPUBar
+			if bar == nil || bar.Evaluated || bar.Reason == "" {
+				t.Fatalf("CPU bar=%+v, want unevaluated with a stated reason", bar)
+			}
+			if cells := topBarCells(bar, 40); cells != nil {
+				t.Fatalf("cells=%v, want none for an unevaluated bar", cells)
+			}
+		})
+	}
+	// The guard is a MINIMUM, not a rejection of every short interval: an ordinary
+	// refresh tick must still produce a rate, or the whole view would be blank.
+	if delta := topCPUDeltaBetween(
+		topCPUSample{UnixNano: topTestCPUBase},
+		topCPUSample{UnixNano: topTestCPUBase + int64(topRefreshInterval)}); !delta.OK {
+		t.Fatalf("the ordinary refresh interval %s was rejected: %+v", topRefreshInterval, delta)
+	}
+}
+
+// (d) CPU bar geometry: the region widths, their absolute offsets, and the
+// columns they map to, across representative core-count and usage scenarios.
+// Mirrors the RAM bar's own (d)-style test, over the SAME shared bar model and
+// the SAME topBarColumn mapping.
+func TestTopViewModelCPUBarRegionGeometry(t *testing.T) {
+	type wantCPURegion struct {
+		kind     topBarRegionKind
+		start    int64
+		size     int64
+		startCol int
+		endCol   int
+	}
+	const second = int64(time.Second)
+	cases := []struct {
+		name  string
+		cores int
+		width int
+		// usec counters at tick two; tick one is all zeroes one second earlier, so
+		// each counter IS its rate in microseconds of CPU per second.
+		system, slice int64
+		scopes        []int64
+
+		wantClaimed    int64
+		wantOutside    int64
+		wantFree       int64
+		wantOvercommit bool
+		wantRegions    []wantCPURegion
+	}{
+		{
+			// 4 cores at width 40: 0.1 core per column.
+			name:  "four-cores-two-jobs-plus-unscoped-and-outside",
+			cores: 4, width: 40,
+			system: 3_000_000, slice: 2_000_000,
+			scopes:      []int64{1_000_000, 500_000},
+			wantClaimed: 2 * topCPUMicroCores,
+			wantOutside: topCPUMicroCores,
+			wantFree:    topCPUMicroCores,
+			wantRegions: []wantCPURegion{
+				{topRegionScope, 0, topCPUMicroCores, 0, 10},
+				{topRegionScope, topCPUMicroCores, topCPUMicroCores / 2, 10, 15},
+				// the slice's own 2.0 cores minus the 1.5 the two jobs account for.
+				{topRegionScopeless, 3 * topCPUMicroCores / 2, topCPUMicroCores / 2, 15, 20},
+				{topRegionFree, 2 * topCPUMicroCores, topCPUMicroCores, 20, 30},
+				{topRegionOutside, 3 * topCPUMicroCores, topCPUMicroCores, 30, 40},
+			},
+		},
+		{
+			// A machine with nothing left: the job and the rest of the system
+			// together exceed both cores. Free is zero and the state is NAMED.
+			name:  "two-cores-saturated-and-over",
+			cores: 2, width: 20,
+			system: 2_500_000, slice: 1_500_000,
+			scopes:         []int64{1_500_000},
+			wantClaimed:    3 * topCPUMicroCores / 2,
+			wantOutside:    topCPUMicroCores,
+			wantFree:       0,
+			wantOvercommit: true,
+			wantRegions: []wantCPURegion{
+				{topRegionScope, 0, 3 * topCPUMicroCores / 2, 0, 15},
+				{topRegionOutside, topCPUMicroCores, topCPUMicroCores, 10, 20},
+			},
+		},
+		{
+			// One job whose rate exactly equals the slice's: no unscoped remainder
+			// to draw, and the free gap absorbs the rest.
+			name:  "eight-cores-single-job-accounts-for-the-whole-slice",
+			cores: 8, width: 32,
+			system: 4_000_000, slice: 2_000_000,
+			scopes:      []int64{2_000_000},
+			wantClaimed: 2 * topCPUMicroCores,
+			wantOutside: 2 * topCPUMicroCores,
+			wantFree:    4 * topCPUMicroCores,
+			wantRegions: []wantCPURegion{
+				{topRegionScope, 0, 2 * topCPUMicroCores, 0, 8},
+				{topRegionFree, 2 * topCPUMicroCores, 4 * topCPUMicroCores, 8, 24},
+				{topRegionOutside, 6 * topCPUMicroCores, 2 * topCPUMicroCores, 24, 32},
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			zero := make([]runner.ConfineRecord, 0, len(testCase.scopes))
+			now := make([]runner.ConfineRecord, 0, len(testCase.scopes))
+			for index, usec := range testCase.scopes {
+				id := "CONFINE-job" + strconv.Itoa(index) + "-10" + strconv.Itoa(index) + "-aa"
+				zero = append(zero, topTestCPURecord(id, "job"+strconv.Itoa(index), 4*gib, gib, 0))
+				now = append(now, topTestCPURecord(id, "job"+strconv.Itoa(index), 4*gib, gib, usec))
+			}
+			_, state := topViewModel(topTick{}, topTestListing(
+				topTestCPUFrame(topTestCPUBase, 0, 0, testCase.cores), zero...))
+			model, _ := topViewModel(state, topTestListing(
+				topTestCPUFrame(topTestCPUBase+second, testCase.system, testCase.slice, testCase.cores), now...))
+			bar := model.CPUBar
+			if bar == nil || !bar.Evaluated {
+				t.Fatalf("CPU bar=%+v, want an evaluated bar", bar)
+			}
+			if bar.Total != int64(testCase.cores)*topCPUMicroCores {
+				t.Fatalf("total=%d, want %d cores", bar.Total, testCase.cores)
+			}
+			if bar.Claimed != testCase.wantClaimed {
+				t.Fatalf("claimed=%d, want %d", bar.Claimed, testCase.wantClaimed)
+			}
+			if !bar.OutsideKnown || bar.Outside != testCase.wantOutside {
+				t.Fatalf("outside=%d known=%v, want %d established", bar.Outside, bar.OutsideKnown, testCase.wantOutside)
+			}
+			if bar.Free != testCase.wantFree {
+				t.Fatalf("free=%d, want %d", bar.Free, testCase.wantFree)
+			}
+			if bar.Overcommitted != testCase.wantOvercommit {
+				t.Fatalf("overcommitted=%v, want %v", bar.Overcommitted, testCase.wantOvercommit)
+			}
+			if len(bar.Regions) != len(testCase.wantRegions) {
+				t.Fatalf("regions=%+v, want %d of them", bar.Regions, len(testCase.wantRegions))
+			}
+			for index, want := range testCase.wantRegions {
+				got := bar.Regions[index]
+				if got.Kind != want.kind || got.Start != want.start || got.Size != want.size {
+					t.Fatalf("region %d = %+v, want kind=%d start=%d size=%d", index, got, want.kind, want.start, want.size)
+				}
+				startCol := topBarColumn(got.Start, bar.Total, testCase.width)
+				endCol := topBarColumn(got.Start+got.Size, bar.Total, testCase.width)
+				if startCol != want.startCol || endCol != want.endCol {
+					t.Fatalf("region %d columns=[%d,%d), want [%d,%d)", index, startCol, endCol, want.startCol, want.endCol)
+				}
+			}
+			// The grey is anchored to the RIGHT EDGE on this bar too, and nothing in
+			// the CPU stack is allowed to be a scope's RAM shading: a CPU rate has no
+			// reserved-and-idle remainder, so no CPU region carries a used split.
+			cells := topBarCells(bar, testCase.width)
+			if len(cells) != testCase.width {
+				t.Fatalf("cells=%d, want %d", len(cells), testCase.width)
+			}
+			if last := cells[testCase.width-1]; last.Kind != topRegionOutside {
+				t.Fatalf("last column=%+v, want the out-of-slice region anchored right", last)
+			}
+			for _, cell := range cells {
+				if cell.Shaded {
+					t.Fatalf("a CPU bar column is shaded: %+v", cell)
+				}
+			}
+		})
+	}
+}
+
+// (e) One colour identity per job across every surface: the table row, the RAM
+// bar's region, and the CPU bar's region are the same value.
+//
+// The fixture exists to break POSITION-based colouring, which is the plausible
+// wrong implementation and the one a naive fixture cannot catch. The first slot
+// is held by a scope that appears in NEITHER bar — an uncapped memory.max gives
+// it no RAM region, and an unreadable CPU counter gives it no CPU region — so
+// every later job's index within each Regions slice is one LESS than its slot.
+// Colouring a region by its position therefore assigns each of them the previous
+// job's colour, which this asserts against; colouring by the shared slot cannot.
+func TestTopViewModelRAMAndCPURegionsShareTheRowColour(t *testing.T) {
+	uncapped := "max"
+	// alpha: slot 0, no RAM region (uncapped), no CPU region (no counter at all).
+	alpha := topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib)
+	alpha.Cap = &uncapped
+	bravo := topTestCPURecord("CONFINE-bravo-102-bb", "bravo", 4*gib, gib, 0)
+	charlie := topTestCPURecord("CONFINE-charlie-103-cc", "charlie", 6*gib, gib, 0)
+	_, state := topViewModel(topTick{}, topTestListing(
+		topTestCPUFrame(topTestCPUBase, 0, 0, 16), alpha, bravo, charlie))
+
+	bravoNow := topTestCPURecord("CONFINE-bravo-102-bb", "bravo", 4*gib, gib, 250_000)
+	charlieNow := topTestCPURecord("CONFINE-charlie-103-cc", "charlie", 6*gib, gib, 750_000)
+	model, _ := topViewModel(state, topTestListing(
+		topTestCPUFrame(topTestCPUBase+int64(time.Second), 2_000_000, 1_000_000, 16),
+		alpha, bravoNow, charlieNow))
+
+	rows := topRowColours(model)
+	if len(rows) != 3 {
+		t.Fatalf("row colours=%v, want three rows", rows)
+	}
+	seen := map[string]bool{}
+	for _, colour := range rows {
+		if seen[colour] {
+			t.Fatalf("two live jobs share a colour: %v", rows)
+		}
+		seen[colour] = true
+	}
+	byName := func(bar *topBar) map[string]string {
+		colours := map[string]string{}
+		for _, region := range bar.Regions {
+			if region.Kind == topRegionScope {
+				colours[region.Label] = region.Colour
+			}
+		}
+		return colours
+	}
+	ram, cpu := byName(model.Bar), byName(model.CPUBar)
+	// The slot-holder that appears in neither bar is what makes the indices shift.
+	if _, drawn := ram["alpha"]; drawn {
+		t.Fatalf("alpha has a RAM region despite an uncapped memory.max: %+v", model.Bar.Regions)
+	}
+	if _, drawn := cpu["alpha"]; drawn {
+		t.Fatalf("alpha has a CPU region despite an unevaluated counter: %+v", model.CPUBar.Regions)
+	}
+	if len(ram) != 2 || len(cpu) != 2 {
+		t.Fatalf("ram=%v cpu=%v, want bravo and charlie in each", ram, cpu)
+	}
+	for id, name := range map[string]string{"CONFINE-bravo-102-bb": "bravo", "CONFINE-charlie-103-cc": "charlie"} {
+		if ram[name] != rows[id] {
+			t.Fatalf("%s RAM region colour=%q, row colour=%q", name, ram[name], rows[id])
+		}
+		if cpu[name] != rows[id] {
+			t.Fatalf("%s CPU region colour=%q, row colour=%q", name, cpu[name], rows[id])
+		}
+	}
+}
+
+// A scope whose CPU counter could not be read is NAMED, and its time is not
+// silently redistributed: the unscoped span still reconciles the slice's own
+// total against what the drawn jobs account for, and the note says so.
+func TestTopViewModelCPUBarNamesScopesItCouldNotDraw(t *testing.T) {
+	known := topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib, 0)
+	blind := topTestRecord("CONFINE-bravo-102-bb", "bravo", 2*gib, gib) // no CPUUsageUsec at all
+	_, state := topViewModel(topTick{}, topTestListing(
+		topTestCPUFrame(topTestCPUBase, 0, 0, 4), known, blind))
+	model, _ := topViewModel(state, topTestListing(
+		topTestCPUFrame(topTestCPUBase+int64(time.Second), 2_000_000, 1_500_000, 4),
+		topTestCPURecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib, 500_000), blind))
+
+	if got := topRowCells(t, model, "CPU CORES")["CONFINE-bravo-102-bb"]; got != "unevaluated" {
+		t.Fatalf("blind scope CPU cell=%q, want unevaluated", got)
+	}
+	bar := model.CPUBar
+	scopes := 0
+	for _, region := range bar.Regions {
+		if region.Kind == topRegionScope {
+			scopes++
+		}
+	}
+	if scopes != 1 {
+		t.Fatalf("CPU bar drew %d scope regions, want only the one with an established rate", scopes)
+	}
+	// slice 1.50 cores, of which the one drawn job accounts for 0.50.
+	if bar.Claimed != 3*topCPUMicroCores/2 {
+		t.Fatalf("claimed=%d, want the slice's whole 1.50 cores", bar.Claimed)
+	}
+	found := false
+	for _, note := range bar.Notes {
+		if strings.Contains(note, "unevaluated CPU rate") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("notes=%v, want the undrawn scope named", bar.Notes)
+	}
+}
+
+// The RAM column is the live memory.current reading, and an unreadable one is
+// named rather than shown as a job using nothing.
+func TestTopViewModelRAMColumnNamesAnUnreadableReading(t *testing.T) {
+	blind := topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib)
+	blind.RSSBytes = nil
+	used := topTestRecord("CONFINE-bravo-102-bb", "bravo", 4*gib, 1536*(1<<20))
+	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), blind, used))
+	cells := topRowCells(t, model, "RAM")
+	if cells["CONFINE-alpha-101-aa"] != "unevaluated" {
+		t.Fatalf("unreadable RAM cell=%q, want unevaluated", cells["CONFINE-alpha-101-aa"])
+	}
+	if cells["CONFINE-bravo-102-bb"] != "1536M" {
+		t.Fatalf("RAM cell=%q, want the live 1536M reading", cells["CONFINE-bravo-102-bb"])
+	}
+}
+
+// AIRA-137 fix. topBarLegend must not end in its own newline: renderTopBar
+// joins every following line (the marker legend, OVER-SUBSCRIBED, each note)
+// with its OWN leading "\n", so a trailing one here doubles up into a blank
+// line. At a panel's real fixed height that blank line pushes the last line
+// off-panel rather than leaving a gap on screen — which is exactly what
+// silently dropped the CPU panel's notes and OVER-SUBSCRIBED line.
+func TestTopBarLegendHasNoTrailingNewline(t *testing.T) {
+	bar := &topBar{Kind: topBarCPU, Total: topCPUMicroCores, Free: topCPUMicroCores}
+	if legend := topBarLegend(bar); strings.HasSuffix(legend, "\n") {
+		t.Fatalf("topBarLegend=%q, want no trailing newline", legend)
+	}
+}
+
+// AIRA-137 fix. Drives renderTopBar exactly as it is really called — a
+// *tview.TextView with a real rect, so GetInnerRect's width check takes the
+// drawn path — and inspects the assembled text it hands to SetText. This is
+// NOT a screenshot test (no screen, no Draw): it is the model-to-text
+// assembly the smoke test's real screen would otherwise have to render to
+// notice was broken. A worst-realistic-case bar (one note, OVER-SUBSCRIBED)
+// must produce no blank line, and every line must fit inside the panel
+// height each bar is actually given in buildWidgets.
+func TestTopBarFitsItsPanelHeight(t *testing.T) {
+	cases := []struct {
+		kind   topBarKind
+		height int
+	}{
+		{topBarRAM, topRAMBarHeight},
+		{topBarCPU, topCPUBarHeight},
+	}
+	for _, testCase := range cases {
+		t.Run(string(testCase.kind), func(t *testing.T) {
+			bar := &topBar{
+				Kind: testCase.kind, Evaluated: true,
+				Total: 10 * topCPUMicroCores, Claimed: 9 * topCPUMicroCores,
+				Outside: 2 * topCPUMicroCores, OutsideKnown: true, Overcommitted: true,
+				Notes: []string{"one scope with an unevaluated rate not drawn"},
+			}
+			target := tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+			target.SetBorder(true)
+			target.SetRect(0, 0, 80, testCase.height)
+			r := &tuiRuntime{}
+			r.renderTopBar(target, bar, panelState{Status: panelReady})
+			text := target.GetText(true)
+			lines := strings.Split(text, "\n")
+			for _, line := range lines {
+				if line == "" {
+					t.Fatalf("rendered bar has a blank line, text=%q", text)
+				}
+			}
+			if inner := testCase.height - 2; len(lines) > inner {
+				t.Fatalf("rendered bar has %d lines, want <= %d (panel height %d minus its border), text=%q",
+					len(lines), inner, testCase.height, text)
+			}
+			if !strings.Contains(text, "OVER-SUBSCRIBED") {
+				t.Fatalf("rendered bar missing OVER-SUBSCRIBED, text=%q", text)
+			}
+			if !strings.Contains(text, "one scope with an unevaluated rate not drawn") {
+				t.Fatalf("rendered bar missing its note, text=%q", text)
+			}
+		})
 	}
 }

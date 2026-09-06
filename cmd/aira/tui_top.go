@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"aira/internal/runner"
@@ -156,11 +157,14 @@ type topBarRegionKind uint8
 const (
 	// topRegionScope is one slotted reservation, stacked from the LEFT.
 	topRegionScope topBarRegionKind = iota + 1
-	// topRegionScopeless is the aggregate of admissions that create no cgroup
-	// scope (`aira confine-reserve` per-test holds, `aira run`). They are part of
-	// the slice's claim and have no row of their own, so the bar carries them as
-	// one labelled region at the end of the stack rather than silently omitting
-	// them and understating what the slice has taken.
+	// topRegionScopeless is the slice's own claim that belongs to NO listed scope,
+	// and so has no row of its own. On the RAM bar that is the aggregate of
+	// admissions which create no cgroup scope (`aira confine-reserve` per-test
+	// holds, `aira run`); on the CPU bar it is the slice's CPU time minus the sum
+	// of the drawn scopes' — the daemon itself, and anything in the slice outside
+	// a confine scope. Either way the bar carries it as one labelled region at the
+	// end of the stack rather than silently omitting it and understating what the
+	// slice has taken.
 	topRegionScopeless
 	// topRegionFree is the GAP: system RAM claimed by neither the slice nor the
 	// rest of the machine. Requirement 5's whole point.
@@ -170,15 +174,25 @@ const (
 	topRegionOutside
 )
 
-// topBarRegion is one painted span of the bar, in BYTES. Columns are derived
-// from these by topBarCells, so the model can be asserted without a terminal.
+// topBarRegion is one painted span of the bar, in the bar's own QUANTITY unit.
+// Columns are derived from these by topBarCells, so the model can be asserted
+// without a terminal.
+//
+// AIRA-137 made the quantity abstract. It used to be named in bytes because RAM
+// was the only bar; a CPU bar is the same stack-from-left / right-anchored-grey
+// / total-capacity shape over a different unit, and the geometry, the z-order,
+// the marker overlay and the rounding rules are unit-blind. The unit is carried
+// once, on the bar (topBar.Kind), and every quantity below is in it: BYTES for a
+// RAM bar, MICRO-CORES for a CPU bar (topCPUMicroCores — 1e6 is one core's worth
+// of CPU time per unit wall-clock). Integers throughout, so the exact-offset
+// arithmetic that keeps adjacent regions abutting is unchanged.
 type topBarRegion struct {
-	Kind       topBarRegionKind
-	Slot       int
-	Label      string
-	Colour     string
-	StartBytes int64
-	Bytes      int64
+	Kind   topBarRegionKind
+	Slot   int
+	Label  string
+	Colour string
+	Start  int64
+	Size   int64
 
 	// AIRA-135. A scope region is drawn in TWO shades of one slot colour: Colour
 	// at full intensity for the part of the reservation that is live-used right
@@ -192,20 +206,26 @@ type topBarRegion struct {
 	// shade rather than as a fabricated 0%-used split. UsedBytes is meaningless
 	// unless UsedKnown.
 	//
-	// UsedBytes is already CLAMPED to Bytes at construction. memory.current can
+	// Used is already CLAMPED to Size at construction. memory.current can
 	// transiently exceed memory.max (the monitoring-lag overshoot just before an
 	// OOM fires), and an unclamped used span would bleed its bright shade into the
 	// neighbouring slot's region and mis-attribute it.
-	UsedBytes   int64
+	//
+	// The CPU bar draws no split at all: a CPU rate has no "reserved but idle"
+	// remainder to darken, because there is no per-job CPU reservation to be idle
+	// against. Its regions leave UsedKnown false and are painted undivided, which
+	// is the SAME path a RAM region with an unestablished usage already takes.
+	Used        int64
 	UsedKnown   bool
 	ShadeColour string
 }
 
-// topBarMarker is a limit tick drawn over the bar.
+// topBarMarker is a limit tick drawn over the bar, positioned at At in the bar's
+// own quantity unit.
 type topBarMarker struct {
 	Name  string
 	Label string
-	Bytes int64
+	At    int64
 }
 
 const (
@@ -214,28 +234,46 @@ const (
 	topMarkerCeiling = "ceiling"
 )
 
-// topBar is the whole bar as a model: total width in bytes, the regions that
-// fill it, and the limit markers over it.
+// topBarKind names WHICH resource a bar measures, and with it the unit every
+// quantity on that bar is in and the words the renderer puts under it.
 //
-// Evaluated is fail-closed. A bar whose total system RAM could not be
-// established is NOT drawn as an empty bar — an empty bar states that the
-// machine is idle, which is a fabricated fact. It reports Reason instead.
+// It is deliberately ONE discriminator rather than a formatter function plus a
+// pile of booleans: the bar model stays a plain comparable value that a test can
+// assert on whole, and the two bars cannot drift into two divergent rendering
+// paths — which is exactly the duplication AIRA-137 exists to avoid.
+type topBarKind string
+
+const (
+	topBarRAM topBarKind = "ram"
+	topBarCPU topBarKind = "cpu"
+)
+
+// topBar is the whole bar as a model: total capacity, the regions that fill it,
+// and the limit markers over it. Quantities are in the unit Kind names — bytes
+// for RAM, micro-cores for CPU.
+//
+// Evaluated is fail-closed. A bar whose total capacity could not be established
+// is NOT drawn as an empty bar — an empty bar states that the machine is idle,
+// which is a fabricated fact. It reports Reason instead.
 type topBar struct {
-	Evaluated  bool
-	Reason     string
-	TotalBytes int64
-	Regions    []topBarRegion
-	Markers    []topBarMarker
-	// ClaimedBytes is the width of the left-hand stack: the sum of the drawn
-	// reservations, scope-less aggregate included.
-	ClaimedBytes int64
-	// OutsideBytes is system-used minus slice-used, the right-anchored grey.
-	OutsideBytes int64
+	Kind      topBarKind
+	Evaluated bool
+	Reason    string
+	// Total is the bar's full width as a quantity: total system RAM, or
+	// core-count worth of CPU time.
+	Total   int64
+	Regions []topBarRegion
+	Markers []topBarMarker
+	// Claimed is the width of the left-hand stack: the sum of the drawn
+	// per-job spans, scope-less aggregate included.
+	Claimed int64
+	// Outside is system-wide usage minus the slice's own, the right-anchored grey.
+	Outside      int64
 	OutsideKnown bool
-	// FreeBytes is the gap between the two, floored at zero.
-	FreeBytes int64
+	// Free is the gap between the two, floored at zero.
+	Free int64
 	// Overcommitted records that the claim and the outside usage together exceed
-	// total RAM — a real state on a slice with an over-subscription allowance, and
+	// the total — a real state on a slice with an over-subscription allowance, and
 	// one the bar must name rather than paper over by shrinking a region.
 	Overcommitted bool
 	// Notes name every scope the bar could NOT draw, so a stack that is narrower
@@ -243,31 +281,251 @@ type topBar struct {
 	Notes []string
 }
 
-// topViewModel builds the whole view: the slot table for the next tick, the
-// process rows in slot order, and the bar.
+// topFormatQuantity renders one of a bar's quantities in that bar's own unit. It
+// is the single place the two units are spelled out, so a legend, a marker and a
+// table cell describing the same bar can never disagree about what its numbers
+// mean.
+func topFormatQuantity(kind topBarKind, value int64) string {
+	if kind == topBarCPU {
+		return topFormatCores(value) + " cores"
+	}
+	return topFormatMegabytes(value)
+}
+
+// topCPUMicroCores is one core's worth of CPU time per unit wall-clock, as an
+// integer quantity. CPU rates are carried in micro-cores rather than as float64
+// so the bar's geometry stays the same exact integer arithmetic the RAM bar
+// uses: adjacent regions abut by construction and no rounding can make the stack
+// drift wider or narrower than the quantity it stands for.
 //
-// previous is the slot table from the last tick; the returned table replaces it.
-func topViewModel(previous []string, result runner.ConfineListResult) (panelModel, []string) {
-	// AIRA-135's column set, exactly. OWNER and SCOPE-ID are gone because they
-	// rendered as long meaningless hex that crowded every useful column off a
-	// normal terminal — tview sizes columns greedily left to right and clamps
-	// whatever no longer fits, which is why RESERVE was arriving truncated. RSS is
-	// gone as a column but NOT as information: it is now the bright/dark split
-	// inside each reservation's own bar region, which answers "how much of its
-	// reservation is this job actually using" that a bare number beside a bare cap
-	// never did. COMMAND is last on purpose: it is the one cell with no bound on
-	// its natural width, so it absorbs the clamp instead of imposing it.
-	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "COMMAND"}}
+// Micro, not milli: a job pinned to a thousandth of a core is not interesting,
+// but the SUM over many small jobs is, and truncating each to a milli-core would
+// lose up to a milli-core per job out of the slice's total.
+const topCPUMicroCores = 1_000_000
+
+// topFormatCores renders a micro-core quantity as cores to two decimal places.
+// Two, because one is not enough to tell an idle job from a lightly busy one and
+// three is precision this sampling does not have.
+func topFormatCores(value int64) string {
+	if value < 0 {
+		value = 0
+	}
+	return strconv.FormatFloat(float64(value)/float64(topCPUMicroCores), 'f', 2, 64)
+}
+
+// topTick is the whole of `aira top`'s cross-tick state, and the reason this
+// file needs any state at all.
+//
+// Slots is AIRA-127's stable slot table. CPU is AIRA-137's previous CPU sample,
+// and it is state for a structural reason rather than a convenience: cgroup
+// cpu.stat publishes only CUMULATIVE counters, so there is no such thing as a
+// live CPU percentage to read. A rate is a difference between two samples over
+// the wall-clock between them — exactly what top(1) and htop do — and the only
+// place two consecutive samples exist is here, between ticks.
+type topTick struct {
+	Slots []string
+	CPU   topCPUSample
+}
+
+// topCPUSample is one tick's CPU counters plus the SERVER's instant for them.
+//
+// Every counter carries its own known bit, or is simply absent from Scopes,
+// because zero is a legal cumulative value: a scope that has genuinely burned no
+// CPU publishes usage_usec 0, and folding "unreadable" into that would turn an
+// unreadable job into an idle one on screen.
+//
+// UnixNano is the daemon's own read instant, not this client's tick time. The
+// difference matters at the precision a rate needs: fetch, decode, slot and
+// render latency skews a client-side clock by tens of milliseconds against a
+// one-second tick, which is a percent-level error on every rate derived from it,
+// and it varies with how busy the machine is — so the error would be largest
+// exactly when the reading matters most.
+type topCPUSample struct {
+	UnixNano    int64
+	System      int64
+	SystemKnown bool
+	Slice       int64
+	SliceKnown  bool
+	// Scopes holds only ESTABLISHED per-scope counters, keyed by scope id.
+	// Absence is "not established", never zero.
+	Scopes map[string]int64
+}
+
+// cloneTopTick deep-copies the cross-tick state for the reducer's
+// copy-on-transition discipline. The Scopes map is the reason it exists: a
+// shallow copy would leave two states sharing one map, and the reducer's whole
+// contract is that a transition cannot mutate the state it was handed.
+func cloneTopTick(tick topTick) topTick {
+	next := topTick{Slots: append([]string(nil), tick.Slots...), CPU: tick.CPU}
+	if tick.CPU.Scopes == nil {
+		return next
+	}
+	scopes := make(map[string]int64, len(tick.CPU.Scopes))
+	for id, usec := range tick.CPU.Scopes {
+		scopes[id] = usec
+	}
+	next.CPU.Scopes = scopes
+	return next
+}
+
+// topCPUMinSampleNanos and topCPUMaxSampleNanos bound the wall-clock interval a
+// rate may be computed over. Outside them the rate is UNEVALUATED — never
+// clamped, never zero.
+//
+// The minimum guards the divide-by-near-zero. Two ticks can land back to back:
+// the reducer's self-sustaining tick is only one-in-flight-at-a-time, but a
+// manual `r` refresh, a mutation-driven invalidation, or a panel re-entry can
+// each deliver a second result immediately after one. With a millisecond
+// between samples, a single scheduler tick's worth of accounting (the kernel
+// charges cpu.stat in ~4ms quanta) divides out to hundreds of cores. 250ms is
+// comfortably above that quantisation and comfortably below the refresh
+// interval, so no ordinary tick is ever rejected by it.
+//
+// The maximum guards STALENESS. The top tick stops when the operator leaves the
+// view and resumes when they return, so a previous sample can be minutes old;
+// the difference across it is a true average over those minutes, but it is
+// labelled as current load, and a 10-minute average presented as "now" is a
+// misreading this view would be inviting. Past the bound the honest answer is
+// that there is no current rate yet — one refresh later there is.
+const (
+	topCPUMinSampleNanos = int64(250 * time.Millisecond)
+	topCPUMaxSampleNanos = int64(30 * time.Second)
+)
+
+// topCPUDelta is the wall-clock interval between two samples, or the reason
+// there is no usable one.
+type topCPUDelta struct {
+	Nanos  int64
+	OK     bool
+	Reason string
+}
+
+// topCPUDeltaBetween establishes the interval ONCE per tick, so every rate on
+// the view — each job's, the slice's, the machine's — is divided by the same
+// number and the parts cannot fail to add up to the whole.
+func topCPUDeltaBetween(previous, current topCPUSample) topCPUDelta {
+	if previous.UnixNano <= 0 || current.UnixNano <= 0 {
+		return topCPUDelta{Reason: "CPU is a rate: it needs two samples, and this is the first"}
+	}
+	nanos := current.UnixNano - previous.UnixNano
+	if nanos < topCPUMinSampleNanos {
+		// Includes the negative case: a server clock that stepped backwards
+		// between ticks establishes no interval at all.
+		return topCPUDelta{Reason: "two samples arrived too close together to establish a rate"}
+	}
+	if nanos > topCPUMaxSampleNanos {
+		return topCPUDelta{Reason: "the previous sample is too old to describe current load"}
+	}
+	return topCPUDelta{Nanos: nanos, OK: true}
+}
+
+// topCPURate turns two cumulative microsecond counters into micro-cores over the
+// interval, and is the one place the three honesty rules live.
+//
+// A counter LOWER than its own previous sample is unevaluated, never clamped to
+// zero. It means something happened that this view cannot account for — a cgroup
+// counter reset, a scope id reused by a different cgroup, a clock or accounting
+// anomaly — and clamping would render every one of those as a peacefully idle
+// job, which is the one reading that hides the anomaly instead of showing it.
+//
+// An unusable interval (see topCPUDelta) is unevaluated for the same reason.
+//
+// The arithmetic goes through float64 deliberately: delta-usec × 1e9 overflows
+// int64 for a long interval on a wide machine, and float64 has 53 bits of
+// mantissa against counters that would need ~285 years of one core to reach it.
+func topCPURate(delta topCPUDelta, previous, current int64) (int64, bool) {
+	if !delta.OK || current < previous {
+		return 0, false
+	}
+	// usec of CPU time × 1000 = nanoseconds of CPU time; over nanoseconds of wall
+	// clock that is cores, and × topCPUMicroCores that is micro-cores.
+	cores := float64(current-previous) * 1000 / float64(delta.Nanos)
+	return int64(cores * topCPUMicroCores), true
+}
+
+// topCPUSampleFrom extracts this tick's counters from the reply. Absent or
+// unknown readings simply do not appear, which is what makes the next tick's
+// rate for them unevaluated rather than fabricated.
+func topCPUSampleFrom(result runner.ConfineListResult) topCPUSample {
+	sample := topCPUSample{Scopes: make(map[string]int64, len(result.Scopes))}
+	if reserve := result.SliceReserve; reserve != nil {
+		sample.UnixNano = reserve.CPUSampleUnixNano
+		sample.System, sample.SystemKnown = reserve.SystemCPUUsageUsec, reserve.SystemCPUKnown
+		sample.Slice, sample.SliceKnown = reserve.SliceCPUUsageUsec, reserve.SliceCPUKnown
+	}
+	for _, record := range result.Scopes {
+		if record.ScopeID == "" || record.CPUUsageUsec == nil {
+			continue
+		}
+		sample.Scopes[record.ScopeID] = *record.CPUUsageUsec
+	}
+	return sample
+}
+
+// topScopeCPURate is one job's rate across the two samples. A scope missing from
+// EITHER sample has no rate: the first tick it is ever seen, and any tick whose
+// reading failed, both report unevaluated rather than a fabricated zero.
+func topScopeCPURate(previous, current topCPUSample, delta topCPUDelta, scopeID string) (int64, bool) {
+	before, hadBefore := previous.Scopes[scopeID]
+	now, hasNow := current.Scopes[scopeID]
+	if !hadBefore || !hasNow {
+		return 0, false
+	}
+	return topCPURate(delta, before, now)
+}
+
+// topCPUCell renders a job's rate for the table, in the SAME unit the CPU bar's
+// legend prints so the two views read as one measurement.
+func topCPUCell(microCores int64, known bool) string {
+	if !known {
+		return "unevaluated"
+	}
+	return topFormatCores(microCores)
+}
+
+// topRAMCell renders a job's live memory.current for the table. AIRA-135 moved
+// this reading into the bar's bright/dark split and dropped the column; AIRA-137
+// puts the column back beside RESERVATION, because the split answers "what
+// fraction of its grant is it using" and the number answers "how much is that",
+// and an operator sizing a cap needs the second one too.
+//
+// nil is "unevaluated", never a blank or a zero: a scope whose memory.current
+// could not be read is not a scope using no memory.
+func topRAMCell(rss *int64) string {
+	if rss == nil || *rss < 0 {
+		return "unevaluated"
+	}
+	return topFormatMegabytes(*rss)
+}
+
+// topViewModel builds the whole view: the cross-tick state for the next tick,
+// the process rows in slot order, and both bars.
+//
+// previous is the state from the last tick; the returned value replaces it.
+func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel, topTick) {
+	// AIRA-135's column set plus AIRA-137's two live-usage columns. OWNER and
+	// SCOPE-ID stay gone because they rendered as long meaningless hex that crowded
+	// every useful column off a normal terminal — tview sizes columns greedily left
+	// to right and clamps whatever no longer fits, which is why RESERVE was
+	// arriving truncated. RAM sits beside RESERVATION because the pair is one
+	// question ("how much of its grant is it using, and how much is that"), and CPU
+	// beside it because the two live readings belong together. COMMAND is last on
+	// purpose: it is the one cell with no bound on its natural width, so it absorbs
+	// the clamp instead of imposing it.
+	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}}
 	if result.Verdict == "unevaluated" {
 		reason := strings.TrimSpace(result.Reason)
 		if reason == "" {
 			reason = "the daemon could not enumerate the slice"
 		}
-		model.Bar = &topBar{Reason: "confine list unevaluated: " + reason}
+		model.Bar = &topBar{Kind: topBarRAM, Reason: "confine list unevaluated: " + reason}
+		model.CPUBar = &topBar{Kind: topBarCPU, Reason: "confine list unevaluated: " + reason}
 		model.Footer = "UNEVALUATED: " + reason
-		// The slot table is carried FORWARD unchanged. An unevaluated listing is
-		// not evidence that anything exited, so freeing every slot on it would
-		// recolour the whole view on a transient read failure.
+		// The cross-tick state is carried FORWARD unchanged. An unevaluated listing
+		// is not evidence that anything exited, so freeing every slot on it would
+		// recolour the whole view on a transient read failure — and dropping the CPU
+		// sample would throw away a baseline the next good tick can still use, so
+		// one failed read would cost two ticks of CPU rates instead of none.
 		return model, previous
 	}
 	byID := make(map[string]runner.ConfineRecord, len(result.Scopes))
@@ -279,12 +537,19 @@ func topViewModel(previous []string, result runner.ConfineListResult) (panelMode
 		byID[record.ScopeID] = record
 		live = append(live, record.ScopeID)
 	}
-	slots := assignTopSlots(previous, live)
-	drawn := make([]topBarRegion, 0, len(slots))
+	next := topTick{Slots: assignTopSlots(previous.Slots, live), CPU: topCPUSampleFrom(result)}
+	// ONE interval for the whole tick, so a job's rate, the slice's and the
+	// machine's are all divided by the same number and the parts add up to the
+	// whole by construction rather than by coincidence.
+	delta := topCPUDeltaBetween(previous.CPU, next.CPU)
+	drawn := make([]topBarRegion, 0, len(next.Slots))
+	cpuDrawn := make([]topBarRegion, 0, len(next.Slots))
 	notes := make([]string, 0, 2)
 	uncapped, unevaluated := 0, 0
+	cpuUnevaluated := 0
+	cpuClaimed := int64(0)
 	offset := int64(0)
-	for slot, scopeID := range slots {
+	for slot, scopeID := range next.Slots {
 		if scopeID == topSlotFree {
 			continue
 		}
@@ -294,10 +559,12 @@ func topViewModel(previous []string, result runner.ConfineListResult) (panelMode
 		}
 		reserve := topReserveFor(record)
 		colour := topSlotColour(slot)
+		rate, rateKnown := topScopeCPURate(previous.CPU, next.CPU, delta, scopeID)
 		model.Rows = append(model.Rows, tableRow{
 			ID: scopeID, Colour: colour, Cells: []string{
 				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
-				topLiveCell(record), reserve.String(), topCommandCell(record.Command),
+				topLiveCell(record), reserve.String(), topRAMCell(record.RSSBytes),
+				topCPUCell(rate, rateKnown), topCommandCell(record.Command),
 			},
 		})
 		switch reserve.State {
@@ -305,9 +572,9 @@ func topViewModel(previous []string, result runner.ConfineListResult) (panelMode
 			region := topBarRegion{
 				Kind: topRegionScope, Slot: slot, Label: record.Name, Colour: colour,
 				ShadeColour: topShadeColour(colour),
-				StartBytes:  offset, Bytes: reserve.Bytes,
+				Start:       offset, Size: reserve.Bytes,
 			}
-			region.UsedBytes, region.UsedKnown = topUsedWithin(record.RSSBytes, reserve.Bytes)
+			region.Used, region.UsedKnown = topUsedWithin(record.RSSBytes, reserve.Bytes)
 			drawn = append(drawn, region)
 			offset += reserve.Bytes
 		case topReserveUncapped:
@@ -315,6 +582,20 @@ func topViewModel(previous []string, result runner.ConfineListResult) (panelMode
 		default:
 			unevaluated++
 		}
+		// The CPU stack is built from the SAME slot in the SAME order with the SAME
+		// colour, and is deliberately independent of the RAM stack's own gates: a
+		// scope whose memory.max is `max` has no RAM width to draw but a perfectly
+		// real CPU rate, and dropping it from this bar because the other bar could
+		// not place it would understate the slice's CPU.
+		if !rateKnown {
+			cpuUnevaluated++
+			continue
+		}
+		cpuDrawn = append(cpuDrawn, topBarRegion{
+			Kind: topRegionScope, Slot: slot, Label: record.Name, Colour: colour,
+			Start: cpuClaimed, Size: rate,
+		})
+		cpuClaimed += rate
 	}
 	if uncapped > 0 {
 		notes = append(notes, fmt.Sprintf("%d uncapped %s not drawn (memory.max is `max`, so the claim has no width)",
@@ -325,8 +606,90 @@ func topViewModel(previous []string, result runner.ConfineListResult) (panelMode
 			unevaluated, confinePlural(unevaluated, "scope", "scopes")))
 	}
 	model.Bar = topBarFor(result.SliceReserve, drawn, offset, notes)
+	model.CPUBar = topCPUBarFor(result.SliceReserve, previous.CPU, next.CPU, delta, cpuDrawn, cpuClaimed, cpuUnevaluated)
 	model.Footer = topFooter(result)
-	return model, slots
+	return model, next
+}
+
+// topCPUBarFor assembles the CPU bar. It is the RAM bar's exact shape over a
+// different unit — a left-hand stack of per-job spans, the slice's own unscoped
+// remainder, the idle gap, and a right-anchored grey for the rest of the machine
+// — and it fails closed the same way: without an established core count and a
+// usable sample interval there is no bar, only a reason.
+//
+// The rest-of-system span is a ROOT-cgroup reading minus the SLICE's own, never
+// a sum over the listed scopes, exactly as the RAM bar derives its grey from
+// system-used minus slice-used.
+func topCPUBarFor(reserve *runner.ConfineSliceReserve, previous, current topCPUSample, delta topCPUDelta,
+	scopes []topBarRegion, claimed int64, unevaluatedScopes int) *topBar {
+	bar := &topBar{Kind: topBarCPU, Regions: scopes, Claimed: claimed}
+	if reserve == nil {
+		bar.Reason = "no slice reserve in the confine listing (the daemon was unreachable, or the slice's CPU could not be read)"
+		return bar
+	}
+	if reserve.Containment != "" {
+		bar.Reason = "ci-shim mode: the host's root-cgroup CPU accounting is not namespaced to the container, so there is no machine-wide CPU frame to draw"
+		return bar
+	}
+	if reserve.CPUCores <= 0 {
+		bar.Reason = "the machine's core count is unevaluated"
+		return bar
+	}
+	if !delta.OK {
+		bar.Reason = delta.Reason
+		return bar
+	}
+	bar.Evaluated = true
+	// TOTAL CAPACITY is core count × one core, which is the maximum CPU time this
+	// machine can produce per unit wall-clock. It is a HARD ceiling, unlike the RAM
+	// bar's total, so a stack that fills this bar is a machine with nothing left.
+	bar.Total = int64(reserve.CPUCores) * topCPUMicroCores
+	if unevaluatedScopes > 0 {
+		bar.Notes = append(bar.Notes, fmt.Sprintf("%d %s with an unevaluated CPU rate not drawn; their time is inside the unscoped span",
+			unevaluatedScopes, confinePlural(unevaluatedScopes, "scope", "scopes")))
+	}
+	sliceRate, sliceKnown := topCPURate(delta, previous.Slice, current.Slice)
+	if previous.SliceKnown && current.SliceKnown && sliceKnown {
+		// The slice's OWN CPU that belongs to no listed scope: the daemon itself,
+		// `aira run` jobs, and — when a scope's rate could not be established — that
+		// scope's time too, which the note above says out loud rather than letting
+		// it read as idle machine.
+		if unscoped := topFloor(sliceRate - bar.Claimed); unscoped > 0 {
+			bar.Regions = append(bar.Regions, topBarRegion{
+				Kind: topRegionScopeless, Slot: topScopelessSlot, Colour: topColourScopeless,
+				Label: "slice, unscoped", Start: bar.Claimed, Size: unscoped,
+			})
+			bar.Claimed += unscoped
+		}
+	} else {
+		bar.Notes = append(bar.Notes, "the slice's own CPU total is unevaluated, so the unscoped remainder is not drawn")
+		sliceKnown = false
+	}
+	systemRate, systemKnown := topCPURate(delta, previous.System, current.System)
+	switch {
+	case !previous.SystemKnown || !current.SystemKnown || !systemKnown:
+		bar.Notes = append(bar.Notes, "the machine's total CPU is unevaluated, so out-of-slice usage is not drawn")
+	case !sliceKnown:
+		bar.Notes = append(bar.Notes, "out-of-slice CPU needs the slice's own total, which is unevaluated")
+	default:
+		bar.Outside = topFloor(systemRate - sliceRate)
+		bar.OutsideKnown = true
+	}
+	bar.Free = topFloor(bar.Total - bar.Claimed - bar.Outside)
+	bar.Overcommitted = bar.Claimed+bar.Outside > bar.Total
+	if bar.Free > 0 {
+		bar.Regions = append(bar.Regions, topBarRegion{
+			Kind: topRegionFree, Slot: topScopelessSlot, Label: "idle", Start: bar.Claimed, Size: bar.Free,
+		})
+	}
+	if bar.OutsideKnown && bar.Outside > 0 {
+		start := topFloor(bar.Total - bar.Outside)
+		bar.Regions = append(bar.Regions, topBarRegion{
+			Kind: topRegionOutside, Slot: topScopelessSlot, Colour: topColourOutside,
+			Label: "rest of system", Start: start, Size: bar.Total - start,
+		})
+	}
+	return bar
 }
 
 // topUsedWithin turns a scope's optional live usage reading into the bar
@@ -393,7 +756,7 @@ func topLiveCell(record runner.ConfineRecord) string {
 // frame. It fails closed: without an established total system RAM there is no
 // bar, only a reason.
 func topBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claimed int64, notes []string) *topBar {
-	bar := &topBar{Regions: scopes, ClaimedBytes: claimed, Notes: notes}
+	bar := &topBar{Kind: topBarRAM, Regions: scopes, Claimed: claimed, Notes: notes}
 	if reserve == nil {
 		bar.Reason = "no slice reserve in the confine listing (the daemon was unreachable, or the slice's memory could not be read)"
 		return bar
@@ -407,14 +770,14 @@ func topBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claim
 		return bar
 	}
 	bar.Evaluated = true
-	bar.TotalBytes = reserve.SystemMemTotalBytes
+	bar.Total = reserve.SystemMemTotalBytes
 	if reserve.ReservationBytes > 0 {
 		bar.Regions = append(bar.Regions, topBarRegion{
 			Kind: topRegionScopeless, Slot: topScopelessSlot, Colour: topColourScopeless,
-			Label:      fmt.Sprintf("%d scope-less", reserve.ReservationJobs),
-			StartBytes: bar.ClaimedBytes, Bytes: reserve.ReservationBytes,
+			Label: fmt.Sprintf("%d scope-less", reserve.ReservationJobs),
+			Start: bar.Claimed, Size: reserve.ReservationBytes,
 		})
-		bar.ClaimedBytes += reserve.ReservationBytes
+		bar.Claimed += reserve.ReservationBytes
 	}
 	// Requirement 5. The rest of the system, anchored RIGHT.
 	//
@@ -427,25 +790,25 @@ func topBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claim
 	if reserve.SystemMemAvailableBytes > 0 {
 		systemUsed := topFloor(reserve.SystemMemTotalBytes - reserve.SystemMemAvailableBytes)
 		sliceUsed := topFloor(reserve.SliceCurrentBytes - reserve.SliceReclaimableBytes)
-		bar.OutsideBytes = topFloor(systemUsed - sliceUsed)
+		bar.Outside = topFloor(systemUsed - sliceUsed)
 		bar.OutsideKnown = true
 	} else {
 		bar.Notes = append(bar.Notes, "system MemAvailable is unevaluated, so out-of-slice usage is not drawn")
 	}
-	bar.FreeBytes = topFloor(bar.TotalBytes - bar.ClaimedBytes - bar.OutsideBytes)
-	bar.Overcommitted = bar.ClaimedBytes+bar.OutsideBytes > bar.TotalBytes
-	if bar.FreeBytes > 0 {
+	bar.Free = topFloor(bar.Total - bar.Claimed - bar.Outside)
+	bar.Overcommitted = bar.Claimed+bar.Outside > bar.Total
+	if bar.Free > 0 {
 		bar.Regions = append(bar.Regions, topBarRegion{
-			Kind: topRegionFree, Slot: topScopelessSlot, Label: "free", StartBytes: bar.ClaimedBytes, Bytes: bar.FreeBytes,
+			Kind: topRegionFree, Slot: topScopelessSlot, Label: "free", Start: bar.Claimed, Size: bar.Free,
 		})
 	}
-	if bar.OutsideKnown && bar.OutsideBytes > 0 {
+	if bar.OutsideKnown && bar.Outside > 0 {
 		// Anchored to the right edge by construction: its start is the total minus
 		// its own width, never "wherever the stack happened to end".
-		start := topFloor(bar.TotalBytes - bar.OutsideBytes)
+		start := topFloor(bar.Total - bar.Outside)
 		bar.Regions = append(bar.Regions, topBarRegion{
 			Kind: topRegionOutside, Slot: topScopelessSlot, Colour: topColourOutside,
-			Label: "rest of system", StartBytes: start, Bytes: bar.TotalBytes - start,
+			Label: "rest of system", Start: start, Size: bar.Total - start,
 		})
 	}
 	bar.Markers = topMarkersFor(reserve)
@@ -463,12 +826,12 @@ func topMarkersFor(reserve *runner.ConfineSliceReserve) []topBarMarker {
 	markers := make([]topBarMarker, 0, 3)
 	if reserve.SliceHighState == runner.ConfineSliceHighSet && reserve.SliceHighBytes > 0 {
 		markers = append(markers, topBarMarker{
-			Name: topMarkerSoft, Label: "soft (memory.high)", Bytes: reserve.SliceHighBytes,
+			Name: topMarkerSoft, Label: "soft (memory.high)", At: reserve.SliceHighBytes,
 		})
 	}
 	if reserve.SliceMaxBytes > 0 {
 		markers = append(markers, topBarMarker{
-			Name: topMarkerHard, Label: "hard (memory.max)", Bytes: reserve.SliceMaxBytes,
+			Name: topMarkerHard, Label: "hard (memory.max)", At: reserve.SliceMaxBytes,
 		})
 	}
 	// Only when it genuinely sits BELOW memory.max. An unthrottled ceiling equals
@@ -476,7 +839,7 @@ func topMarkersFor(reserve *runner.ConfineSliceReserve) []topBarMarker {
 	// not in effect.
 	if reserve.CeilingEffectiveBytes > 0 && reserve.SliceMaxBytes > 0 && reserve.CeilingEffectiveBytes < reserve.SliceMaxBytes {
 		markers = append(markers, topBarMarker{
-			Name: topMarkerCeiling, Label: "admission ceiling", Bytes: reserve.CeilingEffectiveBytes,
+			Name: topMarkerCeiling, Label: "admission ceiling", At: reserve.CeilingEffectiveBytes,
 		})
 	}
 	return markers
@@ -496,15 +859,18 @@ type topBarCell struct {
 	Shaded bool
 }
 
-// topBarCells maps the byte model onto `width` terminal columns.
+// topBarCells maps the quantity model onto `width` terminal columns. It is
+// unit-blind: RAM and CPU go through this same function, because the geometry
+// question — where does each span start and stop on a bar of this many columns —
+// has nothing to do with what the quantity measures (AIRA-137).
 //
-// Offsets are computed from the ABSOLUTE byte offset of each region boundary, so
-// the columns of adjacent regions abut exactly and rounding can never make the
-// stack drift wider or narrower than the bytes it represents. A region narrower
+// Offsets are computed from the ABSOLUTE offset of each region boundary, so the
+// columns of adjacent regions abut exactly and rounding can never make the stack
+// drift wider or narrower than the quantity it represents. A region narrower
 // than one column is rendered as no columns rather than as a whole one: widening
 // it would overstate a claim.
 func topBarCells(bar *topBar, width int) []topBarCell {
-	if bar == nil || !bar.Evaluated || width <= 0 || bar.TotalBytes <= 0 {
+	if bar == nil || !bar.Evaluated || width <= 0 || bar.Total <= 0 {
 		return nil
 	}
 	cells := make([]topBarCell, width)
@@ -520,8 +886,8 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 			if region.Kind != kind {
 				continue
 			}
-			start := topBarColumn(region.StartBytes, bar.TotalBytes, width)
-			end := topBarColumn(region.StartBytes+region.Bytes, bar.TotalBytes, width)
+			start := topBarColumn(region.Start, bar.Total, width)
+			end := topBarColumn(region.Start+region.Size, bar.Total, width)
 			// AIRA-135. Where the bright used span stops and the darkened idle span
 			// begins, derived from the SAME absolute-offset mapping as the region's
 			// own edges, so the boundary can never round outside them. Defaulting it
@@ -529,7 +895,7 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 			// darkened variant — paint the region in one undivided shade.
 			shadedFrom := end
 			if region.UsedKnown && region.ShadeColour != "" {
-				shadedFrom = topBarColumn(region.StartBytes+region.UsedBytes, bar.TotalBytes, width)
+				shadedFrom = topBarColumn(region.Start+region.Used, bar.Total, width)
 			}
 			for column := start; column < end && column < width; column++ {
 				cell := topBarCell{Colour: region.Colour, Slot: region.Slot, Kind: region.Kind}
@@ -541,7 +907,7 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 		}
 	}
 	for _, marker := range bar.Markers {
-		column := topBarColumn(marker.Bytes, bar.TotalBytes, width)
+		column := topBarColumn(marker.At, bar.Total, width)
 		if column >= width {
 			column = width - 1
 		}
@@ -553,17 +919,18 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 	return cells
 }
 
-// topBarColumn is the single byte→column mapping. It floors, and clamps into
-// [0, width]: an offset of exactly TotalBytes lands one past the last column,
-// which is what makes it a valid exclusive end for the final region.
-func topBarColumn(bytes, total int64, width int) int {
-	if total <= 0 || width <= 0 || bytes <= 0 {
+// topBarColumn is the single quantity→column mapping, shared by both bars. It
+// floors, and clamps into [0, width]: an offset of exactly Total lands one past
+// the last column, which is what makes it a valid exclusive end for the final
+// region.
+func topBarColumn(value, total int64, width int) int {
+	if total <= 0 || width <= 0 || value <= 0 {
 		return 0
 	}
-	if bytes >= total {
+	if value >= total {
 		return width
 	}
-	return int(bytes * int64(width) / total)
+	return int(value * int64(width) / total)
 }
 
 func topFloor(value int64) int64 {

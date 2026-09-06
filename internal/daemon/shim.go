@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -105,6 +106,27 @@ func (s *Server) memAvailableReader() func() (int64, bool, string) {
 		return s.shimReadMemAvailable
 	}
 	return readMemAvailable
+}
+
+// cpuFrameReader and cpuCoreCounter are AIRA-137's CPU-frame seams, on the same
+// nil-checks-to-the-package-default rule as every reader above. Production
+// reaches the real root-cgroup/slice cpu.stat pair and runtime.NumCPU — the same
+// core count desiredCPUSlots derives the AIRA-49 worker slot count from, so the
+// bar's capacity and the scheduler's idea of this machine's width cannot drift
+// apart. Neither is shim-specific: shim mode publishes no CPU frame at all, and
+// the withholding is done by confineManagement's own shim gate.
+func (s *Server) cpuFrameReader() func(string) runner.ConfineCPUFrame {
+	if s.readCPUFrame != nil {
+		return s.readCPUFrame
+	}
+	return runner.ReadConfineCPUFrame
+}
+
+func (s *Server) cpuCoreCounter() func() int {
+	if s.readCPUCores != nil {
+		return s.readCPUCores
+	}
+	return runtime.NumCPU
 }
 
 // resolveShimSlicePath answers with the sentinel for ANY requested slice name.

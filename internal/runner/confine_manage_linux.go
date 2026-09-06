@@ -84,6 +84,59 @@ func readProcCmdline(pid int) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(file, ConfineCommandWireLimit+1))
 }
 
+// confineCPUStatReadLimit bounds every cpu.stat read. cpu.stat is at most a
+// dozen short key/value lines, so this is generous by two orders of magnitude
+// and exists for the same availability reason every other bounded read here
+// does: the file belongs to the kernel, not to us, and an unbounded ReadAll of
+// one per scope is a shape this reply must not be able to grow into.
+const confineCPUStatReadLimit = 4096
+
+// readConfineCPUFrame samples the ROOT cgroup's and the SLICE's cumulative CPU
+// counters as one timestamped pair (AIRA-137).
+//
+// The root cgroup is the cgroup2 mount itself, resolved through the SAME
+// unifiedMount() every other cgroup path in this package resolves through — not
+// a hard-coded /sys/fs/cgroup, which is right on this box and wrong in a
+// container or on a host that mounted the hierarchy elsewhere.
+//
+// Nothing here is fatal. Each side carries its own Known bit, an unresolvable
+// mount leaves the system side unknown while the slice side still reports, and a
+// frame with no established sample instant simply yields no rate downstream. The
+// one thing it never does is publish a zero as a reading.
+func readConfineCPUFrame(slicePath string) ConfineCPUFrame {
+	// Stamped BEFORE the reads and shared by both. The two ReadFiles are
+	// microseconds apart against a refresh interval measured in seconds, so the
+	// skew they introduce into a Δusec/Δwall rate is far below the width of one
+	// terminal column; a per-read timestamp would be a precision this display
+	// cannot show and the counters themselves (kernel accounting, updated on
+	// scheduler ticks) do not have.
+	frame := ConfineCPUFrame{SampleUnixNano: time.Now().UnixNano()}
+	if mount, err := unifiedMount(); err == nil {
+		if value := readCgroupCPUUsageUsec(filepath.Join(mount, "cpu.stat")); value != nil {
+			frame.SystemUsageUsec, frame.SystemKnown = *value, true
+		}
+	}
+	if slicePath != "" {
+		if value := readCgroupCPUUsageUsec(filepath.Join(slicePath, "cpu.stat")); value != nil {
+			frame.SliceUsageUsec, frame.SliceKnown = *value, true
+		}
+	}
+	return frame
+}
+
+func readCgroupCPUUsageUsec(path string) *int64 {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, confineCPUStatReadLimit))
+	if err != nil {
+		return nil
+	}
+	return parseCPUUsageUsec(data)
+}
+
 func listConfines(ctx context.Context, slicePath string, registry []ConfineRegistryEntry) (ConfineListResult, error) {
 	return listConfinesWithDeps(ctx, slicePath, registry, defaultConfineScanDeps())
 }
@@ -139,7 +192,7 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		path := filepath.Join(slicePath, entry.Name())
 		fd, openErr := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if openErr != nil {
-			record.UnevaluatedFields = append(record.UnevaluatedFields, "populated", "rss", "cap")
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "populated", "rss", "cap", "cpu")
 			byID[scopeID] = record
 			continue
 		}
@@ -179,6 +232,21 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			}
 		} else {
 			record.UnevaluatedFields = append(record.UnevaluatedFields, "rss")
+		}
+		// AIRA-137. The scope's cumulative CPU counter, read live from the SAME
+		// already-open scope directory and through the SAME seam as memory.current
+		// above. cpu.stat is a multi-line key/value file (usage/user/system/nice,
+		// plus throttling keys on a cgroup with cpu.max set), so it takes a wider
+		// bound than the single-integer memory files beside it — still bounded,
+		// because the read is of a kernel file this process does not control.
+		if data, readErr := deps.readField(scope, "cpu.stat", confineCPUStatReadLimit); readErr == nil {
+			if value := parseCPUUsageUsec(data); value != nil {
+				record.CPUUsageUsec = value
+			} else {
+				record.UnevaluatedFields = append(record.UnevaluatedFields, "cpu")
+			}
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "cpu")
 		}
 		if data, readErr := deps.readField(scope, "memory.max", 64); readErr == nil {
 			value := strings.TrimSpace(string(data))

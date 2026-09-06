@@ -180,6 +180,13 @@ type Server struct {
 	// instead of depending on this host's actual memory state.
 	shimReadMemTotal     func() (int64, bool)
 	shimReadMemAvailable func() (int64, bool, string)
+	// readCPUFrame / readCPUCores are AIRA-137's CPU-frame seams for `aira top`,
+	// on exactly the same rule as the meminfo pair above: nil in production,
+	// which resolves to runner.ReadConfineCPUFrame and runtime.NumCPU. A test
+	// injects a synthetic frame so the reply's shape is asserted without
+	// depending on this host's real, ever-moving CPU counters and core count.
+	readCPUFrame func(string) runner.ConfineCPUFrame
+	readCPUCores func() int
 	// workerScopeScan / workerScopeCreate are the worker-admit ledger's two
 	// cgroupfs seams (AIRA-39). Production uses scanWorkerScopeChildren and
 	// runner.CreateWorkerScope; tests substitute fakes so the ledger's

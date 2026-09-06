@@ -210,6 +210,20 @@ func parseCPUStat(data []byte) (user, system *int64) {
 	return values["user_usec"], values["system_usec"]
 }
 
+// parseCPUUsageUsec reads cpu.stat's TOTAL charged CPU time (AIRA-137). It is
+// the same file, the same format and the same key-value parser parseCPUStat
+// above already uses for the confine trailer's `cpu=user+sys` line, taking the
+// `usage_usec` key the kernel publishes alongside them rather than adding the
+// two: usage_usec is the kernel's own total and needs no arithmetic of ours, and
+// on a cgroup where only some of the three keys are published, summing what is
+// there would silently understate the total.
+//
+// nil when the key is absent or unparseable. Never a fabricated zero: an idle
+// cgroup publishes a real usage_usec 0, and the two must stay distinguishable.
+func parseCPUUsageUsec(data []byte) *int64 {
+	return parseCgroupKeyValues(data)["usage_usec"]
+}
+
 func parseMemoryEvents(data []byte) *int64 {
 	return parseCgroupKeyValues(data)["oom_kill"]
 }
