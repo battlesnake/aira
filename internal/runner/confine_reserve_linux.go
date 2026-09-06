@@ -56,6 +56,15 @@ func confineReserve(ctx context.Context, request ConfineReserveRequest) (*Confin
 // change removes, so it is refused instead. E_CONFINE_UNAVAILABLE, because
 // callers treat that as fail-open: the test then runs UNRESERVED, which
 // under-counts a slice rather than over-charging an unrelated one.
+//
+// What this deliberately does NOT do: consult ResolveConfineSlice, i.e. the
+// operator's `$AIRA_CONFINE_SLICE`. An unconfined `aira confine-reserve` with
+// that variable set still charges DefaultConfineSlice, exactly as before
+// AIRA-115. Honouring it would be defensible — it is the operator saying where
+// AIRA's jobs live — but it is a separate behaviour change to a separate input,
+// outside this fix, and left out on purpose rather than by omission.
+// InheritedConfineSlice reads the coordinate the PARENT JOB emitted; nothing
+// here reads the operator's launch setting.
 func resolveConfineReserveSlice(requested string) (string, error) {
 	if slice := strings.TrimSpace(requested); slice != "" {
 		return slice, nil

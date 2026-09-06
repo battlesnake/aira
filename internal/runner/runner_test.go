@@ -965,7 +965,7 @@ func TestRealCgroupExplicitNonemptyEnvironmentIsCanonicalAndDigested(t *testing.
 //
 // verifies: AIRA-33
 func TestCoordinationEnvironmentIsStrippedAndKeptOutOfTheDigest(t *testing.T) {
-	coordinationKeys := []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_RESERVE_CMD", "AIRA_TEST_MEM_GOVERNOR", "AIRA_CONFINE_SCOPE_ID", "AIRA_CONFINE_SLICE"}
+	coordinationKeys := []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_RESERVE_CMD", "AIRA_TEST_MEM_GOVERNOR", "AIRA_CONFINE_SCOPE_ID", "AIRA_CONFINE_PARENT_SLICE"}
 
 	r, _ := newMemoryRunner(t, nil)
 	var childEnv []string

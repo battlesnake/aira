@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/pylib"
 	"aira/internal/testdeadline"
 )
 
@@ -308,7 +309,7 @@ func TestConfineReserveChargesTheInheritedParentSlice(t *testing.T) {
 	socket, args, _ := reserveAdmitCapture(t)
 	parent := confineScopeID("pytest", "", true)
 	t.Setenv("AIRA_CONFINE_SCOPE_ID", parent)
-	t.Setenv("AIRA_CONFINE_SLICE", "/sys/fs/cgroup/user.slice/custom.slice")
+	t.Setenv(pylib.ConfineParentSliceEnv, "/sys/fs/cgroup/user.slice/custom.slice")
 
 	reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
 		AdmitSocketPath: socket, Bytes: 40, Pinned: true,
@@ -334,13 +335,21 @@ func TestConfineReserveChargesTheInheritedParentSlice(t *testing.T) {
 // was always actually for. Without this, "inherit or refuse" could be
 // over-applied into refusing every standalone `aira confine-reserve`.
 //
+// The operator's AIRA_CONFINE_SLICE is set here on purpose, and its being
+// IGNORED is a recorded decision rather than an oversight (build-review F4).
+// This fix teaches confine-reserve to inherit what its PARENT JOB emitted; it
+// does not newly teach it to read the operator's launch setting, which would be
+// a separate behaviour change to a separate input. Pre-AIRA-115 behaviour for
+// the unconfined caller is therefore unchanged.
+//
 // verifies: AIRA-115
 func TestConfineReserveOutsideAConfineJobKeepsTheDefaultSlice(t *testing.T) {
 	socket, args, _ := reserveAdmitCapture(t)
 	// Emptied rather than assumed absent: the suite itself runs inside `aira
 	// confine`, which now exports both.
 	t.Setenv("AIRA_CONFINE_SCOPE_ID", "")
-	t.Setenv("AIRA_CONFINE_SLICE", "")
+	t.Setenv(pylib.ConfineParentSliceEnv, "")
+	t.Setenv("AIRA_CONFINE_SLICE", "operator.slice")
 
 	reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
 		AdmitSocketPath: socket, Bytes: 40, Pinned: true,
@@ -351,7 +360,7 @@ func TestConfineReserveOutsideAConfineJobKeepsTheDefaultSlice(t *testing.T) {
 	}
 	defer reservation.Close()
 	if got := args(); got["slice"] != DefaultConfineSlice {
-		t.Fatalf("admit slice=%v, want %q for an unconfined caller", got["slice"], DefaultConfineSlice)
+		t.Fatalf("admit slice=%v, want %q for an unconfined caller (the operator's launch setting is not this resolver's input)", got["slice"], DefaultConfineSlice)
 	}
 }
 
@@ -364,7 +373,7 @@ func TestConfineReserveOutsideAConfineJobKeepsTheDefaultSlice(t *testing.T) {
 func TestConfineReserveExplicitSliceOverridesTheInheritedOne(t *testing.T) {
 	socket, args, _ := reserveAdmitCapture(t)
 	t.Setenv("AIRA_CONFINE_SCOPE_ID", confineScopeID("pytest", "", true))
-	t.Setenv("AIRA_CONFINE_SLICE", "/sys/fs/cgroup/user.slice/inherited.slice")
+	t.Setenv(pylib.ConfineParentSliceEnv, "/sys/fs/cgroup/user.slice/inherited.slice")
 
 	reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
 		Slice: "explicit.slice", AdmitSocketPath: socket, Bytes: 40, Pinned: true,
@@ -400,7 +409,7 @@ func TestConfineReserveRefusesRatherThanDefaultUnderAParentScope(t *testing.T) {
 	// refuse one, so InheritedConfineSlice discards it rather than forwarding it.
 	for name, slice := range map[string]string{"absent": "", "unusable": "../escape.slice"} {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("AIRA_CONFINE_SLICE", slice)
+			t.Setenv(pylib.ConfineParentSliceEnv, slice)
 			before := dials()
 			reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
 				AdmitSocketPath: socket, Bytes: 40, Pinned: true,

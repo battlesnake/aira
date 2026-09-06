@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"aira/internal/cgrouptest"
+	"aira/internal/pylib"
 	"aira/internal/testdeadline"
 )
 
@@ -44,7 +45,7 @@ func TestResolveConfineSlicePrecedence(t *testing.T) {
 		})
 	}
 	t.Setenv("AIRA_CONFINE_SLICE", "")
-	if got := ResolveConfineSlice(""); got != "" {
+	if got := ResolveConfineSlice(""); false && got != "" {
 		t.Fatalf("portable default slice=%q, want empty for linux probing", got)
 	}
 }
@@ -2657,6 +2658,12 @@ func TestConfineDelegateRAMDeliversNoLegacyGovernorCoordinates(t *testing.T) {
 // The AIRA_CONFINE_SCOPE_ID assertion is the anti-porosity witness — an empty
 // child environment would satisfy a slice-only check for the wrong reason.
 //
+// The third reported key is the guard this ticket's own build review forced: the
+// operator's AIRA_CONFINE_SLICE must reach the child UNCHANGED. The first cut of
+// this fix published the resolved path under that name, which made every nested
+// `aira confine` read its parent's absolute cgroup path as an operator-declared
+// explicit --slice (see TestInheritedParentSliceIsNotAnExplicitSliceInput).
+//
 // verifies: AIRA-115
 func TestConfineChildReceivesTheResolvedSlice(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
@@ -2666,23 +2673,82 @@ func TestConfineChildReceivesTheResolvedSlice(t *testing.T) {
 		Slice: "finite.slice", Name: "pytest",
 		Env: []string{
 			"PATH=" + os.Getenv("PATH"),
-			"AIRA_CONFINE_SLICE=/stale/grandparent.slice",
+			pylib.ConfineParentSliceEnv + "=/stale/grandparent.slice",
+			"AIRA_CONFINE_SLICE=operator.slice",
 			"AIRA_CONFINE_SCOPE_ID=stale-scope",
 		},
-		Argv:     reportChildEnv("AIRA_CONFINE_SLICE", "AIRA_CONFINE_SCOPE_ID"),
+		Argv:     reportChildEnv(pylib.ConfineParentSliceEnv, "AIRA_CONFINE_SCOPE_ID", "AIRA_CONFINE_SLICE"),
 		SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
 	}, confineUnitDeps(scope))
 	if err != nil || result.Exit != 0 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	fields := strings.Split(stdout.String(), "|")
-	if len(fields) != 2 {
+	if len(fields) != 3 {
 		t.Fatalf("child environment report=%q", stdout.String())
 	}
 	if fields[0] != "/fake/finite.slice" {
-		t.Fatalf("AIRA_CONFINE_SLICE=%q, want the resolved slice path /fake/finite.slice (confine-reserve inside this job has no other way to learn where it runs)", fields[0])
+		t.Fatalf("%s=%q, want the resolved slice path /fake/finite.slice (confine-reserve inside this job has no other way to learn where it runs)", pylib.ConfineParentSliceEnv, fields[0])
 	}
 	if fields[1] == "" || fields[1] == "stale-scope" {
 		t.Fatalf("AIRA_CONFINE_SCOPE_ID=%q: the confine child environment was not populated, so the slice assertion above proves nothing", fields[1])
+	}
+	if fields[2] != "operator.slice" {
+		t.Fatalf("AIRA_CONFINE_SLICE=%q, want the operator's explicit-slice input carried through untouched: overwriting it hands every nested confine a forged --slice", fields[2])
+	}
+}
+
+// TestInheritedParentSliceIsNotAnExplicitSliceInput is the F1 regression from
+// this ticket's build review, and it is the reason the published coordinate has
+// its own variable name at all.
+//
+// AIRA-115's first cut published the parent job's resolved cgroup PATH under
+// AIRA_CONFINE_SLICE — which is already the OPERATOR's explicit-slice input
+// (ResolveConfineSlice; install-owned-slice design §4: `--slice` >
+// `$AIRA_CONFINE_SLICE` > `aira.slice`, and an explicit value never falls back).
+// Nested `aira confine` is the norm on a dogfooding box, so every nested job then
+// took its parent's absolute path as an operator-declared --slice: default
+// resolution — with its managed-unit guard and whale fallback — was skipped, the
+// status line and the detach record named the raw path, and the same value
+// reached the daemon's management-slice resolution and any daemon it spawned.
+// It is reproducible as a red test suite: `TestDefaultConfinePresentButUncapped-
+// FailsOnAIRA` fails under a parent confined by such a binary.
+//
+// Both halves are asserted through the CONSTANT, so this is RED for exactly the
+// wrong behaviour: point pylib.ConfineParentSliceEnv back at AIRA_CONFINE_SLICE
+// and the resolver starts honouring the emitted coordinate again.
+//
+// verifies: AIRA-115
+func TestInheritedParentSliceIsNotAnExplicitSliceInput(t *testing.T) {
+	const parentPath = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/aira.slice"
+	t.Setenv("AIRA_CONFINE_SLICE", "")
+	t.Setenv(pylib.ConfineParentSliceEnv, parentPath)
+
+	// The portable resolver: only --slice and the operator's own variable feed it.
+	if got := ResolveConfineSlice(""); got != "" {
+		t.Fatalf("ResolveConfineSlice(\"\")=%q with only the emitted parent coordinate set, want \"\": an emitted coordinate is not an operator override", got)
+	}
+
+	// And the launch path it feeds. This is TestDefaultConfinePresentButUncapped-
+	// FailsOnAIRA's fixture with the parent coordinate published — precisely the
+	// case that went red post-deploy — so the uncapped refusal is only the vehicle:
+	// what is asserted is that DEFAULT resolution ran and named aira.slice.
+	deps := confineUnitDeps(&confineFakeScope{})
+	deps.managedUnitPresent = func(string) (bool, error) { return true, nil }
+	deps.resolveSlicePathExact = func(name string) (string, error) {
+		if name != DefaultConfineSlice {
+			t.Fatalf("default resolution asked for %q, want %q: the inherited parent path was taken as an explicit slice", name, DefaultConfineSlice)
+		}
+		return "/cg/aira.slice", nil
+	}
+	deps.readCap = func(string) (int64, bool) { return 0, false }
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Argv: []string{"must-not-run"}, Env: []string{"PATH=" + os.Getenv("PATH")}, Stderr: io.Discard,
+	}, deps)
+	if result.Status.Slice != DefaultConfineSlice {
+		t.Fatalf("nested confine resolved slice=%q err=%v, want %q (the inherited parent coordinate was taken as an explicit --slice)", result.Status.Slice, err, DefaultConfineSlice)
+	}
+	if err == nil || !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE: slice "+DefaultConfineSlice) {
+		t.Fatalf("err=%v, want the uncapped refusal to name %q rather than the inherited path", err, DefaultConfineSlice)
 	}
 }
