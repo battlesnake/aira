@@ -419,3 +419,80 @@ was taken because `Runner.Launch`'s ledger/telemetry/PTY/detach surface is all
 keyed on a real scope and the deployment shape this ticket targets does not use
 it. Ticket test (a) therefore covers `confine` only.
 
+### Build-review round 3 — the BLOCK on PR #72, and what changed
+
+**F3 — the meminfo fallback was inoperable for the ticket's own headline
+targets.** `readShimMemory`'s host-wide `/proc/meminfo` fall-back (reached
+whenever there is no readable own-cgroup `memory.current` — `CgroupPath ""`
+from the probe, or a cgroup-v1-only host with no memory controller file, e.g.
+Amazon Linux 2 / legacy Fargate for AWS Batch) computed `current` as host-wide
+`MemTotal - MemAvailable` while `maximum` stayed the container-scoped declared
+or cgroup-derived budget. `checkedAvailable`'s `charge = max(current,
+outstanding)` then pinned to the host-wide figure: on any multi-tenant node
+where host usage exceeds the small declared budget (the normal state of such a
+node), `available` was permanently 0 and every shim job answered
+`E_ADMIT_TOO_LARGE cap_minus_headroom=0` for the container's entire life.
+Fail-closed, never a false pass, but silently and permanently inoperable
+rather than a transient contention wait.
+
+**Fix direction chosen: pair `current` with the budget's own scope
+(reviewer's preferred option), not an install-time refusal.** `readShimMemory`
+now routes on the budget's `Source`, not merely on whether a cgroup path was
+recorded: the meminfo fall-back's `current = MemTotal - MemAvailable`
+computation is reached ONLY when the budget's own source is ITSELF host-wide
+(`ShimBudgetSourceMemTotal` — both sides of `checkedAvailable` are then the
+same scope, the AIRA-120 shape, which already worked end to end). For a
+CONTAINER-scoped budget (`ShimBudgetSourceDeclared` or
+`ShimBudgetSourceCgroupMemoryMax`) with no own-cgroup usage reading,
+`readShimMemory` now reports `current=0, reclaimable=0` — booked-reserve-only
+admission against the declared/derived budget. `checkedAvailable` itself is
+untouched: its `outstanding`-charge logic still correctly gates on whatever
+this ledger has actually granted; it is simply honest that it cannot see usage
+outside what this ledger itself booked, which is the true state of knowledge
+with no readable own-cgroup number. The install-time-refusal alternative was
+rejected because it would turn away exactly the documented cgroup-v1-only
+targets this ticket names, where booked-reserve-only still lets admission
+function.
+
+Tests (`internal/daemon/shim_test.go`):
+`TestReadShimMemoryReportsBookedReserveOnlyForADeclaredBudgetWithNoOwnCgroup`
+(a declared 2GiB budget against an injected 56GiB of host-wide usage; fails
+against the old routing with `current=60129542144`, which zeroes
+`checkedAvailable`) and
+`TestReadShimMemoryReportsBookedReserveOnlyWhenTheRecordedCgroupHasNoMemoryController`
+(the same fix for a recorded cgroup path with no `memory.current` file — the
+cgroup-v1-only shape — rather than an empty path). Both were run against the
+pre-fix code and confirmed to fail before the fix landed.
+
+**Also fixed: the sibling fallback test was porous.**
+`TestReadShimMemoryFallsBackToMeminfoWithNoOwnCgroup` only asserted
+`maximum==budget` and `current>=0 && reclaimable==0`, `t.Skip`-ing outright
+whenever the real host's `/proc/meminfo` made the fall-back inconvenient to
+exercise — it passed against the broken routing on any host with light memory
+pressure and proved nothing about admission actually working. `readMemTotal`
+and `readMemAvailable` are now reached through two new injectable seams on
+`Server` (`shimReadMemTotal`, `shimReadMemAvailable`, defaulting to the package
+funcs on the same nil-checks-to-default rule as `admitResolveSlice` /
+`admitReadMemory`; test setter `SetShimMeminfoForTest`). The test now injects a
+deterministic MemTotal/MemAvailable pair and asserts
+`checkedAvailable(current, maximum, reclaimable, 0, 0) > 0`, matching the round-2
+F1 test's assertion style, instead of skipping.
+
+**Non-blocking note, taken.** `internal/runner/confine_mode.go`'s
+`InstallModeFileEnv` (`AIRA_INSTALL_MODE_FILE`) comment is corrected: this env
+override is a same-user test/tooling convenience, not a security boundary —
+any process that could set the env var could equally write or replace the
+record file it names, so pointing it at a crafted record is not a bypass of
+anything the record's contents are relied on to prove. The override itself is
+unchanged (kept for tests and tooling, as before).
+
+**Non-blocking notes already resolved by the round-2 commit, reconfirmed
+untouched.** `reportShimMode`'s doubled byte count
+(`internal/install/mode.go`) and the `Setpgid`/tty comment
+(`internal/runner/confine_shim_linux.go`) were fixed in `a1248a9` and verified
+still correct; no further change needed for either.
+
+Build `aira confine -- go build ./...`, vet `aira confine -- go vet ./...`,
+and the full suite `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1`
+all green (exit 0) after this round's changes.
+

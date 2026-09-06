@@ -61,6 +61,26 @@ func (s *Server) memoryReader() func(string) (int64, int64, int64, bool, string)
 	return readSliceMemory
 }
 
+// memTotalReader and memAvailableReader are readShimMemory's meminfo seams,
+// on the same nil-checks-to-the-package-default rule as sliceResolver and
+// memoryReader above. Production reaches the real /proc/meminfo readers;
+// tests inject a synthetic pair (SetShimMeminfoForTest) so the host-wide
+// fallback's routing is exercised without depending on this host's actual
+// memory state.
+func (s *Server) memTotalReader() func() (int64, bool) {
+	if s.shimReadMemTotal != nil {
+		return s.shimReadMemTotal
+	}
+	return readMemTotal
+}
+
+func (s *Server) memAvailableReader() func() (int64, bool, string) {
+	if s.shimReadMemAvailable != nil {
+		return s.shimReadMemAvailable
+	}
+	return readMemAvailable
+}
+
 // resolveShimSlicePath answers with the sentinel for ANY requested slice name.
 // A shim container has one budget and one queue; a caller naming aira.slice, a
 // cgroup path, or nothing at all is asking about the same thing.
@@ -94,13 +114,39 @@ func resolveShimSlicePath(string) (string, bool, string) {
 //     container's whole life: fail-closed, but inoperable.
 //
 //  2. /proc/meminfo, as MemTotal - MemAvailable for current usage with max set
-//     to the recorded budget. Reached only when there is NO own-cgroup reading at
-//     all -- no recorded path, or a path with no readable memory.current (a
-//     cgroup-v1-only or cgroup-less host). reclaimable is deliberately ZERO here:
-//     MemAvailable already credits reclaimable page cache, so applying the
-//     AIRA-21 discount on top would double-count it in the permissive direction.
-//     On a container whose /proc is not namespaced this reading is the HOST's,
-//     which is why it is last.
+//     to the recorded budget. Reached only when there is NO own-cgroup reading,
+//     AND the budget's own source is ITSELF host-wide
+//     (ShimBudgetSourceMemTotal): a host-wide budget paired with a host-wide
+//     live reading is the same scope on both sides of checkedAvailable, which
+//     is the AIRA-120 shape and already works end to end. reclaimable is
+//     deliberately ZERO here: MemAvailable already credits reclaimable page
+//     cache, so applying the AIRA-21 discount on top would double-count it in
+//     the permissive direction.
+//
+//  3. current=0, reclaimable=0 (booked-reserve-only), when there is no
+//     own-cgroup reading AND the budget is CONTAINER-scoped (declared or the
+//     container's own cgroup memory.max — ShimBudgetSourceDeclared or
+//     ShimBudgetSourceCgroupMemoryMax). This is AIRA-121 F3: with no cgroup of
+//     its own (CgroupPath=="" from the probe, or a path with no readable
+//     memory.current -- a cgroup-v1-only host), the OLD code fell all the way
+//     through to case 2 regardless of source, pairing a container-scoped
+//     `maximum` with a HOST-WIDE `current` (MemTotal-MemAvailable is not
+//     namespaced). On the normal multi-tenant node this host-wide current
+//     dwarfs a small declared/container budget, checkedAvailable's
+//     charge=max(current,outstanding) pins to it, available collapses to 0,
+//     and every job in the container answers E_ADMIT_TOO_LARGE
+//     cap_minus_headroom=0 for the container's ENTIRE LIFE -- fail-closed, but
+//     silently and permanently inoperable rather than a transient contention
+//     wait. Reporting current=0 here instead makes admission booked-reserve-
+//     only: checkedAvailable's own outstanding-charge logic (untouched) still
+//     correctly gates on whatever THIS ledger has actually granted; it is
+//     simply blind to usage outside what this ledger itself booked, which is
+//     the honest fact when there is no readable own-cgroup number to see it
+//     with. The alternative considered and rejected here was refusing install
+//     outright whenever a declared budget has no own-cgroup usage to pair
+//     with; booked-reserve-only was preferred because it still lets the
+//     documented cgroup-v1-only targets (Amazon Linux 2 / legacy Fargate for
+//     AWS Batch) admit at all, which a hard install-time refusal would not.
 //
 // Any failure reports ok=false, which the existing code turns into a fail-CLOSED
 // outcome: waiters stay queued and each one's own maxWait still fires
@@ -119,8 +165,14 @@ func (s *Server) readShimMemory(string) (int64, int64, int64, bool, string) {
 			return current, maximum, reclaimable, true, ""
 		}
 	}
-	total, totalOK := readMemTotal()
-	available, availableOK, reason := readMemAvailable()
+	if budget.Source != runner.ShimBudgetSourceMemTotal {
+		// F3: a container-scoped budget with no own-cgroup reading to pair it
+		// with. See case 3 above -- host-wide meminfo must never stand in for
+		// this container's usage.
+		return 0, budget.Bytes, 0, true, ""
+	}
+	total, totalOK := s.memTotalReader()()
+	available, availableOK, reason := s.memAvailableReader()()
 	if !totalOK || !availableOK {
 		if reason == "" {
 			reason = "meminfo-unreadable"

@@ -38,8 +38,15 @@ const (
 const ShimConfineSlice = "ci-shim"
 
 // InstallModeFileEnv overrides where the install-mode record is read from. It
-// is a TEST/override seam for the location only, never for the mode: what the
-// record SAYS is still the single source of truth. Production leaves it unset.
+// is a TEST/tooling convenience seam, not a security boundary: this is a
+// same-user threat model, the same as every other AIRA_* override in this
+// package (AIRA_DAEMON_CONFINE_MODE and friends, resolveDaemonConfineMode in
+// internal/daemon/shim.go). Any process running as the same user that could
+// set this env var could equally write or replace the record file this const
+// points AT — an ordinary env var offers no more resistance to a same-user
+// parent than the file it names does, so pointing it at a crafted record is
+// not a bypass of anything the record's contents are relied on to prove.
+// Production leaves it unset.
 const InstallModeFileEnv = "AIRA_INSTALL_MODE_FILE"
 
 // InstallModeRecord is the durable install-mode record. It is written by

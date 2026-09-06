@@ -163,6 +163,13 @@ type Server struct {
 	confineMode              string
 	shimBudget               shimBudget
 	admitConfineScanInterval time.Duration
+	// shimReadMemTotal / shimReadMemAvailable are readShimMemory's host-wide
+	// /proc/meminfo seams (AIRA-121 F3). Nil in production, which resolves to
+	// the package funcs readMemTotal/readMemAvailable; a test injects a
+	// synthetic pair so the fallback's routing is exercised deterministically
+	// instead of depending on this host's actual memory state.
+	shimReadMemTotal     func() (int64, bool)
+	shimReadMemAvailable func() (int64, bool, string)
 	// workerScopeScan / workerScopeCreate are the worker-admit ledger's two
 	// cgroupfs seams (AIRA-39). Production uses scanWorkerScopeChildren and
 	// runner.CreateWorkerScope; tests substitute fakes so the ledger's

@@ -85,3 +85,12 @@ func (s *Server) SetConfineShimModeForTest(budgetBytes int64, source, cgroupPath
 	s.confineMode = runner.ConfineModeShim
 	s.shimBudget = shimBudget{Bytes: budgetBytes, Source: source, CgroupPath: cgroupPath}
 }
+
+// SetShimMeminfoForTest injects readShimMemory's host-wide /proc/meminfo
+// fallback seams (AIRA-121 F3), so a test can drive the
+// ShimBudgetSourceMemTotal branch with a synthetic MemTotal/MemAvailable pair
+// instead of depending on this host's actual, unpredictable memory state.
+func (s *Server) SetShimMeminfoForTest(readTotal func() (int64, bool), readAvailable func() (int64, bool, string)) {
+	s.shimReadMemTotal = readTotal
+	s.shimReadMemAvailable = readAvailable
+}

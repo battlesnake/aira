@@ -301,21 +301,108 @@ func TestReadShimMemoryUsesTheOwnCgroupWhenItsLimitIsUnbounded(t *testing.T) {
 // verifies: AIRA-121 requirement 4, finding F1
 //
 // With NO own-cgroup reading available at all — a cgroup-v1-only or cgroup-less
-// container, where install recorded no path — meminfo is still the fall-back,
-// and it is still bounded by the recorded budget. The fix must not turn the
-// fall-back off, only stop it being reached by a readable cgroup.
+// container, where install recorded no path — meminfo is still the fall-back
+// for a budget whose OWN source is host-wide (ShimBudgetSourceMemTotal: a
+// host-wide budget paired with a host-wide live reading is the same scope on
+// both sides), and it is still bounded by the recorded budget. The fix must
+// not turn the fall-back off, only stop it being reached by a readable cgroup
+// or by a container-scoped budget (see the F3 test below for that half).
+//
+// The meminfo pair is INJECTED (SetShimMeminfoForTest) rather than read from
+// this host's real /proc/meminfo, per the F3 round-2 finding: a test that
+// skips whenever the host happens to be memory-pressured, and asserts nothing
+// about admission actually working, cannot catch a regression that zeroes
+// availability. The sibling F1 assertion style — checkedAvailable(...) > 0 —
+// is used here for the same reason.
 func TestReadShimMemoryFallsBackToMeminfoWithNoOwnCgroup(t *testing.T) {
 	server := NewServer(Paths{})
 	server.SetConfineShimModeForTest(4<<30, runner.ShimBudgetSourceMemTotal, "")
+	server.SetShimMeminfoForTest(
+		func() (int64, bool) { return 8 << 30, true },
+		func() (int64, bool, string) { return 6 << 30, true, "" },
+	)
 	current, maximum, reclaimable, ok, reason := server.readShimMemory(runner.ShimConfineSlice)
 	if !ok {
-		t.Skipf("this host's /proc/meminfo is unreadable, so the fall-back cannot be exercised: %s", reason)
+		t.Fatalf("readShimMemory not ok: %s", reason)
 	}
 	if maximum != 4<<30 {
 		t.Fatalf("max=%d, want the recorded budget", maximum)
 	}
-	if current < 0 || reclaimable != 0 {
-		t.Fatalf("current=%d reclaimable=%d: MemAvailable already credits reclaimable page cache, so the discount must stay zero here", current, reclaimable)
+	if current != 2<<30 {
+		t.Fatalf("current=%d, want MemTotal(8GiB)-MemAvailable(6GiB)=2GiB", current)
+	}
+	if reclaimable != 0 {
+		t.Fatalf("reclaimable=%d: MemAvailable already credits reclaimable page cache, so the discount must stay zero here", reclaimable)
+	}
+	if available := checkedAvailable(current, maximum, reclaimable, 0, 0); available <= 0 {
+		t.Fatalf("available=%d: a host-wide budget matched with a host-wide reading below it must not zero admission", available)
+	}
+}
+
+// verifies: AIRA-121 finding F3
+//
+// THE BUG: a DECLARED --memory-max budget with no own-cgroup usage reading to
+// pair it with (CgroupPath=="" from the probe -- the cgroup-v1-only host case,
+// e.g. Amazon Linux 2 / legacy Fargate for AWS Batch) must NOT fall through to
+// host-wide meminfo. On a real multi-tenant node, host-wide
+// MemTotal-MemAvailable routinely dwarfs a small per-container declared
+// budget; checkedAvailable's charge=max(current,outstanding) then pins to that
+// inflated current, available collapses to 0, and EVERY job in the container
+// answers E_ADMIT_TOO_LARGE cap_minus_headroom=0 for the container's ENTIRE
+// LIFE. Fail-closed, but silently and permanently inoperable, not a transient
+// contention wait.
+//
+// Counterexample this fails against: the OLD readShimMemory, which routed on
+// "is there a cgroup path" alone and fell through to
+// current=MemTotal-MemAvailable regardless of the budget's own source. Here
+// the injected host usage (56GiB) vastly exceeds the declared 2GiB container
+// budget, so the old code's current=56GiB makes checkedAvailable(...)==0.
+func TestReadShimMemoryReportsBookedReserveOnlyForADeclaredBudgetWithNoOwnCgroup(t *testing.T) {
+	const budget = int64(2) << 30 // 2 GiB declared container budget
+	server := NewServer(Paths{})
+	server.SetConfineShimModeForTest(budget, runner.ShimBudgetSourceDeclared, "")
+	// A busy multi-tenant host: 64GiB total, only 8GiB free -- 56GiB "in use"
+	// host-wide, dwarfing the 2GiB container budget many times over.
+	server.SetShimMeminfoForTest(
+		func() (int64, bool) { return 64 << 30, true },
+		func() (int64, bool, string) { return 8 << 30, true, "" },
+	)
+	current, maximum, reclaimable, ok, reason := server.readShimMemory(runner.ShimConfineSlice)
+	if !ok {
+		t.Fatalf("readShimMemory not ok: %s", reason)
+	}
+	if maximum != budget {
+		t.Fatalf("max=%d, want the declared budget %d", maximum, budget)
+	}
+	if current != 0 || reclaimable != 0 {
+		t.Fatalf("current=%d reclaimable=%d, want 0/0 (booked-reserve-only): host-wide meminfo must never stand in for a container-scoped budget's usage", current, reclaimable)
+	}
+	if available := checkedAvailable(current, maximum, reclaimable, 0, 0); available <= 0 {
+		t.Fatalf("available=%d: a declared per-container budget must not be permanently zeroed by unrelated host-wide usage", available)
+	}
+}
+
+// verifies: AIRA-121 finding F3
+//
+// The same booked-reserve-only fix must also fire when a cgroup path WAS
+// recorded but its usage is unreadable -- the cgroup-v1-only host shape where
+// the probe found a cgroup directory with no memory controller file in it --
+// not only when CgroupPath is empty outright.
+func TestReadShimMemoryReportsBookedReserveOnlyWhenTheRecordedCgroupHasNoMemoryController(t *testing.T) {
+	const budget = int64(2) << 30
+	dir := t.TempDir() // no memory.current file: simulates a v1-only cgroup dir
+	server := NewServer(Paths{})
+	server.SetConfineShimModeForTest(budget, runner.ShimBudgetSourceCgroupMemoryMax, dir)
+	server.SetShimMeminfoForTest(
+		func() (int64, bool) { return 64 << 30, true },
+		func() (int64, bool, string) { return 8 << 30, true, "" },
+	)
+	current, maximum, _, ok, reason := server.readShimMemory(runner.ShimConfineSlice)
+	if !ok {
+		t.Fatalf("readShimMemory not ok: %s", reason)
+	}
+	if maximum != budget || current != 0 {
+		t.Fatalf("current=%d max=%d, want current=0 max=%d: an unreadable recorded cgroup must fall to booked-reserve-only, not host-wide meminfo", current, maximum, budget)
 	}
 }
 
