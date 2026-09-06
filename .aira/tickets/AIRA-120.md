@@ -1,7 +1,17 @@
 ---
-{"schema":1,"id":"AIRA-120","project":"aira","title":"aira install --ci: size the slice ceiling to current free RAM with zero headroom, for dedicated CI workers","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","install"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-120","project":"aira","title":"aira install --ci: size the slice ceiling to current free RAM with zero headroom, for dedicated CI workers","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-120","to":"AIRA-121"}]}
 ---
 Requested directly by the owner, 2026-09-06.
+
+SCOPE NOTE (added after a follow-up owner question, same session): this ticket
+is scoped to a systemd + delegated-cgroup-v2-available CI host (e.g. a
+self-hosted runner VM with a normal systemd user session) -- exactly what
+`aira install` already assumes today. A containerised batch environment
+(GCP Batch container runnables, similar AWS Batch/Fargate/k8s Job shapes)
+typically has NO systemd at all, not even for the one-time install step, so
+this ticket's `--ci` does not apply there. That case is AIRA-121, deliberately
+kept separate rather than folded in here, since it is a different mechanism
+(no cgroup enforcement at all), not a variant of this one's sizing formula.
 
 ## The ask
 
