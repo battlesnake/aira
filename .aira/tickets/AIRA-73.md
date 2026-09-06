@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-73","project":"aira","title":"A conflicted outbox intent has no retire path — one write conflict permanently bricks a ticket path and blocks eject","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","store"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-73","project":"aira","title":"A conflicted outbox intent has no retire path — one write conflict permanently bricks a ticket path and blocks eject","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","store"],"hold":false,"relations":[]}
 ---
 Found during the whole-project simplification review (PR #12), originally as "`outbox.resolution` is never written". Scoped in the backlog remediation plan's Phase 2 (`docs/superpowers/plans/2026-09-04-backlog-remediation-plan.md` §4, §5 item 4).
 
@@ -35,6 +35,9 @@ A retire needs its own small design: the verb and face surface, its event/receip
 ## Resolution — Half 2 (the retire path): BUILT
 
 Plan: `docs/superpowers/plans/2026-09-06-aira73-intent-retire-plan.md` (v4, GATE PASS).
+PR: https://github.com/battlesnake/aira/pull/59 — merged as `4b75f52`
+(merge commit; branch tip `e89df78`). Merged artifact independently re-verified
+against `origin/master` after the merge, not taken from the PR description.
 
 ### What was built
 
@@ -105,3 +108,105 @@ amended (`:127`, `:171`, `:193`, `:409`, `:441`, `:714`, `:724`, `:740`).
   with no built alternative. The residue is one DB column no face surfaces, and
   the test asserts every consequence that would make it matter is absent.
 
+### Verification
+
+| gate | exit |
+|---|---|
+| `aira confine -- go build ./...` | **0** |
+| `aira confine -- go vet ./...` | **0** |
+| `aira confine -- go test ./...` | **0** (14 packages, no failures) |
+| `pre-push` hook (`make ci`) | **0** — ran on both pushes |
+
+Each was re-run after rebasing onto the master of the moment (`f1f699a` →
+`88d4cea` → `3216862`).
+
+**Process deviation, recorded honestly:** the plan said TDD, red-first. In
+practice the implementation and its tests were written together and the
+*failure* evidence came from the mutation battery below rather than from a
+red-then-green cycle per test. The battery is the stronger evidence for the
+property that matters — that each test can actually fail against a wrong
+implementation — but it is not the same thing as having been written first.
+
+### Mutation battery — 20 mutants, all killed
+
+Every load-bearing guard has a mutant; each was applied to the committed tree,
+the naming test run, and the tree restored. Harness:
+`~/tmp/aira73-mutants.py`.
+
+| mutant | killed by |
+|---|---|
+| M1 drop the conflicted-only requirement | `TestRetireRefusedWhenDigestEqualsPrecondition`, `…EqualsIntended`, `…ForReceiptOnlyIntent` |
+| M2 drop the in-transaction `materialised` re-read | `TestRetireRefusedWhenMaterialisedAfterResolve` |
+| M3 drop the worktree guard (bare-seq selector) | `TestRetireRefusedForForeignWorktreeIntent` |
+| M4 drop the allocations retirement | `TestRetiringAnAllocationIntentClearsTheCheckWedge` |
+| M5 drop the `Rebuild` retire replay | `TestRetireRepairsAMissingAllocationReceiptAndTheIDIsNeverReused` |
+| M6 drop the finding delete | `TestRetireClearsTheReconciliationFinding` |
+| M7 drop the parked retire outbox row | `TestRetireJournalCrashIsReplayed` |
+| M8 report a failed resolution as success | `TestRetireIsIdempotentWithAStableNotFoundCode` |
+| M9 swap the classifier's replayable/already-written order | `TestClassifyPendingIntentMatchesReconcile` |
+| M10 drop the pre-delete receipt repair | `TestRetireRepairsAMissingAllocationReceiptAndTheIDIsNeverReused` |
+| M11 carry `allocation_id` on the parked retire row | `TestRetireCrashOnAnAllocationIntentDoesNotPoisonTheReceipts` |
+| M12 drop the path lock | `TestRetireCannotRaceAConcurrentMaterialise` |
+| M13 drop `AND state='allocated'` (both sites) | `TestRetireCannotRetireAMaterialisedAllocation`, `TestRebuildRetireReplayCannotRetireAMaterialisedAllocation` |
+| M14 report an unreadable digest as a conflict | `TestRetireReportsUnevaluatedDigest` |
+| M15 drop the finding-mutation lock | `TestRetireHoldsTheFindingLockAgainstAConcurrentReconcile` |
+| M16 reconcile repairs a kindless receipt | `TestReconcileRepairsARequirementReceiptWithTheRightKind` |
+| M17 validate a constant instead of the real allocation id | `TestRetireRefusesAMalformedAllocationID` |
+| M18 drop the allocations exactly-one-row check | `TestRetireCannotRetireAMaterialisedAllocation` |
+| M19 run the `Rebuild` retire replay without the receipt loop | `TestRetireRepairsAMissingAllocationReceiptAndTheIDIsNeverReused` |
+| M20 retire hardcodes the ticket kind | `TestRetireWritesTheRequirementKindWithoutReconcile` |
+
+**M11 and M15 SURVIVED the first pass.** Both were genuinely porous tests, and
+both tests were fixed rather than excused:
+
+- M11: reaching the defect needs all three of an allocation-bearing intent, a
+  crash leaving the retire row unjournaled, and a reconcile before the rebuild.
+  No test had all three; one now does.
+- M15: the mutual-exclusion check was a `select`/`default`, which races the
+  goroutine it checks. It now handshakes on `afterRetireResolve` and then waits
+  a bounded window, with the load-bearing assertion on the final state.
+
+One guard has **no killable mutant and that is recorded rather than dressed up**:
+the `DELETE`'s `RowsAffected() == 1` check. The authoritative re-read is in the
+same `BEGIN IMMEDIATE` transaction, so no interleaving can make it fire; it is a
+defensive invariant assertion.
+
+### Review
+
+**Plan gate — Codex/Sol (GPT-5.6, repo-read-only, high effort), four rounds.**
+v1 `GATE-FAIL` (3 P0), v2 `GATE-FAIL` (2 P0), v3 `GATE-FAIL` (1 P0), **v4 PASS**.
+Six P0s between them, every one accepted and built: the pre-delete receipt
+repair (ID re-mint after DB loss); the path lock (a DB transaction does not
+exclude a mid-materialisation writer); `allocation_id=''` on the parked row
+(otherwise reconcile appends an empty-path receipt and bricks `Rebuild`); the
+`prepareCreate`-direct test construction (both create flows append the receipt
+before `materialiseIntent`, so the `beforeMaterialise` seam is too late); and
+promoting reconcile's kindless requirement receipt from a deferral into scope
+(it is deduped ahead of retire's correct one, so a requirement retire would
+still brick `Rebuild`). Every finding and its disposition is in the plan's §10.
+
+**Build review — same lineage, adversarial, both false-fail and false-pass.**
+No P0. One P1 taken as a **reasoned no** (refusing a retire when the conflicting
+file validly claims the ID would reintroduce the wedge; pinned by a
+characterisation test instead). One P1 documented as an accepted limitation (the
+journal digest is unkeyed, so a retirement is no more forgeable than any other
+journal-replayed fact; the `allocated`-only narrowing bounds the blast radius).
+Four P2s applied: the finding-lock handshake, bounded channel receives in both
+concurrency tests, the receipt-only arm exercised through real reconcile, and
+the spec's ordering/worktree wording.
+
+**DeepSeek-pro (4 attempts) and Gemini (2) both failed to return.** This work
+therefore carries ONE external review lineage, not three. Recorded rather than
+papered over.
+
+### Open questions from the brief, resolved
+
+| question | resolution |
+|---|---|
+| verb + face shape | `intent-retire <selector>`, one top-level dispatch entry; `<noun>-<verb>` house style, so it cannot be confused with the ticket status `retired` |
+| SafetyClass | `SafetyReconcile` + `Destructive` — the reconciliation-resolution class the spec names, and it correctly keeps a destructive durable-row deletion out of the TUI palette |
+| selector | three forms, precedence documented: finding key → bare sequence → path (relative paths resolve against the worktree root, never the daemon's CWD). 0 matches → `E_NOT_FOUND`, >1 → `E_SELECTOR_AMBIGUOUS`, blank → `E_SELECTOR_INVALID` |
+| allocation receipt | the brief's sketch (append a `State:"retired"` receipt) does **not** work: `appendReceiptIfMissing` dedupes on `(project, id, seq)` so it is silently dropped at the original seq, and at a new seq it fails the next `Rebuild` with `E_JOURNAL_CORRUPT`. Retirement is recorded in `allocations.state` + the journal instead — symmetric with how a materialisation is recorded |
+| findings | deleted, keyed on `reconcile:<worktree>:<seq>`. Note the brief said `aira check` reports it; it does not — `aira find ls subtype:reconciliation` does, which is also where the operator gets the selector |
+| force-materialise | **deferred**, with the reason recorded in the spec and above |
+| crash between DELETE and journal | replayed by the existing `replayUnjournaledEvents` **and** `reconcile` paths, via the parked lease-shaped row. Proved on both paths by test, not asserted |
