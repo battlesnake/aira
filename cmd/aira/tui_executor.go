@@ -94,6 +94,18 @@ type tuiExecutor struct {
 }
 
 func newTUIExecutor(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, workers int) *tuiExecutor {
+	return newTUIExecutorWithWatch(ctx, dispatcher, executeDispatcher, scope, workers, true)
+}
+
+// newTUIExecutorWithWatch adds one decision to the constructor: whether to run
+// the project event-watch loop at all.
+//
+// `aira top` resolves NO project and dispatches with an empty worktree scope, so
+// a watch there would fail on every exchange and spin its reconnect backoff
+// forever against the daemon — an error loop behind a view that never shows it.
+// Not starting it is the honest answer: the top view has no event panel, so
+// there is nothing the loop would have fed.
+func newTUIExecutorWithWatch(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, workers int, watch bool) *tuiExecutor {
 	if workers < 1 {
 		workers = 1
 	}
@@ -108,11 +120,13 @@ func newTUIExecutor(ctx context.Context, dispatcher, executeDispatcher Dispatche
 		executor.wg.Add(1)
 		go executor.worker()
 	}
-	executor.wg.Add(1)
-	go func() {
-		defer executor.wg.Done()
-		runTUIWatchLoop(ctx, dispatcher, scope, executor.messages, executor.reconnect)
-	}()
+	if watch {
+		executor.wg.Add(1)
+		go func() {
+			defer executor.wg.Done()
+			runTUIWatchLoop(ctx, dispatcher, scope, executor.messages, executor.reconnect)
+		}()
+	}
 	return executor
 }
 
@@ -175,8 +189,15 @@ func (e *tuiExecutor) commandLoop() {
 					return
 				}
 			case cmdScheduleRefresh:
+				// The debounce is the DEFAULT, not the only delay: AIRA-127's top
+				// view reuses this one timer path for its live tick and names its own
+				// (much longer) interval, so there is no second scheduler.
+				delay := tuiRefreshDebounce
+				if command.Backoff > 0 {
+					delay = command.Backoff
+				}
 				e.wg.Add(1)
-				go e.deliverAfter(tuiRefreshDebounce, tuiMessage{Kind: msgRefreshDue, View: command.View})
+				go e.deliverAfter(delay, tuiMessage{Kind: msgRefreshDue, View: command.View})
 			case cmdReconnect:
 				e.wg.Add(1)
 				go e.reconnectAfter(command.Backoff)

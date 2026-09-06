@@ -9,6 +9,56 @@ import (
 	"aira/internal/core"
 )
 
+// AIRA-127. The SLOT COLOUR palette, added to this module because the ticket
+// directs the top view to reuse "the existing colour palette module,
+// cmd/aira/tui_palette.go". A note for whoever reads this next: everything below
+// the colour block is a COMMAND palette (the `:` verb picker) and there was no
+// pre-existing colour-allocation mechanism anywhere in the TUI to extend — the
+// dashboard's only colours are three literal tcell constants keyed off
+// tableRow.Style. So this is the module's first colour table rather than an
+// extension of one, and it is placed here so a second palette never appears.
+//
+// The colours are chosen to stay distinguishable on both light and dark
+// terminals and to avoid the greys the bar reserves for out-of-slice usage.
+// A slot beyond the table's length WRAPS, so two rows can share a colour on a
+// slice running more than len(topSlotColours) scopes at once. That is a stated
+// limit, not a defect to be hidden: the SLOT is the identity the bar and the row
+// agree on, and the colour is a lookup from it, so a wrap costs legibility and
+// never correctness.
+var topSlotColours = []string{
+	"#5fafff", // blue
+	"#5fd75f", // green
+	"#ff875f", // orange
+	"#af87ff", // violet
+	"#5fd7d7", // cyan
+	"#d7d75f", // yellow
+	"#ff5faf", // magenta
+	"#87af5f", // olive
+}
+
+// topSlotColour is the ONE mapping from a stable slot index to a colour. The bar
+// region and the process-list row for the same reservation both call it, which
+// is what makes requirement 6 — identical colour in both places — structural
+// rather than a convention two call sites have to remember.
+func topSlotColour(slot int) string {
+	if slot < 0 {
+		return topColourScopeless
+	}
+	return topSlotColours[slot%len(topSlotColours)]
+}
+
+const (
+	// topColourScopeless marks the aggregate scope-less-reservation region. It is
+	// deliberately outside the slot table: that region has no slot, no row, and no
+	// stable identity to hold one.
+	topColourScopeless = "#d7af00"
+	// topColourOutside is the grey of requirement 5 — memory used by the rest of
+	// the system, anchored to the bar's right edge.
+	topColourOutside = "#6c6c6c"
+	// topColourMarker draws the soft/hard/ceiling limit ticks.
+	topColourMarker = "#ffffff"
+)
+
 type paletteArg struct {
 	Spec     core.ArgSpec
 	Required bool

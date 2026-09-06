@@ -157,7 +157,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 			return core.Response{OK: true, Code: "UNEVALUATED", Data: result, Exit: 3}
 		}
 		readMemory := s.memoryReader()
-		_, maximum, _, ok, _ := readMemory(path)
+		sliceCurrent, maximum, sliceReclaimable, ok, _ := readMemory(path)
 		if ok {
 			// AIRA-103. A CAPACITY question -- "what would one more job face" --
 			// so it takes the pressure-throttled maximum, exactly like the
@@ -239,6 +239,37 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				CapAggregateBytes: snapshot.capAggregate,
 				CapAggregateKnown: snapshot.capAggregateKnown,
 				CapBoundBytes:     s.oversubscriptionLimit(ceilingMaximum),
+			}
+			// AIRA-127. The system-and-slice frame `aira top` draws its RAM bar
+			// in, from the SAME reading whose `ok` gates this whole struct plus
+			// one memory.high read and the same /proc/meminfo pair the ceiling
+			// subsystem samples. Nothing here feeds an admission decision.
+			//
+			// Withheld ENTIRELY in shim mode: the host's /proc/meminfo is not
+			// namespaced to the container (readShimMemory documents the same
+			// trap), so publishing host MemTotal beside an advisory container
+			// budget would present a frame nobody measured. Its absence is what
+			// makes the renderer say "unevaluated" instead of drawing a bar.
+			if !s.shimMode() {
+				sliceHigh, sliceHighState := s.memoryHighReader()(path)
+				memTotal, memTotalOK := s.memTotalReader()()
+				memAvailable, memAvailableOK, _ := s.memAvailableReader()()
+				result.SliceReserve.SliceCurrentBytes = sliceCurrent
+				result.SliceReserve.SliceReclaimableBytes = sliceReclaimable
+				result.SliceReserve.SliceMaxBytes = maximum
+				result.SliceReserve.SliceHighBytes = sliceHigh
+				result.SliceReserve.SliceHighState = sliceHighState
+				result.SliceReserve.CeilingEffectiveBytes = sliceCeilingReportedEffective(ceiling, ceilingMaximum)
+				// Each meminfo figure is published only if IT was established:
+				// a failed MemAvailable read must not also erase a MemTotal the
+				// same pass did establish, and a zero here is an absence the
+				// renderer refuses to draw rather than a machine with no RAM.
+				if memTotalOK {
+					result.SliceReserve.SystemMemTotalBytes = memTotal
+				}
+				if memAvailableOK {
+					result.SliceReserve.SystemMemAvailableBytes = memAvailable
+				}
 			}
 			// AIRA-121. The advisory wording travels on the SAME line as the
 			// numbers it qualifies. Without it a shim reserve summary is

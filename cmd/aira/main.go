@@ -164,6 +164,30 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for tui", Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
 		return render(response, true, stdout, stderr)
 	}
+	// AIRA-127. `aira top` is handled HERE, before project discovery, because it
+	// resolves no project: confine state is machine-wide and `confine --list`
+	// needs none. Routing it through the scope resolution below would make a
+	// machine-wide monitor refuse to start outside an AIRA project — which is
+	// most of the directories an operator watching the slice is standing in.
+	if verb == "top" {
+		if jsonOutput {
+			response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for top", Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
+			return render(response, true, stdout, stderr)
+		}
+		if len(positional) != 0 {
+			response := core.Response{Code: "E_SELECTOR_INVALID", Error: "E_SELECTOR_INVALID: top accepts no positional arguments", Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
+			return render(response, renderJSON, stdout, stderr)
+		}
+		dispatcher := injected
+		if dispatcher == nil {
+			var dispatcherErr error
+			dispatcher, dispatcherErr = newDaemonDispatcher(stdin, io.Discard, io.Discard, false)
+			if dispatcherErr != nil {
+				return render(transportErrorResponse(dispatcherErr), renderJSON, stdout, stderr)
+			}
+		}
+		return runTop(context.Background(), dispatcher, stdin, stdout, stderr)
+	}
 	if verb == "confine" {
 		// AIRA-22: --status joins --list/--kill as a management form. Unlike those
 		// two it is answered LOCALLY rather than through the daemon: it reads a
@@ -663,16 +687,19 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
-		"touch":        {"token": true},
-		"ready":        {"list": true},
-		"find":         {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
-		"req":          {"status": true, "fields": true},
-		"test-report":  {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
-		"spend":        {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
-		"quota":        {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
-		"insights":     {},
-		"lease":        {},
-		"tui":          nil,
+		"touch":       {"token": true},
+		"ready":       {"list": true},
+		"find":        {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
+		"req":         {"status": true, "fields": true},
+		"test-report": {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
+		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
+		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
+		"insights":    {},
+		"lease":       {},
+		"tui":         nil,
+		// AIRA-127. `top` takes no options today; the entry exists so an unknown
+		// one is refused by name rather than silently accepted and discarded.
+		"top":          nil,
 		"commands":     {"by": true},
 		"git":          {},
 		"run-kill":     {"steal": true},

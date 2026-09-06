@@ -198,6 +198,17 @@ func TestShimConfineManagementListsAndRefusesToKill(t *testing.T) {
 	if result.SliceReserve.BudgetSource != runner.ShimBudgetSourceDeclared {
 		t.Fatalf("summary budget source=%q, want %q", result.SliceReserve.BudgetSource, runner.ShimBudgetSourceDeclared)
 	}
+	// AIRA-127. The system frame is WITHHELD in shim mode, and its absence is
+	// load-bearing rather than incidental: the host's /proc/meminfo is not
+	// namespaced to the container, so publishing host MemTotal here would let
+	// `aira top` draw a "total system RAM" bar around an advisory container
+	// budget — a frame nobody measured, presented as a machine.
+	if reserve := result.SliceReserve; reserve.SystemMemTotalBytes != 0 || reserve.SystemMemAvailableBytes != 0 ||
+		reserve.SliceCurrentBytes != 0 || reserve.SliceReclaimableBytes != 0 ||
+		reserve.SliceMaxBytes != 0 || reserve.SliceHighBytes != 0 || reserve.SliceHighState != "" ||
+		reserve.CeilingEffectiveBytes != 0 {
+		t.Fatalf("ci-shim summary carried a system frame: %+v; the host's meminfo is not the container's", reserve)
+	}
 
 	killed := server.confineManagement(t.Context(), core.Request{
 		Verb: "confine-kill", Args: map[string]any{"owner": "session-a", "selector": "gate"},

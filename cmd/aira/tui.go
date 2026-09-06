@@ -31,11 +31,16 @@ const (
 )
 
 type tuiRuntime struct {
-	app                  *tview.Application
-	outerPages           *tview.Pages
-	panelPages           *tview.Pages
-	tabs                 *tview.TextView
-	detachedStatus       *tview.TextView
+	app            *tview.Application
+	outerPages     *tview.Pages
+	panelPages     *tview.Pages
+	tabs           *tview.TextView
+	detachedStatus *tview.TextView
+	topBar         *tview.TextView
+	views          []tuiView
+	// projectless marks a face that resolves NO project/worktree scope (`aira
+	// top`). It changes what the tab line offers, never what a key does.
+	projectless          bool
 	tables               map[tuiView]*tview.Table
 	details              map[tuiView]*tview.TextView
 	footers              map[tuiView]*tview.TextView
@@ -84,6 +89,23 @@ func runTUI(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope
 	return runTUIRuntime(runtime, stderr)
 }
 
+// runTop is AIRA-127's `aira top` face: THIS runtime, this controller, this
+// executor and this palette, restricted to the one project-less panel.
+//
+// It is a separate entry point rather than a separate stack. The verb exists as
+// its own because confine state is machine-wide and `aira confine --list` needs
+// no project, so `aira top` must run where `aira tui` cannot — in any directory,
+// with an empty worktree scope. The same panel is tab 7 of the ordinary
+// dashboard for anyone already in one.
+func runTop(ctx context.Context, dispatcher Dispatcher, stdin io.Reader, stdout, stderr io.Writer) int {
+	runtime := newTopRuntime(ctx, dispatcher, stdin, stdout, stderr, nil)
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
+	return runTUIRuntime(runtime, stderr)
+}
+
 func runTUIRuntime(runtime *tuiRuntime, stderr io.Writer) int {
 	if err := runtime.run(); err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_INTERNAL: tui: %v\n", err)
@@ -93,10 +115,24 @@ func runTUIRuntime(runtime *tuiRuntime, stderr io.Writer) int {
 }
 
 func newTUIRuntime(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
+	return newTUIRuntimeForViews(parent, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, screen, allViews, dataViews, true)
+}
+
+// newTopRuntime builds the `aira top` runtime: one panel, no project scope, no
+// foreground execute (every execute verb resolves a project), and no event-watch
+// loop (there is no project to watch).
+func newTopRuntime(parent context.Context, dispatcher Dispatcher, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
+	runtime := newTUIRuntimeForViews(parent, dispatcher, nil, daemon.WorktreeScope{}, stdin, stdout, stderr, screen, topOnlyViews, nil, false)
+	runtime.projectless = true
+	return runtime
+}
+
+func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen, views, data []tuiView, watch bool) *tuiRuntime {
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &tuiRuntime{
-		app: tview.NewApplication(), state: newTUIState(512), descriptors: core.New(nil).DispatchDescriptors(),
+		app: tview.NewApplication(), state: newTUIStateForViews(512, views, data), descriptors: core.New(nil).DispatchDescriptors(),
 		ctx: ctx, cancel: cancel, pumpDone: make(chan struct{}), coordDone: make(chan struct{}),
+		views:  append([]tuiView(nil), views...),
 		tables: make(map[tuiView]*tview.Table), details: make(map[tuiView]*tview.TextView), footers: make(map[tuiView]*tview.TextView),
 		executeDispatcher: executeDispatcher, canExecute: executeDispatcher != nil, scope: scope,
 		stdin: stdin, stdout: stdout, stderr: stderr,
@@ -105,16 +141,23 @@ func newTUIRuntime(parent context.Context, dispatcher, executeDispatcher Dispatc
 	if screen != nil {
 		runtime.app.SetScreen(screen)
 	}
-	runtime.executor = newTUIExecutor(ctx, dispatcher, executeDispatcher, scope, 4)
+	runtime.executor = newTUIExecutorWithWatch(ctx, dispatcher, executeDispatcher, scope, 4, watch)
 	runtime.buildWidgets()
 	runtime.suspend = runtime.app.Suspend
 	return runtime
 }
 
 func (r *tuiRuntime) run() error {
-	for _, view := range dataViews {
+	for _, view := range tuiDataViews(r.state) {
 		var commands []tuiCmd
 		r.state, commands = requestPanelRefresh(r.state, view)
+		r.submitCommands(commands)
+	}
+	// The top panel is not a data view (no AIRA mutation invalidates it), so it
+	// is started here only when it is the view actually on screen.
+	if r.state.Active == viewTop {
+		var commands []tuiCmd
+		r.state, commands = requestPanelRefresh(r.state, viewTop)
 		r.submitCommands(commands)
 	}
 	r.render()
@@ -129,7 +172,7 @@ func (r *tuiRuntime) run() error {
 func (r *tuiRuntime) buildWidgets() {
 	r.tabs = tview.NewTextView().SetDynamicColors(true)
 	r.panelPages = tview.NewPages()
-	for _, view := range allViews {
+	for _, view := range r.runtimeViews() {
 		if view == viewInsights {
 			r.insights = tview.NewTextView().SetWrap(true)
 			r.insights.SetBorder(true).SetTitle(" Insight gauges ")
@@ -154,6 +197,19 @@ func (r *tuiRuntime) buildWidgets() {
 		footer := tview.NewTextView().SetWrap(false)
 		r.footers[view] = footer
 		var content tview.Primitive
+		if view == viewTop {
+			// The bar sits ABOVE the process list and shares its colours, which is
+			// requirement 6 made visible: one glance maps a coloured span to the row
+			// that owns it.
+			r.topBar = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+			r.topBar.SetBorder(true).SetTitle(" System RAM ")
+			content = tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(r.topBar, 7, 0, false).
+				AddItem(table, 0, 1, true).
+				AddItem(footer, 1, 0, false)
+			r.panelPages.AddPage(string(view), content, true, false)
+			continue
+		}
 		if view == viewTickets || view == viewFindings {
 			detail := tview.NewTextView().SetWrap(true).SetScrollable(true)
 			detail.SetBorder(true).SetTitle(" Detail ")
@@ -167,9 +223,17 @@ func (r *tuiRuntime) buildWidgets() {
 		r.panelPages.AddPage(string(view), content, true, false)
 	}
 	r.detachedStatus = tview.NewTextView().SetWrap(true)
+	// The detached-run status strip only ever carries text a foreground/detached
+	// execute produced, so a face with no execute dispatcher (`aira top`) gives it
+	// no rows rather than two permanently blank ones. The widget still exists, so
+	// render's unconditional SetText stays valid.
+	detachedRows := 2
+	if !r.canExecute {
+		detachedRows = 0
+	}
 	dashboard := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(r.tabs, 1, 0, false).
-		AddItem(r.detachedStatus, 2, 0, false).
+		AddItem(r.detachedStatus, detachedRows, 0, false).
 		AddItem(r.panelPages, 0, 1, true)
 	r.paletteList = r.makePaletteList()
 	r.outerPages = tview.NewPages().
@@ -361,19 +425,42 @@ func (r *tuiRuntime) coordinateShutdown() {
 	r.app.Stop()
 }
 
+// runtimeViews is the view set this runtime was built for, defaulting to the
+// full dashboard so a zero-value runtime (tests) behaves as before.
+func (r *tuiRuntime) runtimeViews() []tuiView {
+	if len(r.views) == 0 {
+		return allViews
+	}
+	return r.views
+}
+
 func (r *tuiRuntime) render() {
-	tabNames := make([]string, 0, len(allViews))
-	for index, view := range allViews {
+	views := r.runtimeViews()
+	tabNames := make([]string, 0, len(views))
+	for index, view := range views {
 		name := fmt.Sprintf("%d:%s", index+1, strings.Title(string(view))) //nolint:staticcheck
 		if view == r.state.Active {
 			name = "[black:white] " + name + " [-:-]"
 		}
 		tabNames = append(tabNames, name)
 	}
-	r.tabs.SetText(strings.Join(tabNames, "  ") + "    r refresh  : palette  x execute  q quit")
+	// Advertise only the keys this face can act on. `aira top` resolves no
+	// project, so every palette verb and every execute verb would reach the daemon
+	// with an empty scope and be refused; naming them on the tab line would be
+	// offering doors that lead nowhere. Both keys still WORK — pressing one gets
+	// the refusal in words, on the same rule as
+	// TestTUIExecuteCapabilityAbsentIsVisible — they are simply not offered.
+	keys := "    r refresh  : palette  x execute  q quit"
+	switch {
+	case r.projectless:
+		keys = "    r refresh  q quit"
+	case !r.canExecute:
+		keys = "    r refresh  : palette  q quit"
+	}
+	r.tabs.SetText(strings.Join(tabNames, "  ") + keys)
 	r.detachedStatus.SetText(r.state.DetachedReport)
 	r.panelPages.SwitchToPage(string(r.state.Active))
-	for _, view := range allViews {
+	for _, view := range views {
 		if view == viewInsights {
 			r.renderInsights(r.state.Panels[view])
 			continue
@@ -382,8 +469,100 @@ func (r *tuiRuntime) render() {
 		if view == viewEvents {
 			model = eventViewModel(r.state.Events)
 		}
+		if view == viewTop {
+			r.renderTopBar(model.Bar, r.state.Panels[view])
+		}
 		r.renderTable(view, model, r.state.Panels[view])
 	}
+}
+
+// renderTopBar paints the system-RAM bar. It is a THIN face over the model:
+// every width, offset and colour was decided by topBarCells/topBarFor, so what
+// is asserted in tests is what reaches the terminal.
+//
+// A bar the model could not evaluate prints its reason. It never prints an empty
+// bar, which would state that the machine is idle.
+func (r *tuiRuntime) renderTopBar(bar *topBar, panel panelState) {
+	if r.topBar == nil {
+		return
+	}
+	var out strings.Builder
+	if panel.Status == panelError {
+		fmt.Fprintf(&out, "ERROR %s\n", panel.ErrorCode)
+	}
+	switch {
+	case bar == nil:
+		out.WriteString("loading…")
+	case !bar.Evaluated:
+		fmt.Fprintf(&out, "UNEVALUATED: %s", bar.Reason)
+	default:
+		_, _, width, _ := r.topBar.GetInnerRect()
+		if width < topBarMinColumns {
+			// REFUSE rather than truncate. A bar drawn wider than the panel is
+			// clipped at the right edge, which silently removes the out-of-slice
+			// region and turns a full machine into an empty one on screen.
+			fmt.Fprintf(&out, "terminal too narrow for the bar (%d columns, %d needed)", width, topBarMinColumns)
+			r.topBar.SetText(out.String())
+			return
+		}
+		cells := topBarCells(bar, width)
+		for _, cell := range cells {
+			switch {
+			case cell.Marker != "":
+				fmt.Fprintf(&out, "[%s]%s[-]", topColourMarker, topMarkerGlyph(cell.Marker))
+			case cell.Colour != "":
+				fmt.Fprintf(&out, "[%s]█[-]", cell.Colour)
+			default:
+				out.WriteString(" ")
+			}
+		}
+		out.WriteString("\n")
+		fmt.Fprintf(&out, "total %s | reserved %s | rest of system %s | free %s\n",
+			formatReserveBytes(bar.TotalBytes), formatReserveBytes(bar.ClaimedBytes),
+			topOutsideText(bar), formatReserveBytes(bar.FreeBytes))
+		out.WriteString(topMarkerLegend(bar))
+		if bar.Overcommitted {
+			out.WriteString("\nOVER-SUBSCRIBED: reservations plus out-of-slice usage exceed total RAM")
+		}
+		for _, note := range bar.Notes {
+			out.WriteString("\n" + note)
+		}
+	}
+	r.topBar.SetText(out.String())
+}
+
+// topBarMinColumns keeps the bar honest on a very narrow terminal: below this,
+// a single column would stand for several gigabytes and every small reservation
+// would round away to nothing.
+const topBarMinColumns = 20
+
+func topMarkerGlyph(name string) string {
+	switch name {
+	case topMarkerSoft:
+		return "┊"
+	case topMarkerCeiling:
+		return "╎"
+	default:
+		return "│"
+	}
+}
+
+func topMarkerLegend(bar *topBar) string {
+	if len(bar.Markers) == 0 {
+		return "no slice limit could be established"
+	}
+	parts := make([]string, 0, len(bar.Markers))
+	for _, marker := range bar.Markers {
+		parts = append(parts, fmt.Sprintf("%s %s %s", topMarkerGlyph(marker.Name), marker.Label, formatReserveBytes(marker.Bytes)))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func topOutsideText(bar *topBar) string {
+	if !bar.OutsideKnown {
+		return "unevaluated"
+	}
+	return formatReserveBytes(bar.OutsideBytes)
 }
 
 func (r *tuiRuntime) renderTable(view tuiView, model panelModel, panel panelState) {
@@ -402,6 +581,12 @@ func (r *tuiRuntime) renderTable(view tuiView, model panelModel, panel panelStat
 				tableCell.SetTextColor(tcell.ColorRed)
 			case "stale":
 				tableCell.SetTextColor(tcell.ColorOrange)
+			}
+			// An explicit row colour wins (AIRA-127). It comes from the SAME
+			// topSlotColour lookup the bar region uses, so the row and its span
+			// cannot drift apart.
+			if row.Colour != "" {
+				tableCell.SetTextColor(tcell.GetColor(row.Colour))
 			}
 			table.SetCell(rowIndex+1, column, tableCell)
 		}

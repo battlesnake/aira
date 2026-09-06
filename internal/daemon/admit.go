@@ -2862,6 +2862,32 @@ func readSliceMemoryUsage(path string) (cur, max, reclaimable int64, ok bool, re
 	return current, limit, reclaimable, true, ""
 }
 
+// readSliceMemoryHigh reads a cgroup's memory.high SOFT limit for AIRA-127's
+// operator surface. It is a REPORTING read and nothing else: no admission
+// decision consults memory.high, which is reclaim pressure rather than a bound.
+//
+// It returns three distinguishable outcomes and never collapses them, because
+// they call for different words on the bar. A parsed number is "set". The
+// literal `max` is "none" — a POSITIVE fact that no soft limit is configured,
+// which is the normal state of an aira.slice installed without --memory-high.
+// An unreadable or unparsable file is "unevaluated", and its zero must never be
+// drawn as a limit sitting at the bar's origin.
+func readSliceMemoryHigh(path string) (int64, string) {
+	data, err := os.ReadFile(filepath.Join(path, "memory.high"))
+	if err != nil {
+		return 0, runner.ConfineSliceHighUnevaluated
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "max" {
+		return 0, runner.ConfineSliceHighNone
+	}
+	value, valid := parseAdmitMemory([]byte(text))
+	if !valid {
+		return 0, runner.ConfineSliceHighUnevaluated
+	}
+	return value, runner.ConfineSliceHighSet
+}
+
 // parseSliceMemoryStat returns the file-LRU reclaimable total — AIRA-21's
 // admission discount, whose meaning is unchanged — and, SEPARATELY,
 // slab_reclaimable.

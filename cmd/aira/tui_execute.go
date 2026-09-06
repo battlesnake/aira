@@ -167,7 +167,7 @@ func onExecuteComplete(state tuiState) tuiState {
 func onExecuteResume(state tuiState) (tuiState, []tuiCmd) {
 	state = cloneTUIState(state)
 	var commands []tuiCmd
-	for _, view := range dataViews {
+	for _, view := range tuiDataViews(state) {
 		var refresh []tuiCmd
 		state, refresh = requestPanelRefresh(state, view)
 		commands = append(commands, refresh...)

@@ -816,3 +816,20 @@ func sliceCeilingWouldBeBytes(snapshot sliceCeilingSnapshot, effectiveMaximum, h
 	}
 	return subtractFloor(wouldBe, headroom)
 }
+
+// sliceCeilingReportedEffective is AIRA-127's bar marker: the ceiling admission
+// ACTUALLY USES, before the per-job headroom CeilingBytes subtracts. Zero when
+// the subsystem is off, which is an absence and must render as one.
+//
+// Deliberately NOT the observe-mode counterfactual. A marker drawn on an
+// operator's bar has to show the capacity a launch will really meet, and observe
+// mode applies nothing — so there the applied ceiling IS the slice's own
+// memory.max and the marker coincides with the hard limit, which is the truth.
+// CeilingWouldBeBytes beside it on the wire carries the counterfactual that the
+// observe-then-enforce rollout needs, and the two must not be conflated.
+func sliceCeilingReportedEffective(snapshot sliceCeilingSnapshot, effectiveMaximum int64) int64 {
+	if snapshot.Mode == "" {
+		return 0
+	}
+	return effectiveMaximum
+}
