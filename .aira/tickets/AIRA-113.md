@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-113","project":"aira","title":"Dynamic per-scope oom_score_adj steering for the residual aggregate-full slice OOM","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","scheduler"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-113","project":"aira","title":"Dynamic per-scope oom_score_adj steering for the residual aggregate-full slice OOM","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","scheduler"],"hold":false,"relations":[]}
 ---
 Deferred from AIRA-29 (dynamic reserve), with reasoning recorded in
 `docs/superpowers/specs/2026-09-06-aira29-dynamic-reserve-plan.md` §3.6 and endorsed at P2
@@ -34,3 +34,113 @@ FEASIBLE; the reason to defer is proportionality, not permission.
 
 Revisit if the residual aggregate-full slice OOM is ever observed in the field picking a
 compliant victim.
+
+## Resolution (in-review)
+
+Built per AIRA-29 §3.6, sequenced after AIRA-114's aggregate bound. Branch
+`aira113-dynamic-oom-score-steering`, off `ba83566`.
+
+### What the mechanism actually is
+
+A daemon subsystem (`internal/daemon/oomsteer.go`) on its own **250 ms** cadence. Each tick
+it reads the slice's `memory.current` and `memory.stat` and asks one question: is the
+aggregate genuinely full? Only when it is does it snapshot the admission ledger, read one
+`memory.current` per charged scope, and raise a scope whose live usage is past its ledger
+charge to `oom_score_adj` 1000 — restoring it to its AIRA-27 class baseline when it comes
+back inside its charge, when the slice drains, or when it leaves the ledger.
+
+The cadence is the reason this could not be a term in `evaluateAdmitQueue`, exactly as §3.6
+said: inside that pass the charge is derived from the same reading the trigger would use, so
+the trigger is near-inert there. `AIRA_DAEMON_OOM_STEER_INTERVAL` therefore **refuses** any
+value at or above `admitConfineScanIntervalDefault` rather than accepting a cadence the loop
+cannot outrun, and a test pins that.
+
+### The arithmetic that makes this worth building
+
+`oom_score_adj` is worth `adj/1000` of MACHINE total in kernel badness. On a 64 GiB box the
+delegate class's 800 outweighs the non-delegate 500 by ~19 GiB of virtual badness, so a
+compliant `--delegate-ram` suite at 20 GiB (score 71) outscores a non-delegate job that has
+burst to 30 GiB past what admission accounts for (score 62) — the kernel kills the
+COMPLIANT neighbour. At 1000 the offender scores 94 and is picked. The static class bias
+alone cannot express "this one is the offender", which is why a graduated or class-preserving
+band was rejected: a raise that stays under the neighbouring class's baseline cannot flip the
+victim, and flipping the victim is the whole requirement.
+
+### Decisions taken, with reasons
+
+1. **Two-level, not proportional.** The kernel already ranks by RSS; the adj only has to
+   lift a proven offender above the compliant band, after which the kernel's own RSS
+   ordering breaks ties between offenders. A proportional curve is more machinery for a
+   weaker steer.
+2. **Never below a scope's own class baseline**, whatever `steeredAdj` is configured to.
+   AIRA-27's bias is containment this may sharpen and must never weaken; a misconfigured
+   steer value under a class baseline is clamped up, not applied, and a test pins it.
+3. **Fullness on the NON-reclaimable footprint** (`sliceCeilingAnon`), not raw
+   `memory.current`: page cache is dropped before any OOM, so steering on raw usage would
+   raise the adj of healthy jobs during every large build. With hysteresis (90% enter, 80%
+   exit) so a scope cannot flap between 500 and 1000 several times a second.
+4. **Against the kernel-enforced `memory.max`, deliberately NOT `admitEffectiveMaximum`.**
+   AIRA-103's published ceiling is a figure admission believes in; the OOM this steers is a
+   kernel event at the real cap. The two gates measure different things and are allowed to
+   disagree here.
+5. **The budget sums an aitest parent's `confine-reserve` children into the parent.** A
+   `--delegate-ram` suite's own waiter charges the pinned framework overhead while its
+   `memory.current` is HIERARCHICAL and already contains everything its per-test
+   sub-reservations allocated. Without this the most compliant job on the machine reads as
+   the offender on every full slice — the AIRA-29 build-review double-book, from the other
+   direction. Pinned by its own test and its own mutant.
+6. **Recursive subtree walker** (`runner.SetSubtreeOOMScoreAdj`), because `Members()` is
+   leaf-only and cgroup-v2's no-internal-process rule means a scope with children has no
+   pids of its own — a leaf-only walker would steer exactly zero processes for the aitest
+   population most likely to be over-committing. Real-cgroup test with processes in the
+   scope root, a child and a grandchild.
+7. **PID-reuse guard**: each write re-checks `/proc/<pid>/cgroup` for the scope directory as
+   a whole path element before writing, so a pid recycled between the `cgroup.procs` read
+   and the write is skipped rather than handed a 1000 it never earned. Fail-closed.
+8. **Modes off/observe/enforce, default OFF**, like the watchdog and the slice ceiling: this
+   writes `/proc` for processes it does not own, so "off is exactly today's behaviour" must
+   stay true, and a malformed interval must not refuse to start a daemon that never asked
+   for the subsystem. **Deploy is the coordinating session's, not this build's.**
+
+### Tests
+
+The load-bearing one is `TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender`: a real
+cgroup-v2 slice with a real `memory.max`, two real `.aira-CONFINE-*` scopes of DIFFERENT
+AIRA-27 classes, real allocating processes placed before they allocate, the production
+readers, the production ledger snapshot and the production `/proc` walker. The scenario is
+stacked AGAINST the fix — the compliant neighbour is the BIGGER scope — and the BEFORE state
+is read out of `/proc` and shown to favour the compliant one, so the AFTER assertion is not a
+tautology. It then asserts the restore against the same live processes.
+
+Everything else is the seam tier plus a real-cgroup walker test. **Mutation battery: 18
+deliberate breakages, 18 caught, 0 survivors.** The battery found one genuine gap — removing
+the PID-reuse guard failed no test — fixed by a second commit rather than written down as
+accepted.
+
+### Residuals, stated rather than papered over
+
+- Adopted (post-daemon-restart) scopes are not steered: the ledger keeps them as an
+  aggregate, not per scope, and an adopted scope's charge is re-derived from its own
+  `memory.current` every pass, so it cannot read as over-budget by construction.
+- A scope raised and still alive when the daemon stops keeps 1000 for the rest of its life.
+  Safe direction (it demonstrably outran its accounting), but a real asymmetry.
+- A scope whose charge is still its frozen estimate rather than an observation can read as
+  over-budget while it ramps — the sub-second window between a grant and the first
+  admission scan. Self-corrects within one scan interval, and both the raise and the restore
+  are logged.
+- Only the default confine slice is steered, exactly as AIRA-103's ceiling governs only that
+  one.
+
+### Deferred, deliberately
+
+No `aira install --oom-steer` flag or doctor line was added, unlike `--watchdog` and
+`--slice-ceiling`. The subsystem ships default-off and an operator enables it with a systemd
+drop-in — which, per AIRA-111, actually SURVIVES a later `aira install` where a baked unit
+value does not. Adding the flag means the unit template, the doctor report and their tests,
+and belongs to the rollout change rather than this one.
+
+### Verification
+
+- `aira confine -- go build ./...` — exit 0
+- `aira confine -- go vet ./...` — exit 0
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0

@@ -1508,7 +1508,7 @@ func TestConfineOOMScoreAdjBiasDocumentsFanoutBoundary(t *testing.T) {
 	score := func(rss int64, adj int) int64 {
 		return rss + int64(adj)*total/1000
 	}
-	nonDelegate, delegate := confineOOMScoreAdj, confineDelegateOOMScoreAdj
+	nonDelegate, delegate := ConfineOOMScoreAdj, ConfineDelegateOOMScoreAdj
 	if delegate <= nonDelegate || nonDelegate <= 0 {
 		t.Fatalf("oom score ordering delegate=%d non-delegate=%d", delegate, nonDelegate)
 	}

@@ -261,6 +261,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	steerMode, steerInterval, err := oomSteerConfigFromEnv()
+	if err != nil {
+		return err
+	}
 	watchPollInterval, err := watchPollIntervalFromEnv()
 	if err != nil {
 		return err
@@ -450,6 +454,23 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(sliceCeilingDone)
 		s.runSliceCeiling(sliceCeilingCtx, sliceCeilingMode, sliceCeilingInterval, sliceCeilingRuntimeDeps)
 	}()
+	// AIRA-113. The dynamic oom_score_adj steering loop. Deliberately NOT beside
+	// the two above on their shared cadence: it must sample faster than the
+	// admission charge refresh to see the burst the ledger has not yet absorbed,
+	// which is the whole reason AIRA-29 could not fold it into the admit scan.
+	// Like the ceiling it holds no admission lock while it works, and unlike the
+	// watchdog it never signals anything -- it only changes which process the
+	// kernel would prefer if an OOM happened anyway.
+	steerCtx, cancelOOMSteer := context.WithCancel(ctx)
+	steerDone := make(chan struct{})
+	steerRuntimeDeps := oomSteerDeps{}
+	if steerMode != oomSteerOff {
+		steerRuntimeDeps = realOOMSteerDeps(s)
+	}
+	go func() {
+		defer close(steerDone)
+		s.runOOMSteer(steerCtx, steerMode, steerInterval, steerRuntimeDeps)
+	}()
 
 	var connections sync.WaitGroup
 	stopping := make(chan struct{})
@@ -486,6 +507,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelScopeReaper()
 	cancelWatchdog()
 	cancelSliceCeiling()
+	cancelOOMSteer()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
@@ -497,6 +519,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		<-scopeReaperDone
 		<-watchdogDone
 		<-sliceCeilingDone
+		<-steerDone
 		close(drained)
 	}()
 	timeout := s.DrainTimeout
