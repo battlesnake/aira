@@ -132,6 +132,24 @@ Unevaluated renders as `unevaluated / … (not applied while unevaluated)`, neve
 measured `0B`; a disabled bound prints nothing at all. The daemon logs the bound as a
 TRANSITION only (the evaluator runs at up to 4/s).
 
+Two honest limits of that line, both raised by the build review and both stated here
+rather than rounded off:
+
+- A queue exists only while it has waiters, so once the last one leaves and the queue
+  is dropped (`pruneAdmitQueue`) the aggregate reports `unevaluated` even if orphan or
+  flock-fallback scopes are still live on the slice. That follows the pre-existing
+  absent-queue convention (`adopted` reads 0 there too), but the `(not applied while
+  unevaluated)` suffix is slightly stronger than the truth in that state: nothing is
+  gated because nothing is asking, and the bound IS applied on the first evaluator pass
+  after a waiter arrives. Documented rather than given its own machinery.
+- A waiter refused by this bound arms the AIRA-59 fairness freeze exactly as a
+  reserve-refused head does, and `if frozen { continue }` precedes the sub-reservation
+  exemption. So per-test sub-reservations queued behind an aggregate-blocked head are
+  frozen for the hold phase even though only their own suite's EXIT relieves the bound.
+  Bounded by the duty cycle's yield phase and identical to the pre-existing behaviour
+  for a reserve-blocked head — not a regression from this change, and not fixed here,
+  but a real interaction and named as one.
+
 ### Tests
 
 `internal/daemon/admit_oversubscription_test.go` (13 tests, exact assertions, each
@@ -173,3 +191,82 @@ guard; removing BOTH lower bounds was then caught, so the rule is genuinely pinn
   reserve-accounting change in the tightening direction and is untouched here; the
   cap accounting has its own liveness reading precisely so the two need not move
   together.
+
+## Build-review round 2 — BLOCK on porous operator-surface tests, fixed
+
+The first review confirmed the admission logic itself as sound and non-porous (12/12
+of its own real mutants caught, the real-cgroup anti-INERT test observed running
+rather than skipping) but BLOCKed on the OPERATOR-SURFACE plumbing this change adds:
+`queue → admitSnapshot → ConfineSliceReserve.CapAggregate{Bytes,Known}` had no test
+that could fail. Three findings, all in the test tier; **no production code changed
+in this round.**
+
+1. **Vacuous assertion** (`admit_oversubscription_test.go`, the snapshot claim in
+   `TestAggregateUnestablishedWithholdsNothing`). It snapshotted a hand-built queue
+   that was never put in `s.admitQueues`, and `admitSliceSnapshotFor` returns
+   `admitSnapshot{phase}` for an absent path — so `capAggregateKnown` was false BY
+   CONSTRUCTION and the assertion could not fail against any implementation.
+2. **`admit.go`'s snapshot copy untested.** Deleting
+   `capAggregate: queue.capAggregate, capAggregateKnown: queue.capAggregateKnown`
+   left the full `internal/daemon` package GREEN (verified: mutant survived, exit 0).
+3. **`confine_manage.go`'s wire copy untested, one layer up.** Hardcoding
+   `CapAggregateKnown: false` also left the full package green (verified, exit 0),
+   because both existing arms of `TestConfineListSliceReserveSummary` pin only the
+   default-FALSE fixture.
+
+The consequence was concrete and is why a porous test was the right call to block on:
+with either mutant live, `aira confine --list` prints `slice scope caps: unevaluated /
+… (not applied while unevaluated)` permanently WHILE the bound is refusing launches.
+An operator debugging a wait would read the exact opposite of the truth — the AIRA-71
+silent-wait failure with a false statement attached instead of a missing one.
+
+### What was done
+
+- `registerAdmitQueue` helper puts a hand-built queue into `s.admitQueues` under
+  `s.admitRegistryMu`, the lock the daemon itself uses.
+- `TestAggregateUnestablishedWithholdsNothing` now registers its queue and asserts
+  `snapshot.present` FIRST. That guard is the load-bearing half: it is what excludes
+  the absent-queue zero, so the unestablished-bit claim beside it is a reading of a
+  real queue rather than a tautology.
+- New `TestSnapshotCarriesTheEstablishedAggregate` is the POSITIVE arm the negative
+  one structurally cannot be (`known == false` is also what a build that never copied
+  the field reports). It runs an establishing scan on a registered queue and asserts
+  the EXACT total across both contributing arms of `aggregateScopeCap` —
+  30 GiB scan-visible leaf-drained + 10 GiB connection-held-but-unscanned = 40 GiB —
+  so a snapshot that copied only one arm, or a stale zero, fails too.
+- New `TestConfineListSliceReserveSummary/aggregate-established` drives the same
+  property to the WIRE struct through the real `confine-list` handler, after a real
+  `evaluateAdmitQueue` pass, asserting `CapAggregateKnown: true` AND
+  `CapAggregateBytes: 30 GiB` under the arm's full `reflect.DeepEqual`. It carries its
+  own fixture because a real evaluator pass changes adoption and charge state the
+  shared expectations do not describe. Its scan record is LEAF-DRAINED, which keeps
+  every other wire field at its idle value so the aggregate is the single thing the
+  arm changes — and incidentally exercises the subtree-live reading at the operator
+  surface.
+- Both non-blocking review observations (queue-dropped `unevaluated` wording; the
+  AIRA-59 freeze over sub-reservations behind an aggregate-blocked head) are written
+  into **Operator surface** above.
+
+### Round-2 mutation battery — 5 breakages, 5 caught, 0 survivors
+
+Every mutant applied to production code, then reverted; the two the reviewer PROVED
+survive were re-run against the **full** `internal/daemon` package, not a `-run`
+subset.
+
+| # | Mutation | Scope run | Result |
+|---|----------|-----------|--------|
+| 1 | delete the `capAggregate/capAggregateKnown` copy in `admit.go` | full package | **caught** (exit 1) — `TestSnapshotCarriesTheEstablishedAggregate` + `…/aggregate-established` |
+| 2 | `CapAggregateKnown: false` hardcoded in `confine_manage.go` | full package | **caught** (exit 1) — `…/aggregate-established` |
+| 3 | `CapAggregateBytes: 0` hardcoded on the wire | targeted | **caught** (exit 1) |
+| 4 | `capAggregate: 0` in the snapshot, bit left correct | targeted | **caught** (exit 1) by both new tests |
+| 5 | `capAggregateKnown: true` hardcoded in the snapshot | targeted | **caught** (exit 1) — proves the unestablished arm is no longer vacuous |
+
+Plus a test-of-the-test: removing the `registerAdmitQueue` call makes
+`TestAggregateUnestablishedWithholdsNothing` fail on its own `present` guard, so the
+registration is demonstrably load-bearing rather than decorative.
+
+### Round-2 exit codes
+
+- `aira confine -- go build ./...` → 0
+- `aira confine -- go vet ./...` → 0
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` → 0

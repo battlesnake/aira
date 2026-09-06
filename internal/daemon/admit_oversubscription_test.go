@@ -312,6 +312,7 @@ func TestAggregateUnestablishedWithholdsNothing(t *testing.T) {
 		staticScan(oversubRecord("CONFINE-hog-1-a", gib, 100*gib), opaque))
 	waiter := queuedScopeWaiter(1, "CONFINE-newcomer-1-a", 40*gib, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{waiter}}
+	registerAdmitQueue(server, queue)
 
 	server.evaluateAdmitQueue(queue)
 
@@ -321,8 +322,89 @@ func TestAggregateUnestablishedWithholdsNothing(t *testing.T) {
 	if waiter.state != admitGranted {
 		t.Fatalf("the bound must withhold nothing while the aggregate is unestablished (state=%v)", waiter.state)
 	}
-	if snapshot := server.admitSliceSnapshot("/slice"); snapshot.capAggregateKnown {
+	snapshot := server.admitSliceSnapshot("/slice")
+	// `present` first, and it is the load-bearing half of this assertion. An
+	// ABSENT queue returns admitSnapshot{phase} — capAggregateKnown false by
+	// construction — so without this line the claim below would hold against
+	// every possible implementation, including one that never copied the bit at
+	// all. It is asserted here, and the established value is asserted in
+	// TestSnapshotCarriesTheEstablishedAggregate, because a false bit alone
+	// cannot distinguish "copied and false" from "never copied".
+	if !snapshot.present {
+		t.Fatal("test wiring: the queue must be REGISTERED, or the snapshot's unestablished bit is an absent-queue zero and proves nothing")
+	}
+	if snapshot.capAggregateKnown {
 		t.Fatal("the snapshot must carry the unestablished bit so no surface renders the total as a fact")
+	}
+}
+
+// registerAdmitQueue puts a hand-built queue into the server's registry under
+// the lock the daemon itself uses, so admitSliceSnapshot resolves it instead of
+// returning the absent-queue zero.
+func registerAdmitQueue(server *Server, queue *sliceQueue) {
+	server.admitRegistryMu.Lock()
+	server.admitQueues[queue.path] = queue
+	server.admitRegistryMu.Unlock()
+}
+
+// TestSnapshotCarriesTheEstablishedAggregate is the POSITIVE arm of the
+// snapshot plumbing, and it exists because the unestablished arm above cannot
+// be it: `capAggregateKnown == false` is also what a build that never copied
+// the field at all would report.
+//
+// The path under test is queue -> admitSnapshot, which is what every operator
+// surface reads (`confine --list` renders it one layer further out, pinned by
+// TestConfineListSliceReserveSummary/aggregate-established). Deleting the
+// snapshot's `capAggregate/capAggregateKnown` copy leaves `confine --list`
+// permanently printing "slice scope caps: unevaluated ... (not applied while
+// unevaluated)" WHILE the bound is being enforced — a false operator statement
+// of exactly the silent-wait class AIRA-71 was raised for. This test is what
+// makes that deletion fail.
+//
+// Both contributing arms of aggregateScopeCap are present and the total is
+// stated EXACTLY, so a snapshot that copied only one of them, or copied a
+// stale zero, is caught too:
+//
+//	scan-visible, not connection-held   a leaf-drained suite scope, 30 GiB cap
+//	connection-held, not yet scanned    a granted waiter, 10 GiB prospective cap
+func TestSnapshotCarriesTheEstablishedAggregate(t *testing.T) {
+	const (
+		sliceMax = 64 * gib
+		suiteCap = 30 * gib
+		heldCap  = 10 * gib
+		total    = suiteCap + heldCap
+	)
+	now := time.Unix(260_000, 0)
+	server := oversubServer(&now, sliceMax, 3*gib, 200,
+		staticScan(leafDrainedRecord("CONFINE-suite-1-a", 2*gib, suiteCap)))
+	// Granted, scope-backed, and deliberately ABSENT from the scan: its cap is
+	// the daemon's own prospective figure, which is the grant -> backend.Create
+	// window this accounting exists to close.
+	held := heldScopeWaiter(1, "CONFINE-held-1-a", heldCap, now.Add(-time.Hour))
+	queue := &sliceQueue{
+		path: "/slice", server: server, waiters: []*admitWaiter{held},
+		outstanding: heldCap, outstandingJobs: 1,
+	}
+	registerAdmitQueue(server, queue)
+
+	server.evaluateAdmitQueue(queue)
+
+	// The queue's own state first, so a failure below is unambiguously the
+	// snapshot copy rather than the accounting the other tests here cover.
+	if !queue.capAggregateKnown || queue.capAggregate != total {
+		t.Fatalf("test premise: queue aggregate = (%d, known=%v), want (%d, true)",
+			queue.capAggregate, queue.capAggregateKnown, int64(total))
+	}
+	snapshot := server.admitSliceSnapshot("/slice")
+	if !snapshot.present {
+		t.Fatal("test wiring: the registered queue was not resolved, so nothing below is a reading of it")
+	}
+	if !snapshot.capAggregateKnown {
+		t.Fatal("an aggregate established by a successful scan must reach the snapshot as ESTABLISHED; rendering it unevaluated would tell an operator the bound is not applied while it is")
+	}
+	if snapshot.capAggregate != total {
+		t.Fatalf("snapshot aggregate = %d, want exactly %d (%d scan-visible + %d connection-held)",
+			snapshot.capAggregate, int64(total), int64(suiteCap), int64(heldCap))
 	}
 }
 
