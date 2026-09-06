@@ -1802,6 +1802,11 @@ func confineUnitDeps(scope *confineFakeScope) confineDeps {
 			return admissionResult{state: "immediate"}, nil
 		},
 		writeOOMGroup: func(Scope) error { return nil },
+		// A fake scope has no cgroup FD, so the production swap-cap writer would
+		// fail closed on EBADF here. Stubbed to the disposition a real capped
+		// scope reports; TestConfineRealScopeBoundsSwapToZero exercises the real
+		// writer against a real cgroup.
+		writeScopeSwapCap: func(Scope) (string, error) { return WorkerAdmitSwapCapEnforced, nil },
 		readCap: func(string) (int64, bool) {
 			return 64 << 30, true
 		},
@@ -2384,6 +2389,7 @@ func TestConfineRealCPUWeightStartsAging(t *testing.T) {
 type confineScopeObservation struct {
 	oomGroup  string
 	cpuWeight string
+	swapMax   string
 }
 
 type confineObservingBackend struct {
@@ -2410,6 +2416,12 @@ func (scope *confineObservingScope) Remove() error {
 	}
 	if data, err := os.ReadFile(filepath.Join(scope.Reference(), "cpu.weight")); err == nil {
 		scope.observation.cpuWeight = strings.TrimSpace(string(data))
+	}
+	// AIRA-110: read while the scope still exists. It is torn down here, so a
+	// test that waited until Confine returned could only assert on a directory
+	// that is already gone.
+	if data, err := os.ReadFile(filepath.Join(scope.Reference(), "memory.swap.max")); err == nil {
+		scope.observation.swapMax = strings.TrimSpace(string(data))
 	}
 	return scope.Scope.Remove()
 }

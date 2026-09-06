@@ -142,6 +142,7 @@ type confineDeps struct {
 	newBackend            func(string) ScopeBackend
 	admit                 func(context.Context, string, ConfineRequest, int64) (admissionResult, error)
 	writeOOMGroup         func(Scope) error
+	writeScopeSwapCap     func(Scope) (string, error)
 	writeScopeMemoryCap   func(Scope, int64, int64, bool) error
 	writeScopeCPUWeight   func(Scope, int64) bool
 	start                 func(*confineCommand) error
@@ -176,6 +177,7 @@ func defaultConfineDeps() confineDeps {
 		newBackend:            newDefaultBackend,
 		admit:                 admitConfine,
 		writeOOMGroup:         writeConfineOOMGroup,
+		writeScopeSwapCap:     writeScopeSwapCap,
 		writeScopeMemoryCap:   writeScopeMemoryCap,
 		writeScopeCPUWeight:   writeScopeCPUWeightFailOpen,
 		start:                 func(command *confineCommand) error { return command.Start() },
@@ -210,6 +212,9 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	}
 	if deps.writeOOMGroup == nil {
 		deps.writeOOMGroup = defaults.writeOOMGroup
+	}
+	if deps.writeScopeSwapCap == nil {
+		deps.writeScopeSwapCap = defaults.writeScopeSwapCap
 	}
 	if deps.writeScopeMemoryCap == nil {
 		deps.writeScopeMemoryCap = defaults.writeScopeMemoryCap
@@ -820,6 +825,32 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, confineUnavailable(sliceName, fmt.Errorf("set memory.oom.group: %w", err))
 	}
 	result.Status.OOMGroup = ConfineOOMGroupSet
+	// AIRA-110. memory.swap.max=0, UNCONDITIONALLY and before any cap decision
+	// below, because cgroup-v2's memory.max bounds memory and not memory+swap: a
+	// scope with only a memory.max is reclaimed into swap instead of being killed
+	// (measured: 512 MiB allocated inside a 32 MiB cap, exit status 0, ~520 MiB
+	// paged out). AIRA's whole job is protecting a shared machine from
+	// uncontrolled memory pressure, and letting a confined job swap defeats it --
+	// swap thrash degrades the WHOLE box worse than a clean in-scope OOM-kill,
+	// and it is invisible to the reserve ledger and to the peak-RSS history that
+	// sizes future reserves. There is deliberately no opt-out flag: a swapping
+	// confined job is never the behaviour this primitive promises.
+	//
+	// Unconditional, rather than paired with the memory.max write further down,
+	// because the cap is conditional (an unpinned, non-daemon-admitted launch is
+	// deliberately left uncapped) while the swap bound is policy for EVERY
+	// confine scope -- an uncapped scope that swaps still evades the slice
+	// accounting and still records a deflated peak.
+	//
+	// Placed immediately after the oom.group write for the ordering reason
+	// writeScopeSwapCap documents: that successful memory.* write is the proof
+	// that this cgroup HAS the memory controller, so a subsequent ENOENT can only
+	// mean the kernel has no swap control rather than no controller at all.
+	swapCap, err := deps.writeScopeSwapCap(scope)
+	if err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("set memory.swap.max: %w", err))
+	}
+	result.Status.ScopeSwapCap = swapCap
 	scopeMemoryMax := request.ScopeMemoryMax
 	admitted := admission.state == "immediate" || admission.state == "waited"
 	// A PINNED reserve is the user's own declared number (--memory-reserve, or
