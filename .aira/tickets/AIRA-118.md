@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-118","project":"aira","title":"TestM20LauncherDefersACKAndBoundsReadiness/handle_before_ack flakes under machine saturation — 1s Eventually budget for a subprocess ACK","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["flake","runner"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-118","project":"aira","title":"TestM20LauncherDefersACKAndBoundsReadiness/handle_before_ack flakes under machine saturation — 1s Eventually budget for a subprocess ACK","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["flake","runner"],"hold":false,"relations":[]}
 ---
 Observed 2026-09-06 in the `pre-push` `make ci` gate for AIRA-73's PR (a change that touches ZERO files in internal/runner).
 
