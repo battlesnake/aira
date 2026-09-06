@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-116","project":"aira","title":"No test proves Serve applies any of the daemon's parsed env settings","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["config","daemon","test-coverage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-116","project":"aira","title":"No test proves Serve applies any of the daemon's parsed env settings","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["config","daemon","test-coverage"],"hold":false,"relations":[]}
 ---
 Found during the AIRA-29 adversarial build review (Sol), then ground-checked. PRE-EXISTING and
 shared by every env setting the daemon parses, not specific to AIRA-29.
@@ -108,3 +108,9 @@ list above.
 - `aira confine -- go vet ./...` — exit 0
 - `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0
   (all 15 packages `ok`)
+
+## Done
+
+Merged via PR #66 as merge commit `f775e73`. Fable build-review independently re-ran the gate
+(build/vet/test all exit 0) and 9 one-line `server.go` mutations (8 drops/cross-wires + an
+uncovered ninth setting + a stale row), all killed.
