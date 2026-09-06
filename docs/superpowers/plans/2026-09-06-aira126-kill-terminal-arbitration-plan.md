@@ -523,4 +523,83 @@ No changes to `internal/codes`, `internal/store`, `internal/core`, or any face:
 `KillIntent` is confined to `internal/runner` and its ledger JSON, and no new
 error code is introduced.
 
+## 12. Gate conditions — amendments made at implementation time
+
+The plan gate returned GATE-PASS-WITH-CONDITIONS. Each condition and how the
+built change satisfies it:
+
+**C1/C2 — the terminal CAS must read the ledger's KillIntent BEFORE the merge.**
+The §4 sketch was a tautology and its pre-merge `record.KillIntent` assignment
+would have clobbered a concurrently-completed intent. Implemented instead as a
+pure rule, `decideNotExecutedDisposition(intentNotExecuted, ledgerErr,
+ledgerIntent, publishedSequence)` in `decisions.go`, evaluated on `latest`
+**before** `mergeEvidence`. `record.KillIntent` is left zero throughout, so the
+merge preserves the ledger's own intent (sequence, requested scope kill) and the
+disposition is the single field the arbitration adds afterwards. A concurrent
+`Completed:true`, a foreign sequence, or a ledger read error all refuse it and
+leave the unchanged reconcile-required arm in charge.
+`TestAIRA126CompletedIntentIsNotDowngradedByNotExecuted` drives a real
+concurrent completion through a live Launch and asserts the ledger, not the
+return path.
+
+**C3 — the spec forbade reading (1) as literally as reading (2).** Amended in
+this PR: runner-lite §6.3 gains clause (5) for an intent that finds nothing to
+signal, plus a note on the `kill_intent` record field. Clauses (3) and (4) are
+unchanged and still govern every intent that has something to signal.
+
+**C4 — §10.3's hermetic tests were not viable as written.** Option (a) is taken,
+with the scope fake rebuilt rather than seeded: `livenessScope.Members()` models
+`cgroup.procs` against real kernel state (a task is a member exactly while its
+`/proc` entry exists with the recorded start tick, so a zombie is still listed
+and a reaped task is not). Launch therefore reaches `scopeVerified == true` and
+appends `running`, and the scope genuinely empties on reap, so `killScope`
+really returns at `len(pids) == 0` with `Started == false`. `startFn` strips
+`UseCgroupFD`. The `readProcStatFn → ESRCH` device is dropped entirely, as the
+condition required.
+
+The remaining problem — that the timer branch versus the wait branch is decided
+by chance — is solved without faking any evidence: `gatedStdin` holds
+`Cmd.Wait()` open past the deadline through its stdin copy goroutine, which
+os/exec joins only *after* reaping. The child really exits, is really reaped and
+the scope really empties before the deadline; only the moment Launch learns of
+the wait outcome is controlled. The timer branch then fires deterministically
+(observed 6/6 iterations), against a genuinely empty scope and a genuinely dead
+leader.
+
+**C5 — non-vacuity.** Both loops count the iterations that actually took the
+timer branch, log the count, and fail if it is zero.
+
+**C6 — bounded receive.** The arbitration receive has its own bound,
+`arbitrationWaitBound(grace) = max(grace, 250ms)`; `r.grace` alone (1ms in the
+memory-runner tests) would expire spuriously and make the fail-closed fallback
+indistinguishable from a regression.
+
+**C7 — orphan cleanup.** The harness records the child's `*os.Process` and
+`t.Cleanup` kills it, so the mutation-guard test cannot leak a live process on a
+failing run.
+
+**C8 — the second detached site.** Both `detach_linux.go` sites are guarded, not
+one: `terminalizeDetachedNoChild` (which also stops deriving
+`KillIntent.Completed` from `Present` alone) and the detached finaliser's
+`case`. Each has its own test.
+
+**C9 — honest deviation record.** Written into the ticket resolution and §5:
+exit-versus-deadline ordering is unestablished and `E_RUN_TIMEOUT` is
+deliberately omitted, so an `exited 0` record carrying
+`KillIntent.NotExecuted` means the deadline DID fire and killed nothing. No face
+reads `KillIntent`, so the surfacing note is a one-line addition to the spec's
+run-record field table rather than a rendering change.
+
+### 12.1 §10.6's committed reproduction — re-specified
+
+The real-cgroup probe is committed as `TestAIRA126RealCgroupDeadlineStraddleSoak`
+and is opt-in (`AIRA126_SOAK=1`, `AIRA126_SOAK_ITERATIONS`, default 800). The
+race is ~2% per iteration, so a loop short enough for the standard suite would
+pass vacuously most of the time — exactly the porous shape C5 rejects — and a
+loop long enough to be non-vacuous costs a minute of suite time on every run.
+Making it opt-in keeps the measurement's reproduction executable and honest
+about what it proves, and the always-on coverage of the same arbitration is the
+hermetic pair, whose device makes the timer branch deterministic rather than
+lucky.
+
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>

@@ -69,6 +69,19 @@ type KillIntent struct {
 	Sequence  uint64 `json:"sequence,omitempty"`
 	Completed bool   `json:"completed"`
 	Empty     bool   `json:"empty_scope"`
+	// NotExecuted is the AIRA-126 disposition of a published intent that
+	// provably delivered NO signal to anything: killScope found the scope
+	// already empty (Members() empty AND Empty() true) and returned BEFORE
+	// Terminate and before Kill, and the leader was proved dead by
+	// processLive at that instant.
+	//
+	// It is a disposition of the intent, never a claim that a kill happened,
+	// and it is set only by the launch that itself created the intent (see
+	// killAttempt.IntentCreated). Completed keeps its exact prior meaning —
+	// cgroup.kill executed and the scope was proved empty AFTERWARDS — and is
+	// never set on this path; {Completed:true, NotExecuted:true} is not
+	// reachable and no code produces it.
+	NotExecuted bool `json:"not_executed,omitempty"`
 }
 
 type PIDIdentity struct {

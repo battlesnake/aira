@@ -677,13 +677,16 @@ func (r *Runner) terminalizeDetachedNoChild(ctx context.Context, record RunRecor
 	if current.Status.Terminal() {
 		return &current, nil
 	}
-	if current.KillIntent.Present {
+	// AIRA-126: a NotExecuted intent is a published intent that provably
+	// delivered no signal. It must never be read as "killed" on any path.
+	if current.KillIntent.Present && !current.KillIntent.NotExecuted {
 		killed = true
 		code = "E_RUN_KILLED"
 	}
 	if killed {
 		current.Status = StatusKilled
-		current.KillIntent.Completed, current.KillIntent.Empty = current.KillIntent.Present, true
+		current.KillIntent.Completed = current.KillIntent.Present && !current.KillIntent.NotExecuted
+		current.KillIntent.Empty = true
 	} else {
 		current.Status = StatusCancelled
 	}
@@ -746,7 +749,9 @@ func (r *Runner) finalizeDetachedTerminalLocked(ctx context.Context, id string, 
 	current.CaptureComplete = complete
 	current.EndedAt, current.TerminalComplete = nowString(r.now), true
 	switch {
-	case current.KillIntent.Present:
+	// AIRA-126: an intent dispositioned not-executed delivered no signal, so it
+	// is not evidence of a kill here either. The leader's own exit stands.
+	case current.KillIntent.Present && !current.KillIntent.NotExecuted:
 		current.Status = StatusKilled
 		current.KillIntent.Completed, current.KillIntent.Empty = true, true
 		current.ErrorCodes = appendUnique(current.ErrorCodes, "E_RUN_KILLED")

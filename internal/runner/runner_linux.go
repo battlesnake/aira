@@ -577,6 +577,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	var waitErr error
 	var waitState *os.ProcessState
 	timedOut := false
+	intentNotExecuted := false
 	var timeoutKill killAttempt
 	if req.Timeout > 0 {
 		timer := time.NewTimer(req.Timeout)
@@ -586,6 +587,15 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		case <-timer.C:
 			attempt, killErr := r.killWithIntent(ctx, id, "run-timeout", killPolicy{Enforce: false})
 			timeoutKill = attempt
+			// AIRA-126. The deadline can fire against a scope the leader has
+			// already left. killWithIntent has then published a durable intent
+			// that killScope refused to execute — it returned at len(pids)==0
+			// before Terminate and before Kill — so no signal was sent to
+			// anything. When the leader is also proved dead at that instant,
+			// the established facts are the child's own exit and the absence of
+			// any delivered kill, and this launch honours the pending wait
+			// instead of reporting a termination that did not happen.
+			intentNotExecuted = decideTimeoutIntentNotExecuted(killErr, attempt, processLive(record.PIDIdentity))
 			if killErr != nil || !attempt.IntentPublished {
 				// A wait result published before the deadline wins. Otherwise retain
 				// the timeout as unevaluated evidence and let the terminal CAS below
@@ -594,7 +604,21 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			} else {
 				timedOut = true
 			}
-			if !timedOut {
+			waitDrained := false
+			if intentNotExecuted {
+				// A dead leader's cmd.Wait() is already blocked in wait4 on our
+				// own child, so only the reap and one scheduler wakeup remain.
+				// The bound is a pure anti-hang guard whose expiry can only
+				// produce today's outcome, never a wrong one.
+				select {
+				case outcome := <-waitCh:
+					waitErr, waitState = outcome.err, outcome.state
+					timedOut, waitDrained = false, true
+				case <-time.After(arbitrationWaitBound(r.grace)):
+					intentNotExecuted = false
+				}
+			}
+			if !timedOut && !waitDrained {
 				outcome := <-waitCh
 				waitErr, waitState = outcome.err, outcome.state
 			}
@@ -847,8 +871,22 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		}
 		return &latest, nil
 	}
+	// AIRA-126. The disposition is decided from the PRE-merge ledger state,
+	// under the terminal lock. mergeEvidence replaces base.KillIntent wholesale
+	// whenever the candidate's is Present, so a post-merge read could neither
+	// see a concurrent actor's Completed:true nor compare sequences honestly.
+	// A concurrent completion, a sequence that is not the one this launch
+	// published, or a read error all refuse the disposition and leave the
+	// existing reconcile-required arm in charge.
+	honourNotExecuted := decideNotExecutedDisposition(intentNotExecuted, latestErr, latest.KillIntent, timeoutKill.IntentSequence)
 	latest = mergeEvidence(latest, record)
-	if latestErr == nil && latest.KillIntent.Present && !latest.KillIntent.Completed {
+	if honourNotExecuted {
+		// record.KillIntent is deliberately left zero on this path so the merge
+		// preserves the ledger's own intent (sequence, requested scope kill) and
+		// this is the only field the arbitration adds. Completed is never set.
+		latest.KillIntent.NotExecuted = true
+	}
+	if latestErr == nil && latest.KillIntent.Present && !latest.KillIntent.Completed && !honourNotExecuted {
 		latest.TerminalComplete = false
 		if _, err := r.append(ledgerEvent{Kind: "capture-finalized", Run: latest}); err != nil {
 			_ = unlockFile(terminalLock)
@@ -875,6 +913,22 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		return &committed, launchErr("U_RUN_RECONCILE_REQUIRED", ptyCleanupErr)
 	}
 	return &committed, nil
+}
+
+// arbitrationWaitFloor bounds the AIRA-126 post-arbitration receive on waitCh.
+// Grace is the runner's general "how long we wait for evidence" knob and is
+// configured as low as a millisecond by tests and by callers that want a snappy
+// capture abandon; reusing it unfloored here would let the bound expire under
+// ordinary scheduler load and silently fall back to the pre-arbitration
+// outcome, which is indistinguishable from a regression. The receive is only an
+// anti-hang guard on an already-reaping wait4, so a fixed floor is enough.
+const arbitrationWaitFloor = 250 * time.Millisecond
+
+func arbitrationWaitBound(grace time.Duration) time.Duration {
+	if grace < arbitrationWaitFloor {
+		return arbitrationWaitFloor
+	}
+	return grace
 }
 
 func (r *Runner) applyScopeMemoryCap(scope Scope, req Request, record *RunRecord) error {
@@ -2180,7 +2234,12 @@ type killAttempt struct {
 	Kill            killResult
 	WaitPublished   bool
 	IntentPublished bool
-	IntentSequence  uint64
+	// IntentCreated is true only when THIS call durably appended the
+	// kill-intent event. It is false when the intent was already present —
+	// a concurrent external run-kill, or a steal — so a foreign intent can
+	// never be dispositioned by a launch that did not create it (AIRA-126).
+	IntentCreated  bool
+	IntentSequence uint64
 }
 
 // killWithIntent is the shared durable kill path. It publishes KillIntent
@@ -2220,6 +2279,7 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy ki
 	if waitPublished && !current.KillIntent.Present {
 		return killAttempt{Current: current, WaitPublished: true}, nil
 	}
+	intentCreated := false
 	if !current.KillIntent.Present {
 		current.KillIntent = KillIntent{Present: true}
 		current.ScopeKill.Requested = true
@@ -2231,6 +2291,7 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy ki
 			return killAttempt{}, appendErr
 		}
 		current = event.Run
+		intentCreated = true
 	} else if policy.Steal && policy.CallerOwner != "" {
 		current.StolenBy = policy.CallerOwner
 		event, appendErr := r.append(ledgerEvent{Kind: "kill-steal", Run: current})
@@ -2239,7 +2300,7 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy ki
 		}
 		current = event.Run
 	}
-	attempt := killAttempt{Current: current, IntentPublished: current.KillIntent.Present, IntentSequence: current.KillIntent.Sequence}
+	attempt := killAttempt{Current: current, IntentPublished: current.KillIntent.Present, IntentCreated: intentCreated, IntentSequence: current.KillIntent.Sequence}
 	scope, err := r.backend.Open(ctx, current.CgroupScope)
 	if err != nil {
 		if current.Detached && current.Status == StatusStarting {
