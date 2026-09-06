@@ -71,6 +71,16 @@ import (
 //     governs only that one.
 //   - The fullness reading and the per-scope reading are taken at slightly
 //     different instants; a burst inside that window is caught on the next tick.
+//   - A scope whose ledger charge is still its FROZEN ESTIMATE rather than an
+//     observation can read as over-budget while it ramps. In practice that is
+//     the sub-second window between a grant and the first admission scan (the
+//     charge is re-derived at <=1s, and AIRA-29's cold floor only ever raises a
+//     charge, so it cannot hold an observed scope down), and for a
+//     --delegate-ram suite whose very first action is a test, before any pass
+//     observed it between reservations. The error self-corrects within one scan
+//     interval and costs the scope a raised adj for one tick on an
+//     already-full slice; it is not silent, because the raise and the restore
+//     are both logged.
 
 type oomSteerMode string
 
@@ -416,8 +426,10 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 // and the same overrun floor as everything else, and is stated here rather than
 // hidden.
 //
-// Lock order is the established admitRegistryMu -> queue.mu, and the map is
-// copied out so nothing is read from the queue afterwards.
+// The two admission locks are taken SEQUENTIALLY, never nested, so this cannot
+// participate in a lock-order inversion at all; the queue pointer stays valid
+// after admitRegistryMu is released, and the map is copied out so nothing is
+// read from the queue afterwards.
 func (s *Server) admitScopeBudgets(path string) map[string]int64 {
 	s.admitRegistryMu.Lock()
 	queue := s.admitQueues[path]

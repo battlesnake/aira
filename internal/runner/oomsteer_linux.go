@@ -26,6 +26,14 @@ var oomSteerOpenat = unix.Openat
 // real /proc write. Production always uses writePIDOOMScoreAdj.
 var oomSteerWritePID = writePIDOOMScoreAdj
 
+// oomSteerReadProcs is a seam for the PID-REUSE guard's own test. That guard
+// defends against a STALE cgroup.procs reading — a pid that has exited and been
+// recycled between the read and the write — and the kernel will not produce that
+// state on demand, so the only honest way to exercise it is to hand the walker
+// the stale list the race would have produced. Production always uses
+// readOOMSteerProcs.
+var oomSteerReadProcs = readOOMSteerProcs
+
 func setSubtreeOOMScoreAdj(scopePath string, adj int) (OOMScoreSteerResult, error) {
 	scopePath = filepath.Clean(scopePath)
 	scopeDir := filepath.Base(scopePath)
@@ -65,7 +73,7 @@ func openOOMSteerDirectory(parentFD int, name string) (*os.File, error) {
 // exactly how much was done. It therefore records counts and returns nothing.
 func walkOOMSteerTree(dir *os.File, scopeDir string, value []byte, depth int, result *OOMScoreSteerResult) {
 	result.Cgroups++
-	for _, pid := range readOOMSteerProcs(dir) {
+	for _, pid := range oomSteerReadProcs(dir) {
 		result.PIDs++
 		// PID-REUSE GUARD. cgroup.procs was read a moment ago; by the time the
 		// write lands that pid may have exited and been recycled by an unrelated

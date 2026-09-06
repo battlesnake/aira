@@ -116,6 +116,48 @@ func TestSetSubtreeOOMScoreAdjMovesEveryProcessInTheSubtree(t *testing.T) {
 	}
 }
 
+// TestSetSubtreeOOMScoreAdjSkipsAPIDThatHasLeftTheScope is the PID-REUSE guard
+// against a real process.
+//
+// cgroup.procs is read a moment before each write. If a pid exits in that window
+// and the kernel recycles it, the walker would otherwise hand a 1000 to an
+// unrelated process — a stranger's job made the machine's preferred OOM victim
+// by AIRA. The kernel will not produce a stale procs list on demand, so the
+// stale list is injected and the guard's refusal is asserted against a live
+// process that really is outside the scope.
+func TestSetSubtreeOOMScoreAdjSkipsAPIDThatHasLeftTheScope(t *testing.T) {
+	parent := cgrouptest.IsolatedScopeParent(t)
+	scope := steerTestScope(t, parent, "reuse")
+
+	outsider := exec.Command("sleep", "300")
+	if err := outsider.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = outsider.Process.Kill()
+		_, _ = outsider.Process.Wait()
+	})
+	outsiderPID := outsider.Process.Pid
+	if err := os.WriteFile("/proc/"+strconv.Itoa(outsiderPID)+"/oom_score_adj", []byte("0\n"), 0o644); err != nil {
+		t.Fatalf("cannot set the outsider's starting oom_score_adj: %v", err)
+	}
+
+	restore := oomSteerReadProcs
+	oomSteerReadProcs = func(*os.File) []int { return []int{outsiderPID} }
+	t.Cleanup(func() { oomSteerReadProcs = restore })
+
+	result, err := SetSubtreeOOMScoreAdj(scope, ConfineMaxOOMScoreAdj)
+	if err != nil {
+		t.Fatalf("SetSubtreeOOMScoreAdj: %v", err)
+	}
+	if result.Written != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %+v, want the stale pid skipped and nothing written", result)
+	}
+	if got := readOOMScoreAdj(t, outsiderPID); got != 0 {
+		t.Fatalf("a process outside the scope was moved to oom_score_adj %d", got)
+	}
+}
+
 func TestSetSubtreeOOMScoreAdjRefusesAnUnsteerableValue(t *testing.T) {
 	for _, adj := range []int{-1000, 0, ConfineOOMScoreAdj - 1, ConfineMaxOOMScoreAdj + 1} {
 		if _, err := SetSubtreeOOMScoreAdj("/sys/fs/cgroup", adj); err == nil {
