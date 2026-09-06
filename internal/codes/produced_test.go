@@ -182,7 +182,8 @@ func TestDivergenceTablesAreCurrent(t *testing.T) {
 // rule AIRA is built on. A W_ code is a warning and must exit 0, which is only
 // safe because TestNoWarningCodeIsRaisedAsAnError keeps a W_ code out of the
 // error path. E_ codes carry no such rule — they are bucketed 0..4 by kind — so
-// they are not asserted here.
+// they are not asserted here; the eleven whose bucket AIRA-107 decided are
+// pinned individually by TestRebucketedCodesFollowTheKindConvention below.
 //
 // The pin has no per-code escape hatch on purpose. A future code that genuinely
 // needs to break one of these conventions is a contract decision, and making its
@@ -202,6 +203,73 @@ func TestCataloguedExitsFollowThePrefixConvention(t *testing.T) {
 			if exit != 0 {
 				t.Errorf("%s exits %d; every warning code must exit 0", code, exit)
 			}
+		}
+	}
+}
+
+// verifies: AIRA-107 — the eleven E_ codes AIRA-87 catalogued at ExitForCode's
+// default now carry a decided bucket, and the decision is pinned here so it
+// cannot silently regress to the default (or drift to some third value) the way
+// it silently sat at the default before.
+//
+// TestCataloguedExitsFollowThePrefixConvention above cannot cover these: E_ codes
+// have no single prefix rule, they are bucketed by kind. So the pin is an
+// explicit table. It is deliberately exhaustive over AIRA-107's list rather than
+// a spot check, and it asserts both directions of the split within each family —
+// E_ADMIT_TOO_LARGE at 2 against E_ADMIT_SATURATED at 4, E_RANT_REDACTED at 2
+// against E_RANT_REDACTION_INCOMPLETE at 4, E_RUN_TELEMETRY_CONFLICT at 2
+// against E_RUN_USAGE_READ at 4 — because a lazy "move them all to 4" would pass
+// a one-sided check while destroying the distinction the buckets exist to carry.
+func TestRebucketedCodesFollowTheKindConvention(t *testing.T) {
+	// AIRA-107's decision, code by code. 2 = the request was bad; 4 = internal or
+	// infrastructure failure.
+	want := map[string]int{
+		"E_ADMIT_SATURATED":           4,
+		"E_ADMIT_TOO_LARGE":           2,
+		"E_COMMAND_INVALID":           2,
+		"E_FINDING_INDEX_DIVERGENCE":  4,
+		"E_RELATION_INDEX_DIVERGENCE": 4,
+		"E_GATE_EXISTS":               2,
+		"E_RANT_REDACTED":             2,
+		"E_RANT_REDACTION_INCOMPLETE": 4,
+		"E_RUN_RECONCILE_REQUIRED":    4,
+		"E_RUN_TELEMETRY_CONFLICT":    2,
+		"E_RUN_USAGE_READ":            4,
+	}
+	for code, exit := range want {
+		catalogued, ok := ExitCodes[code]
+		if !ok {
+			t.Errorf("%s is no longer catalogued; AIRA-107 bucketed it at %d, so removing it is a contract decision that must edit this test", code, exit)
+			continue
+		}
+		if catalogued != exit {
+			t.Errorf("%s exits %d, want %d (AIRA-107)", code, catalogued, exit)
+		}
+		if got := ExitForCode(code); got != exit {
+			t.Errorf("ExitForCode(%s)=%d, want %d", code, got, exit)
+		}
+		if exit == ExitForCode("E_CODE_NOT_IN_MAP_SENTINEL") {
+			t.Errorf("%s is pinned at the ExitForCode default; AIRA-107 exists precisely to take these codes off the default, so a pin at that value proves nothing", code)
+		}
+	}
+
+	// The neighbours each decision was argued from. If one of these moves, the
+	// reasoning recorded in codes.go stops holding and the pin above becomes an
+	// arbitrary number rather than a family alignment.
+	family := map[string]int{
+		"E_ADMIT_WAIT_TOO_LONG":    2, // E_ADMIT_TOO_LARGE is the same bad-request kind.
+		"E_DAEMON_BUSY":            4, // E_ADMIT_SATURATED is the same capacity-exhaustion kind.
+		"E_ALREADY_INITIALIZED":    2, // E_GATE_EXISTS is the same already-exists refusal.
+		"E_RECONCILE_REQUIRED":     4, // E_RUN_RECONCILE_REQUIRED is its runner analogue.
+		"U_RUN_RECONCILE_REQUIRED": 3, // ...and the unevaluated twin stays at 3.
+		"E_JOURNAL_CORRUPT":        4, // The index-divergence pair is this store-integrity kind.
+		"E_RUN_CAPTURE_FAILED":     4, // E_RUN_USAGE_READ is the same I/O-read failure.
+		"E_RANT_INVALID":           2, // E_RANT_REDACTED is the same bad-request kind.
+		"E_RECEIPT_IO":             4, // E_RANT_REDACTION_INCOMPLETE is the same store-I/O kind.
+	}
+	for code, exit := range family {
+		if got := ExitForCode(code); got != exit {
+			t.Errorf("%s exits %d, want %d: AIRA-107 bucketed a sibling code by alignment with this one, so moving it needs that reasoning revisited", code, got, exit)
 		}
 	}
 }

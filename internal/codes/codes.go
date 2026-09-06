@@ -10,6 +10,22 @@
 // must be emittable. produced_test.go enforces both directions against a static
 // scan of the source tree, and every accepted divergence is written down there
 // with its reason.
+//
+// The exit buckets are:
+//
+//	0  warning only; the operation succeeded (every W_ code)
+//	1  the operation genuinely failed
+//	2  the request was bad: argument, selector, or a named target that cannot
+//	   serve it
+//	3  the result is unevaluated — not a pass and not a fail (every U_ code)
+//	4  internal or infrastructure failure: the machine, store, or daemon could
+//	   not carry the request out
+//
+// A code's bucket is a published contract, so choosing one is a decision to be
+// made deliberately rather than by falling through ExitForCode's default.
+// AIRA-107 re-bucketed the eleven E_ codes AIRA-87 had catalogued at that
+// default; each of those entries carries its reasoning inline below, and
+// TestRebucketedCodesFollowTheKindConvention pins every one of them.
 package codes
 
 var ExitCodes = map[string]int{
@@ -32,8 +48,19 @@ var ExitCodes = map[string]int{
 	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_RANT_INVALID": 2, "E_RANT_TOO_LARGE": 2, "E_RANT_IDEMPOTENCY_CONFLICT": 2, "E_RANT_REF_INVALID": 2,
-	"E_RANT_REDACTED": 1, "E_RANT_REDACTION_INCOMPLETE": 1,
-	"E_COMMAND_INVALID": 1,
+	// AIRA-107 split the redaction pair, which AIRA-87 had left together at the
+	// default. E_RANT_REDACTED refuses an operation on a rant whose body is gone:
+	// the caller named a target that cannot serve the request, which is the same
+	// bad-request shape as the E_RANT_* family above and E_NOT_FOUND, so 2.
+	// E_RANT_REDACTION_INCOMPLETE is the opposite kind of answer entirely — the
+	// store could not complete the physical erasure (a held WAL keeps the old
+	// bytes reachable) — which is a storage-infrastructure failure, not anything
+	// the caller wrote, so it joins E_DB_BUSY / E_RECEIPT_IO at 4.
+	"E_RANT_REDACTED": 2, "E_RANT_REDACTION_INCOMPLETE": 4,
+	// A malformed command-language program is an argument error like every other
+	// invalid input above (AIRA-107; it sat at the default only because AIRA-87
+	// catalogued it without re-bucketing).
+	"E_COMMAND_INVALID": 2,
 	// E_SKILL_INSTALL is registered at 2 because that is what the skill
 	// installer actually returns: cmd/aira/skill.go writes the error and
 	// returns 2 directly rather than routing through ExitForCode.
@@ -52,7 +79,11 @@ var ExitCodes = map[string]int{
 	// U_RELATION_GRAPH_UNESTABLISHED is additionally raised as an error by
 	// scan_read.go exactly like its catalogued twin U_INDEX_UNESTABLISHED, so it
 	// must exit 3 rather than falling through to the default (AIRA-87).
-	"E_FINDING_INDEX_DIVERGENCE": 1, "E_RELATION_INDEX_DIVERGENCE": 1,
+	// Both divergence codes report that a derived index disagrees with the
+	// canonical git-file truth it is projected from. That is the store-integrity
+	// family — E_JOURNAL_CORRUPT, E_RECONCILE_REQUIRED, E_DB_CORRUPT — not a
+	// generic operation failure, so AIRA-107 moved them to 4.
+	"E_FINDING_INDEX_DIVERGENCE": 4, "E_RELATION_INDEX_DIVERGENCE": 4,
 	"U_RELATION_GRAPH_UNESTABLISHED": 3, "U_RELATION_OWNER_UNREADABLE": 3,
 	"W_STALE_INDEX": 0, "W_ORPHAN_WORKTREE": 0, "W_WORKTREE_DIVERGENCE": 0,
 	"W_AREA_OVERLAP": 0, "W_RELATION_TARGET_MISSING": 0, "W_RELATION_INVALID": 0,
@@ -67,7 +98,16 @@ var ExitCodes = map[string]int{
 	"E_RUN_SCOPE_UNAVAILABLE": 4, "E_RUN_CAP_UNAVAILABLE": 4, "E_RUN_SCOPE_INVALID": 4, "E_RUN_SCOPE_HANDOFF": 4,
 	"E_RUN_SCOPE_MIGRATION": 4, "E_RUN_DESCENDANT_KILLED": 4, "E_RUN_LAUNCH_FAILED": 4,
 	"U_RUN_EXIT_UNKNOWN": 3, "U_RUN_OUTPUT_UNAVAILABLE": 3, "U_RUN_RECONCILE_REQUIRED": 3,
-	"E_RUN_RECONCILE_REQUIRED": 1, "E_RUN_TELEMETRY_CONFLICT": 1, "E_RUN_USAGE_READ": 1,
+	// AIRA-107 re-bucketed all three off the default. E_RUN_RECONCILE_REQUIRED is
+	// the runner analogue of E_RECONCILE_REQUIRED (4) and the error twin of
+	// U_RUN_RECONCILE_REQUIRED (3): the run ledger cannot be trusted until it is
+	// reconciled, which is an infrastructure state, so 4. E_RUN_USAGE_READ is an
+	// I/O read failure on the usage file, so it joins E_RUN_OUTPUT_OPEN and
+	// E_RUN_CAPTURE_FAILED at 4. E_RUN_TELEMETRY_CONFLICT is the one caller-facing
+	// member of the three — telemetry submitted for a run that is already settled
+	// or never had a pending envelope is a bad request, not a broken machine — so
+	// it takes 2 with the rest of the E_RUN_*_INVALID argument family.
+	"E_RUN_RECONCILE_REQUIRED": 4, "E_RUN_TELEMETRY_CONFLICT": 2, "E_RUN_USAGE_READ": 4,
 	"U_RUN_REPORT_NOT_REQUESTED": 3, "U_RUN_COMPUTE_NOT_REQUESTED": 3,
 	"U_RUN_REPORT_CAPTURE_INCOMPLETE": 3, "U_RUN_TELEMETRY_PENDING": 3,
 	"E_RUN_DETACH_FAILED": 4, "E_RUN_IDENTITY_UNAVAILABLE": 4,
@@ -84,11 +124,18 @@ var ExitCodes = map[string]int{
 	// argument error, so it exits 2 rather than falling through to a default.
 	"E_ADMIT_WAIT_TOO_LONG": 2,
 	// The other two terminal admission rejections the daemon can answer with
-	// (daemon.CodeAdmitTooLarge / CodeAdmitSaturated). They are registered at the
-	// exit they already take via the ExitForCode default, so cataloguing them
-	// changes no behaviour; whether either deserves its own bucket the way
-	// E_ADMIT_WAIT_TOO_LONG does is a contract decision, not this move (AIRA-87).
-	"E_ADMIT_TOO_LARGE": 1, "E_ADMIT_SATURATED": 1,
+	// (daemon.CodeAdmitTooLarge / CodeAdmitSaturated). AIRA-87 catalogued them at
+	// the default without deciding a bucket; AIRA-107 made that decision, and it
+	// splits them because they are not the same kind of "no". E_ADMIT_TOO_LARGE
+	// says the request can never be satisfied on this slice at any time — the
+	// reserve exceeds the ceiling itself — which is a bad request exactly like
+	// E_ADMIT_WAIT_TOO_LONG above, so 2. E_ADMIT_SATURATED says the request is
+	// well-formed and the machine ran out of capacity for it within the wait: a
+	// resource-exhaustion condition about the host, not about the argv, so it
+	// joins E_DAEMON_BUSY and E_DB_BUSY at 4. The distinction is the one an agent
+	// actually needs from an exit status alone: 2 means fix the request, 4 means
+	// retry when the box is free.
+	"E_ADMIT_TOO_LARGE": 2, "E_ADMIT_SATURATED": 4,
 	// AIRA-101's two exclusive-admission refusals. E_ADMIT_EXCLUSIVE_ACTIVE is an
 	// ordinary refusal — another benchmark holds the slice, retry later — so it
 	// takes 1. U_ADMIT_EXCLUSIVE_UNESTABLISHED exits 3 with the rest of the U_
@@ -142,7 +189,10 @@ var ExitCodes = map[string]int{
 	"W_TRACE_UNCOVERED":    0, "W_TRACE_UNVERIFIED": 0,
 	"U_TRACE_UNSCANNED": 3, "U_TRACE_EMPTY": 3,
 	"E_GATE_INVALID": 2, "E_GATE_KIND_INVALID": 2, "E_GATE_CANARY_INVALID": 2,
-	"E_GATE_EXISTS": 1, "U_GATE_SET_EMPTY": 3,
+	// `gate add` on an id that already exists is a bad request — the caller named
+	// a gate (or canary) that cannot be created — and refusing it is the same
+	// shape as E_ALREADY_INITIALIZED (2), so AIRA-107 moved it off the default.
+	"E_GATE_EXISTS": 2, "U_GATE_SET_EMPTY": 3,
 	"E_GATE_ATTESTATION_INVALID": 2,
 	"E_GATE_FAILED":              1, "E_GATE_RATCHET_REGRESSED": 1, "E_GATE_CANARY_DID_NOT_FIRE": 1,
 	"E_GATE_COMMAND_FAILED": 1,
