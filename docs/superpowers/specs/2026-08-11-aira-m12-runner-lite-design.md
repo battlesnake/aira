@@ -492,10 +492,25 @@ unique terminal slot:
    resumes the intent and completes the kill/empty-scope proof, or records
    `lost`/`U_RUN_RECONCILE_REQUIRED` if that proof cannot be established. It
    never appends `killed` merely because intent exists.
+5. Clause 3 governs an intent that has something to signal. If instead the kill
+   finds the scope already empty **before any signal is sent** — the whole-scope
+   membership read returns nothing, so the bounded grace and `cgroup.kill` are
+   never performed — and the launch that published the intent holds kernel proof
+   that the leader was already dead at that instant, then the intent is
+   dispositioned **not-executed** and the waiter's wait result stands: the run
+   commits `exited` with the child's real exit evidence, and the published
+   intent is retained on the record as published-and-not-executed. It is never
+   `completed`, and `killed` is never appended, because no signal was delivered
+   and clause 4's prohibition is unchanged. Only the launch that itself created
+   the intent may disposition it; an intent adopted from another actor falls
+   under clause 3. Whether the child's exit fell before or after the deadline
+   instant is unestablished and is asserted in neither direction, so no timeout
+   error code is appended either (AIRA-126).
 
 The lock/CAS and ledger uniqueness check reject a second terminal append as a
 journal integrity failure. No path appends both `exited` and `killed`, and no
-path fabricates an exit code for a kill or lost outcome.
+path fabricates an exit code for a kill or lost outcome — nor discards a real
+one for a kill that provably never happened.
 
 ### 6.4 Stable code registration
 
@@ -541,7 +556,7 @@ the common-dir ledger:
 | `capture_forced_closed` | Whether the descendant grace expired and scope kill was needed to reach pipe EOF; distinct from byte completeness. |
 | `stdin_stored` | Whether `RUN-n.in` exists; false by default. |
 | `scope_kill` | Requested/started/completed, grace outcome, and actor/at when applicable. |
-| `kill_intent` | Durable intent sequence and completion/empty-scope proof; it arbitrates the terminal slot. |
+| `kill_intent` | Durable intent sequence and completion/empty-scope proof; it arbitrates the terminal slot. `not_executed` (§6.3(5)) marks an intent that was published and then provably delivered no signal: an `exited` record carrying it means the deadline DID fire and killed nothing, not that no deadline was reached. |
 | `error_codes` | Stable ordered codes and machine-readable error markers; no driver-string parsing by consumers. |
 | `pid_identity` | Ephemeral launch PID plus process start identity while useful; never the sole kill authority. |
 

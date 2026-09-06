@@ -866,46 +866,28 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	r = realRunner(t)
 	nearDeadline, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sleep", "0.04"}, Timeout: 50 * time.Millisecond})
 	if err != nil {
-		// AIRA-126: this scenario deliberately straddles its own deadline, and
-		// production has a THIRD honest outcome the two terminal branches below
-		// do not cover. When the timer and the child's exit are simultaneously
-		// ready and the timer branch wins, killWithIntent has already published a
-		// durable kill intent, killScope then finds the scope already empty and
-		// refuses to call that a completed kill, and Launch reports
-		// U_RUN_RECONCILE_REQUIRED with a non-terminal record. Reproduced at ~2%
-		// in an isolated 800-iteration probe; whether that record should instead
-		// arbitrate to exited or to killed is a kill-arbitration design decision
-		// tracked by AIRA-126, not something to decide inside this test.
-		//
-		// Accepted here only against the full evidence signature of that one
-		// outcome, so any other error, or a record missing any part of it, still
-		// fails. Tighten this back when AIRA-126 lands.
-		var launchError *LaunchError
-		if !errors.As(err, &launchError) || launchError.Code != "U_RUN_RECONCILE_REQUIRED" {
-			t.Fatalf("near-deadline launch error=%v record=%+v", err, nearDeadline)
-		}
-		if nearDeadline == nil {
-			t.Fatalf("near-deadline reconcile-required outcome published no record: %v", err)
-		}
-		if !nearDeadline.KillIntent.Present || nearDeadline.KillIntent.Completed {
-			t.Fatalf("near-deadline reconcile-required outcome without an unproven kill intent: %+v", nearDeadline)
-		}
-		if !containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || !containsString(nearDeadline.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
-			t.Fatalf("near-deadline reconcile-required outcome lost its evidence codes: %+v", nearDeadline)
-		}
-		if nearDeadline.Status.Terminal() || nearDeadline.TerminalComplete {
-			t.Fatalf("near-deadline reconcile-required outcome claimed a terminal state: %+v", nearDeadline)
-		}
-		if got := terminalRecords(t, r); got != 0 {
-			t.Fatalf("near-deadline reconcile-required terminal records=%d", got)
-		}
-		return
+		// AIRA-112 accepted a third, reconcile-required outcome here against a
+		// seven-part evidence signature, with a pointer to AIRA-126. AIRA-126
+		// landed: a deadline that fires against an already-empty scope now
+		// arbitrates to the child's real exit and dispositions the intent
+		// not-executed. Reaching reconcile-required from this scenario would
+		// require an escape, a kill error, or a foreign intent, none of which
+		// `/bin/sleep 0.04` in a private real cgroup can honestly produce, so
+		// the tolerance is gone and any LaunchError fails the test again.
+		t.Fatalf("near-deadline launch error=%v record=%+v", err, nearDeadline)
 	}
 	switch nearDeadline.Status {
 	case StatusExited:
 		assertHonestExitScope(t, r, nearDeadline)
 		if nearDeadline.ExitCode == nil || *nearDeadline.ExitCode != 0 || containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || !nearDeadline.CleanSuccess() {
 			t.Fatalf("near-deadline clean exit evidence=%+v", nearDeadline)
+		}
+		// AIRA-126: when the deadline DID fire against an already-empty scope,
+		// the published intent must carry its not-executed disposition, must
+		// never read as completed, and no signal may be recorded as sent.
+		if nearDeadline.KillIntent.Present &&
+			(!nearDeadline.KillIntent.NotExecuted || nearDeadline.KillIntent.Completed || nearDeadline.ScopeKill.Started) {
+			t.Fatalf("near-deadline exit carries an undisposed or over-claimed kill intent: %+v", nearDeadline)
 		}
 	case StatusKilled:
 		if !containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || nearDeadline.CleanSuccess() || !nearDeadline.KillIntent.Present || !nearDeadline.KillIntent.Completed {
