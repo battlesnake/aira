@@ -205,6 +205,11 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 				Reserve: reservationBytes, HeldMS: 90000,
 			}},
 			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
+			// AIRA-114. The bound is ON by default, so its limit is reported.
+			// CapAggregateKnown stays FALSE here because no evaluator pass has
+			// scanned this fixture's slice, and an unevaluated aggregate must
+			// present as unevaluated rather than as a measured zero.
+			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
 		}
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want %+v", got, want)
@@ -228,11 +233,71 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		want := runner.ConfineSliceReserve{
 			GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs, Queued: 0, FreezePhase: "idle",
 			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
+			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
 		}
 		// Reservations is nil here, and that is a POSITIVE fact from the same
 		// walk (this fixture cleared the waiter list), not an unevaluated read.
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want adopted-only %+v", got, want)
+		}
+	})
+
+	// AIRA-114. The ESTABLISHED arm of the aggregate, and the only one that can
+	// fail against a build which hardcodes `CapAggregateKnown: false` on the wire
+	// or drops the queue -> snapshot copy. Both arms above pin the DEFAULT-false
+	// fixture, which such a build reproduces exactly.
+	//
+	// It carries its own fixture rather than reusing setup(): this arm needs a
+	// real evaluateAdmitQueue pass, whose adoption and charge effects the shared
+	// expectations do not describe, and reusing them would have meant loosening
+	// the DeepEqual that makes every other field here load-bearing.
+	//
+	// What a false report costs, and why this is worth its own arm: with the bit
+	// stuck false `aira confine --list` prints "slice scope caps: unevaluated ...
+	// (not applied while unevaluated)" permanently, while the bound is in fact
+	// refusing launches — an operator debugging a wait would be told the exact
+	// opposite of the truth, the AIRA-71 silent-wait failure with a wrong
+	// statement attached instead of a missing one.
+	t.Run("aggregate-established", func(t *testing.T) {
+		const suiteCap = int64(30) << 30
+		path := t.TempDir()
+		server := NewServer(Paths{})
+		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
+		server.admitSliceHeadroomBase = base
+		server.admitSliceHeadroomSupervisor = supervisor
+		frozen := time.Now()
+		server.admitNow = func() time.Time { return frozen }
+		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+			return 0, maximum, 0, true, ""
+		}
+		// One LEAF-DRAINED scope: subtree-live, so the aggregate counts it, but
+		// leaf-empty, so the adoption loop skips it. That keeps every other field
+		// on the wire at its idle value and leaves the aggregate as the single
+		// thing this arm changes.
+		server.admitConfineScanInterval = time.Nanosecond
+		server.admitConfineScan = staticScan(leafDrainedRecord("CONFINE-suite-5101-abc", 2<<30, suiteCap))
+		queue := &sliceQueue{path: path, server: server}
+		server.admitRegistryMu.Lock()
+		server.admitQueues[path] = queue
+		server.admitRegistryMu.Unlock()
+
+		server.evaluateAdmitQueue(queue)
+
+		response := server.confineManagement(context.Background(), request)
+		result, ok := response.Data.(runner.ConfineListResult)
+		if !response.OK || !ok || result.SliceReserve == nil {
+			t.Fatalf("response=%+v result=%+v", response, result)
+		}
+		want := runner.ConfineSliceReserve{
+			CeilingBytes: maximum - base - supervisor, Queued: 0, FreezePhase: "idle",
+			// The value AND the bit. Asserting only the bit would survive a build
+			// that reported a fabricated total beside a true bit.
+			CapAggregateBytes: suiteCap,
+			CapAggregateKnown: true,
+			CapBoundBytes:     maximum * oversubscriptionFactorPctDefault / 100,
+		}
+		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
+			t.Fatalf("slice reserve=%+v, want %+v", got, want)
 		}
 	})
 

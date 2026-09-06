@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -284,6 +286,49 @@ func dynamicReserveFromEnv() (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_DYNAMIC_RESERVE must be enabled, disabled, 1 or 0")
+}
+
+// oversubscriptionFactorFromEnv reads the AIRA-114 aggregate over-subscription
+// bound as a MULTIPLE of the slice ceiling ("2", "2.5", "3"), returned as an
+// integer percentage so no admission arithmetic ever touches a float. The
+// literal "disabled" (or "0"/"off") turns the bound off entirely and reverts to
+// the AIRA-29 behaviour of an unbounded aggregate.
+//
+// Two refusals rather than substitutions, both deliberate:
+//
+//   - An unrecognised value is REFUSED (the AIRA-58 rule). The operator reaching
+//     for this is tightening or loosening a machine-wide admission bound under
+//     load, and quietly giving them the other behaviour is the worst outcome for
+//     exactly that person.
+//   - A factor BELOW 1 is refused, and that is the structural anti-wedge
+//     guarantee rather than taste. A job may be admitted with a reserve up to
+//     the whole ceiling (admitConnection's E_ADMIT_TOO_LARGE boundary), and its
+//     scope's memory.max is that reserve, so a factor below 1 would make such a
+//     job permanently unadmittable even on a completely idle machine. The bound
+//     must only ever stop a job from joining OTHERS.
+//
+// The upper limit is 100x: beyond that the "bound" states nothing, and it also
+// keeps the percentage far away from any overflow of the ceiling multiply.
+func oversubscriptionFactorFromEnv() (int64, error) {
+	const invalid = "E_CONFIG_INVALID: AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR must be a multiple of the slice ceiling in [1,100] (for example 2 or 2.5), or disabled"
+	value, set := os.LookupEnv("AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR")
+	value = strings.TrimSpace(value)
+	if !set || value == "" {
+		return oversubscriptionFactorPctDefault, nil
+	}
+	switch value {
+	case "disabled", "off", "0":
+		return 0, nil
+	}
+	factor, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(factor) || math.IsInf(factor, 0) || factor < 1 || factor > 100 {
+		return 0, errors.New(invalid)
+	}
+	pct := int64(math.Round(factor * 100))
+	if pct < 100 || pct > 10000 {
+		return 0, errors.New(invalid)
+	}
+	return pct, nil
 }
 
 func watchPollIntervalFromEnv() (time.Duration, error) {

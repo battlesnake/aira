@@ -96,10 +96,20 @@ type Server struct {
 	// moment it is misbehaving: AIRA_DAEMON_DYNAMIC_RESERVE=disabled plus a
 	// restart reverts the WHOLE of AIRA-29 -- the live charge and the adoption
 	// margin both -- back to the frozen-reserve behaviour.
-	dynamicReserve         bool
-	chargeMarginFloor      int64
-	chargeMarginPct        int64
-	chargeColdFloorWindow  time.Duration
+	dynamicReserve        bool
+	chargeMarginFloor     int64
+	chargeMarginPct       int64
+	chargeColdFloorWindow time.Duration
+	// AIRA-114. The aggregate over-subscription bound, as an integer percentage
+	// of the slice ceiling (200 = 2x). Zero disables the bound entirely and
+	// restores AIRA-29's unbounded aggregate.
+	//
+	// It is BOTH the tuning knob and the kill switch, deliberately as one
+	// setting: AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR=disabled is the operational
+	// escape hatch for a daemon already under load, and a second boolean beside
+	// the factor would make "off" expressible two ways that could disagree.
+	oversubscriptionFactorPct int64
+
 	workerScopesMu         sync.Mutex
 	workerScopes           map[string]*workerScopeState
 	workerAdmitHeadroom    int64
@@ -199,6 +209,7 @@ func NewServer(paths Paths) *Server {
 		chargeMarginFloor:            chargeMarginFloorDefault,
 		chargeMarginPct:              chargeMarginPctDefault,
 		chargeColdFloorWindow:        chargeColdFloorWindowDefault,
+		oversubscriptionFactorPct:    oversubscriptionFactorPctDefault,
 		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
 		staleLeaseReleaseGrace:       defaultStaleLeaseReleaseGrace,
@@ -275,6 +286,11 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.dynamicReserve = dynamicReserve
+	oversubscriptionFactorPct, err := oversubscriptionFactorFromEnv()
+	if err != nil {
+		return err
+	}
+	s.oversubscriptionFactorPct = oversubscriptionFactorPct
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one
