@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-112","project":"aira","title":"Flake: TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration reports unverified scope integrity for a sub-millisecond job","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","flake","testing"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-112","to":"AIRA-126"}]}
+{"schema":1,"id":"AIRA-112","project":"aira","title":"Flake: TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration reports unverified scope integrity for a sub-millisecond job","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","flake","testing"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-112","to":"AIRA-126"}]}
 ---
 Reproduced on CLEAN origin/master (8f16769) with no local changes, while merging AIRA-106.
 
@@ -222,3 +222,21 @@ so nothing below is a result carried over from an earlier tree.
 - Earlier targeted soak, pre-rebase: the same command at `-count=400` — exit **0**
   (`ok aira/internal/runner 301.608s`), 1200 real-cgroup launches. The same
   command on the pre-fix tree failed inside 200-300 iterations.
+
+### Merge record
+
+Merged via PR #70 as merge commit `315d500fe60c191c9c19961182977844214796ff`
+(2026-09-06). Independent build-review re-ran build/vet/gofmt/full suite from a
+clean worktree at the PR head (`ec6c04f`, based on `9abc100`): exit 0/0/0/0, 14
+packages `ok` + `cgrouptest` no test files, zero FAIL. The kernel ESRCH-at-read
+claim was reproduced with a standalone probe (open `/proc/<pid>/stat`, reap the
+child, `read()` → `ESRCH`, `errors.Is(err, os.ErrNotExist) == false`). The
+executed revert check was repeated independently: with the one call site put
+back to `errors.Is(err, os.ErrNotExist)`, `ReapedLeaderIsNotAResidualGap` and
+`ProcessLiveMapsAbsenceErrnosToDead/esrch-at-read` go red (exit 1) and the
+restored tree is clean and green (exit 0). Accepted non-blocking notes: the
+AIRA-126 test accommodation is tight (seven-part evidence signature matching
+only `runner_linux.go` lines 786-842) and the two other scenarios still pin
+both terminal edges; the D5 spec's pseudo-code note "read error →
+processUnknown" is now imprecise for ENOENT/ESRCH (a historical spec, not
+updated here).
