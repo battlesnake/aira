@@ -777,12 +777,15 @@ func addClamp(a, b int64) int64 {
 // the proportional half of the charge margin.
 //
 // pct is capped at 100: a margin larger than the job's whole size is not a
-// meaningful setting, and that cap is also what makes the overflow branch
-// EXACT rather than merely non-negative. With pct <= 100, value/100*pct <=
-// value, so the fallback cannot overflow either, and it differs from the direct
-// form only by a remainder smaller than pct. An earlier version returned
-// MaxInt64/100*pct here, which is non-negative but wildly LARGER than the true
-// answer -- safe in direction, wrong as arithmetic.
+// meaningful setting, and that cap is also what BOUNDS the overflow branch's
+// error instead of leaving it merely non-negative. With pct <= 100,
+// value/100*pct <= value, so the fallback cannot overflow either, and it
+// under-reports the exact answer by a remainder strictly smaller than pct --
+// tens of bytes on a gigabyte figure. Not exact, and the tests assert that
+// bound rather than exactness. An earlier version returned MaxInt64/100*pct
+// here, which is non-negative but roughly twelve times LARGER than the true
+// answer: safe in direction, wrong as arithmetic, and invisible to a test that
+// only checked the sign.
 func pctClamp(value, pct int64) int64 {
 	if value <= 0 || pct <= 0 {
 		return 0
@@ -1018,6 +1021,25 @@ func (s *Server) recomputeWaiterCharge(waiter *admitWaiter, rss, capBytes int64,
 // exists to remove. Such a parent therefore keeps its pinned framework overhead
 // as before, and the children remain the real charge. Found by the adversarial
 // build review.
+//
+// Two limits of that exclusion, both established rather than assumed:
+//
+//   - It is QUEUE-LOCAL, because the ledger is. `confine-reserve` inherits its
+//     parent's scope id from the environment but defaults its SLICE
+//     independently (confine_reserve_linux.go), so a parent confined to a
+//     non-default slice can have its children register against aira.slice
+//     instead. That split mis-attributes the child's reserve to a slice whose
+//     cgroup does not hold the memory -- but it is PRE-EXISTING and untouched
+//     here: before this change the parent charged its frozen reserve in its own
+//     queue and the child charged its reserve in the other one, the same split.
+//     No single queue double-books, because a queue that has no child charge is
+//     exactly the queue where charging the parent its live usage is correct.
+//     Filed as its own ticket rather than fixed from inside the ledger.
+//   - It keys on a scope ID, so a stale child could in principle suppress a
+//     REPLACEMENT parent that reused the same id. That is unreachable: an id
+//     embeds the minting pid and a nanosecond stamp (confine_linux.go), and
+//     enqueueAdmitInternal already refuses a duplicate scope id among
+//     non-released waiters, so the two cannot coexist.
 func (s *Server) refreshWaiterCharge(queue *sliceQueue, waiter *admitWaiter, record runner.ConfineRecord, subReserved map[string]struct{}, now time.Time) {
 	if !s.dynamicReserve {
 		return
