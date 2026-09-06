@@ -293,6 +293,57 @@ func TestRebucketedCodesFollowTheKindConvention(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-124 — one machine condition ("an exclusive job holds this
+// slice") must reach a caller as ONE exit status whichever path reports it.
+//
+// AIRA-101 catalogued E_ADMIT_EXCLUSIVE_ACTIVE at 1 as an ordinary refusal;
+// AIRA-107 independently decided E_ADMIT_SATURATED at 4 as capacity exhaustion.
+// Neither number was wrong in isolation, but the pair split the same condition:
+// a second `--exclusive` request is refused with E_ADMIT_EXCLUSIVE_ACTIVE, while
+// an ordinary job that waits out its admission budget behind that very holder is
+// refused with E_ADMIT_SATURATED (runner/admission_linux.go, rejection.Exclusive
+// == "held"/"draining"). An agent branching on the exit alone could not tell the
+// two were the same event. AIRA-124 unified them at 4.
+//
+// The pin is written as an EQUALITY between the two codes as well as a literal,
+// so it fails in both drift directions — E_ADMIT_EXCLUSIVE_ACTIVE sliding back
+// to 1 and E_ADMIT_SATURATED being re-bucketed out from under it — rather than
+// only re-asserting a number.
+func TestExclusiveAdmissionRefusalSharesTheCapacityBucket(t *testing.T) {
+	const wantExclusive = 4
+
+	catalogued, ok := ExitCodes["E_ADMIT_EXCLUSIVE_ACTIVE"]
+	if !ok {
+		t.Fatal("E_ADMIT_EXCLUSIVE_ACTIVE is no longer catalogued; AIRA-124 bucketed it at 4, so removing it is a contract decision that must edit this test")
+	}
+	if catalogued != wantExclusive {
+		t.Errorf("E_ADMIT_EXCLUSIVE_ACTIVE exits %d, want %d (AIRA-124: the same condition as E_ADMIT_SATURATED, so the same exit)", catalogued, wantExclusive)
+	}
+	if got := ExitForCode("E_ADMIT_EXCLUSIVE_ACTIVE"); got != wantExclusive {
+		t.Errorf("ExitForCode(E_ADMIT_EXCLUSIVE_ACTIVE)=%d, want %d", got, wantExclusive)
+	}
+
+	// The invariant itself, not just its current value: the two paths that report
+	// "an exclusive job holds the slice" must agree.
+	if a, b := ExitForCode("E_ADMIT_EXCLUSIVE_ACTIVE"), ExitForCode("E_ADMIT_SATURATED"); a != b {
+		t.Errorf("E_ADMIT_EXCLUSIVE_ACTIVE exits %d but E_ADMIT_SATURATED exits %d; both report that an exclusive job holds the slice, and AIRA-124 requires one exit for one condition", a, b)
+	}
+	// The exit the confine face actually produces for this refusal: the runner
+	// wraps the daemon's code as E_CONFINE_UNAVAILABLE. If that moved, the
+	// catalogue would again publish a number no face emits.
+	if got := ExitForCode("E_CONFINE_UNAVAILABLE"); got != wantExclusive {
+		t.Errorf("E_CONFINE_UNAVAILABLE exits %d, want %d: the runner reports an unavailable exclusive admission with this code, so AIRA-124's alignment needs revisiting if it moves", got, wantExclusive)
+	}
+
+	// The half AIRA-124 must NOT sweep along. U_ADMIT_EXCLUSIVE_UNESTABLISHED is
+	// a different claim — the daemon could not establish emptiness, not "the
+	// slice is busy" — and stays unevaluated at 3. A lazy "move the exclusive
+	// codes to 4" would pass every assertion above and fail here.
+	if got := ExitForCode("U_ADMIT_EXCLUSIVE_UNESTABLISHED"); got != 3 {
+		t.Errorf("U_ADMIT_EXCLUSIVE_UNESTABLISHED exits %d, want 3: it is an unevaluated verdict, never a report that the slice is held", got)
+	}
+}
+
 // TestNoWarningCodeIsRaisedAsAnError closes the hazard the W_ convention opens
 // at the AUTHORING end: nobody should ever construct an error whose message
 // starts "W_SOMETHING: ...", because a warning code is cataloged to exit 0 and
