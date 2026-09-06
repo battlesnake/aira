@@ -507,6 +507,25 @@ unique terminal slot:
    instant is unestablished and is asserted in neither direction, so no timeout
    error code is appended either (AIRA-126).
 
+“The deadline” in clauses 1–5 covers **both** bounds a run may carry: the
+wall-clock `--timeout` and the cumulative CPU-time `--cpu-timeout` budget
+(AIRA-136). They are multiplexed into one deadline source that emits at most one
+value, so there is exactly one kill trigger, one kill site, and one arbitration.
+The bound that fired is named by the record’s error code and by
+`scope_kill.actor` (`run-timeout` versus `run-cpu-timeout`) and is never
+inferred. When both are breached in the same instant the record names the one
+that won and does not assert the other, because no ordering was established.
+
+A run whose **requested** CPU budget AIRA cannot assert it applied additionally
+carries `U_RUN_CPU_BUDGET_UNENFORCED`. That is decided from the authoritative
+teardown counters, not from whether the budget fired: a fire that killed nothing
+— clause 5’s arbitrated exit — leaves the bound unenforced, and only an executed
+CPU-budget kill suppresses the code. Consequently a wall-clock kill whose final
+total also crosses the CPU budget carries `E_RUN_TIMEOUT` **and**
+`U_RUN_CPU_BUDGET_UNENFORCED`, with `scope_kill.actor` naming the wall bound that
+did the killing. A run whose final established total is under its budget is fully
+evaluated and carries neither.
+
 The lock/CAS and ledger uniqueness check reject a second terminal append as a
 journal integrity failure. No path appends both `exited` and `killed`, and no
 path fabricates an exit code for a kill or lost outcome — nor discards a real
@@ -523,6 +542,24 @@ The implementation plan must add at least these entries to
 | Established operation failure | `E_RUN_FAILED`, `E_RUN_KILLED` | 1 |
 | Capture/scope infrastructure | `E_RUN_OUTPUT_OPEN`, `E_RUN_OUTPUT_DISK_FULL`, `E_RUN_CAPTURE_FAILED`, `E_RUN_SCOPE_UNAVAILABLE`, `E_RUN_SCOPE_INVALID`, `E_RUN_SCOPE_HANDOFF`, `E_RUN_SCOPE_MIGRATION`, `E_RUN_DESCENDANT_KILLED`, `E_RUN_LAUNCH_FAILED` | 4 |
 | Unevaluated/lost | `U_RUN_EXIT_UNKNOWN`, `U_RUN_OUTPUT_UNAVAILABLE`, `U_RUN_RECONCILE_REQUIRED` | 3 |
+| Deadlines (AIRA-136) | `E_RUN_CPU_TIMEOUT`, `U_RUN_CPU_BUDGET_UNENFORCED` | 3 |
+
+`E_RUN_CPU_TIMEOUT` is the CPU-time twin of `E_RUN_TIMEOUT` and takes the same
+exit class for the same reason: a run cut short at a deadline produced no
+evaluated result. The two are distinct codes so a record names which bound
+actually fired, and the gate command lane maps both to
+`U_GATE_COMMAND_TIMEOUT`.
+
+`U_RUN_CPU_BUDGET_UNENFORCED` covers exactly two states, and a reader must not
+collapse them. **Never measured**: no `cpu.stat` read succeeded during the run
+and the teardown read did not succeed either, so no CPU quantity for this run
+exists — the state a run in a non-kernel scope necessarily reaches. **Measured,
+breached, not enforced**: the final established total did reach the budget and no
+CPU-budget kill was executed, so the measurement exists (it is the record's
+`cpu_user`/`cpu_sys`) and only the enforcement is missing. The name says
+UNENFORCED rather than UNEVALUATED because the second state is a two-sided
+measured fact, not an absence of measurement. In both states the honest claim is
+the same one: AIRA did not apply a bound the operator asked for.
 
 The `E_RUN_LAUNCH_FAILED` classification must distinguish “AIRA could not
 start the requested argv” from a child that started and returned non-zero;

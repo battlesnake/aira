@@ -1,9 +1,29 @@
 # AIRA-136 — a job deadline expressed in cumulative CPU-time, not wall clock
 
-Status: planned. Branch `aira136-cpu-time-timeout` off `origin/master` at
+Status: **built**. Branch `aira136-cpu-time-timeout` off `origin/master` at
 `3f4f54a`. Two-loop work per CLAUDE.md: this touches the kill/terminal-CAS
 arbitration AIRA-126 landed hours ago, so this document is the plan artifact for
-plan-review and the plan gate. No production code is changed by this commit.
+plan-review and the plan gate.
+
+The plan gate returned **GATE-PASS-WITH-CONDITIONS** (C1–C8). Every condition is
+applied in the implementation and folded into the body of this document; §0
+below records where each one landed and what changed from the gated draft, so a
+reviewer can check the conditions against the code rather than against a promise.
+
+---
+
+## 0. Gate conditions, and where each is discharged
+
+| # | Condition | Where it landed |
+|---|---|---|
+| C1 | `decideCPUBudgetUnevaluated` must not short-circuit on `fired`; only an EXECUTED CPU kill suppresses the rule | §4.5 rewritten: the input is `killedByCPUBudget = timedOut && fired.Code == "E_RUN_CPU_TIMEOUT"`. Pinned by `TestAIRA136CPUBudgetUnenforcedRule`, `TestAIRA136WallKillDoesNotSuppressTheUnenforcedCode`, the §7.5 arbitrated-exited test, and the §7.4 both-codes row. §8 narrowed accordingly. |
+| C2 | The code covers two states; `UNEVALUATED` misdescribes the second | Renamed **`U_RUN_CPU_BUDGET_UNENFORCED`**, with both states stated precisely in the `codes.go` entry and in spec §6.4. |
+| C3 | Define `finalConsumed` when the pre-start baseline read failed | `decideFinalCPUConsumed` returns the absolute counter — an upper bound, erring only toward reporting the code. Pinned by `TestAIRA136FinalCPUConsumedUsesTheAbsoluteCounterWithoutABaseline`. §4.3/§4.5. |
+| C4 | The cumulative-scope test compared two runs' wall durations: porous | Replaced by a single-run assertion, §7.4. |
+| C5 | Surface the `aira confine` deferral to the owner in this PR | Follow-up ticket filed with `aira create` in this PR, `relates` AIRA-136; recorded in the AIRA-136 resolution and named in the PR body. §3.2. |
+| C6 | Pin the both-codes record shape | §4.5/§9(5) state it; `TestAIRA136RealCgroupWallKillOverTheCPUBudgetCarriesBothCodes` pins it against a real cgroup. |
+| C7 | The arbitration tests' injected reader must gate on the child's real exit, not on a wall-clock coincidence | `overBudgetAfterLeaderExit` gates on the harness observing leader death through `readProcStatFn`; the non-vacuity counter is kept; no test that swaps `readCgroupCPUFn` is `t.Parallel`. §7.5. |
+| C8 | Record the executed reverts | §7.6, with exit codes and named failing tests, repeated in the PR body. |
 
 Every line reference below is `origin/master` at `3f4f54a`, and every one of
 them was re-read against the tree rather than carried over: `3f4f54a` adds only
@@ -370,6 +390,17 @@ scope. If the baseline read fails, the first successful sample is adopted (see
 the sketch), which undercounts and therefore fires **late, never early** — the
 safe direction, written down rather than discovered.
 
+That adopted baseline lives entirely inside the sampler goroutine and is
+deliberately not published back to Launch: it is a lower bound taken after the
+child was already running, so it carries no evidence Launch could use, and
+publishing it would be shared mutable state for nothing. Gate condition C3 asks
+what `finalConsumed` then means, and `decideFinalCPUConsumed` answers it: with no
+ESTABLISHED baseline, the absolute counter. That is an upper bound on this run's
+consumption, so it can only err toward reporting
+`U_RUN_CPU_BUDGET_UNENFORCED` — never toward a kill, since that value is not an
+input to any kill decision. `TestAIRA136FinalCPUConsumedUsesTheAbsoluteCounterWithoutABaseline`
+is the rule row.
+
 ### 4.4 Launch — the actual diff at the arbitration block
 
 `startDeadlineSource` is called at exactly the point `time.NewTimer(req.Timeout)`
@@ -477,20 +508,42 @@ func decideCPUBudgetExceeded(consumed, budget time.Duration) bool {
 	return budget > 0 && consumed >= budget
 }
 
-// decideCPUBudgetUnevaluated reports whether a REQUESTED CPU-time budget cannot
-// be asserted to have held. Two states reach it:
+// decideFinalCPUConsumed is the run's final consumed CPU-time (gate condition
+// C3). With no ESTABLISHED pre-start baseline the absolute counter is used: an
+// upper bound on this run's consumption, so it errs only toward reporting the
+// code and never toward a kill, since this value is not an input to any kill.
+// The sampler's own adopted baseline is deliberately private to its goroutine.
+func decideFinalCPUConsumed(total, baseline time.Duration, baselineEstablished bool) time.Duration {
+	if !baselineEstablished {
+		return total
+	}
+	return total - baseline
+}
+
+// decideCPUBudgetUnenforced reports whether a REQUESTED CPU-time budget cannot
+// be asserted to have been APPLIED. Two states reach it:
 //
 //   - nothing was ever established: no cpu.stat read succeeded during the run
 //     AND the teardown read did not succeed either, so AIRA has no idea how
 //     much CPU the job used;
-//   - the final total DID cross the budget and nothing was killed: sampling was
-//     degraded for long enough to miss the crossing.
+//   - the final total DID cross the budget and no CPU-budget kill was executed:
+//     sampling was degraded for long enough to miss the crossing, or another
+//     bound ended the run first.
 //
 // A run whose final established total is under the budget is fully evaluated
 // even if the sampler was blind for part of it — the teardown read is a
 // two-sided proof that the bound held, and AIRA already collects it.
-func decideCPUBudgetUnevaluated(budget time.Duration, fired bool, finalConsumed time.Duration, finalEstablished bool) bool {
-	if budget <= 0 || fired {
+//
+// killedByCPUBudget, NOT "the CPU deadline fired", is the suppressing input
+// (gate condition C1). A fire that killed nothing — AIRA-126's arbitrated exit —
+// leaves the breach a two-sided ESTABLISHED fact with no enforcement against it,
+// which is exactly what this code is for; unlike AIRA-126's wall case this is
+// not an unknowable ordering. Suppressing on the fire alone would make the
+// record depend on sampler PHASE: the same job burning the same CPU would report
+// a clean success if a tick happened to land after its exit and an unenforced
+// budget if it did not.
+func decideCPUBudgetUnenforced(budget time.Duration, killedByCPUBudget bool, finalConsumed time.Duration, finalEstablished bool) bool {
+	if budget <= 0 || killedByCPUBudget {
 		return false
 	}
 	if !finalEstablished {
@@ -500,10 +553,23 @@ func decideCPUBudgetUnevaluated(budget time.Duration, fired bool, finalConsumed 
 }
 ```
 
-When it reports true, Launch appends `U_RUN_CPU_BUDGET_UNEVALUATED` (exit class
+When it reports true, Launch appends `U_RUN_CPU_BUDGET_UNENFORCED` (exit class
 3, with the other `U_RUN_*` codes). `finalConsumed` is `snapshotUsage`'s
-already-taken teardown read (runner_linux.go:862, `record.CPUUser + record.CPUSys`)
-minus the same baseline — no new read, no new timing.
+already-taken teardown read (`record.CPUUser + record.CPUSys`) through
+`decideFinalCPUConsumed` — no new read, no new timing.
+
+The name is **UNENFORCED**, not UNEVALUATED (gate condition C2), because the
+second state above is a two-sided measured fact and only the enforcement is
+missing. `codes.go` and spec §6.4 both state the two states in full, so a reader
+of the record cannot take the code as "no measurement".
+
+`killedByCPUBudget` is `timedOut && fired.Code == "E_RUN_CPU_TIMEOUT"`. One
+consequence is stated here rather than left to be discovered (gate condition C6):
+**a wall-clock kill whose teardown total also crosses the CPU budget carries BOTH
+`E_RUN_TIMEOUT` and `U_RUN_CPU_BUDGET_UNENFORCED`**, with `ScopeKill.Actor ==
+"run-timeout"`. That is the honest record — the wall bound did the killing, and
+the CPU bound the operator also asked for was measured, breached, and not
+applied. §7.4 pins it against a real cgroup.
 
 `finalEstablished` has an exact definition, and it must be read off the pointer
 fields rather than off a summed number, because a nil in either is what "the
@@ -516,21 +582,22 @@ here is a genuine "never established", never a zero. Summing first and testing
 the sum against zero would turn an unreadable counter into a *measured* zero —
 the fake-zero the whole ticket's honesty rule forbids — so the plan requires the
 nil test, and §7.1's table pins it with a row whose final read is unestablished
-and whose budget is large: the correct implementation reports *unevaluated*
-there, while the summed-to-zero implementation reports a clean, fully-evaluated
-run (`0 >= 10s` is false) and therefore fails that row. The row exists solely to
+and whose budget is large: the correct implementation reports the code there,
+while the summed-to-zero implementation reports a clean, fully-evaluated run
+(`0 >= 10s` is false) and therefore fails that row. The row exists solely to
 fail against that specific wrong implementation.
 
-**This is the plan's one genuinely debatable addition and the plan gate should
-rule on it.** Against it: [[architectural-simplicity]] says prefer "keep the
+**This was the plan's one genuinely debatable addition and the plan gate ruled on
+it: kept, with C1's correction and C2's rename.** Against it: [[architectural-simplicity]] says prefer "keep the
 primitive, document the gap" over new machinery, and on any box AIRA can run on
 at all (cgroup v2 delegation is a hard precondition) `cpu.stat` is essentially
 always readable, so the code is near-unreachable. For it: near-unreachable *and
 would report a clean success under an unenforced bound if it happened* is exactly
 the shape AIRA's honesty rule exists for, and the cost is one catalogue entry and
-one pure function with no branching in the hot path. The plan adopts it; a
-GATE-FAIL on this point would be answered by deleting the code and the rule and
-writing the gap into §9 instead.
+one pure function with no branching in the hot path. The gate agreed, and made it
+carry more weight than the draft gave it: under C1 the code is not a rare
+non-kernel-scope curiosity but the ordinary record of a wall-clock kill that also
+crossed the CPU budget, and of an arbitrated exit that did.
 
 ---
 
@@ -596,12 +663,13 @@ makes the whole thing safe to run by default.
 |---|---|
 | `internal/runner/types.go` | `Request.CPUTimeout time.Duration` |
 | `internal/runner/deadline_linux.go` (new) | `deadlineFire`, `deadlineSource`, `startDeadlineSource`, `halt`, `readCgroupCPUUsed`, `readCgroupCPUFn`, `cpuBudgetSampleInterval` |
-| `internal/runner/decisions.go` | `decideCPUBudgetExceeded`, `decideCPUBudgetUnevaluated` |
-| `internal/runner/runner_linux.go` | baseline read in `launchPrep`; `deadlineSource` replaces the bare timer at 582-632; `fired.Actor` at the one `killWithIntent` call; `fired.Code` / `fired.Actor` in the status block at 823-835; `U_RUN_CPU_BUDGET_UNEVALUATED` append |
-| `internal/codes/codes.go` | `E_RUN_CPU_TIMEOUT: 3`, `U_RUN_CPU_BUDGET_UNEVALUATED: 3` |
+| `internal/runner/decisions.go` | `decideCPUBudgetExceeded`, `decideFinalCPUConsumed`, `decideCPUBudgetUnenforced` |
+| `internal/runner/runner_linux.go` | baseline read in `launchPrep`; `deadlineSource` replaces the bare timer at 582-632; `fired.Actor` at the one `killWithIntent` call; `fired.Code` / `fired.Actor` in the status block at 823-835; `U_RUN_CPU_BUDGET_UNENFORCED` append |
+| `internal/codes/codes.go` | `E_RUN_CPU_TIMEOUT: 3`, `U_RUN_CPU_BUDGET_UNENFORCED: 3` |
 | `internal/store/gate_command.go` | line 93 also maps `E_RUN_CPU_TIMEOUT` → `U_GATE_COMMAND_TIMEOUT` |
 | `internal/core/core.go` | `cpu_timeout` ArgSpec on `run`; parse; `--cpu-timeout` + `--detach` refusal |
 | `cmd/aira/main.go` | `cpu-timeout` in the run option whitelist (1673) and the arg mapping (1854) |
+| `cmd/aira/mcp.go` | `cpu_timeout` default in the MCP `run` argument fill — **the plan missed this**, see below |
 | `docs/superpowers/specs/2026-08-11-aira-m12-runner-lite-design.md` | §6.3(5) note that "the deadline" covers both bounds; §6.4 note for the two new codes |
 | `.aira/tickets/AIRA-136.md` | status + resolution at PR time |
 
@@ -618,10 +686,18 @@ Notes on three of these:
   `hasRunnerCodeExcept` → `U_GATE_COMMAND_RUN_UNEVALUATED`: still unevaluated, so
   not *dishonest*, but it loses the "it hit its deadline" distinction the code
   exists to carry.
-- **Generated surfaces need no separate edit.** Help, MCP schemas and the agent
-  guide come from the `core.go` dispatch table; adding the `ArgSpec` is the whole
-  change. There is no committed golden to regenerate (verified: nothing outside
-  `core.go` carries the run flag list).
+- **Generated surfaces need no separate edit — but the MCP face's ARGUMENT FILL
+  did, and the plan was wrong about it.** Help, MCP schemas and the agent guide
+  do all come from the `core.go` dispatch table, and there is no committed golden
+  to regenerate. What the plan missed is that `cmd/aira/mcp.go` separately fills
+  a default for every `run` argument so the MCP and CLI faces construct the
+  *identical* `core.Request`, and that list is hand-maintained. Omitting
+  `cpu_timeout` there was caught immediately, in the build, by the existing
+  parity tests `TestMCPRunnerLaunchMatchesCLIRequestAndPreservesTargetOptions`,
+  `TestMCPRunnerPTYMatchesCLIRequest` and
+  `TestMCPRunnerTelemetryArgumentsMatchCLIRequest`. It is recorded here rather
+  than quietly fixed because §6.1's whole point is that a "files touched" table
+  is a claim about the tree, and this is the one place the claim was incomplete.
 
 `parseRunTimeout` (core.go:639) is refactored into a shared
 `parsePositiveDuration(value, label string)` so `--timeout`'s existing message
@@ -658,7 +734,7 @@ recorded so a reviewer can re-run it rather than trust it.
 - **The codes catalogue's convention tests need no edit for either new code, and
   this was checked rather than assumed.**
   `TestCataloguedExitsFollowThePrefixConvention` requires every `U_` code to exit
-  3, which `U_RUN_CPU_BUDGET_UNEVALUATED: 3` satisfies, and asserts nothing about
+  3, which `U_RUN_CPU_BUDGET_UNENFORCED: 3` satisfies, and asserts nothing about
   `E_` codes (its own comment says they are bucketed by kind), so
   `E_RUN_CPU_TIMEOUT: 3` is unconstrained there and aligns with its sibling
   `E_RUN_TIMEOUT: 3` by argument rather than by rule.
@@ -703,7 +779,7 @@ The caller-side half of that rule gets its own test, because the table cannot
 see it: `TestAIRA136UnevaluatedIsDerivedFromTheNilCounters` drives Launch with a
 teardown `cpu.stat` read that fails (injected `readCgroupCPUFn`, and the scope's
 `cpu.stat` absent), a requested budget, and no fire, and asserts the record
-carries `U_RUN_CPU_BUDGET_UNEVALUATED` with `CPUUser == nil && CPUSys == nil` —
+carries `U_RUN_CPU_BUDGET_UNENFORCED` with `CPUUser == nil && CPUSys == nil` —
 proving the code is raised from the absence of evidence rather than from a
 zero.
 
@@ -749,7 +825,7 @@ The test is a **pair on the same argv**, which is what makes it non-porous:
 | run | argv | bounds | required outcome |
 |---|---|---|---|
 | A | `/bin/sh -c 'sleep 0.5'` | `Timeout: 100ms` | `killed`, `E_RUN_TIMEOUT`, one terminal |
-| B | `/bin/sh -c 'sleep 0.5'` | `CPUTimeout: 100ms`, no wall bound | `exited 0`, `CleanSuccess()`, no `E_RUN_CPU_TIMEOUT`, no `U_RUN_CPU_BUDGET_UNEVALUATED`, one terminal |
+| B | `/bin/sh -c 'sleep 0.5'` | `CPUTimeout: 100ms`, no wall bound | `exited 0`, `CleanSuccess()`, no `E_RUN_CPU_TIMEOUT`, no `U_RUN_CPU_BUDGET_UNENFORCED`, one terminal |
 
 Same command, same duration, opposite outcomes, and the only difference is which
 bound was requested. **A CPU timeout implemented as a wall-clock timer fails run
@@ -779,19 +855,43 @@ guard: the same spinner with a large `CPUTimeout` (30 s) and a small
 `Timeout: 100ms` must produce `E_RUN_TIMEOUT` and **not** `E_RUN_CPU_TIMEOUT`,
 with `Actor == "run-timeout"`. Neither source may claim the other's kill.
 
+`TestAIRA136RealCgroupWallKillOverTheCPUBudgetCarriesBothCodes` — gate condition
+C6's record shape: spinner, `Timeout: 100ms`, `CPUTimeout: 1ms`, asserting
+`E_RUN_TIMEOUT` **and** `U_RUN_CPU_BUDGET_UNENFORCED` with
+`Actor == "run-timeout"`, plus `E_RUN_CPU_TIMEOUT` absent and the measured total
+at or over the budget so the "measured, breached" arm is the one exercised.
+
+The sampler is injected to report an honest, established, permanently-zero
+consumption. That is not a convenience: with a 1 ms budget and a 100 ms sample
+interval, an uninjected version would be racing the wall timer against the first
+tick, and the record would depend on which channel `select` happened to find
+ready — the coincidence a test must not rest on. The injection also models the
+exact production state §4.5 names (sampling degraded for long enough to miss the
+crossing), while the teardown read stays the real kernel one, so the counters the
+assertion rests on are genuine cgroup accounting.
+
 `TestAIRA136RealCgroupBudgetIsCumulativeAcrossTheScope` — the assertion that the
 budget is a *cgroup-wide* sum, which no wall-clock implementation can satisfy.
-Two runs on the same box, same `CPUTimeout`, one spinner vs four spinners
-(`for i in 1 2 3 4; do (while :; do :; done) & done; wait`); assert the
-four-spinner run's **wall** duration is materially shorter, because four
-processes reach the same cumulative budget in less elapsed time.
 
-Contention honesty, because this is the one test a loaded box can distort:
-compute the four-spinner run's achieved parallelism from its own record,
-`(CPUUser+CPUSys) / wall`. If it is below 1.5 the box did not actually give the
-job parallelism, the comparison is **unevaluated**, and the test `t.Skip`s with
-the measured value logged — an honest unevaluated, never a fake pass and never a
-flaky fail. `runtime.NumCPU() < 2` skips for the same reason.
+Gate condition C4 replaced the draft's two-run wall comparison, which asserted a
+kernel scheduling fact against an unstated "materially shorter" threshold and was
+flaky under load. It is now a **single run** of four spinners
+(`for i in 1 2 3 4; do (while :; do :; done) & done; wait`) with
+`CPUTimeout: 1500ms` — comfortably more than one 100 ms sampling interval, so a
+single interval of overshoot cannot by itself push the elapsed wall past the
+budget — asserting:
+
+- `record.CPUUser + record.CPUSys >= CPUTimeout` (the kill was grounded in the
+  cumulative total), and
+- elapsed wall **< `CPUTimeout`**.
+
+A wall-clock mutant always yields elapsed >= budget, so it fails that second row
+deterministically. Contention honesty, because this is the one test a loaded box
+can distort: the achieved parallelism is computed from the run's own record,
+`(CPUUser+CPUSys) / elapsed`, and below 1.5 the claim is **unevaluated** and the
+test `t.Skip`s with the measured value logged — an honest unevaluated, never a
+fake pass and never a flaky fail. `runtime.NumCPU() < 2` skips for the same
+reason.
 
 ### 7.5 Scenario (c): the AIRA-126 arbitration race, for the CPU source
 
@@ -804,11 +904,20 @@ claim rather than assuming it.
 
 Hermetic and deterministic, reusing AIRA-126's own harness
 (`internal/runner/timeout_arbitration_linux_test.go`: `livenessScope`,
-`gatedStdin`, `aira126Harness`, extended with a `cpuBudget` option and an
-injected `readCgroupCPUFn`). `gatedStdin` holds the wait outcome past the fire
-instant, so the deadline branch is taken deterministically against a genuinely
-empty scope and a genuinely dead leader — no faked evidence, only the moment
-Launch learns of the wait:
+`gatedStdin`, `aira126Harness`) with an injected `readCgroupCPUFn`. `gatedStdin`
+holds the wait outcome past the fire instant, so the deadline branch is taken
+deterministically against a genuinely empty scope and a genuinely dead leader —
+no faked evidence, only the moment Launch learns of the wait.
+
+Gate condition C7 governs the injected reader: the budget crossing must become
+observable **only after the child's real exit**, never on a wall-clock
+coincidence. `overBudgetAfterLeaderExit` returns an honest, established 0 until
+the harness observes the leader's death through `readProcStatFn` — the same real
+kernel liveness `livenessScope` models `cgroup.procs` with — and only then a
+value far over the budget. The pre-start baseline read therefore lands on the
+honest 0, and the first sample that can fire is one taken after the child was
+already reaped. Per the existing `readProcStatFn` convention, no test that swaps
+`readCgroupCPUFn` is `t.Parallel`.
 
 - `TestAIRA136CPUBudgetAgainstAlreadyExitedLeaderArbitratesToExited` — the CPU
   budget fires against an already-empty scope. Required outcome, **identical to
@@ -818,19 +927,44 @@ Launch learns of the wait:
   or after the budget crossing is unestablished — §8); exactly one terminal
   record. Non-vacuity: the loop counts the iterations that actually took the
   deadline branch and fails if that count is zero (AIRA-126 gate condition C5).
+  Additionally, per gate condition C1, **`U_RUN_CPU_BUDGET_UNENFORCED` IS
+  present**: the requested budget was not applied, and this harness has no kernel
+  cgroup, so the "never measured" arm is the one that fires — the test asserts
+  `CPUUser == nil && CPUSys == nil` alongside it, so the code is provably raised
+  from the absence of evidence rather than from a measured zero. An
+  implementation that suppressed the code merely because the CPU deadline FIRED
+  reports a clean, fully-evaluated run here and fails this row. The "measured,
+  breached" arm is pinned separately by §7.4's both-codes row.
 - `TestAIRA136CPUBudgetWithLiveLeaderStillKills` — **the mutation guard, and the
   most important test in the set.** Same empty fake scope, but the leader is
   still alive at the fire (`emptyAfterFirstMembers`). `processLive` reads alive,
   the arbitration must refuse, and the record must be `killed` with
   `E_RUN_CPU_TIMEOUT` and today's reconcile-required/`handoff-unverified` shape.
   This is what stops the fix widening into "an empty scope means the run
-  finished" through the new source.
+  finished" through the new source. It is also C1's complement: this run IS
+  reported as terminated by its CPU budget, so `U_RUN_CPU_BUDGET_UNENFORCED` must
+  be **absent** — the one state that suppresses it.
 - `TestAIRA136CPUBudgetDoesNotDismissAForeignKillIntent` — `seedForeignIntent`
   plus a CPU fire: `IntentCreated` is false, no disposition, today's outcome.
-- `TestAIRA136DeadlineBranchTakenOnceUnderBothBounds` — both bounds set and both
-  breached; exactly one `kill-intent` event in the ledger and exactly one
-  terminal record. **This is the ledger-level proof that the CPU budget did not
-  become a second kill trigger.**
+- `TestAIRA136DeadlineBranchTakenOnceUnderBothBounds` — **the ledger-level proof
+  that the CPU budget did not become a second kill trigger.** Both bounds are
+  requested. The CPU budget is breached from the first sample (~100 ms); the wall
+  bound is set an order of magnitude beyond it. Under the multiplexed design the
+  source sends ONE value and returns, so the wall timer is structurally dead from
+  that instant and Launch's single deadline branch attributes the kill to the CPU
+  bound: `E_RUN_CPU_TIMEOUT` present, `E_RUN_TIMEOUT` absent,
+  `ScopeKill.Actor == "run-cpu-timeout"`, exactly one `kill-intent` event, exactly
+  one terminal record.
+
+  The attribution is what makes it non-porous, and it is worth saying why the
+  event count alone would not be. Against the two-independent-triggers design — a
+  bare wall timer left in Launch's select plus a separate goroutine that kills on
+  the CPU budget by itself — the independent goroutine's `killWithIntent` ADOPTS
+  the run's existing intent rather than creating a second one, so the ledger still
+  holds exactly one `kill-intent` event. What the mutant cannot fake is the
+  attribution: Launch's own select contains only the wall timer, so the record it
+  writes says `run-timeout`, an order of magnitude of wall clock later. Every
+  assertion on the CPU attribution fails against it, deterministically.
 
 Opt-in real-cgroup soak, for the same reason and in the same shape as
 `TestAIRA126RealCgroupDeadlineStraddleSoak` (plan §12.1: a ~2 % race needs a long
@@ -859,23 +993,67 @@ loop to be non-vacuous, and a long loop is a minute of suite time on every run):
 - Catalogue coverage is `internal/codes/produced_test.go`, bidirectionally, with
   no new test needed.
 
-**Executed revert (§7 is worthless without it).** With only the CPU wiring
-neutered — `startDeadlineSource` ignoring `cfg.CPU` — run
-`go test ./internal/runner/ ./internal/core/ ./internal/store/ -run 'AIRA136' -count=1`
-and record the exact exit code and the **named** failing tests. Expected to fail
-at minimum: §7.3 run B's pair partner (the CPU bound stops existing), §7.4's
-spinner kill, §7.5's arbitration and mutation-guard pair. Expected to **pass on
-both sides**, and recorded as such: `TestAIRA136UnreadableCPUStatNeverFires`,
-`TestAIRA136RealCgroupWallBoundStillWinsOnASpinner`,
-`TestAIRA136CPUBudgetDoesNotDismissAForeignKillIntent` — the over-widening guards.
+**Executed reverts (§7 is worthless without them).** Both were run, not read.
+Gate condition C8 requires the exact exit codes and named failing tests, so they
+are recorded here.
 
-A second revert, of the *multiplexing* only (restoring a bare wall timer and
-adding an independent CPU-kill goroutine), must fail
-`TestAIRA136DeadlineBranchTakenOnceUnderBothBounds`. That is the executed proof
-that the single-trigger property is actually enforced by a test and not merely
-asserted by this document.
+**Revert 1 — the CPU wiring neutered.** `startDeadlineSource` builds the source
+as usual but the CPU branch can never fire (`tick = nil` after the ticker is
+created, so the wall bound and the source's lifecycle are untouched and no test
+dies on a nil source instead of on the property under test).
 
-Then restore, confirm `git status --porcelain` is empty, and re-run the gate.
+```
+AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/ ./internal/core/ ./internal/store/ -run 'AIRA136' -count=1
+exit 1
+```
+
+Failing tests, named:
+
+| test | what it proves the mutant lacks |
+|---|---|
+| `TestAIRA136DeadlineSourceCPUFireCarriesCPUActorAndCode` | the CPU bound exists at all |
+| `TestAIRA136CPUBudgetIsMeasuredFromItsBaseline` | it is measured from the baseline |
+| `TestAIRA136LostBaselineAdoptsFirstSampleAndFiresLate` | the lost-baseline adoption |
+| `TestAIRA136UnreadableCPUStatNeverFires` | its own non-vacuity counter: a blind sampler is not the same as a sampler that never runs |
+| `TestAIRA136CPUBudgetAgainstAlreadyExitedLeaderArbitratesToExited` | the non-vacuity counter — the deadline branch was never taken |
+| `TestAIRA136CPUBudgetWithLiveLeaderStillKills` | the CPU bound kills a live leader |
+| `TestAIRA136DeadlineBranchTakenOnceUnderBothBounds` | the CPU bound wins over a far-away wall bound |
+| `TestAIRA136RealCgroupSpinnerExceedsCPUBudgetAndIsKilled` | scenario (b) |
+| `TestAIRA136RealCgroupBudgetIsCumulativeAcrossTheScope` | the cumulative-across-the-scope claim |
+
+`TestAIRA136UnreadableCPUStatNeverFires` was expected to pass on both sides and
+did **not**: its `reader.count() == 0` non-vacuity guard fails when the sampler
+never runs at all. That is the guard doing its job and is recorded rather than
+smoothed over. Everything else in the `AIRA136` set passed on both sides — the
+pure rules, the wall-bound tests, and, as the plan predicted, the over-widening
+guards `TestAIRA136RealCgroupWallBoundStillWinsOnASpinner` and
+`TestAIRA136CPUBudgetDoesNotDismissAForeignKillIntent`, plus
+`TestAIRA136RealCgroupSleepingJobIsNotKilledByCPUBudget` (a sleeping job is not
+killed either way) and `TestAIRA136RealCgroupWallKillOverTheCPUBudgetCarriesBothCodes`
+(its sampler is deliberately blind already).
+
+**Revert 2 — the multiplexing only.** Launch's source keeps the wall bound
+(`CPU: 0`) and the CPU budget becomes a second, independent goroutine with its
+own `killWithIntent` call site — the exact shape §4 refuses.
+
+```
+AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/ -run 'AIRA136DeadlineBranchTakenOnceUnderBothBounds' -count=1
+exit 1
+```
+
+`TestAIRA136DeadlineBranchTakenOnceUnderBothBounds` failed, and the failure is
+worth reading rather than merely counting: the mutant returned
+`U_RUN_RECONCILE_REQUIRED: kill intent won before terminal evidence` with a
+**non-terminal `running` record** carrying
+`[E_RUN_SCOPE_MIGRATION E_RUN_TIMEOUT U_RUN_RECONCILE_REQUIRED U_RUN_CPU_BUDGET_UNENFORCED]`.
+The independent trigger published an intent Launch's own deadline branch could
+not disposition, the terminal CAS refused, and the run was left unevaluated and
+mis-attributed to the wall bound. That is the intent-arbitration hazard AIRA-126
+exists to prevent, reproduced in the new shape, and it is why the CPU budget is
+multiplexed rather than added.
+
+Both reverts were then restored and the tree confirmed clean before the gate was
+re-run.
 
 ### 7.7 Merge gate — foreground, exact exit codes recorded
 
@@ -888,6 +1066,15 @@ gofmt -l internal/ cmd/
 
 Run serially, in the foreground, each to completion, with its exact exit code
 recorded. No truncated-output green claims.
+
+**Executed, on the restored tree:**
+
+| command | exit |
+|---|---:|
+| `aira confine -- go build ./...` | 0 |
+| `aira confine -- go vet ./...` | 0 |
+| `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` | 0 |
+| `gofmt -l internal/ cmd/` | 0, empty output |
 
 ---
 
@@ -917,9 +1104,34 @@ report the established facts (the child exited by itself with status N, by
 `wait4`; no signal was delivered, by control flow), and let the durable intent
 carry the record that a bound fired and killed nothing.
 
-`CleanSuccess()` can therefore be true for a run whose CPU budget fired and
-delivered nothing. That is correct and is the same conclusion AIRA-126 reached:
-the command succeeded and the bound had no effect on it.
+**Where the CPU source's reasoning STOPS transferring, and gate condition C1.**
+The paragraphs above are about the *ordering* — whether the child's exit fell
+before or after the budget crossing — and that is genuinely unestablished, so no
+`E_RUN_CPU_TIMEOUT` is appended. But the CPU source has a second fact AIRA-126's
+wall source does not: the **final total**, read at teardown, is a two-sided
+measurement of what the job actually consumed. When that total reaches the
+budget, the breach itself is established even though the ordering is not, and
+nothing enforced it. That is a different claim from the ordering, and it is the
+claim `U_RUN_CPU_BUDGET_UNENFORCED` carries.
+
+So the draft's rule — suppress on "the CPU deadline fired" — was wrong, and the
+counterexample is exact. Budget 300 ms; a job burns 350 ms of CPU and exits. If
+it exits between ticks, no fire ever happens and the teardown total 350 >= 300
+raises the code. If a tick lands one interval later against the now-empty scope,
+AIRA-126's arbitration commits the exited-0 record and the draft rule returned
+false, so the record was a clean success with no code at all. Identical job
+behaviour, different records, decided by sampler phase — and the second is a fake
+pass. The rule therefore suppresses only on `killedByCPUBudget`, an EXECUTED CPU
+kill; an arbitrated exit, a wall-clock kill and a plain exit are all decided by
+the teardown total.
+
+`CleanSuccess()` is therefore true for such a run **only when the final total is
+under the budget**. A run whose CPU budget fired, delivered nothing, and whose
+measured total reached the budget carries `U_RUN_CPU_BUDGET_UNENFORCED` and is
+consequently not a clean success — which is the honest report, because the
+operator asked for a bound and did not get it. Where the total is under the
+budget, AIRA-126's conclusion stands unchanged: the command succeeded and the
+bound had no effect on it.
 
 ---
 
@@ -936,7 +1148,13 @@ the command succeeded and the bound had no effect on it.
 4. **`aira confine` has no CPU bound** (§3.2), and `aira run --detach` refuses the
    combination (§3.3) until AIRA-131 lands. Both are filed, not silently absent.
 5. **Simultaneous breach of both bounds** records the one Go's select picked. The
-   other is not asserted, because no ordering was established.
+   other is not asserted, because no ordering was established. This is about
+   which bound did the KILLING, and is separate from the record shape gate
+   condition C6 pins: a wall-clock kill whose final measured total also crosses
+   the CPU budget carries `E_RUN_TIMEOUT` **and**
+   `U_RUN_CPU_BUDGET_UNENFORCED`, with `ScopeKill.Actor == "run-timeout"`. There
+   is no ambiguity there and nothing is suppressed — one bound killed the run and
+   the other was measured, breached, and not applied.
 6. **Everything AIRA-126 §8 already accepts** applies unchanged to the CPU
    source, because it is the same code: the crash window between arbitration and
    terminal append, the bounded-receive expiry, and a foreign concurrent intent.
@@ -945,7 +1163,7 @@ the command succeeded and the bound had no effect on it.
    today, and any future run-side analogue of confine's `ci-shim` mode, which
    `confine.go:177-198` already describes as "there IS no scope"), every
    `cpu.stat` read is unevaluated, the budget can never fire, and a *requested*
-   budget therefore ends the run with `U_RUN_CPU_BUDGET_UNEVALUATED` (§4.5).
+   budget therefore ends the run with `U_RUN_CPU_BUDGET_UNENFORCED` (§4.5).
    That is the intended outcome and the reason §4.5's rule is worth its code: the
    alternative is a run that reports clean success under a bound the machine was
    structurally incapable of applying. It is stated here so the code is read as

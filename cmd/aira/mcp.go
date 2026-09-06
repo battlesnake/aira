@@ -529,6 +529,9 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		if _, ok := args["timeout"]; !ok {
 			args["timeout"] = ""
 		}
+		if _, ok := args["cpu_timeout"]; !ok {
+			args["cpu_timeout"] = ""
+		}
 		for _, name := range []string{"ticket", "phase", "label", "tool", "report", "report_stream", "suite", "shard", "retry", "usage", "provider"} {
 			if _, ok := args[name]; !ok {
 				args[name] = ""

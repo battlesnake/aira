@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-136","project":"aira","title":"aira run/confine: express a job timeout in cumulative CPU-time, not just wall-clock","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["confine","runner"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-136","project":"aira","title":"aira run/confine: express a job timeout in cumulative CPU-time, not just wall-clock","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["confine","runner"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-138","to":"AIRA-136"}]}
 ---
 Requested directly by the owner, 2026-09-06.
 
@@ -88,3 +88,77 @@ timeout source integrates with AIRA-126's arbitration without reintroducing
 a race -- a CPU-time-budget-exceeded event racing the job's own clean exit at
 the same instant must resolve the same principled way AIRA-126 already
 resolves that race for the wall-clock source, not a hand-wavy 'good enough'.
+
+## Resolution (in-review)
+
+Plan: `docs/superpowers/plans/2026-09-06-aira136-cpu-time-timeout-plan.md`
+(GATE-PASS-WITH-CONDITIONS; §0 of the plan maps each of C1-C8 to where it landed).
+
+`aira run --cpu-timeout DURATION` bounds a run by the CUMULATIVE user+system CPU
+time charged to its cgroup, read from `cpu.stat` -- the same pair the record
+already stores as `cpu_user`/`cpu_sys`, so the number a kill was decided on and
+the number in the record are the same quantity by construction.
+
+The mechanism is deliberately NOT a second kill trigger. Both bounds are
+multiplexed into ONE `deadlineSource` (`internal/runner/deadline_linux.go`) that
+emits at most one value, so Launch keeps exactly one deadline branch, exactly one
+`killWithIntent` call site, and AIRA-126's kill/terminal arbitration is reached
+identically for either bound -- the only change inside that block is the literal
+`"run-timeout"` becoming `fired.Actor`. The executed multiplexing revert (below)
+shows what the rejected shape actually costs.
+
+Sampling is 100ms, its own constant, chosen on OVERSHOOT rather than cost
+(interval x achieved parallelism, ~1.6 cpu-s on a 16-way box). Every mechanism
+here errs the same way -- a coarse interval, a lost baseline, an unevaluated
+sample -- and the error is always "fires later than the budget", never "kills a
+job that had not reached it".
+
+New codes: `E_RUN_CPU_TIMEOUT` (exit 3, the CPU twin of `E_RUN_TIMEOUT`; the gate
+command lane maps both to `U_GATE_COMMAND_TIMEOUT`) and
+`U_RUN_CPU_BUDGET_UNENFORCED` (exit 3), which says a REQUESTED budget was not
+applied and covers two states stated in full in `codes.go` and spec §6.4: never
+measured, or measured-breached-but-not-enforced. Only an EXECUTED CPU-budget kill
+suppresses it, so a wall-clock kill whose final total also crosses the CPU budget
+carries BOTH codes with `scope_kill.actor == "run-timeout"`, and an AIRA-126
+arbitrated exit over budget carries it too. Suppressing on "the deadline fired"
+would have made the record depend on sampler phase.
+
+### Deferrals, filed not silent
+
+- **`aira confine` gets no CPU bound** -- filed as **AIRA-138** (`relates`
+  AIRA-136) in this PR, carrying the full analysis. confine has NO job deadline
+  of any kind today: its wait is an unconditional `waitConfineCommand`, with no
+  select, timer, kill trigger, kill-intent ledger or terminal CAS. Adding one is
+  building confine's FIRST deadline-and-kill path in a supervisor with different
+  kill semantics and deliberately no run ledger -- the whole AIRA-126 class of
+  question again, in a second location. This is surfaced explicitly because the
+  ticket title named `aira run/confine` and `aira confine` is where heavy suites
+  on a loaded box actually run: **the owner can override this deferral before
+  merge rather than discover it after.**
+- **`--cpu-timeout` with `--detach` is REFUSED** (`E_RUN_ARGUMENT_INVALID`), not
+  silently ignored, until AIRA-131 gives the detached branch AIRA-126's
+  arbitration. A bound the operator asked for and did not get is a fake pass.
+
+### Evidence
+
+Executed reverts, both run rather than read (plan §7.6 has the full named lists):
+
+- CPU wiring neutered: exit 1, nine named AIRA136 failures including the
+  scenario (b) spinner kill, the cumulative-across-the-scope row, and both
+  arbitration tests' non-vacuity counters.
+- Multiplexing only reverted (bare wall timer + an independent CPU-kill
+  goroutine): exit 1 on `TestAIRA136DeadlineBranchTakenOnceUnderBothBounds`, and
+  the mutant did not merely mis-attribute the kill -- it returned
+  `U_RUN_RECONCILE_REQUIRED: kill intent won before terminal evidence` with a
+  NON-TERMINAL `running` record. That is the AIRA-126 hazard reproduced in the
+  new shape.
+
+The build also corrected one incomplete claim in the plan: `cmd/aira/mcp.go`
+hand-maintains a default for every `run` argument so the MCP and CLI faces
+construct an identical `core.Request`, and the plan's "generated surfaces need no
+separate edit" missed it. The existing MCP/CLI parity tests caught it. Recorded
+in plan §6.1 rather than quietly fixed.
+
+Accepted coverage gaps are plan §9 (sampling overshoot; sub-interval budgets;
+baseline skew; confine and detach; simultaneous breach; no-kernel-cgroup
+enforcement; contention itself not reproduced in tests).
