@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-128","project":"aira","title":"aira confine's default reservation estimate under-provisions the standalone `make test-lite` signature, producing phantom OOM-kill failures","status":"in-review","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","estimator","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-128","project":"aira","title":"aira confine's default reservation estimate under-provisions the standalone `make test-lite` signature, producing phantom OOM-kill failures","status":"done","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","estimator","honesty"],"hold":false,"relations":[]}
 ---
 Reported by peer session 'speed' relaying peer 'money's' evidence, 2026-09-06 (landing
 their #1199), NARROWED by speed's own follow-up correction the same day. Money's own numbers,
@@ -139,7 +139,7 @@ the same signature is admitted at a materially higher, OOM-escalated reserve. A 
 calls resolveAdmitReserve directly with synthetic OOMCount>0 stats would be porous for hypothesis
 2 -- it must exercise a REAL OOM event's attribution path, not just the escalation arithmetic.
 
-## Resolution (2026-09-06) — verified: hypothesis 1 confirmed, hypothesis 2 refuted, no estimator defect
+## Resolution (done — PR #78 merged as 4eda4cc, 2026-09-06) — verified: hypothesis 1 confirmed, hypothesis 2 refuted, no estimator defect
 
 Investigated by reproduction under `AIRA_REAL_CGROUP=1` on the live daemon before any
 code was written, exactly as the hand-off notes required. **Every number below is a
