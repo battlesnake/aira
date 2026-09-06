@@ -842,7 +842,7 @@ truncated output, reported as `pass` / `fail` / `unevaluated`.
 | `internal/daemon/admit.go` | `admitWaiter.exclusive` / `exclusiveHolder` / `parentScopeID`; derived drain/hold; §5.2 gate; §5.3 refusal; §5.4 validation; `liveScopes`/`liveScopesKnown`/`scanFailingSince`; §6.2 abort; exclusive ceiling; `admitRejection.Exclusive`; snapshot exposes exclusive state |
 | `internal/daemon/worker_admit.go` | §12.2 gate before the outer-scope lock; new reason token |
 | `internal/daemon/confine_manage.go` | populate `ConfineSliceReserve.Exclusive` from the same snapshot |
-| `internal/daemon/protocol.go`, `internal/codes/codes.go` | `U_ADMIT_EXCLUSIVE_UNESTABLISHED` (3), `E_ADMIT_EXCLUSIVE_ACTIVE` (1) — `produced_test.go` enforces both directions |
+| `internal/daemon/protocol.go`, `internal/codes/codes.go` | `U_ADMIT_EXCLUSIVE_UNESTABLISHED` (3), `E_ADMIT_EXCLUSIVE_ACTIVE` (1 as planned here; **superseded — AIRA-124 moved it to 4**, joining `E_ADMIT_SATURATED`, because both report that an exclusive job holds the slice) — `produced_test.go` enforces both directions |
 | `internal/runner/confine_manage.go` / `_linux.go` | `ConfineExclusiveState`; `ConfineSliceReserve.Exclusive`; `ConfineRecord.SubtreePopulated` + subtree-aware scan (§6.1) |
 | `internal/runner/confine.go` | `ConfineRequest.Exclusive`; `AdmitExclusiveWaitCeiling`; trailer `exclusive=` facet (§9.3) |
 | `internal/runner/confine_linux.go` | `AIRA_CONFINE_EXCLUSIVE` into the job env (§8 constraints); §9.4 lease watcher |

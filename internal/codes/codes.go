@@ -214,13 +214,30 @@ var ExitCodes = map[string]int{
 	// actually needs from an exit status alone: 2 means fix the request, 4 means
 	// retry when the box is free.
 	"E_ADMIT_TOO_LARGE": 2, "E_ADMIT_SATURATED": 4,
-	// AIRA-101's two exclusive-admission refusals. E_ADMIT_EXCLUSIVE_ACTIVE is an
-	// ordinary refusal — another benchmark holds the slice, retry later — so it
-	// takes 1. U_ADMIT_EXCLUSIVE_UNESTABLISHED exits 3 with the rest of the U_
-	// vocabulary because it is genuinely UNEVALUATED: the daemon could not read
-	// the slice to establish emptiness, which is not the same claim as "the slice
-	// is busy" and must never be reported as one.
-	"E_ADMIT_EXCLUSIVE_ACTIVE": 1, "U_ADMIT_EXCLUSIVE_UNESTABLISHED": 3,
+	// AIRA-101's two exclusive-admission refusals. AIRA-101 catalogued
+	// E_ADMIT_EXCLUSIVE_ACTIVE at 1 as "an ordinary refusal — another benchmark
+	// holds the slice, retry later". AIRA-124 moved it to 4, because that reading
+	// splits ONE machine condition across two exit statuses. The condition is
+	// "an exclusive job holds this slice"; it reaches a caller down two paths:
+	// a second `--exclusive` request is refused with E_ADMIT_EXCLUSIVE_ACTIVE,
+	// while an ordinary job that waits out its admission budget behind the same
+	// holder is refused with E_ADMIT_SATURATED, whose message says literally
+	// "the slice is held exclusively by another job for benchmarking; retry when
+	// it finishes" (runner/admission_linux.go, rejection.Exclusive == "held").
+	// E_ADMIT_SATURATED is 4 by AIRA-107 as host capacity exhaustion, and that is
+	// what this is too: temporary capacity exhaustion of the whole slice, cured
+	// by waiting rather than by editing the request or the project's durable
+	// state. An agent branching on the exit status alone — the thing the buckets
+	// exist for — must see one number for one condition, and 4 already means
+	// "retry when the box is free". The confine face agrees: the runner wraps
+	// this refusal as E_CONFINE_UNAVAILABLE, which is 4, so 1 here was also out
+	// of line with the exit the CLI actually produces for the same event.
+	//
+	// U_ADMIT_EXCLUSIVE_UNESTABLISHED exits 3 with the rest of the U_ vocabulary
+	// because it is genuinely UNEVALUATED: the daemon could not read the slice to
+	// establish emptiness, which is not the same claim as "the slice is busy" and
+	// must never be reported as one. AIRA-124 did not touch it.
+	"E_ADMIT_EXCLUSIVE_ACTIVE": 4, "U_ADMIT_EXCLUSIVE_UNESTABLISHED": 3,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
 	"U_CONFINE_NOT_LAUNCHED": 3, "U_CONFINE_KILL_UNCONFIRMED": 3,
 	// AIRA-22's detached confine surface, mirroring the run-detach pair
