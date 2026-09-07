@@ -207,3 +207,51 @@ a verbose targeted run with `AIRA_REAL_CGROUP=1` shows
 (0.47s)` and `--- PASS: TestOOMSelfHealFixtureStaysOffTheCeilingClamp`, with **no
 SKIP**, alongside the other six §7.3 must-stay-green tests. A skip would have
 been reported as `unevaluated`, never as a pass.
+
+## Merged (2026-09-07)
+
+PR #101 merged to master as **`030b8cb`** (merge commit; branch head
+`5c20036`, base `16b9141`).
+
+### Fable work-review record (final gate)
+
+Verdict **MERGE**. Verified from source and by re-running, not from the build
+summary:
+
+- **Scope exact.** Production diff is one hunk in `internal/daemon/admit.go`
+  (the clamp nested inside `escalated > reserve`, strict comparison and the
+  `MaxOOMPeak < ceiling && reserve > ceiling` guard retained verbatim) plus one
+  clause in `internal/core/skill.go`. `ResolveConfineReserve` /
+  `DefaultConfineMemoryReserve` (AIRA-153's territory), `checkedAvailable`,
+  `admitConnection`, the enqueue-time re-check and
+  `resolveDelegateRAMScopeCeiling` are untouched.
+- **Expectations moved: exactly four sites**, each the plan's own accepted
+  cost — `admit_oom_basis_test.go` rows e/measured and e/malformed (T4c);
+  `admit_saturated_diagnosis_test.go` `oomClampedHistory()` + eight
+  `const maximum` (T4; the ninth `4 << 30` in that file is the pre-existing
+  `peak` constant, and the two 8 GiB declarations are untouched, no assertion
+  changed); `admission_insight_test.go` comment only (T4b); `skill_test.go` one
+  added pin (T7).
+- **AIRA-128's real-cgroup fixture unedited and PASS** under
+  `AIRA_REAL_CGROUP=1` (0.71s, no SKIP) — row (d), as §1.3 predicted. AIRA-149's
+  facet-2b fixtures affected exactly as R3 predicted: re-based onto row (b),
+  asserting `Required == run.ceiling` and `Grantable == run.ceiling - 4096`
+  derived from each test's own `maximum`.
+- **Mutation evidence reproduced independently** in a detached throwaway
+  worktree: M1 (master's `admit.go`) reddens exactly T1 rows
+  e-default/e-malformed/c-prime/tie, T2, T3 (5.02s deadline, not a hang) and
+  the two moved basis rows, with rows (a)/(b) and every `TestSaturated*`
+  fixture green; M2 (`>=`) reddens exactly the `tie` row; M3 (clamp deleted)
+  reddens row (b) in both tables, `TestConfineEstimatorAndOOMEscalationClamp`,
+  `TestSliceCeilingDoesNotReachTheOOMEscalationClamp` and every re-based
+  facet-2b fixture — a narrowing, not a deletion.
+- **Bookkeeping follows the approved plan**, not the build brief's parenthetical:
+  AIRA-150 stays `planned`, narrowed (G1, plan-gate ruling §10 Q5); AIRA-152
+  stays `planned` with the owner decision recorded (G6). Both are the truthful
+  treatment — AIRA-150's defect persists on row (b), and AIRA-152 is compatible
+  rather than superseded. If the owner overrides the gate, each is a one-line
+  status flip.
+- **Incidental, pre-existing, not this branch:** `aira reconcile` fails with
+  `E_JOURNAL_CORRUPT: invalid run ledger record` (exit 4) identically from the
+  master root at `16b9141`. Machine state (the run ledger); worth a dogfood
+  ticket.
