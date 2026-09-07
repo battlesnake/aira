@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-138","project":"aira","title":"aira confine: a job deadline, including cumulative CPU-time, for a supervisor with no run ledger","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","runner"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-138","project":"aira","title":"aira confine: a job deadline, including cumulative CPU-time, for a supervisor with no run ledger","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","runner"],"hold":false,"relations":[]}
 ---
 Deferred out of AIRA-136 (which added `--cpu-timeout` to `aira run` only), and
 surfaced as its own ticket rather than left implicit, because the AIRA-136
@@ -90,10 +90,13 @@ already available (scope empty by two reads, `cgroup.kill` written against
 nothing, `processLive == processDead`, the real outcome pending unread in the
 wait channel). Deterministic via AIRA-126's `gatedStdin`, 5/5, no soak.
 
-## Resolution (implemented, in review)
+## Resolution
 
 Built exactly to the gated plan revision 2
-(`docs/superpowers/plans/2026-09-07-aira138-confine-deadline-plan.md`, `02a4eee`).
+(`docs/superpowers/plans/2026-09-07-aira138-confine-deadline-plan.md`;
+`02a4eee` is the plan-fix SHA in the builder's own pre-rebase reflog, `ae99c72`
+on the merged branch — noted by the build review as a doc-accuracy nit, fixed
+here).
 `aira confine` now accepts `--timeout DURATION` and `--cpu-timeout DURATION`
 in the launch form only, both clocks starting at the RELEASE WRITE so neither
 includes the admission wait or the setup handshake.
@@ -192,3 +195,16 @@ reproduced in tests; AIRA-70's irreducible signal window is untouched.
 `aira run` carries the same leaf-only kill-gate defect and is filed separately as
 **AIRA-140**, with this ticket's `deadlineConfineScope` fake and reproduction
 written to be reused there.
+
+## Merged
+
+PR #88, merge commit `d1a761b`. Fable's build review found one real issue — a
+test-harness-only data race on a package-level `readProcStatFn` swap racing
+the membership-monitor goroutine in `TestAIRA138...` (production code was not
+racy) — fixed in commit `76dd536` before merging. Independently re-verified
+after recovering from a session-limit interruption mid-merge: `go build`,
+`go vet`, and the full `AIRA_REAL_CGROUP=1 go test ./...` all exit 0; `-race
+-run AIRA138` flaked once under extreme shared-box contention (a scope not
+yet empty at a timing-sensitive fire) and passed clean 21/21 on an immediate
+retry with zero changes — consistent with this session's other observed
+environment-load flakes tonight, not a regression.
