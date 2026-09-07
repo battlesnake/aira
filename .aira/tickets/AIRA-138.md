@@ -43,3 +43,49 @@ own ticket warns against, in a second location.
   killed confine job is as auditable as a killed run record.
 
 Correctness-critical: full two-loop per CLAUDE.md, not the light path.
+
+## Plan (committed, awaiting plan-gate review)
+
+`docs/superpowers/plans/2026-09-07-aira138-confine-deadline-plan.md`, on branch
+`aira138-confine-deadline`. What it decides:
+
+- **Yes**, confine gets a deadline, and **both** bounds in one design:
+  `--timeout` and `--cpu-timeout`, names identical to `aira run`'s, launch-form
+  only. `timeout(1)` is not an answer even for the wall case — it signals the
+  SUPERVISOR, which renders as `terminated-by=supervisor-signal:SIGTERM`,
+  indistinguishable from an operator's Ctrl-C. `ulimit -t` is per-process and
+  `cpu.max` is a throttle, so the CPU bound has no external equivalent at all.
+- **The ledger-less arbitration.** AIRA-126's failure had two halves: (a) a
+  durable artifact asserting a kill that never happened, and (b) the child's real
+  exit being discarded. Half (a) does not exist in foreground confine, so
+  `decideTimeoutIntentNotExecuted` is deliberately NOT transplanted — passing
+  `IntentPublished`/`IntentCreated` as true for a ledger that does not exist
+  would be a lie wearing the costume of reuse. Half (b) transplants exactly:
+  **confine's durable evidence is its exit code and its trailer**, and a confine
+  fabrication is final the instant it is printed (`ConfineResult` has no
+  `ErrorCodes`, and there is no reconcile pass to correct it later). A new pure
+  rule `decideConfineDeadlineNotExecuted` keeps AIRA-126's two EVIDENCE conjuncts
+  verbatim (`Empty && !Started`; `leader == processDead`) and drops only the two
+  ledger ones.
+- **Three arms**: killed / not-executed (drain-then-report the child's real exit,
+  with no ledger write at the end — exactly the shape the ticket anticipated) /
+  unevaluated. A bounded drain that expires degrades to unevaluated, never to a
+  kill claim.
+- **Trailer**: yes — two fields, `timeout=` and `cpu-timeout=`, present only when
+  that bound was requested, with a closed state vocabulary including
+  `fired-not-executed` and (CPU only) `unenforced`. They are load-bearing rather
+  than decorative, because the exit code stays a pass-through of the job's.
+- **Verified in source, not assumed**: confine DOES have `--detach`, and its
+  supervisor calls the same `Confine`, so detach is in scope and gets both bounds
+  through the one arbitration site — to be proved by a test, not by reading.
+  ci-shim mode REFUSES both bounds, fail-closed (no `cpu.stat`, no `cgroup.kill`).
+
+Reproduction / danger proof, committed with the plan:
+`internal/runner/confine_deadline_danger_linux_test.go`. Since confine has no
+deadline code to make misbehave, the artifact proves the DANGER is real rather
+than theoretical: a minimal naive first draft, built from confine's real
+primitives, reports `exit 137` and a deadline attribution for a child that exited
+`7` normally having signalled nothing — while every input needed to refuse was
+already available (scope empty by two reads, `cgroup.kill` written against
+nothing, `processLive == processDead`, the real outcome pending unread in the
+wait channel). Deterministic via AIRA-126's `gatedStdin`, 5/5, no soak.
