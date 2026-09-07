@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-146","project":"aira","title":"quiescePTYScope's hadDescendants read is leaf-only, so a nested-cgroup descendant it actually reclaims is reported as a clean success (false-green)","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-146","project":"aira","title":"quiescePTYScope's hadDescendants read is leaf-only, so a nested-cgroup descendant it actually reclaims is reported as a clean success (false-green)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Accepted gap recommended for its own ticket during AIRA-143's build (PR #91,
