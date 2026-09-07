@@ -106,7 +106,101 @@ def pytest_runtestloop(session):
             unevaluated += 1
     print("aitest: %d passed, %d failed, %d skipped, %d error, %d unevaluated" % (passed, failed, skipped, error, unevaluated))
     session.testsfailed = failed + error + unevaluated
+    # AIRA-161: hand the SAME count to pytest_terminal_summary below, so the
+    # distinction survives to the bottom of the log, where a consumer actually
+    # reads the failure total. Nothing is recomputed there: one count reported
+    # in two places, which is why the two lines can never contradict each other.
+    session.config.stash[_UNEVALUATED_COUNT_KEY] = unevaluated
     return True
+
+
+# Set only by pytest_runtestloop above, and only when the pool actually ran.
+# Per-Config, never a module global: an in-process pytester run nests a second
+# pytest session in this same process, and a module global would leak the inner
+# session's count into the outer session's summary. StashKey is pytest's own
+# public, collision-free way to attach plugin state to a Config.
+_UNEVALUATED_COUNT_KEY = pytest.StashKey()
+
+# Why an unevaluated result is reported as a failure at all, and what to do
+# about it -- stated once, next to the count, rather than left to be inferred
+# from an individual longrepr.
+_UNEVALUATED_SUMMARY_DETAIL = (
+    "Unevaluated means aitest never established a result for that test: the worker running",
+    "it died (an OOM kill, say) and its one retry died too, or admission was refused before",
+    'it ever ran. Each one is REPORTED as a failure because "unevaluated" is not a pytest',
+    "outcome and junitxml silently drops an unrecognised one -- so every such report's",
+    'longrepr begins "unevaluated: ", and aitest\'s own per-test lines earlier in this run',
+    'say "unevaluated" rather than "failed".',
+    "Re-run those tests to get a real result. They are not evidence that the code under",
+    "test is broken.",
+)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """AIRA-161: say, next to pytest's own failure count, how many of those
+    failures are aitest's synthesized unevaluated results rather than real test
+    failures.
+
+    Signature verified against pytest's own hookspec (_pytest/hookspec.py,
+    pytest 9.0.3): ``pytest_terminal_summary(terminalreporter, exitstatus,
+    config)``, called by TerminalReporter.pytest_sessionfinish. The reporter's
+    own wrapper hookimpl runs summary_failures() and friends BEFORE yielding to
+    other plugins' hookimpls, and short_test_summary() after, so these lines
+    land between the failure tracebacks and the final "N failed" stats line --
+    the part of the log a consumer actually reads.
+
+    This closes a LEGIBILITY gap only. Detection, the requeue-once, and the
+    synthesized report's deliberate outcome="failed" shape are untouched: that
+    shape is correct precisely BECAUSE junitxml silently drops an unrecognised
+    outcome, and a silently missing test is worse than one over-counted as a
+    failure. What was missing was the aggregate -- without it, separating
+    infrastructure-caused non-results from real failures meant grepping every
+    individual longrepr for the "unevaluated: " prefix, which is exactly what a
+    downstream consumer did not do when a run reporting ~370 failures was
+    nearly recorded as a genuinely red baseline.
+
+    Silent when the count is zero: the common case must not pay for this.
+
+    Not printed at all under -p no:terminal or --no-summary, where pytest never
+    calls this hook. Accepted rather than overlooked -- pytest's own failure
+    count, the number this contextualises, is equally absent there, and
+    aitest's terminalreporter-independent plain lines still carry the honest
+    three-way count."""
+    unevaluated = config.stash.get(_UNEVALUATED_COUNT_KEY, 0)
+    if not unevaluated:
+        # Either the aitest pool never ran this session, or every collected
+        # test got a real result. Say nothing.
+        return
+    # Mirrors terminal.py's own _get_reports_to_display filter, so this
+    # denominator is exactly the number pytest's "N failed" line displays,
+    # rather than a plausible-looking near-miss.
+    reported_failures = len(
+        [
+            report
+            for report in terminalreporter.stats.get("failed", ())
+            if getattr(report, "count_towards_summary", True)
+        ]
+    )
+    plural = "" if unevaluated == 1 else "s"
+    verb = "is" if unevaluated == 1 else "are"
+    real = "a real" if unevaluated == 1 else "real"
+    if reported_failures >= unevaluated:
+        headline = "aitest: %d of the %d failures pytest counted %s UNEVALUATED, not %s test failure%s." % (
+            unevaluated, reported_failures, verb, real, plural,
+        )
+    else:
+        # Defensive, and honest about the uncertainty rather than asserting a
+        # subset relationship that does not hold: this run's unevaluated
+        # results are not all inside pytest's own failure count (a synthesized
+        # report that never reached the terminal reporter, say). State both
+        # numbers and claim nothing about how they overlap.
+        headline = "aitest: %d result%s this run %s UNEVALUATED, not %s test failure%s (pytest counted %d failed)." % (
+            unevaluated, plural, verb, real, plural, reported_failures,
+        )
+    terminalreporter.write_sep("=", "aitest unevaluated results", yellow=True)
+    terminalreporter.write_line(headline, yellow=True)
+    for line in _UNEVALUATED_SUMMARY_DETAIL:
+        terminalreporter.write_line(line)
 
 
 def _resolve_worker_count(workers_option):
