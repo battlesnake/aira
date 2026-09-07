@@ -1406,17 +1406,37 @@ func drain(name string, rd io.ReadCloser, dst *os.File, out chan<- captureResult
 // quiescePTYScope removes every possible descendant slave reference before the
 // master drain is joined. cgroup.kill is intentional even when the leader was
 // the last observed member; waitEmpty is bounded by both ctx and runner grace.
+//
+// AIRA-146: the returned bool is a REPORT, not a gate — the cgroup.kill write
+// below is unconditional and recursive, so a descendant living in a child cgroup
+// of this scope is reclaimed whatever the reads say. What the bool decides is
+// whether that reclamation is recorded at all (ScopeDescendantKilled +
+// E_RUN_DESCENDANT_KILLED). It therefore needs the same two agreeing reads
+// AIRA-140 established for killScope's own gate: leaf cgroup.procs via Members()
+// AND subtree-aware cgroup.events populated via Empty(). They legitimately
+// disagree for a job whose processes live in child cgroups it created inside its
+// own scope (aitest / --delegate-ram / podman --cgroups=split), which reads
+// leaf-empty while fully busy — on the leaf read alone such a run silently
+// reclaimed a live descendant and then reported a clean success.
+//
+// Either read observing a population is positive evidence and reports it; only
+// two readable, agreeing empty reads may conclude that nothing was here. With no
+// positive evidence and an unreadable read the answer is not established, so the
+// error is returned (the caller turns that into ScopeHandoffUnverified +
+// U_RUN_RECONCILE_REQUIRED) rather than a fabricated clean success.
 func (r *Runner) quiescePTYScope(ctx context.Context, scope Scope) (bool, error) {
 	members, membersErr := scope.Members()
-	hadDescendants := len(members) > 0
+	empty, emptyErr := scope.Empty()
+	hadDescendants := (membersErr == nil && len(members) > 0) || (emptyErr == nil && !empty)
+	unevaluated := !hadDescendants && (membersErr != nil || emptyErr != nil)
 	if err := scope.Kill(); err != nil {
 		return hadDescendants, err
 	}
 	if err := waitEmpty(ctx, scope, r.grace); err != nil {
 		return hadDescendants, err
 	}
-	if membersErr != nil {
-		return false, membersErr
+	if unevaluated {
+		return false, errors.Join(membersErr, emptyErr)
 	}
 	return hadDescendants, nil
 }
