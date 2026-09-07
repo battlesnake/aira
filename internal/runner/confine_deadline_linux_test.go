@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -441,14 +442,26 @@ func TestAIRA138DeadlineWithLiveLeaderNeverArbitrates(t *testing.T) {
 func TestAIRA138DeadlineWithUnknownLeaderStaysUnevaluated(t *testing.T) {
 	scope := &deadlineConfineScope{}
 	gate := newDeadlineGatedStdin(aira126Scale(10 * time.Second))
+	// A stat that READS but cannot be parsed: processLive cannot establish
+	// liveness either way, which is processUnknown and not processDead. The
+	// swapped reader is INSTALLED before the launch, so the write to the package
+	// variable happens-before every goroutine the launch creates (the membership
+	// monitor reads it through processLive concurrently with the kill gate), and
+	// it is ARMED inside the gate through an atomic flag, so the launch's own
+	// identity establishment (which runs long before) still sees the real stat.
+	// Build review: writing the variable inside the hook was a data race against
+	// the monitor goroutine and turned the CI race lane red.
+	var malformed atomic.Bool
 	originalStat := readProcStatFn
+	readProcStatFn = func(pid int) ([]byte, error) {
+		if malformed.Load() {
+			return []byte("malformed"), nil
+		}
+		return originalStat(pid)
+	}
 	t.Cleanup(func() { readProcStatFn = originalStat })
 	scope.onFirstEmpty = func() {
-		// A stat that READS but cannot be parsed: processLive cannot establish
-		// liveness either way, which is processUnknown and not processDead. Swapped
-		// here, inside the gate, so the launch's own identity establishment (which
-		// ran long before) is untouched.
-		readProcStatFn = func(int) ([]byte, error) { return []byte("malformed"), nil }
+		malformed.Store(true)
 		gate.open()
 	}
 	swapCPUReader(t, overBudgetOnceLeaderIsDead(scope))
