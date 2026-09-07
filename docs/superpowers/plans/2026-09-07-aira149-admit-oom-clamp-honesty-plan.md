@@ -1,9 +1,31 @@
 # AIRA-149 — the OOM-escalation basis names a provenance its number does not have, and the wait it wedges reports a fabricated cause
 
-Status: **plan revision 1 — awaiting plan review and the Fable plan gate**. This
+Status: **plan revision 2 — awaiting plan review and the Fable plan gate**. This
 touches the machine-wide admission gate every `aira confine` job on this box goes
 through, so it is the full two-loop per `CLAUDE.md`, not the light path. **No
 implementation has begun**; this commit adds only this document.
+
+*Revision 2* is a self-review pass against the source at the same commit. It
+changes no direction and no adopted design; it repairs six places where the plan
+was less rigorous than the honesty rule it is trying to enforce:
+
+1. **§0** — the ticket's `MaxOOMPeak * 3 / 2` is a paraphrase; the real
+   escalation is overflow-guarded, and the function carries two flags the ticket
+   did not show. Recorded, and the guard pinned by I1.
+2. **§3.1** — rows (c)–(e) hard-coded one estimator spelling where several are
+   reachable. Now stated generically, with the `ConfinePeakHistory` invariant
+   that governs which can actually occur *established from the SQL* rather than
+   assumed.
+3. **§3.4 / T3** — the plan specified a T3 case (`SampleCount == 1` →
+   `…:n=1`) that its **own** scope could not deliver: that path exits at a
+   post-block `return` which never reads the `basis` local. T3 corrected, the
+   scope boundary written down, and T3b added to pin it.
+4. **I8** — an invariant cited twice as "§4.3" and never actually stated. Now
+   stated and tabulated against the evaluator's three refusal sites.
+5. **D4** — its reachability was overstated. Restated at its true reachability.
+6. **D1** — undercounted the defect ("two of four" outcomes mislabelled; it is
+   four of five). Corrected against §3.1's table, along with a stale
+   cross-reference in R2's source row.
 
 Ticket: `.aira/tickets/AIRA-149.md` (P2, `admission`/`confine`/`honesty`).
 Filed out of AIRA-139 (`19c6bf2`), which removed the flake at fixture level and
@@ -35,7 +57,9 @@ quotations were checked and are current.
 
 | Fact | Where | Confirmed |
 | --- | --- | --- |
-| the OOM branch, verbatim as the ticket quotes it | `internal/daemon/admit.go:1486-1503` | yes |
+| the OOM branch, structurally as the ticket quotes it | `internal/daemon/admit.go:1485-1503` | yes — **with two differences from the ticket's paraphrase, both re-read here** (next two rows) |
+| the escalation is **not** `MaxOOMPeak * 3 / 2` as the ticket writes it; it is the overflow-guarded `escalated := MaxOOMPeak; if escalated > math.MaxInt64-escalated/2 { escalated = math.MaxInt64 } else { escalated += escalated / 2 }` | `admit.go:1486-1491` | yes — arithmetically identical for every non-overflowing value, so the ticket's measured numbers stand; but the guard is real code this plan must preserve **byte-for-byte** (I1) |
+| `resolveAdmitReserve` also carries `historyUnavailable` and `insufficientSamples` flags the ticket's quote omits, consumed by the post-block fallbacks | `admit.go:1460-1461`, `1482-1486`, `1516-1523` | yes — the OOM branch `return`s before they are read, so they are untouched by this change; noted so the gate is not surprised by code the ticket did not show |
 | an unpinned confine request's reserve is *exactly* `DefaultConfineMemoryReserve` | `internal/runner/confine.go:103-119`, `confine.go:19` (`4 << 30`) | yes — `--memory-reserve`, `--memory-max` and `--delegate-ram` each set `pinned` |
 | a pinned request returns at the first line of `resolveAdmitReserve` | `admit.go:1454-1456` | yes |
 | the ordinary estimate needs ≥ 3 samples | `internal/runner/resource_estimate.go:33-41` (`memoryEstimateMinSamples`) | yes |
@@ -55,11 +79,13 @@ quotations were checked and are current.
 | `reserve-basis=` is space-delimited in the trailer, so a basis may contain commas but never spaces | `internal/runner/confine.go:897-900` | yes — existing bases already carry comma params (`estimate:max=%d,n=%d,f=115`) |
 | the evaluator computes `available` *before* the freeze check, and skips it only on the exclusivity `continue` | `admit.go:2240-2246`, `2247-2250` | yes |
 | the evaluator returns early, evaluating nobody, when the slice memory read fails | `admit.go:2157-2168` | yes — a waiter can time out having never been evaluated |
-| `oversubscriptionBlocks` requires `queue.capAggregate > 0`, which requires live scanned scopes | `internal/daemon/admit_oversubscription.go:299-307` | yes — load-bearing for the §4.3 invariant |
+| `oversubscriptionBlocks` requires `queue.capAggregate > 0`, which requires live scanned scopes | `internal/daemon/admit_oversubscription.go:299-307` | yes — load-bearing for **I8** |
+| the evaluator's three refusal sites are the exclusivity `continue` (`gate.blocks`), the freeze `continue`, and the capacity branch `waiter.reserve > available \|\| overSubscribed` | `admit.go:2235-2238`, `2245-2248`, `2259-2262` | yes — these are exactly the branches §3.5 latches in, and they are the whole set |
+| `queue.outstandingJobs` and `queue.adoptedJobs` are real `sliceQueue` fields under `queue.mu` | `admit.go:619`, `621` | yes — §3.5's rule is written against real field names, not invented ones |
 | the AIRA-128 fixture's phase 3 is *exactly* the "escalation did not determine the value" case, and its own comment says so | `internal/daemon/confine_oom_selfheal_real_cgroup_linux_test.go:73-85` | yes — "what phase 3 pins is the escalation's ATTRIBUTION … not the escalated VALUE" |
 | that fixture's phase-3 assertion is `ReserveBasis != "estimate:oom-escalated"` → fail | same file, `:256-259`, and the unit twin at `:320-323` | yes |
 | the agent guide sells the label to agents | `internal/core/skill.go:324`; pinned by `internal/core/skill_test.go:644` | yes |
-| `estimate%` is the SQL predicate for the AIRA-52 gauge population | `internal/runner/estimate_actual.go:47` | yes — §5.2 |
+| `estimate%` is the SQL predicate for the AIRA-52 gauge population | `internal/runner/estimate_actual.go:47` | yes — see **R2** |
 
 Measured evidence carried over from the ticket and re-derived against the code
 above (arithmetic checked by hand, not re-run):
@@ -80,10 +106,18 @@ Neither the escalation nor any estimate appears in that answer.
 ## 1. What is actually wrong, stated as defects
 
 **D1 (facet 1).** `estimate:oom-escalated` is returned unconditionally by the OOM
-branch, including when the escalation did not determine the returned value. Two
-of the branch's four reachable outcomes therefore carry a false label, and one of
-those two — no usable ordinary estimate, escalation below the client's reserve —
-is the *normal* state immediately after a first OOM.
+branch, including when the escalation did not determine the returned value.
+Counted against §3.1's table: of the branch's five outcomes, **only row (a)**
+— the escalation strictly raised the reserve and no clamp followed — carries a
+label that matches its number. Rows (b)–(e) all report a 1.5×-OOM-peak
+provenance for a value that is either the ceiling or the client's own default.
+And row (d)/(e) — no usable ordinary estimate, escalation below the client's
+reserve — is the *normal* state immediately after a first OOM, i.e. exactly when
+the self-heal is supposed to be acting.
+
+(Revision 1 of this plan said "two of the branch's four reachable outcomes".
+That was an undercount on both terms — the table has five rows, and four of them
+mislabel — and it is corrected here rather than left to the gate to notice.)
 
 **D2 (facet 2b, part one).** The saturated rejection omits `Required` and
 `Ceiling`, so the operator-facing sentence prints the **client's own unresolved
@@ -98,8 +132,15 @@ manufactured cause.
 
 **D4 (small, same function, same class).** `resolveAdmitReserve` discards the
 estimator's own `!ok` basis and substitutes a hardcoded
-`"fallback:insufficient-samples"`, which is wrong when the real reason was
-`fallback:malformed` or `fallback:capture-unavailable`.
+`"fallback:insufficient-samples"`, which is a false label when the real reason
+was `fallback:malformed`. **Stated at its true reachability:** per §3.1's store
+invariant, `fallback:malformed` cannot arise from real `ConfinePeakHistory` data
+at either call site, so D4 is today reachable only through the injected
+`admitPeakHistory` seam, a schema change, or a corrupt row. It is fixed here
+because it is two lines in the function this change is already rewriting and
+because the same honesty rule governs it — **not** because it is biting an
+operator today. Claiming otherwise would be the same overreach the ticket is
+about.
 
 **Not a defect: the in-wait progress line.** "queue position 1 of 1 by enqueue
 order, 0B queued ahead" was literally true. It is the terminal message that
@@ -199,12 +240,55 @@ changes only what it returns as `basis`:
 | --- | --- | --- | --- |
 | a | `escalated > reserve`, no clamp | `1.5 × MaxOOMPeak` | `estimate:oom-escalated` *(unchanged)* |
 | b | `escalated > reserve`, clamp applied | `ceiling` | `estimate:oom-escalated,ceiling-clamped` |
-| c | `escalated <= reserve`, ordinary estimate usable | the ordinary estimate | `estimate:max=<P>,n=<N>,f=115,oom-on-record` |
-| d | `escalated <= reserve`, no usable estimate | the client's reserve | `fallback:insufficient-samples:n=<N>,oom-on-record` |
-| e | as (d), then clamp applied | `ceiling` | `fallback:insufficient-samples:n=<N>,oom-on-record,ceiling-clamped` |
+| c | `escalated <= reserve`, ordinary estimate usable | the ordinary estimate | *the estimator's own returned basis* + `,oom-on-record` |
+| d | `escalated <= reserve`, no usable estimate | the client's reserve | *the estimator's own `!ok` basis* + `,oom-on-record` |
+| e | as (d), then clamp applied | `ceiling` | as (d) + `,ceiling-clamped` |
 
-Row (e) is the ticket's measured case. Rows (a) and (b) keep the token every
-existing document, test and agent-facing string already uses.
+Row (e) is the ticket's measured case, and there it reads
+`fallback:insufficient-samples:n=1,oom-on-record,ceiling-clamped`. Rows (a) and
+(b) keep the token every existing document, test and agent-facing string already
+uses.
+
+**Rows (c)–(e) are stated as "whatever the estimator returned", not as one
+spelling, and that is deliberate.** `EstimateMemoryReserve`
+(`resource_estimate.go:31-75`) has six returns, and `ordinary.OOMCount = 0`
+suppresses only its `estimate:oom:` arm. Which of the rest can actually appear
+here is governed by a **store-level invariant this plan had to establish
+rather than assume**, from `ConfinePeakHistory`'s own SQL
+(`internal/store/confine_peak_history.go:58-64`):
+
+> `TotalCount = COUNT(*)`, `SampleCount = #rows with peak_rss > 0`,
+> `PeakMax = MAX(peak_rss)` over those, and
+> `MaxOOMPeak = MAX(peak_rss)` over rows with `oom=1 AND peak_rss > 0`.
+>
+> So the OOM branch's own guard, `OOMCount > 0 && MaxOOMPeak > 0`, **entails**
+> `SampleCount >= 1` and `PeakMax >= MaxOOMPeak > 0` — the row that supplied
+> `MaxOOMPeak` is itself a usable sample.
+
+| Estimator return | Row | Reachable from real store data? |
+| --- | --- | --- |
+| `estimate:max=<P>,n=<N>,f=115` | c | **yes** — `SampleCount >= 3` |
+| `estimate:capped` | c | **yes** — as above, 115 % figure over `MaxMemoryEstimateReserve` |
+| `fallback:insufficient-samples:n=1` / `n=2` | d/e | **yes** — and this is the ticket's measured case |
+| `fallback:malformed` | d/e | **no** — needs `SampleCount >= 3` with `PeakMax <= 0`, which the SQL cannot produce |
+| `fallback:capture-unavailable` | d/e | **no** — needs `SampleCount == 0`, excluded by the guard above |
+| `fallback:no-history` | d/e | **no** — needs `TotalCount == 0`, and an OOM row is a row |
+
+Two consequences, both of which change what this plan claims:
+
+1. The original row-(d) spelling `fallback:insufficient-samples:n=<N>` was in
+   fact **exhaustive for real store data** — but only because of the invariant
+   above, which was nowhere stated. It is stated now, so the property is
+   *established* rather than accidentally true, and T2 asserts the pairing
+   instead of resting on this reasoning.
+2. The last three rows remain reachable through the **injected `admitPeakHistory`
+   seam**, which is how every unit test drives this function and is the only way
+   T1/T3 can reach them at all. They are therefore specified — generically, as
+   "the estimator's own basis" — rather than pinned to a spelling that would be
+   false the moment a stub, a schema change, or a corrupt row produces one of
+   them. In a change whose entire subject is labels that do not match the value
+   they describe, hard-coding a label the code does not actually guarantee is
+   the one mistake it cannot afford.
 
 Grammar, and why it is not new machinery: the basis vocabulary is already
 `family:name[:params]` with **comma-separated params** (`estimate:max=%d,n=%d,f=115`,
@@ -224,7 +308,7 @@ number and the source basis is reported.
 1. *attribution* — "an OOM record for **this signature** was found and consulted";
 2. *provenance* — "the returned number is 1.5× the OOM peak".
 
-Meaning (2) is false in rows (c)–(e). Meaning (1) is true in all four, and it is
+Meaning (2) is false in rows (b)–(e). Meaning (1) is true in all five, and it is
 **load-bearing**: AIRA-128's real-cgroup end-to-end test uses it as the proof
 that a real kernel OOM travelled `memory.events → confine teardown → reportPeak →
 RecordConfinePeak → ConfinePeakHistory → resolveAdmitReserve`, and its comment
@@ -263,6 +347,26 @@ reserve > 0` return (reachable with `ok == false` only via `fallback:malformed`,
 which today is reported as `insufficient-samples` — a false label) and the new
 row (c)/(d) arm. Two lines, same honesty rule, same function; leaving it would be
 indefensible in a change whose subject is false bases.
+
+**Scope boundary, stated because it is easy to get wrong and this plan got it
+wrong once.** The `basis` local is declared *inside* the history block and is
+read by exactly those two returns. The function's **post-block** fallbacks
+(`admit.go:1516-1524`) — `fallback:no-signature`, `fallback:history-unavailable`,
+`fallback:insufficient-samples`, `fallback:no-history` — are separate `return`
+statements with their own literals, and they never see `basis` at all. In
+particular a signature with 1–2 samples and **no** OOM record exits at the
+post-block `insufficientSamples` return with a bare `fallback:insufficient-samples`,
+carrying **no** `n=` param, and this change does not alter that.
+
+That is deliberate, and it leaves a visible asymmetry: after this change the same
+two-sample signature reports `fallback:insufficient-samples:n=2,oom-on-record`
+when it *has* an OOM record (row (d), through the local) and bare
+`fallback:insufficient-samples` when it does not (post-block literal). The
+asymmetry is accepted rather than fixed because the post-block label is **not
+dishonest** — the reason really was insufficient samples; it is merely less
+precise — and widening the change to thread a sample count through four more
+returns would be new plumbing for no honesty gain, which the simplicity rule
+refuses. Filed as F8 so it is a recorded decision and not an oversight.
 
 ### 3.5 Facet 2b — an established diagnosis instead of a manufactured one
 
@@ -366,7 +470,12 @@ Two wording rules the implementation must hold to:
 ## 4. Invariants
 
 **I1. No resolved reserve value changes anywhere.** Every row of T1 asserts the
-value as well as the basis; §3.3.
+value as well as the basis; §3.3. This explicitly includes the escalation's
+**overflow guard** (`admit.go:1486-1491`), which the ticket's paraphrase
+`MaxOOMPeak * 3 / 2` silently drops: the real code saturates at `math.MaxInt64`
+instead of wrapping negative. It is preserved byte-for-byte, and a `MaxOOMPeak`
+above `math.MaxInt64 * 2 / 3` is carried as a row-(a)/(b) case in T1 so a
+rewrite of this branch cannot reintroduce the wrap.
 
 **I2. No admission or grant decision changes.** `checkedAvailable`, the
 `reserve > ceiling` terminal boundary, the OOM clamp, the AIRA-59 freeze, the
@@ -390,6 +499,24 @@ no extra socket round trip, no extra cgroupfs read.
 **I7. Every new field is written and read under `queue.mu` only.** Same
 discipline as the AIRA-29 charge fields documented at `admit.go:220-224`.
 
+**I8. A `none-observed` latch can only be produced by the capacity gate.** This
+is the invariant that makes the §3.6 solo sentence safe to print, and it was
+cited twice in earlier revisions of this plan without ever being stated; T12
+pins it. The evaluator has exactly three refusal sites (§0), and the other two
+cannot produce `none-observed`:
+
+| Refusal site | `admit.go` | Why `othersPresent` is necessarily true |
+| --- | --- | --- |
+| exclusivity `continue` (`gate.blocks`) | `2235-2238` | another waiter holds or is draining the slice; §3.5 sets `"observed"` **explicitly** here rather than deriving it |
+| AIRA-59 freeze `continue` | `2245-2248` | the freeze arms only after a waiter ahead was refused on capacity, so `queuedAhead > 0` |
+| capacity: `waiter.reserve > available \|\| overSubscribed` | `2259-2262` | **the only site that may latch `none-observed`** — and only on the `reserve > available` disjunct, since the AIRA-114 `overSubscribed` disjunct needs `capAggregate > 0`, which needs live scanned scopes, i.e. other jobs |
+
+So "nothing else held or was queued at any evaluation" is only ever printed for a
+waiter that could not fit the slice's own capacity — which is exactly the ticket's
+measured case, and exactly what the sentence claims. If a future change gives the
+freeze or the aggregate bound a path to a solo refusal, **T12 fails** rather than
+the operator receiving a confidently wrong sentence.
+
 ---
 
 ## 5. Risks
@@ -404,9 +531,21 @@ spelling itself is unchanged where it is true.
 **R2 — the AIRA-52 estimate-vs-actual gauge population moves.**
 `estimate_actual.go:47` selects `admission_reserve_basis LIKE 'estimate%'`.
 Row (d)/(e) rows leave that population (they were never estimates); rows (c),
-(a), (b) stay in it. This is an intended honesty improvement — the gauge is
-measuring estimate adequacy and was being fed non-estimates — and it is named
+(a), (b) stay in it, since `LIKE 'estimate%'` is a prefix match and the new
+tokens are appended suffixes. This is an intended honesty improvement — the gauge
+is measuring estimate adequacy and was being fed non-estimates — and it is named
 here rather than discovered later.
+
+Two second-order effects, named so they are not discovered as surprises:
+**(a)** row (b) stays in the population while being a *clamped* value, so the
+gauge counts it as an estimate that was cut down by the ceiling rather than by
+the estimator's own judgement; it was already counted that way before this
+change, and `,ceiling-clamped` now makes such rows **identifiable** in the gauge
+for the first time, which is a strict improvement over the status quo.
+**(b)** the population change is not retroactive — historical rows keep the
+basis string they were written with — so a gauge reading that spans this change
+mixes two vocabularies. Neither is a reason to hold the change; both are reasons
+the deferral list, not the gauge, is where the follow-up belongs.
 
 **R3 — new mutable per-waiter state.** Mitigated by I7 and by a mandatory local
 `go test -race ./internal/daemon/...` run (CI has `-race` off per AIRA-20, so the
@@ -454,9 +593,10 @@ and observed RED against `19c6bf2` before the corresponding code exists.
 
 | Id | Name / file | Asserts | RED against master because |
 | --- | --- | --- | --- |
-| **T1** | `TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve` — new `internal/daemon/admit_oom_basis_test.go` | the full §3.1 table, **value and basis** for rows (a)–(e), including row (e) driven with the ticket's measured stats and ceiling | master returns `estimate:oom-escalated` for (b)–(e) |
+| **T1** | `TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve` — new `internal/daemon/admit_oom_basis_test.go` | the full §3.1 table, **value and basis** for rows (a)–(e), including row (e) driven with the ticket's measured stats and ceiling. Rows (c)–(e) are driven **across the estimator bases §3.1 lists**, not one example each: `estimate:max=…` and `estimate:capped` for (c), `fallback:insufficient-samples:n=1` and (via the injected seam) `fallback:malformed` for (d)/(e) — so the table is verified as the general rule it claims to be rather than for one lucky spelling | master returns `estimate:oom-escalated` for (b)–(e) |
 | **T2** | `TestEveryOOMBranchBasisNamesTheOOMRecordAndOnlyTheOOMBranchDoes` — same file | every row of T1 contains `oom-escalated` or `oom-on-record`; the identical stats with `OOMCount = 0` (and with `MaxOOMPeak = 0`) contain **neither** | new property; it is the test that keeps AIRA-128's attribution proof non-porous (§3.2). Mutation: dropping the `,oom-on-record` append must turn it RED |
-| **T3** | `TestResolveAdmitReserveKeepsTheEstimatorsOwnFallbackBasis` — same file | `SampleCount >= 3` with `PeakMax <= 0` → `fallback:malformed`; `SampleCount == 1` → `fallback:insufficient-samples:n=1` | master reports `fallback:insufficient-samples` for both (D4) |
+| **T3** | `TestResolveAdmitReserveKeepsTheEstimatorsOwnFallbackBasis` — same file | **through the `basis` local only:** `SampleCount >= 3`, `PeakMax <= 0`, no OOM record → `fallback:malformed` (master: `fallback:insufficient-samples`, the D4 false label); and `SampleCount == 1` **with** an OOM record → `fallback:insufficient-samples:n=1,oom-on-record` (row (d)) | master reports the hardcoded `fallback:insufficient-samples` / `estimate:oom-escalated` respectively |
+| **T3b** | `TestPostBlockInsufficientSamplesFallbackIsUnchanged` — same file | `SampleCount == 1`, **no** OOM record, no p90 prior → exactly `fallback:insufficient-samples`, bare, **no** `n=` param, value `== request.reserve` | **GREEN against master by construction.** It is a *pinning* test, not a RED-first one: it fixes the §3.4 scope boundary so a later "tidy-up" cannot quietly thread the local through the post-block returns and silently change a fourth label. Its RED direction is against that future change, and it is the F8 decision made executable |
 | **T4** | *updates, not new:* `TestConfineEstimatorAndOOMEscalationClamp` (→ `estimate:oom-escalated,ceiling-clamped`), `TestSliceCeilingDoesNotReachTheOOMEscalationClamp` (→ same; this **strengthens** its own stated purpose, since the clamp it exists to exercise is now named in the basis), `TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins` (label unchanged — verified row (a) with no clamp) | — | — |
 | **T5** | *updates:* `TestOOMSelfHealFixtureStaysOffTheCeilingClamp` and `TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission` phase 3 → exact `fallback:insufficient-samples:n=1,oom-on-record`, with the fixture comment rewritten to say what the token proves and what it does not | the value assertions (`ScopeMemoryMax >= 1.5 × oomPeak`, "the second run succeeds") are untouched | — |
 | **T6** | *update:* `internal/core/skill_test.go:644` + the `skill.go:324` prose | the agent guide describes the token family truthfully | — |
@@ -473,7 +613,7 @@ is, because the defect is in what reaches the client.
 | **T9** | `TestSaturatedRejectionReportsContentionWhenAnotherJobHeldTheSlice` | a granted job holds the ledger; the second waiter times out → `"observed"` | false-positive direction; guards the new clause from claiming solitude wrongly |
 | **T10** | `TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection` | a holder occupies the slice for the early passes and is **released before the deadline**, leaving the waiter alone at the instant of rejection → still `"observed"` | RED against any implementation that reads the queue at rejection time instead of latching (§3.5) |
 | **T11** | `TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt` | `admitReadMemory` returns `ok == false` for the whole wait, so the evaluator returns early every pass → `"unevaluated"`, and **no** `grantable_bytes` | master fabricates "contended" for a slice it could not even read |
-| **T12** | `TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate` | drive an AIRA-114 aggregate-cap refusal and an AIRA-59 freeze refusal; both report `"observed"` | pins the §4.3 invariant that makes the solo sentence safe — `oversubscriptionBlocks` needs `capAggregate > 0`, which needs live scopes, and a freeze needs a waiter ahead. If a future change breaks that, this fails instead of shipping a wrong sentence |
+| **T12** | `TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate` | drive an AIRA-114 aggregate-cap refusal and an AIRA-59 freeze refusal; both report `"observed"` | pins **I8**, the invariant that makes the solo sentence safe — `oversubscriptionBlocks` needs `capAggregate > 0`, which needs live scopes, and a freeze needs a waiter ahead. If a future change breaks that, this fails instead of shipping a wrong sentence |
 
 ### 7.3 Facet 2b — the sentence (client side, `internal/runner`)
 
@@ -542,6 +682,21 @@ here**, per `CLAUDE.md`.
   terminal message; deferred as a separate diagnostic decision, and the line as
   it stands is true.
 - **F7 — accepted coverage gap:** no real-cgroup test drives the wedge (§7.4).
+- **F8 — the post-block fallback labels keep no sample count (§3.4).** After this
+  change a 1–2 sample signature reports `fallback:insufficient-samples:n=<N>,oom-on-record`
+  when it carries an OOM record and a bare `fallback:insufficient-samples` when it
+  does not. The bare label is imprecise but **not false**, and threading a count
+  through four more `return` statements is plumbing the simplicity rule refuses
+  for no honesty gain. Pinned green by T3b so the boundary cannot move silently.
+- **F9 — the AIRA-67 design spec's basis vocabulary bullet goes stale.**
+  `docs/superpowers/specs/2026-08-25-confine-estimate-reserve-design.md:143`
+  enumerates the basis vocabulary and will not list `,oom-on-record` or
+  `,ceiling-clamped`. **Deliberately not edited:** that document is a dated
+  milestone design record, and this repo treats shipped specs as history rather
+  than as living reference (the authoritative live surface is the generated agent
+  guide, which §9 *does* update). Named here so a reviewer meets a decision
+  rather than an omission; if the gate prefers the spec amended instead, it is a
+  one-line change.
 
 ---
 
@@ -552,7 +707,7 @@ here**, per `CLAUDE.md`.
 | `internal/daemon/admit.go` | `resolveAdmitReserve` basis (§3.1, §3.4); `admitRejection` gains `Contention` + `Grantable`; `admitWaiter` gains the latch fields; `evaluateAdmitQueue` refusal branches write them; the two `writeAdmitRejection` saturated call sites populate `Required`/`Ceiling`/`Contention`/`Grantable` |
 | `internal/runner/admission_linux.go` | `runnerAdmitRejection` mirrors the two fields; the `default:` arm of the exclusivity switch becomes the three-way contention render |
 | `internal/core/skill.go` | the agent-guide sentence about `estimate:oom-escalated` |
-| `internal/daemon/admit_oom_basis_test.go` | new — T1, T2, T3 |
+| `internal/daemon/admit_oom_basis_test.go` | new — T1, T2, T3, T3b |
 | `internal/daemon/admit_saturated_diagnosis_test.go` | new — T7–T12 |
 | `internal/runner/admission_saturated_message_test.go` | new — T13–T17 |
 | `internal/daemon/confine_admit_test.go`, `sliceceiling_test.go`, `confine_oom_selfheal_real_cgroup_linux_test.go`, `internal/core/skill_test.go` | T4, T5, T6 updates |
