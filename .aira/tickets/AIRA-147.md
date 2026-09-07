@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-147","project":"aira","title":"aira confine: E_ADMIT_SATURATED (never admitted) should be distinguishable from a ran-and-failed job, not just exit non-zero","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-147","project":"aira","title":"aira confine: E_ADMIT_SATURATED (never admitted) should be distinguishable from a ran-and-failed job, not just exit non-zero","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Reported by peer session 'qual', 2026-09-07, alongside a since-corrected FIFO
@@ -86,3 +86,121 @@ A genuine follow-up, if anyone wants to pursue it: correlate a wait past 240s
 lines (`logAdmitFreezeTransition`) to establish whether the duty cycle is
 EVER exceeding its own documented bound -- not established by the data given
 here, and not filed since it would be speculative.
+## Resolution (PR, branch `aira147-never-admitted-envelope`)
+
+### What was built
+
+One new stderr line — the **never-ran trailer** — emitted whenever `confine`
+returns an error, plus the Skill-guide paragraph that teaches an agent to read
+it. Nothing else changed.
+
+```
+confine: ran=no code=E_ADMIT_SATURATED slice=aira.slice admission=saturated
+```
+
+Observed live against a real box (`aira confine --slice does-not-exist.slice
+-- /bin/true`):
+
+```
+confine: ran=no code=E_CONFINE_UNAVAILABLE slice=does-not-exist.slice admission=unevaluated
+E_CONFINE_UNAVAILABLE: slice does-not-exist.slice: slice-not-found
+EXIT=4
+```
+
+and a job that really ran and chose exit 4 (`aira confine -- /bin/sh -c 'exit 4'`)
+still exits 4, emits the ordinary trailer, and emits **no** `ran=no` — which is
+precisely the collision this ticket named, now resolvable without parsing prose.
+
+### Why this shape, and what was rejected
+
+**The exit-code bucketing in `internal/codes/codes.go` is untouched, and so is
+AIRA-138 §5.4's passthrough.** The ticket was right that both are sound design;
+the whole point is that a *unique* exit code is unobtainable while the
+passthrough contract stands, so the fix must live somewhere other than `$?`.
+
+**Rejected: a `--json` envelope for confine.** The ticket suggested one, but
+`--json` is explicitly REFUSED for `confine` today (`cmd/aira/main.go` ~L200:
+`E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine`), and
+deliberately so — confine's stdout belongs to the wrapped job, byte for byte,
+and a structured document interleaved into it would corrupt every pipeline that
+consumes a confined command's output. Adding a JSON mode would also have meant
+new plumbing through `core.Do` for a verb that is deliberately not a
+`core.Do` verb at all. The existing machine-readable channel for a confined
+job's facts is the `confine: key=value ...` trailer on **stderr**, which is what
+`skill.go` already teaches agents to read and what `FormatConfineStatus`
+already produces. Matching that shape was the architecture-following choice;
+inventing a parallel one was not.
+
+**Facet set: `ran=no code= slice= admission=`.** Each is a fact already
+established at every error return, none is derived or guessed, and each follows
+`FormatConfineStatus`'s always-rendered discipline — an unestablished value
+reads `unevaluated` rather than vanishing, since a silently-absent field on a
+diagnosis line is the exact ambiguity these trailers exist to end.
+`admission=` is the actionable one: `saturated` (the box was full — retry,
+nothing is wrong with the request), `too_large`/`wait_too_long` (the request
+cannot be satisfied as written), `unevaluated` with
+`code=E_CONFINE_UNAVAILABLE` (a host/install problem retrying will not fix).
+
+**`ran=no` rather than reusing `terminated-by=`.** `FormatConfineStatus` emits
+no `ran=` facet at all, so the token is unambiguous *by construction* and a
+consumer can match it as a fixed string. A test pins that non-collision.
+
+**No symmetric `ran=yes` on the ran trailer.** It would have rewritten every
+existing trailer for no diagnostic gain — the ran trailer's presence, and its
+`terminated-by=` facet, already say the job ran, and `skill.go` already teaches
+that. Churn against a line dozens of tests pin, for redundancy.
+
+### Where it is emitted, and why there
+
+In `runner.Confine` (`internal/runner/confine.go`) — the single funnel every
+launch passes through: the real Linux path, the ci-shim path, the non-Linux
+stub, and the detached supervisor. There are ~25 `confineUnavailable` call
+sites plus a separate admission-rejection return; emitting at each could not
+have stayed in step.
+
+The claim `ran=no` is safe because it is **not a new invariant**: confine
+already reserves error returns for "the confinement could not be established",
+every error return happens before the release write that lets the setup shim
+`exec` the target (`abortStarted` included — it is unreachable once
+`releaseWrite.Write` succeeds), and every path that reaches the target returns
+a nil error carrying an exit code. This change makes an existing structural
+invariant machine-readable; it does not assert a new one.
+
+`confineErrorCode` moved from `confine_detach_linux.go` to `confine.go`
+unchanged, so one grammar serves both callers on every platform rather than two
+copies free to drift.
+
+### Tests (each verified non-porous by reverting the behaviour)
+
+- `TestConfineEmitsNeverRanEnvelopeOnError` — removing the emit → FAIL.
+- `TestRealCgroupConfineSuccessEmitsNoNeverRanEnvelope` — the opposite
+  direction: moving the emit outside the `err != nil` guard, so a successful
+  job is stamped `ran=no`, → FAIL. (The same lie, reversed.)
+- `TestFormatConfineNeverRan` — dropping the `unevaluated` fallbacks → FAIL on
+  3 of 4 cases.
+- `TestConfineRanTrailerNeverCarriesTheNeverRanFacet` — pins the token's
+  non-collision with the ran trailer.
+- `TestConfineErrorCodeRejectsNonCodes` — the code facet reports `unevaluated`
+  rather than transcribing an arbitrary leading word as a code.
+- `TestSkillTeachesTheNeverRanEnvelope` — removing the guidance paragraph →
+  all 6 legs fail across both generated documents (12 failures).
+
+### Gates
+
+- `aira confine -- go build ./...` → exit 0
+- `aira confine -- go vet ./...` → exit 0
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` → exit 0
+
+The first full-suite run hit `TestAIRA138NaiveConfineDeadlineFabricatesAKill`
+failing at its own precondition (`the scope was not empty at the fire:
+members=[2714176]`) — byte-identical to the symptom AIRA-148 already documents,
+in a test that exercises an in-test fake (`livenessScope`,
+`naiveConfineDeadlineDraft`) touching nothing this change alters. It passed 3/3
+on re-run and the full suite was then green end to end. Recorded, not silently
+retried past.
+
+### Accepted coverage gap
+
+The CLI's own `runConfineCommand` tests inject a fake `runConfined`, so they do
+not exercise the emit — by design, since the emitter is the runner and the CLI
+is a transcribing face. The funnel test covers it at the layer that owns it.
