@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-147","project":"aira","title":"aira confine: E_ADMIT_SATURATED (never admitted) should be distinguishable from a ran-and-failed job, not just exit non-zero","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-147","project":"aira","title":"aira confine: E_ADMIT_SATURATED (never admitted) should be distinguishable from a ran-and-failed job, not just exit non-zero","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Reported by peer session 'qual', 2026-09-07, alongside a since-corrected FIFO
@@ -204,3 +204,56 @@ retried past.
 The CLI's own `runConfineCommand` tests inject a fake `runConfined`, so they do
 not exercise the emit — by design, since the emitter is the runner and the CLI
 is a transcribing face. The funnel test covers it at the layer that owns it.
+
+## Build review (Fable) — MERGE, PR #95 merged as `75c9595`
+
+Verified from source, not narrative:
+
+- `internal/codes/` and `cmd/aira/` have ZERO diff lines against master: the
+  AIRA-107/AIRA-124 exit-code bucketing and the AIRA-138 §5.4 passthrough are
+  untouched. `Confine` adds one `Fprintln` inside `err != nil` and returns
+  `result, err` unchanged.
+- The "error ⇒ never exec'd" claim holds on every arm: after `releaseWrite.Write`
+  succeeds, `confine_linux.go` has exactly one return (`return result, nil`,
+  L1463) and `confine_shim_linux.go` likewise (L487); every `abortStarted` site
+  precedes the release write, so the child it kills is the blocked
+  `confine-setup` shim, never the target. The non-Linux stub returns
+  `Status{Slice}` + error. The detached supervisor passes `job.stderr`, so a
+  detached never-ran job's stderr capture carries the line.
+- `admission=` wire values named in skill.go (`saturated`, `too_large`,
+  `wait_too_long`) are the literal strings the client sets
+  (`admission_linux.go` L564 `TrimPrefix(lower(code),"e_admit_")`, L204, L517).
+- `Status.Slice` and `Status.AdmissionState` are assigned BEFORE the rejection
+  return (L693 precedes L696), so the saturated line is real, not fabricated —
+  confirmed by a throwaway probe driving `confineWithDeps` with a fake admit
+  returning `state:"saturated"` + `E_ADMIT_SATURATED`: rendered
+  `confine: ran=no code=E_ADMIT_SATURATED slice=finite.slice admission=saturated`.
+- No consumer parses `confine: ` stderr lines by grammar (grep: emitters only),
+  so the new line shape breaks nothing.
+
+Gates (reviewer, foreground, `aira confine`): `go build ./...` exit 0;
+`go vet ./...` exit 0; `AIRA_REAL_CGROUP=1 go test ./... -count=1` exit 0
+(all 15 packages ok, no flake this run).
+
+Dogfood, branch binary against the live daemon (exit codes unchanged):
+
+```
+--slice does-not-exist.slice        → ran=no code=E_CONFINE_UNAVAILABLE admission=unevaluated  EXIT=4
+--memory-reserve 1T --admit-timeout 2s → ran=no code=E_ADMIT_TOO_LARGE admission=too_large      EXIT=2
+--memory-reserve 60G --admit-timeout 2s → ran=no code=E_ADMIT_SATURATED admission=saturated     EXIT=4
+-- /bin/sh -c 'exit 4' (ran)        → ordinary trailer, NO ran=no                            EXIT=4
+-- /bin/echo hello                  → stdout "hello" byte-identical                          EXIT=0
+```
+
+Accepted coverage gaps (reviewer-accepted, non-blocking):
+
+1. No committed test drives the real `E_ADMIT_SATURATED` rejection through
+   `confineWithDeps` and asserts the emitted line; `TestFormatConfineNeverRan`
+   hand-builds `AdmissionState:"saturated"`. A regression that moved the
+   `result.Status.AdmissionState = admission.state` assignment below the
+   `return result, err` would silently degrade the facet to `unevaluated`
+   unnoticed. The probe above is the reproduction to lift into a test if it is
+   ever wanted.
+2. skill.go names three `admission=` values; `exclusive_unavailable`
+   (`U_ADMIT_EXCLUSIVE_UNESTABLISHED`) also reaches the facet and is not named.
+   The paragraph does not claim exhaustiveness, so this is omission, not error.
