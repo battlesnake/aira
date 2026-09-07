@@ -277,3 +277,23 @@ Re-run after the build-review fixes:
 - `aira confine -- go build ./...` — exit 0
 - `aira confine -- go vet ./...` — exit 0
 - `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0
+
+Independent re-confirmation of the fix round, foreground, exact exit codes, same
+three commands on the same base:
+
+- `aira confine -- go build ./...` — exit 0
+- `aira confine -- go vet ./...` — exit 0
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0 (every
+  package `ok`; the AIRA-135 `TestConfineScanReadsTheSupervisorCommand…` flake
+  the reviewer hit did NOT recur on this run. That is what a wall-clock flake
+  looks like from one sample — it does not retire the reviewer's observation,
+  and that test still wants its own ticket.)
+
+The non-porosity of the P1 regression tests was re-verified rather than taken on
+the fix commit's word: deleting the `processLive` switch from `Reconcile`, so the
+advisory branch falls straight through to `openErr = errKillTargetAbsent` (the
+pre-fix behaviour), fails `TestShimRunReconcilePreservesALiveRun` and
+`TestShimRunReconcilePreservesAnUnestablishedLeader`, while
+`TestShimRunReconcileTerminalisesADeadLeaderWithoutTouchingTheBackend` still
+passes. The two new tests discriminate exactly the wrong behaviour, and the
+third is not a duplicate of either.
