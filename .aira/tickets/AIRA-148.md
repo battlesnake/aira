@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-148","project":"aira","title":"TestAIRA138NaiveConfineDeadlineFabricatesAKill is a wall-clock-tight flake under box load (independently observed by AIRA-141 and AIRA-146)","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-148","project":"aira","title":"TestAIRA138NaiveConfineDeadlineFabricatesAKill is a wall-clock-tight flake under box load (independently observed by AIRA-141 and AIRA-146)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Recorded independently by TWO different build/review agents tonight (AIRA-141
@@ -172,3 +172,48 @@ Foreground, exact exit codes, on `origin/master` `d74bb6e`:
 - `aira confine -- go vet ./...` — exit 0
 - `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0, every
   package `ok`, no FAIL
+
+## Fable build-review record (2026-09-07) — MERGE
+
+PR #96 merged as `ad19b9b` (`--merge`, branch deleted). Reviewed against
+`origin/master` at `75c9595` in a detached worktree; the branch merged clean
+onto the moved master (`git merge-tree` no conflicts).
+
+Scope check (from the diff, not the narrative): exactly two files changed —
+this ticket and `internal/runner/confine_deadline_danger_linux_test.go`. No
+production file is touched; `decideConfineDeadlineNotExecuted`,
+`decideTimeoutIntentNotExecuted`, `processLive` are byte-identical to master.
+
+Mechanism verified from source, independently of the PR text:
+`processLive` (runner_linux.go) returns `processDead` on a `Z` state byte,
+while `livenessScope.membersLocked()` (timeout_arbitration_linux_test.go)
+tests only `/proc/<pid>/stat` existence + start tick, so a zombie is a
+member until `cmd.Wait()` reaps it. The old readiness gate therefore left the
+whole zombie window between its last poll and the `Members()` assertion; the
+new gate polls `Empty() && processLive()==processDead`, which cannot be true
+before the reap. The fall-through on expiry keeps all four precondition
+assertions live, so a state that never arrives still fails, just later. The
+assertions the test exists for (fabricated 137, deadline attribution,
+cgroup.kill against an empty scope, real exit 7, honest `normal`) are
+untouched — nothing is masked.
+
+Independent reproduction, same box, load average ~17-27, baseline and branch
+run concurrently (`-run TestAIRA138NaiveConfineDeadlineFabricatesAKill$ -count=25 -v`):
+
+- baseline `origin/master`: **1/25 FAIL**, exactly the precondition line
+  `the scope was not empty at the fire: members=[3129585] err=<nil>`, exit 1
+- branch: **25/25 PASS**, exit 0
+- branch under `-race -count=5`: PASS, exit 0
+
+Gate commands, foreground, exact exit codes, on the branch worktree:
+
+- `aira confine -- go build ./...` — exit 0
+- `aira confine -- go vet ./...` — exit 0
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0
+  (14 packages ok, 0 FAIL)
+
+Accepted, noted, not blocking: the per-iteration cost of this one test rises
+from ~2s to ~5s because the stdin hold widened to `aira126Scale(5s)`; and a
+genuine never-reap failure now prints the same "not empty at the fire" line
+the flake used to, but it now means the reap took longer than `readyBound`,
+which is a real signal rather than a scheduling coin-flip.
