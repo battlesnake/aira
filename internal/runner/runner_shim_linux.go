@@ -100,6 +100,27 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	}
 	var releaseOnce sync.Once
 	releaseAdmit := func() { releaseOnce.Do(admission.releaseAdmission) }
+	// AIRA-141. The DAEMON lease is held for the job's WHOLE LIFE, and this defer
+	// — at launchShim's scope, not launchPrep's — is what makes that true. It is
+	// the confineShim rule, adopted here for the reason confineShim has it and the
+	// real `aira run` path does not need it.
+	//
+	// On the real path a running job stays visible to the daemon's ledger without
+	// any lease: its memory is charged to a cgroup under the slice, and
+	// memory.current is a live reading of exactly that. Releasing at child start
+	// there loses the BOOKED reserve but not the job — the kernel keeps counting
+	// it. ci-shim has no cgroup, so there is no such charge and nothing else that
+	// knows the job exists: releasing at start made the running job INVISIBLE to
+	// the ledger the instant it began, and a second `aira run` could then be
+	// admitted against RAM this one is already using — silently over-committing
+	// the very budget this mode's admission exists to enforce.
+	//
+	// So the reserve is held until the wait returns and the terminal is committed,
+	// which is this function's return. Only the FLOCK is released at start (see
+	// the call site below): the flock is a mutual-exclusion primitive that
+	// serialises fallback clients, not a charge against a budget, and holding it
+	// for a job's life would serialise every shim launch on the box.
+	defer releaseAdmit()
 
 	var id string
 	var record RunRecord
@@ -184,10 +205,17 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	}()
 
 	launchPrep := func() (*RunRecord, error) {
-		// A leak backstop only. Every failure below releases EXPLICITLY before
-		// failLaunchPrep, because that call evaluates terminal arbitration and a
-		// sibling must be able to recheck admission before it does.
-		defer releaseAdmit()
+		// AIRA-141: there is deliberately NO `defer releaseAdmit()` here. It used to
+		// be one, described as a leak backstop, but it was also the whole admission
+		// lifetime: a successful prep released the daemon lease at child start. The
+		// backstop now lives at launchShim's own scope (above), which covers the
+		// failure paths just as completely without ending the lease on the success
+		// path.
+		//
+		// Every failure below still releases EXPLICITLY, and that is not redundant
+		// with the outer defer: it must happen BEFORE failLaunchPrep, because that
+		// call evaluates terminal arbitration and a sibling must be able to recheck
+		// admission before it does.
 
 		reserveID := r.ledger.reserveID
 		if r.reserveIDFn != nil {
@@ -347,6 +375,21 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	}
 	if failedRecord, prepErr := launchPrep(); prepErr != nil {
 		return failedRecord, prepErr
+	}
+	// AIRA-141, the confineShim rule exactly: the child is running, so the FLOCK
+	// has done its whole job and is released now, while the daemon lease is not.
+	//
+	// The two are different things wearing the same release function. A daemon
+	// grant is a BOOKED RESERVE against the shim RAM budget and must last as long
+	// as the RAM does. The flock fallback (daemon down) is a whole-slice mutual
+	// exclusion with no reserve behind it: one holder at a time, admitting the
+	// next client only when this one lets go. Holding it for the job's life would
+	// turn a degraded fallback into a global serialiser of every shim launch,
+	// which is not what it was ever asked to be. `admission.lock != nil` is the
+	// discriminator the flock path itself sets (admitWithFlock), and it is the
+	// same one confineShim reads.
+	if admission.lock != nil {
+		releaseAdmit()
 	}
 
 	for _, w := range writers {
