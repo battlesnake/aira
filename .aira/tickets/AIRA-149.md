@@ -317,3 +317,71 @@ sends one. The RED-first coverage of that defect is
 `TestSaturatedRejectionCarriesTheResolvedReserveAndCeiling` (T7), which was
 observed red (`required=0, want the DAEMON-resolved reserve 4939212390`). T13 is
 a pin on the render half, not a demonstration.
+
+## Merged (2026-09-07) — PR #100, merge commit `8a07a17`
+
+`8a07a176d6aa23baeea2c938cd5f4703370dacee` on `origin/master`, merged by the
+Fable work-review below (the final gate) after verification from source, not
+from the build summary.
+
+### Fable work-review record — MERGE
+
+Reviewed at PR head `c7dbfa2` against base `19c6bf2` (== `origin/master` and
+local `master` at review time). Every item below was established by reading the
+diff and the surrounding source, or by an independent run under `aira confine`,
+serialised — never from the builder's claims.
+
+1. **Scope matches the approved revision-3 plan; no silent widening.** The
+   touched file set equals plan §9's table plus the ten deferral tickets and the
+   plan document. No protocol version, CLI flag, MCP/Skill surface, or
+   `internal/store/admission_insight.go` change.
+2. **No resolved reserve VALUE and no admission or grant decision changed** —
+   confirmed by reading the whole of `resolveAdmitReserve`, the rejection sites
+   in `admitConnection`, and the whole of `evaluateAdmitQueue` at the PR head:
+   `reserve` is computed by the identical statements in the identical order
+   (including the `math.MaxInt64` overflow guard); `checkedAvailable`, the
+   `reserve > ceiling` terminal boundary and `enqueueResolvedConfineAdmit` have no
+   hunk; the evaluator's grant path is untouched, with every new statement inside
+   one of the three pre-existing refusal branches plus one `queuedAhead` counter
+   declaration. `EstimateMemoryReserve` returns a non-empty basis on every `!ok`
+   path, so `basis + ",oom-on-record"` can never yield a bare token. Under all
+   three mutations below, T1's VALUE assertion never fired — only its basis line.
+3. **Both honesty facets are genuinely fixed.** Facet 1: the five-row basis table
+   was re-derived by hand for rows (b), (c-capped), (d-malformed) and the
+   overflow row. Facet 2b: T8 drives the exact measured shape (one waiter,
+   position 1 of 1, nothing queued ahead, `current=4096`, resolved reserve ==
+   ceiling) through the real `admitConnection` wire path and receives
+   `contention="none-observed"`, `required == cap_minus_headroom == ceiling`, and
+   `grantable_bytes == ceiling - 4096`; the client renders the resolved reserve,
+   the ceiling and `1007612K` with no "slice contended". The `reserve`/`ceiling`
+   locals at the rejection sites are the request-entry figures from lines
+   1896/1902 and are never reassigned between there and the write; the write is
+   built under `queue.mu`.
+4. **Tests are non-porous — three mutations reproduced independently** in a
+   detached throwaway worktree at `c7dbfa2`, each alone, each restored (all
+   `go test` exit 1): (M-a) counter-derived contention -> both ordinary-disjunct
+   arms of `TestSoloRefusalBesideALeafDrainedScopeReportsContention` RED with
+   `contention="none-observed"`; (M-b) overwrite instead of join ->
+   `TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection` and
+   both arms of `TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved`
+   RED; (M-c) drop `,oom-on-record` -> T1 rows (c)-(e), T2 and
+   `TestOOMSelfHealFixtureStaysOffTheCeilingClamp` RED. The second T12 arm
+   isolates `sliceProvablyEmpty` by leaving the aggregate unestablished, and
+   `reject()` refuses a grant frame, so the aggregate arm cannot pass vacuously.
+5. **AIRA-128's self-heal convergence is untouched.** The real-cgroup
+   `TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission` and its unit
+   twin were re-run on this box with `AIRA_REAL_CGROUP=1` under `aira confine`:
+   both PASS (0.52s, actually executed, not skipped), exit 0. In the diff their
+   value assertions (`ScopeMemoryMax >= 1.5 x oomPeak`, second run succeeds) are
+   unchanged; only the basis string and its comment moved.
+
+Independent gate on the PR head, `aira confine`, serialised:
+`go test ./internal/daemon/ ./internal/runner/ ./internal/store/ ./internal/core/ -count=1`
+-> every package `ok`, exit 0; `gofmt -l internal/ cmd/` -> clean.
+
+One non-blocking observation, recorded rather than acted on: in a mixed wait
+where an early pass establishes solitude and every later pass returns before the
+waiter loop on a failed slice-memory read, `none-observed` stands and the
+sentence's "at any evaluation" is literally true of the evaluations that
+occurred; F5 (AIRA-154) names the whole-wait read failure but not this mixed
+shape. Not a fabrication, so not a finding against the merge.
