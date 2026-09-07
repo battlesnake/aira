@@ -44,9 +44,13 @@ func decideReconcile(waitObserved, killIntent, scopeEmpty, killProven bool) Reco
 //     never dispositioned here.
 //   - Kill.Empty && !Kill.Started: the only killScope return shape that proves
 //     no signal was emitted (it returned before Terminate and before Kill) AND
-//     that the scope was verified empty by two independent reads. A scope
-//     repopulated between Members() and Empty() yields Empty:false and falls
-//     through to the unchanged timeout outcome.
+//     that the scope was verified empty by two independent reads — leaf
+//     cgroup.procs and subtree-aware cgroup.events, which must AGREE. A scope
+//     that is leaf-empty but subtree-POPULATED is a busy nested job: since
+//     AIRA-140 killScope kills it and returns Started:true, so this conjunct
+//     fails and the run keeps the ordinary killed-by-timeout outcome, which is
+//     the correct one. A scope repopulated between the two reads is handled the
+//     same way.
 //   - leader == processDead: kernel proof that the leader was already gone at
 //     the instant the kill found nothing to signal. This is what separates
 //     "already exited before any signal" from "still running past its deadline

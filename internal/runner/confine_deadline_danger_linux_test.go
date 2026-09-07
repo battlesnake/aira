@@ -326,8 +326,11 @@ func TestAIRA138DeadlineSourcePrimitivesAreReusableFromConfine(t *testing.T) {
 // The first danger proof above reproduces AIRA-126's fabrication in confine's
 // currency. The plan gate then found a SECOND, independent hazard in the fix
 // that was proposed for it: the draft `killConfineScope` copied `aira run`'s
-// `killScope` gate verbatim (runner_linux.go:2244-2252), which refuses to write
-// `cgroup.kill` whenever LEAF `cgroup.procs` is empty.
+// then-current `killScope` gate verbatim, which refuses to write `cgroup.kill`
+// whenever LEAF `cgroup.procs` is empty. (`aira run` carried the same defect and
+// was fixed separately, in AIRA-140, reusing this file's fake and this test's
+// bracketing shape; `leafOnlyKillDraft` below therefore no longer mirrors any
+// production gate and stands purely as the historical hazard.)
 //
 // That gate is inert against confine's flagship heavy-job shape. An aitest /
 // --delegate-ram job drains EVERY pid out of the outer scope into
@@ -413,9 +416,12 @@ type draftKillResult struct {
 	Completed bool
 }
 
-// leafOnlyKillDraft is the plan's ORIGINAL §5.2 gate: `aira run`'s `killScope`
-// refusal discipline transplanted verbatim, refusing to write cgroup.kill on an
-// empty LEAF read. It is the mutation target for the plan's mutation #5.
+// leafOnlyKillDraft is the plan's ORIGINAL §5.2 gate: `aira run`'s
+// then-current `killScope` refusal discipline transplanted verbatim, refusing to
+// write cgroup.kill on an empty LEAF read. It is the mutation target for the
+// plan's mutation #5. Since AIRA-140 it mirrors no production gate — `killScope`
+// carries the two-read form too — and is kept as the executable statement of the
+// hazard both fixes answer.
 func leafOnlyKillDraft(ctx context.Context, scope Scope) (draftKillResult, error) {
 	pids, err := scope.Members()
 	if err != nil {

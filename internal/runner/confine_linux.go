@@ -2233,12 +2233,16 @@ const (
 // killConfineScope is the deadline's ONE kill site (AIRA-138).
 //
 // It follows killScope's REFUSAL DISCIPLINE — never claim a win on an empty
-// scope — but deliberately DIVERGES from killScope's gate, and the divergence is
-// the whole point.
+// scope — and shares its two-read gate. (Historical note, AIRA-140: killScope
+// gated on the LEAF read alone when this was written, which is why the paragraphs
+// below argue the divergence at length; that same defect was then fixed in
+// killScope itself, so the two gates now agree. What still diverges is the
+// SIGTERM grace, described at the end.)
 //
-// killScope refuses to write cgroup.kill whenever LEAF cgroup.procs is empty.
-// That gate is INERT against the exact job this bound exists for. Scope.Members()
-// reads leaf cgroup.procs; Scope.Empty() reads cgroup.events `populated`, which
+// A leaf-only gate refuses to write cgroup.kill whenever LEAF cgroup.procs is
+// empty. That gate is INERT against the exact job this bound exists for.
+// Scope.Members() reads leaf cgroup.procs; Scope.Empty() reads cgroup.events
+// `populated`, which
 // is SUBTREE-aware. They are two independent sources and they legitimately
 // disagree, in one direction, for one very common shape: a job whose processes
 // live in child cgroups it created inside its own scope.
@@ -2265,7 +2269,9 @@ const (
 // rather than folded into a half-populated one: a failed population read means
 // AIRA cannot establish whether there was anything to kill.
 //
-// NO SIGTERM GRACE, deliberately. killScope does Terminate -> grace -> Kill;
+// NO SIGTERM GRACE, deliberately. killScope's LEAF-POPULATED arm does
+// Terminate -> grace -> Kill (its nested arm, like this one, goes straight to
+// the recursive kill because Terminate takes leaf pids and there are none);
 // confine's own teardown (cleanupConfineScope) goes straight to scope.Kill(), and
 // CLAUDE.md documents confine's contract as "a confined job has NO graceful
 // shutdown — Ctrl-C / SIGTERM hard-kills the whole job tree instantly". A
