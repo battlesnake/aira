@@ -89,3 +89,51 @@ not otherwise touching test ordering. It surfaces only when
 `go test ./internal/daemon/ ...` happens to run this test a second time, or
 run another real-cgroup-admission-waiting test immediately after it, which was
 not previously exercised.
+
+## Update — a working, non-fixing mitigation, and a narrowed root cause
+
+AIRA-133's PR could not land at all through this repo's own pre-push hook
+(`make test` = `go test ./...`) while this bug fired deterministically: its
+new real-cgroup test in `internal/daemon` happened to sort alphabetically
+BEFORE this ticket's test, and — confirmed by direct experiment — this
+ticket's test fails reliably whenever it is NOT the first real `Server`+slice
+sequence started in the test binary process, and passes reliably whenever it
+IS first, regardless of what ran before it or how large that predecessor's own
+workload was.
+
+**Mitigation shipped in AIRA-133** (not a fix for this ticket): its new file
+was named `oom_cap_source_real_cgroup_linux_test.go` specifically so it sorts,
+and therefore runs, AFTER `confine_oom_selfheal_real_cgroup_linux_test.go` —
+letting this ticket's test go first, where it is reliably fine. Confirmed
+clean 2/2 full-package runs after the rename. This is fragile in principle
+(any future file that happens to sort earlier, or any reordering of Go's own
+file-compilation convention, could reintroduce the failure with a different
+victim) and should not be treated as a real fix.
+
+**Narrowed root cause.** Ruled out by direct experiment (not assumed):
+- NOT the new test's memory footprint (shrunk 5x, no effect).
+- NOT host-wide MemAvailable settling (a bounded poll-wait had no effect).
+- NOT any `internal/daemon` package-level `var` — the only two are
+  `sync.Once` guards for LOG DEDUP (`admitExclusiveCeilingWarnOnce`,
+  `sliceMemoryStatDegradeOnce`), neither touches admission/ceiling decisions.
+- NOT `t.TempDir()` / `XDG_STATE_HOME` / `XDG_RUNTIME_DIR` collision —
+  `shortRuntimeDir` uses `os.MkdirTemp` (genuinely unique per call), and
+  `testPaths`'s `t.TempDir()` base is unique per test.
+- NOT daemon-goroutine teardown timing — `startServer`'s `t.Cleanup` blocks
+  (bounded 5s) on `<-done` after `cancel()`, so `server.Serve(ctx)` has fully
+  returned before the next test in the package starts.
+
+What is confirmed: the failure is a real `E_ADMIT_SATURATED` after the full
+30s `AdmissionMaxWait`, with the admission queue reporting "position 1 of 1,
+0B queued ahead" — i.e. it is NOT waiting behind a queued reservation. The
+next candidate worth checking (not yet investigated): a kernel-level resource
+that a first real Server/daemon instantiation in the process consumes and a
+second cannot fully get back on the SAME timescale — inotify/fsnotify watch
+descriptors on cgroup `memory.events` (if the daemon watches it for OOM
+detection), a per-user inotify instance limit, or open file descriptors on
+`/sys/fs/cgroup` paths from the first daemon's still-closing watchers. This
+would explain "not about memory pressure or state, but a second-invocation
+sensitivity" cleanly, and is a concrete, checkable next step (e.g.
+`ls /proc/<pid>/fd | wc -l` and `find /proc/<pid>/fdinfo -name 'inotify'`
+across the two Server instances, or straceing the second admission wait to
+see what syscall it is actually blocked on).
