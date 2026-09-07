@@ -515,3 +515,91 @@ def test_rich_assertion_diff_is_byte_identical_under_color_between_plain_and_ait
         "plain:\n%r\naitest:\n%r" % (plain_failure, aitest_failure)
     )
     assert "RICH-DIFF-MARKER" in aitest_failure
+
+
+_TEST_MIXED = '''
+import os
+
+
+def test_crashes():
+    os._exit(137)
+
+
+def test_really_fails():
+    assert 1 == 2, "REAL-FAILURE-MARKER"
+
+
+def test_passes():
+    assert True
+'''
+
+
+def _build_mixed_suite(tmp_path, name):
+    suite = tmp_path / name
+    suite.mkdir()
+    (suite / "conftest.py").write_text(_CONFTEST)
+    (suite / "test_mixed.py").write_text(_TEST_MIXED)
+    return suite
+
+
+def test_terminal_summary_says_how_many_of_the_reported_failures_are_unevaluated(tmp_path):
+    """AIRA-161, against a REAL mixed run: one worker-death (unevaluated) and
+    one genuine assertion failure, both of which pytest counts as failures.
+
+    The gap this closes is legibility in the aggregate, not detection. The
+    synthesized report's outcome="failed" shape is correct and deliberate --
+    TestReport.outcome is Literal["passed","failed","skipped"] and junitxml
+    silently DROPS an unrecognised one, so a synthesized failure is the only
+    shape that keeps the lost test visible at all. What was missing was any
+    statement of HOW MANY of the reported failures are that: aitest's own
+    plain "N unevaluated" line is printed by pytest_runtestloop, thousands of
+    lines above pytest's own failure count in a large run, so a consumer
+    reading the tail saw only "2 failed" and would have had to grep every
+    individual longrepr for the "unevaluated: " prefix to learn otherwise.
+    That is exactly what a downstream consumer did NOT do when a run reporting
+    ~370 failures -- almost all of them worker OOM-deaths -- was nearly
+    recorded as a genuinely red baseline.
+
+    The second, deselected run is the anti-noise half: same suite, same flags,
+    crash removed, one real failure still present, and the signal must be
+    completely absent."""
+    suite = _build_mixed_suite(tmp_path, "mixed")
+    aitest = _run_suite(
+        suite, _fresh_barrier(suite, "run"), tmp_path / "mixed.xml",
+        ["--aitest-workers=1"], tmp_path,
+    )
+    output = aitest.stdout + aitest.stderr
+
+    # Premise, asserted rather than assumed: this run really did produce one
+    # unevaluated result and one real failure, which pytest itself counts as
+    # two failures.
+    assert "test_mixed.py::test_crashes unevaluated" in output, output
+    assert "test_mixed.py::test_really_fails failed" in output, output
+    assert "1 unevaluated" in output, output
+    assert "2 failed" in output, output
+
+    # The signal itself, with the real numbers.
+    assert "aitest unevaluated results" in output, output
+    assert (
+        "aitest: 1 of the 2 failures pytest counted is UNEVALUATED, not a real test failure."
+        in output
+    ), output
+    # It lands in pytest's own summary region -- after the FAILURES section,
+    # i.e. next to the failure count it is about, not thousands of lines above
+    # it with the per-nodeid lines.
+    assert output.index("aitest: 1 of the 2 failures") > output.index("FAILURES"), output
+    assert output.index("aitest: 1 of the 2 failures") > output.index(
+        "test_mixed.py::test_crashes unevaluated"
+    ), output
+
+    # Anti-noise: the same suite with the crashing test deselected still has a
+    # real failure, and must say nothing about unevaluated results.
+    clean = _run_suite(
+        suite, _fresh_barrier(suite, "clean"), tmp_path / "clean.xml",
+        ["--aitest-workers=1", "--deselect", "test_mixed.py::test_crashes"], tmp_path,
+    )
+    clean_output = clean.stdout + clean.stderr
+    assert "1 failed" in clean_output, clean_output
+    assert "0 unevaluated" in clean_output, clean_output
+    assert "aitest unevaluated results" not in clean_output, clean_output
+    assert "UNEVALUATED" not in clean_output, clean_output

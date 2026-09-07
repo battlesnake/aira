@@ -26,6 +26,32 @@ progress, real failure tracebacks and captured output all work, and are proven
 against a plain, non-aitest run of the same suite by
 `test_junit_fidelity.py`.
 
+### Unevaluated results in the terminal summary (AIRA-161)
+
+A test whose worker died — and whose one requeue died too — is recorded as
+`unevaluated`, and rendered into the report as a `TestReport` with
+`outcome="failed"` whose longrepr begins `unevaluated: `. That shape is
+deliberate: `TestReport.outcome` is only ever meaningfully
+passed/failed/skipped, and `junitxml` silently DROPS an unrecognised one, so a
+synthesized failure is the only shape that keeps the lost test visible at all.
+
+The consequence is that pytest's own `N failed` count mixes real test failures
+with infrastructure-caused non-results. So whenever the count is nonzero,
+aitest adds an `aitest unevaluated results` block to pytest's terminal summary,
+next to that count:
+
+```text
+========================= aitest unevaluated results =========================
+aitest: 12 of the 370 failures pytest counted are UNEVALUATED, not real test failures.
+Unevaluated means aitest never established a result for that test: ...
+```
+
+It is silent when nothing was unevaluated, and absent under `-p no:terminal` /
+`--no-summary`, where pytest never calls the hook (and its own failure count is
+equally absent there). It reports the same number as the plain
+`aitest: … N unevaluated` line — one count, printed in two places — and changes
+nothing about detection, the requeue-once, or the synthesized report.
+
 ### Coverage
 
 `aitest` **owns nothing** about coverage. It never originates a coverage
@@ -73,4 +99,6 @@ would for xdist.
   replayed pytest/JUnit summary counts it as a failure. `unevaluated` is not a
   pytest outcome, and `junitxml` silently ignores an outcome it does not
   recognise — a synthesized failure is the only shape that keeps the test
-  visible in the report at all.
+  visible in the report at all. AIRA-161 does not remove that divergence (the
+  report shape stays exactly as it is); it makes it legible in the aggregate,
+  via the terminal-summary block described above.
