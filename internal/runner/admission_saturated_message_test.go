@@ -194,3 +194,129 @@ func TestSaturatedExclusiveWordingStillWinsOverTheContentionClause(t *testing.T)
 		})
 	}
 }
+
+// AIRA-151. The population this ticket routes onto E_ADMIT_TOO_LARGE, seen from
+// the client side.
+//
+// tooLargeAdmission runs one admission against a daemon that answers with the
+// given E_ADMIT_TOO_LARGE frame, and returns everything the caller is handed:
+// the result, whether the exchange was HANDLED (a false there means
+// admitThroughDaemon fell through to fail() and then to the flock fallback,
+// launching the job outside the ledger), and the error text.
+func tooLargeAdmission(t *testing.T, clientReserve int64, message string, rejection runnerAdmitRejection) (admissionResult, bool, error) {
+	t.Helper()
+	runner := &Runner{
+		memorySlice:      "/fake/finite.slice",
+		memoryReserve:    clientReserve,
+		admissionMaxWait: time.Second,
+		pollInterval:     time.Millisecond,
+		clock:            newInstantClock(),
+		sliceMemory:      func(string) (int64, int64, bool, string) { return 0, 1 << 30, true, "" },
+	}
+	client, server := net.Pipe()
+	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	go func() {
+		defer server.Close()
+		var frame runnerAdmitRequestFrame
+		if err := readRunnerAdmitFrame(server, &frame); err != nil {
+			return
+		}
+		data, _ := json.Marshal(rejection)
+		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{
+			Code: "E_ADMIT_TOO_LARGE", Error: message, Data: data,
+		})
+	}()
+	return runner.admitThroughDaemon(context.Background(), Request{DaemonEstimateMemory: true}, clientReserve)
+}
+
+// The §0.1 measured shape and the message internal/daemon/admit.go:2800 builds
+// for it, byte for byte:
+//
+//	fmt.Sprintf("%s: required=%d cap_minus_headroom=%d basis=%s", …)
+const (
+	tooLargeRequired = int64(4294967296) // the unpinned client default, UNCLAMPED
+	tooLargeCeiling  = int64(1031798784) // 1 GiB slice - 32 MiB - 8 MiB headroom
+	tooLargeBasis    = "fallback:insufficient-samples:n=1,oom-on-record"
+	tooLargeMessage  = "E_ADMIT_TOO_LARGE: required=4294967296 cap_minus_headroom=1031798784 basis=fallback:insufficient-samples:n=1,oom-on-record"
+)
+
+// TestTooLargeRefusalMessageNamesBothNumbersAndTheBasis records the exact
+// operator-facing string this ticket now routes traffic onto.
+//
+// It is GREEN by construction and is NOT a red-first demonstration: the client
+// already passes an E_ADMIT_TOO_LARGE message through unchanged. It exists so
+// that deferral G3 — "the too-large message names no escape hatch and prints
+// raw bytes, unlike the AIRA-149 saturated sentence beside it" — rests on a
+// recorded string rather than on a claim, and so that a later wording change is
+// a deliberate edit to a test rather than unnoticed drift.
+//
+// verifies: AIRA-151 §3.5, G3
+func TestTooLargeRefusalMessageNamesBothNumbersAndTheBasis(t *testing.T) {
+	result, _, err := tooLargeAdmission(t, DefaultConfineMemoryReserve, tooLargeMessage, runnerAdmitRejection{
+		Required: tooLargeRequired, Ceiling: tooLargeCeiling, Basis: tooLargeBasis,
+	})
+	if err == nil {
+		t.Fatalf("a too-large rejection produced no error (result=%+v)", result)
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"required=4294967296",
+		"cap_minus_headroom=1031798784",
+		"basis=" + tooLargeBasis,
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("message %q omits %q; both numbers and the basis are what make this refusal actionable at all", message, want)
+		}
+	}
+	if result.basis != "reject:too-large" {
+		t.Fatalf("basis=%q, want %q — the run's recorded admission basis", result.basis, "reject:too-large")
+	}
+	if result.state != "too_large" {
+		t.Fatalf("state=%q, want %q — the terminal state the agent guide tells agents not to retry", result.state, "too_large")
+	}
+	if result.reserve != tooLargeRequired {
+		t.Fatalf("reserve=%d, want the DAEMON-resolved %d", result.reserve, tooLargeRequired)
+	}
+	if result.ceiling != tooLargeCeiling {
+		t.Fatalf("ceiling=%d, want %d", result.ceiling, tooLargeCeiling)
+	}
+	// G3's evidence, recorded rather than asserted as acceptable: unlike the
+	// AIRA-149 saturated sentence this message names no escape hatch and renders
+	// raw byte counts. The agent guide carries the action instead (AIRA-151 §3.6).
+	if strings.Contains(message, "--memory-reserve") {
+		t.Fatalf("message %q now names an escape hatch; G3 was filed against a message that did not, and its successor must start from a current string", message)
+	}
+}
+
+// TestTooLargeRejectionForAnUnescalatedOverCeilingReserveIsAcceptedByTheClient
+// pins I5.
+//
+// The rejection AIRA-151 newly routes this population onto must satisfy
+// validRunnerAdmitRejection, or admitThroughDaemon drops through fail() into
+// the flock fallback and launches the job OUTSIDE the ledger — the loudest
+// failure available in this subsystem, and the reason this is a test rather
+// than an argument.
+//
+// GREEN by construction: Required > 0, Ceiling >= 0 and a non-empty Basis are
+// all satisfied at admit.go:1904 today. Its RED direction is a future payload
+// or validation change.
+//
+// verifies: AIRA-151 I5, §3.4
+func TestTooLargeRejectionForAnUnescalatedOverCeilingReserveIsAcceptedByTheClient(t *testing.T) {
+	payload := runnerAdmitRejection{
+		Required: tooLargeRequired, Ceiling: tooLargeCeiling, Basis: tooLargeBasis,
+	}
+	if !validRunnerAdmitRejection("E_ADMIT_TOO_LARGE", payload) {
+		t.Fatalf("the daemon payload %+v is rejected by validRunnerAdmitRejection; this population would launch outside the ledger", payload)
+	}
+	result, handled, err := tooLargeAdmission(t, DefaultConfineMemoryReserve, tooLargeMessage, payload)
+	if !handled {
+		t.Fatalf("the exchange was not handled (result=%+v, err=%v); admitThroughDaemon fell through to fail() and the flock fallback", result, err)
+	}
+	if err == nil {
+		t.Fatal("a too-large rejection must be terminal, and a terminal refusal carries an error")
+	}
+	if result.basis != "reject:too-large" {
+		t.Fatalf("basis=%q, want %q", result.basis, "reject:too-large")
+	}
+}

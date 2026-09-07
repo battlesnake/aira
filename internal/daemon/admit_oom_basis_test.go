@@ -148,23 +148,32 @@ func TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve(t *testing.T) {
 			basis:   "fallback:malformed,oom-on-record",
 		},
 		{
-			// (e) THE TICKET'S MEASURED CASE, byte for byte. The returned
-			// 1031798784 is the ceiling; neither 84541440 (the escalation) nor any
-			// estimate appears in it.
-			row:     "e/measured: client default clamped to the ceiling",
+			// (e) THE TICKET'S MEASURED CASE, byte for byte.
+			//
+			// AIRA-151 moved this row. Until then the returned value was the
+			// ceiling (1031798784) and the basis carried `,ceiling-clamped`,
+			// because the clamp applied to whatever produced `reserve`. It now
+			// applies only where the ESCALATION produced it, and here the
+			// escalation (84541440) is far below the client's own unpinned 4 GiB
+			// default, so nothing derived from the OOM peak is in the number and
+			// the clamp's rationale does not reach it. The 4 GiB is returned
+			// unclamped for admitConnection's `reserve > ceiling` boundary to
+			// refuse terminally with E_ADMIT_TOO_LARGE.
+			row:     "e/measured: client default over the ceiling, no longer clamped (AIRA-151)",
 			stats:   runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: measuredPeak, OOMCount: 1, MaxOOMPeak: measuredPeak},
 			reserve: measuredReserve,
 			ceiling: measuredCeiling,
-			want:    measuredCeiling,
-			basis:   "fallback:insufficient-samples:n=1,oom-on-record,ceiling-clamped",
+			want:    measuredReserve,
+			basis:   "fallback:insufficient-samples:n=1,oom-on-record",
 		},
 		{
-			row:     "e/malformed history clamped to the ceiling",
+			// The same AIRA-151 move, through the estimator's OTHER !ok basis.
+			row:     "e/malformed history over the ceiling, no longer clamped (AIRA-151)",
 			stats:   runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 0, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
 			reserve: 200 * gibBasis,
 			ceiling: 100 * gibBasis,
-			want:    100 * gibBasis,
-			basis:   "fallback:malformed,oom-on-record,ceiling-clamped",
+			want:    200 * gibBasis,
+			basis:   "fallback:malformed,oom-on-record",
 		},
 	} {
 		t.Run(test.row, func(t *testing.T) {

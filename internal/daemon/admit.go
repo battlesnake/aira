@@ -1684,13 +1684,39 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 					if escalated > reserve {
 						reserve = escalated
 						oomBasis = "estimate:oom-escalated"
-					}
-					// An OOM observed at the present ceiling is genuinely too
-					// large. Earlier censored caps are allowed to climb to the
-					// ceiling so a runnable job is never permanently wedged.
-					if stats.MaxOOMPeak < ceiling && reserve > ceiling {
-						reserve = ceiling
-						oomBasis += ",ceiling-clamped"
+						// AIRA-151. The clamp lives INSIDE this branch, which is
+						// the whole change.
+						//
+						// An OOM observed at the present ceiling is genuinely too
+						// large. Earlier censored caps are allowed to climb to the
+						// ceiling so a runnable job is never permanently wedged.
+						//
+						// That justification is about a value DERIVED FROM THE OOM
+						// PEAK. It does not apply to the blind unpinned client
+						// default, nor to an ordinary peak-history estimate: for
+						// those the no-OOM path already refuses an over-ceiling
+						// value terminally with E_ADMIT_TOO_LARGE (the reserve >
+						// ceiling boundary in admitConnection), naming both
+						// numbers, and an OOM record must not make the same number
+						// behave differently. A clamped reserve is exactly the
+						// ENTRY ceiling, and such a reserve is grantable only while
+						// the slice's charge stays inside a band of one per-job
+						// headroom term per job the request entered behind --
+						// byte-exact zero when it entered an empty slice
+						// (AIRA-150) -- so what the clamp bought those rows was
+						// usually a wait that ends in a refusal anyway, not a run.
+						//
+						// Nesting rather than an escalationDetermined flag is
+						// deliberate: it makes "clamped without the escalation
+						// having set the value" unrepresentable rather than merely
+						// untrue, and keeps ONE condition governing both the basis
+						// and the value, so the label and the number can never
+						// disagree about which term acted. The comparison stays
+						// STRICT: on an exact tie the escalation raised nothing.
+						if stats.MaxOOMPeak < ceiling && reserve > ceiling {
+							reserve = ceiling
+							oomBasis += ",ceiling-clamped"
+						}
 					}
 					return reserve, oomBasis
 				}

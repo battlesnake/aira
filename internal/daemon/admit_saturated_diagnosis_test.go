@@ -54,12 +54,30 @@ func staticPeakHistory(stats runner.PeakRSSStats) func(context.Context, string) 
 	return func(context.Context, string) (runner.PeakRSSStats, error) { return stats, nil }
 }
 
-// oomClampedHistory is the ticket's measured shape: one sample, which is one
-// OOM, so there is no usable ordinary estimate, the 1.5x escalation is far below
-// the unpinned 4 GiB client default, and that default is then clamped to
-// EXACTLY the ceiling.
+// oomClampedHistory manufactures the shape every test below needs: a resolved
+// reserve EXACTLY equal to the request-entry ceiling, and different from what
+// the client asked for, so `Required`, `Ceiling` and `Grantable` are three
+// distinct numbers an implementation that echoes the request cannot fake.
+//
+// AIRA-151 re-based it. It used to be AIRA-149 §0's own measured shape — one
+// sample, which is one OOM, so no usable ordinary estimate, a 1.5x escalation
+// far below the unpinned 4 GiB client default, and that default then clamped to
+// exactly the ceiling on a 1 GiB slice. That is AIRA-149 §3.1 row (e), and
+// AIRA-151 is precisely the ticket that stopped clamping it: such a request is
+// now refused terminally with E_ADMIT_TOO_LARGE at request entry and never
+// enqueues, so every test here would have failed in startSaturatedAdmit's "no
+// waiter appeared" loop rather than on its own assertion — a failure mode that
+// says nothing about what these tests examine.
+//
+// So the fixture drives row (b) instead, which still clamps because the
+// ESCALATION determined the value: MaxOOMPeak 3.5 GiB escalates to 5637144576,
+// which beats the 4 GiB default, and the guard `MaxOOMPeak < ceiling` still
+// holds against the 4 GiB slice these tests now declare. Every assertion below
+// is unchanged, `run.ceiling` is derived from each test's own `maximum`, and the
+// fact that this helper had to move is itself the executable evidence that
+// AIRA-150's systematic route onto the ceiling is gone.
 func oomClampedHistory() runner.PeakRSSStats {
-	return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 56360960, OOMCount: 1, MaxOOMPeak: 56360960}
+	return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 3758096384, OOMCount: 1, MaxOOMPeak: 3758096384}
 }
 
 type saturatedRun struct {
@@ -238,7 +256,7 @@ func TestSaturatedRejectionCarriesTheResolvedReserveAndCeiling(t *testing.T) {
 // nothing is outstanding or adopted. The daemon must say so, and must report the
 // largest grantable reserve it actually computed — `ceiling - 4096`, NOT zero.
 func TestSaturatedRejectionReportsNoContentionWhenNothingWasEverQueuedOrHeld(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 	server := saturatedServer(t)
 	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
@@ -280,7 +298,7 @@ func TestSaturatedRejectionReportsNoContentionWhenNothingWasEverQueuedOrHeld(t *
 // are different facts. An omitempty scalar would erase the first into the
 // second, which is the conflation this whole change exists to remove.
 func TestSaturatedRejectionReportsAMeasuredZeroGrantableAsPresent(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 	server := saturatedServer(t)
 	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
 	ceiling := subtractFloor(maximum, server.admitSliceHeadroom(1))
@@ -312,7 +330,7 @@ func heldLedgerWaiter(seq, reserve int64) *admitWaiter {
 // false-positive direction: the new clause must never claim solitude beside a
 // real job.
 func TestSaturatedRejectionReportsContentionWhenAnotherJobHeldTheSlice(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 	server := saturatedServer(t)
 	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
@@ -341,7 +359,7 @@ func TestSaturatedRejectionReportsContentionWhenAnotherJobHeldTheSlice(t *testin
 // implementation that sampled then would tell a waiter that spent almost all of
 // its wait behind a real job that nothing was ever in the way.
 func TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 	server := saturatedServer(t)
 	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
@@ -384,7 +402,7 @@ func TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection(t *
 // (shim.go's memoryReader) serves both reads, so the entry read must succeed and
 // every evaluator read must fail.
 func TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 	server := saturatedServer(t)
 	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
 	var reads atomic.Int64
@@ -518,7 +536,7 @@ func requireNoCounters(t *testing.T, queue *sliceQueue) {
 // rung. "Nothing else … at ANY evaluation" cannot be claimed if one evaluation
 // could not establish it.
 func TestUnestablishedEmptinessNeverReportsNoneObserved(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 	server := saturatedServer(t)
 	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
 	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
@@ -546,7 +564,7 @@ func TestUnestablishedEmptinessNeverReportsNoneObserved(t *testing.T) {
 // monotone JOIN itself, not its three cases separately: an implementation that
 // overwrites or resets instead of joining fails here.
 func TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 
 	t.Run("one unestablished pass forbids none-observed", func(t *testing.T) {
 		server := saturatedServer(t)
@@ -620,7 +638,7 @@ func TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved(t *te
 // of I8's table: the evaluator has exactly three refusal sites and only the
 // capacity gate's `reserve > available` disjunct may ever latch none-observed.
 func TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate(t *testing.T) {
-	const maximum = int64(1) << 30
+	const maximum = int64(4) << 30
 
 	t.Run("AIRA-59 freeze refusal", func(t *testing.T) {
 		server := saturatedServer(t)
