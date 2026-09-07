@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-140","project":"aira","title":"aira run's killScope leaf-only empty gate makes --timeout / --cpu-timeout inert against a nested-cgroup job","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["runner","timeout"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-140","project":"aira","title":"aira run's killScope leaf-only empty gate makes --timeout / --cpu-timeout inert against a nested-cgroup job","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["runner","timeout"],"hold":false,"relations":[]}
 ---
 
 Filed at AIRA-138's plan-fix, from that ticket's plan-gate P0. It is explicitly
@@ -178,3 +178,64 @@ AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1 -> 0
 - Contention (a scope repopulating between the two reads) is reasoned about but
   not reproduced in a test; the outcome in that window is the ordinary
   killed-by-timeout arm, which is the safe direction.
+
+## Build review (Fable, 2026-09-07) — MERGE; PR #89 merged as `c662e6c`
+
+Independently re-run in a detached review worktree at `bcab10c`, all foreground
+under `aira confine`, exact exit codes:
+
+```
+aira confine -- go build ./...                                   -> 0
+aira confine -- go vet ./...                                     -> 0
+AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1        -> 0
+AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner -race -count=1  -> 0 (x2, no flake)
+```
+
+**Non-porousness re-proved by an executed revert, not taken from the ticket.**
+`killScope` was restored to the leaf-only gate in the review worktree and
+`-run 'AIRA140|AIRA126|AIRA131|AIRA138'` re-run under `AIRA_REAL_CGROUP=1`:
+exactly `TestAIRA140KillScopeKillsALeafEmptySubtreePopulatedRunScope`
+(`{Started:false Completed:false Empty:false}`, no write) and
+`TestAIRA140RealCgroupTimeoutKillsARunLivingInAChildCgroup`
+(`U_RUN_RECONCILE_REQUIRED`, `ScopeKill{Requested:true Started:false}`) went
+red; T2/T3/T4 passed in both directions as designed; every AIRA-126, AIRA-131
+and AIRA-138 test passed unchanged on BOTH the old and the new gate. The fix
+therefore did not touch the already-empty / genuinely-dead-leader shape
+`decideTimeoutIntentNotExecuted` consumes: the `Empty && !Started` refusal still
+returns before any write and now needs both reads to agree (strictly stronger).
+
+**Dogfood, real nested cgroup, PR binary:** `aira run --timeout 2s -- /bin/sh
+payload.sh` where the payload mkdirs `.aira-nested` under its own run scope,
+moves `$$` in, proves it via `/proc/self/cgroup`, then `exec sleep 31.14`.
+Ended at 2.14s with `status:killed`, `scope_kill{started,completed}`,
+`kill_intent{completed,empty_scope}`, `error_codes:[E_RUN_TIMEOUT]` only, and
+no surviving `sleep`. On master's binary this job would have run its full 31s.
+
+Verified from source: the nested arm goes straight to the recursive
+`cgroup.kill` (no `Terminate` on an empty leaf list, no `termGrace` wait) and
+`waitEmpty(grace)` confirms on the subtree-aware read; a failed `Kill()` write
+keeps `Started:false`; an `Empty()` error returns the zero result with the error
+(byte-identical to the old gate's value on that path). The diff is confined to
+`killScope`, three doc comments that had gone false, the ticket, and tests that
+reuse AIRA-138's `nestedWorkloadScope` rather than re-deriving it.
+
+### Findings (non-blocking, recorded as accepted gaps)
+
+- **Over-claim in the Resolution above:** "each of the four callers ... is fixed
+  by the one change" is not quite true of the PTY capture teardown.
+  `runner_linux.go` (the `req.PTY` branch of capture teardown) still pre-gates
+  its `killScope` call on `len(scope.Members()) > 0` — a LEAF-only read — so a
+  descendant lingering in a child cgroup after a PTY leader exits is still not
+  reached by that path. Pre-existing, outside `killScope`'s gate (the ticket's
+  scope), and the non-PTY path (`attestScopeTeardown`) is already subtree-aware
+  via `scope.Empty()`. Worth its own small ticket.
+- **Empty child-cgroup dirs survive a nested kill:** after the nested arm
+  completes, `executeScopeKill`'s `scope.Remove()` is a single `rmdir` of the
+  run scope, which fails (EBUSY) while the job's now-empty child cgroup is still
+  inside it, and the error is discarded. The dogfood run left
+  `.aira-RUN-8/.aira-nested` behind, both `populated 0`. The same happens today
+  for any nested job that exits normally, so this PR only makes it reachable
+  from the kill path; no processes are leaked. Also worth a small ticket
+  (deepest-first removal, as `cgrouptest.removeScopeTree` already does).
+- The builder's worktree `~/tmp/aira-wt-AIRA-140` still holds the merged local
+  branch; `gh pr merge --delete-branch` removed the remote branch only.
