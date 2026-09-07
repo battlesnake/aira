@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-143","project":"aira","title":"PTY capture-teardown's killScope call still leaf-gated, missing a nested-cgroup descendant after the PTY leader exits","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-143","project":"aira","title":"PTY capture-teardown's killScope call still leaf-gated, missing a nested-cgroup descendant after the PTY leader exits","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Accepted gap recorded during AIRA-140's Fable review (PR #89, merged `c662e6c`),
@@ -203,3 +203,47 @@ recorded rather than glossed:
 - `ScopeKill.GraceMS` still records the runner's CONFIGURED `termGrace` on the
   nested arm, where no grace was waited. Inherited unchanged from AIRA-140,
   which accepted it as a config echo rather than a measurement.
+
+## Fable review (build gate, 2026-09-07) — MERGE
+
+PR #91 merged as `e8bd968`. Reviewed from source in an isolated worktree, not
+from the PR narrative:
+
+- Diff confined to the one PTY capture-teardown call site
+  (`internal/runner/runner_linux.go`), its test, and this ticket. No scope creep.
+- Dropping the outer leaf-only pre-check rather than duplicating AIRA-140's
+  two-read logic is the right shape: `killScope` already returns `{Empty:true}`
+  before any write when both reads agree, so the pre-check was pure redundancy.
+- Mutation both ways, executed: restoring the leaf-only pre-check turns
+  `TestAIRA143PTYCaptureTeardownKillsALeafEmptySubtreePopulatedScope` red at
+  its first assertion (one kill write, `ScopeKill` all-false, `E_RUN_SCOPE_HANDOFF`);
+  mutating the gate to always claim a completed kill turns
+  `TestAIRA143PTYCaptureTeardownStillRefusesToSignalAScopeBothReadsCallEmpty`
+  red. HEAD passes both `-count=3`.
+- The new `ptyNestedScope` fake instead of the ticket's suggested
+  `nestedWorkloadScope` is justified: that fake's `Members()` is
+  unconditionally `nil`, which on the real `Launch` path would let the
+  membership monitor manufacture a `migrated` verdict that outranks
+  `descendant-killed`.
+- The "no real-cgroup lane" reasoning holds: `quiescePTYScope` writes
+  `cgroup.kill` unconditionally and a real one is recursive, so on a healthy
+  scope the teardown branch has nothing left to reach either way.
+
+Independent evidence, foreground, exact exit codes:
+
+```
+aira confine -- go build ./...                                       -> 0
+aira confine -- go vet ./...                                         -> 0
+AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1 -timeout 25m -> 0
+```
+
+Observation, not a finding (pre-existing pattern, not introduced here): the
+`else if forced` arm assigns `ScopeHandoffUnverified` directly rather than
+through `scopeIntegrityPrecedence`, so in the (already near-impossible after a
+confirmed quiesce) widened row it could overwrite a `ScopeDescendantKilled`
+set at the quiesce report. The later `finalIntegrity` merge is
+precedence-guarded; this arm is not. Accepted as-is.
+
+The PR's accepted gaps (`quiescePTYScope.hadDescendants` still leaf-only for
+REPORTING purposes; the `forced`-and-incomplete-kill widening; `GraceMS`
+config echo) are accepted by this review.
