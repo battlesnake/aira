@@ -142,7 +142,7 @@ func TestClassifyConfineTermination(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := classifyConfineTermination(test.term, test.usage, test.supervisor); got != test.want {
+			if got := classifyConfineTermination(test.term, test.usage, test.supervisor, deadlineKindUnset); got != test.want {
 				t.Fatalf("classify = %q, want %q (%s)", got, test.want, test.why)
 			}
 		})

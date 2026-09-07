@@ -789,7 +789,11 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			options[name] = "true"
 			continue
 		}
-		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" && name != "admit-timeout" {
+		// AIRA-138 adds --timeout and --cpu-timeout here, in the VALUED branch and
+		// only in the launch form. parseConfineManagementArgs keeps rejecting them,
+		// so `aira confine --timeout 5m --list` is an argument error rather than a
+		// silently ignored no-op — the same discipline --exclusive already follows.
+		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" && name != "admit-timeout" && name != "timeout" && name != "cpu-timeout" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
 		}
 		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
@@ -829,7 +833,35 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
 		}
 	}
+	// AIRA-138. Both job bounds are validated SYNCHRONOUSLY here, so the caller
+	// learns before any daemon round trip. A zero or negative value is an argument
+	// error and never "no bound": a bound the operator asked for and silently did
+	// not get is a fake pass.
+	for _, name := range []string{"timeout", "cpu-timeout"} {
+		raw, present := options[name]
+		if !present {
+			continue
+		}
+		if _, err := parseConfineJobBound(raw); err != nil {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s: %w", name, err)
+		}
+	}
 	return target, options, nil
+}
+
+// parseConfineJobBound parses one --timeout/--cpu-timeout value. It is the ONE
+// definition of what those options accept, shared by the parse-time refusal and
+// the request transcription, so the two cannot drift into accepting different
+// languages (AIRA-138).
+func parseConfineJobBound(raw string) (time.Duration, error) {
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if value <= 0 {
+		return 0, errors.New("must be positive")
+	}
+	return value, nil
 }
 
 func parseConfineReserveArgs(argv []string) ([]string, map[string]string, error) {
@@ -1051,6 +1083,25 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
+	// AIRA-138. The CLI TRANSCRIBES both job bounds; parseConfineArgs has already
+	// refused anything non-positive or unparseable, and this re-parse goes through
+	// the same one helper so the two can never accept different languages.
+	var jobTimeout, jobCPUTimeout time.Duration
+	for _, bound := range []struct {
+		name  string
+		value *time.Duration
+	}{{"timeout", &jobTimeout}, {"cpu-timeout", &jobCPUTimeout}} {
+		raw := options[bound.name]
+		if raw == "" {
+			continue
+		}
+		parsed, boundErr := parseConfineJobBound(raw)
+		if boundErr != nil {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --%s: %v\n", bound.name, boundErr)
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		*bound.value = parsed
+	}
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", err)
@@ -1064,7 +1115,8 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		Exclusive:      options["exclusive"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		AdmissionMaxWait: admitTimeout,
-		Stdin:            stdin, Stdout: stdout, Stderr: stderr,
+		Timeout:          jobTimeout, CPUTimeout: jobCPUTimeout,
+		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {
 		request.RuntimeDir = paths.RuntimeDir

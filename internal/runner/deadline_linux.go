@@ -39,12 +39,38 @@ import (
 // a job had not actually reached.
 const cpuBudgetSampleInterval = 100 * time.Millisecond
 
+// deadlineKind is the TYPED discriminator for which bound fired (AIRA-138).
+//
+// It exists because `aira confine` reuses this source and must tell the two
+// bounds apart, and the two alternatives are both unsound there:
+//
+//   - String-matching Code == "E_RUN_CPU_TIMEOUT" couples confine's trailer to a
+//     RUN-flavoured error code confine never emits, and is a latent break the
+//     compiler cannot see.
+//   - Discriminating on Observed > 0 is refused outright: Observed's own doc says
+//     it is zero for the wall bound, so reading a zero-valued field as evidence is
+//     exactly the fake-evidence pattern this package refuses everywhere else
+//     (LocalOOM, PeakRSS, CPUUser).
+//
+// Additive: Launch reads neither Kind nor anything derived from it, so `aira
+// run`'s behaviour is unchanged (pinned by TestAIRA138DeadlineFireKindDoesNotChangeRun).
+type deadlineKind uint8
+
+const (
+	// deadlineKindUnset is the zero value: no bound fired, or no deadline kill
+	// was executed. It must never be read as either bound.
+	deadlineKindUnset deadlineKind = iota
+	deadlineKindWall
+	deadlineKindCPU
+)
+
 // deadlineFire is the single value a deadline source ever emits. It names the
 // bound that fired so the ONE kill site can attribute the kill honestly without
 // making a second decision.
 type deadlineFire struct {
 	Actor    string        // "run-timeout" | "run-cpu-timeout"
 	Code     string        // "E_RUN_TIMEOUT" | "E_RUN_CPU_TIMEOUT"
+	Kind     deadlineKind  // AIRA-138: which bound, typed rather than string-matched
 	Budget   time.Duration // the bound that was breached
 	Observed time.Duration // CPU-time consumed at the deciding sample; zero for the wall bound
 }
@@ -113,7 +139,7 @@ func startDeadlineSource(cfg deadlineConfig) *deadlineSource {
 			case <-src.stop:
 				return
 			case <-wall:
-				src.C <- deadlineFire{Actor: "run-timeout", Code: "E_RUN_TIMEOUT", Budget: cfg.Wall}
+				src.C <- deadlineFire{Actor: "run-timeout", Code: "E_RUN_TIMEOUT", Kind: deadlineKindWall, Budget: cfg.Wall}
 				return
 			case <-tick:
 				used, ok := cfg.ReadCPU(cfg.ScopePath)
@@ -137,7 +163,7 @@ func startDeadlineSource(cfg deadlineConfig) *deadlineSource {
 					continue
 				}
 				src.C <- deadlineFire{
-					Actor: "run-cpu-timeout", Code: "E_RUN_CPU_TIMEOUT",
+					Actor: "run-cpu-timeout", Code: "E_RUN_CPU_TIMEOUT", Kind: deadlineKindCPU,
 					Budget: cfg.CPU, Observed: consumed,
 				}
 				return
