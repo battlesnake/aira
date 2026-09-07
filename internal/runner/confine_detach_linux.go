@@ -772,27 +772,7 @@ func confineEnvironmentDigest(env []string) string {
 	return hex.EncodeToString(sum.Sum(nil)[:16])
 }
 
-// confineErrorCode extracts the stable leading error code from a confine error.
-// internal/runner must not import internal/store, so the extraction is local;
-// the grammar is the project's own "CODE: detail" convention.
-func confineErrorCode(err error) string {
-	if err == nil {
-		return ""
-	}
-	text := err.Error()
-	colon := strings.IndexByte(text, ':')
-	if colon <= 0 {
-		return ""
-	}
-	candidate := text[:colon]
-	if !strings.HasPrefix(candidate, "E_") && !strings.HasPrefix(candidate, "U_") && !strings.HasPrefix(candidate, "W_") {
-		return ""
-	}
-	for _, r := range candidate {
-		if r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' {
-			continue
-		}
-		return ""
-	}
-	return candidate
-}
+// confineErrorCode moved to confine.go with AIRA-147: FormatConfineNeverRan
+// needs the same extraction on every platform, and two copies of one grammar
+// would have been free to drift. The detached supervisor's use of it is
+// unchanged.

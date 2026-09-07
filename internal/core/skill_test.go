@@ -655,3 +655,44 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 		}
 	}
 }
+
+// TestSkillTeachesTheNeverRanEnvelope is the documentation half of AIRA-147.
+//
+// AIRA-128 (above) taught agents to read `terminated-by=` before a job's own
+// output. That guidance has a blind spot the never-admitted case falls straight
+// into: a job that NEVER RAN has no termination to attribute and emits no
+// trailer at all, so an agent following the OOM lesson to the letter finds
+// nothing and falls back on the exit code — which cannot answer the question.
+// AIRA-138 §5.4 passes a real job's own status through verbatim, so
+// E_ADMIT_SATURATED's exit 4 is byte-identical to an ordinary command that ran
+// and exited 4, and 1/2/3 collide the same way.
+//
+// Enforced by a test for the same reason the OOM leg is: the failure mode is an
+// agent confidently reporting a contended box as a broken build, and the only
+// thing standing between it and that mistake is whether AIRA's own instructions
+// name the signal.
+//
+// verifies: AIRA-147
+func TestSkillTeachesTheNeverRanEnvelope(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ text, why string }{
+		{"ran=no", "the token that says the command never executed, matchable literally"},
+		{"The `admission=` facet is what to act on", "the facet that says WHICH never-ran case this is"},
+		{"saturated", "the retry-when-the-box-frees-up case, distinct from a bad request"},
+		{"`code=E_CONFINE_UNAVAILABLE`", "the host/install case that retrying will not fix"},
+		{"exit `4`", "the collision that makes the exit code unable to answer this"},
+		{"passed through verbatim and unmodified", "why the exit code cannot be reserved: a real job's status passes through"},
+	} {
+		for _, document := range []struct{ name, body string }{
+			{"SKILL.md", string(artifacts.SkillMD)},
+			{"guide", string(artifacts.Guide)},
+		} {
+			if !strings.Contains(document.body, want.text) {
+				t.Errorf("%s no longer teaches %q (%s)", document.name, want.text, want.why)
+			}
+		}
+	}
+}

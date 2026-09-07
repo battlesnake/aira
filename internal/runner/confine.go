@@ -753,10 +753,107 @@ func ResolveConfineSlice(flagValue string) string {
 	return ""
 }
 
+// ConfineNeverRanFacet is the token that opens AIRA-147's never-ran trailer and
+// appears on NO other line confine emits — FormatConfineStatus has no `ran=`
+// facet, so `ran=no` is unambiguous by construction and a reader may key on it
+// with a fixed-string match rather than a pattern.
+const ConfineNeverRanFacet = "ran=no"
+
+// FormatConfineNeverRan is the never-ran counterpart of FormatConfineStatus:
+// the single operator-facing projection for a confine that returned an error
+// (AIRA-147).
+//
+// It exists because the two outcomes were asymmetric in exactly the direction
+// that misleads. A job that RAN gets a full trailer whose `terminated-by=`
+// facet the Skill guide already teaches agents to read before the job's own
+// output; a job that NEVER ran got no trailer at all — only a free-text error
+// line and an exit code. And that exit code is deliberately NOT unique:
+// AIRA-138 §5.4 passes a job's own status through verbatim, so a job that
+// really ran and exited 4 is byte-identical at the exit-code layer to
+// E_ADMIT_SATURATED never having started one. The reserved codes 1, 2 and 3
+// collide the same way. This line is the machine-readable carrier of the one
+// fact the exit code cannot carry.
+//
+// The claim is safe because it is not a new invariant: confine reserves error
+// returns for "the confinement could not be established", every error return
+// happens before the release write that lets the setup shim exec the target,
+// and every path that reaches the target returns a nil error carrying its exit
+// code. So a non-nil error from Confine means the target argv never executed,
+// and this line states that and nothing more.
+//
+// Facets follow FormatConfineStatus's discipline: each is always rendered, and
+// a value that was never established reads `unevaluated` rather than being
+// omitted — a field silently missing from a diagnosis line is exactly the
+// ambiguity these trailers exist to end.
+func FormatConfineNeverRan(status ConfineStatus, err error) string {
+	code := confineErrorCode(err)
+	if code == "" {
+		code = "unevaluated"
+	}
+	slice := status.Slice
+	if slice == "" {
+		slice = "unevaluated"
+	}
+	// The admission facet reads off AdmissionState, the wire-level state the
+	// runner records BEFORE it returns an admission error, so the saturated
+	// rejection this ticket is about renders `admission=saturated`. It is what
+	// separates "the box was full, retry when it frees up" from "this launch was
+	// never admissible as asked" — the same distinction the exit-code bucketing
+	// in internal/codes already draws, made legible without parsing prose.
+	admission := status.AdmissionState
+	if admission == "" {
+		admission = string(status.Admission)
+	}
+	if admission == "" {
+		admission = "unevaluated"
+	}
+	return "confine: " + ConfineNeverRanFacet + " code=" + code + " slice=" + slice + " admission=" + admission
+}
+
+// confineErrorCode extracts the stable leading error code from a confine error.
+// internal/runner must not import internal/store, so the extraction is local;
+// the grammar is the project's own "CODE: detail" convention.
+func confineErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	colon := strings.IndexByte(text, ':')
+	if colon <= 0 {
+		return ""
+	}
+	candidate := text[:colon]
+	if !strings.HasPrefix(candidate, "E_") && !strings.HasPrefix(candidate, "U_") && !strings.HasPrefix(candidate, "W_") {
+		return ""
+	}
+	for _, r := range candidate {
+		if r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' {
+			continue
+		}
+		return ""
+	}
+	return candidate
+}
+
 // Confine runs a foreground command in a newly-created cgroup scope. Platform
 // implementations must fail closed when the scope cannot be established.
+//
+// AIRA-147: this is the ONE funnel every confine launch passes through — the
+// real Linux path, the ci-shim path, the non-Linux stub, and the detached
+// supervisor — so the never-ran trailer is emitted HERE rather than at the ~25
+// scattered confineUnavailable sites, which could not have stayed in step. The
+// exit-code passthrough contract (AIRA-138 §5.4) is untouched: this adds one
+// diagnostic line and changes no exit code, on any arm.
 func Confine(ctx context.Context, request ConfineRequest) (ConfineResult, error) {
-	return confine(ctx, request)
+	result, err := confine(ctx, request)
+	if err != nil {
+		diagnostics := request.Stderr
+		if diagnostics == nil {
+			diagnostics = os.Stderr
+		}
+		_, _ = fmt.Fprintln(diagnostics, FormatConfineNeverRan(result.Status, err))
+	}
+	return result, err
 }
 
 func FormatConfineBytes(value int64) string {
