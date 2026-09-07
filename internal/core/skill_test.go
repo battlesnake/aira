@@ -696,3 +696,55 @@ func TestSkillTeachesTheNeverRanEnvelope(t *testing.T) {
 		}
 	}
 }
+
+// TestSkillTeachesTheWaitIdiomAndThePipelineStatusTrap is the documentation half
+// of AIRA-142.
+//
+// AIRA-142 was reported with measured production evidence: in one day on this
+// box, three `pgrep -f` patterns with ZERO real jobs running matched two or
+// three processes each — six live waiters, every match a waiter seeing its own
+// argv or a sibling's. `until ! pgrep -f <pattern>` deadlocks by construction,
+// and the deadlock is indistinguishable from a slow job, so the agent gives up
+// and launches ANOTHER copy of the work. Six distinct actors wrote that shape in
+// a day and two of them had an explicit warning against it in their own
+// briefing, which is why this lands as an idiom to COPY (the file sentinel the
+// job writes itself, which worked first time unprompted elsewhere) rather than
+// as one more rule to obey.
+//
+// The ticket's second trap rides with it because the two compose into a false
+// green: a waiter that finally exits, then reads the job's status through
+// `| tail`, gets tail's `0` rather than the job's failure.
+//
+// This ticket was resolved as documentation only — no `aira confine --wait`
+// verb — so the generated Skill and guide ARE the entire deliverable, and a
+// test is the only thing standing between the guidance and a silent deletion.
+// Same reason as TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal and
+// TestSkillTeachesTheNeverRanEnvelope above.
+//
+// verifies: AIRA-142
+func TestSkillTeachesTheWaitIdiomAndThePipelineStatusTrap(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ text, why string }{
+		{"never poll `pgrep`", "the heading that names the broken shape, so it is findable"},
+		{"matches the full command line of EVERY process, the waiter's own included", "the mechanism: why the loop deadlocks against itself"},
+		{"it matches ITSELF", "the self-match, stated so it cannot be read as a flaky-tool story"},
+		{"write no waiter at all", "the common case: the harness already backgrounds and reports completion"},
+		{"until grep -q '^GATE_EXIT=' ~/tmp/some-gate.log", "the file-sentinel idiom to copy for another agent's or a detached job"},
+		{"never on a process name", "the rule that generalises the idiom beyond the one example"},
+		{"reports `tail`'s exit code", "the pipeline trap that turns a failed job into a false green"},
+		{"${PIPESTATUS[0]}", "the bash-native fix for a status already sent through a pipe"},
+		{"echo \"GATE_EXIT=$?\" >> ~/tmp/some-gate.log", "the better fix: the sentinel carries the true status, so nothing can swallow it"},
+	} {
+		for _, document := range []struct{ name, body string }{
+			{"SKILL.md", string(artifacts.SkillMD)},
+			{"guide", string(artifacts.Guide)},
+		} {
+			if !strings.Contains(document.body, want.text) {
+				t.Errorf("%s no longer teaches %q (%s)", document.name, want.text, want.why)
+			}
+		}
+	}
+}
