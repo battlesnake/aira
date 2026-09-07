@@ -354,6 +354,27 @@ type admitWaiter struct {
 	exclusive       bool
 	exclusiveHolder string
 	parentScopeID   string
+
+	// AIRA-149. DIAGNOSIS ONLY: neither field is read by any admission or grant
+	// decision, and both are written ONLY inside evaluateAdmitQueue's existing
+	// refusal branches, under queue.mu -- the same discipline as the AIRA-29
+	// charge fields above.
+	//
+	// contention is LATCHED ACROSS THE WHOLE WAIT, never sampled at the instant
+	// of rejection, and that is the point of it existing at all: a waiter blocked
+	// behind a real job for 29 of its 30 seconds and alone when the timer fires
+	// must still be told the truth. It holds the monotone lattice below, joined
+	// with max() at every refusal, so `observed` is sticky, a single
+	// unestablished pass forbids `none-observed` for the whole wait, and
+	// `none-observed` survives only if EVERY pass positively established
+	// solitude.
+	//
+	// lastGrantable is the checkedAvailable figure the capacity gate last
+	// computed for THIS waiter -- the number that actually explains the refusal.
+	// A pointer, so a waiter no pass ever evaluated reports nothing rather than a
+	// fabricated zero.
+	contention    int
+	lastGrantable *int64
 }
 
 // ledgerCharge is what this waiter contributes to queue.outstanding: the
@@ -491,6 +512,123 @@ func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
 // parent job has escaped its scope or died with its socket held open.
 func sliceProvablyEmpty(queue *sliceQueue) bool {
 	return queue.outstandingJobs == 0 && queue.liveScopesKnown && queue.liveScopes == 0
+}
+
+// AIRA-149. The three-valued contention lattice, and the ONE reading that
+// writes it. Diagnosis only: nothing here takes part in any admission or grant
+// decision, and this file's readings are consumed, never computed or altered.
+//
+// The lattice is MONOTONE and joined with max(), which is the whole transition
+// rule:
+//
+//	observed > unevaluated > none-observed
+//
+// so `observed` is sticky (a wait spent behind a real job is reported as such
+// even if the slice is empty when the timer fires), a single pass that could
+// not establish solitude forbids `none-observed` for the whole wait, and
+// `none-observed` survives only when EVERY pass positively established it.
+const (
+	contentionUnset        = 0
+	contentionNoneObserved = 1
+	contentionUnevaluated  = 2
+	contentionObserved     = 3
+)
+
+// admitContentionToken renders a latched reading as its wire token. An
+// UNSET latch -- a waiter no pass ever evaluated -- is `unevaluated`, never
+// "nothing was in the way": absence of a reading is not a reading.
+func admitContentionToken(contention int) string {
+	switch contention {
+	case contentionObserved:
+		return "observed"
+	case contentionNoneObserved:
+		return "none-observed"
+	default:
+		return "unevaluated"
+	}
+}
+
+// joinContentionLocked raises this waiter's latch to at most the given reading.
+// queue.mu must be held.
+func (w *admitWaiter) joinContentionLocked(reading int) {
+	if w != nil && reading > w.contention {
+		w.contention = reading
+	}
+}
+
+// noteGrantableLocked records the capacity the gate just computed for this
+// waiter. queue.mu must be held. Written only where `available` was actually
+// computed, so an absent value means "no pass ever measured this".
+func (w *admitWaiter) noteGrantableLocked(available int64) {
+	if w == nil {
+		return
+	}
+	value := available
+	w.lastGrantable = &value
+}
+
+// soloReadingLocked is the emptiness reading for ONE refusal pass. queue.mu must
+// be held.
+//
+// It is derived STRUCTURALLY, from the subtree-aware population AIRA-101 and
+// AIRA-114 already maintain, and deliberately NOT from the reserve counters
+// (outstandingJobs / adoptedJobs). The comment above the adopted loop says why
+// in its own words: that loop skips leaf-unpopulated scopes, connection-held
+// ones, nil/malformed caps and delegate-without-usable-RSS ones, and every one
+// of those exclusions is correct for RESERVE accounting and wrong for
+// EMPTINESS, because a skipped scope is still a running job. On this box the
+// commonest such scope is a post-restart aitest/delegate outer scope that has
+// drained every pid into a child cgroup: its leaf Populated reads 0 and
+// adoptedJobs stays 0, while it is very much using memory -- driving `current`
+// up and refusing a solo waiter on the ORDINARY disjunct. A counter-derived
+// rule would print "nothing else held or was queued for this slice" beside a
+// running suite: the ticket's own defect, reintroduced by its fix.
+//
+// Job counts, not bytes, remains load-bearing. A residual 4 KiB page in the
+// slice is NOT another job; reading a nonzero `current` as contention is
+// exactly the misdiagnosis AIRA-149 is about (the measured case had
+// current=4096 with zero jobs). sliceProvablyEmpty counts scopes and jobs,
+// never bytes.
+//
+// One bounded gap, named rather than engineered around: the scan behind
+// liveScopes/capAggregate is rate-limited to at most once per second
+// (queue.adoptedAt), so a single pass can read a scope population up to that
+// stale. Over a multi-second wait every pass would have to miss the same
+// neighbour for a false `none-observed`, and it is the identical staleness
+// AIRA-101 already accepts for the strictly more consequential decision of
+// GRANTING exclusivity.
+func soloReadingLocked(queue *sliceQueue, queuedAhead int, overSubscribed bool) int {
+	// A failing confine scan cannot establish solitude. Fail closed, and ALWAYS
+	// first: an unestablished reading outranks every "looks empty" test below it,
+	// so a single such pass forbids the solo claim for the whole wait.
+	if !queue.liveScopesKnown {
+		return contentionUnevaluated
+	}
+	// The disjunct actually taken. An aggregate refusal is by construction a
+	// refusal caused by OTHER scopes' caps.
+	if overSubscribed {
+		return contentionObserved
+	}
+	// Belt and braces on the same scanned population, for the ordinary disjunct:
+	// a nonzero established aggregate means aggregateScopeCap saw live scopes.
+	// It should never be the deciding test -- every scope it counts is also
+	// counted by liveScopes -- and it is kept because it costs one comparison on
+	// a refusal path and makes the AIRA-114 population's contribution to the
+	// claim legible at the site rather than inferable.
+	if queue.capAggregateKnown && queue.capAggregate > 0 {
+		return contentionObserved
+	}
+	if !sliceProvablyEmpty(queue) {
+		return contentionObserved
+	}
+	// AHEAD is the load-bearing word. queuedAhead counts still-queued waiters
+	// already examined in THIS pass, i.e. genuinely ahead of this request; a
+	// waiter granted earlier in the same pass has already incremented
+	// outstandingJobs, so sliceProvablyEmpty catches it.
+	if queuedAhead > 0 {
+		return contentionObserved
+	}
+	return contentionNoneObserved
 }
 
 // exclusiveGateStateLocked renders the queue's exclusive state as its wire
@@ -812,6 +950,23 @@ type admitRejection struct {
 	// the slice" from ordinary saturation. Additive: Basis keeps its exact
 	// "reject:saturated" spelling, which validRunnerAdmitRejection pins.
 	Exclusive string `json:"exclusive,omitempty"`
+
+	// AIRA-149. DIAGNOSIS ONLY: neither field is consulted by any admission or
+	// grant decision, and both are additive beside the pinned Basis spelling.
+	//
+	// Contention is the LATCHED three-valued reading of "was anything else ever
+	// in the way", as one of "observed" / "none-observed" / "unevaluated". The
+	// daemon always sets one of the three on this path, so an EMPTY value at the
+	// client strictly means "not reported by this build" and lands on the
+	// unchanged pre-AIRA-149 wording.
+	//
+	// Grantable is the checkedAvailable figure the capacity gate last computed
+	// for THIS waiter. The pointer is load-bearing: `charge >= ceiling` yields a
+	// genuine zero — "not one byte was grantable at the last evaluation" — and an
+	// omitempty scalar would erase that real reading into "the daemon did not
+	// report this", which is the exact conflation this change exists to remove.
+	Contention string `json:"contention,omitempty"`
+	Grantable  *int64 `json:"grantable_bytes,omitempty"`
 }
 
 func subtractFloor(value, subtract int64) int64 {
@@ -1472,11 +1627,17 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 				historyUnavailable = true
 			} else {
 				reserve := request.reserve
-				basis := "fallback:insufficient-samples"
 				ordinary := stats
 				ordinary.OOMCount = 0
-				if estimated, ok, estimatedBasis := runner.EstimateMemoryReserve(ordinary, 0); ok {
-					reserve, basis = estimated, estimatedBasis
+				// AIRA-149 (D4). The estimator's OWN basis is kept in BOTH arms. This
+				// local used to start at a hardcoded "fallback:insufficient-samples"
+				// that survived whenever ok == false, which is a false label the moment
+				// the real reason was something else (fallback:malformed, reachable
+				// through the injected history seam). The VALUE path is unchanged:
+				// reserve still moves only when the estimate is usable.
+				estimated, estimateUsable, basis := runner.EstimateMemoryReserve(ordinary, 0)
+				if estimateUsable {
+					reserve = estimated
 				}
 				if stats.TotalCount > 0 {
 					// Some observations exist but did not yield a usable estimate
@@ -1490,16 +1651,48 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 					} else {
 						escalated += escalated / 2
 					}
+					// AIRA-149 (D1). reserve-basis names the provenance of the number
+					// actually RETURNED, not the branch that was entered.
+					//
+					// "estimate:oom-escalated" used to be returned unconditionally from
+					// here, which is true of exactly ONE of this branch's five outcomes.
+					// In the commonest state right after a first OOM -- one sample, so no
+					// usable ordinary estimate, and a 1.5x escalation far below the
+					// unpinned 4 GiB client default -- the value returned is the client's
+					// own default (or the ceiling it was clamped to), and nothing derived
+					// from the OOM peak appears in it.
+					//
+					// ",oom-on-record" is NOT decoration. "estimate:oom-escalated" carried
+					// two meanings welded together: ATTRIBUTION ("an OOM record for THIS
+					// signature was found and consulted") and PROVENANCE ("the number is
+					// 1.5x the OOM peak"). Only the provenance half was ever false, and the
+					// attribution half is load-bearing: AIRA-128's real-cgroup fixture uses
+					// it as the proof that a real kernel OOM travelled memory.events ->
+					// confine teardown -> RecordConfinePeak -> ConfinePeakHistory -> here.
+					// Reporting a bare fallback basis would have deleted a verified
+					// property while fixing a false one.
+					//
+					// The tie-break is stated rather than accidental: the escalation is
+					// deemed to have determined the value only when it STRICTLY raised it,
+					// which is the existing condition, unchanged. On an exact tie both
+					// terms produce the same number and the source basis is reported.
+					//
+					// The grammar is the existing one: family:name[:params] with
+					// COMMA-separated params, as estimate:max=%d,n=%d,f=115 already uses.
+					// No space, which the trailer's key=value field forbids.
+					oomBasis := basis + ",oom-on-record"
 					if escalated > reserve {
 						reserve = escalated
+						oomBasis = "estimate:oom-escalated"
 					}
 					// An OOM observed at the present ceiling is genuinely too
 					// large. Earlier censored caps are allowed to climb to the
 					// ceiling so a runnable job is never permanently wedged.
 					if stats.MaxOOMPeak < ceiling && reserve > ceiling {
 						reserve = ceiling
+						oomBasis += ",ceiling-clamped"
 					}
-					return reserve, "estimate:oom-escalated"
+					return reserve, oomBasis
 				}
 				if stats.SampleCount >= 3 && reserve > 0 {
 					return reserve, basis
@@ -1781,8 +1974,10 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		// in the budget I set". Naming it keeps the two apart for the one caller who
 		// most needs the difference (found by build review).
 		if waiter.exclusive {
+			diagnosis := saturatedDiagnosisLocked(waiter, reserve, ceiling)
+			diagnosis.Exclusive = admitExclusiveDraining
 			queue.mu.Unlock()
-			s.writeAdmitRejection(conn, CodeAdmitSaturated, admitRejection{Basis: "reject:saturated", Exclusive: admitExclusiveDraining})
+			s.writeAdmitRejection(conn, CodeAdmitSaturated, diagnosis)
 			return
 		}
 		// Report WHETHER the wait expired under an exclusive drain or hold, so a
@@ -1790,8 +1985,10 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		// saturation. Basis keeps its exact "reject:saturated" spelling, which
 		// validRunnerAdmitRejection pins, so this is purely additive.
 		exclusiveState := exclusiveGateStateLocked(queue)
+		diagnosis := saturatedDiagnosisLocked(waiter, reserve, ceiling)
+		diagnosis.Exclusive = exclusiveState
 		queue.mu.Unlock()
-		s.writeAdmitRejection(conn, CodeAdmitSaturated, admitRejection{Basis: "reject:saturated", Exclusive: exclusiveState})
+		s.writeAdmitRejection(conn, CodeAdmitSaturated, diagnosis)
 		return
 	}
 	if waiter.state != admitGranted {
@@ -2225,6 +2422,9 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	oversubLimit := s.oversubscriptionLimit(effectiveMaximum)
 	oversubBlocked := false
 	frozen := false
+	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
+	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
+	queuedAhead := 0
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
 			continue
@@ -2239,6 +2439,21 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// there is no backfill to stop.
 		if gate.blocks(queue, waiter) {
 			waiter.waited = true
+			// AIRA-149. A waiter that is not the drain head is blocked because
+			// another waiter is exclusively holding or draining the slice --
+			// something else is in the way BY CONSTRUCTION, so it latches observed
+			// directly. The drain head itself is blocked by !sliceProvablyEmpty, so
+			// it takes the shared reading: with an unestablished scan that is
+			// `unevaluated`, never `observed`, because the daemon could not
+			// establish the contention it would otherwise be asserting. At render
+			// time the AIRA-101 Exclusive arm wins the wording, but a stored false
+			// claim is still the wrong value.
+			if gate.draining != nil && waiter == gate.draining {
+				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, false))
+			} else {
+				waiter.joinContentionLocked(contentionObserved)
+			}
+			queuedAhead++
 			continue
 		}
 		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
@@ -2246,6 +2461,12 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		available := checkedAvailable(current, effectiveMaximum, reclaimable, addClamp(queue.outstanding, queue.adopted), headroom)
 		if frozen {
 			waiter.waited = true
+			// AIRA-149. `frozen` is only ever set by a waiter AHEAD in this same
+			// pass that was refused on capacity, so queuedAhead is already >= 1 and
+			// the shared reading cannot return none-observed here.
+			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, false))
+			waiter.noteGrantableLocked(available)
+			queuedAhead++
 			continue
 		}
 		// AIRA-114. The aggregate bound is folded into the SAME branch as the
@@ -2262,6 +2483,14 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		if waiter.reserve > available || overSubscribed {
 			waiter.waited = true
+			// AIRA-149. THE ONLY SITE that may ever latch none-observed, and only on
+			// the `reserve > available` disjunct: overSubscribed is passed into the
+			// reading as computed just above, so an aggregate refusal short-circuits
+			// to observed and the reading is taken over the disjunct ACTUALLY taken
+			// rather than reconstructed afterwards.
+			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, overSubscribed))
+			waiter.noteGrantableLocked(available)
+			queuedAhead++
 			// now is pass-start time, so a slow adopted-confine scan can defer this freeze by its duration.
 			if s.admitBackfillGrace <= 0 || now.Sub(waiter.enqueued) >= s.admitBackfillGrace {
 				switch {
@@ -2527,6 +2756,37 @@ func (s *Server) writeAdmitError(conn net.Conn, code, message string) {
 		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
 	}
 	_ = write(conn, errorFrame(code, message))
+}
+
+// saturatedDiagnosisLocked builds the AIRA-149 diagnosis half of a saturated
+// rejection. queue.mu must be held, which is where the latch fields are written.
+//
+// Every value is one this request already established: the DAEMON-RESOLVED
+// reserve (not the client's own unresolved request, which is what the message
+// used to print under the word "reserve"), the request-entry ceiling, the
+// latched contention reading, and the capacity the gate last computed for this
+// waiter. Nothing here is consulted by any decision, and Basis keeps its exact
+// "reject:saturated" spelling -- validRunnerAdmitRejection pins it, and a
+// mismatch would drop the client into the unaccounted flock fallback.
+//
+// The grantable figure is COPIED out of the waiter rather than aliased, so the
+// payload cannot observe a later write once queue.mu is released.
+func saturatedDiagnosisLocked(waiter *admitWaiter, reserve, ceiling int64) admitRejection {
+	rejection := admitRejection{
+		Required: reserve,
+		Ceiling:  ceiling,
+		Basis:    "reject:saturated",
+	}
+	if waiter == nil {
+		rejection.Contention = admitContentionToken(contentionUnset)
+		return rejection
+	}
+	rejection.Contention = admitContentionToken(waiter.contention)
+	if waiter.lastGrantable != nil {
+		grantable := *waiter.lastGrantable
+		rejection.Grantable = &grantable
+	}
+	return rejection
 }
 
 func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admitRejection) {

@@ -641,7 +641,9 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 		{"exits `137`", "the exit code a consumer's own wrapper sees, so a swallowed status is checkable"},
 		{"UNEVALUATED run", "the honesty framing: a killed run has no result, it is not a failing result"},
 		{"estimate:p90-prior", "the basis a never-seen command's first run is capped at"},
-		{"estimate:oom-escalated", "the basis that proves the next run self-healed"},
+		{"estimate:oom-escalated", "the basis when 1.5x the OOM peak IS the reserve"},
+		{",oom-on-record", "the token that proves the OOM was attributed to this signature even when another term set the number"},
+		{",ceiling-clamped", "the token that says the slice ceiling cut the reserve down"},
 		{"RE-RUN the identical command", "the correct response to a first-run OOM"},
 		{"pytest -n auto", "the input-nondeterminism case no per-signature estimate can learn"},
 	} {

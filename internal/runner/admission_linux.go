@@ -144,6 +144,24 @@ type runnerAdmitRejection struct {
 	// that has nothing to do with RAM, and it would have made the daemon-side
 	// reason inert at the one surface it exists for (found by build review).
 	Exclusive string `json:"exclusive,omitempty"`
+
+	// AIRA-149. The daemon's LATCHED diagnosis of the wait, mirrored here for the
+	// same reason Exclusive is: a field the client does not unmarshal is a field
+	// the operator never sees, which makes the daemon-side reading inert at the
+	// one surface it exists for.
+	//
+	// Contention is "observed" / "none-observed" / "unevaluated". EMPTY is a
+	// fourth, distinct state — "not reported by this daemon build" — and lands on
+	// the unchanged pre-AIRA-149 wording; it must never be read as an established
+	// solitude.
+	//
+	// Grantable is a POINTER because a measured zero and an absent field are
+	// different facts: FormatConfineBytes(0) renders "unknown", this codebase's
+	// word for NOT ESTABLISHED, so a measured zero has to be rendered separately
+	// or the honest reading "not one byte was grantable" becomes "the daemon does
+	// not know".
+	Contention string `json:"contention,omitempty"`
+	Grantable  *int64 `json:"grantable_bytes,omitempty"`
 }
 
 // ErrExclusiveUnavailable prefixes every refusal of an `--exclusive` request
@@ -555,7 +573,41 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 						// Neither is a memory problem.
 						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — the slice was draining for an exclusive job and the drain did not complete within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
 					default:
-						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice contended, no memory admission within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+						// AIRA-149. The daemon's LATCHED contention reading replaces a
+						// manufactured cause. "slice contended, no memory admission within
+						// the wait" used to be asserted for every non-exclusive rejection,
+						// including one where the daemon never observed anything else
+						// holding or queued ahead -- the measured case, where a resolved
+						// reserve equal to the ceiling simply could not fit a slice carrying
+						// one residual page.
+						//
+						// An EMPTY value is a fourth state, "not reported by this daemon
+						// build", and keeps the existing sentence: it must never be read as
+						// an established solitude.
+						elapsed := time.Since(admissionStarted).Round(time.Second)
+						switch rejection.Contention {
+						case "none-observed":
+							// The ceiling is the REQUEST-ENTRY figure and the grantable is the
+							// gate's LAST PASS; they are different instants, so each is labelled
+							// by its own provenance and the sentence never invites the reader to
+							// subtract one from the other. "queued AHEAD of this request" is the
+							// fact that was established -- a waiter queued behind was never in
+							// this request's way -- and it is deliberately narrower than "the
+							// slice was empty", which would be a new fabrication: the slice's own
+							// residual charge is exactly why the request failed.
+							message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — nothing else was running in this slice or queued ahead of this request at any evaluation; the resolved reserve %s did not fit the admission ceiling %s%s. Pin --memory-reserve or --memory-max to size this job yourself.",
+								elapsed, FormatConfineBytes(resolved), ceiling, formatGrantableClause(rejection.Grantable))
+						case "unevaluated":
+							// Covers all three causes without naming one: the deadline fired
+							// before any pass, the slice memory read failed for the whole wait,
+							// or a failing confine scan left emptiness unestablished. "Could not
+							// establish" is true of all three.
+							message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — the admission gate could not establish this request's contention before the wait expired (reserve %s/%s)",
+								elapsed, FormatConfineBytes(resolved), ceiling)
+						default:
+							message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice contended, no memory admission within the wait (reserve %s/%s)",
+								elapsed, FormatConfineBytes(resolved), ceiling)
+						}
 					}
 				}
 				if message == "" {
@@ -651,6 +703,25 @@ func validRunnerAdmitGrant(grant runnerAdmitGrant) bool {
 	default:
 		return false
 	}
+}
+
+// formatGrantableClause renders the daemon's last-measured grantable figure, or
+// nothing at all when the daemon did not report one (AIRA-149).
+//
+// A MEASURED ZERO must not be rendered through FormatConfineBytes, which
+// returns the string "unknown" for 0 -- this codebase's word for NOT
+// ESTABLISHED. Passing a measured zero through it would turn the honest reading
+// "not one byte was grantable" into "the daemon does not know", which is exactly
+// the conflation this change exists to remove.
+func formatGrantableClause(grantable *int64) string {
+	if grantable == nil {
+		return ""
+	}
+	text := "0B"
+	if *grantable > 0 {
+		text = FormatConfineBytes(*grantable)
+	}
+	return " (largest grantable reserve " + text + " at the last evaluation)"
 }
 
 func validRunnerAdmitRejection(code string, rejection runnerAdmitRejection) bool {

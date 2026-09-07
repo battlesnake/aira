@@ -115,6 +115,54 @@ func TestAdmissionAdequacyStrictBasisGrammar(t *testing.T) {
 	admissionField(t, result, "adequate", 2)
 }
 
+// TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation pins the AIRA-149
+// R2 negative: every basis resolveAdmitReserve's OOM branch can now emit stays
+// in the classifier's `default:` arm — counted malformedBasis + sig.excluded and
+// `continue`d — exactly as the unsuffixed `estimate:oom-escalated` does today.
+//
+// It is GREEN by construction and is not a RED-first test. Its RED direction is
+// a FUTURE change that returns the estimator's own basis UNSUFFIXED from that
+// branch — an easy-looking simplification — after which the row would match
+// admissionMaxBasis and silently ENTER this shipped gauge's evaluable
+// population, moving a published number with no test objecting.
+//
+// verifies: AIRA-149 R2
+func TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation(t *testing.T) {
+	// Exactly the strings AIRA-149 §3.1 rows (a)-(e) can produce.
+	for _, basis := range []string{
+		"estimate:oom-escalated",
+		"estimate:oom-escalated,ceiling-clamped",
+		"estimate:max=42949672960,n=5,f=115,oom-on-record",
+		"estimate:max=42949672960,n=5,f=115,oom-on-record,ceiling-clamped",
+		"estimate:capped,oom-on-record",
+		"estimate:capped,oom-on-record,ceiling-clamped",
+		"fallback:insufficient-samples:n=1,oom-on-record",
+		"fallback:insufficient-samples:n=1,oom-on-record,ceiling-clamped",
+		"fallback:malformed,oom-on-record",
+		"fallback:malformed,oom-on-record,ceiling-clamped",
+	} {
+		if admissionMaxBasis.MatchString(basis) || admissionOOMMaxBasis.MatchString(basis) || basis == "estimate:capped" {
+			t.Fatalf("basis %q reaches an adequacy VERDICT; the OOM branch's rows have never been evaluable and this change must not move that population", basis)
+		}
+		// And the whole-classifier consequence, so the assertion above cannot be
+		// satisfied by a matcher change alone.
+		result := classifyAdmissionAdequacy([]runner.AdmissionSample{
+			admissionSample("sig", basis, "exited", admissionI64(100), admissionI64(50)),
+		}, true)
+		if estimatePrefixed(basis) {
+			admissionField(t, result, "candidate", 1)
+			admissionField(t, result, "malformed_basis", 1)
+		} else {
+			// A `fallback:` row leaves the population at stage 1 entirely, which
+			// REDUCES the malformed count rather than adding to it.
+			admissionField(t, result, "candidate", 0)
+			admissionField(t, result, "malformed_basis", 0)
+		}
+		admissionField(t, result, "adequate", 0)
+		admissionField(t, result, "inadequate", 0)
+	}
+}
+
 // verifies: AIRA task #52 evaluates OOM before capped/invalid-reserve exclusion.
 func TestAdmissionAdequacyOOMAxisIsFirst(t *testing.T) {
 	result := classifyAdmissionAdequacy([]runner.AdmissionSample{

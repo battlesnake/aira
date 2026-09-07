@@ -1358,7 +1358,12 @@ func TestSliceCeilingDoesNotReachTheOOMEscalationClamp(t *testing.T) {
 		if err := json.Unmarshal(mustMarshal(t, frame), &response); err != nil {
 			t.Fatal(err)
 		}
-		if response.Data.Basis != "estimate:oom-escalated" {
+		// AIRA-149. The basis now NAMES the clamp, which strengthens this test's own
+		// stated purpose: the clamp it exists to exercise is visible in the answer
+		// rather than inferred from the value alone. Row (b) -- the escalation
+		// determined the value (1.5 x 50G beats the 57.5G ordinary estimate) and the
+		// STATIC ceiling then cut it to 64G.
+		if response.Data.Basis != "estimate:oom-escalated,ceiling-clamped" {
 			t.Fatalf("basis=%q, want the OOM-escalation path so the clamp is actually exercised", response.Data.Basis)
 		}
 		if response.Data.Reserve != maximum {

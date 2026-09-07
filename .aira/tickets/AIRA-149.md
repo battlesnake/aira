@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-149","project":"aira","title":"An OOM-escalated reserve clamped to EXACTLY the slice ceiling is ungrantable, and reports a fabricated \"slice contended\"","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-149","project":"aira","title":"An OOM-escalated reserve clamped to EXACTLY the slice ceiling is ungrantable, and reports a fabricated \"slice contended\"","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","honesty"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-149","to":"AIRA-150"},{"kind":"relates","from":"AIRA-149","to":"AIRA-151"},{"kind":"relates","from":"AIRA-149","to":"AIRA-152"},{"kind":"relates","from":"AIRA-149","to":"AIRA-153"},{"kind":"relates","from":"AIRA-149","to":"AIRA-154"},{"kind":"relates","from":"AIRA-149","to":"AIRA-155"},{"kind":"relates","from":"AIRA-149","to":"AIRA-156"},{"kind":"relates","from":"AIRA-149","to":"AIRA-157"},{"kind":"relates","from":"AIRA-149","to":"AIRA-158"},{"kind":"relates","from":"AIRA-149","to":"AIRA-159"}]}
 ---
 
 Found while root-causing AIRA-139 (a test flake) and deliberately NOT fixed
@@ -137,3 +137,183 @@ deliberately, do not merge one as a "cleanup":
 
 Recording it, unfixed, is deliberate: see the AIRA-139 resolution for why the
 flake was closed at fixture level rather than by changing this.
+
+## Resolution (2026-09-07) — direction 3 (diagnosis) plus the facet-1 labelling fix
+
+Plan: `docs/superpowers/plans/2026-09-07-aira149-admit-oom-clamp-honesty-plan.md`
+(revision 3, plan-gate approved). Branch `aira149-admit-oom-clamp-honesty`.
+
+**No resolved reserve VALUE and no admission or grant decision changed.** Every
+row of the new basis table asserts the value as well as the label, and the only
+things that moved anywhere in the tree are operator-facing STRINGS and two new
+diagnosis-only wire fields. `checkedAvailable`, the `reserve > ceiling` terminal
+boundary, the OOM clamp arithmetic (including its `math.MaxInt64` overflow
+guard), the AIRA-59 freeze, the AIRA-114 aggregate bound,
+`enqueueAdmitInternal`'s ceiling check and the reserve ledger are untouched.
+
+### Facet 1 — the basis names the term that determined the value
+
+`resolveAdmitReserve`'s OOM branch returned `estimate:oom-escalated`
+unconditionally, which is true of exactly ONE of its five outcomes. It now names
+the provenance of the number actually returned:
+
+| # | Condition | Value | Basis |
+| --- | --- | --- | --- |
+| a | `escalated > reserve`, no clamp | 1.5x MaxOOMPeak | `estimate:oom-escalated` *(unchanged)* |
+| b | `escalated > reserve`, clamped | ceiling | `estimate:oom-escalated,ceiling-clamped` |
+| c | `escalated <= reserve`, ordinary estimate usable | the estimate | *the estimator's own basis* + `,oom-on-record` |
+| d | `escalated <= reserve`, no usable estimate | the client's reserve | *the estimator's own `!ok` basis* + `,oom-on-record` |
+| e | as (d), then clamped | ceiling | as (d) + `,ceiling-clamped` |
+
+Row (e) is this ticket's measured case and now reads
+`fallback:insufficient-samples:n=1,oom-on-record,ceiling-clamped`.
+
+`,oom-on-record` is not decoration. `estimate:oom-escalated` welded together
+ATTRIBUTION ("an OOM record for THIS signature was consulted") and PROVENANCE
+("the number is 1.5x the OOM peak"). Only the provenance half was false, and the
+attribution half is load-bearing: AIRA-128's real-cgroup fixture uses it as the
+proof that a real kernel OOM travelled `memory.events` -> teardown ->
+`RecordConfinePeak` -> `ConfinePeakHistory` -> `resolveAdmitReserve`. Dropping it
+would have deleted a verified property while fixing a false one, and left that
+fixture's assertion comparing a string reachable from many paths.
+
+**D4, same function, same rule:** the estimator's own `!ok` basis is no longer
+overwritten with a hardcoded `fallback:insufficient-samples`, so a genuine
+`fallback:malformed` is reported as such.
+
+### Facet 2b — an established diagnosis instead of a manufactured one
+
+The saturated rejection carried only `Basis` and `Exclusive`, so the terminal
+message printed the CLIENT'S OWN unresolved request under the word "reserve",
+`unknown` for the ceiling, and asserted "slice contended, no memory admission
+within the wait" for every non-exclusive rejection — including one where nothing
+else was ever in the way. It now carries:
+
+- `required` / `cap_minus_headroom` — the daemon-resolved reserve and the
+  request-entry ceiling, both already in scope at the rejection site;
+- `contention` — a LATCHED three-valued reading, joined with `max()` over every
+  evaluator pass on the monotone lattice `observed > unevaluated > none-observed`;
+- `grantable_bytes` — a POINTER to the `checkedAvailable` figure the capacity
+  gate last computed for this waiter, so a measured zero stays distinguishable
+  from an absent field.
+
+The reading is derived STRUCTURALLY from `sliceProvablyEmpty` (subtree-aware,
+AIRA-101) plus the pass's own `overSubscribed` and a `queuedAhead` counter —
+deliberately NOT from `outstandingJobs`/`adoptedJobs`, which `admit.go` itself
+forbids for emptiness judgements because a skipped scope is still a running job.
+A leaf-drained aitest outer scope has both counters at zero while using memory,
+and a counter-derived rule would have printed "nothing else was in the way"
+beside a running suite: this ticket's own defect, reintroduced by its fix.
+`TestSoloRefusalBesideALeafDrainedScopeReportsContention` drives exactly that
+shape on both refusal disjuncts.
+
+The measured case now reports:
+
+    E_ADMIT_SATURATED: confine: admission rejected after 30s — nothing else was
+    running in this slice or queued ahead of this request at any evaluation; the
+    resolved reserve 984M did not fit the admission ceiling 984M (largest
+    grantable reserve 1007612K at the last evaluation). Pin --memory-reserve or
+    --memory-max to size this job yourself.
+
+`1007612K` is `ceiling - 4096`, re-derived from the arithmetic rather than
+asserted; an earlier plan revision claimed `0B` there, which would have been a
+fabricated number inside a change about fabricated numbers. A MEASURED zero
+renders `0B` and never through `FormatConfineBytes`, whose output for 0 is the
+string `unknown` — this codebase's word for "not established". An ABSENT field
+omits the parenthetical entirely and keeps today's wording, so an older daemon
+degrades to the existing message rather than to a wrong one.
+
+AIRA-101 exclusivity keeps precedence over the new clause, and `Basis` keeps its
+exact `reject:saturated` spelling, which `validRunnerAdmitRejection` pins.
+
+### Facet 2 proper — NOT fixed here
+
+A resolved reserve equal to the ceiling remains grantable only on a
+byte-exactly-empty slice. It now fails with an accurate message inside the wait's
+own bound instead of a fabricated one; it still fails. That is AIRA-150, with the
+two candidate fixes filed separately (AIRA-151, AIRA-153) precisely so a SIZING
+change on the machine-wide admission gate is never merged inside an honesty fix.
+
+### Tests
+
+New: `internal/daemon/admit_oom_basis_test.go` (the five-row table across every
+estimator basis it can produce, the overflow-guard row, the OOM-attribution
+property and its negative direction, D4, and the F8 post-block pin);
+`internal/daemon/admit_saturated_diagnosis_test.go` (the wire-path diagnosis,
+the latch, the lattice join, the leaf-drained hole, the three refusal sites);
+`internal/runner/admission_saturated_message_test.go` (the rendered sentence,
+including the measured-zero and absent-field cases and the AIRA-101 precedence);
+a new case in `internal/store/admission_insight_test.go` pinning that the OOM
+branch's bases stay OUTSIDE the AIRA-52 gauge's evaluable population.
+
+Updated: `TestConfineEstimatorAndOOMEscalationClamp` and
+`TestSliceCeilingDoesNotReachTheOOMEscalationClamp` (now assert
+`estimate:oom-escalated,ceiling-clamped`, which strengthens the latter's own
+stated purpose); the AIRA-128 self-heal fixture and its unit twin (now assert
+`fallback:insufficient-samples:n=1,oom-on-record`, with the comment rewritten to
+say what the token proves and what it does not); the agent guide and its pin.
+
+`TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins` is unchanged: it is a
+verified row (a) with no clamp.
+
+### Deferrals — filed, not silent
+
+AIRA-150 (F1, the structural wedge), AIRA-151 (F2, narrow the clamp),
+AIRA-152 (F3, replacement escalation), AIRA-153 (F4, the unconditioned unpinned
+default), AIRA-154 (F5, `unevaluated` does not name which of three causes),
+AIRA-155 (F6, the in-wait progress line), AIRA-156 (F7, accepted coverage gap:
+no real-cgroup test drives the wedge), AIRA-157 (F8, the post-block label
+asymmetry, pinned green), AIRA-158 (F9, the dated AIRA-67 spec bullet),
+AIRA-159 (F10, the ~1s scan staleness).
+
+### Gate — exact exit codes, all under `aira confine`, serialised
+
+Run on the committed tree (`630d8cf`), in this order, never concurrently:
+
+| Command | Exit |
+| --- | --- |
+| `aira confine -- go build ./...` | **0** |
+| `aira confine -- go vet ./...` | **0** |
+| `aira confine -- go test -race ./internal/daemon/... -count=1` (R3) | **0** (ok 112.3s) |
+| `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` | **0** (every package ok) |
+
+`gofmt -l internal/ cmd/` is clean. Log: `~/tmp/aira149/gate2.log`.
+
+`aira check` reports `E_JOURNAL_CORRUPT: invalid run ledger record` — reproduced
+identically from the repository root on `master`, so it is pre-existing,
+machine-wide and about the run ledger, not this change or these tickets.
+
+### Mutation evidence — the load-bearing tests are not porous
+
+Each mutation applied alone, in a detached throwaway worktree at `630d8cf`, then
+reverted. All four RED (exit 1):
+
+1. **Drop the `,oom-on-record` append** ->
+   `TestEveryOOMBranchBasisNamesTheOOMRecordAndOnlyTheOOMBranchDoes` FAILS
+   ("stats[2] ... basis=`estimate:max=42949672960,n=5,f=115` names no OOM
+   record"). This is the mutant that would have silently degraded AIRA-128's
+   attribution proof.
+2. **Overwrite the latch instead of joining it** -> both
+   `TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection`
+   (got `none-observed`) and both arms of
+   `TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved` FAIL.
+3. **Derive contention from `outstandingJobs`/`adoptedJobs`** (plan revision 2's
+   rule, with the AIRA-114 belt-and-braces check removed) -> both ordinary-disjunct
+   arms of `TestSoloRefusalBesideALeafDrainedScopeReportsContention` FAIL with
+   `contention="none-observed"` beside a running leaf-drained suite. The
+   aggregate-disjunct arm correctly survives, because `overSubscribed`
+   short-circuits to `observed` before the mutated check — which is what that
+   third arm is separately for.
+4. **Render a measured zero grantable through `FormatConfineBytes`** ->
+   `TestSaturatedMessageNamesTheUnfittableReserveInsteadOfContention` FAILS on the
+   message "largest grantable reserve **unknown** at the last evaluation".
+
+### One honest note on a test's RED direction
+
+`TestSaturatedMessagePrintsTheDaemonsResolvedReserveNotTheClientsRequest` (plan
+T13) is GREEN against master by construction: it is a client-side render test
+driven with an explicit `Required`, and master's defect is that the DAEMON never
+sends one. The RED-first coverage of that defect is
+`TestSaturatedRejectionCarriesTheResolvedReserveAndCeiling` (T7), which was
+observed red (`required=0, want the DAEMON-resolved reserve 4939212390`). T13 is
+a pin on the render half, not a demonstration.
