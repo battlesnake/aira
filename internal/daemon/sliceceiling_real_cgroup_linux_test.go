@@ -25,9 +25,52 @@ import (
 // aira.slice itself is NEVER touched: these tests run alongside dozens of live
 // confine jobs on a shared machine and must not be able to disturb one.
 
+// AIRA-117. The fixture's sizing is derived, not picked, and every constant here
+// is stated in terms of the REAL cgroup memory the helper charges rather than the
+// app-level allocation that produces it -- because under -race those two differ by
+// a factor of two, and a flat cap that ignored the difference OOM-killed the
+// helper. The derivation, the measurement and the failure are documented in the
+// ceilingFixtureRaceScale files beside this one.
 const (
-	ceilingFixtureCap   = int64(2 << 30)
-	ceilingFixtureTouch = int64(600 << 20)
+	// ceilingFixtureResident is the NON-RECLAIMABLE cgroup memory ONE touch is
+	// expected to charge. It is the quantity every assertion in this file is
+	// really about, and it is deliberately identical in both build modes.
+	ceilingFixtureResident = int64(600 << 20)
+
+	// ceilingFixtureTouch is the app-level allocation that produces it: the byte
+	// count handed to the helper. Under -race the instrumentation doubles it back
+	// up to ceilingFixtureResident, so this is the one constant that differs
+	// between build modes -- and it differs precisely so that nothing else does.
+	ceilingFixtureTouch = ceilingFixtureResident / ceilingFixtureRaceScale
+
+	// ceilingFixtureAnonTouches is the most ANON touches any test here drives
+	// through a single fixture: the initial touch plus the two "anon" grows of
+	// TestSliceCeilingRealCgroupSignalTracksRealAccounting. Page-cache growth is
+	// excluded on purpose -- it is reclaimable, so the kernel evicts it under the
+	// cap instead of killing the job; only the anon floor can force an OOM.
+	ceilingFixtureAnonTouches = 3
+
+	// ceilingFixtureOverhead is everything the helper charges that is not one of
+	// those touches: its own Go runtime, its page tables, the cgroup's slab.
+	// Measured at 12 MiB (ordinary build) and 35 MiB (-race); carried at 256 MiB
+	// so the bound below is a bound and not a tripwire on ordinary variation.
+	ceilingFixtureOverhead = int64(256 << 20)
+
+	// ceilingFixtureWorstCase is the most NON-RECLAIMABLE memory this fixture can
+	// hold. TestSliceCeilingRealCgroupFixtureSurvivesWorstCaseGrowth asserts the
+	// real fixture stays under it -- so it is a checked model, not a hope -- and
+	// asserts the footprint reached the touches' nominal total, so it cannot pass
+	// by the fixture allocating nothing.
+	ceilingFixtureWorstCase = ceilingFixtureAnonTouches*ceilingFixtureResident + ceilingFixtureOverhead
+
+	// ceilingFixtureCap leaves a full 2x margin over that checked worst case.
+	// MEASURED against the flat 2 GiB it replaces: the ordinary build reaches
+	// 1.77 GiB, 13% of margin; the -race build reached 3.55 GiB, 78% OVER the old
+	// cap, which is what OOM-killed the helper. The value is otherwise inert to
+	// what these tests assert: the two tests a fixture-sized memory.max
+	// could clamp deliberately model the maximum away, and the negative control
+	// writes its own 32 MiB cap over it.
+	ceilingFixtureCap = 2 * ceilingFixtureWorstCase
 )
 
 // TestSliceCeilingAllocHelper is the re-exec'd fixture process (the
@@ -175,9 +218,21 @@ func (f *ceilingCgroupFixture) grow(t *testing.T, kind string) {
 	if _, err := f.stdin.WriteString(kind + "\n"); err != nil {
 		t.Fatalf("instruct helper to grow (%s): %v", kind, err)
 	}
-	if !f.replies.Scan() {
-		t.Fatalf("helper did not acknowledge %s growth: %v", kind, f.replies.Err())
+	if f.replies.Scan() {
+		return
 	}
+	// A bare EOF here surfaces as "<nil>" -- Scan returned false with no read
+	// error -- and says nothing at all about why the helper vanished. AIRA-117 was
+	// exactly that: the kernel OOM-killed the helper against the fixture's own cap
+	// and the only symptom the parent could see was the closed pipe. Ask the
+	// cgroup, and name the cause when it is there to be named.
+	if kills := readCgroupOOMKills(t, f.dir); kills > 0 {
+		t.Fatalf("helper did not acknowledge %s growth: the kernel OOM-KILLED it against the fixture's own cap (memory.max=%s memory.peak=%s oom_kill=%d). The cap is too small for this build mode -- see ceilingFixtureCap and ceilingFixtureRaceScale (AIRA-117). Scanner error: %v",
+			kind,
+			bestEffortCgroupRead(f.dir, "memory.max"), bestEffortCgroupRead(f.dir, "memory.peak"),
+			kills, f.replies.Err())
+	}
+	t.Fatalf("helper did not acknowledge %s growth (no OOM kill recorded in the fixture cgroup): %v", kind, f.replies.Err())
 }
 
 // poke instructs the helper WITHOUT waiting for its acknowledgement, for the
@@ -221,6 +276,17 @@ func readCgroupRaw(t *testing.T, dir, name string) string {
 	return string(data)
 }
 
+// bestEffortCgroupRead is for DIAGNOSTIC text only: it reports why a read failed
+// instead of failing the test, so a kernel without (say) memory.peak cannot turn
+// an accurate "the helper was OOM-killed" report into a misleading read error.
+func bestEffortCgroupRead(dir, name string) string {
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return "<unreadable: " + err.Error() + ">"
+	}
+	return strings.TrimSpace(string(data))
+}
+
 func readCgroupOOMKills(t *testing.T, dir string) int64 {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(dir, "memory.events"))
@@ -239,6 +305,72 @@ func readCgroupOOMKills(t *testing.T, dir string) int64 {
 	}
 	t.Fatal("memory.events has no oom_kill line")
 	return 0
+}
+
+// verifies (AIRA-117): THE FIXTURE ITSELF, in whichever build mode is running.
+//
+// Every other test in this file silently assumes the helper survives the growth
+// it is instructed to perform. Under -race that assumption was false, and had
+// been since these tests landed: the helper is the test binary re-exec'd, so it
+// carries ThreadSanitizer shadow, its 600 MiB touches charged 1.20 GiB of real
+// cgroup anon each, three of them blew the flat 2 GiB cap, and the kernel
+// OOM-killed it -- which reached the parent only as an unexplained EOF on the
+// helper's stdout, failing all three growing ceiling tests for a reason none of
+// them mentioned.
+//
+// So this drives ONE fixture through the worst-case sequence any test here
+// performs -- the initial touch plus ceilingFixtureAnonTouches-1 anon grows, each
+// followed by page-cache growth competing for the same cap -- and pins the sizing
+// model the cap is derived from.
+//
+// BOTH directions are asserted, which is what stops it passing vacuously. A
+// fixture that quietly allocated nothing, or one whose helper died before the
+// last instruction, would satisfy "comfortably under the cap" and prove nothing;
+// the lower bound is what makes the upper bound mean something. The lower bound
+// is also the tripwire for ceilingFixtureRaceScale itself: if a future toolchain
+// stops charging 2x for instrumented memory, the fixture's real footprint stops
+// matching what the constants claim, and this says so in one line instead of
+// leaving the next reader with a nil-error EOF.
+func TestSliceCeilingRealCgroupFixtureSurvivesWorstCaseGrowth(t *testing.T) {
+	fixture := newCeilingCgroupFixture(t)
+	killsBefore := readCgroupOOMKills(t, fixture.dir)
+	for i := 1; i < ceilingFixtureAnonTouches; i++ {
+		fixture.grow(t, "anon")
+		// Reclaimable, and deliberately interleaved: it must be the kernel's page
+		// cache that gives way under the cap, never the helper.
+		fixture.grow(t, "file")
+	}
+
+	current, reclaimable, _, ok, reason := readSliceCeilingParts(fixture.dir)
+	if !ok {
+		cgrouptest.SkipOrFailRealCgroup(t, "fixture slice read unevaluated: %s", reason)
+	}
+	// The kernel's own figure for what CANNOT be reclaimed, which is the only part
+	// of memory.current that can force an OOM against the cap.
+	resident := sliceCeilingAnon(current, reclaimable)
+	// Recorded on every run, so the measurement the constants are derived from is
+	// visible under -v in whatever build mode and on whatever kernel is running,
+	// instead of living only in a ticket.
+	t.Logf("fixture worst case: resident=%d current=%d (touch=%d x%d touches, raceScale=%d; nominal %d, modelled worst case %d, cap %d)",
+		resident, current, ceilingFixtureTouch, ceilingFixtureAnonTouches, ceilingFixtureRaceScale,
+		ceilingFixtureAnonTouches*ceilingFixtureResident, ceilingFixtureWorstCase, ceilingFixtureCap)
+
+	const residentTolerance = int64(96 << 20)
+	if nominal := ceilingFixtureAnonTouches * ceilingFixtureResident; resident < nominal-residentTolerance {
+		t.Fatalf("after %d touches the fixture holds only %d bytes of non-reclaimable memory, want at least %d: the helper is not charging what ceilingFixtureResident claims (ceilingFixtureRaceScale=%d, ceilingFixtureTouch=%d), so every footprint this file asserts on is smaller than it reads",
+			ceilingFixtureAnonTouches, resident, nominal-residentTolerance, ceilingFixtureRaceScale, ceilingFixtureTouch)
+	}
+	if resident > ceilingFixtureWorstCase {
+		t.Fatalf("the fixture's non-reclaimable footprint %d exceeds the modelled worst case %d that ceilingFixtureCap=%d is derived from; the cap's margin is not what it claims and this fixture is on its way to the AIRA-117 OOM",
+			resident, ceilingFixtureWorstCase, ceilingFixtureCap)
+	}
+	if kills := readCgroupOOMKills(t, fixture.dir); kills != killsBefore {
+		t.Fatalf("oom_kill went from %d to %d driving the fixture's own worst case: the cap %d does not cover a footprint of %d in this build mode",
+			killsBefore, kills, ceilingFixtureCap, resident)
+	}
+	if !fixture.alive(t) {
+		t.Fatalf("the fixture helper died driving the fixture's own worst-case growth (footprint %d against cap %d)", resident, ceilingFixtureCap)
+	}
 }
 
 // realCeilingSimulatedTotal is the MemTotal these fixtures model. MemAvailable is
