@@ -32,7 +32,10 @@ func TestConfineEstimatorAndOOMEscalationClamp(t *testing.T) {
 		t.Fatalf("ordinary reserve=%d basis=%q", ordinary, basis)
 	}
 	escalated, basis := server.resolveAdmitReserve(admitRequest{reserve: 4 << 30, signature: "oom"}, 55<<30)
-	if escalated != 55<<30 || basis != "estimate:oom-escalated" {
+	// AIRA-149 row (b): the escalation DID determine the value (1.5 x 40G beats
+	// the 46G ordinary estimate) and the ceiling then cut it down, so the basis
+	// names both terms. The VALUE is unchanged.
+	if escalated != 55<<30 || basis != "estimate:oom-escalated,ceiling-clamped" {
 		t.Fatalf("OOM reserve=%d basis=%q, want multiplicative result clamped to ceiling", escalated, basis)
 	}
 }

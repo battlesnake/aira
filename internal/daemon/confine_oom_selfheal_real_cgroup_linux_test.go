@@ -71,9 +71,14 @@ import (
 //     attribution end to end.
 //
 // A second accepted gap, named by AIRA-139 rather than introduced by it: what
-// phase 3 pins is the escalation's ATTRIBUTION (the `estimate:oom-escalated`
-// basis, reachable only through this signature's own OOM record), not the
-// escalated VALUE. With one OOM sample there is no usable ordinary estimate, so
+// phase 3 pins is the escalation's ATTRIBUTION (the `,oom-on-record` token,
+// reachable only through this signature's own OOM record), not the
+// escalated VALUE. AIRA-149 made that distinction visible in the basis itself --
+// this fixture's phase 3 now reads
+// `fallback:insufficient-samples:n=1,oom-on-record`, which says both halves
+// truthfully, where it used to read `estimate:oom-escalated` and name a
+// provenance the number did not have.
+// With one OOM sample there is no usable ordinary estimate, so
 // resolveAdmitReserve's max(estimate, 1.5x OOM peak) keeps the unpinned client
 // default (runner.DefaultConfineMemoryReserve, 4 GiB) -- far above the ~80 MiB
 // 1.5x figure -- and that default is what the second run then succeeds at. It
@@ -248,14 +253,27 @@ func TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission(t *testing.
 	if second.err != nil {
 		t.Fatalf("second confine run: %v (stderr %q)", second.err, second.stderr)
 	}
-	// The load-bearing assertion. This basis is reachable ONLY through
-	// stats.OOMCount > 0 for THIS exact signature, which is only true if the
-	// kernel's OOM kill was observed at teardown, reported over the wire, and
-	// durably recorded against the signature the estimator reads back. A
-	// signature-attribution gap of any kind leaves this at a fallback basis.
-	if second.result.Status.ReserveBasis != "estimate:oom-escalated" {
+	// The load-bearing assertion, and AIRA-149 states precisely what it proves and
+	// what it does not.
+	//
+	// PROVES (attribution): the ",oom-on-record" token is reachable ONLY through
+	// stats.OOMCount > 0 && stats.MaxOOMPeak > 0 for THIS exact signature, which
+	// is only true if the kernel's OOM kill was observed at teardown, reported
+	// over the wire, and durably recorded against the signature the estimator
+	// reads back. A signature-attribution gap of any kind leaves this at a bare
+	// fallback basis with no OOM token at all.
+	//
+	// DOES NOT PROVE (provenance): that the escalation produced the number. With
+	// ONE OOM sample there is no usable ordinary estimate and the ~80 MiB 1.5x
+	// figure is far below the unpinned 4 GiB client default, so the default is
+	// what survives and what the second run then succeeds at. Before AIRA-149 this
+	// line asserted "estimate:oom-escalated", which named a provenance the number
+	// did not have -- the exact defect that ticket is about, sitting inside the
+	// test that was meant to be the proof.
+	const wantSelfHealBasis = "fallback:insufficient-samples:n=1,oom-on-record"
+	if second.result.Status.ReserveBasis != wantSelfHealBasis {
 		t.Fatalf("second-run reserve-basis=%q (reserve=%d), want %q — the real OOM was not attributed to this command's own signature, so nothing self-heals and every re-run repeats the kill",
-			second.result.Status.ReserveBasis, second.result.Status.ReserveBytes, "estimate:oom-escalated")
+			second.result.Status.ReserveBasis, second.result.Status.ReserveBytes, wantSelfHealBasis)
 	}
 	wantFloor := oomPeak + oomPeak/2
 	if second.result.Status.ScopeMemoryMax < wantFloor {
@@ -317,9 +335,13 @@ func TestOOMSelfHealFixtureStaysOffTheCeilingClamp(t *testing.T) {
 	ceiling := oomSelfHealSliceMax - server.admitSliceHeadroom(1)
 	reserve, basis := server.resolveAdmitReserve(
 		admitRequest{reserve: runner.DefaultConfineMemoryReserve, signature: "target"}, ceiling)
-	if basis != "estimate:oom-escalated" {
+	// AIRA-149: the phase-3 resolution is row (d) -- one sample, so no usable
+	// ordinary estimate, and an escalation below the unpinned client default,
+	// which therefore survives unclamped. The basis names that, and the
+	// ",oom-on-record" half is what still proves the OOM record was consulted.
+	if basis != "fallback:insufficient-samples:n=1,oom-on-record" {
 		t.Fatalf("phase-3 basis=%q reserve=%d, want %q — the fixture no longer models the run it guards",
-			basis, reserve, "estimate:oom-escalated")
+			basis, reserve, "fallback:insufficient-samples:n=1,oom-on-record")
 	}
 	if slack := ceiling - reserve; slack < oomSelfHealTargetBytes {
 		t.Fatalf("phase-3 reserve=%d leaves %d below the fixture ceiling %d, want at least %d — "+
