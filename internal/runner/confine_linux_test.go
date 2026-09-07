@@ -553,19 +553,66 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 	maxPeak := int64(math.MaxInt64)
 	almostMax := int64(math.MaxInt64 - 1)
 	for _, test := range []struct {
-		name string
-		cap  int64
-		peak *int64
-		oom  bool
-		want string
+		name   string
+		cap    int64
+		peak   *int64
+		oom    bool
+		source string
+		want   string
 	}{
+		// AIRA-133. The rows below are the whole point of the source argument:
+		// the same cap, the same peak and the same kill produce DIFFERENT next
+		// steps, each keyed on recorded provenance rather than on anything
+		// re-derived from the numbers. The pairing that matters is the operator
+		// rows against the auto rows — an operator-supplied cap must never be
+		// answered with "re-run", and an AIRA-chosen cap must never be answered
+		// with "raise your own flag".
 		{
+			name: "oom against an operator --memory-max says re-running will not help", cap: 100, peak: &peak95, oom: true,
+			source: ConfineCapSourceMemoryMax,
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=operator:--memory-max — " +
+				"this cap is YOUR OWN --memory-max, not an AIRA estimate, so re-running the identical command will not change it. " +
+				"Raise that flag, or split heavy work.",
+		},
+		{
+			name: "oom against an operator --memory-reserve says re-running will not help", cap: 100, peak: &peak95, oom: true,
+			source: ConfineCapSourceMemoryReserve,
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=operator:--memory-reserve — " +
+				"this cap is YOUR OWN --memory-reserve, not an AIRA estimate, so re-running the identical command will not change it. " +
+				"Raise that flag, or split heavy work.",
+		},
+		{
+			name: "oom against a daemon-resolved reserve names the re-run", cap: 100, peak: &peak95, oom: true,
+			source: ConfineCapSourceDaemonReserve,
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:daemon-reserve — " +
+				"AIRA chose this cap from this command's peak-RSS history, you did not. The kill has now been recorded against " +
+				"this command's signature, so RE-RUN THE IDENTICAL COMMAND and the next admission is sized higher on its own. " +
+				"If an identical re-run is killed at the same cap again, that is a genuine bug worth reporting. " +
+				"Pass --memory-reserve/--memory-max to skip the cycle.",
+		},
+		{
+			name: "oom against the delegate-ram ceiling names the re-run", cap: 100, peak: &peak95, oom: true,
+			source: ConfineCapSourceDelegateRAM,
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:delegate-ram — " +
+				"this is --delegate-ram's whole-scope ceiling, chosen by AIRA rather than by you, and it climbs with this " +
+				"signature's recorded peaks: RE-RUN THE IDENTICAL COMMAND before changing anything. " +
+				"Pass --memory-max to set the ceiling yourself.",
+		},
+		{
+			// An unrecorded source is never resolved to either party's choice:
+			// the line names both possibilities instead of guessing one.
 			name: "oom with observed peak", cap: 100, peak: &peak95, oom: true,
-			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); raise the cap with --memory-max (or --memory-reserve for a whole-job reserve), or split heavy work",
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=unevaluated — " +
+				"where this cap came from could not be established. If you set --memory-max/--memory-reserve yourself, raise it; " +
+				"if AIRA estimated it, re-running the identical command admits at a higher reserve. " +
+				"Either way, splitting heavy work also helps.",
 		},
 		{
 			name: "oom with unreadable peak", cap: 100, oom: true,
-			want: "confine: job OOM-killed at its memory cap 100 (peak RSS unknown); raise the cap with --memory-max (or --memory-reserve for a whole-job reserve), or split heavy work",
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS unknown); cap-source=unevaluated — " +
+				"where this cap came from could not be established. If you set --memory-max/--memory-reserve yourself, raise it; " +
+				"if AIRA estimated it, re-running the identical command admits at a higher reserve. " +
+				"Either way, splitting heavy work also helps.",
 		},
 		{
 			// Negative control: removing the cap==0 guard would falsely advise
@@ -612,8 +659,8 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := formatConfineReserveAdvisory(test.cap, test.peak, test.oom); got != test.want {
-				t.Fatalf("formatConfineReserveAdvisory(%d, %v, %v) = %q, want %q", test.cap, test.peak, test.oom, got, test.want)
+			if got := formatConfineReserveAdvisory(test.cap, test.peak, test.oom, test.source); got != test.want {
+				t.Fatalf("formatConfineReserveAdvisory(%d, %v, %v, %q) = %q, want %q", test.cap, test.peak, test.oom, test.source, got, test.want)
 			}
 		})
 	}

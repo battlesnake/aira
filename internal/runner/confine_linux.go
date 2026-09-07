@@ -922,6 +922,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	result.Status.ScopeSwapCap = swapCap
 	scopeMemoryMax := request.ScopeMemoryMax
+	// AIRA-133. capSource is written by the SAME branch that chooses the cap, so
+	// the provenance and the number can never disagree: there is no second
+	// derivation to keep in step, and nothing downstream re-infers the source by
+	// decoding reserve-basis or by pattern-matching a byte count. Assigned here
+	// (rather than left to a switch after the fact) precisely because the branch
+	// order below encodes real precedence — --memory-max wins over a declared
+	// reserve, which wins over the daemon grant, and delegate-ram's ceiling only
+	// fills a gap none of those filled.
+	capSource := ""
+	if scopeMemoryMax > 0 {
+		capSource = ConfineCapSourceMemoryMax
+	}
 	admitted := admission.state == "immediate" || admission.state == "waited"
 	// A PINNED reserve is the user's own declared number (--memory-reserve, or
 	// --memory-max, which already set ScopeMemoryMax above) — not an estimate — so
@@ -953,6 +965,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// case left for this branch to hide.
 	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve {
 		scopeMemoryMax = declaredReserveBytes
+		capSource = ConfineCapSourceMemoryReserve
 	}
 	// An UNPINNED reserve stays restricted to an ADMITTED (accounted) daemon
 	// grant: only that carries a history-derived estimate the daemon has itself
@@ -964,6 +977,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// reserve is framework overhead, and it gets a finite cap below.
 	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
+		capSource = ConfineCapSourceDaemonReserve
 	}
 	// Delegate-ram: an explicit --memory-max (scopeMemoryMax > 0) is the user's
 	// informed, still-finite-and-contained choice and WINS — it is never lowered by
@@ -976,6 +990,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		if scopeMemoryMax <= 0 {
 			scopeMemoryMax = delegateRAMScopeFallback()
 		}
+		capSource = ConfineCapSourceDelegateRAM
 	}
 	if request.DelegateRAM && scopeMemoryMax <= 0 {
 		return result, confineUnavailable(sliceName, errors.New("delegate-ram scope has no finite memory.max"))
@@ -986,6 +1001,14 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		}
 		result.Status.ScopeMemoryMax = floorMemoryPage(scopeMemoryMax)
 		result.Status.ScopeMemoryHigh = floorMemoryPage(request.ScopeMemoryHigh)
+		// AIRA-133. Recorded only where a cap was actually WRITTEN, so the facet
+		// can never describe a cap that does not exist. An enforced cap whose
+		// source somehow went unrecorded renders as unevaluated rather than
+		// defaulting to either party.
+		result.Status.ScopeMemoryCapSource = capSource
+		if result.Status.ScopeMemoryCapSource == "" {
+			result.Status.ScopeMemoryCapSource = ConfineCapSourceUnevaluated
+		}
 		result.Status.ScopeMemoryBinding = "ancestor-limited"
 		result.Status.ScopeMemoryEffective = maximum
 		if result.Status.ScopeMemoryMax < maximum {
@@ -1292,7 +1315,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
 	// Only an OWN-limit OOM may reach the "job OOM-killed at its memory cap" line
 	// (AIRA-102). Its other branch -- peak RSS near the cap -- is unaffected.
-	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, confineOwnCapAdviceWarranted(usage)); advisory != "" {
+	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, confineOwnCapAdviceWarranted(usage), result.Status.ScopeMemoryCapSource); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
 	// The remaining attributions get their OWN line, deliberately NOT gated on
@@ -1394,7 +1417,19 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 	}
 }
 
-func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool) string {
+// formatConfineReserveAdvisory names the next step an OOM at this scope's own
+// cap actually warrants. AIRA-133 made that step depend on capSource, because
+// the generic "raise the cap" wording it used to emit was wrong for the common
+// case: most confine jobs are killed at a cap AIRA ESTIMATED, and for those the
+// correct action is to re-run the identical command — the OOM has by now been
+// recorded against the command's own signature and the next admission is sized
+// higher with no operator action at all. Telling an operator to raise a flag
+// they never set sent a real session hunting a limit it could not find.
+//
+// The source is the recorded provenance of the cap that was written, never a
+// guess: an unevaluated source gets the original source-agnostic wording, which
+// names both possibilities rather than picking one.
+func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool, capSource string) string {
 	if scopeMemoryMax <= 0 {
 		return ""
 	}
@@ -1403,7 +1438,32 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 		peak = FormatConfineBytes(*peakRSS)
 	}
 	if oom {
-		return fmt.Sprintf("confine: job OOM-killed at its memory cap %s (peak RSS %s); raise the cap with --memory-max (or --memory-reserve for a whole-job reserve), or split heavy work", FormatConfineBytes(scopeMemoryMax), peak)
+		head := fmt.Sprintf("confine: job OOM-killed at its memory cap %s (peak RSS %s)", FormatConfineBytes(scopeMemoryMax), peak)
+		switch capSource {
+		case ConfineCapSourceMemoryMax:
+			// The operator's own number. Re-running changes nothing here, and
+			// saying so is the whole point: the auto case below tells the reader
+			// to re-run, and an operator who applies that advice to a limit they
+			// set themselves just repeats the kill.
+			return head + "; cap-source=" + capSource + " — this cap is YOUR OWN --memory-max, not an AIRA estimate, " +
+				"so re-running the identical command will not change it. Raise that flag, or split heavy work."
+		case ConfineCapSourceMemoryReserve:
+			return head + "; cap-source=" + capSource + " — this cap is YOUR OWN --memory-reserve, not an AIRA estimate, " +
+				"so re-running the identical command will not change it. Raise that flag, or split heavy work."
+		case ConfineCapSourceDaemonReserve:
+			return head + "; cap-source=" + capSource + " — AIRA chose this cap from this command's peak-RSS history, you did not. " +
+				"The kill has now been recorded against this command's signature, so RE-RUN THE IDENTICAL COMMAND and the next " +
+				"admission is sized higher on its own. If an identical re-run is killed at the same cap again, that is a genuine " +
+				"bug worth reporting. Pass --memory-reserve/--memory-max to skip the cycle."
+		case ConfineCapSourceDelegateRAM:
+			return head + "; cap-source=" + capSource + " — this is --delegate-ram's whole-scope ceiling, chosen by AIRA rather than " +
+				"by you, and it climbs with this signature's recorded peaks: RE-RUN THE IDENTICAL COMMAND before changing anything. " +
+				"Pass --memory-max to set the ceiling yourself."
+		default:
+			return head + "; cap-source=" + ConfineCapSourceUnevaluated + " — where this cap came from could not be established. " +
+				"If you set --memory-max/--memory-reserve yourself, raise it; if AIRA estimated it, re-running the identical " +
+				"command admits at a higher reserve. Either way, splitting heavy work also helps."
+		}
 	}
 	// Overflow-safe threshold: never multiply a byte count that the input domain
 	// allows to approach MaxInt64. `scopeMemoryMax - scopeMemoryMax/10` is a

@@ -539,7 +539,7 @@ func TestConfineOOMAttributionAdvisoryIsNeverSilent(t *testing.T) {
 	if confineOwnCapAdviceWarranted(usage) {
 		t.Fatalf("a descendant OOM still warrants own-cap advice")
 	}
-	if advisory := formatConfineReserveAdvisory(32<<20, nil, confineOwnCapAdviceWarranted(usage)); strings.Contains(advisory, "OOM-killed at its memory cap") {
+	if advisory := formatConfineReserveAdvisory(32<<20, nil, confineOwnCapAdviceWarranted(usage), ConfineCapSourceMemoryMax); strings.Contains(advisory, "OOM-killed at its memory cap") {
 		t.Fatalf("descendant OOM still reported as the job's own cap: %q", advisory)
 	}
 	// ...and it was not replaced by silence, with no cap in play at all.

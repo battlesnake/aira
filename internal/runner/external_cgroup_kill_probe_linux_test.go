@@ -193,7 +193,7 @@ func TestExternalCgroupKillProducesNoOOMAdvisory(t *testing.T) {
 	if oom {
 		t.Fatalf("probe precondition failed: oom flag is true after an external cgroup.kill (usage=%+v)", usage)
 	}
-	advisory := formatConfineReserveAdvisory(scopeMemoryMax, usage.PeakRSS, oom)
+	advisory := formatConfineReserveAdvisory(scopeMemoryMax, usage.PeakRSS, oom, ConfineCapSourceMemoryMax)
 
 	if strings.Contains(advisory, "OOM-killed") {
 		t.Fatalf("external cgroup kill misreported as a kernel OOM kill: %q", advisory)
@@ -210,7 +210,7 @@ func TestExternalCgroupKillProducesNoOOMAdvisory(t *testing.T) {
 	// assertion above for the wrong reason. A positive oom_kill count must still
 	// produce the kernel-OOM advisory.
 	oomCount := int64(1)
-	if reported := formatConfineReserveAdvisory(scopeMemoryMax, usage.PeakRSS, oomCount > 0); !strings.Contains(reported, "OOM-killed") {
+	if reported := formatConfineReserveAdvisory(scopeMemoryMax, usage.PeakRSS, oomCount > 0, ConfineCapSourceMemoryMax); !strings.Contains(reported, "OOM-killed") {
 		t.Fatalf("kernel-OOM advisory no longer fires for oom_kill>0: %q", reported)
 	}
 }
