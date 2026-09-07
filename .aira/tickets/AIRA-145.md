@@ -64,3 +64,153 @@ rather than poked at.
    and report the one bad record while still reconciling everything else --
    a "one poison record blocks all reconciliation forever" failure mode
    would itself be worth a design decision, not just a bugfix.
+
+## Resolution (step 1 only)
+
+Branch `aira145-ledger-corrupt-diagnostics`. This resolves **step 1 only**:
+the error now names which check failed and where. Steps 2 and 3 are NOT
+resolved -- see "Still open" below.
+
+### What the message said, and why it was useless
+
+`internal/runner/ledger.go`'s `read()` had one branch covering **five**
+distinct defects:
+
+```go
+if err := dec.Decode(&event); err != nil || event.SchemaVersion != ledgerSchema ||
+    event.Sequence == 0 || event.Sequence <= prior || event.Kind == "" {
+    return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid run ledger record")
+}
+```
+
+A JSON decode failure, a schema-version mismatch, a zero sequence, a
+non-advancing sequence and an empty kind all surfaced as the same sentence,
+with no record index, no byte offset and no file path. `aira reconcile`
+(`Runner.Reconcile` -> `r.ledger.read()`) surfaced exactly that, which is the
+symptom filed above.
+
+### What it says now
+
+The condition is unchanged -- `ledgerRecordDefect` applies the same five
+checks in the same order, so `read()` accepts and rejects exactly the ledgers
+it did before. Only the message improves:
+
+```
+E_JOURNAL_CORRUPT: invalid run ledger record: payload did not decode as a
+ledger event: json: unknown field "containment" (record 41 at byte offset
+12987, 613-byte payload, of /home/mark/.local/state/aira/aira/runs/ledger.bin;
+partially decoded sequence=42 kind="starting" run="RUN-17")
+```
+
+- **which** check failed, in its own words;
+- **where**: 0-based record index, byte offset of the record's length prefix,
+  declared payload length, and the ledger path;
+- **what identity was salvageable**: sequence / kind / run id, labelled
+  `partially decoded` when the decoder itself failed, because after a decode
+  error those fields are partial by construction and must not be presented as
+  authoritative.
+
+The offset is counted, not recomputed: `ledgerCounter` wraps the `bufio.Reader`
+and tallies the bytes `ReadByte`/`Read` actually consumed. Re-deriving the
+prefix width from the decoded length would lie on a non-canonical varint --
+precisely the case a corrupt file can produce.
+
+`store.ErrorCode` takes the token before the first colon, so the code stays
+`E_JOURNAL_CORRUPT` and the exit code stays 4. A test pins that.
+
+Also enriched, message-only and in the same loop, because a checksum mismatch
+with no location is unactionable for the same reason: `torn ledger
+length/payload/checksum` (still `U_RUN_RECONCILE_REQUIRED`), `run ledger
+checksum mismatch` and `trailing ledger payload` (still `E_JOURNAL_CORRUPT`)
+now carry the same site. No code and no control flow changed anywhere.
+
+### Tests
+
+`internal/runner/ledger_corrupt_diagnostics_test.go`. Every ledger is a
+synthetic `ledger.bin` built inside `t.TempDir()`; **nothing in this ticket
+read or wrote the machine's live shared run ledger**, which is why the
+original filing declined to poke at it and why this change did not either.
+
+One case per defect, each asserting the correct reason is named **and** that
+the reasons belonging to the other four are absent; plus offset correctness
+across a >127-byte record (which widens the varint prefix), the
+partial-vs-full decode labelling, the framing-error sites, and an
+acceptance-unchanged test over a valid multi-record ledger.
+
+Non-porousness was verified by reverting `ledger.go` to `origin/master` and
+re-running: all six sub-cases and all three of the other new tests fail with
+`"E_JOURNAL_CORRUPT: invalid run ledger record"` and nothing else. They cannot
+pass against the pre-fix implementation.
+
+### The concurrent-writer question: probably NOT the cause
+
+The filing wondered whether this is a genuine race between the 12+ sessions
+sharing this box. Read-only source inspection says a same-binary-version race
+is an unlikely explanation, though it does not prove what the cause was.
+
+`ledger.append()` takes `lockFile(l.lock)` -- a blocking `LOCK_EX` flock on
+`<common>/aira/runs/ledger.lock` -- as its first statement and holds it via
+`defer` for the whole function: the `read()` that computes the next sequence,
+the `json.Marshal`, the append write, the `fsync`, and the directory sync.
+Sequence allocation and the write it belongs to are therefore atomic against
+another `append`. `git log -L` on those lines shows the lock has been there
+since the ledger was introduced (`3959004`, M12a, 2026-08-11), so no shipped
+build of this repo ever appended without it. `append` is the only writer of
+`ledger.bin`.
+
+A second, stronger argument from the framing: this specific message requires a
+record whose length prefix, payload and **sha256 checksum are all mutually
+consistent** but whose JSON/schema/sequence/kind is invalid. A reader racing a
+partial write sees a torn frame and reports `U_RUN_RECONCILE_REQUIRED: torn
+ledger ...` instead -- a truncated write cannot forge a matching digest. So
+"another session was mid-append" does not explain the observed error at all.
+
+### Leading hypothesis: mixed binary versions, not corruption
+
+Unproven, but it fits the code and the timeline, and is recorded as a lead:
+
+`read()` calls `dec.DisallowUnknownFields()`. A ledger record written by a
+**newer** `aira` binary containing a field an **older** binary's structs do not
+have is therefore a hard decode failure for the older reader -- surfacing as
+exactly `E_JOURNAL_CORRUPT: invalid run ledger record`. On this box the run
+ledger is shared common-dir state while each worktree runs its own build, so
+mixed-version readers and writers are the normal condition, not an edge case.
+
+Two such fields landed on ledger-serialised structs in the days before the
+filing:
+
+- `run.containment` (`RunRecord.Containment`) -- `b6b56cb`, AIRA-129,
+  2026-09-07, one of the merges the filing names as happening that same night;
+- `kill_intent.not_executed` (`KillIntent.NotExecuted`) -- `b705d4e`,
+  AIRA-126, 2026-09-06.
+
+Eleven new JSON field names appeared in `internal/runner/types.go` in the two
+weeks before the filing; those two are the ones reachable from a ledger record.
+
+This is a hypothesis, not a proven root cause. The cheap confirmation is now
+built in and non-destructive: the next occurrence prints `json: unknown field
+"..."` plus the offset, which either names the field outright or rules the
+theory out. A read-only copy of the ledger would answer it immediately without
+touching shared state.
+
+If confirmed, the fix is a design decision, not a patch: `DisallowUnknownFields`
+on a store shared by mixed-version binaries makes every additive field a
+forward-compat break. That belongs with step 3 below, not here.
+
+### Still open -- deliberately not resolved by this ticket
+
+- **Step 3 (unresolved, needs a decision).** Whether `aira reconcile` should
+  keep failing closed on one bad record, or skip and report it while
+  reconciling the rest, is untouched. `read()` still returns on the first bad
+  record and reconcile still refuses to proceed. This is a real design
+  question -- "one poison record blocks all reconciliation forever" versus
+  "silently reconciling around unexplained state" -- and picking one while
+  fixing a message would have smuggled a behaviour change in under a
+  diagnostics change. It needs its own ticket and its own decision.
+- **Step 2 (unresolved).** Whether the observed failure was genuine data
+  corruption or a regression in AIRA-131/138/140 is still not established. The
+  mixed-version hypothesis above is the leading lead; a stale binary bypassing
+  the current lock path, or external editing of `ledger.bin`, remain
+  alternatives that have not been ruled out.
+- The `W_STALE_INDEX` / stale `aira list` symptom is untouched and its
+  relationship to this error is still unknown.

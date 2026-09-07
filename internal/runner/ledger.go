@@ -279,38 +279,43 @@ func (l *ledger) read() ([]ledgerEvent, error) {
 		return nil, fmt.Errorf("E_RUN_RECONCILE_REQUIRED: %w", err)
 	}
 	defer f.Close()
-	r := bufio.NewReader(f)
+	r := &ledgerCounter{r: bufio.NewReader(f)}
 	var events []ledgerEvent
 	var prior uint64
 	for {
+		site := ledgerRecordSite{path: l.ledger, index: len(events), offset: r.read}
 		n, readErr := binary.ReadUvarint(r)
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil || n == 0 || n > 16<<20 {
-			return nil, fmt.Errorf("U_RUN_RECONCILE_REQUIRED: torn ledger length")
+			return nil, fmt.Errorf("U_RUN_RECONCILE_REQUIRED: torn ledger length (%s)", site)
 		}
+		site.payload = n
 		payload := make([]byte, n)
 		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil, fmt.Errorf("U_RUN_RECONCILE_REQUIRED: torn ledger payload: %w", err)
+			return nil, fmt.Errorf("U_RUN_RECONCILE_REQUIRED: torn ledger payload (%s): %w", site, err)
 		}
 		var want [sha256.Size]byte
 		if _, err := io.ReadFull(r, want[:]); err != nil {
-			return nil, fmt.Errorf("U_RUN_RECONCILE_REQUIRED: torn ledger checksum: %w", err)
+			return nil, fmt.Errorf("U_RUN_RECONCILE_REQUIRED: torn ledger checksum (%s): %w", site, err)
 		}
 		got := sha256.Sum256(payload)
 		if !equalBytes(got[:], want[:]) {
-			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: run ledger checksum mismatch")
+			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: run ledger checksum mismatch (%s)", site)
 		}
 		var event ledgerEvent
 		dec := json.NewDecoder(bytesReader(payload))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&event); err != nil || event.SchemaVersion != ledgerSchema || event.Sequence == 0 || event.Sequence <= prior || event.Kind == "" {
-			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid run ledger record")
+		decodeErr := dec.Decode(&event)
+		// One condition, five distinct causes. Report WHICH one and WHERE, so a
+		// corrupt ledger is locatable instead of merely announced (AIRA-145).
+		if defect := ledgerRecordDefect(decodeErr, event, prior); defect != "" {
+			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid run ledger record: %s (%s; %s)", defect, site, ledgerRecordIdentity(decodeErr, event))
 		}
 		var extra any
 		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: trailing ledger payload")
+			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: trailing ledger payload (%s; %s)", site, ledgerRecordIdentity(nil, event))
 		}
 		if event.Kind != "telemetry" {
 			normalizeBuffering(&event.Run)
@@ -320,6 +325,96 @@ func (l *ledger) read() ([]ledgerEvent, error) {
 		events = append(events, event)
 	}
 	return events, nil
+}
+
+// ledgerCounter tracks the exact number of ledger bytes the reader has
+// consumed. The underlying bufio.Reader reads ahead, so the file descriptor's
+// offset is NOT the position of the record being parsed; and the length prefix
+// is a varint, so its width cannot be recomputed after the fact from the value
+// (a non-canonical encoding in a corrupt file would decode to the same number
+// from a different number of bytes). Counting what ReadByte and Read actually
+// consumed is the only way to name a record's true byte offset honestly.
+//
+// covers: AIRA-145
+type ledgerCounter struct {
+	r    *bufio.Reader
+	read int64
+}
+
+func (c *ledgerCounter) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.read += int64(n)
+	return n, err
+}
+
+func (c *ledgerCounter) ReadByte() (byte, error) {
+	b, err := c.r.ReadByte()
+	if err == nil {
+		c.read++
+	}
+	return b, err
+}
+
+// ledgerRecordSite locates one record inside the ledger file. Every field is
+// something the reader actually knows at the failure point: nothing here is
+// inferred or guessed, and payload stays 0 until the length prefix has in fact
+// been read.
+//
+// covers: AIRA-145
+type ledgerRecordSite struct {
+	path    string
+	index   int    // 0-based position of this record in the file
+	offset  int64  // byte offset of this record's length prefix
+	payload uint64 // declared payload length in bytes; 0 before it is known
+}
+
+func (s ledgerRecordSite) String() string {
+	if s.payload == 0 {
+		return fmt.Sprintf("record %d at byte offset %d of %s", s.index, s.offset, s.path)
+	}
+	return fmt.Sprintf("record %d at byte offset %d, %d-byte payload, of %s", s.index, s.offset, s.payload, s.path)
+}
+
+// ledgerRecordDefect names the ONE validation that rejects a decoded ledger
+// record, or "" when the record is valid. It is the exact predicate read()
+// applied before AIRA-145 -- decode failure, wrong schema version, zero
+// sequence, non-advancing sequence, or empty kind -- with the same evaluation
+// order, so the accept/reject decision is bit-for-bit unchanged and only the
+// diagnostic improves. Notably the decode branch surfaces encoding/json's own
+// message, which under DisallowUnknownFields names the offending field: an
+// unknown field written by a NEWER aira binary into a shared ledger reads as
+// `json: unknown field "..."` rather than as anonymous corruption.
+//
+// covers: AIRA-145
+func ledgerRecordDefect(decodeErr error, event ledgerEvent, prior uint64) string {
+	switch {
+	case decodeErr != nil:
+		return fmt.Sprintf("payload did not decode as a ledger event: %v", decodeErr)
+	case event.SchemaVersion != ledgerSchema:
+		return fmt.Sprintf("schema_version is %d, want %d", event.SchemaVersion, ledgerSchema)
+	case event.Sequence == 0:
+		return "sequence is 0, want a positive sequence"
+	case event.Sequence <= prior:
+		return fmt.Sprintf("sequence %d does not advance past the preceding record's sequence %d", event.Sequence, prior)
+	case event.Kind == "":
+		return "kind is empty"
+	default:
+		return ""
+	}
+}
+
+// ledgerRecordIdentity reports whatever identity the decoder managed to
+// populate. After a decode failure those fields are partial by construction --
+// encoding/json fills what it parsed before it stopped -- so the text says
+// "partially decoded" rather than presenting the values as authoritative.
+//
+// covers: AIRA-145
+func ledgerRecordIdentity(decodeErr error, event ledgerEvent) string {
+	state := "decoded"
+	if decodeErr != nil {
+		state = "partially decoded"
+	}
+	return fmt.Sprintf("%s sequence=%d kind=%q run=%q", state, event.Sequence, event.Kind, event.Run.ID)
 }
 
 // tiny reader avoids exposing bytes.Buffer in the protocol code.
