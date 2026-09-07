@@ -502,20 +502,70 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 			}
 		case <-timer.C:
 			attempt, killErr := r.killWithIntent(ctx, id, "run-timeout", killPolicy{Enforce: false})
+			arbitrated := false
 			if killErr != nil || !attempt.Kill.Completed {
-				if killErr == nil {
-					killErr = errors.New("timeout kill was not proven complete")
+				// AIRA-131. The deadline can fire against a scope the leader has already
+				// left: killWithIntent has published a durable intent that killScope
+				// refused to execute (it returned at len(pids)==0 before Terminate and
+				// before Kill), so no signal reached anything. With the leader also proved
+				// dead at that instant, the established facts are the child's own exit and
+				// the absence of any delivered kill — honour the pending wait rather than
+				// discard it. Every other shape keeps the unchanged unevaluated arm.
+				if decideTimeoutIntentNotExecuted(killErr, attempt, processLive(record.PIDIdentity)) {
+					// Drain BEFORE publishing: a drain that expires must leave no durable
+					// disposition behind, so the timed-out case is byte-for-byte today's.
+					// A dead leader's cmd.Wait() is already blocked in wait4 on our own
+					// child, so only the reap and one scheduler wakeup remain; the bound is
+					// a pure anti-hang guard whose expiry can only produce today's outcome.
+					drain := time.NewTimer(arbitrationWaitBound(r.grace))
+					select {
+					case outcome = <-waitCh:
+						if !drain.Stop() {
+							select {
+							case <-drain.C:
+							default:
+							}
+						}
+						// The drain SUCCEEDED, so wait4 has reaped the leader and this
+						// supervisor now holds its exit evidence. That is a KERNEL FACT,
+						// independent of whether the disposition below is honoured — and
+						// waitCh is buffered 1 with a single-send goroutine (:435-439), so
+						// nothing will ever refill it. Record the reap HERE, before any
+						// path that can return: otherwise a refused disposition returns
+						// with leaderReaped false and drives the input-plane defer
+						// (:374-392) into a 2s block on an empty channel followed by an
+						// unlocked input-abort-incomplete append of the pre-timeout
+						// `record`, which replay adopts wholesale (ledger.go:415),
+						// durably ERASING the kill intent just published. See plan §2.3.
+						leaderReaped = true
+						honoured, dispositionErr := r.appendDetachedNotExecutedLocked(id, true, attempt.IntentSequence, attempt.Current)
+						if dispositionErr != nil {
+							return nil, launchErr("U_RUN_RECONCILE_REQUIRED", dispositionErr)
+						}
+						arbitrated = honoured
+					case <-drain.C:
+						// Expired: waitCh is UNTOUCHED and no durable disposition exists,
+						// so leaderReaped stays false and this path — including the
+						// input-plane defer's kill-then-receive — is byte-for-byte today's.
+					}
 				}
-				return nil, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
+				if !arbitrated {
+					if killErr == nil {
+						killErr = errors.New("timeout kill was not proven complete")
+					}
+					return nil, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
+				}
 			}
-			completed := attempt.Current
-			completed.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: "run-timeout", At: nowString(r.now)}
-			completed.KillIntent.Completed, completed.KillIntent.Empty = true, true
-			completed.ErrorCodes = appendUnique(completed.ErrorCodes, "E_RUN_TIMEOUT")
-			if err := r.appendDetachedEvidenceLocked(id, "kill-completed", completed); err != nil {
-				return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+			if !arbitrated {
+				completed := attempt.Current
+				completed.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: "run-timeout", At: nowString(r.now)}
+				completed.KillIntent.Completed, completed.KillIntent.Empty = true, true
+				completed.ErrorCodes = appendUnique(completed.ErrorCodes, "E_RUN_TIMEOUT")
+				if err := r.appendDetachedEvidenceLocked(id, "kill-completed", completed); err != nil {
+					return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+				}
+				outcome = <-waitCh
 			}
-			outcome = <-waitCh
 		}
 	} else {
 		outcome = <-waitCh
@@ -662,6 +712,42 @@ func (r *Runner) appendDetachedEvidenceLocked(id, kind string, candidate RunReco
 	}
 	_, err = r.append(ledgerEvent{Kind: kind, Run: mergeEvidence(current, candidate)})
 	return err
+}
+
+// appendDetachedNotExecutedLocked publishes the AIRA-131 disposition of a
+// run-timeout kill intent that provably delivered no signal (AIRA-126's rule on
+// the detached path). The disposition is re-decided against the PRE-merge ledger
+// state under the SAME per-run lock as the append, because killWithIntent
+// released that lock before returning: mergeEvidence replaces KillIntent
+// wholesale whenever the candidate's is Present, so publishing without this
+// re-read could durably downgrade a concurrent actor's completed kill.
+//
+// It reports whether the disposition was honoured. Every refusal — a ledger read
+// error, a record another actor already terminalized, an absent or already
+// completed intent, or an intent whose sequence is not the one THIS launch
+// published — leaves the caller's unchanged U_RUN_RECONCILE_REQUIRED arm in
+// charge. A refusal is never an error in itself.
+func (r *Runner) appendDetachedNotExecutedLocked(id string, intentNotExecuted bool, publishedSequence uint64, candidate RunRecord) (bool, error) {
+	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+	if err != nil {
+		return false, err
+	}
+	defer unlockFile(lock)
+	current, readErr := r.ledger.current(id)
+	if readErr == nil && current.Status.Terminal() {
+		return false, nil
+	}
+	if !decideNotExecutedDisposition(intentNotExecuted, readErr, current.KillIntent, publishedSequence) {
+		return false, readErr
+	}
+	merged := mergeEvidence(current, candidate)
+	// The ledger's own intent (sequence, requested scope kill) is preserved;
+	// NotExecuted is the ONLY field this arbitration adds. Completed is never set.
+	merged.KillIntent.NotExecuted = true
+	if _, err := r.append(ledgerEvent{Kind: "kill-not-executed", Run: merged}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (r *Runner) terminalizeDetachedNoChild(ctx context.Context, record RunRecord, killed bool, code string, cause error) (*RunRecord, error) {
