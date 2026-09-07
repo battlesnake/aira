@@ -335,10 +335,61 @@ func (s *linuxScope) Remove() error {
 	} else if !empty {
 		return errors.New("scope is not empty")
 	}
+	// AIRA-144. Empty() proves no PROCESS remains anywhere in the subtree
+	// (cgroup.events `populated` is subtree-aware); it says nothing about the
+	// child cgroup DIRECTORIES the workload created inside this scope, which
+	// cgroup.kill does not remove. rmdir refuses a cgroup that still has a child
+	// cgroup, even an empty one, so without this the rmdir below fails EBUSY and
+	// the whole tree is left on the slice — observed as `.aira-RUN-8` plus
+	// `.aira-RUN-8/.aira-nested`, both reading `populated 0`, after AIRA-140's
+	// nested kill, and equally after any nested job that exits normally.
+	if err := s.removeChildCgroups(); err != nil {
+		return err
+	}
 	if err := s.fd.Close(); err != nil {
 		return err
 	}
 	return os.Remove(s.path)
+}
+
+// removeChildCgroups rmdirs every descendant cgroup directory inside the scope,
+// deepest-first, leaving the scope itself for Remove's own rmdir.
+//
+// Deepest-first is the whole point: a child that has children of its own (the
+// aitest `--delegate-ram` shape — outer -> .aira-supervisor / .aira-worker-N —
+// or any workload that nests more than one level) cannot be rmdir'd until its
+// own children are gone, so a single-level sweep would still leave the tree
+// behind. internal/cgrouptest's removeScopeTree makes the same point for tests.
+//
+// The walk is AIRA-72's reaper walk, reused rather than re-derived: the whole
+// post-order plan is read before the first unlink, every Openat and Unlinkat is
+// anchored to an already-open O_NOFOLLOW directory fd rather than to a rebuilt
+// path, and the depth is bounded. Its helpers carry `confine` in their names
+// because the reaper was their first caller; nothing in them is confine-specific.
+//
+// Removal is not a second emptiness proof and does not weaken the first one: the
+// kernel refuses Unlinkat(AT_REMOVEDIR) on anything populated, so a child
+// repopulated between Empty() and here fails the unlink and Remove returns that
+// error rather than reporting a teardown that did not happen.
+func (s *linuxScope) removeChildCgroups() error {
+	// A duplicate directory fd: readConfineReapTree closes every fd it owns, and
+	// the scope's own fd outlives this call (Remove closes it, and a failure here
+	// must leave the scope usable).
+	dir, err := openConfineReapDirectory(s.FD(), ".")
+	if err != nil {
+		return err
+	}
+	tree, err := readConfineReapTree(dir, ".", 0)
+	if err != nil {
+		return err // readConfineReapTree closed every owned fd.
+	}
+	defer tree.close()
+	for _, child := range tree.children {
+		if err := removeConfineReapTree(int(tree.dir.Fd()), child); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func waitEmpty(ctx context.Context, scope Scope, timeout time.Duration) error {
