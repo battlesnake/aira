@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-154","project":"aira","title":"A saturated rejection's contention=unevaluated does not say which of its three causes applied","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-154","project":"aira","title":"A saturated rejection's contention=unevaluated does not say which of its three causes applied","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","honesty"],"hold":false,"relations":[]}
 ---
 
 AIRA-149 deferral **F5**.
@@ -22,3 +22,13 @@ code: real plumbing for a distinction with no different action behind it.
 
 Filed so the choice is visible; raise only if an operator actually needs the
 distinction.
+
+## Resolution (2026-09-07)
+
+Closed as recorded-and-accepted, not built. `unevaluated` remaining a single
+value for all three causes was AIRA-149's own considered decision, not an
+oversight it left behind: all three are honest, and all three point an
+operator at the same next step, so splitting them needs real plumbing (a
+queue-level early-return record plus a per-pass reason code) for no different
+action on the operator's part. Nothing to build unless that changes. Raise a
+fresh ticket if an operator is ever actually blocked by the ambiguity.

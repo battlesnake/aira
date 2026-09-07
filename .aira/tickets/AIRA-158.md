@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-158","project":"aira","title":"The AIRA-67 design spec's basis vocabulary bullet predates the AIRA-149 tokens","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["docs"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-158","project":"aira","title":"The AIRA-67 design spec's basis vocabulary bullet predates the AIRA-149 tokens","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["docs"],"hold":false,"relations":[]}
 ---
 
 AIRA-149 deferral **F9**, filed as a RECORDED decision.
@@ -16,3 +16,12 @@ reference. The authoritative live surface is the generated agent guide
 
 Named here so a reader meets a decision rather than an omission. If the project
 later decides dated specs should be amended in place, this is a one-line change.
+
+## Resolution (2026-09-07)
+
+Closed as recorded-and-accepted, not built. This repo treats a shipped dated
+design spec as history, not living reference — the authoritative live surface
+(the generated agent guide, `internal/core/skill.go`) already reflects the
+AIRA-149 tokens and is pinned by `internal/core/skill_test.go`. If the project
+later decides dated specs should be amended in place, this is a one-line
+change referencing this ticket.
