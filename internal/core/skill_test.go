@@ -644,6 +644,8 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 		{"estimate:oom-escalated", "the basis when 1.5x the OOM peak IS the reserve"},
 		{",oom-on-record", "the token that proves the OOM was attributed to this signature even when another term set the number"},
 		{",ceiling-clamped", "the token that says the slice ceiling cut the reserve down"},
+		{"refused immediately with `E_ADMIT_TOO_LARGE` naming `required` and `cap_minus_headroom` instead of waiting: pin `--memory-reserve` (or `--memory-max`) at or below the printed `cap_minus_headroom`",
+			"AIRA-151: the clamp now applies only to the escalated value, so an over-ceiling reserve from any other term is refused terminally — the RE-RUN self-heal below does not cover a slice that small, and this names what to pass instead"},
 		{"RE-RUN the identical command", "the correct response to a first-run OOM"},
 		{"pytest -n auto", "the input-nondeterminism case no per-signature estimate can learn"},
 	} {

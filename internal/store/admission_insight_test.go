@@ -126,9 +126,24 @@ func TestAdmissionAdequacyStrictBasisGrammar(t *testing.T) {
 // admissionMaxBasis and silently ENTER this shipped gauge's evaluable
 // population, moving a published number with no test objecting.
 //
-// verifies: AIRA-149 R2
+// verifies: AIRA-149 R2, AIRA-151 R4, I8
 func TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation(t *testing.T) {
-	// Exactly the strings AIRA-149 §3.1 rows (a)-(e) can produce.
+	// The strings AIRA-149 §3.1 rows (a)-(e) could produce when this test was
+	// written. AIRA-151 made FOUR of them unproducible by narrowing the ceiling
+	// clamp to the rows where the escalation determined the value: every
+	// `,ceiling-clamped` spelling that is NOT preceded by `estimate:oom-escalated`
+	// — the two `estimate:…,oom-on-record,ceiling-clamped` rows and the two
+	// `fallback:…,oom-on-record,ceiling-clamped` rows.
+	//
+	// They are KEPT rather than deleted, and this is the deliberate choice: they
+	// are forward-defensive negatives. A regression that re-widens the clamp must
+	// not silently move this shipped gauge's evaluable population, and a test that
+	// only enumerates today's reachable strings could not object to that.
+	//
+	// AIRA-151 moves no published number in either direction: no basis changes
+	// spelling and no classifier changes, so the only effect is that rows which
+	// were counted `malformed_basis` and excluded stop being produced at all — a
+	// small reduction in an exclusion count.
 	for _, basis := range []string{
 		"estimate:oom-escalated",
 		"estimate:oom-escalated,ceiling-clamped",

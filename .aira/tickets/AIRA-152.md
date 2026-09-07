@@ -22,3 +22,31 @@ succeeds") as a convergence ladder and retuning its real-cgroup fixture
 
 A real design question with a real cost either way; not a by-product of an
 honesty fix.
+
+## Owner decision and current standing (2026-09-07)
+
+**Not chosen for this round, and deliberately NOT closed.** The owner was asked
+to choose between AIRA-151 (narrow the ceiling clamp to the rows where the
+escalation determined the value) and AIRA-152 (replace rather than `max` the
+escalation) as the sizing fix for AIRA-150, and chose **AIRA-151**, which has
+since shipped. This ticket is therefore no longer a live candidate for that
+decision; it is a filed, still-valid design option awaiting its own two-loop if
+anyone takes it.
+
+Why it was not chosen, recorded so a future session meets a decision rather than
+an open question (AIRA-151 plan §2.2):
+
+- in AIRA-149's measured example it sizes the next attempt at 84 MiB instead of
+  4 GiB for a job that needs ~320 MiB, so the self-heal converges over several
+  more OOM kills instead of one;
+- it requires restating AIRA-128's shipped "the very next run succeeds" claim as
+  a convergence ladder and re-tuning its real-cgroup fixture — the invariant
+  AIRA-151 was able to hold untouched (AIRA-151 I4);
+- the current `max()` encodes a defensible rule: never size the next attempt
+  below what an unpinned client asked for.
+
+**AIRA-151 forecloses nothing here.** The two are compatible: AIRA-152, if ever
+taken, would shrink the population AIRA-151 acts on by making the resolved value
+smaller, not by changing what the clamp does. Anyone reopening it should start
+from AIRA-151's shipped behaviour, not from the pre-AIRA-151 code this ticket
+was written against.
