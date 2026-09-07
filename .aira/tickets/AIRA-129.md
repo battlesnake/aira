@@ -134,10 +134,31 @@ a pure identity (admission key, `--list` row, `--kill` target), never a cgroup
 path, and its `--status` is the stored `ConfineStatus`, whose `Containment`
 facet already reads `advisory`.
 
-`Reconcile` skips `backend.Open` entirely for an advisory record and takes the
-absent-scope branch, which is the correct outcome as well as the cgroup-free
-one: a stranded shim run is genuinely lost, because the supervisor held the only
-reach and is gone.
+`Reconcile` skips `backend.Open` entirely for an advisory record — there is no
+cgroup to open — but it still ASKS the question the real path puts to
+`cgroup.procs`: is anything still running? The record answers it itself. The
+`running` event carries the leader's `PIDIdentity`, and `processLive` is a
+boot-aware, start-tick-checked observation of it, so a recycled pid cannot be
+mistaken for the original leader. The three answers map onto the real path's
+three:
+
+- `processAlive` is the analogue of a non-empty scope — PRESERVE. It never
+  escalates to a kill the way a non-empty scope under a kill intent does,
+  because the only reach here is `kill(-pgid)` through the launching
+  supervisor's own `confineCommand`, which holds the `markReaped` cut-off that
+  makes that delivery safe. Reconcile has no such cut-off, so a kill from here
+  could land on a reissued pgid belonging to a stranger.
+- `processUnknown` is the analogue of an unreadable scope — PRESERVE, flagged
+  `U_RUN_RECONCILE_REQUIRED`. Unestablished liveness is not proof of death, so
+  it may not become a terminal. That is the disposition
+  `reconcileDetachedLocked` already gives an unreadable supervisor.
+- `processDead` is the analogue of an empty scope — the absent-scope branch, so
+  an unfinished shim run becomes `lost`. That is honest here: the supervisor
+  held the only reach and went with the leader, so there is no second party
+  that could observe or end it.
+
+Asking is load-bearing, not defensive; the first version did not, and the
+build-review section below records what that cost.
 
 ### 4. Tests
 
@@ -153,6 +174,8 @@ Each was verified non-porous by reverting the behaviour it covers:
 - C9 signal ordering — sending SIGKILL before the received signal fails it (the
   grandchild's 0.3s TERM handler never completes);
 - cgroup-free reconcile — removing the advisory branch panics on the backend;
+- live-run reconcile and unestablished-leader reconcile (added by the
+  build-review fix, below) — deleting the liveness switch fails both;
 - gate admissibility — the two-value `admissibleScopeIntegrity` fails it.
 
 ### What was NOT built, and why
@@ -164,14 +187,92 @@ Each was verified non-porous by reverting the behaviour it covers:
   Accepted gap.
 - The setsid'd-descendant escape is inherited from AIRA-121 unchanged: out of
   reach of any non-cgroup mechanism, documented rather than papered over.
+- A SIGTERM-IGNORING IN-GROUP DESCENDANT can outlive a "completed" timeout kill.
+  Named explicitly here rather than left inside the general "`Completed` ≠
+  subtree empty" statement, because it is the one case where the survivor is
+  reachable in principle. `shimGroupKill` sends the group SIGTERM and returns
+  `Completed` as soon as the LEADER is proved dead within `termGrace`; the
+  escalating group SIGKILL is never reached, and `markReaped` closes the group
+  off the instant the leader is reaped, so no later delivery is possible either.
+  Such a child survives with `CaptureForcedClosed` as its only trace, and no
+  trace at all if it closed its stdio. It is NOT closed by sending the group
+  SIGKILL first: `shimGroupKill`'s leading return exists because a pgid whose
+  leader has been reaped may have been REISSUED, and nothing available here can
+  distinguish "the original group still has members" from "the pgid was
+  recycled". Signalling on that ambiguity could kill an unrelated job, which is
+  strictly worse than a survivor. Accepted gap, recorded in the `shimGroupKill`
+  doc comment as well as here. The real path has no such gap — `cgroup.kill` is
+  a set operation on a durable named object.
 - The daemon-down flock fallback resolves the CONFIGURED slice name rather than
   the ci-shim sentinel `confineShim` passes explicitly. In a genuine shim
   container no such cgroup path exists, so it answers `unevaluated` and the
   launch says so; `r.admit` was left untouched rather than refactored.
 
+### Build review (PR #87 head b6b56cb) and its fixes
+
+BLOCKed on one P1 and two P3s. All three are addressed.
+
+**P1 (CONFIRMED, executable repro) — `Reconcile` terminalised a LIVE ci-shim
+run.** The advisory branch set `openErr = errKillTargetAbsent` for EVERY
+advisory record unconditionally, so
+`decideReconcile(waitObserved=false, killIntent=false, scopeEmpty=true, false)`
+turned a healthy, mid-flight run into `status=lost` +
+`U_RUN_RECONCILE_REQUIRED`, reachable from the routine `aira check` and `aira
+reconcile` verbs. The damage did not stop at the reconcile output: the launching
+supervisor re-reads the ledger and honours any terminal it finds
+(`latest.Status.Terminal()` in `runner_shim_linux.go`), so it then returned that
+fabricated `lost` with `err == nil` and DISCARDED the run's real exit 0 and
+complete capture. On the real path the same instant yields `PreserveOpen`,
+because `scope.Empty()` is false — the shim branch had simply dropped the
+question. The ticket's own justification ("the supervisor that held the only
+reach is gone") was asserted, never checked, when the record carried a
+boot-aware, start-tick-checked `PIDIdentity` all along.
+
+Fixed by the three-arm liveness switch documented in section 3. Regression
+tests, both verified non-porous by deleting the switch:
+`TestShimRunReconcilePreservesALiveRun` (the reviewer's repro, made
+deterministic: the child blocks on a marker file the test creates only AFTER
+`Reconcile` returns, so the run is provably live at the moment of inspection,
+and both halves are asserted — reconcile leaves it alone AND the launch still
+lands its own exit 0 with a complete capture) and
+`TestShimRunReconcilePreservesAnUnestablishedLeader` (a zero `PIDIdentity` is
+preserved and flagged, and no `terminal` event is appended). The existing
+abandoned-run test now supplies a cross-boot `PIDIdentity` — proof of death from
+the kernel's own facts, needing no seam — and is renamed
+`TestShimRunReconcileTerminalisesADeadLeaderWithoutTouchingTheBackend`.
+
+**P3 — the PTY branch's `deliver(syscall.SIGKILL)` was a proven no-op.** The
+wait goroutine calls `command.markReaped()` before publishing on `waitCh`, and
+`confineCommand.signal` returns nil once reaped, so by the time that line ran
+nothing could be delivered; the comment claiming it was "the equivalent" of the
+real path's `cgroup.kill` quiesce was false. Removed, and the comment rewritten
+to say what is actually true: ci-shim has NO equivalent, the candidate is not
+merely weak but unreachable, and `collectPTYCapture`'s bounded abandon is the
+only thing that terminates the drain.
+
+**P3 — the SIGTERM-ignoring in-group descendant was not named as an accepted
+gap.** Now named explicitly, above and in the `shimGroupKill` doc comment, with
+the argument for accepting rather than closing it.
+
+**Suite evidence (not a PR regression).** The reviewer's full-suite run exited 1
+on `TestConfineScanReadsTheSupervisorCommandAndSaysUnevaluatedWhenItCannot`
+(`internal/runner/confine_manage_linux_test.go`, AIRA-135, a file this PR does
+not touch): the live `/proc` cmdline read raced the child's exec under full-suite
+load, `Command:<nil>`, and it passed 3/3 in isolation. A pre-existing wall-clock
+flake on master, in the same class as AIRA-20 and AIRA-112; it wants its own
+ticket.
+
 ### Verification
 
-Foreground, exact exit codes, on `origin/master` c7b3e32:
+Foreground, exact exit codes, on `origin/master` c7b3e32.
+
+Original build:
+
+- `aira confine -- go build ./...` — exit 0
+- `aira confine -- go vet ./...` — exit 0
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0
+
+Re-run after the build-review fixes:
 
 - `aira confine -- go build ./...` — exit 0
 - `aira confine -- go vet ./...` — exit 0

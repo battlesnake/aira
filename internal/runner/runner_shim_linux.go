@@ -469,13 +469,18 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	var forced, capComplete bool
 	if req.PTY {
 		// The real path quiesces the pty scope with cgroup.kill and PROVES the
-		// scope empty before joining the master drain. Here the equivalent is a
-		// SIGKILL to the job's process group, which proves nothing: a descendant
-		// that left the group still holds a slave reference. That is why nothing
-		// below claims ScopeDescendantKilled and why the bounded abandon in
-		// collectPTYCapture, not a proof, is what terminates the drain.
+		// scope empty before joining the master drain. ci-shim has NO equivalent,
+		// and does not pretend to one. The obvious candidate — a SIGKILL to the
+		// job's process group — is not merely weak here, it is UNREACHABLE: by the
+		// time this branch runs the leader has been reaped (the wait goroutine
+		// calls command.markReaped() before publishing on waitCh) and
+		// confineCommand.signal delivers nothing once that cut-off is closed,
+		// because the pgid may by then have been reissued to a stranger. A call
+		// here would be a silent no-op dressed as a quiesce. So nothing below
+		// claims ScopeDescendantKilled, and the bounded abandon in
+		// collectPTYCapture — not a proof, and not a signal — is the only thing
+		// that terminates the drain.
 		completeness := &captureCompleteness{}
-		_ = deliver(syscall.SIGKILL)
 		closers := make([]io.Closer, 0, len(readers)+len(files))
 		for _, rd := range readers {
 			closers = append(closers, rd)
@@ -635,6 +640,19 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 //     of reach of every signal sent here, and no non-cgroup mechanism can
 //     enumerate it. So Empty is never set, and the caller never publishes
 //     kill_intent.empty_scope.
+//
+// ACCEPTED GAP (AIRA-129, named rather than implied): `Completed` here means
+// "the LEADER is proved dead", not "the subtree is gone", and the two come apart
+// for an IN-group descendant that ignores SIGTERM. Such a child is signalled but
+// survives the SIGTERM, the leader dies within termGrace, this returns
+// Completed, and the escalating SIGKILL below is never reached — so the child
+// outlives a "completed" timeout kill. It cannot be closed by simply sending the
+// group SIGKILL first: the return above exists because a pgid whose leader has
+// been reaped may have been REISSUED, and delivering into it could kill an
+// unrelated job. Nothing here can distinguish "the original group still has
+// members" from "the pgid was recycled", so the honest option is to signal
+// nothing and say so. The only trace such a survivor leaves is
+// CaptureForcedClosed, and none at all if it closed its stdio.
 //
 // No usage snapshot is taken, unlike the real executor: there is no memory.peak
 // or cpu.stat to read, and a fabricated zero is worse than an absence.

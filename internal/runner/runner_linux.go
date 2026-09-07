@@ -2767,11 +2767,46 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 		var openErr error
 		if record.Containment == ConfineContainmentAdvisory {
 			// AIRA-129. A ci-shim record names no cgroup and never did, so there is
-			// nothing to open and no cgroup call is made. It takes the same branch an
-			// absent scope takes on the real path, which is the correct outcome for
-			// it as well: the supervisor that held the only reach (kill(-pgid)) is
-			// gone, so an unfinished shim run is genuinely LOST — there is no second
-			// party that could observe or end it.
+			// nothing to open and no cgroup call is made. But the question the real
+			// path puts to the kernel here — is anything still RUNNING? — must still
+			// be asked, and the record answers it itself: the `running` event carries
+			// the leader's PIDIdentity, and processLive is a boot-aware,
+			// start-tick-checked observation of it, so a recycled pid can never be
+			// mistaken for the original leader.
+			//
+			// Asking is load-bearing, not defensive. Taking the absent-scope branch
+			// unconditionally terminalises a LIVE, healthy shim run as `lost` +
+			// U_RUN_RECONCILE_REQUIRED from any routine `aira check` / `aira
+			// reconcile`; the launching supervisor honours whatever terminal it then
+			// finds in the ledger, so it would return that fabricated `lost` with a
+			// nil error and discard the run's real exit status and capture.
+			switch processLive(record.PIDIdentity) {
+			case processAlive:
+				// The ci-shim analogue of a non-empty scope, and it PRESERVES for the
+				// same reason. It never escalates to a kill the way a non-empty scope
+				// under a kill intent does on the real path: the only reach here is
+				// kill(-pgid) through the launching supervisor's own confineCommand,
+				// which holds the reaped cut-off that makes that delivery safe.
+				// Reconcile has no such cut-off, so a kill from here could land on a
+				// reissued pgid belonging to a stranger.
+				result = append(result, record)
+				_ = unlockFile(lock)
+				continue
+			case processUnknown:
+				// Liveness is UNESTABLISHED — no identity was ever recorded (the
+				// record never got past `starting`), /proc was unreadable, or the boot
+				// ID could not be read. None of that is proof of death, so it may not
+				// become `lost`. The record is preserved and flagged, exactly as
+				// reconcileDetachedLocked flags an unreadable supervisor.
+				record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+				result = append(result, record)
+				_ = unlockFile(lock)
+				continue
+			}
+			// processDead. The leader is PROVED gone, and the supervisor that held
+			// the only reach (kill(-pgid)) went with it, so an unfinished shim run is
+			// genuinely LOST — there is no second party that could observe or end it.
+			// It takes the same branch an absent scope takes on the real path.
 			openErr = errKillTargetAbsent
 		} else {
 			scope, openErr = r.backend.Open(ctx, record.CgroupScope)

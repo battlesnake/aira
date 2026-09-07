@@ -251,16 +251,22 @@ func TestShimRunKillRefusesWithoutPublishingAKillIntent(t *testing.T) {
 // verifies: AIRA-129 requirement 2 — reconcile reaches no cgroup seam for a
 // ci-shim record, and terminalises an abandoned one honestly.
 //
-// A stranded shim run really is LOST: the supervisor held the only reach
-// (kill(-pgid)) and is gone, so no second party can observe or end it. What must
-// not happen is a cgroup call against a record that names no cgroup, which
-// shimPanicBackend turns into a failure rather than a silent no-op.
-func TestShimRunReconcileTerminalisesWithoutTouchingTheBackend(t *testing.T) {
+// A stranded shim run whose leader is PROVED dead really is LOST: the supervisor
+// held the only reach (kill(-pgid)) and is gone, so no second party can observe
+// or end it. What must not happen is a cgroup call against a record that names
+// no cgroup, which shimPanicBackend turns into a failure rather than a silent
+// no-op.
+//
+// The proof of death is a cross-boot PIDIdentity, which needs no seam: this boot
+// ID cannot be the running kernel's, so processLive answers processDead from the
+// kernel's own facts.
+func TestShimRunReconcileTerminalisesADeadLeaderWithoutTouchingTheBackend(t *testing.T) {
 	r := shimRunner(t, Config{})
 	record := RunRecord{
 		SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning,
 		Containment: ConfineContainmentAdvisory, ScopeIntegrity: ScopeAdvisory,
-		OutputRefs: map[string]OutputRef{},
+		PIDIdentity: PIDIdentity{PID: 1, StartTick: 1, BootID: "aira-129-a-previous-boot"},
+		OutputRefs:  map[string]OutputRef{},
 	}
 	if _, err := r.ledger.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
 		t.Fatal(err)
@@ -274,6 +280,128 @@ func TestShimRunReconcileTerminalisesWithoutTouchingTheBackend(t *testing.T) {
 	}
 	if !containsPrefix(reconciled[0].ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("codes=%v", reconciled[0].ErrorCodes)
+	}
+}
+
+// verifies: AIRA-129 requirement 2 — reconcile must PRESERVE a ci-shim record
+// whose leader liveness it cannot establish, rather than call it lost.
+//
+// A record that never got past `starting` carries no PIDIdentity, so nothing can
+// be observed about it. That is unevaluated evidence, not proof of death: the
+// child may have been started in the window between exec and the `running`
+// append. AIRA's honesty rule forbids turning it into a terminal, so the record
+// is preserved open and flagged for a human, the same disposition
+// reconcileDetachedLocked gives an unreadable supervisor.
+//
+// Counterexample: the pre-fix branch terminalised this as status=lost.
+func TestShimRunReconcilePreservesAnUnestablishedLeader(t *testing.T) {
+	r := shimRunner(t, Config{})
+	record := RunRecord{
+		SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning,
+		Containment: ConfineContainmentAdvisory, ScopeIntegrity: ScopeAdvisory,
+		OutputRefs: map[string]OutputRef{},
+	}
+	if _, err := r.ledger.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := r.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reconciled) != 1 {
+		t.Fatalf("reconciled=%+v", reconciled)
+	}
+	if reconciled[0].Status.Terminal() {
+		t.Fatalf("unestablished liveness was turned into a terminal: %+v", reconciled[0])
+	}
+	if !containsPrefix(reconciled[0].ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+		t.Fatalf("an unevaluated reconcile must SAY so; codes=%v", reconciled[0].ErrorCodes)
+	}
+	// The preserved verdict must not be written back as a terminal event either.
+	for _, kind := range shimLedgerKinds(t, r) {
+		if kind == "terminal" {
+			t.Fatalf("reconcile appended a terminal event for an unevaluated record; kinds=%v", shimLedgerKinds(t, r))
+		}
+	}
+}
+
+// waitForShimRunning blocks until the ledger carries a `running` event for id.
+func waitForShimRunning(t *testing.T, r *Runner, id string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if events, err := r.ledger.read(); err == nil {
+			for _, event := range events {
+				if event.Kind == "running" && event.Run.ID == id {
+					return
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no `running` event for %s within the budget", id)
+}
+
+// verifies: AIRA-129 requirement 2 — reconcile must ASK whether a ci-shim run's
+// leader is still alive, and must leave a LIVE one alone.
+//
+// This is the counterexample the first implementation failed. That branch set
+// openErr = errKillTargetAbsent for EVERY advisory record unconditionally, so
+// decideReconcile(waitObserved=false, killIntent=false, scopeEmpty=true, false)
+// terminalised a healthy mid-flight run as status=lost +
+// U_RUN_RECONCILE_REQUIRED — reachable from the routine `aira check` and `aira
+// reconcile` verbs. The damage does not stop at the reconcile output: the
+// launching supervisor re-reads the ledger and honours any terminal it finds
+// (latest.Status.Terminal()), so it returned that fabricated `lost` with a nil
+// error and DISCARDED the run's real exit 0 and complete capture. Both halves
+// are asserted here.
+//
+// Non-porosity: the child blocks on a marker file this test alone creates, and
+// the marker is created only AFTER Reconcile has returned, so the run is
+// provably still live at the moment reconcile inspects it. There is no sleep to
+// lose a race against.
+func TestShimRunReconcilePreservesALiveRun(t *testing.T) {
+	r := shimRunner(t, Config{})
+	marker := filepath.Join(t.TempDir(), "release")
+	type launchOutcome struct {
+		record *RunRecord
+		err    error
+	}
+	done := make(chan launchOutcome, 1)
+	go func() {
+		record, err := r.Launch(context.Background(), Request{
+			Argv: []string{"/bin/sh", "-c", "while [ ! -f " + marker + " ]; do sleep 0.01; done; exit 0"},
+		})
+		done <- launchOutcome{record: record, err: err}
+	}()
+	waitForShimRunning(t, r, "RUN-1")
+
+	reconciled, err := r.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile err=%v", err)
+	}
+	if len(reconciled) != 1 {
+		t.Fatalf("reconciled=%+v", reconciled)
+	}
+	if reconciled[0].Status.Terminal() {
+		t.Fatalf("reconcile terminalised a LIVE ci-shim run: %+v", reconciled[0])
+	}
+	if containsPrefix(reconciled[0].ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+		t.Fatalf("a healthy live run was flagged as needing reconciliation: %v", reconciled[0].ErrorCodes)
+	}
+
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outcome := <-done
+	if outcome.err != nil {
+		t.Fatalf("launch err=%v", outcome.err)
+	}
+	if outcome.record.Status != StatusExited || outcome.record.ExitCode == nil || *outcome.record.ExitCode != 0 {
+		t.Fatalf("the launch lost its own true outcome to reconcile: %+v", outcome.record)
+	}
+	if !outcome.record.CaptureComplete || len(outcome.record.ErrorCodes) != 0 {
+		t.Fatalf("capture/errors=%+v", outcome.record)
 	}
 }
 
