@@ -834,13 +834,33 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if (!record.CaptureComplete || forced) && !req.PTY {
 		teardown = attestScopeTeardown(ctx, scope, record.PIDIdentity.PID, r.grace)
 	} else if (!record.CaptureComplete || forced) && req.PTY {
-		members, membersErr := scope.Members()
-		if membersErr == nil && len(members) > 0 {
-			if kill, err := r.killScope(ctx, scope, id, "capture"); err == nil && kill.Completed {
-				record.ScopeIntegrity = ScopeDescendantKilled
-				record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED")
-				record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: "aira", At: nowString(r.now)}
-			}
+		// AIRA-143. THERE IS NO PRE-GATE HERE, deliberately. This call site used
+		// to short-circuit on `len(scope.Members()) > 0` — a LEAF cgroup.procs
+		// read — before killScope was ever entered, so AIRA-140's correction to
+		// killScope's OWN gate could not help this path: a job whose processes
+		// live in a child cgroup it created inside its own scope (aitest /
+		// --delegate-ram / `podman --cgroups=split`) reads leaf-empty while fully
+		// busy, the pre-check called that "nothing to kill", and the descendant
+		// was never reached. Two gates in front of one decision is what created
+		// that hole; killScope's two-agreeing-reads gate is the authority, and it
+		// alone decides now. The pre-check was only ever an optimisation that
+		// avoided entering killScope on an already-empty scope, and killScope
+		// returns from exactly that state before any write, so nothing is lost by
+		// removing it.
+		//
+		// The result is read the same way as before: only a COMPLETED kill
+		// attests a reclaimed descendant. Every other outcome — a refusal
+		// (nothing to kill), an unevaluated read, or a signal that could not be
+		// confirmed — leaves a forced capture abandon reported as an unverified
+		// handoff, which is what the old `else if forced` arm said and is the
+		// honest reading of "we abandoned the capture and cannot prove the scope
+		// is clear".
+		//
+		// covers: AIRA-143
+		if kill, err := r.killScope(ctx, scope, id, "capture"); err == nil && kill.Completed {
+			record.ScopeIntegrity = ScopeDescendantKilled
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED")
+			record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: "aira", At: nowString(r.now)}
 		} else if forced {
 			record.ScopeIntegrity = ScopeHandoffUnverified
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
