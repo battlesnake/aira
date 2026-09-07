@@ -1709,7 +1709,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1717,7 +1717,13 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
-			stringSpec("admit_timeout", false, false, "Positive bounded daemon admission wait"),
+			// AIRA-138. The three timeout-suffixed options are disambiguated HERE,
+			// in the generated help, because --admit-timeout was for a long time the
+			// only one and is exactly what an operator reaches for expecting a job
+			// bound. Each says where its clock starts.
+			stringSpec("timeout", false, false, "Positive wall-clock bound on the confined JOB, measured from the moment the job is released to run; excludes the admission wait (see --admit-timeout) and setup. The job is SIGKILLed through cgroup.kill, which reaches setsid'd descendants; the trailer's timeout= field says what the kill did. Unavailable in ci-shim mode, where there is no cgroup.kill to enforce it"),
+			stringSpec("cpu_timeout", false, false, "Positive cumulative CPU-time (user+system, whole scope subtree) bound on the confined JOB, measured from the same point as --timeout. Resolution is one 100ms sample, so it can only fire late. Unavailable in ci-shim mode, where there is no cpu.stat to measure"),
+			stringSpec("admit_timeout", false, false, "Positive bounded daemon admission wait. This bounds the ADMISSION WAIT ONLY, before the job starts — it is not a job deadline; see --timeout and --cpu-timeout"),
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
 			boolSpec("exclusive", false, false, "Run alone in the slice for uncontended benchmarking: stop admitting new jobs, let running ones finish, then run alone. Refuses rather than running non-exclusively; check $AIRA_CONFINE_EXCLUSIVE inside the job and exclusive= on the trailer. Bound the wait with --admit-timeout. Does NOT cover processes placed in the slice by hand, or Docker containers, which run outside it entirely. The trailer's peak-rss/cpu are whole-subtree hierarchical counters (aitest worker sub-scopes and a podman --cgroups=split child included); Docker containers are structurally outside the slice and are NOT counted"),
 			boolSpec("detach", false, false, "Run session-independently; report the handle and poll it with confine --status"),
@@ -1730,6 +1736,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_reserve")
 			_ = stringArg(args, "memory_max")
 			_ = stringArg(args, "memory_high")
+			_ = stringArg(args, "timeout")
+			_ = stringArg(args, "cpu_timeout")
 			_ = stringArg(args, "admit_timeout")
 			_ = boolArg(args, "delegate_ram")
 			_ = boolArg(args, "exclusive")

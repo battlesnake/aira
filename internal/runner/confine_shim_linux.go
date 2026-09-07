@@ -50,6 +50,23 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// launch outcome that produces enforced containment, so the facet is a fact
 	// from the first line rather than something a later step could forget to set.
 	result.Status.Containment = ConfineContainmentAdvisory
+	// AIRA-138. Both job bounds are REFUSED here, fail-closed, at the point mode
+	// is already known. Both refusals are structural, not conservative taste:
+	//
+	//   - There is no cgroup, so there is no cpu.stat. The CPU bound is not merely
+	//     hard here, it is UNMEASURABLE: readCgroupCPUUsed would report unevaluated
+	//     forever and the sampler would never fire -- a silently disabled bound.
+	//   - There is no cgroup.kill. Shim mode's reach is kill(-pgid, ...), which
+	//     TestShimConfineSignalDoesNotReachASetsidDescendant already pins as unable
+	//     to reach a setsid'd descendant. A wall bound here could not honour its own
+	//     promise on the exact job shapes (test runners, container CLIs) that need it.
+	//
+	// A bound AIRA cannot honour must be refused, not degraded into a no-op the
+	// operator would read as enforcement.
+	if request.Timeout > 0 || request.CPUTimeout > 0 {
+		return result, errors.New("E_CONFINE_ARGUMENT_INVALID: --timeout and --cpu-timeout are unavailable in ci-shim mode: " +
+			"there is no cgroup to measure cpu.stat against and no cgroup.kill to enforce a bound with")
+	}
 	// Cap/CapBytes stay UNEVALUATED and ZERO. CapBytes is deliberately NOT the
 	// shim budget: the budget is the LEDGER's number, not this job's enforced
 	// ceiling, and putting it here would be the single most misleading value in
@@ -465,7 +482,7 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// Batch container starts with an empty history, so the estimator would not
 	// have learned anything usable within one container's life either way. Recorded
 	// as an accepted residual; peak-rss reads `unevaluated` on the trailer.
-	result.Status.TerminatedBy = classifyConfineTermination(termination, cgroupUsage{}, terminatedBySignal)
+	result.Status.TerminatedBy = classifyConfineTermination(termination, cgroupUsage{}, terminatedBySignal, deadlineKindUnset)
 	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
 	return result, nil
 }

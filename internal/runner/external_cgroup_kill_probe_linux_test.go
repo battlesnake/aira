@@ -242,7 +242,7 @@ func TestExternalCgroupKillIsReportedOnTheTrailer(t *testing.T) {
 	status, usage, scope := externalCgroupKillProbe(t, scopeMemoryMax)
 
 	term := confineTermination{Decoded: true, Signaled: status.Signaled(), Signal: status.Signal()}
-	verdict := classifyConfineTermination(term, usage, nil)
+	verdict := classifyConfineTermination(term, usage, nil, deadlineKindUnset)
 	if verdict != "unattributed-sigkill" {
 		t.Fatalf("real external cgroup.kill on %s classified as %q, want unattributed-sigkill (status=%v usage=%+v)",
 			scope, verdict, status, usage)

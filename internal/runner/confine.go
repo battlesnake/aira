@@ -342,7 +342,81 @@ type ConfineStatus struct {
 	// operator's memory.
 	Exclusive          string `json:"exclusive,omitempty"`
 	ExclusiveDrainedMS int64  `json:"exclusive_drained_ms,omitempty"`
+	// AIRA-138. The two job-deadline facets, one per bound, on the same
+	// absent-unless-requested discipline as Exclusive above: a bound nobody asked
+	// for has no outcome to hide, so omitting the field fabricates nothing and
+	// every existing trailer stays byte-identical.
+	//
+	// They are LOAD-BEARING rather than decorative. A confine deadline never
+	// causes Confine to return an error — the exit code stays a pass-through of
+	// the job's own (§5.4 of the plan) — and ConfineResult has no ErrorCodes
+	// array, so this field is the ONLY machine-readable carrier of "a bound
+	// fired". The budget travels with the state so the trailer names the knob to
+	// change; a zero budget means the bound was not requested and nothing renders.
+	TimeoutBudget    time.Duration        `json:"timeout_budget,omitempty"`
+	Timeout          ConfineDeadlineState `json:"timeout,omitempty"`
+	CPUTimeoutBudget time.Duration        `json:"cpu_timeout_budget,omitempty"`
+	CPUTimeout       ConfineDeadlineState `json:"cpu_timeout,omitempty"`
 }
+
+// ConfineDeadlineState is the CLOSED trailer vocabulary for one requested job
+// bound (AIRA-138). The empty string means the bound was not requested and the
+// field is not rendered at all.
+//
+// The three fired-kill-* / fired-not-executed values describe the KILL
+// OPERATION, not the cause of death: `terminated-by` owns causation, and the two
+// are allowed to disagree. `cpu-timeout=10m:fired-kill-completed` beside
+// `terminated-by=normal` and `exit 0` is not a contradiction — it says AIRA wrote
+// cgroup.kill, the scope did end up empty, and the job had already exited on its
+// own between the membership read and the write.
+type ConfineDeadlineState string
+
+const (
+	// ConfineDeadlineNotReached: requested, and THIS bound did not fire. For the
+	// CPU bound it additionally means the final established total is under budget
+	// — a two-sided proof that the bound held.
+	ConfineDeadlineNotReached ConfineDeadlineState = "not-reached"
+	// ConfineDeadlineFiredKillCompleted: this bound fired, cgroup.kill was written
+	// and waitEmpty then CONFIRMED the scope empty.
+	ConfineDeadlineFiredKillCompleted ConfineDeadlineState = "fired-kill-completed"
+	// ConfineDeadlineFiredKillUnconfirmed: this bound fired and the cgroup.kill
+	// write succeeded, but emptiness was not confirmed afterwards.
+	ConfineDeadlineFiredKillUnconfirmed ConfineDeadlineState = "fired-kill-unconfirmed"
+	// ConfineDeadlineFiredNotExecuted: this bound fired and provably delivered NO
+	// signal — the scope was verified empty by two independent reads before any
+	// write and the job's leader was proved dead — so the child's own exit is
+	// reported. AIRA-126's arbitrated exit, in confine's currency.
+	ConfineDeadlineFiredNotExecuted ConfineDeadlineState = "fired-not-executed"
+	// ConfineDeadlineFiredUnevaluated: this bound fired and AIRA cannot establish
+	// what its kill did. Never rendered as either a kill or a no-op.
+	ConfineDeadlineFiredUnevaluated ConfineDeadlineState = "fired-unevaluated"
+	// ConfineDeadlineUnenforced: CPU bound only. It did not fire, and either
+	// nothing was ever measured or the final established total reached the budget
+	// with no executed CPU-budget kill. The wall bound has no such state: a wall
+	// timer either fired or the job ended first, and there is no measurement that
+	// can be unavailable.
+	ConfineDeadlineUnenforced ConfineDeadlineState = "unenforced"
+)
+
+// ConfineDeadlineLabel names the FLAG a deadline facet belongs to, so the
+// trailer FIELD and the fire-time diagnostic both point at the knob an operator
+// would change. Two renderers, one vocabulary.
+const (
+	ConfineDeadlineLabelWall = "timeout"
+	ConfineDeadlineLabelCPU  = "cpu-timeout"
+)
+
+// The `terminated-by=deadline:<bound>` suffixes, which are deliberately NOT the
+// flag names above. `terminated-by` answers "what ended this job", and it reads
+// as a CAUSE — `deadline:wall` and `deadline:cpu` name the quantity that was
+// exceeded, where `deadline:timeout` would name a knob and say nothing about
+// which clock ran out. The flag names still appear on the same trailer line, on
+// the `timeout=`/`cpu-timeout=` fields, so nothing is lost: the operator reads
+// the cause on one field and the knob on the other.
+const (
+	ConfineDeadlineBoundWall = "wall"
+	ConfineDeadlineBoundCPU  = "cpu"
+)
 
 // The cap-provenance vocabulary (AIRA-133). Rendered as `cap-source=` beside
 // `scope-memory.max=enforced=N`, and read by formatConfineReserveAdvisory to
@@ -450,6 +524,19 @@ const (
 	// of which deliver SIGKILL and nothing else, can have been the cause. Who
 	// sent it is not established.
 	ConfineTerminatedChildSignalPrefix = "child-signal:"
+	// ConfineTerminatedDeadlinePrefix: a job deadline this supervisor was asked
+	// for fired and its cgroup.kill write SUCCEEDED, so SIGKILL was delivered to
+	// every member of the scope (AIRA-138). Suffixed with the QUANTITY that was
+	// exceeded — ConfineDeadlineBoundWall or ConfineDeadlineBoundCPU, i.e.
+	// `deadline:wall` / `deadline:cpu` — never with the flag name, because
+	// terminated-by states a cause and the flag names live on the same line's
+	// `timeout=`/`cpu-timeout=` fields.
+	//
+	// It sits BELOW `oom` and `supervisor-signal:` in the classifier, and above
+	// `unattributed-sigkill`, whose advisory positively claims the supervisor
+	// "sent no signal itself" — a sentence that becomes false the instant a
+	// deadline kill writes cgroup.kill.
+	ConfineTerminatedDeadlinePrefix = "deadline:"
 )
 
 type ConfineRequest struct {
@@ -469,10 +556,26 @@ type ConfineRequest struct {
 	// be established the launch is REFUSED, never silently downgraded, because a
 	// benchmark that runs contended while believing otherwise produces numbers
 	// that look clean — the incident this flag exists to prevent.
-	Exclusive         bool
-	ScopeMemoryMax    int64
-	ScopeMemoryHigh   int64
-	AdmissionMaxWait  time.Duration
+	Exclusive        bool
+	ScopeMemoryMax   int64
+	ScopeMemoryHigh  int64
+	AdmissionMaxWait time.Duration
+	// AIRA-138. Timeout and CPUTimeout are the JOB's two bounds, and neither is
+	// AdmissionMaxWait: that one bounds the ADMISSION WAIT and nothing else.
+	//
+	// Both clocks start at the RELEASE WRITE — the instant the setup shim is
+	// released to execve the job — so neither includes the admission wait (which
+	// on a contended shared box can legitimately be minutes) nor the setup
+	// handshake. That is not incidental placement: a wall bound measured from
+	// invocation would fire against a job that had not run for its budget at all,
+	// a fabrication in the EARLY direction, which is the one direction AIRA-136's
+	// invariant forbids.
+	//
+	// CPUTimeout is cumulative user+system CPU-time over the scope AND every
+	// descendant, sampled from cpu.stat — the quantity `ulimit -t` (per-process)
+	// and cpu.max (a bandwidth throttle, never an end) both fail to express.
+	Timeout           time.Duration
+	CPUTimeout        time.Duration
 	PollInterval      time.Duration
 	HandshakeTimeout  time.Duration
 	Stdin             io.Reader `json:"-"`
@@ -765,6 +868,14 @@ func FormatConfineStatus(status ConfineStatus) string {
 		terminated = ConfineTerminatedUnevaluated
 	}
 	line += " terminated-by=" + terminated
+	// AIRA-138, sited directly after terminated-by because the two answer
+	// adjacent questions and are allowed to disagree (see ConfineDeadlineState).
+	// Rendered ONLY for a bound that was actually requested, so a confine with no
+	// deadline produces a byte-identical trailer to before this facet existed —
+	// there is no fabrication risk in omitting a field for a bound nobody asked
+	// for, which is why this is not on terminated-by's always-rendered discipline.
+	line += formatConfineDeadlineFacet(ConfineDeadlineLabelWall, status.TimeoutBudget, status.Timeout)
+	line += formatConfineDeadlineFacet(ConfineDeadlineLabelCPU, status.CPUTimeoutBudget, status.CPUTimeout)
 	// AIRA-102, on the same absent-unless-relevant discipline as the exclusive
 	// facet below: rendered only when a container runtime was actually detected,
 	// so every trailer for an ordinary job is unchanged.
@@ -810,6 +921,26 @@ func FormatConfineStatus(status ConfineStatus) string {
 		line += " cpu=unevaluated"
 	}
 	return line
+}
+
+// formatConfineDeadlineFacet renders ONE bound's trailer field, or "" when that
+// bound was never requested (AIRA-138).
+//
+// The field NAME is the flag name, so an operator reading `cpu-timeout=10m0s:
+// fired-kill-completed` knows which knob produced it. Two keys rather than one
+// shared `deadline=` key, so requesting both bounds cannot produce duplicates.
+//
+// A requested bound whose state was never established renders `unevaluated`
+// rather than being dropped: the budget is proof the operator asked, and a
+// silent omission there would be indistinguishable from not having asked.
+func formatConfineDeadlineFacet(label string, budget time.Duration, state ConfineDeadlineState) string {
+	if budget <= 0 {
+		return ""
+	}
+	if state == "" {
+		state = ConfineDeadlineState(ConfineTerminatedUnevaluated)
+	}
+	return " " + label + "=" + budget.String() + ":" + string(state)
 }
 
 // formatConfineCPUUsec renders a cpu.stat usec counter (user or system) as a

@@ -34,7 +34,12 @@ func TestAIRA136CLIAcceptsCPUTimeoutOnce(t *testing.T) {
 	if _, _, err := parseArgs("run", []string{"--cpu-timeout", "--", "suite"}); err == nil {
 		t.Fatal("--cpu-timeout was accepted without a value")
 	}
-	if _, _, err := parseArgs("confine", []string{"--cpu-timeout", "1m", "--", "suite"}); err == nil {
-		t.Fatal("confine accepted --cpu-timeout, which it has no deadline path to honour")
+	// AIRA-138 INVERTS this assertion: confine now HAS a deadline path, built on
+	// the same one deadlineSource, so it accepts the same flag under the same
+	// name. `aira run --cpu-timeout` and `aira confine --cpu-timeout` mean one
+	// thing, spelled one way.
+	if _, options, err := parseArgs("confine", []string{"--cpu-timeout", "1m", "--", "suite"}); err != nil ||
+		options["cpu-timeout"] != "1m" {
+		t.Fatalf("confine refused --cpu-timeout, which it now honours: err=%v options=%#v", err, options)
 	}
 }

@@ -31,42 +31,59 @@ import (
 // its trailer — and those are just as capable of asserting a termination that
 // did not occur.
 //
-// T1 witnesses the gap (there is no bound to express today) and T2 is the
-// load-bearing danger proof. Both are written to be INVERTED by the AIRA-138
-// implementation, not deleted: see
-// docs/superpowers/plans/2026-09-07-aira138-confine-deadline-plan.md §8.
+// POST-IMPLEMENTATION STATE (plan §8). The gap witness is INVERTED rather than
+// deleted: it now asserts that both bounds and both trailer facets exist. The
+// two danger proofs and their draft implementations are KEPT, deliberately:
 //
-// verifies: AIRA-138 (reproduction phase)
+//   - `naiveConfineDeadlineDraft` is mutation #1's executed target. Forcing
+//     `decideConfineDeadlineNotExecuted` to false must make the real arbitration
+//     produce exactly the signature this draft produces here (exit 137, a
+//     deadline attribution), which is what proves the real test is not porous.
+//   - `leafOnlyKillDraft` is mutation #5's executed target, for the plan gate's
+//     P0. Restoring `killConfineScope`'s gate to the leaf-only form must make the
+//     nested-workload tests go red, and this file already runs that gate against
+//     the state it is blind to.
+//
+// The honest, arbitrated behaviour of the SHIPPED code is asserted in
+// confine_deadline_linux_test.go (hermetic) and confine_deadline_real_linux_test.go
+// (real kernel cgroups).
+//
+// verifies: AIRA-138
 
-// TestAIRA138ConfineHasNoJobDeadlineToday is the gap witness. It asserts the
-// exact absence the ticket rests on, at the one place that absence is
-// structural: `ConfineRequest` carries no bound for the JOB. `AdmissionMaxWait`
-// exists and is deliberately named in the negative assertion below, because it
-// is the field an operator (and a careless implementer) most easily mistakes
-// for a job deadline — it bounds the ADMISSION WAIT and nothing else.
+// TestAIRA138ConfineHasAJobDeadline is the INVERTED gap witness (plan §8). In
+// the reproduction phase it asserted the absence AIRA-138 rests on; now it
+// asserts the presence, at the one place the fix is structural: `ConfineRequest`
+// carries both JOB bounds, and `ConfineStatus` carries both trailer facets.
 //
-// The fix INVERTS this test: when `Timeout` and `CPUTimeout` land on
-// `ConfineRequest`, this becomes the positive assertion that both exist and are
-// `time.Duration`.
-func TestAIRA138ConfineHasNoJobDeadlineToday(t *testing.T) {
+// `AdmissionMaxWait` stays asserted positively beside them, because it is the
+// field an operator (and a careless implementer) most easily mistakes for a job
+// deadline — it bounds the ADMISSION WAIT and nothing else, and the whole point
+// of AIRA-138's naming decision is that the three are now distinguishable.
+//
+// verifies: AIRA-138
+func TestAIRA138ConfineHasAJobDeadline(t *testing.T) {
+	duration := reflect.TypeOf(time.Duration(0))
 	requestType := reflect.TypeOf(ConfineRequest{})
-	for _, name := range []string{"Timeout", "CPUTimeout", "Deadline", "CPUBudget"} {
-		if _, present := requestType.FieldByName(name); present {
-			t.Fatalf("ConfineRequest.%s exists: AIRA-138's premise (confine has no job deadline) no longer holds; "+
-				"invert this test rather than deleting it", name)
+	for _, name := range []string{"Timeout", "CPUTimeout", "AdmissionMaxWait"} {
+		field, present := requestType.FieldByName(name)
+		if !present || field.Type != duration {
+			t.Fatalf("ConfineRequest.%s is not a time.Duration: %+v present=%v", name, field, present)
 		}
 	}
-	// The near-miss field, asserted positively so the distinction is pinned
-	// rather than implied.
-	admit, present := requestType.FieldByName("AdmissionMaxWait")
-	if !present || admit.Type != reflect.TypeOf(time.Duration(0)) {
-		t.Fatalf("AdmissionMaxWait is not a time.Duration on ConfineRequest: %+v present=%v", admit, present)
-	}
 	statusType := reflect.TypeOf(ConfineStatus{})
-	for _, name := range []string{"Timeout", "CPUTimeout", "Deadline"} {
-		if _, present := statusType.FieldByName(name); present {
-			t.Fatalf("ConfineStatus.%s exists: the trailer already names a bound, so AIRA-138's "+
-				"trailer-field question is already answered; invert this test", name)
+	stateType := reflect.TypeOf(ConfineDeadlineState(""))
+	for _, name := range []string{"Timeout", "CPUTimeout"} {
+		field, present := statusType.FieldByName(name)
+		if !present || field.Type != stateType {
+			t.Fatalf("ConfineStatus.%s is not a ConfineDeadlineState: %+v present=%v", name, field, present)
+		}
+	}
+	// The BUDGET travels with the state, or the trailer could say a bound fired
+	// without naming the number the operator would have to change.
+	for _, name := range []string{"TimeoutBudget", "CPUTimeoutBudget"} {
+		field, present := statusType.FieldByName(name)
+		if !present || field.Type != duration {
+			t.Fatalf("ConfineStatus.%s is not a time.Duration: %+v present=%v", name, field, present)
 		}
 	}
 }
@@ -115,7 +132,7 @@ func naiveConfineDeadlineDraft(scope Scope, cmd *exec.Cmd, fire <-chan deadlineF
 	case out := <-waitCh:
 		return naiveConfineDeadlineOutcome{
 			Exit:         out.Exit,
-			TerminatedBy: classifyConfineTermination(out.Term, cgroupUsage{}, nil),
+			TerminatedBy: classifyConfineTermination(out.Term, cgroupUsage{}, nil, deadlineKindUnset),
 		}, waitCh
 	case fired := <-fire:
 		killErr := scope.Kill()
@@ -252,7 +269,7 @@ func TestAIRA138NaiveConfineDeadlineFabricatesAKill(t *testing.T) {
 	if real.Exit != 7 || !real.Term.Decoded || real.Term.Signaled {
 		t.Fatalf("the child's real outcome is not the one the reproduction depends on: exit=%d term=%+v", real.Exit, real.Term)
 	}
-	if honest := classifyConfineTermination(real.Term, cgroupUsage{}, nil); honest != ConfineTerminatedNormal {
+	if honest := classifyConfineTermination(real.Term, cgroupUsage{}, nil, deadlineKindUnset); honest != ConfineTerminatedNormal {
 		t.Fatalf("the honest verdict for this evidence is not %q: got %q", ConfineTerminatedNormal, honest)
 	}
 

@@ -140,6 +140,92 @@ func decideCPUBudgetUnenforced(budget time.Duration, killedByCPUBudget bool, fin
 	return finalConsumed >= budget
 }
 
+// decideConfineDeadlineNotExecuted is AIRA-126's IDEA in a supervisor with no
+// ledger (AIRA-138). It keeps AIRA-126's two EVIDENCE conjuncts verbatim and
+// drops its two LEDGER conjuncts, which have no referent in confine: confine
+// publishes nothing before it kills, so there is no intent to be foreign and
+// none to have been concurrently completed. Dropping them is sound BECAUSE the
+// artifact they guard does not exist; it is not a relaxation of the evidence
+// bar. Passing `true, true` for conjuncts confine has no referent for would be a
+// lie wearing the costume of reuse.
+//
+// What confine has instead is an exit code and a trailer, and those are just as
+// capable of asserting a termination that did not occur — with LESS recourse,
+// because ConfineResult has no ErrorCodes array and no reconcile pass to correct
+// the record later. A confine fabrication is final the instant it is printed.
+//
+//   - killErr == nil: an errored kill is unevaluated, never dismissed.
+//   - Empty && !Started: the only killConfineScope shape that proves no signal
+//     was emitted (it returned before the cgroup.kill write) AND that the scope
+//     was verified empty by TWO INDEPENDENT READS — leaf cgroup.procs and the
+//     subtree-aware cgroup.events `populated`. A leaf-empty but
+//     subtree-POPULATED scope is a busy job living in child cgroups it created
+//     inside its own scope (the aitest / --delegate-ram / podman --cgroups=split
+//     shape), and it never reaches this state: it is killed instead.
+//   - leader == processDead: kernel proof the leader was already gone at the
+//     instant the kill found nothing to signal. This separates "already exited
+//     before any signal" from "still running past its deadline and unkillable";
+//     processAlive and processUnknown both refuse.
+//
+// It never reports true for an empty scope alone: emptiness is not proof that
+// any kill won, which is exactly the inference killScope refuses.
+func decideConfineDeadlineNotExecuted(killErr error, attempt confineKillResult, leader processLiveness) bool {
+	return killErr == nil && attempt.Empty && !attempt.Started && leader == processDead
+}
+
+// decideConfineDeadlineState is the TOTAL function from arbitration evidence to
+// the one state ONE bound's trailer field renders (AIRA-138). It is called once
+// per requested bound, and the caller passes, FOR THAT BOUND:
+//
+//	requested      : this bound was asked for (> 0). False renders nothing.
+//	firedThisBound : the deadline source fired AND fired.Kind is this bound's.
+//	attempt        : killConfineScope's result for that fire (zero if !fired).
+//	killErr        : killConfineScope's error for that fire (nil if !fired).
+//	notExecuted    : decideConfineDeadlineNotExecuted(killErr, attempt, leader).
+//	cpuUnenforced  : decideCPUBudgetUnenforced(...) for the CPU bound; ALWAYS
+//	                 false for the wall bound, which has no such state.
+//
+// PRECEDENCE, stated because two true things can describe one run:
+//
+// For the bound that FIRED, the fire-derived state wins. It is strictly more
+// informative than `unenforced`: `fired-not-executed` says the budget was
+// reached AND the bound fired AND the kill reached nothing, which ENTAILS "not
+// enforced" and additionally says why. Rendering `unenforced` there would delete
+// the fact that AIRA acted.
+//
+// For a bound that did NOT fire there is no kill to describe, so the measurement
+// decides: the CPU bound renders `unenforced` when decideCPUBudgetUnenforced is
+// true (the final total reached the budget with no executed CPU kill, or nothing
+// was ever measured) and `not-reached` otherwise; the wall bound always renders
+// `not-reached`, since a wall timer that did not fire is a one-sided fact
+// needing no measurement.
+//
+// At most ONE bound can be fire-derived per run: the select consumes exactly one
+// deadlineFire and deadlines.halt() discards any second, so the two fields can
+// never both claim a fire.
+func decideConfineDeadlineState(
+	requested, firedThisBound bool,
+	attempt confineKillResult, killErr error,
+	notExecuted, cpuUnenforced bool,
+) ConfineDeadlineState {
+	switch {
+	case !requested:
+		return ""
+	case firedThisBound && notExecuted:
+		return ConfineDeadlineFiredNotExecuted
+	case firedThisBound && attempt.Started && attempt.Completed && killErr == nil:
+		return ConfineDeadlineFiredKillCompleted
+	case firedThisBound && attempt.Started:
+		return ConfineDeadlineFiredKillUnconfirmed
+	case firedThisBound:
+		return ConfineDeadlineFiredUnevaluated
+	case cpuUnenforced:
+		return ConfineDeadlineUnenforced
+	default:
+		return ConfineDeadlineNotReached
+	}
+}
+
 func classifyMembership(initialVerified, processStillAlive, memberNow bool) (ScopeIntegrity, bool) {
 	if !initialVerified {
 		return ScopeHandoffUnverified, false

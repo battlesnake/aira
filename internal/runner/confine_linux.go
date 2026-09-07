@@ -1241,6 +1241,27 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		<-monitorResult
 		return abortStarted(errors.New("interrupted before confined target release"))
 	}
+	// AIRA-138. The CPU baseline is read HERE: after the membership and identity
+	// verification above, and BEFORE the release write below.
+	//
+	// Not earlier, and the reason is the one invariant AIRA-136 established —
+	// every error is in the LATE direction, never the early one. confine re-execs
+	// itself as `aira confine-setup` INSIDE the scope; that shim parses args,
+	// verifies its cgroup, applies oom_score_adj/nice/ionice and writes the
+	// handshake, all inside the scope and therefore charged to cpu.stat. A
+	// baseline read before cmd.Start() would charge the shim's setup cost to the
+	// job's budget, making the bound fire EARLY. Reading here, while the shim is
+	// blocked on the release pipe, excludes it.
+	//
+	// The residual is stated rather than claimed absent: the shim's post-release
+	// path — one read(2) return and an execve — is still charged. That is
+	// microseconds against a budget measured in minutes, and it is the one
+	// remaining early-direction term in this design.
+	var cpuBaseline time.Duration
+	var cpuBaselineOK bool
+	if request.CPUTimeout > 0 {
+		cpuBaseline, cpuBaselineOK = readCgroupCPUFn(scope.Reference())
+	}
 	if n, writeErr := releaseWrite.Write([]byte{1}); writeErr != nil || n != 1 {
 		close(monitorStop)
 		<-monitorResult
@@ -1250,7 +1271,78 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return abortStarted(fmt.Errorf("release confined target: %w", writeErr))
 	}
 	_ = releaseWrite.Close()
-	exitCode, termination := waitConfineCommand(cmd)
+	// AIRA-138. The wait moves behind a channel so ONE select can race it against
+	// ONE deadline source. waitConfineCommand itself is unchanged and still shared
+	// with the shim path.
+	waitCh := make(chan confineWaitOutcome, 1)
+	go func() {
+		exit, term := waitConfineCommand(cmd)
+		waitCh <- confineWaitOutcome{Exit: exit, Termination: term}
+	}()
+	var (
+		fired               deadlineFire
+		deadlineFired       bool
+		deadlineAttempt     confineKillResult
+		deadlineKillErr     error
+		deadlineNotExecuted bool
+		outcome             confineWaitOutcome
+	)
+	deadlines := startDeadlineSource(deadlineConfig{
+		Wall: request.Timeout, CPU: request.CPUTimeout,
+		CPUBase: cpuBaseline, CPUBaseOK: cpuBaselineOK,
+		ScopePath: scope.Reference(), Interval: cpuBudgetSampleInterval,
+		ReadCPU: readCgroupCPUFn,
+	})
+	if deadlines == nil {
+		// No bound requested: a bare receive, byte-for-byte the behaviour this
+		// path had before AIRA-138.
+		outcome = <-waitCh
+	} else {
+		select {
+		case outcome = <-waitCh:
+		case fired = <-deadlines.C:
+			deadlineFired = true
+			deadlineAttempt, deadlineKillErr = killConfineScope(ctx, scope)
+			// AIRA-126's half (b), transplanted: the deadline can fire against a
+			// scope the leader has ALREADY left, with the child's own real exit
+			// sitting unread in waitCh. When no signal was provably emitted and the
+			// leader is proved dead at that instant, the established facts are the
+			// child's own exit and the ABSENCE of any delivered kill, and this
+			// launch reports those instead of a termination that did not happen.
+			deadlineNotExecuted = decideConfineDeadlineNotExecuted(deadlineKillErr, deadlineAttempt, processLive(identity))
+			// ACT FIRST, LOG SECOND, exactly as the supervisor-signal handler
+			// documents: `diagnostics` is the confineLockedWriter shared with the
+			// child's stderr pump and can block behind a stalled reader, so the kill
+			// above must never be gated on this write.
+			_, _ = fmt.Fprintln(diagnostics, formatConfineDeadlineAdvisory(fired, scopeID, sliceName,
+				deadlineAttempt, deadlineKillErr, deadlineNotExecuted))
+			if deadlineNotExecuted {
+				select {
+				case outcome = <-waitCh:
+				case <-time.After(confineArbitrationWaitBound):
+					// The bound expired. Degrade to `fired-unevaluated`, never to a
+					// kill claim, and still drain: the child is this process's own
+					// and cmd.Wait() is the only way to reap it.
+					deadlineNotExecuted = false
+					outcome = <-waitCh
+				}
+			} else {
+				// Arms A and C drain unconditionally and without a bound. Not
+				// draining would leak a zombie and lose the exit code.
+				outcome = <-waitCh
+			}
+		}
+		// halt joins the source goroutine so no sampler outlives this launch. After
+		// a fire the goroutine has already returned; a fire that lost the select
+		// sits in the buffered channel and is discarded with the source.
+		deadlines.halt()
+	}
+	exitCode, termination := outcome.Exit, outcome.Termination
+	// AIRA-138 §5.4. The exit code stays a PASS-THROUGH of the job's own, on every
+	// arm. confine's exit code is a hard contract every Makefile on this box
+	// depends on, and confine reserves error returns for "the confinement could
+	// not be established" — a job that WAS confined and then hit its bound is not
+	// a confinement failure. The trailer facets carry "a bound fired" instead.
 	result.Exit = exitCode
 	// Snapshot on the very next statement, and close the cut-off in the same
 	// critical section: from here on the handler records nothing and tears
@@ -1305,7 +1397,41 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if observation := escapedObservation(scope.Reference(), monitorSummary.Escape, teardown.Escape); observation != nil {
 		result.Status.DescendantEscape = &DescendantEscapeEvidence{PIDIdentity: observation.Identity, Cgroup: observation.Cgroup}
 	}
-	result.Status.TerminatedBy = classifyConfineTermination(termination, usage, terminatedBySignal)
+	// AIRA-138. A deadline reaches the termination verdict ONLY when its
+	// cgroup.kill write actually returned nil; a fire that signalled nothing never
+	// attributes a death to itself.
+	deadlineKillKind := deadlineKindUnset
+	if deadlineFired && deadlineAttempt.Started {
+		deadlineKillKind = fired.Kind
+	}
+	result.Status.TerminatedBy = classifyConfineTermination(termination, usage, terminatedBySignal, deadlineKillKind)
+	// AIRA-138. The two bound facets, each derived by the one total rule in
+	// decisions.go and each rendered only if that bound was requested.
+	//
+	// finalEstablished is read off the POINTER fields, never off a sum: summing
+	// first would turn an unreadable counter into a MEASURED zero, which is the
+	// fake zero decideCPUBudgetUnenforced exists to refuse.
+	finalEstablished := usage.CPUUser != nil && usage.CPUSys != nil
+	var finalConsumed time.Duration
+	if finalEstablished {
+		total := time.Duration(*usage.CPUUser+*usage.CPUSys) * time.Microsecond
+		finalConsumed = decideFinalCPUConsumed(total, cpuBaseline, cpuBaselineOK)
+	}
+	// STRICTER than `aira run`'s killedByCPUBudget, deliberately, and the
+	// divergence is named so a reviewer does not read it as drift: run's is true
+	// for a CPU fire whose kill did not execute, which AIRA-136's own build review
+	// recorded as overclaiming. confine requires the executed write. (Aligning run
+	// is filed as a follow-up, not ridden on this ticket.)
+	killedByCPUBudget := deadlineFired && fired.Kind == deadlineKindCPU && deadlineAttempt.Started
+	cpuUnenforced := decideCPUBudgetUnenforced(request.CPUTimeout, killedByCPUBudget, finalConsumed, finalEstablished)
+	result.Status.TimeoutBudget = request.Timeout
+	result.Status.Timeout = decideConfineDeadlineState(request.Timeout > 0,
+		deadlineFired && fired.Kind == deadlineKindWall,
+		deadlineAttempt, deadlineKillErr, deadlineNotExecuted, false)
+	result.Status.CPUTimeoutBudget = request.CPUTimeout
+	result.Status.CPUTimeout = decideConfineDeadlineState(request.CPUTimeout > 0,
+		deadlineFired && fired.Kind == deadlineKindCPU,
+		deadlineAttempt, deadlineKillErr, deadlineNotExecuted, cpuUnenforced)
 	// AIRA-101, finalised beside its sibling facet and on the same completion
 	// path. A lease that closed mid-run downgrades granted -> lost, so a
 	// measurement taken while the hold was gone is never reported as clean.
@@ -2063,6 +2189,200 @@ type confineTermination struct {
 	Signal   syscall.Signal
 }
 
+// confineWaitOutcome carries waitConfineCommand's two return values across the
+// channel the deadline select races. waitConfineCommand itself is UNCHANGED and
+// still shared with the shim path; only the call site moved behind a goroutine.
+type confineWaitOutcome struct {
+	Exit        int
+	Termination confineTermination
+}
+
+// confineKillResult is what one deadline kill attempt established (AIRA-138).
+// Every field is a positive observation, never an inference:
+//
+//	Empty     : BOTH reads agreed the scope was empty — leaf cgroup.procs AND the
+//	            subtree-aware cgroup.events `populated`. Also set after a
+//	            confirmed kill, where emptiness was re-established.
+//	Started   : cgroup.kill was written and the write returned nil, i.e. SIGKILL
+//	            was delivered to every member of the whole subtree.
+//	Completed : waitEmpty then CONFIRMED the scope empty after that write.
+type confineKillResult struct {
+	Empty     bool
+	Started   bool
+	Completed bool
+}
+
+const (
+	// confineDeadlineKillGrace bounds waitEmpty's emptiness CONFIRMATION after the
+	// recursive cgroup.kill write. It is the value cleanupConfineScope already
+	// uses for the identical confirmation on confine's own teardown path, and
+	// waitEmpty's own default. Not a new number; the existing one, named.
+	confineDeadlineKillGrace = 2 * time.Second
+
+	// confineArbitrationWaitBound bounds arm B's drain of the child's real
+	// outcome. `aira run` uses arbitrationWaitBound(r.grace) = max(grace, 250ms);
+	// confine has no r.grace at all, so the FLOOR is the whole bound and the
+	// constant is REUSED rather than re-derived. Run's cost argument carries over
+	// unchanged: on this arm the leader is PROVED dead, so cmd.Wait() is already
+	// blocked in wait4 on our own child and only the reap plus one scheduler
+	// wakeup remain. On expiry the arm degrades to `fired-unevaluated`, never to a
+	// kill claim — an expired bound can only produce an honest "unevaluated".
+	confineArbitrationWaitBound = arbitrationWaitFloor
+)
+
+// killConfineScope is the deadline's ONE kill site (AIRA-138).
+//
+// It follows killScope's REFUSAL DISCIPLINE — never claim a win on an empty
+// scope — but deliberately DIVERGES from killScope's gate, and the divergence is
+// the whole point.
+//
+// killScope refuses to write cgroup.kill whenever LEAF cgroup.procs is empty.
+// That gate is INERT against the exact job this bound exists for. Scope.Members()
+// reads leaf cgroup.procs; Scope.Empty() reads cgroup.events `populated`, which
+// is SUBTREE-aware. They are two independent sources and they legitimately
+// disagree, in one direction, for one very common shape: a job whose processes
+// live in child cgroups it created inside its own scope.
+// BootstrapAitestSupervisor drains EVERY pid of a --delegate-ram/aitest job into
+// <outer>/.aira-supervisor and .aira-worker-N; `podman --cgroups=split` does the
+// same. Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.
+// SubtreePopulated's own doc comment says so. With a leaf-only gate the deadline
+// would fire, signal nothing, report `fired-unevaluated`, and then wait for the
+// job it was supposed to end.
+//
+// The repository already solved this once and said why, in confine --kill
+// (confine_manage_linux.go): "Leaf-only cgroup.procs would miss a workload that
+// migrated into a child cgroup it created inside its own scope ... cgroup.kill is
+// itself recursive, so the whole subtree is the correct unit for both the gate
+// and the confirmation." This follows that precedent rather than inventing a
+// second answer.
+//
+// The correction does NOT weaken the no-signal refusal, which is the thing that
+// must not move: it still returns before any write, and its Empty flag now means
+// verified empty by BOTH reads agreeing rather than by one read alone — strictly
+// stronger proof, not a relaxed one.
+//
+// An Empty() error is `unevaluated`, returned as an error with a zero result
+// rather than folded into a half-populated one: a failed population read means
+// AIRA cannot establish whether there was anything to kill.
+//
+// NO SIGTERM GRACE, deliberately. killScope does Terminate -> grace -> Kill;
+// confine's own teardown (cleanupConfineScope) goes straight to scope.Kill(), and
+// CLAUDE.md documents confine's contract as "a confined job has NO graceful
+// shutdown — Ctrl-C / SIGTERM hard-kills the whole job tree instantly". A
+// deadline kill that behaved more gently than a Ctrl-C would contradict the
+// documented contract and would add a third outcome shape for no honesty gain.
+//
+// covers: AIRA-138
+func killConfineScope(ctx context.Context, scope Scope) (confineKillResult, error) {
+	pids, err := scope.Members()
+	if err != nil {
+		return confineKillResult{}, err
+	}
+	if len(pids) == 0 {
+		// LEAF cgroup.procs is empty. That is NOT emptiness: consult the
+		// subtree-aware source before concluding there is nothing to kill.
+		empty, emptyErr := scope.Empty()
+		if emptyErr != nil {
+			return confineKillResult{}, emptyErr
+		}
+		if empty {
+			// BOTH reads agree. Return BEFORE any write: no signal was emitted,
+			// provably. This is the sole input to decideConfineDeadlineNotExecuted.
+			return confineKillResult{Empty: true}, nil
+		}
+		// Leaf-empty, subtree-POPULATED: a busy job living in child cgroups. Fall
+		// through to the kill — cgroup.kill is recursive, so one write is the
+		// correct and sufficient action for the whole subtree.
+	}
+	if err := scope.Kill(); err != nil {
+		// The WRITE failed, so nothing establishes that any signal was delivered.
+		// Started stays false — unlike killScope, which returns Started:true here
+		// because it has already sent SIGTERM by that point and this path has sent
+		// nothing at all. Reporting Started on a failed write would put a
+		// never-delivered kill on the `deadline:` termination verdict.
+		return confineKillResult{}, err
+	}
+	if err := waitEmpty(ctx, scope, confineDeadlineKillGrace); err != nil {
+		return confineKillResult{Started: true}, err
+	}
+	return confineKillResult{Started: true, Completed: true, Empty: true}, nil
+}
+
+// confineDeadlineLabel names the FLAG a fire belongs to, for the fire-time
+// diagnostic and the trailer field. An unset kind renders the neutral "deadline"
+// rather than guessing at either bound.
+func confineDeadlineLabel(kind deadlineKind) string {
+	switch kind {
+	case deadlineKindWall:
+		return ConfineDeadlineLabelWall
+	case deadlineKindCPU:
+		return ConfineDeadlineLabelCPU
+	default:
+		return "deadline"
+	}
+}
+
+// confineDeadlineBound names the QUANTITY a fire exceeded, for the
+// `terminated-by=deadline:<bound>` verdict. It is a separate vocabulary from the
+// flag names above on purpose (see ConfineDeadlineBoundWall): terminated-by
+// states a cause, not a knob. An unset kind is never rendered — the caller gates
+// on deadlineKindUnset before reaching here — but it degrades to "unevaluated"
+// rather than to either bound, because guessing which clock ran out is exactly
+// the fabrication this facet exists to prevent.
+func confineDeadlineBound(kind deadlineKind) string {
+	switch kind {
+	case deadlineKindWall:
+		return ConfineDeadlineBoundWall
+	case deadlineKindCPU:
+		return ConfineDeadlineBoundCPU
+	default:
+		return ConfineTerminatedUnevaluated
+	}
+}
+
+// formatConfineDeadlineAdvisory is the ONE stderr line the deadline writes at
+// the instant it fires (AIRA-138).
+//
+// It exists because the supervisor-signal handler tells the operator what it did
+// the moment it acts, and a deadline that said nothing until the trailer would
+// leave an operator watching a still-running job — on arm A's unconfirmed
+// emptiness, or on arm C, potentially for hours — believing the bound was live
+// and silent.
+//
+// Tense discipline is the signal handler's: past tense ONLY for what has already
+// happened. The caller writes this AFTER the kill attempt and never gates the
+// kill on the write, because `diagnostics` is the confineLockedWriter shared with
+// the child's stderr pump and can block behind a stalled reader.
+//
+// The label is the flag name and the budget is the operator's own number, so the
+// line names the knob to change, exactly as the trailer field does.
+func formatConfineDeadlineAdvisory(fired deadlineFire, scopeID, sliceName string, attempt confineKillResult, killErr error, notExecuted bool) string {
+	head := "confine: " + confineDeadlineLabel(fired.Kind) + " " + fired.Budget.String() + " fired; "
+	switch {
+	case notExecuted:
+		return head + "sent no signal — scope " + scopeID + " was already empty and the job's leader already dead; " +
+			"reporting the job's own exit"
+	case attempt.Started && attempt.Completed && killErr == nil:
+		return head + "killed scope " + scopeID + " on " + sliceName
+	case attempt.Started:
+		return head + "wrote cgroup.kill for scope " + scopeID + ", emptiness unconfirmed: " + confineDeadlineReason(killErr,
+			"waitEmpty returned without confirming the scope empty")
+	default:
+		return head + "kill unevaluated: " + confineDeadlineReason(killErr,
+			"the scope read empty by both reads but the job's leader could not be proved dead")
+	}
+}
+
+// confineDeadlineReason renders an error, or the stated fallback when there is
+// none. It never renders an empty clause: a diagnostic that trails off after a
+// colon reads as a truncated failure rather than as the state it describes.
+func confineDeadlineReason(err error, fallback string) string {
+	if err != nil {
+		return err.Error()
+	}
+	return fallback
+}
+
 func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 	err := cmd.Wait()
 	if err == nil {
@@ -2093,7 +2413,32 @@ func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 //  4. not signalled                                  -> normal
 //  5. signal is not SIGKILL                          -> child-signal:<NAME>
 //  6. local oom_kill not readable                    -> unevaluated
-//  7. SIGKILL with local oom_kill == 0               -> unattributed-sigkill
+//  7. a deadline kill was STARTED                    -> deadline:wall | deadline:cpu
+//  8. SIGKILL with local oom_kill == 0               -> unattributed-sigkill
+//
+// Step 7 is AIRA-138's, and its placement is PROVED from the existing code
+// rather than chosen by taste. formatConfineTerminationAdvisory tells the
+// operator, for the `unattributed-sigkill` verdict, that this supervisor "sent no
+// signal itself" — a sentence that becomes FALSE the instant a deadline kill
+// wrote cgroup.kill. Leaving a deadline kill in step 8 would make a shipped
+// advisory lie, so step 7 is where it must go.
+//
+// The gate is deadlineKill != deadlineKindUnset, which the caller sets only when
+// the cgroup.kill write RETURNED NIL — i.e. SIGKILL was delivered to every
+// member, which is already enough to falsify the advisory. Whether waitEmpty then
+// confirmed emptiness is a separate fact, reported separately on the trailer's
+// fired-kill-unconfirmed state.
+//
+// It sits BELOW supervisor-signal (step 3), not above: an operator's Ctrl-C
+// independently tears the scope down (the handler calls cleanup() -> scope.Kill()),
+// so a Ctrl-C racing a deadline makes both true and the true cause is not
+// decidable. AIRA-70 exists so an operator's signal is never invisible, and
+// ordering the deadline above would re-hide it. Nothing is lost by preferring the
+// operator here, because the deadline gets its own always-rendered-when-requested
+// trailer field. It sits below `oom` (step 2) for the same reason step 3 does:
+// cgroup.kill never increments oom_kill, so a positive LOCAL counter is never our
+// doing, and a job that genuinely OOMed at its cap while the deadline was firing
+// really was OOM-killed.
 //
 // Step 2 rests on TWO independent guards, both added by build review, because
 // memcg events propagate UPWARD and this project's own aitest worker scopes are
@@ -2141,8 +2486,8 @@ func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 // (see confineWithDeps): the handler stays live through the post-run teardown,
 // and a signal arriving there terminated nothing.
 //
-// covers: AIRA-70, AIRA-91 Part A
-func classifyConfineTermination(term confineTermination, usage cgroupUsage, supervisorSignal os.Signal) string {
+// covers: AIRA-70, AIRA-91 Part A, AIRA-138
+func classifyConfineTermination(term confineTermination, usage cgroupUsage, supervisorSignal os.Signal, deadlineKill deadlineKind) string {
 	if !term.Decoded {
 		return ConfineTerminatedUnevaluated
 	}
@@ -2162,6 +2507,9 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 	}
 	if !oomEvaluated {
 		return ConfineTerminatedUnevaluated
+	}
+	if deadlineKill != deadlineKindUnset {
+		return ConfineTerminatedDeadlinePrefix + confineDeadlineBound(deadlineKill)
 	}
 	return ConfineTerminatedUnattributedSIGKILL
 }

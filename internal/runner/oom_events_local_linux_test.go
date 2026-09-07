@@ -125,7 +125,7 @@ func TestReadCgroupUsageReadsTheLocalOOMCounters(t *testing.T) {
 			t.Fatalf("an unreadable memory.events.local was reported as evaluated: %+v", usage)
 		}
 		verdict := classifyConfineTermination(
-			confineTermination{Decoded: true, Signaled: true, Signal: syscall.SIGKILL}, usage, nil)
+			confineTermination{Decoded: true, Signaled: true, Signal: syscall.SIGKILL}, usage, nil, deadlineKindUnset)
 		if verdict != ConfineTerminatedUnevaluated {
 			t.Fatalf("verdict = %q with no readable local counter, want %q -- claiming either an OOM or an "+
 				"unattributed kill from an unread file is a fabricated zero", verdict, ConfineTerminatedUnevaluated)
@@ -253,7 +253,7 @@ func TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM(t *testing.T) {
 				"(usage=%+v) -- a real aitest run would report unattributed-sigkill for a kernel OOM", usage)
 		}
 		verdict := classifyConfineTermination(
-			confineTermination{Decoded: true, Signaled: true, Signal: syscall.SIGKILL}, usage, nil)
+			confineTermination{Decoded: true, Signaled: true, Signal: syscall.SIGKILL}, usage, nil, deadlineKindUnset)
 		if verdict != ConfineTerminatedOOM {
 			t.Fatalf("verdict = %q for a drained-leader OOM at our own cap, want %q", verdict, ConfineTerminatedOOM)
 		}
@@ -332,7 +332,7 @@ func TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM(t *testing.T) {
 		// unattributed, not as a kernel OOM of this job.
 		usage := readCgroupUsage(scope)
 		verdict := classifyConfineTermination(
-			confineTermination{Decoded: true, Signaled: true, Signal: syscall.SIGKILL}, usage, nil)
+			confineTermination{Decoded: true, Signaled: true, Signal: syscall.SIGKILL}, usage, nil, deadlineKindUnset)
 		if verdict != ConfineTerminatedUnattributedSIGKILL {
 			t.Fatalf("verdict = %q for an external SIGKILL on a scope carrying a descendant's OOM, want %q (usage=%+v)",
 				verdict, ConfineTerminatedUnattributedSIGKILL, usage)
