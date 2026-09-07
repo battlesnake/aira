@@ -15,6 +15,19 @@ import (
 	"aira/internal/runner"
 )
 
+// Filename note. This file is named oom_cap_source_..., not the more obvious
+// confine_cap_source_..., so it sorts (and therefore runs, within this
+// package's one test binary) AFTER confine_oom_selfheal_real_cgroup_linux_test.go.
+// That ordering matters: AIRA-128's TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission
+// in that file has a real, pre-existing, unrelated bug (filed as AIRA-139) —
+// it reliably fails whenever it is NOT the first real Server+slice sequence in
+// the test binary process (reproduced even against ITSELF at -count=2, with no
+// other file involved). Naming this file to run after it, rather than before,
+// avoids tripping that bug; it does not fix it. See AIRA-139 for the
+// investigation (ruled out: this file's own memory footprint, and host
+// MemAvailable settling — neither made any difference) and for whoever
+// eventually finds the real root cause.
+//
 // AIRA-133. Against a REAL cgroup, a REAL daemon and a REAL kernel OOM kill:
 // two jobs killed the same way, at caps of the same order, report
 // DISTINGUISHABLY different provenance and are told to do different things.
