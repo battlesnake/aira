@@ -70,12 +70,48 @@ import (
 //     real-cgroup test drives a nested-victim OOM through reportPeak's
 //     attribution end to end.
 //
+// A second accepted gap, named by AIRA-139 rather than introduced by it: what
+// phase 3 pins is the escalation's ATTRIBUTION (the `estimate:oom-escalated`
+// basis, reachable only through this signature's own OOM record), not the
+// escalated VALUE. With one OOM sample there is no usable ordinary estimate, so
+// resolveAdmitReserve's max(estimate, 1.5x OOM peak) keeps the unpinned client
+// default (runner.DefaultConfineMemoryReserve, 4 GiB) -- far above the ~80 MiB
+// 1.5x figure -- and that default is what the second run then succeeds at. It
+// was already so before AIRA-139; that ticket only made the resolution stop
+// landing on the fixture ceiling. Driving the ARITHMETIC would need an OOM peak
+// above 2.7 GiB, i.e. a multi-gigabyte real workload on a shared box; the
+// arithmetic is pinned instead, at unit cost, by
+// TestConfineEstimatorAndOOMEscalationClamp and
+// TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins.
+//
 // verifies: AIRA-128
 const (
-	// The fixture slice budget. Small on purpose -- the headroom fields below
-	// are scaled to match, so the ceiling arithmetic is exercised at fixture
-	// scale rather than being switched off.
-	oomSelfHealSliceMax = int64(1 << 30)
+	// The fixture slice budget. A LIMIT, not an allocation: the workloads below
+	// touch a few hundred MiB whatever this says, so its only job is to place
+	// the fixture's admission ceiling.
+	//
+	// It is derived from runner.DefaultConfineMemoryReserve rather than picked,
+	// and that is the AIRA-139 fix. This fixture's phase-3 request is UNPINNED,
+	// so the reserve it carries to the daemon is exactly that default, and
+	// resolveAdmitReserve's OOM-escalation branch takes max(estimate, 1.5x the
+	// OOM peak): with a single OOM sample there is no usable ordinary estimate,
+	// so the default (4 GiB) survives, dwarfs the 1.5x escalation (~80 MiB
+	// here), and is then clamped to EXACTLY the ceiling by the branch's
+	// too-large clamp. A reserve equal to the ceiling is grantable only while
+	// the slice's own charge reads byte-exact zero -- checkedAvailable charges
+	// max(current - reclaimable, outstanding) against that same ceiling -- which
+	// on a slice five earlier confine runs just used is a coin flip on a single
+	// residual 4 KiB page. Measured: the original 1 GiB budget passed only when
+	// a poll happened to read current=0, and hung for the full 30s admission
+	// wait (E_ADMIT_SATURATED, "queue position 1 of 1, 0B queued ahead" -- an
+	// empty slice) when it read 4096 instead.
+	//
+	// Keeping the budget clear of the default keeps the resolution off that
+	// edge: the reserve resolves to the default UNCLAMPED, with the whole margin
+	// below spare. TestOOMSelfHealFixtureStaysOffTheCeilingClamp pins the
+	// invariant so a future change to either constant fails loudly instead of
+	// reintroducing the flake.
+	oomSelfHealSliceMax = runner.DefaultConfineMemoryReserve + (2 << 30)
 	// What the seeding runs touch. Their peak becomes the machine-wide p90
 	// prior, which is what the target command's cold start is then capped at.
 	// It must leave a Go runtime room to start, and must be far below the
@@ -124,10 +160,12 @@ func TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission(t *testing.
 	slice := newOOMSelfHealSlice(t)
 	paths := testPaths(t)
 	server := NewServer(paths)
-	// Fixture-scale headroom. The slice above is 1 GiB, while production
-	// headroom is 2 GiB + 64 MiB per job, which would leave this fixture no
-	// ceiling at all. Scaled, NOT disabled: the ceiling clamp on the escalated
-	// reserve is still a live part of the path under test.
+	// Fixture-scale headroom. Production headroom is 2 GiB + 64 MiB per job,
+	// which against this fixture's budget would eat a third of it. Scaled, NOT
+	// disabled: every admission here is still sized against a real
+	// maximum-minus-headroom ceiling, and a request over it is still terminally
+	// refused. See oomSelfHealSliceMax for why the ceiling must stay clear of
+	// runner.DefaultConfineMemoryReserve (AIRA-139).
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
 	startServer(t, server)
@@ -233,6 +271,61 @@ func TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission(t *testing.
 	if second.result.Exit != 0 || second.result.Status.TerminatedBy != "normal" || !strings.Contains(second.stdout, oomSelfHealMarker) {
 		t.Fatalf("second run exit=%d terminated-by=%q stdout=%q stderr=%q, want the same command to succeed at the escalated reserve",
 			second.result.Exit, second.result.Status.TerminatedBy, second.stdout, second.stderr)
+	}
+}
+
+// TestOOMSelfHealFixtureStaysOffTheCeilingClamp pins the fixture invariant the
+// AIRA-139 flake violated, at unit cost and with no cgroup: the phase-3
+// resolution must land CLEAR of this fixture's admission ceiling, never on it.
+//
+// It exists because the failure it guards is invisible in the fixture itself.
+// Landing exactly on the ceiling does not fail the assertions above; it makes
+// the second run's admission depend on the slice's residual charge reading
+// byte-exact zero at the moment a poll looks, so the fixture passes and fails
+// on the same code, decided by one 4 KiB page. Asserting the RESOLUTION here
+// converts that into a deterministic, self-describing failure at the two
+// constants that can reintroduce it -- oomSelfHealSliceMax and
+// runner.DefaultConfineMemoryReserve -- or at the reserve policy itself.
+//
+// The margin asserted is one whole target workload rather than a token gap: it
+// says the fixture's ceiling can hold the phase-3 reserve even while the slice
+// still carries everything the previous phase touched, which is the condition
+// the flake actually broke.
+//
+// verifies: AIRA-139
+func TestOOMSelfHealFixtureStaysOffTheCeilingClamp(t *testing.T) {
+	server := NewServer(Paths{})
+	server.stopping = make(chan struct{})
+	server.admitSliceHeadroomBase = 32 << 20
+	server.admitSliceHeadroomSupervisor = 8 << 20
+	server.admitPeakP90 = func(context.Context) (int64, bool, error) {
+		t.Fatal("the OOM-escalation branch must resolve before the machine-wide prior is consulted")
+		return 0, false, nil
+	}
+	// Exactly the history the cold-start OOM leaves for the target signature:
+	// ONE observation, which is one OOM and no usable ordinary estimate. The
+	// peak's exact value is immaterial to what is asserted -- any peak whose
+	// 1.5x escalation is below the unpinned default reproduces the phase-3
+	// resolution -- so it is sized from the seed bytes the prior is built from
+	// rather than pinned to one host's measurement.
+	peak := oomSelfHealSeedBytes + oomSelfHealSeedBytes/2
+	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
+		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: peak, OOMCount: 1, MaxOOMPeak: peak}, nil
+	}
+	// One job's worth of headroom: the phase-3 request is alone on the slice,
+	// which is the ceiling admitConnection computes for it.
+	ceiling := oomSelfHealSliceMax - server.admitSliceHeadroom(1)
+	reserve, basis := server.resolveAdmitReserve(
+		admitRequest{reserve: runner.DefaultConfineMemoryReserve, signature: "target"}, ceiling)
+	if basis != "estimate:oom-escalated" {
+		t.Fatalf("phase-3 basis=%q reserve=%d, want %q — the fixture no longer models the run it guards",
+			basis, reserve, "estimate:oom-escalated")
+	}
+	if slack := ceiling - reserve; slack < oomSelfHealTargetBytes {
+		t.Fatalf("phase-3 reserve=%d leaves %d below the fixture ceiling %d, want at least %d — "+
+			"a reserve at or near the ceiling is grantable only while the slice's own charge reads zero, "+
+			"which is the AIRA-139 flake; raise oomSelfHealSliceMax clear of runner.DefaultConfineMemoryReserve (%d)",
+			reserve, slack, ceiling, oomSelfHealTargetBytes, runner.DefaultConfineMemoryReserve)
 	}
 }
 

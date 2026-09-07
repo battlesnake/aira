@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-139","project":"aira","title":"TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission fails when run twice in a row (self-interaction, not contention)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-139","project":"aira","title":"TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission fails when run twice in a row (self-interaction, not contention)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","flake","testing"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-139","to":"AIRA-149"}]}
 ---
 
 Discovered while building AIRA-133 (aira top's OOM-cap-provenance ticket): a
@@ -137,3 +137,120 @@ sensitivity" cleanly, and is a concrete, checkable next step (e.g.
 `ls /proc/<pid>/fd | wc -l` and `find /proc/<pid>/fdinfo -name 'inotify'`
 across the two Server instances, or straceing the second admission wait to
 see what syscall it is actually blocked on).
+
+## RESOLVED — it is not a second-invocation sensitivity at all
+
+The kernel-resource hypothesis above is **wrong, and so is the framing**. There
+is no leaked watch, no leaked fd, no process-global state, and nothing that a
+second `Server` cannot reclaim. The two runs are not different: **BOTH of them
+sit on the same ungrantable knife edge, and the first one wins a coin flip.**
+
+Established by instrumenting the daemon's own admission evaluator and reserve
+resolver (temporary `log.Printf` under `AIRA_DEBUG_ADMIT=1`, removed before
+commit) and reading the real numbers off the failing run.
+
+### The mechanism, end to end
+
+1. Phase 3's confine request is **UNPINNED**, so by `ResolveConfineReserve` the
+   reserve it carries to the daemon is *exactly* `runner.DefaultConfineMemoryReserve`
+   = 4 GiB. That is not an operator figure and never can be: any explicit
+   `--memory-reserve`, any `--memory-max`, and `--delegate-ram` all set
+   `pinned`, and a pinned request returns from `resolveAdmitReserve` at its
+   first line. An unpinned reserve is the blind 4 GiB constant, always.
+
+2. In `resolveAdmitReserve`, the target signature's history after the phase-2
+   OOM is exactly ONE observation. Measured:
+
+       stats={TotalCount:1 SampleCount:1 PeakMax:56360960 OOMCount:1 MaxOOMPeak:56360960}
+       req.reserve=4294967296  ceiling=1031798784  estimate=4294967296 basis="fallback:insufficient-samples"
+
+   One sample yields no usable ordinary estimate, so `reserve` is still the
+   blind 4 GiB. The OOM branch then takes `max(reserve, 1.5 * MaxOOMPeak)` --
+   and 1.5 x 56360960 = 84541440 (80 MiB) does not come close to 4 GiB, so the
+   escalation changes nothing. The value returned under basis
+   `estimate:oom-escalated` is the untouched client default.
+
+3. 4 GiB exceeds the fixture ceiling, so the branch's too-large clamp fires:
+   `reserve = ceiling = 1031798784` -- the ceiling **exactly**, to the byte
+   (1 GiB slice - 32 MiB base - 8 MiB supervisor headroom).
+
+4. `checkedAvailable` computes `available = ceiling - max(current - reclaimable,
+   outstanding)`. A reserve equal to the ceiling is therefore grantable **only
+   while the slice's own charge reads byte-exact zero**.
+
+5. And that is the entire flake. Measured, same binary, back-to-back:
+
+       iteration 1 (PASSES): ... current=40960 -> 4096 (x11) -> current=0  => avail == reserve  => GRANTED
+       iteration 2 (FAILS):  ... current=8192  -> 4096 (x107, ~30s)        => avail == reserve-4096 => never granted
+
+   One residual 4 KiB page on an otherwise empty slice is the whole difference
+   between pass and fail. The queue diagnostic in the original report was
+   telling the truth all along: "queue position 1 of 1 by enqueue order, 0B
+   queued ahead" -- nothing was contending; the request simply could not fit a
+   ceiling it was itself equal to.
+
+The "first run passes, second fails" pattern that made this look like a
+second-invocation sensitivity was luck, not structure: iteration 1 was ALSO
+stuck on that wait, for ~4 of its 4.79s, and merely happened to catch a poll
+where the slice read zero. That also explains every disproof already recorded
+above -- workload size, MemAvailable settling and daemon-goroutine teardown are
+all irrelevant to whether one page is still charged at the instant a 1s poll
+looks, and it explains why *file order* mattered without any test actually
+interfering with another.
+
+### The fix (test-only)
+
+`internal/daemon/confine_oom_selfheal_real_cgroup_linux_test.go`:
+
+- `oomSelfHealSliceMax` is now **derived** rather than picked:
+  `runner.DefaultConfineMemoryReserve + (2 << 30)` (6 GiB). The fixture budget
+  is a LIMIT, not an allocation -- the workloads still touch a few hundred MiB
+  -- so its only job is to place the ceiling, and it must sit clear of the
+  unpinned default or every unpinned resolution reaching the escalation branch
+  lands exactly on that ceiling. Phase 3 now resolves to 4 GiB UNCLAMPED
+  against a 6.4e9 ceiling with ~2 GiB spare, measured granted `admission=immediate`.
+- New `TestOOMSelfHealFixtureStaysOffTheCeilingClamp` pins the invariant at unit
+  cost with no cgroup: it drives the real `resolveAdmitReserve` with the exact
+  history the cold-start OOM leaves (one sample, one OOM) and requires the
+  resolution to clear the fixture ceiling by at least one whole target
+  workload. Mutation-checked: restoring `oomSelfHealSliceMax = 1 << 30` turns it
+  RED with `phase-3 reserve=1031798784 leaves 0 below the fixture ceiling
+  1031798784, want at least 335544320`.
+- The header records a second accepted coverage gap that AIRA-139 **named
+  rather than introduced**: phase 3 pins the escalation's ATTRIBUTION (the
+  basis, reachable only via this signature's own OOM record), not the escalated
+  VALUE, which is and was the client default. Driving the arithmetic for real
+  would need an OOM peak above 2.7 GiB. It stays pinned at unit cost by
+  `TestConfineEstimatorAndOOMEscalationClamp` and
+  `TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins`.
+
+### Why no production change was made
+
+The clamp-to-ceiling behaviour is DELIBERATE and already documented in
+`TestSliceCeilingDoesNotReachTheOOMEscalationClamp` ("clamps back to 64G --
+accepted, so the request waits on the throttle"). Changing the resolution
+policy so the blind default stops dominating the escalation would drop phase
+3's cap from the ceiling to ~80 MiB, below the 320 MiB the workload needs --
+i.e. it would break the AIRA-128 self-heal property this fixture exists to
+prove, and it is a sizing decision for the machine-wide admission gate, not
+something to slip into a P2 flake ticket. What the investigation DID surface
+about production is written up separately as **AIRA-149** rather than being
+fixed here or left implicit.
+
+### Verification
+
+- `-run 'TestRealOOMAttributes...$' -count=5`: 5/5 PASS, 0.52-0.62s each
+  (against 4.79s + a 30s hang before). Deterministic, and the ~4s of wait that
+  even the "passing" run was burning is gone.
+- Self-run `-count=2` with the AIRA-133 neighbour: PASS.
+- The ORIGINAL AIRA-133 blocking scenario reproduced deliberately by renaming
+  `oom_cap_source_real_cgroup_linux_test.go` to sort BEFORE this file:
+  `-count=2` PASS both iterations. **The AIRA-133 file-name mitigation is
+  therefore no longer load-bearing.** It is left in place (the name is fine on
+  its own merits and renaming it back is pointless churn), but it is no longer
+  the thing holding the package green.
+- `AIRA_REAL_CGROUP=1 go test ./internal/daemon/ -count=1`: ok, 70.0s.
+- `make ci` (fmt-check, vet, build, `go test ./... -count=1 -timeout 20m`):
+  exit 0, every package ok.
+
+All runs under `aira confine`.
