@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-131","project":"aira","title":"Detached run timeout that fires against an already-empty scope still returns U_RUN_RECONCILE_REQUIRED without draining its wait outcome","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["detach","honesty","runner"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-131","project":"aira","title":"Detached run timeout that fires against an already-empty scope still returns U_RUN_RECONCILE_REQUIRED without draining its wait outcome","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["detach","honesty","runner"],"hold":false,"relations":[]}
 ---
 Filed from AIRA-126 (`docs/superpowers/plans/2026-09-06-aira126-kill-terminal-arbitration-plan.md` §6). AIRA-126 fixed the foreground `Launch` path only; this is the same state on the detached path, deliberately left out of that PR's scope.
 
@@ -137,3 +137,70 @@ pre-existing `Reconcile`-can-steal window is untouched; no face renders
 detached straddle soak — the hermetic, deterministic reproduction covers the
 same state without the observability problem a separate-process straddle
 soak would have).
+
+**Merged**: PR #85, merge commit `5bf8d9f`. Fable's build review independently
+re-verified the fix, ran its own mutation set (finding and fixing the T2/T8
+gap recorded above), re-ran the full gate, and merged.
+
+## Fable build review (2026-09-07) — MERGE; PR #85 merged as `5bf8d9f`
+
+Independent adversarial review from a detached worktree at the PR head
+`9f2f44c`, verified from source rather than from the plan or PR narrative.
+
+**Reuse and untouched sites, confirmed by diff.** `internal/runner/decisions.go`
+and `timeout_arbitration_linux_test.go` have zero diff vs `origin/master`
+(`dc37705`, also the merge base): `decideTimeoutIntentNotExecuted` and
+`decideNotExecutedDisposition` are byte-identical reuses. The PR's only
+production diff is `detach_linux.go` (timer branch + the new
+`appendDetachedNotExecutedLocked`); `terminalizeDetachedNoChild` and
+`finalizeDetachedTerminalLocked` are untouched and their AIRA-126 tests ran
+and passed (not skipped).
+
+**Control-flow contract, verified by reading `:503-569`.** The arbitrated arm
+sets `outcome` via the nested `case outcome = <-waitCh`, sets
+`leaderReaped = true` unconditionally at that receive (before the disposition
+call and before every return on that path), and sets `arbitrated = honoured`;
+both the `if !arbitrated { return U_RUN_RECONCILE_REQUIRED }` and the
+`if !arbitrated { completed := attempt.Current ... outcome = <-waitCh }`
+continuation are skipped, so the honoured path exits the outer select with
+`outcome` set and never fabricates a `kill-completed` or re-receives on the
+drained channel. The drain-expired arm leaves `waitCh` untouched, publishes
+nothing, and leaves `leaderReaped` false. The drain is bounded by the existing
+`arbitrationWaitBound(r.grace)`.
+
+**`appendDetachedNotExecutedLocked`, verified.** Takes the same `<id>.lock`
+`killWithIntent` released (`runner_linux.go:2290`), re-reads the ledger under
+it, and refuses without a write on: read error (returns `false, readErr` —
+caller reports `U_RUN_RECONCILE_REQUIRED`), already-terminal record, absent or
+`Completed` intent, and sequence mismatch — the last three through the reused
+`decideNotExecutedDisposition`. Nit (documentation only, not a defect): the
+comment says the ledger's own intent is "preserved", but mechanically
+`mergeEvidence` REPLACES `KillIntent`/`ScopeKill` with the candidate's
+(`attempt.Current` is `Present`); it is equivalent only because the CAS just
+proved the ledger intent has the same `Sequence` and `!Completed`, and no
+writer sets `Empty`/`NotExecuted` without `Completed` or a terminal record.
+The foreground path achieves the same by leaving `record.KillIntent` zero.
+
+**Reviewer's own mutation evidence** (each restored and re-verified green):
+- revert `leaderReaped = true` at the drain receive → ONLY T7 red:
+  `elapsed=2.936s want<1.9s` (the 0.9s hold + the defer's fixed 2s stall);
+- bypass the CAS (`if false {`) → T4 red: ledger shows the concurrent actor's
+  `Completed:true` downgraded to `Completed:false NotExecuted:true` and the
+  run terminalised `exited` (T7 red for the same reason, same device);
+- drop `IntentCreated` at the call site → T3 red;
+- guard removed entirely (`if true {`) → T3 red and the new T8 red;
+- force `processDead` at the call site → T2 GREEN, T8 red. This was the
+  review's one finding: T2 cannot pin the call-site liveness read (see the
+  corrected non-porosity note above). Fixed in `8672914` by adding T8; the
+  production diff is unchanged by that commit.
+
+**Gate, foreground, exact exit codes** (all `aira confine --`):
+`go build ./...` 0; `go vet ./...` 0;
+`AIRA_REAL_CGROUP=1 go test ./... -count=1` 0 (15 packages ok);
+`internal/runner -race` 0 (pass 1, pristine PR tree, 147s) and 0 (pass 2,
+with T8, 146s); `-race -run TestAIRA131 -count=3` 0; T1–T8 `-v` all PASS.
+`AIRA126_SOAK=1` (unmodified foreground soak): **vacuous**, 0/800 straddled,
+exit 1 via the test's own vacuity guard — `unevaluated` for this PR, not a
+wrong-value failure; the foreground `Launch` path it drives has zero diff.
+
+**Accepted deferrals:** plan §8(1)–(8) as written; the reviewer accepts them.
