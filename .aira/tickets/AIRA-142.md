@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-142","project":"aira","title":"aira confine --wait (by owner/scope): a supervisor-authoritative wait primitive to replace agents' broken pgrep -f self-match loops","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-142","project":"aira","title":"aira confine --wait (by owner/scope): a supervisor-authoritative wait primitive to replace agents' broken pgrep -f self-match loops","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Reported by peer session 'field', 2026-09-07, with measured production evidence.
@@ -86,3 +86,60 @@ harness's own backgrounding instead, or (c) both -- a primitive for the
 genuine cross-agent/detached-wait gap, plus prose steering everyone else away
 from ever needing it. The reporter leans toward (c) but flags it as a real
 open call, not a foregone conclusion.
+## Resolution (2026-09-07): option (b), documentation only
+
+Resolved as **(b)** from the scope question above: prose in the generated
+Skill/agent guide promoting the file-sentinel idiom and the harness's own
+backgrounding. **No `aira confine --wait` verb was built.**
+
+Why (b) and not (c):
+
+- The reporter's own framing said there was "no urgency, and genuinely fine if
+  the answer is 'document the harness behaviour instead'", and recorded that
+  every one of the six measured waiters was UNNECESSARY -- the harness already
+  backgrounds a long-running command and reports completion with the true exit
+  code. The common case needs no waiter and no primitive.
+- The one idiom that demonstrably worked, unprompted and first time, was the
+  file sentinel (`until grep -q '^GATE_EXIT=' ...`). It is data the job wrote,
+  so it cannot self-match, and it needs nothing from AIRA at all.
+- This project's architectural-simplicity rule prefers "keep the primitive and
+  document the gap" over new machinery. A `--wait` verb would add a blocking
+  daemon-coupled surface to solve a problem whose measured instances were all
+  solvable by not writing the loop.
+
+### What was built
+
+`internal/core/skill.go`, `renderMarkdownBody` -- one new section, "Waiting for
+a job to finish (never poll `pgrep`)", generated into BOTH the installed
+`SKILL.md` and the agent guide, covering both traps from the report:
+
+1. The `pgrep -f` self-match deadlock, with the measured evidence (three
+   patterns, zero real jobs, six live waiters), why it is silent and
+   self-perpetuating, and the replacement shapes: no waiter at all for a job
+   started in the current session; a job-written file sentinel for another
+   agent's job or a `--detach`ed one; `aira confine --status` as the
+   supervisor's own point-in-time answer for a detached confine job.
+2. The pipeline exit-status trap (`<cmd> | tail -5; echo $?` reports `tail`'s
+   status), with `${PIPESTATUS[0]}` and, preferred, writing the status into the
+   sentinel itself so nothing is left to swallow it.
+
+Test: `TestSkillTeachesTheWaitIdiomAndThePipelineStatusTrap` in
+`internal/core/skill_test.go`, following the
+`TestSkillTeachesTheNeverRanEnvelope` (AIRA-147) precedent -- asserts each
+load-bearing phrase appears in both generated documents. Verified NON-POROUS by
+deleting each of the four new source lines in turn: heading removed -> 2 failed
+assertions, trap paragraph -> 4, sentinel paragraph -> 6, pipeline paragraph
+-> 6. No behaviour of any command changed.
+
+### Accepted, intentional deferral (not a silent omission)
+
+The genuine gap the reporter identified REMAINS OPEN and is deliberately not
+closed here: **there is no supervisor-authoritative blocking wait for another
+agent's job or a detached one.** `aira confine --status` answers the question
+point-in-time and must be polled; the documented sentinel idiom requires the
+job's own author to write the sentinel, so it does not help an agent waiting on
+a job it did not launch and cannot modify. If that case shows up with measured
+cost, `aira confine --wait --owner/--scope` (with the reporter's load-bearing
+constraint that it cannot be composed wrongly -- status via exit code or a file,
+no stdout inviting a `| tail`) is the shape to build. That is a future ticket,
+not part of this one.
