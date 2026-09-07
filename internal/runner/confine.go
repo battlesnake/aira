@@ -268,6 +268,24 @@ type ConfineStatus struct {
 	ScopeMemoryHigh      int64                     `json:"scope_memory_high,omitempty"`
 	ScopeMemoryBinding   string                    `json:"scope_memory_binding,omitempty"`
 	ScopeMemoryEffective int64                     `json:"scope_memory_effective,omitempty"`
+	// ScopeMemoryCapSource is AIRA-133's cap-PROVENANCE facet: WHOSE number the
+	// enforced scope memory.max is. One of the ConfineCapSource* values below.
+	//
+	// It exists because a job killed at a cap AIRA estimated and a job killed at
+	// a cap the operator typed produced byte-identical output, while wanting
+	// opposite responses: the first self-heals on an identical re-run (the OOM is
+	// recorded against the command's signature and the next admission is sized
+	// higher), the second never will, because nothing about a `--memory-max` the
+	// operator chose changes when the command is run again.
+	//
+	// The value is recorded at the single branch in confineWithDeps that CHOOSES
+	// the cap, so it is the provenance itself rather than a re-derivation: no
+	// caller decodes the reserve-basis string, and no heuristic infers "this
+	// looks operator-supplied". Empty whenever no cap was enforced (there is then
+	// no provenance to state, and `scope-memory.max=not-requested` already says
+	// so); an enforced cap with no recorded source renders as unevaluated, never
+	// as either party's choice.
+	ScopeMemoryCapSource string `json:"scope_memory_cap_source,omitempty"`
 	// ScopeSwapCap is AIRA-110's swap-bound disposition: one of the
 	// WorkerAdmitSwapCap* values (the vocabulary AIRA-35 minted for the same
 	// primitive on aitest worker scopes). It exists because `scope-memory.max=
@@ -324,6 +342,52 @@ type ConfineStatus struct {
 	// operator's memory.
 	Exclusive          string `json:"exclusive,omitempty"`
 	ExclusiveDrainedMS int64  `json:"exclusive_drained_ms,omitempty"`
+}
+
+// The cap-provenance vocabulary (AIRA-133). Rendered as `cap-source=` beside
+// `scope-memory.max=enforced=N`, and read by formatConfineReserveAdvisory to
+// choose which next step an OOM at that cap actually warrants.
+//
+// The split that matters is operator: vs auto:. Everything under operator: is a
+// number the caller typed, which an identical re-run cannot change; everything
+// under auto: is a number AIRA chose, which an identical re-run can. The
+// finer-grained value inside each half names the exact flag or mechanism, so the
+// advisory can point at the right knob without a second lookup.
+const (
+	// ConfineCapSourceMemoryMax: the operator passed --memory-max. It wins over
+	// every other source (confineWithDeps tries it first), including the
+	// delegate-ram learned ceiling.
+	ConfineCapSourceMemoryMax = "operator:--memory-max"
+	// ConfineCapSourceMemoryReserve: no --memory-max, but the operator DECLARED a
+	// --memory-reserve, which is enforced as the scope cap. Keyed on the
+	// declared-ness captured before ResolveConfineReserve widens `pinned`, so a
+	// token reserve some caller passed without declaring it never lands here.
+	ConfineCapSourceMemoryReserve = "operator:--memory-reserve"
+	// ConfineCapSourceDaemonReserve: the cap is the reserve the DAEMON resolved
+	// and granted for an unpinned job. Deliberately not called "estimate": the
+	// grant is usually history-derived (`reserve-basis=estimate:*`) but can be a
+	// fallback the daemon returned when history was unusable, and the trailer's
+	// own reserve-basis field beside this one says which. What this value claims
+	// is only what it can establish — AIRA chose this number, not the caller.
+	ConfineCapSourceDaemonReserve = "auto:daemon-reserve"
+	// ConfineCapSourceDelegateRAM: a --delegate-ram job with no --memory-max of
+	// its own, capped at the daemon's learned scope ceiling or, when the daemon
+	// supplied none, at the compiled-in fallback. Also AIRA's number, not the
+	// caller's, but a whole-scope CEILING rather than the job's reserve — so an
+	// OOM here says the suite outgrew its ceiling, not that a reserve estimate
+	// was low.
+	ConfineCapSourceDelegateRAM = "auto:delegate-ram"
+	// ConfineCapSourceUnevaluated: a cap IS enforced but no branch recorded where
+	// it came from. Never rendered as either party's choice.
+	ConfineCapSourceUnevaluated = "unevaluated"
+)
+
+// ConfineCapSourceIsOperator reports whether an enforced cap is a number the
+// CALLER supplied. False for `unevaluated` and for the empty string: an
+// unestablished provenance must never be read as "the operator asked for this",
+// which is the half that tells a reader re-running is pointless.
+func ConfineCapSourceIsOperator(source string) bool {
+	return source == ConfineCapSourceMemoryMax || source == ConfineCapSourceMemoryReserve
 }
 
 // The exclusivity-outcome vocabulary (AIRA-101). Rendered on the trailer
@@ -661,6 +725,17 @@ func FormatConfineStatus(status ConfineStatus) string {
 		line += " scope-memory.max=not-requested"
 	} else {
 		line += " scope-memory.max=enforced=" + strconv.FormatInt(status.ScopeMemoryMax, 10)
+		// AIRA-133. Always rendered alongside an ENFORCED cap, on the same
+		// discipline as terminated-by: before this facet existed, a cap AIRA
+		// estimated and a cap the operator typed were byte-identical here, and
+		// omitting it when the source is unknown would reproduce exactly the
+		// ambiguity it ends. Not rendered at all for an unenforced scope, where
+		// there is no cap to have a source and `not-requested` above says so.
+		capSource := status.ScopeMemoryCapSource
+		if capSource == "" {
+			capSource = ConfineCapSourceUnevaluated
+		}
+		line += " cap-source=" + capSource
 		if status.ScopeMemoryBinding != "" {
 			line += " binding=" + status.ScopeMemoryBinding
 		}
