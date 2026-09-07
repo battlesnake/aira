@@ -2277,14 +2277,76 @@ func captureCode(err error) string {
 	return "E_RUN_CAPTURE_FAILED"
 }
 
+// killScope is `aira run`'s ONE kill site, shared by the deadline
+// (killWithIntent -> executeScopeKill), `aira run kill`, PTY capture teardown,
+// and reconcile.
+//
+// THE GATE IS TWO INDEPENDENT READS (AIRA-140 — the same correction AIRA-138
+// made to killConfineScope). Scope.Members() reads LEAF cgroup.procs;
+// Scope.Empty() reads cgroup.events `populated`, which is SUBTREE-aware. They
+// are two independent sources and they legitimately disagree, in one direction,
+// for one very common shape: a job whose processes live in child cgroups it
+// created inside its own scope. BootstrapAitestSupervisor drains EVERY pid of a
+// --delegate-ram/aitest job into <outer>/.aira-supervisor and .aira-worker-N;
+// `podman --cgroups=split` does the same; so does any nested-cgroup workload.
+// Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.SubtreePopulated's
+// own doc comment says so. Gating on the leaf read alone made --timeout and
+// --cpu-timeout INERT against exactly that job: the deadline fired,
+// Terminate/Kill were never reached, decideTimeoutIntentNotExecuted's Empty
+// conjunct failed, and the run reported an unevaluated kill while the job ran on.
+//
+// The repository solved this once already and said why, in confine --kill
+// (confine_manage_linux.go): "Leaf-only cgroup.procs would miss a workload that
+// migrated into a child cgroup it created inside its own scope ... cgroup.kill is
+// itself recursive, so the whole subtree is the correct unit for both the gate
+// and the confirmation."
+//
+// The correction can only ever produce a signal where the old gate REFUSED one,
+// never the reverse. The no-signal refusal — the sole input to AIRA-126's
+// `Empty && !Started` proof — still returns before any write, and its Empty flag
+// now means verified empty by BOTH reads agreeing rather than by one read alone:
+// strictly stronger proof, not a relaxed one. An Empty() error is still
+// unevaluated, returned with the same zero result as before.
+//
+// NO SIGTERM GRACE ON THE NESTED ARM, deliberately. Terminate takes LEAF pids,
+// which are empty in this shape, so "terminate nothing, wait termGrace, then
+// kill" would be a pure delay in front of the only signal that reaches the job.
+// The recursive cgroup.kill is both the correct and the sufficient action there.
+// The leaf-populated arm below is untouched and keeps its TERM-then-KILL
+// escalation.
+//
+// covers: AIRA-140
 func (r *Runner) killScope(ctx context.Context, scope Scope, id, actor string) (killResult, error) {
 	pids, err := scope.Members()
 	if err != nil {
 		return killResult{}, err
 	}
 	if len(pids) == 0 {
+		// LEAF cgroup.procs is empty. That is NOT emptiness: consult the
+		// subtree-aware source before concluding there is nothing to kill.
 		empty, emptyErr := scope.Empty()
-		return killResult{Empty: empty && emptyErr == nil}, emptyErr
+		if emptyErr != nil {
+			// Unevaluated: a failed population read cannot establish whether
+			// there was anything to kill. Same zero result the old gate returned.
+			return killResult{}, emptyErr
+		}
+		if empty {
+			// BOTH reads agree. Return BEFORE any write: no signal was emitted,
+			// provably. This is what decideTimeoutIntentNotExecuted consumes.
+			return killResult{Empty: true}, nil
+		}
+		// Leaf-empty, subtree-POPULATED: a busy job living in child cgroups it
+		// made inside its own scope. One recursive cgroup.kill reaches all of it.
+		if err := scope.Kill(); err != nil {
+			// The WRITE failed and nothing was sent before it, so Started stays
+			// false — unlike the leaf-populated arm below, which has already
+			// delivered SIGTERM by the time it reaches its own Kill().
+			return killResult{}, err
+		}
+		if err := waitEmpty(ctx, scope, r.grace); err != nil {
+			return killResult{Started: true}, err
+		}
+		return killResult{Started: true, Completed: true, Empty: true}, nil
 	}
 	if err := scope.Terminate(pids); err != nil {
 		return killResult{}, err

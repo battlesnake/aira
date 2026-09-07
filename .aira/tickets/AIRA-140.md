@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-140","project":"aira","title":"aira run's killScope leaf-only empty gate makes --timeout / --cpu-timeout inert against a nested-cgroup job","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["runner","timeout"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-140","project":"aira","title":"aira run's killScope leaf-only empty gate makes --timeout / --cpu-timeout inert against a nested-cgroup job","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["runner","timeout"],"hold":false,"relations":[]}
 ---
 
 Filed at AIRA-138's plan-fix, from that ticket's plan-gate P0. It is explicitly
@@ -71,3 +71,110 @@ the timeout must still end it.
 - AIRA-126 -- the arbitration whose `Empty && !Started` proof this gate feeds;
   the fix strengthens that proof (two agreeing reads) rather than weakening it.
 - AIRA-101 -- where `SubtreePopulated` was added to the scan for the same reason.
+
+## Resolution
+
+`Runner.killScope` (`internal/runner/runner_linux.go`) now gates its refusal to
+signal on **two independent reads that must agree** -- leaf `cgroup.procs` via
+`Members()` AND subtree-aware `cgroup.events populated` via `Empty()` -- exactly
+the correction AIRA-138 landed in `killConfineScope`. A leaf-empty,
+subtree-POPULATED scope is a busy job living in child cgroups it created inside
+its own scope (aitest / `--delegate-ram` / `podman --cgroups=split`) and is now
+KILLED rather than shrugged at.
+
+The change is strictly one-directional: it can only produce a signal in cases
+that previously refused one, never the reverse.
+
+- Leaf-empty **and** subtree-empty: unchanged -- returns `{Empty:true}` BEFORE
+  any write. That is the sole input to AIRA-126's `Empty && !Started` proof, and
+  it is now backed by two agreeing reads rather than one, which is strictly
+  stronger evidence for the same claim.
+- `Empty()` error: unchanged -- the zero result plus the error (`unevaluated`).
+  The old `killResult{Empty: empty && emptyErr == nil}` already yielded
+  `Empty:false` on that path, so the returned value is byte-identical; only its
+  derivation is now explicit rather than incidental.
+- Leaf-populated: unchanged -- full `Terminate` -> TERM grace -> `cgroup.kill`
+  escalation.
+- Leaf-empty, subtree-populated: **the only behaviour change.** Straight to the
+  recursive `cgroup.kill`, with NO SIGTERM grace, because `Terminate` takes leaf
+  pids and there are none: "terminate nothing, wait the grace, then kill" would
+  be a pure delay in front of the only signal that reaches the job. This is the
+  care point the ticket names. A failed `Kill()` write on this arm returns
+  `Started:false`, because nothing was sent before it -- unlike the
+  leaf-populated arm, which has already delivered SIGTERM by the time it reaches
+  its own `Kill()`.
+
+The gate is shared by all four `killScope` callers (the deadline via
+`killWithIntent` -> `executeScopeKill`, `aira run kill`, PTY capture teardown,
+and reconcile); each of them previously mis-read a nested job as "nothing to
+kill", so each is fixed by the one change.
+
+### Tests
+
+`internal/runner/run_nested_kill_gate_linux_test.go`, reusing AIRA-138's
+`nestedWorkloadScope` fake and the bracketing shape of
+`TestAIRA138LeafOnlyKillGateIsInertAgainstANestedWorkload` rather than
+re-deriving them. `livenessScope` still cannot express this state (its `Empty()`
+is derived from the same `membersLocked()` as its `Members()`), which is why no
+pre-existing test caught the defect.
+
+| Test | Direction it guards |
+| --- | --- |
+| `TestAIRA140KillScopeKillsALeafEmptySubtreePopulatedRunScope` | the defect: the gate must not re-narrow to `len(pids)==0`; also asserts `Terminate` was NOT called, and that AIRA-126 reads the result as a delivered kill |
+| `TestAIRA140KillScopeStillRefusesToSignalAScopeBothReadsCallEmpty` | the over-correction: the gate must not widen to always-kill, or AIRA-126's not-executed arm silently disappears and its fabrication returns |
+| `TestAIRA140KillScopeTreatsAnUnreadablePopulationAsUnevaluated` | a failed population read is `unevaluated`, with no write attempted and no half-populated result |
+| `TestAIRA140KillScopeKeepsTheTermGraceEscalationForALeafPopulatedScope` | the untouched arm keeps TERM -> grace -> KILL |
+| `TestAIRA140RealCgroupTimeoutKillsARunLivingInAChildCgroup` | the real-cgroup lane: the payload nests a child cgroup, migrates itself in, then `exec sleep 30`; the record AND the kernel are both checked |
+
+**Non-porousness proved by executed revert, not asserted.** `killScope` was
+restored to the leaf-only gate and the suite re-run:
+
+- `TestAIRA140KillScopeKillsALeafEmptySubtreePopulatedRunScope` FAILED --
+  `{Started:false Completed:false Empty:false}`, no `cgroup.kill` written.
+- `TestAIRA140RealCgroupTimeoutKillsARunLivingInAChildCgroup` FAILED --
+  `Launch` returned `U_RUN_RECONCILE_REQUIRED`, the record carried
+  `ScopeKill:{Requested:true Started:false Completed:false}` and
+  `ErrorCodes:[E_RUN_TIMEOUT U_RUN_RECONCILE_REQUIRED]`, and the payload's
+  `sleep 30` was still running afterwards as a real orphan on the box (killed by
+  hand). That is the ticket's defect observed end-to-end, not argued.
+- The three anti-over-correction tests passed in BOTH directions, as intended:
+  they exist to fail on a widening, which the revert is not.
+
+The real-cgroup lane reports `unavailable` (skip, or fatal under
+`AIRA_REAL_CGROUP=1`) rather than degrading into an ordinary leaf-populated
+timeout if the environment cannot nest a cgroup: the payload exits 9 instead of
+sleeping.
+
+### Doc comments corrected
+
+`killConfineScope` and `leafOnlyKillDraft` both described `aira run`'s
+`killScope` as leaf-only in the present tense. Both are now historical notes, so
+neither states something false about current code, and
+`decideTimeoutIntentNotExecuted`'s conjunct comment now says what a
+leaf-empty/subtree-populated scope actually produces (`Started:true`, the
+ordinary killed-by-timeout outcome).
+
+### Evidence
+
+Foreground, exact exit codes, full suite under `AIRA_REAL_CGROUP=1`:
+
+```
+aira confine -- go build ./...                            -> 0
+aira confine -- go vet ./...                              -> 0
+AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1 -> 0
+```
+
+### Accepted gaps
+
+- The nested arm has no SIGTERM grace at all (deliberate, argued above). A job
+  that would have exited cleanly on SIGTERM gets SIGKILL if its pids live in a
+  child cgroup. `Scope` has no recursive terminate, and adding one to buy a
+  grace on this arm is new machinery for no honesty gain; `aira confine`'s
+  deadline already documents the same choice.
+- `ScopeKill.GraceMS` still records the runner's CONFIGURED `termGrace` on every
+  arm, including the nested one where no grace was waited. It is a config
+  echo, not a measurement, and was so before this change; left alone rather
+  than given a second meaning.
+- Contention (a scope repopulating between the two reads) is reasoned about but
+  not reproduced in a test; the outcome in that window is the ordinary
+  killed-by-timeout arm, which is the safe direction.
