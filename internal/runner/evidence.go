@@ -7,6 +7,14 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	if candidate.CgroupScope != "" {
 		base.CgroupScope = candidate.CgroupScope
 	}
+	// AIRA-129. Containment is established once, at launch, and never changes for
+	// the life of a record, so a non-empty candidate value only ever restates the
+	// base's. Carrying it is what keeps the ci-shim marker on the record through
+	// every merge — a terminal candidate assembled after the launch would
+	// otherwise silently drop it and the terminal record would read as real-slice.
+	if candidate.Containment != "" {
+		base.Containment = candidate.Containment
+	}
 	if candidate.Owner != "" {
 		base.Owner = candidate.Owner
 	}
@@ -98,6 +106,15 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 func scopeIntegrityPrecedence(integrity ScopeIntegrity) int {
 	switch integrity {
 	case ScopeContained:
+		return 1
+	// AIRA-129. ScopeAdvisory shares ScopeContained's precedence, and the reason
+	// is that it is the same KIND of value: established once at launch, never
+	// upgraded, and never in competition with any other verdict — the ci-shim
+	// path produces no other, and the real path produces this one never. Sharing
+	// the floor means an empty base is still upgraded to it (0 -> 1), which is
+	// what keeps a merge from silently dropping the marker, while no real-path
+	// verdict can be displaced by it.
+	case ScopeAdvisory:
 		return 1
 	case ScopeHandoffUnverified:
 		return 2

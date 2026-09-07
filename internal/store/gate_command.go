@@ -236,8 +236,19 @@ func allOutputsComplete(record runner.RunRecord) bool {
 // States that evidence a real integrity failure (a descendant killed at teardown
 // or witnessed escaping, leader migration, a handoff never verified) stay
 // inadmissible: the run was not clean.
+//
+// AIRA-129 adds ScopeAdvisory on the same argument, one step further out. A
+// ci-shim run has no cgroup scope at all, so it evidences no integrity FAILURE
+// either — it evidences the absence of the mechanism, which the record states in
+// its own containment facet. The two facts this verdict actually rests on, the
+// leader's exit code and a completely-captured output, are established in ci-shim
+// mode exactly as they are on the real path. Refusing it would make every gate on
+// a shim box report U_GATE_COMMAND_RUN_UNEVALUATED — a permanent unevaluated in
+// the one deployment shape (a CI container) that AIRA-121 exists to serve — while
+// adding no honesty, because nothing on this path ever claimed containment.
 func admissibleScopeIntegrity(integrity runner.ScopeIntegrity) bool {
-	return integrity == runner.ScopeContained || integrity == runner.ScopeUnverified
+	return integrity == runner.ScopeContained || integrity == runner.ScopeUnverified ||
+		integrity == runner.ScopeAdvisory
 }
 
 // admissibleCommandRun deliberately does not delegate to CleanSuccess: command

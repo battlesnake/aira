@@ -48,6 +48,33 @@ func TestCommandAdmissibilityRejectsIncompleteEvidenceBeforeParsing(t *testing.T
 	}
 }
 
+// verifies: AIRA-129 — a ci-shim run record is admissible evidence for a command
+// gate, and an integrity FAILURE still is not.
+//
+// The second half is what stops the first from being a blanket relaxation: only
+// the advisory value was added, and every state that evidences a real integrity
+// failure must still be refused. Verified by reverting admissibleScopeIntegrity
+// to its two-value form, which fails the advisory row.
+func TestCommandAdmissibilityAcceptsAdvisoryContainmentButNotIntegrityFailures(t *testing.T) {
+	zero := 0
+	record := completeCommandRecord(zero)
+	record.ScopeIntegrity = runner.ScopeAdvisory
+	record.Containment = runner.ConfineContainmentAdvisory
+	if admissible, clean, code := admissibleCommandRun(record); !admissible || !clean || code != "" {
+		t.Fatalf("a clean ci-shim run must be admissible: %v/%v/%q", admissible, clean, code)
+	}
+	for _, integrity := range []runner.ScopeIntegrity{
+		runner.ScopeHandoffUnverified, runner.ScopeMigrated,
+		runner.ScopeDescendantKilled, runner.ScopeDescendantEscaped,
+	} {
+		failing := completeCommandRecord(zero)
+		failing.ScopeIntegrity = integrity
+		if admissible, _, code := admissibleCommandRun(failing); admissible || code != "U_GATE_COMMAND_RUN_UNEVALUATED" {
+			t.Fatalf("%s was admitted: %v/%q", integrity, admissible, code)
+		}
+	}
+}
+
 func TestCommandAdmissibilityClassifiesCleanNonzeroAsFailure(t *testing.T) {
 	exit := 7
 	record := completeCommandRecord(exit)

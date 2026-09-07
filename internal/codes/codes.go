@@ -210,6 +210,19 @@ var ExitCodes = map[string]int{
 	// "the budget was fine"; it is always "AIRA did not enforce what you asked
 	// for", which is why it exits 3 rather than 0.
 	"U_RUN_CPU_BUDGET_UNENFORCED": 3,
+	// AIRA-129. U_RUN_SCOPE_CAP_UNENFORCED says a per-run `--memory-max` (and any
+	// paired `--memory-high`) was REQUESTED and no kernel wrote it, because the
+	// launch ran in ci-shim mode where there is no cgroup to write it to.
+	//
+	// It is a REPORT, not a refusal, and that is the AIRA-121 rule it inherits:
+	// the resource flags parse and run in shim mode rather than rejecting a
+	// container's whole invocation. But a requested bound AIRA did not apply can
+	// never be silently dropped — the operator asked the kernel to stop the job at
+	// N bytes and nothing will — so the request survives in the record as this
+	// code, exits 3 like every other "you asked for something AIRA could not
+	// assert", and scope_memory_max stays unevaluated rather than being echoed
+	// back as though it had been enforced.
+	"U_RUN_SCOPE_CAP_UNENFORCED": 3,
 	// AIRA-107 decided all three, which had sat at the default.
 	//
 	// E_RUN_RECONCILE_REQUIRED is the runner analogue of E_RECONCILE_REQUIRED (4)
