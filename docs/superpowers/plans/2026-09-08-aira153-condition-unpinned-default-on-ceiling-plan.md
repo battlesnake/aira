@@ -207,10 +207,13 @@ must not read this ticket as a reversal:
   slice the request entered empty. Broken, but occasionally worked.
 - **after AIRA-151:** that clamp applies only where the escalation determined the
   value. Stated exactly rather than as "never": the escalation determines it only
-  when `1.5 × MaxOOMPeak > 4294967296`, i.e. `MaxOOMPeak > 2863311530`, which on
-  a slice whose ceiling is under 4 GiB requires the job to have already been
-  OOM-killed above ~2.67 GiB — reachable on a 3–4 GiB slice, and impossible on
-  anything smaller than 2.67 GiB. So for the small slices this ticket is about
+  when `MaxOOMPeak + MaxOOMPeak/2 > 4294967296` in integer arithmetic, i.e.
+  `MaxOOMPeak >= 2863311532` — `2863311531` is AIRA-151 §3.2's exact TIE
+  (`2863311531 + 1431655765 = 4294967296`), which its strict `>` deliberately
+  does not treat as an escalation. That requires the job to have already been
+  OOM-killed above ~2.67 GiB, which is reachable on a 3–4 GiB slice and
+  impossible on anything whose ceiling is smaller. So for the small slices this
+  ticket is about
   the hint is returned unclamped and refused terminally, every time; on the
   narrow 3–4 GiB band the clamp still fires and the request waits on AIRA-150's
   residual band instead. Both outcomes are the same defect.
