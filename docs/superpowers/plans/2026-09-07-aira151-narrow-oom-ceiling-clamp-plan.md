@@ -1,7 +1,16 @@
 # AIRA-151 — the OOM ceiling clamp applies only where the escalation determined the value
 
-Status: **plan revision 1 — written for the plan gate. No implementation has
-begun; this commit adds only this document.**
+Status: **plan revision 2 — the documentation-only fix round the plan gate
+required. No implementation has begun; this commit changes only this document.**
+
+Revision 2 changes **nothing** about the direction, §3.1's code change, the
+invariants I1–I8, the population (§1.2), the fixture analysis (§1.3) or the test
+plan. Both gate lineages verified the design from source and neither asked for it
+to move. What they refused was the *document*: §2.3 understated the accepted
+cost, R5 reached a correct conclusion by an obsolete route, §3.5/G3 and §10 Q2
+inherited that stale premise, §3.6 mis-described a paragraph, and two figures
+(one byte-exact constant, one count) were wrong. The five required edits, and the
+one optional one, are recorded at §11 with where each landed.
 
 This changes SIZING on the machine-wide admission gate every `aira confine` job
 on this box passes through, so it is the full two-loop per `CLAUDE.md`, not the
@@ -59,8 +68,15 @@ Every line below was read fresh in this worktree at `16b9141` (== `origin/master
 | the too-large refusal happens **before** `enqueueResolvedConfineAdmit`, so nothing is charged, no waiter exists, and no scope is created | `admit.go:1903-1907` | yes |
 | a second, race-free ceiling check under `queue.mu` re-refuses `E_ADMIT_TOO_LARGE` at enqueue time | `admit.go:2054-2056` | yes — unreachable for the affected population after this change, which is refused one call earlier |
 | the grant gate is `waiter.reserve > available` with `available = checkedAvailable(current, effectiveMaximum, reclaimable, outstanding+adopted, admitSliceHeadroom(outstanding+adopted+1))` | `admit.go:2459-2461`, `:2484` | yes |
-| `checkedAvailable` charges `max(current - reclaimable, outstanding+adopted)` against `maximum - headroom` and returns 0 when the charge reaches the ceiling | `admit.go:2622-2639` | yes — **so a reserve equal to the ceiling is grantable only while that charge is byte-exact zero** (AIRA-150) |
-| `reclaimable` is the file-LRU total, not slab | `admit.go:3106-3122`, `:3151-3161` | yes — so the zero-charge condition is `current - file_lru <= 0`, not `current == 0` |
+| `checkedAvailable` charges `max(current - reclaimable, outstanding+adopted)` against `effectiveMaximum - headroom` and returns 0 once the charge reaches that ceiling | `admit.go:2622-2639` | yes |
+| the ENTRY ceiling and the EVALUATOR ceiling are computed from **different job counts**: entry uses `admitSliceHeadroom(admitOutstandingJobs(path)+1)`, and `admitOutstandingJobs` reads `queue.outstandingJobs` **only** — adopted jobs are excluded; the evaluator uses `admitSliceHeadroom(outstandingJobs + adoptedJobs + 1)` | `admit.go:1894-1896` + `:1276-1288` vs `:2459-2461` | yes — **this asymmetry is why "grantable only at byte-exact-zero charge" is too strong**; §2.3 derives the real inequality |
+| `admitSliceHeadroom(n) = base + n × perJob`, with production defaults `base = 2 << 30` and `perJob = 64 << 20` (64 MiB); the AIRA-139/AIRA-149 fixtures override them to 32 MiB / 8 MiB | `admit.go:1079-1089`, `:49-50`; `admit_saturated_diagnosis_test.go:41-42`, `confine_oom_selfheal_real_cgroup_linux_test.go:174-175` | yes — **the production per-job term is 64 MiB, eight times the fixture's**, which is what makes §2.3's residual band material rather than a knife edge |
+| `reclaimable` is the file-LRU total, not slab | `admit.go:3106-3122`, `:3151-3161` | yes — so the charge term is `current - file_lru`, not `current` |
+| ci-shim mode reports **no peak-RSS and no OOM at all**, by AIRA-121 gate condition C10, so nothing from a shim run ever enters the per-signature estimator; `reportConfinePeak` is wired only on the real path and has zero references in the shim file | `internal/runner/confine_shim_linux.go:469-484`; `confine_linux.go:239` vs `admission_linux.go:768` | yes — **so `stats.OOMCount > 0` is unreachable for a shim signature and the OOM branch cannot execute there** (R5) |
+| the normal shim ledger carries a REAL finite budget (own-cgroup `memory.max`, a declared `--memory-max`, or MemTotal), routinely BELOW the 4 GiB unpinned default; the `cap_minus_headroom = 0` state its comments describe is the failure AIRA-121 F1/F3 **fixed**, written in the past tense | `internal/daemon/shim.go:139-201` | yes — **so the "ceiling 0 makes the population unsatisfiable" premise revision 1 used is dead**; R5 and G3 are rewritten off it |
+| an unpinned request on a sub-4 GiB shim budget with **no** OOM history is ALREADY refused terminally today: `fallback:no-history` (or `:insufficient-samples`) returns the client's own 4 GiB, which `admit.go:1903` refuses | `admit.go:1703-1718` → `:1903` | yes — so this ticket changes nothing in shim mode, in either direction |
+| shim case 3 (booked-reserve-only) reports `current = 0, reclaimable = 0` deterministically | `shim.go:174-197` | yes — noted as a forward caution in R5: if shim history ever fed the estimator, §2.3's "residual charge" term would be zero by construction |
+| `--delegate-ram` pins by the `reserve <= 0` arm of `ResolveConfineReserve`, and that derivation is ALREADY pinned by a shipped test row | `internal/runner/confine.go:103-119`; `confine_reserve_resolution_linux_test.go:176-178` (`MemoryReserve: -1, DelegateRAM: true` → `wantPinned: true`) | yes — the identical `reserve <= 0` path a bare `ConfineRequest{DelegateRAM: true}` takes; §7.3 records it as covered rather than adding a row |
 | the resolved reserve **becomes a non-delegate job's own hard scope `memory.max`** when no `--memory-max` and no declared reserve was given | `internal/runner/confine_linux.go:966-967`, `:978-979`; the rule is stated at `internal/daemon/sliceceiling.go:27-33` | yes — so the clamp's output is kernel-enforced containment, not only an accounting figure |
 | the throttled ceiling is deliberately NOT applied to the clamp or to the terminal boundary | `admit.go:2413-2417`, `sliceceiling.go:27-40` | yes — untouched here; `TestSliceCeilingDoesNotReachTheOOMEscalationClamp` pins it |
 | the too-large operator message is `fmt.Sprintf("%s: required=%d cap_minus_headroom=%d basis=%s", …)` — raw byte counts, and it names **no escape hatch** | `admit.go:2799-2801` | yes — see §3.5 and R2; the AIRA-149 saturated sentence *does* name one |
@@ -98,10 +114,12 @@ E_ADMIT_TOO_LARGE: required=4294967296 cap_minus_headroom=1031798784 basis=fallb
 ```
 
 And what it gets **today**, from AIRA-150's measurement: the reserve is placed
-exactly on the ceiling, the grant gate then needs `max(current - reclaimable,
-outstanding + adopted) == 0`, and with `current = 4096, reclaimable = 0` it was
-refused for **107 consecutive evaluator passes (~30 s)** before timing out into
-AIRA-149's saturated sentence.
+exactly on the ceiling, and the grant gate then needs the slice's charge to fall
+inside §2.3's residual band — which in that fixture, entered with **nothing
+outstanding**, collapses to `max(current - reclaimable, outstanding + adopted)
+== 0`. With `current = 4096, reclaimable = 0` it was refused for **107
+consecutive evaluator passes (~30 s)** before timing out into AIRA-149's
+saturated sentence.
 
 ### 0.2 The two rows, named unambiguously
 
@@ -158,10 +176,10 @@ treated differently solely because one of them also carries an OOM record:
 - **without an OOM record** → `admit.go:1697-1699` returns the estimate
   unclamped → `admit.go:1903` refuses terminally with `E_ADMIT_TOO_LARGE`,
   naming `required`, `cap_minus_headroom` and the basis;
-- **with an OOM record** → the clamp cuts the value to exactly the ceiling → the
-  request is admissible but, per AIRA-150, grantable only while the slice's
-  charge is byte-exact zero → it almost always waits out its whole window and is
-  then refused anyway, with a longer message and 30 s later.
+- **with an OOM record** → the clamp cuts the value to exactly the entry ceiling
+  → the request is admissible but, per AIRA-150, grantable only while the slice's
+  charge stays inside §2.3.1's narrow residual band → it usually waits out its
+  whole window and is then refused anyway, with a longer message and 30 s later.
 
 The OOM record makes the outcome *worse*, on the self-heal path, which is the
 path the escalation exists to serve.
@@ -182,8 +200,26 @@ post-block fallback, and every row where the escalation won are untouched.
 
 Because the clamp sets `reserve = ceiling` **exactly**, this population is
 precisely AIRA-150's population: today every one of these requests is admitted
-with a reserve equal to the ceiling and is then grantable only while
-`max(current - reclaimable, outstanding + adopted) == 0`.
+with a reserve equal to the *entry* ceiling, and is then grantable only inside the
+narrow residual band §2.3 derives — which is byte-exact-zero charge whenever the
+request entered a slice with no outstanding jobs, and a small multiple of the
+per-job headroom term otherwise.
+
+Two derivations that must not be inferred, and are established from source in §0
+instead:
+
+- **Pinned and `--delegate-ram` requests never reach the clamp**, because
+  `ResolveConfineReserve` (`confine.go:103-119`) sets `pinned = true` for a
+  declared `--memory-reserve`, for `--memory-max` (`ScopeMemoryMax > 0`) and for
+  `--delegate-ram` (via the `reserve <= 0` arm, which takes the 512 MiB pinned
+  overhead), and `admit.go:1609-1611` returns `pinned:client` at the first line.
+  The delegate-ram half of that is not an assumption: it is pinned by a shipped
+  test row, `confine_reserve_resolution_linux_test.go:176-178`, which drives the
+  identical `reserve <= 0` path and asserts `wantPinned: true` (§7.3).
+- **ci-shim mode cannot reach this branch at all**, because AIRA-121 gate
+  condition C10 reports no peak-RSS and no OOM from a shim run, so a shim
+  signature never carries `OOMCount > 0`. R5 states this and the shim-specific
+  caution that goes with it.
 
 ### 1.3 The AIRA-128 real-cgroup fixture does **not** exercise this — verified, not assumed
 
@@ -248,60 +284,126 @@ resolved value smaller, not by changing what the clamp does.
 
 The ticket states the cost as "it converts an occasionally-grantable wait into a
 CERTAIN terminal refusal for a job … which today can still be granted on a quiet
-slice". That is the right shape but too generous by construction, and a sizing
-change on shared infrastructure deserves the exact figure rather than the
-comfortable one. Derived from `checkedAvailable` (`admit.go:2622-2639`) and the
-evaluator (`:2459-2484`):
+slice". That is the right shape but not the exact figure, and a sizing change on
+shared infrastructure deserves the exact figure rather than the comfortable one.
+**Revision 1 of this plan gave a figure that was too small in the direction that
+understates what is given up, and both gate lineages refused it. This is the
+re-derivation.**
+
+#### 2.3.1 The exact grant condition, derived
 
 Every request in §1.2's population is, today, resolved to a reserve **exactly
-equal to the request-entry ceiling**. Such a reserve is granted if and only if,
-on some evaluator pass:
+equal to the request-ENTRY ceiling**. Write the two ceilings out, because they
+are not the same expression and that is the whole correction:
 
-1. `max(current - reclaimable, outstanding + adopted) == 0` — the slice's
-   non-file-reclaimable charge is byte-exact zero and nothing else is booked; and
-2. `outstanding + adopted == 0` — otherwise the evaluator's own headroom
-   (`admitSliceHeadroom(outstanding + adopted + 1)`) exceeds the entry headroom
-   and the evaluator's ceiling is strictly below the reserve; and
-3. no AIRA-103 throttle is published — otherwise `effectiveMaximum < maximum` and
-   the same inequality bites.
+```
+entry      (admit.go:1894-1896, admitOutstandingJobs at :1276-1288)
+  J_entry   = queue.outstandingJobs at arrival        # ADOPTED JOBS EXCLUDED
+  ceiling   = maximum - ( base + (J_entry + 1) * perJob )
 
-So the availability this change gives up is exactly: **the grant that happens
-only on a byte-exactly-idle, unthrottled, otherwise-empty slice.** It is not "a
-quiet slice" — one residual 4 KiB anonymous page is enough to close it, which is
-what AIRA-150 measured (107 consecutive refusals, ~30 s, `current = 4096`) and
-what made AIRA-139 a flake: the same fixture passed when a poll happened to read
-`current = 0` and hung when it read `4096`.
+evaluator  (admit.go:2459-2461, :2484; checkedAvailable at :2622-2639)
+  J_eval    = outstandingJobs_now + adoptedJobs_now + 1     # adopted INCLUDED
+  charge    = max( current - reclaimable , outstanding + adopted )
+  available = ( effectiveMaximum - ( base + J_eval * perJob ) ) - charge   # floored at 0
+  granted  iff  reserve <= available
+```
 
-Where that window is genuinely open, and where it is not:
+Substituting `reserve = ceiling` and cancelling `base`, the request is granted on
+some evaluator pass iff
 
-- **The production 64 GiB `aira.slice`:** the window is closed in practice. The
-  slice carries live jobs and residual charge essentially always, and reaching
-  §1.2's population there needs an ordinary estimate above ~62 GiB (peak history
-  above ~54 GiB) with an OOM peak below ~41 GiB. Today such a request waits its
-  whole window and is refused; after this change it is refused immediately, with
-  both numbers. **No availability is lost on production.**
-- **A small or fixture slice** (a CI slice, a shim-configured ceiling, a test
-  fixture, a small `aira.slice` install): the window is open exactly when the
-  slice is idle, which for a freshly created fixture slice is common — this is
-  the case AIRA-139 measured as a coin flip. Here the change is real: an unpinned
-  job whose signature carries an OOM record and whose resolved reserve exceeds
-  the ceiling now **cannot run at all** without `--memory-reserve` /
+```
+charge  <=  (effectiveMaximum - maximum)
+            + perJob * ( J_entry - outstandingJobs_now - adoptedJobs_now )
+```
+
+Three consequences, each of which revision 1 got wrong or omitted:
+
+1. **The "byte-exact zero" reading is the special case `J_entry == 0`.** It is
+   correct only for a request that entered a slice with nothing outstanding —
+   which is exactly the AIRA-139/AIRA-149 fixture shape, and is why the wrong
+   generalisation survived revision 1. A request that entered *behind* N
+   outstanding jobs which have since drained is grantable while carrying up to
+   `N * perJob` of residual non-reclaimable charge.
+2. **On production `perJob` is 64 MiB, not the fixture's 8 MiB**
+   (`admit.go:50` `admitSliceHeadroomSupervisorDefault = 64 << 20`; base 2 GiB at
+   `:49`). So on a slice a request entered behind twelve outstanding jobs, the
+   residual band is up to ~768 MiB of charge — **that is not a knife edge**, and
+   describing it as one was the understatement.
+3. **The AIRA-103 throttle term subtracts directly.** `effectiveMaximum <
+   maximum` while a throttle is published, so a throttle shrinks the band by the
+   full published amount and can close it outright. Revision 1 had this right and
+   it is unchanged.
+
+The adopted term is asymmetric and worth naming on its own: adopted jobs are
+excluded from the entry ceiling but charged at evaluation, so an adoption that
+lands between arrival and the pass makes the band *smaller* than it was at
+arrival, never larger.
+
+#### 2.3.2 The three environments, re-derived from that inequality
+
+- **The production 64 GiB `aira.slice`:** the conclusion of revision 1 survives,
+  but for a different and stronger reason than the one it gave. The band is
+  **not** vanishing there — it is up to `perJob * J_entry` = 64 MiB per job the
+  request entered behind, which on a busy slice is hundreds of MiB. What closes
+  production is the **population**, not the band: reaching §1.2 on a 64 GiB slice
+  needs an unpinned resolved reserve above the ~62 GiB ceiling — an ordinary
+  estimate over ~62 GiB (peak history above ~54 GiB) or the 4 GiB default over a
+  62 GiB ceiling, the latter impossible — *and* an OOM peak below that ceiling.
+  That set is essentially empty. **No availability is lost on production because
+  essentially no production request is in the population, not because the grant
+  window there is shut.**
+- **A small or fixture slice** (a CI slice, a test fixture, a small `aira.slice`
+  install): here the population is easy to reach — every unpinned request on a
+  slice smaller than 4 GiB whose signature carries an OOM record — and the band
+  is open whenever the slice is quiet at the entry count the request arrived
+  under. For a freshly created fixture slice (`J_entry == 0`) that reduces to the
+  byte-exact-zero case AIRA-139 measured as a coin flip. Here the change is real:
+  such a job now **cannot run at all** without `--memory-reserve` /
   `--memory-max`, where today it sometimes could.
 - **The sharpest form of that**, stated plainly rather than buried: on a slice
   whose ceiling is below the 4 GiB unpinned default, AIRA-128's cold-start
   self-heal (`terminated-by=oom` → "re-run the identical command") stops working
-  for that command. Today the re-run is admitted iff the slice reads byte-exactly
-  idle at some pass; after this change it is refused terminally every time until
-  the operator pins a reserve. That is a genuine regression in that environment,
-  and it is accepted because the alternative it replaces is a 30-second wait that
-  ends in a refusal anyway on any slice that is not idle, because the first run
-  of a *novel* command on such a slice is **already** refused terminally by the
-  identical `reserve > ceiling` boundary (AIRA-153), and because the underlying
-  fault is the unconditioned default, not the clamp (§3.7).
+  for that command. Today the re-run is admitted iff the slice's charge falls
+  inside the band at some pass; after this change it is refused terminally every
+  time until the operator pins a reserve. That is a genuine regression in that
+  environment, and it is accepted because the alternative it replaces is a
+  30-second wait that ends in a refusal anyway on any slice outside the band,
+  because the first run of a *novel* command on such a slice is **already**
+  refused terminally by the identical `reserve > ceiling` boundary (AIRA-153),
+  and because the underlying fault is the unconditioned default, not the clamp
+  (§3.7).
+
+#### 2.3.3 The transient-boundary cost, which revision 1 omitted entirely
+
+The entry ceiling is **itself** a function of how many jobs happened to be
+outstanding when the request arrived: it moves by `perJob` — 64 MiB on production
+— for each one. So a request whose unclamped reserve falls inside that moving
+band gets a *different answer depending on the slice's momentary occupancy at
+arrival*, and after this change that answer is a **terminal**
+`E_ADMIT_TOO_LARGE` whose `cap_minus_headroom` is a transient rather than a
+property of the request.
+
+This matters because of what the agent guide already says. `skill.go:323` tells
+agents that `too_large` "means the request itself cannot be satisfied as written,
+so change the reserve or the wait rather than retrying it unchanged" — correct
+advice for a genuinely oversized request, and misleading for one that was 64 MiB
+over a ceiling that will be 64 MiB higher once a neighbour finishes. Today that
+request is clamped and can be granted after the drain; after this change it is
+refused with advice not to retry.
+
+This is **already true of the no-OOM path** — the identical `reserve > ceiling`
+boundary at `admit.go:1903` refuses an ordinary estimate the same way, against
+the same transient ceiling — so the change does not invent the defect. It is
+**new for the OOM path**, and it is named here rather than discovered later. The
+mitigation available in this ticket is one sentence of guide text (§3.6), which
+is written to *reinforce* `skill.go:323` rather than contradict it: pin at or
+below the printed `cap_minus_headroom`, or run where the slice is larger. A
+message that distinguishes a transient ceiling from a permanent one is G3's
+business, not this ticket's.
 
 Two costs the change **removes**, for completeness of the ledger:
 
-- A job that wins today's byte-exact-zero window is granted a scope
+- A job that wins today's residual band is granted a scope
   `memory.max` equal to the **whole slice ceiling** (`confine_linux.go:978-979`)
   — a job that just OOM-killed at 56 MiB gets the entire slice as its own hard
   cap. That stops happening.
@@ -347,9 +449,11 @@ if escalated > reserve {
     // path already refuses an over-ceiling value terminally with
     // E_ADMIT_TOO_LARGE (admit.go:1903), naming both numbers, and an OOM record
     // must not make the same number behave differently. A clamped reserve is
-    // exactly the ceiling, and a reserve exactly on the ceiling is grantable only
-    // while the slice's own charge reads byte-exact zero (AIRA-150), so what the
-    // clamp bought those rows was a wait that almost never ends, not a run.
+    // exactly the ENTRY ceiling, and such a reserve is grantable only while the
+    // slice's charge stays inside a band of one per-job headroom term per job the
+    // request entered behind -- byte-exact zero when it entered an empty slice
+    // (AIRA-150) -- so what the clamp bought those rows was usually a wait that
+    // ends in a refusal anyway, not a run.
     if stats.MaxOOMPeak < ceiling && reserve > ceiling {
         reserve = ceiling
         oomBasis += ",ceiling-clamped"
@@ -442,16 +546,26 @@ Both numbers and the basis are there; the escape hatch is not, and the figures
 are raw bytes rather than `FormatConfineBytes` renderings.
 
 **This plan does not change that message**, and the reason is not scope
-squeamishness. The string is shared with every other `E_ADMIT_TOO_LARGE` — a
-pinned request that asked for more than the slice holds (where "pin
-`--memory-reserve`" is the wrong advice, since the operator already did), and
-ci-shim mode, which answers `cap_minus_headroom=0` for a mis-sized container's
-entire life (`shim.go:161`, `:186`; `install/mode.go:134-152`), where "pin at or
-below 0B" is not advice at all. Making the clause correct for all three needs a
-case analysis inside a message renderer, which is machinery this ticket has no
-business adding on top of a sizing change. It is filed as **G3** with the exact
-strings and the ci-shim complication, and T5 pins the message this ticket
-actually routes traffic onto so the follow-up starts from evidence.
+squeamishness. The string is shared with every other `E_ADMIT_TOO_LARGE`,
+including a **pinned** request that asked for more than the slice holds — where
+"pin `--memory-reserve`" is precisely the wrong advice, since the operator
+already did, and the honest advice is the opposite one (lower it, or run
+elsewhere). A second case, added in revision 2 from §2.3.3, is a request whose
+`cap_minus_headroom` is a **transient**: the entry ceiling moves by 64 MiB per
+outstanding job at arrival, so an escape-hatch clause must not tell an operator
+the number is a property of the slice when it is a property of the moment.
+Making one clause correct for all three needs a case analysis inside a message
+renderer, which is machinery this ticket has no business adding on top of a
+sizing change. It is filed as **G3** with the exact strings and both
+complications, and T5 pins the message this ticket actually routes traffic onto
+so the follow-up starts from evidence.
+
+*(Revision 1 justified this partly on ci-shim mode "answering
+`cap_minus_headroom=0` for a mis-sized container's entire life". That premise is
+dead: the two comment blocks it cited — `shim.go:161`, `:186` — describe, in the
+past tense, the failure AIRA-121 F1/F3 **fixed**. The clause is removed rather
+than restated, so G3's successor does not start from a false constraint. The
+pinned-request reason stands on its own and is sufficient.)*
 
 **What this plan does do instead** is fix the actionability where it costs one
 sentence and no branching: the generated agent guide (§3.6). The guide is this
@@ -462,21 +576,41 @@ terminal refusal.
 
 ### 3.6 The agent guide
 
-`internal/core/skill.go:324` currently ends its self-heal paragraph with "A
+`internal/core/skill.go:324`'s self-heal paragraph contains the sentence "A
 trailing `,ceiling-clamped` means the slice's admission ceiling cut the result
-down." After this change that sentence is still true but incomplete in the one
-place it matters: it does not say what happens when the ceiling cannot
+down." That sentence is **mid-paragraph**, not its ending: it is followed by "So
+an OOM token in the basis is the proof the kill was attributed to this command's
+own signature…" and then by the paragraph's actual conclusion, "So the response
+to `terminated-by=oom` on a first run is to RE-RUN the identical command". *(A
+placement claim revision 1 got wrong, and it matters, because the new clause has
+to sit between the `,ceiling-clamped` sentence and that "RE-RUN" advice — the
+exact advice it qualifies.)*
+
+After this change the `,ceiling-clamped` sentence is still true but incomplete in
+the one place it matters: it does not say what happens when the ceiling cannot
 accommodate the number at all, which is now a terminal refusal rather than a
-wait. One clause is added, in the same paragraph, saying:
+wait, and the paragraph then tells the agent to re-run. One clause is added,
+immediately after that sentence and before the "So an OOM token…" sentence,
+saying:
 
 - `,ceiling-clamped` appears only on the escalated value — the slice ceiling caps
   how far the OOM escalation may climb;
 - when the reserve the daemon resolves is above the ceiling and did **not** come
   from the escalation, the run is refused immediately with `E_ADMIT_TOO_LARGE`
-  naming `required` and `cap_minus_headroom`, instead of waiting;
-- the action is to pin `--memory-reserve` (or `--memory-max`) at or below the
-  printed `cap_minus_headroom`, or to run where the slice is larger — and that on
-  such a slice a re-run alone will not self-heal.
+  naming `required` and `cap_minus_headroom`, instead of waiting — so on a slice
+  that small, the "RE-RUN the identical command" advice below does not
+  self-heal;
+- the action is the one `skill.go:323` already gives for `too_large` — change the
+  request rather than retrying it unchanged: pin `--memory-reserve` (or
+  `--memory-max`) at or below the printed `cap_minus_headroom`, or run where the
+  slice is larger.
+
+The clause is written to **reinforce** `skill.go:323`'s existing `too_large`
+guidance rather than contradict it: 323 says a `too_large` request cannot be
+satisfied as written, and this clause names the one new way an agent can arrive
+there and what to pass instead. It deliberately does **not** tell the agent the
+ceiling might rise if it waits, even though §2.3.3 establishes that it can — that
+distinction needs the message itself to carry it, which is G3.
 
 `skill_test.go`'s existing token pins stay, plus one new pin (T7), so the claim
 cannot rot silently. No other surface's wording changes.
@@ -509,8 +643,8 @@ size; refuse at install time) all remain open and all remain sizing decisions
 needing their own two-loop.
 
 **AIRA-150 is narrowed, not closed.** A resolved reserve exactly equal to the
-ceiling is still grantable only at byte-exact zero charge, and after this change
-three routes still produce one:
+entry ceiling is still grantable only inside §2.3.1's residual band, and after
+this change three routes still produce one:
 
 1. rows (a)/(b) — the escalation determined the value and the clamp cut it to the
    ceiling: **deliberately kept**, since that is the case the clamp's rationale
@@ -579,11 +713,13 @@ classified. R4.
 
 ## 5. Risks
 
-**R1 — availability on a small idle slice.** §2.3 states the exact window this
-closes and the exact environments where it is open. Accepted; it is the owner's
-decision and the ticket's own named counter-argument. Mitigations that exist
-already: `--memory-reserve` and `--memory-max` both pin and bypass resolution
-entirely, and both are named in the guide clause added by §3.6.
+**R1 — availability on a small idle slice.** §2.3.1 states the exact grant
+inequality this closes, §2.3.2 the three environments and where each stands, and
+§2.3.3 the transient-boundary cost that comes with routing traffic onto a
+terminal refusal. Accepted; it is the owner's decision and the ticket's own named
+counter-argument. Mitigations that exist already: `--memory-reserve` and
+`--memory-max` both pin and bypass resolution entirely, and both are named in the
+guide clause added by §3.6.
 
 **R2 — the terminal message is less actionable than the saturated one it
 replaces.** Measured in §3.5, not asserted. Deferred as **G3** with its exact
@@ -613,13 +749,22 @@ unsatisfiable on a 1 GiB slice — hence the fixture slice must grow, not the
 history alone. The plan's choice:
 
 ```
-maximum      1 << 30  ->  4 << 30        (each `const maximum` in the affected tests)
-ceiling      1031798784 -> 4253023744    (= 4 GiB - 32 MiB - 8 MiB, unchanged formula)
+maximum      1 << 30  ->  4 << 30        (the EIGHT `const maximum` declarations named in §9)
+ceiling      1031798784 -> 4253024256    (= 4294967296 - 41943040; 4 GiB - 32 MiB - 8 MiB, unchanged formula)
 MaxOOMPeak   56360960 -> 3758096384      (3.5 GiB; PeakMax likewise, TotalCount/SampleCount 1)
 escalated    5637144576 > 4294967296     -> row (b), escalation determined
-clamp guard  3758096384 < 4253023744     -> fires, reserve = ceiling
+clamp guard  3758096384 < 4253024256     -> fires, reserve = ceiling
 request      runner.DefaultConfineMemoryReserve, UNCHANGED (the production unpinned value)
 ```
+
+*(Revision 1 printed the ceiling as `4253023744`, 512 bytes low — a
+mis-evaluation of the right formula, since the 1 GiB figure `1031798784 =
+1073741824 - 41943040` is correct. Corrected here because this table is presented
+as a byte-exact target the implementer is told not to re-derive. Note also that
+the tests **derive** `run.ceiling` from `maximum` via `subtractFloor(maximum,
+server.admitSliceHeadroom(1))` (`admit_saturated_diagnosis_test.go:120`, `:286`,
+`:631`, `:659`) — so this figure must NOT be pasted into an assertion; it exists
+only so the implementer can check the row-(b) arithmetic holds.)*
 
 `current = 4096` still yields `grantable = ceiling - 4096`; T8b's
 `current = ceiling` still yields a measured 0; the seeded waiters in T12c/T12d
@@ -630,8 +775,8 @@ longer reachable **because this ticket refused it**, and that the fixture now
 drives the row that still clamps — which is itself the executable evidence that
 AIRA-150's systematic route is gone. T4 covers this.
 
-**R4 — the ledger and the AIRA-52 gauge.** Runs that used to be granted in the
-byte-exact-zero window (and to record `estimate:…,oom-on-record,ceiling-clamped`
+**R4 — the ledger and the AIRA-52 gauge.** Runs that used to be granted inside
+§2.3.1's residual band (and to record `estimate:…,oom-on-record,ceiling-clamped`
 or `fallback:…,ceiling-clamped`) no longer happen, and runs that used to end
 `reject:saturated` now end `reject:too-large`. No basis string changes spelling
 and no classifier changes, so no published number moves except by the
@@ -643,9 +788,45 @@ the same direction AIRA-149's R2 established. I8; pinned by the unchanged
 must be corrected (T4b) because four of its ten enumerated strings become
 unreachable while remaining correct as forward-defensive negatives.
 
-**R5 — ci-shim mode.** A shim ledger with `cap_minus_headroom = 0` already
-refuses every request terminally, whatever the clamp does; §1.2's population
-requires `MaxOOMPeak < ceiling`, which is unsatisfiable at ceiling 0. Unaffected.
+**R5 — ci-shim mode.** Unaffected, but **not for the reason revision 1 gave**,
+and the correction matters because the wrong reason would license a real
+regression later.
+
+*The dead premise.* Revision 1 argued that "a shim ledger with
+`cap_minus_headroom = 0` already refuses every request terminally … §1.2's
+population requires `MaxOOMPeak < ceiling`, which is unsatisfiable at ceiling 0".
+That state is one AIRA-121 F1/F3 **deliberately eliminated**. `shim.go:139-201`
+gives the normal shim ledger a real finite budget — the container's own cgroup
+`memory.max`, a declared `--memory-max`, or MemTotal — routinely **below** the
+4 GiB unpinned default, i.e. exactly §1.2's shape. The two comment blocks
+revision 1 cited (`shim.go:161`, `:186`) describe the permanent-zero failure in
+the **past tense**, as the thing that was fixed.
+
+*The actual reason, which is stronger and structural.* **ci-shim mode reports no
+peak-RSS and no OOM at all**, by AIRA-121 gate condition C10
+(`internal/runner/confine_shim_linux.go:469-484`), and `reportConfinePeak` is
+wired only on the real path (`confine_linux.go:239`; zero references in the shim
+file). So `stats.OOMCount > 0` is never true for a shim-mode signature and **the
+entire OOM branch — clamp included — is unreachable there**. Narrowing a branch
+that cannot execute changes nothing.
+
+*And nothing was mitigating shim mode anyway.* An unpinned request on a sub-4 GiB
+shim budget is **already** refused terminally today, on the no-OOM path: with no
+history the resolution falls through `admit.go:1703-1718` to
+`fallback:no-history` (or `fallback:insufficient-samples`) returning the client's
+own 4 GiB, which `admit.go:1903` refuses with `E_ADMIT_TOO_LARGE`. This ticket
+neither creates nor removes that outcome.
+
+*The forward caution, which is the part worth writing down.* Shim **case 3**
+(`shim.go:174-197`, booked-reserve-only) reports `current = 0, reclaimable = 0`
+deterministically. So if the shim seam ever opened — if shim runs began feeding
+peak/OOM history back into the estimator, e.g. by adopting `ru_maxrss` with the
+provenance marker C10 refused for want of a wire field — the OOM branch would
+become reachable there **and** §2.3.1's charge term would be zero by
+construction, so the residual band would be wide open on every such container.
+The cost of this change in that world is not occasional, it is total: every
+small-container OOM signature would move from clamped-and-granted to terminally
+refused. Anyone reopening that seam must revisit AIRA-151 in the same change.
 
 **R6 — mixed daemon/client builds.** `[[aira-not-live-no-compat]]` makes this a
 non-goal, and nothing on the wire changes: the same codes, the same payload
@@ -710,7 +891,7 @@ gap here is deliberate so each id names one thing throughout.)
 
 | Id | What | Why |
 | --- | --- | --- |
-| **T4** | `internal/daemon/admit_saturated_diagnosis_test.go`: `oomClampedHistory()` and the `const maximum` of its ten call sites, per R3's table; and the helper's doc comment rewritten to say the AIRA-149 §0 shape is no longer reachable **because this ticket refuses it**, and that the fixture now drives row (b) | R3. Every assertion in T8/T8b/T9/T10/T11/T12b/T12c/T12d is preserved verbatim; only the two constants and the comment move |
+| **T4** | `internal/daemon/admit_saturated_diagnosis_test.go`: `oomClampedHistory()` and the **eight** `const maximum = int64(1) << 30` declarations that serve its ten call sites (§9 names the exact lines, and the two 8 GiB declarations that must NOT be touched), per R3's table; and the helper's doc comment rewritten to say the AIRA-149 §0 shape is no longer reachable **because this ticket refuses it**, and that the fixture now drives row (b) | R3. Every assertion in T8/T8b/T9/T10/T11/T12b/T12c/T12d is preserved verbatim; only the history helper, those eight constants and the comment move |
 | **T4b** | `internal/store/admission_insight_test.go` `TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation`: the ten strings are **kept**, the comment corrected | Four of them (`estimate:…,oom-on-record,ceiling-clamped`, `estimate:capped,oom-on-record,ceiling-clamped`, `fallback:…,oom-on-record,ceiling-clamped` ×2) become unproducible. They stay as forward-defensive negatives — a regression that re-widens the clamp must not silently move the gauge — but the comment's claim "exactly the strings rows (a)-(e) can produce" would be false and is rewritten to say which are now unreachable and why they are retained |
 | **T4c** | `internal/daemon/admit_oom_basis_test.go` T1 rows `e/measured…` and `e/malformed history clamped to the ceiling` | Those two rows encode the old behaviour. They move to their post-change values/bases (i.e. they become T1's `(e-default)` / `(e-malformed)` rows) with a comment naming AIRA-151. Every other row of that table, and all of T2/T3/T3b, are untouched |
 
@@ -744,6 +925,17 @@ that *should* have objected are known:
   payloads; unaffected.
 - `TestConfineRejectedAdmissionCreatesNoScopeAndStartsNoChild` — the terminal
   refusal still creates nothing.
+- `internal/runner/confine_reserve_resolution_linux_test.go` — the whole
+  `ResolveConfineReserve` table, unedited. **This is where §1.2's "delegate-ram
+  requests are untouched" claim is already pinned**, and it is recorded here as
+  *covered* rather than given a new test row: the row at `:176-178`
+  (`ConfineRequest{MemoryReserve: -1, DelegateRAM: true}` → `wantPinned: true`)
+  drives the identical `reserve <= 0` arm of `confine.go:103-119` that a bare
+  `ConfineRequest{DelegateRAM: true}` takes, so the pin derivation this ticket
+  depends on cannot regress silently. An orthogonal review asked for a new row
+  here; it was checked against source and found already covered, so nothing is
+  added — but if a later change splits that arm, this file is the one that must
+  gain a literal `{DelegateRAM: true}` row.
 
 ### 7.4 Mutation evidence to produce at implement time
 
@@ -800,10 +992,15 @@ updated rather than re-filed.
   now produces one. The design question it names is unchanged and unanswered.
 - **G3 — the `E_ADMIT_TOO_LARGE` message names no escape hatch and prints raw
   bytes.** Filed with §3.5's two strings side by side, with T5's pin as its
-  evidence, and with the reason it is not a one-liner: the message is shared with
-  pinned requests (where "pin it" is wrong) and with ci-shim's permanent
-  `cap_minus_headroom=0` (where "pin at or below 0B" is not advice). Whoever
-  takes it must decide the case analysis deliberately.
+  evidence, and with the two reasons it is not a one-liner: the message is shared
+  with **pinned** requests, where "pin `--memory-reserve`" is wrong advice
+  because the operator already did; and `cap_minus_headroom` is a **transient**
+  on a busy slice (§2.3.3 — the entry ceiling moves by 64 MiB per outstanding job
+  at arrival), so an escape-hatch clause must not present it as a fixed property
+  of the slice. Whoever takes it must decide that case analysis deliberately.
+  **The ci-shim `cap_minus_headroom=0` reason revision 1 filed here is withdrawn**
+  — it describes the state AIRA-121 F1/F3 fixed (R5), and a successor starting
+  from it would be constrained by a condition that no longer exists.
 - **G4 — no real-cgroup test drives the newly-terminal path.** T3 drives it
   deterministically through the real wire path with a stubbed slice reader.
   Reproducing it against a real cgroup needs a slice whose ceiling is below the
@@ -831,7 +1028,7 @@ updated rather than re-filed.
 | `internal/daemon/admit_oom_clamp_scope_test.go` | new — T1, T2 |
 | `internal/daemon/admit_oom_clamp_wire_test.go` | new — T3 |
 | `internal/runner/admission_saturated_message_test.go` | new cases — T5, T6 |
-| `internal/daemon/admit_saturated_diagnosis_test.go` | T4 — `oomClampedHistory()` + ten `const maximum` values + the helper comment (R3) |
+| `internal/daemon/admit_saturated_diagnosis_test.go` | T4 — `oomClampedHistory()` (`:57-63`) + the **eight** `const maximum = int64(1) << 30` declarations at `:241`, `:283`, `:315`, `:344`, `:387`, `:521`, `:549`, `:623` + the helper comment (R3). **Eight declarations, ten call sites**: `:549` serves the subtests at `:553` and `:579`, and `:623` serves those at `:627` and `:655`. **The two 8 GiB declarations must NOT be touched** — `:209` (`TestSaturatedRejectionCarriesTheResolvedReserveAndCeiling`, which uses a non-OOM history) and `:438` (`TestSoloRefusalBesideALeafDrainedScopeReportsContention`, no OOM history); neither calls `oomClampedHistory()` and neither is affected by this ticket |
 | `internal/daemon/admit_oom_basis_test.go` | T4c — the two row-(e) table entries |
 | `internal/store/admission_insight_test.go` | T4b — comment only, strings retained |
 | `internal/core/skill_test.go` | T7 — one new required phrase |
@@ -847,7 +1044,11 @@ MCP/Skill dispatch surface.
 
 ---
 
-## 10. Questions this plan expects the gate to press on
+## 10. Questions this plan expected the gate to press on — and the rulings
+
+All five were pressed and all five are answered. They are kept, with the ruling
+recorded beneath each, because a question deleted after it was answered leaves no
+evidence that it was asked.
 
 1. **Is the tie (`escalated == reserve`) handled right?** §3.2 keeps the strict
    comparison, so an exact tie is treated as "the client's request determined the
@@ -856,13 +1057,20 @@ MCP/Skill dispatch surface.
    there and is defensible, since the number *is* numerically the escalation's.
    The plan's answer is that one condition must govern both the basis and the
    value, and that the tie is production-reachable at exactly
-   `MaxOOMPeak = 2863311531`, so the gate should rule rather than let it be
-   discovered.
+   `MaxOOMPeak = 2863311531`.
+   → **RULED: keep the strict `>`.** Both lineages endorsed it as the
+   data-model-first form — nesting makes "clamped without the escalation having
+   set the value" unrepresentable, and one condition governs both label and value.
+   The tie arithmetic was independently re-run (`2863311531 + 1431655765 =
+   4294967296`) and the production-reachability claim confirmed. Unchanged.
 2. **Should the `E_ADMIT_TOO_LARGE` message move with this ticket?** §3.5 says no
-   and files G3, mitigating with the guide clause; R2 states the cost honestly. A
-   gate that thinks a sizing change may not ship while routing traffic onto a
-   less actionable message should say so now — the fix is a conditional clause,
-   and the ci-shim `cap_minus_headroom=0` case is the reason it needs a decision.
+   and files G3, mitigating with the guide clause; R2 states the cost honestly.
+   → **RULED: defer, with the reasons corrected.** Deferring G3 and mitigating via
+   the agent guide is the right call. But the ci-shim `cap_minus_headroom=0`
+   ground revision 1 gave is **withdrawn** — it describes the state AIRA-121
+   F1/F3 fixed (R5). The reasons that stand are the shared pinned-request case
+   and, added in revision 2, the transient-ceiling case from §2.3.3. §3.5 and G3
+   now say exactly that.
 3. **Is re-basing AIRA-149's facet-2b fixtures onto row (b) the right move, or
    should they move off the OOM branch entirely?** R3 chooses row (b) to keep
    `resolved != requested` and to keep the fixtures in the branch they were
@@ -870,12 +1078,52 @@ MCP/Skill dispatch surface.
    an ordinary estimate that lands on it — is simpler but weakens the fixtures'
    realism. Either way the fixture comment must record that this ticket is why
    they moved.
-4. **Is §2.3's cost quantification complete?** It claims the lost grant window is
-   exactly "byte-exactly idle, unthrottled, nothing outstanding or adopted". The
-   gate should check that against `checkedAvailable` and the evaluator headroom
-   directly rather than against this prose, since the whole availability argument
-   rests on it.
+   → **RULED: row (b), as proposed.** Both lineages re-derived the arithmetic
+   (`3758096384 × 1.5 = 5637144576 > 4294967296` → escalation determined; guard
+   `3758096384 < 4253024256` → still clamps), confirmed `run.ceiling` is derived
+   from `maximum` so every assertion scales, and confirmed the file asserts no
+   resolved basis. The pinned-fixture alternative was rejected for losing
+   `resolved != requested`. R3's ceiling figure is corrected to `4253024256`.
+4. **Is §2.3's cost quantification complete?** Revision 1 claimed the lost grant
+   window was exactly "byte-exactly idle, unthrottled, nothing outstanding or
+   adopted", and asked the gate to check that against `checkedAvailable` and the
+   evaluator headroom directly rather than against the prose.
+   → **RULED: NO — it was not, and §2.3 is re-derived.** The honest answer is the
+   inequality now at §2.3.1: a reserve equal to the entry ceiling is granted iff
+   `charge <= (effectiveMaximum - maximum) + perJob × (J_entry -
+   outstandingJobs_now - adoptedJobs_now)`. Revision 1's condition is the special
+   case `J_entry == 0`, because the entry ceiling excludes adopted jobs and uses
+   `outstandingJobs + 1` while the evaluator uses `outstandingJobs + adoptedJobs
+   + 1`. A request that entered behind N since-drained jobs is grantable with up
+   to `N × perJob` of residual charge, and **production `perJob` is 64 MiB, eight
+   times the fixtures' 8 MiB** — up to ~768 MiB behind twelve jobs, which is not a
+   knife edge. The production conclusion survives, but for a different reason
+   (§2.3.2: the *population* is essentially empty there, not the window shut), and
+   §2.3.3 adds the transient-boundary cost revision 1 omitted altogether.
 5. **Should AIRA-150 be closed by this merge?** The plan says no (§3.7, G1) and
-   names the three residual routes. A gate that reads AIRA-150 as "the systematic
-   case only" may disagree; the honest record either way must state what remains
-   grantable-only-at-zero-charge.
+   names the three residual routes.
+   → **RULED: no, do not close it.** Endorsed by both lineages: the three residual
+   routes are correct and the route this ticket removes is the systematic one.
+   AIRA-150's resolution note records what remains grantable only inside
+   §2.3.1's residual band.
+
+---
+
+## 11. Revision 2 — where each required edit landed
+
+The gate's verdict was *documentation-only*: no change of direction, no change to
+§3.1's code change, to I1–I8, to §1.2's population, to §1.3's fixture analysis or
+to the test plan. Its five required edits, plus the one optional item raised by
+the orthogonal review, are recorded here so the re-check is a diff and not a
+re-gate.
+
+| # | Required edit | Landed in |
+| --- | --- | --- |
+| 1 | Re-derive §2.3 from the real entry-vs-evaluator headroom inequality, with production `perJob = 64 MiB`, and add the transient-boundary cost; answer Q4 in the corrected form | **§2.3.1** (the derivation and its three consequences), **§2.3.2** (the three environments re-derived), **§2.3.3** (the transient boundary and its interaction with `skill.go:323`), **§10 Q4** (the ruling). Knock-ons: the §0 table gains the entry-vs-evaluator and headroom-defaults rows and drops the "byte-exact zero" gloss; §0.1, §1.2, §2.3's removed-costs bullet, §3.1's code comment and §3.7 are re-worded off the same overstatement |
+| 2 | Rewrite R5's reason to AIRA-121 C10 plus the already-terminal no-OOM shim path, with the case-3 caution | **R5**, rewritten in four parts (dead premise named, C10 as the structural reason, the already-terminal no-OOM path, the forward caution about case 3's deterministic zero charge). Grounded by three new §0 table rows |
+| 3 | Drop the stale `cap_minus_headroom=0` clause from §3.5/G3; fix §3.6's paragraph description | **§3.5** (clause removed and explicitly withdrawn; the transient-ceiling reason added in its place), **G3** (same), **§10 Q2** (same), **§3.6** (the `,ceiling-clamped` sentence is mid-paragraph, followed by "So an OOM token…" and the "RE-RUN the identical command" conclusion; the new clause is placed after it and written to reinforce `skill.go:323` rather than contradict it) |
+| 4 | `4253023744` → `4253024256` | **R3's re-basing table**, both occurrences, with the mis-evaluation noted and a warning that the tests derive `run.ceiling` from `maximum` so the figure must not be pasted into an assertion |
+| 5 | "ten `const maximum` values" → **eight** declarations, excluding `:209` and `:438` | **§9's file table** (the eight lines enumerated, the eight-declarations/ten-call-sites mapping stated, and both 8 GiB declarations named as must-not-touch) and **§7.2's T4 row** |
+| opt | Record that the delegate-ram pin derivation is already covered | **§7.3** (a must-stay-green entry for `confine_reserve_resolution_linux_test.go`, naming the `:176-178` row and why no new test is added) and a **§0 table row**. No new test row; the gate downgraded this to optional after confirming the coverage exists |
+
+Nothing else in the document changed. `git diff 26b6ff9` touches only this file.
