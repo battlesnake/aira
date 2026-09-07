@@ -254,3 +254,69 @@ fixed here or left implicit.
   exit 0, every package ok.
 
 All runs under `aira confine`.
+
+## Fable build-review record (2026-09-07) — MERGE
+
+PR #99 merged as `3f318d4` (`--merge`). Reviewed head `1aa6413` against
+`origin/master` (merge-base `f570a35`; master had moved to `52290de` by merge
+time and the merge was clean). Scope from `git show --stat`, not the
+narrative: exactly three files — this ticket, `AIRA-149.md` (new), and
+`internal/daemon/confine_oom_selfheal_real_cgroup_linux_test.go`. No
+production code touched; no `AIRA_DEBUG_ADMIT` instrumentation left behind.
+
+Mechanism verified from source, independently of the PR text:
+
+1. `runner.ResolveConfineReserve` (`confine.go:103`) leaves an unpinned
+   request at `DefaultConfineMemoryReserve` (4 GiB); `resolveAdmitReserve`
+   (`admit.go:1453`) returns pinned requests at its first line, and for one
+   OOM sample `EstimateMemoryReserve` yields no usable estimate, so the OOM
+   branch's `max` keeps 4 GiB and the clamp at `admit.go:1499-1500` pins it
+   to `ceiling` exactly. `admitConnection` passes
+   `ceiling = maximum - admitSliceHeadroom(outstanding+1)` (`admit.go:1701-1709`),
+   which is what the new unit test models. The evaluator grants iff
+   `waiter.reserve <= checkedAvailable(...)` (`admit.go:2246,2263`), i.e.
+   `reserve <= ceiling - max(current - reclaimable, outstanding)`. So a
+   reserve equal to the ceiling needs a byte-exact-zero charge. Arithmetic
+   checks: 1 GiB - 32 MiB - 8 MiB = 1031798784; 6 GiB - 40 MiB = 6400507904;
+   slack 2105540608 >= 335544320.
+2. The instrumented logs under `~/tmp/aira139/` carry exactly those numbers
+   (`reserve=1031798784`, `current=4096`, `reclaimable=0`, `outstanding=0`,
+   `avail=1031794688`; post-fix `ceiling=6400507904`, `reserve=4294967296`
+   unclamped, `admission=immediate`). `run5.log` is the 5/5 at 0.52-0.62s;
+   `pkg-real.log` the 70.0s package run; `ci.log` every package ok.
+3. Non-porousness and causality reproduced, not trusted. In a detached
+   throwaway worktree at `1aa6413` with ONLY `oomSelfHealSliceMax` reverted to
+   `int64(1 << 30)`: `TestOOMSelfHealFixtureStaysOffTheCeilingClamp` FAILS
+   with the exact recorded message (exit 1), and the real-cgroup fixture at
+   `-count=3` reproduces the flake — iteration 1 PASS after a 9.74s wait on
+   the edge, iterations 2 and 3 FAIL `E_ADMIT_SATURATED` at 30.29s/30.44s
+   (exit 1). On the PR head the same `-count=3` is 3/3 PASS at 0.49-0.50s.
+
+Gates run here, exact exit codes, all under `aira confine`:
+`TestOOMSelfHealFixtureStaysOffTheCeilingClamp` + the two referenced
+arithmetic tests — exit 0; real-cgroup fixture `-count=3` — exit 0;
+`AIRA_REAL_CGROUP=1 go test ./internal/daemon/ -count=1` — ok 67.7s, exit 0;
+`go vet ./internal/daemon/` — exit 0; `gofmt -l` on the changed file — clean.
+`aira get` parses both tickets; AIRA-149 collides with nothing on
+`origin/master` or any other remote branch.
+
+Accepted, noted, not blocking:
+
+- The "coin flip / luck, not structure" framing slightly overclaims. The
+  failure MECHANISM (reserve == ceiling, so any residual charge is fatal) is
+  proven, but the data — the builder's `run2`/`run3` and my mutant run alike —
+  shows a reliable order effect: the first fixture slice in a process decays
+  to `current=0`, later ones sit at 4 KiB for the whole wait. WHY the residual
+  is stickier after the first iteration was not identified. It is a non-file
+  charge (`reclaimable` = `inactive_file + active_file` read 0, so not page
+  cache). Not load-bearing: with the derived budget the wait would need a
+  residual above ~2 GiB. Recorded as a named residual rather than a claim.
+- The "renamed file sorts first, `-count=2` PASS" check has no log under
+  `~/tmp/aira139/`; the `-count=3` runs here (iterations 2-3 are "not first
+  in process", the actual trigger) cover the same mechanism.
+- `ci.log` records every package `ok` and no `FAIL`, but no literal exit code
+  line; the daemon package was re-run here as the merge gate.
+- The unit test models the raw `maximum`, not `admitEffectiveMaximum`
+  (`sliceceiling.go:746`, min with the published ceiling snapshot). A fixture
+  slice path has no snapshot, so `effmax == max` in every log; irrelevant
+  here, named so nobody reads the unit test as covering the throttle.
