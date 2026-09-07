@@ -1,31 +1,50 @@
 # AIRA-149 — the OOM-escalation basis names a provenance its number does not have, and the wait it wedges reports a fabricated cause
 
-Status: **plan revision 2 — awaiting plan review and the Fable plan gate**. This
+Status: **plan revision 3 — the Fable plan gate's FAIL findings applied**. This
 touches the machine-wide admission gate every `aira confine` job on this box goes
 through, so it is the full two-loop per `CLAUDE.md`, not the light path. **No
 implementation has begun**; this commit adds only this document.
 
-*Revision 2* is a self-review pass against the source at the same commit. It
-changes no direction and no adopted design; it repairs six places where the plan
-was less rigorous than the honesty rule it is trying to enforce:
+*Revision 3* answers a `GATE: FAIL — one fix round required` whose verdict on the
+**direction was APPROVE**: the diagnosis-only path, the invariants, and the
+value-path analysis were independently verified against source by two reviewers
+and are carried into this revision **unchanged**, as the gate required. What
+failed was the specification of the contention latch (§3.5/I8) and three test
+specs. Eight changes, the first four of which were the gate:
 
-1. **§0** — the ticket's `MaxOOMPeak * 3 / 2` is a paraphrase; the real
-   escalation is overflow-guarded, and the function carries two flags the ticket
-   did not show. Recorded, and the guard pinned by I1.
-2. **§3.1** — rows (c)–(e) hard-coded one estimator spelling where several are
-   reachable. Now stated generically, with the `ConfinePeakHistory` invariant
-   that governs which can actually occur *established from the SQL* rather than
-   assumed.
-3. **§3.4 / T3** — the plan specified a T3 case (`SampleCount == 1` →
-   `…:n=1`) that its **own** scope could not deliver: that path exits at a
-   post-block `return` which never reads the `basis` local. T3 corrected, the
-   scope boundary written down, and T3b added to pin it.
-4. **I8** — an invariant cited twice as "§4.3" and never actually stated. Now
-   stated and tabulated against the evaluator's three refusal sites.
-5. **D4** — its reachability was overstated. Restated at its true reachability.
-6. **D1** — undercounted the defect ("two of four" outcomes mislabelled; it is
-   four of five). Corrected against §3.1's table, along with a stale
-   cross-reference in R2's source row.
+1. **§3.5 / I8 — the latch source was itself a fabricated-diagnosis defect.**
+   Revision 2 derived "was anything else in the way" from the reserve-accounting
+   counters `outstandingJobs`/`adoptedJobs`, which `admit.go:2042-2057` says
+   verbatim must never be used for an emptiness judgement. Rewritten onto the
+   subtree-aware primitive AIRA-101 built for exactly this (`sliceProvablyEmpty`),
+   latched at the disjunct actually taken, with an unestablished reading
+   forbidding `none-observed`. §3.5 (ii).
+2. **T12 would have passed vacuously** over that hole. Respecified onto the
+   scanned-scope population via the existing `leafDrainedRecord` helper, with a
+   scan-failure sibling and an ordinary-disjunct case. §7.2.
+3. **T8 asserted a grantable of 0 that the code does not produce** — in a change
+   whose subject is fabricated numbers. The arithmetic is re-derived here and the
+   figure corrected to `ceiling - 4096`; a separate case pins the genuine zero.
+   §3.5 (iii), §3.6, §7.2.
+4. **T11 was unbuildable through its own mandated wire path** (`admitConnection`
+   never reaches a saturated rejection when the *entry* memory read fails).
+   Respecified with an entry-succeeds/evaluator-fails stub. §7.2.
+5. **R2's AIRA-52 gauge analysis was wrong** — asserted, not read. Restated
+   against `internal/store/admission_insight.go`'s anchored matchers, and pinned
+   by a new T2b so a future unsuffixed return cannot move the gauge population
+   unnoticed. §0, §5.
+6. **The basis grammar was stated but pinned by no test.** T1 gains a `^\S+$`
+   assertion. §7.1.
+7. **The contention lattice is now stated as monotone** (`observed` >
+   `unevaluated` > `none-observed`), and §3.6's claim narrowed by one word
+   (`queued **ahead** of this request`). §3.5, §3.6, F5.
+8. **Citation fixes**: the three refusal-site line numbers, and
+   `ContainerAdvisories` added to §0's consumer enumeration.
+
+*Revision 2* (retained for the record) was a self-review pass that recorded the
+escalation's real overflow guard, established the `ConfinePeakHistory` invariant
+from the SQL, corrected T3's scope boundary and added T3b, stated I8, restated
+D4 at its true reachability, and corrected D1's undercount.
 
 Ticket: `.aira/tickets/AIRA-149.md` (P2, `admission`/`confine`/`honesty`).
 Filed out of AIRA-139 (`19c6bf2`), which removed the flake at fixture level and
@@ -77,15 +96,26 @@ quotations were checked and are current.
 | `validRunnerAdmitRejection` pins only `Basis == "reject:saturated"` for this code | `admission_linux.go:660-661` | yes — extra fields are free |
 | the in-wait progress line "queue position 1 of 1 … 0B queued ahead" | `internal/runner/confine_queue_position_linux.go:168-185` | yes — and it was **honest**; only the terminal message lied (§3.6) |
 | `reserve-basis=` is space-delimited in the trailer, so a basis may contain commas but never spaces | `internal/runner/confine.go:897-900` | yes — existing bases already carry comma params (`estimate:max=%d,n=%d,f=115`) |
-| the evaluator computes `available` *before* the freeze check, and skips it only on the exclusivity `continue` | `admit.go:2240-2246`, `2247-2250` | yes |
+| the evaluator computes `available` *before* the freeze check, and skips it only on the exclusivity `continue` | `admit.go:2244-2246`, `2247-2250` | yes |
 | the evaluator returns early, evaluating nobody, when the slice memory read fails | `admit.go:2157-2168` | yes — a waiter can time out having never been evaluated |
-| `oversubscriptionBlocks` requires `queue.capAggregate > 0`, which requires live scanned scopes | `internal/daemon/admit_oversubscription.go:299-307` | yes — load-bearing for **I8** |
-| the evaluator's three refusal sites are the exclusivity `continue` (`gate.blocks`), the freeze `continue`, and the capacity branch `waiter.reserve > available \|\| overSubscribed` | `admit.go:2235-2238`, `2245-2248`, `2259-2262` | yes — these are exactly the branches §3.5 latches in, and they are the whole set |
-| `queue.outstandingJobs` and `queue.adoptedJobs` are real `sliceQueue` fields under `queue.mu` | `admit.go:619`, `621` | yes — §3.5's rule is written against real field names, not invented ones |
+| `oversubscriptionBlocks` requires `queue.capAggregateKnown && queue.capAggregate > 0` | `internal/daemon/admit_oversubscription.go:299-307` | yes — but **not** sufficient for I8; see the next four rows |
+| the evaluator's three refusal sites are the exclusivity `continue` (`gate.blocks`), the freeze `continue`, and the capacity branch `waiter.reserve > available \|\| overSubscribed` | `admit.go:2240-2243`, `2247-2250`, `2259-2264` (`overSubscribed` computed at `2259`) | yes — these are exactly the branches §3.5 latches in, and they are the whole set. **Revision 2 cited these three as 2235-2238 / 2245-2248 / 2259-2262; the gate caught the drift and they are corrected here** |
+| **`sliceProvablyEmpty(queue)` is the codebase's own emptiness primitive:** `outstandingJobs == 0 && liveScopesKnown && liveScopes == 0` | `admit.go:492-494`, fields at `619`, `621`, `682-683` | yes — this is what §3.5 latches from after the gate's P1 |
+| `liveScopes` is **subtree-aware** (`SubtreePopulated == nil \|\| *SubtreePopulated` → counts as live), computed in the same successful scan | `admit.go:2058-2068` | yes — "unevaluated is NOT empty" is the comment's own rule |
+| `liveScopesKnown` is cleared **fail-closed** the moment a confine scan fails | `admit.go:1963-1970` | yes — and `capAggregateKnown` is cleared beside it, with the *opposite* consequence (the bound withholds nothing) |
+| **the adopted loop skips scopes that are running jobs** — leaf-unpopulated, connection-held, nil/malformed/negative cap, and `delegate && !usableRSS` | `admit.go:2078-2080`, `2081-2083`, `2089-2095`, `2126-2129` | yes — and `admit.go:2042-2057` says **verbatim** why reusing these counters for emptiness is forbidden: "every one of those exclusions is correct for RESERVE accounting and wrong for EMPTINESS, because a skipped scope is still a running job" |
+| `aggregateScopeCap` counts a scanned scope via the subtree-aware `scopeRecordIsLive`, i.e. it sees exactly the scopes the adopted loop skips | `admit_oversubscription.go:184-186`, `225-249` | yes — so `capAggregate > 0` with `adoptedJobs == 0` is a real state, which is half of the gate's P1 |
+| **`admitConnection` reads slice memory at request entry** and, on `!ok`, writes an `unevaluated` **grant** with basis `fallback:slice-unreadable` and returns **without enqueueing** | `admit.go:1690-1700` | yes — so an entry-read failure can never produce `E_ADMIT_SATURATED`; this is what makes revision 2's T11 unbuildable (§7.2) |
+| both memory reads go through the same seam, `s.memoryReader()` | `internal/daemon/shim.go:66-72` | yes — one stub serves entry and evaluator, so T11 must sequence it |
+| the request-entry ceiling is `maximum - admitSliceHeadroom(admitOutstandingJobs(path) + 1)` | `admit.go:1121-1133`, `1701-1703`, `924-934` | yes |
+| the evaluator's per-waiter headroom is `admitSliceHeadroom(outstandingJobs + adoptedJobs + 1)` | `admit.go:2244-2245` | yes — **identical to the entry ceiling when both counters are zero**, which is the T8 shape, and this is what fixes T8's number (§3.5 (iii)) |
+| the AIRA-52 gauge's basis matchers are **`$`-anchored** (`^estimate:max=\d+,n=\d+,f=115$`, `^estimate:oom:max=\d+,n=\d+,oom=\d+,f=115$`) or exact (`sample.Basis == "estimate:capped"`) | `internal/store/admission_insight.go:17-18`, `111-118` | yes — everything else falls to `default:` and is counted `malformedBasis` + `sig.excluded` (`:119-122`), never reaching an adequacy verdict. **Revision 2's R2 asserted the opposite without reading this file** |
+| `estimatePrefixed` is a *separate*, looser helper and is not the classifier's gate | `admission_insight.go:64-66` | yes — it is what revision 2 confused with the matchers |
+| `estimate%` is the SQL predicate for the AIRA-52 gauge population | `internal/runner/estimate_actual.go:47` | yes — the population *selector*; the classifier above is the *verdict* stage. See **R2** |
 | the AIRA-128 fixture's phase 3 is *exactly* the "escalation did not determine the value" case, and its own comment says so | `internal/daemon/confine_oom_selfheal_real_cgroup_linux_test.go:73-85` | yes — "what phase 3 pins is the escalation's ATTRIBUTION … not the escalated VALUE" |
 | that fixture's phase-3 assertion is `ReserveBasis != "estimate:oom-escalated"` → fail | same file, `:256-259`, and the unit twin at `:320-323` | yes |
 | the agent guide sells the label to agents | `internal/core/skill.go:324`; pinned by `internal/core/skill_test.go:644` | yes |
-| `estimate%` is the SQL predicate for the AIRA-52 gauge population | `internal/runner/estimate_actual.go:47` | yes — see **R2** |
+| **the complete set of production basis consumers**, none of them a decision: the trailer's `reserve-basis=` field; `result.Status.ReserveBasis`; `ContainerAdvisories`, which interpolates the string into the nested-container advisory; the `admission_reserve_basis` ledger column; the AIRA-52 gauge | `internal/runner/confine.go:897-900`; `confine_linux.go:692`; `confine_linux.go:1072` → `internal/runner/container.go:504`, `538-543`; `estimate_actual.go:47` | yes — **`ContainerAdvisories` was missing from revision 2's enumeration**, which is a gap in a plan that claims to have enumerated them. It is display-only and unaffected: the basis is concatenated into one advisory line, never parsed |
 
 Measured evidence carried over from the ticket and re-derived against the code
 above (arithmetic checked by hand, not re-run):
@@ -100,6 +130,35 @@ req.reserve=4294967296  ceiling=1031798784
 ```
 
 Neither the escalation nor any estimate appears in that answer.
+
+**And the grantable figure for that same shape, re-derived because revision 2 got
+it wrong.** The gate caught this and it is the plan's own headline number, so it
+is written out in full rather than asserted:
+
+```
+entry (admit.go:1701-1703):  jobs = admitOutstandingJobs(path) = 0
+                             ceiling = maximum - admitSliceHeadroom(0+1)
+evaluator (admit.go:2244-2246):
+                             jobs = clamp(outstandingJobs=0 + adoptedJobs=0) + 1 = 1
+                             headroom = admitSliceHeadroom(1)          <- the SAME headroom
+                             available = checkedAvailable(current=4096, effectiveMaximum=maximum,
+                                                          reclaimable=0, outstanding=0, headroom)
+checkedAvailable (admit.go:2393-2410):
+                             effectiveCurrent = subtractFloor(4096, 0) = 4096
+                             ceiling'         = maximum - headroom      == the entry ceiling
+                             charge           = max(4096, 0) = 4096
+                             4096 < ceiling'  -> return ceiling' - 4096
+refusal: waiter.reserve (= ceiling) > available (= ceiling - 4096)      -> refused, correctly
+```
+
+So the largest grantable reserve at the last evaluation is **`ceiling - 4096`**,
+i.e. `1031794688` = `1007612K` as `FormatConfineBytes` renders it — **not zero**.
+Grantable reaches zero only when `charge >= ceiling`. Revision 2 asserted `0` in
+§3.5 (iii), §3.6 and T8; T8 as written would have been RED against a correct
+implementation, and the only way to make it green would have been to fabricate a
+zero — in a change whose subject is fabricated numbers. Corrected throughout, and
+the genuine-zero case is given its own test (T8b) so the `omitempty` rationale
+still has a pin.
 
 ---
 
@@ -127,8 +186,13 @@ numbers that *is* printed is not the number the decision was made on.
 
 **D3 (facet 2b, part two).** "slice contended, no memory admission within the
 wait" is asserted for every non-exclusive saturated rejection, including one
-where the daemon never observed another job holding or queued. That is a
+where the daemon never observed another job holding or queued ahead. That is a
 manufactured cause.
+
+The fix must not manufacture the *opposite* cause, and revision 2's version did:
+see §3.5 (ii). The replacement claim is only ever printed from a positively
+established reading, and it is deliberately narrower than "the slice was empty"
+(§3.6).
 
 **D4 (small, same function, same class).** `resolveAdmitReserve` discards the
 estimator's own `!ok` basis and substitutes a hardcoded
@@ -211,7 +275,7 @@ justification:
   it refuses fail-closed. What was wrong was the sentence at the end of it.
 - After this change the operator gets, within the wait's own bound, the three
   numbers that fully explain the refusal plus the established statement that
-  nothing else was in the way, and the documented escape hatch
+  nothing else was running or queued ahead of it, and the documented escape hatch
   (`--memory-reserve` / `--memory-max`, both of which pin and bypass resolution
   entirely). That is actionable, which is the whole of the AIRA-71 lesson.
 - Nothing else in this plan can *end* the wedge without changing sizing, and
@@ -381,54 +445,165 @@ headroom`) in scope at the rejection site (`admit.go:1709`, `1703`, read at
 the client's own 4 GiB under the word "reserve".
 
 **(ii) Latch, over the whole wait, whether anything else was ever in the way.**
-Three new fields on `admitWaiter`, written **only** in `evaluateAdmitQueue`'s
+Two new fields on `admitWaiter`, written **only** in `evaluateAdmitQueue`'s
 existing refusal branches, under `queue.mu`, which the loop already holds:
 
 ```go
 // AIRA-149. Diagnosis only: never read by any admission decision.
 // LATCHED across the wait, never sampled at the instant of rejection.
-contention   string // "" | admitContentionObserved | admitContentionNoneObserved
+contention    int    // the monotone lattice below; 0 = nothing latched
 lastGrantable *int64 // the checkedAvailable the capacity gate last computed for THIS waiter
 ```
 
-Transition rule, at each refusal of this waiter:
+**What revision 2 got wrong, stated plainly because it is the same defect class
+the ticket is about.** Revision 2 derived "was anything else in the way" from
+`queue.outstandingJobs > 0 || queue.adoptedJobs > 0 || queuedAhead > 0`. Those
+are **reserve-accounting** counters, and `admit.go:2042-2057` forbids exactly
+that use in its own words: the adopted loop skips leaf-unpopulated scopes
+(`:2078-2080`), connection-held ones (`:2081-2083`), nil/malformed caps
+(`:2089-2095`) and `delegate && !usableRSS` (`:2126-2129`), *"and every one of
+those exclusions is correct for RESERVE accounting and wrong for EMPTINESS,
+because a skipped scope is still a running job."* On this very box the commonest
+such scope is a post-restart aitest/delegate outer scope that has drained every
+pid into a child cgroup: its leaf `Populated` reads 0, `adoptedJobs` stays 0 — and
+it is using memory, driving `current` up, so a solo waiter is refused on the
+**ordinary** `reserve > available` disjunct with both counters at zero. Revision
+2's rule would then have printed "nothing else held or was queued for this slice
+at any evaluation" beside a running suite. That is the ticket's own defect,
+reintroduced by its fix, on the commonest path — not merely on the AIRA-114
+aggregate path the reviews' first example used.
+
+**The correct source already exists three lines away**, built by AIRA-101 for
+precisely this question, and is *subtree*-aware:
+
+```go
+// admit.go:492-494 — unchanged, read only
+func sliceProvablyEmpty(queue *sliceQueue) bool {
+	return queue.outstandingJobs == 0 && queue.liveScopesKnown && queue.liveScopes == 0
+}
+```
+
+So the latch is derived **structurally**, from one shared reading computed at each
+refusal site, rather than inferred from job counts:
+
+```go
+// AIRA-149. The three-valued emptiness reading for ONE refusal pass.
+// queue.mu held. Reads nothing this file does not already maintain.
+const (
+	contentionUnset       = 0
+	contentionNoneObserved = 1
+	contentionUnevaluated  = 2
+	contentionObserved     = 3
+)
+
+func soloReadingLocked(queue *sliceQueue, queuedAhead int, overSubscribed bool) int {
+	// A failing confine scan cannot establish solitude. Fail closed, ALWAYS
+	// first: unestablished outranks every "looks empty" reading below it.
+	if !queue.liveScopesKnown {
+		return contentionUnevaluated
+	}
+	// The disjunct actually taken. An aggregate refusal is by construction a
+	// refusal caused by other scopes.
+	if overSubscribed {
+		return contentionObserved
+	}
+	// Belt and braces on the same population, for the ordinary disjunct: a
+	// nonzero aggregate means aggregateScopeCap saw live scopes.
+	if queue.capAggregateKnown && queue.capAggregate > 0 {
+		return contentionObserved
+	}
+	if !sliceProvablyEmpty(queue) {
+		return contentionObserved
+	}
+	if queuedAhead > 0 {
+		return contentionObserved
+	}
+	return contentionNoneObserved
+}
+```
+
+**The lattice is monotone, and the join is the whole transition rule:**
 
 ```
-othersPresent := queue.outstandingJobs > 0 || queue.adoptedJobs > 0 || queuedAhead > 0
-othersPresent -> contention = "observed"      (STICKY; once observed, never cleared)
-!othersPresent && contention != "observed" -> contention = "none-observed"
+contention = max(contention, soloReadingLocked(...))       // observed > unevaluated > none-observed
 whenever `available` was computed for this waiter -> lastGrantable = &available
 ```
 
+That single line gives all three properties the plan needs, without a case
+analysis that can go stale:
+
+- **`observed` is sticky** — it is the top of the lattice, so nothing can clear
+  it. A waiter blocked behind a real job for 29 of 30 seconds and alone at the
+  instant the timer fires is still told the truth (T10).
+- **An unestablished pass forbids `none-observed` for the whole wait.** "Nothing
+  else … at **any** evaluation" cannot be claimed if one evaluation could not
+  establish it. A single failing confine scan therefore yields `unevaluated`
+  unless real contention was also seen (T12b). This is the gate's P3 lattice
+  item, and it is *why* the rule is a join rather than a sticky boolean.
+- **`none-observed` requires every pass to have established solitude** — it is
+  the bottom of the lattice, so it survives only if no pass ever returned
+  anything higher.
+
+Two site-specific notes, both structural rather than inferential:
+
+- **The exclusivity `continue` (`admit.go:2240-2243`).** A waiter that is *not*
+  the drain head is blocked because another waiter is exclusively holding or
+  draining the slice — something else is in the way by construction — so it
+  latches `contentionObserved` directly. The **drain head itself** is blocked by
+  `gate.blocks` on `!sliceProvablyEmpty(queue)` (`admit.go:611`), so it takes the
+  shared reading: with `liveScopesKnown == false` that is `unevaluated`, not
+  `observed`, because the daemon could not establish the contention it would
+  otherwise be asserting. (At render time this latch is dead data — the AIRA-101
+  `Exclusive` arm at `admit.go:1783-1786` / `admission_linux.go:549-556` wins the
+  wording — but a stored false claim is still the wrong value, and I8 is stated
+  over the latch, not over the sentence.)
+- **The capacity branch (`admit.go:2259-2264`).** `overSubscribed` is passed in as
+  computed at `:2259`, so the reading is taken over **the disjunct actually
+  taken** rather than reconstructed afterwards.
+
 `queuedAhead` is a local counter of still-queued waiters already examined in this
-pass; a waiter granted earlier in the same pass has already incremented
-`outstandingJobs`, so it counts as present. The exclusivity `continue` branch
-sets `"observed"` explicitly rather than by inference.
+pass — i.e. genuinely **ahead of** this request. A waiter granted earlier in the
+same pass has already incremented `outstandingJobs`, so `sliceProvablyEmpty`
+catches it.
 
-Three decisions in that rule are load-bearing and each is tested:
+One property this rule does **not** claim, named rather than left to be
+discovered: `liveScopes`/`capAggregate` are refreshed by a scan rate-limited to
+at most once per second (`queue.adoptedAt`), so a single pass can read a scope
+population up to ~1 s stale. Over a multi-second wait every pass would have to
+miss the same neighbour for a false `none-observed`, and this is the identical
+staleness AIRA-101 already accepts for the far more consequential decision of
+granting exclusivity. Accepted, and recorded as F10 rather than engineered
+around.
 
-- **Sticky.** "Contended" wins for the whole wait. A waiter that was blocked
-  behind a real job for 29 of 30 seconds and happens to be alone at the instant
-  the timer fires must not be told nothing was in the way (T8).
-- **Job counts, not bytes.** A residual 4 KiB page in the slice is **not**
-  another job. Reading a nonzero `current` as contention is exactly the
-  misdiagnosis this ticket is about; the AIRA-139 case had `current=4096` with
-  zero jobs (T6).
-- **Absent means unevaluated.** A waiter the gate never evaluated (its wait
-  expired before any pass, or the slice memory read failed for the whole wait —
-  `admit.go:2157-2168`) latches nothing, and is reported `unevaluated`, never
-  "nothing was in the way" (T9).
+**Job counts, not bytes, remains true and remains load-bearing.** A residual
+4 KiB page in the slice is **not** another job; reading a nonzero `current` as
+contention is exactly the misdiagnosis this ticket is about (the AIRA-139 case
+had `current=4096` with zero jobs). The new rule keeps that — `sliceProvablyEmpty`
+counts *scopes and jobs*, never bytes — while closing the hole where a real job
+was invisible to the counters revision 2 used (T8, T12).
+
+**Absent means unevaluated.** A waiter the gate never evaluated — its wait expired
+before any pass, or the evaluator returned early at `admit.go:2157-2168` on every
+pass because the slice memory read failed — latches nothing (`contentionUnset`),
+and is reported `unevaluated`, never "nothing was in the way" (T11). The
+evaluator's early return is *before* the waiter loop, so no latch is written on
+such a pass, which is what makes this safe rather than lucky.
 
 **(iii) Carry them on the wire.** `admitRejection` gains
 `Contention string json:"contention,omitempty"` and
-`Grantable *int64 json:"grantable_bytes,omitempty"`. The pointer is deliberate:
-`0` grantable is the *interesting* value in the ticket's own case, and an
-`omitempty` scalar would erase it. `Basis` keeps its exact `reject:saturated`
-spelling, which `validRunnerAdmitRejection` pins.
+`Grantable *int64 json:"grantable_bytes,omitempty"`. The pointer is deliberate,
+though **not for the reason revision 2 gave**: `0` grantable is not the ticket's
+own case (the measured shape yields `ceiling - 4096`, §0), but it *is* genuinely
+reachable whenever `charge >= ceiling`, and there it is a real reading — "not one
+byte was grantable at the last evaluation" — that an `omitempty` scalar would
+erase into "the daemon did not report this". The pointer keeps a measured zero
+distinguishable from an absent field; T8b pins that. `Basis` keeps its exact
+`reject:saturated` spelling, which `validRunnerAdmitRejection` pins.
 
-Daemon-side the enum is `"observed"` / `"none-observed"` / `"unevaluated"`, and
-the daemon always sets one of the three on this path, so an **empty** value at
-the client strictly means "not reported by this build".
+Daemon-side the wire enum is `"observed"` / `"none-observed"` / `"unevaluated"`,
+and the daemon always sets one of the three on this path (`contentionUnset` maps
+to `"unevaluated"`), so an **empty** value at the client strictly means "not
+reported by this build".
 
 ### 3.6 The sentence the client renders
 
@@ -437,11 +612,12 @@ AIRA-101 exclusivity `switch` keeps its precedence — the new clause only ever
 replaces the `default:` arm.
 
 ```
-none-observed:
-  E_ADMIT_SATURATED: confine: admission rejected after 30s — nothing else held or
-  was queued for this slice at any evaluation; the resolved reserve 984M did not
-  fit the admission ceiling 984M (largest grantable reserve 0B at the last
-  evaluation). Pin --memory-reserve or --memory-max to size this job yourself.
+none-observed (the ticket's measured shape, with §0's re-derived figures):
+  E_ADMIT_SATURATED: confine: admission rejected after 30s — nothing else was
+  running in this slice or queued ahead of this request at any evaluation; the
+  resolved reserve 984M did not fit the admission ceiling 984M (largest grantable
+  reserve 1007612K at the last evaluation). Pin --memory-reserve or --memory-max
+  to size this job yourself.
 
 observed (wording unchanged, numbers now real):
   E_ADMIT_SATURATED: confine: admission rejected after 30s — slice contended, no
@@ -449,21 +625,46 @@ observed (wording unchanged, numbers now real):
 
 unevaluated:
   E_ADMIT_SATURATED: confine: admission rejected after 30s — the admission gate
-  did not evaluate this request before the wait expired (reserve 984M/984M)
+  could not establish this request's contention before the wait expired
+  (reserve 984M/984M)
 
 empty (not reported by this daemon build):
   the existing sentence, unchanged
 ```
 
-Two wording rules the implementation must hold to:
+`1007612K` is `ceiling - 4096` as `FormatConfineBytes` renders it (§0). It is
+exactly the number that explains the refusal — the reserve missed by one page —
+and printing `0B` there, as revision 2 specified, would have been a fabrication
+of the same kind the ticket is about.
+
+Three wording rules the implementation must hold to:
 
 - The ceiling is the **request-entry** figure and the grantable is the **gate's
   last pass**; they are different instants (a throttle or a change in job count
   can move the second). Each is labelled by provenance and the sentence never
   invites the reader to subtract one from the other.
-- "nothing else held or was queued **at any evaluation**" is the fact that was
-  established. Not "the slice was empty" — the slice's own residual charge is why
-  the request failed, and claiming emptiness would be a new fabrication.
+- "nothing else was running in this slice or **queued ahead of this request** at
+  any evaluation" is the fact that was established, and the word `ahead` is
+  load-bearing (gate P3). A waiter queued *behind* the head is "queued for this
+  slice" but was never in the head's way; if it were ever granted it would
+  increment `outstandingJobs` and latch `observed` anyway. Claiming the broader
+  fact would be a small over-claim in a message whose entire purpose is not to
+  over-claim.
+- Not "the slice was empty" — the slice's own residual charge is why the request
+  failed, and claiming emptiness would be a new fabrication.
+- The `unevaluated` sentence covers all three causes (F5) without naming one:
+  never evaluated, slice unreadable for the whole wait, or emptiness
+  unestablished by a failing confine scan. "Could not establish" is true of all
+  three; "did not evaluate" was true of only two, and revision 2's wording would
+  have been false for the third.
+- **A measured zero grantable must not render as `unknown`.**
+  `FormatConfineBytes(0)` returns the string `"unknown"`
+  (`internal/runner/confine.go:859-862`), which is this codebase's word for *not
+  established* — so passing a measured 0 through it would turn the honest reading
+  "not one byte was grantable" into "the daemon does not know", the exact
+  conflation this plan exists to remove. The clause renders `0B` for a present
+  zero and omits the parenthetical entirely when the field is absent. T14's
+  sibling case pins it.
 
 ---
 
@@ -499,23 +700,42 @@ no extra socket round trip, no extra cgroupfs read.
 **I7. Every new field is written and read under `queue.mu` only.** Same
 discipline as the AIRA-29 charge fields documented at `admit.go:220-224`.
 
-**I8. A `none-observed` latch can only be produced by the capacity gate.** This
-is the invariant that makes the §3.6 solo sentence safe to print, and it was
-cited twice in earlier revisions of this plan without ever being stated; T12
-pins it. The evaluator has exactly three refusal sites (§0), and the other two
-cannot produce `none-observed`:
+**I8. `none-observed` is only ever latched on a pass that positively established
+solitude, and only from the capacity gate's `reserve > available` disjunct.**
+This is the invariant that makes the §3.6 solo sentence safe to print. Revision 2
+argued it *inferentially*, from job counts, and the gate showed the inference was
+unsound. It is now a **structural consequence** of `soloReadingLocked` (§3.5 ii):
+that function is the only writer of `contentionNoneObserved`, and it returns it
+only after four positive checks — a successful confine scan (`liveScopesKnown`),
+`!overSubscribed`, no established aggregate, `sliceProvablyEmpty`, and
+`queuedAhead == 0`.
 
-| Refusal site | `admit.go` | Why `othersPresent` is necessarily true |
+The evaluator has exactly three refusal sites (§0), and the other two cannot
+reach that return:
+
+| Refusal site | `admit.go` | Why `none-observed` is unreachable |
 | --- | --- | --- |
-| exclusivity `continue` (`gate.blocks`) | `2235-2238` | another waiter holds or is draining the slice; §3.5 sets `"observed"` **explicitly** here rather than deriving it |
-| AIRA-59 freeze `continue` | `2245-2248` | the freeze arms only after a waiter ahead was refused on capacity, so `queuedAhead > 0` |
-| capacity: `waiter.reserve > available \|\| overSubscribed` | `2259-2262` | **the only site that may latch `none-observed`** — and only on the `reserve > available` disjunct, since the AIRA-114 `overSubscribed` disjunct needs `capAggregate > 0`, which needs live scanned scopes, i.e. other jobs |
+| exclusivity `continue` (`gate.blocks`) | `2240-2243` | a non-head waiter latches `contentionObserved` **directly** (§3.5 ii) — another waiter is holding or draining by construction. The drain head takes the shared reading, which under `!liveScopesKnown` is `unevaluated`, never `none-observed` |
+| AIRA-59 freeze `continue` | `2247-2250` | `frozen` is assigned only at `:2280` and `:2282`, both inside `if waiter.reserve > available \|\| overSubscribed` **earlier in the same pass**, so a waiter ahead was already refused on capacity and `queuedAhead >= 1` |
+| capacity: `waiter.reserve > available \|\| overSubscribed` | `2259-2264` | **the only site that may latch `none-observed`** — and only on the `reserve > available` disjunct, because `overSubscribed` is passed into the reading and short-circuits to `observed` |
 
-So "nothing else held or was queued at any evaluation" is only ever printed for a
-waiter that could not fit the slice's own capacity — which is exactly the ticket's
-measured case, and exactly what the sentence claims. If a future change gives the
-freeze or the aggregate bound a path to a solo refusal, **T12 fails** rather than
-the operator receiving a confidently wrong sentence.
+So "nothing else was running in this slice or queued ahead of this request at any
+evaluation" is only ever printed for a waiter that could not fit the slice's own
+capacity on a pass where the slice's population was *positively read and found
+empty* — which is exactly the ticket's measured case, and exactly what the
+sentence claims.
+
+**Why the subtree-aware source is what makes this true rather than merely
+plausible.** The state that broke revision 2's version is `liveScopes > 0` with
+`outstandingJobs == 0 && adoptedJobs == 0`: a post-restart leaf-drained,
+uncapped, or `delegate && !usableRSS` scope, which the adoption loop skips and
+which `liveScopes`/`aggregateScopeCap` both see. Such a scope is a running job
+using memory, so it drives `current` up and refuses a solo waiter on the
+**ordinary** disjunct — the commonest path, needing no aggregate bound at all.
+`sliceProvablyEmpty` returns false there, so the reading is `observed`. T12
+drives exactly that shape, on both disjuncts, so a future change that swaps the
+source back to job counts fails a test instead of shipping a confidently wrong
+sentence.
 
 ---
 
@@ -528,24 +748,52 @@ agent guide prose is updated in the same change to describe what the token
 family actually means, and `skill_test.go:644` with it. The `oom-escalated`
 spelling itself is unchanged where it is true.
 
-**R2 — the AIRA-52 estimate-vs-actual gauge population moves.**
-`estimate_actual.go:47` selects `admission_reserve_basis LIKE 'estimate%'`.
-Row (d)/(e) rows leave that population (they were never estimates); rows (c),
-(a), (b) stay in it, since `LIKE 'estimate%'` is a prefix match and the new
-tokens are appended suffixes. This is an intended honesty improvement — the gauge
-is measuring estimate adequacy and was being fed non-estimates — and it is named
-here rather than discovered later.
+**R2 — the AIRA-52 estimate-vs-actual gauge. Restated against the classifier,
+because revision 2's version was asserted rather than read, and was wrong.**
+Both reviewers caught it, and in a plan whose whole subject is claims that outrun
+their evidence it is the one risk row that could not be left unchecked.
 
-Two second-order effects, named so they are not discovered as surprises:
-**(a)** row (b) stays in the population while being a *clamped* value, so the
-gauge counts it as an estimate that was cut down by the ceiling rather than by
-the estimator's own judgement; it was already counted that way before this
-change, and `,ceiling-clamped` now makes such rows **identifiable** in the gauge
-for the first time, which is a strict improvement over the status quo.
-**(b)** the population change is not retroactive — historical rows keep the
-basis string they were written with — so a gauge reading that spans this change
-mixes two vocabularies. Neither is a reason to hold the change; both are reasons
-the deferral list, not the gauge, is where the follow-up belongs.
+The gauge has **two** stages, and revision 2 only read the first:
+
+1. **Population** — `estimate_actual.go:47` selects
+   `admission_reserve_basis LIKE 'estimate%'`, a prefix match.
+2. **Verdict** — `classifyAdmissionAdequacy`
+   (`internal/store/admission_insight.go:111-122`) assigns a `form` from
+   **`$`-anchored** patterns: `^estimate:max=\d+,n=\d+,f=115$`,
+   `^estimate:oom:max=\d+,n=\d+,oom=\d+,f=115$`, or the exact string
+   `estimate:capped`. **Everything else falls to `default:`, is counted
+   `malformedBasis` + `sig.excluded`, and `continue`s** — it never reaches an
+   adequacy verdict at all.
+
+What follows, per §3.1's rows:
+
+| Row | Basis after this change | Stage 1 | Stage 2 | Change vs today |
+| --- | --- | --- | --- | --- |
+| a | `estimate:oom-escalated` | in | `default:` → `malformedBasis` | **none** — it is excluded today for the same reason |
+| b | `estimate:oom-escalated,ceiling-clamped` | in | `default:` → `malformedBasis` | **none** — still excluded |
+| c | `estimate:max=…,f=115,oom-on-record` / `estimate:capped,oom-on-record` | in | `default:` → `malformedBasis` (the suffix breaks the anchor / the exact match) | **none** — the unsuffixed twin was never produced by this branch, since `ordinary.OOMCount = 0` is set before the estimator call and the OOM branch owns this return |
+| d/e | `fallback:…,oom-on-record[,ceiling-clamped]` | **out** (no `estimate` prefix) | — | leaves the population; **reduces** the `malformedBasis` count |
+
+So the two claims revision 2 made are both **false and are withdrawn**: rows in
+the OOM branch never reached an adequacy verdict before this change, and
+`,ceiling-clamped` does **not** make them "identifiable in the gauge for the first
+time" — they remain outside the evaluable population, exactly as today. The net
+effect of this plan on the gauge is benign and slightly positive: rows (a)–(c)
+are classified exactly as they are now, and rows (d)/(e) stop being counted as
+malformed estimates when they were never estimates at all.
+
+**One live hazard this does create, and the pin for it.** Row (c) returns the
+estimator's own basis **plus** `,oom-on-record`. If a future change ever returned
+that basis *unsuffixed* from this arm — an easy-looking simplification — the row
+would start matching `admissionMaxBasis` and would **silently enter** the
+evaluable population, moving a shipped gauge with no test objecting. **T2b** pins
+the negative: the OOM branch's row (c)–(e) bases match none of
+`admissionMaxBasis`, `admissionOOMMaxBasis`, or `estimate:capped`.
+
+**(b)** The population change is not retroactive — historical rows keep the basis
+string they were written with — so a gauge reading spanning this change mixes two
+vocabularies. Not a reason to hold the change; a reason the deferral list, not
+the gauge, is where a follow-up belongs.
 
 **R3 — new mutable per-waiter state.** Mitigated by I7 and by a mandatory local
 `go test -race ./internal/daemon/...` run (CI has `-race` off per AIRA-20, so the
@@ -559,7 +807,7 @@ existing, already-shipped sentence.
 `internal/runner/confine_linux_test.go:934` requires `"slice contended"` for
 `E_ADMIT_SATURATED`. It sends a rejection with no `contention` field, so it lands
 on the unchanged empty-value arm and stays green — but it must not be left as the
-only saturated-wording coverage, so T12–T14 are added beside it.
+only saturated-wording coverage, so T13–T17 are added beside it.
 
 **R6 — mixed daemon/client builds.** `[[aira-not-live-no-compat]]` makes this a
 non-goal, but the empty-value arm means an older daemon degrades to today's
@@ -573,14 +821,19 @@ message rather than to a wrong one. Stated, not engineered for.
   the OOM branch (row (d)/(e)), and in row (c).
 - One false number deleted from a terminal message (the client's own 4 GiB
   printed as "reserve") and one `unknown` replaced by the real ceiling.
-- One manufactured cause ("slice contended") replaced by an established one, in
-  the exact case the ticket measured — including the daemon's own last grantable
-  figure, which is the number that explains it.
+- One manufactured cause ("slice contended") replaced by an **established** one —
+  established from the subtree-aware reading AIRA-101 built, not from reserve
+  counters that are blind to a leaf-drained suite — in the exact case the ticket
+  measured, including the daemon's own last grantable figure, which is the number
+  that explains it.
 - A silent 30-second dead-end on a shared box becomes a message naming both the
   cause and the escape hatch — the AIRA-71 outcome, on a second surface.
 - Two follow-up tickets filed with the evidence to judge them (§8 F1, F2), rather
   than a sizing change merged inside an honesty fix.
-- Net new production state: three fields, all diagnosis-only.
+- Net new production state: **two `admitWaiter` fields and two wire fields**, all
+  diagnosis-only, plus one pure read-only helper (`soloReadingLocked`). No new
+  reading is computed — the latch consumes readings AIRA-101 and AIRA-114 already
+  maintain.
 
 ---
 
@@ -593,8 +846,9 @@ and observed RED against `19c6bf2` before the corresponding code exists.
 
 | Id | Name / file | Asserts | RED against master because |
 | --- | --- | --- | --- |
-| **T1** | `TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve` — new `internal/daemon/admit_oom_basis_test.go` | the full §3.1 table, **value and basis** for rows (a)–(e), including row (e) driven with the ticket's measured stats and ceiling. Rows (c)–(e) are driven **across the estimator bases §3.1 lists**, not one example each: `estimate:max=…` and `estimate:capped` for (c), `fallback:insufficient-samples:n=1` and (via the injected seam) `fallback:malformed` for (d)/(e) — so the table is verified as the general rule it claims to be rather than for one lucky spelling | master returns `estimate:oom-escalated` for (b)–(e) |
+| **T1** | `TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve` — new `internal/daemon/admit_oom_basis_test.go` | the full §3.1 table, **value and basis** for rows (a)–(e), including row (e) driven with the ticket's measured stats and ceiling. Rows (c)–(e) are driven **across the estimator bases §3.1 lists**, not one example each: `estimate:max=…` and `estimate:capped` for (c), `fallback:insufficient-samples:n=1` and (via the injected seam) `fallback:malformed` for (d)/(e) — so the table is verified as the general rule it claims to be rather than for one lucky spelling. **Plus one table-wide assertion: every basis every row produces matches `^\S+$`** | master returns `estimate:oom-escalated` for (b)–(e) |
 | **T2** | `TestEveryOOMBranchBasisNamesTheOOMRecordAndOnlyTheOOMBranchDoes` — same file | every row of T1 contains `oom-escalated` or `oom-on-record`; the identical stats with `OOMCount = 0` (and with `MaxOOMPeak = 0`) contain **neither** | new property; it is the test that keeps AIRA-128's attribution proof non-porous (§3.2). Mutation: dropping the `,oom-on-record` append must turn it RED |
+| **T2b** | `TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation` — `internal/store/admission_insight_test.go`, beside `TestAdmissionAdequacyStrictBasisGrammar` | every basis §3.1 rows (c)–(e) can produce matches **none** of `admissionMaxBasis`, `admissionOOMMaxBasis`, or the exact `estimate:capped` — i.e. they stay in the `default:` → `malformedBasis` arm, exactly as `estimate:oom-escalated` does today | **GREEN by construction**, a pinning test like T3b. Its RED direction is against a *future* change that returns the estimator's basis unsuffixed from the OOM branch, which would silently move a shipped gauge's evaluable population (R2) |
 | **T3** | `TestResolveAdmitReserveKeepsTheEstimatorsOwnFallbackBasis` — same file | **through the `basis` local only:** `SampleCount >= 3`, `PeakMax <= 0`, no OOM record → `fallback:malformed` (master: `fallback:insufficient-samples`, the D4 false label); and `SampleCount == 1` **with** an OOM record → `fallback:insufficient-samples:n=1,oom-on-record` (row (d)) | master reports the hardcoded `fallback:insufficient-samples` / `estimate:oom-escalated` respectively |
 | **T3b** | `TestPostBlockInsufficientSamplesFallbackIsUnchanged` — same file | `SampleCount == 1`, **no** OOM record, no p90 prior → exactly `fallback:insufficient-samples`, bare, **no** `n=` param, value `== request.reserve` | **GREEN against master by construction.** It is a *pinning* test, not a RED-first one: it fixes the §3.4 scope boundary so a later "tidy-up" cannot quietly thread the local through the post-block returns and silently change a fourth label. Its RED direction is against that future change, and it is the F8 decision made executable |
 | **T4** | *updates, not new:* `TestConfineEstimatorAndOOMEscalationClamp` (→ `estimate:oom-escalated,ceiling-clamped`), `TestSliceCeilingDoesNotReachTheOOMEscalationClamp` (→ same; this **strengthens** its own stated purpose, since the clamp it exists to exercise is now named in the basis), `TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins` (label unchanged — verified row (a) with no clamp) | — | — |
@@ -604,16 +858,29 @@ and observed RED against `19c6bf2` before the corresponding code exists.
 ### 7.2 Facet 2b — the diagnosis (daemon side, `internal/daemon`)
 
 Driven through the real `admitConnection` wire path, as `TestSliceCeilingDoesNotReachTheOOMEscalationClamp`
-is, because the defect is in what reaches the client.
+is, because the defect is in what reaches the client. Two seam facts the gate
+established and every test below must respect: **(1)** a failing memory read at
+*request entry* writes an `unevaluated` grant and returns without enqueueing
+(`admit.go:1690-1700`), so only an **evaluator-pass** read failure can produce a
+saturated rejection, and one stub (`s.memoryReader()`) serves both — T11 sequences
+it; **(2)** the scanned-scope population and the reserve counters are different
+populations, so a fixture that grants a waiter to create contention (`heldScopeWaiter`,
+`oversubRecord`) exercises the counters, and only `leafDrainedRecord`/`uncappedRecord`
+with **no** granted waiter exercises the scan-only case that revision 2's rule got
+wrong — T12 uses the latter, deliberately.
 
 | Id | Name (new `internal/daemon/admit_saturated_diagnosis_test.go`) | Asserts | RED because |
 | --- | --- | --- | --- |
 | **T7** | `TestSaturatedRejectionCarriesTheResolvedReserveAndCeiling` | a timed-out waiter's rejection has `required` == the **daemon-resolved** reserve and `cap_minus_headroom` == the request-entry ceiling | master leaves both zero |
-| **T8** | `TestSaturatedRejectionReportsNoContentionWhenNothingWasEverQueuedOrHeld` | **the facet-2b shape, exactly**: one waiter, alone, resolved reserve == ceiling, slice `current = 4096`, nothing outstanding or adopted → `contention == "none-observed"`, `required == ceiling`, `grantable_bytes == 0` (present, not omitted) | master reports no contention field at all |
+| **T8** | `TestSaturatedRejectionReportsNoContentionWhenNothingWasEverQueuedOrHeld` | **the facet-2b shape, exactly**: one waiter, alone, resolved reserve == ceiling, slice `current = 4096`, `reclaimable = 0`, nothing outstanding, adopted or scanned → `contention == "none-observed"`, `required == ceiling`, and **`grantable_bytes == ceiling - 4096`**, computed by the test from the same `admitSliceHeadroom(1)` the daemon uses rather than hard-coded (§0) | master reports no contention field at all. **Revision 2 asserted `grantable_bytes == 0` here, which is RED against a correct implementation**; the gate caught it |
+| **T8b** | `TestSaturatedRejectionReportsAMeasuredZeroGrantableAsPresent` | the same shape with `current` **at or above** the ceiling → `grantable_bytes` is **present and 0**, not omitted | pins the pointer/`omitempty` choice (§3.5 iii) at the only shape that actually produces a zero, so the rationale has a test rather than an assertion |
 | **T9** | `TestSaturatedRejectionReportsContentionWhenAnotherJobHeldTheSlice` | a granted job holds the ledger; the second waiter times out → `"observed"` | false-positive direction; guards the new clause from claiming solitude wrongly |
 | **T10** | `TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection` | a holder occupies the slice for the early passes and is **released before the deadline**, leaving the waiter alone at the instant of rejection → still `"observed"` | RED against any implementation that reads the queue at rejection time instead of latching (§3.5) |
-| **T11** | `TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt` | `admitReadMemory` returns `ok == false` for the whole wait, so the evaluator returns early every pass → `"unevaluated"`, and **no** `grantable_bytes` | master fabricates "contended" for a slice it could not even read |
-| **T12** | `TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate` | drive an AIRA-114 aggregate-cap refusal and an AIRA-59 freeze refusal; both report `"observed"` | pins **I8**, the invariant that makes the solo sentence safe — `oversubscriptionBlocks` needs `capAggregate > 0`, which needs live scopes, and a freeze needs a waiter ahead. If a future change breaks that, this fails instead of shipping a wrong sentence |
+| **T11** | `TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt` | a **call-sequenced** `admitReadMemory` stub: the **first** call (request entry, `admit.go:1690-1700`) succeeds, every later call (the evaluator, `admit.go:2157-2168`) returns `ok == false` → the waiter enqueues, is never evaluated, times out → `"unevaluated"`, and **no** `grantable_bytes` | master fabricates "contended" for a slice it could not even read. **Revision 2 specified `ok == false` for the whole wait, which is unbuildable through this wire path**: the entry read failing writes an `unevaluated` *grant* and returns without enqueueing, so `E_ADMIT_SATURATED` is never reached. One seam serves both reads (`shim.go:66-72`), hence the sequencing |
+| **T12** | `TestSoloRefusalBesideALeafDrainedScopeReportsContention` — the gate's P1, driven on **both** disjuncts | a `ConfineRecord` from the existing `leafDrainedRecord` helper (`admit_oversubscription_test.go:72`: leaf `Populated = 0`, `SubtreePopulated = true`) and **no granted waiter**, so `outstandingJobs == 0 && adoptedJobs == 0` while `liveScopes == 1`. Two cases: **(a) ordinary disjunct** — no aggregate bound, `current` driven high enough that `reserve > available`; **(b) aggregate disjunct** — the AIRA-114 bound made to bind from that same scanned population. Both → `"observed"` | **Revision 2's rule reports `"none-observed"` on both**, so this is the test that fails against it. It is also why the helper matters: revision 2's T12 said only "drive an aggregate refusal", and every existing fixture that would have been reused (`heldScopeWaiter` with `outstandingJobs: 1`, `oversubRecord` with `Populated = 1` and a usable RSS) **does** increment the counters revision 2 read — so that T12 would have gone green over the untouched hole |
+| **T12b** | `TestUnestablishedEmptinessNeverReportsNoneObserved` | the same solo shape with the confine scan **failing** (`liveScopesKnown == false`, `admit.go:1963-1970`) while the slice memory read still succeeds → `"unevaluated"`, never `"none-observed"` | pins the lattice's middle rung (§3.5 ii, gate P3): a pass that could not establish solitude must forbid the claim "at any evaluation" for the whole wait |
+| **T12c** | `TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved` | a wait whose passes yield, in order, an established-empty pass, then a scan-failing pass, then another established-empty pass → `"unevaluated"`; and a wait with a real holder in any pass plus scan-failing passes → `"observed"` | pins the **monotone join** itself rather than its three cases separately, so an implementation that resets or overwrites instead of joining fails |
+| **T12d** | `TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate` | an AIRA-59 freeze refusal (`frozen` set by a waiter ahead refused on capacity in the same pass) reports `"observed"`; a non-head waiter blocked by the exclusivity gate reports `"observed"` | pins the other two rows of **I8**'s table. Revision 2 carried this as the whole of T12; it is retained, renamed, and demoted to what it actually proves |
 
 ### 7.3 Facet 2b — the sentence (client side, `internal/runner`)
 
@@ -624,7 +891,7 @@ New `internal/runner/admission_saturated_message_test.go`, driving
 | Id | Name | Asserts | RED because |
 | --- | --- | --- | --- |
 | **T13** | `TestSaturatedMessagePrintsTheDaemonsResolvedReserveNotTheClientsRequest` | `Required = 984M` with a client `effectiveReserve` of 4 GiB → the message contains `984M` and **not** `4G` | master prints the client's request (`admission_linux.go:527-530`) |
-| **T14** | `TestSaturatedMessageNamesTheUnfittableReserveInsteadOfContention` | `contention="none-observed"`, `Required == Ceiling`, `Grantable = 0` → message does **not** contain `slice contended`, and does contain the reserve, the ceiling, the grantable figure and the "nothing else held or was queued" fact | master always says "slice contended" |
+| **T14** | `TestSaturatedMessageNamesTheUnfittableReserveInsteadOfContention` | `contention="none-observed"`, `Required == Ceiling`, `Grantable = Ceiling - 4096` → message does **not** contain `slice contended`, and does contain the reserve, the ceiling, the **grantable figure as `FormatConfineBytes` renders it** (`1007612K` for §0's shape, not `0B`) and the "queued **ahead** of this request" fact. A sibling case with `Grantable = 0` asserts the zero renders too, since `FormatConfineBytes(0)` is `"unknown"` and the clause must not print "largest grantable reserve unknown" for a measured zero | master always says "slice contended" |
 | **T15** | `TestSaturatedMessageKeepsTheContendedWordingWhenContentionWasObserved` | `contention="observed"` → the existing sentence, with real numbers | false-fail direction |
 | **T16** | `TestSaturatedMessageFallsBackToTheGenericWordingWhenContentionIsUnreported` | `contention=""` → today's sentence, unchanged | pins that empty is **not** read as "none-observed" (R6), and keeps `confine_linux_test.go:934` meaningful |
 | **T17** | `TestSaturatedExclusiveWordingStillWinsOverTheContentionClause` | `Exclusive="held"` **and** `contention="none-observed"` → the AIRA-101 exclusivity sentence | I4; a regression here would resurrect the exact misdirection AIRA-101's build review caught |
@@ -643,11 +910,16 @@ gap, not an oversight.
 `whale-run`-prefixed, with exact exit codes, per `CLAUDE.md`:
 
 - `aira confine -- go build ./...`
-- `aira confine -- go test ./internal/daemon/... ./internal/runner/... ./internal/core/...`
+- `aira confine -- go test ./internal/daemon/... ./internal/runner/... ./internal/core/... ./internal/store/...`
+  (`internal/store` added for T2b)
 - `aira confine -- go test -race ./internal/daemon/...` (R3)
 - `aira confine -- go test ./...`
 - the real-cgroup suite for `internal/daemon` on this box, since T5 touches the
   AIRA-128 fixture; a skip is reported as `unevaluated`, never as a pass.
+
+Runs are **serialised**, never concurrent, per `CLAUDE.md`. Each command's exact
+exit code is recorded and `pass` / `fail` / `unevaluated` are kept distinct; a
+truncated log is never read as green.
 
 ---
 
@@ -673,10 +945,16 @@ here**, per `CLAUDE.md`.
   ~4 GiB + headroom and near-unreachable on the 62 GiB production ceiling. A
   design question in its own right; note that the no-OOM path already refuses
   such a request terminally, so the question is what a small slice *should* do.
-- **F5 — `contention="unevaluated"` does not say why** (deadline before the first
-  pass vs a slice memory read failing for the whole wait). Both are honest as
-  `unevaluated`; naming which would need a queue-level record of the early
-  return.
+- **F5 — `contention="unevaluated"` does not say which of its three causes
+  applied.** (1) The deadline fired before any pass; (2) the slice memory read
+  failed for the whole wait, so the evaluator returned at `admit.go:2157-2168`
+  every pass; (3) **the confine scan failed on at least one pass**, so
+  `liveScopesKnown` was false and solitude could not be established — the third
+  cause, added by revision 3's lattice (§3.5 ii). All three are honest as
+  `unevaluated` and all three point the operator at the same next step; naming
+  which would need a queue-level record of the early return and a per-pass
+  reason code, which is plumbing for a distinction with no different action
+  behind it.
 - **F6 — the in-wait progress line is unchanged.** Adding "your resolved reserve
   is the whole ceiling" to each 15 s tick would surface the fact sooner than the
   terminal message; deferred as a separate diagnostic decision, and the line as
@@ -697,6 +975,15 @@ here**, per `CLAUDE.md`.
   guide, which §9 *does* update). Named here so a reviewer meets a decision
   rather than an omission; if the gate prefers the spec amended instead, it is a
   one-line change.
+- **F10 — the scan behind `liveScopes` is at most ~1 s stale (§3.5 ii).** A
+  single pass can read a scope population up to one rate-limit interval old
+  (`queue.adoptedAt`), so a neighbour that appeared within that window is
+  invisible to that one pass. Over a multi-second wait every pass would have to
+  miss it for a false `none-observed`, and it is the identical staleness AIRA-101
+  already accepts for granting exclusivity — a strictly more consequential
+  decision than a diagnosis string. Accepted as a bounded gap; a follow-up would
+  have to tighten the scan for exclusivity first, which is where the cost/benefit
+  actually sits.
 
 ---
 
@@ -704,22 +991,36 @@ here**, per `CLAUDE.md`.
 
 | File | Change |
 | --- | --- |
-| `internal/daemon/admit.go` | `resolveAdmitReserve` basis (§3.1, §3.4); `admitRejection` gains `Contention` + `Grantable`; `admitWaiter` gains the latch fields; `evaluateAdmitQueue` refusal branches write them; the two `writeAdmitRejection` saturated call sites populate `Required`/`Ceiling`/`Contention`/`Grantable` |
-| `internal/runner/admission_linux.go` | `runnerAdmitRejection` mirrors the two fields; the `default:` arm of the exclusivity switch becomes the three-way contention render |
+| `internal/daemon/admit.go` | `resolveAdmitReserve` basis (§3.1, §3.4); `admitRejection` gains `Contention` + `Grantable`; `admitWaiter` gains the two latch fields; **the new `soloReadingLocked` helper (§3.5 ii), which only *reads* `sliceProvablyEmpty`, `liveScopesKnown`, `capAggregate*` and the pass's `overSubscribed`**; `evaluateAdmitQueue`'s three refusal branches join the lattice; the two `writeAdmitRejection` saturated call sites populate `Required`/`Ceiling`/`Contention`/`Grantable` |
+| `internal/runner/admission_linux.go` | `runnerAdmitRejection` mirrors the two fields; the `default:` arm of the exclusivity switch becomes the three-way contention render, with the measured-zero rendering rule (§3.6) |
 | `internal/core/skill.go` | the agent-guide sentence about `estimate:oom-escalated` |
 | `internal/daemon/admit_oom_basis_test.go` | new — T1, T2, T3, T3b |
-| `internal/daemon/admit_saturated_diagnosis_test.go` | new — T7–T12 |
+| `internal/daemon/admit_saturated_diagnosis_test.go` | new — T7, T8, T8b, T9, T10, T11, T12, T12b, T12c, T12d |
 | `internal/runner/admission_saturated_message_test.go` | new — T13–T17 |
+| `internal/store/admission_insight_test.go` | new case — T2b (the gauge-population pin, R2) |
 | `internal/daemon/confine_admit_test.go`, `sliceceiling_test.go`, `confine_oom_selfheal_real_cgroup_linux_test.go`, `internal/core/skill_test.go` | T4, T5, T6 updates |
 | `.aira/tickets/AIRA-149.md` | status, resolution, and the §8 links |
 
 No changes to `checkedAvailable`, the clamp arithmetic, the ceiling computation,
 the freeze, the aggregate bound, the ledger, the protocol version, any CLI flag,
-or any MCP/Skill surface.
+or any MCP/Skill surface. In particular **`sliceProvablyEmpty`, `liveScopes`,
+`liveScopesKnown`, `capAggregate` and `capAggregateKnown` are read-only to this
+change** — the latch consumes AIRA-101's and AIRA-114's readings, it does not
+compute, alter or extend them, and `internal/store/admission_insight.go` itself
+is untouched (only its test gains a pin).
 
 ---
 
 ## 10. Questions this plan expects the gate to press on
+
+**Already answered by the revision-2 gate, recorded so they are not re-litigated:**
+the adopted direction, I1–I7, the sticky rule and its T10 justification, the
+refusal of the early-refuse sub-option (§2.4), T3's RED direction, T3b's scope
+boundary, F9's decision to leave the dated AIRA-67 spec bullet unedited, and R5's
+accuracy were all **confirmed sound against source, no change needed**, by both
+the gate and the orthogonal review. The gate's instruction was explicit that the
+direction, the invariants and the value-path analysis "must not change in the
+revision", and they have not. What follows is what remains genuinely open.
 
 1. **Is `oom-on-record` new machinery the simplicity rule should refuse?** The
    answer this plan gives: it is one comma param in an existing basis grammar,
@@ -731,7 +1032,19 @@ or any MCP/Skill surface.
 2. **Is a latched three-state contention field too much state for a diagnosis?**
    The cheaper alternative (read the queue at rejection time) is refuted by T10:
    it would report "nothing was in the way" for a wait that spent almost all of
-   itself behind a real job.
+   itself behind a real job. Revision 3 makes the state *smaller* than revision 2
+   proposed, not larger — one `int` on the lattice instead of a string, and one
+   pure read-only helper — while the four-check reading it joins is the one thing
+   that made the previous version wrong.
+2b. **Is the belt-and-braces `capAggregate > 0` check redundant now that
+   `sliceProvablyEmpty` is the primary source?** Largely, yes: every scope
+   `aggregateScopeCap` counts is also counted by `liveScopes`, so the check
+   should never be the deciding one. It is kept because the gate explicitly
+   welcomed it, because it costs one comparison on a refusal path, and because it
+   makes the AIRA-114 population's contribution to the claim *legible* at the
+   site rather than inferable. If the gate would rather have one source than two,
+   deleting it is a one-line change that no test in §7.2 depends on — and saying
+   so is the point of naming it here rather than presenting it as load-bearing.
 3. **Should `Ceiling` on a saturated rejection be the request-entry ceiling or
    the gate's last-pass ceiling?** This plan sends the request-entry one (the
    same number the terminal `E_ADMIT_TOO_LARGE` boundary used, and a stable
