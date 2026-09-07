@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-141","project":"aira","title":"aira run's ci-shim launch path releases its daemon admission lease too early, unlike aira confine's shim path","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-141","project":"aira","title":"aira run's ci-shim launch path releases its daemon admission lease too early, unlike aira confine's shim path","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Accepted gap recorded during AIRA-129's Fable review (PR #87, merged `71d90d5`),
@@ -180,3 +180,8 @@ fourth try" is only honest if the first three are named.
    neither `confineShim` nor the deadline path. Same class as the AIRA-135
    cmdline-read flake AIRA-129's review recorded, and as AIRA-20 / AIRA-112;
    it wants its own ticket.
+
+**Merged**: PR #94, merge commit `2bd972b`. `TestAIRA138NaiveConfineDeadlineFabricatesAKill`'s
+flake was independently re-characterized by AIRA-146's own review with real
+statistics (master `54c4962` 1/20 then 11/20 failures; branch `762f987` 1/20
+then 3/20; box load average ~32) and filed separately as AIRA-148.
