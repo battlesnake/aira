@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-145","project":"aira","title":"aira reconcile fails with E_JOURNAL_CORRUPT: invalid run ledger record","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-145","project":"aira","title":"aira reconcile fails with E_JOURNAL_CORRUPT: invalid run ledger record","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Noticed 2026-09-07, ~13:16 local, while sanity-checking the ticket index after
@@ -214,3 +214,53 @@ forward-compat break. That belongs with step 3 below, not here.
   alternatives that have not been ruled out.
 - The `W_STALE_INDEX` / stale `aira list` symptom is untouched and its
   relationship to this error is still unknown.
+
+## Fable build-review record (2026-09-07) — MERGE
+
+PR #98 merged as `e24e1ae` (`--merge`). Reviewed head `1aa4ea3` against
+`origin/master` (merge-base `ad19b9b`; master had moved to `70f9c9d` by merge
+time and the merge was clean). Scope from `gh pr diff`, not the narrative:
+exactly three files — this ticket, `internal/runner/ledger.go`,
+`internal/runner/ledger_corrupt_diagnostics_test.go`.
+
+Verified from source, independently of the PR text:
+
+1. **Control flow and code family unchanged.** `ledgerRecordDefect` is an
+   ordered `switch` over the same five predicates the old `||` chain used,
+   every arm returns a non-empty string, so `defect != ""` is exactly the old
+   condition; every branch still `return nil, err`s on the first bad record.
+   The `E_JOURNAL_CORRUPT` / `U_RUN_RECONCILE_REQUIRED` prefixes are
+   untouched; `store.ErrorCode` (`check.go:676`) cuts at the first colon, and
+   `codes.go:85` still maps `E_JOURNAL_CORRUPT` to exit 4. `ledgerCounter`
+   passes reader errors through unchanged, so the `io.EOF` loop exit is
+   unaffected; the site offset is captured from `r.read` before
+   `ReadUvarint`, so it is the length-prefix offset. No non-test consumer
+   matches on the full message string.
+2. **No shared production state touched.** The test file's only filesystem
+   root is `newLedger(t.TempDir(), "")`; no env, `HOME`, or common-dir
+   lookups. `ledger.go` gains no filesystem access, only the path string in
+   messages (already exposed via the `os.Open` `*PathError` before this PR).
+3. **Step 3 left open, not silently resolved.** `read()` still returns on the
+   first bad record; the ticket records the fail-closed-vs-skip decision as
+   unresolved and needing its own ticket.
+4. **Non-porousness reproduced, not trusted.** In a detached throwaway
+   worktree at `1aa4ea3` with `origin/master`'s `ledger.go` swapped in: all
+   six sub-cases of `TestLedgerCorruptRecordNamesReasonAndOffset`, plus the
+   partial-decode, variable-length-offset and framing-site tests FAIL, each
+   reporting only the bare old sentence (exit 1).
+   `TestLedgerDiagnosticsDoNotChangeAcceptance` passes on both — by design,
+   it is the acceptance-unchanged guard.
+
+Gates run here, exact exit codes, all under `aira confine`: new ledger tests
+plus `TestLedgerFrameRoundTripAndTornFrameFailsClosed` — exit 0; the same
+under `-race` — exit 0; `go vet ./internal/runner/` — exit 0; `gofmt -l` on
+both changed Go files — clean. CI on `1aa4ea3`: build + vet + gofmt, test,
+and race all `success`.
+
+Accepted, noted, not blocking: the "undecodable json" case's `mustNotContain`
+omits "sequence is 0" (harmless, the wantReason assertion carries it); the
+non-canonical-varint offset argument in `ledgerCounter`'s comment is not
+exercised by a test — recorded as a coverage gap, the counted-offset design
+is correct regardless. This done record was committed with a pathspec
+restricted to this file because another session had `AIRA-142.md` staged in
+the root worktree at the time.
