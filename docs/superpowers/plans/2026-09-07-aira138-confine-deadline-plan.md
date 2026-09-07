@@ -1,8 +1,11 @@
 # AIRA-138 — `aira confine`: a job deadline, including cumulative CPU-time, for a supervisor with no run ledger
 
-Status: **plan, awaiting plan-gate review**. Correctness-critical kill/terminal
+Status: **plan revision 2 — plan-fix, awaiting re-gate**. Revision 1 (`a9271a3`)
+was FAILed by the Fable plan gate on one P0 and one P1; every finding is answered
+here and the diff is summarised in §12. Correctness-critical kill/terminal
 arbitration on a genuinely new code path; full two-loop per `CLAUDE.md`, not the
-light path.
+light path. **No implementation has begun** — this revision changes the plan and
+the committed reproduction only.
 
 Ticket: `.aira/tickets/AIRA-138.md`. Deferred out of AIRA-136
 (`docs/superpowers/plans/2026-09-06-aira136-cpu-time-timeout-plan.md`, PR #83,
@@ -12,7 +15,10 @@ and AIRA-131 (`docs/superpowers/plans/2026-09-06-aira131-detached-timeout-arbitr
 
 Branch: `aira138-confine-deadline`. Reproduction/danger-proof artifact:
 `internal/runner/confine_deadline_danger_linux_test.go` (committed with this
-plan; §8 says how the implementation inverts it).
+plan; §8 says how the implementation inverts it). It now carries **two** danger
+proofs: the AIRA-126-shaped fabrication this ticket started from, and — added at
+plan-fix — the leaf-empty/subtree-populated inertness the plan gate found in the
+first draft's own fix (§5.2.1).
 
 ---
 
@@ -28,6 +34,9 @@ ticket's own references were checked and are current except where noted.
 | confine's accepted launch options | `cmd/aira/main.go:785-802` — valueless `delegate-ram`/`detach`/`exclusive`; valued `slice`/`name`/`owner`/`memory-reserve`/`memory-max`/`memory-high`/`admit-timeout` | yes |
 | `--admit-timeout` bounds admission only | `cmd/aira/main.go:1038-1053`, `ConfineRequest.AdmissionMaxWait` | yes |
 | confine's kill mechanism is `scope.Kill()` = one write to `cgroup.kill` | `cgroup_linux.go:321-331`; teardown at `cleanupConfineScope` (`confine_linux.go:2246-2257`) | yes |
+| `Scope.Members()` reads LEAF `cgroup.procs`; `Scope.Empty()` reads `cgroup.events` `populated`, which is SUBTREE-aware | `cgroup_linux.go:248-267` vs `268-301` | yes — **two independent sources that legitimately disagree; load-bearing for §5.2** |
+| confine's flagship heavy shape is LEAF-EMPTY WHILE BUSY | `BootstrapAitestSupervisor` drains every pid into `<outer>/.aira-supervisor` and `.aira-worker-N` (`aitest_bootstrap_linux.go`); documented at `confine_manage.go` `ConfineRecord.SubtreePopulated` ("a fully busy suite reads `Populated == 0` while `SubtreePopulated` is true") | yes |
+| the repo already solved this once, in `confine --kill` | `confine_manage_linux.go:533-549` — "Leaf-only `cgroup.procs` would miss a workload that migrated into a child cgroup it created inside its own scope … `cgroup.kill` is itself recursive, so the whole subtree is the correct unit for both the gate and the confirmation" | yes — **the precedent §5.2 follows** |
 | the supervisor-signal witness and its `runEnded` cut-off | `confine_linux.go:845-884`, snapshot at `1266-1269` | yes |
 | confine holds a verified, boot-aware leader identity | `confine_linux.go:1217-1224` — `PIDIdentity{PID, StartTick, BootID}`, aborts the launch if it cannot be established | yes |
 | confine has NO ledger, NO kill intent, NO terminal CAS | grep: nothing in `confine_linux.go` touches `ledgerEvent`, `KillIntent`, `killWithIntent` | yes |
@@ -103,6 +112,28 @@ run`'s.** No divergence.
 - Validation: `time.ParseDuration`, must be `> 0`. A zero or negative value is
   `E_CONFINE_ARGUMENT_INVALID`, never "no bound" — a bound the operator asked for
   and silently did not get is a fake pass.
+- **Where each bound's clock starts, stated explicitly rather than implied by
+  placement (gate nit).** Both bounds start at the **release write**
+  (`confine_linux.go:1244`) — the instant the setup shim is released to `execve`
+  the job. Neither bound includes the **admission wait** (which `--admit-timeout`
+  bounds and which, on this shared box, can legitimately be minutes) nor the
+  setup handshake. This is not incidental: on a contended box an operator's
+  `--timeout 30m` would otherwise be consumed by a queue this job did not choose
+  to join, so a wall bound measured from invocation would fire against a job that
+  had not run for 30 minutes — a fabrication in the *early* direction, the one
+  direction AIRA-136's invariant forbids. The CPU baseline is read just before
+  the same release write for the same reason (§5.7), so the two bounds start at
+  one point, not two.
+  This sentence goes verbatim into the generated help, next to `--admit-timeout`:
+
+  ```
+  --timeout DURATION       wall-clock bound on the confined job, measured from the
+                           moment the job is released to run; excludes the
+                           admission wait (see --admit-timeout) and setup.
+  --cpu-timeout DURATION   cumulative CPU-time (user+system, whole scope subtree)
+                           bound, measured from the same point.
+  --admit-timeout DURATION bound on the ADMISSION WAIT only, before the job starts.
+  ```
 - **Lower bound.** `--cpu-timeout` below `cpuBudgetSampleInterval` (100ms) is
   accepted but cannot be enforced within one sample; it is not refused (a
   sub-interval budget is a legitimate, if odd, request and the overshoot is in
@@ -248,12 +279,14 @@ inflated into a ledger confine deliberately does not have
 (`[[architectural-simplicity]]`).
 
 **New: `killConfineScope(ctx, scope) (confineKillResult, error)`**, in
-`confine_linux.go`, following `killScope`'s refusal discipline exactly
-(`runner_linux.go:2244-2267`) but with confine's own semantics:
+`confine_linux.go`. It follows `killScope`'s *refusal discipline*
+(`runner_linux.go:2244-2267`) — never claim a win on an empty scope — but it
+**does not copy `killScope`'s gate**, and the divergence is the subject of the
+next subsection.
 
 ```go
 type confineKillResult struct {
-    Empty     bool // the scope was verified empty by TWO independent reads
+    Empty     bool // BOTH reads agreed the scope was empty: leaf AND subtree
     Started   bool // cgroup.kill was written and the write returned nil
     Completed bool // waitEmpty then CONFIRMED the scope empty
 }
@@ -264,9 +297,20 @@ func killConfineScope(ctx context.Context, scope Scope) (confineKillResult, erro
         return confineKillResult{}, err            // unevaluated, never "empty"
     }
     if len(pids) == 0 {
+        // LEAF cgroup.procs is empty. That is NOT emptiness: consult the
+        // subtree-aware source before concluding there is nothing to kill.
         empty, emptyErr := scope.Empty()
-        return confineKillResult{Empty: empty && emptyErr == nil}, emptyErr
-        // returns BEFORE any write: no signal was emitted, provably.
+        if emptyErr != nil {
+            return confineKillResult{}, emptyErr   // population unestablished: unevaluated
+        }
+        if empty {
+            // BOTH reads agree. Return BEFORE any write: no signal was emitted,
+            // provably. This is arm B's sole input.
+            return confineKillResult{Empty: true}, nil
+        }
+        // Leaf-empty, subtree-POPULATED: a busy job living in child cgroups.
+        // Fall through to the kill. cgroup.kill is recursive, so one write is
+        // the correct and sufficient action for the whole subtree.
     }
     if err := scope.Kill(); err != nil {
         return confineKillResult{}, err            // the write failed: unevaluated
@@ -276,7 +320,85 @@ func killConfineScope(ctx context.Context, scope Scope) (confineKillResult, erro
     }
     return confineKillResult{Started: true, Completed: true, Empty: true}, nil
 }
+
+const (
+    // confineDeadlineKillGrace bounds waitEmpty's emptiness CONFIRMATION after
+    // the recursive cgroup.kill write. 2s, the value cleanupConfineScope already
+    // uses for the identical confirmation on confine's own teardown path
+    // (confine_linux.go:2252-2256) and waitEmpty's own default
+    // (cgroup_linux.go:344-347). Not a new number; the existing one, named.
+    confineDeadlineKillGrace = 2 * time.Second
+
+    // confineArbitrationWaitBound bounds arm B's drain. run uses
+    // arbitrationWaitBound(r.grace) = max(grace, 250ms); confine has no r.grace
+    // at all, so the FLOOR is the whole bound and the constant is reused rather
+    // than re-derived. The cost argument is run's, unchanged: on this arm the
+    // leader is PROVED dead, so cmd.Wait() is already blocked in wait4 on our own
+    // child and only the reap plus one scheduler wakeup remain.
+    confineArbitrationWaitBound = arbitrationWaitFloor // 250ms
+)
 ```
+
+#### 5.2.1 Why the gate is two reads and not `len(pids)==0` (plan-gate P0)
+
+The first draft of this plan copied `killScope`'s gate verbatim: `if len(pids)
+== 0 { … return }`, refusing to write `cgroup.kill` whenever LEAF `cgroup.procs`
+is empty. **That gate is inert against the exact job this bound is built for**,
+and the plan gate was right to block on it.
+
+`Scope.Members()` reads leaf `cgroup.procs`; `Scope.Empty()` reads
+`cgroup.events` `populated`, which is **subtree-aware** (§0). They are two
+independent sources and they legitimately disagree, in one direction, for one
+very common shape: a job whose processes live in child cgroups it created inside
+its own scope. `BootstrapAitestSupervisor` drains **every** pid of a
+`--delegate-ram`/aitest job into `<outer>/.aira-supervisor` and
+`.aira-worker-N`; `podman --cgroups=split` does the same; so does any nested
+cgroup workload. Such a job reads **leaf-empty while fully busy**. The repository
+already states this in `ConfineRecord.SubtreePopulated`'s own doc comment.
+
+With the leaf-only gate, the failure is total and silent: the deadline fires,
+`Members()` returns `[]`, `Empty()` returns `false`, the function returns
+`{Empty:false, Started:false}`, `decideConfineDeadlineNotExecuted` is false (its
+`Empty` conjunct fails), the run lands in **arm C** and reports
+`fired-unevaluated` — and then arm C's drain waits for the job to finish on its
+own. **The heavy pytest suite on the load-48 box is precisely the job the bound
+would silently fail to end**, and the operator would learn only at the trailer,
+possibly hours later, that the kill was "unevaluated".
+
+The repo solved this once already and said why, in `confine --kill`
+(`confine_manage_linux.go:533-549`): "Leaf-only `cgroup.procs` would miss a
+workload that migrated into a child cgroup it created inside its own scope,
+reporting a running job as not-launched and leaving it uncancellable;
+`cgroup.kill` is itself recursive, so the whole subtree is the correct unit for
+both the gate and the confirmation." This plan follows that precedent rather
+than inventing a second answer.
+
+**The correction does not weaken arm B**, which is the thing that must not move.
+The refusal still returns before any write, and its `Empty` flag still means
+*verified empty*, only now by **both** reads agreeing rather than one read
+alone — a strictly stronger proof than the draft's, not a relaxed one. `Empty &&
+!Started` remains reachable only from the pre-write return, so
+`decideConfineDeadlineNotExecuted` is **unchanged** (§5.2's rule below is the
+same function it was before this fix).
+
+An `Empty()` error is now `unevaluated` rather than being folded into a
+half-populated result. The draft's `return confineKillResult{Empty: empty &&
+emptyErr == nil}, emptyErr` returned a result *and* an error together, which is
+the shape a caller most easily reads past; a failed population read means AIRA
+cannot establish whether there was anything to kill, which is `unevaluated` by
+this repository's own rule and nothing else.
+
+**This is proved, not argued.** `TestAIRA138LeafOnlyKillGateIsInertAgainstA
+NestedWorkload` (added to the committed reproduction at plan-fix, passing today)
+drives both gates against a `nestedWorkloadScope` whose leaf is always empty and
+whose subtree is populated, and shows the leaf-only gate emitting no signal at
+all against a busy job while the two-read gate kills it — and that a scope both
+reads call empty is still refused. It also pins, positively, **why
+`livenessScope` could not have surfaced this**: `livenessScope.Empty()` is
+derived from the same `membersLocked()` that `Members()` returns, so its two
+reads are coupled by construction and can never disagree. That coupling is why
+the original danger proof, and the gate's own reproduction of it, ran green past
+a P0.
 
 **No SIGTERM grace, deliberately.** `killScope` does `Terminate` → grace →
 `Kill`; confine's own teardown (`cleanupConfineScope`) goes straight to
@@ -302,7 +424,10 @@ deferral (§9).
 //   - Empty && !Started     : the only killConfineScope shape that proves no
 //                             signal was emitted (it returned before the
 //                             cgroup.kill write) AND that the scope was verified
-//                             empty by two independent reads.
+//                             empty by TWO INDEPENDENT READS — leaf cgroup.procs
+//                             and subtree-aware cgroup.events. A leaf-empty but
+//                             subtree-populated scope is a BUSY job (§5.2.1) and
+//                             never reaches this state: it is killed instead.
 //   - leader == processDead : kernel proof the leader was already gone at the
 //                             instant the kill found nothing to signal.
 //                             processAlive and processUnknown both refuse.
@@ -335,16 +460,46 @@ receive so a confine with no bound is byte-for-byte unchanged, and
 
 | Arm | Condition | Exit reported | `terminated-by` | trailer bound-state |
 | --- | --- | --- | --- | --- |
-| **A — killed** | fire; `Started` (the `cgroup.kill` write returned nil) | the child's real wait-derived code (`137`) | `deadline:wall` / `deadline:cpu` when the classifier would otherwise say `unattributed-sigkill` (§5.5); otherwise the classifier's own, higher-priority verdict | `fired-killed` (also `Completed`) or `fired-kill-unconfirmed` |
-| **B — not executed** | fire; `decideConfineDeadlineNotExecuted` true | **the child's own real exit code**, drained | the classifier's honest verdict on the real wait status (typically `normal`) | `fired-not-executed` |
-| **C — unevaluated** | anything else: kill errored, `Members()` errored, leader `processAlive`/`processUnknown`, `Empty` false with no successful write | the child's real wait-derived code | the classifier's own verdict on real evidence | `fired-unevaluated` |
+| **A — killed** | fire; `Started` (the `cgroup.kill` write returned nil). Reached both when the leaf had members AND when the leaf was empty but the subtree was populated (§5.2.1) | the child's real wait-derived code (`137`) | `deadline:wall` / `deadline:cpu` when the classifier would otherwise say `unattributed-sigkill` (§5.5); otherwise the classifier's own, higher-priority verdict | `fired-kill-completed` (also `Completed`) or `fired-kill-unconfirmed` |
+| **B — not executed** | fire; `decideConfineDeadlineNotExecuted` true (which now requires **both** reads empty) | **the child's own real exit code**, drained | the classifier's honest verdict on the real wait status (typically `normal`) | `fired-not-executed` |
+| **C — unevaluated** | anything else: `Members()` errored, `Empty()` errored, the `cgroup.kill` write errored, `waitEmpty` did not confirm with no `Started`, or the leader was `processAlive`/`processUnknown` on an all-empty scope | the child's real wait-derived code | the classifier's own verdict on real evidence | `fired-unevaluated` |
+
+Note what left arm C at the P0 fix: "`Empty` false with no successful write" is
+**no longer an arm-C row**, because a populated subtree is now killed rather than
+shrugged at. Arm C is now reached only by a read or a write that genuinely
+errored, or by a leader whose liveness AIRA could not establish — i.e. only by
+states AIRA truly cannot evaluate, which is what the name has to mean.
 
 **Arm B is the AIRA-126 answer, and it is a drain-then-report, exactly as the
 ticket anticipated — with no ledger write at the end.** The drain is bounded by
-the same anti-hang reasoning AIRA-131 used: a dead leader's `cmd.Wait()` is
-already blocked in `wait4` on our own child, so only the reap and one scheduler
-wakeup remain. On expiry the arm degrades to **C**, never to A: an expired bound
-can only produce an honest "unevaluated", never a wrong kill claim.
+`confineArbitrationWaitBound` (= `arbitrationWaitFloor`, 250ms; §5.2), on the
+same anti-hang reasoning AIRA-131 used: a dead leader's `cmd.Wait()` is already
+blocked in `wait4` on our own child, so only the reap and one scheduler wakeup
+remain. On expiry the arm degrades to **C**, never to A: an expired bound can
+only produce an honest "unevaluated", never a wrong kill claim.
+
+**One stderr line at the fire, per arm (plan-gate P2).** The supervisor-signal
+handler tells the operator what it did the instant it acts
+(`confine_linux.go:877`, "received SIGTERM; killed scope …"). A deadline that
+said nothing until the trailer would leave an operator watching a still-running
+job — on arm A's `waitEmpty` expiry, or arm C, potentially for hours — believing
+the bound was live and silent. So the deadline branch writes exactly one line to
+`diagnostics`, in the signal handler's own tense discipline (past tense only for
+what has already happened) and with the same **act-first, log-second** ordering
+the handler documents at `confine_linux.go:864-871`: `diagnostics` is the
+`confineLockedWriter` shared with the child's stderr pump and can block behind a
+stalled reader, so the kill must never be gated on the write.
+
+```text
+arm A, confirmed   confine: cpu-timeout 10m fired; killed scope <id> on <slice>
+arm A, unconfirmed confine: cpu-timeout 10m fired; wrote cgroup.kill for scope <id>, emptiness unconfirmed: <err>
+arm B              confine: cpu-timeout 10m fired; sent no signal — scope <id> was already empty and the job's leader already dead; reporting the job's own exit
+arm C              confine: timeout 30m fired; kill unevaluated: <err>
+```
+
+The label is the flag name (`timeout` / `cpu-timeout`) and the budget, so the
+line names the knob to change, exactly as the trailer field does (§5.6). Pinned
+by T17.
 
 Arms A and C **also** drain the wait, unconditionally and without a bound: the
 child is this process's own child and `cmd.Wait()` is the only way to reap it.
@@ -442,12 +597,16 @@ that already puts step 2 above step 3. A job that genuinely OOMed at its cap
 while the deadline was firing really was OOM-killed, and `oom` is the actionable
 verdict.
 
-**The graceful middle case falls out for free, correctly.** If the fire finds
-members, we write `cgroup.kill`, but the child had *already* exited between
-`Members()` and the write, the wait status is a clean `exit 0` → step 4 →
-`normal`. That is the honest answer (the child exited by itself; the kill
-signalled a scope it had left), and `cpu-timeout=…:fired-killed` still records
-that AIRA acted. No extra machinery.
+**The graceful middle case falls out for free, correctly.** If the fire finds the
+scope populated (by either read), we write `cgroup.kill`, but the child had
+*already* exited between that read and the write, the wait status is a clean
+`exit 0` → step 4 → `normal`. That is the honest answer (the child exited by
+itself; the kill signalled a scope it had left), and
+`cpu-timeout=…:fired-kill-completed` still records that AIRA acted. The pair is
+not contradictory once the state's meaning is read as §5.6 defines it — the state
+describes the **kill operation**, `terminated-by` describes the **cause of
+death** — which is why the first draft's `fired-killed` was renamed. No extra
+machinery.
 
 ### 5.6 The trailer: two new fields, present only when the bound was requested
 
@@ -463,7 +622,7 @@ nobody asked for.
 
 ```
 timeout=30m:not-reached
-cpu-timeout=10m:fired-killed
+cpu-timeout=10m:fired-kill-completed
 ```
 
 Two keys rather than one shared `deadline=` key, so that requesting both bounds
@@ -475,16 +634,119 @@ never a guess):
 
 | State | Meaning |
 | --- | --- |
-| `not-reached` | requested; the job ended first, and (CPU only) the final established total is under budget — a two-sided proof the bound held |
-| `fired-killed` | fired; the kill was written and `waitEmpty` confirmed the scope empty |
-| `fired-kill-unconfirmed` | fired; the write succeeded but emptiness was not confirmed |
+| `not-reached` | requested; **this** bound did not fire, and (CPU only) the final established total is under budget — a two-sided proof the bound held |
+| `fired-kill-completed` | this bound fired; `cgroup.kill` was written and `waitEmpty` confirmed the scope empty |
+| `fired-kill-unconfirmed` | this bound fired; the write succeeded but emptiness was not confirmed |
 | `fired-not-executed` | the §5.2 arm: provably no signal delivered, leader proved dead, the child's own exit is reported |
-| `fired-unevaluated` | fired; AIRA cannot establish what its kill did |
-| `unenforced` | **CPU only.** `decideCPUBudgetUnenforced` is true: never measured, or measured-breached with no executed kill |
+| `fired-unevaluated` | this bound fired; AIRA cannot establish what its kill did |
+| `unenforced` | **CPU only.** This bound did not fire and `decideCPUBudgetUnenforced` is true: never measured, or measured-breached with no executed kill |
+
+**The three `fired-kill-*` / `fired-not-executed` states describe the KILL
+OPERATION, not the cause of death (plan-gate P2).** `fired-kill-completed` is
+confine's spelling of run's `ScopeKill.Completed`: the write happened and the
+scope was confirmed empty afterwards. It does **not** assert that the kill is
+what ended the job — `terminated-by` owns causation, and the two fields are
+allowed to disagree. That is why the state was renamed from the first draft's
+`fired-killed`, which read as a causal claim: `cpu-timeout=10m:fired-killed`
+beside `terminated-by=normal` and `exit 0` (the §5.5 graceful middle case, where
+the child exited between `Members()` and the write) is a self-contradictory
+line, whereas `fired-kill-completed` beside `terminated-by=normal` reads
+correctly — AIRA wrote the kill, the scope did end up empty, and the job had
+already exited on its own.
 
 **The wall bound has no `unenforced` state, deliberately.** A wall timer either
 fired or the job ended first; there is no measurement that can be unavailable.
 The asymmetry is stated rather than papered over with a vacuous value.
+
+#### 5.6.1 `decideConfineDeadlineState` — the total function (plan-gate P1)
+
+The first draft gave the vocabulary but no rule mapping evidence onto it, and
+left two rules competing for the one `cpu-timeout=` field. Since §5.4 makes this
+field the **only** machine-readable carrier of "a bound fired", an
+under-specified derivation is not a documentation gap — it is an honesty gap in
+the load-bearing artifact. So the derivation is a **pure rule in `decisions.go`**
+beside the others, total over its inputs, with a table test covering every row
+(T18).
+
+```go
+// ConfineDeadlineState is the closed trailer vocabulary of §5.6. The empty
+// string means the bound was not requested and the field is not rendered.
+type ConfineDeadlineState string
+
+const (
+    ConfineDeadlineNotReached          ConfineDeadlineState = "not-reached"
+    ConfineDeadlineFiredKillCompleted  ConfineDeadlineState = "fired-kill-completed"
+    ConfineDeadlineFiredKillUnconfirmed ConfineDeadlineState = "fired-kill-unconfirmed"
+    ConfineDeadlineFiredNotExecuted    ConfineDeadlineState = "fired-not-executed"
+    ConfineDeadlineFiredUnevaluated    ConfineDeadlineState = "fired-unevaluated"
+    ConfineDeadlineUnenforced          ConfineDeadlineState = "unenforced"
+)
+
+// decideConfineDeadlineState is the TOTAL function from arbitration evidence to
+// the one state ONE bound's trailer field renders. It is called once per
+// requested bound, and the caller passes, for THAT bound:
+//
+//   requested      : this bound was asked for (> 0). False renders nothing.
+//   firedThisBound : the deadline source fired AND fired.Kind is this bound's.
+//   attempt        : killConfineScope's result for that fire (zero if !fired).
+//   killErr        : killConfineScope's error for that fire (nil if !fired).
+//   notExecuted    : decideConfineDeadlineNotExecuted(killErr, attempt, leader).
+//   cpuUnenforced  : decideCPUBudgetUnenforced(...) for the CPU bound;
+//                    ALWAYS false for the wall bound, which has no such state.
+//
+// PRECEDENCE, stated because two true things can describe one run:
+//
+//   For the bound that FIRED, the fire-derived state wins. It is strictly more
+//   informative than `unenforced`: `fired-not-executed` says the budget was
+//   reached AND the bound fired AND the kill reached nothing, which entails
+//   "not enforced" and additionally says why. Rendering `unenforced` there
+//   would DELETE the fact that AIRA acted.
+//
+//   For a bound that did NOT fire, there is no kill to describe, so the
+//   measurement decides: CPU renders `unenforced` when decideCPUBudgetUnenforced
+//   is true (the total reached the budget with no executed CPU kill, or nothing
+//   was ever measured) and `not-reached` otherwise; wall always renders
+//   `not-reached`, since a wall timer that did not fire is a one-sided fact that
+//   needs no measurement.
+//
+// At most ONE bound can be fire-derived per run: the select consumes exactly one
+// deadlineFire and deadlines.halt() discards any second, so the two fields can
+// never both claim a fire.
+func decideConfineDeadlineState(
+    requested, firedThisBound bool,
+    attempt confineKillResult, killErr error,
+    notExecuted, cpuUnenforced bool,
+) ConfineDeadlineState {
+    switch {
+    case !requested:
+        return ""
+    case firedThisBound && notExecuted:
+        return ConfineDeadlineFiredNotExecuted
+    case firedThisBound && attempt.Started && attempt.Completed && killErr == nil:
+        return ConfineDeadlineFiredKillCompleted
+    case firedThisBound && attempt.Started:
+        return ConfineDeadlineFiredKillUnconfirmed
+    case firedThisBound:
+        return ConfineDeadlineFiredUnevaluated
+    case cpuUnenforced:
+        return ConfineDeadlineUnenforced
+    default:
+        return ConfineDeadlineNotReached
+    }
+}
+```
+
+The four cases the gate named as unresolved, resolved explicitly:
+
+| Situation | Wall field | CPU field | Why |
+| --- | --- | --- | --- |
+| CPU requested; **wall** fired and killed; final CPU ≥ budget | `fired-kill-completed` | `unenforced` | the CPU bound never fired, so its measurement decides; `killedByCPUBudget` is false (the kill was the wall's), the total reached the budget, and nothing enforced it — exactly what `decideCPUBudgetUnenforced` is for |
+| **CPU** fired, arm B (`notExecuted`) | `not-reached` (if requested) | `fired-not-executed` | fire-derived wins; it entails `unenforced` and says more |
+| CPU requested, did not fire, teardown `cpu.stat` unreadable | — | `unenforced` | `finalEstablished` false ⇒ `decideCPUBudgetUnenforced` true. **Never `not-reached`**, whose definition demands the two-sided proof |
+| **wall** fired, arm C; CPU also requested | `fired-unevaluated` | `unenforced` or `not-reached` per the CPU measurement | the wall's kill is unevaluated; the CPU bound is decided by its own teardown total, independently |
+
+`finalEstablished` is read off the **pointer** fields, never off a sum (§5.7), so
+an unreadable counter can never enter this rule as a measured zero.
 
 **`decideCPUBudgetUnenforced` is reused verbatim, with a stricter
 `killedByCPUBudget` than run's.** confine passes `fired ∧ Kind==CPU ∧
@@ -559,6 +821,18 @@ rebuilt: `livenessScope` / `livenessBackend` / `gatedStdin` / `aira126Scale`
 `writeOOMGroup`, `writeScopeSwapCap`, `writeScopeMemoryCap`, `readUsage` and
 `signalSource`, so a fully hermetic confine harness needs no new production seam.
 
+**One new test double is unavoidable, and the reason is the P0 itself.**
+`livenessScope.Empty()` is derived from the same `membersLocked()` that
+`Members()` returns, so its two reads are **coupled by construction** and can
+never disagree — which is precisely why the first draft's danger proof ran green
+past a P0 that lives in their disagreement. `nestedWorkloadScope`
+(already committed with the reproduction, §8) decouples them: leaf always empty,
+subtree independently controllable, `Kill()` recursive as the kernel's is. It is
+the fake T15 and T17 drive, and the reproduction asserts positively that
+`livenessScope` cannot express the state, so nobody re-derives the coupled fake
+later. T16 covers the same shape against a real kernel cgroup, because a fake
+that models a disagreement can also model the wrong disagreement.
+
 **Determinism over soak, on measured grounds.** AIRA-136's gate review recorded
 that its 800-iteration real-cgroup soak reached the arbitrated arm **0 times** on
 an idle box. This plan does not repeat that: the arbitrated arm is covered by a
@@ -568,7 +842,7 @@ the killed arm, where a soak is not needed.
 
 | # | Test | What it pins | Goes red against |
 | --- | --- | --- | --- |
-| T1 | `…CPUBudgetKillsASpinningConfinedJob` (real cgroup) | arm A end to end: `terminated-by=deadline:cpu`, `cpu-timeout=…:fired-killed`, and the trailer's own `cpu=` counters ≥ the budget | the CPU wiring neutered |
+| T1 | `…CPUBudgetKillsASpinningConfinedJob` (real cgroup) | arm A end to end: `terminated-by=deadline:cpu`, `cpu-timeout=…:fired-kill-completed`, and the trailer's own `cpu=` counters ≥ the budget | the CPU wiring neutered |
 | T2 | `…WallTimeoutKillsButCPUBudgetDoesNot` (real cgroup) | the FEATURE's point: one argv, two runs — a 0.5s sleep dies at `--timeout 100ms` and survives `--cpu-timeout 100ms` | a CPU bound implemented on wall-clock |
 | T3 | `…DeadlineAgainstAlreadyExitedChildReportsTheRealExit` (hermetic) | **arm B**: exit 7 survives, `terminated-by=normal`, `cpu-timeout=…:fired-not-executed`, `scope.signalled()` false. The committed reproduction, inverted (§8) | the naive draft; any missing conjunct |
 | T4 | `…DeadlineWithLiveLeaderStillKills` (hermetic) | the over-widening guard: empty scope but leader `processAlive` ⇒ arm C/A, never B. Stops "an empty scope means the job finished" | `processDead` forced at the call site |
@@ -582,6 +856,10 @@ the killed arm, where a soak is not needed.
 | T12 | `…ShimModeRefusesBothBounds` | §3.1 fail-closed refusal | a bound silently ignored in shim mode |
 | T13 | `cmd/aira`: `parseConfineArgs` accepts each bound once, requires a value, rejects non-positive, and `parseConfineManagementArgs` still refuses both | the flag surface | a valueless or repeatable option |
 | T14 | `internal/core` + `cmd/aira` MCP/CLI parity | AIRA-136's build found `cmd/aira/mcp.go` hand-maintains a default per argument; confine's own faces must be checked the same way | a face that silently drops the bound |
+| **T15** | `TestAIRA138DeadlineKillsALeafEmptySubtreePopulatedScope` (hermetic, **new fake**) | **the plan-gate P0**: `Members()==[]` while `Empty()==false` ⇒ `killConfineScope` **writes** `cgroup.kill`, returns `Started:true`, and the run lands in arm A — never arm B, never `fired-unevaluated`. Also asserts the converse in the same test: both reads empty ⇒ no write, `{Empty:true, Started:false}` | the leaf-only gate (mutation 5); and, in the other direction, a gate widened until arm B is unreachable |
+| **T16** | `…DeadlineKillsAJobLivingInAChildCgroup` (real cgroup) | the same shape against the kernel, not a fake: the confined payload creates `<scope>/.aira-nested`, migrates itself into it, and spins. The deadline must still end it, `terminated-by=deadline:*`, `…:fired-kill-completed`. This is the motivating aitest/`--delegate-ram` shape end to end | any gate, fake or real, that reads leaf `cgroup.procs` as emptiness |
+| **T17** | `TestAIRA138DeadlineWritesOneDiagnosticLinePerArm` (hermetic) | §5.3's fire-time stderr line exists, names the flag and the budget, and is arm-correct (past tense only for what happened); and that the kill is not gated on the write | a silent deadline (P2), or a line claiming a kill on arm B/C |
+| **T18** | `TestAIRA138ConfineDeadlineStateRule` (pure, **table**) | `decideConfineDeadlineState` over **every** row of §5.6.1: not-requested, each fire-derived state, the four gate-named cross-bound cases, and both `unenforced` routes (unmeasured, measured-breached) | any competing rule for the `cpu-timeout=` field; `unenforced` shadowing a fire-derived state |
 
 **Mutation (executed reverts, run not read), recorded in the ticket's Evidence
 section at build time:**
@@ -590,15 +868,29 @@ section at build time:**
 2. Force it to `true` ⇒ T4, T5 must fail.
 3. Move step 7 above step 3 in the classifier ⇒ T8 must fail.
 4. Neuter the CPU wiring (never sample) ⇒ T1, T2, T9 must fail.
-5. Replace `killConfineScope`'s two-read empty check with `len(pids)==0` alone
-   ⇒ a test must go red, or the guard is porous and the plan is wrong.
+5. **Restore the leaf-only gate** — replace `killConfineScope`'s
+   leaf-then-subtree check with `if len(pids) == 0 { … return }` alone, i.e. run's
+   `killScope` gate verbatim ⇒ **T15 and T16 must both fail**, T15 because no
+   `cgroup.kill` write is recorded against a leaf-empty/subtree-populated scope
+   and T16 because the real nested job outlives its deadline. This is the
+   plan-gate P0's own mutation, and it is already executable today against the
+   committed reproduction (`TestAIRA138LeafOnlyKillGateIsInertAgainstANested
+   Workload`, §8), so it is not a promise made about future code.
+6. Widen the gate the other way — kill unconditionally, dropping the
+   both-reads-empty refusal ⇒ **T3 must fail** (arm B becomes unreachable and the
+   AIRA-126 fabrication returns). Mutations 5 and 6 bracket the gate from both
+   sides; either alone would leave a porous guard.
+7. Collapse `decideConfineDeadlineState`'s precedence — return `unenforced`
+   whenever `cpuUnenforced` is true, before the fire-derived cases ⇒ T18 must
+   fail on the `fired-not-executed` row.
 
 ---
 
 ## 8. How the committed reproduction is inverted, not deleted
 
 `internal/runner/confine_deadline_danger_linux_test.go` ships with this plan and
-passes 5/5 today. At implement time:
+**passes green today** (`aira confine -- go test -count=1 -run TestAIRA138 -v
+./internal/runner/` → exit 0, 4 tests). At implement time:
 
 - `TestAIRA138ConfineHasNoJobDeadlineToday` is **inverted** into a positive
   assertion that `ConfineRequest.Timeout` / `.CPUTimeout` and the two
@@ -612,6 +904,19 @@ passes 5/5 today. At implement time:
   porous.
 - `TestAIRA138DeadlineSourcePrimitivesAreReusableFromConfine` is kept as-is and
   extended to assert `fired.Kind == deadlineKindCPU` (§4.2).
+- `TestAIRA138LeafOnlyKillGateIsInertAgainstANestedWorkload` — **added at
+  plan-fix in answer to the gate's P0** — becomes **T15**: the same
+  `nestedWorkloadScope`, driven through the real `killConfineScope` instead of
+  the local `twoReadKillDraft`. `leafOnlyKillDraft` is **kept** in the file, for
+  the same reason `naiveConfineDeadlineDraft` is: it is mutation 5's executed
+  target and the proof that T15 is not porous. `nestedWorkloadScope` itself is
+  promoted to the shared confine test seam, since T17 needs it too.
+
+The plan-fix additions to this file were run before this revision was committed:
+both drafts against a busy nested scope, the corrected gate against an empty one,
+and the positive assertion that `livenessScope` cannot express the state. The P0
+reproduces deterministically — leaf-only gate: `{Empty:false Started:false
+Completed:false}`, `cgroup.kill` written = **false**, job still running.
 
 ---
 
@@ -651,9 +956,9 @@ passes 5/5 today. At implement time:
 
 | File | Change |
 | --- | --- |
-| `internal/runner/confine.go` | `ConfineRequest.Timeout` / `.CPUTimeout`; `ConfineStatus` two facets + their vocabulary; `FormatConfineStatus` renders them when requested |
-| `internal/runner/confine_linux.go` | the wait behind a channel; the one deadline branch and one kill site; `killConfineScope`; the CPU baseline read; step 7 in `classifyConfineTermination`; a `formatConfineDeadlineAdvisory` |
-| `internal/runner/decisions.go` | `decideConfineDeadlineNotExecuted` (new, sited beside AIRA-126's) |
+| `internal/runner/confine.go` | `ConfineRequest.Timeout` / `.CPUTimeout`; `ConfineStatus` two facets; the `ConfineDeadlineState` type and its six constants (§5.6.1); `FormatConfineStatus` renders each field when requested |
+| `internal/runner/confine_linux.go` | the wait behind a channel; the one deadline branch and one kill site; `killConfineScope` with the **two-read** gate and the two named constants (§5.2); the fire-time diagnostic line (§5.3); the CPU baseline read; step 7 in `classifyConfineTermination`; a `formatConfineDeadlineAdvisory` |
+| `internal/runner/decisions.go` | `decideConfineDeadlineNotExecuted` and `decideConfineDeadlineState` (both new, sited beside AIRA-126's) |
 | `internal/runner/deadline_linux.go` | `deadlineKind` + `deadlineFire.Kind` — additive only (§4.2) |
 | `cmd/aira/main.go` | `parseConfineArgs` accepts and validates both options; `runConfineCommand` transcribes them |
 | `cmd/aira/mcp.go` + skill/help surfaces | per AIRA-136's build finding: hand-maintained per-argument defaults must be checked, not assumed generated |
@@ -663,6 +968,27 @@ passes 5/5 today. At implement time:
 Explicitly **not** touched: `waitConfineCommand`, `killScope`, `killWithIntent`,
 `mergeEvidence`, the run terminal CAS, `decideTimeoutIntentNotExecuted`,
 `decideNotExecutedDisposition`, `ConfineDetachSchema`.
+
+`killScope` staying untouched is now a **deliberate, filed** decision rather than
+an omission — see §10.1.
+
+### 10.1 Filed, not fixed here: `aira run` has the same defect (**AIRA-140**)
+
+The plan gate observed that `Runner.killScope`
+(`runner_linux.go:2244-2252`) carries the identical leaf-only gate, so `aira run
+--timeout` / `--cpu-timeout` is **likewise inert** against a leaf-empty,
+subtree-busy job. That is true, and it is out of AIRA-138's scope.
+
+It is not a rider: fixing run's gate touches AIRA-126's arbitrated launch path,
+its SIGTERM-grace ordering (`Terminate(pids)` takes leaf pids, which are empty in
+this shape) and its terminal CAS, none of which this ticket otherwise goes near,
+and a change there would have to be gated on its own evidence.
+
+It is also not dropped. **`.aira/tickets/AIRA-140.md` is filed with this
+plan-fix revision**, carrying the defect, the fix, the ordering hazard, and the
+instruction to reuse this ticket's `nestedWorkloadScope` and its executable
+reproduction. AIRA-138's own artifacts are written to be reused there: the fake
+and the danger proof are general, not confine-specific.
 
 ---
 
@@ -681,5 +1007,35 @@ Explicitly **not** touched: `waitConfineCommand`, `killScope`, `killWithIntent`,
 5. **§5.2** — that dropping AIRA-126's two ledger conjuncts is sound because the
    artifact they guard does not exist, and is not a quiet relaxation of the
    evidence bar.
+6. **§5.2.1** — that the two-read gate, which *diverges* from `killScope`'s
+   discipline rather than copying it, is the right divergence: it strengthens
+   arm B's proof (two agreeing reads, not one) while removing the inertness. The
+   gate may prefer that AIRA-140 land first so the two verbs share one gate; this
+   plan's position is that confine must not wait on run to stop being inert.
+7. **§5.6.1** — the stated precedence (fire-derived beats `unenforced`). The
+   opposite reading — that an unenforced budget is the more alarming fact and
+   should win — is coherent; this plan rejects it because `fired-not-executed`
+   *entails* unenforced and says more, so the chosen order strictly dominates.
+
+---
+
+## 12. What changed at plan-fix (gate round 1 → this revision)
+
+Recorded so the gate reviews a diff, not a new document.
+
+| Gate finding | Where fixed | What changed |
+| --- | --- | --- |
+| **P0** — `killConfineScope` inert for the motivating (leaf-empty, subtree-busy) shape | §5.2, new §5.2.1; §5.3 arm table; §0 (4 new source rows) | the no-signal refusal now requires **both** reads empty; a populated subtree falls through to the recursive `cgroup.kill`; `Empty()` errors become `unevaluated`. `decideConfineDeadlineNotExecuted` is **unchanged** — its `Empty` input is now strictly stronger. New T15 (hermetic, new decoupled fake) + T16 (real nested cgroup); mutations 5 and 6 bracket the gate from both sides. The hazard is now an **executed** reproduction, committed and green (§8) |
+| **P1** — trailer state derivation under-specified; two rules competing for `cpu-timeout=` | new §5.6.1 | `decideConfineDeadlineState`, a total pure rule in `decisions.go` with a typed closed vocabulary, an explicit precedence (fire-derived wins for the bound that fired; measurement decides for one that did not), the four gate-named cases resolved in a table, and T18 as a row-per-case table test |
+| **P2** — no stderr diagnostic at fire time | §5.3 | one line per arm at the fire, in the signal handler's tense and act-first/log-second discipline; T17 |
+| **P2** — `fired-killed` contradicts `terminated-by=normal` | §5.6 (renamed throughout) | renamed `fired-kill-completed`, **and** the vocabulary now states that these states describe the kill operation, not the cause of death, which `terminated-by` owns |
+| **Nit** — two constants used but never valued | §5.2 | `confineDeadlineKillGrace = 2s` (cleanupConfineScope's own value, named not minted); `confineArbitrationWaitBound = arbitrationWaitFloor` (250ms), with run's cost argument restated for confine's ledger-free case |
+| **Nit** — `--timeout`'s start point unstated | §2 | both bounds start at the **release write**, excluding the admission wait and setup; the early-direction argument is given, and the help text is written out verbatim |
+| **Follow-up** — run's `killScope` has the identical defect | new §10.1 | **`.aira/tickets/AIRA-140.md` filed with this revision**; not a rider, not dropped; AIRA-138's fake and reproduction are written to be reused there |
+
+Nothing the gate marked "verified sound" was changed: the arms A/B/C structure,
+`decideConfineDeadlineNotExecuted`, the exit pass-through (§5.4), step-7
+placement (§5.5), the detach reading (§3.2), and every §9 deferral stand as
+gated.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>

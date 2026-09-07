@@ -6,6 +6,7 @@ import (
 	"context"
 	"os/exec"
 	"reflect"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -300,4 +301,225 @@ func TestAIRA138DeadlineSourcePrimitivesAreReusableFromConfine(t *testing.T) {
 	// Nothing above needed a Runner, a ledger, a RunRecord or a Request: the
 	// reuse the ticket asserts is real.
 	_ = context.Background()
+}
+
+// ---------------------------------------------------------------------------
+// AIRA-138 DANGER PROOF 2 (added at plan-fix, in answer to the plan gate's P0).
+//
+// The first danger proof above reproduces AIRA-126's fabrication in confine's
+// currency. The plan gate then found a SECOND, independent hazard in the fix
+// that was proposed for it: the draft `killConfineScope` copied `aira run`'s
+// `killScope` gate verbatim (runner_linux.go:2244-2252), which refuses to write
+// `cgroup.kill` whenever LEAF `cgroup.procs` is empty.
+//
+// That gate is inert against confine's flagship heavy-job shape. An aitest /
+// --delegate-ram job drains EVERY pid out of the outer scope into
+// `<outer>/.aira-supervisor` and `.aira-worker-N` (BootstrapAitestSupervisor);
+// `podman --cgroups=split` and any nested-cgroup workload do the same. Such a
+// job is LEAF-EMPTY WHILE FULLY BUSY. The repository already knows this and says
+// so twice, in the two places that had to get it right:
+//
+//   - confine_manage_linux.go (killConfine): "Leaf-only cgroup.procs would miss a
+//     workload that migrated into a child cgroup it created inside its own scope
+//     ... cgroup.kill is itself recursive, so the whole subtree is the correct
+//     unit for both the gate and the confirmation."
+//   - confine_manage.go (ConfineRecord.SubtreePopulated): "a fully busy suite
+//     reads Populated == 0 while SubtreePopulated is true. Reading a running job
+//     as empty is how an exclusive benchmark would be handed a fabricated 'you
+//     are alone'."
+//
+// This test makes that hazard EXECUTABLE rather than argued, so the plan's
+// mutation #5 has something to go red. It is inverted into T15 by the
+// implementation: see the plan's §7 and §8.
+//
+// verifies: AIRA-138 (reproduction phase)
+
+// nestedWorkloadScope models the one shape `livenessScope` structurally cannot
+// express, and the reason a second fake is needed rather than a parameter on the
+// first: `livenessScope.Empty()` is DERIVED from the same `membersLocked()` that
+// `Members()` returns, so its two reads are coupled by construction and can
+// never disagree. A real cgroup's two reads are independent sources —
+// `cgroup.procs` (leaf) and `cgroup.events` `populated` (subtree-aware) — and it
+// is exactly their disagreement that the leaf-only gate is blind to.
+type nestedWorkloadScope struct {
+	mu sync.Mutex
+	// subtreePopulated is the `cgroup.events` reading: true while the workload is
+	// alive in a CHILD cgroup of this scope.
+	subtreePopulated bool
+	killed           bool
+	terminated       bool
+}
+
+func (s *nestedWorkloadScope) Reference() string { return "/aira138-nested-scope" }
+func (s *nestedWorkloadScope) FD() int           { return -1 }
+
+// Members reads LEAF cgroup.procs and is therefore ALWAYS empty here: every pid
+// of this job lives in a child cgroup the job created inside its own scope.
+func (s *nestedWorkloadScope) Members() ([]int, error) { return nil, nil }
+
+func (s *nestedWorkloadScope) Empty() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.subtreePopulated, nil
+}
+
+func (s *nestedWorkloadScope) Terminate([]int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.terminated = true
+	return nil
+}
+
+// Kill models cgroup.kill's documented RECURSION: one write reaches the whole
+// subtree, which is why the subtree is the correct unit for the gate too.
+func (s *nestedWorkloadScope) Kill() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.killed = true
+	s.subtreePopulated = false
+	return nil
+}
+
+func (s *nestedWorkloadScope) Remove() error { return nil }
+
+func (s *nestedWorkloadScope) signalled() (bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminated, s.killed
+}
+
+// draftKillResult is the plan's `confineKillResult` under a test-local name, so
+// this reproduction depends on no production type that does not exist yet.
+type draftKillResult struct {
+	Empty     bool
+	Started   bool
+	Completed bool
+}
+
+// leafOnlyKillDraft is the plan's ORIGINAL §5.2 gate: `aira run`'s `killScope`
+// refusal discipline transplanted verbatim, refusing to write cgroup.kill on an
+// empty LEAF read. It is the mutation target for the plan's mutation #5.
+func leafOnlyKillDraft(ctx context.Context, scope Scope) (draftKillResult, error) {
+	pids, err := scope.Members()
+	if err != nil {
+		return draftKillResult{}, err
+	}
+	if len(pids) == 0 {
+		empty, emptyErr := scope.Empty()
+		return draftKillResult{Empty: empty && emptyErr == nil}, emptyErr
+	}
+	if err := scope.Kill(); err != nil {
+		return draftKillResult{}, err
+	}
+	if err := waitEmpty(ctx, scope, time.Second); err != nil {
+		return draftKillResult{Started: true}, err
+	}
+	return draftKillResult{Started: true, Completed: true, Empty: true}, nil
+}
+
+// twoReadKillDraft is the CORRECTED gate the plan-fix adopts: the no-signal
+// refusal requires BOTH reads to agree that the scope is empty. A leaf-empty,
+// subtree-populated scope falls through to the recursive kill, which is the
+// whole point; a scope both reads call empty still returns before any write,
+// which is what keeps arm B's `Empty && !Started` proof intact.
+func twoReadKillDraft(ctx context.Context, scope Scope) (draftKillResult, error) {
+	pids, err := scope.Members()
+	if err != nil {
+		return draftKillResult{}, err
+	}
+	if len(pids) == 0 {
+		empty, emptyErr := scope.Empty()
+		if emptyErr != nil {
+			return draftKillResult{}, emptyErr
+		}
+		if empty {
+			return draftKillResult{Empty: true}, nil
+		}
+		// leaf-empty, subtree-populated: fall through and kill.
+	}
+	if err := scope.Kill(); err != nil {
+		return draftKillResult{}, err
+	}
+	if err := waitEmpty(ctx, scope, time.Second); err != nil {
+		return draftKillResult{Started: true}, err
+	}
+	return draftKillResult{Started: true, Completed: true, Empty: true}, nil
+}
+
+// TestAIRA138LeafOnlyKillGateIsInertAgainstANestedWorkload is the second danger
+// proof. It shows, against the same busy job, that the leaf-only gate emits no
+// signal at all while the corrected two-read gate kills it — and that the
+// correction does NOT weaken arm B, whose refusal must survive untouched.
+func TestAIRA138LeafOnlyKillGateIsInertAgainstANestedWorkload(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. THE HAZARD. A fully busy nested workload, seen through the leaf-only gate.
+	busy := &nestedWorkloadScope{subtreePopulated: true}
+	attempt, err := leafOnlyKillDraft(ctx, busy)
+	if err != nil {
+		t.Fatalf("the leaf-only gate errored, so this is not the state under test: %v", err)
+	}
+	if attempt.Started {
+		t.Fatal("the leaf-only gate wrote cgroup.kill; this reproduction no longer reproduces anything")
+	}
+	if _, killed := busy.signalled(); killed {
+		t.Fatal("cgroup.kill was recorded despite Started=false")
+	}
+	if empty, _ := busy.Empty(); empty {
+		t.Fatal("the workload is not populated, so the reproduction never reached its state")
+	}
+	// The bound fired, the job is still running, and NOTHING was signalled. The
+	// arbitration cannot rescue this either: with Empty=false the plan's arm-B
+	// conjunct is false, so the run reports `fired-unevaluated` and then waits for
+	// the job it was supposed to end.
+	if attempt.Empty {
+		t.Fatalf("a busy subtree reported Empty=true: %+v", attempt)
+	}
+	t.Logf("AIRA-138 P0 reproduced: leaf-empty/subtree-populated job, deadline fired, "+
+		"kill attempt = %+v, cgroup.kill written = false, job still running", attempt)
+
+	// 2. THE FIX. The same busy job, seen through the two-read gate.
+	busy2 := &nestedWorkloadScope{subtreePopulated: true}
+	fixed, err := twoReadKillDraft(ctx, busy2)
+	if err != nil {
+		t.Fatalf("the two-read gate errored against a busy nested workload: %v", err)
+	}
+	if !fixed.Started || !fixed.Completed {
+		t.Fatalf("the two-read gate did not kill a busy nested workload: %+v", fixed)
+	}
+	if _, killed := busy2.signalled(); !killed {
+		t.Fatal("the two-read gate reported Started without recording a cgroup.kill write")
+	}
+
+	// 3. THE ANTI-OVER-CORRECTION. A scope BOTH reads call empty must still
+	// return before any write: that `Empty && !Started` shape is the sole input
+	// to decideConfineDeadlineNotExecuted, and widening the kill would silently
+	// delete arm B.
+	quiet := &nestedWorkloadScope{subtreePopulated: false}
+	refused, err := twoReadKillDraft(ctx, quiet)
+	if err != nil {
+		t.Fatalf("the two-read gate errored against an empty scope: %v", err)
+	}
+	if !refused.Empty || refused.Started || refused.Completed {
+		t.Fatalf("the two-read gate did not refuse an empty scope: %+v", refused)
+	}
+	if _, killed := quiet.signalled(); killed {
+		t.Fatal("the two-read gate wrote cgroup.kill against a scope both reads called empty")
+	}
+
+	// 4. WHY A SECOND FAKE EXISTS, pinned rather than asserted in prose:
+	// livenessScope's two reads are coupled, so it can never produce the state
+	// above and could never have surfaced this defect.
+	coupled := &livenessScope{}
+	members, membersErr := coupled.Members()
+	empty, emptyErr := coupled.Empty()
+	if membersErr != nil || emptyErr != nil {
+		t.Fatalf("livenessScope reads errored: members=%v empty=%v", membersErr, emptyErr)
+	}
+	if len(members) != 0 || !empty {
+		t.Fatalf("livenessScope did not start empty: members=%v empty=%v", members, empty)
+	}
+	if len(members) == 0 && !empty {
+		t.Fatal("livenessScope expressed leaf-empty/subtree-populated; the second fake is now redundant")
+	}
 }
