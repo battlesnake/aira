@@ -174,10 +174,23 @@ func TestAIRA138NaiveConfineDeadlineFabricatesAKill(t *testing.T) {
 	}
 	scope := &livenessScope{}
 
+	// AIRA-148. `readyBound` must stay STRICTLY INSIDE gatedStdin's `hold`. The
+	// hold is the only thing keeping `cmd.Wait()` pending past the fire, so a
+	// readiness poll allowed to outlive it would let the draft take its WAIT
+	// branch and the reproduction would then fail as "vacuous" rather than as
+	// "never reached its state" — a misleading diagnosis of a timing problem.
+	// The original code had exactly that inversion latent in it (a 5s readiness
+	// gate against a 2s hold); the guard below is what stops a future edit from
+	// re-introducing it silently.
+	hold, readyBound := aira126Scale(5*time.Second), aira126Scale(2*time.Second)
+	if readyBound >= hold {
+		t.Fatalf("the readiness bound (%s) must stay inside gatedStdin's hold (%s)", readyBound, hold)
+	}
+
 	// exit 7, chosen so the fabricated 137 cannot coincide with the real code and
 	// so a passing assertion cannot be a zero-value accident.
 	cmd := exec.Command("/bin/sh", "-c", "exit 7")
-	cmd.Stdin = gatedStdin{hold: aira126Scale(2 * time.Second)}
+	cmd.Stdin = gatedStdin{hold: hold}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child: %v", err)
 	}
@@ -198,12 +211,50 @@ func TestAIRA138NaiveConfineDeadlineFabricatesAKill(t *testing.T) {
 		done <- draftResult{outcome, pending}
 	}()
 
-	// Wait until the leader is PROVABLY gone. This is the state the fire must
-	// land in, and it is established by the kernel, not assumed.
-	deadline := time.Now().Add(aira126Scale(5 * time.Second))
-	for processLive(identity) != processDead {
+	// Wait until the WHOLE state the fire must land in has arrived — the leader
+	// provably gone AND the scope actually empty — established by the kernel, not
+	// assumed.
+	//
+	// AIRA-148. This gate used to poll `processLive(identity) != processDead`
+	// alone and then assert, in the next breath, that the scope was already
+	// empty. Those are two DIFFERENT observations of the same child, and one
+	// strictly PRECEDES the other rather than arriving with it:
+	//
+	//   - `processLive` reads /proc/<pid>/stat's STATE field, so it answers
+	//     `processDead` the moment the child becomes a ZOMBIE ('Z').
+	//   - `livenessScope.membersLocked()` deliberately does NOT read that field:
+	//     existence plus a matching start tick IS membership, because "a zombie is
+	//     still listed (as a real cgroup lists it) and a reaped task is not". The
+	//     leader therefore leaves this scope only at the REAP.
+	//
+	// The reap is performed by `cmd.Wait()` inside the draft's own wait goroutine,
+	// two `go` statements away from this loop, so the entire zombie window sat
+	// between the old gate and the assertion that followed it. On a loaded box the
+	// test then failed at its own SETUP — `the scope was not empty at the fire:
+	// members=[<pid>]` — before its subject was exercised at all (measured: 0/30
+	// on a quiet box, 7/60 at load average 35-46; the ticket records 11/20 at load
+	// ~32). Nothing about the race is in production code: `processLive` and
+	// `membersLocked` are answering two different questions, correctly, and the
+	// test was reading one as an answer to the other.
+	//
+	// Polling the real precondition removes the window without weakening anything.
+	// Every assertion below still runs against a single instantaneous read, and a
+	// state that never arrives still fails — the loop falls THROUGH on expiry
+	// rather than calling t.Fatal, so those assertions name exactly which facet is
+	// missing instead of a generic "never reached its state".
+	//
+	// `Empty()` is polled rather than `Members()` because the two are derived from
+	// the same `membersLocked()` (step 4 of this file's second danger proof pins
+	// that coupling as structural) and `Empty()` alone has no `firstMembersDone`
+	// side effect to spend on a poll.
+	deadline := time.Now().Add(readyBound)
+	for {
+		empty, emptyErr := scope.Empty()
+		if emptyErr == nil && empty && processLive(identity) == processDead {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatal("the child never became provably dead; the reproduction never reached its state")
+			break
 		}
 		time.Sleep(time.Millisecond)
 	}
