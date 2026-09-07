@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -875,6 +876,114 @@ func TestAIRA131DetachedStdinConnectRefusedDispositionLeavesLedgerIntact(t *test
 	}
 	if !current.ScopeKill.Completed || current.ScopeKill.Actor != "concurrent-killer" {
 		t.Fatalf("the concurrent actor's scope-kill evidence was lost: %+v", current)
+	}
+	if got := terminalRecords(t, r); got != 0 {
+		t.Fatalf("terminal records=%d", got)
+	}
+}
+
+// TestAIRA131DetachedEscapedLeaderExitingInsideDrainWindowStaysUnevaluated is
+// T8, added by the build review. It pins the liveness read AT THE CALL SITE —
+// processLive(record.PIDIdentity), evaluated at the instant the kill found
+// nothing — which T2 cannot: T2's leader lives 30s, so a mis-wired liveness
+// input (a stale or forced processDead) is masked there by the drain bound
+// expiring first and falling into the same U_RUN_RECONCILE_REQUIRED arm.
+//
+// Here the escaped leader is ALIVE at the deadline but exits INSIDE the drain
+// window. "The drain succeeded" then only proves the leader was dead by the
+// time the drain succeeded, NOT at the deadline — and only the conjunct
+// decides. Correct behaviour: the run stays unevaluated; it must not be
+// arbitrated to Exited because the leader happened to exit a moment later.
+// Verified red against both `processDead` forced at the call site and the
+// guard removed entirely, with T2 green under the same mutations.
+//
+// The leader's life is scaled with the deadline (the reverse of T1's device,
+// where the child must be dead BEFORE the deadline): it must outlive the scaled
+// deadline and die before the scaled drain bound at any testdeadline.Scale().
+func TestAIRA131DetachedEscapedLeaderExitingInsideDrainWindowStaysUnevaluated(t *testing.T) {
+	bootID, err := readBootIDFn()
+	if err != nil || bootID == "" {
+		t.Skipf("kernel boot id unavailable: %v", err)
+	}
+	scope := &livenessScope{emptyAfterFirstMembers: true}
+	deadline := aira126Scale(200 * time.Millisecond)
+	r, err := New(Config{
+		CommonDir: t.TempDir(),
+		Backend:   &livenessBackend{scope: scope},
+		// The drain bound (arbitrationWaitBound(Grace)) must outlast the leader.
+		Grace:     aira126Scale(2 * time.Second),
+		TermGrace: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var child *os.Process
+	r.startFn = func(cmd *exec.Cmd) error {
+		cmd.SysProcAttr.UseCgroupFD, cmd.SysProcAttr.CgroupFD = false, 0
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		scope.adopt(PIDIdentity{PID: cmd.Process.Pid, StartTick: processStartTick(cmd.Process.Pid), BootID: bootID})
+		child = cmd.Process
+		return nil
+	}
+	t.Cleanup(func() {
+		if child != nil {
+			_ = child.Kill()
+		}
+	})
+
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackR, ackW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Alive at the deadline (3x margin), dead well inside the drain bound.
+	req := Request{
+		Argv:        []string{"/bin/sleep", fmt.Sprintf("%.3f", (3 * deadline).Seconds())},
+		Detach:      true,
+		Timeout:     deadline,
+		detachReady: &detachSignal{file: readyW},
+		detachAck:   ackR,
+	}
+	type outcome struct {
+		record *RunRecord
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		record, launchError := r.launchDetachedValidated(context.Background(), req, nil, t.TempDir(), []string{}, "digest", "none", req.Argv, bootID)
+		done <- outcome{record: record, err: launchError}
+	}()
+	var ready detachReadyMessage
+	if err := json.NewDecoder(readyR).Decode(&ready); err != nil || ready.ID == "" {
+		t.Fatalf("readiness=%+v err=%v", ready, err)
+	}
+	if _, err := ackW.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackW.Close()
+
+	result := <-done
+	var launchError *LaunchError
+	if !errors.As(result.err, &launchError) || launchError.Code != "U_RUN_RECONCILE_REQUIRED" {
+		t.Fatalf("a leader ALIVE at the deadline was arbitrated away because it exited inside the drain window: err=%v record=%+v", result.err, result.record)
+	}
+	if result.record != nil {
+		t.Fatalf("the unevaluated arm published a record instead of nil: %+v", result.record)
+	}
+	current, err := r.Get(ready.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.KillIntent.NotExecuted || current.Status.Terminal() {
+		t.Fatalf("a leader alive at the deadline was dispositioned not-executed: %+v", current)
+	}
+	if !current.KillIntent.Present || current.KillIntent.Completed {
+		t.Fatalf("the deadline's intent evidence was lost: %+v", current)
 	}
 	if got := terminalRecords(t, r); got != 0 {
 		t.Fatalf("terminal records=%d", got)

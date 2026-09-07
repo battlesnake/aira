@@ -100,14 +100,22 @@ needs the adopted leader genuinely signalled.
 - Bypassing `appendDetachedNotExecutedLocked`'s CAS refusal (`if false {`) →
   T4 fails, reporting the concurrent actor's `Completed:true` kill silently
   overwritten to `Completed:false, NotExecuted:true`.
-- (T2 was also tried against a call-site mutation forcing `processDead`
-  unconditionally; it did not go red. This is not porosity — with a real OS
-  process, `waitCh` can only ever deliver once the leader has genuinely
-  exited, so "drain succeeds" and "leader dead" are tautologically linked in
-  this harness. The `processDead` conjunct itself is pinned at the pure
-  function level by the existing, unmodified `TestAIRA126TimeoutIntentNotExecutedRule`,
-  which AIRA-131 relies on rather than duplicates, per the plan's own risk
-  table.)
+- T2 was also tried against a call-site mutation forcing `processDead`
+  unconditionally; it did not go red. The build's first explanation — that
+  "drain succeeds" and "leader dead" are tautologically linked with a real OS
+  process — was **corrected by the Fable build review**: the drain only proves
+  the leader was dead *by the time the drain succeeded*, not *at the deadline*.
+  T2's 30s leader never delivers inside the bound, so the drain-expiry arm masks
+  a mis-wired liveness input there. The review's counterexample — an escaped
+  leader alive at the deadline that exits *inside* the drain window — goes red
+  against both `processDead` forced at the call site and the guard removed
+  entirely (arbitrated to `exited`/`NotExecuted`), while T2 stays green under
+  the same mutations. Per policy it became regression test **T8**
+  `TestAIRA131DetachedEscapedLeaderExitingInsideDrainWindowStaysUnevaluated`.
+  The conjunct's pure-function semantics remain pinned by the unmodified
+  `TestAIRA126TimeoutIntentNotExecutedRule`; T8 pins the call-site wiring.
+- Fable review's own additional mutations: dropping the `IntentCreated`
+  conjunct at the call site → T3 red; guard removed entirely → T3 + T8 red.
 
 **Gate**, foreground, exact exit codes:
 `aira confine -- go build ./...` 0; `aira confine -- go vet ./...` 0;
