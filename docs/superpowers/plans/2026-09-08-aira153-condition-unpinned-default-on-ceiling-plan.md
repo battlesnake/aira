@@ -92,7 +92,7 @@ Every line below was read fresh in this worktree at `0165918` (== `origin/master
 | ci-shim reports no peak-RSS and no OOM (AIRA-121 C10), so the OOM branch is unreachable there — but the four post-block fallbacks are not | `internal/runner/confine_shim_linux.go:469-484`; `admit.go:1735-1744` | yes — **the shim's route into this defect is `fallback:no-history`, not the OOM branch** |
 | the AIRA-52 gauge selects `estimate%` and then `$`-anchors its matchers, so every other basis lands on `default:` → `malformedBasis` + `excluded`; `fallback:` bases never enter the population at all | `internal/store/admission_insight.go:64-66`, `:111-122`; `internal/runner/estimate_actual.go:47` | yes — unchanged by this ticket (R5) |
 | the AIRA-128 fixture's slice budget is `runner.DefaultConfineMemoryReserve + (2 << 30)` = 6 GiB, chosen by AIRA-139 to keep phase 3 clear of the clamp; fixture headroom is 32 MiB + 8 MiB | `internal/daemon/confine_oom_selfheal_real_cgroup_linux_test.go:93-133`, `:174-175` | yes — §1.4 shows this makes it a structural no-op here too |
-| AIRA-149's facet-2b fixtures declare `maximum = 4 GiB` (eight sites) and `8 GiB` (one), with `oomClampedHistory()` driving AIRA-151 row (b) | `internal/daemon/admit_saturated_diagnosis_test.go:41-42`, `:57-83`, and the `const maximum` sites at `:259,301,333,362,405,456,539,567,641` | yes — §1.4 shows every one of them resolves IDENTICALLY after this change |
+| AIRA-149's facet-2b fixtures: **eight** `maximum = 4 GiB` declarations (`:259,301,333,362,405,539,567,641`) serving **ten** `oomClampedHistory()` call sites (`:261,303,335,364,407,541,571,597,645,673`), plus **two** `8 GiB` declarations (`:227` inside a `const (…)` block, and `:456`) that call it not at all | `internal/daemon/admit_saturated_diagnosis_test.go:41-42`, `:57-83` | yes — the same eight-declarations/ten-call-sites mapping AIRA-151 §9 recorded, at shifted lines; §1.4 shows every one of them resolves IDENTICALLY after this change, and the two 8 GiB sites are outside the OOM branch entirely |
 | the agent guide's self-heal paragraph carries AIRA-151's clause, and `skill_test.go` pins its exact sentence | `internal/core/skill.go:324`; `internal/core/skill_test.go:639-660` | yes — that sentence becomes FALSE after this change and must move (§3.6) |
 | `E_ADMIT_TOO_LARGE`'s operator message is `required=%d cap_minus_headroom=%d basis=%s`, raw bytes, no escape hatch | `admit.go:2799-2801` | yes — unchanged here; it is AIRA-151's filed G3 |
 
@@ -920,10 +920,12 @@ that *should* have objected are known. Each was checked against §0.1's boundary
   single most important green in the set:** AIRA-128's shipped self-heal claim
   and its basis string must not move, and a mis-implementation that fitted
   unconditionally (or fitted the escalation) fails here first.
-- The whole of `internal/daemon/admit_saturated_diagnosis_test.go` — all nine
-  `const maximum` sites, `oomClampedHistory()` and every `Required`/`Ceiling`/
-  `Grantable`/contention assertion. Verified in §0.1 (4): the hint is fitted and
-  the answer is unchanged because the escalation wins either way.
+- The whole of `internal/daemon/admit_saturated_diagnosis_test.go` — the eight
+  4 GiB `maximum` declarations and their ten `oomClampedHistory()` call sites,
+  the two 8 GiB declarations that use a non-OOM history, and every
+  `Required`/`Ceiling`/`Grantable`/contention assertion. Verified in §0.1 (4):
+  the hint IS fitted there and the answer is unchanged anyway, because the
+  escalation wins either way and the clamp then cuts it to the same ceiling.
 - `TestSliceCeilingDoesNotReachTheOOMEscalationClamp` (`sliceceiling_test.go`) —
   64 GiB, headroom 0 → no-op; the AIRA-103 static-ceiling rule is untouched.
 - `TestConfineEstimatorAndOOMEscalationClamp` and
