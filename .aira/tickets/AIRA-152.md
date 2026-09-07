@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-152","project":"aira","title":"Candidate: make the OOM escalation a replacement rather than a max with the unpinned default","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-152","project":"aira","title":"Candidate: make the OOM escalation a replacement rather than a max with the unpinned default","status":"superseded","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-152","to":"AIRA-151"}]}
 ---
 
 AIRA-149 deferral **F3**, with the cost analysis so a future session does not
@@ -50,3 +50,11 @@ taken, would shrink the population AIRA-151 acts on by making the resolved value
 smaller, not by changing what the clamp does. Anyone reopening it should start
 from AIRA-151's shipped behaviour, not from the pre-AIRA-151 code this ticket
 was written against.
+
+## Closed as superseded (2026-09-07)
+
+Status flipped `planned` -> `superseded`: the owner's decision above is final
+for this backlog round, so this is no longer live open work, though the
+technical option and its cost analysis remain valid and are preserved above
+for whoever reopens it. Superseded by the AIRA-151 decision, not rejected on
+technical merit.
