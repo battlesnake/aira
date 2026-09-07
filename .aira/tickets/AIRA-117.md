@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-117","project":"aira","title":"All three TestSliceCeilingRealCgroup* tests fail under -race on a real-cgroup host (helper dies before acknowledging)","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aira-106","cgroup","test","race"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-117","project":"aira","title":"All three TestSliceCeilingRealCgroup* tests fail under -race on a real-cgroup host (helper dies before acknowledging)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aira-106","cgroup","test","race"],"hold":false,"relations":[]}
 ---
 Found while verifying AIRA-35 under `-race` (which AIRA-20 has just re-enabled
 in CI). **Not caused by AIRA-35** -- reproduced on pristine `origin/master`
@@ -201,3 +201,59 @@ Run in the foreground under `aira confine`, exact exit codes:
 - bonus, the ticket's own "cannot be used as a pre-merge gate" complaint:
   `AIRA_REAL_CGROUP=1 go test -race ./internal/daemon/ -count=1` — exit **0**
   (`ok aira/internal/daemon 122.652s`)
+
+## Review (Fable build-review gate) — MERGED
+
+PR #90 merged as `5588a8d` (2026-09-07). Everything below is the reviewer's own
+reproduction on this host (kernel 6.18.33, go1.25.0), not the builder's transcript.
+
+- **Root cause independently re-confirmed BEFORE trusting the fix.** Pristine
+  `origin/master` (`4463bce`) in a detached worktree,
+  `AIRA_REAL_CGROUP=1 aira confine -- go test -race ./internal/daemon/ -run
+  TestSliceCeilingRealCgroupSignalTracksRealAccounting$` → exit 1, the bare
+  `helper did not acknowledge anon growth: <nil>`; and the kernel log, timestamped
+  after a marker taken immediately before the run:
+  `oom-kill:constraint=CONSTRAINT_MEMCG, oom_memcg=.../.aira-test-TestSliceCeilingRealCgroupSignalTracksRealAccounting-*/fixture,
+  task=daemon.test` / `Killed process (daemon.test) total-vm:6602704kB, anon-rss:2090112kB`.
+  Anon pinned at the flat 2 GiB cap; the hypothesis is an established finding.
+- **Fix addresses that cause.** On the branch, `-race -run TestSliceCeilingRealCgroup
+  -count=3` → exit 0, 18/18 PASS. The fixture OOM kills recorded after a fresh marker
+  were exactly three, all `HarnessDetectsALimitWrite` (the negative control, one per
+  count); zero from the three tests that used to die.
+- **The measurement the constants rest on holds in BOTH modes on this host:** the new
+  test logged resident = 1.79 GiB under `-race` (300 MiB touched x3 → 2.04x) and
+  1.77 GiB in the ordinary build (600 MiB x3), against the 2.01 GiB modelled worst
+  case and 4.02 GiB cap. `memory.peak` is present on this kernel, so the diagnostic
+  prints a real figure.
+- **Non-porosity re-run by the reviewer, both directions.** Pre-fix constants
+  restored (`raceScale=1`, `cap=2<<30`) under `-race` → FAIL with the new diagnostic
+  (`OOM-KILLED ... memory.max=2147483648 memory.peak=2147487744 oom_kill=1`).
+  `raceScale=1` with the NEW cap under `-race` → FAIL on the model bound alone
+  (resident 3.82 GiB > 2.01 GiB; `memory.current` clamped at the cap, no kill), so the
+  upper bound is live independently of the OOM path. Edits reverted, tree clean.
+- **Mechanism untouched:** `internal/daemon/sliceceiling.go` has no diff; only fixture
+  sizing and the `grow` diagnostic moved.
+- Gates, foreground under `aira confine`, exact exit codes: `go build ./...` 0;
+  `go vet ./...` 0; `go vet -race ./internal/daemon/` 0;
+  `AIRA_REAL_CGROUP=1 go test ./... -count=1` 0; the `-race -count=3` run above 0.
+  CI: build+vet+gofmt, test and race all green on the PR head.
+
+Accepted, non-blocking findings (documented, not fixed here):
+
+1. The "footprint invariant across build modes" claim is true of ANON only. The
+   helper's `file` instruction writes `size` = `ceilingFixtureTouch` bytes, so under
+   `-race` the page-cache growth in `SignalTracksRealAccounting` and
+   `NeverShrinksBelowRealUsage` is 300 MiB, not 600 MiB. Still ~3x the 96 MiB tolerance
+   and ~19x the 16 MiB test quantum, so the page-cache half of the signal is exercised
+   at a real, non-trivial size; noted as a precision gap in the Resolution's wording.
+2. `SignalTracksRealAccounting` (line ~539) asserts the anon rise against
+   `ceilingFixtureTouch - tolerance`, i.e. 204 MiB under `-race` for a rise that is
+   really ~600 MiB. It should compare against `ceilingFixtureResident` so the floor is
+   the same 504 MiB in both modes. Not a false-pass risk today: the new test's lower
+   bound (`resident >= 3 x 600 MiB - 96 MiB`) is the tripwire that catches a helper
+   charging less than the constants claim. Cheap follow-up tightening.
+3. `ceilingFixtureRaceScale = 2` is a measured property of this toolchain/kernel pair,
+   and the tripwire for it is a hard FAIL (not a skip) under `AIRA_REAL_CGROUP=1` on a
+   host where the factor differs. That is the intended honesty behaviour and the
+   message names both constants; recorded so the next reader on a different Go race
+   runtime knows where to look.
