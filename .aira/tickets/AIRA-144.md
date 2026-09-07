@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-144","project":"aira","title":"executeScopeKill leaves empty child-cgroup directories behind after a nested kill (scope.Remove is not deepest-first)","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["runner","cgroup"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-144","project":"aira","title":"executeScopeKill leaves empty child-cgroup directories behind after a nested kill (scope.Remove is not deepest-first)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["runner","cgroup"],"hold":false,"relations":[]}
 ---
 
 Accepted gap recorded during AIRA-140's Fable review (PR #89, merged `c662e6c`),
@@ -178,3 +178,51 @@ hidden. It is the AIRA-20 flake class, not a regression:
   `confineReapMaxDepth` (32) makes the walk return an error and the scope is
   left behind — the reaper's existing behaviour, reused deliberately rather than
   re-tuned for this caller.
+
+## Fable review record (2026-09-07) — MERGE, PR #92 merged `b142fac`
+
+Reviewed from source in a detached worktree at `dc9dba8`; merge against
+`origin/master` (`9ff6531`) clean with no overlapping files.
+
+Independent evidence, foreground, exact exit codes:
+
+```
+aira confine -- go build ./...                            -> 0
+aira confine -- go vet ./...                              -> 0
+AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1 -> 0
+```
+
+Both load-bearing mutations re-executed by the reviewer, not taken on report:
+
+1. `removeChildCgroups()` call deleted from `Remove()`: T1 and T2 FAILED with
+   the ticket's exact shape (`the run scope survived its own teardown:
+   .../.aira-RUN-1`, `leftover child cgroup: .../.aira-RUN-1/.aira-nested`);
+   T3, T4 passed. Source restored, `git status` clean.
+2. `Empty()` gate deleted from `Remove()`: T4 FAILED (`Remove() stripped a
+   LIVE job's empty child cgroup .../.aira-worker-1 instead of refusing at its
+   gate`); T1-T3 passed. Source restored.
+
+Source checks that closed the reviewer's remaining questions:
+
+- `testdeadline.Wait(300ms)` floors at `MinBackstop` (5s) before scaling, so
+  T1's kill cannot fire before the payload's four shell commands have nested —
+  the "killed before nesting, passes vacuously" race is closed by the floor,
+  the same way AIRA-140's T5 relies on it. Residual: T1 does not independently
+  attest that the nested shape was built (only the exit-9 sentinel guards the
+  environment). Accepted, same as AIRA-140.
+- `removedMeansEmpty` is set only on the confine-kill confirmation scope
+  (`confine_manage_linux.go`), which goes to `waitEmpty` and never to
+  `Remove()`, so the `Empty()`-true-on-ENOENT → `openat(fd, ".")` on a dead
+  cgroup path is unreachable in production.
+- The daemon never rmdirs worker scopes on lease close
+  (`worker_admit.go` ~L1097), so the outer confine scope's new sweep cannot
+  collide with a daemon-side removal.
+
+Observation (non-blocking, consistent with the stated design that a failed
+`Remove()` leaves the scope usable): when the child walk fails, `Remove()` now
+returns BEFORE `s.fd.Close()`, whereas the old EBUSY-rmdir path closed the fd
+first. Every caller discards the error and drops the scope, so in a long-lived
+process that fd would linger until the finalizer; today all `Remove()` callers
+are short-lived CLI/supervisor processes.
+
+The PR's three accepted gaps above are accepted by the reviewer.
