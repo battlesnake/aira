@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-161","project":"aira","title":"aitest's worker-death results are counted as ordinary failures with no aggregate legibility signal","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-161","project":"aira","title":"aitest's worker-death results are counted as ordinary failures with no aggregate legibility signal","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","honesty"],"hold":false,"relations":[]}
 ---
 When a worker dies (OOM kill, host watchdog, any non-reporting exit) and its one
 requeue also dies, aitest correctly records the nodeid as 'unevaluated' -- a distinct
@@ -126,3 +126,53 @@ Non-porosity, each mutant applied to an otherwise-clean tree with the aitest sui
 The Python tier is inside `make ci` transitively: `internal/pylib`'s
 `TestRealPytestAitestPackageUnitTests` shells out to a real `pytest -q aitest/test_*.py`.
 It was also run directly, standalone, for its own recorded exit code above.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #102 merged as `6cdecb5` (2026-09-08, real merge commit; branch head `145633c`).
+Everything below is the reviewer's own reproduction and code reading, not the builder's
+transcript.
+
+- **Purely additive, confirmed by diff.** The branch touches only `__init__.py`,
+  `README.md`, `test_init.py`, `test_junit_fidelity.py` and this ticket. `supervisor.py`
+  is untouched: `_handle_worker_exit`, `requeue_once`, and
+  `_synthesize_unevaluated_reports` (`outcome="failed"`, `when="call"`, longrepr
+  `"unevaluated: …"`) are byte-identical to master.
+- **Hook usage verified against installed pytest 9.0.3 source, not the citation.**
+  `_pytest/hookspec.py:1153` declares `pytest_terminal_summary(terminalreporter,
+  exitstatus, config)`. `TerminalReporter.pytest_sessionfinish` (terminal.py:957) calls
+  it only `if exitstatus in summary_exit_codes and not self.no_summary`, then
+  `summary_stats()` — so the block precedes the final `N failed` line and is absent under
+  `--no-summary`, exactly as the ticket states. The reporter's own `wrapper=True`
+  `pytest_terminal_summary` (:984) runs `summary_errors/summary_failures/…` before yield
+  and `short_test_summary()` after, so a plain hookimpl lands between the tracebacks and
+  the short summary. `_build_normal_summary_stats_line` (:1432) counts
+  `_get_reports_to_display(key)` = `count_towards_summary` filter (:1427-1430), which the
+  hook mirrors, so the denominator is the displayed number. `write_sep(sep, title,
+  fullwidth, **markup)` / `write_line(line, **markup)` accept `yellow=True`.
+  `pytest.StashKey`/`pytest.Stash` are public exports; `Stash.get(key, default)` exists.
+- **Subset claim ("N of the M failures") is true on every standard path.** The
+  synthesized report is `when="call"`, and terminal.py:341 reroutes a failed report to the
+  `error` category only for collect/setup/teardown, so every synthesized report lands in
+  `stats["failed"]` with `count_towards_summary=True`. Replay is atomic per item
+  (supervisor.py ~1836: staged events fire only after the nodeid's own result line is
+  confirmed), so a mid-item crash never puts the nodeid into `_replayed_nodeids`, and the
+  runtestloop count and the synthesis loop agree. The only divergent path is the
+  pre-existing `_replayed_nodeids` skip after an invalid-batch/foreign-result crash, where
+  the defensive both-numbers wording applies whenever the numbers diverge — accepted.
+- **Non-porosity reproduced by the reviewer** (throwaway detached worktree, 7 selected
+  tests, baseline exit 0): hook silenced → exit 1, 5 FAIL; `count_towards_summary` filter
+  dropped → exit 1, 1 FAIL (the N-of-M test); branch condition inverted → exit 1, 5 FAIL;
+  hook silenced + block printed from `pytest_runtestloop` (wrong placement) → e2e FAIL on
+  the `index(...) > index("FAILURES")` assertion specifically, proving the placement check
+  is load-bearing; stash write removed → exit 1, 2 FAIL.
+- **Gates, reviewer's own exit codes:** aitest Python suite under `aira confine`
+  (`cwd=internal/pylib/aitest`, `PYTHONPATH=internal/pylib`) = exit 0, 182 passed;
+  `aira confine -- go test ./internal/pylib/ -count=1` = exit 0 (the only Go package whose
+  behaviour depends on the changed files). CI on `145633c`: build+vet+gofmt pass, test
+  pass, race pass. Builder's `gotest.log` re-read in full: 14 `ok` + 1 `[no test files]`
+  (`internal/cgrouptest`), 0 FAIL — the "15 packages ok" wording above is 14 ok + 1
+  no-tests, not 15 ok.
+- Cosmetic, not blocking: `_UNEVALUATED_COUNT_KEY` is defined below its first use in
+  `pytest_runtestloop` (correct at runtime since the module executes fully before any hook
+  fires).
