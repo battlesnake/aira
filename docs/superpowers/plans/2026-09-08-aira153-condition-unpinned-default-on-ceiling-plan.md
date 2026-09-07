@@ -206,9 +206,14 @@ must not read this ticket as a reversal:
   the residual band AIRA-151 §2.3.1 derives, which is byte-exact-zero charge on a
   slice the request entered empty. Broken, but occasionally worked.
 - **after AIRA-151:** that clamp applies only where the escalation determined the
-  value, which is never true of the hint on a small slice (the escalation would
-  have to exceed the hint, i.e. an OOM peak above 2.7 GiB, on a slice smaller than
-  4 GiB). So the hint is returned unclamped and refused terminally, every time.
+  value. Stated exactly rather than as "never": the escalation determines it only
+  when `1.5 × MaxOOMPeak > 4294967296`, i.e. `MaxOOMPeak > 2863311530`, which on
+  a slice whose ceiling is under 4 GiB requires the job to have already been
+  OOM-killed above ~2.67 GiB — reachable on a 3–4 GiB slice, and impossible on
+  anything smaller than 2.67 GiB. So for the small slices this ticket is about
+  the hint is returned unclamped and refused terminally, every time; on the
+  narrow 3–4 GiB band the clamp still fires and the request waits on AIRA-150's
+  residual band instead. Both outcomes are the same defect.
 
 AIRA-151 was right — a wait that almost always ends in a refusal is worse than an
 immediate honest refusal — and it removed the last accidental mitigation of THIS
@@ -368,9 +373,10 @@ Each was checked against source and rejected for a stated reason, not on taste.
 - **Fit to `ceiling - admitSliceHeadroom(1)`, or to `ceiling - perJob`.** Both
   express the margin in the codebase's own headroom vocabulary, and both
   degenerate: `admitSliceHeadroomBase`/`Supervisor` are configurable and are set
-  to **0** by fourteen existing test servers, and `subtractFloor` would then make
-  the margin zero — the rejected variant above, reachable by configuration. A
-  margin that can be configured to nothing is not a margin.
+  to **0** at 21 and 22 call sites respectively in `internal/daemon`'s own tests,
+  and `subtractFloor` would then make the margin zero — the rejected variant
+  above, reachable by configuration. A margin that can be configured to nothing
+  is not a margin.
 - **A fixed constant margin (`ceiling - 256 MiB`).** An arbitrary number; the
   simplicity rule refuses it, and AIRA-151 §2.4 already refused "ceiling minus an
   arbitrary slack" for the clamp. It also scales wrongly in both directions: on a
