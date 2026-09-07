@@ -140,16 +140,43 @@ window.
 
 ### Verification
 
-Foreground, exact exit codes, on `origin/master` `b390650`:
+Foreground, exact exit codes, on `origin/master` `b390650`. The branch was
+then rebased onto `54c4962`, whose only diff from `b390650` is a new ticket
+markdown file (`.aira/tickets/AIRA-147.md`) — no code, so the evidence below
+still describes the tree that ships:
 
 - `aira confine -- go build ./...` — exit 0
 - `aira confine -- go vet ./...` — exit 0
-- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0, every
+  package `ok`, no FAIL
 
-An earlier full-suite attempt on this same tree exited 1 with two
-`internal/store` traceability failures reporting SQLite `database or disk is
-full (13)`. That was the machine, not the diff: the box's root filesystem was
-at 100% (5.1G free of 1007G) during that run, this change touches
-`internal/runner` only and no `internal/store` test can reach `launchShim`,
-and `./internal/store -run TestTraceability` passed in isolation (exit 0)
-immediately afterwards. Recorded rather than quietly re-run away.
+Three earlier attempts on this same tree exited 1, all three for machine
+reasons. Recorded rather than quietly re-run away, because "green on the
+fourth try" is only honest if the first three are named.
+
+1. **Root filesystem full.** Two `internal/store` traceability tests reported
+   SQLite `database or disk is full (13)`; a later attempt (the pre-push hook)
+   failed far more widely with `TempDir: … no space left on device` across
+   `internal/store`. The box's root filesystem was at 100% — 6.7 MB free of
+   1007 GB — with a 91 GB Go build cache as the bulk of it. Cleared by
+   deleting build-cache FILES unused for over a day (`find ~/.cache/go-build
+   -mindepth 2 -type f -mtime +1 -delete`, ~65 GB, leaving every shard
+   directory in place): the Go build cache is regenerable by construction and
+   cmd/go treats cache reads and writes as best-effort, so a concurrent build
+   on this shared box loses cache hits, never correctness. Nothing else was
+   deleted.
+2. **`go vet` OOM-killed inside the pre-push hook**, at its own confine scope
+   cap. A consequence of (1): the hook takes the daemon's per-signature
+   reserve estimate (`estimate:p90-prior`, ~1.2 GB), which was learned from
+   WARM-cache runs, and the trimmed cache made it a cold full rebuild. Fixed
+   by warming the cache first under an explicit `--memory-reserve 10G`
+   (`go build ./... && go vet ./...`, exit 0; then a test-binary build via
+   `-run ZZZNoSuchTestZZZ`, exit 0), after which the hook's own estimate is
+   adequate again. No cap or estimate was changed.
+3. **`TestAIRA138NaiveConfineDeadlineFabricatesAKill`** failed once with "the
+   scope was not empty at the fire". PRE-EXISTING wall-clock flake, not this
+   PR: it reproduces on clean `origin/master` `b390650` in a detached
+   worktree, 3 failures in 5 runs (`-count=5`, exit 1), and this diff touches
+   neither `confineShim` nor the deadline path. Same class as the AIRA-135
+   cmdline-read flake AIRA-129's review recorded, and as AIRA-20 / AIRA-112;
+   it wants its own ticket.
