@@ -70,6 +70,37 @@ type Runner struct {
 	beforeRunningAppendFn func()
 	inputRuntimeDir       string
 	inputDialFn           func(context.Context, string) (net.Conn, error)
+	// resolveModeFn is the AIRA-129 test seam for the durable install mode. It is
+	// nil in production, where ResolveConfineMode reads the record written by
+	// `aira install` once and caches it. Tests set it directly rather than going
+	// through AIRA_INSTALL_MODE_FILE plus a cache reset, because that pair is
+	// process-global and cannot be used by two tests at once.
+	resolveModeFn func() string
+	// signalSourceFn is the AIRA-129 test seam for the ci-shim launch's signal
+	// forwarder — the same shape confineDeps.signalSource gives `confine`. It is
+	// nil in production, where confineSignalSource installs a real signal.Notify;
+	// injecting the channel is what lets a test deliver a SIGTERM to the JOB
+	// without delivering one to the test binary.
+	signalSourceFn func() (<-chan os.Signal, func())
+}
+
+// shimSignalSource returns the ci-shim launch's signal source.
+func (r *Runner) shimSignalSource() (<-chan os.Signal, func()) {
+	if r.signalSourceFn != nil {
+		return r.signalSourceFn()
+	}
+	return confineSignalSource()
+}
+
+// confineMode reports this Runner's install mode. Absent a seam it is the
+// durable, process-wide record — the SAME resolution `aira confine` uses, by the
+// same function, so a client cannot believe it is in shim mode for one verb and
+// real mode for another.
+func (r *Runner) confineMode() string {
+	if r.resolveModeFn != nil {
+		return r.resolveModeFn()
+	}
+	return ResolveConfineMode()
 }
 
 // SetAdmitSocketPath supplies the mandatory daemon endpoint resolved by the
@@ -235,22 +266,6 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if len(req.Argv) == 0 || req.Argv[0] == "" {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("target argv is empty"))
 	}
-	// AIRA-121, and this is a RECORDED DECISION rather than an oversight (plan
-	// section 5.7, residual 5). `aira run` carries a far larger surface than
-	// `aira confine` -- the project ledger, telemetry, PTY, --detach, per-run
-	// scope caps, the descendant-escape attestation -- all of it keyed on a real
-	// cgroup scope. Fitting the shim launch through it is a separate piece of
-	// work, and the deployment shape this ticket exists for (a GCP Batch
-	// container running `aira confine -- make ...`) does not use it.
-	//
-	// So `run` REFUSES in shim mode rather than silently attempting a scope
-	// creation that will fail with E_RUN_SCOPE_UNAVAILABLE deep inside the launch,
-	// after the ledger has already been written to. Refusing here is the honest
-	// degradation the ticket asks for; the follow-up is tracked as AIRA-129.
-	if ResolveConfineMode() == ConfineModeShim {
-		return nil, launchErr("E_RUN_SCOPE_UNAVAILABLE", errors.New(
-			"ci-shim mode has no cgroup scope for a project run; use `aira confine -- <argv>`, which has an advisory ci-shim path (AIRA-129 tracks `aira run` support)"))
-	}
 	if err := validateScopeMemoryCap(req.ScopeMemoryMax, req.ScopeMemoryHigh); err != nil {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", err)
 	}
@@ -332,6 +347,18 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			err = errors.New("kernel boot_id is empty")
 		}
 		return nil, launchErr("E_RUN_IDENTITY_UNAVAILABLE", err)
+	}
+	// AIRA-129. The ci-shim branch sits HERE, and the position is the whole
+	// structural claim: every argument, environment, cwd, prefix and identity
+	// check above is SHARED with the real path (a shim box must refuse the same
+	// bad request the same way), and every cgroup seam — backend.Probe,
+	// intendedScope, backend.Create, the memory/swap cap writes, cgroup.procs
+	// membership, the AIRA-20 teardown attestation, readCgroupUsage — lives below
+	// it. There is no point past this branch at which launchShim could reach one,
+	// which is what makes "skipped entirely, never attempted-and-failed"
+	// verifiable by a backend whose every method panics.
+	if r.confineMode() == ConfineModeShim {
+		return r.launchShim(ctx, req, prefix, cwd, env, envDigest, buffering, effectiveArgv, bootID)
 	}
 	if err := r.backend.Probe(ctx); err != nil {
 		return nil, launchErr("E_RUN_SCOPE_UNAVAILABLE", err)
@@ -1126,7 +1153,16 @@ func (r *Runner) failBeforeLaunch(ctx context.Context, record RunRecord, code st
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
 	}
 	if current.KillIntent.Present && !current.KillIntent.Completed {
-		scope, openErr := r.backend.Open(ctx, current.CgroupScope)
+		// AIRA-129. The guard is on the reference, not on the mode, because it is
+		// true of every record that carries none: there is nothing to open. A
+		// ci-shim record never carries one (and cannot have an intent either — Kill
+		// refuses in that mode before publishing), while the real path sets the
+		// intended reference before Create, so this can only skip work that could
+		// not have succeeded.
+		scope, openErr := Scope(nil), error(errKillTargetAbsent)
+		if current.CgroupScope != "" {
+			scope, openErr = r.backend.Open(ctx, current.CgroupScope)
+		}
 		if openErr == nil {
 			result, killErr := r.killScope(ctx, scope, current.ID, "run-kill")
 			if killErr == nil && result.Started && result.Completed {
@@ -2279,10 +2315,31 @@ type killAttempt struct {
 	IntentSequence uint64
 }
 
+// killExecutor is the step that actually reaches the running job, once the
+// durable kill intent has been published and while the per-run lock is still
+// held. AIRA-129 gave it a seam because ci-shim mode has no cgroup to reach
+// through: everything ABOVE it — ownership enforcement, the wait-published
+// check, intent creation, steal recording, sequence allocation — is identical in
+// both modes and must not be duplicated, and everything BELOW it is the one
+// thing that genuinely differs (cgroup.kill versus kill(-pgid)).
+//
+// It receives current by POINTER because the real executor snapshots cgroup
+// usage onto it, and that snapshot must reach the caller's terminal candidate.
+type killExecutor func(ctx context.Context, current *RunRecord, id, actor string) (killResult, error)
+
 // killWithIntent is the shared durable kill path. It publishes KillIntent
 // before touching the scope, and leaves terminal publication to the caller so
 // Launch can merge monitor and capture evidence before its terminal CAS.
 func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy killPolicy) (killAttempt, error) {
+	return r.killWithIntentUsing(ctx, id, actor, policy, r.executeScopeKill)
+}
+
+// killWithIntentUsing is killWithIntent with the reaching step injected. The
+// per-run lock is acquired here and held across the executor, which is the
+// pre-AIRA-129 behaviour and is load-bearing: releasing it between publishing an
+// intent and acting on it would open a window for a concurrent kill or a
+// terminal CAS to land against a half-executed intent.
+func (r *Runner) killWithIntentUsing(ctx context.Context, id, actor string, policy killPolicy, execute killExecutor) (killAttempt, error) {
 	lock, err := r.boundedRunLock(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {
 		return killAttempt{}, err
@@ -2338,30 +2395,69 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy ki
 		current = event.Run
 	}
 	attempt := killAttempt{Current: current, IntentPublished: current.KillIntent.Present, IntentCreated: intentCreated, IntentSequence: current.KillIntent.Sequence}
+	kill, killErr := execute(ctx, &current, id, actor)
+	attempt.Current = current
+	if errors.Is(killErr, errKillTargetAbsent) {
+		return attempt, nil
+	}
+	if killErr != nil {
+		return attempt, killErr
+	}
+	attempt.Kill = kill
+	return attempt, nil
+}
+
+// errKillTargetAbsent is the executor's way of saying "there was nothing to
+// reach, and that is not an error for this run" — today only a detached run
+// still in `starting`, whose scope has not been created yet. It preserves the
+// pre-AIRA-129 shape exactly: the attempt is returned with the intent published,
+// no kill evidence, and a nil error.
+var errKillTargetAbsent = errors.New("kill target is absent")
+
+// executeScopeKill is the real-slice kill executor: the block that used to sit
+// inline in killWithIntent, moved behind the killExecutor seam unchanged. It
+// runs with the per-run lock still held, exactly as it did before, because
+// killWithIntentUsing calls it inside that lock's scope rather than after it.
+func (r *Runner) executeScopeKill(ctx context.Context, current *RunRecord, id, actor string) (killResult, error) {
 	scope, err := r.backend.Open(ctx, current.CgroupScope)
 	if err != nil {
 		if current.Detached && current.Status == StatusStarting {
-			return attempt, nil
+			return killResult{}, errKillTargetAbsent
 		}
-		return attempt, launchErr("E_RUN_SCOPE_INVALID", err)
+		return killResult{}, launchErr("E_RUN_SCOPE_INVALID", err)
 	}
 	kill, killErr := r.killScope(ctx, scope, id, actor)
 	// cgroup usage remains readable after cgroup.kill and before removal.
 	// Carry this snapshot to the caller so its terminal candidate, not a
 	// post-removal read, owns the evidence.
-	snapshotUsage(&current, scope.Reference())
-	attempt.Current = current
+	snapshotUsage(current, scope.Reference())
 	if killErr != nil {
-		return attempt, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
+		return killResult{}, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
 	}
-	attempt.Kill = kill
 	if kill.Completed && !current.Detached {
 		_ = scope.Remove()
 	}
-	return attempt, nil
+	return kill, nil
 }
 
 func (r *Runner) Kill(ctx context.Context, id string, steal bool) (*RunRecord, error) {
+	// AIRA-129. `aira run kill` is a CROSS-PROCESS kill: the killer is not the
+	// supervisor that launched the run. On the real path that works because the
+	// authority is a cgroup — a durable, named object any process can open and
+	// cgroup.kill. In ci-shim mode there is no such object. The only reach a shim
+	// launch has is kill(-pgid) from the supervisor that created the group, and a
+	// pgid is a recycled pid: a second process acting on one it read out of a
+	// ledger could signal an unrelated process group entirely.
+	//
+	// So this refuses BEFORE publishing a kill intent. That ordering is the point
+	// — publishing first and failing to execute would leave a durable intent
+	// nothing can ever satisfy, and would drive the launching supervisor into its
+	// U_RUN_RECONCILE_REQUIRED arm for a kill that was never even attempted. A
+	// refusal at the door leaves the run exactly as it was.
+	if r.confineMode() == ConfineModeShim {
+		return nil, launchErr("E_RUN_SCOPE_UNAVAILABLE", errors.New(
+			"ci-shim mode has no cgroup scope, so a run cannot be killed from another process; signal the supervisor that launched it (it forwards to the job's process group, then escalates)"))
+	}
 	attempt, err := r.killWithIntent(ctx, id, "run-kill", killPolicy{Enforce: !steal, Steal: steal, CallerOwner: r.owner})
 	if err != nil {
 		var foreign *ForeignOwnerError
@@ -2667,7 +2763,54 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 			continue
 		}
 		waitObserved := hasEvent(freshEvents, id, "wait-observed")
-		scope, openErr := r.backend.Open(ctx, record.CgroupScope)
+		var scope Scope
+		var openErr error
+		if record.Containment == ConfineContainmentAdvisory {
+			// AIRA-129. A ci-shim record names no cgroup and never did, so there is
+			// nothing to open and no cgroup call is made. But the question the real
+			// path puts to the kernel here — is anything still RUNNING? — must still
+			// be asked, and the record answers it itself: the `running` event carries
+			// the leader's PIDIdentity, and processLive is a boot-aware,
+			// start-tick-checked observation of it, so a recycled pid can never be
+			// mistaken for the original leader.
+			//
+			// Asking is load-bearing, not defensive. Taking the absent-scope branch
+			// unconditionally terminalises a LIVE, healthy shim run as `lost` +
+			// U_RUN_RECONCILE_REQUIRED from any routine `aira check` / `aira
+			// reconcile`; the launching supervisor honours whatever terminal it then
+			// finds in the ledger, so it would return that fabricated `lost` with a
+			// nil error and discard the run's real exit status and capture.
+			switch processLive(record.PIDIdentity) {
+			case processAlive:
+				// The ci-shim analogue of a non-empty scope, and it PRESERVES for the
+				// same reason. It never escalates to a kill the way a non-empty scope
+				// under a kill intent does on the real path: the only reach here is
+				// kill(-pgid) through the launching supervisor's own confineCommand,
+				// which holds the reaped cut-off that makes that delivery safe.
+				// Reconcile has no such cut-off, so a kill from here could land on a
+				// reissued pgid belonging to a stranger.
+				result = append(result, record)
+				_ = unlockFile(lock)
+				continue
+			case processUnknown:
+				// Liveness is UNESTABLISHED — no identity was ever recorded (the
+				// record never got past `starting`), /proc was unreadable, or the boot
+				// ID could not be read. None of that is proof of death, so it may not
+				// become `lost`. The record is preserved and flagged, exactly as
+				// reconcileDetachedLocked flags an unreadable supervisor.
+				record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+				result = append(result, record)
+				_ = unlockFile(lock)
+				continue
+			}
+			// processDead. The leader is PROVED gone, and the supervisor that held
+			// the only reach (kill(-pgid)) went with it, so an unfinished shim run is
+			// genuinely LOST — there is no second party that could observe or end it.
+			// It takes the same branch an absent scope takes on the real path.
+			openErr = errKillTargetAbsent
+		} else {
+			scope, openErr = r.backend.Open(ctx, record.CgroupScope)
+		}
 		if openErr != nil {
 			decision := decideReconcile(waitObserved, record.KillIntent.Present, true, false)
 			if decision.PreserveOpen {

@@ -32,7 +32,20 @@ const (
 	// ScopeUnverified means placement was proven but the available observations
 	// cannot attest descendant containment. It is not evidence of migration,
 	// and it is deliberately not positive containment.
-	ScopeUnverified        ScopeIntegrity = "unverified"
+	ScopeUnverified ScopeIntegrity = "unverified"
+	// ScopeAdvisory (AIRA-129) is the ci-shim value, and it is ESTABLISHED at
+	// launch rather than derived from any observation: in ci-shim mode no cgroup
+	// scope is created for the run, so there is nothing that could be contained,
+	// migrated, escaped from, or left unverified-but-placed.
+	//
+	// It is deliberately its OWN value rather than ScopeUnverified. Unverified
+	// means "placement was PROVEN and whole-subtree containment is not
+	// attestable", which asserts a placement that never happened here; and it is
+	// deliberately not ScopeHandoffUnverified, which is a failure state that
+	// always carries a reconcile error. Advisory is neither: it is the honest name
+	// for a mode with no containment mechanism at all, and RunRecord.Containment
+	// on the same record says which mode that is.
+	ScopeAdvisory          ScopeIntegrity = "advisory"
 	ScopeHandoffUnverified ScopeIntegrity = "handoff-unverified"
 	ScopeMigrated          ScopeIntegrity = "migrated"
 	ScopeDescendantKilled  ScopeIntegrity = "descendant-killed"
@@ -102,61 +115,88 @@ type DescendantEscapeEvidence struct {
 // environment values or inferred green field. Telemetry is an opaque envelope:
 // runner persists it but never assigns meaning to its values or references.
 type RunRecord struct {
-	SchemaVersion         int                       `json:"schema_version"`
-	ID                    string                    `json:"id"`
-	Owner                 string                    `json:"owner,omitempty"`
-	StolenBy              string                    `json:"stolen_by,omitempty"`
-	Ticket                string                    `json:"ticket,omitempty"`
-	Phase                 string                    `json:"phase,omitempty"`
-	Label                 string                    `json:"label,omitempty"`
-	Tool                  string                    `json:"tool,omitempty"`
-	Argv                  []string                  `json:"argv"`
-	Cwd                   string                    `json:"cwd"`
-	EnvDigest             string                    `json:"env_digest"`
-	Buffering             string                    `json:"buffering"`
-	Merge                 bool                      `json:"merge_streams"`
-	Admission             string                    `json:"admission"`
-	AdmissionReason       string                    `json:"admission_reason,omitempty"`
-	AdmissionWaitedMS     int64                     `json:"admission_waited_ms"`
-	ResourceSignature     string                    `json:"resource_signature,omitempty"`
-	AdmissionReserve      *int64                    `json:"admission_reserve,omitempty"`
-	AdmissionReserveBasis string                    `json:"admission_reserve_basis,omitempty"`
-	ScopeMemoryMax        *int64                    `json:"scope_memory_max,omitempty"`
-	ScopeMemoryHigh       *int64                    `json:"scope_memory_high,omitempty"`
-	LaunchPrefix          []string                  `json:"launch_prefix,omitempty"`
-	CgroupScope           string                    `json:"cgroup_scope,omitempty"`
-	StartedAt             string                    `json:"started_at"`
-	EndedAt               string                    `json:"ended_at,omitempty"`
-	Status                Status                    `json:"status"`
-	ScopeIntegrity        ScopeIntegrity            `json:"scope_integrity"`
-	DescendantEscape      *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
-	ExitCode              *int                      `json:"exit_code,omitempty"`
-	Signal                string                    `json:"signal,omitempty"`
-	OutputRefs            map[string]OutputRef      `json:"output_refs,omitempty"`
-	CaptureComplete       bool                      `json:"capture_complete"`
-	CaptureForcedClosed   bool                      `json:"capture_forced_closed"`
-	StdinStored           bool                      `json:"stdin_stored"`
-	ScopeKill             ScopeKill                 `json:"scope_kill"`
-	KillIntent            KillIntent                `json:"kill_intent"`
-	ErrorCodes            []string                  `json:"error_codes,omitempty"`
-	PeakRSS               *int64                    `json:"peak_rss,omitempty"`
-	CPUUser               *int64                    `json:"cpu_user,omitempty"`
-	CPUSys                *int64                    `json:"cpu_sys,omitempty"`
-	PIDIdentity           PIDIdentity               `json:"pid_identity,omitempty"`
-	Detached              bool                      `json:"detached,omitempty"`
-	StdinConnect          bool                      `json:"stdin_connect,omitempty"`
-	InputSocket           string                    `json:"input_socket,omitempty"`
-	SupervisorPID         PIDIdentity               `json:"supervisor_pid,omitempty"`
-	LeaderExitObserved    bool                      `json:"leader_exit_observed,omitempty"`
-	QuiesceForced         bool                      `json:"quiesce_forced,omitempty"`
-	TerminalComplete      bool                      `json:"terminal_complete"`
-	Telemetry             string                    `json:"telemetry,omitempty"`
-	TelemetryRefs         []string                  `json:"telemetry_refs,omitempty"`
+	SchemaVersion         int      `json:"schema_version"`
+	ID                    string   `json:"id"`
+	Owner                 string   `json:"owner,omitempty"`
+	StolenBy              string   `json:"stolen_by,omitempty"`
+	Ticket                string   `json:"ticket,omitempty"`
+	Phase                 string   `json:"phase,omitempty"`
+	Label                 string   `json:"label,omitempty"`
+	Tool                  string   `json:"tool,omitempty"`
+	Argv                  []string `json:"argv"`
+	Cwd                   string   `json:"cwd"`
+	EnvDigest             string   `json:"env_digest"`
+	Buffering             string   `json:"buffering"`
+	Merge                 bool     `json:"merge_streams"`
+	Admission             string   `json:"admission"`
+	AdmissionReason       string   `json:"admission_reason,omitempty"`
+	AdmissionWaitedMS     int64    `json:"admission_waited_ms"`
+	ResourceSignature     string   `json:"resource_signature,omitempty"`
+	AdmissionReserve      *int64   `json:"admission_reserve,omitempty"`
+	AdmissionReserveBasis string   `json:"admission_reserve_basis,omitempty"`
+	ScopeMemoryMax        *int64   `json:"scope_memory_max,omitempty"`
+	ScopeMemoryHigh       *int64   `json:"scope_memory_high,omitempty"`
+	LaunchPrefix          []string `json:"launch_prefix,omitempty"`
+	CgroupScope           string   `json:"cgroup_scope,omitempty"`
+	StartedAt             string   `json:"started_at"`
+	EndedAt               string   `json:"ended_at,omitempty"`
+	Status                Status   `json:"status"`
+	// Containment (AIRA-129) is the ci-shim marker on a run record, and the ONLY
+	// value it ever carries is ConfineContainmentAdvisory.
+	//
+	// It is written by the ci-shim launch path alone, from the record's first
+	// line, and the real-slice path deliberately leaves it EMPTY. That asymmetry
+	// is the point rather than an omission: `enforced` on the confine trailer
+	// means "a per-job scope under a FINITE-CAPPED slice", and `aira run` has
+	// never required a finite cap on the slice it runs under, so stamping
+	// `enforced` here would be a containment claim this verb does not check.
+	// Empty therefore means "the real-slice path, whose containment is described
+	// by cgroup_scope and scope_integrity — both of which exist only there", and
+	// never "unevaluated containment on a shim box".
+	//
+	// One consequence is worth stating where it will be read. On an advisory
+	// record, `scope_kill.completed` means the process-GROUP kill ran to its
+	// terminal state and the leader was proved dead; it does NOT mean a subtree
+	// was proved empty, because proving that is exactly what a cgroup does and
+	// ci-shim has none. `kill_intent.empty_scope` is the field that makes the
+	// emptiness claim, and on this path it is never set.
+	Containment         ConfineContainment        `json:"containment,omitempty"`
+	ScopeIntegrity      ScopeIntegrity            `json:"scope_integrity"`
+	DescendantEscape    *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
+	ExitCode            *int                      `json:"exit_code,omitempty"`
+	Signal              string                    `json:"signal,omitempty"`
+	OutputRefs          map[string]OutputRef      `json:"output_refs,omitempty"`
+	CaptureComplete     bool                      `json:"capture_complete"`
+	CaptureForcedClosed bool                      `json:"capture_forced_closed"`
+	StdinStored         bool                      `json:"stdin_stored"`
+	ScopeKill           ScopeKill                 `json:"scope_kill"`
+	KillIntent          KillIntent                `json:"kill_intent"`
+	ErrorCodes          []string                  `json:"error_codes,omitempty"`
+	PeakRSS             *int64                    `json:"peak_rss,omitempty"`
+	CPUUser             *int64                    `json:"cpu_user,omitempty"`
+	CPUSys              *int64                    `json:"cpu_sys,omitempty"`
+	PIDIdentity         PIDIdentity               `json:"pid_identity,omitempty"`
+	Detached            bool                      `json:"detached,omitempty"`
+	StdinConnect        bool                      `json:"stdin_connect,omitempty"`
+	InputSocket         string                    `json:"input_socket,omitempty"`
+	SupervisorPID       PIDIdentity               `json:"supervisor_pid,omitempty"`
+	LeaderExitObserved  bool                      `json:"leader_exit_observed,omitempty"`
+	QuiesceForced       bool                      `json:"quiesce_forced,omitempty"`
+	TerminalComplete    bool                      `json:"terminal_complete"`
+	Telemetry           string                    `json:"telemetry,omitempty"`
+	TelemetryRefs       []string                  `json:"telemetry_refs,omitempty"`
 }
 
 func (r RunRecord) CleanSuccess() bool {
+	// ScopeAdvisory is accepted for the same reason admissibleScopeIntegrity
+	// accepts it (internal/store/gate_command.go): a clean exit with a complete
+	// capture is established identically in ci-shim mode, and no claim about
+	// descendant containment is made by either the record or this predicate.
+	// Keeping the two in step matters — they are the two "was this run clean"
+	// answers in the codebase and a split between them would be a trap.
+	contained := r.ScopeIntegrity == ScopeContained || r.ScopeIntegrity == ScopeAdvisory
 	return r.Status == StatusExited && r.ExitCode != nil && *r.ExitCode == 0 &&
-		r.ScopeIntegrity == ScopeContained && r.CaptureComplete && r.TerminalComplete && len(r.ErrorCodes) == 0
+		contained && r.CaptureComplete && r.TerminalComplete && len(r.ErrorCodes) == 0
 }
 
 type EnvEntry struct {
