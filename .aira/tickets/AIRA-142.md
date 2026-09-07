@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-142","project":"aira","title":"aira confine --wait (by owner/scope): a supervisor-authoritative wait primitive to replace agents' broken pgrep -f self-match loops","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-142","project":"aira","title":"aira confine --wait (by owner/scope): a supervisor-authoritative wait primitive to replace agents' broken pgrep -f self-match loops","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 Reported by peer session 'field', 2026-09-07, with measured production evidence.
@@ -94,8 +94,10 @@ backgrounding. **No `aira confine --wait` verb was built.**
 
 Why (b) and not (c):
 
-- The reporter's own framing said there was "no urgency, and genuinely fine if
-  the answer is 'document the harness behaviour instead'", and recorded that
+- The reporter's covering message (relayed in the build brief; those words are
+  NOT in the ticket body above -- see the review record below) said there was
+  "no urgency, and genuinely fine if the answer is 'document the harness
+  behaviour instead'", and the ticket body itself records that
   every one of the six measured waiters was UNNECESSARY -- the harness already
   backgrounds a long-running command and reports completion with the true exit
   code. The common case needs no waiter and no primitive.
@@ -143,3 +145,75 @@ cost, `aira confine --wait --owner/--scope` (with the reporter's load-bearing
 constraint that it cannot be composed wrongly -- status via exit code or a file,
 no stdout inviting a `| tail`) is the shape to build. That is a future ticket,
 not part of this one.
+
+## Fable build-review record (2026-09-07) — MERGE
+
+PR #97 merged as `70f9c9d` (`--merge`, remote branch deleted). Reviewed
+against `origin/master` at `f570a35`; `git merge-tree` reported no conflicts.
+
+Scope check (from the diff, not the narrative): exactly three files — this
+ticket, `internal/core/skill.go` (four `out.WriteString` lines inside
+`renderMarkdownBody`, string literals only), and `internal/core/skill_test.go`
+(one new test). No flag parsing, no dispatch-table entry, no command behaviour
+touched; `--wait` does not exist anywhere in `cmd/aira` or `internal/core`.
+The `--status` and `--detach` forms the guidance leans on exist (AIRA-22) and
+report exactly the `finished`-carries-the-real-exit-code semantics the
+existing skill text already documents, so the new text contradicts nothing.
+
+Mechanism verified empirically, not from the ticket: from this harness,
+`bash -c 'pgrep -f "<unique pattern>"'` returned two PIDs — the harness's own
+outer `bash -c` wrapper and the inner one — and even a pattern living only in
+a script FILE matched, because the outer wrapper's argv carries the whole
+command text. "Deadlocks by construction" is accurate for how agents actually
+run commands here.
+
+Accuracy against the ticket's evidence: every figure in the generated text
+(three patterns, zero real jobs, two-or-three matches each, six waiters, two
+of six pre-warned, seventeen accumulated, one spinning over an hour firing
+spurious notices, one false green from `| tail`) matches the ticket body; no
+figure is inflated or dropped.
+
+Non-porosity verified independently of the build's mutation run: each of the
+nine asserted phrases occurs ZERO times anywhere on `origin/master` outside
+this PR (bare `PIPESTATUS` appears only in `AIRA-91.md` and a plan doc,
+neither of which feeds the generated documents) and exactly once in the PR's
+`skill.go`; `SkillMD` and `Guide` are both rendered by the single
+`renderMarkdownBody`, so deleting the section fails the test on both.
+
+Gate commands, foreground, exact exit codes, on the PR commit `b13b26f` in
+the build worktree:
+
+- `aira confine -- go build ./...` — exit 0
+- `aira confine -- go vet ./...` — exit 0
+- `aira confine -- go test ./internal/core/ -count=1` — exit 0 (unpiped;
+  `ok 31.7s`)
+- `gofmt -l` on both changed Go files — exit 0, nothing listed
+
+(The build's own full-suite `AIRA_REAL_CGROUP=1` run and the pre-push hook's
+`make ci` were both exit 0; not re-run here for a string-literal change.)
+
+Corrected in this record (the one honesty defect found): the resolution
+above quoted the reporter as saying "no urgency, and genuinely fine if the
+answer is 'document the harness behaviour instead'". Those words are not in
+this ticket as filed (`b6a1211`), its commit message, or the AIRA state DB;
+they reached the build via the peer session's covering message relayed in
+the build brief. The sentence now says so. The conclusion it supports is
+independently grounded in the ticket body ("Every one of the six waiters
+measured above was unnecessary"; "part of the answer may be as cheap as
+supplying an idiom to copy").
+
+Accepted, noted, not blocking:
+
+- The sentinel idiom as written (`>` truncation at job start, then
+  `>> GATE_EXIT=`) is fresh for a waiter that starts AFTER the job does; a
+  waiter that starts BEFORE the job has truncated the log can match a stale
+  `GATE_EXIT=` from a previous run. The text praises "still true after the
+  job exits" without naming this flip side. Cheap mitigation for an author:
+  `rm -f` the log before launch.
+- `until grep -q ...; do sleep 5; done` prints a "No such file" line on
+  stderr every iteration until the job creates the log; harmless, unmentioned.
+- `set -o pipefail` is not mentioned as a third answer to the pipe trap;
+  `${PIPESTATUS[0]}` and the sentinel are sufficient and the text is not
+  wrong without it.
+- The deferral (no cross-agent/detached blocking wait) is recorded above and
+  accepted as the intentional scope of option (b).
