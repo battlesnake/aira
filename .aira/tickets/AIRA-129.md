@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-129","project":"aira","title":"aira run: ci-shim support (AIRA-121 deferred it; only aira confine has a shim path)","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["ci","confine","run"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-129","project":"aira","title":"aira run: ci-shim support (AIRA-121 deferred it; only aira confine has a shim path)","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["ci","confine","run"],"hold":false,"relations":[]}
 ---
 Follow-up recorded by AIRA-121 (ci-shim mode for systemd/cgroup-unavailable
 containers), taken as an explicit, written decision rather than a silent trim —
@@ -297,3 +297,90 @@ pre-fix behaviour), fails `TestShimRunReconcilePreservesALiveRun` and
 `TestShimRunReconcileTerminalisesADeadLeaderWithoutTouchingTheBackend` still
 passes. The two new tests discriminate exactly the wrong behaviour, and the
 third is not a duplicate of either.
+
+## Review record (Fable re-verification after the fix round, 2026-09-07) — MERGE, PR #87 → `71d90d5`
+
+Re-verified from source at head `82fad07`, in a detached worktree, not from
+the PR narrative:
+
+- The mode branch in `Launch` sits after every argument/env/cwd/prefix/identity
+  check and before `backend.Probe`; nothing on the shim side of it can reach a
+  backend method, and `shimPanicBackend` (Probe, Create AND Open panic) is what
+  makes that a proof rather than a promise.
+- `Reconcile`'s advisory branch asks `processLive` and maps its three answers
+  onto the real path's three (alive → preserve; unknown → preserve + flag;
+  dead → the absent-scope branch). The `wait-observed` guard still runs ahead
+  of the dead arm through `decideReconcile`. `Kill` refuses before publishing
+  an intent; `launchShim` refuses `--detach` before the ID is reserved.
+- `killWithIntentUsing` keeps the per-run lock across the injected executor;
+  `executeScopeKill` is the old inline block moved unchanged, with the
+  `errKillTargetAbsent` sentinel preserving the "detached-and-starting" nil
+  return exactly. `shimGroupKill` never delivers into a group whose leader is
+  proved dead, so a reissued pgid can never be signalled from a timeout.
+- `ScopeAdvisory`'s precedence shares `ScopeContained`'s floor so a merge
+  cannot drop the marker; `CleanSuccess` and `admissibleScopeIntegrity` are in
+  step, and the integrity-FAILURE states remain inadmissible (asserted).
+
+Mutation check re-done independently: with the `Reconcile` liveness switch
+made unreachable (every advisory record falls through to the unconditional
+`errKillTargetAbsent`, the pre-fix behaviour),
+`TestShimRunReconcilePreservesALiveRun` and
+`TestShimRunReconcilePreservesAnUnestablishedLeader` both fail (each
+terminalised as `lost` + `U_RUN_RECONCILE_REQUIRED`) while
+`TestShimRunReconcileTerminalisesADeadLeaderWithoutTouchingTheBackend` still
+passes — exit 1 on the mutant, restored to a clean tree afterwards.
+
+Gate, exact exit codes, detached worktree at `82fad07` on base `c7b3e32`
+(master had not moved when merged): `aira confine -- go build ./...` 0;
+`aira confine -- go vet ./...` 0; `AIRA_REAL_CGROUP=1 aira confine -- go test
+./... -count=1` 0 (every package ok, no FAIL; the AIRA-135 cmdline-read flake
+did not recur on this sample either).
+
+Dogfood with the PR binary in a throwaway project (`AIRA_INSTALL_MODE_FILE`
+pointing at a `ci-shim` record with a declared 8 GiB budget), all seven
+exercised for real: (1) a plain run lands `exited 0`,
+`containment=advisory(ci-shim,no-cgroup,no-kill-backstop)`,
+`scope_integrity=advisory`, no `cgroup_scope`, nil peak/cpu, complete capture;
+(2) `--memory-max 1G` runs and reports `U_RUN_SCOPE_CAP_UNENFORCED`, exit 3,
+with `scope_memory_max` unevaluated; (3) `--detach` refuses with
+`E_RUN_SCOPE_UNAVAILABLE` naming `aira confine --detach`, exit 4; (4)
+`--timeout 1s` against `sh -c "(sleep 3; touch marker) & sleep 30"` yields
+`killed` + `E_RUN_TIMEOUT`, `scope_kill.completed=true`,
+`kill_intent.empty_scope=false`, capture complete, and the marker never
+appears — the grandchild was reached through the group; (5) `--cpu-timeout`
+reports `U_RUN_CPU_BUDGET_UNENFORCED`, exit 3; (6) `aira reconcile` against a
+run provably live at that instant (child blocked on a marker) returns it as
+`running` with no error codes, and the launch then lands its own `exited 0`
+with a complete capture; `aira run-kill` on the live run refuses with
+`E_RUN_SCOPE_UNAVAILABLE` and publishes no `kill-intent` event; (7) SIGTERM to
+the supervisor is forwarded to the group — the child's 0.3s TERM handler runs
+to completion (its marker appears), the record is `exited 0` with no kill
+evidence, and both supervisor and child are gone afterwards.
+
+### Accepted gaps recorded at review (not silent, not blocking)
+
+- **Admission lease lifetime differs from `confineShim`.** `launchShim`
+  releases its admission at the end of `launchPrep` (child start), which is the
+  real `aira run` path's model (the daemon's `.aira-CONFINE-*` adoption scan
+  never re-books an `.aira-RUN-*` scope either, and the real path is covered
+  by the slice's live `memory.current` charge). `confineShim`, by contrast,
+  keeps its DAEMON lease for the job's whole life and releases only the flock
+  after start. In shim mode with a declared or cgroup-memory-max budget and no
+  readable own-cgroup usage (the daemon's booked-reserve-only case), a running
+  `aira run` job is therefore invisible to the ledger after launch, and a
+  second `aira run` can be admitted against RAM the first is already using.
+  Consistent with the existing `aira run` model, so not a regression; a
+  divergence from `confine`'s shim behaviour that deserves its own ticket
+  (hold the daemon lease until the wait returns, as `confineShim` does). No
+  test drives `launchShim` through a daemon grant to observe lease lifetime,
+  which is why this was not caught earlier — coverage gap, written down.
+- **Interrupt window between `interrupted.Load()` and `startWith`** (inherited
+  from `confineShim`, identical shape): a signal landing in that window is
+  delivered to a nil process (no-op), the 2s escalation still SIGKILLs the
+  group, so the job dies without its SIGTERM but is never orphaned or lost.
+- **Late-signal wording**: a signal received after the job has ended still
+  prints "forwarding to the job's process group"; `confineShim` has a
+  distinct "received after the job had already ended" line. Cosmetic.
+- Dogfood exercised `admission=disabled` (a fresh project has no
+  `run.memory_slice`), so the daemon-admission leg of the shim launch was
+  covered by the shared `r.admit` reading, not by a live grant.
