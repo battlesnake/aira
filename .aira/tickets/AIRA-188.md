@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-188","project":"aira","title":"aira init defaults an unset --prefixes to the hardcoded \"AIRA\" prefix, silently claiming a machine-wide-exclusive namespace another project already owns","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["init","ownership"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-188","project":"aira","title":"aira init defaults an unset --prefixes to the hardcoded \"AIRA\" prefix, silently claiming a machine-wide-exclusive namespace another project already owns","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["init","ownership"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-188","to":"AIRA-190"}]}
 ---
 
 Peer report (devproc, 2026-09-08), verified from source. `aira init` in a
