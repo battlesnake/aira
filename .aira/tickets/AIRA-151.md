@@ -255,3 +255,64 @@ summary:
   `E_JOURNAL_CORRUPT: invalid run ledger record` (exit 4) identically from the
   master root at `16b9141`. Machine state (the run ledger); worth a dogfood
   ticket.
+
+## Amended by AIRA-153 (2026-09-08) — the clamp's TARGET and GUARD moved
+
+AIRA-153 shipped
+(`docs/superpowers/plans/2026-09-08-aira153-condition-unpinned-default-on-ceiling-plan.md`,
+§3.3 / G5). This ticket's shipped behaviour changed, so it must not read as
+untouched.
+
+**What is unchanged.** The rule, the NESTING inside `escalated > reserve`, the
+STRICT tie-break, the single condition governing both the value and the basis,
+the `,ceiling-clamped` spelling, and the use of the STATIC ceiling (AIRA-103).
+The condition to ENTER the clamp is still `reserve > ceiling`, so an escalation
+landing in `(FIT(ceiling), ceiling]` is left exactly as it is.
+
+**What changed.** Both halves of the clamp now use
+`runner.SliceFittedReserve(ceiling)` — `floor(100*ceiling/115)`, the largest
+reserve the slice can actually GRANT one job — instead of `ceiling`:
+
+    before: if stats.MaxOOMPeak < ceiling && reserve > ceiling { reserve = ceiling }
+    after:  if fit > 0 && stats.MaxOOMPeak < fit && reserve > ceiling { reserve = fit }
+
+**Why the TARGET had to move.** This ticket kept the clamp so "earlier censored
+caps are allowed to climb ... so a runnable job is never permanently wedged". A
+value equal to the ENTRY ceiling is not one such a job can be GRANTED: that is
+AIRA-150, byte-exact zero residual charge on a slice the request entered empty.
+So the clamp was producing a number the slice could not give.
+
+**Why the GUARD had to move, and why it could not be deferred.** AIRA-153 admits
+a small-slice job at a fitted `memory.max` of `FIT(c) = 0.8696c`. A job
+OOM-killed there records `MaxOOMPeak ~= 0.8696c`, which lies inside this clamp's
+band `(2/3, 1)` BY CONSTRUCTION. With the guard left at `ceiling`, the next
+admission would escalate to `1.304c`, clamp to exactly `c`, wait out the default
+30-minute window, and be refused `E_ADMIT_SATURATED` — whose documented meaning
+to an agent is "owed a RETRY, nothing about the request is wrong". Because the
+job never runs, no new peak is recorded, so the state is PERMANENT rather than a
+rung. That is precisely the wedge-then-refuse outcome this ticket shipped to
+remove, reintroduced on the population AIRA-153 exists to serve.
+
+**The production cost, stated exactly** (64 GiB `aira.slice`, entry ceiling
+66504884224 at zero occupancy, `FIT` 57830334107):
+
+| recorded `MaxOOMPeak` | before | after |
+| --- | --- | --- |
+| < 44336589484 (41.29 GiB) | escalation under the ceiling, no clamp | unchanged |
+| 44336589484 .. 57830334106 | clamped to 66504884224 (61.94 GiB) | clamped to **57830334107** (53.86 GiB), and grantable |
+| 57830334107 .. 66504884223 | clamped to 66504884224 | **no clamp — terminal `E_ADMIT_TOO_LARGE`** |
+| >= 66504884224 | no clamp | unchanged |
+
+Accepted on this ticket's OWN rationale: a wait that ends in a refusal is worse
+than an honest refusal, and a job whose last kill was at 54-62 GiB against a
+62 GiB ceiling is genuinely too large for that slice. The refusal names
+`required` and `cap_minus_headroom`, so the operator gets a number to pin at.
+
+Two properties the retarget preserves and one it adds: every clamped value is
+still strictly ABOVE the OOM peak that produced it (the guard), and is now also
+strictly BELOW the ceiling by ~13% (the quantity), so a clamped rung is a real,
+grantable one.
+
+Deferral **G3** of this ticket (the `E_ADMIT_TOO_LARGE` message prints raw bytes
+and names no escape hatch) is carried forward and now has its own ticket,
+AIRA-165, with the population narrowed by AIRA-153 recorded there.

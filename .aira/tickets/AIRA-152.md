@@ -58,3 +58,29 @@ for this backlog round, so this is no longer live open work, though the
 technical option and its cost analysis remain valid and are preserved above
 for whoever reopens it. Superseded by the AIRA-151 decision, not rejected on
 technical merit.
+
+## Still superseded after AIRA-153 (2026-09-08)
+
+AIRA-153 shipped and does not reopen this. Recorded because AIRA-153's rejection
+of one variant of its own fix rested on this ticket's rule, and that rule has now
+been REFINED rather than removed (AIRA-153 plan §2.3, G10).
+
+The rule this ticket's rejection rested on — *never size the next attempt below
+what an unpinned client asked for* — now reads:
+
+> never size the next attempt below what an unpinned client asked for, **bounded
+> by what the slice can hold**.
+
+On every slice where the old rule was satisfiable that is the identical rule, and
+on slices where it was unsatisfiable (the unpinned default alone exceeding the
+admission ceiling) it replaces "refuse the job" with "give it the largest prior
+the slice can grant". AIRA-153 also keeps `max(prior, escalation)` a genuine max
+of two candidates by fitting the prior BEFORE the comparison, so the escalation
+can still raise the reserve to whatever this command's own OOM evidence
+justifies — which is exactly the `max()` behaviour this ticket proposed to
+remove.
+
+So the cost analysis above is unchanged and still valid, but the "several more
+OOM kills to converge" cost is now weighed against a fit that has already removed
+the case where the `max()` produced an unusable number. Anyone reopening this
+should start from AIRA-153's shipped behaviour.

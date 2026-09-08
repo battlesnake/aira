@@ -54,30 +54,43 @@ func staticPeakHistory(stats runner.PeakRSSStats) func(context.Context, string) 
 	return func(context.Context, string) (runner.PeakRSSStats, error) { return stats, nil }
 }
 
-// oomClampedHistory manufactures the shape every test below needs: a resolved
-// reserve EXACTLY equal to the request-entry ceiling, and different from what
-// the client asked for, so `Required`, `Ceiling` and `Grantable` are three
-// distinct numbers an implementation that echoes the request cannot fake.
+// ceilingExactEstimateHistory manufactures the shape every test below needs: a
+// resolved reserve EXACTLY equal to the request-entry ceiling, and different
+// from what the client asked for, so `Required`, `Ceiling` and `Grantable` are
+// three distinct numbers an implementation that echoes the request cannot fake.
 //
-// AIRA-151 re-based it. It used to be AIRA-149 §0's own measured shape — one
-// sample, which is one OOM, so no usable ordinary estimate, a 1.5x escalation
-// far below the unpinned 4 GiB client default, and that default then clamped to
-// exactly the ceiling on a 1 GiB slice. That is AIRA-149 §3.1 row (e), and
-// AIRA-151 is precisely the ticket that stopped clamping it: such a request is
-// now refused terminally with E_ADMIT_TOO_LARGE at request entry and never
-// enqueues, so every test here would have failed in startSaturatedAdmit's "no
-// waiter appeared" loop rather than on its own assertion — a failure mode that
-// says nothing about what these tests examine.
+// It has now been re-based TWICE, and each move is itself the executable
+// evidence that a systematic route onto AIRA-150's ungrantable equality was
+// removed:
 //
-// So the fixture drives row (b) instead, which still clamps because the
-// ESCALATION determined the value: MaxOOMPeak 3.5 GiB escalates to 5637144576,
-// which beats the 4 GiB default, and the guard `MaxOOMPeak < ceiling` still
-// holds against the 4 GiB slice these tests now declare. Every assertion below
-// is unchanged, `run.ceiling` is derived from each test's own `maximum`, and the
-// fact that this helper had to move is itself the executable evidence that
-// AIRA-150's systematic route onto the ceiling is gone.
-func oomClampedHistory() runner.PeakRSSStats {
-	return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 3758096384, OOMCount: 1, MaxOOMPeak: 3758096384}
+//   - originally AIRA-149 §0's measured shape — one sample, which is one OOM, so
+//     no usable ordinary estimate, a 1.5x escalation far below the unpinned 4 GiB
+//     client default, and that default then CLAMPED to exactly the ceiling on a
+//     1 GiB slice (AIRA-149 §3.1 row (e)). AIRA-151 stopped clamping anything the
+//     escalation did not determine.
+//   - then row (b), which still clamped because the ESCALATION determined the
+//     value: MaxOOMPeak 3758096384 escalating to 5637144576, over the 4 GiB
+//     slice's ceiling, cut down to it because `MaxOOMPeak < ceiling` held.
+//     AIRA-153 retargeted that clamp to FIT(ceiling) and tightened its guard to
+//     `MaxOOMPeak < FIT(ceiling)`; 3758096384 is ABOVE FIT(4253024256) =
+//     3698281961, so the guard now fails, the escalation stands over the ceiling,
+//     and the request is refused terminally at entry — every test here would have
+//     died in startSaturatedAdmit's "never reached the queue" loop rather than on
+//     its own assertion, a failure mode that says nothing about what these tests
+//     examine.
+//
+// The route it now takes is AIRA-150 route 3's ESTIMATE half, which AIRA-153
+// deliberately leaves untouched: an ordinary per-signature estimate that happens
+// to equal the ceiling exactly. That is this command's OWN measured evidence, so
+// it is never fitted and never clamped. The fixture is derived, not searched:
+// PeakMax 3698281962 grown by the estimator's own 15% is 4253024256, byte-exactly
+// the 4 GiB slice's entry ceiling (4 GiB - 32 MiB - 8 MiB).
+//
+// Route 2 (a PINNED reserve exactly equal to the ceiling) also survives and was
+// considered, but it makes the resolved reserve EQUAL what the client asked for,
+// which is precisely the property this helper's own contract forbids.
+func ceilingExactEstimateHistory() runner.PeakRSSStats {
+	return runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 3698281962}
 }
 
 type saturatedRun struct {
@@ -258,7 +271,7 @@ func TestSaturatedRejectionCarriesTheResolvedReserveAndCeiling(t *testing.T) {
 func TestSaturatedRejectionReportsNoContentionWhenNothingWasEverQueuedOrHeld(t *testing.T) {
 	const maximum = int64(4) << 30
 	server := saturatedServer(t)
-	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+	server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 4096, maximum, 0, true, ""
 	}
@@ -300,7 +313,7 @@ func TestSaturatedRejectionReportsNoContentionWhenNothingWasEverQueuedOrHeld(t *
 func TestSaturatedRejectionReportsAMeasuredZeroGrantableAsPresent(t *testing.T) {
 	const maximum = int64(4) << 30
 	server := saturatedServer(t)
-	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+	server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 	ceiling := subtractFloor(maximum, server.admitSliceHeadroom(1))
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		// The slice's own charge is at the ceiling: checkedAvailable returns a
@@ -332,7 +345,7 @@ func heldLedgerWaiter(seq, reserve int64) *admitWaiter {
 func TestSaturatedRejectionReportsContentionWhenAnotherJobHeldTheSlice(t *testing.T) {
 	const maximum = int64(4) << 30
 	server := saturatedServer(t)
-	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+	server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 4096, maximum, 0, true, ""
 	}
@@ -361,7 +374,7 @@ func TestSaturatedRejectionReportsContentionWhenAnotherJobHeldTheSlice(t *testin
 func TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection(t *testing.T) {
 	const maximum = int64(4) << 30
 	server := saturatedServer(t)
-	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+	server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 4096, maximum, 0, true, ""
 	}
@@ -404,7 +417,7 @@ func TestSaturatedContentionIsLatchedAcrossTheWholeWaitNotSampledAtRejection(t *
 func TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt(t *testing.T) {
 	const maximum = int64(4) << 30
 	server := saturatedServer(t)
-	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+	server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 	var reads atomic.Int64
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		if reads.Add(1) == 1 {
@@ -538,7 +551,7 @@ func requireNoCounters(t *testing.T, queue *sliceQueue) {
 func TestUnestablishedEmptinessNeverReportsNoneObserved(t *testing.T) {
 	const maximum = int64(4) << 30
 	server := saturatedServer(t)
-	server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+	server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
 		return runner.ConfineListResult{}, errors.New("confine scan failed")
 	}
@@ -568,7 +581,7 @@ func TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved(t *te
 
 	t.Run("one unestablished pass forbids none-observed", func(t *testing.T) {
 		server := saturatedServer(t)
-		server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+		server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 		var scanFails atomic.Bool
 		server.admitConfineScan = func(path string) (runner.ConfineListResult, error) {
 			if scanFails.Load() {
@@ -594,7 +607,7 @@ func TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved(t *te
 
 	t.Run("observed survives later unestablished passes", func(t *testing.T) {
 		server := saturatedServer(t)
-		server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+		server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 		var scanFails atomic.Bool
 		server.admitConfineScan = func(path string) (runner.ConfineListResult, error) {
 			if scanFails.Load() {
@@ -642,7 +655,7 @@ func TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate(t *testing.T) {
 
 	t.Run("AIRA-59 freeze refusal", func(t *testing.T) {
 		server := saturatedServer(t)
-		server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+		server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 			return 4096, maximum, 0, true, ""
 		}
@@ -670,7 +683,7 @@ func TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate(t *testing.T) {
 
 	t.Run("exclusivity refusal", func(t *testing.T) {
 		server := saturatedServer(t)
-		server.admitPeakHistory = staticPeakHistory(oomClampedHistory())
+		server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 			return 4096, maximum, 0, true, ""
 		}

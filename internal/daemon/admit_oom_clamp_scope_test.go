@@ -50,14 +50,24 @@ func TestCeilingClampAppliesOnlyWhenTheEscalationDeterminedTheValue(t *testing.T
 			stats:   runner.PeakRSSStats{TotalCount: 4, SampleCount: 4, PeakMax: 40 * gibBasis, OOMCount: 1, MaxOOMPeak: 40 * gibBasis},
 			reserve: 4 * gibBasis,
 			ceiling: 55 * gibBasis,
-			want:    55 * gibBasis,
-			basis:   "estimate:oom-escalated,ceiling-clamped",
+			// AIRA-153 retargeted the clamp: it now cuts an over-ceiling escalation
+			// down to FIT(ceiling) = 51352869843, the largest reserve this slice can
+			// actually GRANT, rather than to the ceiling itself, which is grantable
+			// only inside AIRA-150's residual band. The rule, the nesting and the
+			// basis are unchanged; only the number moves.
+			want:  51352869843,
+			basis: "estimate:oom-escalated,ceiling-clamped",
 		},
 		{
-			// (a) UNCHANGED. The escalation determined the value and the clamp's own
-			// MaxOOMPeak < ceiling guard refuses it: an OOM observed AT or ABOVE the
-			// present ceiling is genuinely too large, so the value is returned
-			// unclamped and admit.go:1903 refuses it terminally.
+			// (a) UNCHANGED, value and basis. The escalation determined the value
+			// and the clamp's own guard refuses it: an OOM observed at or above what
+			// this slice can give is genuinely too large, so the value is returned
+			// unclamped and admit.go refuses it terminally.
+			//
+			// AIRA-153 moved that guard from `MaxOOMPeak < ceiling` to
+			// `MaxOOMPeak < FIT(ceiling)`, which is strictly tighter, so this row's
+			// 10 GiB peak against an 8 GiB ceiling (FIT = 7469508340) still fails it
+			// and the row is genuinely untouched rather than coincidentally so.
 			row:     "a/escalation determined the value, OOM peak at or above the ceiling",
 			stats:   runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 10 * gibBasis, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
 			reserve: 4 * gibBasis,
@@ -71,23 +81,29 @@ func TestCeilingClampAppliesOnlyWhenTheEscalationDeterminedTheValue(t *testing.T
 			// (84541440) is far below the unpinned 4 GiB default. Nothing derived
 			// from the OOM peak is in the number, so the clamp no longer applies and
 			// the 4 GiB is returned for admit.go:1903 to refuse terminally.
-			row:     "e-default/client default over the ceiling is no longer clamped",
+			// AIRA-153: the client default is a PRIOR, and a prior at or over the
+			// ceiling is now FITTED to FIT(ceiling) before anything reads it. So the
+			// number is no longer the unconditioned 4 GiB and the request is no
+			// longer refused terminally — but the clamp still does not apply, which
+			// is what this row exists to say, and the basis now names the fit
+			// instead of leaving a changed number under an unchanged label.
+			row:     "e-default/client default over the ceiling is fitted, not clamped",
 			stats:   runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: measuredPeak, OOMCount: 1, MaxOOMPeak: measuredPeak},
 			reserve: measuredReserve,
 			ceiling: measuredCeiling,
-			want:    measuredReserve,
-			basis:   "fallback:insufficient-samples:n=1,oom-on-record",
+			want:    897216333, // FIT(1031798784)
+			basis:   "fallback:insufficient-samples:n=1,oom-on-record,ceiling-fitted",
 		},
 		{
 			// (e-malformed) the same row reached through the estimator's OTHER !ok
 			// basis, so the rule is verified as "whatever else produced the number"
 			// rather than on one lucky spelling.
-			row:     "e-malformed/client reserve over the ceiling is no longer clamped",
+			row:     "e-malformed/client reserve over the ceiling is fitted, not clamped",
 			stats:   runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 0, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
 			reserve: 200 * gibBasis,
 			ceiling: 100 * gibBasis,
-			want:    200 * gibBasis,
-			basis:   "fallback:malformed,oom-on-record",
+			want:    93368854260, // FIT(100 GiB)
+			basis:   "fallback:malformed,oom-on-record,ceiling-fitted",
 		},
 		{
 			// (c') the row AIRA-149's table did not enumerate: an ORDINARY estimate
@@ -105,15 +121,27 @@ func TestCeilingClampAppliesOnlyWhenTheEscalationDeterminedTheValue(t *testing.T
 			// (tie) AIRA-151 §3.2. Nesting the clamp inside `escalated > reserve`
 			// promotes that STRICT comparison from a labelling rule to a SIZING one:
 			// on an exact tie the escalation raised nothing, the number was already
-			// there, and the clamp does not apply. 2 GiB * 1.5 == 3 GiB exactly.
-			// Production-reachable at MaxOOMPeak = 2863311531, where the escalation
-			// equals the unpinned 4 GiB default to the byte.
+			// there, and the clamp does not apply.
+			//
+			// AIRA-153 RE-BASED this row. It used to tie the escalation against the
+			// unpinned CLIENT DEFAULT over the ceiling — a shape the fit removes,
+			// because a prior at or over the ceiling is now fitted before the
+			// comparison happens, so the two numbers can no longer be equal there.
+			// The tie is now between the escalation and an ORDINARY ESTIMATE, which
+			// is never fitted (I2), so the ruling stays pinned on a shape a real
+			// client can still produce:
+			//
+			//	estimate:   2801065628 + 2801065628*15/100 == 3221225472
+			//	escalation: 2147483648 + 2147483648/2      == 3221225472
+			//
+			// Both recomputed, and the tie is exact. Widening the comparison to
+			// `escalated >= reserve` turns this row RED (mutation M7).
 			row:     "tie/escalation equals the reserve, so it determined nothing",
-			stats:   runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 2 * gibBasis, OOMCount: 1, MaxOOMPeak: 2 * gibBasis},
-			reserve: 3 * gibBasis,
-			ceiling: 2*gibBasis + gibBasis/2,
-			want:    3 * gibBasis,
-			basis:   "fallback:insufficient-samples:n=1,oom-on-record",
+			stats:   runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 2801065628, OOMCount: 1, MaxOOMPeak: 2147483648},
+			reserve: 4 * gibBasis,
+			ceiling: 2684354560,
+			want:    3221225472,
+			basis:   estimateMaxBasis(2801065628, 5) + ",oom-on-record",
 		},
 	} {
 		t.Run(test.row, func(t *testing.T) {

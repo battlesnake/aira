@@ -1362,12 +1362,22 @@ func TestSliceCeilingDoesNotReachTheOOMEscalationClamp(t *testing.T) {
 		// stated purpose: the clamp it exists to exercise is visible in the answer
 		// rather than inferred from the value alone. Row (b) -- the escalation
 		// determined the value (1.5 x 50G beats the 57.5G ordinary estimate) and the
-		// STATIC ceiling then cut it to 64G.
+		// STATIC ceiling then cut it down.
+		//
+		// AIRA-153 moved what the clamp cuts down TO: FIT(static ceiling) rather
+		// than the static ceiling itself. The AIRA-103 rule this test exists for is
+		// PRESERVED and strengthened -- against the THROTTLED 1 GiB ceiling the
+		// clamp's guard would still fail (MaxOOMPeak 50 GiB >= FIT(1 GiB)), leaving
+		// 75 GiB and a terminal refusal, so the test still discriminates static from
+		// throttled -- and the grant no longer depends on this fixture's
+		// `current = 0`, which removed an AIRA-150 knife edge from a shipped test.
+		const wantFitted = int64(59756066726) // FIT(68719476736); this fixture's headroom is 0
 		if response.Data.Basis != "estimate:oom-escalated,ceiling-clamped" {
 			t.Fatalf("basis=%q, want the OOM-escalation path so the clamp is actually exercised", response.Data.Basis)
 		}
-		if response.Data.Reserve != maximum {
-			t.Fatalf("reserve=%d, want it clamped by the STATIC ceiling %d", response.Data.Reserve, maximum)
+		if response.Data.Reserve != wantFitted {
+			t.Fatalf("reserve=%d, want it clamped by the STATIC ceiling %d to what that slice can GRANT (%d)",
+				response.Data.Reserve, maximum, wantFitted)
 		}
 	case err := <-errs:
 		t.Fatalf("read after the ceiling lifted: %v", err)
