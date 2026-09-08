@@ -283,6 +283,12 @@ func TestConfineDaemonDownRequiresSteal(t *testing.T) {
 }
 
 func TestConfineRunsDirectlyWithoutProjectOrDispatcher(t *testing.T) {
+	// AIRA-187 pins the nesting coordinate rather than reading the ambient one.
+	// Its assertions are unchanged; without this they would depend on HOW the
+	// suite was invoked, because this repository runs its own tests under `aira
+	// confine` and the test binary therefore inherits a real parent scope id —
+	// which makes this launch genuinely nested and correctly warned about.
+	withInheritedConfineScope(t, "")
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
 	called := false
