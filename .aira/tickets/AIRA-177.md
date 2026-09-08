@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-177","project":"aira","title":"aira install should default the slice-ceiling to enforce, not observe","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-177","project":"aira","title":"aira install should default the slice-ceiling to enforce, not observe","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[]}
 ---
 
 Owner decision (2026-09-08): "slice ceiling should be enforced by default (and
@@ -199,3 +199,75 @@ on `observe`. That precondition must be re-verified read-only immediately before
 any deploy; if the line is ever absent or unparseable, a flagless deploy would
 land on `enforce` — D1 by accident rather than by decision — and the deploy
 should stop there instead.
+
+## Review (Fable work-review gate) — MERGED
+
+PR #109 merged as `c32c601` (2026-09-08, merge commit; head `4873dbd`). Status
+moved `planned` → `done` here by the merger, as the Resolution above asked.
+Everything below is the reviewer's own reading and reproduction, not the
+builder's transcript.
+
+- **Scope matches plan revision 2 exactly.** The build commit touches
+  `internal/install/{install.go,daemon_service_test.go}`, one help string in
+  `internal/core/core.go`, one comment (zero code) in `internal/daemon/paths.go`,
+  and this ticket — the nine items §1.1 enumerates and nothing else. No wire
+  field, error code, formula or gate under `internal/daemon/` changed.
+- **Defaults genuinely decoupled.** `resolveDaemonModes` (install.go:561-611,
+  read at HEAD) reads `defaultWatchdogMode` (`"observe"`) for the watchdog and
+  `defaultSliceCeilingMode` (`"enforce"`) for the ceiling; `grep` finds no
+  surviving `defaultDaemonSubsystemMode` in Go source. Preservation
+  (`installedEnvironmentValue` → `validDaemonMode`) still runs BEFORE the ship
+  default and the `""` sentinel is untouched.
+- **Daemon raw env default untouched.** `sliceCeilingModeFromEnv`
+  (paths.go:147-158) still returns `sliceCeilingOff` for an unset/empty
+  variable; the diff there is comment-only.
+- **Enforce premise re-read, not assumed.** `sliceCeilingEffectiveMaximum`
+  (sliceceiling.go:766) returns the throttled ceiling only when
+  `Mode == sliceCeilingEnforce`; its sole capacity consumer is
+  `evaluateAdmitQueue` (admit.go:2536 → `checkedAvailable` :2580 and the
+  AIRA-114 `oversubscriptionLimit` :2541). `admitEffectiveMaximum`'s doc
+  (sliceceiling.go:722-745) confirms it must not reach `admitConnection`'s
+  terminal ceiling — so the worst case of enforce-by-default is a wait.
+- **Preservation test read, not trusted.**
+  `TestInstallReinstallDoesNotUpgradeObserveSliceCeiling` installs with an
+  explicit `sliceCeiling: "observe"`, then re-runs `runInstall` with only
+  `memoryMax`; it asserts the rendered unit still says `observe`, `state.writes`
+  is unchanged, and no `systemctl --user restart aira-daemon.service` argv was
+  issued. That restart fires only when `daemonPresent && daemonChanged`
+  (install.go:1159-1160), so the side-effect assertions are real. The resolver
+  seam is also pinned by table row b.
+- **Fresh-install test read.** `TestInstallFreshDaemonUnitEnforcesSliceCeilingByDefault`
+  drives `runInstall` on a clean fake state and asserts the RENDERED file
+  contains both `AIRA_DAEMON_SLICE_CEILING_MODE=enforce` and
+  `AIRA_DAEMON_WATCHDOG_MODE=observe`, through `renderDaemonUnit`'s
+  `validDaemonMode` guards (install.go:1486/1489) and the under-lock re-resolve
+  (install.go:1008-1020).
+- **Non-porosity re-run independently** in a throwaway detached worktree at
+  `4873dbd`, under `aira confine` (exit 0 overall; green baseline
+  `internal/install` exit 0, `internal/daemon -run SliceCeiling` exit 0):
+  W1 (default back to `observe`) → RED on `TestResolveDaemonModesPreservesInstalledModes`,
+  `…FreshInstallDefaultsSliceCeilingToEnforce`, `TestInstallFreshDaemonUnitEnforcesSliceCeilingByDefault`;
+  W2 (watchdog also `enforce`) → RED on the same three;
+  W3 (default hoisted above preservation) → RED on the table (rows b/c),
+  `TestInstallReinstallDoesNotUpgradeObserveSliceCeiling`,
+  `TestInstallDaemonConcurrentModeChangeSurvivesTheLock`;
+  W4 (`Mode == off` gate in the daemon) → RED on `TestSliceCeilingModeGating`
+  only. This matches the builder's report, including its two corrections (row f
+  does not discriminate W2; only one test discriminates W4). Worktree clean
+  after each revert; removed afterwards.
+- **Live machine untouched, verified three ways at review time:**
+  `~/.config/systemd/user/aira-daemon.service` mtime still 2026-09-06 19:08:25
+  with line 11 `AIRA_DAEMON_SLICE_CEILING_MODE=observe`; `aira.slice` mtime
+  2026-09-06 17:28:29; `systemctl --user show aira-daemon.service -p Environment`
+  reports the RUNNING daemon on `observe`. The test fixture (`newFakeInstall`)
+  uses `t.TempDir()` as HOME via a stubbed `getenv` and stubs `d.run`, so no
+  test can reach real systemd. Nothing in the diff invokes `aira install`.
+- CI on `4873dbd`: build+vet+gofmt, test and race all SUCCESS before merge.
+
+**Accepted coverage gaps, carried forward (not new):** table rows d/e pin I4
+only and discriminate no wrong implementation; `TestInstallDaemonReinstallPreservesModes`
+no longer discriminates in its slice-ceiling half (recorded at the test).
+
+**D1 stands.** This box is still on `observe`. A flagless `install.sh` deploy
+of this merge preserves that only because line 11 is a valid `observe`; re-verify
+read-only before any deploy, per the Resolution.
