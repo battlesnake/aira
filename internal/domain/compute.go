@@ -56,7 +56,15 @@ func ValidatePhase(phase string) error {
 func ValidPhase(phase string) bool { return ValidatePhase(phase) == nil }
 
 type ComputeEvent struct {
-	ID              string            `json:"id"`
+	ID string `json:"id"`
+	// TicketID is an opaque, project-scoped external reference: trimmed on
+	// write (internal/store.compute.go) and never resolved against this
+	// project's own ticket table. A caller with its own id allocator (e.g.
+	// a downstream project citing its own ticket ids, not aira's) may pass
+	// any string here — it does not need to name a real aira ticket, and
+	// aira never validates that it does. Two projects recording the same
+	// literal ticket_id cannot collide, since every read and write is
+	// scoped by project_id.
 	TicketID        string            `json:"ticket_id,omitempty"`
 	Phase           string            `json:"phase,omitempty"`
 	Model           string            `json:"model"`

@@ -233,6 +233,27 @@ func TestRunResourceOnlyComputeEventPersistsNilTokenBuckets(t *testing.T) {
 	}
 }
 
+func TestComputeEventTicketIDIsOpaqueAndNotResolvedAgainstTickets(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	// An external, project-scoped ticket reference that does not — and must
+	// not need to — name a real ticket in this project's own ticket table.
+	const external = "BL-1129"
+	result, err := s.AddComputeEvent(context.Background(), domain.ComputeEventInput{
+		TicketID: external, Model: "sonnet", Source: "run",
+	})
+	if err != nil {
+		t.Fatalf("event with an unresolved external ticket_id was rejected: %v", err)
+	}
+	if result.Event.TicketID != external {
+		t.Fatalf("ticket_id round-trip = %q, want %q", result.Event.TicketID, external)
+	}
+	rows, err := s.ListComputeEvents("")
+	if err != nil || len(rows) != 1 || rows[0].TicketID != external {
+		t.Fatalf("stored rows=%+v err=%v", rows, err)
+	}
+}
+
 func TestComputeMismatchIsStoredAndRaisesWarningFinding(t *testing.T) {
 	base := t.TempDir()
 	s := testStore(t, base, filepath.Join(base, "common"), filepath.Join(base, "state"))

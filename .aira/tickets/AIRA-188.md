@@ -77,15 +77,37 @@ directly (`internal/store/lifecycle.go`, `internal/store/store.go`,
 `go build ./internal/store/...` green) — same "purely trivial ...
 mechanical" class as the Usage-string fix above.
 
+## Follow-up (devproc, relaying an adversarial review from a second model, 2026-09-08) — the fail-closed fix needs two doors, not one
+
+Sharpens the (ii) recommendation above rather than replacing it. A project
+that never allocates IDs through aira at all (fastest-ee: its own
+allocator, `scripts/next_id.sh`, has zero coupling to aira; it only wants
+`aira spend` telemetry) has no `--prefixes` to name — refusing bare `init`
+and asking for one forces a meaningless placeholder token (observed:
+`aira init --project fastest-ee --prefixes FEESPEND`, a prefix that will
+never be allocated). Verified from source: `ComputeEvent.TicketID` is
+already an opaque, project-scoped external reference never resolved
+against this project's own ticket table (`internal/store/compute.go:91`,
+just trimmed; every read/write scoped by `project_id=?`) — so a
+telemetry-only project genuinely has no dependency on owning any prefix
+at all. **Amended recommendation: (ii) should offer two doors** — refuse
+bare `init` naming `--prefixes` as today, but also accept an explicit
+opt-out (e.g. `--no-tickets` / `--telemetry-only`) that registers the
+project with zero prefixes, skipping prefix ownership entirely. This is a
+real shape decision for `init`'s argument surface, left for whoever
+builds AIRA-188 to settle alongside the refusal-message wording below —
+not built here.
+
 ## Not designed here
 
-Exact refusal message wording, and whether `AIRA` itself should keep a
+Exact refusal message wording, whether `AIRA` itself should keep a
 special-cased default *only* when running inside this specific repository
 (detectable via the repo's own known project id/slug, matching how this
 project already treats its own dogfooding specially in a few other
 places) versus removing the hardcoded default entirely and requiring
-every caller, aira's own repo included, to pass `--prefixes` explicitly —
-left for whoever gates this.
+every caller, aira's own repo included, to pass `--prefixes` explicitly,
+and the exact shape of the `--no-tickets`/telemetry-only opt-out above —
+left for whoever gates this. [[AIRA-190]]
 
 ## Adjacent, already fixed
 

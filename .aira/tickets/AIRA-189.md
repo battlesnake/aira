@@ -30,3 +30,19 @@ this points at a broader pattern worth checking (are there other
 write-side fields on `ComputeEvent` with no corresponding `--by` support?)
 is left for whoever picks this up. Looks like a small, contained fix
 either way.
+
+## Follow-up (devproc, 2026-09-08) — the ticket-join workaround does not
+actually substitute for this; sharpens the justification
+
+The reporter initially described their own `--ticket`-join workaround
+(ticket → their own build/review/gate-to-model mapping, joined against
+`aira spend --by ticket`) as sufficient. On reflection they withdrew
+that: a single ticket's compute events legitimately span multiple models
+(a Sonnet build, an Astra review, a Fable gate all against one ticket),
+so a ticket-level total cannot be correctly split across models by any
+join — the join only has ticket-level granularity, not event-level. Since
+`Model` is required and recorded on every individual event, true
+per-model cost is only correctly computable as an event-level
+aggregation, which is exactly what `--by model` would give directly.
+This makes the fix a genuine correctness gap for that use case, not
+merely a convenience the join already covers.
