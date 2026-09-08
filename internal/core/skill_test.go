@@ -17,8 +17,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 75 {
-		t.Fatalf("actions=%d, want 75", len(artifacts.Actions))
+	if len(artifacts.Actions) != 77 {
+		t.Fatalf("actions=%d, want 77", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {

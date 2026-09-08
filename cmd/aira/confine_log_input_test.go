@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -269,6 +270,79 @@ func TestConfineInputPartialDeliveryTravelsWithItsRefusal(t *testing.T) {
 	}
 	if data["accepted"] != int64(41) || data["scope_id"] != "CONFINE-gate-9-a@session-a" {
 		t.Fatalf("the partial delivery was not reported: %v", data)
+	}
+}
+
+// TestConfineInputNeverForwardsTheMCPProtocolStream is the sharp edge this verb
+// shares with run-input and must not inherit: a daemonDispatcher's stdin is the
+// CLI operator's pipe on one face and the MCP face's JSON-RPC PROTOCOL STREAM on
+// the other. Forwarding the latter into a confined job's stdin would feed the
+// job the transport and desynchronise the session, so the fallback is opt-in and
+// the CLI is the only thing that opts in.
+//
+// verifies: AIRA-196
+func TestConfineInputNeverForwardsTheMCPProtocolStream(t *testing.T) {
+	protocol := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`)
+	var reachedReader io.Reader
+	newDispatcher := func(carries bool) *daemonDispatcher {
+		d := &daemonDispatcher{paths: daemon.Paths{ConfineDetachDir: "/state/confine"}, stdin: protocol, stdinCarriesJobInput: carries}
+		d.confineInput = func(_ context.Context, _ string, request runner.ConfineInputRequest) (*runner.ConfineInputResult, error) {
+			reachedReader = request.Reader
+			return &runner.ConfineInputResult{ScopeID: "CONFINE-gate-9-a@session-a"}, nil
+		}
+		return d
+	}
+
+	// MCP-shaped: no `data`, no --close. The protocol stream must NOT be
+	// forwarded, and the refusal must say how to send bytes instead.
+	response := newDispatcher(false).Dispatch(context.Background(), daemon.WorktreeScope{}, core.Request{
+		Verb: "confine-input", Args: map[string]any{"selector": "gate", "owner": "session-a"},
+	})
+	if response.OK {
+		t.Fatal("an MCP-shaped confine-input with no data was accepted; it would have streamed the JSON-RPC transport into the job")
+	}
+	if response.Code != "E_CONFINE_ARGUMENT_INVALID" || !strings.Contains(response.Error, "data") {
+		t.Fatalf("the refusal does not name how to send bytes: %+v", response)
+	}
+	if reachedReader != nil {
+		t.Fatal("a reader reached the injector on the MCP path")
+	}
+
+	// MCP with base64 `data` works, and the bytes are the decoded payload rather
+	// than the protocol stream.
+	reachedReader = nil
+	response = newDispatcher(false).Dispatch(context.Background(), daemon.WorktreeScope{}, core.Request{
+		Verb: "confine-input",
+		Args: map[string]any{"selector": "gate", "owner": "session-a", "data": base64.StdEncoding.EncodeToString([]byte("payload\n"))},
+	})
+	if !response.OK {
+		t.Fatalf("base64 data was refused: %+v", response)
+	}
+	decoded, err := io.ReadAll(reachedReader)
+	if err != nil || string(decoded) != "payload\n" {
+		t.Fatalf("the injector received %q (%v), want the decoded data", decoded, err)
+	}
+
+	// The CLI path opts in, and only then is stdin forwarded.
+	reachedReader = nil
+	response = newDispatcher(true).Dispatch(context.Background(), daemon.WorktreeScope{}, core.Request{
+		Verb: "confine-input", Args: map[string]any{"selector": "gate", "owner": "session-a"},
+	})
+	if !response.OK {
+		t.Fatalf("the CLI path was refused: %+v", response)
+	}
+	if reachedReader == nil {
+		t.Fatal("the CLI path did not forward its stdin")
+	}
+
+	// An oversized or malformed payload is refused before it is materialised.
+	for _, bad := range []string{"not base64!!", strings.Repeat("A", base64.StdEncoding.EncodedLen(runner.MaxRunInputFrameBytes)+4)} {
+		response = newDispatcher(false).Dispatch(context.Background(), daemon.WorktreeScope{}, core.Request{
+			Verb: "confine-input", Args: map[string]any{"selector": "gate", "owner": "session-a", "data": bad},
+		})
+		if response.OK || response.Code != "E_CONFINE_ARGUMENT_INVALID" {
+			t.Fatalf("a bad payload was accepted: %+v", response)
+		}
 	}
 }
 

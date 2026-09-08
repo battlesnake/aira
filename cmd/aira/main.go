@@ -2176,11 +2176,15 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 func dispatchConfineJobIORequest(ctx context.Context, request core.Request, jsonOutput bool, stdin io.Reader, stdout, stderr io.Writer, injected Dispatcher) int {
 	dispatcher := injected
 	if dispatcher == nil {
-		var err error
-		dispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, jsonOutput)
+		production, err := newDaemonDispatcher(stdin, stdout, stderr, jsonOutput)
 		if err != nil {
 			return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
 		}
+		// The CLI's stdin IS the operator's bytes, so confine-input may forward
+		// it. Set here rather than in the constructor because the MCP face shares
+		// that constructor and hands it the JSON-RPC protocol stream instead.
+		production.stdinCarriesJobInput = true
+		dispatcher = production
 	}
 	response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, request)
 	// Byte-transparent by default, exactly like run-log: the captured bytes go to

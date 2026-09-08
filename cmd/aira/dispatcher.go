@@ -53,6 +53,12 @@ type daemonDispatcher struct {
 	// AIRA-196 seams. Nil in production.
 	readConfineLog func(context.Context, string, runner.ConfineLogRequest) (*runner.ConfineLogChunk, error)
 	confineInput   func(context.Context, string, runner.ConfineInputRequest) (*runner.ConfineInputResult, error)
+	// stdinCarriesJobInput says this dispatcher's stdin is a HUMAN/PIPE stream
+	// that `confine-input` may forward into a job. It is false by default and
+	// set only by the CLI path, because the MCP face hands this same field its
+	// JSON-RPC PROTOCOL stream -- forwarding that into a confined job would feed
+	// the job the transport and desynchronise the session.
+	stdinCarriesJobInput bool
 }
 
 type childResult struct {
@@ -319,11 +325,17 @@ func (d *daemonDispatcher) dispatchConfineInput(ctx context.Context, request cor
 			}
 			inputRequest.Reader = bytes.NewReader(data)
 		}
-	} else {
+	} else if d.stdinCarriesJobInput {
+		// ONLY the CLI face's stdin is a job-input source. This dispatcher's stdin
+		// is also the MCP face's JSON-RPC PROTOCOL stream, and streaming that into
+		// a confined job's stdin would feed it the transport and desynchronise the
+		// session -- so an MCP caller that names no `data` gets the refusal below
+		// rather than a silent, catastrophic read of the wrong pipe.
 		inputRequest.Reader = d.stdin
 	}
 	if inputRequest.Reader == nil && !inputRequest.Close {
-		return confineClientError(errors.New("E_CONFINE_ARGUMENT_INVALID: confine-input requires data or --close"))
+		return confineClientError(errors.New(
+			"E_CONFINE_ARGUMENT_INVALID: confine-input requires bytes to send or --close (over MCP, pass base64 `data`; on the CLI, pipe them in)"))
 	}
 	inject := d.confineInput
 	if inject == nil {
