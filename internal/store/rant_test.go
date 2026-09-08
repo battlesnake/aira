@@ -542,3 +542,70 @@ func TestRantListTagFilterComposesWithUnreviewedAndSince(t *testing.T) {
 		t.Fatalf("infra+unreviewed+since = %v %#v", err, rows)
 	}
 }
+
+// TestRantRefOnABrokenTicketFileNamesTheRealReason is AIRA-170's most
+// misleading symptom.
+//
+// `aira rant ... --ref ticket:AIRA-165` answered "reference does not exist in
+// this project" for a ticket whose file was sitting on disk the whole time. The
+// index is a projection of those files and the scan EXCLUDES any it cannot
+// parse, so an invalid ticket leaves no row — and the ref check read the row,
+// found nothing, and reported a non-existence it had not established. An agent
+// following that answer goes looking for a ticket it can see with `ls`.
+//
+// The fixture severity is a bogus "P9" rather than P3 deliberately: AIRA-170's
+// first half made P3 legal, so a P3 fixture would stop exercising this path
+// entirely and the test would rot into a tautology.
+//
+// verifies: AIRA-170
+func TestRantRefOnABrokenTicketFileNamesTheRealReason(t *testing.T) {
+	s, root := rantTestStore(t)
+	dir := filepath.Join(root, ".aira", "tickets")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(id, frontmatter string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, id+".md"), []byte("---\n"+frontmatter+"\n---\nbody\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("AIRA-165", `{"schema":1,"id":"AIRA-165","project":"rant","title":"broken severity","status":"planned","kind":"bug","severity":"P9","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}`)
+	write("AIRA-166", `{"schema":1,"id":"AIRA-166","project":"rant","title":"valid but unindexed","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}`)
+
+	_, err := s.AddRant(context.Background(), domain.RantInput{Body: "broken ref", Refs: []domain.RantRef{{Kind: domain.RantRefTicket, ID: "AIRA-165"}}}, gitcontext.GitContext{})
+	if ErrorCode(err) != domain.CodeRantRefInvalid {
+		t.Fatalf("broken-ticket ref code = %v (%v)", ErrorCode(err), err)
+	}
+	message := err.Error()
+	if strings.Contains(message, "does not exist in this project") {
+		t.Fatalf("the refusal still claims a ticket that IS on disk does not exist: %q", message)
+	}
+	for _, want := range []string{"AIRA-165", "severity", `"P9"`, domain.CodeTicketInvalid} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("refusal %q does not name %q", message, want)
+		}
+	}
+
+	// Control 1: a ticket with no file at all. Here "does not exist" is TRUE and
+	// must survive — the fix removes a fabricated cause, it does not replace one
+	// fabrication with another.
+	_, err = s.AddRant(context.Background(), domain.RantInput{Body: "absent ref", Refs: []domain.RantRef{{Kind: domain.RantRefTicket, ID: "AIRA-999"}}}, gitcontext.GitContext{})
+	if ErrorCode(err) != domain.CodeRantRefInvalid || !strings.Contains(err.Error(), "does not exist in this project") {
+		t.Fatalf("absent-ticket ref = %v, want the unchanged does-not-exist refusal", err)
+	}
+
+	// Control 2: a file that is present AND parses (P3 is legal now). Nothing
+	// about the FILE explains the missing row, so the store must not invent a
+	// reason — it falls back to the plain refusal.
+	_, err = s.AddRant(context.Background(), domain.RantInput{Body: "unindexed ref", Refs: []domain.RantRef{{Kind: domain.RantRefTicket, ID: "AIRA-166"}}}, gitcontext.GitContext{})
+	if ErrorCode(err) != domain.CodeRantRefInvalid {
+		t.Fatalf("unindexed-ticket ref code = %v (%v)", ErrorCode(err), err)
+	}
+	if !strings.Contains(err.Error(), "does not exist in this project") {
+		t.Fatalf("a parseable ticket file must not be blamed for the missing row; refusal was %q", err.Error())
+	}
+	if strings.Contains(err.Error(), domain.CodeTicketInvalid) || strings.Contains(err.Error(), "its file is invalid") {
+		t.Fatalf("a parseable ticket file must not be reported as invalid: %q", err.Error())
+	}
+}

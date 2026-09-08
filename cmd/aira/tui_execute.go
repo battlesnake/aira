@@ -12,6 +12,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/domain"
 )
 
 type executeEntry struct {
@@ -487,7 +488,11 @@ func isRunExecutionCode(code string, hasRunRecord bool) bool {
 
 func executeNotLaunchedCode(code string) bool {
 	switch code {
-	case daemon.CodeUnavailable, daemon.CodeTimeout, daemon.CodeProjectInvalid, "E_CONFIG_INVALID":
+	// E_TICKET_INVALID joins E_CONFIG_INVALID here (AIRA-170): a refusal raised
+	// before anything was launched must keep reporting NOT LAUNCHED, whichever
+	// of the two codes the broken artefact carries. Reporting a launch that
+	// never happened is the failure this classifier exists to prevent.
+	case daemon.CodeUnavailable, daemon.CodeTimeout, daemon.CodeProjectInvalid, "E_CONFIG_INVALID", domain.CodeTicketInvalid:
 		return true
 	default:
 		return false

@@ -4050,7 +4050,7 @@ func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFind
 			return nil, nil, nil, true, nil
 		}
 		if err != nil {
-			if ErrorCode(err) == "E_CONFIG_INVALID" {
+			if isTicketFileInvalidCode(ErrorCode(err)) {
 				findings = append(findings, scanFinding(root, path, err))
 				exclude(path)
 				continue

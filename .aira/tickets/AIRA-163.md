@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-163","project":"aira","title":"A slice can now admit a job it will certainly OOM-kill (the band above the degenerate floor)","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-163","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-163","project":"aira","title":"A slice can now admit a job it will certainly OOM-kill (the band above the degenerate floor)","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[]}
 ---
 
 AIRA-153 deferral **G2**, accepted deliberately and written down rather than

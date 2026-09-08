@@ -532,7 +532,40 @@ func (s *Store) validateRantRefConn(ctx context.Context, conn *sql.Conn, ref dom
 		return err
 	}
 	if exists == 0 {
+		if ref.Kind == domain.RantRefTicket {
+			if reason := s.ticketRefRefusalReason(ref.ID); reason != nil {
+				return reason
+			}
+		}
 		return errors.New(domain.CodeRantRefInvalid + ": reference does not exist in this project")
+	}
+	return nil
+}
+
+// ticketRefRefusalReason answers "why is there no indexed ticket named id?" when
+// the ticket's own git file is sitting right there on disk.
+//
+// The index is a projection of those files, and the scan EXCLUDES any file it
+// cannot parse (scanTickets). So a ticket whose file is present but invalid
+// leaves no row, and the caller was told "reference does not exist in this
+// project" — which is simply false, and sends an agent looking for a ticket it
+// can see with `ls`. AIRA-170 fixes the lie at its source: when the file exists
+// and the refusal is the FILE's, this returns that real reason, still under
+// E_RANT_REF_INVALID because the ref is what is being refused. It returns nil —
+// leaving the honest "does not exist" message in place — whenever the file is
+// genuinely absent, and also whenever the file reads and parses cleanly, since
+// then this function has established nothing and must not invent a cause.
+func (s *Store) ticketRefRefusalReason(id string) error {
+	path := s.ticketPath(id)
+	data, outcome, err := readRegularTicket(path)
+	if outcome == scanReadInconclusive || err != nil || data == nil {
+		// Absent (scanReadInconclusive covers ErrNotExist), unreadable, or a
+		// torn read: nothing established about a present-and-broken file.
+		return nil
+	}
+	if _, _, parseErr := domain.ParseTicket(data); parseErr != nil {
+		return fmt.Errorf("%s: ticket %s exists at %s but its file is invalid, so nothing indexes it: %w",
+			domain.CodeRantRefInvalid, id, repoPath(s.root, path), parseErr)
 	}
 	return nil
 }

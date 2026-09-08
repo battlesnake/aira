@@ -12,6 +12,7 @@ import (
 	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/domain"
 	"aira/internal/store"
 )
 
@@ -123,7 +124,11 @@ func printWatchEvent(out io.Writer, event store.WatchEvent, jsonOutput bool) err
 
 func watchFatal(code string) bool {
 	switch code {
-	case daemon.CodeProtocol, daemon.CodeProjectInvalid, "E_SELECTOR_INVALID", "E_NOT_PROJECT", "E_CONFIG_INVALID":
+	// E_TICKET_INVALID joins E_CONFIG_INVALID here (AIRA-170) so a broken ticket
+	// file keeps the fatal classification it had before its refusals were split
+	// off that code; reconnecting forever against a file the scan will refuse
+	// again is not a recovery.
+	case daemon.CodeProtocol, daemon.CodeProjectInvalid, "E_SELECTOR_INVALID", "E_NOT_PROJECT", "E_CONFIG_INVALID", domain.CodeTicketInvalid:
 		return true
 	default:
 		return false

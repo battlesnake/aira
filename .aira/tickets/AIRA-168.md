@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-168","project":"aira","title":"No real-cgroup coverage of the degenerate too-small-slice refusal","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","tests"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-168","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-168","project":"aira","title":"No real-cgroup coverage of the degenerate too-small-slice refusal","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","tests"],"hold":false,"relations":[]}
 ---
 
 AIRA-153 deferral **G9**: an accepted coverage gap, written down rather than

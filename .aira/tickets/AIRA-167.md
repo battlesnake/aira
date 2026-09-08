@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-167","project":"aira","title":"Refusing a too-small slice at install time was considered and NOT taken","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-167","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-167","project":"aira","title":"Refusing a too-small slice at install time was considered and NOT taken","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[]}
 ---
 
 AIRA-153 deferral **G8**: one of the three candidate directions the AIRA-153
