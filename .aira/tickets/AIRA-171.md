@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-171","project":"aira","title":"Nine ticket files on master are unreadable: unsorted relations, non-canonical relation storage, unsorted labels, and bodies with no trailing newline","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-171","project":"aira","title":"Nine ticket files on master are unreadable: unsorted relations, non-canonical relation storage, unsorted labels, and bodies with no trailing newline","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-171","to":"AIRA-172"}]}
 ---
 Found by the AIRA-170 work-review's real-files probe (Fable, PR #105), which
 drove the store over this repository's own `.aira/tickets` rather than over
