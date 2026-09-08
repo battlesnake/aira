@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-150","project":"aira","title":"A resolved reserve equal to the slice admission ceiling is grantable only at byte-exact zero charge","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-151","to":"AIRA-150"}]}
+{"schema":1,"id":"AIRA-150","project":"aira","title":"A resolved reserve equal to the slice admission ceiling is grantable only at byte-exact zero charge","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-151","to":"AIRA-150"},{"kind":"relates","from":"AIRA-153","to":"AIRA-150"}]}
 ---
 
 AIRA-149 deferral **F1**. AIRA-149 fixed the DIAGNOSIS; this is the structure
@@ -114,3 +114,26 @@ evidence rather than only a note. That helper has now been re-based twice
 systematic route was removed.
 
 The band's arithmetic is unchanged by AIRA-153.
+
+## Closed (2026-09-08)
+
+Both systematic routes onto a ceiling-exact resolved reserve — the OOM clamp
+and either auto-sized prior (client default, machine-wide p90) — are now
+unreachable, per AIRA-153's own resolution above. What remains, precisely:
+
+1. An operator's own explicit `--memory-reserve`/`--memory-max` pin exactly
+   equal to the ceiling. Not a defect: it is the operator's own requested
+   number, and this project never resizes a pin — doing so would be exactly
+   the "primitives, not judgement" line this project's own rules forbid
+   crossing.
+2. An ordinary per-signature estimate that happens to equal the ceiling
+   exactly. Also not a defect: AIRA never fits or clamps a real measurement,
+   for the same reason — fabricating margin onto honest evidence is worse
+   than the narrow residual band it would avoid.
+
+Both are inherent to having a finite admission ceiling at all, not fixable by
+further sizing logic without crossing that line, and the residual grantable
+band in either case is now hundreds of MiB on a busy production slice (AIRA-151's
+per-job headroom analysis), not the byte-exact-zero knife-edge this ticket
+was filed against. Closed rather than left open for a route no further code
+should try to remove.

@@ -339,3 +339,23 @@ G10 are records on existing tickets: **AIRA-150 stays open, narrowed twice and
 NOT closed**; **AIRA-151** records that its clamp's target and guard moved;
 **AIRA-152** stays superseded, with the `max()` rule its rejection rested on
 recorded as refined rather than removed.
+
+## Fable work-review record (2026-09-08)
+
+MERGE verdict. Verified from source, independently: scope matches the
+plan-gate-approved plan exactly (admit.go's three sites, one new pure
+`runner.SliceFittedReserve` helper, one skill.go clause, thirteen test
+files); pinned requests return before either new site (`pinned:client` at
+admit.go:1609, before the fit at :1623); the self-heal escalation is not
+capped, only its floor made viable (the fit sits below `reserve :=
+request.reserve` at :1667, so `escalated > reserve` at :1731 still raises it
+whenever the OOM peak justifies it); the too-large terminal boundary and the
+enqueue-time re-check are untouched; every new/updated test asserts value AND
+basis together so a mutant shipping a changed number under an unchanged label
+fails; AIRA-150's bookkeeping is correct. CI green on the exact head SHA
+(`build + vet + gofmt`, `race`, `test`, via `gh pr checks 103`), PR
+`MERGEABLE`/`CLEAN`.
+
+Merged via `gh pr merge 103 --repo battlesnake/aira --merge` from
+`/home/mark/claude/aira` on `master`; confirmed via `git fetch` +
+`git log --oneline -1 origin/master` = `a66e555`.
