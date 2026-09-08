@@ -1579,6 +1579,16 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 // would in any case measure a slice this job's own memory has already left. An
 // unestablished slice cap (0) is reported as unevaluated rather than assumed
 // roomy, so no run gets a fabricated headroom claim.
+//
+// The same bound governs what a slice cap TOO SMALL for the suggested pin may
+// say, and the AIRA-184 build review found the first attempt over it. Every
+// daemon-reserve outcome therefore KEEPS the re-run advice — it is the one
+// remedy that needs no operator action, and this side of the branch is not
+// entitled to withdraw it. What the comparison withdraws is the PIN, which is
+// all it establishes: a pin the slice cannot hold is not one to hand over.
+// Whether the identical re-run is itself refused is admission's to decide and
+// not this client's to assert — see the branch's own comment for why the two
+// conditions are not the same one.
 func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool, capSource string, sliceCapBytes int64) string {
 	if scopeMemoryMax <= 0 {
 		return ""
@@ -1613,15 +1623,45 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 				" — this cap is AIRA's OWN AUTO-ESTIMATE of what this command needs, not a limit you set"
 			suggested := confineSuggestedReserve(scopeMemoryMax, peakRSS)
 			if sliceCapBytes > 0 && suggested >= sliceCapBytes {
-				// skill.go documents this as the one case the re-run cannot heal: the
-				// escalated reserve is already at or past what the slice can grant, so
-				// admission refuses it terminally rather than running it. Telling this
-				// reader to re-run, or handing them a pin that cannot be admitted,
-				// would send them round a cycle that cannot converge.
-				return estimate + ", but this slice's own cap is " + FormatConfineBytes(sliceCapBytes) +
-					", so a materially higher reserve is more than this slice can grant: it is refused E_ADMIT_TOO_LARGE " +
-					"rather than run, so split heavy work, or run where the slice is larger."
+				// What this condition establishes is EXACTLY one thing: the pin this
+				// line would otherwise hand over is not a value the slice can hold, so
+				// naming it would send the reader after a reserve admission cannot
+				// grant. It does NOT establish that the identical re-run is refused,
+				// and the wording must not say so (build review, confirmed BLOCK).
+				//
+				// skill.go's rule is narrower than this test: it is a job OOM-killed AT
+				// what the slice can give. This branch fires from `1.5 x peak >= slice
+				// cap`, i.e. every peak at or above TWO-THIRDS of the cap, and inside
+				// that gap the daemon does admit the re-run: an unpinned over-ceiling
+				// escalation is clamped DOWN to FIT(ceiling) ~= 0.87 x (cap - headroom)
+				// and granted whenever the recorded OOM peak is under that fit
+				// (AIRA-151/153, admit.go's `fit > 0 && stats.MaxOOMPeak < fit &&
+				// reserve > ceiling`). The daemon's own fixture is inside the gap: a
+				// 40G peak on a 56G slice is clamped and RUN.
+				//
+				// The client cannot decide between the two. It knows the slice's cap
+				// and nothing else -- not the headroom term, not the fit, not what the
+				// ledger has granted -- so it states the condition and leaves the
+				// verdict to admission, which announces it in its own words and names
+				// both numbers when it does refuse.
+				return estimate + ", but the pin AIRA would otherwise suggest — 1.5x this run's own figure, " +
+					FormatConfineBytes(suggested) + " — is at or above this slice's own cap of " + FormatConfineBytes(sliceCapBytes) +
+					", so no pin is offered. The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL " +
+					"COMMAND — admission sizes the next run itself, fitting it under this slice's cap where the recorded peak " +
+					"leaves room, and refusing it E_ADMIT_TOO_LARGE (naming both required and cap_minus_headroom) only where " +
+					"that peak is already at what this slice can give. Split heavy work, or run where the slice is larger, " +
+					"only if it is in fact refused."
 			}
+			// ACCEPTED GAP, written down rather than silently carried (build review,
+			// AIRA-184, raised non-blocking): the pin offered here is only checked
+			// against the slice's whole CAP, so a suggestion landing in
+			// (cap - headroom, cap] is one admission refuses once it is PINNED —
+			// a pin takes the `pinned:client` arm and gets no fitting. Narrowing it
+			// would mean reproducing the daemon's headroom term client-side, which is
+			// exactly the unestablished arithmetic this function refuses to do. The
+			// reader is not stranded when it happens: the refusal is the daemon's own
+			// E_ADMIT_TOO_LARGE, which names `required` and `cap_minus_headroom`, so
+			// the correct pin is on the very next line they see.
 			room := "; this slice's own cap could not be established, so whether the slice had room above the estimate is unevaluated"
 			if sliceCapBytes > 0 {
 				room = ", and this slice's own cap is " + FormatConfineBytes(sliceCapBytes) +
