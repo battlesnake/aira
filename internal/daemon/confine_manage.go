@@ -206,6 +206,11 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// now: absence of a position, never "position zero".
 				QueuePosition:    snapshot.queuePosition,
 				QueuedAheadBytes: snapshot.queuedAheadBytes,
+				// AIRA-186: the same matched waiter's own resolved reserve, so a
+				// blocked launcher can weigh what IT is asking for against the
+				// ceiling beside it. Absent for every caller that named no queued
+				// scope id, `aira confine --list` included.
+				ResolvedReserveBytes: snapshot.queuedReserveBytes,
 				// AIRA-68: the same snapshot's population split, so the summary can
 				// never again be read against the Scopes table above it as though
 				// they counted the same thing.

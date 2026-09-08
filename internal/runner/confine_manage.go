@@ -222,6 +222,27 @@ type ConfineSliceReserve struct {
 	QueuePosition    int   `json:"queue_position,omitempty"`
 	QueuedAheadBytes int64 `json:"queued_ahead_bytes,omitempty"`
 
+	// AIRA-186. The RESOLVED reserve of that SAME named waiter — the figure the
+	// daemon is actually gating this job's admission on — taken from the same
+	// locked pass and the same waiter as the two fields above.
+	//
+	// It exists because a blocked launcher cannot otherwise know it. An UNPINNED
+	// request sends the daemon a compiled-in prior as a hint; resolveAdmitReserve
+	// replaces it with a history-derived estimate before the job is ever queued,
+	// and the client learns that number only on the single blocking admit
+	// response. So while it waits, the figure its own progress line prints
+	// ("requested reserve 2G, unpinned") is NOT the number the slice is
+	// contending over, and a 35.7G estimate against a 61.6G ceiling is
+	// indistinguishable at the wait site from ordinary contention — the exact
+	// misreading AIRA-186 was filed for. It rides the AIRA-24 probe that already
+	// asks for the position, so it costs no extra round trip and no new verb.
+	//
+	// Zero is an ABSENCE — the scope id is not a queued waiter here, or the
+	// daemon does not report it — never a reserve of zero; a renderer must print
+	// nothing rather than a fabricated figure. `aira confine --list` passes no
+	// scope id, so its output is unchanged.
+	ResolvedReserveBytes int64 `json:"resolved_reserve_bytes,omitempty"`
+
 	// AIRA-68. Jobs and GrantedBytes above are TOTALS over three structurally
 	// different populations, and only two of them can ever appear as a row in the
 	// Scopes table:

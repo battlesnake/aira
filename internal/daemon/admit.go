@@ -1333,6 +1333,19 @@ type admitSnapshot struct {
 	// two different instants, which is the whole reason admitSnapshot exists.
 	queuePosition    int
 	queuedAheadBytes int64
+	// AIRA-186. That same waiter's OWN resolved reserve — `waiter.reserve`, the
+	// frozen figure admission is gating on, which is also the quantity
+	// queuedAheadBytes sums for the waiters in front. Taken at the SAME match, so
+	// "how much is ahead of me" and "how much am I asking for" cannot come from
+	// two different instants.
+	//
+	// Deliberately the frozen reserve and not ledgerCharge(): the dynamic charge
+	// applies to a GRANTED waiter's live usage, while a queued waiter is gated on
+	// the frozen number. Reporting the charge here would name a quantity that is
+	// not the one blocking it.
+	//
+	// Zero is "not established", on the same discipline as the position.
+	queuedReserveBytes int64
 
 	// AIRA-114. The aggregate of live scope caps and whether it is established,
 	// taken from the same locked pass as everything else so an operator is never
@@ -1540,6 +1553,10 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			if queuedScopeID != "" && snapshot.queuePosition == 0 && waiter.scopeID == queuedScopeID {
 				snapshot.queuePosition = snapshot.queued
 				snapshot.queuedAheadBytes = queuedBytes
+				// AIRA-186. Taken BEFORE queuedBytes absorbs this waiter's own
+				// reserve, from the matched waiter and not from the running sum:
+				// this is what THIS job is asking for, never what is ahead of it.
+				snapshot.queuedReserveBytes = waiter.reserve
 			}
 			queuedBytes = addClamp(queuedBytes, waiter.reserve)
 			continue

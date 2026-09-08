@@ -114,4 +114,49 @@ func TestConfineListReportsTheCallersOwnQueuePosition(t *testing.T) {
 			t.Fatalf("unasked position=%d ahead=%d, want 0 and 0", got.QueuePosition, got.QueuedAheadBytes)
 		}
 	})
+
+	// AIRA-186. The blocked launcher's own RESOLVED reserve. An unpinned request
+	// carries only a compiled-in hint; resolveAdmitReserve replaces it with a
+	// history-derived estimate before the job is ever queued, and nothing has told
+	// the client. Without this figure the caller cannot weigh its OWN size against
+	// the ceiling beside it, which is what tells "waiting for contention to clear"
+	// apart from "this request needs the slice nearly to itself".
+	//
+	// The fixture's discriminating values are all in play at once: the caller's own
+	// reserve is 3G, the sum queued ahead of it is 2G, the head's is 2G, and the
+	// granted job's is 4G. An implementation that reported the running ahead-sum,
+	// the first queued waiter, or the aggregate would survive a weaker fixture and
+	// fails here.
+	//
+	// verifies: the reported figure is the MATCHED waiter's own frozen reserve, and
+	// is absent — never a zero presented as a value — for callers with no position.
+	t.Run("queued-caller-learns-its-own-resolved-reserve", func(t *testing.T) {
+		got := listFor(t, setup(t), selfID)
+		if got.ResolvedReserveBytes != 3<<30 {
+			t.Fatalf("resolved reserve=%d, want %d (the caller's OWN, not the %d queued ahead of it)",
+				got.ResolvedReserveBytes, int64(3<<30), got.QueuedAheadBytes)
+		}
+	})
+
+	t.Run("head-of-queue-learns-its-own-resolved-reserve", func(t *testing.T) {
+		// The head has nothing ahead of it, so a figure read off the running
+		// ahead-sum would report 0 here and pass as an honest absence.
+		got := listFor(t, setup(t), headID)
+		if got.ResolvedReserveBytes != 2<<30 {
+			t.Fatalf("head resolved reserve=%d, want %d", got.ResolvedReserveBytes, int64(2<<30))
+		}
+	})
+
+	t.Run("callers-with-no-position-learn-no-reserve", func(t *testing.T) {
+		// A granted, unknown, or unasked caller has no queued waiter to speak for.
+		// Reporting the aggregate, or the head's figure, would put a number on the
+		// progress line that is not this job's.
+		for _, scopeID := range []string{grantedID, "CONFINE-absent-9999-zzz", ""} {
+			got := listFor(t, setup(t), scopeID)
+			if got.ResolvedReserveBytes != 0 {
+				t.Fatalf("scope %q resolved reserve=%d, want 0 (an absence, so the renderer prints nothing)",
+					scopeID, got.ResolvedReserveBytes)
+			}
+		}
+	})
 }
