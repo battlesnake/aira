@@ -94,8 +94,29 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 	for _, action := range artifacts.Actions {
 		// confine-status is CLI-only for the same reason confine is, plus one of
 		// its own: it must keep working when the daemon does not.
-		if action.Verb == "confine" || action.Verb == "confine-status" {
+		//
+		// AIRA-185: drain is CLI-only for a third reason — it is a FOREGROUND,
+		// connection-bound hold, so a request/response tool form could only return
+		// before the hold began (a fabricated success) or block a dispatcher for up
+		// to half an hour.
+		if action.Verb == "confine" || action.Verb == "confine-status" || action.Verb == "drain" {
 			t.Fatalf("%s leaked into generated actions; it must stay a prose-only CLI verb", action.Verb)
+		}
+	}
+	// AIRA-185. The drain guidance is prose, exactly like confine's, so its
+	// load-bearing sentences are pinned here rather than left to drift: an agent
+	// that reads --timeout as an overall deadline wastes a whole deploy window,
+	// and one that reads a drain as job-safety draws a conclusion the feature
+	// cannot support.
+	for _, want := range []string{
+		"aira drain wait",
+		"bounds the HELD duration only",
+		"separate budget defaulting to 30 minutes",
+		"NOT job-safety",
+		"best-effort contention reduction",
+	} {
+		if !strings.Contains(skill, want) || !strings.Contains(guide, want) {
+			t.Fatalf("drain guidance missing %q from SKILL.md or the agent guide", want)
 		}
 	}
 }

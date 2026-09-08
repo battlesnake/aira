@@ -245,5 +245,31 @@ directly (§3.1); `--reason` is a genuinely new wire field, not a reuse of
 
 ## 6. Status
 
-Planning only. Revision 3, incorporating both rounds of Astra's
-plan-review. Not yet gated, not yet built.
+Revision 3, incorporating both rounds of Astra's plan-review, returned
+**PASS** on Astra's third pass. **v1 is now BUILT and in review** on branch
+`aira185-drain-wait` — see AIRA-185's own build record for what landed and
+for the live evidence.
+
+Two of §5's open questions were settled by the build, and both are recorded
+here rather than left implicit:
+
+1. **Verb name/home:** `aira drain wait`, a new top-level verb, registered in
+   the dispatch table so it appears in generated help and the agent guide, but
+   deliberately CLI-only (`Include` unset, no MCP tool) like `confine`,
+   `confine-reserve` and `confine-status`. A foreground, connection-bound hold
+   has no honest request/response form: a tool could only return before the
+   hold began — a fabricated success — or block a dispatcher for up to half an
+   hour.
+2. **`aira top`'s footer:** INCLUDED in v1. It is one conditional append
+   matching the pattern already at `tui_top.go:965`, absent when no reason was
+   given, so the footer is byte-identical for every `aira confine --exclusive`.
+
+Question 3 (a v2 detached lifecycle) stays deferred and undecided, as §3.2
+requires. Question 4 (`install.sh` wrapping itself in a drain) was NOT decided
+by this build: `install.sh` is untouched, and the drain guidance added to the
+generated SKILL/agent guide is operator documentation, not a change to any
+deploy sequence.
+
+The status line above was also the plan's own honesty obligation: leaving
+"not yet built" standing after the build would have made this document
+confidently wrong about the one fact it is most likely to be read for.

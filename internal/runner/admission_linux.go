@@ -480,6 +480,18 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	// turns that into a loud refusal rather than a silently non-exclusive launch.
 	if req.Exclusive {
 		frame.Request.Args["exclusive"] = true
+		// AIRA-185. Guarded by req.Exclusive rather than sent whenever it is set:
+		// the daemon refuses `reason` on a non-exclusive request (it has no
+		// exclusive state to attribute it to and will not accept-and-discard it), so
+		// sending it unconditionally would turn a stray label into a REFUSED launch
+		// of an otherwise fine ordinary job. A reason on a non-exclusive
+		// runner.Request is therefore dropped HERE, at the one place that could
+		// otherwise weaponise it — and no CLI face can produce that combination,
+		// because `--reason` exists only on `aira drain wait`, which always asks for
+		// exclusivity.
+		if reason := strings.TrimSpace(req.ExclusiveReason); reason != "" {
+			frame.Request.Args["reason"] = reason
+		}
 	}
 	if req.ExclusiveHolder != "" {
 		frame.Request.Args["exclusive_holder"] = req.ExclusiveHolder

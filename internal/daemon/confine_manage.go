@@ -310,6 +310,12 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 					// beside it, never to a later reading of a state that may have
 					// changed hands in between.
 					SinceMS: snapshot.exclusiveSinceMS,
+					// AIRA-185, from that same pass and the same waiter, so the label
+					// and the hold it explains can never describe different instants.
+					// Empty when the holder supplied none — every `aira confine
+					// --exclusive` does — which every renderer omits rather than
+					// filling in.
+					Reason: snapshot.exclusiveReason,
 				}
 			}
 		}

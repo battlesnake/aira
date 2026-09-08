@@ -1614,7 +1614,7 @@ func confinePercentOfCap(peak, capBytes int64) int {
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {
 	maxWait := request.AdmissionMaxWait
 	if maxWait <= 0 {
-		maxWait = 30 * time.Minute
+		maxWait = DefaultConfineAdmissionWait
 	}
 	poll := request.PollInterval
 	if poll <= 0 {
@@ -1634,6 +1634,10 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		ConfineName:          request.Name,
 		ConfineOwner:         request.Owner,
 		Exclusive:            request.Exclusive,
+		// AIRA-185. TRANSCRIBED, never resolved here: admitThroughDaemon puts it on
+		// the wire only alongside `exclusive`, which is the one place that guard
+		// belongs.
+		ExclusiveReason: request.ExclusiveReason,
 		// AIRA-101. A confine launched from INSIDE an exclusive job inherits that
 		// job's holder token through the environment and forwards it here, so the
 		// daemon exempts it from the hold it would otherwise deadlock against. An

@@ -258,6 +258,14 @@ type Request struct {
 	Exclusive       bool   `json:"exclusive,omitempty"`
 	ExclusiveHolder string `json:"exclusive_holder,omitempty"`
 	ParentScopeID   string `json:"parent_scope_id,omitempty"`
+	// AIRA-185. ExclusiveReason is the holder's free-text label for WHY the slice
+	// is being held ("deploy: slice-ceiling flip"), which ConfineName cannot carry
+	// (it must be a valid confine identity and must match the scope id). It is
+	// DIAGNOSTIC ONLY — no admission or gate decision reads it — and it is only
+	// ever put on the wire alongside Exclusive, because the daemon has nothing to
+	// attribute it to otherwise and REFUSES it on a non-exclusive request rather
+	// than accepting and silently discarding it.
+	ExclusiveReason string `json:"exclusive_reason,omitempty"`
 	// TelemetryPending is an opaque initial envelope supplied by Core. Runner
 	// stamps it into the starting event without interpreting its value.
 	TelemetryPending string `json:"telemetry_pending,omitempty"`

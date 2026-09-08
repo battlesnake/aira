@@ -963,7 +963,19 @@ func topFooter(result runner.ConfineListResult) string {
 		parts = append(parts, fmt.Sprintf("%d queued, freeze %s", reserve.Queued, reserve.FreezePhase))
 	}
 	if reserve.Exclusive != nil {
-		parts = append(parts, "EXCLUSIVE "+reserve.Exclusive.State)
+		exclusive := "EXCLUSIVE " + reserve.Exclusive.State
+		// AIRA-185. One conditional append, matching the pattern already here: the
+		// state says the slice is exclusive, the reason says what for. Only `aira
+		// drain wait` supplies one — every `aira confine --exclusive` leaves it
+		// empty and this footer stays byte-identical to before.
+		//
+		// Escaped and bounded because it is another session's free text arriving in
+		// this operator's terminal. The footer TextView has no dynamic colours, so
+		// escaping non-printables and bounding the length is the whole requirement.
+		if reason := strings.TrimSpace(reserve.Exclusive.Reason); reason != "" {
+			exclusive += " " + strconv.Quote(confineReasonForDisplay(reason))
+		}
+		parts = append(parts, exclusive)
 	}
 	return strings.Join(parts, " | ")
 }
