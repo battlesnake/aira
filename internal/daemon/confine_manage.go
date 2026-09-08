@@ -156,6 +156,28 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		if result.Verdict == "unevaluated" {
 			return core.Response{OK: true, Code: "UNEVALUATED", Data: result, Exit: 3}
 		}
+		// ONE locked snapshot for the WHOLE reply: the per-scope reserves stamped
+		// onto the rows below and the slice totals built from it further down are
+		// the same reading, so a reader can reconcile the rows against the total
+		// (they sum to ScopeBytes + AdoptedBytes) instead of comparing two instants.
+		//
+		// AIRA-24: a caller that is ITSELF queued names its own scope id and gets
+		// its position out of this same pass. `aira confine --list` never passes one
+		// (buildRequest does not accept the option), so that is the blocked
+		// launcher's own progress-line probe and nothing else.
+		//
+		// Taken OUTSIDE the memory-read gate below, unlike the summary it also
+		// feeds: an unreadable slice memory.current says nothing about which job
+		// holds what, and withholding the attribution with it would blank
+		// `aira top`'s bar on a failed cgroup read the ledger was unaffected by.
+		snapshot := s.admitSliceSnapshotFor(path, stringArg(request.Args, "scope_id"))
+		// AIRA-191/AIRA-192. The per-scope reserve, merged by scope id onto the
+		// records the cgroupfs scan produced. This is the ONLY place a listing's
+		// ReserveBytes is established, and a scope the ledger holds no charge for
+		// is left unevaluated here rather than falling back to its memory.max —
+		// which for a --delegate-ram scope is a containment ceiling many times its
+		// real reserve, and is exactly the number AIRA-192 was raised for.
+		runner.ApplyConfineScopeReserves(result.Scopes, snapshot.scopeReserves)
 		readMemory := s.memoryReader()
 		sliceCurrent, maximum, sliceReclaimable, ok, _ := readMemory(path)
 		if ok {
@@ -172,14 +194,9 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 			// to prevent.
 			ceiling := s.sliceCeilingSnapshotFor(path)
 			ceilingMaximum := sliceCeilingEffectiveMaximum(ceiling, maximum)
-			// ONE locked snapshot: granted totals and queued/freeze state must
-			// describe the same instant, or the summary contradicts itself.
-			//
-			// AIRA-24: a caller that is ITSELF queued names its own scope id and
-			// gets its position out of that same pass. `aira confine --list`
-			// never passes one (buildRequest does not accept the option), so this
-			// is the blocked launcher's own progress-line probe and nothing else.
-			snapshot := s.admitSliceSnapshotFor(path, stringArg(request.Args, "scope_id"))
+			// The granted totals and the queued/freeze state come from the SAME
+			// snapshot taken above, so the summary cannot contradict itself, nor
+			// the per-scope rows it was also stamped onto.
 			outstanding, adopted := snapshot.outstanding, snapshot.adopted
 			totalJobs := addJobCountClamp(snapshot.outstandingJobs, snapshot.adoptedJobs)
 			queued, freezePhase := snapshot.queued, snapshot.phase
@@ -206,6 +223,11 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// now: absence of a position, never "position zero".
 				QueuePosition:    snapshot.queuePosition,
 				QueuedAheadBytes: snapshot.queuedAheadBytes,
+				// AIRA-186: the same matched waiter's own resolved reserve, so a
+				// blocked launcher can weigh what IT is asking for against the
+				// ceiling beside it. Absent for every caller that named no queued
+				// scope id, `aira confine --list` included.
+				ResolvedReserveBytes: snapshot.queuedReserveBytes,
 				// AIRA-68: the same snapshot's population split, so the summary can
 				// never again be read against the Scopes table above it as though
 				// they counted the same thing.

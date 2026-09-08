@@ -764,13 +764,32 @@ func (g exclusiveGate) blocks(queue *sliceQueue, waiter *admitWaiter) bool {
 }
 
 type sliceQueue struct {
-	mu                sync.Mutex
-	path              string
-	waiters           []*admitWaiter
-	outstanding       int64
-	outstandingJobs   int
-	adopted           int64
-	adoptedJobs       int
+	mu              sync.Mutex
+	path            string
+	waiters         []*admitWaiter
+	outstanding     int64
+	outstandingJobs int
+	adopted         int64
+	adoptedJobs     int
+	// AIRA-192. The same adoption, PER SCOPE: scope id -> the reconstructed
+	// reserve that scope contributes to `adopted` above. Written in the same
+	// locked block as `adopted`/`adoptedJobs`, from the same loop over the same
+	// scan, and REPLACED WHOLESALE by each successful scan — so the rows and the
+	// scalar can never describe different instants, and a scope that has gone
+	// leaves both together.
+	//
+	// It exists because `adopted` alone is a scalar with no way back to the jobs
+	// that make it up. Before AIRA-192 that was an attribution nuisance
+	// (AIRA-191); once `aira top` draws per-scope reserves it is structural: after
+	// every daemon restart the whole live population is adopted rather than
+	// connection-held, and without this the bar would have to render the entire
+	// machine as unevaluated.
+	//
+	// A FAILED scan leaves it untouched, exactly as it leaves `adopted` untouched
+	// (admit_reconstruction_test pins that retention), because a row set that
+	// disagreed with the total it reconciles against would be worse than a stale
+	// one.
+	adoptedScopes     map[string]int64
 	adoptedAt         time.Time
 	adoptedScanFailed bool
 	seq               int64
@@ -1333,6 +1352,19 @@ type admitSnapshot struct {
 	// two different instants, which is the whole reason admitSnapshot exists.
 	queuePosition    int
 	queuedAheadBytes int64
+	// AIRA-186. That same waiter's OWN resolved reserve — `waiter.reserve`, the
+	// frozen figure admission is gating on, which is also the quantity
+	// queuedAheadBytes sums for the waiters in front. Taken at the SAME match, so
+	// "how much is ahead of me" and "how much am I asking for" cannot come from
+	// two different instants.
+	//
+	// Deliberately the frozen reserve and not ledgerCharge(): the dynamic charge
+	// applies to a GRANTED waiter's live usage, while a queued waiter is gated on
+	// the frozen number. Reporting the charge here would name a quantity that is
+	// not the one blocking it.
+	//
+	// Zero is "not established", on the same discipline as the position.
+	queuedReserveBytes int64
 
 	// AIRA-114. The aggregate of live scope caps and whether it is established,
 	// taken from the same locked pass as everything else so an operator is never
@@ -1403,6 +1435,28 @@ type admitSnapshot struct {
 	// sorting, capping and rendering all happen after the lock is dropped, and a
 	// pointer would let a released waiter's fields be read unsynchronised.
 	reservations []admitReservationRow
+
+	// AIRA-191/AIRA-192. scope id -> the reserve this ledger charges that scope
+	// RIGHT NOW, over both scope-backed populations: connection-held waiters
+	// (their ledgerCharge, the same quantity scopeBytes sums) and scan-adopted
+	// scopes (their reconstructed reserve, the same quantity `adopted` sums).
+	// Gathered in the same locked pass as every total above, so rows and totals
+	// always describe one instant, and reconciling: over one snapshot the values
+	// sum to scopeBytes + adopted.
+	//
+	// It is deliberately NOT the frozen grant and NOT the scope's memory.max. A
+	// delegate scope's memory.max is an AIRA-15 containment ceiling many times its
+	// pinned framework reserve, and since AIRA-29 the frozen grant is not what the
+	// slice is holding either — the ledger charge is. Publishing either of the
+	// other two is how `aira top` came to draw 93 GiB of claims against a 40 GiB
+	// ledger.
+	//
+	// A scope ABSENT from the map is one this ledger charges nothing for and knows
+	// nothing about; the wire renders that as unevaluated, never as a cap.
+	//
+	// Copied out as a fresh map, never a reference to queue state, for exactly the
+	// reason reservations above are copied by value.
+	scopeReserves map[string]int64
 }
 
 // boundedAdmitSignature bounds the DIAGNOSTIC copy of a client-supplied
@@ -1520,6 +1574,19 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		adopted: queue.adopted, adoptedJobs: queue.adoptedJobs,
 		capAggregate: queue.capAggregate, capAggregateKnown: queue.capAggregateKnown,
 		phase: phase, present: true,
+		scopeReserves: make(map[string]int64, len(queue.waiters)+len(queue.adoptedScopes)),
+	}
+	// AIRA-192. The ADOPTED half of the per-scope reserves, copied out first so
+	// the connection-held half below can overwrite it. That precedence is the
+	// correct one and not an accident: the adopted set is a scan reading up to one
+	// interval old, while a granted waiter is this instant's authority, so a scope
+	// that has just become connection-held must be reported once, at its live
+	// charge, rather than twice or at the older figure.
+	for scopeID, reserve := range queue.adoptedScopes {
+		if scopeID == "" {
+			continue
+		}
+		snapshot.scopeReserves[scopeID] = reserve
 	}
 	queuedBytes := int64(0)
 	// ONE reading of the clock for the whole walk (AIRA-108): ages taken per-row
@@ -1540,6 +1607,10 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			if queuedScopeID != "" && snapshot.queuePosition == 0 && waiter.scopeID == queuedScopeID {
 				snapshot.queuePosition = snapshot.queued
 				snapshot.queuedAheadBytes = queuedBytes
+				// AIRA-186. Taken BEFORE queuedBytes absorbs this waiter's own
+				// reserve, from the matched waiter and not from the running sum:
+				// this is what THIS job is asking for, never what is ahead of it.
+				snapshot.queuedReserveBytes = waiter.reserve
 			}
 			queuedBytes = addClamp(queuedBytes, waiter.reserve)
 			continue
@@ -1587,6 +1658,11 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		}
 		snapshot.scopeJobs++
 		snapshot.scopeBytes = addClamp(snapshot.scopeBytes, waiter.ledgerCharge())
+		// AIRA-191/AIRA-192. The same charge, NAMED, from the same accessor and
+		// under the same `admitGranted && accounted` guard the sum above uses — so
+		// a waiter that contributes to scopeBytes contributes a row and one that
+		// does not contributes neither, and the two can never drift apart.
+		snapshot.scopeReserves[waiter.scopeID] = waiter.ledgerCharge()
 		if waiter.scopeVanished {
 			snapshot.vanishedJobs++
 			snapshot.vanishedBytes = addClamp(snapshot.vanishedBytes, waiter.ledgerCharge())
@@ -2431,6 +2507,12 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queue.liveScopesKnown = true
 			adopted := int64(0)
 			adoptedJobs := 0
+			// AIRA-192. Named per scope as it is summed, from this same loop, so
+			// the rows and the total are one derivation rather than two that have to
+			// be kept in step. Every `continue` below is a scope this ledger charges
+			// NOTHING for, and it correctly leaves no row: an operator must not be
+			// shown a claim the slice is not holding.
+			adoptedScopes := make(map[string]int64, len(scanResult.Scopes))
 			for _, record := range scanResult.Scopes {
 				// Populated is the scope's LEAF cgroup.procs count, not the
 				// subtree-aware cgroup.events populated the #72 reaper uses. A live
@@ -2505,9 +2587,17 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				}
 				adopted = addClamp(adopted, cap)
 				adoptedJobs = addJobCountClamp(adoptedJobs, 1)
+				// The row carries the SAME `cap` local the sum above just took, after
+				// every reconstruction the switch applied to it, so no row can report a
+				// figure the ledger did not charge. A scope id repeated by the scan
+				// (structurally impossible — the scan keys its own map by id) would
+				// overwrite rather than double, while the sum would double; that is the
+				// safe direction for a row set whose only job is attribution.
+				adoptedScopes[record.ScopeID] = cap
 			}
 			queue.adopted = adopted
 			queue.adoptedJobs = adoptedJobs
+			queue.adoptedScopes = adoptedScopes
 			queue.adoptedScanFailed = false
 			// AIRA-114. The aggregate cap accounting, derived from the SAME
 			// successful scan and from the very maps built above, but deliberately

@@ -563,6 +563,7 @@ func TestMigrationsFailClosedOnAnUnreadableSchema(t *testing.T) {
 	for name, migrate := range map[string]func(context.Context) error{
 		"ensureAreaHintsGeneration":     s.ensureAreaHintsGeneration,
 		"ensureOutboxKind":              s.ensureOutboxKind,
+		"ensureRantOriginProjectID":     s.ensureRantOriginProjectID,
 		"ensureOutboxResolutionDropped": s.ensureOutboxResolutionDropped,
 		"ensureAllocationKind":          s.ensureAllocationKind,
 		"ensureFindingsSchema":          s.ensureFindingsSchema,

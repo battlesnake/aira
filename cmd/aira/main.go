@@ -703,7 +703,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"init":   {"project": true, "prefixes": true},
 		"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
-		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true},
+		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
 		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
@@ -807,7 +807,12 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 		// launch form. parseConfineManagementArgs keeps rejecting it, so `aira
 		// confine --exclusive` with no `--` argv is an argument error rather than a
 		// silently ignored no-op on a --list/--kill invocation.
-		if name == "delegate-ram" || name == "detach" || name == "exclusive" {
+		//
+		// AIRA-182 moved both branches' vocabularies out to
+		// confineLaunchValuelessOptions / confineLaunchValuedOptions so the
+		// did-you-mean suggestion below reads the SAME list this check reads. The
+		// membership tests are otherwise exactly what they were.
+		if confineLaunchOptionValueless(name) {
 			if _, exists := options[name]; exists {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -818,8 +823,12 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 		// only in the launch form. parseConfineManagementArgs keeps rejecting them,
 		// so `aira confine --timeout 5m --list` is an argument error rather than a
 		// silently ignored no-op — the same discipline --exclusive already follows.
-		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" && name != "admit-timeout" && name != "timeout" && name != "cpu-timeout" {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
+		if !confineLaunchOptionTakesValue(name) {
+			// AIRA-182. The suggestion is APPENDED to the unchanged refusal — same
+			// code, same sentence — and is empty whenever nothing in the vocabulary
+			// is close enough to name honestly.
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine%s",
+				name, optionDidYouMean(name, confineLaunchOptionNames()))
 		}
 		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
@@ -1236,6 +1245,12 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		request.AdmitSocketPath = paths.SocketPath
 	} else if stderr != nil {
 		_, _ = fmt.Fprintf(stderr, "confine: daemon paths unavailable; admission will use flock and no aitest coordinates are exported: %v\n", err)
+	}
+	// AIRA-187. Say the one true thing about a nested launch that nothing said
+	// before. Printed for the detached form too, below, because a detached
+	// supervisor requests admission on exactly the same terms.
+	if warning := nestedConfineWarning(options, inheritedConfineScopeID()); warning != "" && stderr != nil {
+		_, _ = fmt.Fprintln(stderr, warning)
 	}
 	if options["detach"] == "true" {
 		return runConfineDetachCommand(ctx, request, stdout, stderr)
@@ -2368,6 +2383,12 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("rant requires <text> or ls|get|review|redact")
 		}
+		// The target selector names the project the operation applies to and is
+		// carried on EVERY rant sub-verb, not just capture: a rant filed into a
+		// shared tool's project is read, reviewed and redacted there too
+		// (AIRA-179). Both selectors together are refused by the one resolver
+		// that owns the vocabulary, not re-checked here.
+		args["project"], args["prefix"] = options["project"], options["prefix"]
 		switch strings.ToLower(positional[0]) {
 		case "capture":
 			if len(positional) != 2 {
@@ -2991,12 +3012,23 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	// The DATA fields are deliberately left alone: the orphan reaper and the
 	// daemon's reserve reconstruction consume Populated's leaf semantics on
 	// purpose, so this is a FACE-only change.
-	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tLIVE\tLEAF-PROCS\tRSS\tAGE\tCAP")
+	// AIRA-191. RESERVE sits beside CAP, and both are printed, because the whole
+	// defect was that only one of them existed and it was the misleading one. A
+	// --delegate-ram scope's CAP is an AIRA-15 containment ceiling sized for a
+	// whole framework's workers; its RESERVE is what the admission ledger charges
+	// it, and only the reserves sum toward the `slice reserve: <granted>` line
+	// below. The reporter's own incident is exactly that confusion: a 45 GiB cap
+	// read as another session's held reserve, when the reserve was 512M.
+	//
+	// An unestablished reserve prints "unevaluated" like every other facet here —
+	// never the cap standing in for it.
+	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tLIVE\tLEAF-PROCS\tRSS\tAGE\tRESERVE\tCAP")
 	for _, record := range result.Scopes {
-		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			record.Name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
 			confineLiveStatus(record),
-			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds), confineString(record.Cap))
+			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds),
+			confineInt64(record.ReserveBytes), confineString(record.Cap))
 	}
 	if err := table.Flush(); err != nil {
 		return exitForError("E_RUN_DETACH_FAILED")

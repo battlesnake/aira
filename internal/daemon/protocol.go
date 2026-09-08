@@ -66,8 +66,21 @@ import (
 // usual, because aira-daemon.service is a PERSISTENT unit while the relay and
 // the embedded pylib come from the PATH binary, so a rebuild without a restart
 // is the normal way to end up mixed.
+//
+// ProtocolVersion 9 (was 8): AIRA-179 gave the `rant` request a target
+// selector (`project`/`prefix` args) that the DAEMON interprets by swapping the
+// store the request runs against. The frame shape is unchanged; the semantics
+// of a rant request are not. core.Do does not refuse an argument a handler
+// never reads, so an OLD daemon serving a NEW client accepts
+// `aira rant --prefix AIRA ...`, ignores the selector, and files the rant in
+// the CALLER's project -- a silent wrong-project write, the exact fabrication
+// the feature refuses by name everywhere else (E_DAEMON_UNAVAILABLE in-core,
+// E_RANT_INVALID for an unreadable selector, E_NOT_ADOPTED for an
+// unresolvable one). Nothing below this layer can detect that direction: only
+// the version can. The new-daemon/old-client direction is harmless (no
+// selector, local rant). Same atomic reinstall+restart requirement as 6-8.
 const (
-	ProtocolVersion = 8
+	ProtocolVersion = 9
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

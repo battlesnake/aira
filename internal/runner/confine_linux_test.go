@@ -549,16 +549,18 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 	peak90 := int64(90)
 	peak95 := int64(95)
 	peak89 := int64(89)
+	peak40G := int64(40 << 30)
 	halfMax := int64(math.MaxInt64 / 2)
 	maxPeak := int64(math.MaxInt64)
 	almostMax := int64(math.MaxInt64 - 1)
 	for _, test := range []struct {
-		name   string
-		cap    int64
-		peak   *int64
-		oom    bool
-		source string
-		want   string
+		name     string
+		cap      int64
+		peak     *int64
+		oom      bool
+		source   string
+		sliceCap int64
+		want     string
 	}{
 		// AIRA-133. The rows below are the whole point of the source argument:
 		// the same cap, the same peak and the same kill produce DIFFERENT next
@@ -568,31 +570,108 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 		// answered with "re-run", and an AIRA-chosen cap must never be answered
 		// with "raise your own flag".
 		{
+			// AIRA-184's false-pass direction: a slice cap IS available here, and an
+			// operator-pinned cap must not borrow one word of the estimated-cap
+			// wording -- not the "auto-estimate" claim, not the slice figure, not a
+			// pin suggestion for a flag the caller already set themselves.
 			name: "oom against an operator --memory-max says re-running will not help", cap: 100, peak: &peak95, oom: true,
-			source: ConfineCapSourceMemoryMax,
+			source: ConfineCapSourceMemoryMax, sliceCap: 64 << 30,
 			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=operator:--memory-max — " +
 				"this cap is YOUR OWN --memory-max, not an AIRA estimate, so re-running the identical command will not change it. " +
 				"Raise that flag, or split heavy work.",
 		},
 		{
 			name: "oom against an operator --memory-reserve says re-running will not help", cap: 100, peak: &peak95, oom: true,
-			source: ConfineCapSourceMemoryReserve,
+			source: ConfineCapSourceMemoryReserve, sliceCap: 64 << 30,
 			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=operator:--memory-reserve — " +
 				"this cap is YOUR OWN --memory-reserve, not an AIRA estimate, so re-running the identical command will not change it. " +
 				"Raise that flag, or split heavy work.",
 		},
 		{
-			name: "oom against a daemon-resolved reserve names the re-run", cap: 100, peak: &peak95, oom: true,
+			// AIRA-184. The estimated-cap case the ticket is about: the line says in
+			// so many words that the cap was AIRA's own auto-estimate, names the
+			// slice's own cap so the reader can see the ceiling was not what killed
+			// the job, and hands over a concrete higher --memory-reserve rather than
+			// leaving the reader to derive one. The old wording additionally claimed
+			// the number came "from this command's peak-RSS history", which is false
+			// for the commonest shape here -- a cold start at the machine-wide
+			// `estimate:p90-prior`, where this command has no history at all.
+			name: "oom against a daemon-resolved reserve names the estimate, the slice cap and a pin", cap: 100, peak: &peak95, oom: true,
+			source: ConfineCapSourceDaemonReserve, sliceCap: 64 << 30,
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:daemon-reserve — " +
+				"this cap is AIRA's OWN AUTO-ESTIMATE of what this command needs, not a limit you set, and this slice's own cap " +
+				"is 64G, so what bound this job was the estimate and not the slice ceiling. The kill is now recorded against this " +
+				"command's signature: RE-RUN THE IDENTICAL COMMAND and the next admission is sized higher on its own, or pin " +
+				"--memory-reserve 1M now to skip the cycle. If an identical re-run is killed at the same cap again, that is a " +
+				"genuine bug worth reporting.",
+		},
+		{
+			// AIRA-184, the honesty direction: with no slice cap established there
+			// is no headroom claim to make, and the line says so rather than
+			// asserting room it cannot see. The pin and the re-run stay: neither
+			// depends on knowing the slice.
+			name: "oom against a daemon-resolved reserve with no slice cap claims no headroom", cap: 100, peak: &peak95, oom: true,
 			source: ConfineCapSourceDaemonReserve,
 			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:daemon-reserve — " +
-				"AIRA chose this cap from this command's peak-RSS history, you did not. The kill has now been recorded against " +
-				"this command's signature, so RE-RUN THE IDENTICAL COMMAND and the next admission is sized higher on its own. " +
-				"If an identical re-run is killed at the same cap again, that is a genuine bug worth reporting. " +
-				"Pass --memory-reserve/--memory-max to skip the cycle.",
+				"this cap is AIRA's OWN AUTO-ESTIMATE of what this command needs, not a limit you set; this slice's own cap could " +
+				"not be established, so whether the slice had room above the estimate is unevaluated. The kill is now recorded " +
+				"against this command's signature: RE-RUN THE IDENTICAL COMMAND and the next admission is sized higher on its own, " +
+				"or pin --memory-reserve 1M now to skip the cycle. If an identical re-run is killed at the same cap again, that is " +
+				"a genuine bug worth reporting.",
+		},
+		{
+			// AIRA-184, the OTHER false-pass direction, and the one an unconditional
+			// "the slice had headroom" would get wrong: a job killed at a cap whose
+			// 1.5x escalation the slice cannot hold has no PIN to be handed, so the
+			// line must not name one. `sliceCap` here is exactly the suggested pin,
+			// which is the entry boundary: a pin requires the slice to be strictly
+			// larger.
+			//
+			// The build review's confirmed BLOCK is the OTHER half of this row: the
+			// wording used to go on to assert that a re-run "is refused
+			// E_ADMIT_TOO_LARGE rather than run" and dropped the re-run advice. That
+			// generalised skill.go's narrow rule (an OOM AT what the slice can give)
+			// to every peak at or above two-thirds of the slice cap, which does not
+			// imply refusal at all -- the daemon clamps an unpinned over-ceiling
+			// escalation DOWN to FIT(ceiling) and admits it (admit.go's
+			// `MaxOOMPeak < fit` guard). The re-run advice therefore stays in every
+			// daemon-reserve outcome, and the refusal is stated as the condition it
+			// actually is, which only admission can decide.
+			name: "oom against a daemon-resolved reserve above the slice cap offers no pin but keeps the re-run", cap: 100, peak: &peak95, oom: true,
+			source: ConfineCapSourceDaemonReserve, sliceCap: 1 << 20,
+			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:daemon-reserve — " +
+				"this cap is AIRA's OWN AUTO-ESTIMATE of what this command needs, not a limit you set, but the pin AIRA would " +
+				"otherwise suggest — 1.5x this run's own figure, 1M — is at or above this slice's own cap of 1M, so no pin is " +
+				"offered. The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL COMMAND — admission " +
+				"sizes the next run itself, fitting it under this slice's cap where the recorded peak leaves room, and refusing " +
+				"it E_ADMIT_TOO_LARGE (naming both required and cap_minus_headroom) only where that peak is already at what " +
+				"this slice can give. Split heavy work, or run where the slice is larger, only if it is in fact refused.",
+		},
+		{
+			// AIRA-184 build review, the confirmed counterexample, taken from the
+			// daemon's OWN fixture (internal/daemon/confine_admit_test.go, the
+			// signature `oom` in TestConfineEstimatorAndOOMEscalationClamp): a job
+			// OOM-killed at a 40G cap with a 40G peak on a slice whose cap is 56G.
+			// The 1.5x pin is 60G, which is over the slice cap and so cannot be
+			// named -- but the identical re-run is NOT refused: the daemon clamps
+			// the escalation to FIT(ceiling) and admits it, exactly as that fixture
+			// asserts (reserve 51352869843, basis
+			// `estimate:oom-escalated,ceiling-clamped`). The 1M row above cannot
+			// establish this, because SliceFittedReserve returns 0 below
+			// MinPinnedScopeCap, so on a 1M slice there is no fit to admit at.
+			name: "oom at a cap the daemon would still admit a re-run under keeps the re-run", cap: 40 << 30, peak: &peak40G, oom: true,
+			source: ConfineCapSourceDaemonReserve, sliceCap: 56 << 30,
+			want: "confine: job OOM-killed at its memory cap 40G (peak RSS 40G); cap-source=auto:daemon-reserve — " +
+				"this cap is AIRA's OWN AUTO-ESTIMATE of what this command needs, not a limit you set, but the pin AIRA would " +
+				"otherwise suggest — 1.5x this run's own figure, 60G — is at or above this slice's own cap of 56G, so no pin is " +
+				"offered. The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL COMMAND — admission " +
+				"sizes the next run itself, fitting it under this slice's cap where the recorded peak leaves room, and refusing " +
+				"it E_ADMIT_TOO_LARGE (naming both required and cap_minus_headroom) only where that peak is already at what " +
+				"this slice can give. Split heavy work, or run where the slice is larger, only if it is in fact refused.",
 		},
 		{
 			name: "oom against the delegate-ram ceiling names the re-run", cap: 100, peak: &peak95, oom: true,
-			source: ConfineCapSourceDelegateRAM,
+			source: ConfineCapSourceDelegateRAM, sliceCap: 64 << 30,
 			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:delegate-ram — " +
 				"this is --delegate-ram's whole-scope ceiling, chosen by AIRA rather than by you, and it climbs with this " +
 				"signature's recorded peaks: RE-RUN THE IDENTICAL COMMAND before changing anything. " +
@@ -600,8 +679,10 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 		},
 		{
 			// An unrecorded source is never resolved to either party's choice:
-			// the line names both possibilities instead of guessing one.
-			name: "oom with observed peak", cap: 100, peak: &peak95, oom: true,
+			// the line names both possibilities instead of guessing one. A known
+			// slice cap does not change that -- an unestablished provenance may not
+			// borrow the estimated-cap wording either.
+			name: "oom with observed peak", cap: 100, peak: &peak95, oom: true, sliceCap: 64 << 30,
 			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=unevaluated — " +
 				"where this cap came from could not be established. If you set --memory-max/--memory-reserve yourself, raise it; " +
 				"if AIRA estimated it, re-running the identical command admits at a higher reserve. " +
@@ -659,10 +740,193 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := formatConfineReserveAdvisory(test.cap, test.peak, test.oom, test.source); got != test.want {
-				t.Fatalf("formatConfineReserveAdvisory(%d, %v, %v, %q) = %q, want %q", test.cap, test.peak, test.oom, test.source, got, test.want)
+			if got := formatConfineReserveAdvisory(test.cap, test.peak, test.oom, test.source, test.sliceCap); got != test.want {
+				t.Fatalf("formatConfineReserveAdvisory(%d, %v, %v, %q, %d) = %q, want %q", test.cap, test.peak, test.oom, test.source, test.sliceCap, got, test.want)
 			}
 		})
+	}
+}
+
+// verifies: AIRA-184 build review -- EVERY daemon-reserve OOM outcome keeps the
+// re-run advice, and none of them asserts a refusal only admission can decide.
+//
+// The confirmed counterexample is the daemon's own fixture: cap 40G, peak 40G,
+// slice cap 56G. The advisory's no-pin condition here is `1.5 x peak >= slice
+// cap`, i.e. peak >= two-thirds of the cap, which is much WIDER than the rule
+// skill.go documents ("its own measured peak is then already at what the slice
+// can give"). Inside that gap the daemon clamps the over-ceiling escalation down
+// to FIT(ceiling) ~= 0.87 x (cap - headroom) and ADMITS it (admit.go's
+// `fit > 0 && stats.MaxOOMPeak < fit && reserve > ceiling`), so the identical
+// re-run runs with zero operator action. A client that told the caller it would
+// be refused would be asserting something it cannot establish -- it knows
+// neither the headroom term nor the fit -- which is precisely the class of claim
+// this project's honesty rule forbids.
+//
+// This is kept as a PROPERTY beside the exact-wording table rows so that a later
+// rewording cannot quietly restore the defect while the table is updated to
+// match itself.
+func TestEstimatedCapOOMAdvisoryNeverAssertsARefusalItCannotEstablish(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		cap      int64
+		peak     int64
+		sliceCap int64
+	}{
+		// The daemon's own fixture (internal/daemon/confine_admit_test.go,
+		// signature `oom`): the escalation is clamped to FIT and admitted.
+		{name: "the daemon's own clamped-and-admitted fixture", cap: 40 << 30, peak: 40 << 30, sliceCap: 56 << 30},
+		// The degenerate boundary: suggested pin == slice cap exactly.
+		{name: "the suggested pin exactly at the slice cap", cap: 100, peak: 95, sliceCap: 1 << 20},
+		// Room to spare: the ordinary shape, already covered by the table, kept
+		// here so the property is asserted across the branch boundary rather than
+		// on one side of it.
+		{name: "the estimate well under the slice cap", cap: 96 << 20, peak: 100 << 20, sliceCap: 64 << 30},
+		// No slice cap established at all.
+		{name: "no slice cap established", cap: 96 << 20, peak: 100 << 20, sliceCap: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			peak := test.peak
+			got := formatConfineReserveAdvisory(test.cap, &peak, true, ConfineCapSourceDaemonReserve, test.sliceCap)
+			if !strings.Contains(got, "RE-RUN THE IDENTICAL COMMAND") {
+				t.Fatalf("a daemon-estimated cap OOM dropped the re-run advice, which is the ONE remedy that needs no operator action: %q", got)
+			}
+			if strings.Contains(got, "refused E_ADMIT_TOO_LARGE rather than run") {
+				t.Fatalf("the advisory asserted a terminal refusal it cannot establish -- the daemon clamps an unpinned escalation to FIT(ceiling) and admits it: %q", got)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-184 -- the pin the estimated-cap advisory hands over is a
+// figure the reader can paste, is never BELOW what this run already proved it
+// needs, and is a value `--memory-reserve` will actually accept.
+func TestConfineSuggestedReserve(t *testing.T) {
+	const mib = int64(1) << 20
+	peakUnder := int64(80 << 20)
+	// The reported incident's own numbers (AIRA-184): a job that overshot its
+	// estimated cap by ~12 KiB and was killed for it.
+	incidentPeak := int64(1257902080)
+	// An overshoot large enough to change the answer, which the incident's own
+	// ~12 KiB is not: the escalation must be taken from the PEAK, because a
+	// suggestion built from the cap alone sits below the footprint the run
+	// already demonstrated.
+	peakOver := int64(101) << 20
+	maxPeak := int64(math.MaxInt64)
+	nearMax := int64(math.MaxInt64 - 7)
+	for _, test := range []struct {
+		name string
+		cap  int64
+		peak *int64
+		want int64
+	}{
+		{name: "1.5x the cap when the peak is under it", cap: 96 << 20, peak: &peakUnder, want: 144 << 20},
+		{
+			// Documentation, not discrimination: the incident's own overshoot is
+			// ~12 KiB, which the round-up to a whole MiB absorbs, so cap and peak
+			// give the same answer here. The row below is the one that separates
+			// them.
+			name: "the reported incident's own numbers", cap: 1257889792, peak: &incidentPeak, want: 1800 * mib,
+		},
+		{
+			// The false-pass this row exists for: an overshoot big enough to cross
+			// a MiB boundary. Escalating the CAP gives 150MiB; escalating the peak
+			// the kernel actually measured gives 151.5MiB -> 152MiB. A suggestion
+			// built from the cap alone is below the footprint this run proved.
+			name: "1.5x the peak when the peak overshot the cap", cap: 100 * mib, peak: &peakOver, want: 152 * mib,
+		},
+		// A single byte over a round cap: 1.5x is 150MiB+1, which must round UP to
+		// 151MiB. Rounding down would suggest a reserve below the escalation, and
+		// not rounding at all would render as a raw byte count.
+		{name: "rounds up to a whole MiB", cap: 100*mib + 1, peak: nil, want: 151 * mib},
+		{
+			// --memory-reserve refuses anything below 1MiB, so a suggestion below
+			// its own floor would be advice the CLI rejects.
+			name: "never below the 1MiB --memory-reserve floor", cap: 100, peak: nil, want: mib,
+		},
+		{name: "an unestablished peak and an absent cap still suggest the floor", cap: 0, peak: nil, want: mib},
+		{
+			// Overflow safety, both directions: the 1.5x multiply and the
+			// round-up must each saturate rather than wrap negative.
+			name: "saturates at the top of the range", cap: math.MaxInt64, peak: &maxPeak, want: (math.MaxInt64 / mib) * mib,
+		},
+		{name: "round-up near MaxInt64 does not wrap", cap: nearMax, peak: nil, want: (math.MaxInt64 / mib) * mib},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := confineSuggestedReserve(test.cap, test.peak)
+			if got != test.want {
+				t.Fatalf("confineSuggestedReserve(%d, %v) = %d, want %d", test.cap, test.peak, got, test.want)
+			}
+			if got < mib {
+				t.Fatalf("suggestion %d is below the 1MiB --memory-reserve floor", got)
+			}
+			if got%mib != 0 {
+				t.Fatalf("suggestion %d is not a whole MiB, so it renders as a raw byte count", got)
+			}
+			if value, err := ParseMemorySize(FormatConfineBytes(got)); err != nil || value != got {
+				t.Fatalf("the rendered suggestion %q does not round-trip through --memory-reserve's own parser: %d, %v",
+					FormatConfineBytes(got), value, err)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-184 -- the slice cap the advisory names is the one the LAUNCH
+// PATH established, wired from the same status field the trailer renders.
+//
+// A table test over the formatter cannot see this: it would pass just as
+// happily against a call site that passed the job's own cap, or zero, for the
+// slice figure -- which would turn the headroom half of the line into a
+// fabrication. Only a launch whose slice cap is read by deps.readCap and whose
+// scope cap is chosen by the daemon-reserve branch closes that gap.
+func TestOOMAdvisoryNamesTheSliceCapEstablishedAtLaunch(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	// Unpinned, admitted, daemon-granted: the one branch that records
+	// cap-source=auto:daemon-reserve. confineUnitDeps' readCap reports a 64G
+	// slice, which is the figure the advisory must name.
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "immediate", reserve: 96 << 20, basis: "estimate:p90-prior", release: &confineCountingCloser{}}, nil
+	}
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+	// The incident shape: the peak overshoots the estimated cap, and the kill is
+	// this scope's OWN limit (a positive local declaration, which is what
+	// confineOwnCapAdviceWarranted requires before this line may claim a cap).
+	peak := int64(100 << 20)
+	deps.readUsage = func(string) cgroupUsage {
+		return cgroupUsage{
+			PeakRSS: &peak, OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1),
+			OOMGroupKillLocal: int64ptr(1), OOMLocal: int64ptr(1),
+		}
+	}
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	var diagnostics bytes.Buffer
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: &diagnostics,
+	}, deps); err != nil {
+		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
+	}
+	printed := diagnostics.String()
+	for _, want := range []string{
+		"cap-source=auto:daemon-reserve",
+		"this cap is AIRA's OWN AUTO-ESTIMATE",
+		"this slice's own cap is 64G",
+		"pin --memory-reserve 150M",
+	} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("the estimated-cap OOM advisory lacks %q: %q", want, printed)
+		}
+	}
+	// False-pass guards. The headroom half must come from the SLICE cap, never
+	// from the job's own cap restated, and an estimated cap must never be
+	// answered with an operator-pin explanation.
+	if strings.Contains(printed, "this slice's own cap is 96M") {
+		t.Fatalf("the advisory named the JOB's cap as the slice's, so its headroom claim is a restatement: %q", printed)
+	}
+	if strings.Contains(printed, "could not be established, so whether the slice had room") {
+		t.Fatalf("a slice cap the launch path established was reported as unevaluated: %q", printed)
+	}
+	if strings.Contains(printed, "YOUR OWN") {
+		t.Fatalf("an AIRA-estimated cap was blamed on a flag the caller never passed: %q", printed)
 	}
 }
 

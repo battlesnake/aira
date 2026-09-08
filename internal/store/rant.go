@@ -47,6 +47,65 @@ type RantCountResult struct {
 	Groups map[string]RantCountGroup `json:"groups"`
 }
 
+// RantOrigin is the caller's OWN daemon-validated scope, carried into another
+// project's store when an explicit `--project`/`--prefix` target redirects a
+// rant there (AIRA-179). It exists for two reasons, both honesty ones:
+//
+//   - crossCheckGitContext compares caller-observed Git provenance against a
+//     scope, and for a deliberately redirected rant the truthful comparand is
+//     the ORIGINATING worktree, not the target's. Comparing against the target
+//     would stamp every cross-project rant `mismatch`: a fabricated provenance
+//     alarm.
+//   - Git context can legitimately be `unevaluated`, so it cannot be relied on
+//     to say where a rant came from. ProjectID is recorded explicitly, so a
+//     foreign rant is never indistinguishable from a local one.
+type RantOrigin struct {
+	ProjectID  string
+	Root       string
+	CommonDir  string
+	WorktreeID string
+}
+
+// RantOrigin projects this store's own scope into the origin descriptor a
+// redirected rant records and cross-checks against.
+func (s *Store) RantOrigin() RantOrigin {
+	if s == nil {
+		return RantOrigin{}
+	}
+	return RantOrigin{ProjectID: s.projectID, Root: s.root, CommonDir: s.commonDir, WorktreeID: s.worktreeID}
+}
+
+// WithRantOrigin returns a view of this store whose rant writes record origin
+// and whose Git-provenance cross-check is evaluated against that origin rather
+// than against this store's own scope. It is for CROSS-project rants only: an
+// incomplete origin, or one naming this very project, is refused rather than
+// silently recorded, because either would produce an attribution this store
+// cannot stand behind. A rant aimed at the caller's own project needs no
+// redirect and must use the plain store view.
+func (s *Store) WithRantOrigin(origin RantOrigin) (*Store, error) {
+	if s == nil {
+		return nil, errors.New("E_INTERNAL: rant origin has no store")
+	}
+	if origin.ProjectID == "" || origin.Root == "" || origin.CommonDir == "" || origin.WorktreeID == "" {
+		return nil, errors.New("E_INTERNAL: rant origin scope is incomplete")
+	}
+	if origin.ProjectID == s.projectID {
+		return nil, errors.New("E_INTERNAL: rant origin must name a different project than its target")
+	}
+	view := *s
+	view.rantOrigin = &origin
+	return &view, nil
+}
+
+// rantOriginProjectID is the value recorded on a captured rant: empty for an
+// ordinary local rant, the originating project for a redirected one.
+func (s *Store) rantOriginProjectID() string {
+	if s.rantOrigin == nil {
+		return ""
+	}
+	return s.rantOrigin.ProjectID
+}
+
 func (s *Store) AddRant(ctx context.Context, raw domain.RantInput, observed gitcontext.GitContext) (RantAddResult, error) {
 	input, err := raw.Normalised()
 	if err != nil {
@@ -62,7 +121,7 @@ func (s *Store) AddRant(ctx context.Context, raw domain.RantInput, observed gitc
 				return err
 			}
 			if found {
-				if !sameRantInput(existing, input, observed) {
+				if !sameRantInput(existing, input, observed, s.rantOriginProjectID()) {
 					return errors.New(domain.CodeRantIdempotencyConflict + ": key already belongs to different rant input")
 				}
 				result = RantAddResult{Rant: existing, ID: existing.ID, Idempotent: true}
@@ -76,13 +135,14 @@ func (s *Store) AddRant(ctx context.Context, raw domain.RantInput, observed gitc
 		rant := domain.Rant{ID: fmt.Sprintf("RANT-%d", number), Body: input.Body, Tags: append([]string(nil), input.Tags...), Severity: input.Severity,
 			Refs: append([]domain.RantRef(nil), input.Refs...), Actor: input.Actor, Session: input.Session, Model: input.Model,
 			ObservedAt: observed.ObservedAt, ReceivedAt: received, ResolverVersion: observed.ResolverVersion, Seq: sequence,
-			GitContext: observed, Reviewed: false, Reviews: []domain.RantReview{}}
+			OriginProjectID: s.rantOriginProjectID(),
+			GitContext:      observed, Reviewed: false, Reviews: []domain.RantReview{}}
 		var idem any
 		if input.IdempotencyKey != "" {
 			idem = input.IdempotencyKey
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO rants(project_id,id,body,severity,idempotency_key,actor,session,model,observed_at,received_at,resolver_version,seq,redacted)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)`, s.projectID, rant.ID, rant.Body, rant.Severity, idem, rant.Actor, rant.Session, rant.Model, rant.ObservedAt, rant.ReceivedAt, rant.ResolverVersion, rant.Seq); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO rants(project_id,id,body,severity,idempotency_key,actor,session,model,observed_at,received_at,resolver_version,seq,redacted,origin_project_id)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?)`, s.projectID, rant.ID, rant.Body, rant.Severity, idem, rant.Actor, rant.Session, rant.Model, rant.ObservedAt, rant.ReceivedAt, rant.ResolverVersion, rant.Seq, rant.OriginProjectID); err != nil {
 			return err
 		}
 		for _, tag := range rant.Tags {
@@ -387,9 +447,9 @@ func (s *Store) loadRant(ctx context.Context, queryer interface {
 }, id string) (domain.Rant, error) {
 	var rant domain.Rant
 	var reviewed, redacted int
-	err := queryer.QueryRowContext(ctx, `SELECT id,body,severity,actor,session,model,observed_at,received_at,resolver_version,seq,redacted,
+	err := queryer.QueryRowContext(ctx, `SELECT id,body,severity,actor,session,model,observed_at,received_at,resolver_version,seq,redacted,origin_project_id,
 		EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)
-		FROM rants WHERE project_id=? AND id=?`, s.projectID, id).Scan(&rant.ID, &rant.Body, &rant.Severity, &rant.Actor, &rant.Session, &rant.Model, &rant.ObservedAt, &rant.ReceivedAt, &rant.ResolverVersion, &rant.Seq, &redacted, &reviewed)
+		FROM rants WHERE project_id=? AND id=?`, s.projectID, id).Scan(&rant.ID, &rant.Body, &rant.Severity, &rant.Actor, &rant.Session, &rant.Model, &rant.ObservedAt, &rant.ReceivedAt, &rant.ResolverVersion, &rant.Seq, &redacted, &rant.OriginProjectID, &reviewed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Rant{}, errors.New("E_NOT_FOUND: rant not found")
 	}
@@ -480,9 +540,15 @@ func (s *Store) findRantByIdempotency(ctx context.Context, conn *sql.Conn, key s
 // is a distinct caller and must conflict rather than silently return the
 // original rant. Volatile derived Git state (HEAD, ref, remote) and the
 // envelope timestamps are excluded so an honest retry stays idempotent.
-func sameRantInput(rant domain.Rant, input domain.RantInput, observed gitcontext.GitContext) bool {
+//
+// origin is the originating project of THIS attempt (empty for a local rant).
+// Git provenance can be unevaluated on both attempts, so without this a key
+// reused from a different project would alias the original rant and silently
+// misattribute it; a different origin is a different caller and must conflict.
+func sameRantInput(rant domain.Rant, input domain.RantInput, observed gitcontext.GitContext, origin string) bool {
 	if rant.Body != input.Body || rant.Severity != input.Severity ||
 		rant.Actor != input.Actor || rant.Session != input.Session || rant.Model != input.Model ||
+		rant.OriginProjectID != origin ||
 		len(rant.Tags) != len(input.Tags) || len(rant.Refs) != len(input.Refs) {
 		return false
 	}
@@ -623,13 +689,21 @@ func (s *Store) crossCheckGitContext(context gitcontext.GitContext) gitcontext.G
 		}
 	}
 	context = contextFromFields(fields, context.ObservedAt, context.ResolverVersion)
-	expectedRepo := s.root
-	if filepath.Base(filepath.Clean(s.commonDir)) == ".git" {
-		expectedRepo = filepath.Dir(filepath.Clean(s.commonDir))
+	// The comparand is the scope the caller actually observed from, which for a
+	// redirected rant is the ORIGINATING worktree rather than this store's own
+	// (AIRA-179). Both are daemon-validated identities; using the target's here
+	// would report every deliberate cross-project rant as a provenance anomaly.
+	expectedRoot, expectedCommon, expectedWorktreeID := s.root, s.commonDir, s.worktreeID
+	if s.rantOrigin != nil {
+		expectedRoot, expectedCommon, expectedWorktreeID = s.rantOrigin.Root, s.rantOrigin.CommonDir, s.rantOrigin.WorktreeID
+	}
+	expectedRepo := expectedRoot
+	if filepath.Base(filepath.Clean(expectedCommon)) == ".git" {
+		expectedRepo = filepath.Dir(filepath.Clean(expectedCommon))
 	}
 	context.RepoRoot = mismatchPath(context.RepoRoot, expectedRepo)
-	context.WorktreePath = mismatchPath(context.WorktreePath, s.root)
-	if context.WorktreeID.Status == gitcontext.StatusValue && context.WorktreeID.Value != s.worktreeID {
+	context.WorktreePath = mismatchPath(context.WorktreePath, expectedRoot)
+	if context.WorktreeID.Status == gitcontext.StatusValue && context.WorktreeID.Value != expectedWorktreeID {
 		context.WorktreeID.Status, context.WorktreeID.Reason = gitcontext.StatusMismatch, "daemon-scope-worktree-id"
 	}
 	if context.RepoRoot.Status == gitcontext.StatusMismatch || context.WorktreePath.Status == gitcontext.StatusMismatch || context.WorktreeID.Status == gitcontext.StatusMismatch {

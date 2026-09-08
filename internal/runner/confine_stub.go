@@ -18,6 +18,17 @@ func confine(_ context.Context, request ConfineRequest) (ConfineResult, error) {
 
 func RunConfineSetup([]string, io.Writer) int { return 127 }
 
+// InheritedConfineScopeID has no reading to make off Linux: nothing here can
+// create a confine scope, so nothing here is running inside one. It answers ""
+// — the same answer the Linux implementation gives for an absent or malformed
+// coordinate.
+//
+// The stub is load-bearing rather than tidiness: AIRA-187 gave this function a
+// PLATFORM-NEUTRAL caller (the CLI's nested-launch warning). Before that only
+// the Linux-only confine-reserve path read it, so the symbol never had to exist
+// here.
+func InheritedConfineScopeID() string { return "" }
+
 // The detached-confine surface is Linux-only for the same reason confinement is:
 // it exists to own a cgroup-v2 scope. Every stub refuses rather than pretending,
 // so a non-Linux build cannot report a detached job it never started.

@@ -84,18 +84,24 @@ type RantReview struct {
 }
 
 type Rant struct {
-	ID              string                `json:"id"`
-	Body            string                `json:"body"`
-	Tags            []string              `json:"tags"`
-	Severity        RantSeverity          `json:"severity,omitempty"`
-	Refs            []RantRef             `json:"refs"`
-	Actor           string                `json:"actor"`
-	Session         string                `json:"session,omitempty"`
-	Model           string                `json:"model,omitempty"`
-	ObservedAt      string                `json:"observed_at,omitempty"`
-	ReceivedAt      string                `json:"received_at"`
-	ResolverVersion string                `json:"resolver_version,omitempty"`
-	Seq             int64                 `json:"seq"`
+	ID              string       `json:"id"`
+	Body            string       `json:"body"`
+	Tags            []string     `json:"tags"`
+	Severity        RantSeverity `json:"severity,omitempty"`
+	Refs            []RantRef    `json:"refs"`
+	Actor           string       `json:"actor"`
+	Session         string       `json:"session,omitempty"`
+	Model           string       `json:"model,omitempty"`
+	ObservedAt      string       `json:"observed_at,omitempty"`
+	ReceivedAt      string       `json:"received_at"`
+	ResolverVersion string       `json:"resolver_version,omitempty"`
+	Seq             int64        `json:"seq"`
+	// OriginProjectID names the project a cross-project rant was FILED FROM and
+	// is empty for an ordinary local rant. Git provenance can legitimately be
+	// unevaluated, so it is not a reliable origin marker; this is the explicit
+	// one, recorded from the daemon-validated caller scope so a foreign rant is
+	// never indistinguishable from a local one (AIRA-179).
+	OriginProjectID string                `json:"origin_project_id,omitempty"`
 	Reviewed        bool                  `json:"reviewed"`
 	Redacted        bool                  `json:"redacted,omitempty"`
 	GitContext      gitcontext.GitContext `json:"git_context"`

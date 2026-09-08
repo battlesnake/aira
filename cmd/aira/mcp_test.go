@@ -70,10 +70,12 @@ func TestRantMCPIsCaptureOnlyWithApprovedAdvertisement(t *testing.T) {
 	}
 	sort.Strings(got)
 	// scope_dir is the face-level per-call scope override (AIRA-82), injected by
-	// makeToolBinding rather than declared by the rant descriptor. It is listed
-	// here so this guard still refuses any OTHER property leaking into the
-	// capture-only advertisement.
-	want := []string{"idempotency_key", "refs", "scope_dir", "severity", "tags", "text"}
+	// makeToolBinding rather than declared by the rant descriptor. project and
+	// prefix are the rant target selector (AIRA-179): they name the project a
+	// capture applies to, so friction about a shared tool can be filed where its
+	// own maintainers read it. Both are listed here so this guard still refuses
+	// any OTHER property leaking into the capture-only advertisement.
+	want := []string{"idempotency_key", "prefix", "project", "refs", "scope_dir", "severity", "tags", "text"}
 	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(schema.Required, []string{"text"}) {
 		t.Fatalf("schema properties=%v required=%v", got, schema.Required)
 	}

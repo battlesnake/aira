@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-191","project":"aira","title":"confine --list has no per-scope reserve field -- only cap, which does not sum to the slice's own granted total and misleads under --delegate-ram","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["confine","observability"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-191","project":"aira","title":"confine --list has no per-scope reserve field -- only cap, which does not sum to the slice's own granted total and misleads under --delegate-ram","status":"in-progress","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["confine","observability"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-191","to":"AIRA-192"}]}
 ---
 
 Peer report (ems, 2026-09-08/09), verified from source.
@@ -41,3 +41,17 @@ field is genuinely absent.
 Confirms (independently, via ems relaying split's finding) the same
 nested-confine-competes-with-its-own-parent shape already tracked as
 [[AIRA-187]] -- no new ticket for that half.
+
+## Built (2026-09-09), with [[AIRA-192]]
+
+The per-scope field is `ConfineRecord.ReserveBytes` (`"reserve_bytes"`),
+established server-side from the daemon's own admission snapshot and
+rendered as a RESERVE column BESIDE the existing CAP in `confine --list`
+-- both, because the reporter's incident was reading one as the other. It
+carries the ledger CHARGE (what this scope contributes to
+`slice reserve: <granted>` right now), so the rows finally sum to the
+slice total they are read against: `Sum(reserve_bytes) == ScopeBytes +
+AdoptedBytes`, pinned by test. A scope the daemon holds no admission
+record for prints `unevaluated` and names `reserve` in
+`unevaluated_fields`; it never falls back to the cap. See [[AIRA-192]]
+for the full decision record.
