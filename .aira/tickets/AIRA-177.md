@@ -53,8 +53,22 @@ source, must NOT change:
   (`installedSliceCeilingModeRE`) -- verify this property explicitly with a
   test (an already-`observe` install, re-run with no `--slice-ceiling` flag,
   must stay `observe`) so this ticket cannot accidentally make the change
-  retroactive. A truly fresh install (no existing managed unit) is the only
-  population that picks up the new default.
+  retroactive.
+
+  **Corrected 2026-09-08 by the AIRA-177 plan gate (plan revision 2, §1.4):**
+  this bullet originally read "A truly fresh install (no existing managed
+  unit) is the only population that picks up the new default." That is FALSE.
+  `resolveDaemonModes` takes the installed unit's *content*, never its
+  presence, and `installedEnvironmentValue` (`install.go:103-115`) returns
+  `""` — indistinguishable from "no unit" — for an absent slice-ceiling line
+  (every unit rendered by a pre-AIRA-106 binary), an unrecognised value, and a
+  multi-assignment or reset `Environment=` line. All of those fall through to
+  the ship default too. The population that picks up the new default is
+  therefore: **no `--slice-ceiling` flag AND no managed `aira-daemon.service`
+  carrying a mode `validDaemonMode` accepts.** The plan decides that case
+  deliberately (accept the fall-through to `enforce`; §0.2 bounds the
+  consequence to a longer admission wait, never a refusal) and pins it with
+  tests; the preservation requirement above is unchanged and still required.
 - `--slice-ceiling observe`/`off` remain fully supported, explicit opt-outs
   for anyone who wants the old behaviour.
 
