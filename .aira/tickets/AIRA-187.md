@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-187","project":"aira","title":"aira confine gives no warning when nested inside another confine scope, competing with its own already-covering parent reservation","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-187","to":"AIRA-191"}]}
+{"schema":1,"id":"AIRA-187","project":"aira","title":"aira confine gives no warning when nested inside another confine scope, competing with its own already-covering parent reservation","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-187","to":"AIRA-191"},{"kind":"relates","from":"AIRA-187","to":"AIRA-194"}]}
 ---
 
 Peer report (split, 2026-09-08), verified from source. split's own initial
