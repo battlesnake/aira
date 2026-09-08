@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-162","project":"aira","title":"The fitted-reserve ladder can spend one extra real run at its top rung","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-162","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-162","project":"aira","title":"The fitted-reserve ladder can spend one extra real run at its top rung","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[]}
 ---
 
 AIRA-153 deferral **G1**, filed with its derivation rather than left implicit.

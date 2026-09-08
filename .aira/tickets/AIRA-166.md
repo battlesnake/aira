@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-166","project":"aira","title":"The agent guide says a first run is capped at estimate:p90-prior even when no p90 exists","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["docs","admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-166","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-166","project":"aira","title":"The agent guide says a first run is capped at estimate:p90-prior even when no p90 exists","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","docs"],"hold":false,"relations":[]}
 ---
 
 AIRA-153 deferral **G7**. Pre-existing, unrelated to that ticket's change, and

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-170","project":"aira","title":"Seven tickets on master carry severity P3, which domain.validSeverity rejects: aira show/link/rant --ref refuse them with E_CONFIG_INVALID 'ticket enum is invalid'","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-170","project":"aira","title":"Seven tickets on master carry severity P3, which domain.validSeverity rejects: aira show/link/rant --ref refuse them with E_CONFIG_INVALID 'ticket enum is invalid'","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-170","to":"AIRA-171"}]}
 ---
 Found while closing AIRA-165/166 after PR #104 (merged `34ea0b0`).
 
@@ -8,7 +8,9 @@ Found while closing AIRA-165/166 after PR #104 (merged `34ea0b0`).
 - `aira show AIRA-165` → `E_CONFIG_INVALID: ticket enum is invalid` (exit 2)
 - `aira link AIRA-169 relates AIRA-165` → the same
 - `aira rant ... --ref ticket:AIRA-165` → `E_RANT_REF_INVALID: reference does not exist in this project` — the ticket exists on disk; the loader refused it
-- `aira link AIRA-169 relates AIRA-151` (a P2 ticket) → OK, which isolates the cause to the severity value
+- `aira link AIRA-169 relates AIRA-151` (a P2 ticket) → OK, so the severity value is A cause
+
+That last line originally read "which isolates the cause to the severity value". It does not: a P2 control passing shows only that P3 is *one* refusal on the path, and nothing was ever read back from AIRA-165 after widening the enum. Each of the seven files in fact carried a SECOND, independent hand-written defect, and the corrected reasoning is recorded in section 5.
 
 Two separate defects:
 
@@ -140,6 +142,64 @@ identical copies. AIRA-169's duplicates are removed; no relation is lost. This i
 the second, independent reason that file was unreadable, and it is exactly the
 hand-writing this ticket's last paragraph predicted would go wrong.
 
+### 5. The seven files themselves were still unreadable (Fable work-review of PR #105)
+
+Sections 1-4 are code-correct, and the enum, the error quality and the `rant
+--ref` arm all do what they say. They did not make `aira show AIRA-165` work.
+
+Validation is a sequence, and widening the severity ladder only advanced each of
+the seven files to the NEXT hand-written defect in the same frontmatter:
+
+| file | what was left after the enum widened |
+| --- | --- |
+| AIRA-162, 163, 165, 167, 168 | `E_RELATION_INVALID: relation is not stored on its canonical lower-ID ticket` |
+| AIRA-164, 166 | `E_TICKET_INVALID: ticket labels must be unique and sorted` |
+
+and with AIRA-165 still unreadable, `rant --ref ticket:AIRA-165` and `link
+AIRA-170 relates AIRA-165` still refused — the second now correctly naming
+`E_RELATION_INVALID` rather than the severity.
+
+This was missed because every test written for sections 1-4 built its own
+pristine P3 fixture. A fixture that differs from the real file in exactly the way
+that matters cannot see the defect, and one of them described itself as "the
+exact master reproduction", which is what stopped anyone looking further. The
+build review found it by driving the store over this repository's own
+`.aira/tickets`.
+
+**The repair (8 files, 8 lines).** Each of AIRA-162..168 stored `N->AIRA-153` on
+ITSELF, but `CanonicalRelationOwner` is the LOWER id, `AIRA-153`, and
+`AIRA-153.md` already holds `153->162 .. 153->168` canonically. `relates` is its
+own inverse (`RelationKind.Inverse()` maps it to itself), so each of those seven
+is a duplicate of an edge already stored, and deleting it loses nothing.
+
+AIRA-165 additionally held `165->AIRA-151`, which nothing else stored in either
+direction. That one was not deleted — it MOVED onto its canonical owner
+`AIRA-151.md`, inserted between `151->153` and `169->151` (`relationLess` orders
+by kind, then `from`, then `to`).
+
+AIRA-164's labels `[admission, confine, ci]` and AIRA-166's `[docs, admission,
+confine]` were sorted.
+
+`store.TestTheRepositorysOwnTicketFilesAreReadable` asserts both halves of the
+losslessness claim so a later tidy-up cannot quietly undo it: AIRA-151 still
+carries the moved edge, and AIRA-153.md still mirrors all seven deletions.
+
+**Verified end to end through the real CLI**, with a binary built at this branch
+and pointed at a throwaway `HOME`/`XDG_STATE_HOME` so it does not defer to the
+stale installed daemon:
+
+```
+$ aira show AIRA-162 .. AIRA-168   -> OK, severity=P3   (all seven)
+$ aira show AIRA-169               -> OK, severity=P2
+$ aira rant ... --ref ticket:AIRA-165 -> OK (RANT-1)
+```
+
+**Nine OTHER ticket files remain unreadable** — AIRA-28, 62, 117, 141, 144, 145,
+152, 153, 160 — for four defect classes that all predate this work and none of
+which it caused. They are AIRA-171, with the per-file treatment worked out, and
+they are why the whole-repo test carries an explicit quarantine map rather than a
+bare "everything parses".
+
 ### Tests
 
 | test | what it pins |
@@ -147,7 +207,8 @@ hand-writing this ticket's last paragraph predicted would go wrong.
 | `domain.TestP3IsARealSeverityTheReaderPathAccepts` | P3 validates and round-trips through `RenderTicket`/`ParseTicket`; `""`, `P4`, `P9`, `p3`, `"P3 "` and `critical` are still refused, so the enum did not become free text; a P3 FINDING is accepted |
 | `domain.TestInvalidTicketFieldNamesFieldValueAndAllowedSet` | severity/status/kind each refuse with `E_TICKET_INVALID` naming field, value and the whole allowed set, never `E_CONFIG_INVALID`; survives a `ParseTicket` round trip |
 | `core.TestTicketEnumsInTheDispatchTableAreTheDomainsOwn` | the published `create`/`find` enums ARE the domain ladders, every published severity is one the validator accepts, and P3 is offered |
-| `store.TestReaderPathsAcceptP3AndNameABrokenFieldHonestly` | `show` and `link` work on a P3 ticket (the exact master reproduction); a bogus-severity ticket refuses with `E_TICKET_INVALID` naming field/value/allowed set; the exit stays 2; `check` reports it as a finding; `List` stays empty; `Ready` still fails on it |
+| `store.TestReaderPathsAcceptP3AndNameABrokenFieldHonestly` | SYNTHETIC fixtures only, and says so: `show` and `link` work on a pristine P3 ticket; a bogus-severity ticket refuses with `E_TICKET_INVALID` naming field/value/allowed set; the exit stays 2; `check` reports it as a finding; `List` stays empty; `Ready` still fails on it |
+| `store.TestTheRepositorysOwnTicketFilesAreReadable` | **the reproduction.** Copies this repository's own `.aira/tickets`, reconciles, rebuilds, and asserts: every file is readable except an explicit quarantine map asserted in BOTH directions; AIRA-162..168 read back as `SeverityP3`; AIRA-169 reads; the moved `165->151` edge survives on AIRA-151; AIRA-153.md still mirrors the seven deletions; `rant --ref ticket:AIRA-165` and `link AIRA-170 relates AIRA-165` succeed |
 | `store.TestRantRefOnABrokenTicketFileNamesTheRealReason` | the `--ref` refusal names the real reason; two CONTROLS — an absent ticket keeps the honest "does not exist", and a present, parseable one is not blamed |
 
 Every fixture that exercises the ERROR-QUALITY fix uses `"P9"`, not `P3`, on
@@ -171,6 +232,11 @@ KILLED:
 | M6 | dispatch enum back to a hand-copied `"P0","P1","P2"` | `TestTicketEnumsInTheDispatchTableAreTheDomainsOwn` |
 | M7 | `E_TICKET_INVALID` dropped from `isIntegrityError` | `TestReaderPathsAcceptP3AndNameABrokenFieldHonestly` |
 | M8 | `isTicketFileInvalidCode` narrowed to `E_CONFIG_INVALID` | `TestReaderPathsAcceptP3AndNameABrokenFieldHonestly` |
+| M9 | all eight ticket-file repairs reverted to PR-head content | `TestTheRepositorysOwnTicketFilesAreReadable` (7 unreadable, then fatal on `show AIRA-162`) |
+| M10 | the moved `165->151` edge deleted from `AIRA-151.md` | `TestTheRepositorysOwnTicketFilesAreReadable` |
+| M11 | `153->165` mirror deleted from `AIRA-153.md` (making a deletion lossy) | `TestTheRepositorysOwnTicketFilesAreReadable` |
+| M12 | a healthy ticket added to `quarantinedTicketFiles` | `TestTheRepositorysOwnTicketFilesAreReadable` (the "now parses" direction) |
+| M13 | the `Rebuild` call dropped, so the ref check reads an empty index | `TestTheRepositorysOwnTicketFilesAreReadable` (the `rant --ref` arm) |
 
 M5b and M8 SURVIVED on the first pass — the controls were too weak to see them.
 Both tests were tightened (`rant`'s control now requires the unchanged
@@ -179,13 +245,33 @@ mutants are killed. They are recorded here because a mutation that survives once
 is the evidence that a test was porous, and the record is worth more than a
 clean-looking table.
 
-### Coverage gap, accepted
+### What the CLI does and does not prove
 
-No end-to-end check through the live CLI is recorded. `aira show AIRA-165` on
-this box still answers `E_CONFIG_INVALID` after the fix, because the DB-owning
-daemon is service-authoritative and is the INSTALLED binary, not the one built
-in this worktree; the new behaviour reaches the CLI only once the merged binary
-is installed. The reproduction is therefore pinned at the store layer
-(`TestReaderPathsAcceptP3AndNameABrokenFieldHonestly` drives `Get`, `Link`,
-`List`, `Ready` and `Check` against real ticket files on disk) rather than
-through a face this worktree cannot re-point.
+The reader paths ARE verified end to end through the real CLI face (section 5),
+using a branch-built binary with a throwaway `HOME`/`XDG_STATE_HOME` so
+`ServiceIdentityMatches` returns false and the client does not defer.
+
+Against the LIVE daemon this box runs, `aira show AIRA-165` still answers
+`E_CONFIG_INVALID: ticket enum is invalid`, and `aira link AIRA-165 relates
+AIRA-171` still refuses. That is not a gap in this change: the daemon is
+service-authoritative and is the INSTALLED binary (built 2026-09-07 07:45, a day
+behind master), so it applies the old ladder to every mutation and to any read it
+serves. It resolves on install, and it is the reason section 5 built its own
+binary rather than trusting the CLI on this machine — the earlier version of this
+paragraph used that same install caveat to excuse a result it had not checked,
+which is exactly how the seven broken files survived.
+
+Recorded gaps that remain:
+
+- **AIRA-171**: nine ticket files still unreadable, quarantined by name in
+  `TestTheRepositorysOwnTicketFilesAreReadable` and asserted in both directions,
+  so the list cannot grow silently or rot.
+- **AIRA-172**: `aira check` on this box exits 4 with `E_JOURNAL_CORRUPT` under
+  the installed binary, so an operator cannot see any of the above through the
+  CLI today; one bad run-ledger record silences all fourteen check dimensions
+  instead of marking the ledger-derived ones `unevaluated`.
+- No test calls `cmd/aira`'s `watchFatal` or `executeNotLaunchedCode`, so
+  `E_TICKET_INVALID`'s membership in those two classifiers is established by
+  reading, not by execution. Neither is `E_TICKET_INVALID`'s presence in the
+  review verb's `report_instruction` pinned (`cmd/aira/main_test.go:646` checks
+  only `aira find add`).

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-164","project":"aira","title":"ci-shim mode: a ceiling-fitted booking is advisory, with no kernel enforcement behind it","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ci"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-164","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-164","project":"aira","title":"ci-shim mode: a ceiling-fitted booking is advisory, with no kernel enforcement behind it","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","ci","confine"],"hold":false,"relations":[]}
 ---
 
 AIRA-153 deferral **G3**.

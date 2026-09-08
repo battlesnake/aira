@@ -1378,15 +1378,21 @@ func writeTicketFile(t *testing.T, path, id string) {
 }
 
 // TestReaderPathsAcceptP3AndNameABrokenFieldHonestly covers both halves of
-// AIRA-170 at the surfaces that actually broke on master.
+// AIRA-170 over SYNTHETIC fixtures: a P3 ticket is readable and linkable, and a
+// ticket carrying an out-of-ladder severity is refused by a code that names the
+// field, the value and the allowed set.
 //
-// Before the fix, every reader path refused the seven merged P3 tickets:
-// `aira show AIRA-165` and `aira link AIRA-169 relates AIRA-165` both answered
-// `E_CONFIG_INVALID: ticket enum is invalid` (exit 2), while the same operation
-// against a P2 ticket succeeded — which is what isolated the cause to the
-// severity value. The second half of the test keeps the ERROR-QUALITY fix
-// exercised with a value that is still invalid ("P9"), because P3 becoming
-// legal would otherwise retire the only fixture that reached this path.
+// It is deliberately NOT the AIRA-170 reproduction, and must not be read as one.
+// Its P3 fixture is otherwise pristine, so it establishes that the ENUM widened
+// and nothing at all about the seven real files the ticket was filed on — each
+// of which carried a SECOND hand-written defect and stayed unreadable after the
+// enum widened. The first version of this comment called itself "the exact
+// master reproduction"; that claim is what let the real defect survive a build
+// review. TestTheRepositorysOwnTicketFilesAreReadable drives the real files.
+//
+// The second half keeps the ERROR-QUALITY fix exercised with a value that is
+// still invalid ("P9"), because P3 becoming legal would otherwise retire the
+// only fixture that reached this path.
 //
 // verifies: AIRA-170
 func TestReaderPathsAcceptP3AndNameABrokenFieldHonestly(t *testing.T) {
