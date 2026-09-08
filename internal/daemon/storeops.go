@@ -101,7 +101,11 @@ func validateStoreOpEnvelope(frame StoreOpFrame) error {
 		if len(frame.Payload) == 0 {
 			return errors.New(CodeProtocol + ": add-test-report requires a payload")
 		}
-	case "add-compute-event", "add-command-event":
+	// AIRA-176. `worktree register` is client-routed (it reads the CALLER's
+	// checkout), so its one write reaches the single-writer daemon the same way
+	// every other client-routed write does: as a relayed store op. It carries a
+	// small JSON payload and no body.
+	case "add-compute-event", "add-command-event", "register-worktree-binding":
 		if frame.BodyLen != 0 {
 			return fmt.Errorf("%s: %s cannot carry a body", CodeProtocol, frame.Op)
 		}
@@ -242,6 +246,15 @@ func runStoreOp(ctx context.Context, view *store.Store, frame StoreOpFrame) (any
 			return nil, err
 		}
 		return view.AddCommandEvent(ctx, input)
+	case "register-worktree-binding":
+		var input domain.WorktreeBindingInput
+		if err := decodeStoreOpPayload(frame.Payload, &input); err != nil {
+			return nil, err
+		}
+		// The worktree identity is NOT in the payload: the receiving store
+		// stamps its own scope's, so a caller cannot declare a binding for a
+		// checkout it is not standing in.
+		return view.RegisterWorktreeBinding(ctx, input)
 	case "reconcile":
 		if err := view.Reconcile(ctx); err != nil {
 			return nil, err

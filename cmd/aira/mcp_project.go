@@ -76,6 +76,16 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 			code := store.ErrorCode(scopeErr)
 			return core.Response{Code: code, Error: scopeErr.Error(), Exit: codes.ExitForCode(code)}
 		}
+		// AIRA-176. Identity for `worktree register` is resolved from the RESOLVED
+		// SCOPE ROOT, never from ".". Over MCP "." is this server process's working
+		// directory — wherever the host launched it — so a cwd-rooted resolution
+		// would attribute the binding to a directory that is very likely not the
+		// caller's checkout at all, and its @cwd- inference would be actively
+		// misleading.
+		if ownerErr := stampWorktreeOwner(requestContext, scope, &request); ownerErr != nil {
+			code := store.ErrorCode(ownerErr)
+			return core.Response{Code: code, Error: ownerErr.Error(), Exit: codes.ExitForCode(code)}
+		}
 		if err := refuseAmbiguousImportPath(request, scopeDirOverride); err != nil {
 			code := store.ErrorCode(err)
 			return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}

@@ -422,7 +422,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "commands", "confine", "confine-kill", "confine-list", "confine-reserve", "confine-status", "count", "create", "drain", "eject", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "intent-retire", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
+	want := []string{"check", "claim", "commands", "confine", "confine-kill", "confine-list", "confine-reserve", "confine-status", "count", "create", "drain", "eject", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "intent-retire", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink", "worktree-audit", "worktree-register"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

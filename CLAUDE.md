@@ -10,7 +10,11 @@ Before changing anything:
 
 1. Work in a dedicated git worktree on a feature branch. The repository root stays
    on `master` for the owner; never develop there.
-2. Confirm the worktree is clean and record the starting commit.
+2. Confirm the worktree is clean and record the starting commit. Run
+   `aira worktree register <id>` alongside `aira claim <id>`: the claim says you
+   are working it now, the binding says which ticket this checkout is for and
+   outlives the lease. Before removing any worktree, read
+   `aira worktree audit` rather than eyeballing `git status` and `git log`.
 3. Read the applicable design spec in full. Do not infer a missing decision from
    an implementation convenience.
 4. Check the backlog and prerequisites. A ticket blocked by an unlanded

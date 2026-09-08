@@ -1,6 +1,8 @@
 # AIRA-176 — associate worktrees + agent/session identity with tickets, and classify staleness honestly
 
-Status: **plan — §4's open questions resolved (§5, 2026-09-09); not yet built.**
+Status: **BUILT (2026-09-09, AIRA-176).** §4's open questions were resolved in
+§5; the two review passes on §5 are answered in §6 and the test plan is §7. Where
+§6 names a change, §6 supersedes §5 and §2.
 This document proposed a design; it was deliberately not a committed
 implementation spec the way tonight's AIRA-149/151/153 plans were, because the
 owner asked for a plan first, not a build. §5 now records the gate decisions on
@@ -98,6 +100,9 @@ exists to gate a destructive `eject`, not to report worktree state generally.
 
 ### 2.1 A new, durable, DB-only binding table
 
+(**§5.1 changes this key and §6 the columns; the block below is the superseded
+first draft, kept so a reader meets the correction rather than a gap.**)
+
 ```
 worktree_bindings(
   project_id      TEXT,
@@ -193,7 +198,8 @@ conclusion the reader can re-derive, not an opaque verdict.
   prose (dedicated worktree, feature branch, record starting commit) — it
   does not invent a new obligation, it makes an existing one queryable.
 
-- **`aira worktree audit [selector]`** — `SafetyReadOnly`. Enumerates
+- **`aira worktree audit [selector]`** — `SafetyRead` (§6.1: `SafetyReadOnly` is
+  not a class this codebase has). Enumerates
   worktrees via the existing `discoverWorktrees` (`git worktree list
   --porcelain`, the one mechanism already used for this), joins each to its
   current/most-recent binding (explicit or inferred), computes the fact
@@ -219,13 +225,13 @@ special-casing in the generation pipeline:
 
 - `worktree-register` → `MCPTool: "aira_worktree_register"`, safety
   `Mutate`, one hand-written CLI arm.
-- `worktree-audit` → `MCPTool: "aira_worktree_audit"`, safety `ReadOnly`,
+- `worktree-audit` → `MCPTool: "aira_worktree_audit"`, safety `Read`,
   one hand-written CLI arm.
-- Routing (`internal/core/routing.go`'s `Classify`): both touch the local
-  git checkout directly (mirroring `discoverWorktrees`'s existing shell-outs
-  and confine's own owner-resolution), so both classify as client-local, not
-  daemon-proxied — consistent with every other git-reading verb in this
-  codebase.
+- Routing (`internal/core/routing.go`'s `Classify`): both are client-local.
+  **This does not happen by itself — see §6.2.** `Classify`'s default is
+  `RouteDaemon` and every client-local verb is an explicit case, so a
+  `worktree-` prefix case is added by hand; without it both verbs would run
+  inside the daemon and classify the daemon's checkout.
 - New `renderMarkdownBody` prose block (`internal/core/skill.go`), placed
   beside the existing "Start here"-adjacent guidance: *register your
   worktree against its ticket when you start (mirrors CLAUDE.md's own
@@ -356,8 +362,11 @@ Why the key changes from §2.1's `(project_id, worktree_id, registered_at)`:
 Resulting columns: `project_id`, `worktree_id`, `ticket_id`, `branch`,
 `base_ref`, `base_commit`, `owner`, `owner_attested`, `registered_at`, plus the
 projects FK. `last_seen_at` is dropped (see §5.2). `released_at` is dropped
-too: a released binding is DELETEd, so a row means "declared" and its absence
-means "not declared", with no third tombstone state to keep consistent.
+too: a row means "declared" and its absence means "not declared", with no third
+tombstone state to keep consistent. **The "a released binding is DELETEd" half of
+this sentence is withdrawn by §6.4** — nothing deletes a binding except the
+projects FK cascade on `eject`, and an orphaned row is reported rather than
+swept.
 
 One trap to name before a builder walks into it: **`ticket_id` carries no
 foreign key to `tickets`, and must not be given one.** `tickets` is keyed
@@ -506,3 +515,197 @@ the decision rather than the superseded advice.
   genuine but differently named (`investigate-aira91-92-…`,
   `review-whole-project`). A worktree with no ticket must report none, never a
   forced guess.
+
+## 6. Build addendum — review findings resolved (2026-09-09, master `777d75b`)
+
+Two independent reviews ran against §5: an Astra plan review (`NEEDS_REVISION`,
+two findings) and a Fable gate (`FAIL`, five blocking findings plus five
+non-blocking corrections). Every load-bearing citation in both was
+re-verified against `777d75b` before building. This section records what
+changed; §1-§5 stand except where named.
+
+### 6.1 Astra A1 — `SafetyReadOnly` does not exist
+
+Correct, and Fable found it independently. The closed enum is
+`SafetyRead`/`Mutate`/`Lease`/`Reconcile`/`Execute` (`internal/core/core.go:307`).
+`worktree audit` is **`SafetyRead`**; `confine-list` (RouteClient + SafetyRead +
+MCP-exposed) is its exact precedent.
+
+### 6.2 Astra A2 / Fable F2 — routing is now explicit, and `register` writes through the relay
+
+Astra is right that §2.4 asserted client-local routing as if `Classify` produced
+it: it does not. `Classify`'s default is `RouteDaemon`, and every client-local
+verb is a hand-added case. A case is now added — `strings.HasPrefix(canonical,
+"worktree-")` → `RouteClient` — with a comment saying it is required rather than
+decorative.
+
+Fable is right that §5.2's *routing* leg was overstated: `stampGitContext`
+(`cmd/aira/dispatcher.go`) already ships client-observed git provenance into
+daemon handlers, so "the daemon cannot reach the caller's checkout" is not
+literally true. **The evidence-grade argument against `claim` still stands
+unchanged, and it is the one that decided §5.2.** The shape is named here:
+
+- **Both verbs are `RouteClient`.** Beyond matching §2.4, one audit here is ~85
+  checkouts × ~6 git subprocesses; running that inside the machine-wide
+  single-writer daemon would hold a project's store-op lane for the whole sweep
+  and stall every other session on that project.
+- **`register`'s one write goes through a new store op**,
+  `register-worktree-binding` (`internal/daemon/storeops.go` +
+  `writeRelayStore.RegisterWorktreeBinding`), exactly like `add-compute-event`.
+  Without the override the embedded read-only store reaches SQLite `query_only`
+  and fails loudly, which is the design. The worktree identity is **not** in the
+  payload: the receiving store stamps its own scope's, so a caller cannot
+  declare a binding for a checkout it is not standing in. The relayed result is
+  validated against the requested ticket and worktree before the client reports
+  success.
+
+### 6.3 Fable F3 — the binding join, and the subprocess bound
+
+Confirmed and load-bearing: `addDiscoveredWorktree` (`internal/store/store.go`)
+assigns `worktree-<path digest>[:16]`, a placeholder, **not** the
+`hashPath(canonicalPath(gitDir))` bindings are keyed on. Joining on it would have
+silently degraded every explicit binding to `inferred`.
+
+The audit therefore does **not** reuse that scanner. It runs one
+`rev-parse --git-dir --git-common-dir` per checkout and resolves identity through
+`store.CanonicalScopeIdentity` — the store's own function, injected as
+`worktree.IdentityCall`, so there is no second copy to drift. Comparing the two
+resolved identities also gives main-worktree detection for free.
+
+Bounds, named as F3 asks: every git call has a 10s context deadline and a 3s
+`WaitDelay` (the `internal/app` discovery bound, for the same fsmonitor/credential-
+helper grandchild reason), and the whole audit has a `DefaultBudget` of 5
+minutes. When the budget elapses the audit does not fail: checkouts it did not
+reach are reported with unevaluated facts and a note naming the elapsed budget.
+
+### 6.4 Fable F4 — no deletion path, stated rather than left ambiguous
+
+**Decision: AIRA never deletes a binding.** There is no `unregister` verb, no gc,
+and §5.1's "a released binding is DELETEd" is withdrawn. The only removal is the
+projects FK cascade on `aira eject`. A deletion path would be a second way to
+lose the record of where work was done, in a feature whose entire purpose is not
+to lose work.
+
+What `audit` reports for a binding whose checkout is gone: an
+**`orphan_bindings`** entry carrying the ticket, branch, owner, attestation and
+registration time, plus the last path the `worktrees` registry saw that identity
+at (`WorktreeRoots`). Nothing about a worktree's location is cached on the
+binding row, so there is no second copy to drift; when the registry has no row
+the path is simply absent rather than invented.
+
+### 6.5 Fable F5 — the chain's step 2 under the per-ticket key
+
+Specified as Fable asks. Among a checkout's bindings, the distinct non-empty
+`base_ref` values are collected:
+
+- none → fall through to step 3;
+- one → use it, after re-verifying it still resolves (a deleted ref becomes
+  `unevaluated`, naming the remedy);
+- two or more → **`unevaluated("binding base_ref conflict: … pass --base <ref>
+  to settle it")`, and the chain STOPS.** It deliberately does not fall through
+  to the configured ref: answering from a source none of the bindings named
+  would settle an ambiguity by arbitrary premise. Ambiguity is refused here
+  exactly as it is for selectors.
+
+`register` stores **nothing** when steps 3-4 resolve nothing: `base_ref` and
+`base_commit` are empty, and the response says so with the remedy. An
+unresolvable explicit `--base` is an error, not a silent empty field.
+
+One further fail-closed decision made here: a **configured** `git.integration_ref`
+that does not resolve reports `unevaluated` rather than falling through to
+`origin/HEAD`. A configured value is a positively established configuration;
+papering over it would answer from a source the operator did not choose and hide
+the typo.
+
+### 6.6 Fable's non-blocking corrections
+
+- `SafetyReadOnly` → `SafetyRead` (§6.1).
+- **`resolveConfineOwner`'s hardcoded `app.Discover(ctx, ".")` is fixed for this
+  verb.** It is now `resolveOwnerIn(ctx, explicit, dir)`; `resolveConfineOwner`
+  keeps its exact historical behaviour by passing `dir == ""`, and
+  `stampWorktreeOwner` passes the **resolved scope root** from both the CLI and
+  MCP faces. Over MCP `"."` is the server process's launch directory, so the
+  old form would have attributed a binding to a directory outside the repository
+  — and its `@cwd-` inference would have been actively misleading.
+- §2.3's `git status --porcelain` wording is corrected: it **does** list
+  untracked files; only ignored files are invisible to it. The report says so in
+  its own notes, and a real-git test asserts an untracked file produces
+  `recover`.
+- **Squash-merged branches are an accepted gap**, recorded here: `is-ancestor` is
+  false for a squash-merged branch, so it reads as "not merged" — the safe
+  direction (no removal recommendation), at the cost of not recognising work
+  that is genuinely integrated. `pushed_to_any_remote` still keeps it out of the
+  recovery bucket, so the outcome is a `superseded` prompt or no recommendation,
+  never a false "recover".
+- **Remote-tracking refs are only as fresh as the last fetch**, so
+  `pushed_to_any_remote` can report false for a branch that was pushed from
+  elsewhere. Accepted, and stated in the report's own notes. Safe direction:
+  it over-reports "recover", never under-reports it.
+- The ticket's stale "four open questions … left for the build" paragraph is
+  updated through the ticket file itself.
+
+### 6.7 Two decisions taken during the build, recorded here
+
+- **The main worktree is never a removal candidate.** Its facts (clean, merged,
+  zero unique commits) would otherwise compose to "nothing to lose — safe to
+  remove" for the repository root. Detected by its git dir being the common dir;
+  `git worktree remove` cannot remove it anyway.
+- **Every removal-adjacent bucket demands a PROVEN absence**, not an absence of
+  proof. `Flag.False()` exists so a bucket must ask for an established false;
+  `!True()` would let an unevaluated `git status` through as "clean". A mutation
+  test confirms this: weakening `False()` to `!True()` makes three tests fail
+  with the exact false pass — "merged — safe to remove" for a checkout whose
+  dirty state was never established.
+
+## 7. Test plan (Fable F1)
+
+Named per invariant, with the direction each guards. `→` names the file.
+
+| Invariant | False-fail (must fire) | False-pass (must not fire) |
+| --- | --- | --- |
+| PK is per (worktree, ticket) | `TestBindingKeyIsPerTicketSoOneCheckoutCanServeSeveral` — three tickets on one checkout all survive → `internal/store` | same test: registering a second ticket must not close the first |
+| Register idempotency | `TestRegisterWorktreeBindingIsIdempotentPerTicket` — one row, refreshed | same test: an unattested re-register must not inherit the earlier attestation |
+| Identity comes from the store's scope | `TestBindingCarriesTheStoresOwnWorktreeIdentity` | same test: two checkouts must not collapse to one row |
+| Schema enforces the evidence grade | — | `TestWorktreeBindingSchemaRefusesAnAttestedRowWithNoOwner` (direct SQL, bypassing Validate) |
+| Project scoping of the read | `TestWorktreeBindingsAreScopedToTheProject` | same test: another project's rows must not appear |
+| `owner_attested` derives from `ConfineOwnerIsAttested` | `TestStampWorktreeOwnerDerivesAttestationFromTheResolvedIdentity` (attested leg) → `cmd/aira` | same test (inferred leg): a `@cwd-` identity must never report attested |
+| Attestation is not forgeable | — | `TestWorktreeOptionsAreRefusedWhereTheyDoNotApply` + `TestWorktreeRegisterBuildsItsRequest`: `--owner-attested` is unreachable from the CLI and `buildRequest` never leaves a truthy value |
+| Owner resolves from the scope root, not cwd | `TestStampWorktreeOwnerResolvesFromTheScopeRootNotTheProcessCwd` | `TestStampWorktreeOwnerTouchesNoOtherVerb` |
+| §5.3 asymmetry | `TestUnresolvedIntegrationRefStillRecoversUnpushedWork` — recovery stays evaluable | `TestUpstreamIsNeverConsulted` — no removal verdict with no integration ref |
+| `@{upstream}` never consulted | — | `TestUpstreamIsNeverConsulted` asserts on the recorded git ARGV, not the conclusion: `@{upstream}`, `branch.`, `--symbolic-full-name` and `rev-parse --abbrev-ref` are never asked |
+| Chain order 1 > 2 > 3 > 4 > unevaluated | `TestIntegrationRefChainPrefersExplicitBaseOverEverything`, `TestIntegrationRefChainPrefersBindingOverConfig`, `TestAgreeingBindingBaseRefsAreUsed` | `TestBrokenConfiguredRefDoesNotFallThroughToOriginHead`, `TestUnresolvableExplicitBaseIsRefused` |
+| F5 conflict refusal | — | `TestConflictingBindingBaseRefsRefuseRatherThanFallThrough` |
+| `live_lease` override | `TestLiveLeaseOverridesEveryRemovalBucket` | `TestUnresolvableWorktreeIdentitySuppressesRemoval` — an unknown identity cannot prove no lease, so no removal |
+| Unevaluated suppresses removal | — | `TestUnevaluatedStatusSuppressesEveryRemovalRecommendation`; mutation-verified (§6.7) |
+| `merge-base` exit codes | `TestMergedCleanWorktreeIsSafeToRemove` | `TestMergeBaseFailureIsUnevaluatedNotNotMerged` |
+| Recovery beats removal | `TestUnpushedUniqueCommitsRecommendRecovery` | `TestUncommittedChangesBeatMerged` |
+| Superseded needs a closed ticket | `TestPushedUniqueCommitsOnDoneTicketLookSuperseded` | `TestOpenTicketIsNotSuperseded` |
+| Main worktree excluded | `TestMainWorktreeIsNeverARemovalCandidate` | same test |
+| Inference labelled, never promoted | `TestBranchNameInferenceIsLabelledInferred`, `TestMultiTicketCommitPrefixesAreAllInferred` | `TestExplicitBindingIsNeverDowngradedAndSuppressesInference` |
+| No ticket → none, never a guess | — | `TestInferenceNeverInventsATicket`, `TestUnconventionalBranchNamesInferNothing` (four real branch names from this repository) |
+| Orphan bindings reported | `TestOrphanBindingIsReportedNotSwept` | same test |
+| Selector forms | `TestAuditSelectorFormsResolveIndependently`, `TestTicketSelectorScopesToThatTicketsCheckouts` → `internal/core` | `TestAuditSelectorRefusesAnArgumentThatCouldBeEither`, `TestPathSelectorNamingNoCheckoutIsRefused` |
+| Store without the capability | — | `TestWorktreeVerbsRefuseAStoreThatCannotAnswer` (E_WORKTREE_UNAVAILABLE, never an empty all-clear) |
+| Routing (Astra A2) | `TestWorktreeVerbsAreClientRouted` | same test: the prefix rule must not leak onto `touch`; `TestWorktreeVerbsAreNotStoreFreeCarved` |
+| Relay faithfulness | `TestRegisterWorktreeBindingStoreOpRoundTrip` → `internal/daemon` | `TestRelayedBindingMustDescribeTheRequestedWrite` → `cmd/aira`; `TestRegisterWorktreeBindingStoreOpEnvelopeIsValidated` |
+| Inherited `GIT_DIR` does not redirect | `TestAuditAgainstARealRepositoryIgnoresAnInheritedGitDir` (real repo + real decoy repo) → `internal/worktree`; mutation-verified: removing the scrub makes it fail | same test |
+| Untracked files are work | `TestAuditSeesUntrackedFilesAsWorkToRecover` | same test |
+| Register records nothing it did not establish | `TestCaptureRegistrationRecordsTheMergeBaseWhenARefResolves` | `TestCaptureRegistrationRecordsNothingWhenNoIntegrationRefResolves`, `TestCaptureRegistrationRefusesAnUnresolvableExplicitBase` |
+| Time budget | `TestElapsedBudgetReportsUnevaluatedRatherThanAPartialTruth` | same test: unreached checkouts must not be presented as audited |
+| Generated faces stay in step | `TestSkillSafetyGolden`, `TestCanonicalDispatchNamesAndAliases`, `TestMCPToolListIsGeneratedAndStable`, `TestSkillMetadataNormalisesEveryIncludedAction` | — |
+| Skill teaches the idiom | `TestSkillTeachesTheWorktreeRitualAndHowToReadItsUnevaluatedFacts` (six legs) | — |
+
+### 7.1 Coverage gaps, accepted and written down
+
+- **Squash merges** read as not-merged (§6.6). Safe direction; no test asserts
+  the unreachable behaviour.
+- **Stale remote-tracking refs** can make `pushed_to_any_remote` false for a
+  branch pushed from elsewhere (§6.6). Safe direction.
+- **A ticket selector matches on registered bindings and branch-name convention
+  only**, not commit-message inference — scanning every checkout's log to
+  resolve a scoped audit would defeat the point of scoping. Stated in the verb's
+  argument description.
+- **No concurrency test** for two sessions registering the same
+  `(worktree, ticket)` simultaneously: the write is a single `withImmediate`
+  upsert on a per-row primary key, so the outcome is one row either way and
+  there is no CAS to get wrong. Recorded rather than silently untested.

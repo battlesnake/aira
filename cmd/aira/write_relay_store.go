@@ -90,6 +90,48 @@ func (s *writeRelayStore) AddCommandEvent(ctx context.Context, input domain.Comm
 	return result, nil
 }
 
+// RegisterWorktreeBinding is AIRA-176's one write from a client-routed verb.
+// Without this override the embedded read-only Store would reach SQLite
+// query_only and fail loudly — which is the design, not an accident: an
+// unoverridden writer must never silently succeed against a read-only view.
+func (s *writeRelayStore) RegisterWorktreeBinding(ctx context.Context, input domain.WorktreeBindingInput) (domain.WorktreeBinding, error) {
+	frame, err := daemon.NewJSONStoreOp(s.scope, "register-worktree-binding", input)
+	if err != nil {
+		return domain.WorktreeBinding{}, err
+	}
+	var binding domain.WorktreeBinding
+	if err := s.exchange(ctx, frame, &binding, false); err != nil {
+		return domain.WorktreeBinding{}, err
+	}
+	if err := validateRelayedWorktreeBinding(binding, input, s.scope.WorktreeID); err != nil {
+		return domain.WorktreeBinding{}, malformedStoreOpResult(frame.Op, err)
+	}
+	return binding, nil
+}
+
+// validateRelayedWorktreeBinding refuses a relayed result that does not
+// describe the write that was actually requested, for this scope's checkout. A
+// relay echoing a different ticket or a different worktree would make the
+// client report a registration that never happened.
+func validateRelayedWorktreeBinding(binding domain.WorktreeBinding, input domain.WorktreeBindingInput, worktreeID string) error {
+	if strings.TrimSpace(binding.TicketID) == "" {
+		return errors.New("binding names no ticket")
+	}
+	if binding.TicketID != strings.TrimSpace(input.TicketID) {
+		return fmt.Errorf("binding names ticket %q, requested %q", binding.TicketID, input.TicketID)
+	}
+	if worktreeID != "" && binding.WorktreeID != worktreeID {
+		return fmt.Errorf("binding names worktree %q, requested %q", binding.WorktreeID, worktreeID)
+	}
+	if strings.TrimSpace(binding.RegisteredAt) == "" {
+		return errors.New("binding carries no registration time")
+	}
+	if binding.OwnerAttested && strings.TrimSpace(binding.Owner) == "" {
+		return errors.New("binding is attested with no owner")
+	}
+	return nil
+}
+
 func (s *writeRelayStore) Reconcile(ctx context.Context) error {
 	frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: s.scope, Op: "reconcile"}
 	return s.exchange(ctx, frame, nil, true)

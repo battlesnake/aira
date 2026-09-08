@@ -364,8 +364,28 @@ var ExitCodes = map[string]int{
 	"E_INTENT_NOT_PENDING": 1, "E_INTENT_REPLAYABLE": 1,
 	"U_INTENT_UNEVALUATED": 3,
 	"E_CLOCK_UNAVAILABLE":  1,
-	"E_TRACE_DANGLING":     1,
-	"W_TRACE_UNCOVERED":    0, "W_TRACE_UNVERIFIED": 0,
+	// AIRA-176's worktree vocabulary.
+	//
+	// E_WORKTREE_BINDING_INVALID is a malformed declaration — no ticket, or an
+	// attested claim with no owner to attest — so it is a usage error, exit 2,
+	// beside E_FINDING_INVALID and E_REQUIREMENT_INVALID.
+	//
+	// E_WORKTREE_AUDIT exits 4 beside E_GIT_SCAN, which it is the same kind of
+	// thing as: the repository's own checkouts could not be enumerated, so the
+	// audit produced no answer at all. Note the narrow scope — anything the audit
+	// CAN scope to one checkout is reported as an unevaluated fact inside a
+	// successful report rather than failing the command, so this code means the
+	// sweep never started, never that some fact came back unestablished.
+	//
+	// E_WORKTREE_UNAVAILABLE exits 3, the unevaluated family: the store handed to
+	// the verb cannot answer binding queries, so the audit's result is UNKNOWN.
+	// Exiting 0 with an empty report would be a fabricated all-clear for a
+	// feature whose whole job is to say what would be lost.
+	"E_WORKTREE_BINDING_INVALID": 2,
+	"E_WORKTREE_AUDIT":           4,
+	"E_WORKTREE_UNAVAILABLE":     3,
+	"E_TRACE_DANGLING":           1,
+	"W_TRACE_UNCOVERED":          0, "W_TRACE_UNVERIFIED": 0,
 	"U_TRACE_UNSCANNED": 3, "U_TRACE_EMPTY": 3,
 	"E_GATE_INVALID": 2, "E_GATE_KIND_INVALID": 2, "E_GATE_CANARY_INVALID": 2,
 	// `gate add` on an id that already exists (gate_write.go:149/169) is decided at
