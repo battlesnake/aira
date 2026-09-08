@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-194","project":"aira","title":"A zero-reserve pass-through confine mode -- group-kill + cgroup grouping for an orchestrator whose children all self-confine, contributing nothing to the admission ledger","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-194","project":"aira","title":"A zero-reserve pass-through confine mode -- group-kill + cgroup grouping for an orchestrator whose children all self-confine, contributing nothing to the admission ledger","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-194","to":"AIRA-195"}]}
 ---
 
 Peer proposal (fastest-ee-4b, 2026-09-09), designing per-sub-job `aira

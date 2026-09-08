@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-183","project":"aira","title":"confine --list's LIVE=no is ambiguous between a genuinely dead supervisor pending reap and a momentarily-idle-but-alive scope","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["confine","reaper","ux"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-183","project":"aira","title":"confine --list's LIVE=no is ambiguous between a genuinely dead supervisor pending reap and a momentarily-idle-but-alive scope","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["confine","reaper","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-183","to":"AIRA-195"}]}
 ---
 
 Peer report (split, 2026-09-08), verified from source. After `kill <supervisor-pid>`
