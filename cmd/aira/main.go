@@ -1246,6 +1246,12 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	} else if stderr != nil {
 		_, _ = fmt.Fprintf(stderr, "confine: daemon paths unavailable; admission will use flock and no aitest coordinates are exported: %v\n", err)
 	}
+	// AIRA-187. Say the one true thing about a nested launch that nothing said
+	// before. Printed for the detached form too, below, because a detached
+	// supervisor requests admission on exactly the same terms.
+	if warning := nestedConfineWarning(options, inheritedConfineScopeID()); warning != "" && stderr != nil {
+		_, _ = fmt.Fprintln(stderr, warning)
+	}
 	if options["detach"] == "true" {
 		return runConfineDetachCommand(ctx, request, stdout, stderr)
 	}
