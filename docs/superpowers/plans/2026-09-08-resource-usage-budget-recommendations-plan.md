@@ -257,7 +257,338 @@ golden-tested Skill/guide mention — with only the CLI `parseArgs`/
    persistence threshold (N consecutive runs) to avoid noise on a single
    atypical run.
 
+## 5r. §5 resolved — gate decisions (2026-09-09)
+
+All five open questions are decided below. Every citation in §1–§4 was
+re-verified against `master` before deciding; four of them were wrong or
+incomplete, and two of the corrections are load-bearing enough that they
+change the answers. The corrections come first, because Decision 1 exists
+only because of correction (a).
+
+### 5r.0 Corrections to §1–§4 (re-verified from source)
+
+**(a) §3.1's "no new capture needed" is FALSE for `aira confine` — and
+confine is where the reported pain is.** The confine-report wire frame
+carries only `{signature, oom, peak_rss}`
+(`internal/runner/admission_linux.go:794-797` →
+`internal/daemon/confine_report.go:11-45` → `RecordConfinePeak`). The
+reserve a confine job was actually *granted* is persisted nowhere; the
+source says so in as many words at
+`internal/runner/confine_shim_linux.go:471-476` ("the confine-report wire
+frame carries only signature/oom/peak_rss and the runs projection has no
+provenance column"). The claim is true only of `aira run`, whose ledger
+projection does carry `admission_reserve` and `admission_reserve_basis`
+(`internal/runner/ledger.go:640-651`). Consequence: with today's schema the
+**over-provisioned direction is unevaluable for confine** — the feature
+could not reproduce its own headline evidence (subpipe's
+`--memory-reserve 8G` against a 52 MiB–841 MiB actual). That is what
+Decision 1 fixes.
+
+**(b) §3.2's `Observed{P90, …}` does not exist per subject.**
+`ConfinePeakHistory` returns aggregates only — total count, usable-sample
+count, **MAX** peak, OOM count, max-OOM peak
+(`internal/store/confine_peak_history.go:52-69`). `ConfinePeakP90`
+(`:71-102`) is a *different quantity*: the cross-signature p90 of
+per-signature maxima, and it is read live by admission as the machine-wide
+prior for a job with no history of its own
+(`internal/daemon/admit.go:1854`, `cachedAdmitPeakP90` at `:1954`). It is
+not this subject's p90 and must not be borrowed as one. Decision 4 resolves
+this by classifying against MAX — the same statistic `EstimateMemoryReserve`
+itself uses (`internal/runner/resource_estimate.go:94-116`) — so a
+recommendation and the automatic estimate can never be talking about
+different numbers.
+
+**(c) §1/§3.4 mis-describe the `.aira/config` precedent.** `RunConfig`
+(`internal/app/project.go:65-75`) carries `memory_headroom` as a byte-count
+string but `memory_estimate` as a **bool** — the switch that enables the
+estimator, not a value. And `RunConfig` is the `run.` section governing
+`aira run` specifically (`Config` sections are schema/project/lease/run/git,
+`project.go:25-31`); an aitest knob does not belong under it. Feeds
+Decision 3.
+
+**(d) §3.1 names the wrong capture point in `supervisor.py`.**
+`_forget_worker_scope` (`:1493-1518`) receives only the scope *path* — not
+the grant, therefore not the worker's `memory_max` (the budget term) and not
+the pool key. The grant is in hand one frame up, in `_retire_worker`
+(`:1487`), and the supervisor already has a precedent for exactly this
+ordering: `_describe_worker_death` is called BEFORE `_retire_worker`
+(`:2010-2013`) for the stated reason that "once it is gone the evidence for
+WHY this worker died is gone with it". Capture belongs beside that call, not
+inside the rmdir.
+
+**(e) Unrecorded in §3.1: there is no back-channel to report a pool peak.**
+The supervisor's only daemon transport is the per-worker `aira worker-admit`
+relay subprocess. A pool-peak report needs a new report path — the analogue
+of the `confine-report` verb — and v1 must scope that explicitly rather than
+discover it during the build.
+
+**(f) Q1 is not fully open: the authoritative aitest spec already answers
+its direction.** `docs/superpowers/specs/2026-09-01-aitest-design.md:232-236`
+already prescribes per-suite sizing by "reuse of
+`internal/store/confine_peak_history.go`'s existing table" under a signature
+`pytest-worker:<suite-hash>`. Per CLAUDE.md ("read the applicable design
+spec in full; do not infer a missing decision from an implementation
+convenience"), the gate's job here is to confirm that decision against
+current source and name what it does not cover — not to re-open it.
+
+### 5r.1 Decision 1 — extend `confine_peak_history`, with a `kind`
+discriminator and budget columns
+
+**Decided: extend the existing table. Add three columns:**
+
+```sql
+ALTER TABLE confine_peak_history ADD COLUMN kind TEXT NOT NULL DEFAULT 'confine';
+ALTER TABLE confine_peak_history ADD COLUMN budget INTEGER;       -- nullable
+ALTER TABLE confine_peak_history ADD COLUMN budget_basis TEXT;    -- nullable
+```
+
+with the index rebuilt on `(kind, signature)` and every existing reader
+filtered on `kind`.
+
+Why one table, not two:
+
+- The authoritative aitest spec already prescribes reuse (correction (f)).
+- The two subjects have byte-identical shape — subject key, observed peak,
+  OOM flag, timestamp — and now the same budget pair.
+- The 20-newest-per-key retention (`confinePeakHistoryLimit`,
+  `confine_peak_history.go:12,43-48`) is a correctness-critical invariant
+  with tests behind it. A second table duplicates it, and duplicated
+  retention invariants drift.
+- `EstimateMemoryReserve`/`ConfinePeakHistory` already read this shape; a
+  second table means a parallel reader the classifier has to union anyway.
+
+Why `kind` is **not optional polish — it is the decisive term.**
+`ConfinePeakP90` scans the table with **no per-signature filter at all**
+(`WHERE peak_rss>0 GROUP BY signature HAVING COUNT(peak_rss)>=3`,
+`:77-79`) and its result feeds **live admission** for every job with no
+history of its own (`admit.go:1854`). Dropping aitest worker rows —
+hundreds of small 512 MiB-capped workers — into that table without a filter
+would silently drag the machine-wide admission prior down. That is a
+behaviour change to the live admission path, arriving through a
+report-only feature, invisible to every test that does not already assert
+on the prior. A `kind` **column** rather than a `pytest-worker:` string
+prefix because a prefix is a convention a single-element argv can in
+principle collide with (a `ResourceSignature` for a one-element argv
+contains no NUL separator, `resource_estimate.go:69-79`), whereas a column
+cannot collide: illegal-unrepresentable, the project's stated
+data-model-first review bias.
+
+Why the budget columns: without them correction (a) stands and the
+over-provisioned direction — the reported pain — is unevaluable. `budget`
+is the reserve/`memory.max` actually granted for that sample; `budget_basis`
+its provenance in the existing `family:name[:params]` grammar
+(`pinned:client`, `estimate:max=…`, `env:default`, `env:set`). Both
+nullable, because a sample whose budget could not be established must read
+`unevaluated`, never a fabricated zero — the same discipline `peak_rss`
+already has.
+
+The migration is the established idempotent `tableHasColumn`-guarded
+ADD COLUMN pattern already used for exactly this shape at
+`internal/store/store.go:1239`
+(`ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`).
+`DEFAULT 'confine'` backfills every existing row correctly by construction:
+they *are* confine rows.
+
+**This forbids:** any reader of `confine_peak_history` that does not name a
+`kind`. The build must audit all four existing call sites
+(`RecordConfinePeak`, `ConfinePeakHistory`, `ConfinePeakP90`, and the
+retention DELETE) and add a regression test that a `pytest-worker` row
+cannot move `ConfinePeakP90`'s answer.
+
+### 5r.2 Decision 2 — `resource-budget`, on **two** faces over one
+classifier: project-scoped `aira insights`, project-less `aira confine`
+
+**Decided.** Gauge/classifier name: `resource-budget` — kebab, no verb,
+matching the existing gauge-name grammar (`admission-reserve-adequacy`,
+`quota-burn`, `flaky-rate`, `insights.go:91-100`).
+
+- **Face 1 — `aira insights show resource-budget`** (project-scoped). One
+  row in `insightRegistry` plus one `Compute` func. No new verb, no new CLI
+  `parseArgs` arm, no new MCP tool (it reaches MCP through the existing
+  `aira_insights` tool's `name` argument), no new Skill registration beyond
+  appearing in `insights ls`. This is the cheapest possible addition
+  consistent with the dispatch-table rule.
+- **Face 2 — a new management form on `aira confine`** (project-**less**),
+  answered through the daemon exactly as `--list` already is. This is the
+  pre-flight answer: "for this command, what does history say, and what
+  would be granted".
+
+§5's question assumed one home. One is wrong, and this is the gate's most
+substantive change to the plan. `aira insights` is part of the coordination
+surface, which by design returns `E_CONFIG_MISSING` outside a project the
+user has run `aira init` in (`internal/core/skill.go:336`). But half this
+gauge's subject — `aira confine` — is deliberately project-less, and AIRA
+has already made and written down exactly this call once: `aira top` is
+dispatched *before* project discovery because "confine state is machine-wide
+and `confine --list` needs none. Routing it through the scope resolution
+below would make a machine-wide monitor refuse to start outside an AIRA
+project — **which is most of the directories an operator watching the slice
+is standing in**" (`cmd/aira/main.go:167-172`). qual, subpipe, split and wt
+were all standing in exactly such directories. An insights-only v1 would
+answer `E_CONFIG_MISSING` to the four sessions whose pain motivated the
+ticket. (This objection was independently raised by a DeepSeek-pro
+adversarial pass on the draft decisions and is accepted.)
+
+Two faces is not complexity stacking: it is the project's stated
+architecture — "the core is one downward-layered implementation behind
+`core.Do`; CLI, MCP, Skill, daemon, and TUI are thin faces" (CLAUDE.md) —
+and it is what §3.3 already proposed. The **classifier is one pure function**
+in `internal/store` beside `classifyAdmissionAdequacy`, and the faces hold
+no logic.
+
+**Honesty requirement on Face 1.** This is the first gauge to report
+**machine-wide** data behind a project-scoped verb. Existing gauges are
+per-repo: `admission-reserve-adequacy` reads the common-dir `runs.db`
+(`admission_insight.go:239`, `estimate_actual.go:34`), and the common dir is
+the git common dir. `confine_peak_history` lives in the single machine-wide
+`state.db` and has no `project_id`. `GaugeUniverse.Scope` must say so
+verbatim, and so must the cross-project limitation in 5r.6.
+
+### 5r.3 Decision 3 — the durable `.aira/config` aitest knob is DEFERRED
+
+**Decided: not in v1.** Four reasons, in descending weight:
+
+1. **It is a write-path change wearing a read-path plan's clothes.** This
+   feature's first hard constraint is report/recommend-only. A durable
+   config key that admission reads is a new *admission input*, and shipping
+   it under this plan would put a behaviour change through a gate that
+   reviewed a reporting change.
+2. **The Python side cannot read it.** `internal/pylib/aitest` is env-var
+   only — verified: the only knobs are `AIRA_AITEST_ESTIMATED_BYTES`
+   (`__init__.py:231-283`), `AIRA_AITEST_MAX_WORKERS_FALLBACK`,
+   `AIRA_AITEST_BOOTSTRAP_CMD`, `AIRA_AITEST_WORKER_ADMIT_CMD`. There is no
+   `.aira/config` reader anywhere in the package. v1 would have to mint a
+   new Go→Python configuration channel — unscoped work with its own failure
+   modes, for a knob nothing yet recommends.
+3. **§3.4 proposed the wrong home anyway** (correction (c)): `RunConfig` is
+   the `run.` section for `aira run`. An aitest knob would need its own
+   `aitest` section on `Config`, which is a larger, separately reviewable
+   surface decision.
+4. **Recommending into a knob that does not exist is worse than
+   recommending into one that does.** The existing knobs
+   (`--memory-reserve`/`--memory-max`, `AIRA_AITEST_ESTIMATED_BYTES`) are
+   actionable today. v1's recommendation text names those.
+
+Recorded consequence, to be stated in the gauge rather than left implied:
+until that ticket lands, an aitest subject's `Budget.Origin` can only be
+`env:set` or `env:default`, and there is no project-scoped place to put the
+answer — a caller acting durably still has only a wrapper-script `export`.
+
+### 5r.4 Decision 4 — reuse `marginBucket`'s boundaries; mint no new constant
+
+**Decided.** The band is the one the codebase already has, applied to
+`budget / observed-MAX`:
+
+| ratio | classification | recommendation |
+| --- | --- | --- |
+| any OOM on record for the subject | **under-provisioned** | raise, regardless of ratio |
+| `< 1.0` (shortfall) | **under-provisioned** | raise |
+| `[1.0, 1.25)` | **well-fitted** | none |
+| `[1.25, 2.0)` | **acceptable** | none |
+| `>= 2.0` | **over-provisioned** | lower |
+
+Why this exactly:
+
+- `marginBucket` (`internal/store/admission_insight.go:218-236`) already
+  defines these four boundaries, is already the tested vocabulary for
+  reserve-vs-peak, and computes them by **exact big.Int
+  cross-multiplication** specifically so no float64 rounding can misclassify
+  a value at 1.25 or 2.0 (`:218-222`). Reusing it inherits that correctness
+  and mints zero constants — the same "no new constant enters the codebase"
+  discipline `SliceFittedReserve` states for itself
+  (`resource_estimate.go:17-35`).
+- `[1.0, 1.25)` comfortably contains the estimator's own 1.15 safety factor
+  (`memoryEstimateSafetyPct`, `resource_estimate.go:10-13`), so a subject
+  sized by AIRA's own estimator classifies as well-fitted by construction —
+  the feature never recommends against the estimator's own output.
+- `[1.25, 2.0)` is deliberately classified but **not recommended on**. A
+  dead band matters here: without it, every subject is permanently either
+  too big or too small and the surface becomes noise. 2.0 is where subpipe's
+  156x and AIRA-186's ~35.7 GiB-vs-~22 GiB both sit far outside, so the band
+  is wide enough to be quiet and still catch every reported case.
+- Against MAX, not a p90 — see correction (b). Recorded limitation, from
+  AIRA-186: a MAX-based comparison inherits MAX's tail sensitivity (a 31 GiB
+  outlier in a 20-sample window drives a 35.7 GiB estimate). The classifier
+  therefore publishes `SampleCount` and the OOM count beside every
+  classification so the operator can see whether a single tail sample is
+  driving it; it does not silently smooth the tail away, because the live
+  estimator does not either and the two must not disagree.
+
+### 5r.5 Decision 5 — no persistence threshold; reuse the existing ≥3-sample
+gate, with an OOM bypass
+
+**Decided: no N-consecutive-runs streak counter.**
+
+- A streak counter is **new durable state** — a per-subject counter that
+  must be persisted, pruned, invalidated when the budget changes, and
+  reconstructed after a daemon restart. That is precisely the machinery the
+  owner's architectural-simplicity rule says not to stack for an advisory
+  signal.
+- The evidence gate already exists and is already the codebase's answer to
+  "too little evidence": `memoryEstimateMinSamples = 3`
+  (`resource_estimate.go:11`), mirrored by `ConfinePeakP90`'s
+  `HAVING COUNT(peak_rss)>=3`. Below three usable samples the subject is
+  `unevaluated` with the existing reason shape
+  (`fallback:insufficient-samples:n=N`), never a Warning.
+- Single-run noise is **already asymmetric in the safe direction**, because
+  the comparison is against MAX of a 20-sample window (Decision 4). One
+  atypically *low* run cannot move MAX at all, so it can never manufacture a
+  spurious "over-provisioned, lower it" — the only direction where a wrong
+  recommendation causes an OOM. One atypically *high* run moves MAX up,
+  i.e. toward "raise it" — the direction whose failure mode is wasted
+  headroom, not a dead job. A streak counter would buy nothing the window
+  and the ≥3 gate do not already buy.
+
+**One bypass, accepted from the DeepSeek-pro pass:** a recorded OOM
+classifies under-provisioned **on the first occurrence**, bypassing the ≥3
+gate. An OOM is not a noisy sample — it is realised harm, it is already
+recorded (`confine_peak_history.oom`; and, on the aitest side,
+`_describe_worker_death`'s `oom_group_kill` read, `supervisor.py:2044-2084`),
+and the estimator already escalates on it unconditionally
+(`resource_estimate.go:107-111`). Waiting for a third OOM before saying so
+would be the feature withholding the one thing it is certain about.
+
+### 5r.6 What v1 does NOT ship, and why (written down, not silent)
+
+- **The `aira check` `resource-budget` dimension (§3.3) is deferred.**
+  `checkDimensions` (`internal/store/check.go:44-49`) is the
+  *project-consistency* vocabulary, and `check`'s Warnings are consumed as
+  project evidence. `confine_peak_history` has no `project_id`, and
+  `ResourceSignature` is argv-only with no cwd term
+  (`resource_estimate.go:69-79`) — so `make test` in repo A and repo B are
+  **one row set**. A machine-wide, cross-project advisory landing in a
+  project's `aira check` would let one repo's command warn in another's.
+  Defer until the data is project-attributable; the two query faces cover
+  the reported pain without it.
+- **The project-less pre-flight verb is Face 2 on `confine`, not a new
+  top-level verb.** A new top-level verb would need a CLI arm, an MCP
+  schema, and a Skill registration for a question `confine` is already the
+  home of.
+- **Per-test capture stays out**, unchanged from §3.1/§3.4 — and the build
+  must not regress `TestSkillNamesNothingFromTheRetiredXdistGovernor`.
+- **Named limitation the gauge must state, not imply:** signatures are
+  machine-wide and cross-project (above), and `Universe.Scope` must say so.
+  This is a pre-existing property — the live estimator already sizes
+  admission from the same collided history — so it is a disclosure
+  requirement, not a defect this feature introduces.
+
+### 5r.7 Build scope implied by these decisions
+
+1. Schema: three guarded ADD COLUMNs + `(kind, signature)` index; all four
+   existing readers filtered on `kind`; regression test that a
+   `pytest-worker` row cannot move `ConfinePeakP90`.
+2. Capture, confine side: carry `budget`/`budget_basis` on the
+   `confine-report` frame (the two fields correction (a) shows are missing)
+   and persist them.
+3. Capture, aitest side: read `memory.peak` beside the existing
+   `_describe_worker_death` call in `_handle_worker_death`'s ordering — grant
+   in hand — and add the pool-peak report path correction (e) names.
+4. One pure classifier in `internal/store`, `GaugeResult`-shaped, reusing
+   `marginBucket`.
+5. Two thin faces: `insightRegistry` row; `confine` management form.
+
 ## 6. Status
 
-Planning only. Not yet gated, not yet built, per the owner's explicit
-request.
+Planning only — **§5 now resolved (5r), 2026-09-09**. Not yet built. The
+five gate decisions above, the four source corrections in 5r.0, and the
+deferrals in 5r.6 are binding on the build.

@@ -56,6 +56,45 @@ extending `confine_peak_history`; verb name/home; whether the durable
 whether a `Warning` needs a persistence threshold to avoid single-run
 noise) — none blocking, all deliberately left for the build to decide.
 
+## §5 resolved (gate, 2026-09-09)
+
+All five decided in the plan's new **§5r**, after re-verifying every §1–§4
+citation against `master`. Four citations were wrong; two of the
+corrections changed an answer. Summary:
+
+1. **Extend `confine_peak_history`** — plus a `kind` discriminator column
+   and nullable `budget`/`budget_basis`. `kind` is decisive, not polish:
+   `ConfinePeakP90` scans the table unfiltered and feeds LIVE admission, so
+   unnamespaced aitest rows would silently drag the machine-wide prior. The
+   budget columns are required because the granted reserve for a confine job
+   is persisted **nowhere** today — so §3.1's "no new capture needed" was
+   false, and the over-provisioned direction (this ticket's own headline
+   evidence) was unevaluable.
+2. **`resource-budget`, on TWO faces over one pure classifier** —
+   project-scoped `aira insights show resource-budget`, and a project-LESS
+   management form on `aira confine`. One home was the wrong shape:
+   `insights` answers `E_CONFIG_MISSING` outside an `aira init` project, and
+   AIRA-127 already made this exact call for `aira top` ("most of the
+   directories an operator watching the slice is standing in"). All four
+   reporting sessions were in such directories.
+3. **Durable `.aira/config` aitest knob DEFERRED** — it is a write-path
+   change under a report-only plan; the Python side is env-var-only with no
+   config reader; and §3.4 proposed the wrong section (`run.` governs
+   `aira run`).
+4. **Reuse `marginBucket`'s existing boundaries, mint no constant** —
+   `<1.0` under, `[1.0,1.25)` well-fitted (contains the estimator's own
+   1.15), `[1.25,2.0)` a deliberate quiet band, `>=2.0` over; any OOM on
+   record ⇒ under regardless.
+5. **No persistence threshold** — a streak counter is new durable state for
+   an advisory signal. Reuse the existing ≥3-usable-samples gate; noise is
+   already asymmetric in the safe direction because the comparison is
+   against MAX of a 20-sample window. One bypass: a recorded OOM classifies
+   on the first occurrence.
+
+Also deferred with reasons recorded: the `aira check` dimension (signatures
+are cross-project — `make test` in two repos is one row set — and `check`'s
+warnings are project evidence).
+
 ## Evidence this addresses real, current pain
 
 [[AIRA-160]] already verified a narrower, real gap (aitest worker sizing is
