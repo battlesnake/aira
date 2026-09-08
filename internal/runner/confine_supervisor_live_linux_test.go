@@ -162,6 +162,33 @@ func TestAIRA183ALiveAdmitLeaseVetoesADeadSupervisorReading(t *testing.T) {
 	}
 }
 
+// The veto is for a DEAD reading only, and this pins the half the test above
+// cannot: a LIVE reading under a live lease must be recorded, not swallowed.
+// Every admitted job holds a live admit lease, so a veto written as `if held`
+// rather than `if held && dead` would leave production with no `idle` row at
+// all — the exact half of the split AIRA-183 exists to add — while every other
+// test in this file still passed (build-review mutation, Fable, 2026-09-09).
+func TestAIRA183ALiveAdmitLeaseLeavesALiveReadingAlone(t *testing.T) {
+	t.Parallel()
+	slice := t.TempDir()
+	scopeID := confineTestScopeID("leased-alive", 5401, time.Now().Add(-time.Minute).UnixNano())
+	writeConfineTestScope(t, slice, scopeID, "")
+
+	deps := defaultConfineScanDeps()
+	deps.supervisorLive = func(int) *bool { return boolPtr(true) }
+	result, err := listConfinesWithDeps(context.Background(), slice, []ConfineRegistryEntry{{ScopeID: scopeID}}, deps)
+	if err != nil || len(result.Scopes) != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	record := result.Scopes[0]
+	if record.SupervisorLive == nil || !*record.SupervisorLive {
+		t.Fatalf("a live supervisor under a live admit lease must be recorded live, got %+v", record)
+	}
+	if confineContainsString(record.UnevaluatedFields, "supervisor_live") {
+		t.Fatalf("a live reading under a live lease was named unevaluated: %+v", record)
+	}
+}
+
 // A caller that builds confineScanDeps field-by-field (several existing tests
 // do) must keep the production probe rather than silently losing the field to a
 // nil func — the same nil-fallback discipline readCmdline already has, and the
