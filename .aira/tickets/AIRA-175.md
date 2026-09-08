@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-175","project":"aira","title":"aira check reports 37 own-tree findings that appear to disagree with the actual git-file contents (stale allocation index, and a false-positive sorted-labels flag on AIRA-117)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","data-model"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-172","to":"AIRA-175"}]}
+{"schema":1,"id":"AIRA-175","project":"aira","title":"aira check reports 37 own-tree findings that appear to disagree with the actual git-file contents (stale allocation index, and a false-positive sorted-labels flag on AIRA-117)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","dogfood"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-172","to":"AIRA-175"}]}
 ---
 
 Found while verifying AIRA-172's fix (PR #106, merged `41bdb73`) live, after
