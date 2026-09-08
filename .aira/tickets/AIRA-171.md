@@ -41,9 +41,17 @@ The four relation cases are not one repair. Each was read at filing:
     down; a wrong call here deletes an edge in silence.
   - `153->152`: nothing else stores it. `AIRA-152.md` holds only `152->151`.
     This one must MOVE onto `AIRA-152.md`, not be deleted.
-- **`AIRA-152.md` is a MOVE.** It stores `152->151`, whose canonical owner is
-  `AIRA-151`, and `AIRA-151.md` holds no copy in either direction. Insert it into
-  `AIRA-151.md` in `relationLess` order and remove it from `AIRA-152.md`.
+- **`AIRA-152.md` is a lossless deletion, plus the destination of the
+  `153->152` move above.** It stores `152->151`, whose canonical owner is
+  `AIRA-151` — and `AIRA-151.md` already holds `151->152`, the reversed tuple,
+  the same already-stored shape as the `153->151` case. Delete `152->151` from
+  `AIRA-152.md`; do NOT insert it into `AIRA-151.md`, which would store the one
+  `relates` edge twice on one file, once in each direction (the parser would
+  accept it — the two tuples are distinct). `AIRA-152.md`'s relations then become
+  exactly the moved `153->152`. *(Corrected at the PR #105 close-out: the filed
+  text said `AIRA-151.md` "holds no copy in either direction", which was false —
+  `AIRA-151.md` at `bd9482d` holds `151->152`, `151->153`, `165->151`,
+  `169->151`.)*
 
 PR #105 applied exactly this treatment to the eight files in the AIRA-170
 population, so `.aira/tickets/AIRA-151.md` and `AIRA-165.md` are worked examples
