@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-62","project":"aira","title":"confine CLI forces reserve = --memory-max even for --delegate-ram, silently overriding --memory-reserve","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","daemon","dogfood"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-62","to":"AIRA-28"}]}
+{"schema":1,"id":"AIRA-62","project":"aira","title":"confine CLI forces reserve = --memory-max even for --delegate-ram, silently overriding --memory-reserve","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","daemon","dogfood"],"hold":false,"relations":[]}
 ---
 ## Symptom
 

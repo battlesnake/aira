@@ -57,6 +57,88 @@ assert `check` still grades every dimension that does not read the ledger.
 `ok:true` with a graded report in which the ledger-derived dimensions are
 `unevaluated` and carry the named record, and no other dimension is suppressed.
 
+## Resolution (item 2 only — the code defect)
+
+Done. Item 1 (the stale install) is out of scope by this ticket's own text and
+was not touched. The coordination-journal key conflict below was repaired
+directly by the operator before this work started and is not re-litigated here.
+
+**Reproduced first.** A synthetic two-record ledger whose second record carries a
+field no current writer emits (`DisallowUnknownFields` refuses it) made `aira
+check` answer `ok:false code:E_JOURNAL_CORRUPT exit:4` with `data: nil` — the
+whole graded report discarded. `aira reconcile` answered identically.
+
+**The body's guess about WHICH dimensions are ledger-derived was wrong, and the
+answer was "none of them".** `compute` is named above; it is fed from the
+`findings` table (`E_COMPUTE_CONSERVATION` rows written by
+`ReconcileComputeConservation`), not from the run ledger. Nothing in
+`checkDimensions` read `ledger.bin` at all. The blast radius came from
+`internal/core/core.go`: `store.Check` ran to completion and returned a full
+report, and then `c.runner.Reconcile(ctx)` — a post-step that had only ever
+contributed live-run WARNINGS — returned its error and the handler threw the
+report away with `return nil, reconcileErr`. So the acceptance criterion as
+filed was unreachable: there was no ledger-derived dimension to mark
+`unevaluated`.
+
+**Fix, in three parts.**
+
+1. `runner.LedgerIntegrity(commonDir)` — a read-only entry point that reads and
+   replays the ledger and returns the reader's own error unwrapped, so the
+   AIRA-145 detail (record index, byte offset, declared payload length, salvaged
+   identity, ledger path) survives into the report. Like `HasRun` it builds the
+   path directly instead of through `newLedger`, which would `MkdirAll` the run
+   directories: a read-only pass must not create runner state. An ABSENT ledger
+   is not a defect.
+2. `run-ledger` is now a real check dimension, graded by the store like every
+   other one, so the honest report exists for every face and not only for the
+   one holding a Runner. `checkRunLedger` marks it `unevaluated` and attaches the
+   error's own code and message; the three codes it accepts
+   (`E_JOURNAL_CORRUPT`, `U_RUN_RECONCILE_REQUIRED`, `E_RUN_RECONCILE_REQUIRED`)
+   are the complete set that call graph produces, and anything else still fails
+   the verb, because an unrecognised error is not evidence the ledger is fine.
+3. `core`'s `check` and `reconcile` no longer discard their work on
+   `E_JOURNAL_CORRUPT`. `check` demotes `run-ledger` (via a new exported
+   `CheckReport.MarkUnevaluated`) and returns the graded report; `reconcile`
+   keeps `reconciled: true` — the store half really did reconcile — and reports
+   the run half as `runs_unevaluated` with the code and the named record.
+
+**Scope of the degradation, deliberately narrow.** Only `E_JOURNAL_CORRUPT` is
+degraded at the core layer: it is the one runner code that can only come from
+decoding the ledger. Every other reconcile failure keeps today's fail-closed
+behaviour rather than being quietly widened. The runner's refusal to APPEND to a
+corrupt ledger is untouched — fail-closed is right for a mutation — and a test
+asserts the corrupt record is still on disk byte-for-byte after `reconcile`.
+
+**`unevaluated`, not `fail`, and why.** A positively-established corruption could
+be argued to grade `fail`. It grades `unevaluated` because the dimension is
+defined as the run-ledger-derived EVIDENCE, which genuinely could not be
+established, and because CLAUDE.md's rule is the one this ticket cites. Nothing
+is softened by the choice: the finding itself carries `E_JOURNAL_CORRUPT` and
+the named record, and an established failure in any other dimension still
+produces a `fail` verdict at exit 1 — asserted.
+
+**Verified.** `aira check` on a repository with an unparseable run-ledger record
+now returns `ok:true`, exit 3, with every dimension graded and only `run-ledger`
+`unevaluated`, carrying `unknown field "field_from_the_future"`, `record 1 at
+byte offset 105` and the ledger path. The corrupt and healthy reports are
+compared dimension-for-dimension rather than against a hand-written list, so a
+future dimension cannot be silenced without failing the test.
+
+Every fixture is synthetic and built inside a `t.TempDir()`; no test reads or
+writes the machine's shared common-directory ledger. The framing those fixtures
+use lives once, in `internal/runner/runnertest`, pinned against the runner's real
+unexported `frame()` by `TestLedgerFramingRecipeIsStable` — without that pin a
+framing drift would leave the fixtures producing a TORN frame and the tests
+passing for the wrong reason.
+
+Mutation-checked in four directions: reverting the core degrade fails three
+tests; making the store checker always establish fails the store test; dropping
+the `replay` half of `LedgerIntegrity` fails the runner test; and writing
+`MarkUnevaluated` naively surfaced a real defect — `addFinding` overwrites the
+dimension unconditionally, so an established `fail` was being laundered into an
+`unevaluated`, against `unevaluateDimension`'s own documented invariant. Fixed
+and asserted.
+
 ## A SECOND, worse journal defect found the same afternoon (needs its own fix)
 
 Verifying section 5 of AIRA-170 meant running a branch-built `aira` with a

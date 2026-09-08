@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-28","project":"aira","title":"Bound the delegate-ram aggregate so aira.slice can never over-commit (structural fix, whole-suite airtight charge)","status":"superseded","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","delegate-ram","oom","shared-slice"],"hold":false,"relations":[{"kind":"supersedes","from":"AIRA-29","to":"AIRA-28"},{"kind":"relates","from":"AIRA-62","to":"AIRA-28"}]}
+{"schema":1,"id":"AIRA-28","project":"aira","title":"Bound the delegate-ram aggregate so aira.slice can never over-commit (structural fix, whole-suite airtight charge)","status":"superseded","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","delegate-ram","oom","shared-slice"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-62","to":"AIRA-28"},{"kind":"supersedes","from":"AIRA-29","to":"AIRA-28"}]}
 ---
 The STRUCTURAL follow-up to AIRA-27 Option A (class-based oom_score_adj, which is a bias not a bound — a large airtight neighbour can still be out-scored under a delegate over-commit). Removes the delegate-aggregate over-commit itself so no delegate-aggregate slice-OOM fires at all.
 

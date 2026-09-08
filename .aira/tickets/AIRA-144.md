@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-144","project":"aira","title":"executeScopeKill leaves empty child-cgroup directories behind after a nested kill (scope.Remove is not deepest-first)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["runner","cgroup"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-144","project":"aira","title":"executeScopeKill leaves empty child-cgroup directories behind after a nested kill (scope.Remove is not deepest-first)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["cgroup","runner"],"hold":false,"relations":[]}
 ---
 
 Accepted gap recorded during AIRA-140's Fable review (PR #89, merged `c662e6c`),

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-152","project":"aira","title":"Candidate: make the OOM escalation a replacement rather than a max with the unpinned default","status":"superseded","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-152","to":"AIRA-151"}]}
+{"schema":1,"id":"AIRA-152","project":"aira","title":"Candidate: make the OOM escalation a replacement rather than a max with the unpinned default","status":"superseded","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-153","to":"AIRA-152"}]}
 ---
 
 AIRA-149 deferral **F3**, with the cost analysis so a future session does not

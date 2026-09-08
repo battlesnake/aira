@@ -566,6 +566,46 @@ func HasRun(commonDir, id string) (bool, error) {
 	return true, nil
 }
 
+// LedgerIntegrity reads the project-scoped run ledger end to end and reports
+// the first defect that makes it unreadable, or nil when every record decodes
+// and the whole file replays. An ABSENT ledger is not a defect: a project that
+// has never launched a run has nothing to be inconsistent about, and reporting
+// a missing file as corruption would fail the dimension on every fresh
+// repository.
+//
+// This is the read-only entry point `check` grades its run-ledger dimension
+// from. Like HasRun it builds the ledger path directly instead of through
+// newLedger, because newLedger MkdirAll's the run directories and a read-only
+// consistency pass must never create runner state as a side effect.
+//
+// The reader's own error is returned unwrapped, so the corrupt record's index,
+// byte offset, declared payload length and salvaged identity — the detail
+// AIRA-145 added — survive all the way into the check report.
+//
+// covers: AIRA-172
+func LedgerIntegrity(commonDir string) error {
+	if commonDir == "" {
+		return &LaunchError{"E_CONFIG_INVALID", errors.New("common directory is required")}
+	}
+	common, err := filepath.Abs(commonDir)
+	if err != nil {
+		return err
+	}
+	l := &ledger{root: common, ledger: filepath.Join(common, "aira", "runs", "ledger.bin")}
+	events, err := l.read()
+	if err != nil {
+		return err
+	}
+	// replay enforces the lifecycle invariants read() does not: a record after
+	// a terminal run, a reordered lifecycle, a non-terminal state in a terminal
+	// slot. Those are ledger corruption too, so a dimension that stopped at
+	// read() would report a green it had not established.
+	if _, err := replay(events); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (l *ledger) nextSequence() (uint64, error) {
 	events, err := l.read()
 	if err != nil {

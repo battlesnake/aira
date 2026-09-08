@@ -78,3 +78,61 @@ asserts the failing set is EXACTLY `quarantinedTicketFiles`. Repairing a file
 makes that test fail until its entry is deleted, so this ticket is done when the
 map is empty and the literal can be removed along with the both-directions
 assertion, leaving a plain "every ticket file parses" check.
+
+## Resolution
+
+Done. The filed list was re-derived against master at `c30c074` before anything
+was edited — PR #105 had landed in between and had already fixed this class of
+defect on other files — and the nine files and their nine refusals came back
+byte-identical to the table above. Nothing was stale; every prescription below
+is the ticket's own, applied as written except for the one correction `c30c074`
+had already made.
+
+The prescription was applied verbatim. Each edit is one frontmatter line, except
+the two trailing-newline files, which gain one byte:
+
+| file | before | after |
+| --- | --- | --- |
+| `AIRA-28.md` | `[supersedes 29->28, relates 62->28]` | `[relates 62->28, supersedes 29->28]` — pure re-order, `relates < supersedes` |
+| `AIRA-62.md` | `[relates 62->28]` | `[]` — the identical tuple is on `AIRA-28.md` |
+| `AIRA-117.md` | `["aira-106","cgroup","test","race"]` | `["aira-106","cgroup","race","test"]` |
+| `AIRA-141.md` | body ends `…as AIRA-148.` | trailing `\n` added; no other byte changed |
+| `AIRA-144.md` | `["runner","cgroup"]` | `["cgroup","runner"]` |
+| `AIRA-145.md` | body ends `…at the time.` | trailing `\n` added; no other byte changed |
+| `AIRA-152.md` | `[relates 152->151]` | `[relates 153->152]` — one delete, one move in |
+| `AIRA-153.md` | `[153->150, 153->151, 153->152, 153->162…168]` | `[153->162…168]` — two deletes, one move out |
+| `AIRA-160.md` | `["admission","confine","aitest"]` | `["admission","aitest","confine"]` |
+
+**The `153->151` mirror question, decided.** `relates` IS its own inverse:
+`RelationKind.Inverse()` maps `relates` to `relates`, and
+`derivedRelationViewsWithWarnings` projects a stored `A relates B` from B's end
+as `B relates A`. `AIRA-151.md` holds `151->153`, so a query on AIRA-153 already
+surfaces the edge and deleting the copy on `AIRA-153.md` loses nothing. The same
+reasoning covers `152->151` against `AIRA-151.md`'s `151->152`, which is the
+correction `c30c074` had already made to this ticket.
+
+**Losslessness, measured rather than asserted.** The semantic edge set was
+extracted from every ticket file before and after — `relates` as an UNORDERED
+pair (it is its own inverse), the five directional kinds as ordered pairs. Both
+sides are 81 edges and the two sets are identical: nothing lost, nothing
+invented, only storage location and order changed. Label multisets are likewise
+identical per file and the rest of each frontmatter is byte-equal.
+
+`quarantinedTicketFiles` and the both-directions assertion are gone, replaced by
+a plain "every ticket file is readable" walk. The map was deleted rather than
+emptied: an empty map is a live exemption seam the next hand-edited defect could
+be added to. Two guards were added in its place, because a plain parse walk
+cannot tell a lossless delete from a lost edge — one asserting the tuple that
+must still be STORED on each canonical owner, one asserting the edge is still
+SURFACED from the endpoint whose file lost it. Both were mutation-checked:
+dropping the moved `153->152` fails both halves, and reintroducing AIRA-160's
+unsorted labels fails the walk.
+
+The cascading `E_RELATION_TARGET_MISSING` findings the body predicted would
+disappear are not separately verified here; they were a consequence of the nine
+files being unscannable, and all nine now scan.
+
+The second half the body asks for — whether the writer paths cover what the
+hand-editing was reaching for — is NOT done and is not claimed. "Add a relation
+to a ticket whose file is currently unreadable" still has no verb. That is left
+open as the follow-up this ticket names.
