@@ -68,6 +68,24 @@ RSS (up to ~156x over-reservation, each one holding headroom other waiters
 needed on a saturated slice); split independently reported the same
 guess-then-adjust cycle. None of this is a hypothetical.
 
+## Follow-up ground truth (wt, 2026-09-08) — whole-job peak vs. the outer reservation
+
+`FASTEST_XDIST_WORKERS=3 aira confine --memory-max 16G -- make test-engine`
+completed with `peak-rss=11256984K` (≈10.7 GiB) at 3 xdist workers; a
+4-worker attempt at `--memory-max 10G` was OOM-killed at 51% before
+reaching whole-job peak. Flagged as directly relevant to this ticket's
+per-worker capture design: the whole-job peak (10.7 GiB at 3 workers) is
+far above the 3 GiB `AIRA_AITEST_ESTIMATED_BYTES` outer reservation this
+repo's own `scripts/aitest_engine_estimated_bytes.sh` pins for the same
+suite — a >3x gap. These measure different things (a per-scope admission
+estimate vs. whole-job RSS), so this is not itself a bug, but is exactly
+the kind of aggregate-vs-per-worker discrepancy §3.1's pool-granularity
+capture (not per-test) is designed to make legible rather than leave
+implicit. Reporter's own caveat: box was heavily contended throughout
+(42 confined processes at points), so treat as real but noisy, not a lab
+figure — directionally useful for scoping the capture design, not a
+precise calibration input.
+
 ## Status
 
 Planning only. Not yet gated, not yet built, per the owner's explicit
