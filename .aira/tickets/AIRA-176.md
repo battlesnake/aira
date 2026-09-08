@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-176","project":"aira","title":"Associate worktrees + agent/session identity with tickets, and classify staleness honestly (merged / no-changes / superseded / lost-work)","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","worktree"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-176","project":"aira","title":"Associate worktrees + agent/session identity with tickets, and classify staleness honestly (merged / no-changes / superseded / lost-work)","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","worktree"],"hold":false,"relations":[]}
 ---
 
 Owner request (2026-09-08): a recent session spent real effort manually
@@ -80,3 +80,71 @@ Built on branch `aira176-worktree-ticket-association`. Shipped:
 - Identity from the `AIRA_CONFINE_OWNER` chain, resolved from the RESOLVED SCOPE
   ROOT (not the process cwd) so MCP attributes a binding correctly, with
   `owner_attested` derived — never assertable from the command line.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #120 merged as `07f9064` (2026-09-09; branch tip `d3da6bf`, PR base
+`777d75b`, merge base at landing `5a39425`). Everything below is the reviewer's
+own verification against source and by running the suite, not the builder's
+transcript.
+
+- **AIRA-175 lesson honoured.** No classification verdict is stored anywhere:
+  every fact in `internal/worktree/facts.go` is a fresh subprocess per run, and
+  the schema (`store.go` `worktree_bindings`) has no column for one. The three
+  git-derived columns a binding does carry (`branch`, `base_ref`, `base_commit`)
+  are labelled at-registration hints; the audit reads the live branch/HEAD off
+  `git worktree list --porcelain`, and `base_ref` is only chain step 2 and is
+  re-verified with `rev-parse --verify` before use (a deleted ref becomes
+  `unevaluated`, not a stale answer). The orphan report's path comes from the
+  `worktrees` registry, not from the binding row.
+- **F3 join verified end to end, not just in tests.** Smoke against a real
+  isolated daemon (`XDG_STATE_HOME` keyed): `register` stamped the store's own
+  64-hex `hashPath(gitDir)` identity and a subsequent `audit` joined it as
+  `explicit` — so `store.CanonicalScopeIdentity` injected as `IdentityCall`
+  matches the binding key in practice. Same smoke: unpushed unique commit →
+  `recover`; main → `main-worktree`; clean detached checkout with no resolvable
+  integration ref → `none` with the remedy named, never a removal verdict; that
+  checkout dirtied → `recover` with no integration ref (§5.3 asymmetry live);
+  `--base origin/typo` → `E_SELECTOR_INVALID` exit 2.
+- **Porosity: 11 mutations, 11 genuine kills**, each by the named test, none by
+  a compile error (one first attempt was a vacuous kill from an unused import
+  and was redone with the import kept in use): `Flag.False()`→`!True()` (3
+  tests), env unscrubbed (`GIT_DIR` decoy test), merge-base exit collapsed,
+  main-worktree exclusion removed, superseded skipping an unread ticket,
+  unknown identity read as no-lease, budget ignored, `worktree-` routing case
+  removed, unpushed-recover bucket removed, store stamping a forged identity,
+  `ON CONFLICT` dropping `owner_attested` (attestation inheritance).
+- **Gates, reviewer's own runs, confined, exact exit codes.** On
+  merge(`0c6e0b8` + PR): `go build ./...` 0, `go vet ./...` 0, `gofmt -l` 0
+  (empty), `go test ./...` 0 — 15 packages `ok`, none cached, `internal/worktree`
+  included (the first attempt was OOM-killed at the auto-estimated 1.2G cap and
+  re-run with `--memory-reserve 10G`). Four unrelated PRs (#114/#117/#118/#119)
+  landed on master between that base and the merge, so the landed tree
+  `07f9064` is re-gated by this commit's own pre-push `make ci` (fmt-check, vet,
+  build, `go test ./... -count=1`); the merged `store.go` was read to confirm the
+  `worktree_bindings` table composed cleanly beside the rant changes. CI on the
+  PR: build+vet+gofmt pass, test pass. The first pre-push `make ci` on the
+  landed tree was REFUSED: `gitremote/TestRealRunTimeoutKillsProcessGroup`
+  failed with `pid output=""` — its 50ms deadline expired before `/bin/sh`
+  printed, while the hook's auto-estimated 1.24G cap had the suite at 95% of
+  its reserve beside a cgroup-heavy sibling test. That package is untouched by
+  this PR, the same test passed in the full run above and in CI, [[AIRA-144]]
+  already names it as the 50ms-deadline flake, and a confined `-count=5`
+  re-run on `07f9064` with a 3G reserve passed 5/5 (exit 0). Not bypassed: the
+  push was retried with `AIRA_CONFINE_RESERVE=10G` so the hook's own `make ci`
+  gates this commit unstarved.
+- **Accepted gaps, written down** (none block; all fail safe): (1) a checkout
+  whose `rev-parse --git-dir` fails is not marked `seen`, so its binding is
+  listed under `orphan_bindings` — an informational misreport, no removal
+  recommendation is possible for it; (2) a `locked` worktree is reported but not
+  weighed by `recommend` — `git worktree remove` itself refuses a locked
+  checkout without `--force`; (3) squash merges and stale remote-tracking refs
+  as recorded in the plan §7.1. (4) **Deploy note:** the table is created by
+  the daemon's `initDB`; a new client against a not-yet-restarted daemon fails
+  `WorktreeBindings()` loudly (`no such table`), never an empty all-clear —
+  restart `aira-daemon.service` after `install.sh`.
+- Both builder-flagged decisions stand: the main checkout is never a removal
+  candidate (caught by the real-git test as well as the smoke), and the three
+  new codes are catalogued with exits 2/3/4 (`internal/codes/codes.go`). The
+  four-line `CLAUDE.md` addition is kept: it records the register/audit ritual
+  the generated Skill already teaches, and the two documents now agree.
