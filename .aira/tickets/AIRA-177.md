@@ -92,3 +92,110 @@ this ticket makes.
   no `--slice-ceiling` flag → `enforce`; existing `observe` install +
   re-run with no flag → stays `observe`; explicit `--slice-ceiling observe`
   on a fresh install → `observe` (opt-out still works).
+
+## Resolution (2026-09-08 — built; PR open, NOT merged, NOT deployed)
+
+The frontmatter `status` is deliberately left at `planned`: this branch is not
+merged, and `planned` → `in-review` is not a legal single transition
+(`domain.ValidateTransition`), so the status is moved by whoever merges rather
+than forged here.
+
+Built to plan revision 2
+(`docs/superpowers/plans/2026-09-08-aira177-slice-ceiling-enforce-default-plan.md`),
+which was plan-gate approved. Branch `aira177-slice-ceiling-enforce-default`.
+**Not merged by the builder; not deployed to this box (D1 stands).**
+
+### What was built
+
+One constant split into two, in `internal/install/install.go`:
+
+- `defaultWatchdogMode = "observe"` (the rename of `defaultDaemonSubsystemMode`
+  — mechanical, three occurrences, no test or cross-package reference; the old
+  name asserted "every daemon subsystem defaults to this", which stopped being
+  true here and would have silently handed its default to the next subsystem
+  that grows an install flag);
+- `defaultSliceCeilingMode = "enforce"` (new).
+
+`resolveDaemonModes` now reads one constant per subsystem. **Nothing else in the
+resolution changed**: the explicit flag still wins, preservation still runs
+BEFORE the ship default, and the daemon binary's own env default for an unset
+`AIRA_DAEMON_SLICE_CEILING_MODE` is still `off`.
+
+The premise the ticket asked to be *verified rather than assumed* was verified by
+reading the chain, and one wording correction is recorded: the throttled ceiling
+is applied at `evaluateAdmitQueue` (`admit.go:2536` → `checkedAvailable` and
+`oversubscriptionLimit`), **not** in `admitConnection`. That placement is
+deliberate and unchanged — `admitConnection`'s terminal `E_ADMIT_TOO_LARGE`,
+`resolveAdmitReserve`'s clamp and `resolveDelegateRAMScopeCeiling` all keep
+reading the raw configured maximum. The consequence matters for this ticket:
+defaulting to `enforce` **cannot convert any workload into a hard failure**; its
+worst case is a longer wait on the existing bounded, fair, visible queue.
+
+Four comments that became false with the flip were rewritten rather than left:
+`resolveDaemonModes`'s doc comment and `installedEnvironmentValue`'s (both
+asserted the fall-through was conservative, which is now true only for the
+watchdog), the mirror of the first in `daemon_service_test.go`, and
+`internal/daemon/paths.go:138`'s "never on by default" clause — which is now a
+product-level misstatement, though what that function itself decides (the raw
+env default, `off`) is unchanged. `internal/core/core.go`'s `--slice-ceiling`
+description now reads "omitted keeps the installed value, or enforce when no
+installed value is readable". **No behaviour changes under `internal/daemon/`.**
+
+### The population that actually changes, decided rather than inherited
+
+Per §1.4 of the plan and the correction already recorded in this ticket's Scope
+section: `resolveDaemonModes` takes the installed unit's *content*, never its
+presence, so a managed unit with no slice-ceiling line, an unrecognised value, or
+a multi-assignment/reset `Environment=` line all reach the ship default too. All
+of them are now `enforce`, **deliberately** — bounded to a longer wait by the
+placement above, opt-out-able with one durable command — and pinned by rows f, g
+and h of `TestResolveDaemonModesFreshInstallDefaultsSliceCeilingToEnforce` so a
+future change has to edit an assertion and say why. The rejected alternative
+(thread `daemonPresent` through as a third resolution state) is deferral D6.
+
+### Tests, written first and RED before the constant split
+
+- `TestResolveDaemonModesPreservesInstalledModes` — amended: the ship-default
+  assertion now pins `watchdog == observe && sliceCeiling == enforce` in ONE
+  assertion, so a blanket flip in either direction cannot pass.
+- `TestResolveDaemonModesFreshInstallDefaultsSliceCeilingToEnforce` — new; an
+  8-row table over the whole input space, `want watchdog` filled on every row.
+- `TestInstallFreshDaemonUnitEnforcesSliceCeilingByDefault` — new; end to end
+  through `runInstall`, asserting the rendered unit.
+- `TestInstallReinstallDoesNotUpgradeObserveSliceCeiling` — new; the
+  retroactive-flip non-regression, seeding `observe` (the one value defaulting
+  cannot manufacture) and asserting the side effects too: no unit rewrite, no
+  daemon restart.
+- `TestInstallDaemonConcurrentModeChangeSurvivesTheLock` — amended; its
+  slice-ceiling direction is inverted to `enforce`→`observe`, because the new
+  default made its old direction stop discriminating.
+
+**Two recorded coverage losses, not silent.** This change made two existing
+AIRA-106 preservation tests stop discriminating in their slice-ceiling half,
+because they seed `enforce` — now also the default. The concurrent-lock test was
+repaired by inverting it; `TestInstallDaemonReinstallPreservesModes` was left
+seeded as `enforce` with a comment recording the loss and naming its replacement,
+so the gap stays written down rather than being rediscovered.
+
+Non-porosity evidence (each wrong implementation actually run, not asserted):
+W1 no-change → `TestResolveDaemonModesPreservesInstalledModes`, T2 rows a/f/g/h
+and the fresh-install render test go RED. W2 blanket flip → the same two plus
+seven of the eight T2 rows via the watchdog column (row f is the honest
+exception: its installed unit declares a watchdog mode, so preservation supplies
+it and the default is never reached). W3 default hoisted above preservation →
+T2b, T2c, the reinstall test and the concurrent-lock test; the parse-time variant
+of W3 → `TestParseInstallWatchdogFlags`. W4 observe silently enforcing →
+`TestSliceCeilingModeGating` (the other two tests named in the plan for that row
+pin the positive direction and the wait-not-refuse premise; they do not
+discriminate W4, and are not counted as if they did).
+
+### Not done
+
+D1 — flipping **this** machine's installed mode — is untouched, as the ticket
+requires. The live unit was read read-only only: it still declares
+`AIRA_DAEMON_SLICE_CEILING_MODE=observe` at mtime 2026-09-06 19:08, so it takes
+the preservation path and a flagless `install.sh` deploy of this change leaves it
+on `observe`. That precondition must be re-verified read-only immediately before
+any deploy; if the line is ever absent or unparseable, a flagless deploy would
+land on `enforce` — D1 by accident rather than by decision — and the deploy
+should stop there instead.

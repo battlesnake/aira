@@ -97,12 +97,21 @@ func TestResolveDaemonModesPreservesInstalledModes(t *testing.T) {
 	if err != nil || resolved.watchdog != "off" || resolved.sliceCeiling != "off" || resolved.watchdogInterval != time.Second {
 		t.Fatalf("an explicit option was overridden by the installed unit: %+v err=%v", resolved, err)
 	}
+	// AIRA-177: the two ship defaults are DELIBERATELY DIFFERENT and are asserted
+	// TOGETHER, so a blanket flip of one shared constant -- in either direction --
+	// cannot pass. The watchdog ships observe because enforce kills; the slice
+	// ceiling ships enforce because enforce can only make a job WAIT.
 	resolved, err = resolveDaemonModes(installOpts{}, "")
-	if err != nil || resolved.watchdog != "observe" || resolved.sliceCeiling != "observe" || resolved.watchdogInterval != 2*time.Second {
-		t.Fatalf("first install did not take the ship defaults: %+v err=%v", resolved, err)
+	if err != nil || resolved.watchdog != "observe" || resolved.sliceCeiling != "enforce" || resolved.watchdogInterval != 2*time.Second {
+		t.Fatalf("first install did not take the ship defaults (watchdog observe, slice ceiling enforce -- deliberately different): %+v err=%v", resolved, err)
 	}
 	// A hand-edited or newer-vocabulary unit must neither be propagated nor make
-	// a later install fail: the ship default is the safe answer.
+	// a later install fail: it is IGNORED and the ship default applies. AIRA-177:
+	// for the slice ceiling that fall-through now lands on the ACTIVE mode rather
+	// than the conservative one, deliberately (see resolveDaemonModes, and
+	// TestResolveDaemonModesFreshInstallDefaultsSliceCeilingToEnforce rows f/g/h,
+	// which pin it); the watchdog's own default is still the conservative one,
+	// which is what this row asserts.
 	resolved, err = resolveDaemonModes(installOpts{}, "Environment=AIRA_DAEMON_WATCHDOG_MODE=paranoid\nEnvironment=AIRA_DAEMON_WATCHDOG_INTERVAL=17\n")
 	if err != nil || resolved.watchdog != "observe" || resolved.watchdogInterval != 2*time.Second {
 		t.Fatalf("an unrecognised installed value was propagated or refused: %+v err=%v", resolved, err)
@@ -123,6 +132,128 @@ func TestResolveDaemonModesPreservesInstalledModes(t *testing.T) {
 		resolved, err = resolveDaemonModes(installOpts{}, test.unit)
 		if err != nil || resolved.watchdog != test.want {
 			t.Fatalf("%s: watchdog=%q err=%v, want %q -- a mis-read here silently resets the operator's mode", test.name, resolved.watchdog, err, test.want)
+		}
+	}
+}
+
+// verifies (AIRA-177): the ship default for the slice ceiling is `enforce` while
+// the WATCHDOG's stays `observe`, decided at the seam that decides it.
+//
+// The table is the whole input space of that decision. Rows f, g and h are NOT
+// "a fresh box": they are a managed unit that declares no slice-ceiling mode
+// resolveDaemonModes can read, because installedEnvironmentValue returns "" --
+// indistinguishable from "no unit" -- for an absent line (every unit rendered by
+// a pre-AIRA-106 binary), an unrecognised value, and a multi-assignment or reset
+// Environment= line. They therefore reach the ship default too. That is the
+// AIRA-177 plan's §1.4 DECISION, accepted on the record rather than inherited:
+// the consequence is bounded to a longer admission wait (the throttle never
+// reaches the terminal E_ADMIT_TOO_LARGE or scope-sizing sites), and
+// `--slice-ceiling observe|off` is a durable one-command opt-out. A future
+// change that prefers to distinguish "no unit" from "unit present, unreadable"
+// has to edit these three assertions and say why.
+//
+// RED against, measured rather than asserted: no change at all (rows a, f, g,
+// h); a blanket flip of a shared constant (the want-watchdog column of every row
+// EXCEPT f -- f's own installed unit declares a watchdog mode, so preservation
+// supplies it and the ship default is never reached there); the default applied
+// BEFORE preservation (rows b, c). Rows d and e discriminate none of those: they
+// pin that an explicit flag wins, with and without an installed unit, which no
+// wrong implementation in that list can break.
+func TestResolveDaemonModesFreshInstallDefaultsSliceCeilingToEnforce(t *testing.T) {
+	const managed = "# aira-managed: aira-daemon.service\n[Service]\n"
+	for _, test := range []struct {
+		name             string
+		flag             string
+		installed        string
+		wantSliceCeiling string
+		wantWatchdog     string
+	}{
+		{"a-fresh-install", "", "", "enforce", "observe"},
+		// The critical non-regression: an existing observe install re-run with no
+		// flag must STAY observe. observe is the one value the new ship default
+		// cannot manufacture, which is what makes this row discriminate.
+		{"b-installed-observe-is-preserved", "", managed + "Environment=AIRA_DAEMON_SLICE_CEILING_MODE=observe\n", "observe", "observe"},
+		{"c-installed-off-is-preserved", "", managed + "Environment=AIRA_DAEMON_SLICE_CEILING_MODE=off\n", "off", "observe"},
+		{"d-explicit-opt-out-on-a-fresh-box", "observe", "", "observe", "observe"},
+		{"e-explicit-beats-installed", "off", managed + "Environment=AIRA_DAEMON_SLICE_CEILING_MODE=enforce\n", "off", "observe"},
+		// §1.4, input 2: a unit rendered by a pre-AIRA-106 binary has watchdog
+		// lines only -- @SLICE_CEILING_MODE@ first appears in AIRA-106's asset.
+		{"f-pre-aira106-unit-has-no-slice-ceiling-line", "", managed + "Environment=AIRA_DAEMON_WATCHDOG_MODE=observe\nEnvironment=AIRA_DAEMON_WATCHDOG_INTERVAL=2s\n", "enforce", "observe"},
+		// §1.4, input 3: an unrecognised value states no readable preference.
+		{"g-unrecognised-installed-value", "", managed + "Environment=AIRA_DAEMON_SLICE_CEILING_MODE=paranoid\n", "enforce", "observe"},
+		// §1.4, input 4: a multi-assignment line is not parsed and reads as absent
+		// -- the slice-ceiling mirror of the watchdog row pinned above.
+		{"h-multi-assignment-line", "", managed + "Environment=FOO=1 AIRA_DAEMON_SLICE_CEILING_MODE=observe\n", "enforce", "observe"},
+	} {
+		resolved, err := resolveDaemonModes(installOpts{sliceCeiling: test.flag}, test.installed)
+		if err != nil {
+			t.Fatalf("%s: err=%v", test.name, err)
+		}
+		if resolved.sliceCeiling != test.wantSliceCeiling {
+			t.Errorf("%s: slice ceiling=%q, want %q", test.name, resolved.sliceCeiling, test.wantSliceCeiling)
+		}
+		if resolved.watchdog != test.wantWatchdog {
+			t.Errorf("%s: watchdog=%q, want %q -- the watchdog's own default must not move with the slice ceiling's", test.name, resolved.watchdog, test.wantWatchdog)
+		}
+	}
+}
+
+// verifies (AIRA-177): the new ship default reaches the RENDERED unit on a fresh
+// flagless install, through renderDaemonUnit's own validDaemonMode guard and the
+// under-lock re-resolve -- not just the resolver in isolation.
+func TestInstallFreshDaemonUnitEnforcesSliceCeilingByDefault(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(state.unitDir(), defaultDaemonUnit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"AIRA_DAEMON_SLICE_CEILING_MODE=enforce",
+		"AIRA_DAEMON_WATCHDOG_MODE=observe",
+	} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("a fresh flagless install did not render %q:\n%s", want, content)
+		}
+	}
+}
+
+// verifies (AIRA-177): a flagless re-install must NOT upgrade an installed
+// `observe` to the new `enforce` ship default -- the retroactive-flip failure
+// this ticket must not introduce.
+//
+// It seeds `observe` deliberately: that is the one value defaulting cannot
+// produce, so unlike TestInstallDaemonReinstallPreservesModes's enforce seed
+// (see the note there) this assertion still discriminates a broken preservation.
+// Assertions 2 and 3 are what make it a non-regression rather than a string
+// coincidence: a silent upgrade would rewrite the unit AND bounce the live
+// daemon into the new mode.
+func TestInstallReinstallDoesNotUpgradeObserveSliceCeiling(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G", sliceCeiling: "observe"}); err != nil {
+		t.Fatal(err)
+	}
+	writes := state.writes
+	state.commands = nil
+	// The deploy case: memory sizing given, modes omitted entirely.
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(state.unitDir(), defaultDaemonUnit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "AIRA_DAEMON_SLICE_CEILING_MODE=observe") {
+		t.Fatalf("a flagless re-install silently upgraded an installed observe to the new enforce default:\n%s", content)
+	}
+	if state.writes != writes {
+		t.Fatalf("a preserving re-install rewrote files: %d -> %d", writes, state.writes)
+	}
+	for _, argv := range state.commands {
+		if strings.Join(argv, " ") == "systemctl --user restart "+defaultDaemonUnit {
+			t.Fatalf("a preserving re-install restarted the live daemon into the new default; commands=%q", state.commands)
 		}
 	}
 }
@@ -210,6 +341,15 @@ func TestInstallDaemonIdempotentAndWatchdogChangeRestarts(t *testing.T) {
 // this fix the unit was rewritten to observe and the daemon restarted into it.
 // Both memory subsystems are covered because AIRA-106's own rollout depends on
 // the slice-ceiling mode surviving exactly this sequence.
+//
+// AIRA-177, RECORDED COVERAGE LOSS: this test seeds sliceCeiling "enforce", and
+// `enforce` is now also the ship default -- so its SLICE-CEILING half passes
+// whether preservation works or not, and no longer discriminates a broken
+// preservation. The watchdog and interval halves still do. The replacement pin
+// is TestInstallReinstallDoesNotUpgradeObserveSliceCeiling, which seeds
+// `observe`: the one value defaulting cannot manufacture. The seed is left as
+// `enforce` here rather than "fixed", so the loss stays written down instead of
+// being rediscovered.
 func TestInstallDaemonReinstallPreservesModes(t *testing.T) {
 	d, state := newFakeInstall(t)
 	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "enforce", sliceCeiling: "enforce", watchdogInterval: 5 * time.Second}); err != nil {
@@ -258,9 +398,19 @@ func TestInstallDaemonReinstallPreservesModes(t *testing.T) {
 // The concurrent install is simulated at the only instant that matters, by
 // rewriting the unit inside d.flock -- which is called once, immediately before
 // the locked re-read. RED against resolving only before the lock.
+//
+// AIRA-177: the two subsystems are deliberately swapped in OPPOSITE directions
+// and this asymmetry must not be "tidied" back. With the slice ceiling's ship
+// default now `enforce`, a concurrent observe->enforce swap would be satisfied
+// by the ship default alone, so that half would pass even against a default
+// hoisted above preservation. Inverting it (enforce->observe) restores both
+// discriminations at once: resolving only before the lock yields the pre-swap
+// `enforce` and goes RED, and defaulting above preservation yields `enforce`
+// and goes RED too. The watchdog half keeps its original observe->enforce
+// direction, whose default is unchanged.
 func TestInstallDaemonConcurrentModeChangeSurvivesTheLock(t *testing.T) {
 	d, state := newFakeInstall(t)
-	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "observe", sliceCeiling: "observe", watchdogInterval: 2 * time.Second}); err != nil {
+	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "observe", sliceCeiling: "enforce", watchdogInterval: 2 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	unitPath := filepath.Join(state.unitDir(), defaultDaemonUnit)
@@ -270,10 +420,10 @@ func TestInstallDaemonConcurrentModeChangeSurvivesTheLock(t *testing.T) {
 	}
 	concurrent := strings.NewReplacer(
 		"AIRA_DAEMON_WATCHDOG_MODE=observe", "AIRA_DAEMON_WATCHDOG_MODE=enforce",
-		"AIRA_DAEMON_SLICE_CEILING_MODE=observe", "AIRA_DAEMON_SLICE_CEILING_MODE=enforce",
+		"AIRA_DAEMON_SLICE_CEILING_MODE=enforce", "AIRA_DAEMON_SLICE_CEILING_MODE=observe",
 	).Replace(string(installed))
 	if concurrent == string(installed) {
-		t.Fatalf("the seeded unit did not carry both observe modes:\n%s", installed)
+		t.Fatalf("the seeded unit did not carry watchdog observe and slice ceiling enforce:\n%s", installed)
 	}
 	baseFlock := d.flock
 	swapped := false
@@ -297,7 +447,7 @@ func TestInstallDaemonConcurrentModeChangeSurvivesTheLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"AIRA_DAEMON_WATCHDOG_MODE=enforce", "AIRA_DAEMON_SLICE_CEILING_MODE=enforce"} {
+	for _, want := range []string{"AIRA_DAEMON_WATCHDOG_MODE=enforce", "AIRA_DAEMON_SLICE_CEILING_MODE=observe"} {
 		if !strings.Contains(string(final), want) {
 			t.Fatalf("a concurrent mode change was reverted by a flagless install; want %q in:\n%s", want, final)
 		}

@@ -1814,7 +1814,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
 			stringSpec("watchdog", false, false, "Memory-watchdog mode; omitted keeps the installed value", "off", "observe", "enforce"),
 			stringSpec("watchdog_interval", false, false, "Memory-watchdog sample interval in [1s,30s); omitted keeps the installed value"),
-			stringSpec("slice_ceiling", false, false, "Dynamic slice-ceiling mode; omitted keeps the installed value", "off", "observe", "enforce"),
+			stringSpec("slice_ceiling", false, false, "Dynamic slice-ceiling mode; omitted keeps the installed value, or enforce when no installed value is readable", "off", "observe", "enforce"),
 			boolSpec("allow_overcommit", false, false, "Acknowledge coexistence with capped whale.slice"),
 			boolSpec("dry_run", false, false, "Render units and planned actions without mutation"),
 			boolSpec("status", false, false, "Report each installed and live facet honestly"),
