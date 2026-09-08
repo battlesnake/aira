@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-196","project":"aira","title":"aira confine --detach has no confine-log/confine-input companions -- token-efficient read/write access to a detached confine job, by handle, with confine's own admission/delegate-ram/aitest semantics intact","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","detach","observability"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-196","project":"aira","title":"aira confine --detach has no confine-log/confine-input companions -- token-efficient read/write access to a detached confine job, by handle, with confine's own admission/delegate-ram/aitest semantics intact","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","detach","observability"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-197","to":"AIRA-196"}]}
 ---
 
 Owner request (2026-09-09), following directly from tonight's harness-
