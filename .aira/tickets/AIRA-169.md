@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-169","project":"aira","title":"The agent guide's E_ADMIT_TOO_LARGE sentence calls the pinned population 'a reserve you pinned yourself', which is untrue of aira run, a charged docker --memory limit, and confine-reserve","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","docs"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-169","project":"aira","title":"The agent guide's E_ADMIT_TOO_LARGE sentence calls the pinned population 'a reserve you pinned yourself', which is untrue of aira run, a charged docker --memory limit, and confine-reserve","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","docs"],"hold":false,"relations":[]}
 ---
 AIRA-165 deferral, accepted at the Fable work-review of PR #104 (merged `34ea0b0`) and given its own ticket so it is actionable rather than a paragraph inside another ticket's resolution. Graded P2 because it is the SAME over-claim the AIRA-165 build review BLOCKed at P2 in the daemon's `pinned:client` arm, now surviving only in the generated guide every agent reads (`aira create` accepts no P3).
 
@@ -57,3 +57,19 @@ installed `SKILL.md` and the agent guide — they share `renderMarkdownBody`):
 
 Mutation evidence (M4): restoring the old clause in `skill.go` makes the test
 FAIL. It is not a vacuous negative.
+
+## Fable work-review record (2026-09-08, after the fix round)
+
+Verdict: MERGE. Merged with PR #105 in
+`bd9482d17b878fefb23c7d2e638a5a661be9b979` (`gh pr merge 105 --merge`, run from
+`/home/mark/claude/aira` on `master`; local master fast-forwarded to it).
+
+The AIRA-170 fix round (`30dad5a`, `61023ba`) changed nothing under `internal/`
+except two store test files, so this ticket's change is the one reviewed at
+`40ad1eb`: a single clause in `internal/core/skill.go`'s cold-start paragraph —
+"a reserve you pinned yourself" → "a reserve pinned on the client side", re-read
+at the merge as the only `-`/`+` pair in that file's diff against `2364a17` —
+plus `TestGuideDoesNotBlameTheOperatorForAClientPinnedReserve`. It rode the same
+gates as AIRA-170: `make ci` at `61023ba` exit 0, 14 packages ok, run
+independently in a detached worktree under `aira confine`; CI green on `61023ba`
+for `build + vet + gofmt`, `test` and `race`.

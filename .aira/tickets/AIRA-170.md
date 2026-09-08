@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-170","project":"aira","title":"Seven tickets on master carry severity P3, which domain.validSeverity rejects: aira show/link/rant --ref refuse them with E_CONFIG_INVALID 'ticket enum is invalid'","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-170","to":"AIRA-171"}]}
+{"schema":1,"id":"AIRA-170","project":"aira","title":"Seven tickets on master carry severity P3, which domain.validSeverity rejects: aira show/link/rant --ref refuse them with E_CONFIG_INVALID 'ticket enum is invalid'","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-170","to":"AIRA-171"}]}
 ---
 Found while closing AIRA-165/166 after PR #104 (merged `34ea0b0`).
 
@@ -275,3 +275,75 @@ Recorded gaps that remain:
   reading, not by execution. Neither is `E_TICKET_INVALID`'s presence in the
   review verb's `report_instruction` pinned (`cmd/aira/main_test.go:646` checks
   only `aira find add`).
+
+## Fable work-review record (2026-09-08, after the fix round)
+
+Verdict: MERGE. Merged in `bd9482d17b878fefb23c7d2e638a5a661be9b979` (PR #105,
+`gh pr merge 105 --merge`).
+
+The first review BLOCKed because sections 1-4 were code-correct and `aira show
+AIRA-165` still refused. The two fix commits (`30dad5a`, `61023ba`) were
+re-reviewed against that finding:
+
+- **The repair is what it claims.** All eight files diffed against `40ad1eb`:
+  seven deletions of `N->AIRA-153`, each mirrored by a `153->N` that
+  `AIRA-153.md` already held — confirmed on MASTER's copy of that file, not the
+  branch's; the one move, `165->151`, was on no other file at master and now
+  sits on `AIRA-151.md` between `151->153` and `169->151`, which is
+  `relationLess` order (kind, then `from`, then `to`); AIRA-164's and AIRA-166's
+  labels are sorted. `CanonicalRelationOwner` (`internal/domain/ticket.go:327`)
+  is the lower id and `Validate` (`:227`) refuses anything else, so the seven
+  were never legal on the files they sat on.
+- **The reproduction now runs on the real files.**
+  `TestTheRepositorysOwnTicketFilesAreReadable` passes (exit 0, 2.9s). A probe
+  over the same copy at PR head lists exactly nine unreadable files — AIRA-28,
+  62, 117, 141, 144, 145, 152, 153, 160 — with the refusals the quarantine map
+  documents, and none of the AIRA-170 seven.
+- **Mutations, reproduced independently** in a detached worktree at `61023ba`,
+  each applied alone against a hard-reset tree (a first pass reset with
+  `git checkout -- .` after a `git checkout 40ad1eb -- <files>`, which left M9
+  STAGED under every later run; those results were discarded and the pass
+  re-run — recorded because a contaminated kill table looks identical to a
+  clean one):
+
+  | mutation | result |
+  | --- | --- |
+  | M9 the eight repairs reverted to `40ad1eb` | KILLED at `:82`, seven files unreadable |
+  | M10 the moved `165->151` deleted from AIRA-151 | KILLED at `:119` |
+  | M11 the `153->165` mirror deleted from AIRA-153 | KILLED at `:126` |
+  | M12 a healthy ticket added to the quarantine | KILLED at `:88` |
+  | M13 `Rebuild` neutered | KILLED at `:133`, on the `rant --ref` arm |
+  | M14 (reviewer) a NEW broken `AIRA-999.md` with unsorted labels | KILLED at `:82` — the "durable form" claim holds |
+  | M15 (reviewer) a quarantine REASON string replaced with nonsense | SURVIVED — the map's values are documentation; only its keys are asserted |
+  | M16 (reviewer) AIRA-162 flipped to P2 | KILLED at `:100` |
+  | M17 (reviewer) AIRA-169 given severity `P9` | KILLED at `:82` and `:104` |
+
+- **Gates:** `make ci` at `61023ba` exit 0, 14 packages ok (independent run,
+  detached worktree, `aira confine`); CI on `61023ba`: `build + vet + gofmt`,
+  `test`, `race` all pass. The fix round touched nothing under `internal/`
+  except the two store test files, so the section 1-3 code stands as reviewed
+  at `40ad1eb`.
+
+Accepted, not blocking:
+
+- M15: the quarantine map's reason strings are not asserted, so a quarantined
+  file whose defect changes CLASS is not noticed until it parses. The keys are
+  asserted in both directions, which is the load-bearing property; AIRA-171
+  owns the map and can tighten it as it empties the list.
+- The test's closing `Link(AIRA-170 relates AIRA-165)` runs against a temp
+  copy, so it fails spuriously if someone later records that real relation on
+  `AIRA-165.md`. The error would name it; noted so the fix is a one-line test
+  edit, not a hunt.
+- AIRA-171's worked-out treatment of `AIRA-152.md` was wrong at filing
+  (`AIRA-151.md` DOES hold the reversed tuple `151->152`); corrected on that
+  ticket at this close-out.
+
+Outstanding operator action, NOT this PR's: the shared journal
+`.git/aira/journal.jsonl` carries a rogue last line (`seq 2577`, `rant.create`,
+`RANT-1`) written by the throwaway-state verification client, so every AIRA
+mutation in this repository refuses `E_JOURNAL_CORRUPT`; AIRA-173's allocation
+receipt sits at that same seq, and no receipt exists for the rogue rant. Repair
+and the underlying defect are on AIRA-172. This close-out edits git files only
+and does not touch the journal, which is why both tickets are closed by
+hand-edit; `TestTheRepositorysOwnTicketFilesAreReadable` guards that hand-edit
+and its result on master is in the close-out commit message.
