@@ -135,9 +135,14 @@ func watchdogIntervalFromEnv() (time.Duration, error) {
 // watchdog's pair above, including defaulting to OFF: this subsystem reduces the
 // capacity admission believes in, and on a machine whose configured slice
 // ceiling already exceeds what the box can afford that is a real (if safe)
-// capacity cut. It ships observe-then-enforce, never on by default. Its reserve
-// is not a knob for the same reason the watchdog's thresholds are not -- the
-// existing knob for "how much of this machine AIRA may have" is
+// capacity cut. AIRA-177: `aira install` now renders `enforce` into a freshly
+// installed unit by default, so at the PRODUCT level this subsystem is on by
+// default; what stays off by default is what this function decides -- the raw
+// env-var default for a daemon started OUTSIDE the installed unit (`aira daemon
+// serve` by hand, the /proc/self/exe fallback, every test), which is unchanged
+// and independent because install always renders an explicit Environment= line.
+// Its reserve is not a knob for the same reason the watchdog's thresholds are
+// not -- the existing knob for "how much of this machine AIRA may have" is
 // `aira install --memory-max`, which sets the bound this can never exceed.
 func sliceCeilingModeFromEnv() (sliceCeilingMode, error) {
 	mode := sliceCeilingMode(strings.TrimSpace(os.Getenv("AIRA_DAEMON_SLICE_CEILING_MODE")))

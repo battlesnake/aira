@@ -39,12 +39,21 @@ const (
 	cgroupRoot        = "/sys/fs/cgroup"
 	defaultEtcRoot    = "/etc"
 
-	// The modes a freshly-installed daemon unit declares when the operator gives
-	// no flag AND no managed unit already declares one. Observe for both memory
-	// subsystems: it measures and reports without acting, so a first install can
-	// never change what the machine does.
-	defaultDaemonSubsystemMode = "observe"
-	defaultWatchdogInterval    = 2 * time.Second
+	// The mode a freshly-installed daemon unit declares for the memory WATCHDOG
+	// when the operator gives no flag AND no managed unit already declares one.
+	// Observe: it measures and reports without killing anything.
+	defaultWatchdogMode = "observe"
+	// AIRA-177. The same, for the slice ceiling — and deliberately NOT the same
+	// value. See resolveDaemonModes for why the two diverged.
+	//
+	// Each constant is named for the one subsystem it decides. A single shared
+	// "daemon subsystem mode" asserted a property — every subsystem defaults to
+	// this — that stopped being true the instant the two diverged, and would have
+	// silently handed a default nobody chose to the next subsystem that grows an
+	// install flag (AIRA_DAEMON_OOM_STEER_MODE already exists, forced off, with no
+	// flag yet).
+	defaultSliceCeilingMode = "enforce"
+	defaultWatchdogInterval = 2 * time.Second
 
 	// minimumCeilingGiB is the MemoryMax floor validateSize enforces. Named so
 	// that --ci, which must refuse a snapshot it cannot express, refers to the
@@ -106,6 +115,13 @@ func installedEnvironmentRE(name string) *regexp.Regexp {
 // variant systemd accepts; a multi-assignment line or a `Environment=` reset is
 // not parsed and reads as absent, which falls back to the ship default rather
 // than to a wrong value.
+//
+// AIRA-177: "the ship default" is no longer uniformly the conservative answer.
+// For the WATCHDOG it still is. For the SLICE CEILING the ship default is now
+// `enforce`, so an unparseable line resolves to the ACTIVE mode; that is a
+// decision recorded at resolveDaemonModes, and it is bounded there to a longer
+// admission wait rather than any refusal. Callers must not read this comment as
+// a guarantee of conservatism for both.
 func installedEnvironmentValue(content string, expression *regexp.Regexp) string {
 	matches := expression.FindAllStringSubmatch(content, -1)
 	if len(matches) == 0 {
@@ -527,7 +543,21 @@ func reportDaemonMode(d installDeps, label, variable, liveEnvironment string, li
 // "observe", so an unrelated deploy silently reverted an operator's `enforce`.
 // An installed value that is not a recognised mode is IGNORED rather than
 // propagated or refused — a hand-edited or newer-vocabulary unit must not be
-// able to make a later install fail, and the ship default is the safe answer.
+// able to make a later install fail.
+//
+// AIRA-177: that fall-through no longer lands on a conservative answer for BOTH
+// subsystems. This function takes the installed unit's CONTENT, never its
+// presence, and installedEnvironmentValue returns "" — indistinguishable from
+// "no unit at all" — for an absent line, an unrecognised value, and a
+// multi-assignment or reset Environment= line. All of those now resolve the
+// slice ceiling to the ACTIVE mode, defaultSliceCeilingMode. That is a decision,
+// not an oversight: the throttle is applied only where it can make a job WAIT
+// (admit.go's capacity gate and the aggregate bound), never at the terminal
+// E_ADMIT_TOO_LARGE or scope-sizing sites, so the worst outcome it can produce
+// is a longer wait on an already fair, bounded, visible queue. A unit that
+// declares no readable preference states none, and `--slice-ceiling observe|off`
+// is a durable one-command opt-out. The WATCHDOG's fall-through is still the
+// conservative one, which is why the two constants are separate.
 func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOpts, error) {
 	if !opts.watchdogGiven() {
 		if mode := installedEnvironmentValue(installedDaemonUnit, installedWatchdogModeRE); validDaemonMode(mode) {
@@ -549,17 +579,32 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	// Ship defaults, reached only when the option was not given AND no managed
 	// unit declares a usable value.
 	if !opts.watchdogGiven() {
-		opts.watchdog = defaultDaemonSubsystemMode
+		opts.watchdog = defaultWatchdogMode
 	}
-	// AIRA-106. The slice ceiling ships INSTALLED as observe, mirroring the
-	// watchdog's own rollout: observe applies nothing to admission (it samples,
+	// AIRA-106 shipped the slice ceiling INSTALLED as observe, mirroring the
+	// watchdog's own rollout: "observe applies nothing to admission (it samples,
 	// publishes and reports the ceiling it WOULD apply), so this is the honest
 	// flip out of dormancy AIRA-106 asks for, while `enforce` -- a real capacity
-	// reduction on this box -- stays an explicit operator decision. The DAEMON's
-	// own env default stays `off`, so a daemon started outside the installed unit,
-	// and every test, is unchanged.
+	// reduction on this box -- stays an explicit operator decision." That
+	// reasoning is recorded here because it was a deliberate choice, and AIRA-106
+	// explicitly left "how long to run in observe before flipping, and who
+	// decides" open for the owner.
+	//
+	// AIRA-177 REVERSES it, on the owner's answer to exactly that question
+	// (2026-09-08): "slice ceiling should be enforced by default (and admission
+	// gated on available capacity), otherwise what's the point of it?" The
+	// evidence was measured, not hypothetical: live confine scope caps summing to
+	// ~81.6 GiB against 78 GiB of RAM while the throttle that would have reduced
+	// the effective admission ceiling sat in observe, computing the number and
+	// applying nothing. An admission gate that does not gate admission by default
+	// is diagnostics, not protection.
+	//
+	// What did NOT change: the WATCHDOG's default above (it kills; enforce there
+	// is a different kind of decision), and the DAEMON's own env default, which
+	// stays `off` -- so a daemon started outside the installed unit, and every
+	// test, is unchanged.
 	if !opts.sliceCeilingGiven() {
-		opts.sliceCeiling = defaultDaemonSubsystemMode
+		opts.sliceCeiling = defaultSliceCeilingMode
 	}
 	if !opts.watchdogIntervalGiven() {
 		opts.watchdogInterval = defaultWatchdogInterval
