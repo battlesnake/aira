@@ -640,7 +640,7 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 		{"terminated-by=oom", "the trailer field that distinguishes an OOM kill from a real failure"},
 		{"exits `137`", "the exit code a consumer's own wrapper sees, so a swallowed status is checkable"},
 		{"UNEVALUATED run", "the honesty framing: a killed run has no result, it is not a failing result"},
-		{"estimate:p90-prior", "the basis a never-seen command's first run is capped at"},
+		{"estimate:p90-prior", "the basis a never-seen command's first run is capped at WHEN this box has a machine-wide p90 (AIRA-166 adds the case where it does not)"},
 		{"estimate:oom-escalated", "the basis when 1.5x the OOM peak IS the reserve"},
 		{",oom-on-record", "the token that proves the OOM was attributed to this signature even when another term set the number"},
 		{",ceiling-clamped", "the token that says the slice ceiling cut the reserve down"},
@@ -661,6 +661,60 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 			if !strings.Contains(document.body, want.text) {
 				t.Errorf("%s no longer teaches %q (%s)", document.name, want.text, want.why)
 			}
+		}
+	}
+}
+
+// TestSkillTeachesBothColdStartBases is AIRA-166.
+//
+// The guide taught ONE cold-start basis — "a FIRST run ... is capped at a
+// machine-wide prior (`reserve-basis=estimate:p90-prior`)" — which is true only
+// where a machine-wide p90 EXISTS. It exists only once some signature in this
+// box's one shared state.db has three or more recorded peaks, so on a fresh box
+// or a fresh state.db resolveAdmitReserve falls through to one of its four
+// post-block fallbacks and the real basis is `fallback:no-history` (or
+// `:no-signature` / `:history-unavailable` / `:insufficient-samples`).
+//
+// An agent reading only the old sentence and then seeing `fallback:no-history`
+// on a genuine first run had no way to tell the documented cold start from
+// something wrong — the same class of mistake AIRA-128 filed against a
+// truncated OOM tally, which is why this is a test and not a review note.
+//
+// verifies: AIRA-166
+func TestSkillTeachesBothColdStartBases(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ text, why string }{
+		{"fallback:no-history", "the basis a genuine first run gets when this box has no machine-wide p90 at all"},
+		{"fallback:no-signature", "the sibling for a launch that sent no signature"},
+		{"fallback:history-unavailable", "the sibling for a history read that could not be established"},
+		{"fallback:insufficient-samples", "the sibling for a signature with fewer than three usable samples"},
+		{"three or more recorded peaks", "WHEN the p90 exists at all — the condition the old sentence assumed silently"},
+		{"is NOT a sign that something is wrong", "the whole point: a fallback basis on a first run is the documented cold start"},
+		{"unpinned default (4 GiB)", "AIRA-166: what the fallback NUMBER actually is, not just what it is called"},
+		{"`,ceiling-fitted` form of it described below on a slice too small to grant the whole default",
+			"AIRA-153 made the fitted form the ordinary basis to see on a small slice, so the cold-start clause must name it"},
+	} {
+		for _, document := range []struct{ name, body string }{
+			{"SKILL.md", string(artifacts.SkillMD)},
+			{"guide", string(artifacts.Guide)},
+		} {
+			if !strings.Contains(document.body, want.text) {
+				t.Errorf("%s no longer teaches %q (%s)", document.name, want.text, want.why)
+			}
+		}
+	}
+	// The RED direction: the exact claim AIRA-166 was filed against. A revert to
+	// the unconditional sentence fails here rather than silently returning an
+	// agent to the state where a fallback basis looks like a defect.
+	for _, document := range []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	} {
+		if strings.Contains(document.body, "is capped at a machine-wide prior (`reserve-basis=estimate:p90-prior`)") {
+			t.Errorf("%s again claims every first run is capped at the machine-wide p90; that is true only when one EXISTS", document.name)
 		}
 	}
 }

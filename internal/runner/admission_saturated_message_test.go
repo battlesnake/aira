@@ -5,6 +5,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -229,63 +230,135 @@ func tooLargeAdmission(t *testing.T, clientReserve int64, message string, reject
 	return runner.admitThroughDaemon(context.Background(), Request{DaemonEstimateMemory: true}, clientReserve)
 }
 
-// The §0.1 measured shape and the message internal/daemon/admit.go:2800 builds
-// for it, byte for byte:
+// The §0.1 measured shape and the message internal/daemon/admit.go builds for
+// it, byte for byte:
 //
 //	fmt.Sprintf("%s: required=%d cap_minus_headroom=%d basis=%s", …)
+//
+// followed, since AIRA-165, by " -- " and the advice arm that basis selects.
 const (
 	tooLargeRequired = int64(4294967296) // the unpinned client default, UNCLAMPED
 	tooLargeCeiling  = int64(1031798784) // 1 GiB slice - 32 MiB - 8 MiB headroom
 	tooLargeBasis    = "fallback:insufficient-samples:n=1,oom-on-record"
-	tooLargeMessage  = "E_ADMIT_TOO_LARGE: required=4294967296 cap_minus_headroom=1031798784 basis=fallback:insufficient-samples:n=1,oom-on-record"
+	tooLargeMessage  = "E_ADMIT_TOO_LARGE: required=4294967296 cap_minus_headroom=1031798784 basis=fallback:insufficient-samples:n=1,oom-on-record -- this number is AIRA's blind default for a command it has not measured, not a measurement of this one, and this slice cannot grant even that; pin a --memory-reserve you know this command fits in, or run where the slice is larger"
+
+	// The two other populations AIRA-153 leaves able to reach this refusal, in
+	// the daemon's own spelling. The daemon owns the split and pins it
+	// end-to-end (internal/daemon/admit_too_large_advice_test.go); what these
+	// establish is the half only the CLIENT can establish -- that each arm
+	// reaches the operator intact rather than being rewritten, truncated, or
+	// swapped for the runner's own sentence the way E_ADMIT_SATURATED's is.
+	tooLargePinnedBasis   = "pinned:client"
+	tooLargePinnedMessage = "E_ADMIT_TOO_LARGE: required=4294967296 cap_minus_headroom=1031798784 basis=pinned:client -- you pinned this reserve yourself (--memory-reserve, --memory-max or --delegate-ram) and it is larger than this slice can grant; lower it to at most cap_minus_headroom, or run where the slice is larger -- do not re-pin the same number"
+
+	tooLargeEstimateRequired = int64(2469606195)
+	tooLargeEstimateBasis    = "estimate:max=2147483648,n=5,f=115"
+	tooLargeEstimateMessage  = "E_ADMIT_TOO_LARGE: required=2469606195 cap_minus_headroom=1031798784 basis=estimate:max=2147483648,n=5,f=115 -- this is AIRA's estimate from this command's OWN measured peak history, and it exceeds what this slice can grant; pin a smaller --memory-reserve only if you know the real need is smaller, otherwise this command cannot run on this slice"
+
+	tooLargeOOMRequired = int64(1345824499)
+	tooLargeOOMBasis    = "estimate:oom-escalated"
+	tooLargeOOMMessage  = "E_ADMIT_TOO_LARGE: required=1345824499 cap_minus_headroom=1031798784 basis=estimate:oom-escalated -- this command was OOM-killed here, and the reserve its own recorded peak justifies is larger than this slice can grant; it does not fit on this slice -- run where the slice is larger rather than retrying it unchanged"
 )
 
 // TestTooLargeRefusalMessageNamesBothNumbersAndTheBasis records the exact
-// operator-facing string this ticket now routes traffic onto.
+// operator-facing strings this refusal routes traffic onto, now that AIRA-165
+// has case-split the advice half.
 //
 // It is GREEN by construction and is NOT a red-first demonstration: the client
-// already passes an E_ADMIT_TOO_LARGE message through unchanged. It exists so
-// that deferral G3 — "the too-large message names no escape hatch and prints
-// raw bytes, unlike the AIRA-149 saturated sentence beside it" — rests on a
-// recorded string rather than on a claim, and so that a later wording change is
-// a deliberate edit to a test rather than unnoticed drift.
+// already passes an E_ADMIT_TOO_LARGE message through unchanged. Its subject is
+// what only this side can establish — that whichever arm the daemon selected
+// arrives at the operator with both numbers, the basis, AND that arm's advice
+// intact. AIRA-151 G3 ("the message names no escape hatch") is what this test
+// used to record as an accepted gap; AIRA-165 closed it, so the assertion is
+// now the other way round: an escape hatch appropriate to THIS population must
+// be present, and the one instruction an operator who already pinned cannot act
+// on must be absent from the pinned arm.
 //
-// verifies: AIRA-151 §3.5, G3
+// verifies: AIRA-151 §3.5, AIRA-165
 func TestTooLargeRefusalMessageNamesBothNumbersAndTheBasis(t *testing.T) {
-	result, _, err := tooLargeAdmission(t, DefaultConfineMemoryReserve, tooLargeMessage, runnerAdmitRejection{
-		Required: tooLargeRequired, Ceiling: tooLargeCeiling, Basis: tooLargeBasis,
-	})
-	if err == nil {
-		t.Fatalf("a too-large rejection produced no error (result=%+v)", result)
-	}
-	message := err.Error()
-	for _, want := range []string{
-		"required=4294967296",
-		"cap_minus_headroom=1031798784",
-		"basis=" + tooLargeBasis,
+	for _, test := range []struct {
+		name       string
+		message    string
+		required   int64
+		basis      string
+		wantAdvice string
+	}{
+		{
+			name: "an unpinned prior the slice cannot fit", message: tooLargeMessage,
+			required: tooLargeRequired, basis: tooLargeBasis,
+			wantAdvice: "blind default for a command it has not measured",
+		},
+		{
+			name: "a reserve the operator pinned themselves", message: tooLargePinnedMessage,
+			required: tooLargeRequired, basis: tooLargePinnedBasis,
+			wantAdvice: "you pinned this reserve yourself",
+		},
+		{
+			name: "this command's own measured estimate", message: tooLargeEstimateMessage,
+			required: tooLargeEstimateRequired, basis: tooLargeEstimateBasis,
+			wantAdvice: "this command's OWN measured peak history",
+		},
+		{
+			name: "an OOM escalation the slice cannot grant", message: tooLargeOOMMessage,
+			required: tooLargeOOMRequired, basis: tooLargeOOMBasis,
+			wantAdvice: "this command was OOM-killed here",
+		},
 	} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("message %q omits %q; both numbers and the basis are what make this refusal actionable at all", message, want)
+		t.Run(test.name, func(t *testing.T) {
+			result, _, err := tooLargeAdmission(t, DefaultConfineMemoryReserve, test.message, runnerAdmitRejection{
+				Required: test.required, Ceiling: tooLargeCeiling, Basis: test.basis,
+			})
+			if err == nil {
+				t.Fatalf("a too-large rejection produced no error (result=%+v)", result)
+			}
+			message := err.Error()
+			for _, want := range []string{
+				fmt.Sprintf("required=%d", test.required),
+				"cap_minus_headroom=1031798784",
+				"basis=" + test.basis,
+				test.wantAdvice,
+			} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("message %q omits %q; both numbers, the basis and the advice for THIS population are what make this refusal actionable at all", message, want)
+				}
+			}
+			if result.basis != "reject:too-large" {
+				t.Fatalf("basis=%q, want %q — the run's recorded admission basis", result.basis, "reject:too-large")
+			}
+			if result.state != "too_large" {
+				t.Fatalf("state=%q, want %q — the terminal state the agent guide tells agents not to retry", result.state, "too_large")
+			}
+			if result.reserve != test.required {
+				t.Fatalf("reserve=%d, want the DAEMON-resolved %d", result.reserve, test.required)
+			}
+			if result.ceiling != tooLargeCeiling {
+				t.Fatalf("ceiling=%d, want %d", result.ceiling, tooLargeCeiling)
+			}
+			// Every arm now names an action. G3's recorded gap was that none did.
+			if !strings.Contains(message, "--memory-reserve") && !strings.Contains(message, "run where the slice is larger") {
+				t.Fatalf("message %q names no escape hatch at all; that is the G3 gap AIRA-165 closed", message)
+			}
+		})
+	}
+
+	t.Run("the pinned arm is not told to pin", func(t *testing.T) {
+		// The defect AIRA-165 exists for: "pin --memory-reserve at or below
+		// cap_minus_headroom" was given to every population, and it is the one
+		// instruction an operator who ALREADY pinned cannot act on.
+		result, _, err := tooLargeAdmission(t, DefaultConfineMemoryReserve, tooLargePinnedMessage, runnerAdmitRejection{
+			Required: tooLargeRequired, Ceiling: tooLargeCeiling, Basis: tooLargePinnedBasis,
+		})
+		if err == nil {
+			t.Fatalf("a too-large rejection produced no error (result=%+v)", result)
 		}
-	}
-	if result.basis != "reject:too-large" {
-		t.Fatalf("basis=%q, want %q — the run's recorded admission basis", result.basis, "reject:too-large")
-	}
-	if result.state != "too_large" {
-		t.Fatalf("state=%q, want %q — the terminal state the agent guide tells agents not to retry", result.state, "too_large")
-	}
-	if result.reserve != tooLargeRequired {
-		t.Fatalf("reserve=%d, want the DAEMON-resolved %d", result.reserve, tooLargeRequired)
-	}
-	if result.ceiling != tooLargeCeiling {
-		t.Fatalf("ceiling=%d, want %d", result.ceiling, tooLargeCeiling)
-	}
-	// G3's evidence, recorded rather than asserted as acceptable: unlike the
-	// AIRA-149 saturated sentence this message names no escape hatch and renders
-	// raw byte counts. The agent guide carries the action instead (AIRA-151 §3.6).
-	if strings.Contains(message, "--memory-reserve") {
-		t.Fatalf("message %q now names an escape hatch; G3 was filed against a message that did not, and its successor must start from a current string", message)
-	}
+		message := err.Error()
+		if strings.Contains(message, "pin a ") || strings.Contains(message, "pin --memory-reserve") {
+			t.Fatalf("message %q tells an operator who already pinned to pin", message)
+		}
+		if !strings.Contains(message, "lower it") {
+			t.Fatalf("message %q does not say to lower the pinned number, which is the only action available", message)
+		}
+	})
 }
 
 // TestTooLargeRejectionForAnUnescalatedOverCeilingReserveIsAcceptedByTheClient

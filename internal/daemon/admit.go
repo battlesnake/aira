@@ -2908,6 +2908,62 @@ func saturatedDiagnosisLocked(waiter *admitWaiter, reserve, ceiling int64) admit
 	return rejection
 }
 
+// tooLargeRefusalAdvice is the case-specific half of the E_ADMIT_TOO_LARGE
+// message (AIRA-165, carried from AIRA-151 G3 / AIRA-153 G6). The numbers half
+// is unchanged and unconditional: `required`, `cap_minus_headroom` and `basis`
+// are printed in EVERY case, and this only says what to DO about them.
+//
+// This line named no escape hatch at all, and the one place that did -- the
+// generated agent guide -- gives a SINGLE instruction for the whole population:
+// "pin --memory-reserve at or below the printed cap_minus_headroom". That is
+// exactly the wrong thing to tell an operator whose request was refused BECAUSE
+// they pinned it. AIRA-153 narrowed the population enough for the split to be
+// tractable: after it, a terminal refusal is an over-ceiling per-signature
+// ESTIMATE, an OOM ESCALATION at or above FIT(ceiling), or a PINNED request
+// over the ceiling.
+//
+// A fourth arm exists because AIRA-153 §3.2 routes one more population here
+// deliberately -- a PRIOR on a slice too small for any viable fitted reserve
+// (fit == 0), and the same prior refused at the enqueue re-check when the
+// ceiling tightened behind it -- and telling that operator that "this command's
+// own measurement" is too large would be a fabricated cause: a prior is a guess,
+// and this function must never claim it measured anything.
+//
+// The case is decided by the basis TERM, never by comparing numbers, on the
+// AIRA-149 rule that a label names the term that ACTED: `pinned:client` is
+// returned at resolveAdmitReserve's first line and nowhere else,
+// `estimate:oom-escalated` only where the escalation strictly set the value, and
+// `estimate:p90-prior` is a machine-wide prior rather than this command's own
+// history despite its `estimate:` family. Trailing tokens (`,oom-on-record`,
+// `,ceiling-fitted`, `,ceiling-clamped`) qualify the term, they do not replace
+// it, so they are trimmed before the match rather than pattern-matched around.
+//
+// An UNRECOGNISED basis gets no advice at all rather than a plausible-looking
+// guess: the refusal still names both numbers and the basis, and AIRA does not
+// invent a cause it cannot establish.
+//
+// covers: AIRA-165
+func tooLargeRefusalAdvice(basis string) string {
+	term := basis
+	if comma := strings.IndexByte(term, ','); comma >= 0 {
+		term = term[:comma]
+	}
+	switch {
+	case term == "pinned:client":
+		return "you pinned this reserve yourself (--memory-reserve, --memory-max or --delegate-ram) and it is larger than this slice can grant; lower it to at most cap_minus_headroom, or run where the slice is larger -- do not re-pin the same number"
+	case term == "estimate:oom-escalated":
+		return "this command was OOM-killed here, and the reserve its own recorded peak justifies is larger than this slice can grant; it does not fit on this slice -- run where the slice is larger rather than retrying it unchanged"
+	case term == "estimate:p90-prior":
+		return "this number is a machine-wide PRIOR about other commands, not a measurement of this one, and this slice cannot grant even that; pin a --memory-reserve you know this command fits in, or run where the slice is larger"
+	case strings.HasPrefix(term, "estimate:"):
+		return "this is AIRA's estimate from this command's OWN measured peak history, and it exceeds what this slice can grant; pin a smaller --memory-reserve only if you know the real need is smaller, otherwise this command cannot run on this slice"
+	case strings.HasPrefix(term, "fallback:"):
+		return "this number is AIRA's blind default for a command it has not measured, not a measurement of this one, and this slice cannot grant even that; pin a --memory-reserve you know this command fits in, or run where the slice is larger"
+	default:
+		return ""
+	}
+}
+
 func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admitRejection) {
 	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
 	write := s.admitWriteFrame
@@ -2917,6 +2973,12 @@ func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admit
 	message := code + ": " + rejection.Basis
 	if code == CodeAdmitTooLarge {
 		message = fmt.Sprintf("%s: required=%d cap_minus_headroom=%d basis=%s", code, rejection.Required, rejection.Ceiling, rejection.Basis)
+		// Appended, never substituted: the numbers and the basis keep their exact
+		// spelling and position, so every existing reader of this line is unaffected
+		// and the advice is additive.
+		if advice := tooLargeRefusalAdvice(rejection.Basis); advice != "" {
+			message += " -- " + advice
+		}
 	}
 	frame := errorFrame(code, message)
 	frame.Data, _ = json.Marshal(rejection)
