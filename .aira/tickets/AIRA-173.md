@@ -62,17 +62,26 @@ failure rate. A fix with no before/after rate is not evidence.
 
 Reproduced. The lever is CPU oversubscription, not the suite as such: the race
 needs the client goroutine descheduled between `connect()` and its first
-`write()`. Repro harness `~/tmp/aira173/stress.sh` (N busy loops on a 16-core
-box + `go test -run <name> -count=N`, whole job under `aira confine`).
+`write()`. Committed harness: `docs/dev/aira-173-flake-rate-repro.sh` (N busy
+loops + `go test -run <name> -count=N`; run it under `aira confine`). It is
+shown to be capable of failing — the clean-master row below was produced by the
+committed script itself, not by a private variant.
 
 | condition | executions | failures | rate |
 |---|---|---|---|
 | natural load (no stressor; box already at load ~47), `GOMAXPROCS` default and 1, 2, 4 | 8,000 | **0** | <0.013% |
 | 32 CPU burners | 20,000 | **4** | 0.020% |
 | 64 CPU burners | 30,000 | **3** | 0.010% |
-| **stressed total** | **50,000** | **7** | **0.014%** (1 in ~7,100) |
+| 32 CPU burners, **clean `origin/master` `c30c074`** | 20,000 | **2** | 0.010% |
+| **stressed total** | **70,000** | **9** | **0.013%** (1 in ~7,800) |
 
-All 7 failures carry the identical signature — no second failure mode:
+**The clean-master reproduction this ticket recorded as NOT established now
+is.** The last row ran in a throwaway detached worktree at `origin/master`
+`c30c074`, with no part of the fix present, and reproduced the same signature —
+so the defect is master's, confirming the filing's reasoning that PR #105 (which
+touches no file under `internal/runner`) was only the messenger.
+
+All 9 failures carry the identical signature — no second failure mode:
 
 ```
 run_input_server_linux_test.go:287: write unix @->…/inputs/RUN-1-<nonce>.sock: write: broken pipe
@@ -195,7 +204,8 @@ Before/after under the identical stressors:
 | total | 7 / 50,000 | **0 / 50,000** |
 
 Expected count after the fix had nothing changed was 7; observing 0 gives a
-one-sided Poisson p ≈ 9e-4.
+one-sided Poisson p ≈ 9e-4. (The clean-master row in §1 is a separate before-fix
+sample and is excluded from this paired comparison.)
 
 Gate, exact exit codes: `go build ./...` **0**; `go vet ./...` **0**;
 `AIRA_REAL_CGROUP=1 go test ./... -count=1` **0** (zero `FAIL` lines,
