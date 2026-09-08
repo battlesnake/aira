@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-172","project":"aira","title":"A single unparseable run-ledger record fails the whole check/reconcile verb closed at exit 4, so no dimension is reportable","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","journal"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-172","project":"aira","title":"A single unparseable run-ledger record fails the whole check/reconcile verb closed at exit 4, so no dimension is reportable","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","journal"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-172","to":"AIRA-175"}]}
 ---
 Dogfood friction, found by the AIRA-170 work-review (Fable, PR #105) while
 trying to see the ticket-file defects that review found through the CLI rather
