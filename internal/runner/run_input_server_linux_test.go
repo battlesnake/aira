@@ -351,7 +351,7 @@ func TestRunInputServerAuthStealAndFraming(t *testing.T) {
 	t.Run("foreign and steal", func(t *testing.T) {
 		plane := newTestRunInputPlane(t, "owner-a")
 		plane.serve()
-		foreign := dialRunInputRawHello(t, plane.path, runInputHello{Owner: "owner-b"})
+		foreign := mustDialRunInputRawHello(t, plane.path, runInputHello{Owner: "owner-b"})
 		assertRunInputErrorCode(t, foreign, "E_RUN_INPUT_FOREIGN_OWNER")
 		_ = foreign.Close()
 		steal := dialRunInputHello(t, plane.path, runInputHello{Owner: "owner-b", Steal: true})
@@ -433,24 +433,63 @@ func skipOrFailRunInputSocket(t *testing.T, format string, args ...any) {
 	t.Skipf(format, args...)
 }
 
-func dialRunInputRawHello(t *testing.T, path string, hello runInputHello) *net.UnixConn {
+// dialRunInputRawHello dials and sends HELLO without reading the reply. The
+// server closes a refused connection right after writing its error frame, so this
+// write can lose that race and fail with a broken pipe (AIRA-173); the refusal it
+// already queued is read back and RETURNED, so the caller can tell a transient
+// BUSY from a genuine early close instead of failing on the bare write error.
+func dialRunInputRawHello(t *testing.T, path string, hello runInputHello) (*net.UnixConn, error) {
 	t.Helper()
 	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	payload, _ := encodeRunInputJSON(hello)
-	if err := writeRunInputFrame(conn, runInputOpHello, payload); err != nil {
-		t.Fatal(err)
+	// Bound the classifying read; cleared again on the success path so the caller
+	// keeps the undeadlined connection it had before.
+	_ = conn.SetDeadline(time.Now().Add(testdeadline.Wait(2 * time.Second)))
+	if writeErr := writeRunInputFrame(conn, runInputOpHello, payload); writeErr != nil {
+		refusal := classifyRunInputHelloWriteError(conn, writeErr)
+		_ = conn.Close()
+		return nil, refusal
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+func mustDialRunInputRawHello(t *testing.T, path string, hello runInputHello) *net.UnixConn {
+	t.Helper()
+	conn, err := dialRunInputRawHello(t, path, hello)
+	if err != nil {
+		t.Fatalf("HELLO write refused: %v", err)
 	}
 	return conn
+}
+
+// transientRunInputBusy reports whether a refusal is the sequential-reconnect race
+// with the prior handler's single-writer-slot release: a ZERO-committed BUSY, safe
+// to retry because no DATA has been sent. Every other refusal — and a peer that
+// closed without one — is a real early close and is never retried away.
+func transientRunInputBusy(err error) bool {
+	var inputErr *RunInputError
+	return errors.As(err, &inputErr) && inputErr.Code == "E_RUN_INPUT_BUSY" && inputErr.Committed == 0
 }
 
 func dialRunInputHello(t *testing.T, path string, hello runInputHello) *net.UnixConn {
 	t.Helper()
 	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for {
-		conn := dialRunInputRawHello(t, path, hello)
+		// The same transient BUSY can surface on either side of the HELLO write,
+		// depending on whether the refuse-and-close beat it (AIRA-173): both are
+		// retried within one bounded budget, and nothing else is.
+		conn, refusal := dialRunInputRawHello(t, path, hello)
+		if refusal != nil {
+			if transientRunInputBusy(refusal) && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			t.Fatalf("HELLO write refused: %v", refusal)
+		}
 		_ = conn.SetReadDeadline(time.Now().Add(testdeadline.Wait(2 * time.Second))) // a silent server can't hang the helper
 		op, payload, err := readRunInputFrame(conn)
 		if err != nil {
@@ -466,11 +505,10 @@ func dialRunInputHello(t *testing.T, path string, hello runInputHello) *net.Unix
 		}
 		if op == runInputOpError {
 			wireErr := decodeRunInputWireError(payload)
-			var inputErr *RunInputError
 			// A sequential reconnect can transiently race the prior handler's
 			// single-writer-slot release; a ZERO-committed BUSY is safe to retry
 			// within a bounded budget (raw prompt-BUSY tests connect directly).
-			if errors.As(wireErr, &inputErr) && inputErr.Code == "E_RUN_INPUT_BUSY" && inputErr.Committed == 0 && time.Now().Before(deadline) {
+			if transientRunInputBusy(wireErr) && time.Now().Before(deadline) {
 				_ = conn.Close()
 				time.Sleep(5 * time.Millisecond)
 				continue

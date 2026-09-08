@@ -155,22 +155,28 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 			_ = conn.Close()
 			return nil, &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: deadlineErr}
 		}
-		writeErr := writeRunInputFrame(conn, runInputOpHello, hello)
-		if writeErr != nil {
-			_ = conn.Close()
-			return nil, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Err: writeErr}
-		}
-		committed, respErr := readRunInputResponse(conn, 0)
-		if respErr == nil {
-			if committed != 0 {
-				_ = conn.Close()
-				return nil, runInputProtocolError("HELLO ACK was nonzero")
+		// A refused connection is closed by the server right after its error frame,
+		// so the HELLO write itself can lose that race and fail with EPIPE. Both
+		// outcomes are the same refusal and are classified the same way, so a
+		// transient BUSY is retried whichever side of the write it lands on
+		// (AIRA-173).
+		var respErr error
+		if writeErr := writeRunInputFrame(conn, runInputOpHello, hello); writeErr != nil {
+			respErr = classifyRunInputHelloWriteError(conn, writeErr)
+		} else {
+			var committed int64
+			committed, respErr = readRunInputResponse(conn, 0)
+			if respErr == nil {
+				if committed != 0 {
+					_ = conn.Close()
+					return nil, runInputProtocolError("HELLO ACK was nonzero")
+				}
+				if clearErr := conn.SetDeadline(time.Time{}); clearErr != nil {
+					_ = conn.Close()
+					return nil, &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: clearErr}
+				}
+				return conn, nil
 			}
-			if clearErr := conn.SetDeadline(time.Time{}); clearErr != nil {
-				_ = conn.Close()
-				return nil, &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: clearErr}
-			}
-			return conn, nil
 		}
 		_ = conn.Close()
 		var inputErr *RunInputError
@@ -194,6 +200,34 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 		case <-time.After(backoff):
 		}
 	}
+}
+
+// classifyRunInputHelloWriteError explains a HELLO write that failed. The server
+// refuses a connection it cannot serve by writing an error frame and CLOSING, so
+// this write can lose the race to that close and fail with EPIPE even though the
+// refusal is already queued on the socket — a Unix stream keeps what the peer
+// wrote before closing, so it is still readable here (AIRA-173). Reading it
+// reports the refusal under the server's own code, which keeps a transient
+// zero-committed BUSY as retryable on this path as it already is when the same
+// race is lost one step later, on the read.
+//
+// When nothing explains the close, the peer went away mid-handshake: that is the
+// design's "socket is unreachable — dead/gone", never E_RUN_INPUT_OUTCOME_UNKNOWN.
+// No DATA frame has been sent at this point, so no byte can have reached the
+// child's stdin and there is no delivery ambiguity — which is precisely what
+// OUTCOME_UNKNOWN is defined to mean, and claiming it here would fabricate an
+// unknown out of a known-empty outcome.
+//
+// The caller must already have bounded the connection with a deadline, so the
+// read cannot hang on a peer that is merely unresponsive.
+func classifyRunInputHelloWriteError(conn net.Conn, writeErr error) error {
+	op, payload, readErr := readRunInputFrame(conn)
+	if readErr != nil || op != runInputOpError {
+		return &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: writeErr}
+	}
+	// decodeRunInputWireError always yields a *RunInputError: the server's own
+	// refusal code, or E_RUN_INPUT_PROTOCOL for a frame it could not decode.
+	return decodeRunInputWireError(payload)
 }
 
 func readRunInputResponse(reader io.Reader, lastCommitted int64) (int64, error) {
