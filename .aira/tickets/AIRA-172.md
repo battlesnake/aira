@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-172","project":"aira","title":"A single unparseable run-ledger record fails the whole check/reconcile verb closed at exit 4, so no dimension is reportable","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","journal"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-172","project":"aira","title":"A single unparseable run-ledger record fails the whole check/reconcile verb closed at exit 4, so no dimension is reportable","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","journal"],"hold":false,"relations":[]}
 ---
 Dogfood friction, found by the AIRA-170 work-review (Fable, PR #105) while
 trying to see the ticket-file defects that review found through the CLI rather
@@ -190,3 +190,42 @@ the single last line of `.git/aira/journal.jsonl` — `seq 2577`, `rant.create`,
 event onto the freed seq. The record describes an event that never happened in
 the authoritative database; the genuine RANT-1 is at seq 4 with the same payload
 digest. A backup of the pre-repair file is at `~/tmp/aira169-mut/journal.jsonl.bak`.
+
+## Review (Fable build-review gate) — MERGED (item 2)
+
+PR #106 merged as `41bdb73` (2026-09-08). Reviewer's own verification, not the
+builder's transcript.
+
+- The degrade is genuine and lives at the layer that owns the dimension: `Store.Check`
+  grades a new `run-ledger` dimension from `runner.LedgerIntegrity`, which is
+  read-only (builds the path directly and never `MkdirAll`s — asserted), treats an
+  absent ledger as pass, and enforces both `read()` and `replay()`. The store test
+  compares the corrupt and healthy reports dimension-for-dimension, so a future
+  dimension cannot be silenced without failing it; the core test does the same through
+  `core.Do` and asserts `ok:true`, no exit 4, only `run-ledger` unevaluated, and the
+  AIRA-145 diagnostic (`unknown field`, `record 1 at byte offset N`, the ledger path)
+  on the finding. An established failure in another dimension still yields `fail` at
+  exit 1 with the corrupt ledger present — asserted.
+- Non-porosity re-run by the reviewer in four directions: core degrade reverted to
+  `c30c074` → four core tests fail; `checkRunLedger` forced to always establish → the
+  store test fails; `LedgerIntegrity` without its replay half → the runner test fails;
+  and `MarkUnevaluated` keeps a recorded fail rather than laundering it (asserted).
+- Nothing touches shared state: every ledger fixture is built by `runnertest` inside
+  `t.TempDir()`, and the fixture framing is pinned to the runner's real unexported
+  `frame()` by `TestLedgerFramingRecipeIsStable`. The reviewer likewise did not run the
+  branch binary against the live repository, for the reason the second half of this
+  ticket names.
+- Accepted gap, pre-existing and deliberately not widened by this PR: a TORN tail
+  (`U_RUN_RECONCILE_REQUIRED` from `read()`, e.g. a crash mid-append — nothing in the
+  runner ever truncates one) grades `run-ledger` unevaluated in the store, but the core
+  `check`/`reconcile` verbs still fail closed on it at exit 3 with `data:nil`, because
+  only `E_JOURNAL_CORRUPT` is degraded there. Same silence shape as this ticket,
+  different code; it needs its own decision rather than a quiet widening.
+- Merge gate, reviewer's own run: `AIRA_REAL_CGROUP=1 aira confine -- go test ./...
+  -count=1` exit 0; gofmt clean on every changed Go file.
+
+**Still OPEN after this merge and needing their own tickets — not filed here, because
+IDs are allocated by `aira id` and never hand-picked:** item 1 (the stale install:
+`~/.local/bin/aira` predates this fix until `install.sh` is re-run), and the state-split
+defect in the section below (a client with a foreign state home writes into the shared
+journal's sequence space instead of being refused).

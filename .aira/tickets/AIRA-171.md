@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-171","project":"aira","title":"Nine ticket files on master are unreadable: unsorted relations, non-canonical relation storage, unsorted labels, and bodies with no trailing newline","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-171","to":"AIRA-172"}]}
+{"schema":1,"id":"AIRA-171","project":"aira","title":"Nine ticket files on master are unreadable: unsorted relations, non-canonical relation storage, unsorted labels, and bodies with no trailing newline","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","tickets"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-171","to":"AIRA-172"}]}
 ---
 Found by the AIRA-170 work-review's real-files probe (Fable, PR #105), which
 drove the store over this repository's own `.aira/tickets` rather than over
@@ -136,3 +136,41 @@ The second half the body asks for — whether the writer paths cover what the
 hand-editing was reaching for — is NOT done and is not claimed. "Add a relation
 to a ticket whose file is currently unreadable" still has no verb. That is left
 open as the follow-up this ticket names.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #106 merged as `41bdb73` (2026-09-08). Everything below is the reviewer's own
+reproduction, not the builder's transcript.
+
+- Real-file walk reproduced independently, the way the AIRA-170 review's probe did: a
+  throwaway `domain.ParseTicket` walk over this repository's `.aira/tickets` (172
+  files). At the PR base `c30c074` it refuses exactly the nine files in the table
+  above with exactly the nine codes; at the PR head `ae92c64` it refuses none
+  (172/172 parse), both from a `git archive` of the commit and from the live
+  worktree.
+- Losslessness re-measured rather than trusted: an independent script extracted every
+  stored relation from all 172 files before and after (`relates` as an unordered pair,
+  the directional kinds ordered) — 81 edges each side, `lost=[]`, `invented=[]`. The
+  only stored tuples that changed location are the five the ticket prescribes:
+  `152->151` gone (`AIRA-151.md` holds `151->152`), `153->150` and `62->28`
+  deduplicated onto their canonical owners, `153->151` gone (`AIRA-151.md` holds
+  `151->153`), `153->152` moved to `AIRA-152.md`. Label multisets identical per file,
+  every other frontmatter field byte-equal, every body ends in `\n`, every label list
+  sorted and unique, every stored relation on its canonical lower-ID owner.
+- `quarantinedTicketFiles` and its both-directions assertion are gone from
+  `repository_tickets_test.go`, not emptied (confirmed on the diff). Non-porosity
+  re-run by the reviewer: re-introducing AIRA-160's unsorted labels in the worktree
+  fails `TestTheRepositorysOwnTicketFilesAreReadable`.
+- One pre-existing shape outside this ticket's nine, recorded as a follow-up rather than
+  chased: `AIRA-30.md` stores both `AIRA-30 relates AIRA-36` and `AIRA-36 relates
+  AIRA-30` — one `relates` edge stored twice on one file, once in each direction. The
+  parser accepts it (the two tuples are distinct, exactly as the body above warned),
+  so it is not a refusal, but it is the double-storage no writer path would produce.
+- Merge gate, reviewer's own run: `AIRA_REAL_CGROUP=1 aira confine -- go test ./...
+  -count=1` exit 0; gofmt clean on every changed Go file.
+- The owner's separate root commit adding `relates AIRA-171->AIRA-172` ("AIRA-171:
+  record its relation to AIRA-172") was rebased onto the merge commit ahead of this
+  record; AIRA-171 is the lower id, so this file is that edge's canonical owner.
+
+The second half the body asks for — a writer path for "add a relation to a ticket
+whose file is currently unreadable" — remains open, as the Resolution says.
