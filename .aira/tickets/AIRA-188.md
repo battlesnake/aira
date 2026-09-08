@@ -98,6 +98,45 @@ real shape decision for `init`'s argument surface, left for whoever
 builds AIRA-188 to settle alongside the refusal-message wording below —
 not built here.
 
+## Follow-up (devproc, 2026-09-08) — name the mode, don't negate a boolean; and a transition hazard that reintroduces the original bug
+
+Two refinements to the two-doors proposal above, offered unprompted after
+confirming the doc/test fix landed:
+
+**Shape: `--tickets none|own` (or equivalent), not `--no-tickets`.** A
+boolean reads as two states, but this is really "what does this project
+use aira for", which several verbs' behaviour depends on (`id`, `create`,
+and anything else that allocates) — the tell that a boolean is a
+disguised enum is exactly this: set in one place (`init`), read far away
+in several others. Naming the mode (rather than negating a noun) also
+gives a future third mode — `references-only`, i.e. [[AIRA-190]]'s
+reserved-but-not-allocatable prefix — somewhere to go without a second
+boolean beside the first. What matters most for whoever builds this: `id`/
+`create`/`gate`/`lease` must REFUSE with a typed error naming the mode and
+how to change it in telemetry-only mode, not silently no-op — a mode that
+can be silently bypassed is cosmetic, not real.
+
+**The hazard: enabling tickets later, for a prefix already used
+telemetry-only, reintroduces AIRA-188's own bug through an unwatched
+door.** A project that starts telemetry-only and later wants real ticket
+allocation will run whatever "enable tickets for prefix X" transition
+exists; `id_counters` seeds at 1 and hands back e.g. `BL-1` — which can
+already be a live external id the project has been citing in
+`compute_events.ticket_id` all along (project-scoped, so aira can see
+this: the data already distinguishes "this project has referenced BL-1129"
+from "this project has never used BL-anything"). Unlike init's own
+prefix conflict, which is loud (init fails outright), this version is
+silent — by transition time nothing else owns the prefix, so nothing
+conflicts. Two shapes named, no preference stated by the reporter but
+their own lean given: (a) seed the counter from the project's real
+high-water mark (inference, not fact — the weaker option), or (b) refuse
+the transition outright when the prefix already appears in stored
+external references, and require the operator to seed the counter
+explicitly. This is the same class Astra already flagged on AIRA-190
+("explicit transition rules for existing counters") — worth stating once
+in whichever ticket ends up owning the mode-concept build, not twice.
+Left for whoever builds this; not designed further here.
+
 ## Not designed here
 
 Exact refusal message wording, whether `AIRA` itself should keep a
