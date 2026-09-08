@@ -159,13 +159,15 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 		// so the HELLO write itself can lose that race and fail with EPIPE. Both
 		// outcomes are the same refusal and are classified the same way, so a
 		// transient BUSY is retried whichever side of the write it lands on
-		// (AIRA-173).
+		// (AIRA-173). The read is classified symmetrically (AIRA-174): a HELLO the
+		// peer answers with nothing at all is an unreachable peer, not an unknown
+		// outcome.
 		var respErr error
 		if writeErr := writeRunInputFrame(conn, runInputOpHello, hello); writeErr != nil {
 			respErr = classifyRunInputHelloWriteError(conn, writeErr)
 		} else {
 			var committed int64
-			committed, respErr = readRunInputResponse(conn, 0)
+			committed, respErr = readRunInputHelloResponse(conn)
 			if respErr == nil {
 				if committed != 0 {
 					_ = conn.Close()
@@ -230,11 +232,55 @@ func classifyRunInputHelloWriteError(conn net.Conn, writeErr error) error {
 	return decodeRunInputWireError(payload)
 }
 
+// readRunInputHelloResponse reads the server's answer to a HELLO frame. It is
+// readRunInputResponse with ONE difference, and it exists for that difference: a
+// peer that hands back no frame at all is reported E_RUN_INPUT_UNREACHABLE with
+// committed 0, never E_RUN_INPUT_OUTCOME_UNKNOWN (AIRA-174).
+//
+// The server can close a connection at HELLO time without ever writing a frame —
+// acceptLoop's post-CAS recheck closes bare when the plane went terminal under the
+// accept (run_input_server_linux.go:148-151), as does a reject with no slot left
+// (:168-170), and closeTerminal can close the claimed conn mid-handshake. No DATA
+// frame has been sent at this point, so no byte can have reached the child's stdin
+// and the committed count is known to be 0. OUTCOME_UNKNOWN is defined as the
+// delivery ambiguity of bytes that may or may not have landed (D6 §2.4); claiming
+// it here would fabricate an unknown out of a known-empty outcome, exactly as the
+// write side did before AIRA-173. This is the same judgement, one step later.
+//
+// A frame that arrives is interpreted unchanged: an ACK, or the server's OWN
+// refusal code — so a zero-committed BUSY still re-enters the caller's bounded
+// retry and every other refusal stays terminal. Nor does UNREACHABLE swallow a
+// verdict the frame reader itself reached: readRunInputFrame's own
+// E_RUN_INPUT_PROTOCOL (an oversized or malformed frame) is determinate and keeps
+// its code, since the peer demonstrably did answer.
+func readRunInputHelloResponse(reader io.Reader) (int64, error) {
+	op, payload, err := readRunInputFrame(reader)
+	if err != nil {
+		var determinate *RunInputError
+		if errors.As(err, &determinate) {
+			return 0, err
+		}
+		return 0, &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: err}
+	}
+	return interpretRunInputResponse(op, payload, 0)
+}
+
+// readRunInputResponse reads a mid-stream or CLOSE-time answer, where a connection
+// that drops before the final ACK IS a real delivery ambiguity: bytes after the
+// last ACK may have committed with the ACK lost (D6 §2.4). That is what
+// E_RUN_INPUT_OUTCOME_UNKNOWN means and it is honest here, unlike at HELLO time.
 func readRunInputResponse(reader io.Reader, lastCommitted int64) (int64, error) {
 	op, payload, err := readRunInputFrame(reader)
 	if err != nil {
 		return lastCommitted, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: lastCommitted, Err: err}
 	}
+	return interpretRunInputResponse(op, payload, lastCommitted)
+}
+
+// interpretRunInputResponse turns a frame the client actually received into an ACK
+// count or an error. It is shared verbatim by both readers: only the classification
+// of a frame that never arrived differs between HELLO time and mid-stream.
+func interpretRunInputResponse(op byte, payload []byte, lastCommitted int64) (int64, error) {
 	switch op {
 	case runInputOpAck:
 		return decodeRunInputAck(payload)
