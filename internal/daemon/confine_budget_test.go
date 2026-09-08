@@ -55,8 +55,9 @@ func TestConfineBudgetIsProjectlessAndReportsWorstFirst(t *testing.T) {
 	for index := 0; index < 3; index++ {
 		// Wildly over-reserved: 8G held against a ~100M actual.
 		recordBudgetSample(t, db, "subpipe", 100<<20, 8<<30, false, base.Add(time.Duration(index)*time.Second))
-		// Comfortable, inside the quiet band.
-		recordBudgetSample(t, db, "quiet", 1<<30, 3<<28, false, base.Add(time.Duration(index)*time.Second))
+		// Comfortable: 1.5G granted against a 1G peak is ratio 1.5, inside the
+		// deliberate [1.25, 2.0) quiet band, so it is classified and NOT nagged at.
+		recordBudgetSample(t, db, "quiet", 1<<30, 3<<29, false, base.Add(time.Duration(index)*time.Second))
 	}
 	// Realised harm at the current budget: worst, and it must sort first.
 	recordBudgetSample(t, db, "qual", 40<<30, 40<<30, true, base)
@@ -75,6 +76,9 @@ func TestConfineBudgetIsProjectlessAndReportsWorstFirst(t *testing.T) {
 	}
 	if result.Subjects[1].Direction != store.ResourceBudgetOverProvisioned {
 		t.Fatalf("over-provisioned must outrank the quiet band: %+v", result.Subjects)
+	}
+	if result.Subjects[2].Direction != store.ResourceBudgetAcceptable || result.Subjects[2].Recommendation != "" {
+		t.Fatalf("the quiet band must be classified and recommended NOTHING: %+v", result.Subjects[2])
 	}
 	if result.Scope == "" {
 		t.Fatal("the machine-wide, cross-project universe must be disclosed on the wire")
@@ -138,7 +142,7 @@ func TestConfineBudgetRefusesAnInvalidOwner(t *testing.T) {
 // verifies: AIRA-180
 func TestConfineBudgetOnEmptyHistoryIsAnAnswerNotAnError(t *testing.T) {
 	server, _ := budgetTestServer(t)
-	response := server.confineBudget(map[string]any{})
+	response := server.confineBudget(map[string]any{"owner": "session-a"})
 	if !response.OK {
 		t.Fatalf("response=%+v", response)
 	}

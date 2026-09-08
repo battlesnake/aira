@@ -898,7 +898,7 @@ func TestOOMAdvisoryNamesTheSliceCapEstablishedAtLaunch(t *testing.T) {
 			OOMGroupKillLocal: int64ptr(1), OOMLocal: int64ptr(1),
 		}
 	}
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 	var diagnostics bytes.Buffer
 	if _, err := confineWithDeps(context.Background(), ConfineRequest{
 		Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: &diagnostics,
