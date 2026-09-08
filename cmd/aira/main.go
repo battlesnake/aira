@@ -209,7 +209,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		// survivability verb depend on the component most likely to have been
 		// restarted during exactly the long pause it exists to survive.
 		status := options["status"] == "true"
-		management := options["list"] == "true" || options["kill"] != "" || status
+		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true"
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
@@ -270,7 +270,14 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runWorkerAdmitCommand(context.Background(), options, stdin, stdout, stderr)
 	}
-	if verb == "confine-list" || verb == "confine-kill" {
+	if verb == "worker-peak" {
+		if jsonOutput {
+			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for worker-peak")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		return runWorkerPeakCommand(context.Background(), options, stderr)
+	}
+	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-budget" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
 			code := store.ErrorCode(requestErr)
@@ -666,6 +673,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "worker-admit" {
 		return parseWorkerAdmitArgs(argv)
 	}
+	if verb == "worker-peak" {
+		return parseWorkerPeakArgs(argv)
+	}
 	if verb == "run" {
 		return parseRunArgs(argv)
 	}
@@ -751,16 +761,17 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"tui":               nil,
 		// AIRA-127. `top` takes no options today; the entry exists so an unknown
 		// one is refused by name rather than silently accepted and discarded.
-		"top":          nil,
-		"commands":     {"by": true},
-		"git":          {},
-		"run-kill":     {"steal": true},
-		"run-input":    {"close": true, "steal": true},
-		"run-log":      {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
-		"confine-list": {"slice": true, "owner": true},
-		"confine-kill": {"steal": true, "slice": true, "owner": true},
-		"watch":        {"from": true, "from-start": true, "verb": true},
-		"gate":         {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
+		"top":            nil,
+		"commands":       {"by": true},
+		"git":            {},
+		"run-kill":       {"steal": true},
+		"run-input":      {"close": true, "steal": true},
+		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
+		"confine-list":   {"slice": true, "owner": true},
+		"confine-budget": {"slice": true, "owner": true},
+		"confine-kill":   {"steal": true, "slice": true, "owner": true},
+		"watch":          {"from": true, "from-start": true, "verb": true},
+		"gate":           {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -1100,6 +1111,91 @@ func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 	return nil, options, nil
 }
 
+// parseWorkerPeakArgs parses the aitest supervisor's ONE end-of-run pool sample.
+//
+// CLI-only, like worker-admit, and for the same reason: its caller is the aitest
+// supervisor relaying to the daemon, not an agent. It is deliberately not a
+// dispatch-table verb — there is nothing an agent would ever ask it, and adding
+// an MCP tool for a machine-to-machine report would be surface with no reader.
+func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	valued := map[string]bool{"signature": true, "peak-rss": true, "budget": true, "budget-basis": true}
+	for i := 0; i < len(argv); i++ {
+		name := strings.TrimPrefix(argv[i], "--")
+		if name == "oom" {
+			options["oom"] = "true"
+			continue
+		}
+		if !valued[name] {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for worker-peak", name)
+		}
+		// A value may legitimately begin with "--" only if it is a signature,
+		// and a pytest argument genuinely can (`--aitest-workers=auto`). So the
+		// look-ahead guard that worker-admit uses is deliberately NOT copied
+		// here: it would truncate exactly the keys this verb exists to carry.
+		if i+1 >= len(argv) {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		i++
+		options[name] = argv[i]
+	}
+	if options["signature"] == "" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --signature is required for worker-peak")
+	}
+	if (options["budget"] == "") != (options["budget-basis"] == "") {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --budget and --budget-basis must be given together")
+	}
+	return nil, options, nil
+}
+
+// runWorkerPeakCommand relays one aitest pool sample to the daemon.
+//
+// It is best-effort by design and says so on stderr rather than failing loudly:
+// the caller is a pytest run that has already finished its real work, and a
+// suite must never be reported differently because AIRA could not record how
+// much memory it used. Nothing is fabricated to fill a gap — an unparseable or
+// absent term is simply not sent, and the store records it as unevaluated.
+func runWorkerPeakCommand(ctx context.Context, options map[string]string, stderr io.Writer) int {
+	report := runner.ConfinePeakReport{
+		Kind:        string(store.ResourcePeakKindPytestWorker),
+		Signature:   options["signature"],
+		OOM:         options["oom"] == "true",
+		BudgetBasis: options["budget-basis"],
+	}
+	if raw := options["peak-rss"]; raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --peak-rss must be a positive byte count, got %q\n", raw)
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		report.Peak = &value
+	}
+	if raw := options["budget"]; raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --budget must be a positive byte count, got %q\n", raw)
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		report.Budget = &value
+	}
+	if report.Budget != nil && runner.ConfineBudgetFamilyOf(report.BudgetBasis) == "" {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --budget-basis %q names no cap:/reserve: family\n", report.BudgetBasis)
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: daemon paths unavailable: %v\n", err)
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := runner.ReportPeakSample(reportCtx, paths.SocketPath, report); err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: report pool peak: %v\n", err)
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	return 0
+}
+
 func parseConfineManagementArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	for i := 0; i < len(argv); i++ {
@@ -1118,7 +1214,7 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 			// an operator who forgot the delimiter that they must pick a management
 			// verb sends them the wrong way entirely.
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --detach requires a launch target after --, e.g. aira confine --detach --name gate -- make merge-gate")
-		case "list", "steal":
+		case "list", "steal", "budget":
 			if hasInline {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s does not take a value", name)
 			}
@@ -1159,14 +1255,15 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	list := options["list"] == "true"
 	kill := options["kill"] != ""
 	status := options["status"] == "true"
+	budget := options["budget"] == "true"
 	selected := 0
-	for _, chosen := range []bool{list, kill, status} {
+	for _, chosen := range []bool{list, kill, status, budget} {
 		if chosen {
 			selected++
 		}
 	}
 	if selected != 1 {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --kill <selector>, or --status [<selector>]")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --kill <selector>, or --status [<selector>]")
 	}
 	if !kill && options["steal"] == "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")
@@ -1997,6 +2094,9 @@ func runConfineManagementCommand(ctx context.Context, options map[string]string,
 	}
 	verb := "confine-list"
 	args := map[string]any{"slice": options["slice"], "owner": owner}
+	if options["budget"] == "true" {
+		verb = "confine-budget"
+	}
 	if selector := options["kill"]; selector != "" {
 		verb = "confine-kill"
 		args["selector"] = selector
@@ -2022,6 +2122,9 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 	response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, request)
 	if request.Verb == "confine-list" && !jsonOutput && response.OK {
 		return renderConfineListResponse(response, stdout, stderr)
+	}
+	if request.Verb == "confine-budget" && !jsonOutput && response.OK {
+		return renderConfineBudgetResponse(response, stdout, stderr)
 	}
 	return render(response, jsonOutput, stdout, stderr)
 }
@@ -2286,6 +2389,15 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 	case "confine-list":
 		if len(positional) != 0 {
 			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-list accepts no selector")
+		}
+		args["slice"], args["owner"] = options["slice"], options["owner"]
+	case "confine-budget":
+		// No selector by design. A subject key is a NUL- or unit-separator-joined
+		// argv, which is not a thing anyone can type; v1 answers for every subject
+		// at once, worst-first, and the operator reads their own command off the
+		// SUBJECT column.
+		if len(positional) != 0 {
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-budget accepts no selector")
 		}
 		args["slice"], args["owner"] = options["slice"], options["owner"]
 	case "confine-kill":

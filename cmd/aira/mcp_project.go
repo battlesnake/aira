@@ -54,7 +54,7 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 			// Eject is a machine-level daemon operation; its safety checks are
 			// performed by the daemon and it has no project scope to discover.
 			scope = daemon.WorktreeScope{}
-		} else if canonical == "confine-list" || canonical == "confine-kill" {
+		} else if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" {
 			// Confine management is machine-local and project-less. Ownership,
 			// destructive confirmation, and populated-gate checks remain in the
 			// management handler; this bypasses project discovery only.

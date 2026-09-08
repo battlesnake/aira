@@ -125,7 +125,41 @@ implicit. Reporter's own caveat: box was heavily contended throughout
 figure — directionally useful for scoping the capture design, not a
 precise calibration input.
 
+## Review round 2 (Astra + Fable, 2026-09-09) — four blocking findings resolved
+
+Both passes BLOCKED. All four accepted and resolved in the plan's new **§5s**;
+none needed a redesign.
+
+1. **Astra — pool capture was scoped to the CRASH path only.** §5r.7.3 put the
+   read beside `_describe_worker_death`, whose only caller is
+   `_handle_worker_exit`, which is reached only when a worker crashes. The two
+   ordinary retirement paths (recycle, end-of-run stop) never reach it, so a
+   clean run — the only kind that can show over-provisioning — would have
+   recorded nothing. Capture moved into `_retire_worker`, the single point every
+   retirement funnels through, beside its own `grant` fetch and before
+   `_forget_worker_scope`'s rmdir.
+2. **Fable — a per-ROW budget was being classified as if it were one budget.**
+   Every row is now bucketed individually against the CURRENT budget (the newest
+   budgeted row, or Face 2's pre-flight request); the OOM bypass is scoped to
+   OOM rows whose own budget is at or above the current one; OOM peaks, which
+   are truncated lower bounds, never feed the lowering direction; null-budget
+   rows get their own counted exclusion.
+3. **Fable — "budget" conflated the granted reserve with the scope
+   `memory.max`.** One quantity per row, with the family named in
+   `budget_basis` (`cap:` for a kernel-enforced bound, `reserve:` for a ledger
+   booking), and the classifier partitions by family so the two are never
+   summarised together.
+4. **Fable — tests were not named per invariant.** Twelve named, each with the
+   direction it guards; see §5s.5.
+
+Also settled: one pool sample per RUN rather than per retirement (a relay fork
+on the dispatch loop's hot path would have been the cost of the correct call
+site), and the aitest pool key defined — the pytest rootdir plus invocation
+arguments, unit-separator joined, which unlike an argv-only confine signature
+does not collide across projects.
+
 ## Status
 
-Planning only. Not yet gated, not yet built, per the owner's explicit
-request.
+Built on `aira180-resource-budget-tracking`. Report-only throughout, and that
+constraint is asserted as a SQLite write count on BOTH faces rather than left
+to review.

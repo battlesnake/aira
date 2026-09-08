@@ -149,7 +149,7 @@ func TestMCPScopeDirNeverReachesTheCoreRequest(t *testing.T) {
 // silently ignored.
 func TestMCPScopeDirIsDeclaredOnProjectScopedToolsOnly(t *testing.T) {
 	server := newMCPServer(nil)
-	projectLess := map[string]bool{"aira_eject": true, "aira_confine_list": true, "aira_confine_kill": true}
+	projectLess := map[string]bool{"aira_eject": true, "aira_confine_list": true, "aira_confine_kill": true, "aira_confine_budget": true}
 	for _, tool := range server.tools {
 		schema, ok := tool.InputSchema.(mcpInputSchema)
 		if !ok {
@@ -424,7 +424,7 @@ func TestCLIScopeDirCoversEveryDiscoverySite(t *testing.T) {
 // than accepting and discarding it.
 func TestCLIScopeDirIsRefusedForProjectlessVerbs(t *testing.T) {
 	_, callerWorktree := scopeDirFaceEnv(t)
-	for _, verb := range []string{"confine", "confine-list", "confine-reserve", "worker-admit"} {
+	for _, verb := range []string{"confine", "confine-list", "confine-budget", "confine-reserve", "worker-admit", "worker-peak"} {
 		var stdout, stderr bytes.Buffer
 		exit := RunWithDispatcher([]string{"--scope-dir", callerWorktree, verb, "--", "true"}, &stdout, &stderr, dispatcherFunc(
 			func(context.Context, daemon.WorktreeScope, core.Request) core.Response {

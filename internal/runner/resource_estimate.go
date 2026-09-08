@@ -78,6 +78,36 @@ func ResourceSignature(commandPrefix, requestPrefix, argv []string) (string, err
 	return strings.Join(effective, "\x00"), nil
 }
 
+// GrowByEstimatorMargin applies the ONE growth margin this codebase sizes
+// anything by (memoryEstimateSafetyPct), so a figure derived anywhere else can
+// never drift from the one admission itself uses. SliceFittedReserve is its
+// exact inverse; EstimateMemoryReserve below is its principal caller.
+//
+// It exists because AIRA-180's recommendation surface must be able to grow an
+// observed peak into a suggested budget in the one case the ESTIMATOR itself
+// declines: a single recorded OOM is enough evidence to say "this budget is too
+// small" while still being too little evidence to size live admission from.
+// Reusing the constant rather than restating it is what keeps the recommended
+// figure and the automatic estimate commensurable.
+//
+// Returns 0 for a non-positive peak (there is nothing to grow) and clamps to
+// MaxMemoryEstimateReserve, matching EstimateMemoryReserve's own ceiling.
+//
+// covers: AIRA-180 §5s.3
+func GrowByEstimatorMargin(peak int64) int64 {
+	if peak <= 0 {
+		return 0
+	}
+	if peak > MaxMemoryEstimateReserve {
+		return MaxMemoryEstimateReserve
+	}
+	grown := peak + peak*memoryEstimateSafetyPct/100
+	if grown > MaxMemoryEstimateReserve || grown < peak {
+		return MaxMemoryEstimateReserve
+	}
+	return grown
+}
+
 // EstimateMemoryReserve is the #50 conservative peak-RSS estimator. override
 // is false when callers must retain their fixed fallback headroom.
 func EstimateMemoryReserve(stats PeakRSSStats, headroom int64) (reserve int64, override bool, basis string) {

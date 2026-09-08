@@ -3641,3 +3641,248 @@ sys.stdin.read()
         "neither consumed by this death nor requeued twice"
     )
     assert replacements == [True], "a mid-run death asks for a replacement worker"
+
+
+# --------------------------------------------------------------------------
+# AIRA-180: pool-usage capture. The load-bearing scoping decision is that the
+# fold lives in _retire_worker, which EVERY retirement path funnels through, and
+# not beside _describe_worker_death, which only the crash path reaches.
+# --------------------------------------------------------------------------
+
+
+def _worker_scope(tmp_path, name, peak=None, oom_group_kill=None):
+    """A fake worker cgroup scope directory, with only the files under test."""
+    scope = tmp_path / name
+    scope.mkdir()
+    if peak is not None:
+        (scope / "memory.peak").write_text("%d\n" % peak)
+    if oom_group_kill is not None:
+        (scope / "memory.events").write_text(
+            "low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\noom_group_kill %d\n" % oom_group_kill
+        )
+    return scope
+
+
+def _retirable_state(scope, memory_max=104857600):
+    """The narrowest worker state _retire_worker will accept, with a grant."""
+    dispatch_read, dispatch_write = os.pipe()
+    result_read, result_write = os.pipe()
+    os.close(result_write)
+    return dispatch_read, {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": True,
+        "in_flight": None, "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None,
+        "grant": {"scope": str(scope), "memory_max": memory_max, "worker_id": "1"},
+    }
+
+
+def test_retire_worker_records_pool_peak_before_the_scope_is_removed(tmp_path):
+    """The peak read must PRECEDE _forget_worker_scope: that call rmdirs the
+    scope, and memory.peak goes with it.
+
+    Asserted by observing the accumulator AT THE MOMENT _forget_worker_scope is
+    entered, rather than by checking the directory afterwards. A real worker
+    scope is a cgroup directory, whose control files do not block rmdir; an
+    ordinary temp directory holding a memory.peak file does, so an
+    after-the-fact existence check would test the fixture rather than the
+    ordering."""
+    scope = _worker_scope(tmp_path, "worker-1", peak=700 * 1024 * 1024)
+    supervisor = Supervisor()
+    pid = 999990
+    dispatch_read, state = _retirable_state(scope)
+    supervisor.workers[pid] = state
+
+    observed_at_removal = []
+    real_forget = supervisor._forget_worker_scope
+
+    def recording_forget(path):
+        observed_at_removal.append(supervisor._pool_peak_max)
+        return real_forget(path)
+
+    supervisor._forget_worker_scope = recording_forget
+    supervisor._retire_worker(pid, state)
+
+    assert observed_at_removal == [700 * 1024 * 1024], (
+        "the peak must already be folded in by the time the scope is torn down"
+    )
+    assert supervisor._pool_peak_samples == 1
+    assert supervisor._pool_budget == 104857600
+    os.close(dispatch_read)
+
+
+def test_a_scope_already_gone_records_nothing(tmp_path):
+    """The other half of the ordering: reading AFTER the rmdir would capture
+    nothing at all, and nothing is exactly what a removed scope must yield --
+    not a zero."""
+    scope = tmp_path / "already-gone"
+    supervisor = Supervisor()
+    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": 104857600})
+    assert supervisor._pool_peak_max is None
+    assert supervisor._pool_peak_samples == 0
+
+
+def test_retire_worker_records_pool_peak_on_the_recycle_and_stop_paths_too(tmp_path):
+    """AIRA-180 §5s.1, the plan-gate's own blocking finding. Capture scoped to
+    _handle_worker_exit would fire ONLY on a crash, so a clean run -- the common
+    case, and the only one that can ever show over-provisioning -- would record
+    nothing at all. Every retirement path reaches _retire_worker, so exercising
+    it three times with three different worker scopes proves the fold is
+    path-independent, which is exactly the property the wrong call site lacked.
+    """
+    supervisor = Supervisor()
+    peaks = [100 * 1024 * 1024, 900 * 1024 * 1024, 300 * 1024 * 1024]
+    for index, peak in enumerate(peaks):
+        scope = _worker_scope(tmp_path, "worker-%d" % index, peak=peak)
+        pid = 999980 + index
+        dispatch_read, state = _retirable_state(scope)
+        supervisor.workers[pid] = state
+        supervisor._retire_worker(pid, state)
+        os.close(dispatch_read)
+
+    assert supervisor._pool_peak_samples == 3
+    assert supervisor._pool_peak_max == 900 * 1024 * 1024, (
+        "the pool sample is the LARGEST peak any worker reached, because the "
+        "budget it is compared against is per-worker"
+    )
+    assert supervisor._pool_scoped_workers == 3
+
+
+def test_unreadable_pool_peak_records_nothing_rather_than_zero(tmp_path):
+    """An absent or unparseable memory.peak must leave the accumulator absent.
+    A fabricated zero would make the pool look infinitely over-provisioned to
+    the classifier, whose recommendation is 'lower it' -- the one direction
+    whose failure mode is a dead job."""
+    missing = _worker_scope(tmp_path, "worker-missing")
+    garbage = _worker_scope(tmp_path, "worker-garbage")
+    (garbage / "memory.peak").write_text("not-a-number\n")
+    supervisor = Supervisor()
+    for index, scope in enumerate((missing, garbage)):
+        pid = 999970 + index
+        dispatch_read, state = _retirable_state(scope)
+        supervisor.workers[pid] = state
+        supervisor._retire_worker(pid, state)
+        os.close(dispatch_read)
+
+    assert supervisor._pool_peak_max is None
+    assert supervisor._pool_peak_samples == 0
+    assert supervisor._pool_scoped_workers == 2, "the retirements themselves still happened"
+
+
+def test_retire_worker_records_a_per_worker_oom(tmp_path):
+    """oom_group_kill on the worker's OWN scope is realised harm at the granted
+    cap, and the classifier bypasses its evidence gate for it. It must survive
+    retirement, not be thrown away with the scope."""
+    killed = _worker_scope(tmp_path, "worker-oom", peak=104857600, oom_group_kill=1)
+    survived = _worker_scope(tmp_path, "worker-ok", peak=1024, oom_group_kill=0)
+    supervisor = Supervisor()
+    for index, scope in enumerate((survived, killed)):
+        pid = 999960 + index
+        dispatch_read, state = _retirable_state(scope)
+        supervisor.workers[pid] = state
+        supervisor._retire_worker(pid, state)
+        os.close(dispatch_read)
+
+    assert supervisor._pool_peak_oom is True
+
+    # False-pass direction: a pool where nothing was OOM-killed must not claim
+    # one, and a scope whose memory.events cannot be read must not either.
+    clean = Supervisor()
+    for index, scope in enumerate(
+        (_worker_scope(tmp_path, "clean-1", peak=1024, oom_group_kill=0),
+         _worker_scope(tmp_path, "clean-2", peak=1024))
+    ):
+        pid = 999950 + index
+        dispatch_read, state = _retirable_state(scope)
+        clean.workers[pid] = state
+        clean._retire_worker(pid, state)
+        os.close(dispatch_read)
+    assert clean._pool_peak_oom is False
+
+
+def test_worker_without_a_cgroup_scope_contributes_no_pool_evidence(tmp_path):
+    """A ledger-only (ci-shim) grant has no scope, so there is no kernel-enforced
+    budget and no peak to compare against one. It must contribute nothing at all
+    rather than a budget with no bound behind it."""
+    supervisor = Supervisor()
+    supervisor._observe_worker_usage({"scope": "", "memory_max": 104857600})
+    assert supervisor._pool_budget is None
+    assert supervisor._pool_scoped_workers == 0
+
+
+def test_pool_subject_key_leads_with_the_rootdir_and_is_argv_safe():
+    """The aitest key leads with the pytest rootdir -- which is what stops it
+    colliding across projects the way an argv-only confine signature does -- and
+    joins with a separator that survives argv. A NUL would be truncated at the
+    first separator by execve, collapsing every pool in a repository into one
+    subject."""
+    class Invocation:
+        args = ("tests", "--aitest-workers=auto")
+
+    class Config:
+        rootpath = "/repo/one"
+        invocation_params = Invocation()
+
+    supervisor = Supervisor(config=Config())
+    key = supervisor._pool_subject_key()
+
+    assert "\x00" not in key, "a NUL separator would be truncated in argv"
+    assert key.split(supervisor_module._POOL_KEY_SEPARATOR) == [
+        "/repo/one", "tests", "--aitest-workers=auto"
+    ]
+    # Two repositories running the same pytest arguments are DIFFERENT subjects.
+    class OtherConfig(Config):
+        rootpath = "/repo/two"
+
+    assert Supervisor(config=OtherConfig())._pool_subject_key() != key
+    # No config at all suppresses the report rather than inventing a key.
+    assert Supervisor()._pool_subject_key() == ""
+
+
+def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, monkeypatch):
+    """One relay invocation per RUN, carrying every established term and no
+    fabricated one; and every failure of that relay is silent."""
+    class Invocation:
+        args = ("tests",)
+
+    class Config:
+        rootpath = str(tmp_path)
+        invocation_params = Invocation()
+
+    recorded = []
+
+    def fake_run(argv, **kwargs):
+        recorded.append(argv)
+        raise OSError("relay is not installed here")
+
+    monkeypatch.setattr(supervisor_module.subprocess, "run", fake_run)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", "/usr/bin/aira")
+    monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", "104857600")
+
+    supervisor = Supervisor(config=Config())
+    supervisor._pool_scoped_workers = 2
+    supervisor._pool_peak_max = 700 * 1024 * 1024
+    supervisor._pool_budget = 104857600
+    supervisor._pool_peak_oom = True
+
+    supervisor._report_pool_usage()  # An OSError here must not escape.
+
+    assert len(recorded) == 1, "one relay invocation per run, not per worker"
+    argv = recorded[0]
+    assert argv[:2] == ["/usr/bin/aira", "worker-peak"]
+    assert "--peak-rss" in argv and str(700 * 1024 * 1024) in argv
+    assert "--budget" in argv and "104857600" in argv
+    assert "cap:aitest:env:set" in argv
+    assert "--oom" in argv
+
+    # An absent peak is simply not sent -- never sent as a zero.
+    recorded.clear()
+    quiet = Supervisor(config=Config())
+    quiet._pool_scoped_workers = 1
+    quiet._report_pool_usage()
+    assert "--peak-rss" not in recorded[0]
+    assert "--budget" not in recorded[0]
+
+    # A pool where no worker ever had a cgroup scope reports nothing at all.
+    recorded.clear()
+    Supervisor(config=Config())._report_pool_usage()
+    assert recorded == []

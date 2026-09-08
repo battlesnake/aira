@@ -151,8 +151,8 @@ func refuseAmbiguousImportPath(request core.Request, scopeDirOverride string) er
 // override instead of accepting and discarding it.
 func verbAcceptsScopeDir(verb string) bool {
 	switch verb {
-	case "confine", "confine-reserve", "confine-list", "confine-kill",
-		"aitest-bootstrap", "worker-admit",
+	case "confine", "confine-reserve", "confine-list", "confine-kill", "confine-budget",
+		"aitest-bootstrap", "worker-admit", "worker-peak",
 		// AIRA-127. `top` watches the machine-wide slice and resolves no project.
 		"top",
 		// AIRA-185. A drain holds the machine-wide slice and resolves no project,
@@ -175,7 +175,7 @@ func verbAcceptsScopeDir(verb string) bool {
 // no discovery for eject at all and requires an explicit selector.
 func toolAcceptsScopeDir(tool string) bool {
 	switch tool {
-	case "aira_eject", "aira_confine_list", "aira_confine_kill":
+	case "aira_eject", "aira_confine_list", "aira_confine_kill", "aira_confine_budget":
 		return false
 	}
 	return true

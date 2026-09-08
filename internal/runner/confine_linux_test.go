@@ -1305,7 +1305,7 @@ func TestConfineDaemonLeaseHeldUntilScopeTeardown(t *testing.T) {
 		}
 		return cgroupUsage{}
 	}
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 	if _, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps); err != nil {
 		t.Fatal(err)
 	}
@@ -1327,7 +1327,7 @@ func TestConfineFallbackFlockReleasedAtStart(t *testing.T) {
 		}
 		return cgroupUsage{}
 	}
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 	if _, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps); err != nil {
 		t.Fatal(err)
 	}
@@ -1353,14 +1353,18 @@ func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
 	}
 	peak, oomKill := int64(80<<20), int64(1)
 	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{PeakRSS: &peak, OOMKill: &oomKill} }
-	reported := false
-	deps.reportPeak = func(_ context.Context, _ ConfineRequest, signature string, got *int64, oom bool) error {
-		reported = signature != "" && got != nil && *got == peak && oom
+	reported, reportedBudget := false, false
+	deps.reportPeak = func(_ context.Context, _ ConfineRequest, report ConfinePeakReport) error {
+		reported = report.Signature != "" && report.Peak != nil && *report.Peak == peak && report.OOM
+		// AIRA-180: the budget term travels with the sample, and it is the
+		// ENFORCED cap here (96 MiB was written), never a fabricated zero.
+		reportedBudget = report.Budget != nil && *report.Budget == 96<<20 &&
+			strings.HasPrefix(report.BudgetBasis, ConfineBudgetFamilyCap)
 		return nil
 	}
 	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
-	if err != nil || capWritten != 96<<20 || result.Status.ScopeMemoryMax != 96<<20 || result.Status.PeakRSS == nil || *result.Status.PeakRSS != peak || !reported {
-		t.Fatalf("result=%+v err=%v cap=%d reported=%v", result, err, capWritten, reported)
+	if err != nil || capWritten != 96<<20 || result.Status.ScopeMemoryMax != 96<<20 || result.Status.PeakRSS == nil || *result.Status.PeakRSS != peak || !reported || !reportedBudget {
+		t.Fatalf("result=%+v err=%v cap=%d reported=%v reportedBudget=%v", result, err, capWritten, reported, reportedBudget)
 	}
 }
 
@@ -1379,7 +1383,7 @@ func TestConfineCPUTimeReachesStatusFromTheSameTeardownRead(t *testing.T) {
 	deps.writeScopeMemoryCap = func(_ Scope, maximum, high int64, setOOM bool) error { return nil }
 	user, sys := int64(1_500_000), int64(0)
 	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{CPUUser: &user, CPUSys: &sys} }
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
 	if err != nil {
 		t.Fatal(err)
@@ -1559,7 +1563,7 @@ func TestConfineUnevaluatedDaemonGrantIsNotSubCapped(t *testing.T) {
 		return nil
 	}
 	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
 	if err != nil || result.Status.ScopeMemoryMax != 0 {
 		t.Fatalf("result=%+v err=%v, want no sub-cap for an unevaluated grant", result, err)
@@ -1572,8 +1576,8 @@ func TestConfineZeroPeakIsReportedAsUnknown(t *testing.T) {
 	zero := int64(0)
 	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{PeakRSS: &zero} }
 	reportedUnknown := false
-	deps.reportPeak = func(_ context.Context, _ ConfineRequest, _ string, peak *int64, _ bool) error {
-		reportedUnknown = peak == nil
+	deps.reportPeak = func(_ context.Context, _ ConfineRequest, report ConfinePeakReport) error {
+		reportedUnknown = report.Peak == nil
 		return nil
 	}
 	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)

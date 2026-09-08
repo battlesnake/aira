@@ -1900,6 +1900,21 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-list requires the project-less daemon transport")
 		}},
+		// AIRA-180 Face 2. A NEW verb rather than a flag on confine-list, matching
+		// how --list and --kill are each their own verb with their own MCP tool.
+		// It is project-LESS for the reason AIRA-127 already wrote down for `aira
+		// top`: this history is machine-wide, and routing it through project
+		// discovery would answer E_CONFIG_MISSING in most of the directories an
+		// operator sizing a job is standing in — which is exactly where the four
+		// sessions that motivated the ticket were standing.
+		"confine-budget": {Name: "confine-budget", Usage: "confine --budget [--slice S] [--owner ID] [--json]", Args: []ArgSpec{
+			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, MCPTool: "aira_confine_budget", Summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change.", Safety: SafetyRead, Include: true, Example: []string{}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "slice")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-budget requires the project-less daemon transport")
+		}},
 		"confine-kill": {Name: "confine-kill", Usage: "confine --kill <name|supervisor-pid|scope-id> [--steal] [--slice S] [--owner ID]", Args: []ArgSpec{
 			stringSpec("selector", true, true, "Exact confine name, supervisor PID, or scope ID"),
 			boolSpec("steal", false, false, "Override unknown or foreign ownership"),
@@ -2251,6 +2266,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
+		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change", safety: SafetyRead, example: []string{}},
 		"confine-kill":    {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
 		"confine-status":  {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		// AIRA-185. Excluded from Include below for the same reason confine is, and

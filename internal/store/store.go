@@ -894,9 +894,15 @@ func (s *Store) initDB(ctx context.Context) error {
 			PRIMARY KEY (project_id, run_id),
 			FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
+		// AIRA-180 adds kind/budget/budget_basis. A database written before that
+		// reaches the same shape through ensureConfinePeakHistorySubject below;
+		// the column defaults here and there must stay identical, which is why
+		// each ALTER states the same DEFAULT this DDL does.
 		`CREATE TABLE IF NOT EXISTS confine_peak_history (
 		    signature TEXT NOT NULL, peak_rss INTEGER, oom INTEGER NOT NULL, at TEXT NOT NULL,
-		    CHECK(length(signature)>0), CHECK(peak_rss IS NULL OR peak_rss>0), CHECK(oom IN (0,1))
+		    kind TEXT NOT NULL DEFAULT 'confine', budget INTEGER, budget_basis TEXT,
+		    CHECK(length(signature)>0), CHECK(peak_rss IS NULL OR peak_rss>0), CHECK(oom IN (0,1)),
+		    CHECK(length(kind)>0), CHECK(budget IS NULL OR budget>0)
 		)`,
 		`CREATE INDEX IF NOT EXISTS confine_peak_history_signature
 		    ON confine_peak_history(signature)`,
@@ -1154,6 +1160,9 @@ func (s *Store) initDB(ctx context.Context) error {
 	if err := s.ensureRantOriginProjectID(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureConfinePeakHistorySubject(ctx); err != nil {
+		return err
+	}
 	// Runs before ensureProjectOwnershipFKs, which recreates tables by
 	// replaying their existing DDL: dropping the column first means the FK
 	// migration carries forward the current shape, not the deleted one.
@@ -1275,6 +1284,39 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 func (s *Store) ensureRantOriginProjectID(ctx context.Context) error {
 	return s.ensureColumnAdded(ctx, "rants", "origin_project_id",
 		`ALTER TABLE rants ADD COLUMN origin_project_id TEXT NOT NULL DEFAULT ''`)
+}
+
+// ensureConfinePeakHistorySubject adds AIRA-180's subject-kind discriminator and
+// budget pair to a database written before them, then indexes the composite key
+// the retention window and every reader now use.
+//
+// `DEFAULT 'confine'` backfills every pre-existing row correctly by
+// construction: they ARE confine rows — nothing else has ever written to this
+// table. The budget pair is deliberately left NULL on those rows rather than
+// backfilled from anything: the reserve a past confine job was granted is
+// persisted nowhere, so any value invented here would be a fabricated fact, and
+// the classifier is built to report an unknown budget as unevaluated.
+//
+// The index is created AFTER the columns, in this function rather than in the
+// DDL block, because the DDL block runs before any migration: naming `kind` in a
+// CREATE INDEX up there would fail on exactly the pre-AIRA-180 database this
+// migration exists for. Guarded against the concurrent-opener race the same way
+// each column is — see ensureColumnAdded (AIRA-97 Finding 1).
+func (s *Store) ensureConfinePeakHistorySubject(ctx context.Context) error {
+	for _, column := range []struct{ name, ddl string }{
+		{"kind", `ALTER TABLE confine_peak_history ADD COLUMN kind TEXT NOT NULL DEFAULT 'confine'`},
+		{"budget", `ALTER TABLE confine_peak_history ADD COLUMN budget INTEGER`},
+		{"budget_basis", `ALTER TABLE confine_peak_history ADD COLUMN budget_basis TEXT`},
+	} {
+		if err := s.ensureColumnAdded(ctx, "confine_peak_history", column.name, column.ddl); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS confine_peak_history_kind_signature
+		    ON confine_peak_history(kind, signature)`); err != nil {
+		return translateDBError(err)
+	}
+	return nil
 }
 
 // ensureColumnAdded is the guarded form of "add this column if it is absent",

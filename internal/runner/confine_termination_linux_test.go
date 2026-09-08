@@ -259,7 +259,7 @@ func TestConfineTrailerIgnoresASignalThatArrivesAfterTheRunEnded(t *testing.T) {
 	deps := confineUnitDeps(scope)
 	signals := make(chan os.Signal, 1)
 	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 
 	// Synchronise on the WRITE, not on a poll or a sleep. The earlier version of
 	// this fixture polled for the handler having dequeued the signal, which is
@@ -313,7 +313,7 @@ func confineTrailer(t *testing.T, argv []string, usage cgroupUsage, scopeMemoryM
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	deps.readUsage = func(string) cgroupUsage { return usage }
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 	if scopeMemoryMax > 0 {
 		deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
 	}
@@ -499,7 +499,7 @@ func TestConfineTrailerReportsSupervisorSignal(t *testing.T) {
 	signals := make(chan os.Signal, 1)
 	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
 	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
-	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 
 	// The child announces itself, then becomes a single `sleep` via exec, so the
 	// signal is delivered to a running job and nothing is orphaned when it dies.
