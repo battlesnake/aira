@@ -27,13 +27,20 @@ import (
 
 const gib = int64(1) << 30
 
+// topTestRecord is an ordinary non-delegate confine job: its memory.max was
+// written from its own daemon grant, so its cap and the ledger's charge for it
+// are the same number. AIRA-192 made the RESERVE the bar's source; carrying both
+// here keeps every assertion in this file meaning exactly what it meant, and the
+// delegate population — where the two diverge by design — has its own fixture in
+// tui_top_reserve_test.go.
 func topTestRecord(scopeID, name string, capBytes, rss int64) runner.ConfineRecord {
 	capText := strconv.FormatInt(capBytes, 10)
 	live := true
 	pid := 4242
+	reserve := capBytes
 	return runner.ConfineRecord{
 		Name: name, Owner: "session-a", ScopeID: scopeID, SupervisorPID: &pid,
-		Cap: &capText, RSSBytes: &rss, SubtreePopulated: &live,
+		Cap: &capText, ReserveBytes: &reserve, RSSBytes: &rss, SubtreePopulated: &live,
 	}
 }
 
@@ -122,8 +129,10 @@ func TestTopViewModelRowAndBarRegionShareAColour(t *testing.T) {
 	frame := topTestFrame()
 	model, _ := topViewModel(topTick{}, topTestListing(frame,
 		topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, 1*gib),
-		// A scope with no width: it has a row but no bar region, which shifts every
-		// later region's index away from its row's index.
+		// A scope with no width: the daemon published no reserve for it, so it has a
+		// row but no bar region, which shifts every later region's index away from
+		// its row's index. Its memory.max is deliberately present and uncapped — a
+		// cap is not a reserve, and AIRA-192 forbids reading one as the other.
 		runner.ConfineRecord{Name: "bravo", ScopeID: "CONFINE-bravo-102-bb", Cap: &uncapped},
 		topTestRecord("CONFINE-charlie-103-cc", "charlie", 3*gib, 2*gib)))
 	colours := topRowColours(model)
@@ -140,7 +149,7 @@ func TestTopViewModelRowAndBarRegionShareAColour(t *testing.T) {
 		t.Fatalf("charlie region colour=%q, row colour=%q", got, want)
 	}
 	if _, drawn := byName["bravo"]; drawn {
-		t.Fatal("an uncapped scope was drawn a bar region; its claim has no width")
+		t.Fatal("a scope with no established reserve was drawn a bar region; its width would be a fabrication")
 	}
 	if len(model.Bar.Notes) == 0 {
 		t.Fatal("an undrawn scope was not named in the bar's notes")
@@ -503,21 +512,29 @@ func TestTopFormatMegabytesRoundsToTheNearestMiBInOneFixedUnit(t *testing.T) {
 	}
 }
 
-// The reserve column reads the cap `confine --list` already reports, and keeps
-// its three states apart: a number, an uncapped `max`, and an unreadable field.
-// Collapsing the last two would draw an unknown claim as an unlimited one.
-func TestTopReserveKeepsItsThreeStatesApart(t *testing.T) {
-	numeric, uncapped, junk := "2147483648", "max", "not-a-number"
+// The reserve column reads the ledger's per-scope charge (AIRA-192), and keeps
+// its two states apart: an established number, or nothing at all. A zero is a
+// REAL charge and must not collapse into the absence beside it.
+//
+// The cap cases are here on purpose, as the false-pass guard: a scope carrying
+// only a memory.max — the whole delegate-ram population, and every scope in a
+// daemon-down listing — is UNEVALUATED, because a containment ceiling is not
+// evidence of a grant. That is the AIRA-192 defect stated as a case.
+func TestTopReserveKeepsItsTwoStatesApart(t *testing.T) {
+	numeric, uncapped := "2147483648", "max"
+	established, zero, negative := int64(2*gib), int64(0), int64(-1)
 	for _, testCase := range []struct {
 		name   string
 		record runner.ConfineRecord
 		want   topReserve
 		text   string
 	}{
-		{"set", runner.ConfineRecord{Cap: &numeric}, topReserve{Bytes: 2 * gib, State: topReserveSet}, "2048M"},
-		{"uncapped", runner.ConfineRecord{Cap: &uncapped}, topReserve{State: topReserveUncapped}, "max (uncapped)"},
+		{"set", runner.ConfineRecord{ReserveBytes: &established}, topReserve{Bytes: 2 * gib, State: topReserveSet}, "2048M"},
+		{"zero-is-a-real-charge", runner.ConfineRecord{ReserveBytes: &zero}, topReserve{State: topReserveSet}, "0M"},
 		{"nil", runner.ConfineRecord{}, topReserve{State: topReserveUnevaluated}, "unevaluated"},
-		{"unparsable", runner.ConfineRecord{Cap: &junk}, topReserve{State: topReserveUnevaluated}, "unevaluated"},
+		{"negative-is-not-a-byte-count", runner.ConfineRecord{ReserveBytes: &negative}, topReserve{State: topReserveUnevaluated}, "unevaluated"},
+		{"cap-alone-is-not-a-reserve", runner.ConfineRecord{Cap: &numeric}, topReserve{State: topReserveUnevaluated}, "unevaluated"},
+		{"uncapped-with-no-grant", runner.ConfineRecord{Cap: &uncapped}, topReserve{State: topReserveUnevaluated}, "unevaluated"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			got := topReserveFor(testCase.record)
@@ -1341,16 +1358,18 @@ func TestTopViewModelCPUBarRegionGeometry(t *testing.T) {
 //
 // The fixture exists to break POSITION-based colouring, which is the plausible
 // wrong implementation and the one a naive fixture cannot catch. The first slot
-// is held by a scope that appears in NEITHER bar — an uncapped memory.max gives
-// it no RAM region, and an unreadable CPU counter gives it no CPU region — so
-// every later job's index within each Regions slice is one LESS than its slot.
+// is held by a scope that appears in NEITHER bar — an unevaluated reservation
+// gives it no RAM region, and an unreadable CPU counter gives it no CPU region —
+// so every later job's index within each Regions slice is one LESS than its slot.
 // Colouring a region by its position therefore assigns each of them the previous
 // job's colour, which this asserts against; colouring by the shared slot cannot.
 func TestTopViewModelRAMAndCPURegionsShareTheRowColour(t *testing.T) {
 	uncapped := "max"
-	// alpha: slot 0, no RAM region (uncapped), no CPU region (no counter at all).
+	// alpha: slot 0, no RAM region (AIRA-192 — the daemon published no reserve for
+	// it, and its uncapped memory.max is not a substitute), no CPU region (no
+	// counter at all).
 	alpha := topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib)
-	alpha.Cap = &uncapped
+	alpha.Cap, alpha.ReserveBytes = &uncapped, nil
 	bravo := topTestCPURecord("CONFINE-bravo-102-bb", "bravo", 4*gib, gib, 0)
 	charlie := topTestCPURecord("CONFINE-charlie-103-cc", "charlie", 6*gib, gib, 0)
 	_, state := topViewModel(topTick{}, topTestListing(

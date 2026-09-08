@@ -587,9 +587,12 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 }
 
 // topBarLegend is the numbers line under a bar, in that bar's own unit and its
-// own vocabulary. The RAM bar's left-hand stack is a set of RESERVATIONS — what
-// jobs are allowed to hold — while the CPU bar's is MEASURED USE, and calling
-// either by the other's name would misdescribe what the colours mean.
+// own vocabulary. The RAM bar's left-hand stack is a set of RESERVATIONS — since
+// AIRA-192 the reserve the admission ledger CHARGES each job, which is what the
+// slice is holding for it and what gates the next admission, rather than the
+// scope ceiling it is permitted to grow into — while the CPU bar's is MEASURED
+// USE, and calling either by the other's name would misdescribe what the colours
+// mean.
 //
 // It carries NO trailing newline: renderTopBar joins every following line (the
 // marker legend, OVER-SUBSCRIBED, each note) with its own leading "\n", so a

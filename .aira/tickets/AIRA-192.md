@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-192","project":"aira","title":"aira top's RAM bar sums scope CAP, not granted reserve -- a delegate-ram scope's ceiling inflates the displayed claim far past what is actually reserved","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","delegate-ram","observability","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-192","project":"aira","title":"aira top's RAM bar sums scope CAP, not granted reserve -- a delegate-ram scope's ceiling inflates the displayed claim far past what is actually reserved","status":"in-progress","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","delegate-ram","observability","tui"],"hold":false,"relations":[]}
 ---
 
 Owner observation (2026-09-09, live): "aira top currently shows 90GB of
@@ -102,3 +102,58 @@ simpler and removes the whole cap-vs-reserve distinction as a rendering
 concern going forward) -- left for whoever builds this. [[AIRA-191]]
 (the per-scope `reserve_bytes` field for `--json` output generally) and
 this ticket are now the same underlying fix; build together.
+
+## Built (2026-09-09) -- the two questions this ticket left open, decided
+
+**Wire shape: a per-scope field on `ConfineRecord`, not a fourth row type.**
+`ConfineRecord.ReserveBytes *int64` (`"reserve_bytes"`, always on the wire,
+`null` when unestablished), merged server-side by scope id in
+`runner.ApplyConfineScopeReserves`. Rows on `ConfineSliceReserve` in the
+`ConfineReservationHold` mould were considered and rejected: every
+scope-backed granted waiter ALREADY has a row in the Scopes table (a
+missing cgroup directory surfaces as a `Pending` row via the registry
+merge), so a parallel row list would duplicate data that can then
+disagree with itself, and it would not serve [[AIRA-191]], whose ask is a
+per-scope field in `--json` output. One field, one source.
+
+**Which number: the LEDGER CHARGE (`admitWaiter.ledgerCharge()`), not the
+frozen grant and not the cap.** Under AIRA-29 a scope's charge is
+re-derived from live usage, and it is the charge -- not the grant payload
+-- that occupies the slice, sums to `GrantedBytes`, and gates the next
+admission. Publishing the frozen `reserve` would have fixed the delegate
+symptom while leaving `aira top` disagreeing with `confine --list`'s own
+`slice reserve:` line for every dynamically charged job, which is the
+same class of complaint in a new place. The invariant is now pinned by
+test: the per-scope reserves in one listing sum to that listing's own
+`ScopeBytes + AdoptedBytes`.
+
+**Point 4's premise ("non-delegate cap and reserve are numerically
+identical today") is FALSE, and was checked rather than assumed.** At
+least five ways they differ for a non-delegate scope: `floorMemoryPage`
+rounds the WRITTEN cap down to a page (observed live on this branch's own
+build job -- granted reserve 931227238, `scope-memory.max` 931225600, a
+1638-byte gap); AIRA-29's dynamic charge sits BELOW the cap for any
+tracked scope; an explicit `--memory-max` sets the cap independently of
+the reserve; `ConfineCapSourceMemoryReserve` writes the DECLARED reserve
+rather than the daemon's resolved one; and the flock fallback leaves the
+cap `max` with no ledger record at all. So the unified path is not a
+behavioural no-op for that population -- it is a correction there too,
+in the same direction. Where the two genuinely do coincide the drawn
+output is unchanged, and that case has its own test.
+
+**Adopted scopes are now named per scope.** `queue.adoptedScopes` breaks
+the post-restart adopted scalar down by scope id in the same locked block
+and the same loop that sums it. Without it every scope on the machine
+would render unevaluated across every daemon restart -- trading a wrong
+number for a blank bar. It moves exactly as the scalar does, including
+being RETAINED (not cleared) across a failed scan.
+
+**Accepted, documented gaps.** A scope the ledger charges nothing for
+renders unevaluated rather than 0 (an operator must not read "not
+tracked" as "claims nothing"). Rows and totals can skew by up to one
+scan interval for adopted scopes, the same bound the adopted scalar
+already carries. And a `--delegate-ram` suite holding per-test
+`confine-reserve` leases is charged in two places by design -- the
+parent's small pinned reserve plus the workers in the scope-less region
+-- so its region is narrower than its RAM column; drawing the parent at
+its own `memory.current` would count its children twice.

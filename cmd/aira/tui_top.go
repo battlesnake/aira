@@ -91,49 +91,73 @@ func assignTopSlots(previous []string, live []string) []string {
 	return next
 }
 
-// topReserve is one scope's claim on the slice, kept as a three-state value
-// rather than an int64 so an unreadable cap can never be drawn as a zero-width
-// region beside a real one.
+// topReserve is one scope's claim on the slice, kept as a two-state value rather
+// than a bare int64 so an unestablished reserve can never be drawn as a
+// zero-width region beside a real one.
 type topReserve struct {
 	Bytes int64
-	// State is "set", "uncapped" (memory.max is `max`), or "unevaluated".
+	// State is "set" or "unevaluated".
 	State string
 }
 
 const (
 	topReserveSet         = "set"
-	topReserveUncapped    = "uncapped"
 	topReserveUnevaluated = "unevaluated"
 )
 
-// topReserveFor reads a scope's granted claim from the cap `confine --list`
-// already reports. The cap IS the granted reserve since AIRA-67 (the daemon
-// writes the grant as the scope's memory.max hard sub-cap), so this needs no
-// second source and invents nothing.
+// topReserveFor reads a scope's claim on the slice from the per-scope reserve the
+// daemon's admission ledger publishes for it (AIRA-191/AIRA-192).
+//
+// It used to read the scope's memory.max instead, on the AIRA-67-era assumption
+// that "the cap IS the granted reserve". That assumption is FALSE for the largest
+// cap population on the machine: a --delegate-ram scope's memory.max is an
+// AIRA-15 containment ceiling wide enough for a whole framework's workers, not
+// the pinned framework reserve the ledger charges it. Summing caps therefore drew
+// ~93 GiB of claims on an 80 GiB machine while `confine --list`'s own line read
+// 40 GiB granted of a 53 GiB ceiling — and fed that inflated total to
+// bar.Overcommitted, firing OVER-SUBSCRIBED on a half-empty slice.
+//
+// There is deliberately NO fallback to Cap. An absent reserve means the daemon
+// holds no admission record for this scope — it is unreachable, or the job
+// predates its knowledge — and a cap is not evidence of a grant. Drawing one
+// would be the original defect with a narrower blast radius, so this reports
+// unevaluated and the bar names it in a note rather than inventing a width.
+//
+// The same source serves EVERY scope, delegate or not, so the cap-versus-reserve
+// distinction is no longer a rendering concern at all. Where the two coincide —
+// an ordinary confine job whose memory.max was written from its own grant, and
+// which no dynamic re-charge has moved — the drawn result is what the cap-sourced
+// bar produced.
+//
+// A "max" cap no longer has a state of its own here, and that is a deliberate
+// narrowing rather than lost information: an uncapped scope with a grant is now
+// DRAWN at its real reserve (the cap-sourced bar could only ever discard it), and
+// one without a grant is unevaluated for the same reason every other unknown
+// scope is. The cap itself remains on every `confine --list` row for a reader who
+// wants it.
+//
+// ONE reading subtlety, worth knowing before it is mistaken for a bug: a
+// --delegate-ram suite that takes per-test `aira confine-reserve` holds is charged
+// in TWO places by design. The parent scope keeps its small pinned framework
+// reserve (the ledger stops re-charging a scope whose children are charged
+// separately), and the workers' memory is in the scope-less region at the end of
+// the stack. So such a job's region can be far narrower than its RAM column, and
+// the bar still totals the truth — drawing the parent at its own memory.current
+// instead would count its children twice.
+//
+// covers: AIRA-192
 func topReserveFor(record runner.ConfineRecord) topReserve {
-	if record.Cap == nil {
+	if record.ReserveBytes == nil || *record.ReserveBytes < 0 {
 		return topReserve{State: topReserveUnevaluated}
 	}
-	text := strings.TrimSpace(*record.Cap)
-	if text == "max" {
-		return topReserve{State: topReserveUncapped}
-	}
-	value, err := strconv.ParseInt(text, 10, 64)
-	if err != nil || value < 0 {
-		return topReserve{State: topReserveUnevaluated}
-	}
-	return topReserve{Bytes: value, State: topReserveSet}
+	return topReserve{Bytes: *record.ReserveBytes, State: topReserveSet}
 }
 
 func (r topReserve) String() string {
-	switch r.State {
-	case topReserveSet:
+	if r.State == topReserveSet {
 		return topFormatMegabytes(r.Bytes)
-	case topReserveUncapped:
-		return "max (uncapped)"
-	default:
-		return "unevaluated"
 	}
+	return "unevaluated"
 }
 
 // topFormatMegabytes renders a byte quantity in whole megabytes, for
@@ -545,7 +569,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	drawn := make([]topBarRegion, 0, len(next.Slots))
 	cpuDrawn := make([]topBarRegion, 0, len(next.Slots))
 	notes := make([]string, 0, 2)
-	uncapped, unevaluated := 0, 0
+	unevaluated := 0
 	cpuUnevaluated := 0
 	cpuClaimed := int64(0)
 	offset := int64(0)
@@ -567,26 +591,27 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 				topCPUCell(rate, rateKnown), topCommandCell(record.Command),
 			},
 		})
-		switch reserve.State {
-		case topReserveSet:
+		if reserve.State == topReserveSet {
 			region := topBarRegion{
 				Kind: topRegionScope, Slot: slot, Label: record.Name, Colour: colour,
 				ShadeColour: topShadeColour(colour),
 				Start:       offset, Size: reserve.Bytes,
 			}
+			// AIRA-192. Size is the ledger's real charge for this job, so the bright
+			// sub-span is "how much of its reservation it is using" — the owner's own
+			// statement of what this bar is for. topUsedWithin is unchanged: it
+			// divides whatever Size it is handed, and only the source of Size moved.
 			region.Used, region.UsedKnown = topUsedWithin(record.RSSBytes, reserve.Bytes)
 			drawn = append(drawn, region)
 			offset += reserve.Bytes
-		case topReserveUncapped:
-			uncapped++
-		default:
+		} else {
 			unevaluated++
 		}
 		// The CPU stack is built from the SAME slot in the SAME order with the SAME
 		// colour, and is deliberately independent of the RAM stack's own gates: a
-		// scope whose memory.max is `max` has no RAM width to draw but a perfectly
-		// real CPU rate, and dropping it from this bar because the other bar could
-		// not place it would understate the slice's CPU.
+		// scope whose reserve the ledger cannot name has no RAM width to draw but a
+		// perfectly real CPU rate, and dropping it from this bar because the other
+		// bar could not place it would understate the slice's CPU.
 		if !rateKnown {
 			cpuUnevaluated++
 			continue
@@ -597,13 +622,13 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		})
 		cpuClaimed += rate
 	}
-	if uncapped > 0 {
-		notes = append(notes, fmt.Sprintf("%d uncapped %s not drawn (memory.max is `max`, so the claim has no width)",
-			uncapped, confinePlural(uncapped, "scope", "scopes")))
-	}
+	// AIRA-192. ONE undrawn category now, because there is one reason: the daemon
+	// published no reserve for that scope. The note says so rather than leaving an
+	// operator to read a shorter stack as a quieter machine — the stack understates
+	// the slice by exactly these jobs, and that is a fact to state, not to hide.
 	if unevaluated > 0 {
-		notes = append(notes, fmt.Sprintf("%d %s with an unevaluated cap not drawn",
-			unevaluated, confinePlural(unevaluated, "scope", "scopes")))
+		notes = append(notes, fmt.Sprintf("%d %s with an unevaluated reservation not drawn (the daemon holds no admission record for %s)",
+			unevaluated, confinePlural(unevaluated, "scope", "scopes"), confinePlural(unevaluated, "it", "them")))
 	}
 	model.Bar = topBarFor(result.SliceReserve, drawn, offset, notes)
 	model.CPUBar = topCPUBarFor(result.SliceReserve, previous.CPU, next.CPU, delta, cpuDrawn, cpuClaimed, cpuUnevaluated)
