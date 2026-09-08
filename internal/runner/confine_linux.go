@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"math/bits"
 	"net"
 	"os"
@@ -1441,7 +1442,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
 	// Only an OWN-limit OOM may reach the "job OOM-killed at its memory cap" line
 	// (AIRA-102). Its other branch -- peak RSS near the cap -- is unaffected.
-	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, confineOwnCapAdviceWarranted(usage), result.Status.ScopeMemoryCapSource); advisory != "" {
+	// AIRA-184. CapBytes is the SLICE's own finite cap, established by deps.readCap
+	// before this job launched (and a launch precondition, so it is set on every
+	// path that can reach a kill here) -- deliberately not ScopeMemoryMax, which is
+	// this job's own cap and is already the advisory's first argument.
+	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, confineOwnCapAdviceWarranted(usage), result.Status.ScopeMemoryCapSource, result.Status.CapBytes); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
 	// The remaining attributions get their OWN line, deliberately NOT gated on
@@ -1555,7 +1560,26 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 // The source is the recorded provenance of the cap that was written, never a
 // guess: an unevaluated source gets the original source-agnostic wording, which
 // names both possibilities rather than picking one.
-func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool, capSource string) string {
+//
+// AIRA-184 sharpened the ESTIMATED-cap case, which cap-source could already
+// name but only implicitly. The reported incident is a job killed ~12 KiB over
+// a cap AIRA itself had estimated, on a slice with tens of GiB spare, whose only
+// stated remedy was "re-run and it will be sized higher" — true, but it leaves
+// the reader to work out both that the number was never theirs and what to pin
+// instead. Three things are now said outright: that the cap was an AUTO-ESTIMATE
+// rather than an operator pin, what the slice's own cap is, and a concrete
+// --memory-reserve to pin now.
+//
+// sliceCapBytes is the slice's own finite cap (ConfineStatus.CapBytes, the
+// figure deps.readCap established before the launch). What it supports is one
+// precise claim — whether the enforced cap had room ABOVE it inside the slice —
+// and the wording never goes past that. In particular it is NOT a claim that
+// the slice was idle at kill time: what the slice's other jobs were holding is
+// the daemon's ledger to know, is not established here, and a post-kill read
+// would in any case measure a slice this job's own memory has already left. An
+// unestablished slice cap (0) is reported as unevaluated rather than assumed
+// roomy, so no run gets a fabricated headroom claim.
+func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool, capSource string, sliceCapBytes int64) string {
 	if scopeMemoryMax <= 0 {
 		return ""
 	}
@@ -1577,10 +1601,35 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 			return head + "; cap-source=" + capSource + " — this cap is YOUR OWN --memory-reserve, not an AIRA estimate, " +
 				"so re-running the identical command will not change it. Raise that flag, or split heavy work."
 		case ConfineCapSourceDaemonReserve:
-			return head + "; cap-source=" + capSource + " — AIRA chose this cap from this command's peak-RSS history, you did not. " +
-				"The kill has now been recorded against this command's signature, so RE-RUN THE IDENTICAL COMMAND and the next " +
-				"admission is sized higher on its own. If an identical re-run is killed at the same cap again, that is a genuine " +
-				"bug worth reporting. Pass --memory-reserve/--memory-max to skip the cycle."
+			// AIRA-184. Deliberately NOT "from this command's peak-RSS history",
+			// which the previous wording asserted unconditionally and which is false
+			// for the commonest shape here: a cold start capped at the machine-wide
+			// `estimate:p90-prior`, or at a `fallback:` prior, where this command has
+			// no history at all. The trailer's own reserve-basis field, printed
+			// directly above this line, says which term produced the number; this
+			// line claims only what every branch of that path has in common — AIRA
+			// chose it, the caller did not.
+			estimate := head + "; cap-source=" + capSource +
+				" — this cap is AIRA's OWN AUTO-ESTIMATE of what this command needs, not a limit you set"
+			suggested := confineSuggestedReserve(scopeMemoryMax, peakRSS)
+			if sliceCapBytes > 0 && suggested >= sliceCapBytes {
+				// skill.go documents this as the one case the re-run cannot heal: the
+				// escalated reserve is already at or past what the slice can grant, so
+				// admission refuses it terminally rather than running it. Telling this
+				// reader to re-run, or handing them a pin that cannot be admitted,
+				// would send them round a cycle that cannot converge.
+				return estimate + ", but this slice's own cap is " + FormatConfineBytes(sliceCapBytes) +
+					", so a materially higher reserve is more than this slice can grant: it is refused E_ADMIT_TOO_LARGE " +
+					"rather than run, so split heavy work, or run where the slice is larger."
+			}
+			room := "; this slice's own cap could not be established, so whether the slice had room above the estimate is unevaluated"
+			if sliceCapBytes > 0 {
+				room = ", and this slice's own cap is " + FormatConfineBytes(sliceCapBytes) +
+					", so what bound this job was the estimate and not the slice ceiling"
+			}
+			return estimate + room + ". The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL COMMAND " +
+				"and the next admission is sized higher on its own, or pin --memory-reserve " + FormatConfineBytes(suggested) +
+				" now to skip the cycle. If an identical re-run is killed at the same cap again, that is a genuine bug worth reporting."
 		case ConfineCapSourceDelegateRAM:
 			return head + "; cap-source=" + capSource + " — this is --delegate-ram's whole-scope ceiling, chosen by AIRA rather than " +
 				"by you, and it climbs with this signature's recorded peaks: RE-RUN THE IDENTICAL COMMAND before changing anything. " +
@@ -1598,6 +1647,53 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 		return fmt.Sprintf("confine: peak RSS %s reached %d%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", peak, confinePercentOfCap(*peakRSS, scopeMemoryMax), FormatConfineBytes(scopeMemoryMax))
 	}
 	return ""
+}
+
+// confineSuggestedReserve is the concrete --memory-reserve the estimated-cap OOM
+// advisory hands over (AIRA-184), so the reader is not left to derive a number
+// from two byte counts on a trailer.
+//
+// It is AIRA's OWN escalation, not a second opinion: 1.5x, the same factor the
+// daemon applies to a recorded OOM peak when it sizes the next admission
+// (`estimate:oom-escalated`, admit.go). Pinning it therefore skips exactly one
+// self-heal cycle rather than steering the job somewhere the estimator would
+// not have gone by itself.
+//
+// The base is the LARGER of the enforced cap and the measured peak. A job can
+// overshoot its cap before the kill lands — the reported incident overshot by
+// ~12 KiB — and escalating the cap alone would suggest a reserve below the
+// footprint this very run already demonstrated.
+//
+// The result is rounded UP to a whole MiB and floored at 1 MiB: below that
+// `--memory-reserve` refuses the value outright, and a non-round figure renders
+// as a raw byte count instead of a unit the reader can retype. Both the
+// multiply and the round-up saturate rather than wrap.
+func confineSuggestedReserve(scopeMemoryMax int64, peakRSS *int64) int64 {
+	const mib = int64(1) << 20
+	base := scopeMemoryMax
+	if peakRSS != nil && *peakRSS > base {
+		base = *peakRSS
+	}
+	if base < mib {
+		return mib
+	}
+	escalated := base
+	if escalated > math.MaxInt64-escalated/2 {
+		escalated = math.MaxInt64
+	} else {
+		escalated += escalated / 2
+	}
+	if remainder := escalated % mib; remainder != 0 {
+		if escalated > math.MaxInt64-(mib-remainder) {
+			// int64 holds no whole MiB above this one, so the largest one below it
+			// is the only representable suggestion left. It is under the saturated
+			// value by less than 1 MiB, on a figure already at the top of the range.
+			escalated -= remainder
+		} else {
+			escalated += mib - remainder
+		}
+	}
+	return escalated
 }
 
 // confinePercentOfCap returns floor(peak*100/cap) exactly, for any peak and cap
