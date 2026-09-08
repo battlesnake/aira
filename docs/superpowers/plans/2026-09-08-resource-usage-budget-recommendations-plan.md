@@ -587,8 +587,236 @@ would be the feature withholding the one thing it is certain about.
    `marginBucket`.
 5. Two thin faces: `insightRegistry` row; `confine` management form.
 
+## 5s. Plan-gate round 2 — Astra + Fable blocking findings, resolved
+
+Two orthogonal review passes ran against 5r. Both raised blocking findings;
+all four are accepted and resolved below. Every one is a correction to 5r,
+not a redesign, and each is re-verified against `master` at `c7e4e7b`.
+
+### 5s.1 Astra — pool capture was scoped to the CRASH path only (ACCEPTED)
+
+5r.7.3 said "read `memory.peak` beside the existing `_describe_worker_death`
+call in `_handle_worker_exit`'s ordering". Re-verified: `_describe_worker_death`
+has exactly one caller, `_handle_worker_exit` (`supervisor.py:2012`), and
+`_handle_worker_exit` is reached **only** when a worker stops reporting
+without a terminating record — a crash. The two ORDINARY retirement paths,
+recycling after a completed test (`:1844`) and the end-of-run `__stop__`
+broadcast (`:2293`), never reach it. A clean run with zero worker crashes —
+the common case, and precisely the case needed to observe over-provisioning —
+would record nothing at all, leaving a sample set skewed entirely toward
+crashes, which can only ever look under-provisioned.
+
+**Resolved: capture moves into `_retire_worker`**, beside its own existing
+`grant = state.get("grant")` fetch (`:1485`) and before
+`_forget_worker_scope`'s `os.rmdir`. That is the single point every
+retirement funnels through — all three call sites — and the grant (hence
+`memory_max`, the budget term) is already in hand there.
+
+### 5s.2 Aggregation: one report per RUN, not one per retirement
+
+Following directly from 5s.1, and settling correction (e)'s "new report
+path" concretely. `_retire_worker` fires on every recycle, so a report
+subprocess per retirement would put a fork on the dispatch loop's hot path.
+Instead `_retire_worker` folds each worker's `memory.peak` and its own
+`memory.events` `oom_group_kill` into a per-run accumulator (max peak, any-OOM,
+the granted per-worker `memory.max`), and `run()` emits **one** pool sample
+after the dispatch loop through a new CLI verb `aira worker-peak`, invoked
+with the binary already named by `AIRA_AITEST_WORKER_ADMIT_CMD`. One
+subprocess per suite run, not per worker.
+
+This is also the honest granularity. The budget is per-worker
+(`AIRA_AITEST_ESTIMATED_BYTES` sizes each worker's `memory.max`), so the
+like-for-like observation is the largest peak any worker in the pool reached,
+compared against that per-worker cap. One sample per run matches the confine
+side exactly, so the shared ≥3-sample gate means the same thing on both.
+
+Fail-open throughout: an unreadable `memory.peak`, an absent grant, a missing
+relay binary or a non-zero relay exit are all silent no-ops on the suite. A
+sample is never fabricated — an unreadable peak records nothing rather than a
+zero.
+
+**Pool key defined** (Fable's third non-blocking point). The aitest subject
+key is the pytest **rootdir** followed by the invocation arguments, joined by
+the ASCII unit separator (`\x1f` — NOT the NUL `runner.ResourceSignature` uses:
+this key travels as an argv element to the `aira worker-peak` relay, and argv
+strings are NUL-terminated, so a NUL would silently truncate it at the first
+separator; the build corrected this and `supervisor.py` states it). Unlike a confine
+signature, which is argv-only and therefore collides across projects (5r.6), a
+key that leads with the rootdir does **not** collide across projects; the gauge
+states both facts rather than implying either. `pytest-worker:<suite-hash>`
+from the aitest spec is not used: the `kind` column already namespaces these
+rows (Decision 1), so a prefix would be a second, redundant namespacing
+mechanism, and an opaque hash would make the subject unreadable on the
+operator surface for no gain.
+
+### 5s.3 Fable blocking 1 — per-ROW budget, classified as if it were one
+budget (ACCEPTED)
+
+Decision 1 persists `budget` per row, but Decision 4 computed a single
+`budget / MAX(window)` and Decision 5 said "any OOM on record ⇒ under,
+regardless". `classifyAdmissionAdequacy` buckets per sample
+(`admission_insight.go:38-50`) precisely so this cannot happen. Fable's
+counterexample is the ticket's own qual sequence: 40G → 30G (OOM) → 40G. The
+30G OOM row sits in the 20-row window for up to 20 more runs and the surface
+says "under-provisioned, raise" for all of them — after the caller already
+raised.
+
+**Resolved, with no new durable state:**
+
+- **Current budget** is the newest sample carrying a non-NULL budget (Face 2
+  may override it with the budget a caller is about to request — the
+  pre-flight question). If no sample carries one, the subject is
+  `unevaluated`, never zero.
+- **Every row is bucketed individually** into exactly one of: its
+  `marginBucket(budget, peak)` bucket, or one named exclusion
+  (`budget_unknown`, `basis_family_mismatch`, `oom_at_or_above_current`,
+  `oom_below_current`, `missing_peak`). The bucket counts are published.
+- **The OOM bypass is scoped**: only an OOM row whose own budget is
+  `>= current budget` is evidence that the CURRENT budget is short. An OOM at
+  a smaller budget is recorded and counted (`oom_below_current`) but proves
+  nothing about a larger one.
+- **OOM rows never feed the over-provisioned direction.** An OOM-killed run's
+  peak is truncated at its own cap — a lower bound on demand, not a
+  measurement — so treating it as a peak could produce "over-provisioned,
+  lower it" from evidence that the job was killed. Only clean rows contribute
+  to the observed max.
+- The headline direction is `marginBucket(currentBudget, maxCleanPeak)`, with
+  the per-row buckets published beside it as the evidence.
+
+### 5s.4 Fable blocking 2 — `budget` conflated reserve with `memory.max`
+(ACCEPTED)
+
+5r.1 wrote "the reserve/`memory.max` actually granted" as if one quantity.
+They diverge on real launches (AIRA-192 was filed the same day on exactly this
+distinction). Verified where: for a NON-delegate job `ResolveConfineReserve`
+sets the reserve **to** `--memory-max` (`confine.go:124-127`) and the cap is
+then the declared reserve or the daemon grant, so the two agree. They diverge
+for `--delegate-ram`, whose reserve is deliberately framework overhead
+(`DefaultDelegateRAMOverhead`) while the cap is the learned scope ceiling.
+
+**Resolved: one quantity per row, with the family named in `budget_basis`,
+and families never mixed inside one classification.**
+
+- `budget` is the **enforced scope cap** when one was written —
+  `ScopeMemoryMax > 0` — with `budget_basis = "cap:" + ScopeMemoryCapSource`,
+  reusing the existing AIRA-133 cap-source vocabulary
+  (`operator:--memory-max`, `operator:--memory-reserve`, `daemon:reserve`,
+  `delegate-ram`) rather than minting a second one.
+- Otherwise it is the **granted reserve**, `budget_basis = "reserve:" +
+  ReserveBasis`. This is the genuinely uncapped case (an unpinned,
+  non-daemon-admitted job): the number is a ledger booking, not a bound, and
+  saying so is the point.
+- aitest rows are always `cap:aitest:env:set` or `cap:aitest:env:default` —
+  the per-worker `memory.max` really is a kernel-enforced bound.
+- Neither term available ⇒ `budget` is NULL and the row reads
+  `budget_unknown`, never a fabricated zero.
+- The classifier partitions a subject's rows by basis family and classifies
+  only the current family, counting the rest as `basis_family_mismatch`. So a
+  `cap:`-derived ratio can never be summarised together with a `reserve:`-derived
+  one even when one signature has been launched both ways.
+
+### 5s.5 Fable blocking 3 — tests named per invariant (ACCEPTED)
+
+5r.7 named one test. The build ships one named test per invariant below;
+each is listed with the direction it guards.
+
+1. `TestResourceBudgetNeverWrites` — the classifier and both faces issue zero
+   writes (read-only DB handle), and `Recommendation` is text + `Drilldown`
+   only. False-pass direction: a classifier that silently applied a reserve.
+2. `TestResourceBudgetBoundariesReuseMarginBucket` — exact 1.25 and 2.0
+   boundaries, reusing the existing table's values.
+3. `TestResourceBudgetOOMAtOrAboveCurrentBypassesSampleGate` — one OOM at
+   `budget >= current` classifies under-provisioned at n=1.
+4. `TestResourceBudgetOOMBelowCurrentDoesNotRecommendRaising` — Fable's own
+   40G → 30G(OOM) → 40G counterexample; must NOT say "raise".
+5. `TestResourceBudgetInsufficientSamplesIsUnevaluatedNotWarning` — n<3 with
+   no OOM reads `fallback:insufficient-samples:n=N`.
+6. `TestResourceBudgetNullBudgetIsUnevaluatedNotZero`.
+7. `TestResourceBudgetMigrationBackfillsKindConfine` — a pre-existing row
+   reads `kind='confine'`, budget NULL, under the AIRA-97 concurrent-opener
+   guard.
+8. `TestConfinePeakRetentionIsPerKindAndSignature` — a 21st aitest row must
+   not evict a confine row sharing the signature string.
+9. `TestConfinePeakP90IgnoresNonConfineKinds` — a `pytest-worker` row cannot
+   move the live admission prior.
+10. `TestResourceBudgetRefusesMixedBasisFamilies` — `cap:` and `reserve:`
+    rows are never summarised together.
+11. Python: `test_retire_worker_records_pool_peak_on_every_path` (all three
+    retirement call sites), `test_pool_peak_read_precedes_rmdir`,
+    `test_unreadable_pool_peak_records_nothing` (nil, not zero).
+12. `TestSkillNamesNothingFromTheRetiredXdistGovernor` stays green.
+
+### 5s.6 Fable non-blocking, accepted
+
+- Face 2 is a NEW dispatch verb `confine-budget` with its own CLI arm, MCP
+  tool `aira_confine_budget` and Skill registration — exactly as
+  `confine-list`/`confine-kill` are their own verbs. v1 answers for every
+  subject at once, sorted worst-first, so no signature selector has to be
+  typed; a NUL-joined argv is not a usable command-line argument.
+- Face 1's data path is stated: the peak-history readers live on `*DB`
+  (`store.go:114`) and gauges on `*Store` (`:136`), reached through the
+  `owner` handle `NewScope` already stores. A `*Store` with no owner reads
+  `unevaluated`, never empty. Face 2 goes via the daemon, which holds the
+  same `*DB`.
+
+### 5s.7 Revised build scope (supersedes 5r.7)
+
+1. Schema: three guarded ADD COLUMNs + `(kind, signature)` index; all four
+   existing readers filtered on `kind`; retention DELETE scoped to
+   `(kind, signature)`.
+2. Capture, confine side: `budget`/`budget_basis` on the `confine-report`
+   frame, sourced per 5s.4.
+3. Capture, aitest side: per-worker fold in `_retire_worker` (5s.1), one
+   pool sample per run through the new `aira worker-peak` verb (5s.2).
+4. One pure classifier in `internal/store`, `GaugeResult`-shaped, reusing
+   `marginBucket`, per-row bucketing per 5s.3.
+5. Two faces: `insightRegistry` row `resource-budget`; dispatch verb
+   `confine-budget` on CLI + MCP + Skill.
+
+## 5t. Final build-review (Fable, 2026-09-09) — two findings, fixed before merge
+
+Independent re-derivation of every 5r/5s claim against PR #121's diff. Both
+faces are real dispatch verbs with their own wiring; the report-only guarantee
+holds (no write path anywhere in the classifier or either face; asserted as a
+SQLite `total_changes()` count on both); the `aira_mem` boundary is untouched;
+`_retire_worker` is the single retirement funnel (three callers: recycle,
+crash, end-of-run stop — the two out-of-band `_forget_worker_scope` calls are
+placement failures for workers that ran nothing); `cap:`/`reserve:` families
+are never summarised together. Two findings survived:
+
+1. **Porous load-bearing test (5r.1's own mandated regression).**
+   `TestConfinePeakP90IgnoresNonConfineKinds` PASSED against a mutant with the
+   `kind` filter deleted from `ConfinePeakP90`: its 12 pools, 10 sharing a
+   confine signature, left the unfiltered reader with 12 maxima whose
+   nearest-rank p90 index still lands on 900. Fixed by fixture size (30 pools
+   on distinct signatures → unfiltered answer 600 ≠ 900); the mutant now fails.
+   The production filter was always present — this is a test-strength fix.
+2. **Wrong advice on the common suite launch shape (5s.4 gap).** 5s.4 chose
+   "cap wins" and listed `delegate-ram` among reusable cap sources without
+   deciding what a `cap:auto:delegate-ram` row should recommend. That ceiling
+   is daemon-derived (`resolveDelegateRAMScopeCeiling`: 1.15×history,
+   floor-clamped to 4G, 48G with no history) and the job's slice booking is the
+   pinned overhead — so every delegate-ram suite peaking under 2G read
+   `over-provisioned, consider --memory-reserve N`, which on a delegate-ram job
+   overrides the framework overhead: a false verdict with advice that
+   manufactures the whole-suite reservation `--delegate-ram` exists to avoid.
+   Fixed in the classifier: that basis's lowering direction reads
+   `unevaluated` with reason `delegate-ram:ceiling-not-a-budget` (evidence
+   still published); the OOM/raise direction stays live and names
+   `--memory-max`. Test: `TestResourceBudgetDelegateRAMCeilingIsNotABudget`,
+   with the ordinary-cap false-pass direction beside it.
+
+Also fixed: Face 2's human render dropped every `UnevaluatedReason` (only
+`--json` carried it), so an `unevaluated` row gave no reason; it now prints
+one line per unevaluated subject, and the render has a test. Accepted gap,
+recorded: the Python tests prove the fold in `_retire_worker` directly rather
+than by driving the three call sites end-to-end; the funnel property is a
+source-level fact (grep) and was verified that way.
+
 ## 6. Status
 
-Planning only — **§5 now resolved (5r), 2026-09-09**. Not yet built. The
-five gate decisions above, the four source corrections in 5r.0, and the
-deferrals in 5r.6 are binding on the build.
+Planning resolved — **§5 resolved (5r) 2026-09-09; review round 2 resolved
+(5s) 2026-09-09; final build-review (5t) 2026-09-09**. The five gate
+decisions, the four source corrections in 5r.0, the four review resolutions in
+5s.1–5s.5, the two 5t fixes, and the deferrals in 5r.6 are binding on the
+build.

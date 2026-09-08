@@ -17,8 +17,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 74 {
-		t.Fatalf("actions=%d, want 74", len(artifacts.Actions))
+	if len(artifacts.Actions) != 75 {
+		t.Fatalf("actions=%d, want 75", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -163,7 +163,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"insights/ls":   SafetyRead, "insights/show": SafetyRead,
 		"test-report/add": SafetyMutate, "test-report/ls": SafetyRead, "test-report/show": SafetyRead, "test-report/flaky": SafetyRead,
 		"run": SafetyExecute, "run-input": SafetyExecute, "run-kill": SafetyExecute, "run-log": SafetyRead,
-		"confine-list": SafetyRead, "confine-kill": SafetyExecute,
+		"confine-list": SafetyRead, "confine-kill": SafetyExecute, "confine-budget": SafetyRead,
 		// AIRA-176. The asymmetry is the point: register is the only writer of a
 		// binding, audit writes nothing at all and must stay SafetyRead.
 		"worktree-register": SafetyMutate, "worktree-audit": SafetyRead,

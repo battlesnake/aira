@@ -98,6 +98,7 @@ var insightRegistry = []Gauge{
 	{Name: "quota-burn", Title: "Latest quota use and burn by provider", Kind: GaugeKindRate},
 	{Name: "command-latency", Title: "Recorded command latency by key", Kind: GaugeKindDuration},
 	{Name: "traceability-status", Title: "Requirement traceability status", Kind: GaugeKindDistribution},
+	{Name: resourceBudgetName, Title: resourceBudgetTitle, Kind: GaugeKindDistribution},
 }
 
 func init() {
@@ -121,6 +122,8 @@ func init() {
 			insightRegistry[i].Compute = computeCommandLatencyByKeyPair
 		case "traceability-status":
 			insightRegistry[i].Compute = computeTraceabilityStatus
+		case resourceBudgetName:
+			insightRegistry[i].Compute = computeResourceBudget
 		}
 	}
 }

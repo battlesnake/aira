@@ -44,7 +44,7 @@ func Classify(verb, selector string) (string, Route) {
 		return canonical, RouteClient
 	case canonical == "time":
 		return canonical, RouteClient
-	case canonical == "confine" || canonical == "confine-reserve" || canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-status" || canonical == "eject":
+	case canonical == "confine" || canonical == "confine-reserve" || canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" || canonical == "confine-status" || canonical == "eject":
 		return canonical, RouteClient
 	// AIRA-185. `drain` joins the confine family: it launches a real confine job
 	// in the CALLER's own process (that is what makes its hold connection-bound),
@@ -126,7 +126,7 @@ func StoreFreeCarved(verb string, args map[string]any) bool {
 			}
 		}
 		return true
-	case "run-kill", "run-log", "run-input", "git", "confine", "confine-reserve", "confine-list", "confine-kill", "confine-status", "drain", "eject":
+	case "run-kill", "run-log", "run-input", "git", "confine", "confine-reserve", "confine-list", "confine-kill", "confine-budget", "confine-status", "drain", "eject":
 		return true
 	case "show":
 		selector, _ := args["selector"].(string)

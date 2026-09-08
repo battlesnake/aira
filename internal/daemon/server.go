@@ -782,6 +782,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = s.reply(conn, responseFrame(s.confineReport(request.Request.Args)))
 		return
 	}
+	if verb == "confine-budget" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = s.reply(conn, responseFrame(s.confineBudget(request.Request.Args)))
+		return
+	}
 	if verb == "confine-list" || verb == "confine-kill" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)

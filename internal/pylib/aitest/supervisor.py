@@ -33,6 +33,68 @@ _SPECULATIVE_MAX_WAIT = "0s"
 # continuously ready, so the timeout branch may never be taken at all and a
 # probe attached to it would never fire (Sol plan-review).
 _GROWTH_PROBE_INTERVAL_SECONDS = 1.0
+
+# AIRA-180. The pool-usage subject key separator. It is NOT the NUL byte a
+# confine ResourceSignature joins with, for one hard reason: this key travels as
+# an argv element to the `aira worker-peak` relay, and argv strings are
+# NUL-terminated -- a NUL would silently truncate the key at the first
+# separator, collapsing every pool in a repository into one subject. \x1f (ASCII
+# unit separator) is argv-safe and just as absent from real paths and pytest
+# arguments.
+_POOL_KEY_SEPARATOR = "\x1f"
+# One relay invocation per RUN (not per worker), so this bound is generous
+# without ever sitting on the dispatch loop.
+_POOL_REPORT_TIMEOUT_SECONDS = 10.0
+
+
+def _read_cgroup_int(path):
+    """One non-negative integer from a cgroup file, or None.
+
+    None means "could not be established" and is propagated as such: this whole
+    capture path records an absence rather than a zero, because a fabricated
+    zero peak would make a pool look infinitely over-provisioned to the
+    classifier that reads it."""
+    try:
+        # errors="replace" for the same reason _describe_worker_death uses it: a
+        # decode failure is a ValueError, which OSError does not catch, and must
+        # not take the dispatch loop down.
+        with open(path, encoding="ascii", errors="replace") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _scope_oom_group_killed(scope):
+    """True/False if this scope's own memory.events settles the question,
+    else None.
+
+    Attribution is sound because memory.events counters are per-scope and
+    propagate only upward: oom_group_kill > 0 on THIS scope means THIS scope's
+    own memory.oom.group fired, not an ancestor's. Factored out of
+    _describe_worker_death so the pool-usage capture reads the same file the
+    same way rather than growing a second, drifting parser."""
+    if not scope:
+        return None
+    try:
+        with open(
+            os.path.join(scope, "memory.events"), encoding="ascii", errors="replace"
+        ) as handle:
+            events = handle.read()
+    except OSError:
+        return None
+    for line in events.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "oom_group_kill":
+            try:
+                return int(parts[1]) > 0
+            except ValueError:
+                return None
+    return None
 # How often (in retry attempts, i.e. roughly every N seconds at the above
 # interval) to remind stderr that a run is stalled waiting on a reachable
 # but saturated daemon -- see _wait_for_admission_or_disable, shared by
@@ -611,6 +673,14 @@ class Supervisor:
         self._run_estimated_bytes = 0
         self._run_max_wait = "30s"
         self._run_worker_count = 1
+        # AIRA-180 pool-usage accumulator. One sample per RUN, folded from every
+        # worker retirement -- see _observe_worker_usage for why the fold lives
+        # in _retire_worker and why the report is emitted once at the end.
+        self._pool_peak_max = None
+        self._pool_peak_oom = False
+        self._pool_budget = None
+        self._pool_peak_samples = 0
+        self._pool_scoped_workers = 0
         # AIRA-64 growth probe bookkeeping.
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
@@ -1484,11 +1554,137 @@ class Supervisor:
             _terminate_process(state["admit_process"])
         grant = state.get("grant")
         if grant is not None:
+            # AIRA-180 §5s.1. The fold happens HERE, not beside
+            # _describe_worker_death, and the difference is load-bearing.
+            # _describe_worker_death is called only from _handle_worker_exit,
+            # which is reached only when a worker CRASHES. _retire_worker is the
+            # single point every retirement funnels through -- recycling after a
+            # completed test, the end-of-run __stop__ broadcast, and the crash
+            # path alike -- so capturing anywhere else would have produced a
+            # sample set skewed entirely toward crashes, which can only ever look
+            # under-provisioned, never over-provisioned. And it must precede
+            # _forget_worker_scope: that call rmdirs the scope, and memory.peak
+            # goes with it.
+            self._observe_worker_usage(grant)
             self._forget_worker_scope(grant["scope"])
         # An earlier retirement whose rmdir failed is still charging the ledger;
         # this is the natural moment to try again.
         self._sweep_unremoved_scopes()
         del self.workers[pid]
+
+    def _observe_worker_usage(self, grant):
+        """Fold ONE retiring worker's usage into this run's pool sample.
+
+        Pool granularity, deliberately not per-test (spec 3.1): a worker runs
+        many tests sequentially inside one cgroup with one memory.max, so the
+        budget that is actually granted and actually violated is per-worker. The
+        like-for-like observation is therefore the largest peak any worker in
+        this pool reached, compared against that per-worker cap. Per-test RSS
+        would need sampling inside each test and would reintroduce exactly the
+        per-test annotation burden AIRA-33 deliberately removed.
+
+        Every term is independently optional and an absent one stays absent. A
+        worker with no cgroup scope (a ledger-only ci-shim grant, or a
+        containment-stripped fallback worker) contributes nothing but its
+        retirement; an unreadable memory.peak contributes nothing rather than a
+        zero.
+        """
+        scope = grant.get("scope")
+        if not scope:
+            return
+        self._pool_scoped_workers += 1
+        memory_max = grant.get("memory_max")
+        # The budget recorded is the cap the daemon actually WROTE on this
+        # worker's scope, not what was asked for. Max across the pool because
+        # every worker in a run is granted the same figure; a divergence would
+        # mean the run was not uniformly sized, and the larger cap is the one an
+        # observed peak could actually have grown into.
+        if isinstance(memory_max, int) and memory_max > 0:
+            if self._pool_budget is None or memory_max > self._pool_budget:
+                self._pool_budget = memory_max
+        peak = _read_cgroup_int(os.path.join(scope, "memory.peak"))
+        if peak is not None and peak > 0:
+            self._pool_peak_samples += 1
+            if self._pool_peak_max is None or peak > self._pool_peak_max:
+                self._pool_peak_max = peak
+        if _scope_oom_group_killed(scope):
+            self._pool_peak_oom = True
+
+    def _pool_subject_key(self):
+        """This pool's durable subject key: the pytest rootdir followed by the
+        invocation arguments, joined by _POOL_KEY_SEPARATOR.
+
+        Leading with the rootdir is what makes an aitest key project-scoped. A
+        confine ResourceSignature is argv-only with no cwd term, so `make test`
+        in two repositories is ONE subject there; this key is not, and the
+        surface that reports both says so rather than implying either.
+
+        Empty when there is no pytest config to read it from (Slice 1's own
+        tests construct Supervisor(config=None)), which suppresses the report
+        entirely rather than inventing a key."""
+        config = self.config
+        if config is None:
+            return ""
+        root = getattr(config, "rootpath", None)
+        if root is None:
+            root = getattr(config, "rootdir", None)
+        if root is None:
+            return ""
+        invocation = getattr(config, "invocation_params", None)
+        args = getattr(invocation, "args", ()) if invocation is not None else ()
+        parts = [str(root)] + [str(argument) for argument in args or ()]
+        # A separator inside a path or argument would forge a key boundary. It
+        # cannot occur in practice; stripping it keeps that true by construction
+        # rather than by assumption.
+        return _POOL_KEY_SEPARATOR.join(
+            part.replace(_POOL_KEY_SEPARATOR, " ") for part in parts
+        )
+
+    def _report_pool_usage(self):
+        """Emit this run's ONE pool sample through the `aira worker-peak` relay.
+
+        One subprocess per RUN, not per retirement: _retire_worker fires on
+        every recycle, so a relay spawn there would put a fork on the dispatch
+        loop's hot path.
+
+        FAIL-OPEN in every direction. A missing relay binary, an unreadable
+        peak, no pytest config, a non-zero relay exit and a relay that hangs are
+        all silent no-ops on the suite: this is advisory telemetry, and a test
+        run must never fail because AIRA could not record how much memory it
+        used. Nothing is fabricated to fill a gap -- an absent term is simply
+        not sent, and the store records it as unevaluated."""
+        if self._pool_scoped_workers == 0:
+            # No worker in this run had a cgroup scope at all (ledger-only
+            # ci-shim, or a fully daemon-less fallback pool). There is no
+            # kernel-enforced budget and no peak to compare against one, so
+            # there is nothing honest to record.
+            return
+        signature = self._pool_subject_key()
+        if not signature:
+            return
+        command = os.environ.get("AIRA_AITEST_WORKER_ADMIT_CMD", "")
+        if not command:
+            return
+        argv = [command, "worker-peak", "--signature", signature]
+        if self._pool_peak_max is not None:
+            argv += ["--peak-rss", str(self._pool_peak_max)]
+        if self._pool_budget is not None:
+            # The basis names where the REQUEST came from (Decision 3 deferred a
+            # durable project-scoped knob, so env is the only origin there is),
+            # while the value is the cap actually written. `cap:` because a
+            # worker's memory.max is a real kernel-enforced bound.
+            origin = "set" if os.environ.get("AIRA_AITEST_ESTIMATED_BYTES") else "default"
+            argv += ["--budget", str(self._pool_budget), "--budget-basis", "cap:aitest:env:" + origin]
+        if self._pool_peak_oom:
+            argv.append("--oom")
+        try:
+            subprocess.run(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=_POOL_REPORT_TIMEOUT_SECONDS,
+                close_fds=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _forget_worker_scope(self, scope):
         """Remove one worker's cgroup scope, remembering it for retry on failure.
@@ -2051,31 +2247,12 @@ class Supervisor:
         scope = grant.get("scope")
         if not scope:
             return generic
-        try:
-            # errors="replace": a decode failure must not escape as a
-            # UnicodeDecodeError (a ValueError, which OSError does not catch)
-            # and take the dispatch loop down with it. Unreachable on today's
-            # kernels, which is exactly why it would never be found later --
-            # this function's contract is that EVERY uncertainty falls back to
-            # the generic sentence, and an exception is not a fallback.
-            with open(
-                os.path.join(scope, "memory.events"), encoding="ascii", errors="replace"
-            ) as handle:
-                events = handle.read()
-        except OSError:
-            return generic
-        killed = False
-        for line in events.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[0] == "oom_group_kill":
-                try:
-                    killed = int(parts[1]) > 0
-                except ValueError:
-                    return generic
-                break
-        else:
-            return generic
-        if not killed:
+        # _scope_oom_group_killed returns None for every uncertainty -- an
+        # unreadable or already-removed scope, an undecodable file, a kernel
+        # whose memory.events omits the counter -- and None collapses into the
+        # generic sentence here exactly as False does. A fabricated OOM claim
+        # would be worse than a vague true one.
+        if not _scope_oom_group_killed(scope):
             return generic
         return (
             "worker %d was killed by its own per-worker memory cap "
@@ -2291,6 +2468,10 @@ class Supervisor:
                     except BrokenPipeError:
                         pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
+        # AIRA-180. After the dispatch loop, so every worker has retired and
+        # folded its usage in, and before _cleanup_supervisor_scope so a slow
+        # relay cannot delay the rmdir retry. Fail-open: see _report_pool_usage.
+        self._report_pool_usage()
         self._cleanup_supervisor_scope()
         # ONE structurally complete pass, after every other path has had its
         # say -- see _synthesize_unevaluated_reports for why this is a single

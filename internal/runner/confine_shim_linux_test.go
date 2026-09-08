@@ -45,7 +45,7 @@ func shimUnitDeps() confineDeps {
 		writeScopeCPUWeight: func(Scope, int64) bool { panicSeam("writeScopeCPUWeight")(); return true },
 		readCap:             func(string) (int64, bool) { panicSeam("readCap")(); return 0, false },
 		readUsage:           func(string) cgroupUsage { panicSeam("readUsage")(); return cgroupUsage{} },
-		reportPeak: func(context.Context, ConfineRequest, string, *int64, bool) error {
+		reportPeak: func(context.Context, ConfineRequest, ConfinePeakReport) error {
 			panicSeam("reportPeak")()
 			return nil
 		},

@@ -23,7 +23,9 @@ func TestConfinePeakHistoryUnknownSamplesAndLastTwenty(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
 	exactSignature := "/bin/tool\x00 trailing "
-	if err := db.RecordConfinePeak(ctx, exactSignature, nil, true, base); err != nil {
+	if err := db.RecordConfinePeak(ctx, ResourcePeakObservation{
+		Kind: ResourcePeakKindConfine, Signature: exactSignature, OOM: true, At: base,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	stats, err := db.ConfinePeakHistory(ctx, exactSignature)
@@ -35,7 +37,10 @@ func TestConfinePeakHistoryUnknownSamplesAndLastTwenty(t *testing.T) {
 	}
 	for index := 1; index <= 25; index++ {
 		peak := int64(index)
-		if err := db.RecordConfinePeak(ctx, "bounded", &peak, index == 25, base.Add(time.Duration(index)*time.Second)); err != nil {
+		if err := db.RecordConfinePeak(ctx, ResourcePeakObservation{
+			Kind: ResourcePeakKindConfine, Signature: "bounded", Peak: &peak, OOM: index == 25,
+			At: base.Add(time.Duration(index) * time.Second),
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -52,7 +57,10 @@ func TestConfinePeakP90UsesPeakMaxAcrossUsableSignatures(t *testing.T) {
 	for signatureIndex := 1; signatureIndex <= 10; signatureIndex++ {
 		for sample := 0; sample < 3; sample++ {
 			peak := int64(signatureIndex * 100)
-			if err := db.RecordConfinePeak(ctx, string(rune('a'+signatureIndex)), &peak, false, base.Add(time.Duration(signatureIndex*10+sample)*time.Second)); err != nil {
+			if err := db.RecordConfinePeak(ctx, ResourcePeakObservation{
+				Kind: ResourcePeakKindConfine, Signature: string(rune('a' + signatureIndex)), Peak: &peak,
+				At: base.Add(time.Duration(signatureIndex*10+sample) * time.Second),
+			}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -60,7 +68,9 @@ func TestConfinePeakP90UsesPeakMaxAcrossUsableSignatures(t *testing.T) {
 	// This heavy signature has only two usable rows and must not enter the prior.
 	for sample := 0; sample < 2; sample++ {
 		peak := int64(10_000)
-		if err := db.RecordConfinePeak(ctx, "insufficient", &peak, false, base); err != nil {
+		if err := db.RecordConfinePeak(ctx, ResourcePeakObservation{
+			Kind: ResourcePeakKindConfine, Signature: "insufficient", Peak: &peak, At: base,
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -777,10 +777,22 @@ func writeRunnerAdmitBytes(w io.Writer, data []byte) error {
 	return nil
 }
 
-func reportConfinePeak(ctx context.Context, request ConfineRequest, signature string, peak *int64, oom bool) error {
-	if strings.TrimSpace(request.AdmitSocketPath) == "" || signature == "" {
+func reportConfinePeak(ctx context.Context, request ConfineRequest, report ConfinePeakReport) error {
+	if strings.TrimSpace(request.AdmitSocketPath) == "" || report.Signature == "" {
 		return errors.New("daemon report unavailable")
 	}
+	return ReportPeakSample(ctx, request.AdmitSocketPath, report)
+}
+
+// ReportPeakSample sends one usage sample to the daemon over the project-less
+// admit socket. Exported because the aitest supervisor's pool sample travels the
+// same verb through the `aira worker-peak` relay, and a second transport for the
+// same frame is exactly the kind of duplicate that drifts.
+func ReportPeakSample(ctx context.Context, socketPath string, report ConfinePeakReport) error {
+	if strings.TrimSpace(socketPath) == "" || report.Signature == "" {
+		return errors.New("daemon report unavailable")
+	}
+	request := ConfineRequest{AdmitSocketPath: socketPath}
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", request.AdmitSocketPath)
 	if err != nil {
@@ -792,9 +804,19 @@ func reportConfinePeak(ctx context.Context, request ConfineRequest, signature st
 	}
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "confine-report"
-	frame.Request.Args = map[string]any{"signature": signature, "oom": oom}
-	if peak != nil && *peak > 0 {
-		frame.Request.Args["peak_rss"] = *peak
+	frame.Request.Args = map[string]any{"signature": report.Signature, "oom": report.OOM}
+	if report.Kind != "" {
+		frame.Request.Args["kind"] = report.Kind
+	}
+	if report.Peak != nil && *report.Peak > 0 {
+		frame.Request.Args["peak_rss"] = *report.Peak
+	}
+	// The pair travels together or not at all: the daemon refuses half of it,
+	// because a budget with no provenance is a quantity the classifier cannot
+	// compare with anything.
+	if report.Budget != nil && *report.Budget > 0 && report.BudgetBasis != "" {
+		frame.Request.Args["budget"] = *report.Budget
+		frame.Request.Args["budget_basis"] = report.BudgetBasis
 	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return err

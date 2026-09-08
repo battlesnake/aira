@@ -197,7 +197,7 @@ type confineDeps struct {
 	readCap               func(string) (int64, bool)
 	signalSource          func() (<-chan os.Signal, func())
 	readUsage             func(string) cgroupUsage
-	reportPeak            func(context.Context, ConfineRequest, string, *int64, bool) error
+	reportPeak            func(context.Context, ConfineRequest, ConfinePeakReport) error
 	queuePosition         func(context.Context, ConfineRequest, string) (confineQueuePosition, bool)
 	// resolveMode is the AIRA-121 confinement-mode seam. Production is
 	// ResolveConfineMode, which reads the durable install-mode record; tests
@@ -1388,7 +1388,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	oomAttribution := classifyConfineOOM(usage)
 	if signature != "" {
 		reportCtx, cancelReport := context.WithTimeout(context.Background(), 250*time.Millisecond)
-		_ = deps.reportPeak(reportCtx, request, signature, usage.PeakRSS, oom)
+		// AIRA-180. The budget term travels with the sample. Before this, the
+		// reserve/cap a confine job was actually granted was persisted NOWHERE
+		// (confine_shim_linux.go says so in as many words), so a usage history
+		// could say what a command peaked at but never what it had been given —
+		// which left the over-provisioned direction, the reported pain, entirely
+		// unevaluable. Read off result.Status rather than re-derived, so the
+		// reported budget is the same number the trailer prints.
+		budget, budgetBasis := ConfineBudgetTerm(result.Status)
+		_ = deps.reportPeak(reportCtx, request, ConfinePeakReport{
+			Signature: signature, Peak: usage.PeakRSS, OOM: oom,
+			Budget: budget, BudgetBasis: budgetBasis,
+		})
 		cancelReport()
 	}
 	close(monitorStop)
