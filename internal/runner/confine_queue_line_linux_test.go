@@ -283,3 +283,118 @@ func TestConfineAdmissionWaitProbeIsCancelledByTheGrant(t *testing.T) {
 		t.Fatal("the launch was held by an in-flight queue-position probe")
 	}
 }
+
+// AIRA-181 + AIRA-186, on the line an operator actually reads. The clause tests
+// exercise the renderer; this one holds the WIRING, which no renderer test can:
+// the launch path must hand the note the figure the line already prints, or the
+// AIRA-186 clause cannot tell "the daemon resolved a different number" from "it
+// honoured the one you pinned".
+//
+// verifies: an unpinned wait states the resolved reserve the daemon substituted
+// for the printed hint, alongside the reserve held by the admitted jobs.
+func TestConfineAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.admitWaitDiagInterval = 5 * time.Millisecond
+	deps.queuePosition = func(context.Context, ConfineRequest, string) (confineQueuePosition, bool) {
+		return confineQueuePosition{
+			position: 1, queued: 9, aheadBytes: 0,
+			heldBytes: 52 << 30, heldJobs: 9, heldEstablished: true, ceilingBytes: 64 << 30,
+			resolvedReserve: 35 << 30,
+		}, true
+	}
+	got := waitForConfineDiagnostic(t, deps, ConfineRequest{})
+	// The head-of-queue reading that misled four sessions, now with the other
+	// population beside it.
+	if !strings.Contains(got, "queue position 1 of 9 by enqueue order, 0B queued ahead, 52G already granted across 9 admitted jobs / 64G slice ceiling") {
+		t.Fatalf("progress line does not put the queued and the granted populations side by side; stderr=%q", got)
+	}
+	// The printed figure is the unpinned hint (4G); the daemon is gating on 35G.
+	if !strings.Contains(got, "requested reserve 4G") {
+		t.Fatalf("the AIRA-51 hedge must survive; stderr=%q", got)
+	}
+	if !strings.Contains(got, "this job's own reserve resolves to 35G") {
+		t.Fatalf("the unpinned line must name the reserve the daemon actually resolved; stderr=%q", got)
+	}
+}
+
+// The wiring in the other direction. A PINNED request's resolved reserve is the
+// figure already at the head of the line, so it is not repeated — and a launch
+// path that passed 0 (or anything but its own reserve) instead of the printed
+// figure would repeat it on every tick. That is the mistake this test exists to
+// catch; it cannot be caught by testing the renderer alone.
+//
+// verifies: a pinned reserve the daemon honoured verbatim adds no second copy
+// of itself to the line, while the AIRA-181 clause is still rendered.
+func TestConfineAdmissionWaitLineDoesNotRepeatAPinnedReserve(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.admitWaitDiagInterval = 5 * time.Millisecond
+	deps.queuePosition = func(context.Context, ConfineRequest, string) (confineQueuePosition, bool) {
+		return confineQueuePosition{
+			position: 1, queued: 9, aheadBytes: 0,
+			heldBytes: 52 << 30, heldJobs: 9, heldEstablished: true, ceilingBytes: 64 << 30,
+			resolvedReserve: 4 << 30,
+		}, true
+	}
+	got := waitForConfineDiagnostic(t, deps, ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
+	if !strings.Contains(got, "reserve 4G, waited ") {
+		t.Fatalf("the pinned wording must survive; stderr=%q", got)
+	}
+	if strings.Contains(got, "this job's own reserve") {
+		t.Fatalf("a pinned figure already on the line must not be restated; stderr=%q", got)
+	}
+	if !strings.Contains(got, "52G already granted across 9 admitted jobs / 64G slice ceiling") {
+		t.Fatalf("the AIRA-181 clause must still be rendered; stderr=%q", got)
+	}
+}
+
+// The ci-shim launch composes its own progress line from its own goroutine, so
+// its wiring is a second, independent copy of the same seam. It gets the same
+// test rather than an assumption that the two paths agree.
+//
+// verifies: the shim's advisory wait line carries both new clauses AND applies
+// the same "already on the line" suppression — the second case being the one
+// that pins the shim's own copy of the wiring, since a shim that passed anything
+// but its own printed reserve would repeat a pinned figure on every tick.
+func TestShimAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing.T) {
+	shimDeps := func(resolved int64) confineDeps {
+		deps := shimUnitDeps()
+		deps.admitWaitDiagInterval = 5 * time.Millisecond
+		deps.queuePosition = func(context.Context, ConfineRequest, string) (confineQueuePosition, bool) {
+			return confineQueuePosition{
+				position: 1, queued: 9, aheadBytes: 0,
+				heldBytes: 52 << 30, heldJobs: 9, heldEstablished: true, ceilingBytes: 64 << 30,
+				resolvedReserve: resolved,
+			}, true
+		}
+		return deps
+	}
+	t.Run("unpinned-names-the-resolved-reserve", func(t *testing.T) {
+		got := waitForConfineDiagnostic(t, shimDeps(35<<30), ConfineRequest{})
+		if !strings.Contains(got, "waiting for advisory memory admission") {
+			t.Fatalf("the shim's own wait line was never printed; stderr=%q", got)
+		}
+		if !strings.Contains(got, "0B queued ahead, 52G already granted across 9 admitted jobs / 64G slice ceiling") {
+			t.Fatalf("the shim line does not name the admitted jobs' held reserve; stderr=%q", got)
+		}
+		if !strings.Contains(got, "this job's own reserve resolves to 35G") {
+			t.Fatalf("the shim line does not name the resolved reserve; stderr=%q", got)
+		}
+	})
+	t.Run("pinned-figure-is-not-repeated", func(t *testing.T) {
+		// The discriminating case for the shim's wiring: with its own printed
+		// reserve in hand the clause is suppressed, and with anything else — 0
+		// included — it says "resolves to 4G" beside a line that already says 4G.
+		got := waitForConfineDiagnostic(t, shimDeps(4<<30), ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
+		if !strings.Contains(got, "reserve 4G, waited ") {
+			t.Fatalf("the shim's pinned wording must survive; stderr=%q", got)
+		}
+		if strings.Contains(got, "this job's own reserve") {
+			t.Fatalf("a pinned figure already on the shim line must not be restated; stderr=%q", got)
+		}
+		if !strings.Contains(got, "52G already granted across 9 admitted jobs / 64G slice ceiling") {
+			t.Fatalf("the AIRA-181 clause must still be rendered on the shim line; stderr=%q", got)
+		}
+	})
+}

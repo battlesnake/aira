@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-186","project":"aira","title":"Unpinned reserve estimate has no relationship to the slice's own ceiling -- can request more than could ever be granted, indistinguishable from ordinary contention","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","estimator"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-186","project":"aira","title":"Unpinned reserve estimate has no relationship to the slice's own ceiling -- can request more than could ever be granted, indistinguishable from ordinary contention","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","estimator"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-193","to":"AIRA-186"}]}
 ---
 
 Peer report (split, 2026-09-08), verified from source. Framed by the

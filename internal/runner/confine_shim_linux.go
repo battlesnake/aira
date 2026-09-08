@@ -134,7 +134,9 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 			case <-admitWaitDone:
 				return
 			case <-ticker.C:
-				queueNote := confineQueueNote(ctx, deps, request, ShimConfineSlice, admitWaitDone)
+				// The shim line prints `reserve` verbatim too, so the same
+				// AIRA-186 "already on the line" test applies here.
+				queueNote := confineQueueNote(ctx, deps, request, ShimConfineSlice, reserve, admitWaitDone)
 				waited := int64(time.Since(start).Seconds())
 				select {
 				case <-admitWaitDone:

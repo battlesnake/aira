@@ -52,6 +52,33 @@ type confineQueuePosition struct {
 	// so an unrecognised or absent basis names NEITHER.
 	ceilingBasis string
 	memAvailable int64
+
+	// AIRA-181. The OTHER population — the jobs that are already ADMITTED, and
+	// the reserve they hold. aheadBytes above counts only the queued waiters in
+	// front, and at position 1 it is 0B by definition; four independent sessions
+	// read that as "nothing is blocking me", killed correctly-waiting jobs, and
+	// guessed their reserve down. The reserve standing between this job and
+	// admission is almost entirely the granted total, which the probe already had
+	// in its hands and threw away.
+	//
+	// heldEstablished is the honesty bit and is required: heldBytes 0 across
+	// heldJobs 0 is a real, informative reading on an empty-but-closed slice
+	// (a drain, a freeze, a collapsed ceiling), so a renderer must be able to
+	// tell it from the zero value of a struct nobody filled in.
+	//
+	// ceilingBytes is what one MORE job would face — the same figure, from the
+	// same reply, that `confine --list`'s own summary line prints. Zero is "not
+	// established" and must render as nothing, never as a ceiling of zero.
+	heldBytes       int64
+	heldJobs        int
+	heldEstablished bool
+	ceilingBytes    int64
+
+	// AIRA-186. This job's OWN resolved reserve, as the daemon has it. Zero is an
+	// absence: an older daemon, or no queued waiter to speak for. See
+	// ConfineSliceReserve.ResolvedReserveBytes for why the client cannot know
+	// this figure by itself while it waits.
+	resolvedReserve int64
 }
 
 // confineQueueProbeTimeout bounds one probe. It is deliberately far shorter
@@ -100,7 +127,13 @@ const confineQueueProbeTimeout = 2 * time.Second
 // a line no operator can act on onto every tick of a daemon-less wait, and
 // certainly not a zero, which would state that nothing is queued while this
 // very job waits in the queue.
-func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequest, slicePath string, waitDone <-chan struct{}) string {
+//
+// clientReserve is the figure the progress line ALREADY prints ahead of this
+// clause. It is passed in for one purpose (AIRA-186): to keep the resolved
+// reserve off the line when it is byte-for-byte the number already there, so a
+// pinned job is not told twice, while an unpinned job — whose printed figure is
+// a hint the daemon has already replaced — is told the real one.
+func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequest, slicePath string, clientReserve int64, waitDone <-chan struct{}) string {
 	if deps.queuePosition == nil {
 		return ""
 	}
@@ -182,7 +215,115 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// waiters in front — the reserve already GRANTED to running jobs is much
 	// larger and is not in it; a bare "reserved ahead" invites reading it as
 	// "the memory standing between me and admission", which it is not.
-	return fmt.Sprintf("%s, queue position %d of %d by enqueue order, %s queued ahead%s", pressure, position.position, position.queued, ahead, exclusiveNote)
+	//
+	// AIRA-181 closes the gap that wording could only warn about. The warning was
+	// correct and insufficient: naming what the figure is NOT left the reader to
+	// supply the figure it is, and four sessions supplied "nothing". The two
+	// clauses now sit together, each naming its own population in its own words —
+	// "queued ahead" for the waiters, "already granted across N admitted jobs"
+	// for the running set — so neither number can be mistaken for the other and
+	// the larger one is no longer missing. The vocabulary is deliberately
+	// `confine --list`'s own ("granted", "admitted jobs", "ceiling"), so an
+	// operator who cross-checks with that command reads the same nouns.
+	return pressure +
+		fmt.Sprintf(", queue position %d of %d by enqueue order, %s queued ahead", position.position, position.queued, ahead) +
+		confineHeldNote(position) + confineOwnReserveNote(position, clientReserve) + exclusiveNote
+}
+
+// confineHeldNote states what the ADMITTED jobs hold, against the ceiling one
+// more job faces (AIRA-181). Both figures come from the same probe reply that
+// carried the position, so this costs no round trip.
+//
+// It prints nothing at all when the daemon did not establish the pair. A zero
+// it DID establish is printed as "0B ... across 0 admitted jobs", because on a
+// slice that is closed for some other reason — a drain, a fairness freeze, a
+// ceiling collapsed by outside pressure — an empty running set is the single
+// most useful thing the line can say, and suppressing it would leave the
+// operator with the same "nothing is blocking me" reading this clause exists to
+// end.
+//
+// ACCEPTED GAP, stated rather than left for a reader to discover. Both figures
+// go through FormatConfineBytes, which picks whichever of T/G/M/K divides the
+// value EXACTLY and otherwise prints raw bytes. A granted total is a sum of live
+// ledger charges and is essentially never round in any unit, so this clause
+// routinely renders as an eleven-digit integer beside a rounded ceiling —
+// verified live: "54116871208 already granted across 5 admitted jobs / 52608M
+// slice ceiling". That still fixes what AIRA-181 is about (the blocker is now
+// NAMED, where before the line said only "0B queued ahead"), but it makes the
+// magnitude comparison harder than it should be on a line whose whole purpose is
+// being read at a glance.
+//
+// It is deliberately not fixed here. The remedy is the one the owner already
+// chose for the same problem on `aira top` — one fixed unit, rounded
+// (topFormatMegabytes, cmd/aira/tui_top.go) — and applying it to this line means
+// also moving AIRA-24's existing "queued ahead" figure, since two unit systems
+// in one sentence would be worse than either. That is a decision about what unit
+// the admission-wait line speaks, not part of the reporting these two tickets
+// asked for, so it is filed rather than smuggled in. See AIRA-193.
+func confineHeldNote(position confineQueuePosition) string {
+	if !position.heldEstablished {
+		return ""
+	}
+	held := "0B"
+	if position.heldBytes > 0 {
+		held = FormatConfineBytes(position.heldBytes)
+	}
+	jobs := "jobs"
+	if position.heldJobs == 1 {
+		jobs = "job"
+	}
+	note := fmt.Sprintf(", %s already granted across %d admitted %s", held, position.heldJobs, jobs)
+	// A ceiling that could not be established is left out rather than printed as
+	// "0B", which would state that the slice can admit nothing.
+	if position.ceilingBytes > 0 {
+		note += " / " + FormatConfineBytes(position.ceilingBytes) + " slice ceiling"
+	}
+	return note
+}
+
+// confineOwnReserveNote states this job's OWN resolved reserve against that same
+// ceiling (AIRA-186).
+//
+// Two different silences, on purpose:
+//
+//   - A reserve the daemon did not report is an absence and prints nothing. The
+//     client's own figure is NOT substituted: while unpinned it is a hint the
+//     daemon has already replaced, and printing it as "this job's own reserve"
+//     would name a number nothing is gating on — the fabrication this ticket is
+//     about, restated in the fix.
+//   - A resolved reserve identical to the figure already on the line (every
+//     pinned request) adds nothing, so it is not repeated. The comparison it
+//     would support is already available: the pinned figure is at the head of
+//     the line and the ceiling is in the clause above.
+//
+// The one case that always speaks is a reserve larger than the ceiling itself.
+// That is reachable while queued even though admission refuses `reserve >
+// ceiling` outright at enqueue: the ceiling is not fixed, and falls under
+// outside memory pressure or as more jobs are admitted and each takes its own
+// headroom. It is also the one state where waiting is futile in a way ordinary
+// contention is not, and it is exactly the distinction AIRA-186 asks the wait
+// site to make — so it is stated in full, with its own numbers, even when the
+// figure duplicates one already on the line.
+func confineOwnReserveNote(position confineQueuePosition, clientReserve int64) string {
+	if position.resolvedReserve <= 0 {
+		return ""
+	}
+	// "resolves to" is the news that the daemon chose a different number from the
+	// one printed at the head of the line; "is" states a figure the caller pinned
+	// itself. Saying "resolves to" for a pinned request would imply the daemon
+	// moved a number it honours verbatim.
+	verb := "is"
+	if position.resolvedReserve != clientReserve {
+		verb = "resolves to"
+	}
+	if position.ceilingBytes > 0 && position.resolvedReserve > position.ceilingBytes {
+		return fmt.Sprintf(", this job's own reserve %s %s — larger than the whole %s slice ceiling, so it is blocked by its own size and not by the jobs ahead of it; pin a smaller --memory-reserve",
+			verb, FormatConfineBytes(position.resolvedReserve), FormatConfineBytes(position.ceilingBytes))
+	}
+	if position.resolvedReserve == clientReserve {
+		return ""
+	}
+	return fmt.Sprintf(", this job's own reserve %s %s", verb, FormatConfineBytes(position.resolvedReserve))
 }
 
 // describeExclusiveJob names the exclusive job for the progress line. An unnamed
@@ -315,6 +456,25 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	if exclusive.ceilingThrottled && exclusive.ceilingBasis == "system-pressure" &&
 		!reserve.CeilingHeld && reserve.MemAvailableBytes > 0 {
 		exclusive.memAvailable = reserve.MemAvailableBytes
+	}
+	// AIRA-181. The running set's held reserve, from the SAME reply. Both figures
+	// are refused as a PAIR when either is negative: a negative granted total or
+	// job count is a ledger defect, and half of a self-contradictory pair on an
+	// operator-facing line is worse than no clause at all.
+	if reserve.GrantedBytes >= 0 && reserve.Jobs >= 0 {
+		exclusive.heldBytes, exclusive.heldJobs, exclusive.heldEstablished = reserve.GrantedBytes, reserve.Jobs, true
+	}
+	// The ceiling is carried independently of that pair: it is a separate reading
+	// and it is what AIRA-186's own-size comparison is made against, so a
+	// ledger-side absence must not take it away too. Zero or negative is "not
+	// established" and renders as nothing.
+	if reserve.CeilingBytes > 0 {
+		exclusive.ceilingBytes = reserve.CeilingBytes
+	}
+	// AIRA-186. Non-positive is an absence — an older daemon, or a waiter the
+	// daemon did not match — never a reserve of zero.
+	if reserve.ResolvedReserveBytes > 0 {
+		exclusive.resolvedReserve = reserve.ResolvedReserveBytes
 	}
 	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead
 	return exclusive, true

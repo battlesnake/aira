@@ -655,7 +655,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			case <-admitWaitDone:
 				return
 			case <-ticker.C:
-				queueNote := confineQueueNote(ctx, deps, request, path, admitWaitDone)
+				// `reserve` is passed as the figure this line ALREADY prints, so
+				// AIRA-186's clause can tell "the daemon resolved a different
+				// number" from "it honoured the one you pinned". It is never
+				// used as a stand-in for the resolved reserve itself.
+				queueNote := confineQueueNote(ctx, deps, request, path, reserve, admitWaitDone)
 				// Sampled AFTER the probe, which can take up to its own
 				// timeout: reading the clock first would under-report the wait
 				// by however long the daemon took to answer.
