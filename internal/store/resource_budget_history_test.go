@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -46,27 +47,41 @@ func TestConfinePeakP90IgnoresNonConfineKinds(t *testing.T) {
 	}
 	// Hundreds of small aitest worker rows are exactly the shape that would drag
 	// the prior down if the reader did not name a kind.
-	for pool := 0; pool < 12; pool++ {
-		for sample := 0; sample < 5; sample++ {
+	//
+	// The fixture SIZE is load-bearing, not decoration (final build-review,
+	// Fable 2026-09-09): the original 12 pools, 10 of which shared a confine
+	// signature, left an UNFILTERED reader with 12 per-signature maxima
+	// [1, 1, 100..1000], whose nearest-rank p90 index is (9*12+9)/10-1 = 10 —
+	// still 900. The mutant with the kind filter deleted passed. Thirty pools on
+	// DISTINCT signatures give the unfiltered reader 40 maxima [1×30, 100..1000]
+	// and index (9*40+9)/10-1 = 35, i.e. 600: a filter regression now moves the
+	// answer, so the assertion below can actually fail.
+	recordPool := func(signature string, samples int) {
+		for sample := 0; sample < samples; sample++ {
 			peak := int64(1)
 			budget := int64(512 << 20)
 			if err := db.RecordConfinePeak(ctx, ResourcePeakObservation{
-				Kind: ResourcePeakKindPytestWorker, Signature: string(rune('a' + pool)),
+				Kind: ResourcePeakKindPytestWorker, Signature: signature,
 				Peak: &peak, Budget: &budget, BudgetBasis: "cap:aitest:env:default",
-				At: base.Add(time.Duration(pool*10+sample) * time.Second),
+				At: base.Add(time.Duration(sample) * time.Second),
 			}); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
+	for index := 0; index < 30; index++ {
+		recordPool(fmt.Sprintf("pool-%02d", index), 5)
+	}
+	// And one pool that shares a confine signature outright — the collision the
+	// kind column exists to make impossible.
+	recordPool("b", 5)
 	after, ok, err := db.ConfinePeakP90(ctx)
 	if err != nil || !ok || after != before {
 		t.Fatalf("p90 moved after aitest rows: before=%d after=%d ok=%v err=%v", before, after, ok, err)
 	}
 	// The confine reader must be namespaced in the same direction. Signature "b"
 	// now holds BOTH three confine rows (index 1 above) and five pytest-worker
-	// rows (pool 1 above), which is exactly the collision the kind column exists
-	// to make impossible.
+	// rows (the shared pool above).
 	stats, err := db.ConfinePeakHistory(ctx, "b")
 	if err != nil {
 		t.Fatal(err)

@@ -636,8 +636,11 @@ sample is never fabricated — an unreadable peak records nothing rather than a
 zero.
 
 **Pool key defined** (Fable's third non-blocking point). The aitest subject
-key is the pytest **rootdir** followed by the invocation arguments, NUL-joined
-— the same grammar `runner.ResourceSignature` uses for argv. Unlike a confine
+key is the pytest **rootdir** followed by the invocation arguments, joined by
+the ASCII unit separator (`\x1f` — NOT the NUL `runner.ResourceSignature` uses:
+this key travels as an argv element to the `aira worker-peak` relay, and argv
+strings are NUL-terminated, so a NUL would silently truncate it at the first
+separator; the build corrected this and `supervisor.py` states it). Unlike a confine
 signature, which is argv-only and therefore collides across projects (5r.6), a
 key that leads with the rootdir does **not** collide across projects; the gauge
 states both facts rather than implying either. `pytest-worker:<suite-hash>`
@@ -770,9 +773,50 @@ each is listed with the direction it guards.
 5. Two faces: `insightRegistry` row `resource-budget`; dispatch verb
    `confine-budget` on CLI + MCP + Skill.
 
+## 5t. Final build-review (Fable, 2026-09-09) — two findings, fixed before merge
+
+Independent re-derivation of every 5r/5s claim against PR #121's diff. Both
+faces are real dispatch verbs with their own wiring; the report-only guarantee
+holds (no write path anywhere in the classifier or either face; asserted as a
+SQLite `total_changes()` count on both); the `aira_mem` boundary is untouched;
+`_retire_worker` is the single retirement funnel (three callers: recycle,
+crash, end-of-run stop — the two out-of-band `_forget_worker_scope` calls are
+placement failures for workers that ran nothing); `cap:`/`reserve:` families
+are never summarised together. Two findings survived:
+
+1. **Porous load-bearing test (5r.1's own mandated regression).**
+   `TestConfinePeakP90IgnoresNonConfineKinds` PASSED against a mutant with the
+   `kind` filter deleted from `ConfinePeakP90`: its 12 pools, 10 sharing a
+   confine signature, left the unfiltered reader with 12 maxima whose
+   nearest-rank p90 index still lands on 900. Fixed by fixture size (30 pools
+   on distinct signatures → unfiltered answer 600 ≠ 900); the mutant now fails.
+   The production filter was always present — this is a test-strength fix.
+2. **Wrong advice on the common suite launch shape (5s.4 gap).** 5s.4 chose
+   "cap wins" and listed `delegate-ram` among reusable cap sources without
+   deciding what a `cap:auto:delegate-ram` row should recommend. That ceiling
+   is daemon-derived (`resolveDelegateRAMScopeCeiling`: 1.15×history,
+   floor-clamped to 4G, 48G with no history) and the job's slice booking is the
+   pinned overhead — so every delegate-ram suite peaking under 2G read
+   `over-provisioned, consider --memory-reserve N`, which on a delegate-ram job
+   overrides the framework overhead: a false verdict with advice that
+   manufactures the whole-suite reservation `--delegate-ram` exists to avoid.
+   Fixed in the classifier: that basis's lowering direction reads
+   `unevaluated` with reason `delegate-ram:ceiling-not-a-budget` (evidence
+   still published); the OOM/raise direction stays live and names
+   `--memory-max`. Test: `TestResourceBudgetDelegateRAMCeilingIsNotABudget`,
+   with the ordinary-cap false-pass direction beside it.
+
+Also fixed: Face 2's human render dropped every `UnevaluatedReason` (only
+`--json` carried it), so an `unevaluated` row gave no reason; it now prints
+one line per unevaluated subject, and the render has a test. Accepted gap,
+recorded: the Python tests prove the fold in `_retire_worker` directly rather
+than by driving the three call sites end-to-end; the funnel property is a
+source-level fact (grep) and was verified that way.
+
 ## 6. Status
 
 Planning resolved — **§5 resolved (5r) 2026-09-09; review round 2 resolved
-(5s) 2026-09-09**. The five gate decisions, the four source corrections in
-5r.0, the four review resolutions in 5s.1–5s.5, and the deferrals in 5r.6 are
-binding on the build.
+(5s) 2026-09-09; final build-review (5t) 2026-09-09**. The five gate
+decisions, the four source corrections in 5r.0, the four review resolutions in
+5s.1–5s.5, the two 5t fixes, and the deferrals in 5r.6 are binding on the
+build.

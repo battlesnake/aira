@@ -245,11 +245,42 @@ func ClassifyResourceBudget(subject ResourceBudgetSubjectRows, request *Resource
 	case "1.25–2.0":
 		verdict.Direction = ResourceBudgetAcceptable
 	default:
+		if currentBasis == resourceBudgetDelegateRAMBasis {
+			// A large ratio against a delegate-ram ceiling is expected, not
+			// waste: see resourceBudgetDelegateRAMBasis. The evidence (usable
+			// count, observed max, per-row buckets) is still published above;
+			// only the verdict and its lowering advice are withheld, by name.
+			verdict.Unevaluated, verdict.Direction = true, ResourceBudgetUnevaluated
+			verdict.UnevaluatedReason = resourceBudgetDelegateRAMReason
+			return verdict
+		}
 		verdict.Direction = ResourceBudgetOverProvisioned
 		verdict.finishLower(cleanStats, currentBudget)
 	}
 	return verdict
 }
+
+// resourceBudgetDelegateRAMBasis is the one `cap:` basis that is NOT a sizing
+// anyone chose for the job, and the classifier must not treat it as one.
+//
+// A --delegate-ram scope's memory.max is a whole-scope kill backstop the daemon
+// derives itself (resolveDelegateRAMScopeCeiling: learned from this same peak
+// history at the estimator's margin, floor-clamped to a minimum, and a large
+// default when there is no history), while the job's slice booking is the
+// pinned framework overhead. So "over-provisioned" — holding headroom other
+// waiters need — is false for it by construction, and the lowering knob would
+// be the wrong one: --memory-reserve on a delegate-ram job overrides the
+// framework overhead, not the ceiling. Recommending it would manufacture the
+// whole-suite reservation --delegate-ram exists to avoid. The under direction
+// stays evaluable — an OOM at the ceiling is realised harm — and names the
+// ceiling's own override, --memory-max.
+//
+// Final build-review finding (Fable, 2026-09-09): with the 4G floor, every
+// delegate-ram suite peaking under 2G would otherwise have read over-provisioned
+// with that wrong advice — the ticket's own subpipe evidence sits in that range.
+const resourceBudgetDelegateRAMBasis = ResourceBudgetFamilyCap + runner.ConfineCapSourceDelegateRAM
+
+const resourceBudgetDelegateRAMReason = "delegate-ram:ceiling-not-a-budget — a --delegate-ram scope's memory.max is a daemon-derived kill backstop (learned from this history, floor-clamped), not a sizing, and the slice booking is the pinned framework overhead; the lowering direction is not evaluable for this launch shape"
 
 // finishRaise and finishLower both grow an observed peak by
 // runner.GrowByEstimatorMargin — the same 1.15 margin EstimateMemoryReserve
@@ -312,12 +343,19 @@ func (v *ResourceBudgetVerdict) sentence(current int64, recommended *int64, basi
 		return head + "; no specific figure is derivable from this history (" + basis + "). NOT applied — nothing was changed."
 	}
 	return head + fmt.Sprintf("; consider %s %s (%s). NOT applied — nothing was changed.",
-		resourceBudgetKnob(v.Kind), runner.FormatConfineBytes(*recommended), basis)
+		resourceBudgetKnob(v.Kind, v.CurrentBudgetBasis), runner.FormatConfineBytes(*recommended), basis)
 }
 
-func resourceBudgetKnob(kind ResourcePeakKind) string {
+// resourceBudgetKnob names the existing knob a recommendation is a change to.
+// The basis matters, not only the kind: on a --delegate-ram job the quantity on
+// the row is the ceiling, whose override is --memory-max; --memory-reserve there
+// sets the pinned framework overhead, which is not what the row measured.
+func resourceBudgetKnob(kind ResourcePeakKind, basis string) string {
 	if kind == ResourcePeakKindPytestWorker {
 		return "AIRA_AITEST_ESTIMATED_BYTES="
+	}
+	if basis == resourceBudgetDelegateRAMBasis {
+		return "--memory-max"
 	}
 	return "--memory-reserve"
 }

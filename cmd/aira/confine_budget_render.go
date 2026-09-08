@@ -47,6 +47,15 @@ func renderConfineBudgetResponse(response core.Response, stdout, stderr io.Write
 			_, _ = fmt.Fprintf(stdout, "  %s\n", row.Recommendation)
 		}
 	}
+	// An `unevaluated` DIRECTION with no reason would leave the reader guessing
+	// between "too few samples", "budget never recorded" and "this launch shape
+	// has no evaluable sizing" — three different next actions. The reason is
+	// part of the answer, not --json-only detail (final build-review fix).
+	for _, row := range result.Subjects {
+		if row.Unevaluated && row.UnevaluatedReason != "" {
+			_, _ = fmt.Fprintf(stdout, "  %s: unevaluated — %s\n", row.Subject, row.UnevaluatedReason)
+		}
+	}
 	return 0
 }
 
