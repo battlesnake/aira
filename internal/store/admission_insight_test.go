@@ -144,6 +144,18 @@ func TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation(t *testing.T) {
 	// spelling and no classifier changes, so the only effect is that rows which
 	// were counted `malformed_basis` and excluded stop being produced at all — a
 	// small reduction in an exclusion count.
+	//
+	// AIRA-153 adds a `,ceiling-fitted` token and it must not move the population
+	// either. Every newly-producible string is either a `fallback:` one, which the
+	// gauge's `estimate%` predicate never selects at all, or
+	// `estimate:p90-prior,ceiling-fitted`, which fails the `$`-anchored matchers
+	// exactly as the shipped `estimate:p90-prior` already does and is counted
+	// malformed_basis + excluded. `estimate:oom-escalated,ceiling-clamped` is
+	// unchanged in spelling; only the number under it moves. The rows below marked
+	// PRODUCIBLE are ones resolveAdmitReserve can emit today; the rest are the
+	// same forward-defensive negatives as the AIRA-151 block above — a regression
+	// that made a fitted basis evaluable would move a published adequacy number
+	// with nothing objecting.
 	for _, basis := range []string{
 		"estimate:oom-escalated",
 		"estimate:oom-escalated,ceiling-clamped",
@@ -155,6 +167,22 @@ func TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation(t *testing.T) {
 		"fallback:insufficient-samples:n=1,oom-on-record,ceiling-clamped",
 		"fallback:malformed,oom-on-record",
 		"fallback:malformed,oom-on-record,ceiling-clamped",
+		// AIRA-153, all PRODUCIBLE (§3.5's enumeration).
+		"fallback:no-signature,ceiling-fitted",
+		"fallback:history-unavailable,ceiling-fitted",
+		"fallback:insufficient-samples,ceiling-fitted",
+		"fallback:no-history,ceiling-fitted",
+		"fallback:insufficient-samples:n=1,oom-on-record,ceiling-fitted",
+		"fallback:capture-unavailable,oom-on-record,ceiling-fitted",
+		"fallback:malformed,oom-on-record,ceiling-fitted",
+		"fallback:malformed,ceiling-fitted",
+		"estimate:p90-prior,ceiling-fitted",
+		// AIRA-153 forward-defensive negatives: an ORDINARY estimate is never
+		// fitted (I2) and the two tokens are mutually exclusive by construction
+		// (I8), so neither of these is producible. They are here so a regression
+		// that made one producible could not also make it evaluable unnoticed.
+		"estimate:max=42949672960,n=5,f=115,ceiling-fitted",
+		"estimate:oom-escalated,ceiling-clamped,ceiling-fitted",
 	} {
 		if admissionMaxBasis.MatchString(basis) || admissionOOMMaxBasis.MatchString(basis) || basis == "estimate:capped" {
 			t.Fatalf("basis %q reaches an adequacy VERDICT; the OOM branch's rows have never been evaluable and this change must not move that population", basis)

@@ -69,3 +69,48 @@ since-drained jobs is grantable with up to `N * perJob` of residual charge, and
 production `perJob` is 64 MiB (the fixtures use 8 MiB) — hundreds of MiB on a
 busy slice, not a knife edge. A published AIRA-103 throttle subtracts from the
 band directly and can close it outright.
+
+## Narrowed AGAIN by AIRA-153, still NOT closed (2026-09-08)
+
+AIRA-153 shipped
+(`docs/superpowers/plans/2026-09-08-aira153-condition-unpinned-default-on-ceiling-plan.md`,
+§3.8 / G4). It removes the two remaining SYSTEMATIC routes onto a resolved
+reserve exactly equal to the entry ceiling, by introducing one quantity —
+`runner.SliceFittedReserve(ceiling) = floor(100*ceiling/115)`, the largest
+reserve a slice can actually GRANT one job — and using it wherever the daemon
+sizes a value for ITSELF:
+
+- **route 1 (the OOM clamp) is now UNREACHABLE.** AIRA-151 kept the clamp for
+  the rows where the escalation determined the value, and there it still cut the
+  value down to exactly the entry ceiling. AIRA-153 retargets it to
+  `FIT(ceiling)`, strictly ~13% below, and tightens its guard from
+  `MaxOOMPeak < ceiling` to `MaxOOMPeak < FIT(ceiling)`. No clamped value can
+  land on the ceiling any more.
+- **route 3's CLIENT-DEFAULT half is now unreachable.** A prior — the unpinned
+  `DefaultConfineMemoryReserve`, or the machine-wide `estimate:p90-prior` — that
+  is at or over the ceiling is fitted to `FIT(ceiling)` before anything reads it,
+  strictly below the ceiling. The gate is `>=` rather than `>` precisely so an
+  auto-sized prior can never sit exactly on it.
+
+**This ticket stays open.** Two routes remain, and neither is systematic:
+
+2. a PINNED `--memory-reserve` / `--memory-max` exactly equal to the ceiling.
+   That is the operator's own number; `resolveAdmitReserve` returns it at its
+   first line as `pinned:client` and AIRA never resizes it (AIRA-153 I1).
+3. (estimate half) an ORDINARY per-signature estimate that happens to equal the
+   ceiling exactly. That is this command's own MEASURED evidence, and AIRA-153
+   deliberately never fits or clamps a measurement (I2): over the ceiling it is
+   refused terminally with both numbers, and exactly ON it, it is admitted and
+   then grantable only inside the residual band this ticket describes.
+
+So the claim AIRA-153 establishes is **"no auto-sized PRIOR and no CLAMPED value
+can land on the ceiling"**, not "nothing can". Route 3's estimate half is now
+driven DELIBERATELY by a shipped fixture — `ceilingExactEstimateHistory()` in
+`internal/daemon/admit_saturated_diagnosis_test.go`, whose `PeakMax` of
+3698281962 grows by the estimator's own 15% to 4253024256, byte-exactly the
+4 GiB fixture slice's entry ceiling — so the surviving route has executable
+evidence rather than only a note. That helper has now been re-based twice
+(AIRA-151, then AIRA-153), and each re-basing is itself the proof that a
+systematic route was removed.
+
+The band's arithmetic is unchanged by AIRA-153.

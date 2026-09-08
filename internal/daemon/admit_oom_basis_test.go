@@ -95,11 +95,17 @@ func TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve(t *testing.T) {
 			// (b) the escalation determined the value and the ceiling then cut it
 			// down. The escalation is still the term that produced the number the
 			// clamp acted on, so the token survives — with the clamp named.
+			//
+			// AIRA-153 retargeted the clamp to FIT(ceiling) = 51352869843, the
+			// largest reserve this slice can actually GRANT. The basis is unchanged;
+			// only the number is, and this row is the second of the two places that
+			// same shape is tabulated (see admit_oom_clamp_scope_test.go row b) —
+			// duplication that predates this change.
 			row:     "b/escalation then ceiling clamp",
 			stats:   runner.PeakRSSStats{TotalCount: 4, SampleCount: 4, PeakMax: 40 * gibBasis, OOMCount: 1, MaxOOMPeak: 40 * gibBasis},
 			reserve: 4 * gibBasis,
 			ceiling: 55 * gibBasis,
-			want:    55 * gibBasis,
+			want:    51352869843,
 			basis:   "estimate:oom-escalated,ceiling-clamped",
 		},
 		{
@@ -156,24 +162,31 @@ func TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve(t *testing.T) {
 			// applies only where the ESCALATION produced it, and here the
 			// escalation (84541440) is far below the client's own unpinned 4 GiB
 			// default, so nothing derived from the OOM peak is in the number and
-			// the clamp's rationale does not reach it. The 4 GiB is returned
-			// unclamped for admitConnection's `reserve > ceiling` boundary to
-			// refuse terminally with E_ADMIT_TOO_LARGE.
-			row:     "e/measured: client default over the ceiling, no longer clamped (AIRA-151)",
+			// the clamp's rationale does not reach it.
+			//
+			// AIRA-153 then moved the number itself. The client default is a
+			// PRIOR — a compiled-in constant with no relationship to this command
+			// or this slice — and a prior at or over the ceiling is now FITTED to
+			// FIT(ceiling) = 897216333, the largest reserve this slice can grant.
+			// So the request is no longer refused terminally; it runs. The clamp
+			// still does not apply, which is what AIRA-151 established, and the
+			// basis names the fit so a changed number never travels under an
+			// unchanged label.
+			row:     "e/measured: client default over the ceiling is fitted, not clamped",
 			stats:   runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: measuredPeak, OOMCount: 1, MaxOOMPeak: measuredPeak},
 			reserve: measuredReserve,
 			ceiling: measuredCeiling,
-			want:    measuredReserve,
-			basis:   "fallback:insufficient-samples:n=1,oom-on-record",
+			want:    897216333,
+			basis:   "fallback:insufficient-samples:n=1,oom-on-record,ceiling-fitted",
 		},
 		{
-			// The same AIRA-151 move, through the estimator's OTHER !ok basis.
-			row:     "e/malformed history over the ceiling, no longer clamped (AIRA-151)",
+			// The same two moves, through the estimator's OTHER !ok basis.
+			row:     "e/malformed history over the ceiling is fitted, not clamped",
 			stats:   runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 0, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
 			reserve: 200 * gibBasis,
 			ceiling: 100 * gibBasis,
-			want:    200 * gibBasis,
-			basis:   "fallback:malformed,oom-on-record",
+			want:    93368854260, // FIT(100 GiB)
+			basis:   "fallback:malformed,oom-on-record,ceiling-fitted",
 		},
 	} {
 		t.Run(test.row, func(t *testing.T) {
@@ -181,7 +194,12 @@ func TestOOMEscalationBasisNamesTheTermThatDeterminedTheReserve(t *testing.T) {
 			reserve, basis := server.resolveAdmitReserve(
 				admitRequest{reserve: test.reserve, signature: "sig"}, test.ceiling)
 			if reserve != test.want {
-				t.Fatalf("reserve=%d, want %d — the VALUE path must be byte-identical to master", reserve, test.want)
+				// AIRA-149 could say "byte-identical to master" here because it was
+				// a pure labelling change. AIRA-151 and AIRA-153 both moved values
+				// deliberately, so the claim this table makes is the narrower and
+				// still load-bearing one: the number and the basis are governed by
+				// ONE condition and are asserted together, row by row.
+				t.Fatalf("reserve=%d, want %d", reserve, test.want)
 			}
 			if basis != test.basis {
 				t.Fatalf("basis=%q, want %q — the basis must name the term that produced %d", basis, test.basis, reserve)

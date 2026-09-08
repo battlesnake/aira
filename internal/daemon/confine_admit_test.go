@@ -34,9 +34,15 @@ func TestConfineEstimatorAndOOMEscalationClamp(t *testing.T) {
 	escalated, basis := server.resolveAdmitReserve(admitRequest{reserve: 4 << 30, signature: "oom"}, 55<<30)
 	// AIRA-149 row (b): the escalation DID determine the value (1.5 x 40G beats
 	// the 46G ordinary estimate) and the ceiling then cut it down, so the basis
-	// names both terms. The VALUE is unchanged.
-	if escalated != 55<<30 || basis != "estimate:oom-escalated,ceiling-clamped" {
-		t.Fatalf("OOM reserve=%d basis=%q, want multiplicative result clamped to ceiling", escalated, basis)
+	// names both terms.
+	//
+	// AIRA-153 moved the number the clamp cuts DOWN TO, from the entry ceiling
+	// (59055800320) to FIT(ceiling) = 51352869843 — the largest reserve this
+	// slice can actually GRANT. A reserve equal to the entry ceiling is grantable
+	// only inside AIRA-150's residual band, so the old target was a value the
+	// slice usually could not give. The basis is unchanged.
+	if escalated != 51352869843 || basis != "estimate:oom-escalated,ceiling-clamped" {
+		t.Fatalf("OOM reserve=%d basis=%q, want the multiplicative result clamped to FIT(ceiling) %d", escalated, basis, int64(51352869843))
 	}
 }
 
@@ -50,6 +56,11 @@ func TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins(t *testing.T) {
 		t.Fatal("pinned request consulted history prior")
 		return 0, false, nil
 	}
+	// An OOM peak AT the ceiling: the guard refuses it, so the escalation stands
+	// unclamped and admitConnection refuses it terminally. AIRA-153 tightened the
+	// guard from `MaxOOMPeak < ceiling` to `MaxOOMPeak < FIT(ceiling)`, and
+	// FIT(10 GiB) = 9336885426, so a 10 GiB peak still fails it: this row is
+	// genuinely untouched rather than coincidentally so.
 	reserve, basis := server.resolveAdmitReserve(admitRequest{reserve: 4 << 30, signature: "oom"}, 10<<30)
 	if reserve <= 10<<30 || basis != "estimate:oom-escalated" {
 		t.Fatalf("OOM-at-ceiling reserve=%d basis=%q, want terminally too large", reserve, basis)
@@ -57,6 +68,18 @@ func TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins(t *testing.T) {
 	pinned, basis := server.resolveAdmitReserve(admitRequest{reserve: 6 << 30, signature: "oom", pinned: true}, 10<<30)
 	if pinned != 6<<30 || basis != "pinned:client" {
 		t.Fatalf("pinned reserve=%d basis=%q", pinned, basis)
+	}
+	// AIRA-153 pins the NEW boundary where the old one was: one byte under the
+	// fit the guard still holds, and the clamp targets the fit rather than the
+	// ceiling. Without this row the tightened guard would be pinned only from
+	// above, and a mutant that left the target at `ceiling` would pass here.
+	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
+		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 9336885425, OOMCount: 1, MaxOOMPeak: 9336885425}, nil
+	}
+	clamped, basis := server.resolveAdmitReserve(admitRequest{reserve: 4 << 30, signature: "oom"}, 10<<30)
+	if clamped != 9336885426 || basis != "estimate:oom-escalated,ceiling-clamped" {
+		t.Fatalf("one-byte-under-the-fit reserve=%d basis=%q, want %d/%q — a clamped rung must be strictly above the peak that produced it and strictly below the ceiling",
+			clamped, basis, int64(9336885426), "estimate:oom-escalated,ceiling-clamped")
 	}
 }
 
