@@ -216,7 +216,10 @@ func (s *Store) List(selector string) ([]TicketRecord, error) {
 	}
 	if sel.ExactID != "" {
 		record, err := s.exactRecord(sel.ExactID, sel.ExactPath)
-		if ErrorCode(err) == "E_NOT_FOUND" || ErrorCode(err) == "E_CONFIG_INVALID" {
+		// A broken ticket file makes an exact-ID LISTING empty rather than an
+		// error; AIRA-170 keeps that unchanged for the refusals that moved from
+		// E_CONFIG_INVALID to E_TICKET_INVALID by classifying both.
+		if ErrorCode(err) == "E_NOT_FOUND" || isTicketFileInvalidCode(ErrorCode(err)) {
 			return []TicketRecord{}, nil
 		}
 		if err != nil {

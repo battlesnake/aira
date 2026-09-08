@@ -811,3 +811,61 @@ func TestSkillTeachesTheWaitIdiomAndThePipelineStatusTrap(t *testing.T) {
 		}
 	}
 }
+
+// TestGuideDoesNotBlameTheOperatorForAClientPinnedReserve is AIRA-169.
+//
+// The cold-start paragraph told every agent that a reserve above the ceiling
+// with no OOM escalation behind it came from "this command's own measured
+// peak-history estimate, or a reserve you pinned yourself". The second half is
+// an over-claim the generated documents cannot support, and it is FALSE on
+// three live paths where `pinned=true` reaches the daemon with no operator flag
+// anywhere:
+//
+//   - every `aira run` admission (admission_linux.go sends
+//     `!req.DaemonEstimateMemory || req.MemoryReservePinned`, and only confine's
+//     launch path sets DaemonEstimateMemory, so `aira run` — which has no
+//     --memory-reserve flag at all — is ALWAYS pinned:client);
+//   - `aira confine -- docker run --memory=X`, where ContainerPlan.ResolveReserve
+//     charges the container limit and re-marks the request pinned;
+//   - `aira confine-reserve`, the pytest governor's own reservation.
+//
+// AIRA-165 (PR #104) already corrected the identical over-claim in the daemon's
+// own advice, which now says the reserve was "PINNED on the client side" and
+// hedges the cause explicitly. This is the same sentence surviving in the one
+// place every agent reads, so it takes the same wording — and the negative is
+// the load-bearing half: a revert to blaming the operator fails here rather
+// than teaching thousands of sessions to go looking for a flag nobody passed.
+//
+// verifies: AIRA-169
+func TestGuideDoesNotBlameTheOperatorForAClientPinnedReserve(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents := []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	}
+	for _, document := range documents {
+		// RED: the exact over-claim, in both generated documents.
+		if strings.Contains(document.body, "you pinned yourself") {
+			t.Errorf("%s still attributes a client-pinned reserve to the operator (\"you pinned yourself\"); "+
+				"pinned=true reaches the daemon with no operator flag on aira run, a charged docker --memory limit, and confine-reserve", document.name)
+		}
+		// Nor any near-miss rephrasing of the same blame.
+		for _, blame := range []string{"a reserve you pinned", "you pinned this reserve", "the reserve you pinned"} {
+			if strings.Contains(document.body, blame) {
+				t.Errorf("%s asserts an operator cause the document cannot establish: %q", document.name, blame)
+			}
+		}
+		// GREEN: the wire fact, phrased as the daemon's own advice phrases it.
+		if !strings.Contains(document.body, "a reserve pinned on the client side") {
+			t.Errorf("%s no longer states the fact that IS established — the reserve was pinned client-side", document.name)
+		}
+		// The clause must stay attached to the E_ADMIT_TOO_LARGE case it
+		// explains, so this cannot pass on a stray mention elsewhere.
+		if !strings.Contains(document.body, "or a reserve pinned on the client side -- the run is refused immediately with `E_ADMIT_TOO_LARGE`") {
+			t.Errorf("%s: the client-pinned clause is no longer the one explaining E_ADMIT_TOO_LARGE", document.name)
+		}
+	}
+}

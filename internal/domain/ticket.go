@@ -41,7 +41,63 @@ const (
 	SeverityP0 Severity = "P0"
 	SeverityP1 Severity = "P1"
 	SeverityP2 Severity = "P2"
+	// SeverityP3 is the lowest tier, one notch below P2 (AIRA-170). It is not a
+	// new idea imported from outside: the repository's own tickets already used
+	// it — AIRA-162 through AIRA-168 were all hand-written at "P3" for the
+	// accepted-deferral / doc-nit class of work — while validSeverity accepted
+	// only P0..P2, so the reader path refused what the canonical git file
+	// carried. Widening the enum is the fix the practice already voted for; the
+	// meanings of P0, P1 and P2 are untouched.
+	SeverityP3 Severity = "P3"
 )
+
+// CodeTicketInvalid is the stable code for "a ticket's own field is invalid".
+//
+// It exists because E_CONFIG_INVALID, which every one of these refusals used to
+// carry, names the wrong thing: it says `.aira/config` is broken when what is
+// broken is one field of one ticket file, and an agent reading only the code
+// goes and inspects a config that is fine (AIRA-170). It is the ticket-shaped
+// member of the same family as E_FINDING_INVALID, E_REQUIREMENT_INVALID and
+// E_RELATION_INVALID, and it is catalogued at the same exit (2) E_CONFIG_INVALID
+// carried, so no face's exit status changes for the population that moved.
+const CodeTicketInvalid = "E_TICKET_INVALID"
+
+// The allowed-value ladders, ordered. They are exported so a refusal can print
+// the set it is refusing against and so the dispatch table's own enums are
+// projections of the domain rather than a hand-copied second list that can
+// drift away from it — which is exactly how P3 came to be legal in the files
+// and illegal in the tool.
+var (
+	allowedStatuses   = []Status{StatusDraft, StatusPlanned, StatusInProgress, StatusInReview, StatusDone, StatusRetired, StatusSuperseded}
+	allowedKinds      = []Kind{KindFeature, KindBug, KindChore, KindSpike, KindRequirementWork}
+	allowedSeverities = []Severity{SeverityP0, SeverityP1, SeverityP2, SeverityP3}
+)
+
+// AllowedStatusStrings, AllowedKindStrings and AllowedSeverityStrings return the
+// accepted values of each ticket enum, in canonical order.
+func AllowedStatusStrings() []string {
+	result := make([]string, 0, len(allowedStatuses))
+	for _, value := range allowedStatuses {
+		result = append(result, string(value))
+	}
+	return result
+}
+
+func AllowedKindStrings() []string {
+	result := make([]string, 0, len(allowedKinds))
+	for _, value := range allowedKinds {
+		result = append(result, string(value))
+	}
+	return result
+}
+
+func AllowedSeverityStrings() []string {
+	result := make([]string, 0, len(allowedSeverities))
+	for _, value := range allowedSeverities {
+		result = append(result, string(value))
+	}
+	return result
+}
 
 type RelationKind string
 
@@ -125,9 +181,18 @@ func ValidateTransition(from, to Status) error {
 	return nil
 }
 
+// invalidFieldError is the one shape every enum refusal takes: it names the
+// FIELD, the offending VALUE, and the whole allowed set. Naming all three is the
+// point of AIRA-170's second half — "ticket enum is invalid" told a reader
+// neither which of the three enums was wrong, nor what it held, nor what it
+// could legally hold, so the only way to find out was to read this source file.
+func invalidFieldError(field, value string, allowed []string) error {
+	return fmt.Errorf("%s: ticket %s %q is invalid; allowed: %s", CodeTicketInvalid, field, value, strings.Join(allowed, ", "))
+}
+
 func (t Ticket) Validate() error {
 	if t.Schema != 1 {
-		return errors.New("E_CONFIG_INVALID: unsupported ticket schema")
+		return fmt.Errorf("%s: unsupported ticket schema %d; allowed: 1", CodeTicketInvalid, t.Schema)
 	}
 	if err := ValidateID(t.ID); err != nil {
 		return err
@@ -136,17 +201,23 @@ func (t Ticket) Validate() error {
 		return err
 	}
 	if strings.TrimSpace(t.Title) == "" {
-		return errors.New("E_CONFIG_INVALID: ticket title is empty")
+		return errors.New(CodeTicketInvalid + ": ticket title is empty")
 	}
-	if !validStatus(t.Status) || !validKind(t.Kind) || !validSeverity(t.Severity) {
-		return errors.New("E_CONFIG_INVALID: ticket enum is invalid")
+	if !validStatus(t.Status) {
+		return invalidFieldError("status", string(t.Status), AllowedStatusStrings())
+	}
+	if !validKind(t.Kind) {
+		return invalidFieldError("kind", string(t.Kind), AllowedKindStrings())
+	}
+	if !validSeverity(t.Severity) {
+		return invalidFieldError("severity", string(t.Severity), AllowedSeverityStrings())
 	}
 	for i, label := range t.Labels {
 		if label == "" || label != strings.ToLower(label) {
-			return errors.New("E_CONFIG_INVALID: labels must be non-empty lowercase strings")
+			return errors.New(CodeTicketInvalid + ": ticket labels must be non-empty lowercase strings")
 		}
 		if i > 0 && t.Labels[i-1] >= label {
-			return errors.New("E_CONFIG_INVALID: labels must be unique and sorted")
+			return errors.New(CodeTicketInvalid + ": ticket labels must be unique and sorted")
 		}
 	}
 	for i, r := range t.Relations {
@@ -179,29 +250,37 @@ func relationLess(a, b Relation) bool {
 	return idLess(a.To, b.To)
 }
 
+// The three validators read the SAME ordered ladders the refusal messages and
+// the dispatch enums print, so a value can never be legal in one of those three
+// and illegal in another.
 func validStatus(s Status) bool {
-	switch s {
-	case StatusDraft, StatusPlanned, StatusInProgress, StatusInReview, StatusDone, StatusRetired, StatusSuperseded:
-		return true
-	default:
-		return false
+	for _, allowed := range allowedStatuses {
+		if s == allowed {
+			return true
+		}
 	}
+	return false
 }
 
 func validKind(k Kind) bool {
-	switch k {
-	case KindFeature, KindBug, KindChore, KindSpike, KindRequirementWork:
-		return true
-	default:
-		return false
+	for _, allowed := range allowedKinds {
+		if k == allowed {
+			return true
+		}
 	}
+	return false
 }
 
 // ValidKind reports whether k is one of the ticket kinds in the domain.
 func ValidKind(k Kind) bool { return validKind(k) }
 
 func validSeverity(s Severity) bool {
-	return s == SeverityP0 || s == SeverityP1 || s == SeverityP2
+	for _, allowed := range allowedSeverities {
+		if s == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidSeverity reports whether s is one of the ticket severities in the domain.

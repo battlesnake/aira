@@ -22,7 +22,12 @@ func TestReviewFindingConstructorRejectsIllegalStates(t *testing.T) {
 		{"empty ticket", func(in *ReviewFindingInput) { in.TicketID = "" }},
 		{"bad category", func(in *ReviewFindingInput) { in.Category = "Flaky Test" }},
 		{"bad source", func(in *ReviewFindingInput) { in.Source = "codex/ci" }},
-		{"bad severity", func(in *ReviewFindingInput) { in.Severity = Severity("P3") }},
+		// AIRA-170 made P3 a real severity, so it is no longer an illegal state
+		// and this case had to move to a value that genuinely is one. Findings
+		// share the ticket severity ladder deliberately: one validator, one
+		// accepted set, no surface where a value is legal on one entity and not
+		// the other.
+		{"bad severity", func(in *ReviewFindingInput) { in.Severity = Severity("P9") }},
 		{"bad verdict", func(in *ReviewFindingInput) { in.Verdict = Verdict("unknown") }},
 		{"empty message", func(in *ReviewFindingInput) { in.Message = "  " }},
 		{"line without file", func(in *ReviewFindingInput) { in.File, in.Line = "", 2 }},

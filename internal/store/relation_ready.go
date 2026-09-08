@@ -546,10 +546,10 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 			// With no valid rows, an unparseable file leaves the blocker graph
 			// unevaluated; do not let its per-file fail projection mask that
 			// overall verdict. Valid rows retain their existing degradation.
-			if finding.Code == "E_CONFIG_INVALID" && graphUnevaluated && len(rows) == 0 {
+			if isTicketFileInvalidCode(finding.Code) && graphUnevaluated && len(rows) == 0 {
 				continue
 			}
-			if finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_UNOBSERVABLE" || finding.Code == "E_CONFIG_INVALID" {
+			if finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_UNOBSERVABLE" || isTicketFileInvalidCode(finding.Code) {
 				if !findingAlreadyRepresented(result, finding) {
 					result = append(result, ReadyRecord{Ticket: TicketRecord{Path: finding.Subject, WorktreeID: s.worktreeID}, Ready: false, Verdict: "fail", Findings: []CheckFinding{finding}})
 				}

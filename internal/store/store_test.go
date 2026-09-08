@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/domain"
 )
 
@@ -1373,5 +1374,126 @@ func writeTicketFile(t *testing.T, path, id string) {
 	content := "---\n{\"schema\":1,\"id\":\"" + id + "\",\"project\":\"aira\",\"title\":\"seed\",\"status\":\"planned\",\"kind\":\"feature\",\"severity\":\"P2\",\"assignee\":null,\"milestone\":null,\"labels\":[],\"hold\":false,\"relations\":[]}\n---\nseed\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestReaderPathsAcceptP3AndNameABrokenFieldHonestly covers both halves of
+// AIRA-170 at the surfaces that actually broke on master.
+//
+// Before the fix, every reader path refused the seven merged P3 tickets:
+// `aira show AIRA-165` and `aira link AIRA-169 relates AIRA-165` both answered
+// `E_CONFIG_INVALID: ticket enum is invalid` (exit 2), while the same operation
+// against a P2 ticket succeeded — which is what isolated the cause to the
+// severity value. The second half of the test keeps the ERROR-QUALITY fix
+// exercised with a value that is still invalid ("P9"), because P3 becoming
+// legal would otherwise retire the only fixture that reached this path.
+//
+// verifies: AIRA-170
+func TestReaderPathsAcceptP3AndNameABrokenFieldHonestly(t *testing.T) {
+	base := persistentTemp(t, "severity")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	dir := filepath.Join(root, ".aira", "tickets")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(id, severity string) {
+		t.Helper()
+		frontmatter := `{"schema":1,"id":"` + id + `","project":"aira","title":"severity ` + severity +
+			`","status":"planned","kind":"bug","severity":"` + severity +
+			`","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}`
+		if err := os.WriteFile(filepath.Join(dir, id+".md"), []byte("---\n"+frontmatter+"\n---\nbody\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("AIRA-165", "P3")
+	write("AIRA-169", "P2")
+	write("AIRA-900", "P9")
+	s := testStore(t, root, common, filepath.Join(base, "state"))
+	if err := s.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// The regression the ticket was filed on: a P3 ticket is readable and
+	// linkable, exactly as its P2 neighbour already was.
+	record, err := s.Get("AIRA-165")
+	if err != nil {
+		t.Fatalf("show AIRA-165 (P3): %v", err)
+	}
+	if record.Ticket.Severity != domain.SeverityP3 {
+		t.Fatalf("severity = %q, want P3", record.Ticket.Severity)
+	}
+	if _, err := s.Link(context.Background(), "AIRA-169", domain.RelationRelates, "AIRA-165"); err != nil {
+		t.Fatalf("link AIRA-169 relates AIRA-165: %v", err)
+	}
+
+	// The error-quality half: a genuinely invalid field is refused with a
+	// ticket-shaped code that names field, value and allowed set, and never
+	// blames `.aira/config`, which is intact.
+	_, err = s.Get("AIRA-900")
+	if err == nil {
+		t.Fatal("a ticket with severity P9 must still be refused")
+	}
+	if got := ErrorCode(err); got != domain.CodeTicketInvalid {
+		t.Fatalf("code = %q, want %q (nothing in .aira/config is broken)", got, domain.CodeTicketInvalid)
+	}
+	for _, want := range []string{"severity", `"P9"`, "allowed:", "P0", "P1", "P2", "P3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %q does not name %q", err.Error(), want)
+		}
+	}
+	// The exit contract is unchanged by the rename: both codes are bad-request 2.
+	if codes.ExitForCode(domain.CodeTicketInvalid) != codes.ExitForCode("E_CONFIG_INVALID") {
+		t.Fatalf("E_TICKET_INVALID exits %d; the code it replaced exits %d",
+			codes.ExitForCode(domain.CodeTicketInvalid), codes.ExitForCode("E_CONFIG_INVALID"))
+	}
+	// And a broken ticket is still an INTEGRITY finding rather than a hard
+	// error out of `aira check`: the classification must not have moved with
+	// the code.
+	if !isIntegrityError(err) {
+		t.Fatal("E_TICKET_INVALID must classify as an integrity error, or check reports nothing instead of naming the file")
+	}
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	named := false
+	for _, finding := range report.Findings {
+		if finding.Code == domain.CodeTicketInvalid && strings.Contains(finding.Message, `"P9"`) {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatalf("check did not report the broken ticket as an E_TICKET_INVALID finding: %#v", report.Findings)
+	}
+	// The other two classifiers a ticket-file refusal reaches. Both are
+	// behaviour-preservation claims, so both are pinned rather than asserted in
+	// a comment: an exact-ID LISTING of a broken ticket stays EMPTY (it never
+	// errored before the code moved), and the ready listing still projects the
+	// broken file as a fail record instead of silently dropping it.
+	listed, err := s.List("AIRA-900")
+	if err != nil {
+		t.Fatalf("list of a broken ticket must stay empty, not error: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("list of a broken ticket = %#v, want empty", listed)
+	}
+	ready, err := s.Ready("")
+	if err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	projected := false
+	for _, item := range ready {
+		for _, finding := range item.Findings {
+			if finding.Code == domain.CodeTicketInvalid {
+				projected = true
+				if item.Verdict != "fail" {
+					t.Fatalf("broken ticket verdict = %q, want fail", item.Verdict)
+				}
+			}
+		}
+	}
+	if !projected {
+		t.Fatalf("ready dropped the broken ticket file instead of failing on it: %#v", ready)
 	}
 }

@@ -285,7 +285,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 				Message: "allocation has no materialised ticket file", Kind: "fail",
 			})
 		} else if err != nil {
-			if ErrorCode(err) != "E_CONFIG_INVALID" {
+			if !isTicketFileInvalidCode(ErrorCode(err)) {
 				_ = rows.Close()
 				return CheckReport{}, err
 			}
@@ -424,7 +424,7 @@ func (s *Store) checkStaleIndex(report *CheckReport) error {
 			continue
 		}
 		if err != nil {
-			if ErrorCode(err) == "E_CONFIG_INVALID" {
+			if isTicketFileInvalidCode(ErrorCode(err)) {
 				addFinding(report, s.findingFromError(err, id), "ticket-file-integrity")
 				continue
 			}
@@ -577,11 +577,29 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 func isIntegrityError(err error) bool {
 	code := ErrorCode(err)
 	switch code {
-	case "E_CONFIG_INVALID", "E_FINDING_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
+	// E_TICKET_INVALID is in this list for one reason (AIRA-170): before it
+	// existed, a ticket whose own field failed validation reached
+	// reconcile/Rebuild as E_CONFIG_INVALID and was recorded as a `fail`
+	// FINDING naming the file. Omitting the new code would turn that same
+	// broken ticket into a hard error out of `aira check`, which reports
+	// nothing at all instead of naming the file — a strictly worse answer
+	// produced as a side effect of renaming a code.
+	case "E_CONFIG_INVALID", domain.CodeTicketInvalid, "E_FINDING_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
 		return true
 	default:
 		return false
 	}
+}
+
+// isTicketFileInvalidCode reports whether a code means "this ticket FILE is
+// broken". Two codes carry that meaning after AIRA-170: E_TICKET_INVALID for a
+// ticket's own field, and E_CONFIG_INVALID for the frontmatter shape that must
+// parse before any field exists (and for the non-regular-file refusals
+// readRegularTicket raises). Every site that used to classify on
+// E_CONFIG_INVALID alone routes through here, so the population whose code
+// changed keeps exactly the behaviour it had.
+func isTicketFileInvalidCode(code string) bool {
+	return code == "E_CONFIG_INVALID" || code == domain.CodeTicketInvalid
 }
 
 func isUnestablishedError(err error) bool {

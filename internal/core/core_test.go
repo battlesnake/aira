@@ -1029,3 +1029,61 @@ func TestRantListGuardsRejectDishonestFiltersThroughDispatch(t *testing.T) {
 		t.Fatalf("ls --by severity: %#v", r)
 	}
 }
+
+// TestTicketEnumsInTheDispatchTableAreTheDomainsOwn pins the structural half of
+// AIRA-170's first defect.
+//
+// P3 was legal in the git files and illegal in the tool because the dispatch
+// table carried a HAND-COPIED second list of severities ("P0", "P1", "P2")
+// beside the domain's own. Two lists is how the drift happened, so the fix is
+// not "add P3 in both places" — it is that the published enums, the values the
+// validator accepts, and the allowed set a refusal prints are all projections
+// of ONE ladder. This test fails if any of them is ever forked back apart.
+//
+// verifies: AIRA-170
+func TestTicketEnumsInTheDispatchTableAreTheDomainsOwn(t *testing.T) {
+	descriptors := New(nil).DispatchDescriptors()
+	enumOf := func(verb, arg string) []string {
+		for _, descriptor := range descriptors {
+			if descriptor.Name != verb {
+				continue
+			}
+			for _, spec := range descriptor.Args {
+				if spec.Name == arg {
+					return spec.Enum
+				}
+			}
+			t.Fatalf("verb %q has no %q argument", verb, arg)
+		}
+		t.Fatalf("verb %q is missing from the dispatch table", verb)
+		return nil
+	}
+	for _, tc := range []struct{ verb, arg string }{
+		{"create", "severity"},
+		{"find", "severity"},
+	} {
+		if got := enumOf(tc.verb, tc.arg); !reflect.DeepEqual(got, domain.AllowedSeverityStrings()) {
+			t.Errorf("%s --%s enum = %v, want the domain ladder %v", tc.verb, tc.arg, got, domain.AllowedSeverityStrings())
+		}
+	}
+	if got := enumOf("create", "kind"); !reflect.DeepEqual(got, domain.AllowedKindStrings()) {
+		t.Errorf("create --kind enum = %v, want the domain ladder %v", got, domain.AllowedKindStrings())
+	}
+	// Every published severity must actually be accepted by the validator the
+	// write path runs, and P3 specifically must be among them: the enum is what
+	// an agent reads out of the generated help, MCP schema and TUI form.
+	for _, severity := range enumOf("create", "severity") {
+		if !domain.ValidSeverity(domain.Severity(severity)) {
+			t.Errorf("create offers severity %q that domain.ValidSeverity refuses", severity)
+		}
+	}
+	found := false
+	for _, severity := range enumOf("create", "severity") {
+		if severity == "P3" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("aira create must offer P3; seven merged tickets already carry it")
+	}
+}

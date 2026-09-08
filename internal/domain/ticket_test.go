@@ -334,3 +334,125 @@ func TestParseTicketRejectsNonCanonicalRelations(t *testing.T) {
 		})
 	}
 }
+
+// TestP3IsARealSeverityTheReaderPathAccepts is the RED direction of AIRA-170's
+// first half. Seven tickets already merged to master — AIRA-162 through
+// AIRA-168 — carry "severity":"P3" in their canonical git frontmatter, and
+// before this change validSeverity accepted only P0..P2, so every reader path
+// refused a value the writer path had already committed. A value the file
+// format accepts and the tool refuses is not a stricter enum; it is a store
+// that cannot read its own contents.
+//
+// verifies: AIRA-170
+func TestP3IsARealSeverityTheReaderPathAccepts(t *testing.T) {
+	if !ValidSeverity(SeverityP3) {
+		t.Fatal("P3 must be a valid severity: the repository's own merged tickets carry it")
+	}
+	for _, severity := range []Severity{SeverityP0, SeverityP1, SeverityP2, SeverityP3} {
+		ticket := Ticket{
+			Schema: 1, ID: "AIRA-165", Project: "aira", Title: "a P3 ticket parses",
+			Status: StatusPlanned, Kind: KindBug, Severity: severity,
+		}
+		data, err := RenderTicket(ticket, "Body\n")
+		if err != nil {
+			t.Fatalf("render %s: %v", severity, err)
+		}
+		got, _, err := ParseTicket(data)
+		if err != nil {
+			t.Fatalf("ParseTicket %s: %v", severity, err)
+		}
+		if got.Severity != severity {
+			t.Fatalf("severity round trip: got %q want %q", got.Severity, severity)
+		}
+	}
+	// Widening must not have turned the enum into a free-text field: the ladder
+	// is P0..P3 and nothing else.
+	for _, rejected := range []Severity{"", "P4", "P9", "p3", "P3 ", "critical"} {
+		if ValidSeverity(rejected) {
+			t.Fatalf("severity %q must still be refused", rejected)
+		}
+	}
+	if want := []string{"P0", "P1", "P2", "P3"}; !reflect.DeepEqual(AllowedSeverityStrings(), want) {
+		t.Fatalf("AllowedSeverityStrings() = %v, want %v", AllowedSeverityStrings(), want)
+	}
+	// Findings share the ticket ladder through the same validator, so widening
+	// it must widen both surfaces or `find --severity P3` becomes a new instance
+	// of the very split this ticket closed.
+	finding := ReviewFindingInput{
+		TicketID: "AIRA-170", Category: "docs", Source: "opus", Message: "accepted deferral",
+		Severity: SeverityP3, Verdict: VerdictConfirmed, Disposition: DispositionOpen,
+	}
+	if _, err := NewReviewFinding(finding); err != nil {
+		t.Fatalf("a P3 finding must be accepted: %v", err)
+	}
+}
+
+// TestInvalidTicketFieldNamesFieldValueAndAllowedSet is AIRA-170's second half.
+//
+// The old refusal was `E_CONFIG_INVALID: ticket enum is invalid`, which is
+// wrong twice: the code blames `.aira/config`, which is not the broken thing,
+// and the message names neither which of the three enums failed, nor what it
+// held, nor what it could legally hold. The fixture severity here is
+// deliberately a value nothing would ever legitimately write ("P9") rather
+// than P3, so this stays a live test of the ERROR after P3 itself became
+// valid.
+//
+// verifies: AIRA-170
+func TestInvalidTicketFieldNamesFieldValueAndAllowedSet(t *testing.T) {
+	base := Ticket{
+		Schema: 1, ID: "AIRA-1", Project: "aira", Title: "invalid field",
+		Status: StatusPlanned, Kind: KindFeature, Severity: SeverityP2,
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*Ticket)
+		field   string
+		value   string
+		allowed []string
+	}{
+		{"severity", func(ticket *Ticket) { ticket.Severity = "P9" }, "severity", "P9", AllowedSeverityStrings()},
+		{"status", func(ticket *Ticket) { ticket.Status = "blocked" }, "status", "blocked", AllowedStatusStrings()},
+		{"kind", func(ticket *Ticket) { ticket.Kind = "epic" }, "kind", "epic", AllowedKindStrings()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ticket := base
+			tc.mutate(&ticket)
+			err := ticket.Validate()
+			if err == nil {
+				t.Fatal("an invalid enum must be refused")
+			}
+			message := err.Error()
+			if !strings.HasPrefix(message, CodeTicketInvalid+":") {
+				t.Fatalf("refusal must carry the ticket-shaped code, got %q", message)
+			}
+			if strings.Contains(message, "E_CONFIG_INVALID") {
+				t.Fatalf("a ticket's own field must not be reported as a broken config: %q", message)
+			}
+			for _, want := range []string{tc.field, tc.value} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("refusal %q does not name %q", message, want)
+				}
+			}
+			for _, allowed := range tc.allowed {
+				if !strings.Contains(message, allowed) {
+					t.Fatalf("refusal %q does not name the allowed value %q", message, allowed)
+				}
+			}
+		})
+	}
+	// The same refusal must survive a round trip through ParseTicket, which is
+	// the path every reader (show, link, scan, rant --ref) actually takes.
+	broken := base
+	broken.Severity = "P9"
+	data, err := json.Marshal(broken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(append([]byte("---\n"), data...), []byte("\n---\nbody\n")...)
+	_, _, parseErr := ParseTicket(data)
+	if parseErr == nil || !strings.HasPrefix(parseErr.Error(), CodeTicketInvalid+":") ||
+		!strings.Contains(parseErr.Error(), `severity "P9"`) {
+		t.Fatalf("ParseTicket refusal = %v, want %s naming severity \"P9\"", parseErr, CodeTicketInvalid)
+	}
+}

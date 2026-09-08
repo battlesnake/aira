@@ -86,7 +86,21 @@ var ExitCodes = map[string]int{
 	"E_SCHEMA_INVALID":  4, "E_EJECT_LIVE_STATE": 1, "E_EJECT_UNVERIFIED": 3, "E_PURGE_DIRTY": 1,
 	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
 	"E_REQUIREMENT_INVALID": 2,
-	"E_COMPUTE_INVALID":     2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
+	// AIRA-170. The ticket-shaped member of the entity-integrity family above:
+	// a ticket's OWN field (schema, title, status, kind, severity, labels) is
+	// invalid. Every one of those refusals used to be raised as
+	// E_CONFIG_INVALID, which names the wrong artefact — it tells an agent that
+	// `.aira/config` is broken when the config is fine and one ticket file is
+	// not. It takes 2, the exit E_CONFIG_INVALID already carried, so the move is
+	// a naming fix with no exit-contract change for the population that moved:
+	// every face still exits exactly as it did. The frontmatter-SHAPE errors in
+	// domain.ParseTicket (missing/malformed/trailing frontmatter, a body that
+	// does not end in a newline) deliberately keep E_CONFIG_INVALID — those are
+	// refusals of the file's serialised form before any field exists to be
+	// judged — and every store site that classifies on E_CONFIG_INVALID accepts
+	// both codes, so a ticket file's classification is identical either way.
+	"E_TICKET_INVALID":  2,
+	"E_COMPUTE_INVALID": 2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
 	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_RANT_INVALID": 2, "E_RANT_TOO_LARGE": 2, "E_RANT_REF_INVALID": 2,
