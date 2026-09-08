@@ -46,3 +46,20 @@ largest reserve that would admit immediately right now is Yg") are left
 for whoever picks this up — the latter may be better served by AIRA-180's
 resource-budget recommendation surface than by this wait-line change, since
 it is a different moment (pre-submit vs. mid-wait). [[AIRA-180]]
+
+## Follow-up corroboration (qual, 2026-09-08, after the ticket was filed)
+
+qual pinpointed the exact misleading phrase, distinct from "no data at
+all": position 1 with `0B queued ahead` is the literal state the queue is
+in *by definition* at the head — the arithmetic isn't wrong, but "queued
+ahead" reads as "nothing blocking you" when the real blocker (the running
+set's held reserve) is a different, unmentioned population. Their
+suggested minimal shape: put both populations in the same line, e.g.
+`queue position 1 of 9, 0B queued ahead, held by running: 52G / cap 64G`
+— so position-1-with-nothing-ahead reads correctly as "your request is
+fine, wait" instead of "your request will never fit". Live reproduction
+pasted at time of writing: `waited 795s, queue position 1 of 9, 0B queued
+ahead` against 34G MemAvailable and a 44G request, mid-wait, deliberately
+not guessed down this time. Consistent with the fix already scoped above
+(the `SliceReserve` fields are already in hand at the call site) — this
+just sharpens the wording target for whoever implements it.
