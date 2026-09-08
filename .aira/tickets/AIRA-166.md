@@ -90,3 +90,22 @@ the one to expect WHEN a machine-wide p90 exists.
 Shipped in the same branch and gate as AIRA-165; the gate table is recorded on
 that ticket (`build`, `vet`, `go fmt`, and `AIRA_REAL_CGROUP=1 go test ./...`
 all exit 0 on commit `f983788`).
+
+## Fable work-review record (2026-09-08)
+
+MERGE verdict. Shipped with AIRA-165 in PR #104, merged `34ea0b0`.
+
+Re-reviewed after the AIRA-165 fix round (`3af5793`, the reworded
+`pinned:client` arm). This ticket's own change was untouched by that round:
+a word-diff of the PR's `internal/core/skill.go` edit against master confirms
+it is confined to the opening `fallback:` sentences of the cold-start
+paragraph, and the AIRA-165 review verified the paragraph's other claims
+against the source. `internal/core` `ok` under
+`AIRA_REAL_CGROUP=1 go test -count=1` on the head SHA in an independent
+detached worktree; CI green on `3af5793` (`build + vet + gofmt`, `test`,
+`race`); PR `MERGEABLE`/`CLEAN` with no file overlap against the one commit
+master gained since the branch point.
+
+Merged via `gh pr merge 104 --repo battlesnake/aira --merge` from
+`/home/mark/claude/aira` on `master`; confirmed via `git fetch` +
+`git log --oneline -1 origin/master` = `34ea0b0`.

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-165","project":"aira","title":"E_ADMIT_TOO_LARGE prints raw bytes and names no escape hatch, on a now-narrower population","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-165","to":"AIRA-153"},{"kind":"relates","from":"AIRA-165","to":"AIRA-151"}]}
+{"schema":1,"id":"AIRA-165","project":"aira","title":"E_ADMIT_TOO_LARGE prints raw bytes and names no escape hatch, on a now-narrower population","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-165","to":"AIRA-153"},{"kind":"relates","from":"AIRA-165","to":"AIRA-151"},{"kind":"relates","from":"AIRA-169","to":"AIRA-165"}]}
 ---
 
 AIRA-151 deferral **G3**, carried forward by AIRA-153 deferral **G6** and now
@@ -241,3 +241,58 @@ change `FormatConfineBytes` itself, once, for every surface.
   successor rather than fixed here as unreviewed drift. The one-line fix is to
   say "a reserve pinned on the client side" in
   `renderMarkdownBody` (`internal/core/skill.go`), matching the daemon arm.
+  Filed as **AIRA-169** at the work-review below.
+
+## Fable work-review record (2026-09-08, after the fix round)
+
+MERGE verdict on PR #104 head `3af5793`; merged `34ea0b0`.
+
+The BLOCK was the `pinned:client` arm asserting a cause ("you pinned this
+reserve yourself … do not re-pin the same number") that the daemon cannot
+establish. Verified from source, independently, that the fix is bounded by what
+the wire actually carries:
+
+- the three non-flag origins of `pinned=true` are real and each reaches the
+  wire: `internal/runner/admission_linux.go:467` sends
+  `!req.DaemonEstimateMemory || req.MemoryReservePinned` and the sole non-test
+  setter of `DaemonEstimateMemory` is `internal/runner/confine_linux.go:1631`,
+  so `aira run` (`runner_linux.go:369 → admit → admitThroughDaemon`, with the
+  core-built `Request` and no JSON path setting the field) is always
+  `pinned:client`; `ContainerPlan.ResolveReserve` (`container.go:494`) returns
+  `pinned=true` for an unpinned docker job and confine writes it back into
+  `request.MemoryReservePinned` before `deps.admit`; `confine_reserve_linux.go:92`
+  is the only non-test `MemoryReservePinned: true`;
+- the only non-test edit is the one return string plus its doc comment; no
+  admission decision changed; the arm still never says "pin";
+- the runner constant, `pinnedAdvicePhrase`, and this ticket's resolution table
+  are in sync with the new text.
+
+The new test is not porous. Reproduced both mutations in an independent
+detached worktree at `3af5793`, each applied alone and reverted:
+
+| mutation | observed |
+| --- | --- |
+| M6 — drop `!req.DaemonEstimateMemory` from the wire expression | RED on `TestTooLargePinnedAdviceDoesNotBlameConfineFlagsOnAnAiraRunRefusal` only, at its premise line (`admission_saturated_message_test.go:415: the aira run shape sent pinned=false`); the confine-shape test stayed green |
+| M5 — restore the old cause-asserting daemon arm | RED on `TestTooLargeRefusalAdviceIsCaseSplitByPopulation` and `TestTooLargeAdviceIsDecidedByTheTermNotTheTrailingTokens`; `TestEveryRefusableResolutionGetsAdvice` stayed green |
+
+Gate, re-run independently in that worktree, serialised under `aira confine`:
+`go build ./...` exit 0; `go vet ./...` exit 0; `$(go env GOROOT)/bin/gofmt -l
+internal cmd` empty, exit 0 (`gofmt` is not on PATH under confine, exit 127 =
+unevaluated, hence GOROOT); `AIRA_REAL_CGROUP=1 go test ./internal/daemon/
+./internal/runner/ ./internal/core/ -count=1` exit 0, all three `ok`. CI green
+on `3af5793` (`build + vet + gofmt`, `test`, `race`); PR `MERGEABLE`/`CLEAN`;
+the one commit master gained since the branch point (`c19d117`, ticket closures)
+overlaps no PR file.
+
+Accepted deferral: the generated guide's "a reserve you pinned yourself" clause
+(above) is master's pre-existing text; a word-diff of the PR's `skill.go` edit
+against master confirms it touched only the paragraph's opening `fallback:`
+sentences (AIRA-166). Filed as AIRA-169 with the one-clause fix and a negative
+test named. One wording nit, not blocking: "AIRA neither sized it nor fitted it"
+reads as the daemon's view — for an `aira run` estimate the client-side core did
+size it — but the same sentence names "AIRA's own estimate" as a possible origin,
+so no reader is misled about the source.
+
+Merged via `gh pr merge 104 --repo battlesnake/aira --merge` from
+`/home/mark/claude/aira` on `master`; confirmed via `git fetch` +
+`git log --oneline -1 origin/master` = `34ea0b0`.
