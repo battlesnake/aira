@@ -42,7 +42,8 @@ wider population; the two contradicted each other. Revision 2:
    through it, and the read-only pre-deploy re-verification;
 7. resolves **I7** against the stale `internal/daemon/paths.go:138` comment, and
    fills in the T2 `want watchdog` column, the flag-description wording, and a
-   line on the three dated records that state the old default.
+   line on the dated records that state the old default — four of them, not the
+   three the gate listed (§2).
 
 **Verdict, up front (corrected in revision 2).** One constant splits into two.
 `aira install`'s ship default for the slice ceiling becomes `enforce`; the
@@ -354,16 +355,29 @@ distinction between "measured" and "assumed" is recorded rather than blurred.
 The residual safety argument stands on §0.2: enforce can only make a job wait,
 never fail.
 
-**Three dated records state the old default and are deliberately left as
+**Four dated records state the old default and are deliberately left as
 history**, per this project's convention that a dated ticket or design doc
-records what was decided *then*: `.aira/tickets/AIRA-106.md:59`
-("default `observe`"), and the AIRA-106 design doc
-`docs/superpowers/specs/2026-09-06-aira106-two-parameter-slice-ceiling-design.md:411`
-and `:529`. Named here so a future reader who greps for the default and finds
-three sources saying `observe` can see that the divergence is intentional and
-where the live answer lives (§1.1 items 3 and 7). The undated, currently-true
-surfaces — the constant, `resolveDaemonModes`'s comment, the flag description,
-the `paths.go` comment and this ticket — are all corrected in scope above.
+records what was decided *then*:
+
+- `.aira/tickets/AIRA-106.md:59` — "`aira install --slice-ceiling` (default
+  `observe`) is the flip out of `mode=off`";
+- `docs/superpowers/specs/2026-09-06-aira106-two-parameter-slice-ceiling-design.md:411`
+  — the table row "installed value, else `observe`";
+- the same design doc `:529` — "defaults to `observe`";
+- `.aira/tickets/AIRA-111.md:44` — "confirms `AIRA_DAEMON_SLICE_CEILING_MODE=observe`
+  — AIRA-106's own correct default, not yet enforced, as designed". *(The gate
+  named the first three; this fourth was found by re-grepping the repo for the
+  claim rather than taking the gate's list as complete.)*
+
+Named here so a future reader who greps for the default and finds four sources
+saying `observe` can see that the divergence is intentional and where the live
+answer lives (§1.1 items 3 and 7). The undated, currently-true surfaces — the
+constant, `resolveDaemonModes`'s comment, the flag description, the `paths.go`
+comment and this ticket — are all corrected in scope above. Verified that the
+flag description has no second copy: `grep -rn 'omitted keeps the installed
+value'` returns exactly `core.go:1815-1817`, no golden file and no test pins it
+(`internal/core/skill_test.go`'s only slice-ceiling reference, `:646`, is an
+unrelated telemetry token).
 
 ---
 
