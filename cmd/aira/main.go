@@ -215,6 +215,25 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runConfineReserveCommand(context.Background(), options, stdin, stdout, stderr)
 	}
+	// AIRA-185. `drain` and its internal placeholder are handled HERE, beside
+	// confine and before project discovery, for the same reason `top` is: a drain
+	// is machine-wide slice work that resolves no project, and routing it through
+	// the scope resolution below would make it refuse to start in most of the
+	// directories an operator deploying from is standing in.
+	if verb == "drain" {
+		if jsonOutput {
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for drain", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			return render(response, true, stdout, stderr)
+		}
+		return runDrainCommand(context.Background(), positional, options, stdin, stdout, stderr)
+	}
+	if verb == "drain-hold" {
+		if jsonOutput {
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for drain-hold", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			return render(response, true, stdout, stderr)
+		}
+		return runDrainHoldCommand(stdout)
+	}
 	if verb == "aitest-bootstrap" {
 		if jsonOutput {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for aitest-bootstrap", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
@@ -614,6 +633,12 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "confine-reserve" {
 		return parseConfineReserveArgs(argv)
 	}
+	if verb == "drain" {
+		return parseDrainArgs(argv)
+	}
+	if verb == "drain-hold" {
+		return parseDrainHoldArgs(argv)
+	}
 	if verb == "aitest-bootstrap" {
 		return parseAitestBootstrapArgs(argv)
 	}
@@ -862,6 +887,94 @@ func parseConfineJobBound(raw string) (time.Duration, error) {
 		return 0, errors.New("must be positive")
 	}
 	return value, nil
+}
+
+// drainWaitOperation is the ONE spelling of `aira drain`'s only public
+// operation, taken from the dispatch table rather than restated here so the
+// generated help can never advertise an operation this parser rejects.
+const drainWaitOperation = core.DrainWaitOperation
+
+// drainHoldName is the confine scope NAME every drain hold launches under. It
+// is fixed rather than caller-chosen because the name is what `confine --kill`
+// selects on and what the scope id embeds, and a drain's human-readable purpose
+// travels in --reason instead — Name could not carry it in any case
+// (ValidateConfineIdentity rejects spaces and colons, and the daemon requires
+// the name to match the scope id).
+const drainHoldName = "drain"
+
+// parseDrainArgs parses `aira drain wait [--timeout D] [--admit-timeout D]
+// [--reason TEXT]` (AIRA-185).
+//
+// It is its own parser, like confine's, for one reason: the generic parseArgs
+// loop treats any non-`--` token as a positional and would silently accept
+// `aira drain nonsense`. A drain holds up every other session on this machine,
+// so an operation this parser does not recognise is refused by name rather than
+// guessed at.
+func parseDrainArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	var positional []string
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if !strings.HasPrefix(arg, "--") {
+			positional = append(positional, arg)
+			continue
+		}
+		name := strings.TrimPrefix(arg, "--")
+		if name != "timeout" && name != "admit-timeout" && name != "reason" {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for drain", name)
+		}
+		if _, exists := options[name]; exists {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
+		}
+		// --reason takes free text, which may legitimately begin with "--"
+		// ("--force was needed"), so only the DURATION options refuse a value that
+		// looks like another flag. The bound is still that a value must exist.
+		if index+1 >= len(argv) {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		if name != "reason" && strings.HasPrefix(argv[index+1], "--") {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		index++
+		options[name] = argv[index]
+	}
+	if len(positional) != 1 || positional[0] != drainWaitOperation {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: drain requires exactly one operation, and the only one is `wait`, e.g. aira drain wait --reason \"deploy\"")
+	}
+	// Both bounds are validated SYNCHRONOUSLY, before any daemon round trip,
+	// through the SAME helper confine's own --timeout uses, so the two verbs
+	// cannot drift into accepting different duration languages.
+	if raw, present := options["timeout"]; present {
+		if _, err := parseConfineJobBound(raw); err != nil {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --timeout: %w", err)
+		}
+	}
+	if raw, present := options["admit-timeout"]; present {
+		wait, err := time.ParseDuration(raw)
+		if err != nil || wait < time.Millisecond || wait > runner.AdmitWaitCeiling {
+			if err == nil {
+				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
+			}
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
+		}
+	}
+	if raw, present := options["reason"]; present {
+		if strings.TrimSpace(raw) == "" {
+			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --reason requires text; omit the flag to hold with no stated reason")
+		}
+	}
+	return positional, options, nil
+}
+
+// parseDrainHoldArgs parses the INTERNAL placeholder verb `aira drain-hold`,
+// which takes nothing. It is the process `aira drain wait` launches inside the
+// confine scope, never something an operator runs directly, so every argument is
+// refused rather than ignored.
+func parseDrainHoldArgs(argv []string) ([]string, map[string]string, error) {
+	if len(argv) != 0 {
+		return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: drain-hold takes no arguments (got %q)", argv[0])
+	}
+	return nil, map[string]string{}, nil
 }
 
 func parseConfineReserveArgs(argv []string) ([]string, map[string]string, error) {
@@ -1133,6 +1246,181 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		return codes.ExitForCode(store.ErrorCode(err))
 	}
 	return result.Exit
+}
+
+// drainHoldSelfPath is the binary `aira drain wait` launches as its placeholder.
+//
+// `/proc/self/exe` rather than os.Executable() DELIBERATELY, and it matters for
+// exactly the use this verb exists for: a drain window is when the aira binary
+// on $PATH is most likely to be REPLACED underneath us, and /proc/self/exe names
+// the running inode rather than a path whose contents may have changed by the
+// time the setup shim execs it. It is the same default LaunchConfineDetached
+// already uses for its own supervisor.
+//
+// A var, not a const, so a test can substitute a real helper binary without
+// launching the CLI's own process tree.
+var drainHoldSelfPath = "/proc/self/exe"
+
+// runDrainCommand routes `aira drain <operation>`.
+//
+// The switch is not redundant with parseDrainArgs's own refusal, and that is the
+// point: adding a second operation to the parser (or to the dispatch table's
+// enum) without adding it here would otherwise run a WAIT for it — silently
+// doing the wrong, slice-holding thing. The default arm makes that
+// unrepresentable instead of something to remember.
+func runDrainCommand(ctx context.Context, positional []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
+	operation := ""
+	if len(positional) > 0 {
+		operation = positional[0]
+	}
+	switch operation {
+	case drainWaitOperation:
+		return runDrainWaitCommand(ctx, options, stdin, stdout, stderr)
+	default:
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: unknown drain operation %q; the only one is `%s`\n", operation, drainWaitOperation)
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+}
+
+// runDrainWaitCommand implements `aira drain wait` (AIRA-185).
+//
+// It is DELIBERATELY thin: it issues the exact same admission request `aira
+// confine --exclusive -- <argv>` already makes, where <argv> is the internal
+// `aira drain-hold` placeholder, launched through the real runner.Confine
+// scope-creation path — real scope, real admission, real charging. Nothing here
+// blocks on its own; the hold is a genuine exclusive confine job, and it
+// therefore inherits exclusive mode's already-tested safety properties whole:
+// connection-bound release (the daemon's deferred release fires on every
+// connection-close path, so a Ctrl-C'd or SIGKILLed drain unwedges the slice
+// instantly), at most one holder per slice, and no persisted state that could
+// outlive the process.
+//
+// What it does NOT do, and must not be sold as doing: it does not protect
+// already-running jobs from a deploy (they were never at risk — every confine
+// job is its own cgroup scope launched by its own client, never a daemon child),
+// and it is best-effort contention reduction rather than an absolute guarantee
+// (a slice queue at its 256-waiter cap falls back to flock, outside the gate).
+func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// Re-parsed through the SAME helpers parseDrainArgs validated with, so the
+	// refusal and the transcription can never accept different languages.
+	var holdFor time.Duration
+	if raw := options["timeout"]; raw != "" {
+		parsed, err := parseConfineJobBound(raw)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --timeout: %v\n", err)
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		holdFor = parsed
+	}
+	var admitTimeout time.Duration
+	if raw := options["admit-timeout"]; raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed < time.Millisecond || parsed > runner.AdmitWaitCeiling {
+			if err == nil {
+				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
+			}
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		admitTimeout = parsed
+	}
+	owner, err := resolveConfineOwner(ctx, "")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: owner: %v\n", err)
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+	request := runner.ConfineRequest{
+		Name:            drainHoldName,
+		Owner:           owner,
+		Argv:            []string{drainHoldSelfPath, "drain-hold"},
+		Exclusive:       true,
+		ExclusiveReason: strings.TrimSpace(options["reason"]),
+		// The ONE place the two clocks are separated, and the reason the help text
+		// says so out loud: Timeout bounds the HELD duration only (it starts at the
+		// release write, after admission and setup), while AdmissionMaxWait bounds
+		// the wait to be admitted at all. Zero means "confine's own default" for
+		// each, which for admission is 30 minutes — never "no bound" and never
+		// "give up immediately".
+		Timeout:          holdFor,
+		AdmissionMaxWait: admitTimeout,
+		Stdin:            stdin, Stdout: stdout, Stderr: stderr,
+	}
+	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
+		request.RuntimeDir = paths.RuntimeDir
+		request.AdmitSocketPath = paths.SocketPath
+	} else if stderr != nil {
+		// Stated, not swallowed: without daemon paths the admission attempt cannot
+		// reach the daemon, and an exclusive request REFUSES rather than falling
+		// back to flock, so the launch below will fail loudly. Saying why here turns
+		// that refusal from a puzzle into an install problem.
+		_, _ = fmt.Fprintf(stderr, "drain: daemon paths unavailable, so an exclusive admission cannot be established: %v\n", pathErr)
+	}
+	_, _ = fmt.Fprintln(stderr, drainWaitBanner(request, runner.DefaultConfineSlice))
+	result, err := runConfined(ctx, request)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return codes.ExitForCode(store.ErrorCode(err))
+	}
+	return result.Exit
+}
+
+// drainWaitBanner states BOTH clocks at the point of use, before anything
+// blocks.
+//
+// It exists because `--timeout 10s` reads as "give up after 10 seconds" and is
+// not: admission is a separate, already-existing budget that defaults to 30
+// minutes, so a drain can legitimately sit unadmitted far longer than its own
+// --timeout before the hold it bounds has even begun. The help text says this
+// too; saying it again here means an operator who never reads --help still
+// cannot be surprised by it.
+func drainWaitBanner(request runner.ConfineRequest, defaultSlice string) string {
+	slice := strings.TrimSpace(request.Slice)
+	if slice == "" {
+		slice = defaultSlice
+	}
+	// The EFFECTIVE budget, read from the one constant the runner actually applies
+	// when no --admit-timeout is given, rather than a number restated here that
+	// could drift away from it.
+	admission := "up to " + runner.DefaultConfineAdmissionWait.String() + " (the default; --admit-timeout changes it)"
+	if request.AdmissionMaxWait > 0 {
+		admission = "up to " + request.AdmissionMaxWait.String()
+	}
+	hold := "until you interrupt it (Ctrl-C or SIGTERM)"
+	if request.Timeout > 0 {
+		hold = "for " + request.Timeout.String() + ", or until you interrupt it (Ctrl-C or SIGTERM)"
+	}
+	line := fmt.Sprintf("drain: asking to hold %s exclusively; new jobs stop being admitted and already-running ones finish untouched.", slice)
+	line += fmt.Sprintf("\ndrain: waiting %s to be admitted, THEN holding %s. These are two separate budgets.", admission, hold)
+	if reason := strings.TrimSpace(request.ExclusiveReason); reason != "" {
+		line += "\ndrain: reason " + strconv.Quote(confineReasonForDisplay(reason))
+	}
+	return line
+}
+
+// runDrainHoldCommand is the INTERNAL placeholder `aira drain wait` launches
+// inside its confine scope. It is not a verb an operator runs directly, and it
+// is deliberately the simplest possible program: announce that the hold is real,
+// then block.
+//
+// Announcing matters. The line below is written only once the process is
+// RUNNING, which under confine means admission was granted and the scope was
+// created — so it is a positive attestation that the slice is now held, not a
+// claim made in advance of one. Before it appears the state is "draining", which
+// `confine --list` reports as such.
+//
+// Release is by signal or by the confine job's own --timeout, both of which
+// arrive as a cgroup.kill from the supervisor above it: a confined job has no
+// graceful shutdown by design, so the handler installed here is for the
+// unconfined case only and never runs in production.
+func runDrainHoldCommand(stdout io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	// It names every way the hold ends, not just Ctrl-C: --timeout is enforced by
+	// the supervisor ABOVE this process, which knows nothing about it, and a line
+	// that offered only Ctrl-C would quietly contradict an operator who set one.
+	_, _ = fmt.Fprintln(stdout, "drain: the slice is now HELD — no new jobs are being admitted. It is released when this process ends: Ctrl-C, SIGTERM, or --timeout expiring.")
+	<-ctx.Done()
+	return 0
 }
 
 // runConfineDetachCommand launches a session-independent confine supervisor.
@@ -3033,6 +3321,20 @@ func renderConfineExclusiveLine(exclusive *runner.ConfineExclusiveState) string 
 		owner = "unknown owner"
 	}
 	line := fmt.Sprintf("slice exclusive: %s %q (%s)", verb, exclusive.Name, owner)
+	// AIRA-185. The holder's own answer to "why", appended rather than substituted
+	// for the identity: every existing token of this line keeps its exact spelling
+	// and position, and the clause is absent entirely when no reason was given —
+	// which is every `aira confine --exclusive`, whose Name IS the answer. The one
+	// case that needed this is `aira drain wait`, whose Name is a fixed
+	// placeholder ("drain") that says nothing about the deploy it is holding the
+	// slice for.
+	//
+	// UNTRUSTED text from another session, printed straight into this operator's
+	// shell: escaped, length-bounded, and then quoted so it cannot be mistaken for
+	// a field of AIRA's own.
+	if reason := strings.TrimSpace(exclusive.Reason); reason != "" {
+		line += " reason=" + strconv.Quote(confineReasonForDisplay(reason))
+	}
 	if scope := strings.TrimSpace(exclusive.ScopeID); scope != "" {
 		line += " scope=" + scope
 	}
@@ -3100,10 +3402,28 @@ func confineSignatureForDisplay(signature string) string {
 	if strings.TrimSpace(signature) == "" {
 		return "(unnamed)"
 	}
+	return confineTextForDisplay(signature, runner.ConfineReservationSignatureLimit)
+}
+
+// confineReasonForDisplay makes a client-supplied exclusive hold reason safe for
+// a terminal (AIRA-185), on exactly the terms confineSignatureForDisplay makes a
+// signature safe.
+//
+// Unlike a signature it has NO "(unnamed)" substitute: an absent reason is not a
+// thing to name, and every caller omits the whole clause instead, so this is
+// only ever reached with text the holder actually supplied.
+func confineReasonForDisplay(reason string) string {
+	return confineTextForDisplay(reason, runner.ConfineExclusiveReasonLimit)
+}
+
+// confineTextForDisplay is the ONE escaping and bounding rule for
+// client-supplied text that reaches an operator's terminal, shared so a second
+// such field cannot arrive with a second, looser rule beside it.
+func confineTextForDisplay(text string, limit int) string {
 	var builder strings.Builder
 	runes := 0
-	for _, r := range signature {
-		if runes >= runner.ConfineReservationSignatureLimit {
+	for _, r := range text {
+		if runes >= limit {
 			builder.WriteString("…")
 			break
 		}

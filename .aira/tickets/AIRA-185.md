@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-185","project":"aira","title":"aira drain wait -- hold the slice empty for a deploy, reusing exclusive-mode admission mechanics","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deploy"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-185","project":"aira","title":"aira drain wait -- hold the slice empty for a deploy, reusing exclusive-mode admission mechanics","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deploy"],"hold":false,"relations":[]}
 ---
 
 Owner observation (2026-09-08): "Perhaps it would be useful if there was a
@@ -84,3 +84,61 @@ should wrap itself with `drain wait`) — see the plan's §5.
 
 Plan approved (Astra pass 3: PASS). Owner authorised proceeding straight
 to build once approved. Not yet built.
+
+## Build (v1, in review)
+
+Branch `aira185-drain-wait`. Built exactly the approved scope, no more:
+
+- **`aira drain wait [--timeout D] [--admit-timeout D] [--reason TEXT]`** —
+  thin CLI sugar issuing the same `Exclusive: true` admission request `aira
+  confine --exclusive` already makes, with `<argv>` = the internal
+  `aira drain-hold` placeholder launched through the real `runner.Confine`
+  scope-creation path (real scope, real admission, real charging). The
+  placeholder announces the hold once it is actually running — a positive
+  attestation, since under confine it runs only after the grant — then blocks.
+  Foreground, connection-bound, no detach, no background helper.
+- **`--timeout` wraps `ConfineRequest.Timeout`** (post-admission held duration
+  only) and `--admit-timeout` wraps `AdmissionMaxWait`. Both the generated
+  `--help` and a runtime banner printed before anything blocks state that these
+  are two separate budgets, because `--timeout 10s` otherwise reads as an
+  overall deadline. `runner.DefaultConfineAdmissionWait` was exported so the
+  banner reports the real effective default rather than a restated number.
+- **`--reason` is a new optional wire field**, additive in `validateAdmitArgs`
+  (allowlist + argument count 12 -> 13 + string parse, bounded and trimmed at
+  the one place it is retained). It is refused on a non-exclusive request
+  rather than accepted and discarded, and the runner only puts it on the wire
+  alongside `exclusive`. No gate or behaviour change: `sliceProvablyEmpty`,
+  `exclusiveGate` and every admission decision are untouched, and a test
+  asserts a drain queues, is granted and blocks identically for every reason
+  value.
+- **Rendering**: `confine --list`'s exclusive line gains an additive
+  `reason="..."` clause (escaped, bounded, absent when none was given, so every
+  pre-existing line is byte-identical), and `aira top`'s footer gains the same
+  one conditional append.
+- **Faces**: registered in the dispatch table, so it appears in generated help
+  and the agent guide, with `Include` unset — CLI-only like `confine`,
+  `confine-reserve` and `confine-status`. A foreground connection-bound hold
+  has no honest request/response MCP form: a tool could only return before the
+  hold began (fabricated success) or block a dispatcher for up to half an hour.
+
+Deliberately NOT built (per the plan's deferrals): any detached/scriptable
+lifecycle, any gate generalisation, any new release-ownership mechanism, any
+daemon-side timeout suppression, any `ConfineDrainState` struct, and no change
+to `install.sh`. The drain also declares no pinned reserve, so it is charged
+exactly like any other exclusive job, as the plan requires.
+
+Live evidence (this box, real cgroups):
+
+- `aira drain wait --admit-timeout 5s --timeout 2s --reason "..."` against the
+  INSTALLED (pre-change) daemon refused loudly and correctly:
+  `ran=no code=E_CONFINE_UNAVAILABLE ... (E_DAEMON_PROTOCOL: unexpected admit
+  field "reason")` — version skew is loud, never a silently non-exclusive
+  launch.
+- The same without `--reason` reached real admission and was honestly rejected
+  on a busy slice: `E_ADMIT_SATURATED ... the slice was draining for an
+  exclusive job and the drain did not complete within the wait`.
+- The placeholder through a real scope:
+  `aira confine --name drainprobe --timeout 3s -- /proc/self/exe drain-hold`
+  announced `the slice is now HELD`, blocked, and was released by its own
+  bound: `terminated-by=deadline:wall timeout=3s:fired-kill-completed`,
+  exit 137.

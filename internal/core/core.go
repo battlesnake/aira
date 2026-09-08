@@ -430,6 +430,12 @@ type verbSpec struct {
 
 const ListLimit = store.ListLimit
 
+// DrainWaitOperation is the ONE spelling of `aira drain`'s only operation
+// (AIRA-185). The dispatch table's enum, the CLI parser's refusal, and the CLI
+// dispatcher all read this constant, so the generated help can never advertise
+// an operation the parser rejects.
+const DrainWaitOperation = "wait"
+
 func New(s Store) *Core {
 	c := &Core{store: s, reportMaxBytes: defaultRunReportMaxBytes}
 	c.verbs = c.dispatchTable()
@@ -1744,6 +1750,34 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = boolArg(args, "detach")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
 		}},
+		// AIRA-185. `drain` is CLI-only for the same reason confine is, plus a
+		// stronger one of its own: `drain wait` is a FOREGROUND, connection-bound
+		// hold whose entire safety model is that the slice unwedges the instant the
+		// requesting process's socket closes. A request/response MCP tool has no
+		// process to hold that connection open, so it could only ever return before
+		// the hold began (a fabricated success) or block a dispatcher for up to half
+		// an hour. Registered here so it appears in generated help and the agent
+		// guide; Include is unset so it is never a Skill action and never a tool.
+		//
+		// It is deliberately NOT grouped into Operations: `wait` is its only
+		// operation, and a one-entry group would buy a discriminator and nothing
+		// else.
+		"drain": {Name: "drain", Usage: "drain wait [--timeout D] [--admit-timeout D] [--reason TEXT]", Args: []ArgSpec{
+			stringSpec("subverb", true, true, "Drain operation; the only one is `wait`", DrainWaitOperation),
+			// The two clocks are disambiguated HERE, in the generated help, because
+			// --timeout reads as an overall deadline and is not one. Each says where
+			// its clock starts and what it does NOT cover.
+			stringSpec("timeout", false, false, "Positive bound on the HELD duration ONLY, measured from the moment the hold begins. It does NOT bound the wait to be admitted — that is --admit-timeout, a separate budget defaulting to 30 minutes — so `drain wait --timeout 10s` can still queue far longer than 10s before its 10-second hold even starts. When it fires the hold is released by cgroup.kill and the exit code is confine's usual pass-through (137)"),
+			stringSpec("admit_timeout", false, false, "Positive bound on the ADMISSION WAIT ONLY: how long to wait for the slice to drain before giving up, defaulting to 30 minutes. It is not a hold duration; see --timeout"),
+			stringSpec("reason", false, false, "Free-text label for WHY the slice is being held (\"deploy: slice-ceiling flip\"), rendered by `confine --list` and `aira top` so another blocked session can see what is going on. Diagnostic only: no admission decision reads it"),
+		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			_ = ctx
+			_ = stringArg(args, "subverb")
+			_ = stringArg(args, "timeout")
+			_ = stringArg(args, "admit_timeout")
+			_ = stringArg(args, "reason")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: drain is a direct CLI-only foreground verb")
+		}},
 		// confine-status is CLI-only, like confine and confine-reserve, and unlike
 		// confine-list/confine-kill: it reads a durable filesystem record and needs
 		// no daemon at all. Routing it through the daemon would make AIRA-22's
@@ -2137,8 +2171,13 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
 		"confine-kill":    {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
 		"confine-status":  {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
-		"install":         {summary: "Install and inspect the AIRA-owned confinement slice", safety: SafetyExecute, example: []string{"--status"}},
-		"time":            {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		// AIRA-185. Excluded from Include below for the same reason confine is, and
+		// one stronger: a connection-bound foreground hold cannot be a
+		// request/response tool without either fabricating success or blocking a
+		// dispatcher for up to half an hour. The example is real and runnable.
+		"drain":   {summary: "Hold the slice empty for a deploy, reusing exclusive-mode admission", safety: SafetyExecute, example: []string{"wait", "--reason", "deploy"}},
+		"install": {summary: "Install and inspect the AIRA-owned confinement slice", safety: SafetyExecute, example: []string{"--status"}},
+		"time":    {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"commands": {summary: "Read recorded command events and exact distributions", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "ls", Summary: "List recorded command events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "key-source:program-subcommand key:go test"}},
 			{Name: "count", Summary: "Count command events by a dimension", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by", Required: true}}, Example: []string{"count", "status:exited", "--by", "key"}},
@@ -2218,8 +2257,10 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
+		// AIRA-185 adds "drain" to the CLI-only exclusion list. See its descriptor:
+		// a foreground, connection-bound hold has no honest request/response form.
 		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive,
-			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "install"
+			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "drain" && name != "install"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

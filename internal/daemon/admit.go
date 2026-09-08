@@ -355,6 +355,20 @@ type admitWaiter struct {
 	exclusiveHolder string
 	parentScopeID   string
 
+	// AIRA-185. exclusiveReason is the holder's own free-text label for WHY the
+	// slice is held ("deploy: slice-ceiling flip"), which the identity fields
+	// cannot carry: `name` must be a valid confine identity and must match the
+	// scope id. Set at construction under queue.mu, like every other waiter field,
+	// and read only by the snapshot walk.
+	//
+	// It is DIAGNOSTIC ONLY, on exactly the terms `signature` above is: no
+	// admission, gate, emptiness or reaping decision reads it, so a malformed or
+	// hostile value can only change what an operator is shown. Bounded at the one
+	// place it is retained (validateAdmitArgs -> boundedAdmitReason), so the
+	// memory and the wire are bounded together and a multi-megabyte label cannot
+	// push a `confine --list` reply past MaxFrameBytes.
+	exclusiveReason string
+
 	// AIRA-149. DIAGNOSIS ONLY: neither field is read by any admission or grant
 	// decision, and both are written ONLY inside evaluateAdmitQueue's existing
 	// refusal branches, under queue.mu -- the same discipline as the AIRA-29
@@ -915,16 +929,19 @@ type AdmitResponse struct {
 }
 
 type admitRequest struct {
-	slice           string
-	reserve         int64
-	maxWait         int64
-	signature       string
-	pinned          bool
-	scopeID         string
-	name            string
-	owner           string
-	delegateRAM     bool
-	exclusive       bool
+	slice       string
+	reserve     int64
+	maxWait     int64
+	signature   string
+	pinned      bool
+	scopeID     string
+	name        string
+	owner       string
+	delegateRAM bool
+	exclusive   bool
+	// AIRA-185. The holder's own free-text label for why the slice is held.
+	// DIAGNOSTIC ONLY and already bounded by validateAdmitArgs.
+	exclusiveReason string
 	exclusiveHolder string
 	parentScopeID   string
 
@@ -1363,6 +1380,10 @@ type admitSnapshot struct {
 	exclusiveName    string
 	exclusiveOwner   string
 	exclusiveScopeID string
+	// AIRA-185. The holder's own free-text reason, taken from the SAME waiter the
+	// identity above came from so the label and the job it qualifies can never
+	// come from different instants. Empty is a positive "none supplied".
+	exclusiveReason string
 	// exclusiveWaiting counts the queued waiters actually held up behind the
 	// exclusive job. It excludes the exclusive waiter itself.
 	exclusiveWaiting int
@@ -1406,6 +1427,30 @@ func boundedAdmitSignature(signature string) string {
 		count++
 	}
 	return signature
+}
+
+// boundedAdmitReason bounds the DIAGNOSTIC copy of a client-supplied exclusive
+// hold reason (AIRA-185), on exactly the terms boundedAdmitSignature bounds a
+// signature and for the same availability reason: the admit protocol accepts a
+// string of any length up to the 16 MiB frame, and an unbounded copy retained on
+// a long-lived waiter would ride into every `confine --list` reply until the
+// response exceeded MaxFrameBytes and the verb stopped working for every job on
+// the slice.
+//
+// Surrounding whitespace is trimmed first, so a label that is only whitespace
+// becomes the empty string — an ABSENT reason, which every renderer omits —
+// rather than a blank clause claiming a purpose was given.
+func boundedAdmitReason(reason string) string {
+	trimmed := strings.TrimSpace(reason)
+	const limit = runner.ConfineExclusiveReasonWireLimit
+	count := 0
+	for index := range trimmed {
+		if count == limit {
+			return trimmed[:index] + "…"
+		}
+		count++
+	}
+	return trimmed
 }
 
 // admitReservationRow is one scope-less reservation, copied out of a waiter
@@ -1560,6 +1605,8 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		snapshot.exclusiveName = exclusive.name
 		snapshot.exclusiveOwner = exclusive.owner
 		snapshot.exclusiveScopeID = exclusive.scopeID
+		// AIRA-185, from the same waiter as the identity above.
+		snapshot.exclusiveReason = exclusive.exclusiveReason
 		// Only waiters actually held up behind it: the exclusive waiter is never
 		// counted as waiting for itself.
 		snapshot.exclusiveWaiting = subtractJobCount(snapshot.queued, 1)
@@ -2205,7 +2252,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
@@ -3048,11 +3095,14 @@ func admitErrorCode(err error) string {
 }
 
 func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, error) {
-	if len(args) < 3 || len(args) > 12 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	// AIRA-185 widened the count to 13 and added `reason` to the allowlist below.
+	// Both are ADDITIVE: no existing field changed meaning, and no admission,
+	// gate or emptiness decision reads the new one.
+	if len(args) < 3 || len(args) > 13 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" {
+		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -3118,6 +3168,24 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 			return admitRequest{}, fmt.Errorf("%s: admit exclusive must be boolean", CodeProtocol)
 		}
 	}
+	// AIRA-185. A free-text label for WHY this slice is being held, which the
+	// identity fields cannot carry: `name` must be a valid confine identity (no
+	// spaces, no colons) and must match the scope id, so "deploy: slice-ceiling
+	// flip" satisfies neither constraint.
+	//
+	// DIAGNOSTIC ONLY. It is retained on the waiter, reported in the snapshot, and
+	// read by nothing that decides anything — not sliceProvablyEmpty, not the
+	// exclusive gate, not the reaper — so a malformed or hostile value can only
+	// change what an operator is shown. Bounded here for the same availability
+	// reason `signature` is (see boundedAdmitSignature).
+	exclusiveReason := ""
+	if raw, exists := args["reason"]; exists {
+		text, valid := raw.(string)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit reason must be a string", CodeProtocol)
+		}
+		exclusiveReason = boundedAdmitReason(text)
+	}
 	exclusiveHolder := ""
 	if raw, exists := args["exclusive_holder"]; exists {
 		text, valid := raw.(string)
@@ -3157,6 +3225,17 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if _, hasScope := args["scope_id"]; hasScope {
 			return admitRequest{}, fmt.Errorf("%s: admit parent_scope_id is for sub-reservations and cannot accompany scope_id", CodeProtocol)
 		}
+	}
+	// AIRA-185. `reason` is reported ONLY through the exclusive state, so on a
+	// non-exclusive request there is nowhere to attribute it and nothing would
+	// ever render it. REFUSED rather than accepted-and-discarded, on the AIRA-82
+	// discipline: a field the caller asked for and silently did not get is the
+	// confidently-wrong reporting this codebase exists to refuse. Every real
+	// producer (`aira drain wait`) always sets exclusive, and the runner drops a
+	// stray reason before it reaches the wire, so this refusal is reachable only
+	// by a hand-crafted request.
+	if exclusiveReason != "" && !exclusive {
+		return admitRequest{}, fmt.Errorf("%s: admit reason describes an exclusive hold and requires exclusive", CodeProtocol)
 	}
 	if exclusive {
 		// A nested exclusive inside a hold could never satisfy the emptiness rule
@@ -3230,7 +3309,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3239,7 +3318,11 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	if exclusive {
 		return admitRequest{}, fmt.Errorf("%s: admit exclusive requires the scope_id, name and owner tuple", CodeProtocol)
 	}
-	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+	// exclusiveReason is provably empty on this path (it requires exclusive, and
+	// exclusive requires the tuple refused just above), and it is transcribed
+	// anyway so that relaxing either rule later cannot silently drop the field
+	// instead of failing a test.
+	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

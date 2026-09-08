@@ -45,6 +45,17 @@ const (
 	// becoming 30m on the wire while daemon tests passed. A caller that exceeds
 	// this is REFUSED and told the ceiling, never silently substituted.
 	AdmitWaitCeiling = 24 * time.Hour
+	// DefaultConfineAdmissionWait is how long a confine launch waits to be
+	// ADMITTED when the caller declares no --admit-timeout. It bounds the wait to
+	// get in, and nothing about the job once it is running — ConfineRequest.Timeout
+	// is that, and the two are routinely confused.
+	//
+	// Exported for AIRA-185: `aira drain wait` must be able to TELL an operator
+	// what its admission budget actually is, because `drain wait --timeout 10s`
+	// reads as "give up after 10 seconds" and does not mean that. It was an
+	// unexported literal inside admitConfine, so a face that wanted to report it
+	// would have had to restate it and drift.
+	DefaultConfineAdmissionWait = 30 * time.Minute
 	// MinPinnedScopeCap is the smallest reserve a caller may DECLARE. It mirrors
 	// the minimum `aira confine --memory-reserve` already accepts, so the CLI, the
 	// runner and the daemon all agree on one bound.
@@ -556,7 +567,17 @@ type ConfineRequest struct {
 	// be established the launch is REFUSED, never silently downgraded, because a
 	// benchmark that runs contended while believing otherwise produces numbers
 	// that look clean — the incident this flag exists to prevent.
-	Exclusive        bool
+	Exclusive bool
+	// AIRA-185. ExclusiveReason is a free-text label for WHY the slice is being
+	// held exclusively ("deploy: slice-ceiling flip"), which `aira drain wait
+	// --reason` supplies so `confine --list` can attribute the hold to a purpose
+	// rather than to a placeholder Name. Name cannot carry it: it must be a valid
+	// confine identity (no spaces, no colons) and must match the scope id.
+	//
+	// DIAGNOSTIC ONLY, and IGNORED unless Exclusive is set — see
+	// Request.ExclusiveReason for why forwarding it on a non-exclusive request
+	// would turn a harmless label into a refused launch.
+	ExclusiveReason  string
 	ScopeMemoryMax   int64
 	ScopeMemoryHigh  int64
 	AdmissionMaxWait time.Duration

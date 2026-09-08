@@ -155,6 +155,10 @@ func verbAcceptsScopeDir(verb string) bool {
 		"aitest-bootstrap", "worker-admit",
 		// AIRA-127. `top` watches the machine-wide slice and resolves no project.
 		"top",
+		// AIRA-185. A drain holds the machine-wide slice and resolves no project,
+		// exactly like the confine family it is sugar over, so the override is
+		// REFUSED rather than accepted and discarded.
+		"drain", "drain-hold",
 		"help", "--help":
 		return false
 	}

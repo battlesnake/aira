@@ -541,7 +541,38 @@ type ConfineExclusiveState struct {
 	// that went backwards), never "zero seconds": a renderer must omit the clause
 	// rather than print a fabricated 0s.
 	SinceMS int64 `json:"since_ms,omitempty"`
+
+	// AIRA-185. Reason is the holder's own free-text label for WHY the slice is
+	// exclusive ("deploy: slice-ceiling flip"), supplied by `aira drain wait
+	// --reason`. It exists because Name cannot carry it: Name must be a valid
+	// confine identity (no spaces, no colons) and must match the scope id, so a
+	// human-readable purpose has nowhere to live in the identity fields.
+	//
+	// It is DIAGNOSTIC ONLY and takes part in no admission, gate or reaping
+	// decision anywhere: an absent, malformed or hostile value can only change
+	// what an operator is shown.
+	//
+	// Empty means the holder supplied none — every `aira confine --exclusive` does
+	// — and a renderer must omit the clause rather than invent one. It is
+	// UNTRUSTED terminal-bound text: bounded on the wire by
+	// ConfineExclusiveReasonWireLimit and escaped plus re-bounded by every
+	// renderer.
+	Reason string `json:"reason,omitempty"`
 }
+
+// ConfineExclusiveReasonWireLimit bounds the reason the DAEMON retains and puts
+// on the wire, for the same availability reason
+// ConfineReservationSignatureWireLimit exists: the admit protocol would
+// otherwise accept a reason of any size up to the 16 MiB frame, and an
+// unbounded diagnostic copy on a long-lived waiter would ride into every
+// `confine --list` reply until the response exceeded MaxFrameBytes and the verb
+// stopped working for every job on the slice.
+const ConfineExclusiveReasonWireLimit = 512
+
+// ConfineExclusiveReasonLimit bounds what a RENDERER prints. Narrower than the
+// wire limit on purpose: a JSON consumer should get the whole label, while the
+// terminal gets a line it can display beside the identity it qualifies.
+const ConfineExclusiveReasonLimit = 96
 
 type ConfineKillResult struct {
 	Status  string `json:"status"`
