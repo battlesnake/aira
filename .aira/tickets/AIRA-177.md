@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-177","project":"aira","title":"aira install should default the slice-ceiling to enforce, not observe","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-106","to":"AIRA-177"}]}
+{"schema":1,"id":"AIRA-177","project":"aira","title":"aira install should default the slice-ceiling to enforce, not observe","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[]}
 ---
 
 Owner decision (2026-09-08): "slice ceiling should be enforced by default (and
