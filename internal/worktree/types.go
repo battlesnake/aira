@@ -115,11 +115,10 @@ type TicketBinding struct {
 	TicketStatus gitcontext.Field `json:"ticket_status"`
 	// LiveLease says whether a currently-live lease is held on this ticket, and
 	// from which worktree.
-	LiveLease        Flag   `json:"live_lease"`
-	LeaseWorktreeID  string `json:"lease_worktree_id,omitempty"`
-	LeaseActor       string `json:"lease_actor,omitempty"`
-	LeaseHeldHere    bool   `json:"lease_held_here,omitempty"`
-	LeaseHeldEndOnly bool   `json:"-"`
+	LiveLease       Flag   `json:"live_lease"`
+	LeaseWorktreeID string `json:"lease_worktree_id,omitempty"`
+	LeaseActor      string `json:"lease_actor,omitempty"`
+	LeaseHeldHere   bool   `json:"lease_held_here,omitempty"`
 }
 
 // Facts is the independently-named evidence an audit establishes per checkout.

@@ -97,7 +97,9 @@ func (a *Auditor) Audit(ctx context.Context, in Inputs) (Report, error) {
 	}
 	deadline := a.now().Add(budget)
 
-	report := Report{Root: in.Root}
+	// An empty list, never null: "no checkout matched" is an answer, and a null
+	// here would read to a consumer as "the audit produced nothing".
+	report := Report{Root: in.Root, Worktrees: []Entry{}}
 	out, stderr, err := a.git()(ctx, in.Root, "worktree", "list", "--porcelain")
 	if err != nil {
 		return Report{}, fmt.Errorf("%s: %s", CodeScan, gitFailure("worktree list", stderr, err))

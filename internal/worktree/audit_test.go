@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -729,5 +730,39 @@ func TestSupersededNeedsEveryBoundTicketEstablishedClosed(t *testing.T) {
 	entry := entryFor(t, report, "/wt/feature")
 	if entry.Recommendation.Code == RecommendSuperseded {
 		t.Fatalf("recommendation=%+v: one unreadable bound ticket must sink the bucket", entry.Recommendation)
+	}
+}
+
+// TestAReportWithNoMatchesIsEmptyNotNull. A ticket selector that matches no
+// checkout is an ANSWER — "nothing here is bound to that ticket" — and must not
+// serialise as a null a consumer reads as "the audit produced nothing".
+func TestAReportWithNoMatchesIsEmptyNotNull(t *testing.T) {
+	repo := oneFeatureRepo()
+	report, _ := runAudit(t, repo, Inputs{Selector: Selector{TicketID: "AIRA-404"}})
+	if report.Worktrees == nil {
+		t.Fatal("worktrees is nil; want an empty list")
+	}
+	if len(report.Worktrees) != 0 {
+		t.Fatalf("worktrees=%+v, want none", report.Worktrees)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"worktrees":[]`) {
+		t.Fatalf("encoded=%s, want an empty worktrees list", encoded)
+	}
+}
+
+// TestAnUnboundCheckoutReportsAnEmptyBindingList is the per-entry twin.
+func TestAnUnboundCheckoutReportsAnEmptyBindingList(t *testing.T) {
+	repo := oneFeatureRepo()
+	report, _ := runAudit(t, repo, Inputs{})
+	entry := entryFor(t, report, "/wt/feature")
+	if entry.Bindings == nil {
+		t.Fatal("bindings is nil; want an empty list on an unbound checkout")
+	}
+	if entry.Confidence != ConfidenceNone {
+		t.Fatalf("confidence=%q, want none", entry.Confidence)
 	}
 }
