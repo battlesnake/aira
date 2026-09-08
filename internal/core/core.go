@@ -705,7 +705,7 @@ func (c *Core) DispatchDescriptors() []DispatchDescriptor {
 func (c *Core) dispatchTable() map[string]verbSpec {
 	verbs := map[string]verbSpec{
 		"help": {Name: "help", Usage: "help", Run: func(_ context.Context, _ *argAccessor) (any, error) { return c.Help(), nil }},
-		"init": {Name: "init", Usage: "init", Args: []ArgSpec{stringSpec("project", false, false, "Project slug"), listSpec("prefixes", false, false, "ID prefixes")}, MCPTool: "aira_init", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"init": {Name: "init", Usage: "init [--project SLUG] [--prefixes P,...]", Args: []ArgSpec{stringSpec("project", false, false, "Project slug"), listSpec("prefixes", false, false, "ID prefixes")}, MCPTool: "aira_init", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if c.initializer == nil {
 				return nil, fmt.Errorf("E_CONFIG_INVALID: init is unavailable without a project initializer")
 			}
