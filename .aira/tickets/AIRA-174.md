@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-174","project":"aira","title":"run-input HELLO read side still reports E_RUN_INPUT_OUTCOME_UNKNOWN for a peer that closed without a frame before any DATA was sent","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["runner"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-174","project":"aira","title":"run-input HELLO read side still reports E_RUN_INPUT_OUTCOME_UNKNOWN for a peer that closed without a frame before any DATA was sent","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["runner"],"hold":false,"relations":[]}
 ---
 Found by the AIRA-173 build-review (Fable, PR #107, merged `7401e8d`). The ID was
 allocated by `aira id`; the file is hand-written because the installed binary
@@ -157,3 +157,70 @@ Gate, exact exit codes, all under `aira confine`:
    reading, so there is no before/after rate to report and none is implied.
 3. The darwin/windows cross-build finding recorded on AIRA-173 is pre-existing
    and unrelated; still not fixed here.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #108 merged as `7f37b1c` (head `ef3c676`). Reviewer's own verification, not
+the builder's narrative:
+
+- **Scope is exactly the HELLO read, and exactly the AIRA-173 mirror.** The diff
+  touches one call site (`connectRunInput`'s post-write read, now
+  `readRunInputHelloResponse`), adds that reader, and extracts the decoded-frame
+  switch into `interpretRunInputResponse`. The extraction was checked against the
+  pre-fix body at `01def2d`: verbatim. Server untouched. The write side's
+  `classifyRunInputHelloWriteError` classifies every read failure (any kind) as
+  `UNREACHABLE` with committed 0; the new reader does the same for the read, so
+  the two halves of the handshake now agree.
+- **Mid-stream, CLOSE and final-ACK paths are genuinely untouched.** All three
+  callers (`run_input_linux.go:51`, `:82`, `:105`) still call
+  `readRunInputResponse`, whose error branch is byte-for-byte the pre-fix one:
+  `E_RUN_INPUT_OUTCOME_UNKNOWN` with the last proven committed count. Pinned by
+  `TestRunInputClientDroppedBeforeFinalACKIsOutcomeUnknownWithoutRetry`
+  (committed 4), unchanged.
+- **Decoded refusal frames keep their code and retry behaviour.** A frame that
+  arrives goes through the shared switch with `lastCommitted` 0, exactly as
+  before, so a zero-committed BUSY still hits the `connectRunInput` retry gate
+  at `:185` and every other code is terminal on the first dial. The
+  `errors.As(err, &determinate)` guard can only match a top-level
+  `*RunInputError` (the type has no `Unwrap`), and `readRunInputFrame` yields one
+  only from `runInputProtocolError`, so no transport error can be misread as
+  determinate and no protocol verdict can be demoted to `UNREACHABLE`.
+- **Decision 1 (any HELLO-read transport failure, timeout included) accepted.**
+  D6 §3 invariant 3 buckets "dead/stale → `UNREACHABLE`; ambiguity →
+  `OUTCOME_UNKNOWN` with the committed count"; a peer that accepts and never
+  answers has taken no DATA, so there is no ambiguity to report, and "stale"
+  with "suggest `reconcile`" is the right operator hint for a wedged supervisor.
+  Exit 3 is the unevaluated bucket and was wrong here; 4 is correct. No
+  document, code catalogue or CLI text outside `internal/runner` names the
+  handshake-timeout code, so nothing went stale.
+- **New test is a genuine, non-porous mirror of
+  `TestRunInputClientReportsUnreachableWhenHelloWriteFindsNoRefusal`.** Same
+  four assertions (a `RunInputError`; explicit `!= OUTCOME_UNKNOWN`;
+  `== UNREACHABLE && Committed == 0`; `dials == 1`) plus a discriminator the
+  precedent could not have: the peer goroutine sets `helloRead` only after
+  `readRunInputFrame` returned a HELLO, and closes only after that (deferred),
+  so the client's EOF is strictly ordered after the flag and the test can never
+  pass by exercising the write side. The socketpair peer makes the write succeed
+  deterministically; no scheduling dependency.
+- **RED confirmed by the reviewer, not taken on trust.** The new test file from
+  `ef3c676` dropped into a throwaway detached worktree at pre-fix `01def2d`,
+  `go test -run` on the two new tests under `aira confine`: both FAIL, exit 1,
+  `TestRunInputClientReportsUnreachableWhenHelloReadFindsNoFrame` reporting
+  `E_RUN_INPUT_OUTCOME_UNKNOWN` and the malformed-answer test reporting the
+  double-stated `E_RUN_INPUT_OUTCOME_UNKNOWN: E_RUN_INPUT_PROTOCOL: … (committed=0)`.
+- **GREEN run by the reviewer:** `go test ./internal/runner/ -run RunInput
+  -count=2 -race` on the PR worktree under `aira confine`: `ok`, exit 0. `gofmt -l`
+  on the three changed files: empty, exit 0.
+- **Gate exit codes verified on disk.** `~/tmp/aira174-fullsuite.log` (1005 B):
+  zero `FAIL` lines, `ok aira/internal/runner 149.229s`, confine trailer
+  `terminated-by=normal`. `~/tmp/aira174-push.log`: the pre-push `make ci`
+  transcript (`go vet`, `go build`, `go test ./... -count=1 -timeout 20m`), zero
+  `FAIL` lines, `ok aira/internal/runner 152.617s`, push accepted. PR #108 CI on
+  head `ef3c676`: `build + vet + gofmt`, `test`, `race` all SUCCESS.
+- **Accepted gaps stand as written.** The three bare-close server paths are not
+  deterministically constructible without a new flake; the fix depends on no
+  server property. Pre-existing and not widened here: a context cancelled
+  during the HELLO read is not wired to the connection, so it surfaces after the
+  2 s handshake deadline as `UNREACHABLE` (previously `OUTCOME_UNKNOWN`) rather
+  than `ctx.Err()`; there is no cancellation test on the run-input client.
+  Noted for a follow-up if it ever matters in practice.
