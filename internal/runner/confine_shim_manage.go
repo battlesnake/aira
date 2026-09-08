@@ -37,7 +37,15 @@ func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegis
 		// where there is no /proc or cgroup to read), so the wrapped command and the
 		// CPU usage are as unestablished here as the rss and the cap are. Naming
 		// them unevaluated is what stops a renderer printing an absence as a fact.
-		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap", "command", "cpu"}}
+		//
+		// AIRA-183 adds "supervisor_live" on the same grounds, and the temptation it
+		// resists is worth naming: every row here comes from the daemon's LIVE
+		// admit-lease registry, so it looks free to call its supervisor alive. That
+		// would be a fabricated reading. A granted lease can outlive its holder —
+		// the AIRA-49 stale-lease sweep exists precisely because it does — so lease
+		// membership is grounds for refusing to call a scope orphaned, and nothing
+		// more.
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap", "command", "cpu", "supervisor_live"}}
 		if age := time.Since(time.Unix(0, stamp)); age >= 0 {
 			seconds := int64(age / time.Second)
 			record.AgeSeconds = &seconds

@@ -28,6 +28,10 @@ type confineScanDeps struct {
 	// field-by-field keeps the production behaviour rather than silently losing
 	// the field.
 	readCmdline func(pid int) ([]byte, error)
+	// supervisorLive is the AIRA-183 seam for the supervisor-liveness reading,
+	// tri-state: alive, dead, or unestablished. Nil falls back to the real
+	// kill(pid, 0) probe on exactly the same reasoning as readCmdline above.
+	supervisorLive func(pid int) *bool
 	// afterReapEmptyProof is a test seam for the phase-one/phase-two race.
 	afterReapEmptyProof func()
 }
@@ -39,7 +43,7 @@ const confineReapMaxDepth = 32
 var confineReapOpenat = unix.Openat
 
 func defaultConfineScanDeps() confineScanDeps {
-	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty, readCmdline: readProcCmdline}
+	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty, readCmdline: readProcCmdline, supervisorLive: probeSupervisorLive}
 }
 
 func ResolveConfineManagementSlice(slice string) (string, string, error) {
@@ -153,6 +157,23 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 	if readCmdline == nil {
 		readCmdline = readProcCmdline
 	}
+	supervisorLive := deps.supervisorLive
+	if supervisorLive == nil {
+		supervisorLive = probeSupervisorLive
+	}
+	// AIRA-183. The daemon's own live admit-lease set, as a lookup. It is used
+	// for ONE thing here, and deliberately only for that: to VETO an "orphaned"
+	// reading, never to assert a live one. A granted lease can outlive its holder
+	// (that is why the AIRA-49 stale-lease sweep exists at all), so its presence
+	// is not proof the supervisor is alive — but a supervisor that probes dead
+	// while its lease is still held is exactly what a PID-namespace-local
+	// supervisor PID looks like from outside the namespace, and the orphan reaper
+	// already refuses to reap on that disagreement. The listing refuses to name
+	// it, on the same grounds.
+	leased := make(map[string]struct{}, len(registry))
+	for _, entry := range registry {
+		leased[entry.ScopeID] = struct{}{}
+	}
 	byID := make(map[string]ConfineRecord)
 	for _, entry := range entries {
 		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".aira-CONFINE-") {
@@ -182,6 +203,18 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			}
 		} else {
 			record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
+		}
+		// AIRA-183. Whether the SUPERVISOR still exists, read beside its argv from
+		// the same PID and, like it, independently of whether the scope directory
+		// can be opened at all.
+		if state := supervisorLive(pid); state != nil {
+			if _, held := leased[scopeID]; held && !*state {
+				record.UnevaluatedFields = append(record.UnevaluatedFields, "supervisor_live")
+			} else {
+				record.SupervisorLive = state
+			}
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "supervisor_live")
 		}
 		if age := deps.now().Sub(time.Unix(0, stamp)); age >= 0 {
 			seconds := int64(age / time.Second)
@@ -440,6 +473,45 @@ func removeConfineReapTree(parentFD int, tree *confineReapTree) error {
 		}
 	}
 	return unix.Unlinkat(parentFD, tree.name, unix.AT_REMOVEDIR)
+}
+
+// probeSupervisorLive answers "does the process that launched this scope still
+// exist" from the same kill(pid, 0) signal pidIsDead below uses for the orphan
+// reaper — but as a TRI-STATE, because the listing renders its answer to an
+// operator who may act on it (AIRA-183).
+//
+// A non-positive PID is not probed at all: kill(0, 0) signals the caller's own
+// PROCESS GROUP, which would answer "alive" about something that is not the
+// supervisor, and a negative PID addresses a group too.
+func probeSupervisorLive(pid int) *bool {
+	if pid <= 0 {
+		return nil
+	}
+	return supervisorLiveFromSignalError(unix.Kill(pid, 0))
+}
+
+// supervisorLiveFromSignalError is the whole decision, separated from the
+// syscall so it can be tested exhaustively rather than against whichever PIDs a
+// test host happens to have.
+//
+//   - no error: the PID exists and is signallable — alive.
+//   - EPERM: the PID exists and belongs to someone else — still alive. A PID the
+//     caller may not signal is a PID that is taken.
+//   - ESRCH: no process holds this PID — dead. This is the ONLY reading that can
+//     produce an orphaned row, and it is the one an operator acts on.
+//   - anything else (EINVAL, or an error class this kernel invents later):
+//     unestablished. Never dead by default.
+func supervisorLiveFromSignalError(err error) *bool {
+	live := true
+	switch {
+	case err == nil, errors.Is(err, unix.EPERM):
+		return &live
+	case errors.Is(err, unix.ESRCH):
+		live = false
+		return &live
+	default:
+		return nil
+	}
 }
 
 func pidIsDead(pid int) bool {

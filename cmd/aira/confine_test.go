@@ -210,12 +210,18 @@ func TestRenderConfineListLiveColumnUsesSubtreePopulation(t *testing.T) {
 	if strings.Contains(output, "POPULATED") {
 		t.Fatalf("the ambiguous POPULATED column survived: %q", output)
 	}
-	if output = render(t, &dead); !strings.Contains(output, "no") {
-		t.Fatalf("a genuinely empty scope does not render LIVE=no: %q", output)
+	// AIRA-183 tightened the two assertions below. They were
+	// strings.Contains(output, "no") and (output, "unevaluated") over the WHOLE
+	// table, and the first was porous: the OWNER column renders
+	// runner.ConfineUnknownOwner — "unknown" — which contains "no", so it passed
+	// against any rendering at all, including the POPULATED column this very test
+	// exists to have removed. Both now read the LIVE cell of the named row.
+	if got := liveCell(t, render(t, &dead), "split-job"); got != "no" {
+		t.Fatalf("a genuinely empty scope renders LIVE=%q, want no", got)
 	}
 	// An unreadable population is unevaluated, never a fabricated "no".
-	if output = render(t, nil); !strings.Contains(output, "unevaluated") {
-		t.Fatalf("an unreadable population must render unevaluated, not a guess: %q", output)
+	if got := liveCell(t, render(t, nil), "split-job"); got != "unevaluated" {
+		t.Fatalf("an unreadable population renders LIVE=%q, want unevaluated", got)
 	}
 }
 

@@ -2995,11 +2995,19 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	for _, record := range result.Scopes {
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			record.Name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
-			confineBoolYesNo(record.SubtreePopulated),
+			confineLiveStatus(record),
 			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds), confineString(record.Cap))
 	}
 	if err := table.Flush(); err != nil {
 		return exitForError("E_RUN_DETACH_FAILED")
+	}
+	// AIRA-183. The legend for the two states AIRA-102's "no" used to conflate,
+	// printed ONLY when a row actually shows one of them and naming only the
+	// words that are on screen. An unconditional legend would be noise on the
+	// listing an operator reads most (every row running), and a legend for a word
+	// that is not present would be worse than noise.
+	if legend := confineLiveLegend(result.Scopes); legend != "" {
+		_, _ = fmt.Fprintln(stdout, legend)
 	}
 	if result.SliceReserve != nil {
 		jobLabel := "jobs"
@@ -3211,10 +3219,10 @@ func confineInt(value *int) string {
 	return strconv.Itoa(*value)
 }
 
-// confineBoolYesNo renders the LIVE column (AIRA-102). A nil is "unevaluated",
-// never "no": a population that could not be read is not evidence of a dead job,
-// and rendering it as one is the exact class of fabricated zero this repository
-// forbids.
+// confineBoolYesNo renders a subtree-population reading (AIRA-102). A nil is
+// "unevaluated", never "no": a population that could not be read is not evidence
+// of a dead job, and rendering it as one is the exact class of fabricated zero
+// this repository forbids.
 func confineBoolYesNo(value *bool) string {
 	if value == nil {
 		return "unevaluated"
@@ -3223,6 +3231,77 @@ func confineBoolYesNo(value *bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// The two LIVE values AIRA-183 splits out of AIRA-102's bare "no". They are
+// constants because the renderer, the legend and the tests must all mean the
+// same word by them; a legend that named a word the table did not print would be
+// the same class of defect as the ambiguity it exists to remove.
+const (
+	confineLiveIdle     = "idle"
+	confineLiveOrphaned = "orphaned"
+)
+
+// confineLiveStatus renders the LIVE column.
+//
+// AIRA-102 made this column subtree-aware, which fixed reading a busy job as
+// dead. AIRA-183 fixes what it left: an empty subtree still rendered a bare
+// "no", and "no" was two different situations at once — a supervisor that has
+// DIED (the scope is orphaned and will be reaped) and a supervisor that is very
+// much alive between processes. An operator read one as the other, concluded a
+// kill had failed, and killed a second, unrelated job on that basis.
+//
+// The ordering is deliberate. SubtreePopulated is asked FIRST and answers
+// outright when it is true or unknown, because supervisor liveness cannot
+// improve either of those answers: a scope with live processes is running
+// whoever launched it, and a population that could not be read is unevaluated no
+// matter what the supervisor is doing.
+//
+// The supervisor reading only refines the EMPTY case, and when it is itself
+// unestablished the column falls back to exactly the "no" AIRA-102 printed —
+// the same true statement about the subtree, with no claim about the supervisor
+// attached to it.
+func confineLiveStatus(record runner.ConfineRecord) string {
+	if record.SubtreePopulated == nil {
+		return "unevaluated"
+	}
+	if *record.SubtreePopulated {
+		return "yes"
+	}
+	if record.SupervisorLive == nil {
+		return "no"
+	}
+	if *record.SupervisorLive {
+		return confineLiveIdle
+	}
+	return confineLiveOrphaned
+}
+
+// confineLiveLegend explains the LIVE values actually present in this listing,
+// or says nothing. It is derived from confineLiveStatus rather than from the
+// record fields a second time, so the legend cannot describe a state the table
+// did not render.
+func confineLiveLegend(scopes []runner.ConfineRecord) string {
+	idle, orphaned := false, false
+	for _, record := range scopes {
+		switch confineLiveStatus(record) {
+		case confineLiveIdle:
+			idle = true
+		case confineLiveOrphaned:
+			orphaned = true
+		}
+	}
+	clauses := make([]string, 0, 2)
+	if idle {
+		clauses = append(clauses, confineLiveIdle+" = the scope subtree has no process right now but its supervisor is alive (mid fork/exec, or a genuinely idle moment) — nothing to investigate")
+	}
+	if orphaned {
+		clauses = append(clauses, confineLiveOrphaned+" = the supervisor PID is gone and the scope is empty — the daemon's reaper removes it once it is past the reap grace, so there is nothing left to kill")
+	}
+	if len(clauses) == 0 {
+		return ""
+	}
+	return "LIVE: " + strings.Join(clauses, "; ")
 }
 
 // confinePlural keeps the AIRA-68 breakdown line grammatical for a single-member
