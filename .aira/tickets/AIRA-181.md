@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-181","project":"aira","title":"Admission-wait progress line reports the QUEUE, never the RUNNING reserve that is the actual blocker at position 1","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-181","to":"AIRA-186"},{"kind":"relates","from":"AIRA-193","to":"AIRA-181"}]}
+{"schema":1,"id":"AIRA-181","project":"aira","title":"Admission-wait progress line reports the QUEUE, never the RUNNING reserve that is the actual blocker at position 1","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-181","to":"AIRA-186"},{"kind":"relates","from":"AIRA-193","to":"AIRA-181"}]}
 ---
 
 Four independent peer sessions hit the same misreading tonight
@@ -95,3 +95,54 @@ as [[AIRA-178]] (no live actuator reclaims capacity from already-admitted,
 still-growing jobs) and [[AIRA-177]] (narrows how far over-ceiling the
 slice can drift at admission time, doesn't close it). No new ticket
 filed for this.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #116 merged as `b186877` (2026-09-09), together with [[AIRA-186]] as one
+change (branch `aira181-186-admission-reporting`, tip `2c1f83a`). Everything
+below is the reviewer's own verification, not the builder's transcript.
+
+- The wait line now carries both populations, each under its own noun:
+  `queue position 1 of 9 by enqueue order, 0B queued ahead, 52G already granted
+  across 9 admitted jobs / 64G slice ceiling`. Vocabulary is `confine --list`'s
+  own summary line (`cmd/aira/main.go:3018`), so the two surfaces cross-check.
+  The `:181-184` warning is answered rather than restated: "queued ahead" and
+  "already granted" cannot be read as the same figure, and the larger one is no
+  longer missing. Verified from source that `GrantedBytes = outstanding +
+  adopted` sums only GRANTED, accounted waiters (`admit.go:2721`) — never the
+  queue — and that `CeilingBytes` is cap-minus-headroom for `totalJobs+1`, the
+  same term the evaluator applies (`admit.go:2642-2644`).
+- Established-zero is printed (`0B ... across 0 admitted jobs`) and an
+  unestablished pair is withheld; the pair is refused together on a negative
+  ledger figure. A zero `CeilingBytes` is rendered as an absence — a genuinely
+  collapsed ceiling is thereby conflated with an unreadable one, but the
+  AIRA-103 pressure clause on the same line still names the throttle, so this
+  is a residual, not a misstatement.
+- Gates, reviewer's own runs on `2c1f83a`, confined, exact exit codes: gofmt
+  `0`; `aira confine -- go test ./... -count=1` exit **0** (14 packages ok, 0
+  FAIL lines; the run itself queued behind a 17-deep admission line on the
+  pre-PR daemon and printed the old line — `queue position 5 of 17,
+  11066370866 queued ahead` with no granted-set figure — a live specimen of the
+  gap). CI: build+vet+gofmt pass, test pass, race pass.
+- Porosity, reviewer's own mutants (all killed on the intended assertion, tree
+  restored clean): held clause reading `aheadBytes` instead of `heldBytes` →
+  `TestConfineQueueNoteNamesTheReserveHeldByAdmittedJobs` fails on `0B already
+  granted`; launch path passing `0` instead of the printed reserve →
+  `TestConfineAdmissionWaitLineDoesNotRepeatAPinnedReserve` fails on `resolves
+  to 4G`; daemon reporting the ahead-sum instead of the matched waiter's own
+  reserve → daemon test fails `2G, want 3G`.
+
+ACCEPTED GAPS (recorded, not silent):
+
+1. Live ledger totals render as raw byte counts (`54194584616 already
+   granted ... / 52608M slice ceiling`) because `FormatConfineBytes` uses
+   exact divisors. The category error is fixed; the at-a-glance comparison is
+   not as good as it should be. [[AIRA-193]] (P3) carries the unit decision,
+   which also moves AIRA-24's existing "queued ahead" figure.
+2. The clause names GRANTED reserve, not live usage. `checkedAvailable`
+   (`admit.go:2805`) charges `max(outstanding, memory.current − reclaimable)`,
+   so when admitted jobs have grown past their grants ([[AIRA-178]]) a small
+   request can still wait against a line reading, say, `52G granted / 64G
+   ceiling`. `SliceCurrentBytes` is already on the wire; adding it is a
+   wording decision for the same line AIRA-193 redesigns, not a defect in what
+   these tickets asked for.

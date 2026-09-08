@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-186","project":"aira","title":"Unpinned reserve estimate has no relationship to the slice's own ceiling -- can request more than could ever be granted, indistinguishable from ordinary contention","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","estimator"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-193","to":"AIRA-186"}]}
+{"schema":1,"id":"AIRA-186","project":"aira","title":"Unpinned reserve estimate has no relationship to the slice's own ceiling -- can request more than could ever be granted, indistinguishable from ordinary contention","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","estimator"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-193","to":"AIRA-186"}]}
 ---
 
 Peer report (split, 2026-09-08), verified from source. Framed by the
@@ -98,3 +98,46 @@ reporter's own suggested wording for the reporting half: a line at the
 wait site naming the mismatch directly, e.g. `waiting: your grant 35.7G,
 slice free 12G, largest holder 9G`, rather than only describing queue
 position.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #116 merged as `b186877` (2026-09-09), together with [[AIRA-181]] as one
+change. Reviewer's own verification; gate exit codes and mutants are recorded
+on AIRA-181 and are not repeated here.
+
+- Gate decision on the open design question: PURE REPORTING FIX. The
+  estimator is not tempered by the ceiling — the reporter's own follow-up
+  shows the 35.7G estimate was correct (measured peak 31.97 GiB) and that
+  pinning lower OOM'd — consistent with keep-the-primitive, document-the-gap.
+- The ticket's premise needed correcting and the builder was right to do so:
+  "compare the caller's OWN resolved reserve" assumes the caller holds it. An
+  UNPINNED client holds only a compiled-in hint the daemon has already replaced
+  (`confine_linux.go:637-647`, `resolveAdmitReserve`), so a pinned-only fix
+  would have missed the reported case entirely. The daemon now reports
+  `ResolvedReserveBytes` — the MATCHED waiter's frozen `waiter.reserve`, taken
+  in the same locked pass and at the same match as the AIRA-24 position
+  (`admit.go:1553-1559`), deliberately not `ledgerCharge()` — on the existing
+  probe: one new wire field, no extra round trip, `confine --list` unchanged
+  (it passes no scope id). Verified the daemon returns a pinned reserve
+  verbatim, so the "is"/"resolves to" distinction is grounded.
+- The three modes are genuinely distinguished at the wait site:
+  queue-blocked (`N queued ahead` with position > 1); running-set-blocked
+  (position 1, `0B queued ahead, X already granted across N admitted jobs / Y
+  slice ceiling`); unschedulable-by-size (`this job's own reserve resolves to
+  70G — larger than the whole 61G slice ceiling, so it is blocked by its own
+  size and not by the jobs ahead of it; pin a smaller --memory-reserve`). The
+  reported 35G-of-61G case is correctly NOT called ungrantable — it is stated
+  as `resolves to 35G` beside the granted/ceiling pair so the caller can weigh
+  it — pinned by `large-but-grantable-is-not-called-ungrantable`. The
+  comparison is against `CeilingBytes` = cap-minus-headroom for one more job,
+  the same term the evaluator and the enqueue-time `reserve > ceiling`
+  refusal (`admit.go:2086`) use, so "exactly the ceiling" is admissible and
+  the strictly-greater test is the honest one.
+- The oversize verdict is reachable only after enqueue (the ceiling falls under
+  outside pressure or per-job headroom). Its remedy names one option (pin
+  smaller); waiting for a system-pressure throttle to clear is the other, and
+  the AIRA-103 pressure clause precedes it on the same line, so the reader has
+  the fact. Recorded as wording, not a defect.
+- Absence discipline holds: an unreported reserve prints nothing and the
+  client's hint is never substituted; a pinned figure already on the line is
+  not repeated, except in the oversize case, which always speaks.
