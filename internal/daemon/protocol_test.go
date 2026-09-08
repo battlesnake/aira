@@ -87,9 +87,17 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 // absent swap_cap, so an unbumped version would have run whole suites with the
 // memory.high livelock and no swap containment, silently. Every bump fails this
 // test if a later "consistency" revert takes the number back down.
+//
+// verifies: AIRA-179 — the 8→9 bump. The daemon now interprets a rant request's
+// `project`/`prefix` args as a target selector and swaps the store the request
+// runs against. Shape unchanged, semantics not: an OLD daemon ignores the
+// selector a NEW client sends and files the rant in the caller's own project,
+// silently — the wrong-project write the feature refuses by name everywhere
+// else, and undetectable below this layer because core.Do does not refuse an
+// argument its handler never reads.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 8 {
-		t.Fatalf("ProtocolVersion = %d, want 8; a wire-shape or wire-semantics change must "+
+	if ProtocolVersion != 9 {
+		t.Fatalf("ProtocolVersion = %d, want 9; a wire-shape or wire-semantics change must "+
 			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }
