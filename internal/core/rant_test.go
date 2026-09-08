@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/domain"
 	"aira/internal/gitcontext"
 )
 
@@ -68,5 +69,37 @@ func TestOnlyRantCaptureRequiresGitContext(t *testing.T) {
 		if got := RequiresGitContext(Request{Verb: "rant", Args: map[string]any{"subverb": operation}}); got != want {
 			t.Fatalf("operation %q requires context=%v, want %v", operation, got, want)
 		}
+	}
+}
+
+// A target selector names ANOTHER project's store, which no core can build:
+// only the daemon owns the machine-wide registration table and the scope
+// construction that reaches a project the caller is not standing in. Every
+// rant sub-verb must therefore refuse the selector by name here, and — the
+// load-bearing half — must NOT quietly fall back to filing locally under a
+// selector that asked for somewhere else.
+func TestRantCoreRefusesATargetSelectorItCannotResolve(t *testing.T) {
+	for name, args := range map[string]map[string]any{
+		"capture by prefix":  {"subverb": "capture", "text": "shared tooling friction", "prefix": "OTHER"},
+		"capture by project": {"subverb": "capture", "text": "shared tooling friction", "project": "project-other"},
+		"ls":                 {"subverb": "ls", "prefix": "OTHER"},
+		"get":                {"subverb": "get", "selector": "RANT-1", "prefix": "OTHER"},
+		"review":             {"subverb": "review", "selector": "RANT-1", "outcome": "planned", "prefix": "OTHER"},
+		"redact":             {"subverb": "redact", "selector": "RANT-1", "prefix": "OTHER"},
+	} {
+		s := coreTestStore(t)
+		response := New(s).Do(context.Background(), Request{Verb: "rant", Args: args, Actor: "opus"})
+		if response.OK || response.Code != "E_DAEMON_UNAVAILABLE" {
+			t.Fatalf("%s: code=%q ok=%v error=%q, want E_DAEMON_UNAVAILABLE", name, response.Code, response.OK, response.Error)
+		}
+		if rants, err := s.ListRants(domain.RantListOptions{}); err != nil || len(rants) != 0 {
+			t.Fatalf("%s: a refused target selector filed %d local rant(s) (err=%v)", name, len(rants), err)
+		}
+	}
+	// Without a selector the same core still captures locally, so the refusal
+	// above is the selector's and not a broken rant path.
+	s := coreTestStore(t)
+	if response := New(s).Do(context.Background(), Request{Verb: "rant", Args: map[string]any{"subverb": "capture", "text": "local friction"}, Actor: "opus"}); !response.OK {
+		t.Fatalf("unselected capture: %#v", response)
 	}
 }

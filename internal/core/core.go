@@ -736,9 +736,31 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
-		"rant": {Name: "rant", Usage: "rant <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls|get|review|redact ...", GitContext: true,
-			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", "papercut", "annoyance", "blocker"), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference")},
+		"rant": {Name: "rant", Usage: "rant [--project ID | --prefix P] <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls|get|review|redact ...", GitContext: true,
+			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", "papercut", "annoyance", "blocker"), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference"), stringSpec("project", false, false, "Target project: exact or unambiguous project ID"), stringSpec("prefix", false, false, "Target project: an ID prefix it owns")},
 			MCPTool: "aira_rant", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+				// A target selector names ANOTHER project's store, which only the
+				// daemon can resolve and build (AIRA-179): it owns the machine-wide
+				// registration table and the scope construction that reaches a
+				// project the caller is not standing in. The daemon therefore
+				// resolves the target and strips these arguments before dispatch,
+				// so a selector still present here means there is no such
+				// transport. Refusing by name is the written exclusion for the
+				// in-process substrate — never a silent fall-back that would file
+				// the rant LOCALLY under a selector that asked for somewhere else.
+				//
+				// Both halves are read up front so the decision is taken on the
+				// whole selector, and each sub-verb below then refuses at its own
+				// store call rather than here, which keeps every declared argument
+				// genuinely read on the path a selector takes.
+				targetProject := strings.TrimSpace(stringArg(args, "project"))
+				targetPrefix := strings.TrimSpace(stringArg(args, "prefix"))
+				refuseTarget := func() error {
+					if targetProject == "" && targetPrefix == "" {
+						return nil
+					}
+					return errors.New("E_DAEMON_UNAVAILABLE: rant --project/--prefix requires the daemon transport")
+				}
 				rants, ok := c.store.(rantStore)
 				if !ok {
 					return nil, errors.New("E_RANT_INVALID: rant store is unavailable")
@@ -753,7 +775,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					if args.gitContext != nil {
 						observed = *args.gitContext
 					}
-					return rants.AddRant(ctx, domain.RantInput{Body: stringArg(args, "text"), Tags: stringSlice(args, "tags"), Severity: domain.RantSeverity(stringArg(args, "severity")), Refs: refs, IdempotencyKey: stringArg(args, "idempotency_key"), Actor: args.actor, Session: args.session, Model: args.model}, observed)
+					input := domain.RantInput{Body: stringArg(args, "text"), Tags: stringSlice(args, "tags"), Severity: domain.RantSeverity(stringArg(args, "severity")), Refs: refs, IdempotencyKey: stringArg(args, "idempotency_key"), Actor: args.actor, Session: args.session, Model: args.model}
+					if err := refuseTarget(); err != nil {
+						return nil, err
+					}
+					return rants.AddRant(ctx, input, observed)
 				}
 				switch subverb {
 				case "ls", "list":
@@ -761,6 +787,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					tags := stringSlice(args, "tags")
 					unreviewed := boolArg(args, "unreviewed")
 					sinceRaw := stringArg(args, "since")
+					if err := refuseTarget(); err != nil {
+						return nil, err
+					}
 					if by != "" {
 						// A distribution aggregates every rant; combining it with
 						// a filter would silently discard the filter.
@@ -786,7 +815,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					}
 					return rants.ListRants(domain.RantListOptions{Unreviewed: unreviewed, Since: since, Tag: tagFilter})
 				case "get":
-					return rants.GetRant(stringArg(args, "selector"))
+					selector := stringArg(args, "selector")
+					if err := refuseTarget(); err != nil {
+						return nil, err
+					}
+					return rants.GetRant(selector)
 				case "review":
 					var resolved *domain.RantRef
 					if raw := stringArg(args, "resolved_by"); raw != "" {
@@ -796,13 +829,22 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 						}
 						resolved = &ref
 					}
-					return rants.ReviewRant(ctx, stringArg(args, "selector"), domain.RantReviewInput{Reviewer: args.actor, Outcome: domain.RantOutcome(stringArg(args, "outcome")), Note: stringArg(args, "note"), ResolvedBy: resolved})
+					review := domain.RantReviewInput{Reviewer: args.actor, Outcome: domain.RantOutcome(stringArg(args, "outcome")), Note: stringArg(args, "note"), ResolvedBy: resolved}
+					selector := stringArg(args, "selector")
+					if err := refuseTarget(); err != nil {
+						return nil, err
+					}
+					return rants.ReviewRant(ctx, selector, review)
 				case "redact":
-					event, err := rants.RedactRant(ctx, stringArg(args, "selector"))
+					selector := stringArg(args, "selector")
+					if err := refuseTarget(); err != nil {
+						return nil, err
+					}
+					event, err := rants.RedactRant(ctx, selector)
 					if err != nil {
 						return nil, err
 					}
-					return mutationData(map[string]any{"id": stringArg(args, "selector"), "redacted": true}, event), nil
+					return mutationData(map[string]any{"id": selector, "redacted": true}, event), nil
 				default:
 					return nil, fmt.Errorf("E_RANT_INVALID: unknown rant operation %q", subverb)
 				}
@@ -2136,11 +2178,11 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"id":     {summary: "Allocate the next ticket identifier", safety: SafetyMutate, example: []string{"AIRA"}},
 		"create": {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
 		"rant": {summary: "Capture and review agent friction", safety: SafetyMutate, operations: []OperationSpec{
-			{Name: "capture", Summary: "Capture unfiltered friction", Safety: SafetyMutate, Args: []OperationArg{{Name: "text", Required: true}, {Name: "tags"}, {Name: "severity"}, {Name: "refs"}, {Name: "idempotency_key"}}, Example: []string{"capture", "slow tests wasted a retry", "--tag", "slow-tests"}},
-			{Name: "ls", Summary: "List or aggregate recorded rants", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "unreviewed"}, {Name: "since"}, {Name: "tags"}}, Example: []string{"ls", "--unreviewed"}},
-			{Name: "get", Summary: "Read one rant including untrusted prose", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"get", "RANT-1"}},
-			{Name: "review", Summary: "Append a review observation", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "outcome"}, {Name: "note"}, {Name: "resolved_by"}}, Example: []string{"review", "RANT-1", "--outcome", "planned"}},
-			{Name: "redact", Summary: "Tombstone a secret-bearing rant body", Safety: SafetyMutate, Destructive: true, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"redact", "RANT-1"}},
+			{Name: "capture", Summary: "Capture unfiltered friction", Safety: SafetyMutate, Args: []OperationArg{{Name: "text", Required: true}, {Name: "tags"}, {Name: "severity"}, {Name: "refs"}, {Name: "idempotency_key"}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"capture", "slow tests wasted a retry", "--tag", "slow-tests"}},
+			{Name: "ls", Summary: "List or aggregate recorded rants", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "unreviewed"}, {Name: "since"}, {Name: "tags"}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"ls", "--unreviewed"}},
+			{Name: "get", Summary: "Read one rant including untrusted prose", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"get", "RANT-1"}},
+			{Name: "review", Summary: "Append a review observation", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "outcome"}, {Name: "note"}, {Name: "resolved_by"}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"review", "RANT-1", "--outcome", "planned"}},
+			{Name: "redact", Summary: "Tombstone a secret-bearing rant body", Safety: SafetyMutate, Destructive: true, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"redact", "RANT-1"}},
 		}},
 		"show":      {summary: "Show one ticket", safety: SafetyRead, example: []string{"AIRA-1", "--fields", "id"}},
 		"review":    {summary: "Assemble a review briefing", safety: SafetyRead, example: []string{"AIRA-1", "--paths", "internal/store/gate.go,docs/x.md"}},

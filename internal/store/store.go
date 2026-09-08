@@ -159,6 +159,11 @@ type Store struct {
 	clock             Clock
 	bootstrap         bool
 	runner            Execution
+	// rantOrigin is set only on the derived view WithRantOrigin returns, for a
+	// rant an explicit target selector redirected into this project from
+	// another one. Nil on every ordinary view, which is what makes a local
+	// rant record no origin and cross-check against its own scope (AIRA-179).
+	rantOrigin *RantOrigin
 	// beforeMaterialise is intentionally nil in production; tests use it to
 	// observe the receipt-before-file ordering at the crash boundary.
 	beforeMaterialise func(Intent) error
@@ -938,6 +943,7 @@ func (s *Store) initDB(ctx context.Context) error {
 		    idempotency_key TEXT, actor TEXT NOT NULL, session TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
 		    observed_at TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL, resolver_version TEXT NOT NULL DEFAULT '',
 		    seq INTEGER NOT NULL CHECK(seq >= 1), redacted INTEGER NOT NULL DEFAULT 0 CHECK(redacted IN (0,1)),
+		    origin_project_id TEXT NOT NULL DEFAULT '',
 		    PRIMARY KEY(project_id,id), UNIQUE(project_id,seq), UNIQUE(project_id,idempotency_key),
 		    CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 8192), CHECK(instr(body,char(0)) = 0),
 		    CHECK(idempotency_key IS NULL OR (length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 256 AND instr(idempotency_key,char(0)) = 0)),
@@ -1127,6 +1133,9 @@ func (s *Store) initDB(ctx context.Context) error {
 	if err := s.ensureOutboxKind(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureRantOriginProjectID(ctx); err != nil {
+		return err
+	}
 	// Runs before ensureProjectOwnershipFKs, which recreates tables by
 	// replaying their existing DDL: dropping the column first means the FK
 	// migration carries forward the current shape, not the deleted one.
@@ -1237,6 +1246,17 @@ func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {
 func (s *Store) ensureOutboxKind(ctx context.Context) error {
 	return s.ensureColumnAdded(ctx, "outbox", "kind",
 		`ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`)
+}
+
+// ensureRantOriginProjectID adds the rants.origin_project_id column to a
+// database written before AIRA-179's explicit rant target selector existed.
+// Guarded against the concurrent-opener race — see ensureColumnAdded (AIRA-97
+// Finding 1). The default is the empty string, which is exactly what a local
+// rant records, so an already-written rant reads back as local rather than as
+// a foreign rant of unknown origin.
+func (s *Store) ensureRantOriginProjectID(ctx context.Context) error {
+	return s.ensureColumnAdded(ctx, "rants", "origin_project_id",
+		`ALTER TABLE rants ADD COLUMN origin_project_id TEXT NOT NULL DEFAULT ''`)
 }
 
 // ensureColumnAdded is the guarded form of "add this column if it is absent",
