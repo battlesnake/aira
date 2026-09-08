@@ -14,27 +14,6 @@ import (
 	"aira/internal/gitcontext"
 )
 
-// quarantinedTicketFiles is the set of ticket files in THIS repository that
-// domain.ParseTicket still refuses, with the hand-written defect in each. Every
-// one predates AIRA-170 and none is caused by it; they are recorded on AIRA-171
-// and repairing them is that ticket's whole content.
-//
-// The list is a CLOSED set, asserted in both directions below: a file that
-// starts failing and is not named here fails the test, and a file named here
-// that has been repaired also fails it, so the quarantine can neither grow
-// silently nor rot into a vacuous allow-list once AIRA-171 lands.
-var quarantinedTicketFiles = map[string]string{
-	"AIRA-28":  "relations must be sorted",
-	"AIRA-62":  "relation is not stored on its canonical lower-ID ticket",
-	"AIRA-117": "ticket labels must be unique and sorted",
-	"AIRA-141": "body does not end in a newline",
-	"AIRA-144": "ticket labels must be unique and sorted",
-	"AIRA-145": "body does not end in a newline",
-	"AIRA-152": "relation is not stored on its canonical lower-ID ticket",
-	"AIRA-153": "relation is not stored on its canonical lower-ID ticket",
-	"AIRA-160": "ticket labels must be unique and sorted",
-}
-
 // TestTheRepositorysOwnTicketFilesAreReadable is the AIRA-170 reproduction the
 // synthetic fixtures could not run.
 //
@@ -50,7 +29,15 @@ var quarantinedTicketFiles = map[string]string{
 // because that is the durable form: any future ticket file that stops parsing
 // fails here, whoever wrote it.
 //
+// AIRA-171 repaired the last nine files that still failed, so the walk is now a
+// plain "EVERY ticket file parses" assertion with no allow-list at all. The
+// quarantine map that stood here until then is deliberately gone rather than
+// emptied: an empty map is a live exemption seam that the next hand-edited
+// defect could be added to, whereas its absence means any reintroduction fails
+// this test with nowhere to record it.
+//
 // verifies: AIRA-170
+// verifies: AIRA-171
 func TestTheRepositorysOwnTicketFilesAreReadable(t *testing.T) {
 	tickets := repositoryTicketDir(t)
 	base := t.TempDir()
@@ -71,20 +58,9 @@ func TestTheRepositorysOwnTicketFilesAreReadable(t *testing.T) {
 		t.Fatalf("rebuild: %v", err)
 	}
 
-	unreadable := map[string]string{}
 	for _, id := range ids {
 		if _, err := s.Get(id); err != nil {
-			unreadable[id] = err.Error()
-		}
-	}
-	for id, err := range unreadable {
-		if _, quarantined := quarantinedTicketFiles[id]; !quarantined {
-			t.Errorf("%s is unreadable and is not a known AIRA-171 quarantine: %s", id, err)
-		}
-	}
-	for id, why := range quarantinedTicketFiles {
-		if _, still := unreadable[id]; !still {
-			t.Errorf("%s (%s) now parses: delete it from quarantinedTicketFiles, and close AIRA-171 when the map is empty", id, why)
+			t.Errorf("%s is unreadable: %s", id, err)
 		}
 	}
 
@@ -120,10 +96,74 @@ func TestTheRepositorysOwnTicketFilesAreReadable(t *testing.T) {
 	}
 
 	// The other half of that losslessness claim: the seven deletions were safe
-	// only because AIRA-153.md holds the mirror of each. AIRA-153 is itself
-	// quarantined, so this reads its frontmatter directly rather than through
-	// the parser that refuses it.
+	// only because AIRA-153.md holds the mirror of each. This reads the
+	// frontmatter directly rather than through the parser, because what has to
+	// survive is the STORED tuple on the canonical owner — a derived view would
+	// still be satisfied if the tuple had drifted to some other file.
 	assertAIRA153MirrorsSurvive(t, filepath.Join(root, ".aira", "tickets", "AIRA-153.md"))
+
+	// AIRA-171's own four relation repairs, in the same shape. Three were
+	// deletions of a non-canonical copy and one was a MOVE, and nothing above
+	// distinguishes a lossless delete from a lost edge, so both halves are
+	// asserted: the tuple that must still be STORED on its canonical owner, and
+	// the edge that must still be SURFACED from the endpoint whose file lost it.
+	//
+	// verifies: AIRA-171
+	for _, want := range []struct {
+		owner    string
+		relation domain.Relation
+		why      string
+	}{
+		// AIRA-28.md was a pure re-order; both tuples must survive it.
+		{"AIRA-28", domain.Relation{Kind: domain.RelationRelates, From: "AIRA-62", To: "AIRA-28"},
+			"the copy deleted from AIRA-62.md was byte-identical to this one"},
+		{"AIRA-28", domain.Relation{Kind: domain.RelationSupersedes, From: "AIRA-29", To: "AIRA-28"},
+			"AIRA-28.md's re-order must not drop the supersedes entry"},
+		// The two deletions off AIRA-153.md.
+		{"AIRA-150", domain.Relation{Kind: domain.RelationRelates, From: "AIRA-153", To: "AIRA-150"},
+			"the copy deleted from AIRA-153.md was byte-identical to this one"},
+		{"AIRA-151", domain.Relation{Kind: domain.RelationRelates, From: "AIRA-151", To: "AIRA-153"},
+			"this is the reversed mirror of the tuple deleted from AIRA-153.md; relates is its own inverse"},
+		// The deletion off AIRA-152.md.
+		{"AIRA-151", domain.Relation{Kind: domain.RelationRelates, From: "AIRA-151", To: "AIRA-152"},
+			"this is the reversed mirror of the tuple deleted from AIRA-152.md; relates is its own inverse"},
+		// The MOVE: 153->152 was stored nowhere but AIRA-153.md, so it had to
+		// land on AIRA-152.md rather than be deleted with the other two.
+		{"AIRA-152", domain.Relation{Kind: domain.RelationRelates, From: "AIRA-153", To: "AIRA-152"},
+			"AIRA-171's one MOVE; no other file holds this edge in either direction"},
+	} {
+		record, err := s.Get(want.owner)
+		if err != nil {
+			t.Fatalf("show %s: %v", want.owner, err)
+		}
+		if !slices.Contains(record.Ticket.Relations, want.relation) {
+			t.Errorf("%s.md no longer stores %s %s->%s (%s); stored: %#v",
+				want.owner, want.relation.Kind, want.relation.From, want.relation.To, want.why, record.Ticket.Relations)
+		}
+	}
+	// The edge-level half: every relation AIRA-171 deleted or moved off a file
+	// must still be reachable FROM that file's ticket, through the canonical
+	// copy elsewhere plus the inverse projection.
+	for id, wants := range map[string][]domain.RelationView{
+		"AIRA-62":  {{Kind: domain.RelationRelates, From: "AIRA-62", To: "AIRA-28"}},
+		"AIRA-152": {{Kind: domain.RelationRelates, From: "AIRA-152", To: "AIRA-151"}},
+		"AIRA-153": {
+			{Kind: domain.RelationRelates, From: "AIRA-153", To: "AIRA-150"},
+			{Kind: domain.RelationRelates, From: "AIRA-153", To: "AIRA-151"},
+			{Kind: domain.RelationRelates, From: "AIRA-153", To: "AIRA-152"},
+		},
+	} {
+		record, err := s.Get(id)
+		if err != nil {
+			t.Fatalf("show %s: %v", id, err)
+		}
+		for _, want := range wants {
+			if !slices.Contains(record.Relations, want) {
+				t.Errorf("%s no longer surfaces %s %s->%s after AIRA-171 moved the storage off its file; views: %#v",
+					id, want.Kind, want.From, want.To, record.Relations)
+			}
+		}
+	}
 
 	// The two operations AIRA-170's body names besides `show`, against the real
 	// AIRA-165 file rather than a fixture.

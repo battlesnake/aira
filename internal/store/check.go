@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"aira/internal/domain"
+	"aira/internal/runner"
 )
 
 type CheckFinding struct {
@@ -35,7 +36,7 @@ type CheckReport struct {
 // a result there: a checker that ran and established it, evidence a checker
 // recorded, or finaliseDimensions reporting that nothing established it.
 //
-// The list is not a seed of results. Check previously seeded all fourteen
+// The list is not a seed of results. Check previously seeded them all
 // `pass` and demoted from there, so a dimension whose checker never ran — not
 // wired, an early return, a dimension added to the map ahead of its checker —
 // reported a fabricated green, which is the AIRA-53/AIRA-54/AIRA-72 defect
@@ -44,7 +45,7 @@ var checkDimensions = []string{
 	"allocated-id-file", "duplicate-id", "stale-index",
 	"orphan-worktree", "ticket-file-integrity", "reconcile-integrity",
 	"rebuild-integrity", "relation-integrity", "finding-integrity", "lease-integrity", "area-overlap",
-	"traceability", "gates", "compute",
+	"traceability", "gates", "compute", "run-ledger",
 }
 
 // establishDimension records that a checker ran and established a clean result
@@ -69,6 +70,40 @@ func unevaluateDimension(report *CheckReport, dimension string) {
 		report.Dimensions[dimension] = "unevaluated"
 	}
 	report.Unevaluated = true
+}
+
+// MarkUnevaluated is the exported form of the primitive above, for the one
+// caller that grades a dimension from outside this package: the core `check`
+// verb, which holds the Runner and so can find the run ledger unreadable after
+// Check has already graded it readable (a ledger corrupted between the two
+// reads, or a face whose runner and store disagree about the common
+// directory). Without it that face would have to either discard the whole
+// report or leave a fabricated `run-ledger: pass` standing.
+//
+// Like finaliseDimensions it writes the dimension FIRST and independently of
+// the finding, because addFinding's unevaluated branch dedupes on
+// (Code, Subject) and returns before it touches the dimension.
+//
+// It also restores an established FAIL afterwards. addFinding's unevaluated
+// branch overwrites the dimension unconditionally, which the internal callers
+// never notice because each of them only ever reaches an ungraded dimension;
+// this one may be handed a dimension that is already graded, and
+// unevaluateDimension's invariant is that an unestablished result never
+// launders away a failure that WAS established. The reason is still recorded as
+// a finding either way, so nothing is lost by keeping the fail.
+//
+// covers: AIRA-172
+func (r *CheckReport) MarkUnevaluated(dimension string, finding CheckFinding) {
+	if r.Dimensions == nil {
+		r.Dimensions = map[string]string{}
+	}
+	finding.Kind = "unevaluated"
+	established := r.Dimensions[dimension]
+	unevaluateDimension(r, dimension)
+	addFinding(r, finding, dimension)
+	if established == "fail" {
+		r.Dimensions[dimension] = "fail"
+	}
 }
 
 // finaliseDimensions reports every dimension nothing established. Check runs
@@ -386,6 +421,9 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := s.checkGatesReadOnly(&report); err != nil {
 		return CheckReport{}, err
 	}
+	if err := s.checkRunLedger(&report); err != nil {
+		return CheckReport{}, err
+	}
 
 	finaliseDimensions(&report)
 	if len(report.Findings) > 0 {
@@ -600,6 +638,57 @@ func isIntegrityError(err error) bool {
 // changed keeps exactly the behaviour it had.
 func isTicketFileInvalidCode(code string) bool {
 	return code == "E_CONFIG_INVALID" || code == domain.CodeTicketInvalid
+}
+
+// checkRunLedger grades the run-ledger dimension. The ledger is durable
+// evidence held in the common directory rather than in the database, and it is
+// the one dimension whose reader lives in the runner package.
+//
+// AIRA-172: until this existed, an unreadable run ledger had no dimension to
+// land on, so the only thing `check` could do with one was abort the whole verb
+// at exit 4 and report NONE of the other dimensions — the exact
+// fabricated-silence shape CLAUDE.md's "a check that cannot establish its
+// result reports unevaluated" forbids. A corrupt ledger record establishes
+// nothing about relation-integrity, ticket-file-integrity, lease-integrity or
+// area-overlap, so it now demotes this dimension alone.
+//
+// The three codes below are the COMPLETE set LedgerIntegrity's call graph can
+// produce, and all three mean the same thing — the ledger's content could not
+// be established: E_JOURNAL_CORRUPT for a record that does not decode or does
+// not replay, U_RUN_RECONCILE_REQUIRED for a torn tail, and
+// E_RUN_RECONCILE_REQUIRED for a file that would not open. Anything else is
+// unexpected and still fails the verb, because an unrecognised error is not
+// evidence that the ledger is fine.
+//
+// covers: AIRA-172
+func (s *Store) checkRunLedger(report *CheckReport) error {
+	if s.commonDir == "" {
+		// The checker cannot run at all, which is precisely the case
+		// finaliseDimensions exists for: it leaves the dimension ungraded here
+		// and finalisation reports U_CHECK_UNEVALUATED with "no checker
+		// established this dimension". Minting a code of its own would say the
+		// same thing in a second vocabulary.
+		return nil
+	}
+	err := runner.LedgerIntegrity(s.commonDir)
+	if err == nil {
+		establishDimension(report, "run-ledger")
+		return nil
+	}
+	code := ErrorCode(err)
+	switch code {
+	case "E_JOURNAL_CORRUPT", "U_RUN_RECONCILE_REQUIRED", "E_RUN_RECONCILE_REQUIRED":
+		// The error's own code and message are carried through verbatim so the
+		// operator reads WHICH record is corrupt and where, not merely that one
+		// is. The dimension is written independently of the finding landing,
+		// because addFinding's unevaluated branch dedupes on (Code, Subject)
+		// and returns before it touches the dimension.
+		unevaluateDimension(report, "run-ledger")
+		addFinding(report, CheckFinding{Code: code, Subject: "run-ledger", Message: err.Error(), Kind: "unevaluated"}, "run-ledger")
+		return nil
+	default:
+		return err
+	}
 }
 
 func isUnestablishedError(err error) bool {

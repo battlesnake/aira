@@ -1892,7 +1892,18 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if c.runner != nil {
 				runs, err := c.runner.Reconcile(ctx)
 				if err != nil {
-					return nil, err
+					// AIRA-172: the store half has already reconciled. A corrupt
+					// run-ledger record means the RUN half could not, which is an
+					// unevaluated result for that half alone and not a reason to
+					// throw away the durable work this verb has already done and
+					// answer exit 4 with nothing in it. The runner's refusal to
+					// APPEND to a corrupt ledger is the right fail-closed
+					// behaviour and is unchanged; only the report is.
+					if store.ErrorCode(err) != "E_JOURNAL_CORRUPT" {
+						return nil, err
+					}
+					data["runs_unevaluated"] = map[string]any{"code": "E_JOURNAL_CORRUPT", "message": err.Error()}
+					return handlerData{Data: data, Verdict: "unevaluated"}, nil
 				}
 				for i := range runs {
 					runs[i] = c.presentRunRecord(runs[i])
@@ -1926,7 +1937,34 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if c.runner != nil {
 				runs, reconcileErr := c.runner.Reconcile(ctx)
 				if reconcileErr != nil {
-					return nil, reconcileErr
+					// AIRA-172: `check` grades INDEPENDENT dimensions, and
+					// a corrupt run-ledger record establishes nothing about
+					// relation-integrity, ticket-file-integrity, lease-integrity or
+					// area-overlap. Failing the whole verb closed here silenced all
+					// of them and left an operator with no way to reach any finding
+					// at all — the opposite of what a read-only report is for.
+					// store.Check has normally already graded run-ledger
+					// unevaluated from its own read; this demotes it again so the
+					// dimension can never be left claiming a green the reconcile
+					// just contradicted, and dedupes to one finding when both reads
+					// saw the same defect.
+					//
+					// Only E_JOURNAL_CORRUPT is degraded. It is the one code in the
+					// runner that can only come from decoding the ledger; every
+					// other reconcile failure keeps today's fail-closed behaviour
+					// rather than being quietly widened into an unevaluated.
+					if store.ErrorCode(reconcileErr) != "E_JOURNAL_CORRUPT" {
+						return nil, reconcileErr
+					}
+					report.MarkUnevaluated("run-ledger", store.CheckFinding{
+						Code: "E_JOURNAL_CORRUPT", Subject: "run-ledger", Message: reconcileErr.Error(),
+					})
+					if len(report.Findings) > 0 {
+						report.Verdict = "fail"
+					} else {
+						report.Verdict = "unevaluated"
+					}
+					return report, nil
 				}
 				for _, run := range runs {
 					if run.Status == runner.StatusStarting || run.Status == runner.StatusRunning {

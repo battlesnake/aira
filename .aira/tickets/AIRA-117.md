@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-117","project":"aira","title":"All three TestSliceCeilingRealCgroup* tests fail under -race on a real-cgroup host (helper dies before acknowledging)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aira-106","cgroup","test","race"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-117","project":"aira","title":"All three TestSliceCeilingRealCgroup* tests fail under -race on a real-cgroup host (helper dies before acknowledging)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aira-106","cgroup","race","test"],"hold":false,"relations":[]}
 ---
 Found while verifying AIRA-35 under `-race` (which AIRA-20 has just re-enabled
 in CI). **Not caused by AIRA-35** -- reproduced on pristine `origin/master`

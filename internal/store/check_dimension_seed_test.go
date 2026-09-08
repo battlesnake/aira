@@ -45,8 +45,9 @@ func TestCheckDoesNotClaimTraceabilityPassWhenNoGraphWasScanned(t *testing.T) {
 // verifies: AIRA-86
 // The mandatory false-unevaluated condition on this fix: seeding unevaluated
 // trades a silent false green for a silent false unevaluated unless every
-// dimension's pass path still reaches pass. One fixture establishes all
-// fourteen at once, so a missing establishment site cannot hide.
+// dimension's pass path still reaches pass. One fixture establishes every
+// dimension in checkDimensions at once, so a missing establishment site cannot
+// hide, and a dimension added later is covered without editing this test.
 func TestCheckReportsEveryDimensionPassWhenEveryCheckerEstablishesIt(t *testing.T) {
 	s := newFullyEstablishedStore(t)
 
@@ -336,9 +337,9 @@ func TestCheckReportsADimensionNoCheckerEstablishedAsUnevaluated(t *testing.T) {
 	if !report.Unevaluated || report.Verdict != "unevaluated" {
 		t.Fatalf("verdict=%q unevaluated=%v, want the rollup demoted; report=%#v", report.Verdict, report.Unevaluated, report)
 	}
-	// Attribution: this fixture establishes all fourteen real dimensions and is
+	// Attribution: this fixture establishes every real dimension and is
 	// otherwise a clean pass, so the sentinel's reason must be the only one in
-	// the report. Asserting that rather than re-walking the fourteen keeps this
+	// the report. Asserting that rather than re-walking them all keeps this
 	// test about the wiring and leaves the per-dimension pass condition to
 	// TestCheckReportsEveryDimensionPassWhenEveryCheckerEstablishesIt.
 	if len(report.UnevaluatedFindings) != 1 {
