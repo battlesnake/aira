@@ -807,7 +807,12 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 		// launch form. parseConfineManagementArgs keeps rejecting it, so `aira
 		// confine --exclusive` with no `--` argv is an argument error rather than a
 		// silently ignored no-op on a --list/--kill invocation.
-		if name == "delegate-ram" || name == "detach" || name == "exclusive" {
+		//
+		// AIRA-182 moved both branches' vocabularies out to
+		// confineLaunchValuelessOptions / confineLaunchValuedOptions so the
+		// did-you-mean suggestion below reads the SAME list this check reads. The
+		// membership tests are otherwise exactly what they were.
+		if confineLaunchOptionValueless(name) {
 			if _, exists := options[name]; exists {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -818,8 +823,12 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 		// only in the launch form. parseConfineManagementArgs keeps rejecting them,
 		// so `aira confine --timeout 5m --list` is an argument error rather than a
 		// silently ignored no-op — the same discipline --exclusive already follows.
-		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" && name != "admit-timeout" && name != "timeout" && name != "cpu-timeout" {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
+		if !confineLaunchOptionTakesValue(name) {
+			// AIRA-182. The suggestion is APPENDED to the unchanged refusal — same
+			// code, same sentence — and is empty whenever nothing in the vocabulary
+			// is close enough to name honestly.
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine%s",
+				name, optionDidYouMean(name, confineLaunchOptionNames()))
 		}
 		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
