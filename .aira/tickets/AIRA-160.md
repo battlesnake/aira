@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-160","project":"aira","title":"aitest worker-count sizing is memory-blind (CPU-only auto, and worker-admit is deliberately blind to new post-admission host pressure)","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-160","to":"AIRA-180"}]}
+{"schema":1,"id":"AIRA-160","project":"aira","title":"aitest worker-count sizing is memory-blind (CPU-only auto, and worker-admit is deliberately blind to new post-admission host pressure)","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-160","to":"AIRA-180"},{"kind":"relates","from":"AIRA-160","to":"AIRA-181"}]}
 ---
 
 Filed from a cross-session peer report (speed, gate owner, co-filing on behalf

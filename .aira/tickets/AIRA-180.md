@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-180","project":"aira","title":"Track real resource usage for tasks and groups of tests vs budget, and recommend (never auto-adjust) quota changes","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","insights"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-180","project":"aira","title":"Track real resource usage for tasks and groups of tests vs budget, and recommend (never auto-adjust) quota changes","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","insights"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-180","to":"AIRA-181"}]}
 ---
 
 Owner observation (2026-09-08): "I see a lot of sessions are setting explicit
