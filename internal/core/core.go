@@ -1792,7 +1792,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1810,6 +1810,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
 			boolSpec("exclusive", false, false, "Run alone in the slice for uncontended benchmarking: stop admitting new jobs, let running ones finish, then run alone. Refuses rather than running non-exclusively; check $AIRA_CONFINE_EXCLUSIVE inside the job and exclusive= on the trailer. Bound the wait with --admit-timeout. Does NOT cover processes placed in the slice by hand, or Docker containers, which run outside it entirely. The trailer's peak-rss/cpu are whole-subtree hierarchical counters (aitest worker sub-scopes and a podman --cgroups=split child included); Docker containers are structurally outside the slice and are NOT counted"),
 			boolSpec("detach", false, false, "Run session-independently; report the handle and poll it with confine --status"),
+			boolSpec("stdin_connect", false, false, "Give the DETACHED job a writable stdin (a per-job socket) so `aira confine-input <handle>` can send it bytes or close it. Requires --detach. OFF by default and deliberately so: without it a detached job's stdin is /dev/null and reads EOF immediately, whereas a connected-but-unwritten pipe blocks any job that touches stdin until someone connects"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
 			_ = stringSlice(args, "argv")
@@ -1825,6 +1826,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = boolArg(args, "delegate_ram")
 			_ = boolArg(args, "exclusive")
 			_ = boolArg(args, "detach")
+			_ = boolArg(args, "stdin_connect")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
 		}},
 		// AIRA-185. `drain` is CLI-only for the same reason confine is, plus a
@@ -1867,6 +1869,51 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "selector")
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-status is a direct CLI-only verb")
+		}},
+		// AIRA-196. `confine-log`/`confine-input` are `run-log`/`run-input` for a
+		// DETACHED CONFINE JOB, addressed by the same selector `confine --status`
+		// takes. Unlike confine-status they ARE generated actions and MCP tools:
+		// nothing about reading a captured file or writing to a socket needs a
+		// terminal, so there is no honest-form objection, and an agent driving a
+		// long detached gate is exactly who needs them.
+		//
+		// Both are answered CLIENT-SIDE (cmd/aira/dispatcher.go), like confine-list
+		// and confine-kill, because the record store is machine-wide and
+		// project-less. The read half additionally reaches no daemon at all, which
+		// is AIRA-22's survivability property and is deliberate: see ReadConfineLog.
+		"confine-log": {Name: "confine-log", Usage: "confine-log <name|supervisor-pid|scope-id> [--stream out|err] [--follow --from N --tail N --full --grep PATTERN] [--owner ID] [--json]", Args: []ArgSpec{
+			stringSpec("selector", true, true, "Exact detached confine name, supervisor PID, or scope ID"),
+			stringSpec("stream", false, false, "Captured stream; a detached confine job captures out and err as separate files and has no merged stream (default: out)", "out", "err"),
+			boolSpec("follow", false, false, "Observe until the job can produce no more output"),
+			stringSpec("from", false, false, "Byte offset"),
+			stringSpec("tail", false, false, "Number of bytes from the end"),
+			boolSpec("full", false, false, "Waive this face's response-size cap for one read and return the whole selected window. The CLI is uncapped already, so this matters over MCP, where the reply can then be large; without it a capped read reports truncated with a next_offset to page from"),
+			stringSpec("grep", false, false, "Keep only the lines of the read window matching this RE2 pattern; the byte cursor still describes the whole file"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, MCPTool: "aira_confine_log", Summary: "Read a detached confine job's captured output by its own handle.", Safety: SafetyRead, Include: true, Example: []string{"gate"}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "selector")
+			_ = stringArg(args, "stream")
+			_ = boolArg(args, "follow")
+			_ = stringArg(args, "from")
+			_ = stringArg(args, "tail")
+			_ = boolArg(args, "full")
+			_ = stringArg(args, "grep")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-log requires the project-less client transport")
+		}},
+		"confine-input": {Name: "confine-input", Usage: "confine-input <name|supervisor-pid|scope-id> [--close] [--owner ID] [--steal]", Args: []ArgSpec{
+			stringSpec("selector", true, true, "Exact detached confine name, supervisor PID, or scope ID"),
+			stringSpec("data", false, false, "Base64 bytes accepted for delivery (MCP; maximum 1 MiB)"),
+			boolSpec("close", false, false, "Close the job's stdin after accepted bytes"),
+			boolSpec("steal", false, false, "Override foreign confine ownership"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, MCPTool: "aira_confine_input", Summary: "Send bytes accepted for delivery to a detached confine job launched with --stdin-connect.", Safety: SafetyExecute, Include: true, Example: []string{"gate", "--close"}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "selector")
+			_ = stringArg(args, "data")
+			_ = boolArg(args, "close")
+			_ = boolArg(args, "steal")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-input requires the project-less client transport")
 		}},
 		"confine-reserve": {Name: "confine-reserve", Usage: "confine-reserve --bytes N --pinned --signature S [--slice S] [--max-wait D]", Args: []ArgSpec{
 			stringSpec("bytes", true, false, "Pinned byte reservation (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
@@ -1973,18 +2020,23 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return record, err
 		}},
-		"run-log": {Name: "run-log", Usage: "run-log <run-id> [--stream out|err|merged] [--follow --from N --tail N --full]", Args: []ArgSpec{
+		"run-log": {Name: "run-log", Usage: "run-log <run-id> [--stream out|err|merged] [--follow --from N --tail N --full --grep PATTERN]", Args: []ArgSpec{
 			stringSpec("run_id", true, true, "Run identifier"),
 			stringSpec("stream", false, false, "Captured stream", "out", "err", "merged"),
 			boolSpec("follow", false, false, "Observe until terminal"),
 			stringSpec("from", false, false, "Byte offset"),
 			stringSpec("tail", false, false, "Number of bytes from the end"),
 			boolSpec("full", false, false, "Opt into the complete selected output"),
+			// AIRA-196 adds --grep to BOTH log verbs rather than only the new one:
+			// the gap was real here too, and one filter language across the pair is
+			// what stops an operator learning two.
+			stringSpec("grep", false, false, "Keep only the lines of the read window matching this RE2 pattern; the byte cursor still describes the whole file"),
 		}, MCPTool: "aira_run_output", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			runID := stringArg(args, "run_id")
 			stream := stringArg(args, "stream")
 			follow := boolArg(args, "follow")
 			full := boolArg(args, "full")
+			grep := stringArg(args, "grep")
 			from, err := nonNegativeInt(args, "from")
 			tail, tailErr := nonNegativeInt(args, "tail")
 			if err != nil {
@@ -1998,7 +2050,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			chunk, readErr := c.runner.ReadOutput(ctx, runner.OutputRequest{
 				RunID: runID, Stream: stream, From: from,
-				Tail: tail, Full: full, Follow: follow, MaxBytes: c.outputCap,
+				Tail: tail, Full: full, Follow: follow, MaxBytes: c.outputCap, Grep: grep,
 			})
 			return outputReadData{Chunk: chunk, Err: readErr}, nil
 		}},
@@ -2269,6 +2321,11 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change", safety: SafetyRead, example: []string{}},
 		"confine-kill":    {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
 		"confine-status":  {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
+		// AIRA-196. Unlike confine/confine-status these ARE included: reading a
+		// captured file and writing to a job's stdin socket both have honest
+		// request/response forms, and an agent driving a detached gate needs them.
+		"confine-log":   {summary: "Read a detached confine job's captured output by its own handle", safety: SafetyRead, example: []string{"gate"}},
+		"confine-input": {summary: "Send bytes accepted for delivery to a detached confine job launched with --stdin-connect", safety: SafetyExecute, example: []string{"gate", "--close"}},
 		// AIRA-185. Excluded from Include below for the same reason confine is, and
 		// one stronger: a connection-bound foreground hold cannot be a
 		// request/response tool without either fabricating success or blocking a

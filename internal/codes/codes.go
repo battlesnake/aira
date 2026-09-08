@@ -330,7 +330,16 @@ var ExitCodes = map[string]int{
 	// `confine --status` reports for a job whose supervisor is gone without
 	// having written an outcome; it is never a claim that the job failed.
 	"E_CONFINE_DETACH_FAILED": 4, "U_CONFINE_DETACH_CANCELLED": 3,
-	"U_CONFINE_OUTCOME_UNKNOWN":  3,
+	"U_CONFINE_OUTCOME_UNKNOWN": 3,
+	// AIRA-196. `confine-log`'s "I could not read the capture", exit 3 with the
+	// rest of the U_ vocabulary because it is exactly an UNEVALUATED read and
+	// never a claim about the job. An empty capture is a successful read (exit 0)
+	// and must not be confused with it.
+	//
+	// `confine-input` deliberately introduces no codes of its own: it speaks
+	// run-input's protocol to run-input's server, so it answers in the
+	// E_RUN_INPUT_* vocabulary already mapped above.
+	"U_CONFINE_LOG_UNAVAILABLE":  3,
 	"E_INSTALL_ARGUMENT_INVALID": 2, "E_INSTALL_UNAVAILABLE": 4,
 	"E_INSTALL_OVERCOMMIT":    1,
 	"E_RUN_WIRING_INCOMPLETE": 4, "E_RUN_USAGE_PROVIDER_REQUIRED": 2, "E_RUN_CONFIG_ENV_INVALID": 2,

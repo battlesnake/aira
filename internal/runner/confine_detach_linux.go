@@ -661,8 +661,42 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 	}
 	defer devnull.Close()
 
+	// AIRA-196. The stdin conduit is OPT-IN and this is the only place it is
+	// decided. With StdinConnect unset -- which is every job that does not name
+	// --stdin-connect -- no plane is prepared, no socket is created, the record's
+	// stdin_connect stays false, and the child's stdin is /dev/null exactly as it
+	// has always been. A pipe here by default would block any job that so much as
+	// probes stdin, forever, waiting for a writer that will never connect.
+	var inputPlane *runInputPlane
+	if request.StdinConnect {
+		plane, planeErr := prepareRunInputPlane(request.RuntimeDir, confineInputPlaneID(supervisor.PID), record.Owner)
+		if planeErr != nil {
+			// Fail closed. A launcher that asked for a writable stdin and silently
+			// got /dev/null would sit waiting on a conduit that does not exist,
+			// which is worse than being told the launch failed.
+			code := "E_RUN_INPUT_UNREACHABLE"
+			var inputErr *RunInputError
+			if errors.As(planeErr, &inputErr) {
+				code = inputErr.Code
+			}
+			return fail(code, fmt.Errorf("%s: --stdin-connect: %w", code, planeErr))
+		}
+		inputPlane = plane
+		// Owns every exit path from here, including the panic recovery above: the
+		// socket must not outlive the supervisor, and the child must not be left
+		// holding a pipe whose writer is gone unclosed.
+		defer inputPlane.closeTerminal()
+		record.StdinConnect, record.InputSocket = true, inputPlane.path
+		if writeErr := job.write(record); writeErr != nil {
+			return fail(CodeConfineDetachFailed, fmt.Errorf("%s: write record: %w", CodeConfineDetachFailed, writeErr))
+		}
+	}
+
 	request.presetScopeID = scopeID
 	request.Stdin, request.Stdout, request.Stderr = devnull, job.stdout, job.stderr
+	if inputPlane != nil {
+		request.Stdin = inputPlane.inputR
+	}
 	request.BeforeAdmit = func(info ConfineLaunchInfo) error {
 		record.Phase, record.AdmittingAt = ConfineDetachPhaseAdmitting, nowString(nil)
 		record.Slice, record.CapBytes = info.Slice, info.CapBytes
@@ -696,6 +730,20 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 					"confine supervisor: could not record the running phase (%v; retry: %v); --status will keep reporting the last phase written\n",
 					writeErr, retryErr)
 			}
+		}
+		if inputPlane != nil {
+			// The child now holds its own dup of the read end, so drop OURS. Keeping
+			// it would make the supervisor a permanent reader of the pipe: a client
+			// filling the buffer after the child exited would block forever on the
+			// write instead of getting EPIPE, wedging supervision -- the same hazard
+			// `run --detach` closes its copy for.
+			_ = inputPlane.inputR.Close()
+			// Accept clients only AFTER the record says `running`, so a
+			// confine-input that resolved the job through the durable record can
+			// always reach the socket that record names. `running` is written above
+			// and is proven, not assumed: OnPlaced fires only once the child is a
+			// verified member of the scope.
+			inputPlane.serve()
 		}
 	}
 

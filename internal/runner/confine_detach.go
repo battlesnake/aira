@@ -111,6 +111,20 @@ type ConfineDetachRecord struct {
 	StderrPath        string `json:"stderr_path,omitempty"`
 	SupervisorLogPath string `json:"supervisor_log_path,omitempty"`
 
+	// StdinConnect and InputSocket describe the OPTIONAL stdin conduit
+	// (AIRA-196). Their absence is the default and is load-bearing: a detached
+	// confine job's stdin is /dev/null unless the launcher passed
+	// --stdin-connect, so a job that never expected input can never be left
+	// blocked on an empty pipe nobody is writing to. `confine-input` refuses by
+	// name when StdinConnect is false rather than dialling a socket that was
+	// never created.
+	//
+	// InputSocket is written only once the plane exists, and a job is dialable
+	// only while its supervisor is alive: a socket path in a durable record is a
+	// discovery hint, never a promise that anything is listening.
+	StdinConnect bool   `json:"stdin_connect,omitempty"`
+	InputSocket  string `json:"input_socket,omitempty"`
+
 	// ReadError is set by the STORE, never by a supervisor, when a record
 	// directory exists but its record.json could not be read or decoded. It is
 	// the difference between "I cannot tell you" and "there is no such job", and
