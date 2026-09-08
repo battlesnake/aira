@@ -62,3 +62,27 @@ for the full decision record.
 PR #119 (built together with AIRA-192) merged (`dd86e94`), all CI checks
 green (build+vet+gofmt, test, race). Verified independently against
 GitHub (merge SHA, check results) and closed out here.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #119 merged as `dd86e94` (2026-09-09), together with [[AIRA-192]] as one
+change (branch `aira192-real-per-scope-reserve`, tip `266ff5a`). The full
+verification record — source reading, gates with exact exit codes, and the
+reviewer's own mutants — is on [[AIRA-192]]; the points specific to this
+ticket's ask:
+
+- `confine --list --json` rows now carry `reserve_bytes` (always present,
+  `null` when unestablished) beside `cap`, and the text face prints a
+  `RESERVE` column beside `CAP` (`TestRenderConfineListShowsTheReserveBesideTheCap`
+  asserts both numbers appear, and that an unestablished reserve prints
+  `unevaluated` with the cap appearing exactly once).
+- The field is the ledger CHARGE, so over one listing
+  `Sum(reserve_bytes) == ScopeBytes + AdoptedBytes`
+  (`TestConfineListPerScopeReservesReconcileWithTheSliceLedger`, over a
+  fixture with three different numbers per scope). A mutant publishing the
+  frozen grant instead fails it.
+- The reporter's incident — reading a 45 GiB `cap` as a held reserve — is
+  now answerable from the row itself; the `ConfineSliceReserve` DeepEqual in
+  `TestConfineListSliceReserveSummary` is untouched and still load-bearing.
+- Reviewer's full `-count=1` suite on `266ff5a`: exit 0, 14 packages ok;
+  CI build/test/race all pass.

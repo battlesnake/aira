@@ -164,3 +164,71 @@ its own `memory.current` would count its children twice.
 PR #119 merged (`dd86e94`), all CI checks green (build+vet+gofmt, test,
 race). Verified independently against GitHub (merge SHA, check results)
 and closed out here.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #119 merged as `dd86e94` (2026-09-09), together with [[AIRA-191]] as one
+change (branch `aira192-real-per-scope-reserve`, tip `266ff5a`). Everything
+below is the reviewer's own verification from source and own runs, not the
+builder's transcript.
+
+- **Source of the number.** `ReserveBytes` is established in exactly one
+  place, `runner.ApplyConfineScopeReserves`, from `admitSnapshot.scopeReserves`,
+  which `admitSliceSnapshotFor` fills under `queue.mu` from
+  `waiter.ledgerCharge()` behind the identical `admitGranted && accounted`
+  guard `scopeBytes` sums, plus the evaluator's own per-scope
+  `queue.adoptedScopes` (written in the same locked block and the same loop as
+  the `adopted` scalar, retained on a failed scan, replaced wholesale on a
+  successful one). The daemon-down client fallback passes a nil map. No path
+  derives or approximates a reserve client-side, and no path reads `Cap`.
+- **Delegate bar width.** Confirmed by reading the test and the code path: a
+  45 GiB ceiling with a 1 GiB charge draws `region.Size == 1 GiB`, two such
+  scopes total `Claimed == 1.5 GiB`, and `Overcommitted` is false on a 64 GiB
+  frame with 12 GiB outside (`TestTopBarDrawsTheGrantedReserveNotTheDelegateScopeCeiling`).
+  The daemon end-to-end test writes a real 45 GiB `memory.max` to a
+  cgroupfs-shaped directory and the listing publishes the 512 MiB charge
+  beside the untouched cap.
+- **Unevaluated path.** `topReserveFor` reads only `ReserveBytes` (nil or
+  negative → unevaluated); the merge marks `reserve` in `unevaluated_fields`;
+  `confineInt64(nil)` prints `unevaluated`. The cap never stands in.
+- **Overcommitted arithmetic** is unchanged (`Claimed+Outside > Total`) and
+  now sees a `Claimed` equal to the ledger's scope-backed charges plus the
+  scope-less aggregate — the same unit throughout the bar.
+- **Shading unchanged.** The diff touches four hunks of `tui_top.go`
+  (`topReserve`/`topReserveFor`/`String`, and the `switch → if` in
+  `topViewModel`); `topUsedWithin` and `topBarCells` are untouched, and the
+  pre-existing split tests still run through the new source.
+- **Non-delegate case.** `TestTopBarIsUnchangedWhereCapAndReserveCoincide`
+  plus every existing geometry test via a fixture carrying reserve == cap.
+  Point 4's "identical today" premise is indeed false: the reviewer's own
+  confined test run printed `reserve=1521233100` beside
+  `scope-memory.max=enforced=1521229824` (page floor, 3276 B), so the unified
+  source is a correction there too.
+- **Gates, reviewer's own runs on `266ff5a`, confined, exact exit codes:**
+  `aira confine -- go test ./...` exit 0 (partly cached), then
+  `aira confine -- go test -count=1 ./...` exit **0**, 14 packages `ok`,
+  0 `FAIL` lines (cmd/aira 68.2s, daemon 126.7s, runner 162.9s, store
+  394.3s; waited through an 8–9-deep admission queue rather than bypassing).
+  CI on the PR: build+vet+gofmt pass, test pass, race pass (6m23s).
+- **Porosity, reviewer's own mutants (all killed, tree restored clean):**
+  publish `waiter.reserve` instead of `ledgerCharge()` → reconciliation test
+  fails; cap fallback inside `ApplyConfineScopeReserves` → runner honesty
+  tests and `TestConfineListLeavesAnUnknownScopeReserveUnevaluated` fail;
+  `topReserveFor` falling back to `Cap` → `…NeverTheCap` and the two-state
+  test fail; `topReserveFor` preferring `Cap` (the original defect) → the
+  headline test fails; dropping `queue.adoptedScopes = adoptedScopes` → both
+  adopted tests fail; `Overcommitted = false` → `TestTopViewModelBarGeometry`
+  fails `overcommitted=false, want true` (the true direction is still pinned).
+
+ACCEPTED GAPS (recorded, not silent — the builder's three, confirmed):
+
+1. A scope the ledger charges nothing for renders unevaluated, never `0`.
+2. Adopted rows and the adopted total can skew by one scan interval; the
+   scalar already carried that bound.
+3. A `--delegate-ram` suite holding per-test `confine-reserve` leases is
+   charged in two places by design (parent's pinned reserve + workers in the
+   scope-less region), so its region is narrower than its RAM column and the
+   clamped used-span paints it fully bright. Documented at `topReserveFor`.
+4. (Reviewer's) The installed daemon must be redeployed for any live
+   listing to carry `reserve_bytes`; until then every row reads unevaluated
+   and the bar is blank with a note — the honest state, not a regression.
