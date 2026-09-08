@@ -45,9 +45,35 @@ type ConfineRecord struct {
 	// or cgroup.events could not be opened) and must never be rendered as empty.
 	// killConfine already used this same source for the same reason; this only
 	// makes it available to the scan.
-	SubtreePopulated *bool   `json:"subtree_populated"`
-	AgeSeconds       *int64  `json:"age_seconds"`
-	Cap              *string `json:"cap"`
+	SubtreePopulated *bool `json:"subtree_populated"`
+	// SupervisorLive is whether the process that LAUNCHED this scope still
+	// exists — a different question from SubtreePopulated above, and the one that
+	// separates the two states an empty subtree used to conflate (AIRA-183):
+	//
+	//   - true with an empty subtree: the supervisor is alive and the scope is
+	//     merely between processes (mid fork/exec, or a legitimately idle moment).
+	//     Nothing is wrong and nothing is going to be reaped.
+	//   - false with an empty subtree: the supervisor is GONE. The scope is
+	//     orphaned and the daemon's reaper removes it once it is past the reap
+	//     grace. This is the state an operator was reading as "the kill did not
+	//     work" or "something leaked".
+	//
+	// It comes from the same kill(pid, 0) signal the orphan reaper's own
+	// supervisorDead predicate uses (orphanedConfineScopeCandidates), so the
+	// listing and the reaper cannot disagree about who is dead.
+	//
+	// nil is "could not be established", never "dead": an unreadable or
+	// ambiguous supervisor reading must not be rendered as an orphan, because
+	// that is precisely the reading an operator acts on by killing something.
+	// Two things produce nil deliberately: a signal error that is neither ESRCH
+	// nor EPERM, and — the load-bearing one — a scope whose supervisor probes
+	// dead while the daemon still holds a live admit lease for it. That
+	// disagreement is exactly what a PID-namespace-local supervisor PID looks
+	// like from outside its namespace, and the reaper already refuses to reap on
+	// it; the listing correspondingly refuses to call it orphaned.
+	SupervisorLive *bool   `json:"supervisor_live"`
+	AgeSeconds     *int64  `json:"age_seconds"`
+	Cap            *string `json:"cap"`
 	// Command is the WRAPPED invocation this scope was created for — the argv
 	// after `aira confine`'s own `--` separator — read live from
 	// /proc/<SupervisorPID>/cmdline at listing time, exactly as RSSBytes and Cap

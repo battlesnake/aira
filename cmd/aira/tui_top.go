@@ -770,6 +770,14 @@ func topCommandCell(command *string) string {
 // topLiveCell renders liveness from the SUBTREE-aware signal, and says so when
 // it could not be established. A nil is never "no": AIRA-102's whole point is
 // that an unreadable population is not evidence of a dead job.
+//
+// AIRA-183 deliberately did NOT bring its idle/orphaned split here. That split
+// exists to stop an operator MISREADING one static listing and acting on it —
+// `confine --list` is a snapshot, so a momentarily empty scope and a dead one
+// look identical in it. `top` redraws every second: a scope whose supervisor has
+// died simply stops changing and then disappears when the reaper takes it, which
+// is the distinction the split has to spell out in a snapshot. Adding the words
+// here would be a second spelling of a state this face already shows over time.
 func topLiveCell(record runner.ConfineRecord) string {
 	if record.Pending {
 		return "pending"
