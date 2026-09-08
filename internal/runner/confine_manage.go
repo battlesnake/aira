@@ -80,9 +80,106 @@ type ConfineRecord struct {
 	// unreadable, or the kernel published no usage_usec key), never a measured
 	// zero — a scope that has genuinely used no CPU publishes usage_usec 0, and
 	// collapsing the two would draw an unreadable scope as an idle one.
-	CPUUsageUsec      *int64   `json:"cpu_usage_usec"`
+	CPUUsageUsec *int64 `json:"cpu_usage_usec"`
+	// ReserveBytes is what the daemon's admission ledger CHARGES this scope right
+	// now — its share of the `slice reserve: <granted>` total the same reply
+	// carries (AIRA-191, AIRA-192). It is established only by
+	// ApplyConfineScopeReserves, from the daemon's own locked admission snapshot,
+	// and never by the cgroupfs scan that fills every field above it.
+	//
+	// It is NOT Cap, and that distinction is the whole reason this field exists. A
+	// `--delegate-ram` scope's memory.max is an AIRA-15 containment CEILING sized
+	// to give a whole framework's workers room, deliberately far wider than the
+	// pinned framework reserve the ledger charges it (admit.go's own words: "a
+	// delegate scope's memory.max is its scope ceiling, not its pinned framework
+	// reserve, and that is the largest cap population on the machine"). Summing
+	// caps to answer "how much of the slice is reserved" therefore over-states the
+	// claim by tens of gigabytes on a machine running a delegate suite, which is
+	// exactly what `aira top` did until AIRA-192: it drew ~93 GiB of claims on an
+	// 80 GiB machine while the ledger's own line read 40 GiB granted of a 53 GiB
+	// ceiling. Nor is it the frozen grant payload: since AIRA-29 a scope's charge
+	// is re-derived from live usage, and it is the CHARGE, not the grant, that
+	// occupies the slice and gates the next admission.
+	//
+	// nil is "the daemon holds no admission record for this scope" — a job it lost
+	// track of across a restart, one whose reserve could not be reconstructed, or
+	// any listing built without the daemon at all — and every renderer must say
+	// unevaluated. Falling back to Cap is forbidden: it IS the defect. Zero, by
+	// contrast, is a REAL established charge and must not collapse into absence,
+	// which is why this is a pointer rather than an int64 with a sentinel.
+	//
+	// Summed over one listing's rows it reconciles with that listing's own
+	// ScopeBytes + AdoptedBytes, up to the one-scan-interval skew the adopted
+	// ledger already documents.
+	ReserveBytes      *int64   `json:"reserve_bytes"`
 	Pending           bool     `json:"pending,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
+}
+
+// ConfineReserveFacet is the UnevaluatedFields name for an unestablished
+// per-scope reserve, spelled once so the producer and every consumer cannot
+// drift.
+const ConfineReserveFacet = "reserve"
+
+// ApplyConfineScopeReserves stamps the daemon's per-scope ledger charges onto a
+// listing's records, matched by scope id.
+//
+// It is the ONE place ConfineRecord.ReserveBytes is ever set, and it is called on
+// EVERY path that produces a listing — including the daemon-down client fallback,
+// which passes a nil map. That uniformity is the point: a record that has been
+// through this function either carries a reserve the daemon established or names
+// `reserve` as unevaluated, so no consumer is left to infer which of the two it
+// is holding, and none of them has any reason to invent a fallback.
+//
+// reserves is a snapshot the caller has already copied out from under the
+// daemon's queue lock; this function takes no lock and makes no decision.
+//
+// covers: AIRA-191
+// covers: AIRA-192
+func ApplyConfineScopeReserves(scopes []ConfineRecord, reserves map[string]int64) {
+	for index := range scopes {
+		record := &scopes[index]
+		if value, ok := reserves[record.ScopeID]; ok && record.ScopeID != "" {
+			// An established reading also clears any earlier "unevaluated" mark, so a
+			// second pass over the same records cannot leave a record contradicting
+			// itself.
+			charge := value
+			record.ReserveBytes = &charge
+			record.UnevaluatedFields = withoutConfineFacet(record.UnevaluatedFields, ConfineReserveFacet)
+			continue
+		}
+		record.ReserveBytes = nil
+		record.UnevaluatedFields = withConfineFacet(record.UnevaluatedFields, ConfineReserveFacet)
+	}
+}
+
+func withConfineFacet(facets []string, facet string) []string {
+	for _, existing := range facets {
+		if existing == facet {
+			return facets
+		}
+	}
+	return append(facets, facet)
+}
+
+// withoutConfineFacet returns a NEW slice when it has to drop something, and the
+// original untouched when it does not. Compacting in place would be shorter and
+// would quietly rewrite whatever else shares that backing array — a hazard with
+// no upside on a list of at most a handful of short strings.
+func withoutConfineFacet(facets []string, facet string) []string {
+	kept := make([]string, 0, len(facets))
+	for _, existing := range facets {
+		if existing != facet {
+			kept = append(kept, existing)
+		}
+	}
+	if len(kept) == len(facets) {
+		return facets
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
 }
 
 // ConfineCPUFrame is the SYSTEM-and-SLICE CPU counter pair, read as one sample

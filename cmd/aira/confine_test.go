@@ -219,6 +219,57 @@ func TestRenderConfineListLiveColumnUsesSubtreePopulation(t *testing.T) {
 	}
 }
 
+// AIRA-191. The per-scope RESERVE column, printed BESIDE the cap rather than
+// instead of it.
+//
+// The gap: `confine --list` exposed only CAP per scope, and a --delegate-ram
+// scope's cap is an AIRA-15 containment ceiling, not its charged reserve. The
+// reporter's own incident is the whole ticket: a 45 GiB cap read as another
+// session's held reserve, when the real reserve was 512M. Nothing in the listing
+// could attribute the slice's granted total back to the jobs holding it.
+//
+// verifies: AIRA-191
+func TestRenderConfineListShowsTheReserveBesideTheCap(t *testing.T) {
+	pid, leaf, rss, age := 4242, 1, int64(9)<<30, int64(7)
+	ceiling := "48318382080" // 45 GiB
+	reserve := int64(536870912)
+	live := true
+
+	render := func(t *testing.T, held *int64) string {
+		t.Helper()
+		result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{{
+			Name: "suite", Owner: "session-b", SupervisorPID: &pid,
+			ScopeID: "CONFINE-@dr-suite-4242-abc@session-b", Populated: &leaf, SubtreePopulated: &live,
+			RSSBytes: &rss, AgeSeconds: &age, Cap: &ceiling, ReserveBytes: held,
+		}}}
+		dispatch := dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, _ core.Request) core.Response {
+			return core.Response{OK: true, Code: "OK", Data: result}
+		})
+		var stdout, stderr bytes.Buffer
+		if exit := runWithInputDispatcher([]string{"confine", "--list"}, &stdout, &stderr, strings.NewReader(""), dispatch); exit != 0 {
+			t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
+		}
+		return stdout.String()
+	}
+
+	output := render(t, &reserve)
+	for _, want := range []string{"RESERVE", "CAP", "536870912", "48318382080"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("a delegate scope's row lacks %q; the reserve and the ceiling are different facts and BOTH are printed: %q", want, output)
+		}
+	}
+	// The honesty case, and the one a cap-shaped fallback would get wrong: an
+	// unestablished reserve says so, and the 45 GiB ceiling does not stand in.
+	output = render(t, nil)
+	if !strings.Contains(output, "unevaluated") {
+		t.Fatalf("an unestablished reserve must render unevaluated: %q", output)
+	}
+	if strings.Count(output, "48318382080") != 1 {
+		t.Fatalf("the cap appears %d times; an unevaluated reserve must not be filled in with it: %q",
+			strings.Count(output, "48318382080"), output)
+	}
+}
+
 func TestRenderConfineListReserveSummary(t *testing.T) {
 	tests := []struct {
 		name    string

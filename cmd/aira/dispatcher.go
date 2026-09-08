@@ -214,6 +214,14 @@ func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, reques
 		if result.Verdict == "unevaluated" {
 			return core.Response{OK: true, Code: "UNEVALUATED", Data: result, Exit: 3}
 		}
+		// AIRA-191/AIRA-192. This is the DAEMON-DOWN listing: a pure cgroupfs scan
+		// with no admission ledger behind it, so no scope's reserve can be
+		// established here at all. Naming that absence explicitly — rather than
+		// leaving the field silently unset — is what keeps every consumer on the
+		// same rule and stops one of them reaching for the cap instead. It is also
+		// the only honest answer: with the daemon unreachable nobody knows what is
+		// charged to whom.
+		runner.ApplyConfineScopeReserves(result.Scopes, nil)
 		return core.Response{OK: true, Code: "OK", Data: result}
 	}
 	selector, _ := request.Args["selector"].(string)
