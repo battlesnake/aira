@@ -56,3 +56,55 @@ assert `check` still grades every dimension that does not read the ledger.
 `aira check` on a repository with an unparseable run-ledger record returns
 `ok:true` with a graded report in which the ledger-derived dimensions are
 `unevaluated` and carry the named record, and no other dimension is suppressed.
+
+## A SECOND, worse journal defect found the same afternoon (needs its own fix)
+
+Verifying section 5 of AIRA-170 meant running a branch-built `aira` with a
+throwaway `HOME`/`XDG_STATE_HOME`, so `ServiceIdentityMatches` returns false and
+the client does not defer to the stale installed daemon. That client got its own
+empty `state.db` — and appended to the SHARED common-dir journal anyway:
+
+```
+.git/aira/journal.jsonl:518
+{"project_id":"21fe...095a","seq":2577,"at":"2026-09-08T02:54:53Z",
+ "actor":"unknown","verb":"rant.create","target":"RANT-1", ...}
+```
+
+`RANT-1` is that isolated database's FIRST rant. The authoritative database's
+rant numbering is at RANT-24 and its seq counter had not yet reached 2577, so the
+next real mutation collided:
+
+```
+$ aira create "..." --kind bug --severity P2
+E_JOURNAL_CORRUPT: journal key conflict: duplicate project/seq 21fe...095a/2577
+has different identity   (exit 4)
+```
+
+Every AIRA mutation in this repository now fails there. The create that hit it
+had already materialised `.aira/tickets/AIRA-173.md` and taken its allocation
+receipt, so the file is real and the event is unjournaled — the ordinary crash
+window `replayUnjournaledEvents` closes, except it cannot, because replay wants
+the same seq 2577.
+
+**The state split is the defect.** The DB lives under `XDG_STATE_HOME`, the
+journal and receipts live in the repository's common dir, and nothing binds one
+to the other. A client with a different state home therefore writes durable
+records into a journal whose sequence space it does not own, and the damage is
+silent at the time it is done. The mandatory DB-owning daemon is what normally
+prevents this, so the bug is that bypassing the daemon **corrupts** rather than
+**refuses**: AIRA is fail-closed everywhere else, and this is the one path where
+an unsupported configuration writes rather than stops.
+
+Candidate fix: stamp the journal with the identity of the database that owns its
+sequence space (a state-home / database fingerprint in the file's header or in
+each record) and refuse to append when it does not match, with a stable code. A
+foreign client would then get a refusal on its first write instead of a conflict
+on someone else's next one.
+
+**Repair for the damage already done** (needs an operator; it is a hand-edit of a
+durable audit journal and is not something an agent should do unasked): delete
+the single last line of `.git/aira/journal.jsonl` — `seq 2577`, `rant.create`,
+`target RANT-1` — then `aira reconcile`, which replays the pending AIRA-173
+event onto the freed seq. The record describes an event that never happened in
+the authoritative database; the genuine RANT-1 is at seq 4 with the same payload
+digest. A backup of the pre-repair file is at `~/tmp/aira169-mut/journal.jsonl.bak`.

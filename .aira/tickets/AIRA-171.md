@@ -15,9 +15,9 @@ is a hand-editing slip in frontmatter that no writer path would have produced.
 | `AIRA-28.md` | `E_RELATION_INVALID: relations must be sorted` |
 | `AIRA-62.md` | `E_RELATION_INVALID: relation is not stored on its canonical lower-ID ticket` |
 | `AIRA-117.md` | `E_TICKET_INVALID: ticket labels must be unique and sorted` |
-| `AIRA-141.md` | `E_CONFIG_INVALID`: body does not end in a newline |
+| `AIRA-141.md` | `E_CONFIG_INVALID: ticket body must end in newline` |
 | `AIRA-144.md` | `E_TICKET_INVALID: ticket labels must be unique and sorted` |
-| `AIRA-145.md` | `E_CONFIG_INVALID`: body does not end in a newline |
+| `AIRA-145.md` | `E_CONFIG_INVALID: ticket body must end in newline` |
 | `AIRA-152.md` | `E_RELATION_INVALID: relation is not stored on its canonical lower-ID ticket` |
 | `AIRA-153.md` | `E_RELATION_INVALID: relation is not stored on its canonical lower-ID ticket` |
 | `AIRA-160.md` | `E_TICKET_INVALID: ticket labels must be unique and sorted` |
