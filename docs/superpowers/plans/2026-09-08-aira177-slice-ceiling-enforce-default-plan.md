@@ -438,7 +438,9 @@ by defaulting. The plan requires a comment at that test recording the loss, so
 the porosity is written down rather than left for someone to rediscover.
 
 **R7 — a SECOND existing AIRA-106 test becomes half-porous, same class as R3.**
-Found by the revision-1 gate, missed by revision 1.
+(Numbered 7 because revision 2 found it; placed here, out of numeric order,
+because it is R3's twin and the two must be read together.) Found by the
+revision-1 gate, missed by revision 1.
 `TestInstallDaemonConcurrentModeChangeSurvivesTheLock`
 (`daemon_service_test.go:261-305`) seeds both modes `observe`, has a concurrent
 writer swap the unit to `enforce` inside `d.flock`, and asserts the final unit
@@ -533,8 +535,10 @@ assertion and say why.
 clean state, asserting the **rendered** `aira-daemon.service` contains both
 `AIRA_DAEMON_SLICE_CEILING_MODE=enforce` and `AIRA_DAEMON_WATCHDOG_MODE=observe`.
 T2 pins the decision; this pins that the decision reaches the file, through
-`renderDaemonUnit`'s own `validDaemonMode` check (`install.go:484-486`) and the
-under-lock re-resolve (`:963-977`).
+`renderDaemonUnit`'s own `validDaemonMode` guard on both modes
+(`install.go:1434` + `:1441`/`:1444`, calling `validDaemonMode` at `:484-486`)
+and the under-lock re-resolve (`:963-977`, from the `preResolve` captured at
+`:866` before the pre-lock resolve at `:867`).
 
 **T4 — new `TestInstallReinstallDoesNotUpgradeObserveSliceCeiling`
 (`internal/install/daemon_service_test.go`), the replacement for R3.** Install
@@ -596,6 +600,13 @@ nothing. Required evidence, recorded in the build report as a table:
 | W2: blanket flip of the shared constant (watchdog also `enforce`) | T1, T3, every T2 row via its `want watchdog` column |
 | W3: the default applied BEFORE preservation (assignment hoisted above the installed-unit read, or pre-filled in `parseInstallArgs`) | T2b, T2c, T4, T5, **T7** |
 | W4: `sliceCeilingEffectiveMaximum` gated on `Mode != off` instead of `== enforce` (i.e. observe silently enforcing) | `TestSliceCeilingModeGating`, `TestSliceCeilingIsKeyedByCanonicalSlicePath`, `TestSliceCeilingThrottleReachesCapacityOnly` |
+
+Coverage accounted honestly rather than left implicit: **T2d and T2e appear in
+no W row.** They pin I4 (an explicit flag wins, with and without an installed
+unit) and are not discriminators for W1–W4 — no wrong implementation in this
+table can break them, because every one of them leaves the explicit-flag branch
+alone. They are kept because I4 is a stated invariant, not because they add
+non-porosity evidence, and the build report should say so rather than count them.
 
 **W4's three named discriminators**, verified to exist and to discriminate — a
 "re-run the existing tests" row without names would be vacuous:
