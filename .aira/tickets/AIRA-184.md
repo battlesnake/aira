@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-184","project":"aira","title":"A job OOM-killed marginally over its own ESTIMATED (non-pinned) cap has no in-run remedy, even with slice headroom to spare","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","estimator"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-184","project":"aira","title":"A job OOM-killed marginally over its own ESTIMATED (non-pinned) cap has no in-run remedy, even with slice headroom to spare","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","estimator"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-184","to":"AIRA-186"}]}
 ---
 
 Peer report (split, 2026-09-08), refined after their own initial "zero

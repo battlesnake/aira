@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-181","project":"aira","title":"Admission-wait progress line reports the QUEUE, never the RUNNING reserve that is the actual blocker at position 1","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-181","project":"aira","title":"Admission-wait progress line reports the QUEUE, never the RUNNING reserve that is the actual blocker at position 1","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-181","to":"AIRA-186"}]}
 ---
 
 Four independent peer sessions hit the same misreading tonight
