@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-163","project":"aira","title":"A slice can now admit a job it will certainly OOM-kill (the band above the degenerate floor)","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-163","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-163","project":"aira","title":"A slice can now admit a job it will certainly OOM-kill (the band above the degenerate floor)","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-163","to":"AIRA-153"}]}
 ---
 
 AIRA-153 deferral **G2**, accepted deliberately and written down rather than
@@ -27,3 +27,10 @@ the ladder and the refusal does not.
 
 Recorded for evidence. Reopen only with a rule that does not require that
 judgement.
+
+## Closed (2026-09-08)
+
+Recorded-and-accepted, not built: refusing inside the admit-then-maybe-OOM
+band needs the same forbidden judgement about a real job's size, and an
+attributed OOM (feeding the self-heal ladder) is not worse than a terminal
+refusal that does not.

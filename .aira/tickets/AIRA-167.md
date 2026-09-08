@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-167","project":"aira","title":"Refusing a too-small slice at install time was considered and NOT taken","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-167","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-167","project":"aira","title":"Refusing a too-small slice at install time was considered and NOT taken","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-167","to":"AIRA-153"}]}
 ---
 
 AIRA-153 deferral **G8**: one of the three candidate directions the AIRA-153
@@ -29,3 +29,9 @@ Refused on three grounds, the third decisive:
 
 AIRA-153 took candidate C instead (bound the prior by the slice, daemon-side).
 This ticket exists so the rejected direction and its derivation survive.
+
+## Closed (2026-09-08)
+
+This ticket's entire scope was recording a rejected candidate direction with
+its derivation. That is complete; there is nothing to build. AIRA-153 took
+candidate C instead.

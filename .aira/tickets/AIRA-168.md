@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-168","project":"aira","title":"No real-cgroup coverage of the degenerate too-small-slice refusal","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","tests"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-168","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-168","project":"aira","title":"No real-cgroup coverage of the degenerate too-small-slice refusal","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","tests"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-168","to":"AIRA-153"}]}
 ---
 
 AIRA-153 deferral **G9**: an accepted coverage gap, written down rather than
@@ -20,3 +20,10 @@ cannot hold the Go test harness itself, let alone a workload.
 
 Same class as AIRA-149's F7 coverage gap. Accepted. Recorded so "the suite is
 green" is not read as covering it.
+
+## Closed (2026-09-08)
+
+Accepted coverage gap, same class as AIRA-149's F7: the degenerate refusal is
+already driven deterministically through the real wire path with a stubbed
+memory reader; a real sub-1.2 MiB cgroup cannot hold the Go test harness
+itself, so no further coverage is being chased.

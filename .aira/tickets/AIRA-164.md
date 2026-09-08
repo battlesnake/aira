@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-164","project":"aira","title":"ci-shim mode: a ceiling-fitted booking is advisory, with no kernel enforcement behind it","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ci"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-164","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-164","project":"aira","title":"ci-shim mode: a ceiling-fitted booking is advisory, with no kernel enforcement behind it","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ci"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-164","to":"AIRA-153"}]}
 ---
 
 AIRA-153 deferral **G3**.
@@ -25,3 +25,10 @@ branch is unreachable there because ci-shim reports no peak-RSS and no OOM
 The booking can never exceed the container's own budget minus headroom, so this
 cannot over-commit the container. Accepted; recorded so the advisory nature of
 the number is not later mistaken for a bound.
+
+## Closed (2026-09-08)
+
+Recorded-and-accepted, not built: ci-shim bookings have always been advisory
+by the mode's own design; AIRA-153 only makes small containers admit unpinned
+jobs at all (strictly better than universal refusal below ~6 GiB), without
+changing the advisory nature of the number.

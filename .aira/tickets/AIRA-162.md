@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-162","project":"aira","title":"The fitted-reserve ladder can spend one extra real run at its top rung","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-162","to":"AIRA-153"}]}
+{"schema":1,"id":"AIRA-162","project":"aira","title":"The fitted-reserve ladder can spend one extra real run at its top rung","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-162","to":"AIRA-153"}]}
 ---
 
 AIRA-153 deferral **G1**, filed with its derivation rather than left implicit.
@@ -32,3 +32,10 @@ visible rather than silent.
 
 Recorded for evidence. No work is proposed here; a successor that wants to
 remove the extra rung should start from this derivation.
+
+## Closed (2026-09-08)
+
+Recorded-and-accepted, not built: predicting a real job's memory need before
+it runs would be exactly the judgement this project's primitives-not-judgement
+rule forbids, and the one-extra-run cost is bounded, attributed, and already
+visible via the guide's own re-run-at-the-same-cap-is-a-bug guidance.
