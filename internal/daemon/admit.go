@@ -2916,11 +2916,11 @@ func saturatedDiagnosisLocked(waiter *admitWaiter, reserve, ceiling int64) admit
 // This line named no escape hatch at all, and the one place that did -- the
 // generated agent guide -- gives a SINGLE instruction for the whole population:
 // "pin --memory-reserve at or below the printed cap_minus_headroom". That is
-// exactly the wrong thing to tell an operator whose request was refused BECAUSE
-// they pinned it. AIRA-153 narrowed the population enough for the split to be
-// tractable: after it, a terminal refusal is an over-ceiling per-signature
-// ESTIMATE, an OOM ESCALATION at or above FIT(ceiling), or a PINNED request
-// over the ceiling.
+// exactly the wrong thing to tell an operator whose request arrived with the
+// reserve already pinned. AIRA-153 narrowed the population enough for the split
+// to be tractable: after it, a terminal refusal is an over-ceiling per-signature
+// ESTIMATE, an OOM ESCALATION at or above FIT(ceiling), or a CLIENT-PINNED
+// reserve over the ceiling.
 //
 // A fourth arm exists because AIRA-153 §3.2 routes one more population here
 // deliberately -- a PRIOR on a slice too small for any viable fitted reserve
@@ -2942,6 +2942,33 @@ func saturatedDiagnosisLocked(waiter *admitWaiter, reserve, ceiling int64) admit
 // guess: the refusal still names both numbers and the basis, and AIRA does not
 // invent a cause it cannot establish.
 //
+// That same rule bounds what the `pinned:client` arm may SAY, and it is the one
+// arm whose cause the daemon genuinely cannot establish (build review, Fable
+// BLOCK). The only fact at this call site is the wire flag, and `pinned=true`
+// arrives on live paths where the operator passed no flag at all:
+//
+//   - EVERY `aira run` admission. internal/runner/admission_linux.go sends
+//     `pinned: !req.DaemonEstimateMemory || req.MemoryReservePinned`, and the sole
+//     setter of DaemonEstimateMemory is confine's own launch path, so `aira run`
+//     is ALWAYS `pinned:client` -- carrying a `run.memory_reserve` from
+//     .aira/config, or core's own peak-RSS estimate, neither of which is a flag
+//     (and `aira run` has no --memory-reserve flag to pass).
+//   - `aira confine -- docker run --memory=X` on an UNPINNED job.
+//     runner.ContainerPlan.ResolveReserve charges the container's own limit and
+//     re-marks the request pinned, so an operator who passed nothing can be
+//     refused here.
+//   - `aira confine-reserve`, which pins the pytest governor's default-sized
+//     per-test reservation.
+//
+// So the arm asserts only what the wire establishes -- the reserve was pinned
+// CLIENT-SIDE, so AIRA neither sized it nor fitted it to this slice -- and names
+// the possible origins AS possibilities. Naming a confine flag as the cause
+// would be exactly the fabrication the default arm's empty return exists to
+// avoid. What survives unchanged is the ACTION (a reserve of at most
+// cap_minus_headroom, or a larger slice) and the property that this arm never
+// tells the operator to pin, which is the instruction the whole ticket exists to
+// stop giving to a request that is already pinned.
+//
 // covers: AIRA-165
 func tooLargeRefusalAdvice(basis string) string {
 	term := basis
@@ -2950,7 +2977,7 @@ func tooLargeRefusalAdvice(basis string) string {
 	}
 	switch {
 	case term == "pinned:client":
-		return "you pinned this reserve yourself (--memory-reserve, --memory-max or --delegate-ram) and it is larger than this slice can grant; lower it to at most cap_minus_headroom, or run where the slice is larger -- do not re-pin the same number"
+		return "this reserve was PINNED on the client side, so AIRA neither sized it nor fitted it to this slice, and it is larger than this slice can grant; which pin is not established here -- it may be a --memory-reserve, --memory-max or --delegate-ram passed to confine, a `docker run --memory` limit AIRA charged for an otherwise unpinned job, or an `aira run` reserve (run.memory_reserve, or AIRA's own estimate, both of which aira run sends pinned); give it a reserve of at most cap_minus_headroom -- lower the one you passed, or set one -- or run where the slice is larger"
 	case term == "estimate:oom-escalated":
 		return "this command was OOM-killed here, and the reserve its own recorded peak justifies is larger than this slice can grant; it does not fit on this slice -- run where the slice is larger rather than retrying it unchanged"
 	case term == "estimate:p90-prior":

@@ -61,7 +61,7 @@ provenance rather than re-derived by comparing numbers.
 
 | basis term | population | advice |
 | --- | --- | --- |
-| `pinned:client` | the operator's own `--memory-reserve` / `--memory-max` / `--delegate-ram` | lower it to at most `cap_minus_headroom`, or use a larger slice — explicitly **not** "pin", which is what they already did |
+| `pinned:client` | the reserve arrived PINNED from the client, so AIRA neither sized nor fitted it — the daemon cannot see WHICH pin | the wire fact, the possible origins named **as possibilities**, then: give it a reserve of at most `cap_minus_headroom` (lower the one you passed, or set one), or use a larger slice — explicitly **not** "pin", which is what the request already carries |
 | `estimate:oom-escalated` | this command's own OOM at or above `FIT(ceiling)` | it does not fit on this slice; run where the slice is larger rather than retrying it unchanged |
 | any other `estimate:` | this command's OWN measured peak history | pin a SMALLER reserve only if you know the real need is smaller, otherwise it cannot run here |
 | `estimate:p90-prior` | a machine-wide prior about OTHER commands | named as a prior, not a measurement; pin a reserve you know fits, or use a larger slice |
@@ -90,6 +90,48 @@ An UNRECOGNISED basis gets no advice rather than a plausible-looking guess, on
 the same rule that makes an unestablished check `unevaluated` rather than a
 pass. The refusal still names both numbers and the basis.
 
+### Why the `pinned:client` arm names no cause (build review, Fable BLOCK)
+
+The first version of this arm said *"you pinned this reserve yourself
+(`--memory-reserve`, `--memory-max` or `--delegate-ram`) … do not re-pin the same
+number"*. That asserts a cause the daemon cannot establish, and it is WRONG on
+live paths. The only fact at the call site is the wire flag
+(`args["pinned"]`), and `pinned=true` arrives with **no operator flag at all**
+in three real cases:
+
+- **Every `aira run` admission.** `internal/runner/admission_linux.go` sends
+  `pinned: !req.DaemonEstimateMemory || req.MemoryReservePinned`, and the sole
+  setter of `DaemonEstimateMemory` is confine's launch path
+  (`internal/runner/confine_linux.go`), so `aira run` is ALWAYS `pinned:client`.
+  Its reserve is a `run.memory_reserve` from `.aira/config`
+  (`internal/app/project.go`) or core's own peak-RSS estimate
+  (`internal/core/resource_estimate.go` → `MemoryReserveOverride`). `aira run`
+  has no `--memory-reserve` flag to pass.
+- **`aira confine -- docker run --memory=X` on an unpinned job.**
+  `runner.ContainerPlan.ResolveReserve` charges the container's own limit and
+  re-marks the request pinned, so on a slice whose ceiling is below the charged
+  figure an operator who passed nothing is refused here.
+- **`aira confine-reserve`**, which pins the pytest governor's default-sized
+  per-test reservation.
+
+The arm now asserts only what the wire establishes — the reserve was pinned
+CLIENT-SIDE, so AIRA neither sized it nor fitted it to this slice — says *"which
+pin is not established here"*, and names the three origins as POSSIBILITIES. The
+ACTION is unchanged in substance (a reserve of at most `cap_minus_headroom`, by
+lowering the one passed or setting one, or a larger slice), and the arm still
+never tells the caller to pin. Naming a confine flag as the cause would have been
+exactly the fabrication the default arm's empty return exists to avoid, and the
+same rule the fourth arm exists for.
+
+The test-coverage gap that let it through: every pinned-arm test used the CONFINE
+shape (the runner helper passed `Request{DaemonEstimateMemory: true}`; the daemon
+test sets `args["pinned"]` directly), so the flag's non-flag origins were never
+exercised. `TestTooLargePinnedAdviceDoesNotBlameConfineFlagsOnAnAiraRunRefusal`
+(`internal/runner`) now drives the `aira run` shape — `Request{}` with
+`DaemonEstimateMemory` unset — asserts the flagless request really does reach the
+wire as `pinned=true` (the premise, established rather than assumed), and asserts
+the message attributes the pin to no confine flag.
+
 ### Tests
 
 - `TestTooLargeRefusalAdviceIsCaseSplitByPopulation`
@@ -99,8 +141,15 @@ pass. The refusal still names both numbers and the basis.
   the exact `required`/`cap_minus_headroom`/`basis` prefix, its own advice
   phrase, and the ABSENCE of every other arm's phrase — so a one-size-fits-all
   regression fails on four of five rows rather than passing on the one it
-  happens to describe. Plus the direct negative: the pinned arm never tells the
-  operator to pin.
+  happens to describe. Plus two direct negatives: the pinned arm never tells the
+  caller to pin, and it asserts no CAUSE for the pin (the strings "you pinned"
+  and friends are forbidden; the hedge and all three origins are required).
+- `TestTooLargePinnedAdviceDoesNotBlameConfineFlagsOnAnAiraRunRefusal`
+  (`internal/runner/admission_saturated_message_test.go`) — the `aira run` shape
+  (`DaemonEstimateMemory` unset), which reaches the daemon as `pinned:client`
+  with no flag passed. It asserts the wire flag is genuinely true for that shape
+  before asserting anything about the text, so a change to the wire expression
+  fails the premise loudly instead of leaving the test vacuous.
 - `TestTooLargeAdviceIsDecidedByTheTermNotTheTrailingTokens` — the classification
   rule over 19 basis spellings, including every token combination and three
   unrecognised bases that must produce NO advice.
@@ -128,11 +177,23 @@ Each applied alone in the worktree, run, then reverted:
 | M2 | one-size advice for every basis (the defect, restated) | four of five wire rows, the pinned negative, and 18 of 19 term rows |
 | M3 | match the `estimate:` FAMILY before the `estimate:p90-prior` term | exactly the two p90 rows and nothing else |
 | M4 | drop the trailing-token trim | exactly the `,ceiling-clamped` and `,ceiling-fitted` rows |
+| M5 | restore the first version's cause-asserting pinned arm ("you pinned this reserve yourself … do not re-pin the same number", in the daemon and in the runner's recorded constant) | exactly the pinned rows: 3 daemon subtests + the `pinned:client` term row + 2 runner subtests + the new `aira run` test; all four other arms and `TestEveryRefusableResolutionGetsAdvice` stay green |
+| M6 | drop the `!req.DaemonEstimateMemory` term from the wire `pinned` expression, i.e. make the `aira run` shape unpinned | only `TestTooLargePinnedAdviceDoesNotBlameConfineFlagsOnAnAiraRunRefusal`, on its PREMISE assertion ("the `aira run` shape sent pinned=false") rather than on any text assertion — so the new test cannot go vacuous in silence |
 
 ### Gate (2026-09-08, worktree `aira165-166-admission-message-polish`)
 
-Serialised, never concurrent, each under `aira confine`, on the code commit
-`f983788` (the only later change is this ticket text, which no test reads):
+Re-run in full after the build-review BLOCK fix (the reworded `pinned:client`
+arm, its two new negatives and the `aira run`-shape regression test). Serialised,
+never concurrent, each under `aira confine`:
+
+| command | exit | verdict |
+| --- | --- | --- |
+| `aira confine -- go build ./...` | 0 | pass |
+| `aira confine -- go vet ./...` | 0 | pass |
+| `aira confine -- go fmt ./internal/... ./cmd/...` | 0, no files rewritten | pass |
+| `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1 -timeout 25m` | 0 | pass — 14 packages `ok`, 0 `FAIL` |
+
+The original gate, on the pre-BLOCK code commit `f983788`, was:
 
 | command | exit | verdict |
 | --- | --- | --- |
@@ -165,9 +226,18 @@ change `FormatConfineBytes` itself, once, for every surface.
   it. Fixing that is an admission-DECISION change (re-evaluation, or a
   retry-after hint), not a wording change, and this ticket was scoped to say
   accurate things about the decision that was actually made.
-- **The generated guide's own `E_ADMIT_TOO_LARGE` sentence is unchanged.** It
-  already names both populations it describes and its advice ("pin at or below
-  the printed `cap_minus_headroom`, or run where the slice is larger") does not
-  contradict any arm above — for a pinned request "pin at or below" and "lower
-  it to at most" are the same instruction. Rewriting it would have been drift,
-  not a fix.
+- **The generated guide's own `E_ADMIT_TOO_LARGE` sentence is unchanged.** Its
+  ACTION ("pin at or below the printed `cap_minus_headroom`, or run where the
+  slice is larger") does not contradict any arm above: for an already-pinned
+  request, "pin at or below" and "give it a reserve of at most" are the same
+  instruction. Rewriting the action would have been drift, not a fix.
+
+  Its CAUSE clause, however, carries the same over-claim the build review BLOCKed
+  in the daemon arm: it calls the pinned population "a reserve you pinned
+  yourself", which is untrue of `aira run` (no such flag exists), of a charged
+  `docker run --memory` limit, and of `aira confine-reserve`. That sentence is
+  master's — this PR does not touch it, and the reviewer verified the guide's
+  other claims against the source — so correcting it is left as a FILED GAP for a
+  successor rather than fixed here as unreviewed drift. The one-line fix is to
+  say "a reserve pinned on the client side" in
+  `renderMarkdownBody` (`internal/core/skill.go`), matching the daemon arm.

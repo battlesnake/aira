@@ -206,6 +206,20 @@ func TestSaturatedExclusiveWordingStillWinsOverTheContentionClause(t *testing.T)
 // launching the job outside the ledger), and the error text.
 func tooLargeAdmission(t *testing.T, clientReserve int64, message string, rejection runnerAdmitRejection) (admissionResult, bool, error) {
 	t.Helper()
+	// The CONFINE shape: DaemonEstimateMemory is set by confine's launch path and
+	// by nothing else, so this is the only shape that leaves `pinned` on the wire
+	// under the operator's control. tooLargeAdmissionForRequest exists because
+	// that made every pinned-arm test here a confine test.
+	result, handled, err, _ := tooLargeAdmissionForRequest(
+		t, Request{DaemonEstimateMemory: true}, clientReserve, message, rejection)
+	return result, handled, err
+}
+
+// tooLargeAdmissionForRequest is tooLargeAdmission over an arbitrary Request,
+// and additionally returns the `pinned` flag the runner actually PUT ON THE
+// WIRE for it -- the one fact the daemon's advice is allowed to rest on.
+func tooLargeAdmissionForRequest(t *testing.T, req Request, clientReserve int64, message string, rejection runnerAdmitRejection) (admissionResult, bool, error, bool) {
+	t.Helper()
 	runner := &Runner{
 		memorySlice:      "/fake/finite.slice",
 		memoryReserve:    clientReserve,
@@ -216,18 +230,23 @@ func tooLargeAdmission(t *testing.T, clientReserve int64, message string, reject
 	}
 	client, server := net.Pipe()
 	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	wire := make(chan bool, 1)
 	go func() {
 		defer server.Close()
+		defer close(wire)
 		var frame runnerAdmitRequestFrame
 		if err := readRunnerAdmitFrame(server, &frame); err != nil {
 			return
 		}
+		pinned, _ := frame.Request.Args["pinned"].(bool)
+		wire <- pinned
 		data, _ := json.Marshal(rejection)
 		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{
 			Code: "E_ADMIT_TOO_LARGE", Error: message, Data: data,
 		})
 	}()
-	return runner.admitThroughDaemon(context.Background(), Request{DaemonEstimateMemory: true}, clientReserve)
+	result, handled, err := runner.admitThroughDaemon(context.Background(), req, clientReserve)
+	return result, handled, err, <-wire
 }
 
 // The §0.1 measured shape and the message internal/daemon/admit.go builds for
@@ -249,7 +268,7 @@ const (
 	// reaches the operator intact rather than being rewritten, truncated, or
 	// swapped for the runner's own sentence the way E_ADMIT_SATURATED's is.
 	tooLargePinnedBasis   = "pinned:client"
-	tooLargePinnedMessage = "E_ADMIT_TOO_LARGE: required=4294967296 cap_minus_headroom=1031798784 basis=pinned:client -- you pinned this reserve yourself (--memory-reserve, --memory-max or --delegate-ram) and it is larger than this slice can grant; lower it to at most cap_minus_headroom, or run where the slice is larger -- do not re-pin the same number"
+	tooLargePinnedMessage = "E_ADMIT_TOO_LARGE: required=4294967296 cap_minus_headroom=1031798784 basis=pinned:client -- this reserve was PINNED on the client side, so AIRA neither sized it nor fitted it to this slice, and it is larger than this slice can grant; which pin is not established here -- it may be a --memory-reserve, --memory-max or --delegate-ram passed to confine, a `docker run --memory` limit AIRA charged for an otherwise unpinned job, or an `aira run` reserve (run.memory_reserve, or AIRA's own estimate, both of which aira run sends pinned); give it a reserve of at most cap_minus_headroom -- lower the one you passed, or set one -- or run where the slice is larger"
 
 	tooLargeEstimateRequired = int64(2469606195)
 	tooLargeEstimateBasis    = "estimate:max=2147483648,n=5,f=115"
@@ -289,9 +308,9 @@ func TestTooLargeRefusalMessageNamesBothNumbersAndTheBasis(t *testing.T) {
 			wantAdvice: "blind default for a command it has not measured",
 		},
 		{
-			name: "a reserve the operator pinned themselves", message: tooLargePinnedMessage,
+			name: "a reserve pinned on the client side", message: tooLargePinnedMessage,
 			required: tooLargeRequired, basis: tooLargePinnedBasis,
-			wantAdvice: "you pinned this reserve yourself",
+			wantAdvice: "was PINNED on the client side",
 		},
 		{
 			name: "this command's own measured estimate", message: tooLargeEstimateMessage,
@@ -344,7 +363,7 @@ func TestTooLargeRefusalMessageNamesBothNumbersAndTheBasis(t *testing.T) {
 	t.Run("the pinned arm is not told to pin", func(t *testing.T) {
 		// The defect AIRA-165 exists for: "pin --memory-reserve at or below
 		// cap_minus_headroom" was given to every population, and it is the one
-		// instruction an operator who ALREADY pinned cannot act on.
+		// instruction a request that arrived ALREADY pinned cannot act on.
 		result, _, err := tooLargeAdmission(t, DefaultConfineMemoryReserve, tooLargePinnedMessage, runnerAdmitRejection{
 			Required: tooLargeRequired, Ceiling: tooLargeCeiling, Basis: tooLargePinnedBasis,
 		})
@@ -353,12 +372,85 @@ func TestTooLargeRefusalMessageNamesBothNumbersAndTheBasis(t *testing.T) {
 		}
 		message := err.Error()
 		if strings.Contains(message, "pin a ") || strings.Contains(message, "pin --memory-reserve") {
-			t.Fatalf("message %q tells an operator who already pinned to pin", message)
+			t.Fatalf("message %q tells an operator whose reserve is already pinned to pin", message)
 		}
-		if !strings.Contains(message, "lower it") {
-			t.Fatalf("message %q does not say to lower the pinned number, which is the only action available", message)
+		if !strings.Contains(message, "at most cap_minus_headroom") || !strings.Contains(message, "lower the one you passed") {
+			t.Fatalf("message %q does not name the action (a reserve at most cap_minus_headroom, by lowering the one passed)", message)
 		}
 	})
+}
+
+// TestTooLargePinnedAdviceDoesNotBlameConfineFlagsOnAnAiraRunRefusal is the
+// regression for the arm's honesty (build review, Fable BLOCK).
+//
+// `pinned:client` is a WIRE FLAG, not an operator action. admitThroughDaemon
+// sends `pinned: !req.DaemonEstimateMemory || req.MemoryReservePinned`, and the
+// SOLE setter of DaemonEstimateMemory is confine's own launch path -- so every
+// `aira run` admission is `pinned:client` even though `aira run` has no
+// --memory-reserve, --memory-max or --delegate-ram flag to pass at all. Its
+// reserve comes from `run.memory_reserve` in .aira/config or from core's own
+// peak-RSS estimate. (The same is true of a `docker run --memory` limit charged
+// onto an otherwise unpinned confine job, and of `aira confine-reserve`.)
+//
+// Every other pinned-arm test here and in internal/daemon uses the CONFINE
+// shape -- Request{DaemonEstimateMemory: true}, or args["pinned"] set directly
+// -- so the flag's non-flag origins were never exercised, which is exactly how
+// the advice came to state a confine flag as the cause. This test drives the
+// `aira run` shape instead.
+//
+// verifies: AIRA-165
+func TestTooLargePinnedAdviceDoesNotBlameConfineFlagsOnAnAiraRunRefusal(t *testing.T) {
+	// The `aira run` shape: no DaemonEstimateMemory (confine sets it and nothing
+	// else does), and no MemoryReservePinned either -- nobody passed a flag.
+	request := Request{ResourceSignature: "sig"}
+
+	result, handled, err, pinnedOnWire := tooLargeAdmissionForRequest(
+		t, request, DefaultConfineMemoryReserve, tooLargePinnedMessage, runnerAdmitRejection{
+			Required: tooLargeRequired, Ceiling: tooLargeCeiling, Basis: tooLargePinnedBasis,
+		})
+
+	// The premise, established rather than assumed: this flagless request really
+	// does arrive at the daemon as pinned, which is why it lands on this arm.
+	if !pinnedOnWire {
+		t.Fatalf("the `aira run` shape sent pinned=%v; if that is now false this test no longer drives the population it exists for", pinnedOnWire)
+	}
+	if !handled {
+		t.Fatalf("the exchange was not handled (result=%+v, err=%v)", result, err)
+	}
+	if err == nil {
+		t.Fatalf("a too-large rejection produced no error (result=%+v)", result)
+	}
+	message := err.Error()
+
+	// An operator here passed NO flag, so any sentence asserting they did is a
+	// fabricated cause -- the same fabrication the unrecognised-basis arm returns
+	// "" to avoid.
+	for _, forbidden := range []string{
+		"you pinned this reserve yourself",
+		"you pinned",
+		"the reserve you pinned",
+		"do not re-pin the same number",
+	} {
+		if strings.Contains(message, forbidden) {
+			t.Fatalf("message %q tells an `aira run` caller %q; aira run has no --memory-reserve/--memory-max/--delegate-ram flag, and its reserve comes from run.memory_reserve or AIRA's own estimate", message, forbidden)
+		}
+	}
+
+	// What it must say instead: the wire fact, the origins as POSSIBILITIES
+	// (including this one), and the action.
+	for _, want := range []string{
+		"was PINNED on the client side",
+		"which pin is not established here",
+		"run.memory_reserve",
+		"at most cap_minus_headroom",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("message %q omits %q, so an `aira run` caller cannot find the reserve AIRA will not name", message, want)
+		}
+	}
+	if strings.Contains(message, "pin a ") || strings.Contains(message, "pin --memory-reserve") {
+		t.Fatalf("message %q tells a caller whose reserve is already pinned to pin", message)
+	}
 }
 
 // TestTooLargeRejectionForAnUnescalatedOverCeilingReserveIsAcceptedByTheClient

@@ -11,16 +11,22 @@ import (
 
 // AIRA-165. The E_ADMIT_TOO_LARGE refusal used to give ONE piece of advice --
 // "pin --memory-reserve at or below cap_minus_headroom" -- to every population
-// that reached it, including the operator who was refused BECAUSE they pinned.
-// The numbers half is unchanged; only the advice is now case-split, and these
-// tests pin the split by PROVENANCE, end to end through the real admission path.
+// that reached it, including a request whose reserve was ALREADY pinned when it
+// arrived. The numbers half is unchanged; only the advice is now case-split, and
+// these tests pin the split by PROVENANCE, end to end through the real admission
+// path.
+//
+// The `pinned:client` arm is bounded by what the WIRE establishes rather than by
+// a cause: `pinned=true` reaches the daemon from `aira run` (always), from a
+// charged `docker run --memory` limit, and from `aira confine-reserve`, none of
+// which is an operator flag. See tooLargeRefusalAdvice's doc comment.
 
 // The distinctive phrase of each arm. They are asserted BOTH ways on every row
 // -- the right one present, all the others absent -- so the one-size-fits-all
 // regression this ticket exists to remove fails on four of five rows rather
 // than passing on the one it happens to describe.
 const (
-	pinnedAdvicePhrase   = "you pinned this reserve yourself"
+	pinnedAdvicePhrase   = "was PINNED on the client side"
 	oomAdvicePhrase      = "this command was OOM-killed here"
 	measuredAdvicePhrase = "this command's OWN measured peak history"
 	p90AdvicePhrase      = "machine-wide PRIOR about other commands"
@@ -63,7 +69,10 @@ func TestTooLargeRefusalAdviceIsCaseSplitByPopulation(t *testing.T) {
 		wantPhrase   string
 	}{
 		{
-			name:         "a reserve the operator pinned themselves",
+			// The wire flag, and nothing more: the daemon cannot see whether a
+			// confine flag, a charged container limit or an `aira run` reserve set
+			// it, which is precisely why the arm names those as possibilities.
+			name:         "a reserve pinned on the client side",
 			pinned:       true,
 			ceiling:      smallCeiling,
 			wantRequired: runner.DefaultConfineMemoryReserve,
@@ -167,13 +176,47 @@ func TestTooLargeRefusalAdviceIsCaseSplitByPopulation(t *testing.T) {
 
 	t.Run("the pinned arm never tells the operator to pin", func(t *testing.T) {
 		// The whole defect: "pin --memory-reserve at or below cap_minus_headroom"
-		// is the one instruction an operator who ALREADY pinned cannot act on.
+		// is the one instruction a request that ALREADY arrived pinned cannot act
+		// on.
 		advice := tooLargeRefusalAdvice("pinned:client")
 		if strings.Contains(advice, "pin a ") || strings.Contains(advice, "pin --memory-reserve") {
-			t.Fatalf("pinned advice %q tells the operator to pin; they already did", advice)
+			t.Fatalf("pinned advice %q tells the operator to pin; the reserve is already pinned", advice)
 		}
-		if !strings.Contains(advice, "lower it") {
-			t.Fatalf("pinned advice %q does not say to lower the pinned number, which is the only action available", advice)
+		if !strings.Contains(advice, "at most cap_minus_headroom") || !strings.Contains(advice, "lower the one you passed") {
+			t.Fatalf("pinned advice %q does not name the action (a reserve at most cap_minus_headroom, by lowering the one passed)", advice)
+		}
+	})
+
+	t.Run("the pinned arm asserts only the wire fact, never a cause", func(t *testing.T) {
+		// The daemon's ONLY fact here is the wire flag, and `pinned=true` reaches
+		// it with no operator flag on three live paths -- every `aira run`
+		// admission (which has no --memory-reserve flag at all), a `docker run
+		// --memory` limit charged onto an otherwise unpinned confine job, and
+		// `aira confine-reserve`'s default-sized per-test reservation. Asserting a
+		// confine flag as the CAUSE is the same fabrication the default arm's
+		// empty return exists to avoid (build review, Fable BLOCK).
+		advice := tooLargeRefusalAdvice("pinned:client")
+		for _, forbidden := range []string{
+			"you pinned this reserve yourself",
+			"you pinned",
+			"the reserve you pinned",
+		} {
+			if strings.Contains(advice, forbidden) {
+				t.Fatalf("pinned advice %q asserts %q as the cause; the daemon establishes only that the reserve arrived pinned, not who pinned it or with what", advice, forbidden)
+			}
+		}
+		// The origins must appear as POSSIBILITIES, hedged, and must include the
+		// two non-flag ones the wire flag actually carries.
+		for _, want := range []string{
+			"which pin is not established here",
+			"it may be a --memory-reserve",
+			"docker run --memory",
+			"aira run",
+			"run.memory_reserve",
+		} {
+			if !strings.Contains(advice, want) {
+				t.Fatalf("pinned advice %q omits %q; the operator is left unable to find the pin AIRA cannot name", advice, want)
+			}
 		}
 	})
 }
