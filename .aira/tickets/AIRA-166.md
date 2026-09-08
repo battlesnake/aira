@@ -86,3 +86,7 @@ eight missing clauses in both documents plus the negative firing on both. The
 existing `TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal` keeps its
 `estimate:p90-prior` assertion, with its rationale updated to say the basis is
 the one to expect WHEN a machine-wide p90 exists.
+
+Shipped in the same branch and gate as AIRA-165; the gate table is recorded on
+that ticket (`build`, `vet`, `go fmt`, and `AIRA_REAL_CGROUP=1 go test ./...`
+all exit 0 on commit `f983788`).

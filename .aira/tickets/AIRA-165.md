@@ -129,6 +129,21 @@ Each applied alone in the worktree, run, then reverted:
 | M3 | match the `estimate:` FAMILY before the `estimate:p90-prior` term | exactly the two p90 rows and nothing else |
 | M4 | drop the trailing-token trim | exactly the `,ceiling-clamped` and `,ceiling-fitted` rows |
 
+### Gate (2026-09-08, worktree `aira165-166-admission-message-polish`)
+
+Serialised, never concurrent, each under `aira confine`, on the code commit
+`f983788` (the only later change is this ticket text, which no test reads):
+
+| command | exit | verdict |
+| --- | --- | --- |
+| `aira confine -- go build ./...` | 0 | pass |
+| `aira confine -- go vet ./...` | 0 | pass |
+| `aira confine -- go fmt ./internal/... ./cmd/...` | 0, no files rewritten | pass |
+| `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1 -timeout 25m` | 0 | pass — 14 packages `ok`, 0 `FAIL` |
+
+`gofmt` is not on PATH on this box, so the formatting leg is `go fmt`, which
+rewrites and names any file it changes; it named none.
+
 ### The raw-bytes half: declined, with the reason
 
 `runner.FormatConfineBytes` renders a suffix only for EXACT multiples of a unit
