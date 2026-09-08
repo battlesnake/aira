@@ -1957,7 +1957,7 @@ func (s *Store) registerDB(ctx context.Context, bootstrap bool) error {
 			if err == nil && owner != s.projectID {
 				var root string
 				_ = conn.QueryRowContext(ctx, `SELECT root FROM worktrees WHERE project_id=? AND active=1 ORDER BY updated_at DESC LIMIT 1`, owner).Scan(&root)
-				return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s owned by project %s at %s; run aira eject --project %s", prefix, owner, root, owner)
+				return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s owned by project %s at %s; pass a different --prefixes, or if that project is yours to retire, aira eject --project %s", prefix, owner, root, owner)
 			}
 			if err == nil && normaliseKind(ownerKind) != kind {
 				// A prefix's kind is immutable: it may not be re-registered under

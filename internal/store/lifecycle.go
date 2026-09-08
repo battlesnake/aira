@@ -172,7 +172,7 @@ func (s *Store) PreflightAdoption(ctx context.Context) error {
 		}
 		var root string
 		_ = s.db.QueryRowContext(ctx, `SELECT root FROM worktrees WHERE project_id=? AND active=1 ORDER BY updated_at DESC LIMIT 1`, owner).Scan(&root)
-		return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s owned by project %s at %s; run aira eject --project %s", prefix, owner, root, owner)
+		return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s owned by project %s at %s; pass a different --prefixes, or if that project is yours to retire, aira eject --project %s", prefix, owner, root, owner)
 	}
 	return nil
 }

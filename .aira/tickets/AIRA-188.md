@@ -57,6 +57,26 @@ there is no compatibility burden worth preserving here consistent with
 this project's stated pre-1.0 stance of prioritising correctness over
 compatibility with a behaviour nobody should have been depending on.
 
+## Follow-up (devproc, 2026-09-08) — the conflict error's own wording actively recommended the destructive remedy, fixed directly
+
+Sharper than the default-behaviour question above: the actual
+`E_PREFIX_OWNERSHIP_CONFLICT` text (`internal/store/lifecycle.go:175`,
+`internal/store/store.go:1960`, verified — both identical) was `"%s owned
+by project %s at %s; run aira eject --project %s"` — the *only* suggested
+remedy was ejecting the colliding project, which for any caller other
+than aira's own dogfood project means deregistering someone else's live
+project. Combined with the (now-fixed) hidden `--prefixes` arg, the error
+steered a caller toward the destructive wrong action while never
+mentioning the safe one. Independent of whichever shape the default-prefix
+fix above ends up taking, this was fixable immediately as a pure wording
+change with no behaviour change: both sites now read `"...; pass a
+different --prefixes, or if that project is yours to retire, aira eject
+--project %s"` — the safe remedy first, `eject` explicitly scoped to
+"yours to retire" rather than presented as the default move. Fixed
+directly (`internal/store/lifecycle.go`, `internal/store/store.go`,
+`go build ./internal/store/...` green) — same "purely trivial ...
+mechanical" class as the Usage-string fix above.
+
 ## Not designed here
 
 Exact refusal message wording, and whether `AIRA` itself should keep a
