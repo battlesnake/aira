@@ -84,3 +84,20 @@ faster-than-5-minutes flagged state (not necessarily auto-killed, given
 this project's preference to never autonomously decide a job is
 disposable) -- is left for whoever picks this up. All three are
 compatible with each other, not alternatives.
+
+## Priority note (fastest-ee-4b, 2026-09-09)
+
+This ticket and [[AIRA-194]] are not merely related -- the reporter
+argues, and it holds up, that this one GATES that one: "a flag that lets
+an orchestrator hold no reservation is only safe once an orphaned child
+is visible" -- a zero-reserve pass-through parent (AIRA-194) makes the
+consequence of an unnoticed orphan strictly worse (nothing was ever
+charged for it, so nothing about the ledger even hints it exists),
+without this ticket's detection fix. Their own repo-side mitigation
+(stop wrapping already-self-confining parallel legs, since the outer
+wrapper protects nothing there per AIRA-187) removes fastest-ee's own
+exposure regardless of build order, but on a machine shared by many
+sessions an invisible orphan holding an engine-suite-sized footprint is
+everyone's problem, not just the originating caller's -- recorded here
+as the argument for sequencing this ticket first if only one is picked
+up soon.
