@@ -63,6 +63,28 @@ wait line saying more than queue position) without being the same fix —
 AIRA-181 surfaces the RUNNING SET's held reserve; this ticket surfaces the
 REQUEST's own size relative to the ceiling. [[AIRA-181]]
 
+## Follow-up (split, 2026-09-08) — the estimator's own number was correct; confirms scope, corrects earlier framing
+
+Reporter's own 24G pin OOM'd (`terminated-by=oom, peak-rss=24G`); a 34G pin
+on the same full-gate configuration completed with measured
+`peak=31.97 GiB` — within ~3% of the estimator's 31 GiB max-of-20, with the
+1.15x safety factor (31 × 1.15 = 35.7G) landing exactly where it did.
+**The estimate was accurate; only the grantability check was missing.**
+Reporter's own correction, preserved verbatim in substance: their earlier
+"one estimator wrong in both directions" framing (linking this ticket to
+[[AIRA-184]] as symptoms of the same defect) is now retracted — AIRA-184's
+cap-path estimate was genuinely marginal (killed 12 KiB over its own
+cap), while this ticket's reserve-path estimate was correct and merely
+ungrantable. Two distinct defects sharing an estimator, not one defect
+with two faces; the cross-link stays, the shared-root-cause reading does
+not. Confirms this ticket must not be resolved by tightening the
+estimator — the reporter is explicit that doing so would have shipped
+their own 24G OOM as permanent behaviour. The unresolved safe-floor
+caveat above is now moot (was based on a mismatched population — a
+single-suite measurement applied to a full multi-suite gate); 34G is not
+itself recommended as a default (only ~6% headroom over the measured
+peak), it merely confirms the estimator's own number was sound.
+
 ## Not designed here
 
 Whether the estimator should itself be tempered by the slice's ceiling
