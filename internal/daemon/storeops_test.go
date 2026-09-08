@@ -332,3 +332,52 @@ func TestDecodeStoreOpPayloadRejectsTrailingJSON(t *testing.T) {
 		t.Fatalf("trailing payload error = %v", err)
 	}
 }
+
+// TestRegisterWorktreeBindingStoreOpRoundTrip is AIRA-176's relay leg: the one
+// write a client-routed verb makes reaches the single-writer daemon as an
+// ordinary store op, and the daemon stamps the SCOPE's worktree identity rather
+// than trusting anything in the payload.
+//
+// verifies: AIRA-176
+func TestRegisterWorktreeBindingStoreOpRoundTrip(t *testing.T) {
+	server, scope := storeOpTestServer(t)
+	input := domain.WorktreeBindingInput{
+		TicketID: "AIRA-176", Branch: "aira176-worktree-ticket-association",
+		BaseRef: "origin/master", Owner: "session-a", OwnerAttested: true,
+	}
+	response := exchangeStoreOpOverPipe(t, server, StoreOpFrame{
+		Proto: ProtocolVersion, Scope: scope, Op: "register-worktree-binding", Payload: payloadForTest(t, input),
+	})
+	if !response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	var binding domain.WorktreeBinding
+	if err := json.Unmarshal(response.Data, &binding); err != nil {
+		t.Fatal(err)
+	}
+	if binding.TicketID != "AIRA-176" || binding.WorktreeID != scope.WorktreeID {
+		t.Fatalf("binding=%+v, want the requested ticket under the scope's own worktree identity", binding)
+	}
+	if !binding.OwnerAttested || binding.Owner != "session-a" || binding.RegisteredAt == "" {
+		t.Fatalf("binding=%+v lost its identity or registration time", binding)
+	}
+}
+
+// TestRegisterWorktreeBindingStoreOpEnvelopeIsValidated: the op carries a JSON
+// payload and never a body, and a payload-free frame is refused rather than
+// silently writing an empty binding.
+func TestRegisterWorktreeBindingStoreOpEnvelopeIsValidated(t *testing.T) {
+	scope := WorktreeScope{StateID: "state"}
+	for name, frame := range map[string]StoreOpFrame{
+		"no payload": {Proto: ProtocolVersion, Scope: scope, Op: "register-worktree-binding"},
+		"with body":  {Proto: ProtocolVersion, Scope: scope, Op: "register-worktree-binding", BodyLen: 1, Payload: json.RawMessage(`{}`)},
+	} {
+		if err := validateStoreOpEnvelope(frame); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	ok := StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: "register-worktree-binding", Payload: json.RawMessage(`{"ticket_id":"AIRA-1"}`)}
+	if err := validateStoreOpEnvelope(ok); err != nil {
+		t.Fatalf("a well-formed frame was rejected: %v", err)
+	}
+}

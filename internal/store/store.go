@@ -901,6 +901,24 @@ func (s *Store) initDB(ctx context.Context) error {
             PRIMARY KEY(project_id, ticket_id, worktree_id, glob),
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 	        )`,
+		// AIRA-176. The ONE durable thing an audit cannot recompute: which ticket
+		// an agent DECLARED a checkout is for. Keyed per (worktree, ticket)
+		// because one checkout here routinely serves several live tickets at once;
+		// ticket_id carries no FK to `tickets` for the same reason area_hints does
+		// not (tickets is keyed per worktree, so a ticket ID has no single parent
+		// row to reference). No classification verdict is stored: every fact the
+		// audit reports is recomputed from git on each run.
+		`CREATE TABLE IF NOT EXISTS worktree_bindings (
+            project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+            branch TEXT NOT NULL DEFAULT '', base_ref TEXT NOT NULL DEFAULT '',
+            base_commit TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '',
+            owner_attested INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, worktree_id, ticket_id),
+            CHECK (length(trim(ticket_id)) > 0),
+            CHECK (owner_attested IN (0, 1)),
+            CHECK (owner_attested = 0 OR length(trim(owner)) > 0),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+	        )`,
 		`CREATE TABLE IF NOT EXISTS gates (
 		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, definition_digest TEXT NOT NULL,
 		    definition_json TEXT NOT NULL, PRIMARY KEY(project_id, gate_id),

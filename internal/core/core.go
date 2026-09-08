@@ -365,6 +365,7 @@ type Core struct {
 	commandPrefix  []string
 	memoryEstimate bool
 	memoryHeadroom int64
+	integrationRef string
 	verbs          map[string]verbSpec
 }
 
@@ -469,6 +470,18 @@ func (c *Core) WithOutputCap(cap int64) *Core {
 // WithGitOps attaches git network operations to a runner-bearing face.
 func (c *Core) WithGitOps(g GitOps) *Core {
 	c.gitops = g
+	return c
+}
+
+// WithIntegrationRef attaches `.aira/config` -> `git.integration_ref`, the
+// configured answer to "what does merged mean in this repository" (AIRA-176).
+//
+// It is injected by the face for the same reason the run prefix is: core does
+// not read project configuration. An empty value is legitimate — an
+// unconfigured project falls through to `refs/remotes/origin/HEAD` and then to
+// `unevaluated`. Nothing ever defaults it to `master`/`main`.
+func (c *Core) WithIntegrationRef(ref string) *Core {
+	c.integrationRef = strings.TrimSpace(ref)
 	return c
 }
 
@@ -1366,6 +1379,28 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: result, Warnings: warnings}, nil
 		}},
+		// AIRA-176. Two verbs, deliberately asymmetric in safety and identical in
+		// routing: `register` is the only writer of a binding, `audit` never
+		// writes anything at all.
+		"worktree-register": {Name: "worktree-register", Usage: "worktree register <id> [--base <ref>] [--owner ID]", Args: []ArgSpec{
+			stringSpec("selector", true, true, "Ticket selector for the ticket this checkout is for"),
+			stringSpec("base", false, false, "Integration ref this work branched from (e.g. origin/master). Overrides .aira/config's git.integration_ref; never guessed when neither is set"),
+			stringSpec("owner", false, false, "Caller owner identity, resolved from the AIRA_CONFINE_OWNER chain by the face"),
+			boolSpec("owner_attested", false, false, "Whether the resolved owner is attested rather than inferred from the launch directory"),
+		}, MCPTool: "aira_worktree_register", Summary: "Declare which ticket this checkout is being worked for.", Safety: SafetyMutate, Include: true, Example: []string{"AIRA-1"},
+			Run: func(ctx context.Context, args *argAccessor) (any, error) {
+				selector, base := stringArg(args, "selector"), stringArg(args, "base")
+				owner, attested := stringArg(args, "owner"), boolArg(args, "owner_attested")
+				return c.worktreeRegister(ctx, selector, base, owner, attested)
+			}},
+		"worktree-audit": {Name: "worktree-audit", Usage: "worktree audit [<id>|<path>] [--base <ref>]", Args: []ArgSpec{
+			stringSpec("selector", false, true, "One ticket ID, or one worktree path (pass an absolute path from MCP, whose process directory is not the caller's). A ticket selector matches registered bindings and the branch-name convention, not commit-message inference, which would mean scanning every checkout's log. Omit to audit every checkout of this repository"),
+			stringSpec("base", false, false, "Integration ref to measure against, overriding every configured and recorded source"),
+		}, MCPTool: "aira_worktree_audit", Summary: "Classify every checkout's git state against its ticket, recomputed live.", Safety: SafetyRead, Include: true, Example: []string{},
+			Run: func(ctx context.Context, args *argAccessor) (any, error) {
+				selector, base := stringArg(args, "selector"), stringArg(args, "base")
+				return c.worktreeAudit(ctx, selector, base)
+			}},
 		"link": {Name: "link", Usage: "link <from> <kind> <to> | link ls <id>", Args: []ArgSpec{boolSpec("list", false, false, "List relations"), stringSpec("selector", false, true, "Ticket selector"), stringSpec("from", false, true, "Source ticket"), stringSpec("kind", false, true, "Relation kind", "blocks", "blocked-by", "parent", "child", "relates", "duplicates", "duplicated-by", "supersedes", "superseded-by", "resolves", "resolved-by"), stringSpec("to", false, true, "Target ticket")}, MCPTool: "aira_link", MCPOperation: "link", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if boolArg(args, "list") {
 				return c.store.Relations(stringArg(args, "selector"))
@@ -2154,11 +2189,16 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		}},
 		"touch":  {summary: "Record ticket area ownership", safety: SafetyMutate, example: []string{"AIRA-1", "**/*.go", "--token", "token"}},
 		"unlink": {summary: "Remove a ticket relation", safety: SafetyMutate, example: []string{"AIRA-1", "blocks", "AIRA-2"}},
-		"ready":  {summary: "List tickets ready to work on", safety: SafetyRead, example: []string{"--list"}},
-		"list":   {summary: "List tickets", safety: SafetyRead, example: []string{"kind:feature", "--by", "status", "--fields", "id"}},
-		"count":  {summary: "Count tickets by a dimension", safety: SafetyRead, example: []string{"kind:feature", "--by", "status"}},
-		"set":    {summary: "Set a ticket field", safety: SafetyMutate, example: []string{"AIRA-1", "status=planned"}},
-		"mv":     {summary: "Move a ticket to a new status", safety: SafetyMutate, example: []string{"AIRA-1", "planned"}},
+		// AIRA-176. The example is a bare ticket ID because that is the whole
+		// start-of-work form; audit takes no example because every selector it
+		// could name is repository-specific and a fixed one would not run.
+		"worktree-register": {summary: "Declare which ticket this checkout is being worked for", safety: SafetyMutate, example: []string{"AIRA-1"}},
+		"worktree-audit":    {summary: "Classify every checkout's git state against its ticket, recomputed live", safety: SafetyRead, example: []string{}},
+		"ready":             {summary: "List tickets ready to work on", safety: SafetyRead, example: []string{"--list"}},
+		"list":              {summary: "List tickets", safety: SafetyRead, example: []string{"kind:feature", "--by", "status", "--fields", "id"}},
+		"count":             {summary: "Count tickets by a dimension", safety: SafetyRead, example: []string{"kind:feature", "--by", "status"}},
+		"set":               {summary: "Set a ticket field", safety: SafetyMutate, example: []string{"AIRA-1", "status=planned"}},
+		"mv":                {summary: "Move a ticket to a new status", safety: SafetyMutate, example: []string{"AIRA-1", "planned"}},
 		"git": {summary: "Run a bounded authenticated git network operation", safety: SafetyExecute, operations: []OperationSpec{
 			{Name: "clone", Summary: "Clone a remote repository", Safety: SafetyExecute, Args: []OperationArg{{Name: "url", Required: true}, {Name: "dir"}}, Example: []string{"clone", "file:///repo", "repo"}},
 			{Name: "fetch", Summary: "Fetch remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"fetch", "origin"}},

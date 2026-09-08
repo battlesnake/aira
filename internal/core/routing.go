@@ -55,6 +55,19 @@ func Classify(verb, selector string) (string, Route) {
 		return canonical, RouteClient
 	case canonical == "reconcile", canonical == "check", canonical == "git":
 		return canonical, RouteClient
+	// AIRA-176. This case is REQUIRED, not decorative. "Touches git locally" does
+	// not imply RouteClient anywhere in this switch: the default below is
+	// RouteDaemon, and every client-local verb above is a hand-added case. Left
+	// out, `worktree register`/`worktree audit` would run INSIDE the daemon and
+	// classify whatever repository the daemon process happened to be standing in
+	// — the exact hazard that disqualified `claim` from writing bindings.
+	//
+	// Client-local is also right on the merits: one audit here is ~85 checkouts
+	// times ~6 git subprocesses, and running that inside the machine-wide
+	// single-writer daemon would hold a project's store-op lane for the whole
+	// sweep and stall every other session working that project.
+	case strings.HasPrefix(canonical, "worktree-"):
+		return canonical, RouteClient
 	case canonical == "gate" && (operation == "run" || operation == "canary-run"):
 		return canonical, RouteClient
 	default:

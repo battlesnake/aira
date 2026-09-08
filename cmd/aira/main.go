@@ -137,6 +137,20 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		return render(response, renderJSON, stdout, stderr)
 	}
 	verb := strings.ToLower(args[0])
+	// AIRA-176. `aira worktree <subverb>` is spelled as one canonical verb
+	// (`worktree-register` / `worktree-audit`) everywhere below it, exactly as
+	// `confine --list` is spelled `confine-list`. The rewrite happens here, before
+	// parseArgs, so the option allow-map and buildRequest arm are per-subverb and
+	// an option valid for one is refused for the other.
+	if verb == "worktree" {
+		rewritten, worktreeErr := canonicalWorktreeVerb(args)
+		if worktreeErr != nil {
+			code := store.ErrorCode(worktreeErr)
+			return render(core.Response{Code: code, Error: worktreeErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+		}
+		args = rewritten
+		verb = args[0]
+	}
 	positional, options, err := parseArgs(verb, args[1:])
 	if err != nil {
 		if verb == "worker-admit" {
@@ -388,6 +402,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if err != nil {
 		code := appErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+	}
+	// AIRA-176. Identity is stamped from the RESOLVED SCOPE ROOT, not the process
+	// cwd, so `--dir` and MCP's scope override both attribute a binding to the
+	// checkout actually being registered.
+	if ownerErr := stampWorktreeOwner(context.Background(), scope, &request); ownerErr != nil {
+		code := store.ErrorCode(ownerErr)
+		return render(core.Response{Code: code, Error: ownerErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	if verb == "tui" {
 		dispatcher := injected
@@ -712,16 +733,22 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
-		"touch":       {"token": true},
-		"ready":       {"list": true},
-		"find":        {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
-		"req":         {"status": true, "fields": true},
-		"test-report": {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
-		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
-		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
-		"insights":    {},
-		"lease":       {},
-		"tui":         nil,
+		"touch": {"token": true},
+		"ready": {"list": true},
+		// AIRA-176. --owner is accepted on register only; audit has no identity of
+		// its own to declare. Neither takes --owner-attested: attestation is
+		// DERIVED from the resolved owner by the face and can never be asserted on
+		// the command line, or the evidence grade would be forgeable.
+		"worktree-register": {"base": true, "owner": true},
+		"worktree-audit":    {"base": true},
+		"find":              {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
+		"req":               {"status": true, "fields": true},
+		"test-report":       {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
+		"spend":             {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
+		"quota":             {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
+		"insights":          {},
+		"lease":             {},
+		"tui":               nil,
 		// AIRA-127. `top` takes no options today; the entry exists so an unknown
 		// one is refused by name rather than silently accepted and discarded.
 		"top":          nil,
@@ -1893,6 +1920,19 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 }
 
 func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {
+	return resolveOwnerIn(ctx, explicit, "")
+}
+
+// resolveOwnerIn is resolveConfineOwner's chain rooted at an explicit
+// directory. dir == "" preserves the historical behaviour exactly: discover
+// from ".", and infer from the process cwd.
+//
+// AIRA-176 needs the parameterised form because `worktree register` must
+// resolve identity for the WORKTREE BEING REGISTERED. Over MCP the server
+// process's cwd is wherever the host launched it — not the caller's checkout —
+// so a cwd-rooted resolution would attribute the binding to the wrong place
+// (and, via the @cwd- inference, to a directory that is not even in the repo).
+func resolveOwnerIn(ctx context.Context, explicit, dir string) (string, error) {
 	if explicit != "" {
 		if err := runner.ValidateConfineIdentity(explicit); err != nil {
 			return "", err
@@ -1905,10 +1945,17 @@ func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {
 		}
 		return environment, nil
 	}
-	if project, err := app.Discover(ctx, "."); err == nil && project.WorktreeID != "" {
+	discoverDir := dir
+	if discoverDir == "" {
+		discoverDir = "."
+	}
+	if project, err := app.Discover(ctx, discoverDir); err == nil && project.WorktreeID != "" {
 		if err := runner.ValidateConfineIdentity(project.WorktreeID); err == nil {
 			return project.WorktreeID, nil
 		}
+	}
+	if dir != "" {
+		return runner.InferConfineOwner(dir), nil
 	}
 	// Last resort: INFER from the launch directory rather than reporting the
 	// literal "unknown" (AIRA-23). The reported hazard was a session about to
@@ -2689,6 +2736,24 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		}
 		args["selector"], args["token"] = positional[0], options["token"]
 		args["globs"] = positional[1:]
+	case "worktree-register":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: worktree register requires exactly one ticket selector")
+		}
+		args["selector"], args["base"] = positional[0], options["base"]
+		// owner/owner_attested are stamped after scope resolution
+		// (stampWorktreeOwner); an --owner given here is only the chain's first
+		// leg, never the final value.
+		args["owner"] = options["owner"]
+		args["owner_attested"] = false
+	case "worktree-audit":
+		if len(positional) > 1 {
+			return core.Request{}, errors.New("E_SELECTOR_AMBIGUOUS: worktree audit accepts at most one selector")
+		}
+		if len(positional) == 1 {
+			args["selector"] = positional[0]
+		}
+		args["base"] = options["base"]
 	case "link":
 		if len(positional) == 2 && positional[0] == "ls" {
 			args["list"], args["selector"] = true, positional[1]

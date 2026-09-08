@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-176","project":"aira","title":"Associate worktrees + agent/session identity with tickets, and classify staleness honestly (merged / no-changes / superseded / lost-work)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","worktree"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-176","project":"aira","title":"Associate worktrees + agent/session identity with tickets, and classify staleness honestly (merged / no-changes / superseded / lost-work)","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["data-model","worktree"],"hold":false,"relations":[]}
 ---
 
 Owner request (2026-09-08): a recent session spent real effort manually
@@ -55,13 +55,28 @@ Summary of the proposal:
   third identity concept (a separate `AIRA_SESSION` inconsistency was found
   during research and is named as its own, smaller, future ticket).
 
-Four open questions recorded in the plan's §4 for whoever gates this
-(new-table-vs-widen-worktrees, whether `aira claim` should opportunistically
-write a binding too, how "upstream/master" is determined rather than
-hard-coded, and full-two-loop-vs-lighter-path) — none blocking, all
-deliberately left for the build to decide with the plan-gate rather than
-settled here.
+The plan's §4 recorded four open questions; all four are **resolved** in §5
+(new table keyed `(project_id, worktree_id, ticket_id)`; `claim` writes no
+binding, `register` is the only writer; a fail-closed integration-ref chain
+ending in `unevaluated` with `@{upstream}` banned; full two-loop). Two review
+passes on §5 — an Astra plan review and a Fable gate — are answered in the
+plan's §6, and §7 is the test plan. Where §6 names a change it supersedes §5
+and §2.
 
 ## Status
 
-Planning only. Not yet gated, not yet built, per the owner's explicit request.
+Built on branch `aira176-worktree-ticket-association`. Shipped:
+
+- `worktree_bindings` (project_id, worktree_id, ticket_id, branch, base_ref,
+  base_commit, owner, owner_attested, registered_at), projects-FK cascade, no
+  FK on ticket_id, no stored classification.
+- `aira worktree register <id> [--base <ref>] [--owner ID]` (SafetyMutate) and
+  `aira worktree audit [<id>|<path>] [--base <ref>]` (SafetyRead), both
+  `RouteClient` via an explicit `Classify` case, both generated into MCP
+  (`aira_worktree_register`, `aira_worktree_audit`) and the Skill.
+- Live classification in `internal/worktree`: tri-state facts, a recommendation
+  that names its basis, inference from branch name and `AIRA-<n>:` commit
+  prefixes always labelled `inferred`, and no deletion path of any kind.
+- Identity from the `AIRA_CONFINE_OWNER` chain, resolved from the RESOLVED SCOPE
+  ROOT (not the process cwd) so MCP attributes a binding correctly, with
+  `owner_attested` derived — never assertable from the command line.

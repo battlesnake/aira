@@ -403,7 +403,11 @@ func (d *daemonDispatcher) dispatchCarved(ctx context.Context, request core.Requ
 	if d.outputCap > 0 {
 		dispatcher = dispatcher.WithOutputCap(d.outputCap)
 	}
-	return dispatcher.WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate).Do(ctx, request)
+	// AIRA-176 adds the integration ref alongside the other project-config values
+	// injected here; core never reads .aira/config itself.
+	return dispatcher.WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).
+		WithMemoryEstimate(project.Config.Run.MemoryEstimate).
+		WithIntegrationRef(project.Config.Git.IntegrationRef).Do(ctx, request)
 }
 
 func (d *daemonDispatcher) exchangeWithReplacement(ctx context.Context, exchange func(context.Context) (daemon.ResponseFrame, error)) (daemon.ResponseFrame, error) {
@@ -694,7 +698,11 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 	if d.outputCap > 0 {
 		dispatcher = dispatcher.WithOutputCap(d.outputCap)
 	}
-	return dispatcher.WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate).Do(ctx, request)
+	// AIRA-176 adds the integration ref alongside the other project-config values
+	// injected here; core never reads .aira/config itself.
+	return dispatcher.WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).
+		WithMemoryEstimate(project.Config.Run.MemoryEstimate).
+		WithIntegrationRef(project.Config.Git.IntegrationRef).Do(ctx, request)
 }
 
 func stampRantCaller(request *core.Request) {

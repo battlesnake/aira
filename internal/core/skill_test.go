@@ -17,8 +17,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 72 {
-		t.Fatalf("actions=%d, want 72", len(artifacts.Actions))
+	if len(artifacts.Actions) != 74 {
+		t.Fatalf("actions=%d, want 74", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -164,6 +164,9 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"test-report/add": SafetyMutate, "test-report/ls": SafetyRead, "test-report/show": SafetyRead, "test-report/flaky": SafetyRead,
 		"run": SafetyExecute, "run-input": SafetyExecute, "run-kill": SafetyExecute, "run-log": SafetyRead,
 		"confine-list": SafetyRead, "confine-kill": SafetyExecute,
+		// AIRA-176. The asymmetry is the point: register is the only writer of a
+		// binding, audit writes nothing at all and must stay SafetyRead.
+		"worktree-register": SafetyMutate, "worktree-audit": SafetyRead,
 		"time": SafetyExecute, "commands/ls": SafetyRead, "commands/count": SafetyRead,
 		"git/clone": SafetyExecute, "git/fetch": SafetyExecute, "git/push": SafetyExecute, "git/ls-remote": SafetyExecute,
 		"find/add": SafetyMutate, "find/ls": SafetyRead, "find/show": SafetyRead, "find/set": SafetyMutate,
@@ -887,6 +890,49 @@ func TestGuideDoesNotBlameTheOperatorForAClientPinnedReserve(t *testing.T) {
 		// explains, so this cannot pass on a stray mention elsewhere.
 		if !strings.Contains(document.body, "or a reserve pinned on the client side -- the run is refused immediately with `E_ADMIT_TOO_LARGE`") {
 			t.Errorf("%s: the client-pinned clause is no longer the one explaining E_ADMIT_TOO_LARGE", document.name)
+		}
+	}
+}
+
+// TestSkillTeachesTheWorktreeRitualAndHowToReadItsUnevaluatedFacts is AIRA-176's
+// documentation half.
+//
+// It is a test rather than a review note for the same reason
+// TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal is: the generated
+// documents are AIRA's own instructions to other agents, and the failure modes
+// here are silent. An agent that never registers leaves every audit guessing
+// from branch names; an agent that reads `unevaluated` as "not merged, fine"
+// deletes a worktree holding work; an agent that treats an `inferred` binding
+// as a declaration attaches the wrong ticket's status to a checkout. The five
+// legs below are exactly those things.
+//
+// verifies: AIRA-176
+func TestSkillTeachesTheWorktreeRitualAndHowToReadItsUnevaluatedFacts(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ text, why string }{
+		{"`aira claim <id>` and `aira worktree register <id>` together",
+			"the start-of-work ritual: the lease says who is working it now, the binding says what this checkout is FOR and outlives the lease"},
+		{"Before removing ANY worktree, run `aira worktree audit`",
+			"the habit the feature exists to create — the owner's reported pain was hand-auditing worktrees with git status and git log"},
+		{"holds work nothing else has a copy of — recover before removing",
+			"the one bucket whose being wrong actually loses work; an agent must recognise it verbatim in the output"},
+		{"a fact reported `unevaluated` is not a pass and not a zero",
+			"the honesty framing, without which an unevaluated merge check reads as permission to delete"},
+		{"never consults `@{upstream}`",
+			"the measured trap: on a feature branch branch.<name>.merge usually points at ITSELF, which would report every pushed branch as merged and safe to delete"},
+		{"is never promoted to the same confidence as one you registered",
+			"an inferred binding is weaker evidence and must not be read as a declaration"},
+	} {
+		for _, document := range []struct{ name, body string }{
+			{"SKILL.md", string(artifacts.SkillMD)},
+			{"guide", string(artifacts.Guide)},
+		} {
+			if !strings.Contains(document.body, want.text) {
+				t.Errorf("%s no longer teaches %q (%s)", document.name, want.text, want.why)
+			}
 		}
 	}
 }

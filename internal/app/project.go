@@ -34,17 +34,26 @@ type GitConfig struct {
 	GhFallback               *bool `json:"gh_fallback,omitempty"`
 	SSHConnectTimeoutSeconds int   `json:"ssh_connect_timeout_seconds,omitempty"`
 	OpTimeoutSeconds         int   `json:"op_timeout_seconds,omitempty"`
-	sshTimeoutPresent        bool
-	opTimeoutPresent         bool
+	// IntegrationRef is the ref this project treats as "merged" (AIRA-176) —
+	// typically "origin/master". It has NO default: `git symbolic-ref
+	// refs/remotes/origin/HEAD` is consulted next, and if that is unset too the
+	// audit reports the fact unevaluated rather than guessing. Guessing
+	// "master"/"main" would produce a confident wrong answer in the one
+	// direction that loses work, and `@{upstream}` is never consulted because a
+	// feature branch's branch.<name>.merge usually points at ITSELF.
+	IntegrationRef    string `json:"integration_ref,omitempty"`
+	sshTimeoutPresent bool
+	opTimeoutPresent  bool
 }
 
 // UnmarshalJSON preserves the distinction between an absent timeout (default)
 // and an explicitly configured zero (invalid).
 func (c *GitConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		GhFallback               *bool `json:"gh_fallback,omitempty"`
-		SSHConnectTimeoutSeconds *int  `json:"ssh_connect_timeout_seconds,omitempty"`
-		OpTimeoutSeconds         *int  `json:"op_timeout_seconds,omitempty"`
+		GhFallback               *bool  `json:"gh_fallback,omitempty"`
+		SSHConnectTimeoutSeconds *int   `json:"ssh_connect_timeout_seconds,omitempty"`
+		OpTimeoutSeconds         *int   `json:"op_timeout_seconds,omitempty"`
+		IntegrationRef           string `json:"integration_ref,omitempty"`
 	}
 	var value wire
 	dec := json.NewDecoder(strings.NewReader(string(data)))
@@ -53,6 +62,7 @@ func (c *GitConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	c.GhFallback = value.GhFallback
+	c.IntegrationRef = strings.TrimSpace(value.IntegrationRef)
 	if value.SSHConnectTimeoutSeconds != nil {
 		c.SSHConnectTimeoutSeconds, c.sshTimeoutPresent = *value.SSHConnectTimeoutSeconds, true
 	}
