@@ -5,7 +5,7 @@ GO ?= go
 GO_BIN := $(shell $(GO) env GOROOT 2>/dev/null)/bin
 export PATH := $(GO_BIN):$(HOME)/.local/bin:$(PATH)
 
-.PHONY: fmt fmt-check vet lint build test race cover fuzz tidy ci install-hooks
+.PHONY: fmt fmt-check vet lint build dist test race cover fuzz tidy ci install-hooks
 
 fmt:
 	@files="$$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*')"; \
@@ -39,6 +39,24 @@ lint:
 
 build:
 	$(GO) build ./...
+
+# Local equivalent of .github/workflows/release.yml's matrix build: both
+# static linux/amd64 and linux/arm64 aira binaries, same flags, in dist/.
+# Kept separate from `build` above, which stays a fast whole-module compile
+# check (a dependency of `ci`/the pre-push gate) and must not slow down or
+# start writing release artifacts.
+DIST_DIR := dist
+DIST_ARCHES := amd64 arm64
+
+dist:
+	@mkdir -p $(DIST_DIR)
+	@for arch in $(DIST_ARCHES); do \
+		out="$(DIST_DIR)/aira-linux-$$arch"; \
+		echo "building $$out"; \
+		CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -ldflags "-s -w" -o "$$out" ./cmd/aira || exit 1; \
+		sha256sum "$$out" > "$$out.sha256"; \
+	done
+	@file $(DIST_DIR)/aira-linux-*
 
 # The explicit -timeout is load-bearing, not decoration. AIRA-20 widened every test
 # liveness backstop so a hang is reported by name instead of by wall clock; a few of
