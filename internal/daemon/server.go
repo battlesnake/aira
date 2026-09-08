@@ -864,7 +864,10 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			response = s.bootstrap(ctx, request.Scope, request.Request.Args)
 		}
 	} else {
-		dispatcher, err := s.coreForScope(request.Scope)
+		dispatcher, resolved, releaseTarget, err := s.coreForRequest(ctx, request.Scope, request.Request)
+		if releaseTarget != nil {
+			defer releaseTarget()
+		}
 		if err != nil {
 			code := store.ErrorCode(err)
 			if strings.HasPrefix(err.Error(), CodeProjectInvalid) {
@@ -874,7 +877,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			}
 			response = core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		} else {
-			response = dispatcher.Do(ctx, request.Request)
+			response = dispatcher.Do(ctx, resolved)
 		}
 	}
 	// AIRA-84's own site: this used to write under the connect-time deadline,

@@ -325,8 +325,12 @@ func TestTUIDestructiveConfirmationRequiresExactResolvedID(t *testing.T) {
 	for _, ch := range "RANT-7" {
 		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
 	}
-	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	// This entry comes from the REAL dispatch table, so how many fields sit
+	// between the first one and Submit follows the rant descriptor — AIRA-179
+	// added the optional --project/--prefix target selector after the required
+	// rant id. Tab until Submit actually has focus rather than assuming a count,
+	// so a later argument addition changes nothing here.
+	tabToPaletteSubmit(t, runtime, screen)
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
 	time.Sleep(20 * time.Millisecond)
 	waitForSimulationText(t, runtime, screen, "Type RANT-7")
@@ -417,6 +421,28 @@ func assertConfirmCancelFocused(t *testing.T, runtime *tuiRuntime) {
 	case <-time.After(time.Second):
 		t.Fatal("reading confirmation focus deadlocked")
 	}
+}
+
+// tabToPaletteSubmit advances focus with Tab until the palette form's Submit
+// button holds it, so a test that opens a REAL dispatch-table entry does not
+// encode how many argument fields that entry happens to declare today.
+func tabToPaletteSubmit(t *testing.T, runtime *tuiRuntime, screen tcell.SimulationScreen) {
+	t.Helper()
+	for attempt := 0; attempt < 16; attempt++ {
+		focused := make(chan bool, 1)
+		go runtime.app.QueueUpdate(func() { focused <- runtime.paletteSubmitButton.HasFocus() })
+		select {
+		case has := <-focused:
+			if has {
+				return
+			}
+		case <-time.After(time.Second):
+			t.Fatal("reading palette submit focus deadlocked")
+		}
+		screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("palette submit button never received focus")
 }
 
 func waitForButtonFocusOnUI(t *testing.T, runtime *tuiRuntime, button *tview.Button) {

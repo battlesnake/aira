@@ -605,6 +605,17 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 		base["run_id"] = "RUN-1"
 		switch descriptor.Name {
 		case "rant":
+			// WRITTEN EXCLUSION (AIRA-179). This fixture asserts that every
+			// routed handler COMPLETES in-core, and a rant carrying a target
+			// selector deliberately cannot: only the daemon can resolve and
+			// build another project's store, so the core refuses by name rather
+			// than filing locally under a selector that asked for somewhere
+			// else. The fixture therefore files an ordinary LOCAL rant. The
+			// refusal has its own test
+			// (TestRantCoreRefusesATargetSelectorItCannotResolve) and the
+			// resolved path its own end-to-end daemon tests.
+			base["project"] = ""
+			base["prefix"] = ""
 			base["selector"] = "RANT-1"
 			base["severity"] = "annoyance"
 			base["text"] = "routing friction"

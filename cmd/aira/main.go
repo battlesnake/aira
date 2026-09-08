@@ -703,7 +703,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"init":   {"project": true, "prefixes": true},
 		"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
-		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true},
+		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
 		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
@@ -2377,6 +2377,12 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("rant requires <text> or ls|get|review|redact")
 		}
+		// The target selector names the project the operation applies to and is
+		// carried on EVERY rant sub-verb, not just capture: a rant filed into a
+		// shared tool's project is read, reviewed and redacted there too
+		// (AIRA-179). Both selectors together are refused by the one resolver
+		// that owns the vocabulary, not re-checked here.
+		args["project"], args["prefix"] = options["project"], options["prefix"]
 		switch strings.ToLower(positional[0]) {
 		case "capture":
 			if len(positional) != 2 {

@@ -32,3 +32,36 @@ outcome such as `wont-fix`. Link implemented follow-up with `--resolved-by` so a
 later review can answer whether captured friction changed anything. If a body
 contains a secret, run `aira rant redact RANT-n`; the tombstone keeps identity,
 provenance, Git context, and event history.
+
+## Ranting about a shared tool from another project
+
+A rant is filed against exactly one project. Friction about a shared tool hit
+from a downstream project belongs in that tool's own project, not in whichever
+repository the session happened to be standing in, so every rant sub-verb takes
+an explicit target selector:
+
+```sh
+aira rant --prefix AIRA "confine's admission wait says nothing while it waits"
+aira rant ls --prefix AIRA --unreviewed
+aira rant get --prefix AIRA RANT-7
+aira rant review --prefix AIRA RANT-7 --outcome planned
+```
+
+`--prefix P` names the project that owns ID prefix `P`; `--project ID` names it
+by project ID (exact, or an unambiguous leading portion). Give exactly one. The
+target only has to be adopted on this machine — the calling project registers
+nothing — and an unresolvable one refuses by name (`E_NOT_ADOPTED`,
+`E_SELECTOR_AMBIGUOUS`) rather than filing anywhere. Naming your own project is
+an ordinary local rant.
+
+A redirected rant is a first-class rant of the target project: its numbering,
+its listing, its review thread. Two things follow. Typed `--ref` arguments
+resolve against the **target**, so it can cite the target's own tickets and not
+the caller's. And the rant records the project it was filed from, so a foreign
+rant is never indistinguishable from a local one; its Git provenance is the
+originating worktree's, recorded as observed rather than flagged as a mismatch.
+
+Any adopted project can file, review or redact in any other. That is deliberate
+and is not new exposure — one machine-wide state database, and `aira eject
+--prefix X` already reaches another project destructively. The mitigation is
+attribution, not authorisation.
