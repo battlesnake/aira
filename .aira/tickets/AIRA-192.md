@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-192","project":"aira","title":"aira top's RAM bar sums scope CAP, not granted reserve -- a delegate-ram scope's ceiling inflates the displayed claim far past what is actually reserved","status":"in-progress","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","delegate-ram","observability","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-192","project":"aira","title":"aira top's RAM bar sums scope CAP, not granted reserve -- a delegate-ram scope's ceiling inflates the displayed claim far past what is actually reserved","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","delegate-ram","observability","tui"],"hold":false,"relations":[]}
 ---
 
 Owner observation (2026-09-09, live): "aira top currently shows 90GB of
@@ -157,3 +157,10 @@ already carries. And a `--delegate-ram` suite holding per-test
 parent's small pinned reserve plus the workers in the scope-less region
 -- so its region is narrower than its RAM column; drawing the parent at
 its own `memory.current` would count its children twice.
+
+
+## Review record (2026-09-09)
+
+PR #119 merged (`dd86e94`), all CI checks green (build+vet+gofmt, test,
+race). Verified independently against GitHub (merge SHA, check results)
+and closed out here.

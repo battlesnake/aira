@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-187","project":"aira","title":"aira confine gives no warning when nested inside another confine scope, competing with its own already-covering parent reservation","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-187","to":"AIRA-191"},{"kind":"relates","from":"AIRA-187","to":"AIRA-194"},{"kind":"relates","from":"AIRA-187","to":"AIRA-195"}]}
+{"schema":1,"id":"AIRA-187","project":"aira","title":"aira confine gives no warning when nested inside another confine scope, competing with its own already-covering parent reservation","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-187","to":"AIRA-191"},{"kind":"relates","from":"AIRA-187","to":"AIRA-194"},{"kind":"relates","from":"AIRA-187","to":"AIRA-195"}]}
 ---
 
 Peer report (split, 2026-09-08), verified from source. split's own initial
@@ -73,3 +73,11 @@ caller's own script for this class of case; building new admission
 machinery to route around callers unnecessarily double-confining would be
 exactly the kind of complexity this project's architectural-simplicity
 preference argues against.
+
+
+## Review record (2026-09-09)
+
+PR #117 merged (`5a39425`), all CI checks green (build+vet+gofmt, test,
+race). The automated review agent hit a session-limit interruption before
+recording this on the ticket itself; verified independently against
+GitHub (merge SHA, check results) and closed out here.

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-182","project":"aira","title":"aira confine rejects an unrecognised option with no did-you-mean (--reserve -> --memory-reserve)","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["confine","ux"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-182","project":"aira","title":"aira confine rejects an unrecognised option with no did-you-mean (--reserve -\u003e --memory-reserve)","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["confine","ux"],"hold":false,"relations":[]}
 ---
 
 Peer report (split, 2026-09-08), verified from source.
@@ -29,3 +29,10 @@ a shared did-you-mean helper other verbs' option-parsers could reuse (this
 repo has several similar small fixed-vocabulary option checks, e.g. the
 `allowed[verb][name]` table at `cmd/aira/main.go:685-708`) is left for
 whoever picks this up.
+
+## Review record (2026-09-09)
+
+PR #113 merged (`df7b050`), all CI checks green (build+vet+gofmt, test,
+race). The automated review agent hit a session-limit interruption before
+recording this on the ticket itself; verified independently against
+GitHub (merge SHA, check results) and closed out here.

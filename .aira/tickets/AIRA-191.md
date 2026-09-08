@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-191","project":"aira","title":"confine --list has no per-scope reserve field -- only cap, which does not sum to the slice's own granted total and misleads under --delegate-ram","status":"in-progress","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["confine","observability"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-191","to":"AIRA-192"}]}
+{"schema":1,"id":"AIRA-191","project":"aira","title":"confine --list has no per-scope reserve field -- only cap, which does not sum to the slice's own granted total and misleads under --delegate-ram","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["confine","observability"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-191","to":"AIRA-192"}]}
 ---
 
 Peer report (ems, 2026-09-08/09), verified from source.
@@ -55,3 +55,10 @@ AdoptedBytes`, pinned by test. A scope the daemon holds no admission
 record for prints `unevaluated` and names `reserve` in
 `unevaluated_fields`; it never falls back to the cap. See [[AIRA-192]]
 for the full decision record.
+
+
+## Review record (2026-09-09)
+
+PR #119 (built together with AIRA-192) merged (`dd86e94`), all CI checks
+green (build+vet+gofmt, test, race). Verified independently against
+GitHub (merge SHA, check results) and closed out here.
