@@ -126,6 +126,14 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 // TestRunInputClientSilentServerHandshakeDeadlineFires proves the per-attempt
 // handshake deadline bounds a silent peer (accepts + reads HELLO, never replies):
 // the client returns in bounded time rather than hanging forever (Sol build confirm).
+//
+// AIRA-174 changed the code this reports, not the property it pins. A peer that
+// never answers the HELLO has taken no DATA frame, so the committed count is known
+// to be 0 and E_RUN_INPUT_OUTCOME_UNKNOWN — the delivery ambiguity of bytes that
+// may or may not have landed — was a fabricated unknown here too. It is now
+// E_RUN_INPUT_UNREACHABLE (exit 4, "dead/gone", suggest reconcile) like every other
+// HELLO-time failure that produced no frame. The deadline-fires assertions below
+// are unchanged, so this still fails if the timeout stops firing.
 func TestRunInputClientSilentServerHandshakeDeadlineFires(t *testing.T) {
 	r, _ := newMemoryRunner(t, nil)
 	r.owner = "owner"
@@ -142,8 +150,8 @@ func TestRunInputClientSilentServerHandshakeDeadlineFires(t *testing.T) {
 	start := time.Now()
 	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
 	var inputErr *RunInputError
-	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_OUTCOME_UNKNOWN" {
-		t.Fatalf("silent server err=%v (want a bounded OUTCOME_UNKNOWN timeout)", err)
+	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_UNREACHABLE" || inputErr.Committed != 0 {
+		t.Fatalf("silent server err=%v (want a bounded E_RUN_INPUT_UNREACHABLE committed=0)", err)
 	}
 	// The deadline must actually FIRE: elapsed is at least the handshake timeout
 	// (an immediate unrelated error would fail this lower bound) and bounded above.

@@ -5,6 +5,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -205,6 +206,121 @@ func TestRunInputServerBusyRefusalOutlivesTheCloseThatRacesTheHelloWrite(t *test
 	var inputErr *RunInputError
 	if !errors.As(refusal, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" || inputErr.Committed != 0 {
 		t.Fatalf("refusal=%v (want a zero-committed E_RUN_INPUT_BUSY recovered after the close)", refusal)
+	}
+}
+
+// AIRA-174 — the READ side of the same handshake. A HELLO write that SUCCEEDS is
+// followed by readRunInputResponse; the server can still close that connection
+// without ever writing a frame (acceptLoop's post-CAS recheck closes bare when the
+// plane went terminal under the accept, run_input_server_linux.go:148-151, as does
+// a reject with no slot left, :168-170; closeTerminal can also close the claimed
+// conn mid-handshake). At that point NO DATA frame has been sent, so committed is
+// known to be 0 and there is no delivery ambiguity for OUTCOME_UNKNOWN to describe
+// — the code for a dead/gone socket is E_RUN_INPUT_UNREACHABLE, exactly as on the
+// write side.
+//
+// The decoded-refusal read path is deliberately untouched and stays pinned by
+// TestRunInputClientRetriesTransientBusyOnceWithoutResending (a BUSY frame on the
+// read is still retried) and TestRunInputClientNonBusyHelloErrorNotRetried (a
+// FOREIGN_OWNER frame is still terminal). The mid-stream ambiguity is real and
+// stays pinned by TestRunInputClientDroppedBeforeFinalACKIsOutcomeUnknownWithoutRetry.
+
+// helloReadRunInputConn returns one end of a real Unix stream socket whose peer
+// READS the HELLO frame, then calls answer (nil = writes nothing), then CLOSES.
+// Because the peer's read completes before the close, the client's HELLO write
+// always succeeds and the failure lands deterministically on the READ — which is
+// the AIRA-174 case, and what separates it from refusedRunInputConn above.
+func helloReadRunInputConn(t *testing.T, answer func(io.Writer)) net.Conn {
+	t.Helper()
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := os.NewFile(uintptr(pair[0]), "run-input-local")
+	peer := os.NewFile(uintptr(pair[1]), "run-input-peer")
+	conn, err := net.FileConn(local)
+	_ = local.Close()
+	if err != nil {
+		_ = peer.Close()
+		t.Fatal(err)
+	}
+	go func() {
+		defer peer.Close()
+		if op, _, readErr := readRunInputFrame(peer); readErr != nil || op != runInputOpHello {
+			return
+		}
+		if answer != nil {
+			answer(peer)
+		}
+	}()
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// TestRunInputClientReportsUnreachableWhenHelloReadFindsNoFrame is the AIRA-174
+// regression and the mirror of
+// TestRunInputClientReportsUnreachableWhenHelloWriteFindsNoRefusal: the peer takes
+// the HELLO and vanishes without answering. Nothing has been streamed, so
+// E_RUN_INPUT_OUTCOME_UNKNOWN would fabricate an unknown out of a known-empty
+// outcome.
+func TestRunInputClientReportsUnreachableWhenHelloReadFindsNoFrame(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.owner = "owner"
+	runInputConnectRecord(t, r)
+	var dials atomic.Int32
+	var helloRead atomic.Bool
+	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
+		dials.Add(1)
+		return helloReadRunInputConn(t, func(io.Writer) { helloRead.Store(true) }), nil
+	}
+	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
+	// The discriminator against silently re-testing the WRITE side: the peer must
+	// have consumed the HELLO, so the write succeeded and the read is what failed.
+	if !helloRead.Load() {
+		t.Fatal("the peer never read the HELLO: this exercised the write side, not the read side")
+	}
+	var inputErr *RunInputError
+	if !errors.As(err, &inputErr) {
+		t.Fatalf("err=%v (want a RunInputError)", err)
+	}
+	if inputErr.Code == "E_RUN_INPUT_OUTCOME_UNKNOWN" {
+		t.Fatalf("a frame-less close on the HELLO read reported %s: no DATA was sent, so the outcome is known-empty", inputErr.Code)
+	}
+	if inputErr.Code != "E_RUN_INPUT_UNREACHABLE" || inputErr.Committed != 0 {
+		t.Fatalf("code=%s committed=%d (want E_RUN_INPUT_UNREACHABLE committed=0)", inputErr.Code, inputErr.Committed)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials=%d (an unexplained close is not retryable)", dials.Load())
+	}
+}
+
+// TestRunInputClientKeepsTheProtocolVerdictOnAMalformedHelloAnswer keeps the
+// AIRA-174 fix from over-reaching: UNREACHABLE is for a transport that gave the
+// client nothing, not for a frame reader that reached its OWN determinate verdict.
+// A peer that answers the HELLO with an oversized frame header is a protocol
+// violation and must keep E_RUN_INPUT_PROTOCOL (before the fix it too was reported
+// as E_RUN_INPUT_OUTCOME_UNKNOWN).
+func TestRunInputClientKeepsTheProtocolVerdictOnAMalformedHelloAnswer(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.owner = "owner"
+	runInputConnectRecord(t, r)
+	var dials atomic.Int32
+	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
+		dials.Add(1)
+		return helloReadRunInputConn(t, func(w io.Writer) {
+			var header [5]byte
+			header[0] = runInputOpAck
+			binary.BigEndian.PutUint32(header[1:], uint32(MaxRunInputFrameBytes+1))
+			_, _ = w.Write(header[:])
+		}), nil
+	}
+	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
+	var inputErr *RunInputError
+	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_PROTOCOL" {
+		t.Fatalf("err=%v (want the frame reader's own E_RUN_INPUT_PROTOCOL verdict)", err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials=%d (a protocol violation is not retryable)", dials.Load())
 	}
 }
 
