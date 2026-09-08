@@ -47,19 +47,58 @@ rendering the wrong number outright, including feeding
 falsely-inflated `Claimed`, which can fire the `OVER-SUBSCRIBED` banner
 on a healthy slice.
 
+## Owner's explicit correction (2026-09-09): the fix is the real one, not an interim workaround
+
+"The bar should show the reservation-size for each job, with the used
+portion brighter." This is the bar's own existing structural intent
+(`topUsedWithin` already computes a used sub-span within each region's
+`Size`, shaded via `ShadeColour`) -- the only defect is that `Size` is
+sourced from `cap` instead of the real per-scope granted reserve.
+Excluding delegate-ram scopes from the bar (the interim option originally
+sketched above) is explicitly NOT what is wanted; it must show the real
+number.
+
+**Investigated further: this needs a genuine new per-scope data source,
+not just a rendering change.** `ListConfines`/`listConfinesWithDeps`
+(`internal/runner/confine_manage_linux.go:140-144`) is a PURE cgroupfs
+scan -- zero daemon round-trip, reads `cap`/`rss`/`command` live from
+`/sys/fs/cgroup/.../aira.slice/.aira-CONFINE-*` and `/proc/<pid>/cmdline`.
+The real per-job charged reserve (`admitWaiter.reserve`,
+`internal/daemon/admit.go:410,1175` etc.) lives only in the daemon's
+in-memory admission-evaluator state, keyed by scope-id, and is currently
+handed to the CLIENT ONLY at the moment of admission
+(`AdmitResponse{Reserve: waiter.reserve, ScopeCeiling: waiter.scopeCeiling}`,
+`admit.go:2164`) -- never persisted or exposed anywhere a LATER listing
+(from a different process, like `aira top`) can read it back.
+
+**However, `confine --list`'s response ALREADY does a daemon round-trip**
+for the slice-wide aggregate (`internal/daemon/confine_manage.go:140-230`,
+`s.admitSliceSnapshotFor`) -- this is not a new RPC to invent, it is an
+existing one to extend. The daemon already tracks per-scope-id reserve
+for every outstanding admitted job (needed for the very
+`GrantedBytes`/`outstanding` aggregate this same response already
+carries) -- the fix is to also return a `map[scope_id]reserve_bytes` (or
+equivalent per-row list, matching the existing `ConfineReservationHold`
+row shape at `internal/runner/confine_manage.go:453-467`, which is the
+closest existing precedent but currently scoped to "scope-less"
+reservations only, e.g. `confine-reserve --pinned` -- this ticket needs
+the same treatment for ordinary CGROUP-SCOPED jobs, a different
+population) on the wire, merged client-side by scope-id into each
+`ConfineRecord` at listing time. `aira top`'s `topReserveFor` then reads
+this real reserve when present, falling back to `unevaluated` (never
+cap, never a fabricated number) when the daemon does not know it (daemon
+down, or a job the daemon lost track of across a restart) -- matching
+this project's honesty convention throughout.
+
 ## Not designed here
 
-Whether the fix reads each delegate-ram scope's actual pinned/charged
-reserve from a source `aira top` doesn't currently have access to (the
-admission ledger's `scopeCeiling`-vs-pinned-reserve distinction lives
-server-side in `internal/daemon/admit.go`, not in anything `confine
---list --json` exposes per-scope today -- this is exactly what
-[[AIRA-191]]'s proposed per-scope `reserve_bytes` field would supply),
-versus excluding delegate-ram scopes from the summed bar width entirely
-with a note ("N delegate-ram scopes not drawn, ceiling not their reserve"
--- matching the existing `uncapped`/`unevaluated` note pattern already in
-`tui_top.go:596-603`) as a cheaper interim fix that doesn't require a new
-wire field, is left for whoever builds this. Given the severity (an
-actively misleading flagship display, not a cosmetic gap), recommend NOT
-waiting on AIRA-191's wire-field work if the interim exclusion is
-buildable now.
+Exact wire shape for the new per-scope reserve data (a map vs. a list of
+rows matching `ConfineReservationHold`'s pattern), and whether
+non-delegate-ram scopes should also switch to reading this real field
+(they should be numerically identical to `cap` today, per the
+`topReserveFor` comment's own now-partially-false claim, but reading the
+SAME source for every scope rather than branching on scope type is
+simpler and removes the whole cap-vs-reserve distinction as a rendering
+concern going forward) -- left for whoever builds this. [[AIRA-191]]
+(the per-scope `reserve_bytes` field for `--json` output generally) and
+this ticket are now the same underlying fix; build together.
