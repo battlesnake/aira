@@ -63,3 +63,35 @@ ahead` against 34G MemAvailable and a 44G request, mid-wait, deliberately
 not guessed down this time. Consistent with the fix already scoped above
 (the `SliceReserve` fields are already in hand at the call site) — this
 just sharpens the wording target for whoever implements it.
+
+## Follow-up reproduction (split, 2026-09-08) — the downstream consequence when it never resolves
+
+A merge-gate leg's 617 MiB request (≈1% of a 63232M slice) waited the full
+30 minutes and hit `E_ADMIT_SATURATED`, surfacing to the leg runner as
+`Error 4`/`exit=2` — indistinguishable, downstream, from a genuinely
+failing `go test`. Only the `E_ADMIT_SATURATED` line one screen up (not
+repeated in any summary) tells the two apart; a caller grepping leg exit
+codes cannot. This is the same root cause as the rest of this ticket, seen
+from the other end: not just "the wait message doesn't say what blocks
+me", but "and if it never resolves, the outcome collapses into a generic
+non-zero exit indistinguishable from a real failure". Relevant to whoever
+implements this ticket's fix: the terminal `ran=no` trailer (AIRA-147)
+already exists precisely to make this greppable — the gap split is
+describing is a caller (their own merge-gate leg runner) not consuming
+that signal into its own leg summary, which is downstream-project scope,
+not an AIRA fix. Noted here only because it's useful corroborating
+context for why the wait-line clarity in this ticket matters (catching the
+starvation *before* it resolves into a saturated timeout is strictly
+better than any downstream attribution fix).
+
+Split also raised, then explicitly declined to request a ticket for: a
+617 MiB request starving 30 minutes while ~75G was already granted against
+a 63232M ceiling reads, on the surface, like "small requests aren't
+prioritised" — but the slice was already over its ceiling by the full
+grant total (three running jobs holding ~75G against 63232M), so there was
+zero headroom for a request of *any* size, not evidence of an
+admission-ordering/fairness defect. This is the same already-tracked gap
+as [[AIRA-178]] (no live actuator reclaims capacity from already-admitted,
+still-growing jobs) and [[AIRA-177]] (narrows how far over-ceiling the
+slice can drift at admission time, doesn't close it). No new ticket
+filed for this.
