@@ -142,3 +142,18 @@ are fabricated zeros and MUST be read as `unevaluated`, never as an empty slice 
 prints `slice reserve: unevaluated (no admission ledger)`. `ceiling_bytes` is an independent
 memory read and stays valid. An agent following this ticket's "trust the slice-reserve line over
 free/MemAvailable" guidance MUST check `granted_established` first.
+
+## Amendment — owner-elevated (2026-09-09, via speed session; origin RANT-39)
+
+**Elevated to immediate priority.** Mark has directed removing fastest-ee's `FASTEST_NO_AITEST=1`
+pins on hosted/services/pipeline and retiring xdist NOW, accepting a temporary spurious-red window.
+That makes this ticket's gap — no live actuator between "admit" and "an external oomd/OOM kills a
+worker" — a LIVE gate-safety exposure across everyone's merge-gate, not a latent one: the box is
+under real memory pressure (it oomd-killed a gate-poll watcher on 2026-09-09).
+
+**Sequencing (honest).** This is the airtight fix ("prevent the kill") and remains architecturally
+substantial — its own plan and its own two-loop, per the body above. It will NOT be rushed into the
+same change as the window-closer. The IMMEDIATE relief is [[AIRA-206]] (classify the oomd-137 kill
+cleanly so it requeues instead of reading as a spurious RED), which is being built first; AIRA-178
+is the follow-on milestone that stops the kill happening at all. The `--delegate-ram` fail-open
+(AIRA-27) is the interim bandaid the owner wants replaced by this actuator, not a per-project pin.

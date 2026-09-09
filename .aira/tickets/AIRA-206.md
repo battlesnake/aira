@@ -19,3 +19,14 @@ confine's status trailer has no line-break guard, so on an OOM kill it glues ont
 **Severity note.** P2, not blocker: nothing malfunctions, the content is correct, exit 137 still reaches the caller, and `confine.go:911` documents the line as "the single operator-facing honesty projection" with `--json` deliberately refused. If the owner rules the foreground trailer **is** a supported scrape surface, this becomes P1 and should also settle whether a foreground `record.json`/`--json` is owed.
 
 ---
+
+## Amendment — owner-elevated (2026-09-09, via speed session; origin RANT-39)
+
+**Elevated to immediate priority as the window-closer for the aitest spurious-red exposure.** Mark
+has directed removing fastest-ee's `FASTEST_NO_AITEST=1` pins on hosted/services/pipeline (and
+retiring xdist entirely) NOW, accepting a temporary spurious-red window. With the pins off, an
+aitest worker systemd-oomd-killed (137) under sustained PSI is exactly the shape this bug
+misclassifies: the glued trailer makes an anchored `^confine:` parse miss `terminated-by=`, so a
+clean KILL reads as an ordinary gate FAIL (a spurious RED) instead of a clean KILLED/unevaluated
+that requeues. Closing this makes the residual exposure HONEST while the deeper fix (AIRA-178
+live actuator) is planned. Building this next.
