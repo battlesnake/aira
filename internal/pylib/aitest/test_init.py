@@ -90,6 +90,48 @@ def test_resolve_estimated_bytes_clamps_an_above_ceiling_value_down_with_a_warni
     assert str(_ESTIMATED_BYTES_MAX + 1) in stderr and str(_ESTIMATED_BYTES_MAX) in stderr
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("4G", 4 << 30),
+        ("512M", 512 << 20),
+        ("1GiB", 1 << 30),
+        ("2gb", 2 << 30),  # case-insensitive, matching Go runner.parseMemorySize
+        ("1048576", 1 << 20),  # a bare integer is still bytes (unchanged contract)
+        ("1536M", 1536 << 20),  # 1.5 GiB expressed in MiB
+        ("1.5G", (3 << 30) // 2),  # decimal mantissa floored to whole bytes
+    ],
+)
+def test_resolve_estimated_bytes_accepts_a_1024_based_size_suffix(monkeypatch, raw, expected):
+    """AIRA-223: every other aira size surface (--memory-reserve, --memory-max)
+    accepts a K/M/G/T suffix, so a user who has typed 8G at aira all day should
+    not get the 512 MiB default here. Suffixes match Go runner.parseMemorySize:
+    1024-based, case-insensitive, a decimal mantissa floored to whole bytes."""
+    monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", raw)
+    assert _resolve_estimated_bytes() == expected
+
+
+@pytest.mark.parametrize("raw", ["4X", "4 G", "1.2.3", "banana", "G", "0x10"])
+def test_resolve_estimated_bytes_warns_loudly_on_a_malformed_value(monkeypatch, capsys, raw):
+    """AIRA-223: the footgun this ticket removes -- an out-of-range INTEGER
+    warned, but a well-formed-LOOKING but unparseable value silently returned
+    the 512 MiB default, sending a suite into per-worker OOM churn over a typo
+    with no signal. A malformed value must now NAME itself on stderr, exactly
+    as the out-of-range cases already do."""
+    monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", raw)
+    assert _resolve_estimated_bytes() == 512 << 20
+    err = capsys.readouterr().err
+    assert raw in err, "a malformed AIRA_AITEST_ESTIMATED_BYTES must not default silently"
+
+
+def test_resolve_estimated_bytes_unset_defaults_silently(monkeypatch, capsys):
+    """Unset is NOT a mistake: no warning, unlike a malformed value. This is the
+    asymmetry that keeps the AIRA-223 warning from firing on every ordinary run."""
+    monkeypatch.delenv("AIRA_AITEST_ESTIMATED_BYTES", raising=False)
+    assert _resolve_estimated_bytes() == 512 << 20
+    assert capsys.readouterr().err == ""
+
+
 def test_unevaluated_outcome_produces_a_nonzero_pytest_exit_code(pytester, monkeypatch):
     """Regression test for a real coverage gap (Fable build-review, final
     gate): pytest_runtestloop's `session.testsfailed = failed + error +
