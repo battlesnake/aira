@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-205","project":"aira","title":"make fmt-check gofmts 8,681 .go files belonging to 24 other agents' worktrees, so any concurrent session's mid-edit file can fail the owner's commit","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-205","project":"aira","title":"make fmt-check gofmts 8,681 .go files belonging to 24 other agents' worktrees, so any concurrent session's mid-edit file can fail the owner's commit","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
