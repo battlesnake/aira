@@ -98,7 +98,7 @@ func TestTopFooterCarriesTheExclusiveHoldReason(t *testing.T) {
 	result := runner.ConfineListResult{
 		Verdict: "pass",
 		SliceReserve: &runner.ConfineSliceReserve{
-			GrantedBytes: 1 << 30, CeilingBytes: 61 << 30, Jobs: 1,
+			GrantedBytes: 1 << 30, CeilingBytes: 61 << 30, Jobs: 1, GrantedEstablished: true,
 			Exclusive: &runner.ConfineExclusiveState{State: "held", Name: "drain", Reason: "deploy"},
 		},
 	}
@@ -119,4 +119,34 @@ func TestTopFooterCarriesTheExclusiveHoldReason(t *testing.T) {
 	if footer = topFooter(result); strings.Contains(footer, "\x1b") {
 		t.Fatalf("an escape sequence reached the footer: %q", footer)
 	}
+}
+
+// verifies: AIRA-220
+// TestTopFooterHonoursGrantedEstablished pins that `aira top`'s footer reports the
+// granted total AND the population split as unevaluated when the daemon holds no
+// admission ledger, and as facts when it does — so an inverted establishment gate
+// (or a build that forgot to gate the footer's population clause) is caught.
+func TestTopFooterHonoursGrantedEstablished(t *testing.T) {
+	t.Run("established", func(t *testing.T) {
+		footer := topFooter(runner.ConfineListResult{Verdict: "pass", SliceReserve: &runner.ConfineSliceReserve{
+			GrantedEstablished: true, GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 2, ScopeJobs: 2, ScopeBytes: 3 << 30,
+		}})
+		if strings.Contains(footer, "unevaluated") {
+			t.Fatalf("established footer wrongly read unevaluated: %q", footer)
+		}
+		if !strings.Contains(footer, "granted") || !strings.Contains(footer, "2 scopes") {
+			t.Fatalf("established footer missing granted or population clause: %q", footer)
+		}
+	})
+	t.Run("absent-ledger", func(t *testing.T) {
+		footer := topFooter(runner.ConfineListResult{Verdict: "pass", SliceReserve: &runner.ConfineSliceReserve{
+			GrantedEstablished: false, CeilingBytes: 12 << 30,
+		}})
+		if !strings.Contains(footer, "granted unevaluated") {
+			t.Fatalf("absent-ledger footer must read granted unevaluated: %q", footer)
+		}
+		if !strings.Contains(footer, "populations unevaluated") {
+			t.Fatalf("absent-ledger footer must read populations unevaluated, not fabricated zeros: %q", footer)
+		}
+	})
 }

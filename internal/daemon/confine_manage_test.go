@@ -184,6 +184,10 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		want.SystemCPUUsageUsec, want.SystemCPUKnown = systemCPUUsec, true
 		want.SliceCPUUsageUsec, want.SliceCPUKnown = sliceCPUUsec, true
 		want.CPUSampleUnixNano, want.CPUCores = cpuSampleNano, cpuCores
+		// AIRA-220. Every arm here registers a queue (an established ledger,
+		// including the established-EMPTY arm), so the granted pair is established
+		// in all of them. The absent-ledger case is TestConfineListReserveUnevaluatedWhenLedgerAbsent.
+		want.GrantedEstablished = true
 		return want
 	}
 	setup := func(t *testing.T) (*Server, string) {
@@ -381,6 +385,10 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			SliceCPUUsageUsec: sliceCPUUsec, SliceCPUKnown: true,
 			CPUSampleUnixNano: cpuSampleNano, CPUCores: cpuCores,
 			CeilingBytes: maximum - base - supervisor, Queued: 0, FreezePhase: "idle",
+			// AIRA-220. This arm registers a queue and runs evaluateAdmitQueue, so
+			// the ledger is established (present:true) even though its granted
+			// total is an established zero.
+			GrantedEstablished: true,
 			// The value AND the bit. Asserting only the bit would survive a build
 			// that reported a fabricated total beside a true bit.
 			CapAggregateBytes: suiteCap,
@@ -445,3 +453,43 @@ func TestReadSliceMemoryHigh(t *testing.T) {
 }
 
 func strPtr(value string) *string { return &value }
+
+// TestConfineListReserveUnevaluatedWhenLedgerAbsent is AIRA-220's regression: a
+// daemon that holds NO queue object for the slice (a fresh or restarted daemon
+// before its first admission, or a long-idle slice) has read no admission ledger
+// at all, yet `confine --list` used to render the resulting fabricated zeros as a
+// confident "0B granted / 0 admitted jobs" — on the very surface AIRA-178 tells
+// operators and agents to trust over free/MemAvailable. The ceiling is an
+// independent memory read and MUST still be reported; only the granted pair is
+// unestablished.
+//
+// Pre-fix this failed: confineManagement built the summary from the snapshot
+// without consulting snapshot.present, so GrantedEstablished did not exist and the
+// pair read as an established zero.
+func TestConfineListReserveUnevaluatedWhenLedgerAbsent(t *testing.T) {
+	const maximum = int64(16 << 30)
+	path := t.TempDir()
+	server := NewServer(Paths{})
+	server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
+	server.shimReadMemTotal = func() (int64, bool) { return 48 << 30, true }
+	server.shimReadMemAvailable = func() (int64, bool, string) { return 20 << 30, true, "" }
+	// A readable ceiling — the memory read succeeds — while NO queue is registered:
+	// server.admitQueues stays empty, exactly the post-restart / idle state.
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 5 << 30, maximum, 1 << 30, true, ""
+	}
+	request := core.Request{Verb: "confine-list", Args: map[string]any{"slice": "test.slice", "owner": "session-a"}}
+	response := server.confineManagement(context.Background(), request)
+	result, ok := response.Data.(runner.ConfineListResult)
+	if !response.OK || !ok || result.SliceReserve == nil {
+		t.Fatalf("response=%+v result=%+v (a readable ceiling must still yield a summary carrying it)", response, result)
+	}
+	if result.SliceReserve.GrantedEstablished {
+		t.Fatalf("GrantedEstablished=true with no admission ledger present: the granted pair is a fabricated zero and must read unevaluated (reserve=%+v)", *result.SliceReserve)
+	}
+	if result.SliceReserve.CeilingBytes <= 0 {
+		t.Fatalf("CeilingBytes=%d: the ceiling is an independent read and must survive an absent ledger", result.SliceReserve.CeilingBytes)
+	}
+}

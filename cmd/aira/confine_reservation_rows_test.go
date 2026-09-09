@@ -33,7 +33,7 @@ func TestRenderConfineListNamesScopelessReservations(t *testing.T) {
 	render := func(t *testing.T, holds []runner.ConfineReservationHold, jobs int) string {
 		t.Helper()
 		reserve := runner.ConfineSliceReserve{
-			GrantedBytes: 8 << 30, CeilingBytes: 61 << 30, Jobs: jobs,
+			GrantedBytes: 8 << 30, CeilingBytes: 61 << 30, Jobs: jobs, GrantedEstablished: true,
 			ReservationJobs: jobs, ReservationBytes: 8 << 30, Reservations: holds,
 		}
 		result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{}, SliceReserve: &reserve}
@@ -178,7 +178,7 @@ func TestRenderConfineListNamesScopelessReservations(t *testing.T) {
 	// An empty population prints its stated zero and NOTHING else — no heading
 	// for rows that do not exist.
 	t.Run("an-empty-population-prints-no-rows-at-all", func(t *testing.T) {
-		reserve := runner.ConfineSliceReserve{GrantedBytes: 0, CeilingBytes: 61 << 30}
+		reserve := runner.ConfineSliceReserve{GrantedBytes: 0, CeilingBytes: 61 << 30, GrantedEstablished: true}
 		result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{}, SliceReserve: &reserve}
 		var stdout, stderr bytes.Buffer
 		if exit := renderConfineListResponse(core.Response{OK: true, Code: "OK", Data: result}, &stdout, &stderr); exit != 0 {

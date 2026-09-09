@@ -284,14 +284,14 @@ func TestRenderConfineListReserveSummary(t *testing.T) {
 	}{
 		{
 			name:    "present",
-			reserve: &runner.ConfineSliceReserve{GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 1},
+			reserve: &runner.ConfineSliceReserve{GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 1, GrantedEstablished: true},
 			want:    "slice reserve: 3G granted / 12G ceiling across 1 admitted job\n",
 		},
 		{
 			// An idle slice (0 granted) renders a genuine zero as "0B", never
 			// "unknown" — reserve/ceiling here are always established values.
 			name:    "idle-zero",
-			reserve: &runner.ConfineSliceReserve{GrantedBytes: 0, CeilingBytes: 12 << 30, Jobs: 0},
+			reserve: &runner.ConfineSliceReserve{GrantedBytes: 0, CeilingBytes: 12 << 30, Jobs: 0, GrantedEstablished: true},
 			want:    "slice reserve: 0B granted / 12G ceiling across 0 admitted jobs\n",
 		},
 		{name: "unavailable"},

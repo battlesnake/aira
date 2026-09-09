@@ -130,3 +130,15 @@ Three additions:
 
 RANT-15 was closed `wont-fix`, but note its original stated reason ("the replacement has no analogue
 to fix") was FALSE and must not be reused; the correct reason is that AIRA-33 deleted the governor.
+
+## Amendment (AIRA-220, 2026-09-09)
+
+`confine --list`'s `slice reserve:` line and its `--json`/MCP `slice_reserve` object now carry
+`granted_established` (bool). It is FALSE when the daemon holds no admission ledger for the slice
+(no queue object: a fresh/restarted daemon before its first admission, or any slice with nothing
+connection-held right now — `pruneAdmitQueue` drops the queue on the last release). When false,
+`granted_bytes`, `jobs`, and the population-split fields (`scope_*`, `reservation_*`, `adopted_*`)
+are fabricated zeros and MUST be read as `unevaluated`, never as an empty slice — the text face
+prints `slice reserve: unevaluated (no admission ledger)`. `ceiling_bytes` is an independent
+memory read and stays valid. An agent following this ticket's "trust the slice-reserve line over
+free/MemAvailable" guidance MUST check `granted_established` first.

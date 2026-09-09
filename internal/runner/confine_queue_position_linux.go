@@ -461,7 +461,13 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	// are refused as a PAIR when either is negative: a negative granted total or
 	// job count is a ledger defect, and half of a self-contradictory pair on an
 	// operator-facing line is worse than no clause at all.
-	if reserve.GrantedBytes >= 0 && reserve.Jobs >= 0 {
+	// AIRA-220. Establishment is the daemon's own GrantedEstablished bit, not
+	// merely non-negative numbers: an absent ledger publishes a fabricated 0/0
+	// that passes a `>= 0` gate, which is exactly how this note came to print
+	// "0B already granted across 0 admitted jobs" on a slice with live jobs. The
+	// `>= 0` sanity is kept as a defensive conjunct against a negative ledger
+	// defect.
+	if reserve.GrantedEstablished && reserve.GrantedBytes >= 0 && reserve.Jobs >= 0 {
 		exclusive.heldBytes, exclusive.heldJobs, exclusive.heldEstablished = reserve.GrantedBytes, reserve.Jobs, true
 	}
 	// The ceiling is carried independently of that pair: it is a separate reading

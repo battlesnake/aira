@@ -17,7 +17,7 @@ import (
 // scope-less population is named explicitly whenever it is non-empty.
 func TestRenderConfineListReserveBreakdown(t *testing.T) {
 	base := runner.ConfineSliceReserve{
-		GrantedBytes: 48 << 30, CeilingBytes: 61 << 30, Jobs: 23,
+		GrantedBytes: 48 << 30, CeilingBytes: 61 << 30, Jobs: 23, GrantedEstablished: true,
 		ScopeJobs: 3, ScopeBytes: 24 << 30,
 		ReservationJobs: 20, ReservationBytes: 14 << 30,
 		AdoptedJobs: 0, AdoptedBytes: 0,

@@ -84,3 +84,43 @@ accepted, not a regression.
 Plan reviewed (advisor / Fable). TDD build (Opus). Independent adversarial build-review of
 the diff (fresh subagent: false-pass/false-fail + porous-test hunt). Confined `make ci`
 green, exit code recorded. PR → merge. Then v0.4 tag on merged master.
+
+## Build-review folded (independent adversarial review, 2026-09-09)
+
+Verdict SOUND_WITH_FIXES. All findings folded:
+
+- **P1 — missed render surface (fixed).** The population-split line
+  (`  of which: N confine scopes …, N adopted scopes …`, cmd/aira/main.go) and the
+  `aira top` footer's population clause (cmd/aira/tui_top.go) are derived from the SAME absent
+  snapshot and were still printing fabricated zeros directly under the fixed headline — and the
+  `0 adopted scopes` there is the exact AIRA-105 misreading the ticket names in its symptom. Both
+  are now gated on `GrantedEstablished` and read `unevaluated` in lockstep. Render/footer tests
+  extended to assert the split does NOT appear when the ledger is absent.
+- **False comment corrected (ticket-required).** `internal/daemon/admit.go`'s absent-queue comment
+  claimed absence "positively establishes that nothing is waiting … must not render as unknown";
+  corrected to say absence establishes nothing-waiting/no-holder (true) but says nothing about the
+  granted/adopted ledger (the AIRA-220 point).
+- **Accepted-consequence wording corrected.** The ledger is absent whenever nothing is
+  connection-held right now — `pruneAdmitQueue` deletes the queue (adopted ledger included) on the
+  last release — not only on a fresh/restart or long-idle slice. So a slice with live adopted jobs
+  reads `unevaluated` between connections. The rendered line now carries a reason
+  (`unevaluated (no admission ledger)`). Struct + daemon comments corrected to match.
+- **`GrantedEstablished` meaning documented (not tightened).** It means "a queue/ledger object
+  exists; its adopted half is as fresh as the last successful scan." Two accepted gaps a true bit
+  does not rule out — a failed adopted scan (stale/zero adopted with the `slice scope caps:
+  unevaluated` line beside it signalling the failure) and a sub-ms first-scan window — are
+  documented rather than machined away, per the simplicity HARD rule.
+- **JSON/MCP wire contract.** The bit rides the wire as `granted_established`, matching the
+  struct's existing `*Known`-companion idiom (CapAggregateKnown, SystemCPUKnown). AIRA-178's
+  operating note is amended so machine readers check it before trusting `granted_bytes`/`jobs`.
+- **Correction to this plan's earlier claims:** the queue-position "already granted" note
+  (confine_queue_position_linux.go) is NOT reachable with an absent ledger from a REAL daemon (its
+  gate runs only after `QueuePosition > 0`, which requires a queue ⇒ present). The change there is
+  a harmless client-contract hardening and its new subcase is a valid contract test, but it is not
+  a "second live render site of the same bug" as first stated.
+- **Deferral recorded:** the ticket's suggested "!present with zero live scopes stays a genuine
+  zero, with a false-pass twin test" (cross-checking the cgroupfs scope scan) is deliberately NOT
+  built. Real reason: a ci-shim post-restart job has neither a scope nor a lease, and the scope
+  scan is up to ~1s stale, so cross-checking would trade one honesty edge for another while adding
+  machinery the simplicity rule discourages. `unevaluated` on an absent ledger is the honest
+  answer regardless of live-scope count.
