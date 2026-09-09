@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-206","project":"aira","title":"confine's status trailer has no line-break guard, so on an OOM kill it glues onto the job's partial last line and an anchored ^confine: parse misses it","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-206","to":"AIRA-214"}]}
+{"schema":1,"id":"AIRA-206","project":"aira","title":"confine's status trailer has no line-break guard, so on an OOM kill it glues onto the job's partial last line and an anchored ^confine: parse misses it","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-206","to":"AIRA-214"}]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
@@ -30,3 +30,24 @@ misclassifies: the glued trailer makes an anchored `^confine:` parse miss `termi
 clean KILL reads as an ordinary gate FAIL (a spurious RED) instead of a clean KILLED/unevaluated
 that requeues. Closing this makes the residual exposure HONEST while the deeper fix (AIRA-178
 live actuator) is planned. Building this next.
+
+## Build review record — DONE (2026-09-09)
+
+Implemented as the ticket's proposed fix: an unconditional leading `\n` at the trailer
+(`confine_linux.go`), the ci-shim twin (`confine_shim_linux.go`), and the mid-run diagnostics
+(late-signal, first-signal, deadline advisory) — NOT a `lastByteWasNewline` bool, because the
+child's stdout is wired raw and is never seen by the `confineLockedWriter` (the discriminating
+shared-`*os.File` test proves this).
+
+TDD: two anchored `(?m)^confine:` tests (partial stderr; the discriminating shared-`*os.File`
+stdout case), both RED before the fix, GREEN after; full `internal/runner` suite green.
+
+Adversarial build-review (Fable): SHIP, no P0-P2. Three P3 fold-ins ALL taken — the ci-shim
+signal lines `:373/:379` (Fable showed the ci-shim is the owner-elevated Batch path and is *more*
+exposed there, so the earlier "advisory-only, lower value" scope call was corrected), the
+exclusivity-lost mid-run warning, a single-`Write` atomicity comment, and a new shim-twin test.
+Verified no false-fail: every diagnostics consumer uses `strings.Contains`; the post-trailer
+advisories still render on their own lines; `confine_never_ran`'s HasPrefix is a different emit
+site. Accepted coverage gap: the mid-run/shim signal lines are fixed but tested by inspection
+(they need mid-run signal injection); the parsed load-bearing surface — the trailer, real and
+shim — is tested both ways.

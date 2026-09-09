@@ -370,13 +370,13 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		}
 		supervisorSignalMu.Unlock()
 		if late {
-			_, _ = fmt.Fprintf(diagnostics, "confine: received %s after the job had already ended (ci-shim: no scope to tear down)\n",
+			_, _ = fmt.Fprintf(diagnostics, "\nconfine: received %s after the job had already ended (ci-shim: no scope to tear down)\n",
 				confineSignalName(received))
 			return
 		}
 		interrupted.Store(true)
 		if first {
-			_, _ = fmt.Fprintf(diagnostics, "confine: received %s; forwarding to the job's process group (ci-shim: advisory containment, no cgroup.kill backstop; a setsid'd descendant is out of reach)\n",
+			_, _ = fmt.Fprintf(diagnostics, "\nconfine: received %s; forwarding to the job's process group (ci-shim: advisory containment, no cgroup.kill backstop; a setsid'd descendant is out of reach)\n",
 				confineSignalName(received))
 		}
 		// AIRA-121 gate condition C9. The ORDER here is the whole correctness of
@@ -485,7 +485,9 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// have learned anything usable within one container's life either way. Recorded
 	// as an accepted residual; peak-rss reads `unevaluated` on the trailer.
 	result.Status.TerminatedBy = classifyConfineTermination(termination, cgroupUsage{}, terminatedBySignal, deadlineKindUnset)
-	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
+	// AIRA-206: see the real path -- prepend \n so the trailer begins its own line
+	// even after a partial (newline-free) last block from the job.
+	_, _ = fmt.Fprintf(diagnostics, "\n%s\n", FormatConfineStatus(result.Status))
 	return result, nil
 }
 

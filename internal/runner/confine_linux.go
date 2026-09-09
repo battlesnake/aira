@@ -787,7 +787,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 					return
 				}
 				exclusiveLost.Store(true)
-				fmt.Fprint(diagnostics, "aira: warning: exclusivity lost (admission lease closed) — this run was no longer scheduled alone; treat any measurement from it as contended\n")
+				// AIRA-206: leading \n -- this is a mid-run warning to the shared
+				// locked writer and would otherwise glue onto the child's partial line.
+				fmt.Fprint(diagnostics, "\naira: warning: exclusivity lost (admission lease closed) — this run was no longer scheduled alone; treat any measurement from it as contended\n")
 			}()
 		}
 	}
@@ -860,7 +862,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		}
 		supervisorSignalMu.Unlock()
 		if late {
-			_, _ = fmt.Fprintf(diagnostics, "confine: received %s after the job had already ended; scope %s is being torn down anyway\n",
+			_, _ = fmt.Fprintf(diagnostics, "\nconfine: received %s after the job had already ended; scope %s is being torn down anyway\n",
 				confineSignalName(received), scopeID)
 			return
 		}
@@ -879,7 +881,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			// "forwarding" is present tense because forwardConfineSignals does
 			// that after this callback returns. Neither tense is decorative --
 			// the line must not claim an action that has not happened.
-			_, _ = fmt.Fprintf(diagnostics, "confine: received %s; killed scope %s on %s, forwarding to the confined job\n",
+			_, _ = fmt.Fprintf(diagnostics, "\nconfine: received %s; killed scope %s on %s, forwarding to the confined job\n",
 				confineSignalName(received), scopeID, sliceName)
 		}
 	})
@@ -1319,7 +1321,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			// documents: `diagnostics` is the confineLockedWriter shared with the
 			// child's stderr pump and can block behind a stalled reader, so the kill
 			// above must never be gated on this write.
-			_, _ = fmt.Fprintln(diagnostics, formatConfineDeadlineAdvisory(fired, scopeID, sliceName,
+			_, _ = fmt.Fprintf(diagnostics, "\n%s\n", formatConfineDeadlineAdvisory(fired, scopeID, sliceName,
 				deadlineAttempt, deadlineKillErr, deadlineNotExecuted))
 			if deadlineNotExecuted {
 				select {
@@ -1454,7 +1456,16 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if request.Exclusive && exclusiveLost.Load() {
 		result.Status.Exclusive = ConfineExclusiveLost
 	}
-	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
+	// AIRA-206: prepend \n so the trailer ALWAYS begins its own line. The child's
+	// last output block may lack a trailing newline (the normal shape for an
+	// oom.group SIGKILL of a block-buffered child); without this, an anchored
+	// ^confine: parse glues onto that partial line and misses terminated-by=. A
+	// lastByteWasNewline bool cannot fix it: the child's stdout is wired raw and
+	// never seen by the locked writer. One possibly-blank line is the accepted cost.
+	// Keep every AIRA-206 site ONE Fprintf -> one confineLockedWriter.Write: splitting
+	// the leading \n into its own write would let a concurrent child-stderr pump
+	// interleave between them and reintroduce exactly the glue this fixes.
+	_, _ = fmt.Fprintf(diagnostics, "\n%s\n", FormatConfineStatus(result.Status))
 	// Only an OWN-limit OOM may reach the "job OOM-killed at its memory cap" line
 	// (AIRA-102). Its other branch -- peak RSS near the cap -- is unaffected.
 	// AIRA-184. CapBytes is the SLICE's own finite cap, established by deps.readCap
