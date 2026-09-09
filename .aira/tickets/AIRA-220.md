@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-220","project":"aira","title":"aira confine --list reports a fabricated 0B/0-job slice reserve after a daemon restart, on the surface AIRA-178 designates as the authoritative check","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","honesty"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-220","to":"AIRA-221"}]}
+{"schema":1,"id":"AIRA-220","project":"aira","title":"aira confine --list reports a fabricated 0B/0-job slice reserve after a daemon restart, on the surface AIRA-178 designates as the authoritative check","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","honesty"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-220","to":"AIRA-221"}]}
 ---
 > Found during the 2026-09-09 deploy of PR #125, by observing the live machine
 > after a routine daemon restart. Verified from source; every claim below was
