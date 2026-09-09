@@ -1792,7 +1792,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1809,6 +1809,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("admit_timeout", false, false, "Positive bounded daemon admission wait. This bounds the ADMISSION WAIT ONLY, before the job starts — it is not a job deadline; see --timeout and --cpu-timeout"),
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
 			boolSpec("exclusive", false, false, "Run alone in the slice for uncontended benchmarking: stop admitting new jobs, let running ones finish, then run alone. Refuses rather than running non-exclusively; check $AIRA_CONFINE_EXCLUSIVE inside the job and exclusive= on the trailer. Bound the wait with --admit-timeout. Does NOT cover processes placed in the slice by hand, or Docker containers, which run outside it entirely. The trailer's peak-rss/cpu are whole-subtree hierarchical counters (aitest worker sub-scopes and a podman --cgroups=split child included); Docker containers are structurally outside the slice and are NOT counted"),
+			boolSpec("require_admission", false, false, "Fail closed: refuse to launch (a non-zero E_CONFINE_UNAVAILABLE) when the job was NOT admitted — memory admission unevaluated (slice unreadable, or a build-time ci-shim install with no runtime slice) or timed out — instead of running it UNGOVERNED and exiting 0. For CI or any unattended launch, where the single stderr warning has no reader. Opt-in; ordinary launches (and a real-slice daemon-restart window, which flock-admits) are unaffected"),
 			boolSpec("detach", false, false, "Run session-independently; report the handle and poll it with confine --status"),
 			boolSpec("stdin_connect", false, false, "Give the DETACHED job a writable stdin (a per-job socket) so `aira confine-input <handle>` can send it bytes or close it. Requires --detach. OFF by default and deliberately so: without it a detached job's stdin is /dev/null and reads EOF immediately, whereas a connected-but-unwritten pipe blocks any job that touches stdin until someone connects"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
@@ -1825,6 +1826,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "admit_timeout")
 			_ = boolArg(args, "delegate_ram")
 			_ = boolArg(args, "exclusive")
+			_ = boolArg(args, "require_admission")
 			_ = boolArg(args, "detach")
 			_ = boolArg(args, "stdin_connect")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")

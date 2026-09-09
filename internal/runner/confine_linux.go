@@ -722,10 +722,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	default:
 		result.Status.Admission = ConfineAdmissionUnevaluated
 	}
-	// AIRA-222. Fail closed BEFORE launch if the caller required an evaluated
-	// admission and did not get one. defer releaseAdmission() (above) still runs,
-	// so the (possibly nil) lease is released.
-	if refusal := requireAdmissionRefusal(request, sliceName, result.Status.Admission, admission.reason); refusal != nil {
+	// AIRA-222. Fail closed BEFORE launch if the caller required admission and the
+	// job was not admitted (state ∉ {immediate, waited}) — including a flock
+	// timeout. defer releaseAdmission() (above) still runs, releasing the
+	// (possibly nil) lease.
+	if refusal := requireAdmissionRefusal(request, sliceName, admission.state, admission.reason); refusal != nil {
 		return result, refusal
 	}
 	// AIRA-101. Reaching here under --exclusive means a REAL grant: admit()
@@ -1995,18 +1996,28 @@ func confineUnavailable(slice string, err error) error {
 // requireAdmissionRefusal implements AIRA-222's --require-admission fail-closed
 // gate, shared by the real and ci-shim launch paths. It returns a terminal
 // E_CONFINE_UNAVAILABLE (the same "precondition not met, refuse to launch" class
-// as the uncapped-slice refusal) when the caller opted in and admission could
-// not be evaluated, so the job would run UNGOVERNED. Keyed on the resolved
-// ConfineAdmissionUnevaluated facet the trailer reports, and on `reason` for the
-// specific cause (slice-not-found, daemon-down, ...). Returns nil — launch
-// proceeds — for an admitted job, for a timeout (a distinct rejection, surfaced
-// on its own), and whenever the flag is absent, so ordinary and daemon-restart
-// launches are never touched.
-func requireAdmissionRefusal(request ConfineRequest, slice string, admission ConfineAdmission, reason string) error {
-	if !request.RequireAdmission || admission != ConfineAdmissionUnevaluated {
+// as the uncapped-slice refusal) when the caller opted in and the job was NOT
+// admitted, so it would run UNGOVERNED.
+//
+// Keyed on the raw admission STATE, refusing anything that is not "immediate" or
+// "waited" (the two admitted states). This is fail-closed by construction: it
+// refuses "unevaluated" (slice unreadable / daemon-down ci-shim / a daemon
+// unevaluated grant) AND "timeout" — the latter is the flock fallback's "waited
+// the whole budget, got no admission, launching anyway" outcome, which is
+// exactly an ungoverned launch, and which an earlier `== unevaluated` key let
+// through (Fable build-review P1). It ALLOWS a flock-fallback "immediate"/
+// "waited": that is a real free-memory check holding a real lock, so keying any
+// stricter (e.g. daemon-booked only) would make the flag unusable on a real
+// slice during a daemon restart. Returns nil whenever the flag is absent, so
+// ordinary launches are never touched.
+func requireAdmissionRefusal(request ConfineRequest, slice, state, reason string) error {
+	if !request.RequireAdmission || state == "immediate" || state == "waited" {
 		return nil
 	}
-	detail := "memory admission is unevaluated"
+	detail := "memory admission is " + state
+	if state == "" {
+		detail = "memory admission is unevaluated"
+	}
 	if reason != "" {
 		detail += " (" + reason + ")"
 	}

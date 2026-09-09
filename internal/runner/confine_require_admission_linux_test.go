@@ -11,20 +11,35 @@ import (
 )
 
 // verifies: AIRA-222 -- --require-admission (ConfineRequest.RequireAdmission)
-// fails the launch CLOSED when memory admission could not be evaluated, instead
-// of running the job UNGOVERNED and exiting 0 (the defect where "governed, slice
-// was empty" and "not governed at all" shared an exit code). It is OPT-IN and
-// default-off: a launch that does not set the flag is unaffected, which is what
-// keeps a transient daemon-restart window from breaking every confine on the box.
+// fails the launch CLOSED when the job was NOT admitted, instead of running it
+// UNGOVERNED and exiting 0 (the defect where "governed, slice was empty" and
+// "not governed at all" shared an exit code). It is OPT-IN and default-off: a
+// launch that does not set the flag is unaffected, which is what keeps ordinary
+// launches unbroken.
 //
-// The gate is keyed on the resolved admission=unevaluated facet, matching the
-// flag name and the ticket. A NOTE for a reviewer weighing the semantic: this
-// refuses a real-path job that has a finite cap (so it IS contained) but whose
-// admission was not evaluated -- e.g. a capped job on a box with the daemon
-// down. That is deliberate for an opt-in "require admission" flag: a caller that
-// asked for a confirmed admission and got none is told so, and the CI use that
-// motivated this (aitest worker-admit) needs a reachable daemon anyway, so a
-// daemon-down container is not giving that caller what it asked for regardless.
+// The gate keys on the raw admission STATE, refusing anything that is not
+// "immediate" or "waited" (the two admitted states). It therefore refuses BOTH
+// "unevaluated" (slice unreadable / ci-shim daemon-down / a daemon unevaluated
+// grant) AND "timeout" -- the flock fallback's "waited the whole budget, got no
+// admission, launching anyway" outcome, which is an ungoverned launch a naive
+// `== unevaluated` key let through (Fable build-review P1). It ALLOWS a
+// flock-fallback "immediate"/"waited": that is a real free-memory check holding
+// a real lock, so a daemon-restart on a real slice still launches under the
+// flag. (Note: on the REAL path a daemon-down job does NOT resolve to
+// unevaluated -- Runner.admit falls to the flock path and returns
+// immediate/waited -- so this does not break daemon-restart windows; only a
+// ci-shim daemon-down job, which has no ledger, resolves to unevaluated and is
+// refused, which is the ticket's own scenario.)
+
+// requireAdmissionRealDeps builds the real-path confine deps and PINS the mode
+// to ConfineModeReal, so these tests exercise the real path deterministically
+// rather than reading the machine's install record (which would silently run
+// the ci-shim path on a shim-installed CI box -- Fable build-review P3).
+func requireAdmissionRealDeps() confineDeps {
+	deps := confineUnitDeps(&confineFakeScope{})
+	deps.resolveMode = func() string { return ConfineModeReal }
+	return deps
+}
 
 // confineRunTouchingMarker runs a child that creates `marker`, through the
 // supplied deps, with admit stubbed to `admitState`. It returns the error from
@@ -52,7 +67,7 @@ func markerExists(marker string) bool {
 // Real path, flag SET, admission unevaluated -> terminal refusal, child never runs.
 func TestRequireAdmissionRefusesRealPathWhenUnevaluated(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "launched")
-	err := confineRunTouchingMarker(t, confineUnitDeps(&confineFakeScope{}), true, "unevaluated", marker)
+	err := confineRunTouchingMarker(t, requireAdmissionRealDeps(), true, "unevaluated", marker)
 	if err == nil {
 		t.Fatal("expected a terminal refusal, got nil (job would have launched ungoverned)")
 	}
@@ -68,13 +83,46 @@ func TestRequireAdmissionRefusesRealPathWhenUnevaluated(t *testing.T) {
 }
 
 // Real path, flag SET, admission granted -> launches normally (no over-refusal).
+// Both admitted states are pinned: "immediate", and "waited" (the flock-fallback
+// grant that must NOT be refused, else the flag is unusable during a daemon
+// restart on a real slice).
 func TestRequireAdmissionAllowsRealPathWhenAdmitted(t *testing.T) {
+	for _, state := range []string{"immediate", "waited"} {
+		marker := filepath.Join(t.TempDir(), "launched")
+		if err := confineRunTouchingMarker(t, requireAdmissionRealDeps(), true, state, marker); err != nil {
+			t.Fatalf("an admitted (%s) job with --require-admission must launch, got: %v", state, err)
+		}
+		if !markerExists(marker) {
+			t.Fatalf("an admitted (%s) job with --require-admission did not launch (marker absent)", state)
+		}
+	}
+}
+
+// Real path, flag SET, admission TIMEOUT -> refuse. The flock fallback's
+// "waited the whole budget, admitted nothing, would launch anyway" is exactly an
+// ungoverned launch; a naive `== unevaluated` gate let it through (Fable P1).
+func TestRequireAdmissionRefusesRealPathWhenTimedOut(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "launched")
-	if err := confineRunTouchingMarker(t, confineUnitDeps(&confineFakeScope{}), true, "immediate", marker); err != nil {
-		t.Fatalf("an admitted job with --require-admission must launch, got: %v", err)
+	err := confineRunTouchingMarker(t, requireAdmissionRealDeps(), true, "timeout", marker)
+	if err == nil {
+		t.Fatal("a flock-timeout admission must be refused under --require-admission (would run ungoverned)")
+	}
+	if !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE") || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("timeout refusal does not name the cause: %v", err)
+	}
+	if markerExists(marker) {
+		t.Fatal("job LAUNCHED on a timeout despite --require-admission")
+	}
+}
+
+// Default-off must STILL launch on a timeout (opt-in preserved on that state too).
+func TestRequireAdmissionAbsentRealPathStillLaunchesTimeout(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "launched")
+	if err := confineRunTouchingMarker(t, requireAdmissionRealDeps(), false, "timeout", marker); err != nil {
+		t.Fatalf("without --require-admission a timeout launch must still run, got: %v", err)
 	}
 	if !markerExists(marker) {
-		t.Fatal("an admitted job with --require-admission did not launch (marker absent)")
+		t.Fatal("default (no flag) launch did not run under timeout admission")
 	}
 }
 
@@ -84,7 +132,7 @@ func TestRequireAdmissionAllowsRealPathWhenAdmitted(t *testing.T) {
 // daemon-restart window.
 func TestRequireAdmissionAbsentRealPathStillLaunchesUnevaluated(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "launched")
-	if err := confineRunTouchingMarker(t, confineUnitDeps(&confineFakeScope{}), false, "unevaluated", marker); err != nil {
+	if err := confineRunTouchingMarker(t, requireAdmissionRealDeps(), false, "unevaluated", marker); err != nil {
 		t.Fatalf("without --require-admission an unevaluated launch must still run, got: %v", err)
 	}
 	if !markerExists(marker) {

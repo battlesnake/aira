@@ -189,7 +189,10 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// `aira install --ci=shim` leaves no slice, so a fresh container reports
 	// admission=unevaluated (slice-not-found) and runs ungoverned at exit 0.
 	// --require-admission turns that into a refusal for an unattended caller.
-	if refusal := requireAdmissionRefusal(request, sliceName, result.Status.Admission, admission.reason); refusal != nil {
+	// (A shim daemon-down fallback resolves to unevaluated, not timeout, so this
+	// path never had the flock-timeout hole the real path did — but it keys on
+	// the same "not admitted" predicate for symmetry.)
+	if refusal := requireAdmissionRefusal(request, sliceName, admission.state, admission.reason); refusal != nil {
 		return result, refusal
 	}
 
