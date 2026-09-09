@@ -27,6 +27,25 @@ func renderConfineBudgetResponse(response core.Response, stdout, stderr io.Write
 	if err := json.Unmarshal(data, &result); err != nil {
 		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-budget response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
 	}
+	// AIRA-201. An UNEVALUATED result also carries zero subjects, so this must be
+	// tested before the empty-history line below — otherwise "we could not look"
+	// renders as "we looked and there is nothing", which is the exact class of
+	// fabrication this verb exists to avoid. Checked on the verdict rather than on
+	// the reason string, so a future unevaluated path that forgets its reason
+	// still cannot fall through to the wrong sentence.
+	if result.Verdict == "unevaluated" {
+		reason := result.Reason
+		if reason == "" {
+			reason = "no reason was reported"
+		}
+		_, _ = fmt.Fprintf(stdout, "confine budget: unevaluated: %s\n", reason)
+		// Mirrors renderConfineListResponse (main.go:3302-3307): carry the
+		// response's own exit when it set one, else the project's unevaluated 3.
+		if response.Exit != 0 {
+			return response.Exit
+		}
+		return 3
+	}
 	// Stated before the rows, not after: a reader who acts on the first line must
 	// already know the history is machine-wide and cross-project.
 	_, _ = fmt.Fprintf(stdout, "universe: %s\n", result.Scope)

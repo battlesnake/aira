@@ -119,7 +119,12 @@ type ConfineBudgetRow struct {
 // ConfineBudgetResult is the whole reply. Scope carries the universe disclosure
 // verbatim rather than leaving a reader to infer it.
 type ConfineBudgetResult struct {
-	Verdict  string             `json:"verdict"`
+	Verdict string `json:"verdict"`
+	// Reason follows ConfineListResult's convention (confine_manage.go:306): when
+	// Verdict is "unevaluated" the reader is told WHY in the same reply, rather
+	// than being handed an empty Subjects slice that reads as "nothing is
+	// mis-provisioned". Empty on an established verdict. AIRA-201.
+	Reason   string             `json:"reason,omitempty"`
 	Scope    string             `json:"scope"`
 	Subjects []ConfineBudgetRow `json:"subjects"`
 }

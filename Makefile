@@ -7,18 +7,31 @@ export PATH := $(GO_BIN):$(HOME)/.local/bin:$(PATH)
 
 .PHONY: fmt fmt-check vet lint build dist test race cover fuzz tidy ci install-hooks
 
+# AIRA-205. The file set every gofmt-driving target shares, defined ONCE. It was
+# previously spelled out at three sites, and a nested-worktree exclusion added to
+# one would have been missing from the other two -- which is how ./.claude went
+# unexcluded here in the first place.
+#
+# ./.claude holds this harness's own per-agent worktrees: full checkouts owned by
+# OTHER concurrently-running sessions. Measured before this exclusion, they were
+# 8,681 of the 9,222 files selected -- 94%. Reaching into them is not merely
+# wasteful: `fmt` runs gofmt -w and goimports -w, so it REWRITES a neighbour's
+# in-progress files, and `fmt-check` runs in the pre-commit hook, so a
+# neighbour's mid-edit file could fail the owner's commit.
+GO_SRC_FIND := find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*' -not -path './.claude/*'
+
 fmt:
-	@files="$$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*')"; \
+	@files="$$($(GO_SRC_FIND))"; \
 	if [ -n "$$files" ]; then gofmt -w $$files; fi
 	@if command -v goimports >/dev/null 2>&1; then \
-		files="$$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*')"; \
+		files="$$($(GO_SRC_FIND))"; \
 		if [ -n "$$files" ]; then goimports -w $$files; fi; \
 	else \
 		echo "goimports is not installed; run: go install golang.org/x/tools/cmd/goimports@latest"; \
 	fi
 
 fmt-check:
-	@files="$$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*')"; \
+	@files="$$($(GO_SRC_FIND))"; \
 	if [ -n "$$files" ] && gofmt -l $$files | grep -q .; then \
 		echo "gofmt check failed; run 'make fmt'" >&2; \
 		gofmt -l $$files; \
