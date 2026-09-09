@@ -566,14 +566,17 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			// made it necessary; TestSkillNamesNothingFromTheRetiredXdistGovernor
 			// now asserts the opposite -- that the phrase is GONE.)
 			"adds no slice-ledger charge",
-			// AIRA_AITEST_ESTIMATED_BYTES is parsed with int(raw)
-			// (internal/pylib/aitest/__init__.py:141-146): a "4G"-style value
-			// raises ValueError and silently falls back to the 512M default,
-			// with no warning at all (only out-of-range integers warn).
-			// Naming the variable without its units would reproduce this
-			// ticket's own defect class, so the units are pinned.
-			"PLAIN INTEGER BYTE COUNT",
-			"AIRA_AITEST_ESTIMATED_BYTES=4294967296",
+			// AIRA_AITEST_ESTIMATED_BYTES is parsed by _parse_estimated_bytes
+			// (internal/pylib/aitest/__init__.py), which accepts a byte count OR
+			// a 1024-based size suffix (4G/512M/1GiB) matching Go
+			// runner.parseMemorySize, and WARNS on a malformed value instead of
+			// silently defaulting to 512M (AIRA-223, which fixed the earlier
+			// silent-fallback footgun the old "4G is silently ignored" wording
+			// documented). Naming the variable without its units, or claiming a
+			// suffix is ignored, would reproduce this ticket's own defect class,
+			// so the units and the suffix support are pinned.
+			"1024-based size suffix",
+			"4G",
 		} {
 			if !strings.Contains(section, want) {
 				t.Fatalf("%s aitest section missing %q", document.name, want)
@@ -592,6 +595,8 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			{"no `--delegate-ram`", "tells agents to omit --delegate-ram (the flag aitest requires)"},
 			{"only a `--delegate-ram` launch is guaranteed", "claims delegate-ram is the only shape with a finite outer cap; --memory-max and a declared --memory-reserve are finite too, they just never receive the coordinates"},
 			{"the slice only ever holds", "overstates slice accounting; see the adds-no-slice-ledger-charge assertion above"},
+			{"silently ignored", "reproduces the AIRA-223 footgun wording: a size suffix is now accepted, not silently ignored"},
+			{"PLAIN INTEGER BYTE COUNT", "the env var now accepts a 1024-based size suffix, so the plain-integer-only claim is stale (AIRA-223)"},
 		} {
 			if strings.Contains(section, forbidden.text) {
 				t.Fatalf("%s aitest section %s: found %q", document.name, forbidden.why, forbidden.text)

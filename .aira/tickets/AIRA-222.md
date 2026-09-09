@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-222","project":"aira","title":"confine exits 0 with admission=unevaluated, so a mis-provisioned host runs every job ungoverned and looks fine","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["ci","confine","silent-degradation"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-224","to":"AIRA-222"},{"kind":"relates","from":"AIRA-225","to":"AIRA-222"}]}
+{"schema":1,"id":"AIRA-222","project":"aira","title":"confine exits 0 with admission=unevaluated, so a mis-provisioned host runs every job ungoverned and looks fine","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["ci","confine","silent-degradation"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-224","to":"AIRA-222"},{"kind":"relates","from":"AIRA-225","to":"AIRA-222"}]}
 ---
 Found putting aira v0.4 into a Docker CI runner image (fastest-ee GCP Batch lane). From the `deploy` session. Every figure measured, in an arm64 container.
 
@@ -31,3 +31,29 @@ OUR WORKAROUND, for reference: install at container START, then probe and refuse
 That works, but every consumer must reinvent it, and only after being bitten.
 
 USEFUL CONTEXT: a RUNTIME `install --ci=shim` fixes it entirely (admission=immediate) and additionally reads the ledger budget from the live host rather than freezing the builders. Our image is built on n4a-standard-8 and runs on n4a-standard-16, so a baked budget is wrong in both directions.
+
+## Build review record — DONE (2026-09-09)
+
+Fix #1 (the flag): `--require-admission` (ConfineRequest.RequireAdmission) refuses to launch —
+terminal E_CONFINE_UNAVAILABLE — when the job was NOT admitted, on both the real and ci-shim paths,
+via a shared `requireAdmissionRefusal`. Opt-in, default-off; ordinary launches are untouched.
+Replaces deploy's grep-the-trailer workaround with a real exit code, and is the honest fallback
+AIRA-224 will name. Documented in the core dispatch table (help/agent-guide/MCP) and the confine
+skill text.
+
+Deferred, explicitly (asks #2/#3): default-on-for-`--ci` and refuse-inside-Docker-BUILD both
+interact with AIRA-224's real-vs-advisory-mode distinction and the build-vs-runtime install policy;
+filed as follow-ups rather than guessed.
+
+TWO-LOOP RECORD — the adversarial review was load-bearing. The first cut keyed the gate on
+`admission == unevaluated` and passed its own green tests. Fable's build-review BLOCKed it with a
+MEASURED P1: a flock-fallback `timeout` admission (the real path's "waited the whole budget,
+admitted nothing, launching anyway") is an ungoverned launch that the `== unevaluated` key let
+through. Fix: key on NOT-admitted (state ∉ {immediate, waited}), which catches `timeout` too while
+still allowing a real flock `immediate`/`waited` (so a daemon-restart on a real slice still
+launches). Fable also caught that the original commit prose overclaimed a daemon-down real-path
+refusal that does not happen (real daemon-down flock-admits), the flag's absence from the dispatch
+table, and the untested CLI→request wiring; all fixed. Owner-visible semantic choice recorded:
+keyed on "admitted" rather than the stricter "daemon-booked", because flock admission is real
+governance and the stricter key would make the flag unusable during a daemon restart — a one-line
+change if the owner prefers otherwise.

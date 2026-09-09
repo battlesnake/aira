@@ -128,6 +128,39 @@ func TestConfineLaunchOwnerThreadsIntoAdmissionRequest(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-222 -- the --require-admission flag actually threads into the
+// request. The option key is duplicated between option_suggest.go's valueless
+// list and main.go's request build with no compile-time link; a typo in either
+// makes the flag silently inert = default-off = an ungoverned launch, the exact
+// silent, load-bearing failure the flag exists to prevent (Fable P2).
+func TestConfineLaunchRequireAdmissionThreadsIntoRequest(t *testing.T) {
+	original := runConfined
+	t.Cleanup(func() { runConfined = original })
+	t.Setenv("AIRA_CONFINE_OWNER", "session-req")
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want bool
+	}{
+		{"flag set", []string{"confine", "--require-admission", "--", "true"}, true},
+		{"flag absent", []string{"confine", "--", "true"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got bool
+			runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+				got = request.RequireAdmission
+				return runner.ConfineResult{}, nil
+			}
+			if exit := runWithInput(tc.argv, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
+				t.Fatalf("exit=%d", exit)
+			}
+			if got != tc.want {
+				t.Fatalf("RequireAdmission=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestConfineManagementDispatchesOutsideProject(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("AIRA_CONFINE_OWNER", "session-a")
@@ -654,8 +687,9 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 		found = true
 		// AIRA-138 adds --timeout and --cpu-timeout to the usage line, beside the
 		// --admit-timeout they must never be confused with. AIRA-196 adds
-		// --stdin-connect, which is meaningful only with --detach.
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] [--stdin-connect] -- <argv...>" {
+		// --stdin-connect, which is meaningful only with --detach. AIRA-222 adds
+		// --require-admission (fail closed when the job was not admitted).
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

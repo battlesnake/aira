@@ -1417,8 +1417,9 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
 		Owner:         owner,
 		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
-		DelegateRAM: options["delegate-ram"] == "true",
-		Exclusive:   options["exclusive"] == "true",
+		DelegateRAM:      options["delegate-ram"] == "true",
+		Exclusive:        options["exclusive"] == "true",
+		RequireAdmission: options["require-admission"] == "true",
 		// AIRA-196. Transcribed, never inferred: with the flag absent this stays
 		// false and the detached job's stdin is /dev/null, exactly as before.
 		StdinConnect:   options["stdin-connect"] == "true",

@@ -8,6 +8,7 @@ is driven from a pytest_runtestloop hookimpl added in Task 17, once
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -228,16 +229,70 @@ _ESTIMATED_BYTES_MAX = 1 << 50  # must match the daemon's own admitMaxReserve
 # (internal/daemon/admit.go) and the CLI's mirrored client-side ceiling
 
 
+# 1024-based size units, case-insensitive, matching Go runner.parseMemorySize
+# (internal/runner/memory_size.go): 4G == 4GB == 4GiB. Kept in sync deliberately
+# so a size typed at AIRA_AITEST_ESTIMATED_BYTES means the same thing it does at
+# --memory-reserve / --memory-max.
+_SIZE_UNITS = {
+    "": 1, "B": 1,
+    "K": 1 << 10, "KB": 1 << 10, "KIB": 1 << 10,
+    "M": 1 << 20, "MB": 1 << 20, "MIB": 1 << 20,
+    "G": 1 << 30, "GB": 1 << 30, "GIB": 1 << 30,
+    "T": 1 << 40, "TB": 1 << 40, "TIB": 1 << 40,
+}
+_SIZE_RE = re.compile(r"\A(\d+)(?:\.(\d+))?([A-Za-z]*)\Z")
+
+
+def _parse_estimated_bytes(raw):
+    """Parse AIRA_AITEST_ESTIMATED_BYTES as a byte count with an OPTIONAL
+    1024-based unit, matching Go runner.parseMemorySize: K/KB/KiB = 2**10,
+    M = 2**20, G = 2**30, T = 2**40, a bare B or no unit = bytes;
+    case-insensitive; a decimal mantissa (e.g. 1.5G) is floored to whole bytes.
+    Returns (value, ok). ok is False for a NON-EMPTY value that does not parse,
+    so the caller can WARN and use the default rather than silently swallowing a
+    512 MiB backstop -- the AIRA-223 footgun. An empty string (unset) returns
+    (0, True): the caller then defaults SILENTLY, because unset is not a mistake.
+    """
+    s = raw.strip()
+    if s == "":
+        return 0, True
+    match = _SIZE_RE.match(s)
+    if match is None:
+        return 0, False
+    whole, frac, unit = match.group(1), match.group(2), match.group(3)
+    multiplier = _SIZE_UNITS.get(unit.upper())
+    if multiplier is None:
+        return 0, False
+    value = int(whole) * multiplier
+    if frac:
+        # floor(frac * multiplier / 10**len(frac)) with no float rounding,
+        # exactly as the Go parser's big.Int path does.
+        value += (int(frac) * multiplier) // (10 ** len(frac))
+    return value, True
+
+
 def _resolve_estimated_bytes():
     # Slice 1: a pinned per-worker memory.max backstop from an env var.
     # Suite-signature-based sizing (design spec 3.3) is a safety-backstop
     # sizing refinement, not the admission signal, and is deferred -- not
     # needed to validate this slice's core admission/lifecycle loop.
     raw = os.environ.get("AIRA_AITEST_ESTIMATED_BYTES", "")
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
+    value, ok = _parse_estimated_bytes(raw)
+    if not ok:
+        # AIRA-223: a NON-EMPTY value that does not parse is a typo -- a size
+        # suffix aira now accepts (4G/512M/1GiB), or genuine garbage. WARN and
+        # use the default rather than returning it silently. The old asymmetry
+        # was the footgun: an out-of-range INTEGER warned (below), but a
+        # well-formed-LOOKING "4G" went silent, dropping the caller to 512 MiB
+        # and sending a memory-hungry suite into per-worker OOM churn -- read as
+        # flaky tests, not a config typo, because nothing said a word.
+        sys.stderr.write(
+            "aira aitest: AIRA_AITEST_ESTIMATED_BYTES=%r is not a valid size; "
+            "use a byte count or a 1024-based size like 4G / 512M / 1GiB "
+            "(K/M/G/T are powers of 1024). Using the %d-byte default.\n"
+            % (raw, 512 << 20)
+        )
+        return 512 << 20
     if value <= 0:
         return 512 << 20
     if value < _ESTIMATED_BYTES_MIN:
