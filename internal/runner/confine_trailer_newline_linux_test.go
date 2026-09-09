@@ -1,7 +1,9 @@
 package runner
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -84,5 +86,34 @@ func TestConfineTrailerBeginsOnOwnLineWhenStdoutSharesStderrFile(t *testing.T) {
 	}
 	if !confineTrailerLineRE.MatchString(out) {
 		t.Fatalf("trailer does not begin its own line: %q", out)
+	}
+}
+
+// Case 3 (ci-shim twin): the shim trailer (confine_shim_linux.go) must begin its
+// own line too. The ci-shim path is the owner-elevated scenario (an aitest worker
+// under GCP Batch, RANT-39) where a partial last block from an oomd kill is most
+// likely, and in that deployment the child's stderr can be wired to a raw fd, so
+// this is not a lesser case than the real path.
+func TestConfineShimTrailerBeginsOnOwnLineAfterPartialStderr(t *testing.T) {
+	deps := shimUnitDeps()
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "unevaluated", reason: "slice-not-found"}, nil
+	}
+	var stderr bytes.Buffer
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{
+		Argv:     []string{"/bin/sh", "-c", "printf shim-partial-no-newline >&2"},
+		SelfPath: os.Args[0], Stderr: &stderr, Stdout: io.Discard,
+	}, deps); err != nil {
+		t.Fatalf("shim confine: %v", err)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "shim-partial-no-newline") {
+		t.Fatalf("child's partial stderr was not emitted (shim): %q", out)
+	}
+	if strings.Contains(out, "shim-partial-no-newlineconfine:") {
+		t.Fatalf("shim trailer glued onto the child's partial last line: %q", out)
+	}
+	if !confineTrailerLineRE.MatchString(out) {
+		t.Fatalf("shim trailer does not begin its own line: %q", out)
 	}
 }
