@@ -43,9 +43,11 @@ type Identity struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-const worktreeReason = "this binary carries no VCS stamp: Go omits one for a build made inside a linked " +
-	"git worktree (silently, even under -buildvcs=true), which is how AIRA development builds are made; " +
-	"the installed and released binaries are stamped"
+const missingStampReason = "this binary carries no VCS stamp, so the commit it was built from cannot be " +
+	"established. The usual cause is a build made inside a linked git worktree, where Go omits the stamp " +
+	"silently -- even under an explicit -buildvcs=true -- which is how AIRA development builds are made; " +
+	"a build from a checkout with its own .git directory, such as the installed binary or a release " +
+	"artifact, is normally stamped. This does NOT establish which of those applies here."
 
 // Current reports the identity of the running binary.
 func Current() Identity {
@@ -73,7 +75,7 @@ func identityFrom(info *debug.BuildInfo, ok bool) Identity {
 	// The revision is the whole point: a stamp carrying a time but no revision
 	// establishes nothing, so it is treated as absent rather than half-reported.
 	if identity.Revision == "" {
-		return Identity{Reason: worktreeReason}
+		return Identity{Reason: missingStampReason}
 	}
 	identity.Established = true
 	return identity

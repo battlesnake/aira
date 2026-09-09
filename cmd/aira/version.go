@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
+	"time"
 
 	"aira/internal/buildid"
 	"aira/internal/core"
 	"aira/internal/daemon"
 )
+
+// versionDaemonWait bounds the daemon half of `aira version`.
+const versionDaemonWait = 5 * time.Second
 
 // runVersionCommand answers `aira version` / `--version` / `-v`.
 //
@@ -21,11 +26,22 @@ import (
 // The verb never fails. The client half is always establishable locally, and an
 // unreachable daemon yields an `unevaluated` daemon half with its reason rather
 // than an error, so the answer is always at least half useful.
-func runVersionCommand(ctx context.Context, dispatcher Dispatcher, jsonOutput bool, stdout, stderr io.Writer) int {
+func runVersionCommand(ctx context.Context, dispatcher Dispatcher, dispatcherErr error, jsonOutput bool, stdout, stderr io.Writer) int {
 	client := buildid.Current()
 	daemonIdentity := buildid.Identity{Reason: "no dispatcher was available to ask the daemon"}
+	if dispatcherErr != nil {
+		daemonIdentity = buildid.Identity{Reason: "the daemon client could not be constructed: " + dispatcherErr.Error()}
+	}
 	if dispatcher != nil {
-		response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, core.Request{Verb: "version"})
+		// Bounded deliberately. The generic client wait is minutes long, which is
+		// right for a mutation that must not be abandoned half-done -- and wrong
+		// for a read-only "what is running", which an operator types precisely
+		// BECAUSE something is wedged. A slow answer here is worth less than a
+		// prompt `unevaluated`, so the wait is short and the timeout is reported
+		// as the reason rather than as a hang.
+		bounded, cancel := context.WithTimeout(ctx, versionDaemonWait)
+		defer cancel()
+		response := dispatcher.Dispatch(bounded, daemon.WorktreeScope{}, core.Request{Verb: "version"})
 		daemonIdentity = daemonIdentityFrom(response)
 	}
 	report := buildid.NewReport(client, daemonIdentity)
@@ -96,4 +112,17 @@ func renderVersion(report buildid.Report, stdout io.Writer) int {
 			"Mutating verbs execute in the DAEMON, so its build decides what is legal; run `aira install` and restart it.")
 	}
 	return 0
+}
+
+// isVersionSpelling matches the verb and both flag spellings, case-insensitively.
+//
+// The fold is not cosmetic: every neighbouring dispatch in main.go lowercases
+// (`verb := strings.ToLower(args[0])`), so without it `aira VERSION` would be
+// the one spelling in the family reported as an unknown verb.
+func isVersionSpelling(arg string) bool {
+	switch strings.ToLower(arg) {
+	case "version", "--version", "-v":
+		return true
+	}
+	return false
 }

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-201","project":"aira","title":"aira confine --budget is unreachable: RouteClient falls through to a project store open and always returns E_CONFIG_INVALID","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-213","to":"AIRA-201"}]}
+{"schema":1,"id":"AIRA-201","project":"aira","title":"aira confine --budget is unreachable: RouteClient falls through to a project store open and always returns E_CONFIG_INVALID","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-213","to":"AIRA-201"}]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
@@ -64,3 +64,12 @@ Still unevaluated: the second symptom in the original body — why
 `aira insights show resource-budget` returns `UNEVALUATED` via
 `internal/store/resource_budget.go`'s `s.owner == nil` branch. Different path,
 not traced, not fixed here.
+
+### Build review addendum
+
+Confirmed gap, fixed: **neither shipped CLI spelling was exercised by any test.**
+The routing test drove `daemonDispatcher` directly, so `confine --budget` (the
+options-form branch) and `confine-budget` (main.go's verb arm) — two different
+routes into the same dispatch — were both unverified, on a ROUTING defect.
+`TestBothConfineBudgetSpellingsReachTheManagementDispatch` now drives both
+through `RunWithDispatcher` and asserts each resolves no project scope.

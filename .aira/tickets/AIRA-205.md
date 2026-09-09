@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-205","project":"aira","title":"make fmt-check gofmts 8,681 .go files belonging to 24 other agents' worktrees, so any concurrent session's mid-edit file can fail the owner's commit","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-205","project":"aira","title":"make fmt-check gofmts 8,681 .go files belonging to 24 other agents' worktrees, so any concurrent session's mid-edit file can fail the owner's commit","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
@@ -52,3 +52,11 @@ that hand-rolls its own find is caught too, and it fails on zero matches so a
 renamed variable cannot read as a pass. Confirmed failing against the unfixed
 Makefile on all three sites, with the vendor/.worktrees cases passing throughout
 — i.e. the fixture proves the harness is not vacuous.
+
+### Build review addendum
+
+Confirmed gap, fixed: the find-expression regex required at least one
+`-not -path` (`+` quantifier), so a future target hand-rolling
+`find . -type f -name '*.go'` with NO exclusions at all — the worst form of this
+regression — would not have matched the regex and the guard would have stayed
+silent about exactly the case it exists to catch. Quantifier is now `*`.

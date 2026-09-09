@@ -179,3 +179,66 @@ func versionDispatcher(t *testing.T, daemonIdentity buildid.Identity) Dispatcher
 		return core.Response{OK: true, Code: "OK", Data: daemonIdentity}
 	})
 }
+
+// TestRenderVersionStatesDivergenceWhenBothHalvesAreEstablished pins the render
+// of the asserting direction, which no end-to-end test could reach: this test
+// binary is built in a linked worktree, so its own client identity is never
+// established and every Diverged==true branch was dead.
+//
+// The build review found the existing divergence test's only real guard was
+// therefore unreachable — a test that passes but could not fail, which is the
+// house failure mode. Driving the renderer directly fixes that.
+//
+// verifies: AIRA-202
+func TestRenderVersionStatesDivergenceWhenBothHalvesAreEstablished(t *testing.T) {
+	report := buildid.NewReport(
+		buildid.Identity{Established: true, Revision: "aaaaaaa", Time: "2026-09-09T00:39:34Z"},
+		buildid.Identity{Established: true, Revision: "bbbbbbb", Time: "2026-09-01T00:00:00Z"},
+	)
+	if !report.Diverged {
+		t.Fatal("fixture must diverge, or this test asserts nothing")
+	}
+	var stdout bytes.Buffer
+	renderVersion(report, &stdout)
+	out := stdout.String()
+	if !strings.Contains(out, "DIVERGED") {
+		t.Fatalf("divergence must be stated, not left for the reader to spot:\n%s", out)
+	}
+	// The remedy matters as much as the fact: the daemon is what decides legality,
+	// so a reader must be told to restart it rather than to reinstall the client.
+	if !strings.Contains(out, "DAEMON") || !strings.Contains(out, "aira install") {
+		t.Fatalf("the divergence line must name the daemon and the remedy:\n%s", out)
+	}
+	if !strings.Contains(out, "aaaaaaa") || !strings.Contains(out, "bbbbbbb") {
+		t.Fatalf("both revisions must be shown so the reader can tell which is which:\n%s", out)
+	}
+}
+
+// TestMCPServerInfoReportsTheRealBuildIdentity is the ticket's own HOW-TO-TEST
+// item (4), which the first pass did not implement — the build review flagged it
+// four separate times. Without it, reverting mcp.go to the literal "m8a" stays
+// green, and that literal is the one surface that actually fabricated a version.
+//
+// verifies: AIRA-202
+func TestMCPServerInfoReportsTheRealBuildIdentity(t *testing.T) {
+	server := &mcpServer{}
+	response, _ := server.handle(context.Background(), []byte(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	encoded, err := json.Marshal(response.Result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var result struct {
+		ServerInfo struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"serverInfo"`
+	}
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		t.Fatalf("unmarshal %s: %v", encoded, err)
+	}
+	if want := buildid.Current().String(); result.ServerInfo.Version != want {
+		t.Fatalf("serverInfo.version=%q, want the live build identity %q — a literal here is how %q survived a thousand commits",
+			result.ServerInfo.Version, want, "m8a")
+	}
+}

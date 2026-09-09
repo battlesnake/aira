@@ -134,3 +134,43 @@ func TestRenderConfineBudgetUnevaluatedDoesNotClaimAnEmptyHistory(t *testing.T) 
 		t.Fatalf("the reason must reach the reader:\n%s", out)
 	}
 }
+
+// TestBothConfineBudgetSpellingsReachTheManagementDispatch closes the gap the
+// build review found: the routing test above drives daemonDispatcher directly,
+// so NEITHER shipped CLI spelling was exercised by anything.
+//
+// That matters because the two spellings reach the dispatch by different routes
+// — `confine --budget` through the options-form branch in runConfineCommand's
+// caller (main.go, `management` includes options["budget"]), and the hyphenated
+// `confine-budget` through main.go's own verb arm — and AIRA-201 was a routing
+// defect. A fix verified only at the dispatcher would not have noticed either
+// entry point being broken.
+//
+// verifies: AIRA-201
+func TestBothConfineBudgetSpellingsReachTheManagementDispatch(t *testing.T) {
+	for _, argv := range [][]string{{"confine", "--budget"}, {"confine-budget"}} {
+		t.Run(strings.Join(argv, " "), func(t *testing.T) {
+			var seen []string
+			injected := dispatcherFunc(func(_ context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+				seen = append(seen, request.Verb)
+				// Project-less by design: a confine verb must resolve no project, so a
+				// populated scope here means the CLI took the project-discovery path.
+				if scope.ProjectID != "" || scope.Root != "" {
+					t.Fatalf("%v resolved a project scope %+v; confine verbs are project-less", argv, scope)
+				}
+				return core.Response{OK: true, Code: "OK", Data: runner.ConfineBudgetResult{
+					Verdict: "ok", Scope: "test-universe", Subjects: []runner.ConfineBudgetRow{},
+				}}
+			})
+			var stdout, stderr bytes.Buffer
+			exit := RunWithDispatcher(argv, &stdout, &stderr, injected)
+			if len(seen) != 1 || seen[0] != "confine-budget" {
+				t.Fatalf("%v dispatched %v, want exactly one confine-budget; exit=%d stdout=%q stderr=%q",
+					argv, seen, exit, stdout.String(), stderr.String())
+			}
+			if exit != 0 {
+				t.Fatalf("%v exit=%d stderr=%q", argv, exit, stderr.String())
+			}
+		})
+	}
+}

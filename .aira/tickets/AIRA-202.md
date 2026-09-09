@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-202","project":"aira","title":"Nothing reports which commit the running aira client or daemon was built from, and MCP serverInfo answers with a hardcoded stale \"m8a\"","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-203","to":"AIRA-202"}]}
+{"schema":1,"id":"AIRA-202","project":"aira","title":"Nothing reports which commit the running aira client or daemon was built from, and MCP serverInfo answers with a hardcoded stale \"m8a\"","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-203","to":"AIRA-202"}]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
@@ -76,3 +76,52 @@ Summary/Safety/Example). That is a real change with its own review surface and
 was deliberately not bundled into this fix. `--version`/`-v` are conventional
 enough for a human; an agent reading the generated guide will not find it.
 Worth a follow-up decision.
+
+### Build review (5 dimensions, adversarially verified) — 26 findings, 24 confirmed
+
+The review found the load-bearing defects were in the TESTS, not the code — the
+house porous-test failure mode, in a change written by an author who had just
+been told to watch for it.
+
+Fixed in the review-fix pass:
+
+1. **The daemon `version` arm had NO test** (P2) — the load-bearing half of this
+   ticket. Now covered by `internal/daemon/version_test.go`, and
+   MUTATION-VERIFIED: disabling the arm yields `E_CONFIG_INVALID: scope options
+   are incomplete`, which `cmd/aira/version.go` converts into a confident "the
+   running daemon is OLDER than this client" accusation against a CURRENT
+   daemon. A fabricated staleness claim from the ticket whose purpose is to stop
+   fabricated version claims. The test kills that mutation; the empty scope is
+   the load-bearing part of it.
+2. **No test could exercise an ESTABLISHED identity** (P2). The test binary is
+   built in a linked worktree, so `Established` is always false and every
+   `Diverged == true` path — including the whole `DIVERGED` render — was dead
+   code to the suite. The divergence test's only real guard was unreachable: a
+   test that passes but cannot fail. Now driven directly through `NewReport`
+   (both directions, five cases) and `renderVersion`.
+3. **`missingStampReason` asserted a cause the code did not establish** (P3).
+   It claimed the worktree explanation for EVERY revision-less build. That is
+   the same over-specified-provenance defect RANT-19 was filed about,
+   reintroduced by the fix for the ticket that cites RANT-19. It now names the
+   usual cause and explicitly disclaims it, with a test asserting the disclaimer.
+4. **MCP `serverInfo` was unpinned** (P3, flagged by four dimensions) — this
+   ticket's own HOW-TO-TEST item (4), unimplemented. Reverting `mcp.go` to the
+   literal `"m8a"` would have stayed green.
+5. **`version` silently swallowed `--scope-dir`** (P3) — added to
+   `verbAcceptsScopeDir`, so the override is refused rather than accepted and
+   discarded.
+6. **`aira VERSION` reported an unknown verb** (P3) — every neighbouring
+   intercept lowercases; this one did not. Now folded via `isVersionSpelling`.
+7. **The daemon half inherited the multi-minute client wait** (P3) — wrong for a
+   read-only "what is running" that an operator types BECAUSE something is
+   wedged. Bounded to 5s, with the timeout reported as the reason.
+8. **A dispatcher-construction failure reported a placeholder** instead of the
+   real cause (P3) — the error is now carried through.
+
+Refuted on verification, and deliberately NOT changed: that `NewReport` should
+fold `vcs.modified` into divergence, and that `Identity.String()` can render
+empty via the daemon-decode path.
+
+The accepted `aira help` gap above stands, but the review disputes its stated
+cost: `install` may be a zero-cost precedent for listing a CLI-intercepted verb.
+Worth checking before the follow-up is sized.

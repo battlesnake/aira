@@ -13,7 +13,11 @@ import (
 // test extracts and RUNS the real expression rather than restating it, so a
 // future edit to the Makefile is exercised instead of silently diverging from a
 // hand-copied duplicate.
-var findExpression = regexp.MustCompile(`find \. -type f -name '\*\.go'(?: -not -path '[^']*')+`)
+// The exclusion group is `*`, not `+`, deliberately: a future target that
+// hand-rolls `find . -type f -name '*.go'` with NO exclusions at all is the
+// worst version of this regression, and a `+` quantifier would not match it, so
+// the guard would stay silent about exactly the case it exists to catch.
+var findExpression = regexp.MustCompile(`find \. -type f -name '\*\.go'(?: -not -path '[^']*')*`)
 
 // TestFmtTargetsDoNotReachIntoNestedAgentWorktrees pins the scope of every
 // gofmt-driving target in the Makefile.
