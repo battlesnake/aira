@@ -185,6 +185,13 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	default:
 		result.Status.Admission = ConfineAdmissionUnevaluated
 	}
+	// AIRA-222. The ci-shim path is where this defect actually bit: a build-time
+	// `aira install --ci=shim` leaves no slice, so a fresh container reports
+	// admission=unevaluated (slice-not-found) and runs ungoverned at exit 0.
+	// --require-admission turns that into a refusal for an unattended caller.
+	if refusal := requireAdmissionRefusal(request, sliceName, result.Status.Admission, admission.reason); refusal != nil {
+		return result, refusal
+	}
 
 	// --- launch -------------------------------------------------------------
 	handshakeRead, handshakeWrite, err := os.Pipe()

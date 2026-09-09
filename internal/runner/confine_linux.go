@@ -722,6 +722,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	default:
 		result.Status.Admission = ConfineAdmissionUnevaluated
 	}
+	// AIRA-222. Fail closed BEFORE launch if the caller required an evaluated
+	// admission and did not get one. defer releaseAdmission() (above) still runs,
+	// so the (possibly nil) lease is released.
+	if refusal := requireAdmissionRefusal(request, sliceName, result.Status.Admission, admission.reason); refusal != nil {
+		return result, refusal
+	}
 	// AIRA-101. Reaching here under --exclusive means a REAL grant: admit()
 	// refuses rather than degrades (see exclusiveRefusal), so there is no path on
 	// which this records exclusivity that was not actually obtained. The facet is
@@ -1984,6 +1990,31 @@ func delegateRAMScopeFallback() int64 {
 
 func confineUnavailable(slice string, err error) error {
 	return fmt.Errorf("E_CONFINE_UNAVAILABLE: slice %s: %w", slice, err)
+}
+
+// requireAdmissionRefusal implements AIRA-222's --require-admission fail-closed
+// gate, shared by the real and ci-shim launch paths. It returns a terminal
+// E_CONFINE_UNAVAILABLE (the same "precondition not met, refuse to launch" class
+// as the uncapped-slice refusal) when the caller opted in and admission could
+// not be evaluated, so the job would run UNGOVERNED. Keyed on the resolved
+// ConfineAdmissionUnevaluated facet the trailer reports, and on `reason` for the
+// specific cause (slice-not-found, daemon-down, ...). Returns nil — launch
+// proceeds — for an admitted job, for a timeout (a distinct rejection, surfaced
+// on its own), and whenever the flag is absent, so ordinary and daemon-restart
+// launches are never touched.
+func requireAdmissionRefusal(request ConfineRequest, slice string, admission ConfineAdmission, reason string) error {
+	if !request.RequireAdmission || admission != ConfineAdmissionUnevaluated {
+		return nil
+	}
+	detail := "memory admission is unevaluated"
+	if reason != "" {
+		detail += " (" + reason + ")"
+	}
+	return confineUnavailable(slice, fmt.Errorf(
+		"%s and --require-admission was set, so this job would run ungoverned; refusing to launch. "+
+			"Ensure the AIRA daemon is reachable and the slice has a finite memory.max "+
+			"(in a container, a RUNTIME `aira install --ci=...`), or drop --require-admission to launch anyway",
+		detail))
 }
 
 func writeConfineOOMGroup(scope Scope) error {

@@ -562,6 +562,15 @@ type ConfineRequest struct {
 	MemoryReserve       int64
 	MemoryReservePinned bool
 	DelegateRAM         bool
+	// AIRA-222. RequireAdmission fails the launch CLOSED when memory admission
+	// could not be evaluated (admission=unevaluated), instead of running the job
+	// UNGOVERNED and exiting 0 — the defect where "governed, slice was empty" and
+	// "not governed at all" shared an exit code, so a mis-provisioned CI host ran
+	// every job ungoverned and looked fine. Opt-in and default false: only a
+	// caller that sets it (CI or anything unattended, where the single stderr
+	// warning has no reader) is refused; ordinary launches, and a transient
+	// daemon-restart window, are unaffected.
+	RequireAdmission bool
 	// AIRA-101. Exclusive asks the daemon to schedule this job ALONE in its slice,
 	// for uncontended benchmarking. Fail-closed end to end: if exclusivity cannot
 	// be established the launch is REFUSED, never silently downgraded, because a
