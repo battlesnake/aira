@@ -485,7 +485,9 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// have learned anything usable within one container's life either way. Recorded
 	// as an accepted residual; peak-rss reads `unevaluated` on the trailer.
 	result.Status.TerminatedBy = classifyConfineTermination(termination, cgroupUsage{}, terminatedBySignal, deadlineKindUnset)
-	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
+	// AIRA-206: see the real path -- prepend \n so the trailer begins its own line
+	// even after a partial (newline-free) last block from the job.
+	_, _ = fmt.Fprintf(diagnostics, "\n%s\n", FormatConfineStatus(result.Status))
 	return result, nil
 }
 
