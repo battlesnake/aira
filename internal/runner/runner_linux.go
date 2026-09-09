@@ -2759,42 +2759,29 @@ func (r *Runner) ReadOutput(ctx context.Context, req OutputRequest) (*OutputChun
 		chunk.ErrorCodes = appendUnique(chunk.ErrorCodes, "U_RUN_OUTPUT_UNAVAILABLE")
 		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", errors.New("captured output is unavailable"))
 	}
-	file, err := os.Open(ref.Path)
-	if err != nil {
+	// AIRA-196. The byte window is the SHARED reader (captured_output.go), so
+	// run-log and confine-log cannot disagree about tail-versus-offset
+	// precedence, what a cap does to the cursor, or whether an offset at EOF is
+	// an empty read. Everything run-specific -- the record, the stream choice,
+	// the output state, the telemetry -- stays here.
+	grep, grepErr := compileCapturedGrep(req.Grep)
+	if grepErr != nil {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", fmt.Errorf("--grep: %w", grepErr))
+	}
+	window, fault, err := readCapturedFile(capturedReadRequest{
+		Path: ref.Path, From: req.From, Tail: req.Tail, MaxBytes: req.MaxBytes, Grep: grep,
+	})
+	switch fault {
+	case capturedFaultArgument:
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", err)
+	case capturedFaultUnavailable:
 		chunk.OutputState = OutputUnavail
 		chunk.ErrorCodes = appendUnique(chunk.ErrorCodes, "U_RUN_OUTPUT_UNAVAILABLE")
 		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
 	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
-	}
-	total := info.Size()
-	start := req.From
-	if req.Tail > 0 && req.From == 0 {
-		start = total - req.Tail
-		if start < 0 {
-			start = 0
-		}
-	}
-	if start > total {
-		return nil, launchErr("E_RUN_ARGUMENT_INVALID", fmt.Errorf("output offset %d exceeds total %d", start, total))
-	}
-	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
-	}
-	limit := total - start
-	if req.MaxBytes > 0 && limit > req.MaxBytes {
-		limit = req.MaxBytes
-		chunk.Truncated = true
-	}
-	data := make([]byte, limit)
-	if _, err := io.ReadFull(file, data); err != nil {
-		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
-	}
-	chunk.Offset, chunk.NextOffset, chunk.TotalBytes, chunk.Bytes = start, start+int64(len(data)), total, data
-	chunk.Truncated = chunk.Truncated || chunk.NextOffset < total
+	chunk.Offset, chunk.NextOffset, chunk.TotalBytes, chunk.Bytes = window.Offset, window.NextOffset, window.TotalBytes, window.Bytes
+	chunk.Truncated = window.Truncated
+	chunk.Filtered, chunk.Grep = window.Filtered, req.Grep
 	chunk.Complete = record.Status.Terminal() && ref.State == OutputComplete && !chunk.Truncated
 	if !record.Status.Terminal() || ref.State != OutputComplete {
 		chunk.OutputState = OutputPartial

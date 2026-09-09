@@ -332,20 +332,31 @@ type OutputRequest struct {
 	Full     bool
 	Follow   bool
 	MaxBytes int64
+	// Grep is an RE2 pattern selecting which LINES of the window come back
+	// (AIRA-196). It never moves the cursor: Offset/NextOffset/TotalBytes keep
+	// describing the underlying file so --from paging still works, and the chunk
+	// reports Filtered so a caller cannot read a filtered body as the whole
+	// window. Empty means no filter at all.
+	Grep string
 }
 
 // OutputChunk is deliberately byte-oriented. encoding/json base64-encodes
 // Bytes, so the same object is safe for arbitrary output over MCP.
 type OutputChunk struct {
-	RunID       string      `json:"run_id"`
-	Stream      string      `json:"stream"`
-	Encoding    string      `json:"encoding"`
-	Offset      int64       `json:"offset"`
-	NextOffset  int64       `json:"next_offset"`
-	TotalBytes  int64       `json:"total_bytes"`
-	Bytes       []byte      `json:"bytes"`
-	Complete    bool        `json:"complete"`
-	Truncated   bool        `json:"truncated"`
+	RunID      string `json:"run_id"`
+	Stream     string `json:"stream"`
+	Encoding   string `json:"encoding"`
+	Offset     int64  `json:"offset"`
+	NextOffset int64  `json:"next_offset"`
+	TotalBytes int64  `json:"total_bytes"`
+	Bytes      []byte `json:"bytes"`
+	Complete   bool   `json:"complete"`
+	Truncated  bool   `json:"truncated"`
+	// Filtered says Bytes is a SUBSET of the window [Offset,NextOffset): --grep
+	// selected lines from it. Stated rather than inferred, so a caller never has
+	// to notice that len(Bytes) and the cursor delta disagree (AIRA-196).
+	Filtered    bool        `json:"filtered,omitempty"`
+	Grep        string      `json:"grep,omitempty"`
 	OutputState OutputState `json:"output_state"`
 	RunStatus   Status      `json:"run_status"`
 	PeakRSS     *int64      `json:"peak_rss,omitempty"`

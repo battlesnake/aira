@@ -293,6 +293,27 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		request.Args["owner"] = owner
 		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
 	}
+	// AIRA-196. Handled HERE, beside the rest of the confine family and BEFORE
+	// project discovery, for the reason the family shares: a detached confine job
+	// is machine-wide and resolves no project, so routing these through scope
+	// resolution below would make them refuse to run in most directories an
+	// operator is standing in when they want to read a running gate's log.
+	if verb == "confine-log" || verb == "confine-input" {
+		request, requestErr := buildRequest(verb, positional, options)
+		if requestErr != nil {
+			code := store.ErrorCode(requestErr)
+			if code == "E_INTERNAL" {
+				code = "E_CONFINE_ARGUMENT_INVALID"
+			}
+			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		}
+		owner, ownerErr := resolveConfineOwner(context.Background(), options["owner"])
+		if ownerErr != nil {
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		}
+		request.Args["owner"] = owner
+		return dispatchConfineJobIORequest(context.Background(), request, jsonOutput, stdin, stdout, stderr, injected)
+	}
 	if verb == "eject" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
@@ -694,7 +715,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && verb == "run-input") || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
+		if name == "rebuild" || name == "steal" || name == "strict" || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
 			options[name] = "true"
 			continue
 		}
@@ -766,12 +787,17 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"git":            {},
 		"run-kill":       {"steal": true},
 		"run-input":      {"close": true, "steal": true},
-		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
+		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
 		"confine-list":   {"slice": true, "owner": true},
 		"confine-budget": {"slice": true, "owner": true},
 		"confine-kill":   {"steal": true, "slice": true, "owner": true},
-		"watch":          {"from": true, "from-start": true, "verb": true},
-		"gate":           {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
+		// AIRA-196. No --slice on either: both address a job through the durable
+		// record store, never a cgroup slice, and an accepted-and-ignored --slice
+		// is exactly the silently discarded scope AIRA-82 refuses.
+		"confine-log":   {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true, "owner": true},
+		"confine-input": {"close": true, "steal": true, "owner": true},
+		"watch":         {"from": true, "from-start": true, "verb": true},
+		"gate":          {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -849,7 +875,9 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 		// AIRA-182 moved both branches' vocabularies out to
 		// confineLaunchValuelessOptions / confineLaunchValuedOptions so the
 		// did-you-mean suggestion below reads the SAME list this check reads. The
-		// membership tests are otherwise exactly what they were.
+		// membership tests are otherwise exactly what they were. AIRA-196 adds
+		// --stdin-connect to the valueless list there; it is refused below unless
+		// --detach is also present.
 		if confineLaunchOptionValueless(name) {
 			if _, exists := options[name]; exists {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
@@ -880,6 +908,13 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	target := append([]string(nil), argv[delimiter+1:]...)
 	if len(target) == 0 || target[0] == "" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine target argv is empty")
+	}
+	// AIRA-196. --stdin-connect is meaningful ONLY when detached: a foreground
+	// confine already passes the caller's own stdin straight through, so there is
+	// nothing for a socket to add and accepting the flag there would be a request
+	// silently discarded. Refused here, synchronously, rather than ignored.
+	if options["stdin-connect"] == "true" && options["detach"] != "true" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --stdin-connect requires --detach; a foreground confine already reads the caller's own stdin")
 	}
 	if _, _, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID"); err != nil {
 		return nil, nil, err
@@ -1357,8 +1392,11 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
 		Owner:         owner,
 		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
-		DelegateRAM:    options["delegate-ram"] == "true",
-		Exclusive:      options["exclusive"] == "true",
+		DelegateRAM: options["delegate-ram"] == "true",
+		Exclusive:   options["exclusive"] == "true",
+		// AIRA-196. Transcribed, never inferred: with the flag absent this stays
+		// false and the detached job's stdin is /dev/null, exactly as before.
+		StdinConnect:   options["stdin-connect"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		AdmissionMaxWait: admitTimeout,
 		Timeout:          jobTimeout, CPUTimeout: jobCPUTimeout,
@@ -2129,6 +2167,64 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 	return render(response, jsonOutput, stdout, stderr)
 }
 
+// dispatchConfineJobIORequest runs `confine-log` / `confine-input` (AIRA-196).
+//
+// It is separate from dispatchConfineManagementRequest for two reasons that are
+// not cosmetic: neither verb takes a --slice to resolve, and confine-input needs
+// the caller's REAL stdin (management passes nil), which is where the bytes come
+// from when no --data was given.
+func dispatchConfineJobIORequest(ctx context.Context, request core.Request, jsonOutput bool, stdin io.Reader, stdout, stderr io.Writer, injected Dispatcher) int {
+	dispatcher := injected
+	if dispatcher == nil {
+		production, err := newDaemonDispatcher(stdin, stdout, stderr, jsonOutput)
+		if err != nil {
+			return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+		}
+		// The CLI's stdin IS the operator's bytes, so confine-input may forward
+		// it. Set here rather than in the constructor because the MCP face shares
+		// that constructor and hands it the JSON-RPC protocol stream instead.
+		production.stdinCarriesJobInput = true
+		dispatcher = production
+	}
+	response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, request)
+	// Byte-transparent by default, exactly like run-log: the captured bytes go to
+	// stdout unaltered and the metadata to stderr as one JSON line, which is what
+	// a piping consumer wants. --json switches to the enveloped form.
+	if request.Verb == "confine-log" && !jsonOutput {
+		return renderConfineLog(response, stdout, stderr)
+	}
+	return render(response, jsonOutput, stdout, stderr)
+}
+
+// renderConfineLog mirrors renderRunLog. The metadata line is written even for a
+// filtered or truncated read -- especially then: `filtered` and `truncated` are
+// how a caller knows the bytes on stdout are not the whole story.
+func renderConfineLog(response core.Response, stdout, stderr io.Writer) int {
+	if chunk, ok := response.Data.(*runner.ConfineLogChunk); ok && chunk != nil {
+		_, _ = stdout.Write(chunk.Bytes)
+		metadata := map[string]any{
+			"scope_id": chunk.ScopeID, "name": chunk.Name, "owner": chunk.Owner,
+			"stream": chunk.Stream, "path": chunk.Path, "offset": chunk.Offset,
+			"next_offset": chunk.NextOffset, "total_bytes": chunk.TotalBytes,
+			"complete": chunk.Complete, "truncated": chunk.Truncated,
+			"filtered": chunk.Filtered, "grep": chunk.Grep,
+			"state": chunk.State, "reason": chunk.Reason,
+			"exit": chunk.Exit, "error_code": chunk.ErrorCode,
+		}
+		data, _ := json.Marshal(metadata)
+		_, _ = fmt.Fprintln(stderr, string(data))
+	} else if response.Error != "" {
+		_, _ = fmt.Fprintln(stderr, response.Error)
+	}
+	if response.Exit != 0 {
+		return response.Exit
+	}
+	if !response.OK {
+		return exitForError(response.Code)
+	}
+	return 0
+}
+
 func parseGitArgs(argv []string) ([]string, map[string]string, error) {
 	positionals := make([]string, 0, len(argv))
 	boundary := false
@@ -2386,6 +2482,23 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if value, ok := options["memory-high"]; ok {
 			args["memory_high"] = value
 		}
+	case "confine-log":
+		if len(positional) != 1 || positional[0] == "" {
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-log requires one selector: a detached confine name, supervisor pid, or scope id")
+		}
+		args["selector"] = positional[0]
+		args["stream"], args["from"], args["tail"] = options["stream"], options["from"], options["tail"]
+		args["follow"] = options["follow"] == "true"
+		args["full"] = options["full"] == "true"
+		args["grep"], args["owner"] = options["grep"], options["owner"]
+	case "confine-input":
+		if len(positional) != 1 || positional[0] == "" {
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-input requires one selector: a detached confine name, supervisor pid, or scope id")
+		}
+		args["selector"] = positional[0]
+		args["close"] = options["close"] == "true"
+		args["steal"] = options["steal"] == "true"
+		args["owner"] = options["owner"]
 	case "confine-list":
 		if len(positional) != 0 {
 			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-list accepts no selector")
@@ -2491,6 +2604,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["from"] = options["from"]
 		args["tail"] = options["tail"]
 		args["full"] = options["full"] == "true"
+		args["grep"] = options["grep"]
 	case "watch":
 		if len(positional) > 1 {
 			return core.Request{}, fmt.Errorf("watch accepts at most one selector")

@@ -33,102 +33,120 @@ func (r *Runner) Input(ctx context.Context, request RunInputRequest) (*RunInputR
 	// slot is released asynchronously by the previous handler — so a fast
 	// sequential reconnect can transiently race it. A genuinely busy run keeps
 	// returning BUSY and is reported honestly after the bounded budget.
-	conn, err := r.connectRunInput(ctx, path, request)
+	conn, err := dialRunInput(ctx, path, r.owner, request.Steal, r.inputDialFn)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
-	result := &RunInputResult{RunID: request.RunID}
+	accepted, closed, streamErr := streamRunInput(conn, request.Reader, request.Close)
+	return &RunInputResult{RunID: request.RunID, Accepted: accepted, Closed: closed}, streamErr
+}
+
+// streamRunInput writes a caller's bytes onto an already-handshaken connection
+// and, if asked, closes the child's stdin. It is deliberately free of any run or
+// confine identity: `run-input` and `confine-input` speak the SAME framed
+// protocol to the SAME server (runInputPlane), so AIRA-196 shares this loop
+// rather than copying it -- two copies would be free to drift on exactly the
+// delivery-ambiguity classifications below, which are the whole reason the
+// protocol acknowledges every frame.
+//
+// It returns what was ACCEPTED even when it also returns an error: a partial
+// delivery is a fact the caller must report, never something to discard.
+func streamRunInput(conn net.Conn, reader io.Reader, closeStdin bool) (int64, bool, error) {
+	var accepted int64
 	buf := make([]byte, MaxRunInputFrameBytes)
-	for request.Reader != nil {
-		n, readErr := request.Reader.Read(buf)
+	for reader != nil {
+		n, readErr := reader.Read(buf)
 		if n > 0 {
-			before := result.Accepted
+			before := accepted
 			if err := writeRunInputFrame(conn, runInputOpData, buf[:n]); err != nil {
-				return result, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: result.Accepted, Err: err}
+				return accepted, false, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: accepted, Err: err}
 			}
-			ack, ackErr := readRunInputResponse(conn, result.Accepted)
+			ack, ackErr := readRunInputResponse(conn, accepted)
 			if ackErr != nil {
 				var inputErr *RunInputError
-				if errors.As(ackErr, &inputErr) && inputErr.Code == "E_RUN_INPUT_CLOSED" && inputErr.Committed > 0 && inputErr.Committed < result.Accepted+int64(n) {
+				if errors.As(ackErr, &inputErr) && inputErr.Code == "E_RUN_INPUT_CLOSED" && inputErr.Committed > 0 && inputErr.Committed < accepted+int64(n) {
 					inputErr.Code = "E_RUN_INPUT_PARTIAL"
 				}
-				return result, ackErr
+				return accepted, false, ackErr
 			}
 			if ack < before || ack > before+int64(n) {
-				return result, runInputProtocolError("ACK count is outside the sent range")
+				return accepted, false, runInputProtocolError("ACK count is outside the sent range")
 			}
-			result.Accepted = ack
+			accepted = ack
 			if ack != before+int64(n) {
-				return result, runInputProtocolError("short DATA ACK")
+				return accepted, false, runInputProtocolError("short DATA ACK")
 			}
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			return result, readErr
+			return accepted, false, readErr
 		}
 		if n == 0 {
 			continue
 		}
 	}
 
-	if request.Close {
+	if closeStdin {
 		if err := writeRunInputFrame(conn, runInputOpClose, nil); err != nil {
-			return result, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: result.Accepted, Err: err}
+			return accepted, false, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: accepted, Err: err}
 		}
-		ack, ackErr := readRunInputResponse(conn, result.Accepted)
+		ack, ackErr := readRunInputResponse(conn, accepted)
 		if ackErr != nil {
-			return result, ackErr
+			return accepted, false, ackErr
 		}
-		if ack != result.Accepted {
-			return result, runInputProtocolError("CLOSE ACK count changed")
+		if ack != accepted {
+			return accepted, false, runInputProtocolError("CLOSE ACK count changed")
 		}
-		result.Closed = true
-		return result, nil
+		return accepted, true, nil
 	}
 
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
 		if closer, closeOK := conn.(interface{ CloseWrite() error }); closeOK {
 			if err := closer.CloseWrite(); err != nil {
-				return result, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: result.Accepted, Err: err}
+				return accepted, false, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: accepted, Err: err}
 			}
 		} else {
-			return result, runInputProtocolError("connection does not support CloseWrite")
+			return accepted, false, runInputProtocolError("connection does not support CloseWrite")
 		}
 	} else if err := unixConn.CloseWrite(); err != nil {
-		return result, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: result.Accepted, Err: err}
+		return accepted, false, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Committed: accepted, Err: err}
 	}
-	ack, err := readRunInputResponse(conn, result.Accepted)
+	ack, err := readRunInputResponse(conn, accepted)
 	if err != nil {
 		var inputErr *RunInputError
 		if errors.As(err, &inputErr) && inputErr.Code == "E_RUN_INPUT_PROTOCOL" && errors.Is(inputErr.Err, io.EOF) {
 			inputErr.Code = "E_RUN_INPUT_OUTCOME_UNKNOWN"
-			inputErr.Committed = result.Accepted
+			inputErr.Committed = accepted
 		}
-		return result, err
+		return accepted, false, err
 	}
-	if ack != result.Accepted {
-		return result, runInputProtocolError("final ACK count changed")
+	if ack != accepted {
+		return accepted, false, runInputProtocolError("final ACK count changed")
 	}
-	return result, nil
+	return accepted, false, nil
 }
 
-// connectRunInput dials and completes the HELLO handshake, retrying ONLY on
+// dialRunInput dials and completes the HELLO handshake, retrying ONLY on
 // E_RUN_INPUT_BUSY within a bounded budget. On success it returns a connection
 // whose HELLO has been acknowledged (zero-committed), ready to stream.
-func (r *Runner) connectRunInput(ctx context.Context, path string, request RunInputRequest) (net.Conn, error) {
-	dial := r.inputDialFn
+//
+// It takes the owner and the dial seam as ARGUMENTS rather than reading them off
+// a Runner, so `confine-input` -- which has no Runner and no run ledger, only a
+// durable confine record naming a socket -- reaches the same handshake, the same
+// bounded BUSY retry, and the same refusal codes (AIRA-196).
+func dialRunInput(ctx context.Context, path, owner string, steal bool, dial func(context.Context, string) (net.Conn, error)) (net.Conn, error) {
 	if dial == nil {
 		dialer := &net.Dialer{Timeout: runInputDialTimeout}
 		dial = func(ctx context.Context, path string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "unix", path)
 		}
 	}
-	hello, err := encodeRunInputJSON(runInputHello{Owner: r.owner, Steal: request.Steal})
+	hello, err := encodeRunInputJSON(runInputHello{Owner: owner, Steal: steal})
 	if err != nil {
 		return nil, err
 	}

@@ -141,6 +141,13 @@ func TestAIRA138ConfineFaceParity(t *testing.T) {
 		if arg.Name == "memory_high" {
 			argv = append(argv, "--memory-max", "2m")
 		}
+		// AIRA-196. --stdin-connect is refused without --detach by design (a
+		// foreground confine already reads the caller's own stdin), so it is
+		// offered with the companion its own rule demands -- the same carve-out
+		// --memory-high has, and for the same reason.
+		if arg.Name == "stdin_connect" {
+			argv = append(argv, "--detach")
+		}
 		argv = append(argv, "--", "true")
 		if _, _, err := parseArgs("confine", argv); err != nil {
 			t.Fatalf("the core table declares %q but the CLI refuses %s: %v", arg.Name, flag, err)

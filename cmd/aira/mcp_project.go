@@ -54,6 +54,21 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 			// Eject is a machine-level daemon operation; its safety checks are
 			// performed by the daemon and it has no project scope to discover.
 			scope = daemon.WorktreeScope{}
+		} else if canonical == "confine-log" || canonical == "confine-input" {
+			// AIRA-196. A detached confine job lives in a machine-wide record store
+			// and resolves no project, like the rest of the family. Neither verb
+			// takes a --slice, so unlike confine-list/kill there is none to resolve;
+			// only the owner is, and it is what scopes a name selector.
+			scope = daemon.WorktreeScope{}
+			owner, ownerErr := resolveConfineOwner(requestContext, stringRequestArg(request.Args, "owner"))
+			if ownerErr != nil {
+				scopeErr = fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %w", ownerErr)
+			} else {
+				if request.Args == nil {
+					request.Args = map[string]any{}
+				}
+				request.Args["owner"] = owner
+			}
 		} else if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" {
 			// Confine management is machine-local and project-less. Ownership,
 			// destructive confirmation, and populated-gate checks remain in the

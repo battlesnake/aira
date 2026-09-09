@@ -653,8 +653,9 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 		}
 		found = true
 		// AIRA-138 adds --timeout and --cpu-timeout to the usage line, beside the
-		// --admit-timeout they must never be confused with.
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] -- <argv...>" {
+		// --admit-timeout they must never be confused with. AIRA-196 adds
+		// --stdin-connect, which is meaningful only with --detach.
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] [--stdin-connect] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

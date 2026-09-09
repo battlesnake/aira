@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,6 +50,15 @@ type daemonDispatcher struct {
 	resolveConfineSlice func(string) (string, string, error)
 	listConfines        func(context.Context, string, []runner.ConfineRegistryEntry) (runner.ConfineListResult, error)
 	killConfine         func(context.Context, string, string, string, bool, []runner.ConfineRegistryEntry) (runner.ConfineKillResult, error)
+	// AIRA-196 seams. Nil in production.
+	readConfineLog func(context.Context, string, runner.ConfineLogRequest) (*runner.ConfineLogChunk, error)
+	confineInput   func(context.Context, string, runner.ConfineInputRequest) (*runner.ConfineInputResult, error)
+	// stdinCarriesJobInput says this dispatcher's stdin is a HUMAN/PIPE stream
+	// that `confine-input` may forward into a job. It is false by default and
+	// set only by the CLI path, because the MCP face hands this same field its
+	// JSON-RPC PROTOCOL stream -- forwarding that into a confined job would feed
+	// the job the transport and desynchronise the session.
+	stdinCarriesJobInput bool
 }
 
 type childResult struct {
@@ -130,6 +141,18 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	request.Verb = canonical
 	if canonical == "confine-list" || canonical == "confine-kill" {
 		return d.dispatchConfineManagement(ctx, request)
+	}
+	// AIRA-196. Answered entirely in THIS process, with no daemon exchange at
+	// all. confine-log reads the durable record store plus one captured file --
+	// the same store `confine --status` reads, and for the same AIRA-22 reason: a
+	// survivability verb must not depend on the component most likely to have
+	// been restarted during the long pause it exists to survive. confine-input
+	// dials the job's own supervisor, so the daemon is not on that path either.
+	if canonical == "confine-log" {
+		return d.dispatchConfineLog(ctx, request)
+	}
+	if canonical == "confine-input" {
+		return d.dispatchConfineInput(ctx, request)
 	}
 	if canonical == "eject" {
 		frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
@@ -235,6 +258,162 @@ func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, reques
 		return confineClientError(killErr)
 	}
 	return core.Response{OK: true, Code: "OK", Data: result}
+}
+
+// dispatchConfineLog answers `aira confine-log` (AIRA-196) with NO daemon
+// exchange: see Dispatch's comment. The observation cap is the face's own
+// (mcpOutputCap for MCP, unbounded for the CLI), which is also what stops a
+// --follow from parking an MCP request for the life of the job.
+func (d *daemonDispatcher) dispatchConfineLog(ctx context.Context, request core.Request) core.Response {
+	owner, _ := request.Args["owner"].(string)
+	if err := runner.ValidateConfineOwner(owner); err != nil {
+		return confineClientError(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err))
+	}
+	from, fromErr := nonNegativeRequestInt(request.Args, "from")
+	if fromErr != nil {
+		return confineClientError(fromErr)
+	}
+	tail, tailErr := nonNegativeRequestInt(request.Args, "tail")
+	if tailErr != nil {
+		return confineClientError(tailErr)
+	}
+	read := d.readConfineLog
+	if read == nil {
+		read = runner.ReadConfineLog
+	}
+	chunk, readErr := read(ctx, d.paths.ConfineDetachDir, runner.ConfineLogRequest{
+		Selector: stringRequestArg(request.Args, "selector"),
+		Owner:    owner,
+		Stream:   stringRequestArg(request.Args, "stream"),
+		From:     from,
+		Tail:     tail,
+		Full:     boolRequestArg(request.Args, "full"),
+		Follow:   boolRequestArg(request.Args, "follow"),
+		Grep:     stringRequestArg(request.Args, "grep"),
+		MaxBytes: d.outputCap,
+	})
+	if readErr != nil {
+		return confineClientError(readErr)
+	}
+	return core.Response{OK: true, Code: "OK", Data: chunk}
+}
+
+// dispatchConfineInput answers `aira confine-input` (AIRA-196).
+//
+// A refusal still carries what was ACCEPTED. A partial delivery is the one
+// outcome an operator must not have to guess at, so the byte count travels with
+// the error rather than being discarded with it -- exactly as `run-input`'s own
+// handler does.
+func (d *daemonDispatcher) dispatchConfineInput(ctx context.Context, request core.Request) core.Response {
+	owner, _ := request.Args["owner"].(string)
+	if err := runner.ValidateConfineOwner(owner); err != nil {
+		return confineClientError(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err))
+	}
+	selector := stringRequestArg(request.Args, "selector")
+	inputRequest := runner.ConfineInputRequest{
+		Selector: selector,
+		Owner:    owner,
+		Close:    boolRequestArg(request.Args, "close"),
+		Steal:    boolRequestArg(request.Args, "steal"),
+	}
+	if encoded, present := request.Args["data"]; present {
+		text, _ := encoded.(string)
+		if text != "" {
+			data, decodeErr := decodeRunInputPayload(text)
+			if decodeErr != nil {
+				return confineClientError(decodeErr)
+			}
+			inputRequest.Reader = bytes.NewReader(data)
+		}
+	} else if d.stdinCarriesJobInput {
+		// ONLY the CLI face's stdin is a job-input source. This dispatcher's stdin
+		// is also the MCP face's JSON-RPC PROTOCOL stream, and streaming that into
+		// a confined job's stdin would feed it the transport and desynchronise the
+		// session -- so an MCP caller that names no `data` gets the refusal below
+		// rather than a silent, catastrophic read of the wrong pipe.
+		inputRequest.Reader = d.stdin
+	}
+	if inputRequest.Reader == nil && !inputRequest.Close {
+		return confineClientError(errors.New(
+			"E_CONFINE_ARGUMENT_INVALID: confine-input requires bytes to send or --close (over MCP, pass base64 `data`; on the CLI, pipe them in)"))
+	}
+	inject := d.confineInput
+	if inject == nil {
+		inject = runner.ConfineInput
+	}
+	result, inputErr := inject(ctx, d.paths.ConfineDetachDir, inputRequest)
+	if inputErr != nil {
+		response := confineClientError(inputErr)
+		// Before the selector resolves there is no scope id, and echoing the
+		// SELECTOR into that field would be a fabrication -- a name is not a scope
+		// id. It stays empty; the error text carries the selector.
+		accepted, closed, scopeID := int64(0), false, ""
+		if result != nil {
+			accepted, closed, scopeID = result.Accepted, result.Closed, result.ScopeID
+		}
+		response.Data = map[string]any{"scope_id": scopeID, "accepted": accepted, "closed": closed}
+		return response
+	}
+	return core.Response{OK: true, Code: "OK", Data: result}
+}
+
+// decodeRunInputPayload decodes an MCP `data` argument for either input verb.
+// The size is checked on BOTH the encoded and decoded forms so an oversized
+// payload is refused before it is materialised.
+func decodeRunInputPayload(encoded string) ([]byte, error) {
+	if len(encoded) > base64.StdEncoding.EncodedLen(runner.MaxRunInputFrameBytes) {
+		return nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-input data exceeds the maximum frame size")
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-input data must be valid base64")
+	}
+	if len(data) > runner.MaxRunInputFrameBytes {
+		return nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-input data exceeds the maximum frame size")
+	}
+	return data, nil
+}
+
+func boolRequestArg(args map[string]any, name string) bool {
+	value, _ := args[name].(bool)
+	return value
+}
+
+// nonNegativeRequestInt reads a --from/--tail argument. The CLI carries them as
+// strings and MCP may carry a JSON number, so both are accepted; anything else,
+// and anything negative, is an argument error rather than a silent zero (which
+// would quietly read from the start of a file the caller meant to page).
+func nonNegativeRequestInt(args map[string]any, name string) (int64, error) {
+	switch value := args[name].(type) {
+	case nil:
+		return 0, nil
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return 0, nil
+		}
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed < 0 {
+			return 0, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s must be a non-negative integer", name)
+		}
+		return parsed, nil
+	case float64:
+		if value < 0 || value != float64(int64(value)) {
+			return 0, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s must be a non-negative integer", name)
+		}
+		return int64(value), nil
+	case int64:
+		if value < 0 {
+			return 0, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s must be a non-negative integer", name)
+		}
+		return value, nil
+	case int:
+		if value < 0 {
+			return 0, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s must be a non-negative integer", name)
+		}
+		return int64(value), nil
+	default:
+		return 0, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s must be a non-negative integer", name)
+	}
 }
 
 func confineClientError(err error) core.Response {

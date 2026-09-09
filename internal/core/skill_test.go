@@ -17,8 +17,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 75 {
-		t.Fatalf("actions=%d, want 75", len(artifacts.Actions))
+	if len(artifacts.Actions) != 77 {
+		t.Fatalf("actions=%d, want 77", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -64,6 +64,15 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		"NOT when the job succeeded",
 		"aira confine --status",
 		"outcome-unknown",
+		// AIRA-196. An agent that does not know these exist goes back to reading
+		// the capture file by path, which is the token-expensive thing the verbs
+		// were added to replace -- and the stdin sentence must keep saying
+		// /dev/null is the DEFAULT, not the only option.
+		"aira confine-log",
+		"--grep PATTERN",
+		"`/dev/null` BY DEFAULT",
+		"aira confine --detach --stdin-connect",
+		"aira confine-input",
 	} {
 		if !strings.Contains(skill, want) {
 			t.Fatalf("SKILL.md missing mandate/opt-in prose: %q", want)
@@ -167,6 +176,10 @@ func TestSkillSafetyGolden(t *testing.T) {
 		// AIRA-176. The asymmetry is the point: register is the only writer of a
 		// binding, audit writes nothing at all and must stay SafetyRead.
 		"worktree-register": SafetyMutate, "worktree-audit": SafetyRead,
+		// AIRA-196. Unlike confine/confine-status these ARE generated actions:
+		// reading a captured file and writing to a job's stdin socket both have
+		// honest request/response forms.
+		"confine-log": SafetyRead, "confine-input": SafetyExecute,
 		"time": SafetyExecute, "commands/ls": SafetyRead, "commands/count": SafetyRead,
 		"git/clone": SafetyExecute, "git/fetch": SafetyExecute, "git/push": SafetyExecute, "git/ls-remote": SafetyExecute,
 		"find/add": SafetyMutate, "find/ls": SafetyRead, "find/show": SafetyRead, "find/set": SafetyMutate,

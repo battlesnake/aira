@@ -34,7 +34,7 @@ var (
 		"memory-reserve", "memory-max", "memory-high",
 		"admit-timeout", "timeout", "cpu-timeout",
 	}
-	confineLaunchValuelessOptions = []string{"delegate-ram", "detach", "exclusive"}
+	confineLaunchValuelessOptions = []string{"delegate-ram", "detach", "exclusive", "stdin-connect"}
 )
 
 // confineLaunchOptionNames is the whole launch vocabulary, valued options first.

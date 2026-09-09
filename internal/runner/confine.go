@@ -610,6 +610,22 @@ type ConfineRequest struct {
 	// transcribes RuntimeDir and AdmitSocketPath.
 	DetachStateDir string
 
+	// StdinConnect asks a DETACHED supervisor to give its job a real stdin --
+	// one end of a pipe fed by a per-job socket -- instead of /dev/null, so
+	// `aira confine-input` can write to it (AIRA-196).
+	//
+	// It defaults to FALSE and must stay that way. A live pipe on the stdin of a
+	// job that never expected input is a new hang class: anything that reads
+	// stdin (a prompt, a `read`, a tool probing for a terminal) blocks forever
+	// waiting for a writer that will never connect, where /dev/null returns EOF
+	// immediately. Nothing here infers the flag; the launcher asks for it
+	// explicitly or the job gets /dev/null.
+	//
+	// It is meaningful ONLY on the detached path. A foreground `aira confine`
+	// already passes the caller's own stdin through, so the CLI refuses the flag
+	// there rather than accepting and ignoring it.
+	StdinConnect bool
+
 	// There is deliberately NO `Detach bool` here. admitConfine transcribes
 	// ConfineRequest fields onto a runner.Request, and Request.Detach arms
 	// checkDetachAdmission, which dereferences r.ledger -- nil in confine's
