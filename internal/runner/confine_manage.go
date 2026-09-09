@@ -312,6 +312,26 @@ type ConfineSliceReserve struct {
 	GrantedBytes int64 `json:"granted_bytes"`
 	CeilingBytes int64 `json:"ceiling_bytes"`
 	Jobs         int   `json:"jobs"`
+	// GrantedEstablished is the honesty bit for the ledger-derived numbers on
+	// this struct (AIRA-220): GrantedBytes, Jobs, and the population split
+	// (ScopeJobs/ScopeBytes, ReservationJobs/ReservationBytes,
+	// AdoptedJobs/AdoptedBytes) are meaningful ONLY when it is true. Its precise
+	// meaning: a queue (ledger) object exists for the slice — its adopted half is
+	// as fresh as the last successful cgroup scan. It is false whenever the daemon
+	// holds no queue object at all, which is NOT only a fresh/restarted daemon
+	// before its first admission: a queue exists only while something is
+	// connection-held, so pruneAdmitQueue deletes it (adopted ledger included) the
+	// moment the last waiter releases. So a slice with live ADOPTED jobs but
+	// nothing connection-held right now also reads false. A false bit must render
+	// as `unevaluated`, never as a `0B granted / 0 admitted jobs` that reads "the
+	// slice is empty, launch freely" while jobs are in fact live. Known accepted
+	// gaps a true bit does NOT rule out (documented, not machined away per the
+	// simplicity rule): a failed adopted scan leaves a stale/zero adopted figure
+	// with present still true (the `slice scope caps: unevaluated` line beside it
+	// signals the scan failure), and a sub-millisecond window between queue
+	// registration and the first adoption scan. CeilingBytes is an independent
+	// memory read and stays valid regardless of this bit.
+	GrantedEstablished bool `json:"granted_established"`
 	// Queued and FreezePhase answer "what is stuck, and why" for the admission
 	// queue. Root-causing AIRA-59 required source reading precisely because
 	// `confine --list` reported only ADMITTED jobs: nothing surfaced waiters that

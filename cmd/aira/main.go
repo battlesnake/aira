@@ -3371,10 +3371,19 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 				result.SliceReserve.Containment,
 				runner.DescribeShimBudgetSource(result.SliceReserve.BudgetSource))
 		}
-		_, _ = fmt.Fprintf(stdout, "slice reserve: %s granted / %s ceiling across %d admitted %s%s\n",
-			formatReserveBytes(result.SliceReserve.GrantedBytes),
-			formatReserveBytes(result.SliceReserve.CeilingBytes),
-			result.SliceReserve.Jobs, jobLabel, containment)
+		if result.SliceReserve.GrantedEstablished {
+			_, _ = fmt.Fprintf(stdout, "slice reserve: %s granted / %s ceiling across %d admitted %s%s\n",
+				formatReserveBytes(result.SliceReserve.GrantedBytes),
+				formatReserveBytes(result.SliceReserve.CeilingBytes),
+				result.SliceReserve.Jobs, jobLabel, containment)
+		} else {
+			// AIRA-220. The daemon holds no ledger for this slice yet, so the
+			// granted total and job count are unestablished; report them as such
+			// rather than as a fabricated empty slice. The ceiling is an
+			// independent read and is still shown when it was established.
+			_, _ = fmt.Fprintf(stdout, "slice reserve: unevaluated (no admission ledger) / %s ceiling%s\n",
+				formatReserveBytes(result.SliceReserve.CeilingBytes), containment)
+		}
 		// AIRA-114. The aggregate over-subscription bound, printed only when the
 		// bound is switched ON (a zero limit is an absence, never a limit of zero).
 		// It explains a wait the reserve summary above cannot: since AIRA-29 the
@@ -3432,15 +3441,22 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		// AIRA-68. The job count above spans three populations and the table above
 		// THAT lists only scopes, so the two are not comparable — reading them
 		// against each other is what produced a P0 that did not exist. Printed
-		// unconditionally, including the zeros, so "no scope-less reservations" is
-		// a stated fact rather than an absence the reader has to interpret.
-		_, _ = fmt.Fprintf(stdout, "  of which: %d confine %s %s, %d scope-less %s %s, %d adopted %s %s\n",
-			result.SliceReserve.ScopeJobs, confinePlural(result.SliceReserve.ScopeJobs, "scope", "scopes"),
-			formatReserveBytes(result.SliceReserve.ScopeBytes),
-			result.SliceReserve.ReservationJobs, confinePlural(result.SliceReserve.ReservationJobs, "reservation", "reservations"),
-			formatReserveBytes(result.SliceReserve.ReservationBytes),
-			result.SliceReserve.AdoptedJobs, confinePlural(result.SliceReserve.AdoptedJobs, "scope", "scopes"),
-			formatReserveBytes(result.SliceReserve.AdoptedBytes))
+		// with the zeros when the ledger IS established, so "no scope-less
+		// reservations" is a stated fact rather than an absence the reader has to
+		// interpret. AIRA-220: when the ledger is NOT established the split is the
+		// SAME fabricated zeros as the headline (the "0 adopted scopes" the ticket
+		// names as the AIRA-105 misreading), so it reads unevaluated in lockstep.
+		if result.SliceReserve.GrantedEstablished {
+			_, _ = fmt.Fprintf(stdout, "  of which: %d confine %s %s, %d scope-less %s %s, %d adopted %s %s\n",
+				result.SliceReserve.ScopeJobs, confinePlural(result.SliceReserve.ScopeJobs, "scope", "scopes"),
+				formatReserveBytes(result.SliceReserve.ScopeBytes),
+				result.SliceReserve.ReservationJobs, confinePlural(result.SliceReserve.ReservationJobs, "reservation", "reservations"),
+				formatReserveBytes(result.SliceReserve.ReservationBytes),
+				result.SliceReserve.AdoptedJobs, confinePlural(result.SliceReserve.AdoptedJobs, "scope", "scopes"),
+				formatReserveBytes(result.SliceReserve.AdoptedBytes))
+		} else {
+			_, _ = fmt.Fprintln(stdout, "  of which: unevaluated (no admission ledger)")
+		}
 		if result.SliceReserve.ReservationJobs > 0 {
 			_, _ = fmt.Fprintln(stdout, "  (a scope-less reservation has no cgroup scope, so it never appears in the table above)")
 			// AIRA-108. NAME them. The aggregate line above was AIRA-68's answer to

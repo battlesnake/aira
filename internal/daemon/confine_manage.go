@@ -202,6 +202,16 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 			queued, freezePhase := snapshot.queued, snapshot.phase
 			result.SliceReserve = &runner.ConfineSliceReserve{
 				GrantedBytes: addClamp(outstanding, adopted),
+				// AIRA-220. present is false when no queue object exists for the
+				// slice, i.e. the daemon holds no admission ledger: a
+				// fresh/restarted daemon before its first admission, OR any slice
+				// with nothing connection-held right now (pruneAdmitQueue deletes
+				// the queue, adopted ledger included, on the last release — so even
+				// a slice with live adopted jobs reads false between connections).
+				// The granted total, job count and population split below are then
+				// fabricated zeros and must be reported unevaluated, not as a
+				// confident empty slice.
+				GrantedEstablished: snapshot.present,
 				// Ceiling is what one MORE job would face; scale headroom by the
 				// TOTAL admitted jobs (outstanding + adopted) so it stays consistent
 				// with the Jobs shown, not just the connection-held ones.

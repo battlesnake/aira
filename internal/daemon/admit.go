@@ -1563,9 +1563,16 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	queue := s.admitQueues[path]
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
-		// An absent queue is a genuine idle zero, not an unevaluated read: a queue
-		// exists only while it has waiters, so its absence positively establishes
-		// that nothing is waiting. Callers must not render this as "unknown".
+		// An absent queue positively establishes that nothing is WAITING and that
+		// there is no exclusive holder — the diagnostics half (queued/phase) is a
+		// genuine idle zero and callers render it as such. But it says NOTHING
+		// about the granted/adopted LEDGER: AIRA-29 adoption of already-running
+		// jobs happens only inside evaluateAdmitQueue, and pruneAdmitQueue deletes
+		// the queue (adopted ledger included) once nothing is connection-held, so
+		// an absent queue is exactly "the ledger was never built or has been
+		// pruned". present stays false here precisely so a caller reports the
+		// granted pair unevaluated rather than as a fabricated empty slice
+		// (AIRA-220). CeilingBytes is an independent memory read and is unaffected.
 		return admitSnapshot{phase: phase}
 	}
 	queue.mu.Lock()

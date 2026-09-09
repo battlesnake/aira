@@ -358,7 +358,7 @@ func queueNoteFor(t *testing.T, clientReserve int64, reserve *ConfineSliceReserv
 func TestConfineQueueNoteNamesTheReserveHeldByAdmittedJobs(t *testing.T) {
 	note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
 		Queued: 9, QueuePosition: 1, QueuedAheadBytes: 0,
-		GrantedBytes: 52 << 30, Jobs: 9, CeilingBytes: 64 << 30,
+		GrantedBytes: 52 << 30, Jobs: 9, CeilingBytes: 64 << 30, GrantedEstablished: true,
 	})
 	if !strings.Contains(note, "queue position 1 of 9 by enqueue order, 0B queued ahead") {
 		t.Fatalf("note=%q, want the AIRA-24 queue clause unchanged", note)
@@ -390,7 +390,7 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 		// A negative granted total is a ledger defect, not a reading. Printing
 		// half of a self-contradictory pair is worse than printing none of it.
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
-			Queued: 2, QueuePosition: 1, GrantedBytes: -1, Jobs: 3, CeilingBytes: 64 << 30,
+			Queued: 2, QueuePosition: 1, GrantedBytes: -1, Jobs: 3, CeilingBytes: 64 << 30, GrantedEstablished: true,
 		})
 		if !strings.Contains(note, "queue position 1 of 2") {
 			t.Fatalf("note=%q, the queue clause must survive a bad ledger figure", note)
@@ -401,7 +401,7 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 	})
 	t.Run("negative-job-count", func(t *testing.T) {
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
-			Queued: 2, QueuePosition: 1, GrantedBytes: 8 << 30, Jobs: -2, CeilingBytes: 64 << 30,
+			Queued: 2, QueuePosition: 1, GrantedBytes: 8 << 30, Jobs: -2, CeilingBytes: 64 << 30, GrantedEstablished: true,
 		})
 		if strings.Contains(note, "already granted") {
 			t.Fatalf("note=%q, a negative job count must take the whole pair with it", note)
@@ -412,7 +412,7 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 		// figure with it, and it must never render as "0B slice ceiling", which
 		// would state that the slice can admit nothing at all.
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
-			Queued: 2, QueuePosition: 1, GrantedBytes: 8 << 30, Jobs: 2, CeilingBytes: 0,
+			Queued: 2, QueuePosition: 1, GrantedBytes: 8 << 30, Jobs: 2, CeilingBytes: 0, GrantedEstablished: true,
 		})
 		if !strings.Contains(note, "8G already granted across 2 admitted jobs") {
 			t.Fatalf("note=%q, an unreadable ceiling must not suppress the held reserve", note)
@@ -428,15 +428,29 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 		// line can say — suppressing it would leave the reader with exactly the
 		// "nothing is blocking me" reading this clause exists to end.
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
-			Queued: 1, QueuePosition: 1, GrantedBytes: 0, Jobs: 0, CeilingBytes: 64 << 30,
+			Queued: 1, QueuePosition: 1, GrantedBytes: 0, Jobs: 0, CeilingBytes: 64 << 30, GrantedEstablished: true,
 		})
 		if !strings.Contains(note, "0B already granted across 0 admitted jobs / 64G slice ceiling") {
 			t.Fatalf("note=%q, an established empty running set is a fact and must be stated", note)
 		}
 	})
+	t.Run("absent-ledger-reads-as-nothing-not-a-zero", func(t *testing.T) {
+		// AIRA-220. GrantedEstablished false is the daemon saying it holds no ledger
+		// for the slice at all (a fresh/restarted daemon before its first admission,
+		// or a long-idle slice whose queue was pruned) -- distinct from the
+		// established-empty case above. The fabricated 0/0 must be WITHHELD, never
+		// printed as "0B already granted across 0 admitted jobs" on the surface
+		// AIRA-178 tells a blocked launcher to trust.
+		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
+			Queued: 1, QueuePosition: 1, GrantedBytes: 0, Jobs: 0, CeilingBytes: 64 << 30, GrantedEstablished: false,
+		})
+		if strings.Contains(note, "already granted") {
+			t.Fatalf("note=%q, an absent ledger must not fabricate an empty running set", note)
+		}
+	})
 	t.Run("one-admitted-job-reads-as-one", func(t *testing.T) {
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
-			Queued: 1, QueuePosition: 1, GrantedBytes: 20 << 30, Jobs: 1, CeilingBytes: 64 << 30,
+			Queued: 1, QueuePosition: 1, GrantedBytes: 20 << 30, Jobs: 1, CeilingBytes: 64 << 30, GrantedEstablished: true,
 		})
 		if !strings.Contains(note, "across 1 admitted job /") {
 			t.Fatalf("note=%q, want the singular", note)
@@ -457,7 +471,7 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 func TestConfineQueueNoteNamesTheJobsOwnResolvedReserve(t *testing.T) {
 	t.Run("unpinned-hint-replaced-by-the-daemon", func(t *testing.T) {
 		note := queueNoteFor(t, 2<<30, &ConfineSliceReserve{
-			Queued: 1, QueuePosition: 1, GrantedBytes: 40 << 30, Jobs: 3, CeilingBytes: 61 << 30,
+			Queued: 1, QueuePosition: 1, GrantedBytes: 40 << 30, Jobs: 3, CeilingBytes: 61 << 30, GrantedEstablished: true,
 			ResolvedReserveBytes: 35 << 30,
 		})
 		if !strings.Contains(note, "this job's own reserve resolves to 35G") {
@@ -475,7 +489,7 @@ func TestConfineQueueNoteNamesTheJobsOwnResolvedReserve(t *testing.T) {
 		// noise, and "resolves to" would imply the daemon moved a number it did
 		// not.
 		note := queueNoteFor(t, 44<<30, &ConfineSliceReserve{
-			Queued: 9, QueuePosition: 1, GrantedBytes: 52 << 30, Jobs: 9, CeilingBytes: 64 << 30,
+			Queued: 9, QueuePosition: 1, GrantedBytes: 52 << 30, Jobs: 9, CeilingBytes: 64 << 30, GrantedEstablished: true,
 			ResolvedReserveBytes: 44 << 30,
 		})
 		if strings.Contains(note, "this job's own reserve") {
@@ -490,7 +504,7 @@ func TestConfineQueueNoteNamesTheJobsOwnResolvedReserve(t *testing.T) {
 		// is NOT substituted: while unpinned it is a hint, and naming it as the
 		// resolved reserve would be the fabrication this ticket is about.
 		note := queueNoteFor(t, 2<<30, &ConfineSliceReserve{
-			Queued: 1, QueuePosition: 1, GrantedBytes: 40 << 30, Jobs: 3, CeilingBytes: 61 << 30,
+			Queued: 1, QueuePosition: 1, GrantedBytes: 40 << 30, Jobs: 3, CeilingBytes: 61 << 30, GrantedEstablished: true,
 		})
 		if strings.Contains(note, "this job's own reserve") {
 			t.Fatalf("note=%q, an unreported reserve must print nothing", note)

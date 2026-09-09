@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-202","project":"aira","title":"Nothing reports which commit the running aira client or daemon was built from, and MCP serverInfo answers with a hardcoded stale \"m8a\"","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-203","to":"AIRA-202"}]}
+{"schema":1,"id":"AIRA-202","project":"aira","title":"Nothing reports which commit the running aira client or daemon was built from, and MCP serverInfo answers with a hardcoded stale \"m8a\"","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-203","to":"AIRA-202"}]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are

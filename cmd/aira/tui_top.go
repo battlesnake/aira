@@ -983,14 +983,28 @@ func topFooter(result runner.ConfineListResult) string {
 		return fmt.Sprintf("%d %s; slice reserve unevaluated",
 			len(result.Scopes), confinePlural(len(result.Scopes), "scope", "scopes"))
 	}
+	// AIRA-220. Granted/jobs are unestablished when the daemon holds no ledger
+	// for the slice; show the ceiling (an independent read) but never a
+	// fabricated "granted 0 across 0 jobs".
+	grantedClause := fmt.Sprintf("granted %s / ceiling %s across %d admitted %s",
+		topFormatMegabytes(reserve.GrantedBytes), topFormatMegabytes(reserve.CeilingBytes),
+		reserve.Jobs, confinePlural(reserve.Jobs, "job", "jobs"))
+	if !reserve.GrantedEstablished {
+		grantedClause = fmt.Sprintf("granted unevaluated / ceiling %s",
+			topFormatMegabytes(reserve.CeilingBytes))
+	}
+	populationClause := fmt.Sprintf("%d %s, %d scope-less %s, %d adopted",
+		reserve.ScopeJobs, confinePlural(reserve.ScopeJobs, "scope", "scopes"),
+		reserve.ReservationJobs, confinePlural(reserve.ReservationJobs, "reservation", "reservations"),
+		reserve.AdoptedJobs)
+	if !reserve.GrantedEstablished {
+		// AIRA-220. Same absent snapshot as the granted pair, so the population
+		// split is the same fabricated zeros; report it unevaluated in lockstep.
+		populationClause = "populations unevaluated"
+	}
 	parts := []string{
-		fmt.Sprintf("granted %s / ceiling %s across %d admitted %s",
-			topFormatMegabytes(reserve.GrantedBytes), topFormatMegabytes(reserve.CeilingBytes),
-			reserve.Jobs, confinePlural(reserve.Jobs, "job", "jobs")),
-		fmt.Sprintf("%d %s, %d scope-less %s, %d adopted",
-			reserve.ScopeJobs, confinePlural(reserve.ScopeJobs, "scope", "scopes"),
-			reserve.ReservationJobs, confinePlural(reserve.ReservationJobs, "reservation", "reservations"),
-			reserve.AdoptedJobs),
+		grantedClause,
+		populationClause,
 	}
 	if reserve.FreezePhase != "" {
 		parts = append(parts, fmt.Sprintf("%d queued, freeze %s", reserve.Queued, reserve.FreezePhase))
