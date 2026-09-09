@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-178","project":"aira","title":"No live actuator throttles/freezes/evicts an already-admitted job as siblings collectively grow toward the aggregate cap","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-178","project":"aira","title":"No live actuator throttles/freezes/evicts an already-admitted job as siblings collectively grow toward the aggregate cap","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-220","to":"AIRA-178"}]}
 ---
 
 Peer report (speed, 2026-09-08), investigated and largely confirmed. A

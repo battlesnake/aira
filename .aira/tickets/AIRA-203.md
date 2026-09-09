@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-203","project":"aira","title":"aira install does not restart the daemon when only the binary changed, so a correctly-run install can leave the old image serving","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-203","project":"aira","title":"aira install does not restart the daemon when only the binary changed, so a correctly-run install can leave the old image serving","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-221","to":"AIRA-203"}]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
