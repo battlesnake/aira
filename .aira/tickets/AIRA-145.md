@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-145","project":"aira","title":"aira reconcile fails with E_JOURNAL_CORRUPT: invalid run ledger record","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-145","project":"aira","title":"aira reconcile fails with E_JOURNAL_CORRUPT: invalid run ledger record","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[{"kind":"relates","from":"AIRA-218","to":"AIRA-145"}]}
 ---
 
 Noticed 2026-09-07, ~13:16 local, while sanity-checking the ticket index after
@@ -264,3 +264,16 @@ exercised by a test — recorded as a coverage gap, the counted-offset design
 is correct regardless. This done record was committed with a pathspec
 restricted to this file because another session had `AIRA-142.md` staged in
 the root worktree at the time.
+
+
+---
+
+## Amendment — 2026-09-09 global rant triage
+
+**Scope honesty: the coordinates delivered here cover the DECODE site only.**
+`internal/runner/ledger.go:211-225`, `:461-495` and `internal/store/gate_audit.go:69-83` — about 13
+further emission sites — still emit `E_JOURNAL_CORRUPT` with no path, record index or offset. So the
+original friction recurs verbatim if a replay-integrity check fails rather than a decode.
+
+No ticket filed: there are zero sightings on those paths, and a sweep is not warranted on zero
+sightings. Recorded here so the scope reads honestly rather than as class-closed.

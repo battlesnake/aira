@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-20","project":"aira","title":"Harden wall-clock-tight tests to re-enable a -race CI job","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flaky","testing"],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-33","to":"AIRA-20"}]}
+{"schema":1,"id":"AIRA-20","project":"aira","title":"Harden wall-clock-tight tests to re-enable a -race CI job","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flaky","testing"],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-33","to":"AIRA-20"},{"kind":"relates","from":"AIRA-204","to":"AIRA-20"}]}
 ---
 The first GitHub Actions CI run (2026-08-30) showed build+test green but the `-race` job failed — NOT on any data race (0 `WARNING: DATA RACE`), but on wall-clock latency assertions that don't survive -race's slowdown on a shared CI runner:
 - internal/daemon/watch_test.go:105 TestWatchReturnsConcurrentEventWithinPollInterval — `event latency=124ms poll=30ms` (asserts an event arrives within the 30ms poll interval; under -race it took 124ms).
@@ -225,3 +225,33 @@ CI yaml addition.
   `ok`); `go test ./internal/daemon/... -race` → 0; `go test
   ./internal/runner/... -race` → 0; GitHub Actions `race`/`test`/`build + vet +
   gofmt` jobs on PR #50 and on the post-merge `master` run → all `success`.
+
+
+---
+
+## Amendment — 2026-09-09 global rant triage
+
+## Unswept remainder and successor
+
+This ticket's resolution currently reads as class-closed. It is not. The pass was scoped to
+`internal/{runner,daemon,pylib}`, and the text names only `cmd/aira` as excluded (line 116);
+`gitremote`, `store`, `install` and `core` were never in scope and are nowhere named.
+
+Raw `time.After(` / `time.Now().Add(` sites in `*_test.go`, by package:
+
+| Package | Sites | Files importing `testdeadline` |
+|---|---|---|
+| `cmd/aira` | 61 | 1 |
+| `internal/store` | 13 | 0 |
+| `internal/install` | 4 | 0 |
+| `internal/core` | 2 | 0 |
+| `internal/gitremote` | 1 | 0 |
+
+Two caveats that keep the number honest: roughly half of `internal/store`'s sites are
+deliberately-correct negative waits (asserting something does *not* happen), and the count misses
+`context.WithTimeout` entirely, so it is a floor rather than a total. `internal/store`'s 13 are named
+by no rant at all — they surfaced only from this inventory.
+
+Successor: the deadline-discipline ticket filed from the 2026-09-09 rant triage, which carries four
+witnessed merge-gate offenders as its named first cases. Link with `aira link`, never a hand-written
+relation tuple.

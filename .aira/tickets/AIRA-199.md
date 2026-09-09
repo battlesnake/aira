@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-199","project":"aira","title":"cmd/aira m20b test hands its own os.File fds to a callee that closes them, so the finalizer double-closes a recycled descriptor -- a -race CI flake and a package-wide cross-test hazard","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flake","test-hygiene"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-199","project":"aira","title":"cmd/aira m20b test hands its own os.File fds to a callee that closes them, so the finalizer double-closes a recycled descriptor -- a -race CI flake and a package-wide cross-test hazard","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flake","test-hygiene"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-204","to":"AIRA-199"}]}
 ---
 Found while gating AIRA-196 (PR #123, 2026-09-09). The `race` CI job failed
 on a branch whose own changes were green, with a single unrelated failure:
@@ -68,3 +68,16 @@ place to carry an unrelated fd-ownership fix. The AIRA-196 `race` job was
 re-run and passed cleanly (run 34294346701), so the merge gate was honest;
 this ticket carries the diagnosis and the measured fix so the flake is not
 merely forgotten.
+
+
+---
+
+## Amendment — 2026-09-09 global rant triage
+
+Cross-reference: the deadline-discipline sweep ticket filed from the 2026-09-09 rant triage
+covers the same package and the same merge gate, but a **different class** — wall-clock deadlines, not
+a descriptor race. **Do not merge them.**
+
+`AIRA-20.md:110-118` records a third, still-unattributed instance of *this* ticket's descriptor-race
+class: `cmd/aira TestCLIRunRealCgroupOrClearSkip` failing `fork/exec /usr/bin/git: bad file
+descriptor`. That sighting belongs here, not on the deadline sweep.

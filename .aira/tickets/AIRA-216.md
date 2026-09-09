@@ -1,0 +1,19 @@
+---
+{"schema":1,"id":"AIRA-216","project":"aira","title":"Ticket and finding front-matter writers HTML-escape \u003c \u003e \u0026 through json.Marshal, so a status-only mv rewrites unrelated title bytes","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+---
+> Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
+> Evidence below survived an independent refutation pass; claims that did not are
+> recorded as dropped in the triage record and deliberately absent here.
+
+Ticket and finding front-matter writers HTML-escape `< > &` through `json.Marshal`, so a status-only `mv` rewrites unrelated title bytes
+**kind** bug · **severity** P3 · **closes** RANT-28 (first half)
+
+**SYMPTOM.** A transition that changes nothing but `status` also rewrites the title bytes, producing a spurious diff hunk. Reproduced from this repo's history: AIRA-182 was filed with a literal `->` in its title (`git show b7eb61f:.aira/tickets/AIRA-182.md`) and the later close rewrote it to `-\u003e` with no other title change. Three of 198 ticket files carry escapes today (AIRA-182, AIRA-14 `nice-\u003e5`, AIRA-5 `\u003c=1/10s`). No data loss — the cost is byte-instability across a no-op-for-that-field rewrite, review noise, and a raw file that no longer matches a `git grep` for the human title.
+
+**ROOT CAUSE.** `internal/domain/ticket.go:541` — `header, err := json.Marshal(ticket)`. The package-level convenience function has `SetEscapeHTML` on and cannot be configured; only an explicit `json.Encoder` can turn it off. There is no HTML context anywhere near a frontmatter line. Same call, same defect, at `internal/domain/finding.go:282` — latent today (no finding files affected) but `findingFrontmatter` carries free text. `internal/domain/requirement.go:101` shares the call but its frontmatter is `{schema,id,status}` only, so it is unreachable; change for consistency, not as a defect fix. This is residue of an accepted decision: AIRA-57 (`4fd0de2`, "no HTML-escaping") fixed the class in the render/wire chain (`main.go:3191/:3202`, `core.go:85`, `protocol.go:217`) and never touched `internal/domain`.
+
+**PROPOSED FIX.** A shared unexported helper in `internal/domain` using `json.NewEncoder` + `SetEscapeHTML(false)`, with `bytes.TrimRight(buf.Bytes(), "\n")` — `Encoder.Encode` appends a newline `json.Marshal` does not, and the frontmatter is assembled with an explicit `\n---\n` separator, so getting this wrong breaks `ParseTicket`'s marker scan. No migration: the three escaped files stay byte-identical, keep parsing, and unescape on their next rewrite. Safe — nothing compares a ticket file's bytes against render output (`internal/store/check.go` has no `RenderTicket` reference; all callers are write paths, and the write path CASes on the **old** bytes). State explicitly that neither `Ticket` nor `findingFrontmatter` contains a field with a custom `MarshalJSON` (`ticket.go:375/:505` show such marshalers exist in the package, on `HeldLease`/`Lease`) — that is the one way this fix could silently not work, since `compact()` does not un-escape bytes an inner marshaler already escaped. The safety audit must also list `RenderFinding`'s callers (`internal/store/finding.go:126`, `:173`).
+
+**HOW TO TEST.** A rendered-**bytes** assertion, not a decoded one: the existing tests and the round-trip fuzz test all assert on the decoded ticket and `\u003e` decodes to `>`, which is exactly why AIRA-57 sailed past this. Render a ticket titled `planned -> done & <id> handling`, assert no `\u003` / `\u0026` in the bytes and the literal title present, then round-trip — the round-trip half is what fails if the newline trim is omitted. Mirror for `RenderFinding` via `WaiverReason`.
+
+---

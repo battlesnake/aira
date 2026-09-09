@@ -94,3 +94,39 @@ live actuator here or the wait-line fix in [[AIRA-181]]:
   by jobs that are idle" (granted ≫ in-use) — two states that call for
   different responses from whoever is waiting, and currently
   indistinguishable at the wait site.
+
+
+---
+
+## Amendment — 2026-09-09 global rant triage
+
+**Precision, not a re-title.** The title is correct as written: its trailing clause "as siblings
+collectively grow toward the aggregate cap" scopes it to memory, and that was verified independently —
+the only `memory.max`/`memory.high` **write** sites are `internal/runner/confine_linux.go:2021/:2025`,
+reached only from launch paths; there is no `cgroup.freeze` and no `memory.reclaim` anywhere in
+`internal/` or `cmd/`; and `internal/daemon/watchdog.go:355-374` requires `verdict.Uncapped`, which a
+capped confine job can never satisfy. **Change the body sentence "Once a job IS admitted, nothing
+re-evaluates it" to "…nothing re-evaluates its MEMORY grant."**
+
+Three additions:
+
+1. **A live actuator already exists on the CPU axis.** `confine_linux.go:70-77` / `:810-816` /
+   `:2174-2205` decay every admitted confine scope's `cpu.weight` 100→10 on elapsed time alone — no
+   contention input, no dwell, no re-raise — so the oldest job deterministically holds the lowest
+   weight. It is owner-decided (Slice-1 plan: "Young = full share, old = yields") and survived AIRA-33
+   by design. Whoever builds the memory actuator is adding a **second** actuator, not the first.
+
+2. **A never-assessed interaction.** AIRA-67 made the reserve lifetime-held
+   (`confine_linux.go:716`), so the oldest job's *completion* is what frees the admission queue — and
+   CPU aging is what slows it. Open question the actuator design must answer: hold weight for
+   reserve-holding jobs, gate decay on real contention, or leave it and document? This cannot be
+   measured until the `cpu-weight=aging` observability ticket lands.
+
+3. **RANT-15's two properties, as design input and explicitly not a duplicate:** require persistence
+   before actuating, and do not let a deterministic total order make one incumbent absorb every
+   actuation. Property two matters *more* here — the governor's park was resumable in 1–2 s, whereas
+   freeze / `memory.high` / clawback are terminal-ish and would compound on the same victim the CPU
+   actuator already picks.
+
+RANT-15 was closed `wont-fix`, but note its original stated reason ("the replacement has no analogue
+to fix") was FALSE and must not be reused; the correct reason is that AIRA-33 deleted the governor.

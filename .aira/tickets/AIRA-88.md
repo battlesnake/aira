@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-88","project":"aira","title":"Three machine-local stores grow without bound: registry.jsonl, common/aira/locks/, and the pylib extraction directories","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["housekeeping","pylib","store"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-88","project":"aira","title":"Three machine-local stores grow without bound: registry.jsonl, common/aira/locks/, and the pylib extraction directories","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["housekeeping","pylib","store"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-209","to":"AIRA-88"}]}
 ---
 PR #12 finding **B13** / plan candidate **77**, filed by the simplification programme's
 Phase 0 (plan §4.3). Source-verified against master `22cedd6`.
@@ -88,3 +88,20 @@ change, and nothing prunes them — the growth *rate* collapses to the rate of r
 source changes, which is the bound this ticket needed.
 
 AIRA-88 -> done. No code in this ticket; the only code involved is AIRA-66's.
+
+
+---
+
+## Amendment — 2026-09-09 global rant triage
+
+**The stated premise has expired.** This decision — "registry.jsonl stays append-only, no
+compaction … 131 lines / 39 KB … needs no bound this decade" — was taken 2026-09-04 at exactly 131
+records. Measured 2026-09-09: **784 records / ~239 KB**, six-fold growth in five days, ~1–3 new dead
+roots per day, driven by ordinary agent worktrees being removed without an eject rather than by the
+e2e tests the original analysis considered.
+
+The decision may still be right, and auto-prune is separately declined (`store.go:1987-1988` writes
+the breadcrumb before the DB transaction precisely so a stale breadcrumb stays recoverable evidence,
+which auto-deleting would trade away). But it should not stand on a number that is five days stale.
+The operational cost is being removed instead, by the discovery-logging ticket filed from the
+2026-09-09 rant triage — without deleting the evidence this decision exists to protect.

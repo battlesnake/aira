@@ -1,0 +1,21 @@
+---
+{"schema":1,"id":"AIRA-212","project":"aira","title":"aira skill install --force with \u003cdir\u003e omitted swallows the flag as the destination path, creates ./--force/ and reports success","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+---
+> Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
+> Evidence below survived an independent refutation pass; claims that did not are
+> recorded as dropped in the triage record and deliberately absent here.
+
+`aira skill install --force` with `<dir>` omitted swallows the flag as the destination path, creates `./--force/` and reports success
+**kind** bug · **severity** P2 · **closes** RANT-8
+
+**SYMPTOM.** Exit 0 and a success banner, having created `./--force/` in the cwd and written both artifacts into it; the real skill directory is untouched, so the operator or agent believes the skill is deployed when nothing was. That is a fake pass in the sense of the project rule. Proven on the running binary without any filesystem mutation: `cd /proc && aira skill install --force` → `E_SKILL_INSTALL: cannot create target: mkdir --force: no such file or directory`. `aira skill install --` creates a directory named `--`. And the flag order is asymmetric: `install --force <dir>` **is** correctly refused, so the failing spelling is the one that damages and the safe spelling is the one rejected.
+
+**This is already embedded in AIRA's own deploy procedure**, which is what lifts it off the hypothetical-typo shelf: `.aira/tickets/AIRA-92.md:147` records "skill reinstalled (`aira skill install --force`)" under `## Deployed`, and `docs/superpowers/specs/2026-08-29-aira-memory-accounting-rework-design.md:271` prescribes the same dir-omitted spelling for future deploys. Anyone following those notes literally records a deploy that did not happen.
+
+**ROOT CAUSE.** `skill` is dispatched ahead of the generic parser (`cmd/aira/main.go:90-91`), so `parseArgs` never applies. `cmd/aira/skill.go:25-30`: with `argv = ["install","--force"]`, `len(argv)==2`, both refusals miss, `force` is false, and the literal `--force` becomes `dir`. `installSkill` validates only non-blankness (`skill.go:36-38`), then `os.MkdirAll` (`skill.go:47`), then prints success (`skill.go:79-80`). `skill install <dir>` is the only positional in the CLI that **creates** a filesystem path and the only one with no leading-dash guard; the generic parser refuses a valueless `--x`, and `git` already guards dash-leading positionals (`main.go:2579-2582`).
+
+**PROPOSED FIX, in this order.** (1) **Primary:** strip `--force` as a flag wherever it appears, so `install --force <dir>` and `install <dir> --force` both work; once stripped, `install --force` leaves zero positionals and `skill.go:36-38`'s blank check already fires with exit 2 and no directory created. (2) **Backstop:** refuse a `<dir>` beginning with `-`, leading with "`<dir>` is required" and mentioning `./--force` only as a secondary escape hatch. Keep the guard inside `runSkill`; do not add a default install target (a separate design question) and do not route `skill` through `parseArgs`. (3) Fix the two deploy notes to the working spelling, or the fix will start failing AIRA's own documented procedure with exit 2. Do **not** claim "the overwrite refusal is disarmed" — in the swallow path the dir is freshly created so `force` is never consulted; the honest statement is that the caller asked for `--force` and provably did not get it.
+
+**HOW TO TEST** (each chdir'd into its own `t.TempDir()`; a **filesystem assertion is required**, not just an exit code): `skill install --force` → exit 2, no `version:` on stdout, and `os.Stat("--force")` reports IsNotExist (today: all four fail). `skill install --` → exit 2, no `--` directory. `skill install --force <tmpdir>` → exit 0 with both artifacts in tmpdir (today exit 2). **And a fourth case the earlier draft omitted:** write a differing `SKILL.md` into the target first, then assert both orderings overwrite it and exit 0 — `force=true` is executed by **no test anywhere in the tree**, so without this the fix ships an order-insensitive flag whose only meaning has still never been exercised.
+
+---

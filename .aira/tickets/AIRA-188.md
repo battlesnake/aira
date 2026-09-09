@@ -160,3 +160,13 @@ no real args), so a narrow point fix rather than a sweep. Already fixed
 directly (`internal/core/core.go:708`, `go build`/`go test
 ./internal/core/...` both green) as this is exactly the "purely trivial
 ... mechanical" class this project's lighter path allows.
+
+
+---
+
+## Amendment — 2026-09-09 global rant triage
+
+One-line precision fix to the observation at lines 154-156: `aira init --help` has never
+rendered anything — it returns `E_SELECTOR_INVALID: option --help requires a value`. Only `aira help`
+was misleading. No change to substance. The `--help` refusal itself is now tracked separately (it has
+twelve emission sites across three parsers, including one a `parseArgs` fix would not reach).
