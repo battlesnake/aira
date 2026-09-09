@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-205","project":"aira","title":"make fmt-check gofmts 8,681 .go files belonging to 24 other agents' worktrees, so any concurrent session's mid-edit file can fail the owner's commit","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-205","project":"aira","title":"make fmt-check gofmts 8,681 .go files belonging to 24 other agents' worktrees, so any concurrent session's mid-edit file can fail the owner's commit","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
@@ -21,3 +21,42 @@
 **HOW TO TEST.** A fixture holding a deliberately unformatted `.go` file under `.claude/worktrees/<other>/` must not fail `make fmt-check`; a deliberately unformatted tracked file still must. The first fails against the current Makefile.
 
 ---
+
+---
+
+## Build correction — 2026-09-09
+
+**The write path matters more than the read path this ticket described.** `fmt`
+runs `gofmt -w` AND `goimports -w` over the same glob, so the defect was not
+merely that `fmt-check` judged other sessions' files — `make fmt` was
+**rewriting** 24 concurrently-running agents' in-progress files underneath them.
+
+**Three sites, not one.** The expression was duplicated at `fmt`'s gofmt, `fmt`'s
+goimports and `fmt-check`. Three copies drifting is precisely how `./.claude`
+came to be excluded from none of them, so the fix folds them into a single
+`GO_SRC_FIND` variable rather than editing three literals.
+
+Exclusion is `./.claude/*` rather than `./.claude/worktrees/*`: everything under
+that directory is harness state, never project source, and the broader form
+needs no revisiting when the harness adds a sibling directory.
+
+**Measured, root checkout:** 9,222 files selected before, 541 after — 94%, as
+predicted. Note the reduction is invisible from a feature worktree, which has no
+nested `.claude/worktrees`; it only shows in the checkout the agents nest under.
+
+The test extracts the find expression from the real Makefile and RUNS it against
+a fixture tree, because the defect was a path-matching one and asserting on the
+Makefile's text would pass against an exclusion that does not actually match. It
+asserts every expression it finds rather than a fixed count, so a future target
+that hand-rolls its own find is caught too, and it fails on zero matches so a
+renamed variable cannot read as a pass. Confirmed failing against the unfixed
+Makefile on all three sites, with the vendor/.worktrees cases passing throughout
+— i.e. the fixture proves the harness is not vacuous.
+
+### Build review addendum
+
+Confirmed gap, fixed: the find-expression regex required at least one
+`-not -path` (`+` quantifier), so a future target hand-rolling
+`find . -type f -name '*.go'` with NO exclusions at all — the worst form of this
+regression — would not have matched the regex and the guard would have stayed
+silent about exactly the case it exists to catch. Quantifier is now `*`.

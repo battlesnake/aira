@@ -139,8 +139,26 @@ func (d *daemonDispatcher) environment() func(string) string {
 func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
-	if canonical == "confine-list" || canonical == "confine-kill" {
+	// AIRA-201. confine-budget belongs here with its two siblings. It is
+	// RouteClient like the rest of the confine family, and every confine-management
+	// caller hands this method an EMPTY WorktreeScope because these verbs resolve
+	// no project by design -- so omitting it did not select some slower path, it
+	// fell through to the client arm, which opened a project store with that empty
+	// scope and refused `E_CONFIG_INVALID: scope options are incomplete` on every
+	// invocation in every directory. Both shipped spellings (`confine --budget`
+	// and `confine-budget`) converge here, so the verb was wholly unreachable and
+	// the daemon's own handler at internal/daemon/server.go:785 was dead code.
+	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" {
 		return d.dispatchConfineManagement(ctx, request)
+	}
+	// AIRA-202. `version` asks the daemon what IT is, so it must reach the daemon
+	// without resolving a project -- the same shape as the confine family above,
+	// and for the same reason. Routing it as an ordinary verb reproduces AIRA-201
+	// exactly: the client arm opens a project store with the empty scope every
+	// caller passes and refuses `E_CONFIG_INVALID: scope options are incomplete`,
+	// which was observed here before this arm existed.
+	if canonical == "version" {
+		return d.dispatchVersion(ctx, request)
 	}
 	// AIRA-196. Answered entirely in THIS process, with no daemon exchange at
 	// all. confine-log reads the durable record store plus one captured file --
@@ -192,6 +210,25 @@ func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, reques
 	}
 	if daemon.IsRequestOutcomeUnknown(err) || !daemon.IsRequestNotSent(err) && store.ErrorCode(err) != daemon.CodeUnavailable {
 		return transportErrorResponse(err)
+	}
+	// AIRA-201. confine-budget has no daemon-down fallback and must not acquire
+	// one by omission: the fallbacks below enumerate the cgroup directory, which
+	// carries no peak-RSS history at all, and the budget report is a comparison
+	// against exactly that history. Answering from cgroupfs could only fabricate.
+	//
+	// This branch is placed BEFORE the ci-shim block because the answer does not
+	// depend on the mode -- the daemon owns the history in both -- and, more
+	// importantly, because everything past this point that is not confine-list
+	// falls through to KillConfine. Without this return, routing a read-only
+	// report into the management arm would turn it into a kill attempt carrying
+	// an empty selector.
+	if request.Verb == "confine-budget" {
+		return core.Response{OK: true, Code: "UNEVALUATED", Exit: 3, Data: runner.ConfineBudgetResult{
+			Verdict: "unevaluated",
+			Reason: "the daemon is unreachable, and it is the only holder of the peak-RSS history a budget is compared against; " +
+				"no budget can be established from the cgroup directory alone",
+			Subjects: []runner.ConfineBudgetRow{},
+		}}
 	}
 	// AIRA-121. The daemon-down fallback below enumerates the REAL slice cgroup
 	// directory. In ci-shim mode there is no such directory and no cgroup record
@@ -928,4 +965,19 @@ func scopeForCWD(ctx context.Context, cwd string, paths daemon.Paths) (daemon.Wo
 		return daemon.WorktreeScope{}, err
 	}
 	return daemon.ScopeFromProject(project, paths)
+}
+
+// dispatchVersion asks the daemon for its own build identity (AIRA-202).
+//
+// It deliberately does NOT start a daemon that is not already running. The
+// question is "what is running right now"; spawning one to answer it would
+// change the thing being measured, and the honest answer when nothing is
+// running is that there is no daemon identity to report.
+func (d *daemonDispatcher) dispatchVersion(ctx context.Context, request core.Request) core.Response {
+	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
+	response, err := d.doExchange(ctx, frame)
+	if err != nil {
+		return transportErrorResponse(err)
+	}
+	return response.CoreResponse()
 }

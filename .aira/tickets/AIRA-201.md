@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-201","project":"aira","title":"aira confine --budget is unreachable: RouteClient falls through to a project store open and always returns E_CONFIG_INVALID","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-213","to":"AIRA-201"}]}
+{"schema":1,"id":"AIRA-201","project":"aira","title":"aira confine --budget is unreachable: RouteClient falls through to a project store open and always returns E_CONFIG_INVALID","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-213","to":"AIRA-201"}]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
@@ -24,3 +24,52 @@ E_CONFIG_INVALID: scope options are incomplete
 **Second symptom, same class, cause UNEVALUATED:** `aira insights show resource-budget` returns exit 3 UNEVALUATED "machine-wide usage history is unavailable to this scope" (`internal/store/resource_budget.go:386-390`, the `s.owner == nil` branch) — a *different* path, untraced. Both documented routes to AIRA-180's data are dead; that is why this is P1. **Do not carry the earlier "stale daemon, a restart would settle it" explanation** — the daemon maps the current binary's inode, other daemon-backed verbs work, and I reproduced the failure today after that restart.
 
 ---
+
+---
+
+## Build correction — 2026-09-09
+
+**The proposed one-line fix was incomplete, and shipping it alone would have been
+worse than the defect.** `dispatchConfineManagement`'s daemon-down fallback
+special-cases `confine-list` and lets everything else fall through to
+`KillConfine` (cmd/aira/dispatcher.go). Adding `confine-budget` to the routing
+arm without a second branch would have turned a read-only budget report into a
+kill attempt carrying an empty selector whenever the daemon was unreachable.
+
+The fix is therefore two parts: the routing arm, plus an explicit
+`confine-budget` branch placed BEFORE the ci-shim block that returns
+`UNEVALUATED` with a reason. A budget is a comparison against the daemon's own
+peak-RSS history; the cgroup directory the fallbacks enumerate carries none, so
+answering from it could only fabricate.
+
+**A second defect was introduced by the fix itself and caught in self-review.**
+`renderConfineBudgetResponse` prints `no usage history recorded yet` whenever
+`Subjects` is empty — and the new unevaluated result is also empty. So "the
+daemon is unreachable" rendered as "we looked and there is nothing", which is a
+worse failure than the `E_CONFIG_INVALID` it replaced. The renderer now tests
+`Verdict == "unevaluated"` first, keyed on the verdict rather than on the reason
+string so a future path that forgets its reason still cannot fall through to the
+wrong sentence.
+
+`ConfineBudgetResult` gained a `Reason` field, following
+`ConfineListResult`'s existing convention.
+
+**Verified live** against the running daemon: the verb now returns real subject
+rows for the first time. Three tests, all confirmed failing against the
+unfixed code: routing (asserts the frame actually leaves for the daemon, so a
+client-side answer that happened to succeed cannot pass it), the never-kills
+twin, and the render twin.
+
+Still unevaluated: the second symptom in the original body — why
+`aira insights show resource-budget` returns `UNEVALUATED` via
+`internal/store/resource_budget.go`'s `s.owner == nil` branch. Different path,
+not traced, not fixed here.
+
+### Build review addendum
+
+Confirmed gap, fixed: **neither shipped CLI spelling was exercised by any test.**
+The routing test drove `daemonDispatcher` directly, so `confine --budget` (the
+options-form branch) and `confine-budget` (main.go's verb arm) — two different
+routes into the same dispatch — were both unverified, on a ROUTING defect.
+`TestBothConfineBudgetSpellingsReachTheManagementDispatch` now drives both
+through `RunWithDispatcher` and asserts each resolves no project scope.

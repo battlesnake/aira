@@ -162,6 +162,11 @@ func verbAcceptsScopeDir(verb string) bool {
 		// exactly like the confine family it is sugar over, so the override is
 		// REFUSED rather than accepted and discarded.
 		"drain", "drain-hold",
+		// AIRA-202. `version` asks what BINARY is running. It resolves no project
+		// and opens no store, so the override is refused rather than accepted and
+		// discarded -- silently discarding it is the confidently-wrong shape this
+		// list exists to prevent.
+		"version", "--version", "-v",
 		"help", "--help":
 		return false
 	}

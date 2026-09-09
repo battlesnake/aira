@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"aira/internal/app"
+	"aira/internal/buildid"
 	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/runner"
@@ -775,6 +776,19 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 	verb := core.CanonicalVerb(request.Request.Verb)
+	// AIRA-202. The daemon reports its OWN build identity. This is the half that
+	// matters: create/show/link/rant are RouteDaemon and execute in this process,
+	// so the domain compiled in HERE decides what is legal -- which is how a
+	// daemon predating AIRA-170 kept refusing P3 tickets whose files on disk
+	// already carried P3. It resolves no project and touches no store, so it is
+	// answered before any scope work, exactly like confine-report.
+	if verb == "version" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = s.reply(conn, responseFrame(core.Response{OK: true, Code: "OK", Data: buildid.Current()}))
+		return
+	}
 	if verb == "confine-report" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)

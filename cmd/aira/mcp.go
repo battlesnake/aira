@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"aira/internal/buildid"
 	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/runner"
@@ -337,7 +338,13 @@ func (s *mcpServer) handle(ctx context.Context, line []byte) (mcpResponse, bool)
 		result := map[string]any{
 			"protocolVersion": "2025-06-18",
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]string{"name": "aira", "version": "m8a"},
+			// AIRA-202. Was the literal "m8a" -- a Milestone-8a label frozen on
+			// 2026-08-09 and roughly a thousand commits stale by the time it was
+			// found. It was the ONLY place aira answered a version question, and it
+			// answered it wrongly, which is worse than the CLI's honest
+			// E_UNKNOWN_VERB. Now the same identity `aira version` reports, and
+			// "unevaluated" when there is no stamp to read.
+			"serverInfo": map[string]string{"name": "aira", "version": buildid.Current().String()},
 		}
 		return resultResponse(id, result), hasRequestID(request.ID)
 	case "notifications/initialized":

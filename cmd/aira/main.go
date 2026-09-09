@@ -129,6 +129,31 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		code := store.ErrorCode(scopeDirResolveErr)
 		return render(core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
+	// AIRA-202. Intercepted HERE, beside help, rather than added to buildRequest's
+	// switch: version resolves no project, opens no store, and must answer with
+	// the daemon down. This is also the one point that catches the verb and the
+	// flag spellings together -- buildRequest has its OWN enumerated switch whose
+	// default raises E_UNKNOWN_VERB before core.Do is reached, so registering the
+	// verb in the core dispatch table alone would leave `aira version` broken
+	// while `--version` worked.
+	if len(args) > 0 && isVersionSpelling(args[0]) {
+		dispatcher := injected
+		var dispatcherErr error
+		if dispatcher == nil {
+			// A dispatcher that cannot even be constructed is not fatal here: the
+			// client half is still establishable locally, and runVersionCommand
+			// reports the daemon half as unevaluated. The CONSTRUCTION error is
+			// carried through rather than swallowed -- reporting a generic "no
+			// dispatcher was available" when the real cause was, say, an unresolvable
+			// XDG_STATE_HOME is the same substitute-a-plausible-cause defect this
+			// verb exists to stop.
+			var production *daemonDispatcher
+			if production, dispatcherErr = newDaemonDispatcher(stdin, stdout, stderr, renderJSON); dispatcherErr == nil {
+				dispatcher = production
+			}
+		}
+		return runVersionCommand(context.Background(), dispatcher, dispatcherErr, renderJSON, stdout, stderr)
+	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
 		if !renderJSON && response.OK {
