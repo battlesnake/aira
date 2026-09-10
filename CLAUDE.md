@@ -108,3 +108,51 @@ cmd/aira/         thin CLI, MCP, TUI, daemon, and install faces
 
 Phase 1 does not create runner, telemetry, or gate implementation merely because
 the top-level architecture names them.
+
+## Simplify and challenge before building — by default, not on request
+
+Before building anything non-trivial — especially when a design, ticket, or plan
+arrives as a given — run a short pass separate from "is it correct?": restate, in
+plain terms, the actual problem the requester needs solved, then ask **does this
+need building at all? what is the simplest thing that solves it? what EXISTING
+complexity can be removed?** A green correctness review proves a design is built
+right, never that it should be built — necessity is a separate question, and it is
+yours to raise unprompted.
+
+**Forcing function — the greenfield minimum.** Ask: *"if we had to solve ONLY this
+problem, from scratch — no existing code, tools or solutions to reuse, and no future
+problems to anticipate — what is the bare-minimum viable build?"* That answer is the
+yardstick. Compare it to what you have or are about to build: the gap is candidate
+complexity, and every part of it needs a live justification — reuse genuinely cheaper
+than the minimum, or a future need that is actually arriving — never "it might be
+handy" or "it's already there." Drift from the minimum should be a conscious choice,
+not an accident.
+
+Bias toward removing or collapsing over adding; prefer "keep the primitive + document
+the gap" over new machinery. AIRA has no users and no backwards-compat obligation, so
+*deleting* existing complexity is on the table, not just declining new complexity.
+Before reversing a trade, check whether a prior decision already settled it (grep the
+ticket store) — don't silently re-litigate it.
+
+Scale it to the stakes: a one-line sanity check for a small change; an explicit
+challenge-review for anything substantial. When you brief a reviewer, make **"what
+can be simplified or removed while still solving the original problem?"** and **"what's
+the from-scratch minimum for *just* this problem?"** standing questions alongside
+correctness — the human shouldn't have to ask.
+
+In this repo this is the operating form of "AIRA is primitives, not judgement" and the
+architectural-simplicity rule: a real design (AIRA-224) passed two correctness gates
+before a challenge pass found the requirement was already met by the existing admission
+ledger and the right move was to build nothing.
+
+A second worked example (2026-09-10, reservation-model admission): a challenge pass *during
+the build* found that the counter the daemon already has, plus socket-liveness (the holder's
+fd closing = release, SIGCHLD downward), plus a rigid version-frozen reconnect+re-declare for
+the daemon-restart-without-reboot case, would meet the admission requirement more simply —
+retiring the kernel-scan/adoption, the live-`memory.current` charge (`refreshWaiterCharge`),
+the `aira worker-peak` relay, and the dual-role `dynamicReserve` flag the design was
+accreting. Its one trade (a bounded cold-start over-admit window) sits inside the
+already-accepted "bounded, not airtight" envelope. Every over-design smell in the global
+CLAUDE.md fired here, and the correctness gates (green, mutation-tested, race-clean) caught
+none — they test built-right, not build-right-thing. Recorded in the review-against-actual-problem
+memory.
