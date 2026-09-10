@@ -5,8 +5,9 @@
   and the Stage-A/B work built against it. Awaiting re-gate on the deltas.
 - **Date**: 2026-09-10 (v1), 2026-09-11 (v2). **Base**: v0.5 (`420429e`).
 - **Owner-decided shape**: a flat per-resource quota counter held as a **signed, scope-id-keyed ledger**; death
-  detected by socket liveness (already the v0.5 model); daemon-restart recovery by a **one-shot startup slice
-  scan + client reconnect/re-declare** reconciled by idempotency; resources as a general named-scalar map;
+  detected by socket liveness (already the v0.5 model); daemon-restart recovery by a **ledger dump-on-shutdown +
+  kill-probe reload + client reconnect/re-declare** reconciled by idempotency; resources as a general named-scalar
+  map;
   **greedy drain inside the homogeneous aitest pool, fairness kept at the shared dev slice; CPU as 2×cores
   accounting-only** (flock governor dropped); no request timeouts; **plenty of data collected, with a CI
   file-dump** for external archival.
@@ -19,11 +20,11 @@
      under the single-writer lock); the daemon **never closes a lease-bearing connection on any error**.
   4. **One connection per lease** to the daemon's single listener — the aitest supervisor holds N connections,
      one per live worker-lease; EOF of that connection releases that one lease; each re-declares independently.
-  5. **Bootstrap = one-shot startup slice scan + idempotent re-declare** (owner design; replaces v1's empty
-     ledger and my rejected `install` guard): the daemon seeds its ledger at startup from the live
-     `.aira-CONFINE-*` scopes (reusing the existing scan **once**, not the retired periodic scan), so old v0.5
-     survivors that cannot re-declare are still counted; a reconnecting client's SET-by-scope-id then *refines*
-     its own lease without double-reserving. Closes the P0 first-upgrade hole with no permanent per-install code.
+  5. **Bootstrap = ledger dump-on-shutdown + kill-probe reload** (owner design; NO cgroup scan, NO `install`
+     guard): the daemon writes the ledger (scope-id, resource vector, client pid) on graceful shutdown; a new
+     daemon that finds that file < 10 s old reloads it and `kill -0`s each pid — keeping live leases, dropping
+     dead ones — then reconnect + idempotent re-declare re-anchors and refines. No leaf-empty scan guessing, no
+     leaked seeds. The one-off first v0.5→new upgrade (no dump exists) is a controlled cutover (§4).
   6. **AIRA-29 dynamic charge stays retired — owner-signed** (§11): declared-only accounting; over-declaring is
      a caller error, and working aitest removes the pressure to hand-guess RAM.
   7. **Fairness kept for the dev shared slice** (AIRA-59 head-of-line + `--exclusive`/drain AIRA-101/185);
@@ -45,16 +46,16 @@ kernel ground truth** (per-scope `ListConfines` scan + adoption, `#74`), **charg
 **Framing correction (gate):** socket-liveness release is *not* a new idea — it is **already the primary release
 path in v0.5** (`internal/daemon/admit.go:2167-2181`, `2262-2266`): a lease is anchored to the admit connection
 and released on peer-EOF. What this design **deletes** is the *periodic scan backstop + live-usage adoption*,
-the *dynamic charge*, and the *relays*; what it **adds** is client reconnect + re-declare (plus a **one-shot**
-reuse of the scan at startup, §4) so the socket model also survives a daemon restart. So this is a **counter
-rebuild on the existing socket-lease core**, not a from-scratch daemon rewrite (§14).
+the *dynamic charge*, and the *relays*; what it **adds** is client reconnect + re-declare (plus a
+dump-on-shutdown + kill-probe reload, §4) so the socket model also survives a daemon restart. So this is a
+**counter rebuild on the existing socket-lease core**, not a from-scratch daemon rewrite (§14).
 
 **Retired:** the *periodic* per-scope scan + live restart-adoption (`#74`); the AIRA-29 live charge
 (`refreshWaiterCharge`) + `dynamicReserve`; the `aira worker-peak` relay + reservation-model Stage-B
 scope-binding; the flock CPU slot-governor (`internal/daemon/cpuslots.go`, owner-ordered dropped once the daemon
 became permanent); the `max_wait_ms` plumbing / worker-admit poll loop / `AdmitWaitCeiling` guard (no timeouts,
-§6); the AIRA-114 aggregate bound (folded into the single ceiling). **Kept:** the scan code, run **once at
-startup** for ledger bootstrap (§4).
+§6); the AIRA-114 aggregate bound (folded into the single ceiling); **and the whole cgroup scan/adoption path**
+— the ledger is instead persisted across a restart by a dump-on-shutdown + kill-probe reload (§4).
 
 ## 1. Problem
 
@@ -81,7 +82,7 @@ flowchart TD
 - **Admit**: `∀r: R[r] ≤ available[r]` ⇒ add `lease{scope-id, R}`; the caller holds it on its connection.
 - **Release**: on lease end, drop that scope-id's lease (resource-agnostic).
 - **Signed / idempotent**: `available` is *derived*, never mutated in two places. A re-declare is a SET of that
-  scope-id's lease (idempotent — double reconnect, or a scope both scan-seeded and re-declared, cannot
+  scope-id's lease (idempotent — double reconnect, or a scope both dump-reloaded and re-declared, cannot
   double-count). If leases sum past a ceiling, `available` legitimately goes **negative** — no invariant
   violation, it simply makes the next *new* admission wait until releases recover it. This removes
   double-count / double-release / clamp-at-zero over-admit, and is what makes the restart window (§4) correct
@@ -119,47 +120,56 @@ flowchart LR
   Pinned by the reconnect-race interleaving test.
 - **`aira confine <cmd>`**: the confine supervisor holds one connection for the job's lifetime.
 - **aitest**: §8 (one connection per worker-lease, supervisor-held).
-- **Power loss / reboot**: self-cleaning — a fresh daemon at full quota is correct (the startup scan finds no
-  live scopes).
+- **Power loss / reboot**: self-cleaning — a fresh daemon at full quota is correct (no fresh dump file, so the
+  reload is skipped).
 - **Orphan edge (accepted, honestly stated — gate correction):** a SIGKILLed supervisor whose worker reparents
   and survives leaves the lease dropped while RAM is held. `oom.group=1` fires on **memory pressure, not on
   supervisor death**, so it does not reliably take the orphan — the **MemAvailable watchdog + own-cgroup OOM
   backstop are the only net**, bounded by orphan lifetime. An intra-slice risk, not "desktop-safe".
 
-## 4. Daemon restart without reboot — startup scan + reconnect/re-declare
+## 4. Daemon restart without reboot — dump on shutdown, reload + kill-probe, re-declare
 
-Every connection drops at once; jobs keep their RAM/CPU. Recovery combines a one-shot scan with client re-declare.
-All timings are localhost.
+Every connection drops at once; jobs keep their RAM/CPU. The ledger is persisted on graceful shutdown and
+reloaded (liveness-checked) on a quick restart, then refined by reconnect/re-declare. **No cgroup scan.** All
+timings are localhost.
 
 ```mermaid
 sequenceDiagram
-  participant D as aira-daemon (restarting)
+  participant D as aira-daemon
   participant S as survivor supervisor
-  Note over D: crash/upgrade — every lease connection drops
-  D->>D: start; ONE-SHOT slice scan seeds ledger from live .aira-CONFINE-* scopes
+  Note over D: graceful shutdown — dump ledger {scope-id, ram, cpu, pid} to a file
+  Note over D: (crash: no dump — rely on re-declare below)
+  D->>D: start; if dump file mtime < 10s: load it, kill -0 each pid, drop dead leases
   D->>D: open listener at t0, FREEZE new admissions
   loop reconnect 2/sec (500 ms timeout)
     S->>D: ARDR re-declare {scope-id, ram, cpu, parent} per held lease
-    D-->>S: 1-byte frozen ack — lease SET (refines the scan-seeded value; idempotent, no double-count)
+    D-->>S: 1-byte frozen ack — lease SET (re-anchors to this connection; idempotent, no double-count)
   end
   Note over D: t0 + 2000 ms: UNFREEZE
 ```
 
-- **One-shot startup scan seeds the ledger (owner design, gate P0-1 fix).** At startup the daemon reuses the
-  existing scan **once** to reconstruct a lease per live `.aira-CONFINE-*` scope, sized from the scope's
-  `memory.max` (an approximate floor). This covers the **first v0.5 → new-daemon upgrade**: v0.5 clients have no
-  re-declare code (`internal/runner/admission_linux.go:689`), so without the scan the ledger would open empty
-  under live jobs → slice OOM. With it, uncounted survivors are impossible.
-- **Reconnect/re-declare refines it, idempotently.** A reconnecting client SETs its own scope-id's lease to the
-  *exact* declared reserve; because SET is keyed by scope-id, a scope both scan-seeded and re-declared counts
-  **once** ("double-action protection"). Scopes whose client never reconnects (old v0.5) stay at the scan
-  estimate — correct, not doubled.
-- **Reconnect 2/sec (500 ms timeout); freeze new admissions 2000 ms from listen-ready** — localhost, so a live
-  survivor reconnects well inside the window. Re-declares accepted immediately; new admissions wait (never
+- **Dump on graceful shutdown; reload + kill-probe on startup (owner design, gate P0-1 fix — replaces the
+  scan).** On a graceful stop (the `aira install` upgrade path stops the daemon) the daemon writes each live
+  lease as `{scope-id, resource vector, client pid}` to a file. A starting daemon that finds that file **< 10 s
+  old** reloads it and `kill -0`s each recorded pid: a live pid keeps its lease (the reserve is the *exact*
+  dumped value — no leaf-empty scan guessing), a dead pid is dropped (no leaked seed). An absent or ≥ 10 s file
+  means a real reboot (or the first upgrade, below) → start at full quota, which is correct.
+- **Reconnect/re-declare refines it, idempotently.** As each client reconnects it SETs its own scope-id's lease,
+  **re-anchoring** it to the new connection (§3 compare-and-release) and refreshing the reserve. SET-by-scope-id
+  means a lease both reloaded and re-declared counts **once**.
+- **Reconnect 2/sec (500 ms timeout); freeze new admissions 2000 ms from listen-ready** — localhost, so
+  survivors reconnect well inside the window. Re-declares accepted immediately; new admissions wait (never
   fail-open).
 - **The signed ledger makes a late re-declare safe:** accepted after the window too; if intervening admissions
   committed, `available` goes negative and the next new admission waits — self-correcting, invariant never
-  violated. The freeze is an optimisation (fewer negative excursions), not the safety mechanism.
+  violated. The freeze is an optimisation, not the safety mechanism.
+- **First v0.5→new upgrade (P0, one-off):** v0.5 has neither dump code nor re-declare code
+  (`internal/runner/admission_linux.go:689`), so this transition alone has nothing to reload and no clients that
+  reconnect — a **controlled cutover** (drain / quiet box) covers it. Every subsequent restart has a dump. The
+  MemAvailable watchdog + OOM backstop remain the net throughout.
+- **pid-recycle edge (bounded):** within the < 10 s window on localhost a recycled pid is negligibly unlikely,
+  and a re-declaring client re-anchors and corrects the lease regardless; cross-check `/proc/<pid>` is an
+  `aira.slice` member only if it ever proves a concern. Not built now.
 - **The re-declare frame is version-frozen** — the load-bearing invariant (restart is usually an *upgrade*, OLD
   client ↔ NEW daemon). Hardened (gate P1-5):
   - **4-byte magic `ARDR` sniffed before any framing/handshake**, with the frozen, tested invariant
@@ -226,14 +236,20 @@ per-resource code is the ceiling calc:
 - **Terminal guard**: a test whose reservation exceeds the whole pool → fail-fast, run alone after drain, or mark
   `unevaluated`. Never hang the queue.
 
-## 9. Defaults & the reserve/containment split
+## 9. Defaults & the peak-RSS auto-sizer
 
 - `aira confine`: **1 core, 1 GB RAM** declared. The **peak-RSS estimate sizes the RAM reserve for any command
   seen before**; the 1 GB default is only the cold-start floor for a first-ever command (err high).
-- **Reserve (ledger) vs containment (`memory.max`) are separate — resolves the first-run OOM trap (gate P1-8):**
-  the ledger charges the *declared reserve* (accounting); the per-scope `memory.max` containment cap is unchanged
-  from v0.5 and **keeps its `peak + peak/2` escalation** (`admit.go:2030`), so a first-ever 4 GB command is not
-  capped at its 1 GB reserve and does not OOM-then-record-1 GB-forever.
+- **Per-scope `memory.max` containment is UNCHANGED from v0.5 and out of scope here — there is no first-run
+  trap.** v0.5 sets the scope cap from the reserve *only* for a daemon-validated, history-derived estimate and
+  deliberately leaves a first-run/guessed reserve **uncapped** (`confine_linux.go:985-992` — "enforcing a guess
+  as a hard cap would OOM-kill jobs that succeed today"). The admission ledger uses the declared reserve for
+  accounting; it does not change how the containment cap is sized. (The gate's P1-8 "first-run OOM trap" was a
+  non-problem; this design touches none of it.)
+- **The peak-RSS estimate keeps its input without the `worker-peak` relay:** the daemon reads each scope's — and
+  each worker sub-scope's — `memory.peak` at lease release (§3), which is exactly when it has the socket. That
+  replaces the deleted relay's feedback role, so declared-reserve auto-sizing (the thing that lets callers stop
+  hand-guessing, §11) is not starved.
 
 ## 10. Invariants
 
@@ -256,7 +272,8 @@ per-resource code is the ceiling calc:
   over-declaring is a caller error; peak-RSS auto-sizes known commands; working aitest removes the pressure to
   hand-guess. The live charge is not re-added (cannot keep both). **Data (§12) measures the residual.**
 - **Fairness on CI (owner-signed):** greedy in the pool; dev keeps AIRA-59/101/185; CI may skip — data decides.
-- **First-upgrade bootstrap:** covered by the one-shot startup scan (§4), not by re-declare.
+- **First v0.5→new upgrade:** a one-off controlled cutover (drain / quiet box) — v0.5 wrote no ledger dump and
+  has no re-declare, so there is nothing to reload and no reconnect; every subsequent restart has a dump (§4).
 - **2×cores loosens the `#49` desktop CPU reserve (owner-decided):** protection rests on `cpu.weight` (§7).
 - **Orphaned scope** (supervisor SIGKILLed, worker survives) — bounded by orphan lifetime; watchdog/OOM is the
   net, `oom.group` does not cover it (§3).
@@ -297,16 +314,16 @@ Socket-as-lease + EOF-release, release-on-failed-grant, peer-EOF arbitration, th
 discipline, the `--exclusive` lifecycle, and `SO_PEERCRED` **already exist and are tested** (`admit.go:2167-2181`).
 
 - **KEEP**: that socket-lease core; the MemAvailable watchdog; per-scope `oom.group` + `memory.max` containment
-  (with escalation); `--exclusive`/drain (dev); the peak-RSS estimate + `confine --list`; the scan code (run
-  once at startup, §4).
+  (unchanged from v0.5); `--exclusive`/drain (dev); the peak-RSS estimate + `confine --list`.
 - **REBUILD**: the ledger as the derived signed `ceiling − Σleases` (§2); add reconnect + re-declare + frozen
-  frame + freeze + startup-seed (§4); add the CPU resource to the map (§7); one-connection-per-worker-lease (§8);
-  the CI `--dump` (§12).
-- **DELETE, each through the two-loop (each is live):** the *periodic* scan/adoption (`#74`),
+  frame + freeze + the dump-on-shutdown / reload+kill-probe (§4); read `memory.peak` at release to feed the
+  estimate (§9); add the CPU resource to the map (§7); one-connection-per-worker-lease (§8); the CI `--dump` (§12).
+- **DELETE, each through the two-loop (each is live):** the whole cgroup scan/adoption path (`#74`),
   `refreshWaiterCharge`/`dynamicReserve` (AIRA-29), the `worker-peak` relay, the `cpuslots` flock governor, the
   `max_wait` plumbing, the AIRA-114 aggregate bound.
 - **BUMP `ProtocolVersion`** so a v0.5 client's *new* admission is refused loudly (re-declare is the only
   cross-version path).
-- **MERGE GATE**: a real-cgroup **restart-under-load integration test** (scan seeds, survivors re-declare, no
-  double-count, no over-admit), plus the reconnect-race and old-frame→new-parser pins.
+- **MERGE GATE**: a real **restart-under-load integration test** (dump on shutdown, reload + kill-probe, dead
+  pids dropped, survivors re-declare, no double-count, no over-admit), plus the reconnect-race and
+  old-frame→new-parser pins.
 - Live swap follows the v0.5 discipline (tests + review + soak; rollback path).
