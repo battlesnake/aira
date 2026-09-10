@@ -343,8 +343,9 @@ discipline, the `--exclusive` lifecycle, and `SO_PEERCRED` **already exist and a
   `confine-report`, above), the `cpuslots` flock governor, the `max_wait` plumbing, the AIRA-114 aggregate bound,
   **and the client-side flock fallback** (`admission_linux.go:427-445`, gate P1-B — a queued request on daemon
   EOF must reconnect and re-request, never fail-open to an ungoverned launch; AIRA-222's class).
-- **NAME the ci-shim's fate** (`internal/daemon/shim.go`, AIRA-121, gate P2-E): it re-sources the deleted scan —
-  either move it onto the counter or retire it. **Decision needed** (subpipe depends on the ci-shim advisory mode).
+- **ci-shim (`internal/daemon/shim.go`, AIRA-121) — OWNER-DECIDED (2026-09-11): retire the scan entirely; CI
+  mode does not need it.** The ci-shim's advisory ledger moves onto the same signed counter (advisory, no cgroup,
+  no scan); nothing re-sources a scan anywhere. subpipe's ci-shim advisory mode is preserved via the counter.
 - **BUMP `ProtocolVersion`** so a v0.5 client's *new* admission is refused loudly (re-declare is the only
   cross-version path).
 - **MERGE GATE**: a real **restart-under-load integration test** (dump on shutdown, reload + kill-probe, dead
