@@ -193,18 +193,13 @@ func TestAdmitReconstructionNonFiniteCapsContributeNeitherBytesNorHeadroom(t *te
 }
 
 // verifies: the scope-ID marker, not volatile daemon registry metadata, carries
-// the cap type across restart. Ceiling caps adopt at current+margin; ordinary
-// #67 finite caps keep adopting at their full cap.
+// the cap type across restart. Delegate ceiling caps adopt at
+// current + delegateRAMAdoptionMargin (the AIRA-74 restart-adoption margin);
+// ordinary #67 finite caps keep adopting at their full cap.
 //
-// AIRA-29 changed the MARGIN these two use, not the discrimination this test
-// exists to prove. Both assertions below are deliberately kept separate: a
-// rewrite that collapsed them into a single total would pass against an
-// implementation that had lost the class distinction altogether. What moved is
-// that the reconstruction now shares the AIRA-29 charge margin
-// (max(256 MiB, 12%)) instead of its own bare 64 MiB constant, so there is one
-// margin policy here rather than two. The unmarked scope also carries no
-// AgeSeconds, which AIRA-29 reads as "age not established, treat as young" --
-// so it adopts its full cap for a second, independent reason.
+// Both assertions below are deliberately kept separate: a rewrite that collapsed
+// them into a single total would pass against an implementation that had lost
+// the class distinction altogether.
 func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
 	const (
 		markedCapBytes  = int64(10 << 30)
@@ -233,8 +228,8 @@ func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
 	// the two reconstruction arms cancel and pass, which is exactly the
 	// discrimination the test exists to provide (found by build review).
 	t.Run("marked ceiling adopts current plus margin", func(t *testing.T) {
-		server, adopted, jobs := adoptOne(t, scope("CONFINE-@dr-suite-1-a", markedCapBytes))
-		want := rss + server.chargeMargin(rss, 0)
+		_, adopted, jobs := adoptOne(t, scope("CONFINE-@dr-suite-1-a", markedCapBytes))
+		want := rss + delegateRAMAdoptionMargin
 		if want >= markedCapBytes {
 			t.Fatalf("test arithmetic: the marked scope must adopt below its %d ceiling, got %d", markedCapBytes, want)
 		}
@@ -249,6 +244,33 @@ func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
 			t.Fatalf("adopted=%d jobs=%d, want exactly the whole cap %d / 1", adopted, jobs, regularCapBytes)
 		}
 	})
+}
+
+// TestAdmitReconstructionSkipsAnUnreconstructableDelegateOrphan pins the
+// delegate `!usableRSS -> continue` arm of the adoption switch: an orphaned
+// delegate scope whose memory.current cannot be read contributes NOTHING to the
+// adopted ledger. Its AIRA-15 containment cap is not a whole-job reservation, so
+// adopting the cap would over-reserve; and without this arm a nil RSS would fall
+// to the delegate reconstruction and dereference a nil pointer. Relocated from
+// the deleted dynamic-charge test file, which is where it used to live.
+func TestAdmitReconstructionSkipsAnUnreconstructableDelegateOrphan(t *testing.T) {
+	now := time.Unix(115_000, 0)
+	server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {
+		populated := 1
+		capText := formatInt64(48 * gib)
+		// RSSBytes deliberately nil: memory.current unreadable.
+		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{
+			{ScopeID: "CONFINE-@dr-suite-1-a", Populated: &populated, Cap: &capText},
+		}}, nil
+	})
+	queue := &sliceQueue{path: "/slice", server: server}
+
+	server.evaluateAdmitQueue(queue)
+
+	if queue.adopted != 0 || queue.adoptedJobs != 0 {
+		t.Fatalf("adopted=%d jobs=%d, want 0/0 -- an unreadable delegate ceiling must never be adopted as a reservation",
+			queue.adopted, queue.adoptedJobs)
+	}
 }
 
 func TestAdmitReconstructionSkipsEmptyAndUnknownScopes(t *testing.T) {

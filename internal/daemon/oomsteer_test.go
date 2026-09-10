@@ -396,27 +396,6 @@ func TestAdmitScopeBudgetsCountsOnlyWhatItCanEstablish(t *testing.T) {
 	}
 }
 
-// TestAdmitScopeBudgetsUsesTheDynamicChargeNotTheFrozenReserve: the budget must
-// be what the ledger actually holds right now. A waiter whose AIRA-29 charge has
-// fallen to 2 GiB is NOT entitled to the 33 GiB it was granted on.
-//
-// Guard: reading waiter.reserve is the obvious implementation and passes every
-// other test here, because those waiters are untracked and ledgerCharge()
-// returns the reserve for them.
-func TestAdmitScopeBudgetsUsesTheDynamicChargeNotTheFrozenReserve(t *testing.T) {
-	server := NewServer(Paths{})
-	queue := &sliceQueue{path: "/slice", server: server}
-	queue.waiters = []*admitWaiter{{
-		seq: 1, state: admitGranted, accounted: true, scopeID: steerNonDelegateScope,
-		reserve: 33 << 30, effectiveCharge: 2 << 30, chargeTracked: true,
-	}}
-	server.admitQueues["/slice"] = queue
-
-	if got := server.admitScopeBudgets("/slice")[steerNonDelegateScope]; got != 2<<30 {
-		t.Fatalf("budget = %d, want the tracked charge %d, not the frozen reserve", got, int64(2<<30))
-	}
-}
-
 // TestOOMSteerHoldsEverythingWhenAReadIsUnevaluated: an unestablished reading
 // must never be turned into a restore. Restoring on a failed read would undo a
 // correct raise on the strength of no evidence at all — the fabricated-fact

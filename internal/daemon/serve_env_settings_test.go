@@ -15,8 +15,8 @@ import (
 // nowhere else: nothing proved Serve applies the parsed value to the field the
 // subsystem actually reads. A dropped assignment, or one written to the wrong
 // field, left the whole suite green while the setting silently did nothing —
-// worst of all for AIRA_DAEMON_DYNAMIC_RESERVE, a kill switch whose one use is
-// an operator reverting an admission change on a loaded shared machine.
+// worst of all for an operational kill switch like AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR,
+// whose one use is an operator adjusting an admission bound on a loaded shared machine.
 //
 // The two tests below close that as a CLASS, not one variable at a time:
 //
@@ -84,15 +84,6 @@ func serveEnvSettingRows() []serveEnvSetting {
 			value: "91s",
 			want:  91 * time.Second,
 			get:   func(s *Server) any { return s.admitFreezeMaxHold },
-		},
-		{
-			// The AIRA-29 kill switch. Default is true, so only "disabled"
-			// proves Serve applied it.
-			field: "dynamicReserve",
-			env:   "AIRA_DAEMON_DYNAMIC_RESERVE",
-			value: "disabled",
-			want:  false,
-			get:   func(s *Server) any { return s.dynamicReserve },
 		},
 		{
 			// AIRA-114, carried as an integer percentage: 3.5x -> 350.

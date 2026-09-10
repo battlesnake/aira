@@ -196,19 +196,17 @@ func TestConfineListPublishesNoReserveForAnUnaccountedWaiter(t *testing.T) {
 // The invariant that makes the whole change checkable rather than merely
 // plausible: the per-scope reserves published by ONE listing sum to that same
 // listing's own scope-backed ledger total. A build whose per-scope number came
-// from anywhere but the ledger — the cap, the frozen grant under a dynamic
-// charge, a re-read of memory.current — fails here.
+// from anywhere but the ledger — the scope's memory.max cap, a re-read of
+// memory.current — fails here.
 //
-// The fixture carries all three populations at once, with three DIFFERENT
-// numbers per scope (cap, frozen reserve, live charge), so no two of them can be
-// confused and still pass.
+// The fixture keeps a scope's declared reserve DIFFERENT from its memory.max cap
+// so the two cannot be confused and still pass.
 func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 	const (
 		delegateCeiling = int64(45) << 30
 		delegateCharge  = int64(512) << 20
 		plainCap        = int64(8) << 30
-		plainFrozen     = int64(8) << 30
-		plainCharge     = int64(3) << 30 // AIRA-29 has re-derived this DOWN from the grant
+		plainCharge     = int64(3) << 30 // the declared reserve the ledger holds, below the scope's cap
 	)
 	slice := t.TempDir()
 	server := NewServer(Paths{})
@@ -227,9 +225,9 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 	queue.waiters = []*admitWaiter{
 		{seq: 1, reserve: delegateCharge, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
 			scopeID: delegateID, name: "suite", owner: "session-a", scopeCeiling: delegateCeiling},
-		// The dynamic-charge case: the frozen grant is 8 GiB, the ledger charges
-		// 3 GiB, and 3 GiB is what the slice is actually holding for it.
-		{seq: 2, reserve: plainFrozen, effectiveCharge: plainCharge, chargeTracked: true,
+		// The plain (non-delegate) case: the declared reserve is 3 GiB, below the
+		// scope's 8 GiB memory.max cap, and 3 GiB is what the slice is holding for it.
+		{seq: 2, reserve: plainCharge,
 			state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
 			scopeID: plainID, name: "build", owner: "session-a"},
 	}
@@ -250,8 +248,8 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 			total, want, result.SliceReserve.ScopeBytes, result.SliceReserve.AdoptedBytes)
 	}
 	if got := reserveScopeByID(t, result, plainID).ReserveBytes; got == nil || *got != plainCharge {
-		t.Fatalf("dynamically charged scope reserve=%v, want the live charge %d rather than the %d frozen grant or the %d cap",
-			got, plainCharge, plainFrozen, plainCap)
+		t.Fatalf("plain scope reserve=%v, want the declared reserve %d rather than the %d memory.max cap",
+			got, plainCharge, plainCap)
 	}
 }
 
@@ -271,7 +269,10 @@ func TestConfineListNamesAdoptedScopeReserves(t *testing.T) {
 	)
 	now := time.Unix(400_000, 0)
 	slice := t.TempDir()
-	scopeID := reserveScopeID(t, "adopted", 5106, false)
+	// A delegate scope: only there does the AIRA-15 containment cap exceed the
+	// declared reserve, so only there is the adopted reconstruction usage+margin
+	// rather than the full cap (a non-delegate scope re-pins its whole cap).
+	scopeID := reserveScopeID(t, "adopted", 5106, true)
 	server := oversubServer(&now, sliceMax, 3*gib, 200, staticScan(oversubRecord(scopeID, rss, capBytes)))
 	server.admitResolveSlice = func(string) (string, bool, string) { return slice, true, "" }
 	reserveScopeDir(t, slice, scopeID, capBytes, rss)

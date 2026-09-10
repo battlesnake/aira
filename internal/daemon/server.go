@@ -87,20 +87,6 @@ type Server struct {
 	admitPriorAt                 time.Time
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
-	// AIRA-29 dynamic reserve. Server fields rather than package globals so a
-	// test can pin the arithmetic; see the constants and rationale in admit.go.
-	//
-	// dynamicReserve is the operational KILL SWITCH, and it exists because this
-	// change deliberately accepts a new bounded over-subscription on a shared,
-	// machine-wide slice that every session on the box depends on. Turning it off
-	// must not require rebuilding and redeploying a daemon under load at the
-	// moment it is misbehaving: AIRA_DAEMON_DYNAMIC_RESERVE=disabled plus a
-	// restart reverts the WHOLE of AIRA-29 -- the live charge and the adoption
-	// margin both -- back to the frozen-reserve behaviour.
-	dynamicReserve        bool
-	chargeMarginFloor     int64
-	chargeMarginPct       int64
-	chargeColdFloorWindow time.Duration
 	// AIRA-114. The aggregate over-subscription bound, as an integer percentage
 	// of the slice ceiling (200 = 2x). Zero disables the bound entirely and
 	// restores AIRA-29's unbounded aggregate.
@@ -234,10 +220,6 @@ func NewServer(paths Paths) *Server {
 		workerScopeScanInterval:      workerScopeScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
-		dynamicReserve:               true,
-		chargeMarginFloor:            chargeMarginFloorDefault,
-		chargeMarginPct:              chargeMarginPctDefault,
-		chargeColdFloorWindow:        chargeColdFloorWindowDefault,
 		oversubscriptionFactorPct:    oversubscriptionFactorPctDefault,
 		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
@@ -355,11 +337,6 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.admitFreezeMaxHold = admitFreezeMaxHold
-	dynamicReserve, err := dynamicReserveFromEnv()
-	if err != nil {
-		return err
-	}
-	s.dynamicReserve = dynamicReserve
 	oversubscriptionFactorPct, err := oversubscriptionFactorFromEnv()
 	if err != nil {
 		return err

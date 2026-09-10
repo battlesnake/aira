@@ -98,10 +98,12 @@ func heldScopeWaiter(seq int64, scopeID string, reserve int64, grantedAt time.Ti
 }
 
 // TestAggregateBoundRefusesTheJobThatWouldBreachIt is the headline: the exact
-// case AIRA-29 §4e recorded and deferred. Six scopes hold 20 GiB caps while
-// using 1 GiB each, so the dynamic ledger has plenty of room and the reserve
-// check would admit a seventh — after which the caps handed out total 140 GiB
-// against a 64 GiB slice.
+// case AIRA-29 §4e recorded and deferred. Six delegate scopes each DECLARE a
+// 1 GiB framework-overhead reserve while their AIRA-15 containment caps are
+// 20 GiB, so the reserve ledger has plenty of room and the reserve check would
+// admit a seventh — after which the caps handed out total 140 GiB against a
+// 64 GiB slice. (Only a delegate scope's cap can exceed its declared reserve;
+// a non-delegate scope's memory.max IS its reserve.)
 //
 // Three arms, because one alone is porous in a different direction each time:
 //
@@ -127,16 +129,16 @@ func TestAggregateBoundRefusesTheJobThatWouldBreachIt(t *testing.T) {
 		records := make([]runner.ConfineRecord, 0, heldCount)
 		waiters := make([]*admitWaiter, 0, heldCount+1)
 		for index := 0; index < heldCount; index++ {
-			scopeID := "CONFINE-hog" + formatInt64(int64(index)) + "-1-a"
+			scopeID := "CONFINE-@dr-hog" + formatInt64(int64(index)) + "-1-a"
 			records = append(records, oversubRecord(scopeID, scopeRSS, scopeCap))
-			waiters = append(waiters, heldScopeWaiter(int64(index+1), scopeID, scopeCap, now.Add(-time.Hour)))
+			waiters = append(waiters, heldScopeWaiter(int64(index+1), scopeID, scopeRSS, now.Add(-time.Hour)))
 		}
 		newcomer := queuedScopeWaiter(heldCount+1, "CONFINE-newcomer-1-a", newcomerReserve, now)
 		waiters = append(waiters, newcomer)
 		server := oversubServer(&now, sliceMax, heldCount*scopeRSS, factorPct, staticScan(records...))
 		queue := &sliceQueue{
 			path: "/slice", server: server, waiters: waiters,
-			outstanding: heldCount * scopeCap, outstandingJobs: heldCount,
+			outstanding: heldCount * scopeRSS, outstandingJobs: heldCount,
 		}
 		return server, queue, newcomer
 	}
@@ -172,7 +174,7 @@ func TestAggregateBoundRefusesTheJobThatWouldBreachIt(t *testing.T) {
 		server.evaluateAdmitQueue(queue)
 
 		if newcomer.state != admitGranted {
-			t.Fatalf("with the bound disabled the newcomer must be admitted exactly as AIRA-29 leaves it (state=%v)", newcomer.state)
+			t.Fatalf("with the bound disabled the newcomer must be admitted; the reserve ledger has room (state=%v)", newcomer.state)
 		}
 		// The number this ticket exists to bound, stated rather than implied.
 		if want := int64(aggregate + 20*gib); want <= sliceMax {
@@ -309,7 +311,7 @@ func TestAggregateUnestablishedWithholdsNothing(t *testing.T) {
 	live := true
 	opaque := runner.ConfineRecord{ScopeID: "CONFINE-opaque-1-a", SubtreePopulated: &live}
 	server := oversubServer(&now, sliceMax, 2*gib, 200,
-		staticScan(oversubRecord("CONFINE-hog-1-a", gib, 100*gib), opaque))
+		staticScan(oversubRecord("CONFINE-@dr-hog-1-a", gib, 100*gib), opaque))
 	waiter := queuedScopeWaiter(1, "CONFINE-newcomer-1-a", 40*gib, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{waiter}}
 	registerAdmitQueue(server, queue)
