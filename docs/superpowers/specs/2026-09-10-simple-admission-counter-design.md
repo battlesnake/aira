@@ -161,15 +161,22 @@ sequenceDiagram
   survivors reconnect well inside the window. Re-declares accepted immediately; new admissions wait (never
   fail-open).
 - **The signed ledger makes a late re-declare safe:** accepted after the window too; if intervening admissions
-  committed, `available` goes negative and the next new admission waits — self-correcting, invariant never
-  violated. The freeze is an optimisation, not the safety mechanism.
+  committed, `available` goes negative and the next new admission waits — self-correcting, the ledger invariant
+  never violated. Division of labour (gate P3): the **freeze bounds the PHYSICAL over-subscription window** (a
+  job admitted against an incomplete ledger has already *launched* — negative `available` cannot retract it),
+  while the **signed ledger bounds ledger DRIFT** (double-count / late re-declare). Both are needed.
 - **First v0.5→new upgrade (P0, one-off):** v0.5 has neither dump code nor re-declare code
   (`internal/runner/admission_linux.go:689`), so this transition alone has nothing to reload and no clients that
   reconnect — a **controlled cutover** (drain / quiet box) covers it. Every subsequent restart has a dump. The
   MemAvailable watchdog + OOM backstop remain the net throughout.
-- **pid-recycle edge (bounded):** within the < 10 s window on localhost a recycled pid is negligibly unlikely,
-  and a re-declaring client re-anchors and corrects the lease regardless; cross-check `/proc/<pid>` is an
-  `aira.slice` member only if it ever proves a concern. Not built now.
+- **Reloaded leases are UNANCHORED until re-declared, and dropped if they stay so (gate P1-A — the biggest
+  risk).** A dump records the *supervisor's* pid, which outlives its workers, so `kill -0` alone would keep a
+  retired worker's lease forever (a leak by a different path than the scan's). So a reloaded lease is marked
+  `unanchored`; a client's re-declare **re-anchors** it to a live connection; any lease still unanchored at
+  **end-of-freeze + a short grace (~10 s) is dropped regardless of pid** — a late re-declare just SETs it again
+  (the signed ledger absorbs the transient). `kill -0` (+ process start-tick, retiring pid-recycle) is only an
+  *early-drop* optimisation, never the sole keep condition. The restart-under-load merge test must cover a
+  worker retiring mid-drain.
 - **The re-declare frame is version-frozen** — the load-bearing invariant (restart is usually an *upgrade*, OLD
   client ↔ NEW daemon). Hardened (gate P1-5):
   - **4-byte magic `ARDR` sniffed before any framing/handshake**, with the frozen, tested invariant
@@ -177,7 +184,9 @@ sequenceDiagram
   - **A TOTAL parser**: every byte sequence parses or is a hard, LOGGED reject — never a silent/partial drop.
   - **Freeze SEMANTICS, not just layout**: the per-build test feeds an old frame to the new parser and asserts
     the resulting **ledger charge**, not field deserialization.
-  - **A frozen 1-byte ack**; **`SO_PEERCRED` same-uid** + scope-id → live-pid check; **order-independent**.
+  - **A frozen 1-byte ack**; **`SO_PEERCRED` same-uid only** (gate P2-C: a scope-id→cgroup-membership check
+    would reject every legitimate re-declare — both confine and aitest holders live *outside* their own scope);
+    **order-independent**.
   - Frame: `magic(4B "ARDR") | frame_len(u32) | scope_id(len-prefixed utf8) | ram_bytes(u64) |
     cpu_cores(u32 integer) | parent_scope_id(len-prefixed utf8, "" if none)`.
   - A **golden-bytes fixture shared by the Go and Python encoders** (aitest's supervisor is Python).
@@ -205,6 +214,11 @@ Request = `{ resources: {ram, cpu, …}, mode }`. Two modes, no timeout:
 **No timeout / no per-scope release verb / no multiplex** — because **one connection = one lease** (§8): a
 finished lease's connection EOFs; a client wanting bounded-wait closes its connection to cancel. Nested
 (delegate) availability = `min(slice-available, outer-cap-available)`, decrementing **both** ledgers.
+
+**On daemon EOF a waiter reconnects and re-requests — never fail-open (gate P1-B).** A blocked or new request
+whose connection drops (daemon restart) retries connect at 2/sec with no timeout and re-issues its request,
+taking a fresh FIFO position; it must never fall back to an ungoverned launch (this replaces the deleted
+client-side flock fallback, §14).
 
 ## 7. Resources — general by construction
 
@@ -246,10 +260,14 @@ per-resource code is the ceiling calc:
   as a hard cap would OOM-kill jobs that succeed today"). The admission ledger uses the declared reserve for
   accounting; it does not change how the containment cap is sized. (The gate's P1-8 "first-run OOM trap" was a
   non-problem; this design touches none of it.)
-- **The peak-RSS estimate keeps its input without the `worker-peak` relay:** the daemon reads each scope's — and
-  each worker sub-scope's — `memory.peak` at lease release (§3), which is exactly when it has the socket. That
-  replaces the deleted relay's feedback role, so declared-reserve auto-sizing (the thing that lets callers stop
-  hand-guessing, §11) is not starved.
+- **The peak-RSS estimate keeps its input via the existing `confine-report` verb — NOT a daemon read at release
+  (gate P1-C: my earlier claim was dead code).** The scope is removed *before* the lease connection closes (LIFO
+  defer: `releaseAdmission` at `confine_linux.go:716` runs before `cleanup`/`scope.Remove` at `:818`), so
+  `memory.peak` is unreadable at EOF. Instead the HOLDER reads `memory.peak` before its own rmdir and sends the
+  sample over the `confine-report`/`ReportPeakSample` verb (`confine_linux.go:1408`, `admission_linux.go:791`);
+  aitest's supervisor sends its one pool sample the same way (`supervisor.py:1605`). KEEP that verb (§14); the
+  estimate is keyed by command signature, independent of the lease. The relay's *transport* is retired, its
+  *feedback* is not — so auto-sizing (§11) is not starved.
 
 ## 10. Invariants
 
@@ -314,16 +332,45 @@ Socket-as-lease + EOF-release, release-on-failed-grant, peer-EOF arbitration, th
 discipline, the `--exclusive` lifecycle, and `SO_PEERCRED` **already exist and are tested** (`admit.go:2167-2181`).
 
 - **KEEP**: that socket-lease core; the MemAvailable watchdog; per-scope `oom.group` + `memory.max` containment
-  (unchanged from v0.5); `--exclusive`/drain (dev); the peak-RSS estimate + `confine --list`.
+  (unchanged from v0.5); `--exclusive`/drain (dev); the peak-RSS estimate + `confine --list`; **the
+  `confine-report`/`ReportPeakSample` verb** (the estimate's feedback — gate P1-C).
 - **REBUILD**: the ledger as the derived signed `ceiling − Σleases` (§2); add reconnect + re-declare + frozen
-  frame + freeze + the dump-on-shutdown / reload+kill-probe (§4); read `memory.peak` at release to feed the
-  estimate (§9); add the CPU resource to the map (§7); one-connection-per-worker-lease (§8); the CI `--dump` (§12).
+  frame + freeze + the dump-on-shutdown / reload+kill-probe with **unanchored-lease-drop** (§4); add the CPU
+  resource to the map (§7); one-connection-per-worker-lease **as a worker-admit — the daemon creates the
+  sub-scope** (§8); the CI `--dump` (§12).
 - **DELETE, each through the two-loop (each is live):** the whole cgroup scan/adoption path (`#74`),
-  `refreshWaiterCharge`/`dynamicReserve` (AIRA-29), the `worker-peak` relay, the `cpuslots` flock governor, the
-  `max_wait` plumbing, the AIRA-114 aggregate bound.
+  `refreshWaiterCharge`/`dynamicReserve` (AIRA-29), the `worker-peak` relay *transport* (its sample feed moves to
+  `confine-report`, above), the `cpuslots` flock governor, the `max_wait` plumbing, the AIRA-114 aggregate bound,
+  **and the client-side flock fallback** (`admission_linux.go:427-445`, gate P1-B — a queued request on daemon
+  EOF must reconnect and re-request, never fail-open to an ungoverned launch; AIRA-222's class).
+- **NAME the ci-shim's fate** (`internal/daemon/shim.go`, AIRA-121, gate P2-E): it re-sources the deleted scan —
+  either move it onto the counter or retire it. **Decision needed** (subpipe depends on the ci-shim advisory mode).
 - **BUMP `ProtocolVersion`** so a v0.5 client's *new* admission is refused loudly (re-declare is the only
   cross-version path).
 - **MERGE GATE**: a real **restart-under-load integration test** (dump on shutdown, reload + kill-probe, dead
   pids dropped, survivors re-declare, no double-count, no over-admit), plus the reconnect-race and
   old-frame→new-parser pins.
 - Live swap follows the v0.5 discipline (tests + review + soak; rollback path).
+
+## 15. Gate fold-list — build-time details (Fable confirm-gate P2/P3, apply at implementation)
+
+Captured so they are not lost; none change the design shape.
+
+- **Dump timing / durability (P2-A):** snapshot the ledger *before* `close(stopping)` (`server.go:573`); write
+  it fsync+rename as the last act before exit. The freshness threshold must be ≥ `DrainTimeout` (10 s) +
+  `RestartSec` (2 s) + margin (~**30 s**, not 10 s) or a slow drain silently skips the reload.
+- **Dump records are frozen ARDR frames + pid + process-start-tick (P2-B/P3):** the dump is written by the OLD
+  binary and read by the NEW one on upgrade, so use the same frozen encoder as the re-declare frame (one Go
+  encoder, one golden fixture); an unparseable record is logged and skipped. Include `parent_scope_id`. Load is
+  **consume-once** (rename away on read) so a stale file cannot re-seed twice.
+- **Exclusive / drain-hold across restart (P2-D):** neither the dump nor the frame carries exclusivity, so an
+  `--exclusive` holder does **not** reconnect — it reports `exclusive=lost` (v0.5's watcher already does this,
+  `confine_linux.go:755-795`) rather than silently running contended.
+- **Worker lease shape (P2-F):** an aitest worker lease is a *worker-admit* (the daemon creates the sub-scope and
+  returns its path + `memory_max`; placement stays in Python via `cgroup.procs`), not a bare resource vector; the
+  worker-ID re-seed reads the tree's largest suffix on restart (`worker_admit.go:769-771`) — a one-readdir read
+  the design keeps.
+- **§3 wording (P3):** "the daemon never closes a lease-bearing connection on error" holds *except at graceful
+  shutdown, which closes every lease connection **after** the dump is written*.
+- **Unverified (report-as):** that N Python re-declare connections reconnect cheaply on localhost (§13) —
+  plausible, measure during Stage-C build.
