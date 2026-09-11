@@ -104,6 +104,52 @@ func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 	}
 }
 
+// verifies: S16 — a non-blocking probe (MaxWait == 0) against the real daemon
+// returns a SNAPSHOT whose available_bytes/available_cpu are carried back to the
+// caller on the outcome (not dropped). This is the client half of the S15→S16
+// pool-growth handoff: before this the client parsed a grant's placement fields
+// but silently discarded the snapshot's headroom, so the aitest supervisor could
+// never size its pool. Mutating the two new grant fields out of the struct (or the
+// pass-through that copies them onto the outcome) reds this.
+func TestRequestWorkerAdmitProbeCarriesSnapshotHeadroom(t *testing.T) {
+	paths := daemonTestPaths(t)
+	server := daemon.NewServer(paths)
+	server.SetAdmitResolveSliceForTest(func(string) (string, bool, string) { return "/slice", true, "" })
+	// A large, KNOWN ceiling with zero current use and no outstanding leases: the
+	// snapshot's available_bytes is then the ceiling minus the daemon's own headroom,
+	// a positive figure the probe must carry back.
+	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 20 << 30, 0, true, "" })
+	server.SetRestartFreezeForTest(0) // not frozen: report a figure, not unevaluated
+	server.SetWorkerScopeTreeForTest()
+	ready := make(chan struct{}, 1)
+	server.Ready = ready
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	<-ready
+
+	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
+		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer",
+		EstimatedBytes: 5 * (1 << 20), MaxWait: 0, // 0 == non-blocking probe
+	})
+	if outcome.Granted() || outcome.Lease != nil {
+		t.Fatalf("a probe must never grant: %+v", outcome)
+	}
+	if outcome.State != runner.WorkerAdmitStateDenied || outcome.Class != runner.WorkerAdmitClassContended ||
+		outcome.Reason != runner.WorkerAdmitReasonSnapshot {
+		t.Fatalf("outcome=%+v, want state=denied class=contended reason=snapshot", outcome)
+	}
+	if outcome.AvailableBytes <= 0 {
+		t.Fatalf("probe dropped available_bytes (got %d) — the snapshot headroom did not survive the daemon->client hop", outcome.AvailableBytes)
+	}
+	// cpuCeiling() defaults to 2*NumCPU and no lease is outstanding, so a positive
+	// core count must come back on any real host.
+	if outcome.AvailableCPU <= 0 {
+		t.Fatalf("probe dropped available_cpu (got %d)", outcome.AvailableCPU)
+	}
+}
+
 func TestRequestWorkerAdmitProbeBoundsWaitWhenDaemonAcceptsButNeverResponds(t *testing.T) {
 	// S15: a non-blocking PROBE (MaxWait == 0) is a bounded request/response, so a
 	// daemon that accepts the connection but stalls before writing ANY response must

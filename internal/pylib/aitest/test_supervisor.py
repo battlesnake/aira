@@ -25,7 +25,30 @@ from aitest.supervisor import _OUTCOME_CLASS_EXCEPTIONS, _parse_worker_admit_out
 from aitest.worker import _EVENT_LINE_PREFIX, _tag_tuples, run_one
 
 
+# S16: a worker-admit relay is now called in two modes. A CLAIM (no --max-wait) is
+# what these stubs answer with a grant/denial; a PROBE (--max-wait 0s) is the
+# non-blocking snapshot the supervisor issues to SIZE pool growth, and it never
+# grants. A stub written to grant a CLAIM would, if it also granted the PROBE, look
+# to the supervisor like a daemon that granted a snapshot -- a contract violation
+# that drains the queue. So any stub that grants (contains "state=granted") is
+# auto-wrapped to answer a probe with a plentiful-headroom SNAPSHOT instead, which
+# lets startup fill the pool exactly as before (the growth guards cap it at
+# worker_count) without a probe ever being mistaken for a grant. Stubs that do NOT
+# grant -- the dedicated snapshot / freeze / unavailable / wedged-probe fixtures --
+# are left untouched so they can drive the probe path themselves.
+_PROBE_SNAPSHOT_WRAPPER = (
+    "import sys as _probe_sys\n"
+    "if '--max-wait' in _probe_sys.argv and '0s' in _probe_sys.argv:\n"
+    "    print('aira-worker-admit state=denied class=contended reason=snapshot "
+    "available_bytes=1099511627776 available_cpu=1024')\n"
+    "    _probe_sys.stdout.flush()\n"
+    "    _probe_sys.exit(1)\n"
+)
+
+
 def _write_stub(path, body):
+    if "state=granted" in body:
+        body = _PROBE_SNAPSHOT_WRAPPER + body
     path.write_text("#!/usr/bin/env python3\n" + body)
     os.chmod(path, 0o700)
     return str(path)
@@ -495,6 +518,65 @@ def test_acquire_worker_malformed_grant_does_not_deadlock_on_a_relay_holding_std
     assert "memory_max" in str(outcome["exc"])
 
 
+def test_probe_available_parses_a_real_snapshot_line(tmp_path, monkeypatch):
+    """S16 wire path: _probe_available parses the daemon's SNAPSHOT
+    (state=denied class=contended reason=snapshot available_bytes=N
+    available_cpu=M) into the (bytes, cpu) headroom the growth policy sizes from.
+    This is the Python half of the S15->S16 handoff; the Go half is
+    TestRequestWorkerAdmitProbeCarriesSnapshotHeadroom /
+    TestWorkerAdmitOutcomeLineCarriesProbeSnapshotHeadroom."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-snapshot",
+        "aira-worker-admit state=denied class=contended reason=snapshot "
+        "available_bytes=419430400 available_cpu=6",
+    )
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    supervisor._run_estimated_bytes = 1 << 20
+    assert supervisor._probe_available() == (419430400, 6)
+    assert supervisor.daemon_available is True
+
+
+def test_probe_available_freeze_snapshot_returns_none(tmp_path, monkeypatch):
+    """The restart-freeze snapshot is state=unevaluated with NO figures (the slice
+    is frozen, not saturated -- the S11 honesty pin). _probe_available must read it
+    as headroom transiently unestablished (None), never as a fabricated 0 that would
+    read as "no room" and wrongly suppress growth for the rest of the freeze."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-freeze",
+        "aira-worker-admit state=unevaluated class=contended reason=snapshot "
+        "detail=restart+freeze",
+    )
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    supervisor._run_estimated_bytes = 1 << 20
+    assert supervisor._probe_available() is None
+    assert supervisor.daemon_available is True
+
+
+def test_growth_probe_unavailable_line_skips_without_disabling(tmp_path, monkeypatch, capsys):
+    """S16 load-bearing property through the REAL parse path: a probe that returns a
+    dial-failed admission-unusable line (the sub-second window of a daemon RESTART)
+    must make the live-pool growth tick SKIP, never disable the daemon. This is the
+    end-to-end mutation target: making _try_grow_one disable on WorkerAdmitUnavailable
+    reds this."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-restart-window",
+        "aira-worker-admit state=unavailable class=admission-unusable reason=dial-failed",
+    )
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    supervisor._run_worker_count = 4
+    supervisor._run_estimated_bytes = 1 << 20
+    supervisor.queue = ["t0", "t1"]
+    supervisor.workers[111] = {"in_flight": None}  # a live pool
+    assert supervisor._try_grow_one() is False
+    assert supervisor.daemon_available is True, (
+        "a dial failure during a daemon restart must not disable the daemon on the live path"
+    )
+    assert "falling back" not in capsys.readouterr().err
+
+
 def test_next_nodeid_and_requeue_once_semantics():
     supervisor = Supervisor()
     supervisor.queue = ["test_a.py::test_one", "test_b.py::test_two"]
@@ -699,7 +781,7 @@ def test_spawn_worker_closes_dispatch_write_when_placement_ack_is_missing(monkey
         return pid, False
 
     supervisor = Supervisor()
-    supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
+    supervisor.acquire_worker = lambda estimated_bytes, blocking: (
         {"scope": "/unused", "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module.os, "pipe", recording_pipe)
@@ -752,7 +834,7 @@ def test_spawn_worker_removes_the_granted_scope_dir_on_placement_failure(tmp_pat
     scope_dir = tmp_path / "granted-scope"
     scope_dir.mkdir()
     supervisor = Supervisor()
-    supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
+    supervisor.acquire_worker = lambda estimated_bytes, blocking: (
         {"scope": str(scope_dir), "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
@@ -1034,7 +1116,7 @@ def test_dispatch_to_idle_workers_dispatches_to_a_same_pass_replacement(monkeypa
     }
     replacement_pid = 999998
 
-    def fake_spawn_worker(estimated_bytes, max_wait="30s"):
+    def fake_spawn_worker(estimated_bytes, blocking=True):
         supervisor.workers[replacement_pid] = {
             "result_fd": replacement_result_read, "read_buffer": b"", "result_eof": False,
             "in_flight": None,
@@ -1499,40 +1581,41 @@ sys.stdin.buffer.read()
     assert results == {items[0].nodeid: "passed"}
 
 
-def test_replace_worker_respects_pool_cap_when_daemon_goes_unavailable_mid_run(monkeypatch):
-    """Regression test for a real bug (Fable build-review, final gate):
-    _replace_worker's daemon-unavailable branch used to call
-    _spawn_fallback_worker() UNCONDITIONALLY on every retirement, never
-    checking the min(worker_count, max_workers_fallback) TOTAL-pool cap
-    run()'s own startup path enforces -- so a daemon that went
-    unreachable mid-run (with N confined workers already live) converged
-    the pool back up to N concurrent UNCONFINED workers instead of
-    draining down to the promised cap, directly contradicting
-    _disable_daemon's own warning text. Sibling test below
-    (test_fallback_worker_count_capped_at_pool_size_not_added_on_top)
-    covers only the mid-STARTUP case; this is a focused unit-level test
-    of _replace_worker's own gate, deterministic (no real fork/timing),
-    for the mid-run case specifically."""
+def test_replace_worker_transient_unavailable_with_live_sibling_does_not_disable(monkeypatch, capsys):
+    """S16 load-bearing property, at the replacement path: with a sibling worker
+    still alive, a transient WorkerAdmitUnavailable (the sub-second dial window of a
+    daemon RESTART) must be a SKIPPED tick, NEVER a disable. Disabling here would
+    strip RAM containment from the rest of the run over a restart the surviving pool
+    rode out transparently (the Go relay re-anchors every held lease). A replacement
+    made while others are alive is speculative -- it goes through the probe, so the
+    probe's own Unavailable is what this exercises.
+
+    The pool-cap gate this test used to cover (don't converge to N unconfined
+    workers) now only applies on the empty-pool path and is covered by
+    test_replace_worker_still_spawns_fallback_when_under_the_pool_cap and
+    test_fallback_worker_count_capped_at_pool_size_not_added_on_top."""
     supervisor = Supervisor()
     supervisor.queue = ["test_a.py::test_one"]
     supervisor._run_worker_count = 2
+    supervisor._run_estimated_bytes = 1 << 20
     supervisor.max_workers_fallback = 1
     supervisor.daemon_available = True
-    # One sibling worker is already live (the survivor of whichever
-    # retirement triggered this _replace_worker call) -- already AT the
-    # min(2, 1)=1 cap.
+    # A sibling worker is still live and dispatching.
     supervisor.workers[111] = {"in_flight": None}
     monkeypatch.setattr(
-        supervisor, "spawn_worker",
-        lambda estimated_bytes, max_wait: (_ for _ in ()).throw(WorkerAdmitUnavailable("daemon gone")),
+        supervisor, "_probe_available",
+        lambda: (_ for _ in ()).throw(WorkerAdmitUnavailable("dial refused: daemon restarting")),
     )
     fallback_calls = []
     monkeypatch.setattr(supervisor, "_spawn_fallback_worker", lambda: fallback_calls.append(1))
 
     supervisor._replace_worker()
 
-    assert supervisor.daemon_available is False
-    assert fallback_calls == [], "pool already at the min(worker_count, max_workers_fallback) cap -- must not grow back up"
+    assert supervisor.daemon_available is True, (
+        "a transient Unavailable on the live-pool replacement path must NOT disable the daemon"
+    )
+    assert fallback_calls == [], "no fallback: the daemon is still available and the pool is intact"
+    assert "falling back" not in capsys.readouterr().err
 
 
 def test_replace_worker_still_spawns_fallback_when_under_the_pool_cap(monkeypatch):
@@ -1549,7 +1632,7 @@ def test_replace_worker_still_spawns_fallback_when_under_the_pool_cap(monkeypatc
     # the min(2, 1)=1 cap.
     monkeypatch.setattr(
         supervisor, "spawn_worker",
-        lambda estimated_bytes, max_wait: (_ for _ in ()).throw(WorkerAdmitUnavailable("daemon gone")),
+        lambda estimated_bytes, blocking: (_ for _ in ()).throw(WorkerAdmitUnavailable("daemon gone")),
     )
     fallback_calls = []
     monkeypatch.setattr(supervisor, "_spawn_fallback_worker", lambda: fallback_calls.append(1))
@@ -1562,37 +1645,32 @@ def test_replace_worker_still_spawns_fallback_when_under_the_pool_cap(monkeypatc
 
 def test_fallback_worker_count_capped_at_pool_size_not_added_on_top(tmp_path, monkeypatch, pytester):
     """Fallback spawning must respect min(requested_worker_count,
-    max_workers_fallback) as the TOTAL pool size -- not spawn up to
-    max_workers_fallback ON TOP OF whatever was already admitted before
-    the daemon was marked unavailable mid-startup, and not ignore
-    --aitest-workers by always growing to the (possibly NumCPU-sized)
-    fallback cap regardless of what was actually requested. The first
-    worker-admit call succeeds (one confined worker gets running); the
-    second reveals the daemon is genuinely unreachable."""
-    outer = tmp_path / "outer"
-    outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+    max_workers_fallback) as the TOTAL pool size -- it must NOT ignore
+    --aitest-workers by always growing to the (possibly NumCPU-sized) fallback
+    cap regardless of what was actually requested.
+
+    S16 note: under the empty-pool/live-pool split, the daemon is only ever
+    DISABLED from an empty pool (the growth path skips a transient Unavailable
+    rather than disabling with workers still alive -- see
+    test_replace_worker_transient_unavailable_with_live_sibling_does_not_disable).
+    So the "already admitted a confined worker, then disabled" shape this test
+    once used no longer arises: whenever fallback runs, the pool is empty, and the
+    cap this pins is min(worker_count, max_workers_fallback) from zero, never
+    max_workers_fallback. Here worker_count=3 < max_workers_fallback=5, so the
+    fallback pool must be capped at 3, proving --aitest-workers is honoured."""
+    bootstrap = _write_stub(tmp_path / "bootstrap", """
 import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
+sys.stdout.write("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor admission=cgroup-sub-scope\\n")
 sys.exit(0)
 """)
-    admit_state = tmp_path / "admit-count"
-    admit_state.write_text("0")
-    admit = _write_stub(tmp_path / "worker-admit", f"""
-import os, sys
-state_path = {str(admit_state)!r}
-count = int(open(state_path).read())
-open(state_path, "w").write(str(count + 1))
-if count == 0:
-    scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
-    os.makedirs(scope, exist_ok=True)
-    print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
-    sys.stdout.flush()
-    sys.stdin.buffer.read()
-else:
-    print("aira-worker-admit state=unavailable class=admission-unusable reason=dial-failed")
-    sys.stdout.flush()
-    sys.exit(1)
+    # The daemon is unreachable for every request -- probe and claim alike (no
+    # "state=granted" in the body, so no probe wrapper is applied): the empty-pool
+    # blocking claim is what disables it, and the fallback pool fills from zero.
+    admit = _write_stub(tmp_path / "worker-admit", """
+import sys
+print("aira-worker-admit state=unavailable class=admission-unusable reason=dial-failed")
+sys.stdout.flush()
+sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
@@ -1625,11 +1703,9 @@ else:
     assert len(results) == 3
     assert all(outcome == "passed" for outcome in results.values())
     assert supervisor.daemon_available is False
-    # 1 confined worker was already admitted before unavailability was
-    # detected -- the fallback loop must add at most 2 MORE (pool size 3 =
-    # min(worker_count=3, max_workers_fallback=5), minus the 1 already
-    # running), never up to 5 on top of it.
-    assert len(fallback_spawns) <= 2
+    # The fallback pool is capped at min(worker_count=3, max_workers_fallback=5),
+    # NOT grown to max_workers_fallback=5 -- --aitest-workers is honoured.
+    assert 1 <= len(fallback_spawns) <= 3
 
 
 def test_startup_never_admits_more_workers_than_there_is_queued_work(tmp_path, monkeypatch, pytester):
@@ -2424,70 +2500,53 @@ def test_drain_worker_rejects_a_logstart_event_for_the_wrong_nodeid(pytester, mo
 # ---------------------------------------------------------------------------
 
 
-def test_unresponsive_admit_relay_does_not_wedge_the_whole_pool(tmp_path, monkeypatch, pytester):
-    """THE AIRA-92 REGRESSION. A relay that answers nothing at all must cost at
-    most one admission attempt, never the run.
+def test_unresponsive_growth_probe_does_not_wedge_a_live_pool(tmp_path, monkeypatch):
+    """S16 retarget of the AIRA-92 whole-pool regression onto the path the property
+    now lives on. A relay that answers NOTHING to a growth PROBE must cost at most
+    one BOUNDED attempt: it must not freeze the single-threaded dispatch loop and
+    must not disable the daemon.
 
-    Against the pre-fix implementation this test does not fail, it HANGS
-    FOREVER on acquire_worker's untimed process.stdout.readline() -- which is
-    precisely the bug. The stub wedges exactly one admission (the replacement
-    acquired after the first recycle) and answers normally afterwards, so a
-    correct supervisor rides through it and still completes every nodeid."""
-    outer = tmp_path / "outer"
-    outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
-    counter = tmp_path / "admit-calls"
-    wedged_marker = tmp_path / "wedged"
-    admit = _write_stub(tmp_path / "worker-admit-wedged", f"""
-import os, sys, time
-with open({str(counter)!r}, "a") as handle:
-    handle.write("x")
-with open({str(counter)!r}) as handle:
-    n = len(handle.read())
-if n == 3:
-    # Answer NOTHING: no grant, no denial, no exit. Models the relay's own
-    # unbounded segments (dial, CreateWorkerScope, PathsFromEnv) which sit
-    # outside its socket deadline.
-    with open({str(wedged_marker)!r}, "w") as handle:
-        handle.write("1")
+    The property is now specifically a LIVE-pool one. Under S15 the EMPTY-pool
+    blocking claim is deliberately UNBOUNDED -- a run with no workers genuinely waits
+    for admission rather than silently falling back to unconfined -- so "don't wedge
+    the pool" only means anything where there IS a pool to wedge. This test seeds one
+    live worker and wedges the probe (which is the only relay call a live-pool growth
+    tick makes before it would claim), proving the growth path stays bounded."""
+    admit = _write_stub(tmp_path / "worker-admit-wedged-probe", """
+import sys, time
+# Wedge ONLY the non-blocking probe (--max-wait 0s). This isolates the live-pool
+# growth probe from the empty-pool blocking claim (which passes no --max-wait and
+# is deliberately unbounded).
+if "0s" in sys.argv:
     time.sleep(600)
-scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
-os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
-sys.stdout.flush()
-sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
-    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
     monkeypatch.setenv("AIRA_AITEST_ADMIT_READ_GRACE", "1")
-
-    items = pytester.getitems("""
-        def test_a(): assert True
-        def test_b(): assert True
-        def test_c(): assert True
-        def test_d(): assert True
-    """)
     supervisor = Supervisor()
-    supervisor.collect(items)
-    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2, max_wait="1s")
+    supervisor.outer_scope = "/outer"
+    supervisor._run_worker_count = 4
+    supervisor._run_estimated_bytes = 1 << 20
+    supervisor.queue = ["t0", "t1", "t2", "t3"]
+    supervisor.workers[111] = {"in_flight": None}  # a live worker: this is a LIVE pool
 
-    assert wedged_marker.exists(), "the wedged-relay branch never ran; test proves nothing"
-    assert len(results) == 4
-    assert all(outcome == "passed" for outcome in results.values()), results
-    # A relay that merely failed to answer is NOT proof the daemon is gone, so
-    # containment must survive it.
-    assert supervisor.daemon_available is True
+    started = time.monotonic()
+    grew = supervisor._maybe_grow_pool()
+    elapsed = time.monotonic() - started
+
+    assert grew is False, "a wedged probe grants nothing"
+    assert elapsed < 30, (
+        "the growth probe read was not bounded (%.1fs) -- a wedged probe wedged the loop" % elapsed
+    )
+    assert supervisor.daemon_available is True, "a wedged probe must not disable the daemon"
 
 
-def test_unresponsive_admit_relay_is_a_denial_not_daemon_unavailable(tmp_path, monkeypatch, capsys):
-    """Classification, isolated from the dispatch loop. WorkerAdmitUnavailable
-    would _disable_daemon and run the REST of the suite unconfined, on a daemon
-    that was never shown to be unreachable."""
+def test_bounded_growth_claim_that_never_grants_is_a_denial_not_daemon_unavailable(tmp_path, monkeypatch, capsys):
+    """Classification, isolated from the dispatch loop. A bounded (blocking=False)
+    growth claim whose relay never grants inside the read grace -- the daemon
+    accepted the claim but another job took the room the probe saw, so the claim now
+    blocks -- must be reported as a DENIAL (containment preserved), NEVER
+    WorkerAdmitUnavailable, which would _disable_daemon and run the REST of the suite
+    unconfined on a daemon that was never shown to be unreachable."""
     relay_pidfile = tmp_path / "relay-pid"
     admit = _write_stub(tmp_path / "worker-admit-silent", f"""
 import os, time
@@ -2502,16 +2561,16 @@ time.sleep(600)
 
     started = time.monotonic()
     try:
-        supervisor.acquire_worker(1 << 20, max_wait="1s")
+        supervisor.acquire_worker(1 << 20, blocking=False)
         assert False, "expected WorkerAdmitDenied"
     except WorkerAdmitUnavailable as exc:
-        assert False, "an unresponsive relay must not be reported as an absent daemon: %s" % exc
+        assert False, "a claim that never granted must not be reported as an absent daemon: %s" % exc
     except WorkerAdmitDenied as exc:
-        assert "relay-unresponsive" in str(exc)
+        assert "growth-claim-lost-race" in str(exc)
     elapsed = time.monotonic() - started
     assert elapsed < 60, "the read was not actually bounded (%.1fs)" % elapsed
     assert supervisor.daemon_available is True
-    assert "did not answer" in capsys.readouterr().err
+    assert "did not grant within the read grace" in capsys.readouterr().err
     # The wedged relay must be KILLED, not abandoned: it is the process holding
     # this job's daemon-side worker grant open, and the daemon releases that
     # grant on peer disconnect. Abandoning it leaks a ledger entry for the rest
@@ -2678,7 +2737,7 @@ def test_placement_ack_timeout_kills_the_child_and_reports_a_denial(monkeypatch)
 
     monkeypatch.setenv("AIRA_AITEST_PLACEMENT_ACK_TIMEOUT", "1")
     supervisor = Supervisor()
-    supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
+    supervisor.acquire_worker = lambda estimated_bytes, blocking: (
         {"scope": "/unused", "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
@@ -2700,26 +2759,6 @@ def test_placement_ack_timeout_kills_the_child_and_reports_a_denial(monkeypatch)
     except OSError:
         alive = False
     assert alive is False, "a wedged, un-acked child must be killed, not leaked"
-
-
-def test_parse_max_wait_falls_back_to_bounded_never_unbounded():
-    """An unparseable --max-wait must degrade to bounded-but-generous. It may
-    never reintroduce an unbounded read, and it may never fire early."""
-    assert supervisor_module._parse_max_wait_seconds("30s") == 30.0
-    assert supervisor_module._parse_max_wait_seconds("2m") == 120.0
-    assert supervisor_module._parse_max_wait_seconds("500ms") == 0.5
-    # Pin the PROPERTY, not the constant. Asserting equality with
-    # _MAX_WAIT_FALLBACK_SECONDS is a tautology: it survives setting that
-    # constant to 0, which would make every admission read expire instantly and
-    # turn a hang into a run that can never admit a worker at all. Mutation
-    # testing found exactly that survivor, so this pins the real invariant --
-    # bounded, but never able to fire before a healthy relay could answer.
-    for unparseable in ("garbage", "", "30 seconds", "-5s", None, 30):
-        fallback = supervisor_module._parse_max_wait_seconds(unparseable)
-        assert fallback >= 300.0, (
-            "%r must fall back to a GENEROUS bound (got %r)" % (unparseable, fallback)
-        )
-        assert fallback < float("inf"), "%r must still be bounded" % (unparseable,)
 
 
 def test_env_seconds_never_disables_a_bound(monkeypatch, capsys):

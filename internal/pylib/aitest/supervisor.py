@@ -1,7 +1,6 @@
 import errno
 import json
 import os
-import re
 import select
 import selectors
 import signal
@@ -15,17 +14,14 @@ from aitest.worker import _EVENT_LINE_PREFIX, _RECYCLE_SUFFIX, _exit_child, _unt
 
 _STOP_LINE = "__stop__"
 _DENIAL_RETRY_SECONDS = 1.0
-# AIRA-64. A SPECULATIVE admission request: "answer from what you can obtain
-# without waiting". The daemon treats max_wait_ms == 0 as try-acquire on both
-# its outer-scope lock and its CPU gate, so such a request never waits on
-# another job's critical section -- which matters because every one of them is
-# issued from this module's SINGLE-THREADED dispatch loop, where a blocking
-# request stalls result draining and nodeid dispatch for every live worker.
-#
-# It is NOT the same as "non-blocking": a speculative request still performs
-# bounded cgroup I/O and, when it GRANTS, the same fork and placement-ack this
-# module already pays for every other spawn. What it guarantees is that it never
-# polls and never waits on another job.
+# S15. The non-blocking PROBE's --max-wait. The daemon reads max_wait_ms
+# present-and-zero as a SNAPSHOT: it reports the unified ledger's current headroom
+# (available_bytes / available_cpu), reserves nothing, and NEVER grants. This
+# replaced AIRA-64's try-acquire, which COULD grant a worker speculatively; under
+# S15 the supervisor sizes pool growth from the reported headroom instead (see
+# _probe_available / _try_grow_one), then issues a real claim only when there is
+# room. Issued from this module's SINGLE-THREADED dispatch loop, so it is read with
+# a short bounded grace and never waits on another job's critical section.
 _SPECULATIVE_MAX_WAIT = "0s"
 # How often the dispatch loop may issue one speculative growth probe. Checked on
 # EVERY loop iteration rather than only on the select() timeout: a suite whose
@@ -95,41 +91,41 @@ def _scope_oom_group_killed(scope):
             except ValueError:
                 return None
     return None
-# How often (in retry attempts, i.e. roughly every N seconds at the above
-# interval) to remind stderr that a run is stalled waiting on a reachable
-# but saturated daemon -- see _wait_for_admission_or_disable, shared by
-# run()'s startup path and _replace_worker's "this was the last worker"
-# path. A stuck run must never be SILENT, even though it must also never
-# fall back to unconfined just because the wait is long.
-_DENIAL_WARN_EVERY = 30
-
-# AIRA-92. The supervisor is SINGLE-THREADED: while it is blocked reading the
+# AIRA-92 / S16. The supervisor is SINGLE-THREADED: while it is blocked reading a
 # worker-admit relay it drains no worker's result pipe and dispatches no queued
-# nodeid to an idle worker. Every blocking read it performs must therefore be
-# bounded, or one wedged relay stops the entire pool with no diagnostic and no
-# forward progress -- alive, near-zero CPU, output frozen mid-run.
+# nodeid to an idle worker. The invariant that keeps that safe under S15 is:
+# NO read on a LIVE pool is unbounded.
 #
-# `aira worker-admit` is NOT self-bounding at the process level. Its socket read
-# deadline is max_wait + admitTransportGrace (1s, internal/runner/
-# admission_linux.go:81), but three of its own segments sit OUTSIDE that
-# deadline with no bound in code: the dial (no Dialer.Timeout and a
-# deadline-free ctx, internal/runner/worker_admit_client_linux.go:55-59),
-# runner.CreateWorkerScope (passed ctx rather than signalCtx, so not even
-# SIGINT-cancellable, cmd/aira/main.go:1074), and daemon.PathsFromEnv's path
-# walking (cmd/aira/main.go:1059). The daemon's own evaluateWorkerAdmit
-# additionally holds job.mu across two cgroupfs reads and documents itself as
-# "uninterruptible and not itself deadline-aware" (internal/daemon/
-# worker_admit.go:192-213). So the client must impose its own bound.
+#  - A PROBE (--max-wait 0s, non-blocking snapshot) and a GROWTH CLAIM (issued only
+#    after a probe showed room) are read with this SHORT grace. A growth claim that
+#    loses the race -- another job took the room in the gap between probe and claim,
+#    so the daemon now blocks the claim indefinitely (S15 removed the daemon/transport
+#    timeout) -- times out here to a denial and skips the tick, so it can never freeze
+#    the dispatch loop for more than the grace while live workers wait for nodeids.
+#  - An EMPTY-POOL blocking claim (run() startup's first worker, and _replace_worker's
+#    last-worker case) is read UNBOUNDED -- there are no live workers to starve, and a
+#    saturated-but-reachable daemon genuinely warrants an indefinite wait rather than a
+#    silent fall back to unconfined. It is kept non-silent by a periodic stderr notice
+#    emitted from inside the read (see _read_line_blocking_with_progress), never by a
+#    timeout.
 #
-# The grace is deliberately several times the Go side's own 1s transport grace:
-# this bound is the LAST resort against a wedge, never a competing timer that
-# races a healthy-but-slow relay into a spurious timeout.
-_ADMIT_READ_GRACE_SECONDS = 15.0
-# Used only when --max-wait cannot be parsed at all. The CLI itself caps
-# --max-wait at 30m (cmd/aira/main.go:962-969), so this can never fire before a
-# genuinely-waiting relay would have answered; it exists purely so an
-# unparseable value degrades to "bounded but generous" instead of "unbounded".
-_MAX_WAIT_FALLBACK_SECONDS = 1800.0
+# S15 deleted the old max-wait-DERIVED bound (a blocking claim now has no daemon-side or
+# transport timeout at all, design §4/§6), and with it _parse_max_wait_seconds and the
+# Go-duration parser: the bound is no longer a function of --max-wait, it is this fixed
+# grace on the live-pool paths and nothing on the empty-pool path.
+#
+# It is deliberately SHORT (5s, was 15s): under S15 it is the ONLY bound on a growth
+# claim (there is no transport timeout behind it any more), and it is exactly how long a
+# lost-race growth claim can freeze the single-threaded dispatch loop -- so it must stay
+# small. After a probe just showed room a grant is a millisecond round trip; not getting
+# one inside 5s means the room is genuinely gone, and skipping the tick to retry a second
+# later is the right answer, not waiting longer.
+_ADMIT_READ_GRACE_SECONDS = 5.0
+# How often the UNBOUNDED empty-pool claim reminds stderr it is still waiting on a
+# reachable-but-saturated daemon (or riding out a daemon restart). A stuck run must
+# never be SILENT, even though it must also never fall back to unconfined just because
+# the wait is long.
+_ADMIT_BLOCKING_WARN_SECONDS = 30.0
 # The post-fork placement ack is pure interpreter work in the child -- close
 # inherited fds, fdopen two pipes, write one line -- with no test code and no
 # daemon round trip in it. A minute is orders of magnitude more than that costs
@@ -144,12 +140,6 @@ _REAP_TIMEOUT_SECONDS = 5.0
 # A sentinel distinct from None, for dict lookups where "the key is absent" and
 # "the value is None" must not be conflated. See _pool_covers_the_queue.
 _UNKNOWN = object()
-
-_GO_DURATION = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(ns|us|µs|ms|s|m|h)?\s*$")
-_GO_DURATION_SCALE = {
-    None: 1.0, "": 1.0, "ns": 1e-9, "us": 1e-6, "µs": 1e-6,
-    "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0,
-}
 
 
 def _env_seconds(name, default):
@@ -173,17 +163,6 @@ def _env_seconds(name, default):
         )
         return default
     return value
-
-
-def _parse_max_wait_seconds(max_wait):
-    """Best-effort parse of the SAME --max-wait string handed to the relay, so
-    the client's own bound is always strictly later than the relay's. Any value
-    this cannot parse yields _MAX_WAIT_FALLBACK_SECONDS -- never an exception
-    and never an unbounded wait."""
-    match = _GO_DURATION.match(max_wait) if isinstance(max_wait, str) else None
-    if match is None:
-        return _MAX_WAIT_FALLBACK_SECONDS
-    return float(match.group(1)) * _GO_DURATION_SCALE[match.group(2)]
 
 
 def _read_line_deadline(fd, timeout):
@@ -222,6 +201,54 @@ def _read_line_deadline(fd, timeout):
     # "replace", not "strict": a stray non-UTF-8 byte must degrade to an
     # unrecognized line handled by the caller's existing malformed-response
     # guards, never an uncaught UnicodeDecodeError that loses the whole run.
+    return (line.decode("utf-8", "replace") if sep else ""), False
+
+
+def _read_line_blocking_with_progress(fd, warn_every):
+    """Read one newline-terminated line from a raw fd, UNBOUNDED, emitting a
+    periodic "still waiting" notice to stderr every warn_every seconds.
+
+    Returns (line, False) -- the second element is always False, matching
+    _read_line_deadline's shape so a caller can treat both uniformly, but this
+    read NEVER reports a timeout: it is used ONLY for the empty-pool blocking
+    claim (S16), where a saturated-but-reachable daemon (or one being ridden out
+    across a restart) genuinely warrants an indefinite wait rather than a silent
+    fall back to unconfined. There are no live workers to starve while it blocks,
+    which is the whole reason this path may be unbounded where every live-pool
+    read is not.
+
+    An EOF with no newline returns ("", False): the relay exited without a grant
+    line, which the caller (acquire_worker) already treats as "no daemon", never
+    as a grant. The periodic notice is what keeps a long wait honest and visible
+    -- the S13 confine precedent for a bounded-but-slow admission wait -- without
+    ever converting the wait into a timeout that would strip containment."""
+    buf = b""
+    start = time.monotonic()
+    next_warn = start + warn_every
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(fd, selectors.EVENT_READ)
+        while b"\n" not in buf:
+            now = time.monotonic()
+            if not selector.select(max(0.0, next_warn - now)):
+                sys.stderr.write(
+                    "aira aitest: still waiting for worker admission (daemon reachable, "
+                    "waited %.0fs) -- containment preserved, not falling back to unconfined\n"
+                    % (time.monotonic() - start)
+                )
+                next_warn += warn_every
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        selector.close()
+    line, sep, _ = buf.partition(b"\n")
+    # "replace", not "strict", for the identical reason _read_line_deadline gives.
     return (line.decode("utf-8", "replace") if sep else ""), False
 
 
@@ -284,8 +311,21 @@ class WorkerAdmitUnavailable(Exception):
     a relay the host could not launch, a client/daemon protocol-version
     skew, or an outer scope that is not a real daemon-admitted scope at
     all. Together with WorkerPlacementFailed it is one of exactly two
-    classes that disable daemon-backed admission for the rest of the run
-    (_disable_daemon, Task 16).
+    classes that CAN disable daemon-backed admission for the rest of the
+    run (_disable_daemon).
+
+    S16 refined WHEN it does: only on an EMPTY-POOL blocking claim (run()
+    startup, _replace_worker's last worker) is an Unavailable honoured as
+    "the daemon is gone" and allowed to disable. On any LIVE-POOL path (a
+    growth probe or a growth claim, _try_grow_one) it is treated as a
+    transient and the tick is skipped WITHOUT disabling -- because a
+    daemon RESTART briefly refuses a dial (a sub-second window), and a
+    lease already held is re-anchored transparently by the Go relay across
+    that restart, so treating a growth-path Unavailable as fatal would
+    strip RAM containment from the rest of the run over a transient the
+    rest of the pool never even noticed. (Accepted residual: an empty-pool
+    claim whose dial lands exactly in that window still disables; rare, as
+    claims happen only at startup / last-worker.)
 
     The relay reports this as class=admission-unusable. The class names
     the disposition, not a diagnosis of the daemon's health -- the
@@ -665,13 +705,13 @@ class Supervisor:
         self._pidfd_warned = set()
         self.items_by_nodeid = {}
         self.workers = {}
-        # Worker scopes whose rmdir failed, for a later retry. See
-        # _forget_worker_scope: AIRA-39 turned an unremoved scope from a stray
-        # empty directory into a permanent charge against this run's own budget.
+        # Worker scopes whose rmdir failed, for a later hygiene retry. See
+        # _forget_worker_scope: since S15 an unremoved scope is a stray empty
+        # directory, NOT a budget charge -- the ledger releases on the relay's
+        # connection EOF, not on the scope's removal.
         self._unremoved_scopes = set()
         self.results = {}
         self._run_estimated_bytes = 0
-        self._run_max_wait = "30s"
         self._run_worker_count = 1
         # AIRA-180 pool-usage accumulator. One sample per RUN, folded from every
         # worker retirement -- see _observe_worker_usage for why the fold lives
@@ -793,90 +833,112 @@ class Supervisor:
         self.queue.insert(0, nodeid)
         return True
 
-    def acquire_worker(self, estimated_bytes, max_wait="30s"):
-        """Returns (grant: dict, process: subprocess.Popen) on success.
-        process.stdin stays open as the daemon lease -- close it to release.
-
-        The relay classifies its own outcome and reports it as one
-        structured stdout line; this method's only job is an exact
-        dictionary lookup from that line's `class` field to one of the four
-        exception types (_OUTCOME_CLASS_EXCEPTIONS). It does NOT inspect
-        the relay's stderr, which carries a human diagnostic only.
-
-        The caller MUST treat the exception types differently (Task 16):
-        only WorkerAdmitUnavailable and WorkerPlacementFailed may disable
-        daemon-backed admission for the rest of the run."""
-        if not self.daemon_available:
-            raise WorkerAdmitUnavailable("daemon unavailable")
+    def _spawn_admit_relay(self, estimated_bytes, probe):
+        """Popen `aira worker-admit` for one worker lease. A CLAIM (probe=False)
+        omits --max-wait, which the daemon reads as "block until the ledger fits"
+        (S15). A PROBE (probe=True) passes --max-wait 0s, the non-blocking snapshot
+        that reserves nothing and never grants. Raises WorkerAdmitDenied for a
+        transient local fork failure (EAGAIN/ENOMEM) and WorkerAdmitUnavailable for
+        a static one, exactly as the whole admit path documents."""
         command = os.environ.get("AIRA_AITEST_WORKER_ADMIT_CMD", "")
         if not command:
             raise WorkerAdmitUnavailable("AIRA_AITEST_WORKER_ADMIT_CMD is unset")
+        argv = [command, "worker-admit", "--job-id", str(os.getpid()),
+                "--outer-scope", self.outer_scope, "--estimated-bytes", str(estimated_bytes)]
+        if probe:
+            argv += ["--max-wait", _SPECULATIVE_MAX_WAIT]
         try:
-            process = subprocess.Popen(
-                [command, "worker-admit", "--job-id", str(os.getpid()), "--outer-scope", self.outer_scope,
-                 "--estimated-bytes", str(estimated_bytes), "--max-wait", max_wait],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
+            return subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
             )
         except OSError as exc:
-            # EAGAIN/ENOMEM here mean this HOST could not fork a process right
-            # now -- a transient resource condition, and one that peaks under
-            # exactly the contention this whole path is about (Fable
-            # plan-review, P2-4). It says nothing whatsoever about the daemon,
-            # so reporting it as WorkerAdmitUnavailable permanently stripped RAM
-            # containment for the rest of the run over a momentary fork failure
-            # on a perfectly healthy daemon -- the same misdiagnosis class as
-            # the transport branch below. Every other OSError (ENOENT, EACCES on
-            # the aira binary) IS a static, permanent local fact and stays
-            # unavailable.
+            # EAGAIN/ENOMEM here mean this HOST could not fork a process right now --
+            # a transient resource condition that peaks under exactly the contention
+            # this whole path is about (Fable plan-review, P2-4). It says nothing
+            # about the daemon, so reporting it as WorkerAdmitUnavailable would strip
+            # RAM containment for the rest of the run over a momentary fork failure on
+            # a perfectly healthy daemon. Every other OSError (ENOENT, EACCES on the
+            # aira binary) IS a static local fact and stays unavailable.
             if exc.errno in (errno.EAGAIN, errno.ENOMEM):
                 raise WorkerAdmitDenied(
                     "worker-admit state=denied class=contended reason=fork-unavailable: %s" % exc
                 )
             raise WorkerAdmitUnavailable(str(exc))
-        # AIRA-92: BOUNDED, never a bare readline(). See _read_line_deadline and
-        # the _ADMIT_READ_GRACE_SECONDS comment for why the relay cannot be
-        # trusted to bound itself, and why this single untimed read was able to
-        # freeze the whole pool -- no result drained, no nodeid dispatched to an
-        # already-idle worker, no diagnostic, for as long as the relay stayed
-        # wedged.
-        #
-        # "replace", not "strict" (Sol build-review, AIRA-38 review wave): a
-        # corrupted/truncated write or a stray binary byte from a
-        # misbehaving relay build must degrade to a line that fails to parse
-        # (WorkerAdmitContractViolation below) rather than raise an uncaught
-        # UnicodeDecodeError that crashes the whole pytest process.
-        read_timeout = _parse_max_wait_seconds(max_wait) + _env_seconds(
-            "AIRA_AITEST_ADMIT_READ_GRACE", _ADMIT_READ_GRACE_SECONDS
+
+    def _read_admit_outcome(self, process, blocking):
+        """Read the relay's one outcome line. Returns (line, timed_out). blocking
+        selects the S16 read-bounding rule: an empty-pool claim is UNBOUNDED (with a
+        periodic notice, never a timeout); every live-pool read is SHORT-bounded so
+        a lost race cannot freeze the single-threaded dispatch loop. See the
+        _ADMIT_READ_GRACE_SECONDS invariant."""
+        fd = process.stdout.fileno()
+        if blocking:
+            return _read_line_blocking_with_progress(
+                fd, _env_seconds("AIRA_AITEST_ADMIT_WARN_EVERY", _ADMIT_BLOCKING_WARN_SECONDS)
+            )
+        return _read_line_deadline(
+            fd, _env_seconds("AIRA_AITEST_ADMIT_READ_GRACE", _ADMIT_READ_GRACE_SECONDS)
         )
-        line, timed_out = _read_line_deadline(process.stdout.fileno(), read_timeout)
+
+    def acquire_worker(self, estimated_bytes, blocking=True):
+        """Issue a blocking CLAIM for one worker lease and return
+        (grant: dict, process: subprocess.Popen). process.stdin stays open as the
+        daemon lease -- close it to release. The Go relay holds ONE daemon
+        connection per worker and, for an enforced grant, reconnects and re-declares
+        it across a daemon restart internally (S15), so a restart is invisible to
+        this supervisor for a lease already held.
+
+        `blocking` selects how the supervisor READS the claim's one outcome line:
+
+          - blocking=True (EMPTY-POOL claim: run() startup's first worker, and
+            _replace_worker's last-worker case): read UNBOUNDED, with a periodic
+            notice. There are no live workers to starve, and a saturated-but-reachable
+            daemon warrants an honest indefinite wait, never a silent fall back to
+            unconfined.
+          - blocking=False (GROWTH claim, issued only after _probe_available showed
+            room): read with a SHORT grace. A lost race -- another job took the room
+            in the gap, so the daemon now blocks the claim -- times out here to a
+            DENIAL and skips the tick, so a growth claim can never freeze the
+            single-threaded dispatch loop for more than the grace.
+
+        The relay classifies its own outcome and reports it as one structured stdout
+        line; this method's only job is an exact dictionary lookup from that line's
+        `class` field to one of the four exception types (_OUTCOME_CLASS_EXCEPTIONS).
+        It does NOT inspect the relay's stderr, which carries a human diagnostic only.
+
+        The caller MUST treat the exception types differently: WorkerAdmitUnavailable
+        and WorkerPlacementFailed are the only two that may disable daemon-backed
+        admission -- and, per S16, an Unavailable is honoured as such ONLY on the
+        empty-pool blocking claim; on the live-pool growth path the caller treats it
+        as a transient (a daemon-restart dial window), never a disable."""
+        if not self.daemon_available:
+            raise WorkerAdmitUnavailable("daemon unavailable")
+        process = self._spawn_admit_relay(estimated_bytes, probe=False)
+        # "replace", not "strict", inside both readers (Sol build-review, AIRA-38
+        # review wave): a corrupted/truncated write or a stray binary byte degrades
+        # to a line that fails to parse (WorkerAdmitContractViolation below) rather
+        # than an uncaught UnicodeDecodeError that crashes the whole pytest process.
+        line, timed_out = self._read_admit_outcome(process, blocking)
         line = line.strip()
         if timed_out:
-            # The relay is alive but has answered nothing at all inside its own
-            # declared budget plus a generous grace. Release it and treat this
-            # as a DENIAL, never as WorkerAdmitUnavailable: we could not
-            # establish a result, which is precisely the state AIRA requires be
-            # reported as such rather than resolved into a confident verdict.
-            # Calling it "unavailable" would assert the daemon is gone -- an
-            # unproven claim whose consequence is stripping RAM containment for
-            # the rest of the run. Calling it a denial keeps containment, keeps
-            # the surviving pool dispatching, and lets the existing retry path
-            # try again.
-            #
-            # Accepted, documented consequence: if the daemon granted in the
-            # microscopic window between our deadline and this kill, it releases
-            # that grant on peer disconnect (internal/daemon/worker_admit.go:
-            # 456-464, idempotent at :295-306) but the scope directory it
-            # created is orphaned until AIRA-36's reaper sweeps it. A leaked
-            # empty directory is strictly better than a frozen run.
+            # Reachable only on a bounded (growth) read: the daemon accepted the claim
+            # but did not grant inside the grace -- the room the probe saw was taken by
+            # another job and the claim is now blocking. Release it and treat this as a
+            # DENIAL, never WorkerAdmitUnavailable: we could not establish a grant,
+            # which AIRA requires be reported as such rather than resolved into "the
+            # daemon is gone" (which would strip RAM containment for the rest of the
+            # run). A denial keeps containment, keeps the pool dispatching, and lets the
+            # next growth tick try again. Since S15 a closed connection RELEASES the
+            # lease on EOF, so a grant that landed between our deadline and this kill is
+            # released cleanly by the daemon -- no orphaned charge -- and the empty
+            # scope is swept by AIRA-36's reaper.
             _terminate_process(process)
             sys.stderr.write(
-                "aira aitest: worker-admit relay did not answer within %.1fs "
-                "(--max-wait %s); treating as a transient denial, containment preserved\n"
-                % (read_timeout, max_wait)
+                "aira aitest: worker-admit growth claim did not grant within the read "
+                "grace; treating as a transient denial, containment preserved\n"
             )
             raise WorkerAdmitDenied(
-                "worker-admit state=denied class=contended reason=relay-unresponsive "
-                "after %.1fs" % read_timeout
+                "worker-admit state=denied class=contended reason=growth-claim-lost-race"
             )
         if not line:
             # The relay produced NO outcome line at all: it died, was killed,
@@ -975,11 +1037,10 @@ class Supervisor:
             # the missing fields, so this is guarded, unlike the
             # unconditional rmdir in spawn_worker's placement-failure path
             # where "grant" is always fully well-formed by construction.
-            # AIRA-39 made this removal load-bearing rather than best-effort:
-            # the daemon's ledger now sums memory.max over the outer scope's
-            # real children, so a scope left behind KEEPS CHARGING this run's
-            # budget. _forget_worker_scope remembers a failed rmdir for the
-            # retry sweep instead of merely warning.
+            # Hygiene, not budget (S15): the daemon released this lease's reserve
+            # on the connection close above, so a scope left behind is a stray
+            # directory, not a charge. _forget_worker_scope removes it best-effort
+            # and remembers a failed rmdir for the sweep.
             self._forget_worker_scope(grant.get("scope"))
             raise WorkerAdmitContractViolation(
                 "worker-admit granted outcome is malformed: %s [relay stderr: %s]"
@@ -988,6 +1049,71 @@ class Supervisor:
         self._note_cpu_slots_state(outcome.get("cpu_slots", ""))
         self._note_swap_cap_state(outcome.get("swap_cap", ""))
         return grant, process
+
+    def _probe_available(self):
+        """One non-blocking probe (--max-wait 0s): the daemon reports the unified
+        ledger's current headroom (available_bytes / available_cpu) with NO
+        reservation taken and NEVER grants (S15). This is what sizes pool growth,
+        replacing AIRA-64's speculative grant.
+
+        Returns (available_bytes, available_cpu) on a clean snapshot, or None when
+        headroom is transiently UNESTABLISHED -- the restart freeze (state=
+        unevaluated: the slice is frozen, not saturated, the S11 honesty pin), or a
+        snapshot missing its figures. None is fail-SAFE: a probe never fabricates
+        room, so an unestablished tick simply does not grow. For a NON-snapshot
+        outcome it raises the SAME exception acquire_worker maps from the class, so
+        the growth caller (_try_grow_one) handles terminal / unavailable / denied
+        uniformly. It never disables the daemon itself: only a live-pool caller's
+        own policy does, and per S16 only the empty-pool blocking claim may."""
+        if not self.daemon_available:
+            raise WorkerAdmitUnavailable("daemon unavailable")
+        process = self._spawn_admit_relay(self._run_estimated_bytes, probe=True)
+        # A probe NEVER grants, so its relay always writes one line and exits; the
+        # read is bounded (a live-pool read is never unbounded) and the process is
+        # released unconditionally -- no lease is ever held on this path.
+        line, timed_out = self._read_admit_outcome(process, blocking=False)
+        line = line.strip()
+        if timed_out:
+            # Accepted but not answered inside the grace: unestablished, not "gone".
+            # Skip this tick, containment preserved, daemon left available.
+            _terminate_process(process)
+            return None
+        _terminate_process(process)
+        if not line:
+            # No outcome line at all -- the relay died/was killed without answering.
+            # A NAMED unusable condition (exactly as acquire_worker treats it); the
+            # live-pool caller turns it into "skip this tick", never a disable.
+            diagnostic = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
+            raise WorkerAdmitUnavailable(
+                "worker-admit probe produced no outcome line [relay stderr: %s]"
+                % (diagnostic.strip() or "none")
+            )
+        outcome = _parse_worker_admit_outcome(line)  # raises WorkerAdmitContractViolation on garbage
+        if outcome.get("reason") == "snapshot":
+            if outcome["state"] == "unevaluated":
+                return None  # restart freeze: transiently frozen, not saturated (S11)
+            available_bytes = outcome.get("available_bytes")
+            available_cpu = outcome.get("available_cpu")
+            if available_bytes is None or available_cpu is None:
+                # Not produced by an S15 daemon: the protocol-11 pin refuses an older
+                # one, and the renderer emits BOTH figures on every denied snapshot.
+                # A defensive guard, not dead code (a test stub can still omit them):
+                # do NOT fabricate room -- skip the tick.
+                return None
+            try:
+                return int(available_bytes), int(available_cpu)
+            except ValueError:
+                return None
+        # Not a snapshot: reuse acquire_worker's exact class -> exception mapping.
+        exception = _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]]
+        if exception is None:
+            # class=granted from a probe is a contract violation: a non-blocking
+            # snapshot must never grant.
+            raise WorkerAdmitContractViolation(
+                "worker-admit probe returned a grant, which a non-blocking snapshot "
+                "must never do: %s" % _describe_outcome(outcome)
+            )
+        raise exception(_describe_outcome(outcome))
 
     def _validate_grant(self, outcome, containment):
         """Return (grant, malformed_reason). malformed_reason is None exactly
@@ -1223,7 +1349,7 @@ class Supervisor:
                         except Exception:
                             pass
 
-    def spawn_worker(self, estimated_bytes, max_wait="30s"):
+    def spawn_worker(self, estimated_bytes, blocking=True):
         """Admits and forks one worker, returning its pid. Raises
         WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, a
         WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid or
@@ -1240,7 +1366,7 @@ class Supervisor:
         cleanup code fully UNCONFINED. (place_self() itself is separately
         guarded the same way inside fork_worker, Task 12, since it can
         raise before this function's own try even starts.)"""
-        grant, admit_process = self.acquire_worker(estimated_bytes, max_wait=max_wait)
+        grant, admit_process = self.acquire_worker(estimated_bytes, blocking=blocking)
         # AIRA-123. None here is a LEDGER-ONLY grant: the daemon really admitted
         # this worker against the container's RAM budget, there is simply no
         # cgroup sub-scope to place it in. Every cgroup-dependent step below is
@@ -1546,11 +1672,14 @@ class Supervisor:
         # nothing and cannot lose data.
         _reap_child(pid)
         if state["admit_process"] is not None:
+            # Closing the relay's stdin is the lease RELEASE (S15): the relay's
+            # io.Copy(stdin) returns, it closes its daemon connection, and the daemon
+            # releases this worker's reserve on that EOF. _terminate_process then
+            # bounds the wait and escalates to SIGKILL -- a wedged relay that ignored
+            # its stdin EOF must never abort the whole run over a best-effort wait, and
+            # (equally) must not be left alive HOLDING the connection open, which would
+            # keep the reserve charged in the daemon ledger after the worker is gone.
             state["admit_process"].stdin.close()
-            # Bounded, then SIGKILL. A wedged admit-relay process must never
-            # abort the whole run over a best-effort wait -- but silently
-            # swallowing the timeout left a LIVE relay behind still holding its
-            # daemon grant, so the ledger entry outlived the worker it was for.
             _terminate_process(state["admit_process"])
         grant = state.get("grant")
         if grant is not None:
@@ -1687,17 +1816,19 @@ class Supervisor:
             pass
 
     def _forget_worker_scope(self, scope):
-        """Remove one worker's cgroup scope, remembering it for retry on failure.
+        """Remove one worker's cgroup scope directory, remembering it for a hygiene
+        retry on failure.
 
-        AIRA-39 made this load-bearing rather than best-effort. The daemon's
-        ledger is now SUM(memory.max) over the outer scope's real
-        .aira-worker-* children, so a scope that is not removed KEEPS CHARGING
-        against this run's budget for the rest of the run -- where the previous
-        in-memory ledger released the grant when the relay closed. One EBUSY (a
-        reaped worker that left a short-lived descendant behind) would otherwise
-        permanently shrink the worker budget, and in the worst case leave
-        _wait_for_admission_or_disable retrying forever against capacity that is
-        never coming back (found by Sol build-review round 2).
+        HYGIENE ONLY since S15. AIRA-39's ledger summed memory.max over the outer
+        scope's real .aira-worker-* children, so an unremoved scope KEPT CHARGING
+        this run's budget and removing it was load-bearing. S15 folded worker
+        accounting into the one unified signed ledger, which RELEASES a worker's
+        reserve when the relay's connection reaches EOF (the retirement close in
+        _retire_worker), NOT when this directory is removed. So a scope left behind
+        after an EBUSY no longer shrinks the budget -- it is just a stray empty
+        directory, which this best-effort rmdir (and, as the real backstop, the #72
+        orphaned-scope reaper) cleans up. Kept rather than dropped because leaking a
+        cgroup directory per worker is still untidy, and the retry is nearly free.
         """
         if not scope:
             return
@@ -1714,12 +1845,12 @@ class Supervisor:
             self._unremoved_scopes.discard(scope)
 
     def _sweep_unremoved_scopes(self):
-        """Re-attempt every removal that failed earlier.
+        """Re-attempt every scope-directory removal that failed earlier.
 
-        At most a handful of rmdir calls, and called exactly where a stuck scope
-        would otherwise hurt: before retiring another worker, and on every
-        admission retry -- so a transient EBUSY self-heals into freed budget
-        instead of a permanently smaller pool or a stalled run.
+        At most a handful of rmdir calls, HYGIENE ONLY since S15: a transient EBUSY
+        self-heals into a removed directory. It no longer frees budget (S15 releases
+        the reserve on the relay's EOF, not on this rmdir), so a scope that stays
+        stuck for a while is untidy but not a shrinking pool or a stalled run.
         """
         for scope in sorted(self._unremoved_scopes):
             try:
@@ -1732,159 +1863,164 @@ class Supervisor:
                 self._unremoved_scopes.discard(scope)
 
     def _wait_for_admission_or_disable(self, spawn):
-        """Retries spawn() (a zero-arg callable performing one admission
-        attempt) INDEFINITELY on WorkerAdmitDenied, with a loud periodic
-        stderr warning so a stalled run is never silent. Returns on
-        success, or on WorkerAdmitUnavailable/WorkerPlacementFailed
-        (which _disable_daemon and the caller's own fallback handle).
-        WorkerAdmitTerminal (either subclass) deliberately propagates to
-        the caller, which marks the affected queue unevaluated rather than
-        retrying or silently falling back unconfined. Never returns on
-        denial-exhaustion, because there is no such thing here:
-        a daemon that stays reachable but saturated forever means the run
-        genuinely waits forever, which is the honest outcome, not this
-        method's job to silently degrade safety instead.
+        """Retries spawn() (a zero-arg callable performing ONE blocking-claim
+        admission attempt) until it succeeds or the daemon is disabled. Returns on
+        success, or on WorkerAdmitUnavailable/WorkerPlacementFailed (which
+        _disable_daemon and the caller's own fallback handle). WorkerAdmitTerminal
+        (either subclass) deliberately propagates to the caller, which marks the
+        affected queue unevaluated rather than retrying or silently falling back
+        unconfined.
 
-        Shared by two callers that hit the identical "zero workers, queue
-        still has work, no other retirement left to hook a retry off of"
-        hazard: run()'s startup path (before any worker has ever been
-        admitted) and _replace_worker's "this was the LAST worker"
-        path (found by a second review round -- the original fix only
-        covered the startup case; retiring the last worker on a plain
-        denial left the exact same hazard unaddressed one level later,
-        since _dispatch_to_idle_workers never fires and the main loop's
-        `while self.workers:` would simply exit with the queue still
-        non-empty, dropping every remaining nodeid to unevaluated)."""
-        attempt = 0
+        Under S15 a blocking claim does not POLL to a deadline and then return
+        denied -- it BLOCKS in the read until the ledger fits (the read emits the
+        periodic "still waiting" notice, so the wait is never silent), so the common
+        path here is a single spawn() that returns only once a worker is admitted. A
+        WorkerAdmitDenied is now the UNCOMMON case: the relay's connection was
+        interrupted by a daemon RESTART (class=contended, reason=response-interrupted)
+        before a grant. That is exactly the transient S16 must ride out rather than
+        treat as unavailability, so it is retried -- the next claim dials the returned
+        daemon and grants. Never returns on saturation, because a daemon that stays
+        reachable-but-saturated forever means the run genuinely waits forever, which
+        is the honest outcome, not this method's job to silently degrade safety.
+
+        Shared by two EMPTY-POOL callers (run()'s startup, before any worker exists,
+        and _replace_worker's last-worker case): with no live worker to starve, a
+        blocking claim's unbounded wait is safe here where it would not be on the
+        live-pool growth path."""
         while self.daemon_available:
             try:
                 spawn()
                 return
             except WorkerAdmitDenied:
+                # A restart-interrupted claim (or a momentary fork failure): retry.
+                # No periodic warning here -- the blocking read already emits one, so
+                # this loop stays quiet and just re-issues the claim.
                 pass
             except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                 self._disable_daemon(str(exc))
                 return
-            attempt += 1
-            # A denial may be caused by capacity a failed rmdir is still holding.
-            # Retrying it here is what turns "retry forever" back into progress.
+            # A failed rmdir no longer holds budget (S15 released the lease on EOF),
+            # but sweeping stray scope directories is free hygiene at the natural
+            # retry point; the #72 reaper is the real backstop.
             self._sweep_unremoved_scopes()
             time.sleep(_DENIAL_RETRY_SECONDS)
-            if attempt % _DENIAL_WARN_EVERY == 0:
-                sys.stderr.write(
-                    "aira aitest: still waiting for worker admission after %d attempts "
-                    "(daemon reachable, budget contended) -- containment preserved, "
-                    "not falling back to unconfined\n" % attempt
-                )
+
+    def _try_grow_one(self):
+        """Probe the ledger's current headroom and, if there is room for one more
+        worker, claim and spawn it. Returns True iff a worker was actually added.
+        Shared by run()'s startup fill, _maybe_grow_pool, and _replace_worker's
+        live-pool case.
+
+        LIVE-POOL SAFE -- this is the load-bearing S16 property. A probe or a bounded
+        growth claim NEVER disables the daemon: a transient dial failure during a
+        daemon RESTART surfaces here as WorkerAdmitUnavailable, and treating that as
+        "daemon gone" would strip RAM containment from the rest of the run over a
+        sub-second restart window (the exact fail-open S16 forbids -- and the daemon's
+        own restart is ridden out transparently by the Go relay for every lease
+        already held). So an Unavailable is "no information this tick": skip, and let
+        the next retirement or growth tick try again. Only WorkerPlacementFailed still
+        disables (it is LOCAL cgroup evidence, not a transport verdict), and only a
+        WorkerAdmitTerminal still drains the queue (a permanent verdict is not made
+        less permanent by having been discovered speculatively)."""
+        if not self.daemon_available or not self.queue:
+            return False
+        try:
+            available = self._probe_available()
+        except WorkerAdmitDenied:
+            return False  # a contended snapshot (e.g. the outer-scope lock is busy): skip
+        except WorkerAdmitTerminal as exc:
+            self._fail_queue_terminal(str(exc))
+            return False
+        except (WorkerAdmitUnavailable, WorkerPlacementFailed):
+            return False  # transient (restart dial window); NEVER disable on the live path
+        if available is None:
+            return False  # headroom transiently unestablished this tick
+        available_bytes, available_cpu = available
+        if available_bytes < self._run_estimated_bytes or available_cpu < 1:
+            return False  # no room for another worker right now
+        # Room a moment ago -> claim it with a BOUNDED read: a lost race (another job
+        # took the room in the gap) times out to a denial and skips the tick, so a
+        # growth claim can never freeze the single-threaded dispatch loop.
+        try:
+            self.spawn_worker(self._run_estimated_bytes, blocking=False)
+            return True
+        except WorkerAdmitDenied:
+            return False
+        except WorkerAdmitTerminal as exc:
+            self._fail_queue_terminal(str(exc))
+            return False
+        except WorkerAdmitUnavailable:
+            return False  # transient; do NOT disable on the live path
+        except WorkerPlacementFailed as exc:
+            self._disable_daemon(str(exc))  # local cgroup mechanism broken -> fall back
+            return False
 
     def _replace_worker(self):
-        """Acquire a fresh worker if queue work remains -- shared by the
-        recycle and crash/retry paths.
+        """Acquire a fresh worker if queue work remains -- shared by the recycle and
+        crash/retry paths.
 
-        WorkerAdmitDenied (the daemon IS reachable, it just declined this
-        particular request right now -- budget exhausted or contended)
-        leaves daemon_available untouched: simply don't replace this
-        worker yet -- UNLESS this was the last worker (self.workers is
-        already empty by the time this runs; the caller always retires
-        before replacing), in which case there is no other retirement
-        left to hook a later retry off of, so wait it out the same way
-        run()'s startup path does rather than let the run end with queue
-        work still undone.
+        With OTHER workers still alive, replacement is speculative: probe the ledger
+        and grow only if there is room (_try_grow_one), which never blocks the
+        single-threaded dispatch loop and never disables the daemon on a transient.
+        No room simply means "don't replace yet" -- some other worker's eventual
+        retirement calls _replace_worker again, or _maybe_grow_pool does.
 
-        WorkerAdmitTerminal is instead a permanent verdict about this
-        request (a per-request rejection) or about the channel itself (a
-        contract violation): drain the remaining queue to unevaluated
-        without disabling the still-healthy daemon or spawning an
-        unconfined fallback worker.
-
-        WorkerAdmitUnavailable (no daemon to talk to at all) and
-        WorkerPlacementFailed (the cgroup mechanism itself is broken
-        locally, not just momentarily busy) both fall back to an
-        unconfined worker for the rest of the run -- these are the only
-        two failure classes that mean the daemon path is genuinely not
-        going to work."""
+        With an EMPTY pool (this was the LAST worker -- the caller always retires
+        before replacing), there is no later retirement to hook a retry off of, so
+        wait it out with a blocking claim rather than let the run end with queue work
+        undone. WorkerAdmitTerminal drains the queue to unevaluated (a permanent
+        verdict, daemon left healthy); WorkerAdmitUnavailable/WorkerPlacementFailed
+        fall back to an unconfined worker -- the only two classes that mean the
+        daemon path is genuinely not going to work."""
         if not self.queue:
             return
         if self.daemon_available:
-            try:
-                # AIRA-64: a replacement made while OTHER workers are still
-                # alive is speculative. It used to use the run's full
-                # `max_wait` (30s by default), which the daemon honours by
-                # POLLING to that deadline -- so under CPU contention, where
-                # denials become the common case rather than a rarity, every
-                # retirement would have frozen this single-threaded dispatch
-                # loop for up to 30 seconds with idle workers waiting for
-                # nodeids. The indefinite wait is kept below for the
-                # last-worker case, where waiting really is the honest thing
-                # to do.
-                self.spawn_worker(
-                    self._run_estimated_bytes,
-                    max_wait=self._run_max_wait if not self.workers else _SPECULATIVE_MAX_WAIT,
-                )
+            if self.workers:
+                # Other workers are still dispatching: a speculative probe-then-claim,
+                # never a blocking claim that would freeze the loop.
+                self._try_grow_one()
                 return
-            except WorkerAdmitDenied:
-                if self.workers:
-                    # Another worker is still running; ITS eventual
-                    # retirement calls _replace_worker again and retries.
-                    return
-                try:
-                    self._wait_for_admission_or_disable(
-                        lambda: self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
-                    )
-                except WorkerAdmitTerminal as exc:
-                    self._fail_queue_terminal(str(exc))
-                    return
-                if self.daemon_available:
-                    return  # the wait succeeded -- a confined worker now exists
-                # else: the wait's own WorkerAdmitUnavailable/
-                # WorkerPlacementFailed branch already called
-                # _disable_daemon -- fall through to the SAME
-                # fallback-spawn every other daemon-unavailable path in
-                # this function already uses, rather than return here and
-                # leave the pool empty with queue work still undone.
+            try:
+                self._wait_for_admission_or_disable(
+                    lambda: self.spawn_worker(self._run_estimated_bytes, blocking=True)
+                )
             except WorkerAdmitTerminal as exc:
                 self._fail_queue_terminal(str(exc))
                 return
-            except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
-                self._disable_daemon(str(exc))
-        # Enforce the SAME min(worker_count, max_workers_fallback) TOTAL
-        # pool cap run()'s own startup path already enforces (Fable
-        # build-review, final gate): this call used to spawn a fallback
-        # worker unconditionally on every mid-run retirement once the
-        # daemon went unavailable, so a run that had admitted N confined
-        # workers before a mid-run daemon crash converged back to N
-        # concurrent UNCONFINED workers instead of draining down to the
-        # promised cap -- directly contradicting _disable_daemon's own
-        # warning text ("falling back to n_workers<=%d").
+            if self.daemon_available:
+                return  # the wait succeeded -- a confined worker now exists
+            # else: the wait's own WorkerAdmitUnavailable/WorkerPlacementFailed branch
+            # already called _disable_daemon -- fall through to the fallback spawn
+            # rather than leave the pool empty with queue work still undone.
+        # Enforce the SAME min(worker_count, max_workers_fallback) TOTAL pool cap
+        # run()'s own startup path enforces (Fable build-review, final gate): a run
+        # that had admitted N confined workers before a mid-run daemon crash must
+        # drain down to the promised cap, not converge back to N concurrent UNCONFINED
+        # workers -- which would contradict _disable_daemon's own warning text.
         if len(self.workers) < min(self._run_worker_count, self.max_workers_fallback):
             self._spawn_fallback_worker()
 
     def _maybe_grow_pool(self):
-        """AIRA-64. One speculative attempt to grow the pool back toward its
-        requested size, rate-limited to once a second.
+        """S15/S16. One attempt to grow the pool back toward its requested size,
+        rate-limited to once a second, sizing growth from the probe SNAPSHOT's
+        available_bytes/available_cpu rather than a speculative grant (which S15
+        removed -- a probe never grants now, see _probe_available / _try_grow_one).
 
-        This exists because the startup pool loop `break`s PERMANENTLY on its
-        first denial and nothing else ever tries to grow again: `_replace_worker`
-        replaces one worker on a retirement, it does not restore a pool to its
-        target size, and the run()'s follow-up wait only fires when the pool is
-        completely EMPTY. Before the CPU gate that was harmless, because a RAM
-        denial at startup was rare. With a machine-wide CPU bound a denial at
-        startup is the NORMAL case on a busy box, so without this a run that got
-        1 of its 15 workers would keep exactly one worker for its entire
-        lifetime -- a far worse regression than the contention this change
-        exists to fix (Sol plan-review).
+        This exists because the startup fill stops on its first no-room and nothing
+        else ever tries to grow again: _replace_worker replaces one worker on a
+        retirement, it does not restore a pool to its target size, and run()'s
+        follow-up wait only fires when the pool is completely EMPTY. With a
+        machine-wide RAM+CPU bound a denial at startup is the NORMAL case on a busy
+        box, so without this a run that got 1 of its N workers would keep exactly one
+        worker for its whole lifetime. It also makes the bound FAIR rather than
+        first-come-first-served: an incumbent that recycles re-requests immediately
+        from its own retirement path, so without a periodic probe from everyone else
+        it would reclaim its own slot forever while a newcomer sat at its floor.
 
-        It is also what makes the bound FAIR rather than first-come-first-served:
-        an incumbent that recycles a worker re-requests immediately from its own
-        retirement path, so without a periodic probe from everyone else it would
-        simply reclaim its own slot forever while a newcomer sat at its floor.
-
-        Called from every dispatch-loop iteration, not just the idle branch: a
-        suite of sub-second tests keeps the loop's descriptors continuously
-        ready, so the select() timeout may never be reached at all.
-
-        Returns True when the pool actually grew, so the caller can dispatch to
-        the new worker immediately instead of leaving it idle for a tick."""
+        Called from every dispatch-loop iteration, not just the idle branch: a suite
+        of sub-second tests keeps the loop's descriptors continuously ready, so the
+        select() timeout may never be reached at all. Returns True when the pool
+        actually grew, so the caller can dispatch to the new worker immediately."""
         if not self.daemon_available or not self.queue:
             return False
         if len(self.workers) >= self._run_worker_count or self._pool_covers_the_queue():
@@ -1893,22 +2029,7 @@ class Supervisor:
         if now - self._last_growth_probe < _GROWTH_PROBE_INTERVAL_SECONDS:
             return False
         self._last_growth_probe = now
-        try:
-            self.spawn_worker(self._run_estimated_bytes, max_wait=_SPECULATIVE_MAX_WAIT)
-            return True
-        except WorkerAdmitDenied:
-            # The ordinary outcome of a probe on a busy machine. Silent by
-            # design: this fires once a second for the life of a contended run,
-            # and a warning per attempt would bury the diagnostics that matter.
-            pass
-        except WorkerAdmitTerminal as exc:
-            # A permanent verdict is NOT made less permanent by having been
-            # discovered speculatively; it gets the same treatment it would on
-            # any other path rather than being swallowed.
-            self._fail_queue_terminal(str(exc))
-        except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
-            self._disable_daemon(str(exc))
-        return False
+        return self._try_grow_one()
 
     def _drain_worker(self, pid, state):
         """Handles every line CURRENTLY AVAILABLE for this worker's result
@@ -2359,51 +2480,45 @@ class Supervisor:
         )
         return idle >= len(self.queue)
 
-    def run(self, estimated_bytes, worker_count=1, max_wait="30s"):
+    def run(self, estimated_bytes, worker_count=1):
         """Slice 1's whole dispatch loop: spawn up to worker_count workers,
         pull-dispatch the queue to whichever are idle, collect results via
         select() over each worker's result pipe, until the queue is drained
-        and every worker has retired. Recycle (Task 14), crash/retry (Task
-        15), and daemon-down fallback (Task 16) extend this method in
-        place."""
+        and every worker has retired. Recycle (Task 14), crash/retry (Task 15),
+        the daemon-down fallback (Task 16), and the S15/S16 probe-sized pool
+        growth extend this method in place."""
         self.bootstrap()
         import gc
         gc.freeze()
         self._run_estimated_bytes = estimated_bytes
-        self._run_max_wait = max_wait
         self._run_worker_count = worker_count
         if self.daemon_available:
+            # Fill the pool as fast as admission allows, sizing each slot from a probe
+            # snapshot (S16). _try_grow_one is LIVE-POOL SAFE: a transient dial failure
+            # during a daemon restart is a skipped tick, never a disable. It returns
+            # False on no-room, a skipped transient, or a terminal it already drained
+            # the queue for -- any of which ends the fill; the empty-pool wait below
+            # then covers the case where nothing at all got admitted.
             for _ in range(worker_count):
                 if self._pool_covers_the_queue():
                     break
-                try:
-                    self.spawn_worker(estimated_bytes, max_wait=max_wait)
-                except WorkerAdmitDenied:
-                    # Contended/no budget RIGHT NOW -- the daemon is still
-                    # there. Stop trying to grow the pool this instant and
-                    # start dispatching to however many DID get admitted;
-                    # a later retirement's _replace_worker tries for more.
+                if not self._try_grow_one():
                     break
-                except WorkerAdmitTerminal as exc:
-                    self._fail_queue_terminal(str(exc))
-                    break
-                except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
-                    self._disable_daemon(str(exc))
-                    break
-            # A denied/contended daemon must never silently strip
-            # containment (denied != unavailable, above) -- but with ZERO
-            # workers admitted yet there is also no later retirement to
-            # hook a retry off of (_replace_worker only fires when an
-            # EXISTING worker retires). Wait it out via the same shared,
-            # INDEFINITELY-retrying-on-denial helper _replace_worker uses
-            # for its own "last worker" case -- see
-            # _wait_for_admission_or_disable's docstring for the full
-            # rationale (spec 3.7; a daemon that stays saturated forever
-            # means this run genuinely waits forever, which is the honest
-            # outcome, never a silent degrade to unconfined).
+            # With ZERO workers admitted and queue work remaining there is no later
+            # retirement to hook a retry off of (_replace_worker only fires when an
+            # existing worker retires), and _try_grow_one's probe never disables -- so a
+            # genuinely-down daemon has not been detected yet. Wait it out with a
+            # BLOCKING claim (empty pool, nothing to starve): it grants once the daemon
+            # has room, rides out a restart via retry-on-contended, or disables on a
+            # true dial failure and falls through to the fallback below (spec 3.7; a
+            # daemon that stays saturated forever means this run genuinely waits
+            # forever, which is the honest outcome, never a silent degrade to
+            # unconfined).
             if self.daemon_available and not self.workers and self.queue:
                 try:
-                    self._wait_for_admission_or_disable(lambda: self.spawn_worker(estimated_bytes, max_wait=max_wait))
+                    self._wait_for_admission_or_disable(
+                        lambda: self.spawn_worker(estimated_bytes, blocking=True)
+                    )
                 except WorkerAdmitTerminal as exc:
                     self._fail_queue_terminal(str(exc))
         if not self.daemon_available:

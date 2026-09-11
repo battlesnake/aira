@@ -81,6 +81,16 @@ type workerAdmitGrant struct {
 	Reserved      int64  `json:"reserved,omitempty"`
 	SwapCap       string `json:"swap_cap,omitempty"`
 	ParentScopeID string `json:"parent_scope_id,omitempty"`
+	// AvailableBytes / AvailableCPU carry the non-blocking probe's current headroom
+	// (design §6/§8): what the unified ledger would admit RIGHT NOW, no reservation
+	// taken. Meaningful only on a snapshot (state=denied reason=snapshot); zero on a
+	// blocking-claim denial or a grant. The daemon marks them omitempty, so a genuine
+	// 0 arrives here as 0 — which is correct: reason=snapshot, not the field's
+	// presence, is what says "this is a real headroom figure", and a 0 there means
+	// "no room" (see RequestWorkerAdmit's snapshot pass-through and the S15 protocol
+	// pin, which refuses a daemon too old to speak reason=snapshot at all).
+	AvailableBytes int64 `json:"available_bytes,omitempty"`
+	AvailableCPU   int64 `json:"available_cpu,omitempty"`
 }
 
 // RequestWorkerAdmit dials the daemon and sends one worker-admit request,
@@ -187,8 +197,13 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		// The daemon's own classification passes through unchanged (a denial, a
 		// timeout, or a probe SNAPSHOT — the latter carrying available_bytes/cpu the
 		// daemon reported). This is the one place a class crosses a process boundary
-		// without being re-derived, the property AIRA-42 asked for.
-		return WorkerAdmitOutcome{State: grant.State, Class: grant.Class, Reason: grant.Reason, Detail: grant.Detail}
+		// without being re-derived, the property AIRA-42 asked for. AvailableBytes/
+		// AvailableCPU are meaningful only on a snapshot; on every other non-grant the
+		// daemon leaves them zero and WorkerAdmitOutcomeLine emits nothing for them.
+		return WorkerAdmitOutcome{
+			State: grant.State, Class: grant.Class, Reason: grant.Reason, Detail: grant.Detail,
+			AvailableBytes: grant.AvailableBytes, AvailableCPU: grant.AvailableCPU,
+		}
 	}
 	if problem := workerAdmitGrantProblem(grant); problem != "" {
 		closeConn()
