@@ -119,10 +119,10 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 				// containment, worker_id, scope, memory_max — the four keys an
 				// ENFORCED grant carries. AIRA-35 removed memory_high from the
 				// set; AIRA-123 added containment (required on every grade) and
-				// `reserved` (advisory only, so absent here). swap_cap and
-				// cpu_slots are optional and empty in this fixture, so a renderer
-				// that started emitting either unconditionally would break this
-				// count rather than slipping through.
+				// `reserved` (advisory only, so absent here). swap_cap is
+				// optional and empty in this fixture, so a renderer that started
+				// emitting it unconditionally would break this count rather than
+				// slipping through.
 				wantTokens += 4
 			}
 			if got := len(strings.Fields(line)); got != wantTokens {
@@ -152,69 +152,42 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-42 — a granted line always carries placement coordinates and
-// a declined line never does, so a half-formed grant cannot be rendered at all.
-// verifies: AIRA-64 §9.21 — the cpu_slots token survives rendering and
-// parsing, and its ABSENCE is preserved as absence.
-//
-// The absence half is the load-bearing one: an older daemon emits no token, and
-// the supervisor must be able to tell "this daemon said nothing" from "this
-// daemon said ok". Rendering an empty value as `cpu_slots=` would collapse that
-// distinction and turn silence into a claim.
-func TestWorkerAdmitOutcomeLineCarriesCPUSlots(t *testing.T) {
+// verifies: S6 — the worker-admit outcome line carries NO cpu_slots token. The
+// AIRA-64 cpuslots flock governor was deleted once CPU became an admission-ledger
+// resource (S5), and its per-grant diagnostic field went with it. This is the
+// render half of the S6 pin (the source half is
+// TestS6CPUSlotsGovernorFullyRemovedFromSource in internal/daemon): even a fully
+// populated ENFORCED grant must not emit cpu_slots, so a re-added render block
+// cannot slip a stale governance token back onto the wire the supervisor reads.
+func TestWorkerAdmitOutcomeLineNeverEmitsCPUSlots(t *testing.T) {
 	granted := WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted}
-	base := WorkerAdmitGrantFields{
+	grant := WorkerAdmitGrantFields{
 		ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400,
-		Containment: WorkerAdmitContainmentEnforced,
+		Containment: WorkerAdmitContainmentEnforced, SwapCap: WorkerAdmitSwapCapEnforced,
 	}
-
-	for _, state := range []string{WorkerAdmitCPUSlotsOK, WorkerAdmitCPUSlotsUnevaluated} {
-		grant := base
-		grant.CPUSlots = state
-		line, err := WorkerAdmitOutcomeLine(granted, &grant)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fields, err := ParseWorkerAdmitOutcomeLine(line)
-		if err != nil {
-			t.Fatalf("parse %q: %v", line, err)
-		}
-		if fields["cpu_slots"] != state {
-			t.Fatalf("cpu_slots=%q, want %q (line=%q)", fields["cpu_slots"], state, line)
-		}
-		// The three fields the supervisor REQUIRES must be untouched by the
-		// addition, or an additive field became a breaking one.
-		for key, want := range map[string]string{
-			"scope": "/outer/.aira-worker-1", "worker_id": "1",
-			"memory_max": "400",
-		} {
-			if fields[key] != want {
-				t.Fatalf("%s=%q want %q", key, fields[key], want)
-			}
-		}
-	}
-
-	line, err := WorkerAdmitOutcomeLine(granted, &base)
+	line, err := WorkerAdmitOutcomeLine(granted, &grant)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(line, "cpu_slots") {
+		t.Fatalf("worker-admit outcome line still carries cpu_slots after S6: %q", line)
 	}
 	fields, err := ParseWorkerAdmitOutcomeLine(line)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse %q: %v", line, err)
 	}
 	if _, present := fields["cpu_slots"]; present {
-		t.Fatalf("an unset CPUSlots must emit NO token, so silence cannot be read as a claim: %q", line)
+		t.Fatalf("parsed fields still carry cpu_slots after S6: %v", fields)
 	}
 }
 
 // verifies: AIRA-35 — swap_cap survives the render/parse round trip for EVERY
 // catalogued value, and an unset SwapCap emits no token at all.
 //
-// The exact value is pinned per state rather than "one of the three", for the
-// same reason worker_admit_cli_granted_linux_test.go pins cpu_slots exactly:
-// mutation testing there proved that accepting any catalogued value lets a hop
-// that hardcodes a constant survive the whole suite. swap_cap is a governance
-// signal with the same failure mode -- "enforced" fabricated on a host where
+// The exact value is pinned per state rather than "one of the three", because
+// accepting any catalogued value lets a hop that hardcodes a constant survive
+// the whole suite (mutation testing proved exactly that). swap_cap is a
+// governance signal with that failure mode -- "enforced" fabricated on a host where
 // swap could not actually be bounded is precisely the silent lost guarantee
 // this field exists to prevent -- so it gets the same treatment.
 func TestWorkerAdmitOutcomeLineCarriesSwapCap(t *testing.T) {

@@ -77,17 +77,13 @@ func TestShimWorkerAdmitGrantsAdvisoryAdmissionWithNoScopeAndNoCap(t *testing.T)
 	if response.MemoryMax != 0 {
 		t.Fatalf("memory_max=%d; nothing enforces a cap here, so reporting one would be read as containment that does not exist", response.MemoryMax)
 	}
-	if response.CPUSlots != runner.WorkerAdmitCPUSlotsUnevaluated {
-		t.Fatalf("cpu_slots=%q, want %q: the CPU gate counts populated worker cgroups, which cannot exist here",
-			response.CPUSlots, runner.WorkerAdmitCPUSlotsUnevaluated)
-	}
 	// And the line the supervisor actually reads must render, which is the
 	// end-to-end proof that the response shape and the channel agree.
 	line, err := runner.WorkerAdmitOutcomeLine(
 		runner.WorkerAdmitOutcome{State: response.State, Class: response.Class},
 		&runner.WorkerAdmitGrantFields{
 			WorkerID: response.WorkerID, Containment: response.Containment,
-			Reserved: response.Reserved, CPUSlots: response.CPUSlots,
+			Reserved: response.Reserved,
 		})
 	if err != nil {
 		t.Fatalf("the daemon produced a grant its own channel refuses to render: %v", err)

@@ -180,13 +180,10 @@ const (
 	WorkerAdmitReasonLedgerBudgetUnreadable = "ledger-budget-unreadable"
 	WorkerAdmitReasonLedgerBudgetExceeded   = "ledger-budget-exceeded"
 	WorkerAdmitReasonConfineModeMismatch    = "confine-mode-mismatch"
-	// AIRA-64. cpu-slots-saturated is the machine-wide CPU-concurrency bound
-	// declining one more worker; admit-locks-busy is a SPECULATIVE request
-	// (max_wait_ms == 0) refusing to wait on a lock another job holds. Both are
-	// class=contended: retriable, containment preserved, never a verdict about
-	// the request or the daemon.
-	WorkerAdmitReasonCPUSlotsSaturated = "cpu-slots-saturated"
-	WorkerAdmitReasonAdmitLocksBusy    = "admit-locks-busy"
+	// admit-locks-busy is a SPECULATIVE request (max_wait_ms == 0) refusing to
+	// wait on the outer-scope lock another job holds. class=contended: retriable,
+	// containment preserved, never a verdict about the request or the daemon.
+	WorkerAdmitReasonAdmitLocksBusy = "admit-locks-busy"
 
 	// AIRA-101. Another job holds this slice EXCLUSIVELY (`aira confine
 	// --exclusive`, for uncontended benchmarking), so no worker may be placed
@@ -371,25 +368,10 @@ type WorkerAdmitGrantFields struct {
 	// the worker escape it into swap? cgroup-v2's memory.max bounds memory, not
 	// memory+swap, and before AIRA-35 nothing capped worker swap at all -- a
 	// 512 MiB allocation inside a 32 MiB cap was measured exiting 0 with half a
-	// gigabyte paged out, never killed. Diagnostic only, exactly like CPUSlots:
-	// nothing branches on it, and an absent token means "an older daemon", not
-	// "ok".
+	// gigabyte paged out, never killed. Diagnostic only: nothing branches on it,
+	// and an absent token means "an older daemon", not "ok".
 	SwapCap string
-	// CPUSlots (AIRA-64) is WorkerAdmitCPUSlotsOK or
-	// WorkerAdmitCPUSlotsUnevaluated, and is omitted from the line when empty.
-	// It answers one question the four fields above cannot: was this grant
-	// actually subject to the CPU-concurrency bound, or did that dimension
-	// fail open? A governance dimension whose fail-open is invisible to the
-	// run it affects is how a subsystem ships inert. Diagnostic only: nothing
-	// branches on it, and an absent token means "an older daemon", not "ok".
-	CPUSlots string
 }
-
-// The CPU-governance states carried by WorkerAdmitGrantFields.CPUSlots.
-const (
-	WorkerAdmitCPUSlotsOK          = "ok"
-	WorkerAdmitCPUSlotsUnevaluated = "unevaluated"
-)
 
 // The swap-containment states carried by WorkerAdmitGrantFields.SwapCap
 // (AIRA-35). Each is a POSITIVE claim about what was established; see
@@ -484,10 +466,6 @@ func WorkerAdmitOutcomeLine(outcome WorkerAdmitOutcome, grant *WorkerAdmitGrantF
 		if grant.SwapCap != "" {
 			builder.WriteString(" swap_cap=")
 			builder.WriteString(url.QueryEscape(grant.SwapCap))
-		}
-		if grant.CPUSlots != "" {
-			builder.WriteString(" cpu_slots=")
-			builder.WriteString(url.QueryEscape(grant.CPUSlots))
 		}
 	}
 	if outcome.Detail != "" {

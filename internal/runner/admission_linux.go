@@ -469,10 +469,12 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	// `confine-reserve` per-test sub-reservation (confine_reserve_linux.go, no
 	// DelegateRAM) declare the one-core default (design §9); the daemon charges each
 	// against the per-slice 2×NumCPU ceiling. So a running --delegate-ram suite's
-	// live per-test reservations ARE each charged one core NOW (bounded by the #64
-	// cpuslots gate until S6). A --delegate-ram SUITE itself reserves 0 cores (spec
+	// live per-test reservations ARE each charged one core NOW. A --delegate-ram
+	// SUITE itself reserves 0 cores (spec
 	// §8): it is framework overhead, and charging it a core on top of its per-test
-	// reservations would double-count. S15 must REPLACE the per-test charge with its
+	// reservations would double-count. (The #49/#64 worker CPU-slot flock gate
+	// that formerly bounded these same workers was deleted in S6; the ledger
+	// charge is now the sole CPU bound.) S15 must REPLACE the per-test charge with its
 	// own worker accounting, not stack on it. Accounting only — no cpu.max is
 	// written. Daemon and client are rebuilt in lockstep on this branch, so the added
 	// arg needs no ProtocolVersion bump (deferred to S7).

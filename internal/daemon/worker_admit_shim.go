@@ -221,17 +221,11 @@ func (s *Server) evaluateShimWorkerAdmit(ctx context.Context, req workerAdmitReq
 		// advisory grant that carries either. There is no cgroup to name and no
 		// cap to report.
 		//
-		// CPUSlots is unevaluated rather than absent or ok, and that is the
-		// honest reading rather than a shortcut: the CPU gate counts POPULATED
-		// worker cgroups under the slice (cpuSlotsDecide), which structurally
-		// cannot exist here, so CPU-concurrency governance genuinely did not
-		// happen for this grant. supervisor.py says so once on the run's own
-		// output. SwapCap is left EMPTY, which the channel defines as "this
-		// daemon has nothing to say about swap" — the alternative, `unavailable`,
-		// is a claim that a swap cap was attempted and could not be established,
-		// and nothing here attempts one.
-		CPUSlots: runner.WorkerAdmitCPUSlotsUnevaluated,
-		leaseID:  leaseID,
+		// SwapCap is left EMPTY, which the channel defines as "this daemon has
+		// nothing to say about swap" — the alternative, `unavailable`, is a claim
+		// that a swap cap was attempted and could not be established, and nothing
+		// here attempts one.
+		leaseID: leaseID,
 	}, true
 }
 
