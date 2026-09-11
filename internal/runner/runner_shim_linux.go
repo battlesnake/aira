@@ -380,18 +380,10 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	// has done its whole job and is released now, while the daemon lease is not.
 	//
 	// The two are different things wearing the same release function. A daemon
-	// grant is a BOOKED RESERVE against the shim RAM budget and must last as long
-	// as the RAM does. The flock fallback (daemon down) is a whole-slice mutual
-	// exclusion with no reserve behind it: one holder at a time, admitting the
-	// next client only when this one lets go. Holding it for the job's life would
-	// turn a degraded fallback into a global serialiser of every shim launch,
-	// which is not what it was ever asked to be. `admission.lock != nil` is the
-	// discriminator the flock path itself sets (admitWithFlock), and it is the
-	// same one confineShim reads.
-	if admission.lock != nil {
-		releaseAdmit()
-	}
-
+	// S13. The flock fallback is deleted: the ONLY admission that carries a release
+	// now is a real daemon grant — a BOOKED RESERVE against the shim RAM budget that
+	// must last as long as the RAM does — so there is no early release here. The lease
+	// keeper is closed by `defer releaseAdmit()` at function return (job end).
 	for _, w := range writers {
 		_ = w.Close()
 	}

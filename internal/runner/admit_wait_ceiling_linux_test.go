@@ -40,15 +40,15 @@ func admitWaitCeilingDaemon(t *testing.T, code, message string, data []byte) (st
 	return socket, reached
 }
 
-// verifies: AIRA-58 — E_ADMIT_WAIT_TOO_LONG is TERMINAL at the runner and must
-// never reach fail(), which routes into the flock fallback and would launch the
-// job outside the daemon ledger. A refusal that silently becomes an unaccounted
-// launch is strictly worse than the silent clamp it replaced, so this is the
-// load-bearing guard on the whole AIRA-58 design.
+// verifies: AIRA-58 — E_ADMIT_WAIT_TOO_LONG is a TERMINAL refusal at the runner.
+// Pre-S13 the risk was fail() routing it into the flock fallback (an unaccounted
+// launch); S13 deleted that fallback, so a well-formed refusal frame is now
+// unconditionally terminal — the runner refuses to launch and surfaces the
+// daemon's reason, never reconnecting on it and never falling open.
 //
 // The malformed-payload variant matters just as much: the refusal must not
 // depend on parsing a rejection body, or a daemon sending a bad payload would
-// degrade into the same unaccounted launch.
+// degrade into an unaccounted launch.
 func TestConfineWaitTooLongIsTerminalAndNeverFallsBackToFlock(t *testing.T) {
 	valid, err := json.Marshal(admitRejectionPayloadForTest())
 	if err != nil {
@@ -103,16 +103,17 @@ func admitRejectionPayloadForTest() runnerAdmitRejection {
 	return runnerAdmitRejection{Basis: "reject:wait-too-long"}
 }
 
-// verifies: the flock-fallback containment gap. A non-delegate scope admitted
-// WITHOUT a daemon grant used to get no memory.max at all, because the cap was
-// gated on `admission.lock == nil` — true only for a daemon grant. The same
-// command therefore produced a capped scope when the daemon answered and an
-// UNCAPPED one when it did not (daemon restart drops every waiting connection at
-// once). An uncapped scope can consume the whole slice and OOM its neighbours.
+// verifies: the containment gap on a non-daemon-grant admission. A non-delegate
+// scope admitted WITHOUT a daemon grant (an `unevaluated` launch — the no-daemon
+// case, or a slice AIRA could not read) must still get a memory.max when the
+// caller PINNED a reserve, or the same command would be capped when the daemon
+// answered and UNCAPPED when it did not. An uncapped scope can consume the whole
+// slice and OOM its neighbours.
 //
-// The cap is keyed on PINNED-ness, not on admission state, because several
-// launchable outcomes (fallback timeout/unevaluated, daemon unevaluated) hold no
-// lock yet still create the scope.
+// The cap is keyed on PINNED-ness, not on admission state, because an unevaluated
+// launch holds no daemon lease yet still creates the scope. (Pre-S13 the flock
+// fallback was another such state; S13 deleted it, leaving `unevaluated` as the
+// non-grant launch state.)
 func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -122,8 +123,7 @@ func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 		wantCap int64
 		wantErr string
 	}{
-		{name: "fallback unevaluated, pinned", state: "unevaluated", reserve: 8 << 20, pinned: true, wantCap: 8 << 20},
-		{name: "fallback timeout, pinned", state: "timeout", reserve: 8 << 20, pinned: true, wantCap: 8 << 20},
+		{name: "unevaluated, pinned", state: "unevaluated", reserve: 8 << 20, pinned: true, wantCap: 8 << 20},
 		{name: "daemon unevaluated, pinned", state: "unevaluated", reserve: 16 << 20, pinned: true, wantCap: 16 << 20},
 		// Unpinned: the client holds only its own guess, and enforcing a guess as
 		// a hard cap would OOM-kill jobs that succeed today. Deliberately uncapped.
@@ -190,11 +190,12 @@ func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-58 — the shared ceiling is enforced by the RUNNER itself, not
-// only at CLI parse time and in the daemon. Neither of those covers a
-// programmatic caller when the daemon is DOWN: admitWithFlock waits on the raw
-// admissionMaxWait, so an over-ceiling request would simply become an
-// over-ceiling flock wait.
+// verifies: AIRA-58 — the shared wait ceiling is enforced by the RUNNER itself,
+// synchronously, not only at CLI parse time and in the daemon. Since S13 the
+// admission wait no longer self-expires (the client blocks/reconnects and bounds
+// by ctx), so the ceiling is now a TYPO GUARD on the one setter that can carry an
+// arbitrary value — the run.admission_max_wait config key — refusing an absurd
+// configured wait rather than accepting and silently ignoring it.
 func TestAdmitRefusesOverCeilingWaitEvenWithNoDaemon(t *testing.T) {
 	r := &Runner{
 		memorySlice:      "finite.slice",

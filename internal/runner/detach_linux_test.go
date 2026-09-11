@@ -544,12 +544,11 @@ func TestDetachedRecordStampsEffectiveAdmissionOverrideAfterAdmit(t *testing.T) 
 	r, _ := newMemoryRunner(t, nil)
 	r.memorySlice = currentSliceForTest(t)
 	r.memoryReserve = 40
-	// Free memory (max-cur) is 60 — strictly between the static reserve (40) and
-	// the override (70). A correct implementation enforcing the override cannot
-	// admit (60 < 70) and times out; an implementation that STAMPS the override
-	// but still ENFORCES the static 40 would admit "immediate" (60 >= 40). The
-	// Admission state below therefore proves the override value was enforced, not
-	// merely recorded.
+	// The MemoryReserveOverride (70) — not the static reserve (40) — is what must be
+	// STAMPED on the detached record's AdmissionReserve. S13 removed client-side reserve
+	// enforcement (the daemon now gates against the ledger, and the flock fallback that
+	// used to gate against slice free-memory is deleted), so with no daemon configured
+	// this admits `unevaluated`; the sliceMemory fn is no longer consulted by admit().
 	r.sliceMemory = func(string) (int64, int64, bool, string) { return 40, 100, true, "" }
 	r.clock = newInstantClock()
 	r.startFn = func(*exec.Cmd) error { return errors.New("injected after detached admission") }
@@ -594,11 +593,12 @@ func TestDetachedRecordStampsEffectiveAdmissionOverrideAfterAdmit(t *testing.T) 
 	if record.ResourceSignature != "sig" || record.AdmissionReserve == nil || *record.AdmissionReserve != override || record.AdmissionReserveBasis != "estimate:max=60,n=3,f=115" {
 		t.Fatalf("detached record=%+v", record)
 	}
-	// The enforced threshold was the override (70), not the static reserve (40):
-	// with 60 free the override cannot be granted, so admission times out
-	// (fail-open). A static-40 enforcement would have granted immediately.
-	if record.Admission != "timeout" {
-		t.Fatalf("override not enforced: admission=%q want timeout (60 free < override 70)", record.Admission)
+	// S13: with no daemon configured and the flock fallback deleted, a launch admits
+	// `unevaluated` (ungoverned but warned). The override value (70) is still stamped on
+	// the record above — which is the property under test — while reserve ENFORCEMENT is
+	// now the daemon's job rather than a client-side free-memory gate.
+	if record.Admission != "unevaluated" {
+		t.Fatalf("override stamping: admission=%q want unevaluated (no daemon, flock deleted)", record.Admission)
 	}
 	if err := r.ledger.project(context.Background()); err != nil {
 		t.Fatal(err)

@@ -31,12 +31,12 @@ func TestAIRA138ConfineAcceptsBothJobBounds(t *testing.T) {
 	if len(target) != 2 || target[0] != "make" {
 		t.Fatalf("target=%#v", target)
 	}
-	// Both bounds coexist with the near-miss option they must never be confused
-	// with: --admit-timeout bounds the ADMISSION WAIT and nothing else.
+	// The two job bounds are independent of each other. (S13 removed the third,
+	// --admit-timeout, so the admission wait is no longer a CLI-bounded near-miss.)
 	if _, options, err := parseArgs("confine", []string{
-		"--timeout", "30m", "--cpu-timeout", "10m", "--admit-timeout", "2h", "--", "suite",
-	}); err != nil || options["admit-timeout"] != "2h" || options["timeout"] != "30m" || options["cpu-timeout"] != "10m" {
-		t.Fatalf("the three timeout-suffixed options are not independent: err=%v options=%#v", err, options)
+		"--timeout", "30m", "--cpu-timeout", "10m", "--", "suite",
+	}); err != nil || options["timeout"] != "30m" || options["cpu-timeout"] != "10m" {
+		t.Fatalf("the two timeout-suffixed job bounds are not independent: err=%v options=%#v", err, options)
 	}
 
 	for _, test := range []struct {
@@ -158,10 +158,14 @@ func TestAIRA138ConfineFaceParity(t *testing.T) {
 			t.Fatalf("the core confine table omits %q, so it is missing from the generated help and schema", want)
 		}
 	}
-	// The usage line an operator actually reads must name them too.
-	for _, want := range []string{"--timeout D", "--cpu-timeout D", "--admit-timeout D"} {
+	// The usage line an operator actually reads must name them too. (S13 removed
+	// --admit-timeout, so it must NOT appear.)
+	for _, want := range []string{"--timeout D", "--cpu-timeout D"} {
 		if !strings.Contains(spec.Usage, want) {
 			t.Fatalf("confine usage %q omits %q", spec.Usage, want)
 		}
+	}
+	if strings.Contains(spec.Usage, "--admit-timeout") {
+		t.Fatalf("confine usage %q still advertises the removed --admit-timeout", spec.Usage)
 	}
 }

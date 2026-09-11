@@ -86,17 +86,10 @@ func runContainerLaunch(t *testing.T, request ConfineRequest, admission admissio
 }
 
 // daemonGrant is the admission shape that makes `scopeMemoryMax =
-// admission.reserve` fire: admitted, no flock lock, a real release.
+// admission.reserve` fire: an admitted grant carrying a real release (the lease
+// keeper), which since S13 is the only admission shape that carries one.
 func daemonGrant(reserve int64) admissionResult {
 	return admissionResult{state: "immediate", reserve: reserve, release: io.NopCloser(nil), basis: "pinned:client"}
-}
-
-// flockFallback reports an "immediate" admission WITH a lock. It is a slice
-// free-memory check, not a ledger charge -- keying the trailer's `:reserved` on
-// admission.state rather than on the grant predicate would claim a charge that
-// never happened.
-func flockFallback() admissionResult {
-	return admissionResult{state: "immediate", lock: &admitLock{}, basis: "fallback:daemon-unavailable"}
 }
 
 func TestContainerLedgerChargeAndScopeCap(t *testing.T) {
@@ -171,22 +164,11 @@ func TestContainerLedgerChargeAndScopeCap(t *testing.T) {
 			wantMemoryFrag: "caller=536870912:reserved",
 		},
 		{
-			// The flock fallback: an "immediate" state WITH a lock. The charge was
-			// requested but never made, and the trailer must say so.
-			name: "docker on the flock fallback reports reserve-requested",
-			request: ConfineRequest{
-				Argv: []string{"docker", "run", "-m", "8g", "alpine"},
-			},
-			admission:      flockFallback(),
-			wantReserve:    8 << 30,
-			wantScopeMax:   0,
-			wantMemoryFrag: "caller=8589934592:reserve-requested",
-		},
-		{
-			// Build review (Sol P2): the flock case alone does not pin the
-			// predicate -- `admission.lock == nil` would pass it while still
-			// mislabelling these. A timeout/unevaluated admission holds no lock
-			// AND no release, so only the full grant predicate rejects it.
+			// The predicate is keyed on a real daemon grant (admission.release != nil),
+			// not on admission.state: an `unevaluated` admission (the no-daemon case,
+			// or a slice AIRA could not read) is a launch with NO ledger charge, so the
+			// trailer must report reserve-requested, never reserved. (Since S13 deleted
+			// the flock fallback, this is the only non-grant admission shape left.)
 			name: "docker on an unevaluated admission reports reserve-requested",
 			request: ConfineRequest{
 				Argv: []string{"docker", "run", "-m", "8g", "alpine"},

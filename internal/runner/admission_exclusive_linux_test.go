@@ -13,26 +13,19 @@ import (
 
 // AIRA-101 §9.1: an exclusive request must FAIL CLOSED on every non-grant.
 //
-// The property under test is the feature's whole reason for existing. Past the
-// daemon exchange lies admitWithFlock, which launches OUTSIDE the daemon ledger
-// and therefore outside any notion of exclusivity — so reaching it with an
-// exclusive request would launch a benchmark that believes it is alone and is
-// not, producing contaminated numbers that look clean.
-//
-// Each test asserts BOTH halves: that the launch is refused, and that the flock
-// fallback was never even attempted. Asserting only the error would pass against
-// an implementation that took the lock, launched, and reported an error
-// afterwards.
+// The property under test is the feature's whole reason for existing: an
+// exclusive request that could not be granted must REFUSE to launch, never run a
+// benchmark that believes it is alone and is not. S13 deleted the flock fallback,
+// so "never launches non-exclusively" is now structural — an ungranted exclusive
+// request has nowhere to fall through to. Each test asserts the refusal and that
+// no lease is held (result.release == nil).
 
-// exclusiveRunner builds a runner whose flock path is booby-trapped: reaching it
-// fails the test outright rather than being detected after the fact.
+// exclusiveRunner builds a runner with a slice and reserve but a daemon dial the
+// individual tests supply — there is no flock fallback for an ungranted request
+// to reach.
 func exclusiveRunner(t *testing.T) *Runner {
 	t.Helper()
 	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 1 << 40, true, "" })
-	r.lockAttemptFn = func(string) (*admitLock, error) {
-		t.Error("an --exclusive request must never reach the flock fallback: it launches outside the ledger and outside exclusivity")
-		return &admitLock{}, nil
-	}
 	return r
 }
 
@@ -49,12 +42,25 @@ func requireExclusiveRefusal(t *testing.T, result admissionResult, err error, wh
 	}
 }
 
-// The commonest way to reach the fallback: no daemon at all.
+// The commonest way to reach the refusal: a daemon that is configured but
+// unreachable (the dial fails).
 func TestExclusiveRefusesWhenTheDaemonIsUnreachable(t *testing.T) {
 	r := exclusiveRunner(t)
 	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed }
 	result, err := r.admit(context.Background(), Request{Exclusive: true})
 	requireExclusiveRefusal(t, result, err, "daemon unreachable")
+}
+
+// The S13 no-socket tail: with a slice and reserve configured but NO daemon dial
+// AND no socket path, admitThroughDaemon returns (granted=false, err=nil) and
+// admit()'s OWN tail must refuse an exclusive request rather than launch it
+// non-exclusively. This is the deleted flock fallback's exclusive-refusal replaced
+// by admit()'s tail; exclusiveRunner sets neither admitDialFn nor admitSocketPath,
+// so it is the only exclusive test that exercises that no-socket branch.
+func TestExclusiveRefusesWhenNoDaemonSocketIsConfigured(t *testing.T) {
+	r := exclusiveRunner(t)
+	result, err := r.admit(context.Background(), Request{Exclusive: true})
+	requireExclusiveRefusal(t, result, err, "no daemon socket configured")
 }
 
 // An OLDER daemon rejects the unknown `exclusive` field with E_DAEMON_PROTOCOL.
@@ -324,10 +330,6 @@ func TestInheritedTokensAreValidatedBeforeUse(t *testing.T) {
 func exclusiveSaturationMessage(t *testing.T, exclusive string) string {
 	t.Helper()
 	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 1 << 40, true, "" })
-	r.lockAttemptFn = func(string) (*admitLock, error) {
-		t.Error("a structured E_ADMIT_SATURATED rejection is terminal and must not reach the flock fallback")
-		return &admitLock{}, nil
-	}
 	client, server := net.Pipe()
 	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
 	go func() {

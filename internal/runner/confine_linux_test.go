@@ -1315,28 +1315,6 @@ func TestConfineDaemonLeaseHeldUntilScopeTeardown(t *testing.T) {
 	}
 }
 
-func TestConfineFallbackFlockReleasedAtStart(t *testing.T) {
-	scope := &confineFakeScope{}
-	closer := &confineCountingCloser{}
-	deps := confineUnitDeps(scope)
-	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "immediate", reserve: 4 << 30, basis: "fallback:daemon-unavailable", lock: &admitLock{}, release: closer}, nil
-	}
-	deps.readUsage = func(string) cgroupUsage {
-		if closer.count != 1 {
-			t.Fatalf("fallback flock closes during run=%d, want release at start", closer.count)
-		}
-		return cgroupUsage{}
-	}
-	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
-	if _, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps); err != nil {
-		t.Fatal(err)
-	}
-	if closer.count != 1 {
-		t.Fatalf("fallback release count=%d", closer.count)
-	}
-}
-
 func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
 	scope := &confineFakeScope{}
 	closer := &confineCountingCloser{}
@@ -1693,11 +1671,17 @@ func TestReadConfineCapDoesNotDependOnMemoryCurrent(t *testing.T) {
 	}
 }
 
-func TestConfineAdmissionTimeoutStillLaunchesAndReportsFacetMix(t *testing.T) {
+// S13 removed the flock "timeout" admission state. An UNEVALUATED admission (the
+// no-daemon case, or a slice AIRA could not read) is now the state that launches
+// ungoverned-but-warned, so this test pins the same facet-honesty property on it:
+// the job still launches, its exit code passes through, and the trailer reports
+// the mix honestly (cap enforced, admission unevaluated, priorities unverified
+// after the forced handshake failure).
+func TestConfineUnevaluatedAdmissionStillLaunchesAndReportsFacetMix(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "timeout", waitedMS: 10}, nil
+		return admissionResult{state: "unevaluated", reason: "no-daemon"}, nil
 	}
 	deps.readHandshake = func(*os.File, time.Duration) ([]byte, error) {
 		return nil, errors.New("forced handshake failure")
@@ -1710,11 +1694,11 @@ func TestConfineAdmissionTimeoutStillLaunchesAndReportsFacetMix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Exit != 23 || result.Status.Admission != ConfineAdmissionTimeout || result.Status.Priorities != ConfinePrioritiesUnverified {
+	if result.Exit != 23 || result.Status.Admission != ConfineAdmissionUnevaluated || result.Status.Priorities != ConfinePrioritiesUnverified {
 		t.Fatalf("result=%+v stderr=%q", result, stderr.String())
 	}
-	if !scope.started || !strings.Contains(stderr.String(), "cap=enforced") || !strings.Contains(stderr.String(), "admission=timeout") || !strings.Contains(stderr.String(), "priorities=unverified") || strings.Contains(stderr.String(), "priorities=applied") {
-		t.Fatalf("timeout launch/status dishonest: scope=%+v stderr=%q", scope, stderr.String())
+	if !scope.started || !strings.Contains(stderr.String(), "cap=enforced") || !strings.Contains(stderr.String(), "admission=unevaluated") || !strings.Contains(stderr.String(), "priorities=unverified") || strings.Contains(stderr.String(), "priorities=applied") {
+		t.Fatalf("unevaluated launch/status dishonest: scope=%+v stderr=%q", scope, stderr.String())
 	}
 }
 

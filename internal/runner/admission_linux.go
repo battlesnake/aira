@@ -4,7 +4,6 @@ package runner
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -13,15 +12,11 @@ import (
 	"io/fs"
 	"net"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 type systemClock struct{}
@@ -33,7 +28,6 @@ type admissionResult struct {
 	state        string
 	reason       string
 	waitedMS     int64
-	lock         *admitLock
 	release      io.Closer
 	reserve      int64
 	ceiling      int64
@@ -51,36 +45,10 @@ var errDetachKillIntent = errors.New("detached run has a pending kill intent")
 // class this slice closes). It never escapes admitThroughDaemon.
 var errAdmitReconnect = errors.New("aira: admission transport failed; reconnect")
 
-type admitLock struct {
-	mu   sync.Mutex
-	file *os.File
-}
-
-func (l *admitLock) release() {
-	if l == nil {
-		return
-	}
-	l.mu.Lock()
-	f := l.file
-	l.file = nil
-	l.mu.Unlock()
-	if f != nil {
-		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-		_ = f.Close()
-	}
-}
-
-func (l *admitLock) Close() error {
-	l.release()
-	return nil
-}
-
 func (result admissionResult) releaseAdmission() {
 	if result.release != nil {
 		_ = result.release.Close()
-		return
 	}
-	result.lock.release()
 }
 
 // DaemonProtocolVersion is the wire protocol the runner's admission client
@@ -231,135 +199,37 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 		}
 		return admissionResult{state: "disabled"}, nil
 	}
-	// AIRA-58: enforce the shared ceiling HERE, before either admission path.
-	// Neither the CLI parse check nor the daemon covers a programmatic caller when
-	// the daemon is DOWN: admitWithFlock waits on the raw r.admissionMaxWait, so
-	// an over-ceiling request would simply become an over-ceiling flock wait.
-	// Refused with the terminal code, never silently clamped.
+	// AIRA-58: the shared wait ceiling, enforced before the daemon round trip. Since
+	// S13 the admission wait no longer self-expires (design §4/§6: the client blocks
+	// until granted, reconnecting across a daemon restart, and bounds the wait by ctx
+	// cancellation), so r.admissionMaxWait no longer bounds anything on THIS path — it
+	// is a flagged-vestigial §6 collision (see the S13 note; only confine-reserve still
+	// applies its own MaxWait, as a ctx deadline). The ceiling survives as a synchronous
+	// TYPO GUARD on the only setter that can produce an ARBITRARY value — the
+	// `run.admission_max_wait` project-config key (admitConfine also sets it, but only to
+	// the fixed DefaultConfineAdmissionWait): an absurd configured wait is refused with
+	// the terminal code rather than accepted and silently ignored.
 	if r.admissionMaxWait > AdmitWaitCeiling {
 		return admissionResult{state: "wait_too_long", basis: "reject:wait-too-long"}, fmt.Errorf(
 			"E_ADMIT_WAIT_TOO_LONG: requested admission wait %s exceeds the ceiling of %s",
 			r.admissionMaxWait, AdmitWaitCeiling)
 	}
-	start := r.clock.Now()
 	if result, granted, err := r.admitThroughDaemon(ctx, req, effectiveReserve); granted || err != nil {
 		return result, err
 	}
-	// AIRA-101. Past here lies the flock fallback, which launches OUTSIDE the
-	// daemon ledger and therefore outside any notion of exclusivity. Reaching it
-	// with an exclusive request would launch a benchmark that believes it is alone
-	// and is not. Refuse instead — including when the daemon was simply
-	// unreachable, which is the commonest way to get here.
+	// S13. admitThroughDaemon returns (granted=false, err=nil) ONLY when no daemon
+	// socket is configured for this launch — a down or restarting daemon reconnects
+	// indefinitely and never falls through here. The flock fallback is deleted, so
+	// there is no self-gating path left: an EXCLUSIVE request refuses (exclusivity
+	// cannot be established without the daemon ledger — AIRA-101), and everything else
+	// launches `unevaluated` (ungoverned but warned; `--require-admission` refuses it,
+	// AIRA-222).
 	if req.Exclusive {
 		return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"},
-			exclusiveRefusal("", "the daemon did not answer an exclusive admission request")
+			exclusiveRefusal("", "no admission daemon is configured, so exclusivity cannot be established")
 	}
-	daemonWaited := false
-	if r.admitDialFn != nil || strings.TrimSpace(r.admitSocketPath) != "" {
-		daemonWaited = r.clock.Now().Sub(start) >= time.Millisecond
-	}
-	path, ok, reason := resolveSlicePath(r.memorySlice)
-	if !ok {
-		r.warnAdmission("unevaluated", reason)
-		return admissionResult{state: "unevaluated", reason: reason}, nil
-	}
-	return r.admitWithFlock(ctx, req, path, start, effectiveReserve, daemonWaited)
-}
-
-// admitWithFlock is the retained #29 self-gating implementation. Every daemon
-// failure closes its socket before entering this one fallback path.
-func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, start time.Time, effectiveReserve int64, waited bool) (admissionResult, error) {
-	// Time already spent waiting on a responsive-but-incomplete daemon outcome
-	// belongs to this admission attempt. Ignore sub-millisecond dial failures so
-	// an immediately acquired fallback lock remains "immediate".
-	lastNote := start.Add(-time.Hour)
-	iteration := uint64(0)
-	finish := func(state, reason string, lock *admitLock) admissionResult {
-		result := admissionResult{state: state, reason: reason, lock: lock, reserve: effectiveReserve, basis: "fallback:daemon-unavailable"}
-		if lock != nil {
-			result.release = lock
-		}
-		if waited {
-			result.waitedMS = r.clock.Now().Sub(start).Milliseconds()
-		}
-		return result
-	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return admissionResult{}, err
-		}
-		if req.Detach {
-			current, currentErr := r.ledger.current(req.detachRunID)
-			if currentErr != nil {
-				return admissionResult{}, launchErr("U_RUN_RECONCILE_REQUIRED", currentErr)
-			}
-			if currentErr == nil && current.Detached && current.KillIntent.Present {
-				return admissionResult{}, errDetachKillIntent
-			}
-		}
-		cur, max, ok, reason := r.sliceMemory(path)
-		if !ok {
-			r.warnAdmission("unevaluated", reason)
-			return finish("unevaluated", reason, nil), nil
-		}
-		if max-cur >= effectiveReserve {
-			lockAttempt := r.lockAttemptFn
-			if lockAttempt == nil {
-				lockAttempt = tryAdmissionLock
-			}
-			lock, lockErr := lockAttempt(path)
-			switch {
-			case lockErr == nil:
-				cur2, max2, ok2, reason2 := r.sliceMemory(path)
-				if !ok2 {
-					lock.release()
-					r.warnAdmission("unevaluated", reason2)
-					return finish("unevaluated", reason2, nil), nil
-				}
-				if max2-cur2 >= effectiveReserve {
-					state := "immediate"
-					if waited {
-						state = "waited"
-					}
-					return finish(state, "", lock), nil
-				}
-				lock.release()
-				cur, max = cur2, max2
-			case errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN) || errors.Is(lockErr, unix.EINTR):
-				// Contention and interrupted flock attempts share the bounded outer loop.
-			default:
-				r.warnAdmission("unevaluated", "lock-error")
-				return finish("unevaluated", "lock-error", nil), nil
-			}
-		}
-		now := r.clock.Now()
-		remaining := r.admissionMaxWait - now.Sub(start)
-		if remaining <= 0 {
-			r.warnAdmission("timeout", "")
-			return finish("timeout", "", nil), nil
-		}
-		waited = true
-		if now.Sub(lastNote) >= 30*time.Second {
-			r.noteAdmission(cur, max, effectiveReserve)
-			lastNote = now
-		}
-		delay := jitteredPoll(r.pollInterval, iteration)
-		iteration++
-		if delay > remaining {
-			delay = remaining
-		}
-		if delay <= 0 {
-			delay = remaining
-			if delay <= 0 {
-				delay = time.Nanosecond
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return admissionResult{}, ctx.Err()
-		case <-r.clock.After(delay):
-		}
-	}
+	r.warnAdmission("unevaluated", "no-daemon")
+	return admissionResult{state: "unevaluated", reason: "no-daemon"}, nil
 }
 
 // admitThroughDaemon runs the admission exchange and, on a TRANSPORT failure
@@ -956,21 +826,15 @@ func jitteredPoll(interval time.Duration, iteration uint64) time.Duration {
 	}
 }
 
-func (r *Runner) noteAdmission(cur, max, effectiveReserve int64) {
-	if r.diagnostics != nil {
-		_, _ = fmt.Fprintf(r.diagnostics, "aira: memory admission waiting: current=%d max=%d reserve=%d\n", cur, max, effectiveReserve)
-	}
-}
-
 func (r *Runner) warnAdmission(state, reason string) {
 	if r.diagnostics == nil {
 		return
 	}
 	if reason == "" {
-		_, _ = fmt.Fprintf(r.diagnostics, "aira: warning: memory admission %s; launching without an admission lock\n", state)
+		_, _ = fmt.Fprintf(r.diagnostics, "aira: warning: memory admission %s; launching ungoverned\n", state)
 		return
 	}
-	_, _ = fmt.Fprintf(r.diagnostics, "aira: warning: memory admission %s (%s); launching without an admission lock\n", state, reason)
+	_, _ = fmt.Fprintf(r.diagnostics, "aira: warning: memory admission %s (%s); launching ungoverned\n", state, reason)
 }
 
 func resolveSlicePath(slice string) (string, bool, string) {
@@ -1160,43 +1024,4 @@ func parseAdmissionMemory(data []byte) (int64, bool) {
 	}
 	value, err := strconv.ParseInt(text, 10, 64)
 	return value, err == nil && value >= 0
-}
-
-func tryAdmissionLock(canonicalPath string) (*admitLock, error) {
-	dir, err := admissionLockDir()
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	digest := sha256.Sum256([]byte(canonicalPath))
-	path := filepath.Join(dir, fmt.Sprintf("%x", digest[:]))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return &admitLock{file: f}, nil
-}
-
-func admissionLockDir() (string, error) {
-	uid := os.Geteuid()
-	runtimeDir := filepath.Join("/run/user", strconv.Itoa(uid))
-	if st, err := os.Lstat(runtimeDir); err == nil && st.IsDir() && st.Mode().Perm()&0o022 == 0 && st.Mode().Perm()&0o300 == 0o300 && runtimeDirOwnedByUser(st, uid) {
-		return filepath.Join(runtimeDir, "aira-admission"), nil
-	}
-	account, err := user.LookupId(strconv.Itoa(uid))
-	if err != nil || account.HomeDir == "" || !filepath.IsAbs(account.HomeDir) {
-		return "", errors.New("user cache directory unavailable")
-	}
-	return filepath.Join(filepath.Clean(account.HomeDir), ".cache", "aira", "admission"), nil
-}
-
-func runtimeDirOwnedByUser(st os.FileInfo, uid int) bool {
-	stat, ok := st.Sys().(*syscall.Stat_t)
-	return ok && stat.Uid == uint32(uid)
 }

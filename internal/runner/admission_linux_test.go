@@ -18,10 +18,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
-
-	"aira/internal/testdeadline"
 )
 
 type chunkReader struct{ reader io.Reader }
@@ -92,29 +88,6 @@ func (c *instantClock) After(d time.Duration) <-chan time.Time {
 	return ch
 }
 
-type pacedClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func newPacedClock() *pacedClock { return &pacedClock{now: time.Unix(200, 0)} }
-func (c *pacedClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-func (c *pacedClock) After(d time.Duration) <-chan time.Time {
-	ch := make(chan time.Time, 1)
-	time.AfterFunc(time.Millisecond, func() {
-		c.mu.Lock()
-		c.now = c.now.Add(d)
-		now := c.now
-		c.mu.Unlock()
-		ch <- now
-	})
-	return ch
-}
-
 func currentSliceForTest(t *testing.T) string {
 	t.Helper()
 	mount, err := unifiedMount()
@@ -130,15 +103,6 @@ func currentSliceForTest(t *testing.T) string {
 		t.Fatalf("resolve current slice: %s", reason)
 	}
 	return path
-}
-
-func secureRuntimeDir(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return dir
 }
 
 func gateOnlyRunner(t *testing.T, clock Clock, fn func(string) (int64, int64, bool, string)) (*Runner, string) {
@@ -237,7 +201,7 @@ func TestResolveSlicePathTable(t *testing.T) {
 	}
 }
 
-func TestAdmissionT1FailOpenReasonsAndDisabled(t *testing.T) {
+func TestAdmissionT1DisabledAndNoDaemonUnevaluated(t *testing.T) {
 	if result, err := (&Runner{}).admit(context.Background(), Request{}); err != nil || result.state != "disabled" {
 		t.Fatalf("disabled result=%+v err=%v", result, err)
 	}
@@ -245,16 +209,17 @@ func TestAdmissionT1FailOpenReasonsAndDisabled(t *testing.T) {
 	if result, err := (&Runner{}).admit(context.Background(), Request{MemoryReserveOverride: &override}); err != nil || result.state != "disabled" {
 		t.Fatalf("override enabled statically-disabled admission: result=%+v err=%v", result, err)
 	}
-	for _, reason := range []string{"slice-not-found", "read-error", "unbounded", "parse-error"} {
-		t.Run(reason, func(t *testing.T) {
-			var diagnostics bytes.Buffer
-			r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 0, false, reason })
-			r.diagnostics = &diagnostics
-			result, err := r.admit(context.Background(), Request{})
-			if err != nil || result.state != "unevaluated" || result.reason != reason || !strings.Contains(diagnostics.String(), "warning") {
-				t.Fatalf("result=%+v err=%v diagnostics=%q", result, err, diagnostics.String())
-			}
-		})
+	// S13: with a slice and reserve configured but NO admission daemon socket, admit()
+	// no longer flock-gates (the fallback is deleted). A non-exclusive launch is
+	// `unevaluated` with reason "no-daemon" and a stderr warning; it runs ungoverned
+	// (and `--require-admission` refuses it). The injected sliceMemory fn is never
+	// consulted — there is no self-gating loop left to read it.
+	var diagnostics bytes.Buffer
+	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
+	r.diagnostics = &diagnostics
+	result, err := r.admit(context.Background(), Request{})
+	if err != nil || result.state != "unevaluated" || result.reason != "no-daemon" || !strings.Contains(diagnostics.String(), "warning") {
+		t.Fatalf("no-daemon result=%+v err=%v diagnostics=%q", result, err, diagnostics.String())
 	}
 }
 
@@ -288,667 +253,11 @@ func (b *countingBackend) Create(context.Context, string) (Scope, error) {
 }
 func (b *countingBackend) Open(context.Context, string) (Scope, error) { return b.scope, nil }
 
-func TestAdmissionT2NoLaunchSideEffectsDuringWait(t *testing.T) {
-	path := currentSliceForTest(t)
-	clock := newPacedClock()
-	var relieved atomic.Bool
-	firstRead := make(chan struct{})
-	var once sync.Once
-	backend := &countingBackend{scope: &memoryScope{}}
-	base := t.TempDir()
-	r, err := New(Config{CommonDir: base, Backend: backend, MemorySlice: path, MemoryReserve: 40, AdmissionMaxWait: time.Second, PollInterval: 10 * time.Millisecond, Clock: clock,
-		sliceMemoryFn: func(string) (int64, int64, bool, string) {
-			// Snapshot the pressure state before notifying the test. Otherwise the
-			// test goroutine can relieve pressure between close(firstRead) and the
-			// load below, accidentally turning the first observation into an
-			// immediate admission instead of exercising the waiting state.
-			wasRelieved := relieved.Load()
-			once.Do(func() { close(firstRead) })
-			if wasRelieved {
-				return 0, 100, true, ""
-			}
-			return 90, 100, true, ""
-		}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.startFn = func(*exec.Cmd) error { return errors.New("injected start failure") }
-	done := make(chan error, 1)
-	go func() {
-		_, launchErr := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-		done <- launchErr
-	}()
-	<-firstRead
-	if _, err := os.Stat(r.ledger.counter); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("counter exists during wait: %v", err)
-	}
-	if events, err := r.ledger.read(); err != nil || len(events) != 0 {
-		t.Fatalf("ledger during wait=%d err=%v", len(events), err)
-	}
-	entries, err := os.ReadDir(r.outputDir)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("outputs during wait=%d err=%v", len(entries), err)
-	}
-	if backend.creates.Load() != 0 {
-		t.Fatalf("scope creates during wait=%d", backend.creates.Load())
-	}
-	relieved.Store(true)
-	if err := <-done; err == nil {
-		t.Fatal("injected post-admission failure was not reached")
-	}
-	events, err := r.ledger.read()
-	if err != nil || len(events) == 0 {
-		t.Fatalf("post-wait ledger=%d err=%v", len(events), err)
-	}
-	last := events[len(events)-1].Run
-	if last.Admission != "waited" || last.AdmissionWaitedMS <= 0 || backend.creates.Load() != 1 {
-		t.Fatalf("record=%+v creates=%d", last, backend.creates.Load())
-	}
-}
-
-func TestAdmissionT3CancelBeforeFirstReadHasNoSideEffects(t *testing.T) {
-	path := currentSliceForTest(t)
-	var reads atomic.Int64
-	backend := &countingBackend{scope: &memoryScope{}}
-	r, err := New(Config{CommonDir: t.TempDir(), Backend: backend, MemorySlice: path, MemoryReserve: 40, Clock: newInstantClock(), sliceMemoryFn: func(string) (int64, int64, bool, string) {
-		reads.Add(1)
-		return 90, 100, true, ""
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := r.Launch(ctx, Request{Argv: []string{"/bin/true"}}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("err=%v", err)
-	}
-	if reads.Load() != 0 || backend.creates.Load() != 0 {
-		t.Fatalf("reads=%d creates=%d", reads.Load(), backend.creates.Load())
-	}
-	if events, err := r.ledger.read(); err != nil || len(events) != 0 {
-		t.Fatalf("events=%d err=%v", len(events), err)
-	}
-}
-
-func TestAdmissionT4ExactFakeClockTimeout(t *testing.T) {
-	clock := newInstantClock()
-	start := clock.Now()
-	r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 90, 100, true, "" })
-	r.admissionMaxWait = 25 * time.Millisecond
-	result, err := r.admit(context.Background(), Request{})
-	if err != nil || result.state != "timeout" || clock.Now().Sub(start) != 25*time.Millisecond || result.waitedMS != 25 || result.lock != nil {
-		t.Fatalf("result=%+v elapsed=%s err=%v", result, clock.Now().Sub(start), err)
-	}
-}
-
-func TestAdmissionFlockFallbackChargesRawCurrent(t *testing.T) {
-	clock := newInstantClock()
-	var lockAttempts atomic.Int64
-	r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 90, 100, true, "" })
-	r.memoryReserve = 30
-	r.admissionMaxWait = time.Millisecond
-	r.lockAttemptFn = func(string) (*admitLock, error) {
-		lockAttempts.Add(1)
-		return &admitLock{}, nil
-	}
-
-	result, err := r.admit(context.Background(), Request{})
-
-	if err != nil || result.state != "timeout" || lockAttempts.Load() != 0 {
-		t.Fatalf("raw fallback result=%+v lockAttempts=%d err=%v", result, lockAttempts.Load(), err)
-	}
-}
-
-func TestAdmissionOverrideControlsBothFlockChecksAndDiagnostic(t *testing.T) {
-	override := int64(70)
-	t.Run("pre-lock threshold", func(t *testing.T) {
-		clock := newInstantClock()
-		var lockAttempts atomic.Int64
-		var diagnostics bytes.Buffer
-		r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 40, 100, true, "" })
-		r.admissionMaxWait = time.Millisecond
-		r.diagnostics = &diagnostics
-		r.lockAttemptFn = func(string) (*admitLock, error) {
-			lockAttempts.Add(1)
-			return &admitLock{}, nil
-		}
-		result, err := r.admit(context.Background(), Request{MemoryReserveOverride: &override})
-		if err != nil || result.state != "timeout" || lockAttempts.Load() != 0 {
-			t.Fatalf("result=%+v lockAttempts=%d err=%v", result, lockAttempts.Load(), err)
-		}
-		if !strings.Contains(diagnostics.String(), "reserve=70") || strings.Contains(diagnostics.String(), "reserve=40") {
-			t.Fatalf("diagnostic=%q", diagnostics.String())
-		}
-	})
-
-	t.Run("under-lock threshold", func(t *testing.T) {
-		clock := newInstantClock()
-		var reads atomic.Int64
-		r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) {
-			if reads.Add(1)%2 == 1 {
-				return 0, 100, true, ""
-			}
-			return 40, 100, true, ""
-		})
-		r.admissionMaxWait = time.Millisecond
-		r.lockAttemptFn = func(string) (*admitLock, error) { return &admitLock{}, nil }
-		result, err := r.admit(context.Background(), Request{MemoryReserveOverride: &override})
-		if err != nil || result.state != "timeout" || reads.Load() < 2 {
-			t.Fatalf("result=%+v reads=%d err=%v", result, reads.Load(), err)
-		}
-	})
-}
-
-func TestAdmissionPersistentEINTRUsesBoundedOuterLoop(t *testing.T) {
-	clock := newInstantClock()
-	start := clock.Now()
-	var attempts atomic.Int64
-	r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	r.admissionMaxWait = 25 * time.Millisecond
-	r.lockAttemptFn = func(string) (*admitLock, error) {
-		attempts.Add(1)
-		return nil, unix.EINTR
-	}
-	type outcome struct {
-		result admissionResult
-		err    error
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan outcome, 1)
-	go func() {
-		result, err := r.admit(ctx, Request{})
-		done <- outcome{result: result, err: err}
-	}()
-	var got outcome
-	select {
-	case got = <-done:
-	case <-testdeadline.After(time.Second):
-		cancel()
-		got = <-done
-		t.Fatalf("persistent EINTR did not reach the admission deadline: err=%v attempts=%d", got.err, attempts.Load())
-	}
-	result, err := got.result, got.err
-	if err != nil || result.state != "timeout" || result.reason != "" || result.lock != nil || result.waitedMS != 25 || clock.Now().Sub(start) != 25*time.Millisecond {
-		t.Fatalf("result=%+v elapsed=%s attempts=%d err=%v", result, clock.Now().Sub(start), attempts.Load(), err)
-	}
-	if attempts.Load() < 2 || attempts.Load() > 10 {
-		t.Fatalf("persistent EINTR attempts=%d, want bounded polling", attempts.Load())
-	}
-}
-
-func TestAdmissionT5RealFlockSerializesWaiters(t *testing.T) {
-	clock := newPacedClock()
-	r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	r.admissionMaxWait = time.Second
-	first, err := r.admit(context.Background(), Request{})
-	if err != nil || first.lock == nil {
-		t.Fatalf("first=%+v err=%v", first, err)
-	}
-	done := make(chan admissionResult, 1)
-	go func() { result, _ := r.admit(context.Background(), Request{}); done <- result }()
-	select {
-	case result := <-done:
-		first.lock.release()
-		t.Fatalf("second bypassed held flock: %+v", result)
-	case <-time.After(10 * time.Millisecond):
-	}
-	first.lock.release()
-	select {
-	case second := <-done:
-		if second.lock == nil || second.state != "waited" {
-			t.Fatalf("second=%+v", second)
-		}
-		second.lock.release()
-	case <-testdeadline.After(time.Second):
-		t.Fatal("second did not acquire after release")
-	}
-}
-
-func TestAdmissionT5LockHeldThroughStartAndSerializedRecheck(t *testing.T) {
-	parent := isolatedScopeParent(t)
-	path := currentSliceForTest(t)
-	clock := newPacedClock()
-	var room atomic.Bool
-	room.Store(true)
-	pressureObserved := make(chan struct{})
-	var pressureOnce sync.Once
-	memory := func(string) (int64, int64, bool, string) {
-		if room.Load() {
-			return 0, 100, true, ""
-		}
-		pressureOnce.Do(func() { close(pressureObserved) })
-		return 90, 100, true, ""
-	}
-	r, err := New(Config{CommonDir: t.TempDir(), CgroupParent: parent, MemorySlice: path, MemoryReserve: 40, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond, Clock: clock, sliceMemoryFn: memory, Grace: time.Second, TermGrace: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Probe(context.Background()); err != nil {
-		skipOrFailRealCgroup(t, "real cgroup unavailable for lock-through-Start test: %v", err)
-	}
-	startEntered := make(chan struct{})
-	allowFirstStart := make(chan struct{})
-	var allowOnce sync.Once
-	allowFirst := func() { allowOnce.Do(func() { close(allowFirstStart) }) }
-	defer allowFirst()
-	firstStarted := make(chan error, 1)
-	secondStarted := make(chan struct{})
-	var starts atomic.Int64
-	r.startFn = func(cmd *exec.Cmd) error {
-		switch starts.Add(1) {
-		case 1:
-			close(startEntered)
-			<-allowFirstStart
-			err := cmd.Start()
-			if err == nil {
-				room.Store(false)
-			}
-			firstStarted <- err
-			return err
-		case 2:
-			close(secondStarted)
-			return errors.New("second start reached")
-		default:
-			return errors.New("unexpected extra start")
-		}
-	}
-	firstDone := make(chan launchOutcome, 1)
-	go func() {
-		record, launchErr := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "sleep 0.05"}})
-		firstDone <- launchOutcome{record: record, err: launchErr}
-	}()
-	select {
-	case <-startEntered:
-	case <-testdeadline.After(time.Second):
-		t.Fatal("first Launch did not reach blocked Start")
-	}
-	secondDone := make(chan launchOutcome, 1)
-	go func() {
-		record, launchErr := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-		secondDone <- launchOutcome{record: record, err: launchErr}
-	}()
-	select {
-	case <-secondStarted:
-		allowFirst()
-		t.Fatal("second Launch reached Start while first Start still held the admission window")
-	case <-time.After(20 * time.Millisecond):
-	}
-	allowFirst()
-	if err := <-firstStarted; err != nil {
-		t.Fatalf("first real Start failed: %v", err)
-	}
-	select {
-	case <-pressureObserved:
-	case <-testdeadline.After(time.Second):
-		t.Fatal("second Launch did not re-read first launch's memory effect")
-	}
-	select {
-	case <-secondStarted:
-		t.Fatal("second Launch started while serialized recheck still reported pressure")
-	default:
-	}
-	room.Store(true)
-	select {
-	case second := <-secondDone:
-		if second.err == nil {
-			t.Fatal("injected second Start failure was not reached after relief")
-		}
-	case <-testdeadline.After(2 * time.Second):
-		t.Fatal("second Launch did not proceed after relief")
-	}
-	select {
-	case first := <-firstDone:
-		if first.err != nil || first.record == nil || first.record.Status != StatusExited {
-			t.Fatalf("first launch=%+v", first)
-		}
-	case <-testdeadline.After(2 * time.Second):
-		t.Fatal("first Launch did not finish")
-	}
-	events, err := r.ledger.read()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var secondRecord RunRecord
-	for _, event := range events {
-		if event.Run.ID == "RUN-2" {
-			secondRecord = event.Run
-		}
-	}
-	if secondRecord.Admission != "waited" || secondRecord.AdmissionWaitedMS <= 0 {
-		t.Fatalf("second admission=%+v", secondRecord)
-	}
-}
-
-func TestAdmissionLockRootIsSharedAcrossXDGEnvironments(t *testing.T) {
-	firstEnv, secondEnv := secureRuntimeDir(t), secureRuntimeDir(t)
-	t.Setenv("XDG_RUNTIME_DIR", firstEnv)
-	firstDir, err := admissionLockDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	r1, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	first, err := r1.admit(context.Background(), Request{})
-	if err != nil || first.lock == nil {
-		t.Fatalf("first=%+v err=%v", first, err)
-	}
-	defer first.lock.release()
-	if err := os.Setenv("XDG_RUNTIME_DIR", secondEnv); err != nil {
-		t.Fatal(err)
-	}
-	secondDir, err := admissionLockDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if firstDir != secondDir {
-		t.Fatalf("lock dirs differ across environments: %q != %q", firstDir, secondDir)
-	}
-	clock := newInstantClock()
-	r2, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	r2.admissionMaxWait = 20 * time.Millisecond
-	var contended atomic.Bool
-	r2.lockAttemptFn = func(path string) (*admitLock, error) {
-		lock, lockErr := tryAdmissionLock(path)
-		if errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN) {
-			contended.Store(true)
-		}
-		return lock, lockErr
-	}
-	second, err := r2.admit(context.Background(), Request{})
-	if err != nil || second.state != "timeout" || second.lock != nil || !contended.Load() {
-		t.Fatalf("second=%+v contended=%v err=%v", second, contended.Load(), err)
-	}
-}
-
 func TestAdmissionT6NoAdmitBypassesPressure(t *testing.T) {
 	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { panic("must not read") })
 	result, err := r.admit(context.Background(), Request{NoAdmit: true})
 	if err != nil || result.state != "bypassed" {
 		t.Fatalf("result=%+v err=%v", result, err)
-	}
-}
-
-func TestAdmissionT7LiveLockHolderTimesOutUnlocked(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", secureRuntimeDir(t))
-	path := currentSliceForTest(t)
-	memory := func(string) (int64, int64, bool, string) { return 0, 100, true, "" }
-	first, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, MemorySlice: path, MemoryReserve: 40, AdmissionMaxWait: time.Second, PollInterval: 10 * time.Millisecond, Clock: newInstantClock(), sliceMemoryFn: memory})
-	if err != nil {
-		t.Fatal(err)
-	}
-	prepEntered := make(chan struct{})
-	releasePrep := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseFirst := func() { releaseOnce.Do(func() { close(releasePrep) }) }
-	defer releaseFirst()
-	first.reserveIDFn = func() (string, error) {
-		close(prepEntered)
-		<-releasePrep
-		return "", errors.New("release first prep")
-	}
-	firstDone := make(chan error, 1)
-	go func() {
-		_, launchErr := first.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-		firstDone <- launchErr
-	}()
-	<-prepEntered
-
-	clock := newInstantClock()
-	var diagnostics bytes.Buffer
-	second, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, MemorySlice: path, MemoryReserve: 40, AdmissionMaxWait: 25 * time.Millisecond, PollInterval: 10 * time.Millisecond, Clock: clock, sliceMemoryFn: memory, Diagnostics: &diagnostics})
-	if err != nil {
-		t.Fatal(err)
-	}
-	second.startFn = func(*exec.Cmd) error { return errors.New("second reached start") }
-	secondDone := make(chan error, 1)
-	go func() {
-		_, launchErr := second.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-		secondDone <- launchErr
-	}()
-	select {
-	case err := <-secondDone:
-		if err == nil {
-			t.Fatal("injected second start failure was not reached")
-		}
-	case <-testdeadline.After(time.Second):
-		t.Fatal("second Launch blocked behind live flock past its deadline")
-	}
-	events, err := second.ledger.read()
-	if err != nil || len(events) == 0 {
-		t.Fatalf("second events=%d err=%v", len(events), err)
-	}
-	last := events[len(events)-1].Run
-	if last.Admission != "timeout" || last.AdmissionWaitedMS != 25 || !strings.Contains(diagnostics.String(), "timeout") {
-		t.Fatalf("second record=%+v diagnostics=%q", last, diagnostics.String())
-	}
-	releaseFirst()
-	if err := <-firstDone; err == nil {
-		t.Fatal("first injected prep failure was not reached")
-	}
-}
-
-func TestAdmissionT8CancelDuringFlockContention(t *testing.T) {
-	clock := newPacedClock()
-	r, path := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	holder, err := tryAdmissionLock(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.release()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { _, admitErr := r.admit(ctx, Request{}); done <- admitErr }()
-	time.Sleep(3 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("err=%v", err)
-		}
-	case <-testdeadline.After(time.Second):
-		t.Fatal("contention wait ignored cancellation")
-	}
-}
-
-func TestAdmissionT9LockDirectoryFailureFailsOpenLoudly(t *testing.T) {
-	var diagnostics bytes.Buffer
-	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	r.diagnostics = &diagnostics
-	r.lockAttemptFn = func(string) (*admitLock, error) { return nil, os.ErrPermission }
-	result, err := r.admit(context.Background(), Request{})
-	if err != nil || result.state != "unevaluated" || result.reason != "lock-error" || !strings.Contains(diagnostics.String(), "warning") {
-		t.Fatalf("result=%+v err=%v diagnostics=%q", result, err, diagnostics.String())
-	}
-}
-
-type createFaultBackend struct{ scope *memoryScope }
-
-func (b *createFaultBackend) Probe(context.Context) error { return nil }
-func (b *createFaultBackend) Create(context.Context, string) (Scope, error) {
-	return nil, errors.New("create fault")
-}
-func (b *createFaultBackend) Open(context.Context, string) (Scope, error) { return b.scope, nil }
-
-func TestAdmissionT10EveryPostAdmissionFailureReleasesLock(t *testing.T) {
-	path := currentSliceForTest(t)
-	for _, name := range []string{"reserve-id", "starting-append", "output", "scope-create", "scope-append", "stdin", "pipes", "start"} {
-		t.Run(name, func(t *testing.T) {
-			t.Setenv("XDG_RUNTIME_DIR", secureRuntimeDir(t))
-			scope := &memoryScope{}
-			var backend ScopeBackend = &memoryBackend{scope: scope}
-			if name == "scope-create" {
-				backend = &createFaultBackend{scope: scope}
-			}
-			r, err := New(Config{CommonDir: t.TempDir(), Backend: backend, MemorySlice: path, MemoryReserve: 40, Clock: newInstantClock(), sliceMemoryFn: func(string) (int64, int64, bool, string) { return 0, 100, true, "" }})
-			if err != nil {
-				t.Fatal(err)
-			}
-			switch name {
-			case "reserve-id":
-				r.reserveIDFn = func() (string, error) { return "", errors.New("reserve fault") }
-			case "starting-append":
-				r.appendFault = func(event ledgerEvent) error {
-					if event.Kind == "starting" {
-						return errors.New("starting fault")
-					}
-					return nil
-				}
-			case "output":
-				r.openOutputsFn = func(string, string, bool) (map[string]string, map[string]*os.File, error) {
-					return nil, nil, errors.New("output fault")
-				}
-			case "scope-append":
-				r.appendFault = func(event ledgerEvent) error {
-					if event.Kind == "scope-created" {
-						return errors.New("scope append fault")
-					}
-					return nil
-				}
-			case "stdin":
-				r.setupStdinFn = func(*exec.Cmd, Request, string) (func(), bool, error) { return nil, false, errors.New("stdin fault") }
-			case "pipes":
-				r.setupPipesFn = func(*exec.Cmd, bool) (map[string]*os.File, map[string]*os.File, error) {
-					return nil, nil, errors.New("pipe fault")
-				}
-			case "start":
-				r.startFn = func(*exec.Cmd) error { return errors.New("start fault") }
-			}
-			if _, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}}); err == nil {
-				t.Fatal("injected failure returned nil")
-			}
-			lock, err := tryAdmissionLock(path)
-			if err != nil {
-				t.Fatalf("admission lock leaked after %s: %v", name, err)
-			}
-			lock.release()
-		})
-	}
-}
-
-func TestAdmissionT10ReleasePrecedesFailBeforeLaunchArbitration(t *testing.T) {
-	path := currentSliceForTest(t)
-	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, MemorySlice: path, MemoryReserve: 40, Clock: newInstantClock(), sliceMemoryFn: func(string) (int64, int64, bool, string) { return 0, 100, true, "" }})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.openOutputsFn = func(string, string, bool) (map[string]string, map[string]*os.File, error) {
-		return nil, nil, errors.New("output fault")
-	}
-	arbitrationEntered := make(chan struct{})
-	unblockArbitration := make(chan struct{})
-	var unblockOnce sync.Once
-	unblock := func() { unblockOnce.Do(func() { close(unblockArbitration) }) }
-	defer unblock()
-	r.failBeforeLaunchFn = func(ctx context.Context, record RunRecord, code string, cause error) (*RunRecord, error) {
-		close(arbitrationEntered)
-		<-unblockArbitration
-		return r.failBeforeLaunch(ctx, record, code, cause)
-	}
-	launchDone := make(chan error, 1)
-	go func() {
-		_, launchErr := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-		launchDone <- launchErr
-	}()
-	select {
-	case <-arbitrationEntered:
-	case <-testdeadline.After(time.Second):
-		t.Fatal("failure did not enter blocked terminal arbitration")
-	}
-	competitor, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	result, err := competitor.admit(context.Background(), Request{})
-	if err != nil || result.state != "immediate" || result.lock == nil {
-		t.Fatalf("competitor could not acquire before arbitration completed: result=%+v err=%v", result, err)
-	}
-	result.lock.release()
-	unblock()
-	if err := <-launchDone; err == nil {
-		t.Fatal("injected launch failure returned nil")
-	}
-}
-
-func TestAdmissionT11KillAndReconcileDoNotTakeAdmissionLock(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", secureRuntimeDir(t))
-	path := currentSliceForTest(t)
-	r, scope := newMemoryRunner(t, nil)
-	r.memorySlice, r.memoryReserve = path, 40
-	r.clock, r.sliceMemory = newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" }
-	// admissionMaxWait is deliberately far longer than the backstop below. The
-	// property under test is that Kill and Reconcile never take the admission lock
-	// at all; with a short max-wait, a regression that DID take it would still
-	// return once the wait expired, and a generous backstop would pass anyway. An
-	// effectively unbounded wait makes "took the lock" mean "never returns", which
-	// is what the backstop can honestly distinguish under any load (AIRA-20).
-	r.admissionMaxWait, r.pollInterval = time.Hour, 10*time.Millisecond
-	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, CgroupScope: scope.Reference(), Admission: "immediate"}
-	appendRunEvent(t, r, "starting", run)
-	appendRunEvent(t, r, "scope-created", run)
-	holder, err := tryAdmissionLock(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.release()
-	done := make(chan struct{}, 2)
-	go func() { _, _ = r.Kill(context.Background(), run.ID, false); done <- struct{}{} }()
-	go func() { _, _ = r.Reconcile(context.Background()); done <- struct{}{} }()
-	for i := 0; i < 2; i++ {
-		select {
-		case <-done:
-		case <-testdeadline.After(time.Second):
-			t.Fatal("Kill/Reconcile blocked on the admission lock")
-		}
-	}
-}
-
-func TestAdmissionT12LockedRecheckFailureUsesExactReason(t *testing.T) {
-	for _, reason := range []string{"read-error", "unbounded", "parse-error"} {
-		t.Run(reason, func(t *testing.T) {
-			var calls atomic.Int64
-			var diagnostics bytes.Buffer
-			r, path := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) {
-				if calls.Add(1) == 1 {
-					return 0, 100, true, ""
-				}
-				return 0, 0, false, reason
-			})
-			r.diagnostics = &diagnostics
-			result, err := r.admit(context.Background(), Request{})
-			if err != nil || result.state != "unevaluated" || result.reason != reason || result.waitedMS != 0 || !strings.Contains(diagnostics.String(), "warning") {
-				t.Fatalf("result=%+v err=%v diagnostics=%q", result, err, diagnostics.String())
-			}
-			lock, err := tryAdmissionLock(path)
-			if err != nil {
-				t.Fatalf("locked recheck leaked flock: %v", err)
-			}
-			lock.release()
-		})
-	}
-}
-
-func TestAdmissionT13WaitedMSOnLateErrorAndEAGAINContention(t *testing.T) {
-	clock := newInstantClock()
-	var calls atomic.Int64
-	r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) {
-		if calls.Add(1) <= 2 {
-			return 90, 100, true, ""
-		}
-		return 0, 0, false, "read-error"
-	})
-	result, err := r.admit(context.Background(), Request{})
-	if err != nil || result.state != "unevaluated" || result.reason != "read-error" || result.waitedMS <= 0 {
-		t.Fatalf("late error result=%+v err=%v", result, err)
-	}
-
-	clock = newInstantClock()
-	r, path := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	r.admissionMaxWait = 20 * time.Millisecond
-	holder, err := tryAdmissionLock(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.release()
-	result, err = r.admit(context.Background(), Request{})
-	if err != nil || result.state != "timeout" || result.reason == "lock-error" || result.waitedMS <= 0 {
-		t.Fatalf("contention result=%+v err=%v", result, err)
 	}
 }
 
@@ -961,74 +270,6 @@ func TestAdmissionDiagnosticsErrorsAreIgnored(t *testing.T) {
 	r.diagnostics = failingWriter{}
 	if result, err := r.admit(context.Background(), Request{}); err != nil || result.state != "unevaluated" {
 		t.Fatalf("result=%+v err=%v", result, err)
-	}
-}
-
-func TestRealMemoryAdmissionWaitsForReliefThenIsImmediate(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		skipOrFailRealCgroup(t, "python3 is unavailable for the admission fixture")
-	}
-	const limit = int64(128 * 1024 * 1024)
-	const reserve = int64(64 * 1024 * 1024)
-	parent := writableMemoryParent(t, "134217728")
-	filler, err := New(Config{CommonDir: t.TempDir(), CgroupParent: parent, Grace: time.Second, TermGrace: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	admitted, err := New(Config{CommonDir: t.TempDir(), CgroupParent: parent, MemorySlice: parent, MemoryReserve: reserve, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond, Grace: time.Second, TermGrace: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := filler.Probe(context.Background()); err != nil {
-		skipOrFailRealCgroup(t, "real admission filler cgroup unavailable: %v", err)
-	}
-	if err := admitted.Probe(context.Background()); err != nil {
-		skipOrFailRealCgroup(t, "real admission run cgroup unavailable: %v", err)
-	}
-	// The filler and admitted runners have independent ledgers whose first IDs
-	// would otherwise collide under the shared parent.
-	if _, err := admitted.ledger.reserveID(); err != nil {
-		t.Fatal(err)
-	}
-	fillerDone := make(chan launchOutcome, 1)
-	go func() {
-		record, launchErr := filler.Launch(context.Background(), Request{Argv: []string{"python3", "-c", "import time; x=bytearray(80*1024*1024); [x.__setitem__(i, 1) for i in range(0, len(x), 4096)]; time.sleep(0.5)"}})
-		fillerDone <- launchOutcome{record: record, err: launchErr}
-	}()
-	pressureDeadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
-	for {
-		cur, max, ok, reason := readSliceMemory(parent)
-		if !ok {
-			t.Fatalf("read real admission parent: %s", reason)
-		}
-		if max != limit {
-			t.Fatalf("memory.max=%d want %d", max, limit)
-		}
-		if max-cur < reserve {
-			break
-		}
-		if time.Now().After(pressureDeadline) {
-			t.Fatal("filler did not create admission pressure")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	waited, err := admitted.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if waited.Admission != "waited" || waited.AdmissionWaitedMS <= 0 {
-		t.Fatalf("waited record=%+v", waited)
-	}
-	fillerResult := <-fillerDone
-	if fillerResult.err != nil || fillerResult.record == nil || fillerResult.record.Status != StatusExited {
-		t.Fatalf("filler result=%+v", fillerResult)
-	}
-	immediate, err := admitted.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if immediate.Admission != "immediate" || immediate.AdmissionWaitedMS != 0 {
-		t.Fatalf("immediate record=%+v", immediate)
 	}
 }
 
@@ -1331,14 +572,11 @@ func TestDaemonAdmitFullFrameWinsWithoutFlock(t *testing.T) {
 		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
 		admitDialFn: func(context.Context, string) (net.Conn, error) { return conn, nil },
 	}
-	var fallback atomic.Int64
-	runner.lockAttemptFn = func(string) (*admitLock, error) {
-		fallback.Add(1)
-		return &admitLock{}, nil
-	}
+	// S13: there is no flock fallback to probe — "never flocks" is now structural.
+	// A full validated grant wins and its connection becomes the lease.
 	result, err := runner.admit(context.Background(), Request{})
-	if err != nil || result.state != "waited" || result.waitedMS != 9 || fallback.Load() != 0 {
-		t.Fatalf("result=%+v fallback=%d err=%v", result, fallback.Load(), err)
+	if err != nil || result.state != "waited" || result.waitedMS != 9 {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	if conn.closed.Load() {
 		t.Fatal("winning grant connection closed before launch release")
@@ -1379,14 +617,9 @@ func TestAdmitTransportFailureReconnectsAndNeverFlocks(t *testing.T) {
 		pollInterval: time.Millisecond, clock: newInstantClock(), admitDialFn: dial,
 		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
 	}
-	var attempts atomic.Int64
-	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 	result, err := runner.admit(context.Background(), Request{})
 	if err != nil || result.state != "waited" {
 		t.Fatalf("result=%+v err=%v (want a reconnect grant)", result, err)
-	}
-	if attempts.Load() != 0 {
-		t.Fatalf("flock fallback was entered (%d attempts); the client must reconnect, never fall open", attempts.Load())
 	}
 	if dials.Load() != 3 {
 		t.Fatalf("dials=%d, want 3 (two transport failures, then a grant)", dials.Load())
@@ -1418,14 +651,9 @@ func TestAdmitWellFormedRefusalIsTerminalNeverFlocks(t *testing.T) {
 				pollInterval: time.Millisecond, clock: newInstantClock(), admitDialFn: dial,
 				sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
 			}
-			var attempts atomic.Int64
-			runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 			result, err := runner.admit(context.Background(), Request{})
 			if err == nil {
 				t.Fatalf("result=%+v err=nil; a well-formed %s refusal must be a terminal error, never a launch", result, code)
-			}
-			if attempts.Load() != 0 {
-				t.Fatalf("%s: flock fallback was entered (%d attempts); a refusal must never fall open", code, attempts.Load())
 			}
 		})
 	}
@@ -1452,16 +680,11 @@ func TestAdmitWedgedDaemonBlocksUntilContextCancel(t *testing.T) {
 		pollInterval: time.Millisecond, clock: systemClock{}, admitDialFn: dial,
 		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
 	}
-	var attempts atomic.Int64
-	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 	_, err := runner.admit(ctx, Request{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want context.Canceled (the client blocks on a wedged daemon until cancelled)", err)
-	}
-	if attempts.Load() != 0 {
-		t.Fatalf("flock fallback was entered (%d attempts); a wedged daemon must not fall open", attempts.Load())
 	}
 }
 

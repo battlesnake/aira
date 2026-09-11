@@ -10,8 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // AIRA-141. The coverage gap AIRA-129's own review named: no test drove
@@ -126,80 +124,5 @@ func TestShimRunHoldsTheDaemonAdmissionLeaseUntilTheJobEnds(t *testing.T) {
 	case <-lease.released:
 	case <-time.After(30 * time.Second):
 		t.Fatal("the daemon admission lease was never released after the run ended: the reserve leaks for the life of the process")
-	}
-}
-
-// verifies: AIRA-141 — the FLOCK fallback is still released when the child
-// starts, and is NOT swept up in the daemon lease's longer lifetime.
-//
-// This is the false-fail direction of the same change, and it pins a real
-// distinction rather than a taste. A daemon grant is a booked reserve against
-// the shim RAM budget and must last as long as the RAM does. The flock fallback
-// (daemon down) carries no reserve at all: it is whole-slice mutual exclusion,
-// one holder at a time, admitting the next client only when this one lets go.
-// Holding it for a job's life would turn a degraded fallback into a global
-// serialiser of every shim launch on the box.
-//
-// Non-porosity: dropping the `admission.lock != nil` discriminator — releasing
-// nothing at start — fails this while the daemon test above still passes.
-func TestShimRunReleasesTheFlockFallbackWhenTheChildStarts(t *testing.T) {
-	r := shimRunner(t, Config{MemorySlice: currentSliceForTest(t), MemoryReserve: 40})
-	// No daemon: admitDialFn stays nil and admitSocketPath is empty, so admit
-	// falls through to admitWithFlock, which is the only producer of an
-	// admissionResult carrying a lock.
-	r.sliceMemory = func(string) (int64, int64, bool, string) { return 0, 1 << 40, true, "" }
-	lockPath := filepath.Join(t.TempDir(), "admission.lock")
-	r.lockAttemptFn = func(string) (*admitLock, error) {
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-			_ = f.Close()
-			return nil, err
-		}
-		return &admitLock{file: f}, nil
-	}
-
-	marker := filepath.Join(t.TempDir(), "release")
-	type launchOutcome struct {
-		record *RunRecord
-		err    error
-	}
-	done := make(chan launchOutcome, 1)
-	go func() {
-		record, err := r.Launch(context.Background(), Request{
-			Argv: []string{"/bin/sh", "-c", "while [ ! -f " + marker + " ]; do sleep 0.01; done; exit 0"},
-		})
-		done <- launchOutcome{record: record, err: err}
-	}()
-	waitForShimRunning(t, r, "RUN-1")
-
-	// A second open file description on the same file. flock(2) treats separate
-	// descriptions independently even within one process, so this contends with
-	// the launch's own lock exactly as another client's would.
-	probe, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer probe.Close()
-	if err := unix.Flock(int(probe.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		t.Fatalf("the flock fallback was still held after the ci-shim child started (%v): it carries no reserve, so holding it for the job's life serialises every shim launch (AIRA-141)", err)
-	}
-	_ = unix.Flock(int(probe.Fd()), unix.LOCK_UN)
-
-	if err := os.WriteFile(marker, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	outcome := <-done
-	if outcome.err != nil {
-		t.Fatalf("launch err=%v", outcome.err)
-	}
-	if outcome.record.Status != StatusExited || outcome.record.ExitCode == nil || *outcome.record.ExitCode != 0 {
-		t.Fatalf("record=%+v", outcome.record)
-	}
-	// The fallback really was taken; otherwise the probe above proves nothing.
-	if outcome.record.Admission != "immediate" || outcome.record.AdmissionReserve == nil {
-		t.Fatalf("admission=%q reserve=%v, want the flock fallback's own grant", outcome.record.Admission, outcome.record.AdmissionReserve)
 	}
 }

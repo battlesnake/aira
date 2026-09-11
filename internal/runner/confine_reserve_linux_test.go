@@ -110,17 +110,12 @@ func TestConfineReserveDaemonDownNeverEngagesFlock(t *testing.T) {
 	r.admitDialFn = func(context.Context, string) (net.Conn, error) {
 		return nil, errors.New("daemon down")
 	}
-	var flockAttempts atomic.Int64
-	r.lockAttemptFn = func(string) (*admitLock, error) {
-		flockAttempts.Add(1)
-		return nil, errors.New("must not engage flock")
-	}
 	started := time.Now()
 	reservation, err := confineReserveWithRunner(context.Background(), ConfineReserveRequest{
 		Bytes: 40, Pinned: true, Signature: "pytest:test_example.py::test_case",
 	}, r)
-	if err == nil || reservation != nil || flockAttempts.Load() != 0 {
-		t.Fatalf("reservation=%+v err=%v flockAttempts=%d (want a bounded error, never flock)", reservation, err, flockAttempts.Load())
+	if err == nil || reservation != nil {
+		t.Fatalf("reservation=%+v err=%v (want a bounded error, never a flock fallback)", reservation, err)
 	}
 	if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 2*time.Second) {
 		t.Fatalf("daemon-down reserve did not return within its bounded wait: %s", elapsed)

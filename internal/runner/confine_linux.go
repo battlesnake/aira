@@ -712,15 +712,15 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	switch admission.state {
 	case "immediate", "waited":
 		result.Status.Admission = ConfineAdmissionAdmitted
-	case "timeout":
-		result.Status.Admission = ConfineAdmissionTimeout
 	default:
 		result.Status.Admission = ConfineAdmissionUnevaluated
 	}
 	// AIRA-222. Fail closed BEFORE launch if the caller required admission and the
-	// job was not admitted (state ∉ {immediate, waited}) — including a flock
-	// timeout. defer releaseAdmission() (above) still runs, releasing the
-	// (possibly nil) lease.
+	// job was not admitted (state ∉ {immediate, waited}). defer releaseAdmission()
+	// (above) still runs, releasing the (possibly nil) lease. S13 removed the flock
+	// "timeout" state: admit()'s reachable non-admitted states are now bypassed,
+	// disabled, unevaluated, refused, too_large/saturated, exclusive_unavailable and
+	// wait_too_long — never "timeout".
 	if refusal := requireAdmissionRefusal(request, sliceName, admission.state, admission.reason); refusal != nil {
 		return result, refusal
 	}
@@ -978,7 +978,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the unpinned fallback is deliberately left uncapped rather than
 	// conservatively capped. Delegate-ram never takes either branch: its pinned
 	// reserve is framework overhead, and it gets a finite cap below.
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
+	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 		capSource = ConfineCapSourceDaemonReserve
 	}
@@ -1065,12 +1065,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
 	if containerPlan.Detected() {
 		result.Status.Container = containerInjection.Placement
-		// The ledger charge is real only on a daemon grant. This is the SAME
-		// predicate the scope-cap assignment above uses; the flock fallback
-		// reports state "immediate"/"waited" WITH a lock and is a slice
-		// free-memory check, so a facet keyed on admission.state would claim a
-		// charge that never happened.
-		ledgerCharged := admitted && admission.lock == nil && admission.release != nil
+		// The ledger charge is real only on a daemon grant, which is exactly what a
+		// non-nil admission.release now witnesses: since S13 deleted the flock fallback,
+		// the only admissionResult carrying a release is a real daemon grant (the keeper
+		// lease). This is the SAME predicate the scope-cap assignment above uses.
+		ledgerCharged := admitted && admission.release != nil
 		result.Status.ContainerMemory = ContainerMemoryFacet(containerPlan, containerInjection, containerReserveSkip, ledgerCharged)
 		for _, advisory := range ContainerAdvisories(containerPlan, containerInjection, scopeMemoryMax, result.Status.ReserveBasis) {
 			_, _ = fmt.Fprintln(diagnostics, advisory)
@@ -1183,9 +1182,6 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	started.Store(true)
 	_ = handshakeWrite.Close()
 	_ = releaseRead.Close()
-	if admission.lock != nil {
-		releaseAdmission()
-	}
 
 	abortStarted := func(cause error) (ConfineResult, error) {
 		_ = releaseWrite.Close()
@@ -1988,17 +1984,14 @@ func confineUnavailable(slice string, err error) error {
 // as the uncapped-slice refusal) when the caller opted in and the job was NOT
 // admitted, so it would run UNGOVERNED.
 //
-// Keyed on the raw admission STATE, refusing anything that is not "immediate" or
-// "waited" (the two admitted states). This is fail-closed by construction: it
-// refuses "unevaluated" (slice unreadable / daemon-down ci-shim / a daemon
-// unevaluated grant) AND "timeout" — the latter is the flock fallback's "waited
-// the whole budget, got no admission, launching anyway" outcome, which is
-// exactly an ungoverned launch, and which an earlier `== unevaluated` key let
-// through (Fable build-review P1). It ALLOWS a flock-fallback "immediate"/
-// "waited": that is a real free-memory check holding a real lock, so keying any
-// stricter (e.g. daemon-booked only) would make the flag unusable on a real
-// slice during a daemon restart. Returns nil whenever the flag is absent, so
-// ordinary launches are never touched.
+// Keyed on the raw admission STATE, refusing ANYTHING that is not "immediate" or
+// "waited" (the two admitted states) rather than on a specific list of bad states.
+// This is fail-closed BY CONSTRUCTION: it refuses "unevaluated" (slice unreadable,
+// a daemon-down ci-shim install, a daemon `unevaluated` grant, or the S13 no-daemon
+// launch) and any other non-admitted state, where an earlier `== unevaluated` key
+// let a different one through (Fable build-review P1). It allows only a real daemon
+// grant's "immediate"/"waited". Returns nil whenever the flag is absent, so ordinary
+// launches are never touched.
 func requireAdmissionRefusal(request ConfineRequest, slice, state, reason string) error {
 	if !request.RequireAdmission || state == "immediate" || state == "waited" {
 		return nil

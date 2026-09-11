@@ -106,8 +106,8 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		//
 		// AIRA-185: drain is CLI-only for a third reason — it is a FOREGROUND,
 		// connection-bound hold, so a request/response tool form could only return
-		// before the hold began (a fabricated success) or block a dispatcher for up
-		// to half an hour.
+		// before the hold began (a fabricated success) or block a dispatcher
+		// indefinitely (S13: the admission wait is no longer client-bounded).
 		if action.Verb == "confine" || action.Verb == "confine-status" || action.Verb == "drain" {
 			t.Fatalf("%s leaked into generated actions; it must stay a prose-only CLI verb", action.Verb)
 		}
@@ -120,7 +120,7 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 	for _, want := range []string{
 		"aira drain wait",
 		"bounds the HELD duration only",
-		"separate budget defaulting to 30 minutes",
+		"NOT client-bounded",
 		"NOT job-safety",
 		"best-effort contention reduction",
 	} {
