@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"aira/internal/runner"
 	"aira/internal/testdeadline"
 )
 
@@ -243,50 +242,12 @@ func TestADaemonRestartReleasesExclusivityRatherThanWedgingTheSlice(t *testing.T
 	}
 }
 
-// Subtree-aware emptiness against a REAL cgroup tree. A running aitest outer
-// scope drains every pid into <outer>/.aira-supervisor, so its LEAF reads empty
-// while the suite is fully busy. A leaf-only reading would declare such a slice
-// empty and hand a benchmark a fabricated "you are alone" — which is the exact
-// contention this ticket exists to eliminate, reported as its opposite.
-//
-// verifies: AIRA-101
-func TestExclusiveGrantIsBlockedByARealLeafEmptyButSubtreePopulatedScope(t *testing.T) {
-	populated := true
-	zero := 0
-	server := NewServer(Paths{})
-	server.stopping = make(chan struct{})
-	defer close(server.stopping)
-	server.admitPollInterval = time.Hour
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
-	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-		return 0, 1 << 40, 0, true, ""
-	}
-	// The real aitest shape: leaf empty, subtree populated.
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{{
-			ScopeID: "CONFINE-suite-800-1@mark", Name: "suite", Owner: "mark",
-			Populated: &zero, SubtreePopulated: &populated,
-		}}}, nil
-	}
-	queue, exclusive, code, err := server.enqueueAdmitInternal("/slice", 1024, "", 0, false, admitRequest{
-		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 801), name: "bench", owner: "mark",
-	})
-	if err != nil {
-		t.Fatalf("enqueue: code=%s err=%v", code, err)
-	}
-	evaluate(t, server, queue)
-	if state, _, _ := waiterState(queue, exclusive); state == admitGranted {
-		t.Fatal("an exclusive job was told it was alone while a leaf-empty, subtree-populated suite was running")
-	}
-
-	// Once the suite's subtree really is empty, the grant proceeds.
-	populated = false
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, queue, exclusive, "the exclusive waiter once the slice was genuinely empty")
-}
+// S14 retired TestExclusiveGrantIsBlockedByARealLeafEmptyButSubtreePopulatedScope
+// with the cgroup scan: a running scope that holds no lease now reads as empty
+// (the accepted D5 orphan gap), so the scan-derived "leaf-empty, subtree-
+// populated blocks exclusivity" behaviour is gone. Emptiness is Σleases == 0;
+// TestExclusiveIsNotGrantedWhileALeaseIsHeld pins that a live LEASE blocks a
+// drain head.
 
 func readAllLines(r interface{ Read([]byte) (int, error) }) (string, error) {
 	buf := make([]byte, 4096)

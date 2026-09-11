@@ -465,39 +465,39 @@ func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
 	return ids
 }
 
-// sliceProvablyEmpty reports whether the daemon can POSITIVELY establish that
-// nothing else is admitted or running in this slice. queue.mu must be held.
+// sliceProvablyEmpty reports whether the slice holds no other admitted job:
+// Σleases == 0, i.e. no granted && accounted waiter. queue.mu must be held.
 //
-// Fail-closed in all three terms, and the third is the important one: a scan the
-// daemon could not complete leaves liveScopesKnown false, and an unestablished
-// emptiness must never be rendered as an empty slice. Telling a benchmark "you
-// are alone" on a reading nobody has is the fabricated pass this codebase
-// forbids everywhere else.
+// S14 rewired this from a cgroup-scan reading (the deleted liveScopes /
+// liveScopesKnown) to the signed ledger. Emptiness is now exactly "the daemon
+// holds no lease for this slice", derived from the same connection-held ledger
+// `available = ceiling − Σleases` is (design §2/§3). outstandingJobs is
+// rederiveLedgerLocked's count of granted && accounted waiters, so this equals
+// Σleases == 0 verbatim: a grant sets state == admitGranted and accounted == true
+// together (nothing ever sets accounted false on a granted waiter), so the count
+// can never lag the leases it describes.
 //
-// KNOWN COVERAGE LIMITS of the emptiness reading, stated rather than discovered
-// later. Each is fail-OPEN for the measurement and fail-SAFE for the machine —
-// they can let an exclusive job be granted beside something, never wedge the
-// slice:
+// ACCEPTED COVERAGE GAP (D5 — owner 2026-09-11, accepted rather than engineered
+// around). Emptiness is a claim about LEASES, never about resident RAM:
 //
-//   - `aira run` scopes are named .aira-RUN-* under a project's own cgroup
-//     parent, not .aira-CONFINE-* under this slice, so the confine scan does not
-//     see them. While such a run holds its admission connection it is still
-//     counted by outstandingJobs; only after a daemon restart does it become
-//     invisible here.
-//   - Anything not admitted through AIRA at all — a process placed into the slice
-//     by hand — is outside this reading by construction, and so is a Docker
-//     container, which lives under /system.slice/docker-<id>.scope entirely
-//     outside this slice. `--exclusive`'s own help text says so; exclusivity must
-//     never be read as a claim about those.
+//   - An orphaned RAM holder that lost its lease — a SIGKILLed supervisor whose
+//     worker reparents and survives (design §3) — reads as empty here, so
+//     `--exclusive` could be granted beside it. Bounded, not airtight: oom.group
+//     fires on memory pressure, not supervisor death, so the MemAvailable
+//     watchdog and per-scope OOM backstop are the only net, bounded by the
+//     orphan's lifetime (design §3, §11).
+//   - Anything not admitted through AIRA at all — a process placed in the slice
+//     by hand, or a Docker container under /system.slice/docker-<id>.scope — is
+//     outside the ledger by construction. `--exclusive`'s own help text says so;
+//     exclusivity is never a claim about those.
 //
-// outstandingJobs is strict, with NO discount for exempt sub-reservations. A
-// discount would be unnecessary — a running job's own scoped lease already keeps
-// the count at 1 or more, and a post-restart reloaded parent is caught by
-// subtree-aware liveScopes — and it would remove a belt-and-braces signal in the
-// one case where it is the only thing still objecting: a live reservation whose
-// parent job has escaped its scope or died with its socket held open.
+// This is a deliberate LOOSENING from the pre-S14 scan reading, which could see a
+// running scope that held no lease (a post-restart survivor before it
+// re-declared) and refuse exclusivity beside it. Under the socket-liveness model
+// a survivor re-declares and re-anchors its lease inside the restart freeze
+// (design §4), so the ledger counts it; the only residue is the orphan gap above.
 func sliceProvablyEmpty(queue *sliceQueue) bool {
-	return queue.outstandingJobs == 0 && queue.liveScopesKnown && queue.liveScopes == 0
+	return queue.outstandingJobs == 0
 }
 
 // AIRA-149. The three-valued contention lattice, and the ONE reading that
@@ -553,43 +553,20 @@ func (w *admitWaiter) noteGrantableLocked(available int64) {
 	w.lastGrantable = &value
 }
 
-// soloReadingLocked is the emptiness reading for ONE refusal pass. queue.mu must
-// be held.
+// soloReadingLocked is the emptiness reading for ONE refusal pass, feeding the
+// AIRA-149 contention diagnosis. queue.mu must be held.
 //
-// It is derived STRUCTURALLY, from the subtree-aware population AIRA-101
-// already maintains, and deliberately NOT from the reserve counter
-// (outstandingJobs). The reserve ledger counts only connection-held leases, so a
-// scope that is running but holds no lease this daemon knows of contributes no
-// job to it — correct for RESERVE accounting and wrong for EMPTINESS, because
-// such a scope is still a running job. On this box the commonest such scope is a
-// post-restart aitest/delegate outer scope that has drained every pid into a
-// child cgroup: its leaf Populated reads 0 and, until it re-declares (S11),
-// outstandingJobs stays 0, while it is very much using memory -- driving
-// `current` up and refusing a solo waiter on the ORDINARY disjunct. A
-// counter-derived rule would print "nothing else held or was queued for this
-// slice" beside a running suite: the ticket's own defect, reintroduced by its
-// fix.
+// It reads the same ledger emptiness (sliceProvablyEmpty == Σleases == 0) the
+// exclusive gate does. S14 removed the cgroup scan, so there is no longer an
+// "emptiness the daemon could not establish" case: the ledger is always readable
+// under queue.mu, so this returns observed or none-observed and never
+// unevaluated. (A waiter no pass ever evaluated still renders `unevaluated`
+// through its UNSET latch — a different absence, upstream of this reading.)
 //
-// Job counts, not bytes, remains load-bearing. A residual 4 KiB page in the
-// slice is NOT another job; reading a nonzero `current` as contention is
-// exactly the misdiagnosis AIRA-149 is about (the measured case had
-// current=4096 with zero jobs). sliceProvablyEmpty counts scopes and jobs,
-// never bytes.
-//
-// One bounded gap, named rather than engineered around: the scan behind
-// liveScopes is rate-limited to at most once per second
-// (queue.adoptedAt), so a single pass can read a scope population up to that
-// stale. Over a multi-second wait every pass would have to miss the same
-// neighbour for a false `none-observed`, and it is the identical staleness
-// AIRA-101 already accepts for the strictly more consequential decision of
-// GRANTING exclusivity.
+// Job counts, not bytes: a residual page in the slice is NOT another job, which
+// is exactly the misdiagnosis AIRA-149 is about (the measured case had
+// current=4096 with zero jobs).
 func soloReadingLocked(queue *sliceQueue, queuedAhead int) int {
-	// A failing confine scan cannot establish solitude. Fail closed, and ALWAYS
-	// first: an unestablished reading outranks every "looks empty" test below it,
-	// so a single such pass forbids the solo claim for the whole wait.
-	if !queue.liveScopesKnown {
-		return contentionUnevaluated
-	}
 	if !sliceProvablyEmpty(queue) {
 		return contentionObserved
 	}
@@ -2599,12 +2576,11 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// AIRA-149. A waiter that is not the drain head is blocked because
 			// another waiter is exclusively holding or draining the slice --
 			// something else is in the way BY CONSTRUCTION, so it latches observed
-			// directly. The drain head itself is blocked by !sliceProvablyEmpty, so
-			// it takes the shared reading: with an unestablished scan that is
-			// `unevaluated`, never `observed`, because the daemon could not
-			// establish the contention it would otherwise be asserting. At render
-			// time the AIRA-101 Exclusive arm wins the wording, but a stored false
-			// claim is still the wrong value.
+			// directly. The drain head itself is blocked by !sliceProvablyEmpty
+			// (Σleases > 0), so it takes the shared ledger reading: `observed` while
+			// a lease is held, `none-observed` once the slice is empty. At render
+			// time the AIRA-101 Exclusive arm wins the wording, but the stored
+			// contention value must still be the truthful one.
 			if gate.draining != nil && waiter == gate.draining {
 				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 			} else {

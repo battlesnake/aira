@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -295,74 +294,27 @@ func TestExclusiveHoldAdmitsANestedHolderTokenJob(t *testing.T) {
 	requireStillQueued(t, queue, forged, "a job carrying a stale or foreign holder token")
 }
 
-// The fail-closed rule. A scan the daemon could not complete leaves emptiness
-// UNESTABLISHED, and an unestablished emptiness must never be granted as an
-// empty slice — that would hand a benchmark a fabricated "you are alone".
-func TestExclusiveIsNotGrantedWhenTheScanCouldNotEstablishEmptiness(t *testing.T) {
+// S14 ledger-emptiness (was the scan-derived "subtree-populated scope" and
+// "scan could not establish emptiness" cases, retired with the cgroup scan).
+// Emptiness is now Σleases == 0: a slice holding one live lease is NOT empty, so
+// a drain head must stay queued beside it.
+//
+// This is the S14 MUTATION PIN for the emptiness rewire: the lease is a REAL
+// granted && accounted lease through rederiveLedgerLocked (seedRunningLease), not
+// a phantom outstandingJobs scalar, so mutating sliceProvablyEmpty to `return
+// true` grants the drain and reds this test.
+func TestExclusiveIsNotGrantedWhileALeaseIsHeld(t *testing.T) {
 	server, _ := exclusiveTestServer(t)
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		return runner.ConfineListResult{}, errors.New("cgroupfs unavailable")
-	}
-	holderID := exclusiveScopeID(t, "bench", 109)
-	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
-		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
-	})
-
-	evaluate(t, server, queue)
-
-	requireStillQueued(t, queue, exclusive, "an exclusive waiter whose slice emptiness could not be established")
-	queue.mu.Lock()
-	known := queue.liveScopesKnown
-	queue.mu.Unlock()
-	if known {
-		t.Fatal("a failed scan must not leave liveScopesKnown true")
-	}
-}
-
-// Subtree-aware liveness. A running aitest suite drains every pid out of its
-// outer scope, so leaf cgroup.procs reads zero while the suite is fully busy.
-// Counting leaf population would declare such a slice empty.
-func TestExclusiveIsNotGrantedWhileASubtreePopulatedScopeRuns(t *testing.T) {
-	populated := true
-	server, _ := exclusiveTestServer(t)
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		zero := 0
-		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{{
-			ScopeID: "CONFINE-suite-300-1@mark", Name: "suite", Owner: "mark",
-			// Leaf-empty, subtree-populated: exactly the aitest layout.
-			Populated: &zero, SubtreePopulated: &populated,
-		}}}, nil
-	}
 	holderID := exclusiveScopeID(t, "bench", 110)
 	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
 		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
 	})
+	// One live lease keeps Σleases > 0, so the slice is not provably empty.
+	seedRunningLease(queue, 300)
 
 	evaluate(t, server, queue)
 
-	requireStillQueued(t, queue, exclusive, "an exclusive waiter beside a leaf-empty but subtree-populated scope")
-}
-
-// Unevaluated is not empty.
-func TestExclusiveIsNotGrantedWhenAScopesPopulationIsUnevaluated(t *testing.T) {
-	server, _ := exclusiveTestServer(t)
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{{
-			ScopeID: "CONFINE-unknown-301-1@mark", Name: "unknown", Owner: "mark",
-			SubtreePopulated: nil,
-		}}}, nil
-	}
-	holderID := exclusiveScopeID(t, "bench", 111)
-	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
-		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
-	})
-
-	evaluate(t, server, queue)
-
-	requireStillQueued(t, queue, exclusive, "an exclusive waiter beside a scope of unknown population")
+	requireStillQueued(t, queue, exclusive, "an exclusive drain head while a live lease is held (Σleases > 0)")
 }
 
 func TestSecondExclusiveRequestIsRefusedAtEnqueue(t *testing.T) {
@@ -423,108 +375,13 @@ func TestARejectedExclusiveWaiterDoesNotBlockTheNextExclusiveRequest(t *testing.
 	requireGranted(t, queue, second, "the replacement exclusive waiter")
 }
 
-// A drain that cannot establish emptiness must ABORT, not stall the whole shared
-// slice for the full ceiling. The machine keeps working; the benchmark fails
-// loudly.
-func TestADrainAbortsWhenTheScanKeepsFailing(t *testing.T) {
-	now := time.Now()
-	server, _ := exclusiveTestServer(t)
-	server.admitNow = func() time.Time { return now }
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		return runner.ConfineListResult{}, errors.New("cgroupfs unavailable")
-	}
-	holderID := exclusiveScopeID(t, "bench", 116)
-	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
-		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
-	})
-	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
-
-	evaluate(t, server, queue)
-	requireStillQueued(t, queue, exclusive, "the exclusive waiter on the first failing pass")
-	requireStillQueued(t, queue, ordinary, "an ordinary waiter while the drain is still live")
-
-	// Past the establishment grace, still failing.
-	now = now.Add(admitExclusiveEstablishGrace + time.Second)
-	evaluate(t, server, queue)
-
-	if exclusive.state != admitRejected {
-		t.Fatalf("expected the drain to abort, got state=%d", exclusive.state)
-	}
-	if exclusive.outcome != admitOutcomeExclusiveUnestablished {
-		t.Fatalf("expected outcome %q, got %q", admitOutcomeExclusiveUnestablished, exclusive.outcome)
-	}
-	// The whole point: the slice must be usable again in the SAME pass.
-	requireGranted(t, queue, ordinary, "an ordinary waiter once the unestablishable drain aborted")
-}
-
-// The abort anchor must arm on the FIRST failure. Arming only "after a success"
-// would never fire when the slice is unreadable from the queue's very first
-// pass, which is the likeliest persistent failure and the case this rule exists
-// for.
-func TestTheDrainAbortArmsWhenTheScanFailsFromTheFirstPass(t *testing.T) {
-	now := time.Now()
-	server, _ := exclusiveTestServer(t)
-	server.admitNow = func() time.Time { return now }
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		return runner.ConfineListResult{}, errors.New("unreadable from the start")
-	}
-	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
-		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 117), name: "bench", owner: "mark",
-	})
-
-	evaluate(t, server, queue)
-	queue.mu.Lock()
-	armed := queue.scanFailingSince
-	queue.mu.Unlock()
-	if armed.IsZero() {
-		t.Fatal("the abort anchor must arm on the first failing scan, with no preceding success")
-	}
-
-	now = now.Add(admitExclusiveEstablishGrace + time.Second)
-	evaluate(t, server, queue)
-	if exclusive.state != admitRejected {
-		t.Fatalf("expected an abort after the grace, got state=%d", exclusive.state)
-	}
-}
-
-// A successful scan must clear the anchor, so an intermittent failure never
-// accumulates toward an abort.
-func TestTheDrainAbortAnchorClearsOnASuccessfulScan(t *testing.T) {
-	now := time.Now()
-	failing := true
-	server, _ := exclusiveTestServer(t)
-	server.admitNow = func() time.Time { return now }
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		if failing {
-			return runner.ConfineListResult{}, errors.New("transient")
-		}
-		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{}}, nil
-	}
-	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
-		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 118), name: "bench", owner: "mark",
-	})
-	// A running job, so the drain does not simply complete on the recovered pass.
-	// A REAL lease, not a phantom outstandingJobs scalar (see seedRunningLease).
-	seedRunningLease(queue, 900)
-
-	evaluate(t, server, queue)
-	failing = false
-	now = now.Add(time.Second)
-	evaluate(t, server, queue)
-
-	queue.mu.Lock()
-	armed := queue.scanFailingSince
-	queue.mu.Unlock()
-	if !armed.IsZero() {
-		t.Fatal("a successful scan must clear the abort anchor")
-	}
-	now = now.Add(admitExclusiveEstablishGrace + time.Second)
-	evaluate(t, server, queue)
-	requireStillQueued(t, queue, exclusive, "an exclusive waiter after the anchor was cleared by a good scan")
-}
+// S14 retired the drain-abort-on-scan-failure feature with the cgroup scan.
+// There is no longer an "emptiness the daemon could not establish" case: the
+// ledger is always readable under the queue lock, so a drain either converges as
+// leases release or is ended by the waiter's own max_wait / connection close.
+// The tests TestADrainAbortsWhenTheScanKeepsFailing,
+// TestTheDrainAbortArmsWhenTheScanFailsFromTheFirstPass and
+// TestTheDrainAbortAnchorClearsOnASuccessfulScan were removed here.
 
 // The un-wedge, at the ledger level: whatever ends the exclusive waiter, the
 // drain must lift. Releasing is what admitConnection's deferred release does on
