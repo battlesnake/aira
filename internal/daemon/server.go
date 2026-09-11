@@ -488,6 +488,15 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			s.serveConnection(context.Background(), conn)
 		}()
 	}
+	// S10 best-effort restart lease dump. Written BEFORE close(stopping): the
+	// leases are still held here, and close(stopping) is precisely what releases
+	// them and closes their connections (admit.go's granted-lease select returns),
+	// so the dump is written before any lease connection closes (§14 P3 / §15
+	// P2-A). It is deliberately NOT after the drain below — the ErrDrainTimeout
+	// early return would skip it, and the leases would already be gone. Fail-open:
+	// a write error is logged and swallowed (dump.go); S9's absent-lease re-declare
+	// recovers a missing or partial dump.
+	s.dumpLeasesForRestart()
 	close(stopping)
 	cancelReaper()
 	cancelFlusher()
