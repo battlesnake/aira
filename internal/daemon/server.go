@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aira/internal/app"
@@ -71,14 +72,27 @@ type Server struct {
 	discoveryFailed map[string]struct{}
 	// stopping closes when Serve stops accepting. Watch handlers observe it
 	// directly so their terminal event drain remains distinct from peer-close.
-	stopping                     chan struct{}
-	watchSlots                   chan struct{}
-	watchPollInterval            time.Duration
-	admitSlots                   chan struct{}
-	admitPollInterval            time.Duration
-	workerAdmitPollInterval      time.Duration
-	admitBackfillGrace           time.Duration
-	admitFreezeMaxHold           time.Duration
+	stopping                chan struct{}
+	watchSlots              chan struct{}
+	watchPollInterval       time.Duration
+	admitSlots              chan struct{}
+	admitPollInterval       time.Duration
+	workerAdmitPollInterval time.Duration
+	admitBackfillGrace      time.Duration
+	admitFreezeMaxHold      time.Duration
+	// S11 restart recovery (design §4). restartFreeze is how long NEW admissions are
+	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
+	// space by a new admission); unanchoredGrace is the extra time after the freeze
+	// before a lease STILL unanchored is dropped (the real safety — kill -0 at reload
+	// only early-drops). Both injectable (defaults 2s / 10s) so tests drive timing via
+	// the fake clock + restartAfter seam, never a real sleep. restartFreezeUntilNanos
+	// is the freeze-end wall-clock UnixNano armed at listen-ready (0 = unarmed); it is
+	// atomic because the reload seeds leases — and so spawns their runEvaluator
+	// goroutines — BEFORE the freeze is armed, so an evaluator pass may read it
+	// concurrently with the arming write.
+	restartFreeze                time.Duration
+	unanchoredGrace              time.Duration
+	restartFreezeUntilNanos      atomic.Int64
 	admitRegistryMu              sync.Mutex
 	admitQueues                  map[string]*sliceQueue
 	admitPriorMu                 sync.Mutex
@@ -159,13 +173,21 @@ type Server struct {
 	workerScopeScanInterval time.Duration
 	admitNow                func() time.Time
 	admitAfter              func(time.Duration) <-chan time.Time
-	admitWriteFrame         func(net.Conn, any) error
-	admitBeforeWrite        func(*admitWaiter)
-	admitPeakHistory        func(context.Context, string) (runner.PeakRSSStats, error)
-	admitPeakP90            func(context.Context) (int64, bool, error)
-	peerCredential          func(net.Conn) (int, int, error)
-	storeOpAppendTimeout    time.Duration
-	storeOpHeavyTimeout     time.Duration
+	// S11 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
+	// runRestartFreeze waits the freeze then the grace via this, and sharing admitAfter
+	// would cross-talk with a live admitConnection in a Serve-driven test. Nil →
+	// time.After. killForProbe is the reload kill-probe's syscall seam (nil →
+	// unix.Kill(pid, 0)) so the ESRCH/EPERM decision table is unit-testable without a
+	// really-dead pid.
+	restartAfter         func(time.Duration) <-chan time.Time
+	killForProbe         func(pid int) error
+	admitWriteFrame      func(net.Conn, any) error
+	admitBeforeWrite     func(*admitWaiter)
+	admitPeakHistory     func(context.Context, string) (runner.PeakRSSStats, error)
+	admitPeakP90         func(context.Context) (int64, bool, error)
+	peerCredential       func(net.Conn) (int, int, error)
+	storeOpAppendTimeout time.Duration
+	storeOpHeavyTimeout  time.Duration
 	// deadlines is the transport's one deadline convention (AIRA-84); see
 	// deadlines.go. It replaces the former storeOpWriteTimeout field and the
 	// hardcoded connect stamp, which were two independent numbers for one
@@ -185,6 +207,8 @@ func NewServer(paths Paths) *Server {
 		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
 		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
+		restartFreeze:                defaultRestartFreeze,
+		unanchoredGrace:              defaultUnanchoredGrace,
 		admitQueues:                  map[string]*sliceQueue{},
 		admitConfineScanInterval:     admitConfineScanIntervalDefault,
 		workerScopeScanInterval:      workerScopeScanIntervalDefault,
@@ -357,6 +381,13 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			returnErr = err
 		}
 	}()
+	// S11 restart recovery (design §4). Reload the previous daemon's graceful lease
+	// dump and seed the survivors UNANCHORED here — after DB-open, BEFORE net.Listen —
+	// so the ledger is pre-seeded before any connection is accepted. Consume-once
+	// (unlink on read) and best-effort: a missing/stale/partial dump just falls back to
+	// the re-declare path. The restart freeze and the unanchored-drop timer are armed
+	// at listen-ready below.
+	s.reloadLeaseDump()
 	listener, err := net.Listen("unix", s.Paths.SocketPath)
 	if err != nil {
 		return err
