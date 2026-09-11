@@ -218,30 +218,38 @@ type topBarRegion struct {
 	Start  int64
 	Size   int64
 
-	// AIRA-135. A scope region is drawn in TWO shades of one slot colour: Colour
-	// at full intensity for the part of the reservation that is live-used right
-	// now, and ShadeColour — the darkened variant — for the remainder, which is
-	// reserved and idle. Bytes above is unchanged and still the whole
-	// RESERVATION, so where the NEXT region starts cannot move: the split is
+	// AIRA-135. A scope region is drawn in ONE slot colour throughout; the split
+	// between the part of the reservation that is live-used right now and the
+	// remainder, which is reserved and idle, is drawn by BLOCK CHARACTER rather
+	// than by a second colour shade: a solid full block for the used part and a
+	// lighter shaded block, in the SAME colour, for the idle remainder (the
+	// glyphs live in tui.go's topBarGlyph). Size above is unchanged and still the
+	// whole RESERVATION, so where the NEXT region starts cannot move: the split is
 	// strictly internal to this span.
 	//
+	// A single colour is the whole point of the block-character scheme: two
+	// shades of the same hue read as two separate bars, and an operator cannot
+	// tell one job's dark half from the next job's bright half. One colour +
+	// solid/shaded glyphs keeps each job unmistakably one span.
+	//
 	// UsedKnown is the honesty bit. RSSBytes is a nil-able live cgroup reading,
-	// and a region whose usage was never established is drawn as ONE undivided
-	// shade rather than as a fabricated 0%-used split. UsedBytes is meaningless
-	// unless UsedKnown.
+	// and a region whose usage was never established draws NEITHER a solid nor a
+	// shaded fill — both now carry a definite meaning (used, idle) that would be a
+	// fabricated 0%- or 100%-used claim — but a distinct "usage unevaluated" glyph
+	// instead. Used is meaningless unless UsedKnown.
 	//
 	// Used is already CLAMPED to Size at construction. memory.current can
 	// transiently exceed memory.max (the monitoring-lag overshoot just before an
-	// OOM fires), and an unclamped used span would bleed its bright shade into the
-	// neighbouring slot's region and mis-attribute it.
+	// OOM fires), and an unclamped used span would bleed its solid fill into the
+	// neighbouring slot's region and mis-attribute it. Clamped over-use therefore
+	// draws the whole span solid — an honest "using at least its whole charge".
 	//
 	// The CPU bar draws no split at all: a CPU rate has no "reserved but idle"
-	// remainder to darken, because there is no per-job CPU reservation to be idle
-	// against. Its regions leave UsedKnown false and are painted undivided, which
-	// is the SAME path a RAM region with an unestablished usage already takes.
-	Used        int64
-	UsedKnown   bool
-	ShadeColour string
+	// remainder, because there is no per-job CPU reservation to be idle against.
+	// Its scope regions leave UsedKnown false, and topBarCells only reads the
+	// used/idle/unknown split for a RAM bar, so every CPU span is painted solid.
+	Used      int64
+	UsedKnown bool
 }
 
 // topBarMarker is a limit tick drawn over the bar, positioned at At in the bar's
@@ -508,7 +516,7 @@ func topCPUCell(microCores int64, known bool) string {
 }
 
 // topRAMCell renders a job's live memory.current for the table. AIRA-135 moved
-// this reading into the bar's bright/dark split and dropped the column; AIRA-137
+// this reading into the bar's used/idle split and dropped the column; AIRA-137
 // puts the column back beside RESERVATION, because the split answers "what
 // fraction of its grant is it using" and the number answers "how much is that",
 // and an operator sizing a cap needs the second one too.
@@ -594,12 +602,11 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		if reserve.State == topReserveSet {
 			region := topBarRegion{
 				Kind: topRegionScope, Slot: slot, Label: record.Name, Colour: colour,
-				ShadeColour: topShadeColour(colour),
-				Start:       offset, Size: reserve.Bytes,
+				Start: offset, Size: reserve.Bytes,
 			}
-			// AIRA-192. Size is the ledger's real charge for this job, so the bright
-			// sub-span is "how much of its reservation it is using" — the owner's own
-			// statement of what this bar is for. topUsedWithin is unchanged: it
+			// AIRA-192. Size is the ledger's real charge for this job, so the solid
+			// used sub-span is "how much of its reservation it is using" — the owner's
+			// own statement of what this bar is for. topUsedWithin is unchanged: it
 			// divides whatever Size it is handed, and only the source of Size moved.
 			region.Used, region.UsedKnown = topUsedWithin(record.RSSBytes, reserve.Bytes)
 			drawn = append(drawn, region)
@@ -721,13 +728,14 @@ func topCPUBarFor(reserve *runner.ConfineSliceReserve, previous, current topCPUS
 // region's used sub-span, and is the ONE place the three edge cases live.
 //
 // A nil (or negative — a reading that cannot be a byte count) RSS is NOT usable:
-// it reports known=false, and the region is then drawn undivided. Zero is a
-// different thing entirely — an established "using nothing", drawn as a fully
-// darkened region — and the two must never collapse into each other.
+// it reports known=false, and the region is then drawn in the "usage
+// unevaluated" glyph rather than split. Zero is a different thing entirely — an
+// established "using nothing", drawn as a wholly shaded-idle region — and the two
+// must never collapse into each other.
 //
 // A usage larger than the reservation is CLAMPED to it. memory.current really can
 // exceed memory.max for a moment before the kernel reclaims or OOM-kills, and the
-// alternative to clamping is a bright span that runs past this region's right
+// alternative to clamping is a solid used span that runs past this region's right
 // edge into the next slot's colour.
 func topUsedWithin(rss *int64, reserved int64) (int64, bool) {
 	if rss == nil || *rss < 0 || reserved < 0 {
@@ -878,24 +886,50 @@ func topMarkersFor(reserve *runner.ConfineSliceReserve) []topBarMarker {
 	return markers
 }
 
+// topBarFill is how a bar column is painted WITHIN its colour: which block
+// character stands in for the column. The colour is the job identity and never
+// varies within a region (AIRA-135's single-colour rule); the fill is the
+// used/idle/unknown distinction, drawn by glyph.
+//
+// The zero value is topFillSolid on purpose, so every column that is not part of
+// a RAM scope's used/idle split — a used column, the scope-less aggregate, the
+// right-anchored grey, and every CPU column — is a solid full block with no
+// special-casing.
+type topBarFill uint8
+
+const (
+	// topFillSolid is the full block █: memory a reservation is using right now,
+	// and every non-split region (scope-less, out-of-slice, and all CPU spans).
+	topFillSolid topBarFill = iota
+	// topFillIdle is the shaded block: memory a reservation holds but is NOT using,
+	// drawn in the SAME colour as the used part so the whole span reads as one job.
+	topFillIdle
+	// topFillUnknown is the "usage unevaluated" glyph: a RAM scope whose live usage
+	// could not be read. It is neither solid (which would claim 100% used) nor
+	// shaded (which would claim 0% used) — an unreadable usage is not evidence of
+	// either, so it gets a mark of its own off the used/idle axis.
+	topFillUnknown
+)
+
 // topBarCell is one rendered column of the bar.
 type topBarCell struct {
 	Colour string
 	Marker string
 	Slot   int
 	Kind   topBarRegionKind
-	// Shaded marks a column in the DARKENED part of a scope's region: memory this
-	// reservation holds but is not using right now (AIRA-135). It is carried
-	// explicitly rather than left to be inferred from Colour, because a region
-	// whose usage was never established is painted entirely in the bright colour
-	// and must not be readable as "100% used".
-	Shaded bool
+	// Fill is which block character this column is drawn with — solid (used),
+	// shaded (reserved and idle), or the unevaluated mark — always in Colour.
+	// Carried explicitly rather than inferred from Colour because the whole point
+	// of the block-character scheme is that one colour serves all three (AIRA-135).
+	Fill topBarFill
 }
 
-// topBarCells maps the quantity model onto `width` terminal columns. It is
-// unit-blind: RAM and CPU go through this same function, because the geometry
+// topBarCells maps the quantity model onto `width` terminal columns. Its
+// GEOMETRY is unit-blind: RAM and CPU go through this same function, because the
 // question — where does each span start and stop on a bar of this many columns —
-// has nothing to do with what the quantity measures (AIRA-137).
+// has nothing to do with what the quantity measures (AIRA-137). The one part
+// that is NOT unit-blind is the per-column fill: only a RAM scope region carries
+// a used/idle/unknown split, so the fill decision below gates on bar.Kind.
 //
 // Offsets are computed from the ABSOLUTE offset of each region boundary, so the
 // columns of adjacent regions abut exactly and rounding can never make the stack
@@ -921,19 +955,34 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 			}
 			start := topBarColumn(region.Start, bar.Total, width)
 			end := topBarColumn(region.Start+region.Size, bar.Total, width)
-			// AIRA-135. Where the bright used span stops and the darkened idle span
+			// AIRA-135. The used/idle/unknown split is a RAM-scope concern only: a
+			// CPU rate has no reserved-but-idle remainder, and no non-scope region
+			// carries a per-job usage reading. Everything else is left solid, which
+			// is what the topFillSolid zero value already gives every cell below.
+			//
+			// idleFrom is where the solid used span stops and the shaded idle span
 			// begins, derived from the SAME absolute-offset mapping as the region's
-			// own edges, so the boundary can never round outside them. Defaulting it
-			// to `end` is what makes an unestablished usage — and a colour with no
-			// darkened variant — paint the region in one undivided shade.
-			shadedFrom := end
-			if region.UsedKnown && region.ShadeColour != "" {
-				shadedFrom = topBarColumn(region.Start+region.Used, bar.Total, width)
+			// own edges so the boundary can never round outside them. A scope whose
+			// usage was never established has no split at all — it is drawn in the
+			// "unevaluated" glyph across its whole width rather than as a fabricated
+			// full-or-empty split.
+			split := bar.Kind == topBarRAM && region.Kind == topRegionScope
+			idleFrom := end
+			unknown := false
+			if split {
+				if region.UsedKnown {
+					idleFrom = topBarColumn(region.Start+region.Used, bar.Total, width)
+				} else {
+					unknown = true
+				}
 			}
 			for column := start; column < end && column < width; column++ {
 				cell := topBarCell{Colour: region.Colour, Slot: region.Slot, Kind: region.Kind}
-				if column >= shadedFrom {
-					cell.Colour, cell.Shaded = region.ShadeColour, true
+				switch {
+				case unknown:
+					cell.Fill = topFillUnknown
+				case column >= idleFrom:
+					cell.Fill = topFillIdle
 				}
 				cells[column] = cell
 			}
