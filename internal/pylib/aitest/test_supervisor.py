@@ -3879,7 +3879,11 @@ def test_pool_subject_key_leads_with_the_rootdir_and_is_argv_safe():
 
 def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, monkeypatch):
     """One relay invocation per RUN, carrying every established term and no
-    fabricated one; and every failure of that relay is silent."""
+    fabricated one; and every failure of that relay is silent.
+
+    S17: the relay verb is `confine-report` (formerly a separately-named
+    `worker-peak` CLI verb) -- same wire frame, same daemon handler
+    (internal/daemon/confine_report.go), unchanged."""
     class Invocation:
         args = ("tests",)
 
@@ -3907,7 +3911,7 @@ def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, mon
 
     assert len(recorded) == 1, "one relay invocation per run, not per worker"
     argv = recorded[0]
-    assert argv[:2] == ["/usr/bin/aira", "worker-peak"]
+    assert argv[:2] == ["/usr/bin/aira", "confine-report"]
     assert "--peak-rss" in argv and str(700 * 1024 * 1024) in argv
     assert "--budget" in argv and "104857600" in argv
     assert "cap:aitest:env:set" in argv
