@@ -213,8 +213,16 @@ func TestAdmitLedgerReleasesWhenAClientDiesWithoutClosingCleanly(t *testing.T) {
 
 	serverConn.kill()
 	e2eWaitLedger(t, server, 1, pinReserve)
-	if final := server.admitSliceSnapshot("/slice"); final.reservationJobs != 0 || final.reservationBytes != 0 {
+	final := server.admitSliceSnapshot("/slice")
+	if final.reservationJobs != 0 || final.reservationBytes != 0 {
 		t.Fatalf("the killed client's scope-less reservation was not discharged: %+v", final)
+	}
+	// The re-derived cache and the independent waiter walk agree at zero after
+	// real grant->kill traffic: a release that dropped the waiter but skipped the
+	// re-derive would leave a non-zero residual here even though the split above
+	// (also a walk) still read clean.
+	if final.residualJobs() != 0 || final.residualBytes() != 0 {
+		t.Fatalf("residual after abrupt release: jobs=%d bytes=%d", final.residualJobs(), final.residualBytes())
 	}
 	defer clientConn.Close()
 }

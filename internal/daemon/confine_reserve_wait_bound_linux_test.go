@@ -446,13 +446,14 @@ func TestConfineReserveGrantOutlivesTheDeclaredBound(t *testing.T) {
 	// still pass a helper that closed its lease and only then blocked, or a
 	// daemon that kept the charge after the peer vanished.
 	//
-	// The INCREMENTAL counters are asserted alongside the derived walk, and that
+	// The re-derived ledger cache is asserted alongside the derived walk, and that
 	// pairing is the point (found by Sol build-review): reservationJobs and
 	// reservations are BOTH derived by walking queue.waiters, so a release that
 	// dropped the waiter while leaving `outstanding`/`outstandingJobs` charged
-	// would satisfy them both and leak ledger capacity silently. residual* is the
-	// cross-check for exactly that. With the anchor holding the queue open, the
-	// expected values are the anchor's alone — an EXACT figure, not a zero.
+	// (removing it from the slice but skipping the re-derive) would satisfy them
+	// both and leak ledger capacity silently. residual* is the cross-check for
+	// exactly that. With the anchor holding the queue open, the expected values
+	// are the anchor's alone — an EXACT figure, not a zero.
 	deadline := time.Now().Add(30 * time.Second)
 	var snapshot admitSnapshot
 	for {

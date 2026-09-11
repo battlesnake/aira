@@ -56,6 +56,27 @@ func enqueueExclusiveTest(t *testing.T, server *Server, reserve int64, request a
 	return queue, waiter
 }
 
+// seedRunningLease adds one REAL granted && accounted lease to the queue and
+// re-derives the ledger, so a drain fixture's "a running job keeps the slice
+// non-empty" precondition is driven by an actual lease rather than a phantom
+// `outstandingJobs = 1` scalar. Returns the lease so the caller can release it
+// when the job "finishes".
+//
+// This is deliberately robust to later slices. Once S4/S14 re-derive on a
+// no-grant pass or read emptiness from Σleases directly, a phantom scalar would
+// be wiped and the drain would wrongly complete, false-reding these tests for a
+// reason unrelated to what they verify; a real lease keeps the slice non-empty
+// for the right reason under either model. Same shape heldLedgerWaiter gives the
+// saturated-diagnosis tests.
+func seedRunningLease(queue *sliceQueue, seq int64) *admitWaiter {
+	lease := heldLedgerWaiter(seq, 1<<20)
+	queue.mu.Lock()
+	queue.waiters = append(queue.waiters, lease)
+	queue.outstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+	queue.mu.Unlock()
+	return lease
+}
+
 // stopEvaluator retires the queue's own evaluator goroutine and WAITS for it to
 // be gone, making this test the single evaluator.
 //
@@ -486,9 +507,8 @@ func TestTheDrainAbortAnchorClearsOnASuccessfulScan(t *testing.T) {
 		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 118), name: "bench", owner: "mark",
 	})
 	// A running job, so the drain does not simply complete on the recovered pass.
-	queue.mu.Lock()
-	queue.outstandingJobs = 1
-	queue.mu.Unlock()
+	// A REAL lease, not a phantom outstandingJobs scalar (see seedRunningLease).
+	seedRunningLease(queue, 900)
 
 	evaluate(t, server, queue)
 	failing = false
@@ -587,14 +607,12 @@ func TestRepeatedExclusiveRequestAndAbandonNeverWedgesTheSlice(t *testing.T) {
 			queue, exclusive = enqueueExclusiveTest(t, server, 10, admitRequest{
 				exclusive: true, scopeID: exclusiveScopeID(t, "drain", 800+round), name: "drain", owner: "mark",
 			})
-			queue.mu.Lock()
-			queue.outstandingJobs = 1
-			queue.mu.Unlock()
+			// A REAL running lease blocks the drain, not a phantom scalar.
+			job := seedRunningLease(queue, 900+int64(round))
 			evaluate(t, server, queue)
 			requireStillQueued(t, queue, exclusive, "a drain held up by a running job")
-			queue.mu.Lock()
-			queue.outstandingJobs = 0
-			queue.mu.Unlock()
+			// The running job finishes: drop its real lease, then abandon the drain.
+			server.releaseAdmitWaiter(queue, job)
 			server.releaseAdmitWaiter(queue, exclusive)
 		case 2:
 			// A DRAIN that expired on its own max_wait.

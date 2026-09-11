@@ -714,9 +714,14 @@ func (g exclusiveGate) blocks(queue *sliceQueue, waiter *admitWaiter) bool {
 }
 
 type sliceQueue struct {
-	mu              sync.Mutex
-	path            string
-	waiters         []*admitWaiter
+	mu      sync.Mutex
+	path    string
+	waiters []*admitWaiter
+	// outstanding / outstandingJobs are a DERIVED CACHE of the ledger, not a
+	// running total: their only writer is rederiveLedgerLocked, called after
+	// every grant and release to re-sum ledgerCharge() over the granted &&
+	// accounted waiters (design §2, `available = ceiling - Σleases`). Never
+	// mutate them directly; change the waiter set and re-derive.
 	outstanding     int64
 	outstandingJobs int
 	adopted         int64
@@ -2003,6 +2008,14 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 // duplicate; S8 wires the live re-anchoring SET onto this same lookup. An empty
 // scopeID keys nothing (scope-less `confine-reserve` waiters) and matches no
 // lease.
+//
+// S8 CAUTION: the re-anchoring SET must gate on state == admitGranted, NOT the
+// `!= admitReleased` this refusal-lookup uses. A waiter that has been REJECTED
+// (timed out, or aborted by the unestablished-emptiness rule) but whose deferred
+// release has not yet run is still `!= admitReleased`; re-anchoring onto it would
+// SET a dead lease that is about to be discharged. The broad predicate is
+// correct HERE (any live-or-dying waiter is a duplicate to refuse) and wrong
+// there.
 func leaseByScopeIDLocked(queue *sliceQueue, scopeID string) *admitWaiter {
 	if scopeID == "" {
 		return nil

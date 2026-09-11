@@ -129,10 +129,9 @@ func TestWorkerAdmitIsAllowedDuringADrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue: code=%s err=%v", code, err)
 	}
-	// A running job keeps the slice non-empty, so this stays a DRAIN.
-	queue.mu.Lock()
-	queue.outstandingJobs = 1
-	queue.mu.Unlock()
+	// A running job keeps the slice non-empty, so this stays a DRAIN. A REAL
+	// lease, not a phantom outstandingJobs scalar (see seedRunningLease).
+	seedRunningLease(queue, 900)
 	evaluate(t, server, queue)
 
 	running := filepath.Join(slicePath, confineScopeDirName(exclusiveScopeID(t, "suite", 506)))

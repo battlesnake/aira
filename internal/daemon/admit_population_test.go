@@ -76,10 +76,11 @@ func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
 	}
 }
 
-// verifies: the derived split and the incremental counters are cross-checked,
-// and a JOB-count divergence is reported rather than hidden. Any divergence is a
-// real lost/double decrement: a waiter is `granted && accounted` if and only if
-// it was counted.
+// verifies: the re-derived ledger cache and an independent walk of the waiters
+// are cross-checked, and a JOB-count divergence is reported rather than hidden.
+// Any divergence is a real defect (a re-derive skipped, or a field set out of
+// step with the waiters): a waiter is `granted && accounted` if and only if it
+// was counted.
 func TestAdmitSnapshotReportsJobResidualWhenTheCounterDesynchronises(t *testing.T) {
 	server := NewServer(Paths{})
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
@@ -99,10 +100,11 @@ func TestAdmitSnapshotReportsJobResidualWhenTheCounterDesynchronises(t *testing.
 // verifies: the BYTE residual is reported independently of the job residual, and
 // a NEGATIVE residual survives as a signed value.
 //
-// This is not redundant with the job residual. The single most plausible
-// regression in releaseAdmitWaiter — dropping `outstanding -= waiter.reserve`
-// while keeping `outstandingJobs--` — is byte-only, and a job-only residual
-// would report a perfectly consistent ledger while the slice silently filled.
+// This is not redundant with the job residual. A byte-only divergence —
+// outstanding carrying bytes the waiter walk does not account for, while the job
+// count still matches — must be reported on its own rather than masked by a
+// matching job count; a job-only residual would report a perfectly consistent
+// ledger while the slice silently filled.
 func TestAdmitSnapshotReportsByteResidualIndependentlyOfJobs(t *testing.T) {
 	server := NewServer(Paths{})
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
