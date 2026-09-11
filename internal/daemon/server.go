@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -695,7 +696,38 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	// Rule (1) of the deadline convention (deadlines.go): this bounds the
 	// HANDSHAKE — reading and parsing the inbound frame — and nothing else.
 	_ = conn.SetDeadline(time.Now().Add(s.resolvedDeadlines().Connect))
-	request, storeOp, err := readInboundFrame(conn)
+	// S7 magic sniff. Read the first 4 bytes and, if they are the frozen ARDR
+	// re-declare magic, route to the re-declare path BEFORE the normal frame
+	// parse and BEFORE the protocol-version close below. That ordering is
+	// load-bearing (design §4, Invariant 8 / gate P1-5): a restart is usually an
+	// UPGRADE, so an OLD client re-declaring against this NEWER daemon must be
+	// parsed, never refused for version skew. The magic (~1.09 GB as a
+	// big-endian u32) is disjoint from every legal frame length (≤ MaxFrameBytes,
+	// 16 MB), so this sniff can never misread a normal frame's length header, and
+	// the normal parser can never misread the magic — see redeclare_frame.go.
+	//
+	// The 4 sniffed bytes are replayed into the normal reader for a non-magic
+	// connection, so readInboundFrame sees an unmodified stream. The sniff lives
+	// here rather than inside readInboundFrame because readInboundFrame cannot
+	// represent "this is a re-declare, not a request/store-op"; the ordering
+	// guarantee is identical.
+	var magic [4]byte
+	if _, err := io.ReadFull(conn, magic[:]); err != nil {
+		wrote = writeFrame(conn, errorFrame(CodeProtocol, fmt.Sprintf("%s: short inbound frame: %v", CodeProtocol, err))) == nil
+		return
+	}
+	inbound := io.Reader(io.MultiReader(bytes.NewReader(magic[:]), conn))
+	if magic == ardrMagic {
+		// S7 STUB: parse the frozen frame and write the 1-byte ack. It does NOT
+		// touch the ledger — S9 wires charge() into the SET+re-anchor, sets its
+		// own read deadline (the line-731 invariant), and HOLDS the connection
+		// (never closes a lease-bearing connection on error, Invariant 4). Here
+		// the connection is closed after the ack by the deferred conn.Close().
+		wrote = true
+		s.serveReDeclareStub(conn, inbound)
+		return
+	}
+	request, storeOp, err := readInboundFrame(inbound)
 	// The three rejections below are handshake failures, so they answer under
 	// the handshake deadline rather than through reply — see deadlines.go.
 	// Accepted consequence, unchanged from before this fix: a peer that spends
@@ -868,6 +900,42 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	// a big subject, a reconcile --rebuild) committed durably and then failed
 	// the response write, which the client can only report as OUTCOME_UNKNOWN.
 	wrote = s.reply(conn, responseFrame(response))
+}
+
+// serveReDeclareStub is the S7 landing point for a sniffed ARDR re-declare
+// frame: a TOTAL parse followed by the frozen 1-byte ack. It deliberately does
+// NOT charge the ledger — that is S9, which will replace this stub with the
+// SET+re-anchor handler, take its own read deadline (server.go's line-731
+// invariant), gate on SO_PEERCRED same-uid (S8's unixPeerCredential), and HOLD
+// the connection open instead of closing after the ack (Invariant 4 — the
+// daemon never closes a lease-bearing connection on error).
+//
+// Until then no client sends an ARDR frame (the client reconnect/re-declare is
+// S13/S16), so this path is exercised only by tests. It is loud about being a
+// stub so a stray ack cannot be mistaken for a real ledger SET.
+//
+// inbound already replays the 4 sniffed magic bytes, so decodeReDeclareFrame
+// re-reads and re-verifies the magic — symmetric with the encoder and with the
+// dump reader S10/S11 reuse.
+func (s *Server) serveReDeclareStub(conn net.Conn, inbound io.Reader) {
+	// The handshake connect deadline still covers this read; the re-declare frame
+	// is small and bounded (maxReDeclareFrameBytes). S9 owns the full read-deadline
+	// discipline once it holds the connection.
+	rec, err := decodeReDeclareFrame(inbound)
+	if err != nil {
+		// TOTAL parser: a malformed frame is a hard, LOGGED reject, never a silent
+		// or partial drop. No ack is written; the deferred conn.Close() ends the
+		// connection, which the peer reads as EOF.
+		log.Printf("aira daemon: S7 re-declare stub: rejecting malformed ARDR frame: %v", err)
+		return
+	}
+	charge := rec.charge()
+	log.Printf("aira daemon: S7 re-declare stub: parsed scope=%q ram=%d cpu=%d parent=%q -- NOT charged, S9 wires the ledger SET",
+		charge.ScopeID, charge.RAM, charge.CPU, charge.ParentScopeID)
+	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
+	if _, err := conn.Write([]byte{reDeclareAckByte}); err != nil {
+		log.Printf("aira daemon: S7 re-declare stub: ack write for scope=%q failed: %v", charge.ScopeID, err)
+	}
 }
 
 func readInboundFrame(r io.Reader) (*RequestFrame, *StoreOpFrame, error) {
