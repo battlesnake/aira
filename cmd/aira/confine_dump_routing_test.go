@@ -179,6 +179,34 @@ func TestConfineDumpJSONFlagIsHonouredOnSuccess(t *testing.T) {
 	}
 }
 
+// TestConfineDumpWriteFailureHonoursJSONFlag pins the same AIRA-82 discipline
+// as TestConfineDumpJSONFlagIsHonouredOnSuccess for the FAILURE path: the
+// atomic-write error must reach render() (JSON when --json is passed), not a
+// hand-rolled fmt.Fprintf that bypasses it.
+//
+// verifies: AIRA (admission-counter rebuild) S18
+func TestConfineDumpWriteFailureHonoursJSONFlag(t *testing.T) {
+	// A target inside a NON-EXISTENT directory: WriteConfineDumpJSONL's
+	// CreateTemp fails, exactly as internal/runner/confine_dump_test.go's
+	// own TestWriteConfineDumpJSONLFailsOnUnwritableDirectory pins.
+	dumpPath := filepath.Join(t.TempDir(), "does-not-exist", "dump.jsonl")
+	injected := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+		return core.Response{OK: true, Code: "OK", Data: runner.ConfineDumpResult{Verdict: "ok", Scope: "test-universe"}}
+	})
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher([]string{"confine", "--dump", dumpPath, "--json"}, &stdout, &stderr, injected)
+	if exit == 0 {
+		t.Fatalf("exit=0, want a write-failure refusal; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("--json write-failure must still be valid JSON on stdout: %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if envelope["code"] != "E_CONFINE_DUMP_WRITE" {
+		t.Fatalf("envelope=%+v, want code E_CONFINE_DUMP_WRITE", envelope)
+	}
+}
+
 // TestConfineDumpUnevaluatedDoesNotWriteAFile pins the honesty discipline at
 // the CLI boundary: when the daemon cannot be reached (or otherwise answers
 // unevaluated), no file is written at all -- a zero-byte or empty-JSONL dump

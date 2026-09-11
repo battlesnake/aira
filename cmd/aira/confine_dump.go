@@ -77,8 +77,7 @@ func runConfineDumpExchange(ctx context.Context, request core.Request, dumpPath 
 		return 3
 	}
 	if err := runner.WriteConfineDumpJSONL(dumpPath, result); err != nil {
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_DUMP_WRITE: %v\n", err)
-		return codes.ExitForCode("E_CONFINE_DUMP_WRITE")
+		return render(core.Response{Code: "E_CONFINE_DUMP_WRITE", Error: "E_CONFINE_DUMP_WRITE: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_DUMP_WRITE")}, jsonOutput, stdout, stderr)
 	}
 	// AIRA-82 discipline: --json is accepted for this verb (dispatchConfineManagementRequest's
 	// generic render() path would honour it for a failure above), so the SUCCESS

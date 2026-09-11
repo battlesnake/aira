@@ -47,6 +47,13 @@ import (
 // admitSliceSnapshotFor and confine_manage.go's own listing already read --
 // outstanding/cpuOutstanding/outstandingJobs, queue.waiters, the freeze
 // state, and the slice's live memory.max.
+//
+// `slice` in args is deliberately IGNORED, exactly like confineBudget above
+// it: Admissions is machine-wide, cross-slice history (the same
+// confine_peak_history table confine-budget reads), and Waiters/Queues
+// report EVERY slice this daemon holds a live queue for, not one selected
+// slice -- an archival dump's point is the whole picture, not a filtered
+// view. Only `owner` is validated.
 func (s *Server) confineDump(args map[string]any) core.Response {
 	callerOwner := stringArg(args, "owner")
 	if err := runner.ValidateConfineOwner(callerOwner); err != nil {
