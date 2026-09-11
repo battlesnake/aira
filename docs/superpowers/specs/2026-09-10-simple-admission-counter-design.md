@@ -233,6 +233,13 @@ per-resource code is the ceiling calc:
 - **CPU is admission-accounting only** — no `cpu.max`; sharing stays `cpu.weight`-based. 2×cores intentionally
   loosens `#49`'s `cpuCount − 1` desktop reserve (owner-decided); desktop protection = `aira.slice cpu.weight <
   desktop` (already in place), kernel handles the 1–2× zone.
+- **The physical/system-RAM gate is MODE-DEPENDENT (owner-decided 2026-09-11, D4).** The ledger check
+  (`Σreserve ≤ ceiling`) applies in both modes. **CI: ledger-only** — a dedicated container, nothing runs
+  outside the slice, so declared reserves + the container `memory.max` are the truth. **Dev: additionally gate
+  on actual SYSTEM-available RAM** — the desktop runs much outside `aira.slice`, so a new admission is refused
+  when the *system* is low even if the slice ledger shows room; the `checkedAvailable` physical gate + the
+  AIRA-103/106 pressure ceiling are KEPT for dev, reading system-available. The physical gate is a hard refusal;
+  the ledger may go signed-negative during the restart re-declare window independently.
 - Adding resource #3 later = one ceiling fn + one map entry. **Not built now:** any resource-type
   registry/plugin/config (over-build). The named-scalar map *is* the minimum.
 
