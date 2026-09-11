@@ -220,9 +220,51 @@ func (r *saturatedRun) reject() admitRejection {
 	return admitRejection{}
 }
 
+// S13: a blocking wait no longer self-expires, so a saturated REJECTION is only
+// produced by the NON-BLOCKING mode (max_wait_ms==0): the request does not wait, and
+// startSaturatedAdmit's admitAfter seam drives the zero deadline on demand via
+// run.reject(). run.pass() runs the evaluator first so the rejection still carries the
+// eval's contention/grantable diagnosis, unchanged.
 func saturatedArgs(reserve int64, signature string) map[string]any {
 	return map[string]any{
-		"slice": "slice", "reserve": reserve, "max_wait_ms": int64(30_000), "signature": signature,
+		"slice": "slice", "reserve": reserve, "max_wait_ms": int64(0), "signature": signature,
+	}
+}
+
+// verifies: S13 / design §4/§6 — a BLOCKING admit (no max_wait_ms on the wire) NEVER
+// self-expires. Only a grant, a daemon stop, or the client closing its connection
+// ends the wait; the daemon writes no timeout/saturated frame of its own accord.
+// MUTATION: reinstating a deadline arm for a blocking wait makes a saturated frame
+// arrive on its own → the "self-expired" branch reds.
+func TestBlockingAdmitNeverSelfExpires(t *testing.T) {
+	const maximum = int64(1) << 30
+	server := saturatedServer(t)
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		// Fully loaded: current == maximum, so the reserve cannot fit and the request
+		// blocks rather than being granted.
+		return maximum, maximum, 0, true, ""
+	}
+	// A BLOCKING request: max_wait_ms is ABSENT (the S13 client sends none).
+	args := map[string]any{"slice": "slice", "reserve": int64(512) << 20, "pinned": true}
+	run := startSaturatedAdmit(t, server, maximum, args)
+	run.pass() // one evaluator pass: the reserve does not fit, so nothing is granted
+
+	select {
+	case frame := <-run.frames:
+		t.Fatalf("a blocking admit self-expired: got frame %+v; a blocked wait ends only on grant/stop/peer-EOF", frame)
+	case err := <-run.errs:
+		t.Fatalf("unexpected read error while the wait should still be blocked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Still blocked, which is the required behaviour.
+	}
+
+	// The client closing its connection is the §6 cancel mechanism: the handler exits
+	// via peer-EOF, writing no frame.
+	_ = run.client.Close()
+	select {
+	case <-run.done:
+	case <-testdeadline.After(2 * time.Second):
+		t.Fatal("the blocked handler did not exit after the client closed its connection")
 	}
 }
 

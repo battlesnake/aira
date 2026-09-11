@@ -286,100 +286,6 @@ func TestAdmitBackfillGraceZeroAndDisabledAreStrictFIFO(t *testing.T) {
 	}
 }
 
-func TestAdmitBlockedHeadRejectsSaturatedAtWaitCap(t *testing.T) {
-	var maximum atomic.Int64
-	maximum.Store(100)
-	server := admitTestServer(&maximum)
-	now := time.Unix(4000, 0)
-	var nowMu sync.Mutex
-	advanceNow := func(wait time.Duration) time.Time {
-		nowMu.Lock()
-		defer nowMu.Unlock()
-		now = now.Add(wait)
-		return now
-	}
-	server.admitNow = func() time.Time {
-		nowMu.Lock()
-		defer nowMu.Unlock()
-		return now
-	}
-	server.admitBackfillGrace = 10 * time.Second
-	var evaluations atomic.Int64
-	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-		evaluations.Add(1)
-		return 50, 100, 0, true, ""
-	}
-	timerReady := make(chan struct{})
-	var deadline chan time.Time
-	var deadlineAt time.Time
-	server.admitAfter = func(wait time.Duration) <-chan time.Time {
-		if wait != time.Duration(admitWaitCeilingMs)*time.Millisecond {
-			t.Fatalf("deadline wait=%s, want cap", wait)
-		}
-		nowMu.Lock()
-		deadline = make(chan time.Time, 1)
-		deadlineAt = now.Add(wait)
-		nowMu.Unlock()
-		close(timerReady)
-		return deadline
-	}
-	serverConn, clientConn := net.Pipe()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer serverConn.Close()
-		server.admitConnection(serverConn, validAdmitArgs(60, admitWaitCeilingMs))
-	}()
-	select {
-	case <-timerReady:
-	case <-testdeadline.After(time.Second):
-		t.Fatal("blocked head did not install its deadline")
-	}
-
-	// At nine seconds the blocked head is still within its backfill grace, so
-	// this first fitting waiter must be admitted past it.
-	advanceNow(9 * time.Second)
-	queue, preFreeze := enqueueAdmitTest(t, server, 30)
-	waitAdmitGrant(t, preFreeze)
-
-	// Once the head reaches its grace age, later fitting waiters must remain
-	// queued on this and subsequent evaluator passes.
-	advanceNow(time.Second)
-	_, laterA := enqueueAdmitTest(t, server, 10)
-	_, laterB := enqueueAdmitTest(t, server, 10)
-	requireAdmitQueued(t, laterA)
-	requireAdmitQueued(t, laterB)
-	previousEvaluations := evaluations.Load()
-	queue.signal()
-	deadlineForPass := time.Now().Add(testdeadline.Wait(time.Second))
-	for evaluations.Load() == previousEvaluations && time.Now().Before(deadlineForPass) {
-		time.Sleep(time.Millisecond)
-	}
-	if evaluations.Load() == previousEvaluations {
-		t.Fatal("frozen queue did not run a subsequent evaluator pass")
-	}
-	requireAdmitQueued(t, laterA)
-	requireAdmitQueued(t, laterB)
-
-	nowMu.Lock()
-	now = deadlineAt
-	expiredAt := now
-	nowMu.Unlock()
-	deadline <- expiredAt
-	var frame ResponseFrame
-	if err := readFrame(clientConn, &frame); err != nil {
-		t.Fatal(err)
-	}
-	if frame.Code != CodeAdmitSaturated {
-		t.Fatalf("blocked head frame=%+v, want saturated", frame)
-	}
-	_ = clientConn.Close()
-	<-done
-	server.releaseAdmitWaiter(queue, preFreeze)
-	server.releaseAdmitWaiter(queue, laterA)
-	server.releaseAdmitWaiter(queue, laterB)
-}
-
 func TestAdmitWeightedReservationsBoundConcurrentSumAcrossSuites(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
@@ -528,52 +434,12 @@ func TestAdmitFailedWriteAndCloseBetweenCommitAndWriteReleaseOnce(t *testing.T) 
 	}
 }
 
-func TestAdmitSaturationRejectUsesUnequalDeadlines(t *testing.T) {
-	var maximum atomic.Int64
-	maximum.Store(10)
-	server := admitTestServer(&maximum)
-	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 10, 10, 0, true, "" }
-	aServer, aClient := net.Pipe()
-	bServer, bClient := net.Pipe()
-	defer aClient.Close()
-	defer bClient.Close()
-	aDone, bDone := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(aDone)
-		defer aServer.Close()
-		server.admitConnection(aServer, validAdmitArgs(10, 200))
-	}()
-	time.Sleep(time.Millisecond)
-	go func() {
-		defer close(bDone)
-		defer bServer.Close()
-		server.admitConnection(bServer, validAdmitArgs(10, 10))
-	}()
-	var bFrame ResponseFrame
-	if err := readFrame(bClient, &bFrame); err != nil {
-		t.Fatal(err)
-	}
-	if bFrame.Code != CodeAdmitSaturated {
-		t.Fatalf("short waiter frame=%+v", bFrame)
-	}
-	_ = bClient.Close()
-	_ = aClient.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-	var early ResponseFrame
-	if err := readFrame(aClient, &early); err == nil {
-		t.Fatal("long waiter received a frame before its own deadline")
-	}
-	_ = aClient.SetReadDeadline(time.Time{})
-	var aFrame ResponseFrame
-	if err := readFrame(aClient, &aFrame); err != nil {
-		t.Fatal(err)
-	}
-	if aFrame.Code != CodeAdmitSaturated {
-		t.Fatalf("long waiter frame=%+v", aFrame)
-	}
-	_ = aClient.Close()
-	<-aDone
-	<-bDone
-}
+// TestAdmitSaturationRejectUsesUnequalDeadlines was removed in S13. It pinned the
+// PER-WAITER blocking deadline (two waiters timing out at their own max_wait), which
+// this slice deletes: a blocking wait no longer self-expires (design §4/§6). The
+// remaining saturated REJECTION path is the non-blocking mode (max_wait_ms==0), driven
+// through the admitAfter seam by the startSaturatedAdmit harness; a blocking wait's
+// no-self-expiry is pinned by TestBlockingAdmitNeverSelfExpires.
 
 func TestAdmitOneShotGrantHandoffCannotDrop(t *testing.T) {
 	var maximum atomic.Int64

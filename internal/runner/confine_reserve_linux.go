@@ -116,6 +116,15 @@ func confineReserveWithRunner(ctx context.Context, request ConfineReserveRequest
 			// which is why this is an explicit marker rather than an inference.
 			ParentScopeID: InheritedConfineScopeID(),
 		}, reserve)
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			// S13: the reservation's bounded wait (its MaxWait, applied as a ctx deadline
+			// above) elapsed, or the caller cancelled, before the daemon granted. The
+			// daemon no longer times out or diagnoses a contended wait (design §6: no
+			// timeout — the client bounds it), so a confine-reserve can only report that
+			// its own bound elapsed with the daemon-unavailable code; it can no longer
+			// surface a daemon-side E_ADMIT_SATURATED. The pytest plugin fails open on it.
+			return nil, fmt.Errorf("E_CONFINE_UNAVAILABLE: no daemon admission within the %s reservation wait", r.admissionMaxWait)
+		}
 		if !answered {
 			if err != nil {
 				return nil, err

@@ -1205,7 +1205,14 @@ func TestConfineRejectedAdmissionCreatesNoScopeAndStartsNoChild(t *testing.T) {
 	}
 }
 
-func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
+// TestConfineDaemonAdmissionSendsNoMaxWait pins the S13 wire change: the confine
+// client sends NO max_wait_ms. The admission wait no longer self-expires (design
+// §4/§6) — the client blocks until granted, reconnects across a daemon restart, and
+// bounds the wait by ctx cancellation, never by a daemon-side timeout. The former
+// TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait (which asserted the
+// requested/default wait was propagated to the wire, AIRA-58) is superseded. A
+// well-formed saturated rejection is still handled terminally.
+func TestConfineDaemonAdmissionSendsNoMaxWait(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		wait time.Duration
@@ -1213,12 +1220,7 @@ func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
 	}{
 		{name: "positive", wait: 25 * time.Millisecond, want: 25 * time.Millisecond},
 		{name: "default", want: 30 * time.Minute},
-		// AIRA-58: a wait above the old private runnerAdmitWaitCap must reach the
-		// daemon INTACT. The runner used to clamp it to 30m before sending, so
-		// `--admit-timeout 2h` silently became 30m on the wire while every
-		// daemon-side test still passed. This table previously had no over-clamp
-		// case at all, which is why the bug survived.
-		{name: "above the old 30m runner clamp", wait: 2 * time.Hour, want: 2 * time.Hour},
+		{name: "large", wait: 2 * time.Hour, want: 2 * time.Hour},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			socket := filepath.Join(t.TempDir(), "admit.sock")
@@ -1257,9 +1259,8 @@ func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
 			}
 			select {
 			case frame := <-frames:
-				got, ok := frame.Request.Args["max_wait_ms"].(float64)
-				if !ok || int64(got) != test.want.Milliseconds() {
-					t.Fatalf("max_wait_ms=%v want=%d", frame.Request.Args["max_wait_ms"], test.want.Milliseconds())
+				if raw, present := frame.Request.Args["max_wait_ms"]; present {
+					t.Fatalf("client sent max_wait_ms=%v; S13 sends none — the client blocks/reconnects and bounds the wait by ctx, not a daemon timeout", raw)
 				}
 			case <-testdeadline.After(time.Second):
 				t.Fatal("daemon did not receive admission request")

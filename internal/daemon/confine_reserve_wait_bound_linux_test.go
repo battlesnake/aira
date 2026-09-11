@@ -225,8 +225,14 @@ func TestConfineReserveWaitEndsAtTheDeclaredBound(t *testing.T) {
 	if !errors.Is(first.err, io.EOF) {
 		t.Fatalf("stdout ended with %v, want a clean EOF and nothing written", first.err)
 	}
-	if diagnostic := waiter.stderr.String(); !strings.Contains(diagnostic, "E_ADMIT_SATURATED") {
-		t.Fatalf("stderr=%q, want the saturation diagnosis named", diagnostic)
+	// S13: the daemon no longer times out or diagnoses a blocking wait (design §6:
+	// no timeout — the client bounds it). A contended confine-reserve therefore ends
+	// at its OWN declared bound with the daemon-unavailable code, not a daemon-side
+	// E_ADMIT_SATURATED (which is only produced by the non-blocking mode, which
+	// confine-reserve does not use). The bound enforcement itself is unchanged and
+	// asserted above (waited >= bound, non-zero exit, no stdout).
+	if diagnostic := waiter.stderr.String(); !strings.Contains(diagnostic, "E_CONFINE_UNAVAILABLE") {
+		t.Fatalf("stderr=%q, want the daemon-unavailable code (S13: no daemon-side saturation diagnosis on a blocking wait)", diagnostic)
 	}
 }
 

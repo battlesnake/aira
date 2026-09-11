@@ -900,8 +900,16 @@ type admitRequest struct {
 	// none — the confine client sends DefaultConfineCPUCores). A value that exceeds
 	// 2×NumCPU is impossible on this box and is refused fail-fast in admitConnection
 	// before any enqueue (design §7 "RequestInvalid").
-	cpu         int64
-	maxWait     int64
+	cpu     int64
+	maxWait int64
+	// nonBlocking is set when max_wait_ms is present on the wire AND equals 0 (design
+	// §6 non-blocking mode): the request does not wait — a zero deadline returns the
+	// current snapshot at once. max_wait_ms ABSENT (the S13 client sends none) means an
+	// ordinary BLOCKING wait with NO timeout: only a grant, daemon stop, or the client
+	// closing its connection ends it (§4/§6). A positive max_wait_ms is accepted but no
+	// longer imposes a timeout (the request blocks); the wait ceilings still validate
+	// it (a §6 collision flagged for the owner — the ceilings are now vestigial).
+	nonBlocking bool
 	signature   string
 	pinned      bool
 	scopeID     string
@@ -1964,17 +1972,21 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	defer release()
 
 	if !alreadyGranted {
-		remaining := time.Duration(request.maxWait)*time.Millisecond - s.admitNowTime().Sub(waiter.enqueued)
-		if remaining < 0 {
-			remaining = 0
-		}
+		// S13: a BLOCKING wait has NO deadline (design §4/§6: no timeout — a wait ends
+		// only on a grant, daemon stop, or the client closing its connection). A nil
+		// deadline channel never fires, so a blocked request never self-expires. Only a
+		// NON-BLOCKING request (max_wait_ms==0) installs a ZERO deadline, returning the
+		// current snapshot at once via timeoutAdmitWaiter. The per-waiter admitAfter
+		// seam is retained so the non-blocking return stays test-drivable.
 		var timer *time.Timer
 		var deadline <-chan time.Time
-		if s.admitAfter != nil {
-			deadline = s.admitAfter(remaining)
-		} else {
-			timer = time.NewTimer(remaining)
-			deadline = timer.C
+		if request.nonBlocking {
+			if s.admitAfter != nil {
+				deadline = s.admitAfter(0)
+			} else {
+				timer = time.NewTimer(0)
+				deadline = timer.C
+			}
 		}
 		defer stopTimer(timer)
 		select {
@@ -3270,7 +3282,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// changed meaning, and (bar cpu, the second ledger resource) no admission, gate
 	// or emptiness decision reads the new ones.
 	if len(args) < 3 || len(args) > 14 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional cpu/signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
 		if name != "slice" && name != "reserve" && name != "cpu" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
@@ -3298,12 +3310,22 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 			return admitRequest{}, fmt.Errorf("%s: admit cpu must be a non-negative integer", CodeProtocol)
 		}
 	}
-	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
-	if !ok {
-		return admitRequest{}, fmt.Errorf("%s: admit max_wait_ms must be an integer", CodeProtocol)
-	}
-	if maxWait < 0 {
-		maxWait = 0
+	// S13: max_wait_ms is OPTIONAL. The confine client no longer sends it (a launch
+	// blocks until granted or reconnects on a daemon restart, never self-expiring —
+	// design §4/§6). Present-and-zero selects NON-BLOCKING mode. Absent → a blocking
+	// wait with no timeout.
+	maxWait := int64(0)
+	nonBlocking := false
+	if raw, exists := args["max_wait_ms"]; exists {
+		parsed, ok := exactAdmitInt64(raw)
+		if !ok {
+			return admitRequest{}, fmt.Errorf("%s: admit max_wait_ms must be an integer", CodeProtocol)
+		}
+		if parsed < 0 {
+			parsed = 0
+		}
+		nonBlocking = parsed == 0
+		maxWait = parsed
 	}
 	// AIRA-58: REFUSE, never silently substitute. The old behaviour clamped to a
 	// hardcoded 30 minutes with no error, no warning, and no field in
@@ -3492,7 +3514,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3505,7 +3527,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// exclusive requires the tuple refused just above), and it is transcribed
 	// anyway so that relaxing either rule later cannot silently drop the field
 	// instead of failing a test.
-	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

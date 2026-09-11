@@ -415,7 +415,6 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 // admit_exclusive_unwedge stays green).
 func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveReserve int64, dial func(context.Context, string) (net.Conn, error)) (admissionResult, bool, error) {
 	admissionStarted := time.Now()
-	maxWait := r.admissionMaxWait
 	// Dial with a bounded 500 ms timeout (design §4). There is NO transport deadline
 	// on the exchange itself: §4/§6 specify no client deadline, so a long legitimate
 	// wait must not tear its own connection down — that would drop the request and
@@ -522,13 +521,16 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	if req.DelegateRAM {
 		cpuCores = 0
 	}
+	// S13: NO max_wait_ms. The admission wait no longer self-expires (design §4/§6):
+	// the client blocks until granted and reconnects across a daemon restart, bounding
+	// the wait by ctx cancellation, never by a daemon-side timeout. An absent
+	// max_wait_ms is a blocking request to the daemon.
 	frame.Request.Args = map[string]any{
-		"slice":       r.memorySlice,
-		"reserve":     effectiveReserve,
-		"cpu":         cpuCores,
-		"max_wait_ms": maxWait.Milliseconds(),
-		"signature":   req.ResourceSignature,
-		"pinned":      !req.DaemonEstimateMemory || req.MemoryReservePinned,
+		"slice":     r.memorySlice,
+		"reserve":   effectiveReserve,
+		"cpu":       cpuCores,
+		"signature": req.ResourceSignature,
+		"pinned":    !req.DaemonEstimateMemory || req.MemoryReservePinned,
 	}
 	if req.DelegateRAM {
 		frame.Request.Args["delegate_ram"] = true
