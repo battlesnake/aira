@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// verifies: S11 restart freeze (design §4). During the ~2s window a NEW admission
-// WAITS (never grants, never fail-opens), while a re-declare of a seeded UNANCHORED
-// lease is accepted IMMEDIATELY and re-anchors it — re-declares never route through the
-// frozen evaluator grant pass. After the freeze ends the new admission is granted.
+// verifies: S13 restart freeze (design §4). During the ~2s window a NEW admission
+// WAITS (never grants, never fail-opens), while a re-declare of an already-established
+// (anchored, granted) lease is accepted IMMEDIATELY and re-anchors it to the reconnecting
+// connection — re-declares never route through the frozen evaluator grant pass. After the
+// freeze ends the new admission is granted.
 func TestRestartFreezeBlocksNewAdmissionWhileReDeclareAnchors(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100 << 30)
@@ -17,14 +18,17 @@ func TestRestartFreezeBlocksNewAdmissionWhileReDeclareAnchors(t *testing.T) {
 	server := admitTestServer(&maximum)
 	server.admitNow = func() time.Time { return now }
 
-	// A seeded UNANCHORED lease (as the reload leaves it) + a fresh NEW admission queued,
-	// in a queue the test drives directly (no evaluator goroutine).
+	// An already-established granted lease (a survivor whose keeper re-declared just after
+	// restart, anchored to its first reconnect) + a fresh NEW admission queued, in a queue
+	// the test drives directly (no evaluator goroutine).
+	connSeed := testAnchorConn()
+	defer connSeed.Close()
 	connA := testAnchorConn()
 	defer connA.Close()
 	seeded := &admitWaiter{
 		seq: 1, reserve: 2 * gib, cpu: 0, state: admitGranted, accounted: true,
-		grantedCh: closedCh(), scopeID: "CONFINE-s@x", basis: "reload",
-		anchor: nil, unanchored: true,
+		grantedCh: closedCh(), scopeID: "CONFINE-s@x", basis: "redeclare",
+		anchor: connSeed,
 	}
 	newAdmit := queuedWaiter(2, 1*gib, now)
 	queue := &sliceQueue{
@@ -36,11 +40,11 @@ func TestRestartFreezeBlocksNewAdmissionWhileReDeclareAnchors(t *testing.T) {
 
 	server.armRestartFreeze(now) // freeze-end = now + restartFreeze (2s)
 
-	// Frozen: the new admission stays queued, the seeded lease stays granted+unanchored.
+	// Frozen: the new admission stays queued, the established lease stays granted.
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, newAdmit)
-	if seeded.state != admitGranted || !seeded.unanchored {
-		t.Fatalf("seeded lease state=%d unanchored=%v, want granted+unanchored during the freeze", seeded.state, seeded.unanchored)
+	if seeded.state != admitGranted {
+		t.Fatalf("seeded lease state=%d, want granted during the freeze", seeded.state)
 	}
 	// The restart freeze and the AIRA-59 fairness freeze are DISTINCT mechanisms: a frozen
 	// restart pass must NOT arm the fairness anchor (or it would perturb the duty-cycle).
@@ -48,17 +52,18 @@ func TestRestartFreezeBlocksNewAdmissionWhileReDeclareAnchors(t *testing.T) {
 		t.Fatalf("the restart freeze must not arm the AIRA-59 fairness anchor, freezeArmedAt=%v", queue.freezeArmedAt)
 	}
 
-	// A re-declare of the seeded scope is accepted IMMEDIATELY during the freeze and
-	// re-anchors it in place (unanchored cleared), proving re-declares are never frozen.
+	// A re-declare of the established scope (a second reconnect) is accepted IMMEDIATELY
+	// during the freeze and re-anchors it in place to connA, proving re-declares are never
+	// frozen.
 	_, got, code, err := server.enqueueReDeclare("/slice", 2*gib, "redeclare", admitRequest{
 		scopeID: "CONFINE-s@x", peerSameUID: true, conn: connA, clientPID: 4321, processStartTick: 99,
 	})
 	if err != nil || code != "" {
 		t.Fatalf("re-declare during freeze refused: code=%q err=%v", code, err)
 	}
-	if got != seeded || seeded.unanchored || seeded.anchor != connA {
-		t.Fatalf("re-declare must re-anchor the seeded lease in place: got==seeded=%v unanchored=%v anchor==connA=%v",
-			got == seeded, seeded.unanchored, seeded.anchor == connA)
+	if got != seeded || seeded.anchor != connA {
+		t.Fatalf("re-declare must re-anchor the established lease in place: got==seeded=%v anchor==connA=%v",
+			got == seeded, seeded.anchor == connA)
 	}
 	requireAdmitQueued(t, newAdmit) // still frozen — the re-declare did not unfreeze
 

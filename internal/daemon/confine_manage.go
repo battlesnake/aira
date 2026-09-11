@@ -209,15 +209,14 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// population split below are then fabricated zeros and must be
 				// reported unevaluated, not as a confident empty slice.
 				//
-				// S11 (design §4). ALSO unevaluated while the restart new-admission
-				// freeze is active OR any reloaded lease is still unanchored: the granted
-				// total is not yet trustworthy (survivors may still re-declare, and
-				// unanchored leases may be dropped at end-of-freeze+grace), so reporting a
-				// confident figure would be the same fabrication AIRA-220 forbids. DERIVED
-				// from the freeze + unanchored count (NOT hardcoded true): S12 deleted the
-				// cgroup-scan adoption, and the bit stays correct because snapshot.present
-				// ("a queue exists") survived that deletion.
-				GrantedEstablished: snapshot.present && !snapshot.restartFrozen && snapshot.unanchoredLeases == 0,
+				// S13 (design §4). ALSO unevaluated while the restart new-admission freeze
+				// is active: the granted total is not yet trustworthy (survivors may still
+				// re-declare to re-anchor their leases), so reporting a confident figure
+				// would be the same fabrication AIRA-220 forbids. DERIVED from the freeze
+				// (NOT hardcoded true): S12 deleted the cgroup-scan adoption and S13 the
+				// dump/unanchored layer, and the bit stays correct because snapshot.present
+				// ("a queue exists") survived both.
+				GrantedEstablished: snapshot.present && !snapshot.restartFrozen,
 				// Ceiling is what one MORE job would face; scale headroom by the
 				// admitted job count so it stays consistent with the Jobs shown.
 				CeilingBytes: subtractFloor(ceilingMaximum, s.admitSliceHeadroom(addJobCountClamp(snapshot.outstandingJobs, 1))),

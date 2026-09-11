@@ -80,18 +80,13 @@ type Server struct {
 	workerAdmitPollInterval time.Duration
 	admitBackfillGrace      time.Duration
 	admitFreezeMaxHold      time.Duration
-	// S11 restart recovery (design §4). restartFreeze is how long NEW admissions are
+	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
 	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
-	// space by a new admission); unanchoredGrace is the extra time after the freeze
-	// before a lease STILL unanchored is dropped (the real safety — kill -0 at reload
-	// only early-drops). Both injectable (defaults 2s / 10s) so tests drive timing via
-	// the fake clock + restartAfter seam, never a real sleep. restartFreezeUntilNanos
-	// is the freeze-end wall-clock UnixNano armed at listen-ready (0 = unarmed); it is
-	// atomic because the reload seeds leases — and so spawns their runEvaluator
-	// goroutines — BEFORE the freeze is armed, so an evaluator pass may read it
-	// concurrently with the arming write.
+	// space by a new admission); injectable (default 2s) so tests drive timing via the
+	// fake clock + restartAfter seam, never a real sleep. restartFreezeUntilNanos is the
+	// freeze-end wall-clock UnixNano armed at listen-ready (0 = unarmed); it is atomic
+	// because a concurrent evaluator pass may read it while listen-ready arms it.
 	restartFreeze                time.Duration
-	unanchoredGrace              time.Duration
 	restartFreezeUntilNanos      atomic.Int64
 	admitRegistryMu              sync.Mutex
 	admitQueues                  map[string]*sliceQueue
@@ -173,14 +168,10 @@ type Server struct {
 	workerScopeScanInterval time.Duration
 	admitNow                func() time.Time
 	admitAfter              func(time.Duration) <-chan time.Time
-	// S11 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
-	// runRestartFreeze waits the freeze then the grace via this, and sharing admitAfter
-	// would cross-talk with a live admitConnection in a Serve-driven test. Nil →
-	// time.After. killForProbe is the reload kill-probe's syscall seam (nil →
-	// unix.Kill(pid, 0)) so the ESRCH/EPERM decision table is unit-testable without a
-	// really-dead pid.
+	// S13 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
+	// runRestartFreeze waits the freeze via this, and sharing admitAfter would cross-talk
+	// with a live admitConnection in a Serve-driven test. Nil → time.After.
 	restartAfter         func(time.Duration) <-chan time.Time
-	killForProbe         func(pid int) error
 	admitWriteFrame      func(net.Conn, any) error
 	admitBeforeWrite     func(*admitWaiter)
 	admitPeakHistory     func(context.Context, string) (runner.PeakRSSStats, error)
@@ -208,7 +199,6 @@ func NewServer(paths Paths) *Server {
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
 		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
 		restartFreeze:                defaultRestartFreeze,
-		unanchoredGrace:              defaultUnanchoredGrace,
 		admitQueues:                  map[string]*sliceQueue{},
 		admitConfineScanInterval:     admitConfineScanIntervalDefault,
 		workerScopeScanInterval:      workerScopeScanIntervalDefault,
@@ -381,13 +371,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			returnErr = err
 		}
 	}()
-	// S11 restart recovery (design §4). Reload the previous daemon's graceful lease
-	// dump and seed the survivors UNANCHORED here — after DB-open, BEFORE net.Listen —
-	// so the ledger is pre-seeded before any connection is accepted. Consume-once
-	// (unlink on read) and best-effort: a missing/stale/partial dump just falls back to
-	// the re-declare path. The restart freeze and the unanchored-drop timer are armed
-	// at listen-ready below.
-	s.reloadLeaseDump()
+	// S13 restart recovery (design §4). The fresh daemon opens an EMPTY ledger; there is
+	// no dump to reload. Survivors' keepers reconnect within the freeze armed at
+	// listen-ready below and re-declare their leases (establish-granted, S9), re-anchoring
+	// their RAM/CPU. The freeze bounds the physical over-admit window until they do.
 	listener, err := net.Listen("unix", s.Paths.SocketPath)
 	if err != nil {
 		return err
@@ -402,14 +389,12 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			_ = os.Remove(s.Paths.SocketPath)
 		}
 	}()
-	// S11 restart freeze (design §4): armed at listen-ready, BEFORE s.Ready fires (so a
+	// S13 restart freeze (design §4): armed at listen-ready, BEFORE s.Ready fires (so a
 	// harness that waits on Ready observes it armed) and before the accept loop. It
 	// freezes NEW admissions for restartFreeze so a survivor's re-declare is not beaten
-	// to its space by a new admission; the drop timer (runRestartFreeze, spawned in the
-	// goroutine region below) then collects any lease still unanchored after the grace.
-	// Armed unconditionally: a crash-restart reloaded nothing but its survivors still
-	// re-declare within the window. restartFreezeUntilNanos is atomic — the reload above
-	// already spawned the seeded queues' evaluator goroutines, which read it.
+	// to its space by a new admission; runRestartFreeze (spawned in the goroutine region
+	// below) wakes the queues at freeze-end. restartFreezeUntilNanos is atomic — a
+	// concurrent evaluator pass may read it while this arms it.
 	s.armRestartFreeze(s.admitNowTime())
 	reaperCtx, cancelReaper := context.WithCancel(ctx)
 	reaperDone := make(chan struct{})
@@ -499,12 +484,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(steerDone)
 		s.runOOMSteer(steerCtx, steerMode, steerInterval, steerRuntimeDeps)
 	}()
-	// S11 restart-recovery timer (design §4 gate P1-A). At freeze-end it wakes every
-	// queue so a waiter blocked PURELY by the restart freeze re-evaluates at once; at
-	// freeze-end + unanchoredGrace it drops every lease STILL unanchored — the REAL
-	// safety, because the dump records the supervisor pid, which outlives its workers,
-	// so kill -0 alone would leak a retired worker's lease. It no-ops if no freeze was
-	// armed (a reboot/stale dump reloaded nothing). Cancelled on shutdown.
+	// S13 restart-recovery timer (design §4 gate P1-A). At freeze-end it wakes every
+	// queue so a waiter blocked PURELY by the restart freeze re-evaluates at once rather
+	// than at the next poll tick. Cancelled on shutdown. (S13 removed the second phase —
+	// the unanchored-drop — with the dump layer.)
 	restartFreezeCtx, cancelRestartFreeze := context.WithCancel(ctx)
 	restartFreezeDone := make(chan struct{})
 	go func() {
@@ -540,15 +523,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			s.serveConnection(context.Background(), conn)
 		}()
 	}
-	// S10 best-effort restart lease dump. Written BEFORE close(stopping): the
-	// leases are still held here, and close(stopping) is precisely what releases
-	// them and closes their connections (admit.go's granted-lease select returns),
-	// so the dump is written before any lease connection closes (§14 P3 / §15
-	// P2-A). It is deliberately NOT after the drain below — the ErrDrainTimeout
-	// early return would skip it, and the leases would already be gone. Fail-open:
-	// a write error is logged and swallowed (dump.go); S9's absent-lease re-declare
-	// recovers a missing or partial dump.
-	s.dumpLeasesForRestart()
+	// S13 removed the graceful lease dump: the fresh daemon starts empty and survivors'
+	// keepers re-declare (establish-granted, S9) to re-anchor their leases within the
+	// restart freeze. close(stopping) releases every held (anchored) lease via its
+	// connection handler — there are no unanchored leases to collect anymore.
 	close(stopping)
 	cancelReaper()
 	cancelFlusher()
@@ -558,14 +536,6 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelSliceCeiling()
 	cancelOOMSteer()
 	cancelRestartFreeze()
-	// cancelRestartFreeze() just killed the timer that would eventually drop a reloaded
-	// lease no client re-declared. Drop those unanchored leases NOW: they are the only
-	// waiter class with no connection handler (close(stopping) released every ANCHORED
-	// lease via its handler), so without this their queues stay non-empty, pruneAdmitRegistry
-	// never closes queue.stop, and their evaluator goroutines outlive Serve. The dump above
-	// already skips unanchored leases, so nothing is lost; a live holder re-declares and
-	// re-establishes (S9). Idempotent with the timer's own drop.
-	s.dropUnanchoredLeases()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
