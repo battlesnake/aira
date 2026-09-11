@@ -1304,78 +1304,17 @@ func TestDaemonAdmitStatesAreByteIdenticalOnRunRecord(t *testing.T) {
 	}
 }
 
-func TestDaemonAdmitWedgedDaemonDeadlineFallsToFlock(t *testing.T) {
-	// A wedged daemon (dial succeeds, no response) trips the client-side transport
-	// deadline (Sol build r1 #1/#4). The client closes the socket, then routes to the
-	// SINGLE flock fallback (§2.1, Sol build r2 #2): the plan-approved advisory
-	// degradation — the flock serialises fallback clients (bounded), never an ungated
-	// unevaluated stampede. The bounded deadline ensures the client is never stranded.
-	path := currentSliceForTest(t)
-	runner := &Runner{
-		memorySlice: path, memoryReserve: 40, admissionMaxWait: 5 * time.Millisecond,
-		pollInterval: time.Millisecond, clock: systemClock{},
-		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
-	}
-	client, server := net.Pipe()
-	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
-	go func() {
-		defer server.Close()
-		var request runnerAdmitRequestFrame
-		if readRunnerAdmitFrame(server, &request) != nil {
-			return
-		}
-		var one [1]byte
-		_, _ = server.Read(one[:]) // wedged: never reply until the client closes
-	}()
-	var attempts atomic.Int64
-	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
-	started := time.Now()
-	result, err := runner.admit(context.Background(), Request{})
-	if err != nil || result.lock == nil || attempts.Load() != 1 {
-		t.Fatalf("result=%+v attempts=%d err=%v (want flock fallback)", result, attempts.Load(), err)
-	}
-	if elapsed := time.Since(started); elapsed < admitTransportGrace || testdeadline.Exceeded(elapsed, 2*time.Second) {
-		t.Fatalf("wedged-daemon deadline elapsed=%v", elapsed)
-	}
-	result.releaseAdmission()
-}
+// S13 replaced the daemon-failure→flock fallback with reconnect (transport
+// failure) or a terminal refuse (well-formed refusal). The former
+// TestDaemonAdmitWedgedDaemonDeadlineFallsToFlock and
+// TestDaemonAdmitPartialFrameFallsToFlock pinned the removed behavior (a wedged
+// daemon tripping a transport deadline into flock; a partial frame into flock).
+// The new behavior — block/reconnect on transport failure, never fall open — is
+// pinned by TestAdmitTransportFailureReconnectsAndNeverFlocks,
+// TestAdmitWellFormedRefusalIsTerminalNeverFlocks, and
+// TestAdmitWedgedDaemonBlocksUntilContextCancel below.
 
-func TestDaemonAdmitPartialFrameFallsToFlock(t *testing.T) {
-	// A partial frame is a post-dial failure (a committed-but-unaccepted grant, §2.1):
-	// the client closes the socket, then routes to the SINGLE flock fallback (Sol build
-	// r2 #2). The truncated frame produces an immediate io.ErrUnexpectedEOF once the
-	// server closes, so no deadline wait is needed here.
-	path := currentSliceForTest(t)
-	runner := &Runner{
-		memorySlice: path, memoryReserve: 40, admissionMaxWait: 50 * time.Millisecond,
-		pollInterval: time.Millisecond, clock: newInstantClock(),
-		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
-	}
-	client, server := net.Pipe()
-	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
-	go func() {
-		var request runnerAdmitRequestFrame
-		if readRunnerAdmitFrame(server, &request) != nil {
-			_ = server.Close()
-			return
-		}
-		var complete bytes.Buffer
-		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: 40, Basis: "pinned:client"})
-		_ = writeRunnerAdmitFrame(&complete, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
-		partial := complete.Bytes()[:len(complete.Bytes())-1]
-		_, _ = server.Write(partial)
-		_ = server.Close() // truncated frame -> client read errors immediately
-	}()
-	var attempts atomic.Int64
-	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
-	result, err := runner.admit(context.Background(), Request{})
-	if err != nil || result.lock == nil || attempts.Load() != 1 {
-		t.Fatalf("result=%+v attempts=%d err=%v (want flock fallback)", result, attempts.Load(), err)
-	}
-	result.releaseAdmission()
-}
-
-func TestDaemonAdmitFullFrameAtDeadlineWinsWithoutFlock(t *testing.T) {
+func TestDaemonAdmitFullFrameWinsWithoutFlock(t *testing.T) {
 	data, err := json.Marshal(runnerAdmitGrant{State: "waited", WaitedMS: 9, Reserve: 40, Basis: "pinned:client"})
 	if err != nil {
 		t.Fatal(err)
@@ -1410,64 +1349,119 @@ func TestDaemonAdmitFullFrameAtDeadlineWinsWithoutFlock(t *testing.T) {
 	}
 }
 
-func TestDaemonAdmitDialFailureAndBusyFallToFlock(t *testing.T) {
-	// §2.1 (Sol build r2 #2): EVERY daemon non-grant routes to the SINGLE flock
-	// fallback — an unreachable daemon (dial failure -> no live reservations) AND a
-	// live daemon that declines at a cap (E_DAEMON_BUSY). Labelling a busy decline as
-	// "unevaluated" would launch un-gated and could stampede; the documented advisory
-	// degradation is the flock, which serialises fallback clients (bounded).
-	for _, test := range []struct {
-		name string
-		dial func(context.Context, string) (net.Conn, error)
-	}{
-		{name: "dial failure",
-			dial: func(context.Context, string) (net.Conn, error) { return nil, os.ErrNotExist }},
-		{name: "busy",
-			dial: func(context.Context, string) (net.Conn, error) {
-				client, server := net.Pipe()
-				go func() {
-					defer server.Close()
-					var request runnerAdmitRequestFrame
-					_ = readRunnerAdmitFrame(server, &request)
-					_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_BUSY", Error: "busy"})
-					var one [1]byte
-					_, _ = server.Read(one[:])
-				}()
-				return client, nil
-			}},
-		{name: "old daemon protocol",
-			dial: func(context.Context, string) (net.Conn, error) {
-				client, server := net.Pipe()
-				go func() {
-					defer server.Close()
-					var request runnerAdmitRequestFrame
-					_ = readRunnerAdmitFrame(server, &request)
-					if _, ok := request.Request.Args["signature"]; !ok {
-						t.Error("new client did not send signature to old daemon")
-					}
-					if _, ok := request.Request.Args["pinned"]; !ok {
-						t.Error("new client did not send pinned marker to old daemon")
-					}
-					_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_PROTOCOL", Error: "unexpected admit field"})
-				}()
-				return client, nil
-			}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
+func TestAdmitTransportFailureReconnectsAndNeverFlocks(t *testing.T) {
+	// S13: a TRANSPORT failure (dial refused/ENOENT, or the daemon EOF'd mid-exchange)
+	// RECONNECTS at 2/sec until the daemon answers — it NEVER falls open to the flock
+	// fallback (the AIRA-222 class this slice closes). Here two dials fail (the daemon is
+	// restarting) and the third is answered with a grant.
+	path := currentSliceForTest(t)
+	var dials atomic.Int64
+	dial := func(context.Context, string) (net.Conn, error) {
+		if dials.Add(1) <= 2 {
+			return nil, os.ErrNotExist
+		}
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			var request runnerAdmitRequestFrame
+			if readRunnerAdmitFrame(server, &request) != nil {
+				return
+			}
+			data, _ := json.Marshal(runnerAdmitGrant{State: "waited", WaitedMS: 3, Reserve: 40, Basis: "pinned:client"})
+			_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+			var one [1]byte
+			_, _ = server.Read(one[:]) // hold the lease until the client closes
+		}()
+		return client, nil
+	}
+	runner := &Runner{
+		memorySlice: path, memoryReserve: 40, admissionMaxWait: time.Second,
+		pollInterval: time.Millisecond, clock: newInstantClock(), admitDialFn: dial,
+		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+	}
+	var attempts atomic.Int64
+	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
+	result, err := runner.admit(context.Background(), Request{})
+	if err != nil || result.state != "waited" {
+		t.Fatalf("result=%+v err=%v (want a reconnect grant)", result, err)
+	}
+	if attempts.Load() != 0 {
+		t.Fatalf("flock fallback was entered (%d attempts); the client must reconnect, never fall open", attempts.Load())
+	}
+	if dials.Load() != 3 {
+		t.Fatalf("dials=%d, want 3 (two transport failures, then a grant)", dials.Load())
+	}
+	result.releaseAdmission()
+}
+
+func TestAdmitWellFormedRefusalIsTerminalNeverFlocks(t *testing.T) {
+	// S13: a WELL-FORMED refusal frame — a fail-closed E_DAEMON_UNAVAILABLE, a
+	// transiently-overloaded E_DAEMON_BUSY, or a version-skew E_DAEMON_PROTOCOL — is a
+	// genuine daemon "no", not a transport failure. The client refuses to launch
+	// (terminal error) rather than reconnecting on it or falling open to the flock
+	// fallback. This is exactly the ungoverned-launch class the removed fallback caused.
+	for _, code := range []string{"E_DAEMON_BUSY", "E_DAEMON_PROTOCOL", "E_DAEMON_UNAVAILABLE"} {
+		t.Run(code, func(t *testing.T) {
 			path := currentSliceForTest(t)
+			dial := func(context.Context, string) (net.Conn, error) {
+				client, server := net.Pipe()
+				go func() {
+					defer server.Close()
+					var request runnerAdmitRequestFrame
+					_ = readRunnerAdmitFrame(server, &request)
+					_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: code, Error: "refused"})
+				}()
+				return client, nil
+			}
 			runner := &Runner{
 				memorySlice: path, memoryReserve: 40, admissionMaxWait: time.Second,
-				pollInterval: time.Millisecond, clock: newInstantClock(), admitDialFn: test.dial,
+				pollInterval: time.Millisecond, clock: newInstantClock(), admitDialFn: dial,
 				sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
 			}
 			var attempts atomic.Int64
 			runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 			result, err := runner.admit(context.Background(), Request{})
-			if err != nil || result.lock == nil || attempts.Load() != 1 || result.basis != "fallback:daemon-unavailable" {
-				t.Fatalf("%s result=%+v attempts=%d err=%v (want flock fallback)", test.name, result, attempts.Load(), err)
+			if err == nil {
+				t.Fatalf("result=%+v err=nil; a well-formed %s refusal must be a terminal error, never a launch", result, code)
 			}
-			result.releaseAdmission()
+			if attempts.Load() != 0 {
+				t.Fatalf("%s: flock fallback was entered (%d attempts); a refusal must never fall open", code, attempts.Load())
+			}
 		})
+	}
+}
+
+func TestAdmitWedgedDaemonBlocksUntilContextCancel(t *testing.T) {
+	// S13: a wedged daemon (dial succeeds, no reply) has NO client transport deadline —
+	// the client blocks until the caller cancels (design §6: close the connection to
+	// cancel). It never self-times-out into the flock fallback.
+	path := currentSliceForTest(t)
+	dial := func(context.Context, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		go func() {
+			var request runnerAdmitRequestFrame
+			_ = readRunnerAdmitFrame(server, &request) // read the request, then never reply
+			var one [1]byte
+			_, _ = server.Read(one[:])
+		}()
+		return client, nil
+	}
+	runner := &Runner{
+		memorySlice: path, memoryReserve: 40, admissionMaxWait: time.Second,
+		pollInterval: time.Millisecond, clock: systemClock{}, admitDialFn: dial,
+		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+	}
+	var attempts atomic.Int64
+	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	_, err := runner.admit(ctx, Request{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context.Canceled (the client blocks on a wedged daemon until cancelled)", err)
+	}
+	if attempts.Load() != 0 {
+		t.Fatalf("flock fallback was entered (%d attempts); a wedged daemon must not fall open", attempts.Load())
 	}
 }
 

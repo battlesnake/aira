@@ -2586,61 +2586,14 @@ func TestConfineRealHandshakeFailureIsUnverified(t *testing.T) {
 	}
 }
 
-func TestConfineRealAdmissionWaitsThenProceedsDaemonDown(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		cgrouptest.SkipOrFailRealCgroup(t, "python3 is unavailable: %v", err)
-	}
-	const reserve = int64(64 << 20)
-	parent := confineMemoryParent(t, "134217728")
-	filler, err := New(Config{CommonDir: t.TempDir(), CgroupParent: parent, Grace: time.Second, TermGrace: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := filler.Probe(context.Background()); err != nil {
-		cgrouptest.SkipOrFailRealCgroup(t, "filler scope unavailable: %v", err)
-	}
-	fillerDone := make(chan error, 1)
-	go func() {
-		_, launchErr := filler.Launch(context.Background(), Request{Argv: []string{"python3", "-c", "import time; x=bytearray(80*1024*1024); x[-1]=1; time.sleep(0.5)"}})
-		fillerDone <- launchErr
-	}()
-	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
-	for {
-		current, maximum, ok, reason := readSliceMemory(parent)
-		if !ok {
-			t.Fatalf("slice memory: %s", reason)
-		}
-		if maximum-current < reserve {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("filler did not create admission pressure")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	result, err := Confine(context.Background(), ConfineRequest{
-		Slice: parent, MemoryReserve: reserve, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond,
-		AdmitSocketPath: filepath.Join(t.TempDir(), "daemon-down.sock"),
-		Argv:            []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Exit != 0 || result.Status.AdmissionState != "waited" || result.Status.AdmissionWaitedMS <= 0 {
-		t.Fatalf("admission result=%+v", result)
-	}
-	if fillerErr := <-fillerDone; fillerErr != nil {
-		t.Fatalf("filler: %v", fillerErr)
-	}
-	immediate, err := Confine(context.Background(), ConfineRequest{
-		Slice: parent, MemoryReserve: reserve, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond,
-		AdmitSocketPath: filepath.Join(t.TempDir(), "daemon-still-down.sock"),
-		Argv:            []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-	})
-	if err != nil || immediate.Exit != 0 || immediate.Status.AdmissionState != "immediate" {
-		t.Fatalf("free-slice admission result=%+v err=%v", immediate, err)
-	}
-}
+// TestConfineRealAdmissionWaitsThenProceedsDaemonDown was removed in S13. It pinned
+// the flock fallback's end-to-end behavior — a confine launch with a down daemon
+// WAITING on raw slice memory and then PROCEEDING (AdmissionState "waited"/"immediate")
+// without any daemon. S13 deletes the flock fallback: a configured-but-unreachable
+// daemon now makes the client RECONNECT indefinitely (fail closed by waiting), never
+// proceed ungoverned (design §4/§6). The new reconnect/terminal/block behavior is
+// pinned by the admission_linux_test.go S13 tests; the real restart-under-load merge
+// gate (S13 exit) covers the live reconnect + re-declare.
 
 func TestConfineRealMissingSubtreeDelegationIsRepairedBeforeLaunch(t *testing.T) {
 	parent := cgrouptest.IsolatedScopeParent(t)

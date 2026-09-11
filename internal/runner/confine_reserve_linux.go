@@ -84,6 +84,18 @@ func confineReserveWithRunner(ctx context.Context, request ConfineReserveRequest
 	if err := validateConfineReserveRequest(request); err != nil {
 		return nil, err
 	}
+	// S13. admitThroughDaemon no longer carries a transport deadline and now
+	// RECONNECTS indefinitely on a down daemon (design §4/§6). A confine-reserve
+	// caller's bounded wait — its MaxWait, 300s by default — therefore has to be
+	// applied here as a ctx deadline (§6: a client wanting a bounded wait cancels its
+	// connection). On deadline the reservation errors and the pytest plugin fails
+	// open, exactly as when the old transport deadline expired; it never falls open to
+	// the (deleted) flock.
+	if wait := r.admissionMaxWait; wait > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, wait)
+		defer cancel()
+	}
 	reserve := request.Bytes
 	clampedFrom := int64(0)
 	for attempt := 0; attempt < 2; attempt++ {

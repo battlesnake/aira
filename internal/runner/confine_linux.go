@@ -12,7 +12,6 @@ import (
 	"io/fs"
 	"math"
 	"math/bits"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -701,17 +700,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, err
 	}
 	var releaseAdmissionOnce sync.Once
-	// AIRA-101. teardownStarted gates the exclusivity watcher below. It MUST be
-	// set before the lease is closed on the ordinary exit path, or the watcher's
-	// read fails with "use of closed network connection" on every CLEAN run and
-	// the facet reports `exclusive=lost` every single time — inverting an honesty
-	// signal into a permanent false alarm.
-	var teardownStarted atomic.Bool
+	// releaseAdmission closes the lease keeper (admission.release). The keeper's Close
+	// sets its stopped flag BEFORE closing the connection, and the exclusivity watcher
+	// (keeper.watchExclusive) treats a close-under-stopped as a clean teardown, not a
+	// loss — the S13 generalisation of the old teardownStarted guard that stopped the
+	// watcher reporting `exclusive=lost` on every clean run.
 	releaseAdmission := func() {
-		releaseAdmissionOnce.Do(func() {
-			teardownStarted.Store(true)
-			admission.releaseAdmission()
-		})
+		releaseAdmissionOnce.Do(admission.releaseAdmission)
 	}
 	defer releaseAdmission()
 	switch admission.state {
@@ -734,7 +729,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// which this records exclusivity that was not actually obtained. The facet is
 	// finalised on the completion path beside TerminatedBy, where a mid-run loss
 	// can still downgrade it.
-	var exclusiveLost atomic.Bool
+	var exclusiveKeeper *leaseKeeper
 	if request.Exclusive {
 		result.Status.Exclusive = ConfineExclusiveGranted
 		result.Status.ExclusiveDrainedMS = admission.waitedMS
@@ -770,34 +765,28 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	//     guard below and reported as a clean run. The window is the teardown
 	//     itself, and erring that way keeps a clean run from being libelled.
 	//
-	// The teardownStarted guard is load-bearing: releaseAdmission closes the lease
-	// on the ordinary exit path, so without it this read would fail with "use of
-	// closed network connection" on EVERY clean run and report exclusive=lost
-	// every time, inverting the honesty signal into a permanent false alarm.
+	// The keeper's stopped flag is the S13 generalisation of the old teardownStarted
+	// guard: releaseAdmission closes the keeper on the ordinary exit path (setting
+	// stopped before closing the conn), so the watcher's read returning under stopped
+	// is a clean teardown, not a loss — without it every clean run would report
+	// exclusive=lost.
 	if request.Exclusive {
-		lease, watchable := admission.release.(net.Conn)
+		keeper, watchable := admission.release.(*leaseKeeper)
 		if !watchable {
 			// The grant is real (admit refuses anything else), but without a lease
-			// connection to watch, a mid-run loss could not be detected — so the run's
+			// keeper to watch, a mid-run loss could not be detected — so the run's
 			// outcome is UNEVALUATED rather than granted. Claiming `granted` here
 			// would assert something this process cannot observe, which is the exact
 			// fabrication the facet exists to prevent, and it is also what made
 			// `unevaluated` unreachable in an earlier revision: a value nothing can
 			// emit is a reader trap (found by build review).
 			result.Status.Exclusive = ConfineExclusiveUnevaluated
-		}
-		if watchable {
-			go func() {
-				var one [1]byte
-				_, readErr := lease.Read(one[:])
-				if readErr == nil || teardownStarted.Load() {
-					return
-				}
-				exclusiveLost.Store(true)
-				// AIRA-206: leading \n -- this is a mid-run warning to the shared
-				// locked writer and would otherwise glue onto the child's partial line.
-				fmt.Fprint(diagnostics, "\naira: warning: exclusivity lost (admission lease closed) — this run was no longer scheduled alone; treat any measurement from it as contended\n")
-			}()
+		} else {
+			// An exclusive lease CANNOT be re-established across a daemon restart
+			// (§15 P2-D), so the keeper's exclusive branch watches for the lease
+			// closing and reports exclusive=lost — it never reconnects.
+			exclusiveKeeper = keeper
+			keeper.watchExclusive(diagnostics)
 		}
 	}
 
@@ -1460,7 +1449,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// AIRA-101, finalised beside its sibling facet and on the same completion
 	// path. A lease that closed mid-run downgrades granted -> lost, so a
 	// measurement taken while the hold was gone is never reported as clean.
-	if request.Exclusive && exclusiveLost.Load() {
+	if request.Exclusive && exclusiveKeeper != nil && exclusiveKeeper.exclusiveWasLost() {
 		result.Status.Exclusive = ConfineExclusiveLost
 	}
 	// AIRA-206: prepend \n so the trailer ALWAYS begins its own line. The child's

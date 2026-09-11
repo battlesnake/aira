@@ -274,9 +274,13 @@ func TestAGrantedLeaseCarriesNoTransportDeadline(t *testing.T) {
 		t.Fatalf("admit: %v", err)
 	}
 	defer result.releaseAdmission()
-	lease, ok := result.release.(net.Conn)
+	keeper, ok := result.release.(*leaseKeeper)
 	if !ok {
-		t.Fatalf("expected the lease to be the connection, got %T", result.release)
+		t.Fatalf("expected the lease to be a *leaseKeeper, got %T", result.release)
+	}
+	lease := keeper.currentConn()
+	if lease == nil {
+		t.Fatal("the lease keeper holds no connection")
 	}
 	// Read on the lease well past when the transport deadline (maxWait + ~1s
 	// grace) would have expired. A healthy, still-held lease must simply block.

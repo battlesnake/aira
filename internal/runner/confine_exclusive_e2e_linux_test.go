@@ -28,14 +28,17 @@ import (
 // contended, when nothing had happened. Unit tests of the renderer and the gate
 // both passed throughout.
 
-// exclusiveLeasePair returns a connected pair standing in for the admission
-// lease. The daemon end is retained by the test so the lease stays open exactly
-// as a live daemon holds it.
-func exclusiveLeasePair(t *testing.T) (client, daemon net.Conn) {
+// exclusiveLeaseKeeper returns a lease KEEPER (S13's admissionResult.release) whose
+// held connection is one end of a pipe, plus the daemon end. Closing the daemon end
+// makes the keeper's exclusive watcher see the lease close, exactly as a live daemon
+// restart does. The keeper is built bare (no reconnect goroutine — an exclusive lease
+// never reconnects, §15 P2-D), matching what newLeaseKeeper produces for an exclusive
+// grant.
+func exclusiveLeaseKeeper(t *testing.T) (*leaseKeeper, net.Conn) {
 	t.Helper()
-	client, daemon = net.Pipe()
+	client, daemon := net.Pipe()
 	t.Cleanup(func() { _ = client.Close(); _ = daemon.Close() })
-	return client, daemon
+	return &leaseKeeper{conn: client, done: make(chan struct{})}, daemon
 }
 
 // A clean exclusive run reports granted, carries its drain wait, exports the
@@ -43,9 +46,9 @@ func exclusiveLeasePair(t *testing.T) (client, daemon net.Conn) {
 func TestExclusiveRunReportsGrantedAndExportsTheToken(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
-	lease, _ := exclusiveLeasePair(t)
+	keeper, _ := exclusiveLeaseKeeper(t)
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "waited", waitedMS: 4000, release: lease}, nil
+		return admissionResult{state: "waited", waitedMS: 4000, release: keeper}, nil
 	}
 	var stderr bytes.Buffer
 	result, err := confineWithDeps(context.Background(), ConfineRequest{
@@ -82,17 +85,14 @@ func TestExclusiveRunReportsGrantedAndExportsTheToken(t *testing.T) {
 func TestALongExclusiveRunIsNotReportedLostByAStaleTransportDeadline(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
-	lease, _ := exclusiveLeasePair(t)
-	// Exactly what admitThroughDaemon does to bound the EXCHANGE. If it survives
-	// onto the lease, the watcher trips as soon as it expires.
-	if err := lease.SetDeadline(time.Now().Add(80 * time.Millisecond)); err != nil {
-		t.Fatal(err)
-	}
+	keeper, _ := exclusiveLeaseKeeper(t)
+	// S13 removed the transport deadline entirely (there is no deadline to survive
+	// onto the lease anymore — see admitExchangeOnce). What this still pins is the
+	// CONSUMER half: given a healthy, never-closing lease, a long run reports granted
+	// and never warns. The regression test that a granted lease carries no deadline is
+	// TestAGrantedLeaseCarriesNoTransportDeadline, through the real admit path.
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		// The production fix: an admission grant clears the transport deadline
-		// before handing the connection back as the lease.
-		_ = lease.SetDeadline(time.Time{})
-		return admissionResult{state: "waited", waitedMS: 10, release: lease}, nil
+		return admissionResult{state: "waited", waitedMS: 10, release: keeper}, nil
 	}
 	var stderr bytes.Buffer
 	result, err := confineWithDeps(context.Background(), ConfineRequest{
@@ -116,9 +116,9 @@ func TestALongExclusiveRunIsNotReportedLostByAStaleTransportDeadline(t *testing.
 func TestAnExclusiveRunWhoseLeaseClosesMidRunIsReportedLost(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
-	lease, daemon := exclusiveLeasePair(t)
+	keeper, daemon := exclusiveLeaseKeeper(t)
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "immediate", release: lease}, nil
+		return admissionResult{state: "immediate", release: keeper}, nil
 	}
 	inner := deps.start
 	deps.start = func(command *confineCommand) error {
@@ -217,9 +217,9 @@ func TestAnExclusiveLaunchStampsItsOwnHolderToken(t *testing.T) {
 	t.Setenv(ExclusiveHolderEnv, "CONFINE-someone-else-1-1@other")
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
-	lease, _ := exclusiveLeasePair(t)
+	keeper, _ := exclusiveLeaseKeeper(t)
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "immediate", release: lease}, nil
+		return admissionResult{state: "immediate", release: keeper}, nil
 	}
 	var childEnv []string
 	inner := deps.start

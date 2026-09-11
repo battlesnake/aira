@@ -43,6 +43,14 @@ type admissionResult struct {
 
 var errDetachKillIntent = errors.New("detached run has a pending kill intent")
 
+// errAdmitReconnect is an INTERNAL sentinel: admitExchangeOnce returns it when the
+// admission exchange failed for a TRANSPORT reason (dial refused/ENOENT, or the
+// daemon EOF'd mid-exchange) on a NON-exclusive request. admitThroughDaemon catches
+// it and reconnects at 2/sec with no total deadline — the client fails CLOSED by
+// waiting, never falling open to an ungoverned launch (design §4/§6; the AIRA-222
+// class this slice closes). It never escapes admitThroughDaemon.
+var errAdmitReconnect = errors.New("aira: admission transport failed; reconnect")
+
 type admitLock struct {
 	mu   sync.Mutex
 	file *os.File
@@ -354,8 +362,14 @@ func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, s
 	}
 }
 
+// admitThroughDaemon runs the admission exchange and, on a TRANSPORT failure
+// (daemon down or restarting mid-exchange) for a non-exclusive request, RECONNECTS
+// at 2/sec with NO total deadline until the daemon answers or ctx is cancelled —
+// the client fails CLOSED by waiting, never falling open to an ungoverned launch
+// (design §4/§6; the AIRA-222 class this slice closes). A grant, a well-formed
+// refusal, an exclusive incompletion, or ctx cancellation is terminal. The flock
+// fallback is never entered from here.
 func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveReserve int64) (admissionResult, bool, error) {
-	admissionStarted := time.Now()
 	dial := r.admitDialFn
 	if dial == nil {
 		if strings.TrimSpace(r.admitSocketPath) == "" {
@@ -366,32 +380,58 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 			return dialer.DialContext(ctx, "unix", path)
 		}
 	}
-	// AIRA-58: the requested wait goes on the wire AS-IS. This used to be silently
-	// clamped to a private 30-minute runnerAdmitWaitCap right here, BEFORE the
-	// request ever reached the daemon, so `--admit-timeout 2h` became 30m on the
-	// wire and NO daemon-side test could observe it. The ceiling now lives in
-	// exactly one place (runner.AdmitWaitCeiling) and is enforced by REFUSAL at
-	// the edges (CLI parse time, and the daemon), never by silent substitution.
-	maxWait := r.admissionMaxWait
-	// The transport deadline follows the REQUESTED wait. Deriving it from a
-	// shorter clamped value tore the connection down while the daemon was still
-	// legitimately holding the request, and a torn connection routes into the
-	// flock fallback — an UNACCOUNTED launch — instead of an honest saturated
-	// rejection. A wedged daemon is still bounded, just at the caller's own
-	// declared budget rather than a hidden one.
-	deadlineWait := maxWait
-	if deadlineWait > time.Duration(mathMaxInt64)-admitTransportGrace {
-		deadlineWait = time.Duration(mathMaxInt64) - admitTransportGrace
-	}
-	transportDeadline := time.Now().Add(deadlineWait + admitTransportGrace)
-	transportCtx, cancelTransport := context.WithDeadline(ctx, transportDeadline)
-	defer cancelTransport()
-	conn, err := dial(transportCtx, r.admitSocketPath)
-	if err != nil {
+	reconnectStart := r.clock.Now()
+	lastNote := time.Time{}
+	for {
 		if err := ctx.Err(); err != nil {
 			return admissionResult{}, false, err
 		}
-		return admissionResult{}, false, nil
+		result, granted, err := r.admitExchangeOnce(ctx, req, effectiveReserve, dial)
+		if !errors.Is(err, errAdmitReconnect) {
+			return result, granted, err
+		}
+		// Transport failure on a non-exclusive request. Retry 2/sec, indefinitely;
+		// only ctx cancellation exits. A periodic "waiting for daemon" line (AIRA-71
+		// shape) tells the operator why the launch is blocked.
+		now := r.clock.Now()
+		if lastNote.IsZero() || now.Sub(lastNote) >= 30*time.Second {
+			r.warnDaemonWait(now.Sub(reconnectStart))
+			lastNote = now
+		}
+		select {
+		case <-ctx.Done():
+			return admissionResult{}, false, ctx.Err()
+		case <-r.clock.After(leaseKeeperReconnectGap):
+		}
+	}
+}
+
+// admitExchangeOnce performs ONE dial + admission frame exchange. It returns a
+// grant (the connection wrapped in a lease keeper as admissionResult.release), a
+// terminal refusal (err set), a ctx-cancellation, or the errAdmitReconnect sentinel
+// for a NON-exclusive transport failure (which admitThroughDaemon turns into a
+// reconnect). An EXCLUSIVE request never reconnects: any incomplete exchange refuses
+// (exclusivity cannot be silently re-tried into a contended launch —
+// admit_exclusive_unwedge stays green).
+func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveReserve int64, dial func(context.Context, string) (net.Conn, error)) (admissionResult, bool, error) {
+	admissionStarted := time.Now()
+	maxWait := r.admissionMaxWait
+	// Dial with a bounded 500 ms timeout (design §4). There is NO transport deadline
+	// on the exchange itself: §4/§6 specify no client deadline, so a long legitimate
+	// wait must not tear its own connection down — that would drop the request and
+	// reconnect it to a fresh FIFO position.
+	dctx, cancelDial := context.WithTimeout(ctx, leaseKeeperDialTimeout)
+	conn, err := dial(dctx, r.admitSocketPath)
+	cancelDial()
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return admissionResult{}, false, cerr
+		}
+		if req.Exclusive {
+			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, false,
+				exclusiveRefusal("", "the daemon was unreachable for an exclusive admission request")
+		}
+		return admissionResult{}, false, errAdmitReconnect
 	}
 	monitorStop := make(chan struct{})
 	monitorDone := make(chan struct{})
@@ -428,12 +468,12 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	} else {
 		close(monitorDone)
 	}
-	// fail closes the socket first, then routes to the SINGLE flock fallback
-	// (§2.1). This is the plan-approved documented advisory degradation: the flock
-	// serialises fallback clients (bounded, unlike an ungated unevaluated
-	// stampede — Sol build r2), while its cross-domain over-grant against live
-	// daemon reservations is bounded by the OOMPolicy=kill backstop. A detach
-	// kill-intent or ctx cancellation aborts instead.
+	// fail closes the socket and classifies the failure (S13). A NON-exclusive
+	// TRANSPORT failure (write/read of the frame failed — the daemon EOF'd or was
+	// mid-restart) becomes errAdmitReconnect, and admitThroughDaemon reconnects; an
+	// EXCLUSIVE one refuses (exclusivity is never silently re-tried into a contended
+	// launch); a detach kill-intent or ctx cancellation is terminal. The flock
+	// fallback is never reached from here — the client fails CLOSED by waiting.
 	fail := func() (admissionResult, bool, error) {
 		_ = conn.Close()
 		select {
@@ -449,22 +489,16 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 				return admissionResult{}, false, err
 			}
 		}
-		// AIRA-101. Every remaining route out of fail() ends in the flock fallback,
-		// which launches outside the ledger and outside exclusivity. An exclusive
-		// request refuses here instead, so a torn connection, an unreadable frame or
-		// an unrecognised daemon code can never become a silently contended
-		// benchmark.
 		if req.Exclusive {
-			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, true,
+			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, false,
 				exclusiveRefusal("", "the exclusive admission exchange with the daemon did not complete")
 		}
-		return admissionResult{}, false, nil
+		return admissionResult{}, false, errAdmitReconnect
 	}
 
-	_ = conn.SetDeadline(transportDeadline)
-	// The connection deadline bounds the transport. Only caller cancellation
-	// closes asynchronously: a full frame that completes exactly at the
-	// transport deadline must win and keep this lease open through Start.
+	// Only caller cancellation closes the conn asynchronously: a full frame that
+	// completes must win and keep this lease open through Start. No transport
+	// deadline — §4/§6 specify no client deadline (see admitExchangeOnce).
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
 
@@ -658,16 +692,35 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 				return admissionResult{state: strings.TrimPrefix(strings.ToLower(response.Code), "e_admit_"), waitedMS: time.Since(admissionStarted).Milliseconds(), reserve: resolved, ceiling: rejection.Ceiling, basis: basis}, true, errors.New(message)
 			}
 		}
-		return fail()
+		// S13. A WELL-FORMED refusal frame with a code the client does not recognise (a
+		// fail-closed CodeUnavailable, a CodeBusy, or a version-skew E_DAEMON_PROTOCOL)
+		// is a genuine refusal, NOT a transport failure. It is TERMINAL: refuse to
+		// launch and surface the daemon's reason. It never reconnects (that would loop
+		// on the same refusal) and never falls open to an ungoverned launch — the
+		// deleted flock fallback's failure mode this slice exists to close.
+		_ = conn.Close()
+		message := strings.TrimSpace(response.Error)
+		if message == "" {
+			message = strings.TrimSpace(response.Code)
+		}
+		if message == "" {
+			message = "the daemon refused admission"
+		}
+		return admissionResult{state: "refused", waitedMS: time.Since(admissionStarted).Milliseconds(), reserve: effectiveReserve, basis: "reject:daemon-refused"}, false,
+			fmt.Errorf("%s; refusing to launch ungoverned", message)
 	}
 	var grant runnerAdmitGrant
 	if err := json.Unmarshal(response.Data, &grant); err != nil || !validRunnerAdmitGrant(grant) {
 		if req.Exclusive {
 			_ = conn.Close()
-			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, true,
+			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, false,
 				exclusiveRefusal("", "the daemon's admission grant could not be read")
 		}
-		return fail()
+		// S13. A malformed grant is a daemon protocol fault, not a transport failure:
+		// reconnecting would re-fetch the same bad frame. TERMINAL refuse, never fall open.
+		_ = conn.Close()
+		return admissionResult{state: "refused", reserve: effectiveReserve, basis: "reject:daemon-refused"}, false,
+			errors.New("E_DAEMON_PROTOCOL: the daemon's admission grant could not be read; refusing to launch ungoverned")
 	}
 	// AIRA-101. `unevaluated` is a real grant state — the daemon answered, but
 	// could not establish the slice's usage — and an ordinary job proceeds on it
@@ -676,7 +729,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	// be fabricated. Only a genuine immediate/waited grant is exclusivity.
 	if req.Exclusive && grant.State != "immediate" && grant.State != "waited" {
 		_ = conn.Close()
-		return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, true,
+		return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, false,
 			exclusiveRefusal("", "the daemon answered "+grant.State+" rather than granting exclusive admission")
 	}
 	// A full, validated frame claims the connection as the lease. Before returning
@@ -699,24 +752,25 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		return admissionResult{}, false, err
 	default:
 	}
-	// CLEAR the transport deadline before handing this connection back as the
-	// LEASE. It was set to `now + maxWait + grace` to bound the admission
-	// EXCHANGE; the exchange is over, and a lease has no deadline — it is held for
-	// the entire life of the job, which routinely outlives any admission wait.
-	//
-	// Leaving it set was harmless only while nothing ever read the lease. AIRA-101
-	// added the first such reader (confine's exclusivity watcher), which made the
-	// latent deadline load-bearing and actively wrong: the read failed with
-	// `i/o timeout` at maxWait+grace on a perfectly healthy connection, so any
-	// exclusive benchmark outliving its own admission budget — 30 minutes by
-	// default — reported `exclusive=lost` and warned that its measurement was
-	// contended when nothing had happened at all. That inverts the honesty facet
-	// on precisely the long runs it exists for, and it silenced the watcher
-	// afterwards so a REAL loss then went unreported (found by build review).
-	_ = conn.SetDeadline(time.Time{})
-	// A full, validated frame is the sole winning outcome even when its final
-	// byte races the transport deadline. The flock fallback is never entered.
-	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis, scopeCeiling: grant.ScopeCeiling}, true, nil
+	// S13. The granted connection is the LEASE. Wrap it in a lease keeper: for a
+	// scope-bearing non-exclusive grant the keeper re-declares the lease across a
+	// daemon restart (design §4); a scope-less confine-reserve lease is held only;
+	// an exclusive lease is watched by the confine caller (watchExclusive). The
+	// keeper's Close() is admissionResult.release — teardown closes it, which the
+	// daemon reads as the lease-releasing EOF. No transport deadline was ever set on
+	// this conn, so a held lease that outlives its admission wait is never torn down.
+	keeper := newLeaseKeeper(conn, req, grant, dial, r.admitSocketPath)
+	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: keeper, reserve: grant.Reserve, basis: grant.Basis, scopeCeiling: grant.ScopeCeiling}, true, nil
+}
+
+// warnDaemonWait emits the periodic "waiting for the daemon" line while the client
+// reconnects across a daemon restart (design §4, AIRA-71 UX shape). It never fails
+// open — the launch is simply blocked until the daemon returns or ctx is cancelled.
+func (r *Runner) warnDaemonWait(waited time.Duration) {
+	if r.diagnostics == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(r.diagnostics, "aira: waiting for the memory-admission daemon to become reachable (waited %s); the launch is held, not run ungoverned\n", waited.Round(time.Second))
 }
 
 const mathMaxInt64 = int64(^uint64(0) >> 1)
