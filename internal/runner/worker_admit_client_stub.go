@@ -12,7 +12,6 @@ type WorkerAdmitLease struct {
 	ScopePath   string
 	MemoryMax   int64
 	SwapCap     string
-	CPUSlots    string
 	Containment string
 	Reserved    int64
 }

@@ -68,15 +68,9 @@ type WorkerAdmitResponse struct {
 	// reasons). Without a swap cap, a worker's memory.max bounds memory but
 	// not memory+swap, so a runaway is reclaimed into swap and never killed --
 	// the containment this grant appears to promise simply does not happen.
-	// Diagnostic like CPUSlots: nothing branches on it, and it is what stops a
-	// lost guarantee from being invisible to the run it affects.
+	// Diagnostic: nothing branches on it, and it is what stops a lost
+	// guarantee from being invisible to the run it affects.
 	SwapCap string `json:"swap_cap,omitempty"`
-	// CPUSlots (AIRA-64) reports whether this grant was actually subject to
-	// CPU-concurrency governance. It exists because a fail-open governance
-	// dimension whose failure is visible only in the daemon journal is how a
-	// subsystem ships operationally inert, which this project has done once
-	// already. It is diagnostic: nothing branches on it.
-	CPUSlots string `json:"cpu_slots,omitempty"`
 	// leaseID is UNEXPORTED and never crosses the wire: it is the shim ledger's
 	// booking id, carried from the evaluator to the connection handler that must
 	// release it when the peer disconnects. Zero on every non-shim response and
@@ -158,17 +152,6 @@ type workerScopeState struct {
 	// reverting to a stale number. Found independently by Sol and DeepSeek
 	// build-review.
 	scanErr error
-	// lastGrantAt is when this daemon last granted a worker under this outer
-	// scope, and it is what closes AIRA-64's grant-to-placement window: a scope
-	// granted moments ago still reads UNPOPULATED, so without this a second
-	// supervisor under the same outer scope would see "no live workers" and take
-	// the liveness floor too.
-	//
-	// It lives here because this cell is already per-outer-scope and already
-	// held under this scope's lock at every decision point, so it needs no
-	// lifetime, expiry or restart story of its own — after a restart it is
-	// zero, which permits exactly one extra floor grant and nothing worse.
-	lastGrantAt time.Time
 }
 
 // workerScopeScanIntervalDefault throttles the per-outer-scope child scan to
@@ -487,9 +470,8 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 		return s.evaluateShimWorkerAdmit(ctx, req)
 	}
 	// AIRA-101, the slice-exclusivity gate. FIRST, before any cgroupfs read and
-	// before both the outer-scope lock and the CPU-slots gate: it is a pure
-	// in-memory map lookup, and taking it here means it adds no lock nesting to
-	// either of those critical sections.
+	// before the outer-scope lock: it is a pure in-memory map lookup, and taking
+	// it here means it adds no lock nesting to that critical section.
 	//
 	// Classed CONTENDED, which is load-bearing rather than a formality. A
 	// contended denial is retriable, so supervisor.py raises WorkerAdmitDenied and
@@ -689,21 +671,6 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
 		}, true
 	}
-	// AIRA-64, CACHED CPU CHECK. Placed HERE, before the forced RAM rescan
-	// below, and the position is load-bearing rather than incidental: a
-	// CPU-saturated request has ample RAM by construction, so it always reaches
-	// that rescan. Checking CPU afterwards would force a full O(tree) RAM walk
-	// on EVERY 200ms saturated poll — the AIRA-61 CPU-regression shape, and
-	// exactly what this ordering avoids (found by Sol plan-review round 2).
-	if verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastGrantAt, false); verdict == cpuSlotsSaturated {
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonCPUSlotsSaturated,
-		}, true
-	} else if verdict == cpuSlotsUnevaluated {
-		s.cpuSlotsWarnOnce(req.outerScope, detail)
-	}
 	// Granting path: force a fresh scan first. A cached sum may never be the
 	// basis of an admission — a `.aira-worker-*` child that appeared since the
 	// last scan is invisible to the cache and need not collide with the id
@@ -725,45 +692,14 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
 		}, true
 	}
-	// AIRA-64, FORCED CPU CHECK, under the machine-wide gate. The gate is held
-	// across [fresh snapshot -> decide -> CreateWorkerScope] so two concurrent
-	// grants under DIFFERENT outer scopes cannot both observe capacity-1 and
-	// both grant. Lock order is outer-scope -> gate, never the reverse.
-	if !s.acquireCPUSlotsGate(ctx, req.maxWaitMS == 0) {
-		if req.maxWaitMS == 0 && ctx.Err() == nil {
-			select {
-			case <-s.stopping:
-				return WorkerAdmitResponse{}, false
-			default:
-			}
-			return WorkerAdmitResponse{
-				State:  runner.WorkerAdmitStateDenied,
-				Class:  runner.WorkerAdmitClassContended,
-				Reason: runner.WorkerAdmitReasonAdmitLocksBusy,
-			}, true
-		}
-		return WorkerAdmitResponse{}, false
-	}
-	defer s.releaseCPUSlotsGate()
-	cpuState := runner.WorkerAdmitCPUSlotsOK
-	switch verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastGrantAt, true); verdict {
-	case cpuSlotsSaturated:
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonCPUSlotsSaturated,
-		}, true
-	case cpuSlotsUnevaluated:
-		// Deliberate asymmetry with the RAM checks above, which fail CLOSED.
-		// An unestablished RAM reading risks an outer-scope memory.oom.group
-		// kill of an entire run, so it must deny. An unestablished CPU reading
-		// risks over-subscription — degradation, and exactly today's behaviour
-		// — so denying would convert a diagnostic failure into a stall of every
-		// aitest run on the machine. It is reported as unevaluated on the
-		// granted line and logged; it is never rendered as a zero or a pass.
-		s.cpuSlotsWarnOnce(req.outerScope, detail)
-		cpuState = runner.WorkerAdmitCPUSlotsUnevaluated
-	}
+	// S6: worker CPU concurrency is no longer gated here. The AIRA-64 CPU
+	// slot-governor (flock-based) that once serialised [fresh snapshot -> decide
+	// -> CreateWorkerScope] machine-wide was deleted once CPU became a per-slice
+	// ledger resource (S5): the ledger charges each `confine-reserve` per-test
+	// sub-reservation one core against the 2×NumCPU ceiling at admission, so a
+	// second CPU bound on the same workers is redundant. The RAM aggregate guard
+	// above stays serialised by this outer scope's own lock (state.release),
+	// which that governor never protected.
 	seq := state.nextSeq
 	if state.maxIndex > seq {
 		// Restart reconstruction: nothing in RAM knows the ids already on the
@@ -832,27 +768,10 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	state.nextSeq = seq
 	// The tree changed under us; the next committed read must see it.
 	state.invalidate()
-	// AIRA-64: the CPU snapshot is now stale-low too, and deliberately NOT
-	// invalidated here — see the comment where cpuSlotsInvalidate used to be.
-	// A stale-low CPU cache can only fail to deny early; it can never admit,
-	// because every grant forces a fresh scan under the gate first.
-	//
-	// AIRA-64: lastGrantAt is recorded for EVERY grant, not only floor grants, and only once
-	// the scope actually exists so a failed creation cannot consume this
-	// scope's floor entitlement.
-	//
-	// Every grant, because the window this closes is "granted but not yet
-	// placed", and a NORMAL (under-capacity) grant opens that window exactly as
-	// a floor grant does: the scope reads unpopulated either way. Recording only
-	// floor grants left the commonest case — a scope grew normally, then the
-	// machine filled up before its newest worker placed — able to draw an extra
-	// floor grant.
-	state.lastGrantAt = s.admitNowTime()
 	return WorkerAdmitResponse{
 		State: runner.WorkerAdmitStateGranted, Class: runner.WorkerAdmitClassGranted,
 		WorkerID: workerID, ScopePath: scopePath,
 		MemoryMax: req.estimatedBytes, SwapCap: swapCap,
-		CPUSlots: cpuState,
 		// AIRA-123: stated positively on the real path too, not only on the
 		// degraded one. A grade that were present only when weak would make its
 		// ABSENCE the claim of strength, which is precisely the reading this

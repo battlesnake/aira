@@ -2077,8 +2077,8 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	grantFields := &runner.WorkerAdmitGrantFields{
 		ScopePath: lease.ScopePath, WorkerID: lease.WorkerID,
 		MemoryMax: lease.MemoryMax, SwapCap: lease.SwapCap,
-		CPUSlots: lease.CPUSlots, Containment: lease.Containment,
-		Reserved: lease.Reserved,
+		Containment: lease.Containment,
+		Reserved:    lease.Reserved,
 	}
 	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {
 		_ = lease.Close()

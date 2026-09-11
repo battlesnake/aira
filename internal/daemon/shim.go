@@ -111,8 +111,8 @@ func (s *Server) memAvailableReader() func() (int64, bool, string) {
 // cpuFrameReader and cpuCoreCounter are AIRA-137's CPU-frame seams, on the same
 // nil-checks-to-the-package-default rule as every reader above. Production
 // reaches the real root-cgroup/slice cpu.stat pair and runtime.NumCPU — the same
-// core count desiredCPUSlots derives the AIRA-49 worker slot count from, so the
-// bar's capacity and the scheduler's idea of this machine's width cannot drift
+// core count the admission ledger's CPU ceiling (2×NumCPU) derives from, so the
+// bar's capacity and the ledger's idea of this machine's width cannot drift
 // apart. Neither is shim-specific: shim mode publishes no CPU frame at all, and
 // the withholding is done by confineManagement's own shim gate.
 func (s *Server) cpuFrameReader() func(string) runner.ConfineCPUFrame {

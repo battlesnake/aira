@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -101,21 +100,6 @@ type Server struct {
 	sliceCeilingMu    sync.RWMutex
 	sliceCeilingState sliceCeilingSnapshot
 
-	// AIRA-64. The CPU-concurrency gate: one machine-wide bound on how many
-	// aitest workers run at once, evaluated inside worker-admit. cpuSlotsGate
-	// is a 1-buffered channel rather than a sync.Mutex so a waiter can abandon
-	// it when its peer disconnects, the daemon stops, or the request declared
-	// itself speculative (max_wait_ms == 0) — the same abandonable shape
-	// acquireWorkerScope uses, and for the same reason.
-	cpuSlotsCapacity     int
-	cpuSlotsGrace        time.Duration
-	cpuSlotsScanInterval time.Duration
-	cpuSlotsGate         chan struct{}
-	cpuSlotsMu           sync.Mutex
-	cpuSlotsCache        map[string]cpuSlotsCacheEntry
-	cpuSlotsWarned       map[string]struct{}
-	cpuSlotsScan         func(string) (cpuSlotsSnapshot, error)
-
 	// Test seams. Production always calls the Store methods and DB.Close.
 	reapScope         func(context.Context, *store.Store) (int, error)
 	flushScopeFn      func(context.Context, *store.Store) (int, error)
@@ -194,12 +178,6 @@ type Server struct {
 }
 
 func NewServer(paths Paths) *Server {
-	capacity, err := desiredCPUSlots(runtime.NumCPU())
-	if err != nil {
-		// Serve reports the malformed setting before accepting requests. Keep a
-		// safe constructor default for unit tests which do not call Serve.
-		capacity = 1
-	}
 	server := &Server{
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, ejecting: map[string]struct{}{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		projectUses: map[string]int{},
@@ -217,13 +195,6 @@ func NewServer(paths Paths) *Server {
 		storeOpAppendTimeout:         30 * time.Second,
 		storeOpHeavyTimeout:          5 * time.Minute,
 		deadlines:                    defaultDeadlines,
-		cpuSlotsCapacity:             capacity,
-		cpuSlotsGrace:                cpuSlotsPlacementGrace(),
-		cpuSlotsScanInterval:         admitConfineScanIntervalDefault,
-		cpuSlotsGate:                 make(chan struct{}, 1),
-		cpuSlotsCache:                map[string]cpuSlotsCacheEntry{},
-		cpuSlotsWarned:               map[string]struct{}{},
-		cpuSlotsScan:                 scanSliceWorkerScopes,
 	}
 	server.projectCond = sync.NewCond(&server.mu)
 	// One scan entry point, mode-aware (AIRA-121). Assigned after the literal
@@ -364,22 +335,6 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	lockHeld = true
 	if err := writeLockInfo(lock); err != nil {
 		return err
-	}
-	desiredSlots, slotErr := desiredCPUSlots(runtime.NumCPU())
-	if slotErr == nil {
-		// AIRA-64: the worker-admit CPU gate is the sole owner of this capacity
-		// since AIRA-33 deleted the daemon scheduler that used to share it. A
-		// malformed setting leaves NewServer's safe capacity-1 fallback in place
-		// and is reported by the branch below.
-		s.cpuSlotsMu.Lock()
-		s.cpuSlotsCapacity = desiredSlots
-		s.cpuSlotsMu.Unlock()
-	}
-	s.cpuSlotsGrace = cpuSlotsPlacementGrace()
-	if slotErr != nil {
-		// NewServer installed the safe capacity-1 fallback, so the worker-admit
-		// CPU gate is still enforcing. Do not claim it was disabled.
-		log.Printf("aira daemon: worker-admit CPU gate using safe capacity-1 fallback (config error: %v)", slotErr)
 	}
 	if err := os.Remove(s.Paths.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -94,35 +93,6 @@ func startServer(t *testing.T, server *Server) (context.CancelFunc, <-chan error
 		}
 	})
 	return cancel, done
-}
-
-func TestServerMalformedCPUReserveLogsCapacityOneFallback(t *testing.T) {
-	t.Setenv("AIRA_DAEMON_CPU_RESERVE", "not-a-number")
-	paths := testPaths(t)
-	server := NewServer(paths)
-	// AIRA-33 retargeted this from the deleted daemon governor to the AIRA-64
-	// worker-admit CPU gate, which is now the sole owner of desiredCPUSlots.
-	// The invariant is unchanged and still load-bearing: a malformed setting
-	// must leave an ENFORCING capacity-1 gate, never a disabled one -- the
-	// AIRA-59 "shipped operationally inert" failure mode.
-	if server.cpuSlotsCapacity != 1 {
-		t.Fatalf("cpu slot capacity=%d, want enforced capacity-1 fallback", server.cpuSlotsCapacity)
-	}
-	var logs bytes.Buffer
-	previous := log.Writer()
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(previous) })
-	_, _ = startServer(t, server)
-	got := logs.String()
-	if !strings.Contains(got, "using safe capacity-1 fallback") || !strings.Contains(got, "AIRA_DAEMON_CPU_RESERVE") {
-		t.Fatalf("fallback log=%q", got)
-	}
-	if strings.Contains(got, "disabled") {
-		t.Fatalf("fallback log falsely claims disabled: %q", got)
-	}
-	if server.cpuSlotsCapacity != 1 {
-		t.Fatalf("cpu slot capacity=%d after Serve, want the fallback retained", server.cpuSlotsCapacity)
-	}
 }
 
 func TestServerRoutedRoundTripAndProtocolEvidence(t *testing.T) {

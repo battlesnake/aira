@@ -301,9 +301,9 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// and withheld whole in shim mode by the same `if` that withholds
 				// the RAM frame.
 				//
-				// Core count comes from runtime.NumCPU(), the same source
-				// desiredCPUSlots derives the AIRA-49 worker slot count from, so the
-				// bar's capacity and the scheduler's own idea of this machine's
+				// Core count comes from runtime.NumCPU(), the same source the
+				// admission ledger's CPU ceiling (2×NumCPU) derives from, so the
+				// bar's capacity and the ledger's own idea of this machine's
 				// width cannot drift apart.
 				cpu := s.cpuFrameReader()(path)
 				result.SliceReserve.SystemCPUUsageUsec = cpu.SystemUsageUsec

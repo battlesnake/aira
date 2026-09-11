@@ -48,11 +48,7 @@ type WorkerAdmitLease struct {
 	// CreateWorkerScope. It replaces MemoryHigh, which AIRA-35 retired along
 	// with the memory.high write it named.
 	SwapCap string
-	// CPUSlots (AIRA-64) carries the daemon's CPU-governance state through to
-	// the outcome line the supervisor reads. It must traverse this hop or the
-	// signal is inert.
-	CPUSlots string
-	conn     net.Conn
+	conn    net.Conn
 }
 
 func (l *WorkerAdmitLease) Close() error {
@@ -82,7 +78,6 @@ type workerAdmitGrant struct {
 	Containment string `json:"containment,omitempty"`
 	Reserved    int64  `json:"reserved,omitempty"`
 	SwapCap     string `json:"swap_cap,omitempty"`
-	CPUSlots    string `json:"cpu_slots,omitempty"`
 }
 
 // RequestWorkerAdmit dials the daemon and sends one worker-admit request,
@@ -206,8 +201,8 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		Lease: &WorkerAdmitLease{
 			WorkerID: grant.WorkerID, ScopePath: grant.ScopePath,
 			MemoryMax: grant.MemoryMax, SwapCap: grant.SwapCap,
-			CPUSlots: grant.CPUSlots, Containment: grant.Containment,
-			Reserved: grant.Reserved, conn: conn,
+			Containment: grant.Containment,
+			Reserved:    grant.Reserved, conn: conn,
 		},
 	}
 }
