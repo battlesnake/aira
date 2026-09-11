@@ -209,6 +209,14 @@ func decodeLeaseDump(r io.Reader) (leaseDump, error) {
 		}
 		dump.Records = append(dump.Records, rec)
 	}
+	// TOTAL parser: no bytes may follow the counted records. The frame decoder rejects
+	// its own trailing bytes; the file decoder must too, or a byte sequence would neither
+	// decode-as-intended nor reject. Unreachable from the atomic-rename writer, but
+	// "decode cleanly or reject" is the contract S11 relies on.
+	var tail [1]byte
+	if n, _ := io.ReadFull(r, tail[:]); n > 0 {
+		return dump, fmt.Errorf("%s: lease dump has trailing bytes after %d record(s)", CodeProtocol, count)
+	}
 	return dump, nil
 }
 
@@ -251,8 +259,10 @@ func (s *Server) snapshotLeaseDump() []leaseDumpRecord {
 				Frame: reDeclareRecord{
 					// The ledger key VERBATIM; S11 establishes the lease under this.
 					ScopeID: waiter.scopeID,
-					// reserve is a non-negative RAM byte count; the frame encoder refuses
-					// anything above MaxInt64, so a pathological value is log-skipped below.
+					// reserve is a non-negative RAM byte count validated to [0, admitMaxReserve]
+					// at admission, so it always fits the frame encoder's MaxInt64 bound. If the
+					// encoder ever DID refuse, encodeLeaseDump aborts the WHOLE dump (there is no
+					// per-record skip) and the write fails open — not a silent partial file.
 					RAMBytes: uint64(waiter.reserve),
 					// cpu is 0..cpuCeiling() (== 2*NumCPU, admit.go's fail-fast), so it
 					// fits u32 and is never negative.

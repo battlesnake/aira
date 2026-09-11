@@ -8,7 +8,6 @@ import (
 	"math"
 	"math/rand"
 	"net"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -271,9 +270,11 @@ func TestEncodeReDeclareRejectsUnchargeableRecords(t *testing.T) {
 func TestOldClientReDeclareIsSniffedBeforeProtocolCheck(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	t.Cleanup(func() { _ = clientConn.Close() })
-	server := NewServer(Paths{StateID: "state"})
-	server.peerCredential = func(net.Conn) (int, int, error) { return os.Geteuid(), os.Getpid(), nil }
-	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
+	// reDeclareTestServer wires ALL the re-declare seams (same-uid credential, resolvable
+	// slice, fail-closed memory reader, no real confine scan, a long poll) so the
+	// establish's evaluator never touches the real host ListConfines / memory reader on
+	// its tick — this is a unit test, not the host slice.
+	server := reDeclareTestServer()
 	done := make(chan struct{})
 	go func() {
 		server.serveConnection(context.Background(), serverConn)

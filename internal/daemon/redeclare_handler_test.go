@@ -356,3 +356,61 @@ func TestReDeclarePostSetErrorHoldsLeaseEOFReleases(t *testing.T) {
 		}
 	}
 }
+
+// TestReDeclareUnreadableCredentialFailsClosedNoAck is the UNREADABLE-credential fail
+// direction of the same-uid gate at the HANDLER level — the companion to
+// TestReDeclareOtherUIDRefusedNoAck, which only covers a readable-but-different uid. When
+// the SO_PEERCRED read ERRORS, peerSameUID must stay false BY OMISSION (fail-closed) and
+// the re-declare is refused: no ack, no lease. A build that set peerSameUID=true, or that
+// assigned it from the (zeroed) uid of a failed read, would establish a lease it could not
+// authenticate — and survives every other handler test, since only a credential ERROR (not
+// a wrong uid) exercises this path.
+func TestReDeclareUnreadableCredentialFailsClosedNoAck(t *testing.T) {
+	server := reDeclareTestServer()
+	server.peerCredential = func(net.Conn) (int, int, error) { return 0, 0, errors.New("unreadable credential") }
+	frame, err := encodeReDeclareFrame(reDeclareRecord{ScopeID: "unreadable-cred-scope", RAMBytes: 2 << 30, CPUCores: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, done := driveReDeclare(t, server, frame)
+	t.Cleanup(func() { _ = clientConn.Close() })
+
+	var ack [1]byte
+	if n, err := io.ReadFull(clientConn, ack[:]); err == nil {
+		t.Fatalf("an unreadable-credential re-declare must fail CLOSED (no ack), got %d byte(s) 0x%02x", n, ack[0])
+	}
+	waitClosed(t, done, "handler to return on fail-closed refuse")
+	if queue := reDeclareQueue(server); queue != nil {
+		if _, _, jobs := queueLedger(queue); jobs != 0 {
+			t.Fatalf("a fail-closed re-declare must establish no lease, jobs=%d", jobs)
+		}
+	}
+}
+
+// TestReDeclareCrashRestartFloodSkipsMaxWaiters pins that the establish arm runs BEFORE the
+// maxWaiters(admitMaxWaiters) gate. The driver for establish-granted is a CRASH restart with
+// no dump: the new daemon opens an EMPTY ledger, and EVERY live survivor's re-declare is
+// absent-lease — there can be MORE than admitMaxWaiters of them. They must ALL establish
+// granted; a single CodeBusy refusal drops a live lease (a survivor launched under admission
+// that the daemon now denies, losing its governance). N deliberately exceeds admitMaxWaiters.
+//
+// MUTATION: move the `else if request.reDeclare` establish arm BELOW the maxWaiters check in
+// enqueueAdmitInternal → the (admitMaxWaiters+1)th re-declare is refused CodeBusy → reds here.
+func TestReDeclareCrashRestartFloodSkipsMaxWaiters(t *testing.T) {
+	server := reDeclareTestServer()
+	n := admitMaxWaiters + 44 // comfortably past the gate
+	for i := 0; i < n; i++ {
+		_, waiter, code, err := server.enqueueReDeclare("/slice", 1*gib, "redeclare", admitRequest{
+			scopeID: "flood-" + formatInt64(int64(i)), cpu: 1, peerSameUID: true, conn: testAnchorConn(),
+		})
+		if err != nil || code != "" {
+			t.Fatalf("crash-restart re-declare %d/%d refused (code=%q err=%v) — a survivor past maxWaiters was dropped", i, n, code, err)
+		}
+		if waiter.state != admitGranted || !waiter.accounted {
+			t.Fatalf("crash-restart re-declare %d must establish granted, state=%v accounted=%v", i, waiter.state, waiter.accounted)
+		}
+	}
+	if _, _, jobs := queueLedger(reDeclareQueue(server)); jobs != n {
+		t.Fatalf("all %d crash-restart survivors must establish, jobs=%d", n, jobs)
+	}
+}

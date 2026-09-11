@@ -216,6 +216,14 @@ func TestLeaseDumpDecodeIsTotal(t *testing.T) {
 			}
 		}
 	})
+	t.Run("trailing bytes after the counted records error, not a silent tail", func(t *testing.T) {
+		// A well-formed file plus one extra byte is malformed — the decoder must reject it
+		// rather than decode the records and silently drop the tail (the TOTAL contract).
+		withTail := append(append([]byte{}, good...), 0x00)
+		if _, err := decodeLeaseDump(bytes.NewReader(withTail)); err == nil {
+			t.Fatal("trailing byte after the records decoded without error — not total")
+		}
+	})
 	t.Run("malformed record returns the decoded prefix plus an error", func(t *testing.T) {
 		// Corrupt the SECOND record's embedded frame magic. The first record is
 		// intact, so the decoder must return it, then error on the second.
