@@ -1095,9 +1095,10 @@ class Supervisor:
             available_bytes = outcome.get("available_bytes")
             available_cpu = outcome.get("available_cpu")
             if available_bytes is None or available_cpu is None:
-                # Unreachable against an S15 daemon: the protocol-11 pin refuses an
-                # older one, and the renderer emits BOTH figures on every denied
-                # snapshot. If it somehow happens, do NOT fabricate room -- skip.
+                # Not produced by an S15 daemon: the protocol-11 pin refuses an older
+                # one, and the renderer emits BOTH figures on every denied snapshot.
+                # A defensive guard, not dead code (a test stub can still omit them):
+                # do NOT fabricate room -- skip the tick.
                 return None
             try:
                 return int(available_bytes), int(available_cpu)
