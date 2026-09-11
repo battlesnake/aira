@@ -209,13 +209,13 @@ func TestConfineDumpQueueReportsNegativeAvailableExcursion(t *testing.T) {
 	}
 }
 
-// TestConfineDumpQueueLeavesAvailableUnevaluatedOnADegenerateCeiling pins the
-// advisor-flagged case checkedAvailable's own doc comment names: a ceiling at
-// or below the configured headroom is an UNUSABLE reading (not "zero
-// available"), and checkedAvailable/ledgerAvailable both collapse that case
-// to the SAME 0 a genuinely-exhausted slice would produce -- so this dump
-// must not trust that 0 at face value. The ceiling figure itself, in
-// contrast, IS still a real, established reading and must still be reported.
+// TestConfineDumpQueueLeavesAvailableUnevaluatedOnADegenerateCeiling pins a
+// case checkedAvailable's own doc comment names: a ceiling at or below the
+// configured headroom is an UNUSABLE reading (not "zero available"), and
+// checkedAvailable/ledgerAvailable both collapse that case to the SAME 0 a
+// genuinely-exhausted slice would produce -- so this dump must not trust
+// that 0 at face value. The ceiling figure itself, in contrast, IS still a
+// real, established reading and must still be reported.
 //
 // verifies: AIRA (admission-counter rebuild) S18
 func TestConfineDumpQueueLeavesAvailableUnevaluatedOnADegenerateCeiling(t *testing.T) {
