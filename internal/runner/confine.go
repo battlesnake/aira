@@ -17,6 +17,12 @@ const (
 	// A project-less invocation has no per-project peak-RSS history. Four GiB is
 	// a conservative #50 no-history fallback; injected callers may override it.
 	DefaultConfineMemoryReserve = int64(4 << 30)
+	// DefaultConfineCPUCores is the CPU-core reservation a plain `aira confine`
+	// declares to the admission ledger (design §9). One core is the confine default;
+	// the daemon charges it against the machine-wide 2×NumCPU CPU ceiling (design
+	// §7). Accounting only — no cpu.max is written. Per-command CPU annotation
+	// (aitest workers) is a later slice; the confine path always sends this.
+	DefaultConfineCPUCores = int64(1)
 	// Under --delegate-ram the suite's OWN reserve must be a small PINNED
 	// framework overhead — never the unpinned whole-command estimate, which
 	// could inflate via history to reject the whole suite E_ADMIT_TOO_LARGE.

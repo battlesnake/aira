@@ -122,10 +122,15 @@ type runnerAdmitResponseFrame struct {
 }
 
 type runnerAdmitGrant struct {
-	State        string `json:"state"`
-	Reason       string `json:"reason,omitempty"`
-	WaitedMS     int64  `json:"waited_ms"`
-	Reserve      int64  `json:"reserve"`
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
+	WaitedMS int64  `json:"waited_ms"`
+	Reserve  int64  `json:"reserve"`
+	// S5. Cpu echoes the granted CPU-core reservation, so the grant wire mirrors the
+	// {ram, cpu} request vector. Informational only — the client applies no cpu.max —
+	// and NOT part of validRunnerAdmitGrant: a 0-core grant (a delegate suite; §8) is
+	// legal, so a zero here must never be read as an invalid grant.
+	Cpu          int64  `json:"cpu,omitempty"`
 	Basis        string `json:"basis"`
 	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
 }
@@ -460,8 +465,21 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "admit"
+	// S5. cpu is the second ledger resource. An ordinary confine declares the
+	// one-core default (design §9); the daemon charges it against the per-slice
+	// 2×NumCPU ceiling. A --delegate-ram SUITE reserves 0 cores (spec §8): it is
+	// framework overhead, and its pytest WORKERS each sub-reserve their own core
+	// later (S15) — charging the suite a core too would double-count. Accounting
+	// only — no cpu.max is written. Daemon and client are rebuilt in lockstep on
+	// this branch, so the added arg needs no ProtocolVersion bump (deferred to S7).
+	cpuCores := DefaultConfineCPUCores
+	if req.DelegateRAM {
+		cpuCores = 0
+	}
 	frame.Request.Args = map[string]any{
-		"slice": r.memorySlice, "reserve": effectiveReserve,
+		"slice":       r.memorySlice,
+		"reserve":     effectiveReserve,
+		"cpu":         cpuCores,
 		"max_wait_ms": maxWait.Milliseconds(),
 		"signature":   req.ResourceSignature,
 		"pinned":      !req.DaemonEstimateMemory || req.MemoryReservePinned,

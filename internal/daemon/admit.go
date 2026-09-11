@@ -142,8 +142,15 @@ const (
 )
 
 type admitWaiter struct {
-	seq       int64
-	reserve   int64
+	seq     int64
+	reserve int64
+	// S5. cpu is this lease's declared CPU-core reservation, the second ledger
+	// resource beside reserve (RAM). {reserve, cpu} is the resource vector admission
+	// gates conjunctively (design §7). CPU is accounting-only: it charges the
+	// per-slice queue.cpuOutstanding ledger and NO cpu.max is ever written — the
+	// kernel time-shares on cpu.weight. Zero for a lease that declared no cores (a
+	// delegate SUITE reserves 0 cores; §8); the confine client's default is one core.
+	cpu       int64
 	state     admitWaiterState
 	grantedCh chan struct{}
 	enqueued  time.Time
@@ -335,15 +342,22 @@ func (w *admitWaiter) ledgerCharge() int64 {
 // be a second copy of that fact to keep in sync -- the double-mutated state §2
 // exists to remove -- and scope-less `confine-reserve` waiters (scopeID == "")
 // have no key at all, so the walk over waiters is the honest ledger here.
-func rederiveLedgerLocked(queue *sliceQueue) (outstanding int64, jobs int) {
+//
+// S5. It re-derives BOTH ledger resources in the one walk: outstanding (RAM, via
+// ledgerCharge) and cpu (Σ lease cores). Both are PER-SLICE caches the caller stores
+// on the queue (queue.outstanding and queue.cpuOutstanding); CPU is gated per slice
+// on the one-slice (aira.slice) assertion (D1). jobs counts either resource's
+// granted && accounted waiters (they are the same set).
+func rederiveLedgerLocked(queue *sliceQueue) (outstanding int64, cpu int64, jobs int) {
 	for _, waiter := range queue.waiters {
 		if waiter == nil || waiter.state != admitGranted || !waiter.accounted {
 			continue
 		}
 		outstanding += waiter.ledgerCharge()
+		cpu = addClamp(cpu, waiter.cpu)
 		jobs++
 	}
-	return outstanding, jobs
+	return outstanding, cpu, jobs
 }
 
 // exclusiveActive reports whether this waiter currently asserts exclusivity.
@@ -689,12 +703,21 @@ type sliceQueue struct {
 	mu      sync.Mutex
 	path    string
 	waiters []*admitWaiter
-	// outstanding / outstandingJobs are a DERIVED CACHE of the ledger, not a
-	// running total: their only writer is rederiveLedgerLocked, called after
-	// every grant and release to re-sum ledgerCharge() over the granted &&
-	// accounted waiters (design §2, `available = ceiling - Σleases`). Never
-	// mutate them directly; change the waiter set and re-derive.
+	// outstanding / cpuOutstanding / outstandingJobs are a DERIVED CACHE of the
+	// ledger, not a running total: their only writer is rederiveLedgerLocked, called
+	// after every grant and release to re-sum over the granted && accounted waiters
+	// (design §2, `available = ceiling - Σleases`). Never mutate them directly;
+	// change the waiter set and re-derive.
+	//
+	// S5. cpuOutstanding is the PER-SLICE CPU sum (Σ lease cores), the second ledger
+	// resource beside RAM's `outstanding`, maintained and consulted exactly as RAM
+	// is. CPU is treated PER SLICE — this asserts ONE slice (aira.slice) in practice
+	// (D1, resolved to per-slice). Cores are a machine-wide resource; if multiple
+	// concurrent slices are ever introduced, CPU accounting must become machine-wide
+	// (sum across slices) — revisit then. Per-slice keeps it parallel to RAM and
+	// makes cross-slice ledger-clobber unrepresentable.
 	outstanding     int64
+	cpuOutstanding  int64
 	outstandingJobs int
 	adopted         int64
 	adoptedJobs     int
@@ -842,17 +865,28 @@ var sliceMemoryStatDegradeOnce sync.Once
 // AdmitResponse is the one grant payload sent before the daemon holds the
 // connection as the reservation lease.
 type AdmitResponse struct {
-	State        string `json:"state"`
-	Reason       string `json:"reason,omitempty"`
-	WaitedMS     int64  `json:"waited_ms"`
-	Reserve      int64  `json:"reserve"`
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
+	WaitedMS int64  `json:"waited_ms"`
+	Reserve  int64  `json:"reserve"`
+	// S5. Cpu echoes the granted CPU-core reservation the ledger charged. Purely
+	// informational (the client applies no cpu.max); it keeps the grant wire
+	// symmetric with the {ram, cpu} request vector. omitempty, so a 0-core grant (a
+	// delegate suite; §8) carries no field and older readers are unaffected.
+	Cpu          int64  `json:"cpu,omitempty"`
 	Basis        string `json:"basis"`
 	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
 }
 
 type admitRequest struct {
-	slice       string
-	reserve     int64
+	slice   string
+	reserve int64
+	// S5. cpu is the declared CPU-core reservation, the second ledger resource. It
+	// is optional on the wire (absent → 0; a lease that declares no cores is charged
+	// none — the confine client sends DefaultConfineCPUCores). A value that exceeds
+	// 2×NumCPU is impossible on this box and is refused fail-fast in admitConnection
+	// before any enqueue (design §7 "RequestInvalid").
+	cpu         int64
 	maxWait     int64
 	signature   string
 	pinned      bool
@@ -1741,6 +1775,29 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitError(conn, admitErrorCode(err), err.Error())
 		return
 	}
+	// S5 fail-fast (design §7 "RequestInvalid"): a request for more cores than this
+	// box can EVER provide (cpu > 2×NumCPU) is permanently impossible — retrying
+	// never helps — so refuse it up front, before any enqueue, rather than queue a
+	// waiter that can never fit and would sit until its max_wait. Placed here rather
+	// than in validateAdmitArgs because the ceiling is machine-specific (2×NumCPU via
+	// the cpuCoreCounter seam), which the pure validator does not have — the same
+	// split reserve uses (RANGE in the validator, CEILING here).
+	//
+	// Reported as a CLIENT-TERMINAL E_ADMIT_TOO_LARGE with a structured rejection
+	// payload, NOT CodeProtocol. CodeProtocol routes the runner's fail() straight to
+	// the flock fallback (admission_linux.go), launching the job OUTSIDE the ledger —
+	// the AIRA-222 fail-open class this whole rebuild closes. E_ADMIT_TOO_LARGE is in
+	// the runner's terminal pre-payload set; the {Required, Ceiling, Basis} payload
+	// is what validRunnerAdmitRejection requires so the client refuses instead of
+	// degrading. (The figures are cores, rendered by the generic too-large message —
+	// cosmetically byte-flavoured, but this is a hand-crafted-request-only guard:
+	// real clients send DefaultConfineCPUCores.)
+	if request.cpu > s.cpuCeiling() {
+		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{
+			Required: request.cpu, Ceiling: s.cpuCeiling(), Basis: "reject:cpu-too-large",
+		})
+		return
+	}
 	// AIRA-121 gate condition C6. --exclusive is refused HERE, before the request
 	// is ever queued, and that placement is the whole mechanism.
 	//
@@ -1895,7 +1952,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		queue.mu.Unlock()
 		return
 	}
-	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Basis: waiter.basis, ScopeCeiling: waiter.scopeCeiling}
+	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Cpu: waiter.cpu, Basis: waiter.basis, ScopeCeiling: waiter.scopeCeiling}
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -2019,7 +2076,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
@@ -2378,14 +2435,58 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queuedAhead++
 			continue
 		}
-		if waiter.reserve > available {
+		// S5 CONJUNCTIVE FIT (design §7): admit only if EVERY resource fits — RAM
+		// AND CPU. Both are PER-SLICE ledgers: `available` is RAM (ceiling − Σreserve),
+		// and CPU is this queue's own cpuOutstanding against the 2×NumCPU ceiling. CPU
+		// is treated per slice on the one-slice (aira.slice) assertion (D1); cores are
+		// machine-wide, so if concurrent slices are ever introduced this must become a
+		// sum across slices. grantedAt marks "the daemon just decided this job may
+		// proceed", deliberately separate from enqueued (a long queue wait is not launch
+		// abandonment — the AIRA-49 v3 defect); nothing but the grant below sets it.
+		ramFits := waiter.reserve <= available
+		cpuFits := waiter.cpu <= cpuAvailable(s.cpuCeiling(), queue.cpuOutstanding)
+		if ramFits && cpuFits {
+			waiter.state = admitGranted
+			waiter.grantedAt = s.admitNowTime()
+			waiter.accounted = true
+			// The ledger is DERIVED, not incremented: this waiter is now granted &&
+			// accounted, so re-deriving over the waiter set folds in BOTH its RAM
+			// ledgerCharge() and its cores. Done here, before the next queued waiter is
+			// evaluated, so a later grant in this same pass reads this one at the
+			// fit-check above — exactly as the old `outstanding +=` did, now for two
+			// resources at once.
+			queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			if waiter.waited {
+				waiter.outcome = "waited"
+				waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
+			} else {
+				waiter.outcome = "immediate"
+			}
+			close(waiter.grantedCh)
+			continue
+		}
+		{
+			// Refused on capacity — RAM short OR CPU short — takes the same FIFO tail:
+			// record the RAM grantable figure and arm the AIRA-59 backfill freeze so a
+			// later smaller waiter cannot jump the head. noteGrantableLocked reports the
+			// RAM availability even for a CPU-only refusal — an honest RAM reading; S5
+			// adds no separate CPU diagnostic field (out of scope).
 			waiter.waited = true
-			// AIRA-149. THE ONLY SITE that may ever latch none-observed. The reading
-			// is taken over the `reserve > available` refusal ACTUALLY taken rather
-			// than reconstructed afterwards. Under declared-only accounting available
-			// is ceiling − Σreserve, so this is the single-ceiling capacity refusal
-			// (the AIRA-114 aggregate over-subscription bound was retired in S3).
-			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
+			// AIRA-149 contention latch, S5-aware. A RAM refusal (ramFits == false) is a
+			// fact about THIS slice's ledger, so it takes the honest solo reading — which
+			// may legitimately be none-observed (the residual-page case). A CPU refusal
+			// (ramFits but !cpuFits) latches `observed` directly: this slice's own cores
+			// are held, so something IS in the way by construction. (It would read
+			// `observed` via soloReadingLocked anyway — a CPU-full slice has
+			// outstandingJobs ≥ 1, so it is never provablyEmpty — but stating it here is
+			// the direct, intent-revealing guard against ever rendering a fabricated
+			// RAM-solitude diagnosis for a CPU refusal.) soloReadingLocked is the ONLY
+			// site that may latch none-observed, and only the RAM arm may reach it.
+			if ramFits {
+				waiter.joinContentionLocked(contentionObserved)
+			} else {
+				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
+			}
 			waiter.noteGrantableLocked(available)
 			queuedAhead++
 			// now is pass-start time, so a slow adopted-confine scan can defer this freeze by its duration.
@@ -2418,30 +2519,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			}
 			continue
 		}
-		// grantedAt is the one moment in this system that authoritatively marks
-		// "the daemon just decided this job may proceed". It is deliberately
-		// separate from enqueued (set once, at waiter creation): a waiter that
-		// queued for a long time under contention is granted here, now, and
-		// measuring its lease age from enqueued would conflate ordinary
-		// admission-queue contention with launch abandonment — the AIRA-49 v3
-		// defect. Nothing but this line may ever set it.
-		waiter.state = admitGranted
-		waiter.grantedAt = s.admitNowTime()
-		waiter.accounted = true
-		// The ledger is derived, not incremented: this waiter is now granted &&
-		// accounted, so re-deriving over the waiter set folds in its
-		// ledgerCharge() (its declared reserve, held for the lease's whole
-		// lifetime). Done here, after accounted is set and before the next queued
-		// waiter is evaluated, so a later grant in this same pass reads this one at
-		// the fit-check above -- exactly as the old `outstanding +=` did.
-		queue.outstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
-		if waiter.waited {
-			waiter.outcome = "waited"
-			waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
-		} else {
-			waiter.outcome = "immediate"
-		}
-		close(waiter.grantedCh)
 	}
 	// Log BEFORE clearing the diagnostics holder: a hold->yield transition is
 	// exactly the moment an operator wants to see WHICH waiter was being
@@ -2534,6 +2611,30 @@ func ledgerAvailable(maximum, outstanding, headroom int64) int64 {
 	return checkedAvailable(0, maximum, 0, outstanding, headroom)
 }
 
+// cpuCeiling is the CPU ceiling: 2 × NumCPU cores (design §7). It is an INTEGER
+// derived purely from the core count — no cgroup read, and no cpu.max is ever
+// written; the 2× over-provision caps admission busyness while the kernel
+// time-shares on cpu.weight. The core count comes through the cpuCoreCounter seam
+// so a test can pin a deterministic ceiling. This is the ONLY per-resource code
+// CPU adds — admit/available/fit/release/wake are otherwise resource-agnostic.
+//
+// The ceiling is applied PER SLICE against queue.cpuOutstanding (D1, resolved to
+// per-slice on the one-slice aira.slice assertion). Cores are a machine-wide
+// resource; a second concurrent slice would let Σ across slices exceed 2×NumCPU,
+// so if concurrent slices are ever introduced this must become machine-wide.
+func (s *Server) cpuCeiling() int64 {
+	return 2 * int64(s.cpuCoreCounter()())
+}
+
+// cpuAvailable is the signed CPU-ledger availability, the sibling of
+// checkedAvailable/ledgerAvailable for the CPU resource: ceiling − Σ(this slice's
+// live lease cores). Signed like the RAM ledger — a slice momentarily over its CPU
+// ceiling simply makes the next new admission wait. Cores are small integers, so
+// the subtraction cannot overflow.
+func cpuAvailable(ceiling, outstanding int64) int64 {
+	return ceiling - outstanding
+}
+
 func (s *Server) timeoutAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 	queue.mu.Lock()
 	if waiter.state != admitQueued {
@@ -2591,7 +2692,10 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 	// true rather than approximate. The grant and this release are the ledger's
 	// only two mutation points, both re-deriving through the one accessor under
 	// this lock.
-	queue.outstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+	// S5. Re-derives BOTH resources: the released lease's RAM (outstanding) and its
+	// cores (cpuOutstanding) drop together, so the per-slice CPU sum the fit-check
+	// reads returns the freed cores immediately on the next pass.
+	queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 	return true
 }
 
@@ -2605,6 +2709,11 @@ func (s *Server) afterAdmitRelease(queue *sliceQueue) {
 	// waiter immediately rather than at the next 250ms poll, so it is pinned by
 	// TestAfterAdmitReleaseKicksTheQueue (AIRA-33 deleted the test that used to
 	// carry that assertion alongside a governor one).
+	//
+	// S5: a CPU release is per-slice (D1, resolved to per-slice), exactly like a RAM
+	// release — it frees cores only in THIS slice's ledger, so kicking this queue is
+	// sufficient to wake its own CPU-blocked waiters. No cross-queue signal: there is
+	// no machine-wide CPU ledger for another slice to be waiting on.
 	queue.signal()
 	s.pruneAdmitQueue(queue)
 }
@@ -2849,13 +2958,14 @@ func admitErrorCode(err error) string {
 
 func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, error) {
 	// AIRA-185 widened the count to 13 and added `reason` to the allowlist below.
-	// Both are ADDITIVE: no existing field changed meaning, and no admission,
-	// gate or emptiness decision reads the new one.
-	if len(args) < 3 || len(args) > 13 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	// S5 widened it to 14 and added `cpu`. All are ADDITIVE: no existing field
+	// changed meaning, and (bar cpu, the second ledger resource) no admission, gate
+	// or emptiness decision reads the new ones.
+	if len(args) < 3 || len(args) > 14 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional cpu/signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
+		if name != "slice" && name != "reserve" && name != "cpu" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -2867,6 +2977,18 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	reserve, ok := exactAdmitInt64(args["reserve"])
 	if !ok || reserve < 0 || reserve > admitMaxReserve {
 		return admitRequest{}, fmt.Errorf("%s: admit reserve must be in [0,%d]", CodeProtocol, admitMaxReserve)
+	}
+	// S5. cpu is optional (absent → 0 cores, charged nothing). Only STRUCTURAL
+	// validation here — a non-integer or negative value is malformed. The
+	// machine-specific "impossible on this box" refusal (cpu > 2×NumCPU) is
+	// fail-fast in admitConnection, which has the core count; done there, exactly as
+	// reserve's RANGE is checked here but its CEILING is checked in admitConnection.
+	cpu := int64(0)
+	if raw, exists := args["cpu"]; exists {
+		cpu, ok = exactAdmitInt64(raw)
+		if !ok || cpu < 0 {
+			return admitRequest{}, fmt.Errorf("%s: admit cpu must be a non-negative integer", CodeProtocol)
+		}
 	}
 	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
 	if !ok {
@@ -3062,7 +3184,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3075,7 +3197,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// exclusive requires the tuple refused just above), and it is transcribed
 	// anyway so that relaxing either rule later cannot silently drop the field
 	// instead of failing a test.
-	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

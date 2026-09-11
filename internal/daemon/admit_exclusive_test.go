@@ -72,7 +72,7 @@ func seedRunningLease(queue *sliceQueue, seq int64) *admitWaiter {
 	lease := heldLedgerWaiter(seq, 1<<20)
 	queue.mu.Lock()
 	queue.waiters = append(queue.waiters, lease)
-	queue.outstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+	queue.outstanding, _, queue.outstandingJobs = rederiveLedgerLocked(queue)
 	queue.mu.Unlock()
 	return lease
 }
