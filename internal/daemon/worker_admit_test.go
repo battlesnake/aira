@@ -85,7 +85,12 @@ func startWorkerAdmit(t *testing.T, server *Server, args map[string]any) (Worker
 
 func sliceLedger(t *testing.T, server *Server, slicePath string) (outstanding, cpuOutstanding int64, jobs int) {
 	t.Helper()
+	// A concurrent worker handler (startWorkerAdmit runs workerAdmitConnection in
+	// its own goroutine) creates/deletes this map entry under admitRegistryMu, so
+	// the map read must hold that lock before dropping to the per-queue lock.
+	server.admitRegistryMu.Lock()
 	queue := server.admitQueues[slicePath]
+	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		return 0, 0, 0
 	}

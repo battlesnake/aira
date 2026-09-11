@@ -102,9 +102,16 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 // admission must be refused loudly (TestProtocolMismatchRefusesLoudly), while a
 // re-declare crosses versions by its magic ahead of this check
 // (TestOldClientReDeclareIsSniffedBeforeProtocolCheck).
+//
+// verifies: AIRA admission-counter S15 — the 10→11 bump. S15 rebuilt worker-admit
+// onto the signed ledger, changing the worker-admit wire's SHAPE (response gained
+// parent_scope_id / available_bytes / available_cpu) and its SEMANTICS (max_wait_ms
+// present-and-zero is now a non-blocking snapshot, not a speculative try-acquire).
+// An old proto-10 worker-admit client must be refused loudly, while the ARDR
+// re-declare still crosses versions by its magic.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 10 {
-		t.Fatalf("ProtocolVersion = %d, want 10; a wire-shape or wire-semantics change must "+
+	if ProtocolVersion != 11 {
+		t.Fatalf("ProtocolVersion = %d, want 11; a wire-shape or wire-semantics change must "+
 			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }

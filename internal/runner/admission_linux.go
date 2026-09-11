@@ -58,11 +58,13 @@ func (result admissionResult) releaseAdmission() {
 // package rather than derived — a bump on one side alone fails that test
 // instead of silently breaking admission negotiation (AIRA-83 item 3).
 //
-// Bumped 9→10 in LOCKSTEP with daemon.ProtocolVersion for the admission-counter
-// rebuild (S5 `cpu` admit arg + S7 signed ledger / version-frozen re-declare
-// frame). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two
-// drift.
-const DaemonProtocolVersion = 10
+// Bumped 9→10 for the admission-counter rebuild (S5 `cpu` admit arg + S7 signed
+// ledger / version-frozen re-declare frame), then 10→11 in LOCKSTEP with
+// daemon.ProtocolVersion for S15's worker-admit wire change (response gained
+// parent_scope_id / available_bytes / available_cpu; max_wait_ms present-and-zero
+// became a non-blocking snapshot). TestRunnerDaemonProtocolVersionMatchesTheDaemon
+// fails if the two drift.
+const DaemonProtocolVersion = 11
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20
