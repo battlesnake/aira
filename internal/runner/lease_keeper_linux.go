@@ -258,7 +258,13 @@ func (k *leaseKeeper) reconnectAndReDeclare() bool {
 		default: // reDeclareRetry
 			noAck++
 			if noAck >= k.maxNoAck {
-				log.Printf("aira: lease keeper: re-declare for scope %q got no ack after %d connected attempts; giving up reconnect — the job keeps running under its cgroup cap (never fell open)", k.scopeID, noAck)
+				// Give-up honesty (concurrency review): the job's SAFETY is intact — its
+				// connection stays closed and it runs under its own cgroup cap, so it never
+				// falls open to an ungoverned launch. But the daemon LEDGER CHARGE is not
+				// restored: nothing re-declares this lease after give-up, so the daemon
+				// UNDER-COUNTS this slice until the job ends (the memory watchdog / OOM
+				// killer is the backstop for the resulting over-admit). Accepted gap.
+				log.Printf("aira: lease keeper: re-declare for scope %q got no ack after %d connected attempts; giving up reconnect. The job keeps running under its cgroup cap (never falls open), but its reserve is no longer counted in the daemon ledger until it ends — the slice is under-counted, with the memory watchdog as the backstop.", k.scopeID, noAck)
 				return false
 			}
 			if k.sleepOrStopped(k.reconnectGap) {

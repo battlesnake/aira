@@ -2070,9 +2070,9 @@ func leaseByScopeIDLocked(queue *sliceQueue, scopeID string) *admitWaiter {
 // anchorLeaseLocked (re-)anchors w to conn (design §3, Inv 4). It is the ONE place a
 // lease is anchored, called identically for a fresh insert and for a re-declare
 // re-anchor, so the anchor identity is established uniformly. It overwrites the anchor
-// connection, records the peer pid and process start-tick the restart dump (S10) and
-// reload+kill-probe (S11) need, and clears unanchored (a reloaded lease is anchored the
-// moment a live connection re-declares it, §4).
+// connection and records the peer pid and process start-tick (diagnostic identity of the
+// anchoring connection's peer since S13 deleted the dump/reload/kill-probe layer that
+// used to read them back).
 //
 // It MUST run inside enqueueAdmitInternal's queue.mu critical section, atomically with
 // the idempotent SET: the overwrite and the SET being one critical section is what makes
@@ -2906,11 +2906,11 @@ func releaseAdmitWaiterLockedAnchored(queue *sliceQueue, waiter *admitWaiter, co
 	if waiter.state == admitReleased {
 		return false
 	}
-	// conn == nil guards the reloaded-lease case (S11): a lease reloaded from a restart
-	// dump is seeded with anchor == nil until a live connection re-declares it, so a
-	// nil conn passed here must NEVER match a nil anchor and release an un-re-declared
-	// lease. No current caller passes nil, but this makes the illegal match
-	// unrepresentable before S11 introduces nil-anchor leases.
+	// conn == nil is refused defensively: an anchored compare-and-release must match a
+	// REAL connection, never release on a nil==nil coincidence. Since S13 deleted the
+	// dump/reload layer every granted lease is anchored to a live connection (no nil
+	// anchors exist), so this is belt-and-braces rather than a reachable guard, but it
+	// keeps the illegal nil match unrepresentable.
 	if conn == nil || waiter.anchor != conn {
 		return false
 	}
