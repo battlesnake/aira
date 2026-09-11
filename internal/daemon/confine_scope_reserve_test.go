@@ -292,8 +292,9 @@ func TestConfineListNamesAdoptedScopeReserves(t *testing.T) {
 	if *record.ReserveBytes != queue.adopted {
 		t.Fatalf("adopted reserve=%d, want the reconstruction the ledger charges: %d", *record.ReserveBytes, queue.adopted)
 	}
-	// It is a reconstruction from LIVE USAGE, never the cap: adopting a delegate
-	// or warm scope's whole cap is the over-reservation AIRA-74/AIRA-29 removed.
+	// It is a reconstruction from LIVE USAGE, never the cap: adopting a DELEGATE
+	// scope's whole cap (an AIRA-15 containment ceiling, not a whole-job
+	// reservation) would be the over-reservation the AIRA-74 reconstruction avoids.
 	if *record.ReserveBytes >= capBytes {
 		t.Fatalf("adopted reserve=%d reached the %d cap; the reconstruction is usage+margin, not the ceiling", *record.ReserveBytes, int64(capBytes))
 	}

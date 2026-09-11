@@ -64,8 +64,7 @@ const (
 	// slice. See admit_oversubscription.go for the whole mechanism.
 	//
 	// 2x rather than a tighter figure because the bound exists to make the worst
-	// case a KNOWN MULTIPLE, not to re-impose the frozen Sigma(reserve) <= ceiling
-	// rule AIRA-29 deliberately removed. Measured against the real slice: two
+	// case a KNOWN MULTIPLE of the ceiling. Measured against the real slice: two
 	// 28 GiB merge-gate caps plus a 48 GiB delegate suite total 104 GiB on a
 	// 64 GiB slice, which this admits; a fourth large job does not fit and waits,
 	// which is exactly the case the residual named. A factor at or below 1 is
@@ -292,8 +291,8 @@ type admitWaiter struct {
 
 	// AIRA-149. DIAGNOSIS ONLY: neither field is read by any admission or grant
 	// decision, and both are written ONLY inside evaluateAdmitQueue's existing
-	// refusal branches, under queue.mu -- the same discipline as the AIRA-29
-	// charge fields above.
+	// refusal branches, under queue.mu -- the same single-writer discipline as
+	// every other evaluator-maintained field on this struct.
 	//
 	// contention is LATCHED ACROSS THE WHOLE WAIT, never sampled at the instant
 	// of rejection, and that is the point of it existing at all: a waiter blocked
@@ -888,12 +887,11 @@ type admitRequest struct {
 	// here so the waiter can be constructed with it already set, under queue.mu.
 	//
 	// It used to be assigned onto the waiter AFTER enqueue, with no lock held,
-	// while the evaluator goroutine was already free to read that waiter. AIRA-29
-	// worked around the resulting race by never reading the field; AIRA-114 must
-	// read it (a delegate scope's memory.max is its scope ceiling, not its pinned
-	// framework reserve, and that is the largest cap population on the machine),
-	// so the write moves to where every other waiter field is written instead of
-	// the read being contorted around it.
+	// while the evaluator goroutine was already free to read that waiter. The
+	// AIRA-114 aggregate accounting reads it (a delegate scope's memory.max is its
+	// scope ceiling, not its pinned framework reserve, and that is the largest cap
+	// population on the machine), so the write moves to where every other waiter
+	// field is written instead of the read being contorted around it.
 	scopeCeiling int64
 }
 
@@ -1262,7 +1260,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// An absent queue positively establishes that nothing is WAITING and that
 		// there is no exclusive holder — the diagnostics half (queued/phase) is a
 		// genuine idle zero and callers render it as such. But it says NOTHING
-		// about the granted/adopted LEDGER: AIRA-29 adoption of already-running
+		// about the granted/adopted LEDGER: restart adoption of already-running
 		// jobs happens only inside evaluateAdmitQueue, and pruneAdmitQueue deletes
 		// the queue (adopted ledger included) once nothing is connection-held, so
 		// an absent queue is exactly "the ledger was never built or has been

@@ -502,12 +502,12 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		s.runSliceCeiling(sliceCeilingCtx, sliceCeilingMode, sliceCeilingInterval, sliceCeilingRuntimeDeps)
 	}()
 	// AIRA-113. The dynamic oom_score_adj steering loop. Deliberately NOT beside
-	// the two above on their shared cadence: it must sample faster than the
-	// admission charge refresh to see the burst the ledger has not yet absorbed,
-	// which is the whole reason AIRA-29 could not fold it into the admit scan.
-	// Like the ceiling it holds no admission lock while it works, and unlike the
-	// watchdog it never signals anything -- it only changes which process the
-	// kernel would prefer if an OOM happened anyway.
+	// the two above on their shared cadence: it must sample memory.current faster
+	// than a burst can drive the slice into an OOM, and the admission scan reads
+	// only declared reserves, so folding it into the admit scan would sample too
+	// slowly to catch the over-use. Like the ceiling it holds no admission lock
+	// while it works, and unlike the watchdog it never signals anything -- it only
+	// changes which process the kernel would prefer if an OOM happened anyway.
 	steerCtx, cancelOOMSteer := context.WithCancel(ctx)
 	steerDone := make(chan struct{})
 	steerRuntimeDeps := oomSteerDeps{}
