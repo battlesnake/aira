@@ -2191,12 +2191,16 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 					return nil, nil, CodeProtocol, fmt.Errorf("%s: re-declare peer is not the lease owner", CodeProtocol)
 				}
 				// P2-D: an exclusive lease is LOST on reconnect — the client reports
-				// exclusive=lost and does NOT re-declare it. A re-declare that carries
-				// exclusive is therefore a protocol violation: refuse it rather than
-				// silently re-anchor it as a non-exclusive lease (which would also slip
-				// past the single-exclusive-per-slice guard below, since the SET returns
-				// before reaching it).
-				if request.exclusive {
+				// exclusive=lost and does NOT re-declare it. Refuse the re-declare if
+				// EITHER side is exclusive: `request.exclusive` (a request that claims it)
+				// OR `existing.exclusive` (the live lease IS exclusive). The lease-side
+				// check is the REACHABLE one on the S9 ARDR path — the frame has no
+				// exclusive field, so request.exclusive is always false there; without the
+				// existing.exclusive guard a non-exclusive re-declare would silently
+				// re-anchor a live exclusive holder, transferring the slice-wide HOLD to a
+				// connection that never asked for it (and slipping past the
+				// single-exclusive-per-slice guard below, since the SET returns first).
+				if request.exclusive || existing.exclusive {
 					return nil, nil, CodeProtocol, fmt.Errorf("%s: an exclusive lease is never re-declared (exclusive=lost on reconnect)", CodeProtocol)
 				}
 				// Idempotent SET of the resource vector + re-anchor to the new
@@ -2882,7 +2886,12 @@ func releaseAdmitWaiterLockedAnchored(queue *sliceQueue, waiter *admitWaiter, co
 	if waiter.state == admitReleased {
 		return false
 	}
-	if waiter.anchor != conn {
+	// conn == nil guards the reloaded-lease case (S11): a lease reloaded from a restart
+	// dump is seeded with anchor == nil until a live connection re-declares it, so a
+	// nil conn passed here must NEVER match a nil anchor and release an un-re-declared
+	// lease. No current caller passes nil, but this makes the illegal match
+	// unrepresentable before S11 introduces nil-anchor leases.
+	if conn == nil || waiter.anchor != conn {
 		return false
 	}
 	return releaseAdmitWaiterLocked(queue, waiter)

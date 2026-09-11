@@ -190,13 +190,14 @@ func TestReconnectRaceBothLockOrders(t *testing.T) {
 	})
 }
 
-// TestReanchorThenStaleReleaseAcrossThreeConnections is the lost-lease-race pin that the
-// monotone-generation design could NOT express. With a generation, the releasing
-// connection captured "its" generation in a critical section separate from the SET that
-// bumped it, so a connection that had been superseded could observe a later generation
-// and discharge a live lease. Conn-identity compare-and-release has no capture: connA,
-// then B re-declares, then C re-declares. Both A's and B's later EOFs must be no-ops (C
-// is the anchor); only C's EOF discharges. Dropping the anchor compare reds here.
+// TestReanchorThenStaleReleaseAcrossThreeConnections is the anchor-compare regression pin
+// across a supersession chain: connA, then B re-declares, then C re-declares. Both A's and
+// B's later EOFs must be no-ops (C is the anchor); only C's EOF discharges. Dropping the
+// anchor compare reds here. (It is not a "capture window" witness: conn-identity
+// compare-and-release has no capture step to race — the guarantee is structural, the fix
+// for the monotone-generation design whose separate capture-vs-SET critical sections could
+// let a superseded connection discharge a live lease. This test pins that the structural
+// guarantee holds across a multi-supersession chain.)
 func TestReanchorThenStaleReleaseAcrossThreeConnections(t *testing.T) {
 	server := anchorTestServer()
 	queue, lease, connA := grantedAnchorLease(server, "CONFINE-job-9-jjjj", 2*gib)
@@ -274,29 +275,54 @@ func TestSETGatesOnGrantedNotRejected(t *testing.T) {
 }
 
 // TestReDeclareExclusiveRefused pins P2-D: an exclusive lease is lost on reconnect and
-// is never re-declared, so a re-declare carrying exclusive is a protocol violation —
-// refused rather than silently re-anchored as a non-exclusive lease. Dropping the
-// explicit exclusive refuse on the SET path reds here (the SET would return the lease
-// re-anchored, err nil).
+// is never re-declared, so the SET path refuses a re-declare if EITHER side is exclusive.
+// Two directions, because the reachable one differs from the obvious one: the ARDR frame
+// carries no exclusive field, so on the real S9 path request.exclusive is ALWAYS false —
+// the lease-side (existing.exclusive) guard is the one that actually fires. Dropping
+// either half lets a live exclusive holder be silently re-anchored (its slice-wide HOLD
+// transferred to a connection that never asked for it).
 func TestReDeclareExclusiveRefused(t *testing.T) {
-	server := anchorTestServer()
-	queue, lease, connA := grantedAnchorLease(server, "CONFINE-job-11-llll", 2*gib)
-
-	_, got, code, err := server.enqueueResolvedConfineAdmit("/slice", 2*gib, "pinned:client", 64*gib, admitRequest{
-		scopeID: "CONFINE-job-11-llll", name: "job", owner: "session-a", cpu: 1, peerSameUID: true, exclusive: true, conn: testAnchorConn(),
+	t.Run("request claims exclusive", func(t *testing.T) {
+		server := anchorTestServer()
+		queue, lease, connA := grantedAnchorLease(server, "CONFINE-job-11-llll", 2*gib)
+		_, got, code, err := server.enqueueResolvedConfineAdmit("/slice", 2*gib, "pinned:client", 64*gib, admitRequest{
+			scopeID: "CONFINE-job-11-llll", name: "job", owner: "session-a", cpu: 1, peerSameUID: true, exclusive: true, conn: testAnchorConn(),
+		})
+		if err == nil || code != CodeProtocol {
+			t.Fatalf("an exclusive re-declare must be refused with %s, got code=%q err=%v", CodeProtocol, code, err)
+		}
+		if got != nil {
+			t.Fatalf("a refused exclusive re-declare must return no waiter")
+		}
+		if lease.anchor != connA {
+			t.Fatalf("a refused exclusive re-declare must leave the lease anchored to A")
+		}
+		if n := len(queue.waiters); n != 1 {
+			t.Fatalf("a refused exclusive re-declare must not add a waiter: %d", n)
+		}
 	})
-	if err == nil || code != CodeProtocol {
-		t.Fatalf("an exclusive re-declare must be refused with %s, got code=%q err=%v", CodeProtocol, code, err)
-	}
-	if got != nil {
-		t.Fatalf("a refused exclusive re-declare must return no waiter")
-	}
-	if lease.anchor != connA {
-		t.Fatalf("a refused exclusive re-declare must leave the lease anchored to A")
-	}
-	if n := len(queue.waiters); n != 1 {
-		t.Fatalf("a refused exclusive re-declare must not add a waiter: %d", n)
-	}
+	t.Run("lease is exclusive, request is not (the reachable S9 case)", func(t *testing.T) {
+		server := anchorTestServer()
+		queue, lease, connA := grantedAnchorLease(server, "CONFINE-job-12-mmmm", 2*gib)
+		lease.exclusive = true // a live exclusive holder
+		// A non-exclusive re-declare (exactly what an ARDR frame produces) must NOT
+		// re-anchor the exclusive lease onto the new connection.
+		_, got, code, err := server.enqueueResolvedConfineAdmit("/slice", 2*gib, "pinned:client", 64*gib, admitRequest{
+			scopeID: "CONFINE-job-12-mmmm", name: "job", owner: "session-a", cpu: 1, peerSameUID: true, exclusive: false, conn: testAnchorConn(),
+		})
+		if err == nil || code != CodeProtocol {
+			t.Fatalf("a re-declare onto a live EXCLUSIVE lease must be refused with %s, got code=%q err=%v", CodeProtocol, code, err)
+		}
+		if got != nil {
+			t.Fatalf("a refused re-declare must return no waiter")
+		}
+		if lease.anchor != connA || !lease.exclusive {
+			t.Fatalf("a refused re-declare must leave the exclusive lease anchored to A and still exclusive: anchored-to-A=%v exclusive=%v", lease.anchor == connA, lease.exclusive)
+		}
+		if n := len(queue.waiters); n != 1 {
+			t.Fatalf("a refused re-declare must not add a waiter: %d", n)
+		}
+	})
 }
 
 // TestReDeclareSameUIDGate pins the SO_PEERCRED same-uid gate on the re-anchoring SET

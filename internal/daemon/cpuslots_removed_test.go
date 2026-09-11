@@ -77,10 +77,17 @@ func TestS6CPUSlotsGovernorFullyRemovedFromSource(t *testing.T) {
 // in the S6 code comment + the BUILT (S6) plan record.
 //
 // This test makes that window a CHECKED fact rather than a silent hole: worker_admit.go
-// references none of the ledger's CPU symbols. S15 (which rebuilds worker-admit onto the
-// signed ledger and charges CPU there) will introduce one of them and RED this guard —
-// which is the signal to DELETE this test, the §S15.3 inversion pattern. It is NOT a
-// claim that no CPU bound is desirable; it is the honest record that there is none yet.
+// references none of the ledger's CPU-governance symbols. It reds IF S15 wires the CPU
+// charge INTO worker_admit.go directly.
+//
+// LIMITATION (honest): S15 may instead charge CPU by routing worker-admit through
+// enqueueResolvedConfineAdmit with a populated admitRequest.cpu — in which case
+// worker_admit.go gains no such token and this guard stays GREEN while the window is
+// closed, leaving the interim comments falsely standing. So this guard is a best-effort
+// tripwire, NOT a reliable closure detector. The AUTHORITATIVE closure signal is the
+// plan's §S15 standing instruction to DELETE this test and the two interim comments
+// (worker_admit.go + admission_linux.go) when S15 lands. It is not a claim that no CPU
+// bound is desirable; it is the honest record that there is none yet.
 func TestS6InterimWorkerAdmitCPUUnbounded(t *testing.T) {
 	data, err := os.ReadFile("worker_admit.go")
 	if err != nil {
@@ -88,14 +95,16 @@ func TestS6InterimWorkerAdmitCPUUnbounded(t *testing.T) {
 	}
 	body := string(data)
 	// The ledger's CPU-governance symbols (S5). Their ABSENCE from worker_admit.go is the
-	// interim window. The S6 explanatory comment in that file deliberately avoids these
-	// literal tokens, so the guard keys on a real call/field, not prose about its own
-	// absence.
-	for _, token := range []string{"cpuOutstanding", "cpuCeiling(", "cpuFits"} {
+	// interim window. `cpuFits` is NOT checked — it is a local in admit.go, not an API
+	// symbol worker-admit would reference. The S6 explanatory comment in worker_admit.go
+	// deliberately avoids these literal tokens, so the guard keys on a real call/field,
+	// not prose about its own absence.
+	for _, token := range []string{"cpuOutstanding", "cpuCeiling("} {
 		if strings.Contains(body, token) {
 			t.Fatalf("worker_admit.go now references %q: worker-admit appears to charge CPU against the ledger. "+
-				"If this is S15 closing the S6->S15 interim window, DELETE this witness test (it has done its job). "+
-				"If not, the interim-window documentation in this file and worker_admit.go is now stale and must be corrected.", token)
+				"If this is S15 closing the S6->S15 interim window, DELETE this witness test AND the interim "+
+				"comments in worker_admit.go + admission_linux.go (the §S15 standing instruction). "+
+				"If not, the interim-window documentation is now stale and must be corrected.", token)
 		}
 	}
 }
