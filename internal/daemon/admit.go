@@ -58,20 +58,6 @@ const (
 	// its full cap instead, because there the cap IS the admission estimate.
 	delegateRAMAdoptionMargin int64 = 64 << 20
 
-	// AIRA-114. oversubscriptionFactorPctDefault bounds the AGGREGATE of every
-	// live scope's own memory.max against the slice ceiling, expressed as a
-	// percentage of that ceiling: 200 means the caps may total at most 2x the
-	// slice. See admit_oversubscription.go for the whole mechanism.
-	//
-	// 2x rather than a tighter figure because the bound exists to make the worst
-	// case a KNOWN MULTIPLE of the ceiling. Measured against the real slice: two
-	// 28 GiB merge-gate caps plus a 48 GiB delegate suite total 104 GiB on a
-	// 64 GiB slice, which this admits; a fourth large job does not fit and waits,
-	// which is exactly the case the residual named. A factor at or below 1 is
-	// REFUSED by the parser, because a single job whose reserve reaches the
-	// ceiling must always fit an empty slice.
-	oversubscriptionFactorPctDefault int64 = 200
-
 	// admitExclusiveWaitCeilingDefault bounds how long an EXCLUSIVE request may
 	// drain the slice. It is deliberately far below the shared 24-hour
 	// AdmitWaitCeiling: an exclusive request holds up every other session on this
@@ -173,8 +159,8 @@ type admitWaiter struct {
 	owner     string
 	// scopeCeiling is the delegate-ram scope's resolved memory.max (AIRA-15),
 	// zero for every other class. Set at construction under queue.mu — see
-	// admitRequest.scopeCeiling for why that moved — so the evaluator may read
-	// it, which AIRA-114's aggregate accounting needs.
+	// admitRequest.scopeCeiling for why that moved — and carried to the launcher
+	// on the grant response (AdmitResponse.ScopeCeiling) so it sizes the scope cap.
 	scopeCeiling int64
 
 	// AIRA-108. A BOUNDED copy of the client's own resource signature, retained
@@ -534,8 +520,8 @@ func (w *admitWaiter) noteGrantableLocked(available int64) {
 // soloReadingLocked is the emptiness reading for ONE refusal pass. queue.mu must
 // be held.
 //
-// It is derived STRUCTURALLY, from the subtree-aware population AIRA-101 and
-// AIRA-114 already maintain, and deliberately NOT from the reserve counters
+// It is derived STRUCTURALLY, from the subtree-aware population AIRA-101
+// already maintains, and deliberately NOT from the reserve counters
 // (outstandingJobs / adoptedJobs). The comment above the adopted loop says why
 // in its own words: that loop skips leaf-unpopulated scopes, connection-held
 // ones, nil/malformed caps and delegate-without-usable-RSS ones, and every one
@@ -555,32 +541,18 @@ func (w *admitWaiter) noteGrantableLocked(available int64) {
 // never bytes.
 //
 // One bounded gap, named rather than engineered around: the scan behind
-// liveScopes/capAggregate is rate-limited to at most once per second
+// liveScopes is rate-limited to at most once per second
 // (queue.adoptedAt), so a single pass can read a scope population up to that
 // stale. Over a multi-second wait every pass would have to miss the same
 // neighbour for a false `none-observed`, and it is the identical staleness
 // AIRA-101 already accepts for the strictly more consequential decision of
 // GRANTING exclusivity.
-func soloReadingLocked(queue *sliceQueue, queuedAhead int, overSubscribed bool) int {
+func soloReadingLocked(queue *sliceQueue, queuedAhead int) int {
 	// A failing confine scan cannot establish solitude. Fail closed, and ALWAYS
 	// first: an unestablished reading outranks every "looks empty" test below it,
 	// so a single such pass forbids the solo claim for the whole wait.
 	if !queue.liveScopesKnown {
 		return contentionUnevaluated
-	}
-	// The disjunct actually taken. An aggregate refusal is by construction a
-	// refusal caused by OTHER scopes' caps.
-	if overSubscribed {
-		return contentionObserved
-	}
-	// Belt and braces on the same scanned population, for the ordinary disjunct:
-	// a nonzero established aggregate means aggregateScopeCap saw live scopes.
-	// It should never be the deciding test -- every scope it counts is also
-	// counted by liveScopes -- and it is kept because it costs one comparison on
-	// a refusal path and makes the AIRA-114 population's contribution to the
-	// claim legible at the site rather than inferable.
-	if queue.capAggregateKnown && queue.capAggregate > 0 {
-		return contentionObserved
 	}
 	if !sliceProvablyEmpty(queue) {
 		return contentionObserved
@@ -808,30 +780,6 @@ type sliceQueue struct {
 	liveScopes      int
 	liveScopesKnown bool
 
-	// AIRA-114. The aggregate over-subscription accounting: the sum of every
-	// live scope's own local memory.max across this slice, and whether that sum
-	// could be established. Both are written only under queue.mu.
-	//
-	// It is a THIRD reading, separate from the reserve ledger above it and from
-	// liveScopes beside it, and the separation is the point: adopted/adoptedJobs
-	// skip leaf-unpopulated and non-finite-cap scopes on purpose, which is
-	// correct for RESERVE accounting and would silently under-count exactly the
-	// largest caps on the machine here. See admit_oversubscription.go.
-	//
-	// capAggregate is re-derived from scratch by every successful scan and
-	// incremented at each grant, so it stays current between scans; the derive is
-	// authoritative and any drift is bounded by one scan interval.
-	//
-	// capAggregateKnown is the fail-OPEN half. It is false whenever the scan
-	// failed or some live scope's cap and usage were both unreadable, and the
-	// bound then withholds nothing at all — the opposite of liveScopesKnown, for
-	// the reason given on oversubscriptionBlocks.
-	capAggregate      int64
-	capAggregateKnown bool
-	// capBlockedLogged is the last state reported, so the bound is logged as a
-	// transition rather than on every pass.
-	capBlockedLogged bool
-
 	// scanFailingSince anchors how long the confine scan has been failing, in the
 	// same derive-from-one-anchor shape as freezeArmedAt. It exists so a drain can
 	// ABORT rather than stall the whole shared slice: with the fail-closed rule
@@ -923,11 +871,9 @@ type admitRequest struct {
 	// here so the waiter can be constructed with it already set, under queue.mu.
 	//
 	// It used to be assigned onto the waiter AFTER enqueue, with no lock held,
-	// while the evaluator goroutine was already free to read that waiter. The
-	// AIRA-114 aggregate accounting reads it (a delegate scope's memory.max is its
-	// scope ceiling, not its pinned framework reserve, and that is the largest cap
-	// population on the machine), so the write moves to where every other waiter
-	// field is written instead of the read being contorted around it.
+	// while the evaluator goroutine was already free to read that waiter. It is
+	// set where every other waiter field is written, under queue.mu, rather than
+	// contorting a later lock-free assignment around a concurrent read.
 	scopeCeiling int64
 }
 
@@ -997,32 +943,6 @@ func pctClamp(value, pct int64) int64 {
 		return value / 100 * pct
 	}
 	return value * pct / 100
-}
-
-// confineRecordCap decodes ConfineRecord.Cap's three-way reading. The scan
-// writes exactly three shapes (confine_manage_linux.go): nil when memory.max
-// could not be read or did not parse, the literal "max" for a scope with no
-// local cap, and a canonical decimal otherwise. They mean different things and
-// a caller (the AIRA-114 aggregate-cap accounting) must not fuse them:
-//
-//   - known=false: the enforced ceiling is UNKNOWN. Treating that as "no clamp"
-//     would be a fabricated reading.
-//   - known=true, finite=false: positively established that nothing caps this
-//     scope locally, so there is nothing to clamp to.
-//   - known=true, finite=true: the enforced ceiling.
-func confineRecordCap(record runner.ConfineRecord) (value int64, finite, known bool) {
-	if record.Cap == nil {
-		return 0, false, false
-	}
-	raw := strings.TrimSpace(*record.Cap)
-	if raw == "max" {
-		return 0, false, true
-	}
-	parsed, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || parsed < 0 {
-		return 0, false, false
-	}
-	return parsed, true, true
 }
 
 func addJobCountClamp(a, b int) int {
@@ -1096,16 +1016,6 @@ type admitSnapshot struct {
 	//
 	// Zero is "not established", on the same discipline as the position.
 	queuedReserveBytes int64
-
-	// AIRA-114. The aggregate of live scope caps and whether it is established,
-	// taken from the same locked pass as everything else so an operator is never
-	// shown a cap total from one instant beside a ledger from another.
-	//
-	// capAggregateKnown false means UNEVALUATED, and a renderer must say so
-	// rather than print the zero: the bound withholds nothing in that state, and
-	// showing "0" would read as an idle slice.
-	capAggregate      int64
-	capAggregateKnown bool
 
 	// AIRA-68. outstandingJobs fuses TWO structurally different populations, and
 	// the reported job total adds a third — while `confine --list`'s table above
@@ -1313,7 +1223,6 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	snapshot := admitSnapshot{
 		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
 		adopted: queue.adopted, adoptedJobs: queue.adoptedJobs,
-		capAggregate: queue.capAggregate, capAggregateKnown: queue.capAggregateKnown,
 		phase: phase, present: true,
 		scopeReserves: make(map[string]int64, len(queue.waiters)+len(queue.adoptedScopes)),
 	}
@@ -2178,12 +2087,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// clearing the KNOWN bit is what makes the exclusive gate fail closed
 			// rather than reading a stale emptiness as current fact.
 			queue.liveScopesKnown = false
-			// AIRA-114. The same treatment for the aggregate cap, with the OPPOSITE
-			// consequence: clearing this bit makes the over-subscription bound
-			// withhold nothing while the scan is failing. A bound that stalled a
-			// machine-wide slice because a cgroup directory could not be read would
-			// be an outage caused by a diagnostic.
-			queue.capAggregateKnown = false
 			// Arm the abort anchor on the FIRST failure while it is zero, and never
 			// renew it on later failures. Arming only after a prior success would
 			// never fire in this rule's own primary case — a slice unreadable from
@@ -2329,12 +2232,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queue.adoptedJobs = adoptedJobs
 			queue.adoptedScopes = adoptedScopes
 			queue.adoptedScanFailed = false
-			// AIRA-114. The aggregate cap accounting, derived from the SAME
-			// successful scan and from the very maps built above, but deliberately
-			// NOT from the adopted totals: that loop's leaf-Populated and
-			// finite-cap skips are correct for reserve accounting and would make
-			// this bound fail to bind. See admit_oversubscription.go.
-			queue.capAggregate, queue.capAggregateKnown = s.aggregateScopeCap(queue, scanResult.Scopes, present, held)
 		}
 	}
 	readMemory := s.memoryReader()
@@ -2401,12 +2298,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// job's own hard scope cap, so a job too large for the throttled ceiling must
 	// WAIT here rather than be refused there.
 	effectiveMaximum := s.admitEffectiveMaximum(queue.path, maximum)
-	// AIRA-114. The aggregate over-subscription limit for this pass, taken from
-	// the same effective maximum the reserve check uses so the two gates cannot
-	// disagree about the size of the slice at this instant. Zero when the bound
-	// is disabled.
-	oversubLimit := s.oversubscriptionLimit(effectiveMaximum)
-	oversubBlocked := false
 	frozen := false
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
@@ -2435,7 +2326,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// time the AIRA-101 Exclusive arm wins the wording, but a stored false
 			// claim is still the wrong value.
 			if gate.draining != nil && waiter == gate.draining {
-				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, false))
+				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 			} else {
 				waiter.joinContentionLocked(contentionObserved)
 			}
@@ -2450,31 +2341,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// AIRA-149. `frozen` is only ever set by a waiter AHEAD in this same
 			// pass that was refused on capacity, so queuedAhead is already >= 1 and
 			// the shared reading cannot return none-observed here.
-			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, false))
+			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 			waiter.noteGrantableLocked(available)
 			queuedAhead++
 			continue
 		}
-		// AIRA-114. The aggregate bound is folded into the SAME branch as the
-		// reserve check rather than given its own `continue` above, and that is
-		// load-bearing. Both are capacity refusals, so both must arm the AIRA-59
-		// fairness freeze: a head held back by the aggregate while smaller-capped
-		// waiters behind it kept being admitted is backfill starvation, exactly
-		// what that duty cycle exists to stop. (The exclusivity gate's separate
-		// `continue` above is not comparable — during a drain there is no backfill
-		// to stop.)
-		overSubscribed := s.oversubscriptionBlocks(queue, waiter, oversubLimit)
-		if overSubscribed {
-			oversubBlocked = true
-		}
-		if waiter.reserve > available || overSubscribed {
+		if waiter.reserve > available {
 			waiter.waited = true
-			// AIRA-149. THE ONLY SITE that may ever latch none-observed, and only on
-			// the `reserve > available` disjunct: overSubscribed is passed into the
-			// reading as computed just above, so an aggregate refusal short-circuits
-			// to observed and the reading is taken over the disjunct ACTUALLY taken
-			// rather than reconstructed afterwards.
-			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, overSubscribed))
+			// AIRA-149. THE ONLY SITE that may ever latch none-observed. The reading
+			// is taken over the `reserve > available` refusal ACTUALLY taken rather
+			// than reconstructed afterwards. Under declared-only accounting available
+			// is ceiling − Σreserve, so this is the single-ceiling capacity refusal
+			// (the AIRA-114 aggregate over-subscription bound was retired in S3).
+			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 			waiter.noteGrantableLocked(available)
 			queuedAhead++
 			// now is pass-start time, so a slow adopted-confine scan can defer this freeze by its duration.
@@ -2524,16 +2403,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// waiter is evaluated, so a later grant in this same pass reads this one at
 		// the fit-check above -- exactly as the old `outstanding +=` did.
 		queue.outstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
-		// AIRA-114. Keep the aggregate current WITHIN a pass and between scans.
-		// The derive above runs at most once a second; without this increment a
-		// burst of grants in one pass would each be measured against the same
-		// stale total and could clear the bound together — the multi-grant
-		// overshoot the bound exists to prevent. Only maintained while the total
-		// is established, because an increment onto an unestablished number would
-		// manufacture one. The next successful scan re-derives it from scratch.
-		if queue.capAggregateKnown && waiter.contributesScopeCap() {
-			queue.capAggregate = addClamp(queue.capAggregate, waiter.prospectiveScopeCap())
-		}
 		if waiter.waited {
 			waiter.outcome = "waited"
 			waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
@@ -2548,21 +2417,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	if maxHold > 0 && phase != queue.freezeLogged {
 		s.logAdmitFreezeTransition(queue, phase, now)
 		queue.freezeLogged = phase
-	}
-	// AIRA-114. Report the bound as a TRANSITION, never per pass: the evaluator
-	// runs at up to 4/s, so a steady-state line would itself be a regression on a
-	// busy box. This is the same reasoning as logAdmitFreezeTransition, and it
-	// exists for the AIRA-71 lesson — a silent admission wait reads to its victim
-	// as a hang, and this change adds a new reason to wait.
-	if oversubBlocked != queue.capBlockedLogged {
-		if oversubBlocked {
-			log.Printf("aira daemon: admission aggregate over-subscription bound reached on %s: live scope caps total %d of %d limit (%d%% of ceiling); waiters hold until a job exits",
-				queue.path, queue.capAggregate, oversubLimit, s.oversubscriptionFactorPct)
-		} else {
-			log.Printf("aira daemon: admission aggregate over-subscription bound cleared on %s: live scope caps total %d of %d limit",
-				queue.path, queue.capAggregate, oversubLimit)
-		}
-		queue.capBlockedLogged = oversubBlocked
 	}
 	if !frozen {
 		// The head fitted, was granted, or left. Clear only the DIAGNOSTICS seq —

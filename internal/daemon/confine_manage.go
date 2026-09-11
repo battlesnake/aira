@@ -264,13 +264,6 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				CeilingHeld:        ceiling.Held,
 				CeilingStaticBytes: ceiling.StaticMax,
 				MemAvailableBytes:  ceiling.MemAvailable,
-				// AIRA-114. From the SAME snapshot and the SAME ceiling reading the
-				// evaluator's own gate uses, so this line can never describe a
-				// different instant or a different slice size than the decision it
-				// explains.
-				CapAggregateBytes: snapshot.capAggregate,
-				CapAggregateKnown: snapshot.capAggregateKnown,
-				CapBoundBytes:     s.oversubscriptionLimit(ceilingMaximum),
 			}
 			// AIRA-127. The system-and-slice frame `aira top` draws its RAM bar
 			// in, from the SAME reading whose `ok` gates this whole struct plus

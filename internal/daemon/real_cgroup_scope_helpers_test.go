@@ -17,9 +17,9 @@ import (
 // base 36 or the scanner omits the scope entirely and the caller would silently
 // prove nothing.
 //
-// Shared by the real-cgroup anti-INERT tests (AIRA-114 oversubscription and the
-// oom-steerer). Lives in its own helper file so those tests do not depend on any
-// one feature's test file being present.
+// Shared by the real-cgroup anti-INERT tests (the oom-steerer). Lives in its own
+// helper file so those tests do not depend on any one feature's test file being
+// present.
 func realConfineScope(t *testing.T, parent, name string) (scopePath, scopeID string) {
 	t.Helper()
 	stamp := strconv.FormatInt(time.Now().UnixNano()%(1<<40), 36)

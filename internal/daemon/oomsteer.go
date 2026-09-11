@@ -21,8 +21,9 @@ import (
 // admission and can expand until aira.slice reaches its own cap and the kernel
 // picks a victim, biased only by AIRA-27's STATIC class steering. (A delegate
 // scope's memory.max is a containment ceiling well above its declared reserve,
-// so physical over-use inside that cap is possible; AIRA-114 separately bounds
-// the aggregate of those caps.)
+// so physical over-use inside that cap is possible; under declared-only
+// admission the per-scope memory.max and the MemAvailable watchdog are the
+// backstop, not an aggregate over-subscription bound.)
 //
 // That static bias picks the wrong victim in exactly the case that matters.
 // oom_score_adj is worth adj/1000 of MACHINE total in badness, so on a 64 GiB

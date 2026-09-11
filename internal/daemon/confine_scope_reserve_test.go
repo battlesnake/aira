@@ -273,7 +273,7 @@ func TestConfineListNamesAdoptedScopeReserves(t *testing.T) {
 	// declared reserve, so only there is the adopted reconstruction usage+margin
 	// rather than the full cap (a non-delegate scope re-pins its whole cap).
 	scopeID := reserveScopeID(t, "adopted", 5106, true)
-	server := oversubServer(&now, sliceMax, 3*gib, 200, staticScan(oversubRecord(scopeID, rss, capBytes)))
+	server := scanLedgerServer(&now, sliceMax, 3*gib, staticScan(liveScopeRecord(scopeID, rss, capBytes)))
 	server.admitResolveSlice = func(string) (string, bool, string) { return slice, true, "" }
 	reserveScopeDir(t, slice, scopeID, capBytes, rss)
 	queue := &sliceQueue{path: slice, server: server}
@@ -318,14 +318,14 @@ func TestAdoptedScopeReservesTrackTheAdoptedScalarAcrossScans(t *testing.T) {
 	now := time.Unix(410_000, 0)
 	scopeID := reserveScopeID(t, "adopted", 5107, false)
 	mode := "ok"
-	server := oversubServer(&now, sliceMax, 3*gib, 200, func(string) (runner.ConfineListResult, error) {
+	server := scanLedgerServer(&now, sliceMax, 3*gib, func(string) (runner.ConfineListResult, error) {
 		switch mode {
 		case "fail":
 			return runner.ConfineListResult{Verdict: "unevaluated", Reason: "stubbed scan failure"}, os.ErrPermission
 		case "gone":
 			return runner.ConfineListResult{Verdict: "pass"}, nil
 		}
-		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{oversubRecord(scopeID, 2*gib, 30*gib)}}, nil
+		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{liveScopeRecord(scopeID, 2*gib, 30*gib)}}, nil
 	})
 	queue := &sliceQueue{path: "/slice", server: server}
 	registerAdmitQueue(server, queue)

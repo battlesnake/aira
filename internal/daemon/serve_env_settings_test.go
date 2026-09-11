@@ -15,8 +15,8 @@ import (
 // nowhere else: nothing proved Serve applies the parsed value to the field the
 // subsystem actually reads. A dropped assignment, or one written to the wrong
 // field, left the whole suite green while the setting silently did nothing —
-// worst of all for an operational kill switch like AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR,
-// whose one use is an operator adjusting an admission bound on a loaded shared machine.
+// worst of all for an operational knob whose one use is an operator adjusting
+// daemon behaviour on a loaded shared machine.
 //
 // The two tests below close that as a CLASS, not one variable at a time:
 //
@@ -84,14 +84,6 @@ func serveEnvSettingRows() []serveEnvSetting {
 			value: "91s",
 			want:  91 * time.Second,
 			get:   func(s *Server) any { return s.admitFreezeMaxHold },
-		},
-		{
-			// AIRA-114, carried as an integer percentage: 3.5x -> 350.
-			field: "oversubscriptionFactorPct",
-			env:   "AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR",
-			value: "3.5",
-			want:  int64(350),
-			get:   func(s *Server) any { return s.oversubscriptionFactorPct },
 		},
 		{
 			// AIRA-64 worker-admit CPU gate. Seconds, as a float.

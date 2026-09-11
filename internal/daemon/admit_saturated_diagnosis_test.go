@@ -43,8 +43,6 @@ func saturatedServer(t *testing.T) *Server {
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	server.admitConfineScan = noConfinesScan
 	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
-	// The AIRA-114 aggregate bound is opted INTO by the one case that needs it.
-	server.oversubscriptionFactorPct = 0
 	return server
 }
 
@@ -442,10 +440,9 @@ func TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt(t *testing
 	}
 }
 
-// unreadableCapRecord is a live scope whose cap AND usage are both unreadable,
-// so it contributes to liveScopes and leaves the AIRA-114 aggregate
-// UNESTABLISHED. It isolates sliceProvablyEmpty as the only source that can
-// object.
+// unreadableCapRecord is a live scope whose cap AND usage are both unreadable.
+// It contributes to liveScopes, isolating sliceProvablyEmpty as the only source
+// that can object.
 func unreadableCapRecord(scopeID string) runner.ConfineRecord {
 	populated, live := 0, true
 	return runner.ConfineRecord{ScopeID: scopeID, Populated: &populated, SubtreePopulated: &live}
@@ -462,9 +459,9 @@ func unreadableCapRecord(scopeID string) runner.ConfineRecord {
 // adoptedJobs/queuedAhead reports "nothing else was in the way" beside a running
 // suite — the ticket's own defect, reintroduced by its fix.
 //
-// Driven on both refusal disjuncts, and a third arm in which the scanned scope's
-// cap and usage are both unreadable so the AIRA-114 belt-and-braces check cannot
-// be what answers.
+// Driven on the ordinary disjunct, and a second arm in which the scanned scope's
+// cap and usage are both unreadable so only the subtree-aware emptiness reading
+// can answer.
 func TestSoloRefusalBesideALeafDrainedScopeReportsContention(t *testing.T) {
 	const maximum = int64(8) << 30
 
@@ -484,7 +481,7 @@ func TestSoloRefusalBesideALeafDrainedScopeReportsContention(t *testing.T) {
 		}
 	})
 
-	t.Run("ordinary disjunct, aggregate unestablished", func(t *testing.T) {
+	t.Run("ordinary disjunct, opaque live scope", func(t *testing.T) {
 		server := saturatedServer(t)
 		server.admitConfineScan = staticScan(unreadableCapRecord("CONFINE-suite-1-a"))
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
@@ -494,39 +491,14 @@ func TestSoloRefusalBesideALeafDrainedScopeReportsContention(t *testing.T) {
 		run.pass()
 		requireNoCounters(t, run.queue)
 		run.queue.mu.Lock()
-		aggregateKnown := run.queue.capAggregateKnown
 		liveScopes := run.queue.liveScopes
 		run.queue.mu.Unlock()
-		if aggregateKnown {
-			t.Fatal("the aggregate was established; this arm cannot isolate sliceProvablyEmpty")
-		}
 		if liveScopes != 1 {
 			t.Fatalf("liveScopes=%d, want 1", liveScopes)
 		}
 		rejection := run.reject()
 		if rejection.Contention != "observed" {
 			t.Fatalf("contention=%q, want %q from the subtree-aware emptiness reading alone",
-				rejection.Contention, "observed")
-		}
-	})
-
-	t.Run("aggregate disjunct", func(t *testing.T) {
-		server := saturatedServer(t)
-		server.oversubscriptionFactorPct = 100
-		server.admitConfineScan = staticScan(leafDrainedRecord("CONFINE-suite-1-a", 1<<30, 7<<30))
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 4096, maximum, 0, true, ""
-		}
-		args := saturatedArgs(2<<30, "")
-		args["scope_id"] = "CONFINE-job-123-abc9@session-a"
-		args["name"] = "job"
-		args["owner"] = "session-a"
-		run := startSaturatedAdmit(t, server, maximum, args)
-		run.pass()
-		requireNoCounters(t, run.queue)
-		rejection := run.reject()
-		if rejection.Contention != "observed" {
-			t.Fatalf("contention=%q, want %q — the refusal was caused by other scopes' aggregate caps",
 				rejection.Contention, "observed")
 		}
 	})
