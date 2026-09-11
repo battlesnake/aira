@@ -673,13 +673,16 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	}
 	inbound := io.Reader(io.MultiReader(bytes.NewReader(magic[:]), conn))
 	if magic == ardrMagic {
-		// S7 STUB: parse the frozen frame and write the 1-byte ack. It does NOT
-		// touch the ledger — S9 wires charge() into the SET+re-anchor, sets its
-		// own read deadline (the line-731 invariant), and HOLDS the connection
-		// (never closes a lease-bearing connection on error, Invariant 4). Here
-		// the connection is closed after the ack by the deferred conn.Close().
+		// S9 re-declare handler (design §3/§4). It SETs-or-ESTABLISHES the lease keyed
+		// by the frame's scope_id, writes the frozen 1-byte ack, and HOLDS the
+		// connection for the lease's lifetime — it sets and clears its OWN read deadline
+		// (this branch is BEFORE the handshake clear at the foot of the handshake below)
+		// and never closes a lease-bearing connection on error (Invariant 4); the lease
+		// is released only by this connection's own EOF. wrote=true suppresses the
+		// generic panic writer, exactly as the admit/worker-admit branches do, so it can
+		// never write after the handler has taken over the connection.
 		wrote = true
-		s.serveReDeclareStub(conn, inbound)
+		s.serveReDeclare(conn, inbound)
 		return
 	}
 	request, storeOp, err := readInboundFrame(inbound)
@@ -857,39 +860,129 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	wrote = s.reply(conn, responseFrame(response))
 }
 
-// serveReDeclareStub is the S7 landing point for a sniffed ARDR re-declare
-// frame: a TOTAL parse followed by the frozen 1-byte ack. It deliberately does
-// NOT charge the ledger — that is S9, which will replace this stub with the
-// SET+re-anchor handler, take its own read deadline (server.go's line-731
-// invariant), gate on SO_PEERCRED same-uid (S8's unixPeerCredential), and HOLD
-// the connection open instead of closing after the ack (Invariant 4 — the
-// daemon never closes a lease-bearing connection on error).
+// serveReDeclare is the S9 ARDR re-declare handler (design §3 compare-and-release,
+// §4 daemon-restart). A sniffed ARDR frame SETs-or-ESTABLISHES the lease keyed by its
+// scope_id, replies the frozen 1-byte ack, and HOLDS the connection for the lease's
+// lifetime. It never closes a lease-bearing connection on error (Invariant 4); the lease
+// is released ONLY by this connection's own EOF, through compare-and-release on the same
+// conn identity passed to both the SET and the release.
 //
-// Until then no client sends an ARDR frame (the client reconnect/re-declare is
-// S13/S16), so this path is exercised only by tests. It is loud about being a
-// stub so a stray ack cannot be mistaken for a real ledger SET.
+// It replaces the S7 stub (which parsed + acked but charged nothing). The frame's
+// charge() is routed STRAIGHT to the idempotent SET (enqueueReDeclare), NOT through
+// admitConnection's front half: that path's cpu>ceiling fail-fast, fail-closed memory
+// read, and reserve>ceiling TooLarge gate all violate Invariant 6 for a re-declare,
+// which is always accepted (design §4 re-declare window — `available` may go negative).
 //
-// inbound already replays the 4 sniffed magic bytes, so decodeReDeclareFrame
-// re-reads and re-verifies the magic — symmetric with the encoder and with the
-// dump reader S10/S11 reuse.
-func (s *Server) serveReDeclareStub(conn net.Conn, inbound io.Reader) {
-	// The handshake connect deadline still covers this read; the re-declare frame
-	// is small and bounded (maxReDeclareFrameBytes). S9 owns the full read-deadline
-	// discipline once it holds the connection.
+// inbound already replays the 4 sniffed magic bytes, so decodeReDeclareFrame re-reads
+// and re-verifies the magic — symmetric with the encoder and with the dump reader
+// S10/S11 reuse.
+func (s *Server) serveReDeclare(conn net.Conn, inbound io.Reader) {
+	// (3) Own read deadline bounding the frame-BODY read. The handshake Connect deadline
+	// set in serveConnection covered only the 4-byte magic sniff; this handler owns the
+	// connection from here. The body is small and bounded (maxReDeclareFrameBytes).
+	_ = conn.SetReadDeadline(time.Now().Add(s.resolvedDeadlines().Connect))
 	rec, err := decodeReDeclareFrame(inbound)
 	if err != nil {
-		// TOTAL parser: a malformed frame is a hard, LOGGED reject, never a silent
-		// or partial drop. No ack is written; the deferred conn.Close() ends the
-		// connection, which the peer reads as EOF.
-		log.Printf("aira daemon: S7 re-declare stub: rejecting malformed ARDR frame: %v", err)
+		// TOTAL parser: a malformed frame is a hard, LOGGED reject. This is a REFUSE —
+		// NO lease is anchored to this connection — so the deferred conn.Close() in
+		// serveConnection ending it is correct (Invariant 4 governs lease-BEARING
+		// connections only) and there is no waiter to release. No ack: the peer reads EOF.
+		log.Printf("aira daemon: re-declare: rejecting malformed ARDR frame: %v", err)
 		return
 	}
+	// (P1, the subtle one) CLEAR the read deadline NOW — before credential resolution,
+	// the enqueue, and watchPeerEOF. The deadline exclusively covered the frame body;
+	// everything below runs with no read deadline, exactly as admitConnection does after
+	// serveConnection's AIRA-84 handshake clear. If this clear is missing, the held
+	// connection's blocking 1-byte EOF read (watchPeerEOF) TIMES OUT at the body-read
+	// deadline, fires peerCtx, and drops a LIVE lease.
+	_ = conn.SetReadDeadline(time.Time{})
 	charge := rec.charge()
-	log.Printf("aira daemon: S7 re-declare stub: parsed scope=%q ram=%d cpu=%d parent=%q -- NOT charged, S9 wires the ledger SET",
-		charge.ScopeID, charge.RAM, charge.CPU, charge.ParentScopeID)
+
+	// (2) Resolve the anchor inputs from THIS connection; (6) SO_PEERCRED same-uid gate,
+	// fail-CLOSED on an unreadable credential (peerSameUID stays false), NO cgroup-
+	// membership check — a confine/aitest holder lawfully lives OUTSIDE its own scope, so
+	// a scope→cgroup-membership check would reject every legitimate re-declare. conn is
+	// carried to BOTH the SET/establish and the release so compare-and-release keys on
+	// this one connection's identity.
+	request := admitRequest{
+		scopeID:       charge.ScopeID,
+		cpu:           charge.CPU,
+		parentScopeID: charge.ParentScopeID,
+		conn:          conn,
+	}
+	if uid, pid, credErr := s.peerCredentialOf(conn); credErr == nil {
+		request.peerSameUID = uid == os.Geteuid()
+		if pid > 0 {
+			request.clientPID = pid
+			if tick, ok, _ := readProcStartTime(pid); ok {
+				request.processStartTick = tick
+			}
+		}
+	}
+
+	// The frozen frame carries NO slice (design §4), so under the one-slice assumption
+	// (D1: aira.slice) the DEFAULT slice is resolved. S10's dump and S11's reload INHERIT
+	// this: a reloaded lease must resolve to the SAME queue a re-declare targets, or the
+	// two land in different queues. A daemon that cannot resolve its own slice cannot
+	// locate the ledger at all — REFUSE (no ack; the client reconnects, S13).
+	//
+	// NOT acquireAdmitSlot-gated, deliberately: a crash-restart re-declare BURST must
+	// never be refused CodeBusy (Invariant 6 — that would drop live leases). The held
+	// count is already bounded because each of these leases was admission-slotted before
+	// the crash; re-declaring them reclaims space the ledger already forgot.
+	path, ok, reason := s.sliceResolver()(runner.DefaultConfineSlice)
+	if !ok {
+		log.Printf("aira daemon: re-declare for scope %q: slice unresolved (%s); refusing", charge.ScopeID, reason)
+		return
+	}
+
+	// (1) charge() straight to the SET/establish. basis is a non-empty diagnostic label
+	// (validRunnerAdmitGrant requires non-empty, were this lease ever framed by a later
+	// plain re-anchor); it participates in no admission decision and no prefix classifier.
+	queue, waiter, code, enqueueErr := s.enqueueReDeclare(path, charge.RAM, "redeclare", request)
+	if enqueueErr != nil {
+		// (4) A REFUSE (not-owner / queued-or-rejected dup / exclusive): NO lease is
+		// anchored to this connection, so there is no waiter to release — releasing a nil
+		// waiter would nil-deref — and closing the connection (deferred, in
+		// serveConnection) is correct. No ack: the peer reads EOF. release is defined
+		// ONLY past this point, so the refuse path can never reach it.
+		log.Printf("aira daemon: re-declare for scope %q refused: %s: %v", charge.ScopeID, code, enqueueErr)
+		return
+	}
+
+	// From here the connection is LEASE-BEARING (re-anchored or freshly established): it
+	// must be HELD, never closed on error, and released ONLY by its own EOF via
+	// compare-and-release (waiter.anchor == conn).
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
+	}
+	peerCtx, cancelPeer := watchPeerEOF(conn)
+	defer cancelPeer()
+	defer release()
+
+	// Frozen 1-byte ack. (5) An ack-write FAILURE must NOT release the lease: a write
+	// error on a 1-byte frame ≈ the peer is gone, but the release is EOF-keyed, not
+	// write-keyed (design §3). So do NOT return here — fall through to the hold; the
+	// peer's EOF then fires peerCtx and the deferred release discharges through the
+	// anchor gate. Returning on the write error would run the deferred release
+	// immediately and drop a lease whose EOF had not yet reported it gone.
 	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-	if _, err := conn.Write([]byte{reDeclareAckByte}); err != nil {
-		log.Printf("aira daemon: S7 re-declare stub: ack write for scope=%q failed: %v", charge.ScopeID, err)
+	if _, werr := conn.Write([]byte{reDeclareAckByte}); werr != nil {
+		log.Printf("aira daemon: re-declare ack write for scope %q failed: %v", charge.ScopeID, werr)
+	}
+
+	// Hold the lease until the holder's EOF or graceful shutdown. On <-s.stopping the
+	// handler returns and the deferred release DISCHARGES the ledger — so S10's dump MUST
+	// snapshot granted leases BEFORE close(stopping), or a held lease is lost from the dump.
+	select {
+	case <-peerCtx.Done():
+	case <-s.stopping:
 	}
 }
 

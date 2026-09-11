@@ -960,6 +960,16 @@ type admitRequest struct {
 	clientPID        int
 	processStartTick uint64
 	peerSameUID      bool
+
+	// S9. reDeclare marks the request as an ARDR re-declare (serveReDeclare), NOT a
+	// fresh admit. It changes exactly ONE thing in enqueueAdmitInternal: when the lease
+	// is ABSENT it ESTABLISHES it granted (the crash-restart-no-dump case, design §4)
+	// instead of inserting a fresh QUEUED waiter. The present-lease SET/re-anchor is
+	// identical either way, so a plain dup-scope admit (reDeclare false) stays
+	// absent→queued — a genuine fresh admission — which is what keeps establish-granted
+	// scoped to the re-declare entrypoint alone. Set only by enqueueReDeclare; no wire
+	// field.
+	reDeclare bool
 }
 
 type admitRejection struct {
@@ -2146,6 +2156,23 @@ func (s *Server) enqueueResolvedConfineAdmit(path string, reserve int64, basis s
 	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true, request)
 }
 
+// enqueueReDeclare is the S9 ARDR re-declare entrypoint into the idempotent SET. It
+// re-anchors a PRESENT granted lease (the S8 SET — identical to a dup-scope admit) or,
+// when the lease is ABSENT (the crash-restart-no-dump case), ESTABLISHES it granted
+// directly under queue.mu, SKIPPING the ceiling gates (design §4 re-declare window;
+// `available` may go negative). request.reDeclare is set HERE, so this is the only path
+// that establishes-granted on absence — a plain admit's enqueueResolvedConfineAdmit
+// leaves it false and an absent lease stays a fresh QUEUED insert.
+//
+// enforceCeiling is FALSE, not `maximum` with true: both re-declare branches return
+// before the ceiling check, so `maximum` is dead — false documents "a re-declare never
+// enforces the ceiling" rather than relying on a latent 0 that a future fall-through
+// could read as a wrong refusal.
+func (s *Server) enqueueReDeclare(path string, reserve int64, basis string, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
+	request.reDeclare = true
+	return s.enqueueAdmitInternal(path, reserve, basis, 0, false, request)
+}
+
 func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	s.admitRegistryMu.Lock()
 	if s.admitQueues == nil {
@@ -2203,6 +2230,16 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 				if request.exclusive || existing.exclusive {
 					return nil, nil, CodeProtocol, fmt.Errorf("%s: an exclusive lease is never re-declared (exclusive=lost on reconnect)", CodeProtocol)
 				}
+				// S9 parent_scope_id (design §4): a re-anchor LEAVES the established
+				// parentScopeID alone — the lease's parent is a property of the original
+				// establish, not of the reconnecting client. A mismatch is LOGGED, never
+				// gated (gating would refuse a legitimate re-declare over a cosmetic
+				// disagreement). Only logged when BOTH are non-empty, so an empty parent on
+				// either side (legal by design) is silent.
+				if existing.parentScopeID != "" && request.parentScopeID != "" && existing.parentScopeID != request.parentScopeID {
+					log.Printf("aira daemon: re-declare for scope %q carries parent_scope_id %q but the established lease has %q; keeping the established value (not gated)",
+						request.scopeID, request.parentScopeID, existing.parentScopeID)
+				}
 				// Idempotent SET of the resource vector + re-anchor to the new
 				// connection. reserve and cpu are the two ledger resources (§2); the
 				// re-derive folds the refreshed vector back into the per-slice ledger.
@@ -2226,6 +2263,56 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			// preserved — TestConfineRegistryRejectsDuplicateScopeID pins this). Only a
 			// live GRANTED lease re-anchors.
 			return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
+		} else if request.reDeclare {
+			// S9 ESTABLISH-GRANTED (design §4, the load-bearing addition). The lease is
+			// ABSENT and this is an ARDR re-declare: the driver is CRASH-restart with NO
+			// dump (SIGKILL/OOM/panic skips the graceful dump → the new daemon opened an
+			// EMPTY ledger), so EVERY live client's re-declare is absent-lease. They MUST
+			// re-establish GRANTED — queuing them behind S11's new-admission freeze would
+			// time them out and drop live leases. So establish directly here, accounted
+			// and anchored, SKIPPING the ceiling AND maxWaiters gates below: Invariant 6
+			// says a re-declare is always accepted, even past the ceiling — `reserve >
+			// ceiling` just establishes with `available` NEGATIVE (§4's re-declare window),
+			// which the signed ledger absorbs and the next NEW admission waits on. This is
+			// the ARDR entrypoint ONLY (request.reDeclare): a plain dup-scope admit whose
+			// lease is absent falls through to the fresh QUEUED insert, a genuine new
+			// admission.
+			//
+			// Same-uid gate, fail-CLOSED (design §4 gate P2-C), identical to the SET branch:
+			// peerSameUID is false on an unreadable credential, so a build that never
+			// resolves it cannot establish a lease for a peer it could not authenticate.
+			if !request.peerSameUID {
+				return nil, nil, CodeProtocol, fmt.Errorf("%s: re-declare peer is not the lease owner", CodeProtocol)
+			}
+			if queue.seq == math.MaxInt64 {
+				return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
+			}
+			queue.seq++
+			// grantedCh is closed immediately: the established lease is granted the instant
+			// it exists, so the "granted ⇒ grantedCh closed" invariant every other granted
+			// waiter holds is preserved (nothing waits on it on the re-declare path, but a
+			// later reader must not block). outcome is "immediate", NOT a new spelling: the
+			// runner's validRunnerAdmitGrant accepts only {immediate,waited,unevaluated},
+			// so were a later plain dup-admit to re-anchor this lease and frame its outcome,
+			// any other value would be rejected → flock fallback → ungoverned launch.
+			grantedCh := make(chan struct{})
+			close(grantedCh)
+			now := s.admitNowTime()
+			waiter := &admitWaiter{
+				seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis,
+				state: admitGranted, accounted: true, grantedCh: grantedCh,
+				enqueued: now, grantedAt: now, outcome: "immediate",
+				scopeID: request.scopeID, name: request.name, owner: request.owner,
+				signature:     boundedAdmitSignature(request.signature),
+				parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling,
+			}
+			anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
+			queue.waiters = append(queue.waiters, waiter)
+			// DERIVED, not incremented (the one ledger writer): folds in this lease's RAM
+			// and cores. An establish CONSUMES capacity, so no signal() is needed — unlike
+			// a re-anchor that may SHRINK the vector and free room for a waiter.
+			queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			return queue, waiter, "", nil
 		}
 	}
 	if len(queue.waiters) >= admitMaxWaiters {
