@@ -65,7 +65,12 @@ func runConfineDumpExchange(ctx context.Context, request core.Request, dumpPath 
 		if reason == "" {
 			reason = "no reason was reported"
 		}
-		_, _ = fmt.Fprintf(stdout, "confine dump: unevaluated: %s\n", reason)
+		if jsonOutput {
+			data, _ := json.Marshal(map[string]any{"verdict": "unevaluated", "reason": reason})
+			_, _ = fmt.Fprintln(stdout, string(data))
+		} else {
+			_, _ = fmt.Fprintf(stdout, "confine dump: unevaluated: %s\n", reason)
+		}
 		if response.Exit != 0 {
 			return response.Exit
 		}
@@ -75,7 +80,19 @@ func runConfineDumpExchange(ctx context.Context, request core.Request, dumpPath 
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_DUMP_WRITE: %v\n", err)
 		return codes.ExitForCode("E_CONFINE_DUMP_WRITE")
 	}
-	_, _ = fmt.Fprintf(stdout, "confine dump: wrote %d admission record(s) and %d queue record(s) to %s\n",
-		len(result.Admissions), len(result.Queues), dumpPath)
+	// AIRA-82 discipline: --json is accepted for this verb (dispatchConfineManagementRequest's
+	// generic render() path would honour it for a failure above), so the SUCCESS
+	// summary must honour it too rather than silently discarding the flag -- an
+	// accepted-and-ignored option is the same defect class AIRA-82 refuses.
+	if jsonOutput {
+		data, _ := json.Marshal(map[string]any{
+			"written": true, "path": dumpPath,
+			"admissions": len(result.Admissions), "waiters": len(result.Waiters), "queues": len(result.Queues),
+		})
+		_, _ = fmt.Fprintln(stdout, string(data))
+		return 0
+	}
+	_, _ = fmt.Fprintf(stdout, "confine dump: wrote %d admission record(s), %d waiter record(s) and %d queue record(s) to %s\n",
+		len(result.Admissions), len(result.Waiters), len(result.Queues), dumpPath)
 	return 0
 }

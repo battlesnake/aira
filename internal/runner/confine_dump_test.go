@@ -10,7 +10,8 @@ import (
 )
 
 // TestWriteConfineDumpJSONLRoundTrips pins the wire shape: one JSON object per
-// line (JSONL), in the order Admissions then Queues, atomically written.
+// line (JSONL), in the order Admissions then Waiters then Queues, atomically
+// written.
 //
 // verifies: AIRA (admission-counter rebuild) S18
 func TestWriteConfineDumpJSONLRoundTrips(t *testing.T) {
@@ -26,6 +27,9 @@ func TestWriteConfineDumpJSONLRoundTrips(t *testing.T) {
 				At: "2026-09-11T00:00:00Z", ObservedPeakBytes: &peak, OOM: false,
 				Outcome: ConfineDumpUnevaluated,
 			},
+		},
+		Waiters: []ConfineDumpWaiterRow{
+			{RecordType: ConfineDumpRecordWaiter, Slice: "/aira.slice", ScopeID: "s1", State: "queued", Outcome: ConfineDumpUnevaluated, WaitMS: 500},
 		},
 		Queues: []ConfineDumpQueueRow{
 			{RecordType: ConfineDumpRecordQueue, Slice: "/aira.slice", RAMOutstandingBytes: 512 << 20, CPUCeilingCores: 4},
@@ -47,8 +51,8 @@ func TestWriteConfineDumpJSONLRoundTrips(t *testing.T) {
 		}
 		lines = append(lines, line)
 	}
-	if len(lines) != 2 {
-		t.Fatalf("want 2 JSONL lines (1 admission + 1 queue), got %d: %q", len(lines), string(data))
+	if len(lines) != 3 {
+		t.Fatalf("want 3 JSONL lines (1 admission + 1 waiter + 1 queue), got %d: %q", len(lines), string(data))
 	}
 	var admission map[string]any
 	if err := json.Unmarshal([]byte(lines[0]), &admission); err != nil {
@@ -60,12 +64,19 @@ func TestWriteConfineDumpJSONLRoundTrips(t *testing.T) {
 	if admission["signature"] != "make test" {
 		t.Fatalf("line 0 signature = %v", admission["signature"])
 	}
-	var queue map[string]any
-	if err := json.Unmarshal([]byte(lines[1]), &queue); err != nil {
+	var waiter map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &waiter); err != nil {
 		t.Fatalf("line 1 not valid JSON: %v", err)
 	}
+	if waiter["record_type"] != "waiter" {
+		t.Fatalf("line 1 record_type = %v, want waiter", waiter["record_type"])
+	}
+	var queue map[string]any
+	if err := json.Unmarshal([]byte(lines[2]), &queue); err != nil {
+		t.Fatalf("line 2 not valid JSON: %v", err)
+	}
 	if queue["record_type"] != "queue" {
-		t.Fatalf("line 1 record_type = %v, want queue", queue["record_type"])
+		t.Fatalf("line 2 record_type = %v, want queue", queue["record_type"])
 	}
 }
 

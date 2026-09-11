@@ -24,6 +24,11 @@ import (
 const (
 	ConfineDumpRecordAdmission = "admission"
 	ConfineDumpRecordQueue     = "queue"
+	// ConfineDumpRecordWaiter is a currently-live (in-memory) admission --
+	// queued, or granted within this daemon process's lifetime -- as
+	// distinct from ConfineDumpRecordAdmission's PERSISTED confine_peak_history
+	// samples. See ConfineDumpWaiterRow.
+	ConfineDumpRecordWaiter = "waiter"
 )
 
 // ConfineDumpUnevaluated is the honest sentinel for a string-valued field this
@@ -41,10 +46,11 @@ const ConfineDumpUnevaluated = "unevaluated"
 // self-report of peak_rss/oom and carries neither the admission outcome
 // (grant/deny/fail-fast) nor the wait duration. Inventing either from an
 // unrelated invariant (e.g. "every reporting job must have been granted")
-// would be exactly the fabricated value the honesty rule forbids -- so this
-// dump reports the real, currently-measurable wait/outcome for whatever is
-// in-flight at dump time on the QUEUE records instead, and leaves this
-// population's outcome/wait an honest gap (recorded, not silently dropped).
+// would be exactly the fabricated value the honesty rule forbids. Design
+// §12's "per admission: ... wait time, and outcome" is instead met by
+// ConfineDumpWaiterRow, for the population where those two terms are
+// actually measurable: an admission still live in this daemon process's
+// in-memory queue at dump time.
 type ConfineDumpAdmissionRow struct {
 	RecordType           string `json:"record_type"`
 	Kind                 string `json:"kind"`
@@ -84,6 +90,30 @@ type ConfineDumpQueueRow struct {
 	RestartFrozen       bool   `json:"restart_frozen"`
 }
 
+// ConfineDumpWaiterRow is ONE currently-live admission -- queued or granted
+// in this daemon process's in-memory queue at dump time -- carrying the
+// wait/outcome terms design §12 asks for and ConfineDumpAdmissionRow's
+// persisted population structurally cannot (see its doc comment).
+//
+// State/Outcome/WaitMS are all real, freshly-measured facts, never
+// fabricated: a still-QUEUED waiter reports State "queued", Outcome
+// ConfineDumpUnevaluated (its eventual grant/deny is not yet decided --
+// asserting one now would be a fabrication in the other direction), and
+// WaitMS as its wait SO FAR (a genuine, non-final measurement, not the
+// eventual total). A GRANTED or REJECTED waiter reports its daemon-decided
+// terminal Outcome and final WaitMS.
+type ConfineDumpWaiterRow struct {
+	RecordType   string `json:"record_type"`
+	Slice        string `json:"slice"`
+	ScopeID      string `json:"scope_id,omitempty"`
+	Signature    string `json:"signature,omitempty"`
+	ReserveBytes int64  `json:"reserve_bytes"`
+	CPUCores     int64  `json:"cpu_cores"`
+	State        string `json:"state"`
+	Outcome      string `json:"outcome"`
+	WaitMS       int64  `json:"wait_ms"`
+}
+
 // ConfineDumpResult is the whole `confine-dump` reply, mirroring
 // ConfineBudgetResult's shape (verdict/reason/scope + rows) for consistency
 // with the rest of the confine-management family.
@@ -93,18 +123,24 @@ type ConfineDumpResult struct {
 	Scope      string                    `json:"scope"`
 	Admissions []ConfineDumpAdmissionRow `json:"admissions,omitempty"`
 	Queues     []ConfineDumpQueueRow     `json:"queues,omitempty"`
+	Waiters    []ConfineDumpWaiterRow    `json:"waiters,omitempty"`
 }
 
-// WriteConfineDumpJSONL writes result's rows as JSONL (Admissions then
-// Queues, one JSON object per line) to path, atomically: CreateTemp beside
-// the target, write, fsync, close, rename -- so a reader never observes a
-// partially-written file, and a failed write never clobbers a prior good
-// dump. Mirrors the identical pattern in
+// WriteConfineDumpJSONL writes result's rows as JSONL (Admissions, then
+// Waiters, then Queues, one JSON object per line) to path, atomically:
+// CreateTemp beside the target, write, fsync, close, rename -- so a reader
+// never observes a partially-written file, and a failed write never
+// clobbers a prior good dump. Mirrors the identical pattern in
 // internal/runner/confine_mode.go's writeInstallModeRecord.
 func WriteConfineDumpJSONL(path string, result ConfineDumpResult) error {
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
 	for _, row := range result.Admissions {
+		if err := encoder.Encode(row); err != nil {
+			return err
+		}
+	}
+	for _, row := range result.Waiters {
 		if err := encoder.Encode(row); err != nil {
 			return err
 		}

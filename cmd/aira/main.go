@@ -326,6 +326,21 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		request.Args["owner"] = owner
 		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
 	}
+	// AIRA (admission-counter rebuild) S18. The hyphenated spelling of
+	// `confine --dump <file>`, on the SAME two-spellings-must-both-work
+	// discipline AIRA-201 pinned for confine-budget
+	// (TestBothConfineBudgetSpellingsReachTheManagementDispatch): buildRequest
+	// has no "confine-dump" case (it is not a generic management verb -- it
+	// writes a local file, unlike list/kill/budget), so this is handled
+	// directly rather than through the generic buildRequest+dispatchConfineManagementRequest
+	// pair above.
+	if verb == "confine-dump" {
+		dumpPath := options["dump"]
+		if dumpPath == "" {
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		}
+		return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
+	}
 	// AIRA-196. Handled HERE, beside the rest of the confine family and BEFORE
 	// project discovery, for the reason the family shares: a detached confine job
 	// is machine-wide and resolves no project, so routing these through scope
@@ -823,7 +838,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
 		"confine-list":   {"slice": true, "owner": true},
 		"confine-budget": {"slice": true, "owner": true},
-		"confine-kill":   {"steal": true, "slice": true, "owner": true},
+		// AIRA (admission-counter rebuild) S18.
+		"confine-dump": {"dump": true, "slice": true, "owner": true},
+		"confine-kill": {"steal": true, "slice": true, "owner": true},
 		// AIRA-196. No --slice on either: both address a job through the durable
 		// record store, never a cgroup slice, and an accepted-and-ignored --slice
 		// is exactly the silently discarded scope AIRA-82 refuses.

@@ -27,20 +27,26 @@ import (
 // structured data over its existing local transport; the CLI face
 // (cmd/aira/confine_dump.go) performs the actual file write.
 
-// confineDump answers the `confine-dump` wire verb: design §12's two
-// retained populations, reshaped for archival.
+// confineDump answers the `confine-dump` wire verb: design §12's retained
+// populations, reshaped for archival.
 //
 //   - Admissions: every retained confine_peak_history sample (the SAME
 //     table/reader AIRA-180's confine-budget already classifies) --
 //     "declared reserve vs observed peak". No new capture machinery.
+//   - Waiters: every admission still live in this daemon process's
+//     in-memory queue at dump time (queued or granted), carrying the real
+//     wait/outcome terms §12 asks for and the persisted Admissions rows
+//     structurally cannot -- see ConfineDumpAdmissionRow's doc comment.
 //   - Queues: one row per slice this daemon currently holds an admission
-//     queue for, read via a dedicated locked walk (buildConfineDumpQueues)
-//     that consults exactly the fields admitSliceSnapshotFor and
-//     confine_manage.go's own listing already read -- outstanding/cpuOutstanding,
-//     queue.waiters, the freeze state, and the slice's live memory.max --
-//     giving oldest-blocked wait, a negative-available excursion (the
-//     signed ledger going negative during the §4 restart window), and
+//     queue for, giving oldest-blocked wait, a negative-available excursion
+//     (the signed ledger going negative during the §4 restart window), and
 //     per-resource (ram/cpu) utilisation.
+//
+// Waiters and Queues are read together, in ONE locked walk per queue
+// (buildConfineDumpQueuesAndWaiters), that consults exactly the fields
+// admitSliceSnapshotFor and confine_manage.go's own listing already read --
+// outstanding/cpuOutstanding/outstandingJobs, queue.waiters, the freeze
+// state, and the slice's live memory.max.
 func (s *Server) confineDump(args map[string]any) core.Response {
 	callerOwner := stringArg(args, "owner")
 	if err := runner.ValidateConfineOwner(callerOwner); err != nil {
@@ -55,11 +61,13 @@ func (s *Server) confineDump(args map[string]any) core.Response {
 	if err != nil {
 		return core.Response{Code: CodeInternal, Error: CodeInternal + ": read usage history: " + err.Error()}
 	}
+	queues, waiters := s.buildConfineDumpQueuesAndWaiters()
 	result := runner.ConfineDumpResult{
 		Verdict:    "ok",
 		Scope:      store.ResourceBudgetUniverseScope(),
 		Admissions: buildConfineDumpAdmissions(subjects),
-		Queues:     s.buildConfineDumpQueues(),
+		Waiters:    waiters,
+		Queues:     queues,
 	}
 	return core.Response{OK: true, Code: "OK", Data: result}
 }
@@ -99,21 +107,59 @@ func buildConfineDumpAdmissions(subjects []store.ResourceBudgetSubjectRows) []ru
 	return rows
 }
 
-// buildConfineDumpQueues is a READ-ONLY, SEPARATE locked walk over every
-// slice this daemon currently holds an admission queue for. It does not call
-// or modify admitSliceSnapshotFor or any admission-decision function in
-// admit.go -- admit.go is untouched by this slice, per the S18 brief's hard
-// constraint. It reads the same queue fields admitSliceSnapshotFor and
-// confine_manage.go's listing already read (queue.outstanding,
-// queue.cpuOutstanding, queue.waiters, queue.freezeArmedAt) under the same
-// queue.mu discipline, and the same memory-reader seam admitConnection uses,
-// so a negative `available` is computed on the SAME signed arithmetic
-// admission itself uses (checkedAvailable/ledgerAvailable), never re-derived
-// differently.
+// waiterOutcomeName maps an admitWaiterState to the confine-dump wire
+// vocabulary. admitReleased never appears here: a released waiter is
+// removed from queue.waiters (releaseAdmitWaiterLocked), so this walk never
+// observes one.
+func waiterOutcomeName(waiter *admitWaiter) string {
+	switch waiter.state {
+	case admitQueued:
+		// Genuinely undecided -- asserting a grant/deny now, before the
+		// evaluator has decided either way, would be exactly the fabrication
+		// the honesty rule forbids in the OTHER direction.
+		return runner.ConfineDumpUnevaluated
+	case admitGranted, admitRejected:
+		// waiter.outcome is the daemon's own decided term ("immediate",
+		// "waited", "saturated", ...) -- reused verbatim rather than
+		// re-derived, so this can never drift from what admission itself
+		// decided.
+		if waiter.outcome != "" {
+			return waiter.outcome
+		}
+		return runner.ConfineDumpUnevaluated
+	default:
+		return runner.ConfineDumpUnevaluated
+	}
+}
+
+func waiterStateName(waiter *admitWaiter) string {
+	switch waiter.state {
+	case admitQueued:
+		return "queued"
+	case admitGranted:
+		return "granted"
+	case admitRejected:
+		return "rejected"
+	default:
+		return runner.ConfineDumpUnevaluated
+	}
+}
+
+// buildConfineDumpQueuesAndWaiters is a READ-ONLY, SEPARATE locked walk over
+// every slice this daemon currently holds an admission queue for. It does
+// not call or modify admitSliceSnapshotFor or any admission-decision
+// function in admit.go -- admit.go is untouched by this slice, per the S18
+// brief's hard constraint. It reads the same queue fields
+// admitSliceSnapshotFor and confine_manage.go's listing already read
+// (queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs,
+// queue.waiters, queue.freezeArmedAt) under the same queue.mu discipline,
+// and the same memory-reader seam admitConnection uses, so a negative
+// `available` is computed on the SAME signed arithmetic admission itself
+// uses (checkedAvailable/ledgerAvailable), never re-derived differently.
 //
 // Ordering is by slice path (sorted), so the dump is deterministic across
 // runs rather than depending on Go's randomised map iteration.
-func (s *Server) buildConfineDumpQueues() []runner.ConfineDumpQueueRow {
+func (s *Server) buildConfineDumpQueuesAndWaiters() ([]runner.ConfineDumpQueueRow, []runner.ConfineDumpWaiterRow) {
 	s.admitRegistryMu.Lock()
 	paths := make([]string, 0, len(s.admitQueues))
 	byPath := make(map[string]*sliceQueue, len(s.admitQueues))
@@ -128,6 +174,7 @@ func (s *Server) buildConfineDumpQueues() []runner.ConfineDumpQueueRow {
 	readMemory := s.memoryReader()
 	shim := s.shimMode()
 	rows := make([]runner.ConfineDumpQueueRow, 0, len(paths))
+	var waiterRows []runner.ConfineDumpWaiterRow
 	for _, path := range paths {
 		queue := byPath[path]
 		row := runner.ConfineDumpQueueRow{RecordType: runner.ConfineDumpRecordQueue, Slice: path}
@@ -135,15 +182,37 @@ func (s *Server) buildConfineDumpQueues() []runner.ConfineDumpQueueRow {
 		queue.mu.Lock()
 		row.RAMOutstandingBytes = queue.outstanding
 		row.CPUOutstandingCores = queue.cpuOutstanding
+		// Captured under the lock, used for the headroom computation OUTSIDE
+		// it: this is the queue's OWN CURRENT job count, matching what the
+		// evaluator's fit-check charges for capacity already held (NOT
+		// jobs+1, which is admitConnection's own prospective-new-admission
+		// headroom for a job that has not arrived -- reporting that basis
+		// here would UNDER-headroom relative to what admission actually
+		// reserves, making `available` read more optimistic than reality).
+		outstandingJobsSnapshot := queue.outstandingJobs
 		var oldestWaitMS int64
 		for _, waiter := range queue.waiters {
-			if waiter == nil || waiter.state != admitQueued {
+			if waiter == nil {
 				continue
 			}
-			row.QueuedCount++
-			if waited := elapsedMilliseconds(waiter.enqueued, now); waited > oldestWaitMS {
-				oldestWaitMS = waited
+			if waiter.state == admitQueued {
+				row.QueuedCount++
+				if waited := elapsedMilliseconds(waiter.enqueued, now); waited > oldestWaitMS {
+					oldestWaitMS = waited
+				}
 			}
+			waiterRow := runner.ConfineDumpWaiterRow{
+				RecordType: runner.ConfineDumpRecordWaiter, Slice: path,
+				ScopeID: waiter.scopeID, Signature: waiter.signature,
+				ReserveBytes: waiter.reserve, CPUCores: waiter.cpu,
+				State: waiterStateName(waiter), Outcome: waiterOutcomeName(waiter),
+			}
+			if waiter.state == admitQueued {
+				waiterRow.WaitMS = elapsedMilliseconds(waiter.enqueued, now)
+			} else {
+				waiterRow.WaitMS = waiter.waitedMS
+			}
+			waiterRows = append(waiterRows, waiterRow)
 		}
 		if s.admitFreezeMaxHold > 0 {
 			row.Phase = admitFreezePhaseAt(queue.freezeArmedAt, now, s.admitFreezeMaxHold).String()
@@ -166,10 +235,7 @@ func (s *Server) buildConfineDumpQueues() []runner.ConfineDumpQueueRow {
 		// signed-ledger observation, not a live admission decision, and pulling
 		// in that subsystem would be new surface this slice does not need.
 		current, maximum, reclaimable, ok, _ := readMemory(path)
-		// headroom == 0 addl. jobs: this reports the CURRENT ledger's own
-		// excursion, not "would headroom admit one more job" (which is what
-		// admitConnection computes with jobs+1 for a prospective admission).
-		jobsHeadroom := s.admitSliceHeadroom(0)
+		jobsHeadroom := s.admitSliceHeadroom(outstandingJobsSnapshot)
 		if ok && maximum >= 0 {
 			value := maximum
 			row.RAMCeilingBytes = &value
@@ -198,5 +264,5 @@ func (s *Server) buildConfineDumpQueues() []runner.ConfineDumpQueueRow {
 
 		rows = append(rows, row)
 	}
-	return rows
+	return rows, waiterRows
 }

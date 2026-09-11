@@ -90,48 +90,92 @@ func TestConfineDumpDaemonDownIsUnevaluatedAndNeverKills(t *testing.T) {
 // being broken. It also exercises the one behaviour unique to this verb among
 // its confine-management siblings: writing a local file.
 //
+// Both shipped spellings are driven, exactly like
+// TestBothConfineBudgetSpellingsReachTheManagementDispatch: `confine --dump`
+// reaches runConfineDumpCommand through the options-form branch inside the
+// `verb == "confine"` arm, while the hyphenated `confine-dump` reaches it
+// through its OWN dedicated `verb == "confine-dump"` arm (buildRequest has no
+// "confine-dump" case -- unlike confine-list/kill/budget, this verb performs
+// a local file write rather than a generic dispatch-and-render, so it cannot
+// share their branch). A prior build wired only the first spelling; this
+// test would have caught that.
+//
 // verifies: AIRA (admission-counter rebuild) S18
 func TestConfineDumpArgvWritesTheFile(t *testing.T) {
+	for _, argv := range [][]string{{"confine", "--dump"}, {"confine-dump", "--dump"}} {
+		t.Run(strings.Join(argv, " "), func(t *testing.T) {
+			dir := t.TempDir()
+			dumpPath := filepath.Join(dir, "dump.jsonl")
+			var seen []string
+			peak := int64(123 << 20)
+			injected := dispatcherFunc(func(_ context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+				seen = append(seen, request.Verb)
+				if scope.ProjectID != "" || scope.Root != "" {
+					t.Fatalf("resolved a project scope %+v; confine-dump is project-less", scope)
+				}
+				return core.Response{OK: true, Code: "OK", Data: runner.ConfineDumpResult{
+					Verdict: "ok", Scope: "test-universe",
+					Admissions: []runner.ConfineDumpAdmissionRow{{
+						RecordType: runner.ConfineDumpRecordAdmission, Kind: "confine", Signature: "make test",
+						ObservedPeakBytes: &peak, Outcome: runner.ConfineDumpUnevaluated,
+					}},
+					Queues: []runner.ConfineDumpQueueRow{{RecordType: runner.ConfineDumpRecordQueue, Slice: "/aira.slice"}},
+				}}
+			})
+			var stdout, stderr bytes.Buffer
+			exit := RunWithDispatcher(append(append([]string(nil), argv...), dumpPath), &stdout, &stderr, injected)
+			if len(seen) != 1 || seen[0] != "confine-dump" {
+				t.Fatalf("dispatched %v, want exactly one confine-dump; exit=%d stdout=%q stderr=%q", seen, exit, stdout.String(), stderr.String())
+			}
+			if exit != 0 {
+				t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
+			}
+			data, err := os.ReadFile(dumpPath)
+			if err != nil {
+				t.Fatalf("dump file not written: %v", err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("want 2 JSONL lines, got %d: %q", len(lines), string(data))
+			}
+			var row map[string]any
+			if err := json.Unmarshal([]byte(lines[0]), &row); err != nil {
+				t.Fatalf("line 0 not valid JSON: %v", err)
+			}
+			if row["signature"] != "make test" {
+				t.Fatalf("line 0 = %v", row)
+			}
+		})
+	}
+}
+
+// TestConfineDumpJSONFlagIsHonouredOnSuccess pins the AIRA-82 discipline: an
+// accepted option must not be silently discarded. --json is accepted for
+// confine-dump (like its confine-list/confine-budget siblings), so a
+// successful dump's stdout summary must actually be JSON when --json is
+// passed, not the plain-text sentence unconditionally.
+//
+// verifies: AIRA (admission-counter rebuild) S18
+func TestConfineDumpJSONFlagIsHonouredOnSuccess(t *testing.T) {
 	dir := t.TempDir()
 	dumpPath := filepath.Join(dir, "dump.jsonl")
-	var seen []string
-	peak := int64(123 << 20)
-	injected := dispatcherFunc(func(_ context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
-		seen = append(seen, request.Verb)
-		if scope.ProjectID != "" || scope.Root != "" {
-			t.Fatalf("resolved a project scope %+v; confine-dump is project-less", scope)
-		}
-		return core.Response{OK: true, Code: "OK", Data: runner.ConfineDumpResult{
-			Verdict: "ok", Scope: "test-universe",
-			Admissions: []runner.ConfineDumpAdmissionRow{{
-				RecordType: runner.ConfineDumpRecordAdmission, Kind: "confine", Signature: "make test",
-				ObservedPeakBytes: &peak, Outcome: runner.ConfineDumpUnevaluated,
-			}},
-			Queues: []runner.ConfineDumpQueueRow{{RecordType: runner.ConfineDumpRecordQueue, Slice: "/aira.slice"}},
-		}}
+	injected := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+		return core.Response{OK: true, Code: "OK", Data: runner.ConfineDumpResult{Verdict: "ok", Scope: "test-universe"}}
 	})
 	var stdout, stderr bytes.Buffer
-	exit := RunWithDispatcher([]string{"confine", "--dump", dumpPath}, &stdout, &stderr, injected)
-	if len(seen) != 1 || seen[0] != "confine-dump" {
-		t.Fatalf("dispatched %v, want exactly one confine-dump; exit=%d stdout=%q stderr=%q", seen, exit, stdout.String(), stderr.String())
-	}
+	exit := RunWithDispatcher([]string{"confine", "--dump", dumpPath, "--json"}, &stdout, &stderr, injected)
 	if exit != 0 {
 		t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
 	}
-	data, err := os.ReadFile(dumpPath)
-	if err != nil {
-		t.Fatalf("dump file not written: %v", err)
+	var summary map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &summary); err != nil {
+		t.Fatalf("--json summary must be valid JSON: %v; stdout=%q", err, stdout.String())
 	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("want 2 JSONL lines, got %d: %q", len(lines), string(data))
+	if summary["written"] != true {
+		t.Fatalf("summary=%+v, want written:true", summary)
 	}
-	var row map[string]any
-	if err := json.Unmarshal([]byte(lines[0]), &row); err != nil {
-		t.Fatalf("line 0 not valid JSON: %v", err)
-	}
-	if row["signature"] != "make test" {
-		t.Fatalf("line 0 = %v", row)
+	if summary["path"] != dumpPath {
+		t.Fatalf("summary=%+v, want path %q", summary, dumpPath)
 	}
 }
 
@@ -159,6 +203,27 @@ func TestConfineDumpUnevaluatedDoesNotWriteAFile(t *testing.T) {
 	}
 	if _, err := os.Stat(dumpPath); err == nil {
 		t.Fatal("no file should have been written for an unevaluated dump")
+	}
+}
+
+// TestConfineDumpHyphenatedVerbRequiresDumpFlag pins the argument-error path
+// of the dedicated `verb == "confine-dump"` arm (main.go): with no --dump the
+// invoking process's own filesystem has no target, and that must be an
+// argument error rather than a silent no-op or a nil-pointer write attempt.
+//
+// verifies: AIRA (admission-counter rebuild) S18
+func TestConfineDumpHyphenatedVerbRequiresDumpFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher([]string{"confine-dump"}, &stdout, &stderr,
+		dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+			t.Fatal("must not reach the dispatcher with no --dump")
+			return core.Response{}
+		}))
+	if exit == 0 {
+		t.Fatalf("exit=0, want a refusal; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "E_CONFINE_ARGUMENT_INVALID") {
+		t.Fatalf("stderr must name the argument error: %q", stderr.String())
 	}
 }
 

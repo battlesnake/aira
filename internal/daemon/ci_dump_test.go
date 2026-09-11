@@ -386,3 +386,145 @@ func TestConfineDumpWritesNoQuota(t *testing.T) {
 		t.Fatalf("confine-dump wrote to the database: total_changes %d -> %d", before, after)
 	}
 }
+
+// TestConfineDumpWaitersReportRealWaitAndOutcome pins design §12's "per
+// admission: ... wait time, and outcome" for the population where those
+// terms actually exist: an admission still live in the daemon's in-memory
+// queue at dump time. It exercises all three shapes waiterOutcomeName /
+// waiterStateName distinguish:
+//   - a still-QUEUED waiter: outcome unevaluated (genuinely undecided), a
+//     real in-progress wait measured from its own enqueue time;
+//   - a GRANTED waiter that waited: state "granted", outcome "waited", its
+//     daemon-finalised waitedMS;
+//   - a GRANTED waiter admitted immediately: outcome "immediate", waitedMS 0
+//     (a REAL zero, not a fabricated one -- it never queued).
+//
+// verifies: AIRA (admission-counter rebuild) S18
+func TestConfineDumpWaitersReportRealWaitAndOutcome(t *testing.T) {
+	server := ciDumpTestServer(t)
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	server.admitNow = func() time.Time { return now }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, 0, 0, false, "no memory reader configured for this test"
+	}
+	injectCIDumpQueue(server, "/aira.slice", func(queue *sliceQueue) {
+		queue.waiters = []*admitWaiter{
+			{state: admitQueued, scopeID: "s-queued", signature: "queued-cmd", enqueued: now.Add(-12 * time.Second), reserve: 1 << 20, cpu: 1},
+			{state: admitGranted, accounted: true, scopeID: "s-waited", signature: "waited-cmd", enqueued: now.Add(-40 * time.Second), reserve: 2 << 20, cpu: 2, outcome: "waited", waitedMS: 25_000},
+			{state: admitGranted, accounted: true, scopeID: "s-immediate", signature: "immediate-cmd", enqueued: now, reserve: 4 << 20, cpu: 1, outcome: "immediate", waitedMS: 0},
+		}
+	})
+
+	response := server.confineDump(map[string]any{"owner": "session-a"})
+	if !response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	result := response.Data.(runner.ConfineDumpResult)
+	if len(result.Waiters) != 3 {
+		t.Fatalf("want 3 waiter records, got %d: %+v", len(result.Waiters), result.Waiters)
+	}
+	byScope := map[string]runner.ConfineDumpWaiterRow{}
+	for _, row := range result.Waiters {
+		if row.RecordType != runner.ConfineDumpRecordWaiter {
+			t.Fatalf("record_type = %q", row.RecordType)
+		}
+		if row.Slice != "/aira.slice" {
+			t.Fatalf("slice = %q", row.Slice)
+		}
+		byScope[row.ScopeID] = row
+	}
+
+	queued, ok := byScope["s-queued"]
+	if !ok {
+		t.Fatalf("missing s-queued: %+v", result.Waiters)
+	}
+	if queued.State != "queued" {
+		t.Fatalf("queued.State = %q", queued.State)
+	}
+	if queued.Outcome != runner.ConfineDumpUnevaluated {
+		t.Fatalf("queued.Outcome = %q, want unevaluated (genuinely undecided)", queued.Outcome)
+	}
+	if queued.WaitMS != 12_000 {
+		t.Fatalf("queued.WaitMS = %d, want 12000 (real in-progress wait)", queued.WaitMS)
+	}
+	if queued.ReserveBytes != 1<<20 || queued.CPUCores != 1 {
+		t.Fatalf("queued resource vector = %+v", queued)
+	}
+	if queued.Signature != "queued-cmd" {
+		t.Fatalf("queued.Signature = %q", queued.Signature)
+	}
+
+	waited, ok := byScope["s-waited"]
+	if !ok {
+		t.Fatalf("missing s-waited: %+v", result.Waiters)
+	}
+	if waited.State != "granted" || waited.Outcome != "waited" {
+		t.Fatalf("waited = %+v", waited)
+	}
+	if waited.WaitMS != 25_000 {
+		t.Fatalf("waited.WaitMS = %d, want 25000 (the daemon-finalised waitedMS, not a re-derived figure)", waited.WaitMS)
+	}
+
+	immediate, ok := byScope["s-immediate"]
+	if !ok {
+		t.Fatalf("missing s-immediate: %+v", result.Waiters)
+	}
+	if immediate.State != "granted" || immediate.Outcome != "immediate" {
+		t.Fatalf("immediate = %+v", immediate)
+	}
+	if immediate.WaitMS != 0 {
+		t.Fatalf("immediate.WaitMS = %d, want 0 (real: never queued)", immediate.WaitMS)
+	}
+}
+
+// TestConfineDumpAvailableUsesCurrentJobCountNotAProspectiveNewAdmission
+// pins the headroom-basis fix: the dump reports the CURRENT ledger's own
+// excursion, so its headroom must scale with the queue's OWN outstandingJobs
+// count (what admission is already charging for), never with jobs+1 (what
+// admitConnection computes when sizing a PROSPECTIVE new admission that has
+// not arrived) and never a hardcoded 0 regardless of how many jobs the
+// slice actually holds -- either of those would make `available` read more
+// optimistic than what the evaluator itself would compute right now.
+//
+// verifies: AIRA (admission-counter rebuild) S18
+func TestConfineDumpAvailableUsesCurrentJobCountNotAProspectiveNewAdmission(t *testing.T) {
+	server := ciDumpTestServer(t)
+	// A non-zero per-job headroom term, so headroom(N) and headroom(N+1)
+	// actually differ and the test can tell them apart.
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 100 << 20 // 100 MiB per job
+	const ceiling = int64(2) << 30                  // 2 GiB
+	const outstanding = int64(500) << 20            // 500 MiB
+	const jobs = 3
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, ceiling, 0, true, ""
+	}
+	injectCIDumpQueue(server, "/aira.slice", func(queue *sliceQueue) {
+		queue.outstanding = outstanding
+		queue.outstandingJobs = jobs
+	})
+
+	response := server.confineDump(map[string]any{"owner": "session-a"})
+	if !response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	row := response.Data.(runner.ConfineDumpResult).Queues[0]
+	if row.AvailableBytes == nil {
+		t.Fatal("available_bytes must be established")
+	}
+	// The CORRECT basis: headroom(outstandingJobs=3) = 300 MiB.
+	// available = ceiling - headroom - outstanding = 2GiB - 300MiB - 500MiB.
+	wantHeadroom := int64(3) * (100 << 20)
+	wantAvailable := ceiling - wantHeadroom - outstanding
+	if *row.AvailableBytes != wantAvailable {
+		// The two wrong bases this pins against, named so a regression's
+		// failure message says WHICH wrong basis crept back in:
+		zeroJobsHeadroom := int64(0)
+		zeroJobsAvailable := ceiling - zeroJobsHeadroom - outstanding
+		jobsPlusOneHeadroom := int64(4) * (100 << 20)
+		jobsPlusOneAvailable := ceiling - jobsPlusOneHeadroom - outstanding
+		t.Fatalf("available_bytes = %d, want %d (headroom at outstandingJobs=%d); "+
+			"got the hardcoded-0-jobs basis (%d) or the jobs+1 prospective-admission basis (%d) instead",
+			*row.AvailableBytes, wantAvailable, jobs, zeroJobsAvailable, jobsPlusOneAvailable)
+	}
+}
