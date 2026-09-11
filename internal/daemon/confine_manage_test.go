@@ -130,13 +130,11 @@ func TestConfineRegistryRejectsDuplicateScopeID(t *testing.T) {
 
 func TestConfineListSliceReserveSummary(t *testing.T) {
 	const (
-		maximum     = int64(16 << 30)
-		granted     = int64(3 << 30)
-		adopted     = int64(4 << 30)
-		jobs        = 2
-		adoptedJobs = 3
-		base        = int64(2 << 30)
-		supervisor  = int64(64 << 20)
+		maximum    = int64(16 << 30)
+		granted    = int64(3 << 30)
+		jobs       = 2
+		base       = int64(2 << 30)
+		supervisor = int64(64 << 20)
 	)
 	// AIRA-68: the two connection-held jobs are REAL waiters of the two real
 	// populations — one scope-backed `aira confine` job and one scope-less
@@ -231,7 +229,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		// is asserted as a lower bound rather than an equality.
 		frozen := time.Now()
 		server.admitNow = func() time.Time { return frozen }
-		queue := &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs, adopted: adopted, adoptedJobs: adoptedJobs}
+		queue := &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs}
 		queue.waiters = []*admitWaiter{
 			{seq: 1, reserve: scopeBackedBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{}), scopeID: "CONFINE-job-5101-abc", name: "job", owner: "session-a"},
 			// AIRA-108: the scope-less waiter carries the signature and grant
@@ -255,14 +253,14 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		if !response.OK || !ok || result.SliceReserve == nil {
 			t.Fatalf("response=%+v result=%+v", response, result)
 		}
-		wantJobs := jobs + adoptedJobs
-		// Ceiling scales headroom by TOTAL admitted jobs (outstanding+adopted)+1.
-		wantCeiling := maximum - base - int64(jobs+adoptedJobs+1)*supervisor
+		wantJobs := jobs
+		// Ceiling scales headroom by admitted jobs + 1.
+		wantCeiling := maximum - base - int64(jobs+1)*supervisor
 		// Queued/FreezePhase are the AIRA-59 diagnostics. This fixture has no
 		// queued waiters, so a KNOWN zero and "idle" are the correct report —
 		// never "unevaluated", which is reserved for state that cannot be read.
 		want := withSystemFrame(runner.ConfineSliceReserve{
-			GrantedBytes: granted + adopted, CeilingBytes: wantCeiling, Jobs: wantJobs, Queued: 0, FreezePhase: "idle",
+			GrantedBytes: granted, CeilingBytes: wantCeiling, Jobs: wantJobs, Queued: 0, FreezePhase: "idle",
 			// The split names WHICH population each job belongs to, so the job
 			// count can never again be read against the scope table above it.
 			ScopeJobs: 1, ScopeBytes: scopeBackedBytes,
@@ -274,35 +272,9 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 				State: runner.ConfineReservationStateHolding, Signature: "pytest:tools/test_x.py::test_y",
 				Reserve: reservationBytes, HeldMS: 90000,
 			}},
-			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
 		})
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want %+v", got, want)
-		}
-	})
-
-	t.Run("adopted-only", func(t *testing.T) {
-		server, path := setup(t)
-		server.admitQueues[path].outstanding = 0
-		server.admitQueues[path].outstandingJobs = 0
-		server.admitQueues[path].waiters = nil
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return sliceCurrent, maximum, sliceReclaimable, true, ""
-		}
-		response := server.confineManagement(context.Background(), request)
-		result, ok := response.Data.(runner.ConfineListResult)
-		if !response.OK || !ok || result.SliceReserve == nil {
-			t.Fatalf("response=%+v result=%+v", response, result)
-		}
-		wantCeiling := maximum - base - int64(adoptedJobs+1)*supervisor
-		want := withSystemFrame(runner.ConfineSliceReserve{
-			GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs, Queued: 0, FreezePhase: "idle",
-			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
-		})
-		// Reservations is nil here, and that is a POSITIVE fact from the same
-		// walk (this fixture cleared the waiter list), not an unevaluated read.
-		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
-			t.Fatalf("slice reserve=%+v, want adopted-only %+v", got, want)
 		}
 	})
 

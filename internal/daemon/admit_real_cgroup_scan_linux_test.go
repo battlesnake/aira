@@ -15,7 +15,15 @@ import (
 	"aira/internal/testdeadline"
 )
 
-func TestAdmitReconstructionRealCgroupEvaluationDoesNotDeadlock(t *testing.T) {
+// TestAdmitRealCgroupScanEvaluationDoesNotDeadlock drives evaluateAdmitQueue
+// through a REAL confine scan over a populated cgroup scope. The scan survives
+// S12 (it still feeds liveScopes and the scopeVanished transition; only the
+// AIRA-74 reserve adoption was deleted), so this is still the regression guard
+// that the scan's registry interaction does not re-acquire queue.mu and
+// deadlock. With adoption gone the populated scope reconstructs no reserve, so
+// the queued waiter the old adoption charge used to block now fits the ceiling
+// and is granted — pinning that the deletion removed the spurious wait.
+func TestAdmitRealCgroupScanEvaluationDoesNotDeadlock(t *testing.T) {
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
@@ -71,7 +79,13 @@ func TestAdmitReconstructionRealCgroupEvaluationDoesNotDeadlock(t *testing.T) {
 	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("evaluateAdmitQueue deadlocked during real confine scan")
 	}
-	if queue.adopted != 16<<20 || queue.adoptedJobs != 1 || waiter.state != admitQueued {
-		t.Fatalf("adopted=%d jobs=%d waiter=%v, want %d/1/queued", queue.adopted, queue.adoptedJobs, waiter.state, 16<<20)
+	// The scan still runs and enumerates the live scope (liveScopesKnown true,
+	// one live scope), but contributes no reserve, so the 9 MiB waiter fits the
+	// 24 MiB ceiling and is granted rather than blocked by a reconstructed charge.
+	if waiter.state != admitGranted {
+		t.Fatalf("waiter=%v, want granted (S12 deleted the adoption charge that used to block it)", waiter.state)
+	}
+	if !queue.liveScopesKnown || queue.liveScopes != 1 {
+		t.Fatalf("liveScopesKnown=%v liveScopes=%d, want true/1 (the scan still observes the populated scope)", queue.liveScopesKnown, queue.liveScopes)
 	}
 }

@@ -28,16 +28,17 @@ func populationTestScopeID(name string, pid int) string {
 	return "CONFINE-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
-// verifies: the ledger reports connection-held SCOPE-BACKED jobs, connection-held
-// SCOPE-LESS reservations and scan-adopted scopes as three separate populations,
-// in both counts and bytes, while the totals keep their present meaning.
+// verifies: the ledger reports connection-held SCOPE-BACKED jobs and
+// connection-held SCOPE-LESS reservations as separate populations, in both
+// counts and bytes, while the totals keep their present meaning. (A third
+// scan-adopted population was deleted in S12.)
 //
 // The classifier is scopeID, and nothing else. Classifying on name or owner
 // would pass a naive test, because validateAdmitArgs requires the
 // scope_id/name/owner tuple to be supplied together — so the mutation this test
 // must break is "treat every connection-held grant as scope-backed", not
 // "classify by name".
-func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
+func TestAdmitSnapshotSeparatesTheLedgerPopulations(t *testing.T) {
 	server := NewServer(Paths{})
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
 	queue.waiters = []*admitWaiter{
@@ -50,7 +51,6 @@ func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
 	}
 	queue.outstanding = 20<<30 + 512<<20 + 1<<30 + 1<<30 + 512<<20
 	queue.outstandingJobs = 5
-	queue.adopted, queue.adoptedJobs = 8<<30, 2
 	server.admitQueues["/slice"] = queue
 
 	snapshot := server.admitSliceSnapshot("/slice")
@@ -60,9 +60,6 @@ func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
 	}
 	if snapshot.reservationJobs != 3 || snapshot.reservationBytes != 1<<30+1<<30+512<<20 {
 		t.Errorf("scope-less reservation population = %d jobs / %d bytes, want 3 / %d", snapshot.reservationJobs, snapshot.reservationBytes, int64(1<<30+1<<30+512<<20))
-	}
-	if snapshot.adoptedJobs != 2 || snapshot.adopted != 8<<30 {
-		t.Errorf("adopted population = %d jobs / %d bytes, want 2 / %d", snapshot.adoptedJobs, snapshot.adopted, int64(8<<30))
 	}
 	if snapshot.queued != 1 {
 		t.Errorf("queued = %d, want 1 (the split must not swallow queued waiters)", snapshot.queued)
@@ -138,7 +135,7 @@ func TestAdmitSnapshotAbsentQueueStaysAGenuineIdleZero(t *testing.T) {
 	if snapshot.present {
 		t.Fatal("absent queue reported present; callers would render a fabricated ledger")
 	}
-	if snapshot.outstanding != 0 || snapshot.outstandingJobs != 0 || snapshot.adopted != 0 || snapshot.adoptedJobs != 0 {
+	if snapshot.outstanding != 0 || snapshot.outstandingJobs != 0 {
 		t.Fatalf("absent queue reported non-zero totals: %+v", snapshot)
 	}
 	if snapshot.scopeJobs != 0 || snapshot.reservationJobs != 0 || snapshot.vanishedJobs != 0 {

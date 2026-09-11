@@ -50,13 +50,13 @@ func TestConfineListReserveRenderHonoursEstablished(t *testing.T) {
 			t.Fatalf("absent-ledger summary dropped the independently-read ceiling:\n%s", out)
 		}
 		// The precise fabrications this ticket exists to end — including the
-		// population-split line the ticket quotes as its symptom (the "0 adopted
-		// scopes" AIRA-105 misreading), which is derived from the same absent
-		// snapshot and must go unevaluated in lockstep, not print fabricated zeros.
+		// population-split line the ticket quotes as its symptom (the AIRA-105
+		// misreading), which is derived from the same absent snapshot and must go
+		// unevaluated in lockstep, not print fabricated zeros.
 		if strings.Contains(out, "0B granted") || strings.Contains(out, "across 0 admitted") {
 			t.Fatalf("absent-ledger summary fabricated an empty slice:\n%s", out)
 		}
-		if strings.Contains(out, "of which: 0 confine") || strings.Contains(out, "0 adopted scopes") {
+		if strings.Contains(out, "of which: 0 confine") {
 			t.Fatalf("absent-ledger summary fabricated a population split:\n%s", out)
 		}
 	})

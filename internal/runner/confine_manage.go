@@ -135,8 +135,7 @@ type ConfineRecord struct {
 	// which is why this is a pointer rather than an int64 with a sentinel.
 	//
 	// Summed over one listing's rows it reconciles with that listing's own
-	// ScopeBytes + AdoptedBytes, up to the one-scan-interval skew the adopted
-	// ledger already documents.
+	// ScopeBytes.
 	ReserveBytes      *int64   `json:"reserve_bytes"`
 	Pending           bool     `json:"pending,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
@@ -314,28 +313,22 @@ type ConfineSliceReserve struct {
 	Jobs         int   `json:"jobs"`
 	// GrantedEstablished is the honesty bit for the ledger-derived numbers on
 	// this struct (AIRA-220): GrantedBytes, Jobs, and the population split
-	// (ScopeJobs/ScopeBytes, ReservationJobs/ReservationBytes,
-	// AdoptedJobs/AdoptedBytes) are meaningful ONLY when it is true. Its precise
-	// meaning: a queue (ledger) object exists for the slice — its adopted half is
-	// as fresh as the last successful cgroup scan. It is false whenever the daemon
-	// holds no queue object at all, which is NOT only a fresh/restarted daemon
-	// before its first admission: a queue exists only while something is
-	// connection-held, so pruneAdmitQueue deletes it (adopted ledger included) the
-	// moment the last waiter releases. So a slice with live ADOPTED jobs but
-	// nothing connection-held right now also reads false. A false bit must render
-	// as `unevaluated`, never as a `0B granted / 0 admitted jobs` that reads "the
-	// slice is empty, launch freely" while jobs are in fact live. Known accepted
-	// gaps a true bit does NOT rule out (documented, not machined away per the
-	// simplicity rule): a failed adopted scan leaves a stale/zero adopted figure
-	// with present still true, and a sub-millisecond window between queue
-	// registration and the first adoption scan. Since S3 deleted the AIRA-114
-	// over-subscription bound, that scan-failure gap is now UNSIGNALLED on
-	// `confine --list` — the daemon log line `aira daemon: confine reserve scan
-	// failed` (admit.go) is the only signal — until S12 deletes the adopted
-	// ledger entirely and closes the gap. Recorded against AIRA-220's
-	// accepted-gap record; no wire bit is added, as S12 removes this surface.
-	// CeilingBytes is an independent memory read and stays valid regardless of
-	// this bit.
+	// (ScopeJobs/ScopeBytes, ReservationJobs/ReservationBytes) are meaningful ONLY
+	// when it is true. Its precise meaning: a queue (ledger) object exists for the
+	// slice. It is false whenever the daemon holds no queue object at all, which
+	// is NOT only a fresh/restarted daemon before its first admission: a queue
+	// exists only while something is connection-held, so pruneAdmitQueue deletes
+	// it the moment the last waiter releases. A false bit must render as
+	// `unevaluated`, never as a `0B granted / 0 admitted jobs` that reads "the
+	// slice is empty, launch freely" while jobs are in fact live.
+	//
+	// S11 (design §4) also makes it false while the restart new-admission freeze
+	// is active or any reloaded lease is still unanchored — the granted total is
+	// not yet settled. (Before S12 a scan-adoption reserve was also folded in
+	// here, with a scan-failure staleness gap; S12 deleted that reserve, so the
+	// only ledger now is the connection-held one and the gap is gone. S11's reload
+	// + re-declare is the post-restart guard in its place.) CeilingBytes is an
+	// independent memory read and stays valid regardless of this bit.
 	GrantedEstablished bool `json:"granted_established"`
 	// Queued and FreezePhase answer "what is stuck, and why" for the admission
 	// queue. Root-causing AIRA-59 required source reading precisely because
@@ -391,28 +384,29 @@ type ConfineSliceReserve struct {
 	// scope id, so its output is unchanged.
 	ResolvedReserveBytes int64 `json:"resolved_reserve_bytes,omitempty"`
 
-	// AIRA-68. Jobs and GrantedBytes above are TOTALS over three structurally
-	// different populations, and only two of them can ever appear as a row in the
+	// AIRA-68. Jobs and GrantedBytes above are TOTALS over two structurally
+	// different populations, and only one of them can ever appear as a row in the
 	// Scopes table:
 	//
 	//   ScopeJobs        connection-held `aira confine` jobs        -> a row
 	//   ReservationJobs  connection-held `aira confine-reserve`
 	//                    per-test reservations, which create NO
 	//                    cgroup scope at all                        -> NO row
-	//   AdoptedJobs      scopes adopted by the daemon's scan        -> a row
+	//
+	// (A third population, S12-deleted: scopes the daemon's scan ADOPTED after a
+	// restart. S11's reload + re-declare re-seeds survivors as connection-held
+	// leases instead, so they now count under ScopeJobs.)
 	//
 	// Comparing Jobs against len(Scopes) is therefore invalid, and doing so is
 	// what produced AIRA-68's P0 "23 admitted jobs, only 3 live scopes" report:
 	// 20 of those were healthy per-test reservations from a running
 	// --delegate-ram pytest suite. Jobs > len(Scopes) is the EXPECTED shape while
 	// such a suite runs. Consumers wanting "how much is charged to something with
-	// a scope" want ScopeBytes + AdoptedBytes, never GrantedBytes.
+	// a scope" want ScopeBytes, never GrantedBytes.
 	ScopeJobs        int   `json:"scope_jobs"`
 	ScopeBytes       int64 `json:"scope_bytes"`
 	ReservationJobs  int   `json:"reservation_jobs"`
 	ReservationBytes int64 `json:"reservation_bytes"`
-	AdoptedJobs      int   `json:"adopted_jobs"`
-	AdoptedBytes     int64 `json:"adopted_bytes"`
 
 	// VanishedJobs/VanishedBytes are a SUBSET of ScopeJobs/ScopeBytes: leases
 	// whose scope the daemon's own scan observed and then observed gone. They are
