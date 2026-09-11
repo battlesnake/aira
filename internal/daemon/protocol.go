@@ -84,12 +84,14 @@ import (
 // coupled wire changes, both silent below this layer:
 //   - S5 added a `cpu` arg (integer cores) to the `admit` request — the second
 //     ledger resource. Its bump was deferred to here (admission_linux.go).
-//   - S7 froze the version-frozen re-declare frame (design §4) and switched the
-//     ledger to the signed `ceiling − Σleases` model. An OLD (v0.5 / proto-9)
-//     client's NEW admission must now be refused LOUDLY — a re-declare (the ARDR
-//     frame, sniffed BEFORE this check in server.go) is the ONLY cross-version
-//     path, so an unbumped version would let a proto-9 client's new admission
-//     negotiate against a signed-ledger daemon that no longer speaks its shape.
+//   - S7 froze the version-frozen re-declare frame (design §4). (The signed
+//     `ceiling − Σleases` ledger it serves landed EARLIER — S2 introduced it, S4 made
+//     it the admission gate — NOT at S7; S7 only froze the re-declare frame and carried
+//     the S5 `cpu`-arg bump above.) An OLD (v0.5 / proto-9) client's NEW admission must
+//     now be refused LOUDLY — a re-declare (the ARDR frame, sniffed BEFORE this check in
+//     server.go) is the ONLY cross-version path, so an unbumped version would let a
+//     proto-9 client's new admission negotiate against a signed-ledger daemon that no
+//     longer speaks its shape.
 //
 // The re-declare frame is deliberately NOT gated by this number: it is sniffed
 // by its magic ahead of the proto check precisely so an upgrade (OLD client ↔

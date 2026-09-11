@@ -18,19 +18,20 @@ import (
 // MaxFrameBytes. That single inequality is what lets the magic sniff and the
 // normal length-prefixed framer coexist unambiguously — a normal frame's size
 // header can never equal the magic, and the magic can never be read as a legal
-// frame length. It also asserts the two representations of the magic agree, so
-// ardrMagic (the wire bytes) and ardrMagicValue (the u32) cannot silently drift.
+// frame length. The magic's numeric value is decoded from the wire bytes here
+// (ardrMagic is the single source of truth), so there is no second constant to drift.
 //
-// MUTATION: raising MaxFrameBytes above ardrMagicValue reds THIS test (not the
+// MUTATION: raising MaxFrameBytes above the magic value reds THIS test (not the
 // happy-path sniff test, which still routes correctly — it is the DISJOINTNESS
 // guarantee that breaks, and this is its pin).
 func TestReDeclareMagicIsDisjointFromFrameLength(t *testing.T) {
-	if got := binary.BigEndian.Uint32(ardrMagic[:]); got != ardrMagicValue {
-		t.Fatalf("ardrMagic bytes decode to 0x%08x, but ardrMagicValue is 0x%08x — the two representations have drifted", got, ardrMagicValue)
+	magicValue := binary.BigEndian.Uint32(ardrMagic[:])
+	if magicValue != 0x41524452 {
+		t.Fatalf("ardrMagic bytes decode to 0x%08x, want 0x41524452 (\"ARDR\") — the magic has drifted", magicValue)
 	}
-	if !(MaxFrameBytes < ardrMagicValue) {
+	if !(uint32(MaxFrameBytes) < magicValue) {
 		t.Fatalf("MaxFrameBytes (0x%08x) must stay STRICTLY BELOW the ARDR magic (0x%08x): "+
-			"a normal frame length could otherwise be mistaken for the magic and vice-versa (Invariant 8)", MaxFrameBytes, ardrMagicValue)
+			"a normal frame length could otherwise be mistaken for the magic and vice-versa (Invariant 8)", MaxFrameBytes, magicValue)
 	}
 	if !(maxReDeclareFrameBytes < MaxFrameBytes) {
 		t.Fatalf("maxReDeclareFrameBytes (%d) must stay below MaxFrameBytes (%d)", maxReDeclareFrameBytes, MaxFrameBytes)
@@ -133,6 +134,13 @@ func TestReDeclareParserIsTotal(t *testing.T) {
 
 	oversizeLen := append(append([]byte{}, ardrMagic[:]...), 0x00, 0x01, 0x00, 0x01) // 65537 > 65536
 
+	// frame_len == maxReDeclareFrameBytes (65536) — the EXACT boundary. It PASSES the
+	// length gate (the bound is `> max`, so the max itself is allowed), then the body
+	// parser rejects: the declared 65536-byte body is not present (truncation). Pins the
+	// `> max` (not `>= max`) boundary, and that a large declared length with no body is
+	// still a bounded reject.
+	boundaryLen := append(append([]byte{}, ardrMagic[:]...), 0x00, 0x01, 0x00, 0x00) // 65536 == 65536
+
 	// frame_len = 8 but scope_id_len = 100 overruns the 8-byte body.
 	scopeOverrun := append([]byte{}, ardrMagic[:]...)
 	scopeOverrun = append(scopeOverrun, 0x00, 0x00, 0x00, 0x08)
@@ -175,6 +183,7 @@ func TestReDeclareParserIsTotal(t *testing.T) {
 		"wrong magic":     badMagic,
 		"zero frame_len":  zeroLen,
 		"oversize len":    oversizeLen,
+		"boundary len":    boundaryLen,
 		"scope overrun":   scopeOverrun,
 		"trailing byte":   trailing,
 		"empty scope id":  emptyScope,
@@ -202,14 +211,25 @@ func TestReDeclareParserIsTotal(t *testing.T) {
 	}
 
 	// Deterministic fuzz: no byte sequence may panic the parser. Half carry the
-	// magic prefix to drive the post-magic field parser harder.
+	// magic prefix AND an in-range frame_len, so the post-magic body field parser is
+	// reached on every magic iteration. (A random u32 in bytes 4..7 would almost
+	// always exceed maxReDeclareFrameBytes and reject before the body parser ran, so
+	// the fuzz would exercise little beyond the length check — the body parser's
+	// deterministic coverage is the reject table + the every-prefix loop above; this
+	// fuzz is the no-panic property over arbitrary bodies.)
 	rng := rand.New(rand.NewSource(0x5137))
 	for i := 0; i < 4000; i++ {
 		n := rng.Intn(80)
+		if i%2 == 0 && n < 8 {
+			n = 8 // room for magic + frame_len
+		}
 		raw := make([]byte, n)
 		rng.Read(raw)
-		if i%2 == 0 && n >= 4 {
+		if i%2 == 0 {
 			copy(raw, ardrMagic[:])
+			// A small, in-range frame_len so the parser proceeds PAST the length gate
+			// into the body field parser this iteration.
+			binary.BigEndian.PutUint32(raw[4:8], uint32(rng.Intn(72)))
 		}
 		// A panic here fails the test; the return value is intentionally ignored —
 		// the property under test is "returns, never panics; parse xor reject".

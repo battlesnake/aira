@@ -99,6 +99,15 @@ Branch `admission-counter-planfix`. Each slice = one two-loop (Opus builds, Fabl
 3. **Tests:** re-declare accepted during freeze; same-uid re-declare accepted for a holder living OUTSIDE its own scope (confine + aitest); assert no cgroup-membership check. **Mutation:** make the refuse path `return` (→ `defer conn.Close()` drops the lease) → a "refuse-keeps-lease-alive" test reds.
 4. **Deps:** S7, S8.
 5. **Parallel:** **Y with S10** (`serveConnection` handler vs `Serve` shutdown).
+6. **STANDING INSTRUCTIONS (gathered from the S6/S7/S8 work-reviews — the S9 builder MUST satisfy all):**
+   1. **Route the sniffed frame's `charge()` STRAIGHT to the SET** (`enqueueResolvedConfineAdmit`, or a thin wrapper), NOT through `admitConnection`'s front half. Three pre-enqueue refusals there violate Inv 6 for a re-declare: the `cpu > cpuCeiling()` fail-fast, `writeAdmitFailClosed` on an unresolvable slice / unreadable memory, and the `reserve > ceiling` `TooLarge` check. The SET's early-return (admit.go, the `request.scopeID != "" && existing.state == admitGranted` branch) is deliberately BEFORE those gates so a re-declare skips them.
+   2. **S9 resolves the anchor inputs itself** — `conn`, `peerSameUID`, `clientPID`, `processStartTick` — via `peerCredentialOf(conn)` + `readProcStartTime(pid)` (that resolution currently lives only in `admitConnection`). Pass the handler's own raw `conn` to BOTH the SET and the release (compare-and-release keys on conn identity, S8 fix).
+   3. **Set its own read deadline** on the held connection (AIRA-84, the server.go Connect-deadline invariant) — the S7 stub still runs under the Connect deadline.
+   4. **Hold the connection; never `return`/close on refuse** (Invariant 4 / §3: the daemon never closes a lease-bearing connection on error). The S7 stub closes after the ack — S9 must replace that with the SET + hold.
+   5. **The 1-byte ack write failure must NOT release the lease** — leave it anchored and let EOF decide (§3). A write error on a small frame ≈ peer gone, but the release is EOF-keyed, not write-keyed.
+   6. **SO_PEERCRED same-uid gate via `unixPeerCredential`/`peerCredentialOf`; NO cgroup-membership check** (P2-C — a confine/aitest holder lawfully lives outside its own scope). `peerSameUID` fails closed on an unreadable credential.
+   7. **The GATE TEST must assert the LEDGER, not `charge()`** (S7 froze the golden test at the pure `charge()` projection because the stub touches no ledger): drive `goldenReDeclareFrame` through `serveConnection` on a Server with a real ledger; assert the ledger snapshot holds exactly `{scope:"child", ram:5 GiB, cpu:2, parent:"parent"}` and Σleases moved by exactly that. **Mutation:** S9 handler ignores `parent_scope_id` → reds. Also decide (and pin) whether the frame's `parent_scope_id` SETs the lease's `parentScopeID`.
+   - The re-anchor grant response on the interim S8 path carries the ORIGINAL `outcome`/`waitedMS`/`basis` (the SET refreshes reserve+cpu only) — cosmetic, because S9's 1-byte ack REPLACES that framed response. No S8 fix; noted so S9 does not re-raise it.
 
 ### S10 — Dump-on-shutdown
 1. **Goal:** persist the live-lease ledger on graceful shutdown as frozen ARDR records + pid + start-tick + parent_scope_id.
@@ -128,6 +137,7 @@ Branch `admission-counter-planfix`. Each slice = one two-loop (Opus builds, Fabl
 4. **Deps:** S9 (daemon re-declare handler), S11 (freeze).
 5. **Parallel:** N (shares `admit.go` eval-loop region with S12).
 6. **Gate exit:** confine-only restart-under-load merge test passes here (see MERGE GATE).
+7. **CUTOVER note (S7 work-review #2):** the proto 9→10 bump makes a NEW (proto-10) confine client launched against a STILL-OLD (proto-9) daemon hit a silent path — `admission_linux.go` `fail()` falls into the flock fallback with no `warnAdmission` naming the mismatch (the CLI `exchangeWithReplacement` and `--exclusive` paths DO detect+replace; the non-exclusive `confine` path does not). Until this slice deletes the fallback, the one-off mitigation is a **cutover-runbook rule: reinstall the PATH binary and restart `aira-daemon.service` atomically, before any new confine launches** (and `--require-admission`, AIRA-222, already fails such a launch closed). S13 DELETES the fallback, which removes the silent path entirely; if a code diagnostic is wanted before then, have the non-exclusive path name "protocol" in the diagnostics stream before falling back. Not blocking — on-branch nothing is live.
 
 ---
 

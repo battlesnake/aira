@@ -19,8 +19,8 @@ import (
 //   - Sniffed by its 4-byte magic "ARDR" BEFORE any framing/handshake and BEFORE
 //     the protocol-version check (server.go serveConnection). That ordering is
 //     load-bearing: a version skew must NOT refuse a re-declare (Invariant 6/8).
-//   - The magic read as a big-endian uint32 is ardrMagicValue (0x41524452,
-//     ~1.09 GB), STRICTLY GREATER than MaxFrameBytes (16 MB). A normal
+//   - The magic read as a big-endian uint32 is 0x41524452 (~1.09 GB), STRICTLY
+//     GREATER than MaxFrameBytes (16 MB). A normal
 //     length-prefixed frame's u32 size header can therefore never equal the
 //     magic, and the magic can never be read as a valid frame length — the two
 //     wire kinds are disjoint by construction. This inequality is the frozen
@@ -42,15 +42,11 @@ import (
 //   - A frozen 1-byte ack (reDeclareAckByte) is written by the daemon after it
 //     SETs the lease; the ack is order-independent (design §4).
 //
-// The SAME encoder/decoder is reused for the dump-on-shutdown records (§15,
-// P2-B: "one Go encoder, one golden fixture"), so encode/decode round-trip the
-// full frame (magic included). S9 wires a sniffed frame's charge() into the
-// ledger SET+re-anchor; S10/S11 reuse this codec for the dump.
+// S9 wires a sniffed frame's charge() into the ledger SET+re-anchor. The dump
+// records (§15, P2-B) carry a frame PLUS a pid and process-start-tick, so S10
+// wraps this codec per record rather than reusing it whole — this frame is the
+// wire shape, not the dump record shape.
 const (
-	// ardrMagicValue is the 4-byte ARDR magic as a big-endian uint32:
-	// 'A'0x41 'R'0x52 'D'0x44 'R'0x52. ~1.09 GB, far above MaxFrameBytes.
-	ardrMagicValue = 0x41524452
-
 	// reDeclareAckByte is the FROZEN single-byte re-declare acknowledgement the
 	// daemon writes once a lease is SET (design §4). Its value is arbitrary but
 	// frozen — a re-declaring client waits for exactly one byte, not a framed
@@ -64,9 +60,10 @@ const (
 	maxReDeclareFrameBytes = 64 << 10
 )
 
-// ardrMagic is the on-wire byte order of the sniff token. Kept as a byte array
-// (not derived from ardrMagicValue at runtime) so the invariant test can assert
-// the two representations agree and neither can silently drift from the other.
+// ardrMagic is the on-wire byte order of the sniff token, and the single source of
+// truth for the magic. The disjointness invariant test decodes it to a uint32 and
+// asserts that value stays strictly above MaxFrameBytes, so the frame-length/magic
+// separation cannot silently drift.
 var ardrMagic = [4]byte{'A', 'R', 'D', 'R'}
 
 // reDeclareRecord is the decoded re-declare frame — a pure wire projection. The
