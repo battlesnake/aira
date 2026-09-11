@@ -234,13 +234,21 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		// survivability verb depend on the component most likely to have been
 		// restarted during exactly the long pause it exists to survive.
 		status := options["status"] == "true"
-		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true"
+		// AIRA (admission-counter rebuild) S18.
+		dumpPath := options["dump"]
+		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true" || dumpPath != ""
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
 		if status {
 			return runConfineStatusCommand(context.Background(), options, jsonOutput, stdout, stderr)
+		}
+		// --dump writes a LOCAL FILE (the caller's own filesystem), which is not
+		// something the generic render()-based runConfineManagementCommand does
+		// for any other management flag, so it gets its own command function.
+		if dumpPath != "" {
+			return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
 		}
 		if management {
 			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
@@ -1273,7 +1281,9 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 				i++
 				options["status-selector"] = argv[i]
 			}
-		case "kill", "slice", "owner":
+		// AIRA (admission-counter rebuild) S18. --dump joins kill/slice/owner in
+		// the value-required group: the archival target file path.
+		case "kill", "slice", "owner", "dump":
 			value := inline
 			if !hasInline {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
@@ -1294,14 +1304,15 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	kill := options["kill"] != ""
 	status := options["status"] == "true"
 	budget := options["budget"] == "true"
+	dump := options["dump"] != ""
 	selected := 0
-	for _, chosen := range []bool{list, kill, status, budget} {
+	for _, chosen := range []bool{list, kill, status, budget, dump} {
 		if chosen {
 			selected++
 		}
 	}
 	if selected != 1 {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --kill <selector>, or --status [<selector>]")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --dump <file>, --kill <selector>, or --status [<selector>]")
 	}
 	if !kill && options["steal"] == "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")
