@@ -93,12 +93,29 @@ import (
 //     proto-9 client's new admission negotiate against a signed-ledger daemon that no
 //     longer speaks its shape.
 //
+// ProtocolVersion 11 (was 10): the admission-counter rebuild (S15) rebuilt the
+// worker-admit path onto the same signed ledger, which changed the worker-admit
+// wire's SHAPE and its SEMANTICS, both silent below this layer:
+//   - WorkerAdmitResponse gained parent_scope_id (the suite scope-id a worker
+//     lease sub-reserves under, echoed so the relay can re-declare it VERBATIM),
+//     and available_bytes / available_cpu (the non-blocking probe's current
+//     ledger headroom).
+//   - max_wait_ms semantics inverted: PRESENT-and-zero is now a non-blocking
+//     SNAPSHOT that takes no reservation (it used to be a speculative
+//     try-acquire that could GRANT); ABSENT or PRESENT-and-positive is a
+//     BLOCKING queue-lease claim. The old max-wait ceiling validation is gone.
+//
+// An OLD (proto-10) worker-admit client speaking the try-acquire contract must
+// be refused LOUDLY rather than silently mis-served against the snapshot daemon.
+// The re-declare (ARDR) frame remains sniffed BEFORE this check, so a suite's
+// held worker leases still re-anchor across the upgrade.
+//
 // The re-declare frame is deliberately NOT gated by this number: it is sniffed
 // by its magic ahead of the proto check precisely so an upgrade (OLD client ↔
 // NEW daemon) can re-anchor its leases. Same atomic reinstall+restart
-// requirement as 6-9.
+// requirement as 6-10.
 const (
-	ProtocolVersion = 10
+	ProtocolVersion = 11
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

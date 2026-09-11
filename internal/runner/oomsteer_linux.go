@@ -143,8 +143,8 @@ func readOOMSteerProcs(dir *os.File) []int {
 // through the named confine scope directory.
 //
 // It matches a whole PATH ELEMENT, never a substring, so a scope whose name
-// merely contains another's id can never be mistaken for it — the same rule
-// exclusiveDeniesWorkerAdmit applies for the same reason. Element matching also
+// merely contains another's id can never be mistaken for it — the same rule the
+// daemon's scope-id matching applies for the same reason. Element matching also
 // makes the check mount-point agnostic: /proc/<pid>/cgroup reports a path
 // relative to the cgroup-v2 root, which is not the filesystem path the caller
 // holds, and a confine scope id embeds the minting pid and a nanosecond stamp,

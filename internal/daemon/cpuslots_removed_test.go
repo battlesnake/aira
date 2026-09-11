@@ -67,44 +67,11 @@ func TestS6CPUSlotsGovernorFullyRemovedFromSource(t *testing.T) {
 	}
 }
 
-// verifies: S6 — the INTERIM CPU window. S6 deleted the flock governor that bounded
-// aitest pytest workers' CPU concurrency, but S5's ledger CPU charge is on the
-// `aira confine` / `confine-reserve` admission path, NOT on worker-admit:
-// evaluateWorkerAdmit charges no CPU term, and aitest workers reach the daemon via
-// worker-admit (not confine-reserve — the embedded per-test governor that issued it was
-// retired in AIRA-33). So between S6 and S15 an aitest worker carries NO CPU charge at
-// all (RAM stays bounded by the aggregate guard). This is plan-sanctioned and documented
-// in the S6 code comment + the BUILT (S6) plan record.
-//
-// This test makes that window a CHECKED fact rather than a silent hole: worker_admit.go
-// references none of the ledger's CPU-governance symbols. It reds IF S15 wires the CPU
-// charge INTO worker_admit.go directly.
-//
-// LIMITATION (honest): S15 may instead charge CPU by routing worker-admit through
-// enqueueResolvedConfineAdmit with a populated admitRequest.cpu — in which case
-// worker_admit.go gains no such token and this guard stays GREEN while the window is
-// closed, leaving the interim comments falsely standing. So this guard is a best-effort
-// tripwire, NOT a reliable closure detector. The AUTHORITATIVE closure signal is the
-// plan's §S15 standing instruction to DELETE this test and the two interim comments
-// (worker_admit.go + admission_linux.go) when S15 lands. It is not a claim that no CPU
-// bound is desirable; it is the honest record that there is none yet.
-func TestS6InterimWorkerAdmitCPUUnbounded(t *testing.T) {
-	data, err := os.ReadFile("worker_admit.go")
-	if err != nil {
-		t.Fatalf("read worker_admit.go: %v", err)
-	}
-	body := string(data)
-	// The ledger's CPU-governance symbols (S5). Their ABSENCE from worker_admit.go is the
-	// interim window. `cpuFits` is NOT checked — it is a local in admit.go, not an API
-	// symbol worker-admit would reference. The S6 explanatory comment in worker_admit.go
-	// deliberately avoids these literal tokens, so the guard keys on a real call/field,
-	// not prose about its own absence.
-	for _, token := range []string{"cpuOutstanding", "cpuCeiling("} {
-		if strings.Contains(body, token) {
-			t.Fatalf("worker_admit.go now references %q: worker-admit appears to charge CPU against the ledger. "+
-				"If this is S15 closing the S6->S15 interim window, DELETE this witness test AND the interim "+
-				"comments in worker_admit.go + admission_linux.go (the §S15 standing instruction). "+
-				"If not, the interim-window documentation is now stale and must be corrected.", token)
-		}
-	}
-}
+// S15 CLOSED the S6->S15 interim CPU window: worker-admit now charges each worker's
+// one core against the unified signed ledger (via enqueueResolvedConfineAdmit with a
+// populated admitRequest.cpu), so an aitest worker is CPU-bounded like every other
+// lease. The TestS6InterimWorkerAdmitCPUUnbounded witness that documented the window
+// was deleted here per the plan's §S15 standing instruction, together with the two
+// interim comments in worker_admit.go and runner/admission_linux.go. The mutation that
+// pins the closure now lives beside the worker-admit ledger tests (dropping the worker
+// CPU charge must red a test that reads queue.cpuOutstanding after a worker grant).

@@ -17,43 +17,25 @@ import (
 
 // TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary drives the real
 // `aira worker-admit` binary against a real daemon and asserts the SINGLE
-// structured stdout line the aitest supervisor parses.
+// structured stdout line the aitest supervisor parses, plus that stderr carries no
+// classification. It covers the reachable DETERMINISTIC verdicts: under S15 a
+// blocking claim no longer self-expires (no timeout verdict), and a zero max-wait is
+// a non-blocking snapshot.
 //
-// This test used to assert stderr prose ("worker-admit denied" plus
-// "reject:exceeds-ceiling"), which was the boundary contract before AIRA-42:
-// two channels, with the load-bearing classification carried as a substring of
-// a human sentence. It now asserts what the supervisor actually consumes — one
-// line, exact enum values — and that stderr carries no classification at all.
-//
-// verifies: AIRA-42
+// verifies: AIRA-42, S15
 func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) {
 	binary := buildAiraBinary(t)
 
 	paths := testPaths(t)
 	server := NewServer(paths)
-	// AIRA-39: the ledger sums the outer scope's real `.aira-worker-*` children
-	// and the daemon creates the granted scope itself. The fixture scopes below
-	// are not real cgroups, so both seams are stubbed; neither denial path in
-	// this test reaches a create.
-	_ = newWorkerScopeTree().install(server)
-	server.workerAdmitHeadroom = 0
-	server.workerAdmitPollInterval = time.Millisecond
-	server.admitReadMemory = func(scope string) (int64, int64, int64, bool, string) {
-		switch scope {
-		case "/deny-ceiling":
-			// 2 MiB requested bytes exceed this 1 MiB ceiling even at
-			// zero usage, so workerAdmitConnection returns the permanent
-			// request-invalid denial without polling.
-			return 0, workerAdmitEstimatedBytesMin, 0, true, ""
-		case "/deny-timeout":
-			// Full live occupancy leaves this otherwise valid request with
-			// no headroom on every poll, forcing its own max-wait timeout.
-			return 2 * workerAdmitEstimatedBytesMin, 2 * workerAdmitEstimatedBytesMin, 0, true, ""
-		case "/unbounded":
-			return 0, 0, 0, false, "unbounded"
-		default:
-			return 0, 0, 0, false, "unexpected scope in test fixture"
-		}
+	server.restartFreeze = 0
+	// The unified ledger's slice resolves deterministically; the ceiling is 1 MiB so
+	// a 2 MiB request exceeds it. No subtest below reaches a scope create.
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
+	server.admitResolveSlice = func(string) (string, bool, string) { return "/test-slice", true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, workerAdmitEstimatedBytesMin, 0, true, ""
 	}
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
@@ -81,11 +63,11 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 		var stdout, stderr bytes.Buffer
 		command.Stdout = &stdout
 		command.Stderr = &stderr
-		_ = command.Run() // denied and timeout are both expected nonzero exits.
+		_ = command.Run()
 		return stdout.String(), stderr.String()
 	}
 
-	assertOutcome := func(t *testing.T, stdout, stderr, wantState, wantClass, wantReason string) {
+	assertOutcome := func(t *testing.T, stdout, stderr, wantState, wantClass, wantReason string, wantStderrDiagnostic bool) {
 		t.Helper()
 		lines := strings.Split(strings.TrimSpace(stdout), "\n")
 		if len(lines) != 1 {
@@ -98,82 +80,40 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 		if fields["state"] != wantState || fields["class"] != wantClass || fields["reason"] != wantReason {
 			t.Fatalf("outcome=%v, want state=%s class=%s reason=%s", fields, wantState, wantClass, wantReason)
 		}
-		// stderr is a human diagnostic. Nothing may need to read it, and in
-		// particular the classification must not depend on it.
-		if strings.TrimSpace(stderr) == "" {
+		if wantStderrDiagnostic && strings.TrimSpace(stderr) == "" {
 			t.Fatal("a declined worker-admit must still leave a human diagnostic on stderr")
 		}
 	}
 
-	t.Run("permanent rejection", func(t *testing.T) {
-		stdout, stderr := runWorkerAdmit("/deny-ceiling", 2*workerAdmitEstimatedBytesMin, "5s")
+	t.Run("permanent rejection (exceeds ceiling)", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/slice/.aira-suite", 2*workerAdmitEstimatedBytesMin, "5s")
 		assertOutcome(t, stdout, stderr,
 			runner.WorkerAdmitStateDenied, runner.WorkerAdmitClassRequestInvalid,
-			runner.WorkerAdmitReasonExceedsCeiling)
+			runner.WorkerAdmitReasonExceedsCeiling, true)
 	})
 
-	t.Run("timeout is contended, never a permanent verdict", func(t *testing.T) {
-		started := time.Now()
-		stdout, stderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "50ms")
-		if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 5*time.Second) {
-			t.Fatalf("timeout worker-admit took %v — looks like it ignored max-wait", elapsed)
-		}
+	// A zero max-wait is a non-blocking PROBE (S15): it reports a snapshot and reserves
+	// nothing, never a timeout. The daemon has always accepted zero; before AIRA-64
+	// only the CLI refused it.
+	t.Run("a zero max-wait is a non-blocking snapshot", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/slice/.aira-suite", workerAdmitEstimatedBytesMin, "0")
 		assertOutcome(t, stdout, stderr,
-			runner.WorkerAdmitStateTimeout, runner.WorkerAdmitClassContended,
-			runner.WorkerAdmitReasonSaturated)
+			runner.WorkerAdmitStateDenied, runner.WorkerAdmitClassContended,
+			runner.WorkerAdmitReasonSnapshot, true)
 	})
 
-	t.Run("an unbounded outer scope is the one structural unevaluated", func(t *testing.T) {
-		stdout, stderr := runWorkerAdmit("/unbounded", workerAdmitEstimatedBytesMin, "50ms")
-		assertOutcome(t, stdout, stderr,
-			runner.WorkerAdmitStateUnevaluated, runner.WorkerAdmitClassAdmissionUnusable,
-			runner.WorkerAdmitReasonOuterScopeUnbounded)
-	})
-
-	t.Run("a transient unevaluated read stays retriable", func(t *testing.T) {
-		stdout, stderr := runWorkerAdmit("/no-such-fixture", workerAdmitEstimatedBytesMin, "50ms")
-		assertOutcome(t, stdout, stderr,
-			runner.WorkerAdmitStateUnevaluated, runner.WorkerAdmitClassContended,
-			runner.WorkerAdmitReasonOuterScopeUnreadable)
-	})
-
-	// verifies: AIRA-64 §9.20 — a SPECULATIVE request (`--max-wait 0`) reaches
-	// the daemon and comes back CONTENDED.
-	//
-	// This is the real CLI-subprocess-against-a-real-daemon seam, deliberately
-	// not a unit test of the argument parser: the shipping defect was that only
-	// the CLI refused zero (the daemon's own validator has always accepted it),
-	// so any test that stubbed either side would have passed against it. The
-	// aitest supervisor classes `request-invalid` as WorkerAdmitTerminal and
-	// responds by draining its remaining queue to `unevaluated`, so every
-	// speculative pool-growth probe would have destroyed the run it was issued
-	// to help (Sol plan-review round 2, P0).
-	t.Run("a speculative zero max-wait is contended, never terminal", func(t *testing.T) {
-		started := time.Now()
-		stdout, stderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "0")
-		if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 5*time.Second) {
-			t.Fatalf("a zero max-wait took %v — it must evaluate once and answer, never poll", elapsed)
-		}
-		assertOutcome(t, stdout, stderr,
-			runner.WorkerAdmitStateTimeout, runner.WorkerAdmitClassContended,
-			runner.WorkerAdmitReasonSaturated)
-	})
-
-	t.Run("a negative max-wait is still refused", func(t *testing.T) {
-		stdout, stderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "-1s")
+	t.Run("a negative max-wait is refused client-side", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/slice/.aira-suite", workerAdmitEstimatedBytesMin, "-1s")
 		assertOutcome(t, stdout, stderr,
 			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
-			runner.WorkerAdmitReasonMaxWaitInvalid)
+			runner.WorkerAdmitReasonMaxWaitInvalid, true)
 	})
 
-	t.Run("a client argument mistake never reaches the daemon", func(t *testing.T) {
-		// The floor rejection happens pre-dial. Before AIRA-42 it produced
-		// only a rendered stderr error, which the supervisor could read
-		// only as "the relay produced nothing" -> run unconfined.
-		stdout, stderr := runWorkerAdmit("/deny-ceiling", 1024, "5s")
+	t.Run("a client estimated-bytes mistake never reaches the daemon", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/slice/.aira-suite", 1024, "5s")
 		assertOutcome(t, stdout, stderr,
 			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
-			runner.WorkerAdmitReasonEstimatedBytesOutOfRange)
+			runner.WorkerAdmitReasonEstimatedBytesOutOfRange, true)
 	})
 
 	t.Run("a pre-dispatch argument error still speaks the channel", func(t *testing.T) {
@@ -185,30 +125,23 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 		_ = command.Run()
 		assertOutcome(t, stdout.String(), stderr.String(),
 			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
-			runner.WorkerAdmitReasonArgumentsInvalid)
+			runner.WorkerAdmitReasonArgumentsInvalid, true)
 	})
 
-	// AIRA-63, proven through the REAL client rather than the in-process
-	// response struct: an admitSlots-saturated worker-admit must reach
-	// supervisor.py as a RETRIABLE denial, so it retries once a slot frees
-	// instead of marking the queue unevaluated. Delivered as an error frame it
-	// would arrive as a contract violation (and, before AIRA-42, as the prose
-	// "worker-admit request rejected", which matched none of the classifier's
-	// denial substrings, fell through to WorkerAdmitUnavailable, and made
-	// _disable_daemon run the whole suite UNCONFINED).
-	//
-	// Kept LAST and not parallel: it drains the shared admitSlots semaphore,
-	// so any sub-test running concurrently would be saturated too.
+	// AIRA-63, proven through the REAL client: an admitSlots-saturated worker-admit
+	// must reach supervisor.py as a RETRIABLE denial, not an error frame (which would
+	// arrive as a terminal contract violation). Kept LAST and not parallel: it drains
+	// the shared admitSlots semaphore.
 	t.Run("slot saturation is a retriable denial, not an error frame", func(t *testing.T) {
 		for i := 0; i < admitGlobalMax; i++ {
 			server.admitSlots <- struct{}{}
 		}
-		stdout, stderr := runWorkerAdmit("/deny-ceiling", workerAdmitEstimatedBytesMin, "5s")
+		stdout, stderr := runWorkerAdmit("/slice/.aira-suite", workerAdmitEstimatedBytesMin, "5s")
 		for i := 0; i < admitGlobalMax; i++ {
 			<-server.admitSlots
 		}
 		assertOutcome(t, stdout, stderr,
 			runner.WorkerAdmitStateDenied, runner.WorkerAdmitClassContended,
-			runner.WorkerAdmitReasonAdmitSlotsSaturated)
+			runner.WorkerAdmitReasonAdmitSlotsSaturated, true)
 	})
 }

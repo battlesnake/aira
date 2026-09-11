@@ -217,6 +217,13 @@ const (
 	// local placement failure the relay discovers after a grant.
 	WorkerAdmitReasonWorkerScopeCreateFailed = "worker-scope-create-failed"
 
+	// WorkerAdmitReasonSnapshot (S15) accompanies the non-blocking probe's answer
+	// (max_wait_ms present and zero): the daemon reserved nothing and reports the
+	// unified ledger's current available_bytes / available_cpu so the aitest
+	// supervisor can size its pool. class=contended (retriable), never a verdict
+	// about a specific request.
+	WorkerAdmitReasonSnapshot = "snapshot"
+
 	// CLI-side.
 	WorkerAdmitReasonArgumentsInvalid         = "arguments-invalid"
 	WorkerAdmitReasonEstimatedBytesOutOfRange = "estimated-bytes-out-of-range"

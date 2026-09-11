@@ -33,12 +33,14 @@ func daemonTestPaths(t *testing.T) daemon.Paths {
 func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	paths := daemonTestPaths(t) // small local helper: mirrors internal/daemon's own testPaths(t), sets XDG_STATE_HOME/XDG_RUNTIME_DIR under t.TempDir()
 	server := daemon.NewServer(paths)
-	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 20 * (1 << 20), 0, true, "" })
-	server.SetAdmitReadWorkerSupervisorMemoryForTest(func(string) (int64, int64, bool, string) { return 0, 0, true, "" })
-	server.SetWorkerAdmitHeadroomForTest(0) // production default (64 MiB) would swallow this test's tiny synthetic byte values
-	// AIRA-39: the ledger now sums the outer scope's real `.aira-worker-*`
-	// children and the daemon creates the granted scope itself. "/outer" is not
-	// a real cgroup here, so both seams are answered by an in-memory tree.
+	server.SetAdmitResolveSliceForTest(func(string) (string, bool, string) { return "/slice", true, "" })
+	// A large ceiling: workers now draw on the confine slice headroom (~2 GiB base),
+	// which the runner test cannot zero, so the ceiling must sit well above it.
+	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 20 << 30, 0, true, "" })
+	server.SetRestartFreezeForTest(0) // do not wait out the 2s restart freeze for a grant
+	// S15: the worker lease charges the unified ledger and the daemon creates the
+	// granted scope itself. "/outer" is not a real cgroup here, so the create seam is
+	// answered by an in-memory tree.
 	server.SetWorkerScopeTreeForTest()
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
@@ -75,8 +77,9 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 	paths := daemonTestPaths(t)
 	server := daemon.NewServer(paths)
+	server.SetAdmitResolveSliceForTest(func(string) (string, bool, string) { return "/slice", true, "" })
 	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 100, 0, true, "" })
-	server.SetWorkerAdmitHeadroomForTest(0)
+	server.SetRestartFreezeForTest(0)
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())
@@ -101,20 +104,14 @@ func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 	}
 }
 
-func TestRequestWorkerAdmitBoundsWaitWhenDaemonAcceptsButNeverResponds(t *testing.T) {
-	// Regression test for a real bug (Sol build-review, AIRA-38 review
-	// wave): RequestWorkerAdmit only called conn.SetDeadline when the
-	// caller's OWN ctx had a deadline -- but the real CLI caller
-	// (runWorkerAdmitCommand, cmd/aira/main.go) builds its context from
-	// context.Background() via signal.NotifyContext, which never adds
-	// one. A daemon that accepts the connection but stalls before writing
-	// ANY response (a daemon-side hang/bug -- distinct from a normal
-	// denied/timeout the daemon's own poll loop would otherwise return,
-	// which the sibling test above already covers) used to hang this read
-	// forever regardless of --max-wait. A raw stalling listener stands in
-	// for the daemon here -- the real daemon.Server always eventually
-	// responds on its own poll loop, so it cannot reproduce a genuine
-	// server-side hang.
+func TestRequestWorkerAdmitProbeBoundsWaitWhenDaemonAcceptsButNeverResponds(t *testing.T) {
+	// S15: a non-blocking PROBE (MaxWait == 0) is a bounded request/response, so a
+	// daemon that accepts the connection but stalls before writing ANY response must
+	// not hang it — the transport deadline (grace) bounds it. (A blocking CLAIM,
+	// MaxWait > 0, deliberately has NO transport deadline and is bounded only by ctx,
+	// the S13 confine model — that is the connection the CLI's signal ctx cancels.)
+	// A raw stalling listener stands in for the daemon; the real daemon.Server always
+	// eventually responds.
 	socketPath := filepath.Join(t.TempDir(), "stall.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -132,25 +129,23 @@ func TestRequestWorkerAdmitBoundsWaitWhenDaemonAcceptsButNeverResponds(t *testin
 
 	start := time.Now()
 	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
-		SocketPath: socketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: 200 * time.Millisecond,
+		SocketPath: socketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: 0,
 	})
 	elapsed := time.Since(start)
 	if outcome.Granted() {
 		t.Fatal("expected a non-grant from a daemon that accepts a connection but never responds")
 	}
-	// AIRA-42: the stall is a socket-deadline overrun, which is RETRIABLE —
-	// the daemon was dialled and the request was sent, so nothing here
-	// establishes that admission is unusable. Classifying it otherwise would
-	// strip containment for the rest of the run on one slow reply.
+	// The stall is a socket-deadline overrun, which is RETRIABLE — the daemon was
+	// dialled and the request was sent, so nothing here establishes that admission is
+	// unusable. Classifying it otherwise would strip containment for the rest of the run.
 	if outcome.Class != runner.WorkerAdmitClassContended ||
 		outcome.Reason != runner.WorkerAdmitReasonResponseTimeout {
 		t.Fatalf("outcome=%+v, want class=contended reason=response-timeout", outcome)
 	}
-	// Generous bound (MaxWait + the fixed transport grace + real
-	// scheduling slack) that a fix completes well inside, but an
-	// unconditional hang would never reach.
+	// Generous bound (the fixed transport grace + real scheduling slack) that a fix
+	// completes well inside, but an unconditional hang would never reach.
 	if testdeadline.Exceeded(elapsed, 5*time.Second) {
-		t.Fatalf("RequestWorkerAdmit took %s against a 200ms MaxWait -- looks like the unbounded-read regression", elapsed)
+		t.Fatalf("RequestWorkerAdmit probe took %s -- looks like the unbounded-read regression", elapsed)
 	}
 	select {
 	case conn := <-accepted:

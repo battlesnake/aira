@@ -11,26 +11,23 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"aira/internal/redeclare"
 )
 
-// WorkerAdmitLease is a granted worker-admit connection, held open until Close
-// releases it. The daemon parks its side on the same connection and returns
-// when it observes the peer disconnect.
+// WorkerAdmitLease is a granted worker-admit connection, held open by a leaseKeeper
+// until Close releases it. The daemon parks its side on the same connection and
+// releases the ledger charge when it observes the peer disconnect (S15, the AIRA-41
+// reversal: EOF releases the lease). One connection per worker lease.
 //
-// It does NOT free ledger capacity, and this comment used to say it did —
-// "the daemon frees the ledger entry when it detects the peer disconnect",
-// true only of the pre-AIRA-39/41 in-memory grants map. AIRA-41 made the
-// ledger Σ memory.max over the outer scope's real `.aira-worker-*` children
-// precisely so a killed or exited relay could no longer free capacity while
-// its worker was still alive under a still-intact cap; capacity is released by
-// REMOVING the scope (supervisor.py's _forget_worker_scope, after it has
-// reaped the worker), never by closing this. The stale wording outlived the
-// fix long enough to be restated as fact in AIRA-43's own problem statement,
-// so it is corrected here rather than left to mislead again.
+// S15: for an ENFORCED grant the keeper RECONNECTS and re-declares the lease (its
+// ARDR frame keyed on ScopePath) across a daemon restart, re-anchoring the worker's
+// RAM and core in the fresh daemon's ledger — exactly like the confine lease keeper.
+// A shim ADVISORY grant has no scope path and no ARDR key, so its keeper HOLDS only
+// (no reconnect), the same rule the confine keeper applies to a scope-less lease.
 //
-// What closing this lease does release is the daemon-side connection and the
-// shared admission slot workerAdmitConnection holds for a granted connection's
-// whole lifetime.
+// Closing the lease stops the keeper and closes the connection, which the daemon
+// sees as the lease-releasing EOF.
 type WorkerAdmitLease struct {
 	WorkerID  string
 	ScopePath string
@@ -48,14 +45,14 @@ type WorkerAdmitLease struct {
 	// CreateWorkerScope. It replaces MemoryHigh, which AIRA-35 retired along
 	// with the memory.high write it named.
 	SwapCap string
-	conn    net.Conn
+	keeper  *leaseKeeper
 }
 
 func (l *WorkerAdmitLease) Close() error {
-	if l == nil || l.conn == nil {
+	if l == nil || l.keeper == nil {
 		return nil
 	}
-	return l.conn.Close()
+	return l.keeper.Close()
 }
 
 type WorkerAdmitClientRequest struct {
@@ -64,20 +61,26 @@ type WorkerAdmitClientRequest struct {
 	OuterScope     string
 	Signature      string
 	EstimatedBytes int64
-	MaxWait        time.Duration
+	// MaxWait == 0 is a non-blocking PROBE (report current available, reserve
+	// nothing); any positive value is a blocking CLAIM (wait until granted, no
+	// daemon-side or transport timeout — bounded only by ctx). The positive value
+	// itself is not sent: a claim omits max_wait_ms, which the daemon reads as
+	// "block" (design §4/§6, the S13 confine precedent).
+	MaxWait time.Duration
 }
 
 type workerAdmitGrant struct {
-	State       string `json:"state"`
-	Class       string `json:"class"`
-	Reason      string `json:"reason,omitempty"`
-	Detail      string `json:"detail,omitempty"`
-	WorkerID    string `json:"worker_id,omitempty"`
-	ScopePath   string `json:"scope_path,omitempty"`
-	MemoryMax   int64  `json:"memory_max,omitempty"`
-	Containment string `json:"containment,omitempty"`
-	Reserved    int64  `json:"reserved,omitempty"`
-	SwapCap     string `json:"swap_cap,omitempty"`
+	State         string `json:"state"`
+	Class         string `json:"class"`
+	Reason        string `json:"reason,omitempty"`
+	Detail        string `json:"detail,omitempty"`
+	WorkerID      string `json:"worker_id,omitempty"`
+	ScopePath     string `json:"scope_path,omitempty"`
+	MemoryMax     int64  `json:"memory_max,omitempty"`
+	Containment   string `json:"containment,omitempty"`
+	Reserved      int64  `json:"reserved,omitempty"`
+	SwapCap       string `json:"swap_cap,omitempty"`
+	ParentScopeID string `json:"parent_scope_id,omitempty"`
 }
 
 // RequestWorkerAdmit dials the daemon and sends one worker-admit request,
@@ -94,41 +97,54 @@ type workerAdmitGrant struct {
 // transport error, a response code, a catalogued enum value — never from the
 // text of a message.
 func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) WorkerAdmitOutcome {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", req.SocketPath)
+	dial := func(dctx context.Context, socket string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(dctx, "unix", socket)
+	}
+	conn, err := dial(ctx, req.SocketPath)
 	if err != nil {
 		return classifyWorkerAdmitDialFailure(err)
 	}
-	// The daemon's own poll loop is bounded by max_wait_ms and degrades to a
-	// clean "timeout" response within that budget -- but nothing protected
-	// THIS side if the daemon hung before ever writing a response: the CLI's
-	// actual ctx (runWorkerAdmitCommand's signalCtx, cmd/aira/main.go) is
-	// built from context.Background() via signal.NotifyContext, which adds
-	// cancellation on a signal but never a deadline, so `ctx.Deadline()`
-	// below was never ok and no socket deadline was ever set (found by Sol
-	// build-review). Mirror admitThroughDaemon's own transport-deadline
-	// pattern (admission_linux.go, same package): grant the daemon its full
-	// declared wait budget plus a fixed grace margin to answer even at the
-	// very edge of that budget, then bound the read regardless of what ctx
-	// itself carries -- still honoring an EARLIER caller deadline if one is
-	// present.
-	deadlineWait := req.MaxWait
-	if deadlineWait > time.Duration(mathMaxInt64)-admitTransportGrace {
-		deadlineWait = time.Duration(mathMaxInt64) - admitTransportGrace
+
+	// PROBE (MaxWait == 0): a bounded request/response snapshot — set a transport
+	// deadline so a stalled daemon cannot hang the probe. CLAIM (MaxWait > 0): a
+	// blocking lease with NO transport deadline (design §4/§6, the S13 confine
+	// precedent) — the wait is bounded only by ctx, which closes the connection on
+	// cancel. On a grant the ctx-close is DETACHED and the keeper owns the lifetime.
+	probe := req.MaxWait == 0
+	var stopCtxClose func() bool
+	if probe {
+		deadlineWait := req.MaxWait
+		if deadlineWait > time.Duration(mathMaxInt64)-admitTransportGrace {
+			deadlineWait = time.Duration(mathMaxInt64) - admitTransportGrace
+		}
+		transportDeadline := time.Now().Add(deadlineWait + admitTransportGrace)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(transportDeadline) {
+			transportDeadline = ctxDeadline
+		}
+		_ = conn.SetDeadline(transportDeadline)
+	} else {
+		stopCtxClose = context.AfterFunc(ctx, func() { _ = conn.Close() })
 	}
-	transportDeadline := time.Now().Add(deadlineWait + admitTransportGrace)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(transportDeadline) {
-		transportDeadline = ctxDeadline
+	closeConn := func() {
+		if stopCtxClose != nil {
+			stopCtxClose()
+		}
+		_ = conn.Close()
 	}
-	_ = conn.SetDeadline(transportDeadline)
+
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "worker-admit"
 	frame.Request.Args = map[string]any{
 		"job_id": req.JobID, "outer_scope": req.OuterScope, "signature": req.Signature,
-		"estimated_bytes": req.EstimatedBytes, "max_wait_ms": req.MaxWait.Milliseconds(),
+		"estimated_bytes": req.EstimatedBytes,
+	}
+	if probe {
+		// PRESENT and zero → non-blocking probe. A CLAIM omits it → the daemon blocks.
+		frame.Request.Args["max_wait_ms"] = int64(0)
 	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
-		_ = conn.Close()
+		closeConn()
 		return WorkerAdmitOutcome{
 			State: WorkerAdmitStateUnavailable, Class: WorkerAdmitClassAdmissionUnusable,
 			Reason: WorkerAdmitReasonRequestSendFailed, Detail: "send worker-admit request: " + err.Error(),
@@ -136,16 +152,16 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 	}
 	var response runnerAdmitResponseFrame
 	if err := readRunnerAdmitFrame(conn, &response); err != nil {
-		_ = conn.Close()
+		closeConn()
 		return classifyWorkerAdmitReadFailure(err)
 	}
 	if response.Code != "OK" {
-		_ = conn.Close()
+		closeConn()
 		return classifyWorkerAdmitDaemonError(response)
 	}
 	var grant workerAdmitGrant
 	if err := json.Unmarshal(response.Data, &grant); err != nil {
-		_ = conn.Close()
+		closeConn()
 		// An OK frame whose payload is not a worker-admit response is the
 		// daemon and this client disagreeing about the channel itself.
 		// Terminal and loud, never a silent unconfined fallback.
@@ -156,12 +172,10 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 	}
 	if !IsWorkerAdmitState(grant.State) || !IsWorkerAdmitClass(grant.Class) ||
 		(grant.State == WorkerAdmitStateGranted) != (grant.Class == WorkerAdmitClassGranted) {
-		_ = conn.Close()
+		closeConn()
 		// Protocol versions matched (or we would not be here), so this is
 		// not skew: the daemon produced an outcome outside the catalogue,
-		// or one that contradicts itself. Refusing it is the point — the
-		// old code's equivalent situation fell through to "daemon
-		// unavailable" and stripped containment for the whole run.
+		// or one that contradicts itself. Refusing it is the point.
 		return WorkerAdmitOutcome{
 			State: WorkerAdmitStateUnevaluated, Class: WorkerAdmitClassContractViolation,
 			Reason: WorkerAdmitReasonUnknownDaemonOutcome,
@@ -169,40 +183,52 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		}
 	}
 	if grant.State != WorkerAdmitStateGranted {
-		_ = conn.Close()
-		// The daemon's own classification passes through unchanged. This is
-		// the one place a class crosses a process boundary without being
-		// re-derived, which is exactly the property AIRA-42 asked for.
+		closeConn()
+		// The daemon's own classification passes through unchanged (a denial, a
+		// timeout, or a probe SNAPSHOT — the latter carrying available_bytes/cpu the
+		// daemon reported). This is the one place a class crosses a process boundary
+		// without being re-derived, the property AIRA-42 asked for.
 		return WorkerAdmitOutcome{State: grant.State, Class: grant.Class, Reason: grant.Reason, Detail: grant.Detail}
 	}
 	if problem := workerAdmitGrantProblem(grant); problem != "" {
-		_ = conn.Close()
-		// A grant whose placement coordinates are unusable is a CONTRACT
-		// problem: the daemon and this client disagree about what a grant is.
-		//
-		// Found by Sol build-review against the pre-AIRA-39 shape, where the
-		// CLI called CreateWorkerScope itself and a malformed grant (then, one
-		// with memory_high >= memory_max; that field is gone since AIRA-35)
-		// sailed through to it, failed there, and was
-		// reported `placement-failed` — one of the two classes that make
-		// the supervisor run the rest of the suite UNCONFINED. AIRA-39 moved
-		// that creation into the daemon, so this is no longer the difference
-		// between two classes on a live path; it is a pure contract guard
-		// against a daemon that is buggy or out of lockstep with this client.
-		// Kept for that reason, and because the check is nearly free and only
-		// ever moves an outcome AWAY from a containment-stripping class.
+		closeConn()
+		// A grant whose placement coordinates are unusable is a CONTRACT problem: the
+		// daemon and this client disagree about what a grant is. A pure contract guard
+		// against a daemon that is buggy or out of lockstep, moving the outcome AWAY
+		// from a containment-stripping class.
 		return WorkerAdmitOutcome{
 			State: WorkerAdmitStateUnevaluated, Class: WorkerAdmitClassContractViolation,
 			Reason: WorkerAdmitReasonMalformedGrant, Detail: problem,
 		}
+	}
+	// GRANTED. Hand the connection to a keeper: for an ENFORCED grant it reconnects
+	// and re-declares (ARDR frame keyed on the scope path) across a daemon restart;
+	// an ADVISORY (shim) grant has no scope path and no ARDR key, so it HOLDS only.
+	// Detach the ctx-close first — the keeper now owns the connection's lifetime, and
+	// the CLI closes the lease (stopping the keeper) on stdin EOF or signal.
+	if stopCtxClose != nil {
+		stopCtxClose()
+	}
+	_ = conn.SetDeadline(time.Time{})
+	var reDeclareFrame []byte
+	if grant.Containment == WorkerAdmitContainmentEnforced && grant.ScopePath != "" {
+		// A minted scope path is valid utf8 and the reserve is > 0, so this cannot
+		// fail in practice; if it ever does, hold WITHOUT reconnect (the worker runs
+		// under its cgroup cap) rather than refuse the grant.
+		reDeclareFrame, _ = redeclare.EncodeFrame(redeclare.Record{
+			ScopeID:       grant.ScopePath,
+			RAMBytes:      uint64(grant.MemoryMax),
+			CPUCores:      uint32(DefaultConfineCPUCores),
+			ParentScopeID: grant.ParentScopeID,
+		})
 	}
 	return WorkerAdmitOutcome{
 		State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,
 		Lease: &WorkerAdmitLease{
 			WorkerID: grant.WorkerID, ScopePath: grant.ScopePath,
 			MemoryMax: grant.MemoryMax, SwapCap: grant.SwapCap,
-			Containment: grant.Containment,
-			Reserved:    grant.Reserved, conn: conn,
+			Containment: grant.Containment, Reserved: grant.Reserved,
+			keeper: newLeaseKeeperFrame(conn, reDeclareFrame, grant.ScopePath, dial, req.SocketPath),
 		},
 	}
 }

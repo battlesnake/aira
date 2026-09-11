@@ -91,20 +91,10 @@ type leaseKeeper struct {
 // ledger holds — re-SETting it is idempotent, no double-count), the CPU is the
 // declared core count (1, or 0 for a delegate suite), matching the original admit.
 func newLeaseKeeper(conn net.Conn, req Request, grant runnerAdmitGrant, dial func(context.Context, string) (net.Conn, error), socketPath string) *leaseKeeper {
-	k := &leaseKeeper{
-		conn:         conn,
-		done:         make(chan struct{}),
-		dial:         dial,
-		socketPath:   socketPath,
-		scopeID:      req.ConfineScopeID,
-		dialTimeout:  leaseKeeperDialTimeout,
-		reconnectGap: leaseKeeperReconnectGap,
-		maxNoAck:     leaseKeeperMaxNoAck,
-	}
 	if req.Exclusive || req.ConfineScopeID == "" || dial == nil {
 		// Exclusive: never reconnect (watchExclusive handles EOF). Scope-less: no
 		// ARDR key, hold only. Either way, no reconnect goroutine.
-		return k
+		return newLeaseKeeperFrame(conn, nil, req.ConfineScopeID, dial, socketPath)
 	}
 	cpuCores := uint32(DefaultConfineCPUCores)
 	if req.DelegateRAM {
@@ -121,6 +111,31 @@ func newLeaseKeeper(conn net.Conn, req Request, grant runnerAdmitGrant, dial fun
 		// unreachable in practice; if it ever fires, hold without reconnecting (the
 		// job is cgroup-capped) rather than spin on an un-encodable frame.
 		log.Printf("aira: lease keeper: cannot encode re-declare frame for scope %q: %v; holding without reconnect", req.ConfineScopeID, err)
+		return newLeaseKeeperFrame(conn, nil, req.ConfineScopeID, dial, socketPath)
+	}
+	return newLeaseKeeperFrame(conn, frame, req.ConfineScopeID, dial, socketPath)
+}
+
+// newLeaseKeeperFrame is the shared keeper core (S15): it wraps conn and, when frame
+// is non-nil and a dialer is available, starts the reconnect + re-declare loop that
+// re-anchors the lease across a daemon restart. A nil frame (or nil dial) is a
+// HOLD-ONLY keeper — a scope-less confine-reserve, an exclusive lease that cannot be
+// re-established, or a shim advisory worker lease with no ARDR key. Both the confine
+// keeper (newLeaseKeeper) and the aitest worker relay (RequestWorkerAdmit) build
+// their own frozen ARDR frame and hand it here, so there is ONE reconnect state
+// machine and two frame-builders, not two loops that could drift.
+func newLeaseKeeperFrame(conn net.Conn, frame []byte, scopeID string, dial func(context.Context, string) (net.Conn, error), socketPath string) *leaseKeeper {
+	k := &leaseKeeper{
+		conn:         conn,
+		done:         make(chan struct{}),
+		dial:         dial,
+		socketPath:   socketPath,
+		scopeID:      scopeID,
+		dialTimeout:  leaseKeeperDialTimeout,
+		reconnectGap: leaseKeeperReconnectGap,
+		maxNoAck:     leaseKeeperMaxNoAck,
+	}
+	if frame == nil || dial == nil {
 		return k
 	}
 	k.frame = frame

@@ -443,21 +443,9 @@ func TestValidateAdmitArgsRefusesOverCeilingWaitAndNamesTheCeiling(t *testing.T)
 	}
 }
 
-// verifies: AIRA-58/AIRA-63 — the daemon and worker-admit ceilings are
-// deliberately DIFFERENT, and worker-admit's is the smaller one. AIRA-63 has
-// given worker-admit the admitSlots bound it lacked, so the ceilings COULD now
-// be unified — but that is deliberately left to its own change: raising
-// worker-admit's ceiling 48x changes how long a saturated aitest run may hold
-// slots that ordinary admission also draws from. A "consistency" refactor that
-// unifies them as a side effect must still fail here.
-func TestWorkerAdmitCeilingStaysBelowTheSharedAdmitCeiling(t *testing.T) {
-	if workerAdmitWaitCeilingMs >= admitWaitCeilingMs {
-		t.Fatalf("worker-admit ceiling %d must stay below the shared admit ceiling %d until the unification is made deliberately", workerAdmitWaitCeilingMs, admitWaitCeilingMs)
-	}
-	if workerAdmitWaitCeilingMs != int64(30*time.Minute/time.Millisecond) {
-		t.Fatalf("worker-admit ceiling = %d ms, want 30m until the ceilings are unified in their own change", workerAdmitWaitCeilingMs)
-	}
-}
+// S15 deleted TestWorkerAdmitCeilingStaysBelowTheSharedAdmitCeiling: worker-admit
+// no longer has a wait ceiling at all — a worker CLAIM is a blocking lease with no
+// daemon-side timeout (design §4/§6), exactly like the confine admit path.
 
 // verifies: AIRA-59 — the freeze hold is configurable and fails closed on a
 // malformed setting, following the admitBackfillGrace precedent exactly.

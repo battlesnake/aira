@@ -145,28 +145,41 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	const ceiling = 128 << 20
 	const request = 32 << 20
 
+	const slicePath = "/test-slice"
 	paths := testPaths(t)
 	server := NewServer(paths)
-	server.workerAdmitHeadroom = 0
-	server.workerAdmitPollInterval = time.Millisecond
-	// Deliberately NO newWorkerScopeTree() here, unlike every other worker-admit
-	// test: the scan and the create seams stay at their production defaults so
-	// this exercises the real scanWorkerScopeChildren and the real
-	// runner.CreateWorkerScope against `outer`. Only the two MEMORY readings are
-	// stubbed, and only so the admission arithmetic is deterministic — the
-	// cgroup objects the contract is about are all real.
-	server.workerScopeScanInterval = time.Millisecond
-	server.admitReadMemory = func(scope string) (int64, int64, int64, bool, string) {
-		if scope != outer {
-			return 0, 0, 0, false, "unexpected scope in test fixture: " + scope
-		}
-		return 0, ceiling, 0, true, ""
-	}
-	server.admitReadWorkerSupervisorMemory = func(string) (int64, int64, bool, string) { return 0, 0, true, "" }
+	server.restartFreeze = 0
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
+	// Deliberately leave the create + id-reseed seams at their production defaults so
+	// this exercises the real runner.CreateWorkerScope against `outer`. Only the
+	// slice memory reading is stubbed, and only so the admission arithmetic is
+	// deterministic — the cgroup objects the contract is about are all real. The
+	// worker lease charges the unified ledger keyed on the resolved slice.
+	server.admitResolveSlice = func(string) (string, bool, string) { return slicePath, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, ceiling, 0, true, "" }
 	startServer(t, server)
 
-	if held := len(server.admitSlots); held != 0 {
-		t.Fatalf("admit slots held before the request: %d, want 0", held)
+	// A held worker lease is observed on the unified ledger (queue.outstanding), NOT
+	// on admitSlots — S15 releases the admission slot AFTER the grant (a held lease
+	// is not admission negotiation).
+	ledgerCharged := func() int64 {
+		// The daemon's connection goroutine creates (enqueueAdmitInternal) and
+		// deletes (pruneAdmitQueue) this map entry under admitRegistryMu, so the
+		// map read itself must hold that lock — mirror production's registry->queue
+		// lock dance. A bare read here is a data race against a live grant/release.
+		server.admitRegistryMu.Lock()
+		queue := server.admitQueues[slicePath]
+		server.admitRegistryMu.Unlock()
+		if queue == nil {
+			return 0
+		}
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		return queue.outstanding
+	}
+	if out := ledgerCharged(); out != 0 {
+		t.Fatalf("ledger charged before the request: %d, want 0", out)
 	}
 
 	command := exec.Command(binary, "worker-admit", "--job-id", "job-1", "--outer-scope", outer,
@@ -321,12 +334,11 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// The daemon-side half, asserted separately because "the process is alive"
 	// alone would still pass a relay that closed its lease connection and only
 	// THEN blocked on stdin — which frees the grant daemon-side exactly as
-	// Regression A does, while looking correct from the outside.
-	// workerAdmitConnection holds one shared admitSlots token for precisely the
-	// lifetime of a granted connection, so that token is the observable for "the
-	// daemon still holds this lease".
-	if held := len(server.admitSlots); held != 1 {
-		t.Fatalf("admit slots held while the grant is live: %d, want 1 — the relay is running but the daemon-side grant has already been released", held)
+	// Regression A does, while looking correct from the outside. The unified
+	// ledger's charge for this scope is the observable for "the daemon still holds
+	// this lease".
+	if out := ledgerCharged(); out != request {
+		t.Fatalf("ledger charged while the grant is live: %d, want %d — the relay is running but the daemon-side lease has already been released", out, request)
 	}
 
 	// --- Phase 3 (Regression B): stdin EOF releases it, promptly and cleanly. ---
@@ -355,45 +367,29 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// release rather than assuming it has already happened.
 	released := false
 	for deadline := time.Now().Add(testdeadline.Wait(grantedRelayExitBudget)); time.Now().Before(deadline); {
-		if len(server.admitSlots) == 0 {
+		if ledgerCharged() == 0 {
 			released = true
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if !released {
-		t.Fatalf("the daemon still holds the granted connection %v after the relay exited", grantedRelayExitBudget)
+		t.Fatalf("the daemon still holds the granted lease %v after the relay exited", grantedRelayExitBudget)
 	}
 
-	// --- Phase 4 (AIRA-41): releasing the lease frees NO ledger capacity. ---
-	// The ledger charges the SCOPE, so a killed or exited relay can no longer
-	// silently free capacity while its worker is still alive under a still-intact
-	// cap; only removing the scope releases it, which is supervisor.py's
-	// _forget_worker_scope, after it has reaped the worker. This is the invariant
-	// AIRA-43's own text has backwards.
-	//
-	// The invariant itself is NOT newly pinned here, and an earlier draft of this
-	// comment implied it was (corrected on build-review):
-	// TestWorkerAdmitLedgerKeepsChargingAfterRelayCloses already asserts it. That
-	// test drives evaluateWorkerAdmit directly against a STUBBED workerScopeTree
-	// and never opens a connection, so what phase 4 adds on top of it is
-	// narrower and worth exactly that much: the real cgroup tree, and the real
-	// workerAdmitConnection peer-disconnect path — which is why a daemon-side
-	// rmdir-on-disconnect is caught here and nowhere else.
-	children, err := scanWorkerScopeChildren(outer)
-	if err != nil {
-		t.Fatalf("scan the real outer scope after the lease closed: %v", err)
-	}
-	if children.count != 1 || children.committed != request {
-		t.Fatalf("children=%+v after the lease closed, want the scope still charging %d — a closed lease must not release the ledger", children, request)
+	// --- Phase 4 (S15 / AIRA-41 REVERSAL): the holder's EOF frees the ledger
+	// IMMEDIATELY, while the scope DIRECTORY persists. ---
+	// The worker lease is a normal signed-ledger lease keyed on its scope path, so
+	// the relay's exit (its connection's EOF) releases the ledger charge at once
+	// (already confirmed by the release poll above). The daemon does NOT rmdir the
+	// scope on EOF — that is supervisor.py's _forget_worker_scope, after it has
+	// reaped the worker — so the scope directory is still on the real tree here.
+	// This is the exact inversion of v0.5's "a closed connection frees nothing":
+	// RAM returns at EOF, not at scope removal.
+	if _, err := os.Stat(scopePath); err != nil {
+		t.Fatalf("the daemon removed the worker scope on the relay's EOF (%v); it must leave it for the supervisor to rmdir after reaping the worker", err)
 	}
 	if err := os.Remove(scopePath); err != nil {
 		t.Fatalf("remove the worker scope: %v", err)
-	}
-	if children, err = scanWorkerScopeChildren(outer); err != nil {
-		t.Fatalf("scan the real outer scope after removing the worker scope: %v", err)
-	}
-	if children.count != 0 || children.committed != 0 {
-		t.Fatalf("children=%+v after removing the worker scope, want the capacity released", children)
 	}
 }

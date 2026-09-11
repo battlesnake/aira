@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,34 +9,52 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aira/internal/core"
 	"aira/internal/runner"
 )
 
-// workerAdmitHeadroomDefault is a SEPARATE, much smaller headroom than
-// admitSliceHeadroomBase (2 GiB, sized for the whole machine-wide slice,
-// admit.go). Reusing the slice-wide constant here would swallow most of a
-// realistically-sized outer scope's own cap in production. This is a
-// build-time tunable, not yet sized from field data — a reasonable small
-// fixed default for Slice 1.
-const workerAdmitHeadroomDefault int64 = 64 << 20 // 64 MiB
-
 // workerAdmitEstimatedBytesMin matches --memory-reserve's minimum
 // (cmd/aira/main.go), so a sub-page estimate can never floor memory.max to
 // zero pages and instant-OOM the worker on placement.
 const workerAdmitEstimatedBytesMin int64 = 1 << 20 // 1 MiB
 
-// WorkerAdmitResponse is the one grant/denial payload the worker-admit
+// workerScopeChildPrefix is the directory-name prefix every aitest worker scope
+// carries under its outer scope (`.aira-worker-<N>`). Since S15 it is read for
+// ONE purpose only: re-seeding the worker-id counter from the tree after a daemon
+// restart. The RAM/CPU accounting moved to the unified signed ledger — a worker
+// lease charges queue.outstanding / queue.cpuOutstanding directly, exactly like an
+// `aira confine` lease — so the tree is no longer summed for a committed total.
+const workerScopeChildPrefix = ".aira-worker-"
+
+// workerAdmitBasis is the diagnostic label a worker lease carries in the ledger.
+// It participates in no admission decision (validRunnerAdmitGrant only requires a
+// non-empty basis were the lease ever framed as an AdmitResponse by a later
+// re-anchor); it exists so a `confine --list` walk can tell a worker lease apart
+// from an ordinary confine one.
+const workerAdmitBasis = "worker"
+
+// maxWorkerScopeSeq bounds worker-id allocation so a reconstructed counter near
+// the int limit can never wrap into a colliding low id. Reaching it is a terminal
+// create failure, not a silent wrap.
+const maxWorkerScopeSeq = 1 << 30
+
+// errWorkerIDSpaceExhausted is the sentinel allocateWorkerScopeID returns when the
+// per-outer-scope id counter reaches maxWorkerScopeSeq. Terminal, not retriable:
+// ids only grow (a restart re-seeds from the largest suffix on the tree), so no
+// amount of waiting produces a free id.
+var errWorkerIDSpaceExhausted = errors.New("worker id space exhausted")
+
+// WorkerAdmitResponse is the one grant/denial/snapshot payload the worker-admit
 // connection sends before optionally holding itself open as the lease.
 //
-// AIRA-42: State, Class and Reason are all drawn from the single vocabulary in
+// AIRA-42: State, Class and Reason are drawn from the single vocabulary in
 // internal/runner (runner.WorkerAdmitState*/Class*/Reason*), never spelled as
-// literals here. Class is the load-bearing field — the disposition the
-// supervisor acts on — and it replaced the "reject:"/"fallback:" reason-string
-// prefix convention that used to carry that meaning. Reason is a stable
-// exact-match token; Detail is free text that NOTHING parses.
+// literals here. Class is the load-bearing field — the disposition the supervisor
+// acts on — and Reason is a stable exact-match token; Detail is free text that
+// NOTHING parses.
 type WorkerAdmitResponse struct {
 	State string `json:"state"`
 	Class string `json:"class"`
@@ -54,120 +71,69 @@ type WorkerAdmitResponse struct {
 	MemoryMax int64  `json:"memory_max,omitempty"`
 	// Containment (AIRA-123) is runner.WorkerAdmitContainmentEnforced or
 	// ...Advisory, and is REQUIRED on every granted response. It is what stops an
-	// admission-only grant ever being readable as a kernel-enforced one: the
-	// outcome renderer and the client both refuse a grant without it, and refuse
-	// one whose other fields contradict it.
+	// admission-only grant ever being readable as a kernel-enforced one.
 	Containment string `json:"containment,omitempty"`
 	// Reserved (AIRA-123) is the ADVISORY grant's booked reservation in bytes.
-	// Positive exactly on an advisory grant; on an enforced one memory_max is
-	// both the booking and the bound and a second number could only disagree.
+	// Positive exactly on an advisory (shim) grant; on an enforced one memory_max
+	// is both the booking and the bound.
 	Reserved int64 `json:"reserved,omitempty"`
 	// SwapCap (AIRA-35) reports whether this worker's swap could actually be
-	// bounded. It replaced memory_high, which named a memory.high write
-	// AIRA-35 stopped doing (runner.CreateWorkerScope carries the measured
-	// reasons). Without a swap cap, a worker's memory.max bounds memory but
-	// not memory+swap, so a runaway is reclaimed into swap and never killed --
-	// the containment this grant appears to promise simply does not happen.
-	// Diagnostic: nothing branches on it, and it is what stops a lost
-	// guarantee from being invisible to the run it affects.
+	// bounded (runner.WorkerAdmitSwapCap*). Empty on an advisory grant and on a
+	// non-grant. Diagnostic: nothing branches on it, and it is what stops a lost
+	// swap-containment guarantee from being invisible to the run it affects.
 	SwapCap string `json:"swap_cap,omitempty"`
-	// leaseID is UNEXPORTED and never crosses the wire: it is the shim ledger's
-	// booking id, carried from the evaluator to the connection handler that must
-	// release it when the peer disconnects. Zero on every non-shim response and
-	// on every non-grant.
-	leaseID uint64
+	// ParentScopeID is the suite scope-id this worker lease is a sub-reservation of
+	// (design §8). It is echoed on a granted response so the relay can re-declare
+	// the lease VERBATIM across a daemon restart (internal/redeclare's ARDR frame),
+	// re-anchoring it in the new daemon's ledger with the same parent — which is
+	// what preserves the exclusivity exemption for a `--exclusive` suite's own
+	// workers after a restart.
+	ParentScopeID string `json:"parent_scope_id,omitempty"`
+	// AvailableBytes / AvailableCPU carry the non-blocking probe's current headroom
+	// (design §6/§8): what the unified ledger would admit RIGHT NOW, with no
+	// reservation taken. Meaningful only on a snapshot (max_wait_ms present and
+	// zero); zero/omitted on every grant and every blocking-claim denial.
+	AvailableBytes int64 `json:"available_bytes,omitempty"`
+	AvailableCPU   int64 `json:"available_cpu,omitempty"`
 }
 
 type workerAdmitRequest struct {
 	jobID      string
 	outerScope string
-	// signature is accepted on the wire (the key spec 3.3 names for a
-	// future per-suite peak-history-based cap-sizing backstop) but UNUSED
-	// for anything in Slice 1 — deferred past Slice 1; estimatedBytes
-	// alone governs the backstop cap for now (see also Task 17's
-	// _resolve_estimated_bytes, which states the same deferral on the
-	// Python side).
+	// signature is accepted on the wire (spec 3.3's per-suite peak-history key) but
+	// carried only as the lease's diagnostic signature; it governs no admission
+	// decision in this slice.
 	signature      string
 	estimatedBytes int64
-	maxWaitMS      int64
+	// nonBlocking is true when max_wait_ms is PRESENT on the wire AND equals 0 (the
+	// aitest pool-sizing probe, design §6/§8): report current available and reserve
+	// nothing. max_wait_ms ABSENT, or PRESENT and positive, is a BLOCKING claim —
+	// the request waits until the ledger fits, ended only by a grant, daemon stop,
+	// or the client closing its connection (design §4/§6). A positive value no
+	// longer imposes a timeout (mirrors the S13 confine admit path).
+	nonBlocking bool
 }
 
-// workerScopeChildPrefix is the directory-name prefix every aitest worker
-// scope carries under its outer scope. It is the whole membership test for the
-// ledger: `.aira-supervisor` (deliberately uncapped, charged separately by the
-// aggregate guard's supervisor-RSS term) and any non-AIRA child are excluded
-// by construction.
-const workerScopeChildPrefix = ".aira-worker-"
-
-// workerScopeChildren is one cgroupfs-derived reading of an outer scope's
-// worker children. AIRA-39: this, not an in-memory grants map, is the
-// worker-admit ledger — it survives a daemon restart because the kernel object
-// it sums IS the state.
-type workerScopeChildren struct {
-	// committed is Σ memory.max over every `.aira-worker-*` child. Every such
-	// child is charged whatever its suffix looks like: CreateWorkerScope
-	// accepts any slashless id (runner.WorkerScopeChildPath), so charging only
-	// the numeric ones would silently under-count an externally created or
-	// oddly named worker scope — the exact direction this fix exists to close.
-	committed int64
-	// maxIndex is the largest NUMERIC suffix seen, and only feeds worker-id
-	// allocation. A non-numeric or out-of-range suffix contributes nothing
-	// here while still being charged above; the two concerns are deliberately
-	// separate (found by Sol plan-review).
-	maxIndex int
-	count    int
-}
-
-// workerScopeState is the per-OUTER-SCOPE ledger cell. Keyed by outer scope
-// alone, not by (job_id, outer_scope): the committed sum is now taken over the
-// scope's real children, so it already covers every job that placed a worker
-// there, and the old workerScopeOwner binding (which existed only because the
-// sum was per-job) is deleted with it. The lock must then be per outer scope
-// or two jobs sharing one scope would evaluate and create under two different
-// locks and both grant against the same pre-create sum.
+// workerScopeState is the per-OUTER-SCOPE worker-id allocator. Since S15 it holds
+// ONLY the id counter: the ledger accounting it used to carry (the committed sum,
+// the supervisor-RSS guard) is gone, folded into the one unified signed ledger.
 //
-// Not pruned, same accepted slow-growth gap as the map it replaces — now one
-// entry per outer scope rather than one per (job_id, outer_scope) pair.
+// seeded records whether nextSeq has been reconstructed from the tree yet. The
+// re-seed happens once per outer scope per daemon lifetime (and again after a
+// create collision), NOT per allocation — a per-allocation readdir is the
+// AIRA-61 O(tree)-per-call CPU regression this deliberately avoids.
+//
+// Not pruned, an accepted slow-growth gap: one small entry per outer scope ever
+// seen.
 type workerScopeState struct {
-	// lock is a 1-buffered channel rather than a sync.Mutex so a waiter can
-	// abandon it when its peer disconnects or the daemon stops. The previous
-	// job.mu was documented as "uninterruptible and not itself deadline-aware";
-	// with a cgroupfs scan and a scope creation now inside the critical
-	// section, and with worker-admit consuming a shared admitSlots token while
-	// it waits (AIRA-63), an uninterruptible wait would let one slow outer
-	// scope pin admission slots that ordinary `aira confine` admission needs.
-	lock           chan struct{}
-	outerScopePath string
-	nextSeq        int
-	committed      int64
-	maxIndex       int
-	committedAt    time.Time // last scan ATTEMPT, successful or not
-	scanned        bool
-	// scanErr is the last attempt's failure, held for the same interval a
-	// successful sum is. Without it the throttle below is defeated on exactly
-	// the path that most needs it: `scanned` is false after a failure, so every
-	// poll would walk the tree again -- the AIRA-61 CPU-regression shape, on a
-	// filesystem already misbehaving. Replaying the error (rather than the last
-	// good sum) keeps the answer honestly "unevaluated" instead of silently
-	// reverting to a stale number. Found independently by Sol and DeepSeek
-	// build-review.
-	scanErr error
+	mu      sync.Mutex
+	nextSeq int
+	seeded  bool
 }
 
-// workerScopeScanIntervalDefault throttles the per-outer-scope child scan to a
-// <=1/second cadence, reusing admitConfineScanIntervalDefault as the shared 1s
-// reference (S14 removed the slice-wide admission confine scan; the constant
-// survives only as this cadence reference and the OOM-steer interval bound).
-const workerScopeScanIntervalDefault = admitConfineScanIntervalDefault
-
-// maxWorkerScopeSeq bounds worker-id allocation so a reconstructed maxIndex
-// near the int limit can never wrap into a colliding low id. Reaching it is a
-// terminal create failure, not a silent wrap.
-const maxWorkerScopeSeq = 1 << 30
-
-// workerScopeFor returns the ledger cell for outerScope, creating it
-// atomically under workerScopesMu so two concurrent first callers can never
-// end up with two cells (or a nil lock channel).
+// workerScopeFor returns the id-allocator cell for outerScope, creating it
+// atomically under workerScopesMu so two concurrent first callers can never end up
+// with two cells.
 func (s *Server) workerScopeFor(outerScope string) *workerScopeState {
 	s.workerScopesMu.Lock()
 	defer s.workerScopesMu.Unlock()
@@ -176,620 +142,99 @@ func (s *Server) workerScopeFor(outerScope string) *workerScopeState {
 	}
 	state := s.workerScopes[outerScope]
 	if state == nil {
-		state = &workerScopeState{lock: make(chan struct{}, 1), outerScopePath: outerScope}
+		state = &workerScopeState{}
 		s.workerScopes[outerScope] = state
 	}
 	return state
 }
 
-// acquireWorkerScope takes state's lock, or reports false when the caller's
-// context is done or the daemon is stopping. The ONLY statement permitted
-// after a true return is `defer state.release()`.
-func (s *Server) acquireWorkerScope(ctx context.Context, state *workerScopeState) bool {
-	return s.acquireWorkerScopeTry(ctx, state, false)
-}
-
-// acquireWorkerScopeTry is acquireWorkerScope with an added non-blocking mode
-// for AIRA-64's speculative requests (max_wait_ms == 0), which must never wait
-// on a lock another job holds.
-func (s *Server) acquireWorkerScopeTry(ctx context.Context, state *workerScopeState, tryOnly bool) bool {
-	if tryOnly {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-s.stopping:
-			return false
-		default:
-		}
-		select {
-		case state.lock <- struct{}{}:
-			return true
-		default:
-			return false
-		}
-	}
-	return s.acquireWorkerScopeBlocking(ctx, state)
-}
-
-func (s *Server) acquireWorkerScopeBlocking(ctx context.Context, state *workerScopeState) bool {
-	// Checked BEFORE the select below, because select picks uniformly at random
-	// among ready cases: with an already-cancelled peer AND a free lock, the bare
-	// select took the lock about half the time and went on to create a worker
-	// scope for a peer that was already gone (CreateWorkerScope does not observe
-	// ctx). That orphan scope then charges the ledger until job teardown. This
-	// makes the already-cancelled case deterministic; it narrows but cannot close
-	// the race against a peer that vanishes mid-acquire, whose residue is the
-	// same safe over-charge (Sol build-review round 2).
-	select {
-	case <-ctx.Done():
-		return false
-	case <-s.stopping:
-		return false
-	default:
-	}
-	select {
-	case state.lock <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
-	case <-s.stopping:
-		return false
-	}
-}
-
-func (state *workerScopeState) release() { <-state.lock }
-
-// invalidate forces the next committed read to rescan. Called ONLY on the
-// daemon's own mutation of the tree (a successful create) and on the one
-// interleaving that proves the cache is stale-LOW (an EEXIST collision) —
-// never on an externally observed change.
-func (state *workerScopeState) invalidate() {
-	state.committedAt = time.Time{}
-	state.scanned = false
-	state.scanErr = nil
-}
-
-// scanWorkerScopeChildren sums memory.max over outerScope's `.aira-worker-*`
-// children. Fail-closed in the one direction that matters: it never reports a
-// smaller total than the tree actually holds. Any reading it cannot establish
-// is an error, which the caller turns into "unevaluated" — never a zero.
-func scanWorkerScopeChildren(outerScope string) (workerScopeChildren, error) {
+// scanWorkerMaxIndex returns the largest numeric N among outerScope's existing
+// `.aira-worker-<N>` children, 0 if none. It is the SLIM readdir the worker-id
+// allocator re-seeds from after a daemon restart (design §4): the new daemon holds
+// no counter in RAM, so a fresh id must not collide with a survivor whose scope is
+// still on the tree. It reads no memory.max — S15 moved worker RAM/CPU accounting
+// to the unified signed ledger, so id re-seeding is the only thing the tree is
+// read for now.
+func scanWorkerMaxIndex(outerScope string) (int, error) {
 	entries, err := os.ReadDir(outerScope)
 	if err != nil {
-		return workerScopeChildren{}, fmt.Errorf("read worker scopes: %w", err)
+		return 0, fmt.Errorf("read worker scopes: %w", err)
 	}
-	return sumWorkerScopeChildren(outerScope, entries)
-}
-
-// sumWorkerScopeChildren is the half of the scan that runs AFTER the directory
-// listing. Split out so a test can hand it an entry naming a child that is
-// already gone — the benign _retire_worker race — which cannot be constructed
-// deterministically through os.ReadDir.
-func sumWorkerScopeChildren(outerScope string, entries []os.DirEntry) (workerScopeChildren, error) {
-	var children workerScopeChildren
+	maxIndex := 0
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), workerScopeChildPrefix) {
 			continue
 		}
-		child := filepath.Join(outerScope, entry.Name())
-		data, err := os.ReadFile(filepath.Join(child, "memory.max"))
+		if index, err := strconv.Atoi(strings.TrimPrefix(entry.Name(), workerScopeChildPrefix)); err == nil && index > maxIndex {
+			maxIndex = index
+		}
+	}
+	return maxIndex, nil
+}
+
+// allocateWorkerScopeID reserves the next worker id under outerScope and returns
+// (workerID, scopePath). Re-seeds the per-outer-scope counter from the tree the
+// FIRST time the scope is used (and after a create collision) so a restart never
+// re-allocates a survivor's id. Returns errWorkerIDSpaceExhausted at the id-space
+// limit; propagates the tree-read error (which the caller turns into a retriable
+// "worker scopes unreadable"), never a fabricated success.
+func (s *Server) allocateWorkerScopeID(outerScope string) (string, string, error) {
+	state := s.workerScopeFor(outerScope)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.seeded {
+		scan := s.workerScopeMaxIndex
+		if scan == nil {
+			scan = scanWorkerMaxIndex
+		}
+		maxIndex, err := scan(outerScope)
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				// ENOENT alone does NOT prove the child vanished (Sol
-				// plan-review): an existing directory with no memory.max means
-				// the memory controller is not delegated, which is an anomaly
-				// and must not be silently skipped. Re-stat to tell the two
-				// apart. A genuinely vanished child is the benign race with
-				// supervisor.py's _retire_worker rmdir and is skipped: it is
-				// gone, so it charges nothing, which is correct rather than an
-				// under-count.
-				if _, statErr := os.Stat(child); errors.Is(statErr, fs.ErrNotExist) {
-					continue
-				}
-				return workerScopeChildren{}, fmt.Errorf("worker scope %s has no memory.max (memory controller not delegated)", child)
-			}
-			return workerScopeChildren{}, fmt.Errorf("worker scope %s: read memory.max: %w", child, err)
+			return "", "", err
 		}
-		value, valid := parseAdmitMemory(data)
-		if !valid {
-			// "max" (uncapped), malformed, or negative. Unreachable in the
-			// normal flow — the daemon writes and verifies every worker cap
-			// itself — so this is a genuine anomaly, and a fabricated zero
-			// here is precisely the AIRA-39 failure.
-			return workerScopeChildren{}, fmt.Errorf("worker scope %s: memory.max is not a finite byte count (%q)", child, strings.TrimSpace(string(data)))
-		}
-		children.committed = addClamp(children.committed, value)
-		children.count++
-		if index, err := strconv.Atoi(strings.TrimPrefix(entry.Name(), workerScopeChildPrefix)); err == nil && index > children.maxIndex {
-			children.maxIndex = index
-		}
+		state.nextSeq = maxIndex
+		state.seeded = true
 	}
-	return children, nil
-}
-
-// workerCommitted returns the outer scope's committed total, refreshing the
-// cached scan when it is older than the scan interval or when force is set.
-// Caller holds state's lock.
-//
-// The cadence bound is load-bearing (AIRA-61 precedent: a per-poll O(tree)
-// sweep produced 25-65% supervisor CPU before it was fixed). evaluateWorkerAdmit
-// runs once per 200ms poll per waiter, so the contended DENIAL path reads the
-// cache and scans at most once per interval. force is passed only on the path
-// that is about to GRANT — at most once per admitted worker, never per poll —
-// because a cached sum may never be the basis of an admission: a
-// `.aira-worker-*` child that appeared since the last scan is invisible to the
-// cache and need not collide with the id being allocated, so the cache can be
-// stale-LOW exactly there (found by Sol plan-review). Everywhere else a stale
-// cache is stale-HIGH, which only ever denies.
-func (s *Server) workerCommitted(state *workerScopeState, force bool) (int64, error) {
-	interval := s.workerScopeScanInterval
-	if interval <= 0 {
-		interval = workerScopeScanIntervalDefault
-	}
-	now := s.admitNowTime()
-	if !force && !state.committedAt.IsZero() && now.Sub(state.committedAt) < interval {
-		// A FAILED attempt is throttled exactly like a successful one, by
-		// replaying its error. Gating this on `scanned` (as it first did) meant a
-		// failing scan cleared the flag and every subsequent poll rescanned,
-		// which is the per-poll O(tree) walk the cadence bound exists to prevent.
-		if state.scanErr != nil {
-			return 0, state.scanErr
-		}
-		if state.scanned {
-			return state.committed, nil
-		}
-	}
-	scan := s.workerScopeScan
-	if scan == nil {
-		scan = scanWorkerScopeChildren
-	}
-	children, err := scan(state.outerScopePath)
-	// committedAt records the last ATTEMPT, successful or not, so a failing
-	// filesystem does not turn every poll into another scan.
-	state.committedAt = now
-	if err != nil {
-		state.scanned, state.scanErr = false, err
-		return 0, err
-	}
-	state.committed, state.maxIndex, state.scanned, state.scanErr = children.committed, children.maxIndex, true, nil
-	return children.committed, nil
-}
-
-// workerScopesUnreadableDetail builds the human detail for a scan the daemon
-// could not establish.
-//
-// It used to be workerScopesUnreadableReason, and it used to MANGLE the token
-// "unbounded" into "un-bounded" before returning. That was a defensive hack
-// against the prose channel: the detail embeds cgroup paths (which carry the
-// operator's own `aira confine --name`) and raw memory.max file contents, and
-// supervisor.py's substring classifier disabled daemon-backed admission
-// outright — the WHOLE pytest suite UNCONFINED on this RAM-capped shared
-// machine — for any "worker-admit unevaluated" message that merely CONTAINED
-// the literal token "unbounded". A job named "unbounded-suite", or a corrupt
-// memory.max echoed back through %q, was read as a genuinely uncapped outer
-// scope (found independently by Sol and DeepSeek build-review on AIRA-39).
-//
-// AIRA-42 deletes the mangling, as AIRA-39's own comment here predicted it
-// would: the outer-scope-unbounded condition is now carried by an exact-match
-// reason token in its own field, and Detail is not parsed by anything. There is
-// no longer a way for operator-controlled text to be mistaken for a verdict, so
-// the diagnostic gets to be accurate again.
-func workerScopesUnreadableDetail(err error) string {
-	return "worker scopes unreadable: " + err.Error()
-}
-
-// readWorkerSupervisorMemory reads a scope's live memory.current (plus its
-// memory.stat reclaimable-cache figure) WITHOUT requiring memory.max to be
-// set. This is deliberately narrower than readSliceMemory (admit.go), which
-// treats memory.max=="max" (uncapped) as a read failure — a correct,
-// defensive precondition for the OUTER-scope ledger read above (every
-// confine-launched outer scope IS always given an explicit finite cap by
-// construction, so "unbounded" there is a genuine anomaly worth failing
-// loudly on) but WRONG for the supervisor's own child scope: bootstrap
-// (BootstrapAitestSupervisor, aitest_bootstrap_linux.go) deliberately never
-// writes memory.max on it at all -- the supervisor is meant to be contained
-// transitively by the OUTER scope's cap, never capped individually. Found
-// live (AIRA-38, real-cgroup e2e): reusing readSliceMemory for this read
-// meant the aggregate guard's supervisor-RSS check (below) reported
-// "unevaluated" on EVERY real invocation, since the supervisor scope's own
-// memory.max is unconditionally "max" -- the granted (confined) path was
-// never actually reachable outside a mocked unit test.
-func readWorkerSupervisorMemory(path string) (current, reclaimable int64, ok bool, reason string) {
-	currentData, err := os.ReadFile(filepath.Join(path, "memory.current"))
-	if err != nil {
-		return 0, 0, false, "read-error"
-	}
-	current, valid := parseAdmitMemory(currentData)
-	if !valid {
-		return 0, 0, false, "parse-error"
-	}
-	statData, err := os.ReadFile(filepath.Join(path, "memory.stat"))
-	if err == nil {
-		// Slab discarded: worker-admit's discount is the same AIRA-21 page-cache
-		// figure admission uses, and must not change meaning. Only AIRA-103's
-		// ceiling signal consumes slab_reclaimable.
-		reclaimable, _, valid = parseSliceMemoryStat(statData)
-	}
-	if err != nil || !valid {
-		reclaimable = 0
-	}
-	return current, reclaimable, true, ""
-}
-
-// evaluateWorkerAdmit makes one synchronous grant/deny decision for req.
-// "Used" is the OUTER scope's own live memory.current, read directly —
-// cgroup memory accounting is hierarchical, so this single read already
-// includes the supervisor's own RSS plus every already-placed worker's
-// (spec 3.3). Summing individually-read worker-scope grants separately (an
-// earlier version of this function did) was both redundant with that
-// hierarchical accounting AND unsafe: Σ(worker grants) + supervisor RSS
-// could exceed outerMax even when the ledger thought there was room,
-// risking an outer-scope-level memory.oom.group kill of the ENTIRE run —
-// precisely the incident class this design exists to prevent.
-//
-// AIRA-39/AIRA-41: `committed` is no longer an in-memory grants map. It is
-// Σ memory.max over the outer scope's real `.aira-worker-*` children, and the
-// daemon creates each worker's scope itself inside this critical section, so
-// the ledger survives a daemon restart and a killed relay cannot free it.
-//
-// Reports (response, false) when the caller's context ended or the daemon is
-// stopping while queued on the outer scope's lock — the caller returns without
-// writing anything, mirroring workerAdmitConnection's own peer-gone paths.
-func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest) (WorkerAdmitResponse, bool) {
-	// AIRA-121 gate condition C1, as AIRA-123 rebuilt it. FIRST, before every
-	// other gate: in ci-shim mode there is no outer cgroup scope, so every gate
-	// below — which without exception reads, sums or creates one — is
-	// inapplicable rather than merely unlucky.
-	//
-	// AIRA-121 answered UNAVAILABLE here, which was the honest answer while
-	// worker-admit could only mean "nest an enforced sub-scope". AIRA-123 splits
-	// enforcement from admission, so the honest answer is now a real ADMISSION
-	// decision made against the shim ledger, reported as advisory. See
-	// worker_admit_shim.go for what that does and does not buy.
-	//
-	// THE MODE AGREEMENT CHECK, both directions. The client's outer_scope is the
-	// shim sentinel exactly when the CLIENT resolved shim mode, and an absolute
-	// cgroup path exactly when it resolved real mode. A disagreement means two
-	// processes read different install-mode records, and neither branch below is
-	// safe to run on the other's request: a real-mode request evaluated by the
-	// shim ledger would be admitted with no cgroup while its supervisor tried to
-	// place workers into one, and the shim sentinel down the real path would be
-	// read as a cgroup path and fail somewhere far less legible. Terminal
-	// (admission-unusable) rather than retriable, because waiting cannot make two
-	// records agree.
-	shim := s.shimMode()
-	if shim != (req.outerScope == runner.ShimConfineSlice) {
-		detail := "this daemon is in " + s.confineModeName() + " mode and the client asked about outer scope " + req.outerScope
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateUnavailable,
-			Class:  runner.WorkerAdmitClassAdmissionUnusable,
-			Reason: runner.WorkerAdmitReasonConfineModeMismatch,
-			Detail: detail,
-		}, true
-	}
-	if shim {
-		return s.evaluateShimWorkerAdmit(ctx, req)
-	}
-	// AIRA-101, the slice-exclusivity gate. FIRST, before any cgroupfs read and
-	// before the outer-scope lock: it is a pure in-memory map lookup, and taking
-	// it here means it adds no lock nesting to that critical section.
-	//
-	// Classed CONTENDED, which is load-bearing rather than a formality. A
-	// contended denial is retriable, so supervisor.py raises WorkerAdmitDenied and
-	// keeps polling until the benchmark finishes. A terminal class here would make
-	// it abandon daemon-backed admission and run the WHOLE suite UNCONFINED on
-	// this RAM-capped shared machine — a safety regression, and exactly what a
-	// wrongly-classed denial caused once before (AIRA-63).
-	if s.exclusiveDeniesWorkerAdmit(req.outerScope) {
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonSliceExclusive,
-		}, true
-	}
-	readMemory := s.memoryReader()
-	used, outerMax, reclaimable, ok, reason := readMemory(req.outerScope)
-	if !ok {
-		// readSliceMemory reports "unbounded" when the outer scope's own
-		// memory.max reads back "max". That is structural, not transient: a
-		// real confine-launched outer scope is always given a finite
-		// memory.max as part of the same atomic grant that launches it, so
-		// waiting can never make it capped. It is the one unevaluated
-		// sub-case the design spec (§3.7) classifies as fallback-triggering
-		// rather than retriable — and it is now carried by Class, instead of
-		// by the client sniffing the word "unbounded" out of a sentence that
-		// also quotes operator-controlled cgroup paths.
-		if reason == "unbounded" {
-			return WorkerAdmitResponse{
-				State:  runner.WorkerAdmitStateUnevaluated,
-				Class:  runner.WorkerAdmitClassAdmissionUnusable,
-				Reason: runner.WorkerAdmitReasonOuterScopeUnbounded,
-				Detail: "outer scope " + req.outerScope + " has no finite memory.max",
-			}, true
-		}
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateUnevaluated,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonOuterScopeUnreadable,
-			Detail: reason,
-		}, true
-	}
-	// memory.stat's file pages are reclaimable cache, not non-negotiable
-	// worker pressure. Match checkedAvailable's exact floor-and-discount
-	// arithmetic so a read-heavy test suite is not persistently denied even
-	// though the kernel can reclaim this cache below the outer cap.
-	if reclaimable < 0 {
-		reclaimable = 0
-	}
-	used = subtractFloor(used, reclaimable)
-	headroom := s.workerAdmitHeadroom
-	if headroom < 0 {
-		headroom = 0
-	}
-	ceiling := outerMax - headroom
-	if req.estimatedBytes > ceiling {
-		// Could never fit even at zero current usage — a stable fact about
-		// THIS request, not a transient contention moment. Deny
-		// immediately (workerAdmitConnection, Task 5, breaks its poll loop
-		// on this reason) instead of waiting out the full poll timeout
-		// only to time out anyway.
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassRequestInvalid,
-			Reason: runner.WorkerAdmitReasonExceedsCeiling,
-			Detail: fmt.Sprintf("estimated %d bytes exceeds the outer scope's %d-byte ceiling", req.estimatedBytes, ceiling),
-		}, true
-	}
-	// One lock per OUTER SCOPE (not per job), held across the committed scan,
-	// the supervisor read and the scope creation below. It is what makes
-	// "read the sum, then add to it" atomic — and it is why deleting
-	// workerScopeOwner is safe: the sum now covers every job's workers under
-	// this scope, and every requester for the scope queues on this one lock.
-	// Moving any of it outside would let two concurrent requests both read the
-	// same pre-create sum and both grant, the aggregate-guard-defeating race
-	// AIRA-27/28/29 fixed at whole-job granularity.
-	//
-	// Unlike the sync.Mutex it replaces, this acquisition is abandonable: with
-	// a cgroupfs scan and a scope creation inside the critical section, and
-	// with worker-admit now holding a shared admitSlots token while it waits
-	// (AIRA-63), an uninterruptible wait would let one slow outer scope pin
-	// admission slots ordinary `aira confine` admission needs.
-	state := s.workerScopeFor(req.outerScope)
-	// AIRA-64: a SPECULATIVE request (max_wait_ms == 0) never waits on another
-	// job's critical section. The aitest supervisor issues these from its
-	// single-threaded dispatch loop to grow its pool when capacity frees, so a
-	// blocking acquisition here would freeze that loop behind an unrelated job.
-	if !s.acquireWorkerScopeTry(ctx, state, req.maxWaitMS == 0) {
-		if req.maxWaitMS == 0 && ctx.Err() == nil {
-			select {
-			case <-s.stopping:
-				return WorkerAdmitResponse{}, false
-			default:
-			}
-			return WorkerAdmitResponse{
-				State:  runner.WorkerAdmitStateDenied,
-				Class:  runner.WorkerAdmitClassContended,
-				Reason: runner.WorkerAdmitReasonAdmitLocksBusy,
-			}, true
-		}
-		return WorkerAdmitResponse{}, false
-	}
-	defer state.release()
-	// Saturating comparison, never `ceiling-used`: with `committed` now summed
-	// from the tree it is no longer bounded by admitMaxReserve per grant, and
-	// the subtractive form wraps POSITIVE once a term saturates at MaxInt64
-	// (ceiling=0, committed=MaxInt64, supervisorUsed=2 wraps the right-hand
-	// side to MaxInt64 and grants). addClamp saturates, so a saturated total is
-	// always > ceiling and always denies (found by Sol plan-review).
-	if addClamp(req.estimatedBytes, used) > ceiling {
-		// Not available RIGHT NOW (transient: current live usage), but
-		// could be granted once usage drops — the caller's poll loop keeps
-		// retrying this until granted or its own max_wait_ms deadline
-		// converts it to "timeout".
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonInsufficientHeadroom,
-		}, true
-	}
-	// Worst-case guard, on top of the live-usage check above: live usage
-	// having room RIGHT NOW does not mean it always will. Sum the
-	// memory.max already promised to this job's other workers — if every
-	// one of them simultaneously grew to its own full cap, the total must
-	// still fit under ceiling, or an outer-scope memory.oom.group kill can
-	// take out the whole run (supervisor plus every sibling worker), not
-	// just the one that grew — precisely what Goal 2 in the design spec
-	// requires this NOT be able to do. This trades a little utilization
-	// (the live-usage check alone would admit a worker whose siblings
-	// simply haven't grown to their peaks YET) for that hard guarantee —
-	// the same aggregate-not-bound failure class AIRA-27/28/29 already
-	// fixed at whole-job granularity, found here at worker granularity by
-	// build-review (a live-usage-only check is silent on the SUM of caps,
-	// only on CURRENT usage). Pollable, not an immediate reject: an
-	// existing worker retiring frees its share of committed capacity.
-	//
-	// CORRECTED (found by a second review round: the first version of
-	// this guard omitted the supervisor's own footprint entirely). The
-	// worst case isn't just Σ(worker caps) — it's supervisor RSS PLUS
-	// Σ(worker caps), and a warm-imported pytest supervisor (spec 3.1/3.2:
-	// COW-shared interpreter state is the whole point of this design) can
-	// routinely hold hundreds of MiB, far more than headroom (64MiB
-	// default) alone budgets for. Concretely: an 8G outer cap with a 600M
-	// supervisor and eight workers each admitted at 970M (low live usage
-	// at grant time) would pass both checks above (Σcaps=7.76G ≤
-	// ceiling≈7.94G) yet still exceed the outer cap once every worker
-	// grows to its own peak (600M+7.76G=8.36G > 8G) — the exact
-	// outer-scope oom.group incident Goal 2 requires be impossible.
-	// Reading the supervisor scope's own live memory.current and
-	// subtracting it here closes that gap; an unreadable supervisor
-	// scope reports unevaluated (fail toward safety — this codebase never
-	// silently admits on a read it cannot establish), same as an
-	// unreadable outer scope above. Uses readWorkerSupervisorMemory (a
-	// SEPARATE seam from readMemory above), not readMemory/readSliceMemory:
-	// the supervisor scope is deliberately never given its own memory.max
-	// (see readWorkerSupervisorMemory's own doc comment) — reusing the
-	// outer-scope reader here made this guard report unevaluated on EVERY
-	// real invocation, an AIRA-38 finding.
-	readSupervisorMemory := s.admitReadWorkerSupervisorMemory
-	if readSupervisorMemory == nil {
-		readSupervisorMemory = readWorkerSupervisorMemory
-	}
-	supervisorScope := runner.WorkerScopeChildPath(req.outerScope, "supervisor")
-	supervisorUsed, supervisorReclaimable, supervisorOK, supervisorReason := readSupervisorMemory(supervisorScope)
-	if !supervisorOK {
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateUnevaluated,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonSupervisorScopeUnreadable,
-			Detail: "supervisor scope unreadable: " + supervisorReason,
-		}, true
-	}
-	// Apply the same reclaimable-cache discount to the supervisor half of the
-	// aggregate guard. Its memory.current is otherwise a second source of
-	// spurious denials after the supervisor has populated page cache.
-	if supervisorReclaimable < 0 {
-		supervisorReclaimable = 0
-	}
-	supervisorUsed = subtractFloor(supervisorUsed, supervisorReclaimable)
-	fits := func(committed int64) bool {
-		return addClamp(addClamp(req.estimatedBytes, committed), supervisorUsed) <= ceiling
-	}
-	// Contended path: the cached sum, refreshed at most once per interval. This
-	// is the 200ms-per-waiter poll path AIRA-61's CPU regression was about.
-	committed, err := s.workerCommitted(state, false)
-	if err != nil {
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateUnevaluated,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
-			Detail: workerScopesUnreadableDetail(err),
-		}, true
-	}
-	if !fits(committed) {
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
-		}, true
-	}
-	// Granting path: force a fresh scan first. A cached sum may never be the
-	// basis of an admission — a `.aira-worker-*` child that appeared since the
-	// last scan is invisible to the cache and need not collide with the id
-	// about to be allocated, so the cache can be stale-LOW exactly here. This
-	// costs one scan per ADMITTED WORKER (a handful per suite), never one per
-	// poll, so the cadence bound above is untouched.
-	if committed, err = s.workerCommitted(state, true); err != nil {
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateUnevaluated,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
-			Detail: workerScopesUnreadableDetail(err),
-		}, true
-	}
-	if !fits(committed) {
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassContended,
-			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
-		}, true
-	}
-	// S6: worker CPU concurrency is no longer gated here, and — until S15 — is NOT
-	// governed at all. The AIRA-64 flock CPU-slot governor that once serialised
-	// [fresh snapshot -> decide -> CreateWorkerScope] machine-wide was deleted once CPU
-	// became a per-slice ledger resource (S5). But S5's ledger CPU charge is applied on
-	// the `aira confine` / `confine-reserve` ADMISSION paths, NOT here: evaluateWorkerAdmit
-	// consults no per-slice CPU ledger term, and aitest pytest
-	// workers reach the daemon via worker-admit, NOT confine-reserve (the embedded
-	// per-test governor that issued confine-reserve was retired in AIRA-33). So between
-	// S6 and S15 an aitest worker carries NO CPU charge at all: a plain suite can run up
-	// to 2×NumCPU concurrent suites each sizing its pool at NumCPU workers, and a
-	// --delegate-ram suite (0 declared cores) is unbounded on CPU. This is the AIRA-64
-	// problem returning, for the worker-admit path only, for the duration of the rebuild
-	// — plan-sanctioned (S15 rebuilds worker-admit onto the ledger and charges CPU there;
-	// see the BUILT (S6) record + the TestS6InterimWorkerAdmitCPUUnbounded witness). The
-	// RAM aggregate guard above stays serialised by this outer scope's own lock
-	// (state.release), which that governor never protected, so RAM is still bounded.
-	seq := state.nextSeq
-	if state.maxIndex > seq {
-		// Restart reconstruction: nothing in RAM knows the ids already on the
-		// tree, so the largest existing numeric suffix seeds the sequence.
-		seq = state.maxIndex
-	}
+	seq := state.nextSeq + 1
 	if seq >= maxWorkerScopeSeq {
-		// Terminal, not retriable: ids are never reused (nextSeq only grows,
-		// and a restart re-seeds it from the largest suffix on the tree), so
-		// no amount of waiting produces a free id. request-invalid is the
-		// TERMINAL-BUT-DAEMON-HEALTHY disposition, not a claim that the
-		// request was malformed — see the class's own doc comment.
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassRequestInvalid,
-			Reason: runner.WorkerAdmitReasonWorkerIDSpaceExhausted,
-			Detail: fmt.Sprintf("worker id space exhausted under %s (limit %d)", req.outerScope, maxWorkerScopeSeq),
-		}, true
-	}
-	seq++
-	workerID := strconv.Itoa(seq)
-	create := s.workerScopeCreate
-	if create == nil {
-		create = runner.CreateWorkerScope
-	}
-	// The daemon creates the scope itself, inside this critical section, using
-	// the SAME runner.CreateWorkerScope the CLI used to call — no second
-	// scope-creation implementation. This closes the grant->creation window
-	// (the grant used to be recorded here and the directory created afterwards
-	// by a different process) and makes the ledger's source of truth exist
-	// before the grant is ever delivered.
-	scopePath, swapCap, err := create(ctx, req.outerScope, workerID, req.estimatedBytes)
-	if err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			// A child the scan did not see PROVES the cached sum was
-			// stale-low, so this must never "take the next id and grant" —
-			// that would admit against a sum omitting the colliding child, the
-			// exact AIRA-39 over-admit. Invalidate and deny RETRIABLY: the
-			// caller's poll loop re-evaluates against a fresh scan that now
-			// includes it, and then grants or denies correctly.
-			state.invalidate()
-			return WorkerAdmitResponse{
-				State:  runner.WorkerAdmitStateDenied,
-				Class:  runner.WorkerAdmitClassContended,
-				Reason: runner.WorkerAdmitReasonWorkerScopeIDCollision,
-			}, true
-		}
-		// Fail closed: no grant is ever recorded without its scope. Classed
-		// request-invalid, which is the TERMINAL-BUT-DAEMON-HEALTHY
-		// disposition (formerly carried by the "reject:" reason prefix). Not
-		// every such failure is provably permanent, but
-		// BootstrapAitestSupervisor has already enabled
-		// cgroup.subtree_control before any worker-admit call runs, so the
-		// realistic cause is broken daemon-side cgroupfs access — and a
-		// `contended` class would be retried INDEFINITELY, stalling every
-		// aitest run on the machine rather than the one job that hit it.
-		// `admission-unusable` is not the answer either: it would strip
-		// containment for a whole run over a daemon that is answering fine.
-		return WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassRequestInvalid,
-			Reason: runner.WorkerAdmitReasonWorkerScopeCreateFailed,
-			Detail: err.Error(),
-		}, true
+		return "", "", errWorkerIDSpaceExhausted
 	}
 	state.nextSeq = seq
-	// The tree changed under us; the next committed read must see it.
-	state.invalidate()
-	return WorkerAdmitResponse{
-		State: runner.WorkerAdmitStateGranted, Class: runner.WorkerAdmitClassGranted,
-		WorkerID: workerID, ScopePath: scopePath,
-		MemoryMax: req.estimatedBytes, SwapCap: swapCap,
-		// AIRA-123: stated positively on the real path too, not only on the
-		// degraded one. A grade that were present only when weak would make its
-		// ABSENCE the claim of strength, which is precisely the reading this
-		// field exists to make impossible.
-		Containment: runner.WorkerAdmitContainmentEnforced,
-	}, true
+	workerID := strconv.Itoa(seq)
+	return workerID, runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
 }
 
-func validateWorkerAdmitArgs(args map[string]any, waitCeilingMs int64) (workerAdmitRequest, error) {
+// reseedWorkerScope forces the next allocation for outerScope to re-read the tree.
+// Called ONLY on a create EEXIST — positive proof the counter is stale-low because
+// a child it did not know about is already on the tree.
+func (s *Server) reseedWorkerScope(outerScope string) {
+	state := s.workerScopeFor(outerScope)
+	state.mu.Lock()
+	state.seeded = false
+	state.mu.Unlock()
+}
+
+// workerParentScopeID maps a worker's outer cgroup path to the suite scope-id the
+// worker lease is a sub-reservation OF (design §8). A confine job's scope
+// directory is ".aira-<scopeID>" (confineScopeDirName), so the suite's scope-id is
+// the outer directory's base with that prefix stripped. Setting the worker lease's
+// parentScopeID to this is what makes the shared exclusivity gate (exclusiveGate.
+// blocks) treat the holder's OWN aitest workers as its internal progress — the
+// exact exemption the deleted exclusiveDeniesWorkerAdmit provided, now expressed as
+// a lease property rather than a bespoke worker gate.
+//
+// It only needs to MATCH a holder scope-id when the worker's suite is itself the
+// exclusive holder (`aira confine --exclusive --delegate-ram -- pytest`); a
+// non-".aira-" base (aitest run outside confine) yields a harmless non-empty value
+// that matches no holder and still marks the lease a sub-reservation (so a drain
+// elsewhere does not block it).
+func workerParentScopeID(outerScope string) string {
+	return strings.TrimPrefix(filepath.Base(filepath.Clean(outerScope)), ".aira-")
+}
+
+// validateWorkerAdmitArgs parses the worker-admit wire arguments. Since S15 there
+// is NO max_wait ceiling to validate: a blocking claim has no daemon-side timeout
+// (design §4/§6), and a present-and-zero max_wait_ms is the non-blocking probe.
+func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	req := workerAdmitRequest{}
 	str := func(key string, required bool) (string, error) {
 		raw, exists := args[key]
@@ -812,21 +257,12 @@ func validateWorkerAdmitArgs(args map[string]any, waitCeilingMs int64) (workerAd
 	if req.outerScope, err = str("outer_scope", true); err != nil {
 		return workerAdmitRequest{}, err
 	}
-	// Canonicalise BEFORE anything keys on it. The per-outer-scope lock is now
-	// the only serialisation of "read the sum, then add to it", so `/x`, `/x/`
-	// and `/x/.` reaching three different ledger cells while mutating one
-	// cgroup would defeat it outright — and linuxScopeBackend.Create cleans its
-	// parent anyway, so an uncleaned key would also not match the directory the
-	// daemon creates (found by Sol plan-review). A relative path is refused
-	// rather than resolved against the daemon's own working directory, which
-	// would silently name a different cgroup than the client meant.
-	//
-	// AIRA-123: the ci-shim SENTINEL is the one accepted non-path value. It is
-	// not a cgroup path and must never be cleaned into one, so it short-circuits
-	// both the absolute-path rule and filepath.Clean. Whether it is the RIGHT
-	// value for this daemon is not decided here — evaluateWorkerAdmit's mode
-	// agreement check owns that, so the answer is a catalogued outcome class
-	// rather than a protocol error the client can only report as prose.
+	// Canonicalise BEFORE anything keys on it, so `/x`, `/x/` and `/x/.` cannot name
+	// three different things while mutating one cgroup. A relative path is refused
+	// rather than resolved against the daemon's own working directory. The ci-shim
+	// SENTINEL is the one accepted non-path value; it is not a cgroup path and must
+	// never be Cleaned into one (evaluateWorkerAdmit's mode-agreement check owns
+	// whether it is the RIGHT value for this daemon).
 	if req.outerScope != runner.ShimConfineSlice {
 		if !filepath.IsAbs(req.outerScope) {
 			return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit outer_scope must be an absolute cgroup path or the ci-shim sentinel %q, got %q", CodeProtocol, runner.ShimConfineSlice, req.outerScope)
@@ -836,211 +272,364 @@ func validateWorkerAdmitArgs(args map[string]any, waitCeilingMs int64) (workerAd
 	if req.signature, err = str("signature", false); err != nil {
 		return workerAdmitRequest{}, err
 	}
-	// exactAdmitInt64 (existing, admit.go) — overflow-safe float64->int64,
-	// reused rather than the naive int64(estimated) truncation this used
-	// to do, which let an arbitrary huge float64 truncate unchecked.
+	// exactAdmitInt64 (admit.go) — overflow-safe float64->int64, so an arbitrary
+	// huge float64 cannot truncate unchecked into a plausible small reserve.
 	estimated, ok := exactAdmitInt64(args["estimated_bytes"])
 	if !ok || estimated < workerAdmitEstimatedBytesMin || estimated > admitMaxReserve {
 		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_bytes must be at least %d bytes and no larger than %d", CodeProtocol, workerAdmitEstimatedBytesMin, admitMaxReserve)
 	}
 	req.estimatedBytes = estimated
-	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
-	if !ok {
-		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms must be an integer", CodeProtocol)
+	if raw, present := args["max_wait_ms"]; present {
+		value, ok := exactAdmitInt64(raw)
+		if !ok {
+			return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms must be an integer", CodeProtocol)
+		}
+		// PRESENT and zero → non-blocking probe. PRESENT and positive → a blocking
+		// claim (no timeout), the same S13 treatment the confine admit path gives a
+		// positive max_wait_ms. ABSENT (below) is also a blocking claim.
+		req.nonBlocking = value == 0
 	}
-	if maxWait < 0 {
-		maxWait = 0
-	}
-	// AIRA-58: refuse rather than silently clamp, same honesty fix as the admit
-	// path. The code stays CodeProtocol (NOT CodeAdmitWaitTooLong) on purpose:
-	// worker_admit_client_linux.go wraps every non-OK response as
-	// E_CONFINE_UNAVAILABLE, and the aitest supervisor responds to "unavailable"
-	// by disabling daemon admission and running UNCONFINED. It already classifies
-	// E_DAEMON_PROTOCOL as permanent, so refusing with that code fails closed
-	// instead of silently dropping confinement.
-	if maxWait > waitCeilingMs {
-		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms %d exceeds the ceiling of %d ms (%s)",
-			CodeProtocol, maxWait, waitCeilingMs, time.Duration(waitCeilingMs)*time.Millisecond)
-	}
-	req.maxWaitMS = maxWait
 	return req, nil
 }
 
+// writeWorkerAdmitResponse stamps the observed wait and writes the one terminal
+// worker-admit frame. OK is true exactly on a grant. It never returns the write
+// error: on a grant the lease is released by the holder's EOF (design §3), NOT by
+// this write's success, so the caller falls through to the held read regardless
+// (serveReDeclare's ack does the same); on a non-grant the handler returns anyway.
+func (s *Server) writeWorkerAdmitResponse(conn net.Conn, start time.Time, resp WorkerAdmitResponse) {
+	resp.WaitedMS = elapsedMilliseconds(start, s.admitNowTime())
+	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
+	ok := resp.State == runner.WorkerAdmitStateGranted
+	_ = writeFrame(conn, responseFrame(core.Response{OK: ok, Code: "OK", Data: resp}))
+}
+
+// workerAdmitSnapshot is the non-blocking probe's answer: the unified ledger's
+// current available RAM and CPU under path's queue, with NO reservation taken
+// (design §6/§8). During the restart freeze it reports unevaluated rather than a
+// figure — the slice is not saturated, it is frozen (the S11 honesty pin).
+//
+// It re-derives available the same way evaluateAdmitQueue does (checkedAvailable in
+// dev, ledgerAvailable in shim, cpuAvailable for cores), reading the queue's ledger
+// under queue.mu. A slice with no queue yet reads outstanding 0 (the ceiling is
+// wholly available).
+func (s *Server) workerAdmitSnapshot(path string, current, maximum, reclaimable int64) WorkerAdmitResponse {
+	now := s.admitNowTime()
+	if s.restartFrozenAt(now) {
+		return WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateUnevaluated, Class: runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonSnapshot,
+			Detail: "restart freeze: available is transiently unestablished",
+		}
+	}
+	var outstanding, cpuOutstanding int64
+	outstandingJobs := 0
+	s.admitRegistryMu.Lock()
+	queue := s.admitQueues[path]
+	s.admitRegistryMu.Unlock()
+	if queue != nil {
+		queue.mu.Lock()
+		outstanding, cpuOutstanding, outstandingJobs = queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs
+		queue.mu.Unlock()
+	}
+	headroom := s.admitSliceHeadroom(addJobCountClamp(outstandingJobs, 1))
+	effectiveMaximum := maximum
+	var available int64
+	if s.shimMode() {
+		available = ledgerAvailable(effectiveMaximum, outstanding, headroom)
+	} else {
+		effectiveMaximum = s.admitEffectiveMaximum(path, maximum)
+		available = checkedAvailable(current, effectiveMaximum, reclaimable, outstanding, headroom)
+	}
+	return WorkerAdmitResponse{
+		State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassContended,
+		Reason:         runner.WorkerAdmitReasonSnapshot,
+		AvailableBytes: available,
+		AvailableCPU:   cpuAvailable(s.cpuCeiling(), cpuOutstanding),
+	}
+}
+
+// workerAdmitEnqueueRejection maps an enqueue error code to a worker-admit
+// disposition. CodeAdmitTooLarge is the one genuinely-terminal case (a request
+// larger than the whole ceiling can never fit); every other code is reported
+// RETRIABLE (contended) so the supervisor polls rather than abandoning
+// daemon-backed admission and running the whole suite UNCONFINED — the AIRA-63
+// safety regression a wrongly-terminal class caused.
+func workerAdmitEnqueueRejection(code string) WorkerAdmitResponse {
+	if code == CodeAdmitTooLarge {
+		return WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
+			Reason: runner.WorkerAdmitReasonExceedsCeiling,
+			Detail: "estimated bytes exceed the slice ceiling minus headroom",
+		}
+	}
+	return WorkerAdmitResponse{
+		State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassContended,
+		Reason: runner.WorkerAdmitReasonAdmitSlotsSaturated,
+		Detail: "worker-admit enqueue refused: " + code,
+	}
+}
+
+// workerAdmitConnection admits ONE worker as a lease on the unified signed ledger
+// and holds it on this connection for the worker's life; the connection's EOF
+// releases the lease (design §3, the AIRA-41 reversal). One connection per worker
+// lease.
+//
+// AIRA-41 REVERSAL. Before S15 a closed worker-admit connection freed NOTHING (the
+// ledger summed the outer scope's `.aira-worker-*` children, so a killed relay
+// could not drop a live worker's charge). S15 makes the worker lease a normal
+// signed-ledger lease keyed on the worker's scope path and RELEASES it on the
+// holder's EOF via compare-and-release (releaseAdmitWaiterAnchored) — the same
+// primitive S8 built for confine. RAM (and the worker's one core) return
+// IMMEDIATELY when the relay closes, not at suite end.
 func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	start := s.admitNowTime()
-	// AIRA-63: worker-admit retains a connection and a polling goroutine for
-	// its whole wait, and until now had no concurrency bound at all, unlike
-	// admitConnection. Share the existing admitSlots semaphore rather than
-	// adding a second one.
-	//
-	// Saturation is deliberately NOT an error frame the way admitConnection's
-	// CodeBusy is. An unrecognised error Code is classified
-	// contract-violation by RequestWorkerAdmit — terminal and loud — which is
-	// not what a transient slot shortage deserves. Before AIRA-42 it was worse
-	// still: any non-"OK" Code became the prose "worker-admit request
-	// rejected", which matched none of supervisor.py's denial substrings, fell
-	// through to WorkerAdmitUnavailable, and made _disable_daemon run the WHOLE
-	// suite unconfined — a safety regression, not a denial. Emitting it as an
-	// ordinary denial classed `contended` makes supervisor.py raise the
-	// retriable WorkerAdmitDenied, which _wait_for_admission_or_disable retries
-	// until a slot frees. That disposition is now the Class field itself rather
-	// than a "fallback:" spelling convention on the reason.
+	// AIRA-63: worker-admit shares the admitSlots semaphore that bounds concurrent
+	// admission connections. Saturation is a `contended` DENIAL (retriable), not an
+	// error frame — an unrecognised error Code would be classed contract-violation
+	// (terminal) by the client and strip containment for the whole suite.
 	if !s.acquireAdmitSlot() {
-		saturated := WorkerAdmitResponse{
-			State:  runner.WorkerAdmitStateDenied,
-			Class:  runner.WorkerAdmitClassContended,
+		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassContended,
 			Reason: runner.WorkerAdmitReasonAdmitSlotsSaturated,
-		}
-		saturated.WaitedMS = elapsedMilliseconds(start, s.admitNowTime())
-		_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-		_ = writeFrame(conn, responseFrame(core.Response{OK: false, Code: "OK", Data: saturated}))
+		})
 		return
 	}
-	defer s.releaseAdmitSlot()
+	slotReleased := false
+	releaseSlot := func() {
+		if !slotReleased {
+			slotReleased = true
+			s.releaseAdmitSlot()
+		}
+	}
+	defer releaseSlot()
 
-	req, err := validateWorkerAdmitArgs(args, workerAdmitWaitCeilingMs)
+	req, err := validateWorkerAdmitArgs(args)
 	if err != nil {
 		_ = writeFrame(conn, errorFrame(CodeProtocol, err.Error()))
 		return
 	}
-	// S8: the shared peer-EOF watcher (admit.go). Worker-admit has no ledger lease to
-	// anchor until S15, so it uses only the watcher half of the shared helper today.
+
+	// THE MODE-AGREEMENT CHECK, both directions. The client's outer_scope is the
+	// ci-shim sentinel exactly when the CLIENT resolved shim mode, and an absolute
+	// cgroup path exactly when it resolved real mode. A disagreement means two
+	// processes read different install-mode records; neither branch below is safe on
+	// the other's request. Terminal (admission-unusable), because waiting cannot make
+	// two records agree.
+	shim := s.shimMode()
+	if shim != (req.outerScope == runner.ShimConfineSlice) {
+		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateUnavailable, Class: runner.WorkerAdmitClassAdmissionUnusable,
+			Reason: runner.WorkerAdmitReasonConfineModeMismatch,
+			Detail: "this daemon is in " + s.confineModeName() + " mode and the client asked about outer scope " + req.outerScope,
+		})
+		return
+	}
+
+	// Resolve the ONE slice whose signed ledger every lease charges (design §7, D1):
+	// aira.slice in real mode, the ci-shim sentinel in shim mode. This is the SAME
+	// resolver+input serveReDeclare uses, so a fresh worker lease and its
+	// post-restart re-declare land in the identical queue and cannot double-count.
+	path, ok, resolveReason := s.sliceResolver()(runner.DefaultConfineSlice)
+	if !ok {
+		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateUnevaluated, Class: runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonOuterScopeUnreadable, Detail: resolveReason,
+		})
+		return
+	}
+	current, maximum, reclaimable, ok, memReason := s.memoryReader()(path)
+	if !ok {
+		// FAIL CLOSED on a new admission, but RETRIABLE: the supervisor keeps polling
+		// rather than stripping containment. A persistent failure ends the claim only
+		// when the client gives up (its connection closes).
+		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateUnevaluated, Class: runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonOuterScopeUnreadable, Detail: memReason,
+		})
+		return
+	}
+
+	if req.nonBlocking {
+		// Non-blocking probe: report current available, reserve nothing, create no
+		// scope. The aitest supervisor sizes its pool from this; a CLAIM is a blocking
+		// request (max_wait_ms absent or positive).
+		s.writeWorkerAdmitResponse(conn, start, s.workerAdmitSnapshot(path, current, maximum, reclaimable))
+		return
+	}
+
+	// BLOCKING CLAIM (design §8 v1 scheduler): reserve {ram, one core} on the unified
+	// ledger and wait until it fits conjunctively (RAM AND CPU), then create the
+	// worker's cgroup sub-scope and hold the lease. There is no outer-cap aggregate
+	// scan any more (S15 deleted it); the outer scope's own memory.oom.group is the
+	// kernel-side bound on Σ(worker caps) ≤ outer-cap (design §8/§10 Inv 2), and the
+	// unified ledger bounds Σ(all leases) ≤ the slice ceiling.
+
+	// Exceeds-ceiling fast-fail, BEFORE the worker-id allocation reads the tree: a
+	// request larger than the whole slice ceiling can never fit, so refuse it up
+	// front (terminal, request-invalid) rather than allocate an id and enqueue a
+	// waiter that would block forever. enqueue re-checks the ceiling authoritatively
+	// against the jobs-scaled headroom; this pre-check only avoids the doomed work.
+	if req.estimatedBytes > subtractFloor(maximum, s.admitSliceHeadroom(1)) {
+		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
+			Reason: runner.WorkerAdmitReasonExceedsCeiling,
+			Detail: fmt.Sprintf("estimated %d bytes exceeds the slice ceiling", req.estimatedBytes),
+		})
+		return
+	}
+
+	// Allocate the id + scope path BEFORE enqueue so the lease has a stable scope-id
+	// key. Real mode re-seeds the counter from the tree (survivors keep their
+	// .aira-worker-<N> across a restart); shim mode has no tree, so a synthetic
+	// monotonic id keys the advisory lease.
+	var workerID, scopePath, scopeID string
+	if shim {
+		workerID = strconv.FormatUint(s.shimWorkerSeq.Add(1), 10)
+		scopeID = "ci-shim-worker-" + workerID
+	} else {
+		workerID, scopePath, err = s.allocateWorkerScopeID(req.outerScope)
+		if err != nil {
+			if errors.Is(err, errWorkerIDSpaceExhausted) {
+				s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+					State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
+					Reason: runner.WorkerAdmitReasonWorkerIDSpaceExhausted,
+					Detail: fmt.Sprintf("worker id space exhausted under %s (limit %d)", req.outerScope, maxWorkerScopeSeq),
+				})
+				return
+			}
+			s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+				State: runner.WorkerAdmitStateUnevaluated, Class: runner.WorkerAdmitClassContended,
+				Reason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
+				Detail: "worker scopes unreadable: " + err.Error(),
+			})
+			return
+		}
+		scopeID = scopePath
+	}
+	parentScopeID := workerParentScopeID(req.outerScope)
+
+	request := admitRequest{
+		reserve:       req.estimatedBytes,
+		cpu:           runner.DefaultConfineCPUCores,
+		scopeID:       scopeID,
+		parentScopeID: parentScopeID,
+		signature:     req.signature,
+		conn:          conn,
+	}
+	// Anchor identity, read BEFORE the enqueue lock (mirrors admitConnection): the
+	// lease's EOF release compares this handler's own conn against the anchor, and
+	// the re-declare same-uid gate reads peerSameUID. A net.Pipe test conn with no
+	// injected credential seam simply anchors with pid 0.
+	if uid, pid, credErr := s.peerCredentialOf(conn); credErr == nil {
+		request.peerSameUID = uid == os.Geteuid()
+		if pid > 0 {
+			request.clientPID = pid
+			if tick, ok, _ := readProcStartTime(pid); ok {
+				request.processStartTick = tick
+			}
+		}
+	}
+	queue, waiter, code, enqErr := s.enqueueResolvedConfineAdmit(path, req.estimatedBytes, workerAdmitBasis, maximum, request)
+	if enqErr != nil {
+		s.writeWorkerAdmitResponse(conn, start, workerAdmitEnqueueRejection(code))
+		return
+	}
 	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
-
-	poll := s.workerAdmitPollInterval
-	if poll <= 0 {
-		poll = 200 * time.Millisecond
-	}
-	deadline := s.admitNowTime().Add(time.Duration(req.maxWaitMS) * time.Millisecond)
-	var response WorkerAdmitResponse
-	for {
-		var proceed bool
-		// evaluateWorkerAdmit can queue on the outer scope's lock; a peer that
-		// vanished or a stopping daemon abandons it there, exactly like the
-		// poll sleep's own peerCtx/stopping cases below.
-		if response, proceed = s.evaluateWorkerAdmit(peerCtx, req); !proceed {
+	released := false
+	release := func() {
+		if released {
 			return
 		}
-		// AIRA-121: Unavailable joins the break set. It is a TERMINAL daemon-side
-		// verdict -- "this backend cannot function in this mode" -- and polling it
-		// would burn the caller's whole max_wait before answering the same thing.
-		if response.State == runner.WorkerAdmitStateGranted || response.State == runner.WorkerAdmitStateUnevaluated ||
-			response.State == runner.WorkerAdmitStateUnavailable {
-			break
+		released = true
+		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
+	}
+	defer release()
+
+	// A blocking claim has NO daemon-side deadline (design §4/§6): the wait ends only
+	// on a grant, a stopping daemon, or the peer closing its connection.
+	select {
+	case <-waiter.grantedCh:
+	case <-s.stopping:
+		return
+	case <-peerCtx.Done():
+		return
+	}
+	queue.mu.Lock()
+	grantedState := waiter.state
+	queue.mu.Unlock()
+	if grantedState != admitGranted {
+		// A blocking claim never times out, so the only non-grant terminal state is a
+		// rejection by the exclusive-drain unestablished-emptiness rule — retriable.
+		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonSaturated,
+		})
+		return
+	}
+	// Granted. Release the shared admission slot NOW (release-after-grant): the lease
+	// is charged on the ledger and will be held on this connection for the worker's
+	// whole life, which is NOT admission negotiation. A re-declared worker lease
+	// (serveReDeclare) holds no slot either, so releasing here keeps a fresh grant
+	// consistent with its own re-declared future and decouples the max live-worker
+	// count from admitGlobalMax and the box's core count. Queued claims still hold a
+	// slot while waiting, bounded by admitMaxWaiters (256) < admitGlobalMax (1024).
+	releaseSlot()
+
+	containment := runner.WorkerAdmitContainmentEnforced
+	reserved := int64(0)
+	memoryMax := req.estimatedBytes
+	swapCap := ""
+	if shim {
+		// Advisory: no cgroup to name and no cap to write; the outcome renderer refuses
+		// an advisory grant that carries a scope_path or memory_max, so both stay zero
+		// and the booking is reported via Reserved instead.
+		containment = runner.WorkerAdmitContainmentAdvisory
+		reserved = req.estimatedBytes
+		memoryMax = 0
+	} else {
+		// The daemon creates the worker's cgroup sub-scope AFTER the grant — never
+		// under queue.mu (the evaluator must do no filesystem I/O). The ledger already
+		// charges the reserve; a creation failure discharges it.
+		create := s.workerScopeCreate
+		if create == nil {
+			create = runner.CreateWorkerScope
 		}
-		// AIRA-42: this was `strings.HasPrefix(response.Reason, "reject:")`
-		// — the daemon running the SAME defect on its own reason strings that
-		// supervisor.py ran on the daemon's prose. The convention it
-		// implemented was real and load-bearing (Fable re-gate round 3: every
-		// permanently-impossible verdict must break this loop, not just the
-		// two that existed when it was written), but spelling it as a prefix
-		// made the disposition a property of how a reason was WORDED. It is
-		// now the Class field, so a new terminal verdict gets the right
-		// behaviour by declaring its disposition rather than by remembering
-		// to spell its reason a particular way.
-		//
-		// The old scoping hazard disappears by construction rather than by
-		// comment: the timeout verdict's reason used to be "reject:saturated",
-		// which coincidentally matched the prefix, so this test had to be
-		// narrowed to state=="denied" to avoid breaking on it. There is no
-		// coincidental match to guard against now — but the state check is
-		// KEPT, because it is independently correct: a timeout means the
-		// CLIENT's own wait budget expired, which is retriable with a fresh
-		// request, never a stable daemon-side verdict.
-		if response.State == runner.WorkerAdmitStateDenied && response.Class == runner.WorkerAdmitClassRequestInvalid {
-			// A stable "never going to fit" fact about this request, not a
-			// transient contention moment — surface "denied" to the client
-			// immediately instead of waiting out the full poll timeout
-			// only to time out anyway. Every OTHER non-granted state keeps
-			// polling below (a live-usage-driven "not right now" is
-			// retried until it clears or the deadline converts it to
-			// "timeout").
-			break
-		}
-		remaining := deadline.Sub(s.admitNowTime())
-		if remaining <= 0 {
-			// The reason token is now plain `saturated`. It used to be
-			// "reject:saturated", whose accidental prefix match is what forced
-			// the state-scoping above to be reasoned about at all.
-			response = WorkerAdmitResponse{
-				State:  runner.WorkerAdmitStateTimeout,
-				Class:  runner.WorkerAdmitClassContended,
-				Reason: runner.WorkerAdmitReasonSaturated,
+		sp, sc, createErr := create(peerCtx, req.outerScope, workerID, req.estimatedBytes)
+		if createErr != nil {
+			release()
+			if errors.Is(createErr, fs.ErrExist) {
+				// A survivor the re-seed missed collided with this id. Force a fresh
+				// re-seed and deny RETRIABLY: the supervisor's next claim gets a higher id.
+				s.reseedWorkerScope(req.outerScope)
+				s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+					State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassContended,
+					Reason: runner.WorkerAdmitReasonWorkerScopeIDCollision,
+				})
+				return
 			}
-			break
-		}
-		// Clamp the sleep to whatever's left of the caller's own declared
-		// deadline, not the unconditional fixed poll interval (found by
-		// Sol build-review, AIRA-38 review wave): sleeping the full
-		// interval when only a fraction of it remains let waited_ms
-		// overshoot the caller's max_wait_ms by up to one poll interval
-		// before the NEXT loop iteration's evaluate ever ran -- low
-		// impact (a late grant is a strictly better outcome than a
-		// spurious timeout), but a genuine budget-precision violation.
-		sleep := poll
-		if remaining < sleep {
-			sleep = remaining
-		}
-		select {
-		case <-time.After(sleep):
-		case <-peerCtx.Done():
-			return
-		case <-s.stopping:
+			// Fail closed: no grant is delivered without its scope. request-invalid is
+			// the TERMINAL-BUT-DAEMON-HEALTHY disposition — a `contended` class would
+			// retry indefinitely, stalling every aitest run on the machine.
+			s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+				State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
+				Reason: runner.WorkerAdmitReasonWorkerScopeCreateFailed, Detail: createErr.Error(),
+			})
 			return
 		}
+		scopePath = sp
+		swapCap = sc
 	}
-	// Every response below is written as a single terminal decision. Use the
-	// admit clock seam (rather than time.Now) so its observed wait is both
-	// consistent with deadline handling and deterministic in tests.
-	response.WaitedMS = elapsedMilliseconds(start, s.admitNowTime())
-	// AIRA-123. The shim ledger's booking is released when this handler returns,
-	// which covers every exit path BELOW: the response write failing, the client
-	// closing its side, the daemon stopping.
-	//
-	// Nothing above can leak a booking, and the reason is structural rather than
-	// a promise: evaluateShimWorkerAdmit books ONLY on a grant, and a granted
-	// response breaks the poll loop immediately, so the only statement between
-	// the booking and this defer is the WaitedMS assignment above. Every other
-	// loop exit (a denied verdict, a peer that vanished, a stopping daemon)
-	// carries leaseID zero because it never booked.
-	//
-	// See worker_admit_shim.go's "THE LEASE IS THE CONNECTION" note for why in
-	// shim mode and why that is weaker than the real path's cgroup-backed ledger:
-	// this is not the AIRA-41 mistake being reintroduced, it is the only lifetime
-	// signal that exists when there is no cgroup to charge.
-	if response.leaseID != 0 {
-		defer s.releaseShimWorkerLease(response.leaseID)
-	}
-
-	// There is NO ledger release here any more, on any exit path, and that is
-	// deliberate (AIRA-41). The ledger charges the SCOPE, not this connection,
-	// so:
-	//   - a killed relay no longer silently frees capacity while its worker is
-	//     still alive under its still-intact cap — the bug this fix closes;
-	//   - the normal release is supervisor.py's _retire_worker, which reaps the
-	//     worker FIRST and only then rmdirs the (now empty) scope;
-	//   - a daemon-side rmdir on lease close would be actively wrong in the
-	//     AIRA-41 case: the cgroup is still populated, the rmdir would fail
-	//     EBUSY, and the scope SHOULD keep charging until the worker is reaped.
-	//
-	// A grant whose response write fails therefore leaves its scope on the tree,
-	// charging until the outer confine job's own teardown removes the subtree.
-	// Removing it here is NOT safe: writeFrameBytes surfaces the underlying
-	// Write error and discards n, so "the client provably never learned the
-	// path" is false — a fully delivered frame followed by a deadline or reset
-	// error is possible, and a client that forks its worker into a removed
-	// cgroup hits WorkerPlacementFailed -> _disable_daemon -> the whole suite
-	// unconfined. An over-charge produces a loud, retriable denial instead
-	// (found by Sol plan-review; DeepSeek argued the opposite and was not taken).
-	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-	ok := response.State == runner.WorkerAdmitStateGranted
-	if err := writeFrame(conn, responseFrame(core.Response{OK: ok, Code: "OK", Data: response})); err != nil {
-		return
-	}
-	if !ok {
-		return
-	}
+	s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+		State: runner.WorkerAdmitStateGranted, Class: runner.WorkerAdmitClassGranted,
+		WorkerID: workerID, ScopePath: scopePath, MemoryMax: memoryMax,
+		SwapCap: swapCap, Containment: containment, Reserved: reserved,
+		ParentScopeID: parentScopeID,
+	})
+	// Hold the lease until the holder's EOF (the deferred compare-and-release then
+	// discharges the ledger) or graceful shutdown. The write result above does not
+	// gate this: release is EOF-keyed, not write-keyed.
 	select {
 	case <-peerCtx.Done():
 	case <-s.stopping:

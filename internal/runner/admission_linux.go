@@ -58,11 +58,13 @@ func (result admissionResult) releaseAdmission() {
 // package rather than derived — a bump on one side alone fails that test
 // instead of silently breaking admission negotiation (AIRA-83 item 3).
 //
-// Bumped 9→10 in LOCKSTEP with daemon.ProtocolVersion for the admission-counter
-// rebuild (S5 `cpu` admit arg + S7 signed ledger / version-frozen re-declare
-// frame). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two
-// drift.
-const DaemonProtocolVersion = 10
+// Bumped 9→10 for the admission-counter rebuild (S5 `cpu` admit arg + S7 signed
+// ledger / version-frozen re-declare frame), then 10→11 in LOCKSTEP with
+// daemon.ProtocolVersion for S15's worker-admit wire change (response gained
+// parent_scope_id / available_bytes / available_cpu; max_wait_ms present-and-zero
+// became a non-blocking snapshot). TestRunnerDaemonProtocolVersionMatchesTheDaemon
+// fails if the two drift.
+const DaemonProtocolVersion = 11
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20
@@ -379,14 +381,11 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// against the per-slice 2×NumCPU ceiling at admission. A --delegate-ram job declares
 	// 0 cores (spec §8): it is framework overhead and charging it a core would double-count.
 	//
-	// This bounds the CONFINE path only. It does NOT bound aitest pytest workers: those
-	// reach the daemon via worker-admit (not confine-reserve — the embedded per-test
-	// governor that issued confine-reserve was retired in AIRA-33), and evaluateWorkerAdmit
-	// charges no CPU term between S6 (which deleted the #49/#64 flock gate that used to
-	// bound them) and S15 (which rebuilds worker-admit onto the ledger). See the S6 note in
-	// worker_admit.go. Accounting only — no cpu.max is written. The S5 `cpu` arg's
-	// ProtocolVersion bump landed in S7: both DaemonProtocolVersion and daemon.ProtocolVersion
-	// are now 10, in lockstep.
+	// aitest pytest workers are bounded too, since S15: they reach the daemon via
+	// worker-admit, which now charges each worker's one core against the SAME per-slice
+	// 2×NumCPU ledger (the worker lease is an ordinary signed-ledger lease). Accounting
+	// only — no cpu.max is written. The S5 `cpu` arg's ProtocolVersion bump landed in S7:
+	// both DaemonProtocolVersion and daemon.ProtocolVersion are 10, in lockstep.
 	cpuCores := DefaultConfineCPUCores
 	if req.DelegateRAM {
 		cpuCores = 0
