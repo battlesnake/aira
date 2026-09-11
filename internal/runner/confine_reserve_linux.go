@@ -84,6 +84,18 @@ func confineReserveWithRunner(ctx context.Context, request ConfineReserveRequest
 	if err := validateConfineReserveRequest(request); err != nil {
 		return nil, err
 	}
+	// S13. admitThroughDaemon no longer carries a transport deadline and now
+	// RECONNECTS indefinitely on a down daemon (design §4/§6). A confine-reserve
+	// caller's bounded wait — its MaxWait, 300s by default — therefore has to be
+	// applied here as a ctx deadline (§6: a client wanting a bounded wait cancels its
+	// connection). On deadline the reservation errors and the pytest plugin fails
+	// open, exactly as when the old transport deadline expired; it never falls open to
+	// the (deleted) flock.
+	if wait := r.admissionMaxWait; wait > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, wait)
+		defer cancel()
+	}
 	reserve := request.Bytes
 	clampedFrom := int64(0)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -104,6 +116,15 @@ func confineReserveWithRunner(ctx context.Context, request ConfineReserveRequest
 			// which is why this is an explicit marker rather than an inference.
 			ParentScopeID: InheritedConfineScopeID(),
 		}, reserve)
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			// S13: the reservation's bounded wait (its MaxWait, applied as a ctx deadline
+			// above) elapsed, or the caller cancelled, before the daemon granted. The
+			// daemon no longer times out or diagnoses a contended wait (design §6: no
+			// timeout — the client bounds it), so a confine-reserve can only report that
+			// its own bound elapsed with the daemon-unavailable code; it can no longer
+			// surface a daemon-side E_ADMIT_SATURATED. The pytest plugin fails open on it.
+			return nil, fmt.Errorf("E_CONFINE_UNAVAILABLE: no daemon admission within the %s reservation wait", r.admissionMaxWait)
+		}
 		if !answered {
 			if err != nil {
 				return nil, err

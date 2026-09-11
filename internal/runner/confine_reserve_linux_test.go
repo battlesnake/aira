@@ -101,24 +101,24 @@ func TestConfineReserveKilledHelperReleasesLeaseOnce(t *testing.T) {
 }
 
 func TestConfineReserveDaemonDownNeverEngagesFlock(t *testing.T) {
+	// S13: on a down daemon admitThroughDaemon reconnects (it no longer fails fast to
+	// flock). A confine-reserve's bounded wait is its MaxWait, applied as a ctx
+	// deadline: so a down daemon blocks up to MaxWait, then errors (the plugin fails
+	// open) — and NEVER engages the (deleted) flock fallback.
 	r := reserveTestRunner()
+	r.admissionMaxWait = 50 * time.Millisecond
 	r.admitDialFn = func(context.Context, string) (net.Conn, error) {
 		return nil, errors.New("daemon down")
-	}
-	var flockAttempts atomic.Int64
-	r.lockAttemptFn = func(string) (*admitLock, error) {
-		flockAttempts.Add(1)
-		return nil, errors.New("must not engage flock")
 	}
 	started := time.Now()
 	reservation, err := confineReserveWithRunner(context.Background(), ConfineReserveRequest{
 		Bytes: 40, Pinned: true, Signature: "pytest:test_example.py::test_case",
 	}, r)
-	if err == nil || reservation != nil || flockAttempts.Load() != 0 {
-		t.Fatalf("reservation=%+v err=%v flockAttempts=%d", reservation, err, flockAttempts.Load())
+	if err == nil || reservation != nil {
+		t.Fatalf("reservation=%+v err=%v (want a bounded error, never a flock fallback)", reservation, err)
 	}
-	if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 100*time.Millisecond) {
-		t.Fatalf("daemon-down reserve was not instant: %s", elapsed)
+	if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 2*time.Second) {
+		t.Fatalf("daemon-down reserve did not return within its bounded wait: %s", elapsed)
 	}
 }
 

@@ -47,20 +47,21 @@ const (
 	// It is ONE constant on purpose. Three independent 30-minute ceilings had
 	// drifted into the codebase — daemon admit, daemon worker-admit, and this
 	// runner — and the runner's silently clamped every request BEFORE it reached
-	// the daemon, so a daemon-side-only fix left `--admit-timeout 2h` still
-	// becoming 30m on the wire while daemon tests passed. A caller that exceeds
-	// this is REFUSED and told the ceiling, never silently substituted.
+	// the daemon. A caller that exceeds this is REFUSED and told the ceiling, never
+	// silently substituted. Its live callers since S13 are `confine-reserve
+	// --max-wait` (which applies its value as a real ctx deadline) and the
+	// `run.admission_max_wait` project-config key (validated here, then vestigial —
+	// see DefaultConfineAdmissionWait).
 	AdmitWaitCeiling = 24 * time.Hour
-	// DefaultConfineAdmissionWait is how long a confine launch waits to be
-	// ADMITTED when the caller declares no --admit-timeout. It bounds the wait to
-	// get in, and nothing about the job once it is running — ConfineRequest.Timeout
-	// is that, and the two are routinely confused.
-	//
-	// Exported for AIRA-185: `aira drain wait` must be able to TELL an operator
-	// what its admission budget actually is, because `drain wait --timeout 10s`
-	// reads as "give up after 10 seconds" and does not mean that. It was an
-	// unexported literal inside admitConfine, so a face that wanted to report it
-	// would have had to restate it and drift.
+	// DefaultConfineAdmissionWait was how long a confine launch waited to be ADMITTED
+	// when no --admit-timeout was given. S13 removed --admit-timeout and the admission
+	// wait no longer self-expires (design §4/§6: a blocking wait ends on the grant or
+	// on ctx cancellation, never a client-side timeout), so this constant no longer
+	// bounds anything: admitConfine still assigns it to the runner's admissionMaxWait,
+	// but that field is now read only by the vestigial wait-ceiling TYPO GUARD in
+	// admit(). It is a flagged §6 collision (owner question), kept rather than deleted
+	// pending that decision. ConfineRequest.Timeout — a real job deadline — is a
+	// different quantity and the two are routinely confused.
 	DefaultConfineAdmissionWait = 30 * time.Minute
 	// MinPinnedScopeCap is the smallest reserve a caller may DECLARE. It mirrors
 	// the minimum `aira confine --memory-reserve` already accepts, so the CLI, the

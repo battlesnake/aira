@@ -41,14 +41,14 @@ func captureDrainRequest(t *testing.T, argv []string) (runner.ConfineRequest, in
 
 // verifies: AIRA-185
 func TestDrainWaitParserAcceptsOnlyTheWaitOperationAndItsOwnFlags(t *testing.T) {
-	positional, options, err := parseDrainArgs([]string{"wait", "--timeout", "10m", "--admit-timeout", "5m", "--reason", "deploy: slice-ceiling flip"})
+	positional, options, err := parseDrainArgs([]string{"wait", "--timeout", "10m", "--reason", "deploy: slice-ceiling flip"})
 	if err != nil {
 		t.Fatalf("a valid drain was refused: %v", err)
 	}
 	if len(positional) != 1 || positional[0] != "wait" {
 		t.Fatalf("positional=%v", positional)
 	}
-	if options["timeout"] != "10m" || options["admit-timeout"] != "5m" || options["reason"] != "deploy: slice-ceiling flip" {
+	if options["timeout"] != "10m" || options["reason"] != "deploy: slice-ceiling flip" {
 		t.Fatalf("options=%v", options)
 	}
 	// The bare form is the common one and must stay valid.
@@ -63,23 +63,23 @@ func TestDrainWaitParserAcceptsOnlyTheWaitOperationAndItsOwnFlags(t *testing.T) 
 		t.Fatalf("flag-shaped reason: options=%v err=%v", options, err)
 	}
 	for name, argv := range map[string][]string{
-		"no operation":        {},
-		"unknown operation":   {"start"},
-		"two operations":      {"wait", "wait"},
-		"operation as flag":   {"--wait"},
-		"unknown flag":        {"wait", "--slice", "aira.slice"},
-		"confine flag":        {"wait", "--exclusive"},
-		"duplicate flag":      {"wait", "--reason", "a", "--reason", "b"},
-		"missing value":       {"wait", "--timeout"},
-		"flag-shaped value":   {"wait", "--timeout", "--reason"},
-		"unparsed timeout":    {"wait", "--timeout", "soon"},
-		"zero timeout":        {"wait", "--timeout", "0s"},
-		"negative timeout":    {"wait", "--timeout", "-1m"},
-		"sub-ms admit":        {"wait", "--admit-timeout", "500us"},
-		"over-ceiling admit":  {"wait", "--admit-timeout", "48h"},
-		"blank reason":        {"wait", "--reason", "   "},
-		"empty reason":        {"wait", "--reason", ""},
-		"trailing positional": {"wait", "--reason", "x", "extra"},
+		"no operation":      {},
+		"unknown operation": {"start"},
+		"two operations":    {"wait", "wait"},
+		"operation as flag": {"--wait"},
+		"unknown flag":      {"wait", "--slice", "aira.slice"},
+		"confine flag":      {"wait", "--exclusive"},
+		"duplicate flag":    {"wait", "--reason", "a", "--reason", "b"},
+		"missing value":     {"wait", "--timeout"},
+		"flag-shaped value": {"wait", "--timeout", "--reason"},
+		"unparsed timeout":  {"wait", "--timeout", "soon"},
+		"zero timeout":      {"wait", "--timeout", "0s"},
+		"negative timeout":  {"wait", "--timeout", "-1m"},
+		// S13 removed --admit-timeout; it is now an unknown drain flag.
+		"removed admit-timeout": {"wait", "--admit-timeout", "5m"},
+		"blank reason":          {"wait", "--reason", "   "},
+		"empty reason":          {"wait", "--reason", ""},
+		"trailing positional":   {"wait", "--reason", "x", "extra"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := parseDrainArgs(argv); err == nil {
@@ -95,7 +95,7 @@ func TestDrainWaitParserAcceptsOnlyTheWaitOperationAndItsOwnFlags(t *testing.T) 
 //
 // verifies: AIRA-185
 func TestDrainWaitIssuesTheExclusiveConfineRequestWithAPlaceholderBinary(t *testing.T) {
-	request, exit, _, _ := captureDrainRequest(t, []string{"drain", "wait", "--reason", "deploy: slice-ceiling flip", "--timeout", "10m", "--admit-timeout", "5m"})
+	request, exit, _, _ := captureDrainRequest(t, []string{"drain", "wait", "--reason", "deploy: slice-ceiling flip", "--timeout", "10m"})
 	if exit != 0 {
 		t.Fatalf("exit=%d", exit)
 	}
@@ -126,9 +126,11 @@ func TestDrainWaitIssuesTheExclusiveConfineRequestWithAPlaceholderBinary(t *test
 	}
 }
 
-// The two clocks are SEPARATE budgets, and this is the assertion that says so
-// in code: --timeout lands on the job bound (which excludes admission and setup
-// by construction) and leaves the admission budget entirely alone.
+// --timeout bounds ONLY the held duration; it never touches the admission wait.
+// S13 removed --admit-timeout, so the admission wait is no longer client-bounded
+// (a blocking wait ends on the grant or on interrupting the command, design
+// §4/§6) — AdmissionMaxWait stays 0 on the request and the banner says the wait
+// is interrupt-bounded rather than advertising a duration nothing enforces.
 //
 // verifies: AIRA-185
 func TestDrainWaitTimeoutBoundsTheHoldAndNotTheAdmissionWait(t *testing.T) {
@@ -136,29 +138,19 @@ func TestDrainWaitTimeoutBoundsTheHoldAndNotTheAdmissionWait(t *testing.T) {
 	if request.Timeout != 10*time.Second {
 		t.Fatalf("hold bound=%s, want 10s", request.Timeout)
 	}
-	// Zero means "the runner's own default", which is 30 minutes — NOT "no wait"
-	// and NOT 10 seconds. A --timeout that silently became the admission budget
-	// would make `drain wait --timeout 10s` give up at the door on a busy box.
+	// A --timeout that silently became the admission budget would make `drain wait
+	// --timeout 10s` give up at the door on a busy box. It must not: the admission
+	// wait is a separate, now-unbounded phase, so AdmissionMaxWait stays 0.
 	if request.AdmissionMaxWait != 0 {
-		t.Fatalf("admission budget=%s, want the runner default (0 on the request)", request.AdmissionMaxWait)
+		t.Fatalf("admission budget=%s, want 0 (the admission wait is not client-bounded)", request.AdmissionMaxWait)
 	}
-	if !strings.Contains(stderr, runner.DefaultConfineAdmissionWait.String()) {
-		t.Fatalf("the banner must state the effective admission budget:\n%s", stderr)
+	// The banner must state the interrupt-bounded admission wait honestly, not a
+	// duration nothing enforces.
+	if !strings.Contains(stderr, "until it is admitted") || !strings.Contains(stderr, "interrupt") {
+		t.Fatalf("the banner must state the interrupt-bounded admission wait:\n%s", stderr)
 	}
-
-	// And the converse: --admit-timeout bounds only the wait, never the hold.
-	request, _, _, _ = captureDrainRequest(t, []string{"drain", "wait", "--admit-timeout", "90s"})
-	if request.AdmissionMaxWait != 90*time.Second {
-		t.Fatalf("admission budget=%s, want 90s", request.AdmissionMaxWait)
-	}
-	if request.Timeout != 0 {
-		t.Fatalf("hold bound=%s, want unbounded", request.Timeout)
-	}
-
-	// Both together stay independent.
-	request, _, _, _ = captureDrainRequest(t, []string{"drain", "wait", "--timeout", "10s", "--admit-timeout", "90s"})
-	if request.Timeout != 10*time.Second || request.AdmissionMaxWait != 90*time.Second {
-		t.Fatalf("hold=%s admission=%s", request.Timeout, request.AdmissionMaxWait)
+	if strings.Contains(stderr, runner.DefaultConfineAdmissionWait.String()) {
+		t.Fatalf("the banner still advertises a %s admission budget that nothing enforces:\n%s", runner.DefaultConfineAdmissionWait, stderr)
 	}
 }
 
@@ -171,9 +163,8 @@ func TestDrainWaitBannerStatesBothBudgetsBeforeAnythingBlocks(t *testing.T) {
 	for _, want := range []string{
 		"aira.slice",
 		"already-running ones finish untouched",
-		"to be admitted",
+		"until it is admitted",
 		"THEN holding",
-		"two separate budgets",
 		"10s",
 		`"deploy"`,
 	} {
@@ -260,20 +251,9 @@ func TestDrainDescriptorAdvertisesOnlyWhatTheParserAccepts(t *testing.T) {
 		if _, _, err := parseDrainArgs([]string{"wait", flag, "5m"}); err != nil {
 			t.Fatalf("help advertises %s but the parser refuses it: %v", flag, err)
 		}
-		if arg.Name == "timeout" && !strings.Contains(arg.Description, "--admit-timeout") {
+		if arg.Name == "timeout" && !strings.Contains(arg.Description, "wait to be admitted") {
 			t.Fatalf("--timeout's help must distinguish it from the admission wait: %q", arg.Description)
 		}
-	}
-}
-
-// The help text names the admission default in prose, so a change to the
-// constant must break a test rather than silently make the documentation wrong.
-//
-// verifies: AIRA-185
-func TestDrainHelpAdmissionDefaultMatchesTheConstantItDescribes(t *testing.T) {
-	if runner.DefaultConfineAdmissionWait != 30*time.Minute {
-		t.Fatalf("the confine admission default is now %s; update `aira help drain`'s --admit-timeout wording, which says 30 minutes",
-			runner.DefaultConfineAdmissionWait)
 	}
 }
 

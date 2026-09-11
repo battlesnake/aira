@@ -12,7 +12,6 @@ import (
 	"io/fs"
 	"math"
 	"math/bits"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -701,31 +700,27 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, err
 	}
 	var releaseAdmissionOnce sync.Once
-	// AIRA-101. teardownStarted gates the exclusivity watcher below. It MUST be
-	// set before the lease is closed on the ordinary exit path, or the watcher's
-	// read fails with "use of closed network connection" on every CLEAN run and
-	// the facet reports `exclusive=lost` every single time — inverting an honesty
-	// signal into a permanent false alarm.
-	var teardownStarted atomic.Bool
+	// releaseAdmission closes the lease keeper (admission.release). The keeper's Close
+	// sets its stopped flag BEFORE closing the connection, and the exclusivity watcher
+	// (keeper.watchExclusive) treats a close-under-stopped as a clean teardown, not a
+	// loss — the S13 generalisation of the old teardownStarted guard that stopped the
+	// watcher reporting `exclusive=lost` on every clean run.
 	releaseAdmission := func() {
-		releaseAdmissionOnce.Do(func() {
-			teardownStarted.Store(true)
-			admission.releaseAdmission()
-		})
+		releaseAdmissionOnce.Do(admission.releaseAdmission)
 	}
 	defer releaseAdmission()
 	switch admission.state {
 	case "immediate", "waited":
 		result.Status.Admission = ConfineAdmissionAdmitted
-	case "timeout":
-		result.Status.Admission = ConfineAdmissionTimeout
 	default:
 		result.Status.Admission = ConfineAdmissionUnevaluated
 	}
 	// AIRA-222. Fail closed BEFORE launch if the caller required admission and the
-	// job was not admitted (state ∉ {immediate, waited}) — including a flock
-	// timeout. defer releaseAdmission() (above) still runs, releasing the
-	// (possibly nil) lease.
+	// job was not admitted (state ∉ {immediate, waited}). defer releaseAdmission()
+	// (above) still runs, releasing the (possibly nil) lease. S13 removed the flock
+	// "timeout" state: admit()'s reachable non-admitted states are now bypassed,
+	// disabled, unevaluated, refused, too_large/saturated, exclusive_unavailable and
+	// wait_too_long — never "timeout".
 	if refusal := requireAdmissionRefusal(request, sliceName, admission.state, admission.reason); refusal != nil {
 		return result, refusal
 	}
@@ -734,7 +729,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// which this records exclusivity that was not actually obtained. The facet is
 	// finalised on the completion path beside TerminatedBy, where a mid-run loss
 	// can still downgrade it.
-	var exclusiveLost atomic.Bool
+	var exclusiveKeeper *leaseKeeper
 	if request.Exclusive {
 		result.Status.Exclusive = ConfineExclusiveGranted
 		result.Status.ExclusiveDrainedMS = admission.waitedMS
@@ -770,34 +765,28 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	//     guard below and reported as a clean run. The window is the teardown
 	//     itself, and erring that way keeps a clean run from being libelled.
 	//
-	// The teardownStarted guard is load-bearing: releaseAdmission closes the lease
-	// on the ordinary exit path, so without it this read would fail with "use of
-	// closed network connection" on EVERY clean run and report exclusive=lost
-	// every time, inverting the honesty signal into a permanent false alarm.
+	// The keeper's stopped flag is the S13 generalisation of the old teardownStarted
+	// guard: releaseAdmission closes the keeper on the ordinary exit path (setting
+	// stopped before closing the conn), so the watcher's read returning under stopped
+	// is a clean teardown, not a loss — without it every clean run would report
+	// exclusive=lost.
 	if request.Exclusive {
-		lease, watchable := admission.release.(net.Conn)
+		keeper, watchable := admission.release.(*leaseKeeper)
 		if !watchable {
 			// The grant is real (admit refuses anything else), but without a lease
-			// connection to watch, a mid-run loss could not be detected — so the run's
+			// keeper to watch, a mid-run loss could not be detected — so the run's
 			// outcome is UNEVALUATED rather than granted. Claiming `granted` here
 			// would assert something this process cannot observe, which is the exact
 			// fabrication the facet exists to prevent, and it is also what made
 			// `unevaluated` unreachable in an earlier revision: a value nothing can
 			// emit is a reader trap (found by build review).
 			result.Status.Exclusive = ConfineExclusiveUnevaluated
-		}
-		if watchable {
-			go func() {
-				var one [1]byte
-				_, readErr := lease.Read(one[:])
-				if readErr == nil || teardownStarted.Load() {
-					return
-				}
-				exclusiveLost.Store(true)
-				// AIRA-206: leading \n -- this is a mid-run warning to the shared
-				// locked writer and would otherwise glue onto the child's partial line.
-				fmt.Fprint(diagnostics, "\naira: warning: exclusivity lost (admission lease closed) — this run was no longer scheduled alone; treat any measurement from it as contended\n")
-			}()
+		} else {
+			// An exclusive lease CANNOT be re-established across a daemon restart
+			// (§15 P2-D), so the keeper's exclusive branch watches for the lease
+			// closing and reports exclusive=lost — it never reconnects.
+			exclusiveKeeper = keeper
+			keeper.watchExclusive(diagnostics)
 		}
 	}
 
@@ -989,7 +978,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the unpinned fallback is deliberately left uncapped rather than
 	// conservatively capped. Delegate-ram never takes either branch: its pinned
 	// reserve is framework overhead, and it gets a finite cap below.
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
+	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 		capSource = ConfineCapSourceDaemonReserve
 	}
@@ -1076,12 +1065,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
 	if containerPlan.Detected() {
 		result.Status.Container = containerInjection.Placement
-		// The ledger charge is real only on a daemon grant. This is the SAME
-		// predicate the scope-cap assignment above uses; the flock fallback
-		// reports state "immediate"/"waited" WITH a lock and is a slice
-		// free-memory check, so a facet keyed on admission.state would claim a
-		// charge that never happened.
-		ledgerCharged := admitted && admission.lock == nil && admission.release != nil
+		// The ledger charge is real only on a daemon grant, which is exactly what a
+		// non-nil admission.release now witnesses: since S13 deleted the flock fallback,
+		// the only admissionResult carrying a release is a real daemon grant (the keeper
+		// lease). This is the SAME predicate the scope-cap assignment above uses.
+		ledgerCharged := admitted && admission.release != nil
 		result.Status.ContainerMemory = ContainerMemoryFacet(containerPlan, containerInjection, containerReserveSkip, ledgerCharged)
 		for _, advisory := range ContainerAdvisories(containerPlan, containerInjection, scopeMemoryMax, result.Status.ReserveBasis) {
 			_, _ = fmt.Fprintln(diagnostics, advisory)
@@ -1194,9 +1182,6 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	started.Store(true)
 	_ = handshakeWrite.Close()
 	_ = releaseRead.Close()
-	if admission.lock != nil {
-		releaseAdmission()
-	}
 
 	abortStarted := func(cause error) (ConfineResult, error) {
 		_ = releaseWrite.Close()
@@ -1460,7 +1445,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// AIRA-101, finalised beside its sibling facet and on the same completion
 	// path. A lease that closed mid-run downgrades granted -> lost, so a
 	// measurement taken while the hold was gone is never reported as clean.
-	if request.Exclusive && exclusiveLost.Load() {
+	if request.Exclusive && exclusiveKeeper != nil && exclusiveKeeper.exclusiveWasLost() {
 		result.Status.Exclusive = ConfineExclusiveLost
 	}
 	// AIRA-206: prepend \n so the trailer ALWAYS begins its own line. The child's
@@ -1999,17 +1984,14 @@ func confineUnavailable(slice string, err error) error {
 // as the uncapped-slice refusal) when the caller opted in and the job was NOT
 // admitted, so it would run UNGOVERNED.
 //
-// Keyed on the raw admission STATE, refusing anything that is not "immediate" or
-// "waited" (the two admitted states). This is fail-closed by construction: it
-// refuses "unevaluated" (slice unreadable / daemon-down ci-shim / a daemon
-// unevaluated grant) AND "timeout" — the latter is the flock fallback's "waited
-// the whole budget, got no admission, launching anyway" outcome, which is
-// exactly an ungoverned launch, and which an earlier `== unevaluated` key let
-// through (Fable build-review P1). It ALLOWS a flock-fallback "immediate"/
-// "waited": that is a real free-memory check holding a real lock, so keying any
-// stricter (e.g. daemon-booked only) would make the flag unusable on a real
-// slice during a daemon restart. Returns nil whenever the flag is absent, so
-// ordinary launches are never touched.
+// Keyed on the raw admission STATE, refusing ANYTHING that is not "immediate" or
+// "waited" (the two admitted states) rather than on a specific list of bad states.
+// This is fail-closed BY CONSTRUCTION: it refuses "unevaluated" (slice unreadable,
+// a daemon-down ci-shim install, a daemon `unevaluated` grant, or the S13 no-daemon
+// launch) and any other non-admitted state, where an earlier `== unevaluated` key
+// let a different one through (Fable build-review P1). It allows only a real daemon
+// grant's "immediate"/"waited". Returns nil whenever the flag is absent, so ordinary
+// launches are never touched.
 func requireAdmissionRefusal(request ConfineRequest, slice, state, reason string) error {
 	if !request.RequireAdmission || state == "immediate" || state == "waited" {
 		return nil

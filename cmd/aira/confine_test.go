@@ -411,25 +411,16 @@ func TestConfineMemoryFlagsThreadIntoRequest(t *testing.T) {
 	}
 }
 
-func TestConfineAdmitTimeoutValidationAndThreading(t *testing.T) {
-	original := runConfined
-	t.Cleanup(func() { runConfined = original })
-	// Sub-1ms values (500us, 999us) must ALSO be rejected: the wire value is
-	// max_wait_ms and Milliseconds() truncates them to 0, which would reintroduce
-	// the deferred zero-wait evaluator race (a false "saturated" reject).
-	for _, raw := range []string{"0", "-1s", "500us", "999us"} {
-		if _, _, err := parseArgs("confine", []string{"--admit-timeout", raw, "--", "true"}); err == nil || !strings.Contains(err.Error(), "--admit-timeout") {
-			t.Fatalf("--admit-timeout %q err=%v, want CLI rejection", raw, err)
+// S13 removed --admit-timeout: the admission wait no longer self-expires (a
+// blocking wait ends on the grant or on interrupting the command, design §4/§6),
+// so the flag has no meaning and is rejected as an unknown confine option rather
+// than parsed. This pins that removal so a later change cannot silently re-add a
+// flag that does nothing.
+func TestConfineAdmitTimeoutRemovedAndRejected(t *testing.T) {
+	for _, raw := range []string{"25ms", "5m", "0", "48h"} {
+		if _, _, err := parseArgs("confine", []string{"--admit-timeout", raw, "--", "true"}); err == nil || !strings.Contains(err.Error(), "not valid for confine") {
+			t.Fatalf("--admit-timeout %q err=%v, want an unknown-option rejection", raw, err)
 		}
-	}
-	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
-		if request.AdmissionMaxWait != 25*time.Millisecond {
-			t.Fatalf("AdmissionMaxWait=%s want 25ms", request.AdmissionMaxWait)
-		}
-		return runner.ConfineResult{}, nil
-	}
-	if exit := runWithInput([]string{"confine", "--admit-timeout", "25ms", "--", "true"}, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
-		t.Fatalf("exit=%d", exit)
 	}
 }
 
@@ -685,11 +676,11 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		// AIRA-138 adds --timeout and --cpu-timeout to the usage line, beside the
-		// --admit-timeout they must never be confused with. AIRA-196 adds
+		// AIRA-138 adds --timeout and --cpu-timeout to the usage line. AIRA-196 adds
 		// --stdin-connect, which is meaningful only with --detach. AIRA-222 adds
-		// --require-admission (fail closed when the job was not admitted).
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
+		// --require-admission (fail closed when the job was not admitted). S13 removed
+		// --admit-timeout (the admission wait no longer self-expires).
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

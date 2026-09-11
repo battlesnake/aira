@@ -1205,7 +1205,14 @@ func TestConfineRejectedAdmissionCreatesNoScopeAndStartsNoChild(t *testing.T) {
 	}
 }
 
-func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
+// TestConfineDaemonAdmissionSendsNoMaxWait pins the S13 wire change: the confine
+// client sends NO max_wait_ms. The admission wait no longer self-expires (design
+// §4/§6) — the client blocks until granted, reconnects across a daemon restart, and
+// bounds the wait by ctx cancellation, never by a daemon-side timeout. The former
+// TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait (which asserted the
+// requested/default wait was propagated to the wire, AIRA-58) is superseded. A
+// well-formed saturated rejection is still handled terminally.
+func TestConfineDaemonAdmissionSendsNoMaxWait(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		wait time.Duration
@@ -1213,12 +1220,7 @@ func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
 	}{
 		{name: "positive", wait: 25 * time.Millisecond, want: 25 * time.Millisecond},
 		{name: "default", want: 30 * time.Minute},
-		// AIRA-58: a wait above the old private runnerAdmitWaitCap must reach the
-		// daemon INTACT. The runner used to clamp it to 30m before sending, so
-		// `--admit-timeout 2h` silently became 30m on the wire while every
-		// daemon-side test still passed. This table previously had no over-clamp
-		// case at all, which is why the bug survived.
-		{name: "above the old 30m runner clamp", wait: 2 * time.Hour, want: 2 * time.Hour},
+		{name: "large", wait: 2 * time.Hour, want: 2 * time.Hour},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			socket := filepath.Join(t.TempDir(), "admit.sock")
@@ -1257,9 +1259,8 @@ func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
 			}
 			select {
 			case frame := <-frames:
-				got, ok := frame.Request.Args["max_wait_ms"].(float64)
-				if !ok || int64(got) != test.want.Milliseconds() {
-					t.Fatalf("max_wait_ms=%v want=%d", frame.Request.Args["max_wait_ms"], test.want.Milliseconds())
+				if raw, present := frame.Request.Args["max_wait_ms"]; present {
+					t.Fatalf("client sent max_wait_ms=%v; S13 sends none — the client blocks/reconnects and bounds the wait by ctx, not a daemon timeout", raw)
 				}
 			case <-testdeadline.After(time.Second):
 				t.Fatal("daemon did not receive admission request")
@@ -1311,28 +1312,6 @@ func TestConfineDaemonLeaseHeldUntilScopeTeardown(t *testing.T) {
 	}
 	if closer.count != 1 {
 		t.Fatalf("lease closes=%d", closer.count)
-	}
-}
-
-func TestConfineFallbackFlockReleasedAtStart(t *testing.T) {
-	scope := &confineFakeScope{}
-	closer := &confineCountingCloser{}
-	deps := confineUnitDeps(scope)
-	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "immediate", reserve: 4 << 30, basis: "fallback:daemon-unavailable", lock: &admitLock{}, release: closer}, nil
-	}
-	deps.readUsage = func(string) cgroupUsage {
-		if closer.count != 1 {
-			t.Fatalf("fallback flock closes during run=%d, want release at start", closer.count)
-		}
-		return cgroupUsage{}
-	}
-	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
-	if _, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps); err != nil {
-		t.Fatal(err)
-	}
-	if closer.count != 1 {
-		t.Fatalf("fallback release count=%d", closer.count)
 	}
 }
 
@@ -1692,11 +1671,17 @@ func TestReadConfineCapDoesNotDependOnMemoryCurrent(t *testing.T) {
 	}
 }
 
-func TestConfineAdmissionTimeoutStillLaunchesAndReportsFacetMix(t *testing.T) {
+// S13 removed the flock "timeout" admission state. An UNEVALUATED admission (the
+// no-daemon case, or a slice AIRA could not read) is now the state that launches
+// ungoverned-but-warned, so this test pins the same facet-honesty property on it:
+// the job still launches, its exit code passes through, and the trailer reports
+// the mix honestly (cap enforced, admission unevaluated, priorities unverified
+// after the forced handshake failure).
+func TestConfineUnevaluatedAdmissionStillLaunchesAndReportsFacetMix(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "timeout", waitedMS: 10}, nil
+		return admissionResult{state: "unevaluated", reason: "no-daemon"}, nil
 	}
 	deps.readHandshake = func(*os.File, time.Duration) ([]byte, error) {
 		return nil, errors.New("forced handshake failure")
@@ -1709,11 +1694,11 @@ func TestConfineAdmissionTimeoutStillLaunchesAndReportsFacetMix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Exit != 23 || result.Status.Admission != ConfineAdmissionTimeout || result.Status.Priorities != ConfinePrioritiesUnverified {
+	if result.Exit != 23 || result.Status.Admission != ConfineAdmissionUnevaluated || result.Status.Priorities != ConfinePrioritiesUnverified {
 		t.Fatalf("result=%+v stderr=%q", result, stderr.String())
 	}
-	if !scope.started || !strings.Contains(stderr.String(), "cap=enforced") || !strings.Contains(stderr.String(), "admission=timeout") || !strings.Contains(stderr.String(), "priorities=unverified") || strings.Contains(stderr.String(), "priorities=applied") {
-		t.Fatalf("timeout launch/status dishonest: scope=%+v stderr=%q", scope, stderr.String())
+	if !scope.started || !strings.Contains(stderr.String(), "cap=enforced") || !strings.Contains(stderr.String(), "admission=unevaluated") || !strings.Contains(stderr.String(), "priorities=unverified") || strings.Contains(stderr.String(), "priorities=applied") {
+		t.Fatalf("unevaluated launch/status dishonest: scope=%+v stderr=%q", scope, stderr.String())
 	}
 }
 
@@ -2586,61 +2571,14 @@ func TestConfineRealHandshakeFailureIsUnverified(t *testing.T) {
 	}
 }
 
-func TestConfineRealAdmissionWaitsThenProceedsDaemonDown(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		cgrouptest.SkipOrFailRealCgroup(t, "python3 is unavailable: %v", err)
-	}
-	const reserve = int64(64 << 20)
-	parent := confineMemoryParent(t, "134217728")
-	filler, err := New(Config{CommonDir: t.TempDir(), CgroupParent: parent, Grace: time.Second, TermGrace: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := filler.Probe(context.Background()); err != nil {
-		cgrouptest.SkipOrFailRealCgroup(t, "filler scope unavailable: %v", err)
-	}
-	fillerDone := make(chan error, 1)
-	go func() {
-		_, launchErr := filler.Launch(context.Background(), Request{Argv: []string{"python3", "-c", "import time; x=bytearray(80*1024*1024); x[-1]=1; time.sleep(0.5)"}})
-		fillerDone <- launchErr
-	}()
-	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
-	for {
-		current, maximum, ok, reason := readSliceMemory(parent)
-		if !ok {
-			t.Fatalf("slice memory: %s", reason)
-		}
-		if maximum-current < reserve {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("filler did not create admission pressure")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	result, err := Confine(context.Background(), ConfineRequest{
-		Slice: parent, MemoryReserve: reserve, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond,
-		AdmitSocketPath: filepath.Join(t.TempDir(), "daemon-down.sock"),
-		Argv:            []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Exit != 0 || result.Status.AdmissionState != "waited" || result.Status.AdmissionWaitedMS <= 0 {
-		t.Fatalf("admission result=%+v", result)
-	}
-	if fillerErr := <-fillerDone; fillerErr != nil {
-		t.Fatalf("filler: %v", fillerErr)
-	}
-	immediate, err := Confine(context.Background(), ConfineRequest{
-		Slice: parent, MemoryReserve: reserve, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond,
-		AdmitSocketPath: filepath.Join(t.TempDir(), "daemon-still-down.sock"),
-		Argv:            []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-	})
-	if err != nil || immediate.Exit != 0 || immediate.Status.AdmissionState != "immediate" {
-		t.Fatalf("free-slice admission result=%+v err=%v", immediate, err)
-	}
-}
+// TestConfineRealAdmissionWaitsThenProceedsDaemonDown was removed in S13. It pinned
+// the flock fallback's end-to-end behavior — a confine launch with a down daemon
+// WAITING on raw slice memory and then PROCEEDING (AdmissionState "waited"/"immediate")
+// without any daemon. S13 deletes the flock fallback: a configured-but-unreachable
+// daemon now makes the client RECONNECT indefinitely (fail closed by waiting), never
+// proceed ungoverned (design §4/§6). The new reconnect/terminal/block behavior is
+// pinned by the admission_linux_test.go S13 tests; the real restart-under-load merge
+// gate (S13 exit) covers the live reconnect + re-declare.
 
 func TestConfineRealMissingSubtreeDelegationIsRepairedBeforeLaunch(t *testing.T) {
 	parent := cgrouptest.IsolatedScopeParent(t)

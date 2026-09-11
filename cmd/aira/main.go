@@ -953,18 +953,6 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %w", err)
 		}
 	}
-	if raw, present := options["admit-timeout"]; present {
-		wait, err := time.ParseDuration(raw)
-		// Reject below 1ms: the wire value is max_wait_ms (Milliseconds() truncates
-		// toward zero), so a sub-1ms timeout reaches the daemon as 0 — the deferred
-		// zero-wait evaluator race that falsely rejects an admissible job.
-		if err != nil || wait < time.Millisecond {
-			if err == nil {
-				err = errors.New("must be at least 1ms")
-			}
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
-		}
-	}
 	// AIRA-138. Both job bounds are validated SYNCHRONOUSLY here, so the caller
 	// learns before any daemon round trip. A zero or negative value is an argument
 	// error and never "no bound": a bound the operator asked for and silently did
@@ -1009,8 +997,7 @@ const drainWaitOperation = core.DrainWaitOperation
 // the name to match the scope id).
 const drainHoldName = "drain"
 
-// parseDrainArgs parses `aira drain wait [--timeout D] [--admit-timeout D]
-// [--reason TEXT]` (AIRA-185).
+// parseDrainArgs parses `aira drain wait [--timeout D] [--reason TEXT]` (AIRA-185).
 //
 // It is its own parser, like confine's, for one reason: the generic parseArgs
 // loop treats any non-`--` token as a positional and would silently accept
@@ -1027,7 +1014,7 @@ func parseDrainArgs(argv []string) ([]string, map[string]string, error) {
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name != "timeout" && name != "admit-timeout" && name != "reason" {
+		if name != "timeout" && name != "reason" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for drain", name)
 		}
 		if _, exists := options[name]; exists {
@@ -1054,15 +1041,6 @@ func parseDrainArgs(argv []string) ([]string, map[string]string, error) {
 	if raw, present := options["timeout"]; present {
 		if _, err := parseConfineJobBound(raw); err != nil {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --timeout: %w", err)
-		}
-	}
-	if raw, present := options["admit-timeout"]; present {
-		wait, err := time.ParseDuration(raw)
-		if err != nil || wait < time.Millisecond || wait > runner.AdmitWaitCeiling {
-			if err == nil {
-				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
-			}
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
 		}
 	}
 	if raw, present := options["reason"]; present {
@@ -1373,22 +1351,6 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	// shared ledger 32G rather than the 512M asked for. runner.ResolveConfineReserve
 	// is now the single decision site; the non-delegate up-charge lives there and is
 	// unchanged.
-	admitTimeout := time.Duration(0)
-	if raw := options["admit-timeout"]; raw != "" {
-		admitTimeout, err = time.ParseDuration(raw)
-		// AIRA-58: bound it HERE, synchronously, so the caller learns before any
-		// daemon round-trip — the same already-honest shape as
-		// `confine-reserve --max-wait`. The daemon enforces the same shared
-		// runner.AdmitWaitCeiling independently, since a non-CLI caller reaches
-		// the runner directly and an operator may run an older client.
-		if err != nil || admitTimeout < time.Millisecond || admitTimeout > runner.AdmitWaitCeiling {
-			if err == nil {
-				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
-			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-	}
 	// AIRA-138. The CLI TRANSCRIBES both job bounds; parseConfineArgs has already
 	// refused anything non-positive or unparseable, and this re-parse goes through
 	// the same one helper so the two can never accept different languages.
@@ -1424,8 +1386,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		// false and the detached job's stdin is /dev/null, exactly as before.
 		StdinConnect:   options["stdin-connect"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
-		AdmissionMaxWait: admitTimeout,
-		Timeout:          jobTimeout, CPUTimeout: jobCPUTimeout,
+		Timeout: jobTimeout, CPUTimeout: jobCPUTimeout,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {
@@ -1515,18 +1476,6 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 		}
 		holdFor = parsed
 	}
-	var admitTimeout time.Duration
-	if raw := options["admit-timeout"]; raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed < time.Millisecond || parsed > runner.AdmitWaitCeiling {
-			if err == nil {
-				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
-			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-		admitTimeout = parsed
-	}
 	owner, err := resolveConfineOwner(ctx, "")
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: owner: %v\n", err)
@@ -1538,24 +1487,22 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 		Argv:            []string{drainHoldSelfPath, "drain-hold"},
 		Exclusive:       true,
 		ExclusiveReason: strings.TrimSpace(options["reason"]),
-		// The ONE place the two clocks are separated, and the reason the help text
-		// says so out loud: Timeout bounds the HELD duration only (it starts at the
-		// release write, after admission and setup), while AdmissionMaxWait bounds
-		// the wait to be admitted at all. Zero means "confine's own default" for
-		// each, which for admission is 30 minutes — never "no bound" and never
-		// "give up immediately".
-		Timeout:          holdFor,
-		AdmissionMaxWait: admitTimeout,
-		Stdin:            stdin, Stdout: stdout, Stderr: stderr,
+		// Timeout bounds the HELD duration only (it starts at the release write, after
+		// admission and setup); zero means "no hold bound — until you interrupt it".
+		// S13 removed --admit-timeout: the wait to be ADMITTED is no longer client-bounded
+		// (design §4/§6 — a blocking wait ends on the grant or on interrupting the
+		// command; there is no admission timeout).
+		Timeout: holdFor,
+		Stdin:   stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
 		request.RuntimeDir = paths.RuntimeDir
 		request.AdmitSocketPath = paths.SocketPath
 	} else if stderr != nil {
 		// Stated, not swallowed: without daemon paths the admission attempt cannot
-		// reach the daemon, and an exclusive request REFUSES rather than falling
-		// back to flock, so the launch below will fail loudly. Saying why here turns
-		// that refusal from a puzzle into an install problem.
+		// reach the daemon, and an exclusive request REFUSES (it never degrades to a
+		// non-exclusive launch), so the launch below will fail loudly. Saying why here
+		// turns that refusal from a puzzle into an install problem.
 		_, _ = fmt.Fprintf(stderr, "drain: daemon paths unavailable, so an exclusive admission cannot be established: %v\n", pathErr)
 	}
 	_, _ = fmt.Fprintln(stderr, drainWaitBanner(request, runner.DefaultConfineSlice))
@@ -1567,33 +1514,29 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 	return result.Exit
 }
 
-// drainWaitBanner states BOTH clocks at the point of use, before anything
-// blocks.
+// drainWaitBanner states BOTH phases at the point of use, before anything blocks.
 //
 // It exists because `--timeout 10s` reads as "give up after 10 seconds" and is
-// not: admission is a separate, already-existing budget that defaults to 30
-// minutes, so a drain can legitimately sit unadmitted far longer than its own
-// --timeout before the hold it bounds has even begun. The help text says this
-// too; saying it again here means an operator who never reads --help still
-// cannot be surprised by it.
+// not: the admission WAIT is a separate phase that `--timeout` does not bound.
+// Since S13 that wait is no longer client-bounded at all (design §4/§6 — a
+// blocking wait ends on the grant or on interrupting the command), so the banner
+// says exactly that rather than advertising a duration nothing enforces. The help
+// text says this too; saying it again here means an operator who never reads
+// --help still cannot be surprised by it.
 func drainWaitBanner(request runner.ConfineRequest, defaultSlice string) string {
 	slice := strings.TrimSpace(request.Slice)
 	if slice == "" {
 		slice = defaultSlice
 	}
-	// The EFFECTIVE budget, read from the one constant the runner actually applies
-	// when no --admit-timeout is given, rather than a number restated here that
-	// could drift away from it.
-	admission := "up to " + runner.DefaultConfineAdmissionWait.String() + " (the default; --admit-timeout changes it)"
-	if request.AdmissionMaxWait > 0 {
-		admission = "up to " + request.AdmissionMaxWait.String()
-	}
+	// The admission wait no longer self-expires and is not client-bounded (S13): it
+	// ends when the hold is granted or when the operator interrupts the command.
+	admission := "until it is admitted, or until you interrupt it (Ctrl-C or SIGTERM)"
 	hold := "until you interrupt it (Ctrl-C or SIGTERM)"
 	if request.Timeout > 0 {
 		hold = "for " + request.Timeout.String() + ", or until you interrupt it (Ctrl-C or SIGTERM)"
 	}
 	line := fmt.Sprintf("drain: asking to hold %s exclusively; new jobs stop being admitted and already-running ones finish untouched.", slice)
-	line += fmt.Sprintf("\ndrain: waiting %s to be admitted, THEN holding %s. These are two separate budgets.", admission, hold)
+	line += fmt.Sprintf("\ndrain: waiting %s, THEN holding %s.", admission, hold)
 	if reason := strings.TrimSpace(request.ExclusiveReason); reason != "" {
 		line += "\ndrain: reason " + strconv.Quote(confineReasonForDisplay(reason))
 	}
