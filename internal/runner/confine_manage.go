@@ -327,10 +327,15 @@ type ConfineSliceReserve struct {
 	// slice is empty, launch freely" while jobs are in fact live. Known accepted
 	// gaps a true bit does NOT rule out (documented, not machined away per the
 	// simplicity rule): a failed adopted scan leaves a stale/zero adopted figure
-	// with present still true (the `slice scope caps: unevaluated` line beside it
-	// signals the scan failure), and a sub-millisecond window between queue
-	// registration and the first adoption scan. CeilingBytes is an independent
-	// memory read and stays valid regardless of this bit.
+	// with present still true, and a sub-millisecond window between queue
+	// registration and the first adoption scan. Since S3 deleted the AIRA-114
+	// over-subscription bound, that scan-failure gap is now UNSIGNALLED on
+	// `confine --list` — the daemon log line `aira daemon: confine reserve scan
+	// failed` (admit.go) is the only signal — until S12 deletes the adopted
+	// ledger entirely and closes the gap. Recorded against AIRA-220's
+	// accepted-gap record; no wire bit is added, as S12 removes this surface.
+	// CeilingBytes is an independent memory read and stays valid regardless of
+	// this bit.
 	GrantedEstablished bool `json:"granted_established"`
 	// Queued and FreezePhase answer "what is stuck, and why" for the admission
 	// queue. Root-causing AIRA-59 required source reading precisely because
