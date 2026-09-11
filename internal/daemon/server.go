@@ -968,7 +968,7 @@ func (s *Server) serveReDeclare(conn net.Conn, inbound io.Reader) {
 	// connection's blocking 1-byte EOF read (watchPeerEOF) TIMES OUT at the body-read
 	// deadline, fires peerCtx, and drops a LIVE lease.
 	_ = conn.SetReadDeadline(time.Time{})
-	charge := rec.charge()
+	charge := redeclareChargeOf(rec)
 
 	// (2) Resolve the anchor inputs from THIS connection; (6) SO_PEERCRED same-uid gate,
 	// fail-CLOSED on an unreadable credential (peerSameUID stays false), NO cgroup-

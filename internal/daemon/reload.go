@@ -97,7 +97,7 @@ func (s *Server) reloadLeaseDump() {
 			dropped++
 			continue
 		}
-		charge := rec.Frame.charge()
+		charge := redeclareChargeOf(rec.Frame)
 		request := admitRequest{
 			scopeID:          charge.ScopeID,
 			cpu:              charge.CPU,
