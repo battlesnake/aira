@@ -993,10 +993,9 @@ func topFooter(result runner.ConfineListResult) string {
 		grantedClause = fmt.Sprintf("granted unevaluated / ceiling %s",
 			topFormatMegabytes(reserve.CeilingBytes))
 	}
-	populationClause := fmt.Sprintf("%d %s, %d scope-less %s, %d adopted",
+	populationClause := fmt.Sprintf("%d %s, %d scope-less %s",
 		reserve.ScopeJobs, confinePlural(reserve.ScopeJobs, "scope", "scopes"),
-		reserve.ReservationJobs, confinePlural(reserve.ReservationJobs, "reservation", "reservations"),
-		reserve.AdoptedJobs)
+		reserve.ReservationJobs, confinePlural(reserve.ReservationJobs, "reservation", "reservations"))
 	if !reserve.GrantedEstablished {
 		// AIRA-220. Same absent snapshot as the granted pair, so the population
 		// split is the same fabricated zeros; report it unevaluated in lockstep.

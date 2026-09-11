@@ -3419,22 +3419,21 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		} else {
 			_, _ = fmt.Fprintln(stdout, renderConfineExclusiveLine(exclusive))
 		}
-		// AIRA-68. The job count above spans three populations and the table above
+		// AIRA-68. The job count above spans two populations and the table above
 		// THAT lists only scopes, so the two are not comparable — reading them
 		// against each other is what produced a P0 that did not exist. Printed
 		// with the zeros when the ledger IS established, so "no scope-less
 		// reservations" is a stated fact rather than an absence the reader has to
 		// interpret. AIRA-220: when the ledger is NOT established the split is the
-		// SAME fabricated zeros as the headline (the "0 adopted scopes" the ticket
-		// names as the AIRA-105 misreading), so it reads unevaluated in lockstep.
+		// SAME fabricated zeros as the headline, so it reads unevaluated in
+		// lockstep. (The third "adopted scopes" population the AIRA-105 misreading
+		// named was deleted in S12; survivors now count as confine scopes.)
 		if result.SliceReserve.GrantedEstablished {
-			_, _ = fmt.Fprintf(stdout, "  of which: %d confine %s %s, %d scope-less %s %s, %d adopted %s %s\n",
+			_, _ = fmt.Fprintf(stdout, "  of which: %d confine %s %s, %d scope-less %s %s\n",
 				result.SliceReserve.ScopeJobs, confinePlural(result.SliceReserve.ScopeJobs, "scope", "scopes"),
 				formatReserveBytes(result.SliceReserve.ScopeBytes),
 				result.SliceReserve.ReservationJobs, confinePlural(result.SliceReserve.ReservationJobs, "reservation", "reservations"),
-				formatReserveBytes(result.SliceReserve.ReservationBytes),
-				result.SliceReserve.AdoptedJobs, confinePlural(result.SliceReserve.AdoptedJobs, "scope", "scopes"),
-				formatReserveBytes(result.SliceReserve.AdoptedBytes))
+				formatReserveBytes(result.SliceReserve.ReservationBytes))
 		} else {
 			_, _ = fmt.Fprintln(stdout, "  of which: unevaluated (no admission ledger)")
 		}

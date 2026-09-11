@@ -50,13 +50,6 @@ const (
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
 	delegateRAMScopeMinDefault          int64 = 4 << 30
 	delegateRAMScopeSafetyPct           int64 = 15
-	// delegateRAMAdoptionMargin is the AIRA-74 restart-adoption reconstruction
-	// margin for a delegate-ram scope: on a daemon restart such a scope's charge
-	// is rebuilt as its live memory.current plus this margin, because its own
-	// memory.max is an AIRA-15 containment ceiling, not a whole-job reservation,
-	// so adopting the full cap would over-reserve. A non-delegate scope adopts
-	// its full cap instead, because there the cap IS the admission estimate.
-	delegateRAMAdoptionMargin int64 = 64 << 20
 
 	// admitExclusiveWaitCeilingDefault bounds how long an EXCLUSIVE request may
 	// drain the slice. It is deliberately far below the shared 24-hour
@@ -191,10 +184,10 @@ type admitWaiter struct {
 	signature string
 
 	// AIRA-68. scopeSeen/scopeVanished record a TRANSITION observed by the
-	// evaluator's own <=1s confine scan — the same authority the adopted ledger
-	// already trusts — and are meaningful only for a scope-backed waiter
-	// (scopeID != ""). Both are written ONLY inside evaluateAdmitQueue's
-	// scan-success block, under queue.mu, and never on a failed scan.
+	// evaluator's own <=1s confine scan — the same authority liveScopes already
+	// trusts — and are meaningful only for a scope-backed waiter (scopeID != "").
+	// Both are written ONLY inside evaluateAdmitQueue's scan-success block, under
+	// queue.mu, and never on a failed scan.
 	//
 	// The pair exists because plain ABSENCE is not a safe reclaim signal and the
 	// transition is. The pre-existing empty-scope reclaim is safe against a
@@ -504,7 +497,7 @@ func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
 //
 // outstandingJobs is strict, with NO discount for exempt sub-reservations. A
 // discount would be unnecessary — a running job's own scoped lease already keeps
-// the count at 1 or more, and a post-restart adopted parent is caught by
+// the count at 1 or more, and a post-restart reloaded parent is caught by
 // subtree-aware liveScopes — and it would remove a belt-and-braces signal in the
 // one case where it is the only thing still objecting: a live reservation whose
 // parent job has escaped its scope or died with its socket held open.
@@ -569,18 +562,18 @@ func (w *admitWaiter) noteGrantableLocked(available int64) {
 // be held.
 //
 // It is derived STRUCTURALLY, from the subtree-aware population AIRA-101
-// already maintains, and deliberately NOT from the reserve counters
-// (outstandingJobs / adoptedJobs). The comment above the adopted loop says why
-// in its own words: that loop skips leaf-unpopulated scopes, connection-held
-// ones, nil/malformed caps and delegate-without-usable-RSS ones, and every one
-// of those exclusions is correct for RESERVE accounting and wrong for
-// EMPTINESS, because a skipped scope is still a running job. On this box the
-// commonest such scope is a post-restart aitest/delegate outer scope that has
-// drained every pid into a child cgroup: its leaf Populated reads 0 and
-// adoptedJobs stays 0, while it is very much using memory -- driving `current`
-// up and refusing a solo waiter on the ORDINARY disjunct. A counter-derived
-// rule would print "nothing else held or was queued for this slice" beside a
-// running suite: the ticket's own defect, reintroduced by its fix.
+// already maintains, and deliberately NOT from the reserve counter
+// (outstandingJobs). The reserve ledger counts only connection-held leases, so a
+// scope that is running but holds no lease this daemon knows of contributes no
+// job to it — correct for RESERVE accounting and wrong for EMPTINESS, because
+// such a scope is still a running job. On this box the commonest such scope is a
+// post-restart aitest/delegate outer scope that has drained every pid into a
+// child cgroup: its leaf Populated reads 0 and, until it re-declares (S11),
+// outstandingJobs stays 0, while it is very much using memory -- driving
+// `current` up and refusing a solo waiter on the ORDINARY disjunct. A
+// counter-derived rule would print "nothing else held or was queued for this
+// slice" beside a running suite: the ticket's own defect, reintroduced by its
+// fix.
 //
 // Job counts, not bytes, remains load-bearing. A residual 4 KiB page in the
 // slice is NOT another job; reading a nonzero `current` as contention is
@@ -753,27 +746,13 @@ type sliceQueue struct {
 	outstanding     int64
 	cpuOutstanding  int64
 	outstandingJobs int
-	adopted         int64
-	adoptedJobs     int
-	// AIRA-192. The same adoption, PER SCOPE: scope id -> the reconstructed
-	// reserve that scope contributes to `adopted` above. Written in the same
-	// locked block as `adopted`/`adoptedJobs`, from the same loop over the same
-	// scan, and REPLACED WHOLESALE by each successful scan — so the rows and the
-	// scalar can never describe different instants, and a scope that has gone
-	// leaves both together.
-	//
-	// It exists because `adopted` alone is a scalar with no way back to the jobs
-	// that make it up. Before AIRA-192 that was an attribution nuisance
-	// (AIRA-191); once `aira top` draws per-scope reserves it is structural: after
-	// every daemon restart the whole live population is adopted rather than
-	// connection-held, and without this the bar would have to render the entire
-	// machine as unevaluated.
-	//
-	// A FAILED scan leaves it untouched, exactly as it leaves `adopted` untouched
-	// (admit_reconstruction_test pins that retention), because a row set that
-	// disagreed with the total it reconciles against would be worse than a stale
-	// one.
-	adoptedScopes     map[string]int64
+	// adoptedAt/adoptedScanFailed throttle and fail-track the periodic confine
+	// scan. S12 deleted the AIRA-74 reserve-adoption term the scan used to feed
+	// (`adopted`/`adoptedJobs`/`adoptedScopes`), so the "adopted" prefix is now
+	// vestigial: these two remain only as the scan's once-per-interval throttle
+	// and its fail-closed bit, which still drive liveScopes (the exclusive gate)
+	// and the reaper's scopeSeen/scopeVanished transition. The scan itself and
+	// these fields are removed together in S14.
 	adoptedAt         time.Time
 	adoptedScanFailed bool
 	seq               int64
@@ -824,10 +803,11 @@ type sliceQueue struct {
 	freezeLogged    admitFreezePhase // last phase logged, so logs are transitions
 
 	// AIRA-101. liveScopes is the EMPTINESS reading, deliberately separate from
-	// adopted/adoptedJobs, which are a RESERVE reading. adoptedJobs skips
-	// non-finite-cap scopes and connection-held scopes on purpose — both correct
-	// for reserve accounting and both wrong here, because a skipped scope is still
-	// a running job. Reusing it would let an exclusive job be told it is alone
+	// the RESERVE ledger (outstanding/outstandingJobs). The reserve ledger counts
+	// only connection-held leases, so a running scope with no lease this daemon
+	// knows of — a pre-re-declare post-restart survivor, say — contributes no job
+	// to it: correct for reserve accounting and wrong here, because such a scope
+	// is still running. Reusing it would let an exclusive job be told it is alone
 	// while a delegate-ram suite runs beside it.
 	//
 	// liveScopesKnown is the fail-closed half: it is true only when the scan that
@@ -1086,11 +1066,6 @@ func (s *Server) admitOutstandingJobs(path string) int {
 	return jobs
 }
 
-func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outstandingJobs int, adopted int64, adoptedJobs int, ok bool) {
-	snapshot := s.admitSliceSnapshot(path)
-	return snapshot.outstanding, snapshot.outstandingJobs, snapshot.adopted, snapshot.adoptedJobs, snapshot.present
-}
-
 // admitSliceSnapshot reads the ledger AND the queue diagnostics in ONE locked
 // pass. Taking them in two rounds would let `confine --list` report a granted
 // total and a queued count from different moments — a self-inconsistent picture
@@ -1098,8 +1073,6 @@ func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outsta
 type admitSnapshot struct {
 	outstanding     int64
 	outstandingJobs int
-	adopted         int64
-	adoptedJobs     int
 	queued          int
 	phase           string
 	present         bool
@@ -1133,14 +1106,16 @@ type admitSnapshot struct {
 	// Zero is "not established", on the same discipline as the position.
 	queuedReserveBytes int64
 
-	// AIRA-68. outstandingJobs fuses TWO structurally different populations, and
-	// the reported job total adds a third — while `confine --list`'s table above
-	// the summary lists only SCOPES:
+	// AIRA-68. outstandingJobs fuses TWO structurally different populations, while
+	// `confine --list`'s table above the summary lists only SCOPES:
 	//
 	//   scopeJobs        connection-held `aira confine` jobs   -> a table row
 	//   reservationJobs  connection-held `aira confine-reserve` reservations,
 	//                    which create no cgroup scope at all   -> NO table row
-	//   adoptedJobs      scan-adopted scopes                   -> a table row
+	//
+	// (A third population, S12-deleted: scan-adopted scopes. S11's reload +
+	// re-declare re-seeds post-restart survivors as connection-held leases, so
+	// they now count under scopeJobs.)
 	//
 	// So "N admitted jobs" is not comparable with the row count, and reading it
 	// that way is precisely what produced AIRA-68's P0 misdiagnosis: 20 of 23
@@ -1194,18 +1169,18 @@ type admitSnapshot struct {
 	reservations []admitReservationRow
 
 	// AIRA-191/AIRA-192. scope id -> the reserve this ledger charges that scope
-	// RIGHT NOW, over both scope-backed populations: connection-held waiters
-	// (their ledgerCharge, the same quantity scopeBytes sums) and scan-adopted
-	// scopes (their reconstructed reserve, the same quantity `adopted` sums).
-	// Gathered in the same locked pass as every total above, so rows and totals
-	// always describe one instant, and reconciling: over one snapshot the values
-	// sum to scopeBytes + adopted.
+	// RIGHT NOW: the connection-held waiters' ledgerCharge, the same quantity
+	// scopeBytes sums. (Before S12 a second source, scan-adopted scopes'
+	// reconstructed reserve, also fed this map; S12 deleted adoption, so the map
+	// now carries only connection-held scopes.) Gathered in the same locked pass
+	// as every total above, so rows and totals always describe one instant, and
+	// reconciling: over one snapshot the values sum to scopeBytes.
 	//
 	// It is deliberately NOT the scope's memory.max: a delegate scope's
 	// memory.max is an AIRA-15 containment ceiling many times its declared
 	// reserve, and publishing it is how `aira top` came to draw 93 GiB of claims
 	// against a 40 GiB ledger. For a connection-held waiter this equals its
-	// declared reserve; for a scan-adopted scope it is the reconstructed reserve.
+	// declared reserve.
 	//
 	// A scope ABSENT from the map is one this ledger charges nothing for and knows
 	// nothing about; the wire renders that as unevaluated, never as a cap.
@@ -1281,9 +1256,6 @@ type admitReservationRow struct {
 // or a second hand-maintained mutation site added beside the one accessor — not
 // noise.
 //
-// adoptedJobs/adopted appear on both sides of the reported total and cancel, so
-// these are stated over the connection-held ledger alone.
-//
 // The two are reported INDEPENDENTLY and SIGNED. The single most plausible
 // regression — a release path that removes a waiter but skips the re-derive, so
 // outstanding keeps a discharged lease's bytes — is byte-only, and a job-only
@@ -1326,33 +1298,19 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// An absent queue positively establishes that nothing is WAITING and that
 		// there is no exclusive holder — the diagnostics half (queued/phase) is a
 		// genuine idle zero and callers render it as such. But it says NOTHING
-		// about the granted/adopted LEDGER: restart adoption of already-running
-		// jobs happens only inside evaluateAdmitQueue, and pruneAdmitQueue deletes
-		// the queue (adopted ledger included) once nothing is connection-held, so
-		// an absent queue is exactly "the ledger was never built or has been
-		// pruned". present stays false here precisely so a caller reports the
-		// granted pair unevaluated rather than as a fabricated empty slice
-		// (AIRA-220). CeilingBytes is an independent memory read and is unaffected.
+		// about the granted LEDGER: pruneAdmitQueue deletes the queue once nothing
+		// is connection-held, so an absent queue is exactly "the ledger was never
+		// built or has been pruned". present stays false here precisely so a caller
+		// reports the granted pair unevaluated rather than as a fabricated empty
+		// slice (AIRA-220). CeilingBytes is an independent memory read and is
+		// unaffected.
 		return admitSnapshot{phase: phase}
 	}
 	queue.mu.Lock()
 	snapshot := admitSnapshot{
 		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
-		adopted: queue.adopted, adoptedJobs: queue.adoptedJobs,
 		phase: phase, present: true,
-		scopeReserves: make(map[string]int64, len(queue.waiters)+len(queue.adoptedScopes)),
-	}
-	// AIRA-192. The ADOPTED half of the per-scope reserves, copied out first so
-	// the connection-held half below can overwrite it. That precedence is the
-	// correct one and not an accident: the adopted set is a scan reading up to one
-	// interval old, while a granted waiter is this instant's authority, so a scope
-	// that has just become connection-held must be reported once, at its live
-	// charge, rather than twice or at the older figure.
-	for scopeID, reserve := range queue.adoptedScopes {
-		if scopeID == "" {
-			continue
-		}
-		snapshot.scopeReserves[scopeID] = reserve
+		scopeReserves: make(map[string]int64, len(queue.waiters)),
 	}
 	queuedBytes := int64(0)
 	// ONE reading of the clock for the whole walk (AIRA-108): ages taken per-row
@@ -2460,8 +2418,10 @@ func (q *sliceQueue) signal() {
 
 func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// Production has exactly one caller: this queue's runEvaluator goroutine.
-	// That single-writer property permits the throttle read before queue.mu;
-	// other goroutines only read the adopted ledger while holding queue.mu.
+	// That single-writer property permits the scan throttle read (adoptedAt)
+	// before queue.mu; other goroutines read the scan-derived state (liveScopes,
+	// the scopeVanished bits, adoptedAt/adoptedScanFailed) only while holding
+	// queue.mu.
 	now := s.admitNowTime()
 	refreshInterval := s.admitConfineScanInterval
 	if refreshInterval <= 0 {
@@ -2520,21 +2480,18 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			for _, record := range scanResult.Scopes {
 				present[record.ScopeID] = record
 			}
-			held := make(map[string]struct{})
-			// The join direction here is load-bearing, not incidental: this walks
-			// WAITERS and looks records up, never the reverse. The scan ran
+			// The join direction here is load-bearing: this walks WAITERS and looks
+			// records up, never the reverse, because a VANISHED scope has no record
+			// to iterate — only its waiter still carries the id, so the seen->gone
+			// transition can be detected only from the waiter side. The scan ran
 			// lock-free before queue.mu was taken, so its snapshot may name a scope
-			// whose waiter has since been released -- and that waiter is already out
-			// of queue.waiters (releaseAdmitWaiterLocked removes it under this same
-			// lock), so its stale record simply matches nothing. A waiter granted
-			// during that same window is conversely not yet in the scan, so it is
-			// not usable and holds its reserve. Iterating records instead would
-			// resurrect the first case.
+			// whose waiter has since been released; that waiter is already out of
+			// queue.waiters (releaseAdmitWaiterLocked removes it under this same
+			// lock), so its stale record simply matches nothing.
 			for _, waiter := range queue.waiters {
 				if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
 					continue
 				}
-				held[waiter.scopeID] = struct{}{}
 				// The seen -> gone TRANSITION, recorded on the waiter. See the
 				// scopeSeen/scopeVanished comment on admitWaiter for why the
 				// transition, and not plain absence, is what the stale-lease sweep
@@ -2547,22 +2504,16 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 					waiter.scopeVanished = true
 				}
 			}
-			// AIRA-101. The EMPTINESS reading, computed in the same successful scan
-			// but deliberately NOT derived from adopted/adoptedJobs below.
-			//
-			// The adopted loop skips scopes on purpose — unpopulated ones,
-			// non-finite-cap ones, and connection-held ones — and every one of those
-			// exclusions is correct for RESERVE accounting and wrong for EMPTINESS,
-			// because a skipped scope is still a running job. Reusing it would let an
-			// exclusive job be told it is alone while a suite runs beside it.
+			// AIRA-101. The EMPTINESS reading, computed in the same successful scan.
 			//
 			// Liveness is SUBTREE-aware. Leaf cgroup.procs is not usable here:
 			// BootstrapAitestSupervisor drains EVERY pid out of an aitest outer scope
 			// into <outer>/.aira-supervisor, so a running suite's outer scope reads
 			// leaf-empty. Before a daemon restart its connection-held lease still
-			// keeps outstandingJobs >= 1, but after one it is merely an adopted scope
-			// — and a leaf-only reading would then declare the slice empty and hand a
-			// benchmark a fabricated "you are alone" while the suite ran on.
+			// keeps outstandingJobs >= 1; after a restart S11's reload re-seeds it
+			// as a granted lease (keeping outstandingJobs >= 1), so a leaf-only
+			// reading would still declare the slice empty and hand a benchmark a
+			// fabricated "you are alone" while the suite ran on.
 			liveScopes := 0
 			for _, record := range scanResult.Scopes {
 				// Unevaluated is NOT empty. A scope whose population could not be read
@@ -2574,78 +2525,11 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			}
 			queue.liveScopes = liveScopes
 			queue.liveScopesKnown = true
-			adopted := int64(0)
-			adoptedJobs := 0
-			// AIRA-192. Named per scope as it is summed, from this same loop, so
-			// the rows and the total are one derivation rather than two that have to
-			// be kept in step. Every `continue` below is a scope this ledger charges
-			// NOTHING for, and it correctly leaves no row: an operator must not be
-			// shown a claim the slice is not holding.
-			adoptedScopes := make(map[string]int64, len(scanResult.Scopes))
-			for _, record := range scanResult.Scopes {
-				// Populated is the scope's LEAF cgroup.procs count, not the
-				// subtree-aware cgroup.events populated the #72 reaper uses. A live
-				// workload nested in a child cgroup it created reads empty here and is
-				// SKIPPED — the safe direction (its reserve is under-counted → over-
-				// admit, exactly as a fully forgotten pre-restart ledger, never worse).
-				// Subtree-aware liveness for adopted is a v2 item.
-				if record.Populated == nil || *record.Populated <= 0 {
-					continue
-				}
-				if _, connectionHeld := held[record.ScopeID]; connectionHeld {
-					continue
-				}
-				// A non-finite cap (delegate-ram "max", nil, malformed, negative)
-				// contributes NEITHER reserve bytes NOR a headroom-job: such a scope is
-				// unreconstructable, left as a safe under-count (its actual RSS is still
-				// charged via `current`). Counting only finite-cap scopes keeps adopted
-				// and adoptedJobs consistent — never a new wrongful-wait.
-				if record.Cap == nil {
-					continue
-				}
-				cap, err := strconv.ParseInt(strings.TrimSpace(*record.Cap), 10, 64)
-				if err != nil || cap < 0 {
-					continue
-				}
-				// AIRA-74 restart adoption rebuilds an orphaned scope's charge after a
-				// daemon restart. The two classes differ in what `cap` MEANS:
-				//
-				//   - non-delegate: cap IS the admission estimate, so adopting the full
-				//     cap is the correct reconstruction.
-				//   - delegate: cap is an AIRA-15 containment ceiling, never a whole-job
-				//     reservation, so adopting it would be the very over-reservation
-				//     this path was written to avoid. A usable memory.current is
-				//     reconstructed to current + margin; an unusable one is a safe
-				//     under-count (its RSS is not readable, so contribute nothing).
-				usableRSS := record.RSSBytes != nil && *record.RSSBytes >= 0
-				delegate := runner.IsDelegateRAMScopeID(record.ScopeID)
-				switch {
-				case !delegate:
-					// Adopt the full cap (the admission estimate).
-				case !usableRSS:
-					// Delegate, unreconstructable: contributes neither bytes nor a
-					// headroom job, left as a safe under-count.
-					continue
-				default:
-					// Delegate with a usable reading: reconstruct current + margin.
-					tracked := addClamp(*record.RSSBytes, delegateRAMAdoptionMargin)
-					if tracked < cap {
-						cap = tracked
-					}
-				}
-				adopted = addClamp(adopted, cap)
-				adoptedJobs = addJobCountClamp(adoptedJobs, 1)
-				// The row carries the SAME `cap` local the sum above just took, after
-				// every reconstruction the switch applied to it, so no row can report a
-				// figure the ledger did not charge. A scope id repeated by the scan
-				// (structurally impossible — the scan keys its own map by id) would
-				// overwrite rather than double, while the sum would double; that is the
-				// safe direction for a row set whose only job is attribution.
-				adoptedScopes[record.ScopeID] = cap
-			}
-			queue.adopted = adopted
-			queue.adoptedJobs = adoptedJobs
-			queue.adoptedScopes = adoptedScopes
+			// S12 deleted the AIRA-74 reserve-adoption sum that used to run here;
+			// S11's dump -> reload -> re-declare is the post-restart reserve guard
+			// now, so the scan no longer reconstructs a parallel `adopted` charge.
+			// The scan still runs for liveScopes (above) and scopeVanished (the loop
+			// over waiters above); S14 removes the scan and these fields entirely.
 			queue.adoptedScanFailed = false
 		}
 	}
@@ -2778,14 +2662,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queuedAhead++
 			continue
 		}
-		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
+		jobs := addJobCountClamp(queue.outstandingJobs, 1)
 		headroom := s.admitSliceHeadroom(jobs)
 		// S4 (D4): the LEDGER check (ceiling − Σleases, signed) applies in BOTH
 		// modes; the physical current/reclaimable floor is DEV-only. CI drops it
 		// (ledger-only) because nothing runs outside the container; DEV keeps it,
 		// so a slice already over its declared reserve is gated on the real bytes,
 		// alongside the MemAvailable-aware effectiveMaximum above.
-		outstanding := addClamp(queue.outstanding, queue.adopted)
+		//
+		// S12: a single accounting — the connection-held ledger (queue.outstanding).
+		// The AIRA-74 scan-adoption addend is gone; a post-restart survivor is
+		// counted ONCE via S11's reload + re-declare, never a second time via a
+		// parallel scan-reconstructed reserve.
+		outstanding := queue.outstanding
 		var available int64
 		if s.shimMode() {
 			available = ledgerAvailable(effectiveMaximum, outstanding, headroom)
@@ -3568,7 +3457,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		// ONE parser, runner's own, rather than a regex restating the grammar
 		// beside it: the two drifted apart (build-review, Sol) and a scope id the
 		// regex admitted but the scanner's parser rejected was admitted and then
-		// invisible to every scan, adoption pass and reaper.
+		// invisible to every scan and reaper.
 		embeddedName, _, _, embeddedOwner, parsed := runner.ParseConfineScopeID(scopeText)
 		if !scopeOK || !parsed {
 			return admitRequest{}, fmt.Errorf("%s: admit scope_id is not canonical", CodeProtocol)

@@ -243,114 +243,12 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 			total += *record.ReserveBytes
 		}
 	}
-	if want := result.SliceReserve.ScopeBytes + result.SliceReserve.AdoptedBytes; total != want {
-		t.Fatalf("per-scope reserves sum to %d, want the listing's own %d (ScopeBytes %d + AdoptedBytes %d)",
-			total, want, result.SliceReserve.ScopeBytes, result.SliceReserve.AdoptedBytes)
+	if want := result.SliceReserve.ScopeBytes; total != want {
+		t.Fatalf("per-scope reserves sum to %d, want the listing's own ScopeBytes %d",
+			total, want)
 	}
 	if got := reserveScopeByID(t, result, plainID).ReserveBytes; got == nil || *got != plainCharge {
 		t.Fatalf("plain scope reserve=%v, want the declared reserve %d rather than the %d memory.max cap",
 			got, plainCharge, plainCap)
-	}
-}
-
-// The post-restart population. A scope the daemon ADOPTED by scan (its
-// connection-held lease died with the previous daemon) is charged a
-// reconstructed reserve, and that reconstruction is per-scope inside the
-// evaluator — so the listing can name it rather than reporting the whole
-// adopted population as one anonymous scalar.
-//
-// Without this the bar goes blank across every daemon restart, which is a new
-// honesty problem in place of the old wrong-number one.
-func TestConfineListNamesAdoptedScopeReserves(t *testing.T) {
-	const (
-		sliceMax = 64 * gib
-		capBytes = 30 * gib
-		rss      = 2 * gib
-	)
-	now := time.Unix(400_000, 0)
-	slice := t.TempDir()
-	// A delegate scope: only there does the AIRA-15 containment cap exceed the
-	// declared reserve, so only there is the adopted reconstruction usage+margin
-	// rather than the full cap (a non-delegate scope re-pins its whole cap).
-	scopeID := reserveScopeID(t, "adopted", 5106, true)
-	server := scanLedgerServer(&now, sliceMax, 3*gib, staticScan(liveScopeRecord(scopeID, rss, capBytes)))
-	server.admitResolveSlice = func(string) (string, bool, string) { return slice, true, "" }
-	reserveScopeDir(t, slice, scopeID, capBytes, rss)
-	queue := &sliceQueue{path: slice, server: server}
-	registerAdmitQueue(server, queue)
-
-	server.evaluateAdmitQueue(queue)
-	if queue.adoptedJobs != 1 || queue.adopted <= 0 {
-		t.Fatalf("test premise: the scan adopted %d jobs / %d bytes", queue.adoptedJobs, queue.adopted)
-	}
-
-	result := reserveListing(t, server)
-	record := reserveScopeByID(t, result, scopeID)
-	if record.ReserveBytes == nil {
-		t.Fatal("an adopted scope published no reserve; the evaluator reconstructed one for it and the listing must be able to say whose it is")
-	}
-	if *record.ReserveBytes != queue.adopted {
-		t.Fatalf("adopted reserve=%d, want the reconstruction the ledger charges: %d", *record.ReserveBytes, queue.adopted)
-	}
-	// It is a reconstruction from LIVE USAGE, never the cap: adopting a DELEGATE
-	// scope's whole cap (an AIRA-15 containment ceiling, not a whole-job
-	// reservation) would be the over-reservation the AIRA-74 reconstruction avoids.
-	if *record.ReserveBytes >= capBytes {
-		t.Fatalf("adopted reserve=%d reached the %d cap; the reconstruction is usage+margin, not the ceiling", *record.ReserveBytes, int64(capBytes))
-	}
-	if result.SliceReserve == nil || result.SliceReserve.AdoptedBytes != *record.ReserveBytes {
-		t.Fatalf("adopted row=%d does not reconcile with AdoptedBytes=%+v", *record.ReserveBytes, result.SliceReserve)
-	}
-}
-
-// The per-scope adopted reserves must move EXACTLY as the adopted scalar beside
-// them does, in both directions, or the rows and the total they reconcile
-// against start describing different instants.
-//
-// A failed scan deliberately RETAINS the adopted ledger (a stale reserve is the
-// conservative direction for admission, and admit_reconstruction_test pins it),
-// so the rows must be retained too — dropping them would report an adopted total
-// no row accounts for. A later SUCCESSFUL scan is authoritative and replaces the
-// whole set, so a scope that has gone must leave with it rather than lingering
-// as a phantom claim.
-func TestAdoptedScopeReservesTrackTheAdoptedScalarAcrossScans(t *testing.T) {
-	const sliceMax = 64 * gib
-	now := time.Unix(410_000, 0)
-	scopeID := reserveScopeID(t, "adopted", 5107, false)
-	mode := "ok"
-	server := scanLedgerServer(&now, sliceMax, 3*gib, func(string) (runner.ConfineListResult, error) {
-		switch mode {
-		case "fail":
-			return runner.ConfineListResult{Verdict: "unevaluated", Reason: "stubbed scan failure"}, os.ErrPermission
-		case "gone":
-			return runner.ConfineListResult{Verdict: "pass"}, nil
-		}
-		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{liveScopeRecord(scopeID, 2*gib, 30*gib)}}, nil
-	})
-	queue := &sliceQueue{path: "/slice", server: server}
-	registerAdmitQueue(server, queue)
-
-	server.evaluateAdmitQueue(queue)
-	granted := server.admitSliceSnapshot("/slice").scopeReserves[scopeID]
-	if granted <= 0 || granted != queue.adopted {
-		t.Fatalf("test premise: per-scope reserve %d does not carry the adopted scalar %d", granted, queue.adopted)
-	}
-
-	mode, now = "fail", now.Add(time.Hour)
-	server.evaluateAdmitQueue(queue)
-	if !queue.adoptedScanFailed || queue.adopted != granted {
-		t.Fatalf("test premise: a failed scan changed the adopted scalar (%d, failed=%v)", queue.adopted, queue.adoptedScanFailed)
-	}
-	if got := server.admitSliceSnapshot("/slice").scopeReserves[scopeID]; got != granted {
-		t.Fatalf("failed scan dropped the per-scope reserve to %d while the adopted scalar it reconciles with stayed at %d", got, granted)
-	}
-
-	mode, now = "gone", now.Add(time.Hour)
-	server.evaluateAdmitQueue(queue)
-	if queue.adopted != 0 {
-		t.Fatalf("test premise: the successful scan left adopted=%d", queue.adopted)
-	}
-	if _, present := server.admitSliceSnapshot("/slice").scopeReserves[scopeID]; present {
-		t.Fatal("a successful scan that no longer sees the scope left its reserve standing as a phantom claim")
 	}
 }

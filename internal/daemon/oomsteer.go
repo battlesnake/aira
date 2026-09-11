@@ -56,12 +56,12 @@ import (
 //
 // RESIDUALS, stated rather than papered over:
 //
-//   - Adopted (post-daemon-restart) scopes are not steered. AIRA-192 added a
-//     per-scope breakdown of that ledger (queue.adoptedScopes) for reporting, so
-//     a budget could now be named per scope — but steering them would still be
-//     vacuous: an adopted scope's charge is re-derived from its own
-//     memory.current on every scan, so it cannot read as over-budget by
-//     construction. A deliberate non-target, not a missing input.
+//   - Post-daemon-restart survivors are not steered until they re-declare.
+//     S11 reloads them as reserve-only leases and S12 deleted the scan-adoption
+//     ledger that once tracked them per scope, so there is no over-budget
+//     reading to steer on; once a survivor re-declares it is an ordinary
+//     connection-held lease and is steered like any other. A bounded
+//     post-restart gap, not a missing input.
 //   - A scope raised to 1000 and still alive when the daemon stops keeps that
 //     value for the rest of its life: the restore pass lives in the daemon.
 //     That leaves a job which demonstrably outran its accounting as the

@@ -505,15 +505,15 @@ func TestSoloRefusalBesideALeafDrainedScopeReportsContention(t *testing.T) {
 }
 
 // requireNoCounters asserts the fixture really is the shape it claims: the
-// reserve counters revision 2 read are both zero, so a rule built on them would
-// see an empty slice.
+// connection-held job counter is zero, so a rule built on it would see an empty
+// slice.
 func requireNoCounters(t *testing.T, queue *sliceQueue) {
 	t.Helper()
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if queue.outstandingJobs != 0 || queue.adoptedJobs != 0 {
-		t.Fatalf("outstandingJobs=%d adoptedJobs=%d, want both zero; this fixture does not exercise the scan-only hole",
-			queue.outstandingJobs, queue.adoptedJobs)
+	if queue.outstandingJobs != 0 {
+		t.Fatalf("outstandingJobs=%d, want zero; this fixture does not exercise the scan-only hole",
+			queue.outstandingJobs)
 	}
 }
 

@@ -20,7 +20,6 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		GrantedBytes: 48 << 30, CeilingBytes: 61 << 30, Jobs: 23, GrantedEstablished: true,
 		ScopeJobs: 3, ScopeBytes: 24 << 30,
 		ReservationJobs: 20, ReservationBytes: 14 << 30,
-		AdoptedJobs: 0, AdoptedBytes: 0,
 	}
 	render := func(t *testing.T, reserve runner.ConfineSliceReserve) string {
 		t.Helper()
@@ -32,9 +31,9 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		return stdout.String()
 	}
 
-	t.Run("splits-the-three-populations", func(t *testing.T) {
+	t.Run("splits-the-populations", func(t *testing.T) {
 		out := render(t, base)
-		if !strings.Contains(out, "of which: 3 confine scopes 24G, 20 scope-less reservations 14G, 0 adopted scopes 0B") {
+		if !strings.Contains(out, "of which: 3 confine scopes 24G, 20 scope-less reservations 14G") {
 			t.Fatalf("stdout=%q", out)
 		}
 		if !strings.Contains(out, "never appears in the table above") {
@@ -50,9 +49,9 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 
 	t.Run("singular-forms", func(t *testing.T) {
 		reserve := base
-		reserve.ScopeJobs, reserve.ReservationJobs, reserve.AdoptedJobs = 1, 1, 1
+		reserve.ScopeJobs, reserve.ReservationJobs = 1, 1
 		out := render(t, reserve)
-		if !strings.Contains(out, "1 confine scope 24G, 1 scope-less reservation 14G, 1 adopted scope 0B") {
+		if !strings.Contains(out, "1 confine scope 24G, 1 scope-less reservation 14G") {
 			t.Fatalf("stdout=%q", out)
 		}
 	})
