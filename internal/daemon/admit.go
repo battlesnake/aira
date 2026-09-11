@@ -302,6 +302,44 @@ type admitWaiter struct {
 	// fabricated zero.
 	contention    int
 	lastGrantable *int64
+
+	// S8 (restart/anchor state — design §3 compare-and-release, §4 restart).
+	//
+	// anchor is the connection that CURRENTLY owns this lease plus a per-waiter
+	// MONOTONE generation. The generation is the load-bearing value behind
+	// compare-and-release (Inv 4): a lease is released ONLY by the EOF of its
+	// current-anchor connection. Every (re-)anchor through anchorLeaseLocked bumps
+	// the generation, so a re-declare on a new connection makes a stale old
+	// connection's later EOF a no-op (releaseAdmitWaiterLockedAnchored compares the
+	// generation the releasing connection anchored at against the current one). The
+	// bump is atomic with the idempotent SET in enqueueAdmitInternal, under queue.mu,
+	// so there is no window in which a stale EOF discharges a lease a re-declare has
+	// just re-anchored. anchor.conn is retained for diagnostics and for S9/S10; the
+	// compare is on the generation alone (an equal or recycled conn value can never
+	// be mistaken for the anchor).
+	//
+	// clientPID / processStartTick are the peer's pid and /proc start-tick, read
+	// from the connection at anchor time. They are the fields the graceful-shutdown
+	// dump (S10) records and the reload+kill-probe (S11) liveness-checks; S8 only
+	// populates them (zero when the peer credential is unreadable, e.g. a net.Pipe
+	// test connection with no injected credential seam).
+	//
+	// unanchored marks a lease that was reloaded from a restart dump but not yet
+	// re-declared by a live connection (§4). S8 only adds and clears the bit (a
+	// re-declare anchors the lease, clearing it); the reload that SETS it, and the
+	// end-of-freeze drop of leases still unanchored, are S11.
+	anchor           admitAnchor
+	clientPID        int
+	processStartTick uint64
+	unanchored       bool
+}
+
+// admitAnchor identifies the connection that currently owns (anchors) a lease and
+// carries the monotone generation behind compare-and-release (design §3, Inv 4).
+// See admitWaiter.anchor.
+type admitAnchor struct {
+	conn net.Conn
+	gen  int64
 }
 
 // ledgerCharge is what this waiter contributes to queue.outstanding: its
@@ -337,8 +375,9 @@ func (w *admitWaiter) ledgerCharge() int64 {
 // step with the waiters it is supposed to describe.
 //
 // The scope-id keying the design names IS the waiter set: enqueueAdmitInternal
-// refuses a duplicate scope id (see leaseByScopeIDLocked), so at most one live
-// waiter carries any scope id. A separate per-queue map keyed by scope id would
+// refuses a queued/rejected duplicate scope id and re-anchors a granted one in place
+// (see leaseByScopeIDLocked), so at most one non-released waiter carries any scope id.
+// A separate per-queue map keyed by scope id would
 // be a second copy of that fact to keep in sync -- the double-mutated state §2
 // exists to remove -- and scope-less `confine-reserve` waiters (scopeID == "")
 // have no key at all, so the walk over waiters is the honest ledger here.
@@ -909,6 +948,23 @@ type admitRequest struct {
 	// set where every other waiter field is written, under queue.mu, rather than
 	// contorting a later lock-free assignment around a concurrent read.
 	scopeCeiling int64
+
+	// S8 (anchor). conn / clientPID / processStartTick / peerSameUID are resolved by
+	// admitConnection from the connection BEFORE the enqueue lock and carried here so
+	// enqueueAdmitInternal can anchor the lease (anchorLeaseLocked) atomically with the
+	// idempotent SET. None is a wire field.
+	//
+	// peerSameUID is a BOOL, not a uid, and that is deliberate: its zero value (false)
+	// fails the re-declare same-uid gate closed, so a build or test that never resolves
+	// it cannot accidentally authorise a re-anchor — whereas a zero uid int equals
+	// root's euid and would fail OPEN if anything ever ran as root. It is true only when
+	// the SO_PEERCRED read succeeded AND the peer uid equals the daemon's euid (design
+	// §4 gate P2-C: SO_PEERCRED same-uid only, NO cgroup-membership check — both confine
+	// and aitest holders live outside their own scope).
+	conn             net.Conn
+	clientPID        int
+	processStartTick uint64
+	peerSameUID      bool
 }
 
 type admitRejection struct {
@@ -1286,8 +1342,10 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			// AIRA-24. The position is an index among QUEUED waiters only, so it
 			// is taken here and nowhere else: counting granted or released
 			// waiters would report a place in a line that no longer exists. The
-			// first match wins — enqueueAdmitInternal refuses a duplicate scope
-			// id (CodeProtocol), so a second match is not reachable.
+			// first match wins — enqueueAdmitInternal refuses a second queued (or
+			// rejected) waiter for a scope id (CodeProtocol) and re-anchors a granted
+			// one in place rather than adding a waiter, so a second match is not
+			// reachable.
 			if queuedScopeID != "" && snapshot.queuePosition == 0 && waiter.scopeID == queuedScopeID {
 				snapshot.queuePosition = snapshot.queued
 				snapshot.queuedAheadBytes = queuedBytes
@@ -1861,6 +1919,22 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{Required: reserve, Ceiling: ceiling, Basis: basis})
 		return
 	}
+	// S8 anchor identity: read the peer credential BEFORE the enqueue lock (mirrors the
+	// supervisor-lease handler — no getsockopt/proc read under queue.mu) and carry it on
+	// the request so enqueueAdmitInternal can anchor the lease atomically with the SET.
+	// A fresh admit does NOT gate on uid (behaviour preserved; net.Pipe test connections
+	// with no injected credential seam simply anchor with pid 0). peerSameUID is set true
+	// only for a same-uid peer and is the gate the idempotent re-declare SET checks.
+	request.conn = conn
+	if uid, pid, credErr := s.peerCredentialOf(conn); credErr == nil {
+		request.peerSameUID = uid == os.Geteuid()
+		if pid > 0 {
+			request.clientPID = pid
+			if tick, ok, _ := readProcStartTime(pid); ok {
+				request.processStartTick = tick
+			}
+		}
+	}
 	queue, waiter, code, enqueueErr := s.enqueueResolvedConfineAdmit(path, reserve, basis, maximum, request)
 	if enqueueErr != nil {
 		if code == CodeAdmitTooLarge {
@@ -1870,13 +1944,20 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		}
 		return
 	}
-	peerCtx, cancelPeer := context.WithCancel(context.Background())
+	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
-	go func() {
-		var one [1]byte
-		_, _ = conn.Read(one[:])
-		cancelPeer()
-	}()
+
+	// myGen is the generation THIS connection anchored the lease at (set by the enqueue
+	// above, under queue.mu). The release below discharges the lease only if the lease
+	// is still at this generation — i.e. no re-declare has re-anchored it to another
+	// connection. alreadyGranted is true when the enqueue re-anchored an existing granted
+	// lease (the idempotent SET): its grantedCh is already closed, so there is no wait and
+	// the deadline/grantedCh select below is skipped rather than resolved by the runtime's
+	// random ready-case choice.
+	queue.mu.Lock()
+	myGen := waiter.anchor.gen
+	alreadyGranted := waiter.state == admitGranted
+	queue.mu.Unlock()
 
 	released := false
 	release := func() {
@@ -1884,31 +1965,33 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 			return
 		}
 		released = true
-		s.releaseAdmitWaiter(queue, waiter)
+		s.releaseAdmitWaiterAnchored(queue, waiter, myGen)
 	}
 	defer release()
 
-	remaining := time.Duration(request.maxWait)*time.Millisecond - s.admitNowTime().Sub(waiter.enqueued)
-	if remaining < 0 {
-		remaining = 0
-	}
-	var timer *time.Timer
-	var deadline <-chan time.Time
-	if s.admitAfter != nil {
-		deadline = s.admitAfter(remaining)
-	} else {
-		timer = time.NewTimer(remaining)
-		deadline = timer.C
-	}
-	defer stopTimer(timer)
-	select {
-	case <-waiter.grantedCh:
-	case <-deadline:
-		s.timeoutAdmitWaiter(queue, waiter)
-	case <-s.stopping:
-		return
-	case <-peerCtx.Done():
-		return
+	if !alreadyGranted {
+		remaining := time.Duration(request.maxWait)*time.Millisecond - s.admitNowTime().Sub(waiter.enqueued)
+		if remaining < 0 {
+			remaining = 0
+		}
+		var timer *time.Timer
+		var deadline <-chan time.Time
+		if s.admitAfter != nil {
+			deadline = s.admitAfter(remaining)
+		} else {
+			timer = time.NewTimer(remaining)
+			deadline = timer.C
+		}
+		defer stopTimer(timer)
+		select {
+		case <-waiter.grantedCh:
+		case <-deadline:
+			s.timeoutAdmitWaiter(queue, waiter)
+		case <-s.stopping:
+			return
+		case <-peerCtx.Done():
+			return
+		}
 	}
 
 	queue.mu.Lock()
@@ -1979,20 +2062,19 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 // on this queue, or nil. queue.mu must be held.
 //
 // It is the lookup half of the idempotent SET-by-scope-id the signed ledger is
-// keyed on (design §2): because enqueueAdmitInternal refuses a duplicate scope
-// id, at most one non-released waiter can carry any scope id, so this is a point
-// read of that scope's lease. Today enqueueAdmitInternal uses it to REFUSE a
-// duplicate; S8 wires the live re-anchoring SET onto this same lookup. An empty
-// scopeID keys nothing (scope-less `confine-reserve` waiters) and matches no
-// lease.
+// keyed on (design §2): because enqueueAdmitInternal refuses a second queued/rejected
+// waiter for a scope id and re-anchors a granted one in place, at most one
+// non-released waiter can carry any scope id, so this is a point read of that scope's
+// lease. enqueueAdmitInternal uses it both to REFUSE a queued/rejected duplicate and
+// to find the granted lease its re-anchoring SET updates. An empty scopeID keys
+// nothing (scope-less `confine-reserve` waiters) and matches no lease.
 //
-// S8 CAUTION: the re-anchoring SET must gate on state == admitGranted, NOT the
-// `!= admitReleased` this refusal-lookup uses. A waiter that has been REJECTED
-// (timed out, or aborted by the unestablished-emptiness rule) but whose deferred
-// release has not yet run is still `!= admitReleased`; re-anchoring onto it would
-// SET a dead lease that is about to be discharged. The broad predicate is
-// correct HERE (any live-or-dying waiter is a duplicate to refuse) and wrong
-// there.
+// CAUTION: this lookup matches on `!= admitReleased` (any live-or-dying waiter is a
+// duplicate to refuse), but enqueueAdmitInternal's re-anchoring SET narrows to
+// state == admitGranted. A waiter that has been REJECTED (timed out, or aborted by the
+// unestablished-emptiness rule) but whose deferred release has not yet run is still
+// `!= admitReleased`; re-anchoring onto it would SET a dead lease that is about to be
+// discharged. The broad predicate is correct for the refusal and wrong for the SET.
 func leaseByScopeIDLocked(queue *sliceQueue, scopeID string) *admitWaiter {
 	if scopeID == "" {
 		return nil
@@ -2003,6 +2085,62 @@ func leaseByScopeIDLocked(queue *sliceQueue, scopeID string) *admitWaiter {
 		}
 	}
 	return nil
+}
+
+// anchorLeaseLocked (re-)anchors w to conn and returns the new monotone generation
+// (design §3, Inv 4). It is the ONE place a lease is anchored, called identically for
+// a fresh insert (generation 0→1) and for a re-declare re-anchor (N→N+1), so the
+// anchor identity/generation is established uniformly. It bumps the generation,
+// records the connection plus the peer pid and process start-tick the restart dump
+// (S10) and reload+kill-probe (S11) need, and clears unanchored (a reloaded lease is
+// anchored the moment a live connection re-declares it, §4).
+//
+// It MUST run inside enqueueAdmitInternal's queue.mu critical section, atomically with
+// the idempotent SET: the bump and the SET being one critical section is what makes
+// compare-and-release correct under the reconnect race. A stale old connection's EOF
+// then either already ran (and the SET finds no lease, inserting a fresh one) or sees
+// the bumped generation and no-ops — never discharges a lease the re-declare holds.
+// The returned generation is what the anchoring connection passes to
+// releaseAdmitWaiterLockedAnchored on its own EOF. queue.mu must be held.
+func anchorLeaseLocked(w *admitWaiter, conn net.Conn, pid int, startTick uint64) int64 {
+	w.anchor.gen++
+	w.anchor.conn = conn
+	w.clientPID = pid
+	w.processStartTick = startTick
+	w.unanchored = false
+	return w.anchor.gen
+}
+
+// watchPeerEOF starts the peer-EOF liveness watcher shared by every lease-bearing
+// connection (design §3): a goroutine blocks reading one byte from conn and cancels
+// the returned context the instant the read returns — peer close, or any error. The
+// holder needs this connection anyway; holder death ⇒ connection EOF ⇒ the context
+// fires, which the caller keys its release on. Extracted from the byte-identical
+// inline goroutines in admitConnection and workerAdmitConnection so both establish
+// liveness the same way; S9's re-declare handler and S15's worker lease reuse it.
+func watchPeerEOF(conn net.Conn) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		var one [1]byte
+		_, _ = conn.Read(one[:])
+		cancel()
+	}()
+	return ctx, cancel
+}
+
+// peerCredentialOf reads the connecting peer's uid and pid through the SO_PEERCRED
+// seam (s.peerCredential, defaulting to unixPeerCredential), the same mechanism the
+// supervisor-lease handler uses. Read BEFORE taking queue.mu (no getsockopt under the
+// hot lock). A failure (e.g. a net.Pipe test connection with no injected seam) returns
+// an error the caller tolerates on the fresh-admit path; only the re-declare same-uid
+// gate depends on it, and an unreadable credential there fails closed (peerSameUID
+// stays false).
+func (s *Server) peerCredentialOf(conn net.Conn) (uid, pid int, err error) {
+	credential := s.peerCredential
+	if credential == nil {
+		credential = unixPeerCredential
+	}
+	return credential(conn)
 }
 
 func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWaiter, string, error) {
@@ -2035,21 +2173,63 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 	defer s.admitRegistryMu.Unlock()
+	// S8 idempotent SET-by-scope-id (design §2/§4) — FIRST, before the maxWaiters,
+	// too-large, single-exclusive and seq guards below. A re-declare of an existing
+	// GRANTED lease re-anchors it in place: it adds no waiter (so maxWaiters must not
+	// refuse it) and Inv 6 says a re-declare is always accepted even if it pushes
+	// available negative (so the too-large ceiling check must not refuse it). S9's
+	// ARDR re-declare handler routes to this same SET, so the early return here is what
+	// keeps S9 free of those fresh-admission gates.
+	if request.scopeID != "" {
+		if existing := leaseByScopeIDLocked(queue, request.scopeID); existing != nil {
+			if existing.state == admitGranted {
+				// Gate on admitGranted, NOT leaseByScopeIDLocked's `!= admitReleased`
+				// (see its CAUTION): a REJECTED-but-not-yet-removed lease is still
+				// `!= admitReleased`, and re-anchoring onto it would SET a dead lease
+				// whose deferred release is about to discharge it. A granted lease is
+				// always accounted (both set together at the grant), so the SET
+				// preserves granted && accounted and the re-derive below keeps counting
+				// it.
+				//
+				// Same-uid gate (design §4 gate P2-C): SO_PEERCRED same-uid only, NO
+				// cgroup-membership check — both confine and aitest lease holders live
+				// OUTSIDE their own scope, so a scope→cgroup-membership check would
+				// reject every legitimate re-declare. peerSameUID fails closed when the
+				// credential was unreadable.
+				if !request.peerSameUID {
+					return nil, nil, CodeProtocol, fmt.Errorf("%s: re-declare peer is not the lease owner", CodeProtocol)
+				}
+				// Idempotent SET of the resource vector + re-anchor to the new
+				// connection. reserve and cpu are the two ledger resources (§2); the
+				// re-derive folds the refreshed vector back into the per-slice ledger.
+				// enqueued is NOT reset (it is the FIFO position, and the lease is
+				// already granted), and exclusive is left untouched (P2-D: an exclusive
+				// holder never re-declares — it reports exclusive=lost). anchorLeaseLocked
+				// bumps the generation atomically with this SET, which is what makes a
+				// concurrent stale old-connection EOF a no-op.
+				existing.reserve = reserve
+				existing.cpu = request.cpu
+				anchorLeaseLocked(existing, request.conn, request.clientPID, request.processStartTick)
+				queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+				// A re-declare that SHRINKS the vector frees capacity; wake the queue so
+				// a waiter that now fits is not stalled to the next poll tick (the
+				// fresh-insert path signals for the same reason).
+				queue.signal()
+				return queue, existing, "", nil
+			}
+			// A queued lease means the original connection is still establishing this
+			// scope's lease, and a rejected-dying one is about to be torn down: both are
+			// genuine duplicates, refused exactly as before (CodeProtocol, behaviour
+			// preserved — TestConfineRegistryRejectsDuplicateScopeID pins this). Only a
+			// live GRANTED lease re-anchors.
+			return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
+		}
+	}
 	if len(queue.waiters) >= admitMaxWaiters {
 		return nil, nil, CodeBusy, fmt.Errorf("%s: too many admission waiters for slice", CodeBusy)
 	}
 	if enforceCeiling && reserve > subtractFloor(maximum, s.admitSliceHeadroom(queue.outstandingJobs+1)) {
 		return nil, nil, CodeAdmitTooLarge, fmt.Errorf("%s: required reserve exceeds cap minus headroom", CodeAdmitTooLarge)
-	}
-	if request.scopeID != "" {
-		if leaseByScopeIDLocked(queue, request.scopeID) != nil {
-			// The idempotent SET-by-scope-id the signed ledger is built on
-			// (design §2) begins here as its lookup half: a hit is this scope's
-			// existing lease. Today that is a duplicate and is refused (behaviour
-			// preserved); S8 turns the same hit into a re-anchoring SET of that
-			// lease's reserve on the new connection instead of a refusal.
-			return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
-		}
 	}
 	// AIRA-101. At most ONE exclusive waiter per slice, refused here under
 	// queue.mu so the check is race-free beside the duplicate-scope-id check
@@ -2077,6 +2257,10 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 	}
 	queue.seq++
 	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
+	// Anchor the fresh lease to its connection (generation 0→1) through the same
+	// helper a re-declare uses, so the anchor identity/generation is set uniformly.
+	// The connection's EOF release compares against this generation.
+	anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
@@ -2662,6 +2846,44 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 	if released {
 		s.afterAdmitRelease(queue)
 	}
+}
+
+// releaseAdmitWaiterAnchored is the socket-EOF release: the connection that anchored
+// the lease at generation gen discharges it on its own EOF, via the compare-and-release
+// gate. See releaseAdmitWaiterLockedAnchored. It runs afterAdmitRelease only when it
+// performed the discharge.
+func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, gen int64) {
+	queue.mu.Lock()
+	released := releaseAdmitWaiterLockedAnchored(queue, waiter, gen)
+	queue.mu.Unlock()
+	if released {
+		s.afterAdmitRelease(queue)
+	}
+}
+
+// releaseAdmitWaiterLockedAnchored is compare-and-release (design §3, Inv 4), with
+// queue.mu ALREADY HELD: it discharges the lease ONLY if the EOF is from the connection
+// that is CURRENTLY the anchor — i.e. the lease's generation still equals the generation
+// this connection anchored at. A re-declare on a new connection bumped the generation
+// (anchorLeaseLocked), so this stale connection's later EOF releases nothing.
+//
+// This is the ONLY release path the final design keeps: every lease is released by its
+// current-anchor connection's EOF (S15's worker-lease EOF reuses THIS variant). The
+// unconditional releaseAdmitWaiterLocked is retained for the periodic cgroup-scan
+// stale-lease sweep (dischargeVanishedStaleLease) and the operator/exclusive/test
+// reclaim paths — all of which S14 removes; a socket-EOF release must NOT route through
+// it, or the generation gate is bypassed.
+//
+// The caller runs afterAdmitRelease once it has dropped queue.mu, and only when this
+// returned true.
+func releaseAdmitWaiterLockedAnchored(queue *sliceQueue, waiter *admitWaiter, gen int64) bool {
+	if waiter.state == admitReleased {
+		return false
+	}
+	if waiter.anchor.gen != gen {
+		return false
+	}
+	return releaseAdmitWaiterLocked(queue, waiter)
 }
 
 // releaseAdmitWaiterLocked is the ledger discharge itself, with queue.mu ALREADY

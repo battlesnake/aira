@@ -975,13 +975,10 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		_ = writeFrame(conn, errorFrame(CodeProtocol, err.Error()))
 		return
 	}
-	peerCtx, cancelPeer := context.WithCancel(context.Background())
+	// S8: the shared peer-EOF watcher (admit.go). Worker-admit has no ledger lease to
+	// anchor until S15, so it uses only the watcher half of the shared helper today.
+	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
-	go func() {
-		var one [1]byte
-		_, _ = conn.Read(one[:])
-		cancelPeer()
-	}()
 
 	poll := s.workerAdmitPollInterval
 	if poll <= 0 {
