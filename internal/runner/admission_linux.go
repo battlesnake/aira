@@ -729,6 +729,13 @@ func formatGrantableClause(grantable *int64) string {
 	if grantable == nil {
 		return ""
 	}
+	// S4: the ledger is signed, so `available` can be NEGATIVE (the slice is
+	// over-subscribed during the restart re-declare window). Render that deficit
+	// honestly rather than flattening it to "0B", which would read as "nothing
+	// grantable right now" and hide that a release must first recover the ledger.
+	if *grantable < 0 {
+		return " (slice over-subscribed by " + FormatConfineBytes(-*grantable) + " at the last evaluation)"
+	}
 	text := "0B"
 	if *grantable > 0 {
 		text = FormatConfineBytes(*grantable)

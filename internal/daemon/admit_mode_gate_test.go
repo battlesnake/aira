@@ -135,6 +135,35 @@ func TestS4CIModeLedgerOnlyIgnoresPhysicalOveruse(t *testing.T) {
 	}
 }
 
+// verifies: S4 — the DEV arm of the mode-gate KEEPS the physical floor: physical
+// over-use (memory.current above ceiling − Σleases) refuses a newcomer that fits
+// the ledger. The dev mirror of the CI test above, holding current identical; the
+// opposite verdict (refused vs granted) is the mode split. Mutation-verified by
+// the same seam as test (ii): making the CI arm consult the floor makes CI behave
+// like this; making the DEV arm ledger-only would grant here.
+func TestS4DevModeFloorRefusesOnPhysicalOveruse(t *testing.T) {
+	const (
+		maximum = 64 * gib
+		current = 60 * gib // physical over-use: ceiling − current = 4 GiB
+		reserve = 32 * gib // fits the empty ledger but not the physical floor
+	)
+	now := time.Unix(715_000, 0)
+	server := NewServer(Paths{}) // dev mode (real-cgroup): no SetConfineShimModeForTest
+	server.admitNow = func() time.Time { return now }
+	server.admitConfineScanInterval = time.Nanosecond
+	server.admitConfineScan = noConfinesScan
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return current, maximum, 0, true, ""
+	}
+
+	queued := buildS4Queue(server, "/slice", now, nil, reserve)
+	if queued.state != admitQueued {
+		t.Fatalf("DEV mode must REFUSE a 32 GiB reserve when physical use (%d bytes) leaves only ceiling−current room, even though the ledger is empty (state=%v)", int64(current), queued.state)
+	}
+}
+
 // verifies: S4 test (iii) — DEV mode refuses a NEW admission when SYSTEM-available
 // RAM is low even though the slice LEDGER shows room. The MemAvailable-aware
 // AIRA-103/106 pressure ceiling shrinks the effective maximum; a reserve that fits
@@ -180,11 +209,12 @@ func TestS4DevModeRefusesWhenSystemAvailableRAMLow(t *testing.T) {
 // reply an OK grant, reding the refusal assertion.
 func TestS4AdmitConnectionFailsClosedWhenSliceUnreadable(t *testing.T) {
 	// Ordinary and exclusive requests both fail CLOSED on an unreadable slice, with
-	// their own honest codes. The exclusive branch is load-bearing: routing an
-	// exclusive request through the ordinary refuse code would drop it into the
-	// runner's flock fallback and launch it BOTH unaccounted AND non-exclusive, so
-	// it must stay E_ADMIT_EXCLUSIVE_UNESTABLISHED (which the runner treats as a
-	// terminal exclusive refusal, not a fallback).
+	// their own honest codes. The exclusive code is code-HONESTY only, not
+	// launch-prevention: the runner's fail() refuses ANY exclusive request before
+	// the flock fallback (admission_linux.go:447), so E_DAEMON_UNAVAILABLE would ALSO
+	// refuse exclusivity — U_ADMIT_EXCLUSIVE_UNESTABLISHED just carries the precise
+	// reason (handled by the runner's pre-payload exclusive switch) instead of the
+	// generic "exchange did not complete". This case pins that specific code.
 	for _, tc := range []struct {
 		name      string
 		exclusive bool

@@ -1766,7 +1766,10 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	resolve := s.sliceResolver()
 	path, ok, reason := resolve(request.slice)
 	if !ok {
-		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason})
+		// S4 (D4 / Invariant 6): an unresolvable slice is "no readable budget" too —
+		// fail CLOSED, symmetric with the unreadable-memory path below, rather than
+		// the pre-S4 grant-shaped `unevaluated`.
+		s.writeAdmitFailClosed(conn, request.exclusive, reason)
 		return
 	}
 	readMemory := s.memoryReader()
@@ -1778,30 +1781,14 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		// which leaves waiters queued and grants nothing. The pre-S4 code returned a
 		// grant-shaped `unevaluated` here, which the runner treated as a real grant
 		// and LAUNCHED THE JOB UNCAPPED (admission_linux.go: "an ordinary job
-		// proceeds on it uncapped-but-launched") — the exact over-admit this slice
-		// closes.
+		// proceeds on it uncapped-but-launched").
 		//
 		// INTERIM GAP (recorded, not fixed here — the S13 client-flock-fallback
-		// delete owns it): a refusal without --require-admission routes through the
-		// runner's fail() to the flock fallback, which still launches ungoverned;
-		// --require-admission already fails closed (it refuses any non-admitted
-		// state). Post-S13 fail() becomes reconnect + re-request, which is where the
-		// E_DAEMON_UNAVAILABLE code below lands honestly: the daemon is up but cannot
-		// serve an admission decision for this slice.
-		if reason == "" {
-			reason = "slice memory unreadable"
-		}
-		if request.exclusive {
-			// Preserve v0.5's clean exclusive refusal: an unreadable slice is exactly
-			// "an empty slice could not be established", and routing an exclusive
-			// request through the ordinary refuse code would drop it into the runner's
-			// flock fallback and launch it BOTH unaccounted AND non-exclusive. Same
-			// code the ci-shim exclusive refusal (above) and the drain-abort use.
-			s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
-				CodeAdmitExclusiveUnestablished+": the slice memory is unreadable, so an empty slice could not be established for an exclusive request ("+reason+")")
-			return
-		}
-		s.writeAdmitError(conn, CodeUnavailable, CodeUnavailable+": "+reason)
+		// delete owns it): an ORDINARY refusal without --require-admission still
+		// routes through the runner's fail() to the flock fallback and launches
+		// ungoverned until S13; --require-admission already fails closed (it refuses
+		// any non-admitted state). Post-S13 fail() becomes reconnect + re-request.
+		s.writeAdmitFailClosed(conn, request.exclusive, reason)
 		return
 	}
 	jobs := s.admitOutstandingJobs(path)
@@ -2654,6 +2641,31 @@ func (s *Server) writeAdmitGrant(conn net.Conn, grant AdmitResponse) {
 		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
 	}
 	_ = write(conn, responseFrame(core.Response{OK: true, Code: "OK", Data: grant}))
+}
+
+// writeAdmitFailClosed refuses a NEW admission the daemon cannot evaluate
+// (Invariant 6): an unresolvable slice or an unreadable slice/container budget.
+// It NEVER emits a grant — a grant-shaped `unevaluated` here is launched UNCAPPED
+// by the runner.
+//
+// An exclusive request gets the specific U_ADMIT_EXCLUSIVE_UNESTABLISHED (the
+// same code the ci-shim exclusive refusal and the drain-abort use) purely for
+// HONESTY: the runner's fail() already refuses ANY exclusive request before the
+// flock fallback (admission_linux.go), so both codes refuse exclusivity — this
+// one just carries the precise reason to the client instead of the generic
+// "exchange did not complete". An ordinary refusal routes through the runner's
+// fail() to the flock fallback in the interim (S13 replaces that with reconnect +
+// re-request); --require-admission already fails closed on any non-admitted state.
+func (s *Server) writeAdmitFailClosed(conn net.Conn, exclusive bool, reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "slice budget unreadable"
+	}
+	if exclusive {
+		s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
+			CodeAdmitExclusiveUnestablished+": "+reason+" — an empty slice could not be established for an exclusive request")
+		return
+	}
+	s.writeAdmitError(conn, CodeUnavailable, CodeUnavailable+": "+reason)
 }
 
 func (s *Server) writeAdmitError(conn net.Conn, code, message string) {

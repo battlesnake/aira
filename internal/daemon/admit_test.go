@@ -763,7 +763,10 @@ func TestAdmitShutdownHandlerOwnsReleaseAndPrunesAfterDrain(t *testing.T) {
 	server.admitRegistryMu.Unlock()
 }
 
-func TestAdmitUnevaluatedImmediateWithoutEnqueue(t *testing.T) {
+// S4 (P3-3): an unresolvable slice fails CLOSED, symmetric with the
+// unreadable-memory path — the pre-S4 grant-shaped `unevaluated` here was launched
+// uncapped by the runner. It refuses (E_DAEMON_UNAVAILABLE) and enqueues nothing.
+func TestAdmitUnresolvableSliceFailsClosedWithoutEnqueue(t *testing.T) {
 	var maximum atomic.Int64
 	server := admitTestServer(&maximum)
 	server.admitResolveSlice = func(string) (string, bool, string) { return "", false, "slice-not-found" }
@@ -778,14 +781,13 @@ func TestAdmitUnevaluatedImmediateWithoutEnqueue(t *testing.T) {
 	if err := readFrame(clientConn, &frame); err != nil {
 		t.Fatal(err)
 	}
-	grant := admitGrantData(t, frame)
-	if grant.State != "unevaluated" || grant.Reason != "slice-not-found" {
-		t.Fatalf("grant=%+v", grant)
+	if frame.Code != CodeUnavailable {
+		t.Fatalf("an unresolvable slice must fail CLOSED with %s, not a grant-shaped response (code=%q data=%s)", CodeUnavailable, frame.Code, frame.Data)
 	}
 	<-done
 	server.admitRegistryMu.Lock()
 	if len(server.admitQueues) != 0 {
-		t.Fatalf("unevaluated enqueued: %d", len(server.admitQueues))
+		t.Fatalf("a fail-closed refusal must not enqueue: %d", len(server.admitQueues))
 	}
 	server.admitRegistryMu.Unlock()
 }

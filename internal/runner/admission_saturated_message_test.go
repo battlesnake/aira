@@ -130,6 +130,22 @@ func TestSaturatedMessageNamesTheUnfittableReserveInsteadOfContention(t *testing
 	if strings.Contains(absent, "largest grantable reserve") {
 		t.Fatalf("message %q reports a grantable figure the daemon never sent", absent)
 	}
+
+	// S4 (P2-2): the signed ledger can drive grantable NEGATIVE during the restart
+	// re-declare window. That deficit is rendered honestly as "over-subscribed by
+	// N", NOT flattened to "0B" (which would read as "nothing grantable now" and
+	// hide that a release must first recover the ledger).
+	deficit := int64(-(16 << 30))
+	negative := saturatedMessage(t, DefaultConfineMemoryReserve, runnerAdmitRejection{
+		Basis: "reject:saturated", Required: saturatedCeiling, Ceiling: saturatedCeiling,
+		Contention: "none-observed", Grantable: &deficit,
+	})
+	if !strings.Contains(negative, "slice over-subscribed by "+FormatConfineBytes(-deficit)) {
+		t.Fatalf("message %q does not render a negative grantable as the over-subscription deficit", negative)
+	}
+	if strings.Contains(negative, "largest grantable reserve 0B") {
+		t.Fatalf("message %q flattened a negative deficit to 0B, hiding the over-subscription", negative)
+	}
 }
 
 func TestSaturatedMessageKeepsTheContendedWordingWhenContentionWasObserved(t *testing.T) {
