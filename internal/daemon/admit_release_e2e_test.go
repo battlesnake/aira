@@ -42,16 +42,16 @@ func e2eDrainGrant(conn net.Conn) {
 // insists the queue is STILL PRESENT while it reads it.
 //
 // The `present` requirement is load-bearing, not decoration. releaseAdmitWaiter
-// removes the waiter from queue.waiters OUTSIDE the `accounted` guard that does
-// the arithmetic, and pruneAdmitQueue then deletes a queue whose waiter list is
+// removes the waiter from queue.waiters and then re-derives the ledger from the
+// survivors, and pruneAdmitQueue then deletes a queue whose waiter list is
 // empty — so once the last client goes away the queue is gone and
 // admitSliceSnapshot honestly reports the absent-queue zero. An earlier version
 // of these tests waited for (0 jobs, 0 bytes) after closing every client, which
 // that absent-queue zero satisfies WITHOUT the discharge ever running: mutation
-// testing (deleting `queue.outstanding -= waiter.reserve; queue.outstandingJobs--`
-// outright) left both tests green. They were reading the ledger's absence as
-// proof of its correctness — the exact leak this ticket alleges would have
-// slipped straight through.
+// testing (dropping the release's rederiveLedgerLocked call, so outstanding
+// keeps a discharged lease's bytes) left both tests green. They were reading the
+// ledger's absence as proof of its correctness — the exact leak this ticket
+// alleges would have slipped straight through.
 //
 // The tests below therefore keep one PINNED client open throughout, so the queue
 // can never be pruned, and assert the discharged ledger equals the pin's own
