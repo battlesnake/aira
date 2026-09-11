@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -258,6 +259,11 @@ func TestEncodeReDeclareRejectsUnchargeableRecords(t *testing.T) {
 // frozen 1-byte ack rather than a protocol refusal. This is the OLD-client ↔
 // NEW-daemon upgrade path (design §4).
 //
+// S9: the handler is no longer the stub (ack-and-close). It now gates on SO_PEERCRED
+// same-uid and HOLDS the connection, so the test injects a same-uid credential seam and
+// a slice resolver (NEVER the real host resolver — the box itself runs under aira.slice),
+// reads the ack through the ACCEPT path, then closes the client so the hold exits.
+//
 // MUTATION: moving the magic sniff AFTER the protocol-version check reds this
 // test — readInboundFrame then reads the magic as an oversized frame length,
 // refuses with a length-prefixed E_DAEMON_PROTOCOL response, and the first byte
@@ -265,9 +271,12 @@ func TestEncodeReDeclareRejectsUnchargeableRecords(t *testing.T) {
 func TestOldClientReDeclareIsSniffedBeforeProtocolCheck(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	t.Cleanup(func() { _ = clientConn.Close() })
+	server := NewServer(Paths{StateID: "state"})
+	server.peerCredential = func(net.Conn) (int, int, error) { return os.Geteuid(), os.Getpid(), nil }
+	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	done := make(chan struct{})
 	go func() {
-		NewServer(Paths{StateID: "state"}).serveConnection(context.Background(), serverConn)
+		server.serveConnection(context.Background(), serverConn)
 		close(done)
 	}()
 	frame, err := encodeReDeclareFrame(reDeclareRecord{ScopeID: "aira.slice/aira-CONFINE-x.scope", RAMBytes: 1 << 30, CPUCores: 1})
@@ -283,14 +292,19 @@ func TestOldClientReDeclareIsSniffedBeforeProtocolCheck(t *testing.T) {
 	if ack[0] != reDeclareAckByte {
 		t.Fatalf("re-declare ack = 0x%02x, want the frozen 0x%02x", ack[0], reDeclareAckByte)
 	}
+	// S9 HOLDS the lease-bearing connection: close the client so the hold's EOF path
+	// releases the lease and the handler returns.
+	_ = clientConn.Close()
 	<-done
 }
 
-// TestReDeclareStubRejectsMalformedFrameWithoutAck pins the TOTAL-parser
+// TestReDeclareHandlerRejectsMalformedFrameWithoutAck pins the TOTAL-parser
 // contract at the SERVER boundary: a frame with a valid magic but a malformed
 // body is a hard reject — the daemon logs it and writes NOTHING, so the peer
-// reads EOF, never a fabricated ack.
-func TestReDeclareStubRejectsMalformedFrameWithoutAck(t *testing.T) {
+// reads EOF, never a fabricated ack. The malformed-frame path is identical under
+// S9 (decode error → return before any lease or ack), so this stays green across
+// the stub→handler replacement.
+func TestReDeclareHandlerRejectsMalformedFrameWithoutAck(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	t.Cleanup(func() { _ = clientConn.Close() })
 	done := make(chan struct{})
