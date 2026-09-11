@@ -305,18 +305,21 @@ type admitWaiter struct {
 
 	// S8 (restart/anchor state — design §3 compare-and-release, §4 restart).
 	//
-	// anchor is the connection that CURRENTLY owns this lease plus a per-waiter
-	// MONOTONE generation. The generation is the load-bearing value behind
-	// compare-and-release (Inv 4): a lease is released ONLY by the EOF of its
-	// current-anchor connection. Every (re-)anchor through anchorLeaseLocked bumps
-	// the generation, so a re-declare on a new connection makes a stale old
-	// connection's later EOF a no-op (releaseAdmitWaiterLockedAnchored compares the
-	// generation the releasing connection anchored at against the current one). The
-	// bump is atomic with the idempotent SET in enqueueAdmitInternal, under queue.mu,
-	// so there is no window in which a stale EOF discharges a lease a re-declare has
-	// just re-anchored. anchor.conn is retained for diagnostics and for S9/S10; the
-	// compare is on the generation alone (an equal or recycled conn value can never
-	// be mistaken for the anchor).
+	// anchor is the connection that CURRENTLY owns this lease (design §3 Inv 4): a
+	// lease is released ONLY by the EOF of its current-anchor connection. Each
+	// (re-)anchor through anchorLeaseLocked OVERWRITES it under queue.mu, so a
+	// re-declare on a new connection makes a stale old connection's later EOF a
+	// no-op — releaseAdmitWaiterLockedAnchored discharges only when the releasing
+	// connection still IS the anchor. The compare is direct identity on the live
+	// net.Conn the handler holds for the lease's whole lifetime: a handler never
+	// releases a conn it is not still holding, so an equal-or-recycled value cannot
+	// arise, and there is NO separate "which generation am I" value for the
+	// releasing connection to capture in a second critical section. (A monotone
+	// generation — bumped on re-anchor, captured by each connection for its later
+	// release — was the builder's first cut; Fable found it reintroduced the very
+	// lost-lease race it meant to close, because the capture and the bump were
+	// separate critical sections. Conn identity is the plan's own wording,
+	// "discharge only if anchor==thisConn", and has no capture window.)
 	//
 	// clientPID / processStartTick are the peer's pid and /proc start-tick, read
 	// from the connection at anchor time. They are the fields the graceful-shutdown
@@ -328,18 +331,10 @@ type admitWaiter struct {
 	// re-declared by a live connection (§4). S8 only adds and clears the bit (a
 	// re-declare anchors the lease, clearing it); the reload that SETS it, and the
 	// end-of-freeze drop of leases still unanchored, are S11.
-	anchor           admitAnchor
+	anchor           net.Conn
 	clientPID        int
 	processStartTick uint64
 	unanchored       bool
-}
-
-// admitAnchor identifies the connection that currently owns (anchors) a lease and
-// carries the monotone generation behind compare-and-release (design §3, Inv 4).
-// See admitWaiter.anchor.
-type admitAnchor struct {
-	conn net.Conn
-	gen  int64
 }
 
 // ledgerCharge is what this waiter contributes to queue.outstanding: its
@@ -1947,15 +1942,15 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
 
-	// myGen is the generation THIS connection anchored the lease at (set by the enqueue
-	// above, under queue.mu). The release below discharges the lease only if the lease
-	// is still at this generation — i.e. no re-declare has re-anchored it to another
-	// connection. alreadyGranted is true when the enqueue re-anchored an existing granted
-	// lease (the idempotent SET): its grantedCh is already closed, so there is no wait and
-	// the deadline/grantedCh select below is skipped rather than resolved by the runtime's
-	// random ready-case choice.
+	// alreadyGranted is true when the enqueue re-anchored an existing granted lease
+	// (the idempotent SET): its grantedCh is already closed, so there is no wait and
+	// the deadline/grantedCh select below is skipped rather than resolved by the
+	// runtime's random ready-case choice. This read is in a critical section separate
+	// from the enqueue, which is benign: if the evaluator granted in the gap, grantedCh
+	// is already closed and the select returns immediately. The RELEASE below captures
+	// NO such value — it compares this handler's own conn against the live anchor, so
+	// the reconnect race has no capture window (unlike a per-connection generation).
 	queue.mu.Lock()
-	myGen := waiter.anchor.gen
 	alreadyGranted := waiter.state == admitGranted
 	queue.mu.Unlock()
 
@@ -1965,7 +1960,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 			return
 		}
 		released = true
-		s.releaseAdmitWaiterAnchored(queue, waiter, myGen)
+		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
 	}
 	defer release()
 
@@ -2087,28 +2082,24 @@ func leaseByScopeIDLocked(queue *sliceQueue, scopeID string) *admitWaiter {
 	return nil
 }
 
-// anchorLeaseLocked (re-)anchors w to conn and returns the new monotone generation
-// (design §3, Inv 4). It is the ONE place a lease is anchored, called identically for
-// a fresh insert (generation 0→1) and for a re-declare re-anchor (N→N+1), so the
-// anchor identity/generation is established uniformly. It bumps the generation,
-// records the connection plus the peer pid and process start-tick the restart dump
-// (S10) and reload+kill-probe (S11) need, and clears unanchored (a reloaded lease is
-// anchored the moment a live connection re-declares it, §4).
+// anchorLeaseLocked (re-)anchors w to conn (design §3, Inv 4). It is the ONE place a
+// lease is anchored, called identically for a fresh insert and for a re-declare
+// re-anchor, so the anchor identity is established uniformly. It overwrites the anchor
+// connection, records the peer pid and process start-tick the restart dump (S10) and
+// reload+kill-probe (S11) need, and clears unanchored (a reloaded lease is anchored the
+// moment a live connection re-declares it, §4).
 //
 // It MUST run inside enqueueAdmitInternal's queue.mu critical section, atomically with
-// the idempotent SET: the bump and the SET being one critical section is what makes
+// the idempotent SET: the overwrite and the SET being one critical section is what makes
 // compare-and-release correct under the reconnect race. A stale old connection's EOF
-// then either already ran (and the SET finds no lease, inserting a fresh one) or sees
-// the bumped generation and no-ops — never discharges a lease the re-declare holds.
-// The returned generation is what the anchoring connection passes to
-// releaseAdmitWaiterLockedAnchored on its own EOF. queue.mu must be held.
-func anchorLeaseLocked(w *admitWaiter, conn net.Conn, pid int, startTick uint64) int64 {
-	w.anchor.gen++
-	w.anchor.conn = conn
+// then either already ran (and the SET finds no lease, inserting a fresh one) or finds
+// the anchor now points at the re-declaring connection and no-ops — never discharges a
+// lease the re-declare holds. queue.mu must be held.
+func anchorLeaseLocked(w *admitWaiter, conn net.Conn, pid int, startTick uint64) {
+	w.anchor = conn
 	w.clientPID = pid
 	w.processStartTick = startTick
 	w.unanchored = false
-	return w.anchor.gen
 }
 
 // watchPeerEOF starts the peer-EOF liveness watcher shared by every lease-bearing
@@ -2199,14 +2190,22 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 				if !request.peerSameUID {
 					return nil, nil, CodeProtocol, fmt.Errorf("%s: re-declare peer is not the lease owner", CodeProtocol)
 				}
+				// P2-D: an exclusive lease is LOST on reconnect — the client reports
+				// exclusive=lost and does NOT re-declare it. A re-declare that carries
+				// exclusive is therefore a protocol violation: refuse it rather than
+				// silently re-anchor it as a non-exclusive lease (which would also slip
+				// past the single-exclusive-per-slice guard below, since the SET returns
+				// before reaching it).
+				if request.exclusive {
+					return nil, nil, CodeProtocol, fmt.Errorf("%s: an exclusive lease is never re-declared (exclusive=lost on reconnect)", CodeProtocol)
+				}
 				// Idempotent SET of the resource vector + re-anchor to the new
 				// connection. reserve and cpu are the two ledger resources (§2); the
 				// re-derive folds the refreshed vector back into the per-slice ledger.
 				// enqueued is NOT reset (it is the FIFO position, and the lease is
-				// already granted), and exclusive is left untouched (P2-D: an exclusive
-				// holder never re-declares — it reports exclusive=lost). anchorLeaseLocked
-				// bumps the generation atomically with this SET, which is what makes a
-				// concurrent stale old-connection EOF a no-op.
+				// already granted), and exclusive is left untouched (refused above).
+				// anchorLeaseLocked overwrites the anchor atomically with this SET, which
+				// is what makes a concurrent stale old-connection EOF a no-op.
 				existing.reserve = reserve
 				existing.cpu = request.cpu
 				anchorLeaseLocked(existing, request.conn, request.clientPID, request.processStartTick)
@@ -2257,9 +2256,9 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 	}
 	queue.seq++
 	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
-	// Anchor the fresh lease to its connection (generation 0→1) through the same
-	// helper a re-declare uses, so the anchor identity/generation is set uniformly.
-	// The connection's EOF release compares against this generation.
+	// Anchor the fresh lease to its connection through the same helper a re-declare
+	// uses, so the anchor identity is set uniformly. The connection's EOF release
+	// compares its own conn against this anchor.
 	anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
@@ -2849,12 +2848,12 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 }
 
 // releaseAdmitWaiterAnchored is the socket-EOF release: the connection that anchored
-// the lease at generation gen discharges it on its own EOF, via the compare-and-release
-// gate. See releaseAdmitWaiterLockedAnchored. It runs afterAdmitRelease only when it
-// performed the discharge.
-func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, gen int64) {
+// the lease discharges it on its own EOF, via the compare-and-release gate. conn is the
+// releasing handler's own connection. See releaseAdmitWaiterLockedAnchored. It runs
+// afterAdmitRelease only when it performed the discharge.
+func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) {
 	queue.mu.Lock()
-	released := releaseAdmitWaiterLockedAnchored(queue, waiter, gen)
+	released := releaseAdmitWaiterLockedAnchored(queue, waiter, conn)
 	queue.mu.Unlock()
 	if released {
 		s.afterAdmitRelease(queue)
@@ -2863,24 +2862,27 @@ func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWait
 
 // releaseAdmitWaiterLockedAnchored is compare-and-release (design §3, Inv 4), with
 // queue.mu ALREADY HELD: it discharges the lease ONLY if the EOF is from the connection
-// that is CURRENTLY the anchor — i.e. the lease's generation still equals the generation
-// this connection anchored at. A re-declare on a new connection bumped the generation
-// (anchorLeaseLocked), so this stale connection's later EOF releases nothing.
+// that is CURRENTLY the anchor — i.e. waiter.anchor still IS conn. A re-declare on a new
+// connection overwrote the anchor (anchorLeaseLocked), so this stale connection's later
+// EOF releases nothing. The compare is direct identity on the live net.Conn the handler
+// holds for the lease's lifetime — NO generation value is captured, so none can be
+// captured in a critical section separate from the SET that set it (the reconnect-race
+// lost-lease bug this avoids by construction).
 //
 // This is the ONLY release path the final design keeps: every lease is released by its
 // current-anchor connection's EOF (S15's worker-lease EOF reuses THIS variant). The
 // unconditional releaseAdmitWaiterLocked is retained for the periodic cgroup-scan
 // stale-lease sweep (dischargeVanishedStaleLease) and the operator/exclusive/test
 // reclaim paths — all of which S14 removes; a socket-EOF release must NOT route through
-// it, or the generation gate is bypassed.
+// it, or the anchor gate is bypassed.
 //
 // The caller runs afterAdmitRelease once it has dropped queue.mu, and only when this
 // returned true.
-func releaseAdmitWaiterLockedAnchored(queue *sliceQueue, waiter *admitWaiter, gen int64) bool {
+func releaseAdmitWaiterLockedAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) bool {
 	if waiter.state == admitReleased {
 		return false
 	}
-	if waiter.anchor.gen != gen {
+	if waiter.anchor != conn {
 		return false
 	}
 	return releaseAdmitWaiterLocked(queue, waiter)
