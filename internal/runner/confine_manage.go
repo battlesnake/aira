@@ -408,20 +408,6 @@ type ConfineSliceReserve struct {
 	ReservationJobs  int   `json:"reservation_jobs"`
 	ReservationBytes int64 `json:"reservation_bytes"`
 
-	// VanishedJobs/VanishedBytes are a SUBSET of ScopeJobs/ScopeBytes: leases
-	// whose scope the daemon's own scan observed and then observed gone. They are
-	// reclaimed at the stale-lease TTL.
-	//
-	// Named for what was observed, never for a verdict. A scope can be empty and
-	// removed while the job's leader is still alive, having migrated into a
-	// sibling cgroup — real, witnessed behaviour — so "its scope is gone" is a
-	// fact and "the job is dead" is not one this daemon can establish.
-	//
-	// Structurally blind to the scope-less population: a reservation has no cgroup
-	// artifact, so nothing can be observed about it either way.
-	VanishedJobs  int   `json:"vanished_jobs"`
-	VanishedBytes int64 `json:"vanished_bytes"`
-
 	// AIRA-103. WHY the ceiling is what it is. CeilingBytes above already derives
 	// from the EFFECTIVE maximum, so it is honest without these; they exist so an
 	// operator waiting on admission can tell external system memory pressure from

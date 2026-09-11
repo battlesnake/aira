@@ -154,9 +154,10 @@ type workerScopeState struct {
 	scanErr error
 }
 
-// workerScopeScanIntervalDefault throttles the per-outer-scope child scan to
-// the same <=1/second cadence evaluateAdmitQueue already uses for the
-// slice-wide adopted-confine scan (admitConfineScanIntervalDefault).
+// workerScopeScanIntervalDefault throttles the per-outer-scope child scan to a
+// <=1/second cadence, reusing admitConfineScanIntervalDefault as the shared 1s
+// reference (S14 removed the slice-wide admission confine scan; the constant
+// survives only as this cadence reference and the OOM-steer interval bound).
 const workerScopeScanIntervalDefault = admitConfineScanIntervalDefault
 
 // maxWorkerScopeSeq bounds worker-id allocation so a reconstructed maxIndex

@@ -32,8 +32,6 @@ type s5Lease struct{ reserve, cpu int64 }
 func cpuLedgerServer(now *time.Time, numCPU int) *Server {
 	server := NewServer(Paths{})
 	server.admitNow = func() time.Time { return *now }
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = noConfinesScan
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.readCPUCores = func() int { return numCPU }

@@ -357,7 +357,6 @@ func TestAdmitFreezeYieldRespectsCeilingWhenOutstandingDominates(t *testing.T) {
 	// pass, because every remaining candidate happened to fit.
 	tooBig := queuedWaiter(4, 50, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{held, head, small, tooBig}, outstanding: 60, outstandingJobs: 1}
-	server.admitConfineScanInterval = time.Hour
 
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, small)

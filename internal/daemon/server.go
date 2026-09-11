@@ -132,7 +132,6 @@ type Server struct {
 	// ledger read's own safety precondition. Defaults to
 	// readWorkerSupervisorMemory.
 	admitReadWorkerSupervisorMemory func(string) (int64, int64, bool, string)
-	admitConfineScan                func(string) (runner.ConfineListResult, error)
 	// AIRA-121. confineMode is runner.ConfineModeReal or ConfineModeShim, and
 	// shimBudget is the recorded container RAM budget the ledger admits against
 	// in shim mode. Both are resolved once, in Serve, from the durable
@@ -143,8 +142,7 @@ type Server struct {
 	// AIRA-123. The ci-shim per-WORKER admission ledger (worker_admit_shim.go).
 	// Distinct from shimBudget, which is the container-wide ceiling both this
 	// ledger and ordinary job admission draw against.
-	shimWorkers              shimWorkerLedger
-	admitConfineScanInterval time.Duration
+	shimWorkers shimWorkerLedger
 	// shimReadMemTotal / shimReadMemAvailable are readShimMemory's host-wide
 	// /proc/meminfo seams (AIRA-121 F3). Nil in production, which resolves to
 	// the package funcs readMemTotal/readMemAvailable; a test injects a
@@ -200,7 +198,6 @@ func NewServer(paths Paths) *Server {
 		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
 		restartFreeze:                defaultRestartFreeze,
 		admitQueues:                  map[string]*sliceQueue{},
-		admitConfineScanInterval:     admitConfineScanIntervalDefault,
 		workerScopeScanInterval:      workerScopeScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
@@ -212,9 +209,6 @@ func NewServer(paths Paths) *Server {
 		deadlines:                    defaultDeadlines,
 	}
 	server.projectCond = sync.NewCond(&server.mu)
-	// One scan entry point, mode-aware (AIRA-121). Assigned after the literal
-	// because it closes over the server it belongs to.
-	server.admitConfineScan = server.confineScan
 	server.confineMode = runner.ConfineModeReal
 	return server
 }
@@ -283,9 +277,9 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		//                     convenient, since that sweep's release gate is a proof of
 		//                     cgroup emptiness it can never obtain here.
 		//
-		// The admission confine scan is NOT in this list: it stays live and returns
-		// a true empty result (Server.confineScan), because the ledger's accounting
-		// pass legitimately runs and legitimately finds no scopes.
+		// (S14 removed the periodic admission confine scan entirely; there is no
+		// longer a scan seam to leave live in either mode. Emptiness is derived from
+		// the signed ledger.)
 		watchdogMode = watchdogOff
 		sliceCeilingMode = sliceCeilingOff
 		steerMode = oomSteerOff

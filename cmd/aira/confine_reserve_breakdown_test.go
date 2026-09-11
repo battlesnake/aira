@@ -42,9 +42,6 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		if strings.Contains(out, "LEDGER INCONSISTENCY") {
 			t.Fatalf("consistent ledger reported an inconsistency; stdout=%q", out)
 		}
-		if strings.Contains(out, "whose scope was observed") {
-			t.Fatalf("no vanished leases, yet the vanished line rendered; stdout=%q", out)
-		}
 	})
 
 	t.Run("singular-forms", func(t *testing.T) {
@@ -68,19 +65,8 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		}
 	})
 
-	// A vanished lease is reported as an OBSERVATION, never as a death verdict:
-	// a scope can be gone while the job's leader lives on in a sibling cgroup.
-	t.Run("vanished-leases-are-an-observation-not-a-verdict", func(t *testing.T) {
-		reserve := base
-		reserve.VanishedJobs, reserve.VanishedBytes = 2, 4<<30
-		out := render(t, reserve)
-		if !strings.Contains(out, "2 leases 4G whose scope the confine scan observed and then observed absent") {
-			t.Fatalf("stdout=%q", out)
-		}
-		if strings.Contains(strings.ToLower(out), "ghost") || strings.Contains(strings.ToLower(out), "dead") {
-			t.Fatalf("the vanished line issued a liveness verdict the daemon cannot establish; stdout=%q", out)
-		}
-	})
+	// (S14 removed the `vanished` line and its VanishedJobs/VanishedBytes wire
+	// fields with the cgroup scan that produced them.)
 
 	// The residual is signed and printed for jobs AND bytes independently. The
 	// most plausible regression (a lost `outstanding -=` with the job decrement

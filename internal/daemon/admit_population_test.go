@@ -138,7 +138,7 @@ func TestAdmitSnapshotAbsentQueueStaysAGenuineIdleZero(t *testing.T) {
 	if snapshot.outstanding != 0 || snapshot.outstandingJobs != 0 {
 		t.Fatalf("absent queue reported non-zero totals: %+v", snapshot)
 	}
-	if snapshot.scopeJobs != 0 || snapshot.reservationJobs != 0 || snapshot.vanishedJobs != 0 {
+	if snapshot.scopeJobs != 0 || snapshot.reservationJobs != 0 {
 		t.Fatalf("absent queue reported a non-zero split: %+v", snapshot)
 	}
 	if snapshot.residualJobs() != 0 || snapshot.residualBytes() != 0 {
@@ -146,28 +146,8 @@ func TestAdmitSnapshotAbsentQueueStaysAGenuineIdleZero(t *testing.T) {
 	}
 }
 
-// verifies: vanishedJobs/vanishedBytes are a SUBSET of the scope-backed
-// population, not a fourth one — the split must still sum to the totals, or the
-// residual cross-check above would cry wolf on every vanished lease.
-func TestAdmitSnapshotVanishedLeasesRemainInsideTheScopeBackedPopulation(t *testing.T) {
-	server := NewServer(Paths{})
-	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
-	live := populationTestWaiter(1, 2<<30, populationTestScopeID("live", 101))
-	live.scopeSeen = true
-	gone := populationTestWaiter(2, 4<<30, populationTestScopeID("gone", 102))
-	gone.scopeSeen, gone.scopeVanished = true, true
-	queue.waiters = []*admitWaiter{live, gone}
-	queue.outstanding, queue.outstandingJobs = 6<<30, 2
-	server.admitQueues["/slice"] = queue
-
-	snapshot := server.admitSliceSnapshot("/slice")
-	if snapshot.vanishedJobs != 1 || snapshot.vanishedBytes != 4<<30 {
-		t.Errorf("vanished = %d jobs / %d bytes, want 1 / %d", snapshot.vanishedJobs, snapshot.vanishedBytes, int64(4<<30))
-	}
-	if snapshot.scopeJobs != 2 || snapshot.scopeBytes != 6<<30 {
-		t.Errorf("scope-backed = %d jobs / %d bytes, want 2 / %d — a vanished lease is still a scope-backed lease", snapshot.scopeJobs, snapshot.scopeBytes, int64(6<<30))
-	}
-	if snapshot.residualJobs() != 0 || snapshot.residualBytes() != 0 {
-		t.Errorf("vanished leases broke the split sum: jobs=%d bytes=%d", snapshot.residualJobs(), snapshot.residualBytes())
-	}
-}
+// S14 retired TestAdmitSnapshotVanishedLeasesRemainInsideTheScopeBackedPopulation
+// with the cgroup scan: the vanishedJobs/vanishedBytes snapshot sub-population was
+// derived from the scan's scopeVanished bit, which no longer exists. The
+// scope/reservation split and the residual cross-check it rode alongside are
+// pinned by the tests above.
