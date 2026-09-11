@@ -79,8 +79,24 @@ import (
 // unresolvable one). Nothing below this layer can detect that direction: only
 // the version can. The new-daemon/old-client direction is harmless (no
 // selector, local rant). Same atomic reinstall+restart requirement as 6-8.
+//
+// ProtocolVersion 10 (was 9): the admission-counter rebuild (S5/S7). Two
+// coupled wire changes, both silent below this layer:
+//   - S5 added a `cpu` arg (integer cores) to the `admit` request — the second
+//     ledger resource. Its bump was deferred to here (admission_linux.go).
+//   - S7 froze the version-frozen re-declare frame (design §4) and switched the
+//     ledger to the signed `ceiling − Σleases` model. An OLD (v0.5 / proto-9)
+//     client's NEW admission must now be refused LOUDLY — a re-declare (the ARDR
+//     frame, sniffed BEFORE this check in server.go) is the ONLY cross-version
+//     path, so an unbumped version would let a proto-9 client's new admission
+//     negotiate against a signed-ledger daemon that no longer speaks its shape.
+//
+// The re-declare frame is deliberately NOT gated by this number: it is sniffed
+// by its magic ahead of the proto check precisely so an upgrade (OLD client ↔
+// NEW daemon) can re-anchor its leases. Same atomic reinstall+restart
+// requirement as 6-9.
 const (
-	ProtocolVersion = 9
+	ProtocolVersion = 10
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

@@ -81,7 +81,12 @@ func (result admissionResult) releaseAdmission() {
 // TestRunnerDaemonProtocolVersionMatchesTheDaemon in the external runner_test
 // package rather than derived — a bump on one side alone fails that test
 // instead of silently breaking admission negotiation (AIRA-83 item 3).
-const DaemonProtocolVersion = 9
+//
+// Bumped 9→10 in LOCKSTEP with daemon.ProtocolVersion for the admission-counter
+// rebuild (S5 `cpu` admit arg + S7 signed ledger / version-frozen re-declare
+// frame). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two
+// drift.
+const DaemonProtocolVersion = 10
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20
@@ -476,8 +481,8 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	// that formerly bounded these same workers was deleted in S6; the ledger
 	// charge is now the sole CPU bound.) S15 must REPLACE the per-test charge with its
 	// own worker accounting, not stack on it. Accounting only — no cpu.max is
-	// written. Daemon and client are rebuilt in lockstep on this branch, so the added
-	// arg needs no ProtocolVersion bump (deferred to S7).
+	// written. The S5 `cpu` arg's ProtocolVersion bump landed in S7: both
+	// DaemonProtocolVersion and daemon.ProtocolVersion are now 10, in lockstep.
 	cpuCores := DefaultConfineCPUCores
 	if req.DelegateRAM {
 		cpuCores = 0
