@@ -499,6 +499,18 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(steerDone)
 		s.runOOMSteer(steerCtx, steerMode, steerInterval, steerRuntimeDeps)
 	}()
+	// S11 restart-recovery timer (design §4 gate P1-A). At freeze-end it wakes every
+	// queue so a waiter blocked PURELY by the restart freeze re-evaluates at once; at
+	// freeze-end + unanchoredGrace it drops every lease STILL unanchored — the REAL
+	// safety, because the dump records the supervisor pid, which outlives its workers,
+	// so kill -0 alone would leak a retired worker's lease. It no-ops if no freeze was
+	// armed (a reboot/stale dump reloaded nothing). Cancelled on shutdown.
+	restartFreezeCtx, cancelRestartFreeze := context.WithCancel(ctx)
+	restartFreezeDone := make(chan struct{})
+	go func() {
+		defer close(restartFreezeDone)
+		s.runRestartFreeze(restartFreezeCtx)
+	}()
 
 	var connections sync.WaitGroup
 	stopping := make(chan struct{})
@@ -545,6 +557,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelWatchdog()
 	cancelSliceCeiling()
 	cancelOOMSteer()
+	cancelRestartFreeze()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
@@ -557,6 +570,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		<-watchdogDone
 		<-sliceCeilingDone
 		<-steerDone
+		<-restartFreezeDone
 		close(drained)
 	}()
 	timeout := s.DrainTimeout
