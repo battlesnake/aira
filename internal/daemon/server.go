@@ -72,14 +72,13 @@ type Server struct {
 	discoveryFailed map[string]struct{}
 	// stopping closes when Serve stops accepting. Watch handlers observe it
 	// directly so their terminal event drain remains distinct from peer-close.
-	stopping                chan struct{}
-	watchSlots              chan struct{}
-	watchPollInterval       time.Duration
-	admitSlots              chan struct{}
-	admitPollInterval       time.Duration
-	workerAdmitPollInterval time.Duration
-	admitBackfillGrace      time.Duration
-	admitFreezeMaxHold      time.Duration
+	stopping           chan struct{}
+	watchSlots         chan struct{}
+	watchPollInterval  time.Duration
+	admitSlots         chan struct{}
+	admitPollInterval  time.Duration
+	admitBackfillGrace time.Duration
+	admitFreezeMaxHold time.Duration
 	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
 	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
 	// space by a new admission); injectable (default 2s) so tests drive timing via the
@@ -97,9 +96,14 @@ type Server struct {
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
 
-	workerScopesMu         sync.Mutex
-	workerScopes           map[string]*workerScopeState
-	workerAdmitHeadroom    int64
+	// workerScopesMu / workerScopes are the per-outer-scope worker-id allocator
+	// (S15). Since the RAM/CPU accounting moved to the unified signed ledger, this
+	// holds only the id counter — no committed sum, no supervisor-RSS guard.
+	workerScopesMu sync.Mutex
+	workerScopes   map[string]*workerScopeState
+	// shimWorkerSeq mints synthetic ids for ci-shim worker leases (advisory, no
+	// cgroup tree to re-seed from), keying each in the same unified ledger.
+	shimWorkerSeq          atomic.Uint64
 	scopeReapGrace         time.Duration
 	staleLeaseReleaseGrace time.Duration
 
@@ -124,14 +128,6 @@ type Server struct {
 	// to fake a limit the ledger never consults, and vice versa. Nil in
 	// production, which resolves to readSliceMemoryHigh.
 	admitReadMemoryHigh func(string) (int64, string)
-	// admitReadWorkerSupervisorMemory is a SEPARATE seam from admitReadMemory
-	// above: the aggregate guard's supervisor-scope read (worker_admit.go)
-	// must tolerate an uncapped memory.max (the supervisor's scope is never
-	// individually capped by design), which admitReadMemory's default
-	// (readSliceMemory) deliberately refuses to do for the OUTER-scope
-	// ledger read's own safety precondition. Defaults to
-	// readWorkerSupervisorMemory.
-	admitReadWorkerSupervisorMemory func(string) (int64, int64, bool, string)
 	// AIRA-121. confineMode is runner.ConfineModeReal or ConfineModeShim, and
 	// shimBudget is the recorded container RAM budget the ledger admits against
 	// in shim mode. Both are resolved once, in Serve, from the durable
@@ -139,10 +135,6 @@ type Server struct {
 	// launch path in a shim-installed home yields a shim daemon.
 	confineMode string
 	shimBudget  shimBudget
-	// AIRA-123. The ci-shim per-WORKER admission ledger (worker_admit_shim.go).
-	// Distinct from shimBudget, which is the container-wide ceiling both this
-	// ledger and ordinary job admission draw against.
-	shimWorkers shimWorkerLedger
 	// shimReadMemTotal / shimReadMemAvailable are readShimMemory's host-wide
 	// /proc/meminfo seams (AIRA-121 F3). Nil in production, which resolves to
 	// the package funcs readMemTotal/readMemAvailable; a test injects a
@@ -157,15 +149,16 @@ type Server struct {
 	// depending on this host's real, ever-moving CPU counters and core count.
 	readCPUFrame func(string) runner.ConfineCPUFrame
 	readCPUCores func() int
-	// workerScopeScan / workerScopeCreate are the worker-admit ledger's two
-	// cgroupfs seams (AIRA-39). Production uses scanWorkerScopeChildren and
-	// runner.CreateWorkerScope; tests substitute fakes so the ledger's
-	// arithmetic is exercised without a real delegated cgroup.
-	workerScopeScan         func(string) (workerScopeChildren, error)
-	workerScopeCreate       func(context.Context, string, string, int64) (string, string, error)
-	workerScopeScanInterval time.Duration
-	admitNow                func() time.Time
-	admitAfter              func(time.Duration) <-chan time.Time
+	// workerScopeMaxIndex / workerScopeCreate are worker-admit's two cgroupfs seams
+	// (S15). workerScopeMaxIndex is the SLIM readdir the worker-id allocator
+	// re-seeds from (production: scanWorkerMaxIndex); workerScopeCreate makes the
+	// per-worker sub-scope after a grant (production: runner.CreateWorkerScope).
+	// Tests substitute fakes so the id allocation and grant flow run without a real
+	// delegated cgroup.
+	workerScopeMaxIndex func(string) (int, error)
+	workerScopeCreate   func(context.Context, string, string, int64) (string, string, error)
+	admitNow            func() time.Time
+	admitAfter          func(time.Duration) <-chan time.Time
 	// S13 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
 	// runRestartFreeze waits the freeze via this, and sharing admitAfter would cross-talk
 	// with a live admitConnection in a Serve-driven test. Nil → time.After.
@@ -198,10 +191,8 @@ func NewServer(paths Paths) *Server {
 		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
 		restartFreeze:                defaultRestartFreeze,
 		admitQueues:                  map[string]*sliceQueue{},
-		workerScopeScanInterval:      workerScopeScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
-		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
 		staleLeaseReleaseGrace:       defaultStaleLeaseReleaseGrace,
 		storeOpAppendTimeout:         30 * time.Second,

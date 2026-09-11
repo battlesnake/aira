@@ -136,14 +136,12 @@ func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 	paths := testPaths(t)
 	server := NewServer(paths)
 	server.deadlines.Connect = 100 * time.Millisecond
-	_ = newWorkerScopeTree().install(server)
-	// Saturated: the outer scope's own live usage consumes the whole ceiling, so
-	// the handler cannot grant and must sit in its poll loop -- which is what
-	// makes it outlive the connect budget rather than answering inside it.
-	server.admitReadMemory = admitReadMemoryFixture(
-		map[string]int64{"/outer": 2 * workerAdmitEstimatedBytesMin}, 2*workerAdmitEstimatedBytesMin)
-	server.workerAdmitHeadroom = 0
-	server.workerAdmitPollInterval = 10 * time.Millisecond
+	server.restartFreeze = 0
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
+	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 1 << 30, 0, true, "" }
+	server.SetWorkerScopeTreeForTest()
 	_, _ = startServer(t, server)
 	scope := testScope(t, paths, "one")
 
@@ -155,41 +153,37 @@ func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(testdeadline.Wait(10 * time.Second))); err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
-	// max_wait_ms deliberately exceeds deadlines.Connect several times over: the
-	// handler must still be alive, and still reading, long after the handshake
-	// budget would have expired.
+	// A blocking CLAIM that fits is granted, and the daemon then HOLDS the connection
+	// as the lease — its peer-watcher read (watchPeerEOF) must not be bounded by the
+	// handshake connect deadline. If that deadline survived into the held read, the
+	// read would fire at ~Connect and the lease would be released prematurely.
 	if err := writeFrame(conn, RequestFrame{
 		Proto: ProtocolVersion, Scope: scope,
 		Request: core.Request{Verb: "worker-admit", Args: map[string]any{
-			"job_id": "job-1", "outer_scope": "/outer",
+			"job_id": "job-1", "outer_scope": "/slice/.aira-suite",
 			"estimated_bytes": float64(workerAdmitEstimatedBytesMin),
-			"max_wait_ms":     float64(500),
 		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	var frame ResponseFrame
 	if err := readFrame(conn, &frame); err != nil {
-		t.Fatalf("worker-admit died with the handshake deadline instead of waiting out max_wait_ms: %v", err)
+		t.Fatalf("read the grant: %v", err)
 	}
-	// The elapsed LOWER bound is the actual subject: the handler answered only
-	// after outliving the connect budget several times over, which it could not
-	// have done had the handshake deadline survived into its peer-watcher read.
-	// A lower bound is also the AIRA-20-safe direction -- load makes it larger,
-	// never smaller.
-	if elapsed := time.Since(started); elapsed <= server.deadlines.Connect {
-		t.Fatalf("answered in %v, within the %v connect budget: this test proves nothing unless the handler outlives it", elapsed, server.deadlines.Connect)
-	}
-	// And the answer must be a real verdict, not an error frame that happens to
-	// arrive late. A permanently-saturated outer scope can never fit, so the
-	// handler polls until max_wait_ms elapses and reports timeout.
 	var response WorkerAdmitResponse
 	if err := json.Unmarshal(frame.Data, &response); err != nil {
 		t.Fatalf("frame=%+v: %v", frame, err)
 	}
-	if response.State != runner.WorkerAdmitStateTimeout {
-		t.Fatalf("state=%q, want %q (a permanently saturated outer scope waits out max_wait_ms)", response.State, runner.WorkerAdmitStateTimeout)
+	if response.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("state=%q, want a grant", response.State)
+	}
+	// Wait several connect budgets: the held lease must survive, proving the connect
+	// deadline did not survive into the handler's peer-watcher read. Had it, the read
+	// would have errored at ~Connect and released the lease.
+	time.Sleep(testdeadline.Wait(5 * server.deadlines.Connect))
+	if _, cpu, jobs := sliceLedger(t, server, "/slice"); jobs != 1 || cpu != runner.DefaultConfineCPUCores {
+		t.Fatalf("lease jobs=%d cpu=%d after %v (>> the %v connect budget): the handler's held read died with the handshake deadline",
+			jobs, cpu, 5*server.deadlines.Connect, server.deadlines.Connect)
 	}
 }
 

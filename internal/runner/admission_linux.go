@@ -379,14 +379,11 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// against the per-slice 2×NumCPU ceiling at admission. A --delegate-ram job declares
 	// 0 cores (spec §8): it is framework overhead and charging it a core would double-count.
 	//
-	// This bounds the CONFINE path only. It does NOT bound aitest pytest workers: those
-	// reach the daemon via worker-admit (not confine-reserve — the embedded per-test
-	// governor that issued confine-reserve was retired in AIRA-33), and evaluateWorkerAdmit
-	// charges no CPU term between S6 (which deleted the #49/#64 flock gate that used to
-	// bound them) and S15 (which rebuilds worker-admit onto the ledger). See the S6 note in
-	// worker_admit.go. Accounting only — no cpu.max is written. The S5 `cpu` arg's
-	// ProtocolVersion bump landed in S7: both DaemonProtocolVersion and daemon.ProtocolVersion
-	// are now 10, in lockstep.
+	// aitest pytest workers are bounded too, since S15: they reach the daemon via
+	// worker-admit, which now charges each worker's one core against the SAME per-slice
+	// 2×NumCPU ledger (the worker lease is an ordinary signed-ledger lease). Accounting
+	// only — no cpu.max is written. The S5 `cpu` arg's ProtocolVersion bump landed in S7:
+	// both DaemonProtocolVersion and daemon.ProtocolVersion are 10, in lockstep.
 	cpuCores := DefaultConfineCPUCores
 	if req.DelegateRAM {
 		cpuCores = 0
