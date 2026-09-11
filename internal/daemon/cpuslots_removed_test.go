@@ -66,3 +66,36 @@ func TestS6CPUSlotsGovernorFullyRemovedFromSource(t *testing.T) {
 			"but S6 must remove it entirely (CPU is governed by the admission ledger, S5): %v", offenders)
 	}
 }
+
+// verifies: S6 — the INTERIM CPU window. S6 deleted the flock governor that bounded
+// aitest pytest workers' CPU concurrency, but S5's ledger CPU charge is on the
+// `aira confine` / `confine-reserve` admission path, NOT on worker-admit:
+// evaluateWorkerAdmit charges no CPU term, and aitest workers reach the daemon via
+// worker-admit (not confine-reserve — the embedded per-test governor that issued it was
+// retired in AIRA-33). So between S6 and S15 an aitest worker carries NO CPU charge at
+// all (RAM stays bounded by the aggregate guard). This is plan-sanctioned and documented
+// in the S6 code comment + the BUILT (S6) plan record.
+//
+// This test makes that window a CHECKED fact rather than a silent hole: worker_admit.go
+// references none of the ledger's CPU symbols. S15 (which rebuilds worker-admit onto the
+// signed ledger and charges CPU there) will introduce one of them and RED this guard —
+// which is the signal to DELETE this test, the §S15.3 inversion pattern. It is NOT a
+// claim that no CPU bound is desirable; it is the honest record that there is none yet.
+func TestS6InterimWorkerAdmitCPUUnbounded(t *testing.T) {
+	data, err := os.ReadFile("worker_admit.go")
+	if err != nil {
+		t.Fatalf("read worker_admit.go: %v", err)
+	}
+	body := string(data)
+	// The ledger's CPU-governance symbols (S5). Their ABSENCE from worker_admit.go is the
+	// interim window. The S6 explanatory comment in that file deliberately avoids these
+	// literal tokens, so the guard keys on a real call/field, not prose about its own
+	// absence.
+	for _, token := range []string{"cpuOutstanding", "cpuCeiling(", "cpuFits"} {
+		if strings.Contains(body, token) {
+			t.Fatalf("worker_admit.go now references %q: worker-admit appears to charge CPU against the ledger. "+
+				"If this is S15 closing the S6->S15 interim window, DELETE this witness test (it has done its job). "+
+				"If not, the interim-window documentation in this file and worker_admit.go is now stale and must be corrected.", token)
+		}
+	}
+}

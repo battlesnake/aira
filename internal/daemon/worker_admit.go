@@ -692,14 +692,22 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
 		}, true
 	}
-	// S6: worker CPU concurrency is no longer gated here. The AIRA-64 CPU
-	// slot-governor (flock-based) that once serialised [fresh snapshot -> decide
-	// -> CreateWorkerScope] machine-wide was deleted once CPU became a per-slice
-	// ledger resource (S5): the ledger charges each `confine-reserve` per-test
-	// sub-reservation one core against the 2×NumCPU ceiling at admission, so a
-	// second CPU bound on the same workers is redundant. The RAM aggregate guard
-	// above stays serialised by this outer scope's own lock (state.release),
-	// which that governor never protected.
+	// S6: worker CPU concurrency is no longer gated here, and — until S15 — is NOT
+	// governed at all. The AIRA-64 flock CPU-slot governor that once serialised
+	// [fresh snapshot -> decide -> CreateWorkerScope] machine-wide was deleted once CPU
+	// became a per-slice ledger resource (S5). But S5's ledger CPU charge is applied on
+	// the `aira confine` / `confine-reserve` ADMISSION paths, NOT here: evaluateWorkerAdmit
+	// consults no per-slice CPU ledger term, and aitest pytest
+	// workers reach the daemon via worker-admit, NOT confine-reserve (the embedded
+	// per-test governor that issued confine-reserve was retired in AIRA-33). So between
+	// S6 and S15 an aitest worker carries NO CPU charge at all: a plain suite can run up
+	// to 2×NumCPU concurrent suites each sizing its pool at NumCPU workers, and a
+	// --delegate-ram suite (0 declared cores) is unbounded on CPU. This is the AIRA-64
+	// problem returning, for the worker-admit path only, for the duration of the rebuild
+	// — plan-sanctioned (S15 rebuilds worker-admit onto the ledger and charges CPU there;
+	// see the BUILT (S6) record + the TestS6InterimWorkerAdmitCPUUnbounded witness). The
+	// RAM aggregate guard above stays serialised by this outer scope's own lock
+	// (state.release), which that governor never protected, so RAM is still bounded.
 	seq := state.nextSeq
 	if state.maxIndex > seq {
 		// Restart reconstruction: nothing in RAM knows the ids already on the

@@ -470,19 +470,20 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "admit"
-	// S5. cpu is the second ledger resource. An ordinary confine AND each
-	// `confine-reserve` per-test sub-reservation (confine_reserve_linux.go, no
-	// DelegateRAM) declare the one-core default (design §9); the daemon charges each
-	// against the per-slice 2×NumCPU ceiling. So a running --delegate-ram suite's
-	// live per-test reservations ARE each charged one core NOW. A --delegate-ram
-	// SUITE itself reserves 0 cores (spec
-	// §8): it is framework overhead, and charging it a core on top of its per-test
-	// reservations would double-count. (The #49/#64 worker CPU-slot flock gate
-	// that formerly bounded these same workers was deleted in S6; the ledger
-	// charge is now the sole CPU bound.) S15 must REPLACE the per-test charge with its
-	// own worker accounting, not stack on it. Accounting only — no cpu.max is
-	// written. The S5 `cpu` arg's ProtocolVersion bump landed in S7: both
-	// DaemonProtocolVersion and daemon.ProtocolVersion are now 10, in lockstep.
+	// S5. cpu is the second ledger resource on the CONFINE admission path. An ordinary
+	// `aira confine` AND an `aira confine-reserve` sub-reservation (confine_reserve_linux.go,
+	// no DelegateRAM) declare the one-core default (design §9); the daemon charges each
+	// against the per-slice 2×NumCPU ceiling at admission. A --delegate-ram job declares
+	// 0 cores (spec §8): it is framework overhead and charging it a core would double-count.
+	//
+	// This bounds the CONFINE path only. It does NOT bound aitest pytest workers: those
+	// reach the daemon via worker-admit (not confine-reserve — the embedded per-test
+	// governor that issued confine-reserve was retired in AIRA-33), and evaluateWorkerAdmit
+	// charges no CPU term between S6 (which deleted the #49/#64 flock gate that used to
+	// bound them) and S15 (which rebuilds worker-admit onto the ledger). See the S6 note in
+	// worker_admit.go. Accounting only — no cpu.max is written. The S5 `cpu` arg's
+	// ProtocolVersion bump landed in S7: both DaemonProtocolVersion and daemon.ProtocolVersion
+	// are now 10, in lockstep.
 	cpuCores := DefaultConfineCPUCores
 	if req.DelegateRAM {
 		cpuCores = 0
