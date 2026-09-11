@@ -870,8 +870,13 @@ func TestSliceCeilingRealCgroupUsageBoundHarnessDetectsAViolation(t *testing.T) 
 			// uses it: a more generous reclaimable discount here would make the
 			// control easier to satisfy than production.
 			current, admitReclaimable, _, _ := ceilingBoundCharge(t, fixture.dir)
-			if available := checkedAvailable(current, published.Ceiling, admitReclaimable, 0, 0); available != 0 {
-				t.Fatalf("available=%d under a ceiling %d below the slice's own footprint %d, want admission fully closed", available, published.Ceiling, sliceAnon)
+			// S4 un-clamp: a charge above a valid ceiling yields a SIGNED negative
+			// available, not clamp-at-zero. "Fully closed" is therefore available <= 0
+			// (no positive headroom exposed); a negative figure — the ceiling minus the
+			// slice's own over-ceiling footprint — is the honest deficit and still
+			// refuses every positive reserve.
+			if available := checkedAvailable(current, published.Ceiling, admitReclaimable, 0, 0); available > 0 {
+				t.Fatalf("available=%d under a ceiling %d below the slice's own footprint %d, want admission fully closed (<=0)", available, published.Ceiling, sliceAnon)
 			}
 		})
 	}

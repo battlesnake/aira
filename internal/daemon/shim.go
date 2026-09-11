@@ -139,6 +139,16 @@ func resolveShimSlicePath(string) (string, bool, string) {
 // readShimMemory is the ledger's live reading in shim mode. The path argument is
 // the sentinel and is ignored.
 //
+// S4 (D4) note: CI (ci-shim) admission is now LEDGER-ONLY — the fit-check derives
+// availability from ceiling − Σleases and NO LONGER consults `current`
+// (ledgerAvailable, admit.go). So the "host-wide current dwarfs the budget ->
+// checkedAvailable's charge=max(current,outstanding) collapses available to 0"
+// failure the F1/F3 cases below reason about can no longer gate admission at all;
+// the `current` this function returns is retained for honesty/telemetry, and
+// `maximum` (the container budget = the ceiling) is the value the ledger uses.
+// The cases are kept as written because the reasoning still documents WHY each
+// reading is the honest one to report.
+//
 // Preference order, and why (requirement 4's documented choice):
 //
 //  1. The container's OWN cgroup, whenever install recorded one whose

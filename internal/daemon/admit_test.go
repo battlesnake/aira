@@ -852,12 +852,20 @@ func TestAdmitValidationAndCaps(t *testing.T) {
 	}
 }
 
-func TestCheckedAvailableClampsWithoutOverflow(t *testing.T) {
+// TestCheckedAvailableSignedAndOverflowSafe pins the S4 un-clamp: a charge that
+// exceeds a VALID ceiling yields a SIGNED negative available (so the next new
+// admission waits until a release recovers it), NOT a clamp-at-zero. Invalid
+// inputs and a degenerate ceiling (headroom >= maximum) still report 0 — those
+// are an unusable reading, not a legitimately over-subscribed ledger — and huge
+// values do not overflow.
+func TestCheckedAvailableSignedAndOverflowSafe(t *testing.T) {
 	for _, test := range []struct {
 		current, maximum, outstanding, headroom, want int64
 	}{
 		{0, 100, 25, 0, 75}, {20, 100, 25, 10, 65}, {80, 100, 25, 10, 10},
-		{100, 100, 0, 0, 0}, {101, 100, 0, 0, 0},
+		{100, 100, 0, 0, 0},
+		// charge (101) past the valid ceiling (100) is SIGNED −1, not clamped 0.
+		{101, 100, 0, 0, -1},
 		{0, math.MaxInt64, math.MaxInt64, 0, 0}, {-1, math.MaxInt64, 0, 0, 0},
 	} {
 		if got := checkedAvailable(test.current, test.maximum, 0, test.outstanding, test.headroom); got != test.want {

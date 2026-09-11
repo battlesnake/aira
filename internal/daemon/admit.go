@@ -1772,12 +1772,36 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	readMemory := s.memoryReader()
 	_, maximum, _, ok, reason := readMemory(path)
 	if !ok {
-		// The daemon answered; only the slice's live usage was unreadable. Report
-		// that honestly (NOT "daemon-unavailable") so the operator-facing basis is
-		// truthful. A non-delegate scope is left uncapped here (state != admitted);
-		// a delegate-ram scope gets no daemon scope_ceiling and so falls back to the
-		// finite client-side default (AIRA-15) — never uncapped.
-		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason, Reserve: request.reserve, Basis: "fallback:slice-unreadable"})
+		// S4 (D4 / Invariant 6): FAIL CLOSED. With no readable slice/container
+		// budget the ceiling cannot be established, so a NEW admission must be
+		// REFUSED, never granted — matching evaluateAdmitQueue's own !ok branch,
+		// which leaves waiters queued and grants nothing. The pre-S4 code returned a
+		// grant-shaped `unevaluated` here, which the runner treated as a real grant
+		// and LAUNCHED THE JOB UNCAPPED (admission_linux.go: "an ordinary job
+		// proceeds on it uncapped-but-launched") — the exact over-admit this slice
+		// closes.
+		//
+		// INTERIM GAP (recorded, not fixed here — the S13 client-flock-fallback
+		// delete owns it): a refusal without --require-admission routes through the
+		// runner's fail() to the flock fallback, which still launches ungoverned;
+		// --require-admission already fails closed (it refuses any non-admitted
+		// state). Post-S13 fail() becomes reconnect + re-request, which is where the
+		// E_DAEMON_UNAVAILABLE code below lands honestly: the daemon is up but cannot
+		// serve an admission decision for this slice.
+		if reason == "" {
+			reason = "slice memory unreadable"
+		}
+		if request.exclusive {
+			// Preserve v0.5's clean exclusive refusal: an unreadable slice is exactly
+			// "an empty slice could not be established", and routing an exclusive
+			// request through the ordinary refuse code would drop it into the runner's
+			// flock fallback and launch it BOTH unaccounted AND non-exclusive. Same
+			// code the ci-shim exclusive refusal (above) and the drain-abort use.
+			s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
+				CodeAdmitExclusiveUnestablished+": the slice memory is unreadable, so an empty slice could not be established for an exclusive request ("+reason+")")
+			return
+		}
+		s.writeAdmitError(conn, CodeUnavailable, CodeUnavailable+": "+reason)
 		return
 	}
 	jobs := s.admitOutstandingJobs(path)
@@ -2297,7 +2321,17 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// same file: that one decides the TERMINAL E_ADMIT_TOO_LARGE and sizes a
 	// job's own hard scope cap, so a job too large for the throttled ceiling must
 	// WAIT here rather than be refused there.
-	effectiveMaximum := s.admitEffectiveMaximum(queue.path, maximum)
+	// S4 (D4): the AIRA-103/106 pressure ceiling is MemAvailable-aware and part of
+	// the DEV system-aware gate ONLY. CI (ci-shim / advisory) is ledger-only —
+	// nothing runs outside the container, so the container memory.max IS the
+	// ceiling; there is no slice pressure to throttle against and the sampler does
+	// not run. Mode-gating it here (rather than relying on the shim snapshot being
+	// inert) is the explicit seam the "dev skips the system-RAM check" mutation
+	// flips.
+	effectiveMaximum := maximum
+	if !s.shimMode() {
+		effectiveMaximum = s.admitEffectiveMaximum(queue.path, maximum)
+	}
 	frozen := false
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
@@ -2335,7 +2369,18 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
 		headroom := s.admitSliceHeadroom(jobs)
-		available := checkedAvailable(current, effectiveMaximum, reclaimable, addClamp(queue.outstanding, queue.adopted), headroom)
+		// S4 (D4): the LEDGER check (ceiling − Σleases, signed) applies in BOTH
+		// modes; the physical current/reclaimable floor is DEV-only. CI drops it
+		// (ledger-only) because nothing runs outside the container; DEV keeps it,
+		// so a slice already over its declared reserve is gated on the real bytes,
+		// alongside the MemAvailable-aware effectiveMaximum above.
+		outstanding := addClamp(queue.outstanding, queue.adopted)
+		var available int64
+		if s.shimMode() {
+			available = ledgerAvailable(effectiveMaximum, outstanding, headroom)
+		} else {
+			available = checkedAvailable(current, effectiveMaximum, reclaimable, outstanding, headroom)
+		}
 		if frozen {
 			waiter.waited = true
 			// AIRA-149. `frozen` is only ever set by a waiter AHEAD in this same
@@ -2460,6 +2505,19 @@ func subtractJobCount(value, subtract int) int {
 	return value - subtract
 }
 
+// checkedAvailable is the DEV (real-cgroup) physical-floor availability:
+// ceiling − max(effectiveCurrent, Σleases). The charge is the LARGER of the
+// slice's own physical use (memory.current less the AIRA-21 reclaimable discount)
+// and the declared ledger, so a slice already over its declared reserve is gated
+// on the real bytes.
+//
+// S4 (D4): the result is SIGNED. A charge that exceeds a VALID ceiling — the
+// ledger driven past the ceiling during the restart re-declare window (§4), or a
+// physical over-use — yields a NEGATIVE available, which makes the next NEW
+// admission wait until a release recovers it, rather than a clamp-at-zero that
+// hides the deficit. Only INVALID inputs and a degenerate ceiling (headroom >=
+// maximum) report 0: those are an unusable reading, not a legitimately
+// over-subscribed ledger.
 func checkedAvailable(current, maximum, reclaimable, outstanding, headroom int64) int64 {
 	if current < 0 || maximum < 0 || outstanding < 0 || headroom < 0 || maximum <= headroom {
 		return 0
@@ -2473,10 +2531,20 @@ func checkedAvailable(current, maximum, reclaimable, outstanding, headroom int64
 	if effectiveCurrent > charge {
 		charge = effectiveCurrent
 	}
-	if charge >= ceiling {
-		return 0
-	}
+	// SIGNED: ceiling and charge are both non-negative, so ceiling − charge cannot
+	// overflow, and a charge past the ceiling is a legitimate negative available.
 	return ceiling - charge
+}
+
+// ledgerAvailable is the CI (ci-shim / advisory) mode availability: the signed
+// ledger ceiling − Σleases, with NO physical floor. In ci-shim mode nothing runs
+// outside the container, so declared reserves + the container memory.max (the
+// ceiling) are the whole truth (D4, design §7) — a large host-wide memory.current
+// says nothing about this container and must not gate it. It reuses
+// checkedAvailable with a zero physical reading, so the ceiling/headroom guards
+// and the signed result are identical to the dev path's ledger term.
+func ledgerAvailable(maximum, outstanding, headroom int64) int64 {
+	return checkedAvailable(0, maximum, 0, outstanding, headroom)
 }
 
 func (s *Server) timeoutAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
