@@ -317,8 +317,8 @@ type admitWaiter struct {
 // error, and the peak-RSS estimate sizes the declared reserve for a known
 // command. queue.mu must be held.
 //
-// Every ledger site goes through this -- the grant's add, the release's
-// subtract, and admitSliceSnapshotFor's sums -- so
+// Every ledger site goes through this -- rederiveLedgerLocked's sum after each
+// grant and release, and admitSliceSnapshotFor's sums -- so
 // "outstanding == sum of ledgerCharge over granted && accounted waiters" is one
 // statement about one function, not an agreement between call sites that must
 // be maintained by hand.
@@ -327,6 +327,37 @@ func (w *admitWaiter) ledgerCharge() int64 {
 		return 0
 	}
 	return w.reserve
+}
+
+// rederiveLedgerLocked recomputes the queue's ledger from its waiters: the sum
+// of ledgerCharge() over every granted && accounted waiter, and the count of
+// them. queue.mu must be held.
+//
+// It is the ONE writer of queue.outstanding / queue.outstandingJobs, called
+// after every grant and every release. Those fields are therefore a re-derived
+// CACHE of the waiter set -- `available = ceiling - Σleases` derived from the
+// leases themselves (design §2) -- never a running total mutated in two places.
+// A grant that flips a waiter to granted && accounted, or a release that removes
+// it (and marks it admitReleased), changes exactly one term of this sum, so the
+// derived figure equals what the old `+=` / `-=` counter produced for any real
+// waiter set; what changes is only that nothing can now set the scalar out of
+// step with the waiters it is supposed to describe.
+//
+// The scope-id keying the design names IS the waiter set: enqueueAdmitInternal
+// refuses a duplicate scope id (see leaseByScopeIDLocked), so at most one live
+// waiter carries any scope id. A separate per-queue map keyed by scope id would
+// be a second copy of that fact to keep in sync -- the double-mutated state §2
+// exists to remove -- and scope-less `confine-reserve` waiters (scopeID == "")
+// have no key at all, so the walk over waiters is the honest ledger here.
+func rederiveLedgerLocked(queue *sliceQueue) (outstanding int64, jobs int) {
+	for _, waiter := range queue.waiters {
+		if waiter == nil || waiter.state != admitGranted || !waiter.accounted {
+			continue
+		}
+		outstanding += waiter.ledgerCharge()
+		jobs++
+	}
+	return outstanding, jobs
 }
 
 // exclusiveActive reports whether this waiter currently asserts exclusivity.
@@ -1209,21 +1240,25 @@ type admitReservationRow struct {
 	heldMS    int64
 }
 
-// residualJobs and residualBytes cross-check the DERIVED split (a walk of
-// queue.waiters) against the INCREMENTAL counters. They are equal by
-// construction: a waiter is `admitGranted && accounted` if and only if it was
-// counted, and releaseAdmitWaiter discharges under exactly that guard. A
-// non-zero residual is therefore a real lost or double decrement, not noise.
+// residualJobs and residualBytes cross-check the re-derived ledger cache
+// (queue.outstanding / outstandingJobs, recomputed by rederiveLedgerLocked at
+// the last grant or release) against an INDEPENDENT walk of queue.waiters taken
+// in this snapshot (scopeJobs+reservationJobs, scopeBytes+reservationBytes).
+// They are equal by construction: both count `admitGranted && accounted`
+// waiters and sum the same ledgerCharge(), so a non-zero residual is a real
+// defect — a grant or release that changed the waiter set without re-deriving,
+// or a second hand-maintained mutation site added beside the one accessor — not
+// noise.
 //
 // adoptedJobs/adopted appear on both sides of the reported total and cancel, so
 // these are stated over the connection-held ledger alone.
 //
 // The two are reported INDEPENDENTLY and SIGNED. The single most plausible
-// regression in releaseAdmitWaiter — dropping `outstanding -= waiter.reserve`
-// while keeping `outstandingJobs--` — is byte-only, and a job-only residual
-// would report a perfectly consistent ledger while the slice silently filled.
-// A negative residual (more discharged than was ever charged) is just as real a
-// defect as a positive one and must never be floored away.
+// regression — a release path that removes a waiter but skips the re-derive, so
+// outstanding keeps a discharged lease's bytes — is byte-only, and a job-only
+// residual would report a perfectly consistent ledger while the slice silently
+// filled. A negative residual (more discharged than was ever charged) is just
+// as real a defect as a positive one and must never be floored away.
 //
 // What they do NOT detect: a stuck waiter that is consistently present in BOTH
 // accountings. That is what vanishedJobs is for, for the population where an
@@ -1958,6 +1993,28 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	}
 }
 
+// leaseByScopeIDLocked returns the one live waiter currently anchoring scopeID
+// on this queue, or nil. queue.mu must be held.
+//
+// It is the lookup half of the idempotent SET-by-scope-id the signed ledger is
+// keyed on (design §2): because enqueueAdmitInternal refuses a duplicate scope
+// id, at most one non-released waiter can carry any scope id, so this is a point
+// read of that scope's lease. Today enqueueAdmitInternal uses it to REFUSE a
+// duplicate; S8 wires the live re-anchoring SET onto this same lookup. An empty
+// scopeID keys nothing (scope-less `confine-reserve` waiters) and matches no
+// lease.
+func leaseByScopeIDLocked(queue *sliceQueue, scopeID string) *admitWaiter {
+	if scopeID == "" {
+		return nil
+	}
+	for _, existing := range queue.waiters {
+		if existing != nil && existing.state != admitReleased && existing.scopeID == scopeID {
+			return existing
+		}
+	}
+	return nil
+}
+
 func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWaiter, string, error) {
 	return s.enqueueAdmitInternal(path, reserve, "", 0, false, admitRequest{})
 }
@@ -1995,10 +2052,13 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeAdmitTooLarge, fmt.Errorf("%s: required reserve exceeds cap minus headroom", CodeAdmitTooLarge)
 	}
 	if request.scopeID != "" {
-		for _, existing := range queue.waiters {
-			if existing != nil && existing.state != admitReleased && existing.scopeID == request.scopeID {
-				return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
-			}
+		if leaseByScopeIDLocked(queue, request.scopeID) != nil {
+			// The idempotent SET-by-scope-id the signed ledger is built on
+			// (design §2) begins here as its lookup half: a hit is this scope's
+			// existing lease. Today that is a duplicate and is refused (behaviour
+			// preserved); S8 turns the same hit into a re-anchoring SET of that
+			// lease's reserve on the new connection instead of a refusal.
+			return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
 		}
 	}
 	// AIRA-101. At most ONE exclusive waiter per slice, refused here under
@@ -2444,11 +2504,13 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		waiter.state = admitGranted
 		waiter.grantedAt = s.admitNowTime()
 		waiter.accounted = true
-		// ledgerCharge() is the waiter's declared reserve, held for the whole
-		// lifetime of the lease; the grant add and the release subtract are its
-		// only two writers, both through the one accessor under this lock.
-		queue.outstanding += waiter.ledgerCharge()
-		queue.outstandingJobs++
+		// The ledger is derived, not incremented: this waiter is now granted &&
+		// accounted, so re-deriving over the waiter set folds in its
+		// ledgerCharge() (its declared reserve, held for the lease's whole
+		// lifetime). Done here, after accounted is set and before the next queued
+		// waiter is evaluated, so a later grant in this same pass reads this one at
+		// the fit-check above -- exactly as the old `outstanding +=` did.
+		queue.outstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 		// AIRA-114. Keep the aggregate current WITHIN a pass and between scans.
 		// The derive above runs at most once a second; without this increment a
 		// burst of grants in one pass would each be measured against the same
@@ -2591,14 +2653,6 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 	if waiter.state == admitReleased {
 		return false
 	}
-	if waiter.state == admitGranted && waiter.accounted {
-		// Discharge the declared reserve. The add in the grant loop and this
-		// subtraction are the only two writers, and both go through ledgerCharge()
-		// under the same admitGranted && accounted condition, which is what makes
-		// "outstanding returns to exactly zero" true rather than approximate.
-		queue.outstanding -= waiter.ledgerCharge()
-		queue.outstandingJobs--
-	}
 	for index, candidate := range queue.waiters {
 		if candidate == waiter {
 			copy(queue.waiters[index:], queue.waiters[index+1:])
@@ -2608,6 +2662,14 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 		}
 	}
 	waiter.state = admitReleased
+	// Discharge is a re-derive, not a subtraction: this waiter is now removed
+	// from queue.waiters AND marked admitReleased, so re-deriving over the
+	// survivors drops its ledgerCharge() exactly when it drops any granted &&
+	// accounted lease -- which is what makes "outstanding returns to exactly zero"
+	// true rather than approximate. The grant and this release are the ledger's
+	// only two mutation points, both re-deriving through the one accessor under
+	// this lock.
+	queue.outstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 	return true
 }
 
