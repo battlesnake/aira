@@ -118,9 +118,7 @@ type staleLeaseCandidate struct {
 //   - A granted waiter whose scope directory does not exist yet at all
 //     (genuinely still mid-launch, before scope creation) is correctly never a
 //     candidate for release by this pass: ReapScopeIfEmpty fails to open it and
-//     reports reaped=false, and AIRA-68's vanished branch requires a scope that
-//     was OBSERVED to exist first, which such a waiter never had. Its only
-//     current release path if abandoned before
+//     reports reaped=false. Its only release path if abandoned before
 //     ever creating a scope is the connection-close path. That window is
 //     bounded by how long scope creation itself can plausibly take -- normally
 //     a fraction of a second (one socket frame, an Mkdir, a handful of
@@ -212,31 +210,24 @@ func (s *Server) staleGrantedLeases(grace time.Duration) []staleLeaseCandidate {
 
 // releaseStaleGrantedLeasesPass is AIRA-49's backstop: a granted lease
 // that never transitions out of "granted" -- for whatever reason, known
-// or not (see this plan's "root-cause honesty" note; the ordinary
-// connection-close release path is expected to handle a plain SIGKILL of
-// the launcher, so a lease reaching this backstop may indicate a rarer
-// path than originally assumed) -- would otherwise be permanently stuck:
-// ConfineKill's own empty-scope path returns a "retry" error that can
-// never resolve, and the ordinary orphan reaper explicitly treats any
-// granted lease as proof of life and skips it. For each lease past its
-// TTL (per staleGrantedLeases -- grantedAt-based, immune to queueing
-// delay; see defaultStaleLeaseReleaseGrace's doc comment for why this is
-// a reclaim POLICY, not a death proof), this establishes ONE of two positive
-// proofs and reclaims the ledger lease only on that -- never on the age signal
-// alone:
+// or not -- would otherwise be permanently stuck: ConfineKill's own
+// empty-scope path returns a "retry" error that can never resolve, and the
+// ordinary orphan reaper explicitly treats any granted lease as proof of life
+// and skips it. For each lease past its TTL (per staleGrantedLeases --
+// grantedAt-based, immune to queueing delay; see defaultStaleLeaseReleaseGrace's
+// doc comment for why this is a reclaim POLICY, not a death proof), this reclaims
+// the ledger lease ONLY on the same kernel-enforced physical reap the ordinary
+// orphan reaper trusts (runner.ReapScopeIfEmpty) -- never on the age signal alone.
 //
-//  1. the same kernel-enforced physical reap the ordinary orphan reaper trusts
-//     (runner.ReapScopeIfEmpty), or
-//  2. AIRA-68's seen -> gone TRANSITION, observed by the evaluator's own confine
-//     scan (admitWaiter.scopeSeen/scopeVanished).
-//
-// The second exists because ReapScopeIfEmpty returns ENOENT for a scope
-// directory that is ALREADY GONE, which the old code treated as "skip" -- so a
-// lease whose scope had disappeared could never be reclaimed by this pass at
-// all, on any pass, forever. That is exactly AIRA-68's stated failure shape.
-// See releaseStaleLeaseCandidate for why the vanished branch must make no
-// filesystem call, and admitWaiter for why the transition is admissible where
-// plain absence was not.
+// S14 note: the live release model is socket-EOF compare-and-release (design §3)
+// — a supervisor's death EOFs its connection and drops the lease directly, and
+// the operator `confine --kill` is the only other release path. This physical-
+// reap pass remains only for the residual case where the connection is somehow
+// still open on the daemon side while the scope is physically empty. S14 deleted
+// the periodic cgroup scan and, with it, AIRA-68's seen->gone vanished branch
+// (which reclaimed a lease whose scope DIRECTORY had already disappeared); a
+// supervisor whose scope vanished is now caught by the socket-EOF release, and
+// ReapScopeIfEmpty by design reclaims only a scope that still exists and is empty.
 func (s *Server) releaseStaleGrantedLeasesPass(ctx context.Context) {
 	grace := s.staleLeaseGrace()
 	var released []string
@@ -291,47 +282,6 @@ func staleLeaseActionableLocked(now time.Time, queue *sliceQueue, waiter *admitW
 	return !waiter.grantedAt.IsZero() && now.Sub(waiter.grantedAt) >= grace
 }
 
-// dischargeVanishedStaleLease validates and discharges in ONE critical section,
-// and is the whole vanished branch: it makes no filesystem call at all, because
-// there is nothing to reap and a scope-id-keyed destructive rmdir here could
-// remove a same-id replacement's newly created, still-empty scope.
-//
-// TWO conditions beyond the shared validation, both fail-closed:
-//
-//   - waiter.scopeVanished, re-read HERE rather than trusted from the candidate
-//     snapshot. A scope observed absent one pass ago may have been observed
-//     present since, and the evaluator clears the bit when it is.
-//   - !queue.adoptedScanFailed. A vanished bit is an observation, and an
-//     observation that can no longer be refreshed is not a current fact. While
-//     the scan is failing the daemon cannot establish whether the scope is still
-//     absent, so it must not reclaim on a stale sighting — "a check that cannot
-//     establish its result reports unevaluated, never a fake pass". Both plan
-//     reviewers found this independently; without it one persistent cgroupfs
-//     failure freezes a stale absence into a permanent licence to reclaim.
-//
-// Doing this in one critical section (rather than validate, unlock, discharge)
-// is what closes the race both reviewers found: between an unlocked validation
-// and the discharge, the evaluator can re-observe the scope and clear the bit,
-// after which the sweep would discharge a lease whose proof had just evaporated.
-func (s *Server) dischargeVanishedStaleLease(candidate staleLeaseCandidate, grace time.Duration) bool {
-	queue, waiter := candidate.queue, candidate.waiter
-	if queue == nil || waiter == nil {
-		return false
-	}
-	queue.mu.Lock()
-	if !staleLeaseActionableLocked(s.admitNowTime(), queue, waiter, candidate.scopeID, grace) ||
-		!waiter.scopeVanished || queue.adoptedScanFailed {
-		queue.mu.Unlock()
-		return false
-	}
-	released := releaseAdmitWaiterLocked(queue, waiter)
-	queue.mu.Unlock()
-	if released {
-		s.afterAdmitRelease(queue)
-	}
-	return released
-}
-
 // dischargeReapedStaleLease re-validates and discharges atomically AFTER a
 // successful physical reap. The reap syscall itself cannot be made under
 // queue.mu, so the validation is done twice: once to decide whether to touch the
@@ -367,23 +317,14 @@ func (s *Server) staleLeaseStillActionable(candidate staleLeaseCandidate, grace 
 	return staleLeaseActionableLocked(s.admitNowTime(), queue, waiter, candidate.scopeID, grace)
 }
 
-// releaseStaleLeaseCandidate reclaims ONE stale lease, on either of two proofs,
-// and reports which. It returns reclaimed=false whenever it could not establish
-// one — never a reclaim on the age signal alone, and never a reported reclaim
-// that a concurrent ordinary release actually performed.
-//
-// A candidate that is vanished but whose scan has since failed falls through to
-// the reap branch, where ReapScopeIfEmpty returns ENOENT for the absent
-// directory and nothing is reclaimed. That is the intended fail-closed outcome,
-// not an accident of ordering.
+// releaseStaleLeaseCandidate reclaims ONE stale lease on the single remaining
+// proof — a kernel-enforced physical reap of an empty scope — and reports it. It
+// returns reclaimed=false whenever it could not establish that proof: never a
+// reclaim on the age signal alone, and never a reported reclaim that a concurrent
+// ordinary release actually performed. (S14 removed the scan-derived vanished
+// branch; see releaseStaleGrantedLeasesPass.)
 func (s *Server) releaseStaleLeaseCandidate(candidate staleLeaseCandidate) (proof string, reclaimed bool) {
 	grace := s.staleLeaseGrace()
-	if s.dischargeVanishedStaleLease(candidate, grace) {
-		// Past tense, and only about the SCAN's observations. "is now gone" would
-		// be a present-tense claim about state last read up to one scan ago, and
-		// the daemon cannot establish it at the moment it prints it.
-		return "scope observed by the confine scan and then observed absent", true
-	}
 	if !s.staleLeaseStillActionable(candidate, grace) {
 		return "", false
 	}

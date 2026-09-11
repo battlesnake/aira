@@ -94,9 +94,7 @@ func startExclusiveTestDaemon(t *testing.T) (*Server, string, string) {
 	server.admitPollInterval = 20 * time.Millisecond
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
-	server.admitConfineScanInterval = 10 * time.Millisecond
 	server.admitResolveSlice = func(string) (string, bool, string) { return slicePath, true, "" }
-	server.admitConfineScan = noConfinesScan
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 0, 1 << 40, 0, true, ""
 	}
@@ -224,7 +222,6 @@ func TestADaemonRestartReleasesExclusivityRatherThanWedgingTheSlice(t *testing.T
 	second.admitSliceHeadroomBase = 0
 	second.admitSliceHeadroomSupervisor = 0
 	second.admitResolveSlice = func(string) (string, bool, string) { return slicePath, true, "" }
-	second.admitConfineScan = noConfinesScan
 	second.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 0, 1 << 40, 0, true, ""
 	}

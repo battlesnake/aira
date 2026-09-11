@@ -70,8 +70,6 @@ func TestS4SignedLedgerNegativeWaitsThenRecoversOnRelease(t *testing.T) {
 			now := time.Unix(700_000, 0)
 			server := NewServer(Paths{})
 			server.admitNow = func() time.Time { return now }
-			server.admitConfineScanInterval = time.Nanosecond
-			server.admitConfineScan = noConfinesScan
 			server.admitSliceHeadroomBase = 0
 			server.admitSliceHeadroomSupervisor = 0
 			// current=0 in both modes: the DEV physical floor is idle, so the ONLY
@@ -120,8 +118,6 @@ func TestS4CIModeLedgerOnlyIgnoresPhysicalOveruse(t *testing.T) {
 	now := time.Unix(710_000, 0)
 	server := NewServer(Paths{})
 	server.admitNow = func() time.Time { return now }
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = noConfinesScan
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.SetConfineShimModeForTest(maximum, runner.ShimBudgetSourceDeclared, "")
@@ -150,8 +146,6 @@ func TestS4DevModeFloorRefusesOnPhysicalOveruse(t *testing.T) {
 	now := time.Unix(715_000, 0)
 	server := NewServer(Paths{}) // dev mode (real-cgroup): no SetConfineShimModeForTest
 	server.admitNow = func() time.Time { return now }
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = noConfinesScan
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
@@ -179,8 +173,6 @@ func TestS4DevModeRefusesWhenSystemAvailableRAMLow(t *testing.T) {
 	now := time.Unix(720_000, 0)
 	server := NewServer(Paths{})
 	server.admitNow = func() time.Time { return now }
-	server.admitConfineScanInterval = time.Nanosecond
-	server.admitConfineScan = noConfinesScan
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	// Slice usage is low (current=0) and the ledger is empty, so the ONLY refusal
@@ -228,7 +220,6 @@ func TestS4AdmitConnectionFailsClosedWhenSliceUnreadable(t *testing.T) {
 			server.stopping = make(chan struct{})
 			server.admitPollInterval = time.Hour
 			server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
-			server.admitConfineScan = noConfinesScan
 			server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 				return 0, 0, 0, false, "slice-unreadable"
 			}

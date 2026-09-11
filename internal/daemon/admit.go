@@ -57,11 +57,6 @@ const (
 	// machine while it drains, so a day-long drain is not a wait, it is an outage.
 	// Enforced by REFUSAL, never silent substitution (the AIRA-58 rule).
 	admitExclusiveWaitCeilingDefault = 30 * time.Minute
-
-	// admitExclusiveEstablishGrace is how long the confine scan may be failing
-	// before a draining exclusive waiter is ABORTED rather than left holding the
-	// slice. See sliceQueue.scanFailingSince.
-	admitExclusiveEstablishGrace = 30 * time.Second
 )
 
 // admitExclusiveWaitCeiling is the effective exclusive ceiling. It can never
@@ -103,14 +98,6 @@ const (
 	admitExclusiveDraining = "draining"
 	admitExclusiveHeld     = "held"
 )
-
-// admitOutcomeExclusiveUnestablished is the waiter outcome the unestablished-
-// emptiness abort records. admitConnection branches on it so the abort reaches
-// the client as its own code rather than as E_ADMIT_SATURATED — reporting "the
-// slice was busy" for what is actually "the daemon could not read the slice"
-// would be a fabricated diagnosis of exactly the kind the fail-closed rule exists
-// to prevent.
-const admitOutcomeExclusiveUnestablished = "exclusive-unestablished"
 
 // exclusiveStateOf names which half of the exclusive lifecycle a waiter is in.
 // Empty for a waiter that is not asserting exclusivity at all, so callers can
@@ -182,56 +169,6 @@ type admitWaiter struct {
 	// bounded together; the renderer's escaping is a second, narrower bound for
 	// the terminal.
 	signature string
-
-	// AIRA-68. scopeSeen/scopeVanished record a TRANSITION observed by the
-	// evaluator's own <=1s confine scan — the same authority liveScopes already
-	// trusts — and are meaningful only for a scope-backed waiter (scopeID != "").
-	// Both are written ONLY inside evaluateAdmitQueue's scan-success block, under
-	// queue.mu, and never on a failed scan.
-	//
-	// The pair exists because plain ABSENCE is not a safe reclaim signal and the
-	// transition is. The pre-existing empty-scope reclaim is safe against a
-	// launcher stalled before scope creation only because it is DESTRUCTIVE: it
-	// removes the directory, so the launcher's next cgroupfs write fails
-	// ENOENT/ENODEV and the launch aborts cleanly. Reclaiming on absence alone
-	// has no such fence — the stalled launcher would lose its lease, then create
-	// its scope and run entirely UNCHARGED, which is the #67 aggregate-OOM class.
-	// A waiter that never created a scope never gets scopeSeen, so it is never a
-	// candidate, and its treatment is unchanged.
-	//
-	// scopeVanished is deliberately CLEARED when the scope is observed again: a
-	// scan is a fresh fact, not a latch, and a stale "vanished" must never
-	// outlive the observation that produced it.
-	//
-	// Honest limits, all pre-existing and all in the safe direction:
-	//   - A scope created and removed entirely between two scans never sets
-	//     scopeSeen, so a lease stuck that way stays stuck (the empty-reap branch
-	//     has the identical blind spot: it needs a directory to reap).
-	//   - A scope id accepted by confineScopeIDPattern but rejected by the
-	//     scanner's own parseConfineScopeID is omitted from every scan, so
-	//     scopeSeen never becomes true. Never a false reclaim.
-	//   - "Seen then gone" proves the scope held no processes at removal time. It
-	//     does NOT prove the job is dead: a leader can migrate into a sibling
-	//     cgroup and keep running (internal/runner/descendant_escape_linux_test.go).
-	//     That is exactly the strength of the empty-reap branch's own proof, and
-	//     why the reported counter is named `vanished`, never `ghost`.
-	//   - Strictly, the scan observes a PATHNAME, and cgroup v2 permits renaming a
-	//     cgroup within its parent — so an absent scope id means "no cgroup by
-	//     that name", not unconditionally "that cgroup was removed". A renamed,
-	//     still-populated scope would therefore be read as vanished and its lease
-	//     reclaimed after the TTL while the job runs on, still contained. Both
-	//     plan reviewers raised this independently and it is recorded, not fixed:
-	//     nothing in AIRA renames a scope, closing it needs per-scope inode
-	//     identity threaded through the scan (real machinery for an
-	//     externally-injected scenario, which architectural-simplicity says to
-	//     document rather than build), and the consequence is bounded the same way
-	//     the migrated-leader case is — the release is LEDGER-ONLY, and a renamed
-	//     cgroup is still inside the slice, so its memory is still charged through
-	//     max(current - reclaimable, sum of reserves). Requiring a currently
-	//     succeeding scan (see dischargeVanishedStaleLease) narrows the window but
-	//     does not close it.
-	scopeSeen     bool
-	scopeVanished bool
 
 	// AIRA-101. Exclusivity is a DERIVED property of this waiter, never a
 	// standalone flag on the queue or the server. That is the whole crash-safety
@@ -468,8 +405,8 @@ func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
 // sliceProvablyEmpty reports whether the slice holds no other admitted job:
 // Σleases == 0, i.e. no granted && accounted waiter. queue.mu must be held.
 //
-// S14 rewired this from a cgroup-scan reading (the deleted liveScopes /
-// liveScopesKnown) to the signed ledger. Emptiness is now exactly "the daemon
+// S14 rewired this from a cgroup-scan reading (the deleted subtree-population
+// counters) to the signed ledger. Emptiness is now exactly "the daemon
 // holds no lease for this slice", derived from the same connection-held ledger
 // `available = ceiling − Σleases` is (design §2/§3). outstandingJobs is
 // rederiveLedgerLocked's count of granted && accounted waiters, so this equals
@@ -718,28 +655,18 @@ type sliceQueue struct {
 	outstanding     int64
 	cpuOutstanding  int64
 	outstandingJobs int
-	// adoptedAt/adoptedScanFailed throttle and fail-track the periodic confine
-	// scan. S12 deleted the AIRA-74 reserve-adoption term the scan used to feed
-	// (`adopted`/`adoptedJobs`/`adoptedScopes`), so the "adopted" prefix is now
-	// vestigial: these two remain only as the scan's once-per-interval throttle
-	// and its fail-closed bit, which still drive liveScopes (the exclusive gate)
-	// and the reaper's scopeSeen/scopeVanished transition. The scan itself and
-	// these fields are removed together in S14.
-	adoptedAt         time.Time
-	adoptedScanFailed bool
-	seq               int64
-	kick              chan struct{}
-	stop              chan struct{}
-	stopOnce          sync.Once
+	seq             int64
+	kick            chan struct{}
+	stop            chan struct{}
+	stopOnce        sync.Once
 	// stopped is closed by runEvaluator as it exits, so a caller can establish
 	// that the goroutine is GONE rather than merely asked to stop.
 	//
 	// It exists for the tests, and the reason is a real invariant rather than
-	// convenience: evaluateAdmitQueue reads the scan throttle BEFORE taking
-	// queue.mu, which is sound only under the single-writer property documented
-	// there — in production this queue's own goroutine is the sole caller. A test
-	// that drove passes directly while that goroutine was still live would break
-	// the invariant and race, so it must be able to retire it and know when.
+	// convenience: in production this queue's own goroutine is the sole caller of
+	// evaluateAdmitQueue (the single-writer property its state relies on). A test
+	// that drove passes directly while that goroutine was still live would race
+	// that writer, so it must be able to retire the goroutine and know when.
 	stopped chan struct{}
 	poll    time.Duration
 	server  *Server
@@ -773,38 +700,6 @@ type sliceQueue struct {
 	freezeArmedAt   time.Time
 	freezeHolderSeq int64            // diagnostics only; never affects timing
 	freezeLogged    admitFreezePhase // last phase logged, so logs are transitions
-
-	// AIRA-101. liveScopes is the EMPTINESS reading, deliberately separate from
-	// the RESERVE ledger (outstanding/outstandingJobs). The reserve ledger counts
-	// only connection-held leases, so a running scope with no lease this daemon
-	// knows of — a pre-re-declare post-restart survivor, say — contributes no job
-	// to it: correct for reserve accounting and wrong here, because such a scope
-	// is still running. Reusing it would let an exclusive job be told it is alone
-	// while a delegate-ram suite runs beside it.
-	//
-	// liveScopesKnown is the fail-closed half: it is true only when the scan that
-	// produced liveScopes SUCCEEDED. Granting exclusivity on an unestablished
-	// emptiness would state "you are alone" on a reading the daemon does not have,
-	// which is the fabricated pass this codebase forbids everywhere else.
-	liveScopes      int
-	liveScopesKnown bool
-
-	// scanFailingSince anchors how long the confine scan has been failing, in the
-	// same derive-from-one-anchor shape as freezeArmedAt. It exists so a drain can
-	// ABORT rather than stall the whole shared slice: with the fail-closed rule
-	// above, a persistently unreadable slice would otherwise block the drain head
-	// (cannot establish emptiness) AND every other waiter (blocked by the drain)
-	// for the full wait ceiling — a machine-wide outage caused by a diagnostic
-	// failure.
-	//
-	// Armed on the FIRST failure while zero and never renewed on later failures;
-	// cleared on any success. Arming only "after a success" would never fire in
-	// this rule's own primary case — a slice unreadable from the queue's very
-	// first pass, which is the likeliest persistent failure, since a queue is
-	// created on demand and its first scan is its first contact with the path.
-	// Never renewing is the freezeArmedAt lesson: a renewed anchor postpones its
-	// own deadline forever.
-	scanFailingSince time.Time
 }
 
 // admitFreezePhaseAt derives the duty-cycle phase from the anchor instant. Held
@@ -1094,12 +989,6 @@ type admitSnapshot struct {
 	reservationJobs  int
 	reservationBytes int64
 
-	// vanishedJobs/vanishedBytes are a SUBSET of scopeJobs/scopeBytes, never a
-	// fourth population — the split must keep summing to the totals or the
-	// residual below would cry wolf on every vanished lease.
-	vanishedJobs  int
-	vanishedBytes int64
-
 	// AIRA-101. The slice's exclusive state, derived in the SAME locked walk as
 	// everything above so `confine --list` and a blocked launcher's progress line
 	// can never render an exclusive holder alongside counts from another instant.
@@ -1231,8 +1120,9 @@ type admitReservationRow struct {
 // as real a defect as a positive one and must never be floored away.
 //
 // What they do NOT detect: a stuck waiter that is consistently present in BOTH
-// accountings. That is what vanishedJobs is for, for the population where an
-// answer is physically possible.
+// accountings — a lease held while its job has gone. S14 deleted the cgroup scan
+// that used to surface that population as `vanished`; the socket-EOF release
+// (design §3) and the physical-reap stale-lease backstop are the reclaim paths now.
 func (snapshot admitSnapshot) residualJobs() int {
 	return snapshot.outstandingJobs - (snapshot.scopeJobs + snapshot.reservationJobs)
 }
@@ -1320,9 +1210,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// These three sum ledgerCharge(), the same quantity the ledger itself
 		// carries. They must move with queue.outstanding or residualBytes() -- a
 		// real lost/double-decrement detector surfaced by `confine --list` --
-		// would report a fabricated ledger defect. vanishedBytes is a SUBSET of
-		// scopeBytes and is NOT part of the residual equation, so it needs its own
-		// direct assertion in the tests rather than riding along on that check.
+		// would report a fabricated ledger defect.
 		if waiter.scopeID == "" {
 			snapshot.reservationJobs++
 			// Goes through ledgerCharge() rather than reading waiter.reserve
@@ -1355,10 +1243,6 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// a waiter that contributes to scopeBytes contributes a row and one that
 		// does not contributes neither, and the two can never drift apart.
 		snapshot.scopeReserves[waiter.scopeID] = waiter.ledgerCharge()
-		if waiter.scopeVanished {
-			snapshot.vanishedJobs++
-			snapshot.vanishedBytes = addClamp(snapshot.vanishedBytes, waiter.ledgerCharge())
-		}
 	}
 	if s.admitFreezeMaxHold > 0 {
 		snapshot.phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
@@ -1812,16 +1696,13 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	// AIRA-121 gate condition C6. --exclusive is refused HERE, before the request
 	// is ever queued, and that placement is the whole mechanism.
 	//
-	// In shim mode the confine scan honestly reports an empty slice (there are no
-	// cgroup scopes), and sliceProvablyEmpty would therefore grant exclusivity to
-	// an UNCONFINED job on the strength of an emptiness that says nothing about
-	// what else is running in this container. The plan proposed forcing
-	// liveScopesKnown false instead; that is not buildable through the scan seam --
-	// the only way a scan leaves liveness unknown is a Verdict=unevaluated result,
-	// which the evaluator converts to a scan ERROR, logs as "confine reserve scan
-	// failed", and uses to arm the exclusive abort anchor. Refusing up front makes
-	// liveScopesKnown's value irrelevant, because sliceProvablyEmpty's only reader
-	// is the exclusive drain gate.
+	// In shim mode the ledger holds no lease for an unconfined job, so
+	// sliceProvablyEmpty (Σleases == 0) would read the slice as empty and grant
+	// exclusivity on the strength of an emptiness that says nothing about what else
+	// is running in this container — there are no cgroup scopes here at all.
+	// Refusing --exclusive up front is the whole mechanism: a benchmark demanding
+	// solitude must run on a real-slice install where the ledger actually accounts
+	// for its neighbours.
 	//
 	// CodeAdmitExclusiveUnestablished is reused rather than a new code minted: its
 	// established meaning -- "an empty slice could not be established" -- is
@@ -1953,17 +1834,6 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 
 	queue.mu.Lock()
 	if waiter.state == admitRejected {
-		// AIRA-101. Branch on the OUTCOME rather than hardcoding saturation for
-		// every rejected waiter. An unestablished-emptiness abort is not a busy
-		// slice — it is a slice the daemon could not read — and reporting it as
-		// E_ADMIT_SATURATED would be a fabricated diagnosis of exactly the kind the
-		// fail-closed emptiness rule exists to prevent.
-		if waiter.outcome == admitOutcomeExclusiveUnestablished {
-			queue.mu.Unlock()
-			s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
-				CodeAdmitExclusiveUnestablished+": the confine scan is failing, so an empty slice could not be established for an exclusive request")
-			return
-		}
 		// The EXCLUSIVE requester's own expiry. Its state is already admitRejected
 		// by the time the gate is re-derived, so it no longer matches the drain
 		// predicate and would otherwise be reported as plain saturation — "the slice
@@ -2345,122 +2215,15 @@ func (q *sliceQueue) signal() {
 }
 
 func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
-	// Production has exactly one caller: this queue's runEvaluator goroutine.
-	// That single-writer property permits the scan throttle read (adoptedAt)
-	// before queue.mu; other goroutines read the scan-derived state (liveScopes,
-	// the scopeVanished bits, adoptedAt/adoptedScanFailed) only while holding
-	// queue.mu.
+	// Production has exactly one caller: this queue's runEvaluator goroutine, the
+	// single writer of queue state; other goroutines read it only under queue.mu.
+	// S14 deleted the periodic cgroup scan that used to run here — emptiness is now
+	// derived from the signed ledger (sliceProvablyEmpty), so a pass touches only
+	// queue state.
 	now := s.admitNowTime()
-	refreshInterval := s.admitConfineScanInterval
-	if refreshInterval <= 0 {
-		refreshInterval = admitConfineScanIntervalDefault
-	}
-	refreshAdopted := queue.adoptedAt.IsZero() || now.Sub(queue.adoptedAt) >= refreshInterval
-	var scanResult runner.ConfineListResult
-	var scanErr error
-	if refreshAdopted {
-		scan := s.admitConfineScan
-		if scan == nil {
-			scan = func(path string) (runner.ConfineListResult, error) {
-				return runner.ListConfines(context.Background(), path, nil)
-			}
-		}
-		scanResult, scanErr = scan(queue.path)
-		if scanErr == nil && scanResult.Verdict == "unevaluated" {
-			reason := strings.TrimSpace(scanResult.Reason)
-			if reason == "" {
-				reason = "confine scan unevaluated"
-			}
-			scanErr = errors.New(reason)
-		}
-	}
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if refreshAdopted {
-		// adoptedAt is the last scan attempt, successful or not, so a failing
-		// filesystem does not turn every queue kick into another scan.
-		queue.adoptedAt = now
-		if scanErr != nil {
-			if !queue.adoptedScanFailed {
-				log.Printf("aira daemon: confine reserve scan failed: %v", scanErr)
-			}
-			queue.adoptedScanFailed = true
-			// AIRA-101. liveScopes is only meaningful alongside a successful scan;
-			// clearing the KNOWN bit is what makes the exclusive gate fail closed
-			// rather than reading a stale emptiness as current fact.
-			queue.liveScopesKnown = false
-			// Arm the abort anchor on the FIRST failure while it is zero, and never
-			// renew it on later failures. Arming only after a prior success would
-			// never fire in this rule's own primary case — a slice unreadable from
-			// the queue's very first pass — and renewing would let the anchor
-			// postpone its own deadline forever (the freezeArmedAt lesson).
-			if queue.scanFailingSince.IsZero() {
-				queue.scanFailingSince = now
-			}
-		} else {
-			queue.scanFailingSince = time.Time{}
-			// AIRA-68. listConfines enumerates EVERY .aira-CONFINE-* directory
-			// under the slice, irrespective of population or cap, so scan
-			// membership is an authoritative presence test — and this block runs
-			// only when the scan SUCCEEDED, so a failed scan writes no bit at all.
-			present := make(map[string]runner.ConfineRecord, len(scanResult.Scopes))
-			for _, record := range scanResult.Scopes {
-				present[record.ScopeID] = record
-			}
-			// The join direction here is load-bearing: this walks WAITERS and looks
-			// records up, never the reverse, because a VANISHED scope has no record
-			// to iterate — only its waiter still carries the id, so the seen->gone
-			// transition can be detected only from the waiter side. The scan ran
-			// lock-free before queue.mu was taken, so its snapshot may name a scope
-			// whose waiter has since been released; that waiter is already out of
-			// queue.waiters (releaseAdmitWaiterLocked removes it under this same
-			// lock), so its stale record simply matches nothing.
-			for _, waiter := range queue.waiters {
-				if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
-					continue
-				}
-				// The seen -> gone TRANSITION, recorded on the waiter. See the
-				// scopeSeen/scopeVanished comment on admitWaiter for why the
-				// transition, and not plain absence, is what the stale-lease sweep
-				// is allowed to reclaim on.
-				if _, exists := present[waiter.scopeID]; exists {
-					waiter.scopeSeen, waiter.scopeVanished = true, false
-					continue
-				}
-				if waiter.scopeSeen {
-					waiter.scopeVanished = true
-				}
-			}
-			// AIRA-101. The EMPTINESS reading, computed in the same successful scan.
-			//
-			// Liveness is SUBTREE-aware. Leaf cgroup.procs is not usable here:
-			// BootstrapAitestSupervisor drains EVERY pid out of an aitest outer scope
-			// into <outer>/.aira-supervisor, so a running suite's outer scope reads
-			// leaf-empty. Before a daemon restart its connection-held lease still
-			// keeps outstandingJobs >= 1; after a restart S11's reload re-seeds it
-			// as a granted lease (keeping outstandingJobs >= 1), so a leaf-only
-			// reading would still declare the slice empty and hand a benchmark a
-			// fabricated "you are alone" while the suite ran on.
-			liveScopes := 0
-			for _, record := range scanResult.Scopes {
-				// Unevaluated is NOT empty. A scope whose population could not be read
-				// counts as live, so an unreadable scope can only ever delay an
-				// exclusive grant, never fake one.
-				if record.SubtreePopulated == nil || *record.SubtreePopulated {
-					liveScopes++
-				}
-			}
-			queue.liveScopes = liveScopes
-			queue.liveScopesKnown = true
-			// S12 deleted the AIRA-74 reserve-adoption sum that used to run here;
-			// S11's dump -> reload -> re-declare is the post-restart reserve guard
-			// now, so the scan no longer reconstructs a parallel `adopted` charge.
-			// The scan still runs for liveScopes (above) and scopeVanished (the loop
-			// over waiters above); S14 removes the scan and these fields entirely.
-			queue.adoptedScanFailed = false
-		}
-	}
 	readMemory := s.memoryReader()
 	current, maximum, reclaimable, ok, _ := readMemory(queue.path)
 	if !ok {
@@ -2478,8 +2241,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// restart a phase — a blip must not hand anyone a fresh exclusive window.
 	maxHold := s.admitFreezeMaxHold
 	// Derived, not stored. Uses pass-start `now`, the same instant the grace check
-	// below uses, so hold and yield shift symmetrically if an adopted-confine scan
-	// delays the pass.
+	// below uses, so hold and yield shift symmetrically if anything delays the pass.
 	phase := admitFreezePhaseAt(queue.freezeArmedAt, now, maxHold)
 	if maxHold > 0 && phase == admitFreezeIdle && !queue.freezeArmedAt.IsZero() {
 		// A completed cycle must YIELD AT LEAST ONE EVALUATION before re-arming.
@@ -2488,34 +2250,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// would let the queue go hold -> idle -> re-armed in a single pass and
 		// backfill nothing at all — freezing forever while looking well-behaved.
 		// That happens whenever maxHold approaches the poll interval (any positive
-		// duration is accepted) or a slow adopted-confine scan delays a pass past
-		// a whole cycle. Clearing the anchor and treating THIS pass as a yield
+		// duration is accepted) or anything else delays a pass past a whole cycle.
+		// Clearing the anchor and treating THIS pass as a yield
 		// makes the guarantee "at least one backfilling pass per cycle", which is
 		// what actually admits waiters, rather than merely "some wall time spent
 		// nominally yielding".
 		queue.freezeArmedAt = time.Time{}
 		phase = admitFreezeYield
 	}
-	// AIRA-101. Abort a drain the daemon cannot establish emptiness for, BEFORE
-	// the grant loop, so the drain lifts in the same pass rather than one later.
-	// Without this the fail-closed emptiness rule would stall the whole shared
-	// slice for the full ceiling on a persistently unreadable slice: the drain
-	// head cannot be granted, and every other waiter is blocked by the drain.
-	//
-	// The abort takes the identical path as timeoutAdmitWaiter — state becomes
-	// admitRejected, grantedCh closes, and the handler's deferred release removes
-	// the waiter — so it leaks nothing, and exclusiveActive() stops matching the
-	// instant the state changes, which is what lifts the drain.
-	if gate := exclusiveGateLocked(queue); gate.draining != nil && !queue.scanFailingSince.IsZero() &&
-		now.Sub(queue.scanFailingSince) >= admitExclusiveEstablishGrace {
-		waiter := gate.draining
-		waiter.state = admitRejected
-		waiter.outcome = admitOutcomeExclusiveUnestablished
-		waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
-		close(waiter.grantedCh)
-		log.Printf("aira daemon: exclusive admission aborted on %s: confine scan failing for %s, cannot establish an empty slice (scope=%s)",
-			queue.path, now.Sub(queue.scanFailingSince).Round(time.Second), waiter.scopeID)
-	}
+	// S14: the drain head no longer needs an abort path. Emptiness is ledger-
+	// derived and always readable under queue.mu, so a drain converges as leases
+	// release (sliceProvablyEmpty) and is otherwise ended by the waiter's own
+	// max_wait or connection close — there is no "unreadable slice" case left to
+	// stall it.
 	gate := exclusiveGateLocked(queue)
 	// AIRA-103. The one place the pressure throttle actually gates admission.
 	// Hoisted out of the waiter loop: it is a per-pass fact, and a pure leaf-lock
@@ -2678,7 +2425,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			}
 			waiter.noteGrantableLocked(available)
 			queuedAhead++
-			// now is pass-start time, so a slow adopted-confine scan can defer this freeze by its duration.
+			// now is pass-start time, so anything delaying the pass defers this freeze by its duration.
 			if s.admitBackfillGrace <= 0 || now.Sub(waiter.enqueued) >= s.admitBackfillGrace {
 				switch {
 				case maxHold <= 0:
@@ -2869,12 +2616,13 @@ func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWait
 // captured in a critical section separate from the SET that set it (the reconnect-race
 // lost-lease bug this avoids by construction).
 //
-// This is the ONLY release path the final design keeps: every lease is released by its
-// current-anchor connection's EOF (S15's worker-lease EOF reuses THIS variant). The
-// unconditional releaseAdmitWaiterLocked is retained for the periodic cgroup-scan
-// stale-lease sweep (dischargeVanishedStaleLease) and the operator/exclusive/test
-// reclaim paths — all of which S14 removes; a socket-EOF release must NOT route through
-// it, or the anchor gate is bypassed.
+// This is the primary release path: every lease is released by its current-anchor
+// connection's EOF (S15's worker-lease EOF reuses THIS variant). The unconditional
+// releaseAdmitWaiterLocked is retained for the remaining reclaim paths that are NOT
+// keyed on a releasing connection — the operator `confine --kill`, the exclusive
+// unwedge, the physical-reap stale-lease backstop (S14 deleted the scan-derived
+// vanished branch), and the tests. A socket-EOF release must NOT route through the
+// unconditional form, or the anchor gate is bypassed.
 //
 // The caller runs afterAdmitRelease once it has dropped queue.mu, and only when this
 // returned true.
@@ -2899,11 +2647,11 @@ func releaseAdmitWaiterLockedAnchored(queue *sliceQueue, waiter *admitWaiter, co
 // already done.
 //
 // AIRA-68 split this out of releaseAdmitWaiter so the stale-lease sweep can make
-// its final validation and its discharge ONE critical section. Validating under
-// the lock, dropping it, and then discharging leaves a window in which the
-// evaluator re-observes the scope and clears scopeVanished — after which the
-// sweep would still discharge a lease whose reclaim proof had just evaporated.
-// Both plan reviewers found that window independently.
+// its final validation and its discharge ONE critical section: validating under
+// the lock, dropping it, and then discharging would leave a window in which the
+// facts the reclaim proof rests on change under the sweep. The physical-reap
+// backstop (the only stale-lease reclaim path left after S14 deleted the scan)
+// still relies on that single-critical-section discharge.
 //
 // The caller must run afterAdmitRelease once it has dropped queue.mu, and only
 // when this returned true.

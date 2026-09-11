@@ -3410,16 +3410,6 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 					unlisted, confinePlural(unlisted, "reservation", "reservations"))
 			}
 		}
-		if result.SliceReserve.VanishedJobs > 0 {
-			// An observation, never a verdict, and stated in the PAST TENSE about
-			// what the scan saw. A scope can be absent while the job's leader lives
-			// on, having migrated into a sibling cgroup; and the newest sighting
-			// here is up to one scan old, so "is now gone" would assert present
-			// state the daemon cannot establish at the moment it prints it.
-			_, _ = fmt.Fprintf(stdout, "  %d %s %s whose scope the confine scan observed and then observed absent; reclaimed at the stale-lease TTL\n",
-				result.SliceReserve.VanishedJobs, confinePlural(result.SliceReserve.VanishedJobs, "lease", "leases"),
-				formatReserveBytes(result.SliceReserve.VanishedBytes))
-		}
 		// AIRA-103. WHY the ceiling is what it is. Printed only when the subsystem
 		// is running (CeilingMode == "" means off), and never claiming anything it
 		// cannot establish: an unevaluated ceiling prints its reason, not a number,

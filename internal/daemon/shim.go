@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -242,25 +241,6 @@ func (s *Server) readShimMemory(string) (int64, int64, int64, bool, string) {
 		current = 0
 	}
 	return current, budget.Bytes, 0, true, ""
-}
-
-// confineScan is the daemon's ONE confine-scan entry point. In shim mode it
-// returns an EMPTY BUT SUCCESSFUL result, which is the true reading and not a
-// suppressed failure: there are no cgroup scopes, so zero adopted reserve and
-// zero adopted jobs is what is actually there.
-//
-// The emptiness would ordinarily let sliceProvablyEmpty grant --exclusive on
-// fabricated grounds -- an UNCONFINED job told it was running alone. That is
-// closed at the other end (admitConnection refuses --exclusive outright in shim
-// mode, before the request is ever queued), which is why this can honestly
-// report success instead of forcing a scan FAILURE it would then have to
-// pretend was real: a failure here would log "confine reserve scan failed" every
-// second and arm the exclusive abort anchor against a slice that is fine.
-func (s *Server) confineScan(path string) (runner.ConfineListResult, error) {
-	if s.shimMode() {
-		return runner.ConfineListResult{Verdict: "ok", Scopes: []runner.ConfineRecord{}}, nil
-	}
-	return runner.ListConfines(context.Background(), path, nil)
 }
 
 // resolveDaemonConfineMode decides THIS daemon process's mode.

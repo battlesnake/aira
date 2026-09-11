@@ -36,11 +36,9 @@ func saturatedServer(t *testing.T) *Server {
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour // passes are driven explicitly below
 	server.admitBackfillGrace = 0
-	server.admitConfineScanInterval = time.Nanosecond
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
-	server.admitConfineScan = noConfinesScan
 	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 	return server
 }

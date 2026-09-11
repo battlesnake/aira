@@ -253,8 +253,6 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// Sorted and capped OUTSIDE the queue lock — the snapshot already
 				// copied the values out under it.
 				Reservations:  confineReservationRows(snapshot.reservations),
-				VanishedJobs:  snapshot.vanishedJobs,
-				VanishedBytes: snapshot.vanishedBytes,
 				ResidualJobs:  snapshot.residualJobs(),
 				ResidualBytes: snapshot.residualBytes(),
 				// AIRA-103. Absent (all zero/empty) when the subsystem is off, so

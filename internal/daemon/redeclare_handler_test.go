@@ -34,7 +34,6 @@ func reDeclareTestServer() *Server {
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 0, 0, 0, false, "no-memory (a re-declare skips the ceiling)"
 	}
-	server.admitConfineScan = noConfinesScan
 	server.peerCredential = func(net.Conn) (int, int, error) { return os.Geteuid(), os.Getpid(), nil }
 	return server
 }

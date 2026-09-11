@@ -579,14 +579,15 @@ func TestAnExclusiveWaiterStillFacesOrdinaryRAMAdmission(t *testing.T) {
 	requireStillQueued(t, queue, exclusive, "an exclusive waiter too large for its own slice")
 }
 
-// Plan item: the AIRA-49/68 stale-lease sweep must not reclaim a held exclusive
-// whose scope is genuinely populated, and MUST reclaim one whose scope has
-// vanished — releasing the slice rather than wedging it.
+// Plan item: the AIRA-49 stale-lease sweep must not reclaim a held exclusive on
+// the age signal alone — reclaiming a live holder silently ends a benchmark's
+// exclusivity. The sweep is exclusivity-agnostic by design; this pins that it
+// stays so.
 //
-// The sweep is exclusivity-agnostic by design; this pins that it stays so in
-// both directions, because getting it wrong either way is severe: reclaiming a
-// live holder silently ends a benchmark's exclusivity, while failing to reclaim
-// a vanished one leaves the slice held with nothing running.
+// S14 note: the sweep's only reclaim proof is now a physical reap of an empty
+// scope (the scan-derived vanished proof is gone). Here no scope exists on disk,
+// so ReapScopeIfEmpty cannot reap and the hold must survive; the vanished-proof
+// half of this test was retired with the scan.
 func TestTheStaleLeaseSweepRespectsAHeldExclusiveLease(t *testing.T) {
 	server, _ := exclusiveTestServer(t)
 	server.staleLeaseReleaseGrace = time.Nanosecond
@@ -597,25 +598,13 @@ func TestTheStaleLeaseSweepRespectsAHeldExclusiveLease(t *testing.T) {
 	evaluate(t, server, queue)
 	requireGranted(t, queue, holder, "the exclusive holder")
 
-	// No scope on disk at all, and no vanished observation: NEITHER reclaim proof
-	// is available, so the hold must survive. (Labelled honestly — this is the
-	// absent-scope direction, not a populated one; what it establishes is the
-	// load-bearing property that the sweep never reclaims on the age signal
-	// alone, which is what would otherwise silently end a live benchmark.)
+	// No scope on disk at all: no reclaim proof is available, so the hold must
+	// survive. The load-bearing property is that the sweep never reclaims on the
+	// age signal alone, which is what would otherwise silently end a live benchmark.
 	server.releaseStaleGrantedLeasesPass(context.Background())
 	requireGranted(t, queue, holder, "a held exclusive with no reclaim proof available")
 	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != admitExclusiveHeld {
 		t.Fatalf("the sweep ended a live benchmark's exclusivity: state=%q", state)
-	}
-
-	// Now the scope is observed and then observed GONE — the vanished proof.
-	queue.mu.Lock()
-	holder.scopeSeen, holder.scopeVanished = true, true
-	queue.adoptedScanFailed = false
-	queue.mu.Unlock()
-	server.releaseStaleGrantedLeasesPass(context.Background())
-	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != "" {
-		t.Fatalf("a vanished exclusive holder must release the slice, got state=%q", state)
 	}
 }
 

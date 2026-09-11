@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,10 +99,11 @@ func TestShimLedgerQueuesASecondJobUntilTheFirstReleases(t *testing.T) {
 
 // verifies: AIRA-121 gate condition C6
 //
-// --exclusive is REFUSED before the request is queued, and — the half the gate
-// condition specifically calls for — WITHOUT the confine scan having to fail:
-// no "confine reserve scan failed" log line, no armed abort anchor.
-func TestShimRefusesExclusiveWithoutFailingTheConfineScan(t *testing.T) {
+// --exclusive is REFUSED before the request is queued. (Pre-S14 this also
+// asserted the refusal did not need the confine scan to fail; S14 deleted the
+// scan entirely, so the refusal is up front by construction — emptiness is now
+// ledger-derived and shim mode holds no lease for an unconfined job.)
+func TestShimRefusesExclusiveUpFront(t *testing.T) {
 	server := shimTestServer(t, 1<<30)
 	serverConn, clientConn := net.Pipe()
 	go func() {
@@ -126,27 +126,6 @@ func TestShimRefusesExclusiveWithoutFailingTheConfineScan(t *testing.T) {
 	if !strings.Contains(frame.Error, "ci-shim") {
 		t.Fatalf("refusal %q does not say why exclusivity cannot be established here", frame.Error)
 	}
-
-	// The scan path must be untouched by the refusal: run one evaluator pass and
-	// confirm it SUCCEEDED, leaving no scan-failure state behind. An
-	// implementation that forced the scan to report unevaluated in order to keep
-	// sliceProvablyEmpty false would set adoptedScanFailed and arm the anchor.
-	queue, _ := enqueueShimAdmit(t, server, 10)
-	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
-	for time.Now().Before(deadline) {
-		queue.mu.Lock()
-		settled := !queue.adoptedAt.IsZero()
-		failed, anchored := queue.adoptedScanFailed, !queue.scanFailingSince.IsZero()
-		queue.mu.Unlock()
-		if settled {
-			if failed || anchored {
-				t.Fatalf("the ci-shim confine scan reported a failure (failed=%v anchor-armed=%v); it must report an honest EMPTY SUCCESS instead", failed, anchored)
-			}
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("the evaluator never ran a scan pass")
 }
 
 // AIRA-121 gate condition C1's test lived here and asserted that shim-mode
@@ -497,22 +476,7 @@ func TestShimBudgetEnvironmentOverrideIsValidated(t *testing.T) {
 
 // verifies: AIRA-121 requirement 3
 //
-// Real mode is untouched by every seam change above: with no record and no
-// environment, the resolvers are the production real-path ones.
-func TestRealModeResolversAreUnchanged(t *testing.T) {
-	server := NewServer(Paths{})
-	if server.shimMode() {
-		t.Fatal("a freshly constructed server is in shim mode")
-	}
-	var scanned atomic.Bool
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		scanned.Store(true)
-		return runner.ConfineListResult{Verdict: "ok"}, nil
-	}
-	if _, err := server.admitConfineScan("/slice"); err != nil {
-		t.Fatal(err)
-	}
-	if !scanned.Load() {
-		t.Fatal("a test-injected scan seam was bypassed")
-	}
-}
+// (Pre-S14 this asserted the admission confine-scan seam was the production
+// real-path one in real mode. S14 deleted that seam entirely; the remaining
+// real-mode resolvers — memory reader, slice resolver — are exercised by the
+// mode-gate and admission tests.)

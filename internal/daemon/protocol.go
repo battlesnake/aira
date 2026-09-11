@@ -139,21 +139,18 @@ const (
 	// unaccounted but also NOT exclusive, while its operator believed otherwise.
 	CodeAdmitExclusiveActive = "E_ADMIT_EXCLUSIVE_ACTIVE"
 
-	// CodeAdmitExclusiveUnestablished aborts a draining exclusive waiter when the
-	// daemon cannot establish that the slice is empty — the confine scan has been
-	// failing for longer than the establishment grace (AIRA-101).
+	// CodeAdmitExclusiveUnestablished refuses an --exclusive request UP FRONT when
+	// the daemon cannot establish that the slice is empty (AIRA-101). After S14 it
+	// is raised in exactly two places, both before the request is queued: ci-shim
+	// mode (no cgroup scopes exist, so an empty slice cannot be asserted for an
+	// unconfined job) and writeAdmitFailClosed (an unresolvable slice or unreadable
+	// budget — Invariant 6). S14 removed the drain-abort that used to raise it after
+	// a persistently failing confine scan, along with the scan itself.
 	//
 	// It is a U_ code because it is an UNEVALUATED verdict, not a failure of the
 	// request: the daemon is not saying the slice is busy, it is saying it cannot
-	// read the slice. Reporting it as E_ADMIT_SATURATED would be a fabricated
-	// diagnosis, which is why admitConnection branches on the waiter outcome
-	// rather than hardcoding saturation for every rejected waiter.
-	//
-	// Aborting rather than waiting is deliberate: with the fail-closed emptiness
-	// rule, a persistently unreadable slice would otherwise block the drain head
-	// AND every waiter behind it for the full ceiling — a machine-wide stall
-	// caused by a diagnostic failure. The benchmark fails loudly; the machine
-	// keeps working.
+	// establish solitude. Reporting it as E_ADMIT_SATURATED would be a fabricated
+	// diagnosis.
 	CodeAdmitExclusiveUnestablished = "U_ADMIT_EXCLUSIVE_UNESTABLISHED"
 )
 

@@ -30,7 +30,6 @@ func workerExclusiveServer(t *testing.T, slicePath string) *Server {
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return slicePath, true, "" }
-	server.admitConfineScan = noConfinesScan
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 0, 1 << 40, 0, true, ""
 	}

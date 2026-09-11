@@ -33,8 +33,6 @@ func TestSingleCeilingRefusesWhenSumReserveExceedsCeiling(t *testing.T) {
 		now := time.Unix(500_000, 0)
 		server := NewServer(Paths{})
 		server.admitNow = func() time.Time { return now }
-		server.admitConfineScanInterval = time.Nanosecond
-		server.admitConfineScan = noConfinesScan
 		// No headroom and a tiny physical current+reclaimable, so `available`
 		// reduces to the declared term `ceiling − Σreserve`: this pins the
 		// single-ceiling bound, not the physical floor (S4) or headroom.
@@ -101,8 +99,6 @@ func TestDelegateScopesAdmitOnDeclaredReserveNotContainmentCap(t *testing.T) {
 		now := time.Unix(600_000, 0)
 		server := NewServer(Paths{})
 		server.admitNow = func() time.Time { return now }
-		server.admitConfineScanInterval = time.Nanosecond
-		server.admitConfineScan = noConfinesScan
 		server.admitSliceHeadroomBase = 0
 		server.admitSliceHeadroomSupervisor = 0
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
