@@ -1104,6 +1104,15 @@ type admitSnapshot struct {
 	phase           string
 	present         bool
 
+	// S11 (design §4 / AIRA-220 honesty). restartFrozen is whether the restart
+	// new-admission freeze is active at the snapshot instant; unanchoredLeases counts
+	// granted leases reloaded from the dump but not yet re-declared. Both taken in the
+	// same locked, single-clock walk as `present`, so the GrantedEstablished honesty bit
+	// can read FALSE while the granted total is still settling (survivors may re-declare
+	// and unanchored leases may be dropped) without a second, possibly-inconsistent read.
+	restartFrozen    bool
+	unanchoredLeases int
+
 	// AIRA-24. One waiter's own place in the queue, answered only when a
 	// caller named its own scope id. queuePosition is 1-based and counts ONLY
 	// queued waiters, in enqueue-sequence (evaluation) order; queuedAheadBytes
@@ -1350,6 +1359,8 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	// would drift across a long waiter list, so two rows could report an ordering
 	// the queue never had.
 	now := s.admitNowTime()
+	// S11. The freeze state at this same instant — part of the GrantedEstablished bit.
+	snapshot.restartFrozen = s.restartFrozenAt(now)
 	for _, waiter := range queue.waiters {
 		if waiter == nil {
 			continue
@@ -1380,6 +1391,14 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// classifying on the wrong fact.
 		if waiter.state != admitGranted || !waiter.accounted {
 			continue
+		}
+		// S11. A reloaded lease not yet re-declared still holds its RAM/CPU here, but
+		// the granted total is not yet trustworthy: this lease may be dropped at
+		// end-of-freeze+grace, or refreshed by a re-declare. Count them so
+		// GrantedEstablished reads false while any remains (a reloaded lease always
+		// carries a scope id, so this is always the scope-backed population below).
+		if waiter.unanchored {
+			snapshot.unanchoredLeases++
 		}
 		// These three sum ledgerCharge(), the same quantity the ledger itself
 		// carries. They must move with queue.outstanding or residualBytes() -- a
