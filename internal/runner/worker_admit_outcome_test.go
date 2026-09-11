@@ -152,6 +152,83 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 	}
 }
 
+// verifies: S16 — a non-blocking probe's SNAPSHOT carries the ledger's current
+// headroom (available_bytes / available_cpu) to the aitest supervisor, and ONLY a
+// snapshot does. This is the wire half of the S15→S16 pool-growth handoff: the
+// supervisor sizes pool growth from these figures instead of a speculative grant
+// that S15 removed. The presence rule is load-bearing — reason=snapshot gates the
+// figures, and a genuine 0 is rendered so the supervisor tells "no room" (present,
+// 0) apart from "this daemon does not speak snapshots" (absent).
+func TestWorkerAdmitOutcomeLineCarriesProbeSnapshotHeadroom(t *testing.T) {
+	// A denied snapshot renders BOTH figures, verbatim, and round-trips.
+	for _, headroom := range []struct {
+		name               string
+		bytes, cpu         int64
+		wantBytes, wantCPU string
+	}{
+		{"positive headroom", 400 << 20, 3, "419430400", "3"},
+		{"no room renders as explicit zero", 0, 0, "0", "0"},
+		{"negative excursion survives verbatim", -1 << 20, -2, "-1048576", "-2"},
+	} {
+		t.Run(headroom.name, func(t *testing.T) {
+			line, err := WorkerAdmitOutcomeLine(WorkerAdmitOutcome{
+				State: WorkerAdmitStateDenied, Class: WorkerAdmitClassContended,
+				Reason: WorkerAdmitReasonSnapshot, AvailableBytes: headroom.bytes, AvailableCPU: headroom.cpu,
+			}, nil)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			fields, err := ParseWorkerAdmitOutcomeLine(line)
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			if fields["available_bytes"] != headroom.wantBytes || fields["available_cpu"] != headroom.wantCPU {
+				t.Fatalf("headroom lost: available_bytes=%q available_cpu=%q, want %q/%q from %q",
+					fields["available_bytes"], fields["available_cpu"], headroom.wantBytes, headroom.wantCPU, line)
+			}
+		})
+	}
+
+	// The restart-freeze snapshot is state=unevaluated: it reports NO figure (the
+	// slice is frozen, not saturated — the S11 honesty pin), so the supervisor must
+	// see absence and skip the tick rather than read a fabricated 0 as "no room".
+	t.Run("freeze snapshot carries no figures", func(t *testing.T) {
+		line, err := WorkerAdmitOutcomeLine(WorkerAdmitOutcome{
+			State: WorkerAdmitStateUnevaluated, Class: WorkerAdmitClassContended,
+			Reason: WorkerAdmitReasonSnapshot, AvailableBytes: 123, AvailableCPU: 4,
+		}, nil)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		fields, err := ParseWorkerAdmitOutcomeLine(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if _, present := fields["available_bytes"]; present {
+			t.Fatalf("a freeze (state=unevaluated) snapshot must carry NO available_bytes: %q", line)
+		}
+		if _, present := fields["available_cpu"]; present {
+			t.Fatalf("a freeze (state=unevaluated) snapshot must carry NO available_cpu: %q", line)
+		}
+	})
+
+	// A non-snapshot denial must NEVER render the figures, even if a caller left them
+	// set: reason gates the render, so a blocking-claim denial carrying stale
+	// AvailableBytes cannot leak a headroom token the supervisor would size against.
+	t.Run("non-snapshot denial renders no figures", func(t *testing.T) {
+		line, err := WorkerAdmitOutcomeLine(WorkerAdmitOutcome{
+			State: WorkerAdmitStateDenied, Class: WorkerAdmitClassContended,
+			Reason: WorkerAdmitReasonInsufficientHeadroom, AvailableBytes: 999, AvailableCPU: 9,
+		}, nil)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		if strings.Contains(line, "available_bytes") || strings.Contains(line, "available_cpu") {
+			t.Fatalf("a non-snapshot denial must not carry headroom figures: %q", line)
+		}
+	})
+}
+
 // verifies: S6 — the worker-admit outcome line carries NO cpu_slots token. The
 // AIRA-64 cpuslots flock governor was deleted once CPU became an admission-ledger
 // resource (S5), and its per-grant diagnostic field went with it. This is the

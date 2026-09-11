@@ -293,6 +293,16 @@ type WorkerAdmitOutcome struct {
 	// query-escaped on the wire so it can never break the line's
 	// tokenisation nor be mistaken for a field of its own.
 	Detail string
+	// AvailableBytes / AvailableCPU are the non-blocking probe's current headroom
+	// (S15, design §6/§8). They are rendered on the outcome line ONLY for a snapshot
+	// (Reason == WorkerAdmitReasonSnapshot and State == WorkerAdmitStateDenied), and
+	// then ALWAYS — even a 0 — so a consumer can tell "no room" (present, 0) from
+	// "this daemon does not speak snapshots" (absent). reason=snapshot is the gate,
+	// not the field's presence; that is what lets the daemon keep them omitempty on
+	// its own wire without a 0 being read as absent. Zero and ignored on every other
+	// outcome.
+	AvailableBytes int64
+	AvailableCPU   int64
 	// Lease is non-nil exactly when State == WorkerAdmitStateGranted.
 	Lease *WorkerAdmitLease
 }
@@ -450,6 +460,18 @@ func WorkerAdmitOutcomeLine(outcome WorkerAdmitOutcome, grant *WorkerAdmitGrantF
 	if outcome.Reason != "" {
 		builder.WriteString(" reason=")
 		builder.WriteString(url.QueryEscape(outcome.Reason))
+	}
+	// S15. A non-blocking probe's SNAPSHOT carries the ledger's current headroom.
+	// Emitted ONLY on the denied snapshot (never on a grant, a blocking-claim denial,
+	// or the restart-freeze's state=unevaluated snapshot, which reports no figure by
+	// design), and then unconditionally — a 0 is rendered, so the consumer reads
+	// "present, 0 => no room" rather than "absent => unsupported". This is the
+	// aitest supervisor's pool-growth sizing input.
+	if outcome.Reason == WorkerAdmitReasonSnapshot && outcome.State == WorkerAdmitStateDenied {
+		builder.WriteString(" available_bytes=")
+		builder.WriteString(strconv.FormatInt(outcome.AvailableBytes, 10))
+		builder.WriteString(" available_cpu=")
+		builder.WriteString(strconv.FormatInt(outcome.AvailableCPU, 10))
 	}
 	if grant != nil {
 		builder.WriteString(" containment=")
