@@ -1963,6 +1963,22 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-budget requires the project-less daemon transport")
 		}},
+		// AIRA (admission-counter rebuild) S18. A NEW verb, on the SAME
+		// project-less-history reasoning as confine-budget above: `aira confine
+		// --dump <file>` writes the daemon's admission/utilisation records as
+		// JSONL for a CI job to archive (design §12). CLI-only, like
+		// confine/confine-status/confine-reserve/drain (the exclusion list
+		// below): the file it writes belongs to the INVOKING process's own
+		// filesystem, which is not a meaningful concept for a remote MCP
+		// client. See cmd/aira/confine_dump.go for the atomic write.
+		"confine-dump": {Name: "confine-dump", Usage: "confine --dump <file> [--slice S] [--owner ID]", Args: []ArgSpec{
+			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, Summary: "Write the daemon's admission/utilisation records as JSONL for CI archival.", Safety: SafetyRead, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "slice")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-dump is a direct CLI-only verb")
+		}},
 		"confine-kill": {Name: "confine-kill", Usage: "confine --kill <name|supervisor-pid|scope-id> [--steal] [--slice S] [--owner ID]", Args: []ArgSpec{
 			stringSpec("selector", true, true, "Exact confine name, supervisor PID, or scope ID"),
 			boolSpec("steal", false, false, "Override unknown or foreign ownership"),
@@ -2320,8 +2336,12 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
 		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change", safety: SafetyRead, example: []string{}},
-		"confine-kill":    {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
-		"confine-status":  {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
+		// AIRA (admission-counter rebuild) S18. CLI-only (see the Include
+		// exclusion list below): the target file belongs to the invoking
+		// process's own filesystem.
+		"confine-dump":   {summary: "Write the daemon's admission/utilisation records as JSONL for CI archival", safety: SafetyRead, example: []string{}},
+		"confine-kill":   {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
+		"confine-status": {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		// AIRA-196. Unlike confine/confine-status these ARE included: reading a
 		// captured file and writing to a job's stdin socket both have honest
 		// request/response forms, and an agent driving a detached gate needs them.
@@ -2416,7 +2436,11 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// AIRA-185 adds "drain" to the CLI-only exclusion list. See its descriptor:
 		// a foreground, connection-bound hold has no honest request/response form.
 		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive,
-			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "drain" && name != "install"
+			// AIRA S18 adds confine-dump to the CLI-only exclusion set: it writes a
+			// file on the invoking process's own filesystem, which a remote MCP
+			// client cannot meaningfully name, the same local-affinity reason
+			// confine/confine-status/confine-reserve/drain are excluded.
+			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "confine-dump" && name != "drain" && name != "install"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

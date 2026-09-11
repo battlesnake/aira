@@ -234,13 +234,21 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		// survivability verb depend on the component most likely to have been
 		// restarted during exactly the long pause it exists to survive.
 		status := options["status"] == "true"
-		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true"
+		// AIRA (admission-counter rebuild) S18.
+		dumpPath := options["dump"]
+		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true" || dumpPath != ""
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
 		if status {
 			return runConfineStatusCommand(context.Background(), options, jsonOutput, stdout, stderr)
+		}
+		// --dump writes a LOCAL FILE (the caller's own filesystem), which is not
+		// something the generic render()-based runConfineManagementCommand does
+		// for any other management flag, so it gets its own command function.
+		if dumpPath != "" {
+			return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
 		}
 		if management {
 			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
@@ -317,6 +325,21 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		request.Args["owner"] = owner
 		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
+	}
+	// AIRA (admission-counter rebuild) S18. The hyphenated spelling of
+	// `confine --dump <file>`, on the SAME two-spellings-must-both-work
+	// discipline AIRA-201 pinned for confine-budget
+	// (TestBothConfineBudgetSpellingsReachTheManagementDispatch): buildRequest
+	// has no "confine-dump" case (it is not a generic management verb -- it
+	// writes a local file, unlike list/kill/budget), so this is handled
+	// directly rather than through the generic buildRequest+dispatchConfineManagementRequest
+	// pair above.
+	if verb == "confine-dump" {
+		dumpPath := options["dump"]
+		if dumpPath == "" {
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		}
+		return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
 	}
 	// AIRA-196. Handled HERE, beside the rest of the confine family and BEFORE
 	// project discovery, for the reason the family shares: a detached confine job
@@ -815,7 +838,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
 		"confine-list":   {"slice": true, "owner": true},
 		"confine-budget": {"slice": true, "owner": true},
-		"confine-kill":   {"steal": true, "slice": true, "owner": true},
+		// AIRA (admission-counter rebuild) S18.
+		"confine-dump": {"dump": true, "slice": true, "owner": true},
+		"confine-kill": {"steal": true, "slice": true, "owner": true},
 		// AIRA-196. No --slice on either: both address a job through the durable
 		// record store, never a cgroup slice, and an accepted-and-ignored --slice
 		// is exactly the silently discarded scope AIRA-82 refuses.
@@ -1273,7 +1298,9 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 				i++
 				options["status-selector"] = argv[i]
 			}
-		case "kill", "slice", "owner":
+		// AIRA (admission-counter rebuild) S18. --dump joins kill/slice/owner in
+		// the value-required group: the archival target file path.
+		case "kill", "slice", "owner", "dump":
 			value := inline
 			if !hasInline {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
@@ -1294,14 +1321,15 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	kill := options["kill"] != ""
 	status := options["status"] == "true"
 	budget := options["budget"] == "true"
+	dump := options["dump"] != ""
 	selected := 0
-	for _, chosen := range []bool{list, kill, status, budget} {
+	for _, chosen := range []bool{list, kill, status, budget, dump} {
 		if chosen {
 			selected++
 		}
 	}
 	if selected != 1 {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --kill <selector>, or --status [<selector>]")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --dump <file>, --kill <selector>, or --status [<selector>]")
 	}
 	if !kill && options["steal"] == "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")

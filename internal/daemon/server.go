@@ -797,6 +797,14 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = s.reply(conn, responseFrame(s.confineManagement(ctx, request.Request)))
 		return
 	}
+	// AIRA (admission-counter rebuild) S18.
+	if verb == "confine-dump" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = s.reply(conn, responseFrame(s.confineDump(request.Request.Args)))
+		return
+	}
 	if verb == "eject" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
