@@ -2468,9 +2468,15 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		{
 			// Refused on capacity — RAM short OR CPU short — takes the same FIFO tail:
 			// record the RAM grantable figure and arm the AIRA-59 backfill freeze so a
-			// later smaller waiter cannot jump the head. noteGrantableLocked reports the
-			// RAM availability even for a CPU-only refusal — an honest RAM reading; S5
-			// adds no separate CPU diagnostic field (out of scope).
+			// later smaller waiter cannot jump the head.
+			//
+			// ACCEPTED GAP (S5, out of scope): noteGrantableLocked records the RAM
+			// `available` figure even for a CPU-only refusal, and there is no CPU
+			// diagnostic field — so a job blocked purely on CPU is rejected with
+			// E_ADMIT_SATURATED rendering the RAM-flavoured "no memory admission within
+			// the wait". Diagnosis only (no admission decision reads it); a dedicated CPU
+			// diagnostic is deferred. The contention latch below still tells the honest
+			// truth (observed, never a fabricated solitude).
 			waiter.waited = true
 			// AIRA-149 contention latch, S5-aware. A RAM refusal (ramFits == false) is a
 			// fact about THIS slice's ledger, so it takes the honest solo reading — which

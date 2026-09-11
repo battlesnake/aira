@@ -198,13 +198,71 @@ func TestS5NPlusOneOneCoreWorkersLastBlocksUntilRelease(t *testing.T) {
 	}
 }
 
-// verifies: S5 / P1 (Fable) — CPU is PER SLICE, so a pruned queue's stale evaluator
-// pass cannot erase a same-path successor's CPU charge (the over-admit the
-// machine-wide ledger bred). Q1 on /P is released and pruned; Q2, a NEW queue on the
-// SAME path, holds the whole ceiling; Q1's stale pass runs; Q2 must still gate its
-// own slice on its own intact cpuOutstanding. (Green by construction now — each
-// queue's CPU sum is self-contained; this guards against ever regressing to a shared
-// path-keyed CPU ledger.)
+// verifies: S5 — the GRANT-path CPU charge is applied IN-PASS, before the next
+// queued waiter's fit-check in the SAME evaluation. The burst-launch shape: ceiling
+// 4, 3 cores held, TWO one-core newcomers queued in ONE evaluateAdmitQueue call. The
+// first fits (4th core free) and its grant must charge the 4th core so the second —
+// evaluated later in the same pass — sees 4/4 and BLOCKS. cpuOutstanding is 4 after.
+//
+// This is the one shape every other S5 fixture misses (they seed cpuOutstanding and
+// enqueue exactly one newcomer): a grant-path re-derive that dropped the CPU sum
+// (`queue.outstanding, _, queue.outstandingJobs = rederiveLedgerLocked(queue)`, with
+// the release re-derive intact) would leave the second newcomer seeing 3/4 and
+// over-admit it — this test REDs that mutation.
+func TestS5InPassGrantChargesCPUBeforeNextFit(t *testing.T) {
+	const numCPU = 2 // ceiling = 4 cores
+	now := time.Unix(860_000, 0)
+	server := cpuLedgerServer(&now, numCPU)
+
+	// 3 held one-core leases => cpuOutstanding 3, one core free under the ceiling of 4.
+	var waiters []*admitWaiter
+	seq := int64(0)
+	for i := 0; i < 3; i++ {
+		seq++
+		waiters = append(waiters, &admitWaiter{
+			seq: seq, reserve: 1 << 20, cpu: 1, state: admitGranted, accounted: true,
+			grantedCh: make(chan struct{}), grantedAt: now.Add(-time.Hour),
+		})
+	}
+	// TWO one-core newcomers queued in the SAME pass.
+	seq++
+	first := &admitWaiter{seq: seq, reserve: 1 << 20, cpu: 1, state: admitQueued,
+		grantedCh: make(chan struct{}), enqueued: now}
+	seq++
+	second := &admitWaiter{seq: seq, reserve: 1 << 20, cpu: 1, state: admitQueued,
+		grantedCh: make(chan struct{}), enqueued: now}
+	waiters = append(waiters, first, second)
+	queue := &sliceQueue{
+		path: "/slice", server: server, kick: make(chan struct{}, 1),
+		waiters: waiters, outstanding: 3 << 20, cpuOutstanding: 3, outstandingJobs: 3,
+	}
+
+	server.evaluateAdmitQueue(queue)
+
+	if first.state != admitGranted {
+		t.Fatalf("the first newcomer must be granted (the 4th core is free), state=%v", first.state)
+	}
+	if second.state != admitQueued {
+		t.Fatalf("the second newcomer must BLOCK: the first grant charges the 4th core before the second's fit-check in the SAME pass (state=%v); a grant-path re-derive that dropped the CPU sum would over-admit it", second.state)
+	}
+	if queue.cpuOutstanding != 4 {
+		t.Fatalf("cpuOutstanding after the pass = %d, want 4 (3 held + 1 granted in-pass)", queue.cpuOutstanding)
+	}
+}
+
+// verifies: S5 / P1 (Fable) — per-slice CPU self-containment. Q1 on /P is released
+// and pruned; Q2, a NEW queue on the SAME path, holds the whole ceiling; Q1's stale
+// evaluator pass runs; Q2 must still gate its own slice on its own intact
+// cpuOutstanding. This is GREEN by construction — each queue's CPU sum lives on the
+// queue, so nothing a pruned Q1 does can touch Q2.
+//
+// It does NOT reproduce the deleted machine-wide design's over-admit, and must not
+// be read as doing so: that old code republished a queue's OWN Σ at pass start, so
+// Q2's own pass would have republished its 4 before its fit-check — the real P1
+// needed a THIRD queue on ANOTHER path reading the machine-wide sum after Q1's stale
+// pass zeroed /P's shared entry. The true fix for P1 is the DELETION of that shared
+// ledger; this test is a standing guard against ever reintroducing a path-keyed
+// cross-queue CPU map.
 func TestS5PrunedQueueStalePassDoesNotEraseSuccessorCPU(t *testing.T) {
 	const numCPU = 2 // ceiling = 4 cores
 	now := time.Unix(840_000, 0)
@@ -333,26 +391,30 @@ func TestS5NegativeCPURejected(t *testing.T) {
 // cpu.max in comments are unquoted and do not match. This guards the quoted literal;
 // it is not an exhaustive proof — an assembled path would evade it.)
 func TestS5NoCPUMaxReferenceInSource(t *testing.T) {
-	root := ".." // internal/
+	// Walk both the library (internal/) and the faces (cmd/), relative to this
+	// package dir (internal/daemon).
+	roots := []string{"..", "../../cmd"}
 	var offenders []string
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+	for _, root := range roots {
+		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			if strings.Contains(string(data), `"cpu.max"`) {
+				offenders = append(offenders, path)
+			}
 			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s source: %v", root, err)
 		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		if strings.Contains(string(data), `"cpu.max"`) {
-			offenders = append(offenders, path)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk internal/ source: %v", err)
 	}
 	if len(offenders) != 0 {
 		t.Fatalf("cpu.max is referenced by name in production source, but S5 CPU accounting must write no cpu.max: %v", offenders)

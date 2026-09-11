@@ -465,13 +465,17 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "admit"
-	// S5. cpu is the second ledger resource. An ordinary confine declares the
-	// one-core default (design §9); the daemon charges it against the per-slice
-	// 2×NumCPU ceiling. A --delegate-ram SUITE reserves 0 cores (spec §8): it is
-	// framework overhead, and its pytest WORKERS each sub-reserve their own core
-	// later (S15) — charging the suite a core too would double-count. Accounting
-	// only — no cpu.max is written. Daemon and client are rebuilt in lockstep on
-	// this branch, so the added arg needs no ProtocolVersion bump (deferred to S7).
+	// S5. cpu is the second ledger resource. An ordinary confine AND each
+	// `confine-reserve` per-test sub-reservation (confine_reserve_linux.go, no
+	// DelegateRAM) declare the one-core default (design §9); the daemon charges each
+	// against the per-slice 2×NumCPU ceiling. So a running --delegate-ram suite's
+	// live per-test reservations ARE each charged one core NOW (bounded by the #64
+	// cpuslots gate until S6). A --delegate-ram SUITE itself reserves 0 cores (spec
+	// §8): it is framework overhead, and charging it a core on top of its per-test
+	// reservations would double-count. S15 must REPLACE the per-test charge with its
+	// own worker accounting, not stack on it. Accounting only — no cpu.max is
+	// written. Daemon and client are rebuilt in lockstep on this branch, so the added
+	// arg needs no ProtocolVersion bump (deferred to S7).
 	cpuCores := DefaultConfineCPUCores
 	if req.DelegateRAM {
 		cpuCores = 0
