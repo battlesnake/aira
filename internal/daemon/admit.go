@@ -2705,11 +2705,31 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		effectiveMaximum = s.admitEffectiveMaximum(queue.path, maximum)
 	}
 	frozen := false
+	// S11 restart freeze (design §4): a per-pass fact like `phase`. While active, NO
+	// NEW admission is granted — survivors must re-declare (re-anchor / establish) their
+	// leases before a new admission can take space they are about to re-claim. Re-declares
+	// do NOT come through here: they SET/establish directly under queue.mu in
+	// enqueueAdmitInternal, so they are never frozen (Invariant 6).
+	restartFrozen := s.restartFrozenAt(now)
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
 	queuedAhead := 0
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
+			continue
+		}
+		// S11 restart-freeze gate (design §4). Placed BEFORE the exclusivity gate and the
+		// fit/grant so a NEW admission during the freeze simply WAITS — it never grants
+		// (never fail-opens), never arms the AIRA-59 fairness anchor (that arm lives in the
+		// refused-on-capacity block below, which this skips), and records NO contention and
+		// NO grantable. The no-contention part is load-bearing honesty: a non-blocking
+		// (max_wait_ms==0) admit that times out during the freeze must then read
+		// Contention "unevaluated" (the unset AIRA-149 latch) — the slice is not saturated,
+		// it is frozen — rather than a fabricated "saturated" solitude or a grant-shaped
+		// "unevaluated" (which the runner launches UNCAPPED). A blocking waiter re-evaluates
+		// at freeze-end, woken by the restart timer's signal or the next poll tick.
+		if restartFrozen {
+			waiter.waited = true
 			continue
 		}
 		// AIRA-101, the exclusivity gate. Placed before the RAM fit check because

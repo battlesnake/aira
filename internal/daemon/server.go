@@ -402,6 +402,15 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			_ = os.Remove(s.Paths.SocketPath)
 		}
 	}()
+	// S11 restart freeze (design §4): armed at listen-ready, BEFORE s.Ready fires (so a
+	// harness that waits on Ready observes it armed) and before the accept loop. It
+	// freezes NEW admissions for restartFreeze so a survivor's re-declare is not beaten
+	// to its space by a new admission; the drop timer (runRestartFreeze, spawned in the
+	// goroutine region below) then collects any lease still unanchored after the grace.
+	// Armed unconditionally: a crash-restart reloaded nothing but its survivors still
+	// re-declare within the window. restartFreezeUntilNanos is atomic — the reload above
+	// already spawned the seeded queues' evaluator goroutines, which read it.
+	s.armRestartFreeze(s.admitNowTime())
 	reaperCtx, cancelReaper := context.WithCancel(ctx)
 	reaperDone := make(chan struct{})
 	go func() {
