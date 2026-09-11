@@ -255,6 +255,16 @@ func (s *Server) snapshotLeaseDump() []leaseDumpRecord {
 			if waiter.scopeID == "" {
 				continue
 			}
+			// S11. A lease reloaded from a PRIOR restart dump but never re-declared is
+			// still unanchored. It must NOT be re-dumped: a client that never re-declared
+			// it across one restart will not across the next either, so re-dumping it
+			// would chain a ghost lease forward through every graceful restart, holding
+			// RAM no live process owns. Safe because S9's establish-granted backstops a
+			// genuinely-live holder — its re-declare re-anchors the lease (clearing
+			// unanchored), after which it IS dumped like any held lease.
+			if waiter.unanchored {
+				continue
+			}
 			recs = append(recs, leaseDumpRecord{
 				Frame: reDeclareRecord{
 					// The ledger key VERBATIM; S11 establishes the lease under this.

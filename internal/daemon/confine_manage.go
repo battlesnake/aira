@@ -211,7 +211,16 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// The granted total, job count and population split below are then
 				// fabricated zeros and must be reported unevaluated, not as a
 				// confident empty slice.
-				GrantedEstablished: snapshot.present,
+				//
+				// S11 (design §4). ALSO unevaluated while the restart new-admission
+				// freeze is active OR any reloaded lease is still unanchored: the granted
+				// total is not yet trustworthy (survivors may still re-declare, and
+				// unanchored leases may be dropped at end-of-freeze+grace), so reporting a
+				// confident figure would be the same fabrication AIRA-220 forbids. DERIVED
+				// from the freeze + unanchored count (NOT hardcoded true) so that when S12
+				// deletes the cgroup-scan adoption the bit stays correct: snapshot.present
+				// is "a queue exists", which survives S12.
+				GrantedEstablished: snapshot.present && !snapshot.restartFrozen && snapshot.unanchoredLeases == 0,
 				// Ceiling is what one MORE job would face; scale headroom by the
 				// TOTAL admitted jobs (outstanding + adopted) so it stays consistent
 				// with the Jobs shown, not just the connection-held ones.

@@ -970,6 +970,18 @@ type admitRequest struct {
 	// scoped to the re-declare entrypoint alone. Set only by enqueueReDeclare; no wire
 	// field.
 	reDeclare bool
+
+	// S11. reload marks the request as a RESTART-DUMP reload seed (reloadLeaseDump),
+	// a sibling of reDeclare on the establish-granted path: when the lease is ABSENT
+	// it ESTABLISHES it granted, like reDeclare, BUT the lease is seeded UNANCHORED
+	// (anchor == nil, unanchored == true) and the same-uid peer gate is BYPASSED —
+	// the dump was written by THIS uid's own daemon and there is no peer connection
+	// to authenticate. A reloaded lease holds its RAM/CPU in the ledger immediately;
+	// a client's re-declare re-anchors it (clearing unanchored), and any lease still
+	// unanchored at end-of-freeze+grace is dropped by the unanchored-drop timer (the
+	// real safety — kill -0 at reload is only an early-drop optimisation). Set only
+	// by enqueueReload; no wire field.
+	reload bool
 }
 
 type admitRejection struct {
@@ -1091,6 +1103,15 @@ type admitSnapshot struct {
 	queued          int
 	phase           string
 	present         bool
+
+	// S11 (design §4 / AIRA-220 honesty). restartFrozen is whether the restart
+	// new-admission freeze is active at the snapshot instant; unanchoredLeases counts
+	// granted leases reloaded from the dump but not yet re-declared. Both taken in the
+	// same locked, single-clock walk as `present`, so the GrantedEstablished honesty bit
+	// can read FALSE while the granted total is still settling (survivors may re-declare
+	// and unanchored leases may be dropped) without a second, possibly-inconsistent read.
+	restartFrozen    bool
+	unanchoredLeases int
 
 	// AIRA-24. One waiter's own place in the queue, answered only when a
 	// caller named its own scope id. queuePosition is 1-based and counts ONLY
@@ -1338,6 +1359,8 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	// would drift across a long waiter list, so two rows could report an ordering
 	// the queue never had.
 	now := s.admitNowTime()
+	// S11. The freeze state at this same instant — part of the GrantedEstablished bit.
+	snapshot.restartFrozen = s.restartFrozenAt(now)
 	for _, waiter := range queue.waiters {
 		if waiter == nil {
 			continue
@@ -1368,6 +1391,14 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// classifying on the wrong fact.
 		if waiter.state != admitGranted || !waiter.accounted {
 			continue
+		}
+		// S11. A reloaded lease not yet re-declared still holds its RAM/CPU here, but
+		// the granted total is not yet trustworthy: this lease may be dropped at
+		// end-of-freeze+grace, or refreshed by a re-declare. Count them so
+		// GrantedEstablished reads false while any remains (a reloaded lease always
+		// carries a scope id, so this is always the scope-backed population below).
+		if waiter.unanchored {
+			snapshot.unanchoredLeases++
 		}
 		// These three sum ledgerCharge(), the same quantity the ledger itself
 		// carries. They must move with queue.outstanding or residualBytes() -- a
@@ -2112,6 +2143,35 @@ func anchorLeaseLocked(w *admitWaiter, conn net.Conn, pid int, startTick uint64)
 	w.unanchored = false
 }
 
+// newEstablishedWaiter builds a GRANTED + accounted lease (grantedCh already
+// closed, outcome "immediate") for the two establish-granted paths: S9's
+// absent-lease ARDR re-declare and S11's restart-dump reload. The caller appends
+// it to queue.waiters and re-derives the ledger, under queue.mu.
+//
+// The anchor is NOT set here — the two callers differ exactly there, which is why
+// the shape is factored but the anchoring is not: S9's re-declare anchors it to the
+// live connection via anchorLeaseLocked (unanchored stays false); S11's reload
+// leaves anchor == nil and sets unanchored == true (no live connection yet), so the
+// unanchored-drop timer can collect a lease no client ever re-declares.
+//
+// grantedCh is closed immediately so the "granted ⇒ grantedCh closed" invariant
+// every other granted waiter holds is preserved (nothing waits on it on these
+// paths, but a later reader must not block). outcome is "immediate", NOT a novel
+// spelling: validRunnerAdmitGrant accepts only {immediate,waited,unevaluated}, so a
+// later plain dup-scope admit that re-anchors and frames this lease stays valid.
+func newEstablishedWaiter(seq, reserve, cpu int64, basis string, request admitRequest, now time.Time) *admitWaiter {
+	grantedCh := make(chan struct{})
+	close(grantedCh)
+	return &admitWaiter{
+		seq: seq, reserve: reserve, cpu: cpu, basis: basis,
+		state: admitGranted, accounted: true, grantedCh: grantedCh,
+		enqueued: now, grantedAt: now, outcome: "immediate",
+		scopeID: request.scopeID, name: request.name, owner: request.owner,
+		signature:     boundedAdmitSignature(request.signature),
+		parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling,
+	}
+}
+
 // watchPeerEOF starts the peer-EOF liveness watcher shared by every lease-bearing
 // connection (design §3): a goroutine blocks reading one byte from conn and cancels
 // the returned context the instant the read returns — peer close, or any error. The
@@ -2171,6 +2231,18 @@ func (s *Server) enqueueResolvedConfineAdmit(path string, reserve int64, basis s
 func (s *Server) enqueueReDeclare(path string, reserve int64, basis string, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	request.reDeclare = true
 	return s.enqueueAdmitInternal(path, reserve, basis, 0, false, request)
+}
+
+// enqueueReload is the S11 restart-dump reload entrypoint into the establish-granted
+// path. A reloaded lease is ALWAYS absent (the ledger is empty at reload time, before
+// net.Listen), so this establishes it GRANTED but UNANCHORED, skipping the ceiling,
+// maxWaiters AND same-uid gates (see the reload arm of enqueueAdmitInternal). basis is
+// "reload". enforceCeiling is FALSE for the same reason enqueueReDeclare passes it:
+// the establish branch returns before the ceiling check, so a reloaded lease whose
+// reserve exceeds the ceiling establishes with `available` negative (§4).
+func (s *Server) enqueueReload(path string, reserve int64, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
+	request.reload = true
+	return s.enqueueAdmitInternal(path, reserve, "reload", 0, false, request)
 }
 
 func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
@@ -2263,50 +2335,51 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			// preserved — TestConfineRegistryRejectsDuplicateScopeID pins this). Only a
 			// live GRANTED lease re-anchors.
 			return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
-		} else if request.reDeclare {
-			// S9 ESTABLISH-GRANTED (design §4, the load-bearing addition). The lease is
-			// ABSENT and this is an ARDR re-declare: the driver is CRASH-restart with NO
-			// dump (SIGKILL/OOM/panic skips the graceful dump → the new daemon opened an
-			// EMPTY ledger), so EVERY live client's re-declare is absent-lease. They MUST
-			// re-establish GRANTED — queuing them behind S11's new-admission freeze would
-			// time them out and drop live leases. So establish directly here, accounted
-			// and anchored, SKIPPING the ceiling AND maxWaiters gates below: Invariant 6
-			// says a re-declare is always accepted, even past the ceiling — `reserve >
-			// ceiling` just establishes with `available` NEGATIVE (§4's re-declare window),
-			// which the signed ledger absorbs and the next NEW admission waits on. This is
-			// the ARDR entrypoint ONLY (request.reDeclare): a plain dup-scope admit whose
-			// lease is absent falls through to the fresh QUEUED insert, a genuine new
-			// admission.
+		} else if request.reDeclare || request.reload {
+			// ESTABLISH-GRANTED (design §4, the load-bearing addition). The lease is
+			// ABSENT and this is either an ARDR re-declare (S9) or a restart-dump reload
+			// seed (S11). Both establish the lease GRANTED directly here, accounted,
+			// SKIPPING the ceiling AND maxWaiters gates below: Invariant 6 says a
+			// re-declare is always accepted, even past the ceiling — `reserve > ceiling`
+			// just establishes with `available` NEGATIVE (§4's re-declare window), which
+			// the signed ledger absorbs and the next NEW admission waits on.
 			//
-			// Same-uid gate, fail-CLOSED (design §4 gate P2-C), identical to the SET branch:
-			// peerSameUID is false on an unreadable credential, so a build that never
-			// resolves it cannot establish a lease for a peer it could not authenticate.
-			if !request.peerSameUID {
+			//   - reDeclare (S9): the driver is CRASH-restart with NO dump (SIGKILL/OOM/
+			//     panic skips the graceful dump → the new daemon opened an EMPTY ledger),
+			//     so EVERY live client's re-declare is absent-lease. They MUST re-establish
+			//     GRANTED — queuing them behind S11's new-admission freeze would time them
+			//     out and drop live leases. Anchored to the live connection; SAME-UID
+			//     gated (fail-closed: peerSameUID is false on an unreadable credential, so
+			//     a build that never resolves it cannot establish a lease for a peer it
+			//     could not authenticate — design §4 gate P2-C).
+			//   - reload (S11): a GRACEFUL-restart dump pre-seed, so a slow re-declarer
+			//     does not lose its space to a new admission after the freeze. Seeded
+			//     UNANCHORED (anchor nil, unanchored true) so the drop timer can collect it
+			//     if no client ever re-declares; the same-uid gate is BYPASSED — the dump
+			//     was written by THIS uid's own daemon and there is no peer to authenticate.
+			//
+			// A plain dup-scope admit (neither flag) falls through to the fresh QUEUED
+			// insert, a genuine new admission.
+			if !request.reload && !request.peerSameUID {
 				return nil, nil, CodeProtocol, fmt.Errorf("%s: re-declare peer is not the lease owner", CodeProtocol)
 			}
 			if queue.seq == math.MaxInt64 {
 				return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 			}
 			queue.seq++
-			// grantedCh is closed immediately: the established lease is granted the instant
-			// it exists, so the "granted ⇒ grantedCh closed" invariant every other granted
-			// waiter holds is preserved (nothing waits on it on the re-declare path, but a
-			// later reader must not block). outcome is "immediate", NOT a new spelling: the
-			// runner's validRunnerAdmitGrant accepts only {immediate,waited,unevaluated},
-			// so were a later plain dup-admit to re-anchor this lease and frame its outcome,
-			// any other value would be rejected → flock fallback → ungoverned launch.
-			grantedCh := make(chan struct{})
-			close(grantedCh)
-			now := s.admitNowTime()
-			waiter := &admitWaiter{
-				seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis,
-				state: admitGranted, accounted: true, grantedCh: grantedCh,
-				enqueued: now, grantedAt: now, outcome: "immediate",
-				scopeID: request.scopeID, name: request.name, owner: request.owner,
-				signature:     boundedAdmitSignature(request.signature),
-				parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling,
+			waiter := newEstablishedWaiter(queue.seq, reserve, request.cpu, basis, request, s.admitNowTime())
+			if request.reload {
+				// Reloaded UNANCHORED (§4): anchor stays nil, unanchored set, and the
+				// peer pid/start-tick carried HONESTLY (the kill-probe already ran at
+				// reload; these are only consulted again if this lease is re-declared,
+				// which overwrites them via anchorLeaseLocked, or re-dumped — which the
+				// dump-predicate's unanchored skip prevents for an un-re-declared lease).
+				waiter.unanchored = true
+				waiter.clientPID = request.clientPID
+				waiter.processStartTick = request.processStartTick
+			} else {
+				anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
 			}
-			anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
 			queue.waiters = append(queue.waiters, waiter)
 			// DERIVED, not incremented (the one ledger writer): folds in this lease's RAM
 			// and cores. An establish CONSUMES capacity, so no signal() is needed — unlike
@@ -2651,11 +2724,31 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		effectiveMaximum = s.admitEffectiveMaximum(queue.path, maximum)
 	}
 	frozen := false
+	// S11 restart freeze (design §4): a per-pass fact like `phase`. While active, NO
+	// NEW admission is granted — survivors must re-declare (re-anchor / establish) their
+	// leases before a new admission can take space they are about to re-claim. Re-declares
+	// do NOT come through here: they SET/establish directly under queue.mu in
+	// enqueueAdmitInternal, so they are never frozen (Invariant 6).
+	restartFrozen := s.restartFrozenAt(now)
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
 	queuedAhead := 0
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
+			continue
+		}
+		// S11 restart-freeze gate (design §4). Placed BEFORE the exclusivity gate and the
+		// fit/grant so a NEW admission during the freeze simply WAITS — it never grants
+		// (never fail-opens), never arms the AIRA-59 fairness anchor (that arm lives in the
+		// refused-on-capacity block below, which this skips), and records NO contention and
+		// NO grantable. The no-contention part is load-bearing honesty: a non-blocking
+		// (max_wait_ms==0) admit that times out during the freeze must then read
+		// Contention "unevaluated" (the unset AIRA-149 latch) — the slice is not saturated,
+		// it is frozen — rather than a fabricated "saturated" solitude or a grant-shaped
+		// "unevaluated" (which the runner launches UNCAPPED). A blocking waiter re-evaluates
+		// at freeze-end, woken by the restart timer's signal or the next poll tick.
+		if restartFrozen {
+			waiter.waited = true
 			continue
 		}
 		// AIRA-101, the exclusivity gate. Placed before the RAM fit check because
