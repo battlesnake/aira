@@ -173,3 +173,106 @@ func TestDropUnanchoredSerialisesWithReDeclare(t *testing.T) {
 		}
 	})
 }
+
+// writeReloadDump writes a single-record restart dump (alive pid + real tick) for a
+// Serve-driven reload test, creating RuntimeDir (the reload reads the dump before Serve's
+// own MkdirAll would run — see server.go).
+func writeReloadDump(t *testing.T, paths Paths, scopeID string) {
+	t.Helper()
+	tick, ok, _ := readProcStartTime(os.Getpid())
+	if !ok {
+		t.Skip("cannot read this process's /proc start-tick; the kill-probe keep-path needs it")
+	}
+	rec := leaseDumpRecord{
+		Frame:            reDeclareRecord{ScopeID: scopeID, RAMBytes: 2 << 30, CPUCores: 1},
+		ClientPID:        os.Getpid(),
+		ProcessStartTick: tick,
+	}
+	data, err := encodeLeaseDump(time.Now(), []leaseDumpRecord{rec})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := os.MkdirAll(paths.RuntimeDir, 0o700); err != nil {
+		t.Fatalf("mkdir runtime dir: %v", err)
+	}
+	if err := os.WriteFile(leaseDumpPath(paths), data, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// verifies: S11 C2 / Fable P2-1 — the unanchored-drop SAFETY is NOT coupled to the freeze
+// being armed. With restartFreeze=0 (freeze disabled) a reloaded dump still seeds
+// unanchored leases (reloadLeaseDump is not gated on the freeze), which must still be
+// dropped at grace. runRestartFreeze runs UNCONDITIONALLY.
+//
+// MUTATION: restore the `if restartFreezeUntilNanos.Load()==0 { return }` guard in
+// runRestartFreeze -> with the freeze disabled the drop never runs -> the live-pid lease
+// is never dropped -> the final wait times out and this reds.
+func TestRestartDropRunsWithFreezeDisabled(t *testing.T) {
+	server, paths := serveDumpTestServer(t)
+	server.restartFreeze = 0 // freeze DISABLED; the drop safety must still run
+	phase1 := make(chan time.Time)
+	phase2 := make(chan time.Time)
+	var calls int32
+	server.restartAfter = func(time.Duration) <-chan time.Time {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return phase1
+		}
+		return phase2
+	}
+	writeReloadDump(t, paths, "CONFINE-nofreeze@s")
+
+	cancel, done := startServeInline(t, server)
+	defer func() { cancel(); awaitShutdown(t, done) }()
+
+	if !waitForLeaseCount(server, 1, 2*time.Second) {
+		t.Fatal("lease was not seeded with the freeze disabled — reloadLeaseDump must not be gated on the freeze")
+	}
+	close(phase1)
+	close(phase2)
+	if !waitForLeaseCount(server, 0, 2*time.Second) {
+		t.Fatal("the unanchored lease was NOT dropped with the freeze disabled — the drop safety is wrongly coupled to the freeze arm")
+	}
+}
+
+// verifies: S11 C1 (concurrency review) — a reloaded UNANCHORED lease never re-declared
+// must not leak its queue's evaluator goroutine across shutdown. It is the only waiter
+// class with no connection handler, so without the shutdown-time drop its queue stays
+// non-empty, pruneAdmitRegistry never closes queue.stop, and runEvaluator outlives Serve.
+// A graceful shutdown BEFORE the freeze+grace drop timer fires must still stop it.
+//
+// MUTATION: remove s.dropUnanchoredLeases() from the shutdown path in Serve -> queue.stop
+// is never closed -> queue.stopped never closes -> this reds (the bounded wait times out).
+func TestRestartShutdownBeforeGraceStopsEvaluator(t *testing.T) {
+	server, paths := serveDumpTestServer(t)
+	// Never fire the grace seam: the timer's own drop must NOT be what saves us.
+	server.restartAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+	writeReloadDump(t, paths, "CONFINE-leak@s")
+
+	cancel, done := startServeInline(t, server)
+	if !waitForLeaseCount(server, 1, 2*time.Second) {
+		cancel()
+		awaitShutdown(t, done)
+		t.Fatal("reloaded lease was not seeded")
+	}
+	// Capture the queue before shutdown prunes it from the registry.
+	server.admitRegistryMu.Lock()
+	queue := server.admitQueues["/slice"]
+	server.admitRegistryMu.Unlock()
+	if queue == nil {
+		cancel()
+		awaitShutdown(t, done)
+		t.Fatal("no /slice queue after reload")
+	}
+
+	// Shut down BEFORE the grace timer fires: only the shutdown-path drop can empty the
+	// queue and let pruneAdmitRegistry close queue.stop so runEvaluator exits.
+	cancel()
+	awaitShutdown(t, done)
+
+	select {
+	case <-queue.stopped:
+	case <-testdeadline.After(2 * time.Second):
+		t.Fatal("the reloaded-lease queue's evaluator did not stop after shutdown — a never-re-declared unanchored lease leaked its evaluator (queue.stop never closed)")
+	}
+}

@@ -558,6 +558,14 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelSliceCeiling()
 	cancelOOMSteer()
 	cancelRestartFreeze()
+	// cancelRestartFreeze() just killed the timer that would eventually drop a reloaded
+	// lease no client re-declared. Drop those unanchored leases NOW: they are the only
+	// waiter class with no connection handler (close(stopping) released every ANCHORED
+	// lease via its handler), so without this their queues stay non-empty, pruneAdmitRegistry
+	// never closes queue.stop, and their evaluator goroutines outlive Serve. The dump above
+	// already skips unanchored leases, so nothing is lost; a live holder re-declares and
+	// re-establishes (S9). Idempotent with the timer's own drop.
+	s.dropUnanchoredLeases()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {

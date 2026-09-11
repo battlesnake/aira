@@ -67,15 +67,18 @@ func (s *Server) reloadLeaseDump() {
 		// "logged and skipped"): seed the prefix, log the rest.
 		log.Printf("aira daemon: restart: lease dump decode stopped after %d record(s): %v", len(dump.Records), decErr)
 	}
+	// Nothing to seed — a valid empty dump OR a header-decode failure (zero records,
+	// zero Stamp). Return BEFORE the freshness check so a corrupt header does not also
+	// log a misleading "56y old" from the zero-value Stamp.
+	if len(dump.Records) == 0 {
+		return
+	}
 	// FRESHNESS (§15 P2-A): a dump older than the threshold means a real reboot or a
 	// slow drain → full quota. Uses s.admitNowTime() (not time.Since) so the fake clock
 	// drives the boundary; the stamp is wall-clock UnixNano so it survives the restart.
 	age := s.admitNowTime().Sub(dump.Stamp)
 	if age > leaseDumpFreshness {
 		log.Printf("aira daemon: restart: lease dump is %s old (> %s); starting at full quota", age.Round(time.Second), leaseDumpFreshness)
-		return
-	}
-	if len(dump.Records) == 0 {
 		return
 	}
 	// Resolve the ONE slice ONCE (D1: the frozen dump/frame carry no slice, so every
@@ -175,18 +178,20 @@ func (s *Server) restartFrozenAt(now time.Time) bool {
 }
 
 // runRestartFreeze is the restart-recovery timer, spawned at listen-ready and cancelled
-// on shutdown. It does nothing if no freeze was armed (a reboot/stale dump reloaded
-// nothing). Two phases, driven by the restartAfter seam (nil → time.After) so tests
+// on shutdown. Two phases, driven by the restartAfter seam (nil → time.After) so tests
 // advance the schedule without a real sleep:
 //
 //  1. at freeze-end: signal every admit queue so a waiter blocked PURELY by the freeze
 //     re-evaluates immediately rather than at the next poll tick.
 //  2. at freeze-end + unanchoredGrace: drop every lease STILL unanchored — the REAL
 //     safety (kill -0 alone leaks a supervisor pid that outlived its worker).
+//
+// It runs UNCONDITIONALLY — NOT gated on the freeze having been armed. The drop safety
+// must NOT be coupled to the freeze: a build with restartFreeze<=0 (freeze disabled) that
+// still reloaded a dump seeds unanchored leases which must still be dropped. Both phases
+// no-op harmlessly when there is nothing to do (an immediate signal, a drop over an empty
+// unanchored set), so the cost of always running is a single cancellable goroutine.
 func (s *Server) runRestartFreeze(ctx context.Context) {
-	if s.restartFreezeUntilNanos.Load() == 0 {
-		return
-	}
 	after := s.restartAfter
 	if after == nil {
 		after = time.After

@@ -42,6 +42,11 @@ func TestRestartFreezeBlocksNewAdmissionWhileReDeclareAnchors(t *testing.T) {
 	if seeded.state != admitGranted || !seeded.unanchored {
 		t.Fatalf("seeded lease state=%d unanchored=%v, want granted+unanchored during the freeze", seeded.state, seeded.unanchored)
 	}
+	// The restart freeze and the AIRA-59 fairness freeze are DISTINCT mechanisms: a frozen
+	// restart pass must NOT arm the fairness anchor (or it would perturb the duty-cycle).
+	if !queue.freezeArmedAt.IsZero() {
+		t.Fatalf("the restart freeze must not arm the AIRA-59 fairness anchor, freezeArmedAt=%v", queue.freezeArmedAt)
+	}
 
 	// A re-declare of the seeded scope is accepted IMMEDIATELY during the freeze and
 	// re-anchors it in place (unanchored cleared), proving re-declares are never frozen.
@@ -93,6 +98,41 @@ func TestRestartFreezeNonBlockingReturnsUnevaluated(t *testing.T) {
 	}
 	if rejection.Grantable != nil {
 		t.Fatalf("frozen rejection carries a Grantable figure (%d); the freeze gate must record none", *rejection.Grantable)
+	}
+}
+
+// verifies: S11/S9 plan item 8 (Fable P2-2) — the ABSENT-lease ESTABLISH is freeze-EXEMPT.
+// The crash-restart-no-dump driver: a fresh daemon has an EMPTY ledger and every live
+// survivor's re-declare is absent-lease; they MUST establish GRANTED immediately even
+// while the freeze is active (the freeze gates ONLY the evaluator's new-admission grant
+// pass, never enqueueReDeclare). The existing freeze test covers the SET/re-anchor of a
+// SEEDED lease; this covers the ABSENT case. A freeze check misplaced into the
+// reDeclare/reload arm of enqueueAdmitInternal — or routing the establish to the queued
+// insert — would freeze the survivors behind the 2s, time them out, and drop live leases.
+func TestRestartFreezeExemptsAbsentLeaseEstablish(t *testing.T) {
+	server := reDeclareTestServer()
+	now := time.Unix(5500, 0)
+	server.admitNow = func() time.Time { return now }
+	server.armRestartFreeze(now)
+	if !server.restartFrozenAt(now) {
+		t.Fatal("precondition: the freeze must be active at now")
+	}
+
+	// Empty ledger, a NEW scope re-declare (absent lease): establish GRANTED immediately.
+	conn := testAnchorConn()
+	defer conn.Close()
+	_, got, code, err := server.enqueueReDeclare("/slice", 2*gib, "redeclare", admitRequest{
+		scopeID: "CONFINE-absent@x", peerSameUID: true, conn: conn, cpu: 1,
+	})
+	if err != nil || code != "" {
+		t.Fatalf("absent-lease re-declare during the freeze refused: code=%q err=%v", code, err)
+	}
+	if got == nil || got.state != admitGranted || !got.accounted {
+		t.Fatalf("absent-lease establish during the freeze must be GRANTED immediately (freeze-exempt), got=%+v", got)
+	}
+	// It is a real ledger lease, not a queued shadow.
+	if out, _, jobs := queueLedger(reDeclareQueue(server)); out != 2*gib || jobs != 1 {
+		t.Fatalf("established lease must count in the ledger: outstanding=%d jobs=%d, want 2Gi/1", out, jobs)
 	}
 }
 
