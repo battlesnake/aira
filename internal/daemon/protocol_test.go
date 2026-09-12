@@ -95,10 +95,45 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 // silently — the wrong-project write the feature refuses by name everywhere
 // else, and undetectable below this layer because core.Do does not refuse an
 // argument its handler never reads.
+//
+// verifies: AIRA admission-counter S5/S7 — the 9→10 bump. S5 added the `cpu`
+// admit arg (its bump deferred to S7); S7 froze the version-frozen re-declare
+// frame and switched to the signed ledger, so a v0.5/proto-9 client's NEW
+// admission must be refused loudly (TestProtocolMismatchRefusesLoudly), while a
+// re-declare crosses versions by its magic ahead of this check
+// (TestOldClientReDeclareIsSniffedBeforeProtocolCheck).
+//
+// verifies: AIRA admission-counter S15 — the 10→11 bump. S15 rebuilt worker-admit
+// onto the signed ledger, changing the worker-admit wire's SHAPE (response gained
+// parent_scope_id / available_bytes / available_cpu) and its SEMANTICS (max_wait_ms
+// present-and-zero is now a non-blocking snapshot, not a speculative try-acquire).
+// An old proto-10 worker-admit client must be refused loudly, while the ARDR
+// re-declare still crosses versions by its magic.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 9 {
-		t.Fatalf("ProtocolVersion = %d, want 9; a wire-shape or wire-semantics change must "+
+	if ProtocolVersion != 11 {
+		t.Fatalf("ProtocolVersion = %d, want 11; a wire-shape or wire-semantics change must "+
 			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
+	}
+}
+
+// TestProtocolMismatchRefusesLoudly pins the OTHER half of the S7 goal: a client
+// speaking the previous protocol (a v0.5/proto-9 client) that sends a NEW
+// admission — an ordinary length-prefixed request — is refused LOUDLY with
+// E_DAEMON_PROTOCOL, not silently accepted against the signed-ledger daemon. The
+// re-declare path (the ARDR frame) is the ONLY cross-version exception, and it
+// is sniffed BEFORE this check, so this test and the sniff test together pin both
+// directions.
+func TestProtocolMismatchRefusesLoudly(t *testing.T) {
+	response := serveProtocolFrame(t, RequestFrame{
+		Proto:   ProtocolVersion - 1,
+		Scope:   WorktreeScope{StateID: "state"},
+		Request: core.Request{Verb: "admit"},
+	}, false)
+	if response.Code != CodeProtocol || !strings.Contains(response.Error, "daemon protocol is") {
+		t.Fatalf("proto-mismatch response = %+v; want a loud %s refusal", response, CodeProtocol)
+	}
+	if response.Proto != ProtocolVersion {
+		t.Fatalf("mismatch refusal carries proto %d, want the daemon's own %d", response.Proto, ProtocolVersion)
 	}
 }
 

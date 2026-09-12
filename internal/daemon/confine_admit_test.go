@@ -107,7 +107,6 @@ func TestDelegateRAMPinnedAdmitGrantIncludesScopeCeiling(t *testing.T) {
 	server.stopping = make(chan struct{})
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
-	server.admitConfineScan = noConfinesScan
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 8 << 30}, nil
 	}
@@ -169,7 +168,6 @@ func TestConfineEstimatorP90PriorNotMedianOrFlat(t *testing.T) {
 
 func TestAdmitConcurrencyScaledHeadroomAndLifetimeCapacity(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitConfineScan = noConfinesScan
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
@@ -200,7 +198,6 @@ func TestAdmitConcurrencyScaledHeadroomAndLifetimeCapacity(t *testing.T) {
 // call site (which the coarser 15 GiB / 64 GiB case cannot detect).
 func TestAdmitScaledHeadroomDiscriminatesPerSupervisorTerm(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitConfineScan = noConfinesScan
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
 	server.admitSliceHeadroomBase = 2 << 30
@@ -232,7 +229,6 @@ func TestAdmitScaledHeadroomDiscriminatesPerSupervisorTerm(t *testing.T) {
 // waiters stay queued and are granted, accounted, once the read recovers.
 func TestAdmitReadFailureKeepsWaitersQueuedUncounted(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitConfineScan = noConfinesScan
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
 	readable := false

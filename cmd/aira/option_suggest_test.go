@@ -71,7 +71,6 @@ func TestAIRA182ConfineNamesTheOptionATypoMeant(t *testing.T) {
 		{"ower", "--owner"},
 		{"detatch", "--detach"},
 		{"exclsuive", "--exclusive"},
-		{"admit-timout", "--admit-timeout"},
 		{"memory-reserved", "--memory-reserve"},
 	} {
 		t.Run(test.unknown, func(t *testing.T) {

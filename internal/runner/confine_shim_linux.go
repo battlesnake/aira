@@ -227,7 +227,7 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		// third argument is the same "did the daemon really book it" predicate
 		// the real path uses.
 		ledgerCharged := (admission.state == "immediate" || admission.state == "waited") &&
-			admission.lock == nil && admission.release != nil
+			admission.release != nil
 		result.Status.ContainerMemory = ContainerMemoryFacet(containerPlan, containerInjection, containerReserveSkip, ledgerCharged)
 	}
 	setupArgv, err := confineSetupArgv(containerInjection.Argv, request.DelegateRAM)
@@ -430,9 +430,6 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	}
 	_ = handshakeWrite.Close()
 	_ = releaseRead.Close()
-	if admission.lock != nil {
-		releaseAdmission()
-	}
 	handshakeTimeout := request.HandshakeTimeout
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = time.Second

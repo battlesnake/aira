@@ -26,19 +26,9 @@ const (
 	// hardcoded 30-minute cap applied by SILENT SUBSTITUTION here and in two
 	// other places; over-ceiling requests are now refused and told the bound.
 	admitWaitCeilingMs = int64(runner.AdmitWaitCeiling / time.Millisecond)
-	// workerAdmitWaitCeilingMs deliberately stays at 30 minutes rather than
-	// adopting the shared ceiling. AIRA-63 has now given workerAdmitConnection
-	// the same admitSlots bound admitConnection has, so the ORIGINAL reason for
-	// the split ("worker-admit is not gated at all, and a 24h ceiling would
-	// permit unbounded concurrent retained connections") no longer holds — but
-	// unifying the two ceilings is deliberately NOT part of that fix. Raising
-	// worker-admit's ceiling 48x changes how long a saturated aitest run may sit
-	// holding shared admission slots that ordinary `aira confine` admission also
-	// draws from, which needs its own sizing decision rather than riding along
-	// with a ledger change. Its only caller, the aitest supervisor, uses waits
-	// two orders of magnitude smaller either way. Revisit deliberately, in its
-	// own change, not as a "consistency" refactor.
-	workerAdmitWaitCeilingMs            int64 = 30 * 60 * 1000
+	// S15 deleted workerAdmitWaitCeilingMs: a worker-admit CLAIM is a blocking
+	// lease with no daemon-side timeout (design §4/§6), exactly like the confine
+	// admit path, so there is no wait to ceiling-check.
 	admitMaxWaiters                           = 256
 	admitGlobalMax                            = 1024
 	admitMaxReserve                     int64 = 1 << 50
@@ -50,47 +40,6 @@ const (
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
 	delegateRAMScopeMinDefault          int64 = 4 << 30
 	delegateRAMScopeSafetyPct           int64 = 15
-	// delegateRAMAdoptionMargin is the pre-AIRA-29 reconstruction margin. AIRA-29
-	// replaced it with the shared chargeMargin policy; it survives only as what
-	// the dynamic-reserve kill switch reverts to, so the switch restores the
-	// whole prior behaviour rather than most of it.
-	delegateRAMAdoptionMargin int64 = 64 << 20
-
-	// AIRA-29 dynamic reserve. The admission ledger charges a confine scope its
-	// LIVE cgroup usage plus a growth margin, refreshed on the evaluator's own
-	// <=1s scan, instead of holding the frozen peak ESTIMATE for the whole job
-	// lifetime. Measured motivation: a `make merge-gate` held a 33.6G reserve
-	// while using 2.6G for 62 minutes, blocking other jobs while ~48G sat idle.
-	//
-	// chargeMarginFloorDefault is the smallest margin any tracked scope carries,
-	// so a job sitting exactly at its observed peak still has room to breathe
-	// between two scans without the ledger having to be re-read.
-	chargeMarginFloorDefault int64 = 256 << 20
-	// chargeMarginPctDefault scales the margin with the job's own size: a 20G job
-	// does not grow in 256 MiB steps.
-	chargeMarginPctDefault int64 = 12
-	// chargeColdFloorWindowDefault is how long a freshly granted waiter keeps
-	// being charged its full resolved reserve. It closes the cold-start hole: a
-	// job admitted on a 33.6G estimate that has not allocated YET must not free
-	// 33.6G of ledger to its neighbours and then allocate 20G. It is a FLOOR, not
-	// a ceiling -- a job that ramps fast charges its real usage through it at the
-	// very next scan.
-	chargeColdFloorWindowDefault = 90 * time.Second
-
-	// AIRA-114. oversubscriptionFactorPctDefault bounds the AGGREGATE of every
-	// live scope's own memory.max against the slice ceiling, expressed as a
-	// percentage of that ceiling: 200 means the caps may total at most 2x the
-	// slice. See admit_oversubscription.go for the whole mechanism.
-	//
-	// 2x rather than a tighter figure because the bound exists to make the worst
-	// case a KNOWN MULTIPLE, not to re-impose the frozen Sigma(reserve) <= ceiling
-	// rule AIRA-29 deliberately removed. Measured against the real slice: two
-	// 28 GiB merge-gate caps plus a 48 GiB delegate suite total 104 GiB on a
-	// 64 GiB slice, which this admits; a fourth large job does not fit and waits,
-	// which is exactly the case the residual named. A factor at or below 1 is
-	// REFUSED by the parser, because a single job whose reserve reaches the
-	// ceiling must always fit an empty slice.
-	oversubscriptionFactorPctDefault int64 = 200
 
 	// admitExclusiveWaitCeilingDefault bounds how long an EXCLUSIVE request may
 	// drain the slice. It is deliberately far below the shared 24-hour
@@ -98,11 +47,6 @@ const (
 	// machine while it drains, so a day-long drain is not a wait, it is an outage.
 	// Enforced by REFUSAL, never silent substitution (the AIRA-58 rule).
 	admitExclusiveWaitCeilingDefault = 30 * time.Minute
-
-	// admitExclusiveEstablishGrace is how long the confine scan may be failing
-	// before a draining exclusive waiter is ABORTED rather than left holding the
-	// slice. See sliceQueue.scanFailingSince.
-	admitExclusiveEstablishGrace = 30 * time.Second
 )
 
 // admitExclusiveWaitCeiling is the effective exclusive ceiling. It can never
@@ -145,14 +89,6 @@ const (
 	admitExclusiveHeld     = "held"
 )
 
-// admitOutcomeExclusiveUnestablished is the waiter outcome the unestablished-
-// emptiness abort records. admitConnection branches on it so the abort reaches
-// the client as its own code rather than as E_ADMIT_SATURATED — reporting "the
-// slice was busy" for what is actually "the daemon could not read the slice"
-// would be a fabricated diagnosis of exactly the kind the fail-closed rule exists
-// to prevent.
-const admitOutcomeExclusiveUnestablished = "exclusive-unestablished"
-
 // exclusiveStateOf names which half of the exclusive lifecycle a waiter is in.
 // Empty for a waiter that is not asserting exclusivity at all, so callers can
 // treat "" as an honest absence rather than a third state.
@@ -176,8 +112,15 @@ const (
 )
 
 type admitWaiter struct {
-	seq       int64
-	reserve   int64
+	seq     int64
+	reserve int64
+	// S5. cpu is this lease's declared CPU-core reservation, the second ledger
+	// resource beside reserve (RAM). {reserve, cpu} is the resource vector admission
+	// gates conjunctively (design §7). CPU is accounting-only: it charges the
+	// per-slice queue.cpuOutstanding ledger and NO cpu.max is ever written — the
+	// kernel time-shares on cpu.weight. Zero for a lease that declared no cores (a
+	// delegate SUITE reserves 0 cores; §8); the confine client's default is one core.
+	cpu       int64
 	state     admitWaiterState
 	grantedCh chan struct{}
 	enqueued  time.Time
@@ -193,8 +136,8 @@ type admitWaiter struct {
 	owner     string
 	// scopeCeiling is the delegate-ram scope's resolved memory.max (AIRA-15),
 	// zero for every other class. Set at construction under queue.mu — see
-	// admitRequest.scopeCeiling for why that moved — so the evaluator may read
-	// it, which AIRA-114's aggregate accounting needs.
+	// admitRequest.scopeCeiling for why that moved — and carried to the launcher
+	// on the grant response (AdmitResponse.ScopeCeiling) so it sizes the scope cap.
 	scopeCeiling int64
 
 	// AIRA-108. A BOUNDED copy of the client's own resource signature, retained
@@ -216,116 +159,6 @@ type admitWaiter struct {
 	// bounded together; the renderer's escaping is a second, narrower bound for
 	// the terminal.
 	signature string
-
-	// AIRA-29 dynamic reserve. All five are read and written ONLY under queue.mu,
-	// and only ever by evaluateAdmitQueue's own scan block, the grant, and the
-	// release -- the same critical sections that own queue.outstanding, which is
-	// what makes "outstanding == sum of effectiveCharge" checkable rather than
-	// merely intended.
-	//
-	// effectiveCharge/chargeTracked are ONE value with a two-state provenance,
-	// and they are deliberately read only through ledgerCharge(). chargeTracked
-	// is false until a usable scan reading has replaced the frozen estimate, and
-	// while it is false this waiter charges its `reserve` -- which is exactly the
-	// pre-AIRA-29 behaviour, and exactly what the grant-before-scope-creation
-	// window needs.
-	//
-	// The pair exists in this shape rather than as a single field initialised at
-	// the grant because a lone effectiveCharge makes an INVALID STATE
-	// REPRESENTABLE: any waiter that reaches admitGranted without it being set
-	// charges zero, silently, and the ledger under-counts a live job. That is the
-	// exact defect class this ledger exists to prevent, and it is not something
-	// to be careful about -- ledgerCharge() makes it unwritable. Zero is a
-	// legitimate charge (a scope whose memory.max is 0), so a "0 means fall back
-	// to reserve" rule would not do: it would corrupt that reading instead.
-	//
-	// The frozen `reserve` above deliberately stays untouched: it is still the
-	// client's grant payload and the scope's hard memory.max, and the AIRA-24
-	// "bytes queued ahead of me" figure is a statement about reserves, not
-	// charges.
-	//
-	// peakSoFar is a LIFETIME ratchet of the scope's observed memory.current. The
-	// charge never falls below a level the job has already demonstrated, which
-	// removes the peak-drop-then-regrow race: a job cannot free ledger space by
-	// dipping and then reclaim memory somebody else was admitted into.
-	//
-	// lastRSS/havePrevRSS carry the previous sample so one interval's observed
-	// growth can enter the margin. havePrevRSS is not a convenience: without it
-	// the first sample reads as growth == rss and doubles every cold charge.
-	//
-	// trackedRatchet is the monotone non-decreasing high-water mark of
-	// min(cap, peak+margin), EXCLUDING the cold floor. It is what stops the
-	// charge oscillating. The growth term is inherently non-monotone -- it enters
-	// the margin on a growing scan and leaves it on the next flat one -- so
-	// without this a bursty job would swing the SHARED ledger by gigabytes every
-	// second, and neighbours would be admitted precisely during its lulls, which
-	// is the least conservative moment there is. The cold floor is deliberately
-	// outside the ratchet: it MUST be able to lapse, or the feature could never
-	// engage at all.
-	//
-	// Stated precisely, because "monotone" is easy to over-claim: the RATCHET is
-	// unconditionally monotone, and the resulting CHARGE is monotone for a scope
-	// whose memory.max does not change -- which is every scope AIRA creates, since
-	// the cap is written once at setup and neither this change nor AIRA-103 ever
-	// moves a kernel-enforced value afterwards. An externally rewritten cap would
-	// take the charge down with it, because the clamp is applied after the
-	// ratchet; honouring a lowered hard cap is the correct behaviour there anyway.
-	effectiveCharge int64
-	chargeTracked   bool
-	peakSoFar       int64
-	lastRSS         int64
-	havePrevRSS     bool
-	trackedRatchet  int64
-
-	// AIRA-68. scopeSeen/scopeVanished record a TRANSITION observed by the
-	// evaluator's own <=1s confine scan — the same authority the adopted ledger
-	// already trusts — and are meaningful only for a scope-backed waiter
-	// (scopeID != ""). Both are written ONLY inside evaluateAdmitQueue's
-	// scan-success block, under queue.mu, and never on a failed scan.
-	//
-	// The pair exists because plain ABSENCE is not a safe reclaim signal and the
-	// transition is. The pre-existing empty-scope reclaim is safe against a
-	// launcher stalled before scope creation only because it is DESTRUCTIVE: it
-	// removes the directory, so the launcher's next cgroupfs write fails
-	// ENOENT/ENODEV and the launch aborts cleanly. Reclaiming on absence alone
-	// has no such fence — the stalled launcher would lose its lease, then create
-	// its scope and run entirely UNCHARGED, which is the #67 aggregate-OOM class.
-	// A waiter that never created a scope never gets scopeSeen, so it is never a
-	// candidate, and its treatment is unchanged.
-	//
-	// scopeVanished is deliberately CLEARED when the scope is observed again: a
-	// scan is a fresh fact, not a latch, and a stale "vanished" must never
-	// outlive the observation that produced it.
-	//
-	// Honest limits, all pre-existing and all in the safe direction:
-	//   - A scope created and removed entirely between two scans never sets
-	//     scopeSeen, so a lease stuck that way stays stuck (the empty-reap branch
-	//     has the identical blind spot: it needs a directory to reap).
-	//   - A scope id accepted by confineScopeIDPattern but rejected by the
-	//     scanner's own parseConfineScopeID is omitted from every scan, so
-	//     scopeSeen never becomes true. Never a false reclaim.
-	//   - "Seen then gone" proves the scope held no processes at removal time. It
-	//     does NOT prove the job is dead: a leader can migrate into a sibling
-	//     cgroup and keep running (internal/runner/descendant_escape_linux_test.go).
-	//     That is exactly the strength of the empty-reap branch's own proof, and
-	//     why the reported counter is named `vanished`, never `ghost`.
-	//   - Strictly, the scan observes a PATHNAME, and cgroup v2 permits renaming a
-	//     cgroup within its parent — so an absent scope id means "no cgroup by
-	//     that name", not unconditionally "that cgroup was removed". A renamed,
-	//     still-populated scope would therefore be read as vanished and its lease
-	//     reclaimed after the TTL while the job runs on, still contained. Both
-	//     plan reviewers raised this independently and it is recorded, not fixed:
-	//     nothing in AIRA renames a scope, closing it needs per-scope inode
-	//     identity threaded through the scan (real machinery for an
-	//     externally-injected scenario, which architectural-simplicity says to
-	//     document rather than build), and the consequence is bounded the same way
-	//     the migrated-leader case is — the release is LEDGER-ONLY, and a renamed
-	//     cgroup is still inside the slice, so its memory is still charged through
-	//     max(current - reclaimable, sum of reserves). Requiring a currently
-	//     succeeding scan (see dischargeVanishedStaleLease) narrows the window but
-	//     does not close it.
-	scopeSeen     bool
-	scopeVanished bool
 
 	// AIRA-101. Exclusivity is a DERIVED property of this waiter, never a
 	// standalone flag on the queue or the server. That is the whole crash-safety
@@ -371,8 +204,8 @@ type admitWaiter struct {
 
 	// AIRA-149. DIAGNOSIS ONLY: neither field is read by any admission or grant
 	// decision, and both are written ONLY inside evaluateAdmitQueue's existing
-	// refusal branches, under queue.mu -- the same discipline as the AIRA-29
-	// charge fields above.
+	// refusal branches, under queue.mu -- the same single-writer discipline as
+	// every other evaluator-maintained field on this struct.
 	//
 	// contention is LATCHED ACROSS THE WHOLE WAIT, never sampled at the instant
 	// of rejection, and that is the point of it existing at all: a waiter blocked
@@ -389,25 +222,91 @@ type admitWaiter struct {
 	// fabricated zero.
 	contention    int
 	lastGrantable *int64
+
+	// S8 (restart/anchor state — design §3 compare-and-release, §4 restart).
+	//
+	// anchor is the connection that CURRENTLY owns this lease (design §3 Inv 4): a
+	// lease is released ONLY by the EOF of its current-anchor connection. Each
+	// (re-)anchor through anchorLeaseLocked OVERWRITES it under queue.mu, so a
+	// re-declare on a new connection makes a stale old connection's later EOF a
+	// no-op — releaseAdmitWaiterLockedAnchored discharges only when the releasing
+	// connection still IS the anchor. The compare is direct identity on the live
+	// net.Conn the handler holds for the lease's whole lifetime: a handler never
+	// releases a conn it is not still holding, so an equal-or-recycled value cannot
+	// arise, and there is NO separate "which generation am I" value for the
+	// releasing connection to capture in a second critical section. (A monotone
+	// generation — bumped on re-anchor, captured by each connection for its later
+	// release — was the builder's first cut; Fable found it reintroduced the very
+	// lost-lease race it meant to close, because the capture and the bump were
+	// separate critical sections. Conn identity is the plan's own wording,
+	// "discharge only if anchor==thisConn", and has no capture window.)
+	//
+	// clientPID / processStartTick are the peer's pid and /proc start-tick, read
+	// from the connection at anchor time (zero when the peer credential is unreadable,
+	// e.g. a net.Pipe test connection with no injected credential seam). Since S13
+	// deleted the dump/reload layer they are diagnostic only — no restart path reads
+	// them back — but a granted lease is always anchored to a live connection, so they
+	// remain the identity of that connection's peer.
+	anchor           net.Conn
+	clientPID        int
+	processStartTick uint64
 }
 
-// ledgerCharge is what this waiter contributes to queue.outstanding: the
-// dynamic charge once a usable scan reading has established one, and the frozen
-// resolved reserve until then. queue.mu must be held.
+// ledgerCharge is what this waiter contributes to queue.outstanding: its
+// DECLARED reserve, for the whole lifetime of the lease. The admission model is
+// declared-only (there is no live-usage tracking) -- over-declaring is a caller
+// error, and the peak-RSS estimate sizes the declared reserve for a known
+// command. queue.mu must be held.
 //
-// Every ledger site goes through this -- the grant's add, the release's
-// subtract, the scan's delta, and admitSliceSnapshotFor's three sums -- so
+// Every ledger site goes through this -- rederiveLedgerLocked's sum after each
+// grant and release, and admitSliceSnapshotFor's sums -- so
 // "outstanding == sum of ledgerCharge over granted && accounted waiters" is one
-// statement about one function, not an agreement between six call sites that
-// must be maintained by hand.
+// statement about one function, not an agreement between call sites that must
+// be maintained by hand.
 func (w *admitWaiter) ledgerCharge() int64 {
 	if w == nil {
 		return 0
 	}
-	if w.chargeTracked {
-		return w.effectiveCharge
-	}
 	return w.reserve
+}
+
+// rederiveLedgerLocked recomputes the queue's ledger from its waiters: the sum
+// of ledgerCharge() over every granted && accounted waiter, and the count of
+// them. queue.mu must be held.
+//
+// It is the ONE writer of queue.outstanding / queue.outstandingJobs, called
+// after every grant and every release. Those fields are therefore a re-derived
+// CACHE of the waiter set -- `available = ceiling - Σleases` derived from the
+// leases themselves (design §2) -- never a running total mutated in two places.
+// A grant that flips a waiter to granted && accounted, or a release that removes
+// it (and marks it admitReleased), changes exactly one term of this sum, so the
+// derived figure equals what the old `+=` / `-=` counter produced for any real
+// waiter set; what changes is only that nothing can now set the scalar out of
+// step with the waiters it is supposed to describe.
+//
+// The scope-id keying the design names IS the waiter set: enqueueAdmitInternal
+// refuses a queued/rejected duplicate scope id and re-anchors a granted one in place
+// (see leaseByScopeIDLocked), so at most one non-released waiter carries any scope id.
+// A separate per-queue map keyed by scope id would
+// be a second copy of that fact to keep in sync -- the double-mutated state §2
+// exists to remove -- and scope-less `confine-reserve` waiters (scopeID == "")
+// have no key at all, so the walk over waiters is the honest ledger here.
+//
+// S5. It re-derives BOTH ledger resources in the one walk: outstanding (RAM, via
+// ledgerCharge) and cpu (Σ lease cores). Both are PER-SLICE caches the caller stores
+// on the queue (queue.outstanding and queue.cpuOutstanding); CPU is gated per slice
+// on the one-slice (aira.slice) assertion (D1). jobs counts either resource's
+// granted && accounted waiters (they are the same set).
+func rederiveLedgerLocked(queue *sliceQueue) (outstanding int64, cpu int64, jobs int) {
+	for _, waiter := range queue.waiters {
+		if waiter == nil || waiter.state != admitGranted || !waiter.accounted {
+			continue
+		}
+		outstanding += waiter.ledgerCharge()
+		cpu = addClamp(cpu, waiter.cpu)
+		jobs++
+	}
+	return outstanding, cpu, jobs
 }
 
 // exclusiveActive reports whether this waiter currently asserts exclusivity.
@@ -493,39 +392,39 @@ func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
 	return ids
 }
 
-// sliceProvablyEmpty reports whether the daemon can POSITIVELY establish that
-// nothing else is admitted or running in this slice. queue.mu must be held.
+// sliceProvablyEmpty reports whether the slice holds no other admitted job:
+// Σleases == 0, i.e. no granted && accounted waiter. queue.mu must be held.
 //
-// Fail-closed in all three terms, and the third is the important one: a scan the
-// daemon could not complete leaves liveScopesKnown false, and an unestablished
-// emptiness must never be rendered as an empty slice. Telling a benchmark "you
-// are alone" on a reading nobody has is the fabricated pass this codebase
-// forbids everywhere else.
+// S14 rewired this from a cgroup-scan reading (the deleted subtree-population
+// counters) to the signed ledger. Emptiness is now exactly "the daemon
+// holds no lease for this slice", derived from the same connection-held ledger
+// `available = ceiling − Σleases` is (design §2/§3). outstandingJobs is
+// rederiveLedgerLocked's count of granted && accounted waiters, so this equals
+// Σleases == 0 verbatim: a grant sets state == admitGranted and accounted == true
+// together (nothing ever sets accounted false on a granted waiter), so the count
+// can never lag the leases it describes.
 //
-// KNOWN COVERAGE LIMITS of the emptiness reading, stated rather than discovered
-// later. Each is fail-OPEN for the measurement and fail-SAFE for the machine —
-// they can let an exclusive job be granted beside something, never wedge the
-// slice:
+// ACCEPTED COVERAGE GAP (D5 — owner 2026-09-11, accepted rather than engineered
+// around). Emptiness is a claim about LEASES, never about resident RAM:
 //
-//   - `aira run` scopes are named .aira-RUN-* under a project's own cgroup
-//     parent, not .aira-CONFINE-* under this slice, so the confine scan does not
-//     see them. While such a run holds its admission connection it is still
-//     counted by outstandingJobs; only after a daemon restart does it become
-//     invisible here.
-//   - Anything not admitted through AIRA at all — a process placed into the slice
-//     by hand — is outside this reading by construction, and so is a Docker
-//     container, which lives under /system.slice/docker-<id>.scope entirely
-//     outside this slice. `--exclusive`'s own help text says so; exclusivity must
-//     never be read as a claim about those.
+//   - An orphaned RAM holder that lost its lease — a SIGKILLed supervisor whose
+//     worker reparents and survives (design §3) — reads as empty here, so
+//     `--exclusive` could be granted beside it. Bounded, not airtight: oom.group
+//     fires on memory pressure, not supervisor death, so the MemAvailable
+//     watchdog and per-scope OOM backstop are the only net, bounded by the
+//     orphan's lifetime (design §3, §11).
+//   - Anything not admitted through AIRA at all — a process placed in the slice
+//     by hand, or a Docker container under /system.slice/docker-<id>.scope — is
+//     outside the ledger by construction. `--exclusive`'s own help text says so;
+//     exclusivity is never a claim about those.
 //
-// outstandingJobs is strict, with NO discount for exempt sub-reservations. A
-// discount would be unnecessary — a running job's own scoped lease already keeps
-// the count at 1 or more, and a post-restart adopted parent is caught by
-// subtree-aware liveScopes — and it would remove a belt-and-braces signal in the
-// one case where it is the only thing still objecting: a live reservation whose
-// parent job has escaped its scope or died with its socket held open.
+// This is a deliberate LOOSENING from the pre-S14 scan reading, which could see a
+// running scope that held no lease (a post-restart survivor before it
+// re-declared) and refuse exclusivity beside it. Under the socket-liveness model
+// a survivor re-declares and re-anchors its lease inside the restart freeze
+// (design §4), so the ledger counts it; the only residue is the orphan gap above.
 func sliceProvablyEmpty(queue *sliceQueue) bool {
-	return queue.outstandingJobs == 0 && queue.liveScopesKnown && queue.liveScopes == 0
+	return queue.outstandingJobs == 0
 }
 
 // AIRA-149. The three-valued contention lattice, and the ONE reading that
@@ -581,57 +480,20 @@ func (w *admitWaiter) noteGrantableLocked(available int64) {
 	w.lastGrantable = &value
 }
 
-// soloReadingLocked is the emptiness reading for ONE refusal pass. queue.mu must
-// be held.
+// soloReadingLocked is the emptiness reading for ONE refusal pass, feeding the
+// AIRA-149 contention diagnosis. queue.mu must be held.
 //
-// It is derived STRUCTURALLY, from the subtree-aware population AIRA-101 and
-// AIRA-114 already maintain, and deliberately NOT from the reserve counters
-// (outstandingJobs / adoptedJobs). The comment above the adopted loop says why
-// in its own words: that loop skips leaf-unpopulated scopes, connection-held
-// ones, nil/malformed caps and delegate-without-usable-RSS ones, and every one
-// of those exclusions is correct for RESERVE accounting and wrong for
-// EMPTINESS, because a skipped scope is still a running job. On this box the
-// commonest such scope is a post-restart aitest/delegate outer scope that has
-// drained every pid into a child cgroup: its leaf Populated reads 0 and
-// adoptedJobs stays 0, while it is very much using memory -- driving `current`
-// up and refusing a solo waiter on the ORDINARY disjunct. A counter-derived
-// rule would print "nothing else held or was queued for this slice" beside a
-// running suite: the ticket's own defect, reintroduced by its fix.
+// It reads the same ledger emptiness (sliceProvablyEmpty == Σleases == 0) the
+// exclusive gate does. S14 removed the cgroup scan, so there is no longer an
+// "emptiness the daemon could not establish" case: the ledger is always readable
+// under queue.mu, so this returns observed or none-observed and never
+// unevaluated. (A waiter no pass ever evaluated still renders `unevaluated`
+// through its UNSET latch — a different absence, upstream of this reading.)
 //
-// Job counts, not bytes, remains load-bearing. A residual 4 KiB page in the
-// slice is NOT another job; reading a nonzero `current` as contention is
-// exactly the misdiagnosis AIRA-149 is about (the measured case had
-// current=4096 with zero jobs). sliceProvablyEmpty counts scopes and jobs,
-// never bytes.
-//
-// One bounded gap, named rather than engineered around: the scan behind
-// liveScopes/capAggregate is rate-limited to at most once per second
-// (queue.adoptedAt), so a single pass can read a scope population up to that
-// stale. Over a multi-second wait every pass would have to miss the same
-// neighbour for a false `none-observed`, and it is the identical staleness
-// AIRA-101 already accepts for the strictly more consequential decision of
-// GRANTING exclusivity.
-func soloReadingLocked(queue *sliceQueue, queuedAhead int, overSubscribed bool) int {
-	// A failing confine scan cannot establish solitude. Fail closed, and ALWAYS
-	// first: an unestablished reading outranks every "looks empty" test below it,
-	// so a single such pass forbids the solo claim for the whole wait.
-	if !queue.liveScopesKnown {
-		return contentionUnevaluated
-	}
-	// The disjunct actually taken. An aggregate refusal is by construction a
-	// refusal caused by OTHER scopes' caps.
-	if overSubscribed {
-		return contentionObserved
-	}
-	// Belt and braces on the same scanned population, for the ordinary disjunct:
-	// a nonzero established aggregate means aggregateScopeCap saw live scopes.
-	// It should never be the deciding test -- every scope it counts is also
-	// counted by liveScopes -- and it is kept because it costs one comparison on
-	// a refusal path and makes the AIRA-114 population's contribution to the
-	// claim legible at the site rather than inferable.
-	if queue.capAggregateKnown && queue.capAggregate > 0 {
-		return contentionObserved
-	}
+// Job counts, not bytes: a residual page in the slice is NOT another job, which
+// is exactly the misdiagnosis AIRA-149 is about (the measured case had
+// current=4096 with zero jobs).
+func soloReadingLocked(queue *sliceQueue, queuedAhead int) int {
 	if !sliceProvablyEmpty(queue) {
 		return contentionObserved
 	}
@@ -666,67 +528,12 @@ func confineScopeDirName(scopeID string) string {
 	return ".aira-" + scopeID
 }
 
-// exclusiveDeniesWorkerAdmit reports whether a slice-exclusive HOLD forbids
-// placing a worker under this outer scope (AIRA-101).
-//
-// A DRAIN deliberately does NOT deny. A worker is an already-running job's
-// internal progress, not new work entering the slice, and denying it would stop
-// running suites from finishing — which is exactly what the drain is waiting
-// for, so blocking here would prevent the drain from ever converging. It is also
-// structurally safe to allow: CreateWorkerScope only ever creates
-// `.aira-worker-*` CHILDREN inside an already-existing outer scope, so
-// worker-admit cannot introduce new top-level work into a draining slice however
-// it is answered.
-//
-// A HOLD denies every outer scope that is not the holder's own work — the holder
-// itself, or a nested `aira confine` launched from inside it carrying its token.
-// By construction the slice is empty of other jobs when a hold begins, so this
-// denies nothing that should exist: it is belt-and-braces enforcement of the
-// invariant, not a load-bearing path.
-//
-// Lock order is the established admitRegistryMu -> queue.mu. The caller must
-// hold neither the outer-scope lock nor the CPU-slots gate, so this adds no new
-// nesting.
-func (s *Server) exclusiveDeniesWorkerAdmit(outerScope string) bool {
-	outerScope = strings.TrimSpace(outerScope)
-	if outerScope == "" {
-		return false
-	}
-	// The queue is keyed by resolveAdmitSlicePath's EvalSymlinks'd path, while
-	// worker-admit only Cleans its outer_scope. Canonicalise the parent the same
-	// way, or the lookup silently misses and this gate ships INERT — the failure
-	// mode this project has shipped once already. Falling back to the cleaned path
-	// keeps a scope removed mid-request working instead of turning a lookup miss
-	// into an error.
-	slicePath := filepath.Dir(filepath.Clean(outerScope))
-	if resolved, err := filepath.EvalSymlinks(slicePath); err == nil {
-		slicePath = resolved
-	}
-	scopeDir := filepath.Base(filepath.Clean(outerScope))
-
-	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[slicePath]
-	if queue == nil {
-		s.admitRegistryMu.Unlock()
-		return false
-	}
-	queue.mu.Lock()
-	defer s.admitRegistryMu.Unlock()
-	defer queue.mu.Unlock()
-	gate := exclusiveGateLocked(queue)
-	if gate.holder == nil {
-		return false
-	}
-	// A scope's directory is ".aira-" + its scope id. Compare on that exact
-	// mapping rather than a substring, so a scope whose name merely contains
-	// another's id can never be mistaken for it.
-	for scopeID := range gate.holderScopeIDs(queue) {
-		if scopeDir == confineScopeDirName(scopeID) {
-			return false
-		}
-	}
-	return true
-}
+// S15 deleted the bespoke exclusiveDeniesWorkerAdmit gate. A worker is now an
+// ordinary sub-reservation lease on the unified ledger (parentScopeID = the suite
+// scope-id, via workerParentScopeID), so the shared exclusivity gate handles it:
+// exclusiveGate.blocks exempts a sub-reservation from a DRAIN unconditionally and
+// from a HOLD when its parent is the holder's own work — the exact behaviour this
+// gate provided, now expressed once for every lease rather than duplicated.
 
 // blocks reports whether the exclusivity gate requires this queued waiter to
 // stay queued. queue.mu must be held.
@@ -764,47 +571,37 @@ func (g exclusiveGate) blocks(queue *sliceQueue, waiter *admitWaiter) bool {
 }
 
 type sliceQueue struct {
-	mu              sync.Mutex
-	path            string
-	waiters         []*admitWaiter
+	mu      sync.Mutex
+	path    string
+	waiters []*admitWaiter
+	// outstanding / cpuOutstanding / outstandingJobs are a DERIVED CACHE of the
+	// ledger, not a running total: their only writer is rederiveLedgerLocked, called
+	// after every grant and release to re-sum over the granted && accounted waiters
+	// (design §2, `available = ceiling - Σleases`). Never mutate them directly;
+	// change the waiter set and re-derive.
+	//
+	// S5. cpuOutstanding is the PER-SLICE CPU sum (Σ lease cores), the second ledger
+	// resource beside RAM's `outstanding`, maintained and consulted exactly as RAM
+	// is. CPU is treated PER SLICE — this asserts ONE slice (aira.slice) in practice
+	// (D1, resolved to per-slice). Cores are a machine-wide resource; if multiple
+	// concurrent slices are ever introduced, CPU accounting must become machine-wide
+	// (sum across slices) — revisit then. Per-slice keeps it parallel to RAM and
+	// makes cross-slice ledger-clobber unrepresentable.
 	outstanding     int64
+	cpuOutstanding  int64
 	outstandingJobs int
-	adopted         int64
-	adoptedJobs     int
-	// AIRA-192. The same adoption, PER SCOPE: scope id -> the reconstructed
-	// reserve that scope contributes to `adopted` above. Written in the same
-	// locked block as `adopted`/`adoptedJobs`, from the same loop over the same
-	// scan, and REPLACED WHOLESALE by each successful scan — so the rows and the
-	// scalar can never describe different instants, and a scope that has gone
-	// leaves both together.
-	//
-	// It exists because `adopted` alone is a scalar with no way back to the jobs
-	// that make it up. Before AIRA-192 that was an attribution nuisance
-	// (AIRA-191); once `aira top` draws per-scope reserves it is structural: after
-	// every daemon restart the whole live population is adopted rather than
-	// connection-held, and without this the bar would have to render the entire
-	// machine as unevaluated.
-	//
-	// A FAILED scan leaves it untouched, exactly as it leaves `adopted` untouched
-	// (admit_reconstruction_test pins that retention), because a row set that
-	// disagreed with the total it reconciles against would be worse than a stale
-	// one.
-	adoptedScopes     map[string]int64
-	adoptedAt         time.Time
-	adoptedScanFailed bool
-	seq               int64
-	kick              chan struct{}
-	stop              chan struct{}
-	stopOnce          sync.Once
+	seq             int64
+	kick            chan struct{}
+	stop            chan struct{}
+	stopOnce        sync.Once
 	// stopped is closed by runEvaluator as it exits, so a caller can establish
 	// that the goroutine is GONE rather than merely asked to stop.
 	//
 	// It exists for the tests, and the reason is a real invariant rather than
-	// convenience: evaluateAdmitQueue reads the scan throttle BEFORE taking
-	// queue.mu, which is sound only under the single-writer property documented
-	// there — in production this queue's own goroutine is the sole caller. A test
-	// that drove passes directly while that goroutine was still live would break
-	// the invariant and race, so it must be able to retire it and know when.
+	// convenience: in production this queue's own goroutine is the sole caller of
+	// evaluateAdmitQueue (the single-writer property its state relies on). A test
+	// that drove passes directly while that goroutine was still live would race
+	// that writer, so it must be able to retire the goroutine and know when.
 	stopped chan struct{}
 	poll    time.Duration
 	server  *Server
@@ -838,61 +635,6 @@ type sliceQueue struct {
 	freezeArmedAt   time.Time
 	freezeHolderSeq int64            // diagnostics only; never affects timing
 	freezeLogged    admitFreezePhase // last phase logged, so logs are transitions
-
-	// AIRA-101. liveScopes is the EMPTINESS reading, deliberately separate from
-	// adopted/adoptedJobs, which are a RESERVE reading. adoptedJobs skips
-	// non-finite-cap scopes and connection-held scopes on purpose — both correct
-	// for reserve accounting and both wrong here, because a skipped scope is still
-	// a running job. Reusing it would let an exclusive job be told it is alone
-	// while a delegate-ram suite runs beside it.
-	//
-	// liveScopesKnown is the fail-closed half: it is true only when the scan that
-	// produced liveScopes SUCCEEDED. Granting exclusivity on an unestablished
-	// emptiness would state "you are alone" on a reading the daemon does not have,
-	// which is the fabricated pass this codebase forbids everywhere else.
-	liveScopes      int
-	liveScopesKnown bool
-
-	// AIRA-114. The aggregate over-subscription accounting: the sum of every
-	// live scope's own local memory.max across this slice, and whether that sum
-	// could be established. Both are written only under queue.mu.
-	//
-	// It is a THIRD reading, separate from the reserve ledger above it and from
-	// liveScopes beside it, and the separation is the point: adopted/adoptedJobs
-	// skip leaf-unpopulated and non-finite-cap scopes on purpose, which is
-	// correct for RESERVE accounting and would silently under-count exactly the
-	// largest caps on the machine here. See admit_oversubscription.go.
-	//
-	// capAggregate is re-derived from scratch by every successful scan and
-	// incremented at each grant, so it stays current between scans; the derive is
-	// authoritative and any drift is bounded by one scan interval.
-	//
-	// capAggregateKnown is the fail-OPEN half. It is false whenever the scan
-	// failed or some live scope's cap and usage were both unreadable, and the
-	// bound then withholds nothing at all — the opposite of liveScopesKnown, for
-	// the reason given on oversubscriptionBlocks.
-	capAggregate      int64
-	capAggregateKnown bool
-	// capBlockedLogged is the last state reported, so the bound is logged as a
-	// transition rather than on every pass.
-	capBlockedLogged bool
-
-	// scanFailingSince anchors how long the confine scan has been failing, in the
-	// same derive-from-one-anchor shape as freezeArmedAt. It exists so a drain can
-	// ABORT rather than stall the whole shared slice: with the fail-closed rule
-	// above, a persistently unreadable slice would otherwise block the drain head
-	// (cannot establish emptiness) AND every other waiter (blocked by the drain)
-	// for the full wait ceiling — a machine-wide outage caused by a diagnostic
-	// failure.
-	//
-	// Armed on the FIRST failure while zero and never renewed on later failures;
-	// cleared on any success. Arming only "after a success" would never fire in
-	// this rule's own primary case — a slice unreadable from the queue's very
-	// first pass, which is the likeliest persistent failure, since a queue is
-	// created on demand and its first scan is its first contact with the path.
-	// Never renewing is the freezeArmedAt lesson: a renewed anchor postpones its
-	// own deadline forever.
-	scanFailingSince time.Time
 }
 
 // admitFreezePhaseAt derives the duty-cycle phase from the anchor instant. Held
@@ -939,18 +681,37 @@ var sliceMemoryStatDegradeOnce sync.Once
 // AdmitResponse is the one grant payload sent before the daemon holds the
 // connection as the reservation lease.
 type AdmitResponse struct {
-	State        string `json:"state"`
-	Reason       string `json:"reason,omitempty"`
-	WaitedMS     int64  `json:"waited_ms"`
-	Reserve      int64  `json:"reserve"`
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
+	WaitedMS int64  `json:"waited_ms"`
+	Reserve  int64  `json:"reserve"`
+	// S5. Cpu echoes the granted CPU-core reservation the ledger charged. Purely
+	// informational (the client applies no cpu.max); it keeps the grant wire
+	// symmetric with the {ram, cpu} request vector. omitempty, so a 0-core grant (a
+	// delegate suite; §8) carries no field and older readers are unaffected.
+	Cpu          int64  `json:"cpu,omitempty"`
 	Basis        string `json:"basis"`
 	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
 }
 
 type admitRequest struct {
-	slice       string
-	reserve     int64
-	maxWait     int64
+	slice   string
+	reserve int64
+	// S5. cpu is the declared CPU-core reservation, the second ledger resource. It
+	// is optional on the wire (absent → 0; a lease that declares no cores is charged
+	// none — the confine client sends DefaultConfineCPUCores). A value that exceeds
+	// 2×NumCPU is impossible on this box and is refused fail-fast in admitConnection
+	// before any enqueue (design §7 "RequestInvalid").
+	cpu     int64
+	maxWait int64
+	// nonBlocking is set when max_wait_ms is present on the wire AND equals 0 (design
+	// §6 non-blocking mode): the request does not wait — a zero deadline returns the
+	// current snapshot at once. max_wait_ms ABSENT (the S13 client sends none) means an
+	// ordinary BLOCKING wait with NO timeout: only a grant, daemon stop, or the client
+	// closing its connection ends it (§4/§6). A positive max_wait_ms is accepted but no
+	// longer imposes a timeout (the request blocks); the wait ceilings still validate
+	// it (a §6 collision flagged for the owner — the ceilings are now vestigial).
+	nonBlocking bool
 	signature   string
 	pinned      bool
 	scopeID     string
@@ -968,13 +729,37 @@ type admitRequest struct {
 	// here so the waiter can be constructed with it already set, under queue.mu.
 	//
 	// It used to be assigned onto the waiter AFTER enqueue, with no lock held,
-	// while the evaluator goroutine was already free to read that waiter. AIRA-29
-	// worked around the resulting race by never reading the field; AIRA-114 must
-	// read it (a delegate scope's memory.max is its scope ceiling, not its pinned
-	// framework reserve, and that is the largest cap population on the machine),
-	// so the write moves to where every other waiter field is written instead of
-	// the read being contorted around it.
+	// while the evaluator goroutine was already free to read that waiter. It is
+	// set where every other waiter field is written, under queue.mu, rather than
+	// contorting a later lock-free assignment around a concurrent read.
 	scopeCeiling int64
+
+	// S8 (anchor). conn / clientPID / processStartTick / peerSameUID are resolved by
+	// admitConnection from the connection BEFORE the enqueue lock and carried here so
+	// enqueueAdmitInternal can anchor the lease (anchorLeaseLocked) atomically with the
+	// idempotent SET. None is a wire field.
+	//
+	// peerSameUID is a BOOL, not a uid, and that is deliberate: its zero value (false)
+	// fails the re-declare same-uid gate closed, so a build or test that never resolves
+	// it cannot accidentally authorise a re-anchor — whereas a zero uid int equals
+	// root's euid and would fail OPEN if anything ever ran as root. It is true only when
+	// the SO_PEERCRED read succeeded AND the peer uid equals the daemon's euid (design
+	// §4 gate P2-C: SO_PEERCRED same-uid only, NO cgroup-membership check — both confine
+	// and aitest holders live outside their own scope).
+	conn             net.Conn
+	clientPID        int
+	processStartTick uint64
+	peerSameUID      bool
+
+	// S9. reDeclare marks the request as an ARDR re-declare (serveReDeclare), NOT a
+	// fresh admit. It changes exactly ONE thing in enqueueAdmitInternal: when the lease
+	// is ABSENT it ESTABLISHES it granted (the crash-restart-no-dump case, design §4)
+	// instead of inserting a fresh QUEUED waiter. The present-lease SET/re-anchor is
+	// identical either way, so a plain dup-scope admit (reDeclare false) stays
+	// absent→queued — a genuine fresh admission — which is what keeps establish-granted
+	// scoped to the re-declare entrypoint alone. Set only by enqueueReDeclare; no wire
+	// field.
+	reDeclare bool
 }
 
 type admitRejection struct {
@@ -1019,8 +804,8 @@ func addClamp(a, b int64) int64 {
 	return a + b
 }
 
-// pctClamp returns value*pct/100 without ever overflowing. AIRA-29 uses it for
-// the proportional half of the charge margin.
+// pctClamp returns value*pct/100 without ever overflowing. It is a shared
+// percentage helper (the oomsteer fullness band uses it).
 //
 // pct is capped at 100: a margin larger than the job's whole size is not a
 // meaningful setting, and that cap is also what BOUNDS the overflow branch's
@@ -1045,65 +830,6 @@ func pctClamp(value, pct int64) int64 {
 	return value * pct / 100
 }
 
-// applyChargeDelta moves one waiter's contribution to the ledger from oldCharge
-// to newCharge and reports whether the move may be applied. The caller must
-// apply BOTH the returned outstanding and the new charge, or neither.
-//
-// It REFUSES an overflowing increase rather than saturating, and that is the
-// whole reason it exists rather than a bare addClamp. A saturating clamp breaks
-// conservation permanently and silently: with another waiter contributing 60,
-// clamping this one's move to MaxInt64 leaves outstanding at MaxInt64 while the
-// sum of effective charges is MaxInt64+60, and the later releases then subtract
-// their way to a NEGATIVE ledger. Refusing leaves the invariant exact; the
-// waiter simply holds its last established charge, which is the same outcome as
-// any other unusable reading.
-//
-// It is deliberately NOT floored at zero. Flooring would hide exactly the lost
-// or doubled decrement that admitSnapshot.residualBytes exists to expose. The
-// decreasing direction cannot wrap, because outstanding >= oldCharge holds by
-// construction: oldCharge is one of the summands of outstanding.
-func applyChargeDelta(outstanding, oldCharge, newCharge int64) (int64, bool) {
-	if outstanding < 0 || oldCharge < 0 || newCharge < 0 {
-		return outstanding, false
-	}
-	if newCharge >= oldCharge {
-		delta := newCharge - oldCharge
-		if outstanding > math.MaxInt64-delta {
-			return outstanding, false
-		}
-		return outstanding + delta, true
-	}
-	return outstanding - (oldCharge - newCharge), true
-}
-
-// confineRecordCap decodes ConfineRecord.Cap's three-way reading. The scan
-// writes exactly three shapes (confine_manage_linux.go): nil when memory.max
-// could not be read or did not parse, the literal "max" for a scope with no
-// local cap, and a canonical decimal otherwise. They mean different things and
-// AIRA-29 must not fuse them:
-//
-//   - known=false: the enforced ceiling is UNKNOWN. Treating that as "no clamp"
-//     would be a fabricated reading, and it has a concrete cost -- a near-cap
-//     non-delegate scope would charge peak+margin ABOVE its own frozen reserve
-//     for as long as the read failed, then flap back when it recovered.
-//   - known=true, finite=false: positively established that nothing caps this
-//     scope locally, so there is nothing to clamp to.
-//   - known=true, finite=true: the enforced ceiling.
-func confineRecordCap(record runner.ConfineRecord) (value int64, finite, known bool) {
-	if record.Cap == nil {
-		return 0, false, false
-	}
-	raw := strings.TrimSpace(*record.Cap)
-	if raw == "max" {
-		return 0, false, true
-	}
-	parsed, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || parsed < 0 {
-		return 0, false, false
-	}
-	return parsed, true, true
-}
-
 func addJobCountClamp(a, b int) int {
 	maxInt := int(^uint(0) >> 1)
 	if a < 0 || b < 0 || a > maxInt-b {
@@ -1124,191 +850,6 @@ func (s *Server) admitSliceHeadroom(jobs int) int64 {
 	return base + int64(jobs)*perJob
 }
 
-// chargeMargin is the headroom added to a scope's observed peak. Its three
-// terms answer three different questions: the floor covers a job sitting still,
-// the percentage scales with the job's own size (a 20G job does not grow in
-// 256 MiB steps), and the observed one-interval growth is the self-tuning term
-// that budgets the NEXT interval for a job that is actually climbing. The
-// growth term is what replaces a kernel soft-throttle here: the owner's ruling
-// leaves the growth race to be absorbed by the ledger, not by memory.high.
-func (s *Server) chargeMargin(peak, growth int64) int64 {
-	margin := s.chargeMarginFloor
-	if pct := pctClamp(peak, s.chargeMarginPct); pct > margin {
-		margin = pct
-	}
-	if growth > margin {
-		margin = growth
-	}
-	if margin < 0 {
-		return 0
-	}
-	return margin
-}
-
-// adoptedScopeIsWarm reports whether an orphaned scope looks old enough for its
-// own memory.current to be a better reading than its admission estimate. A
-// daemon that has restarted has no memory of when it granted anything, so the
-// scope id's own timestamp is the only clock available.
-//
-// STATE THE LIMIT RATHER THAN OVERSELL IT (found by the adversarial build
-// review). AgeSeconds is derived from the SCOPE ID stamp
-// (confine_manage_linux.go), and a scope id is minted BEFORE admission
-// (confine_linux.go) -- so a job that queued for half an hour and then started
-// moments ago already reads as "old". If the daemon restarts inside that
-// window, such a job is adopted at its live usage rather than its full estimate,
-// which is the under-charge direction this gate exists to prevent. It is a
-// best-effort heuristic, not a proof of age, and the alternatives are worse:
-// directory mtime was already refuted for this purpose by the AIRA-64
-// real-cgroup tier, and keeping per-scope history across a restart is exactly
-// the daemon memory that does not survive one.
-//
-// What bounds the residual is that adoption is RE-DERIVED on every scan, so the
-// under-charge is one scan interval's growth -- the same bound the steady-state
-// path carries -- not a 90-second hole. Recorded as a plan residual.
-//
-// Fail-closed on an unestablished age (AgeSeconds is nil whenever the scope's
-// stat could not be taken), because the consequence of guessing wrong is the
-// under-charge direction. A non-positive window means the cold-floor policy is
-// off entirely, which must mean the same thing here as it does in
-// chargeColdFloor -- no floor, so every scope is warm -- rather than the
-// opposite.
-func (s *Server) adoptedScopeIsWarm(record runner.ConfineRecord) bool {
-	if s.chargeColdFloorWindow <= 0 {
-		return true
-	}
-	if record.AgeSeconds == nil {
-		return false
-	}
-	return *record.AgeSeconds >= int64(s.chargeColdFloorWindow/time.Second)
-}
-
-// chargeColdFloor is the resolved reserve a freshly granted waiter keeps being
-// charged until it has had a chance to show its real usage. Fail-safe in both
-// unusual directions: a waiter with no grant instant recorded, and a clock that
-// moved backwards, both read as COLD and keep the full reserve.
-func (s *Server) chargeColdFloor(waiter *admitWaiter, now time.Time) int64 {
-	if s.chargeColdFloorWindow <= 0 {
-		return 0
-	}
-	if waiter.grantedAt.IsZero() || now.Sub(waiter.grantedAt) < s.chargeColdFloorWindow {
-		return waiter.reserve
-	}
-	return 0
-}
-
-// recomputeWaiterCharge advances one waiter's tracked state from a single
-// usable memory.current sample and returns the charge that state implies.
-// queue.mu must be held.
-//
-// The tracked state advances even if the caller then declines to apply the
-// ledger delta (see applyChargeDelta): the sample WAS observed, and discarding
-// it would make the next interval's growth term span two intervals. Conservation
-// is unaffected -- it is a statement about outstanding and effectiveCharge, and
-// neither moves unless the delta is applied.
-func (s *Server) recomputeWaiterCharge(waiter *admitWaiter, rss, capBytes int64, capFinite bool, now time.Time) int64 {
-	if rss > waiter.peakSoFar {
-		waiter.peakSoFar = rss
-	}
-	growth := int64(0)
-	if waiter.havePrevRSS && rss > waiter.lastRSS {
-		growth = rss - waiter.lastRSS
-	}
-	waiter.lastRSS, waiter.havePrevRSS = rss, true
-
-	tracked := addClamp(waiter.peakSoFar, s.chargeMargin(waiter.peakSoFar, growth))
-	if capFinite && tracked > capBytes {
-		tracked = capBytes
-	}
-	if tracked > waiter.trackedRatchet {
-		waiter.trackedRatchet = tracked
-	}
-	charge := waiter.trackedRatchet
-	if floor := s.chargeColdFloor(waiter, now); floor > charge {
-		charge = floor
-	}
-	if capFinite && charge > capBytes {
-		charge = capBytes
-	}
-	return charge
-}
-
-// refreshWaiterCharge is the AIRA-29 dynamic replacement itself. queue.mu must
-// be held, and the record must be the one this pass's scan produced for this
-// waiter's own scope id.
-//
-// The ONE rule: only a usable record may move a charge; otherwise the last
-// established charge stands unchanged. Every early return below is that rule,
-// and each is in the over-charge direction:
-//
-//   - the grant -> backend.Create window, which EVERY launch has: the scope does
-//     not exist yet, so no record reaches here and the frozen reserve stands.
-//     Without this a job would be charged nothing for the moments before it runs.
-//   - memory.current or memory.max unevaluated: no pass invents a number.
-//   - a ledger delta that would overflow: see applyChargeDelta.
-//
-// Deliberately NOT gated on record.Populated. That gate belongs to the adoption
-// loop below, where it is a liveness heuristic, and it reads LEAF cgroup.procs:
-// BootstrapAitestSupervisor drains every pid of an aitest outer scope into a
-// child cgroup, so a fully busy suite reads Populated == 0. A connection-held
-// waiter has already proved its liveness by holding the lease, and
-// memory.current is hierarchical, so the reading is correct regardless. Gating
-// on it here would silently drop live scopes OUT of the ledger, which is the
-// one direction this rule exists to prevent.
-//
-// One further exclusion, and it is a DOUBLE-BOOK rather than an unusable
-// reading: a scope with live `aira confine-reserve` SUB-RESERVATIONS is not
-// dynamically charged. Those children are scope-less waiters in this same queue,
-// each charging its own reserve, while the parent's memory.current is
-// HIERARCHICAL and already contains everything they have allocated. Charging the
-// parent its live usage too would count the same bytes twice: a suite's 28 GiB
-// of per-test reservations would sit in the ledger alongside a parent charge
-// that already included them, and a healthy 4 GiB job would then be refused with
-// half the slice physically free -- exactly the over-reservation this ticket
-// exists to remove. Such a parent therefore keeps its pinned framework overhead
-// as before, and the children remain the real charge. Found by the adversarial
-// build review.
-//
-// Two limits of that exclusion, both established rather than assumed:
-//
-//   - It is QUEUE-LOCAL, because the ledger is. `confine-reserve` inherits its
-//     parent's scope id from the environment but defaults its SLICE
-//     independently (confine_reserve_linux.go), so a parent confined to a
-//     non-default slice can have its children register against aira.slice
-//     instead. That split mis-attributes the child's reserve to a slice whose
-//     cgroup does not hold the memory -- but it is PRE-EXISTING and untouched
-//     here: before this change the parent charged its frozen reserve in its own
-//     queue and the child charged its reserve in the other one, the same split.
-//     No single queue double-books, because a queue that has no child charge is
-//     exactly the queue where charging the parent its live usage is correct.
-//     Filed as its own ticket rather than fixed from inside the ledger.
-//   - It keys on a scope ID, so a stale child could in principle suppress a
-//     REPLACEMENT parent that reused the same id. That is unreachable: an id
-//     embeds the minting pid and a nanosecond stamp (confine_linux.go), and
-//     enqueueAdmitInternal already refuses a duplicate scope id among
-//     non-released waiters, so the two cannot coexist.
-func (s *Server) refreshWaiterCharge(queue *sliceQueue, waiter *admitWaiter, record runner.ConfineRecord, subReserved map[string]struct{}, now time.Time) {
-	if !s.dynamicReserve {
-		return
-	}
-	if _, hasSubReservations := subReserved[waiter.scopeID]; hasSubReservations {
-		return
-	}
-	if record.RSSBytes == nil || *record.RSSBytes < 0 {
-		return
-	}
-	capBytes, capFinite, capKnown := confineRecordCap(record)
-	if !capKnown {
-		return
-	}
-	charge := s.recomputeWaiterCharge(waiter, *record.RSSBytes, capBytes, capFinite, now)
-	next, ok := applyChargeDelta(queue.outstanding, waiter.ledgerCharge(), charge)
-	if !ok {
-		return
-	}
-	queue.outstanding = next
-	waiter.effectiveCharge, waiter.chargeTracked = charge, true
-}
-
 func (s *Server) admitOutstandingJobs(path string) int {
 	s.admitRegistryMu.Lock()
 	queue := s.admitQueues[path]
@@ -1323,11 +864,6 @@ func (s *Server) admitOutstandingJobs(path string) int {
 	return jobs
 }
 
-func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outstandingJobs int, adopted int64, adoptedJobs int, ok bool) {
-	snapshot := s.admitSliceSnapshot(path)
-	return snapshot.outstanding, snapshot.outstandingJobs, snapshot.adopted, snapshot.adoptedJobs, snapshot.present
-}
-
 // admitSliceSnapshot reads the ledger AND the queue diagnostics in ONE locked
 // pass. Taking them in two rounds would let `confine --list` report a granted
 // total and a queued count from different moments — a self-inconsistent picture
@@ -1335,11 +871,17 @@ func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outsta
 type admitSnapshot struct {
 	outstanding     int64
 	outstandingJobs int
-	adopted         int64
-	adoptedJobs     int
 	queued          int
 	phase           string
 	present         bool
+
+	// S13 (design §4 / AIRA-220 honesty). restartFrozen is whether the restart
+	// new-admission freeze is active at the snapshot instant, taken in the same locked,
+	// single-clock walk as `present`, so the GrantedEstablished honesty bit can read
+	// FALSE while the granted total is still settling (survivors may still re-declare)
+	// without a second, possibly-inconsistent read. (S13 removed the unanchoredLeases
+	// count with the dump layer: no granted lease is ever unanchored now.)
+	restartFrozen bool
 
 	// AIRA-24. One waiter's own place in the queue, answered only when a
 	// caller named its own scope id. queuePosition is 1-based and counts ONLY
@@ -1353,37 +895,24 @@ type admitSnapshot struct {
 	queuePosition    int
 	queuedAheadBytes int64
 	// AIRA-186. That same waiter's OWN resolved reserve — `waiter.reserve`, the
-	// frozen figure admission is gating on, which is also the quantity
-	// queuedAheadBytes sums for the waiters in front. Taken at the SAME match, so
-	// "how much is ahead of me" and "how much am I asking for" cannot come from
-	// two different instants.
-	//
-	// Deliberately the frozen reserve and not ledgerCharge(): the dynamic charge
-	// applies to a GRANTED waiter's live usage, while a queued waiter is gated on
-	// the frozen number. Reporting the charge here would name a quantity that is
-	// not the one blocking it.
+	// figure admission is gating on, which is also the quantity queuedAheadBytes
+	// sums for the waiters in front. Taken at the SAME match, so "how much is
+	// ahead of me" and "how much am I asking for" cannot come from two different
+	// instants.
 	//
 	// Zero is "not established", on the same discipline as the position.
 	queuedReserveBytes int64
 
-	// AIRA-114. The aggregate of live scope caps and whether it is established,
-	// taken from the same locked pass as everything else so an operator is never
-	// shown a cap total from one instant beside a ledger from another.
-	//
-	// capAggregateKnown false means UNEVALUATED, and a renderer must say so
-	// rather than print the zero: the bound withholds nothing in that state, and
-	// showing "0" would read as an idle slice.
-	capAggregate      int64
-	capAggregateKnown bool
-
-	// AIRA-68. outstandingJobs fuses TWO structurally different populations, and
-	// the reported job total adds a third — while `confine --list`'s table above
-	// the summary lists only SCOPES:
+	// AIRA-68. outstandingJobs fuses TWO structurally different populations, while
+	// `confine --list`'s table above the summary lists only SCOPES:
 	//
 	//   scopeJobs        connection-held `aira confine` jobs   -> a table row
 	//   reservationJobs  connection-held `aira confine-reserve` reservations,
 	//                    which create no cgroup scope at all   -> NO table row
-	//   adoptedJobs      scan-adopted scopes                   -> a table row
+	//
+	// (A third population, S12-deleted: scan-adopted scopes. S11's reload +
+	// re-declare re-seeds post-restart survivors as connection-held leases, so
+	// they now count under scopeJobs.)
 	//
 	// So "N admitted jobs" is not comparable with the row count, and reading it
 	// that way is precisely what produced AIRA-68's P0 misdiagnosis: 20 of 23
@@ -1394,12 +923,6 @@ type admitSnapshot struct {
 	scopeBytes       int64
 	reservationJobs  int
 	reservationBytes int64
-
-	// vanishedJobs/vanishedBytes are a SUBSET of scopeJobs/scopeBytes, never a
-	// fourth population — the split must keep summing to the totals or the
-	// residual below would cry wolf on every vanished lease.
-	vanishedJobs  int
-	vanishedBytes int64
 
 	// AIRA-101. The slice's exclusive state, derived in the SAME locked walk as
 	// everything above so `confine --list` and a blocked launcher's progress line
@@ -1437,19 +960,18 @@ type admitSnapshot struct {
 	reservations []admitReservationRow
 
 	// AIRA-191/AIRA-192. scope id -> the reserve this ledger charges that scope
-	// RIGHT NOW, over both scope-backed populations: connection-held waiters
-	// (their ledgerCharge, the same quantity scopeBytes sums) and scan-adopted
-	// scopes (their reconstructed reserve, the same quantity `adopted` sums).
-	// Gathered in the same locked pass as every total above, so rows and totals
-	// always describe one instant, and reconciling: over one snapshot the values
-	// sum to scopeBytes + adopted.
+	// RIGHT NOW: the connection-held waiters' ledgerCharge, the same quantity
+	// scopeBytes sums. (Before S12 a second source, scan-adopted scopes'
+	// reconstructed reserve, also fed this map; S12 deleted adoption, so the map
+	// now carries only connection-held scopes.) Gathered in the same locked pass
+	// as every total above, so rows and totals always describe one instant, and
+	// reconciling: over one snapshot the values sum to scopeBytes.
 	//
-	// It is deliberately NOT the frozen grant and NOT the scope's memory.max. A
-	// delegate scope's memory.max is an AIRA-15 containment ceiling many times its
-	// pinned framework reserve, and since AIRA-29 the frozen grant is not what the
-	// slice is holding either — the ledger charge is. Publishing either of the
-	// other two is how `aira top` came to draw 93 GiB of claims against a 40 GiB
-	// ledger.
+	// It is deliberately NOT the scope's memory.max: a delegate scope's
+	// memory.max is an AIRA-15 containment ceiling many times its declared
+	// reserve, and publishing it is how `aira top` came to draw 93 GiB of claims
+	// against a 40 GiB ledger. For a connection-held waiter this equals its
+	// declared reserve.
 	//
 	// A scope ABSENT from the map is one this ledger charges nothing for and knows
 	// nothing about; the wire renders that as unevaluated, never as a cap.
@@ -1515,25 +1037,27 @@ type admitReservationRow struct {
 	heldMS    int64
 }
 
-// residualJobs and residualBytes cross-check the DERIVED split (a walk of
-// queue.waiters) against the INCREMENTAL counters. They are equal by
-// construction: a waiter is `admitGranted && accounted` if and only if it was
-// counted, and releaseAdmitWaiter discharges under exactly that guard. A
-// non-zero residual is therefore a real lost or double decrement, not noise.
-//
-// adoptedJobs/adopted appear on both sides of the reported total and cancel, so
-// these are stated over the connection-held ledger alone.
+// residualJobs and residualBytes cross-check the re-derived ledger cache
+// (queue.outstanding / outstandingJobs, recomputed by rederiveLedgerLocked at
+// the last grant or release) against an INDEPENDENT walk of queue.waiters taken
+// in this snapshot (scopeJobs+reservationJobs, scopeBytes+reservationBytes).
+// They are equal by construction: both count `admitGranted && accounted`
+// waiters and sum the same ledgerCharge(), so a non-zero residual is a real
+// defect — a grant or release that changed the waiter set without re-deriving,
+// or a second hand-maintained mutation site added beside the one accessor — not
+// noise.
 //
 // The two are reported INDEPENDENTLY and SIGNED. The single most plausible
-// regression in releaseAdmitWaiter — dropping `outstanding -= waiter.reserve`
-// while keeping `outstandingJobs--` — is byte-only, and a job-only residual
-// would report a perfectly consistent ledger while the slice silently filled.
-// A negative residual (more discharged than was ever charged) is just as real a
-// defect as a positive one and must never be floored away.
+// regression — a release path that removes a waiter but skips the re-derive, so
+// outstanding keeps a discharged lease's bytes — is byte-only, and a job-only
+// residual would report a perfectly consistent ledger while the slice silently
+// filled. A negative residual (more discharged than was ever charged) is just
+// as real a defect as a positive one and must never be floored away.
 //
 // What they do NOT detect: a stuck waiter that is consistently present in BOTH
-// accountings. That is what vanishedJobs is for, for the population where an
-// answer is physically possible.
+// accountings — a lease held while its job has gone. S14 deleted the cgroup scan
+// that used to surface that population as `vanished`; the socket-EOF release
+// (design §3) and the physical-reap stale-lease backstop are the reclaim paths now.
 func (snapshot admitSnapshot) residualJobs() int {
 	return snapshot.outstandingJobs - (snapshot.scopeJobs + snapshot.reservationJobs)
 }
@@ -1566,40 +1090,27 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// An absent queue positively establishes that nothing is WAITING and that
 		// there is no exclusive holder — the diagnostics half (queued/phase) is a
 		// genuine idle zero and callers render it as such. But it says NOTHING
-		// about the granted/adopted LEDGER: AIRA-29 adoption of already-running
-		// jobs happens only inside evaluateAdmitQueue, and pruneAdmitQueue deletes
-		// the queue (adopted ledger included) once nothing is connection-held, so
-		// an absent queue is exactly "the ledger was never built or has been
-		// pruned". present stays false here precisely so a caller reports the
-		// granted pair unevaluated rather than as a fabricated empty slice
-		// (AIRA-220). CeilingBytes is an independent memory read and is unaffected.
+		// about the granted LEDGER: pruneAdmitQueue deletes the queue once nothing
+		// is connection-held, so an absent queue is exactly "the ledger was never
+		// built or has been pruned". present stays false here precisely so a caller
+		// reports the granted pair unevaluated rather than as a fabricated empty
+		// slice (AIRA-220). CeilingBytes is an independent memory read and is
+		// unaffected.
 		return admitSnapshot{phase: phase}
 	}
 	queue.mu.Lock()
 	snapshot := admitSnapshot{
 		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
-		adopted: queue.adopted, adoptedJobs: queue.adoptedJobs,
-		capAggregate: queue.capAggregate, capAggregateKnown: queue.capAggregateKnown,
 		phase: phase, present: true,
-		scopeReserves: make(map[string]int64, len(queue.waiters)+len(queue.adoptedScopes)),
-	}
-	// AIRA-192. The ADOPTED half of the per-scope reserves, copied out first so
-	// the connection-held half below can overwrite it. That precedence is the
-	// correct one and not an accident: the adopted set is a scan reading up to one
-	// interval old, while a granted waiter is this instant's authority, so a scope
-	// that has just become connection-held must be reported once, at its live
-	// charge, rather than twice or at the older figure.
-	for scopeID, reserve := range queue.adoptedScopes {
-		if scopeID == "" {
-			continue
-		}
-		snapshot.scopeReserves[scopeID] = reserve
+		scopeReserves: make(map[string]int64, len(queue.waiters)),
 	}
 	queuedBytes := int64(0)
 	// ONE reading of the clock for the whole walk (AIRA-108): ages taken per-row
 	// would drift across a long waiter list, so two rows could report an ordering
 	// the queue never had.
 	now := s.admitNowTime()
+	// S11. The freeze state at this same instant — part of the GrantedEstablished bit.
+	snapshot.restartFrozen = s.restartFrozenAt(now)
 	for _, waiter := range queue.waiters {
 		if waiter == nil {
 			continue
@@ -1609,8 +1120,10 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			// AIRA-24. The position is an index among QUEUED waiters only, so it
 			// is taken here and nowhere else: counting granted or released
 			// waiters would report a place in a line that no longer exists. The
-			// first match wins — enqueueAdmitInternal refuses a duplicate scope
-			// id (CodeProtocol), so a second match is not reachable.
+			// first match wins — enqueueAdmitInternal refuses a second queued (or
+			// rejected) waiter for a scope id (CodeProtocol) and re-anchors a granted
+			// one in place rather than adding a waiter, so a second match is not
+			// reachable.
 			if queuedScopeID != "" && snapshot.queuePosition == 0 && waiter.scopeID == queuedScopeID {
 				snapshot.queuePosition = snapshot.queued
 				snapshot.queuedAheadBytes = queuedBytes
@@ -1629,21 +1142,16 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		if waiter.state != admitGranted || !waiter.accounted {
 			continue
 		}
-		// AIRA-29. These three sum ledgerCharge(), the same quantity the ledger
-		// itself carries, not the frozen reserve. They must move with
-		// queue.outstanding or residualBytes() -- a real lost/double-decrement
-		// detector surfaced by `confine --list` -- would report a fabricated ledger
-		// defect on every dynamic pass. vanishedBytes is a SUBSET of scopeBytes and
-		// is NOT part of the residual equation, so it needs its own direct
-		// assertion in the tests rather than riding along on that check.
+		// These three sum ledgerCharge(), the same quantity the ledger itself
+		// carries. They must move with queue.outstanding or residualBytes() -- a
+		// real lost/double-decrement detector surfaced by `confine --list` --
+		// would report a fabricated ledger defect.
 		if waiter.scopeID == "" {
 			snapshot.reservationJobs++
-			// AIRA-29 sums ledgerCharge() here rather than the frozen reserve, so
-			// this stays equal to what queue.outstanding carries and residualBytes()
-			// keeps meaning what it says. For THIS population the two are always the
-			// same value -- a scope-LESS waiter has no scope to read, so it is never
-			// dynamically replaced -- but going through the same accessor as every
-			// other ledger site keeps that a property of the code rather than a
+			// Goes through ledgerCharge() rather than reading waiter.reserve
+			// directly, so this stays equal to what queue.outstanding carries and
+			// residualBytes() keeps meaning what it says -- every ledger site uses
+			// the one accessor, keeping that a property of the code rather than a
 			// coincidence to be rediscovered.
 			snapshot.reservationBytes = addClamp(snapshot.reservationBytes, waiter.ledgerCharge())
 			// AIRA-108. Name it, in the same pass. heldMS is derived from grantedAt
@@ -1670,10 +1178,6 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// a waiter that contributes to scopeBytes contributes a row and one that
 		// does not contributes neither, and the two can never drift apart.
 		snapshot.scopeReserves[waiter.scopeID] = waiter.ledgerCharge()
-		if waiter.scopeVanished {
-			snapshot.vanishedJobs++
-			snapshot.vanishedBytes = addClamp(snapshot.vanishedBytes, waiter.ledgerCharge())
-		}
 	}
 	if s.admitFreezeMaxHold > 0 {
 		snapshot.phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
@@ -2101,19 +1605,39 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitError(conn, admitErrorCode(err), err.Error())
 		return
 	}
+	// S5 fail-fast (design §7 "RequestInvalid"): a request for more cores than this
+	// box can EVER provide (cpu > 2×NumCPU) is permanently impossible — retrying
+	// never helps — so refuse it up front, before any enqueue, rather than queue a
+	// waiter that can never fit and would sit until its max_wait. Placed here rather
+	// than in validateAdmitArgs because the ceiling is machine-specific (2×NumCPU via
+	// the cpuCoreCounter seam), which the pure validator does not have — the same
+	// split reserve uses (RANGE in the validator, CEILING here).
+	//
+	// Reported as a CLIENT-TERMINAL E_ADMIT_TOO_LARGE with a structured rejection
+	// payload, NOT CodeProtocol. CodeProtocol routes the runner's fail() straight to
+	// the flock fallback (admission_linux.go), launching the job OUTSIDE the ledger —
+	// the AIRA-222 fail-open class this whole rebuild closes. E_ADMIT_TOO_LARGE is in
+	// the runner's terminal pre-payload set; the {Required, Ceiling, Basis} payload
+	// is what validRunnerAdmitRejection requires so the client refuses instead of
+	// degrading. (The figures are cores, rendered by the generic too-large message —
+	// cosmetically byte-flavoured, but this is a hand-crafted-request-only guard:
+	// real clients send DefaultConfineCPUCores.)
+	if request.cpu > s.cpuCeiling() {
+		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{
+			Required: request.cpu, Ceiling: s.cpuCeiling(), Basis: "reject:cpu-too-large",
+		})
+		return
+	}
 	// AIRA-121 gate condition C6. --exclusive is refused HERE, before the request
 	// is ever queued, and that placement is the whole mechanism.
 	//
-	// In shim mode the confine scan honestly reports an empty slice (there are no
-	// cgroup scopes), and sliceProvablyEmpty would therefore grant exclusivity to
-	// an UNCONFINED job on the strength of an emptiness that says nothing about
-	// what else is running in this container. The plan proposed forcing
-	// liveScopesKnown false instead; that is not buildable through the scan seam --
-	// the only way a scan leaves liveness unknown is a Verdict=unevaluated result,
-	// which the evaluator converts to a scan ERROR, logs as "confine reserve scan
-	// failed", and uses to arm the exclusive abort anchor. Refusing up front makes
-	// liveScopesKnown's value irrelevant, because sliceProvablyEmpty's only reader
-	// is the exclusive drain gate.
+	// In shim mode the ledger holds no lease for an unconfined job, so
+	// sliceProvablyEmpty (Σleases == 0) would read the slice as empty and grant
+	// exclusivity on the strength of an emptiness that says nothing about what else
+	// is running in this container — there are no cgroup scopes here at all.
+	// Refusing --exclusive up front is the whole mechanism: a benchmark demanding
+	// solitude must run on a real-slice install where the ledger actually accounts
+	// for its neighbours.
 	//
 	// CodeAdmitExclusiveUnestablished is reused rather than a new code minted: its
 	// established meaning -- "an empty slice could not be established" -- is
@@ -2126,18 +1650,29 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	resolve := s.sliceResolver()
 	path, ok, reason := resolve(request.slice)
 	if !ok {
-		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason})
+		// S4 (D4 / Invariant 6): an unresolvable slice is "no readable budget" too —
+		// fail CLOSED, symmetric with the unreadable-memory path below, rather than
+		// the pre-S4 grant-shaped `unevaluated`.
+		s.writeAdmitFailClosed(conn, request.exclusive, reason)
 		return
 	}
 	readMemory := s.memoryReader()
 	_, maximum, _, ok, reason := readMemory(path)
 	if !ok {
-		// The daemon answered; only the slice's live usage was unreadable. Report
-		// that honestly (NOT "daemon-unavailable") so the operator-facing basis is
-		// truthful. A non-delegate scope is left uncapped here (state != admitted);
-		// a delegate-ram scope gets no daemon scope_ceiling and so falls back to the
-		// finite client-side default (AIRA-15) — never uncapped.
-		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason, Reserve: request.reserve, Basis: "fallback:slice-unreadable"})
+		// S4 (D4 / Invariant 6): FAIL CLOSED. With no readable slice/container
+		// budget the ceiling cannot be established, so a NEW admission must be
+		// REFUSED, never granted — matching evaluateAdmitQueue's own !ok branch,
+		// which leaves waiters queued and grants nothing. The pre-S4 code returned a
+		// grant-shaped `unevaluated` here, which the runner treated as a real grant
+		// and LAUNCHED THE JOB UNCAPPED (admission_linux.go: "an ordinary job
+		// proceeds on it uncapped-but-launched").
+		//
+		// INTERIM GAP (recorded, not fixed here — the S13 client-flock-fallback
+		// delete owns it): an ORDINARY refusal without --require-admission still
+		// routes through the runner's fail() to the flock fallback and launches
+		// ungoverned until S13; --require-admission already fails closed (it refuses
+		// any non-admitted state). Post-S13 fail() becomes reconnect + re-request.
+		s.writeAdmitFailClosed(conn, request.exclusive, reason)
 		return
 	}
 	jobs := s.admitOutstandingJobs(path)
@@ -2153,6 +1688,22 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{Required: reserve, Ceiling: ceiling, Basis: basis})
 		return
 	}
+	// S8 anchor identity: read the peer credential BEFORE the enqueue lock (mirrors the
+	// supervisor-lease handler — no getsockopt/proc read under queue.mu) and carry it on
+	// the request so enqueueAdmitInternal can anchor the lease atomically with the SET.
+	// A fresh admit does NOT gate on uid (behaviour preserved; net.Pipe test connections
+	// with no injected credential seam simply anchor with pid 0). peerSameUID is set true
+	// only for a same-uid peer and is the gate the idempotent re-declare SET checks.
+	request.conn = conn
+	if uid, pid, credErr := s.peerCredentialOf(conn); credErr == nil {
+		request.peerSameUID = uid == os.Geteuid()
+		if pid > 0 {
+			request.clientPID = pid
+			if tick, ok, _ := readProcStartTime(pid); ok {
+				request.processStartTick = tick
+			}
+		}
+	}
 	queue, waiter, code, enqueueErr := s.enqueueResolvedConfineAdmit(path, reserve, basis, maximum, request)
 	if enqueueErr != nil {
 		if code == CodeAdmitTooLarge {
@@ -2162,13 +1713,20 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		}
 		return
 	}
-	peerCtx, cancelPeer := context.WithCancel(context.Background())
+	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
-	go func() {
-		var one [1]byte
-		_, _ = conn.Read(one[:])
-		cancelPeer()
-	}()
+
+	// alreadyGranted is true when the enqueue re-anchored an existing granted lease
+	// (the idempotent SET): its grantedCh is already closed, so there is no wait and
+	// the deadline/grantedCh select below is skipped rather than resolved by the
+	// runtime's random ready-case choice. This read is in a critical section separate
+	// from the enqueue, which is benign: if the evaluator granted in the gap, grantedCh
+	// is already closed and the select returns immediately. The RELEASE below captures
+	// NO such value — it compares this handler's own conn against the live anchor, so
+	// the reconnect race has no capture window (unlike a per-connection generation).
+	queue.mu.Lock()
+	alreadyGranted := waiter.state == admitGranted
+	queue.mu.Unlock()
 
 	released := false
 	release := func() {
@@ -2176,46 +1734,41 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 			return
 		}
 		released = true
-		s.releaseAdmitWaiter(queue, waiter)
+		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
 	}
 	defer release()
 
-	remaining := time.Duration(request.maxWait)*time.Millisecond - s.admitNowTime().Sub(waiter.enqueued)
-	if remaining < 0 {
-		remaining = 0
-	}
-	var timer *time.Timer
-	var deadline <-chan time.Time
-	if s.admitAfter != nil {
-		deadline = s.admitAfter(remaining)
-	} else {
-		timer = time.NewTimer(remaining)
-		deadline = timer.C
-	}
-	defer stopTimer(timer)
-	select {
-	case <-waiter.grantedCh:
-	case <-deadline:
-		s.timeoutAdmitWaiter(queue, waiter)
-	case <-s.stopping:
-		return
-	case <-peerCtx.Done():
-		return
+	if !alreadyGranted {
+		// S13: a BLOCKING wait has NO deadline (design §4/§6: no timeout — a wait ends
+		// only on a grant, daemon stop, or the client closing its connection). A nil
+		// deadline channel never fires, so a blocked request never self-expires. Only a
+		// NON-BLOCKING request (max_wait_ms==0) installs a ZERO deadline, returning the
+		// current snapshot at once via timeoutAdmitWaiter. The per-waiter admitAfter
+		// seam is retained so the non-blocking return stays test-drivable.
+		var timer *time.Timer
+		var deadline <-chan time.Time
+		if request.nonBlocking {
+			if s.admitAfter != nil {
+				deadline = s.admitAfter(0)
+			} else {
+				timer = time.NewTimer(0)
+				deadline = timer.C
+			}
+		}
+		defer stopTimer(timer)
+		select {
+		case <-waiter.grantedCh:
+		case <-deadline:
+			s.timeoutAdmitWaiter(queue, waiter)
+		case <-s.stopping:
+			return
+		case <-peerCtx.Done():
+			return
+		}
 	}
 
 	queue.mu.Lock()
 	if waiter.state == admitRejected {
-		// AIRA-101. Branch on the OUTCOME rather than hardcoding saturation for
-		// every rejected waiter. An unestablished-emptiness abort is not a busy
-		// slice — it is a slice the daemon could not read — and reporting it as
-		// E_ADMIT_SATURATED would be a fabricated diagnosis of exactly the kind the
-		// fail-closed emptiness rule exists to prevent.
-		if waiter.outcome == admitOutcomeExclusiveUnestablished {
-			queue.mu.Unlock()
-			s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
-				CodeAdmitExclusiveUnestablished+": the confine scan is failing, so an empty slice could not be established for an exclusive request")
-			return
-		}
 		// The EXCLUSIVE requester's own expiry. Its state is already admitRejected
 		// by the time the gate is re-derived, so it no longer matches the drain
 		// predicate and would otherwise be reported as plain saturation — "the slice
@@ -2244,7 +1797,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		queue.mu.Unlock()
 		return
 	}
-	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Basis: waiter.basis, ScopeCeiling: waiter.scopeCeiling}
+	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Cpu: waiter.cpu, Basis: waiter.basis, ScopeCeiling: waiter.scopeCeiling}
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -2267,6 +1820,110 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	}
 }
 
+// leaseByScopeIDLocked returns the one live waiter currently anchoring scopeID
+// on this queue, or nil. queue.mu must be held.
+//
+// It is the lookup half of the idempotent SET-by-scope-id the signed ledger is
+// keyed on (design §2): because enqueueAdmitInternal refuses a second queued/rejected
+// waiter for a scope id and re-anchors a granted one in place, at most one
+// non-released waiter can carry any scope id, so this is a point read of that scope's
+// lease. enqueueAdmitInternal uses it both to REFUSE a queued/rejected duplicate and
+// to find the granted lease its re-anchoring SET updates. An empty scopeID keys
+// nothing (scope-less `confine-reserve` waiters) and matches no lease.
+//
+// CAUTION: this lookup matches on `!= admitReleased` (any live-or-dying waiter is a
+// duplicate to refuse), but enqueueAdmitInternal's re-anchoring SET narrows to
+// state == admitGranted. A waiter that has been REJECTED (timed out, or aborted by the
+// unestablished-emptiness rule) but whose deferred release has not yet run is still
+// `!= admitReleased`; re-anchoring onto it would SET a dead lease that is about to be
+// discharged. The broad predicate is correct for the refusal and wrong for the SET.
+func leaseByScopeIDLocked(queue *sliceQueue, scopeID string) *admitWaiter {
+	if scopeID == "" {
+		return nil
+	}
+	for _, existing := range queue.waiters {
+		if existing != nil && existing.state != admitReleased && existing.scopeID == scopeID {
+			return existing
+		}
+	}
+	return nil
+}
+
+// anchorLeaseLocked (re-)anchors w to conn (design §3, Inv 4). It is the ONE place a
+// lease is anchored, called identically for a fresh insert and for a re-declare
+// re-anchor, so the anchor identity is established uniformly. It overwrites the anchor
+// connection and records the peer pid and process start-tick (diagnostic identity of the
+// anchoring connection's peer since S13 deleted the dump/reload/kill-probe layer that
+// used to read them back).
+//
+// It MUST run inside enqueueAdmitInternal's queue.mu critical section, atomically with
+// the idempotent SET: the overwrite and the SET being one critical section is what makes
+// compare-and-release correct under the reconnect race. A stale old connection's EOF
+// then either already ran (and the SET finds no lease, inserting a fresh one) or finds
+// the anchor now points at the re-declaring connection and no-ops — never discharges a
+// lease the re-declare holds. queue.mu must be held.
+func anchorLeaseLocked(w *admitWaiter, conn net.Conn, pid int, startTick uint64) {
+	w.anchor = conn
+	w.clientPID = pid
+	w.processStartTick = startTick
+}
+
+// newEstablishedWaiter builds a GRANTED + accounted lease (grantedCh already
+// closed, outcome "immediate") for the establish-granted path: S9's absent-lease
+// ARDR re-declare (the sole caller since S13 deleted the restart-dump reload). The
+// caller appends it to queue.waiters, anchors it to the live connection via
+// anchorLeaseLocked, and re-derives the ledger, under queue.mu.
+//
+// grantedCh is closed immediately so the "granted ⇒ grantedCh closed" invariant
+// every other granted waiter holds is preserved (nothing waits on it on these
+// paths, but a later reader must not block). outcome is "immediate", NOT a novel
+// spelling: validRunnerAdmitGrant accepts only {immediate,waited,unevaluated}, so a
+// later plain dup-scope admit that re-anchors and frames this lease stays valid.
+func newEstablishedWaiter(seq, reserve, cpu int64, basis string, request admitRequest, now time.Time) *admitWaiter {
+	grantedCh := make(chan struct{})
+	close(grantedCh)
+	return &admitWaiter{
+		seq: seq, reserve: reserve, cpu: cpu, basis: basis,
+		state: admitGranted, accounted: true, grantedCh: grantedCh,
+		enqueued: now, grantedAt: now, outcome: "immediate",
+		scopeID: request.scopeID, name: request.name, owner: request.owner,
+		signature:     boundedAdmitSignature(request.signature),
+		parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling,
+	}
+}
+
+// watchPeerEOF starts the peer-EOF liveness watcher shared by every lease-bearing
+// connection (design §3): a goroutine blocks reading one byte from conn and cancels
+// the returned context the instant the read returns — peer close, or any error. The
+// holder needs this connection anyway; holder death ⇒ connection EOF ⇒ the context
+// fires, which the caller keys its release on. Extracted from the byte-identical
+// inline goroutines in admitConnection and workerAdmitConnection so both establish
+// liveness the same way; S9's re-declare handler and S15's worker lease reuse it.
+func watchPeerEOF(conn net.Conn) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		var one [1]byte
+		_, _ = conn.Read(one[:])
+		cancel()
+	}()
+	return ctx, cancel
+}
+
+// peerCredentialOf reads the connecting peer's uid and pid through the SO_PEERCRED
+// seam (s.peerCredential, defaulting to unixPeerCredential), the same mechanism the
+// supervisor-lease handler uses. Read BEFORE taking queue.mu (no getsockopt under the
+// hot lock). A failure (e.g. a net.Pipe test connection with no injected seam) returns
+// an error the caller tolerates on the fresh-admit path; only the re-declare same-uid
+// gate depends on it, and an unreadable credential there fails closed (peerSameUID
+// stays false).
+func (s *Server) peerCredentialOf(conn net.Conn) (uid, pid int, err error) {
+	credential := s.peerCredential
+	if credential == nil {
+		credential = unixPeerCredential
+	}
+	return credential(conn)
+}
+
 func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWaiter, string, error) {
 	return s.enqueueAdmitInternal(path, reserve, "", 0, false, admitRequest{})
 }
@@ -2277,6 +1934,23 @@ func (s *Server) enqueueResolvedAdmit(path string, reserve int64, basis string, 
 
 func (s *Server) enqueueResolvedConfineAdmit(path string, reserve int64, basis string, maximum int64, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true, request)
+}
+
+// enqueueReDeclare is the S9 ARDR re-declare entrypoint into the idempotent SET. It
+// re-anchors a PRESENT granted lease (the S8 SET — identical to a dup-scope admit) or,
+// when the lease is ABSENT (the crash-restart-no-dump case), ESTABLISHES it granted
+// directly under queue.mu, SKIPPING the ceiling gates (design §4 re-declare window;
+// `available` may go negative). request.reDeclare is set HERE, so this is the only path
+// that establishes-granted on absence — a plain admit's enqueueResolvedConfineAdmit
+// leaves it false and an absent lease stays a fresh QUEUED insert.
+//
+// enforceCeiling is FALSE, not `maximum` with true: both re-declare branches return
+// before the ceiling check, so `maximum` is dead — false documents "a re-declare never
+// enforces the ceiling" rather than relying on a latent 0 that a future fall-through
+// could read as a wrong refusal.
+func (s *Server) enqueueReDeclare(path string, reserve int64, basis string, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
+	request.reDeclare = true
+	return s.enqueueAdmitInternal(path, reserve, basis, 0, false, request)
 }
 
 func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
@@ -2297,18 +1971,119 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 	defer s.admitRegistryMu.Unlock()
+	// S8 idempotent SET-by-scope-id (design §2/§4) — FIRST, before the maxWaiters,
+	// too-large, single-exclusive and seq guards below. A re-declare of an existing
+	// GRANTED lease re-anchors it in place: it adds no waiter (so maxWaiters must not
+	// refuse it) and Inv 6 says a re-declare is always accepted even if it pushes
+	// available negative (so the too-large ceiling check must not refuse it). S9's
+	// ARDR re-declare handler routes to this same SET, so the early return here is what
+	// keeps S9 free of those fresh-admission gates.
+	if request.scopeID != "" {
+		if existing := leaseByScopeIDLocked(queue, request.scopeID); existing != nil {
+			if existing.state == admitGranted {
+				// Gate on admitGranted, NOT leaseByScopeIDLocked's `!= admitReleased`
+				// (see its CAUTION): a REJECTED-but-not-yet-removed lease is still
+				// `!= admitReleased`, and re-anchoring onto it would SET a dead lease
+				// whose deferred release is about to discharge it. A granted lease is
+				// always accounted (both set together at the grant), so the SET
+				// preserves granted && accounted and the re-derive below keeps counting
+				// it.
+				//
+				// Same-uid gate (design §4 gate P2-C): SO_PEERCRED same-uid only, NO
+				// cgroup-membership check — both confine and aitest lease holders live
+				// OUTSIDE their own scope, so a scope→cgroup-membership check would
+				// reject every legitimate re-declare. peerSameUID fails closed when the
+				// credential was unreadable.
+				if !request.peerSameUID {
+					return nil, nil, CodeProtocol, fmt.Errorf("%s: re-declare peer is not the lease owner", CodeProtocol)
+				}
+				// P2-D: an exclusive lease is LOST on reconnect — the client reports
+				// exclusive=lost and does NOT re-declare it. Refuse the re-declare if
+				// EITHER side is exclusive: `request.exclusive` (a request that claims it)
+				// OR `existing.exclusive` (the live lease IS exclusive). The lease-side
+				// check is the REACHABLE one on the S9 ARDR path — the frame has no
+				// exclusive field, so request.exclusive is always false there; without the
+				// existing.exclusive guard a non-exclusive re-declare would silently
+				// re-anchor a live exclusive holder, transferring the slice-wide HOLD to a
+				// connection that never asked for it (and slipping past the
+				// single-exclusive-per-slice guard below, since the SET returns first).
+				if request.exclusive || existing.exclusive {
+					return nil, nil, CodeProtocol, fmt.Errorf("%s: an exclusive lease is never re-declared (exclusive=lost on reconnect)", CodeProtocol)
+				}
+				// S9 parent_scope_id (design §4): a re-anchor LEAVES the established
+				// parentScopeID alone — the lease's parent is a property of the original
+				// establish, not of the reconnecting client. A mismatch is LOGGED, never
+				// gated (gating would refuse a legitimate re-declare over a cosmetic
+				// disagreement). Only logged when BOTH are non-empty, so an empty parent on
+				// either side (legal by design) is silent.
+				if existing.parentScopeID != "" && request.parentScopeID != "" && existing.parentScopeID != request.parentScopeID {
+					log.Printf("aira daemon: re-declare for scope %q carries parent_scope_id %q but the established lease has %q; keeping the established value (not gated)",
+						request.scopeID, request.parentScopeID, existing.parentScopeID)
+				}
+				// Idempotent SET of the resource vector + re-anchor to the new
+				// connection. reserve and cpu are the two ledger resources (§2); the
+				// re-derive folds the refreshed vector back into the per-slice ledger.
+				// enqueued is NOT reset (it is the FIFO position, and the lease is
+				// already granted), and exclusive is left untouched (refused above).
+				// anchorLeaseLocked overwrites the anchor atomically with this SET, which
+				// is what makes a concurrent stale old-connection EOF a no-op.
+				existing.reserve = reserve
+				existing.cpu = request.cpu
+				anchorLeaseLocked(existing, request.conn, request.clientPID, request.processStartTick)
+				queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+				// A re-declare that SHRINKS the vector frees capacity; wake the queue so
+				// a waiter that now fits is not stalled to the next poll tick (the
+				// fresh-insert path signals for the same reason).
+				queue.signal()
+				return queue, existing, "", nil
+			}
+			// A queued lease means the original connection is still establishing this
+			// scope's lease, and a rejected-dying one is about to be torn down: both are
+			// genuine duplicates, refused exactly as before (CodeProtocol, behaviour
+			// preserved — TestConfineRegistryRejectsDuplicateScopeID pins this). Only a
+			// live GRANTED lease re-anchors.
+			return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
+		} else if request.reDeclare {
+			// ESTABLISH-GRANTED (design §4, the load-bearing addition). The lease is
+			// ABSENT and this is an ARDR re-declare (S9). It establishes the lease GRANTED
+			// directly here, accounted and anchored to the live connection, SKIPPING the
+			// ceiling AND maxWaiters gates below: Invariant 6 says a re-declare is always
+			// accepted, even past the ceiling — `reserve > ceiling` just establishes with
+			// `available` NEGATIVE (§4's re-declare window), which the signed ledger
+			// absorbs and the next NEW admission waits on.
+			//
+			// The driver is ANY restart (crash or graceful): S13 deleted the dump, so the
+			// new daemon always opens an EMPTY ledger and EVERY live client's keeper
+			// re-declare is absent-lease. They MUST re-establish GRANTED — queuing them
+			// behind the new-admission freeze would time them out and drop live leases.
+			// SAME-UID gated (fail-closed: peerSameUID is false on an unreadable
+			// credential, so a build that never resolves it cannot establish a lease for a
+			// peer it could not authenticate — design §4 gate P2-C).
+			//
+			// A plain dup-scope admit (reDeclare false) falls through to the fresh QUEUED
+			// insert, a genuine new admission.
+			if !request.peerSameUID {
+				return nil, nil, CodeProtocol, fmt.Errorf("%s: re-declare peer is not the lease owner", CodeProtocol)
+			}
+			if queue.seq == math.MaxInt64 {
+				return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
+			}
+			queue.seq++
+			waiter := newEstablishedWaiter(queue.seq, reserve, request.cpu, basis, request, s.admitNowTime())
+			anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
+			queue.waiters = append(queue.waiters, waiter)
+			// DERIVED, not incremented (the one ledger writer): folds in this lease's RAM
+			// and cores. An establish CONSUMES capacity, so no signal() is needed — unlike
+			// a re-anchor that may SHRINK the vector and free room for a waiter.
+			queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			return queue, waiter, "", nil
+		}
+	}
 	if len(queue.waiters) >= admitMaxWaiters {
 		return nil, nil, CodeBusy, fmt.Errorf("%s: too many admission waiters for slice", CodeBusy)
 	}
 	if enforceCeiling && reserve > subtractFloor(maximum, s.admitSliceHeadroom(queue.outstandingJobs+1)) {
 		return nil, nil, CodeAdmitTooLarge, fmt.Errorf("%s: required reserve exceeds cap minus headroom", CodeAdmitTooLarge)
-	}
-	if request.scopeID != "" {
-		for _, existing := range queue.waiters {
-			if existing != nil && existing.state != admitReleased && existing.scopeID == request.scopeID {
-				return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
-			}
-		}
 	}
 	// AIRA-101. At most ONE exclusive waiter per slice, refused here under
 	// queue.mu so the check is race-free beside the duplicate-scope-id check
@@ -2335,7 +2110,11 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
+	// Anchor the fresh lease to its connection through the same helper a re-declare
+	// uses, so the anchor identity is set uniformly. The connection's EOF release
+	// compares its own conn against this anchor.
+	anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
@@ -2371,249 +2150,15 @@ func (q *sliceQueue) signal() {
 }
 
 func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
-	// Production has exactly one caller: this queue's runEvaluator goroutine.
-	// That single-writer property permits the throttle read before queue.mu;
-	// other goroutines only read the adopted ledger while holding queue.mu.
+	// Production has exactly one caller: this queue's runEvaluator goroutine, the
+	// single writer of queue state; other goroutines read it only under queue.mu.
+	// S14 deleted the periodic cgroup scan that used to run here — emptiness is now
+	// derived from the signed ledger (sliceProvablyEmpty), so a pass touches only
+	// queue state.
 	now := s.admitNowTime()
-	refreshInterval := s.admitConfineScanInterval
-	if refreshInterval <= 0 {
-		refreshInterval = admitConfineScanIntervalDefault
-	}
-	refreshAdopted := queue.adoptedAt.IsZero() || now.Sub(queue.adoptedAt) >= refreshInterval
-	var scanResult runner.ConfineListResult
-	var scanErr error
-	if refreshAdopted {
-		scan := s.admitConfineScan
-		if scan == nil {
-			scan = func(path string) (runner.ConfineListResult, error) {
-				return runner.ListConfines(context.Background(), path, nil)
-			}
-		}
-		scanResult, scanErr = scan(queue.path)
-		if scanErr == nil && scanResult.Verdict == "unevaluated" {
-			reason := strings.TrimSpace(scanResult.Reason)
-			if reason == "" {
-				reason = "confine scan unevaluated"
-			}
-			scanErr = errors.New(reason)
-		}
-	}
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if refreshAdopted {
-		// adoptedAt is the last scan attempt, successful or not, so a failing
-		// filesystem does not turn every queue kick into another scan.
-		queue.adoptedAt = now
-		if scanErr != nil {
-			if !queue.adoptedScanFailed {
-				log.Printf("aira daemon: confine reserve scan failed: %v", scanErr)
-			}
-			queue.adoptedScanFailed = true
-			// AIRA-101. liveScopes is only meaningful alongside a successful scan;
-			// clearing the KNOWN bit is what makes the exclusive gate fail closed
-			// rather than reading a stale emptiness as current fact.
-			queue.liveScopesKnown = false
-			// AIRA-114. The same treatment for the aggregate cap, with the OPPOSITE
-			// consequence: clearing this bit makes the over-subscription bound
-			// withhold nothing while the scan is failing. A bound that stalled a
-			// machine-wide slice because a cgroup directory could not be read would
-			// be an outage caused by a diagnostic.
-			queue.capAggregateKnown = false
-			// Arm the abort anchor on the FIRST failure while it is zero, and never
-			// renew it on later failures. Arming only after a prior success would
-			// never fire in this rule's own primary case — a slice unreadable from
-			// the queue's very first pass — and renewing would let the anchor
-			// postpone its own deadline forever (the freezeArmedAt lesson).
-			if queue.scanFailingSince.IsZero() {
-				queue.scanFailingSince = now
-			}
-		} else {
-			queue.scanFailingSince = time.Time{}
-			// AIRA-68. listConfines enumerates EVERY .aira-CONFINE-* directory
-			// under the slice, irrespective of population or cap, so scan
-			// membership is an authoritative presence test — and this block runs
-			// only when the scan SUCCEEDED, so a failed scan writes no bit at all.
-			present := make(map[string]runner.ConfineRecord, len(scanResult.Scopes))
-			for _, record := range scanResult.Scopes {
-				present[record.ScopeID] = record
-			}
-			held := make(map[string]struct{})
-			// AIRA-29. Parents that already have their children charged separately:
-			// see refreshWaiterCharge. Collected in its own pass because a
-			// sub-reservation may appear anywhere in the waiter list, before or
-			// after its parent.
-			subReserved := make(map[string]struct{})
-			for _, waiter := range queue.waiters {
-				if waiter == nil || waiter.state != admitGranted || !waiter.accounted {
-					continue
-				}
-				if waiter.parentScopeID != "" {
-					subReserved[waiter.parentScopeID] = struct{}{}
-				}
-			}
-			// The join direction here is load-bearing, not incidental: this walks
-			// WAITERS and looks records up, never the reverse. The scan ran
-			// lock-free before queue.mu was taken, so its snapshot may name a scope
-			// whose waiter has since been released -- and that waiter is already out
-			// of queue.waiters (releaseAdmitWaiterLocked removes it under this same
-			// lock), so its stale record simply matches nothing. A waiter granted
-			// during that same window is conversely not yet in the scan, so it is
-			// not usable and holds its reserve. Iterating records instead would
-			// resurrect the first case.
-			for _, waiter := range queue.waiters {
-				if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
-					continue
-				}
-				held[waiter.scopeID] = struct{}{}
-				// The seen -> gone TRANSITION, recorded on the waiter. See the
-				// scopeSeen/scopeVanished comment on admitWaiter for why the
-				// transition, and not plain absence, is what the stale-lease sweep
-				// is allowed to reclaim on.
-				if record, exists := present[waiter.scopeID]; exists {
-					waiter.scopeSeen, waiter.scopeVanished = true, false
-					// AIRA-29. The dynamic charge, taken under the same lock and from
-					// the same scan record. `accounted` is what the ledger add and
-					// subtract are both guarded by, so the replacement must carry the
-					// identical guard or conservation stops holding.
-					if waiter.accounted {
-						s.refreshWaiterCharge(queue, waiter, record, subReserved, now)
-					}
-					continue
-				}
-				if waiter.scopeSeen {
-					waiter.scopeVanished = true
-				}
-			}
-			// AIRA-101. The EMPTINESS reading, computed in the same successful scan
-			// but deliberately NOT derived from adopted/adoptedJobs below.
-			//
-			// The adopted loop skips scopes on purpose — unpopulated ones,
-			// non-finite-cap ones, and connection-held ones — and every one of those
-			// exclusions is correct for RESERVE accounting and wrong for EMPTINESS,
-			// because a skipped scope is still a running job. Reusing it would let an
-			// exclusive job be told it is alone while a suite runs beside it.
-			//
-			// Liveness is SUBTREE-aware. Leaf cgroup.procs is not usable here:
-			// BootstrapAitestSupervisor drains EVERY pid out of an aitest outer scope
-			// into <outer>/.aira-supervisor, so a running suite's outer scope reads
-			// leaf-empty. Before a daemon restart its connection-held lease still
-			// keeps outstandingJobs >= 1, but after one it is merely an adopted scope
-			// — and a leaf-only reading would then declare the slice empty and hand a
-			// benchmark a fabricated "you are alone" while the suite ran on.
-			liveScopes := 0
-			for _, record := range scanResult.Scopes {
-				// Unevaluated is NOT empty. A scope whose population could not be read
-				// counts as live, so an unreadable scope can only ever delay an
-				// exclusive grant, never fake one.
-				if record.SubtreePopulated == nil || *record.SubtreePopulated {
-					liveScopes++
-				}
-			}
-			queue.liveScopes = liveScopes
-			queue.liveScopesKnown = true
-			adopted := int64(0)
-			adoptedJobs := 0
-			// AIRA-192. Named per scope as it is summed, from this same loop, so
-			// the rows and the total are one derivation rather than two that have to
-			// be kept in step. Every `continue` below is a scope this ledger charges
-			// NOTHING for, and it correctly leaves no row: an operator must not be
-			// shown a claim the slice is not holding.
-			adoptedScopes := make(map[string]int64, len(scanResult.Scopes))
-			for _, record := range scanResult.Scopes {
-				// Populated is the scope's LEAF cgroup.procs count, not the
-				// subtree-aware cgroup.events populated the #72 reaper uses. A live
-				// workload nested in a child cgroup it created reads empty here and is
-				// SKIPPED — the safe direction (its reserve is under-counted → over-
-				// admit, exactly as a fully forgotten pre-restart ledger, never worse).
-				// Subtree-aware liveness for adopted is a v2 item.
-				if record.Populated == nil || *record.Populated <= 0 {
-					continue
-				}
-				if _, connectionHeld := held[record.ScopeID]; connectionHeld {
-					continue
-				}
-				// A non-finite cap (delegate-ram "max", nil, malformed, negative)
-				// contributes NEITHER reserve bytes NOR a headroom-job: such a scope is
-				// unreconstructable, left as a safe under-count (its actual RSS is still
-				// charged via `current`). Counting only finite-cap scopes keeps adopted
-				// and adoptedJobs consistent — never a new wrongful-wait.
-				if record.Cap == nil {
-					continue
-				}
-				cap, err := strconv.ParseInt(strings.TrimSpace(*record.Cap), 10, 64)
-				if err != nil || cap < 0 {
-					continue
-				}
-				// AIRA-29 generalises this reconstruction from delegate-only to BOTH
-				// classes. Without it the headline win regressed on EVERY daemon
-				// restart: a non-delegate orphan re-pinned its full estimate until it
-				// exited, which is exactly the 33.6G-for-2.6G problem this change
-				// exists to remove, reintroduced by every deploy.
-				//
-				// The two classes differ in what `cap` MEANS, and that is why the age
-				// gate applies to only one of them:
-				//
-				//   - non-delegate: cap IS the admission estimate, so adopting it is a
-				//     correct cold-start floor for a scope too young to have shown its
-				//     usage. An unestablished age is treated as YOUNG, never as warm:
-				//     reading an unknown age as "old enough to track actual" would hand
-				//     a cold, not-yet-allocated job the full under-charge the floor
-				//     exists to prevent.
-				//   - delegate: cap is an AIRA-15 containment ceiling, never a
-				//     whole-job reservation, so adopting it would be the very
-				//     over-reservation this path was written to avoid. Its behaviour is
-				//     unchanged except for the margin policy below.
-				usableRSS := record.RSSBytes != nil && *record.RSSBytes >= 0
-				delegate := runner.IsDelegateRAMScopeID(record.ScopeID)
-				switch {
-				case !s.dynamicReserve && !delegate:
-					// Kill switch thrown: the pre-AIRA-29 behaviour for this class was
-					// to adopt the full cap, so fall through to exactly that. The
-					// delegate arm below is NOT switched off with it -- current+margin
-					// reconstruction there is AIRA-74, which shipped long before this
-					// change and must survive its rollback -- but its MARGIN reverts
-					// too, so the switch restores the whole prior behaviour rather than
-					// most of it.
-				case delegate && !usableRSS:
-					// Unreconstructable: contributes neither bytes nor a headroom job,
-					// left as a safe under-count exactly as before.
-					continue
-				case usableRSS && (delegate || s.adoptedScopeIsWarm(record)):
-					// One margin policy shared with the connection-held charge, rather
-					// than this path's own bare 64 MiB constant. For delegate scopes
-					// that is a change in the over-charge (safe) direction.
-					margin := delegateRAMAdoptionMargin
-					if s.dynamicReserve {
-						margin = s.chargeMargin(*record.RSSBytes, 0)
-					}
-					tracked := addClamp(*record.RSSBytes, margin)
-					if tracked < cap {
-						cap = tracked
-					}
-				}
-				adopted = addClamp(adopted, cap)
-				adoptedJobs = addJobCountClamp(adoptedJobs, 1)
-				// The row carries the SAME `cap` local the sum above just took, after
-				// every reconstruction the switch applied to it, so no row can report a
-				// figure the ledger did not charge. A scope id repeated by the scan
-				// (structurally impossible — the scan keys its own map by id) would
-				// overwrite rather than double, while the sum would double; that is the
-				// safe direction for a row set whose only job is attribution.
-				adoptedScopes[record.ScopeID] = cap
-			}
-			queue.adopted = adopted
-			queue.adoptedJobs = adoptedJobs
-			queue.adoptedScopes = adoptedScopes
-			queue.adoptedScanFailed = false
-			// AIRA-114. The aggregate cap accounting, derived from the SAME
-			// successful scan and from the very maps built above, but deliberately
-			// NOT from the adopted totals: that loop's leaf-Populated and
-			// finite-cap skips are correct for reserve accounting and would make
-			// this bound fail to bind. See admit_oversubscription.go.
-			queue.capAggregate, queue.capAggregateKnown = s.aggregateScopeCap(queue, scanResult.Scopes, present, held)
-		}
-	}
 	readMemory := s.memoryReader()
 	current, maximum, reclaimable, ok, _ := readMemory(queue.path)
 	if !ok {
@@ -2631,8 +2176,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// restart a phase — a blip must not hand anyone a fresh exclusive window.
 	maxHold := s.admitFreezeMaxHold
 	// Derived, not stored. Uses pass-start `now`, the same instant the grace check
-	// below uses, so hold and yield shift symmetrically if an adopted-confine scan
-	// delays the pass.
+	// below uses, so hold and yield shift symmetrically if anything delays the pass.
 	phase := admitFreezePhaseAt(queue.freezeArmedAt, now, maxHold)
 	if maxHold > 0 && phase == admitFreezeIdle && !queue.freezeArmedAt.IsZero() {
 		// A completed cycle must YIELD AT LEAST ONE EVALUATION before re-arming.
@@ -2641,34 +2185,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// would let the queue go hold -> idle -> re-armed in a single pass and
 		// backfill nothing at all — freezing forever while looking well-behaved.
 		// That happens whenever maxHold approaches the poll interval (any positive
-		// duration is accepted) or a slow adopted-confine scan delays a pass past
-		// a whole cycle. Clearing the anchor and treating THIS pass as a yield
+		// duration is accepted) or anything else delays a pass past a whole cycle.
+		// Clearing the anchor and treating THIS pass as a yield
 		// makes the guarantee "at least one backfilling pass per cycle", which is
 		// what actually admits waiters, rather than merely "some wall time spent
 		// nominally yielding".
 		queue.freezeArmedAt = time.Time{}
 		phase = admitFreezeYield
 	}
-	// AIRA-101. Abort a drain the daemon cannot establish emptiness for, BEFORE
-	// the grant loop, so the drain lifts in the same pass rather than one later.
-	// Without this the fail-closed emptiness rule would stall the whole shared
-	// slice for the full ceiling on a persistently unreadable slice: the drain
-	// head cannot be granted, and every other waiter is blocked by the drain.
-	//
-	// The abort takes the identical path as timeoutAdmitWaiter — state becomes
-	// admitRejected, grantedCh closes, and the handler's deferred release removes
-	// the waiter — so it leaks nothing, and exclusiveActive() stops matching the
-	// instant the state changes, which is what lifts the drain.
-	if gate := exclusiveGateLocked(queue); gate.draining != nil && !queue.scanFailingSince.IsZero() &&
-		now.Sub(queue.scanFailingSince) >= admitExclusiveEstablishGrace {
-		waiter := gate.draining
-		waiter.state = admitRejected
-		waiter.outcome = admitOutcomeExclusiveUnestablished
-		waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
-		close(waiter.grantedCh)
-		log.Printf("aira daemon: exclusive admission aborted on %s: confine scan failing for %s, cannot establish an empty slice (scope=%s)",
-			queue.path, now.Sub(queue.scanFailingSince).Round(time.Second), waiter.scopeID)
-	}
+	// S14: the drain head no longer needs an abort path. Emptiness is ledger-
+	// derived and always readable under queue.mu, so a drain converges as leases
+	// release (sliceProvablyEmpty) and is otherwise ended by the waiter's own
+	// max_wait or connection close — there is no "unreadable slice" case left to
+	// stall it.
 	gate := exclusiveGateLocked(queue)
 	// AIRA-103. The one place the pressure throttle actually gates admission.
 	// Hoisted out of the waiter loop: it is a per-pass fact, and a pure leaf-lock
@@ -2677,19 +2206,43 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// same file: that one decides the TERMINAL E_ADMIT_TOO_LARGE and sizes a
 	// job's own hard scope cap, so a job too large for the throttled ceiling must
 	// WAIT here rather than be refused there.
-	effectiveMaximum := s.admitEffectiveMaximum(queue.path, maximum)
-	// AIRA-114. The aggregate over-subscription limit for this pass, taken from
-	// the same effective maximum the reserve check uses so the two gates cannot
-	// disagree about the size of the slice at this instant. Zero when the bound
-	// is disabled.
-	oversubLimit := s.oversubscriptionLimit(effectiveMaximum)
-	oversubBlocked := false
+	// S4 (D4): the AIRA-103/106 pressure ceiling is MemAvailable-aware and part of
+	// the DEV system-aware gate ONLY. CI (ci-shim / advisory) is ledger-only —
+	// nothing runs outside the container, so the container memory.max IS the
+	// ceiling; there is no slice pressure to throttle against and the sampler does
+	// not run. Mode-gating it here (rather than relying on the shim snapshot being
+	// inert) is the explicit seam the "dev skips the system-RAM check" mutation
+	// flips.
+	effectiveMaximum := maximum
+	if !s.shimMode() {
+		effectiveMaximum = s.admitEffectiveMaximum(queue.path, maximum)
+	}
 	frozen := false
+	// S11 restart freeze (design §4): a per-pass fact like `phase`. While active, NO
+	// NEW admission is granted — survivors must re-declare (re-anchor / establish) their
+	// leases before a new admission can take space they are about to re-claim. Re-declares
+	// do NOT come through here: they SET/establish directly under queue.mu in
+	// enqueueAdmitInternal, so they are never frozen (Invariant 6).
+	restartFrozen := s.restartFrozenAt(now)
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
 	queuedAhead := 0
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
+			continue
+		}
+		// S11 restart-freeze gate (design §4). Placed BEFORE the exclusivity gate and the
+		// fit/grant so a NEW admission during the freeze simply WAITS — it never grants
+		// (never fail-opens), never arms the AIRA-59 fairness anchor (that arm lives in the
+		// refused-on-capacity block below, which this skips), and records NO contention and
+		// NO grantable. The no-contention part is load-bearing honesty: a non-blocking
+		// (max_wait_ms==0) admit that times out during the freeze must then read
+		// Contention "unevaluated" (the unset AIRA-149 latch) — the slice is not saturated,
+		// it is frozen — rather than a fabricated "saturated" solitude or a grant-shaped
+		// "unevaluated" (which the runner launches UNCAPPED). A blocking waiter re-evaluates
+		// at freeze-end, woken by the restart timer's signal or the next poll tick.
+		if restartFrozen {
+			waiter.waited = true
 			continue
 		}
 		// AIRA-101, the exclusivity gate. Placed before the RAM fit check because
@@ -2705,56 +2258,109 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// AIRA-149. A waiter that is not the drain head is blocked because
 			// another waiter is exclusively holding or draining the slice --
 			// something else is in the way BY CONSTRUCTION, so it latches observed
-			// directly. The drain head itself is blocked by !sliceProvablyEmpty, so
-			// it takes the shared reading: with an unestablished scan that is
-			// `unevaluated`, never `observed`, because the daemon could not
-			// establish the contention it would otherwise be asserting. At render
-			// time the AIRA-101 Exclusive arm wins the wording, but a stored false
-			// claim is still the wrong value.
+			// directly. The drain head itself is blocked by !sliceProvablyEmpty
+			// (Σleases > 0), so it takes the shared ledger reading: `observed` while
+			// a lease is held, `none-observed` once the slice is empty. At render
+			// time the AIRA-101 Exclusive arm wins the wording, but the stored
+			// contention value must still be the truthful one.
 			if gate.draining != nil && waiter == gate.draining {
-				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, false))
+				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 			} else {
 				waiter.joinContentionLocked(contentionObserved)
 			}
 			queuedAhead++
 			continue
 		}
-		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
+		jobs := addJobCountClamp(queue.outstandingJobs, 1)
 		headroom := s.admitSliceHeadroom(jobs)
-		available := checkedAvailable(current, effectiveMaximum, reclaimable, addClamp(queue.outstanding, queue.adopted), headroom)
+		// S4 (D4): the LEDGER check (ceiling − Σleases, signed) applies in BOTH
+		// modes; the physical current/reclaimable floor is DEV-only. CI drops it
+		// (ledger-only) because nothing runs outside the container; DEV keeps it,
+		// so a slice already over its declared reserve is gated on the real bytes,
+		// alongside the MemAvailable-aware effectiveMaximum above.
+		//
+		// S12: a single accounting — the connection-held ledger (queue.outstanding).
+		// The AIRA-74 scan-adoption addend is gone; a post-restart survivor is
+		// counted ONCE via S11's reload + re-declare, never a second time via a
+		// parallel scan-reconstructed reserve.
+		outstanding := queue.outstanding
+		var available int64
+		if s.shimMode() {
+			available = ledgerAvailable(effectiveMaximum, outstanding, headroom)
+		} else {
+			available = checkedAvailable(current, effectiveMaximum, reclaimable, outstanding, headroom)
+		}
 		if frozen {
 			waiter.waited = true
 			// AIRA-149. `frozen` is only ever set by a waiter AHEAD in this same
 			// pass that was refused on capacity, so queuedAhead is already >= 1 and
 			// the shared reading cannot return none-observed here.
-			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, false))
+			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 			waiter.noteGrantableLocked(available)
 			queuedAhead++
 			continue
 		}
-		// AIRA-114. The aggregate bound is folded into the SAME branch as the
-		// reserve check rather than given its own `continue` above, and that is
-		// load-bearing. Both are capacity refusals, so both must arm the AIRA-59
-		// fairness freeze: a head held back by the aggregate while smaller-capped
-		// waiters behind it kept being admitted is backfill starvation, exactly
-		// what that duty cycle exists to stop. (The exclusivity gate's separate
-		// `continue` above is not comparable — during a drain there is no backfill
-		// to stop.)
-		overSubscribed := s.oversubscriptionBlocks(queue, waiter, oversubLimit)
-		if overSubscribed {
-			oversubBlocked = true
+		// S5 CONJUNCTIVE FIT (design §7): admit only if EVERY resource fits — RAM
+		// AND CPU. Both are PER-SLICE ledgers: `available` is RAM (ceiling − Σreserve),
+		// and CPU is this queue's own cpuOutstanding against the 2×NumCPU ceiling. CPU
+		// is treated per slice on the one-slice (aira.slice) assertion (D1); cores are
+		// machine-wide, so if concurrent slices are ever introduced this must become a
+		// sum across slices. grantedAt marks "the daemon just decided this job may
+		// proceed", deliberately separate from enqueued (a long queue wait is not launch
+		// abandonment — the AIRA-49 v3 defect); nothing but the grant below sets it.
+		ramFits := waiter.reserve <= available
+		cpuFits := waiter.cpu <= cpuAvailable(s.cpuCeiling(), queue.cpuOutstanding)
+		if ramFits && cpuFits {
+			waiter.state = admitGranted
+			waiter.grantedAt = s.admitNowTime()
+			waiter.accounted = true
+			// The ledger is DERIVED, not incremented: this waiter is now granted &&
+			// accounted, so re-deriving over the waiter set folds in BOTH its RAM
+			// ledgerCharge() and its cores. Done here, before the next queued waiter is
+			// evaluated, so a later grant in this same pass reads this one at the
+			// fit-check above — exactly as the old `outstanding +=` did, now for two
+			// resources at once.
+			queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			if waiter.waited {
+				waiter.outcome = "waited"
+				waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
+			} else {
+				waiter.outcome = "immediate"
+			}
+			close(waiter.grantedCh)
+			continue
 		}
-		if waiter.reserve > available || overSubscribed {
+		{
+			// Refused on capacity — RAM short OR CPU short — takes the same FIFO tail:
+			// record the RAM grantable figure and arm the AIRA-59 backfill freeze so a
+			// later smaller waiter cannot jump the head.
+			//
+			// ACCEPTED GAP (S5, out of scope): noteGrantableLocked records the RAM
+			// `available` figure even for a CPU-only refusal, and there is no CPU
+			// diagnostic field — so a job blocked purely on CPU is rejected with
+			// E_ADMIT_SATURATED rendering the RAM-flavoured "no memory admission within
+			// the wait". Diagnosis only (no admission decision reads it); a dedicated CPU
+			// diagnostic is deferred. The contention latch below still tells the honest
+			// truth (observed, never a fabricated solitude).
 			waiter.waited = true
-			// AIRA-149. THE ONLY SITE that may ever latch none-observed, and only on
-			// the `reserve > available` disjunct: overSubscribed is passed into the
-			// reading as computed just above, so an aggregate refusal short-circuits
-			// to observed and the reading is taken over the disjunct ACTUALLY taken
-			// rather than reconstructed afterwards.
-			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead, overSubscribed))
+			// AIRA-149 contention latch, S5-aware. A RAM refusal (ramFits == false) is a
+			// fact about THIS slice's ledger, so it takes the honest solo reading — which
+			// may legitimately be none-observed (the residual-page case). A CPU refusal
+			// (ramFits but !cpuFits) latches `observed` directly: this slice's own cores
+			// are held, so something IS in the way by construction. (It would read
+			// `observed` via soloReadingLocked anyway — a CPU-full slice has
+			// outstandingJobs ≥ 1, so it is never provablyEmpty — but stating it here is
+			// the direct, intent-revealing guard against ever rendering a fabricated
+			// RAM-solitude diagnosis for a CPU refusal.) soloReadingLocked is the ONLY
+			// site that may latch none-observed, and only the RAM arm may reach it.
+			if ramFits {
+				waiter.joinContentionLocked(contentionObserved)
+			} else {
+				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
+			}
 			waiter.noteGrantableLocked(available)
 			queuedAhead++
-			// now is pass-start time, so a slow adopted-confine scan can defer this freeze by its duration.
+			// now is pass-start time, so anything delaying the pass defers this freeze by its duration.
 			if s.admitBackfillGrace <= 0 || now.Sub(waiter.enqueued) >= s.admitBackfillGrace {
 				switch {
 				case maxHold <= 0:
@@ -2784,39 +2390,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			}
 			continue
 		}
-		// grantedAt is the one moment in this system that authoritatively marks
-		// "the daemon just decided this job may proceed". It is deliberately
-		// separate from enqueued (set once, at waiter creation): a waiter that
-		// queued for a long time under contention is granted here, now, and
-		// measuring its lease age from enqueued would conflate ordinary
-		// admission-queue contention with launch abandonment — the AIRA-49 v3
-		// defect. Nothing but this line may ever set it.
-		waiter.state = admitGranted
-		waiter.grantedAt = s.admitNowTime()
-		waiter.accounted = true
-		// AIRA-29. ledgerCharge() is the resolved reserve until a usable scan
-		// reading replaces it (refreshWaiterCharge), which is what makes the
-		// grant -> scope-creation window safe: an untracked waiter charges its
-		// whole estimate, never zero.
-		queue.outstanding += waiter.ledgerCharge()
-		queue.outstandingJobs++
-		// AIRA-114. Keep the aggregate current WITHIN a pass and between scans.
-		// The derive above runs at most once a second; without this increment a
-		// burst of grants in one pass would each be measured against the same
-		// stale total and could clear the bound together — the multi-grant
-		// overshoot the bound exists to prevent. Only maintained while the total
-		// is established, because an increment onto an unestablished number would
-		// manufacture one. The next successful scan re-derives it from scratch.
-		if queue.capAggregateKnown && waiter.contributesScopeCap() {
-			queue.capAggregate = addClamp(queue.capAggregate, waiter.prospectiveScopeCap())
-		}
-		if waiter.waited {
-			waiter.outcome = "waited"
-			waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
-		} else {
-			waiter.outcome = "immediate"
-		}
-		close(waiter.grantedCh)
 	}
 	// Log BEFORE clearing the diagnostics holder: a hold->yield transition is
 	// exactly the moment an operator wants to see WHICH waiter was being
@@ -2824,21 +2397,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	if maxHold > 0 && phase != queue.freezeLogged {
 		s.logAdmitFreezeTransition(queue, phase, now)
 		queue.freezeLogged = phase
-	}
-	// AIRA-114. Report the bound as a TRANSITION, never per pass: the evaluator
-	// runs at up to 4/s, so a steady-state line would itself be a regression on a
-	// busy box. This is the same reasoning as logAdmitFreezeTransition, and it
-	// exists for the AIRA-71 lesson — a silent admission wait reads to its victim
-	// as a hang, and this change adds a new reason to wait.
-	if oversubBlocked != queue.capBlockedLogged {
-		if oversubBlocked {
-			log.Printf("aira daemon: admission aggregate over-subscription bound reached on %s: live scope caps total %d of %d limit (%d%% of ceiling); waiters hold until a job exits",
-				queue.path, queue.capAggregate, oversubLimit, s.oversubscriptionFactorPct)
-		} else {
-			log.Printf("aira daemon: admission aggregate over-subscription bound cleared on %s: live scope caps total %d of %d limit",
-				queue.path, queue.capAggregate, oversubLimit)
-		}
-		queue.capBlockedLogged = oversubBlocked
 	}
 	if !frozen {
 		// The head fitted, was granted, or left. Clear only the DIAGNOSTICS seq —
@@ -2882,6 +2440,19 @@ func subtractJobCount(value, subtract int) int {
 	return value - subtract
 }
 
+// checkedAvailable is the DEV (real-cgroup) physical-floor availability:
+// ceiling − max(effectiveCurrent, Σleases). The charge is the LARGER of the
+// slice's own physical use (memory.current less the AIRA-21 reclaimable discount)
+// and the declared ledger, so a slice already over its declared reserve is gated
+// on the real bytes.
+//
+// S4 (D4): the result is SIGNED. A charge that exceeds a VALID ceiling — the
+// ledger driven past the ceiling during the restart re-declare window (§4), or a
+// physical over-use — yields a NEGATIVE available, which makes the next NEW
+// admission wait until a release recovers it, rather than a clamp-at-zero that
+// hides the deficit. Only INVALID inputs and a degenerate ceiling (headroom >=
+// maximum) report 0: those are an unusable reading, not a legitimately
+// over-subscribed ledger.
 func checkedAvailable(current, maximum, reclaimable, outstanding, headroom int64) int64 {
 	if current < 0 || maximum < 0 || outstanding < 0 || headroom < 0 || maximum <= headroom {
 		return 0
@@ -2895,10 +2466,44 @@ func checkedAvailable(current, maximum, reclaimable, outstanding, headroom int64
 	if effectiveCurrent > charge {
 		charge = effectiveCurrent
 	}
-	if charge >= ceiling {
-		return 0
-	}
+	// SIGNED: ceiling and charge are both non-negative, so ceiling − charge cannot
+	// overflow, and a charge past the ceiling is a legitimate negative available.
 	return ceiling - charge
+}
+
+// ledgerAvailable is the CI (ci-shim / advisory) mode availability: the signed
+// ledger ceiling − Σleases, with NO physical floor. In ci-shim mode nothing runs
+// outside the container, so declared reserves + the container memory.max (the
+// ceiling) are the whole truth (D4, design §7) — a large host-wide memory.current
+// says nothing about this container and must not gate it. It reuses
+// checkedAvailable with a zero physical reading, so the ceiling/headroom guards
+// and the signed result are identical to the dev path's ledger term.
+func ledgerAvailable(maximum, outstanding, headroom int64) int64 {
+	return checkedAvailable(0, maximum, 0, outstanding, headroom)
+}
+
+// cpuCeiling is the CPU ceiling: 2 × NumCPU cores (design §7). It is an INTEGER
+// derived purely from the core count — no cgroup read, and no cpu.max is ever
+// written; the 2× over-provision caps admission busyness while the kernel
+// time-shares on cpu.weight. The core count comes through the cpuCoreCounter seam
+// so a test can pin a deterministic ceiling. This is the ONLY per-resource code
+// CPU adds — admit/available/fit/release/wake are otherwise resource-agnostic.
+//
+// The ceiling is applied PER SLICE against queue.cpuOutstanding (D1, resolved to
+// per-slice on the one-slice aira.slice assertion). Cores are a machine-wide
+// resource; a second concurrent slice would let Σ across slices exceed 2×NumCPU,
+// so if concurrent slices are ever introduced this must become machine-wide.
+func (s *Server) cpuCeiling() int64 {
+	return 2 * int64(s.cpuCoreCounter()())
+}
+
+// cpuAvailable is the signed CPU-ledger availability, the sibling of
+// checkedAvailable/ledgerAvailable for the CPU resource: ceiling − Σ(this slice's
+// live lease cores). Signed like the RAM ledger — a slice momentarily over its CPU
+// ceiling simply makes the next new admission wait. Cores are small integers, so
+// the subtraction cannot overflow.
+func cpuAvailable(ceiling, outstanding int64) int64 {
+	return ceiling - outstanding
 }
 
 func (s *Server) timeoutAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
@@ -2924,33 +2529,70 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 	}
 }
 
+// releaseAdmitWaiterAnchored is the socket-EOF release: the connection that anchored
+// the lease discharges it on its own EOF, via the compare-and-release gate. conn is the
+// releasing handler's own connection. See releaseAdmitWaiterLockedAnchored. It runs
+// afterAdmitRelease only when it performed the discharge.
+func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) {
+	queue.mu.Lock()
+	released := releaseAdmitWaiterLockedAnchored(queue, waiter, conn)
+	queue.mu.Unlock()
+	if released {
+		s.afterAdmitRelease(queue)
+	}
+}
+
+// releaseAdmitWaiterLockedAnchored is compare-and-release (design §3, Inv 4), with
+// queue.mu ALREADY HELD: it discharges the lease ONLY if the EOF is from the connection
+// that is CURRENTLY the anchor — i.e. waiter.anchor still IS conn. A re-declare on a new
+// connection overwrote the anchor (anchorLeaseLocked), so this stale connection's later
+// EOF releases nothing. The compare is direct identity on the live net.Conn the handler
+// holds for the lease's lifetime — NO generation value is captured, so none can be
+// captured in a critical section separate from the SET that set it (the reconnect-race
+// lost-lease bug this avoids by construction).
+//
+// This is the primary release path: every lease is released by its current-anchor
+// connection's EOF (S15's worker-lease EOF reuses THIS variant). The unconditional
+// releaseAdmitWaiterLocked is retained for the remaining reclaim paths that are NOT
+// keyed on a releasing connection — the operator `confine --kill`, the exclusive
+// unwedge, the physical-reap stale-lease backstop (S14 deleted the scan-derived
+// vanished branch), and the tests. A socket-EOF release must NOT route through the
+// unconditional form, or the anchor gate is bypassed.
+//
+// The caller runs afterAdmitRelease once it has dropped queue.mu, and only when this
+// returned true.
+func releaseAdmitWaiterLockedAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) bool {
+	if waiter.state == admitReleased {
+		return false
+	}
+	// conn == nil is refused defensively: an anchored compare-and-release must match a
+	// REAL connection, never release on a nil==nil coincidence. Since S13 deleted the
+	// dump/reload layer every granted lease is anchored to a live connection (no nil
+	// anchors exist), so this is belt-and-braces rather than a reachable guard, but it
+	// keeps the illegal nil match unrepresentable.
+	if conn == nil || waiter.anchor != conn {
+		return false
+	}
+	return releaseAdmitWaiterLocked(queue, waiter)
+}
+
 // releaseAdmitWaiterLocked is the ledger discharge itself, with queue.mu ALREADY
 // HELD by the caller. It reports whether THIS call performed the transition, so
 // a caller can never log or count a reclaim that a concurrent release had
 // already done.
 //
 // AIRA-68 split this out of releaseAdmitWaiter so the stale-lease sweep can make
-// its final validation and its discharge ONE critical section. Validating under
-// the lock, dropping it, and then discharging leaves a window in which the
-// evaluator re-observes the scope and clears scopeVanished — after which the
-// sweep would still discharge a lease whose reclaim proof had just evaporated.
-// Both plan reviewers found that window independently.
+// its final validation and its discharge ONE critical section: validating under
+// the lock, dropping it, and then discharging would leave a window in which the
+// facts the reclaim proof rests on change under the sweep. The physical-reap
+// backstop (the only stale-lease reclaim path left after S14 deleted the scan)
+// still relies on that single-critical-section discharge.
 //
 // The caller must run afterAdmitRelease once it has dropped queue.mu, and only
 // when this returned true.
 func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 	if waiter.state == admitReleased {
 		return false
-	}
-	if waiter.state == admitGranted && waiter.accounted {
-		// AIRA-29. Discharge the CURRENT ledger charge, not the frozen reserve.
-		// The add in the grant loop and this subtraction are the only two writers
-		// besides refreshWaiterCharge's delta, and all three go through
-		// ledgerCharge() under the same admitGranted && accounted condition, which
-		// is what makes "outstanding returns to exactly zero" true rather than
-		// approximate.
-		queue.outstanding -= waiter.ledgerCharge()
-		queue.outstandingJobs--
 	}
 	for index, candidate := range queue.waiters {
 		if candidate == waiter {
@@ -2961,6 +2603,17 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 		}
 	}
 	waiter.state = admitReleased
+	// Discharge is a re-derive, not a subtraction: this waiter is now removed
+	// from queue.waiters AND marked admitReleased, so re-deriving over the
+	// survivors drops its ledgerCharge() exactly when it drops any granted &&
+	// accounted lease -- which is what makes "outstanding returns to exactly zero"
+	// true rather than approximate. The grant and this release are the ledger's
+	// only two mutation points, both re-deriving through the one accessor under
+	// this lock.
+	// S5. Re-derives BOTH resources: the released lease's RAM (outstanding) and its
+	// cores (cpuOutstanding) drop together, so the per-slice CPU sum the fit-check
+	// reads returns the freed cores immediately on the next pass.
+	queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 	return true
 }
 
@@ -2974,6 +2627,11 @@ func (s *Server) afterAdmitRelease(queue *sliceQueue) {
 	// waiter immediately rather than at the next 250ms poll, so it is pinned by
 	// TestAfterAdmitReleaseKicksTheQueue (AIRA-33 deleted the test that used to
 	// carry that assertion alongside a governor one).
+	//
+	// S5: a CPU release is per-slice (D1, resolved to per-slice), exactly like a RAM
+	// release — it frees cores only in THIS slice's ledger, so kicking this queue is
+	// sufficient to wake its own CPU-blocked waiters. No cross-queue signal: there is
+	// no machine-wide CPU ledger for another slice to be waiting on.
 	queue.signal()
 	s.pruneAdmitQueue(queue)
 }
@@ -3010,6 +2668,31 @@ func (s *Server) writeAdmitGrant(conn net.Conn, grant AdmitResponse) {
 		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
 	}
 	_ = write(conn, responseFrame(core.Response{OK: true, Code: "OK", Data: grant}))
+}
+
+// writeAdmitFailClosed refuses a NEW admission the daemon cannot evaluate
+// (Invariant 6): an unresolvable slice or an unreadable slice/container budget.
+// It NEVER emits a grant — a grant-shaped `unevaluated` here is launched UNCAPPED
+// by the runner.
+//
+// An exclusive request gets the specific U_ADMIT_EXCLUSIVE_UNESTABLISHED (the
+// same code the ci-shim exclusive refusal and the drain-abort use) purely for
+// HONESTY: the runner's fail() already refuses ANY exclusive request before the
+// flock fallback (admission_linux.go), so both codes refuse exclusivity — this
+// one just carries the precise reason to the client instead of the generic
+// "exchange did not complete". An ordinary refusal routes through the runner's
+// fail() to the flock fallback in the interim (S13 replaces that with reconnect +
+// re-request); --require-admission already fails closed on any non-admitted state.
+func (s *Server) writeAdmitFailClosed(conn net.Conn, exclusive bool, reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "slice budget unreadable"
+	}
+	if exclusive {
+		s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
+			CodeAdmitExclusiveUnestablished+": "+reason+" — an empty slice could not be established for an exclusive request")
+		return
+	}
+	s.writeAdmitError(conn, CodeUnavailable, CodeUnavailable+": "+reason)
 }
 
 func (s *Server) writeAdmitError(conn net.Conn, code, message string) {
@@ -3193,13 +2876,14 @@ func admitErrorCode(err error) string {
 
 func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, error) {
 	// AIRA-185 widened the count to 13 and added `reason` to the allowlist below.
-	// Both are ADDITIVE: no existing field changed meaning, and no admission,
-	// gate or emptiness decision reads the new one.
-	if len(args) < 3 || len(args) > 13 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	// S5 widened it to 14 and added `cpu`. All are ADDITIVE: no existing field
+	// changed meaning, and (bar cpu, the second ledger resource) no admission, gate
+	// or emptiness decision reads the new ones.
+	if len(args) < 3 || len(args) > 14 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
+		if name != "slice" && name != "reserve" && name != "cpu" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -3212,12 +2896,34 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	if !ok || reserve < 0 || reserve > admitMaxReserve {
 		return admitRequest{}, fmt.Errorf("%s: admit reserve must be in [0,%d]", CodeProtocol, admitMaxReserve)
 	}
-	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
-	if !ok {
-		return admitRequest{}, fmt.Errorf("%s: admit max_wait_ms must be an integer", CodeProtocol)
+	// S5. cpu is optional (absent → 0 cores, charged nothing). Only STRUCTURAL
+	// validation here — a non-integer or negative value is malformed. The
+	// machine-specific "impossible on this box" refusal (cpu > 2×NumCPU) is
+	// fail-fast in admitConnection, which has the core count; done there, exactly as
+	// reserve's RANGE is checked here but its CEILING is checked in admitConnection.
+	cpu := int64(0)
+	if raw, exists := args["cpu"]; exists {
+		cpu, ok = exactAdmitInt64(raw)
+		if !ok || cpu < 0 {
+			return admitRequest{}, fmt.Errorf("%s: admit cpu must be a non-negative integer", CodeProtocol)
+		}
 	}
-	if maxWait < 0 {
-		maxWait = 0
+	// S13: max_wait_ms is OPTIONAL. The confine client no longer sends it (a launch
+	// blocks until granted or reconnects on a daemon restart, never self-expiring —
+	// design §4/§6). Present-and-zero selects NON-BLOCKING mode. Absent → a blocking
+	// wait with no timeout.
+	maxWait := int64(0)
+	nonBlocking := false
+	if raw, exists := args["max_wait_ms"]; exists {
+		parsed, ok := exactAdmitInt64(raw)
+		if !ok {
+			return admitRequest{}, fmt.Errorf("%s: admit max_wait_ms must be an integer", CodeProtocol)
+		}
+		if parsed < 0 {
+			parsed = 0
+		}
+		nonBlocking = parsed == 0
+		maxWait = parsed
 	}
 	// AIRA-58: REFUSE, never silently substitute. The old behaviour clamped to a
 	// hardcoded 30 minutes with no error, no warning, and no field in
@@ -3371,7 +3077,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		// ONE parser, runner's own, rather than a regex restating the grammar
 		// beside it: the two drifted apart (build-review, Sol) and a scope id the
 		// regex admitted but the scanner's parser rejected was admitted and then
-		// invisible to every scan, adoption pass and reaper.
+		// invisible to every scan and reaper.
 		embeddedName, _, _, embeddedOwner, parsed := runner.ParseConfineScopeID(scopeText)
 		if !scopeOK || !parsed {
 			return admitRequest{}, fmt.Errorf("%s: admit scope_id is not canonical", CodeProtocol)
@@ -3406,7 +3112,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3419,7 +3125,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// exclusive requires the tuple refused just above), and it is transcribed
 	// anyway so that relaxing either rule later cannot silently drop the field
 	// instead of failing a test.
-	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

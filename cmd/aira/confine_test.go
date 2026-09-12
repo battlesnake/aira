@@ -411,25 +411,16 @@ func TestConfineMemoryFlagsThreadIntoRequest(t *testing.T) {
 	}
 }
 
-func TestConfineAdmitTimeoutValidationAndThreading(t *testing.T) {
-	original := runConfined
-	t.Cleanup(func() { runConfined = original })
-	// Sub-1ms values (500us, 999us) must ALSO be rejected: the wire value is
-	// max_wait_ms and Milliseconds() truncates them to 0, which would reintroduce
-	// the deferred zero-wait evaluator race (a false "saturated" reject).
-	for _, raw := range []string{"0", "-1s", "500us", "999us"} {
-		if _, _, err := parseArgs("confine", []string{"--admit-timeout", raw, "--", "true"}); err == nil || !strings.Contains(err.Error(), "--admit-timeout") {
-			t.Fatalf("--admit-timeout %q err=%v, want CLI rejection", raw, err)
+// S13 removed --admit-timeout: the admission wait no longer self-expires (a
+// blocking wait ends on the grant or on interrupting the command, design §4/§6),
+// so the flag has no meaning and is rejected as an unknown confine option rather
+// than parsed. This pins that removal so a later change cannot silently re-add a
+// flag that does nothing.
+func TestConfineAdmitTimeoutRemovedAndRejected(t *testing.T) {
+	for _, raw := range []string{"25ms", "5m", "0", "48h"} {
+		if _, _, err := parseArgs("confine", []string{"--admit-timeout", raw, "--", "true"}); err == nil || !strings.Contains(err.Error(), "not valid for confine") {
+			t.Fatalf("--admit-timeout %q err=%v, want an unknown-option rejection", raw, err)
 		}
-	}
-	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
-		if request.AdmissionMaxWait != 25*time.Millisecond {
-			t.Fatalf("AdmissionMaxWait=%s want 25ms", request.AdmissionMaxWait)
-		}
-		return runner.ConfineResult{}, nil
-	}
-	if exit := runWithInput([]string{"confine", "--admit-timeout", "25ms", "--", "true"}, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
-		t.Fatalf("exit=%d", exit)
 	}
 }
 
@@ -685,11 +676,11 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		// AIRA-138 adds --timeout and --cpu-timeout to the usage line, beside the
-		// --admit-timeout they must never be confused with. AIRA-196 adds
+		// AIRA-138 adds --timeout and --cpu-timeout to the usage line. AIRA-196 adds
 		// --stdin-connect, which is meaningful only with --detach. AIRA-222 adds
-		// --require-admission (fail closed when the job was not admitted).
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
+		// --require-admission (fail closed when the job was not admitted). S13 removed
+		// --admit-timeout (the admission wait no longer self-expires).
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}
@@ -956,80 +947,6 @@ func TestRenderConfineListCeilingLine(t *testing.T) {
 				if strings.Contains(haystack, absent) {
 					t.Fatalf("ceiling block=%q, must not contain %q", haystack, absent)
 				}
-			}
-		})
-	}
-}
-
-// TestRenderConfineListScopeCapBound is the operator-facing half of AIRA-114.
-// The bound adds a NEW reason a job waits, and AIRA-71's lesson is that a
-// silent admission wait reads to its victim as a hang — so the line that
-// explains it has to actually appear, and has to distinguish an established
-// aggregate from one nobody could read.
-func TestRenderConfineListScopeCapBound(t *testing.T) {
-	tests := []struct {
-		name    string
-		reserve runner.ConfineSliceReserve
-		want    string
-		absent  bool
-	}{
-		{
-			name: "established",
-			reserve: runner.ConfineSliceReserve{
-				GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 1,
-				CapAggregateBytes: 20 << 30, CapAggregateKnown: true, CapBoundBytes: 24 << 30,
-			},
-			want: "slice scope caps: 20G across live scopes / 24G over-subscription bound\n",
-		},
-		{
-			// A zero aggregate is a real reading only while it is ESTABLISHED, and
-			// then it means "no live capped scope" — printed, not suppressed.
-			name: "established zero",
-			reserve: runner.ConfineSliceReserve{
-				GrantedBytes: 0, CeilingBytes: 12 << 30, Jobs: 0,
-				CapAggregateBytes: 0, CapAggregateKnown: true, CapBoundBytes: 24 << 30,
-			},
-			want: "slice scope caps: 0B across live scopes / 24G over-subscription bound\n",
-		},
-		{
-			// Unevaluated must never render as the zero above: while it is
-			// unevaluated the bound withholds nothing, so "0B" would state the
-			// opposite of the truth about a slice that may be full.
-			name: "unevaluated",
-			reserve: runner.ConfineSliceReserve{
-				GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 1,
-				CapAggregateBytes: 0, CapAggregateKnown: false, CapBoundBytes: 24 << 30,
-			},
-			want: "slice scope caps: unevaluated / 24G over-subscription bound (not applied while unevaluated)\n",
-		},
-		{
-			// The bound switched off adds nothing to the surface: an absence, not
-			// a rendered limit of zero.
-			name: "bound disabled",
-			reserve: runner.ConfineSliceReserve{
-				GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 1,
-				CapAggregateBytes: 20 << 30, CapAggregateKnown: true, CapBoundBytes: 0,
-			},
-			absent: true,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			reserve := test.reserve
-			result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{}, SliceReserve: &reserve}
-			var stdout, stderr bytes.Buffer
-			exit := renderConfineListResponse(core.Response{OK: true, Code: "OK", Data: result}, &stdout, &stderr)
-			if exit != 0 || stderr.Len() != 0 {
-				t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
-			}
-			if test.absent {
-				if strings.Contains(stdout.String(), "slice scope caps:") {
-					t.Fatalf("a disabled bound must add no line at all: %q", stdout.String())
-				}
-				return
-			}
-			if !strings.Contains(stdout.String(), test.want) {
-				t.Fatalf("stdout=%q, want %q", stdout.String(), test.want)
 			}
 		})
 	}

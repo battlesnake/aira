@@ -316,7 +316,10 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 		t.Fatal(err)
 	}
 	server := daemon.NewServer(paths)
-	server.SetWorkerAdmitHeadroomForTest(0)
+	// S15: worker leases charge the unified signed ledger against the real
+	// aira.slice ceiling (this e2e runs the real daemon against the real slice), so
+	// no worker-specific headroom override is needed — the real slice has ample room
+	// for the suite's real workers.
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())

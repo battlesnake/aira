@@ -64,6 +64,9 @@ no `memory.high` written anywhere.**
   unestablished scope age as young; without it the win regressed on every daemon restart.
 - `AIRA_DAEMON_DYNAMIC_RESERVE=disabled` reverts the WHOLE change (live charge and adoption
   margin) on a live daemon without a rebuild; an unrecognised value is refused at start.
+  **RETIRED by the admission-counter rebuild S1 (2026-09-11):** the AIRA-29 live charge is
+  deleted and the ledger is declared-only, so this variable no longer exists — it is now
+  silently ignored, not a kill switch.
 
 ### Deliberately NOT built, with reasoning (each filed as its own ticket)
 

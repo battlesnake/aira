@@ -159,7 +159,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// ONE locked snapshot for the WHOLE reply: the per-scope reserves stamped
 		// onto the rows below and the slice totals built from it further down are
 		// the same reading, so a reader can reconcile the rows against the total
-		// (they sum to ScopeBytes + AdoptedBytes) instead of comparing two instants.
+		// (they sum to ScopeBytes) instead of comparing two instants.
 		//
 		// AIRA-24: a caller that is ITSELF queued names its own scope id and gets
 		// its position out of this same pass. `aira confine --list` never passes one
@@ -197,25 +197,29 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 			// The granted totals and the queued/freeze state come from the SAME
 			// snapshot taken above, so the summary cannot contradict itself, nor
 			// the per-scope rows it was also stamped onto.
-			outstanding, adopted := snapshot.outstanding, snapshot.adopted
-			totalJobs := addJobCountClamp(snapshot.outstandingJobs, snapshot.adoptedJobs)
+			outstanding := snapshot.outstanding
 			queued, freezePhase := snapshot.queued, snapshot.phase
 			result.SliceReserve = &runner.ConfineSliceReserve{
-				GrantedBytes: addClamp(outstanding, adopted),
+				GrantedBytes: outstanding,
 				// AIRA-220. present is false when no queue object exists for the
 				// slice, i.e. the daemon holds no admission ledger: a
 				// fresh/restarted daemon before its first admission, OR any slice
 				// with nothing connection-held right now (pruneAdmitQueue deletes
-				// the queue, adopted ledger included, on the last release — so even
-				// a slice with live adopted jobs reads false between connections).
-				// The granted total, job count and population split below are then
-				// fabricated zeros and must be reported unevaluated, not as a
-				// confident empty slice.
-				GrantedEstablished: snapshot.present,
+				// the queue on the last release). The granted total, job count and
+				// population split below are then fabricated zeros and must be
+				// reported unevaluated, not as a confident empty slice.
+				//
+				// S13 (design §4). ALSO unevaluated while the restart new-admission freeze
+				// is active: the granted total is not yet trustworthy (survivors may still
+				// re-declare to re-anchor their leases), so reporting a confident figure
+				// would be the same fabrication AIRA-220 forbids. DERIVED from the freeze
+				// (NOT hardcoded true): S12 deleted the cgroup-scan adoption and S13 the
+				// dump/unanchored layer, and the bit stays correct because snapshot.present
+				// ("a queue exists") survived both.
+				GrantedEstablished: snapshot.present && !snapshot.restartFrozen,
 				// Ceiling is what one MORE job would face; scale headroom by the
-				// TOTAL admitted jobs (outstanding + adopted) so it stays consistent
-				// with the Jobs shown, not just the connection-held ones.
-				CeilingBytes: subtractFloor(ceilingMaximum, s.admitSliceHeadroom(addJobCountClamp(totalJobs, 1))),
+				// admitted job count so it stays consistent with the Jobs shown.
+				CeilingBytes: subtractFloor(ceilingMaximum, s.admitSliceHeadroom(addJobCountClamp(snapshot.outstandingJobs, 1))),
 				// AIRA-103. What the ceiling WOULD be if applied. In enforce mode
 				// it equals CeilingBytes; in OBSERVE mode CeilingBytes is the
 				// untouched static capacity (observe applies nothing), so
@@ -225,8 +229,8 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// because "off adds nothing to the wire" is the claim this ships
 				// on, pinned by TestConfineListSliceReserveSummary.
 				CeilingWouldBeBytes: sliceCeilingWouldBeBytes(ceiling, ceilingMaximum,
-					s.admitSliceHeadroom(addJobCountClamp(totalJobs, 1))),
-				Jobs:        totalJobs,
+					s.admitSliceHeadroom(addJobCountClamp(snapshot.outstandingJobs, 1))),
+				Jobs:        snapshot.outstandingJobs,
 				Queued:      queued,
 				FreezePhase: freezePhase,
 				// Zero unless the caller named a scope id that is queued right
@@ -249,10 +253,6 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// Sorted and capped OUTSIDE the queue lock — the snapshot already
 				// copied the values out under it.
 				Reservations:  confineReservationRows(snapshot.reservations),
-				AdoptedJobs:   snapshot.adoptedJobs,
-				AdoptedBytes:  snapshot.adopted,
-				VanishedJobs:  snapshot.vanishedJobs,
-				VanishedBytes: snapshot.vanishedBytes,
 				ResidualJobs:  snapshot.residualJobs(),
 				ResidualBytes: snapshot.residualBytes(),
 				// AIRA-103. Absent (all zero/empty) when the subsystem is off, so
@@ -264,13 +264,6 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				CeilingHeld:        ceiling.Held,
 				CeilingStaticBytes: ceiling.StaticMax,
 				MemAvailableBytes:  ceiling.MemAvailable,
-				// AIRA-114. From the SAME snapshot and the SAME ceiling reading the
-				// evaluator's own gate uses, so this line can never describe a
-				// different instant or a different slice size than the decision it
-				// explains.
-				CapAggregateBytes: snapshot.capAggregate,
-				CapAggregateKnown: snapshot.capAggregateKnown,
-				CapBoundBytes:     s.oversubscriptionLimit(ceilingMaximum),
 			}
 			// AIRA-127. The system-and-slice frame `aira top` draws its RAM bar
 			// in, from the SAME reading whose `ok` gates this whole struct plus
@@ -308,9 +301,9 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// and withheld whole in shim mode by the same `if` that withholds
 				// the RAM frame.
 				//
-				// Core count comes from runtime.NumCPU(), the same source
-				// desiredCPUSlots derives the AIRA-49 worker slot count from, so the
-				// bar's capacity and the scheduler's own idea of this machine's
+				// Core count comes from runtime.NumCPU(), the same source the
+				// admission ledger's CPU ceiling (2×NumCPU) derives from, so the
+				// bar's capacity and the ledger's own idea of this machine's
 				// width cannot drift apart.
 				cpu := s.cpuFrameReader()(path)
 				result.SliceReserve.SystemCPUUsageUsec = cpu.SystemUsageUsec

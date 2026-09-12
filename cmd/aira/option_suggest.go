@@ -32,7 +32,7 @@ var (
 	confineLaunchValuedOptions = []string{
 		"slice", "name", "owner",
 		"memory-reserve", "memory-max", "memory-high",
-		"admit-timeout", "timeout", "cpu-timeout",
+		"timeout", "cpu-timeout",
 	}
 	confineLaunchValuelessOptions = []string{"delegate-ram", "detach", "exclusive", "require-admission", "stdin-connect"}
 )

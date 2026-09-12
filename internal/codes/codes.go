@@ -339,7 +339,14 @@ var ExitCodes = map[string]int{
 	// `confine-input` deliberately introduces no codes of its own: it speaks
 	// run-input's protocol to run-input's server, so it answers in the
 	// E_RUN_INPUT_* vocabulary already mapped above.
-	"U_CONFINE_LOG_UNAVAILABLE":  3,
+	"U_CONFINE_LOG_UNAVAILABLE": 3,
+	// AIRA (admission-counter rebuild) S18. `confine --dump`'s atomic JSONL
+	// write failed (a bad target directory, a full disk, ...) after the
+	// daemon round trip already succeeded -- a local I/O condition about the
+	// invoking process, not about the request or the daemon, so it joins
+	// E_ADMIT_SATURATED/E_CONFINE_DETACH_FAILED at 4 ("retry/fix the
+	// environment") rather than 2 ("fix the request").
+	"E_CONFINE_DUMP_WRITE":       4,
 	"E_INSTALL_ARGUMENT_INVALID": 2, "E_INSTALL_UNAVAILABLE": 4,
 	"E_INSTALL_OVERCOMMIT":    1,
 	"E_RUN_WIRING_INCOMPLETE": 4, "E_RUN_USAGE_PROVIDER_REQUIRED": 2, "E_RUN_CONFIG_ENV_INVALID": 2,

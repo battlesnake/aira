@@ -332,6 +332,13 @@ func TestOOMSteerNeverGoesBelowTheClassBaseline(t *testing.T) {
 // byte they allocated. Comparing 30 GiB of hierarchical usage against a 512 MiB
 // overhead would mark the most compliant job on the machine as the offender —
 // on EVERY full slice, which is exactly when getting it wrong costs a kill.
+//
+// The promise is SCOPED to `confine-reserve` children: the parent is spared only
+// because those children are separate waiters whose reserves are summed into its
+// budget (admitScopeBudgets). Under declared-only accounting an aitest outer
+// scope that books only the 512 MiB DefaultDelegateRAMOverhead and registers no
+// per-test children is NOT excluded — its live usage above that overhead reads
+// as an under-declaration, exactly as the signal now intends.
 func TestOOMSteerDoesNotSteerAnAitestParentWhoseChildrenHoldTheCharge(t *testing.T) {
 	server := NewServer(Paths{})
 	queue := &sliceQueue{path: "/slice", server: server}
@@ -393,27 +400,6 @@ func TestAdmitScopeBudgetsCountsOnlyWhatItCanEstablish(t *testing.T) {
 	}
 	if got := server.admitScopeBudgets("/no-such-slice"); got != nil {
 		t.Fatalf("budgets for an unknown slice = %v, want nil", got)
-	}
-}
-
-// TestAdmitScopeBudgetsUsesTheDynamicChargeNotTheFrozenReserve: the budget must
-// be what the ledger actually holds right now. A waiter whose AIRA-29 charge has
-// fallen to 2 GiB is NOT entitled to the 33 GiB it was granted on.
-//
-// Guard: reading waiter.reserve is the obvious implementation and passes every
-// other test here, because those waiters are untracked and ledgerCharge()
-// returns the reserve for them.
-func TestAdmitScopeBudgetsUsesTheDynamicChargeNotTheFrozenReserve(t *testing.T) {
-	server := NewServer(Paths{})
-	queue := &sliceQueue{path: "/slice", server: server}
-	queue.waiters = []*admitWaiter{{
-		seq: 1, state: admitGranted, accounted: true, scopeID: steerNonDelegateScope,
-		reserve: 33 << 30, effectiveCharge: 2 << 30, chargeTracked: true,
-	}}
-	server.admitQueues["/slice"] = queue
-
-	if got := server.admitScopeBudgets("/slice")[steerNonDelegateScope]; got != 2<<30 {
-		t.Fatalf("budget = %d, want the tracked charge %d, not the frozen reserve", got, int64(2<<30))
 	}
 }
 
@@ -660,12 +646,12 @@ func TestOOMSteerConfigFromEnv(t *testing.T) {
 	if _, _, err := oomSteerConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "E_CONFIG_INVALID") {
 		t.Fatalf("enforce with a malformed interval = %v, want a stable E_CONFIG_INVALID code", err)
 	}
-	// At or above the admission charge refresh the loop could only ever see
-	// readings the ledger had already absorbed, so it is refused rather than
-	// silently accepted.
+	// At or above the admission scan cadence the loop could only sample as slowly
+	// as the scan that reads declared reserves -- too slow to catch a burst before
+	// the slice OOMs -- so it is refused rather than silently accepted.
 	t.Setenv("AIRA_DAEMON_OOM_STEER_INTERVAL", "1s")
 	if _, _, err := oomSteerConfigFromEnv(); err == nil {
-		t.Fatal("a 1s interval was accepted, but it cannot outrun the charge refresh it exists to beat")
+		t.Fatal("a 1s interval was accepted, but it cannot outrun the admission scan it exists to beat")
 	}
 	t.Setenv("AIRA_DAEMON_OOM_STEER_INTERVAL", "100ms")
 	mode, interval, err = oomSteerConfigFromEnv()

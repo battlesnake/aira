@@ -856,7 +856,6 @@ func TestSliceCeilingSnapshotIsALeafUnderConcurrentEvaluation(t *testing.T) {
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
-	server.admitConfineScan = noConfinesScan
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
 	server.admitQueues["/slice"] = queue
 	var wait sync.WaitGroup
@@ -917,7 +916,6 @@ func TestSliceCeilingThrottleReachesCapacityOnly(t *testing.T) {
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
-	server.admitConfineScan = noConfinesScan
 	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 8 << 30}, nil
@@ -1211,7 +1209,6 @@ func TestConfineListReportsTheCeilingFromTheDaemon(t *testing.T) {
 		server.admitSliceHeadroomSupervisor = 0
 		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, maximum, 0, true, "" }
-		server.admitConfineScan = noConfinesScan
 		snapshot.SlicePath = path
 		server.publishSliceCeilingSnapshot(snapshot)
 		return server, path
@@ -1309,7 +1306,6 @@ func TestSliceCeilingDoesNotReachTheOOMEscalationClamp(t *testing.T) {
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, maximum, 0, true, "" }
-	server.admitConfineScan = noConfinesScan
 	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 4, SampleCount: 4, PeakMax: 50 << 30, OOMCount: 1, MaxOOMPeak: 50 << 30}, nil

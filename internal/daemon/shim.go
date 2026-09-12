@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -111,8 +110,8 @@ func (s *Server) memAvailableReader() func() (int64, bool, string) {
 // cpuFrameReader and cpuCoreCounter are AIRA-137's CPU-frame seams, on the same
 // nil-checks-to-the-package-default rule as every reader above. Production
 // reaches the real root-cgroup/slice cpu.stat pair and runtime.NumCPU — the same
-// core count desiredCPUSlots derives the AIRA-49 worker slot count from, so the
-// bar's capacity and the scheduler's idea of this machine's width cannot drift
+// core count the admission ledger's CPU ceiling (2×NumCPU) derives from, so the
+// bar's capacity and the ledger's idea of this machine's width cannot drift
 // apart. Neither is shim-specific: shim mode publishes no CPU frame at all, and
 // the withholding is done by confineManagement's own shim gate.
 func (s *Server) cpuFrameReader() func(string) runner.ConfineCPUFrame {
@@ -138,6 +137,16 @@ func resolveShimSlicePath(string) (string, bool, string) {
 
 // readShimMemory is the ledger's live reading in shim mode. The path argument is
 // the sentinel and is ignored.
+//
+// S4 (D4) note: CI (ci-shim) admission is now LEDGER-ONLY — the fit-check derives
+// availability from ceiling − Σleases and NO LONGER consults `current`
+// (ledgerAvailable, admit.go). So the "host-wide current dwarfs the budget ->
+// checkedAvailable's charge=max(current,outstanding) collapses available to 0"
+// failure the F1/F3 cases below reason about can no longer gate admission at all;
+// the `current` this function returns is retained for honesty/telemetry, and
+// `maximum` (the container budget = the ceiling) is the value the ledger uses.
+// The cases are kept as written because the reasoning still documents WHY each
+// reading is the honest one to report.
 //
 // Preference order, and why (requirement 4's documented choice):
 //
@@ -232,25 +241,6 @@ func (s *Server) readShimMemory(string) (int64, int64, int64, bool, string) {
 		current = 0
 	}
 	return current, budget.Bytes, 0, true, ""
-}
-
-// confineScan is the daemon's ONE confine-scan entry point. In shim mode it
-// returns an EMPTY BUT SUCCESSFUL result, which is the true reading and not a
-// suppressed failure: there are no cgroup scopes, so zero adopted reserve and
-// zero adopted jobs is what is actually there.
-//
-// The emptiness would ordinarily let sliceProvablyEmpty grant --exclusive on
-// fabricated grounds -- an UNCONFINED job told it was running alone. That is
-// closed at the other end (admitConnection refuses --exclusive outright in shim
-// mode, before the request is ever queued), which is why this can honestly
-// report success instead of forcing a scan FAILURE it would then have to
-// pretend was real: a failure here would log "confine reserve scan failed" every
-// second and arm the exclusive abort anchor against a slice that is fine.
-func (s *Server) confineScan(path string) (runner.ConfineListResult, error) {
-	if s.shimMode() {
-		return runner.ConfineListResult{Verdict: "ok", Scopes: []runner.ConfineRecord{}}, nil
-	}
-	return runner.ListConfines(context.Background(), path, nil)
 }
 
 // resolveDaemonConfineMode decides THIS daemon process's mode.

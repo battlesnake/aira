@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -37,14 +36,10 @@ func saturatedServer(t *testing.T) *Server {
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour // passes are driven explicitly below
 	server.admitBackfillGrace = 0
-	server.admitConfineScanInterval = time.Nanosecond
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
-	server.admitConfineScan = noConfinesScan
 	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
-	// The AIRA-114 aggregate bound is opted INTO by the one case that needs it.
-	server.oversubscriptionFactorPct = 0
 	return server
 }
 
@@ -222,9 +217,51 @@ func (r *saturatedRun) reject() admitRejection {
 	return admitRejection{}
 }
 
+// S13: a blocking wait no longer self-expires, so a saturated REJECTION is only
+// produced by the NON-BLOCKING mode (max_wait_ms==0): the request does not wait, and
+// startSaturatedAdmit's admitAfter seam drives the zero deadline on demand via
+// run.reject(). run.pass() runs the evaluator first so the rejection still carries the
+// eval's contention/grantable diagnosis, unchanged.
 func saturatedArgs(reserve int64, signature string) map[string]any {
 	return map[string]any{
-		"slice": "slice", "reserve": reserve, "max_wait_ms": int64(30_000), "signature": signature,
+		"slice": "slice", "reserve": reserve, "max_wait_ms": int64(0), "signature": signature,
+	}
+}
+
+// verifies: S13 / design §4/§6 — a BLOCKING admit (no max_wait_ms on the wire) NEVER
+// self-expires. Only a grant, a daemon stop, or the client closing its connection
+// ends the wait; the daemon writes no timeout/saturated frame of its own accord.
+// MUTATION: reinstating a deadline arm for a blocking wait makes a saturated frame
+// arrive on its own → the "self-expired" branch reds.
+func TestBlockingAdmitNeverSelfExpires(t *testing.T) {
+	const maximum = int64(1) << 30
+	server := saturatedServer(t)
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		// Fully loaded: current == maximum, so the reserve cannot fit and the request
+		// blocks rather than being granted.
+		return maximum, maximum, 0, true, ""
+	}
+	// A BLOCKING request: max_wait_ms is ABSENT (the S13 client sends none).
+	args := map[string]any{"slice": "slice", "reserve": int64(512) << 20, "pinned": true}
+	run := startSaturatedAdmit(t, server, maximum, args)
+	run.pass() // one evaluator pass: the reserve does not fit, so nothing is granted
+
+	select {
+	case frame := <-run.frames:
+		t.Fatalf("a blocking admit self-expired: got frame %+v; a blocked wait ends only on grant/stop/peer-EOF", frame)
+	case err := <-run.errs:
+		t.Fatalf("unexpected read error while the wait should still be blocked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Still blocked, which is the required behaviour.
+	}
+
+	// The client closing its connection is the §6 cancel mechanism: the handler exits
+	// via peer-EOF, writing no frame.
+	_ = run.client.Close()
+	select {
+	case <-run.done:
+	case <-testdeadline.After(2 * time.Second):
+		t.Fatal("the blocked handler did not exit after the client closed its connection")
 	}
 }
 
@@ -442,209 +479,57 @@ func TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt(t *testing
 	}
 }
 
-// unreadableCapRecord is a live scope whose cap AND usage are both unreadable,
-// so it contributes to liveScopes and leaves the AIRA-114 aggregate
-// UNESTABLISHED. It isolates sliceProvablyEmpty as the only source that can
-// object.
-func unreadableCapRecord(scopeID string) runner.ConfineRecord {
-	populated, live := 0, true
-	return runner.ConfineRecord{ScopeID: scopeID, Populated: &populated, SubtreePopulated: &live}
-}
+// S14 retired the scan-derived contention cases with the cgroup scan:
+// TestSoloRefusalBesideALeafDrainedScopeReportsContention (a leaf-drained,
+// lease-less scope read `observed` from the scan — now the accepted D5 orphan
+// gap, so it reads none-observed) and TestUnestablishedEmptinessNeverReportsNoneObserved
+// (a failed scan read `unevaluated` — there is no failing-scan case any more).
+// The helpers unreadableCapRecord and requireNoCounters went with them.
 
-// TestSoloRefusalBesideALeafDrainedScopeReportsContention is the shape that
-// makes the reserve counters the WRONG source for this question.
+// TestObservedSurvivesLaterEmptyPasses pins the monotone JOIN of the AIRA-149
+// contention latch over the two rungs S14 leaves (observed > none-observed): a
+// pass that sees a live lease latches `observed`, and later empty passes join
+// with max(), so `observed` — the top of the lattice — is never cleared by a
+// subsequent none-observed reading.
 //
-// A busy aitest outer scope has drained every pid into a child cgroup, so its
-// LEAF cgroup.procs reads zero: the adoption loop skips it, adoptedJobs stays 0,
-// and with no granted waiter outstandingJobs is 0 too. It is nevertheless a
-// running job using memory, which is what drives `current` up and refuses a solo
-// waiter on the ORDINARY disjunct. A rule derived from outstandingJobs/
-// adoptedJobs/queuedAhead reports "nothing else was in the way" beside a running
-// suite — the ticket's own defect, reintroduced by its fix.
-//
-// Driven on both refusal disjuncts, and a third arm in which the scanned scope's
-// cap and usage are both unreadable so the AIRA-114 belt-and-braces check cannot
-// be what answers.
-func TestSoloRefusalBesideALeafDrainedScopeReportsContention(t *testing.T) {
-	const maximum = int64(8) << 30
-
-	t.Run("ordinary disjunct", func(t *testing.T) {
-		server := saturatedServer(t)
-		server.admitConfineScan = staticScan(leafDrainedRecord("CONFINE-suite-1-a", 6<<30, 7<<30))
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 6 << 30, maximum, 0, true, ""
-		}
-		run := startSaturatedAdmit(t, server, maximum, saturatedArgs(4<<30, ""))
-		run.pass()
-		requireNoCounters(t, run.queue)
-		rejection := run.reject()
-		if rejection.Contention != "observed" {
-			t.Fatalf("contention=%q, want %q — a leaf-drained suite was running beside this request",
-				rejection.Contention, "observed")
-		}
-	})
-
-	t.Run("ordinary disjunct, aggregate unestablished", func(t *testing.T) {
-		server := saturatedServer(t)
-		server.admitConfineScan = staticScan(unreadableCapRecord("CONFINE-suite-1-a"))
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 6 << 30, maximum, 0, true, ""
-		}
-		run := startSaturatedAdmit(t, server, maximum, saturatedArgs(4<<30, ""))
-		run.pass()
-		requireNoCounters(t, run.queue)
-		run.queue.mu.Lock()
-		aggregateKnown := run.queue.capAggregateKnown
-		liveScopes := run.queue.liveScopes
-		run.queue.mu.Unlock()
-		if aggregateKnown {
-			t.Fatal("the aggregate was established; this arm cannot isolate sliceProvablyEmpty")
-		}
-		if liveScopes != 1 {
-			t.Fatalf("liveScopes=%d, want 1", liveScopes)
-		}
-		rejection := run.reject()
-		if rejection.Contention != "observed" {
-			t.Fatalf("contention=%q, want %q from the subtree-aware emptiness reading alone",
-				rejection.Contention, "observed")
-		}
-	})
-
-	t.Run("aggregate disjunct", func(t *testing.T) {
-		server := saturatedServer(t)
-		server.oversubscriptionFactorPct = 100
-		server.admitConfineScan = staticScan(leafDrainedRecord("CONFINE-suite-1-a", 1<<30, 7<<30))
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 4096, maximum, 0, true, ""
-		}
-		args := saturatedArgs(2<<30, "")
-		args["scope_id"] = "CONFINE-job-123-abc9@session-a"
-		args["name"] = "job"
-		args["owner"] = "session-a"
-		run := startSaturatedAdmit(t, server, maximum, args)
-		run.pass()
-		requireNoCounters(t, run.queue)
-		rejection := run.reject()
-		if rejection.Contention != "observed" {
-			t.Fatalf("contention=%q, want %q — the refusal was caused by other scopes' aggregate caps",
-				rejection.Contention, "observed")
-		}
-	})
-}
-
-// requireNoCounters asserts the fixture really is the shape it claims: the
-// reserve counters revision 2 read are both zero, so a rule built on them would
-// see an empty slice.
-func requireNoCounters(t *testing.T, queue *sliceQueue) {
-	t.Helper()
-	queue.mu.Lock()
-	defer queue.mu.Unlock()
-	if queue.outstandingJobs != 0 || queue.adoptedJobs != 0 {
-		t.Fatalf("outstandingJobs=%d adoptedJobs=%d, want both zero; this fixture does not exercise the scan-only hole",
-			queue.outstandingJobs, queue.adoptedJobs)
-	}
-}
-
-// TestUnestablishedEmptinessNeverReportsNoneObserved pins the lattice's middle
-// rung. "Nothing else … at ANY evaluation" cannot be claimed if one evaluation
-// could not establish it.
-func TestUnestablishedEmptinessNeverReportsNoneObserved(t *testing.T) {
+// The middle `unevaluated` rung is no longer reachable from soloReadingLocked
+// (the scan that produced an unestablished emptiness is gone; the ledger is
+// always readable under the queue lock). It now comes only from a waiter's UNSET
+// latch, pinned by TestSaturatedRejectionSaysUnevaluatedWhenTheGateNeverEvaluatedIt.
+func TestObservedSurvivesLaterEmptyPasses(t *testing.T) {
 	const maximum = int64(4) << 30
 	server := saturatedServer(t)
 	server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
-	server.admitConfineScan = func(string) (runner.ConfineListResult, error) {
-		return runner.ConfineListResult{}, errors.New("confine scan failed")
-	}
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 4096, maximum, 0, true, ""
 	}
-	run := startSaturatedAdmit(t, server, maximum, saturatedArgs(runner.DefaultConfineMemoryReserve, "oom"))
-	run.pass()
-	run.pass()
+	holder := heldLedgerWaiter(1, 64<<20)
+	run := startSaturatedAdmit(t, server, maximum, saturatedArgs(runner.DefaultConfineMemoryReserve, "oom"), holder)
 	run.queue.mu.Lock()
-	known := run.queue.liveScopesKnown
+	run.queue.outstanding = holder.reserve
+	run.queue.outstandingJobs = 1
 	run.queue.mu.Unlock()
-	if known {
-		t.Fatal("liveScopesKnown stayed true although the scan failed; this fixture proves nothing")
-	}
+
+	run.pass() // a real holder: observed (Σleases > 0)
+
+	// The holder finishes: Σleases returns to 0, so subsequent passes read the
+	// slice as empty (none-observed).
+	run.queue.mu.Lock()
+	holder.state = admitReleased
+	holder.accounted = false
+	run.queue.waiters = run.queue.waiters[1:]
+	run.queue.outstanding = 0
+	run.queue.outstandingJobs = 0
+	run.queue.mu.Unlock()
+
+	run.pass()
+	run.pass()
+
 	rejection := run.reject()
-	if rejection.Contention != "unevaluated" {
-		t.Fatalf("contention=%q, want %q — solitude was never established", rejection.Contention, "unevaluated")
+	if rejection.Contention != "observed" {
+		t.Fatalf("contention=%q, want %q — observed is the top of the lattice and nothing may clear it",
+			rejection.Contention, "observed")
 	}
-}
-
-// TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved pins the
-// monotone JOIN itself, not its three cases separately: an implementation that
-// overwrites or resets instead of joining fails here.
-func TestObservedOutranksUnestablishedAndUnestablishedOutranksNoneObserved(t *testing.T) {
-	const maximum = int64(4) << 30
-
-	t.Run("one unestablished pass forbids none-observed", func(t *testing.T) {
-		server := saturatedServer(t)
-		server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
-		var scanFails atomic.Bool
-		server.admitConfineScan = func(path string) (runner.ConfineListResult, error) {
-			if scanFails.Load() {
-				return runner.ConfineListResult{}, errors.New("confine scan failed")
-			}
-			return noConfinesScan(path)
-		}
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 4096, maximum, 0, true, ""
-		}
-		run := startSaturatedAdmit(t, server, maximum, saturatedArgs(runner.DefaultConfineMemoryReserve, "oom"))
-		run.pass() // established empty
-		scanFails.Store(true)
-		run.pass() // unestablished
-		scanFails.Store(false)
-		run.pass() // established empty again
-		rejection := run.reject()
-		if rejection.Contention != "unevaluated" {
-			t.Fatalf("contention=%q, want %q — a later established-empty pass must not clear an earlier unestablished one",
-				rejection.Contention, "unevaluated")
-		}
-	})
-
-	t.Run("observed survives later unestablished passes", func(t *testing.T) {
-		server := saturatedServer(t)
-		server.admitPeakHistory = staticPeakHistory(ceilingExactEstimateHistory())
-		var scanFails atomic.Bool
-		server.admitConfineScan = func(path string) (runner.ConfineListResult, error) {
-			if scanFails.Load() {
-				return runner.ConfineListResult{}, errors.New("confine scan failed")
-			}
-			return noConfinesScan(path)
-		}
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 4096, maximum, 0, true, ""
-		}
-		holder := heldLedgerWaiter(1, 64<<20)
-		run := startSaturatedAdmit(t, server, maximum, saturatedArgs(runner.DefaultConfineMemoryReserve, "oom"), holder)
-		run.queue.mu.Lock()
-		run.queue.outstanding = holder.reserve
-		run.queue.outstandingJobs = 1
-		run.queue.mu.Unlock()
-
-		run.pass() // a real holder: observed
-
-		run.queue.mu.Lock()
-		holder.state = admitReleased
-		holder.accounted = false
-		run.queue.waiters = run.queue.waiters[1:]
-		run.queue.outstanding = 0
-		run.queue.outstandingJobs = 0
-		run.queue.mu.Unlock()
-
-		scanFails.Store(true)
-		run.pass()
-		run.pass()
-
-		rejection := run.reject()
-		if rejection.Contention != "observed" {
-			t.Fatalf("contention=%q, want %q — observed is the top of the lattice and nothing may clear it",
-				rejection.Contention, "observed")
-		}
-	})
 }
 
 // TestSaturatedSoloRefusalCanOnlyComeFromTheCapacityGate pins the other two rows

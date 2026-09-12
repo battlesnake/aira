@@ -130,13 +130,11 @@ func TestConfineRegistryRejectsDuplicateScopeID(t *testing.T) {
 
 func TestConfineListSliceReserveSummary(t *testing.T) {
 	const (
-		maximum     = int64(16 << 30)
-		granted     = int64(3 << 30)
-		adopted     = int64(4 << 30)
-		jobs        = 2
-		adoptedJobs = 3
-		base        = int64(2 << 30)
-		supervisor  = int64(64 << 20)
+		maximum    = int64(16 << 30)
+		granted    = int64(3 << 30)
+		jobs       = 2
+		base       = int64(2 << 30)
+		supervisor = int64(64 << 20)
 	)
 	// AIRA-68: the two connection-held jobs are REAL waiters of the two real
 	// populations — one scope-backed `aira confine` job and one scope-less
@@ -231,7 +229,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		// is asserted as a lower bound rather than an equality.
 		frozen := time.Now()
 		server.admitNow = func() time.Time { return frozen }
-		queue := &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs, adopted: adopted, adoptedJobs: adoptedJobs}
+		queue := &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs}
 		queue.waiters = []*admitWaiter{
 			{seq: 1, reserve: scopeBackedBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{}), scopeID: "CONFINE-job-5101-abc", name: "job", owner: "session-a"},
 			// AIRA-108: the scope-less waiter carries the signature and grant
@@ -255,14 +253,14 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		if !response.OK || !ok || result.SliceReserve == nil {
 			t.Fatalf("response=%+v result=%+v", response, result)
 		}
-		wantJobs := jobs + adoptedJobs
-		// Ceiling scales headroom by TOTAL admitted jobs (outstanding+adopted)+1.
-		wantCeiling := maximum - base - int64(jobs+adoptedJobs+1)*supervisor
+		wantJobs := jobs
+		// Ceiling scales headroom by admitted jobs + 1.
+		wantCeiling := maximum - base - int64(jobs+1)*supervisor
 		// Queued/FreezePhase are the AIRA-59 diagnostics. This fixture has no
 		// queued waiters, so a KNOWN zero and "idle" are the correct report —
 		// never "unevaluated", which is reserved for state that cannot be read.
 		want := withSystemFrame(runner.ConfineSliceReserve{
-			GrantedBytes: granted + adopted, CeilingBytes: wantCeiling, Jobs: wantJobs, Queued: 0, FreezePhase: "idle",
+			GrantedBytes: granted, CeilingBytes: wantCeiling, Jobs: wantJobs, Queued: 0, FreezePhase: "idle",
 			// The split names WHICH population each job belongs to, so the job
 			// count can never again be read against the scope table above it.
 			ScopeJobs: 1, ScopeBytes: scopeBackedBytes,
@@ -274,127 +272,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 				State: runner.ConfineReservationStateHolding, Signature: "pytest:tools/test_x.py::test_y",
 				Reserve: reservationBytes, HeldMS: 90000,
 			}},
-			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
-			// AIRA-114. The bound is ON by default, so its limit is reported.
-			// CapAggregateKnown stays FALSE here because no evaluator pass has
-			// scanned this fixture's slice, and an unevaluated aggregate must
-			// present as unevaluated rather than as a measured zero.
-			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
 		})
-		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
-			t.Fatalf("slice reserve=%+v, want %+v", got, want)
-		}
-	})
-
-	t.Run("adopted-only", func(t *testing.T) {
-		server, path := setup(t)
-		server.admitQueues[path].outstanding = 0
-		server.admitQueues[path].outstandingJobs = 0
-		server.admitQueues[path].waiters = nil
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return sliceCurrent, maximum, sliceReclaimable, true, ""
-		}
-		response := server.confineManagement(context.Background(), request)
-		result, ok := response.Data.(runner.ConfineListResult)
-		if !response.OK || !ok || result.SliceReserve == nil {
-			t.Fatalf("response=%+v result=%+v", response, result)
-		}
-		wantCeiling := maximum - base - int64(adoptedJobs+1)*supervisor
-		want := withSystemFrame(runner.ConfineSliceReserve{
-			GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs, Queued: 0, FreezePhase: "idle",
-			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
-			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
-		})
-		// Reservations is nil here, and that is a POSITIVE fact from the same
-		// walk (this fixture cleared the waiter list), not an unevaluated read.
-		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
-			t.Fatalf("slice reserve=%+v, want adopted-only %+v", got, want)
-		}
-	})
-
-	// AIRA-114. The ESTABLISHED arm of the aggregate, and the only one that can
-	// fail against a build which hardcodes `CapAggregateKnown: false` on the wire
-	// or drops the queue -> snapshot copy. Both arms above pin the DEFAULT-false
-	// fixture, which such a build reproduces exactly.
-	//
-	// It carries its own fixture rather than reusing setup(): this arm needs a
-	// real evaluateAdmitQueue pass, whose adoption and charge effects the shared
-	// expectations do not describe, and reusing them would have meant loosening
-	// the DeepEqual that makes every other field here load-bearing.
-	//
-	// What a false report costs, and why this is worth its own arm: with the bit
-	// stuck false `aira confine --list` prints "slice scope caps: unevaluated ...
-	// (not applied while unevaluated)" permanently, while the bound is in fact
-	// refusing launches — an operator debugging a wait would be told the exact
-	// opposite of the truth, the AIRA-71 silent-wait failure with a wrong
-	// statement attached instead of a missing one.
-	t.Run("aggregate-established", func(t *testing.T) {
-		const suiteCap = int64(30) << 30
-		path := t.TempDir()
-		server := NewServer(Paths{})
-		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
-		server.admitSliceHeadroomBase = base
-		server.admitSliceHeadroomSupervisor = supervisor
-		frozen := time.Now()
-		server.admitNow = func() time.Time { return frozen }
-		server.shimReadMemTotal = func() (int64, bool) { return systemMemTotal, true }
-		server.shimReadMemAvailable = func() (int64, bool, string) { return systemMemAvailable, true, "" }
-		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return sliceCurrent, maximum, sliceReclaimable, true, ""
-		}
-		// AIRA-137: this arm builds its own server, so it pins the CPU frame too.
-		server.SetCPUFrameForTest(
-			func(string) runner.ConfineCPUFrame {
-				return runner.ConfineCPUFrame{
-					SystemUsageUsec: systemCPUUsec, SystemKnown: true,
-					SliceUsageUsec: sliceCPUUsec, SliceKnown: true,
-					SampleUnixNano: cpuSampleNano,
-				}
-			},
-			func() int { return cpuCores })
-		// One LEAF-DRAINED scope: subtree-live, so the aggregate counts it, but
-		// leaf-empty, so the adoption loop skips it. That keeps every other field
-		// on the wire at its idle value and leaves the aggregate as the single
-		// thing this arm changes.
-		server.admitConfineScanInterval = time.Nanosecond
-		server.admitConfineScan = staticScan(leafDrainedRecord("CONFINE-suite-5101-abc", 2<<30, suiteCap))
-		queue := &sliceQueue{path: path, server: server}
-		server.admitRegistryMu.Lock()
-		server.admitQueues[path] = queue
-		server.admitRegistryMu.Unlock()
-
-		server.evaluateAdmitQueue(queue)
-
-		response := server.confineManagement(context.Background(), request)
-		result, ok := response.Data.(runner.ConfineListResult)
-		if !response.OK || !ok || result.SliceReserve == nil {
-			t.Fatalf("response=%+v result=%+v", response, result)
-		}
-		want := runner.ConfineSliceReserve{
-			// AIRA-127. This arm writes NO memory.high into its slice, so the soft
-			// limit is "unevaluated" rather than the "set" the other two pin. That
-			// is the distinction the wire keeps and a renderer acts on: an absent
-			// file is not a slice with no soft limit, and neither is a zero.
-			SystemMemTotalBytes: systemMemTotal, SystemMemAvailableBytes: systemMemAvailable,
-			SliceCurrentBytes: sliceCurrent, SliceReclaimableBytes: sliceReclaimable,
-			SliceMaxBytes: maximum, SliceHighState: runner.ConfineSliceHighUnevaluated,
-			// AIRA-137's CPU frame travels on this arm too: it is published from the
-			// SAME `ok` memory reading, so a build that gated it on anything else
-			// would drop it here while keeping it in the other arms.
-			SystemCPUUsageUsec: systemCPUUsec, SystemCPUKnown: true,
-			SliceCPUUsageUsec: sliceCPUUsec, SliceCPUKnown: true,
-			CPUSampleUnixNano: cpuSampleNano, CPUCores: cpuCores,
-			CeilingBytes: maximum - base - supervisor, Queued: 0, FreezePhase: "idle",
-			// AIRA-220. This arm registers a queue and runs evaluateAdmitQueue, so
-			// the ledger is established (present:true) even though its granted
-			// total is an established zero.
-			GrantedEstablished: true,
-			// The value AND the bit. Asserting only the bit would survive a build
-			// that reported a fabricated total beside a true bit.
-			CapAggregateBytes: suiteCap,
-			CapAggregateKnown: true,
-			CapBoundBytes:     maximum * oversubscriptionFactorPctDefault / 100,
-		}
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want %+v", got, want)
 		}

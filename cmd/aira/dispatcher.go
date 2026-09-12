@@ -148,7 +148,7 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	// invocation in every directory. Both shipped spellings (`confine --budget`
 	// and `confine-budget`) converge here, so the verb was wholly unreachable and
 	// the daemon's own handler at internal/daemon/server.go:785 was dead code.
-	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" {
+	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" || canonical == "confine-dump" {
 		return d.dispatchConfineManagement(ctx, request)
 	}
 	// AIRA-202. `version` asks the daemon what IT is, so it must reach the daemon
@@ -228,6 +228,19 @@ func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, reques
 			Reason: "the daemon is unreachable, and it is the only holder of the peak-RSS history a budget is compared against; " +
 				"no budget can be established from the cgroup directory alone",
 			Subjects: []runner.ConfineBudgetRow{},
+		}}
+	}
+	// AIRA (admission-counter rebuild) S18. confine-dump has no daemon-down
+	// fallback either, and for the identical reason confine-budget above has
+	// none, plus the same fall-through-to-KillConfine hazard this must be
+	// placed before: the dump reads the daemon's own peak-history table AND
+	// its live admission-queue registry, neither of which exists outside the
+	// daemon process.
+	if request.Verb == "confine-dump" {
+		return core.Response{OK: true, Code: "UNEVALUATED", Exit: 3, Data: runner.ConfineDumpResult{
+			Verdict: "unevaluated",
+			Reason: "the daemon is unreachable, and it is the only holder of both the peak-RSS history and the live admission " +
+				"queues this dump reads; nothing here can be established from the cgroup directory alone",
 		}}
 	}
 	// AIRA-121. The daemon-down fallback below enumerates the REAL slice cgroup

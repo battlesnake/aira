@@ -180,13 +180,10 @@ const (
 	WorkerAdmitReasonLedgerBudgetUnreadable = "ledger-budget-unreadable"
 	WorkerAdmitReasonLedgerBudgetExceeded   = "ledger-budget-exceeded"
 	WorkerAdmitReasonConfineModeMismatch    = "confine-mode-mismatch"
-	// AIRA-64. cpu-slots-saturated is the machine-wide CPU-concurrency bound
-	// declining one more worker; admit-locks-busy is a SPECULATIVE request
-	// (max_wait_ms == 0) refusing to wait on a lock another job holds. Both are
-	// class=contended: retriable, containment preserved, never a verdict about
-	// the request or the daemon.
-	WorkerAdmitReasonCPUSlotsSaturated = "cpu-slots-saturated"
-	WorkerAdmitReasonAdmitLocksBusy    = "admit-locks-busy"
+	// admit-locks-busy is a SPECULATIVE request (max_wait_ms == 0) refusing to
+	// wait on the outer-scope lock another job holds. class=contended: retriable,
+	// containment preserved, never a verdict about the request or the daemon.
+	WorkerAdmitReasonAdmitLocksBusy = "admit-locks-busy"
 
 	// AIRA-101. Another job holds this slice EXCLUSIVELY (`aira confine
 	// --exclusive`, for uncontended benchmarking), so no worker may be placed
@@ -219,6 +216,13 @@ const (
 	// section, so this reason moved with it: it is now a daemon verdict, not a
 	// local placement failure the relay discovers after a grant.
 	WorkerAdmitReasonWorkerScopeCreateFailed = "worker-scope-create-failed"
+
+	// WorkerAdmitReasonSnapshot (S15) accompanies the non-blocking probe's answer
+	// (max_wait_ms present and zero): the daemon reserved nothing and reports the
+	// unified ledger's current available_bytes / available_cpu so the aitest
+	// supervisor can size its pool. class=contended (retriable), never a verdict
+	// about a specific request.
+	WorkerAdmitReasonSnapshot = "snapshot"
 
 	// CLI-side.
 	WorkerAdmitReasonArgumentsInvalid         = "arguments-invalid"
@@ -289,6 +293,16 @@ type WorkerAdmitOutcome struct {
 	// query-escaped on the wire so it can never break the line's
 	// tokenisation nor be mistaken for a field of its own.
 	Detail string
+	// AvailableBytes / AvailableCPU are the non-blocking probe's current headroom
+	// (S15, design §6/§8). They are rendered on the outcome line ONLY for a snapshot
+	// (Reason == WorkerAdmitReasonSnapshot and State == WorkerAdmitStateDenied), and
+	// then ALWAYS — even a 0 — so a consumer can tell "no room" (present, 0) from
+	// "this daemon does not speak snapshots" (absent). reason=snapshot is the gate,
+	// not the field's presence; that is what lets the daemon keep them omitempty on
+	// its own wire without a 0 being read as absent. Zero and ignored on every other
+	// outcome.
+	AvailableBytes int64
+	AvailableCPU   int64
 	// Lease is non-nil exactly when State == WorkerAdmitStateGranted.
 	Lease *WorkerAdmitLease
 }
@@ -371,25 +385,10 @@ type WorkerAdmitGrantFields struct {
 	// the worker escape it into swap? cgroup-v2's memory.max bounds memory, not
 	// memory+swap, and before AIRA-35 nothing capped worker swap at all -- a
 	// 512 MiB allocation inside a 32 MiB cap was measured exiting 0 with half a
-	// gigabyte paged out, never killed. Diagnostic only, exactly like CPUSlots:
-	// nothing branches on it, and an absent token means "an older daemon", not
-	// "ok".
+	// gigabyte paged out, never killed. Diagnostic only: nothing branches on it,
+	// and an absent token means "an older daemon", not "ok".
 	SwapCap string
-	// CPUSlots (AIRA-64) is WorkerAdmitCPUSlotsOK or
-	// WorkerAdmitCPUSlotsUnevaluated, and is omitted from the line when empty.
-	// It answers one question the four fields above cannot: was this grant
-	// actually subject to the CPU-concurrency bound, or did that dimension
-	// fail open? A governance dimension whose fail-open is invisible to the
-	// run it affects is how a subsystem ships inert. Diagnostic only: nothing
-	// branches on it, and an absent token means "an older daemon", not "ok".
-	CPUSlots string
 }
-
-// The CPU-governance states carried by WorkerAdmitGrantFields.CPUSlots.
-const (
-	WorkerAdmitCPUSlotsOK          = "ok"
-	WorkerAdmitCPUSlotsUnevaluated = "unevaluated"
-)
 
 // The swap-containment states carried by WorkerAdmitGrantFields.SwapCap
 // (AIRA-35). Each is a POSITIVE claim about what was established; see
@@ -462,6 +461,18 @@ func WorkerAdmitOutcomeLine(outcome WorkerAdmitOutcome, grant *WorkerAdmitGrantF
 		builder.WriteString(" reason=")
 		builder.WriteString(url.QueryEscape(outcome.Reason))
 	}
+	// S15. A non-blocking probe's SNAPSHOT carries the ledger's current headroom.
+	// Emitted ONLY on the denied snapshot (never on a grant, a blocking-claim denial,
+	// or the restart-freeze's state=unevaluated snapshot, which reports no figure by
+	// design), and then unconditionally — a 0 is rendered, so the consumer reads
+	// "present, 0 => no room" rather than "absent => unsupported". This is the
+	// aitest supervisor's pool-growth sizing input.
+	if outcome.Reason == WorkerAdmitReasonSnapshot && outcome.State == WorkerAdmitStateDenied {
+		builder.WriteString(" available_bytes=")
+		builder.WriteString(strconv.FormatInt(outcome.AvailableBytes, 10))
+		builder.WriteString(" available_cpu=")
+		builder.WriteString(strconv.FormatInt(outcome.AvailableCPU, 10))
+	}
 	if grant != nil {
 		builder.WriteString(" containment=")
 		builder.WriteString(url.QueryEscape(grant.Containment))
@@ -484,10 +495,6 @@ func WorkerAdmitOutcomeLine(outcome WorkerAdmitOutcome, grant *WorkerAdmitGrantF
 		if grant.SwapCap != "" {
 			builder.WriteString(" swap_cap=")
 			builder.WriteString(url.QueryEscape(grant.SwapCap))
-		}
-		if grant.CPUSlots != "" {
-			builder.WriteString(" cpu_slots=")
-			builder.WriteString(url.QueryEscape(grant.CPUSlots))
 		}
 	}
 	if outcome.Detail != "" {

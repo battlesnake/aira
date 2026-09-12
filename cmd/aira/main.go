@@ -234,13 +234,21 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		// survivability verb depend on the component most likely to have been
 		// restarted during exactly the long pause it exists to survive.
 		status := options["status"] == "true"
-		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true"
+		// AIRA (admission-counter rebuild) S18.
+		dumpPath := options["dump"]
+		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true" || dumpPath != ""
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
 		if status {
 			return runConfineStatusCommand(context.Background(), options, jsonOutput, stdout, stderr)
+		}
+		// --dump writes a LOCAL FILE (the caller's own filesystem), which is not
+		// something the generic render()-based runConfineManagementCommand does
+		// for any other management flag, so it gets its own command function.
+		if dumpPath != "" {
+			return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
 		}
 		if management {
 			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
@@ -295,12 +303,12 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runWorkerAdmitCommand(context.Background(), options, stdin, stdout, stderr)
 	}
-	if verb == "worker-peak" {
+	if verb == "confine-report" {
 		if jsonOutput {
-			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for worker-peak")
+			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine-report")
 			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
-		return runWorkerPeakCommand(context.Background(), options, stderr)
+		return runConfineReportCommand(context.Background(), options, stderr)
 	}
 	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-budget" {
 		request, requestErr := buildRequest(verb, positional, options)
@@ -317,6 +325,21 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		request.Args["owner"] = owner
 		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
+	}
+	// AIRA (admission-counter rebuild) S18. The hyphenated spelling of
+	// `confine --dump <file>`, on the SAME two-spellings-must-both-work
+	// discipline AIRA-201 pinned for confine-budget
+	// (TestBothConfineBudgetSpellingsReachTheManagementDispatch): buildRequest
+	// has no "confine-dump" case (it is not a generic management verb -- it
+	// writes a local file, unlike list/kill/budget), so this is handled
+	// directly rather than through the generic buildRequest+dispatchConfineManagementRequest
+	// pair above.
+	if verb == "confine-dump" {
+		dumpPath := options["dump"]
+		if dumpPath == "" {
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		}
+		return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
 	}
 	// AIRA-196. Handled HERE, beside the rest of the confine family and BEFORE
 	// project discovery, for the reason the family shares: a detached confine job
@@ -719,8 +742,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "worker-admit" {
 		return parseWorkerAdmitArgs(argv)
 	}
-	if verb == "worker-peak" {
-		return parseWorkerPeakArgs(argv)
+	if verb == "confine-report" {
+		return parseConfineReportArgs(argv)
 	}
 	if verb == "run" {
 		return parseRunArgs(argv)
@@ -815,7 +838,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
 		"confine-list":   {"slice": true, "owner": true},
 		"confine-budget": {"slice": true, "owner": true},
-		"confine-kill":   {"steal": true, "slice": true, "owner": true},
+		// AIRA (admission-counter rebuild) S18.
+		"confine-dump": {"dump": true, "slice": true, "owner": true},
+		"confine-kill": {"steal": true, "slice": true, "owner": true},
 		// AIRA-196. No --slice on either: both address a job through the durable
 		// record store, never a cgroup slice, and an accepted-and-ignored --slice
 		// is exactly the silently discarded scope AIRA-82 refuses.
@@ -953,18 +978,6 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %w", err)
 		}
 	}
-	if raw, present := options["admit-timeout"]; present {
-		wait, err := time.ParseDuration(raw)
-		// Reject below 1ms: the wire value is max_wait_ms (Milliseconds() truncates
-		// toward zero), so a sub-1ms timeout reaches the daemon as 0 — the deferred
-		// zero-wait evaluator race that falsely rejects an admissible job.
-		if err != nil || wait < time.Millisecond {
-			if err == nil {
-				err = errors.New("must be at least 1ms")
-			}
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
-		}
-	}
 	// AIRA-138. Both job bounds are validated SYNCHRONOUSLY here, so the caller
 	// learns before any daemon round trip. A zero or negative value is an argument
 	// error and never "no bound": a bound the operator asked for and silently did
@@ -1009,8 +1022,7 @@ const drainWaitOperation = core.DrainWaitOperation
 // the name to match the scope id).
 const drainHoldName = "drain"
 
-// parseDrainArgs parses `aira drain wait [--timeout D] [--admit-timeout D]
-// [--reason TEXT]` (AIRA-185).
+// parseDrainArgs parses `aira drain wait [--timeout D] [--reason TEXT]` (AIRA-185).
 //
 // It is its own parser, like confine's, for one reason: the generic parseArgs
 // loop treats any non-`--` token as a positional and would silently accept
@@ -1027,7 +1039,7 @@ func parseDrainArgs(argv []string) ([]string, map[string]string, error) {
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name != "timeout" && name != "admit-timeout" && name != "reason" {
+		if name != "timeout" && name != "reason" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for drain", name)
 		}
 		if _, exists := options[name]; exists {
@@ -1054,15 +1066,6 @@ func parseDrainArgs(argv []string) ([]string, map[string]string, error) {
 	if raw, present := options["timeout"]; present {
 		if _, err := parseConfineJobBound(raw); err != nil {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --timeout: %w", err)
-		}
-	}
-	if raw, present := options["admit-timeout"]; present {
-		wait, err := time.ParseDuration(raw)
-		if err != nil || wait < time.Millisecond || wait > runner.AdmitWaitCeiling {
-			if err == nil {
-				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
-			}
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
 		}
 	}
 	if raw, present := options["reason"]; present {
@@ -1171,13 +1174,18 @@ func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 	return nil, options, nil
 }
 
-// parseWorkerPeakArgs parses the aitest supervisor's ONE end-of-run pool sample.
+// parseConfineReportArgs parses the aitest supervisor's ONE end-of-run pool
+// sample, sent over the retained `confine-report` verb (S17: this CLI face
+// replaces a now-deleted, separately-named CLI relay for the same frame — the
+// same wire verb the daemon has always answered
+// (internal/daemon/confine_report.go), now named the same on the CLI as on the
+// wire instead of through a second, differently-named hop).
 //
 // CLI-only, like worker-admit, and for the same reason: its caller is the aitest
 // supervisor relaying to the daemon, not an agent. It is deliberately not a
 // dispatch-table verb — there is nothing an agent would ever ask it, and adding
 // an MCP tool for a machine-to-machine report would be surface with no reader.
-func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
+func parseConfineReportArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	valued := map[string]bool{"signature": true, "peak-rss": true, "budget": true, "budget-basis": true}
 	for i := 0; i < len(argv); i++ {
@@ -1187,7 +1195,7 @@ func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
 			continue
 		}
 		if !valued[name] {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for worker-peak", name)
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine-report", name)
 		}
 		// A value may legitimately begin with "--" only if it is a signature,
 		// and a pytest argument genuinely can (`--aitest-workers=auto`). So the
@@ -1200,7 +1208,7 @@ func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
 		options[name] = argv[i]
 	}
 	if options["signature"] == "" {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --signature is required for worker-peak")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --signature is required for confine-report")
 	}
 	if (options["budget"] == "") != (options["budget-basis"] == "") {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --budget and --budget-basis must be given together")
@@ -1208,14 +1216,21 @@ func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
 	return nil, options, nil
 }
 
-// runWorkerPeakCommand relays one aitest pool sample to the daemon.
+// runConfineReportCommand relays one aitest pool sample to the daemon over the
+// retained confine-report verb.
+//
+// The kind is fixed to pytest-worker rather than exposed as a --kind flag: this
+// CLI face has exactly one caller (the aitest supervisor, which cannot call
+// runner.ReportPeakSample directly the way an in-process `aira confine` job
+// does at its own teardown), so a generic --kind option would be surface with
+// no second reader.
 //
 // It is best-effort by design and says so on stderr rather than failing loudly:
 // the caller is a pytest run that has already finished its real work, and a
 // suite must never be reported differently because AIRA could not record how
 // much memory it used. Nothing is fabricated to fill a gap — an unparseable or
 // absent term is simply not sent, and the store records it as unevaluated.
-func runWorkerPeakCommand(ctx context.Context, options map[string]string, stderr io.Writer) int {
+func runConfineReportCommand(ctx context.Context, options map[string]string, stderr io.Writer) int {
 	report := runner.ConfinePeakReport{
 		Kind:        string(store.ResourcePeakKindPytestWorker),
 		Signature:   options["signature"],
@@ -1295,7 +1310,9 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 				i++
 				options["status-selector"] = argv[i]
 			}
-		case "kill", "slice", "owner":
+		// AIRA (admission-counter rebuild) S18. --dump joins kill/slice/owner in
+		// the value-required group: the archival target file path.
+		case "kill", "slice", "owner", "dump":
 			value := inline
 			if !hasInline {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
@@ -1316,14 +1333,15 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	kill := options["kill"] != ""
 	status := options["status"] == "true"
 	budget := options["budget"] == "true"
+	dump := options["dump"] != ""
 	selected := 0
-	for _, chosen := range []bool{list, kill, status, budget} {
+	for _, chosen := range []bool{list, kill, status, budget, dump} {
 		if chosen {
 			selected++
 		}
 	}
 	if selected != 1 {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --kill <selector>, or --status [<selector>]")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --dump <file>, --kill <selector>, or --status [<selector>]")
 	}
 	if !kill && options["steal"] == "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")
@@ -1373,22 +1391,6 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	// shared ledger 32G rather than the 512M asked for. runner.ResolveConfineReserve
 	// is now the single decision site; the non-delegate up-charge lives there and is
 	// unchanged.
-	admitTimeout := time.Duration(0)
-	if raw := options["admit-timeout"]; raw != "" {
-		admitTimeout, err = time.ParseDuration(raw)
-		// AIRA-58: bound it HERE, synchronously, so the caller learns before any
-		// daemon round-trip — the same already-honest shape as
-		// `confine-reserve --max-wait`. The daemon enforces the same shared
-		// runner.AdmitWaitCeiling independently, since a non-CLI caller reaches
-		// the runner directly and an operator may run an older client.
-		if err != nil || admitTimeout < time.Millisecond || admitTimeout > runner.AdmitWaitCeiling {
-			if err == nil {
-				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
-			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-	}
 	// AIRA-138. The CLI TRANSCRIBES both job bounds; parseConfineArgs has already
 	// refused anything non-positive or unparseable, and this re-parse goes through
 	// the same one helper so the two can never accept different languages.
@@ -1424,8 +1426,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		// false and the detached job's stdin is /dev/null, exactly as before.
 		StdinConnect:   options["stdin-connect"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
-		AdmissionMaxWait: admitTimeout,
-		Timeout:          jobTimeout, CPUTimeout: jobCPUTimeout,
+		Timeout: jobTimeout, CPUTimeout: jobCPUTimeout,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {
@@ -1515,18 +1516,6 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 		}
 		holdFor = parsed
 	}
-	var admitTimeout time.Duration
-	if raw := options["admit-timeout"]; raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed < time.Millisecond || parsed > runner.AdmitWaitCeiling {
-			if err == nil {
-				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
-			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-		admitTimeout = parsed
-	}
 	owner, err := resolveConfineOwner(ctx, "")
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: owner: %v\n", err)
@@ -1538,24 +1527,22 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 		Argv:            []string{drainHoldSelfPath, "drain-hold"},
 		Exclusive:       true,
 		ExclusiveReason: strings.TrimSpace(options["reason"]),
-		// The ONE place the two clocks are separated, and the reason the help text
-		// says so out loud: Timeout bounds the HELD duration only (it starts at the
-		// release write, after admission and setup), while AdmissionMaxWait bounds
-		// the wait to be admitted at all. Zero means "confine's own default" for
-		// each, which for admission is 30 minutes — never "no bound" and never
-		// "give up immediately".
-		Timeout:          holdFor,
-		AdmissionMaxWait: admitTimeout,
-		Stdin:            stdin, Stdout: stdout, Stderr: stderr,
+		// Timeout bounds the HELD duration only (it starts at the release write, after
+		// admission and setup); zero means "no hold bound — until you interrupt it".
+		// S13 removed --admit-timeout: the wait to be ADMITTED is no longer client-bounded
+		// (design §4/§6 — a blocking wait ends on the grant or on interrupting the
+		// command; there is no admission timeout).
+		Timeout: holdFor,
+		Stdin:   stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
 		request.RuntimeDir = paths.RuntimeDir
 		request.AdmitSocketPath = paths.SocketPath
 	} else if stderr != nil {
 		// Stated, not swallowed: without daemon paths the admission attempt cannot
-		// reach the daemon, and an exclusive request REFUSES rather than falling
-		// back to flock, so the launch below will fail loudly. Saying why here turns
-		// that refusal from a puzzle into an install problem.
+		// reach the daemon, and an exclusive request REFUSES (it never degrades to a
+		// non-exclusive launch), so the launch below will fail loudly. Saying why here
+		// turns that refusal from a puzzle into an install problem.
 		_, _ = fmt.Fprintf(stderr, "drain: daemon paths unavailable, so an exclusive admission cannot be established: %v\n", pathErr)
 	}
 	_, _ = fmt.Fprintln(stderr, drainWaitBanner(request, runner.DefaultConfineSlice))
@@ -1567,33 +1554,29 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 	return result.Exit
 }
 
-// drainWaitBanner states BOTH clocks at the point of use, before anything
-// blocks.
+// drainWaitBanner states BOTH phases at the point of use, before anything blocks.
 //
 // It exists because `--timeout 10s` reads as "give up after 10 seconds" and is
-// not: admission is a separate, already-existing budget that defaults to 30
-// minutes, so a drain can legitimately sit unadmitted far longer than its own
-// --timeout before the hold it bounds has even begun. The help text says this
-// too; saying it again here means an operator who never reads --help still
-// cannot be surprised by it.
+// not: the admission WAIT is a separate phase that `--timeout` does not bound.
+// Since S13 that wait is no longer client-bounded at all (design §4/§6 — a
+// blocking wait ends on the grant or on interrupting the command), so the banner
+// says exactly that rather than advertising a duration nothing enforces. The help
+// text says this too; saying it again here means an operator who never reads
+// --help still cannot be surprised by it.
 func drainWaitBanner(request runner.ConfineRequest, defaultSlice string) string {
 	slice := strings.TrimSpace(request.Slice)
 	if slice == "" {
 		slice = defaultSlice
 	}
-	// The EFFECTIVE budget, read from the one constant the runner actually applies
-	// when no --admit-timeout is given, rather than a number restated here that
-	// could drift away from it.
-	admission := "up to " + runner.DefaultConfineAdmissionWait.String() + " (the default; --admit-timeout changes it)"
-	if request.AdmissionMaxWait > 0 {
-		admission = "up to " + request.AdmissionMaxWait.String()
-	}
+	// The admission wait no longer self-expires and is not client-bounded (S13): it
+	// ends when the hold is granted or when the operator interrupts the command.
+	admission := "until it is admitted, or until you interrupt it (Ctrl-C or SIGTERM)"
 	hold := "until you interrupt it (Ctrl-C or SIGTERM)"
 	if request.Timeout > 0 {
 		hold = "for " + request.Timeout.String() + ", or until you interrupt it (Ctrl-C or SIGTERM)"
 	}
 	line := fmt.Sprintf("drain: asking to hold %s exclusively; new jobs stop being admitted and already-running ones finish untouched.", slice)
-	line += fmt.Sprintf("\ndrain: waiting %s to be admitted, THEN holding %s. These are two separate budgets.", admission, hold)
+	line += fmt.Sprintf("\ndrain: waiting %s, THEN holding %s.", admission, hold)
 	if reason := strings.TrimSpace(request.ExclusiveReason); reason != "" {
 		line += "\ndrain: reason " + strconv.Quote(confineReasonForDisplay(reason))
 	}
@@ -2077,8 +2060,8 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	grantFields := &runner.WorkerAdmitGrantFields{
 		ScopePath: lease.ScopePath, WorkerID: lease.WorkerID,
 		MemoryMax: lease.MemoryMax, SwapCap: lease.SwapCap,
-		CPUSlots: lease.CPUSlots, Containment: lease.Containment,
-		Reserved: lease.Reserved,
+		Containment: lease.Containment,
+		Reserved:    lease.Reserved,
 	}
 	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {
 		_ = lease.Close()
@@ -3385,26 +3368,6 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			_, _ = fmt.Fprintf(stdout, "slice reserve: unevaluated (no admission ledger) / %s ceiling%s\n",
 				formatReserveBytes(result.SliceReserve.CeilingBytes), containment)
 		}
-		// AIRA-114. The aggregate over-subscription bound, printed only when the
-		// bound is switched ON (a zero limit is an absence, never a limit of zero).
-		// It explains a wait the reserve summary above cannot: since AIRA-29 the
-		// granted total is LIVE USAGE, so a slice can read half empty while the
-		// caps already handed out total more than it holds, and a job blocked by
-		// that would otherwise be shown no reason at all.
-		//
-		// An unestablished aggregate says so and does NOT print the zero: while it
-		// is unevaluated the bound withholds nothing, and "0B" would state the
-		// opposite of the truth.
-		if result.SliceReserve.CapBoundBytes > 0 {
-			if result.SliceReserve.CapAggregateKnown {
-				_, _ = fmt.Fprintf(stdout, "slice scope caps: %s across live scopes / %s over-subscription bound\n",
-					formatReserveBytes(result.SliceReserve.CapAggregateBytes),
-					formatReserveBytes(result.SliceReserve.CapBoundBytes))
-			} else {
-				_, _ = fmt.Fprintf(stdout, "slice scope caps: unevaluated / %s over-subscription bound (not applied while unevaluated)\n",
-					formatReserveBytes(result.SliceReserve.CapBoundBytes))
-			}
-		}
 		// Why a job is WAITING, which the admitted-jobs table above cannot show.
 		// Printed unconditionally (including the zero) so "nothing is queued" is a
 		// stated fact rather than an absence the reader has to interpret.
@@ -3439,22 +3402,21 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		} else {
 			_, _ = fmt.Fprintln(stdout, renderConfineExclusiveLine(exclusive))
 		}
-		// AIRA-68. The job count above spans three populations and the table above
+		// AIRA-68. The job count above spans two populations and the table above
 		// THAT lists only scopes, so the two are not comparable — reading them
 		// against each other is what produced a P0 that did not exist. Printed
 		// with the zeros when the ledger IS established, so "no scope-less
 		// reservations" is a stated fact rather than an absence the reader has to
 		// interpret. AIRA-220: when the ledger is NOT established the split is the
-		// SAME fabricated zeros as the headline (the "0 adopted scopes" the ticket
-		// names as the AIRA-105 misreading), so it reads unevaluated in lockstep.
+		// SAME fabricated zeros as the headline, so it reads unevaluated in
+		// lockstep. (The third "adopted scopes" population the AIRA-105 misreading
+		// named was deleted in S12; survivors now count as confine scopes.)
 		if result.SliceReserve.GrantedEstablished {
-			_, _ = fmt.Fprintf(stdout, "  of which: %d confine %s %s, %d scope-less %s %s, %d adopted %s %s\n",
+			_, _ = fmt.Fprintf(stdout, "  of which: %d confine %s %s, %d scope-less %s %s\n",
 				result.SliceReserve.ScopeJobs, confinePlural(result.SliceReserve.ScopeJobs, "scope", "scopes"),
 				formatReserveBytes(result.SliceReserve.ScopeBytes),
 				result.SliceReserve.ReservationJobs, confinePlural(result.SliceReserve.ReservationJobs, "reservation", "reservations"),
-				formatReserveBytes(result.SliceReserve.ReservationBytes),
-				result.SliceReserve.AdoptedJobs, confinePlural(result.SliceReserve.AdoptedJobs, "scope", "scopes"),
-				formatReserveBytes(result.SliceReserve.AdoptedBytes))
+				formatReserveBytes(result.SliceReserve.ReservationBytes))
 		} else {
 			_, _ = fmt.Fprintln(stdout, "  of which: unevaluated (no admission ledger)")
 		}
@@ -3487,16 +3449,6 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 				_, _ = fmt.Fprintf(stdout, "    … and %d further %s not listed\n",
 					unlisted, confinePlural(unlisted, "reservation", "reservations"))
 			}
-		}
-		if result.SliceReserve.VanishedJobs > 0 {
-			// An observation, never a verdict, and stated in the PAST TENSE about
-			// what the scan saw. A scope can be absent while the job's leader lives
-			// on, having migrated into a sibling cgroup; and the newest sighting
-			// here is up to one scan old, so "is now gone" would assert present
-			// state the daemon cannot establish at the moment it prints it.
-			_, _ = fmt.Fprintf(stdout, "  %d %s %s whose scope the confine scan observed and then observed absent; reclaimed at the stale-lease TTL\n",
-				result.SliceReserve.VanishedJobs, confinePlural(result.SliceReserve.VanishedJobs, "lease", "leases"),
-				formatReserveBytes(result.SliceReserve.VanishedBytes))
 		}
 		// AIRA-103. WHY the ceiling is what it is. Printed only when the subsystem
 		// is running (CeilingMode == "" means off), and never claiming anything it

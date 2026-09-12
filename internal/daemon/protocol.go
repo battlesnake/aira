@@ -79,8 +79,43 @@ import (
 // unresolvable one). Nothing below this layer can detect that direction: only
 // the version can. The new-daemon/old-client direction is harmless (no
 // selector, local rant). Same atomic reinstall+restart requirement as 6-8.
+//
+// ProtocolVersion 10 (was 9): the admission-counter rebuild (S5/S7). Two
+// coupled wire changes, both silent below this layer:
+//   - S5 added a `cpu` arg (integer cores) to the `admit` request — the second
+//     ledger resource. Its bump was deferred to here (admission_linux.go).
+//   - S7 froze the version-frozen re-declare frame (design §4). (The signed
+//     `ceiling − Σleases` ledger it serves landed EARLIER — S2 introduced it, S4 made
+//     it the admission gate — NOT at S7; S7 only froze the re-declare frame and carried
+//     the S5 `cpu`-arg bump above.) An OLD (v0.5 / proto-9) client's NEW admission must
+//     now be refused LOUDLY — a re-declare (the ARDR frame, sniffed BEFORE this check in
+//     server.go) is the ONLY cross-version path, so an unbumped version would let a
+//     proto-9 client's new admission negotiate against a signed-ledger daemon that no
+//     longer speaks its shape.
+//
+// ProtocolVersion 11 (was 10): the admission-counter rebuild (S15) rebuilt the
+// worker-admit path onto the same signed ledger, which changed the worker-admit
+// wire's SHAPE and its SEMANTICS, both silent below this layer:
+//   - WorkerAdmitResponse gained parent_scope_id (the suite scope-id a worker
+//     lease sub-reserves under, echoed so the relay can re-declare it VERBATIM),
+//     and available_bytes / available_cpu (the non-blocking probe's current
+//     ledger headroom).
+//   - max_wait_ms semantics inverted: PRESENT-and-zero is now a non-blocking
+//     SNAPSHOT that takes no reservation (it used to be a speculative
+//     try-acquire that could GRANT); ABSENT or PRESENT-and-positive is a
+//     BLOCKING queue-lease claim. The old max-wait ceiling validation is gone.
+//
+// An OLD (proto-10) worker-admit client speaking the try-acquire contract must
+// be refused LOUDLY rather than silently mis-served against the snapshot daemon.
+// The re-declare (ARDR) frame remains sniffed BEFORE this check, so a suite's
+// held worker leases still re-anchor across the upgrade.
+//
+// The re-declare frame is deliberately NOT gated by this number: it is sniffed
+// by its magic ahead of the proto check precisely so an upgrade (OLD client ↔
+// NEW daemon) can re-anchor its leases. Same atomic reinstall+restart
+// requirement as 6-10.
 const (
-	ProtocolVersion = 9
+	ProtocolVersion = 11
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )
@@ -121,21 +156,18 @@ const (
 	// unaccounted but also NOT exclusive, while its operator believed otherwise.
 	CodeAdmitExclusiveActive = "E_ADMIT_EXCLUSIVE_ACTIVE"
 
-	// CodeAdmitExclusiveUnestablished aborts a draining exclusive waiter when the
-	// daemon cannot establish that the slice is empty — the confine scan has been
-	// failing for longer than the establishment grace (AIRA-101).
+	// CodeAdmitExclusiveUnestablished refuses an --exclusive request UP FRONT when
+	// the daemon cannot establish that the slice is empty (AIRA-101). After S14 it
+	// is raised in exactly two places, both before the request is queued: ci-shim
+	// mode (no cgroup scopes exist, so an empty slice cannot be asserted for an
+	// unconfined job) and writeAdmitFailClosed (an unresolvable slice or unreadable
+	// budget — Invariant 6). S14 removed the drain-abort that used to raise it after
+	// a persistently failing confine scan, along with the scan itself.
 	//
 	// It is a U_ code because it is an UNEVALUATED verdict, not a failure of the
 	// request: the daemon is not saying the slice is busy, it is saying it cannot
-	// read the slice. Reporting it as E_ADMIT_SATURATED would be a fabricated
-	// diagnosis, which is why admitConnection branches on the waiter outcome
-	// rather than hardcoding saturation for every rejected waiter.
-	//
-	// Aborting rather than waiting is deliberate: with the fail-closed emptiness
-	// rule, a persistently unreadable slice would otherwise block the drain head
-	// AND every waiter behind it for the full ceiling — a machine-wide stall
-	// caused by a diagnostic failure. The benchmark fails loudly; the machine
-	// keeps working.
+	// establish solitude. Reporting it as E_ADMIT_SATURATED would be a fabricated
+	// diagnosis.
 	CodeAdmitExclusiveUnestablished = "U_ADMIT_EXCLUSIVE_UNESTABLISHED"
 )
 

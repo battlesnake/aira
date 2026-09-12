@@ -565,7 +565,7 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 			case cell.Marker != "":
 				fmt.Fprintf(&out, "[%s]%s[-]", topColourMarker, topMarkerGlyph(cell.Marker))
 			case cell.Colour != "":
-				fmt.Fprintf(&out, "[%s]█[-]", cell.Colour)
+				fmt.Fprintf(&out, "[%s]%s[-]", cell.Colour, topBarGlyph(cell))
 			default:
 				out.WriteString(" ")
 			}
@@ -664,6 +664,42 @@ func topMarkerGlyph(name string) string {
 	}
 }
 
+// The block characters a bar column is painted with. AIRA-135 draws a scope's
+// used/idle split by GLYPH within one colour rather than by a second colour
+// shade, because two shades of a hue read as two separate bars and an operator
+// cannot tell one job's dark half from the next job's bright half.
+//
+//   - topBarSolidGlyph █ — memory in use right now (and every non-split span:
+//     scope-less, out-of-slice, all CPU spans).
+//   - topBarIdleGlyph ▒ — memory a reservation holds but is not using. MEDIUM
+//     shade, not light ░: ░ in the dimmer slot colours sinks toward the terminal
+//     background and blurs into the blank free-RAM gap, so the held span would
+//     read as free memory — the inflated-idle misreading AIRA-192 exists to
+//     prevent. ▓ and ▇ sit too close to █ to tell apart at cell size.
+//   - topBarUnknownGlyph ? — a RAM scope whose usage could not be read. OFF the
+//     fill-density axis on purpose: any shaded block would read as a definite
+//     fraction used, and an unreadable usage is not a measured fraction.
+const (
+	topBarSolidGlyph   = "█"
+	topBarIdleGlyph    = "▒"
+	topBarUnknownGlyph = "?"
+)
+
+// topBarGlyph is the pure column-glyph choice, extracted from renderTopBar so the
+// representation can be asserted without a terminal: solid used block, shaded
+// idle block, or the unevaluated mark. The colour is applied by the caller and is
+// the same for all three — the fill is the only thing that varies within a job.
+func topBarGlyph(cell topBarCell) string {
+	switch cell.Fill {
+	case topFillIdle:
+		return topBarIdleGlyph
+	case topFillUnknown:
+		return topBarUnknownGlyph
+	default:
+		return topBarSolidGlyph
+	}
+}
+
 // topMarkerLegend keys the limit ticks drawn over a bar.
 //
 // A RAM bar with no markers says so: the slice HAS a memory.max, so none having
@@ -685,24 +721,46 @@ func topMarkerLegend(bar *topBar) string {
 	return strings.Join(parts, "  ")
 }
 
-// topShadeLegend names the two shades AIRA-135 draws inside each reservation,
-// because a two-tone region with no key is not readable: an operator cannot tell
-// which half is the usage and which is the idle remainder.
+// topShadeLegend keys the block characters AIRA-135 draws inside each
+// reservation, because the glyphs are not self-describing: an operator cannot
+// tell which fill is the usage and which the idle remainder without a key.
 //
-// It is emitted only when a split is ACTUALLY on screen — at least one drawn
-// region with an established usage and a darkened variant to draw it in. A key
-// printed beside a bar with no split would describe something that is not there,
-// which is the same fabrication as drawing the split itself would be.
+// It is a RAM-bar concern only. The CPU bar has scope regions too, but no
+// used/idle split — its spans are all solid — so a key there would describe a
+// distinction that is not on that bar. Hence the bar.Kind guard, which also stops
+// a CPU scope's UsedKnown-false region from being mistaken for an "unevaluated
+// usage" one here.
+//
+// Each clause is emitted only when the glyph it names can actually be on screen:
+// the solid/shaded pair when any scope region has an established usage, and the
+// unevaluated mark when any drawn scope region's usage could not be read. A key
+// for a glyph that is not present would describe something that is not there.
 func topShadeLegend(bar *topBar) string {
-	if bar == nil {
+	if bar == nil || bar.Kind != topBarRAM {
 		return ""
 	}
+	hasKnown, hasUnknown := false, false
 	for _, region := range bar.Regions {
-		if region.Kind == topRegionScope && region.UsedKnown && region.ShadeColour != "" {
-			return " (bright = in use, dark = reserved and idle)"
+		if region.Kind != topRegionScope {
+			continue
+		}
+		if region.UsedKnown {
+			hasKnown = true
+		} else {
+			hasUnknown = true
 		}
 	}
-	return ""
+	parts := make([]string, 0, 2)
+	if hasKnown {
+		parts = append(parts, topBarSolidGlyph+" in use, "+topBarIdleGlyph+" reserved and idle")
+	}
+	if hasUnknown {
+		parts = append(parts, topBarUnknownGlyph+" usage unevaluated")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, "; ") + ")"
 }
 
 func topOutsideText(bar *topBar) string {

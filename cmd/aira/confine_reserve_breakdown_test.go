@@ -20,7 +20,6 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		GrantedBytes: 48 << 30, CeilingBytes: 61 << 30, Jobs: 23, GrantedEstablished: true,
 		ScopeJobs: 3, ScopeBytes: 24 << 30,
 		ReservationJobs: 20, ReservationBytes: 14 << 30,
-		AdoptedJobs: 0, AdoptedBytes: 0,
 	}
 	render := func(t *testing.T, reserve runner.ConfineSliceReserve) string {
 		t.Helper()
@@ -32,9 +31,9 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		return stdout.String()
 	}
 
-	t.Run("splits-the-three-populations", func(t *testing.T) {
+	t.Run("splits-the-populations", func(t *testing.T) {
 		out := render(t, base)
-		if !strings.Contains(out, "of which: 3 confine scopes 24G, 20 scope-less reservations 14G, 0 adopted scopes 0B") {
+		if !strings.Contains(out, "of which: 3 confine scopes 24G, 20 scope-less reservations 14G") {
 			t.Fatalf("stdout=%q", out)
 		}
 		if !strings.Contains(out, "never appears in the table above") {
@@ -43,16 +42,13 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		if strings.Contains(out, "LEDGER INCONSISTENCY") {
 			t.Fatalf("consistent ledger reported an inconsistency; stdout=%q", out)
 		}
-		if strings.Contains(out, "whose scope was observed") {
-			t.Fatalf("no vanished leases, yet the vanished line rendered; stdout=%q", out)
-		}
 	})
 
 	t.Run("singular-forms", func(t *testing.T) {
 		reserve := base
-		reserve.ScopeJobs, reserve.ReservationJobs, reserve.AdoptedJobs = 1, 1, 1
+		reserve.ScopeJobs, reserve.ReservationJobs = 1, 1
 		out := render(t, reserve)
-		if !strings.Contains(out, "1 confine scope 24G, 1 scope-less reservation 14G, 1 adopted scope 0B") {
+		if !strings.Contains(out, "1 confine scope 24G, 1 scope-less reservation 14G") {
 			t.Fatalf("stdout=%q", out)
 		}
 	})
@@ -69,19 +65,8 @@ func TestRenderConfineListReserveBreakdown(t *testing.T) {
 		}
 	})
 
-	// A vanished lease is reported as an OBSERVATION, never as a death verdict:
-	// a scope can be gone while the job's leader lives on in a sibling cgroup.
-	t.Run("vanished-leases-are-an-observation-not-a-verdict", func(t *testing.T) {
-		reserve := base
-		reserve.VanishedJobs, reserve.VanishedBytes = 2, 4<<30
-		out := render(t, reserve)
-		if !strings.Contains(out, "2 leases 4G whose scope the confine scan observed and then observed absent") {
-			t.Fatalf("stdout=%q", out)
-		}
-		if strings.Contains(strings.ToLower(out), "ghost") || strings.Contains(strings.ToLower(out), "dead") {
-			t.Fatalf("the vanished line issued a liveness verdict the daemon cannot establish; stdout=%q", out)
-		}
-	})
+	// (S14 removed the `vanished` line and its VanishedJobs/VanishedBytes wire
+	// fields with the cgroup scan that produced them.)
 
 	// The residual is signed and printed for jobs AND bytes independently. The
 	// most plausible regression (a lost `outstanding -=` with the job decrement

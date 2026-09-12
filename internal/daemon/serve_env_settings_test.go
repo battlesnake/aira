@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -15,8 +14,8 @@ import (
 // nowhere else: nothing proved Serve applies the parsed value to the field the
 // subsystem actually reads. A dropped assignment, or one written to the wrong
 // field, left the whole suite green while the setting silently did nothing —
-// worst of all for AIRA_DAEMON_DYNAMIC_RESERVE, a kill switch whose one use is
-// an operator reverting an admission change on a loaded shared machine.
+// worst of all for an operational knob whose one use is an operator adjusting
+// daemon behaviour on a loaded shared machine.
 //
 // The two tests below close that as a CLASS, not one variable at a time:
 //
@@ -49,13 +48,6 @@ type serveEnvSetting struct {
 // serveEnvSettingRows builds the table. It is a function because one expected
 // value depends on the host's CPU count.
 func serveEnvSettingRows() []serveEnvSetting {
-	// AIRA_DAEMON_CPU_RESERVE=0 means "reserve no CPU", so the gate capacity is
-	// the whole CPU count; NewServer's default reserve of 1 gives NumCPU-1.
-	// Those differ only on a host with at least two CPUs.
-	cpuCapacityUnevaluated := ""
-	if runtime.NumCPU() < 2 {
-		cpuCapacityUnevaluated = "single-CPU host: reserve 0 and the default reserve 1 both clamp to capacity 1, so this row cannot distinguish an applied setting from a dropped one"
-	}
 	return []serveEnvSetting{
 		{
 			field: "watchPollInterval",
@@ -84,43 +76,6 @@ func serveEnvSettingRows() []serveEnvSetting {
 			value: "91s",
 			want:  91 * time.Second,
 			get:   func(s *Server) any { return s.admitFreezeMaxHold },
-		},
-		{
-			// The AIRA-29 kill switch. Default is true, so only "disabled"
-			// proves Serve applied it.
-			field: "dynamicReserve",
-			env:   "AIRA_DAEMON_DYNAMIC_RESERVE",
-			value: "disabled",
-			want:  false,
-			get:   func(s *Server) any { return s.dynamicReserve },
-		},
-		{
-			// AIRA-114, carried as an integer percentage: 3.5x -> 350.
-			field: "oversubscriptionFactorPct",
-			env:   "AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR",
-			value: "3.5",
-			want:  int64(350),
-			get:   func(s *Server) any { return s.oversubscriptionFactorPct },
-		},
-		{
-			// AIRA-64 worker-admit CPU gate. Seconds, as a float.
-			field: "cpuSlotsGrace",
-			env:   "AIRA_AITEST_PLACEMENT_ACK_TIMEOUT",
-			value: "7.5",
-			want:  7500 * time.Millisecond,
-			get:   func(s *Server) any { return s.cpuSlotsGrace },
-		},
-		{
-			field: "cpuSlotsCapacity",
-			env:   "AIRA_DAEMON_CPU_RESERVE",
-			value: "0",
-			want:  runtime.NumCPU(),
-			get: func(s *Server) any {
-				s.cpuSlotsMu.Lock()
-				defer s.cpuSlotsMu.Unlock()
-				return s.cpuSlotsCapacity
-			},
-			unevaluated: cpuCapacityUnevaluated,
 		},
 	}
 }
@@ -162,16 +117,12 @@ func TestServeAppliesParsedEnvSettings(t *testing.T) {
 }
 
 // serveEnvReader reports whether a function name is one of the daemon's
-// env-reading helpers. The *FromEnv suffix is the package's convention; the two
-// named exceptions predate it. A future reader named by neither rule would be
-// missed by the coverage guard below — an accepted, documented gap, and the
-// reason the guard also fails when a covered field disappears (a rename that
-// escapes it cannot also stay silent).
+// env-reading helpers, identified by the package's *FromEnv suffix convention.
+// A future reader named by a different rule would be missed by the coverage
+// guard below — an accepted, documented gap, and the reason the guard also
+// fails when a covered field disappears (a rename that escapes it cannot also
+// stay silent).
 func serveEnvReader(name string) bool {
-	switch name {
-	case "desiredCPUSlots", "cpuSlotsPlacementGrace":
-		return true
-	}
 	return strings.HasSuffix(name, "FromEnv")
 }
 

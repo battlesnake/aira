@@ -51,7 +51,6 @@ type Runner struct {
 	setupPipesFn             func(*exec.Cmd, bool) (map[string]*os.File, map[string]*os.File, error)
 	allocatePTYFn            func() (*os.File, *os.File, error)
 	startFn                  func(*exec.Cmd) error
-	lockAttemptFn            func(string) (*admitLock, error)
 	admitSocketPath          string
 	admitDialFn              func(context.Context, string) (net.Conn, error)
 	daemonScope              map[string]any

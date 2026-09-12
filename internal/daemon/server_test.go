@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -94,35 +93,6 @@ func startServer(t *testing.T, server *Server) (context.CancelFunc, <-chan error
 		}
 	})
 	return cancel, done
-}
-
-func TestServerMalformedCPUReserveLogsCapacityOneFallback(t *testing.T) {
-	t.Setenv("AIRA_DAEMON_CPU_RESERVE", "not-a-number")
-	paths := testPaths(t)
-	server := NewServer(paths)
-	// AIRA-33 retargeted this from the deleted daemon governor to the AIRA-64
-	// worker-admit CPU gate, which is now the sole owner of desiredCPUSlots.
-	// The invariant is unchanged and still load-bearing: a malformed setting
-	// must leave an ENFORCING capacity-1 gate, never a disabled one -- the
-	// AIRA-59 "shipped operationally inert" failure mode.
-	if server.cpuSlotsCapacity != 1 {
-		t.Fatalf("cpu slot capacity=%d, want enforced capacity-1 fallback", server.cpuSlotsCapacity)
-	}
-	var logs bytes.Buffer
-	previous := log.Writer()
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(previous) })
-	_, _ = startServer(t, server)
-	got := logs.String()
-	if !strings.Contains(got, "using safe capacity-1 fallback") || !strings.Contains(got, "AIRA_DAEMON_CPU_RESERVE") {
-		t.Fatalf("fallback log=%q", got)
-	}
-	if strings.Contains(got, "disabled") {
-		t.Fatalf("fallback log falsely claims disabled: %q", got)
-	}
-	if server.cpuSlotsCapacity != 1 {
-		t.Fatalf("cpu slot capacity=%d after Serve, want the fallback retained", server.cpuSlotsCapacity)
-	}
 }
 
 func TestServerRoutedRoundTripAndProtocolEvidence(t *testing.T) {
@@ -1324,14 +1294,17 @@ func TestPathsNamespaceStateIdentity(t *testing.T) {
 func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 	paths := testPaths(t)
 	server := NewServer(paths)
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
-	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
-	// AIRA-39: the worker-admit ledger now sums the outer scope's real
-	// `.aira-worker-*` children and creates the granted scope itself, so this
-	// dispatch test needs a stand-in tree — "/outer" is not a real cgroup here,
-	// and without the seam the honest answer would be "unevaluated".
-	_ = newWorkerScopeTree().install(server)
-	server.workerAdmitHeadroom = 0
+	server.restartFreeze = 0
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
+	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, 4 * workerAdmitEstimatedBytesMin, 0, true, ""
+	}
+	// S15: the worker lease charges the unified ledger and the daemon creates the
+	// granted scope itself. "/slice" is not a real cgroup here, so the create seam
+	// is stubbed with an in-memory tree.
+	server.SetWorkerScopeTreeForTest()
 	_, _ = startServer(t, server)
 	scope := testScope(t, paths, "one")
 
@@ -1340,10 +1313,12 @@ func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	// A blocking CLAIM (max_wait_ms absent) that fits is granted; the daemon then
+	// holds the connection as the lease, which conn.Close (deferred) releases.
 	if err := writeFrame(conn, RequestFrame{
 		Proto: ProtocolVersion, Scope: scope,
 		Request: core.Request{Verb: "worker-admit", Args: map[string]any{
-			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
+			"job_id": "job-1", "outer_scope": "/slice/.aira-suite", "estimated_bytes": float64(workerAdmitEstimatedBytesMin),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -1353,6 +1328,6 @@ func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !frame.OK {
-		t.Fatalf("frame=%+v", frame)
+		t.Fatalf("frame=%+v, want a granted worker-admit over the real socket", frame)
 	}
 }

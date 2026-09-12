@@ -11,17 +11,19 @@ import (
 )
 
 // AIRA-113. Dynamic per-scope oom_score_adj steering: the residual left by
-// AIRA-29 and bounded, but not removed, by AIRA-114.
+// declared-only admission accounting.
 //
-// THE FAILURE THIS EXISTS FOR. Before AIRA-29 the non-delegate confine class was
-// airtight — reserve == the scope's own memory.max, and Sigma(reserve) <= slice
-// cap — so the aggregate could not overrun and no memcg OOM could fire inside
-// aira.slice. AIRA-29 charges LIVE usage instead, on the owner's explicit
-// ruling, and AIRA-114 bounds the resulting over-subscription to a known
-// multiple of the ceiling rather than restoring the airtight property. What
-// remains (AIRA-29 residual 4e) is a genuine aggregate-full case: several scopes
-// expand between scans until aira.slice reaches its own cap and the kernel picks
-// a victim, biased only by AIRA-27's STATIC class steering.
+// THE FAILURE THIS EXISTS FOR. Admission bounds the DECLARED reserves — for a
+// new admission Sigma(reserve) <= slice cap — but it does not measure a scope's
+// LIVE usage: the ledger holds the declared reserve for a lease's whole lifetime
+// (the AIRA-29 live charge was retired). So a scope that USES more than it
+// declared — an under-declaration, or a burst past its reserve — is invisible to
+// admission and can expand until aira.slice reaches its own cap and the kernel
+// picks a victim, biased only by AIRA-27's STATIC class steering. (A delegate
+// scope's memory.max is a containment ceiling well above its declared reserve,
+// so physical over-use inside that cap is possible; under declared-only
+// admission the per-scope memory.max and the MemAvailable watchdog are the
+// backstop, not an aggregate over-subscription bound.)
 //
 // That static bias picks the wrong victim in exactly the case that matters.
 // oom_score_adj is worth adj/1000 of MACHINE total in badness, so on a 64 GiB
@@ -40,15 +42,12 @@ import (
 // any job — the only thing it changes is which process the kernel prefers IF an
 // OOM happens anyway.
 //
-// WHY A SEPARATE LOOP RATHER THAN A TERM IN evaluateAdmitQueue. AIRA-29 §3.6
-// scoped this out and named the reason precisely: inside the admission scan the
-// charge is computed from the same reading the trigger would use, and
-// `rss <= peakSoFar` by the ratchet, so `rss - charge > 0` is reachable there
-// only in the narrow window where memory.current transiently exceeds
-// memory.max. Catching the population this is aimed at — a scope outrunning its
-// accounting BETWEEN charge refreshes — requires reading RSS faster than the
-// <=1s charge refresh. Hence a subsystem with its own cadence, its own state,
-// and no admission lock held while it walks /proc.
+// WHY A SEPARATE LOOP RATHER THAN A TERM IN evaluateAdmitQueue. The admission
+// scan runs at <=1s and accounts only DECLARED reserves; it never reads a
+// scope's live memory.current for charging. Catching a scope that is outrunning
+// its declared reserve means sampling memory.current faster than a burst can
+// drive an already-full slice into an OOM — hence a subsystem with its own
+// faster cadence, its own state, and no admission lock held while it walks /proc.
 //
 // COST. The whole loop is one memory.current + one memory.stat read per tick
 // while the slice is not full, which is ~always. Only when the aggregate is
@@ -57,12 +56,12 @@ import (
 //
 // RESIDUALS, stated rather than papered over:
 //
-//   - Adopted (post-daemon-restart) scopes are not steered. AIRA-192 added a
-//     per-scope breakdown of that ledger (queue.adoptedScopes) for reporting, so
-//     a budget could now be named per scope — but steering them would still be
-//     vacuous: an adopted scope's charge is re-derived from its own
-//     memory.current on every scan, so it cannot read as over-budget by
-//     construction. A deliberate non-target, not a missing input.
+//   - Post-daemon-restart survivors are not steered until they re-declare.
+//     S11 reloads them as reserve-only leases and S12 deleted the scan-adoption
+//     ledger that once tracked them per scope, so there is no over-budget
+//     reading to steer on; once a survivor re-declares it is an ordinary
+//     connection-held lease and is steered like any other. A bounded
+//     post-restart gap, not a missing input.
 //   - A scope raised to 1000 and still alive when the daemon stops keeps that
 //     value for the rest of its life: the restore pass lives in the daemon.
 //     That leaves a job which demonstrably outran its accounting as the
@@ -72,16 +71,13 @@ import (
 //     governs only that one.
 //   - The fullness reading and the per-scope reading are taken at slightly
 //     different instants; a burst inside that window is caught on the next tick.
-//   - A scope whose ledger charge is still its FROZEN ESTIMATE rather than an
-//     observation can read as over-budget while it ramps. In practice that is
-//     the sub-second window between a grant and the first admission scan (the
-//     charge is re-derived at <=1s, and AIRA-29's cold floor only ever raises a
-//     charge, so it cannot hold an observed scope down), and for a
-//     --delegate-ram suite whose very first action is a test, before any pass
-//     observed it between reservations. The error self-corrects within one scan
-//     interval and costs the scope a raised adj for one tick on an
-//     already-full slice; it is not silent, because the raise and the restore
-//     are both logged.
+//   - The ledger charge IS the scope's DECLARED reserve for its whole lifetime,
+//     so a scope reads as over-budget whenever its live memory.current exceeds
+//     that reserve by more than the overrun floor. That is the intended signal —
+//     an under-declaration bias — not an error: over-declaring is a caller error
+//     the ledger accepts, and a job that uses more than it declared is exactly
+//     what this loop biases the OOM toward. Both the raise and the restore are
+//     logged.
 
 type oomSteerMode string
 
@@ -92,10 +88,10 @@ const (
 )
 
 const (
-	// defaultOOMSteerInterval must be FASTER than the <=1s admission charge
-	// refresh (admitConfineScanIntervalDefault). A loop no faster than the
-	// charge would only ever see RSS readings the charge had already absorbed,
-	// which is the exact inertness AIRA-29 §3.6 refused to ship.
+	// defaultOOMSteerInterval must be FASTER than the admission scan cadence
+	// (admitConfineScanIntervalDefault, <=1s). A loop no faster could not sample
+	// a burst before it drives the slice into an OOM, and the admission scan
+	// reads only declared reserves in any case.
 	defaultOOMSteerInterval = 250 * time.Millisecond
 	// oomSteerEnterPctDefault / oomSteerExitPctDefault are the fullness band, as
 	// a percentage of the slice's own kernel-enforced memory.max. Steering below
@@ -104,12 +100,11 @@ const (
 	// second-to-second jitter, so the exit is deliberately lower.
 	oomSteerEnterPctDefault = int64(90)
 	oomSteerExitPctDefault  = int64(80)
-	// oomSteerOverrunFloorDefault is how far past its accounted charge a scope
-	// must be before it counts as an offender. The charge already carries a
-	// margin of at least chargeMarginFloorDefault, so crossing it at all means
-	// the scope has outgrown its whole margin since the last refresh; this floor
-	// only absorbs the torn read between the ledger snapshot and the per-scope
-	// memory.current read.
+	// oomSteerOverrunFloorDefault is how far past its DECLARED reserve a scope's
+	// live memory.current must be before it counts as an offender. The declared
+	// reserve carries no built-in margin, so this floor is what separates a real
+	// under-declaration from the torn read between the ledger snapshot and the
+	// per-scope memory.current read.
 	oomSteerOverrunFloorDefault = int64(64 << 20)
 	// oomSteerUnevaluatedLogInterval rate-limits the "cannot establish" line so
 	// a persistently unreadable slice does not write a log entry four times a

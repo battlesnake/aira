@@ -28,16 +28,17 @@ func populationTestScopeID(name string, pid int) string {
 	return "CONFINE-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
-// verifies: the ledger reports connection-held SCOPE-BACKED jobs, connection-held
-// SCOPE-LESS reservations and scan-adopted scopes as three separate populations,
-// in both counts and bytes, while the totals keep their present meaning.
+// verifies: the ledger reports connection-held SCOPE-BACKED jobs and
+// connection-held SCOPE-LESS reservations as separate populations, in both
+// counts and bytes, while the totals keep their present meaning. (A third
+// scan-adopted population was deleted in S12.)
 //
 // The classifier is scopeID, and nothing else. Classifying on name or owner
 // would pass a naive test, because validateAdmitArgs requires the
 // scope_id/name/owner tuple to be supplied together — so the mutation this test
 // must break is "treat every connection-held grant as scope-backed", not
 // "classify by name".
-func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
+func TestAdmitSnapshotSeparatesTheLedgerPopulations(t *testing.T) {
 	server := NewServer(Paths{})
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
 	queue.waiters = []*admitWaiter{
@@ -50,7 +51,6 @@ func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
 	}
 	queue.outstanding = 20<<30 + 512<<20 + 1<<30 + 1<<30 + 512<<20
 	queue.outstandingJobs = 5
-	queue.adopted, queue.adoptedJobs = 8<<30, 2
 	server.admitQueues["/slice"] = queue
 
 	snapshot := server.admitSliceSnapshot("/slice")
@@ -60,9 +60,6 @@ func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
 	}
 	if snapshot.reservationJobs != 3 || snapshot.reservationBytes != 1<<30+1<<30+512<<20 {
 		t.Errorf("scope-less reservation population = %d jobs / %d bytes, want 3 / %d", snapshot.reservationJobs, snapshot.reservationBytes, int64(1<<30+1<<30+512<<20))
-	}
-	if snapshot.adoptedJobs != 2 || snapshot.adopted != 8<<30 {
-		t.Errorf("adopted population = %d jobs / %d bytes, want 2 / %d", snapshot.adoptedJobs, snapshot.adopted, int64(8<<30))
 	}
 	if snapshot.queued != 1 {
 		t.Errorf("queued = %d, want 1 (the split must not swallow queued waiters)", snapshot.queued)
@@ -76,10 +73,11 @@ func TestAdmitSnapshotSeparatesTheThreeLedgerPopulations(t *testing.T) {
 	}
 }
 
-// verifies: the derived split and the incremental counters are cross-checked,
-// and a JOB-count divergence is reported rather than hidden. Any divergence is a
-// real lost/double decrement: a waiter is `granted && accounted` if and only if
-// it was counted.
+// verifies: the re-derived ledger cache and an independent walk of the waiters
+// are cross-checked, and a JOB-count divergence is reported rather than hidden.
+// Any divergence is a real defect (a re-derive skipped, or a field set out of
+// step with the waiters): a waiter is `granted && accounted` if and only if it
+// was counted.
 func TestAdmitSnapshotReportsJobResidualWhenTheCounterDesynchronises(t *testing.T) {
 	server := NewServer(Paths{})
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
@@ -99,10 +97,11 @@ func TestAdmitSnapshotReportsJobResidualWhenTheCounterDesynchronises(t *testing.
 // verifies: the BYTE residual is reported independently of the job residual, and
 // a NEGATIVE residual survives as a signed value.
 //
-// This is not redundant with the job residual. The single most plausible
-// regression in releaseAdmitWaiter — dropping `outstanding -= waiter.reserve`
-// while keeping `outstandingJobs--` — is byte-only, and a job-only residual
-// would report a perfectly consistent ledger while the slice silently filled.
+// This is not redundant with the job residual. A byte-only divergence —
+// outstanding carrying bytes the waiter walk does not account for, while the job
+// count still matches — must be reported on its own rather than masked by a
+// matching job count; a job-only residual would report a perfectly consistent
+// ledger while the slice silently filled.
 func TestAdmitSnapshotReportsByteResidualIndependentlyOfJobs(t *testing.T) {
 	server := NewServer(Paths{})
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
@@ -136,10 +135,10 @@ func TestAdmitSnapshotAbsentQueueStaysAGenuineIdleZero(t *testing.T) {
 	if snapshot.present {
 		t.Fatal("absent queue reported present; callers would render a fabricated ledger")
 	}
-	if snapshot.outstanding != 0 || snapshot.outstandingJobs != 0 || snapshot.adopted != 0 || snapshot.adoptedJobs != 0 {
+	if snapshot.outstanding != 0 || snapshot.outstandingJobs != 0 {
 		t.Fatalf("absent queue reported non-zero totals: %+v", snapshot)
 	}
-	if snapshot.scopeJobs != 0 || snapshot.reservationJobs != 0 || snapshot.vanishedJobs != 0 {
+	if snapshot.scopeJobs != 0 || snapshot.reservationJobs != 0 {
 		t.Fatalf("absent queue reported a non-zero split: %+v", snapshot)
 	}
 	if snapshot.residualJobs() != 0 || snapshot.residualBytes() != 0 {
@@ -147,28 +146,8 @@ func TestAdmitSnapshotAbsentQueueStaysAGenuineIdleZero(t *testing.T) {
 	}
 }
 
-// verifies: vanishedJobs/vanishedBytes are a SUBSET of the scope-backed
-// population, not a fourth one — the split must still sum to the totals, or the
-// residual cross-check above would cry wolf on every vanished lease.
-func TestAdmitSnapshotVanishedLeasesRemainInsideTheScopeBackedPopulation(t *testing.T) {
-	server := NewServer(Paths{})
-	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
-	live := populationTestWaiter(1, 2<<30, populationTestScopeID("live", 101))
-	live.scopeSeen = true
-	gone := populationTestWaiter(2, 4<<30, populationTestScopeID("gone", 102))
-	gone.scopeSeen, gone.scopeVanished = true, true
-	queue.waiters = []*admitWaiter{live, gone}
-	queue.outstanding, queue.outstandingJobs = 6<<30, 2
-	server.admitQueues["/slice"] = queue
-
-	snapshot := server.admitSliceSnapshot("/slice")
-	if snapshot.vanishedJobs != 1 || snapshot.vanishedBytes != 4<<30 {
-		t.Errorf("vanished = %d jobs / %d bytes, want 1 / %d", snapshot.vanishedJobs, snapshot.vanishedBytes, int64(4<<30))
-	}
-	if snapshot.scopeJobs != 2 || snapshot.scopeBytes != 6<<30 {
-		t.Errorf("scope-backed = %d jobs / %d bytes, want 2 / %d — a vanished lease is still a scope-backed lease", snapshot.scopeJobs, snapshot.scopeBytes, int64(6<<30))
-	}
-	if snapshot.residualJobs() != 0 || snapshot.residualBytes() != 0 {
-		t.Errorf("vanished leases broke the split sum: jobs=%d bytes=%d", snapshot.residualJobs(), snapshot.residualBytes())
-	}
-}
+// S14 retired TestAdmitSnapshotVanishedLeasesRemainInsideTheScopeBackedPopulation
+// with the cgroup scan: the vanishedJobs/vanishedBytes snapshot sub-population was
+// derived from the scan's scopeVanished bit, which no longer exists. The
+// scope/reservation split and the residual cross-check it rode alongside are
+// pinned by the tests above.

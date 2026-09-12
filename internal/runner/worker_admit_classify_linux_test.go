@@ -402,8 +402,7 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 	t.Run("an advisory ledger-only grant survives the JSON hop", func(t *testing.T) {
 		raw := []byte(`{"state":"granted","class":"granted","worker_id":"7",` +
 			`"containment":"` + WorkerAdmitContainmentAdvisory + `","reserved":104857600,` +
-			`"swap_cap":"` + WorkerAdmitSwapCapNotApplicable + `",` +
-			`"cpu_slots":"` + WorkerAdmitCPUSlotsUnevaluated + `"}`)
+			`"swap_cap":"` + WorkerAdmitSwapCapNotApplicable + `"}`)
 		socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
 			return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: raw}
 		})

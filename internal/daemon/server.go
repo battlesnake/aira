@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,9 +13,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aira/internal/app"
@@ -71,14 +72,21 @@ type Server struct {
 	discoveryFailed map[string]struct{}
 	// stopping closes when Serve stops accepting. Watch handlers observe it
 	// directly so their terminal event drain remains distinct from peer-close.
-	stopping                     chan struct{}
-	watchSlots                   chan struct{}
-	watchPollInterval            time.Duration
-	admitSlots                   chan struct{}
-	admitPollInterval            time.Duration
-	workerAdmitPollInterval      time.Duration
-	admitBackfillGrace           time.Duration
-	admitFreezeMaxHold           time.Duration
+	stopping           chan struct{}
+	watchSlots         chan struct{}
+	watchPollInterval  time.Duration
+	admitSlots         chan struct{}
+	admitPollInterval  time.Duration
+	admitBackfillGrace time.Duration
+	admitFreezeMaxHold time.Duration
+	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
+	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
+	// space by a new admission); injectable (default 2s) so tests drive timing via the
+	// fake clock + restartAfter seam, never a real sleep. restartFreezeUntilNanos is the
+	// freeze-end wall-clock UnixNano armed at listen-ready (0 = unarmed); it is atomic
+	// because a concurrent evaluator pass may read it while listen-ready arms it.
+	restartFreeze                time.Duration
+	restartFreezeUntilNanos      atomic.Int64
 	admitRegistryMu              sync.Mutex
 	admitQueues                  map[string]*sliceQueue
 	admitPriorMu                 sync.Mutex
@@ -87,33 +95,15 @@ type Server struct {
 	admitPriorAt                 time.Time
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
-	// AIRA-29 dynamic reserve. Server fields rather than package globals so a
-	// test can pin the arithmetic; see the constants and rationale in admit.go.
-	//
-	// dynamicReserve is the operational KILL SWITCH, and it exists because this
-	// change deliberately accepts a new bounded over-subscription on a shared,
-	// machine-wide slice that every session on the box depends on. Turning it off
-	// must not require rebuilding and redeploying a daemon under load at the
-	// moment it is misbehaving: AIRA_DAEMON_DYNAMIC_RESERVE=disabled plus a
-	// restart reverts the WHOLE of AIRA-29 -- the live charge and the adoption
-	// margin both -- back to the frozen-reserve behaviour.
-	dynamicReserve        bool
-	chargeMarginFloor     int64
-	chargeMarginPct       int64
-	chargeColdFloorWindow time.Duration
-	// AIRA-114. The aggregate over-subscription bound, as an integer percentage
-	// of the slice ceiling (200 = 2x). Zero disables the bound entirely and
-	// restores AIRA-29's unbounded aggregate.
-	//
-	// It is BOTH the tuning knob and the kill switch, deliberately as one
-	// setting: AIRA_DAEMON_OVERSUBSCRIPTION_FACTOR=disabled is the operational
-	// escape hatch for a daemon already under load, and a second boolean beside
-	// the factor would make "off" expressible two ways that could disagree.
-	oversubscriptionFactorPct int64
 
-	workerScopesMu         sync.Mutex
-	workerScopes           map[string]*workerScopeState
-	workerAdmitHeadroom    int64
+	// workerScopesMu / workerScopes are the per-outer-scope worker-id allocator
+	// (S15). Since the RAM/CPU accounting moved to the unified signed ledger, this
+	// holds only the id counter — no committed sum, no supervisor-RSS guard.
+	workerScopesMu sync.Mutex
+	workerScopes   map[string]*workerScopeState
+	// shimWorkerSeq mints synthetic ids for ci-shim worker leases (advisory, no
+	// cgroup tree to re-seed from), keying each in the same unified ledger.
+	shimWorkerSeq          atomic.Uint64
 	scopeReapGrace         time.Duration
 	staleLeaseReleaseGrace time.Duration
 
@@ -123,21 +113,6 @@ type Server struct {
 	// admission lock at the time. The value is a plain struct copied in and out.
 	sliceCeilingMu    sync.RWMutex
 	sliceCeilingState sliceCeilingSnapshot
-
-	// AIRA-64. The CPU-concurrency gate: one machine-wide bound on how many
-	// aitest workers run at once, evaluated inside worker-admit. cpuSlotsGate
-	// is a 1-buffered channel rather than a sync.Mutex so a waiter can abandon
-	// it when its peer disconnects, the daemon stops, or the request declared
-	// itself speculative (max_wait_ms == 0) — the same abandonable shape
-	// acquireWorkerScope uses, and for the same reason.
-	cpuSlotsCapacity     int
-	cpuSlotsGrace        time.Duration
-	cpuSlotsScanInterval time.Duration
-	cpuSlotsGate         chan struct{}
-	cpuSlotsMu           sync.Mutex
-	cpuSlotsCache        map[string]cpuSlotsCacheEntry
-	cpuSlotsWarned       map[string]struct{}
-	cpuSlotsScan         func(string) (cpuSlotsSnapshot, error)
 
 	// Test seams. Production always calls the Store methods and DB.Close.
 	reapScope         func(context.Context, *store.Store) (int, error)
@@ -153,15 +128,6 @@ type Server struct {
 	// to fake a limit the ledger never consults, and vice versa. Nil in
 	// production, which resolves to readSliceMemoryHigh.
 	admitReadMemoryHigh func(string) (int64, string)
-	// admitReadWorkerSupervisorMemory is a SEPARATE seam from admitReadMemory
-	// above: the aggregate guard's supervisor-scope read (worker_admit.go)
-	// must tolerate an uncapped memory.max (the supervisor's scope is never
-	// individually capped by design), which admitReadMemory's default
-	// (readSliceMemory) deliberately refuses to do for the OUTER-scope
-	// ledger read's own safety precondition. Defaults to
-	// readWorkerSupervisorMemory.
-	admitReadWorkerSupervisorMemory func(string) (int64, int64, bool, string)
-	admitConfineScan                func(string) (runner.ConfineListResult, error)
 	// AIRA-121. confineMode is runner.ConfineModeReal or ConfineModeShim, and
 	// shimBudget is the recorded container RAM budget the ledger admits against
 	// in shim mode. Both are resolved once, in Serve, from the durable
@@ -169,11 +135,6 @@ type Server struct {
 	// launch path in a shim-installed home yields a shim daemon.
 	confineMode string
 	shimBudget  shimBudget
-	// AIRA-123. The ci-shim per-WORKER admission ledger (worker_admit_shim.go).
-	// Distinct from shimBudget, which is the container-wide ceiling both this
-	// ledger and ordinary job admission draw against.
-	shimWorkers              shimWorkerLedger
-	admitConfineScanInterval time.Duration
 	// shimReadMemTotal / shimReadMemAvailable are readShimMemory's host-wide
 	// /proc/meminfo seams (AIRA-121 F3). Nil in production, which resolves to
 	// the package funcs readMemTotal/readMemAvailable; a test injects a
@@ -188,22 +149,27 @@ type Server struct {
 	// depending on this host's real, ever-moving CPU counters and core count.
 	readCPUFrame func(string) runner.ConfineCPUFrame
 	readCPUCores func() int
-	// workerScopeScan / workerScopeCreate are the worker-admit ledger's two
-	// cgroupfs seams (AIRA-39). Production uses scanWorkerScopeChildren and
-	// runner.CreateWorkerScope; tests substitute fakes so the ledger's
-	// arithmetic is exercised without a real delegated cgroup.
-	workerScopeScan         func(string) (workerScopeChildren, error)
-	workerScopeCreate       func(context.Context, string, string, int64) (string, string, error)
-	workerScopeScanInterval time.Duration
-	admitNow                func() time.Time
-	admitAfter              func(time.Duration) <-chan time.Time
-	admitWriteFrame         func(net.Conn, any) error
-	admitBeforeWrite        func(*admitWaiter)
-	admitPeakHistory        func(context.Context, string) (runner.PeakRSSStats, error)
-	admitPeakP90            func(context.Context) (int64, bool, error)
-	peerCredential          func(net.Conn) (int, int, error)
-	storeOpAppendTimeout    time.Duration
-	storeOpHeavyTimeout     time.Duration
+	// workerScopeMaxIndex / workerScopeCreate are worker-admit's two cgroupfs seams
+	// (S15). workerScopeMaxIndex is the SLIM readdir the worker-id allocator
+	// re-seeds from (production: scanWorkerMaxIndex); workerScopeCreate makes the
+	// per-worker sub-scope after a grant (production: runner.CreateWorkerScope).
+	// Tests substitute fakes so the id allocation and grant flow run without a real
+	// delegated cgroup.
+	workerScopeMaxIndex func(string) (int, error)
+	workerScopeCreate   func(context.Context, string, string, int64) (string, string, error)
+	admitNow            func() time.Time
+	admitAfter          func(time.Duration) <-chan time.Time
+	// S13 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
+	// runRestartFreeze waits the freeze via this, and sharing admitAfter would cross-talk
+	// with a live admitConnection in a Serve-driven test. Nil → time.After.
+	restartAfter         func(time.Duration) <-chan time.Time
+	admitWriteFrame      func(net.Conn, any) error
+	admitBeforeWrite     func(*admitWaiter)
+	admitPeakHistory     func(context.Context, string) (runner.PeakRSSStats, error)
+	admitPeakP90         func(context.Context) (int64, bool, error)
+	peerCredential       func(net.Conn) (int, int, error)
+	storeOpAppendTimeout time.Duration
+	storeOpHeavyTimeout  time.Duration
 	// deadlines is the transport's one deadline convention (AIRA-84); see
 	// deadlines.go. It replaces the former storeOpWriteTimeout field and the
 	// hardcoded connect stamp, which were two independent numbers for one
@@ -217,46 +183,23 @@ type Server struct {
 }
 
 func NewServer(paths Paths) *Server {
-	capacity, err := desiredCPUSlots(runtime.NumCPU())
-	if err != nil {
-		// Serve reports the malformed setting before accepting requests. Keep a
-		// safe constructor default for unit tests which do not call Serve.
-		capacity = 1
-	}
 	server := &Server{
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, ejecting: map[string]struct{}{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		projectUses: map[string]int{},
 		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
 		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
+		restartFreeze:                defaultRestartFreeze,
 		admitQueues:                  map[string]*sliceQueue{},
-		admitConfineScanInterval:     admitConfineScanIntervalDefault,
-		workerScopeScanInterval:      workerScopeScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
-		dynamicReserve:               true,
-		chargeMarginFloor:            chargeMarginFloorDefault,
-		chargeMarginPct:              chargeMarginPctDefault,
-		chargeColdFloorWindow:        chargeColdFloorWindowDefault,
-		oversubscriptionFactorPct:    oversubscriptionFactorPctDefault,
-		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
 		staleLeaseReleaseGrace:       defaultStaleLeaseReleaseGrace,
 		storeOpAppendTimeout:         30 * time.Second,
 		storeOpHeavyTimeout:          5 * time.Minute,
 		deadlines:                    defaultDeadlines,
-		cpuSlotsCapacity:             capacity,
-		cpuSlotsGrace:                cpuSlotsPlacementGrace(),
-		cpuSlotsScanInterval:         admitConfineScanIntervalDefault,
-		cpuSlotsGate:                 make(chan struct{}, 1),
-		cpuSlotsCache:                map[string]cpuSlotsCacheEntry{},
-		cpuSlotsWarned:               map[string]struct{}{},
-		cpuSlotsScan:                 scanSliceWorkerScopes,
 	}
 	server.projectCond = sync.NewCond(&server.mu)
-	// One scan entry point, mode-aware (AIRA-121). Assigned after the literal
-	// because it closes over the server it belongs to.
-	server.admitConfineScan = server.confineScan
 	server.confineMode = runner.ConfineModeReal
 	return server
 }
@@ -325,9 +268,9 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		//                     convenient, since that sweep's release gate is a proof of
 		//                     cgroup emptiness it can never obtain here.
 		//
-		// The admission confine scan is NOT in this list: it stays live and returns
-		// a true empty result (Server.confineScan), because the ledger's accounting
-		// pass legitimately runs and legitimately finds no scopes.
+		// (S14 removed the periodic admission confine scan entirely; there is no
+		// longer a scan seam to leave live in either mode. Emptiness is derived from
+		// the signed ledger.)
 		watchdogMode = watchdogOff
 		sliceCeilingMode = sliceCeilingOff
 		steerMode = oomSteerOff
@@ -355,16 +298,6 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.admitFreezeMaxHold = admitFreezeMaxHold
-	dynamicReserve, err := dynamicReserveFromEnv()
-	if err != nil {
-		return err
-	}
-	s.dynamicReserve = dynamicReserve
-	oversubscriptionFactorPct, err := oversubscriptionFactorFromEnv()
-	if err != nil {
-		return err
-	}
-	s.oversubscriptionFactorPct = oversubscriptionFactorPct
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one
@@ -403,22 +336,6 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if err := writeLockInfo(lock); err != nil {
 		return err
 	}
-	desiredSlots, slotErr := desiredCPUSlots(runtime.NumCPU())
-	if slotErr == nil {
-		// AIRA-64: the worker-admit CPU gate is the sole owner of this capacity
-		// since AIRA-33 deleted the daemon scheduler that used to share it. A
-		// malformed setting leaves NewServer's safe capacity-1 fallback in place
-		// and is reported by the branch below.
-		s.cpuSlotsMu.Lock()
-		s.cpuSlotsCapacity = desiredSlots
-		s.cpuSlotsMu.Unlock()
-	}
-	s.cpuSlotsGrace = cpuSlotsPlacementGrace()
-	if slotErr != nil {
-		// NewServer installed the safe capacity-1 fallback, so the worker-admit
-		// CPU gate is still enforcing. Do not claim it was disabled.
-		log.Printf("aira daemon: worker-admit CPU gate using safe capacity-1 fallback (config error: %v)", slotErr)
-	}
 	if err := os.Remove(s.Paths.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -439,6 +356,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			returnErr = err
 		}
 	}()
+	// S13 restart recovery (design §4). The fresh daemon opens an EMPTY ledger; there is
+	// no dump to reload. Survivors' keepers reconnect within the freeze armed at
+	// listen-ready below and re-declare their leases (establish-granted, S9), re-anchoring
+	// their RAM/CPU. The freeze bounds the physical over-admit window until they do.
 	listener, err := net.Listen("unix", s.Paths.SocketPath)
 	if err != nil {
 		return err
@@ -453,6 +374,13 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			_ = os.Remove(s.Paths.SocketPath)
 		}
 	}()
+	// S13 restart freeze (design §4): armed at listen-ready, BEFORE s.Ready fires (so a
+	// harness that waits on Ready observes it armed) and before the accept loop. It
+	// freezes NEW admissions for restartFreeze so a survivor's re-declare is not beaten
+	// to its space by a new admission; runRestartFreeze (spawned in the goroutine region
+	// below) wakes the queues at freeze-end. restartFreezeUntilNanos is atomic — a
+	// concurrent evaluator pass may read it while this arms it.
+	s.armRestartFreeze(s.admitNowTime())
 	reaperCtx, cancelReaper := context.WithCancel(ctx)
 	reaperDone := make(chan struct{})
 	go func() {
@@ -525,12 +453,12 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		s.runSliceCeiling(sliceCeilingCtx, sliceCeilingMode, sliceCeilingInterval, sliceCeilingRuntimeDeps)
 	}()
 	// AIRA-113. The dynamic oom_score_adj steering loop. Deliberately NOT beside
-	// the two above on their shared cadence: it must sample faster than the
-	// admission charge refresh to see the burst the ledger has not yet absorbed,
-	// which is the whole reason AIRA-29 could not fold it into the admit scan.
-	// Like the ceiling it holds no admission lock while it works, and unlike the
-	// watchdog it never signals anything -- it only changes which process the
-	// kernel would prefer if an OOM happened anyway.
+	// the two above on their shared cadence: it must sample memory.current faster
+	// than a burst can drive the slice into an OOM, and the admission scan reads
+	// only declared reserves, so folding it into the admit scan would sample too
+	// slowly to catch the over-use. Like the ceiling it holds no admission lock
+	// while it works, and unlike the watchdog it never signals anything -- it only
+	// changes which process the kernel would prefer if an OOM happened anyway.
 	steerCtx, cancelOOMSteer := context.WithCancel(ctx)
 	steerDone := make(chan struct{})
 	steerRuntimeDeps := oomSteerDeps{}
@@ -540,6 +468,16 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	go func() {
 		defer close(steerDone)
 		s.runOOMSteer(steerCtx, steerMode, steerInterval, steerRuntimeDeps)
+	}()
+	// S13 restart-recovery timer (design §4 gate P1-A). At freeze-end it wakes every
+	// queue so a waiter blocked PURELY by the restart freeze re-evaluates at once rather
+	// than at the next poll tick. Cancelled on shutdown. (S13 removed the second phase —
+	// the unanchored-drop — with the dump layer.)
+	restartFreezeCtx, cancelRestartFreeze := context.WithCancel(ctx)
+	restartFreezeDone := make(chan struct{})
+	go func() {
+		defer close(restartFreezeDone)
+		s.runRestartFreeze(restartFreezeCtx)
 	}()
 
 	var connections sync.WaitGroup
@@ -570,6 +508,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			s.serveConnection(context.Background(), conn)
 		}()
 	}
+	// S13 removed the graceful lease dump: the fresh daemon starts empty and survivors'
+	// keepers re-declare (establish-granted, S9) to re-anchor their leases within the
+	// restart freeze. close(stopping) releases every held (anchored) lease via its
+	// connection handler — there are no unanchored leases to collect anymore.
 	close(stopping)
 	cancelReaper()
 	cancelFlusher()
@@ -578,6 +520,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelWatchdog()
 	cancelSliceCeiling()
 	cancelOOMSteer()
+	cancelRestartFreeze()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
@@ -590,6 +533,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		<-watchdogDone
 		<-sliceCeilingDone
 		<-steerDone
+		<-restartFreezeDone
 		close(drained)
 	}()
 	timeout := s.DrainTimeout
@@ -733,7 +677,41 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	// Rule (1) of the deadline convention (deadlines.go): this bounds the
 	// HANDSHAKE — reading and parsing the inbound frame — and nothing else.
 	_ = conn.SetDeadline(time.Now().Add(s.resolvedDeadlines().Connect))
-	request, storeOp, err := readInboundFrame(conn)
+	// S7 magic sniff. Read the first 4 bytes and, if they are the frozen ARDR
+	// re-declare magic, route to the re-declare path BEFORE the normal frame
+	// parse and BEFORE the protocol-version close below. That ordering is
+	// load-bearing (design §4, Invariant 8 / gate P1-5): a restart is usually an
+	// UPGRADE, so an OLD client re-declaring against this NEWER daemon must be
+	// parsed, never refused for version skew. The magic (~1.09 GB as a
+	// big-endian u32) is disjoint from every legal frame length (≤ MaxFrameBytes,
+	// 16 MB), so this sniff can never misread a normal frame's length header, and
+	// the normal parser can never misread the magic — see redeclare_frame.go.
+	//
+	// The 4 sniffed bytes are replayed into the normal reader for a non-magic
+	// connection, so readInboundFrame sees an unmodified stream. The sniff lives
+	// here rather than inside readInboundFrame because readInboundFrame cannot
+	// represent "this is a re-declare, not a request/store-op"; the ordering
+	// guarantee is identical.
+	var magic [4]byte
+	if _, err := io.ReadFull(conn, magic[:]); err != nil {
+		wrote = writeFrame(conn, errorFrame(CodeProtocol, fmt.Sprintf("%s: short inbound frame: %v", CodeProtocol, err))) == nil
+		return
+	}
+	inbound := io.Reader(io.MultiReader(bytes.NewReader(magic[:]), conn))
+	if magic == ardrMagic {
+		// S9 re-declare handler (design §3/§4). It SETs-or-ESTABLISHES the lease keyed
+		// by the frame's scope_id, writes the frozen 1-byte ack, and HOLDS the
+		// connection for the lease's lifetime — it sets and clears its OWN read deadline
+		// (this branch is BEFORE the handshake clear at the foot of the handshake below)
+		// and never closes a lease-bearing connection on error (Invariant 4); the lease
+		// is released only by this connection's own EOF. wrote=true suppresses the
+		// generic panic writer, exactly as the admit/worker-admit branches do, so it can
+		// never write after the handler has taken over the connection.
+		wrote = true
+		s.serveReDeclare(conn, inbound)
+		return
+	}
+	request, storeOp, err := readInboundFrame(inbound)
 	// The three rejections below are handshake failures, so they answer under
 	// the handshake deadline rather than through reply — see deadlines.go.
 	// Accepted consequence, unchanged from before this fix: a peer that spends
@@ -808,6 +786,14 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			s.OnRequest(request.Scope, request.Request)
 		}
 		wrote = s.reply(conn, responseFrame(s.confineManagement(ctx, request.Request)))
+		return
+	}
+	// AIRA (admission-counter rebuild) S18.
+	if verb == "confine-dump" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = s.reply(conn, responseFrame(s.confineDump(request.Request.Args)))
 		return
 	}
 	if verb == "eject" {
@@ -906,6 +892,132 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	// a big subject, a reconcile --rebuild) committed durably and then failed
 	// the response write, which the client can only report as OUTCOME_UNKNOWN.
 	wrote = s.reply(conn, responseFrame(response))
+}
+
+// serveReDeclare is the S9 ARDR re-declare handler (design §3 compare-and-release,
+// §4 daemon-restart). A sniffed ARDR frame SETs-or-ESTABLISHES the lease keyed by its
+// scope_id, replies the frozen 1-byte ack, and HOLDS the connection for the lease's
+// lifetime. It never closes a lease-bearing connection on error (Invariant 4); the lease
+// is released ONLY by this connection's own EOF, through compare-and-release on the same
+// conn identity passed to both the SET and the release.
+//
+// It replaces the S7 stub (which parsed + acked but charged nothing). The frame's
+// charge() is routed STRAIGHT to the idempotent SET (enqueueReDeclare), NOT through
+// admitConnection's front half: that path's cpu>ceiling fail-fast, fail-closed memory
+// read, and reserve>ceiling TooLarge gate all violate Invariant 6 for a re-declare,
+// which is always accepted (design §4 re-declare window — `available` may go negative).
+//
+// inbound already replays the 4 sniffed magic bytes, so decodeReDeclareFrame re-reads
+// and re-verifies the magic — symmetric with the encoder and with the dump reader
+// S10/S11 reuse.
+func (s *Server) serveReDeclare(conn net.Conn, inbound io.Reader) {
+	// (3) Own read deadline bounding the frame-BODY read. The handshake Connect deadline
+	// set in serveConnection covered only the 4-byte magic sniff; this handler owns the
+	// connection from here. The body is small and bounded (maxReDeclareFrameBytes).
+	_ = conn.SetReadDeadline(time.Now().Add(s.resolvedDeadlines().Connect))
+	rec, err := decodeReDeclareFrame(inbound)
+	if err != nil {
+		// TOTAL parser: a malformed frame is a hard, LOGGED reject. This is a REFUSE —
+		// NO lease is anchored to this connection — so the deferred conn.Close() in
+		// serveConnection ending it is correct (Invariant 4 governs lease-BEARING
+		// connections only) and there is no waiter to release. No ack: the peer reads EOF.
+		log.Printf("aira daemon: re-declare: rejecting malformed ARDR frame: %v", err)
+		return
+	}
+	// (P1, the subtle one) CLEAR the read deadline NOW — before credential resolution,
+	// the enqueue, and watchPeerEOF. The deadline exclusively covered the frame body;
+	// everything below runs with no read deadline, exactly as admitConnection does after
+	// serveConnection's AIRA-84 handshake clear. If this clear is missing, the held
+	// connection's blocking 1-byte EOF read (watchPeerEOF) TIMES OUT at the body-read
+	// deadline, fires peerCtx, and drops a LIVE lease.
+	_ = conn.SetReadDeadline(time.Time{})
+	charge := redeclareChargeOf(rec)
+
+	// (2) Resolve the anchor inputs from THIS connection; (6) SO_PEERCRED same-uid gate,
+	// fail-CLOSED on an unreadable credential (peerSameUID stays false), NO cgroup-
+	// membership check — a confine/aitest holder lawfully lives OUTSIDE its own scope, so
+	// a scope→cgroup-membership check would reject every legitimate re-declare. conn is
+	// carried to BOTH the SET/establish and the release so compare-and-release keys on
+	// this one connection's identity.
+	request := admitRequest{
+		scopeID:       charge.ScopeID,
+		cpu:           charge.CPU,
+		parentScopeID: charge.ParentScopeID,
+		conn:          conn,
+	}
+	if uid, pid, credErr := s.peerCredentialOf(conn); credErr == nil {
+		request.peerSameUID = uid == os.Geteuid()
+		if pid > 0 {
+			request.clientPID = pid
+			if tick, ok, _ := readProcStartTime(pid); ok {
+				request.processStartTick = tick
+			}
+		}
+	}
+
+	// The frozen frame carries NO slice (design §4), so under the one-slice assumption
+	// (D1: aira.slice) the DEFAULT slice is resolved. S10's dump and S11's reload INHERIT
+	// this: a reloaded lease must resolve to the SAME queue a re-declare targets, or the
+	// two land in different queues. A daemon that cannot resolve its own slice cannot
+	// locate the ledger at all — REFUSE (no ack; the client reconnects, S13).
+	//
+	// NOT acquireAdmitSlot-gated, deliberately: a crash-restart re-declare BURST must
+	// never be refused CodeBusy (Invariant 6 — that would drop live leases). The held
+	// count is already bounded because each of these leases was admission-slotted before
+	// the crash; re-declaring them reclaims space the ledger already forgot.
+	path, ok, reason := s.sliceResolver()(runner.DefaultConfineSlice)
+	if !ok {
+		log.Printf("aira daemon: re-declare for scope %q: slice unresolved (%s); refusing", charge.ScopeID, reason)
+		return
+	}
+
+	// (1) charge() straight to the SET/establish. basis is a non-empty diagnostic label
+	// (validRunnerAdmitGrant requires non-empty, were this lease ever framed by a later
+	// plain re-anchor); it participates in no admission decision and no prefix classifier.
+	queue, waiter, code, enqueueErr := s.enqueueReDeclare(path, charge.RAM, "redeclare", request)
+	if enqueueErr != nil {
+		// (4) A REFUSE (not-owner / queued-or-rejected dup / exclusive): NO lease is
+		// anchored to this connection, so there is no waiter to release — releasing a nil
+		// waiter would nil-deref — and closing the connection (deferred, in
+		// serveConnection) is correct. No ack: the peer reads EOF. release is defined
+		// ONLY past this point, so the refuse path can never reach it.
+		log.Printf("aira daemon: re-declare for scope %q refused: %s: %v", charge.ScopeID, code, enqueueErr)
+		return
+	}
+
+	// From here the connection is LEASE-BEARING (re-anchored or freshly established): it
+	// must be HELD, never closed on error, and released ONLY by its own EOF via
+	// compare-and-release (waiter.anchor == conn).
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
+	}
+	peerCtx, cancelPeer := watchPeerEOF(conn)
+	defer cancelPeer()
+	defer release()
+
+	// Frozen 1-byte ack. (5) An ack-write FAILURE must NOT release the lease: a write
+	// error on a 1-byte frame ≈ the peer is gone, but the release is EOF-keyed, not
+	// write-keyed (design §3). So do NOT return here — fall through to the hold; the
+	// peer's EOF then fires peerCtx and the deferred release discharges through the
+	// anchor gate. Returning on the write error would run the deferred release
+	// immediately and drop a lease whose EOF had not yet reported it gone.
+	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
+	if _, werr := conn.Write([]byte{reDeclareAckByte}); werr != nil {
+		log.Printf("aira daemon: re-declare ack write for scope %q failed: %v", charge.ScopeID, werr)
+	}
+
+	// Hold the lease until the holder's EOF or graceful shutdown. On <-s.stopping the
+	// handler returns and the deferred release DISCHARGES the ledger — so S10's dump MUST
+	// snapshot granted leases BEFORE close(stopping), or a held lease is lost from the dump.
+	select {
+	case <-peerCtx.Done():
+	case <-s.stopping:
+	}
 }
 
 func readInboundFrame(r io.Reader) (*RequestFrame, *StoreOpFrame, error) {

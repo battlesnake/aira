@@ -330,31 +330,33 @@ func TestAdmitFreezeUnreadableSliceDoesNotDisturbThePhase(t *testing.T) {
 	waitAdmitGrant(t, fitting)
 }
 
-// verifies: AIRA-59 — Sigma(reserve) <= cap-headroom survives a yield even when
-// the ADOPTED ledger dominates the charge. The plain ledger assertion alone can
-// pass an implementation that ignores adopted entirely, so this is the case that
-// actually guards against over-admitting and OOM-ing a neighbour.
-func TestAdmitFreezeYieldRespectsCeilingWhenAdoptedDominates(t *testing.T) {
+// verifies: AIRA-59 — Σ(reserve) ≤ cap-headroom survives a yield. A trailing
+// candidate that does NOT fit even after the yield must stay queued, so the
+// backfill cannot be an implementation that skips the per-candidate fit test.
+// Pre-S12 this guarded the scan-adopted ledger addend; S12 deleted adoption, so
+// the dominant pre-existing charge is now a connection-held granted lease — the
+// only reserve accounting that remains — and the guard is unchanged in substance.
+func TestAdmitFreezeYieldRespectsCeilingWhenOutstandingDominates(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	current := int64(0)
 	now := time.Unix(13000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
 	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
-	head := queuedWaiter(1, 95, now.Add(-10*time.Second))
-	small := queuedWaiter(2, 30, now)
+	// A granted lease already holds 60 of the 100-byte slice: this is what makes
+	// the head unfittable (available = 100 - 60 = 40 < 95).
+	held := &admitWaiter{seq: 1, reserve: 60, state: admitGranted, accounted: true}
+	head := queuedWaiter(2, 95, now.Add(-10*time.Second))
+	small := queuedWaiter(3, 30, now)
 	// A trailing waiter that does NOT fit even after the yield. Without it, an
 	// implementation that skipped the fit test for backfill candidates would still
 	// pass, because every remaining candidate happened to fit.
-	tooBig := queuedWaiter(3, 50, now)
-	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small, tooBig}}
-	// Adopted (not live RSS) is what makes the head unfittable here.
-	queue.adopted = 60
-	queue.adoptedJobs = 1
-	queue.adoptedAt = now
-	server.admitConfineScanInterval = time.Hour
+	tooBig := queuedWaiter(4, 50, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{held, head, small, tooBig}, outstanding: 60, outstandingJobs: 1}
 
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, small)
@@ -362,16 +364,15 @@ func TestAdmitFreezeYieldRespectsCeilingWhenAdoptedDominates(t *testing.T) {
 	now = now.Add(61 * time.Second)
 	server.evaluateAdmitQueue(queue)
 
-	// available = 100 - (adopted 60) = 40, so the 30 fits and nothing more may.
+	// available = 100 - outstanding 60 = 40, so the 30 fits and nothing more may.
 	waitAdmitGrant(t, small)
 	requireAdmitQueued(t, tooBig)
-	charge := queue.outstanding + queue.adopted
-	ceiling := maximum.Load() - server.admitSliceHeadroom(queue.outstandingJobs+queue.adoptedJobs+1)
-	if charge > ceiling {
-		t.Fatalf("yield over-admitted against adopted: outstanding=%d adopted=%d charge=%d ceiling=%d", queue.outstanding, queue.adopted, charge, ceiling)
+	ceiling := maximum.Load() - server.admitSliceHeadroom(queue.outstandingJobs+1)
+	if queue.outstanding > ceiling {
+		t.Fatalf("yield over-admitted: outstanding=%d ceiling=%d", queue.outstanding, ceiling)
 	}
-	if queue.outstanding != 30 {
-		t.Fatalf("outstanding=%d, want exactly the one granted 30", queue.outstanding)
+	if queue.outstanding != 90 {
+		t.Fatalf("outstanding=%d, want 90 (held 60 + the one granted 30)", queue.outstanding)
 	}
 }
 
@@ -442,21 +443,9 @@ func TestValidateAdmitArgsRefusesOverCeilingWaitAndNamesTheCeiling(t *testing.T)
 	}
 }
 
-// verifies: AIRA-58/AIRA-63 — the daemon and worker-admit ceilings are
-// deliberately DIFFERENT, and worker-admit's is the smaller one. AIRA-63 has
-// given worker-admit the admitSlots bound it lacked, so the ceilings COULD now
-// be unified — but that is deliberately left to its own change: raising
-// worker-admit's ceiling 48x changes how long a saturated aitest run may hold
-// slots that ordinary admission also draws from. A "consistency" refactor that
-// unifies them as a side effect must still fail here.
-func TestWorkerAdmitCeilingStaysBelowTheSharedAdmitCeiling(t *testing.T) {
-	if workerAdmitWaitCeilingMs >= admitWaitCeilingMs {
-		t.Fatalf("worker-admit ceiling %d must stay below the shared admit ceiling %d until the unification is made deliberately", workerAdmitWaitCeilingMs, admitWaitCeilingMs)
-	}
-	if workerAdmitWaitCeilingMs != int64(30*time.Minute/time.Millisecond) {
-		t.Fatalf("worker-admit ceiling = %d ms, want 30m until the ceilings are unified in their own change", workerAdmitWaitCeilingMs)
-	}
-}
+// S15 deleted TestWorkerAdmitCeilingStaysBelowTheSharedAdmitCeiling: worker-admit
+// no longer has a wait ceiling at all — a worker CLAIM is a blocking lease with no
+// daemon-side timeout (design §4/§6), exactly like the confine admit path.
 
 // verifies: AIRA-59 — the freeze hold is configurable and fails closed on a
 // malformed setting, following the admitBackfillGrace precedent exactly.

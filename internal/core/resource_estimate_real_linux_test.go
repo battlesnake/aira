@@ -67,7 +67,12 @@ func TestRealCgroupPeakRSSHistoryDrivesEstimatedAdmission(t *testing.T) {
 	// The stamped reserve must be EXACTLY the estimate computed from queried
 	// history — not an arbitrary value, and not the static headroom. This rejects
 	// an implementation that stamps `estimate:*` while enforcing/recording something else.
-	if estimated.Admission != "immediate" || *estimated.AdmissionReserve != wantReserve || estimated.AdmissionReserveBasis != wantBasis {
+	//
+	// S13: there is no daemon in this fixture and the flock fallback is deleted, so
+	// the admission STATE is "unevaluated" (a no-daemon launch runs ungoverned). The
+	// estimate is stamped regardless — it is the reserve the client resolved and
+	// would request — which is exactly the property under test.
+	if estimated.Admission != "unevaluated" || *estimated.AdmissionReserve != wantReserve || estimated.AdmissionReserveBasis != wantBasis {
 		t.Fatalf("stamped reserve/basis must equal the estimate from queried history: got admission=%q reserve=%d basis=%q want reserve=%d basis=%q (stats=%+v)",
 			estimated.Admission, *estimated.AdmissionReserve, estimated.AdmissionReserveBasis, wantReserve, wantBasis, stats)
 	}

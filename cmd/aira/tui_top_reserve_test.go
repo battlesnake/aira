@@ -127,11 +127,11 @@ func TestTopBarRendersAnUnestablishedReserveAsUnevaluatedNeverTheCap(t *testing.
 	}
 }
 
-// "The used portion brighter", measured within the REAL reserve. The shading
+// The used portion drawn solid, measured within the REAL reserve. The split
 // mechanism itself is unchanged by AIRA-192 — it divides whatever Size it is
 // given — so this pins the thing that did change: which number Size is.
 //
-// Against the old cap-sourced Size the same job would draw a 1 GiB bright sliver
+// Against the old cap-sourced Size the same job would draw a 1 GiB used sliver
 // inside a 45 GiB region, reading as a nearly idle slice.
 func TestTopBarShadesUsageWithinTheRealReserve(t *testing.T) {
 	const (
@@ -146,10 +146,7 @@ func TestTopBarShadesUsageWithinTheRealReserve(t *testing.T) {
 		t.Fatalf("region size=%d, want the reserve %d", region.Size, int64(reserve))
 	}
 	if !region.UsedKnown || region.Used != rss {
-		t.Fatalf("used=%d known=%v, want the live %d shaded inside the reserve", region.Used, region.UsedKnown, int64(rss))
-	}
-	if region.ShadeColour == "" || region.ShadeColour == region.Colour {
-		t.Fatalf("shade colour=%q against base %q: the used portion must be distinguishable", region.ShadeColour, region.Colour)
+		t.Fatalf("used=%d known=%v, want the live %d drawn solid inside the reserve", region.Used, region.UsedKnown, int64(rss))
 	}
 }
 

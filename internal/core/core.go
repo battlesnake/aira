@@ -1792,7 +1792,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--admit-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1800,16 +1800,16 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
-			// AIRA-138. The three timeout-suffixed options are disambiguated HERE,
-			// in the generated help, because --admit-timeout was for a long time the
-			// only one and is exactly what an operator reaches for expecting a job
-			// bound. Each says where its clock starts.
-			stringSpec("timeout", false, false, "Positive wall-clock bound on the confined JOB, measured from the moment the job is released to run; excludes the admission wait (see --admit-timeout) and setup. The job is SIGKILLed through cgroup.kill, which reaches setsid'd descendants; the trailer's timeout= field says what the kill did. Unavailable in ci-shim mode, where there is no cgroup.kill to enforce it"),
+			// AIRA-138. The two timeout-suffixed options are disambiguated HERE, in the
+			// generated help, because --timeout reads as an overall deadline and is not
+			// one. Each says where its clock starts. (The admission WAIT was once bounded
+			// by --admit-timeout; S13 removed that flag — a blocking wait now ends on the
+			// grant or on interrupting the command, design §4/§6.)
+			stringSpec("timeout", false, false, "Positive wall-clock bound on the confined JOB, measured from the moment the job is released to run; excludes the admission wait and setup. The job is SIGKILLed through cgroup.kill, which reaches setsid'd descendants; the trailer's timeout= field says what the kill did. Unavailable in ci-shim mode, where there is no cgroup.kill to enforce it"),
 			stringSpec("cpu_timeout", false, false, "Positive cumulative CPU-time (user+system, whole scope subtree) bound on the confined JOB, measured from the same point as --timeout. Resolution is one 100ms sample, so it can only fire late. Unavailable in ci-shim mode, where there is no cpu.stat to measure"),
-			stringSpec("admit_timeout", false, false, "Positive bounded daemon admission wait. This bounds the ADMISSION WAIT ONLY, before the job starts — it is not a job deadline; see --timeout and --cpu-timeout"),
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
-			boolSpec("exclusive", false, false, "Run alone in the slice for uncontended benchmarking: stop admitting new jobs, let running ones finish, then run alone. Refuses rather than running non-exclusively; check $AIRA_CONFINE_EXCLUSIVE inside the job and exclusive= on the trailer. Bound the wait with --admit-timeout. Does NOT cover processes placed in the slice by hand, or Docker containers, which run outside it entirely. The trailer's peak-rss/cpu are whole-subtree hierarchical counters (aitest worker sub-scopes and a podman --cgroups=split child included); Docker containers are structurally outside the slice and are NOT counted"),
-			boolSpec("require_admission", false, false, "Fail closed: refuse to launch (a non-zero E_CONFINE_UNAVAILABLE) when the job was NOT admitted — memory admission unevaluated (slice unreadable, or a build-time ci-shim install with no runtime slice) or timed out — instead of running it UNGOVERNED and exiting 0. For CI or any unattended launch, where the single stderr warning has no reader. Opt-in; ordinary launches (and a real-slice daemon-restart window, which flock-admits) are unaffected"),
+			boolSpec("exclusive", false, false, "Run alone in the slice for uncontended benchmarking: stop admitting new jobs, let running ones finish, then run alone. Refuses rather than running non-exclusively; check $AIRA_CONFINE_EXCLUSIVE inside the job and exclusive= on the trailer. The wait ends when the slice is granted exclusively or you interrupt the command (Ctrl-C/SIGTERM). Does NOT cover processes placed in the slice by hand, or Docker containers, which run outside it entirely. The trailer's peak-rss/cpu are whole-subtree hierarchical counters (aitest worker sub-scopes and a podman --cgroups=split child included); Docker containers are structurally outside the slice and are NOT counted"),
+			boolSpec("require_admission", false, false, "Fail closed: refuse to launch (a non-zero E_CONFINE_UNAVAILABLE) when the job was NOT admitted — memory admission unevaluated (slice unreadable, or a build-time ci-shim install with no runtime slice) — instead of running it UNGOVERNED and exiting 0. For CI or any unattended launch, where the single stderr warning has no reader. Opt-in; ordinary launches are unaffected, and a daemon restart is waited out (the client reconnects and re-declares its lease) rather than degraded"),
 			boolSpec("detach", false, false, "Run session-independently; report the handle and poll it with confine --status"),
 			boolSpec("stdin_connect", false, false, "Give the DETACHED job a writable stdin (a per-job socket) so `aira confine-input <handle>` can send it bytes or close it. Requires --detach. OFF by default and deliberately so: without it a detached job's stdin is /dev/null and reads EOF immediately, whereas a connected-but-unwritten pipe blocks any job that touches stdin until someone connects"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
@@ -1823,7 +1823,6 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_high")
 			_ = stringArg(args, "timeout")
 			_ = stringArg(args, "cpu_timeout")
-			_ = stringArg(args, "admit_timeout")
 			_ = boolArg(args, "delegate_ram")
 			_ = boolArg(args, "exclusive")
 			_ = boolArg(args, "require_admission")
@@ -1843,19 +1842,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// It is deliberately NOT grouped into Operations: `wait` is its only
 		// operation, and a one-entry group would buy a discriminator and nothing
 		// else.
-		"drain": {Name: "drain", Usage: "drain wait [--timeout D] [--admit-timeout D] [--reason TEXT]", Args: []ArgSpec{
+		"drain": {Name: "drain", Usage: "drain wait [--timeout D] [--reason TEXT]", Args: []ArgSpec{
 			stringSpec("subverb", true, true, "Drain operation; the only one is `wait`", DrainWaitOperation),
-			// The two clocks are disambiguated HERE, in the generated help, because
-			// --timeout reads as an overall deadline and is not one. Each says where
-			// its clock starts and what it does NOT cover.
-			stringSpec("timeout", false, false, "Positive bound on the HELD duration ONLY, measured from the moment the hold begins. It does NOT bound the wait to be admitted — that is --admit-timeout, a separate budget defaulting to 30 minutes — so `drain wait --timeout 10s` can still queue far longer than 10s before its 10-second hold even starts. When it fires the hold is released by cgroup.kill and the exit code is confine's usual pass-through (137)"),
-			stringSpec("admit_timeout", false, false, "Positive bound on the ADMISSION WAIT ONLY: how long to wait for the slice to drain before giving up, defaulting to 30 minutes. It is not a hold duration; see --timeout"),
+			// --timeout is disambiguated HERE, in the generated help, because it reads
+			// as an overall deadline and is not one: it bounds only the HELD duration,
+			// not the wait to be admitted. (That wait was once bounded by --admit-timeout;
+			// S13 removed the flag — a blocking wait now ends on the grant or on
+			// interrupting the command, design §4/§6.)
+			stringSpec("timeout", false, false, "Positive bound on the HELD duration ONLY, measured from the moment the hold begins. It does NOT bound the wait to be admitted — that wait ends when the slice is granted exclusively or you interrupt the command (Ctrl-C/SIGTERM) — so `drain wait --timeout 10s` can still queue far longer than 10s before its 10-second hold even starts. When it fires the hold is released by cgroup.kill and the exit code is confine's usual pass-through (137)"),
 			stringSpec("reason", false, false, "Free-text label for WHY the slice is being held (\"deploy: slice-ceiling flip\"), rendered by `confine --list` and `aira top` so another blocked session can see what is going on. Diagnostic only: no admission decision reads it"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
 			_ = stringArg(args, "subverb")
 			_ = stringArg(args, "timeout")
-			_ = stringArg(args, "admit_timeout")
 			_ = stringArg(args, "reason")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: drain is a direct CLI-only foreground verb")
 		}},
@@ -1963,6 +1962,22 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "slice")
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-budget requires the project-less daemon transport")
+		}},
+		// AIRA (admission-counter rebuild) S18. A NEW verb, on the SAME
+		// project-less-history reasoning as confine-budget above: `aira confine
+		// --dump <file>` writes the daemon's admission/utilisation records as
+		// JSONL for a CI job to archive (design §12). CLI-only, like
+		// confine/confine-status/confine-reserve/drain (the exclusion list
+		// below): the file it writes belongs to the INVOKING process's own
+		// filesystem, which is not a meaningful concept for a remote MCP
+		// client. See cmd/aira/confine_dump.go for the atomic write.
+		"confine-dump": {Name: "confine-dump", Usage: "confine --dump <file> [--slice S] [--owner ID]", Args: []ArgSpec{
+			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, Summary: "Write the daemon's admission/utilisation records as JSONL for CI archival.", Safety: SafetyRead, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "slice")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-dump is a direct CLI-only verb")
 		}},
 		"confine-kill": {Name: "confine-kill", Usage: "confine --kill <name|supervisor-pid|scope-id> [--steal] [--slice S] [--owner ID]", Args: []ArgSpec{
 			stringSpec("selector", true, true, "Exact confine name, supervisor PID, or scope ID"),
@@ -2321,8 +2336,12 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
 		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change", safety: SafetyRead, example: []string{}},
-		"confine-kill":    {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
-		"confine-status":  {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
+		// AIRA (admission-counter rebuild) S18. CLI-only (see the Include
+		// exclusion list below): the target file belongs to the invoking
+		// process's own filesystem.
+		"confine-dump":   {summary: "Write the daemon's admission/utilisation records as JSONL for CI archival", safety: SafetyRead, example: []string{}},
+		"confine-kill":   {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
+		"confine-status": {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		// AIRA-196. Unlike confine/confine-status these ARE included: reading a
 		// captured file and writing to a job's stdin socket both have honest
 		// request/response forms, and an agent driving a detached gate needs them.
@@ -2417,7 +2436,11 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// AIRA-185 adds "drain" to the CLI-only exclusion list. See its descriptor:
 		// a foreground, connection-bound hold has no honest request/response form.
 		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive,
-			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "drain" && name != "install"
+			// AIRA S18 adds confine-dump to the CLI-only exclusion set: it writes a
+			// file on the invoking process's own filesystem, which a remote MCP
+			// client cannot meaningfully name, the same local-affinity reason
+			// confine/confine-status/confine-reserve/drain are excluded.
+			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "confine-dump" && name != "drain" && name != "install"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

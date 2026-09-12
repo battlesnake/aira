@@ -219,11 +219,11 @@ func TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender(t *testing.T) {
 	// small fraction of its own — over budget by far more than the overrun floor.
 	offender := &admitWaiter{
 		seq: 1, state: admitGranted, accounted: true, scopeID: offenderScope,
-		reserve: offenderRSS / 8, effectiveCharge: offenderRSS / 8, chargeTracked: true,
+		reserve: offenderRSS / 8,
 	}
 	compliant := &admitWaiter{
 		seq: 2, state: admitGranted, accounted: true, scopeID: compliantScope,
-		reserve: compliantRSS + (64 << 20), effectiveCharge: compliantRSS + (64 << 20), chargeTracked: true,
+		reserve: compliantRSS + (64 << 20),
 	}
 	server.admitQueues[slice] = &sliceQueue{path: slice, server: server, waiters: []*admitWaiter{offender, compliant}}
 
@@ -260,7 +260,7 @@ func TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender(t *testing.T) {
 	// RESTORE-DOWN, against the same real processes: once admission's charge
 	// covers the usage, the offender goes back to its own class baseline — not to
 	// the other class's, and not part-way.
-	offender.effectiveCharge = offenderRSS + (64 << 20)
+	offender.reserve = offenderRSS + (64 << 20)
 	evaluateOOMSteer(oomSteerEnforce, &state, deps)
 	if got := steerReadAdj(t, offenderPID); got != runner.ConfineOOMScoreAdj {
 		t.Fatalf("after the ledger caught up the offender carries oom_score_adj %d, want its class baseline %d", got, runner.ConfineOOMScoreAdj)
