@@ -84,10 +84,15 @@ type workerAdmitRequest struct {
 	estimatedBytes int64
 	// parentScopeID is the suite confine scope id this worker is a sub-reservation
 	// OF (design §16d). It is an EXPLICIT required wire field — the supervisor's own
-	// AIRA_CONFINE_SCOPE_ID, NOT derived from the outer-scope PATH — so a worker can
-	// never silently become a job: an empty one is refused, and a non-empty one must
-	// be parseConfineScopeID-parseable (the ci-shim sentinel exempt) so the daemon
-	// can copy the PARENT supervisor pid out of it for the worker scope name (Task 1).
+	// AIRA_CONFINE_SCOPE_ID, NOT derived from the outer-scope PATH. A worker DOES
+	// count as a job in outstandingJobs (rederiveLedgerLocked does jobs++ for every
+	// granted accounted waiter); what a non-empty parentScopeID marks is the
+	// SUB-RESERVATION — isSubReservation gates the exclusivity-gate exemption
+	// (admit.go) and the oomsteer child aggregation (oomsteer.go), NOT the job count.
+	// An empty one is refused so isSubReservation cannot silently drop (which would
+	// break both), and a non-empty one must be parseConfineScopeID-parseable (the
+	// ci-shim sentinel exempt) so the daemon can copy the PARENT supervisor pid out of
+	// it for the worker scope name (Task 1).
 	parentScopeID string
 	// nonBlocking is true when max_wait_ms is PRESENT on the wire AND equals 0 (the
 	// aitest pool-sizing probe, design §6/§8): report current available and reserve
@@ -140,7 +145,9 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 		return workerAdmitRequest{}, err
 	}
 	// parent_scope_id is REQUIRED (design §16d): a worker must always declare the
-	// suite it is a sub-reservation of, so it can never silently become a job. A
+	// suite it is a sub-reservation of, so isSubReservation cannot silently drop and
+	// leave the worker subject to the exclusivity gate / counted in the parent's
+	// oomsteer child sum (a worker still counts as a job either way). A
 	// non-empty value must be parseConfineScopeID-parseable (mirror admit.go's
 	// exclusive_holder / parent_scope_id checks) so Task 1 can extract the parent
 	// supervisor pid — the ci-shim sentinel is the one exempt value, and it is tied

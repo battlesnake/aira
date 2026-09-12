@@ -68,14 +68,13 @@ const (
 	//
 	// Like WorkerAdmitClassAdmissionUnusable below, it names the DISPOSITION,
 	// not a diagnosis. Most members really are static facts about the request
-	// (exceeds-ceiling, the CLI's own argument rejections), but AIRA-39 added
-	// two that are not: worker-scope-create-failed and
-	// worker-id-space-exhausted are daemon-side infrastructure facts about the
-	// outer scope. They land here because the alternatives are worse and were
-	// weighed in AIRA-39's own review — `contended` would retry a broken
-	// cgroupfs INDEFINITELY and stall every aitest run on the machine, and
-	// `admission-unusable` would strip containment for a run whose daemon is
-	// answering perfectly well. Terminal-and-loud is the honest middle.
+	// (exceeds-ceiling, the CLI's own argument rejections), but AIRA-39 added one
+	// that is not: worker-scope-create-failed is a daemon-side infrastructure fact
+	// (S2a's parent-scope-unparseable is another). They land here because the
+	// alternatives are worse and were weighed in AIRA-39's own review — `contended`
+	// would retry a broken cgroupfs INDEFINITELY and stall every aitest run on the
+	// machine, and `admission-unusable` would strip containment for a run whose
+	// daemon is answering perfectly well. Terminal-and-loud is the honest middle.
 	WorkerAdmitClassRequestInvalid = "request-invalid"
 	// WorkerAdmitClassAdmissionUnusable means daemon-backed admission is not
 	// usable for THIS RUN. Together with WorkerAdmitClassPlacementFailed

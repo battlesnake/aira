@@ -530,7 +530,8 @@ func confineScopeDirName(scopeID string) string {
 
 // S15 deleted the bespoke exclusiveDeniesWorkerAdmit gate. A worker is now an
 // ordinary sub-reservation lease on the unified ledger (parentScopeID = the suite
-// scope-id, via workerParentScopeID), so the shared exclusivity gate handles it:
+// scope-id, from the explicit parent_scope_id wire field), so the shared exclusivity
+// gate handles it:
 // exclusiveGate.blocks exempts a sub-reservation from a DRAIN unconditionally and
 // from a HOLD when its parent is the holder's own work — the exact behaviour this
 // gate provided, now expressed once for every lease rather than duplicated.

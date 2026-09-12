@@ -100,7 +100,8 @@ type Server struct {
 	// worker id is minted as CONFINE-aitest-w<seq>-<parentPid>-<stamp>, so
 	// (seq, parentPid, stamp) is unique by construction — no per-outer-scope
 	// counter, no tree re-seed, no EEXIST path. A restart resets it, but the stamp
-	// (monotonic wall-clock nanos) still separates a fresh worker from any survivor.
+	// (wall-clock time.Now().UnixNano at mint) still separates a fresh worker from any
+	// survivor.
 	workerScopeSeq atomic.Uint64
 	// shimWorkerSeq mints synthetic ids for ci-shim worker leases (advisory, no
 	// cgroup tree to re-seed from), keying each in the same unified ledger.

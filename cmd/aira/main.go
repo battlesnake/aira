@@ -1166,7 +1166,7 @@ func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 		i++
 		options[name] = argv[i]
 	}
-	for _, required := range []string{"job-id", "outer-scope", "estimated-bytes"} {
+	for _, required := range []string{"job-id", "outer-scope", "estimated-bytes", "parent-scope-id"} {
 		if _, present := options[required]; !present {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s is required for worker-admit", required)
 		}

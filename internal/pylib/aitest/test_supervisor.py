@@ -163,6 +163,41 @@ def test_acquire_worker_accepts_a_grant_still_carrying_the_retired_memory_high(t
         process.wait(timeout=5)
 
 
+def test_acquire_worker_forwards_aira_confine_scope_id_as_parent_scope_id(tmp_path, monkeypatch):
+    """S2a §16d: in REAL mode the supervisor forwards its own AIRA_CONFINE_SCOPE_ID
+    (the confine scope id `aira confine` published to it -- an id, not a path) as the
+    worker-admit --parent-scope-id, from which the daemon copies the PARENT supervisor
+    pid into the worker scope name and marks the lease a sub-reservation. The stub
+    records the value it actually received so the forwarding is asserted directly,
+    not merely inferred from the grant succeeding."""
+    seen = tmp_path / "seen-parent-scope-id"
+    stub = _write_stub(tmp_path / "worker-admit-parent", """
+import sys
+argv = sys.argv
+assert "--parent-scope-id" in argv, argv
+with open({seen!r}, "w") as handle:
+    handle.write(argv[argv.index("--parent-scope-id") + 1])
+print("aira-worker-admit state=granted class=granted containment=enforced "
+      "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400")
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""".format(seen=str(seen)))
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    monkeypatch.setenv("AIRA_CONFINE_SCOPE_ID", "CONFINE-suite-222222-1")
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"  # a real path, NOT the ci-shim sentinel
+    grant, process = supervisor.acquire_worker(400)
+    try:
+        assert grant["scope"] == "/outer/.aira-worker-1", grant
+        assert seen.read_text() == "CONFINE-suite-222222-1", (
+            "the supervisor must forward its own AIRA_CONFINE_SCOPE_ID (the id, not "
+            "self.outer_scope which is a path) as --parent-scope-id"
+        )
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+
+
 def _acquire_with_swap_cap(tmp_path, monkeypatch, name, token, supervisor=None):
     line = (
         "aira-worker-admit state=granted class=granted containment=enforced "
@@ -253,11 +288,14 @@ CLASS_TO_EXCEPTION = [
     ("contended", "reject:looks-permanent-but-is-not", "timeout", WorkerAdmitDenied),
     ("contended", "outer-scope-unreadable", "unevaluated", WorkerAdmitDenied),
     ("request-invalid", "exceeds-ceiling", "denied", WorkerAdmitRequestInvalid),
-    # AIRA-39 daemon-side verdicts. Neither is a fact about the REQUEST, and
-    # that is the point: request-invalid is the terminal-but-daemon-healthy
-    # disposition, not a diagnosis (see the exception's own docstring).
+    # AIRA-39/S2a daemon-side request-invalid verdicts: request-invalid is the
+    # terminal-but-daemon-healthy disposition, not a diagnosis (see the exception's
+    # own docstring), whatever the underlying reason. worker-scope-create-failed is a
+    # daemon-side infrastructure fact; parent-scope-unparseable (S2a §16d) is the
+    # request carrying a bad parent_scope_id. (worker-id-space-exhausted was retired
+    # with the S2a id-reseed -- worker ids are now unique by construction.)
     ("request-invalid", "worker-scope-create-failed", "denied", WorkerAdmitRequestInvalid),
-    ("request-invalid", "worker-id-space-exhausted", "denied", WorkerAdmitRequestInvalid),
+    ("request-invalid", "parent-scope-unparseable", "denied", WorkerAdmitRequestInvalid),
     ("request-invalid", "some-future-permanent-condition", "denied", WorkerAdmitRequestInvalid),
     ("request-invalid", "estimated-bytes-out-of-range", "argument-invalid", WorkerAdmitRequestInvalid),
     ("admission-unusable", "dial-failed", "unavailable", WorkerAdmitUnavailable),
@@ -3399,6 +3437,12 @@ import os, sys
 assert "--outer-scope" in sys.argv, sys.argv
 scope = sys.argv[sys.argv.index("--outer-scope") + 1]
 assert scope == "ci-shim", "the relay must be asked about the ci-shim sentinel, got " + repr(scope)
+# S2a §16d: parent_scope_id is a REQUIRED explicit field, and in shim mode (no
+# AIRA_CONFINE_SCOPE_ID, no cgroup) the supervisor forwards the ci-shim sentinel
+# verbatim -- the daemon refuses an empty one, so a missing/empty value would red.
+assert "--parent-scope-id" in sys.argv, sys.argv
+parent = sys.argv[sys.argv.index("--parent-scope-id") + 1]
+assert parent == "ci-shim", "shim mode forwards the ci-shim sentinel as parent_scope_id, got " + repr(parent)
 with open({counter!r}, "a") as handle:
     handle.write("1\\n")
 print("aira-worker-admit state=granted class=granted containment=" + {advisory!r} +
@@ -3406,6 +3450,12 @@ print("aira-worker-admit state=granted class=granted containment=" + {advisory!r
 sys.stdout.flush()
 sys.stdin.read()
 """.format(counter=str(admits), advisory=_ADVISORY_TOKEN))
+    # Exercise the REAL pure-shim path: a --ci=shim deploy has no confine slice and
+    # no AIRA_CONFINE_SCOPE_ID, so _parent_scope_id() returns the ci-shim sentinel.
+    # Without this the ambient AIRA_CONFINE_SCOPE_ID (set when this suite itself runs
+    # under `aira confine`) would leak in and the stub's parent-scope-id assert would
+    # see it instead of the sentinel.
+    monkeypatch.delenv("AIRA_CONFINE_SCOPE_ID", raising=False)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
