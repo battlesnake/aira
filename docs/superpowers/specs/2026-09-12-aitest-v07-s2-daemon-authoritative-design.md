@@ -458,5 +458,51 @@ real alloc-and-hold testdata fixture (the existing fixtures allocate nothing or 
 assert via a **deterministic** anchor (each granted `scope_path` from `pool-report.json` is a
 direct child of the slice), not a "walk the tree while a worker is live" timing race.
 
-*Authoritative for S2, as refined by §16. The S1 spec remains authoritative for S1 history and
-the `aira_mem` marker grammar.*
+### 16.1 GATE-2 refinements (2026-09-12, Fable re-gate)
+
+GATE-2 affirmed the architecture again and confirmed the redraft closed the bulk (P1-3, P1-5,
+all P2s, and P0-1/P1-1/P1-4 on the fresh-admit path). Two gaps remained, both on the
+**daemon-restart path** — which the model's own §16b invokes but no gate exercised:
+
+- **Restart-path parity (§16a + §16b, after a restart).** A worker relay re-declares its lease
+  across a daemon restart keyed by `ScopePath` (a path), which would undo the dirname-key
+  alignment §16a needs; and `serveReDeclare` reinstalls the lease with **no kill hook**, so a
+  post-restart parent-kill re-orphans mid-test workers (§16b re-opened). Fix, no wire change:
+  the relay re-declares with the key `TrimPrefix(Base(ScopePath), ".aira-")`, and
+  `serveReDeclare` installs the same peer-EOF `cgroup.kill`+rmdir when
+  `scopeID != "" && parentScopeID != ""` (that shape is uniquely a worker lease — a scoped
+  ordinary admit carries no `parent_scope_id`). The S18 restart merge-gate asserts the
+  re-anchored key-set (reds on the first half) and must gain a "parent kill after restart leaves
+  no orphan" case (the second).
+
+- **Escape-exemption mechanism (§16c) — local, not daemon-coupled.** "Keyed on the live lease's
+  `parent_scope_id`" would require a daemon round-trip per membership sample and *still*
+  false-flags on the kill path (relays die → leases release → workers live for the sub-second
+  before the daemon kills them → teardown witnesses a live pid in an *un-leased* sibling →
+  `descendant-escaped` on exactly the killed-run case). Fix: **mint the worker-name pid slot with
+  the parent supervisor's pid** (`= os.Getpid()` of the monitor process, foreground and
+  `--detach` alike). The exemption is then a purely local positive check —
+  `parseConfineScopeID(basename)`: name prefix `aitest-w` **and** embedded `pid == os.Getpid()`
+  — no daemon coupling, holding through teardown; a genuine escape to any other cgroup stays
+  witnessed. Worker-admit validates `parent_scope_id` parseability (shim sentinel exempt).
+
+**Consequences now mandatory (not optional):**
+- **`confine --kill <supervisor-pid>` is ambiguous** across a delegate job's sibling workers
+  (they embed the same supervisor pid) → would hit `E_SELECTOR_AMBIGUOUS`. Worker rows must be
+  labelled / filtered from the default `--list`/`--kill` selector. (Was plan Task 10 Step 1,
+  "decide"; now required.)
+- The allocator's `(seq, parent-pid, time-stamp)` id is **unique by construction** → drop the
+  reseed/`EEXIST` machinery entirely. The `@dr` marker's only consumers (`bindConfineScopeID`,
+  the oomsteer class) both go → drop it.
+
+**New accepted gap (§13): daemon-down parent-kill.** Nesting's `cgroup.kill` was
+daemon-independent (workers were in the parent's subtree); sibling kill depends on the daemon
+being alive at parent-death. If the daemon is down **and** the parent is killed **and** a worker
+is mid-test, that worker survives until it finishes its current test and hits nodeid-pipe EOF
+(the supervisor is gone), then exits on its own — a bounded "one more test" leak, not permanent.
+Accepted for S2a. The §16.1 parent-pid slot makes a future reaper fix cheap (a *populated*
+worker scope whose embedded pid is dead is positive orphan proof → a reaper-side `cgroup.kill`),
+if the bounded leak ever proves to matter.
+
+*Authoritative for S2, as refined by §16 and §16.1. The S1 spec remains authoritative for S1
+history and the `aira_mem` marker grammar.*

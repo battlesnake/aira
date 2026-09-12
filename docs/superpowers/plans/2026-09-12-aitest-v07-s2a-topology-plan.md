@@ -4,6 +4,8 @@
 
 > **GATE-1 REDRAFT (2026-09-12).** The Fable plan-gate affirmed the architecture but found nesting was silently doing four jobs (unique naming, kill propagation, escape attestation, sub-reservation marking) the first draft replaced none of, two gates that would pass against a broken impl, an incomplete excision inventory, and a strong simplification. This redraft folds all of it. See spec §16.
 
+> **GATE-2 FOLD (2026-09-12).** GATE-2 = narrow FAIL: bulk closed, architecture affirmed, P0-1/P1-1/P1-4 closed on the fresh-admit path. Two restart-path gaps + a sharper escape mechanism folded (spec §16.1): (1) **restart parity** — the relay re-declares keyed by path + `serveReDeclare` has no kill hook → post-restart parent-kill re-orphans workers (Task 4); (2) **local escape exemption** — mint the worker-name pid slot with the **parent supervisor pid** so the exemption is a local `pid==os.Getpid()` check, no daemon coupling (Task 1 + Task 5); (3) `confine --kill` selector handling is now **mandatory** (Task 10); (4) the `(seq,parent-pid,stamp)` id is unique by construction → drop reseed/`@dr` (Task 1); (5) a new bounded daemon-down accepted gap (Accepted Gaps).
+
 **Goal:** Make each aitest worker a **first-class sibling confine scope** directly under `aira.slice`; collapse `--delegate-ram` to an ordinary confine job (incl. deleting the `aitest-bootstrap` subprocess); and excise the now-harmful v7-1 guard — closing AIRA-229 and AIRA-232 by construction, with no regression to kill propagation, scope-integrity attestation, or job accounting.
 
 **Architecture:** The daemon ledger is already slice-authoritative (each worker is a separate signed lease against the one slice, released on socket-EOF). The change is the kernel cgroup topology: each worker scope is created under the slice via the ordinary confine scope-creation path, with a unique parseable pid-bearing confine name; linkage moves from cgroup-path to an explicit `parent_scope_id`; the daemon owns worker-scope kill+rmdir on relay peer-EOF; escape-attestation exempts the worker's fork→`place_self` migration into its own sibling scope. `--delegate-ram` becomes an ordinary confine job that only additionally publishes aitest coordinates. Because there is no shared smaller-than-slice parent cap, the outer `oom.group` cannot whole-suite-kill (AIRA-229) and N supervisors cannot jointly breach (AIRA-232); the v7-1 guard (which read the parent cap) must be removed in the same change.
@@ -46,28 +48,28 @@ Deleted: `internal/pylib/aitest/test_outer_cap_guard.py` (after relocating the `
 
 ---
 
-## Task 1: First-class worker confine scope names + slice-keyed allocator (P0-1)
+## Task 1: First-class worker confine scope names; pid slot = parent supervisor pid (P0-1, P1-B, P2-C)
 
-**Files:** `internal/daemon/worker_admit.go` (`workerScopeFor`/`allocateWorkerScopeID` :117-214, EEXIST reseed :602-611), `internal/runner/worker_scope_linux.go`/`worker_scope.go`; Test: `internal/daemon/worker_admit_test.go`.
+**Files:** `internal/daemon/worker_admit.go` (`workerScopeFor`/`allocateWorkerScopeID` :117-214, EEXIST reseed :602-611 — **delete the reseed/EEXIST machinery**), `internal/runner/worker_scope_linux.go`/`worker_scope.go`, `internal/runner/confine.go` (mint via the `confineScopeID`/`MintConfineScopeID` grammar :1138-1255); drop the `@dr` marker (`IsDelegateRAMScopeID`, `bindConfineScopeID:1288`) — its only consumers go in Task 7; Test: `internal/daemon/worker_admit_test.go`.
 
-**Interfaces:** Produces `CONFINE-aitest-w<seq>-<supervisorPID>-<stamp>` worker ids, minted through the confine grammar, counter keyed on the **slice** (or globally unique by construction); the granted lease's `scopeID` == scope dir-name-minus-`.aira-`.
+**Interfaces:** Produces `CONFINE-aitest-w<seq>-<parentSupervisorPID>-<stamp36>` worker ids → name `aitest-w<seq>` (valid per `ValidateConfineIdentity`). **The pid slot is the PARENT SUPERVISOR pid** — parsed from `parent_scope_id`, which equals `os.Getpid()` of the monitor process (foreground and `--detach` alike, per `MintConfineScopeID`). This choice is load-bearing downstream: Task 5's escape exemption is a local `parseConfineScopeID(basename).pid == os.Getpid()` check, and a *populated* worker scope whose embedded pid is dead is positive orphan proof. `(seq, parentPid, timeStamp)` is **unique by construction** — no cross-scope counter, no reseed, no `EEXIST` path. The granted lease's `scopeID` == scope dir-name-minus-`.aira-`.
 
-- [ ] **Step 1: Failing unit test** — two distinct outer/supervisor contexts admitting workers under the one slice produce **distinct, `parseConfineScopeID`-parseable** ids with no `EEXIST`/`WorkerScopeIDCollision`. Expected: FAIL (current per-outer `worker-N` collides + is unparseable).
+- [ ] **Step 1: Failing unit test** — two distinct supervisor contexts (distinct parent pids) admitting workers under the one slice produce **distinct, `parseConfineScopeID`-parseable** ids with the parent pid in the pid slot; no `EEXIST`/`WorkerScopeIDCollision` code path is reachable. Expected: FAIL (current per-outer `worker-N` collides + is unparseable).
 - [ ] **Step 2: Run, confirm fail** (collision or parse-reject).
-- [ ] **Step 3: Implement** — new name grammar + slice-keyed (or uniqueness-by-construction) counter; reseed scans the slice for the new prefix; set lease `scopeID` so the reaper `hasLiveLease` veto (confine_reaper.go:55-61) and `oomsteer` `confineScopeDirName` (oomsteer.go:232) align.
-- [ ] **Step 4: Run, confirm pass**; re-run worker-admit + reaper tests (no regression).
+- [ ] **Step 3: Implement** — mint via the confine grammar with the parent-supervisor pid slot; **delete** `allocateWorkerScopeID`'s per-outer scan + the EEXIST reseed (unique-by-construction); set the lease `scopeID` = dirname-minus-`.aira-` so the reaper `hasLiveLease` veto (confine_reaper.go:54-61), `ReapScopeIfEmpty`/`--kill` (confine_manage_linux.go:369-380,560-631) and `oomsteer` `confineScopeDirName` (oomsteer.go:232) all align.
+- [ ] **Step 4: Run, confirm pass**; re-run worker-admit + reaper tests (no regression). Confirm `parseConfineScopeID` accepts the name (gate verified the grammar does).
 - [ ] **Step 5: Commit.**
 
 ## Task 2: Explicit `parent_scope_id`; preserve sub-reservation marking (P1-3, §16d)
 
 **Files:** `worker_admit.go` (`workerParentScopeID` :225-232, `isSubReservation` admit.go:328-330), `internal/pylib/env.go` (`AIRA_CONFINE_SCOPE_ID` :196), `supervisor.py` (~:953-954), `confine_shim_linux.go` (sentinel :300-304); Test: `worker_admit_test.go`.
 
-**Interfaces:** Worker-admit carries `parent_scope_id` as an explicit field (the supervisor's confine scope **id**, from `AIRA_CONFINE_SCOPE_ID` — not `self.outer_scope`, which is a path). Empty is refused.
+**Interfaces:** Worker-admit carries `parent_scope_id` as an explicit field (the supervisor's confine scope **id**, from `AIRA_CONFINE_SCOPE_ID` — not `self.outer_scope`, which is a path). Empty is refused; a non-empty value is validated **parseable** by `parseConfineScopeID` (mirror admit.go:3017; the shim sentinel is the one exempt value), so Task 5 can extract its pid.
 
-- [ ] **Step 1: Failing tests** — (a) `workerParentScopeID` returns the explicit id under sibling placement; (b) an **empty** `parent_scope_id` is refused `E_DAEMON_PROTOCOL` (so a worker can never silently become a job); (c) `isSubReservation` still holds for a worker. Expected: FAIL.
+- [ ] **Step 1: Failing tests** — (a) `workerParentScopeID` returns the explicit id under sibling placement; (b) an **empty** `parent_scope_id` is refused `E_DAEMON_PROTOCOL` (so a worker can never silently become a job); (c) a non-empty-but-unparseable `parent_scope_id` is refused (except the sentinel); (d) `isSubReservation` still holds for a worker. Expected: FAIL.
 - [ ] **Step 2: Run, confirm fail.**
-- [ ] **Step 3: Implement** — add the field; supervisor sends the id; ci-shim publishes a sentinel; daemon refuses empty; the exclusivity exemption + `isSubReservation` read the field.
-- [ ] **Step 4: Run, confirm pass**; re-run the AIRA-68 "workers aren't jobs" invariants (`outstandingJobs`, `sliceProvablyEmpty`, drain/`--exclusive`, `confine --list` N-jobs).
+- [ ] **Step 3: Implement** — add the field; supervisor sends the id (`AIRA_CONFINE_SCOPE_ID`, always published on the real path, confine_linux.go:1110); ci-shim publishes the sentinel; daemon refuses empty + validates parseability; the exclusivity exemption + `isSubReservation` read the field.
+- [ ] **Step 4: Run, confirm pass**; re-run the AIRA-68 "workers aren't jobs" invariants (`outstandingJobs`, `sliceProvablyEmpty`, drain/`--exclusive`, `confine --list` N-jobs). **The real-cgroup e2e harness must publish a canonical `AIRA_CONFINE_SCOPE_ID` as of THIS task** (not Task 9) — otherwise every existing real-cgroup aitest e2e reds on refuse-empty (P3c).
 - [ ] **Step 5: Commit.**
 
 ## Task 3: Create worker scopes as siblings under the slice (§4)
@@ -76,32 +78,36 @@ Deleted: `internal/pylib/aitest/test_outer_cap_guard.py` (after relocating the `
 
 - [ ] **Step 1: Failing unit test** — the computed worker scope path is slice-rooted with the Task-1 name. Expected: FAIL.
 - [ ] **Step 2: Run, confirm fail.**
-- [ ] **Step 3: Implement** — pass the slice (not `req.outerScope`) as parent; reuse the ordinary confine scope-creation path so controller delegation + common-ancestor `cgroup.procs` migration (the permission model `place_self` needs — the slice already carries `+memory/+cpu` via `ensureConfineDelegation`) come for free; daemon returns the new path to the supervisor → worker `place_self` unchanged.
+- [ ] **Step 3: Implement** — pass the slice (not `req.outerScope`) as parent; reuse the ordinary confine scope-creation path so controller delegation + common-ancestor `cgroup.procs` migration (the permission model `place_self` needs — the slice already carries `+memory/+cpu` via `ensureConfineDelegation`) come for free; daemon returns the new path to the supervisor → worker `place_self` unchanged. **Note (P3f):** "the ordinary confine scope-creation path" is currently client launch code (confine_linux.go:793); extract it into a shared helper callable from the daemon's worker-admit, rather than duplicating it.
 - [ ] **Step 4: Run, confirm pass** + full `internal/pylib/aitest` suite + existing real-cgroup e2e. Worker RAM no longer charges the outer scope.
 - [ ] **Step 5: Commit.**
 
-## Task 4: Daemon kills + rmdirs worker scopes on relay peer-EOF (P1-1, §16b)
+## Task 4: Daemon kills + rmdirs worker scopes on relay peer-EOF — fresh AND restart paths (P1-1, P1-A, §16b/§16.1)
 
-**Files:** `worker_admit.go` relay lifecycle :538-548/:630-636, `confine_manage_linux.go` (`cgroup.kill`+rmdir helper :609-624); Test: a real-cgroup gate in Task 9 + a daemon unit test for the `stopping` guard.
+**Files:** `worker_admit.go` relay lifecycle :538-548/:630-636; `server.go` `serveReDeclare` :913-1030; `worker_admit_client_linux.go` re-declare key :229-237; `confine_manage_linux.go` (`cgroup.kill`+rmdir helper :609-624, ENOENT-tolerant); Test: daemon unit tests for both paths + the `stopping` guard; real-cgroup gates D (Task 9) + the S18 restart merge-gate (`restart_merge_gate_worker_e2e_test.go`).
 
-**Interfaces:** On a worker relay's peer-EOF (`peerCtx.Done()`), the daemon `cgroup.kill`s then rmdirs that worker scope. Skipped when `s.stopping` (restart must not kill live workers — they re-declare, :85-91).
+**Interfaces:** On a worker relay's peer-EOF (`peerCtx.Done()`), the daemon `cgroup.kill`s then rmdirs that worker scope (rmdir tolerates ENOENT — the supervisor's own `_forget_worker_scope` may have won the race, :2216). Skipped when `s.stopping` (a daemon restart EOFs every relay, but workers must survive and re-declare, :85-91). **This is the one path where relay death now kills its worker** (was: lease-only release) — documented as an intended behaviour change.
 
-- [ ] **Step 1: Failing test** — (unit) on peer-EOF the worker scope is killed+removed; on `s.stopping` it is NOT. (e2e, in Task 9) kill the parent → no worker process survives, no worker dir remains. Expected: FAIL (today relay-EOF frees the lease but leaves the process + dir).
+**Restart parity (P1-A — the GATE-2 gap):** both halves must hold across a daemon restart, not just on fresh admit:
+- (i) the relay re-declares its lease keyed by `strings.TrimPrefix(filepath.Base(ScopePath), ".aira-")` (currently `ScopeID: grant.ScopePath`, a path — which would undo Task 1's dirname alignment);
+- (ii) `serveReDeclare` installs the **same** peer-EOF kill+rmdir when `scopeID != "" && parentScopeID != ""` (that shape is uniquely a worker lease — a scoped *ordinary* admit carries no `parent_scope_id`, admit.go:3027-3030), so a post-restart parent-kill does not re-orphan mid-test workers.
+
+- [ ] **Step 1: Failing tests** — (unit) on peer-EOF the worker scope is killed+removed; on `s.stopping` it is NOT. (unit/merge-gate) after a simulated restart + re-declare, the lease key is the dirname (not a path) AND a subsequent peer-EOF kills+rmdirs the re-declared worker. (e2e, Task 9 Gate D) kill the parent → no worker survives, no dir remains — both fresh and post-restart. Expected: FAIL (today relay-EOF frees the lease but leaves process+dir; re-declare keys by path and installs no kill).
 - [ ] **Step 2: Run, confirm fail.**
-- [ ] **Step 3: Implement** the peer-EOF kill+rmdir; guard on `peerCtx.Done()` vs `s.stopping`.
-- [ ] **Step 4: Run, confirm pass**; verify the normal supervisor-driven retirement path (`_forget_worker_scope`) still works and doesn't double-rmdir.
+- [ ] **Step 3: Implement** the peer-EOF kill+rmdir on the fresh relay path; re-key the re-declare; install the same hook in `serveReDeclare`; ENOENT-tolerant rmdir; guard both on `peerCtx.Done()` vs `s.stopping`.
+- [ ] **Step 4: Run, confirm pass**; verify `_forget_worker_scope` still works and the double-rmdir race is benign (ENOENT); extend the S18 restart merge-gate with the re-anchored key-set assertion + a "parent kill after restart leaves no orphan" case.
 - [ ] **Step 5: Commit.**
 
-## Task 5: Exempt the worker fork→place_self migration from escape attestation (P1-2, §16c)
+## Task 5: Exempt the worker fork→place_self migration from escape attestation — LOCAL pid check (P1-2, P1-B, §16c/§16.1)
 
-**Files:** `internal/runner/runner_linux.go` `monitorScopeMembership`/`witnessedEscape` :1627-1832, `confine_linux.go` :1237,1400-1408; Test: Task 9 `...ScopeIntegrityContained` gate + mutation.
+**Files:** `internal/runner/runner_linux.go` `monitorScopeMembership`/`witnessedEscape` :1627-1832 **and** `classifyLaunchScopeIntegrity`'s `Teardown.Escape` check :1593, `confine_linux.go` :1237,1400-1408; Test: Task 9 `...ScopeIntegrityContained` gate + mutation.
 
-**Interfaces:** A process migrating from the parent scope **into a live-leased sibling worker scope whose `parent_scope_id` == this scope** is NOT a witnessed escape (positive id, not a name-prefix guess).
+**Interfaces:** A process seen alive in a sibling cgroup whose basename parses (`parseConfineScopeID`) to **name prefix `aitest-w` AND embedded pid == `os.Getpid()`** (this monitor's own pid — which is the pid Task 1 minted into the worker name) is NOT a witnessed escape. This is a **purely local positive check** — no lease table, no daemon round-trip per membership sample — and, crucially, it holds **through teardown**: on a `--timeout`/`--kill` of the parent the relays die and leases release, but the pid-in-the-name is still `os.Getpid()`, so the killed-run case no longer false-flags `descendant-escaped` (the GATE-2 P1-B defect). A genuine escape to any *other* cgroup (no `aitest-w` name / wrong pid) stays witnessed.
 
-- [ ] **Step 1: Failing gate** (Task 9) — a delegate run attests `scope-integrity=contained`, not `descendant-escaped`. Expected: FAIL (every worker migration is currently witnessed).
+- [ ] **Step 1: Failing gate** (Task 9 Gate E) — a delegate run attests `scope-integrity=contained`, not `descendant-escaped`, **including on the `--kill`/`--timeout` teardown path**. Expected: FAIL (every worker migration is currently witnessed).
 - [ ] **Step 2: Run, confirm fail.**
-- [ ] **Step 3: Implement** the exemption keyed on the live lease's `parent_scope_id`.
-- [ ] **Step 4: Run, confirm pass**; confirm a genuine escape (a process leaving to an UNleased/ unrelated cgroup) is still witnessed (don't over-exempt).
+- [ ] **Step 3: Implement** the local exemption in BOTH the live sampler (`witnessedEscape`) and the teardown classifier (`Teardown.Escape`). Requires Task 1's parent-pid slot and Task 2's parseability guarantee.
+- [ ] **Step 4: Run, confirm pass**; confirm a genuine escape (a process in an unrelated cgroup, or an `aitest-w` name whose pid ≠ this monitor) is still witnessed (don't over-exempt); mutation: drop the pid check → Gate E reds.
 - [ ] **Step 5: Commit.**
 
 ## Task 6: Excise the v7-1 guard (§10) — ships with Task 3
@@ -122,15 +128,17 @@ Deleted: `internal/pylib/aitest/test_outer_cap_guard.py` (after relocating the `
 - [ ] **Step 1: Failing tests** — (a) a `--delegate-ram` admit resolves the **ordinary** reserve (not the 512 MiB pin / 48 GiB envelope) + `oom_score_adj=500` + 1 core; (b) `--delegate-ram --memory-reserve 512M` sets the parent `memory.max=512M` like any confine job (document the retired idiom); (c) a delegate signature uses a **namespaced** history key so a fresh parent-only scope is not refused by stale whole-subtree history (P2-2); (d) daemon-down fallback caps at 1 worker under a finite parent cap (P2-3). Expected: FAIL.
 - [ ] **Step 2: Run, confirm fail.**
 - [ ] **Step 3: Implement** — delete the delegate-specific reserve/ceiling/oom-class/core branches per the inventory (do NOT touch `redeclare.go`); keep `AppendAitestChildEnvironment` coordinate publication; **delete the `aitest-bootstrap` verb + `BootstrapAitestSupervisor`/`drainIntoScope`/`moveIntoScope`/`scopeHasFiniteMemoryMax` + supervisor `bootstrap()`**, publishing `AIRA_AITEST_OUTER_SCOPE`(→`parent_scope_id`) + `AIRA_AITEST_ADMISSION` at launch; namespace the parent signature; cap fallback; update `skill.go:318` + confine help prose.
+  - **Shim sentinel source moves (P3a):** the `parent_scope_id` sentinel was published by the now-deleted bootstrap verb (main.go:1878); the **ci-shim launcher** must publish it directly (confine_shim_linux.go:290 currently withholds it deliberately), or shim delegate runs fail refuse-empty (Task 2).
+  - **Fallback e2e trigger (P3b):** the two fallback e2e tests (pytest_aitest_e2e_test.go:127,219) trigger on the deleted `AIRA_AITEST_BOOTSTRAP_CMD` binary (env.go:21,83) — give them a new daemon-down trigger and drop the dead env key.
 - [ ] **Step 4: Run, confirm pass** + full suite + shim tests (shim delegate still ordinary-reserve + coordinate+sentinel publish) + a real-cgroup delegate run (supervisor runs directly in the parent scope; workers sibling).
 - [ ] **Step 5: Commit.**
 
-## Task 8: Measurement channel → parent memory.peak (P2-5)
+## Task 8: Measurement channel → parent memory.peak + per-worker `scope_path` (P2-5, P2-A)
 
-**Files:** `supervisor.py` `_emit_measurement_report` :2145-2156, `_cleanup_supervisor_scope`; Test: `test_measurement_report.py` + the measurement e2e.
+**Files:** `supervisor.py` `_emit_measurement_report` :2145-2156, `_pool_peak_records` :2040, `_cleanup_supervisor_scope`; Test: `test_measurement_report.py` + the measurement e2e.
 
-- [ ] **Step 1: Failing test** — the report's supervisor-peak term reads the parent `memory.peak` (real value), not the removed `supervisor_scope`. Expected: FAIL (reads gone path → `unevaluated`).
-- [ ] **Step 2-4:** implement the redirect; drop the `supervisor_scope=` token; run green.
+- [ ] **Step 1: Failing tests** — (a) the report's supervisor-peak term reads the parent `memory.peak` (real value), not the removed `supervisor_scope`; (b) `_pool_peak_records` now includes each worker's granted `scope_path` (Gate A's deterministic anchor — today it holds only peak/memory_max/oom). Expected: FAIL.
+- [ ] **Step 2-4:** implement the redirect; add `scope_path` to the per-worker record; drop the `supervisor_scope=` token; run green.
 - [ ] **Step 5: Commit.**
 
 ## Task 9: Real-cgroup gates — isolated slice, alloc-and-hold, deterministic anchors (P1-4; AIRA-229/232; §16c/b)
@@ -145,14 +153,18 @@ Deleted: `internal/pylib/aitest/test_outer_cap_guard.py` (after relocating the `
 - [ ] **Mutation checks:** restore nesting → Gate A/B red; restore the guard → Task-6 pool-scales red; drop the escape exemption → Gate E red; drop the peer-EOF kill → Gate D red. Each must red for the right reason.
 - [ ] **Commit.**
 
-## Task 10: `confine --list`/`--kill` naming, tidy, ticket closure (P2-4, P3)
+## Task 10: `confine --list`/`--kill` selector (MANDATORY), tidy, ticket closure (P2-4, P3)
 
-- [ ] **Step 1:** Decide `confine --list`/`--kill` handling of worker rows (pid-bearing names make `--kill <pid>` ambiguous) — label workers with a recognisable component or filter them from the default list; test.
-- [ ] **Step 2:** Re-home/keep `readOuterMemoryEventCounter`; re-home/drop `testdata/test_slow_passing.py`; note oomsteer will begin steering worker leases once names parse (harmless — confirm).
-- [ ] **Step 3:** `aira transition` AIRA-229 + AIRA-232 → done (note → spec §11/§16 + this slice; `aira link` for relations, never hand-write tuples).
+- [ ] **Step 1 (MANDATORY, not "decide"):** every sibling worker of a delegate job embeds the **same** supervisor pid (Task 1), so `confine --kill <supervisor-pid>` would hit `E_SELECTOR_AMBIGUOUS` (confine_manage_linux.go:560-566) — a regression for a core gesture. Label worker rows with a recognisable component and **filter them from the default `--list`/`--kill` pid/name selector** (a worker is killed via its parent, or an explicit worker-scope selector), so `--kill <supervisor-pid>` resolves to the parent job unambiguously. Test both the ambiguity-is-gone and the worker-still-reachable cases.
+- [ ] **Step 2:** Keep/rename `readOuterMemoryEventCounter` (don't delete-then-re-add); re-home/drop `testdata/test_slow_passing.py` (orphaned by the SkipTick gate deletion). **Correct the oomsteer touch:** sub-reservations `continue` before `budgets[]` (oomsteer.go:445-447) so worker leases are **never steered** (the earlier "harmless once names parse" note was wrong) — the real change is to **drop the `children` aggregation** of the parent's `memory.current`, since sibling workers no longer charge the parent.
+- [ ] **Step 3:** `aira transition` AIRA-229 + AIRA-232 → done (note → spec §11/§16/§16.1 + this slice; `aira link` for relations, never hand-write tuples).
 - [ ] **Step 4:** Full `internal/{pylib,runner,daemon}/...` build+vet+test under `aira confine`; exact exit codes recorded. PR (one atomic PR for Tasks 1-10).
 
 ---
+
+## Accepted Gaps (S2a)
+
+- **Daemon-down parent-kill (spec §16.1, P2-B).** Nesting's `cgroup.kill` was daemon-independent (workers were in the parent's subtree); sibling kill depends on the daemon being alive at parent-death. If the daemon is down **and** the parent is killed **and** a worker is mid-test, that worker survives until it finishes its current test and hits nodeid-pipe EOF (supervisor gone), then exits — a **bounded "one more test" leak**, not permanent. Accepted for S2a. Task 1's parent-pid slot makes a future reaper fix cheap (a *populated* worker scope whose embedded pid is dead = positive orphan proof) if the bounded leak ever matters — not built now ("keep the primitive + document the gap").
 
 ## Self-Review
 
@@ -165,4 +177,4 @@ Deleted: `internal/pylib/aitest/test_outer_cap_guard.py` (after relocating the `
 
 ## Execution Handoff
 
-**Subagent-Driven** (fresh Opus builder per task-group + Fable build-review), per the two-loop. Build order: T1 → T2 → T3+T6 (coupled) → T4 → T5 → T7 → T8 → T9 → T10. **Re-gate the redraft before building** (this plan failed GATE-1; it must pass GATE-2 first).
+**Subagent-Driven** (fresh Opus builder per task-group + Fable build-review), per the two-loop. Build order: T1 → T2 → T3+T6 (coupled) → T4 → T5 → T7 → T8 → T9 → T10 (T1's pid slot feeds T5; T8's `scope_path` feeds T9 Gate A). **Re-gate before building** — this plan failed GATE-1 (four nesting-jobs) and GATE-2 (two restart-path gaps + the exemption mechanism), both narrow and converging; it must clear GATE-3 first.
