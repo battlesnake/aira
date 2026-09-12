@@ -35,6 +35,11 @@ func reDeclareTestServer() *Server {
 		return 0, 0, 0, false, "no-memory (a re-declare skips the ceiling)"
 	}
 	server.peerCredential = func(net.Conn) (int, int, error) { return os.Geteuid(), os.Getpid(), nil }
+	// These tests exercise the ledger/ack, not the S2a §16b worker teardown, and some
+	// frames (the golden one: scope "child", parent "parent") have the worker-lease
+	// shape that arms the peer-EOF kill. Stub it to a no-op so they do not invoke the
+	// real cgroupfs helper against a synthetic scope id.
+	server.workerScopeKill = func(context.Context, string, string) error { return nil }
 	return server
 }
 

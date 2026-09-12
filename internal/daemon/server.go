@@ -157,8 +157,14 @@ type Server struct {
 	// cgroup. (S2a deleted the id-reseed readdir seam: worker ids are unique by
 	// construction, so there is no tree to scan.)
 	workerScopeCreate func(context.Context, string, string, int64) (string, string, error)
-	admitNow          func() time.Time
-	admitAfter        func(time.Duration) <-chan time.Time
+	// workerScopeKill is the S2a §16b peer-EOF teardown seam: on a worker relay's EOF
+	// the daemon cgroup.kills + rmdirs that worker's SIBLING scope (production:
+	// runner.KillAndRemoveWorkerScope). Tests substitute a recorder. Nil → the real
+	// helper. Fired ONLY on a discharging anchored release (§16.2 P1-B), NEVER on
+	// s.stopping (a daemon restart must not kill live workers — they re-declare, §16b).
+	workerScopeKill func(context.Context, string, string) error
+	admitNow        func() time.Time
+	admitAfter      func(time.Duration) <-chan time.Time
 	// S13 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
 	// runRestartFreeze waits the freeze via this, and sharing admitAfter would cross-talk
 	// with a live admitConnection in a Serve-driven test. Nil → time.After.
@@ -910,6 +916,32 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 // inbound already replays the 4 sniffed magic bytes, so decodeReDeclareFrame re-reads
 // and re-verifies the magic — symmetric with the encoder and with the dump reader
 // S10/S11 reuse.
+// workerScopeKillTimeout bounds one worker peer-EOF teardown: cgroup.kill is a hard
+// SIGKILL, so a worker (and its test subprocess) dies promptly; 5s is well clear of
+// the kernel reap that lets the rmdir succeed, without hanging the relay's handler
+// goroutine if a scope somehow will not drain.
+const workerScopeKillTimeout = 5 * time.Second
+
+// killWorkerScope tears down one worker's SIBLING scope after its relay's peer-EOF
+// (S2a §16b): cgroup.kill + rmdir, best-effort and fully ENOENT/ENODEV-tolerant (the
+// supervisor's own _forget_worker_scope may have won the race). Errors are LOGGED,
+// never propagated — the ledger lease is already released, and a stray empty scope is
+// swept by the #72 orphan reaper. Callers fire this only on a discharging anchored
+// release and never under s.stopping (both gates live at the call site).
+func (s *Server) killWorkerScope(slicePath, scopeID string) {
+	kill := s.workerScopeKill
+	if kill == nil {
+		kill = func(ctx context.Context, slice, id string) error {
+			return runner.KillAndRemoveWorkerScope(ctx, slice, id, workerScopeKillTimeout)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), workerScopeKillTimeout+time.Second)
+	defer cancel()
+	if err := kill(ctx, slicePath, scopeID); err != nil {
+		log.Printf("aira daemon: worker scope %q peer-EOF kill+rmdir failed: %v", scopeID, err)
+	}
+}
+
 func (s *Server) serveReDeclare(conn net.Conn, inbound io.Reader) {
 	// (3) Own read deadline bounding the frame-BODY read. The handshake Connect deadline
 	// set in serveConnection covered only the 4-byte magic sniff; this handler owns the
@@ -989,12 +1021,13 @@ func (s *Server) serveReDeclare(conn net.Conn, inbound io.Reader) {
 	// must be HELD, never closed on error, and released ONLY by its own EOF via
 	// compare-and-release (waiter.anchor == conn).
 	released := false
+	discharged := false
 	release := func() {
 		if released {
 			return
 		}
 		released = true
-		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
+		discharged = s.releaseAdmitWaiterAnchored(queue, waiter, conn)
 	}
 	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
@@ -1016,6 +1049,24 @@ func (s *Server) serveReDeclare(conn net.Conn, inbound io.Reader) {
 	// snapshot granted leases BEFORE close(stopping), or a held lease is lost from the dump.
 	select {
 	case <-peerCtx.Done():
+		// S2a §16.1 (P1-A): a WORKER lease — scopeID != "" AND parentScopeID != "", a
+		// shape a scoped ORDINARY admit never has (it carries no parent_scope_id) — gets
+		// the SAME peer-EOF kill+rmdir the fresh path installs, so a parent-kill AFTER a
+		// restart does not re-orphan a mid-test worker. Never in shim mode (no cgroup),
+		// never on s.stopping (a restart must not kill live workers — re-checked below).
+		if !s.shimMode() && charge.ScopeID != "" && charge.ParentScopeID != "" {
+			release()
+			// Anchor-gate (§16.2 P1-B), same as the fresh path: kill only when THIS
+			// connection's release actually discharged. A reconnect re-anchors the live
+			// lease to a newer conn, so a stale conn's EOF discharges nothing here too.
+			select {
+			case <-s.stopping:
+			default:
+				if discharged {
+					s.killWorkerScope(path, charge.ScopeID)
+				}
+			}
+		}
 	case <-s.stopping:
 	}
 }

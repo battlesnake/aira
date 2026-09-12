@@ -443,12 +443,13 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
 	released := false
+	discharged := false
 	release := func() {
 		if released {
 			return
 		}
 		released = true
-		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
+		discharged = s.releaseAdmitWaiterAnchored(queue, waiter, conn)
 	}
 	defer release()
 
@@ -529,6 +530,26 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	// gate this: release is EOF-keyed, not write-keyed.
 	select {
 	case <-peerCtx.Done():
+		// The worker relay closed. In real mode the worker is a SIBLING scope under the
+		// slice, so nothing ABOVE it kills the worker process on relay death (§16b) —
+		// the daemon must, on THIS peer-EOF. Discharge the lease here so `discharged`
+		// reflects whether THIS connection was still the anchor.
+		if !shim && scopeID != "" {
+			release()
+			// NEVER kill on a daemon restart: close(stopping) EOFs every relay, but live
+			// workers must survive and re-declare (§16b). Re-check under the select so a
+			// simultaneous stopping+EOF cannot slip a kill through. Anchor-gate on
+			// `discharged` (§16.2 P1-B): a late-ack redial closes THIS conn while conn2
+			// re-anchors the LIVE worker, so a release that discharged nothing must not
+			// kill a mid-test worker (a release is idempotent; a kill is not).
+			select {
+			case <-s.stopping:
+			default:
+				if discharged {
+					s.killWorkerScope(path, scopeID)
+				}
+			}
+		}
 	case <-s.stopping:
 	}
 }

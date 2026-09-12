@@ -2533,14 +2533,21 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 // releaseAdmitWaiterAnchored is the socket-EOF release: the connection that anchored
 // the lease discharges it on its own EOF, via the compare-and-release gate. conn is the
 // releasing handler's own connection. See releaseAdmitWaiterLockedAnchored. It runs
-// afterAdmitRelease only when it performed the discharge.
-func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) {
+// afterAdmitRelease only when it performed the discharge, and RETURNS whether it did.
+//
+// The returned bool is the S2a §16.2 (P1-B) anchor gate: a worker relay's peer-EOF
+// kills+rmdirs its sibling scope ONLY when its own anchored release actually
+// discharged — a stale connection whose lease was re-anchored to a live redial gets
+// false here, so it never kills a mid-test worker (a release is idempotent; a kill
+// is not).
+func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) bool {
 	queue.mu.Lock()
 	released := releaseAdmitWaiterLockedAnchored(queue, waiter, conn)
 	queue.mu.Unlock()
 	if released {
 		s.afterAdmitRelease(queue)
 	}
+	return released
 }
 
 // releaseAdmitWaiterLockedAnchored is compare-and-release (design §3, Inv 4), with

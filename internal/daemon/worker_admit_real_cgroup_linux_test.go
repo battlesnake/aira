@@ -157,10 +157,13 @@ func TestWorkerAdmitCreatesARealWorkerScopeAndEOFFreesTheLedger(t *testing.T) {
 	if out, _, jobs := sliceLedger(t, server, parent); out != 0 || jobs != 0 {
 		t.Fatalf("ledger outstanding=%d jobs=%d after EOF, want released (0, 0)", out, jobs)
 	}
-	// ...but the daemon did NOT remove the scope directory: RAM returns at EOF, not
-	// at scope removal (that is the supervisor's job after it reaps the worker).
-	if _, err := os.Stat(resp.ScopePath); err != nil {
-		t.Fatalf("the daemon removed the scope on EOF (%v); it must leave it for the supervisor to rmdir after reaping", err)
+	// ...AND the daemon TEARS DOWN the worker's sibling scope on that same EOF (S2a
+	// §16b — an intended behaviour change from v0.5). With workers as SIBLINGS under
+	// the slice, nothing above a worker kills it on relay death, so the daemon
+	// cgroup.kills + rmdirs the scope itself. The rmdir runs in the handler right after
+	// the release (before `done` closes, which waitClosed already awaited), so the
+	// directory must be GONE.
+	if _, err := os.Stat(resp.ScopePath); !os.IsNotExist(err) {
+		t.Fatalf("the worker scope still exists after EOF (stat err=%v); the daemon must cgroup.kill+rmdir the sibling scope on the relay's peer-EOF (§16b)", err)
 	}
-	_ = os.RemoveAll(resp.ScopePath)
 }
