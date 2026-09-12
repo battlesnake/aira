@@ -133,6 +133,24 @@ func TestRealPytestAitestMeasurementReport(t *testing.T) {
 		assertHonestByteValue(t, field, value)
 	}
 
+	// P1 regression gate (S2a/T4). The honest-value check above ACCEPTS
+	// worker_peak_rss_max == "unevaluated", so it cannot see a silently-zeroed
+	// pool-peak channel. Post-T4 the daemon kill+rmdirs the worker scope on the
+	// relay-EOF that _retire_worker's stdin.close() triggers; if the supervisor's
+	// memory.peak read is placed after that close it races the sub-ms rmdir and
+	// loses (measured: sample_count 1 -> 0). A confined run MUST fold at least one
+	// real per-worker retirement peak, so require it -- this reds against that
+	// read-ordering regression and greens with the fixed ordering.
+	sampleCount, ok := report["worker_peak_rss_sample_count"]
+	if !ok {
+		t.Fatalf("measurement report is missing %q: %s", "worker_peak_rss_sample_count", raw)
+	}
+	if n, isNum := sampleCount.(float64); !isNum || n < 1 {
+		t.Fatalf("worker_peak_rss_sample_count = %v on a confined run; want >= 1 "+
+			"(the pool-peak channel was silently zeroed -- see _retire_worker's peak-read ordering vs the relay close):\n%s",
+			sampleCount, raw)
+	}
+
 	// The per-test memory.current sidecar(s): log every line so the residue curve
 	// is visible in the run output, and confirm a confined run produced at least
 	// one real (non-"unevaluated") reading somewhere (else the report is vacuous).

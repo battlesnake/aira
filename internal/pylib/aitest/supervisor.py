@@ -1758,16 +1758,6 @@ class Supervisor:
         # recorded by the time we get here, so escalating to SIGKILL costs
         # nothing and cannot lose data.
         _reap_child(pid)
-        if state["admit_process"] is not None:
-            # Closing the relay's stdin is the lease RELEASE (S15): the relay's
-            # io.Copy(stdin) returns, it closes its daemon connection, and the daemon
-            # releases this worker's reserve on that EOF. _terminate_process then
-            # bounds the wait and escalates to SIGKILL -- a wedged relay that ignored
-            # its stdin EOF must never abort the whole run over a best-effort wait, and
-            # (equally) must not be left alive HOLDING the connection open, which would
-            # keep the reserve charged in the daemon ledger after the worker is gone.
-            state["admit_process"].stdin.close()
-            _terminate_process(state["admit_process"])
         grant = state.get("grant")
         if grant is not None:
             # AIRA-180 §5s.1. The fold happens HERE, not beside
@@ -1778,10 +1768,30 @@ class Supervisor:
             # completed test, the end-of-run __stop__ broadcast, and the crash
             # path alike -- so capturing anywhere else would have produced a
             # sample set skewed entirely toward crashes, which can only ever look
-            # under-provisioned, never over-provisioned. And it must precede
-            # _forget_worker_scope: that call rmdirs the scope, and memory.peak
-            # goes with it.
+            # under-provisioned, never over-provisioned.
+            #
+            # S2a/T4: this read MUST precede the relay stdin.close() below, not
+            # merely _forget_worker_scope. Post-T4 the daemon kill+rmdirs the
+            # worker's sibling scope on the relay-EOF that stdin.close() triggers
+            # (sub-ms), so a read placed AFTER the close races the daemon's rmdir
+            # and loses memory.peak (measured: pool-peak sample_count 1 -> 0). The
+            # worker is reaped above, so memory.peak is already final here.
             self._observe_worker_usage(grant)
+        if state["admit_process"] is not None:
+            # Closing the relay's stdin is the lease RELEASE (S15): the relay's
+            # io.Copy(stdin) returns, it closes its daemon connection, and the daemon
+            # releases this worker's reserve on that EOF. _terminate_process then
+            # bounds the wait and escalates to SIGKILL -- a wedged relay that ignored
+            # its stdin EOF must never abort the whole run over a best-effort wait, and
+            # (equally) must not be left alive HOLDING the connection open, which would
+            # keep the reserve charged in the daemon ledger after the worker is gone.
+            state["admit_process"].stdin.close()
+            _terminate_process(state["admit_process"])
+        if grant is not None:
+            # _forget_worker_scope rmdirs the scope; post-T4 the daemon may have
+            # already removed it on the relay-EOF above, so this is ENOENT-tolerant
+            # and merely covers the shim / no-daemon-rmdir path. The peak read above
+            # already captured memory.peak while the scope still existed.
             self._forget_worker_scope(grant["scope"])
         # An earlier retirement whose rmdir failed is still charging the ledger;
         # this is the natural moment to try again.
