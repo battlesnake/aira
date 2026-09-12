@@ -48,12 +48,18 @@ import (
 //     unkillable D-state AIRA-35 reports is a hazard of that same reclaim
 //     path.
 //
-// What memory.high was claimed to buy is provided elsewhere: the outer scope
-// is protected by the daemon's aggregate admission guard (committed memory.max
-// summed, plus live supervisor usage, under the ceiling less headroom), not by
-// the throttle, and the proactive-recycle watermark is a USERSPACE comparison
-// in worker.py that needs a number, not a kernel throttle -- it now reads
-// memory.max.
+// What memory.high was claimed to buy is provided elsewhere. The daemon now
+// checks only the SLICE CEILING (a request larger than it is refused up front,
+// worker_admit.go:473) and bounds Σ(leases) <= that ceiling via the signed
+// scope-id lease counter; it no longer scans and sums the outer scope's
+// children (S15 deleted that aggregate scan -- see worker_admit.go:463-466,
+// which leaves the outer scope's own memory.oom.group as the kernel-side bound
+// on Σ(worker caps) <= outer-cap). The outer-scope AGGREGATE bound -- refusing
+// an over-admitting spawn before oom.group has to fire -- is now the
+// CLIENT-SIDE aitest supervisor guard (AIRA-229, supervisor.py
+// _would_breach_outer_cap). And the proactive-recycle watermark is a USERSPACE
+// comparison in worker.py that needs a number, not a kernel throttle -- it now
+// reads memory.max.
 func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
 	backend := newDefaultBackend(outerScope)
 	scope, err := backend.Create(ctx, "worker-"+workerID)

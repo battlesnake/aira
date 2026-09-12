@@ -369,9 +369,15 @@ def fork_worker(scope_path):
     no memory.max of its own (worker_admit.go's workerScopeChildPrefix and
     readWorkerSupervisorMemory notes), so the bound comes entirely from the
     outer scope one level up -- and that one is guaranteed finite by
-    precondition, not by assumption: worker-admit refuses the grant outright
-    (WorkerAdmitReasonOuterScopeUnbounded, "outer scope ... has no finite
-    memory.max") when it is not, and fork_worker is only ever reached on the
+    precondition, not by assumption. The precondition is enforced BEFORE any
+    grant, not by worker-admit: `aira confine` refuses to exec a job whose
+    cgroup ancestry has no finite memory.max (hasFiniteCapAncestor,
+    confine_linux.go:2899), and aitest-bootstrap independently reproves it
+    (scopeHasFiniteMemoryMax, aitest_bootstrap_linux.go:78) before the
+    supervisor admits a single worker. (The WorkerAdmitReasonOuterScopeUnbounded
+    token is catalogue-defined, worker_admit_outcome.go:141, but the daemon
+    never actually emits it -- the precondition is proven earlier, so the relay
+    path this once cited is dead.) fork_worker is only ever reached on the
     granted path. The sharper hazard is therefore not
     a containment break at all (the reviewer-synthesis nuance AIRA-37
     records) but fork-across-threads locking: an after_in_child handler that
