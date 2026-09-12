@@ -327,18 +327,18 @@ func TestOOMSteerNeverGoesBelowTheClassBaseline(t *testing.T) {
 // double-book guard, and it is the finding AIRA-29's own build review made in
 // the opposite direction.
 //
-// A --delegate-ram suite's own waiter charges only the pinned framework
-// overhead; its per-test `aira confine-reserve` sub-reservations carry the real
-// bytes. The parent's memory.current is HIERARCHICAL and already includes every
-// byte they allocated. Comparing 30 GiB of hierarchical usage against a 512 MiB
-// overhead would mark the most compliant job on the machine as the offender —
-// on EVERY full slice, which is exactly when getting it wrong costs a kill.
+// A --delegate-ram suite's own waiter charges only its own (ordinary)
+// parent-scope reserve; its per-worker sub-reservations carry the real bytes.
+// The parent's memory.current is HIERARCHICAL and already includes every byte
+// they allocated. Comparing 30 GiB of hierarchical usage against that small
+// parent reserve would mark the most compliant job on the machine as the
+// offender — on EVERY full slice, which is exactly when getting it wrong costs a kill.
 //
-// The promise is SCOPED to `confine-reserve` children: the parent is spared only
+// The promise is SCOPED to sub-reservation children: the parent is spared only
 // because those children are separate waiters whose reserves are summed into its
 // budget (admitScopeBudgets). Under declared-only accounting an aitest outer
-// scope that books only the 512 MiB DefaultDelegateRAMOverhead and registers no
-// per-test children is NOT excluded — its live usage above that overhead reads
+// scope that books only its small parent reserve and registers no
+// sub-reservation children is NOT excluded — its live usage above that reserve reads
 // as an under-declaration, exactly as the signal now intends.
 func TestOOMSteerDoesNotSteerAnAitestParentWhoseChildrenHoldTheCharge(t *testing.T) {
 	server := NewServer(Paths{})

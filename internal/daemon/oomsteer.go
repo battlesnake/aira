@@ -399,14 +399,14 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 //
 // TWO POPULATIONS, ONE BUDGET, and getting this wrong is the difference between
 // steering the offender and steering the most compliant job on the box. An
-// aitest `--delegate-ram` suite's own waiter charges only the small pinned
-// FRAMEWORK OVERHEAD, because its per-test `aira confine-reserve`
-// sub-reservations are separate scope-less waiters in this same queue that carry
-// the real charge (the double-book AIRA-29's build review found, from the other
-// direction). The parent's memory.current is HIERARCHICAL and already contains
-// every byte those children allocated, so comparing it against the parent's own
-// 512 MiB overhead would mark a perfectly compliant 30 GiB suite as an offender
-// on every full slice. Summing the children into the parent is what makes the
+// aitest `--delegate-ram` suite's own waiter charges only its OWN (ordinary)
+// parent-scope reserve — sized for the supervisor and framework, not the whole
+// suite — because its per-worker sub-reservations are separate waiters in this
+// same queue that carry the real charge (the double-book AIRA-29's build review
+// found, from the other direction). The parent's memory.current is HIERARCHICAL
+// and already contains every byte those children allocated, so comparing it
+// against the parent's own small reserve would mark a perfectly compliant 30 GiB
+// suite as an offender on every full slice. Summing the children into the parent is what makes the
 // comparison apples-to-apples.
 //
 // A sub-reservation whose parent is not a scope-backed waiter here adds nothing:

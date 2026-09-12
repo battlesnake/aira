@@ -651,6 +651,34 @@ func TestSkillNamesNothingFromTheRetiredXdistGovernor(t *testing.T) {
 	}
 }
 
+// TestSkillNamesNothingFromTheCollapsedDelegateRAMModel is the same anti-stale-prose
+// guard for the S2a collapse of --delegate-ram into an ordinary confine job
+// (T07): the deleted aitest-bootstrap verb and the deleted delegate-ram cap-source
+// token must not survive in AIRA's own instructions to other agents, the same
+// fabricated-fact class as an invented zero.
+//
+// verifies: aitest v0.7 S2a T07
+func TestSkillNamesNothingFromTheCollapsedDelegateRAMModel(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := []string{
+		"aitest-bootstrap",  // the deleted subprocess/verb; coordinates now come from the launch env
+		"auto:delegate-ram", // the deleted cap-source token; a delegate scope is now cap-source=auto:daemon-reserve
+	}
+	for _, document := range []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	} {
+		for _, phrase := range retired {
+			if strings.Contains(document.body, phrase) {
+				t.Errorf("%s still describes the collapsed --delegate-ram model: %q (S2a T07 deleted the mechanism; the prose must go with it)", document.name, phrase)
+			}
+		}
+	}
+}
+
 // TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal is the documentation half
 // of AIRA-128.
 //
