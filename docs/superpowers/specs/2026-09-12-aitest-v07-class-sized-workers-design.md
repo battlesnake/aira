@@ -1,5 +1,14 @@
 # aitest v0.7 — class-sized short-lived workers, per-test RAM annotation
 
+> **⚠ SUPERSEDED FOR S2 (2026-09-12).** The owner reinstated the batch **and** moved all quota
+> authority into the daemon. The S2 design is now
+> [`2026-09-12-aitest-v07-s2-daemon-authoritative-design.md`](2026-09-12-aitest-v07-s2-daemon-authoritative-design.md):
+> slice is the one cap; workers are sibling scopes individually reserved against it; `--delegate-ram`
+> becomes an ordinary confine job; batch/prune + ~10 s age cap + peak-vs-reservation warning +
+> OOM-penalty phantom reservation. The class-sized-workers + client-side outer-cap model below is a
+> review-era reversal that the owner has since overturned for S2 — read it for S1 history and the
+> `aira_mem` marker grammar only. **S1 landed and stands; the v7-1 guard below is removed by S2.**
+>
 > **Status:** DESIGN — landed to master for build 2026-09-12; three-lens adversarially reviewed.
 > **The owner-described batch/prune/kick-back flow is REVERSED here** in favour of class-sized
 > short-lived workers + lazy same-class pull (§2 for the reasoning, OD1 for the one-place reinstate
