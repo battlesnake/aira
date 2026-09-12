@@ -1928,6 +1928,52 @@ func TestConfineDelegateRAMDeliversAitestCoordinates(t *testing.T) {
 	}
 }
 
+// TestConfineDelegateRAMNamespacesTheParentSignature pins §16.1/P2-2: a
+// --delegate-ram parent scope holds only the supervisor and framework overhead
+// (its workers are first-class sibling scopes with their own reserves), so
+// admission-estimate and peak-history for the parent must key on a signature
+// DISTINCT from the same argv run WITHOUT --delegate-ram. Sharing the whole-job
+// signature would size the fresh, small parent scope from the stale
+// whole-subtree peak of a plain run and refuse it, or over-book the slice.
+func TestConfineDelegateRAMNamespacesTheParentSignature(t *testing.T) {
+	argv := []string{"/bin/true"}
+	capture := func(t *testing.T, delegate bool) string {
+		t.Helper()
+		scope := &confineFakeScope{}
+		deps := confineUnitDeps(scope)
+		// DelegateRAM writes the scope memory cap; the fake scope has no real fd.
+		deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+		var seen string
+		inner := deps.admit
+		deps.admit = func(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {
+			seen = request.ResourceSignature
+			return inner(ctx, path, request, reserve)
+		}
+		result, err := confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", DelegateRAM: delegate, Argv: argv,
+			SelfPath: os.Args[0], Stderr: io.Discard,
+		}, deps)
+		if err != nil || result.Exit != 0 {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		return seen
+	}
+	plain := capture(t, false)
+	if plain == "" {
+		t.Fatal("non-delegate signature is empty; the capture proves nothing")
+	}
+	delegate := capture(t, true)
+	if delegate == plain {
+		t.Fatalf("delegate parent signature %q must not equal the whole-job signature %q", delegate, plain)
+	}
+	if !strings.HasPrefix(delegate, "aitest-parent\x00") {
+		t.Fatalf("delegate parent signature %q is not namespaced with the aitest-parent marker", delegate)
+	}
+	if !strings.HasSuffix(delegate, plain) {
+		t.Fatalf("delegate signature %q must be the plain signature %q under the namespace prefix", delegate, plain)
+	}
+}
+
 func TestConfineWritesNoLedgerOrRunRecord(t *testing.T) {
 	working := t.TempDir()
 	t.Chdir(working)

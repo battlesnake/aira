@@ -580,6 +580,15 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			signature = computed
 		}
 	}
+	// §16.1/P2-2: a --delegate-ram parent scope is admitted and recorded against a
+	// namespaced signature so its small supervisor+framework footprint never
+	// collides with the whole-job history of the same argv run without
+	// --delegate-ram. Guarded on a non-empty signature: an unresolved argv has no
+	// per-command history to namespace, and bare-prefixing "" would instead pool
+	// every such run under one key.
+	if request.DelegateRAM && signature != "" {
+		signature = AitestParentSignaturePrefix + signature
+	}
 	request.ResourceSignature = signature
 	request.MemoryReserve = reserve
 	request.MemoryReservePinned = pinned

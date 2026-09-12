@@ -88,6 +88,13 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 			signature = computed
 		}
 	}
+	// §16.1/P2-2, same as the real path: a --delegate-ram parent books the
+	// advisory ledger against a namespaced signature so its small
+	// supervisor+framework footprint never inherits the whole-job history of a
+	// plain run of the same argv (which would over-book the ledger here).
+	if request.DelegateRAM && signature != "" {
+		signature = AitestParentSignaturePrefix + signature
+	}
 	request.ResourceSignature = signature
 	request.MemoryReserve = reserve
 	request.MemoryReservePinned = pinned
