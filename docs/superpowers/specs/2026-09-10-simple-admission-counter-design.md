@@ -1,5 +1,22 @@
 # Simple admission counter — RAM + CPU quota, socket-liveness, rigid reconnect
 
+> **⚠ AS-BUILT AMENDMENT (2026-09-12) — the §4 dump layer was CUT during the build.**
+> This document is the DESIGN as approved on 2026-09-11. During implementation the
+> **dump-on-shutdown + reload + kill-probe + unanchored-lease-drop** layer (§4, and its build steps in
+> §14/§15; gate P0-1) was **built, measured, and then removed** (build-slice S13).
+> **Why:** S9's absent-lease re-declare ("establish-granted") already recovers a crash-restart that left
+> *no* dump, so the dump only pre-seeded the ledger for a **slow** re-declarer — a tail the crash-no-dump
+> path already tolerates. The **2 s restart freeze** bounds the physical over-admission window and the
+> **signed ledger** bounds ledger drift, so the dump carried no correctness weight. Cutting it deleted the
+> §4 P1-A "biggest risk" outright — the supervisor-pid `kill -0` indirection that could keep a retired
+> worker's lease forever — plus the unanchored-drop timer: a bug class *removed* rather than hardened.
+> **As-built restart recovery:** the new daemon starts with an EMPTY ledger + a 2 s new-admission freeze;
+> each survivor's held connection reconnects (2/sec) and re-declares its version-frozen ARDR frame to
+> re-anchor its lease; a lease whose holder never re-declares is simply ABSENT (not leaked). Wire
+> **protocol is 11.** Everything else here shipped as designed — the signed scope-id-keyed ledger,
+> socket-liveness release, the version-frozen ARDR re-declare frame + 2 s freeze, CPU as a second
+> per-slice scalar. The slice plan carries the same amendment with the per-slice record.
+
 - **Status**: DESIGN v2 (plan-fixed after the 2026-09-11 plan-review gate returned BLOCK → plan-fix → re-gate).
   Supersedes the unified reservation-admission design (`2026-09-10-unified-reservation-admission-design.md`)
   and the Stage-A/B work built against it. Awaiting re-gate on the deltas.
@@ -128,6 +145,12 @@ flowchart LR
   backstop are the only net**, bounded by orphan lifetime. An intra-slice risk, not "desktop-safe".
 
 ## 4. Daemon restart without reboot — dump on shutdown, reload + kill-probe, re-declare
+
+> **AS-BUILT: this entire section was CUT (build-slice S13).** The dump / reload / kill-probe /
+> unanchored-lease-drop machinery described below was built then removed; see the as-built amendment at the
+> top of this document. What shipped is reconnect + re-declare against an **empty-started** ledger under a
+> 2 s freeze — no dump file, no `kill -0`, no drop timer. The mermaid flow and bullets below are retained
+> as the design-of-record; read them as the rejected-during-build alternative, not the shipped behaviour.
 
 Every connection drops at once; jobs keep their RAM/CPU. The ledger is persisted on graceful shutdown and
 reloaded (liveness-checked) on a quick restart, then refined by reconnect/re-declare. **No cgroup scan.** All

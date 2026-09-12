@@ -8,6 +8,21 @@ Advisor confirmed the phase structure and gave concrete corrections (move the ad
 
 # Admission-counter rebuild — ordered slice plan
 
+> **⚠ AS-BUILT AMENDMENT (2026-09-12) — the dump layer (planned as S10/S11) was CUT during S13.**
+> The **dump-on-shutdown + reload + kill-probe + unanchored-lease-drop** machinery this plan sequences as
+> S10 ("Dump-on-shutdown") and S11 ("★ single riskiest slice ★") was **built, measured, then removed**
+> during the S13 build. **Why:** S9's absent-lease re-declare (establish-granted) already recovers a
+> crash-restart with no dump, so the dump only pre-seeded the ledger for a *slow* re-declarer — a tail the
+> crash-no-dump path already tolerates. The 2 s restart freeze bounds physical over-admission and the
+> signed ledger bounds drift, so the dump was not load-bearing; deleting it removed the §4 P1-A "biggest
+> risk" (the supervisor-pid `kill -0` leak) and the unanchored-drop timer as a bug class.
+> **As-built restart recovery:** the new daemon starts with an EMPTY ledger + a 2 s freeze; survivors
+> reconnect + re-declare (version-frozen ARDR) to re-anchor; a lease whose holder never re-declares is
+> simply absent. **The S10/S11 BUILT records below are retained as the historical build-log** (they record
+> what was built before the cut); the "Single riskiest slice" and "merge-gate" summary sections near the
+> end have been updated to the as-built reality. Wire protocol shipped at **11**. Net across the whole
+> rebuild vs `041a5bc`: **−3,382 lines** (136 files).
+
 Branch `admission-counter-planfix`. Each slice = one two-loop (Opus builds, Fable reviews); each DELETE is its own loop. Heavy Go build/test under `aira confine --`; exact exit code recorded, never green-from-truncation. Line refs are per the maps @ v0.5 (`041a5bc`); where maps 3 and 6 disagree on a range, trust map 3 (it opened the file).
 
 ## Decision gates (owner/gate calls, resolve before the noted slice — not code)
@@ -233,11 +248,19 @@ Branch `admission-counter-planfix`. Each slice = one two-loop (Opus builds, Fabl
 ---
 
 ## Single riskiest slice
-**S11** (reload + kill-probe + unanchored-drop + restart-freeze). The dump records the **supervisor** pid, which outlives its workers, so `kill -0` alone leaks a retired worker's lease — the drop-after-grace timer is the real safety, `kill -0` only an early-drop optimisation (spec §4 P1-A, self-named "the biggest risk"). Runner-ups: **S4** (physical-floor delete — silent, load-bearing, owner-signed) and **S14** (exclusive-drain emptiness rewire — silent correctness regression, gated by D5). Sharpest ordering hazard: **S12 before S13, after S11** (adopted addend removed too early ⇒ post-restart over-admission).
+> **AS-BUILT:** the slice named below (S11, the dump layer) was **CUT in S13** — its `kill -0`/unanchored-drop
+> leak class was deleted, not shipped. The riskiest *surviving* work was **S13** (client reconnect + re-declare
+> against an empty-started ledger — the sole post-restart recovery once the dump was gone) and **S15**
+> (worker-admit onto the signed ledger + the AIRA-41 EOF-release reversal). Both were mutation-verified against
+> a REAL daemon restart, not a stub. The original assessment is kept below for the record.
+
+~~**S11** (reload + kill-probe + unanchored-drop + restart-freeze). The dump records the **supervisor** pid, which outlives its workers, so `kill -0` alone leaks a retired worker's lease — the drop-after-grace timer is the real safety, `kill -0` only an early-drop optimisation (spec §4 P1-A, self-named "the biggest risk").~~ Runner-ups: **S4** (physical-floor delete — silent, load-bearing, owner-signed) and **S14** (exclusive-drain emptiness rewire — silent correctness regression, gated by D5). Sharpest ordering hazard: **S12 before S13, after S11** (adopted addend removed too early ⇒ post-restart over-admission).
 
 ## Mandatory real restart-under-load merge-gate test (staged)
 Real cgroups, under `aira confine --`, exact exit code recorded, never claimed green from truncated output.
-- **Confine-only form — gates S13 exit:** dump on graceful shutdown → reload + kill-probe → dead pids dropped → survivors reconnect + re-declare → **no double-count, no over-admit**; plus the reconnect-race interleaving pin (both lock orders, seam-forced) and the old-frame→new-parser golden-bytes charge pin.
-- **Full form — gates branch merge (after S16):** the above **with an aitest worker retiring mid-drain across the restart** (exercises the unanchored-lease-drop) and `exclusive=lost` across restart (§15 P2-D).
+> **AS-BUILT (no dump):** the dump/reload/kill-probe was cut in S13, so both forms below are reshaped: the
+> new daemon starts with an EMPTY ledger + 2 s freeze and recovers *only* by reconnect + re-declare.
+- **Confine-only form — gates S13 exit (shipped `restart_merge_gate_real_cgroup_linux_test.go`):** real daemon A → graceful stop (**no** dump) → B starts empty + 2 s freeze → survivor keepers reconnect + re-declare the version-frozen ARDR frame → re-anchor; **Σleases == exactly the survivors' `grant.Reserve`, keyed verbatim** (positive re-anchor, not `≤`); a killed pid's lease is ABSENT; a fresh admit dialled during the freeze waits; the old-frame→new-parser golden-bytes charge pin. 3 mutations RED.
+- **Full form — gates branch merge (after S16):** the confine gate's assertions **plus the WORKER-LEASE path** — a real aitest suite (≥2 workers) under a real daemon, restarted **after the pool is full and stable**, asserting: (1) surviving workers' relay keepers re-anchor, Σ exact + keyed verbatim; (2) `daemon_available` stays true across the restart (the S16 empty-pool-claim-disables-daemon false-pass is avoided by restarting only when the pool is full); (3) a worker retired **while A is still live** has its lease dropped via the real `aira worker-admit` relay's EOF (AIRA-41 EOF-release under real load), then B holds exactly N−1; `exclusive=lost` across restart (§15 P2-D); ACTUAL pool growth via probe→claim (not empty-pool fallback). Plus the full-branch `go test ./...` + `-race` on `internal/daemon`+`internal/runner`. Mutations: disable the relay keeper's reconnect → a survivor's lease absent → (1) reds; re-add a supervisor fail-open on the restart EOF → (2) reds.
 
 Draft saved at `/tmp/claude-1000/-home-mark-claude-aira/f2623d20-c3ca-4d22-b003-91a9d2a30768/scratchpad/slice-plan.md`.
