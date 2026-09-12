@@ -10,12 +10,21 @@ import (
 	"os"
 )
 
-// CreateWorkerScope creates one worker's cgroup as a child of outerScope
-// (already delegated by BootstrapAitestSupervisor), with a hard memory.max
-// cap, memory.swap.max=0, and memory.oom.group=1 so a runaway inside this one
-// worker self-contains (spec 3.3: per-worker hard cap, not a pool-level cap
-// only). It returns the scope path and the SWAP-CAP DISPOSITION, one of the
-// WorkerAdmitSwapCap* values, which the daemon puts on the grant line.
+// CreateWorkerScope creates one worker's cgroup as a child of parent, with a
+// hard memory.max cap, memory.swap.max=0, and memory.oom.group=1 so a runaway
+// inside this one worker self-contains (spec 3.3: per-worker hard cap, not a
+// pool-level cap only). It returns the scope path and the SWAP-CAP DISPOSITION,
+// one of the WorkerAdmitSwapCap* values, which the daemon puts on the grant line.
+//
+// S2a §4: parent is the SLICE (aira.slice), not the outer confine scope — each
+// worker scope is a SIBLING directly under the slice, created via the same
+// ordinary confine scope-creation path (the slice already carries +memory/+cpu
+// via ensureConfineDelegation, so a just-created child exposes memory.* and a
+// forking worker's place_self can migrate across the common ancestor). The old
+// nesting under the outer scope is gone, so there is no shared smaller-than-slice
+// cap for an aggregate oom.group to whole-suite-kill; each worker's own
+// memory.oom.group is the only kernel-side bound on its own footprint, and the
+// daemon's signed ledger bounds Σ(all leases) ≤ the slice ceiling.
 //
 // AIRA-35 removed this scope's memory.high, and it is worth saying why rather
 // than leaving a reader to wonder where the soft throttle went. Two measured
@@ -48,20 +57,17 @@ import (
 //     unkillable D-state AIRA-35 reports is a hazard of that same reclaim
 //     path.
 //
-// What memory.high was claimed to buy is provided elsewhere. The daemon now
-// checks only the SLICE CEILING (a request larger than it is refused up front,
-// worker_admit.go:473) and bounds Σ(leases) <= that ceiling via the signed
-// scope-id lease counter; it no longer scans and sums the outer scope's
-// children (S15 deleted that aggregate scan -- see worker_admit.go:463-466,
-// which leaves the outer scope's own memory.oom.group as the kernel-side bound
-// on Σ(worker caps) <= outer-cap). The outer-scope AGGREGATE bound -- refusing
-// an over-admitting spawn before oom.group has to fire -- is now the
-// CLIENT-SIDE aitest supervisor guard (AIRA-229, supervisor.py
-// _would_breach_outer_cap). And the proactive-recycle watermark is a USERSPACE
-// comparison in worker.py that needs a number, not a kernel throttle -- it now
-// reads memory.max.
-func CreateWorkerScope(ctx context.Context, outerScope, scopeName string, memoryMax int64) (string, string, error) {
-	backend := newDefaultBackend(outerScope)
+// What memory.high was claimed to buy is provided elsewhere. The daemon checks
+// only the SLICE CEILING (a request larger than it is refused up front) and
+// bounds Σ(leases) <= that ceiling via the signed scope-id lease counter; it does
+// not scan or sum any per-suite subtree. With workers as siblings under the slice
+// (S2a §4) there is no shared smaller-than-slice parent cap at all, so there is no
+// aggregate for an oom.group to whole-suite-kill (AIRA-229) and no client-side
+// aggregate guard either (the v7-1 guard was excised in the same S2a slice). And
+// the proactive-recycle watermark is a USERSPACE comparison in worker.py that
+// needs a number, not a kernel throttle -- it now reads memory.max.
+func CreateWorkerScope(ctx context.Context, parent, scopeName string, memoryMax int64) (string, string, error) {
+	backend := newDefaultBackend(parent)
 	scope, err := backend.Create(ctx, scopeName)
 	if err != nil {
 		return "", "", fmt.Errorf("aitest worker scope: create: %w", err)
@@ -94,7 +100,7 @@ func CreateWorkerScope(ctx context.Context, outerScope, scopeName string, memory
 		return removeUnusableScope("memory cap", err)
 	}
 	// ORDER IS LOAD-BEARING: the swap cap is written only AFTER the memory cap
-	// has succeeded. Run it first and an outer scope with no +memory in its
+	// has succeeded. Run it first and a parent scope with no +memory in its
 	// subtree_control -- which exposes NO memory.* files at all -- would return
 	// ENOENT for memory.swap.max, and that ENOENT would be misread below as
 	// "this kernel has no swap support" rather than "this cgroup has no memory
@@ -105,5 +111,5 @@ func CreateWorkerScope(ctx context.Context, outerScope, scopeName string, memory
 	if err != nil {
 		return removeUnusableScope("swap cap", err)
 	}
-	return WorkerScopeChildPath(outerScope, scopeName), swapCap, nil
+	return WorkerScopeChildPath(parent, scopeName), swapCap, nil
 }

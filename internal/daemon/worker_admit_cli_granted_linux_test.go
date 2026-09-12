@@ -139,13 +139,16 @@ type relayExit struct {
 // verifies: AIRA-41
 func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// First, so an unusable host skips before paying for a build.
-	outer := realOuterScope(t)
+	outer, parent := realOuterScope(t)
 	binary := buildAiraBinary(t)
 
 	const ceiling = 128 << 20
 	const request = 32 << 20
 
-	const slicePath = "/test-slice"
+	// S2a §4: worker scopes are siblings under the resolved slice, so the daemon is
+	// pointed at the real `parent` (the aira.slice stand-in) rather than a fake path
+	// — the worker scope is really created under it.
+	slicePath := parent
 	paths := testPaths(t)
 	server := NewServer(paths)
 	server.restartFreeze = 0
@@ -246,10 +249,11 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 		t.Fatalf("outcome=%v, want a grant", fields)
 	}
 	scopePath := fields["scope"]
-	// Task 1: the granted scope is a first-class confine child of `outer`,
-	// CONFINE-aitest-w<seq>-<parentPid>-<stamp>, not a `.aira-worker-N` child.
-	if dir := filepath.Dir(scopePath); dir != outer {
-		t.Fatalf("granted scope=%q is not a child of outer %q", scopePath, outer)
+	// Task 1 + S2a §4: the granted scope is a first-class confine SIBLING under the
+	// resolved slice (parent), CONFINE-aitest-w<seq>-<parentPid>-<stamp>, not a
+	// `.aira-worker-N` child nested under outer.
+	if dir := filepath.Dir(scopePath); dir != parent {
+		t.Fatalf("granted scope=%q is a child of %q, want the resolved slice %q", scopePath, filepath.Dir(scopePath), parent)
 	}
 	base := strings.TrimPrefix(filepath.Base(scopePath), ".aira-")
 	if nm, pid, _, _, ok := runner.ParseConfineScopeID(base); !ok || !strings.HasPrefix(nm, "aitest-w") || pid != realOuterParentPID {

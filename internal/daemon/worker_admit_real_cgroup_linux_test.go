@@ -19,33 +19,36 @@ import (
 // tests assert the worker name carries THIS pid.
 const realOuterParentPID = 111111
 
-// realOuterScope builds a delegated, memory-controlled outer scope shaped like the
-// one BootstrapAitestSupervisor leaves behind, so worker children really expose
-// memory.max/memory.oom.group. Its directory is a CANONICAL confine scope id
-// (Task 1): the daemon parses the parent supervisor pid out of it to mint the
-// worker scope name, and refuses a worker whose parent scope id does not parse.
-func realOuterScope(t *testing.T) string {
+// realOuterScope builds a delegated, memory-controlled parent (the stand-in for
+// aira.slice) holding a canonical-confine-id outer scope, and returns BOTH. The
+// outer directory is a CANONICAL confine scope id (Task 1): the daemon parses the
+// parent supervisor pid out of it to mint the worker scope name, and refuses a
+// worker whose parent scope id does not parse. S2a §4: worker scopes are created as
+// SIBLINGS under the parent (the resolved slice), not nested under outer, so the
+// PARENT carries +memory (worker children expose memory.max/memory.oom.group there);
+// the daemon must be pointed at `parent` as its slice.
+func realOuterScope(t *testing.T) (outer, parent string) {
 	t.Helper()
-	parent := cgrouptest.IsolatedScopeParent(t)
+	parent = cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
 	}
-	outer := filepath.Join(parent, ".aira-CONFINE-outer-111111-1")
+	outer = filepath.Join(parent, ".aira-CONFINE-outer-111111-1")
 	if err := os.Mkdir(outer, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(outer, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "cannot delegate memory into the outer scope: %v", err)
 	}
-	return outer
+	return outer, parent
 }
 
 // realWorkerAdmitServer builds a server that admits worker leases through the REAL
-// runner.CreateWorkerScope against `outer`, with only the slice memory reading
-// stubbed so the admission arithmetic is deterministic. (S2a: worker ids are
-// unique by construction, so there is no longer an id re-seed readdir.) The
-// unified ledger's slice is a fixed path (the cgroup objects the tests care about
-// are all real, under `outer`).
+// runner.CreateWorkerScope, creating each worker scope as a SIBLING under slicePath
+// (the resolved slice — pass the real `parent`), with only the slice memory reading
+// stubbed so the admission arithmetic is deterministic. (S2a: worker ids are unique
+// by construction, so there is no longer an id re-seed readdir; and S2a §4 places
+// worker scopes under the slice, not the outer scope.)
 func realWorkerAdmitServer(t *testing.T, slicePath string, sliceMax int64) *Server {
 	t.Helper()
 	server := NewServer(Paths{})
@@ -65,8 +68,8 @@ func realWorkerAdmitServer(t *testing.T, slicePath string, sliceMax int64) *Serv
 // daemon (long-lived) calls runner.CreateWorkerScope once per aitest worker, so an
 // unclosed directory FD accumulates until a finalizer happens to run.
 func TestCreatingWorkerScopesDoesNotLeakFileDescriptors(t *testing.T) {
-	outer := realOuterScope(t)
-	server := realWorkerAdmitServer(t, "/test-slice", 1<<40)
+	outer, parent := realOuterScope(t)
+	server := realWorkerAdmitServer(t, parent, 1<<40)
 	openFDs := func() int {
 		t.Helper()
 		entries, err := os.ReadDir("/proc/self/fd")
@@ -112,19 +115,20 @@ func TestCreatingWorkerScopesDoesNotLeakFileDescriptors(t *testing.T) {
 // while the scope directory persists (the daemon does not rmdir on EOF — that is
 // supervisor.py's _forget_worker_scope after it reaps the worker).
 func TestWorkerAdmitCreatesARealWorkerScopeAndEOFFreesTheLedger(t *testing.T) {
-	outer := realOuterScope(t)
+	outer, parent := realOuterScope(t)
 	const sliceMax = 128 << 20
 	const request = 32 << 20
-	server := realWorkerAdmitServer(t, "/test-slice", sliceMax)
+	server := realWorkerAdmitServer(t, parent, sliceMax)
 
 	resp, client, done := startWorkerAdmit(t, server, workerArgs(outer, request, false, 0))
 	if resp.State != runner.WorkerAdmitStateGranted {
 		t.Fatalf("resp=%+v", resp)
 	}
-	// The granted scope is a first-class confine child of `outer` whose name
-	// embeds the PARENT supervisor pid (Task 1), not a `.aira-worker-N` child.
-	if dir := filepath.Dir(resp.ScopePath); dir != outer {
-		t.Fatalf("ScopePath=%q is not a child of outer %q", resp.ScopePath, outer)
+	// S2a §4: the granted scope is a first-class confine SIBLING under the parent
+	// (the resolved slice), whose name embeds the PARENT supervisor pid (Task 1),
+	// not a `.aira-worker-N` child nested under outer.
+	if dir := filepath.Dir(resp.ScopePath); dir != parent {
+		t.Fatalf("ScopePath=%q is a child of %q, want the resolved slice %q", resp.ScopePath, dir, parent)
 	}
 	base := strings.TrimPrefix(filepath.Base(resp.ScopePath), ".aira-")
 	if nm, pid, _, _, ok := runner.ParseConfineScopeID(base); !ok || !strings.HasPrefix(nm, "aitest-w") || pid != realOuterParentPID {
@@ -143,14 +147,14 @@ func TestWorkerAdmitCreatesARealWorkerScopeAndEOFFreesTheLedger(t *testing.T) {
 		}
 	}
 	// The unified ledger charges the reserve while the lease is held.
-	if out, _, jobs := sliceLedger(t, server, "/test-slice"); out != request || jobs != 1 {
+	if out, _, jobs := sliceLedger(t, server, parent); out != request || jobs != 1 {
 		t.Fatalf("ledger outstanding=%d jobs=%d, want (%d, 1)", out, jobs, request)
 	}
 
 	// The holder's EOF frees the ledger IMMEDIATELY...
 	_ = client.Close()
 	waitClosed(t, done, "worker handler to return on EOF")
-	if out, _, jobs := sliceLedger(t, server, "/test-slice"); out != 0 || jobs != 0 {
+	if out, _, jobs := sliceLedger(t, server, parent); out != 0 || jobs != 0 {
 		t.Fatalf("ledger outstanding=%d jobs=%d after EOF, want released (0, 0)", out, jobs)
 	}
 	// ...but the daemon did NOT remove the scope directory: RAM returns at EOF, not

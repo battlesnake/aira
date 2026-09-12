@@ -347,10 +347,12 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 
 	// BLOCKING CLAIM (design §8 v1 scheduler): reserve {ram, one core} on the unified
 	// ledger and wait until it fits conjunctively (RAM AND CPU), then create the
-	// worker's cgroup sub-scope and hold the lease. There is no outer-cap aggregate
-	// scan any more (S15 deleted it); the outer scope's own memory.oom.group is the
-	// kernel-side bound on Σ(worker caps) ≤ outer-cap (design §8/§10 Inv 2), and the
-	// unified ledger bounds Σ(all leases) ≤ the slice ceiling.
+	// worker's cgroup scope as a SIBLING directly under the slice (S2a §4) and hold
+	// the lease. There is no outer-cap aggregate scan, and no shared smaller-than-slice
+	// parent cap either: each worker's own memory.oom.group bounds its own footprint,
+	// and the unified ledger bounds Σ(all leases) ≤ the slice ceiling. AIRA-229's
+	// whole-suite kill and AIRA-232's multi-supervisor breach dissolve under this
+	// topology (design §11) — there is no aggregate for an outer oom.group to kill.
 
 	// Exceeds-ceiling fast-fail, BEFORE the worker-id allocation reads the tree: a
 	// request larger than the whole slice ceiling can never fit, so refuse it up
@@ -398,7 +400,10 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		}
 		seq := int(s.workerScopeSeq.Add(1))
 		scopeID = runner.MintWorkerScopeID(seq, parentPID)
-		scopePath = runner.WorkerScopeChildPath(req.outerScope, scopeID)
+		// S2a §4: the worker scope is a SIBLING under the resolved slice (path), not
+		// nested under req.outerScope. req.outerScope now serves only the mode-agreement
+		// sentinel check above and the parent↔worker linkage carried in parentScopeID.
+		scopePath = runner.WorkerScopeChildPath(path, scopeID)
 		workerID = strconv.Itoa(seq)
 	}
 
@@ -482,14 +487,16 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		reserved = req.estimatedBytes
 		memoryMax = 0
 	} else {
-		// The daemon creates the worker's cgroup sub-scope AFTER the grant — never
-		// under queue.mu (the evaluator must do no filesystem I/O). The ledger already
-		// charges the reserve; a creation failure discharges it.
+		// The daemon creates the worker's cgroup scope AFTER the grant — never under
+		// queue.mu (the evaluator must do no filesystem I/O). It is created as a SIBLING
+		// under the resolved slice (path), via the ordinary confine scope-creation path,
+		// NOT nested under req.outerScope (S2a §4). The ledger already charges the
+		// reserve; a creation failure discharges it.
 		create := s.workerScopeCreate
 		if create == nil {
 			create = runner.CreateWorkerScope
 		}
-		sp, sc, createErr := create(peerCtx, req.outerScope, scopeID, req.estimatedBytes)
+		sp, sc, createErr := create(peerCtx, path, scopeID, req.estimatedBytes)
 		if createErr != nil {
 			release()
 			// Fail closed: no grant is delivered without its scope. request-invalid is

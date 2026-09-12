@@ -284,11 +284,13 @@ func TestWorkerAdmitGrantsAndChargesLedger(t *testing.T) {
 	if resp.WorkerID != "1" {
 		t.Fatalf("resp=%+v, want worker id 1 (the first daemon-monotonic seq)", resp)
 	}
-	// Task 1: the grant names a first-class confine scope under the outer scope,
+	// Task 1 + Task 3: the grant names a first-class confine scope,
 	// CONFINE-aitest-w<seq>-<parentPid>-<stamp>, whose pid slot is the PARENT
-	// supervisor pid parsed from the parent scope id — not a `.aira-worker-N` child.
-	if dir := filepath.Dir(resp.ScopePath); dir != workerTestOuterScope {
-		t.Fatalf("ScopePath=%q is not a child of the outer scope %q", resp.ScopePath, workerTestOuterScope)
+	// supervisor pid parsed from the parent scope id — not a `.aira-worker-N` child —
+	// created as a SIBLING directly under the resolved slice, NOT nested under the
+	// outer scope.
+	if dir := filepath.Dir(resp.ScopePath); dir != "/slice" {
+		t.Fatalf("ScopePath=%q is a child of %q, want the resolved slice %q (siblings under the slice)", resp.ScopePath, dir, "/slice")
 	}
 	base := strings.TrimPrefix(filepath.Base(resp.ScopePath), ".aira-")
 	if nm, pid, _, _, ok := runner.ParseConfineScopeID(base); !ok || !strings.HasPrefix(nm, "aitest-w") || pid != workerTestParentPID {
@@ -308,6 +310,38 @@ func TestWorkerAdmitGrantsAndChargesLedger(t *testing.T) {
 	outstanding, _, jobs := sliceLedger(t, server, "/slice")
 	if outstanding != workerTestMiB || jobs != 1 {
 		t.Fatalf("ledger outstanding=%d jobs=%d, want the worker lease charged (%d, 1)", outstanding, jobs, workerTestMiB)
+	}
+	_ = done
+}
+
+// verifies: S2a Task 3 — a worker scope is created as a SIBLING directly under the
+// resolved slice, NOT nested under the outer confine scope. The daemon passes the
+// slice it resolves (the same path the ledger charges) as the create parent, so
+// worker RAM no longer charges hierarchically up to the outer cap and the pool is
+// bounded only by the one slice ledger + each worker's own memory.max.
+//
+// MUTATION: revert workerAdmitConnection to pass req.outerScope as the create parent
+// -> the captured parent is workerTestOuterScope and this test REDS.
+func TestWorkerAdmitCreatesScopeUnderSliceNotOuterScope(t *testing.T) {
+	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
+	var gotParent string
+	server.workerScopeCreate = func(_ context.Context, parent, scopeName string, _ int64) (string, string, error) {
+		gotParent = parent
+		return runner.WorkerScopeChildPath(parent, scopeName), runner.WorkerAdmitSwapCapNotApplicable, nil
+	}
+	resp, client, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, false, 0))
+	defer client.Close()
+	if resp.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("resp=%+v, want granted", resp)
+	}
+	if gotParent != "/slice" {
+		t.Fatalf("worker scope create parent=%q, want the resolved slice %q (siblings under the slice, not the outer scope)", gotParent, "/slice")
+	}
+	if gotParent == workerTestOuterScope {
+		t.Fatalf("worker scope create parent is still the outer scope %q; T3 places workers as slice siblings", workerTestOuterScope)
+	}
+	if dir := filepath.Dir(resp.ScopePath); dir != "/slice" {
+		t.Fatalf("ScopePath=%q parent=%q, want the slice %q", resp.ScopePath, dir, "/slice")
 	}
 	_ = done
 }

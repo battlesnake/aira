@@ -289,6 +289,17 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
 	}
+	// S2a §4/§16: worker scopes are now SIBLINGS created directly under the daemon's
+	// resolved slice, not nested under the outer scope. The daemon is pointed at THIS
+	// isolated parent as its slice (SetAdmitResolveSliceForTest below), so a finite
+	// memory.max on the parent is required for admission to read a ceiling — and it
+	// keeps the test worker scopes off the production aira.slice (cgrouptest forbids
+	// production-named scopes there). 16 GiB is well clear of the default 2 GiB slice
+	// headroom, so a real pool of a few workers always admits; each worker's own
+	// memory.max (not this cap) is what the OOM leg exercises.
+	if err := os.WriteFile(filepath.Join(parent, "memory.max"), []byte("17179869184"), 0o644); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot set slice-parent memory.max: %v", err)
+	}
 	// NO ancestor memory.swap.max here, and its ABSENCE is load-bearing
 	// (AIRA-35).
 	//
@@ -339,10 +350,15 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 		t.Fatal(err)
 	}
 	server := daemon.NewServer(paths)
-	// S15: worker leases charge the unified signed ledger against the real
-	// aira.slice ceiling (this e2e runs the real daemon against the real slice), so
-	// no worker-specific headroom override is needed — the real slice has ample room
-	// for the suite's real workers.
+	// S2a §16: point the daemon at the ISOLATED harness parent as its slice, rather
+	// than the production aira.slice. Post-S2a a worker scope is created as a sibling
+	// under whatever the daemon resolves; against the real aira.slice that would drop
+	// production-named `.aira-CONFINE-aitest-w*` scopes onto the live slice (forbidden
+	// by cgrouptest, and counted by production scans). The parent carries a finite
+	// memory.max (written above) so the ledger has a ceiling to charge against.
+	server.SetAdmitResolveSliceForTest(func(string) (string, bool, string) {
+		return parent, true, ""
+	})
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())
