@@ -1803,11 +1803,9 @@ func monitorScopeMembership(scope Scope, leader PIDIdentity, initialMembers []in
 		if _, present := memberNow[leader.PID]; !present && processLive(leader) == processAlive {
 			// Absence from the scope's own cgroup.procs is not itself a
 			// migration: the leader may have relocated ITSELF into a
-			// descendant cgroup it created (aitest's supervisor moving into
-			// `outer/.aira-supervisor` before forking per-worker sub-scopes,
-			// a podman --cgroups=split nested container, or any other
-			// legitimate nesting) and remain genuinely within the scope
-			// subtree the whole time. Apply the same subtree-aware witness
+			// descendant cgroup it created (a podman --cgroups=split nested
+			// container, or any other legitimate nesting) and remain genuinely
+			// within the scope subtree the whole time. Apply the same subtree-aware witness
 			// the descendant loop below already uses instead of the leaf-only
 			// membership test.
 			observation := observeProcessCgroup(leader, scope.Reference())
@@ -2357,9 +2355,8 @@ func captureCode(err error) string {
 // Scope.Empty() reads cgroup.events `populated`, which is SUBTREE-aware. They
 // are two independent sources and they legitimately disagree, in one direction,
 // for one very common shape: a job whose processes live in child cgroups it
-// created inside its own scope. BootstrapAitestSupervisor drains EVERY pid of a
-// --delegate-ram/aitest job into <outer>/.aira-supervisor and .aira-worker-N;
-// `podman --cgroups=split` does the same; so does any nested-cgroup workload.
+// created inside its own scope. `podman --cgroups=split` does exactly this, as
+// does any nested-cgroup workload.
 // Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.SubtreePopulated's
 // own doc comment says so. Gating on the leaf read alone made --timeout and
 // --cpu-timeout INERT against exactly that job: the deadline fired,

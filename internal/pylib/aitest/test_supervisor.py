@@ -54,39 +54,25 @@ def _write_stub(path, body):
     return str(path)
 
 
-def test_bootstrap_parses_outer_scope_on_success(tmp_path, monkeypatch):
-    stub = _write_stub(tmp_path / "bootstrap-ok", """
-import sys
-print("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", stub)
+def test_bootstrap_reads_the_launcher_coordinates(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", "/outer")
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     supervisor = Supervisor()
     supervisor.bootstrap()
     assert supervisor.outer_scope == "/outer"
-    assert supervisor.supervisor_scope == "/outer/.aira-supervisor"
+    assert supervisor.admission_mode == "cgroup-sub-scope"
+    # S2a: the supervisor runs in the outer scope's own leaf; there is no
+    # relocated child scope, so supervisor_scope stays unset.
+    assert supervisor.supervisor_scope is None
     assert supervisor.daemon_available is True
 
 
-def test_bootstrap_disables_daemon_when_command_unset(monkeypatch):
-    monkeypatch.delenv("AIRA_AITEST_BOOTSTRAP_CMD", raising=False)
+def test_bootstrap_disables_daemon_when_outer_scope_unset(monkeypatch):
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
     supervisor = Supervisor()
     supervisor.bootstrap()
     assert supervisor.daemon_available is False
-    assert supervisor.outer_scope is None
-
-
-def test_bootstrap_disables_daemon_on_nonzero_exit(tmp_path, monkeypatch, capsys):
-    stub = _write_stub(tmp_path / "bootstrap-fail", """
-import sys
-sys.stderr.write("boom\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", stub)
-    supervisor = Supervisor()
-    supervisor.bootstrap()
-    assert supervisor.daemon_available is False
-    assert "boom" in capsys.readouterr().err
+    assert not supervisor.outer_scope
 
 
 def _outcome_stub(tmp_path, monkeypatch, name, line, stderr="", hold_stdin=False, exit_code=1):
@@ -632,11 +618,6 @@ def test_next_nodeid_and_requeue_once_semantics():
 def test_recycle_after_max_tests_respawns_a_fresh_worker(tmp_path, monkeypatch, pytester):
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit_calls = tmp_path / "admit-calls"
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
@@ -647,7 +628,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
 
@@ -686,11 +668,6 @@ def test_recycle_with_two_concurrent_workers_does_not_hang_on_retirement(tmp_pat
     self.workers at the same time)."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit_calls = tmp_path / "admit-calls-2"
     admit = _write_stub(tmp_path / "worker-admit-2", f"""
 import os, sys
@@ -701,7 +678,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
 
@@ -889,11 +867,6 @@ def test_spawn_worker_removes_the_granted_scope_dir_on_placement_failure(tmp_pat
 def test_crash_mid_test_requeues_once_then_reports_unevaluated(tmp_path, monkeypatch, pytester):
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
@@ -902,7 +875,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -928,11 +902,6 @@ def test_crash_on_one_worker_does_not_corrupt_sibling_worker_results(tmp_path, m
     test above insufficient for this regression."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
@@ -941,7 +910,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -1229,11 +1199,6 @@ def test_persistent_denial_at_last_worker_retirement_never_ends_run_early(tmp_pa
     replacement admission call denies several times before granting."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     denial_state = tmp_path / "denials-remaining"
     denial_state.write_text("5")
     call_count_path = tmp_path / "admit-call-count"
@@ -1257,7 +1222,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
     monkeypatch.setattr("aitest.supervisor._DENIAL_RETRY_SECONDS", 0.01)
@@ -1279,7 +1245,7 @@ sys.stdin.buffer.read()
 
 
 def test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subprocess(tmp_path, monkeypatch, pytester, capsys):
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", str(tmp_path / "missing-bootstrap"))
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
     monkeypatch.delenv("AIRA_AITEST_WORKER_ADMIT_CMD", raising=False)
 
@@ -1317,18 +1283,14 @@ def test_malformed_worker_grant_is_terminal_without_losing_collected_results(tmp
     KeyError escapes spawn_worker."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit-malformed", """
 import sys
 print("aira-worker-admit state=granted class=granted containment=enforced scope=/outer/.aira-worker-1 worker_id=1")
 sys.stdout.flush()
 sys.exit(0)
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -1364,11 +1326,6 @@ def test_worker_admit_denied_does_not_disable_daemon_and_still_completes(tmp_pat
     fallback warning emitted at all)."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     denial_state = tmp_path / "denials-remaining"
     denial_state.write_text("2")
     admit = _write_stub(tmp_path / "worker-admit", f"""
@@ -1385,7 +1342,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -1431,11 +1389,6 @@ def test_request_too_large_at_last_worker_replacement_marks_queue_unevaluated(tm
     retiring" case, not the startup path."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     call_state = tmp_path / "admit-calls"
     call_state.write_text("0")
     admit = _write_stub(tmp_path / "worker-admit", f"""
@@ -1456,7 +1409,8 @@ else:
     print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
     sys.exit(1)
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")  # force recycle after test_one
 
@@ -1492,17 +1446,13 @@ def test_worker_admit_request_too_large_marks_queue_unevaluated_without_disablin
     containment was never actually unavailable)."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit", """
 import sys
 print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
 sys.exit(1)
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -1539,11 +1489,6 @@ def test_persistent_denial_never_disables_daemon_or_falls_back(tmp_path, monkeyp
     slightly bigger budget."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     denial_state = tmp_path / "denials-remaining"
     denial_state.write_text("8")
     admit = _write_stub(tmp_path / "worker-admit", f"""
@@ -1560,7 +1505,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setattr("aitest.supervisor._DENIAL_RETRY_SECONDS", 0.01)
 
@@ -1588,11 +1534,6 @@ def test_dispatch_handles_parametrized_nodeid_containing_a_space(tmp_path, monke
     instead, since outcome never contains one."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
@@ -1601,7 +1542,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -1696,11 +1638,6 @@ def test_fallback_worker_count_capped_at_pool_size_not_added_on_top(tmp_path, mo
     cap this pins is min(worker_count, max_workers_fallback) from zero, never
     max_workers_fallback. Here worker_count=3 < max_workers_fallback=5, so the
     fallback pool must be capped at 3, proving --aitest-workers is honoured."""
-    bootstrap = _write_stub(tmp_path / "bootstrap", """
-import sys
-sys.stdout.write("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor admission=cgroup-sub-scope\\n")
-sys.exit(0)
-""")
     # The daemon is unreachable for every request -- probe and claim alike (no
     # "state=granted" in the body, so no probe wrapper is applied): the empty-pool
     # blocking claim is what disables it, and the fallback pool fills from zero.
@@ -1710,7 +1647,8 @@ print("aira-worker-admit state=unavailable class=admission-unusable reason=dial-
 sys.stdout.flush()
 sys.exit(1)
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", "/outer")
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "5")
 
@@ -1764,11 +1702,6 @@ def test_startup_never_admits_more_workers_than_there_is_queued_work(tmp_path, m
     correct either way, which is exactly why this went unnoticed."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit_calls = tmp_path / "admit-calls"
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
@@ -1779,7 +1712,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -1803,11 +1737,6 @@ def test_startup_admits_one_worker_per_queued_test_up_to_the_pool_size(tmp_path,
     pool size, the full pool is still admitted."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit_calls = tmp_path / "admit-calls"
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
@@ -1818,7 +1747,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -1887,7 +1817,7 @@ def test_fallback_startup_never_forks_more_workers_than_there_is_queued_work(tmp
     carried the identical `if not self.queue: break` guard against a queue
     nothing has decremented yet, so one collected test with
     --aitest-workers=4 forked four unconfined workers."""
-    monkeypatch.delenv("AIRA_AITEST_BOOTSTRAP_CMD", raising=False)
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "5")
 
     items = pytester.getitems("""
@@ -2184,11 +2114,6 @@ def test_drain_worker_discards_staged_events_on_a_crash_before_the_result_line(t
     attempt's, never twice."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
@@ -2197,7 +2122,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     marker = tmp_path / "attempt-marker"
@@ -2241,11 +2167,6 @@ def test_run_synthesizes_and_replays_an_honest_report_for_a_twice_crashed_nodeid
     must be replayed instead: not zero, not two."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
@@ -2254,7 +2175,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     items = pytester.getitems("""
@@ -2292,11 +2214,6 @@ def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_q
     even dispatched, after a permanent daemon sizing rejection."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     call_state = tmp_path / "admit-calls"
     call_state.write_text("0")
     admit = _write_stub(tmp_path / "worker-admit", f"""
@@ -2314,7 +2231,8 @@ else:
     print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
     sys.exit(1)
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")  # force recycle after test_one
 
@@ -2368,7 +2286,7 @@ def test_run_synthesizes_a_report_even_for_a_result_defaulted_by_init_pys_own_fa
     via a worker replacement that does not happen, so a future change that
     makes it genuinely reachable cannot silently drop those tests from the
     report."""
-    monkeypatch.delenv("AIRA_AITEST_BOOTSTRAP_CMD", raising=False)
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
     monkeypatch.delenv("AIRA_AITEST_WORKER_ADMIT_CMD", raising=False)
 
     items = pytester.getitems("""
@@ -3195,7 +3113,7 @@ def test_a_host_without_pidfds_degrades_to_eof_detection_and_says_so_once(
         def refuse(pid):
             raise OSError(errno.ESRCH, "no such process")
         monkeypatch.setattr(os, "pidfd_open", refuse, raising=False)
-    monkeypatch.delenv("AIRA_AITEST_BOOTSTRAP_CMD", raising=False)
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
 
     items = pytester.getitems("""
@@ -3253,11 +3171,6 @@ def test_worker_killed_behind_a_forked_grandchild_is_detected_and_the_run_finish
     only a little longer than the alarm rather than far longer."""
     outer = tmp_path / "outer"
     outer.mkdir()
-    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
-import sys
-print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor admission=cgroup-sub-scope")
-sys.exit(0)
-""")
     admit = _write_stub(tmp_path / "worker-admit", f"""
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
@@ -3266,7 +3179,8 @@ print("aira-worker-admit state=granted class=granted containment=enforced scope=
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     attempts = tmp_path / "attempts"
@@ -3412,8 +3326,9 @@ def test_ci_shim_ledger_only_admission_governs_the_whole_suite_without_a_cgroup(
 ):
     """AIRA-123, the headline behaviour end to end.
 
-    In ci-shim mode aitest-bootstrap SUCCEEDS with admission=ledger-only and no
-    supervisor_scope, and every worker is admitted by a real daemon-side ledger
+    In ci-shim mode the launcher publishes the ci-shim outer-scope sentinel with
+    admission=ledger-only and no supervisor_scope, and every worker is admitted
+    by a real daemon-side ledger
     grant that carries containment=advisory and no cgroup coordinates. The run
     must therefore stay DAEMON-BACKED -- daemon_available True, every worker
     admitted -- while skipping every cgroup-dependent step.
@@ -3429,9 +3344,6 @@ def test_ci_shim_ledger_only_admission_governs_the_whole_suite_without_a_cgroup(
     suite merely finishing -- a fallback pool finishes too.
     """
     admits = tmp_path / "admit-count"
-    bootstrap = _write_stub(tmp_path / "bootstrap-ledger", """
-print("outer=ci-shim admission=ledger-only")
-""")
     admit = _write_stub(tmp_path / "worker-admit-ledger", """
 import os, sys
 assert "--outer-scope" in sys.argv, sys.argv
@@ -3456,7 +3368,8 @@ sys.stdin.read()
     # under `aira confine`) would leak in and the stub's parent-scope-id assert would
     # see it instead of the sentinel.
     monkeypatch.delenv("AIRA_CONFINE_SCOPE_ID", raising=False)
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", "ci-shim")
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "ledger-only")
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
 
@@ -3605,10 +3518,8 @@ def test_bootstrap_without_an_admission_grade_disables_the_daemon(tmp_path, monk
     """The backend grade is required, never defaulted. A bootstrap that does not
     state one is out of lockstep with this supervisor, and guessing the enforced
     backend would surface as a mismatch far later, mid-suite."""
-    bootstrap = _write_stub(tmp_path / "bootstrap-no-grade", """
-print("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor")
-""")
-    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", "/outer")
+    monkeypatch.delenv("AIRA_AITEST_ADMISSION", raising=False)
     supervisor = Supervisor()
     supervisor.bootstrap()
     assert supervisor.daemon_available is False

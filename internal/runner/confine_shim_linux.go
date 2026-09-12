@@ -287,11 +287,15 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// pytest-xdist -- makes per-worker RAM invisible to everything and prevents
 	// no over-subscription at all.
 	//
-	// AIRA_AITEST_OUTER_SCOPE is deliberately NOT published (the empty argument):
-	// there is no outer cgroup scope to hand down, and the shim bootstrap branch
-	// answers with the ci-shim sentinel of its own accord rather than trusting an
-	// inherited coordinate. Publishing an invented one would be the first place
-	// this mode pretended to have a cgroup.
+	// AIRA_AITEST_OUTER_SCOPE is published as the ci-shim SENTINEL, not a cgroup
+	// path: there is no outer cgroup scope in shim mode, and the sentinel is
+	// exactly what the (now-deleted) aitest-bootstrap verb used to report on its
+	// own accord for this mode. Handing it down directly (S2a) is what lets the
+	// supervisor read its coordinates from the environment with no subprocess; the
+	// daemon refuses to treat the sentinel as a real path, so this is not the mode
+	// pretending to have a cgroup — it is the mode naming its lack of one.
+	// AIRA_AITEST_ADMISSION is the paired grade: LEDGER-ONLY (advisory, no cgroup
+	// sub-scope, no kill backstop), the honest per-worker guarantee here.
 	//
 	// The non-delegate arm keeps AIRA-121's active STRIP, and that is unchanged
 	// and still load-bearing: a shim confine nested inside some outer
@@ -308,7 +312,7 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		if executable, executableErr := filepath.EvalSymlinks(self); executableErr == nil {
 			aitestCommand = executable
 		}
-		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, aitestCommand, "")
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, aitestCommand, ShimConfineSlice, AitestAdmissionLedgerOnly)
 		// Said on the launch that is affected, not only in a daemon log. The
 		// whole risk AIRA-121 named -- a suite running under an apparent
 		// governance mechanism, "invisible until something OOMs" -- is closed by

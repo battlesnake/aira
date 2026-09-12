@@ -1814,7 +1814,7 @@ func TestConfineNonDelegateLaunchStripsInheritedAitestEnvironment(t *testing.T) 
 var aitestCoordinateKeys = []string{
 	"AIRA_AITEST_LIB",
 	"AIRA_AITEST_WORKER_ADMIT_CMD",
-	"AIRA_AITEST_BOOTSTRAP_CMD",
+	"AIRA_AITEST_ADMISSION",
 	"AIRA_AITEST_MAX_WORKERS_FALLBACK",
 	"AIRA_AITEST_OUTER_SCOPE",
 }
@@ -1860,7 +1860,7 @@ func TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates(t 
 			// not be replaced by fresh ones either.
 			"AIRA_AITEST_LIB=/stale/lib",
 			"AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira",
-			"AIRA_AITEST_BOOTSTRAP_CMD=/stale/aira",
+			"AIRA_AITEST_ADMISSION=stale-grade",
 			"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
 			"AIRA_AITEST_OUTER_SCOPE=/stale/scope",
 		},

@@ -117,7 +117,7 @@ func removeScopeTree(t *testing.T, parent string) {
 // cleanly. Best-effort: a still-populated node just fails its rmdir and is retried.
 //
 // Depth-first matters: a child that itself has child cgroups (a nested test
-// tree, like aitest's own outer -> .aira-supervisor / .aira-worker-N layout)
+// tree, like a podman --cgroups=split layout)
 // cannot be rmdir'd until its own children are gone first, so a single-level
 // sweep would leak nested trees onto the live shared slice -- found live by
 // Fable's final build-review gate on AIRA-30, independently rediscovered and

@@ -240,8 +240,8 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		// AIRA-101. SUBTREE-aware liveness, from the same cgroup.events source
 		// killConfine already trusts for exactly this reason: Members() above reads
 		// LEAF cgroup.procs, so a job whose processes live in child cgroups it
-		// created — every aitest outer scope, which drains all its pids into
-		// .aira-supervisor and .aira-worker-N — reads leaf-empty while fully busy.
+		// created — a podman --cgroups=split container, or any nested-cgroup
+		// workload — reads leaf-empty while fully busy.
 		// Left nil (never false) when it cannot be established, so an unreadable
 		// scope is never mistaken for an empty one.
 		if events, eventsErr := scope.openFile("cgroup.events", unix.O_RDONLY); eventsErr == nil {

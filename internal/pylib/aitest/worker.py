@@ -397,16 +397,15 @@ def fork_worker(scope_path):
     happens inside it; (2) cgroup v2 memory.max is hierarchical, so whatever
     a handler does allocate is still charged to the OUTER confine scope's
     cap -- what is briefly coarser is the GRANULARITY of containment, not
-    containment itself. Say OUTER precisely, not "the scope it is in": the
-    unplaced child sits in `.aira-supervisor`, which is DELIBERATELY given
-    no memory.max of its own, so the bound comes entirely from the
-    outer scope one level up -- and that one is guaranteed finite by
-    precondition, not by assumption. The precondition is enforced BEFORE any
-    grant, not by worker-admit: `aira confine` refuses to exec a job whose
-    cgroup ancestry has no finite memory.max (hasFiniteCapAncestor,
-    confine_linux.go:2899), and aitest-bootstrap independently reproves it
-    (scopeHasFiniteMemoryMax, aitest_bootstrap_linux.go:78) before the
-    supervisor admits a single worker. (The WorkerAdmitReasonOuterScopeUnbounded
+    containment itself. Say OUTER precisely, not "the scope it is in": since S2a
+    the supervisor runs directly in the outer confine scope's own leaf (there is
+    no relocated `.aira-supervisor` child any more), so a just-forked worker that
+    has not yet placed itself into its own sibling scope is charged to that outer
+    scope -- which is guaranteed finite by precondition, not by assumption. The
+    precondition is enforced BEFORE any grant, not by worker-admit: `aira confine`
+    refuses to exec a job whose cgroup ancestry has no finite memory.max
+    (hasFiniteCapAncestor, confine_linux.go:2899) before the supervisor admits a
+    single worker. (The WorkerAdmitReasonOuterScopeUnbounded
     token is catalogue-defined, worker_admit_outcome.go:141, but the daemon
     never actually emits it -- the precondition is proven earlier, so the relay
     path this once cited is dead.) fork_worker is only ever reached on the

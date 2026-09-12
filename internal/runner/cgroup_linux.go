@@ -355,9 +355,9 @@ func (s *linuxScope) Remove() error {
 // removeChildCgroups rmdirs every descendant cgroup directory inside the scope,
 // deepest-first, leaving the scope itself for Remove's own rmdir.
 //
-// Deepest-first is the whole point: a child that has children of its own (the
-// aitest `--delegate-ram` shape — outer -> .aira-supervisor / .aira-worker-N —
-// or any workload that nests more than one level) cannot be rmdir'd until its
+// Deepest-first is the whole point: a child that has children of its own (a
+// podman --cgroups=split container, or any workload that nests more than one
+// level) cannot be rmdir'd until its
 // own children are gone, so a single-level sweep would still leave the tree
 // behind. internal/cgrouptest's removeScopeTree makes the same point for tests.
 //

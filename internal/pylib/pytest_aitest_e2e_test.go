@@ -56,7 +56,7 @@ func requireRealPytest(t *testing.T) string {
 // its child pytest process. testdata/test_oom.py's own skip guard reads this
 // exact variable directly from the child's environment to decide whether a
 // real cgroup cap is expected; a fallback run deliberately has none (its
-// AIRA_AITEST_BOOTSTRAP_CMD points at a missing binary), so an inherited
+// AIRA_AITEST_WORKER_ADMIT_CMD points at a missing binary), so an inherited
 // AIRA_REAL_CGROUP=1 defeats that guard and fires a real, uncapped 512MiB
 // allocation instead of skipping -- and made the mandatory verification tier
 // permanently unable to go green in one invocation of `go test
@@ -147,7 +147,13 @@ func TestRealPytestAitestEndToEndFallback(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
+		// Bootstrap succeeds (an outer scope + admission grade are published),
+		// but the worker-admit relay binary is missing, so the first admission
+		// attempt disables the daemon with one warning and the suite completes
+		// on the unconfined fallback pool (S2a daemon-down trigger).
+		"AIRA_AITEST_OUTER_SCOPE="+t.TempDir(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
+		"AIRA_AITEST_WORKER_ADMIT_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
 	)
 	output, err := command.CombinedOutput()
 	text := string(output)
@@ -230,7 +236,7 @@ func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
 	command := exec.Command(pytest, "-q", "--aitest-workers=2", "test_pass.py")
 	command.Dir = filepath.Join(aitestDir, "testdata")
 	// environWithoutAiraRealCgroup, not os.Environ() (Fable re-gate round
-	// 3): this is a FALLBACK run (missing bootstrap command, no per-worker
+	// 3): this is a FALLBACK run (missing worker-admit command, no per-worker
 	// containment) same as the sibling test above, so it must not forward
 	// this Go test binary's own ambient AIRA_REAL_CGROUP=1 either -- only
 	// safe today because test_pass.py's explicit file argument keeps
@@ -239,7 +245,11 @@ func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
+		// Bootstrap succeeds; the worker-admit relay binary is missing, so the
+		// suite falls back to the unconfined pool with one warning (S2a).
+		"AIRA_AITEST_OUTER_SCOPE="+t.TempDir(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
+		"AIRA_AITEST_WORKER_ADMIT_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
 	)
 	output, err := command.CombinedOutput()
 	text := string(output)
@@ -425,7 +435,12 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+harness.binary,
+		// S2a: the launcher hands the supervisor its outer scope and admission
+		// grade in the environment (no aitest-bootstrap subprocess). This is the
+		// real absolute cgroup path the supervisor is placed into above, exactly
+		// what the daemon resolves worker sub-reservations against.
+		"AIRA_AITEST_OUTER_SCOPE="+harness.outerFile.Name(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
 		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(32<<20),
 		"AIRA_REAL_CGROUP=1",
@@ -535,7 +550,12 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+harness.binary,
+		// S2a: the launcher hands the supervisor its outer scope and admission
+		// grade in the environment (no aitest-bootstrap subprocess). This is the
+		// real absolute cgroup path the supervisor is placed into above, exactly
+		// what the daemon resolves worker sub-reservations against.
+		"AIRA_AITEST_OUTER_SCOPE="+harness.outerFile.Name(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
 		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(32<<20),
 		"AIRA_REAL_CGROUP=1",

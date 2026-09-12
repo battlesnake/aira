@@ -91,7 +91,9 @@ func TestRealPytestAitestMeasurementReport(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+harness.binary,
+		// S2a: outer scope + admission grade published in the environment.
+		"AIRA_AITEST_OUTER_SCOPE="+harness.outerFile.Name(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
 		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(32<<20),
 		"AIRA_AITEST_MEASURE_DIR="+measureDir,

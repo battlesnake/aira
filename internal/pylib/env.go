@@ -18,7 +18,7 @@ var (
 var aitestEnvironmentKeys = map[string]struct{}{
 	"AIRA_AITEST_LIB":                  {},
 	"AIRA_AITEST_WORKER_ADMIT_CMD":     {},
-	"AIRA_AITEST_BOOTSTRAP_CMD":        {},
+	"AIRA_AITEST_ADMISSION":            {},
 	"AIRA_AITEST_MAX_WORKERS_FALLBACK": {},
 	"AIRA_AITEST_OUTER_SCOPE":          {},
 }
@@ -48,21 +48,22 @@ func StripAitestEnvironment(env []string) []string {
 // AppendAitestChildEnvironment publishes the aitest launch coordinates to a
 // confined child.
 //
-// outerScope is the launching job's own confine scope path, and it is
-// load-bearing rather than informational (AIRA-44): the aitest bootstrap verb
-// used to self-discover the outer scope from whatever cgroup the CALLING process
-// happened to be in, which is wrong for the second aitest-enabled pytest run in
-// one confine job — by then the first run's bootstrap has relocated the whole
-// process tree, `make` and its shell included, into <outer>/.aira-supervisor, so
-// run 2 discovers THAT as its outer scope and every worker-admit call against
-// the nested, deliberately-uncapped supervisor scope comes back
-// "unevaluated: unbounded". Passing the real scope down from the launcher, which
-// already holds it, removes the discovery step and with it the failure.
+// outerScope is the launching job's own confine scope path (or the ci-shim
+// sentinel), and admission is the per-worker admission grade this launch backs
+// (runner.AitestAdmission*). Both are load-bearing and both are consumed
+// DIRECTLY by the supervisor at startup (S2a): the supervisor reads them from
+// its environment rather than shelling out to an `aitest-bootstrap` verb that
+// used to report them on stdout. That verb existed to relocate the supervisor
+// into a child scope so the outer scope could delegate controllers to worker
+// CHILDREN; since workers are now first-class SIBLING scopes under the slice
+// (they fork in the parent leaf and migrate out), there is nothing to relocate
+// and no subprocess to run — the launcher, which already holds both facts,
+// simply hands them down.
 //
-// An empty outerScope is honest, not fatal: the launcher passes what it has, and
-// the bootstrap verb falls back to self-discovery with the same behaviour as
-// before, which is still correct for a single-run job.
-func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, workerAdmitCommand, outerScope string) []string {
+// An empty outerScope or admission is honest, not fatal: the supervisor's own
+// bootstrap disables daemon-backed admission with one warning and falls back to
+// its bare-fork pool, the same disposition a failed bootstrap always took.
+func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, workerAdmitCommand, outerScope, admission string) []string {
 	result := StripAitestEnvironment(env)
 	if strings.TrimSpace(runtimeDir) == "" || strings.TrimSpace(workerAdmitCommand) == "" {
 		return result
@@ -80,10 +81,12 @@ func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics i
 	}
 	result = upsertChildEnv(result, "AIRA_AITEST_LIB", aitestDir)
 	result = upsertChildEnv(result, "AIRA_AITEST_WORKER_ADMIT_CMD", workerAdmitCommand)
-	result = upsertChildEnv(result, "AIRA_AITEST_BOOTSTRAP_CMD", workerAdmitCommand)
 	result = upsertChildEnv(result, "AIRA_AITEST_MAX_WORKERS_FALLBACK", strconv.Itoa(runtime.NumCPU()))
 	if scope := strings.TrimSpace(outerScope); scope != "" {
 		result = upsertChildEnv(result, "AIRA_AITEST_OUTER_SCOPE", scope)
+	}
+	if grade := strings.TrimSpace(admission); grade != "" {
+		result = upsertChildEnv(result, "AIRA_AITEST_ADMISSION", grade)
 	}
 	return result
 }

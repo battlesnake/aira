@@ -317,7 +317,9 @@ func TestRestartMergeGateAitestPoolReanchorsAcrossRestart(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(h.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+h.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+h.binary,
+		// S2a: outer scope + admission grade published in the environment.
+		"AIRA_AITEST_OUTER_SCOPE="+h.outer,
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 		"AIRA_AITEST_WORKER_ADMIT_CMD="+h.binary,
 		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(restartGatePytestReserve),
 		"AIRA_REAL_CGROUP=1",

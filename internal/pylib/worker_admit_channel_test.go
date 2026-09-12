@@ -134,12 +134,11 @@ func TestWorkerAdmitOutcomeVocabularyMatchesTheSupervisor(t *testing.T) {
 // probe. This test fails if any of the retired prose tokens reappears anywhere
 // in supervisor.py, or if the classifier grows a message-inspection idiom.
 //
-// Deliberately NOT flagged: the two `startswith` calls that parse the
-// aitest-bootstrap verb's own `outer=`/`supervisor_scope=` line and the worker
-// result pipe's `_EVENT_LINE_PREFIX`. Both are framing on structured records
-// this fix does not touch, not classification of a human sentence — the
-// distinction the assertion below encodes by naming the retired tokens
-// explicitly rather than banning `startswith` outright.
+// Deliberately NOT flagged: the `startswith` call that frames the worker result
+// pipe's `_EVENT_LINE_PREFIX`. That is framing on a structured record this fix
+// does not touch, not classification of a human sentence — the distinction the
+// assertion below encodes by naming the retired tokens explicitly rather than
+// banning `startswith` outright.
 //
 // verifies: AIRA-42
 func TestSupervisorClassifiesWorkerAdmitByEnumNotBySubstring(t *testing.T) {

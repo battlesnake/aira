@@ -44,9 +44,9 @@ type cgroupUsage struct {
 	//	                                         (hierarchical oom_kill > 0)
 	//	external cgroup.kill                   -> every counter stays 0
 	//
-	// The middle row is the one that matters most in practice: aitest drains the
-	// confined leader into a `.aira-supervisor` sub-cgroup, so `oom_kill` alone
-	// would miss a genuine OOM at the confine scope's own cap. `oom_group_kill`
+	// The middle row is the one that matters most in practice: a podman
+	// --cgroups=split job puts the confined leader in a child cgroup, so `oom_kill`
+	// alone would miss a genuine OOM at the confine scope's own cap. `oom_group_kill`
 	// is keyed on the cgroup whose memory.oom.group was honoured -- this scope --
 	// and every confine scope sets memory.oom.group=1 fail-closed.
 	OOMKillLocal      *int64

@@ -148,9 +148,9 @@ func TestListConfinesRealScopeReportsSubtreePopulationForANestedWorkload(t *test
 	defer func() { _ = scope.Kill(); _ = waitEmpty(context.Background(), scope, time.Second); _ = scope.Remove() }()
 
 	// A child cgroup inside the scope, then the workload placed INTO it — so the
-	// outer scope's own leaf cgroup.procs stays empty, exactly as
-	// BootstrapAitestSupervisor leaves a running aitest job.
-	child := filepath.Join(scope.Reference(), ".aira-supervisor")
+	// outer scope's own leaf cgroup.procs stays empty, exactly as a
+	// podman --cgroups=split or other nested-cgroup job leaves a running job.
+	child := filepath.Join(scope.Reference(), ".aira-child")
 	if err := os.Mkdir(child, 0o755); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "nested cgroup unavailable: %v", err)
 	}

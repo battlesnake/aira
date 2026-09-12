@@ -83,11 +83,11 @@ func parseConfineOOMScoreAdjEnv(name string, fallback int) (int, error) {
 // SUBTREE, not leaf, and that is the whole reason this function exists rather
 // than a Members() loop: Members() reads LEAF cgroup.procs, and cgroup-v2's
 // no-internal-process rule means a scope that created any child cgroup has NO
-// pids of its own. BootstrapAitestSupervisor drains every pid of an aitest
-// outer scope into <outer>/.aira-supervisor and .aira-worker-N, and a confine
-// job using podman --cgroups=split nests likewise, so a leaf-only walker would
-// steer exactly zero processes for the population most likely to be the
-// offender — the inert-subsystem failure this project has shipped once already.
+// pids of its own. A confine job using podman --cgroups=split (or any other
+// nested-cgroup workload) puts every process in child cgroups it created inside
+// its own scope, so a leaf-only walker would steer exactly zero processes for
+// the population most likely to be the offender — the inert-subsystem failure
+// this project has shipped once already.
 //
 // An out-of-range adj is refused rather than clamped: the caller decides
 // policy, and a clamp would let a policy bug write a value nobody chose. The

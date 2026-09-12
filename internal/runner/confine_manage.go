@@ -35,11 +35,11 @@ type ConfineRecord struct {
 	RSSBytes      *int64 `json:"rss_bytes"`
 	// SubtreePopulated is liveness read from cgroup.events `populated`, which is
 	// SUBTREE-aware, unlike Populated above (leaf cgroup.procs only). AIRA-101
-	// needs the distinction and it is not cosmetic: BootstrapAitestSupervisor
-	// drains EVERY pid out of an aitest outer scope into <outer>/.aira-supervisor,
-	// so a fully busy suite reads Populated == 0 while SubtreePopulated is true.
-	// Reading a running job as empty is how an exclusive benchmark would be handed
-	// a fabricated "you are alone".
+	// needs the distinction and it is not cosmetic: a job that creates child
+	// cgroups inside its own scope (podman --cgroups=split, or any nested-cgroup
+	// workload) puts its processes there, so a fully busy job reads Populated == 0
+	// while SubtreePopulated is true. Reading a running job as empty is how an
+	// exclusive benchmark would be handed a fabricated "you are alone".
 	//
 	// nil means the reading could not be established (the scope vanished mid-scan,
 	// or cgroup.events could not be opened) and must never be rendered as empty.

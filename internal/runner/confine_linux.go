@@ -1075,7 +1075,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	cmd := exec.CommandContext(ctx, self, setupArgv...)
 	// The one resolved self binary the child's AIRA verbs are invoked through:
-	// worker-admit and aitest-bootstrap are both verbs on it.
+	// worker-admit (and confine-reserve) are verbs on it.
 	reserveCommand := ""
 	if request.DelegateRAM {
 		reserveCommand = self
@@ -1102,17 +1102,16 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// exactly one name and one home.
 	if _, backendOK := AitestBackendCanFunction(ConfineModeReal); request.DelegateRAM && backendOK {
 		// aitest is only meaningful for a delegate-RAM launch (worker-admit
-		// grants nested sub-scopes under THIS job's own outer scope); every
-		// other launch gets no aitest coordinates at all, mirroring
-		// the delegate-RAM gate on reserveCommand immediately above, which is
-		// the SAME resolved self binary — both worker-admit and
-		// aitest-bootstrap are verbs on that one aira binary.
-		// scope.Reference() is THIS job's real outer scope, handed down rather
-		// than rediscovered by the bootstrap verb from its own current cgroup
-		// (AIRA-44) — which is wrong for a second aitest-enabled pytest run in
-		// the same job, because the first run's bootstrap has by then relocated
-		// the whole tree into <outer>/.aira-supervisor.
-		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand, scope.Reference())
+		// grants first-class sibling worker scopes under THIS job's slice); every
+		// other launch gets no aitest coordinates at all, mirroring the
+		// delegate-RAM gate on reserveCommand immediately above (the SAME resolved
+		// self binary the worker-admit verb is invoked through).
+		// scope.Reference() is THIS job's real outer scope, handed down directly:
+		// the supervisor consumes it from its environment (S2a), rather than an
+		// `aitest-bootstrap` verb rediscovering it from the supervisor's own
+		// current cgroup. AitestAdmissionSubScope names the per-worker admission
+		// grade this real launch backs — enforced cgroup sub-scopes.
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand, scope.Reference(), AitestAdmissionSubScope)
 	} else {
 		// Strip unconditionally, not just skip appending (Fable build-review,
 		// final gate): AppendAitestChildEnvironment was previously called
@@ -2393,9 +2392,8 @@ const (
 // is SUBTREE-aware. They are two independent sources and they legitimately
 // disagree, in one direction, for one very common shape: a job whose processes
 // live in child cgroups it created inside its own scope.
-// BootstrapAitestSupervisor drains EVERY pid of a --delegate-ram/aitest job into
-// <outer>/.aira-supervisor and .aira-worker-N; `podman --cgroups=split` does the
-// same. Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.
+// `podman --cgroups=split` does exactly this, as does any nested-cgroup
+// workload. Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.
 // SubtreePopulated's own doc comment says so. With a leaf-only gate the deadline
 // would fire, signal nothing, report `fired-unevaluated`, and then wait for the
 // job it was supposed to end.
@@ -2602,7 +2600,7 @@ func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 //     hierarchical counter on this scope while this scope's own processes are
 //     untouched; the local counters stay at zero for that. They rise when the
 //     OOM killer actually killed something OF OURS -- including when the leader
-//     has been drained into a `.aira-supervisor` sub-cgroup, which is why
+//     has relocated into a child cgroup it created (podman --cgroups=split), which is why
 //     LocalOOM is a disjunction over oom_kill and oom_group_kill rather than a
 //     single counter. Measured, not assumed --
 //     TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM pins every

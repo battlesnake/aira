@@ -612,9 +612,10 @@ func ParseWorkerAdmitOutcomeLine(line string) (map[string]string, error) {
 	return fields, nil
 }
 
-// The aitest ADMISSION BACKEND grades, reported by the `aitest-bootstrap` verb
-// on its own stdout line and recorded by supervisor.py for the whole run
-// (AIRA-123).
+// The aitest ADMISSION BACKEND grades, published by the confine launcher in the
+// child environment as AIRA_AITEST_ADMISSION and read by supervisor.py for the
+// whole run (AIRA-123; S2a moved this from an aitest-bootstrap stdout line to a
+// launch-environment coordinate).
 //
 // This is a different channel from the per-grant containment token above and
 // answers a different question — "which backend is this run using at all",

@@ -530,8 +530,8 @@ _OUTCOME_GRANT_POSITIVE_INTS = {
     "advisory(ci-shim,no-cgroup,no-kill-backstop)": ("reserved",),
 }
 
-# The aitest ADMISSION BACKEND grades, reported once by the `aitest-bootstrap`
-# verb and pinned against Go's runner.AitestAdmission* catalogue.
+# The aitest ADMISSION BACKEND grades, published once by the launcher as
+# AIRA_AITEST_ADMISSION and pinned against Go's runner.AitestAdmission* catalogue.
 _ADMISSION_SUB_SCOPE = "cgroup-sub-scope"
 _ADMISSION_LEDGER_ONLY = "ledger-only"
 _ADMISSION_GRADES = frozenset((
@@ -775,46 +775,34 @@ class Supervisor:
         self._swap_cap_warned = False
 
     def bootstrap(self):
-        """Relocate this process into its own child scope so the outer scope
-        can delegate controllers to worker children. Must run before any
-        worker is admitted."""
-        command = os.environ.get("AIRA_AITEST_BOOTSTRAP_CMD", "")
-        if not command:
-            self._disable_daemon("AIRA_AITEST_BOOTSTRAP_CMD is unset")
-            return
-        try:
-            result = subprocess.run(
-                [command, "aitest-bootstrap", "--supervisor-pid", str(os.getpid())],
-                capture_output=True, text=True, timeout=30,
-            )
-        except Exception as exc:
-            self._disable_daemon(str(exc))
-            return
-        if result.returncode != 0:
-            self._disable_daemon((result.stderr or "").strip() or "aitest-bootstrap failed")
-            return
-        admission = None
-        for token in result.stdout.split():
-            if token.startswith("outer="):
-                self.outer_scope = token[len("outer="):]
-            elif token.startswith("supervisor_scope="):
-                self.supervisor_scope = token[len("supervisor_scope="):]
-            elif token.startswith("admission="):
-                admission = token[len("admission="):]
+        """Read the launcher-published aitest coordinates (S2a). The confine
+        launcher places this supervisor DIRECTLY in its outer scope and
+        publishes AIRA_AITEST_OUTER_SCOPE and AIRA_AITEST_ADMISSION in the
+        environment. There is no subprocess and nothing to relocate: workers are
+        first-class SIBLING scopes under the slice, so they fork here in the
+        parent leaf and place_self out to their own scope, rather than nesting
+        under a drained child scope the way the retired aitest-bootstrap verb set
+        up. Must run before any worker is admitted."""
+        self.outer_scope = os.environ.get("AIRA_AITEST_OUTER_SCOPE", "").strip()
         if not self.outer_scope:
-            self._disable_daemon("aitest-bootstrap did not report an outer scope")
+            # A launcher that did not publish the coordinate (or published it
+            # empty) has not given this run a scope to admit workers under. Same
+            # disposition as every other bootstrap failure: one honest warning,
+            # then the bare-fork fallback pool.
+            self._disable_daemon("AIRA_AITEST_OUTER_SCOPE is unset")
             return
-        # AIRA-123. The backend grade is REQUIRED and is not defaulted. A
-        # bootstrap that does not state one is out of lockstep with this
-        # supervisor, and guessing "cgroup-sub-scope" would be the unsafe guess:
-        # this run would then expect enforced grants, and an advisory grant would
-        # be refused as a mismatch far later, mid-suite. Disabling daemon-backed
-        # admission with one honest warning is the same disposition every other
-        # bootstrap failure already takes.
+        admission = os.environ.get("AIRA_AITEST_ADMISSION", "").strip()
+        # AIRA-123. The backend grade is REQUIRED and is not defaulted. A launch
+        # that does not state one is out of lockstep with this supervisor, and
+        # guessing "cgroup-sub-scope" would be the unsafe guess: this run would
+        # then expect enforced grants, and an advisory grant would be refused as a
+        # mismatch far later, mid-suite. Disabling daemon-backed admission with
+        # one honest warning is the same disposition every other bootstrap
+        # failure already takes.
         if admission not in _ADMISSION_GRADES:
             self._disable_daemon(
-                "aitest-bootstrap reported admission=%r, which is not in this supervisor's "
-                "catalogue (bootstrap and supervisor are out of lockstep)" % (admission,)
+                "AIRA_AITEST_ADMISSION is %r, which is not in this supervisor's "
+                "catalogue (launcher and supervisor are out of lockstep)" % (admission,)
             )
             return
         self.admission_mode = admission
