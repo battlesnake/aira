@@ -741,6 +741,34 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 	if !strings.Contains(rendered, "█") {
 		t.Fatalf("bar text=%q, want painted regions", rendered)
 	}
+	// The block-character split reaches the terminal, crossing the renderTopBar
+	// boundary the model tests above cannot: alpha (slot 0) reserves 4 GiB and uses
+	// 3, so its region carries BOTH a solid used block and a shaded idle block, and
+	// its idle glyph must not be blank — a blank there would be indistinguishable
+	// from the free-RAM gap. GetText(true) strips the colour tags, so this half is
+	// the plain glyphs and the legend key.
+	if !strings.Contains(rendered, topBarIdleGlyph) {
+		t.Fatalf("bar text=%q, want a shaded idle block for the reserved-but-unused headroom", rendered)
+	}
+	if !strings.Contains(rendered, topBarSolidGlyph+" in use") || !strings.Contains(rendered, topBarIdleGlyph+" reserved and idle") {
+		t.Fatalf("bar text=%q, want the block-character key on the legend", rendered)
+	}
+	// The single-colour rule, checked with the tags LEFT IN (GetText(false)): the
+	// ONE slot colour must tag both alpha's used █ and its idle ▒, so the job reads
+	// as one bar rather than the two the old bright/dark shades produced.
+	tagged := make(chan string, 1)
+	go runtime.app.QueueUpdateDraw(func() { tagged <- runtime.topBar.GetText(false) })
+	var markup string
+	select {
+	case markup = <-tagged:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("the tview loop stopped answering the tagged read")
+	}
+	alpha := topSlotColour(0)
+	if !strings.Contains(markup, "["+alpha+"]"+topBarSolidGlyph+"[-]") ||
+		!strings.Contains(markup, "["+alpha+"]"+topBarIdleGlyph+"[-]") {
+		t.Fatalf("tagged bar=%q, want alpha's used █ and idle ▒ BOTH in the one colour %s", markup, alpha)
+	}
 	rows := make(chan int, 1)
 	go runtime.app.QueueUpdateDraw(func() { rows <- runtime.tables[viewTop].GetRowCount() })
 	select {
@@ -861,12 +889,17 @@ func TestTopCommandCellSaysUnevaluatedAndIsTerminalSafe(t *testing.T) {
 	}
 }
 
-// AIRA-135 (c)+(d). The used/unused split INSIDE one reservation's region.
+// AIRA-135 (c)+(d). The used/idle split INSIDE one reservation's region, now
+// drawn by BLOCK CHARACTER within ONE colour rather than by a second colour
+// shade.
 //
 // Every case shares one frame so the byte-to-column mapping is a constant 1 GiB
-// per column, and each asserts three separate things: the region's total width is
-// still the RESERVATION (the next region must not move), the bright span is
-// exactly the live usage, and the darkened span is the rest.
+// per column, and each asserts: the region's total width is still the
+// RESERVATION (the next region must not move); the solid-fill span is exactly the
+// live usage; the shaded-idle span is the rest; every column of the region is the
+// SAME slot colour (the single-colour rule — the split is glyph, not hue); and an
+// unevaluated usage draws the "usage unevaluated" mark across the whole span
+// rather than a fabricated all-solid (100% used) or all-shaded (0% used) fill.
 //
 // verifies: AIRA-135
 func TestTopBarRegionSplitsUsedFromReservedButUnused(t *testing.T) {
@@ -876,24 +909,26 @@ func TestTopBarRegionSplitsUsedFromReservedButUnused(t *testing.T) {
 		SliceMaxBytes: 32 * gib, SliceHighState: runner.ConfineSliceHighNone,
 	}
 	for _, testCase := range []struct {
-		name       string
-		reserved   int64
-		rss        *int64
-		wantUsed   int64
-		wantKnown  bool
-		wantBright int
-		wantShaded int
+		name        string
+		reserved    int64
+		rss         *int64
+		wantUsed    int64
+		wantKnown   bool
+		wantSolid   int
+		wantIdle    int
+		wantUnknown int
 	}{
-		{"half-used", 8 * gib, int64Pointer(4 * gib), 4 * gib, true, 4, 4},
-		{"fully-used", 8 * gib, int64Pointer(8 * gib), 8 * gib, true, 8, 0},
-		// A monitoring-lag overshoot right before an OOM. The used shade is
-		// CLAMPED to this region; it must never bleed into the next slot's.
-		{"used-exceeds-the-reservation", 8 * gib, int64Pointer(11 * gib), 8 * gib, true, 8, 0},
-		// An established zero is not an absence: the whole region is darkened.
-		{"used-is-zero", 8 * gib, int64Pointer(0), 0, true, 0, 8},
-		// Unevaluated usage draws ONE undivided shade rather than a fabricated
-		// 0%-used split, which is what a nil-means-zero build would paint.
-		{"usage-unevaluated", 8 * gib, nil, 0, false, 8, 0},
+		{"half-used", 8 * gib, int64Pointer(4 * gib), 4 * gib, true, 4, 4, 0},
+		{"fully-used", 8 * gib, int64Pointer(8 * gib), 8 * gib, true, 8, 0, 0},
+		// A monitoring-lag overshoot right before an OOM. The used span is CLAMPED
+		// to this region; it must never bleed into the next slot's. Clamped over-use
+		// draws the whole span solid — honest "using at least its whole charge".
+		{"used-exceeds-the-reservation", 8 * gib, int64Pointer(11 * gib), 8 * gib, true, 8, 0, 0},
+		// An established zero is not an absence: the whole region is shaded idle.
+		{"used-is-zero", 8 * gib, int64Pointer(0), 0, true, 0, 8, 0},
+		// Unevaluated usage draws the unevaluated mark across the whole span, never
+		// the all-solid or all-shaded fill a nil-means-zero build would paint.
+		{"usage-unevaluated", 8 * gib, nil, 0, false, 0, 0, 8},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			record := topTestRecord("CONFINE-alpha-101-aa", "alpha", testCase.reserved, 0)
@@ -915,31 +950,29 @@ func TestTopBarRegionSplitsUsedFromReservedButUnused(t *testing.T) {
 			}
 
 			cells := topBarCells(model.Bar, width)
-			bright, shaded := 0, 0
+			solid, idle, unknown := 0, 0, 0
 			for column := 0; column < int(testCase.reserved/gib); column++ {
 				cell := cells[column]
 				if cell.Kind != topRegionScope || cell.Slot != 0 {
 					t.Fatalf("column %d=%+v, want slot 0's own region", column, cell)
 				}
-				if cell.Shaded {
-					shaded++
-					if cell.Colour != region.ShadeColour {
-						t.Fatalf("shaded column %d colour=%q, want the darkened %q", column, cell.Colour, region.ShadeColour)
-					}
-					continue
-				}
-				bright++
+				// Single colour throughout: the split is by glyph, so EVERY column of
+				// the region — solid, idle or unevaluated — carries the one slot colour.
 				if cell.Colour != region.Colour {
-					t.Fatalf("bright column %d colour=%q, want the slot colour %q", column, cell.Colour, region.Colour)
+					t.Fatalf("column %d colour=%q, want the one slot colour %q", column, cell.Colour, region.Colour)
+				}
+				switch cell.Fill {
+				case topFillIdle:
+					idle++
+				case topFillUnknown:
+					unknown++
+				default:
+					solid++
 				}
 			}
-			if bright != testCase.wantBright || shaded != testCase.wantShaded {
-				t.Fatalf("bright=%d shaded=%d, want %d and %d", bright, shaded, testCase.wantBright, testCase.wantShaded)
-			}
-			// The bright and darkened shades are both derived from ONE slot colour,
-			// and the row shares it, so a reservation stays identifiable.
-			if region.ShadeColour == region.Colour {
-				t.Fatalf("the darkened shade equals the bright one (%q); the split would be invisible", region.Colour)
+			if solid != testCase.wantSolid || idle != testCase.wantIdle || unknown != testCase.wantUnknown {
+				t.Fatalf("solid=%d idle=%d unknown=%d, want %d/%d/%d",
+					solid, idle, unknown, testCase.wantSolid, testCase.wantIdle, testCase.wantUnknown)
 			}
 			// The NEXT region is untouched by this one's split.
 			for column := int(testCase.reserved / gib); column < int(testCase.reserved/gib)+4; column++ {
@@ -968,73 +1001,89 @@ func TestTopBarNonScopeRegionsAreNeverSplit(t *testing.T) {
 		if region.Kind == topRegionScope {
 			continue
 		}
-		if region.UsedKnown || region.ShadeColour != "" {
+		if region.UsedKnown {
 			t.Fatalf("region %+v carries a used/unused split it has no reading for", region)
 		}
 	}
 	for _, cell := range topBarCells(model.Bar, 64) {
-		if cell.Shaded && cell.Kind != topRegionScope {
-			t.Fatalf("cell %+v is shaded but belongs to no scope region", cell)
+		if cell.Fill != topFillSolid && cell.Kind != topRegionScope {
+			t.Fatalf("cell %+v is not solid but belongs to no scope region", cell)
 		}
 	}
 }
 
-// topShadeColour darkens a slot colour and refuses anything it cannot parse,
-// because a shade indistinguishable from the bright one would present a split
-// that is not actually being drawn.
+// topBarGlyph maps each fill state to its block character. This is the whole of
+// AIRA-135's single-colour scheme: used, idle and unevaluated are told apart by
+// GLYPH, not by colour, so the three must be three distinct characters and the
+// zero-value fill (every non-split column) must be the solid block.
 //
 // verifies: AIRA-135
-func TestTopShadeColourDarkensEverySlotColourAndRefusesTheRest(t *testing.T) {
-	for _, colour := range topSlotColours {
-		shade := topShadeColour(colour)
-		if shade == "" || shade == colour {
-			t.Fatalf("topShadeColour(%q)=%q, want a distinct darkened colour", colour, shade)
-		}
-		if len(shade) != 7 || shade[0] != '#' {
-			t.Fatalf("topShadeColour(%q)=%q, want the #rrggbb form", colour, shade)
-		}
-		bright, err := strconv.ParseInt(colour[1:], 16, 64)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dark, err := strconv.ParseInt(shade[1:], 16, 64)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if dark >= bright {
-			t.Fatalf("topShadeColour(%q)=%q is not darker", colour, shade)
-		}
+func TestTopBarGlyphIsOneCharacterPerFillState(t *testing.T) {
+	solid := topBarGlyph(topBarCell{Fill: topFillSolid})
+	idle := topBarGlyph(topBarCell{Fill: topFillIdle})
+	unknown := topBarGlyph(topBarCell{Fill: topFillUnknown})
+	if topBarSolidGlyph != "█" {
+		t.Fatalf("the solid glyph constant is %q, want the full block █", topBarSolidGlyph)
 	}
-	for _, bad := range []string{"", "red", "#12345", "#gggggg", "5fafff"} {
-		if got := topShadeColour(bad); got != "" {
-			t.Fatalf("topShadeColour(%q)=%q, want no shade at all", bad, got)
-		}
+	if solid != topBarSolidGlyph {
+		t.Fatalf("solid glyph=%q, want the full block %q", solid, topBarSolidGlyph)
+	}
+	if idle != topBarIdleGlyph || idle == solid {
+		t.Fatalf("idle glyph=%q, want a shaded block distinct from the solid %q", idle, solid)
+	}
+	if unknown != topBarUnknownGlyph || unknown == solid || unknown == idle {
+		t.Fatalf("unknown glyph=%q, want a mark distinct from solid %q and idle %q", unknown, solid, idle)
+	}
+	// The zero value is solid, so an untouched cell (a used column, and every CPU
+	// column) draws the full block with no special-casing.
+	if got := topBarGlyph(topBarCell{}); got != topBarSolidGlyph {
+		t.Fatalf("zero-value cell glyph=%q, want the solid block %q", got, topBarSolidGlyph)
 	}
 }
 
 func int64Pointer(value int64) *int64 { return &value }
 
-// The two shades get a key on the summary line, and ONLY when a split is really
-// drawn: a key beside an undivided bar would describe something that is not on
-// screen.
+// The block-character scheme gets a key on the summary line, and each clause of
+// it appears only when the glyph it names can be on screen: the solid/idle pair
+// for an established-usage scope, and the "usage unevaluated" mark for one whose
+// usage could not be read.
+//
+// This is a DELIBERATE behaviour change from the two-shade scheme, which showed
+// no key at all for an all-unknown bar: under the block-character scheme the ?
+// mark is on screen and needs explaining, so an all-unknown bar now DOES carry a
+// key — the ? clause only.
 //
 // verifies: AIRA-135
-func TestTopShadeLegendAppearsOnlyWhenASplitIsDrawn(t *testing.T) {
+func TestTopShadeLegendKeysTheGlyphsActuallyDrawn(t *testing.T) {
 	frame := topTestFrame()
 	split, _ := topViewModel(topTick{}, topTestListing(frame,
 		topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)))
-	if got := topShadeLegend(split.Bar); got == "" {
-		t.Fatalf("a drawn split carried no key: %+v", split.Bar.Regions)
+	got := topShadeLegend(split.Bar)
+	if !strings.Contains(got, topBarSolidGlyph) || !strings.Contains(got, topBarIdleGlyph) {
+		t.Fatalf("an established-usage bar's key=%q, want the solid and idle glyphs named", got)
 	}
-	// Usage unevaluated for every drawn scope: one undivided shade, no key.
+	if strings.Contains(got, topBarUnknownGlyph) {
+		t.Fatalf("an established-usage bar's key=%q named the unevaluated mark it does not draw", got)
+	}
+	// Usage unevaluated for every drawn scope: the ? clause ONLY, not the
+	// solid/idle pair, which describes a split that is not on this bar.
 	unknown := topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 0)
 	unknown.RSSBytes = nil
 	undivided, _ := topViewModel(topTick{}, topTestListing(frame, unknown))
-	if got := topShadeLegend(undivided.Bar); got != "" {
-		t.Fatalf("an undivided bar carried the split key %q", got)
+	got = topShadeLegend(undivided.Bar)
+	if !strings.Contains(got, topBarUnknownGlyph) {
+		t.Fatalf("an all-unknown bar's key=%q, want the unevaluated mark named", got)
+	}
+	if strings.Contains(got, topBarIdleGlyph) {
+		t.Fatalf("an all-unknown bar's key=%q named the idle glyph it does not draw", got)
+	}
+	// The CPU bar has scope regions but no used/idle split, so it carries no key —
+	// and its UsedKnown-false scopes must not be mistaken for unevaluated-usage.
+	if got := topShadeLegend(&topBar{Kind: topBarCPU, Regions: []topBarRegion{{Kind: topRegionScope}}}); got != "" {
+		t.Fatalf("a CPU bar carried a block-character key %q", got)
 	}
 	if got := topShadeLegend(nil); got != "" {
-		t.Fatalf("a nil bar carried the split key %q", got)
+		t.Fatalf("a nil bar carried the key %q", got)
 	}
 }
 
@@ -1334,9 +1383,11 @@ func TestTopViewModelCPUBarRegionGeometry(t *testing.T) {
 					t.Fatalf("region %d columns=[%d,%d), want [%d,%d)", index, startCol, endCol, want.startCol, want.endCol)
 				}
 			}
-			// The grey is anchored to the RIGHT EDGE on this bar too, and nothing in
-			// the CPU stack is allowed to be a scope's RAM shading: a CPU rate has no
-			// reserved-and-idle remainder, so no CPU region carries a used split.
+			// The grey is anchored to the RIGHT EDGE on this bar too, and every CPU
+			// column is SOLID: a CPU rate has no reserved-and-idle remainder and no
+			// unevaluated-usage split, so no CPU column is ever shaded or marked
+			// unevaluated — including the scope spans, whose UsedKnown is false but
+			// which topBarCells must not mistake for RAM's unevaluated-usage case.
 			cells := topBarCells(bar, testCase.width)
 			if len(cells) != testCase.width {
 				t.Fatalf("cells=%d, want %d", len(cells), testCase.width)
@@ -1345,8 +1396,8 @@ func TestTopViewModelCPUBarRegionGeometry(t *testing.T) {
 				t.Fatalf("last column=%+v, want the out-of-slice region anchored right", last)
 			}
 			for _, cell := range cells {
-				if cell.Shaded {
-					t.Fatalf("a CPU bar column is shaded: %+v", cell)
+				if cell.Fill != topFillSolid {
+					t.Fatalf("a CPU bar column is not solid: %+v", cell)
 				}
 			}
 		})
