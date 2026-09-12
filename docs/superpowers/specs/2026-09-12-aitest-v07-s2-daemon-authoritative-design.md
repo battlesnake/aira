@@ -504,5 +504,39 @@ Accepted for S2a. The §16.1 parent-pid slot makes a future reaper fix cheap (a 
 worker scope whose embedded pid is dead is positive orphan proof → a reaper-side `cgroup.kill`),
 if the bounded leak ever proves to matter.
 
-*Authoritative for S2, as refined by §16 and §16.1. The S1 spec remains authoritative for S1
-history and the `aira_mem` marker grammar.*
+### 16.2 GATE-3 corrections (2026-09-12, Fable re-gate — then build)
+
+GATE-3 confirmed every GATE-2 item closes on the code and the load-bearing pid identity holds
+(the daemon mints the worker *name* but **copies the pid out of `parent_scope_id`**, never its
+own — `bindConfineScopeID` guarantees that pid == the monitor's `os.Getpid()`). Two corrections
+to §16.1, then this design is buildable (no fourth gate round — the build-review is the next
+quality gate):
+
+- **Escape attestation: the honest verdict is `unverified`, not `contained`.** `contained` is
+  **leader-only** by the #20 descendant-escape attestation design
+  (`2026-08-24-aira-descendant-escape-attestation-design.md`); a pytest supervisor always has
+  relay descendants → `HadDescendants` → `classifyLaunchScopeIntegrity` returns `ScopeUnverified`
+  under an observed teardown, by design. So §16c's "attest `contained`" is unattainable and
+  wrong. The exemption's real, correct effect: the escape check precedes the `HadDescendants`
+  rule, so **without** it a delegate run reads `descendant-escaped`/`migrated`; **with** it, that
+  verdict is absent and the run reads `unverified`. Re-spec the goal as **"`unverified` with no
+  `descendant_escape`; never `descendant-escaped`/`migrated`"** (the mutation check — drop the
+  exemption, see the escape verdict return — still reds). The exemption lives in the **single
+  `witnessedEscape` chokepoint** (it backs the sampler and both teardown paths and already holds
+  `observation.Cgroup`), not in two places. **Builder hazard to avoid:** a permanently-red
+  "expect `contained`" gate must NOT be "fixed" by weakening the #20 leader-only rule — the gate
+  asserts `unverified`-without-escape, full stop.
+
+- **The `serveReDeclare` kill hook must be anchor-gated, not bare-`peerCtx.Done()`.** The lease
+  keeper's `adopt()` closes the previous connection before the re-declare exchange, and a late
+  ack (> the 5 s `leaseKeeperExchangeGrace`) triggers a redial: conn1 is closed while conn2
+  re-anchors the **live** worker lease. A kill keyed on bare EOF would then `cgroup.kill` a
+  mid-test worker. A release is idempotent; a kill is not. Fix: `cgroup.kill`+rmdir **only when
+  the anchored release actually discharged** — `releaseAdmitWaiterAnchored` already returns that
+  bool (the ledger was hardened for exactly this old-conn-EOF-is-a-no-op ordering). **New accepted
+  gap:** the reverse order (conn1's EOF processed *before* conn2's frame → a legitimate discharge
+  → kill) re-runs that one test via the supervisor's crash/retry path, bounded by
+  5 s × `maxNoAck`(=10); accepted.
+
+*Authoritative for S2, as refined by §16, §16.1 and §16.2. The S1 spec remains authoritative for
+S1 history and the `aira_mem` marker grammar.*
