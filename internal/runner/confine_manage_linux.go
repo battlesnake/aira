@@ -189,7 +189,7 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		if owner == "" {
 			owner = ConfineUnknownOwner
 		}
-		record := ConfineRecord{Name: name, Owner: owner, ScopeID: scopeID, SupervisorPID: &pid}
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: scopeID, SupervisorPID: &pid, Worker: IsAitestWorkerScopeName(name)}
 		// AIRA-135. The supervisor's own argv, read live from /proc exactly as
 		// memory.current and memory.max are read live from the cgroup below. It is
 		// deliberately read HERE, before the scope-directory open, because the two
@@ -545,11 +545,25 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	selector = strings.TrimSpace(selector)
 	var matches []ConfineRecord
 	for _, record := range listed.Scopes {
+		// An explicit scope-id always matches — the ONLY way to select a worker row
+		// (S2a Task 10 Step 1).
+		if selector == record.ScopeID {
+			matches = append(matches, record)
+			continue
+		}
+		// A worker scope embeds its PARENT supervisor's pid and a non-unique
+		// aitest-w<seq> name, so a job's sibling workers all match `<supervisor-pid>`
+		// and two suites both mint `aitest-w1`. Filtering worker rows out of the
+		// pid/name selector keeps `--kill <supervisor-pid>` resolving to the parent
+		// (unambiguous) while a worker stays reachable by its explicit scope-id above.
+		if IsAitestWorkerScopeName(record.Name) {
+			continue
+		}
 		pid := ""
 		if record.SupervisorPID != nil {
 			pid = strconv.Itoa(*record.SupervisorPID)
 		}
-		if selector == record.ScopeID || selector == record.Name || selector == pid {
+		if selector == record.Name || selector == pid {
 			matches = append(matches, record)
 		}
 	}

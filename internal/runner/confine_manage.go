@@ -136,8 +136,15 @@ type ConfineRecord struct {
 	//
 	// Summed over one listing's rows it reconciles with that listing's own
 	// ScopeBytes.
-	ReserveBytes      *int64   `json:"reserve_bytes"`
-	Pending           bool     `json:"pending,omitempty"`
+	ReserveBytes *int64 `json:"reserve_bytes"`
+	Pending      bool   `json:"pending,omitempty"`
+	// Worker marks an aitest worker sub-scope (S2a §16.1): a first-class sibling
+	// confine scope whose NAME is aitest-w<seq> and whose pid slot is its PARENT
+	// supervisor's pid. It is a display/selector label — the default `--kill`/`--list`
+	// pid/name selector filters these rows out (a worker is reachable only by its
+	// explicit scope-id, or by killing its parent), so `--kill <supervisor-pid>`
+	// resolves to the parent job rather than matching every one of its siblings.
+	Worker            bool     `json:"worker,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
 }
 

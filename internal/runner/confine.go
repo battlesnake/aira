@@ -1295,6 +1295,33 @@ func MintWorkerScopeID(seq, parentPid int) string {
 	return confineScopeIDWithPID("aitest-w"+strconv.Itoa(seq), "", parentPid, false)
 }
 
+// aitestWorkerNamePrefix is the confine NAME prefix every aitest worker scope
+// carries (MintWorkerScopeID mints "aitest-w"+seq). Minted here beside the
+// minter so the recogniser and the minter cannot drift.
+const aitestWorkerNamePrefix = "aitest-w"
+
+// IsAitestWorkerScopeName reports whether a confine scope NAME (the first field
+// parseConfineScopeID returns, e.g. "aitest-w3") is an aitest worker scope. S2a
+// §16.1: with workers as first-class sibling scopes, every one embeds its PARENT
+// supervisor's pid, so `confine --kill <supervisor-pid>` would otherwise match the
+// parent AND every worker (E_SELECTOR_AMBIGUOUS); the default `--list`/`--kill`
+// pid/name selector filters worker rows out (a worker is reachable only by its
+// explicit scope-id, or by killing its parent). The suffix must be a NON-EMPTY run
+// of digits (the seq), so a user's ordinary confine job named e.g. "aitest-wrapper"
+// is NOT mistaken for a worker.
+func IsAitestWorkerScopeName(name string) bool {
+	suffix, ok := strings.CutPrefix(name, aitestWorkerNamePrefix)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // bindConfineScopeID refuses a pre-minted scope id that does not describe THIS
 // process running THIS request. Syntax is not enough and never was: the grammar
 // accepts any canonical pid, any valid owner, and either delegate class, so a

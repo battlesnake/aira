@@ -3325,8 +3325,16 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	// never the cap standing in for it.
 	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tLIVE\tLEAF-PROCS\tRSS\tAGE\tRESERVE\tCAP")
 	for _, record := range result.Scopes {
+		// S2a §16.1: mark aitest worker sub-scopes so an operator can tell them from
+		// their parent job — they share the parent's supervisor pid, and the pid/name
+		// selector deliberately does not resolve them (kill the parent, or use the
+		// worker's explicit scope-id).
+		name := record.Name
+		if record.Worker {
+			name += " (worker)"
+		}
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			record.Name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
+			name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
 			confineLiveStatus(record),
 			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds),
 			confineInt64(record.ReserveBytes), confineString(record.Cap))

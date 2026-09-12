@@ -354,6 +354,45 @@ func TestConfineKillSelectorAmbiguousAndNotFound(t *testing.T) {
 	}
 }
 
+// verifies: S2a Task 10 Step 1 — a delegate job's sibling worker scopes embed the
+// SAME supervisor pid in their pid slot (S2a §16a), so once workers are siblings on
+// the slice, `confine --kill <supervisor-pid>` matched the parent AND every worker
+// -> E_SELECTOR_AMBIGUOUS, a regression for a core gesture. Worker rows are filtered
+// from the default pid/name selector (matched ONLY by their explicit scope-id), so
+// `--kill <supervisor-pid>` resolves to the parent while a worker stays killable by
+// its scope-id.
+//
+// MUTATION: drop the worker-row filter in killConfineWithDeps -> `--kill 4601`
+// matches the parent + two workers -> E_SELECTOR_AMBIGUOUS and this test REDS.
+func TestConfineKillWorkerRowsResolveOnlyByScopeIDNotSupervisorPID(t *testing.T) {
+	slice := t.TempDir()
+	stamp := time.Now().UnixNano()
+	const supervisorPID = 4601
+	parentID := confineTestScopeID("suite", supervisorPID, stamp)
+	worker1 := confineTestScopeID("aitest-w1", supervisorPID, stamp+1)
+	worker2 := confineTestScopeID("aitest-w2", supervisorPID, stamp+2)
+	for _, id := range []string{parentID, worker1, worker2} {
+		writeConfineTestScope(t, slice, id, "71\n")
+	}
+	deps := defaultConfineScanDeps()
+	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
+		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
+	}
+	// --kill <supervisor-pid> must resolve UNAMBIGUOUSLY to the parent job.
+	result, err := killConfineWithDeps(context.Background(), slice, strconv.Itoa(supervisorPID), "owner", true, nil, time.Second, deps)
+	if err != nil {
+		t.Fatalf("--kill <supervisor-pid> err=%v, want the parent job resolved unambiguously (worker rows filtered from the pid selector)", err)
+	}
+	if result.Status != "killed" || result.ScopeID != parentID {
+		t.Fatalf("--kill <supervisor-pid> result=%+v, want the PARENT %q killed, never a worker", result, parentID)
+	}
+	// A worker stays reachable by its explicit scope-id.
+	wresult, werr := killConfineWithDeps(context.Background(), slice, worker1, "owner", true, nil, time.Second, deps)
+	if werr != nil || wresult.Status != "killed" || wresult.ScopeID != worker1 {
+		t.Fatalf("--kill <worker-scope-id> result=%+v err=%v, want worker %q killable by its scope-id", wresult, werr, worker1)
+	}
+}
+
 func TestConfineMidLaunchKillDoesNotFabricateOrReleaseAndLaunchContinues(t *testing.T) {
 	slice := t.TempDir()
 	fake := &confineFakeScope{}
