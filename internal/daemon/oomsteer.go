@@ -403,11 +403,19 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 // parent-scope reserve — sized for the supervisor and framework, not the whole
 // suite — because its per-worker sub-reservations are separate waiters in this
 // same queue that carry the real charge (the double-book AIRA-29's build review
-// found, from the other direction). The parent's memory.current is HIERARCHICAL
-// and already contains every byte those children allocated, so comparing it
-// against the parent's own small reserve would mark a perfectly compliant 30 GiB
-// suite as an offender on every full slice. Summing the children into the parent is what makes the
-// comparison apples-to-apples.
+// found, from the other direction). Under S2a those workers are first-class
+// SIBLING scopes directly under the slice, NOT nested under the parent, so the
+// parent's memory.current does NOT contain their bytes: it is the parent's own
+// RSS alone. The workers themselves are never keys in this map — the loop below
+// continues past every sub-reservation — and oomsteer's consumer iterates only
+// these keys, so a sibling worker scope is never steered here at all; only its
+// parent is (each worker is bounded by its own memory.oom.group instead). The
+// fold below (summing each sub-reservation's charge into its parent's budget) is
+// T3-inherited; post-collapse it makes the parent's budget an OVER-count relative
+// to that sibling-free memory.current, which can only ever make a parent look
+// LESS like an offender — an under-detection, never a false offender, so it is the
+// safe direction. Reconciling the fold with the sibling topology is T10-S2's job,
+// not this comment's; stated here rather than hidden.
 //
 // A sub-reservation whose parent is not a scope-backed waiter here adds nothing:
 // without the parent's own charge there is no budget to add it to, and inventing

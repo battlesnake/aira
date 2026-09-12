@@ -224,7 +224,11 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// path, and for the same reason: only a number the caller chose may be
 	// imposed on their container.
 	declaredContainerCap := request.ScopeMemoryMax
-	if declaredContainerCap <= 0 && declaredReserve && !request.DelegateRAM {
+	// S2a: a --delegate-ram job is an ordinary confine job, so a declared
+	// --memory-reserve is its container cap here exactly as on the real path (the
+	// old `!request.DelegateRAM` guard and its falsified delegate-ceiling
+	// rationale were removed).
+	if declaredContainerCap <= 0 && declaredReserve {
 		declaredContainerCap = request.MemoryReserve
 	}
 	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)

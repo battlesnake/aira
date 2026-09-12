@@ -94,19 +94,20 @@ Heavy jobs run inside a memory-capped, deprioritised cgroup that only starts whe
 aira confine -- make test
 ```
 
-For test suites, `--delegate-ram` charges a small pinned framework overhead at the door instead of the whole job's peak, so a suite is not blocked behind one large reservation. Pair it with AIRA's own pytest plugin, `aitest`: the supervisor forks each worker and admits it through the daemon, which places that worker in its own kernel-enforced cgroup sub-scope nested under the job's scope. A worker that outgrows its sub-scope is OOM-killed alone, its test is retried once, and a second kill reports the test `unevaluated` rather than passed or failed.
+For test suites, `--delegate-ram` reserves only the parent scope's own footprint (the supervisor and framework, estimated from history like any ordinary job) instead of the whole job's peak, so a suite is not blocked behind one large reservation. Pair it with AIRA's own pytest plugin, `aitest`: the supervisor forks each worker and admits it through the daemon, which places that worker in its own kernel-enforced cgroup scope — a first-class sibling directly under the slice, not nested under the job's scope. A worker that outgrows its scope is OOM-killed alone, its test is retried once, and a second kill reports the test `unevaluated` rather than passed or failed.
 
 ```sh
 aira confine --delegate-ram -- pytest --aitest-workers=auto
 ```
 
-`--delegate-ram` is efficient but not airtight: a delegate scope's `memory.max` is a generous ceiling, not its reserve, so worker growth is contained per worker but is not accounted against the shared slice. A plain `aira confine --memory-reserve R -- <cmd>` is the airtight shape, at the cost of reserving the whole-job peak.
+`--delegate-ram` is efficient and fully accounted: each worker is admitted against the shared slice ledger and reserves exactly what its own `memory.max` allows, so worker growth is both contained per worker and booked on the slice. Its one residual is per-worker containment — a test needing more than its worker's reservation is OOM-killed in that one scope (and retried once). A plain `aira confine --memory-reserve R -- <cmd>` is the coarse-grained alternative, at the cost of reserving the whole-job peak.
 
 No per-test RAM annotation is needed or read: each worker is sized from a
 per-worker backstop, and a worker that exceeds it is OOM-killed alone rather
 than taking the suite with it. Raise the backstop for an unusually hungry suite
-with `AIRA_AITEST_ESTIMATED_BYTES` (a plain integer byte count, not a size
-suffix).
+with `AIRA_AITEST_ESTIMATED_BYTES` (a byte count or a 1024-based size suffix like
+`4G` or `512M`; a value that parses as neither warns rather than being silently
+ignored).
 
 ### Capture the friction
 

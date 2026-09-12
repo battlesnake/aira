@@ -557,15 +557,16 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			"conftest.py",
 			"pytest_plugins",
 			// The accounting claim must stay scoped to what worker-admit
-			// actually does. An earlier draft overstated this as "the slice
-			// only ever holds this job's 512M framework overhead", which is
-			// false: a delegate scope adopted after a daemon restart is
-			// reconstructed at live RSS plus margin. (AIRA-77's companion
-			// assertion here, the `-p no:aira_xdist_governor` migration
-			// workaround, was removed by AIRA-33 along with the plugin that
-			// made it necessary; TestSkillNamesNothingFromTheRetiredXdistGovernor
-			// now asserts the opposite -- that the phrase is GONE.)
-			"adds no slice-ledger charge",
+			// actually does — and what it does is charge the slice ledger for
+			// every worker, exactly: admit.go ledgerCharge() has no
+			// sub-reservation exemption, and worker_admit.go sets the worker's
+			// reserve == its memory.max == estimatedBytes, so the ledger reserves
+			// EXACTLY what each sibling worker scope can use. An earlier draft
+			// (the pre-T3 model) had this BACKWARDS — "adds no slice-ledger
+			// charge", "workers grow into the outer ceiling with nothing
+			// reserved" — and the T07 build-review BLOCKed it; those clauses are
+			// now pinned as FORBIDDEN below.
+			"against the ONE machine-wide slice ledger",
 			// AIRA_AITEST_ESTIMATED_BYTES is parsed by _parse_estimated_bytes
 			// (internal/pylib/aitest/__init__.py), which accepts a byte count OR
 			// a 1024-based size suffix (4G/512M/1GiB) matching Go
@@ -595,7 +596,11 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			{"no `--delegate-ram`", "tells agents to omit --delegate-ram (the flag aitest requires)"},
 			{"only a `--delegate-ram` launch is guaranteed", "claims delegate-ram is the only shape with a finite outer cap; --memory-max and a declared --memory-reserve are finite too, they just never receive the coordinates"},
 			{"guaranteed such a cap on every path", "claims a --delegate-ram parent is capped on every path; post-collapse (T07) an unpinned, non-admitted delegate launch is uncapped like any ordinary confine job"},
-			{"the slice only ever holds", "overstates slice accounting; see the adds-no-slice-ledger-charge assertion above"},
+			{"the slice only ever holds", "overstates slice accounting; each worker books its own reservation on the slice ledger — see the against-the-slice-ledger assertion above"},
+			// The T07-BLOCKed pre-T3 model, pinned as the exact false clauses it shipped.
+			{"adds no slice-ledger charge", "false: worker-admit DOES charge the slice ledger for every worker, exactly (charge == the worker's memory.max)"},
+			{"grow into the outer ceiling", "the pre-T3 false claim (workers grew into the outer ceiling with nothing reserved); workers are siblings admitted against the slice ledger, each booking its own reservation"},
+			{"refuses to grant anything unless that outer scope has a finite", "false: worker-admit grants against the slice ceiling and never checks the outer scope's memory.max (worker_admit.go: 'no outer-cap aggregate scan, no shared smaller-than-slice parent cap')"},
 			{"silently ignored", "reproduces the AIRA-223 footgun wording: a size suffix is now accepted, not silently ignored"},
 			{"PLAIN INTEGER BYTE COUNT", "the env var now accepts a 1024-based size suffix, so the plain-integer-only claim is stale (AIRA-223)"},
 		} {
@@ -667,6 +672,13 @@ func TestSkillNamesNothingFromTheCollapsedDelegateRAMModel(t *testing.T) {
 	retired := []string{
 		"aitest-bootstrap",  // the deleted subprocess/verb; coordinates now come from the launch env
 		"auto:delegate-ram", // the deleted cap-source token; a delegate scope is now cap-source=auto:daemon-reserve
+		// The falsified accounting model the T07 build-review BLOCKed. A delegate
+		// job is an ordinary confine job and worker-admit charges the slice ledger
+		// EXACTLY (charge == the worker's memory.max), so none of these may survive
+		// in AIRA's own instructions to other agents.
+		"delegate-ram:ceiling-not-a-budget", // the deleted --budget classifier reason
+		"books nothing on the slice",        // false: a delegate job books its history-estimated reserve like any job
+		"framework overhead",                // the deleted 512M pinned-overhead model (README-era phrasing)
 	}
 	for _, document := range []struct{ name, body string }{
 		{"SKILL.md", string(artifacts.SkillMD)},

@@ -1047,15 +1047,17 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the user's container at tens of megabytes, forever and unrecoverably. Only
 	// a number the caller chose may be imposed on their container.
 	declaredContainerCap := request.ScopeMemoryMax
-	// The !DelegateRAM guard mirrors the scope-cap assignment above, and for the
-	// same reason (build review, Fable): under --delegate-ram a declared
-	// --memory-reserve is the pinned FRAMEWORK OVERHEAD, not a cap -- the scope's
-	// own memory.max is the much larger delegate ceiling. Without this guard,
-	// `--delegate-ram --memory-reserve 512M -- podman run img pytest ...` (the
-	// SKILL's own recommended pytest idiom) would inject `--memory=536870912`
-	// into a container whose scope allows 16G, and OOM-kill it at 512M. Under
-	// delegate-ram only an explicit --memory-max is a declared cap.
-	if declaredContainerCap <= 0 && declaredReserve && !request.DelegateRAM {
+	// Mirrors the scope-cap assignment above: a declared --memory-reserve is the
+	// scope cap, and so it is also the container cap. S2a collapsed --delegate-ram
+	// into an ordinary confine job, so the old `!request.DelegateRAM` guard here
+	// was removed with its (now-false) rationale that "under --delegate-ram the
+	// scope's own memory.max is the much larger delegate ceiling": post-collapse
+	// the scope's memory.max IS the declared reserve (set above at the same
+	// `scopeMemoryMax <= 0 && declaredReserve` branch), so `--delegate-ram
+	// --memory-reserve 512M -- podman run img` now injects `--memory=536870912`
+	// exactly like its non-delegate twin, matching the scope it runs in rather
+	// than diverging from it.
+	if declaredContainerCap <= 0 && declaredReserve {
 		declaredContainerCap = declaredReserveBytes
 	}
 	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
