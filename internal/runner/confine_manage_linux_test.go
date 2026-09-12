@@ -33,10 +33,6 @@ func confineTestOwnedScopeID(name, owner string, pid int, stamp int64) string {
 	return confineTestScopeID(name, pid, stamp) + "@" + owner
 }
 
-func confineTestDelegateScopeID(name string, pid int, stamp int64) string {
-	return "CONFINE-" + delegateRAMScopeIDMarker + "-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(stamp, 36)
-}
-
 func writeConfineTestScope(t *testing.T, slice, scopeID, procs string) string {
 	t.Helper()
 	path := filepath.Join(slice, ".aira-"+scopeID)
@@ -61,7 +57,7 @@ func TestConfineScanUnionDeduplicatesAndRegistryOwnerWins(t *testing.T) {
 	now := time.Now()
 	owned := confineTestOwnedScopeID("build-name.with-dash", "session-a", 4101, now.Add(-time.Minute).UnixNano())
 	scanOnly := confineTestScopeID("fallback", 4102, now.Add(-2*time.Minute).UnixNano())
-	marked := confineTestDelegateScopeID("ceiling-suite", 4105, now.Add(-3*time.Minute).UnixNano())
+	marked := confineTestScopeID("ceiling-suite", 4105, now.Add(-3*time.Minute).UnixNano())
 	pending := confineTestOwnedScopeID("pending", "session-a", 4103, now.UnixNano())
 	writeConfineTestScope(t, slice, owned, "51\n52\n")
 	writeConfineTestScope(t, slice, scanOnly, "61\n")

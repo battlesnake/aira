@@ -309,7 +309,7 @@ func TestConfineInputPlaneIDFitsTheUnixSocketBudget(t *testing.T) {
 		t.Fatalf("a plane path is %d bytes, over the %d-byte Unix socket limit", full, unixSocketPathMax)
 	}
 	// And the id it replaces would NOT have fitted, which is why it exists.
-	scopeID := confineScopeID("merge-gate-worktree-aira196", "session-abcdef012345", false)
+	scopeID := confineScopeID("merge-gate-worktree-aira196", "session-abcdef012345")
 	if oversized := len(runtimeDir) + len(scopeID) + 1 + 24 + len(".sock"); oversized <= unixSocketPathMax {
 		t.Fatalf("a scope-id-named socket path is only %d bytes; if that now fits, the short id has lost its reason to exist", oversized)
 	}

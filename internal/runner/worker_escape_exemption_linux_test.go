@@ -167,7 +167,7 @@ func TestWitnessedEscapeStillWitnessesGenuineEscapes(t *testing.T) {
 
 	// (c) A non-worker confine job named "aitest-wrapper" (suffix not all digits)
 	// carrying THIS pid is a genuine escape — the name gate is worker-specific.
-	notWorker := filepath.Join(slice, ".aira-"+confineScopeIDWithPID("aitest-wrapper", "", os.Getpid(), false))
+	notWorker := filepath.Join(slice, ".aira-"+confineScopeIDWithPID("aitest-wrapper", "", os.Getpid()))
 	if !witnessedEscape(parentScope, obs(notWorker)) {
 		t.Fatalf("a non-worker confine job named aitest-wrapper was wrongly exempted")
 	}

@@ -675,7 +675,7 @@ const ConfineUnknownOwner = "unknown"
 const ConfineInferredOwnerPrefix = "@"
 
 // maxConfineOwnerLen bounds the owner component so that the worst-case scope
-// DIRECTORY name — ".aira-CONFINE-@dr-<name(100)>-<pid(7)>-<stamp(13)>@<owner>"
+// DIRECTORY name — ".aira-CONFINE-<name(100)>-<pid(7)>-<stamp(13)>@<owner>"
 // — stays comfortably inside NAME_MAX (255). Names keep the wider 100-character
 // identity bound because parseConfineScopeID must still accept every name ever
 // minted; only the owner half is newly embedded, so only it is newly bounded.
@@ -1083,14 +1083,12 @@ func formatConfineCPUUsec(usec int64) string {
 	return (time.Duration(usec) * time.Microsecond).String()
 }
 
-// delegateRAMScopeIDMarker, the scope-id parser and its helpers live in this
-// PORTABLE file, not in confine_linux.go, because they are pure string
-// manipulation over a value that crosses the daemon boundary. Keeping them
-// Linux-only forced internal/daemon to carry a SECOND, regex-shaped definition
-// of the same grammar, and the two accepted different languages — an id the
-// daemon admitted could then be invisible to every scan (build-review, Sol).
-// One parser, one language.
-const delegateRAMScopeIDMarker = "@dr"
+// The scope-id parser and its helpers live in this PORTABLE file, not in
+// confine_linux.go, because they are pure string manipulation over a value that
+// crosses the daemon boundary. Keeping them Linux-only forced internal/daemon to
+// carry a SECOND, regex-shaped definition of the same grammar, and the two
+// accepted different languages — an id the daemon admitted could then be invisible
+// to every scan (build-review, Sol). One parser, one language.
 
 // ParseConfineScopeID is the exported form for internal/daemon, which must
 // validate an id a client supplied and bind its embedded name and owner to the
@@ -1115,13 +1113,9 @@ func parseConfineScopeID(scopeID string) (string, int, int64, string, bool) {
 		return "", 0, 0, "", false
 	}
 	rest := strings.TrimPrefix(scopeID, "CONFINE-")
-	if strings.HasPrefix(rest, delegateRAMScopeIDMarker+"-") {
-		rest = strings.TrimPrefix(rest, delegateRAMScopeIDMarker+"-")
-	}
-	// Split at the FIRST remaining '@', keeping the remainder verbatim: an
-	// inferred owner starts with its own '@' (ConfineInferredOwnerPrefix) and
-	// must survive intact. The "@dr" marker was already stripped above, so this
-	// delimiter is unambiguous — neither a name nor an owner may contain '@'.
+	// Split at the FIRST '@', keeping the remainder verbatim: an inferred owner
+	// starts with its own '@' (ConfineInferredOwnerPrefix) and must survive intact.
+	// This delimiter is unambiguous — neither a name nor an owner may contain '@'.
 	owner := ""
 	if at := strings.IndexByte(rest, '@'); at >= 0 {
 		owner = rest[at+1:]
@@ -1157,13 +1151,6 @@ func parseConfineScopeID(scopeID string) (string, int, int64, string, bool) {
 		return "", 0, 0, "", false
 	}
 	return name, int(pid64), stamp, owner, true
-}
-
-// IsDelegateRAMScopeID reports the restart-surviving cap type carrier. The
-// marker uses '@', which cannot occur in a user-supplied confine name, so it is
-// unambiguous even though names themselves may contain '-'.
-func IsDelegateRAMScopeID(scopeID string) bool {
-	return strings.HasPrefix(scopeID, "CONFINE-"+delegateRAMScopeIDMarker+"-")
 }
 
 // validateConfineName lives in the PORTABLE file, alongside the scope-id parser
@@ -1226,7 +1213,7 @@ func MintConfineScopeID(request ConfineRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return confineScopeID(name, owner, request.DelegateRAM), nil
+	return confineScopeID(name, owner), nil
 }
 
 // confineScopeIDWithPID is the ONE place the confine scope-id grammar is minted
@@ -1237,14 +1224,11 @@ func MintConfineScopeID(request ConfineRequest) (string, error) {
 // embedded pid is load-bearing: the orphan reaper's liveness predicate and the
 // S2a escape exemption both read it, so a mis-stamped pid is a correctness bug,
 // not a cosmetic one.
-func confineScopeIDWithPID(name, owner string, pid int, delegateRAM bool) string {
+func confineScopeIDWithPID(name, owner string, pid int) string {
 	if name == "" {
 		name = "job"
 	}
 	id := "CONFINE-"
-	if delegateRAM {
-		id += delegateRAMScopeIDMarker + "-"
-	}
 	id += name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	// An unknown owner is encoded as the ABSENCE of a suffix, never as
 	// "@unknown": a reader must not be able to confuse "nobody claimed this" with
@@ -1262,12 +1246,11 @@ func confineScopeIDWithPID(name, owner string, pid int, delegateRAM bool) string
 // parseConfineScopeID(basename).pid == os.Getpid() check on the monitor process
 // (§16.1/§16.2). The name is aitest-w<seq>; seq (a daemon-monotonic counter)
 // makes (name, parentPid, stamp) unique by construction, so there is no
-// cross-scope counter, no reseed, and no EEXIST path. Owner is empty and the
-// delegate-ram marker is not used: a worker carries neither. The result is
-// parseable by parseConfineScopeID, so the worker is reaped / listed / killable
+// cross-scope counter, no reseed, and no EEXIST path. Owner is empty. The result
+// is parseable by parseConfineScopeID, so the worker is reaped / listed / killable
 // like any confine scope.
 func MintWorkerScopeID(seq, parentPid int) string {
-	return confineScopeIDWithPID("aitest-w"+strconv.Itoa(seq), "", parentPid, false)
+	return confineScopeIDWithPID("aitest-w"+strconv.Itoa(seq), "", parentPid)
 }
 
 // aitestWorkerNamePrefix is the confine NAME prefix every aitest worker scope
@@ -1299,16 +1282,16 @@ func IsAitestWorkerScopeName(name string) bool {
 
 // bindConfineScopeID refuses a pre-minted scope id that does not describe THIS
 // process running THIS request. Syntax is not enough and never was: the grammar
-// accepts any canonical pid, any valid owner, and either delegate class, so a
-// merely-parseable id can name a scope after a foreign supervisor. Each facet is
-// checked and named separately so a refusal says which one was wrong.
+// accepts any canonical pid and any valid owner, so a merely-parseable id can name
+// a scope after a foreign supervisor. Each facet is checked and named separately so
+// a refusal says which one was wrong.
 //
 // Fail closed, never re-mint: silently minting a different id would put the job
 // in a scope directory the durable record does not name, which is precisely the
 // "the record and reality disagree" failure AIRA-22 exists to end.
 //
 // covers: AIRA-22
-func bindConfineScopeID(scopeID, name, owner string, delegateRAM bool) error {
+func bindConfineScopeID(scopeID, name, owner string) error {
 	embeddedName, pid, _, embeddedOwner, ok := parseConfineScopeID(scopeID)
 	if !ok {
 		return fmt.Errorf("scope id %q is malformed", scopeID)
@@ -1327,10 +1310,6 @@ func bindConfineScopeID(scopeID, name, owner string, delegateRAM bool) error {
 	}
 	if embeddedOwner != wantOwner {
 		return fmt.Errorf("scope id %q carries owner %q, not %q", scopeID, embeddedOwner, wantOwner)
-	}
-	if IsDelegateRAMScopeID(scopeID) != delegateRAM {
-		return fmt.Errorf("scope id %q is in the wrong delegate-ram class (id says %v, request says %v)",
-			scopeID, IsDelegateRAMScopeID(scopeID), delegateRAM)
 	}
 	return nil
 }

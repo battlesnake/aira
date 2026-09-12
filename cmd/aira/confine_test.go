@@ -278,7 +278,7 @@ func TestRenderConfineListShowsTheReserveBesideTheCap(t *testing.T) {
 		t.Helper()
 		result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{{
 			Name: "suite", Owner: "session-b", SupervisorPID: &pid,
-			ScopeID: "CONFINE-@dr-suite-4242-abc@session-b", Populated: &leaf, SubtreePopulated: &live,
+			ScopeID: "CONFINE-suite-4242-abc@session-b", Populated: &leaf, SubtreePopulated: &live,
 			RSSBytes: &rss, AgeSeconds: &age, Cap: &ceiling, ReserveBytes: held,
 		}}}
 		dispatch := dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, _ core.Request) core.Response {

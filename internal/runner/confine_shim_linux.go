@@ -97,8 +97,8 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// a cgroup directory to exist.
 	scopeID := request.presetScopeID
 	if scopeID == "" {
-		scopeID = confineScopeID(request.Name, request.Owner, request.DelegateRAM)
-	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner, request.DelegateRAM); bindErr != nil {
+		scopeID = confineScopeID(request.Name, request.Owner)
+	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner); bindErr != nil {
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", bindErr)
 	}
 	request.ScopeID = scopeID
@@ -230,7 +230,7 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 			admission.release != nil
 		result.Status.ContainerMemory = ContainerMemoryFacet(containerPlan, containerInjection, containerReserveSkip, ledgerCharged)
 	}
-	setupArgv, err := confineSetupArgv(containerInjection.Argv, request.DelegateRAM)
+	setupArgv, err := confineSetupArgv(containerInjection.Argv)
 	if err != nil {
 		return result, err
 	}

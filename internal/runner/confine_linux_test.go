@@ -1448,20 +1448,6 @@ func TestConfineDelegateRAMTakesOrdinaryScopeCap(t *testing.T) {
 	})
 }
 
-func TestDelegateRAMScopeIDMarkerIsPositionalAndUnambiguous(t *testing.T) {
-	marked := confineScopeID("suite-with-dash", "", true)
-	unmarked := confineScopeID("dr-suite", "", false)
-	if !IsDelegateRAMScopeID(marked) || IsDelegateRAMScopeID(unmarked) {
-		t.Fatalf("marker classification marked=%q unmarked=%q", marked, unmarked)
-	}
-	if name, _, _, _, ok := parseConfineScopeID(marked); !ok || name != "suite-with-dash" {
-		t.Fatalf("marked parse name=%q ok=%v id=%q", name, ok, marked)
-	}
-	if name, _, _, _, ok := parseConfineScopeID(unmarked); !ok || name != "dr-suite" {
-		t.Fatalf("unmarked parse name=%q ok=%v id=%q", name, ok, unmarked)
-	}
-}
-
 // verifies: a daemon grant whose admission could not be evaluated (state
 // "unevaluated" — the daemon answered but the slice's live usage was unreadable)
 // carries only the flat fallback reserve and was never accounted, so it must NOT
@@ -1685,7 +1671,6 @@ func TestConfineHandshakeAppliesPrioritiesAndInheritsStdio(t *testing.T) {
 
 func TestConfineDelegateRAMSetupAppliesOOMScoreAdjAndInherits(t *testing.T) {
 	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", "")
-	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", "")
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
@@ -1698,88 +1683,41 @@ func TestConfineDelegateRAMSetupAppliesOOMScoreAdjAndInherits(t *testing.T) {
 	if err != nil || result.Exit != 0 || result.Status.Priorities != ConfinePrioritiesApplied {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fields := strings.Fields(stdout.String()); !reflect.DeepEqual(fields, []string{"800", "800"}) {
+	// S2a: a delegate job is an ordinary confine job, so leader and child carry the
+	// single confine-class baseline (500), not the retired delegate 800.
+	if fields := strings.Fields(stdout.String()); !reflect.DeepEqual(fields, []string{"500", "500"}) {
 		t.Fatalf("delegate oom_score_adj leader/child=%q", stdout.String())
 	}
 }
 
+// S2a: a single confine oom-class. confineSetupArgv honours the one
+// AIRA_CONFINE_OOM_SCORE_ADJ override, and an unparseable/out-of-range value is a
+// clear rejection rather than a silent fallback. There is no delegate env or
+// class-ordering invariant any more.
 func TestConfineSetupArgvOOMScoreAdjOverridesAndRejection(t *testing.T) {
-	t.Run("valid overrides select the request class", func(t *testing.T) {
+	t.Run("a valid override is applied", func(t *testing.T) {
 		t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", "600")
-		t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", "900")
-		for _, test := range []struct {
-			name        string
-			delegateRAM bool
-			want        int
-		}{
-			{name: "non-delegate", want: 600},
-			{name: "delegate", delegateRAM: true, want: 900},
-		} {
-			t.Run(test.name, func(t *testing.T) {
-				argv, err := confineSetupArgv([]string{"/bin/true"}, test.delegateRAM)
-				if err != nil {
-					t.Fatal(err)
-				}
-				_, _, oomAdj, _, _, _, err := parseConfineSetupArgs(argv[1:])
-				if err != nil || oomAdj != test.want {
-					t.Fatalf("argv=%q oom_score_adj=%d err=%v, want %d", argv, oomAdj, err, test.want)
-				}
-			})
+		argv, err := confineSetupArgv([]string{"/bin/true"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, oomAdj, _, _, _, err := parseConfineSetupArgs(argv[1:])
+		if err != nil || oomAdj != 600 {
+			t.Fatalf("argv=%q oom_score_adj=%d err=%v, want 600", argv, oomAdj, err)
 		}
 	})
 
 	for _, test := range []struct {
-		name, nonDelegate, delegate, want string
+		name, override, want string
 	}{
-		{name: "non-integer", nonDelegate: "not-an-integer", delegate: "800", want: "AIRA_CONFINE_OOM_SCORE_ADJ"},
-		{name: "non-delegate below desktop floor", nonDelegate: "499", delegate: "800", want: "AIRA_CONFINE_OOM_SCORE_ADJ"},
-		{name: "non-delegate above kernel maximum", nonDelegate: "1001", delegate: "1002", want: "AIRA_CONFINE_OOM_SCORE_ADJ"},
-		{name: "delegate below desktop floor", nonDelegate: "500", delegate: "499", want: "AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE"},
-		{name: "delegate above kernel maximum", nonDelegate: "500", delegate: "1001", want: "AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE"},
-		{name: "inverted classes", nonDelegate: "800", delegate: "800", want: "must be greater"},
+		{name: "non-integer", override: "not-an-integer", want: "AIRA_CONFINE_OOM_SCORE_ADJ"},
+		{name: "below desktop floor", override: "499", want: "AIRA_CONFINE_OOM_SCORE_ADJ"},
+		{name: "above kernel maximum", override: "1001", want: "AIRA_CONFINE_OOM_SCORE_ADJ"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", test.nonDelegate)
-			t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", test.delegate)
-			if _, err := confineSetupArgv([]string{"/bin/true"}, false); err == nil || !strings.Contains(err.Error(), "E_CONFINE_ARGUMENT_INVALID") || !strings.Contains(err.Error(), test.want) {
+			t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", test.override)
+			if _, err := confineSetupArgv([]string{"/bin/true"}); err == nil || !strings.Contains(err.Error(), "E_CONFINE_ARGUMENT_INVALID") || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("argv build error=%v, want clear rejection containing %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestConfineOOMScoreAdjBiasDocumentsFanoutBoundary(t *testing.T) {
-	const total = int64(64 << 30)
-	score := func(rss int64, adj int) int64 {
-		return rss + int64(adj)*total/1000
-	}
-	nonDelegate, delegate := ConfineOOMScoreAdj, ConfineDelegateOOMScoreAdj
-	if delegate <= nonDelegate || nonDelegate <= 0 {
-		t.Fatalf("oom score ordering delegate=%d non-delegate=%d", delegate, nonDelegate)
-	}
-
-	for _, test := range []struct {
-		name                      string
-		nonDelegateRSS, workerRSS int64
-		delegatePreferred         bool
-	}{
-		{
-			name: "moderate airtight process loses to one delegate worker",
-			// Fan-out does not aggregate per-worker badness: a 1 GiB worker still
-			// receives enough 300-point bias to outrank this 10 GiB airtight task.
-			nonDelegateRSS: 10 << 30, workerRSS: 1 << 30, delegatePreferred: true,
-		},
-		{
-			name: "large airtight process can outscore delegate bias",
-			// This deliberately documents the limit: task RSS can outweigh the
-			// class bias, so Option A is not an absolute protection guarantee.
-			nonDelegateRSS: 24 << 30, workerRSS: 1 << 30, delegatePreferred: false,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			got := score(test.workerRSS, delegate) > score(test.nonDelegateRSS, nonDelegate)
-			if got != test.delegatePreferred {
-				t.Fatalf("delegatePreferred=%v, want %v (delegate=%d non-delegate=%d)", got, test.delegatePreferred, delegate, nonDelegate)
 			}
 		})
 	}
@@ -2070,9 +2008,9 @@ func confineUnitDeps(scope *confineFakeScope) confineDeps {
 	}
 }
 
-func mustConfineSetupArgv(t *testing.T, target []string, delegateRAM bool) []string {
+func mustConfineSetupArgv(t *testing.T, target []string) []string {
 	t.Helper()
-	argv, err := confineSetupArgv(target, delegateRAM)
+	argv, err := confineSetupArgv(target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2230,7 +2168,7 @@ func TestConfineRealSetupHandshakeWriteFailureNeverExecsTarget(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], mustConfineSetupArgv(t, []string{
 		"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker,
-	}, false)...)
+	})...)
 	cmd.ExtraFiles = []*os.File{invalidHandshake, releaseRead}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
 	cmd.Stderr = io.Discard
@@ -2268,7 +2206,7 @@ func TestConfineRealStandaloneSetupOutsideOOMGroupNeverExecsTarget(t *testing.T)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], mustConfineSetupArgv(t, []string{
 		"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker,
-	}, false)...)
+	})...)
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
 	cmd.Stderr = io.Discard
@@ -2314,7 +2252,7 @@ func TestConfineRealSetupClosedReleaseNeverExecsTarget(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], mustConfineSetupArgv(t, []string{
 		"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker,
-	}, false)...)
+	})...)
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
 	cmd.Stderr = io.Discard
@@ -2372,7 +2310,7 @@ func confineRealSetupScope(t *testing.T, oomGroup bool) Scope {
 	if err := backend.Probe(context.Background()); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "real setup backend probe: %v", err)
 	}
-	scope, err := backend.Create(context.Background(), confineScopeID("setup-test", "", false))
+	scope, err := backend.Create(context.Background(), confineScopeID("setup-test", ""))
 	if err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "real setup scope create: %v", err)
 	}
@@ -2420,7 +2358,6 @@ func TestConfineRealOOMGroupWrittenAndEffective(t *testing.T) {
 // enforced, and the priority knobs (oom_score_adj=500) are applied and inherited.
 func TestConfineRealPrioritiesUnderCappedSlice(t *testing.T) {
 	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", "")
-	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", "")
 	parent := confineMemoryParent(t, "67108864")
 	var stdout, stderr bytes.Buffer
 	result, err := Confine(context.Background(), ConfineRequest{
@@ -2447,7 +2384,6 @@ func TestConfineRealPrioritiesUnderCappedSlice(t *testing.T) {
 // independent of daemon admission.
 func TestConfineRealDelegateRAMPrioritiesUnderCappedSlice(t *testing.T) {
 	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", "")
-	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", "")
 	parent := confineMemoryParent(t, "67108864")
 	deps := defaultConfineDeps()
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
@@ -2465,7 +2401,9 @@ func TestConfineRealDelegateRAMPrioritiesUnderCappedSlice(t *testing.T) {
 	if result.Exit != 0 || result.Status.Cap != ConfineCapEnforced || result.Status.Scope != ConfineScopePlaced || result.Status.OOMGroup != ConfineOOMGroupSet || result.Status.Priorities != ConfinePrioritiesApplied {
 		t.Fatalf("result=%+v stdout=%q stderr=%q", result, stdout.String(), stderr.String())
 	}
-	if fields := strings.Fields(stdout.String()); !reflect.DeepEqual(fields, []string{"800", "800"}) {
+	// S2a: a delegate job is an ordinary confine job, so leader and child carry the
+	// single confine-class baseline (500), not the retired delegate 800.
+	if fields := strings.Fields(stdout.String()); !reflect.DeepEqual(fields, []string{"500", "500"}) {
 		t.Fatalf("delegate oom_score_adj leader/child=%q", stdout.String())
 	}
 }

@@ -595,8 +595,8 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// that would run the job in a scope the durable record does not name.
 	scopeID := request.presetScopeID
 	if scopeID == "" {
-		scopeID = confineScopeID(request.Name, request.Owner, request.DelegateRAM)
-	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner, request.DelegateRAM); bindErr != nil {
+		scopeID = confineScopeID(request.Name, request.Owner)
+	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner); bindErr != nil {
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", bindErr)
 	}
 	request.ScopeID = scopeID
@@ -1062,7 +1062,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			_, _ = fmt.Fprintln(diagnostics, advisory)
 		}
 	}
-	setupArgv, err := confineSetupArgv(containerInjection.Argv, request.DelegateRAM)
+	setupArgv, err := confineSetupArgv(containerInjection.Argv)
 	if err != nil {
 		return result, err
 	}
@@ -1916,26 +1916,23 @@ func confineEnvironment(env []string) []string {
 }
 
 // confineScopeID mints the scope directory name. The owner is appended after an
-// '@' delimiter (AIRA-52) for the same reason the delegate-RAM marker lives here
-// (see IsDelegateRAMScopeID): the cgroup directory name is the ONLY carrier that
-// survives a daemon restart. Owner used to live exclusively on the in-memory
+// '@' delimiter (AIRA-52) because the cgroup directory name is the ONLY carrier
+// that survives a daemon restart. Owner used to live exclusively on the in-memory
 // admitWaiter, and the daemon's restart-adoption scan rebuilds aggregate reserve
 // scalars from a live cgroup scan without recreating per-job waiters — so a job
 // whose lifetime spanned a restart lost its owner permanently and degraded to
 // "unknown", forcing an unnecessary --steal to kill your own job.
 //
 // '@' is unambiguous: neither a --name nor a caller-supplied owner may contain
-// it (validateConfineName / ValidateConfineIdentity), and the only other '@' in
-// the id is the fixed "@dr" marker immediately after the "CONFINE-" prefix,
-// which parseConfineScopeID strips before looking for this delimiter. An
-// INFERRED owner carries its own leading '@' (ConfineInferredOwnerPrefix) and
-// survives verbatim, because the split takes everything after the first
-// delimiter rather than splitting on every '@'.
-func confineScopeID(name, owner string, delegateRAM bool) string {
+// it (validateConfineName / ValidateConfineIdentity). An INFERRED owner carries
+// its own leading '@' (ConfineInferredOwnerPrefix) and survives verbatim, because
+// the split takes everything after the first delimiter rather than splitting on
+// every '@'.
+func confineScopeID(name, owner string) string {
 	// The grammar itself lives in the portable confineScopeIDWithPID, next to its
 	// parser. A job scope names THIS process; only the daemon minting a worker
 	// scope on behalf of another process (MintWorkerScopeID) passes a different pid.
-	return confineScopeIDWithPID(name, owner, os.Getpid(), delegateRAM)
+	return confineScopeIDWithPID(name, owner, os.Getpid())
 }
 
 func confineUnavailable(slice string, err error) error {
@@ -2225,14 +2222,10 @@ func verifyScopeMemoryValue(scope Scope, name string, want int64) error {
 	return nil
 }
 
-func confineSetupArgv(target []string, delegateRAM bool) ([]string, error) {
-	nonDelegate, delegate, err := confineOOMScoreAdjValues()
+func confineSetupArgv(target []string) ([]string, error) {
+	oomAdj, err := confineOOMScoreAdj()
 	if err != nil {
 		return nil, err
-	}
-	oomAdj := nonDelegate
-	if delegateRAM {
-		oomAdj = delegate
 	}
 	argv := []string{
 		"__confine-setup", "--handshake-fd", strconv.Itoa(confineSetupFD),

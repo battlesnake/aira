@@ -40,17 +40,14 @@ import (
 // verifies: evaluateOOMSteer and runner.SetSubtreeOOMScoreAdj against a real
 // cgroup tree.
 
-// steerRealScope creates <parent>/.aira-<scopeID> for a scope id of the
-// requested AIRA-27 class.
-func steerRealScope(t *testing.T, parent, name string, delegate bool) (scopePath, scopeID string) {
+// steerRealScope creates <parent>/.aira-<scopeID> for an ordinary confine scope
+// (S2a collapsed the delegate class, so every confine scope is one class now).
+func steerRealScope(t *testing.T, parent, name string) (scopePath, scopeID string) {
 	t.Helper()
 	stamp := strconv.FormatInt(time.Now().UnixNano()%(1<<40), 36)
 	scopeID = "CONFINE-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + stamp
-	if delegate {
-		scopeID = "CONFINE-@dr-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + stamp
-	}
-	if runner.IsDelegateRAMScopeID(scopeID) != delegate {
-		t.Fatalf("scope id %q does not carry the class this test needs (delegate=%v)", scopeID, delegate)
+	if _, _, _, _, ok := runner.ParseConfineScopeID(scopeID); !ok {
+		t.Fatalf("scope id %q is not canonical", scopeID)
 	}
 	scopePath = filepath.Join(parent, confineScopeDirName(scopeID))
 	if err := os.Mkdir(scopePath, 0o755); err != nil {
@@ -182,10 +179,10 @@ func TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender(t *testing.T) {
 		cgrouptest.SkipOrFailRealCgroup(t, "cannot set memory.max on %s: %v", slice, err)
 	}
 
-	offenderPath, offenderScope := steerRealScope(t, slice, "offender", false)
-	compliantPath, compliantScope := steerRealScope(t, slice, "suite", true)
+	offenderPath, offenderScope := steerRealScope(t, slice, "offender")
+	compliantPath, compliantScope := steerRealScope(t, slice, "suite")
 	offenderPID := steerRealJob(t, offenderPath, offenderAllocate, runner.ConfineOOMScoreAdj)
-	compliantPID := steerRealJob(t, compliantPath, compliantAllocate, runner.ConfineDelegateOOMScoreAdj)
+	compliantPID := steerRealJob(t, compliantPath, compliantAllocate, runner.ConfineOOMScoreAdj)
 
 	server := NewServer(Paths{})
 	server.admitResolveSlice = func(string) (string, bool, string) { return slice, true, "" }
@@ -227,10 +224,12 @@ func TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender(t *testing.T) {
 	}
 	server.admitQueues[slice] = &sliceQueue{path: slice, server: server, waiters: []*admitWaiter{offender, compliant}}
 
-	// THE BEFORE STATE, read out of /proc rather than assumed: AIRA-27's static
-	// class bias alone picks the compliant neighbour.
+	// THE BEFORE STATE, read out of /proc rather than assumed: both scopes carry
+	// the single confine-class baseline, so it is the compliant neighbour's larger
+	// RSS (not any class bias — S2a collapsed the delegate class) that makes the
+	// kernel prefer it as a victim before steering.
 	beforeOffenderAdj, beforeCompliantAdj := steerReadAdj(t, offenderPID), steerReadAdj(t, compliantPID)
-	if beforeOffenderAdj != runner.ConfineOOMScoreAdj || beforeCompliantAdj != runner.ConfineDelegateOOMScoreAdj {
+	if beforeOffenderAdj != runner.ConfineOOMScoreAdj || beforeCompliantAdj != runner.ConfineOOMScoreAdj {
 		t.Fatalf("the class baselines did not take: offender=%d compliant=%d", beforeOffenderAdj, beforeCompliantAdj)
 	}
 	beforeOffender := oomBadness(offenderRSS, beforeOffenderAdj, memTotal)
@@ -247,7 +246,7 @@ func TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender(t *testing.T) {
 	if afterOffenderAdj != runner.ConfineMaxOOMScoreAdj {
 		t.Fatalf("the offender's real process still carries oom_score_adj %d; the steering is INERT against a real tree", afterOffenderAdj)
 	}
-	if afterCompliantAdj != runner.ConfineDelegateOOMScoreAdj {
+	if afterCompliantAdj != runner.ConfineOOMScoreAdj {
 		t.Fatalf("the compliant neighbour was moved to %d; a uniform raise is no bias at all", afterCompliantAdj)
 	}
 	afterOffender := oomBadness(offenderRSS, afterOffenderAdj, memTotal)
@@ -258,14 +257,14 @@ func TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender(t *testing.T) {
 	}
 
 	// RESTORE-DOWN, against the same real processes: once admission's charge
-	// covers the usage, the offender goes back to its own class baseline — not to
-	// the other class's, and not part-way.
+	// covers the usage, the offender goes back to the confine-class baseline, and
+	// not part-way.
 	offender.reserve = offenderRSS + (64 << 20)
 	evaluateOOMSteer(oomSteerEnforce, &state, deps)
 	if got := steerReadAdj(t, offenderPID); got != runner.ConfineOOMScoreAdj {
 		t.Fatalf("after the ledger caught up the offender carries oom_score_adj %d, want its class baseline %d", got, runner.ConfineOOMScoreAdj)
 	}
-	if got := steerReadAdj(t, compliantPID); got != runner.ConfineDelegateOOMScoreAdj {
+	if got := steerReadAdj(t, compliantPID); got != runner.ConfineOOMScoreAdj {
 		t.Fatalf("the compliant neighbour drifted to %d", got)
 	}
 	if len(state.applied) != 0 {

@@ -307,7 +307,7 @@ func reserveAdmitCapture(t *testing.T) (socket string, args func() map[string]an
 // verifies: AIRA-115
 func TestConfineReserveChargesTheInheritedParentSlice(t *testing.T) {
 	socket, args, _ := reserveAdmitCapture(t)
-	parent := confineScopeID("pytest", "", true)
+	parent := confineScopeID("pytest", "")
 	t.Setenv("AIRA_CONFINE_SCOPE_ID", parent)
 	t.Setenv(pylib.ConfineParentSliceEnv, "/sys/fs/cgroup/user.slice/custom.slice")
 
@@ -372,7 +372,7 @@ func TestConfineReserveOutsideAConfineJobKeepsTheDefaultSlice(t *testing.T) {
 // verifies: AIRA-115
 func TestConfineReserveExplicitSliceOverridesTheInheritedOne(t *testing.T) {
 	socket, args, _ := reserveAdmitCapture(t)
-	t.Setenv("AIRA_CONFINE_SCOPE_ID", confineScopeID("pytest", "", true))
+	t.Setenv("AIRA_CONFINE_SCOPE_ID", confineScopeID("pytest", ""))
 	t.Setenv(pylib.ConfineParentSliceEnv, "/sys/fs/cgroup/user.slice/inherited.slice")
 
 	reservation, err := ConfineReserve(context.Background(), ConfineReserveRequest{
@@ -403,7 +403,7 @@ func TestConfineReserveExplicitSliceOverridesTheInheritedOne(t *testing.T) {
 // verifies: AIRA-115
 func TestConfineReserveRefusesRatherThanDefaultUnderAParentScope(t *testing.T) {
 	socket, _, dials := reserveAdmitCapture(t)
-	parent := confineScopeID("pytest", "", true)
+	parent := confineScopeID("pytest", "")
 	t.Setenv("AIRA_CONFINE_SCOPE_ID", parent)
 	// A ".." component is exactly as unusable as absence: both slice resolvers
 	// refuse one, so InheritedConfineSlice discards it rather than forwarding it.

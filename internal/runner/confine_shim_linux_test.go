@@ -340,7 +340,7 @@ func TestFormatConfineStatusDistinguishesAdvisoryFromEnforcedContainment(t *test
 // Shim --list renders from the daemon's granted-waiter registry alone, so an
 // operator surface exists at all in a mode with no cgroup directory to read.
 func TestShimConfineListRendersPendingRowsFromTheRegistry(t *testing.T) {
-	scopeID := confineScopeID("gate", "session-a", false)
+	scopeID := confineScopeID("gate", "session-a")
 	result := ShimConfineList([]ConfineRegistryEntry{{ScopeID: scopeID}})
 	if result.Verdict != "ok" {
 		t.Fatalf("verdict=%q reason=%q, want ok", result.Verdict, result.Reason)
@@ -363,7 +363,7 @@ func TestShimConfineListRendersPendingRowsFromTheRegistry(t *testing.T) {
 // the supervisor PID to signal instead, which is the only teardown mechanism
 // that exists here.
 func TestShimConfineKillRefusesAndNamesTheSupervisorPID(t *testing.T) {
-	scopeID := confineScopeID("gate", "session-a", false)
+	scopeID := confineScopeID("gate", "session-a")
 	_, _, _, _, ok := parseConfineScopeID(scopeID)
 	if !ok {
 		t.Fatalf("scope id %q does not parse", scopeID)
