@@ -1,6 +1,18 @@
 ---
-{"schema":1,"id":"AIRA-229","project":"aira","title":"Delegate outer-cap aggregate guard is gone: Σ(worker memory.max) bounded only by the slice, so a --delegate-ram suite can be whole-suite oom.group-killed","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.6"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-230","to":"AIRA-229"}]}
+{"schema":1,"id":"AIRA-229","project":"aira","title":"Delegate outer-cap aggregate guard is gone: Σ(worker memory.max) bounded only by the slice, so a --delegate-ram suite can be whole-suite oom.group-killed","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.6"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-230","to":"AIRA-229"},{"kind":"relates","from":"AIRA-232","to":"AIRA-229"}]}
 ---
+> **UPDATE 2026-09-12 — PARTIALLY fixed by v0.7 S1 slice v7-1; this ticket does NOT
+> close.** v7-1 landed a CLIENT-side aggregate outer-cap guard in the aitest supervisor
+> (`supervisor.py` `_would_breach_outer_cap`, consulted at the top of `spawn_worker`) that
+> refuses an over-admitting spawn before it is forked — for ONE supervisor per outer scope
+> (subpipe Stage-C's shape). It sums only THIS supervisor's own live worker caps. The
+> N-supervisors-under-one-outer case (the design's `make -j` use case: several pytest targets
+> in ONE `--delegate-ram` confine job) is NOT covered — each supervisor guards only its own Σ
+> and their combined Σ can still breach the shared outer cap. That remaining half is **AIRA-232**
+> (latent at v0.6 defaults — 2·nCPU·512 MiB ≪ the 48 GiB default outer — and a pre-S2 fork:
+> client sibling-sum+live-current vs a daemon-side term). So the "PROPOSED FIX" below is
+> realised for the single-supervisor case only; do not read a merged v7-1 as closing this.
+>
 > Found 2026-09-12 during the v0.7 aitest design review (three-lens adversarial),
 > grounded against the shipped v0.6 code (#130). Latent in the released v0.6:
 > invisible under the flat-uniform interim, becomes live under any per-test RAM
