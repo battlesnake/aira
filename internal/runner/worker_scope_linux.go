@@ -67,6 +67,20 @@ import (
 // the proactive-recycle watermark is a USERSPACE comparison in worker.py that
 // needs a number, not a kernel throttle -- it now reads memory.max.
 func CreateWorkerScope(ctx context.Context, parent, scopeName string, memoryMax int64) (string, string, error) {
+	// S2a P2-1: re-assert +memory (and +cpu) on the slice BEFORE creating the child.
+	// Idempotent — normally a no-op read on an already-delegated slice — but if the
+	// slice's cgroup.subtree_control lost +memory (a systemd reset, or a sibling
+	// reconfiguring the slice), a just-created child would expose NO memory.* files and
+	// the memory.max write below would ENOENT into a `request-invalid` TERMINAL that
+	// takes the WHOLE suite `unevaluated` (fail-closed, no self-heal). One idempotent
+	// call closes that window; a slice that genuinely cannot delegate memory (the
+	// controller absent from cgroup.controllers, or the parent unreadable) fails HERE,
+	// clearly and before any scope directory exists, rather than at a confusing
+	// downstream ENOENT. delegation.cpuWeight reports whether +cpu is delegated too.
+	delegation, err := ensureConfineDelegation(parent)
+	if err != nil {
+		return "", "", fmt.Errorf("aitest worker scope: delegate memory controller onto %s: %w", parent, err)
+	}
 	backend := newDefaultBackend(parent)
 	scope, err := backend.Create(ctx, scopeName)
 	if err != nil {
@@ -110,6 +124,19 @@ func CreateWorkerScope(ctx context.Context, parent, scopeName string, memoryMax 
 	swapCap, err := writeScopeSwapCap(scope)
 	if err != nil {
 		return removeUnusableScope("swap cap", err)
+	}
+	// S2a P2-2: worker scopes are now SIBLINGS competing directly under the slice with
+	// every other confine job. The ordinary confine path ages cpu.weight 100→10 over
+	// 30 min (a fresh interactive job outweighs a long-running one); a worker has no
+	// long-lived supervisor here to run that decay and IS a sustained test executor, so
+	// write the aged FLOOR statically — N workers then weigh ~ one aged confine job
+	// rather than N, restoring the rough parity the single nested-outer weight used to
+	// give before workers became siblings. Best-effort / fail-open, exactly like the
+	// ordinary path: CPU aging is a contention mitigation, never a correctness gate, and
+	// some delegated parents expose no cpu controller (delegation.cpuWeight is false
+	// then and this is skipped). No goroutine, no decay: a single static write.
+	if delegation.cpuWeight {
+		_ = writeScopeCPUWeightFailOpen(scope, confineCPUWeightConfig().Floor)
 	}
 	return WorkerScopeChildPath(parent, scopeName), swapCap, nil
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -150,7 +151,23 @@ func TestClassifyAbsentSwapControlNeedsPositiveEvidence(t *testing.T) {
 	}
 }
 
-func TestCreateWorkerScopeRemovesScopeOnMemoryCapFailure(t *testing.T) {
+// verifies: S2a P2-1 — CreateWorkerScope SELF-HEALS a recoverable missing +memory
+// delegation. This is the exact window §16b/P2-1 targets: the create parent (the
+// slice) has memory in its cgroup.controllers but LOST it from its own
+// subtree_control (a systemd reset, or T7's outer-scope reconfigure). Pre-P2-1 the
+// worker child then exposed no memory.max and CreateWorkerScope failed, taking the
+// whole suite unevaluated. P2-1's idempotent ensureConfineDelegation re-enables
+// +memory before creating the child, so the memory.max write succeeds.
+//
+// This replaces the former TestCreateWorkerScopeRemovesScopeOnMemoryCapFailure, whose
+// failure scenario (this same missing-delegation condition) P2-1 now HEALS rather than
+// fails on. The swap-after-memory ordering that test also pinned is now unreachable via
+// delegation — ensureConfineDelegation fails closed BEFORE any scope file is written
+// when the controller is truly unavailable (see the fail-closed test below), so the
+// swap write can no longer misread an undelegated controller. MUTATION: drop the
+// ensureConfineDelegation call from CreateWorkerScope → the worker memory.max ENOENTs
+// and this REDS.
+func TestCreateWorkerScopeSelfHealsMissingMemoryDelegation(t *testing.T) {
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
@@ -159,37 +176,77 @@ func TestCreateWorkerScopeRemovesScopeOnMemoryCapFailure(t *testing.T) {
 	if err := os.Mkdir(outer, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Deliberately do NOT call ensureConfineDelegation(outer). Without
-	// +memory in outer's subtree_control, the worker child will not expose
-	// memory.max and writeScopeMemoryCap must fail for this real cgroup
-	// delegation error rather than a fabricated failure.
+	// outer has memory in its cgroup.controllers (parent delegates it) but NOT in its
+	// own subtree_control — the recoverable window. We deliberately do NOT delegate it
+	// here; CreateWorkerScope's ensureConfineDelegation must.
 	data, err := os.ReadFile(filepath.Join(outer, "cgroup.subtree_control"))
 	if err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "read outer cgroup.subtree_control: %v", err)
 	}
 	for _, controller := range strings.Fields(string(data)) {
 		if controller == "memory" {
-			t.Fatalf("test precondition failed: outer unexpectedly delegates memory; cannot reproduce missing worker memory.max")
+			t.Fatalf("test precondition failed: outer already delegates memory; cannot exercise the self-heal")
 		}
 	}
 
-	caplessScopeName := "CONFINE-aitest-w1-111111-1"
-	_, _, err = CreateWorkerScope(context.Background(), outer, caplessScopeName, 134217728)
+	scopeName := "CONFINE-aitest-w1-111111-1"
+	scopePath, _, err := CreateWorkerScope(context.Background(), outer, scopeName, 134217728)
+	if err != nil {
+		t.Fatalf("CreateWorkerScope failed on a RECOVERABLE missing delegation: %v — P2-1's ensureConfineDelegation must re-enable +memory so the worker memory.max write succeeds instead of failing the whole suite unevaluated", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.max")); err != nil || strings.TrimSpace(string(data)) != "134217728" {
+		t.Fatalf("worker memory.max=%q err=%v, want it written after the self-heal (134217728)", data, err)
+	}
+}
+
+// verifies: S2a P2-1 — a genuinely undelegatable parent fails CLOSED at the delegation
+// step, BEFORE any scope directory is created (rather than mkdir a scope and ENOENT on
+// its memory.max downstream). An unreadable parent cgroup.controllers is the robust
+// trigger and needs no privileged cgroup fixture. This preserves the fail-closed
+// coverage the repurposed test above used to carry.
+func TestCreateWorkerScopeFailsClosedWhenParentUndelegatable(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "no-such-cgroup")
+	_, _, err := CreateWorkerScope(context.Background(), parent, "CONFINE-aitest-w1-111111-1", 134217728)
 	if err == nil {
-		t.Fatal("CreateWorkerScope unexpectedly succeeded: worker memory.max was available despite missing outer memory delegation")
+		t.Fatal("CreateWorkerScope succeeded on an undelegatable parent; P2-1 must fail closed at the delegation step")
 	}
-	// verifies: AIRA-35 — the failure must be attributed to the MEMORY cap, not
-	// to the swap cap. An undelegated memory controller exposes no memory.*
-	// files at all, so memory.swap.max is ENOENT too; if the swap write ran
-	// FIRST it would read that ENOENT as "this kernel has no swap support" and
-	// hand back a scope with no memory.max at all. The ordering inside
-	// CreateWorkerScope is what prevents that, and this pins it.
-	if !strings.Contains(err.Error(), "memory cap") {
-		t.Fatalf("error=%v, want it attributed to the memory cap — a swap-cap attribution here "+
-			"means the swap write ran before memory.max and misread an undelegated controller", err)
+	if !strings.Contains(err.Error(), "delegate memory controller") {
+		t.Fatalf("error=%v, want the delegation-step attribution (fail closed before scope creation)", err)
 	}
-	scopePath := WorkerScopeChildPath(outer, caplessScopeName)
-	if _, statErr := os.Stat(scopePath); !os.IsNotExist(statErr) {
-		t.Fatalf("capless worker scope remains after memory cap failure: stat %q: %v", scopePath, statErr)
+	if _, statErr := os.Stat(filepath.Join(parent, ".aira-CONFINE-aitest-w1-111111-1")); !os.IsNotExist(statErr) {
+		t.Fatalf("a scope directory was created despite the delegation failure: stat err=%v", statErr)
+	}
+}
+
+// verifies: S2a P2-2 — a worker sibling scope gets a static cpu.weight = the aged
+// FLOOR, so N workers competing directly under the slice weigh ~ one confine job
+// rather than N. Best-effort: skipped where the host exposes no cpu controller (the
+// write is fail-open, matching the ordinary confine path). MUTATION: drop the
+// cpu.weight write from CreateWorkerScope → the file keeps the kernel default (100)
+// and this REDS.
+func TestCreateWorkerScopeWritesFloorCPUWeight(t *testing.T) {
+	parent := cgrouptest.IsolatedScopeParent(t)
+	controllers, err := os.ReadFile(filepath.Join(parent, "cgroup.controllers"))
+	if err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "read cgroup.controllers: %v", err)
+	}
+	if !strings.Contains(" "+strings.Join(strings.Fields(string(controllers)), " ")+" ", " memory ") {
+		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not available on %s", parent)
+	}
+	if !strings.Contains(" "+strings.Join(strings.Fields(string(controllers)), " ")+" ", " cpu ") {
+		t.Skip("host cgroup has no cpu controller; the worker cpu.weight write is fail-open by design")
+	}
+	scopeName := "CONFINE-aitest-w7-111111-2"
+	scopePath, _, err := CreateWorkerScope(context.Background(), parent, scopeName, 134217728)
+	if err != nil {
+		t.Fatalf("CreateWorkerScope (P2-1 delegates +memory/+cpu on the parent itself): %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(scopePath, "cpu.weight"))
+	if err != nil {
+		t.Fatalf("read worker cpu.weight: %v — P2-2 must write it when the cpu controller is delegated", err)
+	}
+	want := strconv.FormatInt(confineCPUWeightConfig().Floor, 10)
+	if got := strings.TrimSpace(string(data)); got != want {
+		t.Fatalf("worker cpu.weight=%q, want the aged floor %s (N siblings must not over-share CPU vs other confine jobs, P2-2)", got, want)
 	}
 }
