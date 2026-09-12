@@ -292,6 +292,25 @@ more than N workers, but aira may hold it below N when the shared ledger is cont
 
 ## 7. Reconciliation with the v0.6 interim — what changes
 
+> **AS-BUILT AMENDMENT (2026-09-12, S1 slice v7-1 + build-review).** Two corrections to §7 item 1
+> below, from building and adversarially reviewing the guard:
+> 1. **`effective_outer_cap` is read at EVERY guard check, NOT once at startup.** It is a few small
+>    file reads before a relay fork, and re-reading handles an owner `set-property` on `aira.slice`
+>    mid-run for free. (The text below says "read once at startup" — superseded.)
+> 2. **The premise "the client already sizes and counts every worker" holds for ONE supervisor per
+>    outer scope, and is FALSE for N.** Two+ aitest supervisors under one outer scope is daemon-
+>    supported and is exactly the design's `make -j` use case (several pytest targets in one
+>    `--delegate-ram` confine job). v7-1's client guard sums only its OWN `self.workers`, so N
+>    supervisors each guard only their own Σ and can jointly breach the shared outer cap. v7-1
+>    therefore closes the **single-supervisor-per-outer** case only. Closing N-supervisors is a
+>    **pre-S2 fork (AIRA-232), alongside OD1 batch-reinstate:** client sibling-sum
+>    (`os.listdir(outer_scope)`) + a live `.aira-supervisor/memory.current` read (the allowance's
+>    `base + N×per_relay` model breaks when N supervisors share one `.aira-supervisor`) + a
+>    race-sized margin (a cross-supervisor TOCTOU with no shared client map — the `Σ(pending)`
+>    problem across processes), **vs** a daemon-side per-outer-scope term (a cleaner restore of the
+>    S15-deleted scan; the daemon serialises grants, so no client TOCTOU). Latent at v0.6 defaults
+>    (2·nCPU·512 MiB ≪ the 48 GiB default outer); live under S2's per-class sizing.
+
 A clean migration. AIRA has no users/data (no compat obligation), so this is mostly **subtractive**
 plus a targeted addition, each through the two-loop.
 

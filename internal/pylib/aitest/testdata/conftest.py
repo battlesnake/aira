@@ -15,9 +15,16 @@ if not aira_py_lib:
     # `aira confine -- python3 -m pytest -q internal/pylib/aitest/` run --
     # which previously died with a bare KeyError while merely *collecting*
     # this directory. Skip these fixtures cleanly instead.
-    collect_ignore = ["test_pass.py", "test_fail.py", "test_oom.py"]
+    collect_ignore = ["test_pass.py", "test_fail.py", "test_oom.py", "test_slow_passing.py"]
 else:
     if aira_py_lib not in sys.path:
         sys.path.insert(0, aira_py_lib)
     importlib.import_module("aitest")
     pytest_plugins = ("aitest",)
+    # test_slow_passing.py exists only for the AIRA-229 skip-tick e2e, which names
+    # it EXPLICITLY on the pytest command line. The other e2e tests collect this
+    # whole directory with no file args and assert the exact 4-nodeid fixture
+    # (test_pass/test_fail/test_oom), so it must not be swept up by a bare
+    # directory collection. collect_ignore skips it during directory walking but
+    # does NOT block an explicit path argument (verified against pytest 9.0.3).
+    collect_ignore = ["test_slow_passing.py"]
