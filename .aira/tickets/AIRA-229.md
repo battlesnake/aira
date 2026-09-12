@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-229","project":"aira","title":"Delegate outer-cap aggregate guard is gone: Σ(worker memory.max) bounded only by the slice, so a --delegate-ram suite can be whole-suite oom.group-killed","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.6"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-229","project":"aira","title":"Delegate outer-cap aggregate guard is gone: Σ(worker memory.max) bounded only by the slice, so a --delegate-ram suite can be whole-suite oom.group-killed","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.6"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-230","to":"AIRA-229"}]}
 ---
 > Found 2026-09-12 during the v0.7 aitest design review (three-lens adversarial),
 > grounded against the shipped v0.6 code (#130). Latent in the released v0.6:
