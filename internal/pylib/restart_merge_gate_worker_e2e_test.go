@@ -107,16 +107,12 @@ const (
 	// than vacuous (a full pool at worker_count would never touch the daemon during
 	// the restart at all). Margins are ~128/192 MiB, not knife-edge.
 	restartGateFixtureMaximum = 2<<30 + 768<<20
-	// The pinned fixture ledger slice path. Any stable string works: the resolve
-	// AND read seams below both ignore/answer it uniformly, so it need not be a
-	// real cgroup — the leases charge it, the worker sub-scopes are created
-	// elsewhere (under the real outer scope).
-	restartGateFixtureSlice = "/aira-mergegate-worker-fixture-slice"
 )
 
 type restartGateHarness struct {
 	pytest    string // "" when pytest is not needed (the EOF-release test)
 	binary    string
+	parent    string // the real isolated slice-parent (workers are siblings under it)
 	outer     string
 	outerFile *os.File
 	aitestDir string
@@ -192,7 +188,7 @@ func newRestartGateHarness(t *testing.T, needPytest bool) *restartGateHarness {
 	}
 	t.Cleanup(func() { _ = outerFile.Close() })
 	return &restartGateHarness{
-		pytest: pytest, binary: binary, outer: outer, outerFile: outerFile,
+		pytest: pytest, binary: binary, parent: parent, outer: outer, outerFile: outerFile,
 		aitestDir: aitestDir, pythonDir: pythonDir, paths: paths,
 	}
 }
@@ -203,8 +199,16 @@ func newRestartGateHarness(t *testing.T, needPytest bool) *restartGateHarness {
 func (h *restartGateHarness) startServer(t *testing.T) (*daemon.Server, context.CancelFunc, <-chan error) {
 	t.Helper()
 	server := daemon.NewServer(h.paths)
+	// S2a §4/§16b: post-T3 a worker scope is a SIBLING created directly under the
+	// daemon's resolved slice, so the resolver must point at the REAL isolated parent
+	// (with +memory delegated, above), not a synthetic path — else CreateWorkerScope's
+	// mkdir ENOENTs and no lease ever establishes, masking the re-anchor assertions
+	// below. The memory reader stays pinned to the fixture MAXIMUM regardless of path,
+	// which is what keeps the exact-Σ / exact-key-set assertions deterministic on the
+	// shared box. (Mirrors newRealDaemonAndCgroupTestHarness, which T3 made pass on
+	// this topology.)
 	server.SetAdmitResolveSliceForTest(func(string) (string, bool, string) {
-		return restartGateFixtureSlice, true, ""
+		return h.parent, true, ""
 	})
 	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) {
 		// current=0, reclaimable=0, maximum=restartGateFixtureMaximum — sized so the

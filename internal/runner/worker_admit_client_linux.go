@@ -8,7 +8,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -235,8 +237,16 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		// A minted scope path is valid utf8 and the reserve is > 0, so this cannot
 		// fail in practice; if it ever does, hold WITHOUT reconnect (the worker runs
 		// under its cgroup cap) rather than refuse the grant.
+		// S2a §16.1 (P1-A): re-declare keyed by the worker scope's DIRNAME
+		// (TrimPrefix(Base(ScopePath), ".aira-")), NOT the full path. The daemon's
+		// fresh-admit ledger keys the lease by the minted scope-id (the dirname), so a
+		// path key here would land the post-restart re-anchor under a DIFFERENT key —
+		// the survivor would read as a new lease and the original as an orphan (the
+		// restart merge-gate's exact-key-set assertion catches this). This is the same
+		// key Task 1's dirname alignment (`confineScopeDirName` / the reaper's
+		// `hasLiveLease`) uses, so the whole worker-lease path lines up across a restart.
 		reDeclareFrame, _ = redeclare.EncodeFrame(redeclare.Record{
-			ScopeID:       grant.ScopePath,
+			ScopeID:       strings.TrimPrefix(filepath.Base(grant.ScopePath), ".aira-"),
 			RAMBytes:      uint64(grant.MemoryMax),
 			CPUCores:      uint32(DefaultConfineCPUCores),
 			ParentScopeID: grant.ParentScopeID,
