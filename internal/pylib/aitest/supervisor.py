@@ -165,6 +165,13 @@ _OUTER_CAP_ALLOWANCE_BASE = 64 << 20        # 64 MiB supervisor-process starting
 _OUTER_CAP_ALLOWANCE_PER_RELAY = 8 << 20    # 8 MiB per live relay starting point
 _OUTER_CAP_MARGIN = 32 << 20                # 32 MiB safety band starting point
 
+# AIRA-230 (v0.7 S1 / v7-2). The per-test annotation default for a nodeid with no
+# aira_mem marker: the *incremental* peak RSS assumed on top of the warm-import
+# baseline (spec 4.1). 256 MiB is a STARTING POINT, NOT a measured value -- v7-4
+# measures the COW baseline and sets it (spec OD4); do not treat it as load-bearing.
+# Overridable via AIRA_AITEST_DEFAULT_BYTES through the shared size grammar.
+_DEFAULT_ANNOTATION_BYTES = 256 << 20
+
 
 def _env_bytes(name, default):
     """A byte-count tunable override using the shared AIRA_AITEST_ESTIMATED_BYTES
@@ -769,6 +776,10 @@ class Supervisor:
         self._admission_terminal_warned = False
         self._pidfd_warned = set()
         self.items_by_nodeid = {}
+        # AIRA-230 v7-2: nodeid -> incremental-peak-RSS bytes, from each item's
+        # aira_mem marker (or the default). Built in collect(); DOCUMENTED-INERT
+        # in S1 -- no admission consumer yet (plan D5). Empty until collect() runs.
+        self.aira_mem_bytes = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -891,6 +902,22 @@ class Supervisor:
         cross the dispatch/result pipes (Task 13)."""
         self.items_by_nodeid = {item.nodeid: item for item in items}
         self.queue = [item.nodeid for item in items]
+        # AIRA-230 v7-2: read each item's aira_mem annotation into a nodeid->bytes
+        # map alongside items_by_nodeid (inherited by forked workers via COW).
+        # DOCUMENTED-INERT in S1: built but with NO admission consumer -- per-class
+        # worker sizing reads it in S2 (plan D5). Unannotated (and malformed-marker)
+        # nodeids take AIRA_AITEST_DEFAULT_BYTES (256 MiB starting point; v7-4 sets
+        # it). Local import mirrors _env_bytes: __init__ imports Supervisor only
+        # inside a function, so the package is fully initialised here.
+        from aitest import _aira_mem_bytes_for_item
+        default_bytes = _env_bytes("AIRA_AITEST_DEFAULT_BYTES", _DEFAULT_ANNOTATION_BYTES)
+        mem_map = {}
+        for item in items:
+            value, warning = _aira_mem_bytes_for_item(item, default_bytes)
+            mem_map[item.nodeid] = value
+            if warning is not None:
+                sys.stderr.write(warning)
+        self.aira_mem_bytes = mem_map
 
     def next_nodeid(self):
         if not self.queue:
