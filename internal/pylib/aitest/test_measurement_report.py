@@ -2,7 +2,9 @@
 
 v7-4 surfaces the RSS/oom reads the pool ALREADY makes (per-worker memory.peak +
 oom at retirement; per-test memory.current in worker._should_recycle) plus ONE
-new read (.aira-supervisor/memory.peak at run end) into a structured, opt-in
+new read (the parent confine scope's memory.peak at run end -- S2a runs the
+supervisor + framework directly in that scope, no relocated child) into a
+structured, opt-in
 report, so a committed harness can set v0.7's tunables (the 256 MiB default, the
 per-worker headroom, the outer-cap allowance/margin, the watermark fraction, the
 MAX_TESTS fork). No new time-series sampler (plan OVER-BUILD note).
@@ -31,10 +33,13 @@ def test_pool_report_records_real_peaks_and_marks_missing_as_unevaluated(tmp_pat
     monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
     sup = Supervisor()
 
-    sup_scope = tmp_path / "sup"
-    sup_scope.mkdir()
-    (sup_scope / "memory.peak").write_text("40000000\n")
-    sup.supervisor_scope = str(sup_scope)
+    # S2a: the supervisor runs directly in the PARENT confine scope (outer_scope),
+    # so the supervisor-peak term reads that scope's memory.peak. There is no
+    # relocated .aira-supervisor child any more.
+    parent_scope = tmp_path / "parent"
+    parent_scope.mkdir()
+    (parent_scope / "memory.peak").write_text("40000000\n")
+    sup.outer_scope = str(parent_scope)
 
     # Worker A: its scope exposes memory.peak -> a REAL value.
     worker_a = tmp_path / "wa"
@@ -64,15 +69,42 @@ def test_pool_report_records_real_peaks_and_marks_missing_as_unevaluated(tmp_pat
     caps = [sample["memory_max"] for sample in report["worker_peak_rss_samples"]]
     assert 268435456 in caps, caps
 
+    # Each per-worker sample carries its granted scope_path -- the DETERMINISTIC
+    # sibling-placement anchor Task 9's Gate A asserts against (a direct child of
+    # the slice), rather than walking the tree while a worker is live. It is the
+    # grant's own scope, so it is always a real path in a scoped record, never
+    # absent.
+    scope_paths = [sample["scope_path"] for sample in report["worker_peak_rss_samples"]]
+    assert str(worker_a) in scope_paths, scope_paths
+    assert str(worker_b) in scope_paths, scope_paths
 
-def test_supervisor_peak_is_unevaluated_when_the_scope_exposes_none(tmp_path, monkeypatch):
+
+def test_supervisor_peak_is_unevaluated_when_the_parent_scope_exposes_none(tmp_path, monkeypatch):
     measure = tmp_path / "measure"
     monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
     sup = Supervisor()
 
-    sup_scope = tmp_path / "sup"
-    sup_scope.mkdir()  # deliberately NO memory.peak file
-    sup.supervisor_scope = str(sup_scope)
+    parent_scope = tmp_path / "parent"
+    parent_scope.mkdir()  # deliberately NO memory.peak file
+    sup.outer_scope = str(parent_scope)
+
+    sup._emit_measurement_report()
+    report = _read_report(measure)
+
+    assert report["supervisor_peak_rss"] == "unevaluated"
+    assert report["supervisor_peak_rss"] != 0
+
+
+def test_supervisor_peak_is_unevaluated_in_ci_shim_with_no_cgroup(tmp_path, monkeypatch):
+    """ci-shim publishes the outer-scope SENTINEL, not a cgroup path. The
+    supervisor-peak read must not try to open '<sentinel>/memory.peak'; it reports
+    "unevaluated" (never a fabricated 0), exactly like every other absent term."""
+    from aitest.supervisor import _OUTER_SCOPE_SHIM_SENTINEL
+
+    measure = tmp_path / "measure"
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
+    sup = Supervisor()
+    sup.outer_scope = _OUTER_SCOPE_SHIM_SENTINEL
 
     sup._emit_measurement_report()
     report = _read_report(measure)
@@ -84,7 +116,7 @@ def test_supervisor_peak_is_unevaluated_when_the_scope_exposes_none(tmp_path, mo
 def test_no_report_and_no_retention_when_measure_dir_is_unset(tmp_path, monkeypatch):
     monkeypatch.delenv("AIRA_AITEST_MEASURE_DIR", raising=False)
     sup = Supervisor()
-    sup.supervisor_scope = str(tmp_path)
+    sup.outer_scope = str(tmp_path)
 
     worker = tmp_path / "w"
     worker.mkdir()
@@ -137,7 +169,7 @@ def test_report_is_fail_open_on_an_unwritable_measure_dir(tmp_path, monkeypatch)
     blocker.write_text("x")  # a regular file where a directory is expected
     monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(blocker / "sub"))
     sup = Supervisor()
-    sup.supervisor_scope = str(tmp_path)
+    sup.outer_scope = str(tmp_path)
 
     # Must not raise.
     sup._emit_measurement_report()

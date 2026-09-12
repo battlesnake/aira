@@ -34,8 +34,8 @@ import (
 // (default "1"), so the operator harness can run a FULL-POOL sub-run: the
 // supervisor_peak_rss read is specified "at full pool" for the allowance
 // base + per_relay terms (v7-1/§8), and the relays (plain Popen children that
-// never leave .aira-supervisor) are charged there too -- so peak@N-workers minus
-// peak@1-worker isolates the per-relay term. The window knobs
+// never leave the parent confine scope) are charged there too -- so peak@N-workers
+// minus peak@1-worker isolates the per-relay term. The window knobs
 // (AIRA_AITEST_WORKER_MAX_SECONDS etc.) need no forwarding: they ride through on
 // os.Environ() below, and exec dedups to the last value for a key, so the
 // harness-set value wins with nothing special here.
@@ -151,6 +151,50 @@ func TestRealPytestAitestMeasurementReport(t *testing.T) {
 		t.Fatalf("worker_peak_rss_sample_count = %v on a confined run; want >= 1 "+
 			"(the pool-peak channel was silently zeroed -- see _retire_worker's peak-read ordering vs the relay close):\n%s",
 			sampleCount, raw)
+	}
+
+	// S2a/T8 (P2-5). The supervisor now runs DIRECTLY in the parent confine scope
+	// (post-T7 there is no .aira-supervisor sub-scope), so its peak read is the
+	// parent scope's memory.peak -- a REAL positive value on a confined run. The
+	// honest-value loop above ACCEPTS "unevaluated" (the shim/no-cgroup contract),
+	// so it cannot see a supervisor-peak channel left dead by the removed sub-scope.
+	// This reds against that dead read (which reports "unevaluated" on a confined
+	// run) and greens once the read is redirected at the parent leaf.
+	supPeak, ok := report["supervisor_peak_rss"]
+	if !ok {
+		t.Fatalf("measurement report is missing %q: %s", "supervisor_peak_rss", raw)
+	}
+	if n, isNum := supPeak.(float64); !isNum || n <= 0 {
+		t.Fatalf("supervisor_peak_rss = %v on a confined run; want a positive byte count "+
+			"(the supervisor runs in the parent confine scope -- its memory.peak must be read there, "+
+			"not from the removed .aira-supervisor sub-scope):\n%s", supPeak, raw)
+	}
+
+	// S2a/T8 (P2-A). Each per-worker sample carries its granted scope_path -- the
+	// DETERMINISTIC anchor Task 9's Gate A asserts sibling placement against (no
+	// "walk the tree while a worker is live" race). Assert it is a direct child of
+	// the harness SLICE (filepath.Dir == the outer scope's own parent), which reds
+	// if nesting returns: a nested worker at <outer>/.aira-worker-* has the slice
+	// as a grandparent, not a parent, so this catches the exact regression.
+	sliceDir := filepath.Dir(harness.outerFile.Name())
+	samples, ok := report["worker_peak_rss_samples"].([]interface{})
+	if !ok || len(samples) == 0 {
+		t.Fatalf("worker_peak_rss_samples is missing/empty on a confined run: %s", raw)
+	}
+	for i, entry := range samples {
+		sample, ok := entry.(map[string]interface{})
+		if !ok {
+			t.Fatalf("worker_peak_rss_samples[%d] is not an object: %v", i, entry)
+		}
+		scopePath, ok := sample["scope_path"].(string)
+		if !ok || scopePath == "" {
+			t.Fatalf("worker_peak_rss_samples[%d] has no non-empty scope_path (Gate A's anchor): %v\n%s", i, sample, raw)
+		}
+		if got := filepath.Dir(scopePath); got != sliceDir {
+			t.Fatalf("worker_peak_rss_samples[%d].scope_path %q is not a direct child of the slice %q "+
+				"(parent dir %q) -- worker scopes must be siblings under the slice, not nested:\n%s",
+				i, scopePath, sliceDir, got, raw)
+		}
 	}
 
 	// The per-test memory.current sidecar(s): log every line so the residue curve

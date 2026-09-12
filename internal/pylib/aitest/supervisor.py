@@ -722,7 +722,6 @@ class Supervisor:
         self.queue = []
         self.attempts = {}  # nodeid -> attempt count (Task 15's retry-once rule)
         self.outer_scope = None
-        self.supervisor_scope = None
         # AIRA-123. Which per-worker admission backend this run is using.
         # bootstrap() sets it from the verb's own `admission=` token and refuses
         # to start without one, so this initial value is only ever what a
@@ -763,8 +762,8 @@ class Supervisor:
         self._pool_budget = None
         self._pool_peak_samples = 0
         self._pool_scoped_workers = 0
-        # AIRA-230 v7-4. Per-worker (peak, cap, oom) records RETAINED for the
-        # measurement report -- a pool MAX alone cannot size per-worker headroom
+        # AIRA-230 v7-4. Per-worker (peak, cap, oom, scope_path) records RETAINED for
+        # the measurement report -- a pool MAX alone cannot size per-worker headroom
         # or the S2 ladder, which need the distribution. Same reads as the AIRA-180
         # max above, kept not collapsed, and ONLY materialised when the report is
         # enabled (AIRA_AITEST_MEASURE_DIR) so a normal run pays nothing.
@@ -1824,13 +1823,16 @@ class Supervisor:
         scope_oom = _scope_oom_group_killed(scope)
         if scope_oom:
             self._pool_peak_oom = True
-        # AIRA-230 v7-4: retain this worker's (peak, cap, oom) for the measurement
-        # report, ONLY when enabled. The cap is coerced from the grant's memory_max,
-        # which a REAL enforced grant carries as a STRING (the worker-admit outcome
-        # parser stores every field as a string; v7-1 learned this the hard way) --
-        # None where it cannot be read, NEVER a fabricated 0. This deliberately does
-        # NOT touch the AIRA-180 _pool_budget gauge above (its string-cap behaviour
-        # is AIRA-231, out of this slice's scope).
+        # AIRA-230 v7-4: retain this worker's (peak, cap, oom, scope_path) for the
+        # measurement report, ONLY when enabled. The cap is coerced from the grant's
+        # memory_max, which a REAL enforced grant carries as a STRING (the worker-admit
+        # outcome parser stores every field as a string; v7-1 learned this the hard
+        # way) -- None where it cannot be read, NEVER a fabricated 0. The scope_path is
+        # the grant's own worker-scope path (S2a/T8): the DETERMINISTIC anchor Task 9's
+        # Gate A asserts sibling placement against, so it needs no read and is always a
+        # real path here (this method already returned for a scope-less grant). This
+        # deliberately does NOT touch the AIRA-180 _pool_budget gauge above (its
+        # string-cap behaviour is AIRA-231, out of this slice's scope).
         if os.environ.get("AIRA_AITEST_MEASURE_DIR", "").strip():
             cap = memory_max
             if not isinstance(cap, int):
@@ -1838,7 +1840,9 @@ class Supervisor:
                     cap = int(str(cap).strip())
                 except (TypeError, ValueError):
                     cap = None
-            self._pool_peak_records.append({"peak": peak, "memory_max": cap, "oom": scope_oom})
+            self._pool_peak_records.append(
+                {"peak": peak, "memory_max": cap, "oom": scope_oom, "scope_path": scope}
+            )
 
     def _pool_subject_key(self):
         """This pool's durable subject key: the pytest rootdir followed by the
@@ -1934,11 +1938,14 @@ class Supervisor:
 
         Reuses the reads the pool already makes (the AIRA-180 per-worker
         memory.peak/oom at retirement, retained per-worker in
-        _pool_peak_records) and adds exactly ONE new read: the supervisor's own
-        .aira-supervisor/memory.peak at full pool, which sets the outer-cap
-        ALLOWANCE (the uncapped supervisor process charges the outer cap). Called
-        after _report_pool_usage and BEFORE _cleanup_supervisor_scope, while
-        self.supervisor_scope still exists to be read."""
+        _pool_peak_records) and adds exactly ONE new read: the PARENT confine
+        scope's memory.peak at full pool, which sets the outer-cap ALLOWANCE.
+        Post-S2a the supervisor + framework run DIRECTLY in that parent leaf
+        (there is no relocated .aira-supervisor sub-scope any more -- workers are
+        first-class siblings under the slice), so the parent scope's own peak IS
+        the allowance term. Called after _report_pool_usage; `aira confine` owns
+        the parent scope for the life of the launch, so there is nothing of
+        aitest's own to tear down after this read."""
         measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "")
         if not measure_dir.strip():
             return
@@ -1946,10 +1953,14 @@ class Supervisor:
         def honest(value):
             return value if value is not None else "unevaluated"
 
+        # The supervisor runs in the PARENT confine scope's own leaf (outer_scope
+        # is that scope's path), so its memory.peak is that scope's. Skip the
+        # ci-shim sentinel (no cgroup) and the unset/fallback case -- both leave
+        # the term honestly "unevaluated" rather than opening a bogus path.
         supervisor_peak = None
-        if self.supervisor_scope:
+        if self.outer_scope and self.outer_scope != _OUTER_SCOPE_SHIM_SENTINEL:
             supervisor_peak = _read_cgroup_int(
-                os.path.join(self.supervisor_scope, "memory.peak")
+                os.path.join(self.outer_scope, "memory.peak")
             )
 
         report = {
@@ -1965,6 +1976,11 @@ class Supervisor:
                     # the scope's memory.events could not settle it -- that is
                     # "unevaluated", not a fake "not OOM-killed".
                     "oom": honest(record["oom"]),
+                    # The granted worker-scope path (S2a/T8): Gate A's deterministic
+                    # sibling-placement anchor. Always a real path in a retained
+                    # record (a scope-less grant never reaches _pool_peak_records),
+                    # so it is emitted verbatim, not honest()-wrapped.
+                    "scope_path": record["scope_path"],
                 }
                 for record in self._pool_peak_records
             ],
@@ -2762,61 +2778,15 @@ class Supervisor:
                         pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
         # AIRA-180. After the dispatch loop, so every worker has retired and
-        # folded its usage in, and before _cleanup_supervisor_scope so a slow
-        # relay cannot delay the rmdir retry. Fail-open: see _report_pool_usage.
+        # folded its usage in. Fail-open: see _report_pool_usage.
         self._report_pool_usage()
         # AIRA-230 v7-4: after _report_pool_usage (every worker has folded its
-        # usage in) and BEFORE _cleanup_supervisor_scope (which rmdirs the
-        # supervisor scope, taking its memory.peak with it). Opt-in + fail-open.
+        # usage in). The supervisor-peak term reads the PARENT confine scope's
+        # memory.peak, which `aira confine` owns for the life of the launch, so
+        # there is no scope of aitest's own to tear down first. Opt-in + fail-open.
         self._emit_measurement_report()
-        self._cleanup_supervisor_scope()
         # ONE structurally complete pass, after every other path has had its
         # say -- see _synthesize_unevaluated_reports for why this is a single
         # post-run pass over items_by_nodeid rather than per-call-site fixes.
         self._synthesize_unevaluated_reports()
         return self.results
-
-    def _cleanup_supervisor_scope(self):
-        """Best-effort: rmdir the supervisor's OWN child scope this run
-        relocated itself into (bootstrap, Task 2/3/11). The OUTER scope
-        itself is `aira confine`'s own job to tear down when the whole
-        launch process exits -- this is only about the new child scope
-        aitest itself created. NOTE: in the real-cgroup case this
-        typically still fails here (EBUSY) since the supervisor process
-        calling rmdir is itself still a live member of the scope it is
-        trying to remove -- it only ever succeeds AFTER this process
-        exits, which is after this call returns. Attempted anyway because
-        it is free and occasionally correct (e.g. non-real-cgroup test
-        doubles).
-
-        #72's orphaned-scope reaper IS the real backstop for the nested
-        case this rmdir usually can't finish itself (a crashed
-        supervisor/worker -- spec 3.6's normal, expected death-by-OOM
-        path, where nothing here runs -- leaves live-then-dead child
-        scopes under the outer scope). This was a real, confirmed gap
-        for a while (the reaper only did a single-level rmdir, which the
-        kernel refuses on a cgroup with live children, so nested orphans
-        accumulated unbounded) -- fixed and deployed as AIRA-36
-        (reapEmptyConfineScopeTree, internal/runner/confine_manage_linux.go,
-        master 826f33b): whole-subtree-empty positive-proof-gated,
-        fd-anchored, never touches a scope with a live worker anywhere
-        in its subtree. Live-verified sweeping this exact nested shape.
-        """
-        if not self.supervisor_scope:
-            return
-        try:
-            os.rmdir(self.supervisor_scope)
-        except OSError as exc:
-            # EBUSY here is the EXPECTED outcome documented above (found live via
-            # fastest-ee-dc dogfooding, 2026-09-02: even with cgroup.procs already
-            # empty, cgroup-v2 destruction is not synchronous with the last process
-            # leaving -- the kernel's own deferred css-offline accounting can hold
-            # the directory busy for a brief settling window after this call, well
-            # before the #72/AIRA-36 reaper's grace period would ever consider it
-            # orphaned). Printing an alarming "could not remove" line for this on
-            # EVERY real-cgroup run trains users to ignore aitest's stderr output
-            # entirely, which is exactly the failure mode this project's honesty
-            # discipline exists to prevent for messages that ARE diagnostic. Any
-            # OTHER errno is still surfaced -- that is genuinely unexpected.
-            if exc.errno != errno.EBUSY:
-                sys.stderr.write("aira aitest: could not remove supervisor scope %s: %s\n" % (self.supervisor_scope, exc))

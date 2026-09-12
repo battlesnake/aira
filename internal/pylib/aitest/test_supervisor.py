@@ -61,9 +61,8 @@ def test_bootstrap_reads_the_launcher_coordinates(tmp_path, monkeypatch):
     supervisor.bootstrap()
     assert supervisor.outer_scope == "/outer"
     assert supervisor.admission_mode == "cgroup-sub-scope"
-    # S2a: the supervisor runs in the outer scope's own leaf; there is no
-    # relocated child scope, so supervisor_scope stays unset.
-    assert supervisor.supervisor_scope is None
+    # S2a/T8: the supervisor runs in the outer scope's own leaf; there is no
+    # relocated .aira-supervisor child scope any more (the attribute is gone).
     assert supervisor.daemon_available is True
 
 
@@ -1845,48 +1844,12 @@ def test_fallback_startup_never_forks_more_workers_than_there_is_queued_work(tmp
     )
 
 
-def test_cleanup_supervisor_scope_is_silent_on_ebusy(tmp_path, monkeypatch, capsys):
-    scope = str(tmp_path / ".aira-supervisor")
-    supervisor = Supervisor()
-    supervisor.supervisor_scope = scope
-
-    def raise_ebusy(path):
-        assert path == scope
-        raise OSError(errno.EBUSY, "Device or resource busy", path)
-
-    monkeypatch.setattr(supervisor_module.os, "rmdir", raise_ebusy)
-    supervisor._cleanup_supervisor_scope()
-
-    assert capsys.readouterr().err == ""
-
-
-def test_cleanup_supervisor_scope_still_reports_an_unexpected_errno(tmp_path, monkeypatch, capsys):
-    scope = str(tmp_path / ".aira-supervisor")
-    supervisor = Supervisor()
-    supervisor.supervisor_scope = scope
-
-    def raise_eperm(path):
-        raise OSError(errno.EPERM, "Operation not permitted", path)
-
-    monkeypatch.setattr(supervisor_module.os, "rmdir", raise_eperm)
-    supervisor._cleanup_supervisor_scope()
-
-    err = capsys.readouterr().err
-    assert "could not remove supervisor scope" in err
-    assert scope in err
-
-
-def test_cleanup_supervisor_scope_is_a_noop_without_a_supervisor_scope(monkeypatch, capsys):
-    supervisor = Supervisor()
-    assert supervisor.supervisor_scope is None
-
-    def fail_if_called(path):
-        raise AssertionError("rmdir must not be called when supervisor_scope is unset")
-
-    monkeypatch.setattr(supervisor_module.os, "rmdir", fail_if_called)
-    supervisor._cleanup_supervisor_scope()
-
-    assert capsys.readouterr().err == ""
+# S2a/T8 removed the supervisor sub-scope entirely: post-T7 the supervisor runs
+# directly in the parent confine scope, so there is no .aira-supervisor child for
+# aitest to create or rmdir. The `_cleanup_supervisor_scope` method and its three
+# unit tests were deleted with it (the outer/parent scope is `aira confine`'s to
+# tear down, never aitest's). The supervisor-peak measurement read now targets the
+# parent scope -- covered by test_measurement_report.py.
 
 
 # ---------------------------------------------------------------------------
@@ -3327,7 +3290,7 @@ def test_ci_shim_ledger_only_admission_governs_the_whole_suite_without_a_cgroup(
     """AIRA-123, the headline behaviour end to end.
 
     In ci-shim mode the launcher publishes the ci-shim outer-scope sentinel with
-    admission=ledger-only and no supervisor_scope, and every worker is admitted
+    admission=ledger-only and no cgroup scope, and every worker is admitted
     by a real daemon-side ledger
     grant that carries containment=advisory and no cgroup coordinates. The run
     must therefore stay DAEMON-BACKED -- daemon_available True, every worker
@@ -3386,10 +3349,10 @@ sys.stdin.read()
     supervisor = Supervisor()
     supervisor.bootstrap()
     assert supervisor.admission_mode == "ledger-only"
+    # S2a/T8: ci-shim publishes the sentinel as the outer scope; there is no cgroup
+    # and no supervisor sub-scope at all (that machinery is gone). The sentinel is
+    # what the supervisor-peak measurement read skips, staying honestly unevaluated.
     assert supervisor.outer_scope == "ci-shim"
-    assert supervisor.supervisor_scope is None, (
-        "ci-shim has no supervisor cgroup and must not name one"
-    )
     supervisor.collect(items)
 
     deadline = time.monotonic() + 60.0
