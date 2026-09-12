@@ -3930,3 +3930,46 @@ def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, mon
     recorded.clear()
     Supervisor(config=Config())._report_pool_usage()
     assert recorded == []
+
+
+class _ReachedAcquire(Exception):
+    """Sentinel raised by a stubbed acquire_worker to prove spawn_worker
+    PROCEEDED to the real worker-granting admission call — i.e. no client-side
+    outer-cap guard blocked it first."""
+
+
+def test_pool_spawns_past_the_excised_outer_cap_guard(tmp_path, monkeypatch):
+    """v0.7 S2a Task 6 (spec §10): with workers now created as siblings under the
+    slice (Task 3), the v7-1 client-side aggregate outer-cap guard is not a harmless
+    leftover — it becomes ACTIVELY HARMFUL. Its first spawn reads the now-small
+    parent cap, sees Sigma_live==0, and refuses TERMINALLY, dropping the whole queue
+    to unevaluated with no crash and no error. After excision spawn_worker must
+    PROCEED to the real worker-granting admission call regardless of the (now
+    irrelevant) outer-scope cap; the only RAM bounds are the daemon's one slice
+    ledger and each worker's own memory.max.
+
+    RED at HEAD (guard present): under a 300 MiB outer cap with a 256 MiB request
+    and an empty pool, spawn_worker raises WorkerAdmitOuterCapExceeded BEFORE it ever
+    reaches acquire_worker (64 MiB base allowance + 256 MiB > 300 MiB - 32 MiB
+    margin, Sigma_live==0). GREEN after excision: it reaches acquire_worker (the
+    _ReachedAcquire sentinel). This test imports NO guard symbol, so it keeps
+    compiling and asserting after the excision removes them."""
+    outer = tmp_path / "outer"
+    os.makedirs(str(outer))
+    # A faithful cgroup2 stand-in: cgroup.controllers (present on every cgroup dir)
+    # plus a finite memory.max, the two files the old guard's ancestry walk read.
+    with open(str(outer / "cgroup.controllers"), "w") as handle:
+        handle.write("cpuset cpu memory pids\n")
+    with open(str(outer / "memory.max"), "w") as handle:
+        handle.write("%d\n" % (300 << 20))
+    sup = Supervisor()
+    sup.admission_mode = supervisor_module._ADMISSION_SUB_SCOPE
+    sup.daemon_available = True
+    sup.outer_scope = str(outer)  # empty self.workers -> Sigma_live == 0
+
+    def _reach(*_args, **_kwargs):
+        raise _ReachedAcquire()
+
+    monkeypatch.setattr(sup, "acquire_worker", _reach)
+    with pytest.raises(_ReachedAcquire):
+        sup.spawn_worker(256 << 20)

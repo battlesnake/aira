@@ -141,30 +141,6 @@ _REAP_TIMEOUT_SECONDS = 5.0
 # "the value is None" must not be conflated. See _pool_covers_the_queue.
 _UNKNOWN = object()
 
-# AIRA-229 (v0.7 S1) client-side aggregate outer-cap guard tunables. These are
-# TUNABLE STARTING CONSTANTS, NOT measured values -- v7-4 sets them from a
-# full-pool run (spec OD4/§8):
-#   base      = the supervisor's own uncapped .aira-supervisor RSS (the pytest
-#               process itself; it holds no worker cap but consumes the outer cap).
-#   per_relay = one live `aira worker-admit` relay's RSS (a plain Popen that never
-#               relocates out of .aira-supervisor, so N live relays also charge the
-#               outer cap -- allowance = base + N_live * per_relay).
-#   margin    = a safety band held clear under the effective outer cap (distinct
-#               from the per-worker headroom and the daemon slice headroom -- three
-#               different "headroom"s; do not conflate).
-# All three are env-overridable via the shared AIRA_AITEST_ESTIMATED_BYTES size
-# grammar so the real-cgroup branch-exit gate can PIN them (making the admitted-pool
-# count deterministic) and v7-4 can measure against them without a code change.
-# These are SUPERVISOR/relay/band RSS estimates -- NOT the per-worker size default
-# (that is v7-2's AIRA_AITEST_DEFAULT_BYTES, a separate 256 MiB knob). They must be
-# SMALL relative to a realistic outer cap: allowance is the uncapped .aira-supervisor's
-# own footprint (the pytest process + N live relays), not a per-worker figure, and an
-# over-large base would refuse legitimate spawns under a modest outer cap. v7-4
-# measures the real .aira-supervisor/memory.peak at full pool to replace all three.
-_OUTER_CAP_ALLOWANCE_BASE = 64 << 20        # 64 MiB supervisor-process starting point
-_OUTER_CAP_ALLOWANCE_PER_RELAY = 8 << 20    # 8 MiB per live relay starting point
-_OUTER_CAP_MARGIN = 32 << 20                # 32 MiB safety band starting point
-
 # AIRA-230 (v0.7 S1 / v7-2). The per-test annotation default for a nodeid with no
 # aira_mem marker: the *incremental* peak RSS assumed on top of the warm-import
 # baseline (spec 4.1). 256 MiB is a STARTING POINT, NOT a measured value -- v7-4
@@ -449,23 +425,6 @@ class WorkerAdmitContractViolation(WorkerAdmitTerminal):
     shape must never be resolved into "the daemon is gone" and used to
     strip RAM containment from the rest of the suite, which is exactly
     what the substring classifier this replaced did by default."""
-    pass
-
-
-class WorkerAdmitOuterCapExceeded(WorkerAdmitTerminal):
-    """AIRA-229. The CLIENT-SIDE aggregate outer-cap guard refused a spawn that
-    would push Σ(live worker caps) + the supervisor allowance + this request past
-    the effective outer-scope cap, AND the pool was EMPTY (Σ_live == 0): nothing
-    running will ever retire to free room, so retrying or waiting would hang.
-
-    Terminal, and deliberately raised only in the Σ_live == 0 case: with live
-    workers, a breach is a transient (WorkerAdmitDenied -> skip this tick), because
-    a retirement lowers Σ_live. Distinct from the daemon's own
-    WorkerAdmitRequestInvalid/exceeds-ceiling (a request larger than the whole
-    SLICE ceiling): this is a client-side aggregate bound against the OUTER SCOPE
-    cap, which the daemon no longer scans (S15 deleted that scan; it relies on the
-    outer scope's memory.oom.group as the kernel-side backstop -- the whole-suite
-    kill this guard exists to prevent, worker_admit.go:463-466)."""
     pass
 
 
@@ -814,15 +773,6 @@ class Supervisor:
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
         self._swap_cap_warned = False
-        # AIRA-229 client-side aggregate outer-cap guard. Seeded from env (the
-        # branch-exit gate pins these to make the admitted-pool count deterministic;
-        # v7-4 measures against them). Starting constants, NOT measured -- see the
-        # module-level constants' comment.
-        self._outer_cap_base = _env_bytes("AIRA_AITEST_OUTER_CAP_ALLOWANCE_BASE", _OUTER_CAP_ALLOWANCE_BASE)
-        self._outer_cap_per_relay = _env_bytes("AIRA_AITEST_OUTER_CAP_ALLOWANCE_PER_RELAY", _OUTER_CAP_ALLOWANCE_PER_RELAY)
-        self._outer_cap_margin = _env_bytes("AIRA_AITEST_OUTER_CAP_MARGIN", _OUTER_CAP_MARGIN)
-        self._outer_cap_unreadable_warned = False
-        self._outer_cap_bounded_warned = False
 
     def bootstrap(self):
         """Relocate this process into its own child scope so the outer scope
@@ -1478,185 +1428,22 @@ class Supervisor:
                         except Exception:
                             pass
 
-    def _read_cgroup_memory_max(self, path):
-        """The FINITE memory.max at one cgroup level, in bytes, or None. Mirrors
-        Go's readConfineCap (confine_linux.go:1920): a read error OR the literal
-        "max" (unlimited) is "not finite" and returns None; a non-positive value is
-        also None (Go keeps only maximum > 0). Any positive integer is the cap."""
-        try:
-            with open(os.path.join(path, "memory.max"), encoding="ascii", errors="replace") as handle:
-                raw = handle.read().strip()
-        except OSError:
-            return None
-        if raw == "max":
-            return None
-        try:
-            value = int(raw)
-        except ValueError:
-            return None
-        return value if value > 0 else None
-
-    def _effective_outer_cap(self):
-        """The effective outer-scope memory ceiling: the MINIMUM finite memory.max
-        over self.outer_scope and its cgroup ancestors, or None if no finite cap
-        bounds it (or the outer scope is not a real cgroup dir). A Python replica of
-        Go's effectiveCapFrom (confine_linux.go:2926): memory.max is hierarchical, so
-        an uncapped scope under a capped parent is still bounded by the parent, and a
-        level with no memory.max (like the real cgroup2 root) is "not finite, keep
-        walking", not a stop.
-
-        Read at EVERY guard check, deliberately NOT cached at startup (spec §7 said
-        "read once"; recorded as a spec amendment): it is a few small file reads
-        before a relay fork, and re-reading answers "the owner set-property'd
-        aira.slice mid-run" for free.
-
-        The walk stops when the PARENT dir lacks cgroup.controllers -- every cgroup2
-        directory has that file, the mount root's parent does not -- which is the
-        same terminating condition as the Go walk's mount-root stop, discovered from
-        the filesystem rather than a passed-in mount path."""
-        path = self.outer_scope
-        if not path:
-            return None
-        best = None
-        current = os.path.abspath(path)
-        while True:
-            cap = self._read_cgroup_memory_max(current)
-            if cap is not None and (best is None or cap < best):
-                best = cap
-            parent = os.path.dirname(current)
-            if parent == current:
-                break
-            if not os.path.exists(os.path.join(parent, "cgroup.controllers")):
-                break
-            current = parent
-        return best
-
-    def _sum_live_worker_caps(self):
-        """(Σ_live, N_live) derived AT CHECK TIME from the live workers map -- the
-        same drift-proof read _pool_covers_the_queue makes, NOT a counter folded at
-        retirement (which runs only in _observe_worker_usage and would leave the
-        guard inert). Σ_live sums live workers' granted memory.max caps; N_live is
-        their count (each holds one live `aira worker-admit` relay). Skips fallback
-        workers (grant is None) and ledger-only grants (no memory_max): neither holds
-        an enforced cgroup cap against the outer scope.
-
-        `grant["memory_max"]` is a STRING in a real grant (the worker-admit outcome
-        parser stores every field as a string; _validate_grant validates int() but
-        does not store it back), so coerce here rather than isinstance-check for int
-        -- an int check would skip every real grant and leave the guard INERT, a
-        false-pass a porous int-only test fixture hides (caught by the real-cgroup
-        e2e)."""
-        total = 0
-        count = 0
-        for state in self.workers.values():
-            grant = state.get("grant")
-            if not grant:
-                continue
-            raw = grant.get("memory_max")
-            if raw is None:
-                continue  # fallback (grant None handled above) or ledger-only (no memory_max)
-            try:
-                cap = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if cap > 0:
-                total += cap
-                count += 1
-        return total, count
-
-    def _would_breach_outer_cap(self, request):
-        """AIRA-229 client-side aggregate outer-cap guard, consulted at the TOP of
-        spawn_worker before any worker-granting relay is forked. ONE rule:
-
-            spawn is permitted iff  Σ_live + allowance + request <= outer_cap - margin
-
-        where Σ_live/N_live come from the live workers map (at check time),
-        allowance = base + N_live * per_relay, margin is a safety band, and
-        outer_cap is the min finite memory.max over the outer scope's ancestry.
-        Returns None when the spawn may proceed; otherwise raises ONE of two
-        dispositions:
-
-          - Σ_live == 0 -> WorkerAdmitOuterCapExceeded (a WorkerAdmitTerminal):
-            nothing running will ever free room, so a retriable denial would hang
-            the empty-pool wait. Callers route this to _fail_queue_terminal
-            (queue -> unevaluated). This SUBSUMES any single-request-over-cap
-            (Tier-1) check -- at Σ_live == 0 the rule is already stricter -- so
-            there is no separate Tier-1 function.
-          - Σ_live  > 0 -> WorkerAdmitDenied: a live worker's retirement lowers
-            Σ_live and frees room, so the growth path SKIPS THIS TICK and retries.
-
-        MODE (D4): the hazard is a real outer cgroup with an oom.group backstop.
-          - advisory/ci-shim (admission_mode != cgroup-sub-scope): no outer cgroup,
-            no oom.group -> the hazard does not exist. The guard is UNEVALUATED and
-            the spawn PROCEEDS silently; it NEVER refuses.
-          - real (cgroup-sub-scope) with no finite cap anywhere: impossible by
-            precondition (confine's hasFiniteCapAncestor at exec, confine_linux.go
-            :2899; bootstrap's scopeHasFiniteMemoryMax, aitest_bootstrap_linux.go
-            :78). If EVER seen it is a broken assumption -> WARN ONCE, then PROCEED
-            (inside the spec §8 bounded-not-airtight envelope). Never silent, never
-            a refuse-all: refusing every spawn on an unreadable cap would break the
-            whole run over a condition that should not occur."""
-        if self.admission_mode != _ADMISSION_SUB_SCOPE:
-            return  # advisory/ci-shim: no outer cgroup, no oom.group -> hazard absent
-        outer_cap = self._effective_outer_cap()
-        if outer_cap is None:
-            if not self._outer_cap_unreadable_warned:
-                self._outer_cap_unreadable_warned = True
-                sys.stderr.write(
-                    "aira aitest: outer scope %r has no finite memory.max in its cgroup "
-                    "ancestry, which the enforced admission path treats as impossible "
-                    "(confine and aitest-bootstrap both refuse an uncapped outer scope). "
-                    "The aggregate outer-cap guard cannot evaluate and is skipped for this "
-                    "run -- worker over-admission is NOT bounded client-side\n"
-                    % (self.outer_scope,)
-                )
-            return  # broken assumption: warn once, then proceed (never refuse-all)
-        sigma_live, n_live = self._sum_live_worker_caps()
-        allowance = self._outer_cap_base + n_live * self._outer_cap_per_relay
-        if sigma_live + allowance + request <= outer_cap - self._outer_cap_margin:
-            return  # room for this worker under the aggregate outer cap
-        detail = ("outer_cap=%d margin=%d allowance=%d(base=%d+%d*per_relay=%d) "
-                  "sigma_live=%d request=%d"
-                  % (outer_cap, self._outer_cap_margin, allowance, self._outer_cap_base,
-                     n_live, self._outer_cap_per_relay, sigma_live, request))
-        if sigma_live == 0:
-            raise WorkerAdmitOuterCapExceeded(
-                "worker-admit state=denied class=request-invalid reason=outer-cap-exceeded: "
-                "even one worker plus the supervisor allowance would breach the outer scope "
-                "cap, and no live worker will retire to free room -- %s" % detail)
-        # Σ_live > 0: a skip-tick, not terminal. Say it ONCE (the swap-cap/cpu-slots
-        # pattern): a pool silently capped BELOW the requested worker count -- because
-        # the outer cap, not the daemon ledger, is the binding constraint -- is a
-        # governance fact the run must not stay silent about, even though the growth
-        # path itself recovers on the next retirement.
-        if not self._outer_cap_bounded_warned:
-            self._outer_cap_bounded_warned = True
-            sys.stderr.write(
-                "aira aitest: pool bounded by the OUTER-SCOPE cap at %d live worker(s) "
-                "(requested %d); further growth waits for a retirement, not the daemon "
-                "ledger -- %s\n" % (n_live, self._run_worker_count, detail)
-            )
-        raise WorkerAdmitDenied(
-            "worker-admit state=denied class=contended reason=outer-cap-would-breach: "
-            "admitting another worker would breach the outer scope cap; skipping this tick "
-            "until a live worker retires -- %s" % detail)
-
     def spawn_worker(self, estimated_bytes, blocking=True):
         """Admits and forks one worker, returning its pid. Raises
         WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, a
-        WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid,
-        WorkerAdmitContractViolation, or the client-side
-        WorkerAdmitOuterCapExceeded) if this request can never succeed, or
+        WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid or
+        WorkerAdmitContractViolation) if this request can never succeed, or
         WorkerPlacementFailed if the forked child died before confirming it
         joined its granted cgroup scope -- the caller (run()) decides
         fallback/retry/terminal-queue policy for each.
 
-        BEFORE any relay is forked, the AIRA-229 aggregate outer-cap guard
-        (_would_breach_outer_cap) runs: it raises WorkerAdmitOuterCapExceeded
-        (terminal, empty pool) or WorkerAdmitDenied (skip-tick, live pool) if
-        admitting this worker would push Σ(live caps)+allowance+request past the
-        effective outer-scope cap, and returns silently otherwise (including in
-        advisory/ci-shim mode, where the hazard does not exist).
+        S2a §10/§11: there is no client-side outer-cap guard any more. With
+        workers created as siblings under the slice (not nested under a
+        smaller-than-slice outer cap), no aggregate can breach an outer
+        oom.group, so AIRA-229's whole-suite kill and AIRA-232's multi-supervisor
+        breach dissolve by construction; the daemon's one signed slice ledger and
+        each worker's own memory.max are the only RAM bounds, and admission is the
+        daemon's alone.
 
         Safety: the ENTIRE forked-child branch below is wrapped in one
         broad try/except that _exit_child()s (worker.py's coverage-safe
@@ -1666,12 +1453,6 @@ class Supervisor:
         cleanup code fully UNCONFINED. (place_self() itself is separately
         guarded the same way inside fork_worker, Task 12, since it can
         raise before this function's own try even starts.)"""
-        # AIRA-229: the aggregate outer-cap guard, BEFORE any relay is forked, so an
-        # over-admitting spawn is refused client-side rather than admitted and left
-        # for the outer scope's memory.oom.group to whole-suite-kill. Raises on a
-        # breach (terminal / skip-tick per _would_breach_outer_cap); returns None to
-        # proceed (including advisory/ci-shim mode, where the hazard is absent).
-        self._would_breach_outer_cap(estimated_bytes)
         grant, admit_process = self.acquire_worker(estimated_bytes, blocking=blocking)
         # AIRA-123. None here is a LEDGER-ONLY grant: the daemon really admitted
         # this worker against the container's RAM budget, there is simply no
@@ -2195,11 +1976,6 @@ class Supervisor:
             # a real run; reported honestly rather than papered over here).
             "worker_budget": honest(self._pool_budget),
             "oom_group_killed": self._pool_peak_oom,
-            # The guard constants in effect, so the report ties measured
-            # supervisor/worker RSS to the tunables it exists to set (v7-1).
-            "outer_cap_allowance_base": self._outer_cap_base,
-            "outer_cap_allowance_per_relay": self._outer_cap_per_relay,
-            "outer_cap_margin": self._outer_cap_margin,
         }
         try:
             os.makedirs(measure_dir, exist_ok=True)
@@ -2856,12 +2632,12 @@ class Supervisor:
         each of those surplus workers holds a real daemon lease against this
         run's budget for its entire useless lifetime (S15 replaced AIRA-39's
         children-memory.max scan with a signed scope-id LEASE COUNTER, so the
-        daemon now bounds Σ(leases) <= the slice ceiling; the outer-scope
-        aggregate bound Σ(worker caps) <= outer-cap is the AIRA-229 client-side
-        guard, _would_breach_outer_cap), so needless over-spawn makes hitting
-        that cap -- and stalling in _wait_for_admission_or_disable waiting for
-        capacity this run is itself holding -- more likely than the requested
-        pool size warrants.
+        daemon bounds Σ(leases) <= the slice ceiling — and S2a §10 removed the
+        client-side outer-cap guard entirely, since sibling worker scopes have no
+        shared outer cap to aggregate against), so needless over-spawn makes
+        hitting that ceiling -- and stalling in _wait_for_admission_or_disable
+        waiting for capacity this run is itself holding -- more likely than the
+        requested pool size warrants.
 
         Counting IDLE workers rather than all of them (or keeping a local
         counter decremented per spawn, the other shape AIRA-37 suggested) makes
