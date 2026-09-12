@@ -408,13 +408,18 @@ migration **into a live-leased sibling worker scope whose `parent_scope_id` == t
 (positive identification, not a name-prefix guess). A delegate run must attest
 `scope-integrity=contained`.
 
-**(d) Workers must stay sub-reservations.** Today `workerParentScopeID` is always non-empty, so
-`isSubReservation` holds and a worker never counts in `outstandingJobs` (headroom scaling,
-`sliceProvablyEmpty`, drain / `--exclusive` convergence, `confine --list` "N jobs"). Moving
-linkage to an explicit `parent_scope_id` field creates an empty-value path (the e2e harness and
-ci-shim publish no scope id) that would make each worker a *job* — and the gates would pass
-anyway. Fix: the daemon **refuses an empty `parent_scope_id`** (`E_DAEMON_PROTOCOL`) or
-substitutes a synthetic non-holder marker; ci-shim publishes a sentinel; the supervisor sends
+**(d) Workers must stay sub-reservations.** [CORRECTED per GATE-3 build-review: workers DO count
+in `outstandingJobs` — `rederiveLedgerLocked` does `jobs++` for every granted accounted waiter,
+and the `confine --list` split keys on `scopeID==""` (workers have a scopeID → they render as
+scope-jobs). What `isSubReservation` (`parentScopeID != ""`) actually gates is the
+**exclusivity-gate exemption** (`admit.go:552`) and **oomsteer child aggregation**
+(`oomsteer.go:445`) — NOT the job count.] Today `workerParentScopeID` is always non-empty, so
+`isSubReservation` holds. Moving linkage to an explicit `parent_scope_id` field creates an
+empty-value path (the e2e harness and ci-shim publish no scope id) that would drop
+`isSubReservation` → break the exclusivity exemption + oomsteer aggregation (and the linkage/naming
+that depend on a real parent id). Fix: the daemon **refuses an empty `parent_scope_id`**
+(`E_DAEMON_PROTOCOL`) or substitutes a synthetic non-holder marker; ci-shim publishes a sentinel;
+the supervisor sends
 `AIRA_CONFINE_SCOPE_ID` (the *id*, not `self.outer_scope` which is a path).
 
 **Decision-log updates (supersede §12 where they differ):**

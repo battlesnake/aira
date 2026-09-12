@@ -156,8 +156,8 @@ type Server struct {
 	// cgroup. (S2a deleted the id-reseed readdir seam: worker ids are unique by
 	// construction, so there is no tree to scan.)
 	workerScopeCreate func(context.Context, string, string, int64) (string, string, error)
-	admitNow            func() time.Time
-	admitAfter          func(time.Duration) <-chan time.Time
+	admitNow          func() time.Time
+	admitAfter        func(time.Duration) <-chan time.Time
 	// S13 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
 	// runRestartFreeze waits the freeze via this, and sharing admitAfter would cross-talk
 	// with a live admitConnection in a Serve-driven test. Nil → time.After.
