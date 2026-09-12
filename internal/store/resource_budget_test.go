@@ -4,8 +4,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"aira/internal/runner"
 )
 
 func resourceBudgetTestTime() time.Time {
@@ -360,65 +358,5 @@ func TestResourceBudgetGaugeWritesNothing(t *testing.T) {
 	}
 	if !strings.Contains(result.Universe.Scope, "machine-wide") || !strings.Contains(result.Universe.Scope, "cross-project") {
 		t.Fatalf("the gauge must disclose its machine-wide, cross-project universe: %q", result.Universe.Scope)
-	}
-}
-
-// TestResourceBudgetDelegateRAMCeilingIsNotABudget is the final build-review's
-// counterexample (Fable, 2026-09-09). A --delegate-ram scope's memory.max is a
-// daemon-derived kill backstop, floor-clamped to 4G, and the job's slice booking
-// is the pinned framework overhead — so a small suite under --delegate-ram (the
-// ticket's own subpipe evidence peaks at 52M–841M) would otherwise have read
-// "over-provisioned, consider --memory-reserve N": a false verdict (nothing is
-// held) with advice that manufactures the whole-suite reservation --delegate-ram
-// exists to avoid. The lowering direction must read unevaluated BY NAME; the
-// under direction must still fire on an OOM at the ceiling and name the
-// ceiling's own knob.
-//
-// verifies: AIRA-180
-func TestResourceBudgetDelegateRAMCeilingIsNotABudget(t *testing.T) {
-	const g = int64(1) << 30
-	basis := ResourceBudgetFamilyCap + runner.ConfineCapSourceDelegateRAM
-	delegate := func(peak, budget int64, oom bool) ResourceBudgetSample {
-		return budgetSample(peak, budget, oom, basis)
-	}
-	verdict := classify(
-		delegate(200<<20, 4*g, false),
-		delegate(200<<20, 4*g, false),
-		delegate(200<<20, 4*g, false),
-	)
-	if !verdict.Unevaluated || verdict.Direction != ResourceBudgetUnevaluated {
-		t.Fatalf("a delegate-ram ceiling must never read as over-provisioned: %+v", verdict)
-	}
-	if !strings.HasPrefix(verdict.UnevaluatedReason, "delegate-ram:ceiling-not-a-budget") {
-		t.Fatalf("reason=%q must name the launch shape, not blame the evidence", verdict.UnevaluatedReason)
-	}
-	if verdict.RecommendedBudget != nil || verdict.Recommendation != "" {
-		t.Fatalf("nothing may be recommended against a ceiling: %+v", verdict)
-	}
-	// The evidence is still published — withholding the verdict is not
-	// withholding the numbers.
-	if verdict.UsableSamples != 3 || verdict.ObservedMax == nil || *verdict.ObservedMax != 200<<20 || verdict.Buckets[">=2.0"] != 3 {
-		t.Fatalf("evidence must still be published: %+v", verdict)
-	}
-
-	// The under direction is realised harm at the ceiling and stays evaluable;
-	// the knob it names is the ceiling's override, never the framework overhead.
-	killed := classify(delegate(4*g, 4*g, true))
-	if killed.Direction != ResourceBudgetUnderProvisioned || killed.RecommendedBudget == nil {
-		t.Fatalf("an OOM at the delegate-ram ceiling must still classify under-provisioned: %+v", killed)
-	}
-	if !strings.Contains(killed.Recommendation, "--memory-max") || strings.Contains(killed.Recommendation, "--memory-reserve") {
-		t.Fatalf("a delegate-ram raise must name --memory-max, never --memory-reserve: %q", killed.Recommendation)
-	}
-
-	// False-pass direction: the same numbers under an ordinary operator cap ARE
-	// over-provisioned, and the ordinary knob is right there.
-	plain := classify(
-		capSample(200<<20, 4*g, false),
-		capSample(200<<20, 4*g, false),
-		capSample(200<<20, 4*g, false),
-	)
-	if plain.Direction != ResourceBudgetOverProvisioned || !strings.Contains(plain.Recommendation, "--memory-reserve") {
-		t.Fatalf("an ordinary cap with the same ratio must still be over-provisioned: %+v", plain)
 	}
 }

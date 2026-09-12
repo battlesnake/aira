@@ -72,10 +72,6 @@ const (
 	// their number is authoritative and is reported against the container's
 	// rather than overridden by it.
 	ContainerReserveSkipDeclared = "declared"
-	// ContainerReserveSkipDelegateRAM: a delegate-ram job's pinned reserve is
-	// deliberately a small framework overhead because its per-test children
-	// reserve individually (AIRA-62). Raising it would double-book them.
-	ContainerReserveSkipDelegateRAM = "delegate-ram"
 	// ContainerReserveSkipExceedsSlice: the declared container limit is larger
 	// than the whole slice, so charging it would make the daemon terminally
 	// reject the admission and REFUSE a launch the caller never asked to be
@@ -467,7 +463,7 @@ func (plan ContainerPlan) Inject(argv []string, declaredCap int64) ContainerInje
 // this feature was designed around (build review, Fable P1). A footprint larger
 // than the whole slice cannot be meaningfully accounted for anyway, so it is
 // reported and skipped rather than allowed to block the job.
-func (plan ContainerPlan) ResolveReserve(reserve int64, pinned, delegateRAM bool, sliceCap int64) (int64, bool, string) {
+func (plan ContainerPlan) ResolveReserve(reserve int64, pinned bool, sliceCap int64) (int64, bool, string) {
 	if !plan.Detected() || !plan.MemoryEstablished {
 		return reserve, pinned, ""
 	}
@@ -477,8 +473,6 @@ func (plan ContainerPlan) ResolveReserve(reserve int64, pinned, delegateRAM bool
 		// placed elsewhere is not inside this job's reservation and must be
 		// charged like any other escapee (build review, Sol P1).
 		return reserve, pinned, ContainerReserveSkipPodman
-	case delegateRAM:
-		return reserve, pinned, ContainerReserveSkipDelegateRAM
 	case pinned:
 		return reserve, pinned, ContainerReserveSkipDeclared
 	case sliceCap > 0 && plan.MemoryBytes > sliceCap:

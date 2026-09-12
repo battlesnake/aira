@@ -111,7 +111,7 @@ func TestConfineListPublishesTheLedgerChargeNotTheDelegateScopeCeiling(t *testin
 	queue := &sliceQueue{path: slice, server: server, outstanding: charge, outstandingJobs: 1}
 	queue.waiters = []*admitWaiter{{
 		seq: 1, reserve: charge, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
-		scopeID: scopeID, name: "suite", owner: "session-a", scopeCeiling: ceiling,
+		scopeID: scopeID, name: "suite", owner: "session-a",
 	}}
 	server.admitQueues[slice] = queue
 
@@ -224,7 +224,7 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 	}
 	queue.waiters = []*admitWaiter{
 		{seq: 1, reserve: delegateCharge, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
-			scopeID: delegateID, name: "suite", owner: "session-a", scopeCeiling: delegateCeiling},
+			scopeID: delegateID, name: "suite", owner: "session-a"},
 		// The plain (non-delegate) case: the declared reserve is 3 GiB, below the
 		// scope's 8 GiB memory.max cap, and 3 GiB is what the slice is holding for it.
 		{seq: 2, reserve: plainCharge,

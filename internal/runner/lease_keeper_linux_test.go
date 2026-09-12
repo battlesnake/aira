@@ -96,9 +96,10 @@ func TestLeaseKeeperReDeclaresOnEOFWithVerbatimFrame(t *testing.T) {
 	}
 }
 
-// verifies: design §8 — a --delegate-ram grant declares 0 CPU cores, and the
-// re-declare must reproduce that (charging it a core would double-count).
-func TestLeaseKeeperDelegateRAMReDeclaresZeroCores(t *testing.T) {
+// verifies: S2a §4/§16 — a --delegate-ram grant is an ordinary confine job, so it
+// declares ONE CPU core (not 0), and the re-declare must reproduce the original
+// admit's declaration.
+func TestLeaseKeeperDelegateRAMReDeclaresOneCore(t *testing.T) {
 	got := make(chan redeclare.Record, 1)
 	dial := func(context.Context, string) (net.Conn, error) {
 		c, s := net.Pipe()
@@ -123,8 +124,8 @@ func TestLeaseKeeperDelegateRAMReDeclaresZeroCores(t *testing.T) {
 	_ = initialServer.Close()
 	select {
 	case rec := <-got:
-		if rec.CPUCores != 0 {
-			t.Fatalf("delegate re-declare cpu=%d, want 0", rec.CPUCores)
+		if rec.CPUCores != uint32(DefaultConfineCPUCores) {
+			t.Fatalf("delegate re-declare cpu=%d, want %d", rec.CPUCores, DefaultConfineCPUCores)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("keeper did not re-declare")

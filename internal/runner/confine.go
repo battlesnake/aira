@@ -23,20 +23,6 @@ const (
 	// §7). Accounting only — no cpu.max is written. Per-command CPU annotation
 	// (aitest workers) is a later slice; the confine path always sends this.
 	DefaultConfineCPUCores = int64(1)
-	// Under --delegate-ram the suite's OWN reserve must be a small PINNED
-	// framework overhead — never the unpinned whole-command estimate, which
-	// could inflate via history to reject the whole suite E_ADMIT_TOO_LARGE.
-	// Until AIRA-33 the reason was that the deleted pytest plugin took a
-	// separate per-test reservation the whole-command estimate would double-book
-	// in queue.outstanding. That caller is gone; the constant and its value are
-	// unchanged, and the reason is now aitest: a delegate job's containment is
-	// per-WORKER, in nested sub-scopes granted by worker-admit under this job's
-	// own outer ceiling, so charging the slice a whole-suite peak on top would
-	// reserve for growth the slice ledger never sees.
-	DefaultDelegateRAMOverhead = int64(512 << 20)
-	// DefaultDelegateRAMScopeCeiling is the compiled-in containment cap used
-	// whenever a daemon ceiling is unavailable. It is not an admission charge.
-	DefaultDelegateRAMScopeCeiling = int64(48 << 30)
 	// AdmitWaitCeiling is the single upper bound on a requested admission wait,
 	// shared by the CLI, this runner, and the daemon (AIRA-58). It is a TYPO
 	// GUARD, not a policy: real waits on a contended shared slice routinely run
@@ -101,35 +87,31 @@ const (
 // charges what the operator asked for — against this production code rather
 // than against a restatement of it.
 //
-// The two rules, unchanged in substance from the runner code this replaces:
+// The two rules, one for every confine job (S2a §4/§16 collapsed `--delegate-ram`
+// into an ordinary confine job, so there is no longer a delegate carve-out here):
 //
-//   - No reserve given: a delegate-ram job pins a small framework overhead,
-//     because its per-test children reserve individually and charging the
-//     whole-command estimate would double-book them. Anything else takes the
-//     unpinned no-history fallback, which the daemon is free to re-estimate.
-//   - A non-delegate `--memory-max` SETS the reserve to the cap. That is
-//     deliberate and documented (internal/core/skill.go:318): such a scope may
-//     genuinely grow to its cap and nothing else reserves on its behalf, so
-//     booking less would under-book the shared ledger. Note it sets rather than
-//     raises: it is an UP-charge in the case the docs describe (reserve below
-//     cap, "you cannot cap high and reserve low"), but a declared reserve LARGER
-//     than the cap is lowered to the cap — still exact, never under-booked,
-//     since the scope cannot exceed its own memory.max. A delegate-ram cap is a
-//     containment CEILING, not a reserve, so it must not do either.
+//   - No reserve given: take the unpinned no-history fallback, which the daemon
+//     is free to re-estimate from this signature's peak history.
+//   - A `--memory-max` SETS the reserve to the cap. That is deliberate and
+//     documented (internal/core/skill.go): such a scope may genuinely grow to its
+//     cap and nothing else reserves on its behalf, so booking less would under-book
+//     the shared ledger. Note it sets rather than raises: it is an UP-charge in the
+//     case the docs describe (reserve below cap, "you cannot cap high and reserve
+//     low"), but a declared reserve LARGER than the cap is lowered to the cap —
+//     still exact, never under-booked, since the scope cannot exceed its own
+//     memory.max. A `--delegate-ram` job is sized exactly this way now: its parent
+//     scope bounds the supervisor and whatever else runs directly in the job (the
+//     `make`, the shell, a heavy compile), while its pytest workers reserve
+//     individually as sibling scopes via worker-admit.
 //
 // verifies: AIRA-62
 func ResolveConfineReserve(request ConfineRequest) (reserve int64, pinned bool) {
 	reserve = request.MemoryReserve
 	pinned = request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
-		if request.DelegateRAM {
-			reserve = DefaultDelegateRAMOverhead
-			pinned = true
-		} else {
-			reserve = DefaultConfineMemoryReserve
-		}
+		reserve = DefaultConfineMemoryReserve
 	}
-	if !request.DelegateRAM && request.ScopeMemoryMax > 0 {
+	if request.ScopeMemoryMax > 0 {
 		reserve = request.ScopeMemoryMax
 		pinned = true
 	}
@@ -462,13 +444,6 @@ const (
 	// own reserve-basis field beside this one says which. What this value claims
 	// is only what it can establish — AIRA chose this number, not the caller.
 	ConfineCapSourceDaemonReserve = "auto:daemon-reserve"
-	// ConfineCapSourceDelegateRAM: a --delegate-ram job with no --memory-max of
-	// its own, capped at the daemon's learned scope ceiling or, when the daemon
-	// supplied none, at the compiled-in fallback. Also AIRA's number, not the
-	// caller's, but a whole-scope CEILING rather than the job's reserve — so an
-	// OOM here says the suite outgrew its ceiling, not that a reserve estimate
-	// was low.
-	ConfineCapSourceDelegateRAM = "auto:delegate-ram"
 	// ConfineCapSourceUnevaluated: a cap IS enforced but no branch recorded where
 	// it came from. Never rendered as either party's choice.
 	ConfineCapSourceUnevaluated = "unevaluated"

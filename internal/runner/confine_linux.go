@@ -573,7 +573,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the daemon's history estimate with a client-pinned guess.
 	containerPlan := PlanContainerIntegration(request.Argv)
 	var containerReserveSkip string
-	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, request.DelegateRAM, maximum)
+	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, maximum)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
@@ -931,8 +931,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// decoding reserve-basis or by pattern-matching a byte count. Assigned here
 	// (rather than left to a switch after the fact) precisely because the branch
 	// order below encodes real precedence — --memory-max wins over a declared
-	// reserve, which wins over the daemon grant, and delegate-ram's ceiling only
-	// fills a gap none of those filled.
+	// reserve, which wins over the daemon grant. Since S2a collapsed `--delegate-ram`
+	// into an ordinary confine job (spec §4/§16) there is no longer a delegate ceiling
+	// branch below these.
 	capSource := ""
 	if scopeMemoryMax > 0 {
 		capSource = ConfineCapSourceMemoryMax
@@ -966,7 +967,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// default rather than anything the caller said. A declared reserve too small
 	// to be a real cap was refused up front, so there is no silently-uncapped
 	// case left for this branch to hide.
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve {
+	if scopeMemoryMax <= 0 && declaredReserve {
 		scopeMemoryMax = declaredReserveBytes
 		capSource = ConfineCapSourceMemoryReserve
 	}
@@ -976,27 +977,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// default is explicitly a guess (DefaultConfineMemoryReserve), and enforcing a
 	// guess as a hard cap would OOM-kill jobs that succeed today — which is why
 	// the unpinned fallback is deliberately left uncapped rather than
-	// conservatively capped. Delegate-ram never takes either branch: its pinned
-	// reserve is framework overhead, and it gets a finite cap below.
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.release != nil && admission.reserve > 0 {
+	// conservatively capped. S2a §4/§16: a `--delegate-ram` job is an ordinary
+	// confine job and takes exactly these branches — its parent scope is sized for
+	// the supervisor and whatever else runs directly in the job, while its pytest
+	// workers reserve individually as sibling scopes via worker-admit.
+	if scopeMemoryMax <= 0 && admitted && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 		capSource = ConfineCapSourceDaemonReserve
-	}
-	// Delegate-ram: an explicit --memory-max (scopeMemoryMax > 0) is the user's
-	// informed, still-finite-and-contained choice and WINS — it is never lowered by
-	// the learned ceiling, which would false-kill a suite the user deliberately sized
-	// larger (and which is exactly the interim --memory-max mitigation others rely on).
-	// The ceiling only supplies a finite cap when there is no explicit one; a compiled-in
-	// fallback backs it when the daemon provides none, so the scope is never uncapped.
-	if request.DelegateRAM && scopeMemoryMax <= 0 {
-		scopeMemoryMax = admission.scopeCeiling
-		if scopeMemoryMax <= 0 {
-			scopeMemoryMax = delegateRAMScopeFallback()
-		}
-		capSource = ConfineCapSourceDelegateRAM
-	}
-	if request.DelegateRAM && scopeMemoryMax <= 0 {
-		return result, confineUnavailable(sliceName, errors.New("delegate-ram scope has no finite memory.max"))
 	}
 	if scopeMemoryMax > 0 {
 		if err := deps.writeScopeMemoryCap(scope, scopeMemoryMax, request.ScopeMemoryHigh, false); err != nil {
@@ -1688,10 +1675,6 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 			return estimate + room + ". The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL COMMAND " +
 				"and the next admission is sized higher on its own, or pin --memory-reserve " + FormatConfineBytes(suggested) +
 				" now to skip the cycle. If an identical re-run is killed at the same cap again, that is a genuine bug worth reporting."
-		case ConfineCapSourceDelegateRAM:
-			return head + "; cap-source=" + capSource + " — this is --delegate-ram's whole-scope ceiling, chosen by AIRA rather than " +
-				"by you, and it climbs with this signature's recorded peaks: RE-RUN THE IDENTICAL COMMAND before changing anything. " +
-				"Pass --memory-max to set the ceiling yourself."
 		default:
 			return head + "; cap-source=" + ConfineCapSourceUnevaluated + " — where this cap came from could not be established. " +
 				"If you set --memory-max/--memory-reserve yourself, raise it; if AIRA estimated it, re-running the identical " +
@@ -1953,14 +1936,6 @@ func confineScopeID(name, owner string, delegateRAM bool) string {
 	// parser. A job scope names THIS process; only the daemon minting a worker
 	// scope on behalf of another process (MintWorkerScopeID) passes a different pid.
 	return confineScopeIDWithPID(name, owner, os.Getpid(), delegateRAM)
-}
-
-func delegateRAMScopeFallback() int64 {
-	value := strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT"))
-	if parsed, err := ParseMemorySize(value); err == nil && parsed > 0 {
-		return parsed
-	}
-	return DefaultDelegateRAMScopeCeiling
 }
 
 func confineUnavailable(slice string, err error) error {

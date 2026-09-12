@@ -670,14 +670,6 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 				"this slice can give. Split heavy work, or run where the slice is larger, only if it is in fact refused.",
 		},
 		{
-			name: "oom against the delegate-ram ceiling names the re-run", cap: 100, peak: &peak95, oom: true,
-			source: ConfineCapSourceDelegateRAM, sliceCap: 64 << 30,
-			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:delegate-ram — " +
-				"this is --delegate-ram's whole-scope ceiling, chosen by AIRA rather than by you, and it climbs with this " +
-				"signature's recorded peaks: RE-RUN THE IDENTICAL COMMAND before changing anything. " +
-				"Pass --memory-max to set the ceiling yourself.",
-		},
-		{
 			// An unrecorded source is never resolved to either party's choice:
 			// the line names both possibilities instead of guessing one. A known
 			// slice cap does not change that -- an unestablished provenance may not
@@ -1375,13 +1367,21 @@ func TestConfineCPUTimeReachesStatusFromTheSameTeardownRead(t *testing.T) {
 	}
 }
 
-func TestConfineDelegateRAMAlwaysUsesCeilingCap(t *testing.T) {
-	t.Run("daemon ceiling is the scope cap, never the pinned reserve", func(t *testing.T) {
+// S2a Task 7 (spec §4/§16): a `--delegate-ram` job is an ordinary confine job, so
+// its scope memory.max comes from the ordinary daemon-reserve grant (or an explicit
+// --memory-max), NEVER a delegate-specific 48 GiB ceiling. The old
+// TestConfineDelegateRAMAlwaysUsesCeilingCap encoded the retired ceiling model.
+func TestConfineDelegateRAMTakesOrdinaryScopeCap(t *testing.T) {
+	t.Run("unpinned delegate takes the daemon reserve as its cap, not a delegate ceiling", func(t *testing.T) {
 		scope := &confineFakeScope{}
 		deps := confineUnitDeps(scope)
 		closer := &confineCountingCloser{}
-		deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-			return admissionResult{state: "immediate", reserve: DefaultDelegateRAMOverhead, scopeCeiling: 8 << 30, basis: "pinned:client", release: closer}, nil
+		var gotReserve int64
+		var gotPinned bool
+		deps.admit = func(_ context.Context, _ string, request ConfineRequest, reserve int64) (admissionResult, error) {
+			gotReserve, gotPinned = reserve, request.MemoryReservePinned
+			// An ordinary admitted grant: a history estimate, unpinned.
+			return admissionResult{state: "immediate", reserve: 2 << 30, basis: "estimate:p90-prior", release: closer}, nil
 		}
 		var written int64
 		deps.writeScopeMemoryCap = func(_ Scope, maximum, high int64, setOOM bool) error {
@@ -1394,93 +1394,38 @@ func TestConfineDelegateRAMAlwaysUsesCeilingCap(t *testing.T) {
 		result, err := confineWithDeps(context.Background(), ConfineRequest{
 			Slice: "finite.slice", DelegateRAM: true, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
 		}, deps)
-		if err != nil || written != 8<<30 || result.Status.ScopeMemoryMax != 8<<30 || written == DefaultDelegateRAMOverhead {
-			t.Fatalf("result=%+v err=%v written=%d", result, err, written)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The whole-job charge is the ORDINARY unpinned no-history default (not a
+		// pinned framework overhead), and the scope cap is the daemon-granted reserve.
+		if gotReserve != DefaultConfineMemoryReserve || gotPinned {
+			t.Fatalf("delegate no-reserve charged %d pinned=%v, want %d unpinned", gotReserve, gotPinned, DefaultConfineMemoryReserve)
+		}
+		if written != 2<<30 || result.Status.ScopeMemoryMax != 2<<30 || result.Status.ScopeMemoryCapSource != ConfineCapSourceDaemonReserve {
+			t.Fatalf("cap=%d ScopeMemoryMax=%d source=%q, want 2G/daemon-reserve", written, result.Status.ScopeMemoryMax, result.Status.ScopeMemoryCapSource)
 		}
 	})
 
-	t.Run("flock fallback still writes a finite client default", func(t *testing.T) {
-		t.Setenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT", "6G")
+	t.Run("delegate --memory-max sets the cap AND is charged as the reserve, like any confine job", func(t *testing.T) {
 		scope := &confineFakeScope{}
 		deps := confineUnitDeps(scope)
-		// This is the normal post-fallback shape: flock timed out and returned
-		// unevaluated/timeout without a daemon scope_ceiling, but launch proceeds.
-		deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-			return admissionResult{state: "timeout", reserve: DefaultDelegateRAMOverhead, basis: "fallback:daemon-unavailable"}, nil
+		var admittedReserve, written int64
+		deps.admit = func(_ context.Context, _ string, _ ConfineRequest, reserve int64) (admissionResult, error) {
+			admittedReserve = reserve
+			return admissionResult{state: "immediate", reserve: reserve, basis: "pinned:client", release: &confineCountingCloser{}}, nil
 		}
-		var written int64
 		deps.writeScopeMemoryCap = func(_ Scope, maximum, _ int64, _ bool) error { written = maximum; return nil }
 		result, err := confineWithDeps(context.Background(), ConfineRequest{
-			Slice: "finite.slice", DelegateRAM: true, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-		}, deps)
-		if err != nil || written != 6<<30 || result.Status.ScopeMemoryMax != 6<<30 {
-			t.Fatalf("result=%+v err=%v written=%d", result, err, written)
-		}
-	})
-
-	t.Run("explicit smaller max wins without charging it as the reserve", func(t *testing.T) {
-		scope := &confineFakeScope{}
-		deps := confineUnitDeps(scope)
-		var admittedReserve, written int64
-		deps.admit = func(_ context.Context, _ string, _ ConfineRequest, reserve int64) (admissionResult, error) {
-			admittedReserve = reserve
-			return admissionResult{state: "immediate", reserve: reserve, scopeCeiling: 8 << 30, basis: "pinned:client", release: &confineCountingCloser{}}, nil
-		}
-		deps.writeScopeMemoryCap = func(_ Scope, maximum, _ int64, _ bool) error { written = maximum; return nil }
-		if _, err := confineWithDeps(context.Background(), ConfineRequest{
 			Slice: "finite.slice", DelegateRAM: true, ScopeMemoryMax: 2 << 30, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-		}, deps); err != nil {
+		}, deps)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if admittedReserve != DefaultDelegateRAMOverhead || written != 2<<30 {
-			t.Fatalf("reserve=%d cap=%d, want %d/%d", admittedReserve, written, DefaultDelegateRAMOverhead, int64(2<<30))
-		}
-	})
-
-	t.Run("explicit larger max wins over a smaller learned ceiling (no false-kill of a deliberately-sized suite)", func(t *testing.T) {
-		scope := &confineFakeScope{}
-		deps := confineUnitDeps(scope)
-		var admittedReserve, written int64
-		deps.admit = func(_ context.Context, _ string, _ ConfineRequest, reserve int64) (admissionResult, error) {
-			admittedReserve = reserve
-			return admissionResult{state: "immediate", reserve: reserve, scopeCeiling: 8 << 30, basis: "pinned:client", release: &confineCountingCloser{}}, nil
-		}
-		deps.writeScopeMemoryCap = func(_ Scope, maximum, _ int64, _ bool) error { written = maximum; return nil }
-		if _, err := confineWithDeps(context.Background(), ConfineRequest{
-			Slice: "finite.slice", DelegateRAM: true, ScopeMemoryMax: 32 << 30, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-		}, deps); err != nil {
-			t.Fatal(err)
-		}
-		// The user's explicit 32G is finite/contained and their informed choice; a
-		// smaller learned 8G ceiling must NOT lower it (that would false-kill the suite,
-		// hitting exactly the interim --memory-max mitigation others rely on). The
-		// whole-job admission reserve stays the pinned framework overhead (no double-book).
-		if written != 32<<30 || admittedReserve != DefaultDelegateRAMOverhead {
-			t.Fatalf("cap=%d reserve=%d, want %d/%d (explicit wins; reserve unchanged)", written, admittedReserve, int64(32<<30), DefaultDelegateRAMOverhead)
-		}
-	})
-
-	t.Run("no explicit reserve pins a small framework overhead not the unpinned estimate", func(t *testing.T) {
-		scope := &confineFakeScope{}
-		deps := confineUnitDeps(scope)
-		deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
-		closer := &confineCountingCloser{}
-		var gotReserve int64
-		var gotPinned bool
-		deps.admit = func(_ context.Context, _ string, request ConfineRequest, reserve int64) (admissionResult, error) {
-			gotReserve, gotPinned = reserve, request.MemoryReservePinned
-			return admissionResult{state: "immediate", reserve: reserve, basis: "pinned:client", release: closer}, nil
-		}
-		if _, err := confineWithDeps(context.Background(), ConfineRequest{
-			Slice: "finite.slice", DelegateRAM: true, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-		}, deps); err != nil {
-			t.Fatal(err)
-		}
-		// A delegate-ram suite delegates RAM accounting to its per-test reservations,
-		// so its OWN reserve must be a small PINNED overhead — never the unpinned
-		// whole-command estimate (which would double-book the per-test reservations).
-		if gotReserve != DefaultDelegateRAMOverhead || !gotPinned {
-			t.Fatalf("delegate-ram no-reserve => reserve=%d pinned=%v, want %d pinned", gotReserve, gotPinned, DefaultDelegateRAMOverhead)
+		// The retired `--delegate-ram --memory-reserve 512M` idiom: --memory-max now
+		// SETS the reserve to the cap, exactly as on a non-delegate job.
+		if admittedReserve != 2<<30 || written != 2<<30 || result.Status.ScopeMemoryCapSource != ConfineCapSourceMemoryMax {
+			t.Fatalf("reserve=%d cap=%d source=%q, want 2G/2G/memory-max", admittedReserve, written, result.Status.ScopeMemoryCapSource)
 		}
 	})
 
@@ -1514,13 +1459,6 @@ func TestDelegateRAMScopeIDMarkerIsPositionalAndUnambiguous(t *testing.T) {
 	}
 	if name, _, _, _, ok := parseConfineScopeID(unmarked); !ok || name != "dr-suite" {
 		t.Fatalf("unmarked parse name=%q ok=%v id=%q", name, ok, unmarked)
-	}
-}
-
-func TestDelegateRAMScopeFallbackHasCompiledInDefault(t *testing.T) {
-	t.Setenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT", "not-a-size")
-	if got := delegateRAMScopeFallback(); got != DefaultDelegateRAMScopeCeiling {
-		t.Fatalf("fallback=%d want compiled default %d", got, DefaultDelegateRAMScopeCeiling)
 	}
 }
 

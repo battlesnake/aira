@@ -22,16 +22,14 @@ import (
 // independent adversarial plan reviews rejected it for three reasons that are
 // facts about this codebase, not opinions:
 //
-//  1. `maximum` (the value read from memory.max) has FOUR consumers in admission
-//     and only ONE is a capacity question. The other three are a TERMINAL
+//  1. `maximum` (the value read from memory.max) has several consumers in admission
+//     and only ONE is a capacity question. The others are a TERMINAL
 //     rejection (E_ADMIT_TOO_LARGE, admit.go:742/:863, which the runner does not
-//     retry) and two paths that size a job's OWN hard scope memory.max
-//     (resolveAdmitReserve's OOM-escalation clamp, resolveDelegateRAMScopeCeiling).
-//     A cgroupfs write cannot tell them apart: it moves one number all four read.
+//     retry) and the path that sizes a job's OWN hard scope memory.max
+//     (resolveAdmitReserve's OOM-escalation clamp).
+//     A cgroupfs write cannot tell them apart: it moves one number they all read.
 //     A throttled value reaching them turns "wait for pressure to ease" into a
-//     hard failure, and gives a delegate-ram suite a scope cap far below its
-//     default so it OOM-groups itself. Both are self-inflicted failures on
-//     legitimately admitted work.
+//     hard failure on legitimately admitted work.
 //  2. memory.max is a hard kernel cap. Any value written near memory.current puts
 //     the slice into continuous max-triggered reclaim as page cache refills the
 //     gap — manufacturing exactly the sustained-reclaim PSI that trips the
@@ -728,10 +726,10 @@ func (s *Server) sliceCeilingSnapshotFor(path string) sliceCeilingSnapshot {
 //	confineManagement    -> CeilingBytes       what a new job actually faces
 //
 // It must NOT reach admitConnection's own ceiling (admit.go), which feeds the
-// TERMINAL E_ADMIT_TOO_LARGE, resolveAdmitReserve's OOM-escalation clamp, and
-// resolveDelegateRAMScopeCeiling — all three of which decide something durable
-// about a job (whether it can EVER run, and how big its own hard scope cap is)
-// rather than whether there is room right now. A job too large for the throttled
+// TERMINAL E_ADMIT_TOO_LARGE and resolveAdmitReserve's OOM-escalation clamp —
+// both of which decide something durable about a job (whether it can EVER run,
+// and how big its own hard scope cap is) rather than whether there is room right
+// now. A job too large for the throttled
 // ceiling must WAIT, exactly as under ordinary contention, and its scope must be
 // sized from the real configured ceiling. Nor does it reach evaluateWorkerAdmit,
 // which is keyed by an aitest job's OUTER SCOPE rather than by the slice: that

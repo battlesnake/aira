@@ -487,7 +487,6 @@ func TestConfineReserveCLIParsesPinnedRequestAndHoldsUntilStdinClose(t *testing.
 func TestConfineReserveTranscriptionAndResolvedChargeAcrossFlagsAndEnvironment(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
-	const overhead = runner.DefaultDelegateRAMOverhead
 	for _, test := range []struct {
 		name             string
 		env              string
@@ -527,35 +526,37 @@ func TestConfineReserveTranscriptionAndResolvedChargeAcrossFlagsAndEnvironment(t
 			wantReserve: 0, wantPinned: false, wantMax: 16 << 20,
 			wantCharge: 16 << 20, wantChargePinned: true,
 		},
-		// Rows 4-6: delegate-ram. The last three are the AIRA-62 bug.
+		// Rows 4-6: delegate-ram. S2a §4/§16 collapsed `--delegate-ram` into an
+		// ordinary confine job, so each of these resolves EXACTLY as its non-delegate
+		// twin above: the CLI still transcribes the flags verbatim (--delegate-ram
+		// only sets DelegateRAM, which now gates aitest-coordinate publication and
+		// sibling worker placement, never the reserve), and the RESOLVER charges the
+		// same number a non-delegate request would.
 		{
-			name: "delegate honours an explicit reserve", env: "",
+			name: "delegate honours an explicit reserve, like any confine job", env: "",
 			argv:        []string{"confine", "--delegate-ram", "--memory-reserve", "512M", "--", "pytest"},
 			wantReserve: 512 << 20, wantPinned: true, wantDelegate: true,
 			wantCharge: 512 << 20, wantChargePinned: true,
 		},
 		{
-			// The ticket's reproduction: a 64x over-reservation before AIRA-62.
-			name: "delegate memory-max never overrides an explicit reserve", env: "",
+			// The retired `--delegate-ram --memory-max ... --memory-reserve` idiom:
+			// --memory-max now SETS the reserve to the cap, so the ledger charge is 32G.
+			name: "delegate memory-max SETS the reserve to the cap (retired idiom)", env: "",
 			argv:        []string{"confine", "--delegate-ram", "--memory-max", "32G", "--memory-reserve", "512M", "--", "pytest"},
 			wantReserve: 512 << 20, wantPinned: true, wantMax: 32 << 30, wantDelegate: true,
-			wantCharge: 512 << 20, wantChargePinned: true,
+			wantCharge: 32 << 30, wantChargePinned: true,
 		},
 		{
-			// A delegate cap is a containment CEILING, not a reserve, so with no
-			// declared reserve the charge is the framework overhead -- identical to a
-			// delegate job that passes no --memory-max at all.
-			name: "delegate memory-max alone charges the overhead not the cap", env: "",
+			name: "delegate memory-max alone up-charges the reserve to the cap", env: "",
 			argv:        []string{"confine", "--delegate-ram", "--memory-max", "32G", "--", "pytest"},
 			wantReserve: 0, wantPinned: false, wantMax: 32 << 30, wantDelegate: true,
-			wantCharge: overhead, wantChargePinned: true,
+			wantCharge: 32 << 30, wantChargePinned: true,
 		},
 		{
-			// Sol P2: the environment contract must survive under delegate-ram too.
-			name: "delegate memory-max never overrides an environment reserve", env: "8M",
+			name: "delegate memory-max up-charges over an environment reserve", env: "8M",
 			argv:        []string{"confine", "--delegate-ram", "--memory-max", "32G", "--", "pytest"},
 			wantReserve: 8 << 20, wantPinned: true, wantMax: 32 << 30, wantDelegate: true,
-			wantCharge: 8 << 20, wantChargePinned: true,
+			wantCharge: 32 << 30, wantChargePinned: true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -579,42 +580,6 @@ func TestConfineReserveTranscriptionAndResolvedChargeAcrossFlagsAndEnvironment(t
 				t.Fatalf("resolved charge=%d pinned=%v, want %d/%v", charge, chargePinned, test.wantCharge, test.wantChargePinned)
 			}
 		})
-	}
-}
-
-// The exact reproduction recorded in the AIRA-62 ticket body.
-//
-// Named for what it actually proves (build-review P2): this covers PARSE + RESOLVE --
-// the argv the ticket reports, transcribed into a ConfineRequest and run through the
-// production resolver. It does NOT prove the number reaches the daemon; runConfined is
-// mocked here. That last hop is covered in internal/runner by
-// TestConfineAdmitWireFrameCarriesTheResolvedChargeNotTheCap, which drives the real
-// admitConfine over a real socket and decodes the frame.
-//
-// verifies: AIRA-62 the reported argv resolves to the declared reserve, not the cap.
-func TestConfineDelegateRAMWithMemoryMaxResolvesTheReserveNotTheCap(t *testing.T) {
-	original := runConfined
-	t.Cleanup(func() { runConfined = original })
-	t.Setenv("AIRA_CONFINE_RESERVE", "")
-	var captured runner.ConfineRequest
-	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
-		captured = request
-		return runner.ConfineResult{}, nil
-	}
-	// `aira confine --delegate-ram --memory-max 32G --memory-reserve 512M` charged the
-	// admission ledger 32G, not the 512M the caller explicitly asked for (AIRA-62).
-	argv := []string{"confine", "--delegate-ram", "--memory-max", "32G", "--memory-reserve", "512M", "--", "make", "merge-gate"}
-	if exit := runWithInput(argv, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
-		t.Fatalf("exit=%d", exit)
-	}
-	charge, pinned := runner.ResolveConfineReserve(captured)
-	if charge != 512<<20 || !pinned {
-		t.Fatalf("ledger charge=%d pinned=%v, want %d pinned (the cap %d must not be charged)",
-			charge, pinned, int64(512<<20), int64(32<<30))
-	}
-	// The cap itself is untouched: AIRA-62 changes the CHARGE, never the containment.
-	if captured.ScopeMemoryMax != 32<<30 {
-		t.Fatalf("ScopeMemoryMax=%d, want %d", captured.ScopeMemoryMax, int64(32<<30))
 	}
 }
 

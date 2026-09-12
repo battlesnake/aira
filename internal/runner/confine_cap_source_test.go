@@ -28,7 +28,6 @@ func TestFormatConfineStatusRendersCapSource(t *testing.T) {
 		ConfineCapSourceMemoryMax,
 		ConfineCapSourceMemoryReserve,
 		ConfineCapSourceDaemonReserve,
-		ConfineCapSourceDelegateRAM,
 	} {
 		line := FormatConfineStatus(ConfineStatus{
 			Slice: "finite.slice", ScopeMemoryMax: 32 << 20,
@@ -56,7 +55,7 @@ func TestFormatConfineStatusRendersCapSource(t *testing.T) {
 	if !strings.Contains(unknown, "cap-source="+ConfineCapSourceUnevaluated) {
 		t.Fatalf("enforced cap with no recorded source = %q, want cap-source=%s", unknown, ConfineCapSourceUnevaluated)
 	}
-	for _, forbidden := range []string{ConfineCapSourceMemoryMax, ConfineCapSourceMemoryReserve, ConfineCapSourceDaemonReserve, ConfineCapSourceDelegateRAM} {
+	for _, forbidden := range []string{ConfineCapSourceMemoryMax, ConfineCapSourceMemoryReserve, ConfineCapSourceDaemonReserve} {
 		if strings.Contains(unknown, "cap-source="+forbidden) {
 			t.Fatalf("unrecorded source resolved to %q: %q", forbidden, unknown)
 		}
@@ -71,7 +70,6 @@ func TestConfineCapSourceIsOperator(t *testing.T) {
 		ConfineCapSourceMemoryMax:     true,
 		ConfineCapSourceMemoryReserve: true,
 		ConfineCapSourceDaemonReserve: false,
-		ConfineCapSourceDelegateRAM:   false,
 		ConfineCapSourceUnevaluated:   false,
 		"":                            false,
 		"operator":                    false,

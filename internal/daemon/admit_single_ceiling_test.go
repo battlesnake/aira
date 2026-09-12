@@ -72,27 +72,20 @@ func TestSingleCeilingRefusesWhenSumReserveExceedsCeiling(t *testing.T) {
 	})
 }
 
-// TestDelegateScopesAdmitOnDeclaredReserveNotContainmentCap pins the S3
-// loosening (owner-signed, design §14 DELETE list): a delegate scope is admitted
-// on its DECLARED reserve, and its containment cap (scopeCeiling, the AIRA-15
-// memory.max) plays no part in the fit-check. Three delegate suites on a 64 GiB
-// slice each declare 1 GiB and carry a 48 GiB scope ceiling: Σcap = 144 GiB,
-// which the retired AIRA-114 bound refused at its 2x default (128 GiB), while
-// Σreserve = 3 GiB fits the single ceiling, so the third suite is admitted.
+// TestDelegateScopesAdmitOnDeclaredReserveNotContainmentCap pins that admission
+// fits on the DECLARED reserve, not on any per-scope containment cap. Three
+// suites on a 64 GiB slice each declare 1 GiB: Σreserve = 3 GiB fits the single
+// ceiling, so the third suite is admitted. (Since S2a collapsed `--delegate-ram`
+// into an ordinary confine job there is no longer a distinct delegate scope
+// ceiling; the property — admission is reserve-based — is unchanged and still
+// worth pinning.)
 //
-// RED on the pre-S3 tree (30d0659): the aggregate bound refused the third suite.
 // The control arm keeps the test honest about WHICH gate it exercises: the same
 // third suite declaring more than the ceiling leaves is refused.
-//
-// Mutation-verified: re-introducing a cap-based fit term (charging the sum of
-// granted scope ceilings against the ceiling) reds the "Σcap over the ceiling
-// admits" arm while leaving the control arm and the scope-less single-ceiling
-// pin above unaffected.
 func TestDelegateScopesAdmitOnDeclaredReserveNotContainmentCap(t *testing.T) {
 	const (
 		maximum      = 64 * gib
 		suiteReserve = 1 * gib
-		suiteCap     = 48 * gib
 	)
 	build := func(t *testing.T, newcomerReserve int64) *admitWaiter {
 		t.Helper()
@@ -105,17 +98,17 @@ func TestDelegateScopesAdmitOnDeclaredReserveNotContainmentCap(t *testing.T) {
 			return 0, maximum, 0, true, ""
 		}
 		suiteA := &admitWaiter{
-			seq: 1, reserve: suiteReserve, scopeCeiling: suiteCap, scopeID: "CONFINE-suite-1-a@session-a",
+			seq: 1, reserve: suiteReserve, scopeID: "CONFINE-suite-1-a@session-a",
 			state: admitGranted, accounted: true,
 			grantedCh: make(chan struct{}), grantedAt: now.Add(-time.Hour),
 		}
 		suiteB := &admitWaiter{
-			seq: 2, reserve: suiteReserve, scopeCeiling: suiteCap, scopeID: "CONFINE-suite-2-b@session-b",
+			seq: 2, reserve: suiteReserve, scopeID: "CONFINE-suite-2-b@session-b",
 			state: admitGranted, accounted: true,
 			grantedCh: make(chan struct{}), grantedAt: now.Add(-time.Hour),
 		}
 		queued := &admitWaiter{
-			seq: 3, reserve: newcomerReserve, scopeCeiling: suiteCap, scopeID: "CONFINE-suite-3-c@session-c",
+			seq: 3, reserve: newcomerReserve, scopeID: "CONFINE-suite-3-c@session-c",
 			state: admitQueued, grantedCh: make(chan struct{}), enqueued: now,
 		}
 		queue := &sliceQueue{

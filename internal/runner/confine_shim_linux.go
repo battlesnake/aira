@@ -81,7 +81,7 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// sliceCap is 0: there is no slice cap to compare a container's declared
 	// --memory against. The daemon's own E_ADMIT_TOO_LARGE against the shim
 	// budget is what refuses an over-large charge, one gate instead of two.
-	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, request.DelegateRAM, 0)
+	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, 0)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {

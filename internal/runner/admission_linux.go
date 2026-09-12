@@ -25,14 +25,13 @@ func (systemClock) Now() time.Time                         { return time.Now() }
 func (systemClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 type admissionResult struct {
-	state        string
-	reason       string
-	waitedMS     int64
-	release      io.Closer
-	reserve      int64
-	ceiling      int64
-	scopeCeiling int64
-	basis        string
+	state    string
+	reason   string
+	waitedMS int64
+	release  io.Closer
+	reserve  int64
+	ceiling  int64
+	basis    string
 }
 
 var errDetachKillIntent = errors.New("detached run has a pending kill intent")
@@ -111,11 +110,10 @@ type runnerAdmitGrant struct {
 	Reserve  int64  `json:"reserve"`
 	// S5. Cpu echoes the granted CPU-core reservation, so the grant wire mirrors the
 	// {ram, cpu} request vector. Informational only — the client applies no cpu.max —
-	// and NOT part of validRunnerAdmitGrant: a 0-core grant (a delegate suite; §8) is
-	// legal, so a zero here must never be read as an invalid grant.
-	Cpu          int64  `json:"cpu,omitempty"`
-	Basis        string `json:"basis"`
-	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
+	// and NOT part of validRunnerAdmitGrant: a 0-core grant is legal, so a zero here
+	// must never be read as an invalid grant.
+	Cpu   int64  `json:"cpu,omitempty"`
+	Basis string `json:"basis"`
 }
 
 type runnerAdmitRejection struct {
@@ -375,11 +373,11 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "admit"
-	// S5. cpu is the second ledger resource on the CONFINE admission path. An ordinary
-	// `aira confine` AND an `aira confine-reserve` sub-reservation (confine_reserve_linux.go,
-	// no DelegateRAM) declare the one-core default (design §9); the daemon charges each
-	// against the per-slice 2×NumCPU ceiling at admission. A --delegate-ram job declares
-	// 0 cores (spec §8): it is framework overhead and charging it a core would double-count.
+	// S5. cpu is the second ledger resource on the CONFINE admission path. Every
+	// `aira confine` job — INCLUDING a `--delegate-ram` job since S2a collapsed it into
+	// an ordinary confine job (spec §4/§16) — and an `aira confine-reserve` sub-reservation
+	// declare the one-core default (design §9); the daemon charges each against the
+	// per-slice 2×NumCPU ceiling at admission.
 	//
 	// aitest pytest workers are bounded too, since S15: they reach the daemon via
 	// worker-admit, which now charges each worker's one core against the SAME per-slice
@@ -387,9 +385,6 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// only — no cpu.max is written. The S5 `cpu` arg's ProtocolVersion bump landed in S7:
 	// both DaemonProtocolVersion and daemon.ProtocolVersion are 10, in lockstep.
 	cpuCores := DefaultConfineCPUCores
-	if req.DelegateRAM {
-		cpuCores = 0
-	}
 	// S13: NO max_wait_ms. The admission wait no longer self-expires (design §4/§6):
 	// the client blocks until granted and reconnects across a daemon restart, bounding
 	// the wait by ctx cancellation, never by a daemon-side timeout. An absent
@@ -400,9 +395,6 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		"cpu":       cpuCores,
 		"signature": req.ResourceSignature,
 		"pinned":    !req.DaemonEstimateMemory || req.MemoryReservePinned,
-	}
-	if req.DelegateRAM {
-		frame.Request.Args["delegate_ram"] = true
 	}
 	if req.ConfineScopeID != "" {
 		frame.Request.Args["scope_id"] = req.ConfineScopeID
@@ -631,7 +623,7 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// daemon reads as the lease-releasing EOF. No transport deadline was ever set on
 	// this conn, so a held lease that outlives its admission wait is never torn down.
 	keeper := newLeaseKeeper(conn, req, grant, dial, r.admitSocketPath)
-	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: keeper, reserve: grant.Reserve, basis: grant.Basis, scopeCeiling: grant.ScopeCeiling}, true, nil
+	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: keeper, reserve: grant.Reserve, basis: grant.Basis}, true, nil
 }
 
 // warnDaemonWait emits the periodic "waiting for the daemon" line while the client

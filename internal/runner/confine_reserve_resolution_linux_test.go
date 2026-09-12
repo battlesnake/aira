@@ -68,35 +68,29 @@ func TestConfineReserveResolutionAcrossDelegateAndMemoryMax(t *testing.T) {
 			reserve: 64 << 20, pinned: true, max: 16 << 20,
 			wantCharge: 16 << 20, wantPinned: true, wantCap: 16 << 20,
 		},
-		// Delegate-ram: the AIRA-62 fix.
+		// S2a §4/§16: `--delegate-ram` collapsed to an ordinary confine job, so each
+		// row here behaves IDENTICALLY to its non-delegate twin above. The subtest
+		// below asserts that equivalence directly (delegate row == same request with
+		// DelegateRAM cleared).
 		{
-			name:       "delegate with no reserve pins the framework overhead",
+			name:       "delegate with no reserve takes the ordinary unpinned default, capped at the daemon reserve",
 			delegate:   true,
-			wantCharge: DefaultDelegateRAMOverhead, wantPinned: true, wantCap: 8 << 30,
+			wantCharge: DefaultConfineMemoryReserve, wantPinned: false, wantCap: DefaultConfineMemoryReserve,
 		},
 		{
-			name:     "delegate memory-max is a ceiling, never a charge",
+			name:     "delegate memory-max SETS the reserve to the cap (retired 512M idiom)",
 			delegate: true, max: 32 << 30,
-			wantCharge: DefaultDelegateRAMOverhead, wantPinned: true, wantCap: 32 << 30,
+			wantCharge: 32 << 30, wantPinned: true, wantCap: 32 << 30,
 		},
 		{
-			name:     "delegate honours a declared reserve under an explicit memory-max",
+			name:     "delegate memory-max over-rides a smaller declared reserve, exactly like non-delegate",
 			delegate: true, reserve: 512 << 20, pinned: true, max: 32 << 30,
-			wantCharge: 512 << 20, wantPinned: true, wantCap: 32 << 30,
-		},
-		// Value ordering (raised by the Sol plan-review lineage). Both over-book
-		// relative to the cap, which is the SAFE direction, and neither is clamped: a
-		// clamp would be new policy machinery for a case that already fails safe.
-		// Pinned here so the behaviour is known rather than accidental.
-		{
-			name:     "delegate cap below the overhead over-books rather than under-books",
-			delegate: true, max: 256 << 20,
-			wantCharge: DefaultDelegateRAMOverhead, wantPinned: true, wantCap: 256 << 20,
+			wantCharge: 32 << 30, wantPinned: true, wantCap: 32 << 30,
 		},
 		{
-			name:     "delegate declared reserve above the cap is honoured as asked",
-			delegate: true, reserve: 8 << 30, pinned: true, max: 2 << 30,
-			wantCharge: 8 << 30, wantPinned: true, wantCap: 2 << 30,
+			name:     "delegate declared reserve alone is charged and capped at itself",
+			delegate: true, reserve: 6 << 30, pinned: true,
+			wantCharge: 6 << 30, wantPinned: true, wantCap: 6 << 30,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -107,7 +101,7 @@ func TestConfineReserveResolutionAcrossDelegateAndMemoryMax(t *testing.T) {
 			deps.admit = func(_ context.Context, _ string, request ConfineRequest, reserve int64) (admissionResult, error) {
 				gotCharge, gotPinned = reserve, request.MemoryReservePinned
 				return admissionResult{
-					state: "immediate", reserve: reserve, scopeCeiling: 8 << 30,
+					state: "immediate", reserve: reserve,
 					basis: "pinned:client", release: &confineCountingCloser{},
 				}, nil
 			}
@@ -162,20 +156,10 @@ func TestResolveConfineReserveEdgeValues(t *testing.T) {
 			wantCharge: DefaultConfineMemoryReserve, wantPinned: true,
 		},
 		{
-			name:       "pinned with a zero reserve under delegate takes the overhead",
-			request:    ConfineRequest{MemoryReservePinned: true, DelegateRAM: true},
-			wantCharge: DefaultDelegateRAMOverhead, wantPinned: true,
-		},
-		{
 			// A negative reserve is not "declared": it takes the same path as zero.
 			name:       "negative reserve is treated as absent, not as a pin",
 			request:    ConfineRequest{MemoryReserve: -1},
 			wantCharge: DefaultConfineMemoryReserve, wantPinned: false,
-		},
-		{
-			name:       "negative reserve under delegate takes the pinned overhead",
-			request:    ConfineRequest{MemoryReserve: -1, DelegateRAM: true},
-			wantCharge: DefaultDelegateRAMOverhead, wantPinned: true,
 		},
 		{
 			// A negative cap is ABSENT, not present-and-small: it must not up-charge.
@@ -205,6 +189,55 @@ func TestResolveConfineReserveEdgeValues(t *testing.T) {
 	}
 }
 
+// S2a Task 7 (spec §4/§16): `--delegate-ram` collapses to an ordinary confine job.
+// The reserve resolver must no longer special-case DelegateRAM at all — no pinned
+// 512 MiB framework overhead, and --memory-max SETS the reserve exactly as it does
+// for any confine job (the retired `--delegate-ram --memory-reserve 512M` idiom).
+//
+// verifies: S2a-T7 delegate reserve == ordinary reserve.
+func TestDelegateRAMReserveCollapsesToOrdinary(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		request    ConfineRequest
+		wantCharge int64
+		wantPinned bool
+	}{
+		{
+			name:       "delegate with no reserve takes the ordinary no-history default, UNPINNED",
+			request:    ConfineRequest{DelegateRAM: true},
+			wantCharge: DefaultConfineMemoryReserve, wantPinned: false,
+		},
+		{
+			name:       "delegate --memory-max SETS the reserve to the cap, pinned (retired 512M idiom)",
+			request:    ConfineRequest{DelegateRAM: true, ScopeMemoryMax: 512 << 20},
+			wantCharge: 512 << 20, wantPinned: true,
+		},
+		{
+			name:       "delegate declared reserve is charged verbatim like any confine job",
+			request:    ConfineRequest{DelegateRAM: true, MemoryReserve: 6 << 30, MemoryReservePinned: true},
+			wantCharge: 6 << 30, wantPinned: true,
+		},
+		{
+			name:       "delegate and non-delegate resolve identically for the same inputs",
+			request:    ConfineRequest{DelegateRAM: true, ScopeMemoryMax: 16 << 20},
+			wantCharge: 16 << 20, wantPinned: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			charge, pinned := ResolveConfineReserve(test.request)
+			if charge != test.wantCharge || pinned != test.wantPinned {
+				t.Fatalf("charge=%d pinned=%v, want %d/%v", charge, pinned, test.wantCharge, test.wantPinned)
+			}
+			ordinary := test.request
+			ordinary.DelegateRAM = false
+			oc, op := ResolveConfineReserve(ordinary)
+			if oc != charge || op != pinned {
+				t.Fatalf("delegate resolved %d/%v but the same non-delegate request resolved %d/%v", charge, pinned, oc, op)
+			}
+		})
+	}
+}
+
 // AIRA-62. The table above stops at deps.admit; this drives the REAL admitConfine
 // against a fake daemon and asserts the decoded wire frame, closing the last link:
 // confineWithDeps overwrites request.MemoryReservePinned with the resolved value ->
@@ -223,17 +256,18 @@ func TestConfineAdmitWireFrameCarriesTheResolvedChargeNotTheCap(t *testing.T) {
 		wantPinned bool
 	}{
 		{
-			// The ticket's reproduction, as it reaches the daemon.
-			name: "delegate memory-max puts the overhead on the wire, not the 32G cap",
+			// S2a §4/§16: a delegate --memory-max now SETS the reserve to the cap and
+			// reaches the daemon pinned, exactly like a non-delegate --memory-max.
+			name: "delegate memory-max puts the cap on the wire, pinned",
 			request: ConfineRequest{
 				DelegateRAM: true, ScopeMemoryMax: 32 << 30,
 			},
-			wantCharge: DefaultDelegateRAMOverhead, wantPinned: true,
+			wantCharge: 32 << 30, wantPinned: true,
 		},
 		{
-			name: "delegate declared reserve reaches the wire verbatim",
+			name: "delegate declared reserve reaches the wire verbatim (no --memory-max)",
 			request: ConfineRequest{
-				DelegateRAM: true, MemoryReserve: 512 << 20, MemoryReservePinned: true, ScopeMemoryMax: 32 << 30,
+				DelegateRAM: true, MemoryReserve: 512 << 20, MemoryReservePinned: true,
 			},
 			wantCharge: 512 << 20, wantPinned: true,
 		},
@@ -275,7 +309,7 @@ func TestConfineAdmitWireFrameCarriesTheResolvedChargeNotTheCap(t *testing.T) {
 				frames <- frame.Request.Args
 				granted, _ := frame.Request.Args["reserve"].(float64)
 				data, _ := json.Marshal(runnerAdmitGrant{
-					State: "immediate", Reserve: int64(granted), Basis: "pinned:client", ScopeCeiling: 8 << 30,
+					State: "immediate", Reserve: int64(granted), Basis: "pinned:client",
 				})
 				_ = writeRunnerAdmitFrame(conn, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
 				// The grant is held for the life of the connection; block until the
