@@ -63,7 +63,16 @@ func StripAitestEnvironment(env []string) []string {
 // An empty outerScope or admission is honest, not fatal: the supervisor's own
 // bootstrap disables daemon-backed admission with one warning and falls back to
 // its bare-fork pool, the same disposition a failed bootstrap always took.
-func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, workerAdmitCommand, outerScope, admission string) []string {
+//
+// parentCapFinite caps that bare-fork fallback pool. The fallback runs workers
+// UNCONFINED, directly inside the parent scope; since S2a sizes that scope for
+// the supervisor and framework only (workers reserve individually as sibling
+// scopes), a finite parent cap cannot hold N concurrent unconfined workers, so
+// they are limited to ONE — otherwise the pool would group-OOM the whole job.
+// With no finite parent cap (an unpinned, non-daemon-admitted launch, or ci-shim
+// with no cgroup at all) there is nothing to over-run, so the pool keeps its
+// NumCPU bound.
+func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, workerAdmitCommand, outerScope, admission string, parentCapFinite bool) []string {
 	result := StripAitestEnvironment(env)
 	if strings.TrimSpace(runtimeDir) == "" || strings.TrimSpace(workerAdmitCommand) == "" {
 		return result
@@ -79,9 +88,13 @@ func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics i
 		})
 		return result
 	}
+	fallbackWorkers := runtime.NumCPU()
+	if parentCapFinite {
+		fallbackWorkers = 1
+	}
 	result = upsertChildEnv(result, "AIRA_AITEST_LIB", aitestDir)
 	result = upsertChildEnv(result, "AIRA_AITEST_WORKER_ADMIT_CMD", workerAdmitCommand)
-	result = upsertChildEnv(result, "AIRA_AITEST_MAX_WORKERS_FALLBACK", strconv.Itoa(runtime.NumCPU()))
+	result = upsertChildEnv(result, "AIRA_AITEST_MAX_WORKERS_FALLBACK", strconv.Itoa(fallbackWorkers))
 	if scope := strings.TrimSpace(outerScope); scope != "" {
 		result = upsertChildEnv(result, "AIRA_AITEST_OUTER_SCOPE", scope)
 	}

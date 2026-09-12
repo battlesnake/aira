@@ -319,7 +319,10 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		if executable, executableErr := filepath.EvalSymlinks(self); executableErr == nil {
 			aitestCommand = executable
 		}
-		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, aitestCommand, ShimConfineSlice, AitestAdmissionLedgerOnly)
+		// parentCapFinite=false: ci-shim has no cgroup and no scope memory.max, so
+		// there is no parent cap for a fallback pool to over-run; keep the NumCPU
+		// bound.
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, aitestCommand, ShimConfineSlice, AitestAdmissionLedgerOnly, false)
 		// Said on the launch that is affected, not only in a daemon log. The
 		// whole risk AIRA-121 named -- a suite running under an apparent
 		// governance mechanism, "invisible until something OOMs" -- is closed by

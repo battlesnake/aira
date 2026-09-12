@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1971,6 +1972,47 @@ func TestConfineDelegateRAMNamespacesTheParentSignature(t *testing.T) {
 	}
 	if !strings.HasSuffix(delegate, plain) {
 		t.Fatalf("delegate signature %q must be the plain signature %q under the namespace prefix", delegate, plain)
+	}
+}
+
+// TestConfineDelegateRAMFallbackCapUnderAFiniteParentCap: the daemon-down
+// fallback pool runs UNCONFINED workers directly inside the parent scope. Since
+// S2a sizes that scope for the supervisor and framework only (its workers are
+// sibling scopes with their own reserves), N concurrent unconfined fallback
+// workers would group-OOM the whole job. So under a FINITE parent cap the
+// launcher publishes AIRA_AITEST_MAX_WORKERS_FALLBACK=1; with no cap (an
+// unpinned, non-daemon-admitted delegate launch, deliberately left uncapped) it
+// keeps the NumCPU bound, where the parent cap cannot be over-run.
+func TestConfineDelegateRAMFallbackCapUnderAFiniteParentCap(t *testing.T) {
+	fallbackFor := func(t *testing.T, req ConfineRequest) string {
+		t.Helper()
+		t.Setenv("XDG_DATA_HOME", t.TempDir())
+		scope := &confineFakeScope{}
+		deps := confineUnitDeps(scope)
+		deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+		var stdout bytes.Buffer
+		req.Slice = "finite.slice"
+		req.DelegateRAM = true
+		req.Name = "pytest"
+		req.Argv = reportChildEnv("AIRA_AITEST_MAX_WORKERS_FALLBACK")
+		req.RuntimeDir = t.TempDir()
+		req.SelfPath = os.Args[0]
+		req.Stdout = &stdout
+		req.Stderr = io.Discard
+		result, err := confineWithDeps(context.Background(), req, deps)
+		if err != nil || result.Exit != 0 {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		return stdout.String()
+	}
+	// A pinned declared reserve becomes the scope memory.max: a finite parent cap.
+	if got := fallbackFor(t, ConfineRequest{MemoryReserve: 1 << 30, MemoryReservePinned: true}); got != "1" {
+		t.Fatalf("finite-cap delegate fallback = %q, want \"1\"", got)
+	}
+	// Unpinned and not daemon-admitted: the scope is deliberately uncapped, so the
+	// fallback pool keeps its NumCPU bound.
+	if got := fallbackFor(t, ConfineRequest{}); got != strconv.Itoa(runtime.NumCPU()) {
+		t.Fatalf("uncapped delegate fallback = %q, want NumCPU %d", got, runtime.NumCPU())
 	}
 }
 

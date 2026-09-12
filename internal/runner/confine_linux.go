@@ -1120,7 +1120,10 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// `aitest-bootstrap` verb rediscovering it from the supervisor's own
 		// current cgroup. AitestAdmissionSubScope names the per-worker admission
 		// grade this real launch backs — enforced cgroup sub-scopes.
-		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand, scope.Reference(), AitestAdmissionSubScope)
+		// parentCapFinite: a finite scope memory.max was written (997) above, so
+		// the daemon-down fallback pool must cap at one unconfined worker rather
+		// than group-OOM the parent-sized scope.
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand, scope.Reference(), AitestAdmissionSubScope, scopeMemoryMax > 0)
 	} else {
 		// Strip unconditionally, not just skip appending (Fable build-review,
 		// final gate): AppendAitestChildEnvironment was previously called

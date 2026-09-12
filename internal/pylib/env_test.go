@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -175,7 +177,7 @@ func TestAppendAitestChildEnvironmentInjectsAndStripsStaleKeys(t *testing.T) {
 		"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
 		"AIRA_AITEST_OUTER_SCOPE=/stale/scope",
 	}
-	got := childEnvValues(t, AppendAitestChildEnvironment(inherited, runtimeDir, nil, "/opt/aira", "/sys/fs/cgroup/aira.slice/.aira-CONFINE-x", "cgroup-sub-scope"))
+	got := childEnvValues(t, AppendAitestChildEnvironment(inherited, runtimeDir, nil, "/opt/aira", "/sys/fs/cgroup/aira.slice/.aira-CONFINE-x", "cgroup-sub-scope", false))
 	if got["AIRA_AITEST_LIB"] == "" || got["AIRA_AITEST_LIB"] == "/stale" {
 		t.Fatalf("AIRA_AITEST_LIB=%q", got["AIRA_AITEST_LIB"])
 	}
@@ -200,6 +202,25 @@ func TestAppendAitestChildEnvironmentInjectsAndStripsStaleKeys(t *testing.T) {
 	}
 }
 
+// TestAppendAitestChildEnvironmentCapsFallbackUnderAFiniteParentCap: the
+// daemon-down fallback pool is capped at one UNCONFINED worker under a finite
+// parent cap (it runs inside the parent scope, which S2a sizes for the
+// supervisor + framework only, so N concurrent workers would group-OOM the job),
+// and keeps the NumCPU bound when there is no cap to over-run.
+func TestAppendAitestChildEnvironmentCapsFallbackUnderAFiniteParentCap(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	base := []string{"PATH=/bin"}
+	finite := childEnvValues(t, AppendAitestChildEnvironment(base, runtimeDir, nil, "/opt/aira", "/scope", "cgroup-sub-scope", true))
+	if finite["AIRA_AITEST_MAX_WORKERS_FALLBACK"] != "1" {
+		t.Fatalf("finite parent cap: AIRA_AITEST_MAX_WORKERS_FALLBACK=%q, want \"1\"", finite["AIRA_AITEST_MAX_WORKERS_FALLBACK"])
+	}
+	uncapped := childEnvValues(t, AppendAitestChildEnvironment(base, runtimeDir, nil, "/opt/aira", "/scope", "cgroup-sub-scope", false))
+	if uncapped["AIRA_AITEST_MAX_WORKERS_FALLBACK"] != strconv.Itoa(runtime.NumCPU()) {
+		t.Fatalf("no parent cap: AIRA_AITEST_MAX_WORKERS_FALLBACK=%q, want NumCPU %d", uncapped["AIRA_AITEST_MAX_WORKERS_FALLBACK"], runtime.NumCPU())
+	}
+}
+
 // TestAppendAitestChildEnvironmentOmitsAnUnknownOuterScope: a blank scope must
 // leave no key behind at all — not an empty AIRA_AITEST_OUTER_SCOPE=, which the
 // supervisor would read as a set-but-empty coordinate rather than the honest
@@ -210,7 +231,7 @@ func TestAppendAitestChildEnvironmentOmitsAnUnknownOuterScope(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	got := childEnvValues(t, AppendAitestChildEnvironment(
 		[]string{"PATH=/bin", "AIRA_AITEST_OUTER_SCOPE=/stale/scope"},
-		filepath.Join(t.TempDir(), "runtime"), nil, "/opt/aira", "   ", "cgroup-sub-scope"))
+		filepath.Join(t.TempDir(), "runtime"), nil, "/opt/aira", "   ", "cgroup-sub-scope", false))
 	if _, present := got["AIRA_AITEST_OUTER_SCOPE"]; present {
 		t.Fatalf("blank outer scope was published: %v", got)
 	}
@@ -224,11 +245,11 @@ func TestAppendAitestChildEnvironmentEmptyArgsAreSideEffectFree(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", dataHome)
 	input := []string{"PATH=/bin", "AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira"}
 
-	byEmptyRuntimeDir := AppendAitestChildEnvironment(input, "", nil, "/opt/aira", "/scope", "cgroup-sub-scope")
+	byEmptyRuntimeDir := AppendAitestChildEnvironment(input, "", nil, "/opt/aira", "/scope", "cgroup-sub-scope", false)
 	if strings.Join(byEmptyRuntimeDir, "\x00") != "PATH=/bin" {
 		t.Fatalf("empty runtimeDir retained aitest environment: %v", byEmptyRuntimeDir)
 	}
-	byEmptyCommand := AppendAitestChildEnvironment(input, filepath.Join(t.TempDir(), "runtime"), nil, "", "/scope", "cgroup-sub-scope")
+	byEmptyCommand := AppendAitestChildEnvironment(input, filepath.Join(t.TempDir(), "runtime"), nil, "", "/scope", "cgroup-sub-scope", false)
 	if strings.Join(byEmptyCommand, "\x00") != "PATH=/bin" {
 		t.Fatalf("empty workerAdmitCommand retained aitest environment: %v", byEmptyCommand)
 	}
@@ -248,8 +269,8 @@ func TestAppendAitestChildEnvironmentSkipsEverythingOnExtractionFailure(t *testi
 	})
 	input := []string{"PATH=/bin", "AIRA_AITEST_LIB=/stale", "AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira"}
 	var diagnostics bytes.Buffer
-	first := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira", "/scope", "cgroup-sub-scope")
-	second := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira", "/scope", "cgroup-sub-scope")
+	first := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira", "/scope", "cgroup-sub-scope", false)
+	second := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira", "/scope", "cgroup-sub-scope", false)
 	for _, got := range [][]string{first, second} {
 		values := childEnvValues(t, got)
 		if len(values) != 1 || values["PATH"] != "/bin" {
