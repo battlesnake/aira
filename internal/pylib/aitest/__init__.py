@@ -28,6 +28,17 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    # AIRA-230 (v0.7 S1 / v7-2): register the aira_mem marker. This MUST precede
+    # the --aitest-workers early return below: a plain `pytest` run (no
+    # --aitest-workers) hits that return, and if registration were after it the
+    # marker would be unregistered -- so a --strict-markers suite annotated with
+    # @pytest.mark.aira_mem would fail collection on an ordinary, non-aitest run.
+    # It also makes the marker appear in `pytest --markers`.
+    config.addinivalue_line(
+        "markers",
+        "aira_mem(size): declares the test's incremental peak RSS on top of the "
+        "worker warm-import baseline",
+    )
     workers_option = config.getoption("aitest_workers")
     if workers_option is None:
         return
@@ -35,6 +46,52 @@ def pytest_configure(config):
     # Real activation (pytest_runtestloop) is wired in Task 17; this task
     # only establishes the flag and its inert default.
     return
+
+
+def _aira_mem_bytes_for_item(item, default):
+    """Resolve one collected test item's aira_mem annotation to a byte count.
+
+    Returns (bytes, warning). `warning` is None both on success and for an
+    unannotated item (which silently takes `default` -- unannotated is not a
+    mistake, exactly as an unset AIRA_AITEST_ESTIMATED_BYTES is not). `warning`
+    is a ready-to-write stderr string, and `bytes` is `default`, when the marker
+    is MALFORMED -- no positional argument, more than one, or an argument that
+    does not parse under the shared size grammar. A malformed marker is never
+    silently swallowed (the AIRA-223 discipline); the caller writes the returned
+    warning at most once per nodeid.
+
+    `aira_mem` declares a test's INCREMENTAL peak RSS (spec 4.1). This reader is
+    a DOCUMENTED-INERT foundation in S1 (plan D5): the value is stored in the
+    supervisor's nodeid->bytes map but drives no admission sizing yet -- the
+    per-class consumer is S2.
+    """
+    marker = item.get_closest_marker("aira_mem")
+    if marker is None:
+        return default, None
+    if len(marker.args) != 1:
+        kwargs_note = (
+            " (aira_mem takes a single positional size, not keyword arguments)"
+            if marker.kwargs else ""
+        )
+        return default, (
+            "aira aitest: %s has @pytest.mark.aira_mem with %d positional "
+            "argument(s)%s; it takes exactly one size string or byte count "
+            '(e.g. aira_mem("512M")). Using the %d-byte default.\n'
+            % (item.nodeid, len(marker.args), kwargs_note, default)
+        )
+    raw = marker.args[0]
+    # spec 4.1: "a bare int is bytes". _parse_estimated_bytes strips a STRING, so
+    # a bare-int (or any non-str) argument must be str()-ed first --
+    # str(536870912) == "536870912" parses back to the same byte count.
+    value, ok = _parse_estimated_bytes(str(raw))
+    if not ok or value <= 0:
+        return default, (
+            "aira aitest: %s has @pytest.mark.aira_mem(%r), which is not a valid "
+            "size; use a byte count or a 1024-based size like 512M / 1.5G / 512MiB "
+            "(K/M/G/T are powers of 1024). Using the %d-byte default.\n"
+            % (item.nodeid, raw, default)
+        )
+    return value, None
 
 
 def pytest_runtestloop(session):

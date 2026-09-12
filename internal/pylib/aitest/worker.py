@@ -295,6 +295,39 @@ def _should_recycle(scope_path, started_at, completed_count):
     return (current * 100.0 / limit) > watermark_pct
 
 
+def _record_memory_sample(scope_path, nodeid, completed_count):
+    """AIRA-230 v7-4: append one per-test memory.current sample to a per-worker
+    TSV under AIRA_AITEST_MEASURE_DIR, for the fast-suite residue / watermark /
+    MAX_TESTS fork (spec OD4). This is the SAME read _should_recycle already makes
+    for the watermark (memory.current on the worker's own scope); it is retained
+    here only when the measurement report is enabled, not a new time-series
+    sampler (plan OVER-BUILD note).
+
+    OPT-IN: a no-op unless AIRA_AITEST_MEASURE_DIR is set, so a normal run pays
+    nothing. FAIL-SILENT: advisory telemetry must never break a worker (a broken
+    worker turns a passing test unevaluated). HONEST: memory.current is written as
+    'unevaluated' -- never a fabricated 0 -- for a worker with no cgroup scope
+    (ledger-only / fallback, scope_path is None) or an unreadable file."""
+    measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "")
+    if not measure_dir.strip():
+        return
+    current = None
+    if scope_path is not None:
+        try:
+            current = _read_cgroup_int(scope_path, "memory.current")
+        except (OSError, ValueError):
+            current = None
+    try:
+        path = os.path.join(measure_dir, "worker-%d.tsv" % os.getpid())
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "%s\t%s\t%d\n"
+                % (nodeid, "unevaluated" if current is None else current, completed_count)
+            )
+    except OSError:
+        pass
+
+
 def fork_worker(scope_path):
     """Forks. In the child, places itself into scope_path's cgroup before
     returning, UNLESS scope_path is None. Returns (pid, in_child: bool).
@@ -532,6 +565,10 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
         item = items_by_nodeid[nodeid]
         outcome, events = run_one(item)
         completed_count += 1
+        # AIRA-230 v7-4: retain this test's memory.current for the measurement
+        # report (opt-in, fail-silent). Before _should_recycle so a worker that
+        # recycles on THIS test still records the sample that motivated it.
+        _record_memory_sample(scope_path, nodeid, completed_count)
         recycling = _should_recycle(scope_path, started_at, completed_count)
         # Every event line goes out BEFORE this nodeid's plain result line,
         # into the same stream, with ONE flush after the result line: the

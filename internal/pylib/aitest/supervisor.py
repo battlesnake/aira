@@ -165,6 +165,13 @@ _OUTER_CAP_ALLOWANCE_BASE = 64 << 20        # 64 MiB supervisor-process starting
 _OUTER_CAP_ALLOWANCE_PER_RELAY = 8 << 20    # 8 MiB per live relay starting point
 _OUTER_CAP_MARGIN = 32 << 20                # 32 MiB safety band starting point
 
+# AIRA-230 (v0.7 S1 / v7-2). The per-test annotation default for a nodeid with no
+# aira_mem marker: the *incremental* peak RSS assumed on top of the warm-import
+# baseline (spec 4.1). 256 MiB is a STARTING POINT, NOT a measured value -- v7-4
+# measures the COW baseline and sets it (spec OD4); do not treat it as load-bearing.
+# Overridable via AIRA_AITEST_DEFAULT_BYTES through the shared size grammar.
+_DEFAULT_ANNOTATION_BYTES = 256 << 20
+
 
 def _env_bytes(name, default):
     """A byte-count tunable override using the shared AIRA_AITEST_ESTIMATED_BYTES
@@ -769,6 +776,10 @@ class Supervisor:
         self._admission_terminal_warned = False
         self._pidfd_warned = set()
         self.items_by_nodeid = {}
+        # AIRA-230 v7-2: nodeid -> incremental-peak-RSS bytes, from each item's
+        # aira_mem marker (or the default). Built in collect(); DOCUMENTED-INERT
+        # in S1 -- no admission consumer yet (plan D5). Empty until collect() runs.
+        self.aira_mem_bytes = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -786,6 +797,12 @@ class Supervisor:
         self._pool_budget = None
         self._pool_peak_samples = 0
         self._pool_scoped_workers = 0
+        # AIRA-230 v7-4. Per-worker (peak, cap, oom) records RETAINED for the
+        # measurement report -- a pool MAX alone cannot size per-worker headroom
+        # or the S2 ladder, which need the distribution. Same reads as the AIRA-180
+        # max above, kept not collapsed, and ONLY materialised when the report is
+        # enabled (AIRA_AITEST_MEASURE_DIR) so a normal run pays nothing.
+        self._pool_peak_records = []
         # AIRA-64 growth probe bookkeeping.
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
@@ -891,6 +908,22 @@ class Supervisor:
         cross the dispatch/result pipes (Task 13)."""
         self.items_by_nodeid = {item.nodeid: item for item in items}
         self.queue = [item.nodeid for item in items]
+        # AIRA-230 v7-2: read each item's aira_mem annotation into a nodeid->bytes
+        # map alongside items_by_nodeid (inherited by forked workers via COW).
+        # DOCUMENTED-INERT in S1: built but with NO admission consumer -- per-class
+        # worker sizing reads it in S2 (plan D5). Unannotated (and malformed-marker)
+        # nodeids take AIRA_AITEST_DEFAULT_BYTES (256 MiB starting point; v7-4 sets
+        # it). Local import mirrors _env_bytes: __init__ imports Supervisor only
+        # inside a function, so the package is fully initialised here.
+        from aitest import _aira_mem_bytes_for_item
+        default_bytes = _env_bytes("AIRA_AITEST_DEFAULT_BYTES", _DEFAULT_ANNOTATION_BYTES)
+        mem_map = {}
+        for item in items:
+            value, warning = _aira_mem_bytes_for_item(item, default_bytes)
+            mem_map[item.nodeid] = value
+            if warning is not None:
+                sys.stderr.write(warning)
+        self.aira_mem_bytes = mem_map
 
     def next_nodeid(self):
         if not self.queue:
@@ -1987,8 +2020,24 @@ class Supervisor:
             self._pool_peak_samples += 1
             if self._pool_peak_max is None or peak > self._pool_peak_max:
                 self._pool_peak_max = peak
-        if _scope_oom_group_killed(scope):
+        scope_oom = _scope_oom_group_killed(scope)
+        if scope_oom:
             self._pool_peak_oom = True
+        # AIRA-230 v7-4: retain this worker's (peak, cap, oom) for the measurement
+        # report, ONLY when enabled. The cap is coerced from the grant's memory_max,
+        # which a REAL enforced grant carries as a STRING (the worker-admit outcome
+        # parser stores every field as a string; v7-1 learned this the hard way) --
+        # None where it cannot be read, NEVER a fabricated 0. This deliberately does
+        # NOT touch the AIRA-180 _pool_budget gauge above (its string-cap behaviour
+        # is AIRA-231, out of this slice's scope).
+        if os.environ.get("AIRA_AITEST_MEASURE_DIR", "").strip():
+            cap = memory_max
+            if not isinstance(cap, int):
+                try:
+                    cap = int(str(cap).strip())
+                except (TypeError, ValueError):
+                    cap = None
+            self._pool_peak_records.append({"peak": peak, "memory_max": cap, "oom": scope_oom})
 
     def _pool_subject_key(self):
         """This pool's durable subject key: the pytest rootdir followed by the
@@ -2068,6 +2117,82 @@ class Supervisor:
             )
         except (OSError, subprocess.SubprocessError):
             pass
+
+    def _emit_measurement_report(self):
+        """AIRA-230 v7-4: write this run's structured measurement report when
+        AIRA_AITEST_MEASURE_DIR is set, for the committed harness that fixes
+        v0.7's tunables (the 256 MiB default, the per-worker headroom, the
+        outer-cap allowance base/per_relay + margin, the watermark fraction, the
+        MAX_TESTS fork).
+
+        OPT-IN (a no-op unless the env is set; a normal run pays nothing) and
+        FAIL-OPEN (advisory telemetry must never fail a suite). HONEST: every
+        value the kernel does not expose is written as "unevaluated", NEVER a
+        fabricated 0 -- a zero peak would make a pool look infinitely
+        over-provisioned to whatever reads this.
+
+        Reuses the reads the pool already makes (the AIRA-180 per-worker
+        memory.peak/oom at retirement, retained per-worker in
+        _pool_peak_records) and adds exactly ONE new read: the supervisor's own
+        .aira-supervisor/memory.peak at full pool, which sets the outer-cap
+        ALLOWANCE (the uncapped supervisor process charges the outer cap). Called
+        after _report_pool_usage and BEFORE _cleanup_supervisor_scope, while
+        self.supervisor_scope still exists to be read."""
+        measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "")
+        if not measure_dir.strip():
+            return
+
+        def honest(value):
+            return value if value is not None else "unevaluated"
+
+        supervisor_peak = None
+        if self.supervisor_scope:
+            supervisor_peak = _read_cgroup_int(
+                os.path.join(self.supervisor_scope, "memory.peak")
+            )
+
+        report = {
+            # The ONE new read: sets outer_cap_allowance base + per_relay (§8).
+            "supervisor_peak_rss": honest(supervisor_peak),
+            # Per-worker peak/cap/oom reads the pool already made at retirement.
+            "worker_peak_rss_max": honest(self._pool_peak_max),
+            "worker_peak_rss_samples": [
+                {
+                    "peak": honest(record["peak"]),
+                    "memory_max": honest(record["memory_max"]),
+                    # honest() here too: _scope_oom_group_killed returns None when
+                    # the scope's memory.events could not settle it -- that is
+                    # "unevaluated", not a fake "not OOM-killed".
+                    "oom": honest(record["oom"]),
+                }
+                for record in self._pool_peak_records
+            ],
+            "worker_peak_rss_sample_count": self._pool_peak_samples,
+            "scoped_workers": self._pool_scoped_workers,
+            # The AIRA-180 pool budget gauge as-is (AIRA-231 may leave it unset on
+            # a real run; reported honestly rather than papered over here).
+            "worker_budget": honest(self._pool_budget),
+            "oom_group_killed": self._pool_peak_oom,
+            # The guard constants in effect, so the report ties measured
+            # supervisor/worker RSS to the tunables it exists to set (v7-1).
+            "outer_cap_allowance_base": self._outer_cap_base,
+            "outer_cap_allowance_per_relay": self._outer_cap_per_relay,
+            "outer_cap_margin": self._outer_cap_margin,
+        }
+        try:
+            os.makedirs(measure_dir, exist_ok=True)
+            with open(
+                os.path.join(measure_dir, "pool-report.json"), "w", encoding="utf-8"
+            ) as handle:
+                json.dump(report, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        except OSError as exc:
+            # Fail-open: the suite already ran; a report we could not write is a
+            # telemetry gap, not a test failure. One honest notice, never a raise.
+            sys.stderr.write(
+                "aira aitest: could not write measurement report under %s: %s\n"
+                % (measure_dir, exc)
+            )
 
     def _forget_worker_scope(self, scope):
         """Remove one worker's cgroup scope directory, remembering it for a hygiene
@@ -2844,6 +2969,10 @@ class Supervisor:
         # folded its usage in, and before _cleanup_supervisor_scope so a slow
         # relay cannot delay the rmdir retry. Fail-open: see _report_pool_usage.
         self._report_pool_usage()
+        # AIRA-230 v7-4: after _report_pool_usage (every worker has folded its
+        # usage in) and BEFORE _cleanup_supervisor_scope (which rmdirs the
+        # supervisor scope, taking its memory.peak with it). Opt-in + fail-open.
+        self._emit_measurement_report()
         self._cleanup_supervisor_scope()
         # ONE structurally complete pass, after every other path has had its
         # say -- see _synthesize_unevaluated_reports for why this is a single
