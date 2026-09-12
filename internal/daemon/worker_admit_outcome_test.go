@@ -25,14 +25,14 @@ func TestWorkerAdmitClassifiesDeterministicOutcomes(t *testing.T) {
 			name: "slice read failure is retriable",
 			configure: func(s *Server) map[string]any {
 				s.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 0, 0, false, "read-error" }
-				return workerArgs("/slice/.aira-suite", workerTestMiB, false, 0)
+				return workerArgs(workerTestOuterScope, workerTestMiB, false, 0)
 			},
 			wantState: runner.WorkerAdmitStateUnevaluated, wantClass: runner.WorkerAdmitClassContended,
 			wantReason: runner.WorkerAdmitReasonOuterScopeUnreadable,
 		},
 		{
 			name:      "a request larger than the whole ceiling is permanent",
-			configure: func(s *Server) map[string]any { return workerArgs("/slice/.aira-suite", 5*workerTestMiB, false, 0) },
+			configure: func(s *Server) map[string]any { return workerArgs(workerTestOuterScope, 5*workerTestMiB, false, 0) },
 			wantState: runner.WorkerAdmitStateDenied, wantClass: runner.WorkerAdmitClassRequestInvalid,
 			wantReason: runner.WorkerAdmitReasonExceedsCeiling,
 		},
@@ -42,20 +42,20 @@ func TestWorkerAdmitClassifiesDeterministicOutcomes(t *testing.T) {
 				s.workerScopeCreate = func(context.Context, string, string, int64) (string, string, error) {
 					return "", "", errWorkerCreateBoom
 				}
-				return workerArgs("/slice/.aira-suite", workerTestMiB, false, 0)
+				return workerArgs(workerTestOuterScope, workerTestMiB, false, 0)
 			},
 			wantState: runner.WorkerAdmitStateDenied, wantClass: runner.WorkerAdmitClassRequestInvalid,
 			wantReason: runner.WorkerAdmitReasonWorkerScopeCreateFailed,
 		},
 		{
 			name:      "a non-blocking probe reports a snapshot",
-			configure: func(s *Server) map[string]any { return workerArgs("/slice/.aira-suite", workerTestMiB, true, 0) },
+			configure: func(s *Server) map[string]any { return workerArgs(workerTestOuterScope, workerTestMiB, true, 0) },
 			wantState: runner.WorkerAdmitStateDenied, wantClass: runner.WorkerAdmitClassContended,
 			wantReason: runner.WorkerAdmitReasonSnapshot,
 		},
 		{
 			name:      "a grant carries the granted class",
-			configure: func(s *Server) map[string]any { return workerArgs("/slice/.aira-suite", workerTestMiB, false, 0) },
+			configure: func(s *Server) map[string]any { return workerArgs(workerTestOuterScope, workerTestMiB, false, 0) },
 			wantState: runner.WorkerAdmitStateGranted, wantClass: runner.WorkerAdmitClassGranted,
 		},
 	}
@@ -81,7 +81,7 @@ func TestWorkerAdmitClassifiesDeterministicOutcomes(t *testing.T) {
 // the old "reject:"/"fallback:" prose-prefix convention is gone.
 func TestWorkerAdmitResponseCarriesClassOnTheWire(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
-	resp, client, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", 5*workerTestMiB, false, 0))
+	resp, client, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, 5*workerTestMiB, false, 0))
 	defer client.Close()
 	encoded, err := json.Marshal(resp)
 	if err != nil {

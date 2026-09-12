@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,38 @@ import (
 	"aira/internal/runner"
 	"aira/internal/testdeadline"
 )
+
+// A worker admit needs a PARSEABLE parent confine scope id: Task 1 mints the
+// worker name with the PARENT supervisor pid parsed out of it. This canonical
+// outer scope carries a pid (111111) that is deliberately NOT this test
+// process's os.Getpid(), so the pid-slot assertions can prove the daemon copies
+// the PARENT's pid rather than stamping its own.
+const (
+	workerTestParentPID     = 111111
+	workerTestOuterScope    = "/slice/.aira-CONFINE-suite-111111-1"
+	workerTestParentScopeID = "CONFINE-suite-111111-1"
+)
+
+// grantedWaiterScopeIDs returns the scope ids of every granted waiter on the
+// slice queue, read under the registry and per-queue locks.
+func grantedWaiterScopeIDs(t *testing.T, server *Server, slicePath string) []string {
+	t.Helper()
+	server.admitRegistryMu.Lock()
+	queue := server.admitQueues[slicePath]
+	server.admitRegistryMu.Unlock()
+	if queue == nil {
+		return nil
+	}
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	var ids []string
+	for _, waiter := range queue.waiters {
+		if waiter != nil && waiter.state == admitGranted && waiter.accounted {
+			ids = append(ids, waiter.scopeID)
+		}
+	}
+	return ids
+}
 
 // S15 rebuilt worker-admit onto the ONE unified signed ledger: a worker is now an
 // ordinary lease keyed on its own scope path, charging queue.outstanding (RAM) and
@@ -172,16 +207,23 @@ func TestValidateWorkerAdmitArgsAcceptsShimSentinelUncleaned(t *testing.T) {
 // a real scope path, worker id, and swap disposition.
 func TestWorkerAdmitGrantsAndChargesLedger(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
-	resp, client, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, false, 0))
+	resp, client, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, false, 0))
 	defer client.Close()
 	if resp.State != runner.WorkerAdmitStateGranted || resp.MemoryMax != workerTestMiB {
 		t.Fatalf("resp=%+v, want granted with memory_max %d", resp, workerTestMiB)
 	}
 	if resp.WorkerID != "1" {
-		t.Fatalf("resp=%+v, want worker id 1 from a fresh tree", resp)
+		t.Fatalf("resp=%+v, want worker id 1 (the first daemon-monotonic seq)", resp)
 	}
-	if want := runner.WorkerScopeChildPath("/slice/.aira-suite", "worker-1"); resp.ScopePath != want {
-		t.Fatalf("ScopePath=%q want %q", resp.ScopePath, want)
+	// Task 1: the grant names a first-class confine scope under the outer scope,
+	// CONFINE-aitest-w<seq>-<parentPid>-<stamp>, whose pid slot is the PARENT
+	// supervisor pid parsed from the parent scope id — not a `.aira-worker-N` child.
+	if dir := filepath.Dir(resp.ScopePath); dir != workerTestOuterScope {
+		t.Fatalf("ScopePath=%q is not a child of the outer scope %q", resp.ScopePath, workerTestOuterScope)
+	}
+	base := strings.TrimPrefix(filepath.Base(resp.ScopePath), ".aira-")
+	if nm, pid, _, _, ok := runner.ParseConfineScopeID(base); !ok || !strings.HasPrefix(nm, "aitest-w") || pid != workerTestParentPID {
+		t.Fatalf("worker scope name %q (from %q) is not a parseable aitest-w id with parent pid %d", base, resp.ScopePath, workerTestParentPID)
 	}
 	if resp.Containment != runner.WorkerAdmitContainmentEnforced {
 		t.Fatalf("resp=%+v, want enforced containment on the real path", resp)
@@ -191,8 +233,8 @@ func TestWorkerAdmitGrantsAndChargesLedger(t *testing.T) {
 	if resp.SwapCap != runner.WorkerAdmitSwapCapNotApplicable {
 		t.Fatalf("resp=%+v, want the swap_cap scope creation reported", resp)
 	}
-	if resp.ParentScopeID != "suite" {
-		t.Fatalf("resp=%+v, want parent_scope_id derived from the outer scope base (.aira-suite -> suite)", resp)
+	if resp.ParentScopeID != workerTestParentScopeID {
+		t.Fatalf("resp=%+v, want parent_scope_id %q (the outer scope base minus .aira-)", resp, workerTestParentScopeID)
 	}
 	outstanding, _, jobs := sliceLedger(t, server, "/slice")
 	if outstanding != workerTestMiB || jobs != 1 {
@@ -208,7 +250,7 @@ func TestWorkerAdmitGrantsAndChargesLedger(t *testing.T) {
 // interim-window closure (worker CPU is now ledger-charged).
 func TestWorkerAdmitChargesOneCoreAgainstTheCPULedger(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", 1<<30)
-	resp, client, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, false, 0))
+	resp, client, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, false, 0))
 	defer client.Close()
 	if resp.State != runner.WorkerAdmitStateGranted {
 		t.Fatalf("resp=%+v", resp)
@@ -229,7 +271,7 @@ func TestWorkerAdmitChargesOneCoreAgainstTheCPULedger(t *testing.T) {
 // assertion below REDS.
 func TestWorkerAdmitEOFReleasesLeaseImmediately(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
-	first, client, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", 2*workerTestMiB, false, 0))
+	first, client, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, 2*workerTestMiB, false, 0))
 	if first.State != runner.WorkerAdmitStateGranted {
 		t.Fatalf("first=%+v", first)
 	}
@@ -251,8 +293,8 @@ func TestWorkerAdmitEOFReleasesLeaseImmediately(t *testing.T) {
 // worker 1.
 func TestWorkerAdmitEOFReleasesOnlyItsOwnLease(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
-	first, firstClient, firstDone := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, false, 0))
-	second, secondClient, _ := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, false, 0))
+	first, firstClient, firstDone := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, false, 0))
+	second, secondClient, _ := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, false, 0))
 	defer secondClient.Close()
 	if first.State != runner.WorkerAdmitStateGranted || second.State != runner.WorkerAdmitStateGranted {
 		t.Fatalf("first=%+v second=%+v", first, second)
@@ -271,7 +313,7 @@ func TestWorkerAdmitEOFReleasesOnlyItsOwnLease(t *testing.T) {
 // denial (request-invalid / exceeds-ceiling), not a wait.
 func TestWorkerAdmitDeniesRequestLargerThanCeiling(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", workerTestMiB)
-	resp, _, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", 2*workerTestMiB, false, 0))
+	resp, _, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, 2*workerTestMiB, false, 0))
 	awaitReturn(t, done, "handler to return on terminal denial")
 	if resp.State != runner.WorkerAdmitStateDenied || resp.Class != runner.WorkerAdmitClassRequestInvalid || resp.Reason != runner.WorkerAdmitReasonExceedsCeiling {
 		t.Fatalf("resp=%+v, want denied/request-invalid/exceeds-ceiling", resp)
@@ -282,12 +324,12 @@ func TestWorkerAdmitDeniesRequestLargerThanCeiling(t *testing.T) {
 // reserves NOTHING (no lease, no scope), so the ledger is untouched.
 func TestWorkerAdmitNonBlockingSnapshotReservesNothing(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
-	first, firstClient, _ := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", 2*workerTestMiB, false, 0))
+	first, firstClient, _ := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, 2*workerTestMiB, false, 0))
 	defer firstClient.Close()
 	if first.State != runner.WorkerAdmitStateGranted {
 		t.Fatalf("first=%+v", first)
 	}
-	resp, _, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, true, 0))
+	resp, _, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, true, 0))
 	awaitReturn(t, done, "snapshot handler to return")
 	if resp.State != runner.WorkerAdmitStateDenied || resp.Reason != runner.WorkerAdmitReasonSnapshot {
 		t.Fatalf("resp=%+v, want a snapshot response", resp)
@@ -312,7 +354,7 @@ func TestWorkerAdmitNonBlockingSnapshotIsUnevaluatedUnderRestartFreeze(t *testin
 	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
 	// Arm the restart freeze directly (these net.Pipe servers never call Serve).
 	server.restartFreezeUntilNanos.Store(server.admitNowTime().Add(time.Hour).UnixNano())
-	resp, _, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, true, 0))
+	resp, _, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, true, 0))
 	awaitReturn(t, done, "snapshot handler to return")
 	if resp.State != runner.WorkerAdmitStateUnevaluated || resp.Reason != runner.WorkerAdmitReasonSnapshot {
 		t.Fatalf("resp=%+v, want unevaluated snapshot under the restart freeze", resp)
@@ -329,7 +371,7 @@ func TestWorkerAdmitCreateFailureFailsClosedAndReleases(t *testing.T) {
 	server.workerScopeCreate = func(context.Context, string, string, int64) (string, string, error) {
 		return "", "", errWorkerCreateBoom
 	}
-	resp, _, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, false, 0))
+	resp, _, done := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, workerTestMiB, false, 0))
 	awaitReturn(t, done, "handler to return on create failure")
 	if resp.State != runner.WorkerAdmitStateDenied || resp.Class != runner.WorkerAdmitClassRequestInvalid ||
 		resp.Reason != runner.WorkerAdmitReasonWorkerScopeCreateFailed {
@@ -338,23 +380,6 @@ func TestWorkerAdmitCreateFailureFailsClosedAndReleases(t *testing.T) {
 	if out, _, jobs := sliceLedger(t, server, "/slice"); out != 0 || jobs != 0 {
 		t.Fatalf("outstanding=%d jobs=%d, want the briefly-charged lease discharged (0, 0)", out, jobs)
 	}
-}
-
-// verifies: S15 — the worker-id counter re-seeds from the tree, so a daemon that just
-// restarted next to surviving .aira-worker-N children allocates ABOVE them.
-func TestWorkerAdmitReseedsWorkerIDFromTree(t *testing.T) {
-	server := workerAdmitServer(t, "/slice", 1<<30)
-	for _, id := range []string{"1", "2", "3"} {
-		if _, _, err := server.workerScopeCreate(context.Background(), "/slice/.aira-suite", id, workerTestMiB); err != nil {
-			t.Fatal(err)
-		}
-	}
-	resp, client, done := startWorkerAdmit(t, server, workerArgs("/slice/.aira-suite", workerTestMiB, false, 0))
-	defer client.Close()
-	if resp.State != runner.WorkerAdmitStateGranted || resp.WorkerID != "4" {
-		t.Fatalf("resp=%+v, want worker id 4 re-seeded from .aira-worker-1..3", resp)
-	}
-	_ = done
 }
 
 // verifies: S15 — a confine-mode mismatch is terminal admission-unusable, in both
@@ -369,7 +394,7 @@ func TestWorkerAdmitRefusesConfineModeMismatch(t *testing.T) {
 	}
 	shim := workerAdmitServer(t, runner.ShimConfineSlice, 4*workerTestMiB)
 	shim.SetConfineShimModeForTest(4*workerTestMiB, "test", "")
-	resp2, _, done2 := startWorkerAdmit(t, shim, workerArgs("/slice/.aira-suite", workerTestMiB, false, 0))
+	resp2, _, done2 := startWorkerAdmit(t, shim, workerArgs(workerTestOuterScope, workerTestMiB, false, 0))
 	awaitReturn(t, done2, "shim-mode mismatch handler")
 	if resp2.State != runner.WorkerAdmitStateUnavailable || resp2.Class != runner.WorkerAdmitClassAdmissionUnusable ||
 		resp2.Reason != runner.WorkerAdmitReasonConfineModeMismatch {
@@ -399,5 +424,84 @@ func TestShimWorkerAdmitGrantsAdvisoryAndReleasesOnEOF(t *testing.T) {
 	awaitReturn(t, done, "shim worker handler to return on EOF")
 	if out, _, jobs := sliceLedger(t, server, runner.ShimConfineSlice); out != 0 || jobs != 0 {
 		t.Fatalf("shim ledger outstanding=%d jobs=%d after EOF, want released (0, 0)", out, jobs)
+	}
+}
+
+// verifies: S2a Task 1 — a worker scope gets a FIRST-CLASS, parseable confine
+// name whose pid slot is the PARENT SUPERVISOR's pid (copied out of the parent
+// scope id), NEVER the daemon's own os.Getpid(). This is load-bearing: Task 5's
+// escape exemption is a local parseConfineScopeID(basename).pid == os.Getpid()
+// check on the MONITOR process, so the daemon must carry the parent pid through,
+// not stamp its own. It also pins the lease-scopeID == dir-name-minus-".aira-"
+// alignment the reaper / --kill / oomsteer all key on.
+//
+// MUTATION: mint the worker name with os.Getpid() instead of the parent pid ->
+// the pid-slot assertions RED (pid == the daemon's, not the parent's).
+func TestWorkerAdmitMintsFirstClassScopeNameWithParentPid(t *testing.T) {
+	const parentA, parentB = 111111, 222222
+	if os.Getpid() == parentA || os.Getpid() == parentB {
+		t.Skipf("test process pid %d collides with a fixture parent pid", os.Getpid())
+	}
+	server := workerAdmitServer(t, "/slice", 8*workerTestMiB)
+	outerA := "/slice/.aira-CONFINE-supA-" + strconv.Itoa(parentA) + "-1"
+	outerB := "/slice/.aira-CONFINE-supB-" + strconv.Itoa(parentB) + "-1"
+
+	respA, clientA, _ := startWorkerAdmit(t, server, workerArgs(outerA, workerTestMiB, false, 0))
+	defer clientA.Close()
+	respB, clientB, _ := startWorkerAdmit(t, server, workerArgs(outerB, workerTestMiB, false, 0))
+	defer clientB.Close()
+	if respA.State != runner.WorkerAdmitStateGranted || respB.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("respA=%+v respB=%+v, want both granted", respA, respB)
+	}
+
+	for _, tc := range []struct {
+		label      string
+		resp       WorkerAdmitResponse
+		wantParent int
+	}{
+		{"A", respA, parentA},
+		{"B", respB, parentB},
+	} {
+		base := strings.TrimPrefix(filepath.Base(tc.resp.ScopePath), ".aira-")
+		nm, pid, _, owner, ok := runner.ParseConfineScopeID(base)
+		if !ok {
+			t.Fatalf("%s: worker scope name %q (from %q) is not a parseable confine id", tc.label, base, tc.resp.ScopePath)
+		}
+		if !strings.HasPrefix(nm, "aitest-w") {
+			t.Fatalf("%s: worker confine name %q, want an aitest-w<seq> name", tc.label, nm)
+		}
+		if owner != "" {
+			t.Fatalf("%s: worker id carries owner %q, want none", tc.label, owner)
+		}
+		if pid == os.Getpid() {
+			t.Fatalf("%s: worker name embeds the DAEMON pid %d, not the parent's — the Task-5 escape exemption would break", tc.label, pid)
+		}
+		if pid != tc.wantParent {
+			t.Fatalf("%s: worker name embeds pid %d, want the PARENT supervisor pid %d", tc.label, pid, tc.wantParent)
+		}
+	}
+
+	// Unique by construction: distinct parents (and a monotonic seq) yield
+	// distinct worker scope names with no reseed / EEXIST path.
+	if respA.ScopePath == respB.ScopePath {
+		t.Fatalf("both workers share scope path %q, want distinct", respA.ScopePath)
+	}
+
+	// The granted lease's scopeID == the scope dir name minus ".aira-", so the
+	// reaper hasLiveLease veto, confine --kill, and oomsteer all line up.
+	wantA := strings.TrimPrefix(filepath.Base(respA.ScopePath), ".aira-")
+	wantB := strings.TrimPrefix(filepath.Base(respB.ScopePath), ".aira-")
+	ids := grantedWaiterScopeIDs(t, server, "/slice")
+	haveA, haveB := false, false
+	for _, id := range ids {
+		switch id {
+		case wantA:
+			haveA = true
+		case wantB:
+			haveB = true
+		}
+	}
+	if !haveA || !haveB {
+		t.Fatalf("granted lease scopeIDs=%v, want both %q and %q (dir-name-minus-.aira- alignment)", ids, wantA, wantB)
 	}
 }

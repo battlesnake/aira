@@ -31,11 +31,15 @@ func TestCreateWorkerScopeWritesVerifiedMemoryCap(t *testing.T) {
 	// floorMemoryPage code), so an unaligned value like 107374182 would be
 	// floored by the kernel to 107372544 and this verbatim-string comparison
 	// would fail even on a correct implementation.
-	scopePath, swapCap, err := CreateWorkerScope(context.Background(), outer, "1", 134217728)
+	// S2a: CreateWorkerScope now takes the worker's minted confine scope NAME (the
+	// daemon passes CONFINE-aitest-w<seq>-<parentPid>-<stamp>), creating
+	// .aira-<scopeName>, not a .aira-worker-N child.
+	scopeName := "CONFINE-aitest-w1-111111-1"
+	scopePath, swapCap, err := CreateWorkerScope(context.Background(), outer, scopeName, 134217728)
 	if err != nil {
 		t.Fatalf("CreateWorkerScope: %v", err)
 	}
-	if want := WorkerScopeChildPath(outer, "worker-1"); scopePath != want {
+	if want := WorkerScopeChildPath(outer, scopeName); scopePath != want {
 		t.Fatalf("scopePath=%q want %q", scopePath, want)
 	}
 	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.max")); err != nil || strings.TrimSpace(string(data)) != "134217728" {
@@ -169,7 +173,8 @@ func TestCreateWorkerScopeRemovesScopeOnMemoryCapFailure(t *testing.T) {
 		}
 	}
 
-	_, _, err = CreateWorkerScope(context.Background(), outer, "1", 134217728)
+	caplessScopeName := "CONFINE-aitest-w1-111111-1"
+	_, _, err = CreateWorkerScope(context.Background(), outer, caplessScopeName, 134217728)
 	if err == nil {
 		t.Fatal("CreateWorkerScope unexpectedly succeeded: worker memory.max was available despite missing outer memory delegation")
 	}
@@ -183,7 +188,7 @@ func TestCreateWorkerScopeRemovesScopeOnMemoryCapFailure(t *testing.T) {
 		t.Fatalf("error=%v, want it attributed to the memory cap — a swap-cap attribution here "+
 			"means the swap write ran before memory.max and misread an undelegated controller", err)
 	}
-	scopePath := filepath.Join(outer, ".aira-worker-1")
+	scopePath := WorkerScopeChildPath(outer, caplessScopeName)
 	if _, statErr := os.Stat(scopePath); !os.IsNotExist(statErr) {
 		t.Fatalf("capless worker scope remains after memory cap failure: stat %q: %v", scopePath, statErr)
 	}

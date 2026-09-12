@@ -144,10 +144,15 @@ const (
 	WorkerAdmitReasonSupervisorScopeUnreadable = "supervisor-scope-unreadable"
 	WorkerAdmitReasonWorkerScopesUnreadable    = "worker-scopes-unreadable"
 	WorkerAdmitReasonAggregateCapExceeded      = "aggregate-cap-exceeded"
-	WorkerAdmitReasonWorkerIDSpaceExhausted    = "worker-id-space-exhausted"
-	WorkerAdmitReasonWorkerScopeIDCollision    = "worker-scope-id-collision"
-	WorkerAdmitReasonAdmitSlotsSaturated       = "admit-slots-saturated"
-	WorkerAdmitReasonSaturated                 = "saturated"
+	// WorkerAdmitReasonParentScopeUnparseable (S2a §16a) is the terminal refusal
+	// when a worker's parent scope id does not parse as a canonical confine id, so
+	// the daemon cannot copy out the PARENT supervisor pid the worker name's pid
+	// slot requires. (S2a deleted the per-outer-scope id reseed, so the old
+	// worker-id-space-exhausted / worker-scope-id-collision reasons are gone: the
+	// (seq, parentPid, stamp) id is unique by construction.)
+	WorkerAdmitReasonParentScopeUnparseable = "parent-scope-unparseable"
+	WorkerAdmitReasonAdmitSlotsSaturated    = "admit-slots-saturated"
+	WorkerAdmitReasonSaturated              = "saturated"
 	// AIRA-123. The ledger-only (ci-shim) admission path's own conditions.
 	//
 	// AIRA-121 answered every shim-mode worker-admit with

@@ -1949,21 +1949,10 @@ func confineEnvironment(env []string) []string {
 // survives verbatim, because the split takes everything after the first
 // delimiter rather than splitting on every '@'.
 func confineScopeID(name, owner string, delegateRAM bool) string {
-	if name == "" {
-		name = "job"
-	}
-	id := "CONFINE-"
-	if delegateRAM {
-		id += delegateRAMScopeIDMarker + "-"
-	}
-	id += name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	// An unknown owner is encoded as the ABSENCE of a suffix, never as
-	// "@unknown": a reader must not be able to confuse "nobody claimed this" with
-	// a claim, and an id minted before this change parses identically.
-	if owner != "" && owner != ConfineUnknownOwner && ValidateConfineOwner(owner) == nil {
-		id += "@" + owner
-	}
-	return id
+	// The grammar itself lives in the portable confineScopeIDWithPID, next to its
+	// parser. A job scope names THIS process; only the daemon minting a worker
+	// scope on behalf of another process (MintWorkerScopeID) passes a different pid.
+	return confineScopeIDWithPID(name, owner, os.Getpid(), delegateRAM)
 }
 
 func delegateRAMScopeFallback() int64 {

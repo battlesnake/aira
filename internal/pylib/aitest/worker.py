@@ -399,8 +399,7 @@ def fork_worker(scope_path):
     cap -- what is briefly coarser is the GRANULARITY of containment, not
     containment itself. Say OUTER precisely, not "the scope it is in": the
     unplaced child sits in `.aira-supervisor`, which is DELIBERATELY given
-    no memory.max of its own (worker_admit.go's workerScopeChildPrefix and
-    readWorkerSupervisorMemory notes), so the bound comes entirely from the
+    no memory.max of its own, so the bound comes entirely from the
     outer scope one level up -- and that one is guaranteed finite by
     precondition, not by assumption. The precondition is enforced BEFORE any
     grant, not by worker-admit: `aira confine` refuses to exec a job whose

@@ -1,15 +1,12 @@
 package daemon
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"aira/internal/core"
@@ -21,31 +18,12 @@ import (
 // zero pages and instant-OOM the worker on placement.
 const workerAdmitEstimatedBytesMin int64 = 1 << 20 // 1 MiB
 
-// workerScopeChildPrefix is the directory-name prefix every aitest worker scope
-// carries under its outer scope (`.aira-worker-<N>`). Since S15 it is read for
-// ONE purpose only: re-seeding the worker-id counter from the tree after a daemon
-// restart. The RAM/CPU accounting moved to the unified signed ledger — a worker
-// lease charges queue.outstanding / queue.cpuOutstanding directly, exactly like an
-// `aira confine` lease — so the tree is no longer summed for a committed total.
-const workerScopeChildPrefix = ".aira-worker-"
-
 // workerAdmitBasis is the diagnostic label a worker lease carries in the ledger.
 // It participates in no admission decision (validRunnerAdmitGrant only requires a
 // non-empty basis were the lease ever framed as an AdmitResponse by a later
 // re-anchor); it exists so a `confine --list` walk can tell a worker lease apart
 // from an ordinary confine one.
 const workerAdmitBasis = "worker"
-
-// maxWorkerScopeSeq bounds worker-id allocation so a reconstructed counter near
-// the int limit can never wrap into a colliding low id. Reaching it is a terminal
-// create failure, not a silent wrap.
-const maxWorkerScopeSeq = 1 << 30
-
-// errWorkerIDSpaceExhausted is the sentinel allocateWorkerScopeID returns when the
-// per-outer-scope id counter reaches maxWorkerScopeSeq. Terminal, not retriable:
-// ids only grow (a restart re-seeds from the largest suffix on the tree), so no
-// amount of waiting produces a free id.
-var errWorkerIDSpaceExhausted = errors.New("worker id space exhausted")
 
 // WorkerAdmitResponse is the one grant/denial/snapshot payload the worker-admit
 // connection sends before optionally holding itself open as the lease.
@@ -112,105 +90,6 @@ type workerAdmitRequest struct {
 	// or the client closing its connection (design §4/§6). A positive value no
 	// longer imposes a timeout (mirrors the S13 confine admit path).
 	nonBlocking bool
-}
-
-// workerScopeState is the per-OUTER-SCOPE worker-id allocator. Since S15 it holds
-// ONLY the id counter: the ledger accounting it used to carry (the committed sum,
-// the supervisor-RSS guard) is gone, folded into the one unified signed ledger.
-//
-// seeded records whether nextSeq has been reconstructed from the tree yet. The
-// re-seed happens once per outer scope per daemon lifetime (and again after a
-// create collision), NOT per allocation — a per-allocation readdir is the
-// AIRA-61 O(tree)-per-call CPU regression this deliberately avoids.
-//
-// Not pruned, an accepted slow-growth gap: one small entry per outer scope ever
-// seen.
-type workerScopeState struct {
-	mu      sync.Mutex
-	nextSeq int
-	seeded  bool
-}
-
-// workerScopeFor returns the id-allocator cell for outerScope, creating it
-// atomically under workerScopesMu so two concurrent first callers can never end up
-// with two cells.
-func (s *Server) workerScopeFor(outerScope string) *workerScopeState {
-	s.workerScopesMu.Lock()
-	defer s.workerScopesMu.Unlock()
-	if s.workerScopes == nil {
-		s.workerScopes = make(map[string]*workerScopeState)
-	}
-	state := s.workerScopes[outerScope]
-	if state == nil {
-		state = &workerScopeState{}
-		s.workerScopes[outerScope] = state
-	}
-	return state
-}
-
-// scanWorkerMaxIndex returns the largest numeric N among outerScope's existing
-// `.aira-worker-<N>` children, 0 if none. It is the SLIM readdir the worker-id
-// allocator re-seeds from after a daemon restart (design §4): the new daemon holds
-// no counter in RAM, so a fresh id must not collide with a survivor whose scope is
-// still on the tree. It reads no memory.max — S15 moved worker RAM/CPU accounting
-// to the unified signed ledger, so id re-seeding is the only thing the tree is
-// read for now.
-func scanWorkerMaxIndex(outerScope string) (int, error) {
-	entries, err := os.ReadDir(outerScope)
-	if err != nil {
-		return 0, fmt.Errorf("read worker scopes: %w", err)
-	}
-	maxIndex := 0
-	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), workerScopeChildPrefix) {
-			continue
-		}
-		if index, err := strconv.Atoi(strings.TrimPrefix(entry.Name(), workerScopeChildPrefix)); err == nil && index > maxIndex {
-			maxIndex = index
-		}
-	}
-	return maxIndex, nil
-}
-
-// allocateWorkerScopeID reserves the next worker id under outerScope and returns
-// (workerID, scopePath). Re-seeds the per-outer-scope counter from the tree the
-// FIRST time the scope is used (and after a create collision) so a restart never
-// re-allocates a survivor's id. Returns errWorkerIDSpaceExhausted at the id-space
-// limit; propagates the tree-read error (which the caller turns into a retriable
-// "worker scopes unreadable"), never a fabricated success.
-func (s *Server) allocateWorkerScopeID(outerScope string) (string, string, error) {
-	state := s.workerScopeFor(outerScope)
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if !state.seeded {
-		scan := s.workerScopeMaxIndex
-		if scan == nil {
-			scan = scanWorkerMaxIndex
-		}
-		maxIndex, err := scan(outerScope)
-		if err != nil {
-			return "", "", err
-		}
-		state.nextSeq = maxIndex
-		state.seeded = true
-	}
-	seq := state.nextSeq + 1
-	if seq >= maxWorkerScopeSeq {
-		return "", "", errWorkerIDSpaceExhausted
-	}
-	state.nextSeq = seq
-	workerID := strconv.Itoa(seq)
-	return workerID, runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
-}
-
-// reseedWorkerScope forces the next allocation for outerScope to re-read the tree.
-// Called ONLY on a create EEXIST — positive proof the counter is stale-low because
-// a child it did not know about is already on the tree.
-func (s *Server) reseedWorkerScope(outerScope string) {
-	state := s.workerScopeFor(outerScope)
-	state.mu.Lock()
-	state.seeded = false
-	state.mu.Unlock()
 }
 
 // workerParentScopeID maps a worker's outer cgroup path to the suite scope-id the
@@ -479,35 +358,41 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 
-	// Allocate the id + scope path BEFORE enqueue so the lease has a stable scope-id
-	// key. Real mode re-seeds the counter from the tree (survivors keep their
-	// .aira-worker-<N> across a restart); shim mode has no tree, so a synthetic
-	// monotonic id keys the advisory lease.
+	// The suite scope-id this worker is a sub-reservation OF. Resolved BEFORE the id
+	// is minted, because in real mode the worker scope NAME embeds the PARENT
+	// supervisor pid copied out of this id (S2a §16a) — the pid the Task-5 escape
+	// exemption checks locally against os.Getpid().
+	parentScopeID := workerParentScopeID(req.outerScope)
+
+	// Mint the worker's scope id + path BEFORE enqueue so the lease has a stable
+	// scope-id key. Real mode mints a first-class confine id
+	// (CONFINE-aitest-w<seq>-<parentPid>-<stamp>) — unique by construction, so
+	// there is no tree re-seed and no EEXIST path; shim mode has no cgroup, so a
+	// synthetic monotonic id keys the advisory lease.
 	var workerID, scopePath, scopeID string
 	if shim {
 		workerID = strconv.FormatUint(s.shimWorkerSeq.Add(1), 10)
 		scopeID = "ci-shim-worker-" + workerID
 	} else {
-		workerID, scopePath, err = s.allocateWorkerScopeID(req.outerScope)
-		if err != nil {
-			if errors.Is(err, errWorkerIDSpaceExhausted) {
-				s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
-					State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
-					Reason: runner.WorkerAdmitReasonWorkerIDSpaceExhausted,
-					Detail: fmt.Sprintf("worker id space exhausted under %s (limit %d)", req.outerScope, maxWorkerScopeSeq),
-				})
-				return
-			}
+		_, parentPID, _, _, ok := runner.ParseConfineScopeID(parentScopeID)
+		if !ok {
+			// No parent pid to stamp into the worker name: refuse terminally rather
+			// than mint a scope whose pid slot the reaper and the escape exemption
+			// cannot reason about. (Task 2 makes the authoritative refusal the
+			// arg-validator on the explicit parent_scope_id field; this stays as a
+			// defensive invariant — a worker can never silently lose its parent pid.)
 			s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
-				State: runner.WorkerAdmitStateUnevaluated, Class: runner.WorkerAdmitClassContended,
-				Reason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
-				Detail: "worker scopes unreadable: " + err.Error(),
+				State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
+				Reason: runner.WorkerAdmitReasonParentScopeUnparseable,
+				Detail: fmt.Sprintf("parent scope id %q is not a canonical confine id", parentScopeID),
 			})
 			return
 		}
-		scopeID = scopePath
+		seq := int(s.workerScopeSeq.Add(1))
+		scopeID = runner.MintWorkerScopeID(seq, parentPID)
+		scopePath = runner.WorkerScopeChildPath(req.outerScope, scopeID)
+		workerID = strconv.Itoa(seq)
 	}
-	parentScopeID := workerParentScopeID(req.outerScope)
 
 	request := admitRequest{
 		reserve:       req.estimatedBytes,
@@ -596,19 +481,9 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		if create == nil {
 			create = runner.CreateWorkerScope
 		}
-		sp, sc, createErr := create(peerCtx, req.outerScope, workerID, req.estimatedBytes)
+		sp, sc, createErr := create(peerCtx, req.outerScope, scopeID, req.estimatedBytes)
 		if createErr != nil {
 			release()
-			if errors.Is(createErr, fs.ErrExist) {
-				// A survivor the re-seed missed collided with this id. Force a fresh
-				// re-seed and deny RETRIABLY: the supervisor's next claim gets a higher id.
-				s.reseedWorkerScope(req.outerScope)
-				s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
-					State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassContended,
-					Reason: runner.WorkerAdmitReasonWorkerScopeIDCollision,
-				})
-				return
-			}
 			// Fail closed: no grant is delivered without its scope. request-invalid is
 			// the TERMINAL-BUT-DAEMON-HEALTHY disposition — a `contended` class would
 			// retry indefinitely, stalling every aitest run on the machine.

@@ -96,11 +96,12 @@ type Server struct {
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
 
-	// workerScopesMu / workerScopes are the per-outer-scope worker-id allocator
-	// (S15). Since the RAM/CPU accounting moved to the unified signed ledger, this
-	// holds only the id counter — no committed sum, no supervisor-RSS guard.
-	workerScopesMu sync.Mutex
-	workerScopes   map[string]*workerScopeState
+	// workerScopeSeq is the daemon-monotonic worker-scope sequence (S2a §16a). The
+	// worker id is minted as CONFINE-aitest-w<seq>-<parentPid>-<stamp>, so
+	// (seq, parentPid, stamp) is unique by construction — no per-outer-scope
+	// counter, no tree re-seed, no EEXIST path. A restart resets it, but the stamp
+	// (monotonic wall-clock nanos) still separates a fresh worker from any survivor.
+	workerScopeSeq atomic.Uint64
 	// shimWorkerSeq mints synthetic ids for ci-shim worker leases (advisory, no
 	// cgroup tree to re-seed from), keying each in the same unified ledger.
 	shimWorkerSeq          atomic.Uint64
@@ -149,14 +150,12 @@ type Server struct {
 	// depending on this host's real, ever-moving CPU counters and core count.
 	readCPUFrame func(string) runner.ConfineCPUFrame
 	readCPUCores func() int
-	// workerScopeMaxIndex / workerScopeCreate are worker-admit's two cgroupfs seams
-	// (S15). workerScopeMaxIndex is the SLIM readdir the worker-id allocator
-	// re-seeds from (production: scanWorkerMaxIndex); workerScopeCreate makes the
+	// workerScopeCreate is worker-admit's cgroupfs seam (S15): it makes the
 	// per-worker sub-scope after a grant (production: runner.CreateWorkerScope).
-	// Tests substitute fakes so the id allocation and grant flow run without a real
-	// delegated cgroup.
-	workerScopeMaxIndex func(string) (int, error)
-	workerScopeCreate   func(context.Context, string, string, int64) (string, string, error)
+	// Tests substitute a fake so the grant flow runs without a real delegated
+	// cgroup. (S2a deleted the id-reseed readdir seam: worker ids are unique by
+	// construction, so there is no tree to scan.)
+	workerScopeCreate func(context.Context, string, string, int64) (string, string, error)
 	admitNow            func() time.Time
 	admitAfter          func(time.Duration) <-chan time.Time
 	// S13 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):

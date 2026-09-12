@@ -160,7 +160,7 @@ func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 	if err := writeFrame(conn, RequestFrame{
 		Proto: ProtocolVersion, Scope: scope,
 		Request: core.Request{Verb: "worker-admit", Args: map[string]any{
-			"job_id": "job-1", "outer_scope": "/slice/.aira-suite",
+			"job_id": "job-1", "outer_scope": workerTestOuterScope,
 			"estimated_bytes": float64(workerAdmitEstimatedBytesMin),
 		}},
 	}); err != nil {

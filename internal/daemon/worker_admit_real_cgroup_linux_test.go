@@ -14,16 +14,23 @@ import (
 	"aira/internal/runner"
 )
 
+// realOuterParentPID is the parent supervisor pid embedded in realOuterScope's
+// canonical confine id; Task 1 copies it into each worker scope NAME, so the
+// tests assert the worker name carries THIS pid.
+const realOuterParentPID = 111111
+
 // realOuterScope builds a delegated, memory-controlled outer scope shaped like the
 // one BootstrapAitestSupervisor leaves behind, so worker children really expose
-// memory.max/memory.oom.group.
+// memory.max/memory.oom.group. Its directory is a CANONICAL confine scope id
+// (Task 1): the daemon parses the parent supervisor pid out of it to mint the
+// worker scope name, and refuses a worker whose parent scope id does not parse.
 func realOuterScope(t *testing.T) string {
 	t.Helper()
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
 	}
-	outer := filepath.Join(parent, ".aira-outer-test")
+	outer := filepath.Join(parent, ".aira-CONFINE-outer-111111-1")
 	if err := os.Mkdir(outer, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -34,10 +41,11 @@ func realOuterScope(t *testing.T) string {
 }
 
 // realWorkerAdmitServer builds a server that admits worker leases through the REAL
-// runner.CreateWorkerScope + the REAL readdir id re-seed against `outer`, with only
-// the slice memory reading stubbed so the admission arithmetic is deterministic.
-// The unified ledger's slice is a fixed path (the cgroup objects the tests care
-// about are all real, under `outer`).
+// runner.CreateWorkerScope against `outer`, with only the slice memory reading
+// stubbed so the admission arithmetic is deterministic. (S2a: worker ids are
+// unique by construction, so there is no longer an id re-seed readdir.) The
+// unified ledger's slice is a fixed path (the cgroup objects the tests care about
+// are all real, under `outer`).
 func realWorkerAdmitServer(t *testing.T, slicePath string, sliceMax int64) *Server {
 	t.Helper()
 	server := NewServer(Paths{})
@@ -48,9 +56,8 @@ func realWorkerAdmitServer(t *testing.T, slicePath string, sliceMax int64) *Serv
 	server.admitResolveSlice = func(string) (string, bool, string) { return slicePath, true, "" }
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, sliceMax, 0, true, "" }
 	server.readCPUCores = func() int { return 64 }
-	// workerScopeCreate + workerScopeMaxIndex stay at production defaults: the
-	// worker scope is really created under `outer` and the id counter really
-	// re-seeds from that tree.
+	// workerScopeCreate stays at its production default: the worker scope is really
+	// created under `outer` via runner.CreateWorkerScope.
 	return server
 }
 
@@ -114,8 +121,14 @@ func TestWorkerAdmitCreatesARealWorkerScopeAndEOFFreesTheLedger(t *testing.T) {
 	if resp.State != runner.WorkerAdmitStateGranted {
 		t.Fatalf("resp=%+v", resp)
 	}
-	if want := runner.WorkerScopeChildPath(outer, "worker-"+resp.WorkerID); resp.ScopePath != want {
-		t.Fatalf("ScopePath=%q want %q", resp.ScopePath, want)
+	// The granted scope is a first-class confine child of `outer` whose name
+	// embeds the PARENT supervisor pid (Task 1), not a `.aira-worker-N` child.
+	if dir := filepath.Dir(resp.ScopePath); dir != outer {
+		t.Fatalf("ScopePath=%q is not a child of outer %q", resp.ScopePath, outer)
+	}
+	base := strings.TrimPrefix(filepath.Base(resp.ScopePath), ".aira-")
+	if nm, pid, _, _, ok := runner.ParseConfineScopeID(base); !ok || !strings.HasPrefix(nm, "aitest-w") || pid != realOuterParentPID {
+		t.Fatalf("worker scope name %q (from %q) is not a parseable aitest-w id with parent pid %d", base, resp.ScopePath, realOuterParentPID)
 	}
 	if info, err := os.Stat(resp.ScopePath); err != nil || !info.IsDir() {
 		t.Fatalf("the granted scope does not exist on the real tree: stat %q: %v", resp.ScopePath, err)

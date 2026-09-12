@@ -60,9 +60,9 @@ import (
 // _would_breach_outer_cap). And the proactive-recycle watermark is a USERSPACE
 // comparison in worker.py that needs a number, not a kernel throttle -- it now
 // reads memory.max.
-func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
+func CreateWorkerScope(ctx context.Context, outerScope, scopeName string, memoryMax int64) (string, string, error) {
 	backend := newDefaultBackend(outerScope)
-	scope, err := backend.Create(ctx, "worker-"+workerID)
+	scope, err := backend.Create(ctx, scopeName)
 	if err != nil {
 		return "", "", fmt.Errorf("aitest worker scope: create: %w", err)
 	}
@@ -105,5 +105,5 @@ func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryM
 	if err != nil {
 		return removeUnusableScope("swap cap", err)
 	}
-	return WorkerScopeChildPath(outerScope, "worker-"+workerID), swapCap, nil
+	return WorkerScopeChildPath(outerScope, scopeName), swapCap, nil
 }

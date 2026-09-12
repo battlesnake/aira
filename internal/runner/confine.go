@@ -1254,6 +1254,47 @@ func MintConfineScopeID(request ConfineRequest) (string, error) {
 	return confineScopeID(name, owner, request.DelegateRAM), nil
 }
 
+// confineScopeIDWithPID is the ONE place the confine scope-id grammar is minted
+// (portable, next to its parser, for the same "one language" reason
+// parseConfineScopeID lives here). confineScopeID passes os.Getpid(); callers
+// that mint an id NAMING ANOTHER PROCESS — the daemon minting a worker scope on
+// behalf of its parent supervisor — pass that process's pid explicitly. The
+// embedded pid is load-bearing: the orphan reaper's liveness predicate and the
+// S2a escape exemption both read it, so a mis-stamped pid is a correctness bug,
+// not a cosmetic one.
+func confineScopeIDWithPID(name, owner string, pid int, delegateRAM bool) string {
+	if name == "" {
+		name = "job"
+	}
+	id := "CONFINE-"
+	if delegateRAM {
+		id += delegateRAMScopeIDMarker + "-"
+	}
+	id += name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	// An unknown owner is encoded as the ABSENCE of a suffix, never as
+	// "@unknown": a reader must not be able to confuse "nobody claimed this" with
+	// a claim, and an id minted before this change parses identically.
+	if owner != "" && owner != ConfineUnknownOwner && ValidateConfineOwner(owner) == nil {
+		id += "@" + owner
+	}
+	return id
+}
+
+// MintWorkerScopeID mints the first-class confine scope id for one aitest worker
+// (S2a §16a). Unlike a job scope, its pid slot is the PARENT SUPERVISOR's pid —
+// the pid the daemon copies out of the worker's parent_scope_id — not the
+// daemon's own, because the S2a escape exemption is a purely local
+// parseConfineScopeID(basename).pid == os.Getpid() check on the monitor process
+// (§16.1/§16.2). The name is aitest-w<seq>; seq (a daemon-monotonic counter)
+// makes (name, parentPid, stamp) unique by construction, so there is no
+// cross-scope counter, no reseed, and no EEXIST path. Owner is empty and the
+// delegate-ram marker is not used: a worker carries neither. The result is
+// parseable by parseConfineScopeID, so the worker is reaped / listed / killable
+// like any confine scope.
+func MintWorkerScopeID(seq, parentPid int) string {
+	return confineScopeIDWithPID("aitest-w"+strconv.Itoa(seq), "", parentPid, false)
+}
+
 // bindConfineScopeID refuses a pre-minted scope id that does not describe THIS
 // process running THIS request. Syntax is not enough and never was: the grammar
 // accepts any canonical pid, any valid owner, and either delegate class, so a

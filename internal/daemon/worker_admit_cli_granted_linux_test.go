@@ -245,8 +245,14 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 		t.Fatalf("outcome=%v, want a grant", fields)
 	}
 	scopePath := fields["scope"]
-	if want := runner.WorkerScopeChildPath(outer, "worker-"+fields["worker_id"]); scopePath != want {
-		t.Fatalf("granted scope=%q, want %q", scopePath, want)
+	// Task 1: the granted scope is a first-class confine child of `outer`,
+	// CONFINE-aitest-w<seq>-<parentPid>-<stamp>, not a `.aira-worker-N` child.
+	if dir := filepath.Dir(scopePath); dir != outer {
+		t.Fatalf("granted scope=%q is not a child of outer %q", scopePath, outer)
+	}
+	base := strings.TrimPrefix(filepath.Base(scopePath), ".aira-")
+	if nm, pid, _, _, ok := runner.ParseConfineScopeID(base); !ok || !strings.HasPrefix(nm, "aitest-w") || pid != realOuterParentPID {
+		t.Fatalf("granted scope name %q (from %q) is not a parseable aitest-w id with parent pid %d", base, scopePath, realOuterParentPID)
 	}
 	if got := fields["memory_max"]; got != strconv.FormatInt(request, 10) {
 		t.Fatalf("granted memory_max=%q, want %d", got, request)

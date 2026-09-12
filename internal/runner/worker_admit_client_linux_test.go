@@ -53,7 +53,9 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
 		// This external test package cannot access daemon's unexported 1 MiB
 		// protocol minimum. Five MiB is safely above it.
-		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: time.Second,
+		// S2a: the outer scope must be a CANONICAL confine id — the daemon copies the
+		// parent supervisor pid out of it to mint the worker scope name.
+		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/slice/.aira-CONFINE-outer-111111-1", EstimatedBytes: 5 * (1 << 20), MaxWait: time.Second,
 	})
 	if !outcome.Granted() || outcome.Lease == nil {
 		t.Fatalf("RequestWorkerAdmit: outcome=%+v", outcome)

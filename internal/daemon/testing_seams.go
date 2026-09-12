@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -57,39 +55,31 @@ func (s *Server) SetRestartFreezeForTest(d time.Duration) {
 	s.restartFreeze = d
 }
 
-// SetWorkerScopeTreeForTest replaces worker-admit's two cgroupfs seams (S15) with
-// an in-memory tree, for external test packages that exercise the client/daemon
-// boundary against a synthetic outer scope that is not a real cgroup. The seams
-// share one map, so a scope created through the daemon is seen by the next id
-// re-seed, exactly as on a real tree.
+// SetWorkerScopeTreeForTest replaces worker-admit's cgroupfs create seam (S15)
+// with an in-memory tree, for external test packages that exercise the
+// client/daemon boundary against a synthetic outer scope that is not a real
+// cgroup. (S2a deleted the id-reseed readdir seam: worker ids are unique by
+// construction — CONFINE-aitest-w<seq>-<parentPid>-<stamp> — so there is no tree
+// to scan and no collision to recover from.) The create seam is keyed by the
+// worker's minted scope NAME, exactly the value the daemon now passes to
+// runner.CreateWorkerScope.
 func (s *Server) SetWorkerScopeTreeForTest() {
 	var mu sync.Mutex
 	children := map[string]map[string]int64{}
-	s.workerScopeMaxIndex = func(outerScope string) (int, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		maxIndex := 0
-		for name := range children[outerScope] {
-			if index, err := strconv.Atoi(strings.TrimPrefix(name, workerScopeChildPrefix)); err == nil && index > maxIndex {
-				maxIndex = index
-			}
-		}
-		return maxIndex, nil
-	}
-	s.workerScopeCreate = func(_ context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
+	s.workerScopeCreate = func(_ context.Context, outerScope, scopeName string, memoryMax int64) (string, string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if children[outerScope] == nil {
 			children[outerScope] = map[string]int64{}
 		}
-		children[outerScope][workerScopeChildPrefix+workerID] = memoryMax
+		children[outerScope][".aira-"+scopeName] = memoryMax
 		// AIRA-35: deliberately NOT "enforced". This seam stands in for a
 		// successful CreateWorkerScope, and "not-applicable" is an equally real
 		// success disposition (a kernel with no swap support) -- but it differs
 		// from the value a fabricating hop would invent, which is the entire
 		// point: any hop that manufactures the value instead of carrying it fails
 		// the assertions downstream.
-		return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapNotApplicable, nil
+		return runner.WorkerScopeChildPath(outerScope, scopeName), runner.WorkerAdmitSwapCapNotApplicable, nil
 	}
 }
 
