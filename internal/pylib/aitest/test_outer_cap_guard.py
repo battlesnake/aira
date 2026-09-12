@@ -58,7 +58,11 @@ def _real_mode_supervisor(outer_scope, *, base=0, per_relay=0, margin=0):
 def _add_live_worker(sup, memory_max, pid=None):
     if pid is None:
         pid = 100000 + len(sup.workers)
-    sup.workers[pid] = {"grant": {"scope": "/fake/worker-%d" % pid, "memory_max": memory_max},
+    # memory_max is a STRING in a real enforced grant (the worker-admit outcome
+    # parser stores every field as a string). Use str() here so these fixtures
+    # match the real grant shape -- an int-only fixture silently hid a guard that
+    # was inert on every real run (Σ_live always 0), caught by the real-cgroup e2e.
+    sup.workers[pid] = {"grant": {"scope": "/fake/worker-%d" % pid, "memory_max": str(memory_max)},
                         "in_flight": None}
     return pid
 
@@ -115,9 +119,10 @@ def test_effective_outer_cap_walk_stops_below_a_non_cgroup_parent(tmp_path):
 def test_sum_live_worker_caps_skips_fallback_and_ledger_only():
     sup = Supervisor()
     sup.workers[1] = {"grant": None}                                   # fallback (unconfined)
-    sup.workers[2] = {"grant": {"worker_id": "7", "reserved": 500}}    # ledger-only (no memory_max)
-    sup.workers[3] = {"grant": {"scope": "/a", "memory_max": 300}}     # enforced
-    sup.workers[4] = {"grant": {"scope": "/b", "memory_max": 200}}     # enforced
+    sup.workers[2] = {"grant": {"worker_id": "7", "reserved": "500"}}  # ledger-only (no memory_max)
+    # Real enforced grants carry memory_max as a STRING -- the guard must count it.
+    sup.workers[3] = {"grant": {"scope": "/a", "memory_max": "300"}}   # enforced
+    sup.workers[4] = {"grant": {"scope": "/b", "memory_max": "200"}}   # enforced
     sigma, n = sup._sum_live_worker_caps()
     assert sigma == 500
     assert n == 2
@@ -149,6 +154,39 @@ def test_guard_skip_tick_when_pool_nonempty_and_next_would_breach(tmp_path):
     # A skip-tick denial, NOT a terminal (a retirement will free room).
     assert not isinstance(exc.value, WorkerAdmitTerminal)
     assert "outer-cap" in str(exc.value)
+
+
+def test_guard_skip_tick_warns_once_that_pool_is_outer_cap_bounded(tmp_path, capsys):
+    # The Σ_live>0 skip-tick is otherwise silent (the growth path swallows the
+    # denial). A pool capped BELOW the requested worker count by the outer cap is a
+    # governance fact the run must not stay silent about -- say it exactly once.
+    _make_cgroup(tmp_path / "outer", memory_max=1000)
+    sup = _real_mode_supervisor(tmp_path / "outer", base=100, margin=100)
+    sup._run_worker_count = 20
+    for _ in range(8):
+        _add_live_worker(sup, 100)
+    for _ in range(3):
+        with pytest.raises(WorkerAdmitDenied):
+            sup._would_breach_outer_cap(100)
+    err = capsys.readouterr().err
+    assert err.count("pool bounded by the OUTER-SCOPE cap") == 1
+    assert "requested 20" in err
+
+
+def test_env_bytes_accepts_bare_zero_and_warns_on_garbage(monkeypatch, capsys):
+    # per_relay=0 (a bare "0") is how the branch-exit gate pins K exactly; it must
+    # parse to 0, not silently fall back to the default.
+    monkeypatch.setenv("AIRA_AITEST_OUTER_CAP_ALLOWANCE_PER_RELAY", "0")
+    assert supervisor_module._env_bytes("AIRA_AITEST_OUTER_CAP_ALLOWANCE_PER_RELAY", 8 << 20) == 0
+    monkeypatch.setenv("AIRA_AITEST_OUTER_CAP_MARGIN", "32M")
+    assert supervisor_module._env_bytes("AIRA_AITEST_OUTER_CAP_MARGIN", 0) == 32 << 20
+    monkeypatch.delenv("AIRA_AITEST_OUTER_CAP_MARGIN", raising=False)
+    assert supervisor_module._env_bytes("AIRA_AITEST_OUTER_CAP_MARGIN", 99) == 99  # unset -> default, silent
+    assert capsys.readouterr().err == ""
+    # A NON-EMPTY typo warns and keeps the default (AIRA-223), never silent.
+    monkeypatch.setenv("AIRA_AITEST_OUTER_CAP_MARGIN", "12x")  # x is not a valid unit
+    assert supervisor_module._env_bytes("AIRA_AITEST_OUTER_CAP_MARGIN", 99) == 99
+    assert "not a valid size" in capsys.readouterr().err
 
 
 def test_guard_retirement_frees_room(tmp_path):

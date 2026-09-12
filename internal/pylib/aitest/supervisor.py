@@ -798,6 +798,7 @@ class Supervisor:
         self._outer_cap_per_relay = _env_bytes("AIRA_AITEST_OUTER_CAP_ALLOWANCE_PER_RELAY", _OUTER_CAP_ALLOWANCE_PER_RELAY)
         self._outer_cap_margin = _env_bytes("AIRA_AITEST_OUTER_CAP_MARGIN", _OUTER_CAP_MARGIN)
         self._outer_cap_unreadable_warned = False
+        self._outer_cap_bounded_warned = False
 
     def bootstrap(self):
         """Relocate this process into its own child scope so the outer scope
@@ -1482,15 +1483,28 @@ class Supervisor:
         guard inert). Σ_live sums live workers' granted memory.max caps; N_live is
         their count (each holds one live `aira worker-admit` relay). Skips fallback
         workers (grant is None) and ledger-only grants (no memory_max): neither holds
-        an enforced cgroup cap against the outer scope."""
+        an enforced cgroup cap against the outer scope.
+
+        `grant["memory_max"]` is a STRING in a real grant (the worker-admit outcome
+        parser stores every field as a string; _validate_grant validates int() but
+        does not store it back), so coerce here rather than isinstance-check for int
+        -- an int check would skip every real grant and leave the guard INERT, a
+        false-pass a porous int-only test fixture hides (caught by the real-cgroup
+        e2e)."""
         total = 0
         count = 0
         for state in self.workers.values():
             grant = state.get("grant")
             if not grant:
                 continue
-            cap = grant.get("memory_max")
-            if isinstance(cap, int) and cap > 0:
+            raw = grant.get("memory_max")
+            if raw is None:
+                continue  # fallback (grant None handled above) or ledger-only (no memory_max)
+            try:
+                cap = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if cap > 0:
                 total += cap
                 count += 1
         return total, count
@@ -1552,9 +1566,21 @@ class Supervisor:
                      n_live, self._outer_cap_per_relay, sigma_live, request))
         if sigma_live == 0:
             raise WorkerAdmitOuterCapExceeded(
-                "worker-admit state=terminal class=request-invalid reason=outer-cap-exceeded: "
+                "worker-admit state=denied class=request-invalid reason=outer-cap-exceeded: "
                 "even one worker plus the supervisor allowance would breach the outer scope "
                 "cap, and no live worker will retire to free room -- %s" % detail)
+        # Σ_live > 0: a skip-tick, not terminal. Say it ONCE (the swap-cap/cpu-slots
+        # pattern): a pool silently capped BELOW the requested worker count -- because
+        # the outer cap, not the daemon ledger, is the binding constraint -- is a
+        # governance fact the run must not stay silent about, even though the growth
+        # path itself recovers on the next retirement.
+        if not self._outer_cap_bounded_warned:
+            self._outer_cap_bounded_warned = True
+            sys.stderr.write(
+                "aira aitest: pool bounded by the OUTER-SCOPE cap at %d live worker(s) "
+                "(requested %d); further growth waits for a retirement, not the daemon "
+                "ledger -- %s\n" % (n_live, self._run_worker_count, detail)
+            )
         raise WorkerAdmitDenied(
             "worker-admit state=denied class=contended reason=outer-cap-would-breach: "
             "admitting another worker would breach the outer scope cap; skipping this tick "
