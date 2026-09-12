@@ -421,17 +421,18 @@ class WorkerAdmitRequestInvalid(WorkerAdmitTerminal):
     It was called WorkerAdmitRequestTooLarge, which AIRA-45 recorded as an
     actively misleading diagnostic even before AIRA-39: it was already
     raised for protocol-level argument rejections and version skew, neither
-    of which is a sizing problem. AIRA-39 then added two members that are
-    not about the request at all -- worker-scope-create-failed and
-    worker-id-space-exhausted are daemon-side cgroupfs facts about the outer
-    scope. The name now matches the class token exactly, which is the same
-    one-vocabulary rule the rest of this channel follows.
+    of which is a sizing problem. AIRA-39 then added a member that is
+    not about the request at all -- worker-scope-create-failed is a
+    daemon-side cgroupfs fact about the outer scope. The name now matches
+    the class token exactly, which is the same one-vocabulary rule the rest
+    of this channel follows. (S2a deleted worker-id-space-exhausted: worker
+    ids are unique by construction, so there is no id space to exhaust.)
 
     Current members: the daemon's exceeds-ceiling (this request's
     estimated-byte sizing can never fit under the outer scope's cap even
-    with zero contention), its worker-scope-create-failed and
-    worker-id-space-exhausted verdicts, its protocol-level argument
-    rejection, and the CLI's own pre-dial argument validation."""
+    with zero contention), its worker-scope-create-failed verdict, its
+    protocol-level argument rejection, and the CLI's own pre-dial argument
+    validation."""
     pass
 
 
@@ -510,6 +511,12 @@ class WorkerPlacementFailed(Exception):
 # ---------------------------------------------------------------------------
 
 _OUTCOME_MARKER = "aira-worker-admit"
+
+# The ci-shim outer-scope sentinel (runner.ShimConfineSlice). In shim mode there
+# is no cgroup and no AIRA_CONFINE_SCOPE_ID, so the bootstrap reports this as the
+# "outer" scope and a worker-admit sends it verbatim as parent_scope_id — the one
+# value the daemon exempts from canonical-confine-id parsing (S2a §16d).
+_OUTER_SCOPE_SHIM_SENTINEL = "ci-shim"
 
 _OUTCOME_STATES = frozenset((
     "granted",
@@ -940,6 +947,20 @@ class Supervisor:
         self.queue.insert(0, nodeid)
         return True
 
+    def _parent_scope_id(self):
+        """The suite confine scope id a worker-admit declares as its parent
+        (design S2a §16d). It is the supervisor's OWN AIRA_CONFINE_SCOPE_ID -- the
+        scope id `aira confine` published to this process -- NOT self.outer_scope,
+        which is a PATH. In ci-shim mode there is no cgroup and no scope id, so the
+        outer scope is the sentinel and the worker-admit sends the sentinel
+        verbatim (the one value the daemon exempts from canonical parsing). Any
+        other empty case sends "", which the daemon REFUSES fail-closed: a worker
+        must always declare the job it is a sub-reservation of."""
+        scope_id = os.environ.get("AIRA_CONFINE_SCOPE_ID", "").strip()
+        if not scope_id and self.outer_scope == _OUTER_SCOPE_SHIM_SENTINEL:
+            return _OUTER_SCOPE_SHIM_SENTINEL
+        return scope_id
+
     def _spawn_admit_relay(self, estimated_bytes, probe):
         """Popen `aira worker-admit` for one worker lease. A CLAIM (probe=False)
         omits --max-wait, which the daemon reads as "block until the ledger fits"
@@ -951,7 +972,8 @@ class Supervisor:
         if not command:
             raise WorkerAdmitUnavailable("AIRA_AITEST_WORKER_ADMIT_CMD is unset")
         argv = [command, "worker-admit", "--job-id", str(os.getpid()),
-                "--outer-scope", self.outer_scope, "--estimated-bytes", str(estimated_bytes)]
+                "--outer-scope", self.outer_scope, "--estimated-bytes", str(estimated_bytes),
+                "--parent-scope-id", self._parent_scope_id()]
         if probe:
             argv += ["--max-wait", _SPECULATIVE_MAX_WAIT]
         try:

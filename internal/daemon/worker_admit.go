@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"aira/internal/core"
@@ -83,6 +82,13 @@ type workerAdmitRequest struct {
 	// decision in this slice.
 	signature      string
 	estimatedBytes int64
+	// parentScopeID is the suite confine scope id this worker is a sub-reservation
+	// OF (design §16d). It is an EXPLICIT required wire field — the supervisor's own
+	// AIRA_CONFINE_SCOPE_ID, NOT derived from the outer-scope PATH — so a worker can
+	// never silently become a job: an empty one is refused, and a non-empty one must
+	// be parseConfineScopeID-parseable (the ci-shim sentinel exempt) so the daemon
+	// can copy the PARENT supervisor pid out of it for the worker scope name (Task 1).
+	parentScopeID string
 	// nonBlocking is true when max_wait_ms is PRESENT on the wire AND equals 0 (the
 	// aitest pool-sizing probe, design §6/§8): report current available and reserve
 	// nothing. max_wait_ms ABSENT, or PRESENT and positive, is a BLOCKING claim —
@@ -90,24 +96,6 @@ type workerAdmitRequest struct {
 	// or the client closing its connection (design §4/§6). A positive value no
 	// longer imposes a timeout (mirrors the S13 confine admit path).
 	nonBlocking bool
-}
-
-// workerParentScopeID maps a worker's outer cgroup path to the suite scope-id the
-// worker lease is a sub-reservation OF (design §8). A confine job's scope
-// directory is ".aira-<scopeID>" (confineScopeDirName), so the suite's scope-id is
-// the outer directory's base with that prefix stripped. Setting the worker lease's
-// parentScopeID to this is what makes the shared exclusivity gate (exclusiveGate.
-// blocks) treat the holder's OWN aitest workers as its internal progress — the
-// exact exemption the deleted exclusiveDeniesWorkerAdmit provided, now expressed as
-// a lease property rather than a bespoke worker gate.
-//
-// It only needs to MATCH a holder scope-id when the worker's suite is itself the
-// exclusive holder (`aira confine --exclusive --delegate-ram -- pytest`); a
-// non-".aira-" base (aitest run outside confine) yields a harmless non-empty value
-// that matches no holder and still marks the lease a sub-reservation (so a drain
-// elsewhere does not block it).
-func workerParentScopeID(outerScope string) string {
-	return strings.TrimPrefix(filepath.Base(filepath.Clean(outerScope)), ".aira-")
 }
 
 // validateWorkerAdmitArgs parses the worker-admit wire arguments. Since S15 there
@@ -150,6 +138,26 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	}
 	if req.signature, err = str("signature", false); err != nil {
 		return workerAdmitRequest{}, err
+	}
+	// parent_scope_id is REQUIRED (design §16d): a worker must always declare the
+	// suite it is a sub-reservation of, so it can never silently become a job. A
+	// non-empty value must be parseConfineScopeID-parseable (mirror admit.go's
+	// exclusive_holder / parent_scope_id checks) so Task 1 can extract the parent
+	// supervisor pid — the ci-shim sentinel is the one exempt value, and it is tied
+	// to shim mode on BOTH fields so a sentinel parent can never ride a real outer
+	// scope (nor the reverse).
+	if req.parentScopeID, err = str("parent_scope_id", true); err != nil {
+		return workerAdmitRequest{}, err
+	}
+	parentIsSentinel := req.parentScopeID == runner.ShimConfineSlice
+	outerIsSentinel := req.outerScope == runner.ShimConfineSlice
+	if parentIsSentinel != outerIsSentinel {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit parent_scope_id and outer_scope disagree about ci-shim mode (parent %q, outer %q)", CodeProtocol, req.parentScopeID, req.outerScope)
+	}
+	if !parentIsSentinel {
+		if _, _, _, _, parsed := runner.ParseConfineScopeID(req.parentScopeID); !parsed {
+			return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit parent_scope_id %q is not a canonical confine scope id", CodeProtocol, req.parentScopeID)
+		}
 	}
 	// exactAdmitInt64 (admit.go) — overflow-safe float64->int64, so an arbitrary
 	// huge float64 cannot truncate unchecked into a plausible small reserve.
@@ -358,11 +366,11 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 
-	// The suite scope-id this worker is a sub-reservation OF. Resolved BEFORE the id
-	// is minted, because in real mode the worker scope NAME embeds the PARENT
-	// supervisor pid copied out of this id (S2a §16a) — the pid the Task-5 escape
-	// exemption checks locally against os.Getpid().
-	parentScopeID := workerParentScopeID(req.outerScope)
+	// The suite scope-id this worker is a sub-reservation OF — the EXPLICIT wire
+	// field (design §16d), validated non-empty and parseable above. In real mode the
+	// worker scope NAME embeds the PARENT supervisor pid copied out of this id (S2a
+	// §16a) — the pid the Task-5 escape exemption checks locally against os.Getpid().
+	parentScopeID := req.parentScopeID
 
 	// Mint the worker's scope id + path BEFORE enqueue so the lease has a stable
 	// scope-id key. Real mode mints a first-class confine id

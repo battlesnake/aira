@@ -1319,6 +1319,7 @@ func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 		Proto: ProtocolVersion, Scope: scope,
 		Request: core.Request{Verb: "worker-admit", Args: map[string]any{
 			"job_id": "job-1", "outer_scope": workerTestOuterScope, "estimated_bytes": float64(workerAdmitEstimatedBytesMin),
+			"parent_scope_id": workerTestParentScopeID,
 		}},
 	}); err != nil {
 		t.Fatal(err)

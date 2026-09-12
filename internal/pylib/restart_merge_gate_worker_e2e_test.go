@@ -309,7 +309,7 @@ func TestRestartMergeGateAitestPoolReanchorsAcrossRestart(t *testing.T) {
 	// Place the supervisor directly into the real outer scope at creation, the same
 	// clone3(CLONE_INTO_CGROUP) mechanism the S16 e2e uses.
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(h.outerFile.Fd())}
-	command.Env = append(os.Environ(),
+	command.Env = append(environForRealDaemonAitest(),
 		"PYTHONPATH="+filepath.Dir(h.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+h.pythonDir,
@@ -369,7 +369,7 @@ func TestRestartMergeGateAitestPoolReanchorsAcrossRestart(t *testing.T) {
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Second))
 	probe := runner.RequestWorkerAdmit(probeCtx, runner.WorkerAdmitClientRequest{
 		SocketPath: h.paths.SocketPath, JobID: "freeze-probe", OuterScope: h.outer,
-		EstimatedBytes: restartGatePytestReserve, MaxWait: 0,
+		ParentScopeID: e2eConfineScopeID, EstimatedBytes: restartGatePytestReserve, MaxWait: 0,
 	})
 	probeCancel()
 	if probe.State != runner.WorkerAdmitStateUnevaluated || probe.Reason != runner.WorkerAdmitReasonSnapshot {
@@ -456,6 +456,10 @@ func (h *restartGateHarness) startWorkerRelay(t *testing.T, name string) *worker
 	t.Helper()
 	cmd := exec.Command(h.binary, "worker-admit",
 		"--job-id", name, "--outer-scope", h.outer,
+		// S2a §16d: worker-admit requires an explicit, canonical parent_scope_id (the
+		// daemon refuses an empty one). A direct-relay harness has no supervisor to
+		// source AIRA_CONFINE_SCOPE_ID from, so it passes the canonical id directly.
+		"--parent-scope-id", e2eConfineScopeID,
 		"--estimated-bytes", strconv.Itoa(restartGateWorkerReserve))
 	cmd.Env = os.Environ() // carries the harness's XDG_RUNTIME_DIR -> the test socket
 	stdin, err := cmd.StdinPipe()

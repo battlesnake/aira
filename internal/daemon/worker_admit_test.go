@@ -84,11 +84,25 @@ func workerAdmitServer(t *testing.T, slicePath string, sliceMax int64) *Server {
 func workerArgs(outerScope string, estimatedBytes int64, maxWaitPresent bool, maxWaitMS int64) map[string]any {
 	args := map[string]any{
 		"job_id": "job-1", "outer_scope": outerScope, "estimated_bytes": float64(estimatedBytes),
+		// S2a Task 2: parent_scope_id is a REQUIRED explicit field. Derive a
+		// consistent one from the outer scope — the sentinel in shim mode, else the
+		// dir-name-minus-".aira-" (what the supervisor's AIRA_CONFINE_SCOPE_ID is).
+		"parent_scope_id": workerArgsParentScopeID(outerScope),
 	}
 	if maxWaitPresent {
 		args["max_wait_ms"] = float64(maxWaitMS)
 	}
 	return args
+}
+
+// workerArgsParentScopeID derives a test request's parent_scope_id from its outer
+// scope: the ci-shim sentinel when the outer is the sentinel, else the outer dir's
+// base minus ".aira-".
+func workerArgsParentScopeID(outerScope string) string {
+	if outerScope == runner.ShimConfineSlice {
+		return runner.ShimConfineSlice
+	}
+	return strings.TrimPrefix(filepath.Base(outerScope), ".aira-")
 }
 
 // startWorkerAdmit drives one workerAdmitConnection over a net.Pipe and returns the
@@ -144,30 +158,83 @@ func awaitReturn(t *testing.T, done chan struct{}, what string) {
 }
 
 func TestValidateWorkerAdmitArgsParsesFieldsAndBlockingModes(t *testing.T) {
-	// A blocking claim: max_wait_ms ABSENT.
+	// A blocking claim: max_wait_ms ABSENT. (parent_scope_id is required and must
+	// be canonical; the outer scope here is a path, not the sentinel.)
 	req, err := validateWorkerAdmitArgs(map[string]any{
 		"job_id": "job-1", "outer_scope": "/outer/scope", "signature": "suite:abc",
-		"estimated_bytes": float64(4 * workerTestMiB),
+		"estimated_bytes": float64(4 * workerTestMiB), "parent_scope_id": workerTestParentScopeID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if req.jobID != "job-1" || req.outerScope != "/outer/scope" || req.signature != "suite:abc" ||
-		req.estimatedBytes != 4*workerTestMiB || req.nonBlocking {
+		req.estimatedBytes != 4*workerTestMiB || req.parentScopeID != workerTestParentScopeID || req.nonBlocking {
 		t.Fatalf("req=%+v, want absent max_wait_ms parsed as a blocking claim", req)
 	}
 	// A non-blocking probe: max_wait_ms present AND zero.
-	if req, err := validateWorkerAdmitArgs(workerArgs("/outer", workerTestMiB, true, 0)); err != nil || !req.nonBlocking {
+	if req, err := validateWorkerAdmitArgs(workerArgs(workerTestOuterScope, workerTestMiB, true, 0)); err != nil || !req.nonBlocking {
 		t.Fatalf("present-zero max_wait_ms: req=%+v err=%v, want nonBlocking", req, err)
 	}
 	// A positive max_wait_ms is a blocking claim (no timeout), NOT a probe and NOT refused.
-	if req, err := validateWorkerAdmitArgs(workerArgs("/outer", workerTestMiB, true, 30*60*1000+1)); err != nil || req.nonBlocking {
+	if req, err := validateWorkerAdmitArgs(workerArgs(workerTestOuterScope, workerTestMiB, true, 30*60*1000+1)); err != nil || req.nonBlocking {
 		t.Fatalf("positive max_wait_ms: req=%+v err=%v, want accepted as a blocking claim (no ceiling refusal)", req, err)
 	}
 }
 
+// verifies: S2a Task 2 — parent_scope_id is an explicit REQUIRED wire field. The
+// daemon refuses an empty one (E_DAEMON_PROTOCOL, so a worker can never silently
+// become a job), validates a non-empty one is parseConfineScopeID-parseable (the
+// ci-shim sentinel exempt), and ties the sentinel to shim mode on BOTH fields so a
+// parent sentinel with a real outer (or vice versa) is refused.
+func TestValidateWorkerAdmitArgsRequiresParseableParentScope(t *testing.T) {
+	clone := func(extra map[string]any) map[string]any {
+		out := map[string]any{
+			"job_id": "job-1", "outer_scope": workerTestOuterScope,
+			"estimated_bytes": float64(workerTestMiB), "parent_scope_id": workerTestParentScopeID,
+		}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
+	protocolRefusal := func(t *testing.T, args map[string]any, wantSubstr string) {
+		t.Helper()
+		_, err := validateWorkerAdmitArgs(args)
+		if err == nil || !strings.Contains(err.Error(), CodeProtocol) || !strings.Contains(err.Error(), wantSubstr) {
+			t.Fatalf("err=%v, want a %s refusal mentioning %q", err, CodeProtocol, wantSubstr)
+		}
+	}
+
+	// Canonical parent id parses and is carried on the request.
+	if req, err := validateWorkerAdmitArgs(clone(nil)); err != nil || req.parentScopeID != workerTestParentScopeID {
+		t.Fatalf("canonical parent_scope_id: req=%+v err=%v", req, err)
+	}
+	// Absent and empty are both refused — a worker MUST carry a parent.
+	absent := clone(nil)
+	delete(absent, "parent_scope_id")
+	protocolRefusal(t, absent, "parent_scope_id")
+	protocolRefusal(t, clone(map[string]any{"parent_scope_id": ""}), "parent_scope_id")
+	// A non-empty but non-canonical, non-sentinel parent id is refused.
+	protocolRefusal(t, clone(map[string]any{"parent_scope_id": "not-a-confine-id"}), "parent_scope_id")
+	// The ci-shim sentinel is accepted ONLY when the outer scope is also the sentinel.
+	shim := map[string]any{
+		"job_id": "job-1", "outer_scope": runner.ShimConfineSlice,
+		"estimated_bytes": float64(workerTestMiB), "parent_scope_id": runner.ShimConfineSlice,
+	}
+	if req, err := validateWorkerAdmitArgs(shim); err != nil || req.parentScopeID != runner.ShimConfineSlice {
+		t.Fatalf("shim sentinel parent_scope_id: req=%+v err=%v", req, err)
+	}
+	// Mode-gate: a sentinel parent with a real outer, or a real parent with a
+	// sentinel outer, is refused — the sentinel binds to shim mode on both fields.
+	protocolRefusal(t, clone(map[string]any{"parent_scope_id": runner.ShimConfineSlice}), "parent_scope_id")
+	protocolRefusal(t, map[string]any{
+		"job_id": "job-1", "outer_scope": runner.ShimConfineSlice,
+		"estimated_bytes": float64(workerTestMiB), "parent_scope_id": workerTestParentScopeID,
+	}, "parent_scope_id")
+}
+
 func TestValidateWorkerAdmitArgsRejectsInvalidRequiredFields(t *testing.T) {
-	base := map[string]any{"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerTestMiB)}
+	base := map[string]any{"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerTestMiB), "parent_scope_id": workerTestParentScopeID}
 	for _, tc := range []struct {
 		name  string
 		mut   func(map[string]any)
@@ -176,6 +243,7 @@ func TestValidateWorkerAdmitArgsRejectsInvalidRequiredFields(t *testing.T) {
 		{"missing job_id", func(a map[string]any) { delete(a, "job_id") }, "job_id"},
 		{"missing outer_scope", func(a map[string]any) { delete(a, "outer_scope") }, "outer_scope"},
 		{"missing estimated_bytes", func(a map[string]any) { delete(a, "estimated_bytes") }, "estimated_bytes"},
+		{"missing parent_scope_id", func(a map[string]any) { delete(a, "parent_scope_id") }, "parent_scope_id"},
 		{"relative outer_scope", func(a map[string]any) { a["outer_scope"] = "relative/path" }, "outer_scope"},
 		{"below-min estimated_bytes", func(a map[string]any) { a["estimated_bytes"] = float64(workerTestMiB - 1) }, "estimated_bytes"},
 		{"over-max estimated_bytes", func(a map[string]any) { a["estimated_bytes"] = float64(admitMaxReserve + 1) }, "estimated_bytes"},
@@ -197,6 +265,7 @@ func TestValidateWorkerAdmitArgsRejectsInvalidRequiredFields(t *testing.T) {
 func TestValidateWorkerAdmitArgsAcceptsShimSentinelUncleaned(t *testing.T) {
 	req, err := validateWorkerAdmitArgs(map[string]any{
 		"job_id": "job-1", "outer_scope": runner.ShimConfineSlice, "estimated_bytes": float64(workerTestMiB),
+		"parent_scope_id": runner.ShimConfineSlice,
 	})
 	if err != nil || req.outerScope != runner.ShimConfineSlice {
 		t.Fatalf("req=%+v err=%v, want the ci-shim sentinel accepted verbatim", req, err)

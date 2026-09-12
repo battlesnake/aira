@@ -1154,7 +1154,7 @@ func parseAitestBootstrapArgs(argv []string) ([]string, map[string]string, error
 
 func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
-	valid := map[string]bool{"job-id": true, "outer-scope": true, "estimated-bytes": true, "signature": true, "max-wait": true}
+	valid := map[string]bool{"job-id": true, "outer-scope": true, "estimated-bytes": true, "signature": true, "max-wait": true, "parent-scope-id": true}
 	for i := 0; i < len(argv); i++ {
 		name := strings.TrimPrefix(argv[i], "--")
 		if !valid[name] {
@@ -2017,7 +2017,8 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	defer stop()
 	outcome := runner.RequestWorkerAdmit(signalCtx, runner.WorkerAdmitClientRequest{
 		SocketPath: paths.SocketPath, JobID: options["job-id"], OuterScope: options["outer-scope"],
-		Signature: options["signature"], EstimatedBytes: estimatedBytes, MaxWait: maxWait,
+		ParentScopeID: options["parent-scope-id"],
+		Signature:     options["signature"], EstimatedBytes: estimatedBytes, MaxWait: maxWait,
 	})
 	if !outcome.Granted() {
 		// The daemon's (or the transport's) own classification is relayed

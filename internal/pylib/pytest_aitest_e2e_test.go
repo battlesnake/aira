@@ -76,6 +76,29 @@ func environWithoutAiraRealCgroup() []string {
 	return filtered
 }
 
+// e2eConfineScopeID is the canonical confine scope id the real-daemon aitest e2e
+// harnesses publish as AIRA_CONFINE_SCOPE_ID, so the supervisor's worker-admit
+// carries a parseable parent_scope_id (S2a §16d — the daemon REFUSES an empty one,
+// else every real-daemon aitest e2e reds on refuse-empty). A FIXED id keeps the
+// harness hermetic rather than depending on whether this go test binary happens to
+// run under `aira confine` (which would otherwise supply one of its own).
+const e2eConfineScopeID = "CONFINE-e2e-outer-111111-1"
+
+// environForRealDaemonAitest returns os.Environ() with AIRA_CONFINE_SCOPE_ID
+// REPLACED by the canonical harness value — filtering, not appending a duplicate
+// key, for the reason environWithoutAiraRealCgroup documents.
+func environForRealDaemonAitest() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "AIRA_CONFINE_SCOPE_ID=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return append(filtered, "AIRA_CONFINE_SCOPE_ID="+e2eConfineScopeID)
+}
+
 func TestEnvironWithoutAiraRealCgroupFiltersItOut(t *testing.T) {
 	// Regression test for a real bug (Fable re-gate): TestRealPytestAitest
 	// EndToEndFallback used to forward os.Environ() verbatim into its child
@@ -382,7 +405,7 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 	command.WaitDelay = 15 * time.Second
 
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
+	command.Env = append(environForRealDaemonAitest(),
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
@@ -492,7 +515,7 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	// level in: "an outer scope already exists and is about to run its
 	// supervisor", not "aira confine itself parses argv and creates it".
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
+	command.Env = append(environForRealDaemonAitest(),
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
@@ -580,7 +603,7 @@ func TestRealPytestAitestOuterCapGuardTerminal(t *testing.T) {
 	command.Dir = filepath.Join(harness.aitestDir, "testdata")
 	command.WaitDelay = 15 * time.Second
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
+	command.Env = append(environForRealDaemonAitest(),
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
@@ -656,7 +679,7 @@ func TestRealPytestAitestOuterCapGuardSkipTick(t *testing.T) {
 	command.Dir = filepath.Join(harness.aitestDir, "testdata")
 	command.WaitDelay = 15 * time.Second
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
+	command.Env = append(environForRealDaemonAitest(),
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,

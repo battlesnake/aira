@@ -183,6 +183,7 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	}
 
 	command := exec.Command(binary, "worker-admit", "--job-id", "job-1", "--outer-scope", outer,
+		"--parent-scope-id", strings.TrimPrefix(filepath.Base(outer), ".aira-"),
 		"--estimated-bytes", strconv.FormatInt(request, 10), "--max-wait", "10s")
 	stdin, err := command.StdinPipe()
 	if err != nil {

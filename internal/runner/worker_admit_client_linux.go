@@ -56,9 +56,14 @@ func (l *WorkerAdmitLease) Close() error {
 }
 
 type WorkerAdmitClientRequest struct {
-	SocketPath     string
-	JobID          string
-	OuterScope     string
+	SocketPath string
+	JobID      string
+	OuterScope string
+	// ParentScopeID is the suite confine scope id this worker is a sub-reservation
+	// of (design §16d): the supervisor's own AIRA_CONFINE_SCOPE_ID (the ci-shim
+	// sentinel in shim mode), NOT the outer-scope path. The daemon REFUSES an empty
+	// one, so the relay always sends what the launcher published.
+	ParentScopeID  string
 	Signature      string
 	EstimatedBytes int64
 	// MaxWait == 0 is a non-blocking PROBE (report current available, reserve
@@ -147,7 +152,7 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 	frame.Request.Verb = "worker-admit"
 	frame.Request.Args = map[string]any{
 		"job_id": req.JobID, "outer_scope": req.OuterScope, "signature": req.Signature,
-		"estimated_bytes": req.EstimatedBytes,
+		"estimated_bytes": req.EstimatedBytes, "parent_scope_id": req.ParentScopeID,
 	}
 	if probe {
 		// PRESENT and zero → non-blocking probe. A CLAIM omits it → the daemon blocks.
