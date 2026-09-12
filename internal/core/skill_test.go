@@ -594,6 +594,7 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			// text's legitimate "WITHOUT `--delegate-ram`" failure-mode note.
 			{"no `--delegate-ram`", "tells agents to omit --delegate-ram (the flag aitest requires)"},
 			{"only a `--delegate-ram` launch is guaranteed", "claims delegate-ram is the only shape with a finite outer cap; --memory-max and a declared --memory-reserve are finite too, they just never receive the coordinates"},
+			{"guaranteed such a cap on every path", "claims a --delegate-ram parent is capped on every path; post-collapse (T07) an unpinned, non-admitted delegate launch is uncapped like any ordinary confine job"},
 			{"the slice only ever holds", "overstates slice accounting; see the adds-no-slice-ledger-charge assertion above"},
 			{"silently ignored", "reproduces the AIRA-223 footgun wording: a size suffix is now accepted, not silently ignored"},
 			{"PLAIN INTEGER BYTE COUNT", "the env var now accepts a 1024-based size suffix, so the plain-integer-only claim is stale (AIRA-223)"},
