@@ -155,9 +155,15 @@ _UNKNOWN = object()
 # All three are env-overridable via the shared AIRA_AITEST_ESTIMATED_BYTES size
 # grammar so the real-cgroup branch-exit gate can PIN them (making the admitted-pool
 # count deterministic) and v7-4 can measure against them without a code change.
-_OUTER_CAP_ALLOWANCE_BASE = 256 << 20       # 256 MiB starting point
+# These are SUPERVISOR/relay/band RSS estimates -- NOT the per-worker size default
+# (that is v7-2's AIRA_AITEST_DEFAULT_BYTES, a separate 256 MiB knob). They must be
+# SMALL relative to a realistic outer cap: allowance is the uncapped .aira-supervisor's
+# own footprint (the pytest process + N live relays), not a per-worker figure, and an
+# over-large base would refuse legitimate spawns under a modest outer cap. v7-4
+# measures the real .aira-supervisor/memory.peak at full pool to replace all three.
+_OUTER_CAP_ALLOWANCE_BASE = 64 << 20        # 64 MiB supervisor-process starting point
 _OUTER_CAP_ALLOWANCE_PER_RELAY = 8 << 20    # 8 MiB per live relay starting point
-_OUTER_CAP_MARGIN = 64 << 20                # 64 MiB safety band starting point
+_OUTER_CAP_MARGIN = 32 << 20                # 32 MiB safety band starting point
 
 
 def _env_bytes(name, default):
