@@ -32,11 +32,11 @@ _GROWTH_PROBE_INTERVAL_SECONDS = 1.0
 
 # AIRA-180. The pool-usage subject key separator. It is NOT the NUL byte a
 # confine ResourceSignature joins with, for one hard reason: this key travels as
-# an argv element to the `aira worker-peak` relay, and argv strings are
-# NUL-terminated -- a NUL would silently truncate the key at the first
-# separator, collapsing every pool in a repository into one subject. \x1f (ASCII
-# unit separator) is argv-safe and just as absent from real paths and pytest
-# arguments.
+# an argv element to the `aira confine-report` CLI face (S17; formerly a
+# separately-named relay), and argv strings are NUL-terminated -- a NUL would
+# silently truncate the key at the first separator, collapsing every pool in a
+# repository into one subject. \x1f (ASCII unit separator) is argv-safe and just
+# as absent from real paths and pytest arguments.
 _POOL_KEY_SEPARATOR = "\x1f"
 # One relay invocation per RUN (not per worker), so this bound is generous
 # without ever sitting on the dispatch loop.
@@ -1770,7 +1770,10 @@ class Supervisor:
         )
 
     def _report_pool_usage(self):
-        """Emit this run's ONE pool sample through the `aira worker-peak` relay.
+        """Emit this run's ONE pool sample through the `aira confine-report`
+        CLI face (S17: this used to be a separately-named CLI relay; the CLI
+        verb is now spelled the same as the wire verb it always sent to the
+        daemon -- internal/daemon/confine_report.go, unchanged).
 
         One subprocess per RUN, not per retirement: _retire_worker fires on
         every recycle, so a relay spawn there would put a fork on the dispatch
@@ -1794,7 +1797,7 @@ class Supervisor:
         command = os.environ.get("AIRA_AITEST_WORKER_ADMIT_CMD", "")
         if not command:
             return
-        argv = [command, "worker-peak", "--signature", signature]
+        argv = [command, "confine-report", "--signature", signature]
         if self._pool_peak_max is not None:
             argv += ["--peak-rss", str(self._pool_peak_max)]
         if self._pool_budget is not None:

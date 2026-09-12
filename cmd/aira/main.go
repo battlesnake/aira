@@ -303,12 +303,12 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runWorkerAdmitCommand(context.Background(), options, stdin, stdout, stderr)
 	}
-	if verb == "worker-peak" {
+	if verb == "confine-report" {
 		if jsonOutput {
-			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for worker-peak")
+			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine-report")
 			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
-		return runWorkerPeakCommand(context.Background(), options, stderr)
+		return runConfineReportCommand(context.Background(), options, stderr)
 	}
 	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-budget" {
 		request, requestErr := buildRequest(verb, positional, options)
@@ -742,8 +742,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "worker-admit" {
 		return parseWorkerAdmitArgs(argv)
 	}
-	if verb == "worker-peak" {
-		return parseWorkerPeakArgs(argv)
+	if verb == "confine-report" {
+		return parseConfineReportArgs(argv)
 	}
 	if verb == "run" {
 		return parseRunArgs(argv)
@@ -1174,13 +1174,18 @@ func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 	return nil, options, nil
 }
 
-// parseWorkerPeakArgs parses the aitest supervisor's ONE end-of-run pool sample.
+// parseConfineReportArgs parses the aitest supervisor's ONE end-of-run pool
+// sample, sent over the retained `confine-report` verb (S17: this CLI face
+// replaces a now-deleted, separately-named CLI relay for the same frame — the
+// same wire verb the daemon has always answered
+// (internal/daemon/confine_report.go), now named the same on the CLI as on the
+// wire instead of through a second, differently-named hop).
 //
 // CLI-only, like worker-admit, and for the same reason: its caller is the aitest
 // supervisor relaying to the daemon, not an agent. It is deliberately not a
 // dispatch-table verb — there is nothing an agent would ever ask it, and adding
 // an MCP tool for a machine-to-machine report would be surface with no reader.
-func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
+func parseConfineReportArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	valued := map[string]bool{"signature": true, "peak-rss": true, "budget": true, "budget-basis": true}
 	for i := 0; i < len(argv); i++ {
@@ -1190,7 +1195,7 @@ func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
 			continue
 		}
 		if !valued[name] {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for worker-peak", name)
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine-report", name)
 		}
 		// A value may legitimately begin with "--" only if it is a signature,
 		// and a pytest argument genuinely can (`--aitest-workers=auto`). So the
@@ -1203,7 +1208,7 @@ func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
 		options[name] = argv[i]
 	}
 	if options["signature"] == "" {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --signature is required for worker-peak")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --signature is required for confine-report")
 	}
 	if (options["budget"] == "") != (options["budget-basis"] == "") {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --budget and --budget-basis must be given together")
@@ -1211,14 +1216,21 @@ func parseWorkerPeakArgs(argv []string) ([]string, map[string]string, error) {
 	return nil, options, nil
 }
 
-// runWorkerPeakCommand relays one aitest pool sample to the daemon.
+// runConfineReportCommand relays one aitest pool sample to the daemon over the
+// retained confine-report verb.
+//
+// The kind is fixed to pytest-worker rather than exposed as a --kind flag: this
+// CLI face has exactly one caller (the aitest supervisor, which cannot call
+// runner.ReportPeakSample directly the way an in-process `aira confine` job
+// does at its own teardown), so a generic --kind option would be surface with
+// no second reader.
 //
 // It is best-effort by design and says so on stderr rather than failing loudly:
 // the caller is a pytest run that has already finished its real work, and a
 // suite must never be reported differently because AIRA could not record how
 // much memory it used. Nothing is fabricated to fill a gap — an unparseable or
 // absent term is simply not sent, and the store records it as unevaluated.
-func runWorkerPeakCommand(ctx context.Context, options map[string]string, stderr io.Writer) int {
+func runConfineReportCommand(ctx context.Context, options map[string]string, stderr io.Writer) int {
 	report := runner.ConfinePeakReport{
 		Kind:        string(store.ResourcePeakKindPytestWorker),
 		Signature:   options["signature"],

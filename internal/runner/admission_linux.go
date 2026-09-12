@@ -748,8 +748,10 @@ func reportConfinePeak(ctx context.Context, request ConfineRequest, report Confi
 
 // ReportPeakSample sends one usage sample to the daemon over the project-less
 // admit socket. Exported because the aitest supervisor's pool sample travels the
-// same verb through the `aira worker-peak` relay, and a second transport for the
-// same frame is exactly the kind of duplicate that drifts.
+// same verb through the `aira confine-report` CLI face (S17 retired the prior,
+// separately-named CLI relay; the CLI verb is now spelled the same as the wire
+// verb it always sent), and a second transport for the same frame is exactly
+// the kind of duplicate that drifts.
 func ReportPeakSample(ctx context.Context, socketPath string, report ConfinePeakReport) error {
 	if strings.TrimSpace(socketPath) == "" || report.Signature == "" {
 		return errors.New("daemon report unavailable")
