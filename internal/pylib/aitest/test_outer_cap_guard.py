@@ -316,7 +316,7 @@ def test_try_grow_one_routes_terminal_to_fail_queue(tmp_path, monkeypatch):
     assert sup.results["t2"] == "unevaluated"
 
 
-def test_try_grow_one_skips_tick_without_draining_queue(tmp_path, monkeypatch):
+def test_try_grow_one_skips_tick_without_draining_queue(tmp_path, monkeypatch, capsys):
     _make_cgroup(tmp_path / "outer", memory_max=1000)
     sup = _real_mode_supervisor(tmp_path / "outer", base=100, margin=100)
     sup.queue = ["t1", "t2"]
@@ -324,8 +324,40 @@ def test_try_grow_one_skips_tick_without_draining_queue(tmp_path, monkeypatch):
         _add_live_worker(sup, 100)
     live_before = set(sup.workers)
     monkeypatch.setattr(sup, "_probe_available", lambda: (10 ** 12, 1024))
+    # If the guard (wrongly) lets this through -- e.g. a mutant that drops the Σ_live
+    # term -- spawn_worker reaches acquire_worker; the sentinel makes that LOUD instead
+    # of a silent WorkerAdmitUnavailable that would make this test pass for the wrong
+    # reason (the porosity the build-review flagged).
+    monkeypatch.setattr(sup, "acquire_worker",
+                        lambda *a, **k: (_ for _ in ()).throw(_AcquireReached()))
     sup._run_estimated_bytes = 100  # Σ_live>0 breach -> WorkerAdmitDenied -> skip
     assert sup._try_grow_one() is False
     assert sup.queue == ["t1", "t2"]                # NOT drained -- a retirement frees room
     assert set(sup.workers) == live_before          # pool keeps its live workers
     assert sup.results == {}
+    # The non-porous signal: the guard's skip-tick must have FIRED. The "pool bounded
+    # by the OUTER-SCOPE cap" notice is emitted once on the first skip-tick; under a
+    # Σ_live-dropped mutant the guard passes, no skip-tick, no notice -> this reds.
+    assert "pool bounded by the OUTER-SCOPE cap" in capsys.readouterr().err
+
+
+def test_wait_for_admission_propagates_terminal_not_infinite_retry(tmp_path):
+    # The EMPTY-POOL entry (run() startup / _replace_worker's last-worker case) calls
+    # _wait_for_admission_or_disable, which retries WorkerAdmitDenied FOREVER. So the
+    # guard's Σ_live==0 disposition MUST be the TERMINAL WorkerAdmitOuterCapExceeded
+    # (not Denied): the wait loop lets a terminal PROPAGATE (its excepts catch only
+    # Denied/Unavailable/PlacementFailed) to the caller's `except WorkerAdmitTerminal`
+    # -> _fail_queue_terminal. This pins that the loop does NOT catch+retry a terminal
+    # (an empty pool would otherwise spin forever, nothing freeing room). The guard's
+    # own Σ_live==0 -> terminal is covered by
+    # test_spawn_worker_guard_short_circuits_before_acquire_when_terminal.
+    sup = _real_mode_supervisor(tmp_path / "outer", base=100, margin=100)
+    calls = []
+
+    def spawn():
+        calls.append(1)
+        raise WorkerAdmitOuterCapExceeded("terminal: even one worker would breach")
+
+    with pytest.raises(WorkerAdmitOuterCapExceeded):
+        sup._wait_for_admission_or_disable(spawn)
+    assert calls == [1]  # called exactly ONCE -- propagated, not caught-and-retried

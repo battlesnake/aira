@@ -641,6 +641,11 @@ func TestRealPytestAitestOuterCapGuardTerminal(t *testing.T) {
 // (Also verified live: without the string->int coercion in _sum_live_worker_caps the
 // guard is inert here, Σ_live always 0, and no notice fires.)
 func TestRealPytestAitestOuterCapGuardSkipTick(t *testing.T) {
+	// KNOWN false-fail under box contention (RANT-44 class): the 2nd startup spawn
+	// needs the daemon to report available_cpu >= 1. On a CPU-saturated box the pool
+	// can stay at 1 worker, so the "pool bounded by the OUTER-SCOPE cap" skip-tick
+	// notice never fires and this gate reds. That is an environment starvation, NOT a
+	// guard defect -- re-run on a quieter box before treating a red here as a bug.
 	harness := newRealDaemonAndCgroupTestHarness(t) // outer memory.max = 256 MiB
 	outerDir := harness.outerFile.Name()
 
