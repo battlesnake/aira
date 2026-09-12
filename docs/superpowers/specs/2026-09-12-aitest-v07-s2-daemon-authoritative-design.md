@@ -79,6 +79,10 @@ The model is the following seven mechanisms, each detailed below:
 
 ## 4. Sibling worker scopes; `--delegate-ram` is an ordinary confine job
 
+> **Refined by GATE-1 (§16).** Nesting silently provided four things the sibling model must
+> provide explicitly — unique naming/enumeration, kill propagation, escape-attestation
+> containment, and sub-reservation marking. §16 specifies each; read it alongside this section.
+
 **What is already true (do not rebuild it).** Since v0.6 S15 the daemon already treats
 each worker as a *separate signed-ledger lease against the one slice ledger*
 (`worker_admit.go` resolves `DefaultConfineSlice`, enqueues the worker as an ordinary
@@ -368,5 +372,91 @@ can follow in either order; S2e gates the final tunable values.
 
 ---
 
-*Authoritative for S2. The S1 spec remains authoritative for S1 history and the `aira_mem`
-marker grammar.*
+## 16. GATE-1 refinements (2026-09-12, Fable plan-gate)
+
+The first plan-gate affirmed the architecture (the topology move is the right fix;
+the ledger is already slice-authoritative; the cgroup-v2 drain reasoning is sound) but found
+that the old *nesting* was silently doing four jobs. The sibling model must provide each
+explicitly; these are design-level and supersede the lighter treatment in §4/§8/§12.
+
+**(a) Worker scopes are first-class confine scopes.** A worker scope is created under the
+slice with a unique, parseable, pid-bearing confine name (e.g.
+`CONFINE-aitest-w<seq>-<supervisor-pid>-<stamp>`), **not** `worker-N`. Rationale: the id
+allocator was keyed per-outer-scope (`workerScopeFor`/`allocateWorkerScopeID` re-seed by
+scanning the *outer* dir); two `--delegate-ram` jobs under the one slice would both mint
+`worker-1` → `EEXIST` → the reseed finds nothing → the second suite spins `contended` forever.
+And `worker-N` is not parseable by `parseConfineScopeID`, so neither the orphan reaper nor
+`confine --list` would see it. Fix: mint through the real confine grammar, key the counter on
+the slice (or make ids unique by construction), and set the lease `scopeID` = the scope
+dir-name-minus-`.aira-` so the reaper's `hasLiveLease` veto and `oomsteer`'s
+`confineScopeDirName` line up. Workers thus become reaped / listed / killable like any confine
+job — by construction, not by a bespoke path.
+
+**(b) Kill propagation is the daemon's job, on peer-EOF.** `cgroup.kill` is subtree-recursive
+only; with siblings, `confine --kill` / `--timeout` / Ctrl-C / the parent's own `oom.group`
+kill the supervisor + relays but leave worker *processes* running in sibling scopes while
+relay-EOF has already freed the ledger lease. Fix: the daemon `cgroup.kill`s **and** rmdirs a
+worker scope on that worker relay's **peer-EOF** (`peerCtx.Done()`) — and **never on daemon
+`s.stopping`** (a daemon restart EOFs every relay, but workers must survive and re-declare, per
+the v0.6 reconnect contract). This is new daemon logic, not supervisor cleanup.
+
+**(c) Escape-attestation must exempt the worker migration.** `monitorScopeMembership` witnesses
+any process once seen in the parent's `cgroup.procs` and later alive outside the subtree as an
+escape → it would stamp `scope-integrity=descendant-escaped` on essentially every delegate run
+(a worker forks in the parent, then `place_self`s into its sibling scope). Fix: exempt a
+migration **into a live-leased sibling worker scope whose `parent_scope_id` == this scope**
+(positive identification, not a name-prefix guess). A delegate run must attest
+`scope-integrity=contained`.
+
+**(d) Workers must stay sub-reservations.** Today `workerParentScopeID` is always non-empty, so
+`isSubReservation` holds and a worker never counts in `outstandingJobs` (headroom scaling,
+`sliceProvablyEmpty`, drain / `--exclusive` convergence, `confine --list` "N jobs"). Moving
+linkage to an explicit `parent_scope_id` field creates an empty-value path (the e2e harness and
+ci-shim publish no scope id) that would make each worker a *job* — and the gates would pass
+anyway. Fix: the daemon **refuses an empty `parent_scope_id`** (`E_DAEMON_PROTOCOL`) or
+substitutes a synthetic non-holder marker; ci-shim publishes a sentinel; the supervisor sends
+`AIRA_CONFINE_SCOPE_ID` (the *id*, not `self.outer_scope` which is a path).
+
+**Decision-log updates (supersede §12 where they differ):**
+- **`--memory-reserve` on a `--delegate-ram` job now behaves exactly as on any confine job**
+  (sets the ledger reserve and, absent `--memory-max`, the parent `memory.max`). The old
+  `--delegate-ram --memory-reserve 512M` idiom ("reserve 512 MiB framework overhead, workers
+  separate") is **retired** — under the new model it would cap the parent (and its `make`) at
+  512 MiB. The `internal/core/skill.go` prose and confine help that teach the old idiom must be
+  updated. (Consequence of "delegate = ordinary confine job"; no compat obligation.)
+- **§4's "first run over-reserves once" was wrong; corrected.** An ordinary history estimate is
+  *never* fitted — over the ceiling it is **refused** terminally (`E_ADMIT_TOO_LARGE`); only the
+  p90-prior/default is fitted. A signature whose *old whole-subtree* peak × safety ≥
+  ceiling−headroom would get a **refused** first run. Fix: **namespace the parent signature** so
+  a parent-only scope starts with fresh history (it genuinely measures a different thing — the
+  supervisor/make tree, not the whole subtree), avoiding both the refusal and a stale
+  over-estimate. (Replaces the "accept one wasteful run" note.)
+- **Daemon-down fallback pool must cap at 1 under a finite parent cap.**
+  `_spawn_fallback_worker` forks unconfined workers *in the supervisor's cgroup* = the parent,
+  now reserve-sized; `NumCPU` fallback workers in a reserve-sized parent is a whole-suite
+  `oom.group` kill by construction. Cap fallback at 1 when the parent cap is finite, or require
+  `--require-admission`.
+
+**Simplification taken (owner's hard rule).** With the drain gone, the `aitest-bootstrap`
+subprocess has no job left but "echo outer + admission mode". Delete it: the launcher publishes
+`AIRA_AITEST_OUTER_SCOPE` (→ `parent_scope_id`) and a new `AIRA_AITEST_ADMISSION`
+(`cgroup-sub-scope` | `ledger-only`) at launch; remove the `aitest-bootstrap` verb,
+`BootstrapAitestSupervisor`, `drainIntoScope`, `moveIntoScope`, `scopeHasFiniteMemoryMax`, and
+the supervisor's `bootstrap()` subprocess. The supervisor runs directly in the parent confine
+scope (legal: with sibling workers the parent has no controller-enabled children, so the
+cgroup-v2 "no internal processes" rule no longer bites).
+
+**Measurement channel** (§7 carry): `_emit_measurement_report` read `supervisor_scope/memory.peak`;
+that scope is gone. Redirect to the parent's `memory.peak` (now supervisor-only) and drop the
+`supervisor_scope=` token + `_cleanup_supervisor_scope`.
+
+**e2e gates must not run on the production slice.** The harness daemon's default `sliceResolver`
+resolves the real `aira.slice`; post-change, test worker scopes would land on the production
+slice under production naming (forbidden by `cgrouptest`). Gates must use the `admitResolveSlice`
+testing seam to point the daemon at the harness parent (with a finite `memory.max`), drive a
+real alloc-and-hold testdata fixture (the existing fixtures allocate nothing or self-OOM), and
+assert via a **deterministic** anchor (each granted `scope_path` from `pool-report.json` is a
+direct child of the slice), not a "walk the tree while a worker is live" timing race.
+
+*Authoritative for S2, as refined by §16. The S1 spec remains authoritative for S1 history and
+the `aira_mem` marker grammar.*
