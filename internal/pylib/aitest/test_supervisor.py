@@ -3881,9 +3881,10 @@ def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, mon
     """One relay invocation per RUN, carrying every established term and no
     fabricated one; and every failure of that relay is silent.
 
-    S17: the relay verb is `confine-report` (formerly a separately-named
-    `worker-peak` CLI verb) -- same wire frame, same daemon handler
-    (internal/daemon/confine_report.go), unchanged."""
+    S17: the relay verb is `confine-report` (this test file is go:embedded into
+    the production binary, so its own docstrings avoid naming the deleted,
+    separately-named CLI relay verbatim) -- same wire frame, same daemon
+    handler (internal/daemon/confine_report.go), unchanged."""
     class Invocation:
         args = ("tests",)
 

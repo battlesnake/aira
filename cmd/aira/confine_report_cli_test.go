@@ -145,3 +145,67 @@ func TestRunConfineReportCommandSendsPytestWorkerSampleToDaemon(t *testing.T) {
 		t.Fatalf("confine-kind stats=%+v, want no rows -- the pytest-worker sample must not leak into the confine kind", confineStats)
 	}
 }
+
+// verifies: S17 — the two swapped dispatch arms (run-path and parse-path) in
+// main.go actually reach parseConfineReportArgs/runConfineReportCommand through
+// the real argv entrypoint, not just as directly-called Go functions.
+//
+// This is the gap the function-level tests above leave open: they call
+// parseConfineReportArgs/runConfineReportCommand directly, so a dropped or
+// misspelled `if verb == "confine-report"` dispatch arm would not be caught --
+// an unwired verb falls through to buildRequest's generic bottom path instead,
+// which does not recognise "confine-report" and fails with a DIFFERENT code
+// (buildRequest has no such case, so its default returns E_UNKNOWN_VERB /
+// E_INTERNAL rather than the confine-report-specific E_CONFINE_UNAVAILABLE this
+// test pins). The pylib e2e staying green does NOT catch this either --
+// _report_pool_usage is fail-open, so an unwired verb would just make the
+// subprocess exit non-zero and the suite would swallow it silently.
+func TestConfineReportDispatchArmReachesRunConfineReportCommand(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(base, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	var stdout, stderr bytes.Buffer
+	exit := runWithInput([]string{"confine-report", "--signature", "sig"}, &stdout, &stderr, strings.NewReader(""))
+	if want := codes.ExitForCode("E_CONFINE_UNAVAILABLE"); exit != want {
+		t.Fatalf("exit=%d want %d (E_CONFINE_UNAVAILABLE -- an unwired verb would fail with a different code) stdout=%q stderr=%q",
+			exit, want, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "E_CONFINE_UNAVAILABLE") {
+		t.Fatalf("stderr=%q, want E_CONFINE_UNAVAILABLE", stderr.String())
+	}
+}
+
+// verifies: S17 — --json is rejected for confine-report through the real argv
+// entrypoint (the run-path dispatch arm's own guard), mirroring every other
+// project-less machine-to-machine verb.
+func TestConfineReportRejectsJSONThroughRun(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exit := runWithInput([]string{"confine-report", "--json", "--signature", "sig"}, &stdout, &stderr, strings.NewReader(""))
+	if want := codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID"); exit != want {
+		t.Fatalf("exit=%d want %d stdout=%q stderr=%q", exit, want, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "not valid for confine-report") {
+		t.Fatalf("stderr=%q, want a mention that --json is not valid for confine-report", stderr.String())
+	}
+}
+
+// verifies: S17 — the full argv-to-daemon path succeeds end to end: Run's
+// dispatch arm, parseConfineReportArgs, runConfineReportCommand, and a real
+// daemon.Server all agree on the wire frame.
+func TestConfineReportDispatchArmSucceedsAgainstARealDaemon(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(base, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := daemon.NewServer(paths)
+	startCommandDaemon(t, server)
+
+	var stdout, stderr bytes.Buffer
+	exit := runWithInput([]string{"confine-report", "--signature", "sig", "--peak-rss", "1048576"}, &stdout, &stderr, strings.NewReader(""))
+	if exit != 0 {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+}
