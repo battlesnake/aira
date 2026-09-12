@@ -14,6 +14,35 @@ func (s *Server) SetAdmitReadMemoryForTest(fn func(string) (int64, int64, int64,
 	s.admitReadMemory = fn
 }
 
+// GrantedLeasesForTest snapshots the daemon's signed ledger as scope_id ->
+// reserve over every admit queue, counting exactly the granted && accounted
+// waiters (the same "Σleases" definition sliceProvablyEmpty and
+// rederiveLedgerLocked use). It is the EXPORTED twin of the S13 confine merge
+// gate's in-package gateLeases helper, provided so the S18 worker-path merge
+// gate — which lives in the EXTERNAL pylib_test package to break the
+// daemon<->pylib import cycle — can assert the exact scope-id key-set and Σ of
+// re-anchored worker leases across a daemon restart without reaching into these
+// unexported fields itself.
+func (s *Server) GrantedLeasesForTest() map[string]int64 {
+	s.admitRegistryMu.Lock()
+	queues := make([]*sliceQueue, 0, len(s.admitQueues))
+	for _, q := range s.admitQueues {
+		queues = append(queues, q)
+	}
+	s.admitRegistryMu.Unlock()
+	out := map[string]int64{}
+	for _, q := range queues {
+		q.mu.Lock()
+		for _, w := range q.waiters {
+			if w != nil && w.state == admitGranted && w.accounted {
+				out[w.scopeID] = w.reserve
+			}
+		}
+		q.mu.Unlock()
+	}
+	return out
+}
+
 // SetAdmitResolveSliceForTest overrides slice resolution so an external test can
 // pin a deterministic slice path without depending on the host's real aira.slice
 // cgroup. S15's worker-admit resolves the slice (unlike the pre-S15 path that read
