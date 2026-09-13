@@ -63,22 +63,83 @@ func readOuterMemoryEventCounter(t *testing.T, scopeDir, key string) int64 {
 	return -1
 }
 
+// readCgroupMemoryPeak reads a cgroup scope's memory.peak — the maximum, since the
+// scope was created, of the instantaneous total memory charged to it AND its
+// descendants (cgroup-v2, hierarchical). Per the AIRA honesty rule an unreadable
+// counter FAILS the test (it is unevaluated, never a fabricated 0), because the
+// aggregate proof rests on this number.
+func readCgroupMemoryPeak(t *testing.T, scopeDir string) int64 {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(scopeDir, "memory.peak"))
+	if err != nil {
+		t.Fatalf("cannot read %q memory.peak (the aggregate proof is unevaluated, not zero): %v", scopeDir, err)
+	}
+	peak, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		t.Fatalf("%q memory.peak is unparseable %q: %v", scopeDir, strings.TrimSpace(string(data)), err)
+	}
+	return peak
+}
+
+// readCgroupMemoryMax reads a cgroup scope's memory.max as a byte count, failing
+// the test if it is unreadable or the literal "max" (unbounded): the caller uses it
+// to confirm the harness wrote the finite parent cap the proof compares against, and
+// an unbounded or unreadable value would make that check vacuous.
+func readCgroupMemoryMax(t *testing.T, scopeDir string) int64 {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(scopeDir, "memory.max"))
+	if err != nil {
+		t.Fatalf("cannot read %q memory.max (the parent-cap match is unevaluated): %v", scopeDir, err)
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "max" {
+		t.Fatalf("%q memory.max is unbounded (\"max\"): the harness must write a finite parent cap", scopeDir)
+	}
+	value, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		t.Fatalf("%q memory.max is unparseable %q: %v", scopeDir, text, err)
+	}
+	return value
+}
+
 // TestRealPytestAitestNoWholeSuiteKillOnAggregate is Gate B (AIRA-229): several
 // workers that each allocate AND HOLD ~100 MiB run concurrently under a 256 MiB
 // parent scope. Under the sibling topology each worker charges the 16 GiB slice
 // and its own 256 MiB cap, so the ~256 MiB parent (supervisor + relays only) is
-// never approached and its oom.group never fires — every test PASSES. The
-// positive, mutation-independent proof is that the SUM of the per-worker peaks
-// EXCEEDS the parent cap: a shared parent cap of that size WOULD have been
-// breached, yet the parent's oom_group_kill stays 0.
+// never approached and its oom.group never fires — every test PASSES.
+//
+// The positive, mutation-independent proof is a SOUND-BY-CONSTRUCTION witness of
+// genuine CONCURRENCY, not just of aggregate volume: the harness-slice memory.peak
+// MINUS the outer(parent) scope's memory.peak EXCEEDS the parent cap. cgroup-v2
+// memory.peak on the slice records the maximum, over the run, of the INSTANTANEOUS
+// total charged to the whole slice subtree (supervisor in the outer scope + every
+// sibling worker); outer.peak is an upper bound on the supervisor's usage at that
+// same instant, so (slice.peak − outer.peak) is a LOWER BOUND on the worker memory
+// resident SIMULTANEOUSLY at the slice's peak instant. The review measured
+// 374,214,656 − 49,565,696 = 325 MiB > 256 MiB.
+//
+// Why sequential workers CANNOT satisfy it (non-porosity by construction, not by
+// luck): a worker scope's memory.max is perScopeCapBytes == parentCap, so with at
+// most ONE worker ever concurrent the slice's instantaneous total is bounded by
+// (outer usage) + parentCap, hence slice.peak ≤ outer.peak + parentCap and the
+// strict `slice.peak − outer.peak > parentCap` is impossible. It can hold ONLY if
+// ≥2 workers were charged to the slice at one instant — exactly the concurrent
+// breach a shared 256 MiB parent cap would have oom.group-killed. The proof depends
+// on worker cap ≤ parentCap (both are perScopeCapBytes here); the structural guard
+// below confirms nothing but the outer scope and sibling worker scopes charges the
+// slice, so slice.peak carries no third population.
 //
 // Non-porous:
 //   - False-pass trap: assert all 6 alloc-hold tests actually ran and PASSED
 //     (a gate that greened on zero workers / zero tests would prove nothing) and
 //     scoped_workers >= 2 (the aggregate needs at least two live workers).
-//   - Positive aggregate proof: Σ(worker peak) > parent memory.max, so the
-//     no-kill result is meaningful (the load was genuinely capable of breaching a
-//     shared cap), not an artefact of a tiny workload.
+//   - Positive aggregate proof: slice.peak − outer.peak > parentCap (see above),
+//     which sequential workers cannot satisfy — so the no-kill result witnesses a
+//     real concurrent over-cap, not an artefact of a tiny or serialised workload.
+//   - Slice population guard: every child cgroup of the slice is either the outer
+//     scope or a sibling worker scope, so no unaccounted process inflates slice.peak.
+//   - Corroboration: Σ(worker peak) > parentCap too — kept, but it is NOT the proof
+//     (sequential workers also satisfy it), so it is a weaker, secondary signal.
 //   - No worker self-OOM masquerading as a pass: oom_group_killed == false and
 //     every per-worker sample oom != true (a self-OOM would report the test
 //     `unevaluated`, not `passed`, which the "6 passed / 0 unevaluated" assertion
@@ -99,6 +160,14 @@ func readOuterMemoryEventCounter(t *testing.T, scopeDir, key string) int64 {
 func TestRealPytestAitestNoWholeSuiteKillOnAggregate(t *testing.T) {
 	harness := newRealDaemonAndCgroupTestHarness(t) // parent(outer) memory.max = 256 MiB
 	outerDir := harness.outerFile.Name()
+
+	// ONE constant drives BOTH the per-worker cap (AIRA_AITEST_ESTIMATED_BYTES →
+	// each worker scope's memory.max) AND the parent-cap yardstick the aggregate
+	// proof below compares against. They must be the SAME number for the
+	// sound-by-construction non-porosity argument to hold (worker cap ≤ parentCap):
+	// see the doc comment. It also equals the outer scope's own memory.max, which
+	// the harness writes as 256 MiB — asserted below so a harness drift is caught.
+	const perScopeCapBytes = int64(256) << 20
 
 	measureDir := filepath.Join(t.TempDir(), "measure")
 	if err := os.MkdirAll(measureDir, 0o755); err != nil {
@@ -123,7 +192,7 @@ func TestRealPytestAitestNoWholeSuiteKillOnAggregate(t *testing.T) {
 		// 256 MiB per-worker cap: ~100 MiB hold + interpreter baseline stays well
 		// under it (no self-OOM), while 2-3 concurrent workers' peaks SUM past the
 		// 256 MiB parent cap.
-		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(256<<20),
+		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(int(perScopeCapBytes)),
 		"AIRA_AITEST_MEASURE_DIR="+measureDir,
 		"AIRA_REAL_CGROUP=1",
 	)
@@ -195,17 +264,76 @@ func TestRealPytestAitestNoWholeSuiteKillOnAggregate(t *testing.T) {
 		}
 	}
 
-	// POSITIVE AGGREGATE PROOF: the sum of the per-worker peaks EXCEEDS the parent
-	// cap, so the no-kill result is meaningful — the workload genuinely could have
-	// breached a shared 256 MiB parent cap, and did not because the workers are
-	// siblings under the slice. This holds independently of the nesting mutation.
-	const parentCap = int64(256) << 20
-	if sumPeak <= parentCap {
-		t.Fatalf("Σ(worker peak)=%d <= parent cap %d: the aggregate never actually exceeded a shared cap, so "+
-			"'no whole-suite kill' is not a meaningful result here — raise the hold or worker count:\n%s", sumPeak, parentCap, report)
+	// parentCap is the yardstick: the memory.max a NESTED (pre-S2a) topology would
+	// have shared across the workers. It is the SAME constant as the per-worker cap
+	// (see perScopeCapBytes) — the sound-by-construction proof below needs worker
+	// cap ≤ parentCap — and it must equal the outer scope's own memory.max, which
+	// the harness writes. Read that and assert the match so a harness drift (a
+	// changed outer cap that would silently invalidate parentCap) reds here.
+	const parentCap = perScopeCapBytes
+	if outerMax := readCgroupMemoryMax(t, outerDir); outerMax != parentCap {
+		t.Fatalf("outer scope memory.max=%d != parentCap %d: the harness and this gate disagree about the "+
+			"parent cap the proof compares against; keep them one number", outerMax, parentCap)
 	}
-	t.Logf("AIRA-229 aggregate: %d scoped workers, Σ(peak)=%d bytes > parent cap %d bytes, parent oom_group_kill=0",
-		scoped, sumPeak, parentCap)
+
+	// SLICE POPULATION GUARD: the aggregate proof reads the slice's hierarchical
+	// memory.peak, which is only a clean witness of WORKER memory if nothing else
+	// charges the slice. The harness runs its daemon in-process (not a cgroup child
+	// of the slice) and IsolatedScopeParent is a fresh MkdirTemp per test, so the
+	// only children are the outer scope and the sibling worker scopes; assert that
+	// so a stray population cannot inflate slice.peak. (Workers may already be
+	// reaped by the time this runs — the relay cgroup.kills+rmdirs each on peer-EOF
+	// — so this mainly rejects a PERSISTENT third scope; the per-sample Gate A fold
+	// above already pins that the live workers were direct slice children.)
+	entries, err := os.ReadDir(sliceDir)
+	if err != nil {
+		t.Fatalf("cannot enumerate the slice dir %q (slice-population guard is unevaluated): %v", sliceDir, err)
+	}
+	outerBase := filepath.Base(outerDir)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == outerBase || strings.HasPrefix(name, ".aira-CONFINE-") {
+			continue // the outer scope, or a sibling confine/worker scope
+		}
+		t.Fatalf("slice %q has an unexpected child cgroup %q (neither the outer scope %q nor a `.aira-CONFINE-` "+
+			"worker scope) — it would charge the slice's memory.peak and invalidate the aggregate proof",
+			sliceDir, name, outerBase)
+	}
+
+	// POSITIVE AGGREGATE PROOF (sound-by-construction, concurrency-witnessing):
+	// slice.peak − outer.peak > parentCap. slice.peak is the max over the run of the
+	// instantaneous total charged to the whole slice subtree; outer.peak upper-bounds
+	// the supervisor's usage at that instant; the difference is a lower bound on the
+	// worker memory resident SIMULTANEOUSLY. Because a single worker is capped at
+	// parentCap, only ≥2 concurrent workers can drive the difference strictly past
+	// parentCap — the exact concurrent over-cap a shared parent would oom.group-kill,
+	// which here did not fire (oom_group_kill == 0, asserted above). Sequential
+	// workers cannot satisfy this (slice.peak ≤ outer.peak + parentCap), so it is
+	// non-porous independently of the nesting mutation.
+	slicePeak := readCgroupMemoryPeak(t, sliceDir)
+	outerPeak := readCgroupMemoryPeak(t, outerDir)
+	concurrentWorkerFloor := slicePeak - outerPeak
+	if concurrentWorkerFloor <= parentCap {
+		t.Fatalf("slice.peak(%d) − outer.peak(%d) = %d <= parentCap %d: the run never held more than the parent "+
+			"cap in CONCURRENT worker memory, so 'no whole-suite kill' is not a meaningful result — raise the "+
+			"hold or worker count, or re-run on a quieter box that lets the pool grow:\n%s",
+			slicePeak, outerPeak, concurrentWorkerFloor, parentCap, report)
+	}
+
+	// Corroboration only (NOT the proof): Σ(per-worker peak) > parentCap. Sequential
+	// workers also satisfy this — each peak is recorded independently, at possibly
+	// different instants — so it witnesses aggregate volume, not concurrency. Kept as
+	// a weaker secondary signal beside the sound witness above.
+	if sumPeak <= parentCap {
+		t.Fatalf("Σ(worker peak)=%d <= parent cap %d: the aggregate never reached a shared cap's worth of total "+
+			"work — raise the hold or worker count:\n%s", sumPeak, parentCap, report)
+	}
+	t.Logf("AIRA-229 aggregate: %d scoped workers, slice.peak−outer.peak=%d > parentCap %d (concurrency witness), "+
+		"Σ(peak)=%d (corroboration), parent oom_group_kill=0",
+		scoped, concurrentWorkerFloor, parentCap, sumPeak)
 }
 
 // readPoolReport reads and parses the measurement pool-report.json a confined run
