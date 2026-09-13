@@ -310,6 +310,16 @@ def test_acquire_worker_maps_every_class_to_its_exception(tmp_path, monkeypatch,
         assert False, "expected %s" % expected.__name__
     except expected as exc:
         assert reason in str(exc), str(exc)
+        # AIRA-235: the outcome's reason token is carried as a plain ATTRIBUTE set
+        # after construction (never a constructor kwarg -- the map yields bare
+        # Exception subclasses with no reason param, so a kwarg would TypeError the
+        # common contended tick). Asserted here, through the REAL relay path, for
+        # every class -- this mutation-kills a kwarg regression and proves the
+        # exceeds-ceiling branch in the empty-pool bootstrap has a token to read.
+        assert getattr(exc, "reason", None) == reason, (
+            "the exception must carry the outcome's reason as .reason: got %r"
+            % getattr(exc, "reason", None)
+        )
     assert supervisor.daemon_available is True, "acquire_worker must not disable the daemon itself"
 
 
@@ -2174,7 +2184,15 @@ sys.stdin.buffer.read()
 def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_queue_terminal(tmp_path, monkeypatch, pytester):
     """The SAME post-run pass (not a per-site helper) must also cover
     _fail_queue_terminal's own unevaluated-marking: nodes still queued, never
-    even dispatched, after a permanent daemon sizing rejection."""
+    even dispatched, after a permanent daemon rejection.
+
+    AIRA-235: the refusal here is a NON-ceiling request-invalid
+    (worker-scope-create-failed), which still drains the WHOLE queue via
+    _fail_queue_terminal. An exceeds-ceiling refusal now takes the per-nodeid
+    path instead (test_empty_pool_ceiling_refusal_marks_only_that_nodeid_then_retries
+    in test_cpu_growth.py), so this test uses a non-ceiling terminal to keep
+    exercising the whole-queue _fail_queue_terminal -> synthesize coverage it exists
+    for."""
     outer = tmp_path / "outer"
     outer.mkdir()
     call_state = tmp_path / "admit-calls"
@@ -2191,7 +2209,7 @@ if count == 0:
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
-    print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
+    print("aira-worker-admit state=denied class=request-invalid reason=worker-scope-create-failed")
     sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
@@ -2222,7 +2240,7 @@ else:
     assert "unevaluated" in str(synthesized[0].longrepr)
     # The daemon's own permanent-rejection reason must survive into the
     # synthesized message rather than being flattened to a generic string.
-    assert "exceeds-ceiling" in str(synthesized[0].longrepr)
+    assert "worker-scope-create-failed" in str(synthesized[0].longrepr)
     # test_one really ran, so its own three real reports replayed and it must
     # NOT also get a synthesized one.
     real = [r for r in spy.reports if r.nodeid == by_name["test_one"].nodeid]

@@ -480,6 +480,19 @@ class WorkerPlacementFailed(Exception):
 
 _OUTCOME_MARKER = "aira-worker-admit"
 
+# AIRA-235. The one reason TOKEN the supervisor branches on structurally: the
+# empty-pool bootstrap treats a request-invalid carrying this reason as "this ONE
+# test cannot fit under the slice ceiling even alone" and marks only that nodeid
+# unevaluated, where every other terminal drains the whole queue. Mirrors Go's
+# runner.WorkerAdmitReasonExceedsCeiling; the vocabulary-lockstep test holds the two
+# equal so a rename on either side fails the build rather than silently disabling the
+# per-nodeid path. (ACCEPTED coverage gap, reviewer-signed: the daemon shares this
+# token between a static ">ceiling alone" and a jobs-scaled ">ceiling right now given
+# other sessions", so a runnable near-whole-slice test MAY be per-nodeid unevaluated
+# under cross-session contention -- no worse than today's flat-512 whole-queue drain
+# on the same axis, and splitting it would need a daemon change, out of scope.)
+WORKER_ADMIT_REASON_EXCEEDS_CEILING = "exceeds-ceiling"
+
 # The ci-shim outer-scope sentinel (runner.ShimConfineSlice). In shim mode there
 # is no cgroup and no AIRA_CONFINE_SCOPE_ID, so the bootstrap reports this as the
 # "outer" scope and a worker-admit sends it verbatim as parent_scope_id — the one
@@ -1162,9 +1175,18 @@ class Supervisor:
             # grantedness-agreement check guarantees class == "granted" iff
             # state == "granted", which this branch has already excluded.
             # That check is load-bearing for this line, not decorative.
-            raise _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](
+            exc = _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](
                 _describe_outcome(outcome, diagnostic)
             )
+            # AIRA-235: carry the outcome's reason token as a plain ATTRIBUTE, set
+            # AFTER construction -- NOT a constructor kwarg. The map yields bare
+            # Exception subclasses (WorkerAdmitDenied/Unavailable/PlacementFailed)
+            # with no reason parameter, so a kwarg would TypeError the common
+            # contended tick and crash run(). Callers branch on exc.reason (the
+            # empty-pool bootstrap's per-nodeid exceeds-ceiling handling); every
+            # exception raised elsewhere simply has no .reason, which reads as None.
+            exc.reason = outcome.get("reason")
+            raise exc
         containment = outcome.get("containment")
         grant, malformed = self._validate_grant(outcome, containment)
         if malformed is not None:
@@ -1291,7 +1313,9 @@ class Supervisor:
                 "worker-admit probe returned a grant, which a non-blocking snapshot "
                 "must never do: %s" % _describe_outcome(outcome)
             )
-        raise exception(_describe_outcome(outcome))
+        exc = exception(_describe_outcome(outcome))
+        exc.reason = outcome.get("reason")  # AIRA-235: reason as an attribute (see acquire_worker)
+        raise exc
 
     def _validate_grant(self, outcome, containment):
         """Return (grant, malformed_reason). malformed_reason is None exactly
@@ -2250,13 +2274,24 @@ class Supervisor:
         if available is None:
             return False  # headroom transiently unestablished this tick
         available_bytes, available_cpu = available
-        if available_bytes < self._run_estimated_bytes or available_cpu < 1:
-            return False  # no room for another worker right now
+        if available_cpu < 1:
+            return False  # no CPU slot for another worker right now
+        # AIRA-235: largest-first. Size the new worker to the LARGEST ready test that
+        # FITS the measured headroom; big tests thus get sized workers as soon as room
+        # exists, small tests fill the remaining quota. _largest_fitting is now the
+        # SOLE byte-fit authority (it returns None when nothing fits), which is why the
+        # old flat `available_bytes < self._run_estimated_bytes` byte-floor gate is
+        # GONE: once AIRA_AITEST_WORKER_OVERHEAD_BYTES makes sub-512 needs reachable the
+        # old clause would falsely skip a growable tick. pop=False -- the queue is
+        # shrunk by the between-spawns dispatch, not here.
+        nodeid = self._largest_fitting(available_bytes, pop=False)
+        if nodeid is None:
+            return False  # no ready test fits the measured headroom this tick
         # Room a moment ago -> claim it with a BOUNDED read: a lost race (another job
         # took the room in the gap) times out to a denial and skips the tick, so a
         # growth claim can never freeze the single-threaded dispatch loop.
         try:
-            self.spawn_worker(self._run_estimated_bytes, blocking=False)
+            self.spawn_worker(self._need_for(nodeid), blocking=False)
             return True
         except WorkerAdmitDenied:
             return False
@@ -2268,6 +2303,49 @@ class Supervisor:
         except WorkerPlacementFailed as exc:
             self._disable_daemon(str(exc))  # local cgroup mechanism broken -> fall back
             return False
+
+    def _bootstrap_from_empty_pool(self):
+        """AIRA-235. Bootstrap progress from an EMPTY pool with a BLOCKING claim sized
+        to the SMALLEST ready test -- the one most likely to fit minimal free room on
+        a saturated/contended box. Shared by run()'s startup wait and _replace_worker's
+        last-worker case: both have no live worker to starve, so an unbounded blocking
+        claim is safe here where it would freeze the loop on the live-pool growth path.
+
+        This is the EMERGENCY bootstrap, not the largest-first mechanism: it ALWAYS
+        submits (never skips), which is what guarantees forward progress instead of
+        blocking forever on the biggest test while smaller runnable ones sit queued.
+        Once one worker runs, the growth path (_try_grow_one) takes over largest-first.
+
+        A daemon refusal of exceeds-ceiling means THIS one test cannot fit under the
+        slice ceiling even alone: mark only IT unevaluated (a ceiling-specific reason),
+        pop it, and retry the next-smallest -- the queue strictly shrinks, so this
+        terminates. Every OTHER terminal verdict (a non-ceiling request-invalid, or a
+        contract violation) still drains the WHOLE queue, exactly as before. The
+        isinstance guard keeps a WorkerAdmitContractViolation whole-queue even in the
+        (impossible today) event it carried the token."""
+        while self.daemon_available and not self.workers and self.queue:
+            nodeid, need = self._smallest_ready()
+            if nodeid is None:
+                return
+            try:
+                self._wait_for_admission_or_disable(
+                    lambda: self.spawn_worker(need, blocking=True)
+                )
+            except WorkerAdmitTerminal as exc:
+                if isinstance(exc, WorkerAdmitRequestInvalid) and \
+                        getattr(exc, "reason", None) == WORKER_ADMIT_REASON_EXCEEDS_CEILING:
+                    self.queue.remove(nodeid)
+                    self.results.setdefault(nodeid, "unevaluated")
+                    self._unevaluated_reasons.setdefault(
+                        nodeid,
+                        "this test's memory reservation (%d bytes) exceeds the slice "
+                        "ceiling even with no contention; lower its aira_mem or raise "
+                        "the slice ceiling" % need,
+                    )
+                    continue
+                self._fail_queue_terminal(str(exc))
+                return
+            return  # a worker now exists, or the daemon was disabled during the wait
 
     def _replace_worker(self):
         """Acquire a fresh worker if queue work remains -- shared by the recycle and
@@ -2294,15 +2372,13 @@ class Supervisor:
                 # never a blocking claim that would freeze the loop.
                 self._try_grow_one()
                 return
-            try:
-                self._wait_for_admission_or_disable(
-                    lambda: self.spawn_worker(self._run_estimated_bytes, blocking=True)
-                )
-            except WorkerAdmitTerminal as exc:
-                self._fail_queue_terminal(str(exc))
-                return
+            # Empty pool: bootstrap progress with a blocking claim sized to the
+            # SMALLEST ready test (AIRA-235). The helper marks-and-drains terminals
+            # itself, so on return either a worker exists, or the daemon was disabled
+            # (fall through to the fallback spawn), or the queue was drained.
+            self._bootstrap_from_empty_pool()
             if self.daemon_available:
-                return  # the wait succeeded -- a confined worker now exists
+                return  # a worker now exists, or the queue was drained to unevaluated
             # else: the wait's own WorkerAdmitUnavailable/WorkerPlacementFailed branch
             # already called _disable_daemon -- fall through to the fallback spawn
             # rather than leave the pool empty with queue work still undone.
@@ -2810,34 +2886,38 @@ class Supervisor:
         self._run_estimated_bytes = estimated_bytes
         self._run_worker_count = worker_count
         if self.daemon_available:
-            # Fill the pool as fast as admission allows, sizing each slot from a probe
-            # snapshot (S16). _try_grow_one is LIVE-POOL SAFE: a transient dial failure
-            # during a daemon restart is a skipped tick, never a disable. It returns
-            # False on no-room, a skipped transient, or a terminal it already drained
-            # the queue for -- any of which ends the fill; the empty-pool wait below
-            # then covers the case where nothing at all got admitted.
+            # Fill the pool as fast as admission allows, sizing each slot LARGEST-FIRST
+            # from a probe snapshot (AIRA-235: _try_grow_one sizes to the largest ready
+            # test that fits the measured headroom). _try_grow_one is LIVE-POOL SAFE: a
+            # transient dial failure during a daemon restart is a skipped tick, never a
+            # disable. It returns False on no-room, a skipped transient, or a terminal
+            # it already drained the queue for -- any of which ends the fill; the
+            # empty-pool wait below then covers the case where nothing at all got
+            # admitted.
             for _ in range(worker_count):
                 if self._pool_covers_the_queue():
                     break
                 if not self._try_grow_one():
                     break
+                # AIRA-235: dispatch BETWEEN spawns so the queue shrinks and the next
+                # _try_grow_one sizes to the next-largest UNCOVERED test -- otherwise
+                # every worker is over-reserved to the global-largest test (a
+                # concurrency regression). _try_grow_one's own `if not self.queue`
+                # guard then preserves the AIRA-37 no-surplus property.
+                self._dispatch_to_idle_workers()
             # With ZERO workers admitted and queue work remaining there is no later
             # retirement to hook a retry off of (_replace_worker only fires when an
             # existing worker retires), and _try_grow_one's probe never disables -- so a
-            # genuinely-down daemon has not been detected yet. Wait it out with a
-            # BLOCKING claim (empty pool, nothing to starve): it grants once the daemon
-            # has room, rides out a restart via retry-on-contended, or disables on a
-            # true dial failure and falls through to the fallback below (spec 3.7; a
-            # daemon that stays saturated forever means this run genuinely waits
-            # forever, which is the honest outcome, never a silent degrade to
+            # genuinely-down daemon has not been detected yet. Bootstrap it with a
+            # BLOCKING claim sized to the SMALLEST ready test (empty pool, nothing to
+            # starve): it grants once the daemon has room, rides out a restart via
+            # retry-on-contended, per-nodeid-drains an exceeds-ceiling test then retries
+            # the next, or disables on a true dial failure and falls through to the
+            # fallback below (spec 3.7; a daemon that stays saturated forever means this
+            # run genuinely waits forever, the honest outcome, never a silent degrade to
             # unconfined).
             if self.daemon_available and not self.workers and self.queue:
-                try:
-                    self._wait_for_admission_or_disable(
-                        lambda: self.spawn_worker(estimated_bytes, blocking=True)
-                    )
-                except WorkerAdmitTerminal as exc:
-                    self._fail_queue_terminal(str(exc))
+                self._bootstrap_from_empty_pool()
         if not self.daemon_available:
             # Cap TOTAL concurrent workers (already-admitted + fallback) at
             # the configured pool size -- min(worker_count,

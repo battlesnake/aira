@@ -77,6 +77,19 @@ func TestWorkerAdmitOutcomeVocabularyMatchesTheSupervisor(t *testing.T) {
 		t.Fatalf("supervisor.py does not declare %s", marker)
 	}
 
+	// AIRA-235. The one reason TOKEN the supervisor branches on structurally
+	// (the empty-pool bootstrap's per-nodeid exceeds-ceiling handling) is a
+	// duplicated scalar, pinned to Go's constant the same way _OUTCOME_MARKER is:
+	// a rename on either side fails the build rather than silently disabling the
+	// per-nodeid path. A scalar, so it is checked with strings.Contains, NOT routed
+	// through pythonSetLiteral (which delimits on the set literal's \n) / \n}).
+	if want := fmt.Sprintf("WORKER_ADMIT_REASON_EXCEEDS_CEILING = %q", runner.WorkerAdmitReasonExceedsCeiling); !strings.Contains(source, want) {
+		t.Fatalf("supervisor.py does not declare %s", want)
+	}
+	if count := strings.Count(source, "\nWORKER_ADMIT_REASON_EXCEEDS_CEILING = "); count != 1 {
+		t.Fatalf("supervisor.py defines WORKER_ADMIT_REASON_EXCEEDS_CEILING %d times; this guard requires exactly one", count)
+	}
+
 	goStates := runner.WorkerAdmitStates()
 	pyStates := pythonSetLiteral(t, source, "_OUTCOME_STATES")
 	if !slices.Equal(goStates, pyStates) {
