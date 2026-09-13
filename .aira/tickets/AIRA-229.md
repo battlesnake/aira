@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-229","project":"aira","title":"Delegate outer-cap aggregate guard is gone: Σ(worker memory.max) bounded only by the slice, so a --delegate-ram suite can be whole-suite oom.group-killed","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.6"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-230","to":"AIRA-229"},{"kind":"relates","from":"AIRA-232","to":"AIRA-229"}]}
+{"schema":1,"id":"AIRA-229","project":"aira","title":"Delegate outer-cap aggregate guard is gone: Σ(worker memory.max) bounded only by the slice, so a --delegate-ram suite can be whole-suite oom.group-killed","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.6"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-230","to":"AIRA-229"},{"kind":"relates","from":"AIRA-232","to":"AIRA-229"}]}
 ---
 > **UPDATE 2026-09-12 — PARTIALLY fixed by v0.7 S1 slice v7-1; this ticket does NOT
 > close.** v7-1 landed a CLIENT-side aggregate outer-cap guard in the aitest supervisor
@@ -99,3 +99,18 @@ class claims concurrently. This is the load-bearing v0.7 S1 correctness test.
 
 Tracked as the load-bearing correctness item of v0.7 S1 (spec §7/§8/OD3). Filing
 independently so it is visible as a known v0.6 issue even if v0.7 slips.
+
+## RESOLUTION — v0.7 S2a (PR #134 merged, 617e7f8)
+
+Closed by the daemon-authoritative topology, which **dissolves** this hazard class
+rather than guarding it. Worker scopes are now SIBLINGS under `aira.slice`, each
+admitted and charged individually against the ONE signed slice ledger — there is no
+per-outer aggregate to breach and no outer `oom.group` whole-suite kill; over-admission
+is impossible by construction. The "PROPOSED FIX" client-side aggregate guard was NOT
+implemented — it was deleted (`supervisor.py`); the daemon is the sole quota authority.
+This REVERSES the v7-1 "this ticket does NOT close" note above.
+
+Proof (real-cgroup branch-exit Gate B, `TestRealPytestAitestNoWholeSuiteKillOnAggregate`):
+a concurrent alloc-hold pool under a 256 MiB parent never fired the parent `oom.group` —
+slice.peak−outer.peak = 324,755,456 > parentCap 268,435,456 with 3 concurrent workers,
+parent oom_group_kill = 0. Two-loop reviewed; `make race` + real-gates suite green.

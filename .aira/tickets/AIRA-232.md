@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-232","project":"aira","title":"Multi-supervisor outer-cap aggregate: N aitest supervisors under one outer scope each guard only their own Σ (v7-1 client guard covers one-supervisor-per-outer only)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.7"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-232","project":"aira","title":"Multi-supervisor outer-cap aggregate: N aitest supervisors under one outer scope each guard only their own Σ (v7-1 client guard covers one-supervisor-per-outer only)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","confine","v0.7"],"hold":false,"relations":[]}
 ---
 > Found 2026-09-12 in the v7-1 build-review (Fable). v7-1 (AIRA-229) landed a CLIENT-side aggregate outer-cap guard that sums THIS supervisor's live worker caps (`self.workers`). It closes one-supervisor-per-outer (subpipe Stage-C's shape). This ticket tracks the OTHER half.
 
@@ -22,3 +22,17 @@ Record as a spec-§7 amendment; decide before S2 wires per-class sizing.
 ## BACKSTOP MEANWHILE
 
 The daemon ledger (Σ leases ≤ slice ceiling) + the MemAvailable watchdog + the outer `oom.group` (a whole-suite kill, the thing we are trying to avoid) — i.e. the spec §8 "bounded, not airtight" envelope, same as v0.6 had (v0.6 had NO client guard at all, so v7-1 is a strict improvement).
+
+## RESOLUTION — v0.7 S2a (PR #134 merged, 617e7f8)
+
+Closed by the daemon-authoritative topology. The multi-supervisor case (N supervisors
+under one outer, the `make -j` shape) is covered because the daemon is the sole quota
+authority: every worker reservation from every supervisor is serialised against the ONE
+signed slice ledger — no client aggregate, no sibling-sum, no cross-process TOCTOU.
+Neither fork in "THE FORK" above was needed as posed; the topology redesign (siblings
+under the slice, not nested under a shared outer) removes the shared outer cap entirely.
+
+Proof (real-cgroup branch-exit Gate C, `TestRealPytestAitestMultiSupervisorSafe`): two
+supervisors under one slice / one daemon serialised — max combined granted workers = 2,
+max Σ(reserve) = 536,870,912 (= the 2-worker ceiling) sampled throughout, both pid slots
+observed competing, neither parent `oom.group` fired.
