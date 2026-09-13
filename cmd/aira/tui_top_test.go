@@ -813,13 +813,16 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 //
 // verifies: AIRA-135
 // verifies: AIRA-137
+// verifies: AIRA-233 — AGE re-added (compact) after LIVE; dropped set is now OWNER/SCOPE-ID/RSS
 func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	command := "go test ./... -count=1"
 	record := topTestRecord("CONFINE-heavy-suite-31415-9f3ac1de@session-9f3ac1de", "heavy-suite", 42160*(1<<20), 9*gib)
 	record.Command = &command
+	age := int64(93784) // 1d2h3m4s -> compact "1d2h"
+	record.AgeSeconds = &age
 	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), record))
 
-	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}
+	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}
 	if !reflect.DeepEqual(model.Headers, wantHeaders) {
 		t.Fatalf("headers=%v, want %v", model.Headers, wantHeaders)
 	}
@@ -829,9 +832,10 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	if len(model.Rows) != 1 {
 		t.Fatalf("rows=%+v, want one", model.Rows)
 	}
-	// RAM is the record's live memory.current (9 GiB), and CPU is unevaluated on
-	// this single tick because a rate needs two samples.
-	wantCells := []string{"0", "heavy-suite", "4242", "yes", "42160M", "9216M", "unevaluated", command}
+	// AGE is the record's age rendered in the compact two-unit form. RAM is the
+	// record's live memory.current (9 GiB), and CPU is unevaluated on this single
+	// tick because a rate needs two samples.
+	wantCells := []string{"0", "heavy-suite", "4242", "yes", "1d2h", "42160M", "9216M", "unevaluated", command}
 	if !reflect.DeepEqual(model.Rows[0].Cells, wantCells) {
 		t.Fatalf("cells=%v, want %v", model.Rows[0].Cells, wantCells)
 	}
@@ -843,8 +847,9 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 		}
 	}
 	// The dropped columns must be gone from the header row AND from the data, or
-	// the hex is still on screen under a different name.
-	for _, gone := range []string{"OWNER", "SCOPE-ID", "RSS", "AGE"} {
+	// the hex is still on screen under a different name. (AGE was re-added
+	// 2026-09-13 in a compact form and is no longer in this list.)
+	for _, gone := range []string{"OWNER", "SCOPE-ID", "RSS"} {
 		if containsString(model.Headers, gone) {
 			t.Fatalf("headers still carry the dropped column %s: %v", gone, model.Headers)
 		}

@@ -530,6 +530,61 @@ func topRAMCell(rss *int64) string {
 	return topFormatMegabytes(*rss)
 }
 
+// topAgeCell renders a job's age for the table. AIRA-135 dropped this column in
+// the same trim that removed the OWNER/SCOPE-ID hex; the owner asked for it back,
+// so it returns in the COMPACT form below rather than the wide Go-duration string
+// `confine --list` still prints (confineAge, main.go) — a narrow age column is
+// what the width trim was actually protecting.
+//
+// nil (or a negative reading) is "unevaluated", never "0s": a scope whose age
+// could not be read (confine_manage marks it in UnevaluatedFields) is not a
+// zero-second-old scope.
+func topAgeCell(seconds *int64) string {
+	if seconds == nil || *seconds < 0 {
+		return "unevaluated"
+	}
+	return formatConfineAgeShort(*seconds)
+}
+
+// formatConfineAgeShort renders a non-negative second count as at most TWO
+// unit-fields: the most-significant NON-ZERO unit and the next unit BELOW it,
+// where the second field is omitted when it is zero (owner rule, 2026-09-13):
+//
+//	93784s (1d2h3m4s) -> "1d2h"      86700s (1d0h5m)  -> "1d"   (next unit zero)
+//	  7204s (2h0m4s)  -> "2h"          7384s (2h3m4s)  -> "2h3m"
+//	   184s (3m4s)    -> "3m4s"          45s            -> "45s"
+//	     0s           -> "0s"
+//
+// Days are computed here because time.Duration.String() has no day unit (it caps
+// at hours), so it could not produce the owner's "1d2h" example on its own.
+func formatConfineAgeShort(seconds int64) string {
+	const (
+		perDay    = 24 * 60 * 60
+		perHour   = 60 * 60
+		perMinute = 60
+	)
+	units := []struct {
+		value  int64
+		symbol string
+	}{
+		{seconds / perDay, "d"},
+		{(seconds % perDay) / perHour, "h"},
+		{(seconds % perHour) / perMinute, "m"},
+		{seconds % perMinute, "s"},
+	}
+	// The most-significant non-zero unit; falls through to seconds (the last
+	// index) when every unit is zero, so a brand-new scope reads "0s".
+	i := 0
+	for i < len(units)-1 && units[i].value == 0 {
+		i++
+	}
+	out := strconv.FormatInt(units[i].value, 10) + units[i].symbol
+	if i+1 < len(units) && units[i+1].value > 0 {
+		out += strconv.FormatInt(units[i+1].value, 10) + units[i+1].symbol
+	}
+	return out
+}
+
 // topViewModel builds the whole view: the cross-tick state for the next tick,
 // the process rows in slot order, and both bars.
 //
@@ -544,7 +599,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	// beside it because the two live readings belong together. COMMAND is last on
 	// purpose: it is the one cell with no bound on its natural width, so it absorbs
 	// the clamp instead of imposing it.
-	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}}
+	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}}
 	if result.Verdict == "unevaluated" {
 		reason := strings.TrimSpace(result.Reason)
 		if reason == "" {
@@ -595,7 +650,8 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		model.Rows = append(model.Rows, tableRow{
 			ID: scopeID, Colour: colour, Cells: []string{
 				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
-				topLiveCell(record), reserve.String(), topRAMCell(record.RSSBytes),
+				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
+				topRAMCell(record.RSSBytes),
 				topCPUCell(rate, rateKnown), topCommandCell(record.Command),
 			},
 		})
