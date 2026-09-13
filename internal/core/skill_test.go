@@ -641,9 +641,12 @@ func TestSkillNamesNothingFromTheRetiredXdistGovernor(t *testing.T) {
 		"AIRA_TEST_MEM_GOVERNOR", // armed its per-test RAM reservations
 		"AIRA_GOVERNOR",          // armed / disarmed its CPU checkpoint
 		"governor-slot",          // the deleted per-worker relay verb
-		"aira_mem(",              // its per-test RAM marker
-		"per-test gate",          // its fail-open reservation gate
-		"per-test reservation",   // what that gate obtained
+		// NOTE: the governor's per-test marker "aira_mem(" is NOT listed here — it
+		// was RE-INTRODUCED as the live aitest per-test sizing marker by v0.7 S1/S2b
+		// (AIRA-235: reservation = overhead + @aira_mem), so the string can no longer
+		// distinguish stale governor prose from current aitest guidance.
+		"per-test gate",        // its fail-open reservation gate
+		"per-test reservation", // what that gate obtained
 	}
 	for _, document := range []struct{ name, body string }{
 		{"SKILL.md", string(artifacts.SkillMD)},
