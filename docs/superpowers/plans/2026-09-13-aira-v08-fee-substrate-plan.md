@@ -350,7 +350,13 @@ boolean** — presence of `id_prefix` is the whole switch. Config validation: **
 ## Task 2 — id-accepting ticket-import verb (`aira import --tickets <file.jsonl>`)
 
 **Files:** new `internal/store/import_tickets.go` (model on `import_requirements.go`); a core verb +
-CLI face; Test `internal/store/import_tickets_test.go`.
+CLI face; **the requirement read/write verbs (`internal/store/requirement.go`) + a finding's
+`RequirementID` — route through `canonicalID`** (Task-1 follow-up: Task 1's point-(b) seam covered
+ticket ids only, but requirement PREFIXES are composed, so `aira requirement get VR-90` on a
+namespaced project currently misses the stored `FEE-VR-90`; fastest.ee brings **405 requirement rows**
+(VR/NF/IN), so this is a real cutover break, not a nicety — `GetRequirement`/`SetRequirement`/
+`AddRequirement`/`ListRequirements` + the finding `RequirementID` must canonicalize + `displayID` on
+output); Test `internal/store/import_tickets_test.go` + requirement-canonicalization assertions.
 
 **Input:** JSONL, one object per line (ALL ids BARE; aira applies the project prefix):
 `{"id":"BL-123","title":"…","status":"planned","kind":"chore","severity":"P2","body":"…","labels":["area:x"],"links":[{"kind":"blocks","to":"NF-45"}]}`
