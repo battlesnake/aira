@@ -560,6 +560,16 @@ the alternative needs a bail-branch at every site (two entangled models).
     gap backstop).
   - **(3) Flip** the `make id` wrapper to `aira id`; **(4) Unfreeze** (release the flock).
   - `FEESPEND` has 0 live rows, so composing it to `FEE-FEESPEND` orphans nothing.
+  - **IMPORT-VERB OPERATIONAL CONSTRAINTS (build-review, `50d4d39`):** (a) `aira import --tickets`
+    expects ONE combined batch of the WHOLE namespace per invocation — `absent_from_batch` is
+    project-wide, so a partial/per-prefix batch would mis-report present tickets as disappeared;
+    the extractor emits the whole backlog+requirements as one JSONL. (b) The import summary + `aira
+    check` findings surface the STORED COMPOUND ids (`FEE-BL-123`), not the bare form (display-strip
+    is verb-enumerated; import/check are deliberately not on it) — expected, not a bug. (c) The
+    cross-worktree pre-allocated-mint adoption is SAFE under this cutover's flock-quiesce
+    single-allocator discipline; it is NOT hardened against two concurrent live allocators minting
+    the same number — the quiesce (step 1) is the mitigation, so do not run a second allocator during
+    the window.
 - [ ] **Step 6 — move the dup-id gate here (it is fastest.ee's, not aira's):** after the flip, run
   fastest.ee's `check_no_duplicate_ids` (the fail-closed backlog/REQUIREMENTS gate) through a
   seed→mint→author-row cycle as the CUTOVER backstop — it cannot run in an aira Go test. It should
