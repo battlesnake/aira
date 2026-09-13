@@ -165,6 +165,8 @@ func (s *Store) AddRequirement(ctx context.Context, input domain.RequirementInpu
 // generalized write protocol, not an allocation. Requirements have no
 // transition graph, so any valid target status is accepted.
 func (s *Store) SetRequirement(ctx context.Context, id string, status domain.RequirementStatus) (EventKey, error) {
+	// Namespace a bare requirement id before it keys the file/index (AIRA-237 Task 2).
+	id = s.canonicalID(id)
 	reqLock, err := s.acquireRequirementMutationLock()
 	if err != nil {
 		return EventKey{}, err
@@ -296,6 +298,10 @@ func (s *Store) markRequirementMaterialised(ctx context.Context, intent Intent) 
 }
 
 func (s *Store) GetRequirement(id string) (RequirementRecord, error) {
+	// A bare requirement id (VR-90) typed under id_prefix=FEE resolves the stored
+	// compound FEE-VR-90 (AIRA-237 Task 2 — requirement prefixes are composed too;
+	// display-side strip is the shared core projection). Idempotent on a compound id.
+	id = s.canonicalID(id)
 	var rec RequirementRecord
 	var status, text string
 	err := s.db.QueryRow(`SELECT id, path, digest, status, text FROM requirements WHERE project_id=? AND worktree_id=? AND id=?`,

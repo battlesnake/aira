@@ -756,7 +756,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
 			options[name] = "true"
 			continue
 		}
@@ -801,7 +801,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
 		"grep":   {"kind": true, "by": true, "fields": true},
-		"import": {"strict": true},
+		"import": {"strict": true, "tickets": true},
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
@@ -2844,7 +2844,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("import requires <file>")
 		}
-		args["file"], args["strict"] = positional[0], options["strict"] == "true"
+		args["file"], args["strict"], args["tickets"] = positional[0], options["strict"] == "true", options["tickets"] == "true"
 	case "count":
 		if options["by"] == "" {
 			return core.Request{}, fmt.Errorf("count requires --by <field>")

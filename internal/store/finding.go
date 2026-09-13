@@ -97,6 +97,9 @@ func (s *Store) AddFinding(ctx context.Context, input domain.ReviewFindingInput)
 	// BL-123 typed under id_prefix=FEE keys the finding on FEE-BL-123 (the
 	// ingress leak `find add --ticket` would otherwise orphan; AIRA-237 Task 1).
 	input.TicketID = s.canonicalID(strings.TrimSpace(input.TicketID))
+	// A finding's requirement id is likewise composed under namespacing, so a
+	// bare VR-90 must key the stored FEE-VR-90 (AIRA-237 Task 2).
+	input.RequirementID = s.canonicalID(strings.TrimSpace(input.RequirementID))
 	findingLock, err := s.acquireFindingMutationLock()
 	if err != nil {
 		return domain.Finding{}, EventKey{}, err
@@ -272,7 +275,7 @@ func (s *Store) ListFindings(query string) ([]FindingRecord, error) {
 	// (compound) TicketID, so a bare id must be namespaced or it silently
 	// matches nothing (AIRA-237 Task 1).
 	for i := range terms {
-		if terms[i].Field == "ticket" && !terms[i].Text {
+		if (terms[i].Field == "ticket" || terms[i].Field == "requirement") && !terms[i].Text {
 			terms[i].Value = s.canonicalID(terms[i].Value)
 		}
 	}

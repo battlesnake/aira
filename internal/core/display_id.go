@@ -26,6 +26,11 @@ var displayIDFields = map[string]bool{
 	"blocked_by": true,
 	"ticket_id":  true,
 	"ticket":     true,
+	// AIRA-237 Task 2 — requirement ids are composed (FEE-VR-90) too, so strip
+	// them on the human boundary as well. `requirement` is the core finding
+	// projection key (core.go), `requirement_id` the raw domain finding tag.
+	"requirement":    true,
+	"requirement_id": true,
 }
 
 // displayIDVerbs are the (canonical) verbs whose success output is projected.
@@ -39,6 +44,8 @@ var displayIDVerbs = map[string]bool{
 	"ready":    true,
 	"find":     true,
 	"worktree": true,
+	// AIRA-237 Task 2 — requirement records/finding requirement ids print bare.
+	"req": true,
 }
 
 // projectDisplayIDs returns the strip-projected bytes for a whitelisted verb's

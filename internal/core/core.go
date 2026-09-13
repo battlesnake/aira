@@ -981,7 +981,39 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: data}, nil
 		}},
-		"import": {Name: "import", Usage: "import <file> [--strict]", Args: []ArgSpec{stringSpec("file", true, true, "Findings file"), boolSpec("strict", false, false, "Reject partial imports")}, MCPTool: "aira_import", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"import": {Name: "import", Usage: "import <file> [--tickets] [--strict]", Args: []ArgSpec{stringSpec("file", true, true, "Findings (or, with --tickets, ticket) JSONL file"), boolSpec("tickets", false, false, "Import id-preserving coordination tickets instead of findings"), boolSpec("strict", false, false, "Reject partial imports")}, MCPTool: "aira_import", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			// AIRA-237 Task 2 — --tickets selects the id-accepting ticket importer
+			// (preserve ids, seed the allocator, read-merge idempotent upsert). The
+			// default remains the findings importer.
+			if boolArg(args, "tickets") {
+				var summary store.ImportTicketsSummary
+				var err error
+				if args.content != nil {
+					importer, ok := c.store.(interface {
+						ImportTicketsBytes(context.Context, []byte, bool) (store.ImportTicketsSummary, error)
+					})
+					if !ok {
+						return nil, errors.New("E_IMPORT_INVALID: byte import is unavailable")
+					}
+					summary, err = importer.ImportTicketsBytes(ctx, args.content, boolArg(args, "strict"))
+				} else {
+					importer, ok := c.store.(interface {
+						ImportTickets(context.Context, string, bool) (store.ImportTicketsSummary, error)
+					})
+					if !ok {
+						return nil, errors.New("E_IMPORT_INVALID: ticket import is unavailable")
+					}
+					summary, err = importer.ImportTickets(ctx, stringArg(args, "file"), boolArg(args, "strict"))
+				}
+				if err != nil {
+					return nil, err
+				}
+				verdict := "pass"
+				if len(summary.Errored) > 0 {
+					verdict = "fail"
+				}
+				return handlerData{Data: summary, Verdict: verdict}, nil
+			}
 			var summary store.ImportSummary
 			var err error
 			if args.content != nil {
@@ -2310,7 +2342,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"show":      {summary: "Show one ticket", safety: SafetyRead, example: []string{"AIRA-1", "--fields", "id"}},
 		"review":    {summary: "Assemble a review briefing", safety: SafetyRead, example: []string{"AIRA-1", "--paths", "internal/store/gate.go,docs/x.md"}},
 		"grep":      {summary: "Search indexed tickets, findings, and rants", safety: SafetyRead, example: []string{"ticket", "--kind", "ticket", "--by", "kind", "--fields", "id"}},
-		"import":    {summary: "Import findings from a JSONL file", safety: SafetyMutate, example: []string{"findings.jsonl", "--strict"}},
+		"import":    {summary: "Import findings, or id-preserving tickets with --tickets, from a JSONL file", safety: SafetyMutate, example: []string{"tickets.jsonl", "--tickets"}},
 		"claim":     {summary: "Claim a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--steal", "--actor", "codex"}},
 		"release":   {summary: "Release a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
 		"heartbeat": {summary: "Renew a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},

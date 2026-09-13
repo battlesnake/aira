@@ -2362,7 +2362,18 @@ func (s *Store) markTicketMaterialised(ctx context.Context, intent Intent) error
 		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0`, intent.ProjectID, intent.Seq); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=?`, intent.ProjectID, prefixOf(ticket.ID), numberOf(ticket.ID)); err != nil {
+		// AIRA-237 Task 2: on the allocated→materialised transition ONLY, rewrite
+		// the allocation's path/worktree to the materialising worktree, so a
+		// cross-worktree pre-allocated mint (aira id in worktree A, aira import in
+		// worktree B) resolves against B's file. The CASE guard keeps this a no-op
+		// for a normal create (already this worktree's path) and for any
+		// re-materialisation of an already-materialised row (ticket.update), so it
+		// changes nothing outside the pre-allocated-adoption path.
+		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised',
+            path=CASE WHEN state='allocated' THEN ? ELSE path END,
+            worktree_id=CASE WHEN state='allocated' THEN ? ELSE worktree_id END
+            WHERE project_id=? AND prefix=? AND number=?`,
+			intent.Path, intent.WorktreeID, intent.ProjectID, prefixOf(ticket.ID), numberOf(ticket.ID)); err != nil {
 			return err
 		}
 		_, err := conn.ExecContext(ctx, `INSERT INTO tickets(project_id, worktree_id, id, path, digest, status, hold, title, kind, severity)
