@@ -8,12 +8,22 @@ import (
 	"testing"
 )
 
-func TestParseWorkerAdmitArgsRequiresJobIDOuterScopeAndEstimatedBytes(t *testing.T) {
+func TestParseWorkerAdmitArgsRequiresJobIDOuterScopeEstimatedBytesAndParentScope(t *testing.T) {
 	if _, _, err := parseWorkerAdmitArgs(nil); err == nil {
 		t.Fatal("missing required options must error")
 	}
-	_, options, err := parseWorkerAdmitArgs([]string{"--job-id", "j1", "--outer-scope", "/outer", "--estimated-bytes", "400M"})
-	if err != nil || options["job-id"] != "j1" || options["outer-scope"] != "/outer" || options["estimated-bytes"] != "400M" {
+	// S2a §16d: parent-scope-id is a REQUIRED wire field (the daemon refuses an
+	// empty one fail-closed); it is refused pre-dial too, so a missing flag is a
+	// cheap local E_CONFINE_ARGUMENT_INVALID rather than a daemon round-trip.
+	if _, _, err := parseWorkerAdmitArgs([]string{"--job-id", "j1", "--outer-scope", "/outer", "--estimated-bytes", "400M"}); err == nil {
+		t.Fatal("missing --parent-scope-id must error pre-dial")
+	}
+	_, options, err := parseWorkerAdmitArgs([]string{
+		"--job-id", "j1", "--outer-scope", "/outer", "--estimated-bytes", "400M",
+		"--parent-scope-id", "CONFINE-suite-111111-1",
+	})
+	if err != nil || options["job-id"] != "j1" || options["outer-scope"] != "/outer" ||
+		options["estimated-bytes"] != "400M" || options["parent-scope-id"] != "CONFINE-suite-111111-1" {
 		t.Fatalf("options=%v err=%v", options, err)
 	}
 }

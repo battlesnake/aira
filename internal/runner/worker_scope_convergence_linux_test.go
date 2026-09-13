@@ -104,7 +104,7 @@ func TestWorkerScopeOOMGroupKillConvergesPromptly(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			outer := newWorkerConvergenceOuterScope(t)
-			scopePath, swapCap, err := CreateWorkerScope(context.Background(), outer, "1", test.memoryMax)
+			scopePath, swapCap, err := CreateWorkerScope(context.Background(), outer, "CONFINE-aitest-w1-111111-1", test.memoryMax)
 			if err != nil {
 				t.Fatalf("CreateWorkerScope: %v", err)
 			}

@@ -114,8 +114,34 @@ import (
 // by its magic ahead of the proto check precisely so an upgrade (OLD client ↔
 // NEW daemon) can re-anchor its leases. Same atomic reinstall+restart
 // requirement as 6-10.
+//
+// ProtocolVersion 12 (was 11): the aitest v0.7 S2a daemon-authoritative slice
+// changed the worker-admit and confine-admit wire in three coupled ways, all
+// silent below this layer:
+//   - parent_scope_id became a REQUIRED worker-admit REQUEST field. Under S2a a
+//     worker scope is a first-class SIBLING directly under the slice, no longer
+//     NESTED under the suite's outer scope, so the daemon can no longer DERIVE
+//     the parent from the worker's outer cgroup path — the request must declare
+//     it explicitly, and an empty one is REFUSED (design §16d). An OLD proto-11
+//     client omits the field and expects the daemon to derive it from a nested
+//     placement; against a NEW daemon that neither derives nor accepts an empty
+//     value, the worker's sub-reservation would silently fail to anchor.
+//   - delegate_ram was REMOVED from the `admit` allowlist. S2a §4/§16 collapsed
+//     `--delegate-ram` into an ordinary confine job, so the daemon no longer
+//     reads a delegate flag; the allowlist narrowed and now REFUSES a stray
+//     delegate_ram field rather than silently ignoring it.
+//   - scope_ceiling was DROPPED from the grant (AdmitResponse). The AIRA-15
+//     delegate scope ceiling — a containment cap sized many times the reserve —
+//     was retired with the collapse: a delegate parent's memory.max is now its
+//     ordinary reserve, so there is no separate ceiling for the grant to carry.
+//
+// An OLD proto-11 client speaking the pre-collapse worker-admit contract must be
+// refused LOUDLY rather than silently mis-served against the sibling-topology
+// daemon. The re-declare (ARDR) frame remains sniffed BEFORE this check, so a
+// suite's held worker leases still re-anchor across the upgrade. Same atomic
+// reinstall+restart requirement as 6-11.
 const (
-	ProtocolVersion = 11
+	ProtocolVersion = 12
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

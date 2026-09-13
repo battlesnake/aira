@@ -383,10 +383,9 @@ func TestAIRA138DeadlineSourcePrimitivesAreReusableFromConfine(t *testing.T) {
 // bracketing shape; `leafOnlyKillDraft` below therefore no longer mirrors any
 // production gate and stands purely as the historical hazard.)
 //
-// That gate is inert against confine's flagship heavy-job shape. An aitest /
-// --delegate-ram job drains EVERY pid out of the outer scope into
-// `<outer>/.aira-supervisor` and `.aira-worker-N` (BootstrapAitestSupervisor);
-// `podman --cgroups=split` and any nested-cgroup workload do the same. Such a
+// That gate is inert against confine's flagship heavy-job shape. A
+// `podman --cgroups=split` job (or any nested-cgroup workload) puts every
+// process in child cgroups it created inside its own scope. Such a
 // job is LEAF-EMPTY WHILE FULLY BUSY. The repository already knows this and says
 // so twice, in the two places that had to get it right:
 //

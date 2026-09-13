@@ -281,13 +281,6 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runDrainHoldCommand(stdout)
 	}
-	if verb == "aitest-bootstrap" {
-		if jsonOutput {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for aitest-bootstrap", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
-			return render(response, true, stdout, stderr)
-		}
-		return runAitestBootstrapCommand(context.Background(), options, stdout, stderr)
-	}
 	if verb == "worker-admit" {
 		if jsonOutput {
 			// Reported on the structured channel rather than as a rendered
@@ -736,9 +729,6 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "drain-hold" {
 		return parseDrainHoldArgs(argv)
 	}
-	if verb == "aitest-bootstrap" {
-		return parseAitestBootstrapArgs(argv)
-	}
 	if verb == "worker-admit" {
 		return parseWorkerAdmitArgs(argv)
 	}
@@ -1133,28 +1123,9 @@ func parseConfineReserveArgs(argv []string) ([]string, map[string]string, error)
 	return nil, options, nil
 }
 
-func parseAitestBootstrapArgs(argv []string) ([]string, map[string]string, error) {
-	options := map[string]string{}
-	for i := 0; i < len(argv); i++ {
-		name := strings.TrimPrefix(argv[i], "--")
-		if argv[i] != "--supervisor-pid" {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for aitest-bootstrap", name)
-		}
-		if i+1 >= len(argv) {
-			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: option --supervisor-pid requires a value")
-		}
-		i++
-		options["supervisor-pid"] = argv[i]
-	}
-	if _, present := options["supervisor-pid"]; !present {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --supervisor-pid is required")
-	}
-	return nil, options, nil
-}
-
 func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
-	valid := map[string]bool{"job-id": true, "outer-scope": true, "estimated-bytes": true, "signature": true, "max-wait": true}
+	valid := map[string]bool{"job-id": true, "outer-scope": true, "estimated-bytes": true, "signature": true, "max-wait": true, "parent-scope-id": true}
 	for i := 0; i < len(argv); i++ {
 		name := strings.TrimPrefix(argv[i], "--")
 		if !valid[name] {
@@ -1166,7 +1137,7 @@ func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 		i++
 		options[name] = argv[i]
 	}
-	for _, required := range []string{"job-id", "outer-scope", "estimated-bytes"} {
+	for _, required := range []string{"job-id", "outer-scope", "estimated-bytes", "parent-scope-id"} {
 		if _, present := options[required]; !present {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s is required for worker-admit", required)
 		}
@@ -1840,93 +1811,6 @@ func runConfineReserveCommand(ctx context.Context, options map[string]string, st
 	return 0
 }
 
-func runAitestBootstrapCommand(ctx context.Context, options map[string]string, stdout, stderr io.Writer) int {
-	pid, err := strconv.Atoi(options["supervisor-pid"])
-	if err != nil || pid <= 0 {
-		_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: --supervisor-pid must be a positive integer")
-		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-	}
-	// AIRA-121 gate condition C1, as AMENDED by AIRA-123. aitest-bootstrap
-	// relocates the supervisor into a child scope of the job's OUTER cgroup scope
-	// so that scope can delegate controllers to worker children. In ci-shim mode
-	// there is no outer scope and no cgroup to relocate within, so this must not
-	// reach CurrentCgroupPath's self-discovery below: that would nominate whatever
-	// cgroup the container happens to live in as "outer" and then fail far later,
-	// in a place that reads as a broken install rather than a designed
-	// degradation. AIRA-121 shipped that guard as a clean, immediate FAILURE
-	// (supervisor.py's bootstrap() calls _disable_daemon on a non-zero exit,
-	// dropping the suite to its one-warning bare-fork pool); AIRA-123 replaces the
-	// failure with an honest degraded SUCCESS, for the reason stated inside the
-	// branch. Only the disposition changed -- the "do not self-discover" reasoning
-	// is unchanged and still the reason this branch exists at all.
-	if runner.ResolveConfineMode() == runner.ConfineModeShim {
-		// AIRA-123. There is still nothing to relocate into -- the reasoning
-		// above stands -- but a clean FAILURE is no longer the right answer,
-		// because worker-admit can now make a real ledger-only admission decision
-		// with no cgroup at all. Failing here would call _disable_daemon and drop
-		// the whole suite to its ungoverned bare-fork pool, which is exactly the
-		// value AIRA-123 exists to recover.
-		//
-		// So this reports SUCCESS with two honest facts and no third: the outer
-		// "scope" is the ci-shim sentinel (not a path, and the daemon refuses to
-		// treat it as one), and the admission grade is ledger-only. NO
-		// supervisor_scope token is emitted, deliberately -- there is no such
-		// cgroup, and supervisor.py's _cleanup_supervisor_scope correctly does
-		// nothing when it is absent rather than rmdir'ing something invented.
-		_, _ = fmt.Fprintf(stdout, "outer=%s admission=%s\n", runner.ShimConfineSlice, runner.AitestAdmissionLedgerOnly)
-		_, _ = fmt.Fprintln(stderr, "aira aitest: ci-shim mode -- per-worker admission is LEDGER-ONLY (advisory): workers are admitted against the container's RAM budget, but there is no cgroup sub-scope, no memory.max and no kill backstop")
-		return 0
-	}
-	// AIRA_AITEST_OUTER_SCOPE is the launcher's own scope.Reference(), injected
-	// by AppendAitestChildEnvironment. Prefer it over self-discovery (AIRA-44):
-	// a second aitest-enabled pytest run inside one confine job is, by the time
-	// it bootstraps, already living in <outer>/.aira-supervisor — the first run's
-	// drain relocated `make`, its shell and everything else there — so
-	// CurrentCgroupPath() would name the supervisor scope as "outer", nest a
-	// second supervisor scope inside it, and leave every worker-admit call
-	// answering "unevaluated: unbounded" against a deliberately-uncapped cgroup.
-	// The env value is not trusted blindly: BootstrapAitestSupervisor's
-	// membership guard still refuses any scope the supervisor is not actually
-	// inside.
-	outer := strings.TrimSpace(os.Getenv("AIRA_AITEST_OUTER_SCOPE"))
-	if outer != "" {
-		// Refuse a relative path rather than resolving it against whatever
-		// working directory pytest happened to have: bootstrap would mutate one
-		// cgroup and then report an `outer=` the daemon later resolves from a
-		// different directory, which is silently wrong accounting instead of a
-		// clean error. Clean() also normalises a trailing slash so the reported
-		// path and the daemon's are byte-identical.
-		if !filepath.IsAbs(outer) {
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: AIRA_AITEST_OUTER_SCOPE must be an absolute cgroup path, got %q\n", outer)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-		outer = filepath.Clean(outer)
-	}
-	if outer == "" {
-		// Unset means a launcher that predates this coordinate, or a hand
-		// invocation. Self-discovery is still correct for the single-run case,
-		// so fall back rather than refuse.
-		discovered, err := runner.CurrentCgroupPath()
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: discover outer scope: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
-		}
-		outer = discovered
-	}
-	supervisorScope, err := runner.BootstrapAitestSupervisor(ctx, outer, pid)
-	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
-	}
-	// AIRA-123: `admission=` is stated on BOTH bootstrap paths. Emitting it only
-	// on the degraded one would make its ABSENCE the claim that per-worker cgroup
-	// sub-scopes are in play, which is the same "absence reads as the strong
-	// guarantee" shape the containment token on the grant line exists to close.
-	_, _ = fmt.Fprintf(stdout, "bootstrapped outer=%s supervisor_scope=%s admission=%s\n",
-		outer, supervisorScope, runner.AitestAdmissionSubScope)
-	return 0
-}
-
 // writeWorkerAdmitOutcome emits the ONE machine-readable line the aitest
 // supervisor parses, on stdout, plus a human diagnostic on stderr that nothing
 // parses. Every exit from the worker-admit verb goes through here — including
@@ -2017,7 +1901,8 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	defer stop()
 	outcome := runner.RequestWorkerAdmit(signalCtx, runner.WorkerAdmitClientRequest{
 		SocketPath: paths.SocketPath, JobID: options["job-id"], OuterScope: options["outer-scope"],
-		Signature: options["signature"], EstimatedBytes: estimatedBytes, MaxWait: maxWait,
+		ParentScopeID: options["parent-scope-id"],
+		Signature:     options["signature"], EstimatedBytes: estimatedBytes, MaxWait: maxWait,
 	})
 	if !outcome.Granted() {
 		// The daemon's (or the transport's) own classification is relayed
@@ -3301,9 +3186,8 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	//
 	// `Populated` is the scope's OWN cgroup.procs count, and a job that relocates
 	// its processes into a child cgroup reads 0 there while very much running --
-	// aitest drains into `<scope>/.aira-supervisor`, and `podman run
-	// --cgroups=split` moves everything into `<scope>/runtime` plus the container
-	// payload. Printing that 0 under a column named POPULATED told an operator the
+	// `podman run --cgroups=split` moves everything into `<scope>/runtime` plus
+	// the container payload. Printing that 0 under a column named POPULATED told an operator the
 	// job was not running. `SubtreePopulated` is the kernel's own subtree-aware
 	// `cgroup.events populated` signal (already collected since AIRA-101, and
 	// already trusted by the kill path and the exclusive gate) and is the honest
@@ -3324,8 +3208,16 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	// never the cap standing in for it.
 	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tLIVE\tLEAF-PROCS\tRSS\tAGE\tRESERVE\tCAP")
 	for _, record := range result.Scopes {
+		// S2a §16.1: mark aitest worker sub-scopes so an operator can tell them from
+		// their parent job — they share the parent's supervisor pid, and the pid/name
+		// selector deliberately does not resolve them (kill the parent, or use the
+		// worker's explicit scope-id).
+		name := record.Name
+		if record.Worker {
+			name += " (worker)"
+		}
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			record.Name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
+			name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
 			confineLiveStatus(record),
 			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds),
 			confineInt64(record.ReserveBytes), confineString(record.Cap))

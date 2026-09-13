@@ -109,9 +109,18 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 // present-and-zero is now a non-blocking snapshot, not a speculative try-acquire).
 // An old proto-10 worker-admit client must be refused loudly, while the ARDR
 // re-declare still crosses versions by its magic.
+//
+// verifies: aitest v0.7 S2a — the 11→12 bump. S2a made parent_scope_id a REQUIRED,
+// refuse-empty worker-admit request field (worker scopes are now SIBLINGS under the
+// slice, so the daemon can no longer derive the parent from a nested outer path),
+// REMOVED delegate_ram from the `admit` allowlist (a delegate job is an ordinary
+// confine job now), and DROPPED scope_ceiling from the grant (the AIRA-15 delegate
+// ceiling was retired — a delegate parent's memory.max is its ordinary reserve). An
+// old proto-11 client speaking the pre-collapse contract must be refused loudly,
+// while the ARDR re-declare still crosses versions by its magic.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 11 {
-		t.Fatalf("ProtocolVersion = %d, want 11; a wire-shape or wire-semantics change must "+
+	if ProtocolVersion != 12 {
+		t.Fatalf("ProtocolVersion = %d, want 12; a wire-shape or wire-semantics change must "+
 			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }

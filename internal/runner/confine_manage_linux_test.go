@@ -33,10 +33,6 @@ func confineTestOwnedScopeID(name, owner string, pid int, stamp int64) string {
 	return confineTestScopeID(name, pid, stamp) + "@" + owner
 }
 
-func confineTestDelegateScopeID(name string, pid int, stamp int64) string {
-	return "CONFINE-" + delegateRAMScopeIDMarker + "-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(stamp, 36)
-}
-
 func writeConfineTestScope(t *testing.T, slice, scopeID, procs string) string {
 	t.Helper()
 	path := filepath.Join(slice, ".aira-"+scopeID)
@@ -61,7 +57,7 @@ func TestConfineScanUnionDeduplicatesAndRegistryOwnerWins(t *testing.T) {
 	now := time.Now()
 	owned := confineTestOwnedScopeID("build-name.with-dash", "session-a", 4101, now.Add(-time.Minute).UnixNano())
 	scanOnly := confineTestScopeID("fallback", 4102, now.Add(-2*time.Minute).UnixNano())
-	marked := confineTestDelegateScopeID("ceiling-suite", 4105, now.Add(-3*time.Minute).UnixNano())
+	marked := confineTestScopeID("ceiling-suite", 4105, now.Add(-3*time.Minute).UnixNano())
 	pending := confineTestOwnedScopeID("pending", "session-a", 4103, now.UnixNano())
 	writeConfineTestScope(t, slice, owned, "51\n52\n")
 	writeConfineTestScope(t, slice, scanOnly, "61\n")
@@ -351,6 +347,73 @@ func TestConfineKillSelectorAmbiguousAndNotFound(t *testing.T) {
 	}
 	if _, err := KillConfine(context.Background(), slice, "missing", "owner", true, nil); err == nil || !strings.HasPrefix(err.Error(), CodeConfineNotFound+":") {
 		t.Fatalf("not-found err=%v", err)
+	}
+}
+
+// verifies: S2a Task 10 Step 1 — a delegate job's sibling worker scopes embed the
+// SAME supervisor pid in their pid slot (S2a §16a), so once workers are siblings on
+// the slice, `confine --kill <supervisor-pid>` matched the parent AND every worker
+// -> E_SELECTOR_AMBIGUOUS, a regression for a core gesture. Worker rows are filtered
+// from the default pid/name selector (matched ONLY by their explicit scope-id), so
+// `--kill <supervisor-pid>` resolves to the parent while a worker stays killable by
+// its scope-id.
+//
+// MUTATION: drop the worker-row filter in killConfineWithDeps -> `--kill 4601`
+// matches the parent + two workers -> E_SELECTOR_AMBIGUOUS and this test REDS.
+func TestConfineKillWorkerRowsResolveOnlyByScopeIDNotSupervisorPID(t *testing.T) {
+	slice := t.TempDir()
+	stamp := time.Now().UnixNano()
+	const supervisorPID = 4601
+	parentID := confineTestScopeID("suite", supervisorPID, stamp)
+	worker1 := confineTestScopeID("aitest-w1", supervisorPID, stamp+1)
+	worker2 := confineTestScopeID("aitest-w2", supervisorPID, stamp+2)
+	for _, id := range []string{parentID, worker1, worker2} {
+		writeConfineTestScope(t, slice, id, "71\n")
+	}
+	deps := defaultConfineScanDeps()
+	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
+		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
+	}
+	// --kill <supervisor-pid> must resolve UNAMBIGUOUSLY to the parent job.
+	result, err := killConfineWithDeps(context.Background(), slice, strconv.Itoa(supervisorPID), "owner", true, nil, time.Second, deps)
+	if err != nil {
+		t.Fatalf("--kill <supervisor-pid> err=%v, want the parent job resolved unambiguously (worker rows filtered from the pid selector)", err)
+	}
+	if result.Status != "killed" || result.ScopeID != parentID {
+		t.Fatalf("--kill <supervisor-pid> result=%+v, want the PARENT %q killed, never a worker", result, parentID)
+	}
+	// A worker stays reachable by its explicit scope-id.
+	wresult, werr := killConfineWithDeps(context.Background(), slice, worker1, "owner", true, nil, time.Second, deps)
+	if werr != nil || wresult.Status != "killed" || wresult.ScopeID != worker1 {
+		t.Fatalf("--kill <worker-scope-id> result=%+v err=%v, want worker %q killable by its scope-id", wresult, werr, worker1)
+	}
+}
+
+// verifies: S2a Task 10 — a worker scope minted with MintWorkerScopeID now carries
+// the PARENT supervisor's owner in its scope id, so `confine --kill <worker-scope-id>`
+// opens the ownership guard for that same principal WITHOUT --steal (the
+// TestConfineKillWorkerRowsResolveOnlyByScopeIDNotSupervisorPID sibling exercised only
+// steal=true). RED before the owner slot: MintWorkerScopeID minted an ownerless id, so
+// the kill guard reads owner "" (unattested) and demands --steal.
+//
+// MUTATION: revert MintWorkerScopeID to an empty owner -> the round-trip assertion reds
+// AND the steal-less kill reds with CodeConfineOwnerUnverified.
+func TestConfineKillWorkerByScopeIDResolvesWithoutStealWhenParentOwnerCopied(t *testing.T) {
+	slice := t.TempDir()
+	// A worker minted for a parent owned by the attested principal session-a.
+	workerID := MintWorkerScopeID(1, 4701, "session-a")
+	if _, _, _, owner, ok := parseConfineScopeID(workerID); !ok || owner != "session-a" {
+		t.Fatalf("minted worker id %q owner=%q ok=%v, want the parent owner session-a copied in", workerID, owner, ok)
+	}
+	writeConfineTestScope(t, slice, workerID, "71\n")
+	deps := defaultConfineScanDeps()
+	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
+		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
+	}
+	// steal=false: the same-principal owner must open the guard on its own worker.
+	result, err := killConfineWithDeps(context.Background(), slice, workerID, "session-a", false, nil, time.Second, deps)
+	if err != nil || result.Status != "killed" || result.ScopeID != workerID {
+		t.Fatalf("--kill <worker-scope-id> without --steal: result=%+v err=%v, want the worker killed by its same-principal owner", result, err)
 	}
 }
 

@@ -141,30 +141,6 @@ _REAP_TIMEOUT_SECONDS = 5.0
 # "the value is None" must not be conflated. See _pool_covers_the_queue.
 _UNKNOWN = object()
 
-# AIRA-229 (v0.7 S1) client-side aggregate outer-cap guard tunables. These are
-# TUNABLE STARTING CONSTANTS, NOT measured values -- v7-4 sets them from a
-# full-pool run (spec OD4/§8):
-#   base      = the supervisor's own uncapped .aira-supervisor RSS (the pytest
-#               process itself; it holds no worker cap but consumes the outer cap).
-#   per_relay = one live `aira worker-admit` relay's RSS (a plain Popen that never
-#               relocates out of .aira-supervisor, so N live relays also charge the
-#               outer cap -- allowance = base + N_live * per_relay).
-#   margin    = a safety band held clear under the effective outer cap (distinct
-#               from the per-worker headroom and the daemon slice headroom -- three
-#               different "headroom"s; do not conflate).
-# All three are env-overridable via the shared AIRA_AITEST_ESTIMATED_BYTES size
-# grammar so the real-cgroup branch-exit gate can PIN them (making the admitted-pool
-# count deterministic) and v7-4 can measure against them without a code change.
-# These are SUPERVISOR/relay/band RSS estimates -- NOT the per-worker size default
-# (that is v7-2's AIRA_AITEST_DEFAULT_BYTES, a separate 256 MiB knob). They must be
-# SMALL relative to a realistic outer cap: allowance is the uncapped .aira-supervisor's
-# own footprint (the pytest process + N live relays), not a per-worker figure, and an
-# over-large base would refuse legitimate spawns under a modest outer cap. v7-4
-# measures the real .aira-supervisor/memory.peak at full pool to replace all three.
-_OUTER_CAP_ALLOWANCE_BASE = 64 << 20        # 64 MiB supervisor-process starting point
-_OUTER_CAP_ALLOWANCE_PER_RELAY = 8 << 20    # 8 MiB per live relay starting point
-_OUTER_CAP_MARGIN = 32 << 20                # 32 MiB safety band starting point
-
 # AIRA-230 (v0.7 S1 / v7-2). The per-test annotation default for a nodeid with no
 # aira_mem marker: the *incremental* peak RSS assumed on top of the warm-import
 # baseline (spec 4.1). 256 MiB is a STARTING POINT, NOT a measured value -- v7-4
@@ -421,17 +397,18 @@ class WorkerAdmitRequestInvalid(WorkerAdmitTerminal):
     It was called WorkerAdmitRequestTooLarge, which AIRA-45 recorded as an
     actively misleading diagnostic even before AIRA-39: it was already
     raised for protocol-level argument rejections and version skew, neither
-    of which is a sizing problem. AIRA-39 then added two members that are
-    not about the request at all -- worker-scope-create-failed and
-    worker-id-space-exhausted are daemon-side cgroupfs facts about the outer
-    scope. The name now matches the class token exactly, which is the same
-    one-vocabulary rule the rest of this channel follows.
+    of which is a sizing problem. AIRA-39 then added a member that is
+    not about the request at all -- worker-scope-create-failed is a
+    daemon-side cgroupfs fact about the outer scope. The name now matches
+    the class token exactly, which is the same one-vocabulary rule the rest
+    of this channel follows. (S2a deleted worker-id-space-exhausted: worker
+    ids are unique by construction, so there is no id space to exhaust.)
 
     Current members: the daemon's exceeds-ceiling (this request's
     estimated-byte sizing can never fit under the outer scope's cap even
-    with zero contention), its worker-scope-create-failed and
-    worker-id-space-exhausted verdicts, its protocol-level argument
-    rejection, and the CLI's own pre-dial argument validation."""
+    with zero contention), its worker-scope-create-failed verdict, its
+    protocol-level argument rejection, and the CLI's own pre-dial argument
+    validation."""
     pass
 
 
@@ -448,23 +425,6 @@ class WorkerAdmitContractViolation(WorkerAdmitTerminal):
     shape must never be resolved into "the daemon is gone" and used to
     strip RAM containment from the rest of the suite, which is exactly
     what the substring classifier this replaced did by default."""
-    pass
-
-
-class WorkerAdmitOuterCapExceeded(WorkerAdmitTerminal):
-    """AIRA-229. The CLIENT-SIDE aggregate outer-cap guard refused a spawn that
-    would push Σ(live worker caps) + the supervisor allowance + this request past
-    the effective outer-scope cap, AND the pool was EMPTY (Σ_live == 0): nothing
-    running will ever retire to free room, so retrying or waiting would hang.
-
-    Terminal, and deliberately raised only in the Σ_live == 0 case: with live
-    workers, a breach is a transient (WorkerAdmitDenied -> skip this tick), because
-    a retirement lowers Σ_live. Distinct from the daemon's own
-    WorkerAdmitRequestInvalid/exceeds-ceiling (a request larger than the whole
-    SLICE ceiling): this is a client-side aggregate bound against the OUTER SCOPE
-    cap, which the daemon no longer scans (S15 deleted that scan; it relies on the
-    outer scope's memory.oom.group as the kernel-side backstop -- the whole-suite
-    kill this guard exists to prevent, worker_admit.go:463-466)."""
     pass
 
 
@@ -510,6 +470,12 @@ class WorkerPlacementFailed(Exception):
 # ---------------------------------------------------------------------------
 
 _OUTCOME_MARKER = "aira-worker-admit"
+
+# The ci-shim outer-scope sentinel (runner.ShimConfineSlice). In shim mode there
+# is no cgroup and no AIRA_CONFINE_SCOPE_ID, so the bootstrap reports this as the
+# "outer" scope and a worker-admit sends it verbatim as parent_scope_id — the one
+# value the daemon exempts from canonical-confine-id parsing (S2a §16d).
+_OUTER_SCOPE_SHIM_SENTINEL = "ci-shim"
 
 _OUTCOME_STATES = frozenset((
     "granted",
@@ -564,8 +530,8 @@ _OUTCOME_GRANT_POSITIVE_INTS = {
     "advisory(ci-shim,no-cgroup,no-kill-backstop)": ("reserved",),
 }
 
-# The aitest ADMISSION BACKEND grades, reported once by the `aitest-bootstrap`
-# verb and pinned against Go's runner.AitestAdmission* catalogue.
+# The aitest ADMISSION BACKEND grades, published once by the launcher as
+# AIRA_AITEST_ADMISSION and pinned against Go's runner.AitestAdmission* catalogue.
 _ADMISSION_SUB_SCOPE = "cgroup-sub-scope"
 _ADMISSION_LEDGER_ONLY = "ledger-only"
 _ADMISSION_GRADES = frozenset((
@@ -756,7 +722,6 @@ class Supervisor:
         self.queue = []
         self.attempts = {}  # nodeid -> attempt count (Task 15's retry-once rule)
         self.outer_scope = None
-        self.supervisor_scope = None
         # AIRA-123. Which per-worker admission backend this run is using.
         # bootstrap() sets it from the verb's own `admission=` token and refuses
         # to start without one, so this initial value is only ever what a
@@ -797,8 +762,8 @@ class Supervisor:
         self._pool_budget = None
         self._pool_peak_samples = 0
         self._pool_scoped_workers = 0
-        # AIRA-230 v7-4. Per-worker (peak, cap, oom) records RETAINED for the
-        # measurement report -- a pool MAX alone cannot size per-worker headroom
+        # AIRA-230 v7-4. Per-worker (peak, cap, oom, scope_path) records RETAINED for
+        # the measurement report -- a pool MAX alone cannot size per-worker headroom
         # or the S2 ladder, which need the distribution. Same reads as the AIRA-180
         # max above, kept not collapsed, and ONLY materialised when the report is
         # enabled (AIRA_AITEST_MEASURE_DIR) so a normal run pays nothing.
@@ -807,57 +772,36 @@ class Supervisor:
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
         self._swap_cap_warned = False
-        # AIRA-229 client-side aggregate outer-cap guard. Seeded from env (the
-        # branch-exit gate pins these to make the admitted-pool count deterministic;
-        # v7-4 measures against them). Starting constants, NOT measured -- see the
-        # module-level constants' comment.
-        self._outer_cap_base = _env_bytes("AIRA_AITEST_OUTER_CAP_ALLOWANCE_BASE", _OUTER_CAP_ALLOWANCE_BASE)
-        self._outer_cap_per_relay = _env_bytes("AIRA_AITEST_OUTER_CAP_ALLOWANCE_PER_RELAY", _OUTER_CAP_ALLOWANCE_PER_RELAY)
-        self._outer_cap_margin = _env_bytes("AIRA_AITEST_OUTER_CAP_MARGIN", _OUTER_CAP_MARGIN)
-        self._outer_cap_unreadable_warned = False
-        self._outer_cap_bounded_warned = False
 
     def bootstrap(self):
-        """Relocate this process into its own child scope so the outer scope
-        can delegate controllers to worker children. Must run before any
-        worker is admitted."""
-        command = os.environ.get("AIRA_AITEST_BOOTSTRAP_CMD", "")
-        if not command:
-            self._disable_daemon("AIRA_AITEST_BOOTSTRAP_CMD is unset")
-            return
-        try:
-            result = subprocess.run(
-                [command, "aitest-bootstrap", "--supervisor-pid", str(os.getpid())],
-                capture_output=True, text=True, timeout=30,
-            )
-        except Exception as exc:
-            self._disable_daemon(str(exc))
-            return
-        if result.returncode != 0:
-            self._disable_daemon((result.stderr or "").strip() or "aitest-bootstrap failed")
-            return
-        admission = None
-        for token in result.stdout.split():
-            if token.startswith("outer="):
-                self.outer_scope = token[len("outer="):]
-            elif token.startswith("supervisor_scope="):
-                self.supervisor_scope = token[len("supervisor_scope="):]
-            elif token.startswith("admission="):
-                admission = token[len("admission="):]
+        """Read the launcher-published aitest coordinates (S2a). The confine
+        launcher places this supervisor DIRECTLY in its outer scope and
+        publishes AIRA_AITEST_OUTER_SCOPE and AIRA_AITEST_ADMISSION in the
+        environment. There is no subprocess and nothing to relocate: workers are
+        first-class SIBLING scopes under the slice, so they fork here in the
+        parent leaf and place_self out to their own scope, rather than nesting
+        under a drained child scope the way the retired aitest-bootstrap verb set
+        up. Must run before any worker is admitted."""
+        self.outer_scope = os.environ.get("AIRA_AITEST_OUTER_SCOPE", "").strip()
         if not self.outer_scope:
-            self._disable_daemon("aitest-bootstrap did not report an outer scope")
+            # A launcher that did not publish the coordinate (or published it
+            # empty) has not given this run a scope to admit workers under. Same
+            # disposition as every other bootstrap failure: one honest warning,
+            # then the bare-fork fallback pool.
+            self._disable_daemon("AIRA_AITEST_OUTER_SCOPE is unset")
             return
-        # AIRA-123. The backend grade is REQUIRED and is not defaulted. A
-        # bootstrap that does not state one is out of lockstep with this
-        # supervisor, and guessing "cgroup-sub-scope" would be the unsafe guess:
-        # this run would then expect enforced grants, and an advisory grant would
-        # be refused as a mismatch far later, mid-suite. Disabling daemon-backed
-        # admission with one honest warning is the same disposition every other
-        # bootstrap failure already takes.
+        admission = os.environ.get("AIRA_AITEST_ADMISSION", "").strip()
+        # AIRA-123. The backend grade is REQUIRED and is not defaulted. A launch
+        # that does not state one is out of lockstep with this supervisor, and
+        # guessing "cgroup-sub-scope" would be the unsafe guess: this run would
+        # then expect enforced grants, and an advisory grant would be refused as a
+        # mismatch far later, mid-suite. Disabling daemon-backed admission with
+        # one honest warning is the same disposition every other bootstrap
+        # failure already takes.
         if admission not in _ADMISSION_GRADES:
             self._disable_daemon(
-                "aitest-bootstrap reported admission=%r, which is not in this supervisor's "
-                "catalogue (bootstrap and supervisor are out of lockstep)" % (admission,)
+                "AIRA_AITEST_ADMISSION is %r, which is not in this supervisor's "
+                "catalogue (launcher and supervisor are out of lockstep)" % (admission,)
             )
             return
         self.admission_mode = admission
@@ -940,6 +884,20 @@ class Supervisor:
         self.queue.insert(0, nodeid)
         return True
 
+    def _parent_scope_id(self):
+        """The suite confine scope id a worker-admit declares as its parent
+        (design S2a §16d). It is the supervisor's OWN AIRA_CONFINE_SCOPE_ID -- the
+        scope id `aira confine` published to this process -- NOT self.outer_scope,
+        which is a PATH. In ci-shim mode there is no cgroup and no scope id, so the
+        outer scope is the sentinel and the worker-admit sends the sentinel
+        verbatim (the one value the daemon exempts from canonical parsing). Any
+        other empty case sends "", which the daemon REFUSES fail-closed: a worker
+        must always declare the job it is a sub-reservation of."""
+        scope_id = os.environ.get("AIRA_CONFINE_SCOPE_ID", "").strip()
+        if not scope_id and self.outer_scope == _OUTER_SCOPE_SHIM_SENTINEL:
+            return _OUTER_SCOPE_SHIM_SENTINEL
+        return scope_id
+
     def _spawn_admit_relay(self, estimated_bytes, probe):
         """Popen `aira worker-admit` for one worker lease. A CLAIM (probe=False)
         omits --max-wait, which the daemon reads as "block until the ledger fits"
@@ -951,7 +909,8 @@ class Supervisor:
         if not command:
             raise WorkerAdmitUnavailable("AIRA_AITEST_WORKER_ADMIT_CMD is unset")
         argv = [command, "worker-admit", "--job-id", str(os.getpid()),
-                "--outer-scope", self.outer_scope, "--estimated-bytes", str(estimated_bytes)]
+                "--outer-scope", self.outer_scope, "--estimated-bytes", str(estimated_bytes),
+                "--parent-scope-id", self._parent_scope_id()]
         if probe:
             argv += ["--max-wait", _SPECULATIVE_MAX_WAIT]
         try:
@@ -1456,185 +1415,22 @@ class Supervisor:
                         except Exception:
                             pass
 
-    def _read_cgroup_memory_max(self, path):
-        """The FINITE memory.max at one cgroup level, in bytes, or None. Mirrors
-        Go's readConfineCap (confine_linux.go:1920): a read error OR the literal
-        "max" (unlimited) is "not finite" and returns None; a non-positive value is
-        also None (Go keeps only maximum > 0). Any positive integer is the cap."""
-        try:
-            with open(os.path.join(path, "memory.max"), encoding="ascii", errors="replace") as handle:
-                raw = handle.read().strip()
-        except OSError:
-            return None
-        if raw == "max":
-            return None
-        try:
-            value = int(raw)
-        except ValueError:
-            return None
-        return value if value > 0 else None
-
-    def _effective_outer_cap(self):
-        """The effective outer-scope memory ceiling: the MINIMUM finite memory.max
-        over self.outer_scope and its cgroup ancestors, or None if no finite cap
-        bounds it (or the outer scope is not a real cgroup dir). A Python replica of
-        Go's effectiveCapFrom (confine_linux.go:2926): memory.max is hierarchical, so
-        an uncapped scope under a capped parent is still bounded by the parent, and a
-        level with no memory.max (like the real cgroup2 root) is "not finite, keep
-        walking", not a stop.
-
-        Read at EVERY guard check, deliberately NOT cached at startup (spec §7 said
-        "read once"; recorded as a spec amendment): it is a few small file reads
-        before a relay fork, and re-reading answers "the owner set-property'd
-        aira.slice mid-run" for free.
-
-        The walk stops when the PARENT dir lacks cgroup.controllers -- every cgroup2
-        directory has that file, the mount root's parent does not -- which is the
-        same terminating condition as the Go walk's mount-root stop, discovered from
-        the filesystem rather than a passed-in mount path."""
-        path = self.outer_scope
-        if not path:
-            return None
-        best = None
-        current = os.path.abspath(path)
-        while True:
-            cap = self._read_cgroup_memory_max(current)
-            if cap is not None and (best is None or cap < best):
-                best = cap
-            parent = os.path.dirname(current)
-            if parent == current:
-                break
-            if not os.path.exists(os.path.join(parent, "cgroup.controllers")):
-                break
-            current = parent
-        return best
-
-    def _sum_live_worker_caps(self):
-        """(Σ_live, N_live) derived AT CHECK TIME from the live workers map -- the
-        same drift-proof read _pool_covers_the_queue makes, NOT a counter folded at
-        retirement (which runs only in _observe_worker_usage and would leave the
-        guard inert). Σ_live sums live workers' granted memory.max caps; N_live is
-        their count (each holds one live `aira worker-admit` relay). Skips fallback
-        workers (grant is None) and ledger-only grants (no memory_max): neither holds
-        an enforced cgroup cap against the outer scope.
-
-        `grant["memory_max"]` is a STRING in a real grant (the worker-admit outcome
-        parser stores every field as a string; _validate_grant validates int() but
-        does not store it back), so coerce here rather than isinstance-check for int
-        -- an int check would skip every real grant and leave the guard INERT, a
-        false-pass a porous int-only test fixture hides (caught by the real-cgroup
-        e2e)."""
-        total = 0
-        count = 0
-        for state in self.workers.values():
-            grant = state.get("grant")
-            if not grant:
-                continue
-            raw = grant.get("memory_max")
-            if raw is None:
-                continue  # fallback (grant None handled above) or ledger-only (no memory_max)
-            try:
-                cap = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if cap > 0:
-                total += cap
-                count += 1
-        return total, count
-
-    def _would_breach_outer_cap(self, request):
-        """AIRA-229 client-side aggregate outer-cap guard, consulted at the TOP of
-        spawn_worker before any worker-granting relay is forked. ONE rule:
-
-            spawn is permitted iff  Σ_live + allowance + request <= outer_cap - margin
-
-        where Σ_live/N_live come from the live workers map (at check time),
-        allowance = base + N_live * per_relay, margin is a safety band, and
-        outer_cap is the min finite memory.max over the outer scope's ancestry.
-        Returns None when the spawn may proceed; otherwise raises ONE of two
-        dispositions:
-
-          - Σ_live == 0 -> WorkerAdmitOuterCapExceeded (a WorkerAdmitTerminal):
-            nothing running will ever free room, so a retriable denial would hang
-            the empty-pool wait. Callers route this to _fail_queue_terminal
-            (queue -> unevaluated). This SUBSUMES any single-request-over-cap
-            (Tier-1) check -- at Σ_live == 0 the rule is already stricter -- so
-            there is no separate Tier-1 function.
-          - Σ_live  > 0 -> WorkerAdmitDenied: a live worker's retirement lowers
-            Σ_live and frees room, so the growth path SKIPS THIS TICK and retries.
-
-        MODE (D4): the hazard is a real outer cgroup with an oom.group backstop.
-          - advisory/ci-shim (admission_mode != cgroup-sub-scope): no outer cgroup,
-            no oom.group -> the hazard does not exist. The guard is UNEVALUATED and
-            the spawn PROCEEDS silently; it NEVER refuses.
-          - real (cgroup-sub-scope) with no finite cap anywhere: impossible by
-            precondition (confine's hasFiniteCapAncestor at exec, confine_linux.go
-            :2899; bootstrap's scopeHasFiniteMemoryMax, aitest_bootstrap_linux.go
-            :78). If EVER seen it is a broken assumption -> WARN ONCE, then PROCEED
-            (inside the spec §8 bounded-not-airtight envelope). Never silent, never
-            a refuse-all: refusing every spawn on an unreadable cap would break the
-            whole run over a condition that should not occur."""
-        if self.admission_mode != _ADMISSION_SUB_SCOPE:
-            return  # advisory/ci-shim: no outer cgroup, no oom.group -> hazard absent
-        outer_cap = self._effective_outer_cap()
-        if outer_cap is None:
-            if not self._outer_cap_unreadable_warned:
-                self._outer_cap_unreadable_warned = True
-                sys.stderr.write(
-                    "aira aitest: outer scope %r has no finite memory.max in its cgroup "
-                    "ancestry, which the enforced admission path treats as impossible "
-                    "(confine and aitest-bootstrap both refuse an uncapped outer scope). "
-                    "The aggregate outer-cap guard cannot evaluate and is skipped for this "
-                    "run -- worker over-admission is NOT bounded client-side\n"
-                    % (self.outer_scope,)
-                )
-            return  # broken assumption: warn once, then proceed (never refuse-all)
-        sigma_live, n_live = self._sum_live_worker_caps()
-        allowance = self._outer_cap_base + n_live * self._outer_cap_per_relay
-        if sigma_live + allowance + request <= outer_cap - self._outer_cap_margin:
-            return  # room for this worker under the aggregate outer cap
-        detail = ("outer_cap=%d margin=%d allowance=%d(base=%d+%d*per_relay=%d) "
-                  "sigma_live=%d request=%d"
-                  % (outer_cap, self._outer_cap_margin, allowance, self._outer_cap_base,
-                     n_live, self._outer_cap_per_relay, sigma_live, request))
-        if sigma_live == 0:
-            raise WorkerAdmitOuterCapExceeded(
-                "worker-admit state=denied class=request-invalid reason=outer-cap-exceeded: "
-                "even one worker plus the supervisor allowance would breach the outer scope "
-                "cap, and no live worker will retire to free room -- %s" % detail)
-        # Σ_live > 0: a skip-tick, not terminal. Say it ONCE (the swap-cap/cpu-slots
-        # pattern): a pool silently capped BELOW the requested worker count -- because
-        # the outer cap, not the daemon ledger, is the binding constraint -- is a
-        # governance fact the run must not stay silent about, even though the growth
-        # path itself recovers on the next retirement.
-        if not self._outer_cap_bounded_warned:
-            self._outer_cap_bounded_warned = True
-            sys.stderr.write(
-                "aira aitest: pool bounded by the OUTER-SCOPE cap at %d live worker(s) "
-                "(requested %d); further growth waits for a retirement, not the daemon "
-                "ledger -- %s\n" % (n_live, self._run_worker_count, detail)
-            )
-        raise WorkerAdmitDenied(
-            "worker-admit state=denied class=contended reason=outer-cap-would-breach: "
-            "admitting another worker would breach the outer scope cap; skipping this tick "
-            "until a live worker retires -- %s" % detail)
-
     def spawn_worker(self, estimated_bytes, blocking=True):
         """Admits and forks one worker, returning its pid. Raises
         WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, a
-        WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid,
-        WorkerAdmitContractViolation, or the client-side
-        WorkerAdmitOuterCapExceeded) if this request can never succeed, or
+        WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid or
+        WorkerAdmitContractViolation) if this request can never succeed, or
         WorkerPlacementFailed if the forked child died before confirming it
         joined its granted cgroup scope -- the caller (run()) decides
         fallback/retry/terminal-queue policy for each.
 
-        BEFORE any relay is forked, the AIRA-229 aggregate outer-cap guard
-        (_would_breach_outer_cap) runs: it raises WorkerAdmitOuterCapExceeded
-        (terminal, empty pool) or WorkerAdmitDenied (skip-tick, live pool) if
-        admitting this worker would push Σ(live caps)+allowance+request past the
-        effective outer-scope cap, and returns silently otherwise (including in
-        advisory/ci-shim mode, where the hazard does not exist).
+        S2a §10/§11: there is no client-side outer-cap guard any more. With
+        workers created as siblings under the slice (not nested under a
+        smaller-than-slice outer cap), no aggregate can breach an outer
+        oom.group, so AIRA-229's whole-suite kill and AIRA-232's multi-supervisor
+        breach dissolve by construction; the daemon's one signed slice ledger and
+        each worker's own memory.max are the only RAM bounds, and admission is the
+        daemon's alone.
 
         Safety: the ENTIRE forked-child branch below is wrapped in one
         broad try/except that _exit_child()s (worker.py's coverage-safe
@@ -1644,12 +1440,6 @@ class Supervisor:
         cleanup code fully UNCONFINED. (place_self() itself is separately
         guarded the same way inside fork_worker, Task 12, since it can
         raise before this function's own try even starts.)"""
-        # AIRA-229: the aggregate outer-cap guard, BEFORE any relay is forked, so an
-        # over-admitting spawn is refused client-side rather than admitted and left
-        # for the outer scope's memory.oom.group to whole-suite-kill. Raises on a
-        # breach (terminal / skip-tick per _would_breach_outer_cap); returns None to
-        # proceed (including advisory/ci-shim mode, where the hazard is absent).
-        self._would_breach_outer_cap(estimated_bytes)
         grant, admit_process = self.acquire_worker(estimated_bytes, blocking=blocking)
         # AIRA-123. None here is a LEDGER-ONLY grant: the daemon really admitted
         # this worker against the container's RAM budget, there is simply no
@@ -1955,16 +1745,6 @@ class Supervisor:
         # recorded by the time we get here, so escalating to SIGKILL costs
         # nothing and cannot lose data.
         _reap_child(pid)
-        if state["admit_process"] is not None:
-            # Closing the relay's stdin is the lease RELEASE (S15): the relay's
-            # io.Copy(stdin) returns, it closes its daemon connection, and the daemon
-            # releases this worker's reserve on that EOF. _terminate_process then
-            # bounds the wait and escalates to SIGKILL -- a wedged relay that ignored
-            # its stdin EOF must never abort the whole run over a best-effort wait, and
-            # (equally) must not be left alive HOLDING the connection open, which would
-            # keep the reserve charged in the daemon ledger after the worker is gone.
-            state["admit_process"].stdin.close()
-            _terminate_process(state["admit_process"])
         grant = state.get("grant")
         if grant is not None:
             # AIRA-180 §5s.1. The fold happens HERE, not beside
@@ -1975,10 +1755,30 @@ class Supervisor:
             # completed test, the end-of-run __stop__ broadcast, and the crash
             # path alike -- so capturing anywhere else would have produced a
             # sample set skewed entirely toward crashes, which can only ever look
-            # under-provisioned, never over-provisioned. And it must precede
-            # _forget_worker_scope: that call rmdirs the scope, and memory.peak
-            # goes with it.
+            # under-provisioned, never over-provisioned.
+            #
+            # S2a/T4: this read MUST precede the relay stdin.close() below, not
+            # merely _forget_worker_scope. Post-T4 the daemon kill+rmdirs the
+            # worker's sibling scope on the relay-EOF that stdin.close() triggers
+            # (sub-ms), so a read placed AFTER the close races the daemon's rmdir
+            # and loses memory.peak (measured: pool-peak sample_count 1 -> 0). The
+            # worker is reaped above, so memory.peak is already final here.
             self._observe_worker_usage(grant)
+        if state["admit_process"] is not None:
+            # Closing the relay's stdin is the lease RELEASE (S15): the relay's
+            # io.Copy(stdin) returns, it closes its daemon connection, and the daemon
+            # releases this worker's reserve on that EOF. _terminate_process then
+            # bounds the wait and escalates to SIGKILL -- a wedged relay that ignored
+            # its stdin EOF must never abort the whole run over a best-effort wait, and
+            # (equally) must not be left alive HOLDING the connection open, which would
+            # keep the reserve charged in the daemon ledger after the worker is gone.
+            state["admit_process"].stdin.close()
+            _terminate_process(state["admit_process"])
+        if grant is not None:
+            # _forget_worker_scope rmdirs the scope; post-T4 the daemon may have
+            # already removed it on the relay-EOF above, so this is ENOENT-tolerant
+            # and merely covers the shim / no-daemon-rmdir path. The peak read above
+            # already captured memory.peak while the scope still existed.
             self._forget_worker_scope(grant["scope"])
         # An earlier retirement whose rmdir failed is still charging the ledger;
         # this is the natural moment to try again.
@@ -2023,13 +1823,16 @@ class Supervisor:
         scope_oom = _scope_oom_group_killed(scope)
         if scope_oom:
             self._pool_peak_oom = True
-        # AIRA-230 v7-4: retain this worker's (peak, cap, oom) for the measurement
-        # report, ONLY when enabled. The cap is coerced from the grant's memory_max,
-        # which a REAL enforced grant carries as a STRING (the worker-admit outcome
-        # parser stores every field as a string; v7-1 learned this the hard way) --
-        # None where it cannot be read, NEVER a fabricated 0. This deliberately does
-        # NOT touch the AIRA-180 _pool_budget gauge above (its string-cap behaviour
-        # is AIRA-231, out of this slice's scope).
+        # AIRA-230 v7-4: retain this worker's (peak, cap, oom, scope_path) for the
+        # measurement report, ONLY when enabled. The cap is coerced from the grant's
+        # memory_max, which a REAL enforced grant carries as a STRING (the worker-admit
+        # outcome parser stores every field as a string; v7-1 learned this the hard
+        # way) -- None where it cannot be read, NEVER a fabricated 0. The scope_path is
+        # the grant's own worker-scope path (S2a/T8): the DETERMINISTIC anchor Task 9's
+        # Gate A asserts sibling placement against, so it needs no read and is always a
+        # real path here (this method already returned for a scope-less grant). This
+        # deliberately does NOT touch the AIRA-180 _pool_budget gauge above (its
+        # string-cap behaviour is AIRA-231, out of this slice's scope).
         if os.environ.get("AIRA_AITEST_MEASURE_DIR", "").strip():
             cap = memory_max
             if not isinstance(cap, int):
@@ -2037,7 +1840,9 @@ class Supervisor:
                     cap = int(str(cap).strip())
                 except (TypeError, ValueError):
                     cap = None
-            self._pool_peak_records.append({"peak": peak, "memory_max": cap, "oom": scope_oom})
+            self._pool_peak_records.append(
+                {"peak": peak, "memory_max": cap, "oom": scope_oom, "scope_path": scope}
+            )
 
     def _pool_subject_key(self):
         """This pool's durable subject key: the pytest rootdir followed by the
@@ -2133,11 +1938,14 @@ class Supervisor:
 
         Reuses the reads the pool already makes (the AIRA-180 per-worker
         memory.peak/oom at retirement, retained per-worker in
-        _pool_peak_records) and adds exactly ONE new read: the supervisor's own
-        .aira-supervisor/memory.peak at full pool, which sets the outer-cap
-        ALLOWANCE (the uncapped supervisor process charges the outer cap). Called
-        after _report_pool_usage and BEFORE _cleanup_supervisor_scope, while
-        self.supervisor_scope still exists to be read."""
+        _pool_peak_records) and adds exactly ONE new read: the PARENT confine
+        scope's memory.peak at full pool, which sets the outer-cap ALLOWANCE.
+        Post-S2a the supervisor + framework run DIRECTLY in that parent leaf
+        (there is no relocated .aira-supervisor sub-scope any more -- workers are
+        first-class siblings under the slice), so the parent scope's own peak IS
+        the allowance term. Called after _report_pool_usage; `aira confine` owns
+        the parent scope for the life of the launch, so there is nothing of
+        aitest's own to tear down after this read."""
         measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "")
         if not measure_dir.strip():
             return
@@ -2145,10 +1953,14 @@ class Supervisor:
         def honest(value):
             return value if value is not None else "unevaluated"
 
+        # The supervisor runs in the PARENT confine scope's own leaf (outer_scope
+        # is that scope's path), so its memory.peak is that scope's. Skip the
+        # ci-shim sentinel (no cgroup) and the unset/fallback case -- both leave
+        # the term honestly "unevaluated" rather than opening a bogus path.
         supervisor_peak = None
-        if self.supervisor_scope:
+        if self.outer_scope and self.outer_scope != _OUTER_SCOPE_SHIM_SENTINEL:
             supervisor_peak = _read_cgroup_int(
-                os.path.join(self.supervisor_scope, "memory.peak")
+                os.path.join(self.outer_scope, "memory.peak")
             )
 
         report = {
@@ -2164,6 +1976,11 @@ class Supervisor:
                     # the scope's memory.events could not settle it -- that is
                     # "unevaluated", not a fake "not OOM-killed".
                     "oom": honest(record["oom"]),
+                    # The granted worker-scope path (S2a/T8): Gate A's deterministic
+                    # sibling-placement anchor. Always a real path in a retained
+                    # record (a scope-less grant never reaches _pool_peak_records),
+                    # so it is emitted verbatim, not honest()-wrapped.
+                    "scope_path": record["scope_path"],
                 }
                 for record in self._pool_peak_records
             ],
@@ -2173,11 +1990,6 @@ class Supervisor:
             # a real run; reported honestly rather than papered over here).
             "worker_budget": honest(self._pool_budget),
             "oom_group_killed": self._pool_peak_oom,
-            # The guard constants in effect, so the report ties measured
-            # supervisor/worker RSS to the tunables it exists to set (v7-1).
-            "outer_cap_allowance_base": self._outer_cap_base,
-            "outer_cap_allowance_per_relay": self._outer_cap_per_relay,
-            "outer_cap_margin": self._outer_cap_margin,
         }
         try:
             os.makedirs(measure_dir, exist_ok=True)
@@ -2834,12 +2646,12 @@ class Supervisor:
         each of those surplus workers holds a real daemon lease against this
         run's budget for its entire useless lifetime (S15 replaced AIRA-39's
         children-memory.max scan with a signed scope-id LEASE COUNTER, so the
-        daemon now bounds Σ(leases) <= the slice ceiling; the outer-scope
-        aggregate bound Σ(worker caps) <= outer-cap is the AIRA-229 client-side
-        guard, _would_breach_outer_cap), so needless over-spawn makes hitting
-        that cap -- and stalling in _wait_for_admission_or_disable waiting for
-        capacity this run is itself holding -- more likely than the requested
-        pool size warrants.
+        daemon bounds Σ(leases) <= the slice ceiling — and S2a §10 removed the
+        client-side outer-cap guard entirely, since sibling worker scopes have no
+        shared outer cap to aggregate against), so needless over-spawn makes
+        hitting that ceiling -- and stalling in _wait_for_admission_or_disable
+        waiting for capacity this run is itself holding -- more likely than the
+        requested pool size warrants.
 
         Counting IDLE workers rather than all of them (or keeping a local
         counter decremented per spawn, the other shape AIRA-37 suggested) makes
@@ -2966,61 +2778,15 @@ class Supervisor:
                         pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
         # AIRA-180. After the dispatch loop, so every worker has retired and
-        # folded its usage in, and before _cleanup_supervisor_scope so a slow
-        # relay cannot delay the rmdir retry. Fail-open: see _report_pool_usage.
+        # folded its usage in. Fail-open: see _report_pool_usage.
         self._report_pool_usage()
         # AIRA-230 v7-4: after _report_pool_usage (every worker has folded its
-        # usage in) and BEFORE _cleanup_supervisor_scope (which rmdirs the
-        # supervisor scope, taking its memory.peak with it). Opt-in + fail-open.
+        # usage in). The supervisor-peak term reads the PARENT confine scope's
+        # memory.peak, which `aira confine` owns for the life of the launch, so
+        # there is no scope of aitest's own to tear down first. Opt-in + fail-open.
         self._emit_measurement_report()
-        self._cleanup_supervisor_scope()
         # ONE structurally complete pass, after every other path has had its
         # say -- see _synthesize_unevaluated_reports for why this is a single
         # post-run pass over items_by_nodeid rather than per-call-site fixes.
         self._synthesize_unevaluated_reports()
         return self.results
-
-    def _cleanup_supervisor_scope(self):
-        """Best-effort: rmdir the supervisor's OWN child scope this run
-        relocated itself into (bootstrap, Task 2/3/11). The OUTER scope
-        itself is `aira confine`'s own job to tear down when the whole
-        launch process exits -- this is only about the new child scope
-        aitest itself created. NOTE: in the real-cgroup case this
-        typically still fails here (EBUSY) since the supervisor process
-        calling rmdir is itself still a live member of the scope it is
-        trying to remove -- it only ever succeeds AFTER this process
-        exits, which is after this call returns. Attempted anyway because
-        it is free and occasionally correct (e.g. non-real-cgroup test
-        doubles).
-
-        #72's orphaned-scope reaper IS the real backstop for the nested
-        case this rmdir usually can't finish itself (a crashed
-        supervisor/worker -- spec 3.6's normal, expected death-by-OOM
-        path, where nothing here runs -- leaves live-then-dead child
-        scopes under the outer scope). This was a real, confirmed gap
-        for a while (the reaper only did a single-level rmdir, which the
-        kernel refuses on a cgroup with live children, so nested orphans
-        accumulated unbounded) -- fixed and deployed as AIRA-36
-        (reapEmptyConfineScopeTree, internal/runner/confine_manage_linux.go,
-        master 826f33b): whole-subtree-empty positive-proof-gated,
-        fd-anchored, never touches a scope with a live worker anywhere
-        in its subtree. Live-verified sweeping this exact nested shape.
-        """
-        if not self.supervisor_scope:
-            return
-        try:
-            os.rmdir(self.supervisor_scope)
-        except OSError as exc:
-            # EBUSY here is the EXPECTED outcome documented above (found live via
-            # fastest-ee-dc dogfooding, 2026-09-02: even with cgroup.procs already
-            # empty, cgroup-v2 destruction is not synchronous with the last process
-            # leaving -- the kernel's own deferred css-offline accounting can hold
-            # the directory busy for a brief settling window after this call, well
-            # before the #72/AIRA-36 reaper's grace period would ever consider it
-            # orphaned). Printing an alarming "could not remove" line for this on
-            # EVERY real-cgroup run trains users to ignore aitest's stderr output
-            # entirely, which is exactly the failure mode this project's honesty
-            # discipline exists to prevent for messages that ARE diagnostic. Any
-            # OTHER errno is still surfaced -- that is genuinely unexpected.
-            if exc.errno != errno.EBUSY:
-                sys.stderr.write("aira aitest: could not remove supervisor scope %s: %s\n" % (self.supervisor_scope, exc))

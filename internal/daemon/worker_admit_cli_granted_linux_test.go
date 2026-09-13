@@ -139,13 +139,16 @@ type relayExit struct {
 // verifies: AIRA-41
 func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// First, so an unusable host skips before paying for a build.
-	outer := realOuterScope(t)
+	outer, parent := realOuterScope(t)
 	binary := buildAiraBinary(t)
 
 	const ceiling = 128 << 20
 	const request = 32 << 20
 
-	const slicePath = "/test-slice"
+	// S2a §4: worker scopes are siblings under the resolved slice, so the daemon is
+	// pointed at the real `parent` (the aira.slice stand-in) rather than a fake path
+	// — the worker scope is really created under it.
+	slicePath := parent
 	paths := testPaths(t)
 	server := NewServer(paths)
 	server.restartFreeze = 0
@@ -183,6 +186,7 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	}
 
 	command := exec.Command(binary, "worker-admit", "--job-id", "job-1", "--outer-scope", outer,
+		"--parent-scope-id", strings.TrimPrefix(filepath.Base(outer), ".aira-"),
 		"--estimated-bytes", strconv.FormatInt(request, 10), "--max-wait", "10s")
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -245,8 +249,15 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 		t.Fatalf("outcome=%v, want a grant", fields)
 	}
 	scopePath := fields["scope"]
-	if want := runner.WorkerScopeChildPath(outer, "worker-"+fields["worker_id"]); scopePath != want {
-		t.Fatalf("granted scope=%q, want %q", scopePath, want)
+	// Task 1 + S2a §4: the granted scope is a first-class confine SIBLING under the
+	// resolved slice (parent), CONFINE-aitest-w<seq>-<parentPid>-<stamp>, not a
+	// `.aira-worker-N` child nested under outer.
+	if dir := filepath.Dir(scopePath); dir != parent {
+		t.Fatalf("granted scope=%q is a child of %q, want the resolved slice %q", scopePath, filepath.Dir(scopePath), parent)
+	}
+	base := strings.TrimPrefix(filepath.Base(scopePath), ".aira-")
+	if nm, pid, _, _, ok := runner.ParseConfineScopeID(base); !ok || !strings.HasPrefix(nm, "aitest-w") || pid != realOuterParentPID {
+		t.Fatalf("granted scope name %q (from %q) is not a parseable aitest-w id with parent pid %d", base, scopePath, realOuterParentPID)
 	}
 	if got := fields["memory_max"]; got != strconv.FormatInt(request, 10) {
 		t.Fatalf("granted memory_max=%q, want %d", got, request)
@@ -377,19 +388,25 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 		t.Fatalf("the daemon still holds the granted lease %v after the relay exited", grantedRelayExitBudget)
 	}
 
-	// --- Phase 4 (S15 / AIRA-41 REVERSAL): the holder's EOF frees the ledger
-	// IMMEDIATELY, while the scope DIRECTORY persists. ---
-	// The worker lease is a normal signed-ledger lease keyed on its scope path, so
-	// the relay's exit (its connection's EOF) releases the ledger charge at once
-	// (already confirmed by the release poll above). The daemon does NOT rmdir the
-	// scope on EOF — that is supervisor.py's _forget_worker_scope, after it has
-	// reaped the worker — so the scope directory is still on the real tree here.
-	// This is the exact inversion of v0.5's "a closed connection frees nothing":
-	// RAM returns at EOF, not at scope removal.
-	if _, err := os.Stat(scopePath); err != nil {
-		t.Fatalf("the daemon removed the worker scope on the relay's EOF (%v); it must leave it for the supervisor to rmdir after reaping the worker", err)
+	// --- Phase 4 (S15 / AIRA-41 REVERSAL + S2a §16b): the holder's EOF frees the
+	// ledger IMMEDIATELY, and the daemon TEARS DOWN the worker's sibling scope. ---
+	// The worker lease is a normal signed-ledger lease keyed on its scope-id, so the
+	// relay's exit (its connection's EOF) releases the ledger charge at once (already
+	// confirmed by the release poll above). S2a made workers SIBLINGS under the slice,
+	// so nothing above a worker kills it on relay death; the daemon therefore
+	// cgroup.kills + rmdirs the scope on that same EOF (§16b) — an intended behaviour
+	// change from v0.5, where the daemon left the rmdir to supervisor.py's
+	// _forget_worker_scope. The teardown runs in the daemon's handler just after the
+	// release, so poll for the directory to vanish.
+	removed := false
+	for deadline := time.Now().Add(testdeadline.Wait(grantedRelayExitBudget)); time.Now().Before(deadline); {
+		if _, err := os.Stat(scopePath); os.IsNotExist(err) {
+			removed = true
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
-	if err := os.Remove(scopePath); err != nil {
-		t.Fatalf("remove the worker scope: %v", err)
+	if !removed {
+		t.Fatalf("the daemon did not rmdir the worker scope %q after the relay's EOF; with sibling workers the daemon must cgroup.kill+rmdir the scope on peer-EOF (§16b)", scopePath)
 	}
 }

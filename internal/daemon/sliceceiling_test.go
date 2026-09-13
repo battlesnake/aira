@@ -895,16 +895,12 @@ func TestSliceCeilingSnapshotIsALeafUnderConcurrentEvaluation(t *testing.T) {
 // capacity, driven through the real admitConnection wire path rather than the
 // arithmetic.
 //
-// Three claims, each of which a wrong implementation breaks:
+// Two claims, each of which a wrong implementation breaks:
 //
 //   - a request that fits the STATIC ceiling but not the throttled one gets no
 //     E_ADMIT_TOO_LARGE frame and stays queued. The ticket's own proposal (moving
 //     the slice's memory.max) fails this: E_ADMIT_TOO_LARGE is terminal and the
 //     runner does not retry, so a merge gate would hard-fail instead of waiting.
-//   - the grant's delegate-ram ScopeCeiling is sized from the UNTHROTTLED
-//     maximum. A throttled value there gives a pytest suite a scope cap far below
-//     its default and it OOM-groups itself — a self-inflicted OOM on a
-//     legitimately admitted job.
 //   - the waiter IS granted once the ceiling recovers, so the first claim is not
 //     passing merely because nothing was ever admitted.
 func TestSliceCeilingThrottleReachesCapacityOnly(t *testing.T) {
@@ -961,39 +957,6 @@ func TestSliceCeilingThrottleReachesCapacityOnly(t *testing.T) {
 	}
 	_ = clientConn.Close()
 	<-done
-
-	// The scope ceiling must come from the STATIC maximum even while throttled.
-	server.publishSliceCeilingSnapshot(sliceCeilingSnapshot{
-		Mode: sliceCeilingEnforce, SlicePath: "/slice", State: sliceCeilingThrottled,
-		Ceiling: 1 << 30, StaticMax: 64 << 30,
-	})
-	scopeServer, scopeClient := net.Pipe()
-	scopeDone := make(chan struct{})
-	go func() {
-		defer close(scopeDone)
-		defer scopeServer.Close()
-		server.admitConnection(scopeServer, map[string]any{
-			"slice": "slice", "reserve": runner.DefaultDelegateRAMOverhead, "max_wait_ms": int64(2000),
-			"signature": "suite", "pinned": true, "delegate_ram": true,
-		})
-	}()
-	var frame ResponseFrame
-	if err := readFrame(scopeClient, &frame); err != nil {
-		t.Fatalf("delegate-ram admit under throttle: %v", err)
-	}
-	var response struct {
-		Data AdmitResponse `json:"data"`
-	}
-	if err := json.Unmarshal(mustMarshal(t, frame), &response); err != nil {
-		t.Fatal(err)
-	}
-	want := int64(8<<30) + int64(8<<30)*delegateRAMScopeSafetyPct/100
-	if response.Data.ScopeCeiling != want {
-		t.Fatalf("ScopeCeiling=%d under a 1GiB throttled ceiling, want the unthrottled %d — a throttled scope cap self-OOMs a legitimately admitted job",
-			response.Data.ScopeCeiling, want)
-	}
-	_ = scopeClient.Close()
-	<-scopeDone
 }
 
 func mustMarshal(t *testing.T, value any) []byte {

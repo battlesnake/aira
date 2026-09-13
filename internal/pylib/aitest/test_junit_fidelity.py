@@ -174,8 +174,9 @@ def _run_suite(suite, barrier_dir, xml_path, extra_args, tmp_path):
         arg.startswith("--aitest-workers=") and not arg.endswith("=1") for arg in extra_args
     ) else "1"
     # No daemon: the fallback path forks exactly the same way, and this test is
-    # about report fidelity, not admission.
-    env["AIRA_AITEST_BOOTSTRAP_CMD"] = str(tmp_path / "missing-aira")
+    # about report fidelity, not admission. An unset outer scope is the
+    # daemon-down trigger (S2a), so clear any inherited coordinate.
+    env.pop("AIRA_AITEST_OUTER_SCOPE", None)
     env["AIRA_AITEST_MAX_WORKERS_FALLBACK"] = "2"
     env.pop("AIRA_REAL_CGROUP", None)
     command = [

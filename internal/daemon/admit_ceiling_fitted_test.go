@@ -500,9 +500,10 @@ func TestFittingNeverTouchesAPinnedRequest(t *testing.T) {
 		want    int64
 	}{
 		{"--memory-reserve", runner.ConfineRequest{MemoryReserve: fittedHint, MemoryReservePinned: true}, fittedHint},
-		{"--memory-max (non-delegate up-charge)", runner.ConfineRequest{ScopeMemoryMax: fittedHint}, fittedHint},
-		{"--delegate-ram framework overhead", runner.ConfineRequest{DelegateRAM: true}, runner.DefaultDelegateRAMOverhead},
+		{"--memory-max (up-charge)", runner.ConfineRequest{ScopeMemoryMax: fittedHint}, fittedHint},
 		{
+			// S2a §4/§16: a delegate job is ordinary, so a declared --memory-reserve
+			// pins exactly as on any confine job.
 			"--delegate-ram --memory-reserve",
 			runner.ConfineRequest{DelegateRAM: true, MemoryReserve: fittedHint, MemoryReservePinned: true},
 			fittedHint,

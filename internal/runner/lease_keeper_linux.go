@@ -89,7 +89,7 @@ type leaseKeeper struct {
 // non-exclusive grant, starts the reconnect goroutine. grant carries the daemon's
 // echoed figures; the re-declared RAM is grant.Reserve (the exact reserve the
 // ledger holds — re-SETting it is idempotent, no double-count), the CPU is the
-// declared core count (1, or 0 for a delegate suite), matching the original admit.
+// declared core count (1, matching the original admit — S2a made a delegate job ordinary).
 func newLeaseKeeper(conn net.Conn, req Request, grant runnerAdmitGrant, dial func(context.Context, string) (net.Conn, error), socketPath string) *leaseKeeper {
 	if req.Exclusive || req.ConfineScopeID == "" || dial == nil {
 		// Exclusive: never reconnect (watchExclusive handles EOF). Scope-less: no
@@ -97,9 +97,6 @@ func newLeaseKeeper(conn net.Conn, req Request, grant runnerAdmitGrant, dial fun
 		return newLeaseKeeperFrame(conn, nil, req.ConfineScopeID, dial, socketPath)
 	}
 	cpuCores := uint32(DefaultConfineCPUCores)
-	if req.DelegateRAM {
-		cpuCores = 0
-	}
 	frame, err := redeclare.EncodeFrame(redeclare.Record{
 		ScopeID:       req.ConfineScopeID, // VERBATIM: the daemon keys the lease on this string
 		RAMBytes:      uint64(grant.Reserve),

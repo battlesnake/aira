@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 
 // S15 deleted the bespoke exclusiveDeniesWorkerAdmit gate. A worker is now an
 // ordinary sub-reservation lease on the unified ledger (parentScopeID = the suite
-// scope-id, derived by workerParentScopeID), so the SHARED exclusivity gate
+// scope-id the supervisor sends explicitly), so the SHARED exclusivity gate
 // (exclusiveGate.blocks) governs it. These tests pin that the derivation preserves
 // the exact behaviour the deleted gate provided: the holder's own workers pass
 // during its hold, a foreign worker is blocked during a hold, and every worker is
@@ -46,33 +47,20 @@ func holdSliceExclusive(t *testing.T, server *Server, name string, pid int) stri
 }
 
 // enqueueWorkerSubReservation enqueues a worker lease exactly as
-// workerAdmitConnection would: scope id = the worker's scope path, parentScopeID =
-// the suite scope-id derived from the outer scope, one declared core.
+// workerAdmitConnection would: scope id = a worker scope under outerScope,
+// parentScopeID = the suite scope-id (the base of outerScope minus ".aira-", the
+// value the supervisor now sends explicitly as parent_scope_id), one declared core.
 func enqueueWorkerSubReservation(t *testing.T, server *Server, outerScope string) (*sliceQueue, *admitWaiter) {
 	t.Helper()
-	scopeID := runner.WorkerScopeChildPath(outerScope, "worker-1")
+	parentScopeID := strings.TrimPrefix(filepath.Base(filepath.Clean(outerScope)), ".aira-")
+	scopeID := runner.WorkerScopeChildPath(outerScope, runner.MintWorkerScopeID(1, 111111, ""))
 	queue, waiter, code, err := server.enqueueAdmitInternal("/slice", 1<<20, workerAdmitBasis, 1<<40, true, admitRequest{
-		scopeID: scopeID, cpu: runner.DefaultConfineCPUCores, parentScopeID: workerParentScopeID(outerScope),
+		scopeID: scopeID, cpu: runner.DefaultConfineCPUCores, parentScopeID: parentScopeID,
 	})
 	if err != nil {
 		t.Fatalf("enqueue worker sub-reservation: code=%s err=%v", code, err)
 	}
 	return queue, waiter
-}
-
-func TestWorkerParentScopeIDDerivation(t *testing.T) {
-	for _, tc := range []struct {
-		outer string
-		want  string
-	}{
-		{"/slice/.aira-CONFINE-suite-500-1@mark", "CONFINE-suite-500-1@mark"},
-		{"/slice/.aira-suite/", "suite"},
-		{"/some/non-aira-cgroup", "non-aira-cgroup"},
-	} {
-		if got := workerParentScopeID(tc.outer); got != tc.want {
-			t.Fatalf("workerParentScopeID(%q)=%q, want %q", tc.outer, got, tc.want)
-		}
-	}
 }
 
 func TestWorkerSubReservationAdmittedUnderHoldersOwnScope(t *testing.T) {

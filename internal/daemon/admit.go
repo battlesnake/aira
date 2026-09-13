@@ -38,8 +38,6 @@ const (
 	admitConfineScanIntervalDefault           = time.Second
 	admitSliceHeadroomBaseDefault       int64 = 2 << 30
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
-	delegateRAMScopeMinDefault          int64 = 4 << 30
-	delegateRAMScopeSafetyPct           int64 = 15
 
 	// admitExclusiveWaitCeilingDefault bounds how long an EXCLUSIVE request may
 	// drain the slice. It is deliberately far below the shared 24-hour
@@ -134,11 +132,6 @@ type admitWaiter struct {
 	scopeID   string
 	name      string
 	owner     string
-	// scopeCeiling is the delegate-ram scope's resolved memory.max (AIRA-15),
-	// zero for every other class. Set at construction under queue.mu — see
-	// admitRequest.scopeCeiling for why that moved — and carried to the launcher
-	// on the grant response (AdmitResponse.ScopeCeiling) so it sizes the scope cap.
-	scopeCeiling int64
 
 	// AIRA-108. A BOUNDED copy of the client's own resource signature, retained
 	// purely so `confine --list` can NAME a scope-less reservation rather than
@@ -530,7 +523,8 @@ func confineScopeDirName(scopeID string) string {
 
 // S15 deleted the bespoke exclusiveDeniesWorkerAdmit gate. A worker is now an
 // ordinary sub-reservation lease on the unified ledger (parentScopeID = the suite
-// scope-id, via workerParentScopeID), so the shared exclusivity gate handles it:
+// scope-id, from the explicit parent_scope_id wire field), so the shared exclusivity
+// gate handles it:
 // exclusiveGate.blocks exempts a sub-reservation from a DRAIN unconditionally and
 // from a HOLD when its parent is the holder's own work — the exact behaviour this
 // gate provided, now expressed once for every lease rather than duplicated.
@@ -687,11 +681,10 @@ type AdmitResponse struct {
 	Reserve  int64  `json:"reserve"`
 	// S5. Cpu echoes the granted CPU-core reservation the ledger charged. Purely
 	// informational (the client applies no cpu.max); it keeps the grant wire
-	// symmetric with the {ram, cpu} request vector. omitempty, so a 0-core grant (a
-	// delegate suite; §8) carries no field and older readers are unaffected.
-	Cpu          int64  `json:"cpu,omitempty"`
-	Basis        string `json:"basis"`
-	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
+	// symmetric with the {ram, cpu} request vector. omitempty, so a 0-core grant
+	// carries no field and older readers are unaffected.
+	Cpu   int64  `json:"cpu,omitempty"`
+	Basis string `json:"basis"`
 }
 
 type admitRequest struct {
@@ -717,22 +710,12 @@ type admitRequest struct {
 	scopeID     string
 	name        string
 	owner       string
-	delegateRAM bool
 	exclusive   bool
 	// AIRA-185. The holder's own free-text label for why the slice is held.
 	// DIAGNOSTIC ONLY and already bounded by validateAdmitArgs.
 	exclusiveReason string
 	exclusiveHolder string
 	parentScopeID   string
-
-	// scopeCeiling is NOT a client field: admitConnection resolves it and puts it
-	// here so the waiter can be constructed with it already set, under queue.mu.
-	//
-	// It used to be assigned onto the waiter AFTER enqueue, with no lock held,
-	// while the evaluator goroutine was already free to read that waiter. It is
-	// set where every other waiter field is written, under queue.mu, rather than
-	// contorting a later lock-free assignment around a concurrent read.
-	scopeCeiling int64
 
 	// S8 (anchor). conn / clientPID / processStartTick / peerSameUID are resolved by
 	// admitConnection from the connection BEFORE the enqueue lock and carried here so
@@ -1471,73 +1454,6 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	return request.reserve, "fallback:no-history" + fitted
 }
 
-// resolveDelegateRAMScopeCeiling is intentionally separate from reserve
-// resolution: delegate-ram reserves are pinned framework overhead, while this
-// value is a whole-scope containment backstop. In particular, pinned:client
-// must still consult the scope's own peak history.
-func (s *Server) resolveDelegateRAMScopeCeiling(request admitRequest, maximum, headroom int64) int64 {
-	upper := subtractFloor(maximum, headroom)
-	if upper <= 0 {
-		return 0
-	}
-	minimum := delegateRAMScopeMinimum()
-	if minimum > upper {
-		minimum = upper
-	}
-	candidate := delegateRAMScopeDefault()
-	if request.signature != "" {
-		readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
-		defer cancel()
-		read := s.admitPeakHistory
-		if read == nil && s.db != nil {
-			read = s.db.ConfinePeakHistory
-		}
-		if read != nil {
-			if stats, err := read(readCtx, request.signature); err == nil && stats.PeakMax > 0 {
-				candidate = delegateRAMScopeWithSafety(stats.PeakMax)
-				if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
-					candidate = delegateRAMScopeOOMEscalation(stats.MaxOOMPeak)
-				}
-			}
-		}
-	}
-	if candidate < minimum {
-		return minimum
-	}
-	if candidate > upper {
-		return upper
-	}
-	return candidate
-}
-
-func delegateRAMScopeMinimum() int64 {
-	if parsed, err := runner.ParseMemorySize(strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_MIN"))); err == nil && parsed > 0 {
-		return parsed
-	}
-	return delegateRAMScopeMinDefault
-}
-
-func delegateRAMScopeDefault() int64 {
-	if parsed, err := runner.ParseMemorySize(strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT"))); err == nil && parsed > 0 {
-		return parsed
-	}
-	return runner.DefaultDelegateRAMScopeCeiling
-}
-
-func delegateRAMScopeWithSafety(peak int64) int64 {
-	if peak <= 0 || peak > math.MaxInt64/delegateRAMScopeSafetyPct {
-		return math.MaxInt64
-	}
-	return addClamp(peak, peak*delegateRAMScopeSafetyPct/100)
-}
-
-func delegateRAMScopeOOMEscalation(peak int64) int64 {
-	if peak <= 0 || peak > math.MaxInt64-peak/2 {
-		return math.MaxInt64
-	}
-	return peak + peak/2
-}
-
 func (s *Server) cachedAdmitPeakP90(ctx context.Context) (int64, bool) {
 	now := s.admitNowTime()
 	s.admitPriorMu.Lock()
@@ -1678,11 +1594,6 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	jobs := s.admitOutstandingJobs(path)
 	headroom := s.admitSliceHeadroom(jobs + 1)
 	ceiling := subtractFloor(maximum, headroom)
-	if request.delegateRAM {
-		// Resolved BEFORE the enqueue so the waiter is constructed with it, under
-		// queue.mu. See admitRequest.scopeCeiling.
-		request.scopeCeiling = s.resolveDelegateRAMScopeCeiling(request, maximum, headroom)
-	}
 	reserve, basis := s.resolveAdmitReserve(request, ceiling)
 	if reserve > ceiling {
 		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{Required: reserve, Ceiling: ceiling, Basis: basis})
@@ -1797,7 +1708,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		queue.mu.Unlock()
 		return
 	}
-	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Cpu: waiter.cpu, Basis: waiter.basis, ScopeCeiling: waiter.scopeCeiling}
+	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Cpu: waiter.cpu, Basis: waiter.basis}
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -1888,7 +1799,7 @@ func newEstablishedWaiter(seq, reserve, cpu int64, basis string, request admitRe
 		enqueued: now, grantedAt: now, outcome: "immediate",
 		scopeID: request.scopeID, name: request.name, owner: request.owner,
 		signature:     boundedAdmitSignature(request.signature),
-		parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling,
+		parentScopeID: request.parentScopeID,
 	}
 }
 
@@ -2110,7 +2021,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, scopeCeiling: request.scopeCeiling}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
 	// Anchor the fresh lease to its connection through the same helper a re-declare
 	// uses, so the anchor identity is set uniformly. The connection's EOF release
 	// compares its own conn against this anchor.
@@ -2532,14 +2443,21 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 // releaseAdmitWaiterAnchored is the socket-EOF release: the connection that anchored
 // the lease discharges it on its own EOF, via the compare-and-release gate. conn is the
 // releasing handler's own connection. See releaseAdmitWaiterLockedAnchored. It runs
-// afterAdmitRelease only when it performed the discharge.
-func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) {
+// afterAdmitRelease only when it performed the discharge, and RETURNS whether it did.
+//
+// The returned bool is the S2a §16.2 (P1-B) anchor gate: a worker relay's peer-EOF
+// kills+rmdirs its sibling scope ONLY when its own anchored release actually
+// discharged — a stale connection whose lease was re-anchored to a live redial gets
+// false here, so it never kills a mid-test worker (a release is idempotent; a kill
+// is not).
+func (s *Server) releaseAdmitWaiterAnchored(queue *sliceQueue, waiter *admitWaiter, conn net.Conn) bool {
 	queue.mu.Lock()
 	released := releaseAdmitWaiterLockedAnchored(queue, waiter, conn)
 	queue.mu.Unlock()
 	if released {
 		s.afterAdmitRelease(queue)
 	}
+	return released
 }
 
 // releaseAdmitWaiterLockedAnchored is compare-and-release (design §3, Inv 4), with
@@ -2875,15 +2793,17 @@ func admitErrorCode(err error) string {
 }
 
 func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, error) {
-	// AIRA-185 widened the count to 13 and added `reason` to the allowlist below.
-	// S5 widened it to 14 and added `cpu`. All are ADDITIVE: no existing field
-	// changed meaning, and (bar cpu, the second ledger resource) no admission, gate
-	// or emptiness decision reads the new ones.
-	if len(args) < 3 || len(args) > 14 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	// AIRA-185 widened the count and added `reason` to the allowlist below.
+	// S5 added `cpu`. S2a §4/§16 REMOVED `delegate_ram` (a delegate job is now an
+	// ordinary confine job; the daemon no longer reads a delegate flag), narrowing
+	// the count to 13. All prior additions were ADDITIVE: no existing field changed
+	// meaning, and (bar cpu, the second ledger resource) no admission, gate or
+	// emptiness decision reads the others.
+	if len(args) < 3 || len(args) > 13 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/signature/pinned/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "cpu" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
+		if name != "slice" && name != "reserve" && name != "cpu" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -2952,14 +2872,6 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		pinned, valid = raw.(bool)
 		if !valid {
 			return admitRequest{}, fmt.Errorf("%s: admit pinned must be boolean", CodeProtocol)
-		}
-	}
-	delegateRAM := false
-	if raw, exists := args["delegate_ram"]; exists {
-		var valid bool
-		delegateRAM, valid = raw.(bool)
-		if !valid {
-			return admitRequest{}, fmt.Errorf("%s: admit delegate_ram must be boolean", CodeProtocol)
 		}
 	}
 	// AIRA-101.
@@ -3112,7 +3024,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3125,7 +3037,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// exclusive requires the tuple refused just above), and it is transcribed
 	// anyway so that relaxing either rule later cannot silently drop the field
 	// instead of failing a test.
-	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

@@ -107,12 +107,11 @@ func TestValidateAdmitArgsRejectsTraversalShapedConfineScopeID(t *testing.T) {
 	if err != nil || request.scopeID != valid["scope_id"] || request.owner != "session-a" {
 		t.Fatalf("request=%+v err=%v", request, err)
 	}
-	valid["scope_id"] = "CONFINE-@dr-job-with-dash-123-abc9@session-a"
+	valid["scope_id"] = "CONFINE-job-with-dash-123-abc9@session-a"
 	valid["name"] = "job-with-dash"
-	valid["delegate_ram"] = true
 	request, err = validateAdmitArgs(valid, admitWaitCeilingMs)
-	if err != nil || !request.delegateRAM || request.name != "job-with-dash" {
-		t.Fatalf("marked request=%+v err=%v", request, err)
+	if err != nil || request.name != "job-with-dash" {
+		t.Fatalf("dashed-name request=%+v err=%v", request, err)
 	}
 }
 

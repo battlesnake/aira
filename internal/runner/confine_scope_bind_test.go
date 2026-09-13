@@ -7,24 +7,22 @@ import (
 	"testing"
 )
 
-// TestBindConfineScopeIDRefusesAForeignPIDNameOwnerOrDelegateClass is the guard
-// that makes AIRA-22's supervisor-minted scope id safe. The scope-id GRAMMAR is
-// happy with any canonical pid/stamp/owner/@dr combination, so a syntax check
-// alone would let a pre-minted id name a scope after a foreign pid (breaking
-// `confine --kill <pid>`, the --list SupervisorPID column, and the orphan
-// reaper's liveness predicate), after a foreign owner (which the daemon binds
-// separately at admit, so the mismatch degrades to an UNACCOUNTED flock-fallback
-// launch), or in the wrong delegate-RAM class (which decides the cap type that
-// survives a daemon restart).
+// TestBindConfineScopeIDRefusesAForeignPIDNameOrOwner is the guard that makes
+// AIRA-22's supervisor-minted scope id safe. The scope-id GRAMMAR is happy with
+// any canonical pid/stamp/owner combination, so a syntax check alone would let a
+// pre-minted id name a scope after a foreign pid (breaking `confine --kill <pid>`,
+// the --list SupervisorPID column, and the orphan reaper's liveness predicate) or
+// after a foreign owner (which the daemon binds separately at admit, so the
+// mismatch degrades to an UNACCOUNTED flock-fallback launch).
 //
 // Each direction is asserted separately: a single "any mismatch is refused" case
 // would still pass against an implementation that checked only one of them.
 //
 // verifies: AIRA-22
-func TestBindConfineScopeIDRefusesAForeignPIDNameOwnerOrDelegateClass(t *testing.T) {
+func TestBindConfineScopeIDRefusesAForeignPIDNameOrOwner(t *testing.T) {
 	self := os.Getpid()
-	good := confineScopeID("gate", "session-a", false)
-	if err := bindConfineScopeID(good, "gate", "session-a", false); err != nil {
+	good := confineScopeID("gate", "session-a")
+	if err := bindConfineScopeID(good, "gate", "session-a"); err != nil {
 		t.Fatalf("a scope id this process just minted for this request was refused: %v", err)
 	}
 	foreignPID := strings.Replace(good, "-"+strconv.Itoa(self)+"-", "-"+strconv.Itoa(self+1)+"-", 1)
@@ -36,20 +34,18 @@ func TestBindConfineScopeIDRefusesAForeignPIDNameOwnerOrDelegateClass(t *testing
 		scopeID string
 		reqName string
 		owner   string
-		dr      bool
 		want    string
 	}{
 		{name: "foreign pid", scopeID: foreignPID, reqName: "gate", owner: "session-a", want: "supervisor pid"},
 		{name: "foreign name", scopeID: good, reqName: "other", owner: "session-a", want: "name"},
 		{name: "foreign owner", scopeID: good, reqName: "gate", owner: "session-b", want: "owner"},
-		{name: "delegate class mismatch", scopeID: good, reqName: "gate", owner: "session-a", dr: true, want: "delegate"},
 		{name: "malformed", scopeID: "not-a-scope-id", reqName: "gate", owner: "session-a", want: "malformed"},
 		{name: "path separator", scopeID: "CONFINE-a/b-1-1", reqName: "gate", owner: "session-a", want: "malformed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := bindConfineScopeID(test.scopeID, test.reqName, test.owner, test.dr)
+			err := bindConfineScopeID(test.scopeID, test.reqName, test.owner)
 			if err == nil {
-				t.Fatalf("scope id %q was accepted for name=%q owner=%q delegate=%v", test.scopeID, test.reqName, test.owner, test.dr)
+				t.Fatalf("scope id %q was accepted for name=%q owner=%q", test.scopeID, test.reqName, test.owner)
 			}
 			if !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error %q does not name the mismatched facet %q", err, test.want)
@@ -58,31 +54,51 @@ func TestBindConfineScopeIDRefusesAForeignPIDNameOwnerOrDelegateClass(t *testing
 	}
 }
 
-// A delegate-RAM id must bind for a delegate-RAM request, and an unknown owner
-// must bind against the ABSENCE of an owner suffix -- the encoding AIRA-52 chose
-// so "nobody claimed this" can never be confused with a claim.
+// An unknown owner must bind against the ABSENCE of an owner suffix -- the
+// encoding AIRA-52 chose so "nobody claimed this" can never be confused with a
+// claim.
 //
 // verifies: AIRA-22
-func TestBindConfineScopeIDAcceptsDelegateAndUnknownOwnerEncodings(t *testing.T) {
-	delegate := confineScopeID("suite", "session-a", true)
-	if !IsDelegateRAMScopeID(delegate) {
-		t.Fatalf("setup: %q is not a delegate id", delegate)
-	}
-	if err := bindConfineScopeID(delegate, "suite", "session-a", true); err != nil {
-		t.Fatalf("delegate id refused for a delegate request: %v", err)
-	}
-	if err := bindConfineScopeID(delegate, "suite", "session-a", false); err == nil {
-		t.Fatal("a delegate id was accepted for a non-delegate request")
-	}
-	unknown := confineScopeID("job", ConfineUnknownOwner, false)
+func TestBindConfineScopeIDAcceptsUnknownOwnerEncoding(t *testing.T) {
+	unknown := confineScopeID("job", ConfineUnknownOwner)
 	if strings.Contains(strings.TrimPrefix(unknown, "CONFINE-"), "@") {
 		t.Fatalf("setup: unknown owner must be encoded as an absent suffix, got %q", unknown)
 	}
-	if err := bindConfineScopeID(unknown, "job", ConfineUnknownOwner, false); err != nil {
+	if err := bindConfineScopeID(unknown, "job", ConfineUnknownOwner); err != nil {
 		t.Fatalf("unknown-owner id refused: %v", err)
 	}
-	if err := bindConfineScopeID(unknown, "job", "session-a", false); err == nil {
+	if err := bindConfineScopeID(unknown, "job", "session-a"); err == nil {
 		t.Fatal("an ownerless id was accepted for an owned request")
+	}
+}
+
+// TestValidateConfineNameReservesTheAitestWorkerPrefix pins the S2a Task 10 fix: an
+// aitest worker mints the confine NAME aitest-w<seq>, and IsAitestWorkerScopeName
+// classifies exactly that shape as a worker (filtered from the default --list/--kill
+// pid/name selector). A user launching `aira confine --name aitest-w7` would otherwise
+// mint a real job that is misclassified as a worker -> labelled "(worker)" and hidden
+// from the default selector, i.e. unkillable by name. The name-validator (the SINGLE
+// chokepoint every launch and the detached MintConfineScopeID funnel through) therefore
+// reserves the aitest-w<digits> shape, reusing IsAitestWorkerScopeName so reserver and
+// recogniser cannot drift.
+func TestValidateConfineNameReservesTheAitestWorkerPrefix(t *testing.T) {
+	for _, reserved := range []string{"aitest-w7", "aitest-w0", "aitest-w42"} {
+		if err := validateConfineName(reserved); err == nil || !strings.HasPrefix(err.Error(), "E_CONFINE_ARGUMENT_INVALID") {
+			t.Fatalf("--name %q must be refused (reserved aitest worker shape): err=%v", reserved, err)
+		}
+		// The reservation lives in the single identity chokepoint, so the request path
+		// (what confineWithDeps and the detached mint both call) refuses it too.
+		if _, _, err := normalizeConfineIdentity(ConfineRequest{Name: reserved}); err == nil {
+			t.Fatalf("normalizeConfineIdentity accepted the reserved name %q", reserved)
+		}
+	}
+	// A non-worker shape that merely shares the prefix stem stays accepted: the seq
+	// suffix must be a NON-EMPTY run of digits, so "aitest-wrapper" (letters), the bare
+	// "aitest-w" (no seq) and "aitest-w7x" (trailing non-digit) are ordinary names.
+	for _, name := range []string{"aitest-wrapper", "aitest-w", "aitest-w7x", "gate", "job"} {
+		if err := validateConfineName(name); err != nil {
+			t.Fatalf("ordinary name %q must be accepted: err=%v", name, err)
+		}
 	}
 }
 

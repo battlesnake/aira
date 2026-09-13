@@ -27,10 +27,11 @@ import (
 // consumer reads and which the *.py globs correctly no longer ship.
 var notEmbedded = map[string][]string{
 	"aitest": {
-		".gitignore",             // source hygiene for the checkout, not a runtime input
-		"README.md",              // documentation; read in the repo, not from the extraction
-		"testdata/",              // fixtures for aitest's own source-tree pytest tier
-		"restart_gate_testdata/", // fixtures for the S18 worker-path restart merge gate (run from disk, never embedded)
+		".gitignore",                // source hygiene for the checkout, not a runtime input
+		"README.md",                 // documentation; read in the repo, not from the extraction
+		"testdata/",                 // fixtures for aitest's own source-tree pytest tier
+		"restart_gate_testdata/",    // fixtures for the S18 worker-path restart merge gate (run from disk, never embedded)
+		"delegate_escape_testdata/", // fixtures for the S2a T09 Gate E delegate escape-exemption e2e (run from disk, never embedded)
 	},
 }
 

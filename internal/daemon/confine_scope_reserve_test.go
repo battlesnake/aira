@@ -49,15 +49,11 @@ func reserveScopeDir(t *testing.T, slice, scopeID string, capBytes, current int6
 	}
 }
 
-func reserveScopeID(t *testing.T, name string, pid int, delegate bool) string {
+func reserveScopeID(t *testing.T, name string, pid int) string {
 	t.Helper()
-	id := "CONFINE-"
-	if delegate {
-		id += "@dr-"
-	}
-	id += name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "@session-a"
-	if runner.IsDelegateRAMScopeID(id) != delegate {
-		t.Fatalf("test premise: scope id %q does not read as delegate=%v", id, delegate)
+	id := "CONFINE-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "@session-a"
+	if _, _, _, _, ok := runner.ParseConfineScopeID(id); !ok {
+		t.Fatalf("test premise: scope id %q is not canonical", id)
 	}
 	return id
 }
@@ -106,12 +102,12 @@ func TestConfineListPublishesTheLedgerChargeNotTheDelegateScopeCeiling(t *testin
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return current, int64(64) << 30, 0, true, ""
 	}
-	scopeID := reserveScopeID(t, "suite", 5101, true)
+	scopeID := reserveScopeID(t, "suite", 5101)
 	reserveScopeDir(t, slice, scopeID, ceiling, current)
 	queue := &sliceQueue{path: slice, server: server, outstanding: charge, outstandingJobs: 1}
 	queue.waiters = []*admitWaiter{{
 		seq: 1, reserve: charge, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
-		scopeID: scopeID, name: "suite", owner: "session-a", scopeCeiling: ceiling,
+		scopeID: scopeID, name: "suite", owner: "session-a",
 	}}
 	server.admitQueues[slice] = queue
 
@@ -141,7 +137,7 @@ func TestConfineListLeavesAnUnknownScopeReserveUnevaluated(t *testing.T) {
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 1 << 30, int64(64) << 30, 0, true, ""
 	}
-	scopeID := reserveScopeID(t, "orphan", 5102, true)
+	scopeID := reserveScopeID(t, "orphan", 5102)
 	reserveScopeDir(t, slice, scopeID, capBytes, 1<<30)
 	// A queue exists (so the snapshot is `present`) but knows nothing about this
 	// scope: the strictly harder case than no queue at all, because the daemon has
@@ -176,7 +172,7 @@ func TestConfineListPublishesNoReserveForAnUnaccountedWaiter(t *testing.T) {
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 1 << 30, int64(64) << 30, 0, true, ""
 	}
-	scopeID := reserveScopeID(t, "unaccounted", 5103, false)
+	scopeID := reserveScopeID(t, "unaccounted", 5103)
 	reserveScopeDir(t, slice, scopeID, 4<<30, 1<<30)
 	queue := &sliceQueue{path: slice, server: server}
 	queue.waiters = []*admitWaiter{{
@@ -214,8 +210,8 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 12 << 30, int64(64) << 30, 0, true, ""
 	}
-	delegateID := reserveScopeID(t, "suite", 5104, true)
-	plainID := reserveScopeID(t, "build", 5105, false)
+	delegateID := reserveScopeID(t, "suite", 5104)
+	plainID := reserveScopeID(t, "build", 5105)
 	reserveScopeDir(t, slice, delegateID, delegateCeiling, 9<<30)
 	reserveScopeDir(t, slice, plainID, plainCap, 2<<30)
 	queue := &sliceQueue{
@@ -224,7 +220,7 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 	}
 	queue.waiters = []*admitWaiter{
 		{seq: 1, reserve: delegateCharge, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
-			scopeID: delegateID, name: "suite", owner: "session-a", scopeCeiling: delegateCeiling},
+			scopeID: delegateID, name: "suite", owner: "session-a"},
 		// The plain (non-delegate) case: the declared reserve is 3 GiB, below the
 		// scope's 8 GiB memory.max cap, and 3 GiB is what the slice is holding for it.
 		{seq: 2, reserve: plainCharge,

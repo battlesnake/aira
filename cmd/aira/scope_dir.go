@@ -155,7 +155,7 @@ func verbAcceptsScopeDir(verb string) bool {
 		// AIRA-196. A detached confine job lives in a machine-wide record store
 		// and resolves no project, exactly like the rest of the family.
 		"confine-log", "confine-input",
-		"aitest-bootstrap", "worker-admit", "confine-report",
+		"worker-admit", "confine-report",
 		// AIRA-127. `top` watches the machine-wide slice and resolves no project.
 		"top",
 		// AIRA-185. A drain holds the machine-wide slice and resolves no project,

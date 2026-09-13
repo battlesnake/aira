@@ -665,8 +665,9 @@ def test_exit_child_saving_a_real_pytest_cov_active_instance_does_not_disturb_th
     env["PYTHONPATH"] = os.pathsep.join([pylib_dir, str(suite)])
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     # No daemon: the fallback (unconfined) worker path forks exactly the same
-    # way, which is all this test is about.
-    env["AIRA_AITEST_BOOTSTRAP_CMD"] = str(tmp_path / "missing-aira")
+    # way, which is all this test is about. An unset outer scope is the
+    # daemon-down trigger (S2a), so clear any inherited coordinate.
+    env.pop("AIRA_AITEST_OUTER_SCOPE", None)
     env.pop("AIRA_REAL_CGROUP", None)
 
     completed = subprocess.run(

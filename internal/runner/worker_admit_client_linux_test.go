@@ -53,7 +53,11 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
 		// This external test package cannot access daemon's unexported 1 MiB
 		// protocol minimum. Five MiB is safely above it.
-		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: time.Second,
+		// S2a: parent_scope_id is a required, canonical confine id — the daemon copies
+		// the parent supervisor pid out of it to mint the worker scope name, and
+		// refuses an empty one.
+		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/slice/.aira-CONFINE-outer-111111-1",
+		ParentScopeID: "CONFINE-outer-111111-1", EstimatedBytes: 5 * (1 << 20), MaxWait: time.Second,
 	})
 	if !outcome.Granted() || outcome.Lease == nil {
 		t.Fatalf("RequestWorkerAdmit: outcome=%+v", outcome)
@@ -89,7 +93,8 @@ func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 	<-ready
 
 	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
-		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 2 * (1 << 20), MaxWait: 10 * time.Millisecond,
+		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer",
+		ParentScopeID: "CONFINE-outer-111111-1", EstimatedBytes: 2 * (1 << 20), MaxWait: 10 * time.Millisecond,
 	})
 	// AIRA-42: a denial is now a CLASSIFIED outcome rather than an
 	// unclassified error. A request over the whole ceiling is a permanent
@@ -131,6 +136,7 @@ func TestRequestWorkerAdmitProbeCarriesSnapshotHeadroom(t *testing.T) {
 
 	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
 		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer",
+		ParentScopeID:  "CONFINE-outer-111111-1",
 		EstimatedBytes: 5 * (1 << 20), MaxWait: 0, // 0 == non-blocking probe
 	})
 	if outcome.Granted() || outcome.Lease != nil {

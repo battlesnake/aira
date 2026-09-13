@@ -35,11 +35,11 @@ type ConfineRecord struct {
 	RSSBytes      *int64 `json:"rss_bytes"`
 	// SubtreePopulated is liveness read from cgroup.events `populated`, which is
 	// SUBTREE-aware, unlike Populated above (leaf cgroup.procs only). AIRA-101
-	// needs the distinction and it is not cosmetic: BootstrapAitestSupervisor
-	// drains EVERY pid out of an aitest outer scope into <outer>/.aira-supervisor,
-	// so a fully busy suite reads Populated == 0 while SubtreePopulated is true.
-	// Reading a running job as empty is how an exclusive benchmark would be handed
-	// a fabricated "you are alone".
+	// needs the distinction and it is not cosmetic: a job that creates child
+	// cgroups inside its own scope (podman --cgroups=split, or any nested-cgroup
+	// workload) puts its processes there, so a fully busy job reads Populated == 0
+	// while SubtreePopulated is true. Reading a running job as empty is how an
+	// exclusive benchmark would be handed a fabricated "you are alone".
 	//
 	// nil means the reading could not be established (the scope vanished mid-scan,
 	// or cgroup.events could not be opened) and must never be rendered as empty.
@@ -136,8 +136,15 @@ type ConfineRecord struct {
 	//
 	// Summed over one listing's rows it reconciles with that listing's own
 	// ScopeBytes.
-	ReserveBytes      *int64   `json:"reserve_bytes"`
-	Pending           bool     `json:"pending,omitempty"`
+	ReserveBytes *int64 `json:"reserve_bytes"`
+	Pending      bool   `json:"pending,omitempty"`
+	// Worker marks an aitest worker sub-scope (S2a §16.1): a first-class sibling
+	// confine scope whose NAME is aitest-w<seq> and whose pid slot is its PARENT
+	// supervisor's pid. It is a display/selector label — the default `--kill`/`--list`
+	// pid/name selector filters these rows out (a worker is reachable only by its
+	// explicit scope-id, or by killing its parent), so `--kill <supervisor-pid>`
+	// resolves to the parent job rather than matching every one of its siblings.
+	Worker            bool     `json:"worker,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
 }
 

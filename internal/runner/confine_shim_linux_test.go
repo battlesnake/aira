@@ -155,11 +155,13 @@ func TestShimConfineAcceptsDelegateRAM(t *testing.T) {
 // through to plain pytest-xdist, where per-worker RAM is invisible to everything
 // and nothing prevents over-subscription at all.
 //
-// The two negative assertions carry the honesty half. AIRA_AITEST_OUTER_SCOPE
-// must NOT be published -- there is no outer cgroup scope, and inventing one
-// would be the first place this mode pretended to have a cgroup -- and
-// AIRA_CONFINE_SCOPE_ID must not be either.
-func TestShimConfineDelegateRAMPublishesTheAitestCoordinatesButNoScope(t *testing.T) {
+// AIRA_AITEST_OUTER_SCOPE is published as the ci-shim SENTINEL (not a cgroup
+// path), paired with AIRA_AITEST_ADMISSION=ledger-only: S2a hands the supervisor
+// its coordinates in the environment (no aitest-bootstrap subprocess), and the
+// sentinel names this mode's lack of a cgroup rather than inventing one -- the
+// daemon refuses to treat it as a real path. AIRA_CONFINE_SCOPE_ID must still be
+// absent: there is no scope id in ci-shim mode.
+func TestShimConfineDelegateRAMPublishesTheCiShimCoordinates(t *testing.T) {
 	dir := t.TempDir()
 	dump := filepath.Join(dir, "child-env")
 	deps := shimUnitDeps()
@@ -195,13 +197,19 @@ func TestShimConfineDelegateRAMPublishesTheAitestCoordinatesButNoScope(t *testin
 	if lib == "/some/outer/extraction/dir" {
 		t.Fatalf("AIRA_AITEST_LIB=%q was INHERITED, not published: a stale extraction directory from an outer job is exactly the coordinate resurrection the strip exists to prevent", lib)
 	}
-	for _, key := range []string{"AIRA_AITEST_WORKER_ADMIT_CMD", "AIRA_AITEST_BOOTSTRAP_CMD"} {
+	for _, key := range []string{"AIRA_AITEST_WORKER_ADMIT_CMD", "AIRA_AITEST_ADMISSION"} {
 		if child[key] == "" {
 			t.Fatalf("child environment carries no %s; the coordinates are published as a set or not at all", key)
 		}
 	}
-	if scope, present := child["AIRA_AITEST_OUTER_SCOPE"]; present {
-		t.Fatalf("child environment carries AIRA_AITEST_OUTER_SCOPE=%q; there is no outer cgroup scope in ci-shim mode and publishing one -- inherited or invented -- is the first place this mode would pretend otherwise", scope)
+	// The outer "scope" is the ci-shim sentinel, published verbatim so the
+	// supervisor consumes it from the environment; it is not a cgroup path, and
+	// the daemon refuses to treat it as one.
+	if scope := child["AIRA_AITEST_OUTER_SCOPE"]; scope != ShimConfineSlice {
+		t.Fatalf("child environment carries AIRA_AITEST_OUTER_SCOPE=%q, want the ci-shim sentinel %q", scope, ShimConfineSlice)
+	}
+	if grade := child["AIRA_AITEST_ADMISSION"]; grade != AitestAdmissionLedgerOnly {
+		t.Fatalf("child environment carries AIRA_AITEST_ADMISSION=%q, want %q in ci-shim mode", grade, AitestAdmissionLedgerOnly)
 	}
 	if id := child["AIRA_CONFINE_SCOPE_ID"]; id != "" {
 		t.Fatalf("child environment carries AIRA_CONFINE_SCOPE_ID=%q; there is no scope in ci-shim mode", id)
@@ -225,7 +233,7 @@ func TestShimConfineWithoutDelegateRAMStillStripsEveryAitestCoordinate(t *testin
 		MemoryReserve: 512 << 20, MemoryReservePinned: true,
 		Env: append(os.Environ(),
 			"AIRA_AITEST_LIB=/some/outer/extraction/dir",
-			"AIRA_AITEST_BOOTSTRAP_CMD=/usr/bin/aira",
+			"AIRA_AITEST_ADMISSION=ledger-only",
 			"AIRA_AITEST_OUTER_SCOPE=/sys/fs/cgroup/aira.slice/.aira-CONFINE-x"),
 	}
 	if _, err := confineWithDeps(context.Background(), request, deps); err != nil {
@@ -340,7 +348,7 @@ func TestFormatConfineStatusDistinguishesAdvisoryFromEnforcedContainment(t *test
 // Shim --list renders from the daemon's granted-waiter registry alone, so an
 // operator surface exists at all in a mode with no cgroup directory to read.
 func TestShimConfineListRendersPendingRowsFromTheRegistry(t *testing.T) {
-	scopeID := confineScopeID("gate", "session-a", false)
+	scopeID := confineScopeID("gate", "session-a")
 	result := ShimConfineList([]ConfineRegistryEntry{{ScopeID: scopeID}})
 	if result.Verdict != "ok" {
 		t.Fatalf("verdict=%q reason=%q, want ok", result.Verdict, result.Reason)
@@ -363,7 +371,7 @@ func TestShimConfineListRendersPendingRowsFromTheRegistry(t *testing.T) {
 // the supervisor PID to signal instead, which is the only teardown mechanism
 // that exists here.
 func TestShimConfineKillRefusesAndNamesTheSupervisorPID(t *testing.T) {
-	scopeID := confineScopeID("gate", "session-a", false)
+	scopeID := confineScopeID("gate", "session-a")
 	_, _, _, _, ok := parseConfineScopeID(scopeID)
 	if !ok {
 		t.Fatalf("scope id %q does not parse", scopeID)

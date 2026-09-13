@@ -63,6 +63,19 @@ func SliceFittedReserve(ceiling int64) int64 {
 	return fitted
 }
 
+// AitestParentSignaturePrefix namespaces the resource signature of a
+// --delegate-ram PARENT scope (§16.1/P2-2). Since S2a the parent holds only the
+// supervisor and framework overhead — its workers are first-class sibling scopes
+// under the slice, each with its own reserve — so the parent's admission
+// estimate and recorded peak-RSS must key on a signature DISTINCT from the same
+// argv run WITHOUT --delegate-ram. Without this, the whole-subtree peak history
+// of a plain run (or a pre-S2a delegate run) would size the fresh, small parent
+// scope and refuse it, or over-book the slice. The trailing NUL keeps it in the
+// same alphabet as the NUL-joined argv it prefixes, and no real effective argv
+// can begin with this literal followed by a NUL, so the two namespaces never
+// collide.
+const AitestParentSignaturePrefix = "aitest-parent\x00"
+
 // ResourceSignature is the exact effective launch argv joined without lossy
 // shell rendering. It is kept beside the estimator so launch faces share one
 // signature implementation.

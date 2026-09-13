@@ -189,7 +189,7 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		if owner == "" {
 			owner = ConfineUnknownOwner
 		}
-		record := ConfineRecord{Name: name, Owner: owner, ScopeID: scopeID, SupervisorPID: &pid}
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: scopeID, SupervisorPID: &pid, Worker: IsAitestWorkerScopeName(name)}
 		// AIRA-135. The supervisor's own argv, read live from /proc exactly as
 		// memory.current and memory.max are read live from the cgroup below. It is
 		// deliberately read HERE, before the scope-directory open, because the two
@@ -240,8 +240,8 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		// AIRA-101. SUBTREE-aware liveness, from the same cgroup.events source
 		// killConfine already trusts for exactly this reason: Members() above reads
 		// LEAF cgroup.procs, so a job whose processes live in child cgroups it
-		// created — every aitest outer scope, which drains all its pids into
-		// .aira-supervisor and .aira-worker-N — reads leaf-empty while fully busy.
+		// created — a podman --cgroups=split container, or any nested-cgroup
+		// workload — reads leaf-empty while fully busy.
 		// Left nil (never false) when it cannot be established, so an unreadable
 		// scope is never mistaken for an empty one.
 		if events, eventsErr := scope.openFile("cgroup.events", unix.O_RDONLY); eventsErr == nil {
@@ -376,6 +376,75 @@ func ReapScopeIfEmpty(slicePath, scopeID string, afterEmptyProof func()) (bool, 
 	}
 	defer unix.Close(parentFD)
 	return reapEmptyConfineScopeTree(parentFD, ".aira-"+scopeID, afterEmptyProof)
+}
+
+// confineScopeGone reports the errno family that means "this worker scope is already
+// gone" — the supervisor's own _forget_worker_scope (which itself swallows
+// FileNotFoundError, supervisor.py) may have rmdir'd it, or the kernel removed a
+// killed-empty cgroup out from under a held fd (Pread → ENODEV). Every such error is
+// SUCCESS for the daemon's teardown, not a fault to escalate.
+func confineScopeGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENODEV)
+}
+
+// KillAndRemoveWorkerScope is the daemon's peer-EOF teardown for ONE aitest worker's
+// SIBLING scope (S2a §16b): cgroup.kill stops the worker process and any test
+// subprocess subtree-recursively, then the emptied directory is removed via the same
+// fd-anchored, kernel-enforced reaper the orphan sweep uses (ReapScopeIfEmpty).
+//
+// This exists because cgroup.kill is subtree-recursive only WITHIN one subtree: with
+// workers now siblings under the slice (not nested under the outer scope), a
+// supervisor kill / Ctrl-C / the parent's own oom.group reaches the relays but leaves
+// the worker PROCESSES running in their sibling scopes while relay-EOF has already
+// freed the ledger lease. So the daemon must kill the worker on that relay's peer-EOF.
+//
+// Fully ENOENT/ENODEV-tolerant: the supervisor's own _forget_worker_scope may have
+// removed the scope first (a benign race, both sides swallow it), so a scope already
+// gone is SUCCESS. A release is idempotent and a kill is NOT, so the caller fires this
+// only when the anchored ledger release actually discharged (§16.2 P1-B); this
+// function does not re-establish that gate.
+func KillAndRemoveWorkerScope(ctx context.Context, slicePath, scopeID string, timeout time.Duration) error {
+	if !validConfineScopeID(scopeID) {
+		return fmt.Errorf("invalid worker scope id %q", scopeID)
+	}
+	parentFD, err := unix.Open(slicePath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if confineScopeGone(err) {
+			return nil
+		}
+		return fmt.Errorf("open confine slice: %w", err)
+	}
+	childName := ".aira-" + scopeID
+	fd, err := unix.Openat(parentFD, childName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	_ = unix.Close(parentFD)
+	if err != nil {
+		if confineScopeGone(err) {
+			return nil // the supervisor's own rmdir won the race
+		}
+		return fmt.Errorf("open worker scope %s: %w", scopeID, err)
+	}
+	scope := &linuxScope{path: filepath.Join(slicePath, childName), fd: os.NewFile(uintptr(fd), childName)}
+	defer scope.fd.Close()
+	// Hold the cgroup.events fd ACROSS the kill so waitEmpty's removed-means-empty
+	// inference works on a concurrently-rmdir'd scope (Pread on the held fd → ENODEV →
+	// empty), the channel killConfine uses. Failing to open it (already gone) is fine:
+	// Empty() falls back to a per-poll open whose ENOENT waitEmpty surfaces, tolerated.
+	if events, eerr := scope.openFile("cgroup.events", unix.O_RDONLY); eerr == nil {
+		scope.events = events
+		defer scope.events.Close()
+	}
+	scope.removedMeansEmpty = true
+	if err := scope.Kill(); err != nil && !confineScopeGone(err) {
+		return fmt.Errorf("cgroup.kill worker scope %s: %w", scopeID, err)
+	}
+	// Wait for the kernel to reap the killed processes so the rmdir does not EBUSY.
+	if err := waitEmpty(ctx, scope, timeout); err != nil && !confineScopeGone(err) {
+		return fmt.Errorf("worker scope %s did not drain after kill: %w", scopeID, err)
+	}
+	if _, err := ReapScopeIfEmpty(slicePath, scopeID, nil); err != nil && !confineScopeGone(err) {
+		return fmt.Errorf("remove worker scope %s: %w", scopeID, err)
+	}
+	return nil
 }
 
 type confineReapTree struct {
@@ -545,11 +614,25 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	selector = strings.TrimSpace(selector)
 	var matches []ConfineRecord
 	for _, record := range listed.Scopes {
+		// An explicit scope-id always matches — the ONLY way to select a worker row
+		// (S2a Task 10 Step 1).
+		if selector == record.ScopeID {
+			matches = append(matches, record)
+			continue
+		}
+		// A worker scope embeds its PARENT supervisor's pid and a non-unique
+		// aitest-w<seq> name, so a job's sibling workers all match `<supervisor-pid>`
+		// and two suites both mint `aitest-w1`. Filtering worker rows out of the
+		// pid/name selector keeps `--kill <supervisor-pid>` resolving to the parent
+		// (unambiguous) while a worker stays reachable by its explicit scope-id above.
+		if IsAitestWorkerScopeName(record.Name) {
+			continue
+		}
 		pid := ""
 		if record.SupervisorPID != nil {
 			pid = strconv.Itoa(*record.SupervisorPID)
 		}
-		if selector == record.ScopeID || selector == record.Name || selector == pid {
+		if selector == record.Name || selector == pid {
 			matches = append(matches, record)
 		}
 	}

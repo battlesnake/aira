@@ -58,6 +58,7 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 
 	runWorkerAdmit := func(outerScope string, estimatedBytes int64, maxWait string) (string, string) {
 		command := exec.Command(binary, "worker-admit", "--job-id", "job-1", "--outer-scope", outerScope,
+			"--parent-scope-id", workerTestParentScopeID,
 			"--estimated-bytes", strconv.FormatInt(estimatedBytes, 10), "--max-wait", maxWait)
 		command.Stdin = strings.NewReader("")
 		var stdout, stderr bytes.Buffer

@@ -40,3 +40,9 @@ func ReapOrphanedConfineScopes(context.Context, string, time.Duration, func(int)
 func ReapScopeIfEmpty(string, string, func()) (bool, error) {
 	return false, errors.New("E_CONFINE_UNAVAILABLE: confine management requires Linux")
 }
+
+// KillAndRemoveWorkerScope's caller — internal/daemon's S2a §16b worker peer-EOF
+// teardown — is not Linux-gated, so this stub is load-bearing for a non-Linux build.
+func KillAndRemoveWorkerScope(context.Context, string, string, time.Duration) error {
+	return errors.New("E_CONFINE_UNAVAILABLE: confine management requires Linux")
+}

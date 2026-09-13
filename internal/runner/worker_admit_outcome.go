@@ -68,14 +68,13 @@ const (
 	//
 	// Like WorkerAdmitClassAdmissionUnusable below, it names the DISPOSITION,
 	// not a diagnosis. Most members really are static facts about the request
-	// (exceeds-ceiling, the CLI's own argument rejections), but AIRA-39 added
-	// two that are not: worker-scope-create-failed and
-	// worker-id-space-exhausted are daemon-side infrastructure facts about the
-	// outer scope. They land here because the alternatives are worse and were
-	// weighed in AIRA-39's own review — `contended` would retry a broken
-	// cgroupfs INDEFINITELY and stall every aitest run on the machine, and
-	// `admission-unusable` would strip containment for a run whose daemon is
-	// answering perfectly well. Terminal-and-loud is the honest middle.
+	// (exceeds-ceiling, the CLI's own argument rejections), but AIRA-39 added one
+	// that is not: worker-scope-create-failed is a daemon-side infrastructure fact
+	// (S2a's parent-scope-unparseable is another). They land here because the
+	// alternatives are worse and were weighed in AIRA-39's own review — `contended`
+	// would retry a broken cgroupfs INDEFINITELY and stall every aitest run on the
+	// machine, and `admission-unusable` would strip containment for a run whose
+	// daemon is answering perfectly well. Terminal-and-loud is the honest middle.
 	WorkerAdmitClassRequestInvalid = "request-invalid"
 	// WorkerAdmitClassAdmissionUnusable means daemon-backed admission is not
 	// usable for THIS RUN. Together with WorkerAdmitClassPlacementFailed
@@ -144,10 +143,15 @@ const (
 	WorkerAdmitReasonSupervisorScopeUnreadable = "supervisor-scope-unreadable"
 	WorkerAdmitReasonWorkerScopesUnreadable    = "worker-scopes-unreadable"
 	WorkerAdmitReasonAggregateCapExceeded      = "aggregate-cap-exceeded"
-	WorkerAdmitReasonWorkerIDSpaceExhausted    = "worker-id-space-exhausted"
-	WorkerAdmitReasonWorkerScopeIDCollision    = "worker-scope-id-collision"
-	WorkerAdmitReasonAdmitSlotsSaturated       = "admit-slots-saturated"
-	WorkerAdmitReasonSaturated                 = "saturated"
+	// WorkerAdmitReasonParentScopeUnparseable (S2a §16a) is the terminal refusal
+	// when a worker's parent scope id does not parse as a canonical confine id, so
+	// the daemon cannot copy out the PARENT supervisor pid the worker name's pid
+	// slot requires. (S2a deleted the per-outer-scope id reseed, so the old
+	// worker-id-space-exhausted / worker-scope-id-collision reasons are gone: the
+	// (seq, parentPid, stamp) id is unique by construction.)
+	WorkerAdmitReasonParentScopeUnparseable = "parent-scope-unparseable"
+	WorkerAdmitReasonAdmitSlotsSaturated    = "admit-slots-saturated"
+	WorkerAdmitReasonSaturated              = "saturated"
 	// AIRA-123. The ledger-only (ci-shim) admission path's own conditions.
 	//
 	// AIRA-121 answered every shim-mode worker-admit with
@@ -608,9 +612,10 @@ func ParseWorkerAdmitOutcomeLine(line string) (map[string]string, error) {
 	return fields, nil
 }
 
-// The aitest ADMISSION BACKEND grades, reported by the `aitest-bootstrap` verb
-// on its own stdout line and recorded by supervisor.py for the whole run
-// (AIRA-123).
+// The aitest ADMISSION BACKEND grades, published by the confine launcher in the
+// child environment as AIRA_AITEST_ADMISSION and read by supervisor.py for the
+// whole run (AIRA-123; S2a moved this from an aitest-bootstrap stdout line to a
+// launch-environment coordinate).
 //
 // This is a different channel from the per-grant containment token above and
 // answers a different question — "which backend is this run using at all",

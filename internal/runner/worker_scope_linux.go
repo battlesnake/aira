@@ -10,12 +10,21 @@ import (
 	"os"
 )
 
-// CreateWorkerScope creates one worker's cgroup as a child of outerScope
-// (already delegated by BootstrapAitestSupervisor), with a hard memory.max
-// cap, memory.swap.max=0, and memory.oom.group=1 so a runaway inside this one
-// worker self-contains (spec 3.3: per-worker hard cap, not a pool-level cap
-// only). It returns the scope path and the SWAP-CAP DISPOSITION, one of the
-// WorkerAdmitSwapCap* values, which the daemon puts on the grant line.
+// CreateWorkerScope creates one worker's cgroup as a child of parent, with a
+// hard memory.max cap, memory.swap.max=0, and memory.oom.group=1 so a runaway
+// inside this one worker self-contains (spec 3.3: per-worker hard cap, not a
+// pool-level cap only). It returns the scope path and the SWAP-CAP DISPOSITION,
+// one of the WorkerAdmitSwapCap* values, which the daemon puts on the grant line.
+//
+// S2a §4: parent is the SLICE (aira.slice), not the outer confine scope — each
+// worker scope is a SIBLING directly under the slice, created via the same
+// ordinary confine scope-creation path (the slice already carries +memory/+cpu
+// via ensureConfineDelegation, so a just-created child exposes memory.* and a
+// forking worker's place_self can migrate across the common ancestor). The old
+// nesting under the outer scope is gone, so there is no shared smaller-than-slice
+// cap for an aggregate oom.group to whole-suite-kill; each worker's own
+// memory.oom.group is the only kernel-side bound on its own footprint, and the
+// daemon's signed ledger bounds Σ(all leases) ≤ the slice ceiling.
 //
 // AIRA-35 removed this scope's memory.high, and it is worth saying why rather
 // than leaving a reader to wonder where the soft throttle went. Two measured
@@ -48,21 +57,32 @@ import (
 //     unkillable D-state AIRA-35 reports is a hazard of that same reclaim
 //     path.
 //
-// What memory.high was claimed to buy is provided elsewhere. The daemon now
-// checks only the SLICE CEILING (a request larger than it is refused up front,
-// worker_admit.go:473) and bounds Σ(leases) <= that ceiling via the signed
-// scope-id lease counter; it no longer scans and sums the outer scope's
-// children (S15 deleted that aggregate scan -- see worker_admit.go:463-466,
-// which leaves the outer scope's own memory.oom.group as the kernel-side bound
-// on Σ(worker caps) <= outer-cap). The outer-scope AGGREGATE bound -- refusing
-// an over-admitting spawn before oom.group has to fire -- is now the
-// CLIENT-SIDE aitest supervisor guard (AIRA-229, supervisor.py
-// _would_breach_outer_cap). And the proactive-recycle watermark is a USERSPACE
-// comparison in worker.py that needs a number, not a kernel throttle -- it now
-// reads memory.max.
-func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
-	backend := newDefaultBackend(outerScope)
-	scope, err := backend.Create(ctx, "worker-"+workerID)
+// What memory.high was claimed to buy is provided elsewhere. The daemon checks
+// only the SLICE CEILING (a request larger than it is refused up front) and
+// bounds Σ(leases) <= that ceiling via the signed scope-id lease counter; it does
+// not scan or sum any per-suite subtree. With workers as siblings under the slice
+// (S2a §4) there is no shared smaller-than-slice parent cap at all, so there is no
+// aggregate for an oom.group to whole-suite-kill (AIRA-229) and no client-side
+// aggregate guard either (the v7-1 guard was excised in the same S2a slice). And
+// the proactive-recycle watermark is a USERSPACE comparison in worker.py that
+// needs a number, not a kernel throttle -- it now reads memory.max.
+func CreateWorkerScope(ctx context.Context, parent, scopeName string, memoryMax int64) (string, string, error) {
+	// S2a P2-1: re-assert +memory (and +cpu) on the slice BEFORE creating the child.
+	// Idempotent — normally a no-op read on an already-delegated slice — but if the
+	// slice's cgroup.subtree_control lost +memory (a systemd reset, or a sibling
+	// reconfiguring the slice), a just-created child would expose NO memory.* files and
+	// the memory.max write below would ENOENT into a `request-invalid` TERMINAL that
+	// takes the WHOLE suite `unevaluated` (fail-closed, no self-heal). One idempotent
+	// call closes that window; a slice that genuinely cannot delegate memory (the
+	// controller absent from cgroup.controllers, or the parent unreadable) fails HERE,
+	// clearly and before any scope directory exists, rather than at a confusing
+	// downstream ENOENT. delegation.cpuWeight reports whether +cpu is delegated too.
+	delegation, err := ensureConfineDelegation(parent)
+	if err != nil {
+		return "", "", fmt.Errorf("aitest worker scope: delegate memory controller onto %s: %w", parent, err)
+	}
+	backend := newDefaultBackend(parent)
+	scope, err := backend.Create(ctx, scopeName)
 	if err != nil {
 		return "", "", fmt.Errorf("aitest worker scope: create: %w", err)
 	}
@@ -94,7 +114,7 @@ func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryM
 		return removeUnusableScope("memory cap", err)
 	}
 	// ORDER IS LOAD-BEARING: the swap cap is written only AFTER the memory cap
-	// has succeeded. Run it first and an outer scope with no +memory in its
+	// has succeeded. Run it first and a parent scope with no +memory in its
 	// subtree_control -- which exposes NO memory.* files at all -- would return
 	// ENOENT for memory.swap.max, and that ENOENT would be misread below as
 	// "this kernel has no swap support" rather than "this cgroup has no memory
@@ -105,5 +125,18 @@ func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryM
 	if err != nil {
 		return removeUnusableScope("swap cap", err)
 	}
-	return WorkerScopeChildPath(outerScope, "worker-"+workerID), swapCap, nil
+	// S2a P2-2: worker scopes are now SIBLINGS competing directly under the slice with
+	// every other confine job. The ordinary confine path ages cpu.weight 100→10 over
+	// 30 min (a fresh interactive job outweighs a long-running one); a worker has no
+	// long-lived supervisor here to run that decay and IS a sustained test executor, so
+	// write the aged FLOOR statically — N workers then weigh ~ one aged confine job
+	// rather than N, restoring the rough parity the single nested-outer weight used to
+	// give before workers became siblings. Best-effort / fail-open, exactly like the
+	// ordinary path: CPU aging is a contention mitigation, never a correctness gate, and
+	// some delegated parents expose no cpu controller (delegation.cpuWeight is false
+	// then and this is skipped). No goroutine, no decay: a single static write.
+	if delegation.cpuWeight {
+		_ = writeScopeCPUWeightFailOpen(scope, confineCPUWeightConfig().Floor)
+	}
+	return WorkerScopeChildPath(parent, scopeName), swapCap, nil
 }

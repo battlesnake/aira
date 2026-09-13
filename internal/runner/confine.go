@@ -23,20 +23,6 @@ const (
 	// §7). Accounting only — no cpu.max is written. Per-command CPU annotation
 	// (aitest workers) is a later slice; the confine path always sends this.
 	DefaultConfineCPUCores = int64(1)
-	// Under --delegate-ram the suite's OWN reserve must be a small PINNED
-	// framework overhead — never the unpinned whole-command estimate, which
-	// could inflate via history to reject the whole suite E_ADMIT_TOO_LARGE.
-	// Until AIRA-33 the reason was that the deleted pytest plugin took a
-	// separate per-test reservation the whole-command estimate would double-book
-	// in queue.outstanding. That caller is gone; the constant and its value are
-	// unchanged, and the reason is now aitest: a delegate job's containment is
-	// per-WORKER, in nested sub-scopes granted by worker-admit under this job's
-	// own outer ceiling, so charging the slice a whole-suite peak on top would
-	// reserve for growth the slice ledger never sees.
-	DefaultDelegateRAMOverhead = int64(512 << 20)
-	// DefaultDelegateRAMScopeCeiling is the compiled-in containment cap used
-	// whenever a daemon ceiling is unavailable. It is not an admission charge.
-	DefaultDelegateRAMScopeCeiling = int64(48 << 30)
 	// AdmitWaitCeiling is the single upper bound on a requested admission wait,
 	// shared by the CLI, this runner, and the daemon (AIRA-58). It is a TYPO
 	// GUARD, not a policy: real waits on a contended shared slice routinely run
@@ -101,35 +87,31 @@ const (
 // charges what the operator asked for — against this production code rather
 // than against a restatement of it.
 //
-// The two rules, unchanged in substance from the runner code this replaces:
+// The two rules, one for every confine job (S2a §4/§16 collapsed `--delegate-ram`
+// into an ordinary confine job, so there is no longer a delegate carve-out here):
 //
-//   - No reserve given: a delegate-ram job pins a small framework overhead,
-//     because its per-test children reserve individually and charging the
-//     whole-command estimate would double-book them. Anything else takes the
-//     unpinned no-history fallback, which the daemon is free to re-estimate.
-//   - A non-delegate `--memory-max` SETS the reserve to the cap. That is
-//     deliberate and documented (internal/core/skill.go:318): such a scope may
-//     genuinely grow to its cap and nothing else reserves on its behalf, so
-//     booking less would under-book the shared ledger. Note it sets rather than
-//     raises: it is an UP-charge in the case the docs describe (reserve below
-//     cap, "you cannot cap high and reserve low"), but a declared reserve LARGER
-//     than the cap is lowered to the cap — still exact, never under-booked,
-//     since the scope cannot exceed its own memory.max. A delegate-ram cap is a
-//     containment CEILING, not a reserve, so it must not do either.
+//   - No reserve given: take the unpinned no-history fallback, which the daemon
+//     is free to re-estimate from this signature's peak history.
+//   - A `--memory-max` SETS the reserve to the cap. That is deliberate and
+//     documented (internal/core/skill.go): such a scope may genuinely grow to its
+//     cap and nothing else reserves on its behalf, so booking less would under-book
+//     the shared ledger. Note it sets rather than raises: it is an UP-charge in the
+//     case the docs describe (reserve below cap, "you cannot cap high and reserve
+//     low"), but a declared reserve LARGER than the cap is lowered to the cap —
+//     still exact, never under-booked, since the scope cannot exceed its own
+//     memory.max. A `--delegate-ram` job is sized exactly this way now: its parent
+//     scope bounds the supervisor and whatever else runs directly in the job (the
+//     `make`, the shell, a heavy compile), while its pytest workers reserve
+//     individually as sibling scopes via worker-admit.
 //
 // verifies: AIRA-62
 func ResolveConfineReserve(request ConfineRequest) (reserve int64, pinned bool) {
 	reserve = request.MemoryReserve
 	pinned = request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
-		if request.DelegateRAM {
-			reserve = DefaultDelegateRAMOverhead
-			pinned = true
-		} else {
-			reserve = DefaultConfineMemoryReserve
-		}
+		reserve = DefaultConfineMemoryReserve
 	}
-	if !request.DelegateRAM && request.ScopeMemoryMax > 0 {
+	if request.ScopeMemoryMax > 0 {
 		reserve = request.ScopeMemoryMax
 		pinned = true
 	}
@@ -462,13 +444,6 @@ const (
 	// own reserve-basis field beside this one says which. What this value claims
 	// is only what it can establish — AIRA chose this number, not the caller.
 	ConfineCapSourceDaemonReserve = "auto:daemon-reserve"
-	// ConfineCapSourceDelegateRAM: a --delegate-ram job with no --memory-max of
-	// its own, capped at the daemon's learned scope ceiling or, when the daemon
-	// supplied none, at the compiled-in fallback. Also AIRA's number, not the
-	// caller's, but a whole-scope CEILING rather than the job's reserve — so an
-	// OOM here says the suite outgrew its ceiling, not that a reserve estimate
-	// was low.
-	ConfineCapSourceDelegateRAM = "auto:delegate-ram"
 	// ConfineCapSourceUnevaluated: a cap IS enforced but no branch recorded where
 	// it came from. Never rendered as either party's choice.
 	ConfineCapSourceUnevaluated = "unevaluated"
@@ -700,7 +675,7 @@ const ConfineUnknownOwner = "unknown"
 const ConfineInferredOwnerPrefix = "@"
 
 // maxConfineOwnerLen bounds the owner component so that the worst-case scope
-// DIRECTORY name — ".aira-CONFINE-@dr-<name(100)>-<pid(7)>-<stamp(13)>@<owner>"
+// DIRECTORY name — ".aira-CONFINE-<name(100)>-<pid(7)>-<stamp(13)>@<owner>"
 // — stays comfortably inside NAME_MAX (255). Names keep the wider 100-character
 // identity bound because parseConfineScopeID must still accept every name ever
 // minted; only the owner half is newly embedded, so only it is newly bounded.
@@ -1108,14 +1083,12 @@ func formatConfineCPUUsec(usec int64) string {
 	return (time.Duration(usec) * time.Microsecond).String()
 }
 
-// delegateRAMScopeIDMarker, the scope-id parser and its helpers live in this
-// PORTABLE file, not in confine_linux.go, because they are pure string
-// manipulation over a value that crosses the daemon boundary. Keeping them
-// Linux-only forced internal/daemon to carry a SECOND, regex-shaped definition
-// of the same grammar, and the two accepted different languages — an id the
-// daemon admitted could then be invisible to every scan (build-review, Sol).
-// One parser, one language.
-const delegateRAMScopeIDMarker = "@dr"
+// The scope-id parser and its helpers live in this PORTABLE file, not in
+// confine_linux.go, because they are pure string manipulation over a value that
+// crosses the daemon boundary. Keeping them Linux-only forced internal/daemon to
+// carry a SECOND, regex-shaped definition of the same grammar, and the two
+// accepted different languages — an id the daemon admitted could then be invisible
+// to every scan (build-review, Sol). One parser, one language.
 
 // ParseConfineScopeID is the exported form for internal/daemon, which must
 // validate an id a client supplied and bind its embedded name and owner to the
@@ -1140,13 +1113,9 @@ func parseConfineScopeID(scopeID string) (string, int, int64, string, bool) {
 		return "", 0, 0, "", false
 	}
 	rest := strings.TrimPrefix(scopeID, "CONFINE-")
-	if strings.HasPrefix(rest, delegateRAMScopeIDMarker+"-") {
-		rest = strings.TrimPrefix(rest, delegateRAMScopeIDMarker+"-")
-	}
-	// Split at the FIRST remaining '@', keeping the remainder verbatim: an
-	// inferred owner starts with its own '@' (ConfineInferredOwnerPrefix) and
-	// must survive intact. The "@dr" marker was already stripped above, so this
-	// delimiter is unambiguous — neither a name nor an owner may contain '@'.
+	// Split at the FIRST '@', keeping the remainder verbatim: an inferred owner
+	// starts with its own '@' (ConfineInferredOwnerPrefix) and must survive intact.
+	// This delimiter is unambiguous — neither a name nor an owner may contain '@'.
 	owner := ""
 	if at := strings.IndexByte(rest, '@'); at >= 0 {
 		owner = rest[at+1:]
@@ -1184,13 +1153,6 @@ func parseConfineScopeID(scopeID string) (string, int, int64, string, bool) {
 	return name, int(pid64), stamp, owner, true
 }
 
-// IsDelegateRAMScopeID reports the restart-surviving cap type carrier. The
-// marker uses '@', which cannot occur in a user-supplied confine name, so it is
-// unambiguous even though names themselves may contain '-'.
-func IsDelegateRAMScopeID(scopeID string) bool {
-	return strings.HasPrefix(scopeID, "CONFINE-"+delegateRAMScopeIDMarker+"-")
-}
-
 // validateConfineName lives in the PORTABLE file, alongside the scope-id parser
 // and for the same reason: it is pure string validation over a value that
 // crosses process and daemon boundaries, and normalizeConfineIdentity (also
@@ -1207,6 +1169,14 @@ func validateConfineName(name string) error {
 			continue
 		}
 		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name requires letters, digits, '.', '_', or '-'")
+	}
+	// Reserve the aitest-w<digits> shape: it is what MintWorkerScopeID mints and what
+	// IsAitestWorkerScopeName classifies as an aitest worker (filtered from the default
+	// --list/--kill pid/name selector). A user job minting that name would otherwise be
+	// misclassified as a worker and become hidden / unkillable-by-name. Reuse the
+	// recogniser so reserver and recogniser cannot drift (S2a Task 10).
+	if IsAitestWorkerScopeName(name) {
+		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name aitest-w<digits> is reserved for aitest worker scopes")
 	}
 	return nil
 }
@@ -1251,21 +1221,88 @@ func MintConfineScopeID(request ConfineRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return confineScopeID(name, owner, request.DelegateRAM), nil
+	return confineScopeID(name, owner), nil
+}
+
+// confineScopeIDWithPID is the ONE place the confine scope-id grammar is minted
+// (portable, next to its parser, for the same "one language" reason
+// parseConfineScopeID lives here). confineScopeID passes os.Getpid(); callers
+// that mint an id NAMING ANOTHER PROCESS — the daemon minting a worker scope on
+// behalf of its parent supervisor — pass that process's pid explicitly. The
+// embedded pid is load-bearing: the orphan reaper's liveness predicate and the
+// S2a escape exemption both read it, so a mis-stamped pid is a correctness bug,
+// not a cosmetic one.
+func confineScopeIDWithPID(name, owner string, pid int) string {
+	if name == "" {
+		name = "job"
+	}
+	id := "CONFINE-"
+	id += name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	// An unknown owner is encoded as the ABSENCE of a suffix, never as
+	// "@unknown": a reader must not be able to confuse "nobody claimed this" with
+	// a claim, and an id minted before this change parses identically.
+	if owner != "" && owner != ConfineUnknownOwner && ValidateConfineOwner(owner) == nil {
+		id += "@" + owner
+	}
+	return id
+}
+
+// MintWorkerScopeID mints the first-class confine scope id for one aitest worker
+// (S2a §16a). Unlike a job scope, its pid slot is the PARENT SUPERVISOR's pid —
+// the pid the daemon copies out of the worker's parent_scope_id — not the
+// daemon's own, because the S2a escape exemption is a purely local
+// parseConfineScopeID(basename).pid == os.Getpid() check on the monitor process
+// (§16.1/§16.2). The name is aitest-w<seq>; seq (a daemon-monotonic counter)
+// makes (name, parentPid, stamp) unique by construction, so there is no
+// cross-scope counter, no reseed, and no EEXIST path. The owner is copied out of
+// the same parent_scope_id as the pid, so a worker is owned by the same principal
+// as its parent and `confine --kill <worker-scope-id>` resolves without --steal
+// (an unattested / empty parent owner encodes as no suffix, unchanged). The result
+// is parseable by parseConfineScopeID, so the worker is reaped / listed / killable
+// like any confine scope.
+func MintWorkerScopeID(seq, parentPid int, owner string) string {
+	return confineScopeIDWithPID("aitest-w"+strconv.Itoa(seq), owner, parentPid)
+}
+
+// aitestWorkerNamePrefix is the confine NAME prefix every aitest worker scope
+// carries (MintWorkerScopeID mints "aitest-w"+seq). Minted here beside the
+// minter so the recogniser and the minter cannot drift.
+const aitestWorkerNamePrefix = "aitest-w"
+
+// IsAitestWorkerScopeName reports whether a confine scope NAME (the first field
+// parseConfineScopeID returns, e.g. "aitest-w3") is an aitest worker scope. S2a
+// §16.1: with workers as first-class sibling scopes, every one embeds its PARENT
+// supervisor's pid, so `confine --kill <supervisor-pid>` would otherwise match the
+// parent AND every worker (E_SELECTOR_AMBIGUOUS); the default `--list`/`--kill`
+// pid/name selector filters worker rows out (a worker is reachable only by its
+// explicit scope-id, or by killing its parent). The suffix must be a NON-EMPTY run
+// of digits (the seq), so a user's ordinary confine job named e.g. "aitest-wrapper"
+// is NOT mistaken for a worker.
+func IsAitestWorkerScopeName(name string) bool {
+	suffix, ok := strings.CutPrefix(name, aitestWorkerNamePrefix)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // bindConfineScopeID refuses a pre-minted scope id that does not describe THIS
 // process running THIS request. Syntax is not enough and never was: the grammar
-// accepts any canonical pid, any valid owner, and either delegate class, so a
-// merely-parseable id can name a scope after a foreign supervisor. Each facet is
-// checked and named separately so a refusal says which one was wrong.
+// accepts any canonical pid and any valid owner, so a merely-parseable id can name
+// a scope after a foreign supervisor. Each facet is checked and named separately so
+// a refusal says which one was wrong.
 //
 // Fail closed, never re-mint: silently minting a different id would put the job
 // in a scope directory the durable record does not name, which is precisely the
 // "the record and reality disagree" failure AIRA-22 exists to end.
 //
 // covers: AIRA-22
-func bindConfineScopeID(scopeID, name, owner string, delegateRAM bool) error {
+func bindConfineScopeID(scopeID, name, owner string) error {
 	embeddedName, pid, _, embeddedOwner, ok := parseConfineScopeID(scopeID)
 	if !ok {
 		return fmt.Errorf("scope id %q is malformed", scopeID)
@@ -1284,10 +1321,6 @@ func bindConfineScopeID(scopeID, name, owner string, delegateRAM bool) error {
 	}
 	if embeddedOwner != wantOwner {
 		return fmt.Errorf("scope id %q carries owner %q, not %q", scopeID, embeddedOwner, wantOwner)
-	}
-	if IsDelegateRAMScopeID(scopeID) != delegateRAM {
-		return fmt.Errorf("scope id %q is in the wrong delegate-ram class (id says %v, request says %v)",
-			scopeID, IsDelegateRAMScopeID(scopeID), delegateRAM)
 	}
 	return nil
 }

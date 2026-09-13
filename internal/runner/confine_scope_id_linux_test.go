@@ -15,29 +15,26 @@ import (
 // verifies: AIRA-52, AIRA-23
 func TestConfineScopeIDRoundTripsEveryOwnerForm(t *testing.T) {
 	for _, tc := range []struct {
-		label       string
-		name        string
-		owner       string
-		delegateRAM bool
-		wantOwner   string
+		label     string
+		name      string
+		owner     string
+		wantOwner string
 	}{
-		{"attested", "suite", "session-a", false, "session-a"},
-		{"attested-delegate", "suite", "session-a", true, "session-a"},
-		{"inferred", "suite", InferConfineOwner("/home/x/worktree-b"), false, InferConfineOwner("/home/x/worktree-b")},
-		{"inferred-delegate", "suite", InferConfineOwner("/home/x/worktree-b"), true, InferConfineOwner("/home/x/worktree-b")},
+		{"attested", "suite", "session-a", "session-a"},
+		{"inferred", "suite", InferConfineOwner("/home/x/worktree-b"), InferConfineOwner("/home/x/worktree-b")},
 		// A name full of '-' is the shape that broke naive splitting before, and
 		// the owner tail must not disturb it.
-		{"dashed-name", "a-b-c-d", "session-a", false, "session-a"},
+		{"dashed-name", "a-b-c-d", "session-a", "session-a"},
 		// "unknown" and empty both mint NO tail: absence is the encoding for
 		// unowned, so a claim can never be confused with no claim.
-		{"unknown", "suite", ConfineUnknownOwner, false, ""},
-		{"empty", "suite", "", true, ""},
-		// A name that itself looks like the delegate marker must not be mistaken
-		// for one.
-		{"dr-lookalike-name", "dr-suite", "session-a", false, "session-a"},
+		{"unknown", "suite", ConfineUnknownOwner, ""},
+		{"empty", "suite", "", ""},
+		// A name that itself looks like the retired "@dr" marker must still parse
+		// as an ordinary name (the marker is gone since S2a).
+		{"dr-lookalike-name", "dr-suite", "session-a", "session-a"},
 	} {
 		t.Run(tc.label, func(t *testing.T) {
-			id := confineScopeID(tc.name, tc.owner, tc.delegateRAM)
+			id := confineScopeID(tc.name, tc.owner)
 			name, pid, stamp, owner, ok := parseConfineScopeID(id)
 			if !ok {
 				t.Fatalf("minted id %q does not parse", id)
@@ -48,10 +45,7 @@ func TestConfineScopeIDRoundTripsEveryOwnerForm(t *testing.T) {
 			if pid <= 0 || stamp <= 0 {
 				t.Fatalf("id=%q pid=%d stamp=%d", id, pid, stamp)
 			}
-			if IsDelegateRAMScopeID(id) != tc.delegateRAM {
-				t.Fatalf("id=%q delegate classification=%v want %v", id, IsDelegateRAMScopeID(id), tc.delegateRAM)
-			}
-			if tc.wantOwner == "" && strings.Contains(strings.TrimPrefix(id, "CONFINE-"+delegateRAMScopeIDMarker+"-"), "@") {
+			if tc.wantOwner == "" && strings.Contains(strings.TrimPrefix(id, "CONFINE-"), "@") {
 				t.Fatalf("unowned id %q carries an owner tail", id)
 			}
 		})
@@ -63,7 +57,7 @@ func TestConfineScopeIDRoundTripsEveryOwnerForm(t *testing.T) {
 // NAME_MAX) and rejected at parse (so a hand-written id cannot smuggle one in).
 func TestConfineScopeIDRefusesAnOversizedOwnerTail(t *testing.T) {
 	long := strings.Repeat("o", maxConfineOwnerLen+1)
-	id := confineScopeID("suite", long, false)
+	id := confineScopeID("suite", long)
 	if strings.Contains(id, "@") {
 		t.Fatalf("oversized owner was minted into %q", id)
 	}
@@ -72,7 +66,7 @@ func TestConfineScopeIDRefusesAnOversizedOwnerTail(t *testing.T) {
 	}
 	// The boundary itself is accepted, so the bound is not off by one.
 	exact := strings.Repeat("o", maxConfineOwnerLen)
-	if _, _, _, owner, ok := parseConfineScopeID(confineScopeID("suite", exact, false)); !ok || owner != exact {
+	if _, _, _, owner, ok := parseConfineScopeID(confineScopeID("suite", exact)); !ok || owner != exact {
 		t.Fatalf("owner of exactly %d bytes: owner=%q ok=%v", maxConfineOwnerLen, owner, ok)
 	}
 }

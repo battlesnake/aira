@@ -573,12 +573,21 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the daemon's history estimate with a client-pinned guess.
 	containerPlan := PlanContainerIntegration(request.Argv)
 	var containerReserveSkip string
-	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, request.DelegateRAM, maximum)
+	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, maximum)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
 			signature = computed
 		}
+	}
+	// §16.1/P2-2: a --delegate-ram parent scope is admitted and recorded against a
+	// namespaced signature so its small supervisor+framework footprint never
+	// collides with the whole-job history of the same argv run without
+	// --delegate-ram. Guarded on a non-empty signature: an unresolved argv has no
+	// per-command history to namespace, and bare-prefixing "" would instead pool
+	// every such run under one key.
+	if request.DelegateRAM && signature != "" {
+		signature = AitestParentSignaturePrefix + signature
 	}
 	request.ResourceSignature = signature
 	request.MemoryReserve = reserve
@@ -595,8 +604,8 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// that would run the job in a scope the durable record does not name.
 	scopeID := request.presetScopeID
 	if scopeID == "" {
-		scopeID = confineScopeID(request.Name, request.Owner, request.DelegateRAM)
-	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner, request.DelegateRAM); bindErr != nil {
+		scopeID = confineScopeID(request.Name, request.Owner)
+	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner); bindErr != nil {
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", bindErr)
 	}
 	request.ScopeID = scopeID
@@ -931,8 +940,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// decoding reserve-basis or by pattern-matching a byte count. Assigned here
 	// (rather than left to a switch after the fact) precisely because the branch
 	// order below encodes real precedence — --memory-max wins over a declared
-	// reserve, which wins over the daemon grant, and delegate-ram's ceiling only
-	// fills a gap none of those filled.
+	// reserve, which wins over the daemon grant. Since S2a collapsed `--delegate-ram`
+	// into an ordinary confine job (spec §4/§16) there is no longer a delegate ceiling
+	// branch below these.
 	capSource := ""
 	if scopeMemoryMax > 0 {
 		capSource = ConfineCapSourceMemoryMax
@@ -966,7 +976,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// default rather than anything the caller said. A declared reserve too small
 	// to be a real cap was refused up front, so there is no silently-uncapped
 	// case left for this branch to hide.
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve {
+	if scopeMemoryMax <= 0 && declaredReserve {
 		scopeMemoryMax = declaredReserveBytes
 		capSource = ConfineCapSourceMemoryReserve
 	}
@@ -976,27 +986,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// default is explicitly a guess (DefaultConfineMemoryReserve), and enforcing a
 	// guess as a hard cap would OOM-kill jobs that succeed today — which is why
 	// the unpinned fallback is deliberately left uncapped rather than
-	// conservatively capped. Delegate-ram never takes either branch: its pinned
-	// reserve is framework overhead, and it gets a finite cap below.
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.release != nil && admission.reserve > 0 {
+	// conservatively capped. S2a §4/§16: a `--delegate-ram` job is an ordinary
+	// confine job and takes exactly these branches — its parent scope is sized for
+	// the supervisor and whatever else runs directly in the job, while its pytest
+	// workers reserve individually as sibling scopes via worker-admit.
+	if scopeMemoryMax <= 0 && admitted && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 		capSource = ConfineCapSourceDaemonReserve
-	}
-	// Delegate-ram: an explicit --memory-max (scopeMemoryMax > 0) is the user's
-	// informed, still-finite-and-contained choice and WINS — it is never lowered by
-	// the learned ceiling, which would false-kill a suite the user deliberately sized
-	// larger (and which is exactly the interim --memory-max mitigation others rely on).
-	// The ceiling only supplies a finite cap when there is no explicit one; a compiled-in
-	// fallback backs it when the daemon provides none, so the scope is never uncapped.
-	if request.DelegateRAM && scopeMemoryMax <= 0 {
-		scopeMemoryMax = admission.scopeCeiling
-		if scopeMemoryMax <= 0 {
-			scopeMemoryMax = delegateRAMScopeFallback()
-		}
-		capSource = ConfineCapSourceDelegateRAM
-	}
-	if request.DelegateRAM && scopeMemoryMax <= 0 {
-		return result, confineUnavailable(sliceName, errors.New("delegate-ram scope has no finite memory.max"))
 	}
 	if scopeMemoryMax > 0 {
 		if err := deps.writeScopeMemoryCap(scope, scopeMemoryMax, request.ScopeMemoryHigh, false); err != nil {
@@ -1051,15 +1047,17 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the user's container at tens of megabytes, forever and unrecoverably. Only
 	// a number the caller chose may be imposed on their container.
 	declaredContainerCap := request.ScopeMemoryMax
-	// The !DelegateRAM guard mirrors the scope-cap assignment above, and for the
-	// same reason (build review, Fable): under --delegate-ram a declared
-	// --memory-reserve is the pinned FRAMEWORK OVERHEAD, not a cap -- the scope's
-	// own memory.max is the much larger delegate ceiling. Without this guard,
-	// `--delegate-ram --memory-reserve 512M -- podman run img pytest ...` (the
-	// SKILL's own recommended pytest idiom) would inject `--memory=536870912`
-	// into a container whose scope allows 16G, and OOM-kill it at 512M. Under
-	// delegate-ram only an explicit --memory-max is a declared cap.
-	if declaredContainerCap <= 0 && declaredReserve && !request.DelegateRAM {
+	// Mirrors the scope-cap assignment above: a declared --memory-reserve is the
+	// scope cap, and so it is also the container cap. S2a collapsed --delegate-ram
+	// into an ordinary confine job, so the old `!request.DelegateRAM` guard here
+	// was removed with its (now-false) rationale that "under --delegate-ram the
+	// scope's own memory.max is the much larger delegate ceiling": post-collapse
+	// the scope's memory.max IS the declared reserve (set above at the same
+	// `scopeMemoryMax <= 0 && declaredReserve` branch), so `--delegate-ram
+	// --memory-reserve 512M -- podman run img` now injects `--memory=536870912`
+	// exactly like its non-delegate twin, matching the scope it runs in rather
+	// than diverging from it.
+	if declaredContainerCap <= 0 && declaredReserve {
 		declaredContainerCap = declaredReserveBytes
 	}
 	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
@@ -1075,7 +1073,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			_, _ = fmt.Fprintln(diagnostics, advisory)
 		}
 	}
-	setupArgv, err := confineSetupArgv(containerInjection.Argv, request.DelegateRAM)
+	setupArgv, err := confineSetupArgv(containerInjection.Argv)
 	if err != nil {
 		return result, err
 	}
@@ -1088,7 +1086,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	cmd := exec.CommandContext(ctx, self, setupArgv...)
 	// The one resolved self binary the child's AIRA verbs are invoked through:
-	// worker-admit and aitest-bootstrap are both verbs on it.
+	// worker-admit (and confine-reserve) are verbs on it.
 	reserveCommand := ""
 	if request.DelegateRAM {
 		reserveCommand = self
@@ -1115,17 +1113,19 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// exactly one name and one home.
 	if _, backendOK := AitestBackendCanFunction(ConfineModeReal); request.DelegateRAM && backendOK {
 		// aitest is only meaningful for a delegate-RAM launch (worker-admit
-		// grants nested sub-scopes under THIS job's own outer scope); every
-		// other launch gets no aitest coordinates at all, mirroring
-		// the delegate-RAM gate on reserveCommand immediately above, which is
-		// the SAME resolved self binary — both worker-admit and
-		// aitest-bootstrap are verbs on that one aira binary.
-		// scope.Reference() is THIS job's real outer scope, handed down rather
-		// than rediscovered by the bootstrap verb from its own current cgroup
-		// (AIRA-44) — which is wrong for a second aitest-enabled pytest run in
-		// the same job, because the first run's bootstrap has by then relocated
-		// the whole tree into <outer>/.aira-supervisor.
-		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand, scope.Reference())
+		// grants first-class sibling worker scopes under THIS job's slice); every
+		// other launch gets no aitest coordinates at all, mirroring the
+		// delegate-RAM gate on reserveCommand immediately above (the SAME resolved
+		// self binary the worker-admit verb is invoked through).
+		// scope.Reference() is THIS job's real outer scope, handed down directly:
+		// the supervisor consumes it from its environment (S2a), rather than an
+		// `aitest-bootstrap` verb rediscovering it from the supervisor's own
+		// current cgroup. AitestAdmissionSubScope names the per-worker admission
+		// grade this real launch backs — enforced cgroup sub-scopes.
+		// parentCapFinite: a finite scope memory.max was written (997) above, so
+		// the daemon-down fallback pool must cap at one unconfined worker rather
+		// than group-OOM the parent-sized scope.
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand, scope.Reference(), AitestAdmissionSubScope, scopeMemoryMax > 0)
 	} else {
 		// Strip unconditionally, not just skip appending (Fable build-review,
 		// final gate): AppendAitestChildEnvironment was previously called
@@ -1688,10 +1688,6 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 			return estimate + room + ". The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL COMMAND " +
 				"and the next admission is sized higher on its own, or pin --memory-reserve " + FormatConfineBytes(suggested) +
 				" now to skip the cycle. If an identical re-run is killed at the same cap again, that is a genuine bug worth reporting."
-		case ConfineCapSourceDelegateRAM:
-			return head + "; cap-source=" + capSource + " — this is --delegate-ram's whole-scope ceiling, chosen by AIRA rather than " +
-				"by you, and it climbs with this signature's recorded peaks: RE-RUN THE IDENTICAL COMMAND before changing anything. " +
-				"Pass --memory-max to set the ceiling yourself."
 		default:
 			return head + "; cap-source=" + ConfineCapSourceUnevaluated + " — where this cap came from could not be established. " +
 				"If you set --memory-max/--memory-reserve yourself, raise it; if AIRA estimated it, re-running the identical " +
@@ -1933,45 +1929,23 @@ func confineEnvironment(env []string) []string {
 }
 
 // confineScopeID mints the scope directory name. The owner is appended after an
-// '@' delimiter (AIRA-52) for the same reason the delegate-RAM marker lives here
-// (see IsDelegateRAMScopeID): the cgroup directory name is the ONLY carrier that
-// survives a daemon restart. Owner used to live exclusively on the in-memory
+// '@' delimiter (AIRA-52) because the cgroup directory name is the ONLY carrier
+// that survives a daemon restart. Owner used to live exclusively on the in-memory
 // admitWaiter, and the daemon's restart-adoption scan rebuilds aggregate reserve
 // scalars from a live cgroup scan without recreating per-job waiters — so a job
 // whose lifetime spanned a restart lost its owner permanently and degraded to
 // "unknown", forcing an unnecessary --steal to kill your own job.
 //
 // '@' is unambiguous: neither a --name nor a caller-supplied owner may contain
-// it (validateConfineName / ValidateConfineIdentity), and the only other '@' in
-// the id is the fixed "@dr" marker immediately after the "CONFINE-" prefix,
-// which parseConfineScopeID strips before looking for this delimiter. An
-// INFERRED owner carries its own leading '@' (ConfineInferredOwnerPrefix) and
-// survives verbatim, because the split takes everything after the first
-// delimiter rather than splitting on every '@'.
-func confineScopeID(name, owner string, delegateRAM bool) string {
-	if name == "" {
-		name = "job"
-	}
-	id := "CONFINE-"
-	if delegateRAM {
-		id += delegateRAMScopeIDMarker + "-"
-	}
-	id += name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	// An unknown owner is encoded as the ABSENCE of a suffix, never as
-	// "@unknown": a reader must not be able to confuse "nobody claimed this" with
-	// a claim, and an id minted before this change parses identically.
-	if owner != "" && owner != ConfineUnknownOwner && ValidateConfineOwner(owner) == nil {
-		id += "@" + owner
-	}
-	return id
-}
-
-func delegateRAMScopeFallback() int64 {
-	value := strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT"))
-	if parsed, err := ParseMemorySize(value); err == nil && parsed > 0 {
-		return parsed
-	}
-	return DefaultDelegateRAMScopeCeiling
+// it (validateConfineName / ValidateConfineIdentity). An INFERRED owner carries
+// its own leading '@' (ConfineInferredOwnerPrefix) and survives verbatim, because
+// the split takes everything after the first delimiter rather than splitting on
+// every '@'.
+func confineScopeID(name, owner string) string {
+	// The grammar itself lives in the portable confineScopeIDWithPID, next to its
+	// parser. A job scope names THIS process; only the daemon minting a worker
+	// scope on behalf of another process (MintWorkerScopeID) passes a different pid.
+	return confineScopeIDWithPID(name, owner, os.Getpid())
 }
 
 func confineUnavailable(slice string, err error) error {
@@ -2261,14 +2235,10 @@ func verifyScopeMemoryValue(scope Scope, name string, want int64) error {
 	return nil
 }
 
-func confineSetupArgv(target []string, delegateRAM bool) ([]string, error) {
-	nonDelegate, delegate, err := confineOOMScoreAdjValues()
+func confineSetupArgv(target []string) ([]string, error) {
+	oomAdj, err := confineOOMScoreAdj()
 	if err != nil {
 		return nil, err
-	}
-	oomAdj := nonDelegate
-	if delegateRAM {
-		oomAdj = delegate
 	}
 	argv := []string{
 		"__confine-setup", "--handshake-fd", strconv.Itoa(confineSetupFD),
@@ -2436,9 +2406,8 @@ const (
 // is SUBTREE-aware. They are two independent sources and they legitimately
 // disagree, in one direction, for one very common shape: a job whose processes
 // live in child cgroups it created inside its own scope.
-// BootstrapAitestSupervisor drains EVERY pid of a --delegate-ram/aitest job into
-// <outer>/.aira-supervisor and .aira-worker-N; `podman --cgroups=split` does the
-// same. Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.
+// `podman --cgroups=split` does exactly this, as does any nested-cgroup
+// workload. Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.
 // SubtreePopulated's own doc comment says so. With a leaf-only gate the deadline
 // would fire, signal nothing, report `fired-unevaluated`, and then wait for the
 // job it was supposed to end.
@@ -2645,7 +2614,7 @@ func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 //     hierarchical counter on this scope while this scope's own processes are
 //     untouched; the local counters stay at zero for that. They rise when the
 //     OOM killer actually killed something OF OURS -- including when the leader
-//     has been drained into a `.aira-supervisor` sub-cgroup, which is why
+//     has relocated into a child cgroup it created (podman --cgroups=split), which is why
 //     LocalOOM is a disjunction over oom_kill and oom_group_kill rather than a
 //     single counter. Measured, not assumed --
 //     TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM pins every

@@ -370,7 +370,6 @@ func TestContainerReserveDecision(t *testing.T) {
 		argv        []string
 		resolved    int64
 		pinned      bool
-		delegateRAM bool
 		sliceCap    int64
 		wantReserve int64
 		wantPinned  bool
@@ -417,10 +416,6 @@ func TestContainerReserveDecision(t *testing.T) {
 			resolved: 2 << 30, pinned: true, wantReserve: 2 << 30, wantPinned: true, wantSkip: ContainerReserveSkipDeclared,
 		},
 		{
-			name: "delegate-ram is never raised", argv: []string{"docker", "run", "-m", "8g", "alpine"},
-			resolved: 512 << 20, pinned: true, delegateRAM: true, wantReserve: 512 << 20, wantPinned: true, wantSkip: ContainerReserveSkipDelegateRAM,
-		},
-		{
 			// Build review (Fable P1): charging a limit bigger than the whole
 			// slice makes the daemon terminally reject the admission, REFUSING a
 			// launch over a reserve the caller never declared -- the opposite of
@@ -443,7 +438,7 @@ func TestContainerReserveDecision(t *testing.T) {
 			if sliceCap == 0 {
 				sliceCap = 64 << 30
 			}
-			reserve, pinned, skip := plan.ResolveReserve(testCase.resolved, testCase.pinned, testCase.delegateRAM, sliceCap)
+			reserve, pinned, skip := plan.ResolveReserve(testCase.resolved, testCase.pinned, sliceCap)
 			if reserve != testCase.wantReserve {
 				t.Fatalf("reserve = %d, want %d", reserve, testCase.wantReserve)
 			}

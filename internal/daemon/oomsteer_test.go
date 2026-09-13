@@ -20,9 +20,13 @@ import (
 // would act on — is oomsteer_real_cgroup_linux_test.go, and nothing here
 // substitutes for it.
 
+// Two ordinary confine scopes. Since S2a collapsed --delegate-ram into an
+// ordinary confine job there is no longer a delegate scope class; the second name
+// is retained (as an ordinary id) because many tests below use it as a distinct
+// second scope, and one uses it as a parent for worker sub-reservations.
 const (
 	steerNonDelegateScope = "CONFINE-builder-4242-abcdef"
-	steerDelegateScope    = "CONFINE-@dr-suite-4243-abcdeg"
+	steerDelegateScope    = "CONFINE-suite-4243-abcdeg"
 )
 
 type steerWrite struct {
@@ -260,27 +264,24 @@ func TestOOMSteerRestoresWhenTheScopeReturnsWithinItsBudget(t *testing.T) {
 	h.budgets[steerDelegateScope] = 31 << 30
 	evaluateOOMSteer(oomSteerEnforce, &state, h.deps())
 	h.assertWrites(t, "back within budget",
-		steerWrite{dir: h.scopeDir(steerDelegateScope), adj: runner.ConfineDelegateOOMScoreAdj})
+		steerWrite{dir: h.scopeDir(steerDelegateScope), adj: runner.ConfineOOMScoreAdj})
 	if len(state.applied) != 0 {
 		t.Fatalf("state still records %v after the restore", state.applied)
 	}
 }
 
-// TestOOMSteerRestoresToTheSCOPESOWNClassBaseline: a delegate scope must come
-// back to 800, never to the non-delegate 500.
-//
-// Guard: restoring every scope to one hardcoded baseline is a plausible-looking
-// implementation that would silently PROMOTE every steered --delegate-ram suite
-// into the protected class for the rest of its life — a weakening of AIRA-27
-// dressed up as a restore. The delegate assertion is what kills it.
+// TestOOMSteerRestoresToTheScopesOwnClassBaseline: a steered scope must come back
+// to the confine-class baseline (500). Since S2a there is a single confine class,
+// so both scopes restore to the same baseline; the two rows keep the restore path
+// exercised across two distinct scope ids.
 func TestOOMSteerRestoresToTheScopesOwnClassBaseline(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		scopeID string
 		want    int
 	}{
-		{"non-delegate", steerNonDelegateScope, runner.ConfineOOMScoreAdj},
-		{"delegate", steerDelegateScope, runner.ConfineDelegateOOMScoreAdj},
+		{"first scope", steerNonDelegateScope, runner.ConfineOOMScoreAdj},
+		{"second scope", steerDelegateScope, runner.ConfineOOMScoreAdj},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newSteerHarness()
@@ -303,22 +304,22 @@ func TestOOMSteerRestoresToTheScopesOwnClassBaseline(t *testing.T) {
 // subsystem may sharpen that containment and must never weaken it.
 //
 // Guard: `want = deps.steeredAdj` with no floor is the obvious implementation
-// and passes every other test in this file, because 1000 is above both
-// baselines. It fails here.
+// and passes every other test in this file, because 1000 is above the class
+// baseline. It fails here.
 func TestOOMSteerNeverGoesBelowTheClassBaseline(t *testing.T) {
 	h := newSteerHarness()
 	h.atPercent(95)
 	h.budgets[steerDelegateScope] = 1 << 30
 	h.rss[h.scopeDir(steerDelegateScope)] = 30 << 30
 	deps := h.deps()
-	deps.steeredAdj = 600 // below the delegate class baseline of 800
+	deps.steeredAdj = 400 // below the confine class baseline of 500
 	state := newOOMSteerState("")
 
 	evaluateOOMSteer(oomSteerEnforce, &state, deps)
 
 	h.assertWrites(t, "a steer value under the class baseline")
 	if len(state.applied) != 0 {
-		t.Fatalf("state recorded %v; a delegate scope must never be lowered toward 600", state.applied)
+		t.Fatalf("state recorded %v; a confine scope must never be lowered toward 400", state.applied)
 	}
 }
 
@@ -326,18 +327,18 @@ func TestOOMSteerNeverGoesBelowTheClassBaseline(t *testing.T) {
 // double-book guard, and it is the finding AIRA-29's own build review made in
 // the opposite direction.
 //
-// A --delegate-ram suite's own waiter charges only the pinned framework
-// overhead; its per-test `aira confine-reserve` sub-reservations carry the real
-// bytes. The parent's memory.current is HIERARCHICAL and already includes every
-// byte they allocated. Comparing 30 GiB of hierarchical usage against a 512 MiB
-// overhead would mark the most compliant job on the machine as the offender —
-// on EVERY full slice, which is exactly when getting it wrong costs a kill.
+// A --delegate-ram suite's own waiter charges only its own (ordinary)
+// parent-scope reserve; its per-worker sub-reservations carry the real bytes.
+// The parent's memory.current is HIERARCHICAL and already includes every byte
+// they allocated. Comparing 30 GiB of hierarchical usage against that small
+// parent reserve would mark the most compliant job on the machine as the
+// offender — on EVERY full slice, which is exactly when getting it wrong costs a kill.
 //
-// The promise is SCOPED to `confine-reserve` children: the parent is spared only
+// The promise is SCOPED to sub-reservation children: the parent is spared only
 // because those children are separate waiters whose reserves are summed into its
 // budget (admitScopeBudgets). Under declared-only accounting an aitest outer
-// scope that books only the 512 MiB DefaultDelegateRAMOverhead and registers no
-// per-test children is NOT excluded — its live usage above that overhead reads
+// scope that books only its small parent reserve and registers no
+// sub-reservation children is NOT excluded — its live usage above that reserve reads
 // as an under-declaration, exactly as the signal now intends.
 func TestOOMSteerDoesNotSteerAnAitestParentWhoseChildrenHoldTheCharge(t *testing.T) {
 	server := NewServer(Paths{})
@@ -665,25 +666,26 @@ func TestOOMSteerConfigFromEnv(t *testing.T) {
 	}
 }
 
+// S2a: a single confine oom-class. ConfineClassOOMScoreAdj returns the one
+// baseline for ANY scope id, and the AIRA_CONFINE_OOM_SCORE_ADJ override the
+// launcher honours is honoured here too (so the daemon's restore-to-baseline can
+// never disagree with the value the launcher wrote at exec). There is no longer a
+// separate delegate env or a class-ordering invariant.
 func TestConfineClassOOMScoreAdjFollowsTheLauncherPolicy(t *testing.T) {
-	nonDelegate, err := runner.ConfineClassOOMScoreAdj(steerNonDelegateScope)
-	if err != nil || nonDelegate != runner.ConfineOOMScoreAdj {
-		t.Fatalf("non-delegate = (%d, %v), want %d", nonDelegate, err, runner.ConfineOOMScoreAdj)
-	}
-	delegate, err := runner.ConfineClassOOMScoreAdj(steerDelegateScope)
-	if err != nil || delegate != runner.ConfineDelegateOOMScoreAdj {
-		t.Fatalf("delegate = (%d, %v), want %d", delegate, err, runner.ConfineDelegateOOMScoreAdj)
+	for _, scopeID := range []string{steerNonDelegateScope, steerDelegateScope} {
+		got, err := runner.ConfineClassOOMScoreAdj(scopeID)
+		if err != nil || got != runner.ConfineOOMScoreAdj {
+			t.Fatalf("%s = (%d, %v), want the single baseline %d", scopeID, got, err, runner.ConfineOOMScoreAdj)
+		}
 	}
 	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", "600")
-	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", "900")
-	if got, err := runner.ConfineClassOOMScoreAdj(steerNonDelegateScope); err != nil || got != 600 {
-		t.Fatalf("overridden non-delegate = (%d, %v), want 600", got, err)
+	for _, scopeID := range []string{steerNonDelegateScope, steerDelegateScope} {
+		if got, err := runner.ConfineClassOOMScoreAdj(scopeID); err != nil || got != 600 {
+			t.Fatalf("overridden %s = (%d, %v), want 600", scopeID, got, err)
+		}
 	}
-	if got, err := runner.ConfineClassOOMScoreAdj(steerDelegateScope); err != nil || got != 900 {
-		t.Fatalf("overridden delegate = (%d, %v), want 900", got, err)
-	}
-	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", "550")
-	if _, err := runner.ConfineClassOOMScoreAdj(steerDelegateScope); err == nil {
-		t.Fatal("a delegate baseline below the non-delegate one was accepted; the class ordering is the containment")
+	t.Setenv("AIRA_CONFINE_OOM_SCORE_ADJ", "not-a-number")
+	if _, err := runner.ConfineClassOOMScoreAdj(steerNonDelegateScope); err == nil {
+		t.Fatal("an unparseable AIRA_CONFINE_OOM_SCORE_ADJ was accepted; a bad override must be an error, never a silent fallback")
 	}
 }

@@ -3,8 +3,11 @@ package runner
 import "testing"
 
 func TestWorkerScopeChildPathJoinsWithConfineChildConvention(t *testing.T) {
-	got := WorkerScopeChildPath("/sys/fs/cgroup/aira.slice/.aira-CONFINE-x", "supervisor")
-	want := "/sys/fs/cgroup/aira.slice/.aira-CONFINE-x/.aira-supervisor"
+	// Mirrors the live call site (worker_admit.go): parent = the resolved slice, id =
+	// the minted worker scope id, so the worker lands as a SIBLING under the slice with
+	// the ".aira-"+id child convention (post-T7 there is no .aira-supervisor sub-scope).
+	got := WorkerScopeChildPath("/sys/fs/cgroup/aira.slice", "CONFINE-aitest-w1-111111-1")
+	want := "/sys/fs/cgroup/aira.slice/.aira-CONFINE-aitest-w1-111111-1"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}

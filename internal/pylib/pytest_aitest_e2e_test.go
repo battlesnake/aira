@@ -56,7 +56,7 @@ func requireRealPytest(t *testing.T) string {
 // its child pytest process. testdata/test_oom.py's own skip guard reads this
 // exact variable directly from the child's environment to decide whether a
 // real cgroup cap is expected; a fallback run deliberately has none (its
-// AIRA_AITEST_BOOTSTRAP_CMD points at a missing binary), so an inherited
+// AIRA_AITEST_WORKER_ADMIT_CMD points at a missing binary), so an inherited
 // AIRA_REAL_CGROUP=1 defeats that guard and fires a real, uncapped 512MiB
 // allocation instead of skipping -- and made the mandatory verification tier
 // permanently unable to go green in one invocation of `go test
@@ -74,6 +74,29 @@ func environWithoutAiraRealCgroup() []string {
 		filtered = append(filtered, entry)
 	}
 	return filtered
+}
+
+// e2eConfineScopeID is the canonical confine scope id the real-daemon aitest e2e
+// harnesses publish as AIRA_CONFINE_SCOPE_ID, so the supervisor's worker-admit
+// carries a parseable parent_scope_id (S2a §16d — the daemon REFUSES an empty one,
+// else every real-daemon aitest e2e reds on refuse-empty). A FIXED id keeps the
+// harness hermetic rather than depending on whether this go test binary happens to
+// run under `aira confine` (which would otherwise supply one of its own).
+const e2eConfineScopeID = "CONFINE-e2e-outer-111111-1"
+
+// environForRealDaemonAitest returns os.Environ() with AIRA_CONFINE_SCOPE_ID
+// REPLACED by the canonical harness value — filtering, not appending a duplicate
+// key, for the reason environWithoutAiraRealCgroup documents.
+func environForRealDaemonAitest() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "AIRA_CONFINE_SCOPE_ID=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return append(filtered, "AIRA_CONFINE_SCOPE_ID="+e2eConfineScopeID)
 }
 
 func TestEnvironWithoutAiraRealCgroupFiltersItOut(t *testing.T) {
@@ -124,7 +147,13 @@ func TestRealPytestAitestEndToEndFallback(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
+		// Bootstrap succeeds (an outer scope + admission grade are published),
+		// but the worker-admit relay binary is missing, so the first admission
+		// attempt disables the daemon with one warning and the suite completes
+		// on the unconfined fallback pool (S2a daemon-down trigger).
+		"AIRA_AITEST_OUTER_SCOPE="+t.TempDir(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
+		"AIRA_AITEST_WORKER_ADMIT_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
 	)
 	output, err := command.CombinedOutput()
 	text := string(output)
@@ -207,7 +236,7 @@ func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
 	command := exec.Command(pytest, "-q", "--aitest-workers=2", "test_pass.py")
 	command.Dir = filepath.Join(aitestDir, "testdata")
 	// environWithoutAiraRealCgroup, not os.Environ() (Fable re-gate round
-	// 3): this is a FALLBACK run (missing bootstrap command, no per-worker
+	// 3): this is a FALLBACK run (missing worker-admit command, no per-worker
 	// containment) same as the sibling test above, so it must not forward
 	// this Go test binary's own ambient AIRA_REAL_CGROUP=1 either -- only
 	// safe today because test_pass.py's explicit file argument keeps
@@ -216,7 +245,11 @@ func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
 		"PYTHONPATH="+filepath.Dir(aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
+		// Bootstrap succeeds; the worker-admit relay binary is missing, so the
+		// suite falls back to the unconfined pool with one warning (S2a).
+		"AIRA_AITEST_OUTER_SCOPE="+t.TempDir(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
+		"AIRA_AITEST_WORKER_ADMIT_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
 	)
 	output, err := command.CombinedOutput()
 	text := string(output)
@@ -265,6 +298,17 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
+	}
+	// S2a §4/§16: worker scopes are now SIBLINGS created directly under the daemon's
+	// resolved slice, not nested under the outer scope. The daemon is pointed at THIS
+	// isolated parent as its slice (SetAdmitResolveSliceForTest below), so a finite
+	// memory.max on the parent is required for admission to read a ceiling — and it
+	// keeps the test worker scopes off the production aira.slice (cgrouptest forbids
+	// production-named scopes there). 16 GiB is well clear of the default 2 GiB slice
+	// headroom, so a real pool of a few workers always admits; each worker's own
+	// memory.max (not this cap) is what the OOM leg exercises.
+	if err := os.WriteFile(filepath.Join(parent, "memory.max"), []byte("17179869184"), 0o644); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot set slice-parent memory.max: %v", err)
 	}
 	// NO ancestor memory.swap.max here, and its ABSENCE is load-bearing
 	// (AIRA-35).
@@ -316,10 +360,15 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 		t.Fatal(err)
 	}
 	server := daemon.NewServer(paths)
-	// S15: worker leases charge the unified signed ledger against the real
-	// aira.slice ceiling (this e2e runs the real daemon against the real slice), so
-	// no worker-specific headroom override is needed — the real slice has ample room
-	// for the suite's real workers.
+	// S2a §16: point the daemon at the ISOLATED harness parent as its slice, rather
+	// than the production aira.slice. Post-S2a a worker scope is created as a sibling
+	// under whatever the daemon resolves; against the real aira.slice that would drop
+	// production-named `.aira-CONFINE-aitest-w*` scopes onto the live slice (forbidden
+	// by cgrouptest, and counted by production scans). The parent carries a finite
+	// memory.max (written above) so the ledger has a ceiling to charge against.
+	server.SetAdmitResolveSliceForTest(func(string) (string, bool, string) {
+		return parent, true, ""
+	})
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())
@@ -382,11 +431,16 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 	command.WaitDelay = 15 * time.Second
 
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
+	command.Env = append(environForRealDaemonAitest(),
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+harness.binary,
+		// S2a: the launcher hands the supervisor its outer scope and admission
+		// grade in the environment (no aitest-bootstrap subprocess). This is the
+		// real absolute cgroup path the supervisor is placed into above, exactly
+		// what the daemon resolves worker sub-reservations against.
+		"AIRA_AITEST_OUTER_SCOPE="+harness.outerFile.Name(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
 		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(32<<20),
 		"AIRA_REAL_CGROUP=1",
@@ -492,11 +546,16 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	// level in: "an outer scope already exists and is about to run its
 	// supervisor", not "aira confine itself parses argv and creates it".
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
+	command.Env = append(environForRealDaemonAitest(),
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+harness.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+harness.binary,
+		// S2a: the launcher hands the supervisor its outer scope and admission
+		// grade in the environment (no aitest-bootstrap subprocess). This is the
+		// real absolute cgroup path the supervisor is placed into above, exactly
+		// what the daemon resolves worker sub-reservations against.
+		"AIRA_AITEST_OUTER_SCOPE="+harness.outerFile.Name(),
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
 		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(32<<20),
 		"AIRA_REAL_CGROUP=1",
@@ -529,168 +588,5 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	if strings.Contains(text, "swap_cap=unavailable") {
 		t.Fatalf("the daemon could not bound worker swap for this run, so the containment "+
 			"this test asserts was not actually enforced:\n%s", text)
-	}
-}
-
-// readOuterMemoryEventCounter reads one counter (e.g. "oom_kill",
-// "oom_group_kill") from the outer scope's cgroup memory.events. Per the AIRA
-// honesty rule, an absent or unreadable file is NOT a zero: it FAILS the test
-// ("unevaluated, never a fake pass") rather than silently passing the "no kill"
-// assertion. memory.events is hierarchical, so a per-worker OOM would surface on
-// the outer counter too -- both AIRA-229 guard e2e tests below run workloads that
-// allocate NOTHING, so any non-zero here is a genuine outer-scope oom.group fire.
-func readOuterMemoryEventCounter(t *testing.T, outerDir, key string) int64 {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join(outerDir, "memory.events"))
-	if err != nil {
-		t.Fatalf("cannot read outer scope memory.events (%q counter is unevaluated, not zero): %v", key, err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[0] == key {
-			value, parseErr := strconv.ParseInt(fields[1], 10, 64)
-			if parseErr != nil {
-				t.Fatalf("outer scope memory.events %q is unparseable %q: %v", key, fields[1], parseErr)
-			}
-			return value
-		}
-	}
-	t.Fatalf("outer scope memory.events has no %q counter:\n%s", key, data)
-	return -1
-}
-
-// TestRealPytestAitestOuterCapGuardTerminal (AIRA-229, v7-1). On the REAL
-// cgroup+daemon path, a per-worker request LARGER than the outer scope's cap with
-// an EMPTY pool (Σ_live==0) must be refused CLIENT-SIDE as terminal -- the queue
-// goes unevaluated, no worker is forked, and the outer oom.group never fires --
-// rather than admitted (the daemon no longer scans the outer cap, S15) and left
-// to a whole-suite oom.group kill. The guard constants are PINNED so the verdict
-// is independent of the field-tunable defaults (and of v7-4's future numbers).
-//
-// Mutant check: drop the _would_breach_outer_cap call in spawn_worker and the
-// daemon grants a 384 MiB child scope, test_pass runs and prints "passed" -- the
-// "unevaluated"/"outer-cap-exceeded" assertions below red.
-func TestRealPytestAitestOuterCapGuardTerminal(t *testing.T) {
-	harness := newRealDaemonAndCgroupTestHarness(t) // outer memory.max = 256 MiB
-	outerDir := harness.outerFile.Name()
-
-	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(time.Minute))
-	defer cancelRun()
-	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers=2", "test_pass.py")
-	command.Dir = filepath.Join(harness.aitestDir, "testdata")
-	command.WaitDelay = 15 * time.Second
-	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
-		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
-		"PYTHONDONTWRITEBYTECODE=1",
-		"AIRA_AITEST_LIB="+harness.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+harness.binary,
-		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
-		// 384 MiB > the 256 MiB outer cap: Σ_live==0 + request alone breaches.
-		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(384<<20),
-		// Pin the allowance/margin small so the terminal verdict is the guard's,
-		// not an artefact of the defaults.
-		"AIRA_AITEST_OUTER_CAP_ALLOWANCE_BASE="+strconv.Itoa(32<<20),
-		"AIRA_AITEST_OUTER_CAP_ALLOWANCE_PER_RELAY=0",
-		"AIRA_AITEST_OUTER_CAP_MARGIN="+strconv.Itoa(32<<20),
-		"AIRA_REAL_CGROUP=1",
-	)
-	output, err := command.CombinedOutput()
-	text := string(output)
-
-	if !strings.Contains(text, "reason=outer-cap-exceeded") {
-		t.Fatalf("expected the client-side outer-cap terminal verdict; not found: %v\n%s", err, text)
-	}
-	// Both collected tests go unevaluated: no worker was ever forked.
-	if !strings.Contains(text, "test_pass.py::test_one unevaluated") ||
-		!strings.Contains(text, "test_pass.py::test_two unevaluated") {
-		t.Fatalf("expected both tests unevaluated (no worker forked); got: %v\n%s", err, text)
-	}
-	// Positive proof this did NOT silently fall back to unconfined execution.
-	if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
-		t.Fatalf("terminal-guard run unexpectedly fell back to unconfined execution:\n%s", text)
-	}
-	if kills := readOuterMemoryEventCounter(t, outerDir, "oom_group_kill"); kills != 0 {
-		t.Fatalf("outer scope oom_group_kill=%d, want 0 -- a whole-suite kill fired:\n%s", kills, text)
-	}
-	// Cheap, valuable: with no worker forked, the outer scope's peak RSS is the
-	// supervisor + probe relays alone -- a direct read of the `base` tunable. Log
-	// it so v7-4 (and a reviewer) can see whether the 64 MiB default is plausible.
-	if peak, readErr := os.ReadFile(filepath.Join(outerDir, "memory.peak")); readErr == nil {
-		t.Logf("AIRA-229 base-tunable datapoint: outer-scope memory.peak with no workers = %s bytes "+
-			"(supervisor + probe relays; default _OUTER_CAP_ALLOWANCE_BASE is %d)",
-			strings.TrimSpace(string(peak)), 64<<20)
-	}
-}
-
-// TestRealPytestAitestOuterCapGuardSkipTick (AIRA-229, v7-1). The load-bearing
-// branch-exit gate, made DETERMINISTIC (no OOM-timing race). The guard is pinned
-// to admit exactly K=2 concurrent workers under the 256 MiB outer cap (req 64 MiB,
-// base 64 MiB, margin 32 MiB, per_relay 0: the 2nd spawn's 64+64+64=192 <= 224
-// fits, the 3rd's 128+64+64=256 > 224 does not), but SIX workers are requested over
-// EIGHT slow (~1.5 s) tests. The 3rd spawn (Σ_live>0) is refused as a SKIP-TICK with
-// a warn-once notice, the pool is bounded at 2, all eight tests still run and pass,
-// and the outer oom.group NEVER fires -- proving an over-admitting spawn is refused
-// BEFORE it is forked rather than left to a whole-suite oom.group kill.
-//
-// The tests must be SLOW: the supervisor grows the pool at ~1 Hz, so instant tests
-// are drained by one worker before a second is admitted and the Σ_live>0 branch
-// never arises (measured). per_relay=0 makes the dropped-Σ mutant's condition the
-// constant `base+request <= cap-margin` (always admit), so the mutant over-admits
-// all six workers and emits NO notice -- the "notice exactly once" assertion reds.
-// (Also verified live: without the string->int coercion in _sum_live_worker_caps the
-// guard is inert here, Σ_live always 0, and no notice fires.)
-func TestRealPytestAitestOuterCapGuardSkipTick(t *testing.T) {
-	// KNOWN false-fail under box contention (RANT-44 class): the 2nd startup spawn
-	// needs the daemon to report available_cpu >= 1. On a CPU-saturated box the pool
-	// can stay at 1 worker, so the "pool bounded by the OUTER-SCOPE cap" skip-tick
-	// notice never fires and this gate reds. That is an environment starvation, NOT a
-	// guard defect -- re-run on a quieter box before treating a red here as a bug.
-	harness := newRealDaemonAndCgroupTestHarness(t) // outer memory.max = 256 MiB
-	outerDir := harness.outerFile.Name()
-
-	// Eight ~1.5 s tests across a 2-worker pool is ~6 s of real work; generous slack.
-	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Minute))
-	defer cancelRun()
-	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers=6", "test_slow_passing.py")
-	command.Dir = filepath.Join(harness.aitestDir, "testdata")
-	command.WaitDelay = 15 * time.Second
-	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(os.Environ(),
-		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
-		"PYTHONDONTWRITEBYTECODE=1",
-		"AIRA_AITEST_LIB="+harness.pythonDir,
-		"AIRA_AITEST_BOOTSTRAP_CMD="+harness.binary,
-		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
-		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(64<<20), // 64 MiB per worker
-		// Pin K=2: allow the 2nd (64+64+64=192 <= 224), refuse the 3rd
-		// (128+64+64=256 > 224). per_relay=0 makes the dropped-Σ mutant unambiguous.
-		"AIRA_AITEST_OUTER_CAP_ALLOWANCE_BASE="+strconv.Itoa(64<<20),
-		"AIRA_AITEST_OUTER_CAP_ALLOWANCE_PER_RELAY=0",
-		"AIRA_AITEST_OUTER_CAP_MARGIN="+strconv.Itoa(32<<20),
-		"AIRA_REAL_CGROUP=1",
-	)
-	output, err := command.CombinedOutput()
-	text := string(output)
-
-	// The pool was bounded by the OUTER cap (not the daemon ledger), said once.
-	if got := strings.Count(text, "pool bounded by the OUTER-SCOPE cap"); got != 1 {
-		t.Fatalf("expected the outer-cap skip-tick notice exactly once, got %d: %v\n%s", got, err, text)
-	}
-	// All eight tests still completed -- the guard bounded growth, it did not drain
-	// the queue (that is the terminal disposition, which must NOT fire here).
-	for _, name := range []string{"test_s0", "test_s1", "test_s2", "test_s3", "test_s4", "test_s5", "test_s6", "test_s7"} {
-		if !strings.Contains(text, "test_slow_passing.py::"+name+" passed") {
-			t.Fatalf("expected %s to pass under the bounded pool; missing: %v\n%s", name, err, text)
-		}
-	}
-	if strings.Contains(text, "reason=outer-cap-exceeded") {
-		t.Fatalf("a Σ_live>0 breach must be a skip-tick, never the terminal verdict:\n%s", text)
-	}
-	if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
-		t.Fatalf("bounded-pool run unexpectedly fell back to unconfined execution:\n%s", text)
-	}
-	if kills := readOuterMemoryEventCounter(t, outerDir, "oom_group_kill"); kills != 0 {
-		t.Fatalf("outer scope oom_group_kill=%d, want 0 -- over-admission let a whole-suite kill fire:\n%s", kills, text)
 	}
 }

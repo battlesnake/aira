@@ -34,10 +34,13 @@ type ConfinePeakReport struct {
 //   - reserve: is the ledger booking held on the shared slice. It bounds
 //     nothing; it is what slice-holding waste is measured in.
 //
-// They agree for an ordinary non-delegate launch — ResolveConfineReserve sets
-// the reserve TO --memory-max, and the cap is then the declared reserve or the
-// daemon grant — and diverge for --delegate-ram, whose reserve is deliberately
-// framework overhead while its cap is the learned scope ceiling.
+// They agree for an ordinary launch — ResolveConfineReserve sets the reserve TO
+// --memory-max, and the cap is then the declared reserve or the daemon grant.
+// Since S2a a --delegate-ram job is an ordinary confine job and takes exactly
+// these same branches (its per-worker sibling scopes reserve individually via
+// worker-admit); it no longer has the old delegate split of a small reserve
+// against a larger learned scope ceiling. Where cap and reserve still diverge is
+// described on ConfineBudgetTerm below.
 const (
 	ConfineBudgetFamilyCap     = "cap:"
 	ConfineBudgetFamilyReserve = "reserve:"

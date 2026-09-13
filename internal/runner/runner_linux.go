@@ -1632,7 +1632,39 @@ func witnessedEscape(scopePath string, observation *processCgroupObservation) bo
 	if identity.PID <= 0 || identity.StartTick == 0 || observation.StartTickBefore != identity.StartTick || observation.StartTickAfter != identity.StartTick {
 		return false
 	}
-	return !pathEqualOrUnder(scopePath, observation.Cgroup)
+	if pathEqualOrUnder(scopePath, observation.Cgroup) {
+		return false
+	}
+	// S2a §16c/§16.1/§16.2: an aitest worker forks inside the parent supervisor
+	// confine scope and then place_self's into its OWN first-class sibling worker
+	// scope directly under the slice — an expected migration, NOT an escape. This
+	// is the single chokepoint (it backs the live sampler, both teardown paths,
+	// and classifyLaunchScopeIntegrity), so the exemption lives here and nowhere
+	// else. It is a purely LOCAL positive check: the migrated process's cgroup
+	// basename parses to an aitest worker scope id whose embedded pid is THIS
+	// monitor's own pid — the pid S2a Task 1 minted into every worker name for
+	// this supervisor (== os.Getpid(), foreground and --detach alike). No lease
+	// table, no daemon round-trip, so it holds through teardown: on --kill/
+	// --timeout the relays die and the lease releases, but the pid in the worker
+	// name is still os.Getpid(), so the killed-run case is not false-flagged. It
+	// is deliberately narrow — a worker of a DIFFERENT supervisor embeds that
+	// supervisor's pid (!= os.Getpid()) and a genuine escape to any unrelated
+	// cgroup carries no aitest-w name, so both stay witnessed.
+	if isOwnAitestWorkerScopePath(observation.Cgroup) {
+		return false
+	}
+	return true
+}
+
+// isOwnAitestWorkerScopePath reports whether a process cgroup path is one of THIS
+// monitor's own aitest worker sibling scopes: its basename (minus the ".aira-"
+// scope-dir prefix) parses as a confine scope id with an aitest worker name and
+// an embedded pid equal to os.Getpid(). Both facets are load-bearing (§16.1): the
+// name alone would exempt an unrelated "aitest-w..." job, and the pid alone would
+// exempt a foreign supervisor's worker.
+func isOwnAitestWorkerScopePath(cgroupPath string) bool {
+	name, pid, _, _, ok := parseConfineScopeID(strings.TrimPrefix(filepath.Base(cgroupPath), ".aira-"))
+	return ok && IsAitestWorkerScopeName(name) && pid == os.Getpid()
 }
 
 func escapedObservation(scopePath string, observations ...*processCgroupObservation) *processCgroupObservation {
@@ -1771,11 +1803,9 @@ func monitorScopeMembership(scope Scope, leader PIDIdentity, initialMembers []in
 		if _, present := memberNow[leader.PID]; !present && processLive(leader) == processAlive {
 			// Absence from the scope's own cgroup.procs is not itself a
 			// migration: the leader may have relocated ITSELF into a
-			// descendant cgroup it created (aitest's supervisor moving into
-			// `outer/.aira-supervisor` before forking per-worker sub-scopes,
-			// a podman --cgroups=split nested container, or any other
-			// legitimate nesting) and remain genuinely within the scope
-			// subtree the whole time. Apply the same subtree-aware witness
+			// descendant cgroup it created (a podman --cgroups=split nested
+			// container, or any other legitimate nesting) and remain genuinely
+			// within the scope subtree the whole time. Apply the same subtree-aware witness
 			// the descendant loop below already uses instead of the leaf-only
 			// membership test.
 			observation := observeProcessCgroup(leader, scope.Reference())
@@ -2325,9 +2355,8 @@ func captureCode(err error) string {
 // Scope.Empty() reads cgroup.events `populated`, which is SUBTREE-aware. They
 // are two independent sources and they legitimately disagree, in one direction,
 // for one very common shape: a job whose processes live in child cgroups it
-// created inside its own scope. BootstrapAitestSupervisor drains EVERY pid of a
-// --delegate-ram/aitest job into <outer>/.aira-supervisor and .aira-worker-N;
-// `podman --cgroups=split` does the same; so does any nested-cgroup workload.
+// created inside its own scope. `podman --cgroups=split` does exactly this, as
+// does any nested-cgroup workload.
 // Such a job reads leaf-empty WHILE FULLY BUSY — ConfineRecord.SubtreePopulated's
 // own doc comment says so. Gating on the leaf read alone made --timeout and
 // --cpu-timeout INERT against exactly that job: the deadline fired,

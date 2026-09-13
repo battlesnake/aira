@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -19,16 +18,13 @@ import (
 // is. So the policy moved to this portable file, which the daemon can call on
 // any platform, and the launcher keeps calling the identical function.
 const (
-	// ConfineOOMScoreAdj is the non-delegate class baseline: the AIRA-27
+	// ConfineOOMScoreAdj is the single confine-class baseline: the AIRA-27
 	// "protected" class. It is still hugely more killable than anything
 	// unconfined (adj 0), which is the property that makes a confined job the
-	// preferred victim of a HOST OOM.
+	// preferred victim of a HOST OOM. S2a collapsed `--delegate-ram` into an
+	// ordinary confine job, so there is no longer a separate, more-killable
+	// delegate class — every confine scope carries this one baseline.
 	ConfineOOMScoreAdj = 500
-	// ConfineDelegateOOMScoreAdj is the --delegate-ram class baseline: the
-	// AIRA-27 "preferred victim" class, because a delegate scope's memory.max is
-	// a generous ceiling rather than its reserve, so it is the class most likely
-	// to be the one over-committing the slice.
-	ConfineDelegateOOMScoreAdj = 800
 	// ConfineMaxOOMScoreAdj is the kernel's ceiling for oom_score_adj and the
 	// value AIRA-113 steers a proven offender to.
 	ConfineMaxOOMScoreAdj = 1000
@@ -50,39 +46,22 @@ type OOMScoreSteerResult struct {
 	Skipped int
 }
 
-// ConfineClassOOMScoreAdj returns the AIRA-27 class baseline for a scope id.
+// ConfineClassOOMScoreAdj returns the AIRA-27 confine-class baseline.
 //
-// The class is read from the scope ID itself (the restart-surviving cap-type
-// carrier), so it needs no daemon memory and no cgroup read, and it honours the
-// same two environment overrides the launcher honours — including their
-// ordering invariant (delegate strictly above non-delegate). An unparseable
-// override is an ERROR rather than a silent fallback: a steering decision made
-// against a baseline the launcher did not use would be steering against the
-// wrong number.
+// Since S2a collapsed `--delegate-ram` into an ordinary confine job there is a
+// SINGLE confine class, so the scope id no longer selects between two baselines;
+// the parameter is retained because the daemon's oomsteer wires this in as a
+// `func(string) (int, error)` callback (classAdj). The one AIRA_CONFINE_OOM_SCORE_ADJ
+// override the launcher honours is honoured here too; an unparseable override is an
+// ERROR rather than a silent fallback, so a steering decision can never be made
+// against a baseline the launcher did not use.
 func ConfineClassOOMScoreAdj(scopeID string) (int, error) {
-	nonDelegate, delegate, err := confineOOMScoreAdjValues()
-	if err != nil {
-		return 0, err
-	}
-	if IsDelegateRAMScopeID(scopeID) {
-		return delegate, nil
-	}
-	return nonDelegate, nil
+	_ = scopeID
+	return confineOOMScoreAdj()
 }
 
-func confineOOMScoreAdjValues() (nonDelegate, delegate int, err error) {
-	nonDelegate, err = parseConfineOOMScoreAdjEnv("AIRA_CONFINE_OOM_SCORE_ADJ", ConfineOOMScoreAdj)
-	if err != nil {
-		return 0, 0, err
-	}
-	delegate, err = parseConfineOOMScoreAdjEnv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", ConfineDelegateOOMScoreAdj)
-	if err != nil {
-		return 0, 0, err
-	}
-	if delegate <= nonDelegate {
-		return 0, 0, errors.New("E_CONFINE_ARGUMENT_INVALID: AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE must be greater than AIRA_CONFINE_OOM_SCORE_ADJ")
-	}
-	return nonDelegate, delegate, nil
+func confineOOMScoreAdj() (int, error) {
+	return parseConfineOOMScoreAdjEnv("AIRA_CONFINE_OOM_SCORE_ADJ", ConfineOOMScoreAdj)
 }
 
 func parseConfineOOMScoreAdjEnv(name string, fallback int) (int, error) {
@@ -104,11 +83,11 @@ func parseConfineOOMScoreAdjEnv(name string, fallback int) (int, error) {
 // SUBTREE, not leaf, and that is the whole reason this function exists rather
 // than a Members() loop: Members() reads LEAF cgroup.procs, and cgroup-v2's
 // no-internal-process rule means a scope that created any child cgroup has NO
-// pids of its own. BootstrapAitestSupervisor drains every pid of an aitest
-// outer scope into <outer>/.aira-supervisor and .aira-worker-N, and a confine
-// job using podman --cgroups=split nests likewise, so a leaf-only walker would
-// steer exactly zero processes for the population most likely to be the
-// offender — the inert-subsystem failure this project has shipped once already.
+// pids of its own. A confine job using podman --cgroups=split (or any other
+// nested-cgroup workload) puts every process in child cgroups it created inside
+// its own scope, so a leaf-only walker would steer exactly zero processes for
+// the population most likely to be the offender — the inert-subsystem failure
+// this project has shipped once already.
 //
 // An out-of-range adj is refused rather than clamped: the caller decides
 // policy, and a clamp would let a policy bug write a value nobody chose. The

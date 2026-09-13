@@ -191,14 +191,16 @@ func TestContainerLedgerChargeAndScopeCap(t *testing.T) {
 			wantMemoryFrag: "caller=8589934592:reserved",
 		},
 		{
-			name: "delegate-ram is never raised",
+			// S2a §4/§16: a delegate job is ordinary, so its --memory-max declared cap
+			// is not raised by a container exactly as on any confine job (skip:declared).
+			name: "delegate --memory-max declared cap is not raised by a container",
 			request: ConfineRequest{
 				Argv: []string{"docker", "run", "-m", "8g", "alpine"}, DelegateRAM: true, ScopeMemoryMax: 16 << 30,
 			},
-			admission:      daemonGrant(DefaultDelegateRAMOverhead),
-			wantReserve:    DefaultDelegateRAMOverhead,
+			admission:      daemonGrant(16 << 30),
+			wantReserve:    16 << 30,
 			wantScopeMax:   16 << 30,
-			wantMemoryFrag: "caller=8589934592:reserve-skipped:delegate-ram",
+			wantMemoryFrag: "caller=8589934592:reserve-skipped:declared",
 		},
 		{
 			// The reviewers' phantom-limit argv: the `-m` belongs to qemu, not to
@@ -226,19 +228,23 @@ func TestContainerLedgerChargeAndScopeCap(t *testing.T) {
 			wantMemoryFrag: "injected=2147483648",
 		},
 		{
-			// Build review (Fable P1), the regression the P0-1 fix introduced:
-			// under --delegate-ram a declared --memory-reserve is the pinned
-			// FRAMEWORK OVERHEAD, not a cap, so injecting it would OOM-kill the
-			// container at 512M inside a scope that allows the delegate ceiling.
-			name: "delegate-ram never injects the framework overhead as a container cap",
+			// S2a §4/§16 + T07: a delegate job is an ordinary confine job, so a
+			// declared --memory-reserve is BOTH its scope cap (ConfineCapSourceMemory-
+			// Reserve) AND — exactly like the non-delegate twin above — the container
+			// cap injected into podman. The collapse falsified the stale
+			// `!request.DelegateRAM` container-cap guard, whose rationale ("the
+			// scope's own memory.max is the much larger delegate ceiling") is now
+			// wrong: the scope cap IS the declared reserve (see wantScopeMax). With
+			// the guard removed, the container is capped at that same reserve.
+			name: "delegate declared reserve is injected as the container cap, like any confine job",
 			request: ConfineRequest{
 				Argv: []string{"podman", "run", "alpine"}, DelegateRAM: true,
 				MemoryReserve: 512 << 20, MemoryReservePinned: true,
 			},
-			admission:      admissionResult{state: "immediate", reserve: 512 << 20, release: io.NopCloser(nil), scopeCeiling: 16 << 30},
+			admission:      admissionResult{state: "immediate", reserve: 512 << 20, release: io.NopCloser(nil)},
 			wantReserve:    512 << 20,
-			wantScopeMax:   16 << 30,
-			wantMemoryFrag: "none",
+			wantScopeMax:   512 << 20,
+			wantMemoryFrag: "injected=536870912",
 		},
 		{
 			// Build review (Fable P1): a limit larger than the whole slice must be

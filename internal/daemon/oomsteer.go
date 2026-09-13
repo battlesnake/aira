@@ -19,11 +19,16 @@ import (
 // (the AIRA-29 live charge was retired). So a scope that USES more than it
 // declared — an under-declaration, or a burst past its reserve — is invisible to
 // admission and can expand until aira.slice reaches its own cap and the kernel
-// picks a victim, biased only by AIRA-27's STATIC class steering. (A delegate
-// scope's memory.max is a containment ceiling well above its declared reserve,
-// so physical over-use inside that cap is possible; under declared-only
-// admission the per-scope memory.max and the MemAvailable watchdog are the
-// backstop, not an aggregate over-subscription bound.)
+// picks a victim, biased only by AIRA-27's STATIC class steering. (Physical
+// over-use, up to a scope's own memory.max and above the DECLARED reserve the
+// ledger holds, is possible for any scope whose cap exceeds its reserve or which
+// runs uncapped, so under declared-only admission the per-scope memory.max and the
+// MemAvailable watchdog are the backstop, not an aggregate over-subscription bound.
+// PRE-S2a a `--delegate-ram` scope was the textbook example: its memory.max was an
+// AIRA-15 containment ceiling many times its declared reserve. Post-S2a a delegate
+// parent is an ordinary confine job — no dedicated ceiling above its reserve; its
+// memory.max is at most that reserve (or uncapped, like any confine job) — so it is
+// no longer that textbook case; see the fold note below.)
 //
 // That static bias picks the wrong victim in exactly the case that matters.
 // oom_score_adj is worth adj/1000 of MACHINE total in badness, so on a 64 GiB
@@ -399,15 +404,33 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 //
 // TWO POPULATIONS, ONE BUDGET, and getting this wrong is the difference between
 // steering the offender and steering the most compliant job on the box. An
-// aitest `--delegate-ram` suite's own waiter charges only the small pinned
-// FRAMEWORK OVERHEAD, because its per-test `aira confine-reserve`
-// sub-reservations are separate scope-less waiters in this same queue that carry
-// the real charge (the double-book AIRA-29's build review found, from the other
-// direction). The parent's memory.current is HIERARCHICAL and already contains
-// every byte those children allocated, so comparing it against the parent's own
-// 512 MiB overhead would mark a perfectly compliant 30 GiB suite as an offender
-// on every full slice. Summing the children into the parent is what makes the
-// comparison apples-to-apples.
+// aitest `--delegate-ram` suite's own waiter charges only its OWN (ordinary)
+// parent-scope reserve — sized for the supervisor and framework, not the whole
+// suite — because its per-worker sub-reservations are separate waiters in this
+// same queue that carry the real charge (the double-book AIRA-29's build review
+// found, from the other direction). Under S2a those workers are first-class
+// SIBLING scopes directly under the slice, NOT nested under the parent, so the
+// parent's memory.current does NOT contain their bytes: it is the parent's own
+// RSS alone. The workers themselves are never keys in this map — the loop below
+// continues past every sub-reservation — and oomsteer's consumer iterates only
+// these keys, so a sibling worker scope is never steered here at all; only its
+// parent is (each worker is bounded by its own memory.oom.group instead). The
+// fold below (summing each sub-reservation's charge into its parent's budget) is
+// T3-inherited; post-collapse it makes the parent's budget an OVER-count relative
+// to that sibling-free memory.current, which can only ever make a parent look
+// LESS like an offender — an under-detection, never a false offender, so it is the
+// safe direction. T10-S2 landed WITHOUT reconciling the fold to the sibling
+// topology: it is left as an ACCEPTED RESIDUE, and it is inert by construction, not
+// merely safe-direction. A parent that appears here at all is a granted, accounted,
+// scope-backed waiter, so its scope memory.max is AT MOST its ledger charge (post-S2a
+// a delegate parent is an ordinary confine job — its memory.max is its --memory-max,
+// its declared reserve, or its granted reserve, with no delegate ceiling above the
+// reserve; and where a pinned reserve exceeds --memory-max the charge is the larger
+// of the two, so memory.max ≤ charge still holds). memory.current can never exceed
+// memory.max, so a parent's live usage never exceeds even its OWN unfolded charge,
+// let alone the larger folded budget —
+// the over-count can therefore never flip it to an offender on any path, so
+// reconciling the fold buys nothing. Stated here rather than hidden.
 //
 // A sub-reservation whose parent is not a scope-backed waiter here adds nothing:
 // without the parent's own charge there is no budget to add it to, and inventing

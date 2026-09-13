@@ -1,15 +1,11 @@
 package daemon
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"aira/internal/core"
@@ -21,31 +17,12 @@ import (
 // zero pages and instant-OOM the worker on placement.
 const workerAdmitEstimatedBytesMin int64 = 1 << 20 // 1 MiB
 
-// workerScopeChildPrefix is the directory-name prefix every aitest worker scope
-// carries under its outer scope (`.aira-worker-<N>`). Since S15 it is read for
-// ONE purpose only: re-seeding the worker-id counter from the tree after a daemon
-// restart. The RAM/CPU accounting moved to the unified signed ledger — a worker
-// lease charges queue.outstanding / queue.cpuOutstanding directly, exactly like an
-// `aira confine` lease — so the tree is no longer summed for a committed total.
-const workerScopeChildPrefix = ".aira-worker-"
-
 // workerAdmitBasis is the diagnostic label a worker lease carries in the ledger.
 // It participates in no admission decision (validRunnerAdmitGrant only requires a
 // non-empty basis were the lease ever framed as an AdmitResponse by a later
 // re-anchor); it exists so a `confine --list` walk can tell a worker lease apart
 // from an ordinary confine one.
 const workerAdmitBasis = "worker"
-
-// maxWorkerScopeSeq bounds worker-id allocation so a reconstructed counter near
-// the int limit can never wrap into a colliding low id. Reaching it is a terminal
-// create failure, not a silent wrap.
-const maxWorkerScopeSeq = 1 << 30
-
-// errWorkerIDSpaceExhausted is the sentinel allocateWorkerScopeID returns when the
-// per-outer-scope id counter reaches maxWorkerScopeSeq. Terminal, not retriable:
-// ids only grow (a restart re-seeds from the largest suffix on the tree), so no
-// amount of waiting produces a free id.
-var errWorkerIDSpaceExhausted = errors.New("worker id space exhausted")
 
 // WorkerAdmitResponse is the one grant/denial/snapshot payload the worker-admit
 // connection sends before optionally holding itself open as the lease.
@@ -105,6 +82,18 @@ type workerAdmitRequest struct {
 	// decision in this slice.
 	signature      string
 	estimatedBytes int64
+	// parentScopeID is the suite confine scope id this worker is a sub-reservation
+	// OF (design §16d). It is an EXPLICIT required wire field — the supervisor's own
+	// AIRA_CONFINE_SCOPE_ID, NOT derived from the outer-scope PATH. A worker DOES
+	// count as a job in outstandingJobs (rederiveLedgerLocked does jobs++ for every
+	// granted accounted waiter); what a non-empty parentScopeID marks is the
+	// SUB-RESERVATION — isSubReservation gates the exclusivity-gate exemption
+	// (admit.go) and the oomsteer child aggregation (oomsteer.go), NOT the job count.
+	// An empty one is refused so isSubReservation cannot silently drop (which would
+	// break both), and a non-empty one must be parseConfineScopeID-parseable (the
+	// ci-shim sentinel exempt) so the daemon can copy the PARENT supervisor pid out of
+	// it for the worker scope name (Task 1).
+	parentScopeID string
 	// nonBlocking is true when max_wait_ms is PRESENT on the wire AND equals 0 (the
 	// aitest pool-sizing probe, design §6/§8): report current available and reserve
 	// nothing. max_wait_ms ABSENT, or PRESENT and positive, is a BLOCKING claim —
@@ -112,123 +101,6 @@ type workerAdmitRequest struct {
 	// or the client closing its connection (design §4/§6). A positive value no
 	// longer imposes a timeout (mirrors the S13 confine admit path).
 	nonBlocking bool
-}
-
-// workerScopeState is the per-OUTER-SCOPE worker-id allocator. Since S15 it holds
-// ONLY the id counter: the ledger accounting it used to carry (the committed sum,
-// the supervisor-RSS guard) is gone, folded into the one unified signed ledger.
-//
-// seeded records whether nextSeq has been reconstructed from the tree yet. The
-// re-seed happens once per outer scope per daemon lifetime (and again after a
-// create collision), NOT per allocation — a per-allocation readdir is the
-// AIRA-61 O(tree)-per-call CPU regression this deliberately avoids.
-//
-// Not pruned, an accepted slow-growth gap: one small entry per outer scope ever
-// seen.
-type workerScopeState struct {
-	mu      sync.Mutex
-	nextSeq int
-	seeded  bool
-}
-
-// workerScopeFor returns the id-allocator cell for outerScope, creating it
-// atomically under workerScopesMu so two concurrent first callers can never end up
-// with two cells.
-func (s *Server) workerScopeFor(outerScope string) *workerScopeState {
-	s.workerScopesMu.Lock()
-	defer s.workerScopesMu.Unlock()
-	if s.workerScopes == nil {
-		s.workerScopes = make(map[string]*workerScopeState)
-	}
-	state := s.workerScopes[outerScope]
-	if state == nil {
-		state = &workerScopeState{}
-		s.workerScopes[outerScope] = state
-	}
-	return state
-}
-
-// scanWorkerMaxIndex returns the largest numeric N among outerScope's existing
-// `.aira-worker-<N>` children, 0 if none. It is the SLIM readdir the worker-id
-// allocator re-seeds from after a daemon restart (design §4): the new daemon holds
-// no counter in RAM, so a fresh id must not collide with a survivor whose scope is
-// still on the tree. It reads no memory.max — S15 moved worker RAM/CPU accounting
-// to the unified signed ledger, so id re-seeding is the only thing the tree is
-// read for now.
-func scanWorkerMaxIndex(outerScope string) (int, error) {
-	entries, err := os.ReadDir(outerScope)
-	if err != nil {
-		return 0, fmt.Errorf("read worker scopes: %w", err)
-	}
-	maxIndex := 0
-	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), workerScopeChildPrefix) {
-			continue
-		}
-		if index, err := strconv.Atoi(strings.TrimPrefix(entry.Name(), workerScopeChildPrefix)); err == nil && index > maxIndex {
-			maxIndex = index
-		}
-	}
-	return maxIndex, nil
-}
-
-// allocateWorkerScopeID reserves the next worker id under outerScope and returns
-// (workerID, scopePath). Re-seeds the per-outer-scope counter from the tree the
-// FIRST time the scope is used (and after a create collision) so a restart never
-// re-allocates a survivor's id. Returns errWorkerIDSpaceExhausted at the id-space
-// limit; propagates the tree-read error (which the caller turns into a retriable
-// "worker scopes unreadable"), never a fabricated success.
-func (s *Server) allocateWorkerScopeID(outerScope string) (string, string, error) {
-	state := s.workerScopeFor(outerScope)
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if !state.seeded {
-		scan := s.workerScopeMaxIndex
-		if scan == nil {
-			scan = scanWorkerMaxIndex
-		}
-		maxIndex, err := scan(outerScope)
-		if err != nil {
-			return "", "", err
-		}
-		state.nextSeq = maxIndex
-		state.seeded = true
-	}
-	seq := state.nextSeq + 1
-	if seq >= maxWorkerScopeSeq {
-		return "", "", errWorkerIDSpaceExhausted
-	}
-	state.nextSeq = seq
-	workerID := strconv.Itoa(seq)
-	return workerID, runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
-}
-
-// reseedWorkerScope forces the next allocation for outerScope to re-read the tree.
-// Called ONLY on a create EEXIST — positive proof the counter is stale-low because
-// a child it did not know about is already on the tree.
-func (s *Server) reseedWorkerScope(outerScope string) {
-	state := s.workerScopeFor(outerScope)
-	state.mu.Lock()
-	state.seeded = false
-	state.mu.Unlock()
-}
-
-// workerParentScopeID maps a worker's outer cgroup path to the suite scope-id the
-// worker lease is a sub-reservation OF (design §8). A confine job's scope
-// directory is ".aira-<scopeID>" (confineScopeDirName), so the suite's scope-id is
-// the outer directory's base with that prefix stripped. Setting the worker lease's
-// parentScopeID to this is what makes the shared exclusivity gate (exclusiveGate.
-// blocks) treat the holder's OWN aitest workers as its internal progress — the
-// exact exemption the deleted exclusiveDeniesWorkerAdmit provided, now expressed as
-// a lease property rather than a bespoke worker gate.
-//
-// It only needs to MATCH a holder scope-id when the worker's suite is itself the
-// exclusive holder (`aira confine --exclusive --delegate-ram -- pytest`); a
-// non-".aira-" base (aitest run outside confine) yields a harmless non-empty value
-// that matches no holder and still marks the lease a sub-reservation (so a drain
-// elsewhere does not block it).
-func workerParentScopeID(outerScope string) string {
-	return strings.TrimPrefix(filepath.Base(filepath.Clean(outerScope)), ".aira-")
 }
 
 // validateWorkerAdmitArgs parses the worker-admit wire arguments. Since S15 there
@@ -271,6 +143,28 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	}
 	if req.signature, err = str("signature", false); err != nil {
 		return workerAdmitRequest{}, err
+	}
+	// parent_scope_id is REQUIRED (design §16d): a worker must always declare the
+	// suite it is a sub-reservation of, so isSubReservation cannot silently drop and
+	// leave the worker subject to the exclusivity gate / counted in the parent's
+	// oomsteer child sum (a worker still counts as a job either way). A
+	// non-empty value must be parseConfineScopeID-parseable (mirror admit.go's
+	// exclusive_holder / parent_scope_id checks) so Task 1 can extract the parent
+	// supervisor pid — the ci-shim sentinel is the one exempt value, and it is tied
+	// to shim mode on BOTH fields so a sentinel parent can never ride a real outer
+	// scope (nor the reverse).
+	if req.parentScopeID, err = str("parent_scope_id", true); err != nil {
+		return workerAdmitRequest{}, err
+	}
+	parentIsSentinel := req.parentScopeID == runner.ShimConfineSlice
+	outerIsSentinel := req.outerScope == runner.ShimConfineSlice
+	if parentIsSentinel != outerIsSentinel {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit parent_scope_id and outer_scope disagree about ci-shim mode (parent %q, outer %q)", CodeProtocol, req.parentScopeID, req.outerScope)
+	}
+	if !parentIsSentinel {
+		if _, _, _, _, parsed := runner.ParseConfineScopeID(req.parentScopeID); !parsed {
+			return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit parent_scope_id %q is not a canonical confine scope id", CodeProtocol, req.parentScopeID)
+		}
 	}
 	// exactAdmitInt64 (admit.go) — overflow-safe float64->int64, so an arbitrary
 	// huge float64 cannot truncate unchecked into a plausible small reserve.
@@ -460,10 +354,12 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 
 	// BLOCKING CLAIM (design §8 v1 scheduler): reserve {ram, one core} on the unified
 	// ledger and wait until it fits conjunctively (RAM AND CPU), then create the
-	// worker's cgroup sub-scope and hold the lease. There is no outer-cap aggregate
-	// scan any more (S15 deleted it); the outer scope's own memory.oom.group is the
-	// kernel-side bound on Σ(worker caps) ≤ outer-cap (design §8/§10 Inv 2), and the
-	// unified ledger bounds Σ(all leases) ≤ the slice ceiling.
+	// worker's cgroup scope as a SIBLING directly under the slice (S2a §4) and hold
+	// the lease. There is no outer-cap aggregate scan, and no shared smaller-than-slice
+	// parent cap either: each worker's own memory.oom.group bounds its own footprint,
+	// and the unified ledger bounds Σ(all leases) ≤ the slice ceiling. AIRA-229's
+	// whole-suite kill and AIRA-232's multi-supervisor breach dissolve under this
+	// topology (design §11) — there is no aggregate for an outer oom.group to kill.
 
 	// Exceeds-ceiling fast-fail, BEFORE the worker-id allocation reads the tree: a
 	// request larger than the whole slice ceiling can never fit, so refuse it up
@@ -479,35 +375,49 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 
-	// Allocate the id + scope path BEFORE enqueue so the lease has a stable scope-id
-	// key. Real mode re-seeds the counter from the tree (survivors keep their
-	// .aira-worker-<N> across a restart); shim mode has no tree, so a synthetic
-	// monotonic id keys the advisory lease.
+	// The suite scope-id this worker is a sub-reservation OF — the EXPLICIT wire
+	// field (design §16d), validated non-empty and parseable above. In real mode the
+	// worker scope NAME embeds the PARENT supervisor pid copied out of this id (S2a
+	// §16a) — the pid the Task-5 escape exemption checks locally against os.Getpid().
+	parentScopeID := req.parentScopeID
+
+	// Mint the worker's scope id + path BEFORE enqueue so the lease has a stable
+	// scope-id key. Real mode mints a first-class confine id
+	// (CONFINE-aitest-w<seq>-<parentPid>-<stamp>) — unique by construction, so
+	// there is no tree re-seed and no EEXIST path; shim mode has no cgroup, so a
+	// synthetic monotonic id keys the advisory lease.
 	var workerID, scopePath, scopeID string
 	if shim {
 		workerID = strconv.FormatUint(s.shimWorkerSeq.Add(1), 10)
 		scopeID = "ci-shim-worker-" + workerID
 	} else {
-		workerID, scopePath, err = s.allocateWorkerScopeID(req.outerScope)
-		if err != nil {
-			if errors.Is(err, errWorkerIDSpaceExhausted) {
-				s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
-					State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
-					Reason: runner.WorkerAdmitReasonWorkerIDSpaceExhausted,
-					Detail: fmt.Sprintf("worker id space exhausted under %s (limit %d)", req.outerScope, maxWorkerScopeSeq),
-				})
-				return
-			}
+		_, parentPID, _, parentOwner, ok := runner.ParseConfineScopeID(parentScopeID)
+		if !ok {
+			// No parent pid to stamp into the worker name: refuse terminally rather
+			// than mint a scope whose pid slot the reaper and the escape exemption
+			// cannot reason about. (Task 2 makes the authoritative refusal the
+			// arg-validator on the explicit parent_scope_id field; this stays as a
+			// defensive invariant — a worker can never silently lose its parent pid.)
 			s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
-				State: runner.WorkerAdmitStateUnevaluated, Class: runner.WorkerAdmitClassContended,
-				Reason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
-				Detail: "worker scopes unreadable: " + err.Error(),
+				State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
+				Reason: runner.WorkerAdmitReasonParentScopeUnparseable,
+				Detail: fmt.Sprintf("parent scope id %q is not a canonical confine id", parentScopeID),
 			})
 			return
 		}
-		scopeID = scopePath
+		seq := int(s.workerScopeSeq.Add(1))
+		// Copy the parent's OWNER into the worker name alongside its pid (Task 10):
+		// a worker is owned by the same principal as its parent supervisor, so
+		// `confine --kill <worker-scope-id>` opens the ownership guard for that
+		// principal without --steal. An empty / unattested parent owner encodes as
+		// no suffix, so this is a no-op for ownerless parents.
+		scopeID = runner.MintWorkerScopeID(seq, parentPID, parentOwner)
+		// S2a §4: the worker scope is a SIBLING under the resolved slice (path), not
+		// nested under req.outerScope. req.outerScope now serves only the mode-agreement
+		// sentinel check above and the parent↔worker linkage carried in parentScopeID.
+		scopePath = runner.WorkerScopeChildPath(path, scopeID)
+		workerID = strconv.Itoa(seq)
 	}
-	parentScopeID := workerParentScopeID(req.outerScope)
 
 	request := admitRequest{
 		reserve:       req.estimatedBytes,
@@ -538,12 +448,13 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	peerCtx, cancelPeer := watchPeerEOF(conn)
 	defer cancelPeer()
 	released := false
+	discharged := false
 	release := func() {
 		if released {
 			return
 		}
 		released = true
-		s.releaseAdmitWaiterAnchored(queue, waiter, conn)
+		discharged = s.releaseAdmitWaiterAnchored(queue, waiter, conn)
 	}
 	defer release()
 
@@ -589,26 +500,18 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		reserved = req.estimatedBytes
 		memoryMax = 0
 	} else {
-		// The daemon creates the worker's cgroup sub-scope AFTER the grant — never
-		// under queue.mu (the evaluator must do no filesystem I/O). The ledger already
-		// charges the reserve; a creation failure discharges it.
+		// The daemon creates the worker's cgroup scope AFTER the grant — never under
+		// queue.mu (the evaluator must do no filesystem I/O). It is created as a SIBLING
+		// under the resolved slice (path), via the ordinary confine scope-creation path,
+		// NOT nested under req.outerScope (S2a §4). The ledger already charges the
+		// reserve; a creation failure discharges it.
 		create := s.workerScopeCreate
 		if create == nil {
 			create = runner.CreateWorkerScope
 		}
-		sp, sc, createErr := create(peerCtx, req.outerScope, workerID, req.estimatedBytes)
+		sp, sc, createErr := create(peerCtx, path, scopeID, req.estimatedBytes)
 		if createErr != nil {
 			release()
-			if errors.Is(createErr, fs.ErrExist) {
-				// A survivor the re-seed missed collided with this id. Force a fresh
-				// re-seed and deny RETRIABLY: the supervisor's next claim gets a higher id.
-				s.reseedWorkerScope(req.outerScope)
-				s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
-					State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassContended,
-					Reason: runner.WorkerAdmitReasonWorkerScopeIDCollision,
-				})
-				return
-			}
 			// Fail closed: no grant is delivered without its scope. request-invalid is
 			// the TERMINAL-BUT-DAEMON-HEALTHY disposition — a `contended` class would
 			// retry indefinitely, stalling every aitest run on the machine.
@@ -632,6 +535,26 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	// gate this: release is EOF-keyed, not write-keyed.
 	select {
 	case <-peerCtx.Done():
+		// The worker relay closed. In real mode the worker is a SIBLING scope under the
+		// slice, so nothing ABOVE it kills the worker process on relay death (§16b) —
+		// the daemon must, on THIS peer-EOF. Discharge the lease here so `discharged`
+		// reflects whether THIS connection was still the anchor.
+		if !shim && scopeID != "" {
+			release()
+			// NEVER kill on a daemon restart: close(stopping) EOFs every relay, but live
+			// workers must survive and re-declare (§16b). Re-check under the select so a
+			// simultaneous stopping+EOF cannot slip a kill through. Anchor-gate on
+			// `discharged` (§16.2 P1-B): a late-ack redial closes THIS conn while conn2
+			// re-anchors the LIVE worker, so a release that discharged nothing must not
+			// kill a mid-test worker (a release is idempotent; a kill is not).
+			select {
+			case <-s.stopping:
+			default:
+				if discharged {
+					s.killWorkerScope(path, scopeID)
+				}
+			}
+		}
 	case <-s.stopping:
 	}
 }

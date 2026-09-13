@@ -81,12 +81,19 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// sliceCap is 0: there is no slice cap to compare a container's declared
 	// --memory against. The daemon's own E_ADMIT_TOO_LARGE against the shim
 	// budget is what refuses an over-large charge, one gate instead of two.
-	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, request.DelegateRAM, 0)
+	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, 0)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
 			signature = computed
 		}
+	}
+	// §16.1/P2-2, same as the real path: a --delegate-ram parent books the
+	// advisory ledger against a namespaced signature so its small
+	// supervisor+framework footprint never inherits the whole-job history of a
+	// plain run of the same argv (which would over-book the ledger here).
+	if request.DelegateRAM && signature != "" {
+		signature = AitestParentSignaturePrefix + signature
 	}
 	request.ResourceSignature = signature
 	request.MemoryReserve = reserve
@@ -97,8 +104,8 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// a cgroup directory to exist.
 	scopeID := request.presetScopeID
 	if scopeID == "" {
-		scopeID = confineScopeID(request.Name, request.Owner, request.DelegateRAM)
-	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner, request.DelegateRAM); bindErr != nil {
+		scopeID = confineScopeID(request.Name, request.Owner)
+	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner); bindErr != nil {
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", bindErr)
 	}
 	request.ScopeID = scopeID
@@ -217,7 +224,11 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// path, and for the same reason: only a number the caller chose may be
 	// imposed on their container.
 	declaredContainerCap := request.ScopeMemoryMax
-	if declaredContainerCap <= 0 && declaredReserve && !request.DelegateRAM {
+	// S2a: a --delegate-ram job is an ordinary confine job, so a declared
+	// --memory-reserve is its container cap here exactly as on the real path (the
+	// old `!request.DelegateRAM` guard and its falsified delegate-ceiling
+	// rationale were removed).
+	if declaredContainerCap <= 0 && declaredReserve {
 		declaredContainerCap = request.MemoryReserve
 	}
 	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
@@ -230,7 +241,7 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 			admission.release != nil
 		result.Status.ContainerMemory = ContainerMemoryFacet(containerPlan, containerInjection, containerReserveSkip, ledgerCharged)
 	}
-	setupArgv, err := confineSetupArgv(containerInjection.Argv, request.DelegateRAM)
+	setupArgv, err := confineSetupArgv(containerInjection.Argv)
 	if err != nil {
 		return result, err
 	}
@@ -287,11 +298,15 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// pytest-xdist -- makes per-worker RAM invisible to everything and prevents
 	// no over-subscription at all.
 	//
-	// AIRA_AITEST_OUTER_SCOPE is deliberately NOT published (the empty argument):
-	// there is no outer cgroup scope to hand down, and the shim bootstrap branch
-	// answers with the ci-shim sentinel of its own accord rather than trusting an
-	// inherited coordinate. Publishing an invented one would be the first place
-	// this mode pretended to have a cgroup.
+	// AIRA_AITEST_OUTER_SCOPE is published as the ci-shim SENTINEL, not a cgroup
+	// path: there is no outer cgroup scope in shim mode, and the sentinel is
+	// exactly what the (now-deleted) aitest-bootstrap verb used to report on its
+	// own accord for this mode. Handing it down directly (S2a) is what lets the
+	// supervisor read its coordinates from the environment with no subprocess; the
+	// daemon refuses to treat the sentinel as a real path, so this is not the mode
+	// pretending to have a cgroup — it is the mode naming its lack of one.
+	// AIRA_AITEST_ADMISSION is the paired grade: LEDGER-ONLY (advisory, no cgroup
+	// sub-scope, no kill backstop), the honest per-worker guarantee here.
 	//
 	// The non-delegate arm keeps AIRA-121's active STRIP, and that is unchanged
 	// and still load-bearing: a shim confine nested inside some outer
@@ -308,7 +323,10 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		if executable, executableErr := filepath.EvalSymlinks(self); executableErr == nil {
 			aitestCommand = executable
 		}
-		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, aitestCommand, "")
+		// parentCapFinite=false: ci-shim has no cgroup and no scope memory.max, so
+		// there is no parent cap for a fallback pool to over-run; keep the NumCPU
+		// bound.
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, aitestCommand, ShimConfineSlice, AitestAdmissionLedgerOnly, false)
 		// Said on the launch that is affected, not only in a daemon log. The
 		// whole risk AIRA-121 named -- a suite running under an apparent
 		// governance mechanism, "invisible until something OOMs" -- is closed by

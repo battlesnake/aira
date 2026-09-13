@@ -529,7 +529,7 @@ func TestUnacknowledgedDetachedSupervisorRefusesToRunTheJob(t *testing.T) {
 // verifies: AIRA-22
 func TestConfineDetachRecordWriteIsAtomicAcrossAFailureBetweenWriteAndRename(t *testing.T) {
 	state := t.TempDir()
-	scopeID := confineScopeID("atomic", "session-a", false)
+	scopeID := confineScopeID("atomic", "session-a")
 	job, err := openConfineDetachJob(state, scopeID)
 	if err != nil {
 		t.Fatalf("open job: %v", err)
@@ -577,7 +577,7 @@ func TestConfineDetachRecordWriteIsAtomicAcrossAFailureBetweenWriteAndRename(t *
 // verifies: AIRA-22
 func TestConfineDetachRecordFilesAreOwnerOnlyAndRefuseSymlinksAndReuse(t *testing.T) {
 	state := t.TempDir()
-	scopeID := confineScopeID("modes", "session-a", false)
+	scopeID := confineScopeID("modes", "session-a")
 	job, err := openConfineDetachJob(state, scopeID)
 	if err != nil {
 		t.Fatalf("open job: %v", err)
@@ -612,7 +612,7 @@ func TestConfineDetachRecordFilesAreOwnerOnlyAndRefuseSymlinksAndReuse(t *testin
 	// directory from merely ensuring it: the capture files' O_EXCL catches a
 	// populated one either way, so only this case proves the directory itself is
 	// created rather than adopted.
-	empty := confineScopeID("empty", "session-a", false)
+	empty := confineScopeID("empty", "session-a")
 	if err := os.Mkdir(filepath.Join(state, empty), 0o700); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestConfineDetachRecordFilesAreOwnerOnlyAndRefuseSymlinksAndReuse(t *testin
 	// A pre-planted symlink where a capture file would go must be refused, not
 	// written through.
 	victim := filepath.Join(t.TempDir(), "victim")
-	symlinked := confineScopeID("symlink", "session-a", false)
+	symlinked := confineScopeID("symlink", "session-a")
 	if err := os.MkdirAll(filepath.Join(state, symlinked), 0o700); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -658,14 +658,14 @@ func TestConfineDetachStoreRejectsAnInvalidScopeID(t *testing.T) {
 // verifies: AIRA-22
 func TestListConfineDetachRecordsSurfacesUnreadableAndMismatchedRecords(t *testing.T) {
 	state := t.TempDir()
-	corrupt := confineScopeID("corrupt", "session-a", false)
+	corrupt := confineScopeID("corrupt", "session-a")
 	if err := os.MkdirAll(filepath.Join(state, corrupt), 0o700); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(state, corrupt, confineDetachRecordName), []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	mismatched := confineScopeID("mismatch", "session-a", false)
+	mismatched := confineScopeID("mismatch", "session-a")
 	if err := os.MkdirAll(filepath.Join(state, mismatched), 0o700); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -787,7 +787,7 @@ func TestConfineSupervisorAliveDistinguishesLiveReusedAndUnreadablePIDs(t *testi
 //
 // verifies: AIRA-22
 func TestListConfineDetachRecordsRefusesARecordThatDisagreesWithItsDirectory(t *testing.T) {
-	scopeID := confineScopeID("bound", "session-a", false)
+	scopeID := confineScopeID("bound", "session-a")
 	name, pid, _, owner, ok := parseConfineScopeID(scopeID)
 	if !ok {
 		t.Fatalf("setup: %q does not parse", scopeID)
@@ -854,7 +854,7 @@ func TestListConfineDetachRecordsRefusesARecordThatDisagreesWithItsDirectory(t *
 // verifies: AIRA-22
 func TestListConfineDetachRecordsRefusesANonRegularRecord(t *testing.T) {
 	state := t.TempDir()
-	scopeID := confineScopeID("fifo", "session-a", false)
+	scopeID := confineScopeID("fifo", "session-a")
 	if err := os.MkdirAll(filepath.Join(state, scopeID), 0o700); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -885,7 +885,7 @@ func TestListConfineDetachRecordsRefusesANonRegularRecord(t *testing.T) {
 func TestConfineWithDepsRefusesAPreSetScopeIDMintedByAnotherProcess(t *testing.T) {
 	started := false
 	deps := confineDetachFixtureDeps(&started)
-	foreign := strings.Replace(confineScopeID("gate", "session-a", false),
+	foreign := strings.Replace(confineScopeID("gate", "session-a"),
 		"-"+strconv.Itoa(os.Getpid())+"-", "-"+strconv.Itoa(os.Getpid()+1)+"-", 1)
 	request := ConfineRequest{
 		Slice: "finite.slice", Name: "gate", Owner: "session-a",
