@@ -33,6 +33,20 @@ type ConfineRecord struct {
 	ScopeID       string `json:"scope_id"`
 	Populated     *int   `json:"populated"`
 	RSSBytes      *int64 `json:"rss_bytes"`
+	// PeakRSS is the scope's live cgroup-v2 memory.peak -- the maximum
+	// memory.current has reached since the scope's cgroup was created -- read
+	// at listing time from the SAME already-open scope directory RSSBytes and
+	// Cap beside it come from (AIRA-241). It is a DISPLAY facet only: nothing
+	// in this package decides on it, exactly the same trust class as Command.
+	//
+	// nil is "could not be established" -- memory.peak is absent on a kernel
+	// too old for it, the scope vanished mid-scan, or the file was unreadable
+	// -- and is NEVER a fabricated peak of 0 or of RSSBytes' own value.
+	// Collapsing "unevaluated" into "no higher than current usage" is exactly
+	// the honesty violation AIRA-135's RSSBytes/UsedKnown split exists to
+	// prevent for the two-tier fill; PeakRSS inherits the same rule for the
+	// three-tier one.
+	PeakRSS *int64 `json:"peak_rss"`
 	// SubtreePopulated is liveness read from cgroup.events `populated`, which is
 	// SUBTREE-aware, unlike Populated above (leaf cgroup.procs only). AIRA-101
 	// needs the distinction and it is not cosmetic: a job that creates child

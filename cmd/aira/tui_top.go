@@ -250,6 +250,17 @@ type topBarRegion struct {
 	// used/idle/unknown split for a RAM bar, so every CPU span is painted solid.
 	Used      int64
 	UsedKnown bool
+
+	// AIRA-241. Peak/PeakKnown carry the THIRD tier: the task's own high-water
+	// mark, drawn as a mostly-solid band between Used and the region's own
+	// quota (Size). Same honesty contract as Used/UsedKnown above -- a nil
+	// PeakRSS reports PeakKnown=false and the region draws NO such band at
+	// all, degrading exactly to the two-tier fill; a real reading is never
+	// invented from Used, and is CLAMPED into [Used, Size] by topPeakWithin so
+	// the band can never invert (read below current) or bleed past this
+	// region's right edge into the next slot's colour.
+	Peak      int64
+	PeakKnown bool
 }
 
 // topBarMarker is a limit tick drawn over the bar, positioned at At in the bar's
@@ -665,6 +676,10 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 			// own statement of what this bar is for. topUsedWithin is unchanged: it
 			// divides whatever Size it is handed, and only the source of Size moved.
 			region.Used, region.UsedKnown = topUsedWithin(record.RSSBytes, reserve.Bytes)
+			// AIRA-241. Mirrors the Used/UsedKnown line above, one reading later:
+			// topPeakWithin is the ONE place the peak band's own edge cases live,
+			// exactly as topUsedWithin is for the used/idle split.
+			region.Peak, region.PeakKnown = topPeakWithin(record.PeakRSS, region.Used, reserve.Bytes)
 			drawn = append(drawn, region)
 			offset += reserve.Bytes
 		} else {
@@ -802,6 +817,37 @@ func topUsedWithin(rss *int64, reserved int64) (int64, bool) {
 		used = reserved
 	}
 	return used, true
+}
+
+// topPeakWithin turns a scope's optional live memory.peak reading into the bar
+// region's peak sub-span boundary, and is the ONE place ITS OWN edge cases
+// live -- mirroring topUsedWithin above for the used/idle split (AIRA-241).
+//
+// A nil (or negative) peak is NOT usable: it reports known=false, and the
+// region then draws NO middle peak band at all -- degrading to exactly
+// today's two-tier solid/idle split. A measured peak is never invented from
+// used, and an unevaluated one must never silently collapse to "no higher
+// than current usage", which would be a fabricated equality rather than an
+// honest unknown.
+//
+// A usable peak is CLAMPED into [used, reserved]: memory.current can only
+// rise to reach its own recorded peak, so a stale or skewed reading below
+// `used` is raised to it -- giving a zero-width (invisible) band rather than
+// one that would read as running backwards -- and, exactly like
+// topUsedWithin's own reservation clamp, a peak above the reservation is
+// capped to it so the band never bleeds into the next region's slot.
+func topPeakWithin(peak *int64, used int64, reserved int64) (int64, bool) {
+	if peak == nil || *peak < 0 || reserved < 0 {
+		return 0, false
+	}
+	value := *peak
+	if value < used {
+		value = used
+	}
+	if value > reserved {
+		value = reserved
+	}
+	return value, true
 }
 
 // topCommandCell renders the wrapped command, and says "unevaluated" for one that
@@ -957,6 +1003,12 @@ const (
 	// topFillSolid is the full block █: memory a reservation is using right now,
 	// and every non-split region (scope-less, out-of-slice, and all CPU spans).
 	topFillSolid topBarFill = iota
+	// topFillPeak is the mostly-solid block: the band between current usage and
+	// the task's own peak-RSS high-water mark (AIRA-241, an owner override of
+	// AIRA-135's original two-tier fill). Drawn only when a real peak reading
+	// exists AND sits above current usage; otherwise the region has no such band
+	// and degrades to exactly the two-tier solid/idle split below.
+	topFillPeak
 	// topFillIdle is the shaded block: memory a reservation holds but is NOT using,
 	// drawn in the SAME colour as the used part so the whole span reads as one job.
 	topFillIdle
@@ -1011,23 +1063,34 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 			}
 			start := topBarColumn(region.Start, bar.Total, width)
 			end := topBarColumn(region.Start+region.Size, bar.Total, width)
-			// AIRA-135. The used/idle/unknown split is a RAM-scope concern only: a
-			// CPU rate has no reserved-but-idle remainder, and no non-scope region
-			// carries a per-job usage reading. Everything else is left solid, which
-			// is what the topFillSolid zero value already gives every cell below.
+			// AIRA-135/AIRA-241. The used/peak/idle/unknown split is a RAM-scope
+			// concern only: a CPU rate has no reserved-but-idle remainder, and no
+			// non-scope region carries a per-job usage reading. Everything else is
+			// left solid, which is what the topFillSolid zero value already gives
+			// every cell below.
 			//
-			// idleFrom is where the solid used span stops and the shaded idle span
-			// begins, derived from the SAME absolute-offset mapping as the region's
-			// own edges so the boundary can never round outside them. A scope whose
-			// usage was never established has no split at all — it is drawn in the
-			// "unevaluated" glyph across its whole width rather than as a fabricated
-			// full-or-empty split.
+			// usedEnd is where the solid used span stops and the peak band begins;
+			// peakEnd is where the peak band stops and the shaded idle span
+			// begins. Both are derived from the SAME absolute-offset mapping as the
+			// region's own edges so a boundary can never round outside them.
+			// peakEnd defaults to usedEnd (zero-width peak band) whenever there is
+			// no established peak ABOVE current usage, which is what makes an
+			// unevaluated or already-reached peak degrade to exactly the old
+			// two-tier solid/idle split with no separate code path. A scope whose
+			// usage itself was never established has no split at all -- it is
+			// drawn in the "unevaluated" glyph across its whole width rather than
+			// as a fabricated full-or-empty split, and the peak reading is ignored
+			// entirely in that case (current gates the split, not peak).
 			split := bar.Kind == topBarRAM && region.Kind == topRegionScope
-			idleFrom := end
+			usedEnd, peakEnd := end, end
 			unknown := false
 			if split {
 				if region.UsedKnown {
-					idleFrom = topBarColumn(region.Start+region.Used, bar.Total, width)
+					usedEnd = topBarColumn(region.Start+region.Used, bar.Total, width)
+					peakEnd = usedEnd
+					if region.PeakKnown {
+						peakEnd = topBarColumn(region.Start+region.Peak, bar.Total, width)
+					}
 				} else {
 					unknown = true
 				}
@@ -1037,8 +1100,10 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 				switch {
 				case unknown:
 					cell.Fill = topFillUnknown
-				case column >= idleFrom:
+				case column >= peakEnd:
 					cell.Fill = topFillIdle
+				case column >= usedEnd:
+					cell.Fill = topFillPeak
 				}
 				cells[column] = cell
 			}
