@@ -148,6 +148,15 @@ _UNKNOWN = object()
 # Overridable via AIRA_AITEST_DEFAULT_BYTES through the shared size grammar.
 _DEFAULT_ANNOTATION_BYTES = 256 << 20
 
+# AIRA-235 (v0.7 S2b). The per-worker warm-import OVERHEAD every worker reserves
+# on top of a test's declared INCREMENTAL aira_mem (spec 4.1: aira_mem is the peak
+# RSS increment above the warm-import baseline). 512 MiB == today's flat per-worker
+# reserve (_resolve_estimated_bytes, known not to OOM), so an UNANNOTATED worker
+# reserves exactly 512 (== today, provably no regression) and an annotated worker
+# reserves aira_mem + 512 >= today's reserve. Overridable via
+# AIRA_AITEST_WORKER_OVERHEAD_BYTES through the shared size grammar.
+_DEFAULT_WORKER_OVERHEAD_BYTES = 512 << 20
+
 
 def _env_bytes(name, default):
     """A byte-count tunable override using the shared AIRA_AITEST_ESTIMATED_BYTES
@@ -745,6 +754,14 @@ class Supervisor:
         # aira_mem marker (or the default). Built in collect(); DOCUMENTED-INERT
         # in S1 -- no admission consumer yet (plan D5). Empty until collect() runs.
         self.aira_mem_bytes = {}
+        # AIRA-235 (v0.7 S2b): per-nodeid RESERVATION need (overhead + incremental)
+        # and the set of nodeids carrying a real, well-formed aira_mem marker, both
+        # built in collect(). Empty until collect() runs; a nodeid absent from
+        # reservation_need falls back to the bare overhead (only test doubles that
+        # set self.queue directly, without collect(), reach that fallback).
+        self._worker_overhead_bytes = self._resolve_worker_overhead_bytes()
+        self._annotated = set()
+        self.reservation_need = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -772,6 +789,81 @@ class Supervisor:
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
         self._swap_cap_warned = False
+
+    def _resolve_worker_overhead_bytes(self):
+        """The warm-import OVERHEAD every worker reserves on top of a test's
+        declared incremental aira_mem. AIRA_AITEST_WORKER_OVERHEAD_BYTES overrides
+        the _DEFAULT_WORKER_OVERHEAD_BYTES default through the shared size grammar.
+
+        _env_bytes deliberately lets a parsed 0 through ("no band" is legitimate
+        for the branch-exit gate that uses it), so a non-positive result is floored
+        HERE with its own warning: sizing a worker to 0 bytes would make every
+        unannotated claim ask for --estimated-bytes 0, which the daemon refuses as
+        a terminal argument-invalid and which would drain the whole queue."""
+        overhead = _env_bytes("AIRA_AITEST_WORKER_OVERHEAD_BYTES", _DEFAULT_WORKER_OVERHEAD_BYTES)
+        if overhead <= 0:
+            sys.stderr.write(
+                "aira aitest: AIRA_AITEST_WORKER_OVERHEAD_BYTES=%r is not a positive "
+                "size; using the %d-byte default\n"
+                % (os.environ.get("AIRA_AITEST_WORKER_OVERHEAD_BYTES", ""),
+                   _DEFAULT_WORKER_OVERHEAD_BYTES)
+            )
+            return _DEFAULT_WORKER_OVERHEAD_BYTES
+        return overhead
+
+    def _need_for(self, nodeid):
+        """Bytes to reserve for a worker that will run `nodeid`: the warm-import
+        overhead plus the test's declared incremental aira_mem (0 when
+        unannotated). Falls back to the bare overhead for a nodeid collect() never
+        sized."""
+        return self.reservation_need.get(nodeid, self._worker_overhead_bytes)
+
+    def _largest_fitting(self, budget, *, pop):
+        """The ready (still-queued) nodeid whose reservation_need is the GREATEST
+        that still fits `budget` bytes, or None if none fit. Ties keep FIFO order
+        (the earliest-queued nodeid at the greatest fitting need).
+
+        pop=False PEEKS (queue and attempts untouched). pop=True removes the nodeid
+        from the queue AND applies next_nodeid's attempts increment
+        (self.attempts[nodeid] += 1) -- without that increment the crash-retry-once
+        cap (Task 15) breaks and a repeatedly-crashing nodeid requeues forever.
+
+        `budget` is always numeric: a None-reservation (unconfined) worker never
+        calls this -- its dispatch bypasses the fit filter entirely (Task 3)."""
+        best = None
+        best_need = -1
+        for nodeid in self.queue:
+            need = self._need_for(nodeid)
+            if need <= budget and need > best_need:
+                best = nodeid
+                best_need = need
+        if best is None:
+            return None
+        if pop:
+            self.queue.remove(best)
+            self.attempts[best] = self.attempts.get(best, 0) + 1
+        return best
+
+    def _smallest_ready(self):
+        """(nodeid, reservation_need) for the ready nodeid with the SMALLEST
+        reservation_need (FIFO among ties), or (None, 0) when the queue is empty.
+
+        The empty-pool blocking claim (Task 2) sizes itself to this `need` -- the
+        smallest ready test is the one most likely to fit minimal free room on a
+        saturated box -- and, if the daemon refuses it as exceeds-ceiling, marks and
+        pops THIS specific nodeid; a bare byte size would leave that catch site with
+        no nodeid to mark. If even the smallest ready test exceeds the ceiling,
+        every ready test does."""
+        best = None
+        best_need = None
+        for nodeid in self.queue:
+            need = self._need_for(nodeid)
+            if best_need is None or need < best_need:
+                best = nodeid
+                best_need = need
+        if best is None:
+            return None, 0
+        return best, best_need
 
     def bootstrap(self):
         """Read the launcher-published aitest coordinates (S2a). The confine
@@ -862,12 +954,32 @@ class Supervisor:
         from aitest import _aira_mem_bytes_for_item
         default_bytes = _env_bytes("AIRA_AITEST_DEFAULT_BYTES", _DEFAULT_ANNOTATION_BYTES)
         mem_map = {}
+        annotated = set()
+        reservation_need = {}
         for item in items:
             value, warning = _aira_mem_bytes_for_item(item, default_bytes)
             mem_map[item.nodeid] = value
             if warning is not None:
                 sys.stderr.write(warning)
+            # AIRA-235: a nodeid is ANNOTATED iff its item carries a real,
+            # WELL-FORMED aira_mem marker -- the marker OBJECT is present
+            # (get_closest_marker is not None) AND the reader accepted it
+            # (warning is None). Never inferred from the byte value: comparing to
+            # the 256 MiB default would misread an explicit @aira_mem(256M) as
+            # unannotated, and a MALFORMED marker (present but warning set) carries
+            # a fabricated default value, so it counts as UNANNOTATED (reserves the
+            # overhead only, 512, not overhead+256).
+            is_annotated = item.get_closest_marker("aira_mem") is not None and warning is None
+            if is_annotated:
+                annotated.add(item.nodeid)
+            # reservation = overhead + incremental(nodeid); incremental is the
+            # declared aira_mem iff annotated, else 0 (an unannotated worker
+            # reserves exactly the 512 MiB overhead == today's flat reserve).
+            incremental = value if is_annotated else 0
+            reservation_need[item.nodeid] = self._worker_overhead_bytes + incremental
         self.aira_mem_bytes = mem_map
+        self._annotated = annotated
+        self.reservation_need = reservation_need
 
     def next_nodeid(self):
         if not self.queue:
@@ -1511,6 +1623,13 @@ class Supervisor:
             "admit_process": admit_process,
             "dispatch_write": os.fdopen(dispatch_write, "w"),
             "in_flight": None,
+            # AIRA-235: the byte budget this worker was SIZED to (the fit filter
+            # in _dispatch_to_idle_workers hands it only tests whose reservation_need
+            # fits this). The daemon grants the requested estimated_bytes VERBATIM
+            # (worker_admit.go reserves req.estimatedBytes directly), so this IS the
+            # worker's real cap; grant["memory_max"] is a STRING (and absent on a
+            # ledger-only grant), so estimated_bytes is the numeric authority here.
+            "reservation": estimated_bytes,
             # Opened only now, on the path where this worker is actually going
             # to be registered: every failure branch above has already reaped
             # the child, and a pidfd for a reaped pid is either invalid or --
@@ -1633,6 +1752,10 @@ class Supervisor:
             "read_buffer": b"",
             "result_eof": False,
             "in_flight": None,
+            # AIRA-235: an UNCONFINED fallback worker has no memory.max, so it
+            # "fits everything" -- reservation=None is the sentinel the fit filter,
+            # the growth gate and retire-on-no-fit all special-case (Tasks 3/4).
+            "reservation": None,
             # AIRA-40, exactly as on the confined path: this fork site needs
             # the independent liveness signal just as much -- a fallback worker
             # runs the same arbitrary test code, so it inherits the same

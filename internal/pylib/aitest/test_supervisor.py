@@ -3897,3 +3897,133 @@ def test_pool_spawns_past_the_excised_outer_cap_guard(tmp_path, monkeypatch):
     monkeypatch.setattr(sup, "acquire_worker", _reach)
     with pytest.raises(_ReachedAcquire):
         sup.spawn_worker(256 << 20)
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 (v0.7 S2b) — per-test reservation model, largest-first sizing.
+# ---------------------------------------------------------------------------
+
+
+def test_reservation_need_unannotated_is_the_overhead_default(pytester):
+    """An UNANNOTATED test reserves exactly the overhead (512 MiB) == today's
+    flat per-worker reserve: provably no regression."""
+    items = pytester.getitems("def test_x(): pass")
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    assert supervisor.reservation_need[items[0].nodeid] == 512 << 20
+    assert items[0].nodeid not in supervisor._annotated
+
+
+def test_reservation_need_annotated_adds_incremental_to_overhead(pytester):
+    items = pytester.getitems("""
+        import pytest
+        @pytest.mark.aira_mem("2G")
+        def test_big(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    nid = items[0].nodeid
+    assert nid in supervisor._annotated
+    assert supervisor.reservation_need[nid] == (2 << 30) + (512 << 20)
+
+
+def test_reservation_need_explicit_256M_is_annotated_not_mistaken_for_default(pytester):
+    """A marker whose value EQUALS the 256M measurement default must still be
+    ANNOTATED: presence comes from the marker object, never from comparing the
+    byte value to the default."""
+    items = pytester.getitems("""
+        import pytest
+        @pytest.mark.aira_mem("256M")
+        def test_mid(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    nid = items[0].nodeid
+    assert nid in supervisor._annotated
+    assert supervisor.reservation_need[nid] == (256 << 20) + (512 << 20)
+
+
+def test_reservation_need_malformed_marker_is_unannotated_512(pytester, capsys):
+    """A MALFORMED marker (present but unparseable) is NOT annotated: its byte
+    value is a fabricated default, so it reserves the overhead only (512), never
+    overhead+256."""
+    items = pytester.getitems("""
+        import pytest
+        @pytest.mark.aira_mem("not-a-size")
+        def test_bad(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    nid = items[0].nodeid
+    assert nid not in supervisor._annotated
+    assert supervisor.reservation_need[nid] == 512 << 20
+    assert "not a valid size" in capsys.readouterr().err
+
+
+def test_all_unannotated_queue_reserves_exactly_512_each(pytester):
+    items = pytester.getitems("""
+        def test_a(): pass
+        def test_b(): pass
+        def test_c(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    assert all(supervisor.reservation_need[i.nodeid] == 512 << 20 for i in items)
+
+
+def test_worker_overhead_env_override(monkeypatch, pytester):
+    monkeypatch.setenv("AIRA_AITEST_WORKER_OVERHEAD_BYTES", "1G")
+    items = pytester.getitems("def test_x(): pass")
+    supervisor = Supervisor()
+    assert supervisor._worker_overhead_bytes == 1 << 30
+    supervisor.collect(items)
+    assert supervisor.reservation_need[items[0].nodeid] == 1 << 30
+
+
+def test_worker_overhead_non_positive_floors_to_default(monkeypatch, capsys, pytester):
+    """A 0 (or negative) override must warn and floor to the default, never size
+    a worker to 0 bytes -- an unannotated claim of --estimated-bytes 0 is a
+    terminal argument-invalid that would drain the whole queue."""
+    monkeypatch.setenv("AIRA_AITEST_WORKER_OVERHEAD_BYTES", "0")
+    supervisor = Supervisor()
+    assert supervisor._worker_overhead_bytes == 512 << 20
+    assert "AIRA_AITEST_WORKER_OVERHEAD_BYTES" in capsys.readouterr().err
+    items = pytester.getitems("def test_x(): pass")
+    supervisor.collect(items)
+    assert supervisor.reservation_need[items[0].nodeid] == 512 << 20
+
+
+def test_largest_fitting_picks_greatest_need_within_budget():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100, "b": 300, "c": 200}
+    supervisor.queue = ["a", "b", "c"]
+    assert supervisor._largest_fitting(250, pop=False) == "c"
+    assert supervisor.queue == ["a", "b", "c"], "peek must not modify the queue"
+    assert supervisor.attempts == {}, "peek must not increment attempts"
+
+
+def test_largest_fitting_returns_none_when_smallest_exceeds_budget():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100, "b": 300}
+    supervisor.queue = ["a", "b"]
+    assert supervisor._largest_fitting(50, pop=False) is None
+
+
+def test_largest_fitting_pop_removes_and_increments_attempts():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100, "b": 300, "c": 200}
+    supervisor.queue = ["a", "b", "c"]
+    assert supervisor._largest_fitting(1000, pop=True) == "b"
+    assert supervisor.queue == ["a", "c"]
+    assert supervisor.attempts["b"] == 1, (
+        "pop must apply next_nodeid's attempts increment or the crash-retry-once "
+        "cap breaks (infinite requeue)"
+    )
+
+
+def test_smallest_ready_returns_nodeid_and_need():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 300, "b": 100, "c": 200}
+    supervisor.queue = ["a", "b", "c"]
+    assert supervisor._smallest_ready() == ("b", 100)
+    assert supervisor.queue == ["a", "b", "c"], "peek must not modify the queue"
