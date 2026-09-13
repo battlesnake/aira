@@ -310,6 +310,16 @@ def test_acquire_worker_maps_every_class_to_its_exception(tmp_path, monkeypatch,
         assert False, "expected %s" % expected.__name__
     except expected as exc:
         assert reason in str(exc), str(exc)
+        # AIRA-235: the outcome's reason token is carried as a plain ATTRIBUTE set
+        # after construction (never a constructor kwarg -- the map yields bare
+        # Exception subclasses with no reason param, so a kwarg would TypeError the
+        # common contended tick). Asserted here, through the REAL relay path, for
+        # every class -- this mutation-kills a kwarg regression and proves the
+        # exceeds-ceiling branch in the empty-pool bootstrap has a token to read.
+        assert getattr(exc, "reason", None) == reason, (
+            "the exception must carry the outcome's reason as .reason: got %r"
+            % getattr(exc, "reason", None)
+        )
     assert supervisor.daemon_available is True, "acquire_worker must not disable the daemon itself"
 
 
@@ -2174,7 +2184,15 @@ sys.stdin.buffer.read()
 def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_queue_terminal(tmp_path, monkeypatch, pytester):
     """The SAME post-run pass (not a per-site helper) must also cover
     _fail_queue_terminal's own unevaluated-marking: nodes still queued, never
-    even dispatched, after a permanent daemon sizing rejection."""
+    even dispatched, after a permanent daemon rejection.
+
+    AIRA-235: the refusal here is a NON-ceiling request-invalid
+    (worker-scope-create-failed), which still drains the WHOLE queue via
+    _fail_queue_terminal. An exceeds-ceiling refusal now takes the per-nodeid
+    path instead (test_empty_pool_ceiling_refusal_marks_only_that_nodeid_then_retries
+    in test_cpu_growth.py), so this test uses a non-ceiling terminal to keep
+    exercising the whole-queue _fail_queue_terminal -> synthesize coverage it exists
+    for."""
     outer = tmp_path / "outer"
     outer.mkdir()
     call_state = tmp_path / "admit-calls"
@@ -2191,7 +2209,7 @@ if count == 0:
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
-    print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
+    print("aira-worker-admit state=denied class=request-invalid reason=worker-scope-create-failed")
     sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
@@ -2222,7 +2240,7 @@ else:
     assert "unevaluated" in str(synthesized[0].longrepr)
     # The daemon's own permanent-rejection reason must survive into the
     # synthesized message rather than being flattened to a generic string.
-    assert "exceeds-ceiling" in str(synthesized[0].longrepr)
+    assert "worker-scope-create-failed" in str(synthesized[0].longrepr)
     # test_one really ran, so its own three real reports replayed and it must
     # NOT also get a synthesized one.
     real = [r for r in spy.reports if r.nodeid == by_name["test_one"].nodeid]
@@ -3225,9 +3243,11 @@ def test_worker_death_names_the_memory_cap_and_the_knob_when_the_scope_was_oom_k
     swap and its test PASSED; with memory.swap.max=0 that same worker is now
     group-killed, requeued once, and reported unevaluated. Turning a silent
     pass into an unevaluated is correct -- it is the containment this product
-    claims -- but only if the report says what to change. The per-worker cap is
-    a flat AIRA_AITEST_ESTIMATED_BYTES (512 MiB by default), so the remedy is a
-    single environment variable and the message must name it."""
+    claims -- but only if the report says what to change. Since S2b the cap is
+    per-test (overhead + @aira_mem), so the remedy depends on annotation: an
+    unannotated test's cap is the AIRA_AITEST_WORKER_OVERHEAD_BYTES overhead, and
+    the message must name the knob that actually helps -- never the dead
+    AIRA_AITEST_ESTIMATED_BYTES."""
     scope = tmp_path / "oom-killed-scope"
     scope.mkdir()
     (scope / "memory.events").write_text(
@@ -3236,7 +3256,8 @@ def test_worker_death_names_the_memory_cap_and_the_knob_when_the_scope_was_oom_k
     supervisor = Supervisor()
     reason = supervisor._describe_worker_death(4321, _death_state(scope))
     assert "memory.max=33554432" in reason
-    assert "AIRA_AITEST_ESTIMATED_BYTES" in reason
+    assert "AIRA_AITEST_WORKER_OVERHEAD_BYTES" in reason
+    assert "AIRA_AITEST_ESTIMATED_BYTES" not in reason
     assert "4321" in reason
 
 
@@ -3824,7 +3845,7 @@ def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, mon
 
     monkeypatch.setattr(supervisor_module.subprocess, "run", fake_run)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", "/usr/bin/aira")
-    monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", "104857600")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_OVERHEAD_BYTES", "104857600")
 
     supervisor = Supervisor(config=Config())
     supervisor._pool_scoped_workers = 2
@@ -3839,7 +3860,7 @@ def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, mon
     assert argv[:2] == ["/usr/bin/aira", "confine-report"]
     assert "--peak-rss" in argv and str(700 * 1024 * 1024) in argv
     assert "--budget" in argv and "104857600" in argv
-    assert "cap:aitest:env:set" in argv
+    assert "cap:aitest:overhead-env:set" in argv
     assert "--oom" in argv
 
     # An absent peak is simply not sent -- never sent as a zero.
@@ -3897,3 +3918,478 @@ def test_pool_spawns_past_the_excised_outer_cap_guard(tmp_path, monkeypatch):
     monkeypatch.setattr(sup, "acquire_worker", _reach)
     with pytest.raises(_ReachedAcquire):
         sup.spawn_worker(256 << 20)
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 (v0.7 S2b) — per-test reservation model, largest-first sizing.
+# ---------------------------------------------------------------------------
+
+
+def test_reservation_need_unannotated_is_the_overhead_default(pytester):
+    """An UNANNOTATED test reserves exactly the overhead (512 MiB) == today's
+    flat per-worker reserve: provably no regression."""
+    items = pytester.getitems("def test_x(): pass")
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    assert supervisor.reservation_need[items[0].nodeid] == 512 << 20
+    assert items[0].nodeid not in supervisor._annotated
+
+
+def test_reservation_need_annotated_adds_incremental_to_overhead(pytester):
+    items = pytester.getitems("""
+        import pytest
+        @pytest.mark.aira_mem("2G")
+        def test_big(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    nid = items[0].nodeid
+    assert nid in supervisor._annotated
+    assert supervisor.reservation_need[nid] == (2 << 30) + (512 << 20)
+
+
+def test_reservation_need_explicit_256M_is_annotated_not_mistaken_for_default(pytester):
+    """A marker whose value EQUALS the 256M measurement default must still be
+    ANNOTATED: presence comes from the marker object, never from comparing the
+    byte value to the default."""
+    items = pytester.getitems("""
+        import pytest
+        @pytest.mark.aira_mem("256M")
+        def test_mid(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    nid = items[0].nodeid
+    assert nid in supervisor._annotated
+    assert supervisor.reservation_need[nid] == (256 << 20) + (512 << 20)
+
+
+def test_reservation_need_malformed_marker_is_unannotated_512(pytester, capsys):
+    """A MALFORMED marker (present but unparseable) is NOT annotated: its byte
+    value is a fabricated default, so it reserves the overhead only (512), never
+    overhead+256."""
+    items = pytester.getitems("""
+        import pytest
+        @pytest.mark.aira_mem("not-a-size")
+        def test_bad(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    nid = items[0].nodeid
+    assert nid not in supervisor._annotated
+    assert supervisor.reservation_need[nid] == 512 << 20
+    assert "not a valid size" in capsys.readouterr().err
+
+
+def test_all_unannotated_queue_reserves_exactly_512_each(pytester):
+    items = pytester.getitems("""
+        def test_a(): pass
+        def test_b(): pass
+        def test_c(): pass
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    assert all(supervisor.reservation_need[i.nodeid] == 512 << 20 for i in items)
+
+
+def test_worker_overhead_env_override(monkeypatch, pytester):
+    monkeypatch.setenv("AIRA_AITEST_WORKER_OVERHEAD_BYTES", "1G")
+    items = pytester.getitems("def test_x(): pass")
+    supervisor = Supervisor()
+    assert supervisor._worker_overhead_bytes == 1 << 30
+    supervisor.collect(items)
+    assert supervisor.reservation_need[items[0].nodeid] == 1 << 30
+
+
+def test_worker_overhead_non_positive_floors_to_default(monkeypatch, capsys, pytester):
+    """A 0 (or negative) override must warn and floor to the default, never size
+    a worker to 0 bytes -- an unannotated claim of --estimated-bytes 0 is a
+    terminal argument-invalid that would drain the whole queue."""
+    monkeypatch.setenv("AIRA_AITEST_WORKER_OVERHEAD_BYTES", "0")
+    supervisor = Supervisor()
+    assert supervisor._worker_overhead_bytes == 512 << 20
+    assert "AIRA_AITEST_WORKER_OVERHEAD_BYTES" in capsys.readouterr().err
+    items = pytester.getitems("def test_x(): pass")
+    supervisor.collect(items)
+    assert supervisor.reservation_need[items[0].nodeid] == 512 << 20
+
+
+def test_largest_fitting_picks_greatest_need_within_budget():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100, "b": 300, "c": 200}
+    supervisor.queue = ["a", "b", "c"]
+    assert supervisor._largest_fitting(250, pop=False) == "c"
+    assert supervisor.queue == ["a", "b", "c"], "peek must not modify the queue"
+    assert supervisor.attempts == {}, "peek must not increment attempts"
+
+
+def test_largest_fitting_returns_none_when_smallest_exceeds_budget():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100, "b": 300}
+    supervisor.queue = ["a", "b"]
+    assert supervisor._largest_fitting(50, pop=False) is None
+
+
+def test_largest_fitting_pop_removes_and_increments_attempts():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100, "b": 300, "c": 200}
+    supervisor.queue = ["a", "b", "c"]
+    assert supervisor._largest_fitting(1000, pop=True) == "b"
+    assert supervisor.queue == ["a", "c"]
+    assert supervisor.attempts["b"] == 1, (
+        "pop must apply next_nodeid's attempts increment or the crash-retry-once "
+        "cap breaks (infinite requeue)"
+    )
+
+
+def test_smallest_ready_returns_nodeid_and_need():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 300, "b": 100, "c": 200}
+    supervisor.queue = ["a", "b", "c"]
+    assert supervisor._smallest_ready() == ("b", 100)
+    assert supervisor.queue == ["a", "b", "c"], "peek must not modify the queue"
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 — fit-filtered dispatch + retire-and-replace (Task 3).
+# ---------------------------------------------------------------------------
+
+
+def _confined_worker_state(reservation, dispatch_write_fd, result_fd):
+    return {
+        "result_fd": result_fd, "read_buffer": b"", "result_eof": False, "in_flight": None,
+        "dispatch_write": os.fdopen(dispatch_write_fd, "w"), "admit_process": None,
+        "grant": None, "reservation": reservation, "pidfd": None,
+    }
+
+
+def test_dispatch_hands_confined_worker_the_largest_fitting_test():
+    """A confined worker is handed the LARGEST ready test that fits its reservation;
+    an over-cap test stays queued."""
+    dispatch_read, dispatch_write = os.pipe()
+    os.set_blocking(dispatch_read, False)
+    result_read, result_write = os.pipe()
+    os.set_blocking(result_read, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = ["small", "mid", "big"]
+    supervisor.reservation_need = {"small": 100 << 20, "mid": 300 << 20, "big": 4 << 30}
+    # A worker sized to 500 MiB fits small (100M) and mid (300M), not big (4G).
+    supervisor.workers[777] = _confined_worker_state(500 << 20, dispatch_write, result_read)
+
+    supervisor._dispatch_to_idle_workers()
+
+    assert supervisor.workers[777]["in_flight"] == "mid", "the LARGEST FITTING test (mid), not big"
+    assert "mid" not in supervisor.queue
+    assert "big" in supervisor.queue, "the over-cap test stays queued for a bigger worker"
+    assert os.read(dispatch_read, 4096) == b"mid\n", "the worker's own pipe must carry the nodeid"
+    os.close(dispatch_read)
+    os.close(result_read)
+    os.close(result_write)
+
+
+def test_dispatch_retires_and_replaces_a_confined_worker_that_fits_nothing(monkeypatch):
+    """A confined worker that fits NO ready test, with work still queued, is
+    _retire_worker'd AND immediately _replace_worker'd so the freed quota is
+    repacked, not lost. The pool must not empty-and-exit with runnable work queued."""
+    dispatch_read, dispatch_write = os.pipe()
+    os.set_blocking(dispatch_read, False)
+    result_read, result_write = os.pipe()
+    os.set_blocking(result_read, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = ["big"]
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.workers[778] = _confined_worker_state(500 << 20, dispatch_write, result_read)
+
+    retired = []
+    replaced = []
+    monkeypatch.setattr(
+        supervisor, "_retire_worker",
+        lambda pid, state: (retired.append(pid), supervisor.workers.pop(pid, None)),
+    )
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: replaced.append(1))
+
+    supervisor._dispatch_to_idle_workers()
+
+    assert retired == [778], "a worker that fits no ready test must be retired"
+    assert replaced == [1], "and immediately replaced so the freed quota is repacked"
+    assert supervisor.queue == ["big"], "the too-big test stays queued for the replacement"
+    os.close(dispatch_read)
+    os.close(result_read)
+    os.close(result_write)
+
+
+def test_confined_dispatch_crash_twice_marks_unevaluated_after_one_requeue(monkeypatch):
+    """Proves _largest_fitting(pop=True) keeps next_nodeid's attempts increment: a
+    confined worker whose dispatch pipe is broken requeues the nodeid ONCE; its
+    replacement (also broken) marks it unevaluated on the SECOND attempt -- exactly
+    one requeue, never an infinite loop."""
+    nodeid = "pkg/test_mod.py::test_x"
+    dead_dr, dead_dw = os.pipe()
+    os.close(dead_dr)  # write -> BrokenPipe
+    dead_rr, dead_rw = os.pipe()
+    os.set_blocking(dead_rr, False)
+    repl_dr, repl_dw = os.pipe()
+    os.close(repl_dr)  # the replacement's pipe is broken too
+    repl_rr, repl_rw = os.pipe()
+    os.set_blocking(repl_rr, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = [nodeid]
+    supervisor.reservation_need = {nodeid: 100 << 20}
+    dead_pid = 999801
+    supervisor.workers[dead_pid] = _confined_worker_state(500 << 20, dead_dw, dead_rr)
+    repl_pid = 999802
+
+    def fake_spawn_worker(estimated_bytes, blocking=True):
+        supervisor.workers[repl_pid] = _confined_worker_state(500 << 20, repl_dw, repl_rr)
+        return repl_pid
+
+    monkeypatch.setattr(supervisor, "spawn_worker", fake_spawn_worker)
+
+    supervisor._dispatch_to_idle_workers()  # must not hang
+
+    assert supervisor.attempts[nodeid] == 2, (
+        "one dispatch to the dead worker, one to its replacement -- if _largest_fitting(pop=True) "
+        "skipped the attempts increment this would requeue forever"
+    )
+    assert supervisor.results.get(nodeid) == "unevaluated"
+    assert nodeid not in supervisor.queue
+    # _retire_worker already closed each worker's result_fd and dispatch_write; only
+    # the result WRITE ends are still ours, and closing an already-closed fd is EBADF.
+    for fd in (dead_rr, dead_rw, repl_rr, repl_rw):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def test_retired_confined_idle_worker_child_exits_on_dispatch_pipe_eof(monkeypatch):
+    """Retire-on-no-fit must actually make the idle worker EXIT: _retire_worker closes
+    its dispatch pipe and run_worker_loop's `for line in pipe_in` EOFs and returns.
+    Otherwise a retired worker orphans, holding a phantom lease. Forks a REAL worker
+    and confirms it is reaped PROMPTLY (an EOF-exit), well under the 30s
+    SIGKILL-after-timeout backstop."""
+    from aitest.worker import run_worker_loop
+
+    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "30")  # a prompt reap then PROVES EOF-exit
+    dispatch_read, dispatch_write = os.pipe()
+    result_read, result_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(dispatch_write)
+            os.close(result_read)
+            pipe_in = os.fdopen(dispatch_read, "r")
+            pipe_out = os.fdopen(result_write, "w")
+            run_worker_loop(None, {}, pipe_in, pipe_out)
+        except BaseException:
+            os._exit(70)
+        os._exit(0)
+    os.close(dispatch_read)
+    os.close(result_write)
+    os.set_blocking(result_read, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = ["big"]
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.workers[pid] = _confined_worker_state(500 << 20, dispatch_write, result_read)
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)  # isolate the retired worker
+
+    started = time.monotonic()
+    supervisor._dispatch_to_idle_workers()
+    elapsed = time.monotonic() - started
+
+    assert pid not in supervisor.workers, "the no-fit worker must be retired"
+    assert elapsed < 10, (
+        "the child must EOF-exit promptly on dispatch-pipe close, not be SIGKILLed after the "
+        "30s reap timeout (%.1fs elapsed)" % elapsed
+    )
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, 0)  # _retire_worker already reaped it
+    with contextlib.suppress(OSError):
+        os.close(result_read)  # _retire_worker already closed it
+
+
+def test_daemon_down_fallback_dispatches_an_annotated_test_without_fit_filtering(tmp_path, monkeypatch, pytester):
+    """A daemon-down fallback worker has reservation=None ("fits everything"): dispatch
+    must bypass the fit filter (no _largest_fitting, no KeyError, no retire loop), so
+    even a @aira_mem(4G) test whose reservation_need dwarfs any real worker still drains."""
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
+    monkeypatch.delenv("AIRA_AITEST_WORKER_ADMIT_CMD", raising=False)
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.aira_mem("4G")
+        def test_big():
+            assert True
+
+        def test_small():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    assert len(results) == 2
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is False
+
+
+def test_mixed_size_suite_all_pass_under_fit_filtered_dispatch(tmp_path, monkeypatch, pytester):
+    """End-to-end: a mixed-size annotated suite drains completely under fit-filtered
+    dispatch -- no test (large or small) is stranded unevaluated. The admit stub
+    grants each worker the size it requests."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.aira_mem("2G")
+        def test_big():
+            assert True
+
+        @pytest.mark.aira_mem("512M")
+        def test_mid():
+            assert True
+
+        def test_small_a():
+            assert True
+
+        def test_small_b():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values()), results
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 — fit-aware growth gate (_pool_covers_the_queue), Task 4.
+# ---------------------------------------------------------------------------
+
+
+def test_pool_covers_the_queue_too_small_worker_is_not_cover_for_a_big_test():
+    """The whole point: an idle 512 MiB worker does NOT cover a queued @aira_mem(4G)
+    test, so growth must not be blocked while the big test starves."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.queue = ["big"]
+    supervisor.workers = {1: {"in_flight": None, "reservation": 512 << 20}}
+    assert supervisor._pool_covers_the_queue() is False
+
+
+def test_pool_covers_the_queue_worker_that_fits_is_cover():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"mid": 256 << 20}
+    supervisor.queue = ["mid"]
+    supervisor.workers = {1: {"in_flight": None, "reservation": 512 << 20}}
+    assert supervisor._pool_covers_the_queue() is True
+
+
+def test_pool_covers_the_queue_unconfined_worker_covers_anything():
+    """A reservation=None (unconfined) worker has no memory.max, so it covers ANY
+    queued nodeid, however large."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.queue = ["big"]
+    supervisor.workers = {1: {"in_flight": None, "reservation": None}}
+    assert supervisor._pool_covers_the_queue() is True
+
+
+def test_pool_covers_the_queue_unknown_state_is_not_cover():
+    """The directional _UNKNOWN guard is kept: a worker whose state dict has not
+    reached its final shape (no in_flight key) must NOT be counted as cover."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100 << 20}
+    supervisor.queue = ["a"]
+    supervisor.workers = {1: {}}
+    assert supervisor._pool_covers_the_queue() is False
+
+
+def test_pool_covers_the_queue_matches_biggest_test_to_biggest_worker():
+    """Two idle workers of different sizes and two queued tests: covered only when a
+    distinct FITTING worker exists for each (Hall's condition), not by raw count."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"big": 4 << 30, "small": 100 << 20}
+    supervisor.queue = ["small", "big"]
+    # A 4G worker and a 512M worker: the 4G test needs the 4G worker, the small test
+    # takes the 512M worker -> covered.
+    supervisor.workers = {
+        1: {"in_flight": None, "reservation": 4 << 30},
+        2: {"in_flight": None, "reservation": 512 << 20},
+    }
+    assert supervisor._pool_covers_the_queue() is True
+    # But two 512M workers cannot cover the 4G test, even though the count matches.
+    supervisor.workers = {
+        1: {"in_flight": None, "reservation": 512 << 20},
+        2: {"in_flight": None, "reservation": 512 << 20},
+    }
+    assert supervisor._pool_covers_the_queue() is False
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 — turnover coexistence: the count/age recycle cap and the new
+# retire-on-no-fit path must coexist (neither double-frees a lease nor hangs),
+# under fit-filtered largest-first dispatch (Task 5).
+# ---------------------------------------------------------------------------
+
+
+def test_recycle_cap_coexists_with_fit_filtered_dispatch_mixed_sizes(tmp_path, monkeypatch, pytester):
+    """MAX_TESTS=1 forces a recycle after every test, so every worker goes through
+    _retire_worker + _replace_worker repeatedly, WHILE dispatch is fit-filtered and
+    workers are sized largest-first. If the age/count recycle path and retire-on-no-fit
+    double-freed a lease or stranded a test, this mixed-size suite would hang or leave a
+    test unevaluated. It must drain completely."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d-%d" % (os.getpid(), os.getppid()))
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")  # recycle after every test
+
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.aira_mem("2G")
+        def test_big():
+            assert True
+
+        @pytest.mark.aira_mem("512M")
+        def test_mid():
+            assert True
+
+        def test_small_a():
+            assert True
+
+        def test_small_b():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values()), results
+    assert supervisor.daemon_available is True

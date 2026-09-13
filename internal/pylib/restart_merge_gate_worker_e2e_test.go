@@ -322,6 +322,12 @@ func TestRestartMergeGateAitestPoolReanchorsAcrossRestart(t *testing.T) {
 		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 		"AIRA_AITEST_WORKER_ADMIT_CMD="+h.binary,
 		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(restartGatePytestReserve),
+		// AIRA-235: S2b sizes each worker from the reservation model
+		// (overhead + incremental), NOT AIRA_AITEST_ESTIMATED_BYTES (which now
+		// only feeds the growth probe placeholder). These fixtures are
+		// unannotated, so the per-worker size is exactly the overhead: pin it to
+		// the same reserve so the 768 MiB ceiling still fits the expected pool.
+		"AIRA_AITEST_WORKER_OVERHEAD_BYTES="+strconv.Itoa(restartGatePytestReserve),
 		"AIRA_REAL_CGROUP=1",
 		"AIRA_AITEST_RESTART_SENTINEL="+sentinel,
 		"AIRA_AITEST_RESTART_BLOCK_TIMEOUT=100",

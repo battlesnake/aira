@@ -146,6 +146,19 @@ asked about stands: "parent = ordinary confine job".**
 
 ## 5. Worker-held batch dispatch, prune-to-fit, and the age cap
 
+> **SUPERSEDED by S2b largest-first, see AIRA-235.** The owner dropped the batch. S2b
+> delivers per-test sizing scheduled **largest-first** with no batch object, no same-class
+> pull, and no size-classes: the growth path (`_try_grow_one`) sizes each new worker to the
+> largest ready test that fits the measured headroom, the empty-pool blocking claim
+> bootstraps from the *smallest* ready test, and dispatch is fit-filtered
+> (`_largest_fitting`) with retire-and-replace when an idle worker fits nothing. The
+> reservation is `overhead + incremental(nodeid)` per test, not `overhead + max(aira_mem
+> over the batch)`. The ~10 s age cap and generalised requeue described below do not apply
+> as written; the existing age cap stays and retire-on-no-fit covers the idle-forever case
+> instead. Read the S2b plan
+> (`docs/superpowers/plans/2026-09-13-aitest-v07-s2b-largest-first-plan.md`) for the
+> as-built design; this section is retained for history only.
+
 **As-built (the gap to close).** The current worker holds exactly one in-flight test and
 lazy-pulls one nodeid at a time from a supervisor-side flat FIFO; there is no worker-held
 batch, no same-class pull, no per-class sizing, and the age cap is 600 s. The only
@@ -191,6 +204,12 @@ kick-back, age-cap leftovers, and OOM-kill loss all re-queue nodeids. The existi
 
 ## 6. Daemon protocol: non-blocking try-acquire (protocol 11 → 12)
 
+> **SUPERSEDED by S2b largest-first, see AIRA-235.** No protocol bump: S2b stays on
+> **protocol 12** and adds no wire change. Largest-first is a pure supervisor change over
+> the existing non-blocking probe (`_probe_available`, the S15 snapshot) plus the existing
+> blocking claim — there is no restored "return headroom on refusal" try-acquire beyond the
+> snapshot already in the protocol. This section's 11 → 12 bump is not part of S2b.
+
 The supervisor's worker admit becomes **non-blocking**: the daemon either grants the
 reservation or refuses and **returns the current available headroom** for that slice, so
 the supervisor can prune to fit (§5) rather than block a forked worker on RAM. This is the
@@ -227,6 +246,13 @@ workload. Advisory only — it warns, never auto-resizes (auto-resize is the liv
 AIRA-178, owner-elevated and separate).
 
 ## 8. OOM-penalty phantom reservation (machine-wide back-pressure)
+
+> **SUPERSEDED by S2b largest-first, see AIRA-235.** S2b builds no phantom reservation and
+> no `aira confine` ledger-only release verb (§9): there is no phantom waiter and no
+> machine-wide OOM brake in this stage. A test the daemon refuses with reason
+> `exceeds-ceiling` is marked unevaluated for that one nodeid (per-nodeid, on the empty-pool
+> bootstrap) and popped; every other terminal drains the whole queue as today. This section
+> and §9 are retained for history only.
 
 **Rationale.** Reservations are sized from markers/defaults and can under-estimate. When a
 scope is OOM-killed, the naive retry would re-OOM at the same size. The daemon reacts to an

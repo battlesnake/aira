@@ -148,6 +148,15 @@ _UNKNOWN = object()
 # Overridable via AIRA_AITEST_DEFAULT_BYTES through the shared size grammar.
 _DEFAULT_ANNOTATION_BYTES = 256 << 20
 
+# AIRA-235 (v0.7 S2b). The per-worker warm-import OVERHEAD every worker reserves
+# on top of a test's declared INCREMENTAL aira_mem (spec 4.1: aira_mem is the peak
+# RSS increment above the warm-import baseline). 512 MiB == today's flat per-worker
+# reserve (_resolve_estimated_bytes, known not to OOM), so an UNANNOTATED worker
+# reserves exactly 512 (== today, provably no regression) and an annotated worker
+# reserves aira_mem + 512 >= today's reserve. Overridable via
+# AIRA_AITEST_WORKER_OVERHEAD_BYTES through the shared size grammar.
+_DEFAULT_WORKER_OVERHEAD_BYTES = 512 << 20
+
 
 def _env_bytes(name, default):
     """A byte-count tunable override using the shared AIRA_AITEST_ESTIMATED_BYTES
@@ -471,6 +480,19 @@ class WorkerPlacementFailed(Exception):
 
 _OUTCOME_MARKER = "aira-worker-admit"
 
+# AIRA-235. The one reason TOKEN the supervisor branches on structurally: the
+# empty-pool bootstrap treats a request-invalid carrying this reason as "this ONE
+# test cannot fit under the slice ceiling even alone" and marks only that nodeid
+# unevaluated, where every other terminal drains the whole queue. Mirrors Go's
+# runner.WorkerAdmitReasonExceedsCeiling; the vocabulary-lockstep test holds the two
+# equal so a rename on either side fails the build rather than silently disabling the
+# per-nodeid path. (ACCEPTED coverage gap, reviewer-signed: the daemon shares this
+# token between a static ">ceiling alone" and a jobs-scaled ">ceiling right now given
+# other sessions", so a runnable near-whole-slice test MAY be per-nodeid unevaluated
+# under cross-session contention -- no worse than today's flat-512 whole-queue drain
+# on the same axis, and splitting it would need a daemon change, out of scope.)
+WORKER_ADMIT_REASON_EXCEEDS_CEILING = "exceeds-ceiling"
+
 # The ci-shim outer-scope sentinel (runner.ShimConfineSlice). In shim mode there
 # is no cgroup and no AIRA_CONFINE_SCOPE_ID, so the bootstrap reports this as the
 # "outer" scope and a worker-admit sends it verbatim as parent_scope_id — the one
@@ -745,6 +767,14 @@ class Supervisor:
         # aira_mem marker (or the default). Built in collect(); DOCUMENTED-INERT
         # in S1 -- no admission consumer yet (plan D5). Empty until collect() runs.
         self.aira_mem_bytes = {}
+        # AIRA-235 (v0.7 S2b): per-nodeid RESERVATION need (overhead + incremental)
+        # and the set of nodeids carrying a real, well-formed aira_mem marker, both
+        # built in collect(). Empty until collect() runs; a nodeid absent from
+        # reservation_need falls back to the bare overhead (only test doubles that
+        # set self.queue directly, without collect(), reach that fallback).
+        self._worker_overhead_bytes = self._resolve_worker_overhead_bytes()
+        self._annotated = set()
+        self.reservation_need = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -772,6 +802,81 @@ class Supervisor:
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
         self._swap_cap_warned = False
+
+    def _resolve_worker_overhead_bytes(self):
+        """The warm-import OVERHEAD every worker reserves on top of a test's
+        declared incremental aira_mem. AIRA_AITEST_WORKER_OVERHEAD_BYTES overrides
+        the _DEFAULT_WORKER_OVERHEAD_BYTES default through the shared size grammar.
+
+        _env_bytes deliberately lets a parsed 0 through ("no band" is legitimate
+        for the branch-exit gate that uses it), so a non-positive result is floored
+        HERE with its own warning: sizing a worker to 0 bytes would make every
+        unannotated claim ask for --estimated-bytes 0, which the daemon refuses as
+        a terminal argument-invalid and which would drain the whole queue."""
+        overhead = _env_bytes("AIRA_AITEST_WORKER_OVERHEAD_BYTES", _DEFAULT_WORKER_OVERHEAD_BYTES)
+        if overhead <= 0:
+            sys.stderr.write(
+                "aira aitest: AIRA_AITEST_WORKER_OVERHEAD_BYTES=%r is not a positive "
+                "size; using the %d-byte default\n"
+                % (os.environ.get("AIRA_AITEST_WORKER_OVERHEAD_BYTES", ""),
+                   _DEFAULT_WORKER_OVERHEAD_BYTES)
+            )
+            return _DEFAULT_WORKER_OVERHEAD_BYTES
+        return overhead
+
+    def _need_for(self, nodeid):
+        """Bytes to reserve for a worker that will run `nodeid`: the warm-import
+        overhead plus the test's declared incremental aira_mem (0 when
+        unannotated). Falls back to the bare overhead for a nodeid collect() never
+        sized."""
+        return self.reservation_need.get(nodeid, self._worker_overhead_bytes)
+
+    def _largest_fitting(self, budget, *, pop):
+        """The ready (still-queued) nodeid whose reservation_need is the GREATEST
+        that still fits `budget` bytes, or None if none fit. Ties keep FIFO order
+        (the earliest-queued nodeid at the greatest fitting need).
+
+        pop=False PEEKS (queue and attempts untouched). pop=True removes the nodeid
+        from the queue AND applies next_nodeid's attempts increment
+        (self.attempts[nodeid] += 1) -- without that increment the crash-retry-once
+        cap (Task 15) breaks and a repeatedly-crashing nodeid requeues forever.
+
+        `budget` is always numeric: a None-reservation (unconfined) worker never
+        calls this -- its dispatch bypasses the fit filter entirely (Task 3)."""
+        best = None
+        best_need = -1
+        for nodeid in self.queue:
+            need = self._need_for(nodeid)
+            if need <= budget and need > best_need:
+                best = nodeid
+                best_need = need
+        if best is None:
+            return None
+        if pop:
+            self.queue.remove(best)
+            self.attempts[best] = self.attempts.get(best, 0) + 1
+        return best
+
+    def _smallest_ready(self):
+        """(nodeid, reservation_need) for the ready nodeid with the SMALLEST
+        reservation_need (FIFO among ties), or (None, 0) when the queue is empty.
+
+        The empty-pool blocking claim (Task 2) sizes itself to this `need` -- the
+        smallest ready test is the one most likely to fit minimal free room on a
+        saturated box -- and, if the daemon refuses it as exceeds-ceiling, marks and
+        pops THIS specific nodeid; a bare byte size would leave that catch site with
+        no nodeid to mark. If even the smallest ready test exceeds the ceiling,
+        every ready test does."""
+        best = None
+        best_need = None
+        for nodeid in self.queue:
+            need = self._need_for(nodeid)
+            if best_need is None or need < best_need:
+                best = nodeid
+                best_need = need
+        if best is None:
+            return None, 0
+        return best, best_need
 
     def bootstrap(self):
         """Read the launcher-published aitest coordinates (S2a). The confine
@@ -862,12 +967,32 @@ class Supervisor:
         from aitest import _aira_mem_bytes_for_item
         default_bytes = _env_bytes("AIRA_AITEST_DEFAULT_BYTES", _DEFAULT_ANNOTATION_BYTES)
         mem_map = {}
+        annotated = set()
+        reservation_need = {}
         for item in items:
             value, warning = _aira_mem_bytes_for_item(item, default_bytes)
             mem_map[item.nodeid] = value
             if warning is not None:
                 sys.stderr.write(warning)
+            # AIRA-235: a nodeid is ANNOTATED iff its item carries a real,
+            # WELL-FORMED aira_mem marker -- the marker OBJECT is present
+            # (get_closest_marker is not None) AND the reader accepted it
+            # (warning is None). Never inferred from the byte value: comparing to
+            # the 256 MiB default would misread an explicit @aira_mem(256M) as
+            # unannotated, and a MALFORMED marker (present but warning set) carries
+            # a fabricated default value, so it counts as UNANNOTATED (reserves the
+            # overhead only, 512, not overhead+256).
+            is_annotated = item.get_closest_marker("aira_mem") is not None and warning is None
+            if is_annotated:
+                annotated.add(item.nodeid)
+            # reservation = overhead + incremental(nodeid); incremental is the
+            # declared aira_mem iff annotated, else 0 (an unannotated worker
+            # reserves exactly the 512 MiB overhead == today's flat reserve).
+            incremental = value if is_annotated else 0
+            reservation_need[item.nodeid] = self._worker_overhead_bytes + incremental
         self.aira_mem_bytes = mem_map
+        self._annotated = annotated
+        self.reservation_need = reservation_need
 
     def next_nodeid(self):
         if not self.queue:
@@ -1050,9 +1175,18 @@ class Supervisor:
             # grantedness-agreement check guarantees class == "granted" iff
             # state == "granted", which this branch has already excluded.
             # That check is load-bearing for this line, not decorative.
-            raise _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](
+            exc = _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](
                 _describe_outcome(outcome, diagnostic)
             )
+            # AIRA-235: carry the outcome's reason token as a plain ATTRIBUTE, set
+            # AFTER construction -- NOT a constructor kwarg. The map yields bare
+            # Exception subclasses (WorkerAdmitDenied/Unavailable/PlacementFailed)
+            # with no reason parameter, so a kwarg would TypeError the common
+            # contended tick and crash run(). Callers branch on exc.reason (the
+            # empty-pool bootstrap's per-nodeid exceeds-ceiling handling); every
+            # exception raised elsewhere simply has no .reason, which reads as None.
+            exc.reason = outcome.get("reason")
+            raise exc
         containment = outcome.get("containment")
         grant, malformed = self._validate_grant(outcome, containment)
         if malformed is not None:
@@ -1179,7 +1313,9 @@ class Supervisor:
                 "worker-admit probe returned a grant, which a non-blocking snapshot "
                 "must never do: %s" % _describe_outcome(outcome)
             )
-        raise exception(_describe_outcome(outcome))
+        exc = exception(_describe_outcome(outcome))
+        exc.reason = outcome.get("reason")  # AIRA-235: reason as an attribute (see acquire_worker)
+        raise exc
 
     def _validate_grant(self, outcome, containment):
         """Return (grant, malformed_reason). malformed_reason is None exactly
@@ -1511,6 +1647,13 @@ class Supervisor:
             "admit_process": admit_process,
             "dispatch_write": os.fdopen(dispatch_write, "w"),
             "in_flight": None,
+            # AIRA-235: the byte budget this worker was SIZED to (the fit filter
+            # in _dispatch_to_idle_workers hands it only tests whose reservation_need
+            # fits this). The daemon grants the requested estimated_bytes VERBATIM
+            # (worker_admit.go reserves req.estimatedBytes directly), so this IS the
+            # worker's real cap; grant["memory_max"] is a STRING (and absent on a
+            # ledger-only grant), so estimated_bytes is the numeric authority here.
+            "reservation": estimated_bytes,
             # Opened only now, on the path where this worker is actually going
             # to be registered: every failure branch above has already reaped
             # the child, and a pidfd for a reaped pid is either invalid or --
@@ -1633,6 +1776,10 @@ class Supervisor:
             "read_buffer": b"",
             "result_eof": False,
             "in_flight": None,
+            # AIRA-235: an UNCONFINED fallback worker has no memory.max, so it
+            # "fits everything" -- reservation=None is the sentinel the fit filter,
+            # the growth gate and retire-on-no-fit all special-case (Tasks 3/4).
+            "reservation": None,
             # AIRA-40, exactly as on the confined path: this fork site needs
             # the independent liveness signal just as much -- a fallback worker
             # runs the same arbitrary test code, so it inherits the same
@@ -1688,7 +1835,35 @@ class Supervisor:
             for pid, state in list(self.workers.items()):
                 if state["in_flight"] is not None:
                     continue
-                nodeid = self.next_nodeid()
+                reservation = state.get("reservation")
+                if reservation is None:
+                    # AIRA-235: an UNCONFINED fallback worker (no memory.max) fits
+                    # everything -- bypass the fit filter and take the next queued
+                    # nodeid (next_nodeid keeps its own attempts increment); it is
+                    # never retired-on-no-fit. A missing "reservation" key reads as
+                    # None here too, but a real idle worker always has it: both
+                    # registration sites set it in the same state dict as in_flight,
+                    # so any worker idle enough to reach this branch is fully shaped.
+                    nodeid = self.next_nodeid()
+                else:
+                    # AIRA-235: a confined worker is handed the LARGEST ready test
+                    # that FITS its reservation (pop=True keeps next_nodeid's attempts
+                    # increment, so the crash-retry-once cap survives).
+                    nodeid = self._largest_fitting(reservation, pop=True)
+                    if nodeid is None and self.queue:
+                        # Nothing fits this worker but ready work remains: retire it
+                        # and immediately spawn a replacement so the freed quota is
+                        # REPACKED, not lost (mirror the recycle path's _retire_worker
+                        # + _replace_worker). Flag the pass so the while-True re-scan
+                        # dispatches to the fresh replacement THIS pass, exactly as the
+                        # BrokenPipe branch below does -- an idle worker holds ONE lease
+                        # for life and the ~10s age cap fires only after a completed
+                        # test, so a worker waiting for a nodeid it will never fittingly
+                        # get would otherwise sit forever.
+                        crashed_this_pass = True
+                        self._retire_worker(pid, state)
+                        self._replace_worker()
+                        continue
                 if nodeid is None:
                     continue
                 state["in_flight"] = nodeid
@@ -1808,9 +1983,10 @@ class Supervisor:
         self._pool_scoped_workers += 1
         memory_max = grant.get("memory_max")
         # The budget recorded is the cap the daemon actually WROTE on this
-        # worker's scope, not what was asked for. Max across the pool because
-        # every worker in a run is granted the same figure; a divergence would
-        # mean the run was not uniformly sized, and the larger cap is the one an
+        # worker's scope, not what was asked for. Since S2b workers are sized
+        # PER-TEST (overhead + @aira_mem), so the pool is heterogeneously capped;
+        # this reports the LARGEST per-worker cap in the pool -- a coarse
+        # pool-level gauge, not a per-test figure -- because that is the cap an
         # observed peak could actually have grown into.
         if isinstance(memory_max, int) and memory_max > 0:
             if self._pool_budget is None or memory_max > self._pool_budget:
@@ -1906,12 +2082,12 @@ class Supervisor:
         if self._pool_peak_max is not None:
             argv += ["--peak-rss", str(self._pool_peak_max)]
         if self._pool_budget is not None:
-            # The basis names where the REQUEST came from (Decision 3 deferred a
-            # durable project-scoped knob, so env is the only origin there is),
-            # while the value is the cap actually written. `cap:` because a
-            # worker's memory.max is a real kernel-enforced bound.
-            origin = "set" if os.environ.get("AIRA_AITEST_ESTIMATED_BYTES") else "default"
-            argv += ["--budget", str(self._pool_budget), "--budget-basis", "cap:aitest:env:" + origin]
+            # The basis names where the per-worker OVERHEAD came from (the
+            # per-test increment rides on top via @aira_mem); the value is the
+            # LARGEST cap actually written across the heterogeneous pool. `cap:`
+            # because a worker's memory.max is a real kernel-enforced bound.
+            origin = "set" if os.environ.get("AIRA_AITEST_WORKER_OVERHEAD_BYTES") else "default"
+            argv += ["--budget", str(self._pool_budget), "--budget-basis", "cap:aitest:overhead-env:" + origin]
         if self._pool_peak_oom:
             argv.append("--oom")
         try:
@@ -2127,13 +2303,24 @@ class Supervisor:
         if available is None:
             return False  # headroom transiently unestablished this tick
         available_bytes, available_cpu = available
-        if available_bytes < self._run_estimated_bytes or available_cpu < 1:
-            return False  # no room for another worker right now
+        if available_cpu < 1:
+            return False  # no CPU slot for another worker right now
+        # AIRA-235: largest-first. Size the new worker to the LARGEST ready test that
+        # FITS the measured headroom; big tests thus get sized workers as soon as room
+        # exists, small tests fill the remaining quota. _largest_fitting is now the
+        # SOLE byte-fit authority (it returns None when nothing fits), which is why the
+        # old flat `available_bytes < self._run_estimated_bytes` byte-floor gate is
+        # GONE: once AIRA_AITEST_WORKER_OVERHEAD_BYTES makes sub-512 needs reachable the
+        # old clause would falsely skip a growable tick. pop=False -- the queue is
+        # shrunk by the between-spawns dispatch, not here.
+        nodeid = self._largest_fitting(available_bytes, pop=False)
+        if nodeid is None:
+            return False  # no ready test fits the measured headroom this tick
         # Room a moment ago -> claim it with a BOUNDED read: a lost race (another job
         # took the room in the gap) times out to a denial and skips the tick, so a
         # growth claim can never freeze the single-threaded dispatch loop.
         try:
-            self.spawn_worker(self._run_estimated_bytes, blocking=False)
+            self.spawn_worker(self._need_for(nodeid), blocking=False)
             return True
         except WorkerAdmitDenied:
             return False
@@ -2145,6 +2332,57 @@ class Supervisor:
         except WorkerPlacementFailed as exc:
             self._disable_daemon(str(exc))  # local cgroup mechanism broken -> fall back
             return False
+
+    def _bootstrap_from_empty_pool(self):
+        """AIRA-235. Bootstrap progress from an EMPTY pool with a BLOCKING claim sized
+        to the SMALLEST ready test -- the one most likely to fit minimal free room on
+        a saturated/contended box. Shared by run()'s startup wait and _replace_worker's
+        last-worker case: both have no live worker to starve, so an unbounded blocking
+        claim is safe here where it would freeze the loop on the live-pool growth path.
+
+        This is the EMERGENCY bootstrap, not the largest-first mechanism: it ALWAYS
+        submits (never skips), which is what guarantees forward progress instead of
+        blocking forever on the biggest test while smaller runnable ones sit queued.
+        Once one worker runs, the growth path (_try_grow_one) takes over largest-first.
+
+        A daemon refusal of exceeds-ceiling means THIS one test cannot fit under the
+        slice ceiling even alone: mark only IT unevaluated (a ceiling-specific reason),
+        pop it, and retry the next-smallest -- the queue strictly shrinks, so this
+        terminates. Every OTHER terminal verdict (a non-ceiling request-invalid, or a
+        contract violation) still drains the WHOLE queue, exactly as before. The
+        isinstance guard keeps a WorkerAdmitContractViolation whole-queue even in the
+        (impossible today) event it carried the token."""
+        while self.daemon_available and not self.workers and self.queue:
+            nodeid, need = self._smallest_ready()
+            if nodeid is None:
+                return
+            try:
+                self._wait_for_admission_or_disable(
+                    lambda: self.spawn_worker(need, blocking=True)
+                )
+            except WorkerAdmitTerminal as exc:
+                if isinstance(exc, WorkerAdmitRequestInvalid) and \
+                        getattr(exc, "reason", None) == WORKER_ADMIT_REASON_EXCEEDS_CEILING:
+                    self.queue.remove(nodeid)
+                    self.results.setdefault(nodeid, "unevaluated")
+                    if nodeid in self._annotated:
+                        knob = "lower its @aira_mem or raise the slice ceiling"
+                    else:
+                        knob = (
+                            "it declares no @aira_mem, so this reservation is the "
+                            "per-worker overhead -- lower AIRA_AITEST_WORKER_OVERHEAD_BYTES, "
+                            "add an @aira_mem marker, or raise the slice ceiling"
+                        )
+                    self._unevaluated_reasons.setdefault(
+                        nodeid,
+                        "the daemon refused this test's memory reservation (%d bytes): "
+                        "it exceeds the slice ceiling. If the slice is busy this may "
+                        "clear with less concurrent load; otherwise %s" % (need, knob),
+                    )
+                    continue
+                self._fail_queue_terminal(str(exc))
+                return
+            return  # a worker now exists, or the daemon was disabled during the wait
 
     def _replace_worker(self):
         """Acquire a fresh worker if queue work remains -- shared by the recycle and
@@ -2168,18 +2406,22 @@ class Supervisor:
         if self.daemon_available:
             if self.workers:
                 # Other workers are still dispatching: a speculative probe-then-claim,
-                # never a blocking claim that would freeze the loop.
+                # never a blocking claim that would freeze the loop. Skip the grow if
+                # the live pool already covers every ready nodeid -- else several
+                # no-fit retirements in one dispatch pass each spawn a replacement for
+                # the same oversized test, leaving surplus workers holding reservations
+                # with no work (the same cover guard run()'s fill loop uses).
+                if self._pool_covers_the_queue():
+                    return
                 self._try_grow_one()
                 return
-            try:
-                self._wait_for_admission_or_disable(
-                    lambda: self.spawn_worker(self._run_estimated_bytes, blocking=True)
-                )
-            except WorkerAdmitTerminal as exc:
-                self._fail_queue_terminal(str(exc))
-                return
+            # Empty pool: bootstrap progress with a blocking claim sized to the
+            # SMALLEST ready test (AIRA-235). The helper marks-and-drains terminals
+            # itself, so on return either a worker exists, or the daemon was disabled
+            # (fall through to the fallback spawn), or the queue was drained.
+            self._bootstrap_from_empty_pool()
             if self.daemon_available:
-                return  # the wait succeeded -- a confined worker now exists
+                return  # a worker now exists, or the queue was drained to unevaluated
             # else: the wait's own WorkerAdmitUnavailable/WorkerPlacementFailed branch
             # already called _disable_daemon -- fall through to the fallback spawn
             # rather than leave the pool empty with queue work still undone.
@@ -2535,10 +2777,12 @@ class Supervisor:
         same worker is now group-killed, requeued once, and reported
         unevaluated. Turning a silent pass into an unevaluated is correct --
         it is the containment this product claims -- but only if the report
-        says which limit was hit and which knob raises it. The per-worker cap
-        is a flat AIRA_AITEST_ESTIMATED_BYTES (512 MiB by default; per-suite
-        history-based sizing is still deferred), so the remedy is a single
-        environment variable.
+        says which limit was hit and which knob raises it. Since S2b the cap is
+        per-test: overhead (AIRA_AITEST_WORKER_OVERHEAD_BYTES, 512 MiB default)
+        plus the test's own @aira_mem increment. So the remedy depends on whether
+        the test is annotated -- raise its @aira_mem marker, else raise the
+        overhead knob / add a marker. AIRA_AITEST_ESTIMATED_BYTES no longer sizes
+        workers, so the message must never name it.
 
         Attribution is sound because memory.events counters are per-scope and
         propagate only upward: oom_group_kill > 0 on THIS scope means THIS
@@ -2566,10 +2810,18 @@ class Supervisor:
         # would be worse than a vague true one.
         if not _scope_oom_group_killed(scope):
             return generic
+        if state.get("in_flight") in self._annotated:
+            remedy = "raise its @aira_mem marker (or the slice ceiling)"
+        else:
+            remedy = (
+                "this test declares no @aira_mem, so its cap is the per-worker "
+                "overhead -- raise AIRA_AITEST_WORKER_OVERHEAD_BYTES or add an "
+                "@aira_mem marker"
+            )
         return (
             "worker %d was killed by its own per-worker memory cap "
-            "(memory.max=%s bytes; raise AIRA_AITEST_ESTIMATED_BYTES), and the "
-            "one retry was too" % (pid, grant.get("memory_max", "unknown"))
+            "(memory.max=%s bytes); %s, and the one retry was too"
+            % (pid, grant.get("memory_max", "unknown"), remedy)
         )
 
     def _service_ready_workers(self, ready, result_fd_owners, pidfd_owners):
@@ -2668,11 +2920,27 @@ class Supervisor:
         function must not fail in. Inert today (both registration sites set
         in_flight before publishing the state), and it stays inert by
         construction rather than by convention."""
-        idle = sum(
-            1 for state in self.workers.values()
+        # AIRA-235: fit-aware. "Every ready nodeid can be run by some idle worker that
+        # FITS it" is a bipartite matching -- a distinct fitting idle worker per queued
+        # nodeid. A too-small idle worker used to count as cover for a big queued test
+        # (a pure count), blocking growth while that test starved. The `_UNKNOWN`
+        # directional guard stays: a state not in its final shape is NOT idle.
+        idle_caps = [
+            state.get("reservation") for state in self.workers.values()
             if state.get("in_flight", _UNKNOWN) is None
-        )
-        return idle >= len(self.queue)
+        ]
+        if len(self.queue) > len(idle_caps):
+            return False
+        needs = sorted((self._need_for(nodeid) for nodeid in self.queue), reverse=True)
+        # A worker with reservation is None (unconfined fallback) has no memory.max, so
+        # it fits ANY nodeid -- sort it as +infinity so it is matched to the biggest need.
+        caps = sorted(idle_caps, key=lambda c: float("inf") if c is None else c, reverse=True)
+        # Hall's condition, both sorted DESCENDING: a distinct fitting worker exists for
+        # every queued nodeid iff the i-th largest need fits the i-th largest cap.
+        for need, cap in zip(needs, caps):
+            if cap is not None and cap < need:
+                return False
+        return True
 
     def run(self, estimated_bytes, worker_count=1):
         """Slice 1's whole dispatch loop: spawn up to worker_count workers,
@@ -2687,34 +2955,38 @@ class Supervisor:
         self._run_estimated_bytes = estimated_bytes
         self._run_worker_count = worker_count
         if self.daemon_available:
-            # Fill the pool as fast as admission allows, sizing each slot from a probe
-            # snapshot (S16). _try_grow_one is LIVE-POOL SAFE: a transient dial failure
-            # during a daemon restart is a skipped tick, never a disable. It returns
-            # False on no-room, a skipped transient, or a terminal it already drained
-            # the queue for -- any of which ends the fill; the empty-pool wait below
-            # then covers the case where nothing at all got admitted.
+            # Fill the pool as fast as admission allows, sizing each slot LARGEST-FIRST
+            # from a probe snapshot (AIRA-235: _try_grow_one sizes to the largest ready
+            # test that fits the measured headroom). _try_grow_one is LIVE-POOL SAFE: a
+            # transient dial failure during a daemon restart is a skipped tick, never a
+            # disable. It returns False on no-room, a skipped transient, or a terminal
+            # it already drained the queue for -- any of which ends the fill; the
+            # empty-pool wait below then covers the case where nothing at all got
+            # admitted.
             for _ in range(worker_count):
                 if self._pool_covers_the_queue():
                     break
                 if not self._try_grow_one():
                     break
+                # AIRA-235: dispatch BETWEEN spawns so the queue shrinks and the next
+                # _try_grow_one sizes to the next-largest UNCOVERED test -- otherwise
+                # every worker is over-reserved to the global-largest test (a
+                # concurrency regression). _try_grow_one's own `if not self.queue`
+                # guard then preserves the AIRA-37 no-surplus property.
+                self._dispatch_to_idle_workers()
             # With ZERO workers admitted and queue work remaining there is no later
             # retirement to hook a retry off of (_replace_worker only fires when an
             # existing worker retires), and _try_grow_one's probe never disables -- so a
-            # genuinely-down daemon has not been detected yet. Wait it out with a
-            # BLOCKING claim (empty pool, nothing to starve): it grants once the daemon
-            # has room, rides out a restart via retry-on-contended, or disables on a
-            # true dial failure and falls through to the fallback below (spec 3.7; a
-            # daemon that stays saturated forever means this run genuinely waits
-            # forever, which is the honest outcome, never a silent degrade to
+            # genuinely-down daemon has not been detected yet. Bootstrap it with a
+            # BLOCKING claim sized to the SMALLEST ready test (empty pool, nothing to
+            # starve): it grants once the daemon has room, rides out a restart via
+            # retry-on-contended, per-nodeid-drains an exceeds-ceiling test then retries
+            # the next, or disables on a true dial failure and falls through to the
+            # fallback below (spec 3.7; a daemon that stays saturated forever means this
+            # run genuinely waits forever, the honest outcome, never a silent degrade to
             # unconfined).
             if self.daemon_available and not self.workers and self.queue:
-                try:
-                    self._wait_for_admission_or_disable(
-                        lambda: self.spawn_worker(estimated_bytes, blocking=True)
-                    )
-                except WorkerAdmitTerminal as exc:
-                    self._fail_queue_terminal(str(exc))
+                self._bootstrap_from_empty_pool()
         if not self.daemon_available:
             # Cap TOTAL concurrent workers (already-admitted + fallback) at
             # the configured pool size -- min(worker_count,

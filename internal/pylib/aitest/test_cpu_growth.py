@@ -41,6 +41,7 @@ class _RecordingSupervisor(Supervisor):
         self.claim_script = list(claim_script or [])
         self.probe_calls = 0
         self.claim_blocking = []  # the `blocking` flag of each spawn_worker call
+        self.claim_bytes = []  # AIRA-235: the estimated_bytes each claim was sized to
         self._fake_pid = 0
 
     def _probe_available(self):
@@ -52,13 +53,33 @@ class _RecordingSupervisor(Supervisor):
 
     def spawn_worker(self, estimated_bytes, blocking=True):
         self.claim_blocking.append(blocking)
+        self.claim_bytes.append(estimated_bytes)
         outcome = self.claim_script.pop(0) if self.claim_script else "grant"
         if outcome == "deny":
             raise WorkerAdmitDenied("worker-admit state=denied class=contended reason=contended")
         if outcome == "terminal":
             raise WorkerAdmitRequestInvalid("worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
+        if outcome == "ceiling":
+            # AIRA-235: a request-invalid carrying the exceeds-ceiling reason as the
+            # ATTRIBUTE the real acquire_worker sets after construction. The
+            # empty-pool bootstrap branches on getattr(exc, "reason", None).
+            exc = WorkerAdmitRequestInvalid(
+                "worker-admit state=denied class=request-invalid reason=exceeds-ceiling"
+            )
+            exc.reason = "exceeds-ceiling"
+            raise exc
+        if outcome == "terminal-other":
+            # A NON-ceiling request-invalid: the whole queue must still drain.
+            exc = WorkerAdmitRequestInvalid(
+                "worker-admit state=denied class=request-invalid reason=worker-scope-create-failed"
+            )
+            exc.reason = "worker-scope-create-failed"
+            raise exc
         self._fake_pid += 1
-        self.workers[self._fake_pid] = {"in_flight": None, "grant": {}, "admit_process": None}
+        self.workers[self._fake_pid] = {
+            "in_flight": None, "grant": {}, "admit_process": None,
+            "reservation": estimated_bytes,
+        }
         return self._fake_pid
 
 
@@ -67,6 +88,10 @@ def _ready_supervisor(probe_script=None, claim_script=None, worker_count=4, queu
     supervisor.daemon_available = True
     supervisor._run_worker_count = worker_count
     supervisor._run_estimated_bytes = 1 << 20
+    # AIRA-235: these tests set self.queue directly (no collect()), so give the
+    # fit filter a small per-worker overhead -- otherwise _largest_fitting(64 MiB
+    # _ROOM) would find no ready test fitting the default 512 MiB overhead.
+    supervisor._worker_overhead_bytes = 1 << 20
     supervisor.queue = ["t%d" % i for i in range(queued)]
     return supervisor
 
@@ -120,6 +145,21 @@ def test_replacement_is_speculative_while_other_workers_survive():
     assert supervisor.claim_blocking == [False], (
         "with a live worker still dispatching, a replacement must not block the loop"
     )
+
+
+# verifies: AIRA-235 -- a replacement with OTHER workers alive must SKIP growth when the
+# live pool already covers every ready nodeid; else several no-fit retirements in one
+# dispatch pass each spawn a replacement for the same test, leaving surplus workers
+# holding reservations with no work (build-review wf_9f54130b).
+def test_replacement_skips_growth_when_the_live_pool_already_covers_the_queue():
+    supervisor = _ready_supervisor(probe_script=[_ROOM], claim_script=["grant"], queued=0)
+    supervisor.queue = ["t0"]
+    supervisor.reservation_need = {"t0": 2 << 20}
+    supervisor.workers[999] = {"in_flight": None, "reservation": 4 << 20}  # idle, fits t0
+    supervisor._replace_worker()
+    assert supervisor.probe_calls == 0, "a covered pool must not probe for a surplus worker"
+    assert supervisor.claim_blocking == [], "a covered pool must not spawn a surplus replacement"
+    assert 999 in supervisor.workers and len(supervisor.workers) == 1, "no surplus worker added"
 
 
 # verifies: S16 -- the last-worker case waits with a BLOCKING claim rather than
@@ -285,3 +325,110 @@ def test_acquire_worker_surfaces_cpu_slots_from_a_real_outcome_line(tmp_path, mo
     finally:
         process.stdin.close()
         process.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 (v0.7 S2b) — largest-first spawn sizing.
+# ---------------------------------------------------------------------------
+
+
+# verifies: AIRA-235 -- opportunistic growth sizes the new worker to the LARGEST
+# ready test that fits the measured headroom, and skips the tick when nothing fits.
+def test_opportunistic_growth_sizes_to_the_largest_fitting_test():
+    supervisor = _ready_supervisor(probe_script=[_ROOM], claim_script=["grant"], queued=0)
+    supervisor.queue = ["small", "big", "mid"]
+    supervisor.reservation_need = {"small": 8 << 20, "big": 40 << 20, "mid": 16 << 20}
+    assert supervisor._maybe_grow_pool() is True
+    assert supervisor.claim_bytes == [40 << 20], (
+        "the new worker must be sized to the LARGEST ready test that fits the 64 MiB "
+        "headroom, not the run estimate or the smallest"
+    )
+
+
+# verifies: AIRA-235 -- when NO ready test fits the measured headroom, the growth
+# tick is skipped (returns False), replacing the old flat byte-floor gate.
+def test_opportunistic_growth_skips_when_nothing_fits_the_headroom():
+    supervisor = _ready_supervisor(probe_script=[_ROOM], claim_script=["grant"], queued=0)
+    supervisor.queue = ["huge"]
+    supervisor.reservation_need = {"huge": 4 << 30}  # >> the 64 MiB _ROOM
+    assert supervisor._maybe_grow_pool() is False
+    assert supervisor.claim_bytes == [], "nothing fits -> no claim is issued this tick"
+
+
+# verifies: AIRA-235 -- the startup fill dispatches between spawns, so the SECOND
+# worker is sized to the next-largest UNCOVERED test, never the global-largest twice.
+def test_startup_fill_dispatches_between_spawns_sizing_each_to_the_next_largest():
+    supervisor = _ready_supervisor(
+        probe_script=[_ROOM, _ROOM], claim_script=["grant", "grant"], worker_count=2, queued=0,
+    )
+    supervisor.queue = ["small", "big", "mid"]
+    supervisor.reservation_need = {"small": 8 << 20, "big": 40 << 20, "mid": 16 << 20}
+
+    # A faithful stand-in for Task 3's fit-filtered dispatch: hand each idle worker
+    # the LARGEST ready test that fits its reservation and mark it busy. Without the
+    # between-spawns dispatch the queue would not shrink and BOTH workers would size
+    # to "big".
+    def fit_dispatch():
+        for _pid, state in list(supervisor.workers.items()):
+            if state.get("in_flight") is not None:
+                continue
+            nid = supervisor._largest_fitting(state["reservation"], pop=True)
+            if nid is not None:
+                state["in_flight"] = nid
+
+    supervisor._dispatch_to_idle_workers = fit_dispatch
+
+    # Exactly run()'s startup fill loop.
+    for _ in range(supervisor._run_worker_count):
+        if supervisor._pool_covers_the_queue():
+            break
+        if not supervisor._try_grow_one():
+            break
+        supervisor._dispatch_to_idle_workers()
+
+    assert supervisor.claim_bytes == [40 << 20, 16 << 20], (
+        "first worker sized to the biggest test (40M), second to the next-largest (16M) "
+        "after dispatch shrank the queue -- NOT the global-largest twice"
+    )
+
+
+# verifies: AIRA-235 -- an EMPTY pool submits a BLOCKING claim sized to the SMALLEST
+# ready test (never skipped), even when a bigger test is also queued. Largest-first
+# is the growth path's job; the blocking claim only bootstraps progress.
+def test_empty_pool_blocking_claim_is_sized_to_the_smallest_ready_test():
+    supervisor = _ready_supervisor(claim_script=["grant"], queued=0)
+    supervisor.queue = ["small", "big"]
+    supervisor.reservation_need = {"small": 100 << 20, "big": 4 << 30}
+    supervisor.workers = {}  # empty pool -> the blocking-claim bootstrap path
+    supervisor._replace_worker()
+    assert supervisor.claim_blocking == [True], "an empty pool must submit a BLOCKING claim, never skip"
+    assert supervisor.probe_calls == 0, "the empty-pool bootstrap must not probe"
+    assert supervisor.claim_bytes == [100 << 20], "sized to the SMALLEST ready need, not the largest"
+
+
+# verifies: AIRA-235 -- a ceiling refusal marks ONLY that nodeid unevaluated, pops
+# it, and retries the next-smallest; the queue strictly shrinks so it terminates.
+def test_empty_pool_ceiling_refusal_marks_only_that_nodeid_then_retries():
+    supervisor = _ready_supervisor(claim_script=["ceiling", "grant"], queued=0)
+    supervisor.queue = ["refused", "ok"]
+    supervisor.reservation_need = {"refused": 100 << 20, "ok": 4 << 30}
+    supervisor.workers = {}
+    supervisor._replace_worker()
+    assert supervisor.results.get("refused") == "unevaluated"
+    assert "refused" not in supervisor.queue
+    assert "exceeds the slice ceiling" in supervisor._unevaluated_reasons["refused"]
+    assert "ok" not in supervisor.results, "a fitting test must NOT be drained by another's ceiling refusal"
+    assert len(supervisor.workers) == 1, "the retry admitted a worker for the next-smallest test"
+
+
+# verifies: AIRA-235 -- a NON-ceiling terminal (e.g. worker-scope-create-failed) on
+# the empty-pool claim still drains the WHOLE queue, exactly as today.
+def test_empty_pool_non_ceiling_terminal_drains_the_whole_queue(capsys):
+    supervisor = _ready_supervisor(claim_script=["terminal-other"], queued=0)
+    supervisor.queue = ["a", "b", "c"]
+    supervisor.reservation_need = {"a": 100 << 20, "b": 200 << 20, "c": 300 << 20}
+    supervisor.workers = {}
+    supervisor._replace_worker()
+    assert all(supervisor.results.get(n) == "unevaluated" for n in ("a", "b", "c"))
+    assert supervisor.queue == [], "a non-ceiling terminal drains the WHOLE queue, not per-nodeid"
+    assert "cannot be admitted" in capsys.readouterr().err
