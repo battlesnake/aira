@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/runner"
 	"aira/internal/testdeadline"
 )
 
@@ -252,4 +253,249 @@ func reportSamples(t *testing.T, report map[string]interface{}) []map[string]int
 		out = append(out, sample)
 	}
 	return out
+}
+
+// readCgroupProcs returns the PIDs currently in a cgroup scope's cgroup.procs.
+// A non-empty result on a worker scope is positive proof the scope is POPULATED
+// (a live process is running its test there), which is what makes the parent-kill
+// gate's orphan check meaningful — a kill of an already-empty scope would prove
+// nothing.
+func readCgroupProcs(dir string) []int {
+	data, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		if pid, convErr := strconv.Atoi(line); convErr == nil {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// processAlive reports whether a pid is a live process (signal 0 probe). Used
+// only as corroboration of the primary "scope dir is gone" proof — pid reuse
+// makes it weaker, so the dir-removal check is authoritative (rmdir requires an
+// empty cgroup, so a removed worker scope PROVES no process survived in it).
+func processAlive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+// waitScopePopulated polls a worker scope's cgroup.procs until it holds at least
+// one process (the worker forked in the parent leaf and place_self'd into its
+// sibling scope, then pulled a nodeid and began its blocked test — a small window
+// after the lease is established). Returns the pids, or fails if the scope never
+// populates.
+func waitScopePopulated(t *testing.T, dir string, timeout time.Duration) []int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if pids := readCgroupProcs(dir); len(pids) > 0 {
+			return pids
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("worker scope %q never became populated (no process migrated into it) — cannot prove orphan cleanup on an empty scope", dir)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// populatedWorkerScope is one live worker sibling scope captured before the
+// parent kill: its directory (WorkerScopeChildPath == <slice>/.aira-<id>) and the
+// pids it held while populated.
+type populatedWorkerScope struct {
+	id   string
+	dir  string
+	pids []int
+}
+
+// capturePopulatedWorkerScopes waits for each granted worker lease's sibling scope
+// to become populated and records its dir + pids — the pre-kill state the orphan
+// check is asserted against.
+func capturePopulatedWorkerScopes(t *testing.T, leases map[string]int64, slice string) []populatedWorkerScope {
+	t.Helper()
+	out := make([]populatedWorkerScope, 0, len(leases))
+	for id := range leases {
+		dir := runner.WorkerScopeChildPath(slice, id)
+		pids := waitScopePopulated(t, dir, testdeadline.Wait(15*time.Second))
+		out = append(out, populatedWorkerScope{id: id, dir: dir, pids: pids})
+	}
+	return out
+}
+
+// assertNoOrphanAfterParentKill cgroup.kills the outer (parent) scope — which
+// kills the supervisor and its relays, EOFing every worker-admit relay connection
+// — then polls until every worker scope directory is GONE (the daemon
+// cgroup.kill+rmdir'd it on the relay's peer-EOF, §16b) and every captured worker
+// pid is dead. A directory that stays is a leaked worker scope: the exact orphan
+// §16b exists to prevent. The daemon must be ALIVE at kill time (its peer-EOF
+// hook does the kill), so callers keep the server running across this call.
+func assertNoOrphanAfterParentKill(t *testing.T, outer string, workers []populatedWorkerScope) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(outer, "cgroup.kill"), []byte("1"), 0o644); err != nil {
+		t.Fatalf("cgroup.kill the parent (outer) scope %q: %v", outer, err)
+	}
+	deadline := time.Now().Add(testdeadline.Wait(25 * time.Second))
+	for {
+		remaining := []string{}
+		for _, w := range workers {
+			if _, err := os.Stat(w.dir); !os.IsNotExist(err) {
+				remaining = append(remaining, w.dir)
+			}
+		}
+		if len(remaining) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the parent kill %d worker scope dir(s) were NOT removed — the daemon did not "+
+				"kill+rmdir them on peer-EOF (orphaned workers, §16b regressed): %v", len(remaining), remaining)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Corroboration: every process we saw in a worker scope is now dead. (The
+	// dir-removal above is the authoritative proof — rmdir needs an empty cgroup.)
+	for _, w := range workers {
+		for _, pid := range w.pids {
+			if processAlive(pid) {
+				t.Fatalf("worker %s process %d survived the parent kill (its scope dir was removed but the pid is still alive — pid reuse, or a real leak)", w.id, pid)
+			}
+		}
+	}
+}
+
+// startBlockingAitestPool launches a real pytest aitest pool whose fixture tests
+// BLOCK on a never-created sentinel, so the workers stay populated (mid-test) —
+// the state the parent-kill orphan gate requires. Returns the run channel; the
+// caller cancels the run in cleanup (the pool is killed, not released).
+func startBlockingAitestPool(t *testing.T, h *restartGateHarness, runCtx context.Context, workers int) chan runOutcome {
+	t.Helper()
+	// A sentinel path that is NEVER created: every fixture test blocks on it until
+	// the generous inner timeout, so the workers are populated when we kill.
+	sentinel := filepath.Join(t.TempDir(), "never-released")
+	command := exec.CommandContext(runCtx, h.pytest, "-q", "--aitest-workers="+strconv.Itoa(workers))
+	command.Dir = filepath.Join(h.aitestDir, "restart_gate_testdata")
+	command.WaitDelay = 15 * time.Second
+	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(h.outerFile.Fd())}
+	command.Env = append(environForRealDaemonAitest(),
+		"PYTHONPATH="+filepath.Dir(h.aitestDir),
+		"PYTHONDONTWRITEBYTECODE=1",
+		"AIRA_AITEST_LIB="+h.pythonDir,
+		"AIRA_AITEST_OUTER_SCOPE="+h.outer,
+		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
+		"AIRA_AITEST_WORKER_ADMIT_CMD="+h.binary,
+		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(restartGatePytestReserve),
+		"AIRA_REAL_CGROUP=1",
+		"AIRA_AITEST_RESTART_SENTINEL="+sentinel,
+		"AIRA_AITEST_RESTART_BLOCK_TIMEOUT=120",
+	)
+	runCh := make(chan runOutcome, 1)
+	go func() {
+		out, err := command.CombinedOutput()
+		runCh <- runOutcome{out, err}
+	}()
+	return runCh
+}
+
+// TestRealPytestAitestParentKillLeavesNoOrphanFresh is Gate D (fresh path, P1-1):
+// with two workers populated mid-test, killing the parent (cgroup.kill the outer
+// scope, which kills the supervisor + relays) must leave NO orphaned worker — the
+// daemon cgroup.kills + rmdirs each sibling worker scope on the relay's peer-EOF.
+//
+// Mutation: comment out `s.killWorkerScope(path, scopeID)` in worker_admit.go's
+// fresh relay peer-EOF branch (~:549) → the worker scope dir is never removed →
+// this gate reds (orphan). Recorded in the build report.
+func TestRealPytestAitestParentKillLeavesNoOrphanFresh(t *testing.T) {
+	h := newRestartGateHarness(t, true)
+	serverA, cancelA, doneA := h.startServer(t)
+	defer func() { cancelA(); awaitServerShutdown(t, doneA) }()
+
+	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Minute))
+	defer cancelRun()
+	runCh := startBlockingAitestPool(t, h, runCtx, 2)
+
+	leasesA := waitLeaseCount(t, serverA, 2, testdeadline.Wait(45*time.Second), runCh)
+	if len(leasesA) != 2 {
+		cancelRun()
+		o := <-runCh
+		t.Fatalf("pool did not fill to 2 worker leases (got %d: %v)\n%s", len(leasesA), leasesA, o.output)
+	}
+	workers := capturePopulatedWorkerScopes(t, leasesA, h.parent)
+
+	assertNoOrphanAfterParentKill(t, h.outer, workers)
+
+	// The run was killed with the parent; drain it so the goroutine does not leak.
+	cancelRun()
+	select {
+	case <-runCh:
+	case <-testdeadline.After(20 * time.Second):
+	}
+}
+
+// TestRealPytestAitestParentKillLeavesNoOrphanPostRestart is Gate D (post-restart
+// path, P1-A): the SAME orphan-free guarantee must hold after a daemon restart.
+// Two workers fill on A; A is restarted to B; the survivors' relay keepers
+// reconnect and RE-DECLARE into B (serveReDeclare); THEN the parent is killed —
+// and B must kill+rmdir the re-declared workers' scopes on the re-declare
+// connection's peer-EOF. This exercises serveReDeclare's kill hook, which the
+// fresh path does not.
+//
+// Mutation: comment out `s.killWorkerScope(path, charge.ScopeID)` in
+// serveReDeclare's peer-EOF branch (server.go ~:1066) → after the restart the
+// re-declared worker scopes are orphaned on the parent kill → this gate reds
+// while the fresh gate above stays green. Recorded in the build report.
+func TestRealPytestAitestParentKillLeavesNoOrphanPostRestart(t *testing.T) {
+	h := newRestartGateHarness(t, true)
+	serverA, cancelA, doneA := h.startServer(t)
+
+	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Minute))
+	defer cancelRun()
+	runCh := startBlockingAitestPool(t, h, runCtx, 2)
+
+	leasesA := waitLeaseCount(t, serverA, 2, testdeadline.Wait(45*time.Second), runCh)
+	if len(leasesA) != 2 {
+		cancelRun()
+		o := <-runCh
+		t.Fatalf("pool did not fill to 2 worker leases on A (got %d: %v)\n%s", len(leasesA), leasesA, o.output)
+	}
+	wantKeys := make(map[string]int64, len(leasesA))
+	for id, reserve := range leasesA {
+		wantKeys[id] = reserve
+	}
+
+	// Restart A -> B with a daemon-down gap; the survivors' relay keepers reconnect
+	// (2/sec) and re-declare into B's empty-started ledger.
+	cancelA()
+	awaitServerShutdown(t, doneA)
+	time.Sleep(testdeadline.Wait(3 * time.Second))
+	serverB, cancelB, doneB := h.startServer(t)
+	defer func() { cancelB(); awaitServerShutdown(t, doneB) }()
+
+	leasesB := waitLeaseCount(t, serverB, 2, testdeadline.Wait(30*time.Second), runCh)
+	if len(leasesB) != 2 {
+		cancelRun()
+		o := <-runCh
+		t.Fatalf("B holds %d worker leases after the restart, want exactly the 2 survivors re-anchored: %v\n%s", len(leasesB), leasesB, o.output)
+	}
+	// The re-declared leases must carry the VERBATIM survivor scope-ids (else the
+	// scope-dir the kill hook targets would not exist).
+	for id := range wantKeys {
+		if _, present := leasesB[id]; !present {
+			cancelRun()
+			t.Fatalf("B's ledger %v is missing the survivor's verbatim scope-id %q (a transformed re-declare key would misdirect the kill)", leasesB, id)
+		}
+	}
+	workers := capturePopulatedWorkerScopes(t, leasesB, h.parent)
+
+	// B is alive; killing the parent now must reach B's serveReDeclare peer-EOF hook.
+	assertNoOrphanAfterParentKill(t, h.outer, workers)
+
+	cancelRun()
+	select {
+	case <-runCh:
+	case <-testdeadline.After(20 * time.Second):
+	}
 }
