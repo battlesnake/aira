@@ -26,8 +26,9 @@ import (
 // MemAvailable watchdog are the backstop, not an aggregate over-subscription bound.
 // PRE-S2a a `--delegate-ram` scope was the textbook example: its memory.max was an
 // AIRA-15 containment ceiling many times its declared reserve. Post-S2a a delegate
-// parent is an ordinary confine job whose memory.max IS its reserve, so it is no
-// longer that case — see the fold note below.)
+// parent is an ordinary confine job — no dedicated ceiling above its reserve; its
+// memory.max is at most that reserve (or uncapped, like any confine job) — so it is
+// no longer that textbook case; see the fold note below.)
 //
 // That static bias picks the wrong victim in exactly the case that matters.
 // oom_score_adj is worth adj/1000 of MACHINE total in badness, so on a 64 GiB
