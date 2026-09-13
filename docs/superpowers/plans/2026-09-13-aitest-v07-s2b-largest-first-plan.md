@@ -54,12 +54,21 @@ note below).
      path's job; the blocking claim only bootstraps progress from an empty pool.
   2. **Unconfined fallback worker → `reservation = None` = "fits everything"**, special-cased in all
      three consumers (dispatch, growth gate, retire-on-no-fit). Recorded at `_spawn_fallback_worker`.
-  3. **ExceedsCeiling carried structurally**: `WorkerAdmitTerminal.__init__(self, msg, reason=None)`,
-     set from `outcome["reason"]` at both raise sites; branch on `exc.reason == <exceeds-ceiling>`.
+  3. **ExceedsCeiling carried structurally** as a plain `exc.reason` ATTRIBUTE set AFTER construction
+     (NOT a constructor kwarg — the raise-site map yields bare `Exception` subclasses with no `reason`
+     param, so a kwarg would TypeError the common `contended` tick); branch on `exc.reason == <exceeds-ceiling>`.
   4. **Dispatch between spawns in the fill loop** so each worker is sized to the next-largest UNCOVERED
      test, not the global-largest repeatedly.
-  5. **Annotated set from `item.get_closest_marker("aira_mem") is not None`** in `collect()` (not from
-     the reader); a malformed marker counts as UNANNOTATED (→ 512).
+  5. **Annotated set = marker present AND well-formed** (`get_closest_marker("aira_mem") is not None`
+     AND the reader's `warning is None`) in `collect()`; a MALFORMED marker counts as UNANNOTATED (→ 512),
+     never inferring presence from the bytes.
+- **v3 gate → FIX-THEN-BUILD** (`wf_0477b63d`): the five edits closed every liveness hole; no re-review
+  required. Applied five plan-text fixes: reason carried as an ATTRIBUTE not a constructor kwarg (a kwarg
+  TypeErrors the non-Terminal classes the raise-site map yields); `_annotated` = present AND well-formed
+  (a malformed marker was wrongly inflating to 768); `_smallest_ready()` returns `(nodeid, need)` so the
+  ExceedsCeiling catch has a nodeid to mark/pop; the `exceeds-ceiling` token is contention-scaled →
+  documented as an accepted coverage gap (no daemon change, no worse than today); dropped the stale
+  flat-512 byte-floor gate in `_try_grow_one`. **Cleared to build.**
 
 ## Global constraints (apply to every task)
 
@@ -71,8 +80,10 @@ note below).
 - **Reservation = `overhead + incremental(nodeid)`, grounded.** `aira_mem` is a test's *incremental*
   peak RSS on top of the warm-import baseline (`__init__.py:39,63`; spec 4.1). `overhead` == the warm
   baseline. `incremental(nodeid)` = the test's declared `aira_mem` **iff the nodeid carries the marker**
-  (`item.get_closest_marker("aira_mem") is not None`), else **0**. A MALFORMED marker → treated as
-  unannotated (0). **Overhead default = `512 << 20`** = today's flat reserve (`_resolve_estimated_bytes`,
+  (`item.get_closest_marker("aira_mem") is not None` AND the reader's `warning is None` — i.e. present
+  AND well-formed; use the `warning` already in hand at `collect()` `~:866`, do NOT infer presence from
+  the bytes), else **0**. A MALFORMED marker (marker present but `warning` set) → treated as
+  unannotated (0), so it reserves 512 not 768. **Overhead default = `512 << 20`** = today's flat reserve (`_resolve_estimated_bytes`,
   known not to OOM): an unannotated worker reserves exactly 512 (== today, provably no regression); an
   annotated worker reserves `aira_mem + 512 ≥` today's reserve. Env `AIRA_AITEST_WORKER_OVERHEAD_BYTES`.
 - **An UNCONFINED worker fits everything.** A daemon-down fallback worker (`_spawn_fallback_worker`,
@@ -81,10 +92,19 @@ note below).
   for it. A ci-shim ledger-only grant keeps its real reservation.
 - **RAM-only now.** The "which test" choice is a single priority key (reservation-need order) so CPU
   weighting can later be one more term. Do NOT build time-weighting.
-- **Honesty:** a test whose `incremental + overhead > ceiling` can never be sized. It is refused by the
-  blocking claim with structured reason `exceeds-ceiling` and marked unevaluated **for that one nodeid**
-  (ceiling-specific reason), then popped; the loop retries the next test and terminates because the
-  queue strictly shrinks. Every OTHER terminal class stays whole-queue. `nil`/unknown → unevaluated, never 0.
+- **Honesty:** a test the daemon refuses with structured reason `exceeds-ceiling` is marked unevaluated
+  **for that one nodeid** (ceiling-specific reason), then popped; the loop retries the next and terminates
+  because the queue strictly shrinks. Every OTHER terminal class stays whole-queue. `nil`/unknown →
+  unevaluated, never 0.
+  **ACCEPTED COVERAGE GAP (reviewer-signed, no daemon change):** the daemon conflates two refusals under
+  the one `exceeds-ceiling` token — a static "> ceiling even alone" (pre-check `admitSliceHeadroom(1)`,
+  `worker_admit.go:369`) and a *jobs-scaled* "> ceiling right now given other sessions' outstanding jobs"
+  (authoritative enqueue re-check `admitSliceHeadroom(outstandingJobs+1)`, `admit.go:1996`). The supervisor
+  cannot tell them apart from the token, so a near-whole-slice reservation MAY be marked unevaluated under
+  cross-session contention rather than waiting it out. This is consistent with AIRA's "bounded, not
+  airtight" admission and is **NOT a regression** — today's flat-512 path *whole-queue* drains on the same
+  axis, which is strictly worse. Splitting the token would need a daemon change (out of scope); documented,
+  not fixed.
 - **Velocity:** TDD per task; mutation-sensitive assertions inline but DEFER `-race`/real-gate RUNS to
   Task 6. The adversarial build-review is NOT deferred.
 - **No back-compat obligation** (AIRA has no users).
@@ -103,14 +123,14 @@ instead of ~1.4 GiB estimate → fewer concurrent jobs for every session). NOT n
 
 **Interfaces:** Produces:
 - `self._worker_overhead_bytes` (env `AIRA_AITEST_WORKER_OVERHEAD_BYTES` via `_parse_estimated_bytes`; **default `512 << 20`**; non-positive/unparseable → warn + floor to default).
-- `self._annotated` : the set of nodeids whose item has a real `aira_mem` marker, built in `collect()` from `item.get_closest_marker("aira_mem") is not None` (NOT by comparing bytes to 256, and NOT from `_aira_mem_bytes_for_item`, which returns `(bytes, warning)` and exposes no presence bit). A malformed marker is NOT in `_annotated` (its byte value is a fabricated default).
+- `self._annotated` : the set of nodeids whose item has a real, WELL-FORMED `aira_mem` marker, built in `collect()` iff `item.get_closest_marker("aira_mem") is not None` AND the reader's `warning is None`. Use the presence bit for present-vs-absent and the `warning` (already computed at `~:866`) for valid-vs-malformed. Do NOT infer presence from the bytes (comparing to 256). A MALFORMED marker (`get_closest_marker` returns the Mark, but `warning` is set) is NOT in `_annotated` — its byte value is a fabricated default, so it reserves 512, not 768.
 - `self.reservation_need` : `nodeid → overhead + (aira_mem_bytes[nodeid] if nodeid in _annotated else 0)`. (`aira_mem_bytes` keeps its existing 256-default for the measurement channel — do NOT change it.)
 - **Each worker state dict carries `reservation`**: confined workers (`spawn_worker`'s `state.update`, `~1509-1525`) = the granted bytes; **fallback/unconfined workers (`_spawn_fallback_worker`, `~1628-1645`) = `None`** (the "fits everything" sentinel).
-- `_largest_fitting(budget, *, pop)` → the ready (still-queued) nodeid with the greatest `reservation_need ≤ budget`; `None` if none fit. `pop=False` peeks; `pop=True` removes it AND applies `next_nodeid`'s increment (`self.attempts[nodeid] = self.attempts.get(nodeid,0)+1`) so the retry-once cap survives. `budget` is always numeric (a None-reservation worker never calls this — see Task 3). Also add `_smallest_ready_need()` → the smallest `reservation_need` over the ready queue (for the empty-pool claim, Task 2).
+- `_largest_fitting(budget, *, pop)` → the ready (still-queued) nodeid with the greatest `reservation_need ≤ budget`; `None` if none fit. `pop=False` peeks; `pop=True` removes it AND applies `next_nodeid`'s increment (`self.attempts[nodeid] = self.attempts.get(nodeid,0)+1`) so the retry-once cap survives. `budget` is always numeric (a None-reservation worker never calls this — see Task 3). Also add `_smallest_ready()` → `(nodeid, reservation_need)` for the ready nodeid with the SMALLEST `reservation_need` (any nodeid at the smallest need on a tie — if the smallest need exceeds the ceiling, every ready test does). The empty-pool claim (Task 2) sizes to that `need` and, on ExceedsCeiling, marks/pops that specific `nodeid` — a bare byte size would leave the catch site with no nodeid to mark/pop.
 
 - [ ] **Step 1 — RED:** overhead env/floor tests. `reservation_need`: unannotated → `512<<20`; `@aira_mem(2G)` → `2G+512M`; explicit `@aira_mem(256M)` → `256M+512M` (in `_annotated`); MALFORMED marker → `512<<20` (NOT annotated). `_largest_fitting`: largest need ≤ budget; None when smallest exceeds budget; `pop=True` increments attempts by 1; `pop=False` leaves queue+attempts. All-unannotated queue → every `reservation_need == 512<<20`.
 - [ ] **Step 2:** run; FAIL.
-- [ ] **Step 3 — GREEN:** resolve overhead; build `_annotated` + `reservation_need` in `collect()`; record `reservation` at BOTH registration sites (`None` for fallback); add `_largest_fitting` + `_smallest_ready_need`.
+- [ ] **Step 3 — GREEN:** resolve overhead; build `_annotated` + `reservation_need` in `collect()`; record `reservation` at BOTH registration sites (`None` for fallback); add `_largest_fitting` + `_smallest_ready`.
 - [ ] **Step 4:** run; PASS.
 - [ ] **Step 5 — commit:** `feat(aitest): AIRA-235 — reservation model (annotated-aware incremental, unannotated=512, fallback=None-fits-all) + _largest_fitting`.
 
@@ -119,12 +139,12 @@ instead of ~1.4 GiB estimate → fewer concurrent jobs for every session). NOT n
 **Files:** Modify `internal/pylib/aitest/supervisor.py` — `_try_grow_one` (`:2136`), the startup fill loop (`:2696-2700` + dispatch at `:2730`), the two blocking empty-pool claims (`run()` `:2711-2715`, `_replace_worker` `:2174-2177`), and the terminal exceptions (`WorkerAdmitTerminal`/`WorkerAdmitRequestInvalid` `~:380-412`, raise sites `:1053` and `:1182`); Test `internal/pylib/aitest/test_supervisor.py` (+ `test_cpu_growth.py`).
 
 **Interfaces:**
-1. **Opportunistic growth** (`_try_grow_one`, `blocking=False`): `need = _largest_fitting(available_bytes, pop=False)`; `None` → `return False` (skip tick). Else `spawn_worker(need, blocking=False)`.
+1. **Opportunistic growth** (`_try_grow_one`, `blocking=False`): `need = _largest_fitting(available_bytes, pop=False)`; `None` → `return False` (skip tick). Else `spawn_worker(need, blocking=False)`. **Drop the stale flat-512 byte-floor gate** (`available_bytes < self._run_estimated_bytes`, `~:2130`): `_largest_fitting` is now the sole byte-fit authority (it returns `None` when nothing fits), and once `AIRA_AITEST_WORKER_OVERHEAD_BYTES` makes sub-512 needs reachable the old clause would falsely skip a growable tick. Keep ONLY the `available_cpu < 1` gate.
 2. **Dispatch between spawns:** in the startup fill loop, call `_dispatch_to_idle_workers()` after each `_try_grow_one()` so the queue shrinks and the next spawn sizes to the next-largest UNCOVERED test (else every worker is sized to the global-largest, a concurrency regression). `_try_grow_one`'s existing `if not self.queue` guard then preserves the AIRA-37 no-surplus property.
-3. **Empty-pool blocking claims** (`run()` `:2711-2715`, `_replace_worker` `:2174-2177`, both `blocking=True`, NO probe in scope): size to `_smallest_ready_need()` and ALWAYS submit. Never skip. These bootstrap progress from an empty pool on a contended box; largest-first is delivered by the growth path once a worker runs.
-4. **Structured ExceedsCeiling:** add `reason` to `WorkerAdmitTerminal.__init__(self, message, reason=None)`; set `reason=outcome.get("reason")` at both raise sites (`:1053`, `:1182`). Add a Python constant `WORKER_ADMIT_REASON_EXCEEDS_CEILING = "exceeds-ceiling"` mirrored to Go's `WorkerAdmitReasonExceedsCeiling` (extend the existing vocabulary-lockstep test). At the two blocking-claim catch sites: if `getattr(exc, "reason", None) == WORKER_ADMIT_REASON_EXCEEDS_CEILING`, mark ONLY that nodeid unevaluated with a ceiling-specific reason, pop it, and retry (`_smallest_ready_need` shrinks) until a grant or empty queue; every OTHER reason (and `WorkerAdmitContractViolation`) stays `_fail_queue_terminal` (whole-queue) as today.
+3. **Empty-pool blocking claims** (`run()` `:2711-2715`, `_replace_worker` `:2174-2177`, both `blocking=True`, NO probe in scope): take `(nodeid, need) = _smallest_ready()`, size the claim to `need`, remember `nodeid` for the ExceedsCeiling catch, and ALWAYS submit. Never skip. These bootstrap progress from an empty pool on a contended box; largest-first is delivered by the growth path once a worker runs.
+4. **Structured ExceedsCeiling (attribute, NOT constructor kwarg):** the raise sites `:1053`/`:1182` build the exception via `_OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](…)`, whose map yields bare `Exception` subclasses (`WorkerAdmitDenied`/`WorkerAdmitUnavailable`/`WorkerPlacementFailed`, no `reason` param) as well as the Terminal ones — so a `reason=` kwarg would `TypeError` the common `contended` tick (escaping `_try_grow_one`'s `except WorkerAdmitDenied` and crashing `run()`; the existing `test_acquire_worker_maps_every_class_to_its_exception` reds it). Instead set it as a plain attribute after construction, at BOTH sites: `exc = _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](_describe_outcome(…)); exc.reason = outcome.get("reason"); raise exc`. (The `WorkerAdmitTerminal.__init__` kwarg is unnecessary; do NOT pass it on the dict-lookup raise.) Add a Python constant `WORKER_ADMIT_REASON_EXCEEDS_CEILING = "exceeds-ceiling"` mirrored to Go's `WorkerAdmitReasonExceedsCeiling` (extend the existing vocabulary-lockstep test). At the two blocking-claim catch sites: if `getattr(exc, "reason", None) == WORKER_ADMIT_REASON_EXCEEDS_CEILING`, mark ONLY the `nodeid` this claim was sized for (from `_smallest_ready`) unevaluated with a ceiling-specific reason, pop it, and retry (`_smallest_ready` shrinks the queue) until a grant or empty queue; every OTHER reason (and `WorkerAdmitContractViolation`) stays `_fail_queue_terminal` (whole-queue) as today. (Note the accepted contention coverage gap in Global constraints — a jobs-scaled refusal shares this token and may per-nodeid unevaluate a runnable near-whole-slice test; documented, not fixed, and no worse than today.)
 
-- [ ] **Step 1 — RED:** (a) `_try_grow_one` sizes from `_largest_fitting(available, pop=False)`, returns False on None. (b) startup fill dispatches between spawns → the 2nd spawned worker is sized to the next-largest test, NOT the global-largest (mixed-size queue). (c) empty-pool `run()`/`_replace_worker` with pool empty submits a BLOCKING claim sized to `_smallest_ready_need()` (never skipped), even when a bigger test is also queued. (d) oversized: a queued test with `need > ceiling` → blocking claim raises `WorkerAdmitTerminal` with `.reason == "exceeds-ceiling"` → THAT nodeid marked unevaluated (ceiling reason) + popped, retry proceeds; a NON-ceiling request-invalid (e.g. worker-scope-create-failed) still whole-queue drains.
+- [ ] **Step 1 — RED:** (a) `_try_grow_one` sizes from `_largest_fitting(available, pop=False)`, returns False on None. (b) startup fill dispatches between spawns → the 2nd spawned worker is sized to the next-largest test, NOT the global-largest (mixed-size queue). (c) empty-pool `run()`/`_replace_worker` with pool empty submits a BLOCKING claim sized to `_smallest_ready()`'s `need` (never skipped), even when a bigger test is also queued. (d) oversized: a queued test with `need > ceiling` → blocking claim raises `WorkerAdmitTerminal` with `.reason == "exceeds-ceiling"` → THAT nodeid marked unevaluated (ceiling reason) + popped, retry proceeds; a NON-ceiling request-invalid (e.g. worker-scope-create-failed) still whole-queue drains.
 - [ ] **Step 2:** run; FAIL.
 - [ ] **Step 3 — GREEN:** implement all four. Relabel `:2714` in comments (empty-pool wait, not "startup fill"). Leave `available_cpu < 1` gate + other handling unchanged.
 - [ ] **Step 4:** run; PASS.
