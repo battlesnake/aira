@@ -133,12 +133,16 @@ runs directly in the job (the `make`, the shell, a heavy compile/link step). Bec
 parent is an ordinary confine job, its cap is the ordinary history-estimated reserve, and
 `--memory-max` / `--memory-reserve` size it explicitly — so `aira confine --delegate-ram
 -- make ci` sizes the parent for its heaviest *non-worker* step the same way any confine
-job is sized. **Accepted first-run cost:** the peak-RSS history for a signature was
-recorded against the *old whole-subtree* scope, so the first post-cutover run over-reserves
-the parent once, then self-corrects as parent-only peaks are recorded. We accept the one
-wasteful run rather than fold a cutover marker into the signature (AIRA has no users; a
-single over-reserve on first run is cheaper than signature machinery). **This is the one
-decision in §12 the owner was asked about; recorded as "parent = ordinary confine job".**
+job is sized. **The parent signature is namespaced, so there is no first-run cost** (this
+supersedes an earlier "accept one wasteful run" note — see §16). Reusing the signature the
+*old whole-subtree* scope recorded peaks against would size the parent from whole-suite
+history; and because an ordinary history estimate over the ceiling is *refused*
+(`E_ADMIT_TOO_LARGE`), never fitted, a large stale peak would REFUSE the first run outright,
+not merely waste it. AIRA instead prefixes the parent scope's signature
+(`AitestParentSignaturePrefix`) so a parent-only scope starts with fresh history that
+genuinely measures a different thing — the supervisor/make tree, not the whole subtree —
+avoiding both the refusal and a stale over-estimate. **The one decision in §12 the owner was
+asked about stands: "parent = ordinary confine job".**
 
 ## 5. Worker-held batch dispatch, prune-to-fit, and the age cap
 
@@ -336,7 +340,10 @@ guard.
   under sustained load. We **document** this rather than build anti-starvation; the observable
   is the per-nodeid kick-back count surfaced in the §7 warning output, so the owner can decide
   later whether it warrants a scheduler.
-- **First post-cutover run over-reserves the parent once** (§4) — accepted.
+- ~~First post-cutover run over-reserves the parent once~~ — **NOT a gap; closed, not accepted.**
+  §16 corrects §4: the parent signature is namespaced (`AitestParentSignaturePrefix`), so a
+  parent-only scope starts with fresh history and there is no stale whole-subtree over-reserve
+  (which would in fact have been an outright `E_ADMIT_TOO_LARGE` refusal, not a mere waste).
 - **The OOM phantom is coarse** (§8) — a worker's own-cap OOM fires a slice-wide brake;
   accepted, with §7 as the precise complement.
 - **Escape-exemption over-exemption is adversarial-only (§16c/§16.1, T5 review P3-a).** The
