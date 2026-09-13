@@ -61,9 +61,11 @@ func (result admissionResult) releaseAdmission() {
 // ledger / version-frozen re-declare frame), then 10→11 in LOCKSTEP with
 // daemon.ProtocolVersion for S15's worker-admit wire change (response gained
 // parent_scope_id / available_bytes / available_cpu; max_wait_ms present-and-zero
-// became a non-blocking snapshot). TestRunnerDaemonProtocolVersionMatchesTheDaemon
-// fails if the two drift.
-const DaemonProtocolVersion = 11
+// became a non-blocking snapshot), then 11→12 in LOCKSTEP for aitest v0.7 S2a's
+// wire change (parent_scope_id is a REQUIRED, refuse-empty worker-admit request
+// field; delegate_ram removed from the admit allowlist; scope_ceiling dropped from
+// the grant). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two drift.
+const DaemonProtocolVersion = 12
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20
@@ -382,8 +384,9 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// aitest pytest workers are bounded too, since S15: they reach the daemon via
 	// worker-admit, which now charges each worker's one core against the SAME per-slice
 	// 2×NumCPU ledger (the worker lease is an ordinary signed-ledger lease). Accounting
-	// only — no cpu.max is written. The S5 `cpu` arg's ProtocolVersion bump landed in S7:
-	// both DaemonProtocolVersion and daemon.ProtocolVersion are 10, in lockstep.
+	// only — no cpu.max is written. The S5 `cpu` arg's ProtocolVersion bump landed in S7;
+	// DaemonProtocolVersion and daemon.ProtocolVersion have since moved together to 12
+	// (S2a's worker-admit/confine wire change), in lockstep as this constant's doc requires.
 	cpuCores := DefaultConfineCPUCores
 	// S13: NO max_wait_ms. The admission wait no longer self-expires (design §4/§6):
 	// the client blocks until granted and reconnects across a daemon restart, bounding
