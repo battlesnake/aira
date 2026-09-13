@@ -1835,7 +1835,35 @@ class Supervisor:
             for pid, state in list(self.workers.items()):
                 if state["in_flight"] is not None:
                     continue
-                nodeid = self.next_nodeid()
+                reservation = state.get("reservation")
+                if reservation is None:
+                    # AIRA-235: an UNCONFINED fallback worker (no memory.max) fits
+                    # everything -- bypass the fit filter and take the next queued
+                    # nodeid (next_nodeid keeps its own attempts increment); it is
+                    # never retired-on-no-fit. A missing "reservation" key reads as
+                    # None here too, but a real idle worker always has it: both
+                    # registration sites set it in the same state dict as in_flight,
+                    # so any worker idle enough to reach this branch is fully shaped.
+                    nodeid = self.next_nodeid()
+                else:
+                    # AIRA-235: a confined worker is handed the LARGEST ready test
+                    # that FITS its reservation (pop=True keeps next_nodeid's attempts
+                    # increment, so the crash-retry-once cap survives).
+                    nodeid = self._largest_fitting(reservation, pop=True)
+                    if nodeid is None and self.queue:
+                        # Nothing fits this worker but ready work remains: retire it
+                        # and immediately spawn a replacement so the freed quota is
+                        # REPACKED, not lost (mirror the recycle path's _retire_worker
+                        # + _replace_worker). Flag the pass so the while-True re-scan
+                        # dispatches to the fresh replacement THIS pass, exactly as the
+                        # BrokenPipe branch below does -- an idle worker holds ONE lease
+                        # for life and the ~10s age cap fires only after a completed
+                        # test, so a worker waiting for a nodeid it will never fittingly
+                        # get would otherwise sit forever.
+                        crashed_this_pass = True
+                        self._retire_worker(pid, state)
+                        self._replace_worker()
+                        continue
                 if nodeid is None:
                     continue
                 state["in_flight"] = nodeid

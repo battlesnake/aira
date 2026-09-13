@@ -4045,3 +4045,230 @@ def test_smallest_ready_returns_nodeid_and_need():
     supervisor.queue = ["a", "b", "c"]
     assert supervisor._smallest_ready() == ("b", 100)
     assert supervisor.queue == ["a", "b", "c"], "peek must not modify the queue"
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 — fit-filtered dispatch + retire-and-replace (Task 3).
+# ---------------------------------------------------------------------------
+
+
+def _confined_worker_state(reservation, dispatch_write_fd, result_fd):
+    return {
+        "result_fd": result_fd, "read_buffer": b"", "result_eof": False, "in_flight": None,
+        "dispatch_write": os.fdopen(dispatch_write_fd, "w"), "admit_process": None,
+        "grant": None, "reservation": reservation, "pidfd": None,
+    }
+
+
+def test_dispatch_hands_confined_worker_the_largest_fitting_test():
+    """A confined worker is handed the LARGEST ready test that fits its reservation;
+    an over-cap test stays queued."""
+    dispatch_read, dispatch_write = os.pipe()
+    os.set_blocking(dispatch_read, False)
+    result_read, result_write = os.pipe()
+    os.set_blocking(result_read, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = ["small", "mid", "big"]
+    supervisor.reservation_need = {"small": 100 << 20, "mid": 300 << 20, "big": 4 << 30}
+    # A worker sized to 500 MiB fits small (100M) and mid (300M), not big (4G).
+    supervisor.workers[777] = _confined_worker_state(500 << 20, dispatch_write, result_read)
+
+    supervisor._dispatch_to_idle_workers()
+
+    assert supervisor.workers[777]["in_flight"] == "mid", "the LARGEST FITTING test (mid), not big"
+    assert "mid" not in supervisor.queue
+    assert "big" in supervisor.queue, "the over-cap test stays queued for a bigger worker"
+    assert os.read(dispatch_read, 4096) == b"mid\n", "the worker's own pipe must carry the nodeid"
+    os.close(dispatch_read)
+    os.close(result_read)
+    os.close(result_write)
+
+
+def test_dispatch_retires_and_replaces_a_confined_worker_that_fits_nothing(monkeypatch):
+    """A confined worker that fits NO ready test, with work still queued, is
+    _retire_worker'd AND immediately _replace_worker'd so the freed quota is
+    repacked, not lost. The pool must not empty-and-exit with runnable work queued."""
+    dispatch_read, dispatch_write = os.pipe()
+    os.set_blocking(dispatch_read, False)
+    result_read, result_write = os.pipe()
+    os.set_blocking(result_read, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = ["big"]
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.workers[778] = _confined_worker_state(500 << 20, dispatch_write, result_read)
+
+    retired = []
+    replaced = []
+    monkeypatch.setattr(
+        supervisor, "_retire_worker",
+        lambda pid, state: (retired.append(pid), supervisor.workers.pop(pid, None)),
+    )
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: replaced.append(1))
+
+    supervisor._dispatch_to_idle_workers()
+
+    assert retired == [778], "a worker that fits no ready test must be retired"
+    assert replaced == [1], "and immediately replaced so the freed quota is repacked"
+    assert supervisor.queue == ["big"], "the too-big test stays queued for the replacement"
+    os.close(dispatch_read)
+    os.close(result_read)
+    os.close(result_write)
+
+
+def test_confined_dispatch_crash_twice_marks_unevaluated_after_one_requeue(monkeypatch):
+    """Proves _largest_fitting(pop=True) keeps next_nodeid's attempts increment: a
+    confined worker whose dispatch pipe is broken requeues the nodeid ONCE; its
+    replacement (also broken) marks it unevaluated on the SECOND attempt -- exactly
+    one requeue, never an infinite loop."""
+    nodeid = "pkg/test_mod.py::test_x"
+    dead_dr, dead_dw = os.pipe()
+    os.close(dead_dr)  # write -> BrokenPipe
+    dead_rr, dead_rw = os.pipe()
+    os.set_blocking(dead_rr, False)
+    repl_dr, repl_dw = os.pipe()
+    os.close(repl_dr)  # the replacement's pipe is broken too
+    repl_rr, repl_rw = os.pipe()
+    os.set_blocking(repl_rr, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = [nodeid]
+    supervisor.reservation_need = {nodeid: 100 << 20}
+    dead_pid = 999801
+    supervisor.workers[dead_pid] = _confined_worker_state(500 << 20, dead_dw, dead_rr)
+    repl_pid = 999802
+
+    def fake_spawn_worker(estimated_bytes, blocking=True):
+        supervisor.workers[repl_pid] = _confined_worker_state(500 << 20, repl_dw, repl_rr)
+        return repl_pid
+
+    monkeypatch.setattr(supervisor, "spawn_worker", fake_spawn_worker)
+
+    supervisor._dispatch_to_idle_workers()  # must not hang
+
+    assert supervisor.attempts[nodeid] == 2, (
+        "one dispatch to the dead worker, one to its replacement -- if _largest_fitting(pop=True) "
+        "skipped the attempts increment this would requeue forever"
+    )
+    assert supervisor.results.get(nodeid) == "unevaluated"
+    assert nodeid not in supervisor.queue
+    # _retire_worker already closed each worker's result_fd and dispatch_write; only
+    # the result WRITE ends are still ours, and closing an already-closed fd is EBADF.
+    for fd in (dead_rr, dead_rw, repl_rr, repl_rw):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def test_retired_confined_idle_worker_child_exits_on_dispatch_pipe_eof(monkeypatch):
+    """Retire-on-no-fit must actually make the idle worker EXIT: _retire_worker closes
+    its dispatch pipe and run_worker_loop's `for line in pipe_in` EOFs and returns.
+    Otherwise a retired worker orphans, holding a phantom lease. Forks a REAL worker
+    and confirms it is reaped PROMPTLY (an EOF-exit), well under the 30s
+    SIGKILL-after-timeout backstop."""
+    from aitest.worker import run_worker_loop
+
+    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "30")  # a prompt reap then PROVES EOF-exit
+    dispatch_read, dispatch_write = os.pipe()
+    result_read, result_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(dispatch_write)
+            os.close(result_read)
+            pipe_in = os.fdopen(dispatch_read, "r")
+            pipe_out = os.fdopen(result_write, "w")
+            run_worker_loop(None, {}, pipe_in, pipe_out)
+        except BaseException:
+            os._exit(70)
+        os._exit(0)
+    os.close(dispatch_read)
+    os.close(result_write)
+    os.set_blocking(result_read, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = ["big"]
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.workers[pid] = _confined_worker_state(500 << 20, dispatch_write, result_read)
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)  # isolate the retired worker
+
+    started = time.monotonic()
+    supervisor._dispatch_to_idle_workers()
+    elapsed = time.monotonic() - started
+
+    assert pid not in supervisor.workers, "the no-fit worker must be retired"
+    assert elapsed < 10, (
+        "the child must EOF-exit promptly on dispatch-pipe close, not be SIGKILLed after the "
+        "30s reap timeout (%.1fs elapsed)" % elapsed
+    )
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, 0)  # _retire_worker already reaped it
+    with contextlib.suppress(OSError):
+        os.close(result_read)  # _retire_worker already closed it
+
+
+def test_daemon_down_fallback_dispatches_an_annotated_test_without_fit_filtering(tmp_path, monkeypatch, pytester):
+    """A daemon-down fallback worker has reservation=None ("fits everything"): dispatch
+    must bypass the fit filter (no _largest_fitting, no KeyError, no retire loop), so
+    even a @aira_mem(4G) test whose reservation_need dwarfs any real worker still drains."""
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
+    monkeypatch.delenv("AIRA_AITEST_WORKER_ADMIT_CMD", raising=False)
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.aira_mem("4G")
+        def test_big():
+            assert True
+
+        def test_small():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    assert len(results) == 2
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is False
+
+
+def test_mixed_size_suite_all_pass_under_fit_filtered_dispatch(tmp_path, monkeypatch, pytester):
+    """End-to-end: a mixed-size annotated suite drains completely under fit-filtered
+    dispatch -- no test (large or small) is stranded unevaluated. The admit stub
+    grants each worker the size it requests."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.aira_mem("2G")
+        def test_big():
+            assert True
+
+        @pytest.mark.aira_mem("512M")
+        def test_mid():
+            assert True
+
+        def test_small_a():
+            assert True
+
+        def test_small_b():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values()), results
