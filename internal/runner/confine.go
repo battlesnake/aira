@@ -1254,11 +1254,14 @@ func confineScopeIDWithPID(name, owner string, pid int) string {
 // parseConfineScopeID(basename).pid == os.Getpid() check on the monitor process
 // (§16.1/§16.2). The name is aitest-w<seq>; seq (a daemon-monotonic counter)
 // makes (name, parentPid, stamp) unique by construction, so there is no
-// cross-scope counter, no reseed, and no EEXIST path. Owner is empty. The result
+// cross-scope counter, no reseed, and no EEXIST path. The owner is copied out of
+// the same parent_scope_id as the pid, so a worker is owned by the same principal
+// as its parent and `confine --kill <worker-scope-id>` resolves without --steal
+// (an unattested / empty parent owner encodes as no suffix, unchanged). The result
 // is parseable by parseConfineScopeID, so the worker is reaped / listed / killable
 // like any confine scope.
-func MintWorkerScopeID(seq, parentPid int) string {
-	return confineScopeIDWithPID("aitest-w"+strconv.Itoa(seq), "", parentPid)
+func MintWorkerScopeID(seq, parentPid int, owner string) string {
+	return confineScopeIDWithPID("aitest-w"+strconv.Itoa(seq), owner, parentPid)
 }
 
 // aitestWorkerNamePrefix is the confine NAME prefix every aitest worker scope

@@ -53,7 +53,7 @@ func holdSliceExclusive(t *testing.T, server *Server, name string, pid int) stri
 func enqueueWorkerSubReservation(t *testing.T, server *Server, outerScope string) (*sliceQueue, *admitWaiter) {
 	t.Helper()
 	parentScopeID := strings.TrimPrefix(filepath.Base(filepath.Clean(outerScope)), ".aira-")
-	scopeID := runner.WorkerScopeChildPath(outerScope, runner.MintWorkerScopeID(1, 111111))
+	scopeID := runner.WorkerScopeChildPath(outerScope, runner.MintWorkerScopeID(1, 111111, ""))
 	queue, waiter, code, err := server.enqueueAdmitInternal("/slice", 1<<20, workerAdmitBasis, 1<<40, true, admitRequest{
 		scopeID: scopeID, cpu: runner.DefaultConfineCPUCores, parentScopeID: parentScopeID,
 	})

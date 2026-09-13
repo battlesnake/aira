@@ -389,6 +389,34 @@ func TestConfineKillWorkerRowsResolveOnlyByScopeIDNotSupervisorPID(t *testing.T)
 	}
 }
 
+// verifies: S2a Task 10 — a worker scope minted with MintWorkerScopeID now carries
+// the PARENT supervisor's owner in its scope id, so `confine --kill <worker-scope-id>`
+// opens the ownership guard for that same principal WITHOUT --steal (the
+// TestConfineKillWorkerRowsResolveOnlyByScopeIDNotSupervisorPID sibling exercised only
+// steal=true). RED before the owner slot: MintWorkerScopeID minted an ownerless id, so
+// the kill guard reads owner "" (unattested) and demands --steal.
+//
+// MUTATION: revert MintWorkerScopeID to an empty owner -> the round-trip assertion reds
+// AND the steal-less kill reds with CodeConfineOwnerUnverified.
+func TestConfineKillWorkerByScopeIDResolvesWithoutStealWhenParentOwnerCopied(t *testing.T) {
+	slice := t.TempDir()
+	// A worker minted for a parent owned by the attested principal session-a.
+	workerID := MintWorkerScopeID(1, 4701, "session-a")
+	if _, _, _, owner, ok := parseConfineScopeID(workerID); !ok || owner != "session-a" {
+		t.Fatalf("minted worker id %q owner=%q ok=%v, want the parent owner session-a copied in", workerID, owner, ok)
+	}
+	writeConfineTestScope(t, slice, workerID, "71\n")
+	deps := defaultConfineScanDeps()
+	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
+		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
+	}
+	// steal=false: the same-principal owner must open the guard on its own worker.
+	result, err := killConfineWithDeps(context.Background(), slice, workerID, "session-a", false, nil, time.Second, deps)
+	if err != nil || result.Status != "killed" || result.ScopeID != workerID {
+		t.Fatalf("--kill <worker-scope-id> without --steal: result=%+v err=%v, want the worker killed by its same-principal owner", result, err)
+	}
+}
+
 func TestConfineMidLaunchKillDoesNotFabricateOrReleaseAndLaunchContinues(t *testing.T) {
 	slice := t.TempDir()
 	fake := &confineFakeScope{}

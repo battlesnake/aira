@@ -608,3 +608,36 @@ func TestWorkerAdmitMintsFirstClassScopeNameWithParentPid(t *testing.T) {
 		t.Fatalf("granted lease scopeIDs=%v, want both %q and %q (dir-name-minus-.aira- alignment)", ids, wantA, wantB)
 	}
 }
+
+// TestWorkerAdmitCopiesParentOwnerIntoWorkerScope pins the S2a Task 10 P3 fix: the
+// worker scope inherits the PARENT supervisor's owner (copied out of parent_scope_id,
+// alongside the parent pid), so a worker is owned by the same principal as its parent
+// and `confine --kill <worker-scope-id>` resolves without --steal. RED before the fix:
+// MintWorkerScopeID minted an ownerless worker id, so the owner decoded back out of the
+// minted name is empty and the kill guard demands --steal to reach a same-principal
+// worker.
+func TestWorkerAdmitCopiesParentOwnerIntoWorkerScope(t *testing.T) {
+	if os.Getpid() == workerTestParentPID {
+		t.Skipf("test process pid %d collides with the fixture parent pid", os.Getpid())
+	}
+	server := workerAdmitServer(t, "/slice", 8*workerTestMiB)
+	// A parent scope owned by session-a (the @-suffixed AIRA-52 owner encoding). The
+	// pid slot (workerTestParentPID) is deliberately not this process's pid.
+	outer := "/slice/.aira-CONFINE-suite-" + strconv.Itoa(workerTestParentPID) + "-1@session-a"
+	resp, client, _ := startWorkerAdmit(t, server, workerArgs(outer, workerTestMiB, false, 0))
+	defer client.Close()
+	if resp.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("resp=%+v, want granted", resp)
+	}
+	base := strings.TrimPrefix(filepath.Base(resp.ScopePath), ".aira-")
+	nm, pid, _, owner, ok := runner.ParseConfineScopeID(base)
+	if !ok || !strings.HasPrefix(nm, "aitest-w") {
+		t.Fatalf("worker scope name %q (from %q) is not a parseable aitest-w id", base, resp.ScopePath)
+	}
+	if owner != "session-a" {
+		t.Fatalf("worker id owner=%q, want session-a copied from the parent so --kill <worker-scope-id> resolves without --steal", owner)
+	}
+	if pid != workerTestParentPID {
+		t.Fatalf("worker id pid=%d, want the parent supervisor pid %d", pid, workerTestParentPID)
+	}
+}

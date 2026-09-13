@@ -391,7 +391,7 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		workerID = strconv.FormatUint(s.shimWorkerSeq.Add(1), 10)
 		scopeID = "ci-shim-worker-" + workerID
 	} else {
-		_, parentPID, _, _, ok := runner.ParseConfineScopeID(parentScopeID)
+		_, parentPID, _, parentOwner, ok := runner.ParseConfineScopeID(parentScopeID)
 		if !ok {
 			// No parent pid to stamp into the worker name: refuse terminally rather
 			// than mint a scope whose pid slot the reaper and the escape exemption
@@ -406,7 +406,12 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 			return
 		}
 		seq := int(s.workerScopeSeq.Add(1))
-		scopeID = runner.MintWorkerScopeID(seq, parentPID)
+		// Copy the parent's OWNER into the worker name alongside its pid (Task 10):
+		// a worker is owned by the same principal as its parent supervisor, so
+		// `confine --kill <worker-scope-id>` opens the ownership guard for that
+		// principal without --steal. An empty / unattested parent owner encodes as
+		// no suffix, so this is a no-op for ownerless parents.
+		scopeID = runner.MintWorkerScopeID(seq, parentPID, parentOwner)
 		// S2a §4: the worker scope is a SIBLING under the resolved slice (path), not
 		// nested under req.outerScope. req.outerScope now serves only the mode-agreement
 		// sentinel check above and the parent↔worker linkage carried in parentScopeID.

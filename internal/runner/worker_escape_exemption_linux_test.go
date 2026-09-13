@@ -31,7 +31,7 @@ func TestWitnessedEscapeExemptsOwnAitestWorkerMigration(t *testing.T) {
 	parentScope := filepath.Join(slice, ".aira-CONFINE-parent-"+strconv.Itoa(os.Getpid())+"-parent")
 	// Mint a REAL worker id so the grammar (and any drift in it) is exercised;
 	// the pid slot is this monitor's own pid, per Task 1.
-	workerCgroup := filepath.Join(slice, ".aira-"+MintWorkerScopeID(1, os.Getpid()))
+	workerCgroup := filepath.Join(slice, ".aira-"+MintWorkerScopeID(1, os.Getpid(), ""))
 
 	worker := &processCgroupObservation{
 		// The worker's OWN process pid is unrelated to the pid in its scope name
@@ -66,7 +66,7 @@ func TestClassifyLaunchScopeIntegrityWorkerMigrationIsUnverifiedNotEscaped(t *te
 		Live:            processAlive,
 		Readable:        true,
 		StartTickBefore: 200, StartTickAfter: 200,
-		Cgroup: filepath.Join(slice, ".aira-"+MintWorkerScopeID(3, os.Getpid())),
+		Cgroup: filepath.Join(slice, ".aira-"+MintWorkerScopeID(3, os.Getpid(), "")),
 	}
 	base := launchScopeFacts{
 		ScopeVerified: true, PlacementGuaranteed: true, IdentityValid: true, WaitObserved: true,
@@ -112,7 +112,7 @@ func TestAttestScopeTeardownExemptsOwnAitestWorkerMigration(t *testing.T) {
 	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', tick), nil }
 	// The still-alive member's /proc/<pid>/cgroup places it in its own sibling
 	// worker scope under the slice, whose name embeds this monitor's pid.
-	workerRel := "/aira.slice/.aira-" + MintWorkerScopeID(1, os.Getpid())
+	workerRel := "/aira.slice/.aira-" + MintWorkerScopeID(1, os.Getpid(), "")
 	readProcCgroupFn = func(int) ([]byte, error) { return []byte("0::" + workerRel + "\n"), nil }
 
 	parentScope := filepath.Join(mount, "aira.slice", ".aira-CONFINE-parent-"+strconv.Itoa(os.Getpid())+"-parent")
@@ -160,7 +160,7 @@ func TestWitnessedEscapeStillWitnessesGenuineEscapes(t *testing.T) {
 
 	// (b) A worker scope whose embedded pid is a DIFFERENT supervisor's (not this
 	// monitor) is a genuine escape — the pid facet, not the name alone, gates it.
-	foreign := filepath.Join(slice, ".aira-"+MintWorkerScopeID(1, os.Getpid()+1))
+	foreign := filepath.Join(slice, ".aira-"+MintWorkerScopeID(1, os.Getpid()+1, ""))
 	if !witnessedEscape(parentScope, obs(foreign)) {
 		t.Fatalf("a foreign supervisor's worker scope (embedded pid %d != monitor %d) was wrongly exempted", os.Getpid()+1, os.Getpid())
 	}
