@@ -662,7 +662,7 @@ func TestRebuildRetriesMissingRecoveredReceipt(t *testing.T) {
 	}
 	writeTicketFile(t, filepath.Join(root, ".aira", "tickets", "AIRA-7.md"), "AIRA-7")
 	s := openTestStore(t, root, common, state, "main", "AIRA")
-	if _, err := s.db.Exec(`INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq) VALUES(?,?,?,?,?,?,?)`, "project-aira", "AIRA", 7, "main", "recovered", filepath.Join(root, ".aira", "tickets", "AIRA-7.md"), 12); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq,suffix) VALUES(?,?,?,?,?,?,?,'')`, "project-aira", "AIRA", 7, "main", "recovered", filepath.Join(root, ".aira", "tickets", "AIRA-7.md"), 12); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Rebuild(context.Background()); err != nil {

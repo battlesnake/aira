@@ -146,9 +146,11 @@ type CreateTicketInput struct {
 
 // idPattern accepts an optional single compound segment (AIRA-237 Task 1's
 // per-project namespacing: a stored id is composed <id_prefix>-<PREFIX>-<n>,
-// e.g. FEE-BL-123). The number part stays digits-only here; Task 3 extends it
-// with a trailing split-suffix letter (`BL-10a`) — do NOT add that yet.
-var idPattern = regexp.MustCompile(`^[A-Z]{2,}(-[A-Z]{2,})?-[1-9][0-9]*$`)
+// e.g. FEE-BL-123) and a single optional trailing split-suffix letter (Task 3:
+// a hand-authored split-child like `BL-10a` of a plain-numbered parent). The
+// suffix is at most ONE lowercase letter — the allocator never mints it; it
+// exists only to keep a suffixed child's allocation row distinct from its twin.
+var idPattern = regexp.MustCompile(`^[A-Z]{2,}(-[A-Z]{2,})?-[1-9][0-9]*[a-z]?$`)
 var projectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{1,62}$`)
 
 func ValidateID(id string) error {

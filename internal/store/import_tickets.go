@@ -32,10 +32,11 @@ import (
 //     graph UpdateTicketContent enforces (the backlog is authoritative for status).
 
 // bareTicketIDPattern is the id shape an import row must carry: a single bare
-// <PREFIX>-<number>. It rejects an already-composed id (FEE-BL-1, two hyphens) —
-// import is strict, unlike interactive input which canonicaliser-prepends — and
-// (until Task 3) a split-suffix tail (BL-10a).
-var bareTicketIDPattern = regexp.MustCompile(`^[A-Z]{2,}-[1-9][0-9]*$`)
+// <PREFIX>-<number> with an optional single split-suffix letter (BL-10a, Task 3
+// — a hand-authored split-child of a plain-numbered parent). It rejects an
+// already-composed id (FEE-BL-1, two hyphens): import is strict, unlike
+// interactive input which canonicaliser-prepends.
+var bareTicketIDPattern = regexp.MustCompile(`^[A-Z]{2,}-[1-9][0-9]*[a-z]?$`)
 
 // ImportTicketError is one row's (or one link's) named refusal, counted in the
 // summary and never a silent skip.
@@ -86,6 +87,7 @@ type importedTicket struct {
 	ID       string
 	Prefix   string
 	Number   int64
+	Suffix   string
 	Title    string
 	Status   domain.Status
 	Kind     domain.Kind
@@ -275,7 +277,7 @@ func (s *Store) parseTicketRow(line string, lineNum int) (importedTicket, error)
 		return importedTicket{}, fmt.Errorf("E_IMPORT_INVALID: line %d: trailing content after JSON object", lineNum)
 	}
 
-	id, prefix, number, err := s.canonicaliseImportID(raw.ID)
+	id, prefix, number, suffix, err := s.canonicaliseImportID(raw.ID)
 	if err != nil {
 		return importedTicket{}, fmt.Errorf("E_IMPORT_INVALID: line %d: %v", lineNum, err)
 	}
@@ -310,7 +312,7 @@ func (s *Store) parseTicketRow(line string, lineNum int) (importedTicket, error)
 	}
 
 	row := importedTicket{
-		Line: lineNum, ID: id, Prefix: prefix, Number: number,
+		Line: lineNum, ID: id, Prefix: prefix, Number: number, Suffix: suffix,
 		Title: raw.Title, Status: status, Kind: kind, Severity: severity,
 		Body: raw.Body, Labels: raw.Labels, Links: links,
 	}
@@ -324,18 +326,19 @@ func (s *Store) parseTicketRow(line string, lineNum int) (importedTicket, error)
 }
 
 // canonicaliseImportID enforces the bare id contract, composes the project
-// prefix, and returns the compound id plus its (composed) prefix and number.
-func (s *Store) canonicaliseImportID(raw string) (id, prefix string, number int64, err error) {
+// prefix, and returns the compound id plus its (composed) prefix, number, and
+// split-suffix (AIRA-237 Task 3: BL-10a -> ("FEE-BL-10a","FEE-BL",10,"a")).
+func (s *Store) canonicaliseImportID(raw string) (id, prefix string, number int64, suffix string, err error) {
 	raw = strings.TrimSpace(raw)
 	if !bareTicketIDPattern.MatchString(raw) {
-		return "", "", 0, fmt.Errorf("import ids must be a bare PREFIX-N (got %q)", raw)
+		return "", "", 0, "", fmt.Errorf("import ids must be a bare PREFIX-N (got %q)", raw)
 	}
 	id = s.canonicalID(raw)
-	p, n := splitTicketID(id)
+	p, n, suf := splitTicketID(id)
 	if n < 1 {
-		return "", "", 0, fmt.Errorf("ticket id %q has an invalid number", raw)
+		return "", "", 0, "", fmt.Errorf("ticket id %q has an invalid number", raw)
 	}
-	return id, p, int64(n), nil
+	return id, p, int64(n), suf, nil
 }
 
 func (s *Store) parseImportedLinks(from string, raw []rawTicketLink, lineNum int) ([]importedLink, error) {
@@ -380,7 +383,7 @@ func (s *Store) importTicketRow(ctx context.Context, row importedTicket) (string
 	if err != nil {
 		return "", err
 	}
-	alloc, allocExists, err := s.findTicketAllocation(ctx, row.Prefix, row.Number)
+	alloc, allocExists, err := s.findTicketAllocation(ctx, row.Prefix, row.Number, row.Suffix)
 	if err != nil {
 		return "", err
 	}
@@ -484,10 +487,10 @@ func (s *Store) freshImportTicket(row importedTicket) domain.Ticket {
 	}
 }
 
-func (s *Store) findTicketAllocation(ctx context.Context, prefix string, number int64) (ticketAllocation, bool, error) {
+func (s *Store) findTicketAllocation(ctx context.Context, prefix string, number int64, suffix string) (ticketAllocation, bool, error) {
 	var a ticketAllocation
 	err := s.db.QueryRowContext(ctx, `SELECT worktree_id, state, path, seq, kind
-        FROM allocations WHERE project_id=? AND prefix=? AND number=?`, s.projectID, prefix, number).Scan(
+        FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, s.projectID, prefix, number, suffix).Scan(
 		&a.WorktreeID, &a.State, &a.Path, &a.Seq, &a.Kind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ticketAllocation{}, false, nil
@@ -507,7 +510,7 @@ func (s *Store) registerImportedTicket(ctx context.Context, row importedTicket, 
 	var intent Intent
 	var receipt AllocationReceipt
 	err := s.withImmediate(ctx, func(conn *sql.Conn) error {
-		existing, allocExists, err := scanAllocationTx(ctx, conn, s.projectID, row.Prefix, row.Number)
+		existing, allocExists, err := scanAllocationTx(ctx, conn, s.projectID, row.Prefix, row.Number, row.Suffix)
 		if err != nil {
 			return err
 		}
@@ -524,8 +527,8 @@ func (s *Store) registerImportedTicket(ctx context.Context, row importedTicket, 
 			if err != nil {
 				return err
 			}
-			if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
-                VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?)`, s.projectID, row.Prefix, row.Number, s.worktreeID, path, allocSeq, kindTicket); err != nil {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+                VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?, ?)`, s.projectID, row.Prefix, row.Number, s.worktreeID, path, allocSeq, kindTicket, row.Suffix); err != nil {
 				return err
 			}
 			receiptSeq = allocSeq
@@ -560,10 +563,10 @@ func (s *Store) registerImportedTicket(ctx context.Context, row importedTicket, 
 	return intent, receipt, nil
 }
 
-func scanAllocationTx(ctx context.Context, conn *sql.Conn, projectID, prefix string, number int64) (ticketAllocation, bool, error) {
+func scanAllocationTx(ctx context.Context, conn *sql.Conn, projectID, prefix string, number int64, suffix string) (ticketAllocation, bool, error) {
 	var a ticketAllocation
 	err := conn.QueryRowContext(ctx, `SELECT worktree_id, state, path, seq, kind
-        FROM allocations WHERE project_id=? AND prefix=? AND number=?`, projectID, prefix, number).Scan(
+        FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, projectID, prefix, number, suffix).Scan(
 		&a.WorktreeID, &a.State, &a.Path, &a.Seq, &a.Kind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ticketAllocation{}, false, nil

@@ -260,22 +260,25 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		return CheckReport{}, err
 	}
 
-	rows, err := s.db.Query(`SELECT prefix, number, path, state, kind FROM allocations WHERE project_id=?`, s.projectID)
+	rows, err := s.db.Query(`SELECT prefix, number, suffix, path, state, kind FROM allocations WHERE project_id=?`, s.projectID)
 	if err != nil {
 		return CheckReport{}, err
 	}
 	for rows.Next() {
-		var prefix string
+		var prefix, suffix string
 		var number int64
 		var path, state, kind string
-		if err := rows.Scan(&prefix, &number, &path, &state, &kind); err != nil {
+		if err := rows.Scan(&prefix, &number, &suffix, &path, &state, &kind); err != nil {
 			_ = rows.Close()
 			return CheckReport{}, err
 		}
 		if state != "allocated" {
 			continue
 		}
-		id := fmt.Sprintf("%s-%d", prefix, number)
+		// Reconstruct the FULL id including the split-suffix (AIRA-237 Task 3):
+		// dropping it here would make the ticket.ID != id comparison below
+		// fabricate an E_ID_UNRESOLVED for every suffixed allocation.
+		id := fmt.Sprintf("%s-%d%s", prefix, number, suffix)
 		// Integrity: the allocation's recorded kind must agree with the directory
 		// kind of its path, and the kind must be a known value. A corrupt row (a
 		// kind/path disagreement, an unknown kind, or a path outside the entity

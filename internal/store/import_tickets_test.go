@@ -111,7 +111,7 @@ func TestImportTicketsCreatesPrefixedAndSeedsCounter(t *testing.T) {
 
 func mustNumber(t *testing.T, id string) int64 {
 	t.Helper()
-	_, n := splitTicketID(id)
+	_, n, _ := splitTicketID(id)
 	return int64(n)
 }
 

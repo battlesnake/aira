@@ -90,12 +90,15 @@ func scanRequirements(root, worktree string) (requirementScanResult, bool, error
 		return requirementScanResult{}, true, nil
 	}
 	sort.Slice(result.valid, func(i, j int) bool {
-		pi, ni := splitTicketID(result.valid[i].Requirement.ID)
-		pj, nj := splitTicketID(result.valid[j].Requirement.ID)
+		pi, ni, si := splitTicketID(result.valid[i].Requirement.ID)
+		pj, nj, sj := splitTicketID(result.valid[j].Requirement.ID)
 		if pi != pj {
 			return pi < pj
 		}
-		return ni < nj
+		if ni != nj {
+			return ni < nj
+		}
+		return si < sj // deterministic tiebreak for split-suffix siblings (AIRA-237 Task 3)
 	})
 	sort.Slice(result.invalid, func(i, j int) bool { return result.invalid[i].Subject < result.invalid[j].Subject })
 	return result, false, nil
@@ -246,8 +249,9 @@ func (s *Store) prepareCreateRequirement(ctx context.Context, input domain.Requi
 		}
 		path := s.requirementPath(id)
 		digest := digestBytes(data)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
-            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?)`, s.projectID, prefix, number, s.worktreeID, path, seq, kindRequirement); err != nil {
+		// Fresh requirement create: number minted, suffix='' (AIRA-237 Task 3).
+		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?, '')`, s.projectID, prefix, number, s.worktreeID, path, seq, kindRequirement); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
@@ -276,7 +280,7 @@ func (s *Store) markRequirementMaterialised(ctx context.Context, intent Intent) 
 	if kindForPath(intent.Path) != kindRequirement {
 		return fmt.Errorf("E_JOURNAL_CORRUPT: requirement %s materialised outside .aira/requirements/: %s", requirement.ID, intent.Path)
 	}
-	prefix, number := splitTicketID(requirement.ID)
+	prefix, number, suffix := splitTicketID(requirement.ID)
 	if _, err := s.reconcileAllocationKind(prefix, kindRequirement, intent.Path); err != nil {
 		return err
 	}
@@ -284,7 +288,7 @@ func (s *Store) markRequirementMaterialised(ctx context.Context, intent Intent) 
 		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0`, intent.ProjectID, intent.Seq); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=?`, intent.ProjectID, prefix, number); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, intent.ProjectID, prefix, number, suffix); err != nil {
 			return err
 		}
 		_, err := conn.ExecContext(ctx, `INSERT INTO requirements(project_id, worktree_id, id, path, digest, status, text)

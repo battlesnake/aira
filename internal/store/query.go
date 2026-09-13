@@ -550,11 +550,14 @@ func distributionValues(row TicketRecord, by string) []string {
 
 func sortRecords(records []TicketRecord) {
 	sort.SliceStable(records, func(i, j int) bool {
-		leftPrefix, leftNumber := splitTicketID(records[i].Ticket.ID)
-		rightPrefix, rightNumber := splitTicketID(records[j].Ticket.ID)
+		leftPrefix, leftNumber, leftSuffix := splitTicketID(records[i].Ticket.ID)
+		rightPrefix, rightNumber, rightSuffix := splitTicketID(records[j].Ticket.ID)
 		if leftPrefix != rightPrefix {
 			return leftPrefix < rightPrefix
 		}
-		return leftNumber < rightNumber
+		if leftNumber != rightNumber {
+			return leftNumber < rightNumber
+		}
+		return leftSuffix < rightSuffix // deterministic tiebreak for split-suffix siblings (AIRA-237 Task 3)
 	})
 }

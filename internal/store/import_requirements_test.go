@@ -52,7 +52,8 @@ func TestImportRequirementsFreshPreservesIDsAndAdvancesCounter(t *testing.T) {
 			t.Fatalf("%s file=%#v err=%v", id, requirement, err)
 		}
 		var kind string
-		if err := s.db.QueryRow(`SELECT kind FROM allocations WHERE prefix='AR' AND number=?`, numberOf(id)).Scan(&kind); err != nil {
+		_, number, _ := splitTicketID(id)
+		if err := s.db.QueryRow(`SELECT kind FROM allocations WHERE prefix='AR' AND number=?`, number).Scan(&kind); err != nil {
 			t.Fatal(err)
 		}
 		if kind != kindRequirement {

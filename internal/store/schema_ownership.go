@@ -166,6 +166,92 @@ func recreateProjectOwnedTable(ctx context.Context, conn *sql.Conn, table string
 	return nil
 }
 
+// allocationsDDL is the single source of truth for the allocations table shape,
+// used by both the fresh CREATE (ifNotExists=true, table="allocations") and by
+// ensureAllocationsSuffix's recreation (a temp name). The primary key is
+// (project_id, prefix, number, suffix) so a hand-authored split-child
+// (FEE-BL-10a) keeps an allocation row distinct from its plain-numbered twin
+// (AIRA-237 Task 3, path A). suffix is TEXT NOT NULL with NO DEFAULT: an INSERT
+// that omits it fails loudly rather than silently writing the plain-twin key.
+func allocationsDDL(table string, ifNotExists bool) string {
+	ine := ""
+	if ifNotExists {
+		ine = "IF NOT EXISTS "
+	}
+	return `CREATE TABLE ` + ine + table + ` (
+            project_id TEXT NOT NULL, prefix TEXT NOT NULL, number INTEGER NOT NULL,
+            worktree_id TEXT NOT NULL, state TEXT NOT NULL, path TEXT NOT NULL,
+            seq INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'ticket', suffix TEXT NOT NULL,
+            PRIMARY KEY(project_id, prefix, number, suffix),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+        )`
+}
+
+// ensureAllocationsSuffix widens the allocations primary key with the Task-3
+// `suffix` column on a pre-suffix database. SQLite cannot ALTER a primary key
+// and `CREATE TABLE IF NOT EXISTS` is a no-op on the live machine-wide
+// state.db, so the table is recreated: a temp with the 4-column PK, INSERT ...
+// SELECT ..., '' (every existing row keeps an empty suffix), DROP, RENAME — all
+// in one BEGIN IMMEDIATE. A fast-path PRAGMA check keeps the common (already
+// migrated) open read-only, and the predicate is re-checked under the write
+// lock so a losing racer is a no-op (the AIRA-97 shape). It runs BEFORE
+// ensureProjectOwnershipFKs — the recreation carries the project FK forward, so
+// the later FK migration sees allocations already owned and skips it.
+func (s *Store) ensureAllocationsSuffix(ctx context.Context) error {
+	present, err := tableHasColumn(ctx, s.db, "allocations", "suffix")
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		present, err := tableHasColumn(ctx, conn, "allocations", "suffix")
+		if err != nil {
+			return err
+		}
+		if present {
+			return nil
+		}
+		columns, err := tableColumnNames(ctx, conn, "allocations")
+		if err != nil {
+			return err
+		}
+		if len(columns) == 0 || !stringSliceContains(columns, "project_id") {
+			return fmt.Errorf("E_SCHEMA_INVALID: allocations table is missing")
+		}
+		// Rows without a projects parent are detached, rebuildable index data;
+		// they cannot enter the now-FK-enforced table (mirrors
+		// recreateProjectOwnedTable). Harmless on a healthy database.
+		if _, err := conn.ExecContext(ctx, `DELETE FROM allocations WHERE NOT EXISTS (SELECT 1 FROM projects WHERE projects.project_id=allocations.project_id)`); err != nil {
+			return err
+		}
+		const temporary = "allocations_suffix"
+		if _, err := conn.ExecContext(ctx, `DROP TABLE IF EXISTS `+temporary); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, allocationsDDL(temporary, false)); err != nil {
+			return err
+		}
+		quotedColumns := make([]string, len(columns))
+		for index, column := range columns {
+			quotedColumns[index] = quoteIdentifier(column)
+		}
+		columnList := strings.Join(quotedColumns, ",")
+		// Existing rows carry no suffix, so the widened key gets ''.
+		if _, err := conn.ExecContext(ctx, `INSERT INTO `+temporary+` (`+columnList+`, suffix) SELECT `+columnList+`, '' FROM allocations`); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `DROP TABLE allocations`); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE `+temporary+` RENAME TO allocations`); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func tableColumnNames(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, table string) ([]string, error) {
