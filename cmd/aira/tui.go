@@ -679,8 +679,16 @@ func topMarkerGlyph(name string) string {
 //   - topBarUnknownGlyph ? — a RAM scope whose usage could not be read. OFF the
 //     fill-density axis on purpose: any shaded block would read as a definite
 //     fraction used, and an unreadable usage is not a measured fraction.
+//
+// AIRA-241 (owner, informed override of AIRA-135): the three-tier
+// current/peak/quota bar reintroduces ▓ (topBarPeakGlyph) for the new middle
+// peak band — the exact glyph the AIRA-135 note above rejected on cell-size
+// legibility grounds. The owner accepts that tradeoff for the added peak
+// signal. The AIRA-135 reasoning for ▒ on the idle tier is unchanged and
+// still stands.
 const (
 	topBarSolidGlyph   = "█"
+	topBarPeakGlyph    = "▓"
 	topBarIdleGlyph    = "▒"
 	topBarUnknownGlyph = "?"
 )
@@ -691,6 +699,8 @@ const (
 // the same for all three — the fill is the only thing that varies within a job.
 func topBarGlyph(cell topBarCell) string {
 	switch cell.Fill {
+	case topFillPeak:
+		return topBarPeakGlyph
 	case topFillIdle:
 		return topBarIdleGlyph
 	case topFillUnknown:
@@ -739,20 +749,32 @@ func topShadeLegend(bar *topBar) string {
 	if bar == nil || bar.Kind != topBarRAM {
 		return ""
 	}
-	hasKnown, hasUnknown := false, false
+	hasKnown, hasUnknown, hasPeak := false, false, false
 	for _, region := range bar.Regions {
 		if region.Kind != topRegionScope {
 			continue
 		}
 		if region.UsedKnown {
 			hasKnown = true
+			// AIRA-241. A zero-width band (peak == current, or peak unevaluated)
+			// draws no ▓ column at all, so it earns no key clause either -- the
+			// same "only what is actually on screen" rule the known/unknown split
+			// above already follows.
+			if region.PeakKnown && region.Peak > region.Used {
+				hasPeak = true
+			}
 		} else {
 			hasUnknown = true
 		}
 	}
 	parts := make([]string, 0, 2)
 	if hasKnown {
-		parts = append(parts, topBarSolidGlyph+" in use, "+topBarIdleGlyph+" reserved and idle")
+		clause := topBarSolidGlyph + " in use"
+		if hasPeak {
+			clause += ", " + topBarPeakGlyph + " peak reached"
+		}
+		clause += ", " + topBarIdleGlyph + " reserved and idle"
+		parts = append(parts, clause)
 	}
 	if hasUnknown {
 		parts = append(parts, topBarUnknownGlyph+" usage unevaluated")

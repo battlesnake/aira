@@ -266,6 +266,20 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		} else {
 			record.UnevaluatedFields = append(record.UnevaluatedFields, "rss")
 		}
+		// AIRA-241. memory.peak, read live through the SAME seam as
+		// memory.current above, from the same already-open scope directory. A
+		// kernel too old to publish it, or any other read/parse failure, leaves
+		// PeakRSS nil and names "peak" unevaluated -- never a fallback to
+		// RSSBytes and never a fabricated 0.
+		if data, readErr := deps.readField(scope, "memory.peak", 64); readErr == nil {
+			if value, parseErr := parseConfineInt(data); parseErr == nil {
+				record.PeakRSS = &value
+			} else {
+				record.UnevaluatedFields = append(record.UnevaluatedFields, "peak")
+			}
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "peak")
+		}
 		// AIRA-137. The scope's cumulative CPU counter, read live from the SAME
 		// already-open scope directory and through the SAME seam as memory.current
 		// above. cpu.stat is a multi-line key/value file (usage/user/system/nice,

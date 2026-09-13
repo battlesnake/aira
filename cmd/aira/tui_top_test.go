@@ -989,6 +989,145 @@ func TestTopBarRegionSplitsUsedFromReservedButUnused(t *testing.T) {
 	}
 }
 
+// AIRA-241 (owner, informed override of AIRA-135): a scope region's fill now
+// splits into THREE tiers -- solid current, mostly-solid peak band, shaded
+// quota remainder -- and each honesty edge case degrades independently rather
+// than fabricating a peak that was never read.
+//
+// verifies: AIRA-241
+func TestTopBarRegionSplitsCurrentPeakAndQuota(t *testing.T) {
+	const width = 64
+	// SystemMemTotalBytes 64 GiB over 64 columns puts exactly 1 GiB per column,
+	// matching TestTopBarRegionSplitsUsedFromReservedButUnused's convention so
+	// column boundaries can be asserted as plain GiB counts.
+	frame := &runner.ConfineSliceReserve{
+		SystemMemTotalBytes: 64 * gib, SystemMemAvailableBytes: 64 * gib,
+		SliceMaxBytes: 32 * gib, SliceHighState: runner.ConfineSliceHighNone,
+	}
+	const reserved = 8 * gib
+	for _, testCase := range []struct {
+		name          string
+		rss           *int64
+		peak          *int64
+		wantPeak      int64
+		wantPeakKnown bool
+		wantSolid     int
+		wantPeakCols  int
+		wantIdle      int
+		wantUnknown   int
+	}{
+		// (a) current < peak < quota: solid...peak-band...idle-remainder at the
+		// exact GiB boundaries.
+		{"current-lt-peak-lt-quota", int64Pointer(3 * gib), int64Pointer(6 * gib), 6 * gib, true, 3, 3, 2, 0},
+		// An equal-width peak and idle band. A mutation that swapped which
+		// boundary comparison feeds which fill (peakEnd/idle vs usedEnd/peak)
+		// would still produce solid=2/peak=3/idle=3 here -- the SAME per-tier
+		// counts as the correct output -- so only the sequence-order check
+		// below, not the counts above, can catch that particular mutation.
+		{"peak-and-idle-bands-equal-width", int64Pointer(2 * gib), int64Pointer(5 * gib), 5 * gib, true, 2, 3, 3, 0},
+		// (b) peak unevaluated: NO peak band at all -- byte-identical to the old
+		// two-tier fill (solid to current, idle for the rest). The pre-existing
+		// TestTopBarRegionSplitsUsedFromReservedButUnused, run unmodified against
+		// this same implementation, is the stronger version of this proof: it
+		// asserts the exact two-tier output with no knowledge of Peak at all.
+		{"peak-nil-is-byte-identical-to-two-tier", int64Pointer(4 * gib), nil, 0, false, 4, 0, 4, 0},
+		// (c) peak == current: zero-width band, so no peak glyph is drawn, but
+		// Peak/PeakKnown still carry the real reading (PeakKnown=true).
+		{"peak-equals-current-no-band", int64Pointer(5 * gib), int64Pointer(5 * gib), 5 * gib, true, 5, 0, 3, 0},
+		// A stale/skewed peak reading BELOW current is raised to it (the max()
+		// half of the clamp): the MODEL's Peak is pinned to `used`, not the raw
+		// reading, which is what stops a swapped-back clamp from reading as
+		// "no band" for the wrong reason.
+		{"peak-below-current-clamped-up-to-it", int64Pointer(6 * gib), int64Pointer(2 * gib), 6 * gib, true, 6, 0, 2, 0},
+		// (d) peak >= quota: the band runs to the region's right edge and there
+		// is no idle remainder at all -- both an exact-match and an over-shoot.
+		// The MODEL's Peak is pinned to `reserved` (not the raw over-shoot
+		// reading) so a removed upper clamp is caught even though the cell
+		// output alone cannot distinguish it (the column loop is itself bounded
+		// by the region's own width).
+		{"peak-exactly-quota-no-idle-remainder", int64Pointer(2 * gib), int64Pointer(8 * gib), 8 * gib, true, 2, 6, 0, 0},
+		{"peak-exceeds-quota-clamped-to-it", int64Pointer(2 * gib), int64Pointer(11 * gib), 8 * gib, true, 2, 6, 0, 0},
+		// (e) current unevaluated: the WHOLE region is the unknown glyph, even
+		// though the MODEL still carries a real, known Peak (computed from
+		// Used=0 since UsedKnown is false) -- current gates the RENDERED split,
+		// not whether Peak itself gets computed.
+		{"current-unevaluated-ignores-peak", nil, int64Pointer(6 * gib), 6 * gib, true, 0, 0, 0, 8},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			record := topTestRecord("CONFINE-alpha-101-aa", "alpha", reserved, 0)
+			record.RSSBytes = testCase.rss
+			record.PeakRSS = testCase.peak
+			// A second scope AFTER it, exactly as the two-tier test does, so the
+			// 3-way split cannot move the next region's start or steal its
+			// columns.
+			next := topTestRecord("CONFINE-bravo-102-bb", "bravo", 4*gib, 1*gib)
+			model, _ := topViewModel(topTick{}, topTestListing(frame, record, next))
+			region := model.Bar.Regions[0]
+			if after := model.Bar.Regions[1]; after.Start != reserved {
+				t.Fatalf("next region starts at %d, want %d; the split moved it", after.Start, reserved)
+			}
+			// Pin the MODEL's own Peak/PeakKnown, not just the rendered cells:
+			// topBarCells' loop is bounded by the region's own width, so an
+			// unclamped Peak that overshoots the quota can still render the
+			// right number of ▓ columns by accident. Asserting the model value
+			// directly is what actually pins topPeakWithin's clamp.
+			if region.PeakKnown != testCase.wantPeakKnown || region.Peak != testCase.wantPeak {
+				t.Fatalf("region peak=%d known=%v, want %d known=%v",
+					region.Peak, region.PeakKnown, testCase.wantPeak, testCase.wantPeakKnown)
+			}
+
+			cells := topBarCells(model.Bar, width)
+			solid, peak, idle, unknown := 0, 0, 0, 0
+			for column := 0; column < int(reserved/gib); column++ {
+				cell := cells[column]
+				if cell.Kind != topRegionScope || cell.Slot != 0 {
+					t.Fatalf("column %d=%+v, want slot 0's own region", column, cell)
+				}
+				if cell.Colour != region.Colour {
+					t.Fatalf("column %d colour=%q, want the one slot colour %q (AIRA-135 single colour)", column, cell.Colour, region.Colour)
+				}
+				switch cell.Fill {
+				case topFillPeak:
+					peak++
+				case topFillIdle:
+					idle++
+				case topFillUnknown:
+					unknown++
+				default:
+					solid++
+				}
+			}
+			if solid != testCase.wantSolid || peak != testCase.wantPeakCols || idle != testCase.wantIdle || unknown != testCase.wantUnknown {
+				t.Fatalf("solid=%d peak=%d idle=%d unknown=%d, want %d/%d/%d/%d",
+					solid, peak, idle, unknown, testCase.wantSolid, testCase.wantPeakCols, testCase.wantIdle, testCase.wantUnknown)
+			}
+			// The tiers must appear in the fixed left-to-right ORDER solid, peak,
+			// idle. The per-tier counts above cannot tell a correct bar from one
+			// whose peak/idle boundary comparisons were swapped whenever the two
+			// bands happen to be the same width (the "equal-width" case above is
+			// exactly that); this sequence check can.
+			if testCase.wantPeakCols > 0 || testCase.wantIdle > 0 {
+				var sawPeak, sawIdle bool
+				for column := 0; column < int(reserved/gib); column++ {
+					switch cells[column].Fill {
+					case topFillSolid:
+						if sawPeak || sawIdle {
+							t.Fatalf("column %d is solid after a peak/idle column; want solid before peak before idle", column)
+						}
+					case topFillPeak:
+						sawPeak = true
+						if sawIdle {
+							t.Fatalf("column %d is peak after an idle column; want peak before idle", column)
+						}
+					case topFillIdle:
+						sawIdle = true
+					}
+				}
+			}
+		})
+	}
+}
+
 // The scope-less aggregate, the free gap and the out-of-slice grey carry no
 // per-scope usage reading, so none of them is ever split.
 //
@@ -1025,6 +1164,7 @@ func TestTopBarNonScopeRegionsAreNeverSplit(t *testing.T) {
 // verifies: AIRA-135
 func TestTopBarGlyphIsOneCharacterPerFillState(t *testing.T) {
 	solid := topBarGlyph(topBarCell{Fill: topFillSolid})
+	peak := topBarGlyph(topBarCell{Fill: topFillPeak})
 	idle := topBarGlyph(topBarCell{Fill: topFillIdle})
 	unknown := topBarGlyph(topBarCell{Fill: topFillUnknown})
 	if topBarSolidGlyph != "█" {
@@ -1033,11 +1173,27 @@ func TestTopBarGlyphIsOneCharacterPerFillState(t *testing.T) {
 	if solid != topBarSolidGlyph {
 		t.Fatalf("solid glyph=%q, want the full block %q", solid, topBarSolidGlyph)
 	}
-	if idle != topBarIdleGlyph || idle == solid {
-		t.Fatalf("idle glyph=%q, want a shaded block distinct from the solid %q", idle, solid)
+	// AIRA-241 (owner, informed override of AIRA-135): the peak band reuses ▓,
+	// the glyph AIRA-135 rejected for the idle tier on cell-size-legibility
+	// grounds. It must still be a DISTINCT character from solid and idle so a
+	// mutation collapsing it into either neighbour fails here. The literal
+	// pins, like the pre-existing solid one above, catch a mutation that
+	// swapped the peak and idle constants' VALUES (▓ for ▒ or vice versa),
+	// which the distinctness checks alone would not.
+	if topBarPeakGlyph != "▓" {
+		t.Fatalf("the peak glyph constant is %q, want the mostly-solid block ▓", topBarPeakGlyph)
 	}
-	if unknown != topBarUnknownGlyph || unknown == solid || unknown == idle {
-		t.Fatalf("unknown glyph=%q, want a mark distinct from solid %q and idle %q", unknown, solid, idle)
+	if topBarIdleGlyph != "▒" {
+		t.Fatalf("the idle glyph constant is %q, want the medium-shaded block ▒", topBarIdleGlyph)
+	}
+	if peak != topBarPeakGlyph || peak == solid {
+		t.Fatalf("peak glyph=%q, want the mostly-solid block %q distinct from solid %q", peak, topBarPeakGlyph, solid)
+	}
+	if idle != topBarIdleGlyph || idle == solid || idle == peak {
+		t.Fatalf("idle glyph=%q, want a shaded block distinct from solid %q and peak %q", idle, solid, peak)
+	}
+	if unknown != topBarUnknownGlyph || unknown == solid || unknown == idle || unknown == peak {
+		t.Fatalf("unknown glyph=%q, want a mark distinct from solid %q, peak %q and idle %q", unknown, solid, peak, idle)
 	}
 	// The zero value is solid, so an untouched cell (a used column, and every CPU
 	// column) draws the full block with no special-casing.
@@ -1069,6 +1225,27 @@ func TestTopShadeLegendKeysTheGlyphsActuallyDrawn(t *testing.T) {
 	}
 	if strings.Contains(got, topBarUnknownGlyph) {
 		t.Fatalf("an established-usage bar's key=%q named the unevaluated mark it does not draw", got)
+	}
+	// AIRA-241. No PeakRSS was set on this fixture, so no peak band is drawn --
+	// the key must not name a glyph that is not on screen.
+	if strings.Contains(got, topBarPeakGlyph) {
+		t.Fatalf("a bar with no peak band's key=%q named the peak glyph it does not draw", got)
+	}
+	peaked := topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)
+	peaked.PeakRSS = int64Pointer(3 * gib)
+	withPeak, _ := topViewModel(topTick{}, topTestListing(frame, peaked))
+	if got := topShadeLegend(withPeak.Bar); !strings.Contains(got, topBarPeakGlyph) {
+		t.Fatalf("a bar with a real peak band's key=%q, want the peak glyph named", got)
+	}
+	// PeakRSS == RSSBytes (a real reading, but no higher than current usage) is
+	// PeakKnown=true with a ZERO-WIDTH band: no ▓ column is drawn, so the key
+	// must not name it either. This pins the legend's gate as
+	// "PeakKnown AND Peak > Used", not "PeakKnown" alone.
+	reached := topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)
+	reached.PeakRSS = reached.RSSBytes
+	atPeak, _ := topViewModel(topTick{}, topTestListing(frame, reached))
+	if got := topShadeLegend(atPeak.Bar); strings.Contains(got, topBarPeakGlyph) {
+		t.Fatalf("a bar whose peak equals current (zero-width band)'s key=%q named the peak glyph it does not draw", got)
 	}
 	// Usage unevaluated for every drawn scope: the ? clause ONLY, not the
 	// solid/idle pair, which describes a split that is not on this bar.

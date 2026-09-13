@@ -121,6 +121,48 @@ func TestConfineListHonestyUnreadablePerFieldAndHusk(t *testing.T) {
 	}
 }
 
+// AIRA-241. memory.peak is read live from the SAME already-open scope
+// directory memory.current (RSSBytes) and memory.max (Cap) come from, and
+// gets the same per-field honesty treatment: an established reading is never
+// also named unevaluated, and an absent one (no memory.peak file at all --
+// an old kernel, or a scope predating this field) is nil, never a fabricated
+// 0 and never RSSBytes standing in for it.
+func TestConfineListReadsLivePeakRSS(t *testing.T) {
+	slice := t.TempDir()
+	withPeak := confineTestScopeID("peak", 4301, time.Now().Add(-time.Second).UnixNano())
+	path := writeConfineTestScope(t, slice, withPeak, "")
+	if err := os.WriteFile(filepath.Join(path, "memory.peak"), []byte("6144\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// writeConfineTestScope never writes a memory.peak file, so this second
+	// scope simply has none.
+	noPeak := confineTestScopeID("no-peak", 4302, time.Now().Add(-2*time.Second).UnixNano())
+	writeConfineTestScope(t, slice, noPeak, "")
+
+	result, err := ListConfines(context.Background(), slice, nil)
+	if err != nil || len(result.Scopes) != 2 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	seen := map[string]ConfineRecord{}
+	for _, record := range result.Scopes {
+		seen[record.ScopeID] = record
+	}
+	record := seen[withPeak]
+	if record.PeakRSS == nil || *record.PeakRSS != 6144 {
+		t.Fatalf("with-peak record=%+v, want PeakRSS=6144", record)
+	}
+	if confineContainsString(record.UnevaluatedFields, "peak") {
+		t.Fatalf("an established peak was also named unevaluated: %+v", record)
+	}
+	absent := seen[noPeak]
+	if absent.PeakRSS != nil {
+		t.Fatalf("no-peak record=%+v, want a nil PeakRSS -- never fabricated, never RSSBytes standing in for it", absent)
+	}
+	if !confineContainsString(absent.UnevaluatedFields, "peak") {
+		t.Fatalf("an absent memory.peak was not named unevaluated: %+v", absent)
+	}
+}
+
 func TestConfineKillOwnershipGuardAndSteal(t *testing.T) {
 	slice := t.TempDir()
 	scopeID := confineTestOwnedScopeID("owned", "session-a", 4301, time.Now().UnixNano())
