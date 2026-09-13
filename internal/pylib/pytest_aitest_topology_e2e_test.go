@@ -710,3 +710,111 @@ func leasesSnapshotString(leases map[string]int64, sum int64) string {
 	}
 	return "Σ=" + strconv.FormatInt(sum, 10) + " {" + strings.Join(parts, ", ") + "}"
 }
+
+// confineTrailerLine extracts the single `confine: slice=...` operator trailer
+// FormatConfineStatus emits at job end (it carries scope-integrity, and any
+// escaped-pid/escaped-cgroup). Fails if absent — the job never produced a
+// trailer means it never ran a placed scope, and a scope-integrity assertion
+// against a missing trailer would be a false pass.
+func confineTrailerLine(t *testing.T, text string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "confine: slice=") {
+			return strings.TrimSpace(line)
+		}
+	}
+	t.Fatalf("no `confine: slice=...` trailer in the delegate run output (the job never ran a placed scope):\n%s", text)
+	return ""
+}
+
+// TestRealPytestAitestDelegateRunScopeIntegrityNoEscape is Gate E (P1-2,
+// §16.2) — the load-bearing escape-attestation gate, on a REAL `aira confine
+// --delegate-ram` run of the built binary (NOT the CgroupFD harness, which has no
+// runner attestation): the supervisor runs in the parent confine scope, its
+// workers fork there and place_self into first-class SIBLING scopes under the
+// slice. That migration must attest scope-integrity=UNVERIFIED with NO
+// descendant_escape — never descendant-escaped/migrated (and never `contained`,
+// which is leader-only by the #20 design: a supervisor always has relay
+// descendants).
+//
+// The observation is made RELIABLE (not a sampler race) by the delegate_escape_
+// testdata fixture: it registers an os.register_at_fork(after_in_child) handler
+// that dwells each forked worker ~250 ms in the SUPERVISOR's scope before
+// place_self (a documented window — worker.py notes at-fork handlers run in the
+// child before os.fork() returns to aitest, while it is still unplaced), and each
+// test sleeps ~400 ms so the migrated worker stays alive in its sibling scope. The
+// confine supervisor's 50 ms membership sampler therefore reliably catches the
+// worker in-scope during the dwell AND alive in its sibling on a later sample —
+// the exact migration the exemption must not witness as an escape. Without the
+// dwell the sub-millisecond fork→place_self window slips between samples and the
+// migration is never observed, so this gate would pass VACUOUSLY (verified: with
+// the plain blocking fixture the drop-exemption mutation did NOT surface an escape
+// — the teardown attestation enumerates only IN-SCOPE members, and migrated
+// siblings are not in the scope). The confine job runs against the ISOLATED
+// harness slice (--slice <isolated parent>, the same parent the harness daemon
+// admits workers against), never the production aira.slice.
+//
+// NON-VACUITY is proven by the drop-exemption mutation (recorded in the build
+// report, run as a discovery): revert T5's isOwnAitestWorkerScopePath exemption
+// (return false) → with the dwell fixture this run reads scope-integrity=
+// descendant-escaped with escaped-cgroup=<a .aira-CONFINE-aitest-w... path> →
+// the gate reds. (The chokepoint also has DETERMINISTIC unit coverage in
+// worker_escape_exemption_linux_test.go, which reds under the same mutation with
+// no sampler dependence; this is the real-run end-to-end complement.)
+func TestRealPytestAitestDelegateRunScopeIntegrityNoEscape(t *testing.T) {
+	harness := newRealDaemonAndCgroupTestHarness(t)
+	slice := filepath.Dir(harness.outerFile.Name()) // the isolated parent = the daemon's resolved slice
+
+	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Minute))
+	defer cancelRun()
+	command := exec.CommandContext(runCtx, harness.binary, "confine",
+		"--slice", slice, "--delegate-ram",
+		"--", harness.pytest, "-q", "--aitest-workers=2", "test_escape.py")
+	command.Dir = filepath.Join(harness.aitestDir, "delegate_escape_testdata")
+	command.WaitDelay = 20 * time.Second
+	// aira confine --delegate-ram publishes the aitest coordinates itself
+	// (AIRA_AITEST_LIB via ExtractAitest, WORKER_ADMIT_CMD=self, OUTER_SCOPE=its own
+	// scope, ADMISSION), and mints its own AIRA_CONFINE_SCOPE_ID (whose pid slot ==
+	// the confine supervisor's os.Getpid(), the monitor) — so the worker names embed
+	// the monitor's own pid and the local exemption fires. The dwell / real-cgroup
+	// keys pass through (not in the fixed strip set). XDG_* (daemon socket, state)
+	// ride in on os.Environ() from the harness's t.Setenv.
+	command.Env = append(os.Environ(),
+		"PYTHONDONTWRITEBYTECODE=1",
+		"AIRA_REAL_CGROUP=1",
+		"AIRA_AITEST_ESCAPE_FORK_DWELL_MS=250",
+	)
+	output, err := command.CombinedOutput()
+	text := string(output)
+
+	// It must NOT have fallen back to an unconfined pool: a fallback pool forks
+	// workers in-scope and never migrates, so there would be no migration to
+	// attest and the gate would be vacuous.
+	if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
+		t.Fatalf("delegate run fell back to unconfined execution (no sibling migration to attest):\n%s", text)
+	}
+	// The workers actually ran (they forked, migrated, and ran real tests): all
+	// four fixture tests passed. A run where no worker ever spawned would prove
+	// nothing about the migration exemption.
+	if !strings.Contains(text, "4 passed") {
+		t.Fatalf("delegate run did not report all 4 fixture tests passed (workers must have spawned+migrated+run):\nerr=%v\n%s", err, text)
+	}
+
+	trailer := confineTrailerLine(t, text)
+	// The scope was actually placed (not an early admission/resolution error, which
+	// would leave scope-integrity unset).
+	if !strings.Contains(trailer, "scope=placed") {
+		t.Fatalf("delegate run did not place its scope (early error?) — scope-integrity would be meaningless:\ntrailer: %s\n%s", trailer, text)
+	}
+	// The honest verdict: unverified (the supervisor has relay descendants), with
+	// NO escape. NOT descendant-escaped/migrated, NOT an escaped-pid, NOT contained.
+	if !strings.Contains(trailer, "scope-integrity=unverified") {
+		t.Fatalf("delegate run scope-integrity is not 'unverified' (the worker migration must attest unverified-with-no-escape):\ntrailer: %s\n%s", trailer, text)
+	}
+	for _, forbidden := range []string{"scope-integrity=descendant-escaped", "scope-integrity=migrated", "escaped-pid=", "escaped-cgroup="} {
+		if strings.Contains(trailer, forbidden) {
+			t.Fatalf("delegate run wrongly reported %q — the worker fork->place_self migration into its own sibling scope must be EXEMPTED, not witnessed as an escape:\ntrailer: %s", forbidden, trailer)
+		}
+	}
+	t.Logf("Gate E: delegate run attested %q", trailer)
+}
