@@ -188,14 +188,14 @@ func (a *Auditor) infer(ctx context.Context, entry Entry, in Inputs) ([]TicketBi
 		source string
 	}
 	var candidates []candidate
-	for _, id := range branchNameCandidates(entry.Branch.Value, in.Prefixes) {
+	for _, id := range branchNameCandidates(entry.Branch.Value, in.Prefixes, in.IDPrefix) {
 		candidates = append(candidates, candidate{id: id, source: SourceBranchName})
 	}
 	if ref, head, reason := measurable(entry); reason == "" {
 		out, _, err := a.git()(ctx, entry.Path, "log", "--no-merges", "--format=%s",
 			"--max-count="+strconv.Itoa(maxInferredSubjects), ref+".."+head)
 		if err == nil {
-			for _, id := range commitPrefixCandidates(out, in.Prefixes) {
+			for _, id := range commitPrefixCandidates(out, in.Prefixes, in.IDPrefix) {
 				candidates = append(candidates, candidate{id: id, source: SourceCommitPrefix})
 			}
 		}
@@ -233,7 +233,7 @@ func (a *Auditor) infer(ctx context.Context, entry Entry, in Inputs) ([]TicketBi
 // names like `investigate-aira91-92-…` and `review-whole-project`, and a wrong
 // association is worse than none: it attaches another ticket's status to this
 // checkout and can push it into the "superseded" bucket.
-func branchNameCandidates(branch string, prefixes []string) []string {
+func branchNameCandidates(branch string, prefixes []string, idPrefix string) []string {
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
 		return nil
@@ -242,15 +242,26 @@ func branchNameCandidates(branch string, prefixes []string) []string {
 	for _, prefix := range normalisedPrefixes(prefixes) {
 		pattern := regexp.MustCompile(`^(?i:` + regexp.QuoteMeta(prefix) + `)[-_]?(\d+)(?:[-_].*)?$`)
 		if match := pattern.FindStringSubmatch(branch); match != nil {
-			out = append(out, prefix+"-"+strings.TrimLeft(match[1], "0")+"")
+			out = append(out, composeCandidate(idPrefix, prefix, strings.TrimLeft(match[1], "0")))
 		}
 	}
 	return normaliseIDs(out)
 }
 
+// composeCandidate builds an inferred ticket id from a BARE prefix and number,
+// prepending the per-project id_prefix when namespacing is active (AIRA-237
+// Task 1), so `bl449-x` under id_prefix=FEE infers the stored FEE-BL-449 (else
+// the audit inference goes silent under namespacing).
+func composeCandidate(idPrefix, prefix, number string) string {
+	if idPrefix != "" {
+		return idPrefix + "-" + prefix + "-" + number
+	}
+	return prefix + "-" + number
+}
+
 // commitPrefixCandidates reads `AIRA-176:` and the multi-ticket `AIRA-188/189/190:`
 // form this repository uses on 17 of its last 300 master commits.
-func commitPrefixCandidates(subjects string, prefixes []string) []string {
+func commitPrefixCandidates(subjects string, prefixes []string, idPrefix string) []string {
 	var out []string
 	for _, prefix := range normalisedPrefixes(prefixes) {
 		pattern := regexp.MustCompile(`^(?i:` + regexp.QuoteMeta(prefix) + `)-(\d+(?:/\d+)*)\s*:`)
@@ -260,7 +271,7 @@ func commitPrefixCandidates(subjects string, prefixes []string) []string {
 				continue
 			}
 			for _, number := range strings.Split(match[1], "/") {
-				out = append(out, prefix+"-"+strings.TrimLeft(number, "0"))
+				out = append(out, composeCandidate(idPrefix, prefix, strings.TrimLeft(number, "0")))
 			}
 		}
 	}

@@ -221,6 +221,34 @@ func TestTicketRoundTripAndCanonicalRelationOrder(t *testing.T) {
 	}
 }
 
+func TestValidateIDAcceptsOneOptionalCompoundSegment(t *testing.T) {
+	// AIRA-237 Task 1: a namespaced project composes <id_prefix>-<PREFIX>, so a
+	// stored/keyed/filenamed id gains ONE optional compound segment. Task 3 later
+	// adds the trailing split-suffix letter; it must NOT be accepted yet.
+	accept := []string{"AIRA-42", "FEE-BL-123", "STO-NF-1"}
+	for _, id := range accept {
+		if err := ValidateID(id); err != nil {
+			t.Errorf("ValidateID(%q) = %v; want accept", id, err)
+		}
+	}
+	reject := []string{
+		"fee-bl-1",    // lowercase
+		"FEE--1",      // empty second segment
+		"FEE-BL-0",    // zero number
+		"A-1",         // single-letter prefix
+		"AB-CD-EF-1",  // two compound segments
+		"FEE-BL-123a", // trailing suffix (Task 3, not yet)
+		"BL-123a",     // trailing suffix (Task 3, not yet)
+		"FEE-BL",      // no number
+		"FEE-BL-",     // trailing separator, no number
+	}
+	for _, id := range reject {
+		if err := ValidateID(id); err == nil {
+			t.Errorf("ValidateID(%q) = nil; want reject", id)
+		}
+	}
+}
+
 func TestParseTicketRejectsTrailingFrontmatterContent(t *testing.T) {
 	ticket := Ticket{
 		ID: "AIRA-42", Project: "aira", Title: "trailing content",

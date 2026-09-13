@@ -115,6 +115,9 @@ func (s *Store) scanStoredRelations() ([]storedRelation, map[string]domain.Ticke
 }
 
 func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind, to string) (EventKey, error) {
+	// Both endpoints are namespaced on ingress: a bare BL-1 typed under
+	// id_prefix=FEE keys the stored FEE-BL-1 (AIRA-237 Task 1).
+	from, to = s.canonicalID(from), s.canonicalID(to)
 	if err := domain.ValidateID(from); err != nil {
 		return EventKey{}, err
 	}
@@ -209,6 +212,7 @@ func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind,
 }
 
 func (s *Store) Unlink(ctx context.Context, from string, kind domain.RelationKind, to string) (EventKey, error) {
+	from, to = s.canonicalID(from), s.canonicalID(to)
 	if err := domain.ValidateID(from); err != nil {
 		return EventKey{}, err
 	}
@@ -275,6 +279,7 @@ func (s *Store) Unlink(ctx context.Context, from string, kind domain.RelationKin
 }
 
 func (s *Store) Relations(id string) ([]domain.RelationView, error) {
+	id = s.canonicalID(id)
 	if err := domain.ValidateID(id); err != nil {
 		return nil, err
 	}
@@ -434,7 +439,7 @@ func satisfied(status domain.Status) bool {
 }
 
 func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
-	sel, err := parseSelector(selector)
+	sel, err := s.canonicalSelector(selector)
 	if err != nil {
 		return nil, err
 	}

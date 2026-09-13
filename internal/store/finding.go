@@ -93,6 +93,10 @@ func (s *Store) prepareFindingMutation(ctx context.Context, path, precondition s
 }
 
 func (s *Store) AddFinding(ctx context.Context, input domain.ReviewFindingInput) (domain.Finding, EventKey, error) {
+	// Namespace the ticket id BEFORE the finding key is computed, so a bare
+	// BL-123 typed under id_prefix=FEE keys the finding on FEE-BL-123 (the
+	// ingress leak `find add --ticket` would otherwise orphan; AIRA-237 Task 1).
+	input.TicketID = s.canonicalID(strings.TrimSpace(input.TicketID))
 	findingLock, err := s.acquireFindingMutationLock()
 	if err != nil {
 		return domain.Finding{}, EventKey{}, err
@@ -262,6 +266,14 @@ func (s *Store) ListFindings(query string) ([]FindingRecord, error) {
 		terms, err = parseTermsWithValidator(query, validFindingField)
 		if err != nil {
 			return nil, fmt.Errorf("E_SELECTOR_INVALID: %w", err)
+		}
+	}
+	// The finding `ticket:` term does raw string equality against the stored
+	// (compound) TicketID, so a bare id must be namespaced or it silently
+	// matches nothing (AIRA-237 Task 1).
+	for i := range terms {
+		if terms[i].Field == "ticket" && !terms[i].Text {
+			terms[i].Value = s.canonicalID(terms[i].Value)
 		}
 	}
 	subtype := domain.FindingSubtypeReview

@@ -200,27 +200,32 @@ const (
 // WorktreeScope is the serialisable, client-discovered projection needed to
 // construct one Store scope. Machine-wide state paths are intentionally absent.
 type WorktreeScope struct {
-	Root                string             `json:"root"`
-	CommonDir           string             `json:"common_dir"`
-	GitDir              string             `json:"git_dir"`
-	WorktreeID          string             `json:"worktree_id"`
-	ProjectID           string             `json:"project_id"`
-	Slug                string             `json:"slug"`
-	Prefixes            []string           `json:"prefixes"`
-	RequirementPrefixes []string           `json:"requirement_prefixes,omitempty"`
-	ReviewPolicy        store.ReviewPolicy `json:"review_policy"`
-	ReviewConfigured    bool               `json:"review_configured,omitempty"`
-	MaxReports          int                `json:"max_reports,omitempty"`
-	MaxAgeDays          int                `json:"max_age_days,omitempty"`
-	MaxComputeEvents    int                `json:"max_compute_events,omitempty"`
-	MaxComputeAgeDays   int                `json:"max_compute_age_days,omitempty"`
-	MaxCommandEvents    int                `json:"max_command_events,omitempty"`
-	MaxCommandAgeDays   int                `json:"max_command_age_days,omitempty"`
-	MaxQuotaSnapshots   int                `json:"max_quota_snapshots,omitempty"`
-	LeaseTTLNS          uint64             `json:"lease_ttl_ns,omitempty"`
-	ConfigDigest        string             `json:"config_digest"`
-	StateID             string             `json:"state_id,omitempty"`
-	Bootstrap           bool               `json:"bootstrap,omitempty"`
+	Root                string   `json:"root"`
+	CommonDir           string   `json:"common_dir"`
+	GitDir              string   `json:"git_dir"`
+	WorktreeID          string   `json:"worktree_id"`
+	ProjectID           string   `json:"project_id"`
+	Slug                string   `json:"slug"`
+	Prefixes            []string `json:"prefixes"`
+	RequirementPrefixes []string `json:"requirement_prefixes,omitempty"`
+	// IDPrefix carries the per-project namespacing prefix through the daemon
+	// scope path so composition happens inside NewScope on the LIVE path, not
+	// only the test-only app layer (AIRA-237 Task 1). Intentional proto struct
+	// change; free per no-compat, needs a coordinated same-proto daemon restart.
+	IDPrefix          string             `json:"id_prefix,omitempty"`
+	ReviewPolicy      store.ReviewPolicy `json:"review_policy"`
+	ReviewConfigured  bool               `json:"review_configured,omitempty"`
+	MaxReports        int                `json:"max_reports,omitempty"`
+	MaxAgeDays        int                `json:"max_age_days,omitempty"`
+	MaxComputeEvents  int                `json:"max_compute_events,omitempty"`
+	MaxComputeAgeDays int                `json:"max_compute_age_days,omitempty"`
+	MaxCommandEvents  int                `json:"max_command_events,omitempty"`
+	MaxCommandAgeDays int                `json:"max_command_age_days,omitempty"`
+	MaxQuotaSnapshots int                `json:"max_quota_snapshots,omitempty"`
+	LeaseTTLNS        uint64             `json:"lease_ttl_ns,omitempty"`
+	ConfigDigest      string             `json:"config_digest"`
+	StateID           string             `json:"state_id,omitempty"`
+	Bootstrap         bool               `json:"bootstrap,omitempty"`
 }
 
 type RequestFrame struct {

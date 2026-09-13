@@ -85,7 +85,13 @@ type RunConfig struct {
 }
 
 type ProjectConfig struct {
-	Slug                string            `json:"slug"`
+	Slug string `json:"slug"`
+	// IDPrefix namespaces this project's prefixes machine-wide (AIRA-237 Task
+	// 1): when set (e.g. "FEE"), aira composes <id_prefix>-<PREFIX> (FEE-BL) as
+	// the registered/owned/keyed/filenamed prefix and strips/prepends FEE- only
+	// at the human boundary. Absent = today's behaviour (prefixes verbatim).
+	// readConfig uses DisallowUnknownFields, so this field must exist to parse.
+	IDPrefix            string            `json:"id_prefix,omitempty"`
 	Prefixes            []string          `json:"prefixes"`
 	RequirementPrefixes []string          `json:"requirement_prefixes,omitempty"`
 	Review              json.RawMessage   `json:"review,omitempty"`
@@ -242,6 +248,7 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 		ProjectID:    project.ProjectID, WorktreeID: project.WorktreeID,
 		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
 		RequirementPrefixes: project.Config.Project.RequirementPrefixes,
+		IDPrefix:            project.Config.Project.IDPrefix,
 		ReviewPolicy:        reviewPolicy,
 		MaxReports:          project.Config.Project.TestReports.MaxReports,
 		MaxAgeDays:          project.Config.Project.TestReports.MaxAgeDays,
@@ -357,7 +364,7 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 			Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
 			ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
 			ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
-			RequirementPrefixes: project.Config.Project.RequirementPrefixes, ReviewPolicy: reviewPolicy,
+			RequirementPrefixes: project.Config.Project.RequirementPrefixes, IDPrefix: project.Config.Project.IDPrefix, ReviewPolicy: reviewPolicy,
 			LeaseTTLNS: leaseTTLNS(project.Config), ConfigDigest: hex.EncodeToString(digest[:]), Bootstrap: true,
 		})
 		if err != nil {
@@ -398,6 +405,7 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
 		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
 		RequirementPrefixes: project.Config.Project.RequirementPrefixes,
+		IDPrefix:            project.Config.Project.IDPrefix,
 		ReviewPolicy:        reviewPolicy, LeaseTTLNS: leaseTTLNS(project.Config),
 	})
 	if err != nil {
@@ -449,6 +457,9 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 				return InitPlan{}, fmt.Errorf("E_CONFIG_INVALID: committed project prefixes mismatch: config=%v requested=%v", config.Project.Prefixes, requested)
 			}
 		}
+		if requested := strings.ToUpper(strings.TrimSpace(stringArg(args, "id_prefix"))); requested != "" && requested != strings.ToUpper(config.Project.IDPrefix) {
+			return InitPlan{}, fmt.Errorf("E_CONFIG_INVALID: committed project id_prefix mismatch: config=%s requested=%s", config.Project.IDPrefix, requested)
+		}
 		data = committed
 		adopt = true
 	} else if !errors.Is(statErr, os.ErrNotExist) {
@@ -466,7 +477,8 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 		for i := range prefixes {
 			prefixes[i] = strings.ToUpper(prefixes[i])
 		}
-		config = Config{Schema: 1, Project: ProjectConfig{Slug: slug, Prefixes: prefixes}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}}
+		idPrefix := strings.ToUpper(strings.TrimSpace(stringArg(args, "id_prefix")))
+		config = Config{Schema: 1, Project: ProjectConfig{Slug: slug, IDPrefix: idPrefix, Prefixes: prefixes}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}}
 		if err := validateConfig(config); err != nil {
 			return InitPlan{}, err
 		}
@@ -603,6 +615,28 @@ func validateConfig(config Config) error {
 			return fmt.Errorf("E_CONFIG_INVALID: duplicate prefix %q", prefix)
 		}
 		seen[prefix] = true
+	}
+	// AIRA-237 Task 1: id_prefix is plain [A-Z]{2,} (the compound is only ever
+	// composed, never authored) and MUST NOT itself be a project prefix, or the
+	// segment-count prepend rule would be ambiguous. The bare-prefix charset
+	// check above stays strict.
+	if idp := strings.TrimSpace(config.Project.IDPrefix); idp != "" {
+		// Strict on the authored value, exactly like the bare-prefix charset
+		// check above: uppercase A-Z, len>=2, no hyphen (the compound is only
+		// ever composed).
+		if len(idp) < 2 || idp != strings.ToUpper(idp) {
+			return fmt.Errorf("E_CONFIG_INVALID: invalid id_prefix %q", config.Project.IDPrefix)
+		}
+		for _, r := range idp {
+			if r < 'A' || r > 'Z' {
+				return fmt.Errorf("E_CONFIG_INVALID: invalid id_prefix %q", config.Project.IDPrefix)
+			}
+		}
+		for _, prefix := range append(append([]string(nil), config.Project.Prefixes...), config.Project.RequirementPrefixes...) {
+			if strings.ToUpper(prefix) == idp {
+				return fmt.Errorf("E_CONFIG_INVALID: id_prefix %q must not also be a project prefix", config.Project.IDPrefix)
+			}
+		}
 	}
 	ttlSeconds := config.Lease.TTLSeconds
 	if ttlSeconds == 0 {

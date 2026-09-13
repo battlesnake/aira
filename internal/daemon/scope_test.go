@@ -25,7 +25,7 @@ func TestScopeFromProjectMatchesLegacyClientProjection(t *testing.T) {
 				Config: app.Config{
 					Schema: 1,
 					Project: app.ProjectConfig{
-						Slug: "demo", Prefixes: []string{"AIR", "BUG"}, RequirementPrefixes: []string{"REQ"},
+						Slug: "demo", IDPrefix: "FEE", Prefixes: []string{"AIR", "BUG"}, RequirementPrefixes: []string{"REQ"},
 						Review:      json.RawMessage(`{"default_tier":4}`),
 						TestReports: app.TestReportsConfig{MaxReports: 7, MaxAgeDays: 9},
 						Compute:     app.ComputeConfig{MaxEvents: 11, MaxAgeDays: 13, MaxQuotaSnapshots: 17},
@@ -85,7 +85,8 @@ func legacyClientScopeFromProject(project app.Project, paths Paths) (WorktreeSco
 		Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
 		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
 		Slug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
-		RequirementPrefixes: project.Config.Project.RequirementPrefixes, ReviewPolicy: reviewPolicy,
+		RequirementPrefixes: project.Config.Project.RequirementPrefixes, IDPrefix: project.Config.Project.IDPrefix,
+		ReviewPolicy:     reviewPolicy,
 		ReviewConfigured: reviewPolicy.Configured,
 		MaxReports:       project.Config.Project.TestReports.MaxReports, MaxAgeDays: project.Config.Project.TestReports.MaxAgeDays,
 		MaxComputeEvents: project.Config.Project.Compute.MaxEvents, MaxComputeAgeDays: project.Config.Project.Compute.MaxAgeDays,

@@ -590,10 +590,14 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		}
 		return Response{OK: true, Code: code, Data: report, Warnings: warnings, Exit: exitCode(report)}
 	}
+	// AIRA-237 Task 1: strip the id_prefix from id-bearing fields for
+	// human-facing output. nil when non-namespaced/non-whitelisted, so
+	// responseFrame keeps the typed Data unchanged.
+	displayRaw := c.projectDisplayIDs(verb, data)
 	if verdict != "" {
-		return Response{OK: true, Code: strings.ToUpper(verdict), Data: data, Warnings: warnings, Exit: verdictExit(verdict)}
+		return Response{OK: true, Code: strings.ToUpper(verdict), Data: data, RawData: displayRaw, Warnings: warnings, Exit: verdictExit(verdict)}
 	}
-	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings, AfterWrite: afterWrite}
+	return Response{OK: true, Code: "OK", Data: data, RawData: displayRaw, Warnings: warnings, AfterWrite: afterWrite}
 }
 
 func runRecord(data any) (runner.RunRecord, bool) {
@@ -718,11 +722,11 @@ func (c *Core) DispatchDescriptors() []DispatchDescriptor {
 func (c *Core) dispatchTable() map[string]verbSpec {
 	verbs := map[string]verbSpec{
 		"help": {Name: "help", Usage: "help", Run: func(_ context.Context, _ *argAccessor) (any, error) { return c.Help(), nil }},
-		"init": {Name: "init", Usage: "init [--project SLUG] [--prefixes P,...]", Args: []ArgSpec{stringSpec("project", false, false, "Project slug"), listSpec("prefixes", false, false, "ID prefixes")}, MCPTool: "aira_init", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"init": {Name: "init", Usage: "init [--project SLUG] [--prefixes P,...] [--id-prefix X]", Args: []ArgSpec{stringSpec("project", false, false, "Project slug"), listSpec("prefixes", false, false, "ID prefixes"), stringSpec("id_prefix", false, false, "Per-project ID namespacing prefix (AIRA-237)")}, MCPTool: "aira_init", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if c.initializer == nil {
 				return nil, fmt.Errorf("E_CONFIG_INVALID: init is unavailable without a project initializer")
 			}
-			return c.initializer(ctx, map[string]any{"project": stringArg(args, "project"), "prefixes": stringSlice(args, "prefixes")})
+			return c.initializer(ctx, map[string]any{"project": stringArg(args, "project"), "prefixes": stringSlice(args, "prefixes"), "id_prefix": stringArg(args, "id_prefix")})
 		}},
 		"eject": {Name: "eject", Usage: "eject [project-id] [--prefix P | --project ID] [--purge] [--force]", Args: []ArgSpec{
 			stringSpec("project", false, true, "Exact or unambiguous project ID prefix"),

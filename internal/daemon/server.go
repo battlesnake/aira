@@ -1147,7 +1147,8 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 		Root: planRoot, CommonDir: planCommon, GitDir: planGit,
 		ProjectID: projectID, WorktreeID: worktreeID,
 		ProjectSlug: plan.Project.Config.Project.Slug, Prefixes: plan.Project.Config.Project.Prefixes,
-		RequirementPrefixes: plan.Project.Config.Project.RequirementPrefixes, ReviewPolicy: reviewPolicy,
+		RequirementPrefixes: plan.Project.Config.Project.RequirementPrefixes, IDPrefix: plan.Project.Config.Project.IDPrefix,
+		ReviewPolicy:  reviewPolicy,
 		LeaseStateDir: filepath.Join(s.Paths.LeaseStateDir, worktreeID),
 		LeaseTTLNS:    uint64(plan.Project.Config.Lease.TTLSeconds) * uint64(time.Second), ConfigDigest: configDigest,
 		Bootstrap: true,
@@ -1292,7 +1293,7 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 	view, err := store.NewScope(s.db, store.ScopeOptions{
 		Root: root, CommonDir: common, GitDir: gitDir,
 		ProjectID: projectID, WorktreeID: worktreeID, ProjectSlug: scope.Slug,
-		Prefixes: scope.Prefixes, RequirementPrefixes: scope.RequirementPrefixes,
+		Prefixes: scope.Prefixes, RequirementPrefixes: scope.RequirementPrefixes, IDPrefix: scope.IDPrefix,
 		ReviewPolicy: scope.ReviewPolicy, LeaseStateDir: leaseDir, LeaseTTLNS: scope.LeaseTTLNS,
 		MaxReports: scope.MaxReports, MaxAgeDays: scope.MaxAgeDays,
 		MaxComputeEvents: scope.MaxComputeEvents, MaxComputeAgeDays: scope.MaxComputeAgeDays,

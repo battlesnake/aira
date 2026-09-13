@@ -144,7 +144,11 @@ type CreateTicketInput struct {
 	Labels   []string
 }
 
-var idPattern = regexp.MustCompile(`^[A-Z]{2,}-[1-9][0-9]*$`)
+// idPattern accepts an optional single compound segment (AIRA-237 Task 1's
+// per-project namespacing: a stored id is composed <id_prefix>-<PREFIX>-<n>,
+// e.g. FEE-BL-123). The number part stays digits-only here; Task 3 extends it
+// with a trailing split-suffix letter (`BL-10a`) — do NOT add that yet.
+var idPattern = regexp.MustCompile(`^[A-Z]{2,}(-[A-Z]{2,})?-[1-9][0-9]*$`)
 var projectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{1,62}$`)
 
 func ValidateID(id string) error {

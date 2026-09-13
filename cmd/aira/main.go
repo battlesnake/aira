@@ -386,6 +386,9 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		if value := options["prefixes"]; value != "" {
 			requestArgs["prefixes"] = splitComma(value)
 		}
+		if value := options["id-prefix"]; value != "" {
+			requestArgs["id_prefix"] = value
+		}
 		paths, pathErr := daemon.PathsFromEnv()
 		if pathErr != nil {
 			return render(transportErrorResponse(pathErr), renderJSON, stdout, stderr)
@@ -790,7 +793,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		}
 	}
 	allowed := map[string]map[string]bool{
-		"init":   {"project": true, "prefixes": true},
+		"init":   {"project": true, "prefixes": true, "id-prefix": true},
 		"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
 		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},

@@ -66,6 +66,11 @@ type Options struct {
 	// They must be disjoint from Prefixes (ticket-kind); a prefix belongs to
 	// exactly one kind.
 	RequirementPrefixes []string
+	// IDPrefix is the per-project namespacing prefix (AIRA-237 Task 1). When
+	// set (e.g. "FEE"), every bare prefix P is registered/keyed/filenamed as the
+	// composed <IDPrefix>-P (e.g. FEE-BL), and ids are stored compound
+	// (FEE-BL-123). Empty = today's behaviour (prefixes used verbatim).
+	IDPrefix string
 	// ReviewPolicy is validated eagerly by Open. A zero policy means the
 	// project has no review block and therefore defaults to tier 3.
 	ReviewPolicy      ReviewPolicy
@@ -93,19 +98,21 @@ type ScopeOptions struct {
 	ProjectSlug         string
 	Prefixes            []string
 	RequirementPrefixes []string
-	ReviewPolicy        ReviewPolicy
-	LeaseStateDir       string
-	LeaseTTLNS          uint64
-	MaxReports          int
-	MaxAgeDays          int
-	MaxComputeEvents    int
-	MaxComputeAgeDays   int
-	MaxCommandEvents    int
-	MaxCommandAgeDays   int
-	MaxQuotaSnapshots   int
-	ConfigDigest        string
-	Bootstrap           bool
-	Clock               Clock
+	// IDPrefix mirrors Options.IDPrefix for the daemon/relay scope path.
+	IDPrefix          string
+	ReviewPolicy      ReviewPolicy
+	LeaseStateDir     string
+	LeaseTTLNS        uint64
+	MaxReports        int
+	MaxAgeDays        int
+	MaxComputeEvents  int
+	MaxComputeAgeDays int
+	MaxCommandEvents  int
+	MaxCommandAgeDays int
+	MaxQuotaSnapshots int
+	ConfigDigest      string
+	Bootstrap         bool
+	Clock             Clock
 }
 
 // DB is the owner of one machine-wide SQLite connection and its pinned path
@@ -147,6 +154,7 @@ type Store struct {
 	configDigest      string
 	reviewPolicy      ReviewPolicy
 	prefixes          map[string]string // prefix -> entity kind (ticket|requirement)
+	idPrefix          string            // per-project namespacing prefix (AIRA-237 Task 1); "" = none
 	leaseStateDir     string
 	leaseTTLNS        uint64
 	maxReports        int
@@ -330,7 +338,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		Root: opts.Root, CommonDir: opts.CommonDir, GitDir: opts.GitDir,
 		ProjectID: opts.ProjectID, WorktreeID: opts.WorktreeID,
 		ProjectSlug: opts.ProjectSlug, Prefixes: opts.Prefixes,
-		RequirementPrefixes: opts.RequirementPrefixes, ReviewPolicy: opts.ReviewPolicy,
+		RequirementPrefixes: opts.RequirementPrefixes, IDPrefix: opts.IDPrefix, ReviewPolicy: opts.ReviewPolicy,
 		LeaseStateDir: opts.LeaseStateDir, LeaseTTLNS: opts.LeaseTTLNS,
 		MaxReports: opts.MaxReports, MaxAgeDays: opts.MaxAgeDays,
 		MaxComputeEvents: opts.MaxComputeEvents, MaxComputeAgeDays: opts.MaxComputeAgeDays,
@@ -439,24 +447,9 @@ func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
 	if s.clock == nil {
 		s.clock = systemClock{}
 	}
-	for _, prefix := range opts.Prefixes {
-		if !validPrefix(prefix) {
-			_ = conn.Close()
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		s.prefixes[strings.ToUpper(prefix)] = kindTicket
-	}
-	for _, prefix := range opts.RequirementPrefixes {
-		if !validPrefix(prefix) {
-			_ = conn.Close()
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		up := strings.ToUpper(prefix)
-		if existing, duplicate := s.prefixes[up]; duplicate && existing != kindRequirement {
-			_ = conn.Close()
-			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
-		}
-		s.prefixes[up] = kindRequirement
+	if err := s.registerPrefixes(opts.IDPrefix, opts.Prefixes, opts.RequirementPrefixes); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -658,23 +651,8 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	if s.clock == nil {
 		s.clock = systemClock{}
 	}
-	for _, prefix := range opts.Prefixes {
-		if !validPrefix(prefix) {
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		s.prefixes[strings.ToUpper(prefix)] = kindTicket
-	}
-	for _, prefix := range opts.RequirementPrefixes {
-		if !validPrefix(prefix) {
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		up := strings.ToUpper(prefix)
-		if existing, dup := s.prefixes[up]; dup && existing != kindRequirement {
-			// Prefixes are disjoint by kind: a prefix may not be both a ticket
-			// and a requirement prefix.
-			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
-		}
-		s.prefixes[up] = kindRequirement
+	if err := s.registerPrefixes(opts.IDPrefix, opts.Prefixes, opts.RequirementPrefixes); err != nil {
+		return nil, err
 	}
 	if !register {
 		return s, nil
@@ -2084,7 +2062,10 @@ func (s *Store) RegisterWorktree(ctx context.Context, worktreeID, root string) e
 }
 
 func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
-	prefix = strings.ToUpper(prefix)
+	// A bare prefix (BL) typed under id_prefix=FEE mints against the composed
+	// FEE-BL ownership + counter (AIRA-237 Task 1); already-compound passes
+	// through. canonicalID keys off the registered prefix, not HasPrefix.
+	prefix = strings.ToUpper(s.canonicalID(prefix))
 	kind, owned := s.prefixes[prefix]
 	if !validPrefix(prefix) || !owned {
 		return "", fmt.Errorf("E_ID_INVALID: unowned prefix %q", prefix)
@@ -3461,16 +3442,147 @@ func splitTicketID(id string) (string, int) {
 	return id[:idx], n
 }
 
+// validPrefix accepts a bare prefix (A-Z, len>=2, e.g. "BL") or ONE composed
+// <id_prefix>-<PREFIX> shape (AIRA-237 Task 1, e.g. "FEE-BL"): at most one '-'
+// separator, each segment A-Z and len>=2. It rejects arbitrary hyphens
+// ("FEE-BL-X"), a trailing separator ("FEE-"), and lowercase. Task 3 does not
+// widen this further (the compound is only ever formed by composition).
 func validPrefix(prefix string) bool {
-	if len(prefix) < 2 {
+	if prefix == "" {
 		return false
 	}
-	for _, r := range prefix {
+	segments := strings.Split(prefix, "-")
+	if len(segments) > 2 {
+		return false
+	}
+	for _, segment := range segments {
+		if len(segment) < 2 {
+			return false
+		}
+		for _, r := range segment {
+			if r < 'A' || r > 'Z' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// validIDPrefix reports whether p is a valid per-project namespacing prefix:
+// plain A-Z, len>=2 (AIRA-237 Task 1). No hyphen — the compound is only ever
+// composed, never authored.
+func validIDPrefix(p string) bool {
+	if len(p) < 2 {
+		return false
+	}
+	for _, r := range p {
 		if r < 'A' || r > 'Z' {
 			return false
 		}
 	}
 	return true
+}
+
+// registerPrefixes composes and registers a project's ticket and requirement
+// prefixes into s.prefixes, retaining s.idPrefix (AIRA-237 Task 1). When
+// idPrefix is set, each bare prefix P is registered as the composed key
+// <idPrefix>-P, so prefix_ownership and id_counters own the compound (FEE-BL)
+// and every stored/keyed/filenamed id is the full FEE-BL-123. It refuses an
+// id_prefix that is also a project prefix (the segment-count prepend rule would
+// be ambiguous).
+func (s *Store) registerPrefixes(idPrefix string, ticketPrefixes, requirementPrefixes []string) error {
+	idPrefix = strings.ToUpper(strings.TrimSpace(idPrefix))
+	if idPrefix != "" && !validIDPrefix(idPrefix) {
+		return fmt.Errorf("E_CONFIG_INVALID: invalid id_prefix %q", idPrefix)
+	}
+	s.idPrefix = idPrefix
+	compose := func(bare string) (string, error) {
+		up := strings.ToUpper(bare)
+		if idPrefix != "" && up == idPrefix {
+			return "", fmt.Errorf("E_CONFIG_INVALID: id_prefix %q must not also be a project prefix", idPrefix)
+		}
+		key := up
+		if idPrefix != "" {
+			key = idPrefix + "-" + up
+		}
+		if !validPrefix(key) {
+			return "", fmt.Errorf("E_ID_INVALID: invalid prefix %q", bare)
+		}
+		return key, nil
+	}
+	for _, bare := range ticketPrefixes {
+		key, err := compose(bare)
+		if err != nil {
+			return err
+		}
+		s.prefixes[key] = kindTicket
+	}
+	for _, bare := range requirementPrefixes {
+		key, err := compose(bare)
+		if err != nil {
+			return err
+		}
+		if existing, dup := s.prefixes[key]; dup && existing != kindRequirement {
+			// Prefixes are disjoint by kind: a prefix may not be both a ticket
+			// and a requirement prefix.
+			return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", key)
+		}
+		s.prefixes[key] = kindRequirement
+	}
+	return nil
+}
+
+// IDPrefix returns this project's namespacing prefix ("" when none).
+func (s *Store) IDPrefix() string { return s.idPrefix }
+
+// CanonicalID is the exported façade over canonicalID for the core faces.
+func (s *Store) CanonicalID(raw string) string { return s.canonicalID(raw) }
+
+// DisplayID is the exported façade over displayID for the core faces.
+func (s *Store) DisplayID(value string) string { return s.displayID(value) }
+
+// canonicalID prepends the project's id_prefix to a human-typed id (or bare
+// prefix, for `aira id`) when — and only when — doing so names a registered
+// prefix (AIRA-237 Task 1). It is idempotent: an already-compound id copied
+// from aira's own output (FEE-BL-123) has first segment FEE, and FEE-FEE is not
+// registered, so it passes through unchanged. This is NOT a HasPrefix test,
+// which would double-prepend or mangle an unrelated id.
+func (s *Store) canonicalID(raw string) string {
+	if s.idPrefix == "" || raw == "" {
+		return raw
+	}
+	seg1 := raw
+	if i := strings.IndexByte(raw, '-'); i >= 0 {
+		seg1 = raw[:i]
+	}
+	if _, ok := s.prefixes[s.idPrefix+"-"+strings.ToUpper(seg1)]; ok {
+		return s.idPrefix + "-" + raw
+	}
+	return raw
+}
+
+// displayID strips the project's id_prefix from a stored compound id for
+// human-facing output (AIRA-237 Task 1), the exact inverse of canonicalID. It
+// strips iff the value's first two segments name a registered composed prefix,
+// so a value that merely begins with the id_prefix text but is not one of this
+// project's ids is left intact.
+func (s *Store) displayID(value string) string {
+	if s.idPrefix == "" || value == "" {
+		return value
+	}
+	head := s.idPrefix + "-"
+	if !strings.HasPrefix(value, head) {
+		return value
+	}
+	rest := value[len(head):]
+	seg2 := rest
+	if i := strings.IndexByte(rest, '-'); i >= 0 {
+		seg2 = rest[:i]
+	}
+	if _, ok := s.prefixes[s.idPrefix+"-"+strings.ToUpper(seg2)]; ok {
+		return rest
+	}
+	return value
 }
 
 func boolInt(v bool) int {

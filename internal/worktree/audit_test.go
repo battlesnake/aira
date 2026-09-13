@@ -584,11 +584,11 @@ func TestInferenceNeverInventsATicket(t *testing.T) {
 // any of them would attach another ticket's status to the wrong checkout.
 func TestUnconventionalBranchNamesInferNothing(t *testing.T) {
 	for _, branch := range []string{"master", "review-whole-project", "investigate-aira91-92-aitest-contention", "worktree-wf_abc123"} {
-		if got := branchNameCandidates(branch, []string{"AIRA"}); len(got) != 0 {
+		if got := branchNameCandidates(branch, []string{"AIRA"}, ""); len(got) != 0 {
 			t.Errorf("branch %q inferred %v, want nothing", branch, got)
 		}
 	}
-	if got := branchNameCandidates("aira176-worktree-ticket-association", []string{"AIRA"}); len(got) != 1 || got[0] != "AIRA-176" {
+	if got := branchNameCandidates("aira176-worktree-ticket-association", []string{"AIRA"}, ""); len(got) != 1 || got[0] != "AIRA-176" {
 		t.Errorf("conventional branch inferred %v, want [AIRA-176]", got)
 	}
 }
