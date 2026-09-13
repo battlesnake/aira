@@ -4336,3 +4336,57 @@ def test_pool_covers_the_queue_matches_biggest_test_to_biggest_worker():
         2: {"in_flight": None, "reservation": 512 << 20},
     }
     assert supervisor._pool_covers_the_queue() is False
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 — turnover coexistence: the count/age recycle cap and the new
+# retire-on-no-fit path must coexist (neither double-frees a lease nor hangs),
+# under fit-filtered largest-first dispatch (Task 5).
+# ---------------------------------------------------------------------------
+
+
+def test_recycle_cap_coexists_with_fit_filtered_dispatch_mixed_sizes(tmp_path, monkeypatch, pytester):
+    """MAX_TESTS=1 forces a recycle after every test, so every worker goes through
+    _retire_worker + _replace_worker repeatedly, WHILE dispatch is fit-filtered and
+    workers are sized largest-first. If the age/count recycle path and retire-on-no-fit
+    double-freed a lease or stranded a test, this mixed-size suite would hang or leave a
+    test unevaluated. It must drain completely."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d-%d" % (os.getpid(), os.getppid()))
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=1 memory_max=104857600" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")  # recycle after every test
+
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.aira_mem("2G")
+        def test_big():
+            assert True
+
+        @pytest.mark.aira_mem("512M")
+        def test_mid():
+            assert True
+
+        def test_small_a():
+            assert True
+
+        def test_small_b():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values()), results
+    assert supervisor.daemon_available is True
