@@ -339,6 +339,31 @@ guard.
 - **First post-cutover run over-reserves the parent once** (§4) — accepted.
 - **The OOM phantom is coarse** (§8) — a worker's own-cap OOM fires a slice-wide brake;
   accepted, with §7 as the precise complement.
+- **Escape-exemption over-exemption is adversarial-only (§16c/§16.1, T5 review P3-a).** The
+  exemption (`isOwnAitestWorkerScopePath` at the single `witnessedEscape` chokepoint) exempts a
+  migration into a cgroup whose basename parses as an `aitest-w<seq>` confine id with an embedded
+  `pid == os.Getpid()`. Its ONLY over-exemption path is an ADVERSARIAL own descendant that writes
+  its own pid into such a scope, or `mkdir`s a fake `.aira-CONFINE-aitest-w<seq>-<mypid>-<stamp>`
+  sibling and migrates into it — that migration would then read as exempt rather than as an escape.
+  This is exactly the parity #20's design already accepts: a descendant that forks-and-exits or
+  migrates within one sampler period (`scopeMembershipSampleInterval`, 50 ms today) is
+  inherently unobservable, and the pre-S2a NESTED layout was likewise unable to distinguish a
+  worker migrating into its own child scope from a benign one. A cooperative aitest run never does
+  this. Accepted; the positive `pid == os.Getpid()` check keeps a *foreign* supervisor's worker,
+  and any genuine escape to an unrelated cgroup, witnessed.
+- **The escape exemption is basename-exact, not subtree-aware (§16c, T5 review P3-b).**
+  `isOwnAitestWorkerScopePath` reads `filepath.Base(cgroupPath)`, so a descendant NESTED under an
+  own-worker scope — e.g. `podman --cgroups=split` creating a child cgroup inside the worker's own
+  scope — has a basename that is NOT an `aitest-w` id and reads `descendant-escaped`. This is an
+  OVER-witness in the SAFE direction (a false escape flag, never a false containment), so it only
+  degrades honesty conservatively. A later fix is a cheap ancestor walk (does any ANCESTOR basename
+  parse as an own worker scope) in place of the basename check; not built now ("keep the primitive +
+  document the gap").
+- **Daemon-down parent-kill (bounded "one more test" leak).** Recorded in §16.1: sibling kill
+  depends on the daemon being alive at parent-death, so if the daemon is down AND the parent is
+  killed AND a worker is mid-test, that worker survives until it finishes the current test and hits
+  its nodeid-pipe EOF, then exits — bounded, not permanent. Accepted for S2a; the §16.1 parent-pid
+  slot makes a future reaper fix cheap.
 - **CLOSED gap:** the S1 "supervisor RSS is an unreserved outer-cap charge" gap closes — the
   supervisor is now part of a properly-reserved ordinary parent scope.
 
