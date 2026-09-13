@@ -4272,3 +4272,67 @@ sys.stdin.buffer.read()
 
     assert len(results) == 4
     assert all(outcome == "passed" for outcome in results.values()), results
+
+
+# ---------------------------------------------------------------------------
+# AIRA-235 — fit-aware growth gate (_pool_covers_the_queue), Task 4.
+# ---------------------------------------------------------------------------
+
+
+def test_pool_covers_the_queue_too_small_worker_is_not_cover_for_a_big_test():
+    """The whole point: an idle 512 MiB worker does NOT cover a queued @aira_mem(4G)
+    test, so growth must not be blocked while the big test starves."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.queue = ["big"]
+    supervisor.workers = {1: {"in_flight": None, "reservation": 512 << 20}}
+    assert supervisor._pool_covers_the_queue() is False
+
+
+def test_pool_covers_the_queue_worker_that_fits_is_cover():
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"mid": 256 << 20}
+    supervisor.queue = ["mid"]
+    supervisor.workers = {1: {"in_flight": None, "reservation": 512 << 20}}
+    assert supervisor._pool_covers_the_queue() is True
+
+
+def test_pool_covers_the_queue_unconfined_worker_covers_anything():
+    """A reservation=None (unconfined) worker has no memory.max, so it covers ANY
+    queued nodeid, however large."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"big": 4 << 30}
+    supervisor.queue = ["big"]
+    supervisor.workers = {1: {"in_flight": None, "reservation": None}}
+    assert supervisor._pool_covers_the_queue() is True
+
+
+def test_pool_covers_the_queue_unknown_state_is_not_cover():
+    """The directional _UNKNOWN guard is kept: a worker whose state dict has not
+    reached its final shape (no in_flight key) must NOT be counted as cover."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"a": 100 << 20}
+    supervisor.queue = ["a"]
+    supervisor.workers = {1: {}}
+    assert supervisor._pool_covers_the_queue() is False
+
+
+def test_pool_covers_the_queue_matches_biggest_test_to_biggest_worker():
+    """Two idle workers of different sizes and two queued tests: covered only when a
+    distinct FITTING worker exists for each (Hall's condition), not by raw count."""
+    supervisor = Supervisor()
+    supervisor.reservation_need = {"big": 4 << 30, "small": 100 << 20}
+    supervisor.queue = ["small", "big"]
+    # A 4G worker and a 512M worker: the 4G test needs the 4G worker, the small test
+    # takes the 512M worker -> covered.
+    supervisor.workers = {
+        1: {"in_flight": None, "reservation": 4 << 30},
+        2: {"in_flight": None, "reservation": 512 << 20},
+    }
+    assert supervisor._pool_covers_the_queue() is True
+    # But two 512M workers cannot cover the 4G test, even though the count matches.
+    supervisor.workers = {
+        1: {"in_flight": None, "reservation": 512 << 20},
+        2: {"in_flight": None, "reservation": 512 << 20},
+    }
+    assert supervisor._pool_covers_the_queue() is False

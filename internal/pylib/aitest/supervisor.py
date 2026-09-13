@@ -2895,11 +2895,27 @@ class Supervisor:
         function must not fail in. Inert today (both registration sites set
         in_flight before publishing the state), and it stays inert by
         construction rather than by convention."""
-        idle = sum(
-            1 for state in self.workers.values()
+        # AIRA-235: fit-aware. "Every ready nodeid can be run by some idle worker that
+        # FITS it" is a bipartite matching -- a distinct fitting idle worker per queued
+        # nodeid. A too-small idle worker used to count as cover for a big queued test
+        # (a pure count), blocking growth while that test starved. The `_UNKNOWN`
+        # directional guard stays: a state not in its final shape is NOT idle.
+        idle_caps = [
+            state.get("reservation") for state in self.workers.values()
             if state.get("in_flight", _UNKNOWN) is None
-        )
-        return idle >= len(self.queue)
+        ]
+        if len(self.queue) > len(idle_caps):
+            return False
+        needs = sorted((self._need_for(nodeid) for nodeid in self.queue), reverse=True)
+        # A worker with reservation is None (unconfined fallback) has no memory.max, so
+        # it fits ANY nodeid -- sort it as +infinity so it is matched to the biggest need.
+        caps = sorted(idle_caps, key=lambda c: float("inf") if c is None else c, reverse=True)
+        # Hall's condition, both sorted DESCENDING: a distinct fitting worker exists for
+        # every queued nodeid iff the i-th largest need fits the i-th largest cap.
+        for need, cap in zip(needs, caps):
+            if cap is not None and cap < need:
+                return False
+        return True
 
     def run(self, estimated_bytes, worker_count=1):
         """Slice 1's whole dispatch loop: spawn up to worker_count workers,
