@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -107,9 +108,42 @@ func TestRunWorkerAdmitCommandAlwaysWritesOneStructuredOutcome(t *testing.T) {
 // `unevaluated` — so every speculative pool-growth probe would have destroyed
 // the run it was issued to help (Sol plan-review round 2, P0).
 //
-// With no daemon reachable the outcome here is necessarily a non-grant; what is
-// asserted is that it is NOT the max-wait argument rejection.
+// The outcome here is necessarily a non-grant; what is ASSERTED is only that it
+// is NOT the max-wait argument rejection and NEVER the TERMINAL request-invalid
+// class — i.e. that the CLI argument layer ACCEPTED "0"/"0s" instead of refusing
+// it before the dial (the AIRA-64 defect). Coverage note: these assertions are
+// negative-only, and — taken after an unreachable dial — are agnostic to what
+// happens to max-wait past the arg layer, so they would NOT catch a bug that
+// accepted zero and then silently coerced it to a blocking wait. That is a
+// deliberate, accepted gap: the speculative wire semantic (max_wait_ms
+// present-and-zero) is exercised end-to-end by the MaxWait:0 non-blocking-probe
+// cases in internal/runner/worker_admit_client_linux_test.go and pinned in
+// internal/daemon/protocol_test.go; this test guards only the arg-layer
+// acceptance, which is where the shipped defect actually was.
+//
+// Isolation: the test points the XDG resolver (daemon.PathsFromEnv composes the
+// socket path from XDG_RUNTIME_DIR + a hash of XDG_STATE_HOME) at fresh temp
+// dirs, so the socket it dials is canonical-but-absent and the non-grant is a
+// dial failure regardless of any live daemon. This is load-bearing, not hygiene:
+// without it the test relied on the AMBIENT box having no matching-protocol
+// daemon, and the v0.7 S2a proto-12 cutover made one reachable — it then
+// processed this deliberately parent_scope_id-less request (runWorkerAdmitCommand
+// takes a pre-parsed option map, bypassing the parseWorkerAdmitArgs required-field
+// check the CLI's Run path applies) and correctly rejected it request-invalid,
+// reddening the test for everyone on the box. Isolation ENFORCES the "no daemon
+// reachable" precondition the test documents rather than assuming the environment
+// supplies it.
+//
+// Isolation is also why this is fixed by isolating rather than by COMPLETING the
+// request (adding a parent_scope_id): THIS test's request, lacking
+// parent_scope_id, is rejected request-invalid before any grant and creates
+// nothing — but a COMPLETED worker-admit reaching the live daemon would pass
+// validation and be granted its requested reserve verbatim, creating a real
+// worker cgroup scope on the shared slice ledger as a unit-test side effect. Any
+// test in this file that reaches a daemon dial must isolate the same way.
 func TestRunWorkerAdmitCommandAcceptsZeroMaxWaitAsSpeculative(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "runtime"))
 	for _, raw := range []string{"0s", "0"} {
 		t.Run(raw, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer

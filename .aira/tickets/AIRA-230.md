@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-230","project":"aira","title":"aitest v0.7 Stage S1 — foundation + aggregate outer-cap guard + measurement","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","v0.7"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-230","project":"aira","title":"aitest v0.7 Stage S1 — foundation + aggregate outer-cap guard + measurement","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","v0.7"],"hold":false,"relations":[]}
 ---
 Stage S1 of the aitest v0.7 design (`docs/superpowers/specs/2026-09-12-aitest-v07-class-sized-workers-design.md` §11). Slice plan: `docs/superpowers/plans/2026-09-12-aitest-v07-s1-plan.md`.
 
@@ -12,3 +12,10 @@ Ordered two-loop slices (Opus builds, Fable reviews, each mutation-verified):
 DEFERRED to S2 (plan D1/D3, §11 refinement): per-class spawn sizing, per-class dispatch, the growth claim, the ~10 s age-cap flip, and the `Σ(pending requests)` guard term + its mutation guard (inert in S1's single-threaded ≤1-pending model). NON-goal: batch/prune (retired per the design's §2; reinstate path OD1, S2-binding only).
 
 No daemon protocol change. Python-side + one Go doc-comment fix.
+
+## RESOLUTION — done (status merely lagged)
+
+S1 was BUILT and MERGED: v7-1 client guard (PR #131/#132), v7-2 aira_mem reader + v7-4
+measurement channel (PR #133), at master 61745b9. The status was never flipped. v7-1's
+client guard was later SUPERSEDED by S2a's daemon-authoritative redesign (AIRA-229/232,
+PR #134); the aira_mem reader + measurement channel remain in use and are what S2b builds on.
