@@ -421,11 +421,13 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 // safe direction. T10-S2 landed WITHOUT reconciling the fold to the sibling
 // topology: it is left as an ACCEPTED RESIDUE, and it is inert by construction, not
 // merely safe-direction. A parent that appears here at all is a granted, accounted,
-// scope-backed waiter, so its scope memory.max IS its ledger charge (post-S2a a
-// delegate parent is an ordinary confine job — its memory.max is its --memory-max,
+// scope-backed waiter, so its scope memory.max is AT MOST its ledger charge (post-S2a
+// a delegate parent is an ordinary confine job — its memory.max is its --memory-max,
 // its declared reserve, or its granted reserve, with no delegate ceiling above the
-// reserve). memory.current can never exceed memory.max, so a parent's live usage
-// never exceeds even its OWN unfolded charge, let alone the larger folded budget —
+// reserve; and where a pinned reserve exceeds --memory-max the charge is the larger
+// of the two, so memory.max ≤ charge still holds). memory.current can never exceed
+// memory.max, so a parent's live usage never exceeds even its OWN unfolded charge,
+// let alone the larger folded budget —
 // the over-count can therefore never flip it to an offender on any path, so
 // reconciling the fold buys nothing. Stated here rather than hidden.
 //
