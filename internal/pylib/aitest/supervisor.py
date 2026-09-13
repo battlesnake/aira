@@ -1983,9 +1983,10 @@ class Supervisor:
         self._pool_scoped_workers += 1
         memory_max = grant.get("memory_max")
         # The budget recorded is the cap the daemon actually WROTE on this
-        # worker's scope, not what was asked for. Max across the pool because
-        # every worker in a run is granted the same figure; a divergence would
-        # mean the run was not uniformly sized, and the larger cap is the one an
+        # worker's scope, not what was asked for. Since S2b workers are sized
+        # PER-TEST (overhead + @aira_mem), so the pool is heterogeneously capped;
+        # this reports the LARGEST per-worker cap in the pool -- a coarse
+        # pool-level gauge, not a per-test figure -- because that is the cap an
         # observed peak could actually have grown into.
         if isinstance(memory_max, int) and memory_max > 0:
             if self._pool_budget is None or memory_max > self._pool_budget:
@@ -2081,12 +2082,12 @@ class Supervisor:
         if self._pool_peak_max is not None:
             argv += ["--peak-rss", str(self._pool_peak_max)]
         if self._pool_budget is not None:
-            # The basis names where the REQUEST came from (Decision 3 deferred a
-            # durable project-scoped knob, so env is the only origin there is),
-            # while the value is the cap actually written. `cap:` because a
-            # worker's memory.max is a real kernel-enforced bound.
-            origin = "set" if os.environ.get("AIRA_AITEST_ESTIMATED_BYTES") else "default"
-            argv += ["--budget", str(self._pool_budget), "--budget-basis", "cap:aitest:env:" + origin]
+            # The basis names where the per-worker OVERHEAD came from (the
+            # per-test increment rides on top via @aira_mem); the value is the
+            # LARGEST cap actually written across the heterogeneous pool. `cap:`
+            # because a worker's memory.max is a real kernel-enforced bound.
+            origin = "set" if os.environ.get("AIRA_AITEST_WORKER_OVERHEAD_BYTES") else "default"
+            argv += ["--budget", str(self._pool_budget), "--budget-basis", "cap:aitest:overhead-env:" + origin]
         if self._pool_peak_oom:
             argv.append("--oom")
         try:
@@ -2364,11 +2365,19 @@ class Supervisor:
                         getattr(exc, "reason", None) == WORKER_ADMIT_REASON_EXCEEDS_CEILING:
                     self.queue.remove(nodeid)
                     self.results.setdefault(nodeid, "unevaluated")
+                    if nodeid in self._annotated:
+                        knob = "lower its @aira_mem or raise the slice ceiling"
+                    else:
+                        knob = (
+                            "it declares no @aira_mem, so this reservation is the "
+                            "per-worker overhead -- lower AIRA_AITEST_WORKER_OVERHEAD_BYTES, "
+                            "add an @aira_mem marker, or raise the slice ceiling"
+                        )
                     self._unevaluated_reasons.setdefault(
                         nodeid,
-                        "this test's memory reservation (%d bytes) exceeds the slice "
-                        "ceiling even with no contention; lower its aira_mem or raise "
-                        "the slice ceiling" % need,
+                        "the daemon refused this test's memory reservation (%d bytes): "
+                        "it exceeds the slice ceiling. If the slice is busy this may "
+                        "clear with less concurrent load; otherwise %s" % (need, knob),
                     )
                     continue
                 self._fail_queue_terminal(str(exc))
@@ -2397,7 +2406,13 @@ class Supervisor:
         if self.daemon_available:
             if self.workers:
                 # Other workers are still dispatching: a speculative probe-then-claim,
-                # never a blocking claim that would freeze the loop.
+                # never a blocking claim that would freeze the loop. Skip the grow if
+                # the live pool already covers every ready nodeid -- else several
+                # no-fit retirements in one dispatch pass each spawn a replacement for
+                # the same oversized test, leaving surplus workers holding reservations
+                # with no work (the same cover guard run()'s fill loop uses).
+                if self._pool_covers_the_queue():
+                    return
                 self._try_grow_one()
                 return
             # Empty pool: bootstrap progress with a blocking claim sized to the
@@ -2762,10 +2777,12 @@ class Supervisor:
         same worker is now group-killed, requeued once, and reported
         unevaluated. Turning a silent pass into an unevaluated is correct --
         it is the containment this product claims -- but only if the report
-        says which limit was hit and which knob raises it. The per-worker cap
-        is a flat AIRA_AITEST_ESTIMATED_BYTES (512 MiB by default; per-suite
-        history-based sizing is still deferred), so the remedy is a single
-        environment variable.
+        says which limit was hit and which knob raises it. Since S2b the cap is
+        per-test: overhead (AIRA_AITEST_WORKER_OVERHEAD_BYTES, 512 MiB default)
+        plus the test's own @aira_mem increment. So the remedy depends on whether
+        the test is annotated -- raise its @aira_mem marker, else raise the
+        overhead knob / add a marker. AIRA_AITEST_ESTIMATED_BYTES no longer sizes
+        workers, so the message must never name it.
 
         Attribution is sound because memory.events counters are per-scope and
         propagate only upward: oom_group_kill > 0 on THIS scope means THIS
@@ -2793,10 +2810,18 @@ class Supervisor:
         # would be worse than a vague true one.
         if not _scope_oom_group_killed(scope):
             return generic
+        if state.get("in_flight") in self._annotated:
+            remedy = "raise its @aira_mem marker (or the slice ceiling)"
+        else:
+            remedy = (
+                "this test declares no @aira_mem, so its cap is the per-worker "
+                "overhead -- raise AIRA_AITEST_WORKER_OVERHEAD_BYTES or add an "
+                "@aira_mem marker"
+            )
         return (
             "worker %d was killed by its own per-worker memory cap "
-            "(memory.max=%s bytes; raise AIRA_AITEST_ESTIMATED_BYTES), and the "
-            "one retry was too" % (pid, grant.get("memory_max", "unknown"))
+            "(memory.max=%s bytes); %s, and the one retry was too"
+            % (pid, grant.get("memory_max", "unknown"), remedy)
         )
 
     def _service_ready_workers(self, ready, result_fd_owners, pidfd_owners):

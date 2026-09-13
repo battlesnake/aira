@@ -318,7 +318,11 @@ func (v *ResourceBudgetVerdict) sentence(current int64, recommended *int64, basi
 // resourceBudgetKnob names the existing knob a recommendation is a change to.
 func resourceBudgetKnob(kind ResourcePeakKind) string {
 	if kind == ResourcePeakKindPytestWorker {
-		return "AIRA_AITEST_ESTIMATED_BYTES="
+		// S2b: workers are sized overhead + @aira_mem, so the pool-wide floor knob is
+		// AIRA_AITEST_WORKER_OVERHEAD_BYTES (AIRA_AITEST_ESTIMATED_BYTES no longer sizes
+		// workers); per-test raises are via @aira_mem markers. Naming the dead knob
+		// here would misdirect exactly as the OOM-death message used to (AIRA-235).
+		return "AIRA_AITEST_WORKER_OVERHEAD_BYTES="
 	}
 	return "--memory-reserve"
 }

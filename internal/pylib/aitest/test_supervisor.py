@@ -3243,9 +3243,11 @@ def test_worker_death_names_the_memory_cap_and_the_knob_when_the_scope_was_oom_k
     swap and its test PASSED; with memory.swap.max=0 that same worker is now
     group-killed, requeued once, and reported unevaluated. Turning a silent
     pass into an unevaluated is correct -- it is the containment this product
-    claims -- but only if the report says what to change. The per-worker cap is
-    a flat AIRA_AITEST_ESTIMATED_BYTES (512 MiB by default), so the remedy is a
-    single environment variable and the message must name it."""
+    claims -- but only if the report says what to change. Since S2b the cap is
+    per-test (overhead + @aira_mem), so the remedy depends on annotation: an
+    unannotated test's cap is the AIRA_AITEST_WORKER_OVERHEAD_BYTES overhead, and
+    the message must name the knob that actually helps -- never the dead
+    AIRA_AITEST_ESTIMATED_BYTES."""
     scope = tmp_path / "oom-killed-scope"
     scope.mkdir()
     (scope / "memory.events").write_text(
@@ -3254,7 +3256,8 @@ def test_worker_death_names_the_memory_cap_and_the_knob_when_the_scope_was_oom_k
     supervisor = Supervisor()
     reason = supervisor._describe_worker_death(4321, _death_state(scope))
     assert "memory.max=33554432" in reason
-    assert "AIRA_AITEST_ESTIMATED_BYTES" in reason
+    assert "AIRA_AITEST_WORKER_OVERHEAD_BYTES" in reason
+    assert "AIRA_AITEST_ESTIMATED_BYTES" not in reason
     assert "4321" in reason
 
 
@@ -3842,7 +3845,7 @@ def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, mon
 
     monkeypatch.setattr(supervisor_module.subprocess, "run", fake_run)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", "/usr/bin/aira")
-    monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", "104857600")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_OVERHEAD_BYTES", "104857600")
 
     supervisor = Supervisor(config=Config())
     supervisor._pool_scoped_workers = 2
@@ -3857,7 +3860,7 @@ def test_pool_usage_report_is_fail_open_and_sends_the_whole_sample(tmp_path, mon
     assert argv[:2] == ["/usr/bin/aira", "confine-report"]
     assert "--peak-rss" in argv and str(700 * 1024 * 1024) in argv
     assert "--budget" in argv and "104857600" in argv
-    assert "cap:aitest:env:set" in argv
+    assert "cap:aitest:overhead-env:set" in argv
     assert "--oom" in argv
 
     # An absent peak is simply not sent -- never sent as a zero.

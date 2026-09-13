@@ -147,6 +147,21 @@ def test_replacement_is_speculative_while_other_workers_survive():
     )
 
 
+# verifies: AIRA-235 -- a replacement with OTHER workers alive must SKIP growth when the
+# live pool already covers every ready nodeid; else several no-fit retirements in one
+# dispatch pass each spawn a replacement for the same test, leaving surplus workers
+# holding reservations with no work (build-review wf_9f54130b).
+def test_replacement_skips_growth_when_the_live_pool_already_covers_the_queue():
+    supervisor = _ready_supervisor(probe_script=[_ROOM], claim_script=["grant"], queued=0)
+    supervisor.queue = ["t0"]
+    supervisor.reservation_need = {"t0": 2 << 20}
+    supervisor.workers[999] = {"in_flight": None, "reservation": 4 << 20}  # idle, fits t0
+    supervisor._replace_worker()
+    assert supervisor.probe_calls == 0, "a covered pool must not probe for a surplus worker"
+    assert supervisor.claim_blocking == [], "a covered pool must not spawn a surplus replacement"
+    assert 999 in supervisor.workers and len(supervisor.workers) == 1, "no surplus worker added"
+
+
 # verifies: S16 -- the last-worker case waits with a BLOCKING claim rather than
 # degrading to an unconfined run, and retries a restart-interrupted (Denied) claim.
 def test_last_worker_replacement_waits_with_a_blocking_claim(monkeypatch):
