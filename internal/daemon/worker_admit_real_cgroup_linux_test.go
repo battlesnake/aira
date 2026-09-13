@@ -111,9 +111,10 @@ func TestCreatingWorkerScopesDoesNotLeakFileDescriptors(t *testing.T) {
 // verifies: S15 end to end against a real cgroup — a worker-admit CLAIM makes the
 // daemon create the worker scope itself, the grant names the scope it created, the
 // kernel really carries the granted memory.max and memory.oom.group, the unified
-// ledger charges the reserve, and the holder's EOF frees the ledger IMMEDIATELY
-// while the scope directory persists (the daemon does not rmdir on EOF — that is
-// supervisor.py's _forget_worker_scope after it reaps the worker).
+// ledger charges the reserve, and the holder's EOF both frees the ledger IMMEDIATELY
+// AND makes the daemon cgroup.kill+rmdir the sibling worker scope (S2a §16b — with the
+// worker a sibling under the slice, nothing above it kills it on relay death, so the
+// daemon tears the scope down itself on the relay's peer-EOF).
 func TestWorkerAdmitCreatesARealWorkerScopeAndEOFFreesTheLedger(t *testing.T) {
 	outer, parent := realOuterScope(t)
 	const sliceMax = 128 << 20

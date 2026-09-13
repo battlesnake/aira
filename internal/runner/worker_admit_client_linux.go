@@ -23,7 +23,7 @@ import (
 // reversal: EOF releases the lease). One connection per worker lease.
 //
 // S15: for an ENFORCED grant the keeper RECONNECTS and re-declares the lease (its
-// ARDR frame keyed on ScopePath) across a daemon restart, re-anchoring the worker's
+// ARDR frame keyed on the scope DIRNAME) across a daemon restart, re-anchoring the worker's
 // RAM and core in the fresh daemon's ledger — exactly like the confine lease keeper.
 // A shim ADVISORY grant has no scope path and no ARDR key, so its keeper HOLDS only
 // (no reconnect), the same rule the confine keeper applies to a scope-less lease.
@@ -224,8 +224,8 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		}
 	}
 	// GRANTED. Hand the connection to a keeper: for an ENFORCED grant it reconnects
-	// and re-declares (ARDR frame keyed on the scope path) across a daemon restart;
-	// an ADVISORY (shim) grant has no scope path and no ARDR key, so it HOLDS only.
+	// and re-declares (ARDR frame keyed on the scope DIRNAME — see below) across a daemon
+	// restart; an ADVISORY (shim) grant has no scope path and no ARDR key, so it HOLDS only.
 	// Detach the ctx-close first — the keeper now owns the connection's lifetime, and
 	// the CLI closes the lease (stopping the keeper) on stdin EOF or signal.
 	if stopCtxClose != nil {
