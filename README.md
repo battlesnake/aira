@@ -102,12 +102,16 @@ aira confine --delegate-ram -- pytest --aitest-workers=auto
 
 `--delegate-ram` is efficient and fully accounted: each worker is admitted against the shared slice ledger and reserves exactly what its own `memory.max` allows, so worker growth is both contained per worker and booked on the slice. Its one residual is per-worker containment — a test needing more than its worker's reservation is OOM-killed in that one scope (and retried once). A plain `aira confine --memory-reserve R -- <cmd>` is the coarse-grained alternative, at the cost of reserving the whole-job peak.
 
-No per-test RAM annotation is needed or read: each worker is sized from a
-per-worker backstop, and a worker that exceeds it is OOM-killed alone rather
-than taking the suite with it. Raise the backstop for an unusually hungry suite
-with `AIRA_AITEST_ESTIMATED_BYTES` (a byte count or a 1024-based size suffix like
-`4G` or `512M`; a value that parses as neither warns rather than being silently
-ignored).
+Each worker is sized PER-TEST — a warm-import overhead plus the test's own
+declared memory increment — and the pool is scheduled largest-first so big tests
+launch early (while the slice is most free) instead of running last and idling the
+other cores. Annotate a memory-hungry test with `@pytest.mark.aira_mem("4G")` (a
+byte count or a 1024-based size suffix like `4G` or `512M`; a value that parses as
+neither warns rather than being silently ignored); an unannotated test just gets
+the overhead. Raise the overhead floor for a whole suite with
+`AIRA_AITEST_WORKER_OVERHEAD_BYTES` (default 512M, same size grammar). A worker
+that exceeds its reservation is OOM-killed alone rather than taking the suite with
+it, its test requeued once.
 
 ### Capture the friction
 
