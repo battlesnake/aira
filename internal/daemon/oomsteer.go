@@ -19,11 +19,15 @@ import (
 // (the AIRA-29 live charge was retired). So a scope that USES more than it
 // declared — an under-declaration, or a burst past its reserve — is invisible to
 // admission and can expand until aira.slice reaches its own cap and the kernel
-// picks a victim, biased only by AIRA-27's STATIC class steering. (A delegate
-// scope's memory.max is a containment ceiling well above its declared reserve,
-// so physical over-use inside that cap is possible; under declared-only
-// admission the per-scope memory.max and the MemAvailable watchdog are the
-// backstop, not an aggregate over-subscription bound.)
+// picks a victim, biased only by AIRA-27's STATIC class steering. (Physical
+// over-use, up to a scope's own memory.max and above the DECLARED reserve the
+// ledger holds, is possible for any scope whose cap exceeds its reserve or which
+// runs uncapped, so under declared-only admission the per-scope memory.max and the
+// MemAvailable watchdog are the backstop, not an aggregate over-subscription bound.
+// PRE-S2a a `--delegate-ram` scope was the textbook example: its memory.max was an
+// AIRA-15 containment ceiling many times its declared reserve. Post-S2a a delegate
+// parent is an ordinary confine job whose memory.max IS its reserve, so it is no
+// longer that case — see the fold note below.)
 //
 // That static bias picks the wrong victim in exactly the case that matters.
 // oom_score_adj is worth adj/1000 of MACHINE total in badness, so on a 64 GiB
@@ -414,8 +418,16 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 // T3-inherited; post-collapse it makes the parent's budget an OVER-count relative
 // to that sibling-free memory.current, which can only ever make a parent look
 // LESS like an offender — an under-detection, never a false offender, so it is the
-// safe direction. Reconciling the fold with the sibling topology is T10-S2's job,
-// not this comment's; stated here rather than hidden.
+// safe direction. T10-S2 landed WITHOUT reconciling the fold to the sibling
+// topology: it is left as an ACCEPTED RESIDUE, and it is inert by construction, not
+// merely safe-direction. A parent that appears here at all is a granted, accounted,
+// scope-backed waiter, so its scope memory.max IS its ledger charge (post-S2a a
+// delegate parent is an ordinary confine job — its memory.max is its --memory-max,
+// its declared reserve, or its granted reserve, with no delegate ceiling above the
+// reserve). memory.current can never exceed memory.max, so a parent's live usage
+// never exceeds even its OWN unfolded charge, let alone the larger folded budget —
+// the over-count can therefore never flip it to an offender on any path, so
+// reconciling the fold buys nothing. Stated here rather than hidden.
 //
 // A sub-reservation whose parent is not a scope-backed waiter here adds nothing:
 // without the parent's own charge there is no budget to add it to, and inventing
