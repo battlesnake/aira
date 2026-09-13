@@ -205,7 +205,6 @@ func allRequirementTableDashes(cells []string) bool {
 	return true
 }
 
-
 func (s *Store) importRequirementRow(ctx context.Context, row importedRequirement) (string, error) {
 	path := s.requirementPath(row.ID)
 	allocation, exists, err := s.findRequirementAllocation(ctx, row.Prefix, row.Number, row.Suffix)

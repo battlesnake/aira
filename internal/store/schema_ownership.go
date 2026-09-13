@@ -191,7 +191,7 @@ func allocationsDDL(table string, ifNotExists bool) string {
 // `suffix` column on a pre-suffix database. SQLite cannot ALTER a primary key
 // and `CREATE TABLE IF NOT EXISTS` is a no-op on the live machine-wide
 // state.db, so the table is recreated: a temp with the 4-column PK, INSERT ...
-// SELECT ..., '' (every existing row keeps an empty suffix), DROP, RENAME — all
+// SELECT ..., ” (every existing row keeps an empty suffix), DROP, RENAME — all
 // in one BEGIN IMMEDIATE. A fast-path PRAGMA check keeps the common (already
 // migrated) open read-only, and the predicate is re-checked under the write
 // lock so a losing racer is a no-op (the AIRA-97 shape). It runs BEFORE
