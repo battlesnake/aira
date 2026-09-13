@@ -1170,6 +1170,14 @@ func validateConfineName(name string) error {
 		}
 		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name requires letters, digits, '.', '_', or '-'")
 	}
+	// Reserve the aitest-w<digits> shape: it is what MintWorkerScopeID mints and what
+	// IsAitestWorkerScopeName classifies as an aitest worker (filtered from the default
+	// --list/--kill pid/name selector). A user job minting that name would otherwise be
+	// misclassified as a worker and become hidden / unkillable-by-name. Reuse the
+	// recogniser so reserver and recogniser cannot drift (S2a Task 10).
+	if IsAitestWorkerScopeName(name) {
+		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name aitest-w<digits> is reserved for aitest worker scopes")
+	}
 	return nil
 }
 

@@ -72,6 +72,36 @@ func TestBindConfineScopeIDAcceptsUnknownOwnerEncoding(t *testing.T) {
 	}
 }
 
+// TestValidateConfineNameReservesTheAitestWorkerPrefix pins the S2a Task 10 fix: an
+// aitest worker mints the confine NAME aitest-w<seq>, and IsAitestWorkerScopeName
+// classifies exactly that shape as a worker (filtered from the default --list/--kill
+// pid/name selector). A user launching `aira confine --name aitest-w7` would otherwise
+// mint a real job that is misclassified as a worker -> labelled "(worker)" and hidden
+// from the default selector, i.e. unkillable by name. The name-validator (the SINGLE
+// chokepoint every launch and the detached MintConfineScopeID funnel through) therefore
+// reserves the aitest-w<digits> shape, reusing IsAitestWorkerScopeName so reserver and
+// recogniser cannot drift.
+func TestValidateConfineNameReservesTheAitestWorkerPrefix(t *testing.T) {
+	for _, reserved := range []string{"aitest-w7", "aitest-w0", "aitest-w42"} {
+		if err := validateConfineName(reserved); err == nil || !strings.HasPrefix(err.Error(), "E_CONFINE_ARGUMENT_INVALID") {
+			t.Fatalf("--name %q must be refused (reserved aitest worker shape): err=%v", reserved, err)
+		}
+		// The reservation lives in the single identity chokepoint, so the request path
+		// (what confineWithDeps and the detached mint both call) refuses it too.
+		if _, _, err := normalizeConfineIdentity(ConfineRequest{Name: reserved}); err == nil {
+			t.Fatalf("normalizeConfineIdentity accepted the reserved name %q", reserved)
+		}
+	}
+	// A non-worker shape that merely shares the prefix stem stays accepted: the seq
+	// suffix must be a NON-EMPTY run of digits, so "aitest-wrapper" (letters), the bare
+	// "aitest-w" (no seq) and "aitest-w7x" (trailing non-digit) are ordinary names.
+	for _, name := range []string{"aitest-wrapper", "aitest-w", "aitest-w7x", "gate", "job"} {
+		if err := validateConfineName(name); err != nil {
+			t.Fatalf("ordinary name %q must be accepted: err=%v", name, err)
+		}
+	}
+}
+
 // normalizeConfineIdentity is the SINGLE place name/owner defaulting happens, so
 // the supervisor's mint and confineWithDeps cannot disagree about what a scope id
 // should contain. This pins the defaults themselves.
