@@ -512,9 +512,10 @@ func TestConfineReserveTranscriptionAndResolvedChargeAcrossFlagsAndEnvironment(t
 			wantCharge: 8 << 20, wantChargePinned: true,
 		},
 		{
-			// The documented up-charge (internal/core/skill.go:318): "--memory-max N on a
-			// non-delegate job UP-CHARGES the admission reserve to N". Preserved exactly,
-			// but it is now the RESOLVER that does it, not the CLI.
+			// The documented up-charge (internal/core/skill.go): "--memory-max N on any
+			// confine job ... UP-CHARGES the admission reserve to N" — a --delegate-ram
+			// parent included (rows 4-6 below prove it). Preserved exactly, but it is now
+			// the RESOLVER that does it, not the CLI.
 			name: "non-delegate memory-max up-charges the declared reserve", env: "8M",
 			argv:        []string{"confine", "--memory-reserve", "12M", "--memory-max", "16M", "--", "true"},
 			wantReserve: 12 << 20, wantPinned: true, wantMax: 16 << 20,
