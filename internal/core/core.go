@@ -248,6 +248,34 @@ func nonNegativeInt(args *argAccessor, name string) (int64, error) {
 	return value, nil
 }
 
+// parseAllocatedMax decodes the repeatable --allocated-max PREFIX=N flag
+// (AIRA-237 Task 4) into a bare-prefix -> last-allocated-number map. The prefix
+// is left BARE here; the store composes it with the project id_prefix and
+// validates ownership. A malformed entry, a non-positive value, or a repeated
+// prefix is a stable E_IMPORT_INVALID (never a silent drop).
+func parseAllocatedMax(entries []string) (map[string]int64, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]int64, len(entries))
+	for _, entry := range entries {
+		prefix, value, ok := strings.Cut(entry, "=")
+		prefix = strings.TrimSpace(prefix)
+		if !ok || prefix == "" {
+			return nil, fmt.Errorf("E_IMPORT_INVALID: --allocated-max %q must be PREFIX=N", entry)
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("E_IMPORT_INVALID: --allocated-max %q value must be a positive integer", entry)
+		}
+		if _, dup := out[prefix]; dup {
+			return nil, fmt.Errorf("E_IMPORT_INVALID: --allocated-max prefix %q repeated", prefix)
+		}
+		out[prefix] = n
+	}
+	return out, nil
+}
+
 func scopeMemoryArgs(args *argAccessor, code string) (int64, int64, error) {
 	parse := func(raw, flag string) (int64, error) {
 		if raw == "" {
@@ -981,29 +1009,38 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: data}, nil
 		}},
-		"import": {Name: "import", Usage: "import <file> [--tickets] [--strict]", Args: []ArgSpec{stringSpec("file", true, true, "Findings (or, with --tickets, ticket) JSONL file"), boolSpec("tickets", false, false, "Import id-preserving coordination tickets instead of findings"), boolSpec("strict", false, false, "Reject partial imports")}, MCPTool: "aira_import", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"import": {Name: "import", Usage: "import <file> [--tickets] [--strict] [--allocated-max P=N ...]", Args: []ArgSpec{stringSpec("file", true, true, "Findings (or, with --tickets, ticket) JSONL file"), boolSpec("tickets", false, false, "Import id-preserving coordination tickets instead of findings"), boolSpec("strict", false, false, "Reject partial imports"), listSpec("allocated_max", false, false, "With --tickets: seed the forward allocator per prefix from the LAST-allocated number at cutover (repeatable, PREFIX=N); the next mint is N+1")}, MCPTool: "aira_import", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			// AIRA-237 Task 2 — --tickets selects the id-accepting ticket importer
 			// (preserve ids, seed the allocator, read-merge idempotent upsert). The
 			// default remains the findings importer.
+			//
+			// AIRA-237 Task 4 — --allocated-max seeds the per-prefix HWM. Read +
+			// parse it unconditionally (so the metadata read-set matches the
+			// declared args regardless of branch), then refuse it outside --tickets
+			// rather than silently dropping an operator flag.
+			allocatedMax, allocErr := parseAllocatedMax(stringSlice(args, "allocated_max"))
+			if allocErr != nil {
+				return nil, allocErr
+			}
 			if boolArg(args, "tickets") {
 				var summary store.ImportTicketsSummary
 				var err error
 				if args.content != nil {
 					importer, ok := c.store.(interface {
-						ImportTicketsBytes(context.Context, []byte, bool) (store.ImportTicketsSummary, error)
+						ImportTicketsBytes(context.Context, []byte, bool, map[string]int64) (store.ImportTicketsSummary, error)
 					})
 					if !ok {
 						return nil, errors.New("E_IMPORT_INVALID: byte import is unavailable")
 					}
-					summary, err = importer.ImportTicketsBytes(ctx, args.content, boolArg(args, "strict"))
+					summary, err = importer.ImportTicketsBytes(ctx, args.content, boolArg(args, "strict"), allocatedMax)
 				} else {
 					importer, ok := c.store.(interface {
-						ImportTickets(context.Context, string, bool) (store.ImportTicketsSummary, error)
+						ImportTickets(context.Context, string, bool, map[string]int64) (store.ImportTicketsSummary, error)
 					})
 					if !ok {
 						return nil, errors.New("E_IMPORT_INVALID: ticket import is unavailable")
 					}
-					summary, err = importer.ImportTickets(ctx, stringArg(args, "file"), boolArg(args, "strict"))
+					summary, err = importer.ImportTickets(ctx, stringArg(args, "file"), boolArg(args, "strict"), allocatedMax)
 				}
 				if err != nil {
 					return nil, err
@@ -1013,6 +1050,12 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					verdict = "fail"
 				}
 				return handlerData{Data: summary, Verdict: verdict}, nil
+			}
+			// --allocated-max only makes sense for the ticket importer; refuse it on
+			// a findings import rather than accepting-and-ignoring it (AIRA-82's
+			// silently-discarded-scope failure mode).
+			if len(allocatedMax) > 0 {
+				return nil, errors.New("E_IMPORT_INVALID: --allocated-max requires --tickets")
 			}
 			var summary store.ImportSummary
 			var err error

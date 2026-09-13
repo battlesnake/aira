@@ -62,7 +62,7 @@ func TestImportTicketsCreatesPrefixedAndSeedsCounter(t *testing.T) {
 		`{"id":"NF-1","title":"first nf item","status":"in-progress","kind":"feature","severity":"P0","body":"body two"}`,
 	}, "\n")
 
-	summary, err := s.ImportTicketsBytes(ctx, []byte(data), false)
+	summary, err := s.ImportTicketsBytes(ctx, []byte(data), false, nil)
 	if err != nil {
 		t.Fatalf("ImportTicketsBytes: %v", err)
 	}
@@ -140,7 +140,7 @@ func namespacedStoreSharing(t *testing.T, base, worktreeID string, idPrefix stri
 
 func importOne(t *testing.T, s *Store, jsonl string) ImportTicketsSummary {
 	t.Helper()
-	summary, err := s.ImportTicketsBytes(context.Background(), []byte(jsonl), false)
+	summary, err := s.ImportTicketsBytes(context.Background(), []byte(jsonl), false, nil)
 	if err != nil {
 		t.Fatalf("ImportTicketsBytes: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestImportTicketsDanglingEndpoint(t *testing.T) {
 
 	// Strict: zero writes on any error.
 	s2 := namespacedStore(t, "FEE", "BL", "NF")
-	_, err := s2.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"one","status":"planned","kind":"chore","severity":"P2","body":"b","links":[{"kind":"blocks","to":"NF-99"}]}`), true)
+	_, err := s2.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"one","status":"planned","kind":"chore","severity":"P2","body":"b","links":[{"kind":"blocks","to":"NF-99"}]}`), true, nil)
 	if err == nil || !strings.Contains(err.Error(), "E_RELATION_TARGET_MISSING") {
 		t.Fatalf("strict import should fail with the dangling error; got %v", err)
 	}
@@ -400,7 +400,7 @@ func TestImportTicketsCrossWorktreeMaterialise(t *testing.T) {
 	}
 
 	// B imports the same id → materialise HERE (accept the cross-worktree mint).
-	summary, err := b.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"adopted","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true)
+	summary, err := b.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"adopted","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil)
 	if err != nil {
 		t.Fatalf("cross-worktree import: %v", err)
 	}
@@ -420,7 +420,7 @@ func TestImportTicketsCrossWorktreeMaterialise(t *testing.T) {
 
 	// Now A imports the same id → B's materialised file at a DIFFERENT existing
 	// path → refuse (colliding number, different path).
-	_, err = a.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"collide","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true)
+	_, err = a.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"collide","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil)
 	if err == nil || !strings.Contains(err.Error(), "different path") {
 		t.Fatalf("A importing a row materialised at B's path should refuse; got %v", err)
 	}

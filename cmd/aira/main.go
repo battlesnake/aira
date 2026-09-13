@@ -786,7 +786,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 				options["fields"] += ","
 			}
 			options["fields"] += argv[i]
-		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") || (name == "bucket" && verb == "spend") || (verb == "rant" && (name == "tag" || name == "ref")) {
+		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") || (name == "bucket" && verb == "spend") || (verb == "rant" && (name == "tag" || name == "ref")) || (verb == "import" && name == "allocated-max") {
 			options[name] = appendDelimited(options[name], argv[i])
 		} else {
 			options[name] = argv[i]
@@ -801,7 +801,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
 		"grep":   {"kind": true, "by": true, "fields": true},
-		"import": {"strict": true, "tickets": true},
+		"import": {"strict": true, "tickets": true, "allocated-max": true},
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
@@ -2845,6 +2845,13 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("import requires <file>")
 		}
 		args["file"], args["strict"], args["tickets"] = positional[0], options["strict"] == "true", options["tickets"] == "true"
+		// AIRA-237 Task 4 — --allocated-max is repeatable (NUL-accumulated in
+		// parseArgs); the core handler parses each PREFIX=N entry and the store
+		// composes/validates the prefix. Set the key ONLY when the flag is present
+		// (an absent flag must not inject a null-valued arg — the faces reject it).
+		if options["allocated-max"] != "" {
+			args["allocated_max"] = splitOptionList(options["allocated-max"])
+		}
 	case "count":
 		if options["by"] == "" {
 			return core.Request{}, fmt.Errorf("count requires --by <field>")

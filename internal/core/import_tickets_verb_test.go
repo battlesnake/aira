@@ -101,3 +101,53 @@ func TestRequirementDisplayStripThroughCore(t *testing.T) {
 		t.Fatalf("req show path must stay compound: %s", raw)
 	}
 }
+
+// verifies (Task 4): `aira import --tickets --allocated-max BL=1217` seeds the
+// forward allocator from the LAST-allocated number, so `aira id BL` mints
+// EXACTLY N+1 (1218) then N+2 (1219) — the fencepost — and the minted id
+// displays bare (the make-id wrapper contract). This exercises the whole CLI/
+// core parse path (string -> map) + the display strip in one.
+func TestImportAllocatedMaxFencepostThroughCore(t *testing.T) {
+	ctx := context.Background()
+	c, base := namespacedReqCore(t)
+
+	file := filepath.Join(base, "tickets.jsonl")
+	body := `{"id":"BL-1","title":"one","status":"planned","kind":"chore","severity":"P2","body":"b"}`
+	if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp := c.Do(ctx, Request{Verb: "import", Args: map[string]any{"file": file, "tickets": true, "strict": false, "allocated_max": []string{"BL=1217"}}, Content: []byte(body), HasContent: true})
+	if !resp.OK || resp.Code != "PASS" {
+		t.Fatalf("import --tickets --allocated-max: ok=%v code=%q err=%q", resp.OK, resp.Code, resp.Error)
+	}
+
+	first := c.Do(ctx, Request{Verb: "id", Args: map[string]any{"prefix": "BL"}})
+	if !first.OK {
+		t.Fatalf("aira id BL #1: %s", first.Error)
+	}
+	if raw := string(first.RawData); !strings.Contains(raw, `"id":"BL-1218"`) || strings.Contains(raw, `"id":"FEE-BL-1218"`) {
+		t.Fatalf("first mint after --allocated-max BL=1217 = %s; want bare BL-1218 (N+1 fencepost, display-stripped)", raw)
+	}
+	second := c.Do(ctx, Request{Verb: "id", Args: map[string]any{"prefix": "BL"}})
+	if !second.OK {
+		t.Fatalf("aira id BL #2: %s", second.Error)
+	}
+	if raw := string(second.RawData); !strings.Contains(raw, `"id":"BL-1219"`) {
+		t.Fatalf("second mint = %s; want bare BL-1219", raw)
+	}
+}
+
+// verifies (Task 4): --allocated-max outside --tickets is refused with a stable
+// error, never silently dropped (the AIRA-82 discarded-scope failure mode).
+func TestImportAllocatedMaxRequiresTickets(t *testing.T) {
+	ctx := context.Background()
+	c, base := namespacedReqCore(t)
+	file := filepath.Join(base, "findings.jsonl")
+	if err := os.WriteFile(file, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp := c.Do(ctx, Request{Verb: "import", Args: map[string]any{"file": file, "strict": false, "allocated_max": []string{"BL=10"}}})
+	if resp.OK || !strings.Contains(resp.Error, "requires --tickets") {
+		t.Fatalf("--allocated-max without --tickets should be refused; ok=%v err=%q", resp.OK, resp.Error)
+	}
+}

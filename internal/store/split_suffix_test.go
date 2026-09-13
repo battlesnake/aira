@@ -71,7 +71,7 @@ func TestImportSplitSuffixKeepsDistinctAllocations(t *testing.T) {
 {"id":"BL-10a","title":"child a","status":"planned","kind":"chore","severity":"P2","body":"b"}
 {"id":"BL-10b","title":"child b","status":"planned","kind":"chore","severity":"P2","body":"b"}`
 
-	summary, err := s.ImportTicketsBytes(ctx, []byte(jsonl), false)
+	summary, err := s.ImportTicketsBytes(ctx, []byte(jsonl), false, nil)
 	if err != nil {
 		t.Fatalf("ImportTicketsBytes: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestImportSuffixDoesNotStealSiblingAllocation(t *testing.T) {
 	}
 
 	// Import ONLY the suffixed child.
-	if _, err := s.ImportTicketsBytes(ctx, []byte(`{"id":"BL-10a","title":"child","status":"planned","kind":"chore","severity":"P2","body":"b"}`), false); err != nil {
+	if _, err := s.ImportTicketsBytes(ctx, []byte(`{"id":"BL-10a","title":"child","status":"planned","kind":"chore","severity":"P2","body":"b"}`), false, nil); err != nil {
 		t.Fatalf("ImportTicketsBytes(BL-10a): %v", err)
 	}
 
@@ -181,7 +181,7 @@ func TestImportSuffixDoesNotStealSiblingAllocation(t *testing.T) {
 	}
 
 	// Importing the plain parent then adopts its pre-allocated row; check green.
-	if _, err := s.ImportTicketsBytes(ctx, []byte(`{"id":"BL-10","title":"parent","status":"planned","kind":"chore","severity":"P2","body":"b"}`), false); err != nil {
+	if _, err := s.ImportTicketsBytes(ctx, []byte(`{"id":"BL-10","title":"parent","status":"planned","kind":"chore","severity":"P2","body":"b"}`), false, nil); err != nil {
 		t.Fatalf("ImportTicketsBytes(BL-10): %v", err)
 	}
 	report, err := s.Check(ctx)
@@ -217,7 +217,7 @@ func openSuffixRecoveryStore(t *testing.T, root, common, state string) *Store {
 // the reconcile-recovery path (receipts live in git, state.db does not). A plain
 // twin and its suffixed child — as a TICKET pair and a REQUIREMENT pair —
 // written directly into .aira/tickets/.aira/requirements must each recover into
-// TWO distinct allocation rows (suffix '' and the letter). This is the leg that
+// TWO distinct allocation rows (suffix ” and the letter). This is the leg that
 // makes BOTH recovery INSERTs suffix-mutation-sensitive; import-then-check
 // short-circuits before the recovery branch.
 func TestFreshCloneRecoversSplitSuffix(t *testing.T) {
@@ -310,7 +310,7 @@ func createPreSuffixAllocationDB(t *testing.T, dbPath string) {
 
 // TestAllocationsSuffixMigration is leg 4: opening a pre-suffix database
 // recreates allocations with the widened 4-column PK, preserves the existing row
-// with suffix='', admits a suffixed sibling INSERT, refuses a duplicate 4-tuple,
+// with suffix=”, admits a suffixed sibling INSERT, refuses a duplicate 4-tuple,
 // and is a re-run no-op.
 func TestAllocationsSuffixMigration(t *testing.T) {
 	ctx := context.Background()

@@ -113,8 +113,9 @@ type ticketAllocation struct {
 }
 
 // ImportTickets opens and imports a JSONL ticket batch. A missing file is a
-// stable E_NOT_FOUND.
-func (s *Store) ImportTickets(ctx context.Context, path string, strict bool) (ImportTicketsSummary, error) {
+// stable E_NOT_FOUND. allocatedMax carries the AIRA-237 Task 4 --allocated-max
+// seeds (bare prefix -> LAST-allocated number) — see ImportTicketsBytes.
+func (s *Store) ImportTickets(ctx context.Context, path string, strict bool, allocatedMax map[string]int64) (ImportTicketsSummary, error) {
 	if strings.TrimSpace(path) == "" {
 		return ImportTicketsSummary{}, errors.New("E_NOT_FOUND: import requires a file path")
 	}
@@ -130,12 +131,29 @@ func (s *Store) ImportTickets(ctx context.Context, path string, strict bool) (Im
 	if err != nil {
 		return ImportTicketsSummary{}, fmt.Errorf("E_IMPORT_INVALID: cannot read import file %q: %w", path, err)
 	}
-	return s.ImportTicketsBytes(ctx, data, strict)
+	return s.ImportTicketsBytes(ctx, data, strict, allocatedMax)
 }
 
 // ImportTicketsBytes imports caller-read JSONL without resolving a path in the
 // daemon process.
-func (s *Store) ImportTicketsBytes(ctx context.Context, data []byte, strict bool) (ImportTicketsSummary, error) {
+//
+// allocatedMax (AIRA-237 Task 4) is the --allocated-max cutover seed: a bare
+// prefix -> LAST-allocated number map, sourced from the external allocator's
+// counter (which holds the last value it minted, and may EXCEED the max id in
+// the imported backlog because ids minted on unmerged branches are not there).
+// Each entry advances the per-prefix next_number high-water mark to N+1 via the
+// same MAX(current, N+1) upsert the row loop uses, so the forward allocator
+// mints EXACTLY N+1 next (the fencepost the plan-review caught). Composition +
+// ownership of the bare prefix is validated BEFORE any write, so a typo aborts
+// with zero writes rather than a partial import.
+func (s *Store) ImportTicketsBytes(ctx context.Context, data []byte, strict bool, allocatedMax map[string]int64) (ImportTicketsSummary, error) {
+	// Validate + compose the --allocated-max seeds up front (zero-write on a bad
+	// prefix or value); apply them AFTER the row loop below.
+	composedMax, err := s.composeAllocatedMax(allocatedMax)
+	if err != nil {
+		return ImportTicketsSummary{}, err
+	}
+
 	rows, rowErrors, total := s.parseTicketRows(data)
 
 	// Batch id-set: an endpoint is resolvable if it is a row in THIS batch or
@@ -199,6 +217,12 @@ func (s *Store) ImportTicketsBytes(ctx context.Context, data []byte, strict bool
 		}
 	}
 	if err := s.advanceImportedTicketCounters(ctx, maxima); err != nil {
+		return ImportTicketsSummary{}, err
+	}
+	// Apply the --allocated-max cutover seeds AFTER the row loop, on the SAME
+	// MAX(current, N+1) HWM upsert, so a seed can only raise the counter and the
+	// forward allocator mints exactly N+1 next.
+	if err := s.advanceImportedTicketCounters(ctx, composedMax); err != nil {
 		return ImportTicketsSummary{}, err
 	}
 
@@ -649,6 +673,29 @@ func (s *Store) absentImportedTickets(batch map[string]bool) ([]string, error) {
 		}
 	}
 	return absent, rows.Err()
+}
+
+// composeAllocatedMax validates every --allocated-max entry and re-keys it by
+// the COMPOSED prefix (the bare BL typed at the cutover is composed with the
+// project id_prefix exactly like every other prefix, AIRA-237 Task 1). An
+// unowned/non-ticket prefix or a value < 1 is a hard error (an operator
+// misconfiguration, never a per-row skip), returned before any write.
+func (s *Store) composeAllocatedMax(raw map[string]int64) (map[string]int64, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]int64, len(raw))
+	for prefix, last := range raw {
+		if last < 1 {
+			return nil, fmt.Errorf("E_IMPORT_INVALID: --allocated-max value for %q must be >= 1 (got %d)", prefix, last)
+		}
+		composed := strings.ToUpper(s.canonicalID(strings.TrimSpace(prefix)))
+		if kind, owned := s.prefixes[composed]; !owned || kind != kindTicket {
+			return nil, fmt.Errorf("E_IMPORT_INVALID: --allocated-max unowned or non-ticket prefix %q", prefix)
+		}
+		out[composed] = last
+	}
+	return out, nil
 }
 
 func (s *Store) advanceImportedTicketCounters(ctx context.Context, maxima map[string]int64) error {
