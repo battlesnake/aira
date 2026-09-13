@@ -41,9 +41,18 @@ func topRegionsByLabel(model panelModel) map[string]topBarRegion {
 }
 
 func topReservationCells(model panelModel) map[string]string {
+	// Resolve RESERVATION by header name rather than a fixed index: the AGE
+	// column (re-added 2026-09-13) sits before it, and a hardcoded index would
+	// silently read the wrong column after any such insertion.
+	column := 0
+	for i, name := range model.Headers {
+		if name == "RESERVATION" {
+			column = i
+		}
+	}
 	cells := make(map[string]string, len(model.Rows))
 	for _, row := range model.Rows {
-		cells[row.ID] = row.Cells[4]
+		cells[row.ID] = row.Cells[column]
 	}
 	return cells
 }
