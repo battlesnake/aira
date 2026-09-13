@@ -255,6 +255,34 @@ func reportSamples(t *testing.T, report map[string]interface{}) []map[string]int
 	return out
 }
 
+// environForRealDaemonAitestWithScopeID is environForRealDaemonAitest with an
+// EXPLICIT AIRA_CONFINE_SCOPE_ID (filtering any inherited one), so two concurrent
+// supervisors in the AIRA-232 gate publish DISTINCT parent scope-ids — with
+// distinct pid slots — and their worker scope NAMES (which embed that pid, Task 1)
+// are attributable to the supervisor that spawned them.
+func environForRealDaemonAitestWithScopeID(scopeID string) []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "AIRA_CONFINE_SCOPE_ID=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return append(filtered, "AIRA_CONFINE_SCOPE_ID="+scopeID)
+}
+
+// leasePidSlot extracts the parent-supervisor pid embedded in a worker lease's
+// scope-id (CONFINE-aitest-w<seq>-<parentPid>-<stamp>, Task 1) via the exported
+// parser. Returns 0 when the key is not a parseable worker scope-id.
+func leasePidSlot(scopeID string) int {
+	_, pid, _, _, ok := runner.ParseConfineScopeID(scopeID)
+	if !ok {
+		return 0
+	}
+	return pid
+}
+
 // readCgroupProcs returns the PIDs currently in a cgroup scope's cgroup.procs.
 // A non-empty result on a worker scope is positive proof the scope is POPULATED
 // (a live process is running its test there), which is what makes the parent-kill
@@ -498,4 +526,187 @@ func TestRealPytestAitestParentKillLeavesNoOrphanPostRestart(t *testing.T) {
 	case <-runCh:
 	case <-testdeadline.After(20 * time.Second):
 	}
+}
+
+// TestRealPytestAitestMultiSupervisorSafe is Gate C (AIRA-232): two independent
+// aitest supervisors (the `make -j` shape) under one slice, driven by one daemon,
+// cannot jointly breach the slice ledger. The ledger is pinned so exactly TWO
+// pytest workers fit; both supervisors continuously demand workers (8 slow tests
+// each), so their combined demand far exceeds the ceiling. The daemon serialises
+// them against the ONE ledger: at every sampled instant the combined granted
+// worker set is <= 2 and Σ(reserve) <= 2 workers' worth — there is no client
+// aggregate, no sibling-sum, no cross-process TOCTOU that could let each
+// supervisor admit up to its own limit independently.
+//
+// Non-porous:
+//   - EXACT serialisation bound sampled THROUGHOUT the run: combined granted
+//     leases <= 2 and Σ(reserve) <= 2*restartGatePytestReserve at every poll. If
+//     AIRA-232 regressed to per-supervisor guarding, two supervisors would each
+//     admit up to the ceiling → combined 3-4+ workers → this reds.
+//   - Both supervisors actually competed: worker leases from BOTH distinct pid
+//     slots (each supervisor's own AIRA_CONFINE_SCOPE_ID pid) were observed, and
+//     every worker scope-id parses (Task 1 naming). A gate where only one
+//     supervisor ever ran would prove nothing about multi-supervisor safety.
+//   - Both suites completed with every test PASSED (the count trap) and neither
+//     parent scope's oom.group ever fired.
+func TestRealPytestAitestMultiSupervisorSafe(t *testing.T) {
+	h := newRestartGateHarness(t, true)
+
+	// A SECOND parent (outer) scope under the same slice for the second supervisor,
+	// created exactly like the harness's first (finite memory.max, no +memory
+	// pre-delegation — the pytest supervisor runs directly in it, no sub-scopes).
+	outer2 := filepath.Join(h.parent, ".aira-outer-restartgate-2")
+	if err := os.Mkdir(outer2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outer2, "memory.max"), []byte("805306368"), 0o644); err != nil {
+		t.Fatalf("cannot set outer2 memory.max: %v", err)
+	}
+	outer2File, err := os.Open(outer2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outer2File.Close()
+
+	server, cancel, done := h.startServer(t)
+	defer func() { cancel(); awaitServerShutdown(t, done) }()
+
+	const (
+		scopeIDA = "CONFINE-e2e-outerA-111111-1"
+		scopeIDB = "CONFINE-e2e-outerB-222222-1"
+		pidA     = 111111
+		pidB     = 222222
+	)
+
+	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(3*time.Minute))
+	defer cancelRun()
+
+	launch := func(scopeID string, outerFile *os.File, outerPath string) chan runOutcome {
+		command := exec.CommandContext(runCtx, h.pytest, "-q", "--aitest-workers=3", "test_slow_passing.py")
+		command.Dir = filepath.Join(h.aitestDir, "testdata")
+		command.WaitDelay = 15 * time.Second
+		command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(outerFile.Fd())}
+		command.Env = append(environForRealDaemonAitestWithScopeID(scopeID),
+			"PYTHONPATH="+filepath.Dir(h.aitestDir),
+			"PYTHONDONTWRITEBYTECODE=1",
+			"AIRA_AITEST_LIB="+h.pythonDir,
+			"AIRA_AITEST_OUTER_SCOPE="+outerPath,
+			"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
+			"AIRA_AITEST_WORKER_ADMIT_CMD="+h.binary,
+			"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(restartGatePytestReserve),
+			"AIRA_REAL_CGROUP=1",
+		)
+		ch := make(chan runOutcome, 1)
+		go func() {
+			out, runErr := command.CombinedOutput()
+			ch <- runOutcome{out, runErr}
+		}()
+		return ch
+	}
+
+	// Sample the ledger THROUGHOUT both runs: the max combined granted count, the
+	// max combined Σ(reserve), and the union of pid slots seen. Stops when both
+	// runs have completed.
+	const ceiling = int64(2) * restartGatePytestReserve
+	var maxCount int
+	var maxSum int64
+	pidSlots := map[int]bool{}
+	sampleDone := make(chan struct{})
+	sampleStopped := make(chan struct{})
+	go func() {
+		defer close(sampleStopped)
+		violation := ""
+		for {
+			leases := server.GrantedLeasesForTest()
+			var sum int64
+			for id, reserve := range leases {
+				sum += reserve
+				if slot := leasePidSlot(id); slot != 0 {
+					pidSlots[slot] = true
+				}
+			}
+			if len(leases) > maxCount {
+				maxCount = len(leases)
+			}
+			if sum > maxSum {
+				maxSum = sum
+			}
+			// Record the FIRST breach so a regression is reported with the offending
+			// snapshot rather than only a max.
+			if (len(leases) > 2 || sum > ceiling) && violation == "" {
+				violation = leasesSnapshotString(leases, sum)
+				t.Errorf("AIRA-232 BREACH: the daemon granted %d workers (Σ reserve %d) across two supervisors, "+
+					"exceeding the 2-worker / %d-byte ceiling — two supervisors jointly breached the one slice: %s",
+					len(leases), sum, ceiling, violation)
+			}
+			select {
+			case <-sampleDone:
+				return
+			case <-time.After(30 * time.Millisecond):
+			}
+		}
+	}()
+
+	chA := launch(scopeIDA, h.outerFile, h.outer)
+	chB := launch(scopeIDB, outer2File, outer2)
+
+	var outA, outB runOutcome
+	got := 0
+	for got < 2 {
+		select {
+		case outA = <-chA:
+			chA = nil
+			got++
+		case outB = <-chB:
+			chB = nil
+			got++
+		case <-testdeadline.After(3 * time.Minute):
+			cancelRun()
+			close(sampleDone)
+			<-sampleStopped
+			t.Fatalf("multi-supervisor run did not complete (A done=%v B done=%v)", chA == nil, chB == nil)
+		}
+	}
+	close(sampleDone)
+	<-sampleStopped
+
+	// Both suites completed with every slow test passed (the count trap) and no
+	// silent fallback to unconfined execution on either.
+	for name, o := range map[string]runOutcome{"A": outA, "B": outB} {
+		text := string(o.output)
+		if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
+			t.Fatalf("supervisor %s fell back to unconfined execution (containment stripped):\n%s", name, text)
+		}
+		if !strings.Contains(text, "8 passed") {
+			t.Fatalf("supervisor %s did not report all 8 slow tests passed:\nerr=%v\n%s", name, o.err, text)
+		}
+		if o.err != nil {
+			t.Fatalf("supervisor %s exited nonzero: %v\n%s", name, o.err, text)
+		}
+	}
+
+	// Both supervisors genuinely competed for workers under the one daemon: worker
+	// leases from BOTH pid slots were observed.
+	if !pidSlots[pidA] || !pidSlots[pidB] {
+		t.Fatalf("did not observe worker leases from BOTH supervisors (pid slots seen: %v; want %d and %d) — "+
+			"only one supervisor ever ran, so multi-supervisor serialisation was not exercised", pidSlots, pidA, pidB)
+	}
+
+	// Neither parent scope's oom.group fired.
+	for name, dir := range map[string]string{"A": h.outer, "B": outer2} {
+		if kills := readOuterMemoryEventCounter(t, dir, "oom_group_kill"); kills != 0 {
+			t.Fatalf("parent scope %s oom_group_kill=%d, want 0 — a whole-suite kill fired", name, kills)
+		}
+	}
+	t.Logf("AIRA-232: two supervisors serialised — max combined granted workers=%d, max Σ(reserve)=%d (ceiling %d), pid slots=%v",
+		maxCount, maxSum, ceiling, pidSlots)
+}
+
+// leasesSnapshotString renders a ledger snapshot for a breach report.
+func leasesSnapshotString(leases map[string]int64, sum int64) string {
+	parts := make([]string, 0, len(leases))
+	for id, reserve := range leases {
+		parts = append(parts, id+"="+strconv.FormatInt(reserve, 10))
+	}
+	return "Σ=" + strconv.FormatInt(sum, 10) + " {" + strings.Join(parts, ", ") + "}"
 }
