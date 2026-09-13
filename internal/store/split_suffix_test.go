@@ -332,6 +332,25 @@ func TestAllocationsSuffixMigration(t *testing.T) {
 		t.Fatalf("allocations.suffix present %d times; want 1", got)
 	}
 
+	// The project_id -> projects FK is carried forward by the recreation; a
+	// dropped FK would let a detached allocation row survive a projects delete.
+	fkRows, err := db.Query(`PRAGMA foreign_key_list(allocations)`)
+	if err != nil {
+		t.Fatalf("foreign_key_list: %v", err)
+	}
+	fkCount := 0
+	for fkRows.Next() {
+		fkCount++
+	}
+	if err := fkRows.Err(); err != nil {
+		_ = fkRows.Close()
+		t.Fatalf("foreign_key_list rows: %v", err)
+	}
+	_ = fkRows.Close()
+	if fkCount == 0 {
+		t.Fatal("migrated allocations table has no foreign keys; the project_id->projects FK was dropped")
+	}
+
 	// The existing row survived, carrying suffix=''.
 	var state, suffix string
 	if err := db.QueryRow(`SELECT state, suffix FROM allocations WHERE project_id='project-fee' AND prefix='FEE-BL' AND number=10`).Scan(&state, &suffix); err != nil {

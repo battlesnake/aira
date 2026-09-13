@@ -3069,6 +3069,19 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
 					return err
 				}
+				// A cross-worktree-adopted ticket (aira id in A, aira import in B)
+				// replays from the mint receipt as state='allocated' at A's path,
+				// but the file is scanned here in B. Re-point the still-allocated
+				// row at the scanned file's path/worktree — the same allocated→file
+				// resolution markTicketMaterialised's CASE performs — so Check does
+				// not fabricate an E_ID_UNRESOLVED against the empty A path. Guarded
+				// to state='allocated' (never advances a materialised/retired row)
+				// and to a genuine path change (no-op otherwise).
+				if _, err := conn.ExecContext(ctx, `UPDATE allocations SET path=?, worktree_id=?
+                        WHERE project_id=? AND prefix=? AND number=? AND suffix=? AND state='allocated' AND path<>?`,
+					ticket.Path, ticket.WorktreeID, s.projectID, prefix, number, suffix, ticket.Path); err != nil {
+					return err
+				}
 				if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
 					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
 						ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)})

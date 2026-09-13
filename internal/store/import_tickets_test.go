@@ -372,8 +372,11 @@ func TestImportTicketsValidationContract(t *testing.T) {
 
 // verifies (Step 6 / cross-worktree): aira id in worktree A records a
 // state='allocated' row with A's path; aira import in worktree B materialises it
-// (path rewritten to B), NOT the import_requirements.go path-refusal. And a
-// genuinely materialised row at a DIFFERENT existing path is refused.
+// (path rewritten to B), NOT the import_requirements.go path-refusal. A
+// subsequent import of the same id from A (its file absent) is ADOPTED — the
+// same ticket, materialised here — never refused, and the allocation path stays
+// at B. (The file-present → refreshed direction is pinned in
+// TestImportCrossWorktreeReimportRefreshesPathStaysB.)
 func TestImportTicketsCrossWorktreeMaterialise(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
@@ -418,11 +421,147 @@ func TestImportTicketsCrossWorktreeMaterialise(t *testing.T) {
 		t.Fatalf("Get in B after materialise: %v", err)
 	}
 
-	// Now A imports the same id → B's materialised file at a DIFFERENT existing
-	// path → refuse (colliding number, different path).
-	_, err = a.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"collide","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil)
-	if err == nil || !strings.Contains(err.Error(), "different path") {
-		t.Fatalf("A importing a row materialised at B's path should refuse; got %v", err)
+	// Now A imports the same id → the same ticket, ADOPTED (A has no file, so it
+	// materialises A's own copy); the false "different path" refusal is gone and
+	// the allocation path/worktree stay at B (state already materialised).
+	adopt, err := a.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"adopted-in-a","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil)
+	if err != nil {
+		t.Fatalf("A importing a row materialised at B's path must be adopted, not refused; got %v", err)
+	}
+	if len(adopt.Created) != 1 || adopt.Created[0] != "FEE-BL-1" {
+		t.Fatalf("A adopt import = %+v; want created [FEE-BL-1]", adopt)
+	}
+	state, allocPath, _ = allocationRow(t, b, "FEE-BL", 1)
+	if state != "materialised" || !strings.Contains(allocPath, filepath.Join("wt-b", ".aira")) {
+		t.Fatalf("allocation after A adopt = (state=%q,path=%q); want materialised at B's worktree", state, allocPath)
+	}
+}
+
+// (a) HIGH finding + markTicketMaterialised CASE no-clobber: once B has
+// materialised FEE-BL-1, a re-import from worktree A (A's own file now present,
+// content changed) is REFRESHED — never the deleted E_IMPORT_INVALID
+// "different path" refusal — and the allocation row's path/worktree still point
+// at B. A CASE-removal mutation in markTicketMaterialised would flip the path to
+// A, so this also pins the no-clobber direction.
+func TestImportCrossWorktreeReimportRefreshesPathStaysB(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := namespacedStoreSharing(t, base, "wt-a", "FEE", "BL")
+	b := namespacedStoreSharing(t, base, "wt-b", "FEE", "BL")
+
+	// A mints; B materialises (allocation path rewritten to B while it was
+	// state='allocated').
+	if _, err := a.AllocateID(ctx, "BL"); err != nil {
+		t.Fatalf("AllocateID: %v", err)
+	}
+	if _, err := b.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"adopted","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil); err != nil {
+		t.Fatalf("B materialise: %v", err)
+	}
+	_, bPath, _ := allocationRow(t, b, "FEE-BL", 1)
+	if !strings.Contains(bPath, filepath.Join("wt-b", ".aira")) {
+		t.Fatalf("post-materialise alloc path = %q; want B's worktree", bPath)
+	}
+
+	// A imports the same id → adopt the SAME ticket, creating A's own file; the
+	// allocation path/worktree stay at B (state already materialised).
+	created, err := a.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"adopted","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil)
+	if err != nil {
+		t.Fatalf("A cross-worktree import (adopt) must succeed, not E_IMPORT_INVALID: %v", err)
+	}
+	if len(created.Created) != 1 || created.Created[0] != "FEE-BL-1" {
+		t.Fatalf("A first import = %+v; want created [FEE-BL-1]", created)
+	}
+
+	// A re-imports with CHANGED content → REFRESHED; path/worktree still B.
+	refreshed, err := a.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"changed-in-A","status":"in-progress","kind":"chore","severity":"P1","body":"b2"}`), true, nil)
+	if err != nil {
+		t.Fatalf("A re-import (refresh) must succeed, not E_IMPORT_INVALID: %v", err)
+	}
+	if len(refreshed.Refreshed) != 1 || refreshed.Refreshed[0] != "FEE-BL-1" {
+		t.Fatalf("A re-import = %+v; want refreshed [FEE-BL-1]", refreshed)
+	}
+	state, path, _ := allocationRow(t, b, "FEE-BL", 1)
+	if state != "materialised" {
+		t.Fatalf("allocation state = %q; want materialised", state)
+	}
+	if !strings.Contains(path, filepath.Join("wt-b", ".aira")) {
+		t.Fatalf("allocation path after A re-import = %q; want STILL B's worktree (CASE no-clobber)", path)
+	}
+}
+
+// (b) After a state.db loss, a Rebuild of a cross-worktree-adopted ticket
+// re-points the reconstructed allocation (receipt-replayed as state='allocated'
+// at the minting worktree A's path) at the worktree that actually holds the
+// file (B), so Check finds no fabricated E_ID_UNRESOLVED. Reds before fix #2.
+func TestImportRebuildResolvesCrossWorktreeAdoptedAllocation(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := namespacedStoreSharing(t, base, "wt-a", "FEE", "BL")
+	b := namespacedStoreSharing(t, base, "wt-b", "FEE", "BL")
+
+	if _, err := a.AllocateID(ctx, "BL"); err != nil {
+		t.Fatalf("AllocateID: %v", err)
+	}
+	if _, err := b.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"adopted","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil); err != nil {
+		t.Fatalf("B materialise: %v", err)
+	}
+	_ = a.Close()
+	_ = b.Close()
+
+	// Lose the whole database; the durable receipts + journal survive.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(filepath.Join(base, "state", "state.db"+suffix))
+	}
+
+	rebuilt := namespacedStoreSharing(t, base, "wt-b", "FEE", "BL")
+	if err := rebuilt.Rebuild(ctx); err != nil {
+		t.Fatalf("Rebuild after db loss: %v", err)
+	}
+	report, err := rebuilt.Check(ctx)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	for _, f := range report.Findings {
+		if f.Code == "E_ID_UNRESOLVED" {
+			t.Fatalf("Check reports E_ID_UNRESOLVED after cross-worktree rebuild: %+v", f)
+		}
+	}
+	_, path, ok := allocationRow(t, rebuilt, "FEE-BL", 1)
+	if !ok {
+		t.Fatal("allocation row for FEE-BL-1 missing after rebuild")
+	}
+	if !strings.Contains(path, filepath.Join("wt-b", ".aira")) {
+		t.Fatalf("allocation path after rebuild = %q; want re-pointed to B's worktree", path)
+	}
+}
+
+// (c) Strict zero-write on a pass-0-detectable failure: a strict import of
+// [valid row1, bad-link row2] writes NOTHING — row1's file never appears and no
+// ticket.import event is recorded — pinning the honest strict contract (zero
+// writes on parse/link validation failures, caught by the pass-0 probe).
+func TestImportStrictZeroWriteOnPass0LinkFailure(t *testing.T) {
+	ctx := context.Background()
+	s := namespacedStore(t, "FEE", "BL", "NF")
+
+	_, err := s.ImportTicketsBytes(ctx, []byte(strings.Join([]string{
+		`{"id":"BL-1","title":"valid row one","status":"planned","kind":"chore","severity":"P2","body":"b1"}`,
+		`{"id":"BL-2","title":"bad link row","status":"planned","kind":"chore","severity":"P2","body":"b2","links":[{"kind":"blocks","to":"NF-99"}]}`,
+	}, "\n")), true, nil)
+	if err == nil || !strings.Contains(err.Error(), "E_RELATION_TARGET_MISSING") {
+		t.Fatalf("strict import with a dangling link should fail zero-write; got %v", err)
+	}
+	// The fully-valid row1 must NOT have been written before the batch aborted.
+	if _, gerr := s.Get("FEE-BL-1"); ErrorCode(gerr) != "E_NOT_FOUND" {
+		t.Fatalf("strict pass-0 abort must write nothing; FEE-BL-1 exists: %v", gerr)
+	}
+	if n := importEventCount(t, s, "FEE-BL-1"); n != 0 {
+		t.Fatalf("strict pass-0 abort must write no ticket.import event for row1; got %d", n)
 	}
 }
 

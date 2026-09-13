@@ -142,8 +142,9 @@ func (s *Store) ImportTickets(ctx context.Context, path string, strict bool, all
 // counter (which holds the last value it minted, and may EXCEED the max id in
 // the imported backlog because ids minted on unmerged branches are not there).
 // Each entry advances the per-prefix next_number high-water mark to N+1 via the
-// same MAX(current, N+1) upsert the row loop uses, so the forward allocator
-// mints EXACTLY N+1 next (the fencepost the plan-review caught). Composition +
+// same MAX(current, N+1) upsert the per-row upsertImportedCounter uses, so the
+// forward allocator mints EXACTLY N+1 next (the fencepost the plan-review
+// caught). Composition +
 // ownership of the bare prefix is validated BEFORE any write, so a typo aborts
 // with zero writes rather than a partial import.
 func (s *Store) ImportTicketsBytes(ctx context.Context, data []byte, strict bool, allocatedMax map[string]int64) (ImportTicketsSummary, error) {
@@ -191,8 +192,9 @@ func (s *Store) ImportTicketsBytes(ctx context.Context, data []byte, strict bool
 		AbsentFromBatch: []string{}, Errored: errored, Total: total,
 	}
 
-	// Pass 1 — create/refresh each parsed row.
-	maxima := make(map[string]int64)
+	// Pass 1 — create/refresh each parsed row. The per-row upsertImportedCounter
+	// (in registerImportedTicket, on every created row) raises the per-prefix HWM
+	// as each row is created, so no batch-level maxima pass is needed here.
 	for _, row := range rows {
 		outcome, err := s.importTicketRow(ctx, row)
 		if err != nil {
@@ -212,16 +214,10 @@ func (s *Store) ImportTicketsBytes(ctx context.Context, data []byte, strict bool
 		default:
 			return ImportTicketsSummary{}, fmt.Errorf("E_INTERNAL: unknown ticket import outcome %q", outcome)
 		}
-		if row.Number > maxima[row.Prefix] {
-			maxima[row.Prefix] = row.Number
-		}
 	}
-	if err := s.advanceImportedTicketCounters(ctx, maxima); err != nil {
-		return ImportTicketsSummary{}, err
-	}
-	// Apply the --allocated-max cutover seeds AFTER the row loop, on the SAME
-	// MAX(current, N+1) HWM upsert, so a seed can only raise the counter and the
-	// forward allocator mints exactly N+1 next.
+	// Apply the --allocated-max cutover seeds on the SAME MAX(current, N+1) HWM
+	// upsert the per-row upsertImportedCounter uses, so a seed can only raise the
+	// counter and the forward allocator mints exactly N+1 next.
 	if err := s.advanceImportedTicketCounters(ctx, composedMax); err != nil {
 		return ImportTicketsSummary{}, err
 	}
@@ -412,16 +408,15 @@ func (s *Store) importTicketRow(ctx context.Context, row importedTicket) (string
 		return "", err
 	}
 
-	// Refuse a genuine collision: a materialised/recovered allocation whose path
-	// is a DIFFERENT existing file (do NOT copy import_requirements.go's blanket
-	// path-equality refusal — a state='allocated' row from any worktree is a
-	// pre-allocated mint to materialise here).
-	if allocExists && alloc.State != "allocated" && alloc.Path != path {
-		if _, statErr := os.Lstat(alloc.Path); statErr == nil {
-			return "", fmt.Errorf("E_IMPORT_INVALID: ticket %s already materialised at a different path %q", s.displayID(row.ID), alloc.Path)
-		}
-	}
-
+	// A materialised/recovered allocation in ANOTHER worktree is the SAME ticket,
+	// never a genuine number collision: findTicketAllocation keys on the exact
+	// (project,prefix,number,suffix), so alloc.Path != path can only mean a
+	// different worktree of this one id. It is therefore adopted here — file
+	// present → refresh path; file absent → materialise via registerImportedTicket
+	// — and markTicketMaterialised's CASE keeps the allocation path/worktree at the
+	// worktree that first materialised it. (No import_requirements.go-style
+	// path-equality refusal: that wrongly aborts legitimate cross-worktree
+	// re-import, and in strict mode the whole batch.)
 	if localDigest != "" {
 		return s.refreshImportedTicket(ctx, row, path, localDigest, alloc, allocExists)
 	}
@@ -656,6 +651,12 @@ func relationExists(existing []domain.Relation, want domain.Relation) bool {
 // absentImportedTickets lists previously-imported ids (bearing a journaled
 // ticket.import event) that are missing from the current batch. It is a REPORT
 // only — the importer never retires them.
+//
+// The scan is PROJECT-WIDE: it spans every prefix ever imported into this
+// project, not just the prefixes present in this batch. A caller must therefore
+// pass ONE combined batch of the WHOLE ticket namespace per invocation — a
+// partial batch (a subset of prefixes/ids) reports the rest of the namespace as
+// absent, which is correct but rarely what a piecemeal caller intends.
 func (s *Store) absentImportedTickets(batch map[string]bool) ([]string, error) {
 	rows, err := s.db.Query(`SELECT DISTINCT target FROM events WHERE project_id=? AND verb='ticket.import' ORDER BY target`, s.projectID)
 	if err != nil {
