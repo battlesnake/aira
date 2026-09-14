@@ -14,7 +14,7 @@ import (
 func (s *Store) SetTicket(ctx context.Context, id, field, value string) (EventKey, error) {
 	field = strings.ToLower(strings.TrimSpace(field))
 	value = strings.TrimSpace(value)
-	if value == "" && field != "body" && field != "title" {
+	if value == "" && field != "body" && field != "title" && field != "milestone" {
 		return EventKey{}, errors.New("E_CONFIG_INVALID: empty set value")
 	}
 	return s.UpdateTicketContent(ctx, id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
@@ -27,6 +27,15 @@ func (s *Store) SetTicket(ctx context.Context, id, field, value string) (EventKe
 			ticket.Severity = domain.Severity(value)
 		case "status":
 			ticket.Status = domain.Status(value)
+		case "milestone":
+			// A release/sprint label. Empty clears it (the guard above lets
+			// milestone through with an empty value for exactly this).
+			if value == "" {
+				ticket.Milestone = nil
+			} else {
+				milestone := value
+				ticket.Milestone = &milestone
+			}
 		case "hold":
 			hold, err := strconv.ParseBool(strings.ToLower(value))
 			if err != nil {

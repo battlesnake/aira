@@ -184,7 +184,7 @@ func queryValue(raw string, pos int) (string, int, error) {
 
 func validQueryField(field string) bool {
 	switch field {
-	case "id", "status", "kind", "severity", "assignee", "milestone", "label", "project":
+	case "id", "status", "kind", "severity", "assignee", "milestone", "label", "project", "hold":
 		return true
 	default:
 		return false
@@ -428,6 +428,13 @@ func matchesTerms(record TicketRecord, terms []queryTerm) bool {
 			matched = record.Ticket.Assignee != nil && *record.Ticket.Assignee == term.Value
 		case "milestone":
 			matched = record.Ticket.Milestone != nil && *record.Ticket.Milestone == term.Value
+		case "hold":
+			// Accept the same boolean forms SetTicket does (true/false/1/0/t/f),
+			// so `list hold:1` is not a silently-empty result while `set hold=1`
+			// works. An unparseable value simply matches nothing.
+			if want, err := strconv.ParseBool(term.Value); err == nil {
+				matched = record.Ticket.Hold == want
+			}
 		case "label":
 			for _, label := range record.Ticket.Labels {
 				if label == term.Value {

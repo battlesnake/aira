@@ -245,6 +245,35 @@ func TestMCPLifecycleAndProtocolErrors(t *testing.T) {
 	}
 }
 
+// AIRA-249. The MCP initialize result must carry the build-discipline
+// instructions, so an agent connecting over MCP learns the two rules (confine
+// heavy commands; build only what ready lists) without reading the skill.
+func TestMCPInitializeCarriesBuildDisciplineInstructions(t *testing.T) {
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
+		return core.New(nil), func() {}, nil
+	})
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(`{"jsonrpc":"2.0","id":"i","method":"initialize","params":{}}
+`), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	line := out.String()
+	for _, want := range []string{
+		"Confine heavy commands",
+		"ready:true",
+		"aira ready",
+		"--hold",
+		"backlog this",
+		"Never clear a hold on your own initiative",
+		"it never gates building",
+		"milestone",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("initialize instructions missing %q: %s", want, line)
+		}
+	}
+}
+
 func TestMCPPingReturnsEmptyResult(t *testing.T) {
 	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
 		return core.New(nil), func() {}, nil

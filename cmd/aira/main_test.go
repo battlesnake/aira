@@ -40,6 +40,40 @@ func TestImportAllocatedMaxCLIParsing(t *testing.T) {
 	}
 }
 
+// AIRA-249. The CLI face has hand-maintained arg tables (bare-boolean clause +
+// per-verb allow-map + the create arm) separate from the dispatch ArgSpecs, so
+// create --hold/--milestone must be wired in all three or the headline command
+// the skill teaches errors on the CLI. Store tests bypass this parse entirely.
+func TestCreateHoldAndMilestoneCLIParsing(t *testing.T) {
+	build := func(argv []string) core.Request {
+		t.Helper()
+		positional, options, err := parseArgs("create", argv)
+		if err != nil {
+			t.Fatalf("parseArgs(%v): %v", argv, err)
+		}
+		request, err := buildRequest("create", positional, options)
+		if err != nil {
+			t.Fatalf("buildRequest(%v): %v", argv, err)
+		}
+		return request
+	}
+
+	// --hold is a bare boolean, so it does not swallow the title regardless of order.
+	trailing := build([]string{"My title", "--hold", "--milestone", "v0.9"})
+	if trailing.Args["title"] != "My title" || trailing.Args["hold"] != true || trailing.Args["milestone"] != "v0.9" {
+		t.Fatalf("trailing flags: title=%v hold=%v milestone=%v", trailing.Args["title"], trailing.Args["hold"], trailing.Args["milestone"])
+	}
+	leading := build([]string{"--hold", "My title"})
+	if leading.Args["title"] != "My title" || leading.Args["hold"] != true {
+		t.Fatalf("leading --hold: title=%v hold=%v", leading.Args["title"], leading.Args["hold"])
+	}
+	// Default create is unheld with no milestone.
+	plain := build([]string{"Plain title"})
+	if plain.Args["hold"] != false || plain.Args["milestone"] != "" {
+		t.Fatalf("plain create: hold=%v milestone=%v", plain.Args["hold"], plain.Args["milestone"])
+	}
+}
+
 func TestRantCLIRepeatedTagsRefsAndReviewFaces(t *testing.T) {
 	positional, options, err := parseArgs("rant", []string{"raw friction", "--tag", "Slow_Tests", "--tag", "infra", "--severity", "annoyance", "--ref", "ticket:AIRA-1", "--ref", "gate:unit", "--idem", "retry-1"})
 	if err != nil {

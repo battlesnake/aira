@@ -56,6 +56,19 @@ correctness-critical work. Purely trivial documentation or mechanical changes
 may use the lighter path described in
 [`docs/dev/agentic-development-loop.md`](docs/dev/agentic-development-loop.md).
 
+## Backlog and release buckets (this repo)
+
+The machine-wide agent skill teaches the general discipline (build only what
+`aira ready` reports `ready:true`; `hold` a ticket to capture it without
+building; `milestone` is a release label that does not itself gate a build).
+This repo adds one project-specific rule, kept here rather than in the skill so
+it does not ship to every project that runs `aira install`: **work that
+unblocks another project belongs in the immediate next release** — tag it with
+that release's milestone and, once that release is the one being built, leave it
+unheld so it reaches `aira ready`. **Everything else is a later release** — tag
+it with a later milestone and `hold` it until that release opens. So at any
+time, aira's own `aira ready` shows only the current release's committed work.
+
 ## Hard engineering rules
 
 - Phase 1 is coordination MVP: git-file content, rebuildable index,
