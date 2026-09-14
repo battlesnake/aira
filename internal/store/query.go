@@ -193,11 +193,34 @@ func validQueryField(field string) bool {
 
 // Get resolves only an exact ID or exact file anchor. Plural query grammar is
 // deliberately not accepted by singular commands.
+// canonicalSelector parses a selector and rewrites an exact-ID and any id: term
+// through canonicalID, so a human-typed bare id (BL-123) resolves the stored
+// compound (FEE-BL-123) under a namespaced project (AIRA-237 Task 1). A path
+// anchor (ExactPath set) is left alone: its id is derived from the
+// already-compound filename and is never namespaced. parseSelector is a
+// receiver-less package function with no access to id_prefix, so the prepend
+// lives here on the Store, covering the silent id: term matcher too.
+func (s *Store) canonicalSelector(raw string) (selector, error) {
+	sel, err := parseSelector(raw)
+	if err != nil {
+		return selector{}, err
+	}
+	if sel.ExactID != "" && sel.ExactPath == "" {
+		sel.ExactID = s.canonicalID(sel.ExactID)
+	}
+	for i := range sel.Terms {
+		if sel.Terms[i].Field == "id" && !sel.Terms[i].Text {
+			sel.Terms[i].Value = s.canonicalID(sel.Terms[i].Value)
+		}
+	}
+	return sel, nil
+}
+
 func (s *Store) Get(selector string) (TicketRecord, error) {
 	if strings.TrimSpace(selector) == "" {
 		return TicketRecord{}, errors.New("E_SELECTOR_INVALID: singular selector is empty")
 	}
-	sel, err := parseSelector(selector)
+	sel, err := s.canonicalSelector(selector)
 	if err != nil {
 		return TicketRecord{}, err
 	}
@@ -210,7 +233,7 @@ func (s *Store) Get(selector string) (TicketRecord, error) {
 // List returns all current-worktree matches. It does not apply the output cap;
 // the core applies that cap after it has computed the total and distribution.
 func (s *Store) List(selector string) ([]TicketRecord, error) {
-	sel, err := parseSelector(selector)
+	sel, err := s.canonicalSelector(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -527,11 +550,14 @@ func distributionValues(row TicketRecord, by string) []string {
 
 func sortRecords(records []TicketRecord) {
 	sort.SliceStable(records, func(i, j int) bool {
-		leftPrefix, leftNumber := splitTicketID(records[i].Ticket.ID)
-		rightPrefix, rightNumber := splitTicketID(records[j].Ticket.ID)
+		leftPrefix, leftNumber, leftSuffix := splitTicketID(records[i].Ticket.ID)
+		rightPrefix, rightNumber, rightSuffix := splitTicketID(records[j].Ticket.ID)
 		if leftPrefix != rightPrefix {
 			return leftPrefix < rightPrefix
 		}
-		return leftNumber < rightNumber
+		if leftNumber != rightNumber {
+			return leftNumber < rightNumber
+		}
+		return leftSuffix < rightSuffix // deterministic tiebreak for split-suffix siblings (AIRA-237 Task 3)
 	})
 }

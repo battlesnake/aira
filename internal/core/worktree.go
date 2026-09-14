@@ -48,6 +48,39 @@ func (c *Core) worktreeCapableStore() (worktreeStore, error) {
 	return ws, nil
 }
 
+// idNamespacer is the optional per-project namespacing capability (AIRA-237
+// Task 1). The real store implements it; a store that does not is treated as
+// non-namespaced (identity), so no test double is forced to change.
+type idNamespacer interface {
+	IDPrefix() string
+	CanonicalID(string) string
+	DisplayID(string) string
+}
+
+// namespacing returns the store's id_prefix and namespacer, or ("", nil) when
+// the store is not namespaced.
+func (c *Core) namespacing() (string, idNamespacer) {
+	if ns, ok := c.store.(idNamespacer); ok {
+		return ns.IDPrefix(), ns
+	}
+	return "", nil
+}
+
+// bareTicketPrefixes strips the id_prefix from the store's composed ticket
+// prefixes so the audit matches branch names/subjects as the external repo
+// authors them (bare), then re-composes the candidate id (AIRA-237 Task 1).
+func bareTicketPrefixes(prefixes []string, idPrefix string) []string {
+	if idPrefix == "" {
+		return prefixes
+	}
+	head := idPrefix + "-"
+	out := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		out = append(out, strings.TrimPrefix(p, head))
+	}
+	return out
+}
+
 func (c *Core) worktreeRegister(ctx context.Context, selector, base, owner string, ownerAttested bool) (any, error) {
 	ws, err := c.worktreeCapableStore()
 	if err != nil {
@@ -100,12 +133,18 @@ func (c *Core) worktreeAudit(ctx context.Context, selector, base string) (any, e
 	if err != nil {
 		return nil, err
 	}
+	idPrefix, ns := c.namespacing()
 	scoped, err := resolveAuditSelector(selector, func(id string) bool {
 		_, getErr := c.store.Get(id)
 		return getErr == nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	// A human-typed audit selector (BL-449) must match the stored compound
+	// binding/ticket (FEE-BL-449) under namespacing (AIRA-237 Task 1).
+	if ns != nil && scoped.TicketID != "" {
+		scoped.TicketID = ns.CanonicalID(scoped.TicketID)
 	}
 	bindings, err := ws.WorktreeBindings()
 	if err != nil {
@@ -133,7 +172,8 @@ func (c *Core) worktreeAudit(ctx context.Context, selector, base string) (any, e
 		Bindings:          bindings,
 		Leases:            leases,
 		KnownRoots:        roots,
-		Prefixes:          ws.TicketPrefixes(),
+		Prefixes:          bareTicketPrefixes(ws.TicketPrefixes(), idPrefix),
+		IDPrefix:          idPrefix,
 		ConfigRef:         c.integrationRef,
 		BaseOverride:      base,
 		Selector:          scoped,

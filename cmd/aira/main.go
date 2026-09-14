@@ -386,6 +386,9 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		if value := options["prefixes"]; value != "" {
 			requestArgs["prefixes"] = splitComma(value)
 		}
+		if value := options["id-prefix"]; value != "" {
+			requestArgs["id_prefix"] = value
+		}
 		paths, pathErr := daemon.PathsFromEnv()
 		if pathErr != nil {
 			return render(transportErrorResponse(pathErr), renderJSON, stdout, stderr)
@@ -753,7 +756,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
 			options[name] = "true"
 			continue
 		}
@@ -783,14 +786,14 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 				options["fields"] += ","
 			}
 			options["fields"] += argv[i]
-		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") || (name == "bucket" && verb == "spend") || (verb == "rant" && (name == "tag" || name == "ref")) {
+		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") || (name == "bucket" && verb == "spend") || (verb == "rant" && (name == "tag" || name == "ref")) || (verb == "import" && name == "allocated-max") {
 			options[name] = appendDelimited(options[name], argv[i])
 		} else {
 			options[name] = argv[i]
 		}
 	}
 	allowed := map[string]map[string]bool{
-		"init":   {"project": true, "prefixes": true},
+		"init":   {"project": true, "prefixes": true, "id-prefix": true},
 		"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
 		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
@@ -798,7 +801,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
 		"grep":   {"kind": true, "by": true, "fields": true},
-		"import": {"strict": true},
+		"import": {"strict": true, "tickets": true, "allocated-max": true},
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
@@ -2841,7 +2844,14 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("import requires <file>")
 		}
-		args["file"], args["strict"] = positional[0], options["strict"] == "true"
+		args["file"], args["strict"], args["tickets"] = positional[0], options["strict"] == "true", options["tickets"] == "true"
+		// AIRA-237 Task 4 — --allocated-max is repeatable (NUL-accumulated in
+		// parseArgs); the core handler parses each PREFIX=N entry and the store
+		// composes/validates the prefix. Set the key ONLY when the flag is present
+		// (an absent flag must not inject a null-valued arg — the faces reject it).
+		if options["allocated-max"] != "" {
+			args["allocated_max"] = splitOptionList(options["allocated-max"])
+		}
 	case "count":
 		if options["by"] == "" {
 			return core.Request{}, fmt.Errorf("count requires --by <field>")

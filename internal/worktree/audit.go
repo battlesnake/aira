@@ -50,8 +50,14 @@ type Inputs struct {
 	// KnownRoots maps worktree identity to the last path AIRA saw it at, for
 	// naming orphaned bindings.
 	KnownRoots map[string]string
-	// Prefixes are the project's ticket ID prefixes, e.g. ["AIRA"].
+	// Prefixes are the project's BARE ticket ID prefixes, e.g. ["BL"], matched
+	// against branch names and commit subjects as authored by the external repo.
 	Prefixes []string
+	// IDPrefix is the per-project namespacing prefix (AIRA-237 Task 1). When set
+	// (e.g. "FEE"), an inferred candidate is composed <IDPrefix>-<PREFIX>-<n>
+	// (FEE-BL-449) so it matches the stored compound binding/ticket, while the
+	// branch/subject match still keys off the BARE prefix the repo authors.
+	IDPrefix string
 	// ConfigRef is `.aira/config` -> git.integration_ref, empty when unset.
 	ConfigRef string
 	// BaseOverride is an explicit --base on this invocation.
@@ -254,7 +260,7 @@ func (a *Auditor) selects(entry Entry, explicit []domain.WorktreeBinding, in Inp
 				return true
 			}
 		}
-		for _, candidate := range branchNameCandidates(entry.Branch.Value, in.Prefixes) {
+		for _, candidate := range branchNameCandidates(entry.Branch.Value, in.Prefixes, in.IDPrefix) {
 			if strings.EqualFold(candidate, in.Selector.TicketID) {
 				return true
 			}

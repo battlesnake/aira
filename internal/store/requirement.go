@@ -90,12 +90,15 @@ func scanRequirements(root, worktree string) (requirementScanResult, bool, error
 		return requirementScanResult{}, true, nil
 	}
 	sort.Slice(result.valid, func(i, j int) bool {
-		pi, ni := splitTicketID(result.valid[i].Requirement.ID)
-		pj, nj := splitTicketID(result.valid[j].Requirement.ID)
+		pi, ni, si := splitTicketID(result.valid[i].Requirement.ID)
+		pj, nj, sj := splitTicketID(result.valid[j].Requirement.ID)
 		if pi != pj {
 			return pi < pj
 		}
-		return ni < nj
+		if ni != nj {
+			return ni < nj
+		}
+		return si < sj // deterministic tiebreak for split-suffix siblings (AIRA-237 Task 3)
 	})
 	sort.Slice(result.invalid, func(i, j int) bool { return result.invalid[i].Subject < result.invalid[j].Subject })
 	return result, false, nil
@@ -165,6 +168,8 @@ func (s *Store) AddRequirement(ctx context.Context, input domain.RequirementInpu
 // generalized write protocol, not an allocation. Requirements have no
 // transition graph, so any valid target status is accepted.
 func (s *Store) SetRequirement(ctx context.Context, id string, status domain.RequirementStatus) (EventKey, error) {
+	// Namespace a bare requirement id before it keys the file/index (AIRA-237 Task 2).
+	id = s.canonicalID(id)
 	reqLock, err := s.acquireRequirementMutationLock()
 	if err != nil {
 		return EventKey{}, err
@@ -244,8 +249,9 @@ func (s *Store) prepareCreateRequirement(ctx context.Context, input domain.Requi
 		}
 		path := s.requirementPath(id)
 		digest := digestBytes(data)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
-            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?)`, s.projectID, prefix, number, s.worktreeID, path, seq, kindRequirement); err != nil {
+		// Fresh requirement create: number minted, suffix='' (AIRA-237 Task 3).
+		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?, '')`, s.projectID, prefix, number, s.worktreeID, path, seq, kindRequirement); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
@@ -274,7 +280,7 @@ func (s *Store) markRequirementMaterialised(ctx context.Context, intent Intent) 
 	if kindForPath(intent.Path) != kindRequirement {
 		return fmt.Errorf("E_JOURNAL_CORRUPT: requirement %s materialised outside .aira/requirements/: %s", requirement.ID, intent.Path)
 	}
-	prefix, number := splitTicketID(requirement.ID)
+	prefix, number, suffix := splitTicketID(requirement.ID)
 	if _, err := s.reconcileAllocationKind(prefix, kindRequirement, intent.Path); err != nil {
 		return err
 	}
@@ -282,7 +288,7 @@ func (s *Store) markRequirementMaterialised(ctx context.Context, intent Intent) 
 		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0`, intent.ProjectID, intent.Seq); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=?`, intent.ProjectID, prefix, number); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, intent.ProjectID, prefix, number, suffix); err != nil {
 			return err
 		}
 		_, err := conn.ExecContext(ctx, `INSERT INTO requirements(project_id, worktree_id, id, path, digest, status, text)
@@ -296,6 +302,10 @@ func (s *Store) markRequirementMaterialised(ctx context.Context, intent Intent) 
 }
 
 func (s *Store) GetRequirement(id string) (RequirementRecord, error) {
+	// A bare requirement id (VR-90) typed under id_prefix=FEE resolves the stored
+	// compound FEE-VR-90 (AIRA-237 Task 2 — requirement prefixes are composed too;
+	// display-side strip is the shared core projection). Idempotent on a compound id.
+	id = s.canonicalID(id)
 	var rec RequirementRecord
 	var status, text string
 	err := s.db.QueryRow(`SELECT id, path, digest, status, text FROM requirements WHERE project_id=? AND worktree_id=? AND id=?`,

@@ -283,6 +283,42 @@ func TestValidateConfigRejectsInvalidLeaseTiming(t *testing.T) {
 	}
 }
 
+// AIRA-237 Task 1: id_prefix round-trips through readConfig (DisallowUnknownFields
+// requires the field to exist) and is validated as plain [A-Z]{2,} that is NOT
+// itself a project prefix.
+func TestIDPrefixConfigRoundTripAndValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	good := `{"schema":1,"project":{"slug":"fee","id_prefix":"FEE","prefixes":["BL","NF"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := readConfig(path)
+	if err != nil {
+		t.Fatalf("readConfig with id_prefix: %v", err)
+	}
+	if config.Project.IDPrefix != "FEE" {
+		t.Fatalf("id_prefix did not round-trip: %q", config.Project.IDPrefix)
+	}
+
+	for name, cfg := range map[string]string{
+		"id_prefix is a project prefix":              `{"schema":1,"project":{"slug":"fee","id_prefix":"BL","prefixes":["BL"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`,
+		"id_prefix is a requirement prefix":          `{"schema":1,"project":{"slug":"fee","id_prefix":"AR","prefixes":["BL"],"requirement_prefixes":["AR"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`,
+		"id_prefix lowercase":                        `{"schema":1,"project":{"slug":"fee","id_prefix":"fee","prefixes":["BL"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`,
+		"id_prefix too short":                        `{"schema":1,"project":{"slug":"fee","id_prefix":"F","prefixes":["BL"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`,
+		"id_prefix has a hyphen (compound authored)": `{"schema":1,"project":{"slug":"fee","id_prefix":"FEE-BL","prefixes":["BL"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config")
+			if err := os.WriteFile(p, []byte(cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readConfig(p); err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+				t.Fatalf("readConfig(%s) = %v; want E_CONFIG_INVALID", name, err)
+			}
+		})
+	}
+}
+
 func TestGitConfigPresenceDefaultsAndExplicitFalse(t *testing.T) {
 	base := `{"schema":1,"project":{"slug":"demo","prefixes":["DEMO"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}`
 	for _, tc := range []struct {

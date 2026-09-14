@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"aira/internal/domain"
@@ -32,6 +31,7 @@ type importedRequirement struct {
 	Digest string
 	Prefix string
 	Number int64
+	Suffix string
 }
 
 type requirementAllocation struct {
@@ -169,21 +169,19 @@ func parseRequirementTable(data []byte) ([]importedRequirement, error) {
 		if err != nil {
 			return nil, fmt.Errorf("E_IMPORT_INVALID: line %d: %w", lineNumber+1, err)
 		}
-		prefix, numberText, ok := splitImportedRequirementID(id)
-		if !ok {
-			return nil, fmt.Errorf("E_IMPORT_INVALID: line %d: requirement ID %q has an invalid number", lineNumber+1, id)
-		}
 		data, err := domain.RenderRequirement(requirement)
 		if err != nil {
 			return nil, fmt.Errorf("E_IMPORT_INVALID: line %d: render %s: %w", lineNumber+1, id, err)
 		}
-		number, err := strconv.ParseInt(numberText, 10, 64)
-		if err != nil || number < 1 {
+		// The id is already ValidateID-checked above, so the one parser is safe;
+		// a suffixed requirement (IN-4b, AIRA-237 Task 3) round-trips its suffix.
+		prefix, number, suffix := splitTicketID(id)
+		if number < 1 {
 			return nil, fmt.Errorf("E_IMPORT_INVALID: line %d: requirement ID %q has an invalid number", lineNumber+1, id)
 		}
 		seen[id] = struct{}{}
 		rows = append(rows, importedRequirement{ID: id, Text: requirement.Text, Status: requirement.Status,
-			Data: data, Digest: digestBytes(data), Prefix: prefix, Number: number})
+			Data: data, Digest: digestBytes(data), Prefix: prefix, Number: int64(number), Suffix: suffix})
 	}
 	return rows, nil
 }
@@ -207,17 +205,9 @@ func allRequirementTableDashes(cells []string) bool {
 	return true
 }
 
-func splitImportedRequirementID(id string) (string, string, bool) {
-	idx := strings.LastIndexByte(id, '-')
-	if idx <= 0 || idx == len(id)-1 {
-		return "", "", false
-	}
-	return id[:idx], id[idx+1:], true
-}
-
 func (s *Store) importRequirementRow(ctx context.Context, row importedRequirement) (string, error) {
 	path := s.requirementPath(row.ID)
-	allocation, exists, err := s.findRequirementAllocation(ctx, row.Prefix, row.Number)
+	allocation, exists, err := s.findRequirementAllocation(ctx, row.Prefix, row.Number, row.Suffix)
 	if err != nil {
 		return "", err
 	}
@@ -312,10 +302,10 @@ func (s *Store) importRequirementRow(ctx context.Context, row importedRequiremen
 	return "updated", nil
 }
 
-func (s *Store) findRequirementAllocation(ctx context.Context, prefix string, number int64) (requirementAllocation, bool, error) {
+func (s *Store) findRequirementAllocation(ctx context.Context, prefix string, number int64, suffix string) (requirementAllocation, bool, error) {
 	var allocation requirementAllocation
 	err := s.db.QueryRowContext(ctx, `SELECT worktree_id, state, path, seq, kind
-        FROM allocations WHERE project_id=? AND prefix=? AND number=?`, s.projectID, prefix, number).Scan(
+        FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, s.projectID, prefix, number, suffix).Scan(
 		&allocation.WorktreeID, &allocation.State, &allocation.Path, &allocation.Seq, &allocation.Kind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return requirementAllocation{}, false, nil
@@ -404,8 +394,8 @@ func (s *Store) registerImportedRequirement(ctx context.Context, row importedReq
 		if err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
-            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?)`, s.projectID, row.Prefix, row.Number, s.worktreeID, path, seq, kindRequirement); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?, ?)`, s.projectID, row.Prefix, row.Number, s.worktreeID, path, seq, kindRequirement, row.Suffix); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,

@@ -154,8 +154,8 @@ func (s *Store) RetireIntent(ctx context.Context, selector string) (RetireResult
 			row.Seq, row.WorktreeID, s.worktreeID)
 	}
 	if row.AllocationID != "" {
-		// prefixOf/numberOf slice on the last '-' and panic without one, and a
-		// malformed id must never reach them.
+		// splitTicketID slices on the last '-' and panics without one, and a
+		// malformed id must never reach it.
 		if err := domain.ValidateID(row.AllocationID); err != nil {
 			return RetireResult{}, fmt.Errorf("E_JOURNAL_CORRUPT: intent %d carries malformed allocation id %q: %w",
 				row.Seq, row.AllocationID, err)
@@ -292,16 +292,17 @@ func (s *Store) RetireIntent(ctx context.Context, selector string) (RetireResult
 		}
 
 		if current.AllocationID != "" {
-			prefix, number := splitTicketID(current.AllocationID)
+			prefix, number, suffix := splitTicketID(current.AllocationID)
 			// A retirement may only ever move allocated -> retired. The
 			// narrowing means a retire can never silence a materialised
 			// allocation, and it cannot false-fire: 'materialised' is only ever
 			// written in the same transaction that sets outbox.materialised=1,
 			// 'recovered' is only minted for a scanned file that has no
 			// allocation row at all, and prepareCreate writes the allocation and
-			// the outbox row together.
+			// the outbox row together. The suffix keeps the retire keyed to the
+			// child's OWN row (AIRA-237 Task 3), never the plain twin's.
 			updated, err := conn.ExecContext(ctx, `UPDATE allocations SET state='retired'
-				WHERE project_id=? AND prefix=? AND number=? AND state='allocated'`, s.projectID, prefix, number)
+				WHERE project_id=? AND prefix=? AND number=? AND suffix=? AND state='allocated'`, s.projectID, prefix, number, suffix)
 			if err != nil {
 				return err
 			}

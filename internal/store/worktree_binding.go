@@ -43,7 +43,7 @@ func (s *Store) RegisterWorktreeBinding(ctx context.Context, input domain.Worktr
 	}
 	binding := domain.WorktreeBinding{
 		WorktreeID:    s.worktreeID,
-		TicketID:      strings.TrimSpace(input.TicketID),
+		TicketID:      s.canonicalID(strings.TrimSpace(input.TicketID)),
 		Branch:        strings.TrimSpace(input.Branch),
 		BaseRef:       strings.TrimSpace(input.BaseRef),
 		BaseCommit:    strings.TrimSpace(input.BaseCommit),

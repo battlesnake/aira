@@ -204,6 +204,7 @@ func readLeaseRow(ctx context.Context, conn interface {
 }
 
 func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor string) (LeaseClaim, error) {
+	ticketID = s.canonicalID(ticketID)
 	if err := domain.ValidateID(ticketID); err != nil {
 		return LeaseClaim{}, err
 	}
@@ -403,6 +404,7 @@ func (s *Store) commitLeaseToken(ctx context.Context, ticketID, tempPath string,
 }
 
 func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, error) {
+	ticketID = s.canonicalID(ticketID)
 	if err := domain.ValidateID(ticketID); err != nil {
 		return EventKey{}, err
 	}
@@ -498,6 +500,7 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 }
 
 func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.Lease, error) {
+	ticketID = s.canonicalID(ticketID)
 	if err := domain.ValidateID(ticketID); err != nil {
 		return domain.Lease{}, err
 	}

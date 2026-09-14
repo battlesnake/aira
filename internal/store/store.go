@@ -66,6 +66,11 @@ type Options struct {
 	// They must be disjoint from Prefixes (ticket-kind); a prefix belongs to
 	// exactly one kind.
 	RequirementPrefixes []string
+	// IDPrefix is the per-project namespacing prefix (AIRA-237 Task 1). When
+	// set (e.g. "FEE"), every bare prefix P is registered/keyed/filenamed as the
+	// composed <IDPrefix>-P (e.g. FEE-BL), and ids are stored compound
+	// (FEE-BL-123). Empty = today's behaviour (prefixes used verbatim).
+	IDPrefix string
 	// ReviewPolicy is validated eagerly by Open. A zero policy means the
 	// project has no review block and therefore defaults to tier 3.
 	ReviewPolicy      ReviewPolicy
@@ -93,19 +98,21 @@ type ScopeOptions struct {
 	ProjectSlug         string
 	Prefixes            []string
 	RequirementPrefixes []string
-	ReviewPolicy        ReviewPolicy
-	LeaseStateDir       string
-	LeaseTTLNS          uint64
-	MaxReports          int
-	MaxAgeDays          int
-	MaxComputeEvents    int
-	MaxComputeAgeDays   int
-	MaxCommandEvents    int
-	MaxCommandAgeDays   int
-	MaxQuotaSnapshots   int
-	ConfigDigest        string
-	Bootstrap           bool
-	Clock               Clock
+	// IDPrefix mirrors Options.IDPrefix for the daemon/relay scope path.
+	IDPrefix          string
+	ReviewPolicy      ReviewPolicy
+	LeaseStateDir     string
+	LeaseTTLNS        uint64
+	MaxReports        int
+	MaxAgeDays        int
+	MaxComputeEvents  int
+	MaxComputeAgeDays int
+	MaxCommandEvents  int
+	MaxCommandAgeDays int
+	MaxQuotaSnapshots int
+	ConfigDigest      string
+	Bootstrap         bool
+	Clock             Clock
 }
 
 // DB is the owner of one machine-wide SQLite connection and its pinned path
@@ -147,6 +154,7 @@ type Store struct {
 	configDigest      string
 	reviewPolicy      ReviewPolicy
 	prefixes          map[string]string // prefix -> entity kind (ticket|requirement)
+	idPrefix          string            // per-project namespacing prefix (AIRA-237 Task 1); "" = none
 	leaseStateDir     string
 	leaseTTLNS        uint64
 	maxReports        int
@@ -330,7 +338,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		Root: opts.Root, CommonDir: opts.CommonDir, GitDir: opts.GitDir,
 		ProjectID: opts.ProjectID, WorktreeID: opts.WorktreeID,
 		ProjectSlug: opts.ProjectSlug, Prefixes: opts.Prefixes,
-		RequirementPrefixes: opts.RequirementPrefixes, ReviewPolicy: opts.ReviewPolicy,
+		RequirementPrefixes: opts.RequirementPrefixes, IDPrefix: opts.IDPrefix, ReviewPolicy: opts.ReviewPolicy,
 		LeaseStateDir: opts.LeaseStateDir, LeaseTTLNS: opts.LeaseTTLNS,
 		MaxReports: opts.MaxReports, MaxAgeDays: opts.MaxAgeDays,
 		MaxComputeEvents: opts.MaxComputeEvents, MaxComputeAgeDays: opts.MaxComputeAgeDays,
@@ -439,24 +447,9 @@ func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
 	if s.clock == nil {
 		s.clock = systemClock{}
 	}
-	for _, prefix := range opts.Prefixes {
-		if !validPrefix(prefix) {
-			_ = conn.Close()
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		s.prefixes[strings.ToUpper(prefix)] = kindTicket
-	}
-	for _, prefix := range opts.RequirementPrefixes {
-		if !validPrefix(prefix) {
-			_ = conn.Close()
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		up := strings.ToUpper(prefix)
-		if existing, duplicate := s.prefixes[up]; duplicate && existing != kindRequirement {
-			_ = conn.Close()
-			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
-		}
-		s.prefixes[up] = kindRequirement
+	if err := s.registerPrefixes(opts.IDPrefix, opts.Prefixes, opts.RequirementPrefixes); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -658,23 +651,8 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	if s.clock == nil {
 		s.clock = systemClock{}
 	}
-	for _, prefix := range opts.Prefixes {
-		if !validPrefix(prefix) {
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		s.prefixes[strings.ToUpper(prefix)] = kindTicket
-	}
-	for _, prefix := range opts.RequirementPrefixes {
-		if !validPrefix(prefix) {
-			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
-		}
-		up := strings.ToUpper(prefix)
-		if existing, dup := s.prefixes[up]; dup && existing != kindRequirement {
-			// Prefixes are disjoint by kind: a prefix may not be both a ticket
-			// and a requirement prefix.
-			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
-		}
-		s.prefixes[up] = kindRequirement
+	if err := s.registerPrefixes(opts.IDPrefix, opts.Prefixes, opts.RequirementPrefixes); err != nil {
+		return nil, err
 	}
 	if !register {
 		return s, nil
@@ -801,13 +779,7 @@ func (s *Store) initDB(ctx context.Context) error {
             PRIMARY KEY(project_id, prefix),
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
-		`CREATE TABLE IF NOT EXISTS allocations (
-            project_id TEXT NOT NULL, prefix TEXT NOT NULL, number INTEGER NOT NULL,
-            worktree_id TEXT NOT NULL, state TEXT NOT NULL, path TEXT NOT NULL,
-            seq INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'ticket',
-            PRIMARY KEY(project_id, prefix, number),
-            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
-        )`,
+		allocationsDDL("allocations", true),
 		`CREATE TABLE IF NOT EXISTS outbox (
             project_id TEXT NOT NULL, seq INTEGER NOT NULL, worktree_id TEXT NOT NULL,
             path TEXT NOT NULL, verb TEXT NOT NULL, precondition_digest TEXT NOT NULL,
@@ -1170,6 +1142,13 @@ func (s *Store) initDB(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureAllocationKind(ctx); err != nil {
+		return err
+	}
+	// Runs before ensureProjectOwnershipFKs for the same reason as
+	// ensureOutboxResolutionDropped above: it recreates allocations by replaying
+	// the DDL, so widening the PK here means the FK migration (if it runs at all)
+	// carries the 4-column shape forward, not the pre-suffix one.
+	if err := s.ensureAllocationsSuffix(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureFindingsSchema(ctx); err != nil {
@@ -2084,7 +2063,10 @@ func (s *Store) RegisterWorktree(ctx context.Context, worktreeID, root string) e
 }
 
 func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
-	prefix = strings.ToUpper(prefix)
+	// A bare prefix (BL) typed under id_prefix=FEE mints against the composed
+	// FEE-BL ownership + counter (AIRA-237 Task 1); already-compound passes
+	// through. canonicalID keys off the registered prefix, not HasPrefix.
+	prefix = strings.ToUpper(s.canonicalID(prefix))
 	kind, owned := s.prefixes[prefix]
 	if !validPrefix(prefix) || !owned {
 		return "", fmt.Errorf("E_ID_INVALID: unowned prefix %q", prefix)
@@ -2102,8 +2084,10 @@ func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
 			return err
 		}
 		path := s.entityPathForKind(kind, id)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
-            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?)`, s.projectID, prefix, number, s.worktreeID, path, seq, kind); err != nil {
+		// The allocator mints a NUMBER, never a suffix, so a freshly-minted
+		// allocation carries suffix='' (AIRA-237 Task 3).
+		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?, '')`, s.projectID, prefix, number, s.worktreeID, path, seq, kind); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
@@ -2189,8 +2173,9 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 		}
 		path := s.ticketPath(id)
 		digest := digestBytes(data)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq)
-            VALUES(?, ?, ?, ?, 'allocated', ?, ?)`, s.projectID, prefix, number, s.worktreeID, path, seq); err != nil {
+		// Fresh ticket create: number minted, suffix='' (AIRA-237 Task 3).
+		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, suffix)
+            VALUES(?, ?, ?, ?, 'allocated', ?, ?, '')`, s.projectID, prefix, number, s.worktreeID, path, seq); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
@@ -2381,7 +2366,23 @@ func (s *Store) markTicketMaterialised(ctx context.Context, intent Intent) error
 		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0`, intent.ProjectID, intent.Seq); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=?`, intent.ProjectID, prefixOf(ticket.ID), numberOf(ticket.ID)); err != nil {
+		// AIRA-237 Task 2: on the allocated→materialised transition ONLY, rewrite
+		// the allocation's path/worktree to the materialising worktree, so a
+		// cross-worktree pre-allocated mint (aira id in worktree A, aira import in
+		// worktree B) resolves against B's file. The CASE guard keeps this a no-op
+		// for a normal create (already this worktree's path) and for any
+		// re-materialisation of an already-materialised row (ticket.update), so it
+		// changes nothing outside the pre-allocated-adoption path.
+		// AIRA-237 Task 3: the WHERE carries the suffix so materialising a
+		// suffixed child (FEE-BL-10a) updates ONLY its own allocation row and
+		// never over-matches the plain twin's still-allocated row (which the
+		// CASE-guarded path/worktree rewrite would otherwise silently steal).
+		mtPrefix, mtNumber, mtSuffix := splitTicketID(ticket.ID)
+		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised',
+            path=CASE WHEN state='allocated' THEN ? ELSE path END,
+            worktree_id=CASE WHEN state='allocated' THEN ? ELSE worktree_id END
+            WHERE project_id=? AND prefix=? AND number=? AND suffix=?`,
+			intent.Path, intent.WorktreeID, intent.ProjectID, mtPrefix, mtNumber, mtSuffix); err != nil {
 			return err
 		}
 		_, err := conn.ExecContext(ctx, `INSERT INTO tickets(project_id, worktree_id, id, path, digest, status, hold, title, kind, severity)
@@ -2774,7 +2775,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if domain.ValidateID(receipt.ID) != nil {
 			continue
 		}
-		prefix, number := splitTicketID(receipt.ID)
+		prefix, number, _ := splitTicketID(receipt.ID) // HWM is number-only (no minted suffix)
 		if int64(number) > maxima[prefix] {
 			maxima[prefix] = int64(number)
 		}
@@ -2820,7 +2821,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				finding CheckFinding
 			}{entry: entry, finding: finding})
 			if id, ok := ticketIDFromFilename(finding.Subject); ok {
-				prefix, number := splitTicketID(id)
+				prefix, number, _ := splitTicketID(id) // number-only
 				if int64(number) > maxima[prefix] {
 					maxima[prefix] = int64(number)
 				}
@@ -2855,7 +2856,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			// A malformed file still claims its ID: advance the high-water so the
 			// broken node's ID is never reallocated (mirrors the ticket scan).
 			if id, ok := ticketIDFromFilename(invalid.Subject); ok {
-				prefix, number := splitTicketID(id)
+				prefix, number, _ := splitTicketID(id) // number-only
 				if int64(number) > maxima[prefix] {
 					maxima[prefix] = int64(number)
 				}
@@ -2864,13 +2865,13 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		scannedRequirements = append(scannedRequirements, requirementScan.valid...)
 		scanned = append(scanned, tickets...)
 		for _, ticket := range tickets {
-			prefix, number := splitTicketID(ticket.Ticket.ID)
+			prefix, number, _ := splitTicketID(ticket.Ticket.ID) // HWM is number-only
 			if int64(number) > maxima[prefix] {
 				maxima[prefix] = int64(number)
 			}
 		}
 		for _, req := range requirementScan.valid {
-			prefix, number := splitTicketID(req.Requirement.ID)
+			prefix, number, _ := splitTicketID(req.Requirement.ID) // HWM is number-only
 			if int64(number) > maxima[prefix] {
 				maxima[prefix] = int64(number)
 			}
@@ -2990,7 +2991,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if domain.ValidateID(event.Target) != nil {
 				continue
 			}
-			prefix, number := splitTicketID(event.Target)
+			prefix, number, suffix := splitTicketID(event.Target)
 			// allocated -> retired only. A forged or corrupt frame can therefore
 			// never silence a materialised allocation's E_ID_UNRESOLVED, which
 			// an unnarrowed UPDATE would let it do.
@@ -3006,13 +3007,13 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			// The narrowing above is what keeps the blast radius to unresolved
 			// allocations only.
 			if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='retired'
-				WHERE project_id=? AND prefix=? AND number=? AND state='allocated'`,
-				s.projectID, prefix, number); err != nil {
+				WHERE project_id=? AND prefix=? AND number=? AND suffix=? AND state='allocated'`,
+				s.projectID, prefix, number, suffix); err != nil {
 				return err
 			}
 		}
 		for _, ticket := range scanned {
-			prefix, number := splitTicketID(ticket.Ticket.ID)
+			prefix, number, suffix := splitTicketID(ticket.Ticket.ID)
 			if _, err := conn.ExecContext(ctx, `INSERT INTO tickets(project_id, worktree_id, id, path, digest, status, hold, title, kind, severity)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
@@ -3026,8 +3027,8 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			}
 			var allocationSeq int64
 			var allocationWorktree, allocationPath, allocationState, allocationKind string
-			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=?`,
-				s.projectID, prefix, number).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
+			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`,
+				s.projectID, prefix, number, suffix).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
 			if errors.Is(err, sql.ErrNoRows) {
 				// A scanned file lives under .aira/tickets/, so it is ticket-kind by
 				// path. Cross-validate before manufacturing a durable recovery:
@@ -3043,8 +3044,8 @@ func (s *Store) Rebuild(ctx context.Context) error {
 					return err
 				}
 				allocationWorktree, allocationPath, allocationState = ticket.WorktreeID, ticket.Path, "recovered"
-				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind); err != nil {
+				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind, suffix); err != nil {
 					return err
 				}
 				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
@@ -3068,6 +3069,19 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
 					return err
 				}
+				// A cross-worktree-adopted ticket (aira id in A, aira import in B)
+				// replays from the mint receipt as state='allocated' at A's path,
+				// but the file is scanned here in B. Re-point the still-allocated
+				// row at the scanned file's path/worktree — the same allocated→file
+				// resolution markTicketMaterialised's CASE performs — so Check does
+				// not fabricate an E_ID_UNRESOLVED against the empty A path. Guarded
+				// to state='allocated' (never advances a materialised/retired row)
+				// and to a genuine path change (no-op otherwise).
+				if _, err := conn.ExecContext(ctx, `UPDATE allocations SET path=?, worktree_id=?
+                        WHERE project_id=? AND prefix=? AND number=? AND suffix=? AND state='allocated' AND path<>?`,
+					ticket.Path, ticket.WorktreeID, s.projectID, prefix, number, suffix, ticket.Path); err != nil {
+					return err
+				}
 				if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
 					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
 						ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)})
@@ -3078,7 +3092,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			}
 		}
 		for _, req := range scannedRequirements {
-			prefix, number := splitTicketID(req.Requirement.ID)
+			prefix, number, suffix := splitTicketID(req.Requirement.ID)
 			if _, err := conn.ExecContext(ctx, `INSERT INTO requirements(project_id, worktree_id, id, path, digest, status, text)
                     VALUES(?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
@@ -3089,8 +3103,8 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			}
 			var allocationSeq int64
 			var allocationWorktree, allocationPath, allocationState, allocationKind string
-			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=?`,
-				s.projectID, prefix, number).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
+			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`,
+				s.projectID, prefix, number, suffix).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
 			if errors.Is(err, sql.ErrNoRows) {
 				// A scanned file lives under .aira/requirements/, so it is
 				// requirement-kind by path. Cross-validate before manufacturing a
@@ -3105,8 +3119,8 @@ func (s *Store) Rebuild(ctx context.Context) error {
 					return err
 				}
 				allocationWorktree, allocationPath, allocationState = req.WorktreeID, req.Path, "recovered"
-				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind); err != nil {
+				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind, suffix); err != nil {
 					return err
 				}
 				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
@@ -3189,18 +3203,18 @@ func journalEventFor(journal []eventRecord, project string, seq int64) (eventRec
 }
 
 func (s *Store) ensureReceiptAllocation(ctx context.Context, conn *sql.Conn, receipt AllocationReceipt, journal []eventRecord) error {
-	prefix, number := splitTicketID(receipt.ID)
+	prefix, number, suffix := splitTicketID(receipt.ID)
 	kind, err := s.reconcileAllocationKind(prefix, receipt.Kind, receipt.Path)
 	if err != nil {
 		return err
 	}
 	var allocationSeq int64
 	var allocationKind string
-	err = conn.QueryRowContext(ctx, `SELECT seq, kind FROM allocations WHERE project_id=? AND prefix=? AND number=?`, receipt.ProjectID, prefix, number).Scan(&allocationSeq, &allocationKind)
+	err = conn.QueryRowContext(ctx, `SELECT seq, kind FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, receipt.ProjectID, prefix, number, suffix).Scan(&allocationSeq, &allocationKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		allocationSeq = receipt.Seq
-		_, err = conn.ExecContext(ctx, `INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq,kind) VALUES(?,?,?,?,?,?,?,?)`,
-			receipt.ProjectID, prefix, number, receipt.WorktreeID, receipt.State, receipt.Path, allocationSeq, kind)
+		_, err = conn.ExecContext(ctx, `INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq,kind,suffix) VALUES(?,?,?,?,?,?,?,?,?)`,
+			receipt.ProjectID, prefix, number, receipt.WorktreeID, receipt.State, receipt.Path, allocationSeq, kind, suffix)
 	} else if err == nil {
 		if allocationSeq != receipt.Seq {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s has seq %d but allocation has seq %d", receipt.ID, receipt.Seq, allocationSeq)
@@ -3448,29 +3462,171 @@ func (s *Store) pathLockFor(worktreeID, path string) string {
 	return filepath.Join(s.commonDir, "aira", "locks", "path-"+digestBytes([]byte(triple))+".lock")
 }
 
-func prefixOf(id string) string { return id[:strings.LastIndexByte(id, '-')] }
-
-func numberOf(id string) int64 {
-	n, _ := strconv.ParseInt(id[strings.LastIndexByte(id, '-')+1:], 10, 64)
-	return n
-}
-
-func splitTicketID(id string) (string, int) {
+// splitTicketID is the ONE parser for a stored id (AIRA-237 Task 3 collapsed
+// prefixOf/numberOf into it). It splits the prefix on the last '-', peels an
+// optional single trailing split-suffix letter (`BL-10a` -> ("BL", 10, "a")),
+// and parses the numeric part; a plain id has an empty suffix (`BL-10` ->
+// ("BL", 10, "")). Allocation-keying callers carry all three so a suffixed
+// child stays distinct from its plain twin in the allocations PK; the number-
+// only maxima/HWM callers ignore the suffix (the allocator mints numbers, never
+// suffixes). It must only be reached with a well-formed id: a dash-less string
+// slices out of range, so every caller validates (domain.ValidateID) first,
+// exactly as prefixOf/numberOf required.
+func splitTicketID(id string) (prefix string, number int, suffix string) {
 	idx := strings.LastIndexByte(id, '-')
-	n, _ := strconv.Atoi(id[idx+1:])
-	return id[:idx], n
+	prefix = id[:idx]
+	tail := id[idx+1:]
+	if n := len(tail); n > 0 {
+		if c := tail[n-1]; c >= 'a' && c <= 'z' {
+			suffix = tail[n-1:]
+			tail = tail[:n-1]
+		}
+	}
+	number, _ = strconv.Atoi(tail)
+	return prefix, number, suffix
 }
 
+// validPrefix accepts a bare prefix (A-Z, len>=2, e.g. "BL") or ONE composed
+// <id_prefix>-<PREFIX> shape (AIRA-237 Task 1, e.g. "FEE-BL"): at most one '-'
+// separator, each segment A-Z and len>=2. It rejects arbitrary hyphens
+// ("FEE-BL-X"), a trailing separator ("FEE-"), and lowercase. Task 3 does not
+// widen this further (the compound is only ever formed by composition).
 func validPrefix(prefix string) bool {
-	if len(prefix) < 2 {
+	if prefix == "" {
 		return false
 	}
-	for _, r := range prefix {
+	segments := strings.Split(prefix, "-")
+	if len(segments) > 2 {
+		return false
+	}
+	for _, segment := range segments {
+		if len(segment) < 2 {
+			return false
+		}
+		for _, r := range segment {
+			if r < 'A' || r > 'Z' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// validIDPrefix reports whether p is a valid per-project namespacing prefix:
+// plain A-Z, len>=2 (AIRA-237 Task 1). No hyphen — the compound is only ever
+// composed, never authored.
+func validIDPrefix(p string) bool {
+	if len(p) < 2 {
+		return false
+	}
+	for _, r := range p {
 		if r < 'A' || r > 'Z' {
 			return false
 		}
 	}
 	return true
+}
+
+// registerPrefixes composes and registers a project's ticket and requirement
+// prefixes into s.prefixes, retaining s.idPrefix (AIRA-237 Task 1). When
+// idPrefix is set, each bare prefix P is registered as the composed key
+// <idPrefix>-P, so prefix_ownership and id_counters own the compound (FEE-BL)
+// and every stored/keyed/filenamed id is the full FEE-BL-123. It refuses an
+// id_prefix that is also a project prefix (the segment-count prepend rule would
+// be ambiguous).
+func (s *Store) registerPrefixes(idPrefix string, ticketPrefixes, requirementPrefixes []string) error {
+	idPrefix = strings.ToUpper(strings.TrimSpace(idPrefix))
+	if idPrefix != "" && !validIDPrefix(idPrefix) {
+		return fmt.Errorf("E_CONFIG_INVALID: invalid id_prefix %q", idPrefix)
+	}
+	s.idPrefix = idPrefix
+	compose := func(bare string) (string, error) {
+		up := strings.ToUpper(bare)
+		if idPrefix != "" && up == idPrefix {
+			return "", fmt.Errorf("E_CONFIG_INVALID: id_prefix %q must not also be a project prefix", idPrefix)
+		}
+		key := up
+		if idPrefix != "" {
+			key = idPrefix + "-" + up
+		}
+		if !validPrefix(key) {
+			return "", fmt.Errorf("E_ID_INVALID: invalid prefix %q", bare)
+		}
+		return key, nil
+	}
+	for _, bare := range ticketPrefixes {
+		key, err := compose(bare)
+		if err != nil {
+			return err
+		}
+		s.prefixes[key] = kindTicket
+	}
+	for _, bare := range requirementPrefixes {
+		key, err := compose(bare)
+		if err != nil {
+			return err
+		}
+		if existing, dup := s.prefixes[key]; dup && existing != kindRequirement {
+			// Prefixes are disjoint by kind: a prefix may not be both a ticket
+			// and a requirement prefix.
+			return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", key)
+		}
+		s.prefixes[key] = kindRequirement
+	}
+	return nil
+}
+
+// IDPrefix returns this project's namespacing prefix ("" when none).
+func (s *Store) IDPrefix() string { return s.idPrefix }
+
+// CanonicalID is the exported façade over canonicalID for the core faces.
+func (s *Store) CanonicalID(raw string) string { return s.canonicalID(raw) }
+
+// DisplayID is the exported façade over displayID for the core faces.
+func (s *Store) DisplayID(value string) string { return s.displayID(value) }
+
+// canonicalID prepends the project's id_prefix to a human-typed id (or bare
+// prefix, for `aira id`) when — and only when — doing so names a registered
+// prefix (AIRA-237 Task 1). It is idempotent: an already-compound id copied
+// from aira's own output (FEE-BL-123) has first segment FEE, and FEE-FEE is not
+// registered, so it passes through unchanged. This is NOT a HasPrefix test,
+// which would double-prepend or mangle an unrelated id.
+func (s *Store) canonicalID(raw string) string {
+	if s.idPrefix == "" || raw == "" {
+		return raw
+	}
+	seg1 := raw
+	if i := strings.IndexByte(raw, '-'); i >= 0 {
+		seg1 = raw[:i]
+	}
+	if _, ok := s.prefixes[s.idPrefix+"-"+strings.ToUpper(seg1)]; ok {
+		return s.idPrefix + "-" + raw
+	}
+	return raw
+}
+
+// displayID strips the project's id_prefix from a stored compound id for
+// human-facing output (AIRA-237 Task 1), the exact inverse of canonicalID. It
+// strips iff the value's first two segments name a registered composed prefix,
+// so a value that merely begins with the id_prefix text but is not one of this
+// project's ids is left intact.
+func (s *Store) displayID(value string) string {
+	if s.idPrefix == "" || value == "" {
+		return value
+	}
+	head := s.idPrefix + "-"
+	if !strings.HasPrefix(value, head) {
+		return value
+	}
+	rest := value[len(head):]
+	seg2 := rest
+	if i := strings.IndexByte(rest, '-'); i >= 0 {
+		seg2 = rest[:i]
+	}
+	if _, ok := s.prefixes[s.idPrefix+"-"+strings.ToUpper(seg2)]; ok {
+		return rest
+	}
+	return value
 }
 
 func boolInt(v bool) int {
@@ -4233,7 +4389,7 @@ func scanRefMax(root string) (map[string]int64, error) {
 			if err := domain.ValidateID(id); err != nil {
 				continue
 			}
-			prefix, number := splitTicketID(id)
+			prefix, number, _ := splitTicketID(id) // number-only
 			if int64(number) > result[prefix] {
 				result[prefix] = int64(number)
 			}

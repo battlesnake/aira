@@ -455,8 +455,8 @@ func TestRetireRefusesBlankSelector(t *testing.T) {
 	}
 }
 
-// TestRetireRefusesAMalformedAllocationID guards prefixOf/numberOf, which slice
-// on the last '-' and PANIC without one.
+// TestRetireRefusesAMalformedAllocationID guards splitTicketID, which slices
+// on the last '-' and PANICs without one.
 func TestRetireRefusesAMalformedAllocationID(t *testing.T) {
 	f := newRetireFixture(t)
 	ctx := context.Background()
@@ -706,7 +706,7 @@ func newAllocationFixture(t *testing.T, withReceipt bool) allocationFixture {
 
 func allocationState(t *testing.T, s *Store, id string) string {
 	t.Helper()
-	prefix, number := splitTicketID(id)
+	prefix, number, _ := splitTicketID(id)
 	var state string
 	err := s.db.QueryRowContext(context.Background(),
 		`SELECT state FROM allocations WHERE project_id=? AND prefix=? AND number=?`, s.projectID, prefix, number).Scan(&state)
@@ -763,7 +763,7 @@ func TestRetiringAnAllocationIntentClearsTheCheckWedge(t *testing.T) {
 func TestRetireCannotRetireAMaterialisedAllocation(t *testing.T) {
 	f := newAllocationFixture(t, true)
 	ctx := context.Background()
-	prefix, number := splitTicketID(f.intent.AllocationID)
+	prefix, number, _ := splitTicketID(f.intent.AllocationID)
 	if _, err := f.store.db.ExecContext(ctx, `UPDATE allocations SET state='materialised'
 		WHERE project_id=? AND prefix=? AND number=?`, f.store.projectID, prefix, number); err != nil {
 		t.Fatal(err)
@@ -819,8 +819,8 @@ func TestRetireRepairsAMissingAllocationReceiptAndTheIDIsNeverReused(t *testing.
 	if err != nil {
 		t.Fatalf("allocate after rebuild: %v", err)
 	}
-	_, retiredNumber := splitTicketID(f.intent.AllocationID)
-	_, nextNumber := splitTicketID(next)
+	_, retiredNumber, _ := splitTicketID(f.intent.AllocationID)
+	_, nextNumber, _ := splitTicketID(next)
 	if nextNumber <= retiredNumber {
 		t.Fatalf("retired %s but reallocated %s — a retired ID must never be re-minted", f.intent.AllocationID, next)
 	}

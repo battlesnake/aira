@@ -19,6 +19,27 @@ type requestCaptureRunner struct {
 	request runner.Request
 }
 
+// verifies (AIRA-237 Task 4): --allocated-max is repeatable on `import` and
+// reaches the request as a bare-entry string slice for the core handler to
+// parse and the store to compose.
+func TestImportAllocatedMaxCLIParsing(t *testing.T) {
+	positional, options, err := parseArgs("import", []string{"tickets.jsonl", "--tickets", "--allocated-max", "BL=1217", "--allocated-max", "NF=90"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	request, err := buildRequest("import", positional, options)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	got, ok := request.Args["allocated_max"].([]string)
+	if !ok || !reflect.DeepEqual(got, []string{"BL=1217", "NF=90"}) {
+		t.Fatalf("allocated_max = %#v (ok=%v); want []string{BL=1217, NF=90}", request.Args["allocated_max"], ok)
+	}
+	if request.Args["tickets"] != true {
+		t.Fatalf("tickets = %v; want true", request.Args["tickets"])
+	}
+}
+
 func TestRantCLIRepeatedTagsRefsAndReviewFaces(t *testing.T) {
 	positional, options, err := parseArgs("rant", []string{"raw friction", "--tag", "Slow_Tests", "--tag", "infra", "--severity", "annoyance", "--ref", "ticket:AIRA-1", "--ref", "gate:unit", "--idem", "retry-1"})
 	if err != nil {
