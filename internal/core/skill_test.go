@@ -73,6 +73,18 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		"`/dev/null` BY DEFAULT",
 		"aira confine --detach --stdin-connect",
 		"aira confine-input",
+		// AIRA-249. The build-discipline convention must survive in both faces:
+		// ready is the gate, hold captures without building, milestone is a label.
+		"Backlog and release discipline: build only `ready:true` tickets",
+		"Build only tickets that `aira ready` reports as `ready:true`",
+		"To capture a backlog item WITHOUT any agent building it, hold it",
+		"`aira create <title> --hold`",
+		"`aira list hold:true`",
+		"`aira list milestone:<release>`",
+		"does NOT by itself stop a build",
+		// The hold must not be self-cleared: an agent could otherwise decide
+		// "it is time", flip hold=false, and build a ticket the owner parked.
+		"Never clear a hold on your own initiative",
 	} {
 		if !strings.Contains(skill, want) {
 			t.Fatalf("SKILL.md missing mandate/opt-in prose: %q", want)

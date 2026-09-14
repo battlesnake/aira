@@ -19,6 +19,16 @@ import (
 	"aira/internal/store"
 )
 
+// mcpServerInstructions is returned as the MCP `initialize` result's optional
+// top-level `instructions` string, so it reaches every agent's context when the
+// client connects. It carries the two disciplines an agent must not miss and
+// keeps them short; the full guidance lives in the aira skill. AIRA-249.
+const mcpServerInstructions = "AIRA coordinates AI coding agents on this machine. Two disciplines matter most.\n\n" +
+	"1. Confine heavy commands. Run every memory-heavy shell command (builds, test suites, data loads, dev servers, long jobs) under `aira confine -- <cmd>` so a runaway dies in its own memory slice instead of OOM-killing the machine. This works in any directory and needs no project.\n\n" +
+	"2. Build only tickets `aira ready` reports as `ready:true`. `aira ready` is the single source of truth for what may be started now: it withholds that verdict from held tickets, non-workable statuses, tickets with an unresolved blocked-by prerequisite, and tickets carrying a failing or unevaluated finding. Never start a ticket `aira ready` does not report `ready:true`, even if you can see it in `aira list` (a non-ready ticket can still appear there with `ready:false`) — being visible is not an invitation to build it.\n\n" +
+	"To capture a backlog item WITHOUT any agent building it, hold it: `aira create <title> --hold` (or `aira set <id> hold=true`). A held ticket is recorded but stays out of `aira ready` until the hold is cleared. When the owner says \"backlog this\" or \"not now\", create it held and stop — do not plan or build it. Never clear a hold on your own initiative: clear it with `aira set <id> hold=false` only when the owner says that specific ticket should start. Track a ticket's target release with milestone: `aira set <id> milestone=<release>` (or `aira create ... --milestone <release>`) — a label only, it never gates building; `hold` does. Review a release with `aira list milestone:<release>` and the backlog with `aira list hold:true`.\n\n" +
+	"Coordination verbs (tickets, ready, gates, milestones) work only in a project initialized with `aira init`; `aira confine` is machine-wide and always available."
+
 type mcpProvider func(context.Context, core.Request) (*core.Core, func(), error)
 
 type mcpServer struct {
@@ -338,6 +348,11 @@ func (s *mcpServer) handle(ctx context.Context, line []byte) (mcpResponse, bool)
 		result := map[string]any{
 			"protocolVersion": "2025-06-18",
 			"capabilities":    map[string]any{"tools": map[string]any{}},
+			// The MCP spec's optional top-level `instructions` string lands in the
+			// client's context at connect time, so it is where the two rules an
+			// agent must not miss belong: confine heavy commands, and build only
+			// what `aira ready` surfaces. AIRA-249.
+			"instructions": mcpServerInstructions,
 			// AIRA-202. Was the literal "m8a" -- a Milestone-8a label frozen on
 			// 2026-08-09 and roughly a thousand commits stale by the time it was
 			// found. It was the ONLY place aira answered a version question, and it

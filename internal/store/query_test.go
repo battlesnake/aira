@@ -53,8 +53,17 @@ func TestGetAndFindUsePhaseOneSelectors(t *testing.T) {
 	if _, err := s.Find(`kind=bug`); codeOf(err) != "E_SELECTOR_INVALID" {
 		t.Fatalf("equals query code = %q, err=%v", codeOf(err), err)
 	}
-	if _, err := s.Find(`hold:true`); codeOf(err) != "E_SELECTOR_INVALID" {
-		t.Fatalf("hold query code = %q, err=%v", codeOf(err), err)
+	// AIRA-249 deliberately makes `hold` a selectable field so the held backlog
+	// is reviewable (`aira list hold:true`). It was previously refused here; the
+	// exclusion was incidental (hold was already a distribution field, and the
+	// nullable milestone/assignee fields are selectable) rather than principled.
+	holdRows, err := s.Find(`hold:true`)
+	if err != nil || len(holdRows) != 1 || holdRows[0].Ticket.ID != second.ID {
+		t.Fatalf("hold:true query = %#v, %v", holdRows, err)
+	}
+	unheldRows, err := s.Find(`hold:false`)
+	if err != nil || len(unheldRows) != 1 || unheldRows[0].Ticket.ID != first.ID {
+		t.Fatalf("hold:false query = %#v, %v", unheldRows, err)
 	}
 	if _, err := s.Find(`text:queue`); codeOf(err) != "E_SELECTOR_INVALID" {
 		t.Fatalf("unquoted text query code = %q, err=%v", codeOf(err), err)

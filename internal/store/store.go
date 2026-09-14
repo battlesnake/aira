@@ -2158,7 +2158,11 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 		}
 		id := fmt.Sprintf("%s-%d", prefix, number)
 		ticket := domain.Ticket{Schema: 1, ID: id, Project: s.projectSlug, Title: input.Title,
-			Status: domain.StatusPlanned, Kind: input.Kind, Severity: input.Severity, Labels: input.Labels}
+			Status: domain.StatusPlanned, Kind: input.Kind, Severity: input.Severity, Labels: input.Labels,
+			Hold: input.Hold}
+		if milestone := strings.TrimSpace(input.Milestone); milestone != "" {
+			ticket.Milestone = &milestone
+		}
 		if ticket.Labels == nil {
 			ticket.Labels = []string{}
 		}

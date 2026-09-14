@@ -137,11 +137,13 @@ type Ticket struct {
 }
 
 type CreateTicketInput struct {
-	Title    string
-	Kind     Kind
-	Severity Severity
-	Body     string
-	Labels   []string
+	Title     string
+	Kind      Kind
+	Severity  Severity
+	Body      string
+	Labels    []string
+	Hold      bool
+	Milestone string
 }
 
 // idPattern accepts an optional single compound segment (AIRA-237 Task 1's

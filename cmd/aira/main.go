@@ -763,7 +763,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") || (name == "hold" && (verb == "create" || verb == "new")) {
 			options[name] = "true"
 			continue
 		}
@@ -802,9 +802,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	allowed := map[string]map[string]bool{
 		"init":   {"project": true, "prefixes": true, "id-prefix": true},
 		"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
-		"create": {"kind": true, "severity": true, "labels": true, "body": true},
+		"create": {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
 		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
-		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
+		"new":    {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
 		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
 		"grep":   {"kind": true, "by": true, "fields": true},
@@ -2628,6 +2628,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		}
 		args["title"] = strings.Join(positional, " ")
 		args["kind"], args["severity"], args["body"], args["labels"] = options["kind"], options["severity"], options["body"], splitComma(options["labels"])
+		args["milestone"], args["hold"] = options["milestone"], options["hold"] == "true"
 	case "rant":
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("rant requires <text> or ls|get|review|redact")

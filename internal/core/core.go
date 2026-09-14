@@ -773,8 +773,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			id, err := c.store.AllocateID(ctx, prefix)
 			return map[string]any{"id": id}, err
 		}},
-		"create": {Name: "create", Usage: "create <title> [--kind K --severity S --label L --body B]", Args: []ArgSpec{stringSpec("title", true, true, "Ticket title"), stringSpec("kind", false, false, "Ticket kind", domain.AllowedKindStrings()...), stringSpec("severity", false, false, "Ticket severity", domain.AllowedSeverityStrings()...), stringSpec("body", false, false, "Ticket body"), listSpec("labels", false, false, "Ticket labels")}, MCPTool: "aira_create", Run: func(ctx context.Context, args *argAccessor) (any, error) {
-			input := domain.CreateTicketInput{Title: stringArg(args, "title"), Body: stringArg(args, "body"), Kind: domain.Kind(stringArg(args, "kind")), Severity: domain.Severity(stringArg(args, "severity")), Labels: stringSlice(args, "labels")}
+		"create": {Name: "create", Usage: "create <title> [--kind K --severity S --label L --body B --milestone M --hold]", Args: []ArgSpec{stringSpec("title", true, true, "Ticket title"), stringSpec("kind", false, false, "Ticket kind", domain.AllowedKindStrings()...), stringSpec("severity", false, false, "Ticket severity", domain.AllowedSeverityStrings()...), stringSpec("body", false, false, "Ticket body"), listSpec("labels", false, false, "Ticket labels"), stringSpec("milestone", false, false, "Target release milestone"), boolSpec("hold", false, false, "Create held: kept out of aira ready until the hold is cleared")}, MCPTool: "aira_create", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			input := domain.CreateTicketInput{Title: stringArg(args, "title"), Body: stringArg(args, "body"), Kind: domain.Kind(stringArg(args, "kind")), Severity: domain.Severity(stringArg(args, "severity")), Labels: stringSlice(args, "labels"), Milestone: stringArg(args, "milestone"), Hold: boolArg(args, "hold")}
 			ticket, event, err := c.store.CreateTicketWithEvent(ctx, input)
 			if err != nil {
 				return nil, err
