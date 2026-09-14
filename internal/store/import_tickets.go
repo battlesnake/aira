@@ -73,6 +73,15 @@ type rawTicketRow struct {
 	Body     string          `json:"body"`
 	Labels   []string        `json:"labels"`
 	Links    []rawTicketLink `json:"links"`
+	// Origin (AIRA-244) is accepted and otherwise IGNORED. The fastest.ee
+	// extractor stamps a per-row "origin":"fastest-ee-backlog-export" on every
+	// row of a real export; before this field existed, DisallowUnknownFields
+	// (below) rejected every single row with "unknown field \"origin\"",
+	// failing the whole import. It carries no behaviour: the disappear-on-
+	// reimport scoping (absentImportedTickets) keys off the journaled `events`
+	// table's verb='ticket.import' rows, never this field, so a caller cannot
+	// use Origin to scope a re-import differently.
+	Origin string `json:"origin"`
 }
 
 type rawTicketLink struct {

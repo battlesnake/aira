@@ -109,6 +109,63 @@ func TestImportTicketsCreatesPrefixedAndSeedsCounter(t *testing.T) {
 	}
 }
 
+// TestImportTicketsAcceptsExtractorOriginField pins AIRA-244: the fastest.ee
+// extractor stamps a per-row "origin":"fastest-ee-backlog-export" on EVERY row
+// of a real export (verified against a 2007-row export), and rawTicketRow's
+// DisallowUnknownFields decoder used to reject every such row with
+// `json: unknown field "origin"`, failing the whole import. A row carrying
+// origin must parse and import cleanly on BOTH the create and the refresh
+// path, and the field must otherwise be ignored — not persisted onto the
+// ticket, and not consulted by the disappear-on-reimport scoping, which keys
+// off the journaled `events` table (verb=ticket.import), never this field.
+//
+// verifies: AIRA-244
+func TestImportTicketsAcceptsExtractorOriginField(t *testing.T) {
+	s := namespacedStore(t, "FEE", "BL")
+
+	created := importOne(t, s, `{"id":"BL-1","title":"first","status":"planned","kind":"chore","severity":"P1","body":"b","origin":"fastest-ee-backlog-export"}`)
+	if len(created.Errored) != 0 {
+		t.Fatalf("row carrying origin should import cleanly; errored=%v", created.Errored)
+	}
+	if len(created.Created) != 1 || created.Created[0] != "FEE-BL-1" {
+		t.Fatalf("created = %v; want [FEE-BL-1]", created.Created)
+	}
+	rec, err := s.Get("FEE-BL-1")
+	if err != nil {
+		t.Fatalf("Get(FEE-BL-1): %v", err)
+	}
+	if rec.Ticket.Title != "first" {
+		t.Fatalf("ticket = %+v; origin must not corrupt normal fields", rec.Ticket)
+	}
+	// Origin is accepted-as-provenance only: it is not rendered anywhere onto
+	// the stored ticket file (domain.Ticket carries no Origin field at all, so
+	// this also guards against ever adding one by accident).
+	raw, err := os.ReadFile(filepath.Join(s.root, ".aira", "tickets", "FEE-BL-1.md"))
+	if err != nil {
+		t.Fatalf("read stored ticket file: %v", err)
+	}
+	if strings.Contains(string(raw), "fastest-ee-backlog-export") {
+		t.Fatalf("origin leaked into the stored ticket file: %s", raw)
+	}
+
+	// Refresh path: a re-import of the same id, still carrying origin (with a
+	// changed title so the refresh is not a no-op), must also import cleanly.
+	refreshed := importOne(t, s, `{"id":"BL-1","title":"first, revised","status":"planned","kind":"chore","severity":"P1","body":"b","origin":"fastest-ee-backlog-export"}`)
+	if len(refreshed.Errored) != 0 {
+		t.Fatalf("re-import carrying origin should refresh cleanly; errored=%v", refreshed.Errored)
+	}
+	if len(refreshed.Refreshed) != 1 || refreshed.Refreshed[0] != "FEE-BL-1" {
+		t.Fatalf("refreshed = %v; want [FEE-BL-1]", refreshed.Refreshed)
+	}
+	rec2, err := s.Get("FEE-BL-1")
+	if err != nil {
+		t.Fatalf("Get(FEE-BL-1) after refresh: %v", err)
+	}
+	if rec2.Ticket.Title != "first, revised" {
+		t.Fatalf("refreshed ticket = %+v; want revised title", rec2.Ticket)
+	}
+}
+
 func mustNumber(t *testing.T, id string) int64 {
 	t.Helper()
 	_, n, _ := splitTicketID(id)

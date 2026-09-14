@@ -631,6 +631,103 @@ func TestParseConfineArgsRejectsUnsafeShapes(t *testing.T) {
 	}
 }
 
+// TestConfineHelpPrintsBothModesAndExitsZero pins AIRA-243 (a): `aira confine
+// --help` used to fall through to the generic "not valid for confine
+// management" refusal, leaving no way to discover confine's flags short of
+// reading source. It must now exit 0 and print BOTH the management
+// subcommands and the launch-form options (confine's own Usage string
+// already names every launch flag, so asserting one, --memory-reserve, pins
+// that the launch form specifically is present, not just the management
+// list).
+//
+// verifies: AIRA-243
+func TestConfineHelpPrintsBothModesAndExitsZero(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exit := runWithInput([]string{"confine", "--help"}, &stdout, &stderr, strings.NewReader(""))
+	if exit != 0 {
+		t.Fatalf("exit=%d stderr=%q stdout=%q", exit, stderr.String(), stdout.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"--memory-reserve", "--cpu-timeout", "--delegate-ram", "--exclusive", "--require-admission", "--detach", "--stdin-connect", // launch form
+		"confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-status", // management subcommands
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("confine --help output missing %q; stdout=%q", want, out)
+		}
+	}
+}
+
+// TestConfineBareInvocationDocumentsBothModes pins AIRA-243 (b): the
+// zero-management-flags refusal (a bare `aira confine`, or any launch attempt
+// that mis-parsed to no recognised management flags) used to document ONLY
+// the management form. It must now also point at the launch form and at
+// `aira confine --help`.
+//
+// verifies: AIRA-243
+func TestConfineBareInvocationDocumentsBothModes(t *testing.T) {
+	_, _, err := parseArgs("confine", nil)
+	if err == nil {
+		t.Fatal("expected an error for a bare confine invocation")
+	}
+	message := err.Error()
+	for _, want := range []string{"E_CONFINE_ARGUMENT_INVALID", "launch target", "--list", "confine --help"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("bare-confine error missing %q; got %q", want, message)
+		}
+	}
+}
+
+// TestConfineLaunchFlagWithoutDelimiterNamesTheDelimiterRequirement pins
+// AIRA-243 (c): a launch-intent flag typed without `-- <cmd>` (the reported
+// case was --cpu-timeout) used to get the SAME generic "not valid for
+// confine management" refusal as a genuine typo, which previously led a
+// peer to conclude the flag did not exist at all. It must now name the real
+// problem: the flag is real, but launch options require the -- delimiter.
+//
+// verifies: AIRA-243
+func TestConfineLaunchFlagWithoutDelimiterNamesTheDelimiterRequirement(t *testing.T) {
+	for _, name := range []string{"cpu-timeout", "memory-reserve", "exclusive", "delegate-ram"} {
+		_, _, err := parseArgs("confine", []string{"--" + name, "2"})
+		if err == nil {
+			t.Fatalf("--%s without a delimiter should still be refused", name)
+		}
+		message := err.Error()
+		if !strings.Contains(message, "-- <cmd>") || !strings.Contains(message, "--"+name) {
+			t.Fatalf("--%s error should name the flag and the -- <cmd> requirement; got %q", name, message)
+		}
+	}
+	// An option that is NOT a real launch or management flag at all keeps the
+	// plain, unembellished refusal — the clearer message is reserved for
+	// options the parser actually recognises.
+	_, _, err := parseArgs("confine", []string{"--totally-unknown-option"})
+	if err == nil || strings.Contains(err.Error(), "-- <cmd>") {
+		t.Fatalf("a genuinely unknown option should not claim to be a launch flag; err=%v", err)
+	}
+}
+
+// TestConfineManagementArgsAcceptsHelpAloneAndAlongsideOtherFlags is the
+// parser-level pin for AIRA-243 (a): --help must parse successfully by
+// itself, and short-circuit ahead of the exactly-one-management-flag check
+// even when combined with something else.
+//
+// verifies: AIRA-243
+func TestConfineManagementArgsAcceptsHelpAloneAndAlongsideOtherFlags(t *testing.T) {
+	_, options, err := parseConfineManagementArgs([]string{"--help"})
+	if err != nil || options["help"] != "true" {
+		t.Fatalf("options=%v err=%v", options, err)
+	}
+	// --list and --budget together would normally be the "exactly one"
+	// refusal; --help must win before that check ever runs.
+	_, options, err = parseConfineManagementArgs([]string{"--help", "--list", "--budget"})
+	if err != nil || options["help"] != "true" {
+		t.Fatalf("options=%v err=%v", options, err)
+	}
+	if _, _, err := parseConfineManagementArgs([]string{"--help=x"}); err == nil {
+		t.Fatal("--help does not take a value")
+	}
+}
+
 func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 	canonical, route := core.Classify("confine", "")
 	if canonical != "confine" || route != core.RouteClient {

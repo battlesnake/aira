@@ -31,7 +31,10 @@ func (s *Server) confineBudget(args map[string]any) core.Response {
 	if s.db == nil {
 		return core.Response{Code: CodeUnavailable, Error: CodeUnavailable + ": state database is unavailable"}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
+	// AIRA-242: same diagnostic batch read as confineDump, and never on the
+	// caller-blocking admission path — see dumpHistoryTimeout's doc comment in
+	// admit.go for why this must not reuse the hot path's admitHistoryTimeout.
+	ctx, cancel := context.WithTimeout(context.Background(), dumpHistoryTimeout)
 	defer cancel()
 	subjects, err := s.db.ResourceBudgetSubjects(ctx)
 	if err != nil {
