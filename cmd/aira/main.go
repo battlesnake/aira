@@ -228,6 +228,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		return runTop(context.Background(), dispatcher, stdin, stdout, stderr)
 	}
 	if verb == "confine" {
+		// AIRA-243. `--help` short-circuits ahead of everything else below: it is
+		// neither a management flag nor a launch flag, needs no daemon, no
+		// project, and no --json branching, and must work whatever else was also
+		// typed alongside it.
+		if options["help"] == "true" {
+			return runConfineHelpCommand(stdout, stderr)
+		}
 		// AIRA-22: --status joins --list/--kill as a management form. Unlike those
 		// two it is answered LOCALLY rather than through the daemon: it reads a
 		// plain filesystem record, and routing it through the daemon would make the
@@ -1263,6 +1270,17 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 			// an operator who forgot the delimiter that they must pick a management
 			// verb sends them the wrong way entirely.
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --detach requires a launch target after --, e.g. aira confine --detach --name gate -- make merge-gate")
+		case "help":
+			// AIRA-243. `aira confine --help` used to fall through to the "not valid
+			// for confine management" refusal below, the same as any other unknown
+			// option, leaving no way to discover confine's flags short of reading
+			// source. Accepted here and short-circuited immediately after the loop
+			// (below), before the exactly-one-management-flag check, so `--help`
+			// works alone and is never itself subject to that mutual exclusivity.
+			if hasInline {
+				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s does not take a value", name)
+			}
+			options[name] = "true"
 		case "list", "steal", "budget":
 			if hasInline {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s does not take a value", name)
@@ -1300,8 +1318,24 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 			}
 			options[name] = value
 		default:
+			// AIRA-243. An option that is genuinely a confine LAUNCH flag
+			// (--memory-reserve, --cpu-timeout, --exclusive, ...) typed here, with
+			// no `--` delimiter, used to get the SAME generic "not valid for confine
+			// management" refusal as a plain typo — which is technically true but
+			// misdirects an operator who has a real flag and simply forgot the
+			// delimiter (the reported case: no `--cpu-timeout` error implied to a
+			// peer that the flag did not exist at all). Named explicitly instead.
+			if confineLaunchOptionValueless(name) || confineLaunchOptionTakesValue(name) {
+				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s is a confine LAUNCH option and requires the -- <cmd> delimiter, e.g. aira confine --%s ... -- <cmd>; it is not valid for confine management (--list/--budget/--dump/--kill/--status) on its own (run 'aira confine --help' for the full option list)", name, name)
+			}
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine management", name)
 		}
+	}
+	// --help stands alone: it never participates in the exactly-one-management-
+	// flag selection below, and is honoured regardless of whatever else was also
+	// typed alongside it.
+	if options["help"] == "true" {
+		return nil, options, nil
 	}
 	list := options["list"] == "true"
 	kill := options["kill"] != ""
@@ -1313,6 +1347,13 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 		if chosen {
 			selected++
 		}
+	}
+	if selected == 0 {
+		// AIRA-243. Previously documented ONLY the management form, leaving an
+		// operator who typed a bare `aira confine` (or a launch attempt that
+		// mis-parsed to zero recognised management flags) with no hint that a
+		// launch form exists at all.
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine requires either a management flag (--list, --budget, --dump <file>, --kill <selector>, or --status [<selector>]) or a launch target after the -- delimiter (e.g. aira confine --memory-reserve 4G -- make test); run 'aira confine --help' for the full option list")
 	}
 	if selected != 1 {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --dump <file>, --kill <selector>, or --status [<selector>]")
@@ -1332,6 +1373,44 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 		}
 	}
 	return nil, options, nil
+}
+
+// confineHelpVerbs is every dispatch-table verb `aira confine --help` prints:
+// the launch form itself plus its five management subcommands. Deliberately a
+// fixed, named list rather than "every verb whose name starts with confine" —
+// confine-reserve/confine-log/confine-input/confine-report are real, separate
+// features with their own callers (aitest, a detached job's own handle), not
+// part of the two modes AIRA-243 is about.
+var confineHelpVerbs = []string{"confine", "confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-status"}
+
+// runConfineHelpCommand answers `aira confine --help`. It prints EXACTLY the
+// confine-family rows of the generated dispatch-table help (renderHelp, the
+// same renderer and the same descriptor Usage/Summary strings `aira help`
+// itself uses) rather than a hand-written second copy of the same text: the
+// two can now never drift apart, and every launch option (--memory-reserve
+// and friends) is named because confine's own Usage string already carries
+// the whole launch-form option list.
+//
+// Always plain text, and always exit 0: --help ignores --json exactly like
+// --help ignores every other confine option, matching the top-level `aira
+// --help`/`aira help` convention (AIRA-243).
+func runConfineHelpCommand(stdout, stderr io.Writer) int {
+	response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
+	entries, ok := response.Data.([]map[string]string)
+	if !ok {
+		return render(response, false, stdout, stderr)
+	}
+	wanted := make(map[string]bool, len(confineHelpVerbs))
+	for _, verb := range confineHelpVerbs {
+		wanted[verb] = true
+	}
+	filtered := make([]map[string]string, 0, len(confineHelpVerbs))
+	for _, entry := range entries {
+		if wanted[entry["verb"]] {
+			filtered = append(filtered, entry)
+		}
+	}
+	return renderHelp(core.Response{OK: true, Data: filtered}, stdout, stderr)
 }
 
 func runConfineCommand(ctx context.Context, target []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {

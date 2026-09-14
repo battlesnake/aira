@@ -34,7 +34,10 @@ func TestConfineDetachArgumentParsing(t *testing.T) {
 		{name: "status and kill are mutually exclusive", argv: []string{"--kill", "gate", "--status", "gate"}, want: "exactly one of"},
 		{name: "steal is kill-only", argv: []string{"--status", "gate", "--steal"}, want: "--steal is valid only with --kill"},
 		{name: "empty inline status selector is refused", argv: []string{"--status="}, want: "--status requires a value"},
-		{name: "no management verb at all", argv: []string{"--owner", "session-a"}, want: "exactly one of"},
+		// AIRA-243: the zero-selected case now documents BOTH modes (management
+		// AND launch), not just the "exactly one of" management-only message
+		// the 2+-selected case above still uses.
+		{name: "no management verb at all", argv: []string{"--owner", "session-a"}, want: "launch target"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, _, err := parseArgs("confine", test.argv)
