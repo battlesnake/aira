@@ -62,7 +62,11 @@ func (s *Server) confineDump(args map[string]any) core.Response {
 	if s.db == nil {
 		return core.Response{Code: CodeUnavailable, Error: CodeUnavailable + ": state database is unavailable"}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
+	// AIRA-242: this is a diagnostic/archival batch read of the WHOLE retained
+	// history, never a caller-blocking admission decision, so it takes the
+	// generous dumpHistoryTimeout rather than the admit hot path's 250ms
+	// admitHistoryTimeout (see dumpHistoryTimeout's doc comment in admit.go).
+	ctx, cancel := context.WithTimeout(context.Background(), dumpHistoryTimeout)
 	defer cancel()
 	subjects, err := s.db.ResourceBudgetSubjects(ctx)
 	if err != nil {

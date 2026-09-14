@@ -29,11 +29,39 @@ const (
 	// S15 deleted workerAdmitWaitCeilingMs: a worker-admit CLAIM is a blocking
 	// lease with no daemon-side timeout (design §4/§6), exactly like the confine
 	// admit path, so there is no wait to ceiling-check.
-	admitMaxWaiters                           = 256
-	admitGlobalMax                            = 1024
-	admitMaxReserve                     int64 = 1 << 50
-	admitWriteTimeout                         = 5 * time.Second
-	admitHistoryTimeout                       = 250 * time.Millisecond
+	admitMaxWaiters         = 256
+	admitGlobalMax          = 1024
+	admitMaxReserve   int64 = 1 << 50
+	admitWriteTimeout       = 5 * time.Second
+	// admitHistoryTimeout bounds the ADMIT HOT PATH's per-signature history read
+	// (the live evaluator consulting one subject's recent samples while a caller
+	// is blocked waiting for a grant decision) and must stay tight for that
+	// reason alone.
+	admitHistoryTimeout = 250 * time.Millisecond
+	// dumpHistoryTimeout (AIRA-242) bounds the DIAGNOSTIC/BATCH history reads —
+	// confineDump and confineBudget — which both call the identical
+	// ResourceBudgetSubjects(ctx) as the hot path above, but read the WHOLE
+	// machine-wide confine_peak_history table (every retained sample across every
+	// subject, no per-signature filter) rather than one subject's window. That
+	// table has no total-row cap (RecordConfinePeak retains only the newest 20
+	// per (kind,signature), which bounds it per-subject, not in aggregate), so on
+	// a long-lived daemon with many distinct signatures the read legitimately
+	// exceeds 250ms — reusing admitHistoryTimeout for it made `aira confine
+	// --dump` fail once the table grew: the daemon logs
+	// "E_DAEMON_INTERNAL: read usage history: context deadline exceeded", and
+	// the CLIENT reports "E_DAEMON_UNAVAILABLE: EOF" rather than that structured
+	// error (measured on the live box; confineBudget hit the SAME reused
+	// deadline on the SAME query and did not reproduce this at the time it was
+	// observed — why the two diverged, and why the client sees a bare EOF
+	// instead of the daemon's own structured response, are NOT established
+	// here, only that the reused 250ms deadline is provably too tight for this
+	// read: TestConfineDumpSucceedsOnHistoryThatWouldTripTheAdmitHotPathDeadline
+	// reproduces the deadline-exceeded failure in-process at volume and shows
+	// dumpHistoryTimeout below fixes it). Neither confineDump nor confineBudget
+	// sits on any caller-blocking admission path, so a generous deadline costs
+	// nothing there; it must NEVER be used for admitHistoryTimeout's hot-path
+	// callers.
+	dumpHistoryTimeout                        = 30 * time.Second
 	admitPriorRefresh                         = time.Minute
 	admitConfineScanIntervalDefault           = time.Second
 	admitSliceHeadroomBaseDefault       int64 = 2 << 30
