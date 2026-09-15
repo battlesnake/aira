@@ -443,6 +443,8 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 		}
 	case msgBoardSearchResult:
 		r.state, commands = onBoardSearchResult(r.state, message.BoardSearch)
+	case msgBoardGetResult:
+		r.state, commands = onBoardGetResult(r.state, message.BoardGet)
 	case msgPaletteResult:
 		r.state, commands = onPaletteResult(r.state, message.PaletteOutcome, r.descriptors)
 		// The result still drives controller convergence after the operator

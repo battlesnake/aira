@@ -25,12 +25,19 @@ type boardSearchResult struct {
 }
 
 type boardSearchState struct {
-	Active   bool
-	Query    string
-	Pending  bool
-	State    string // "", "ok", "no-matches", "unevaluated:<code>"
-	Results  []boardSearchResult
-	MatchIDs map[string]bool
+	Active    bool
+	Query     string
+	Pending   bool
+	State     string // "", "ok", "no-matches", "not-found", "unevaluated:<code>"
+	Truncated bool   // grep hit the 50-cap: the result set is disclosed as partial
+	Results   []boardSearchResult
+	ResultIdx int             // cursor in the results overlay
+	MatchIDs  map[string]bool // every match id (for card highlighting)
+	// ContentIDs are matches resolved OUTSIDE the loaded cards — a grep content
+	// hit, or a `show`-probe hit. They persist across a refresh (they were never a
+	// loaded-card match), which is what lets boardApplyModel drop a former
+	// client-match that has since scrolled out without dropping a real content hit.
+	ContentIDs map[string]bool
 }
 
 type boardState struct {
@@ -71,6 +78,10 @@ func cloneBoardState(source *boardState) *boardState {
 	for id, ok := range source.Search.MatchIDs {
 		clone.Search.MatchIDs[id] = ok
 	}
+	clone.Search.ContentIDs = make(map[string]bool, len(source.Search.ContentIDs))
+	for id, ok := range source.Search.ContentIDs {
+		clone.Search.ContentIDs[id] = ok
+	}
 	return &clone
 }
 
@@ -98,6 +109,43 @@ func boardApplyModel(state boardState, model boardModel) boardState {
 	} else if state.FocusedCol < 0 {
 		state.FocusedCol = 0
 	}
+	if state.Search.Active {
+		state = boardRecomputeSearchMatches(state)
+	}
+	return state
+}
+
+// boardRecomputeSearchMatches re-derives the CLIENT-SIDE (id/title) match set
+// against the freshly-loaded cards while PRESERVING grep-only hits (matches whose
+// id is not a loaded card). Without this, a background refresh left the highlight
+// set stale — pointing at cards that moved or vanished (P2.9). Pure and cheap.
+func boardRecomputeSearchMatches(state boardState) boardState {
+	if !state.Search.Active || state.Search.Query == "" {
+		return state
+	}
+	// Keep the CONTENT hits (grep / probe) — never former client-matches, which
+	// were only matches because their card was loaded and matched by title/id.
+	kept := make([]boardSearchResult, 0, len(state.Search.Results))
+	for _, result := range state.Search.Results {
+		if state.Search.ContentIDs[result.ID] {
+			kept = append(kept, result)
+		}
+	}
+	client := boardClientSearch(boardState{Model: state.Model}, state.Search.Query).Search
+	merged := append([]boardSearchResult(nil), client.Results...)
+	matchIDs := map[string]bool{}
+	for _, result := range client.Results {
+		matchIDs[result.ID] = true
+	}
+	for _, result := range kept {
+		if !matchIDs[result.ID] {
+			matchIDs[result.ID] = true
+			merged = append(merged, result)
+		}
+	}
+	state.Search.Results = merged
+	state.Search.MatchIDs = matchIDs
+	state.Search.ResultIdx = clampIndex(state.Search.ResultIdx, len(merged))
 	return state
 }
 
@@ -202,23 +250,21 @@ func boardSelectedCardID(state boardState) string {
 	return column.Cards[row].ID
 }
 
-// boardIDShaped reports whether a search query must be resolved CLIENT-SIDE
-// rather than sent to grep. Any query carrying a hyphen is id-shaped: the hyphen
-// is an FTS-syntax hazard (E_QUERY_INVALID), so a hyphenated selector like
-// AIRA-247 or FEE-BL-12 must never reach grep (spec §10). A bare number is an id
-// fragment too.
+// boardIDShaped reports whether a query is a genuine ticket id (or id fragment)
+// to resolve against loaded rows / `show`, rather than a content phrase for grep.
+//
+// It matches a bare number (247) or a prefixed id — AIRA-247, FEE-BL-12, STON-5:
+// one or more letter-led segments joined by hyphens, ending in "-<digits>". It
+// deliberately does NOT treat EVERY hyphen as id-shaped — a hyphenated CONTENT
+// word (in-progress, no-TTY, cgroup-kill) must reach grep, or the board would
+// fabricate "no matches" for it (P1.4). The old hyphen→FTS-hazard guard is dead:
+// boardGrepPhrase quotes every query as a phrase and store.Search passes it to
+// FTS `MATCH ?` unpreprocessed (search.go:196-200), so a hyphen no longer breaks it.
 func boardIDShaped(query string) bool {
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return false
-	}
-	if strings.ContainsRune(query, '-') {
-		return true
-	}
-	return boardAllDigits.MatchString(query)
+	return boardIDPattern.MatchString(strings.TrimSpace(query))
 }
 
-var boardAllDigits = regexp.MustCompile(`^[0-9]+$`)
+var boardIDPattern = regexp.MustCompile(`^([0-9]+|[A-Za-z][A-Za-z0-9]*(-[A-Za-z][A-Za-z0-9]*)*-[0-9]+)$`)
 
 // boardGrepPhrase quotes the query as a single FTS phrase, doubling embedded
 // quotes, so a query with FTS operators or punctuation is matched literally
@@ -246,7 +292,7 @@ func boardClientSearch(state boardState, query string) boardState {
 			}
 		}
 	}
-	state.Search = boardSearchState{Active: true, Query: query, Results: results, MatchIDs: seen}
+	state.Search = boardSearchState{Active: true, Query: query, Results: results, MatchIDs: seen, ContentIDs: map[string]bool{}}
 	return state
 }
 
@@ -267,12 +313,20 @@ func boardFinalizeState(state boardState) boardState {
 // results" (spec §10). Otherwise the rows are deduped into the client matches.
 func boardMergeGrep(state boardState, fetch boardSearchFetch) boardState {
 	state.Search.Pending = false
+	state.Search.Truncated = fetch.Truncated
 	if state.Search.MatchIDs == nil {
 		state.Search.MatchIDs = map[string]bool{}
 	}
+	if state.Search.ContentIDs == nil {
+		state.Search.ContentIDs = map[string]bool{}
+	}
 	for _, row := range fetch.Rows {
 		id := textCell(row["id"])
-		if id == "" || state.Search.MatchIDs[id] {
+		if id == "" {
+			continue
+		}
+		state.Search.ContentIDs[id] = true // a grep content hit, persists across refresh
+		if state.Search.MatchIDs[id] {
 			continue
 		}
 		state.Search.MatchIDs[id] = true
@@ -291,6 +345,36 @@ func boardMergeGrep(state boardState, fetch boardSearchFetch) boardState {
 	return boardFinalizeState(state)
 }
 
+// onBoardGetResult resolves an id-shaped query that matched no loaded card by a
+// `show` probe (P2.5): a found ticket becomes an openable result; a genuine
+// E_NOT_FOUND is an honest "not found" state, never conflated with "no matches"
+// (the ticket could have been in a truncated column tail).
+func onBoardGetResult(state tuiState, fetch boardGetFetch) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if state.Board == nil || !state.Board.Search.Active || state.Board.Search.Query != fetch.Query {
+		return state, nil
+	}
+	search := &state.Board.Search
+	search.Pending = false
+	if !fetch.Found {
+		search.State = "not-found"
+		return state, nil
+	}
+	if search.MatchIDs == nil {
+		search.MatchIDs = map[string]bool{}
+	}
+	if search.ContentIDs == nil {
+		search.ContentIDs = map[string]bool{}
+	}
+	search.ContentIDs[fetch.Query] = true // a probe-resolved id, persists across refresh
+	if !search.MatchIDs[fetch.Query] {
+		search.MatchIDs[fetch.Query] = true
+		search.Results = append(search.Results, boardSearchResult{ID: fetch.Query, Snippet: boardEscapeTruncate(fetch.Title)})
+	}
+	*state.Board = boardFinalizeState(*state.Board)
+	return state, nil
+}
+
 // boardSearchLabel renders the honest result state, never conflating an
 // unevaluated search with an empty one.
 func boardSearchLabel(search boardSearchState) string {
@@ -306,7 +390,15 @@ func boardSearchLabel(search boardSearchState) string {
 	if search.State == "no-matches" {
 		return "no matches"
 	}
-	return strconv.Itoa(len(search.Results)) + " match" + plural(len(search.Results))
+	if search.State == "not-found" {
+		return "not found"
+	}
+	label := strconv.Itoa(len(search.Results)) + " match" + plural(len(search.Results))
+	if search.Truncated {
+		// grep hit the 50-cap: disclose that the count is a floor, not the total.
+		label = strconv.Itoa(len(search.Results)) + "+ matches (truncated)"
+	}
+	return label
 }
 
 func plural(n int) string {
@@ -377,10 +469,11 @@ func onBoardAction(state tuiState, action boardAction) (tuiState, []tuiCmd) {
 	return state, nil
 }
 
-// onBoardSearchSubmit resolves a query the three ways of spec §10. An id-shaped
-// query (any hyphen, or a bare number) is resolved CLIENT-SIDE only and never
-// sent to grep; any other query filters loaded rows client-side AND dispatches a
-// grep content search whose result is merged by onBoardSearchResult.
+// onBoardSearchSubmit resolves a query the three ways of spec §10:
+//   - id-shaped with a loaded match → client-side, done.
+//   - id-shaped with NO loaded match → a `show` probe (cmdBoardGet), so a ticket
+//     in a truncated column tail still resolves rather than reading "no matches".
+//   - content → client-side title/id filter AND a grep phrase search, merged.
 func onBoardSearchSubmit(state tuiState, query string) (tuiState, []tuiCmd) {
 	state = cloneTUIState(state)
 	if state.Board == nil {
@@ -392,11 +485,86 @@ func onBoardSearchSubmit(state tuiState, query string) (tuiState, []tuiCmd) {
 	}
 	*state.Board = boardClientSearch(*state.Board, query)
 	if boardIDShaped(query) {
-		*state.Board = boardFinalizeState(*state.Board)
-		return state, nil
+		if len(state.Board.Search.Results) > 0 {
+			*state.Board = boardFinalizeState(*state.Board)
+			return state, nil
+		}
+		state.Board.Search.Pending = true
+		return state, []tuiCmd{{Kind: cmdBoardGet, Search: query}}
 	}
 	state.Board.Search.Pending = true
 	return state, []tuiCmd{{Kind: cmdBoardSearch, Search: query}}
+}
+
+// boardResultMove moves the results-overlay cursor, clamped.
+func boardResultMove(state boardState, delta int) boardState {
+	state.Search.ResultIdx = clampIndex(state.Search.ResultIdx+delta, len(state.Search.Results))
+	return state
+}
+
+// boardSelectedResultID is the id under the results-overlay cursor, or "".
+func boardSelectedResultID(state boardState) string {
+	idx := state.Search.ResultIdx
+	if idx < 0 || idx >= len(state.Search.Results) {
+		return ""
+	}
+	return state.Search.Results[idx].ID
+}
+
+// boardCardLoaded reports whether an id is a currently-loaded card (so opening it
+// is a jump-to-column, not a detail drill-in for an unloaded grep-only hit).
+func boardCardLoaded(state boardState, id string) bool {
+	for _, column := range state.Model.Columns {
+		for _, card := range column.Cards {
+			if card.ID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// boardJumpToCard focuses the column+row holding id and closes the search. Used
+// when a results-overlay selection is a loaded card.
+func boardJumpToCard(state boardState, id string) boardState {
+	for ci, column := range state.Model.Columns {
+		for ri, card := range column.Cards {
+			if card.ID == id {
+				state.FocusedCol = ci
+				if len(state.Selected) != len(state.Model.Columns) {
+					next := make([]int, len(state.Model.Columns))
+					copy(next, state.Selected)
+					state.Selected = next
+				}
+				state.Selected[ci] = ri
+				state.Search = boardSearchState{MatchIDs: map[string]bool{}}
+				return state
+			}
+		}
+	}
+	return state
+}
+
+// onBoardResultOpen opens the selected result: a LOADED card is jumped to; an
+// unloaded id (a grep-only content hit in a truncated column, or a probed id) is
+// opened as a detail drill-in via the same fetchTicketDetail path (P2.7).
+func onBoardResultOpen(state tuiState) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if state.Board == nil {
+		return state, nil
+	}
+	id := boardSelectedResultID(*state.Board)
+	if id == "" {
+		return state, nil
+	}
+	if boardCardLoaded(*state.Board, id) {
+		*state.Board = boardJumpToCard(*state.Board, id)
+		return state, nil
+	}
+	state.Board.DrillID = id
+	state.Board.Detail = "loading…"
+	panel := state.Panels[viewBoard]
+	return state, []tuiCmd{{Kind: cmdFetch, View: viewBoard, Generation: panel.Generation, DetailID: id}}
 }
 
 // onBoardSearchOpen opens the search overlay with a clean slate.

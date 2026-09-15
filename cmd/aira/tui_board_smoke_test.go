@@ -55,19 +55,50 @@ func (boardSmokeDispatcher) Dispatch(ctx context.Context, _ daemon.WorktreeScope
 	return core.Response{OK: true, Code: "OK", RawData: json.RawMessage(raw)}
 }
 
+// resizeBoardScreen resizes the simulation screen AFTER app.Run()'s Init() reset
+// it to 80x25, then forces a redraw on the UI goroutine so the width seam relays
+// out at the true size (tcell's SetSize posts no resize event, and Init hard-sets
+// 80x25 — so a pre-Run SetSize never takes; P2.12).
+func resizeBoardScreen(t *testing.T, runtime *tuiRuntime, screen tcell.SimulationScreen, w, h int) {
+	t.Helper()
+	done := make(chan struct{})
+	go runtime.app.QueueUpdateDraw(func() { screen.SetSize(w, h); close(done) })
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resize deadlocked")
+	}
+	time.Sleep(30 * time.Millisecond) // let the resize-driven relayout settle
+}
+
+func boardStripWindow(t *testing.T, runtime *tuiRuntime) (int, int) {
+	t.Helper()
+	result := make(chan [2]int, 1)
+	go runtime.app.QueueUpdate(func() { result <- [2]int{runtime.boardUI.lastStart, runtime.boardUI.lastEnd} })
+	select {
+	case window := <-result:
+		return window[0], window[1]
+	case <-time.After(time.Second):
+		t.Fatal("reading strip window deadlocked")
+		return 0, 0
+	}
+}
+
 func TestBoardSmokeRendersBadgesAndDrillIn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
-	screen.SetSize(120, 40)
 	runtime := newBoardRuntime(ctx, boardSmokeDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
-	// AIRA-3's short "[x]" title fits any column width and verifies tview.Escape
-	// reaches the screen literally (the long-title clip is not what we assert).
-	text := waitForSimulationText(t, runtime, screen, "AIRA-1")
-	for _, needle := range []string{"⏸", "⛔", "●", "[x]", "lease AIRA-9", "planned"} {
+	// Wait for the app to be live at the Init 80x25, then widen so the seven
+	// columns are each wide enough to show a full card line (id + sev + badges +
+	// kind + the escaped title), making the [x] escape verifiable on screen.
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	resizeBoardScreen(t, runtime, screen, 220, 40)
+	text := waitForSimulationText(t, runtime, screen, "[x]")
+	for _, needle := range []string{"⏸", "⛔", "●", "[x]", "bug", "lease AIRA-9", "planned"} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("board render missing %q:\n%s", needle, text)
 		}
@@ -100,13 +131,18 @@ func TestBoardSmokeHorizontalScroll(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
-	screen.SetSize(40, 30)
 	runtime := newBoardRuntime(ctx, boardSmokeDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
-	// planned (column 1) is in the initial [0,2) window; AIRA-50 (done, column 4)
-	// is NOT yet on screen.
+	// Init reset the screen to 80x25; resize to a TRUE 40 columns so the seam is
+	// exercised at 40 (fit=2), not 80 (fit=4).
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	resizeBoardScreen(t, runtime, screen, 40, 30)
+	if start, end := boardStripWindow(t, runtime); start != 0 || end != 2 {
+		t.Fatalf("at 40 columns the visible window = [%d,%d), want [0,2) (fit=2)", start, end)
+	}
+	// planned (column 1) is in the [0,2) window; AIRA-50 (done, column 4) is not.
 	initial := waitForSimulationText(t, runtime, screen, "AIRA-1")
 	if strings.Contains(initial, "AIRA-50") {
 		t.Fatalf("done column should not fit at 40 columns initially:\n%s", initial)
@@ -137,11 +173,11 @@ func TestBoardSearchOverlayUnevaluated(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
-	screen.SetSize(160, 40)
 	runtime := newBoardRuntime(ctx, boardSearchDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	resizeBoardScreen(t, runtime, screen, 120, 40) // the results overlay is 90 wide
 
 	screen.InjectKey(tcell.KeyRune, '/', tcell.ModNone)
 	time.Sleep(20 * time.Millisecond)
@@ -158,6 +194,61 @@ func TestBoardSearchOverlayUnevaluated(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("board search smoke did not quit")
 	}
+}
+
+// TestBoardSearchResultsJump drives the headline search UX (spec §10, P2.7): `/`
+// → a content query → the results overlay lists the match → Enter jumps to the
+// card. The stub returns a grep hit for AIRA-2 (a loaded planned card).
+func TestBoardSearchResultsJump(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	runtime := newBoardRuntime(ctx, boardResultsDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	resizeBoardScreen(t, runtime, screen, 120, 40)
+
+	screen.InjectKey(tcell.KeyRune, '/', tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	for _, ch := range "prereq" {
+		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // submit → results overlay
+	waitForSimulationText(t, runtime, screen, "Search results")
+	if text := simulationTextOnUI(t, runtime, screen); !strings.Contains(text, "AIRA-2") {
+		t.Fatalf("results overlay did not list the AIRA-2 match:\n%s", text)
+	}
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // open → jump to AIRA-2's column
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		focus := make(chan int, 1)
+		go runtime.app.QueueUpdate(func() { focus <- runtime.state.Board.FocusedCol })
+		if <-focus == 1 { // planned column
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	focus := make(chan int, 1)
+	go runtime.app.QueueUpdate(func() { focus <- runtime.state.Board.FocusedCol })
+	if got := <-focus; got != 1 {
+		t.Fatalf("Enter on a loaded result did not jump to its column: focus=%d", got)
+	}
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("board results smoke did not quit")
+	}
+}
+
+type boardResultsDispatcher struct{ boardSmokeDispatcher }
+
+func (d boardResultsDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	if request.Verb == "grep" {
+		return core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{"total":1,"rows":[{"id":"AIRA-2","snippet":"…prereq…"}]}`)}
+	}
+	return d.boardSmokeDispatcher.Dispatch(ctx, scope, request)
 }
 
 type boardSearchDispatcher struct{ boardSmokeDispatcher }

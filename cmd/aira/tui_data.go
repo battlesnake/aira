@@ -173,10 +173,20 @@ func fetchBoardData(ctx context.Context, dispatcher Dispatcher, scope daemon.Wor
 			Status: status, Total: env.Total, Truncated: env.Truncated, Rows: env.Rows, Code: code,
 		})
 	}
-	var readyWarnings []string
-	data.ReadyCode, readyWarnings = dispatchTUIDataWithWarnings(ctx, dispatcher, scope,
-		core.Request{Verb: "ready", Args: map[string]any{}}, &data.Ready)
-	collect(readyWarnings)
+	// Dispatch ready directly (not via the decode helper) so the ENVELOPE verdict
+	// code survives: the no-selector ready overlay can arrive OK:true with response
+	// Code "UNEVALUATED" (core.go:619), which decodeTUIResponse flattens to "". A
+	// wholly-unevaluated overlay must not let an absent workable card read "ready".
+	if ctx.Err() != nil {
+		data.ReadyCode = "E_TUI_CANCELLED"
+	} else {
+		readyResponse := dispatcher.Dispatch(ctx, scope, core.Request{Verb: "ready", Args: map[string]any{}})
+		data.ReadyCode = decodeTUIResponse(readyResponse, &data.Ready)
+		if readyResponse.Code == "UNEVALUATED" {
+			data.ReadyUnevaluated = true
+		}
+		collect(readyResponse.Warnings)
+	}
 
 	var leases struct {
 		Total int                  `json:"total"`
@@ -206,6 +216,7 @@ type boardSearchFetch struct {
 	Rows        []map[string]any
 	Code        string
 	Unevaluated bool
+	Truncated   bool // grep hit the 50-cap (P2.6): the result set is partial
 }
 
 func fetchBoardSearch(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, query string) boardSearchFetch {
@@ -214,11 +225,33 @@ func fetchBoardSearch(ctx context.Context, dispatcher Dispatcher, scope daemon.W
 		Total       int              `json:"total"`
 		Rows        []map[string]any `json:"rows"`
 		Unevaluated bool             `json:"unevaluated"`
+		Truncated   bool             `json:"truncated"`
 	}
 	fetch.Code = dispatchTUIData(ctx, dispatcher, scope,
 		core.Request{Verb: "grep", Args: map[string]any{"query": boardGrepPhrase(query), "kind": "ticket"}}, &env)
 	fetch.Rows = env.Rows
 	fetch.Unevaluated = env.Unevaluated
+	fetch.Truncated = env.Truncated
+	return fetch
+}
+
+// boardGetFetch is the reply to an id-shaped query's `show` existence probe
+// (P2.5). Found distinguishes a resolvable ticket (open it) from a genuine
+// E_NOT_FOUND (honest "not found") — never conflated with grep's "no matches".
+type boardGetFetch struct {
+	Query string
+	Found bool
+	Title string
+}
+
+func fetchBoardGet(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, id string) boardGetFetch {
+	fetch := boardGetFetch{Query: id}
+	var row map[string]any
+	if code := dispatchTUIData(ctx, dispatcher, scope,
+		core.Request{Verb: "show", Args: map[string]any{"selector": id}}, &row); code == "" && row != nil {
+		fetch.Found = true
+		fetch.Title = textCell(row["title"])
+	}
 	return fetch
 }
 

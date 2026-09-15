@@ -52,13 +52,18 @@ type boardColumnFetch struct {
 // collapse to one banner on a shared transport failure yet surface a per-section
 // error otherwise.
 type boardData struct {
-	Columns     []boardColumnFetch
-	Ready       listEnvelope
-	ReadyCode   string
-	Leases      []store.HeldLeaseRow
-	LeaseCode   string
-	Confine     *runner.ConfineListResult
-	ConfineCode string
+	Columns   []boardColumnFetch
+	Ready     listEnvelope
+	ReadyCode string
+	// ReadyUnevaluated is the ENVELOPE-level unevaluated verdict of the no-selector
+	// `ready` read (OK:true, response Code "UNEVALUATED", core.go:619) — which the
+	// plain decoder flattens to "". When set, the whole ready overlay is
+	// unevaluated, so an absent workable card cannot be read as "not ready" (§7).
+	ReadyUnevaluated bool
+	Leases           []store.HeldLeaseRow
+	LeaseCode        string
+	Confine          *runner.ConfineListResult
+	ConfineCode      string
 	// Warnings is the deduped union of every read's Response.Warnings (e.g.
 	// W_STALE_INDEX). It is a board-level banner, not a per-card marker, because
 	// TicketRecord.Warnings is json:"-" and the warning rides the envelope (§5).
@@ -135,16 +140,20 @@ func boardEscapeTruncate(text string) string {
 	return tview.Escape(text)
 }
 
-// boardReadySets returns two id sets from the no-selector `ready` reply, both
+// boardReadySets returns three id sets from the no-selector `ready` reply, all
 // SKIPPING id-less finding rows ({path, ready:false}, core.go:3025-3026):
 //
 //   - present: every id the ready scan returned (any ready value). Absence from
-//     this set is what a truncated scan cannot distinguish from "cut past the
-//     50-cap", which is why absence + truncation is UNEVALUATED, not "not ready".
+//     this set is what a truncated/unevaluated scan cannot distinguish from "cut
+//     past the 50-cap", which is why absence + readyUnknown is UNEVALUATED.
 //   - ready: the ids whose row carried ready==true.
-func boardReadySets(env listEnvelope) (present, ready map[string]bool) {
+//   - unevaluated: the ids present with a per-row verdict=="unevaluated"
+//     (relation_ready.go:537-542 — e.g. an unevaluated relation-graph finding
+//     stamps a row). Present-but-unevaluated is NOT "not ready": it is "? ready".
+func boardReadySets(env listEnvelope) (present, ready, unevaluated map[string]bool) {
 	present = make(map[string]bool)
 	ready = make(map[string]bool)
+	unevaluated = make(map[string]bool)
 	for _, row := range env.Rows {
 		id := textCell(row["id"])
 		if id == "" {
@@ -154,8 +163,11 @@ func boardReadySets(env listEnvelope) (present, ready map[string]bool) {
 		if value, ok := row["ready"].(bool); ok && value {
 			ready[id] = true
 		}
+		if textCell(row["verdict"]) == "unevaluated" {
+			unevaluated[id] = true
+		}
 	}
-	return present, ready
+	return present, ready, unevaluated
 }
 
 type boardBlocksEdge struct {
@@ -196,11 +208,13 @@ func boardBlocksEdges(data boardData) (edges []boardBlocksEdge, statusByID map[s
 }
 
 // boardBlockedExact reports whether the blocked-by count can be exact: it can
-// iff no NON-TERMINAL column was truncated. When one was, an unloaded blocking
-// prerequisite could sit in its tail, so the count is unevaluated.
+// iff every NON-TERMINAL column loaded fully. A truncated non-terminal column
+// hides an unloaded blocker in its tail, and a FAILED one (Code != "", Rows=nil)
+// loaded nothing at all — so a real blocker whose From row lives in that column
+// would silently not count. Either makes the count unevaluated.
 func boardBlockedExact(data boardData) bool {
 	for _, column := range data.Columns {
-		if boardNonTerminalStatus(column.Status) && column.Truncated {
+		if boardNonTerminalStatus(column.Status) && (column.Truncated || column.Code != "") {
 			return false
 		}
 	}
@@ -245,13 +259,20 @@ func boardBlockedBadge(cardID, cardStatus string, exact bool, edges []boardBlock
 }
 
 // boardReadyBadgeFor is the honest ready badge (spec §7): positive-or-unevaluated,
-// never a fabricated negative.
-func boardReadyBadgeFor(cardID, cardStatus string, readyTruncated bool, present, ready map[string]bool) string {
+// never a fabricated negative. readyUnknown is true when the ready overlay as a
+// whole cannot be trusted for absence — it was truncated, its fetch failed, or
+// its envelope verdict was unevaluated.
+func boardReadyBadgeFor(cardID, cardStatus string, readyUnknown bool, present, ready, unevaluated map[string]bool) string {
 	if ready[cardID] {
 		return boardReadyBadge
 	}
-	if boardWorkable(cardStatus) && !present[cardID] && readyTruncated {
-		// Absent from a CUT ready scan: genuinely unknowable, not "not ready".
+	if unevaluated[cardID] {
+		// Present, but its own readiness could not be evaluated (e.g. an
+		// unevaluated relation-graph finding) — not "not ready".
+		return boardReadyUnevalBadge
+	}
+	if boardWorkable(cardStatus) && !present[cardID] && readyUnknown {
+		// Absent from a cut/failed/unevaluated ready scan: genuinely unknowable.
 		return boardReadyUnevalBadge
 	}
 	return ""
@@ -261,7 +282,8 @@ func boardReadyBadgeFor(cardID, cardStatus string, readyTruncated bool, present,
 // honest badges, the sessions strip, and the staleness warnings.
 func buildBoardModel(data boardData) boardModel {
 	model := boardModel{}
-	present, ready := boardReadySets(data.Ready)
+	present, ready, unevaluated := boardReadySets(data.Ready)
+	readyUnknown := data.Ready.Truncated || data.ReadyCode != "" || data.ReadyUnevaluated
 	edges, statusByID := boardBlocksEdges(data)
 	exact := boardBlockedExact(data)
 
@@ -290,7 +312,7 @@ func buildBoardModel(data boardData) boardModel {
 				Status:   status,
 				Hold:     hold,
 			}
-			card.ReadyBadge = boardReadyBadgeFor(id, status, data.Ready.Truncated, present, ready)
+			card.ReadyBadge = boardReadyBadgeFor(id, status, readyUnknown, present, ready, unevaluated)
 			card.BlockedBadge = boardBlockedBadge(id, status, exact, edges, statusByID)
 			column.Cards = append(column.Cards, card)
 		}
@@ -308,32 +330,53 @@ func buildBoardModel(data boardData) boardModel {
 func boardSessionRows(data boardData) []boardSessionRow {
 	ticketByWorktree := map[string]string{}
 	rows := make([]boardSessionRow, 0)
-	for _, lease := range data.Leases {
-		if lease.WorktreeID != "" && lease.TicketID != "" {
-			ticketByWorktree[lease.WorktreeID] = lease.TicketID
+
+	// Leases. A failed lease read is UNEVALUATED, never silently absent.
+	if data.LeaseCode != "" {
+		rows = append(rows, boardSessionRow{Style: "unevaluated", Text: "leases unevaluated (ERROR " + data.LeaseCode + ")"})
+	} else {
+		for _, lease := range data.Leases {
+			if lease.WorktreeID != "" && lease.TicketID != "" {
+				ticketByWorktree[lease.WorktreeID] = lease.TicketID
+			}
+			style := ""
+			state := "held"
+			switch {
+			case lease.AgeNote == "stale (prior boot)":
+				style, state = "stale", "STALE"
+			case lease.Expired:
+				style, state = "expired", "EXPIRED"
+			}
+			actor := lease.Actor
+			if actor == "" {
+				actor = "aira"
+			}
+			age := lease.AgeNote
+			if age == "" {
+				age = "unevaluated"
+			}
+			rows = append(rows, boardSessionRow{
+				Style: style,
+				Text:  "lease " + lease.TicketID + " · " + state + " · " + tview.Escape(actor) + " · " + age,
+			})
 		}
-		style := ""
-		state := "held"
-		switch {
-		case lease.AgeNote == "stale (prior boot)":
-			style, state = "stale", "STALE"
-		case lease.Expired:
-			style, state = "expired", "EXPIRED"
-		}
-		actor := lease.Actor
-		if actor == "" {
-			actor = "aira"
-		}
-		age := lease.AgeNote
-		if age == "" {
-			age = "unevaluated"
-		}
-		rows = append(rows, boardSessionRow{
-			Style: style,
-			Text:  "lease " + lease.TicketID + " · " + state + " · " + tview.Escape(actor) + " · " + age,
-		})
 	}
-	if data.Confine != nil && data.Confine.Verdict != "unevaluated" {
+
+	// Running jobs. A failed fetch OR an unevaluated confine verdict is
+	// UNEVALUATED, never silently absent (the dispatcher returns the unevaluated
+	// verdict OK:true, so ConfineCode is "" for it — check the verdict too).
+	switch {
+	case data.ConfineCode != "":
+		rows = append(rows, boardSessionRow{Style: "unevaluated", Text: "jobs unevaluated (ERROR " + data.ConfineCode + ")"})
+	case data.Confine != nil && data.Confine.Verdict == "unevaluated":
+		reason := strings.TrimSpace(data.Confine.Reason)
+		if reason == "" {
+			reason = "the daemon could not enumerate the slice"
+		}
+		rows = append(rows, boardSessionRow{Style: "unevaluated", Text: "jobs unevaluated: " + tview.Escape(reason)})
+	case data.Confine == nil:
+		rows = append(rows, boardSessionRow{Style: "unevaluated", Text: "jobs unevaluated"})
+	default:
 		for _, record := range data.Confine.Scopes {
 			owner := record.Owner
 			ticket := "ticket unknown"
@@ -350,6 +393,10 @@ func boardSessionRows(data boardData) []boardSessionRow {
 			})
 		}
 	}
+
+	// The first-class empty state is ONLY for all-sections-succeeded-and-empty; a
+	// board with any unevaluated section already carries a row above, so it can
+	// never read "no active claims" over an unknown one.
 	if len(rows) == 0 {
 		rows = append(rows, boardSessionRow{Text: "no active claims"})
 	}
@@ -390,6 +437,11 @@ func boardCardLine(card boardCard) string {
 	}
 	if len(badges) > 0 {
 		line += " " + strings.Join(badges, " ")
+	}
+	// Kind sits after the badges (which stay at a fixed early position, visible
+	// even in a narrow column) and before the title (spec §7 lists kind on a card).
+	if card.Kind != "" {
+		line += "  " + card.Kind
 	}
 	if card.Title != "" {
 		line += "  " + card.Title

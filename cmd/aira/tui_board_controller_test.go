@@ -107,14 +107,16 @@ func TestBoardApplyErrorKeepsLastGood(t *testing.T) {
 }
 
 func TestBoardIDShaped(t *testing.T) {
-	for _, q := range []string{"AIRA-247", "247", "FEE-BL-12", "aira-1"} {
+	for _, q := range []string{"AIRA-247", "247", "FEE-BL-12", "aira-1", "STON-5"} {
 		if !boardIDShaped(q) {
-			t.Fatalf("%q should be id-shaped (must not reach grep)", q)
+			t.Fatalf("%q should be id-shaped (resolved client-side / via show)", q)
 		}
 	}
-	for _, q := range []string{"parser", "fix the bug", "review"} {
+	// P1.4: hyphenated CONTENT words must NOT be id-shaped, or they never reach
+	// grep and the board fabricates "no matches" for them.
+	for _, q := range []string{"parser", "fix the bug", "review", "in-progress", "no-TTY", "cgroup-kill", "AIRA", "blocked-by"} {
 		if boardIDShaped(q) {
-			t.Fatalf("%q should NOT be id-shaped", q)
+			t.Fatalf("%q should NOT be id-shaped (it is content and must reach grep)", q)
 		}
 	}
 }
@@ -249,4 +251,122 @@ func TestBoardActionBackClearsDrillThenSearch(t *testing.T) {
 func boardApplyModelPtr(model boardModel) *boardState {
 	bs := boardApplyModel(*newBoardState(), model)
 	return &bs
+}
+
+// TestBoardSearchIDNoMatchProbesGet is P2.5: an id-shaped query with no loaded
+// match dispatches a `show` probe rather than reporting "no matches".
+func TestBoardSearchIDNoMatchProbesGet(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}}}}
+	state, commands := onBoardSearchSubmit(boardTUIState(boardApplyModelPtr(model)), "AIRA-999")
+	found := false
+	for _, command := range commands {
+		if command.Kind == cmdBoardGet && command.Search == "AIRA-999" {
+			found = true
+		}
+		if command.Kind == cmdBoardSearch {
+			t.Fatalf("id-shaped query dispatched grep instead of a show probe")
+		}
+	}
+	if !found {
+		t.Fatalf("id-shaped no-match query did not probe `show`: %#v", commands)
+	}
+	if !state.Board.Search.Pending {
+		t.Fatalf("get probe not marked pending")
+	}
+}
+
+// TestBoardGetResultFoundAndNotFound is P2.5's honest resolution: found → an
+// openable result + "ok"; genuine E_NOT_FOUND → "not found", never "no matches".
+func TestBoardGetResultFoundAndNotFound(t *testing.T) {
+	base := func() tuiState {
+		bs := newBoardState()
+		bs.Search = boardSearchState{Active: true, Query: "AIRA-999", Pending: true, MatchIDs: map[string]bool{}}
+		return boardTUIState(bs)
+	}
+	found, _ := onBoardGetResult(base(), boardGetFetch{Query: "AIRA-999", Found: true, Title: "deep in the tail"})
+	if len(found.Board.Search.Results) != 1 || found.Board.Search.Results[0].ID != "AIRA-999" {
+		t.Fatalf("found probe did not add an openable result: %#v", found.Board.Search.Results)
+	}
+	if boardSearchLabel(found.Board.Search) == "no matches" || boardSearchLabel(found.Board.Search) == "not found" {
+		t.Fatalf("found probe label = %q, want a match count", boardSearchLabel(found.Board.Search))
+	}
+	notFound, _ := onBoardGetResult(base(), boardGetFetch{Query: "AIRA-999", Found: false})
+	if got := boardSearchLabel(notFound.Board.Search); got != "not found" {
+		t.Fatalf("not-found probe label = %q, want 'not found' (never 'no matches')", got)
+	}
+}
+
+// TestBoardSearchTruncatedDisclosed is P2.6: a grep that hit the 50-cap discloses
+// the count is a floor, not the complete total.
+func TestBoardSearchTruncatedDisclosed(t *testing.T) {
+	base := boardState{Search: boardSearchState{Active: true, Query: "the", MatchIDs: map[string]bool{}}}
+	merged := boardMergeGrep(base, boardSearchFetch{Query: "the", Truncated: true, Rows: []map[string]any{{"id": "AIRA-1", "snippet": "s"}}})
+	if label := boardSearchLabel(merged.Search); !strings.Contains(label, "truncated") {
+		t.Fatalf("truncated grep label = %q, want a truncation disclosure", label)
+	}
+}
+
+// TestBoardResultOpenJumpsOrDrills is P2.7: opening a LOADED result jumps to its
+// card (focus + selection, search cleared); opening an UNLOADED result drills in
+// via a detail fetch.
+func TestBoardResultOpenJumpsOrDrills(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{
+		{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}},
+		{Status: "in-progress", Cards: []boardCard{{ID: "AIRA-2", Title: "two"}}},
+	}}
+	// Loaded result → jump.
+	bs := boardApplyModelPtr(model)
+	bs.Search = boardSearchState{Active: true, Query: "x", Results: []boardSearchResult{{ID: "AIRA-2"}}, MatchIDs: map[string]bool{"AIRA-2": true}}
+	jumped, commands := onBoardResultOpen(boardTUIState(bs))
+	if jumped.Board.FocusedCol != 1 || jumped.Board.Selected[1] != 0 {
+		t.Fatalf("jump did not focus AIRA-2's column/row: col=%d sel=%v", jumped.Board.FocusedCol, jumped.Board.Selected)
+	}
+	if jumped.Board.Search.Active {
+		t.Fatalf("jump did not close the search")
+	}
+	for _, command := range commands {
+		if command.Kind == cmdFetch {
+			t.Fatalf("jump to a loaded card must not dispatch a detail fetch")
+		}
+	}
+	// Unloaded result (grep-only content hit) → drill-in.
+	bs2 := boardApplyModelPtr(model)
+	bs2.Search = boardSearchState{Active: true, Query: "x", Results: []boardSearchResult{{ID: "AIRA-777"}}, MatchIDs: map[string]bool{"AIRA-777": true}}
+	drilled, commands2 := onBoardResultOpen(boardTUIState(bs2))
+	if drilled.Board.DrillID != "AIRA-777" {
+		t.Fatalf("unloaded result did not drill in: DrillID=%q", drilled.Board.DrillID)
+	}
+	found := false
+	for _, command := range commands2 {
+		if command.Kind == cmdFetch && command.DetailID == "AIRA-777" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unloaded result did not dispatch a detail fetch: %#v", commands2)
+	}
+}
+
+// TestBoardApplyModelRecomputesSearch is P2.9: a background refresh re-derives the
+// client match set against the new cards while preserving grep-only hits.
+func TestBoardApplyModelRecomputesSearch(t *testing.T) {
+	bs := boardApplyModel(*newBoardState(), boardModel{Columns: []boardColumn{
+		{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "parser"}}},
+	}})
+	bs.Search = boardSearchState{Active: true, Query: "parser", MatchIDs: map[string]bool{"AIRA-1": true, "AIRA-9": true},
+		ContentIDs: map[string]bool{"AIRA-9": true}, // AIRA-9 is a grep-only content hit
+		Results:    []boardSearchResult{{ID: "AIRA-1", Snippet: "parser"}, {ID: "AIRA-9", Snippet: "grep-only"}}}
+	// Refresh: AIRA-1 gone, AIRA-2 "parser" arrives; the grep-only AIRA-9 persists.
+	refreshed := boardApplyModel(bs, boardModel{Columns: []boardColumn{
+		{Status: "planned", Cards: []boardCard{{ID: "AIRA-2", Title: "parser rewrite"}}},
+	}})
+	if refreshed.Search.MatchIDs["AIRA-1"] {
+		t.Fatalf("stale client match AIRA-1 survived a refresh")
+	}
+	if !refreshed.Search.MatchIDs["AIRA-2"] {
+		t.Fatalf("new client match AIRA-2 not recomputed on refresh")
+	}
+	if !refreshed.Search.MatchIDs["AIRA-9"] {
+		t.Fatalf("grep-only hit AIRA-9 was dropped on refresh")
+	}
 }

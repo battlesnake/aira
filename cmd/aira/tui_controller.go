@@ -183,6 +183,7 @@ const (
 	cmdPalette         // executor-only; never emitted by a controller transition
 	cmdExecuteDetached // executor-only; never emitted by a controller transition
 	cmdBoardSearch     // AIRA-252: dispatch a `grep` content search for the board
+	cmdBoardGet        // AIRA-252: dispatch a `show` probe to resolve an id-shaped query
 )
 
 // tuiCmd contains only values (Palette is executor-only). The executor

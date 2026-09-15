@@ -27,26 +27,29 @@ import (
 )
 
 const (
-	boardMainPage   = "board-main"
-	boardDetailPage = "board-detail"
-	boardSearchPage = "board-search"
+	boardMainPage    = "board-main"
+	boardDetailPage  = "board-detail"
+	boardSearchPage  = "board-search"
+	boardResultsPage = "board-results"
 )
 
 // boardWidgets is the kanban's whole widget set, held off the shared tuiRuntime
 // struct so the board layout is self-contained in this file.
 type boardWidgets struct {
-	columns   []*tview.Table
-	strip     *tview.Flex
-	banner    *tview.TextView
-	sessions  *tview.TextView
-	footer    *tview.TextView
-	detail    *tview.TextView
-	search    *tview.InputField
-	inputOpen bool
-	width     int
-	lastStart int
-	lastEnd   int
-	laidOut   bool
+	columns     []*tview.Table
+	strip       *tview.Flex
+	banner      *tview.TextView
+	sessions    *tview.TextView
+	footer      *tview.TextView
+	detail      *tview.TextView
+	search      *tview.InputField
+	results     *tview.List
+	inputOpen   bool
+	resultsOpen bool
+	width       int
+	lastStart   int
+	lastEnd     int
+	laidOut     bool
 }
 
 // runBoard is the `aira board` face. It is project-scoped (scope resolved by the
@@ -91,7 +94,11 @@ func (r *tuiRuntime) buildBoardWidgets() {
 			query := ui.search.GetText()
 			var commands []tuiCmd
 			r.state, commands = onBoardSearchSubmit(r.state, query)
-			r.closeBoardSearch()
+			r.boardUI.inputOpen = false
+			r.outerPages.HidePage(boardSearchPage)
+			// Move to the results overlay: matches are navigable and Enter opens
+			// each one — the headline search UX (spec §10).
+			r.boardUI.resultsOpen = true
 			r.render()
 			r.submitCommands(commands)
 		case tcell.KeyEscape:
@@ -100,6 +107,8 @@ func (r *tuiRuntime) buildBoardWidgets() {
 			r.render()
 		}
 	})
+	ui.results = tview.NewList().ShowSecondaryText(true)
+	ui.results.SetBorder(true).SetTitle(" Search results ")
 	r.boardUI = ui
 
 	main := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -110,6 +119,7 @@ func (r *tuiRuntime) buildBoardWidgets() {
 	r.outerPages = tview.NewPages().
 		AddPage(boardMainPage, main, true, true).
 		AddPage(boardDetailPage, centeredPrimitive(ui.detail, 100, 30), true, false).
+		AddPage(boardResultsPage, centeredPrimitive(ui.results, 90, 24), true, false).
 		AddPage(boardSearchPage, centeredPrimitive(ui.search, 70, 3), true, false)
 	r.app.SetRoot(r.outerPages, true)
 	r.app.SetInputCapture(r.captureBoardInput)
@@ -184,23 +194,61 @@ func (r *tuiRuntime) renderBoard() {
 	}
 	r.boardUI.sessions.SetTitle(" Sessions (" + strconv.Itoa(sessionCount) + ") ")
 	r.boardUI.footer.SetText(boardFooterText(bs))
-	if bs.DrillID != "" {
+
+	// Overlay precedence: detail drill-in > search input > results list. Exactly
+	// one may be visible, so hide the others every render to avoid a stale overlay.
+	detailShown := bs.DrillID != ""
+	resultsShown := !detailShown && !r.boardUI.inputOpen && r.boardUI.resultsOpen && bs.Search.Active
+	if detailShown {
 		r.boardUI.detail.SetTitle(" " + bs.DrillID + " (Esc to close) ")
 		r.boardUI.detail.SetText(bs.Detail)
 		r.outerPages.ShowPage(boardDetailPage)
 	} else {
 		r.outerPages.HidePage(boardDetailPage)
 	}
+	if resultsShown {
+		r.populateBoardResults(bs)
+		r.outerPages.ShowPage(boardResultsPage)
+	} else {
+		r.outerPages.HidePage(boardResultsPage)
+	}
+	if !r.boardUI.inputOpen {
+		r.outerPages.HidePage(boardSearchPage)
+	}
 	r.layoutBoardStrip()
 	switch {
 	case r.boardUI.inputOpen:
 		r.app.SetFocus(r.boardUI.search)
-	case bs.DrillID != "":
+	case detailShown:
 		r.app.SetFocus(r.boardUI.detail)
+	case resultsShown:
+		r.app.SetFocus(r.boardUI.results)
 	default:
 		if focus := bs.FocusedCol; focus >= 0 && focus < len(r.boardUI.columns) {
 			r.app.SetFocus(r.boardUI.columns[focus])
 		}
+	}
+}
+
+// populateBoardResults fills the results list from the merged match set and puts
+// the cursor on the reducer's ResultIdx (the reducer stays authoritative; the
+// list is a pure view). The title carries the honest result-state label.
+func (r *tuiRuntime) populateBoardResults(bs *boardState) {
+	r.boardUI.results.Clear()
+	title := " Search results "
+	if label := boardSearchLabel(bs.Search); label != "" {
+		title = " Search: " + label + " (Enter open · Esc close) "
+	}
+	r.boardUI.results.SetTitle(title)
+	for _, result := range bs.Search.Results {
+		secondary := result.Snippet
+		if !boardCardLoaded(*bs, result.ID) {
+			secondary = "(not in a loaded column) " + secondary
+		}
+		r.boardUI.results.AddItem(result.ID, secondary, 0, nil)
+	}
+	if idx := bs.Search.ResultIdx; idx >= 0 && idx < len(bs.Search.Results) {
+		r.boardUI.results.SetCurrentItem(idx)
 	}
 }
 
@@ -214,6 +262,35 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		}
 		return event // let the detail pane scroll
+	}
+	// Results overlay: the reducer's ResultIdx is authoritative, so every key is
+	// consumed here and the list is only a view (populated in render).
+	if r.boardUI != nil && r.boardUI.resultsOpen && r.state.Board != nil && r.state.Board.Search.Active {
+		switch {
+		case event.Key() == tcell.KeyRune && event.Rune() == 'q':
+			r.applyBoardAction(boardActQuit) // q quits globally, even from the overlay
+		case event.Key() == tcell.KeyEscape:
+			r.state, _ = onBoardAction(r.state, boardActBack) // clears the search
+			r.boardUI.resultsOpen = false
+			r.render()
+		case event.Key() == tcell.KeyEnter:
+			var commands []tuiCmd
+			r.state, commands = onBoardResultOpen(r.state)
+			if r.state.Board == nil || !r.state.Board.Search.Active {
+				r.boardUI.resultsOpen = false // a jump cleared the search
+			}
+			r.render()
+			r.submitCommands(commands)
+		case event.Key() == tcell.KeyUp || (event.Key() == tcell.KeyRune && event.Rune() == 'k'):
+			r.state = cloneTUIState(r.state)
+			*r.state.Board = boardResultMove(*r.state.Board, -1)
+			r.render()
+		case event.Key() == tcell.KeyDown || (event.Key() == tcell.KeyRune && event.Rune() == 'j'):
+			r.state = cloneTUIState(r.state)
+			*r.state.Board = boardResultMove(*r.state.Board, +1)
+			r.render()
+		}
+		return nil
 	}
 	action := boardActNone
 	switch event.Key() {
@@ -265,6 +342,7 @@ func (r *tuiRuntime) applyBoardAction(action boardAction) {
 func (r *tuiRuntime) openBoardSearch() {
 	r.state = onBoardSearchOpen(r.state)
 	r.boardUI.inputOpen = true
+	r.boardUI.resultsOpen = false
 	r.boardUI.search.SetText("")
 	r.outerPages.ShowPage(boardSearchPage)
 	r.app.SetFocus(r.boardUI.search)
@@ -273,6 +351,7 @@ func (r *tuiRuntime) openBoardSearch() {
 
 func (r *tuiRuntime) closeBoardSearch() {
 	r.boardUI.inputOpen = false
+	r.boardUI.resultsOpen = false
 	r.outerPages.HidePage(boardSearchPage)
 }
 
@@ -285,7 +364,12 @@ func boardBannerText(bs *boardState) string {
 	}
 	parts := make([]string, 0, 3)
 	if bs.Stale && bs.ErrorCode != "" {
-		parts = append(parts, "[red]daemon unreachable — showing last-good (ERROR "+bs.ErrorCode+")[-]")
+		if bs.HasData {
+			parts = append(parts, "[red]daemon unreachable — showing last-good (ERROR "+bs.ErrorCode+")[-]")
+		} else {
+			// No successful fetch yet: there is no last-good to show (P2.10).
+			parts = append(parts, "[red]board unavailable (ERROR "+bs.ErrorCode+")[-]")
+		}
 	}
 	if bs.WatchError != "" {
 		parts = append(parts, "[orange]live refresh unavailable (ERROR "+bs.WatchError+") — press r to refresh[-]")

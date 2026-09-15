@@ -103,15 +103,66 @@ func TestBoardReadyBadgeStates(t *testing.T) {
 // TestBoardReadySetsSkipIDlessRows guards the join against id-less finding rows
 // ({path, ready:false}) that the no-selector ready reply emits (core.go:3025).
 func TestBoardReadySetsSkipIDlessRows(t *testing.T) {
-	present, ready := boardReadySets(listEnvelope{Rows: []map[string]any{
+	present, ready, unevaluated := boardReadySets(listEnvelope{Rows: []map[string]any{
 		{"path": "tickets/x.md", "ready": false}, // id-less — must be skipped
 		{"id": "AIRA-7", "ready": true},
+		{"id": "AIRA-8", "ready": false, "verdict": "unevaluated"},
 	}})
-	if present[""] || ready[""] {
+	if present[""] || ready[""] || unevaluated[""] {
 		t.Fatalf("id-less finding row leaked an empty id into the ready sets")
 	}
 	if !present["AIRA-7"] || !ready["AIRA-7"] {
 		t.Fatalf("real ready row missing from the sets present=%v ready=%v", present, ready)
+	}
+	if !unevaluated["AIRA-8"] || ready["AIRA-8"] {
+		t.Fatalf("per-row unevaluated verdict not captured: unevaluated=%v", unevaluated)
+	}
+}
+
+// TestBoardReadyBadgeUnevaluatedStates is the P1.1 false-pass guard for the
+// section-unknown states Fable flagged: a workable card ABSENT from a ready scan
+// that FAILED (ReadyCode) or arrived envelope-UNEVALUATED → "? ready"; and a card
+// PRESENT whose per-row verdict is "unevaluated" → "? ready", never unbadged.
+func TestBoardReadyBadgeUnevaluatedStates(t *testing.T) {
+	// Ready fetch FAILED: absent workable card is unknowable, not "not ready".
+	failed := boardDataFrom(map[string]boardColumnFetch{
+		"planned": {Rows: []map[string]any{boardRow("AIRA-1", "planned", "P1", "one", false)}},
+	}, listEnvelope{})
+	failed.ReadyCode = "E_TUI_CANCELLED"
+	if got := findCard(t, buildBoardModel(failed), "AIRA-1").ReadyBadge; got != boardReadyUnevalBadge {
+		t.Fatalf("failed-ready absent workable card = %q, want %q", got, boardReadyUnevalBadge)
+	}
+
+	// Ready envelope UNEVALUATED: same.
+	envUneval := boardDataFrom(map[string]boardColumnFetch{
+		"planned": {Rows: []map[string]any{boardRow("AIRA-1", "planned", "P1", "one", false)}},
+	}, listEnvelope{})
+	envUneval.ReadyUnevaluated = true
+	if got := findCard(t, buildBoardModel(envUneval), "AIRA-1").ReadyBadge; got != boardReadyUnevalBadge {
+		t.Fatalf("envelope-unevaluated absent workable card = %q, want %q", got, boardReadyUnevalBadge)
+	}
+
+	// PRESENT but per-row verdict unevaluated (e.g. a relation-graph finding): the
+	// card's own readiness could not be evaluated → "? ready", never silently blank.
+	presentUneval := boardDataFrom(map[string]boardColumnFetch{
+		"planned": {Rows: []map[string]any{boardRow("AIRA-1", "planned", "P1", "one", false)}},
+	}, listEnvelope{Rows: []map[string]any{{"id": "AIRA-1", "ready": false, "verdict": "unevaluated"}}})
+	if got := findCard(t, buildBoardModel(presentUneval), "AIRA-1").ReadyBadge; got != boardReadyUnevalBadge {
+		t.Fatalf("present-but-unevaluated card = %q, want %q", got, boardReadyUnevalBadge)
+	}
+}
+
+// TestBoardBlockedUnevaluatedWhenNonTerminalColumnFailed is P1.2: a non-terminal
+// column whose fetch FAILED (Code!=", Rows=nil) loaded no rows, so a real blocker
+// whose From row lives there would silently not count. Must be ⛔?, not unblocked.
+func TestBoardBlockedUnevaluatedWhenNonTerminalColumnFailed(t *testing.T) {
+	data := boardDataFrom(map[string]boardColumnFetch{
+		// AIRA-250's blocker AIRA-240 lives in the FAILED planned column.
+		"in-progress": {Rows: []map[string]any{boardRow("AIRA-250", "in-progress", "P1", "blocked", false, blocksEdge("AIRA-240", "AIRA-250"))}},
+		"planned":     {Code: "E_TUI_CANCELLED"}, // failed fetch: Rows=nil, Truncated=false
+	}, listEnvelope{})
+	if got := findCard(t, buildBoardModel(data), "AIRA-250").BlockedBadge; got != boardBlockedUnevalGlyf {
+		t.Fatalf("blocked badge with a failed non-terminal column = %q, want %q", got, boardBlockedUnevalGlyf)
 	}
 }
 
@@ -198,11 +249,16 @@ func TestBoardTitleIsEscaped(t *testing.T) {
 // lease's ticket, and an unattested owner is "ticket unknown".
 func TestBoardSessionRowsHonesty(t *testing.T) {
 	yes := true
+	rss := int64(1 << 20)
+	age := int64(42)
 	data := boardData{
 		Leases: []store.HeldLeaseRow{{TicketID: "AIRA-9", WorktreeID: "wtattested", Actor: "opus", AgeNote: "2m ago"}},
 		Confine: &runner.ConfineListResult{Verdict: "ok", Scopes: []runner.ConfineRecord{
-			{Name: "job-attested", Owner: "wtattested", SupervisorLive: &yes, Command: nil},
-			{Name: "job-unknown", Owner: runner.ConfineUnknownOwner, SupervisorLive: &yes, Command: nil},
+			// RSS/Age NON-NIL so only the nil Command can produce the trailing
+			// "· unevaluated"; a non-escaping/blank impl then fails (P2.11 — the
+			// old test passed vacuously because RSS/Age also rendered "unevaluated").
+			{Name: "job-attested", Owner: "wtattested", SupervisorLive: &yes, RSSBytes: &rss, AgeSeconds: &age, Command: nil},
+			{Name: "job-unknown", Owner: runner.ConfineUnknownOwner, SupervisorLive: &yes, RSSBytes: &rss, AgeSeconds: &age, Command: nil},
 		}},
 	}
 	rows := boardSessionRows(data)
@@ -210,8 +266,8 @@ func TestBoardSessionRowsHonesty(t *testing.T) {
 	for _, row := range rows {
 		joined += row.Text + "\n"
 	}
-	if !strings.Contains(joined, "unevaluated") {
-		t.Fatalf("nil confine Command was not rendered unevaluated:\n%s", joined)
+	if !strings.Contains(joined, "· unevaluated\n") {
+		t.Fatalf("nil confine Command was not rendered as the trailing unevaluated segment:\n%s", joined)
 	}
 	if !strings.Contains(joined, "job-attested") || !strings.Contains(joined, "ticket AIRA-9") {
 		t.Fatalf("attested owner did not correlate to its lease ticket:\n%s", joined)
@@ -222,9 +278,44 @@ func TestBoardSessionRowsHonesty(t *testing.T) {
 }
 
 func TestBoardSessionRowsEmptyState(t *testing.T) {
-	rows := boardSessionRows(boardData{})
+	// Genuine empty ONLY when both sections succeeded (codes empty, confine present
+	// and evaluated with zero scopes).
+	rows := boardSessionRows(boardData{Confine: &runner.ConfineListResult{Verdict: "ok"}})
 	if len(rows) != 1 || rows[0].Text != "no active claims" {
 		t.Fatalf("empty sessions state = %#v, want the first-class 'no active claims' row", rows)
+	}
+}
+
+// TestBoardSessionRowsUnknownSections is P1.3: an unknown lease or job section
+// must surface an UNEVALUATED row and NEVER read "no active claims" over it.
+func TestBoardSessionRowsUnknownSections(t *testing.T) {
+	joinRows := func(rows []boardSessionRow) string {
+		out := ""
+		for _, row := range rows {
+			out += row.Text + "|" + row.Style + "\n"
+		}
+		return out
+	}
+
+	leaseFail := joinRows(boardSessionRows(boardData{LeaseCode: "E_TUI_CANCELLED", Confine: &runner.ConfineListResult{Verdict: "ok"}}))
+	if !strings.Contains(leaseFail, "leases unevaluated (ERROR E_TUI_CANCELLED)|unevaluated") || strings.Contains(leaseFail, "no active claims") {
+		t.Fatalf("failed lease read: %q", leaseFail)
+	}
+
+	confineFail := joinRows(boardSessionRows(boardData{ConfineCode: "E_TUI_CANCELLED"}))
+	if !strings.Contains(confineFail, "jobs unevaluated (ERROR E_TUI_CANCELLED)|unevaluated") || strings.Contains(confineFail, "no active claims") {
+		t.Fatalf("failed confine read: %q", confineFail)
+	}
+
+	confineUneval := joinRows(boardSessionRows(boardData{Confine: &runner.ConfineListResult{Verdict: "unevaluated", Reason: "daemon down"}}))
+	if !strings.Contains(confineUneval, "jobs unevaluated: daemon down|unevaluated") || strings.Contains(confineUneval, "no active claims") {
+		t.Fatalf("unevaluated confine verdict: %q", confineUneval)
+	}
+
+	// Confine nil with no code (defensive): still unevaluated, never empty-state.
+	confineNil := joinRows(boardSessionRows(boardData{}))
+	if !strings.Contains(confineNil, "jobs unevaluated") || strings.Contains(confineNil, "no active claims") {
+		t.Fatalf("nil confine without code: %q", confineNil)
 	}
 }
 
