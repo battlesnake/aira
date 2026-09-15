@@ -165,13 +165,15 @@ truncated), a colour-ranked severity tag (`P0` hottest), kind, and honest badges
 
 ## 8. Drill-in detail + relations
 
-`Enter` opens a detail pane (horizontal split, table weight 2 / detail weight 1 —
-the existing tickets pattern). It **reuses `fetchTicketDetail`** (`tui_data.go:125-140`:
-`show` + `ready selector` + `link list` + `find`), giving the full ticket, its
-authoritative readiness/blockers, and its relation neighbourhood. Grouping the
-relations by kind (Blocked by / Blocks / Parent / Children / Related / Duplicates /
-Supersedes / Resolves) is optional presentation polish over the `link` rows. `Esc`
-closes. All titles/snippets are `tview.Escape`-d.
+`Enter` opens a detail pane. **Implemented (Increment 1) as a centered overlay**,
+not the tickets tab's horizontal split: the kanban already fills the width with its
+seven-column strip, so an overlay is the cleaner drill-in for this layout and avoids
+permanently reserving a detail column. It **reuses `fetchTicketDetail`**
+(`tui_data.go`: `show` + `ready selector` + `link list` + `find`), giving the full
+ticket, its authoritative readiness/blockers, and its relation neighbourhood.
+Grouping the relations by kind (Blocked by / Blocks / Parent / Children / Related /
+Duplicates / Supersedes / Resolves) is optional presentation polish over the `link`
+rows. `Esc` closes. All titles/snippets are `tview.Escape`-d.
 
 ## 9. Sessions / activity strip
 
@@ -214,8 +216,14 @@ an `E_QUERY_INVALID` renders as **"search unevaluated: <code>"**, never "no
 results". A genuine empty match renders an explicit "no matches" state. Snippets
 contain literal `[term]` markers → `tview.Escape` before rendering.
 
-**Presentation:** matching cards highlighted, non-matches dimmed; a results overlay
-lists `id — snippet`; `Enter` jumps to the card / opens detail; `Esc` clears.
+**Presentation (implemented, Increment 1):** matching cards highlighted, non-matches
+dimmed; a navigable results overlay lists `id — snippet` (`↑/↓` move, `Enter` opens,
+`Esc` clears). `Enter` on a LOADED match jumps to its card; on an UNLOADED id (a
+grep-only content hit in a truncated column, or a `show`-probe-resolved id) it opens
+that ticket's detail drill-in. An id-shaped query with no loaded match falls back to
+a `show` probe: a resolvable ticket becomes an openable result, a genuine
+`E_NOT_FOUND` is an honest "not found" (never conflated with "no matches"). A grep
+that hit the 50-cap discloses the count as a floor ("N+ matches (truncated)").
 
 Increment-1 search is scoped to the focused project. In the Increment-2 overview,
 `/` filters the **project cards** by slug/prefix over loaded overview data (no
