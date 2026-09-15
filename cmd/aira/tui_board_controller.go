@@ -10,6 +10,7 @@ package main
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -33,10 +34,15 @@ type boardSearchState struct {
 }
 
 type boardState struct {
-	Model      boardModel
-	HasData    bool
-	Stale      bool
-	ErrorCode  string
+	Model     boardModel
+	HasData   bool
+	Stale     bool
+	ErrorCode string
+	// WatchError is the live-refresh (event-watch) failure, kept SEPARATE from
+	// Stale: a watch drop means "new mutations may not have arrived yet, press r",
+	// not "the shown data is last-good" — the reads themselves are still fresh. It
+	// therefore never marks columns stale, and is cleared on the next good batch.
+	WatchError string
 	FocusedCol int
 	Selected   []int
 	Search     boardSearchState
@@ -288,8 +294,8 @@ func boardMergeGrep(state boardState, fetch boardSearchFetch) boardState {
 // boardSearchLabel renders the honest result state, never conflating an
 // unevaluated search with an empty one.
 func boardSearchLabel(search boardSearchState) string {
-	if !search.Active {
-		return ""
+	if !search.Active || search.Query == "" {
+		return "" // open but nothing submitted yet — no fabricated "0 matches"
 	}
 	if search.Pending {
 		return "searching…"
@@ -300,7 +306,7 @@ func boardSearchLabel(search boardSearchState) string {
 	if search.State == "no-matches" {
 		return "no matches"
 	}
-	return itoa(len(search.Results)) + " match" + plural(len(search.Results))
+	return strconv.Itoa(len(search.Results)) + " match" + plural(len(search.Results))
 }
 
 func plural(n int) string {

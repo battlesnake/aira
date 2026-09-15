@@ -430,11 +430,12 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 	case msgEOF:
 		r.state, commands = onTUIEOF(r.state)
 	case msgWatchError:
-		// AIRA-252. The board owns no events panel; a watch error IS the
-		// daemon-unreachable signal, so it lands in the board's stale banner (one
-		// banner + last-good columns, spec §14) rather than a phantom viewEvents row.
+		// AIRA-252. The board owns no events panel; a watch error means live
+		// refresh dropped (press r), which is DISTINCT from the columns being
+		// stale/last-good, so it lands in its own board banner field (spec §14)
+		// rather than a phantom viewEvents row.
 		if r.state.Board != nil {
-			*r.state.Board = boardApplyError(*r.state.Board, message.Code)
+			r.state.Board.WatchError = message.Code
 		} else {
 			panel := r.state.Panels[viewEvents]
 			panel.Status, panel.ErrorCode = panelError, message.Code

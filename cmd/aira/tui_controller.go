@@ -636,6 +636,11 @@ func onTUIWatchBatch(state tuiState, events []store.WatchEvent, cursor int64, de
 	}
 	state.Cursor = cursor
 	state.ReconnectAttempt = 0
+	// AIRA-252. A good batch means the watch reconnected; clear the board's
+	// live-refresh-unavailable banner so it does not linger after recovery.
+	if state.Board != nil {
+		state.Board.WatchError = ""
+	}
 	affected := make(map[tuiView]bool)
 	for _, event := range events {
 		for _, view := range invalidatedViews(state, event.Verb, descriptors) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -17,7 +18,7 @@ func stateWithColumns(counts ...int) boardState {
 	for i, count := range counts {
 		column := boardColumn{Status: "planned"}
 		for c := 0; c < count; c++ {
-			column.Cards = append(column.Cards, boardCard{ID: "AIRA-" + itoa(i*100+c), Title: "card"})
+			column.Cards = append(column.Cards, boardCard{ID: "AIRA-" + strconv.Itoa(i*100+c), Title: "card"})
 		}
 		model.Columns = append(model.Columns, column)
 	}

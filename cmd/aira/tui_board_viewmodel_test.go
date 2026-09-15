@@ -228,6 +228,31 @@ func TestBoardSessionRowsEmptyState(t *testing.T) {
 	}
 }
 
+// TestBoardColumnTitleLifecycle is the fabricated-zero guard: before the first
+// fetch a column reads "loading…" (never "· 0"); a failed first fetch reads
+// "unevaluated (ERROR …)"; only real data shows a count.
+func TestBoardColumnTitleLifecycle(t *testing.T) {
+	if got := boardColumnTitle("draft", boardColumn{Status: "draft"}, false, false, ""); got != "draft · loading…" {
+		t.Fatalf("pre-fetch title = %q, want 'draft · loading…' (never a fabricated · 0)", got)
+	}
+	if got := boardColumnTitle("draft", boardColumn{Status: "draft"}, false, true, "E_DAEMON_UNREACHABLE"); !strings.Contains(got, "unevaluated") || strings.Contains(got, "· 0") {
+		t.Fatalf("first-fetch-failure title = %q, want 'unevaluated', never '· 0'", got)
+	}
+	if got := boardColumnTitle("draft", boardColumn{Status: "draft", Total: 3}, true, false, ""); got != "draft · 3" {
+		t.Fatalf("loaded title = %q, want 'draft · 3'", got)
+	}
+	if got := boardColumnTitle("draft", boardColumn{Status: "draft", Total: 3}, true, true, "E_X"); got != "draft · 3 · stale" {
+		t.Fatalf("stale-refresh title = %q, want 'draft · 3 · stale'", got)
+	}
+}
+
+func TestBoardWatchErrorBanner(t *testing.T) {
+	banner := boardBannerText(&boardState{HasData: true, WatchError: "E_DAEMON_UNREACHABLE"})
+	if !strings.Contains(banner, "live refresh unavailable") || !strings.Contains(banner, "E_DAEMON_UNREACHABLE") {
+		t.Fatalf("watch-error banner = %q, want a live-refresh-unavailable disclosure", banner)
+	}
+}
+
 // TestBoardColumnHeaderTruncationDisclosed pins the persistent truncation marker
 // so a >50 column never silently hides its omission (spec §6).
 func TestBoardColumnHeaderTruncationDisclosed(t *testing.T) {

@@ -15,6 +15,7 @@ package main
 // blank or a zero.
 
 import (
+	"strconv"
 	"strings"
 
 	"aira/internal/domain"
@@ -240,7 +241,7 @@ func boardBlockedBadge(cardID, cardStatus string, exact bool, edges []boardBlock
 	if count == 0 {
 		return ""
 	}
-	return "⛔" + itoa(count)
+	return "⛔" + strconv.Itoa(count)
 }
 
 // boardReadyBadgeFor is the honest ready badge (spec §7): positive-or-unevaluated,
@@ -363,9 +364,9 @@ func boardColumnHeader(column boardColumn) string {
 		return column.Status + " · ERROR " + column.Code
 	}
 	if column.Truncated {
-		return column.Status + " · " + itoa(len(column.Cards)) + "/" + itoa(column.Total) + " (lowest ids)"
+		return column.Status + " · " + strconv.Itoa(len(column.Cards)) + "/" + strconv.Itoa(column.Total) + " (lowest ids)"
 	}
-	return column.Status + " · " + itoa(column.Total)
+	return column.Status + " · " + strconv.Itoa(column.Total)
 }
 
 // boardCardLine composes a card's single table-row cell: id, severity, the
@@ -415,26 +416,23 @@ func boardSessionsText(rows []boardSessionRow) string {
 	return strings.Join(lines, "\n")
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+// boardColumnTitle is the honest column header across the fetch lifecycle. Before
+// the FIRST successful fetch a column has no authoritative count, so it reads
+// "loading…" (or "unevaluated (ERROR …)" if that first fetch failed) rather than
+// the fabricated "· 0" that empty Model.Columns would otherwise produce. Once
+// data has arrived, the count is real and a stale refresh is disclosed.
+func boardColumnTitle(status string, column boardColumn, hasData, stale bool, errorCode string) string {
+	if !hasData {
+		if stale && errorCode != "" {
+			return status + " · unevaluated (ERROR " + errorCode + ")"
+		}
+		return status + " · loading…"
 	}
-	negative := n < 0
-	if negative {
-		n = -n
+	title := boardColumnHeader(column)
+	if stale {
+		title += " · stale"
 	}
-	var digits [20]byte
-	index := len(digits)
-	for n > 0 {
-		index--
-		digits[index] = byte('0' + n%10)
-		n /= 10
-	}
-	if negative {
-		index--
-		digits[index] = '-'
-	}
-	return string(digits[index:])
+	return title
 }
 
 // boardHasTransportBanner collapses a shared transport failure across every

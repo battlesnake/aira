@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -157,11 +158,7 @@ func (r *tuiRuntime) renderBoard() {
 		if i < len(bs.Model.Columns) {
 			column = bs.Model.Columns[i]
 		}
-		title := boardColumnHeader(column)
-		if bs.Stale {
-			title += " · stale"
-		}
-		table.SetTitle(" " + title + " ")
+		table.SetTitle(" " + boardColumnTitle(statuses[i], column, bs.HasData, bs.Stale, bs.ErrorCode) + " ")
 		for row, card := range column.Cards {
 			cell := tview.NewTableCell(boardCardLine(card))
 			if bs.Search.Active {
@@ -185,7 +182,7 @@ func (r *tuiRuntime) renderBoard() {
 	if sessionCount == 1 && bs.Model.Sessions[0].Text == "no active claims" {
 		sessionCount = 0
 	}
-	r.boardUI.sessions.SetTitle(" Sessions (" + itoa(sessionCount) + ") ")
+	r.boardUI.sessions.SetTitle(" Sessions (" + strconv.Itoa(sessionCount) + ") ")
 	r.boardUI.footer.SetText(boardFooterText(bs))
 	if bs.DrillID != "" {
 		r.boardUI.detail.SetTitle(" " + bs.DrillID + " (Esc to close) ")
@@ -286,9 +283,12 @@ func boardBannerText(bs *boardState) string {
 	if bs == nil {
 		return ""
 	}
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 3)
 	if bs.Stale && bs.ErrorCode != "" {
 		parts = append(parts, "[red]daemon unreachable — showing last-good (ERROR "+bs.ErrorCode+")[-]")
+	}
+	if bs.WatchError != "" {
+		parts = append(parts, "[orange]live refresh unavailable (ERROR "+bs.WatchError+") — press r to refresh[-]")
 	}
 	for _, warning := range bs.Model.Warnings {
 		if warning == "W_STALE_INDEX" {
