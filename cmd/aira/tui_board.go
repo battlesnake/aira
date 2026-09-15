@@ -36,20 +36,41 @@ const (
 // boardWidgets is the kanban's whole widget set, held off the shared tuiRuntime
 // struct so the board layout is self-contained in this file.
 type boardWidgets struct {
-	columns     []*tview.Table
-	strip       *tview.Flex
-	banner      *tview.TextView
-	sessions    *tview.TextView
-	footer      *tview.TextView
-	detail      *tview.TextView
-	search      *tview.InputField
-	results     *tview.List
+	main     *tview.Flex // the outer FlexRow, kept so the info pane can be resized
+	columns  []*tview.Table
+	strip    *tview.Flex
+	banner   *tview.TextView
+	sessions *tview.TextView
+	footer   *tview.TextView
+	detail   *tview.TextView
+	search   *tview.InputField
+	results  *tview.List
+	// AIRA-254 info pane: a bordered container whose meta|body area splits
+	// side-by-side on a wide terminal (title+fields left, body right) and stacks
+	// into one wrapping column on a narrow one. Both children are PROPORTIONAL —
+	// no hand-computed row counts — so tview never receives a negative size, and
+	// the title, rendered first, is the last thing to clip.
+	info     *tview.Flex
+	infoArea *tview.Flex
+	infoMeta *tview.TextView // wide: title + fields (left). narrow: unused.
+	infoBody *tview.TextView // wide: body (right). narrow: the whole stacked pane.
+	// detailOuter/detailInner hold the expand overlay's centring flexes so the
+	// fixed 100x30 box can be shrunk to fit a small screen each draw (tview does
+	// not clamp a fixed item, so an oversized box would draw off-screen).
+	detailOuter *tview.Flex
+	detailInner *tview.Flex
 	inputOpen   bool
 	resultsOpen bool
 	width       int
+	height      int
 	lastStart   int
 	lastEnd     int
 	laidOut     bool
+	// info-pane relayout memo: the internal area split is rebuilt only when the
+	// (wide, paneHeight) pair actually changes, so it is safe to call every draw.
+	infoLaidOut    bool
+	lastInfoWide   bool
+	lastInfoHeight int
 }
 
 // runBoard is the `aira board` face and its Increment-2 mode-switching OUTER
@@ -199,6 +220,15 @@ func (r *tuiRuntime) buildBoardWidgets() {
 	ui.footer = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 	ui.detail = tview.NewTextView().SetWrap(true).SetScrollable(true)
 	ui.detail.SetBorder(true).SetTitle(" Detail ")
+	// AIRA-254 info pane. Plain text (dynamic colors OFF) so a ticket title/body
+	// containing "[…]" renders literally rather than as a colour tag, and the raw
+	// full title needs no escaping. Both content widgets wrap; the body scrolls.
+	ui.infoMeta = tview.NewTextView().SetWrap(true).SetDynamicColors(false)
+	ui.infoBody = tview.NewTextView().SetWrap(true).SetScrollable(true).SetDynamicColors(false)
+	ui.infoArea = tview.NewFlex()
+	ui.info = tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(ui.infoArea, 0, 1, false)
+	ui.info.SetBorder(true).SetTitle(" Ticket ")
 	ui.search = tview.NewInputField().SetLabel("/ ")
 	ui.search.SetDoneFunc(func(key tcell.Key) {
 		switch key {
@@ -225,12 +255,27 @@ func (r *tuiRuntime) buildBoardWidgets() {
 
 	main := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(ui.banner, 1, 0, false).
+		AddItem(ui.info, boardInfoPaneHeight(0), 0, false).
 		AddItem(ui.strip, 0, 1, true).
 		AddItem(ui.sessions, 6, 0, false).
 		AddItem(ui.footer, 1, 0, false)
+	ui.main = main
+	// The expand overlay is built with resizable centring flexes (not the fixed
+	// centeredPrimitive) so beforeDraw can shrink its 100x30 box to fit a small
+	// screen — at 80x24 a fixed 100x30 box would be placed off-screen and its top
+	// border, header and first title line clipped (the overlay is now the readable
+	// full-detail surface, so that clip would hide real content).
+	ui.detailInner = tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(nil, 0, 1, false).
+		AddItem(ui.detail, 30, 0, true).
+		AddItem(nil, 0, 1, false)
+	ui.detailOuter = tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(ui.detailInner, 100, 0, true).
+		AddItem(nil, 0, 1, false)
 	r.outerPages = tview.NewPages().
 		AddPage(boardMainPage, main, true, true).
-		AddPage(boardDetailPage, centeredPrimitive(ui.detail, 100, 30), true, false).
+		AddPage(boardDetailPage, ui.detailOuter, true, false).
 		AddPage(boardResultsPage, centeredPrimitive(ui.results, 90, 24), true, false).
 		AddPage(boardSearchPage, centeredPrimitive(ui.search, 70, 3), true, false)
 	r.app.SetRoot(r.outerPages, true)
@@ -239,13 +284,167 @@ func (r *tuiRuntime) buildBoardWidgets() {
 	// goroutine, before each draw. Column fit is a PURE function of (width, focus)
 	// and the strip is rebuilt only when the visible window actually changes.
 	r.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
-		width, _ := screen.Size()
-		if width != r.boardUI.width {
+		width, height := screen.Size()
+		if width != r.boardUI.width || height != r.boardUI.height {
 			r.boardUI.width = width
+			r.boardUI.height = height
 			r.layoutBoardStrip()
+			r.layoutBoardOverlay()
+			// Re-COMPOSE the info pane, not just re-lay-it-out: renderBoardInfo's
+			// text assignment (and the "+N ↵" clip disclosure) is width-dependent —
+			// wide puts title+fields left / body right, narrow stacks the lot into
+			// one widget. A tcell resize fires this hook but NOT render() (that needs
+			// a reducer message), so without re-composing here a wide↔narrow resize
+			// with no follow-up keypress would leave stale text in the wrong widget
+			// (title+fields vanish, or a false clip disclosure). renderBoardInfo
+			// calls the idempotent layoutBoardInfo itself.
+			if r.state.Board != nil {
+				r.renderBoardInfo(r.state.Board)
+			} else {
+				r.layoutBoardInfo()
+			}
 		}
 		return false
 	})
+}
+
+const (
+	// boardInfoWideThreshold is the width (columns) at or above which the info
+	// pane splits title+fields | body side-by-side; below it they stack.
+	boardInfoWideThreshold = 90
+	// boardInfoReservedRows is the fixed vertical cost the info pane must leave for
+	// the rest of the board: banner(1) + sessions(6) + footer(1) + a 3-row minimum
+	// column strip. The pane never grows past screenHeight - this.
+	boardInfoReservedRows = 11
+	// boardInfoMinRows is the smallest pane worth showing (border + ~3 content
+	// rows). Below it the pane is hidden entirely so the strip keeps the board
+	// usable on a short terminal (a fixed pane once pushed the usable minimum to
+	// 18 rows and drove the strip to a negative size).
+	boardInfoMinRows = 5
+)
+
+// boardInfoPaneHeight is the info pane's outer height (0 = hidden): about a
+// quarter of the screen, floored so it shows a useful amount, capped at 14, and
+// then capped again so it never eats the columns (screenHeight-reserved). If that
+// leaves less than a useful pane, it returns 0 and the strip takes the space. It
+// depends ONLY on screen height, so the pane does not resize as the cursor moves.
+func boardInfoPaneHeight(screenHeight int) int {
+	height := screenHeight / 4
+	if height < 7 {
+		height = 7
+	}
+	if height > 14 {
+		height = 14
+	}
+	if max := screenHeight - boardInfoReservedRows; height > max {
+		height = max
+	}
+	if height < boardInfoMinRows {
+		return 0
+	}
+	return height
+}
+
+// layoutBoardInfo sizes the info pane and rebuilds its internal split. The pane
+// takes a quarter of the screen (0 = hidden on a short terminal). The area is
+// ALL PROPORTIONAL — no fixed row counts — so tview never gets a negative size:
+// wide terminals split title+fields | body (~40% | ~60%, body the larger share
+// per the owner's ask), narrow terminals put everything in one wrapping column.
+// Idempotent: it only touches the Flexes when (wide, paneHeight) changes.
+func (r *tuiRuntime) layoutBoardInfo() {
+	if r.boardUI == nil || r.state.Board == nil {
+		return
+	}
+	paneHeight := boardInfoPaneHeight(r.boardUI.height)
+	wide := r.boardUI.width >= boardInfoWideThreshold
+	if r.boardUI.infoLaidOut && wide == r.boardUI.lastInfoWide && paneHeight == r.boardUI.lastInfoHeight {
+		return
+	}
+	r.boardUI.lastInfoWide, r.boardUI.lastInfoHeight, r.boardUI.infoLaidOut = wide, paneHeight, true
+
+	r.boardUI.main.ResizeItem(r.boardUI.info, paneHeight, 0)
+	r.boardUI.infoArea.Clear()
+	if paneHeight == 0 {
+		return // hidden: nothing to lay out inside
+	}
+	if wide {
+		r.boardUI.infoArea.SetDirection(tview.FlexColumn)
+		r.boardUI.infoArea.AddItem(r.boardUI.infoMeta, 0, 2, false) // ~40%: title + fields
+		r.boardUI.infoArea.AddItem(r.boardUI.infoBody, 0, 3, false) // ~60%: body
+	} else {
+		r.boardUI.infoArea.SetDirection(tview.FlexRow)
+		r.boardUI.infoArea.AddItem(r.boardUI.infoBody, 0, 1, false) // one wrapping column
+	}
+}
+
+// layoutBoardOverlay shrinks the expand overlay's fixed 100x30 box to fit the
+// screen (tview does not clamp a fixed Flex item, so an oversized box is placed
+// off-screen and clipped). Idempotent via the same width/height memo as the
+// strip/info layouts (its caller only runs on a size change).
+func (r *tuiRuntime) layoutBoardOverlay() {
+	if r.boardUI == nil || r.boardUI.detailOuter == nil {
+		return
+	}
+	width := clampOverlayExtent(100, r.boardUI.width)
+	height := clampOverlayExtent(30, r.boardUI.height)
+	r.boardUI.detailOuter.ResizeItem(r.boardUI.detailInner, width, 0)
+	r.boardUI.detailInner.ResizeItem(r.boardUI.detail, height, 0)
+}
+
+// clampOverlayExtent bounds an overlay dimension to at most (screen-2) so its
+// border stays on-screen, and at least 1.
+func clampOverlayExtent(want, screen int) int {
+	if fit := screen - 2; want > fit {
+		want = fit
+	}
+	if want < 1 {
+		want = 1
+	}
+	return want
+}
+
+// boardInfoOverflow reports how many wrapped display-rows of content spill past
+// the rows the pane can show, so the border can disclose a silent clip (spec §14:
+// an omission of established values is never silent). It wraps each line the way
+// the pane's TextView does — word-wrap, measured in display cells (wide runes
+// count 2) — and counts blank separator lines too. 0 means everything fits.
+func boardInfoOverflow(content string, width, rows int) int {
+	if width < 1 || rows < 1 {
+		return 0
+	}
+	total := 0
+	for _, line := range strings.Split(content, "\n") {
+		wrapped := tview.WordWrap(line, width)
+		if len(wrapped) == 0 {
+			total++ // a blank line still occupies a row
+			continue
+		}
+		total += len(wrapped)
+	}
+	if total > rows {
+		return total - rows
+	}
+	return 0
+}
+
+// boardInfoLeftWidth and boardInfoBodyWidth are the content widths of the wide
+// pane's two columns (title+fields | body, split ~40/60 inside the pane border).
+// They are used only to estimate the clip disclosure, so approximate rounding is
+// fine — the exact tview Flex split need not be reproduced.
+func boardInfoLeftWidth(width int) int {
+	inner := width - 2
+	if inner < 2 {
+		return 1
+	}
+	return inner * 2 / 5
+}
+
+func boardInfoBodyWidth(width int) int {
+	inner := width - 2
+	if inner < 2 {
+		return 1
+	}
+	return inner - inner*2/5
 }
 
 // layoutBoardStrip rebuilds the visible-column window. It is idempotent: it only
@@ -256,7 +455,7 @@ func (r *tuiRuntime) layoutBoardStrip() {
 		return
 	}
 	focus := r.state.Board.FocusedCol
-	start, end := boardVisibleColumns(r.boardUI.width, focus, len(r.boardUI.columns))
+	start, end := boardStripWindow(r.boardUI.width, focus, len(r.boardUI.columns), r.state.Board.FullWidth)
 	if r.boardUI.laidOut && start == r.boardUI.lastStart && end == r.boardUI.lastEnd {
 		return
 	}
@@ -265,6 +464,56 @@ func (r *tuiRuntime) layoutBoardStrip() {
 	for i := start; i < end; i++ {
 		r.boardUI.strip.AddItem(r.boardUI.columns[i], 0, 1, false)
 	}
+}
+
+// renderBoardInfo populates the info pane for the current selection. The border
+// carries the instant header (id · status · severity · kind) from the loaded
+// card plus a "+N ↵" clip disclosure when content spills; the FULL raw title
+// leads the content (so it is the last thing to clip, never truncated); then the
+// fetched meta/body — "loading…" until it lands, "unevaluated (CODE)" if a
+// section could not be read. Wide splits title+fields | body; narrow stacks them
+// into the one wrapping column. An empty column shows an explicit "no ticket".
+func (r *tuiRuntime) renderBoardInfo(bs *boardState) {
+	r.layoutBoardInfo()
+	card, ok := boardSelectedCard(*bs)
+	if !ok {
+		r.boardUI.info.SetTitle(" Ticket ")
+		r.boardUI.infoMeta.SetText("")
+		r.boardUI.infoBody.SetText("no ticket selected")
+		return
+	}
+	// Only render a detail that actually describes THIS card; a detail held for a
+	// different ticket collapses to "loading…" rather than showing under the wrong
+	// title (boardInfoDetail is the honesty seam).
+	detail := boardInfoDetail(card, bs.Detail)
+	title := card.Title // raw, full — never truncated in the pane (the owner's ask)
+	meta := strings.Join(boardDetailMetaLines(card, detail), "\n")
+	body := boardDetailBodyText(detail)
+
+	innerRows := boardInfoPaneHeight(r.boardUI.height) - 2
+	overflow := 0
+	if r.boardUI.width >= boardInfoWideThreshold {
+		left := title + "\n\n" + meta
+		r.boardUI.infoMeta.SetText(left)
+		r.boardUI.infoBody.SetText(body)
+		overflow = boardInfoOverflow(left, boardInfoLeftWidth(r.boardUI.width), innerRows)
+		if o := boardInfoOverflow(body, boardInfoBodyWidth(r.boardUI.width), innerRows); o > overflow {
+			overflow = o
+		}
+	} else {
+		stacked := title + "\n\n" + meta + "\n\n" + body
+		r.boardUI.infoMeta.SetText("")
+		r.boardUI.infoBody.SetText(stacked)
+		overflow = boardInfoOverflow(stacked, r.boardUI.width-2, innerRows)
+	}
+
+	header := boardDetailHeaderLine(card)
+	if overflow > 0 {
+		// Disclose the clip rather than silently drop established values (spec §14);
+		// Enter opens the full detail.
+		header += " · +" + strconv.Itoa(overflow) + " ↵"
+	}
+	r.boardUI.info.SetTitle(" " + header + " ")
 }
 
 func (r *tuiRuntime) renderBoard() {
@@ -306,14 +555,15 @@ func (r *tuiRuntime) renderBoard() {
 	}
 	r.boardUI.sessions.SetTitle(" Sessions (" + strconv.Itoa(sessionCount) + ") ")
 	r.boardUI.footer.SetText(boardFooterText(bs))
+	r.renderBoardInfo(bs)
 
-	// Overlay precedence: detail drill-in > search input > results list. Exactly
+	// Overlay precedence: expand overlay > search input > results list. Exactly
 	// one may be visible, so hide the others every render to avoid a stale overlay.
-	detailShown := bs.DrillID != ""
+	detailShown := bs.Expanded
 	resultsShown := !detailShown && !r.boardUI.inputOpen && r.boardUI.resultsOpen && bs.Search.Active
 	if detailShown {
-		r.boardUI.detail.SetTitle(" " + bs.DrillID + " (Esc to close) ")
-		r.boardUI.detail.SetText(bs.Detail)
+		r.boardUI.detail.SetTitle(" " + bs.Detail.ID + " (Esc to close) ")
+		r.boardUI.detail.SetText(boardDetailOverlayText(bs.Detail.ID, bs.Detail))
 		r.outerPages.ShowPage(boardDetailPage)
 	} else {
 		r.outerPages.HidePage(boardDetailPage)
@@ -368,12 +618,16 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 	if r.boardUI != nil && r.boardUI.inputOpen {
 		return event // the search InputField owns the keyboard while it is open
 	}
-	if r.state.Board != nil && r.state.Board.DrillID != "" {
-		if event.Key() == tcell.KeyEscape {
+	if r.state.Board != nil && r.state.Board.Expanded {
+		switch {
+		case event.Key() == tcell.KeyRune && event.Rune() == 'q':
+			r.applyBoardAction(boardActQuit) // q quits globally, even from the overlay
+			return nil
+		case event.Key() == tcell.KeyEscape:
 			r.applyBoardAction(boardActBack)
 			return nil
 		}
-		return event // let the detail pane scroll
+		return event // let the expand overlay scroll (↑/↓/PgUp/PgDn)
 	}
 	// Results overlay: the reducer's ResultIdx is authoritative, so every key is
 	// consumed here and the list is only a view (populated in render).
@@ -415,7 +669,7 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 	case tcell.KeyDown:
 		action = boardActCardDown
 	case tcell.KeyEnter:
-		action = boardActDrillIn
+		action = boardActExpand
 	case tcell.KeyEscape:
 		action = boardActBack
 	case tcell.KeyRune:
@@ -434,6 +688,8 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 			action = boardActQuit
 		case 'o':
 			action = boardActToOverview
+		case 'f':
+			action = boardActFullWidth
 		case '/':
 			r.openBoardSearch()
 			return nil
@@ -500,7 +756,7 @@ func boardBannerText(bs *boardState) string {
 
 // boardFooterText is the keybinding legend plus the honest search result label.
 func boardFooterText(bs *boardState) string {
-	keys := "←/→ h/l column · ↑/↓ j/k card · Enter detail · / search · o overview · r refresh · q quit"
+	keys := "←/→ h/l column · ↑/↓ j/k card · Enter expand · f full-width · / search · o overview · r refresh · q quit"
 	if bs != nil && bs.Search.Active {
 		if label := boardSearchLabel(bs.Search); label != "" {
 			return "search \"" + tview.Escape(bs.Search.Query) + "\": " + label + "   ·   Esc clears   ·   " + keys

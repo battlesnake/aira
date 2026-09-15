@@ -152,7 +152,8 @@ type tuiState struct {
 	// exist without the previous tick's counters to difference against.
 	Top topTick
 	// Board is AIRA-252's kanban interactive state (columns, focus, per-column
-	// selection, search, drill-in). It is nil for every non-board face, exactly as
+	// selection, search, and the AIRA-254 info-pane detail + expand overlay). It is
+	// nil for every non-board face, exactly as
 	// Top is meaningful only for viewTop; cloneTUIState deep-copies it when set.
 	Board *boardState
 	// Overview is AIRA-252 Increment 2's all-projects overview state (project
@@ -215,10 +216,11 @@ const (
 	cmdScheduleRefresh
 	cmdReconnect
 	cmdQuit
-	cmdPalette         // executor-only; never emitted by a controller transition
-	cmdExecuteDetached // executor-only; never emitted by a controller transition
-	cmdBoardSearch     // AIRA-252: dispatch a `grep` content search for the board
-	cmdBoardGet        // AIRA-252: dispatch a `show` probe to resolve an id-shaped query
+	cmdPalette             // executor-only; never emitted by a controller transition
+	cmdExecuteDetached     // executor-only; never emitted by a controller transition
+	cmdBoardSearch         // AIRA-252: dispatch a `grep` content search for the board
+	cmdBoardGet            // AIRA-252: dispatch a `show` probe to resolve an id-shaped query
+	cmdBoardDetailDebounce // AIRA-254: arm the info-pane detail-fetch debounce
 )
 
 // tuiCmd contains only values (Palette is executor-only). The executor
@@ -260,7 +262,8 @@ type detailResult struct {
 	View       tuiView
 	Generation int
 	ID         string
-	Detail     string
+	Detail     string           // viewTickets/viewFindings: the legacy string detail
+	Board      boardDetailModel // AIRA-254 viewBoard: the readable structured detail
 }
 
 func newTUIState(eventCapacity int) tuiState {
@@ -666,10 +669,26 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 		dirty := panel.Dirty
 		panel.Dirty = false
 		state.Panels[result.View] = panel
-		if dirty {
-			return requestPanelRefresh(state, result.View)
+		// AIRA-254. Reconcile the info-pane detail with the (possibly re-clamped)
+		// selection: arm a fetch on the FIRST load (Detail.ID == "") or when the
+		// selected id changed, and never on a failed fetch (the selection may point
+		// at last-good columns). An unchanged selection keeps its detail.
+		var detailCmds []tuiCmd
+		if state.Board != nil && panel.Status == panelReady && !state.Board.Expanded {
+			// While the expand overlay is open it OWNS Detail (it may show an unloaded
+			// hit whose id differs from the cursor card); a background refresh must not
+			// retarget it. The Back that closes the overlay re-arms the pane.
+			next, arm := boardArmDetail(*state.Board)
+			*state.Board = next
+			if arm {
+				detailCmds = []tuiCmd{{Kind: cmdBoardDetailDebounce}}
+			}
 		}
-		return state, nil
+		if dirty {
+			rstate, rcmds := requestPanelRefresh(state, result.View)
+			return rstate, append(detailCmds, rcmds...)
+		}
+		return state, detailCmds
 	}
 	if result.Code != "" {
 		panel.Status = panelError
@@ -728,13 +747,14 @@ func onTUISelect(state tuiState, view tuiView, id string) (tuiState, []tuiCmd) {
 func onTUIDetailResult(state tuiState, result detailResult) (tuiState, []tuiCmd) {
 	state = cloneTUIState(state)
 	if result.View == viewBoard {
-		// AIRA-252 drill-in: the board keys its detail by the drilled id, not by a
-		// panel SelectedID. A late result for an id the operator has since closed or
-		// changed is dropped rather than shown over the wrong ticket.
-		if state.Board == nil || state.Board.DrillID == "" || state.Board.DrillID != result.ID {
+		// AIRA-254: the board keys its readable detail by the id it was fetched for
+		// (Detail.ID), not a panel SelectedID. A late result for a since-changed
+		// selection is dropped rather than shown over the wrong ticket.
+		if state.Board == nil || state.Board.Detail.ID == "" || state.Board.Detail.ID != result.ID {
 			return state, nil
 		}
-		state.Board.Detail = result.Detail
+		state.Board.Detail.Model = result.Board
+		state.Board.Detail.State = "ready"
 		return state, nil
 	}
 	panel := state.Panels[result.View]

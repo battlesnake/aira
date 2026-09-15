@@ -214,12 +214,15 @@ func TestBoardMergeGrepDedupAndEmpty(t *testing.T) {
 	}
 }
 
-func TestBoardActionDrillInEmitsDetailFetch(t *testing.T) {
+func TestBoardActionExpandEmitsDetailFetch(t *testing.T) {
 	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}}}}
 	state := boardTUIState(boardApplyModelPtr(model))
-	next, commands := onBoardAction(state, boardActDrillIn)
-	if next.Board.DrillID != "AIRA-1" {
-		t.Fatalf("drill-in DrillID = %q, want AIRA-1", next.Board.DrillID)
+	next, commands := onBoardAction(state, boardActExpand)
+	if !next.Board.Expanded {
+		t.Fatalf("expand did not open the overlay")
+	}
+	if next.Board.Detail.ID != "AIRA-1" {
+		t.Fatalf("expand Detail.ID = %q, want AIRA-1", next.Board.Detail.ID)
 	}
 	found := false
 	for _, command := range commands {
@@ -228,29 +231,197 @@ func TestBoardActionDrillInEmitsDetailFetch(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("drill-in did not emit a board detail fetch: %#v", commands)
+		t.Fatalf("expand did not emit a board detail fetch: %#v", commands)
 	}
 }
 
-func TestBoardActionBackClearsDrillThenSearch(t *testing.T) {
+func TestBoardActionBackClosesExpandThenSearch(t *testing.T) {
 	bs := newBoardState()
-	bs.DrillID = "AIRA-1"
-	bs.Detail = "detail"
+	bs.Expanded = true
+	bs.Detail = boardDetailState{ID: "AIRA-1", State: "ready"}
 	bs.Search.Active = true
 	state := boardTUIState(bs)
-	afterDrill, _ := onBoardAction(state, boardActBack)
-	if afterDrill.Board.DrillID != "" || afterDrill.Board.Detail != "" {
-		t.Fatalf("Back did not close drill-in first: %#v", afterDrill.Board)
+	afterExpand, _ := onBoardAction(state, boardActBack)
+	if afterExpand.Board.Expanded {
+		t.Fatalf("Back did not close the expand overlay first: %#v", afterExpand.Board)
 	}
-	afterSearch, _ := onBoardAction(afterDrill, boardActBack)
+	afterSearch, _ := onBoardAction(afterExpand, boardActBack)
 	if afterSearch.Board.Search.Active {
-		t.Fatalf("Back did not clear search after drill-in closed")
+		t.Fatalf("Back did not clear search after the overlay closed")
 	}
 }
 
 func boardApplyModelPtr(model boardModel) *boardState {
 	bs := boardApplyModel(*newBoardState(), model)
 	return &bs
+}
+
+// TestBoardActionBackReArmsPaneAfterUnloadedOverlay pins the AIRA-254 honesty
+// fix: opening an UNLOADED search hit in the overlay, letting its detail land,
+// then closing the overlay with Esc must re-target the pane to the SELECTED card
+// (loading) and request a fetch — never keep the overlay ticket's detail, which
+// the pane would otherwise show under the selected card's title.
+func TestBoardActionBackReArmsPaneAfterUnloadedOverlay(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}}}}
+	bs := boardApplyModelPtr(model)
+	// AIRA-777 is a grep-only hit not present in any loaded column.
+	bs.Search = boardSearchState{Active: true, Query: "x", Results: []boardSearchResult{{ID: "AIRA-777"}}, MatchIDs: map[string]bool{"AIRA-777": true}}
+	state := boardTUIState(bs)
+
+	opened, _ := onBoardResultOpen(state)
+	if !opened.Board.Expanded || opened.Board.Detail.ID != "AIRA-777" {
+		t.Fatalf("opening the unloaded hit did not target the overlay: %#v", opened.Board.Detail)
+	}
+	landed, _ := onTUIDetailResult(opened, detailResult{View: viewBoard, ID: "AIRA-777", Board: boardDetailModel{Assignee: "owner-of-777", Body: "body of 777"}})
+	if landed.Board.Detail.State != "ready" {
+		t.Fatalf("overlay detail did not land ready: %#v", landed.Board.Detail)
+	}
+
+	back, cmds := onBoardAction(landed, boardActBack)
+	selected := boardSelectedCardID(*back.Board)
+	if selected != "AIRA-1" {
+		t.Fatalf("selection after Esc = %q, want AIRA-1", selected)
+	}
+	if back.Board.Detail.ID != selected {
+		t.Fatalf("pane still holds detail for %q after closing overlay on selected %q", back.Board.Detail.ID, selected)
+	}
+	if back.Board.Detail.State == "ready" {
+		t.Fatalf("re-armed pane must be loading, not ready: %#v", back.Board.Detail)
+	}
+	armed := false
+	for _, c := range cmds {
+		if c.Kind == cmdBoardDetailDebounce {
+			armed = true
+		}
+	}
+	if !armed {
+		t.Fatalf("closing the overlay did not re-arm a pane fetch: %#v", cmds)
+	}
+	// Belt: even before the re-armed fetch lands, the pane render for the selected
+	// card must not leak the overlay ticket's fields.
+	card, _ := boardSelectedCard(*back.Board)
+	meta := strings.Join(boardDetailMetaLines(card, boardInfoDetail(card, back.Board.Detail)), "\n")
+	if strings.Contains(meta, "owner-of-777") {
+		t.Fatalf("pane leaked the overlay ticket's assignee:\n%s", meta)
+	}
+}
+
+// TestBoardExpandedOverlayNotClobberedByRefresh pins that while the expand
+// overlay is open on an UNLOADED hit (Detail.ID != selection), a background data
+// refresh must NOT retarget the pane's Detail — the overlay owns it. Without the
+// Expanded guard the reconcile would rewrite the open overlay to the cursor card.
+func TestBoardExpandedOverlayNotClobberedByRefresh(t *testing.T) {
+	data := boardDataFrom(map[string]boardColumnFetch{
+		"planned": {Rows: []map[string]any{boardRow("AIRA-1", "planned", "P1", "one", false)}},
+	}, listEnvelope{})
+	bs := boardApplyModelPtr(buildBoardModel(data)) // selection lands on AIRA-1
+	bs.Expanded = true
+	bs.Detail = boardDetailState{ID: "AIRA-777", State: "ready", Model: boardDetailModel{Assignee: "owner-of-777", Body: "body 777"}}
+	state := boardTUIState(bs)
+	panel := state.Panels[viewBoard]
+	panel.InFlight = true
+	panel.InFlightGeneration = 7
+	state.Panels[viewBoard] = panel
+
+	next, cmds := onTUIFetchResult(state, fetchResult{View: viewBoard, Generation: 7, Board: &data})
+	if next.Board.Detail.ID != "AIRA-777" || next.Board.Detail.State != "ready" || next.Board.Detail.Model.Assignee != "owner-of-777" {
+		t.Fatalf("refresh clobbered the open overlay's detail: %#v", next.Board.Detail)
+	}
+	for _, c := range cmds {
+		if c.Kind == cmdBoardDetailDebounce {
+			t.Fatalf("refresh armed a pane fetch while the overlay was open: %#v", cmds)
+		}
+	}
+}
+
+// TestOnBoardDetailDueSkipsWhileExpanded pins the hazard the reviewer flagged: a
+// due timer firing while the overlay is open must NOT retarget/refetch (the
+// overlay owns Detail), but MUST clear Armed — otherwise Armed stays true with no
+// timer in flight and the pane sticks on "loading…" after the overlay closes.
+func TestOnBoardDetailDueSkipsWhileExpanded(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}}}}
+	bs := boardApplyModelPtr(model)
+	bs.Expanded = true
+	bs.Detail = boardDetailState{ID: "AIRA-777", State: "ready", Armed: true, Model: boardDetailModel{Assignee: "owner-of-777"}}
+	next, cmds := onBoardDetailDue(boardTUIState(bs))
+	if next.Board.Detail.ID != "AIRA-777" || next.Board.Detail.Model.Assignee != "owner-of-777" {
+		t.Fatalf("due clobbered the open overlay's detail: %#v", next.Board.Detail)
+	}
+	if next.Board.Detail.Armed {
+		t.Fatalf("due must clear Armed even when skipping (else pane sticks on loading after Back)")
+	}
+	for _, c := range cmds {
+		if c.Kind == cmdFetch {
+			t.Fatalf("due refetched while the overlay was open: %#v", cmds)
+		}
+	}
+}
+
+// TestBoardActionExpandDispatchesWhenDetailNotReady pins the re-review P1 fix:
+// pressing Enter INSIDE the 250ms debounce window — when a nav has armed a timer
+// for the selected card but no fetch has been dispatched yet (Detail.ID == id,
+// State "loading", Armed) — must dispatch the overlay's fetch IMMEDIATELY. It
+// must NOT rely on the pending timer, which onBoardDetailDue drops while Expanded,
+// else the overlay sticks on "loading…" forever.
+func TestBoardActionExpandDispatchesWhenDetailNotReady(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}}}}
+	bs := boardApplyModelPtr(model)
+	// State as just after a nav: the timer is armed for the selection but the fetch
+	// has not been dispatched (the debounce has not fired).
+	bs.Detail = boardDetailState{ID: "AIRA-1", State: "loading", Armed: true}
+	next, cmds := onBoardAction(boardTUIState(bs), boardActExpand)
+	if !next.Board.Expanded {
+		t.Fatalf("expand did not open the overlay")
+	}
+	found := false
+	for _, c := range cmds {
+		if c.Kind == cmdFetch && c.View == viewBoard && c.DetailID == "AIRA-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expand on a not-ready detail did not dispatch a fetch — the overlay would strand on loading: %#v", cmds)
+	}
+}
+
+// TestBoardActionExpandReusesReadyDetail pins the other side: when the detail is
+// already ready for the selected id, expand reuses it and dispatches no fetch.
+func TestBoardActionExpandReusesReadyDetail(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}}}}
+	bs := boardApplyModelPtr(model)
+	bs.Detail = boardDetailState{ID: "AIRA-1", State: "ready", Model: boardDetailModel{Assignee: "mark"}}
+	next, cmds := onBoardAction(boardTUIState(bs), boardActExpand)
+	for _, c := range cmds {
+		if c.Kind == cmdFetch {
+			t.Fatalf("expand refetched an already-ready detail: %#v", cmds)
+		}
+	}
+	if next.Board.Detail.Model.Assignee != "mark" || next.Board.Detail.State != "ready" {
+		t.Fatalf("expand disturbed the ready detail: %#v", next.Board.Detail)
+	}
+}
+
+// TestBoardActionRefreshResetsPaneDetail pins that an explicit refresh does not
+// leave a stale pane body: it drops the held detail (so the onData reconcile
+// re-arms a fresh fetch) while still starting the panel refresh.
+func TestBoardActionRefreshResetsPaneDetail(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: []boardCard{{ID: "AIRA-1", Title: "one"}}}}}
+	bs := boardApplyModelPtr(model)
+	bs.Detail = boardDetailState{ID: "AIRA-1", State: "ready", Model: boardDetailModel{Body: "stale body"}}
+	next, cmds := onBoardAction(boardTUIState(bs), boardActRefresh)
+	if next.Board.Detail.State == "ready" || next.Board.Detail.Model.Body == "stale body" {
+		t.Fatalf("refresh kept a stale ready detail: %#v", next.Board.Detail)
+	}
+	// The panel refresh must still be requested.
+	refresh := false
+	for _, c := range cmds {
+		if c.Kind == cmdFetch && c.View == viewBoard && c.DetailID == "" {
+			refresh = true
+		}
+	}
+	if !refresh {
+		t.Fatalf("refresh did not start the panel fetch: %#v", cmds)
+	}
 }
 
 // TestBoardSearchIDNoMatchProbesGet is P2.5: an id-shaped query with no loaded
@@ -324,17 +495,24 @@ func TestBoardResultOpenJumpsOrDrills(t *testing.T) {
 	if jumped.Board.Search.Active {
 		t.Fatalf("jump did not close the search")
 	}
+	sawDebounce := false
 	for _, command := range commands {
 		if command.Kind == cmdFetch {
-			t.Fatalf("jump to a loaded card must not dispatch a detail fetch")
+			t.Fatalf("jump to a loaded card must not dispatch an immediate detail fetch")
+		}
+		if command.Kind == cmdBoardDetailDebounce {
+			sawDebounce = true
 		}
 	}
-	// Unloaded result (grep-only content hit) → drill-in.
+	if !sawDebounce {
+		t.Fatalf("jump did not arm the info pane for the jumped-to card: %#v", commands)
+	}
+	// Unloaded result (grep-only content hit) → open the self-contained overlay.
 	bs2 := boardApplyModelPtr(model)
 	bs2.Search = boardSearchState{Active: true, Query: "x", Results: []boardSearchResult{{ID: "AIRA-777"}}, MatchIDs: map[string]bool{"AIRA-777": true}}
-	drilled, commands2 := onBoardResultOpen(boardTUIState(bs2))
-	if drilled.Board.DrillID != "AIRA-777" {
-		t.Fatalf("unloaded result did not drill in: DrillID=%q", drilled.Board.DrillID)
+	opened, commands2 := onBoardResultOpen(boardTUIState(bs2))
+	if !opened.Board.Expanded || opened.Board.Detail.ID != "AIRA-777" {
+		t.Fatalf("unloaded result did not open the overlay: Expanded=%v Detail.ID=%q", opened.Board.Expanded, opened.Board.Detail.ID)
 	}
 	found := false
 	for _, command := range commands2 {

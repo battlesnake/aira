@@ -165,15 +165,35 @@ truncated), a colour-ranked severity tag (`P0` hottest), kind, and honest badges
 
 ## 8. Drill-in detail + relations
 
-`Enter` opens a detail pane. **Implemented (Increment 1) as a centered overlay**,
-not the tickets tab's horizontal split: the kanban already fills the width with its
-seven-column strip, so an overlay is the cleaner drill-in for this layout and avoids
-permanently reserving a detail column. It **reuses `fetchTicketDetail`**
-(`tui_data.go`: `show` + `ready selector` + `link list` + `find`), giving the full
-ticket, its authoritative readiness/blockers, and its relation neighbourhood.
-Grouping the relations by kind (Blocked by / Blocks / Parent / Children / Related /
-Duplicates / Supersedes / Resolves) is optional presentation polish over the `link`
-rows. `Esc` closes. All titles/snippets are `tview.Escape`-d.
+**Increment 3 (AIRA-254) supersedes the Increment-1 JSON overlay.** The owner's
+verdict on the raw drill-in — "just gives me a JSON dump, nothing useful" — drove
+two changes:
+
+- **A persistent info pane** in the top ~quarter of the screen renders the SELECTED
+  ticket's readable detail: an instant header (`id · status · severity · kind`) and
+  the FULL raw title (never truncated — the column cell truncates, the pane does
+  not), then the fetched fields (assignee / labels / milestone / relations /
+  findings) and the body, each honest (`loading…` until landed, `unevaluated
+  (CODE)` for a section that could not be read; a failed section never blanks or
+  fabricates another). On a wide terminal (≥ 90 cols) the pane splits title+fields
+  left | body right (body the larger share); narrow stacks them into one wrapping
+  column. The pane's internal split is ALL PROPORTIONAL — no hand-computed row
+  counts — so tview never gets a negative size, and the title (rendered first) is
+  the last thing to clip; a silent clip is disclosed in the border as `· +N ↵`.
+  The pane is hidden on a terminal too short to fit it without eating the columns.
+- **`Enter` opens the same readable detail as a centered, size-clamped overlay**
+  (the full-screen scrollable view, the escape hatch for a long title/body or a
+  clipped pane). It is self-contained from the fetched model so it also opens an
+  UNLOADED grep-only search hit. The overlay box is shrunk to fit small screens so
+  its border/header/title are never placed off-screen.
+
+The detail is fetched by `fetchBoardDetail` (`tui_board_detail.go`: `show` +
+`link {list,selector}` + `find ls ticket:<id>`) into a structured
+`boardDetailModel` of plain values, each with its own section code. Relations read
+directly from the store's `RelationView` (From = the subject, To = the other end,
+Kind pre-inverted for incoming edges). `Esc` closes the overlay (and re-arms the
+pane for the current selection); the pane's raw full title needs no escaping
+(dynamic colours off), while the width-bounded column cell still escapes+truncates.
 
 ## 9. Sessions / activity strip
 
@@ -337,9 +357,12 @@ card focused/scrolled into view — not eagerly to all N on open.
 `q` quit — **in EVERY mode `q` quits the whole viewer** (Increment-2 build
 correction: the earlier "in board mode reached from overview: back to overview"
 was wrong and contradicted §12; returning to the overview is `o`, and `q` ends
-the outer loop). `←/→` or `h/l` move column · `↑/↓` move card · `Enter` drill in
-/ (overview) open project · `Esc` back/close · `/` search · `r` refresh · `o`
-(Increment 2) board → overview. No mutation keys.
+the outer loop). `←/→` or `h/l` move column · `↑/↓` move card · `Enter` expand the
+selected ticket's detail overlay / (overview) open project · `f` (Increment 3)
+toggle the focused column full-width (hides the other columns for readable titles)
+· `Esc` back/close · `/` search · `r` refresh · `o` (Increment 2) board → overview.
+The selected ticket's readable detail always shows in the top info pane (§8). No
+mutation keys.
 
 ## 16. Increments
 

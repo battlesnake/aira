@@ -71,7 +71,7 @@ func resizeBoardScreen(t *testing.T, runtime *tuiRuntime, screen tcell.Simulatio
 	time.Sleep(30 * time.Millisecond) // let the resize-driven relayout settle
 }
 
-func boardStripWindow(t *testing.T, runtime *tuiRuntime) (int, int) {
+func readBoardStripWindow(t *testing.T, runtime *tuiRuntime) (int, int) {
 	t.Helper()
 	result := make(chan [2]int, 1)
 	go runtime.app.QueueUpdate(func() { result <- [2]int{runtime.boardUI.lastStart, runtime.boardUI.lastEnd} })
@@ -139,7 +139,7 @@ func TestBoardSmokeHorizontalScroll(t *testing.T) {
 	// exercised at 40 (fit=2), not 80 (fit=4).
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
 	resizeBoardScreen(t, runtime, screen, 40, 30)
-	if start, end := boardStripWindow(t, runtime); start != 0 || end != 2 {
+	if start, end := readBoardStripWindow(t, runtime); start != 0 || end != 2 {
 		t.Fatalf("at 40 columns the visible window = [%d,%d), want [0,2) (fit=2)", start, end)
 	}
 	// planned (column 1) is in the [0,2) window; AIRA-50 (done, column 4) is not.
@@ -238,6 +238,163 @@ func TestBoardSearchResultsJump(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("board results smoke did not quit")
+	}
+}
+
+// boardInfoLongTitle is well over boardTitleMax (72 runes) with a distinctive
+// tail word: the column cell truncates it (so ENDMARKER never appears in a
+// column), but the info pane and the expand overlay must show it in FULL — so
+// ENDMARKER on screen proves the full, untruncated title is rendered there.
+const boardInfoLongTitle = "The board info pane must display a genuinely long ticket title in full and wrap it rather than cutting it off ENDMARKER"
+
+// boardInfoDispatcher gives the selected card (AIRA-1) a long title and a rich,
+// fully-established detail (assignee, labels, milestone, a relation, a finding
+// count and a two-line body) so the info-pane render can be driven end-to-end.
+type boardInfoDispatcher struct{ boardSmokeDispatcher }
+
+func (d boardInfoDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	ok := func(raw string) core.Response {
+		return core.Response{OK: true, Code: "OK", RawData: json.RawMessage(raw)}
+	}
+	switch request.Verb {
+	case "list":
+		query, _ := request.Args["query"].(string)
+		if strings.Contains(query, "status:planned") {
+			return ok(`{"total":1,"rows":[{"id":"AIRA-1","status":"planned","severity":"P0","kind":"bug","title":"` + boardInfoLongTitle + `","hold":false}]}`)
+		}
+		return ok(`{"total":0,"rows":[]}`)
+	case "show":
+		return ok(`{"title":"` + boardInfoLongTitle + `","status":"planned","severity":"P0","kind":"bug","assignee":"opus","labels":["ui","board"],"milestone":"v0.11","body":"BODYWORD is the first line of the body.\nA second body line follows here."}`)
+	case "link":
+		return ok(`[{"kind":"blocks","from":"AIRA-1","to":"AIRA-2"}]`)
+	case "find":
+		return ok(`{"total":3}`)
+	}
+	return d.boardSmokeDispatcher.Dispatch(ctx, scope, request)
+}
+
+// TestBoardInfoPaneRendersFullDetail is the load-bearing geometry test (the seams
+// #24 found statically unpinned: renderBoardInfo, layoutBoardInfo,
+// boardInfoPaneHeight, the 'f' toggle, the responsive overlay). It drives the
+// real tview runtime on a SimulationScreen and asserts the owner's requirements
+// at real sizes: the FULL title is never truncated in the pane, the body and
+// fields render when there is room, the overlay is not clipped at 80x24, and 'f'
+// collapses to a single column.
+func TestBoardInfoPaneRendersFullDetail(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	runtime := newBoardRuntime(ctx, boardInfoDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	// Wide and tall so the whole detail fits: full title, all fields, body.
+	resizeBoardScreen(t, runtime, screen, 120, 56)
+	waitForSimulationText(t, runtime, screen, "AIRA-1") // let the resize settle before input
+	// Focus draft→planned so AIRA-1 is selected and the pane fetches its detail.
+	screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone)
+	time.Sleep(30 * time.Millisecond)
+	// Wait on a body word — unique to the loaded pane detail (unlike "opus", which
+	// also appears in the sessions strip's lease row).
+	text := waitForSimulationText(t, runtime, screen, "BODYWORD")
+	for _, needle := range []string{"ENDMARKER", "opus", "v0.11", "blocks AIRA-2", "findings: 3", "BODYWORD"} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("wide info pane missing %q:\n%s", needle, text)
+		}
+	}
+	// The column cell truncates the same title, so the tail is pane-only: the whole
+	// title must not be sitting in a column row.
+	if strings.Count(text, "ENDMARKER") != 1 {
+		t.Fatalf("ENDMARKER should appear once (the pane), not in a truncated column cell:\n%s", text)
+	}
+
+	// Full-width toggle: 'f' collapses the strip to the single focused column.
+	screen.InjectKey(tcell.KeyRune, 'f', tcell.ModNone)
+	time.Sleep(30 * time.Millisecond)
+	if start, end := readBoardStripWindow(t, runtime); end-start != 1 {
+		t.Fatalf("'f' full-width did not collapse to one column: window [%d,%d)", start, end)
+	}
+	screen.InjectKey(tcell.KeyRune, 'f', tcell.ModNone) // back to multi-column
+	time.Sleep(30 * time.Millisecond)
+
+	// Shrink to the common 80x24 and open the expand overlay: its box must be
+	// clamped to fit, so its border title and the full title/body are on-screen
+	// (a fixed 100x30 box would be placed off-screen and clip all three).
+	resizeBoardScreen(t, runtime, screen, 80, 24)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	overlay := waitForSimulationText(t, runtime, screen, "Esc to close")
+	for _, needle := range []string{"AIRA-1", "ENDMARKER", "BODYWORD"} {
+		if !strings.Contains(overlay, needle) {
+			t.Fatalf("expand overlay at 80x24 missing %q (clipped?):\n%s", needle, overlay)
+		}
+	}
+	screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
+
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("board info pane smoke did not quit")
+	}
+}
+
+// TestBoardInfoPaneSurvivesResize is the re-review P2/P3 regression: a resize
+// across the wide/narrow threshold with NO follow-up keypress must re-compose the
+// pane (renderBoardInfo is width-dependent and a tcell resize fires beforeDraw but
+// not render()). The full title and fields must not vanish, and the "+N ↵" clip
+// disclosure must be conditional — present only when content actually overflows.
+func TestBoardInfoPaneSurvivesResize(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	runtime := newBoardRuntime(ctx, boardInfoDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	resizeBoardScreen(t, runtime, screen, 120, 56)
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone) // select AIRA-1
+	time.Sleep(30 * time.Millisecond)
+	wide := waitForSimulationText(t, runtime, screen, "BODYWORD")
+	if strings.Contains(wide, "↵") {
+		t.Fatalf("false clip disclosure at 120x56 where everything fits:\n%s", wide)
+	}
+
+	// Wide→narrow with NO keypress: content must re-compose (not vanish), and the
+	// now-clipped pane must disclose the overflow.
+	resizeBoardScreen(t, runtime, screen, 80, 24)
+	narrow := waitForSimulationText(t, runtime, screen, "ENDMARKER")
+	if !strings.Contains(narrow, "ENDMARKER") {
+		t.Fatalf("full title vanished after a wide→narrow resize with no keypress (P2):\n%s", narrow)
+	}
+	if !strings.Contains(narrow, "↵") {
+		t.Fatalf("clipped narrow pane did not disclose the overflow (P3):\n%s", narrow)
+	}
+
+	// Narrow→wide with NO keypress: content re-splits (title+fields back), and the
+	// false disclosure must be gone.
+	resizeBoardScreen(t, runtime, screen, 120, 56)
+	back := waitForSimulationText(t, runtime, screen, "BODYWORD")
+	if !strings.Contains(back, "ENDMARKER") || !strings.Contains(back, "opus") {
+		t.Fatalf("title/fields not restored after a narrow→wide resize with no keypress (P2):\n%s", back)
+	}
+	if strings.Contains(back, "↵") {
+		t.Fatalf("false clip disclosure after narrow→wide resize (P2):\n%s", back)
+	}
+
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("board info resize smoke did not quit")
 	}
 }
 

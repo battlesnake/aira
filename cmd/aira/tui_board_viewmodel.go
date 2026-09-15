@@ -305,8 +305,14 @@ func buildBoardModel(data boardData) boardModel {
 			status := textCell(row["status"])
 			hold, _ := row["hold"].(bool)
 			card := boardCard{
-				ID:       id,
-				Title:    boardEscapeTruncate(textCell(row["title"])),
+				ID: id,
+				// The RAW title: the info pane shows it in full (wrapped, never
+				// truncated — the owner's explicit ask) with dynamic colours off, so
+				// it needs neither the 72-rune cut nor the tag-escaping. The column
+				// TableCell (boardCardLine) is the one consumer that parses tags and
+				// is width-bounded, so it escapes+truncates there; and client search
+				// filters the raw title so matches past 72 runes are not lost.
+				Title:    textCell(row["title"]),
 				Severity: textCell(row["severity"]),
 				Kind:     textCell(row["kind"]),
 				Status:   status,
@@ -444,7 +450,10 @@ func boardCardLine(card boardCard) string {
 		line += "  " + card.Kind
 	}
 	if card.Title != "" {
-		line += "  " + card.Title
+		// Escape+truncate HERE (not at card construction): this TableCell parses
+		// colour tags and is width-bounded, whereas the info pane wants the raw,
+		// full title.
+		line += "  " + boardEscapeTruncate(card.Title)
 	}
 	return line
 }
