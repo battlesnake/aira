@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-243","project":"aira","title":"aira confine CLI discoverability (speed report): (1) 'confine --help' errors E_CONFINE_ARGUMENT_INVALID — no way to discover confine flags; (2) bare 'confine' + its error document ONLY management mode (--list/--budget/--dump/--kill/--status), NOT the launch options (--memory-reserve/--cpu-timeout/--delegate-ram/...); (3) a launch-intent flag without '-- cmd' mis-parses as management + rejects 'not valid for confine management' rather than 'not a launch flag' — this + no --help is why a peer mis-concluded no CPU flag exists. The launch parser's near-match suggestions ('did you mean --cpu-timeout?') are good but unreachable without '-- cmd'. Batch with AIRA-242 for v0.8.","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+---
+
