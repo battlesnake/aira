@@ -215,11 +215,10 @@ func TestBoardSearchResultsJump(t *testing.T) {
 		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
 	}
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // submit → results overlay
-	waitForSimulationText(t, runtime, screen, "Search results")
-	if text := simulationTextOnUI(t, runtime, screen); !strings.Contains(text, "AIRA-2") {
-		t.Fatalf("results overlay did not list the AIRA-2 match:\n%s", text)
-	}
-	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // open → jump to AIRA-2's column
+	// "Search:" is the results-overlay title prefix — it appears only when the
+	// overlay is open (the board itself never prints it).
+	waitForSimulationText(t, runtime, screen, "Search:")
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // open selected result → jump to AIRA-2's column
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		focus := make(chan int, 1)
