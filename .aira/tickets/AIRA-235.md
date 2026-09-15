@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-235","project":"aira","title":"aitest v0.7 S2b: largest-first per-test worker sizing","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","v0.7"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-235","project":"aira","title":"aitest v0.7 S2b: largest-first per-test worker sizing (requested=given + bin-packing dispatch)","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","aitest","v0.7"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-238","to":"AIRA-235"},{"kind":"relates","from":"AIRA-239","to":"AIRA-235"}]}
 ---
 
 Stage S2b of the aitest v0.7 design. Replaces the flat 512 MiB per-worker
