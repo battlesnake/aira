@@ -668,6 +668,14 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 		action = boardActCardUp
 	case tcell.KeyDown:
 		action = boardActCardDown
+	case tcell.KeyHome:
+		action = boardActCardFirst
+	case tcell.KeyEnd:
+		action = boardActCardLast
+	case tcell.KeyPgUp:
+		action = boardActCardPageUp
+	case tcell.KeyPgDn:
+		action = boardActCardPageDown
 	case tcell.KeyEnter:
 		action = boardActExpand
 	case tcell.KeyEscape:
