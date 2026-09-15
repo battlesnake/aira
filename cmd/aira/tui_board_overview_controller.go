@@ -28,17 +28,13 @@ type overviewState struct {
 	Search   overviewSearchState
 	HasData  bool
 	Stale    bool
-	// ErrorCode is the last list-fetch failure (kept as a banner while last-good
-	// cards stay on screen, spec §14). RegistryCode is the pure-read registry
-	// failure specifically (a torn/corrupt registry.jsonl).
-	ErrorCode    string
-	RegistryCode string
-	Warnings     []string
-	// Chosen is set (with cmdQuit) when the operator opens a project row: the
-	// outer runBoard loop reads it after the runtime tears down and switches into
-	// that project's board (spec §12). Quit ends the whole loop.
+	// ErrorCode is the last list-fetch failure (a registry-read / PathsFromEnv
+	// code), kept as a banner while the last-good cards stay on screen (spec §14).
+	ErrorCode string
+	// Chosen is set (with cmdQuit) when the operator opens a project row: the outer
+	// runBoard loop reads it after the runtime tears down and switches into that
+	// project's board (spec §12). A nil Chosen after teardown means quit.
 	Chosen *daemon.WorktreeScope
-	Quit   bool
 }
 
 type overviewSearchState struct {
@@ -58,7 +54,6 @@ func cloneOverviewState(source *overviewState) *overviewState {
 	clone.Cards = append([]overviewCard(nil), source.Cards...)
 	clone.Groups = append([]overviewGroup(nil), source.Groups...)
 	clone.Jobs = append([]boardSessionRow(nil), source.Jobs...)
-	clone.Warnings = append([]string(nil), source.Warnings...)
 	clone.Data = make(map[string]overviewCardData, len(source.Data))
 	for id, data := range source.Data {
 		clone.Data[id] = data
@@ -97,8 +92,6 @@ func overviewApplyList(state overviewState, data overviewListData) overviewState
 	state.HasData = true
 	state.Stale = false
 	state.ErrorCode = ""
-	state.RegistryCode = data.RegistryCode
-	state.Warnings = append([]string(nil), data.Warnings...)
 
 	live := map[string]bool{}
 	for _, card := range cards {
@@ -124,22 +117,34 @@ func overviewApplyJobs(state overviewState, confine *runner.ConfineListResult, c
 }
 
 // overviewApplyCard merges one project's lazily-fetched count/lease result into
-// the Data map (spec §11.6). An E_NOT_ADOPTED dispatch code marks the project
-// EJECTED (its registry entries persist, §11.5); any other read failure is
-// UNEVALUATED, never a fabricated "0" distribution (§14).
-func overviewApplyCard(state overviewState, result overviewCardResult) overviewState {
-	if result.ProjectID == "" {
-		return state
+// the Data map (spec §11.6), ALWAYS keyed by the card's registry ProjectID
+// resolved from the requested root — never by the fetch's fresh Discover id.
+// This is the P1 review fix: a card-time Discover failure (result==nil or
+// result.Code set, fresh id empty) and a fresh-id≠registry-id mismatch both land
+// a DEFINITE state (unevaluated/ejected) under the card's own key, so the card
+// never stays perpetual "…" and overviewCardNeedsFetch stops re-dispatching on
+// every focus. An E_NOT_ADOPTED dispatch marks the project EJECTED (its registry
+// entries persist, §11.5); any other read failure is UNEVALUATED, never a
+// fabricated "0" distribution (§14).
+func overviewApplyCard(state overviewState, root string, result *overviewCardResult) overviewState {
+	projectID, ok := overviewProjectForRoot(state.Cards, root)
+	if !ok {
+		return state // the card vanished on a concurrent list rebuild
 	}
 	data := overviewCardData{Loaded: true}
 	switch {
+	case result == nil:
+		data.Code = tuiDecodeError
 	case result.Code == "E_NOT_ADOPTED":
 		data.Ejected = true
 	case result.Code != "":
-		data.Code = result.Code
+		data.Code = result.Code // a card-time Discover/scope failure, or a count refusal
+	case result.ProjectID != "" && result.ProjectID != projectID:
+		data.Code = overviewIdentityMismatchCode // fresh Discover disagrees with the registry — skip
 	default:
 		data.Distribution = result.Distribution
 		data.Total = result.Total
+		data.Stale = result.Stale
 		if result.LeaseCode == "E_NOT_ADOPTED" {
 			data.Ejected = true
 		} else if result.LeaseCode != "" {
@@ -151,7 +156,7 @@ func overviewApplyCard(state overviewState, result overviewCardResult) overviewS
 	if state.Data == nil {
 		state.Data = map[string]overviewCardData{}
 	}
-	state.Data[result.ProjectID] = data
+	state.Data[projectID] = data
 	return state
 }
 
@@ -210,7 +215,6 @@ func onOverviewAction(state tuiState, action overviewAction) (tuiState, []tuiCmd
 	}
 	switch action {
 	case overviewActQuit:
-		state.Overview.Quit = true
 		state.ShuttingDown = true
 		return state, []tuiCmd{{Kind: cmdQuit}}
 	case overviewActRefresh:
@@ -254,6 +258,19 @@ func overviewMove(state overviewState, delta int) overviewState {
 func overviewLazyFetchFocused(state tuiState) (tuiState, []tuiCmd) {
 	card, ok := overviewSelectedCard(*state.Overview)
 	if !ok || !overviewCardNeedsFetch(*state.Overview, card) {
+		return state, nil
+	}
+	return requestPanelRefresh(state, overviewCardView(card.CanonicalRoot))
+}
+
+// overviewRefreshFocusedCard re-fetches the focused available card's count/lease
+// UNCONDITIONALLY (ignoring the loaded gate), so the jobs-strip tick keeps the
+// focused card's distribution from going arbitrarily stale (spec §13 deviation:
+// only the focused card is refreshed on the tick — bounded to one project, the
+// honest minimum). Unfocused cards stay lazy.
+func overviewRefreshFocusedCard(state tuiState) (tuiState, []tuiCmd) {
+	card, ok := overviewSelectedCard(*state.Overview)
+	if !ok || card.State != "available" || !card.HasScope {
 		return state, nil
 	}
 	return requestPanelRefresh(state, overviewCardView(card.CanonicalRoot))

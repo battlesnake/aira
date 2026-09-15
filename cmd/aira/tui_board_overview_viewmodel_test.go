@@ -207,11 +207,18 @@ func TestOverviewLoadedDistribution(t *testing.T) {
 	card := buildOneCard(t, group, overviewDiscovery{Slug: "p1"})
 	data := overviewCardData{Loaded: true, Distribution: map[string]int{"planned": 3, "done": 5}, Total: 8, LeaseKnown: true, LeaseCount: 2}
 	label := overviewStateLabel(card, data, true)
+	if !strings.Contains(label, "8 tickets") {
+		// The rendered Total (P3 review fix): 8 tickets, then the per-status breakdown.
+		t.Fatalf("label should render the total ticket count: %q", label)
+	}
 	if !strings.Contains(label, "planned:3") || !strings.Contains(label, "done:5") {
 		t.Fatalf("distribution label=%q", label)
 	}
 	if strings.Contains(label, "draft:0") {
 		t.Fatalf("distribution showed a zero bucket: %q", label)
+	}
+	if strings.Contains(label, "stale") {
+		t.Fatalf("a non-stale card must not show a stale marker: %q", label)
 	}
 	if activity := overviewActivityText(card, data, true); activity != "act 2" {
 		t.Fatalf("activity=%q, want 'act 2' (2 leases + 0 owned jobs)", activity)

@@ -245,12 +245,23 @@ use), never in core:
    checkout it shows (per-worktree truth: the same ticket can differ across
    branches).
 5. `app.Discover(root)` → slug + scope; **render every project with its state
-   code** rather than silently skipping: available, `E_NOT_ADOPTED` (ejected but
-   registry entries persist, `store.go:1953-1957`), or Discover-failed
-   (unavailable + reason). This resolves the §14 contradiction — nothing is dropped.
+   code** rather than silently skipping. **Correction (Increment-2 build):
+   `app.Discover` never returns `E_NOT_ADOPTED` — an ejected project's
+   `.aira/config` persists on disk, so Discover SUCCEEDS. The state is therefore
+   TWO-STAGE: Discover → `available` (has a dispatchable scope) or
+   `unavailable(<code>)` (E_CONFIG_MISSING / E_CONFIG_INVALID / E_NOT_PROJECT);
+   then the lazy DISPATCH (step 6) → `ejected` when `count`/`lease` return
+   `E_NOT_ADOPTED` (the daemon's `storeForScope` refuses an ejected scope,
+   `server.go`), else `unevaluated(<code>)` on any other read failure. An
+   unfocused ejected project reads "…" until its lazy read arrives.** This
+   resolves the §14 contradiction — nothing is dropped.
 6. For each **available** project dispatch `count --by status` + `lease ls` → a card:
    slug, prefixes, status distribution, activity count (open leases + owned jobs).
-   One machine-wide `confine-list` renders the jobs strip.
+   One machine-wide `confine-list` renders the jobs strip. A card's lazy result is
+   ALWAYS keyed by the card's registry `ProjectID` (resolved from the requested
+   root), never by the fetch's fresh Discover id — so a card-time Discover failure
+   or a fresh-id≠registry-id mismatch lands a definite `unevaluated(<code>)` rather
+   than a card that loops "…" and re-dispatches on every focus.
 
 **Bounded side-effect (disclosed):** dispatching a read to a project the daemon has
 not cached since boot appends **one `registry.jsonl` breadcrumb per cold project**
@@ -295,6 +306,12 @@ card focused/scrolled into view — not eagerly to all N on open.
 - **Overview:** a modest seconds-timer (like `viewTop`'s 1 s tick), lazy per-card
   dispatch. Per refresh the overview is ~`2N+1` reads (`count` + `lease ls` per
   focused project + one machine-wide `confine-list`) — kept lean by laziness.
+  **Deviation (Increment-2 build): the seconds-tick refreshes the machine-wide
+  jobs strip AND re-fetches ONLY the currently-focused card's `count`/`lease` on
+  the same cadence, so the focused card's distribution is not arbitrarily stale;
+  unfocused cards stay lazy (fetched once on first focus). A card's `count`
+  envelope carrying `W_STALE_INDEX` is surfaced as a per-card `· stale` marker
+  (§14), so a reconcile-pending distribution never reads authoritative.**
 - Each `list`/`ready`/`count` re-scans ticket files on disk (not a cheap SQLite
   read); `worktree-audit` is never in a refresh loop.
 
@@ -317,10 +334,12 @@ card focused/scrolled into view — not eagerly to all N on open.
 
 ## 15. Keybindings (read-only)
 
-`q` quit (in overview mode: quit; in board mode reached from overview: back to
-overview via the outer loop) · `←/→` or `h/l` move column · `↑/↓` move card ·
-`Enter` drill in / (overview) open project · `Esc` back/close · `/` search ·
-`r` refresh · `o` (Increment 2) to overview. No mutation keys.
+`q` quit — **in EVERY mode `q` quits the whole viewer** (Increment-2 build
+correction: the earlier "in board mode reached from overview: back to overview"
+was wrong and contradicted §12; returning to the overview is `o`, and `q` ends
+the outer loop). `←/→` or `h/l` move column · `↑/↓` move card · `Enter` drill in
+/ (overview) open project · `Esc` back/close · `/` search · `r` refresh · `o`
+(Increment 2) board → overview. No mutation keys.
 
 ## 16. Increments
 

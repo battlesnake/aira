@@ -127,9 +127,15 @@ type overviewListData struct {
 	Scopes       map[string]daemon.WorktreeScope
 	Confine      *runner.ConfineListResult
 	ConfineCode  string
-	RegistryCode string // registry read failed (E_CONFIG_INVALID / io error)
-	Warnings     []string
+	RegistryCode string // registry read failed (E_CONFIG_INVALID / io error) — the only whole-list error
 }
+
+// overviewIdentityMismatchCode marks a card whose canonical root, re-Discovered
+// at card-fetch time, now hashes to a DIFFERENT project id than the registry
+// entry the card was built from (the repo's git common-dir moved). The daemon's
+// own registry pass treats this as a skip; the overview mirrors it by rendering
+// the card unevaluated rather than attributing a foreign project's counts to it.
+const overviewIdentityMismatchCode = "E_PROJECT_IDENTITY"
 
 // overviewCard is one project's static display skeleton. The DYNAMIC per-card
 // count/lease data lives separately in the reducer (overviewCardData) so it
@@ -211,6 +217,19 @@ func buildOverviewCards(data overviewListData) []overviewCard {
 	return cards
 }
 
+// overviewProjectForRoot resolves a requested canonical root back to the card's
+// registry ProjectID, so a lazy per-card result is always keyed by the display
+// id — never by a fresh Discover id that may be empty (card-time failure) or
+// disagree with the registry (P1 review fix). Returns false if the card vanished.
+func overviewProjectForRoot(cards []overviewCard, root string) (string, bool) {
+	for _, card := range cards {
+		if card.CanonicalRoot == root {
+			return card.ProjectID, true
+		}
+	}
+	return "", false
+}
+
 // shortProjectID is a stable human fragment of a project id hash for a project
 // with no readable slug (unavailable). It never fabricates a name.
 func shortProjectID(projectID string) string {
@@ -233,6 +252,7 @@ type overviewCardData struct {
 	Code         string // a non-ejected read failure → unevaluated
 	Distribution map[string]int
 	Total        int
+	Stale        bool // the count reply carried W_STALE_INDEX (reconcile pending, §14)
 	LeaseCount   int
 	LeaseKnown   bool
 	LeaseCode    string
@@ -254,23 +274,28 @@ func overviewStateLabel(card overviewCard, data overviewCardData, present bool) 
 	if data.Code != "" {
 		return "unevaluated (" + data.Code + ")"
 	}
-	return "available · " + overviewDistributionText(data.Distribution)
+	label := "available · " + strconv.Itoa(data.Total) + " tickets"
+	if breakdown := overviewDistributionText(data.Distribution); breakdown != "" {
+		label += " · " + breakdown
+	}
+	if data.Stale {
+		// Reconcile pending: the count is read from canonical files and is correct,
+		// but the derived index is behind (spec §14). Disclose it, never silently.
+		label += " · stale"
+	}
+	return label
 }
 
 // overviewDistributionText renders the status distribution in canonical column
-// order, omitting zero buckets, so the summary matches the board's columns.
+// order, omitting zero buckets, so the summary matches the board's columns. It
+// returns "" for an empty distribution — the "N tickets" total already covers a
+// zero-ticket project, so no fabricated "0 tickets" breakdown is emitted.
 func overviewDistributionText(distribution map[string]int) string {
-	if len(distribution) == 0 {
-		return "0 tickets"
-	}
 	parts := make([]string, 0, len(distribution))
 	for _, status := range boardStatusOrder() {
 		if count := distribution[status]; count > 0 {
 			parts = append(parts, status+":"+strconv.Itoa(count))
 		}
-	}
-	if len(parts) == 0 {
-		return "0 tickets"
 	}
 	return strings.Join(parts, " ")
 }

@@ -66,26 +66,39 @@ type boardWidgets struct {
 // ctx cancelled) before the next mode starts. Every runtime routes through
 // runTUIRuntime — never app.Run() — so a screen-init failure is an honest
 // E_INTERNAL, not a panic (AIRA-134).
-func runBoard(ctx context.Context, dispatcher Dispatcher, paths daemon.Paths, scope daemon.WorktreeScope, startOverview bool, stdin io.Reader, stdout, stderr io.Writer) int {
+func runBoard(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, startOverview bool, stdin io.Reader, stdout, stderr io.Writer) int {
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	overview := startOverview
 	for {
 		if overview {
-			chosen, code := runOverviewMode(ctx, dispatcher, paths, signals, stdin, stdout, stderr, nil)
+			chosen, code := runOverviewMode(ctx, dispatcher, signals, stdin, stdout, stderr, boardHopScreen())
 			if chosen == nil {
 				return code // `q`, a signal, or a screen-init failure — end the loop.
 			}
 			scope, overview = *chosen, false
 			continue
 		}
-		toOverview, code := runProjectBoard(ctx, dispatcher, scope, signals, stdin, stdout, stderr, nil)
+		toOverview, code := runProjectBoard(ctx, dispatcher, scope, signals, stdin, stdout, stderr, boardHopScreen())
 		if !toOverview {
 			return code // `q`, a signal, or a screen-init failure — end the loop.
 		}
 		overview = true
 	}
+}
+
+// boardScreenFactory, if set, supplies the tcell.Screen for each per-mode runtime
+// the outer loop builds (nil in production → a real terminal). Test-only: driving
+// a full overview→board→overview→quit cycle through runBoard itself needs
+// injectable simulation screens.
+var boardScreenFactory func() tcell.Screen
+
+func boardHopScreen() tcell.Screen {
+	if boardScreenFactory != nil {
+		return boardScreenFactory()
+	}
+	return nil
 }
 
 // runProjectBoard runs ONE per-project board runtime to a transition. It returns
@@ -107,8 +120,9 @@ func runProjectBoard(ctx context.Context, dispatcher Dispatcher, scope daemon.Wo
 	if boardHopObserver != nil {
 		boardHopObserver(runtime)
 	}
-	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
+	signalDone := runHopSignalLoop(runtime, signals)
 	code := runTUIRuntime(runtime, stderr)
+	<-signalDone // join before returning: never two loops live at once (P2 review fix)
 	if runtime.state.Board != nil && runtime.state.Board.ToOverview {
 		return true, 0
 	}
@@ -119,18 +133,33 @@ func runProjectBoard(ctx context.Context, dispatcher Dispatcher, scope daemon.Wo
 // (chosenScope, exitCode): a non-nil scope means the operator pressed Enter on a
 // project row and the loop should open that project's board; nil means quit. The
 // gate is the Chosen flag alone, for the reason runProjectBoard's is.
-func runOverviewMode(ctx context.Context, dispatcher Dispatcher, paths daemon.Paths, signals <-chan os.Signal, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) (*daemon.WorktreeScope, int) {
+func runOverviewMode(ctx context.Context, dispatcher Dispatcher, signals <-chan os.Signal, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) (*daemon.WorktreeScope, int) {
 	runtime := newOverviewRuntime(ctx, dispatcher, stdin, stdout, stderr, screen)
 	if boardHopObserver != nil {
 		boardHopObserver(runtime)
 	}
-	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
+	signalDone := runHopSignalLoop(runtime, signals)
 	code := runTUIRuntime(runtime, stderr)
+	<-signalDone // join before returning: never two loops live at once (P2 review fix)
 	if runtime.state.Overview != nil && runtime.state.Overview.Chosen != nil {
 		chosen := *runtime.state.Overview.Chosen
 		return &chosen, 0
 	}
 	return nil, code
+}
+
+// runHopSignalLoop starts a per-hop signal loop bound to the runtime's ctx and
+// returns a channel that closes when it exits. run() cancels runtime.ctx before
+// runTUIRuntime returns, so the caller joins on this channel to guarantee the
+// loop is fully gone before the hop returns — no two signal loops are ever live
+// at once across a mode transition, and none outlives its hop (P2 review fix).
+func runHopSignalLoop(runtime *tuiRuntime, signals <-chan os.Signal) chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
+	}()
+	return done
 }
 
 // boardHopObserver, if set, receives each runtime the mode-switch hop functions

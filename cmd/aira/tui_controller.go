@@ -616,18 +616,26 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 		}
 		panel.Status = panelReady
 		state.Panels[result.View] = panel
+		var commands []tuiCmd
 		if !state.PendingRefresh[viewOverviewJobs] {
 			state.PendingRefresh[viewOverviewJobs] = true
-			return state, []tuiCmd{{Kind: cmdScheduleRefresh, View: viewOverviewJobs, Backoff: topRefreshInterval}}
+			commands = append(commands, tuiCmd{Kind: cmdScheduleRefresh, View: viewOverviewJobs, Backoff: topRefreshInterval})
 		}
-		return state, nil
+		// Piggyback a modest focused-card refresh on the jobs cadence so the focused
+		// card's distribution is not arbitrarily stale (spec §13 deviation).
+		var refresh []tuiCmd
+		state, refresh = overviewRefreshFocusedCard(state)
+		return state, append(commands, refresh...)
 	}
-	if _, ok := overviewCardViewRoot(result.View); ok {
-		// AIRA-252 Increment 2. One project's lazy count/lease result, keyed by
-		// ProjectID so it survives a list rebuild. An E_NOT_ADOPTED dispatch marks
-		// the project ejected; any other failure is unevaluated (spec §11.6, §14).
-		if state.Overview != nil && result.OverviewCard != nil {
-			*state.Overview = overviewApplyCard(*state.Overview, *result.OverviewCard)
+	if root, ok := overviewCardViewRoot(result.View); ok {
+		// AIRA-252 Increment 2. One project's lazy count/lease result, ALWAYS keyed
+		// by the card's registry ProjectID resolved from the requested root (never by
+		// the fetch's fresh Discover id), so a card-time failure lands a definite
+		// unevaluated/ejected state — never perpetual "…" that re-dispatches on every
+		// focus (P1 review fix). E_NOT_ADOPTED → ejected; any other failure →
+		// unevaluated (spec §11.6, §14).
+		if state.Overview != nil {
+			*state.Overview = overviewApplyCard(*state.Overview, root, result.OverviewCard)
 		}
 		panel.Status = panelReady
 		state.Panels[result.View] = panel

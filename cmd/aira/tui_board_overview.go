@@ -13,7 +13,6 @@ package main
 
 import (
 	"strconv"
-	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -55,10 +54,15 @@ func (r *tuiRuntime) buildOverviewWidgets() {
 			r.render()
 			r.submitCommands(commands)
 		case tcell.KeyEscape:
+			// Clearing the filter re-focuses a card that may be unloaded, so it can
+			// emit a lazy fetch — submit it (the executor's no-drop invariant); a
+			// discarded cmdFetch wedges that panel InFlight forever (P2 review fix).
+			var commands []tuiCmd
 			r.overviewUI.inputOpen = false
-			r.state, _ = onOverviewSearchSubmit(r.state, "")
+			r.state, commands = onOverviewSearchSubmit(r.state, "")
 			r.outerPages.HidePage(overviewSearchPage)
 			r.render()
+			r.submitCommands(commands)
 		}
 	})
 	r.overviewUI = ui
@@ -156,25 +160,20 @@ func (r *tuiRuntime) openOverviewSearch() {
 	r.render()
 }
 
-// overviewBannerText is the honest overview-level banner (spec §14): a registry
-// read failure, a stale last-good marker, and the deduped warnings. Empty when
-// the overview is fresh.
+// overviewBannerText is the honest overview-level banner (spec §14). The only
+// whole-list failure is the project-list read (the registry read / PathsFromEnv,
+// which fetchTUIView diverts into result.Code with Overview=nil); it names THAT
+// cause rather than fabricating "daemon unreachable" (a per-project Discover or
+// confine failure is carried in-data, not here). Empty when the overview is
+// fresh.
 func overviewBannerText(ov *overviewState) string {
-	parts := make([]string, 0, 3)
-	if ov.Stale && ov.ErrorCode != "" {
-		if ov.HasData {
-			parts = append(parts, "[red]daemon unreachable — showing last-good (ERROR "+ov.ErrorCode+")[-]")
-		} else {
-			parts = append(parts, "[red]overview unavailable (ERROR "+ov.ErrorCode+")[-]")
-		}
+	if !ov.Stale || ov.ErrorCode == "" {
+		return ""
 	}
-	if ov.RegistryCode != "" {
-		parts = append(parts, "[orange]registry read incomplete (ERROR "+tview.Escape(ov.RegistryCode)+")[-]")
+	if ov.HasData {
+		return "[red]project list read failed (ERROR " + tview.Escape(ov.ErrorCode) + ") — showing last-good[-]"
 	}
-	for _, warning := range ov.Warnings {
-		parts = append(parts, "[orange]"+tview.Escape(warning)+"[-]")
-	}
-	return strings.Join(parts, "  |  ")
+	return "[red]project list unavailable (ERROR " + tview.Escape(ov.ErrorCode) + ")[-]"
 }
 
 // overviewEmptyText distinguishes "no aira projects registered" from "the

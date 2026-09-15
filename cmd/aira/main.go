@@ -502,7 +502,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 			}
 		}
-		return runBoard(context.Background(), dispatcher, paths, boardScope, startOverview, stdin, stdout, stderr)
+		return runBoard(context.Background(), dispatcher, boardScope, startOverview, stdin, stdout, stderr)
 	}
 	scope, err := scopeForCWD(context.Background(), scopeDir, paths)
 	if err != nil {

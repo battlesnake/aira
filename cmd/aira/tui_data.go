@@ -324,6 +324,7 @@ type overviewCardResult struct {
 	ProjectID    string
 	Distribution map[string]int
 	Total        int
+	Stale        bool // the count reply's envelope carried W_STALE_INDEX (§14)
 	Code         string
 	LeaseCount   int
 	LeaseCode    string
@@ -393,10 +394,19 @@ func fetchOverviewCard(ctx context.Context, dispatcher Dispatcher, root string) 
 		Total        int            `json:"total"`
 		Distribution map[string]int `json:"distribution"`
 	}
-	result.Code = dispatchTUIData(ctx, dispatcher, scope,
+	// Use the warnings-carrying decode so W_STALE_INDEX on the count envelope is
+	// surfaced as a per-card stale marker (spec §14) rather than the distribution
+	// reading authoritative when a reconcile is pending (P2 review fix).
+	var warnings []string
+	result.Code, warnings = dispatchTUIDataWithWarnings(ctx, dispatcher, scope,
 		core.Request{Verb: "count", Args: map[string]any{"query": "", "by": "status"}}, &count)
 	if result.Code == "" {
 		result.Distribution, result.Total = count.Distribution, count.Total
+		for _, warning := range warnings {
+			if warning == "W_STALE_INDEX" {
+				result.Stale = true
+			}
+		}
 	}
 	var leases struct {
 		Total int                  `json:"total"`

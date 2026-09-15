@@ -6,6 +6,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -166,7 +168,7 @@ func TestBoardOuterLoopTransitions(t *testing.T) {
 		}
 		done := make(chan result, 1)
 		go func() {
-			scope, code := runOverviewMode(ctx, overviewFixtureDispatcher{}, daemon.Paths{}, signals, nil, nil, nil, screen)
+			scope, code := runOverviewMode(ctx, overviewFixtureDispatcher{}, signals, nil, nil, nil, screen)
 			done <- result{scope, code}
 		}()
 		rt := <-runtimes
@@ -220,9 +222,14 @@ func TestBoardOuterLoopTransitions(t *testing.T) {
 		t.Fatalf("board `o` hop should return toOverview=true (code %d)", code)
 	}
 
-	// Several full cycles must not leak goroutines (watch loop + executor are
-	// joined by run() before it returns). A small tolerance covers the pump's
-	// documented abandonable-QueueUpdateDraw race (tui.go coordinateShutdown).
+	// MANY full cycles must not leak goroutines (watch loop + executor + the joined
+	// per-hop signal loop are all gone before each hop returns). The tolerance is
+	// tied to the cycle count: a genuine PER-CYCLE leak (a stuck watch/signal
+	// goroutine) would grow by ~cycles, so a small absolute cap far below the cycle
+	// count fails it while tolerating the pump's documented abandonable-
+	// QueueUpdateDraw race (tui.go coordinateShutdown) (P2 review fix: was >4 over 4
+	// cycles, which a +1/cycle leak survived).
+	const cycles = 12
 	settle := func() {
 		for i := 0; i < 20; i++ {
 			runtime.GC()
@@ -231,7 +238,7 @@ func TestBoardOuterLoopTransitions(t *testing.T) {
 	}
 	settle()
 	before := runtime.NumGoroutine()
-	for i := 0; i < 4; i++ {
+	for i := 0; i < cycles; i++ {
 		got, _ := overviewHop()
 		if got == nil || got.ProjectID != "P1" {
 			t.Fatalf("cycle %d overview chose %v, want P1", i, got)
@@ -242,7 +249,210 @@ func TestBoardOuterLoopTransitions(t *testing.T) {
 	}
 	settle()
 	after := runtime.NumGoroutine()
-	if after-before > 4 {
-		t.Fatalf("goroutine leak across transitions: before=%d after=%d (>4 growth)", before, after)
+	if after-before > 3 { // 12 cycles: a +1/cycle leak would be ~12, well past 3
+		t.Fatalf("goroutine leak across %d transitions: before=%d after=%d (>3 growth)", cycles, before, after)
+	}
+}
+
+// overviewCountingDispatcher wraps the fixture and tallies dispatches per verb,
+// so a test can assert the overview fetches count LAZILY — one focused card, not
+// a fan-out to all N (P2 review fix: the fixture counted nothing, so a fan-out
+// mutation passed silently).
+type overviewCountingDispatcher struct {
+	overviewFixtureDispatcher
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (d *overviewCountingDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	d.mu.Lock()
+	if d.counts == nil {
+		d.counts = map[string]int{}
+	}
+	d.counts[request.Verb]++
+	d.mu.Unlock()
+	return d.overviewFixtureDispatcher.Dispatch(ctx, scope, request)
+}
+
+func (d *overviewCountingDispatcher) count(verb string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.counts[verb]
+}
+
+// TestOverviewLazyCountFetchedOnce pins laziness (spec §11.6): with TWO projects,
+// opening the overview dispatches `count` for exactly the ONE focused card — not
+// a fan-out to both. The counter is read as soon as the focused distribution
+// renders (well within the 1s jobs-tick that would later refresh it).
+func TestOverviewLazyCountFetchedOnce(t *testing.T) {
+	installOverviewFixtureSeams(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	dispatcher := &overviewCountingDispatcher{}
+	rt := newOverviewRuntime(ctx, dispatcher, nil, nil, nil, screen)
+	done := make(chan int, 1)
+	go func() { done <- runTUIRuntime(rt, nil) }()
+	waitForSimulationText(t, rt, screen, "alpha")
+	resizeBoardScreen(t, rt, screen, 160, 40)
+	waitForSimulationText(t, rt, screen, "planned:3") // the focused card's count landed
+	if got := dispatcher.count("count"); got != 1 {
+		// Mutation guard: a fan-out fetching every card would make this 2 immediately.
+		t.Fatalf("overview open dispatched %d count reads, want exactly 1 (lazy, focused card only)", got)
+	}
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("overview lazy-count smoke did not quit")
+	}
+}
+
+// TestBoardHopsQuitAndSignal pins the transition GATE (P1 review fix — it was
+// porous: no test drove the hop functions to a quit and asserted (false,_)/
+// (nil,_), so a mutation making a hop always return a transition stayed green).
+// It drives the REAL hop functions to BOTH a `q` keypress and a signal send,
+// asserting each returns the QUIT tuple (no transition).
+func TestBoardHopsQuitAndSignal(t *testing.T) {
+	installOverviewFixtureSeams(t)
+	runtimes := make(chan *tuiRuntime, 1)
+	prev := boardHopObserver
+	boardHopObserver = func(rt *tuiRuntime) { runtimes <- rt }
+	t.Cleanup(func() { boardHopObserver = prev })
+
+	// A board hop, driven by `quitKey` (a rune) OR by sending a signal when
+	// quitKey==0. It must return (false, _) — a quit, never a transition.
+	runBoardHopTo := func(quitKey rune) (bool, int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		signals := make(chan os.Signal, 1)
+		screen := tcell.NewSimulationScreen("UTF-8")
+		type result struct {
+			to   bool
+			code int
+		}
+		done := make(chan result, 1)
+		go func() {
+			to, code := runProjectBoard(ctx, boardSmokeDispatcher{}, daemon.WorktreeScope{}, signals, nil, nil, nil, screen)
+			done <- result{to, code}
+		}()
+		rt := <-runtimes
+		waitForSimulationText(t, rt, screen, "planned")
+		if quitKey != 0 {
+			screen.InjectKey(tcell.KeyRune, quitKey, tcell.ModNone)
+		} else {
+			signals <- syscall.SIGINT
+		}
+		select {
+		case r := <-done:
+			return r.to, r.code
+		case <-time.After(4 * time.Second):
+			t.Fatal("board hop did not return")
+			return false, 0
+		}
+	}
+	// An overview hop, same shape, must return (nil, _).
+	runOverviewHopTo := func(quitKey rune) (*daemon.WorktreeScope, int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		signals := make(chan os.Signal, 1)
+		screen := tcell.NewSimulationScreen("UTF-8")
+		type result struct {
+			scope *daemon.WorktreeScope
+			code  int
+		}
+		done := make(chan result, 1)
+		go func() {
+			scope, code := runOverviewMode(ctx, overviewFixtureDispatcher{}, signals, nil, nil, nil, screen)
+			done <- result{scope, code}
+		}()
+		rt := <-runtimes
+		waitForSimulationText(t, rt, screen, "alpha")
+		if quitKey != 0 {
+			screen.InjectKey(tcell.KeyRune, quitKey, tcell.ModNone)
+		} else {
+			signals <- syscall.SIGINT
+		}
+		select {
+		case r := <-done:
+			return r.scope, r.code
+		case <-time.After(4 * time.Second):
+			t.Fatal("overview hop did not return")
+			return nil, 0
+		}
+	}
+
+	if to, _ := runBoardHopTo('q'); to {
+		t.Fatalf("board `q` must return toOverview=false (quit), not a transition")
+	}
+	if to, _ := runBoardHopTo(0); to {
+		t.Fatalf("board SIGINT must return toOverview=false (quit), not a transition")
+	}
+	if scope, _ := runOverviewHopTo('q'); scope != nil {
+		t.Fatalf("overview `q` must return a nil chosen scope (quit), got %v", scope)
+	}
+	if scope, _ := runOverviewHopTo(0); scope != nil {
+		t.Fatalf("overview SIGINT must return a nil chosen scope (quit), got %v", scope)
+	}
+}
+
+// loopDispatcher answers BOTH the overview's count and the board's list/ready/
+// lease/confine/watch, so runBoard can be driven through a full mode cycle.
+type loopDispatcher struct{ boardSmokeDispatcher }
+
+func (d loopDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	if request.Verb == "count" {
+		return core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{"total":8,"distribution":{"planned":3,"done":5}}`)}
+	}
+	return d.boardSmokeDispatcher.Dispatch(ctx, scope, request)
+}
+
+// TestBoardRunLoopFullCycle drives runBoard ITSELF (its loop body, previously
+// unexercised — P1 review fix) through a full overview → project → overview →
+// quit cycle, via the screen-factory + observer seams, asserting it exits 0.
+func TestBoardRunLoopFullCycle(t *testing.T) {
+	installOverviewFixtureSeams(t)
+	screens := make(chan tcell.SimulationScreen, 1)
+	runtimes := make(chan *tuiRuntime, 1)
+	prevFactory, prevObserver := boardScreenFactory, boardHopObserver
+	boardScreenFactory = func() tcell.Screen {
+		s := tcell.NewSimulationScreen("UTF-8")
+		screens <- s
+		return s
+	}
+	boardHopObserver = func(rt *tuiRuntime) { runtimes <- rt }
+	t.Cleanup(func() { boardScreenFactory, boardHopObserver = prevFactory, prevObserver })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		done <- runBoard(ctx, loopDispatcher{}, daemon.WorktreeScope{}, true /* startOverview */, nil, nil, nil)
+	}()
+
+	// hop 1: overview → Enter opens P1.
+	s1, rt1 := <-screens, <-runtimes
+	waitForSimulationText(t, rt1, s1, "alpha")
+	resizeBoardScreen(t, rt1, s1, 160, 40)
+	waitForSimulationText(t, rt1, s1, "planned:3")
+	s1.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+
+	// hop 2: the per-project board → `o` returns to the overview.
+	s2, rt2 := <-screens, <-runtimes
+	waitForSimulationText(t, rt2, s2, "planned")
+	s2.InjectKey(tcell.KeyRune, 'o', tcell.ModNone)
+
+	// hop 3: back at the overview → `q` ends the whole loop.
+	s3, rt3 := <-screens, <-runtimes
+	waitForSimulationText(t, rt3, s3, "alpha")
+	s3.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("runBoard full cycle exited %d, want 0", code)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("runBoard full cycle did not exit")
 	}
 }
