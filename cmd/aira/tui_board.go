@@ -178,6 +178,14 @@ func (r *tuiRuntime) renderBoard() {
 		}
 	}
 	r.boardUI.sessions.SetText(boardSessionsText(bs.Model.Sessions))
+	// Disclose the true session count in the strip title: the strip is a fixed
+	// height, so extra rows clip, and the count keeps that omission from being
+	// silent (the same honesty rule the column headers follow).
+	sessionCount := len(bs.Model.Sessions)
+	if sessionCount == 1 && bs.Model.Sessions[0].Text == "no active claims" {
+		sessionCount = 0
+	}
+	r.boardUI.sessions.SetTitle(" Sessions (" + itoa(sessionCount) + ") ")
 	r.boardUI.footer.SetText(boardFooterText(bs))
 	if bs.DrillID != "" {
 		r.boardUI.detail.SetTitle(" " + bs.DrillID + " (Esc to close) ")
