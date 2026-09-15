@@ -8,6 +8,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/domain"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -41,6 +42,22 @@ func decodeTUIResponse(response core.Response, target any) string {
 		return tuiDecodeError
 	}
 	return ""
+}
+
+// decodeTUIResponseWithWarnings is decodeTUIResponse plus the envelope's
+// Response.Warnings, which the plain decoder discards (AIRA-252). W_STALE_INDEX
+// rides the response envelope, NOT the row data (TicketRecord.Warnings is
+// json:"-"), so the board surfaces it as a board-level banner (spec §5).
+func decodeTUIResponseWithWarnings(response core.Response, target any) (code string, warnings []string) {
+	code = decodeTUIResponse(response, target)
+	return code, append([]string(nil), response.Warnings...)
+}
+
+func dispatchTUIDataWithWarnings(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, request core.Request, target any) (code string, warnings []string) {
+	if err := ctx.Err(); err != nil {
+		return "E_TUI_CANCELLED", nil
+	}
+	return decodeTUIResponseWithWarnings(dispatcher.Dispatch(ctx, scope, request), target)
 }
 
 func fetchTUIView(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, view tuiView, generation int) fetchResult {
@@ -111,8 +128,98 @@ func fetchTUIView(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 			return result
 		}
 		result.Top = &data
+	case viewBoard:
+		// AIRA-252. One composite fetch of the whole board: seven per-status lists,
+		// the ready overlay, held leases, and the machine-wide confine listing. The
+		// raw envelopes are carried to the reducer, which builds the honest view-model
+		// (buildBoardModel) while preserving the interactive selection across refreshes.
+		//
+		// A shared transport failure (every grid section failed with the same code —
+		// the daemon went away) becomes result.Code so the reducer keeps the last-good
+		// columns and raises one banner (spec §14); a partial failure keeps the data
+		// and shows the failed columns' own error headers.
+		data := fetchBoardData(ctx, dispatcher, scope)
+		if code := boardHasTransportBanner(*data); code != "" {
+			result.Code = code
+		} else {
+			result.Board = data
+		}
 	}
 	return result
+}
+
+// fetchBoardData composes the board's read surface. Each section carries its own
+// per-section code so a single failed column never blanks the other six; the
+// staleness warnings from every read are deduped into data.Warnings for the
+// board banner (spec §5, §14). The confine listing is machine-wide, so it is
+// dispatched with an EMPTY worktree scope exactly as viewTop does.
+func fetchBoardData(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope) *boardData {
+	data := &boardData{}
+	seen := map[string]bool{}
+	collect := func(list []string) {
+		for _, warning := range list {
+			if warning != "" && !seen[warning] {
+				seen[warning] = true
+				data.Warnings = append(data.Warnings, warning)
+			}
+		}
+	}
+	for _, status := range domain.AllowedStatusStrings() {
+		var env listEnvelope
+		code, warnings := dispatchTUIDataWithWarnings(ctx, dispatcher, scope,
+			core.Request{Verb: "list", Args: map[string]any{"query": "status:" + status}}, &env)
+		collect(warnings)
+		data.Columns = append(data.Columns, boardColumnFetch{
+			Status: status, Total: env.Total, Truncated: env.Truncated, Rows: env.Rows, Code: code,
+		})
+	}
+	var readyWarnings []string
+	data.ReadyCode, readyWarnings = dispatchTUIDataWithWarnings(ctx, dispatcher, scope,
+		core.Request{Verb: "ready", Args: map[string]any{}}, &data.Ready)
+	collect(readyWarnings)
+
+	var leases struct {
+		Total int                  `json:"total"`
+		Rows  []store.HeldLeaseRow `json:"rows"`
+	}
+	data.LeaseCode = dispatchTUIData(ctx, dispatcher, scope,
+		core.Request{Verb: "lease", Args: map[string]any{"subverb": "ls"}}, &leases)
+	data.Leases = leases.Rows
+
+	var confine runner.ConfineListResult
+	confineRequest := core.Request{Verb: "confine-list", Args: map[string]any{
+		"slice": runner.ResolveConfineSlice(""), "owner": runner.ConfineUnknownOwner,
+	}}
+	if data.ConfineCode = dispatchTUIData(ctx, dispatcher, daemon.WorktreeScope{}, confineRequest, &confine); data.ConfineCode == "" {
+		data.Confine = &confine
+	}
+	return data
+}
+
+// boardSearchFetch is the raw grep reply for a board content search. Query is
+// the ORIGINAL (unquoted) query, so onBoardSearchResult can drop a reply for a
+// superseded query. Code carries a refusal (e.g. E_QUERY_INVALID); Unevaluated
+// carries grep's {unevaluated:true} (E_INDEX_UNEVALUATED) — either is rendered
+// "search unevaluated", never "no results" (spec §10).
+type boardSearchFetch struct {
+	Query       string
+	Rows        []map[string]any
+	Code        string
+	Unevaluated bool
+}
+
+func fetchBoardSearch(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, query string) boardSearchFetch {
+	fetch := boardSearchFetch{Query: query}
+	var env struct {
+		Total       int              `json:"total"`
+		Rows        []map[string]any `json:"rows"`
+		Unevaluated bool             `json:"unevaluated"`
+	}
+	fetch.Code = dispatchTUIData(ctx, dispatcher, scope,
+		core.Request{Verb: "grep", Args: map[string]any{"query": boardGrepPhrase(query), "kind": "ticket"}}, &env)
+	fetch.Rows = env.Rows
+	fetch.Unevaluated = env.Unevaluated
+	return fetch
 }
 
 func dispatchTUIData(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, request core.Request, target any) string {

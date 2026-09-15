@@ -23,6 +23,11 @@ const (
 	// its data is machine-wide confine state, which no AIRA mutation invalidates,
 	// so it is driven by its own tick while active rather than by watch events.
 	viewTop tuiView = "top"
+	// viewBoard is AIRA-252's read-only kanban (spec §16 Increment 1). It is a
+	// project-scoped DATA view — a ticket mutation invalidates it exactly like the
+	// ticket list — so it participates in invalidatedViews via the board face's
+	// own DataViews, and its watch-driven refresh reuses the shared executor loop.
+	viewBoard tuiView = "board"
 )
 
 var (
@@ -32,6 +37,9 @@ var (
 	// confine state is machine-wide and `aira confine --list` needs no project —
 	// so it must not carry the panels that resolve a worktree scope.
 	topOnlyViews = []tuiView{viewTop}
+	// boardViews is the `aira board` face's view set: one project-scoped kanban
+	// panel, registered as its own data view so watch events invalidate it.
+	boardViews = []tuiView{viewBoard}
 )
 
 // topRefreshInterval is the top view's live-refresh cadence. It ticks only while
@@ -111,7 +119,11 @@ type tuiState struct {
 	// sample. It lives here, in the reducer's state, because both must survive
 	// across refresh ticks — a held slot IS requirement 7, and a CPU rate cannot
 	// exist without the previous tick's counters to difference against.
-	Top                   topTick
+	Top topTick
+	// Board is AIRA-252's kanban interactive state (columns, focus, per-column
+	// selection, search, drill-in). It is nil for every non-board face, exactly as
+	// Top is meaningful only for viewTop; cloneTUIState deep-copies it when set.
+	Board                 *boardState
 	Panels                map[tuiView]panelState
 	Cursor                int64
 	Events                []store.WatchEvent
@@ -170,6 +182,7 @@ const (
 	cmdQuit
 	cmdPalette         // executor-only; never emitted by a controller transition
 	cmdExecuteDetached // executor-only; never emitted by a controller transition
+	cmdBoardSearch     // AIRA-252: dispatch a `grep` content search for the board
 )
 
 // tuiCmd contains only values (Palette is executor-only). The executor
@@ -182,6 +195,7 @@ type tuiCmd struct {
 	DetailID   string
 	Palette    *core.Request
 	Execute    *executeLaunch
+	Search     string // AIRA-252: the raw board search query for cmdBoardSearch
 }
 
 type fetchResult struct {
@@ -194,6 +208,10 @@ type fetchResult struct {
 	// fetch goroutine has no access to and must not race, so the fetch delivers
 	// the reading and onTUIFetchResult does the slotting.
 	Top *runner.ConfineListResult
+	// Board carries the RAW board envelopes for viewBoard (AIRA-252). Like Top, it
+	// is delivered raw so onTUIFetchResult builds the view-model into reducer state
+	// (state.Board), preserving the interactive selection across refreshes.
+	Board *boardData
 }
 
 type detailResult struct {
@@ -275,6 +293,7 @@ func cloneTUIState(state tuiState) tuiState {
 	copyState.Views = append([]tuiView(nil), state.Views...)
 	copyState.DataViews = append([]tuiView(nil), state.DataViews...)
 	copyState.Top = cloneTopTick(state.Top)
+	copyState.Board = cloneBoardState(state.Board)
 	copyState.Panels = make(map[tuiView]panelState, len(state.Panels))
 	for view, panel := range state.Panels {
 		panel.Model.Headers = append([]string(nil), panel.Model.Headers...)
@@ -504,6 +523,36 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 		return state, nil
 	}
 	panel.InFlight = false
+	if result.View == viewBoard {
+		// AIRA-252. The board renders from state.Board, not panel.Model. A failed
+		// (or nil-Board) fetch keeps the last-good columns and marks them stale
+		// rather than blanking the board on a transient read (spec §14); a good
+		// fetch rebuilds the view-model while preserving the interactive selection.
+		if result.Code != "" || result.Board == nil {
+			code := result.Code
+			if code == "" {
+				code = tuiDecodeError
+			}
+			panel.Status = panelError
+			panel.ErrorCode = code
+			if state.Board != nil {
+				*state.Board = boardApplyError(*state.Board, code)
+			}
+		} else {
+			panel.Status = panelReady
+			panel.ErrorCode = ""
+			if state.Board != nil {
+				*state.Board = boardApplyModel(*state.Board, buildBoardModel(*result.Board))
+			}
+		}
+		dirty := panel.Dirty
+		panel.Dirty = false
+		state.Panels[result.View] = panel
+		if dirty {
+			return requestPanelRefresh(state, result.View)
+		}
+		return state, nil
+	}
 	if result.Code != "" {
 		panel.Status = panelError
 		panel.ErrorCode = result.Code
@@ -560,6 +609,16 @@ func onTUISelect(state tuiState, view tuiView, id string) (tuiState, []tuiCmd) {
 
 func onTUIDetailResult(state tuiState, result detailResult) (tuiState, []tuiCmd) {
 	state = cloneTUIState(state)
+	if result.View == viewBoard {
+		// AIRA-252 drill-in: the board keys its detail by the drilled id, not by a
+		// panel SelectedID. A late result for an id the operator has since closed or
+		// changed is dropped rather than shown over the wrong ticket.
+		if state.Board == nil || state.Board.DrillID == "" || state.Board.DrillID != result.ID {
+			return state, nil
+		}
+		state.Board.Detail = result.Detail
+		return state, nil
+	}
 	panel := state.Panels[result.View]
 	if result.Generation != panel.Generation || result.ID != panel.SelectedID {
 		return state, nil
