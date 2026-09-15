@@ -55,6 +55,12 @@ type boardState struct {
 	Search     boardSearchState
 	DrillID    string
 	Detail     string
+	// ToOverview is the Increment-2 mode-transition flag (spec §12): set (with a
+	// cmdQuit) when the operator presses `o`, so the outer runBoard loop, after
+	// this runtime tears down, switches to the all-projects overview instead of
+	// quitting. It is read only after run() returns (race-free — the UI goroutine
+	// has exited), and defaults false so a signal/quit ends the loop.
+	ToOverview bool
 }
 
 func newBoardState() *boardState {
@@ -423,6 +429,7 @@ const (
 	boardActBack
 	boardActRefresh
 	boardActQuit
+	boardActToOverview // AIRA-252 Increment 2: `o` returns to the all-projects overview
 )
 
 // onBoardAction is the tuiState-level board reducer wrapper: it clones state,
@@ -436,6 +443,12 @@ func onBoardAction(state tuiState, action boardAction) (tuiState, []tuiCmd) {
 	}
 	switch action {
 	case boardActQuit:
+		state.ShuttingDown = true
+		return state, []tuiCmd{{Kind: cmdQuit}}
+	case boardActToOverview:
+		// Transition, not quit: the outer loop reads ToOverview after teardown and
+		// opens the overview. cmdQuit stops THIS runtime cleanly (spec §12).
+		state.Board.ToOverview = true
 		state.ShuttingDown = true
 		return state, []tuiCmd{{Kind: cmdQuit}}
 	case boardActRefresh:

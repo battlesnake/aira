@@ -2,6 +2,7 @@ package main
 
 import (
 	"regexp"
+	"strings"
 	"time"
 
 	"aira/internal/core"
@@ -28,7 +29,32 @@ const (
 	// ticket list — so it participates in invalidatedViews via the board face's
 	// own DataViews, and its watch-driven refresh reuses the shared executor loop.
 	viewBoard tuiView = "board"
+	// viewOverview is AIRA-252's all-projects overview list fetch (spec §11,
+	// Increment 2): the heavy registry + Discover-all + confine read, run once at
+	// open and on `r` — never on the seconds tick. viewOverviewJobs is the light
+	// machine-wide confine re-read that DOES tick (spec §13). Per-project count /
+	// lease reads are DYNAMIC views (overviewCardView) fetched lazily on focus, so
+	// they are deliberately NOT in the overview's DataViews.
+	viewOverview     tuiView = "overview"
+	viewOverviewJobs tuiView = "overview-jobs"
 )
+
+// overviewCardViewPrefix marks a DYNAMIC per-project overview fetch: the focused
+// project's canonical root is appended, and fetchTUIView resolves it into a
+// per-project scope for the count/lease dispatch. A plain cmdFetch with such a
+// non-constant View reaches fetchTUIView untouched (the viewTop scope-override
+// precedent), so the overview needs ZERO executor change (spec §12).
+const overviewCardViewPrefix = "overview-card:"
+
+func overviewCardView(root string) tuiView { return tuiView(overviewCardViewPrefix + root) }
+
+func overviewCardViewRoot(view tuiView) (string, bool) {
+	value := string(view)
+	if !strings.HasPrefix(value, overviewCardViewPrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(value, overviewCardViewPrefix), true
+}
 
 var (
 	allViews  = []tuiView{viewTickets, viewReady, viewLeases, viewFindings, viewInsights, viewEvents, viewTop}
@@ -40,6 +66,11 @@ var (
 	// boardViews is the `aira board` face's view set: one project-scoped kanban
 	// panel, registered as its own data view so watch events invalidate it.
 	boardViews = []tuiView{viewBoard}
+	// overviewViews is the all-projects overview face's view set (spec §11). Both
+	// the (heavy, open/`r`-only) list fetch and the (light, ticking) jobs fetch
+	// are DataViews so run() kicks both at open; per-card count/lease views are
+	// dynamic and stay out of the set, which is what makes them lazy (spec §11.6).
+	overviewViews = []tuiView{viewOverview, viewOverviewJobs}
 )
 
 // topRefreshInterval is the top view's live-refresh cadence. It ticks only while
@@ -123,7 +154,11 @@ type tuiState struct {
 	// Board is AIRA-252's kanban interactive state (columns, focus, per-column
 	// selection, search, drill-in). It is nil for every non-board face, exactly as
 	// Top is meaningful only for viewTop; cloneTUIState deep-copies it when set.
-	Board                 *boardState
+	Board *boardState
+	// Overview is AIRA-252 Increment 2's all-projects overview state (project
+	// cards, selection, card-filter search, lazy per-project data, mode
+	// transition). Nil for every non-overview face; cloneTUIState deep-copies it.
+	Overview              *overviewState
 	Panels                map[tuiView]panelState
 	Cursor                int64
 	Events                []store.WatchEvent
@@ -213,6 +248,12 @@ type fetchResult struct {
 	// is delivered raw so onTUIFetchResult builds the view-model into reducer state
 	// (state.Board), preserving the interactive selection across refreshes.
 	Board *boardData
+	// Overview carries the raw all-projects list fetch (viewOverview), OverviewCard
+	// the raw per-project lazy fetch (a dynamic overview-card:<root> view). Both are
+	// applied into state.Overview by onTUIFetchResult (AIRA-252 Increment 2). The
+	// jobs tick (viewOverviewJobs) reuses Top (the confine listing).
+	Overview     *overviewListData
+	OverviewCard *overviewCardResult
 }
 
 type detailResult struct {
@@ -295,6 +336,7 @@ func cloneTUIState(state tuiState) tuiState {
 	copyState.DataViews = append([]tuiView(nil), state.DataViews...)
 	copyState.Top = cloneTopTick(state.Top)
 	copyState.Board = cloneBoardState(state.Board)
+	copyState.Overview = cloneOverviewState(state.Overview)
 	copyState.Panels = make(map[tuiView]panelState, len(state.Panels))
 	for view, panel := range state.Panels {
 		panel.Model.Headers = append([]string(nil), panel.Model.Headers...)
@@ -524,6 +566,73 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 		return state, nil
 	}
 	panel.InFlight = false
+	if result.View == viewOverview {
+		// AIRA-252 Increment 2. The all-projects list fetch. A failed (or nil) fetch
+		// keeps the last-good cards and marks them stale (spec §14); a good fetch
+		// rebuilds the card skeleton and then LAZILY fetches the focused card's
+		// count/lease (spec §11.6) — never eagerly all N.
+		var commands []tuiCmd
+		if result.Code != "" || result.Overview == nil {
+			code := result.Code
+			if code == "" {
+				code = tuiDecodeError
+			}
+			panel.Status, panel.ErrorCode = panelError, code
+			if state.Overview != nil {
+				*state.Overview = overviewApplyError(*state.Overview, code)
+			}
+		} else {
+			panel.Status, panel.ErrorCode = panelReady, ""
+			if state.Overview != nil {
+				*state.Overview = overviewApplyList(*state.Overview, *result.Overview)
+			}
+		}
+		dirty := panel.Dirty
+		panel.Dirty = false
+		state.Panels[result.View] = panel
+		if dirty {
+			state, commands = requestPanelRefresh(state, result.View)
+			return state, commands
+		}
+		if panel.Status == panelReady {
+			return overviewLazyFetchFocused(state)
+		}
+		return state, nil
+	}
+	if result.View == viewOverviewJobs {
+		// AIRA-252 Increment 2. The light machine-wide confine tick (spec §13). It
+		// self-schedules the next tick regardless of the (single) active view, like
+		// viewTop, so the jobs strip stays live; it never touches the cards.
+		if state.Overview != nil {
+			if result.Code != "" || result.Top == nil {
+				code := result.Code
+				if code == "" {
+					code = tuiDecodeError
+				}
+				*state.Overview = overviewApplyJobs(*state.Overview, nil, code)
+			} else {
+				*state.Overview = overviewApplyJobs(*state.Overview, result.Top, "")
+			}
+		}
+		panel.Status = panelReady
+		state.Panels[result.View] = panel
+		if !state.PendingRefresh[viewOverviewJobs] {
+			state.PendingRefresh[viewOverviewJobs] = true
+			return state, []tuiCmd{{Kind: cmdScheduleRefresh, View: viewOverviewJobs, Backoff: topRefreshInterval}}
+		}
+		return state, nil
+	}
+	if _, ok := overviewCardViewRoot(result.View); ok {
+		// AIRA-252 Increment 2. One project's lazy count/lease result, keyed by
+		// ProjectID so it survives a list rebuild. An E_NOT_ADOPTED dispatch marks
+		// the project ejected; any other failure is unevaluated (spec §11.6, §14).
+		if state.Overview != nil && result.OverviewCard != nil {
+			*state.Overview = overviewApplyCard(*state.Overview, *result.OverviewCard)
+		}
+		panel.Status = panelReady
+		state.Panels[result.View] = panel
+		return state, nil
+	}
 	if result.View == viewBoard {
 		// AIRA-252. The board renders from state.Board, not panel.Model. A failed
 		// (or nil-Board) fetch keeps the last-good columns and marks them stale

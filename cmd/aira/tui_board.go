@@ -52,24 +52,107 @@ type boardWidgets struct {
 	laidOut     bool
 }
 
-// runBoard is the `aira board` face. It is project-scoped (scope resolved by the
-// caller via scopeForCWD, exactly as `aira tui`) and watch-on. It never calls
-// app.Run() directly — the shared runTUIRuntime routes through the no-TTY
-// coordinator so a screen-init failure is an honest E_INTERNAL, not a panic.
-func runBoard(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer) int {
-	runtime := newBoardRuntime(ctx, dispatcher, scope, stdin, stdout, stderr, nil)
+// runBoard is the `aira board` face and its Increment-2 mode-switching OUTER
+// LOOP (spec §12). Each mode is its OWN independent runtime — the per-project
+// kanban is watch-on, the all-projects overview is watch-less — built fresh via
+// newTUIRuntimeForViews and run to a transition key, then fully torn down before
+// the next mode starts. There is no scope-swap and no watch-rebind inside a
+// runtime; the previously "delicate" concurrency seam is designed out.
+//
+// startOverview picks the initial mode (main.go resolves it from scopeForCWD:
+// success → per-project board on that scope; E_NOT_PROJECT / E_CONFIG_MISSING →
+// overview). Signals are wired ONCE here; each per-mode runtime gets its own
+// signal loop bound to its own ctx, so the prior loop has already exited (its
+// ctx cancelled) before the next mode starts. Every runtime routes through
+// runTUIRuntime — never app.Run() — so a screen-init failure is an honest
+// E_INTERNAL, not a panic (AIRA-134).
+func runBoard(ctx context.Context, dispatcher Dispatcher, paths daemon.Paths, scope daemon.WorktreeScope, startOverview bool, stdin io.Reader, stdout, stderr io.Writer) int {
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
-	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
-	return runTUIRuntime(runtime, stderr)
+	overview := startOverview
+	for {
+		if overview {
+			chosen, code := runOverviewMode(ctx, dispatcher, paths, signals, stdin, stdout, stderr, nil)
+			if chosen == nil {
+				return code // `q`, a signal, or a screen-init failure — end the loop.
+			}
+			scope, overview = *chosen, false
+			continue
+		}
+		toOverview, code := runProjectBoard(ctx, dispatcher, scope, signals, stdin, stdout, stderr, nil)
+		if !toOverview {
+			return code // `q`, a signal, or a screen-init failure — end the loop.
+		}
+		overview = true
+	}
 }
+
+// runProjectBoard runs ONE per-project board runtime to a transition. It returns
+// (toOverview, exitCode): toOverview==true means the operator pressed `o` (or
+// back past the top level) to return to the overview and the loop continues;
+// false means quit (`q`, a signal, or a screen-init failure) and the loop ends.
+//
+// The runtime's executor (watch INCLUDED) is fully joined by run() →
+// coordinateShutdown → executor.wait() BEFORE runTUIRuntime returns, so reading
+// runtime.state afterwards is race-free and no watch goroutine outlives the mode.
+// screen is nil in production (a real terminal); tests inject a simulation screen.
+//
+// The transition gate is the reducer FLAG alone, not the exit code: the flag is
+// set ONLY by a key press (which requires a live screen), so a screen-init
+// failure or a signal cancel — either of which returns before any key — leaves
+// it false and the loop quits (spec §12 / advisor).
+func runProjectBoard(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, signals <-chan os.Signal, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) (bool, int) {
+	runtime := newBoardRuntime(ctx, dispatcher, scope, stdin, stdout, stderr, screen)
+	if boardHopObserver != nil {
+		boardHopObserver(runtime)
+	}
+	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
+	code := runTUIRuntime(runtime, stderr)
+	if runtime.state.Board != nil && runtime.state.Board.ToOverview {
+		return true, 0
+	}
+	return false, code
+}
+
+// runOverviewMode runs ONE overview runtime to a transition. It returns
+// (chosenScope, exitCode): a non-nil scope means the operator pressed Enter on a
+// project row and the loop should open that project's board; nil means quit. The
+// gate is the Chosen flag alone, for the reason runProjectBoard's is.
+func runOverviewMode(ctx context.Context, dispatcher Dispatcher, paths daemon.Paths, signals <-chan os.Signal, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) (*daemon.WorktreeScope, int) {
+	runtime := newOverviewRuntime(ctx, dispatcher, stdin, stdout, stderr, screen)
+	if boardHopObserver != nil {
+		boardHopObserver(runtime)
+	}
+	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
+	code := runTUIRuntime(runtime, stderr)
+	if runtime.state.Overview != nil && runtime.state.Overview.Chosen != nil {
+		chosen := *runtime.state.Overview.Chosen
+		return &chosen, 0
+	}
+	return nil, code
+}
+
+// boardHopObserver, if set, receives each runtime the mode-switch hop functions
+// build, right after construction. Test-only (nil in production): it lets a test
+// drive the runtime a hop builds internally and then assert the hop's returned
+// transition tuple, so the flag→return-value glue is exercised, not just the
+// reducer flag in isolation.
+var boardHopObserver func(*tuiRuntime)
 
 // newBoardRuntime builds the board runtime: one project-scoped kanban view,
 // watch-on (a ticket mutation invalidates the board), no execute dispatcher
 // (read-only), and its own board reducer state.
 func newBoardRuntime(parent context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
-	return newTUIRuntimeForViews(parent, dispatcher, nil, scope, stdin, stdout, stderr, screen, boardViews, boardViews, true, newBoardState())
+	return newTUIRuntimeForViews(parent, dispatcher, nil, scope, stdin, stdout, stderr, screen, boardViews, boardViews, true, newBoardState(), nil)
+}
+
+// newOverviewRuntime builds the all-projects overview runtime: a watch-less,
+// project-less face (like `aira top`) over the overview view set, with its own
+// overview reducer state. paths for the per-project scopes are resolved inside
+// the fetch (daemon.PathsFromEnv), so the runtime needs none.
+func newOverviewRuntime(parent context.Context, dispatcher Dispatcher, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
+	return newTUIRuntimeForViews(parent, dispatcher, nil, daemon.WorktreeScope{}, stdin, stdout, stderr, screen, overviewViews, overviewViews, false, nil, newOverviewState())
 }
 
 func (r *tuiRuntime) buildBoardWidgets() {
@@ -320,6 +403,8 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 			action = boardActRefresh
 		case 'q':
 			action = boardActQuit
+		case 'o':
+			action = boardActToOverview
 		case '/':
 			r.openBoardSearch()
 			return nil
@@ -386,7 +471,7 @@ func boardBannerText(bs *boardState) string {
 
 // boardFooterText is the keybinding legend plus the honest search result label.
 func boardFooterText(bs *boardState) string {
-	keys := "←/→ h/l column · ↑/↓ j/k card · Enter detail · / search · r refresh · q quit"
+	keys := "←/→ h/l column · ↑/↓ j/k card · Enter detail · / search · o overview · r refresh · q quit"
 	if bs != nil && bs.Search.Active {
 		if label := boardSearchLabel(bs.Search); label != "" {
 			return "search \"" + tview.Escape(bs.Search.Query) + "\": " + label + "   ·   Esc clears   ·   " + keys
