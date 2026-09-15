@@ -135,7 +135,14 @@ type overviewListData struct {
 // entry the card was built from (the repo's git common-dir moved). The daemon's
 // own registry pass treats this as a skip; the overview mirrors it by rendering
 // the card unevaluated rather than attributing a foreign project's counts to it.
-const overviewIdentityMismatchCode = "E_PROJECT_IDENTITY"
+//
+// It is E_TUI_-namespaced (like E_TUI_DECODE, its sibling in the same card
+// Code field) because the TUI synthesises it locally: it is never a
+// Response.Code, never crosses the daemon/MCP wire, and never maps to a process
+// exit, so it is excused from the exit-code catalogue in internal/codes rather
+// than published as part of the exit contract. The namespace keeps that excuse
+// scoped to this surface (see producedNotCatalogued).
+const overviewIdentityMismatchCode = "E_TUI_PROJECT_IDENTITY"
 
 // overviewCard is one project's static display skeleton. The DYNAMIC per-card
 // count/lease data lives separately in the reducer (overviewCardData) so it

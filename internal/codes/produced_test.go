@@ -70,6 +70,7 @@ var producedNotCatalogued = map[string]string{
 	"E_TUI_INLINE_ENUM":         tuiLocalVocabulary,
 	"E_TUI_INLINE_FORM":         tuiLocalVocabulary,
 	"E_TUI_INLINE_LEASE_TOKEN":  tuiLocalVocabulary,
+	"E_TUI_PROJECT_IDENTITY":    tuiLocalVocabulary,
 }
 
 // cataloguedNotProduced lists catalogued codes that no source literal produces,
