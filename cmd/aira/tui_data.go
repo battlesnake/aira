@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 
+	"aira/internal/app"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
@@ -62,6 +64,15 @@ func dispatchTUIDataWithWarnings(ctx context.Context, dispatcher Dispatcher, sco
 
 func fetchTUIView(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, view tuiView, generation int) fetchResult {
 	result := fetchResult{View: view, Generation: generation}
+	if root, ok := overviewCardViewRoot(view); ok {
+		// AIRA-252 Increment 2. A dynamic per-project overview fetch: the View string
+		// carries the project's canonical root, which fetchOverviewCard resolves into
+		// a per-project scope for the count/lease dispatch. This is the viewTop
+		// scope-override precedent — a plain cmdFetch reaches here untouched, so the
+		// overview needs no executor change (spec §12).
+		result.OverviewCard = fetchOverviewCard(ctx, dispatcher, root)
+		return result
+	}
 	switch view {
 	case viewTickets:
 		var data listEnvelope
@@ -128,6 +139,29 @@ func fetchTUIView(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 			return result
 		}
 		result.Top = &data
+	case viewOverview:
+		// AIRA-252 Increment 2. The all-projects overview list: the pure-read
+		// registry + per-project Discover + one machine-wide confine (spec §11). A
+		// registry read that fails wholesale becomes result.Code so the reducer keeps
+		// the last-good cards and raises a banner (spec §14); a per-project Discover
+		// failure or a confine failure is carried IN the data (that project reads
+		// "unavailable"; the jobs strip reads "unevaluated") and never blanks the rest.
+		data := fetchOverviewList(ctx, dispatcher)
+		if data.RegistryCode != "" {
+			result.Code = data.RegistryCode
+		} else {
+			result.Overview = data
+		}
+	case viewOverviewJobs:
+		// AIRA-252 Increment 2. The light machine-wide confine tick (spec §13),
+		// dispatched with an EMPTY scope exactly as viewTop does.
+		var confine runner.ConfineListResult
+		request := core.Request{Verb: "confine-list", Args: map[string]any{
+			"slice": runner.ResolveConfineSlice(""), "owner": runner.ConfineUnknownOwner,
+		}}
+		if result.Code = dispatchTUIData(ctx, dispatcher, daemon.WorktreeScope{}, request, &confine); result.Code == "" {
+			result.Top = &confine
+		}
 	case viewBoard:
 		// AIRA-252. One composite fetch of the whole board: seven per-status lists,
 		// the ready overlay, held leases, and the machine-wide confine listing. The
@@ -253,6 +287,149 @@ func fetchBoardGet(ctx context.Context, dispatcher Dispatcher, scope daemon.Work
 		fetch.Title = textCell(row["title"])
 	}
 	return fetch
+}
+
+// The overview's impure seams (AIRA-252 Increment 2), package vars so the pure
+// grouping/card logic is unit-tested directly and the runtime smoke test can
+// inject a controlled registry + Discover outcome without a real filesystem.
+// They default to the real reads: registry file, app.Discover, ScopeFromProject,
+// os.Stat — exactly what the daemon's discoverRegistryPass uses.
+var (
+	overviewRegistrySnapshot = func() ([]store.RegistryEntry, error) {
+		paths, err := daemon.PathsFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		return store.ListRegistryEntries(paths.RegistryPath)
+	}
+	overviewDiscover   = app.Discover
+	overviewBuildScope = func(project app.Project) (daemon.WorktreeScope, error) {
+		paths, err := daemon.PathsFromEnv()
+		if err != nil {
+			return daemon.WorktreeScope{}, err
+		}
+		return daemon.ScopeFromProject(project, paths)
+	}
+	overviewRootExists = func(root string) bool {
+		_, err := os.Stat(root)
+		return err == nil
+	}
+)
+
+// overviewCardResult is one project's raw lazy count/lease reply (spec §11.6).
+// Code carries a count dispatch failure — E_NOT_ADOPTED means the project was
+// ejected though its registry entries persist (§11.5); any other code is
+// unevaluated. LeaseCode carries the lease read's own failure separately.
+type overviewCardResult struct {
+	ProjectID    string
+	Distribution map[string]int
+	Total        int
+	Stale        bool // the count reply's envelope carried W_STALE_INDEX (§14)
+	Code         string
+	LeaseCount   int
+	LeaseCode    string
+}
+
+// fetchOverviewList composes the overview's list read: the pure-read registry,
+// grouped/deduped/dead-root-skipped, each canonical root Discovered for its slug
+// + scope, plus one machine-wide confine. Every failure is carried per-section —
+// a registry read failure is the only whole-list error (no cards to show).
+func fetchOverviewList(ctx context.Context, dispatcher Dispatcher) *overviewListData {
+	data := &overviewListData{Discoveries: map[string]overviewDiscovery{}, Scopes: map[string]daemon.WorktreeScope{}}
+	entries, err := overviewRegistrySnapshot()
+	if err != nil {
+		data.RegistryCode = decodeErrorCode(err)
+		return data
+	}
+	data.Groups = overviewGroupProjects(entries, overviewRootExists)
+	for _, group := range data.Groups {
+		if err := ctx.Err(); err != nil {
+			data.Discoveries[group.ProjectID] = overviewDiscovery{Code: "E_TUI_CANCELLED"}
+			continue
+		}
+		project, discoverErr := overviewDiscover(ctx, group.Canonical.Root)
+		if discoverErr != nil {
+			data.Discoveries[group.ProjectID] = overviewDiscovery{Code: decodeErrorCode(discoverErr)}
+			continue
+		}
+		discovery := overviewDiscovery{Slug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes}
+		if scope, scopeErr := overviewBuildScope(project); scopeErr == nil {
+			data.Scopes[group.ProjectID] = scope
+		} else {
+			// Discovered but the scope could not be built: available in name only,
+			// so it reads unavailable rather than pretending it is dispatchable.
+			discovery.Code = decodeErrorCode(scopeErr)
+		}
+		data.Discoveries[group.ProjectID] = discovery
+	}
+	var confine runner.ConfineListResult
+	confineRequest := core.Request{Verb: "confine-list", Args: map[string]any{
+		"slice": runner.ResolveConfineSlice(""), "owner": runner.ConfineUnknownOwner,
+	}}
+	if data.ConfineCode = dispatchTUIData(ctx, dispatcher, daemon.WorktreeScope{}, confineRequest, &confine); data.ConfineCode == "" {
+		data.Confine = &confine
+	}
+	return data
+}
+
+// fetchOverviewCard is one project's lazy count/lease read (spec §11.6). It
+// re-Discovers the root (a project can vanish between the list and the card
+// fetch) and dispatches count --by status + lease ls with the per-project scope.
+// It ALWAYS returns a non-nil result carrying the ProjectID (or "" when Discover
+// failed) so the reducer can key it — the honest join never fabricates a "0".
+func fetchOverviewCard(ctx context.Context, dispatcher Dispatcher, root string) *overviewCardResult {
+	result := &overviewCardResult{}
+	project, err := overviewDiscover(ctx, root)
+	if err != nil {
+		result.Code = decodeErrorCode(err)
+		return result
+	}
+	result.ProjectID = project.ProjectID
+	scope, scopeErr := overviewBuildScope(project)
+	if scopeErr != nil {
+		result.Code = decodeErrorCode(scopeErr)
+		return result
+	}
+	var count struct {
+		Total        int            `json:"total"`
+		Distribution map[string]int `json:"distribution"`
+	}
+	// Use the warnings-carrying decode so W_STALE_INDEX on the count envelope is
+	// surfaced as a per-card stale marker (spec §14) rather than the distribution
+	// reading authoritative when a reconcile is pending (P2 review fix).
+	var warnings []string
+	result.Code, warnings = dispatchTUIDataWithWarnings(ctx, dispatcher, scope,
+		core.Request{Verb: "count", Args: map[string]any{"query": "", "by": "status"}}, &count)
+	if result.Code == "" {
+		result.Distribution, result.Total = count.Distribution, count.Total
+		for _, warning := range warnings {
+			if warning == "W_STALE_INDEX" {
+				result.Stale = true
+			}
+		}
+	}
+	var leases struct {
+		Total int                  `json:"total"`
+		Rows  []store.HeldLeaseRow `json:"rows"`
+	}
+	result.LeaseCode = dispatchTUIData(ctx, dispatcher, scope,
+		core.Request{Verb: "lease", Args: map[string]any{"subverb": "ls"}}, &leases)
+	if result.LeaseCode == "" {
+		result.LeaseCount = len(leases.Rows)
+	}
+	return result
+}
+
+// decodeErrorCode extracts a stable error code from an app/store error string
+// (its "E_CODE: message" prefix), for the honest per-project state code.
+func decodeErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	if code := store.ErrorCode(err); code != "" {
+		return code
+	}
+	return "E_INTERNAL"
 }
 
 func dispatchTUIData(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, request core.Request, target any) string {

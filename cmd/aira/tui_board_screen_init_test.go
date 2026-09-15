@@ -87,5 +87,5 @@ func boardScreenInitFailureChild() {
 			tuiScreenInitUnevaluatedMarker)
 		os.Exit(tuiScreenInitUnevaluatedExit)
 	}
-	os.Exit(runBoard(context.Background(), boardSmokeDispatcher{}, daemon.WorktreeScope{}, nil, io.Discard, os.Stderr))
+	os.Exit(runBoard(context.Background(), boardSmokeDispatcher{}, daemon.WorktreeScope{}, false, nil, io.Discard, os.Stderr))
 }

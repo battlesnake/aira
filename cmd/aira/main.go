@@ -477,6 +477,33 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if err != nil {
 		return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 	}
+	// AIRA-252 Increment 2. `aira board` hybridises its scope BEFORE the shared
+	// scopeForCWD abort below: inside an aira project it opens that project's
+	// kanban; a plain git repo with no .aira/config (E_CONFIG_MISSING) or a
+	// non-repo (E_NOT_PROJECT) opens the all-projects overview instead of erroring.
+	// E_CONFIG_INVALID stays a hard error — a broken config is not "no project".
+	// --json was refused at the top; board's request is unused (no stamping needed).
+	if verb == "board" {
+		boardScope, scopeErr := scopeForCWD(context.Background(), scopeDir, paths)
+		startOverview := false
+		if scopeErr != nil {
+			switch appErrorCode(scopeErr) {
+			case "E_NOT_PROJECT", "E_CONFIG_MISSING":
+				startOverview = true
+			default:
+				code := appErrorCode(scopeErr)
+				return render(core.Response{Code: code, Error: scopeErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+			}
+		}
+		dispatcher := injected
+		if dispatcher == nil {
+			dispatcher, err = newDaemonDispatcher(stdin, io.Discard, io.Discard, false)
+			if err != nil {
+				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
+			}
+		}
+		return runBoard(context.Background(), dispatcher, boardScope, startOverview, stdin, stdout, stderr)
+	}
 	scope, err := scopeForCWD(context.Background(), scopeDir, paths)
 	if err != nil {
 		code := appErrorCode(err)
@@ -503,20 +530,6 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			}
 		}
 		return runTUI(context.Background(), dispatcher, executeDispatcher, scope, stdin, stdout, stderr)
-	}
-	// AIRA-252. `aira board` is a project-scoped, read-only kanban. It resolves its
-	// project via the same scopeForCWD as `tui` (so out-of-repo returns the normal
-	// Discover error — the all-projects overview is Increment 2), refuses --json,
-	// and needs no execute dispatcher.
-	if verb == "board" {
-		dispatcher := injected
-		if dispatcher == nil {
-			dispatcher, err = newDaemonDispatcher(stdin, io.Discard, io.Discard, false)
-			if err != nil {
-				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
-			}
-		}
-		return runBoard(context.Background(), dispatcher, scope, stdin, stdout, stderr)
 	}
 	faceStdout := &lineTrackingWriter{w: stdout}
 	dispatcher := injected

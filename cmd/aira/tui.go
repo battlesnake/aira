@@ -47,9 +47,16 @@ type tuiRuntime struct {
 	// capture (captureBoardInput) over the SAME runtime shell, executor, watch loop
 	// and no-TTY coordinator — so run()/pump()/coordinateShutdown stay untouched.
 	isBoard bool
-	// boardUI holds AIRA-252's kanban widgets. It is nil for every other face, so
-	// the board's layout lives entirely in tui_board.go and adds one field here.
+	// isOverview marks AIRA-252 Increment 2's all-projects overview face. Like
+	// isBoard it selects a wholly different layout / render / input over the SAME
+	// runtime shell, executor and no-TTY coordinator — run()/pump()/coordinateShutdown
+	// stay untouched — and it is a WATCH-LESS, project-less runtime (like `aira top`).
+	isOverview bool
+	// boardUI holds AIRA-252's kanban widgets. overviewUI holds Increment 2's
+	// overview widgets. Each is nil for every other face, so a face's layout lives
+	// entirely in its own file and adds one field here.
 	boardUI              *boardWidgets
+	overviewUI           *overviewWidgets
 	tables               map[tuiView]*tview.Table
 	details              map[tuiView]*tview.TextView
 	footers              map[tuiView]*tview.TextView
@@ -128,19 +135,19 @@ func runTUIRuntime(runtime *tuiRuntime, stderr io.Writer) int {
 }
 
 func newTUIRuntime(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
-	return newTUIRuntimeForViews(parent, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, screen, allViews, dataViews, true, nil)
+	return newTUIRuntimeForViews(parent, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, screen, allViews, dataViews, true, nil, nil)
 }
 
 // newTopRuntime builds the `aira top` runtime: one panel, no project scope, no
 // foreground execute (every execute verb resolves a project), and no event-watch
 // loop (there is no project to watch).
 func newTopRuntime(parent context.Context, dispatcher Dispatcher, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
-	runtime := newTUIRuntimeForViews(parent, dispatcher, nil, daemon.WorktreeScope{}, stdin, stdout, stderr, screen, topOnlyViews, nil, false, nil)
+	runtime := newTUIRuntimeForViews(parent, dispatcher, nil, daemon.WorktreeScope{}, stdin, stdout, stderr, screen, topOnlyViews, nil, false, nil, nil)
 	runtime.projectless = true
 	return runtime
 }
 
-func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen, views, data []tuiView, watch bool, board *boardState) *tuiRuntime {
+func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen, views, data []tuiView, watch bool, board *boardState, overview *overviewState) *tuiRuntime {
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &tuiRuntime{
 		app: tview.NewApplication(), state: newTUIStateForViews(512, views, data), descriptors: core.New(nil).DispatchDescriptors(),
@@ -155,6 +162,11 @@ func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher
 	if board != nil {
 		runtime.isBoard = true
 		runtime.state.Board = board
+	}
+	if overview != nil {
+		runtime.isOverview = true
+		runtime.projectless = true
+		runtime.state.Overview = overview
 	}
 	if screen != nil {
 		runtime.app.SetScreen(screen)
@@ -192,6 +204,10 @@ func (r *tuiRuntime) run() error {
 }
 
 func (r *tuiRuntime) buildWidgets() {
+	if r.isOverview {
+		r.buildOverviewWidgets()
+		return
+	}
 	if r.isBoard {
 		r.buildBoardWidgets()
 		return
@@ -509,6 +525,10 @@ func (r *tuiRuntime) runtimeViews() []tuiView {
 }
 
 func (r *tuiRuntime) render() {
+	if r.isOverview {
+		r.renderOverview()
+		return
+	}
 	if r.isBoard {
 		r.renderBoard()
 		return
