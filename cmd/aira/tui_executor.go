@@ -27,6 +27,8 @@ const (
 	msgDetailResult
 	msgExecuteResume
 	msgExecuteDetachedResult
+	msgBoardSearchResult // AIRA-252: a grep content-search reply for the board
+	msgBoardGetResult    // AIRA-252: a `show` probe reply resolving an id-shaped query
 )
 
 type tuiMessage struct {
@@ -40,6 +42,8 @@ type tuiMessage struct {
 	View           tuiView
 	Detail         detailResult
 	DetachedResult executeDetachedResult
+	BoardSearch    boardSearchFetch
+	BoardGet       boardGetFetch
 }
 
 type paletteSendEvidence uint8
@@ -77,6 +81,8 @@ type tuiJob struct {
 	Palette    *core.Request
 	Detached   *executeLaunch
 	DetailID   string
+	Search     string // AIRA-252: a board content-search query
+	Get        string // AIRA-252: an id-shaped query to resolve via `show`
 }
 
 type tuiExecutor struct {
@@ -188,6 +194,18 @@ func (e *tuiExecutor) commandLoop() {
 				case <-e.ctx.Done():
 					return
 				}
+			case cmdBoardSearch:
+				select {
+				case e.jobs <- tuiJob{Search: command.Search}:
+				case <-e.ctx.Done():
+					return
+				}
+			case cmdBoardGet:
+				select {
+				case e.jobs <- tuiJob{Get: command.Search}:
+				case <-e.ctx.Done():
+					return
+				}
 			case cmdScheduleRefresh:
 				// The debounce is the DEFAULT, not the only delay: AIRA-127's top
 				// view reuses this one timer path for its live tick and names its own
@@ -245,10 +263,18 @@ func (e *tuiExecutor) worker() {
 				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: result.Text, PaletteOutcome: result.Outcome})
 				continue
 			}
+			if job.Search != "" {
+				e.deliver(tuiMessage{Kind: msgBoardSearchResult, BoardSearch: fetchBoardSearch(e.ctx, e.dispatcher, e.scope, job.Search)})
+				continue
+			}
+			if job.Get != "" {
+				e.deliver(tuiMessage{Kind: msgBoardGetResult, BoardGet: fetchBoardGet(e.ctx, e.dispatcher, e.scope, job.Get)})
+				continue
+			}
 			if job.DetailID != "" {
 				detail := ""
 				switch job.View {
-				case viewTickets:
+				case viewTickets, viewBoard:
 					detail = fetchTicketDetail(e.ctx, e.dispatcher, e.scope, job.DetailID)
 				case viewFindings:
 					detail = fetchFindingDetail(e.ctx, e.dispatcher, e.scope, job.DetailID)

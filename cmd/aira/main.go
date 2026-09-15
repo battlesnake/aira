@@ -199,8 +199,8 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		response := core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		return render(response, renderJSON, stdout, stderr)
 	}
-	if verb == "tui" && jsonOutput {
-		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for tui", Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
+	if (verb == "tui" || verb == "board") && jsonOutput {
+		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for " + verb, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
 		return render(response, true, stdout, stderr)
 	}
 	// AIRA-127. `aira top` is handled HERE, before project discovery, because it
@@ -503,6 +503,20 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			}
 		}
 		return runTUI(context.Background(), dispatcher, executeDispatcher, scope, stdin, stdout, stderr)
+	}
+	// AIRA-252. `aira board` is a project-scoped, read-only kanban. It resolves its
+	// project via the same scopeForCWD as `tui` (so out-of-repo returns the normal
+	// Discover error — the all-projects overview is Increment 2), refuses --json,
+	// and needs no execute dispatcher.
+	if verb == "board" {
+		dispatcher := injected
+		if dispatcher == nil {
+			dispatcher, err = newDaemonDispatcher(stdin, io.Discard, io.Discard, false)
+			if err != nil {
+				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
+			}
+		}
+		return runBoard(context.Background(), dispatcher, scope, stdin, stdout, stderr)
 	}
 	faceStdout := &lineTrackingWriter{w: stdout}
 	dispatcher := injected
@@ -828,6 +842,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"insights":          {},
 		"lease":             {},
 		"tui":               nil,
+		// AIRA-252. `board` takes no options today; the nil entry refuses an unknown
+		// one by name rather than silently accepting and discarding it.
+		"board": nil,
 		// AIRA-127. `top` takes no options today; the entry exists so an unknown
 		// one is refused by name rather than silently accepted and discarded.
 		"top":            nil,
@@ -2612,6 +2629,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("tui accepts no positional arguments")
 		}
 		return core.Request{Verb: "tui"}, nil
+	case "board":
+		if len(positional) != 0 {
+			return core.Request{}, fmt.Errorf("board accepts no positional arguments")
+		}
+		return core.Request{Verb: "board"}, nil
 	case "lease":
 		if len(positional) != 1 || strings.ToLower(positional[0]) != "ls" {
 			return core.Request{}, fmt.Errorf("lease requires ls")

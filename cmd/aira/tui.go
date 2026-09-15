@@ -41,7 +41,15 @@ type tuiRuntime struct {
 	views          []tuiView
 	// projectless marks a face that resolves NO project/worktree scope (`aira
 	// top`). It changes what the tab line offers, never what a key does.
-	projectless          bool
+	projectless bool
+	// isBoard marks AIRA-252's `aira board` kanban face. It selects a wholly
+	// different layout (buildBoardWidgets), render path (renderBoard), and input
+	// capture (captureBoardInput) over the SAME runtime shell, executor, watch loop
+	// and no-TTY coordinator — so run()/pump()/coordinateShutdown stay untouched.
+	isBoard bool
+	// boardUI holds AIRA-252's kanban widgets. It is nil for every other face, so
+	// the board's layout lives entirely in tui_board.go and adds one field here.
+	boardUI              *boardWidgets
 	tables               map[tuiView]*tview.Table
 	details              map[tuiView]*tview.TextView
 	footers              map[tuiView]*tview.TextView
@@ -120,19 +128,19 @@ func runTUIRuntime(runtime *tuiRuntime, stderr io.Writer) int {
 }
 
 func newTUIRuntime(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
-	return newTUIRuntimeForViews(parent, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, screen, allViews, dataViews, true)
+	return newTUIRuntimeForViews(parent, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, screen, allViews, dataViews, true, nil)
 }
 
 // newTopRuntime builds the `aira top` runtime: one panel, no project scope, no
 // foreground execute (every execute verb resolves a project), and no event-watch
 // loop (there is no project to watch).
 func newTopRuntime(parent context.Context, dispatcher Dispatcher, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
-	runtime := newTUIRuntimeForViews(parent, dispatcher, nil, daemon.WorktreeScope{}, stdin, stdout, stderr, screen, topOnlyViews, nil, false)
+	runtime := newTUIRuntimeForViews(parent, dispatcher, nil, daemon.WorktreeScope{}, stdin, stdout, stderr, screen, topOnlyViews, nil, false, nil)
 	runtime.projectless = true
 	return runtime
 }
 
-func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen, views, data []tuiView, watch bool) *tuiRuntime {
+func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen, views, data []tuiView, watch bool, board *boardState) *tuiRuntime {
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &tuiRuntime{
 		app: tview.NewApplication(), state: newTUIStateForViews(512, views, data), descriptors: core.New(nil).DispatchDescriptors(),
@@ -144,6 +152,10 @@ func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher
 		stdin: stdin, stdout: stdout, stderr: stderr,
 	}
 	runtime.state.CanExecute = runtime.canExecute
+	if board != nil {
+		runtime.isBoard = true
+		runtime.state.Board = board
+	}
 	if screen != nil {
 		runtime.app.SetScreen(screen)
 	}
@@ -180,6 +192,10 @@ func (r *tuiRuntime) run() error {
 }
 
 func (r *tuiRuntime) buildWidgets() {
+	if r.isBoard {
+		r.buildBoardWidgets()
+		return
+	}
 	r.tabs = tview.NewTextView().SetDynamicColors(true)
 	r.panelPages = tview.NewPages()
 	for _, view := range r.runtimeViews() {
@@ -414,9 +430,21 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 	case msgEOF:
 		r.state, commands = onTUIEOF(r.state)
 	case msgWatchError:
-		panel := r.state.Panels[viewEvents]
-		panel.Status, panel.ErrorCode = panelError, message.Code
-		r.state.Panels[viewEvents] = panel
+		// AIRA-252. The board owns no events panel; a watch error means live
+		// refresh dropped (press r), which is DISTINCT from the columns being
+		// stale/last-good, so it lands in its own board banner field (spec §14)
+		// rather than a phantom viewEvents row.
+		if r.state.Board != nil {
+			r.state.Board.WatchError = message.Code
+		} else {
+			panel := r.state.Panels[viewEvents]
+			panel.Status, panel.ErrorCode = panelError, message.Code
+			r.state.Panels[viewEvents] = panel
+		}
+	case msgBoardSearchResult:
+		r.state, commands = onBoardSearchResult(r.state, message.BoardSearch)
+	case msgBoardGetResult:
+		r.state, commands = onBoardGetResult(r.state, message.BoardGet)
 	case msgPaletteResult:
 		r.state, commands = onPaletteResult(r.state, message.PaletteOutcome, r.descriptors)
 		// The result still drives controller convergence after the operator
@@ -481,6 +509,10 @@ func (r *tuiRuntime) runtimeViews() []tuiView {
 }
 
 func (r *tuiRuntime) render() {
+	if r.isBoard {
+		r.renderBoard()
+		return
+	}
 	views := r.runtimeViews()
 	tabNames := make([]string, 0, len(views))
 	for index, view := range views {
