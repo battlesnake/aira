@@ -228,19 +228,45 @@ func TestBoardWarningsBecomeBanner(t *testing.T) {
 	}
 }
 
-// TestBoardTitleIsEscaped is the tag-injection guard: a `[x]`-bearing title must
-// be tview.Escape'd so it renders literally, not swallowed as a colour tag.
-func TestBoardTitleIsEscaped(t *testing.T) {
+// TestBoardTitleRawCardLineEscaped pins where escaping lives now: boardCard.Title
+// is the RAW title (so the info pane can show it in full, unescaped, with dynamic
+// colours off), while the column TableCell — the one consumer that parses colour
+// tags — escapes it in boardCardLine so a `[x]`-bearing title renders literally.
+func TestBoardTitleRawCardLineEscaped(t *testing.T) {
 	raw := "[x] rewrite parser"
 	data := boardDataFrom(map[string]boardColumnFetch{
 		"planned": {Rows: []map[string]any{boardRow("AIRA-1", "planned", "P1", raw, false)}},
 	}, listEnvelope{})
 	card := findCard(t, buildBoardModel(data), "AIRA-1")
-	if card.Title != tview.Escape(raw) {
-		t.Fatalf("title = %q, want escaped %q", card.Title, tview.Escape(raw))
+	if card.Title != raw {
+		t.Fatalf("card.Title = %q, want the RAW title %q", card.Title, raw)
 	}
-	if card.Title == raw {
-		t.Fatalf("title was not escaped: %q", card.Title)
+	line := boardCardLine(card)
+	if !strings.Contains(line, tview.Escape(raw)) {
+		t.Fatalf("column cell line %q does not carry the escaped title %q", line, tview.Escape(raw))
+	}
+	if strings.Contains(line, raw) {
+		t.Fatalf("column cell line leaked the unescaped title: %q", line)
+	}
+}
+
+// TestBoardTitleFullInPaneNotTruncated pins the owner's explicit ask: a title
+// longer than boardTitleMax is carried in FULL on the card (the pane renders it
+// whole), while the column cell still truncates for its bounded width.
+func TestBoardTitleFullInPaneNotTruncated(t *testing.T) {
+	raw := strings.Repeat("word ", 40) + "END" // 203 runes, well over boardTitleMax
+	data := boardDataFrom(map[string]boardColumnFetch{
+		"planned": {Rows: []map[string]any{boardRow("AIRA-1", "planned", "P1", raw, false)}},
+	}, listEnvelope{})
+	card := findCard(t, buildBoardModel(data), "AIRA-1")
+	if card.Title != raw {
+		t.Fatalf("card.Title was truncated: got %d runes, want the full %d", len([]rune(card.Title)), len([]rune(raw)))
+	}
+	if !strings.Contains(card.Title, "END") {
+		t.Fatalf("full title lost its tail: %q", card.Title)
+	}
+	if line := boardCardLine(card); strings.Contains(line, "END") {
+		t.Fatalf("column cell should still truncate; it showed the tail: %q", line)
 	}
 }
 

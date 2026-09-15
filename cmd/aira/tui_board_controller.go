@@ -53,14 +53,34 @@ type boardState struct {
 	FocusedCol int
 	Selected   []int
 	Search     boardSearchState
-	DrillID    string
-	Detail     string
 	// ToOverview is the Increment-2 mode-transition flag (spec §12): set (with a
 	// cmdQuit) when the operator presses `o`, so the outer runBoard loop, after
 	// this runtime tears down, switches to the all-projects overview instead of
 	// quitting. It is read only after run() returns (race-free — the UI goroutine
 	// has exited), and defaults false so a signal/quit ends the loop.
 	ToOverview bool
+	// FullWidth (AIRA-254) collapses the strip to the FOCUSED column alone, drawn
+	// at full width so long titles are readable. Toggled by `f`; a pure display
+	// flag that only changes which columns boardStripWindow yields.
+	FullWidth bool
+	// Detail (AIRA-254) is the readable info-pane state for the SELECTED ticket:
+	// the fetched model, the id it is for, and the fetch lifecycle. Expanded opens
+	// the same readable render as a full-screen scrollable overlay.
+	Detail   boardDetailState
+	Expanded bool
+}
+
+// boardDetailState is the info pane's fetch state for the currently-selected
+// ticket. ID is the id the Model/State describe; a result or a debounce fire for
+// a DIFFERENT current selection is ignored, so a stale detail never renders over
+// the wrong ticket. Armed marks a debounce timer in flight (coalescing rapid
+// cursor moves into one fetch of the FINAL selection). State is one of "",
+// "loading", "ready", or "unevaluated:<CODE>".
+type boardDetailState struct {
+	ID    string
+	Model boardDetailModel
+	State string
+	Armed bool
 }
 
 func newBoardState() *boardState {
@@ -88,6 +108,7 @@ func cloneBoardState(source *boardState) *boardState {
 	for id, ok := range source.Search.ContentIDs {
 		clone.Search.ContentIDs[id] = ok
 	}
+	clone.Detail.Model.Relations = append([]string(nil), source.Detail.Model.Relations...)
 	return &clone
 }
 
@@ -240,20 +261,51 @@ func boardVisibleColumns(width, focus, count int) (start, end int) {
 	return start, start + fit
 }
 
-// boardSelectedCardID is the id under the cursor in the focused column, or "".
-func boardSelectedCardID(state boardState) string {
-	if len(state.Model.Columns) == 0 || state.FocusedCol >= len(state.Model.Columns) {
-		return ""
+// boardStripWindow is the strip's column window, layering the AIRA-254 full-width
+// toggle over boardVisibleColumns. When fullWidth is set the strip shows ONLY the
+// focused column (drawn at full width so its titles are readable); otherwise it
+// falls through to the normal multi-column fit. It stays a pure function of
+// (width, focus, count, fullWidth) so the toggle is testable without a screen.
+func boardStripWindow(width, focus, count int, fullWidth bool) (start, end int) {
+	if count <= 0 {
+		return 0, 0
+	}
+	if fullWidth {
+		if focus < 0 {
+			focus = 0
+		}
+		if focus >= count {
+			focus = count - 1
+		}
+		return focus, focus + 1
+	}
+	return boardVisibleColumns(width, focus, count)
+}
+
+// boardSelectedCard is the card under the cursor in the focused column, and
+// whether there is one. The bounds checks mirror the render's clamp so a card
+// that vanished on refresh never yields a stale selection.
+func boardSelectedCard(state boardState) (boardCard, bool) {
+	if len(state.Model.Columns) == 0 || state.FocusedCol < 0 || state.FocusedCol >= len(state.Model.Columns) {
+		return boardCard{}, false
+	}
+	if state.FocusedCol >= len(state.Selected) {
+		return boardCard{}, false
 	}
 	column := state.Model.Columns[state.FocusedCol]
-	if state.FocusedCol >= len(state.Selected) {
-		return ""
-	}
 	row := state.Selected[state.FocusedCol]
 	if row < 0 || row >= len(column.Cards) {
-		return ""
+		return boardCard{}, false
 	}
-	return column.Cards[row].ID
+	return column.Cards[row], true
+}
+
+// boardSelectedCardID is the id under the cursor in the focused column, or "".
+func boardSelectedCardID(state boardState) string {
+	if card, ok := boardSelectedCard(state); ok {
+		return card.ID
+	}
+	return ""
 }
 
 // boardIDShaped reports whether a query is a genuine ticket id (or id fragment)
@@ -294,7 +346,9 @@ func boardClientSearch(state boardState, query string) boardState {
 			}
 			if strings.Contains(strings.ToLower(card.ID), needle) || strings.Contains(strings.ToLower(card.Title), needle) {
 				seen[card.ID] = true
-				results = append(results, boardSearchResult{ID: card.ID, Snippet: card.Title})
+				// card.Title is now raw (see viewmodel); escape+truncate for the
+				// results overlay, mirroring the grep-hit snippet path.
+				results = append(results, boardSearchResult{ID: card.ID, Snippet: boardEscapeTruncate(card.Title)})
 			}
 		}
 	}
@@ -425,11 +479,12 @@ const (
 	boardActColRight
 	boardActCardUp
 	boardActCardDown
-	boardActDrillIn
+	boardActExpand // AIRA-254: Enter opens the full-screen scrollable detail overlay
 	boardActBack
 	boardActRefresh
 	boardActQuit
 	boardActToOverview // AIRA-252 Increment 2: `o` returns to the all-projects overview
+	boardActFullWidth  // AIRA-254: `f` toggles the focused column to full width
 )
 
 // onBoardAction is the tuiState-level board reducer wrapper: it clones state,
@@ -452,7 +507,58 @@ func onBoardAction(state tuiState, action boardAction) (tuiState, []tuiCmd) {
 		state.ShuttingDown = true
 		return state, []tuiCmd{{Kind: cmdQuit}}
 	case boardActRefresh:
+		// Refresh the info pane too: drop the held detail so the reconcile after
+		// the refreshed data lands (onData → boardArmDetail) re-fetches it. The
+		// pane honestly shows "loading…" meanwhile instead of a possibly-stale body.
+		// A nav's debounce timer already in flight is NOT cancelled here (the timer
+		// is fire-and-forget); if it fires after the refresh re-arms, both fetch the
+		// same selection. That is benign — results are keyed by Detail.ID
+		// (onTUIDetailResult), so the redundant one is a no-op.
+		state.Board.Detail = boardDetailState{}
 		return requestPanelRefresh(state, viewBoard)
+	case boardActFullWidth:
+		state.Board.FullWidth = !state.Board.FullWidth
+		return state, nil
+	case boardActExpand:
+		// AIRA-254. Enter opens the full-screen scrollable detail overlay for the
+		// selected ticket, reusing the pane's already-fetched detail. If the pane's
+		// detail is not yet the selected id (a very fast Enter right after a move),
+		// retarget and fetch immediately so the overlay never opens over the wrong
+		// ticket — bypassing the debounce, since this is an explicit request.
+		id := boardSelectedCardID(*state.Board)
+		if id == "" {
+			return state, nil
+		}
+		state.Board.Expanded = true
+		if state.Board.Detail.ID == id && state.Board.Detail.State == "ready" {
+			// Already have this ticket's detail — reuse it, no fetch.
+			return state, nil
+		}
+		// Not READY for this id — dispatch immediately. This must NOT rely on a
+		// pending debounce timer: onBoardDetailDue drops its fetch while Expanded
+		// (so it cannot clobber the overlay), so an armed-but-undispatched fetch
+		// would otherwise strand the overlay on "loading…" forever. Covers both a
+		// fresh id and a nav+Enter INSIDE the 250ms debounce window (Detail.ID==id
+		// but only armed, not yet fetched).
+		state.Board.Detail = boardDetailState{ID: id, State: "loading"}
+		panel := state.Panels[viewBoard]
+		return state, []tuiCmd{{Kind: cmdFetch, View: viewBoard, Generation: panel.Generation, DetailID: id}}
+	case boardActBack:
+		switch {
+		case state.Board.Expanded:
+			state.Board.Expanded = false
+			// The pane again shows the selection. If the overlay was opened on an id
+			// other than the current selection (an unloaded search hit), re-arm so the
+			// pane re-fetches the selection rather than keep the overlay's detail.
+			next, arm := boardArmDetail(*state.Board)
+			*state.Board = next
+			if arm {
+				return state, []tuiCmd{{Kind: cmdBoardDetailDebounce}}
+			}
+		case state.Board.Search.Active:
+			state.Board.Search = boardSearchState{MatchIDs: map[string]bool{}}
+		}
+		return state, nil
 	case boardActColLeft:
 		*state.Board = boardMoveColumn(*state.Board, -1)
 	case boardActColRight:
@@ -461,25 +567,66 @@ func onBoardAction(state tuiState, action boardAction) (tuiState, []tuiCmd) {
 		*state.Board = boardMoveCard(*state.Board, -1)
 	case boardActCardDown:
 		*state.Board = boardMoveCard(*state.Board, +1)
-	case boardActDrillIn:
-		id := boardSelectedCardID(*state.Board)
-		if id == "" {
-			return state, nil
-		}
-		state.Board.DrillID = id
-		state.Board.Detail = "loading…"
-		panel := state.Panels[viewBoard]
-		return state, []tuiCmd{{Kind: cmdFetch, View: viewBoard, Generation: panel.Generation, DetailID: id}}
-	case boardActBack:
-		switch {
-		case state.Board.DrillID != "":
-			state.Board.DrillID = ""
-			state.Board.Detail = ""
-		case state.Board.Search.Active:
-			state.Board.Search = boardSearchState{MatchIDs: map[string]bool{}}
-		}
+	default:
+		return state, nil
+	}
+	// A navigation action fell through: reconcile the info-pane detail with the
+	// new selection, arming a debounced fetch only when the selected id changed.
+	next, arm := boardArmDetail(*state.Board)
+	*state.Board = next
+	if arm {
+		return state, []tuiCmd{{Kind: cmdBoardDetailDebounce}}
 	}
 	return state, nil
+}
+
+// boardArmDetail reconciles the info-pane detail with the current selection. When
+// the selected id differs from the detail we hold, it retargets to the new id in
+// the "loading" state and, unless a debounce timer is already in flight, requests
+// one (returns true). A retarget while a timer is armed does NOT spawn a second
+// timer: the timer re-reads the selection when it fires (onBoardDetailDue), so
+// rapid cursor moves coalesce into ONE fetch of the final id. An empty selection
+// clears the detail.
+func boardArmDetail(bs boardState) (boardState, bool) {
+	id := boardSelectedCardID(bs)
+	if id == "" {
+		bs.Detail = boardDetailState{}
+		return bs, false
+	}
+	if id == bs.Detail.ID {
+		return bs, false
+	}
+	wasArmed := bs.Detail.Armed
+	bs.Detail = boardDetailState{ID: id, State: "loading", Armed: true}
+	return bs, !wasArmed
+}
+
+// onBoardDetailDue fires when the detail debounce elapses: it clears the armed
+// flag and dispatches the actual fetch for the CURRENT selection (which may have
+// moved on since the timer was armed — that is the point of the coalescing).
+func onBoardDetailDue(state tuiState) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if state.Board == nil {
+		return state, nil
+	}
+	if state.Board.Expanded {
+		// The expand overlay owns Detail while open; a due timer must not retarget
+		// or refetch it. Clear Armed (the timer has fired) so a later Back re-arms —
+		// skipping WITHOUT clearing would strand Armed=true with no timer in flight
+		// and the pane would stick on "loading…" after the overlay closes.
+		state.Board.Detail.Armed = false
+		return state, nil
+	}
+	state.Board.Detail.Armed = false
+	id := boardSelectedCardID(*state.Board)
+	if id == "" {
+		state.Board.Detail = boardDetailState{}
+		return state, nil
+	}
+	state.Board.Detail.ID = id
+	state.Board.Detail.State = "loading"
+	panel := state.Panels[viewBoard]
+	return state, []tuiCmd{{Kind: cmdFetch, View: viewBoard, Generation: panel.Generation, DetailID: id}}
 }
 
 // onBoardSearchSubmit resolves a query the three ways of spec §10:
@@ -571,11 +718,23 @@ func onBoardResultOpen(state tuiState) (tuiState, []tuiCmd) {
 		return state, nil
 	}
 	if boardCardLoaded(*state.Board, id) {
+		// The result is a loaded card: jump the cursor to it and arm the info pane
+		// for the new selection (AIRA-254), so the pane follows the jump.
 		*state.Board = boardJumpToCard(*state.Board, id)
+		next, arm := boardArmDetail(*state.Board)
+		*state.Board = next
+		if arm {
+			return state, []tuiCmd{{Kind: cmdBoardDetailDebounce}}
+		}
 		return state, nil
 	}
-	state.Board.DrillID = id
-	state.Board.Detail = "loading…"
+	// An unloaded id (a grep-only content hit in a truncated column, or a probed
+	// id) has no card to select, so open it directly in the expand overlay, whose
+	// readable render is self-contained from the fetched model (AIRA-254).
+	state.Board.Expanded = true
+	// Preserve any pending debounce timer (Armed) across this retarget so a later
+	// nav does not spawn a second one; this immediate fetch adds no new timer.
+	state.Board.Detail = boardDetailState{ID: id, State: "loading", Armed: state.Board.Detail.Armed}
 	panel := state.Panels[viewBoard]
 	return state, []tuiCmd{{Kind: cmdFetch, View: viewBoard, Generation: panel.Generation, DetailID: id}}
 }

@@ -29,6 +29,7 @@ const (
 	msgExecuteDetachedResult
 	msgBoardSearchResult // AIRA-252: a grep content-search reply for the board
 	msgBoardGetResult    // AIRA-252: a `show` probe reply resolving an id-shaped query
+	msgBoardDetailDue    // AIRA-254: the info-pane detail-fetch debounce has elapsed
 )
 
 type tuiMessage struct {
@@ -219,6 +220,12 @@ func (e *tuiExecutor) commandLoop() {
 			case cmdReconnect:
 				e.wg.Add(1)
 				go e.reconnectAfter(command.Backoff)
+			case cmdBoardDetailDebounce:
+				// AIRA-254. Coalesce rapid cursor moves into ONE detail fetch: the
+				// reducer arms exactly one timer, and on msgBoardDetailDue re-reads
+				// the CURRENT selection before dispatching the actual fetch.
+				e.wg.Add(1)
+				go e.deliverAfter(tuiRefreshDebounce, tuiMessage{Kind: msgBoardDetailDue})
 			}
 		}
 	}
@@ -272,14 +279,18 @@ func (e *tuiExecutor) worker() {
 				continue
 			}
 			if job.DetailID != "" {
-				detail := ""
+				result := detailResult{View: job.View, Generation: job.Generation, ID: job.DetailID}
 				switch job.View {
-				case viewTickets, viewBoard:
-					detail = fetchTicketDetail(e.ctx, e.dispatcher, e.scope, job.DetailID)
+				case viewBoard:
+					// AIRA-254: the board uses the readable structured model, not the
+					// legacy json.MarshalIndent string the other detail views still use.
+					result.Board = fetchBoardDetail(e.ctx, e.dispatcher, e.scope, job.DetailID)
+				case viewTickets:
+					result.Detail = fetchTicketDetail(e.ctx, e.dispatcher, e.scope, job.DetailID)
 				case viewFindings:
-					detail = fetchFindingDetail(e.ctx, e.dispatcher, e.scope, job.DetailID)
+					result.Detail = fetchFindingDetail(e.ctx, e.dispatcher, e.scope, job.DetailID)
 				}
-				e.deliver(tuiMessage{Kind: msgDetailResult, Detail: detailResult{View: job.View, Generation: job.Generation, ID: job.DetailID, Detail: detail}})
+				e.deliver(tuiMessage{Kind: msgDetailResult, Detail: result})
 				continue
 			}
 			result := fetchTUIView(e.ctx, e.dispatcher, e.scope, job.View, job.Generation)
