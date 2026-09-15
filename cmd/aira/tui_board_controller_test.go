@@ -89,6 +89,103 @@ func TestBoardMoveCardClamps(t *testing.T) {
 	}
 }
 
+// boardCmdsHaveDetailDebounce reports whether a detail re-arm was emitted.
+func boardCmdsHaveDetailDebounce(cmds []tuiCmd) bool {
+	for _, c := range cmds {
+		if c.Kind == cmdBoardDetailDebounce {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBoardActionCardFirstLast pins AIRA-256: Home/End jump the SELECTION to the
+// first/last card of the focused column (updating the authoritative bs.Selected,
+// not just the tview cursor) and re-arm the info-pane detail like any card move.
+func TestBoardActionCardFirstLast(t *testing.T) {
+	cards := []boardCard{{ID: "AIRA-1"}, {ID: "AIRA-2"}, {ID: "AIRA-3"}, {ID: "AIRA-4"}}
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: cards}}}
+
+	// End (from a fresh state, no timer pending): jump to the last card, retarget
+	// the detail to it, and arm the debounce.
+	endStart := boardApplyModelPtr(model)
+	endStart.Selected[0] = 2 // on AIRA-3
+	end, cmds := onBoardAction(boardTUIState(endStart), boardActCardLast)
+	if end.Board.Selected[0] != 3 {
+		t.Fatalf("End -> selection %d, want 3 (last card)", end.Board.Selected[0])
+	}
+	if end.Board.Detail.ID != "AIRA-4" {
+		t.Fatalf("End did not retarget the detail to the last card: %q", end.Board.Detail.ID)
+	}
+	if !boardCmdsHaveDetailDebounce(cmds) {
+		t.Fatalf("End did not re-arm the info-pane detail: %#v", cmds)
+	}
+
+	// Home (from a fresh state): jump to the first card, retarget, arm. (Chaining
+	// Home after End would NOT re-emit — one timer already coalesces the moves.)
+	homeStart := boardApplyModelPtr(model)
+	homeStart.Selected[0] = 2 // on AIRA-3
+	home, cmds := onBoardAction(boardTUIState(homeStart), boardActCardFirst)
+	if home.Board.Selected[0] != 0 {
+		t.Fatalf("Home -> selection %d, want 0 (first card)", home.Board.Selected[0])
+	}
+	if home.Board.Detail.ID != "AIRA-1" {
+		t.Fatalf("Home did not retarget the detail to the first card: %q", home.Board.Detail.ID)
+	}
+	if !boardCmdsHaveDetailDebounce(cmds) {
+		t.Fatalf("Home did not re-arm the info-pane detail: %#v", cmds)
+	}
+}
+
+// TestBoardActionCardPage pins PgUp/PgDn: move the selection by boardCardPageStep,
+// clamped to the column ends.
+func TestBoardActionCardPage(t *testing.T) {
+	cards := make([]boardCard, 25)
+	for i := range cards {
+		cards[i] = boardCard{ID: "AIRA-" + strconv.Itoa(i)}
+	}
+	model := boardModel{Columns: []boardColumn{{Status: "planned", Cards: cards}}}
+
+	mid := boardApplyModelPtr(model)
+	mid.Selected[0] = 5
+	down, _ := onBoardAction(boardTUIState(mid), boardActCardPageDown)
+	// Literal (5 + a 10-card page), NOT 5+boardCardPageStep: a self-referential
+	// expectation would shift in lockstep with the constant and silently miss a
+	// change to the page size. This also pins boardCardPageStep == 10.
+	if down.Board.Selected[0] != 15 {
+		t.Fatalf("PgDn -> %d, want 15 (5 + a 10-card page)", down.Board.Selected[0])
+	}
+	up, _ := onBoardAction(down, boardActCardPageUp)
+	if up.Board.Selected[0] != 5 {
+		t.Fatalf("PgUp -> %d, want 5", up.Board.Selected[0])
+	}
+
+	nearTop := boardApplyModelPtr(model)
+	nearTop.Selected[0] = 1
+	top, _ := onBoardAction(boardTUIState(nearTop), boardActCardPageUp)
+	if got := top.Board.Selected[0]; got != 0 {
+		t.Fatalf("PgUp near the top -> %d, want 0 (clamped)", got)
+	}
+	nearBottom := boardApplyModelPtr(model)
+	nearBottom.Selected[0] = 23
+	bottom, _ := onBoardAction(boardTUIState(nearBottom), boardActCardPageDown)
+	if got := bottom.Board.Selected[0]; got != 24 {
+		t.Fatalf("PgDn near the bottom -> %d, want 24 (clamped last)", got)
+	}
+}
+
+// TestBoardActionCardEdgeEmptyColumnSafe pins that all four jump/page actions are
+// safe on an empty focused column (no panic, selection stays 0).
+func TestBoardActionCardEdgeEmptyColumnSafe(t *testing.T) {
+	model := boardModel{Columns: []boardColumn{{Status: "planned"}}} // no cards
+	for _, act := range []boardAction{boardActCardFirst, boardActCardLast, boardActCardPageUp, boardActCardPageDown} {
+		next, _ := onBoardAction(boardTUIState(boardApplyModelPtr(model)), act)
+		if next.Board.Selected[0] != 0 {
+			t.Fatalf("action %d on an empty column -> %d, want 0", act, next.Board.Selected[0])
+		}
+	}
+}
+
 func TestBoardApplyModelClampsSelection(t *testing.T) {
 	state := stateWithColumns(5)
 	state.Selected[0] = 4

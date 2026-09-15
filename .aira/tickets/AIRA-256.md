@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-256","project":"aira","title":"aira board: Home/End (and PgUp/PgDn) move the tview cursor but not the reducer selection, so the next arrow jumps back","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["board","dogfood","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-256","project":"aira","title":"aira board: Home/End (and PgUp/PgDn) move the tview cursor but not the reducer selection, so the next arrow jumps back","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["board","dogfood","tui"],"hold":false,"relations":[]}
 ---
 DOGFOOD (owner, 2026-09-15, on v0.11). In `aira board`, pressing Home/End jumps the cursor to the first/last card in the focused column, but the NEXT arrow key (↑/↓ or j/k) jumps BACK to the selection from BEFORE Home/End — not one step from the Home/End position. Home/End are effectively cosmetic and the selection desyncs.
 

@@ -226,6 +226,34 @@ func boardMoveCard(state boardState, delta int) boardState {
 	return state
 }
 
+// boardCardPageStep is how many cards a PgUp/PgDn moves the selection within the
+// focused column. The reducer is height-free, so it pages a fixed amount (not one
+// screenful); the move is clamped like any card move.
+const boardCardPageStep = 10
+
+// boardCardEndIndex is the index End jumps to: clampIndex caps any out-of-range
+// index at the focused column's last card, so this max-int sentinel always lands
+// on the last card without the reducer needing the column length (and without the
+// overflow a large RELATIVE move through boardMoveCard could hit).
+const boardCardEndIndex = int(^uint(0) >> 1)
+
+// boardJumpCard sets the focused column's selection to an ABSOLUTE index, clamped
+// to the column (Home passes 0; End passes boardCardEndIndex). Its empty/length
+// guards mirror boardMoveCard, so it is safe on an empty or unselected board.
+func boardJumpCard(state boardState, index int) boardState {
+	if len(state.Model.Columns) == 0 {
+		return state
+	}
+	if len(state.Selected) != len(state.Model.Columns) {
+		next := make([]int, len(state.Model.Columns))
+		copy(next, state.Selected)
+		state.Selected = next
+	}
+	column := state.Model.Columns[state.FocusedCol]
+	state.Selected[state.FocusedCol] = clampIndex(index, len(column.Cards))
+	return state
+}
+
 // boardVisibleColumns is the WIDTH SEAM: a pure function of (width, focus, count)
 // giving the [start,end) window of columns to draw, always keeping the focused
 // column in view and always showing at least one column. It reads no screen; the
@@ -485,6 +513,14 @@ const (
 	boardActQuit
 	boardActToOverview // AIRA-252 Increment 2: `o` returns to the all-projects overview
 	boardActFullWidth  // AIRA-254: `f` toggles the focused column to full width
+	// AIRA-256: Home/End/PgUp/PgDn move the SELECTION within the focused column.
+	// They must be reducer actions (not left to the tview Table's built-in row
+	// navigation), or the Table's cursor and the authoritative bs.Selected desync
+	// and the next arrow snaps back to the pre-jump selection.
+	boardActCardFirst
+	boardActCardLast
+	boardActCardPageUp
+	boardActCardPageDown
 )
 
 // onBoardAction is the tuiState-level board reducer wrapper: it clones state,
@@ -567,6 +603,14 @@ func onBoardAction(state tuiState, action boardAction) (tuiState, []tuiCmd) {
 		*state.Board = boardMoveCard(*state.Board, -1)
 	case boardActCardDown:
 		*state.Board = boardMoveCard(*state.Board, +1)
+	case boardActCardFirst:
+		*state.Board = boardJumpCard(*state.Board, 0)
+	case boardActCardLast:
+		*state.Board = boardJumpCard(*state.Board, boardCardEndIndex)
+	case boardActCardPageUp:
+		*state.Board = boardMoveCard(*state.Board, -boardCardPageStep)
+	case boardActCardPageDown:
+		*state.Board = boardMoveCard(*state.Board, +boardCardPageStep)
 	default:
 		return state, nil
 	}

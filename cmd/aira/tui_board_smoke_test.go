@@ -84,6 +84,106 @@ func readBoardStripWindow(t *testing.T, runtime *tuiRuntime) (int, int) {
 	}
 }
 
+// readBoardSelectedID reads the reducer's authoritative selected-card id on the UI
+// goroutine — the ground truth that Home/End must keep in sync with the cursor.
+func readBoardSelectedID(t *testing.T, runtime *tuiRuntime) string {
+	t.Helper()
+	result := make(chan string, 1)
+	go runtime.app.QueueUpdate(func() { result <- boardSelectedCardID(*runtime.state.Board) })
+	select {
+	case id := <-result:
+		return id
+	case <-time.After(time.Second):
+		t.Fatal("reading selected card deadlocked")
+		return ""
+	}
+}
+
+// readBoardFocusedCards reads the focused column's card ids in order (ground truth
+// for first/last, so the test needn't assume how the board orders cards).
+func readBoardFocusedCards(t *testing.T, runtime *tuiRuntime) []string {
+	t.Helper()
+	result := make(chan []string, 1)
+	go runtime.app.QueueUpdate(func() {
+		b := runtime.state.Board
+		var ids []string
+		if b != nil && b.FocusedCol >= 0 && b.FocusedCol < len(b.Model.Columns) {
+			for _, c := range b.Model.Columns[b.FocusedCol].Cards {
+				ids = append(ids, c.ID)
+			}
+		}
+		result <- ids
+	})
+	select {
+	case ids := <-result:
+		return ids
+	case <-time.After(time.Second):
+		t.Fatal("reading focused cards deadlocked")
+		return nil
+	}
+}
+
+// TestBoardHomeEndUpdateSelection is the AIRA-256 regression on the real tview
+// runtime: Home/End must move the reducer's selection (not just the tview Table
+// cursor), so the NEXT arrow moves from the Home/End position rather than snapping
+// back to the pre-jump selection. The prior tests never pressed Home/End, which is
+// how the desync shipped.
+func TestBoardHomeEndUpdateSelection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	runtime := newBoardRuntime(ctx, boardSmokeDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	resizeBoardScreen(t, runtime, screen, 120, 40)
+	waitForSimulationText(t, runtime, screen, "AIRA-1")
+	// Focus the planned column (draft -> planned); the smoke fixture gives it 3 cards.
+	screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone)
+	time.Sleep(30 * time.Millisecond)
+	cards := readBoardFocusedCards(t, runtime)
+	if len(cards) < 3 {
+		t.Fatalf("expected the planned column to have >=3 cards, got %v", cards)
+	}
+
+	// Move off the first card, then Home: the selection must be the first card.
+	screen.InjectKey(tcell.KeyDown, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	screen.InjectKey(tcell.KeyHome, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	if id := readBoardSelectedID(t, runtime); id != cards[0] {
+		t.Fatalf("Home did not select the first card: got %q, want %q", id, cards[0])
+	}
+	// The next Down must move to the SECOND card, not snap back to the pre-Home one.
+	screen.InjectKey(tcell.KeyDown, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	if id := readBoardSelectedID(t, runtime); id != cards[1] {
+		t.Fatalf("Down after Home snapped back instead of moving from the first card: got %q, want %q", id, cards[1])
+	}
+	// End -> last card; the next Up moves to the second-to-last.
+	screen.InjectKey(tcell.KeyEnd, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	if id := readBoardSelectedID(t, runtime); id != cards[len(cards)-1] {
+		t.Fatalf("End did not select the last card: got %q, want %q", id, cards[len(cards)-1])
+	}
+	screen.InjectKey(tcell.KeyUp, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	if id := readBoardSelectedID(t, runtime); id != cards[len(cards)-2] {
+		t.Fatalf("Up after End snapped back instead of moving from the last card: got %q, want %q", id, cards[len(cards)-2])
+	}
+
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("board Home/End smoke did not quit")
+	}
+}
+
 func TestBoardSmokeRendersBadgesAndDrillIn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
