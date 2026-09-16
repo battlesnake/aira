@@ -486,9 +486,12 @@ func (r *tuiRuntime) renderBoardInfo(bs *boardState) {
 	// different ticket collapses to "loading…" rather than showing under the wrong
 	// title (boardInfoDetail is the honesty seam).
 	detail := boardInfoDetail(card, bs.Detail)
-	title := card.Title // raw, full — never truncated in the pane (the owner's ask)
+	// AIRA-257: the toggle swaps in the plain-English rewrite (with a header label)
+	// when it is this card's and shown; else the original, so the original is always
+	// one 't' away and nothing fabricated is shown. Swap BEFORE the overflow calc so
+	// the "+N ↵" disclosure measures what is actually rendered.
+	title, body, humanizeLabel := boardHumanizeDisplay(card.ID, card.Title, boardDetailBodyText(detail), bs.Humanize)
 	meta := strings.Join(boardDetailMetaLines(card, detail), "\n")
-	body := boardDetailBodyText(detail)
 
 	innerRows := boardInfoPaneHeight(r.boardUI.height) - 2
 	overflow := 0
@@ -508,6 +511,9 @@ func (r *tuiRuntime) renderBoardInfo(bs *boardState) {
 	}
 
 	header := boardDetailHeaderLine(card)
+	if humanizeLabel != "" {
+		header += " · " + humanizeLabel // AIRA-257: mark the pane as an AI paraphrase
+	}
 	if overflow > 0 {
 		// Disclose the clip rather than silently drop established values (spec §14);
 		// Enter opens the full detail.
@@ -563,7 +569,7 @@ func (r *tuiRuntime) renderBoard() {
 	resultsShown := !detailShown && !r.boardUI.inputOpen && r.boardUI.resultsOpen && bs.Search.Active
 	if detailShown {
 		r.boardUI.detail.SetTitle(" " + bs.Detail.ID + " (Esc to close) ")
-		r.boardUI.detail.SetText(boardDetailOverlayText(bs.Detail.ID, bs.Detail))
+		r.boardUI.detail.SetText(boardDetailOverlayText(bs.Detail.ID, bs.Detail, bs.Humanize))
 		r.outerPages.ShowPage(boardDetailPage)
 	} else {
 		r.outerPages.HidePage(boardDetailPage)
@@ -625,6 +631,12 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		case event.Key() == tcell.KeyEscape:
 			r.applyBoardAction(boardActBack)
+			return nil
+		case event.Key() == tcell.KeyRune && event.Rune() == 't':
+			// AIRA-257: 't' toggles the plain-English rewrite in the overlay too. The
+			// reducer targets Detail.ID while Expanded, so it rewrites the ticket the
+			// overlay is showing (which may be an unloaded search hit).
+			r.applyBoardAction(boardActTranslate)
 			return nil
 		}
 		return event // let the expand overlay scroll (↑/↓/PgUp/PgDn)
@@ -698,6 +710,8 @@ func (r *tuiRuntime) captureBoardInput(event *tcell.EventKey) *tcell.EventKey {
 			action = boardActToOverview
 		case 'f':
 			action = boardActFullWidth
+		case 't':
+			action = boardActTranslate
 		case '/':
 			r.openBoardSearch()
 			return nil
@@ -764,7 +778,7 @@ func boardBannerText(bs *boardState) string {
 
 // boardFooterText is the keybinding legend plus the honest search result label.
 func boardFooterText(bs *boardState) string {
-	keys := "←/→ h/l column · ↑/↓ j/k card · Enter expand · f full-width · / search · o overview · r refresh · q quit"
+	keys := "←/→ h/l column · ↑/↓ j/k card · Enter expand · t plain-English · f full-width · / search · o overview · r refresh · q quit"
 	if bs != nil && bs.Search.Active {
 		if label := boardSearchLabel(bs.Search); label != "" {
 			return "search \"" + tview.Escape(bs.Search.Query) + "\": " + label + "   ·   Esc clears   ·   " + keys

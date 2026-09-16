@@ -27,9 +27,10 @@ const (
 	msgDetailResult
 	msgExecuteResume
 	msgExecuteDetachedResult
-	msgBoardSearchResult // AIRA-252: a grep content-search reply for the board
-	msgBoardGetResult    // AIRA-252: a `show` probe reply resolving an id-shaped query
-	msgBoardDetailDue    // AIRA-254: the info-pane detail-fetch debounce has elapsed
+	msgBoardSearchResult    // AIRA-252: a grep content-search reply for the board
+	msgBoardGetResult       // AIRA-252: a `show` probe reply resolving an id-shaped query
+	msgBoardDetailDue       // AIRA-254: the info-pane detail-fetch debounce has elapsed
+	msgBoardTranslateResult // AIRA-257: a plain-English rewrite reply for a ticket
 )
 
 type tuiMessage struct {
@@ -45,6 +46,7 @@ type tuiMessage struct {
 	DetachedResult executeDetachedResult
 	BoardSearch    boardSearchFetch
 	BoardGet       boardGetFetch
+	Translate      translateResult
 }
 
 type paletteSendEvidence uint8
@@ -98,6 +100,15 @@ type tuiExecutor struct {
 	messages          chan tuiMessage
 	reconnect         chan struct{}
 	wg                sync.WaitGroup
+	// AIRA-257 translate. The translator shells out to an LLM (up to ~90s), so a
+	// cmdBoardTranslate runs on its OWN goroutine — never the shared worker pool,
+	// which a long call would park behind, stalling detail/refresh fetches and the
+	// command loop. Superseded requests are NOT cancelled: a superseded goroutine
+	// finishes, caches its rewrite to disk (so the operator's likely return to that
+	// card is instant), and onBoardTranslateResult drops its now-stale reply by id —
+	// cheaper in complexity than a single-flight cancel and with no spurious-failure
+	// delivery. Each is bounded by the runtime ctx.
+	translator boardTranslator
 }
 
 func newTUIExecutor(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, workers int) *tuiExecutor {
@@ -120,6 +131,7 @@ func newTUIExecutorWithWatch(ctx context.Context, dispatcher, executeDispatcher 
 		ctx: ctx, dispatcher: dispatcher, executeDispatcher: executeDispatcher, scope: scope,
 		wake: make(chan struct{}, 1), jobs: make(chan tuiJob, workers*2),
 		messages: make(chan tuiMessage, 64), reconnect: make(chan struct{}, 1),
+		translator: boardTranslatorFactory(),
 	}
 	executor.wg.Add(1)
 	go executor.commandLoop()
@@ -226,6 +238,10 @@ func (e *tuiExecutor) commandLoop() {
 				// the CURRENT selection before dispatching the actual fetch.
 				e.wg.Add(1)
 				go e.deliverAfter(tuiRefreshDebounce, tuiMessage{Kind: msgBoardDetailDue})
+			case cmdBoardTranslate:
+				// AIRA-257. Off the shared pool, on its own goroutine (see the struct
+				// comment).
+				e.startTranslate(command.TranslateID)
 			}
 		}
 	}
@@ -251,6 +267,35 @@ func (e *tuiExecutor) reconnectAfter(upper time.Duration) {
 	case e.reconnect <- struct{}{}:
 	case <-e.ctx.Done():
 	}
+}
+
+// startTranslate begins one plain-English rewrite off the shared worker pool
+// (AIRA-257), on its own goroutine bounded by the runtime ctx.
+func (e *tuiExecutor) startTranslate(id string) {
+	e.wg.Add(1)
+	go e.translate(id)
+}
+
+// translate fetches the ticket's title+body (a `show` via fetchBoardDetail — the
+// extra relation/finding reads are noise on this rare on-demand path) and runs the
+// injected translator over them, delivering the result keyed by id. A `show`
+// failure or a failed translator surfaces as a Code, so the pane says
+// "unavailable", never a fabrication. On shutdown the runtime ctx is cancelled and
+// the translator/fetch return a cancellation Code; that is NOT delivered — nothing
+// renders during teardown, and it is not an honest ticket verdict.
+func (e *tuiExecutor) translate(id string) {
+	defer e.wg.Done()
+	result := translateResult{ID: id}
+	detail := fetchBoardDetail(e.ctx, e.dispatcher, e.scope, id)
+	if detail.ShowCode != "" {
+		result.Result = boardHumanizeResult{Code: detail.ShowCode}
+	} else {
+		result.Result = e.translator(e.ctx, id, detail.Title, detail.Body)
+	}
+	if e.ctx.Err() != nil {
+		return
+	}
+	e.deliver(tuiMessage{Kind: msgBoardTranslateResult, Translate: result})
 }
 
 func (e *tuiExecutor) worker() {

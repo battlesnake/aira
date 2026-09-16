@@ -179,21 +179,49 @@ func TestBoardDetailOverlayText(t *testing.T) {
 		Title: "the title", Status: "planned", Severity: "P1", Kind: "bug", Body: "body text",
 		Relations: []string{"blocks AIRA-2"}, Findings: "0",
 	}}
-	got := boardDetailOverlayText("AIRA-9", ready)
+	got := boardDetailOverlayText("AIRA-9", ready, boardHumanizeState{})
 	for _, want := range []string{"AIRA-9 · planned · P1 · bug", "the title", "blocks AIRA-2", "body text"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("overlay missing %q:\n%s", want, got)
 		}
 	}
 	// Loading overlay.
-	if got := boardDetailOverlayText("AIRA-9", boardDetailState{State: "loading"}); got != "loading…" {
+	if got := boardDetailOverlayText("AIRA-9", boardDetailState{State: "loading"}, boardHumanizeState{}); got != "loading…" {
 		t.Fatalf("loading overlay = %q", got)
 	}
 	// Ticket unevaluated: the header falls back to the bare id and says so.
 	bad := boardDetailState{ID: "AIRA-9", State: "ready", Model: boardDetailModel{ShowCode: "E_X"}}
-	got = boardDetailOverlayText("AIRA-9", bad)
+	got = boardDetailOverlayText("AIRA-9", bad, boardHumanizeState{})
 	if !strings.Contains(got, "AIRA-9") || !strings.Contains(got, "ticket unevaluated: E_X") {
 		t.Fatalf("unevaluated overlay missing honest marker:\n%s", got)
+	}
+}
+
+// TestBoardDetailOverlayTextHumanizeIsIDGated pins the AIRA-257 honesty seam at the
+// overlay's call site: this gate is LOAD-BEARING because the overlay can show an
+// unloaded search hit whose id differs from the ticket a held rewrite is for. A
+// rewrite keyed to a DIFFERENT ticket must never render under this overlay; only a
+// same-id rewrite is shown, labelled as an AI paraphrase. (A mutation passing
+// Humanize.ID instead of the overlay id — so the rewrite renders under every
+// ticket — reds this test.)
+func TestBoardDetailOverlayTextHumanizeIsIDGated(t *testing.T) {
+	ready := boardDetailState{ID: "AIRA-9", State: "ready", Model: boardDetailModel{
+		Title: "the original title", Status: "planned", Body: "the original body",
+	}}
+	// A rewrite held for a DIFFERENT ticket must not leak into AIRA-9's overlay.
+	foreign := boardHumanizeState{ID: "AIRA-1", State: "ready", PlainTitle: "REWRITTEN", PlainBody: "REWRITTEN BODY", Shown: true}
+	got := boardDetailOverlayText("AIRA-9", ready, foreign)
+	if strings.Contains(got, "REWRITTEN") || strings.Contains(got, "plain-English (AI)") {
+		t.Fatalf("a rewrite for AIRA-1 leaked into AIRA-9's overlay:\n%s", got)
+	}
+	if !strings.Contains(got, "the original body") {
+		t.Fatalf("overlay for a foreign rewrite should show the original:\n%s", got)
+	}
+	// A same-id rewrite IS shown, labelled.
+	own := boardHumanizeState{ID: "AIRA-9", State: "ready", PlainTitle: "REWRITTEN TITLE", PlainBody: "REWRITTEN BODY", Shown: true}
+	got = boardDetailOverlayText("AIRA-9", ready, own)
+	if !strings.Contains(got, "REWRITTEN BODY") || !strings.Contains(got, "plain-English (AI)") {
+		t.Fatalf("a same-id rewrite should render, labelled:\n%s", got)
 	}
 }
 

@@ -68,6 +68,10 @@ type boardState struct {
 	// the same readable render as a full-screen scrollable overlay.
 	Detail   boardDetailState
 	Expanded bool
+	// Humanize (AIRA-257) is the on-demand plain-English rewrite of the CURRENT
+	// ticket's title+body, toggled by 't'. It holds one ticket at a time; the
+	// disk cache makes any other ticket instant. See boardHumanizeState.
+	Humanize boardHumanizeState
 }
 
 // boardDetailState is the info pane's fetch state for the currently-selected
@@ -521,6 +525,9 @@ const (
 	boardActCardLast
 	boardActCardPageUp
 	boardActCardPageDown
+	// boardActTranslate (AIRA-257): 't' toggles the CURRENT ticket's title+body
+	// between the original and an on-demand plain-English LLM rewrite.
+	boardActTranslate
 )
 
 // onBoardAction is the tuiState-level board reducer wrapper: it clones state,
@@ -551,6 +558,10 @@ func onBoardAction(state tuiState, action boardAction) (tuiState, []tuiCmd) {
 		// same selection. That is benign — results are keyed by Detail.ID
 		// (onTUIDetailResult), so the redundant one is a no-op.
 		state.Board.Detail = boardDetailState{}
+		// AIRA-257. Drop any held plain-English rewrite too: keeping it would show a
+		// pre-refresh rewrite next to the refreshed original meta. 't' re-translates
+		// (the disk cache makes it instant if the ticket text is unchanged).
+		state.Board.Humanize = boardHumanizeState{}
 		return requestPanelRefresh(state, viewBoard)
 	case boardActFullWidth:
 		state.Board.FullWidth = !state.Board.FullWidth
@@ -595,6 +606,29 @@ func onBoardAction(state tuiState, action boardAction) (tuiState, []tuiCmd) {
 			state.Board.Search = boardSearchState{MatchIDs: map[string]bool{}}
 		}
 		return state, nil
+	case boardActTranslate:
+		// AIRA-257. Toggle the plain-English rewrite for the CURRENT ticket. The
+		// overlay owns Detail while open, so when Expanded the target is the ticket
+		// the overlay is showing (Detail.ID) — which may be an unloaded search hit
+		// distinct from the cursor card — else the selected card. Pressing 't' on a
+		// ticket whose rewrite we already have (ready) or are fetching (loading) just
+		// flips whether the plain version is shown; otherwise ("" or a prior
+		// unevaluated failure) it starts a fresh request. onBoardTranslateResult keys
+		// the reply by id, so a reply for a since-changed ticket is dropped.
+		id := boardSelectedCardID(*state.Board)
+		if state.Board.Expanded {
+			id = state.Board.Detail.ID
+		}
+		if id == "" {
+			return state, nil
+		}
+		h := &state.Board.Humanize
+		if h.ID == id && (h.State == "ready" || h.State == "loading") {
+			h.Shown = !h.Shown
+			return state, nil
+		}
+		*h = boardHumanizeState{ID: id, State: "loading", Shown: true}
+		return state, []tuiCmd{{Kind: cmdBoardTranslate, TranslateID: id}}
 	case boardActColLeft:
 		*state.Board = boardMoveColumn(*state.Board, -1)
 	case boardActColRight:
@@ -635,11 +669,22 @@ func boardArmDetail(bs boardState) (boardState, bool) {
 	id := boardSelectedCardID(bs)
 	if id == "" {
 		bs.Detail = boardDetailState{}
+		bs.Humanize = boardHumanizeState{} // AIRA-257: no selection → drop any held rewrite
 		return bs, false
 	}
 	if id == bs.Detail.ID {
 		return bs, false
 	}
+	// AIRA-257. The selection moved to a DIFFERENT ticket, so the held plain-English
+	// rewrite (keyed to the previous ticket, and possibly of now-changed text) is
+	// dropped along with the retargeted Detail. Pressing 't' re-derives it from the
+	// new selection's CURRENT content — instant from the disk cache when unchanged,
+	// a fresh translate when changed. Binding the in-memory rewrite's lifecycle to
+	// the Detail re-fetch is what stops a nav round-trip leaving a stale rewrite
+	// beside refreshed meta (Fable P2). It is also why boardHumanizeDisplay's id
+	// gate is defensive for the pane (the selection and Humanize.ID cannot diverge
+	// there) yet load-bearing for the overlay (which can show an unloaded hit id).
+	bs.Humanize = boardHumanizeState{}
 	wasArmed := bs.Detail.Armed
 	bs.Detail = boardDetailState{ID: id, State: "loading", Armed: true}
 	return bs, !wasArmed
@@ -671,6 +716,27 @@ func onBoardDetailDue(state tuiState) (tuiState, []tuiCmd) {
 	state.Board.Detail.State = "loading"
 	panel := state.Panels[viewBoard]
 	return state, []tuiCmd{{Kind: cmdFetch, View: viewBoard, Generation: panel.Generation, DetailID: id}}
+}
+
+// onBoardTranslateResult applies a plain-English rewrite reply (AIRA-257). It is
+// keyed by id: a reply for a ticket the operator has since moved on from (or that
+// a refresh cleared) is DROPPED, never shown under the current ticket. A failed
+// call lands an "unevaluated:<CODE>" state so the pane says "translation
+// unavailable (CODE)" — the honesty rule, never a fabricated rewrite.
+func onBoardTranslateResult(state tuiState, result translateResult) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if state.Board == nil || state.Board.Humanize.ID == "" || state.Board.Humanize.ID != result.ID {
+		return state, nil
+	}
+	h := &state.Board.Humanize
+	if result.Result.Code != "" {
+		h.State = "unevaluated:" + result.Result.Code
+		return state, nil
+	}
+	h.State = "ready"
+	h.PlainTitle = result.Result.PlainTitle
+	h.PlainBody = result.Result.PlainBody
+	return state, nil
 }
 
 // onBoardSearchSubmit resolves a query the three ways of spec §10:
