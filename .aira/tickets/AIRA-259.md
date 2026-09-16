@@ -1,12 +1,43 @@
 ---
-{"schema":1,"id":"AIRA-259","project":"aira","title":"aitest: emit a per-test dispatch/timing/RSS event stream (Chrome trace format) for an interactive Gantt of a confined run","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["aitest","telemetry"],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-259","project":"aira","title":"aitest: emit a per-test dispatch/timing/RSS event stream (Chrome trace format) for an interactive Gantt of a confined run","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["aitest","telemetry"],"hold":false,"relations":[]}
 ---
 
-HELD pending owner build-prioritisation. Requested by deploy (first consumer) to read
-gate-scaling / DoD-curve runs as a picture. Design scoped with deploy 2026-09-16; this
-body is the durable capture. NOT for the imminent 16/32/64-vCPU scaling run (that uses
-tables + the coarse timeline); the Gantt's value is across the whole gate-scaling
-program.
+## Shipped (per-worker, wait4 rusage)
+
+Built 2026-09-16 on the owner's greenlight+prioritisation as RELAYED by deploy (and
+surfaced to the owner, who did not object — the hold was mine, set pending exactly
+that prioritisation). Scope: the PER-WORKER tier — one Gantt span per worker with
+admission/ready/retired timing, the declared reservation, per-worker peak RSS / CPU /
+block-I/O, and the cgroup subtree memory.peak where a scope exists — emitted as
+Chrome Trace Event Format `aitest-trace-<pid>.json` (Perfetto-loadable), opt-in via
+`AIRA_AITEST_MEASURE_DIR`, fail-open. `pool-report.json` and the trace are both
+namespaced by supervisor pid, fixing a latent clobber where concurrent parallel-gate
+legs sharing one measure dir were last-writer-wins.
+
+MECHANISM CHANGE from the original capture below: the resource source is
+`os.wait4(2)` rusage captured at the SINGLE retirement reap (`_reap_child`), NOT a
+worker-side `/proc/self` report. A Fable review found workers SELF-EXIT on recycle
+(so the supervisor can't read a live `/proc` at retirement) and that wait4 rusage is
+simpler (~150 fewer lines, no worker-side file, no pid-reuse/stale-file surface),
+more correct (real numbers even for a SIGKILLed/crashed worker, which a self-read
+records as absent), and BETTER for the scaling consumer (ru_maxrss includes waited
+subprocesses; the /proc VmHWM design excluded them). Trace fields: `peak_rss_bytes`
+(ru_maxrss×1024, process+waited-children MAX), `cpu_user_s`/`cpu_system_s`
+(ru_utime/stime), `io_read_bytes`/`io_write_bytes` (ru_inblock/oublock×512, block-I/O
+disk-pressure), `cgroup_peak_bytes` (subtree, distinct — inherited COW is charged to
+the parent scope so it reads lower), `declared_rss_bytes`, timing. Honest-absent
+everywhere (never a fabricated 0).
+
+DEFERRED (follow-on): PER-TEST granularity (nested spans per nodeid + suite tag) —
+that needs instrumentation on the latency-critical single-threaded dispatch loop,
+deliberately not rushed. Renderer (thin self-contained HTML) + deploy's gate-side
+Tier-1 remain follow-ons; deploy owns the system-level /proc snapshots.
+
+---
+
+Original design capture (from the held backlog ticket; superseded on mechanism by the
+wait4 pivot above). Requested by deploy (first consumer) to read gate-scaling /
+DoD-curve runs as a picture. Design scoped with deploy 2026-09-16.
 
 ## Problem
 

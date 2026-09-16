@@ -24,7 +24,11 @@ from aitest.worker import _record_memory_sample
 
 
 def _read_report(measure_dir):
-    with open(os.path.join(str(measure_dir), "pool-report.json"), encoding="utf-8") as handle:
+    # AIRA-259: pool-report is now namespaced by supervisor pid so concurrent
+    # legs sharing one measure dir don't clobber. The test runs the Supervisor
+    # in-process, so os.getpid() is that supervisor's pid.
+    path = os.path.join(str(measure_dir), "pool-report-%d.json" % os.getpid())
+    with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -124,7 +128,7 @@ def test_no_report_and_no_retention_when_measure_dir_is_unset(tmp_path, monkeypa
     sup._observe_worker_usage({"scope": str(worker), "memory_max": "268435456"})
     sup._emit_measurement_report()
 
-    assert not (tmp_path / "pool-report.json").exists()
+    assert not list(tmp_path.glob("pool-report-*.json"))
     # Retention of per-worker records is also OFF: a normal run pays nothing.
     assert sup._pool_peak_records == []
 

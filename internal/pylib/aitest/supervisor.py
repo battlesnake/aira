@@ -65,6 +65,112 @@ def _read_cgroup_int(path):
     return value if value >= 0 else None
 
 
+def _now_wall_us():
+    """Absolute Unix-epoch microseconds — the Gantt's wall-clock axis (AIRA-259).
+    Absolute (not monotonic) so aitest's per-worker spans share ONE axis with the
+    gate harness's phase/leg spans, which compose in a single Perfetto view."""
+    return int(time.time() * 1_000_000)
+
+
+def _trace_span_start(record):
+    """The wall-µs a worker's timeline span begins: its admission request if
+    known, else when it became ready. None when neither is established."""
+    start = record.get("request_wall_us")
+    if start is None:
+        start = record.get("start_wall_us")
+    return start
+
+
+def _trace_args(record):
+    """The honest arg bag for a worker's active span: every established resource
+    field, and NONE that is unevaluated (absent = no-data, never a fabricated 0)."""
+    args = {}
+    for key in (
+        "pid", "declared_rss_bytes", "peak_rss_bytes", "cgroup_peak_bytes",
+        "cpu_user_s", "cpu_system_s", "io_read_bytes", "io_write_bytes",
+        "scope_path", "oom",
+    ):
+        value = record.get(key)
+        if value is not None:
+            args[key] = value
+    return args
+
+
+def build_worker_trace_events(records, pid, process_label):
+    """Chrome Trace Event Format events for the per-worker Gantt (AIRA-259).
+
+    PURE: no clocks, no I/O. Records already carry absolute epoch-µs timestamps.
+    Workers are interval-packed into lanes (tid) so a recycled worker stacks into
+    a freed lane and the timeline reads as ~concurrency rows — the systemd-analyze
+    plot look — rather than one row per fork. Each worker gets up to three spans on
+    its lane: "admission wait" (request→granted — the RAM-gated queue, deploy's
+    headline insight, which dominates when the slice is contended), "startup"
+    (granted→ready — fork + placement ack), and "worker" (ready→retired — active,
+    carrying the honest resource args). request/granted are None on a fallback
+    worker (ungoverned, no admission step), so it gets only the active span.
+
+    Honest limits of the picture: (1) admission wait exists only where a worker was
+    actually acquired through the daemon — an empty-pool blocking claim (run start,
+    last-worker replace) or a granted growth claim; where a LIVE-pool growth probe
+    finds no room, nothing spawns, so RAM-gated queueing there shows as lane GAPS,
+    not a lead-in. (2) ts is an ABSOLUTE wall-clock (to share the gate harness's
+    axis); a backwards clock step is clamped to a zero-duration span rather than
+    dropping the worker, and can rarely place a span fractionally under a lane-mate."""
+    events = []
+    if process_label:
+        events.append({"ph": "M", "name": "process_name", "pid": pid, "args": {"name": process_label}})
+    placeable = [
+        r for r in records
+        if _trace_span_start(r) is not None and r.get("end_wall_us") is not None
+    ]
+    placeable.sort(key=_trace_span_start)
+    lane_last_end = []
+    named_lanes = set()
+    for record in placeable:
+        start = _trace_span_start(record)
+        end = record["end_wall_us"]
+        lane = None
+        for index, last_end in enumerate(lane_last_end):
+            if last_end <= start:
+                lane = index
+                break
+        if lane is None:
+            lane = len(lane_last_end)
+            lane_last_end.append(end)
+        else:
+            lane_last_end[lane] = end
+        if lane not in named_lanes:
+            named_lanes.add(lane)
+            events.append({
+                "ph": "M", "name": "thread_name", "pid": pid, "tid": lane,
+                "args": {"name": "worker lane %d" % lane},
+            })
+        request = record.get("request_wall_us")
+        granted = record.get("granted_wall_us")
+        ready = record.get("start_wall_us")
+        # admission wait (request→granted): the RAM-gated queue.
+        if request is not None and granted is not None and granted > request:
+            events.append({
+                "ph": "X", "pid": pid, "tid": lane, "name": "admission wait",
+                "ts": request, "dur": granted - request, "cname": "grey",
+            })
+        # startup (granted→ready): fork + placement ack, distinct from the queue.
+        if granted is not None and ready is not None and ready > granted:
+            events.append({
+                "ph": "X", "pid": pid, "tid": lane, "name": "startup",
+                "ts": granted, "dur": ready - granted, "cname": "light_grey",
+            })
+        # active (ready→retired). dur clamped to >= 0 so a backwards clock step
+        # never DROPS a worker that ran (it would vanish from the picture);
+        # max(0, ...) keeps the span honestly, at worst zero-duration.
+        active_start = ready if ready is not None else start
+        events.append({
+            "ph": "X", "pid": pid, "tid": lane, "name": "worker",
+            "ts": active_start, "dur": max(0, end - active_start), "args": _trace_args(record),
+        })
+    return events
+
+
 def _scope_oom_group_killed(scope):
     """True/False if this scope's own memory.events settles the question,
     else None.
@@ -316,31 +422,39 @@ def _terminate_process(process):
 
 
 def _reap_child(pid):
-    """waitpid a child we expect to be exiting, bounded, escalating to SIGKILL.
+    """Reap (os.wait4) a child we expect to be exiting, bounded, escalating to
+    SIGKILL. Returns the reaped child's resource usage (os.wait4's struct_rusage),
+    or None when it could not be reaped (a zombie we gave up on, or already reaped).
 
     The unbounded os.waitpid() this replaces sat directly on the dispatch loop
     (retirement, recycle, shutdown), so a child that reported its result and
     then wedged on the way out -- a coverage save, a wedged atexit, an
     uninterruptible page-fault wait under memory pressure -- froze the whole
-    supervisor exactly as a wedged relay does."""
+    supervisor exactly as a wedged relay does.
+
+    AIRA-259: os.wait4 (same reaping semantics as os.waitpid, plus rusage) is what
+    lets the per-worker Gantt trace record real peak RSS / CPU / block-I/O without
+    a worker-side self-report. rusage is populated by the kernel even for a
+    SIGKILLed or crashed child, so a crashed worker still reports real numbers --
+    the case a /proc self-read (the worker is gone by retirement) could not."""
     deadline = time.monotonic() + _env_seconds("AIRA_AITEST_REAP_TIMEOUT", _REAP_TIMEOUT_SECONDS)
     killed = False
     while True:
         try:
-            done, _ = os.waitpid(pid, os.WNOHANG)
+            done, _, rusage = os.wait4(pid, os.WNOHANG)
         except ChildProcessError:
-            return
+            return None
         if done:
-            return
+            return rusage
         if time.monotonic() >= deadline:
             if killed:
                 # It has been SIGKILLed and still is not reapable. Leaving a
                 # zombie is strictly better than never returning to the loop.
-                return
+                return None
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
-                return
+                return None
             killed = True
             deadline = time.monotonic() + _env_seconds("AIRA_AITEST_REAP_TIMEOUT", _REAP_TIMEOUT_SECONDS)
         time.sleep(0.01)
@@ -798,6 +912,11 @@ class Supervisor:
         # max above, kept not collapsed, and ONLY materialised when the report is
         # enabled (AIRA_AITEST_MEASURE_DIR) so a normal run pays nothing.
         self._pool_peak_records = []
+        # AIRA-259. Per-worker Gantt trace spans (timing + procfs self-report +
+        # cgroup peak cross-check), materialised only when AIRA_AITEST_MEASURE_DIR
+        # is set. One span per worker (recycles are separate spans), interval-packed
+        # into lanes at emit time.
+        self._worker_trace_records = []
         # AIRA-64 growth probe bookkeeping.
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
@@ -1576,7 +1695,17 @@ class Supervisor:
         cleanup code fully UNCONFINED. (place_self() itself is separately
         guarded the same way inside fork_worker, Task 12, since it can
         raise before this function's own try even starts.)"""
+        # AIRA-259: admission REQUESTED — the start of the light "admission wait"
+        # lead-in on the Gantt (the RAM-gated queueing insight). acquire_worker
+        # below blocks until the daemon grants.
+        request_wall_us = _now_wall_us()
         grant, admit_process = self.acquire_worker(estimated_bytes, blocking=blocking)
+        # AIRA-259: admission GRANTED. request→granted is the "admission wait" (the
+        # RAM-gated queue — deploy's headline insight; it dominates when the slice
+        # is contended, which is exactly the scaling case), separated from the
+        # granted→ready fork+placement-ack "startup" below, so the wait is not
+        # over-attributed to admission.
+        granted_wall_us = _now_wall_us()
         # AIRA-123. None here is a LEDGER-ONLY grant: the daemon really admitted
         # this worker against the container's RAM budget, there is simply no
         # cgroup sub-scope to place it in. Every cgroup-dependent step below is
@@ -1654,6 +1783,11 @@ class Supervisor:
             # worker's real cap; grant["memory_max"] is a STRING (and absent on a
             # ledger-only grant), so estimated_bytes is the numeric authority here.
             "reservation": estimated_bytes,
+            # AIRA-259 Gantt timing: requested (spawn entry) → granted (admission)
+            # → ready (now — placement ack already passed for a scoped worker).
+            "request_wall_us": request_wall_us,
+            "granted_wall_us": granted_wall_us,
+            "start_wall_us": _now_wall_us(),
             # Opened only now, on the path where this worker is actually going
             # to be registered: every failure branch above has already reaped
             # the child, and a pidfd for a reaped pid is either invalid or --
@@ -1780,6 +1914,14 @@ class Supervisor:
             # "fits everything" -- reservation=None is the sentinel the fit filter,
             # the growth gate and retire-on-no-fit all special-case (Tasks 3/4).
             "reservation": None,
+            # AIRA-259 Gantt timing. A fallback worker is ungoverned with NO
+            # admission step, so it has no admission-wait lead-in: request is None
+            # (build_worker_trace_events then starts the span at ready and emits no
+            # "admission wait" span) rather than a second clock read, which would
+            # fabricate a spurious few-µs wait that never happened.
+            "request_wall_us": None,
+            "granted_wall_us": None,
+            "start_wall_us": _now_wall_us(),
             # AIRA-40, exactly as on the confined path: this fork site needs
             # the independent liveness signal just as much -- a fallback worker
             # runs the same arbitrary test code, so it inherits the same
@@ -1919,7 +2061,12 @@ class Supervisor:
         # supervisor exactly as a wedged relay did. Its results are already
         # recorded by the time we get here, so escalating to SIGKILL costs
         # nothing and cannot lose data.
-        _reap_child(pid)
+        #
+        # AIRA-259: this reap is the SINGLE point every retirement (recycle, stop,
+        # crash via _handle_worker_exit) funnels through, and os.wait4 returns the
+        # child's rusage here — real even for a crashed/SIGKILLed worker — which is
+        # the per-worker RSS/CPU/IO the Gantt trace records below.
+        rusage = _reap_child(pid)
         grant = state.get("grant")
         if grant is not None:
             # AIRA-180 §5s.1. The fold happens HERE, not beside
@@ -1939,6 +2086,11 @@ class Supervisor:
             # and loses memory.peak (measured: pool-peak sample_count 1 -> 0). The
             # worker is reaped above, so memory.peak is already final here.
             self._observe_worker_usage(grant)
+        # AIRA-259: record this worker's Gantt span BEFORE the scope is torn down
+        # below (the cgroup peak cross-check needs the still-live scope), and
+        # regardless of grant (a fallback/ledger-only worker still gets a span,
+        # with cgroup fields absent). No-op unless AIRA_AITEST_MEASURE_DIR is set.
+        self._record_worker_trace(grant, state, pid, rusage)
         if state["admit_process"] is not None:
             # Closing the relay's stdin is the lease RELEASE (S15): the relay's
             # io.Copy(stdin) returns, it closes its daemon connection, and the daemon
@@ -2018,6 +2170,74 @@ class Supervisor:
                     cap = None
             self._pool_peak_records.append(
                 {"peak": peak, "memory_max": cap, "oom": scope_oom, "scope_path": scope}
+            )
+
+    def _record_worker_trace(self, grant, state, pid, rusage):
+        """Append one worker's Gantt span (AIRA-259): supervisor-side timing +
+        declared reservation, the cgroup subtree memory.peak/oom where a real
+        cgroup exists, and the per-worker RSS / CPU / block-I/O from the reaped
+        child's rusage (os.wait4 in _reap_child). rusage is populated by the
+        kernel even for a crashed/SIGKILLed worker, so a crash still reports real
+        numbers; a worker the reap gave up on (a wedged zombie) yields
+        rusage=None and those fields stay absent. Honest: every field the source
+        did not expose is absent, never a fabricated 0. No-op unless
+        AIRA_AITEST_MEASURE_DIR is set.
+
+        peak_rss_bytes (ru_maxrss) is the largest concurrent RSS of the worker
+        PROCESS plus any children it WAITED for -- a MAX, not a sum. It has a FLOOR:
+        a worker inherits the supervisor's RSS at fork, so every figure is >= the
+        supervisor's own RSS at that moment (a do-nothing worker still reports tens
+        of MB) -- read a worker's cost as the DELTA above that floor. It differs
+        from cgroup_peak_bytes (the worker SCOPE's subtree peak): COW pages the
+        worker inherited from the supervisor are charged to the parent scope, so
+        the cgroup figure reads LOWER. The two are DISTINCT measures, NOT a
+        cross-check. io_*_bytes are ru_inblock/oublock x512 -- 512-byte BLOCK I/O
+        (a disk-pressure signal that undercounts page-cache-satisfied reads),
+        not total bytes touched."""
+        if not os.environ.get("AIRA_AITEST_MEASURE_DIR", "").strip():
+            return
+        scope = grant.get("scope") if grant else None
+        record = {
+            "pid": pid,
+            "request_wall_us": state.get("request_wall_us"),
+            "granted_wall_us": state.get("granted_wall_us"),
+            "start_wall_us": state.get("start_wall_us"),
+            "end_wall_us": _now_wall_us(),
+            "declared_rss_bytes": state.get("reservation"),
+            "scope_path": scope,
+            "cgroup_peak_bytes": _read_cgroup_int(os.path.join(scope, "memory.peak")) if scope else None,
+            "oom": _scope_oom_group_killed(scope) if scope else None,
+        }
+        if rusage is not None:
+            record["peak_rss_bytes"] = rusage.ru_maxrss * 1024  # Linux ru_maxrss is KiB
+            record["cpu_user_s"] = rusage.ru_utime
+            record["cpu_system_s"] = rusage.ru_stime
+            record["io_read_bytes"] = rusage.ru_inblock * 512  # 512-byte block I/O
+            record["io_write_bytes"] = rusage.ru_oublock * 512
+        self._worker_trace_records.append(record)
+
+    def _emit_worker_trace(self):
+        """Write the per-worker Gantt trace as Chrome Trace Event Format
+        (AIRA-259), namespaced by supervisor PID so concurrent legs sharing one
+        measure dir under the parallel gate never clobber each other. OPT-IN (the
+        measure dir) and FAIL-OPEN (advisory telemetry never fails a suite)."""
+        measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "").strip()
+        if not measure_dir:
+            return
+        label = "aitest pool (pid %d" % os.getpid()
+        if self.outer_scope and self.outer_scope != _OUTER_SCOPE_SHIM_SENTINEL:
+            label += ", %s" % os.path.basename(self.outer_scope.rstrip("/"))
+        label += ")"
+        events = build_worker_trace_events(self._worker_trace_records, os.getpid(), label)
+        try:
+            os.makedirs(measure_dir, exist_ok=True)
+            path = os.path.join(measure_dir, "aitest-trace-%d.json" % os.getpid())
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"traceEvents": events, "displayTimeUnit": "ms"}, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        except OSError as exc:
+            sys.stderr.write(
+                "aira aitest: could not write worker trace under %s: %s\n" % (measure_dir, exc)
             )
 
     def _pool_subject_key(self):
@@ -2122,8 +2342,8 @@ class Supervisor:
         the allowance term. Called after _report_pool_usage; `aira confine` owns
         the parent scope for the life of the launch, so there is nothing of
         aitest's own to tear down after this read."""
-        measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "")
-        if not measure_dir.strip():
+        measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "").strip()
+        if not measure_dir:
             return
 
         def honest(value):
@@ -2170,7 +2390,7 @@ class Supervisor:
         try:
             os.makedirs(measure_dir, exist_ok=True)
             with open(
-                os.path.join(measure_dir, "pool-report.json"), "w", encoding="utf-8"
+                os.path.join(measure_dir, "pool-report-%d.json" % os.getpid()), "w", encoding="utf-8"
             ) as handle:
                 json.dump(report, handle, indent=2, sort_keys=True)
                 handle.write("\n")
@@ -3057,6 +3277,7 @@ class Supervisor:
         # memory.peak, which `aira confine` owns for the life of the launch, so
         # there is no scope of aitest's own to tear down first. Opt-in + fail-open.
         self._emit_measurement_report()
+        self._emit_worker_trace()
         # ONE structurally complete pass, after every other path has had its
         # say -- see _synthesize_unevaluated_reports for why this is a single
         # post-run pass over items_by_nodeid rather than per-call-site fixes.
