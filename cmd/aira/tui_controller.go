@@ -221,19 +221,21 @@ const (
 	cmdBoardSearch         // AIRA-252: dispatch a `grep` content search for the board
 	cmdBoardGet            // AIRA-252: dispatch a `show` probe to resolve an id-shaped query
 	cmdBoardDetailDebounce // AIRA-254: arm the info-pane detail-fetch debounce
+	cmdBoardTranslate      // AIRA-257: run a ticket's title+body through the LLM translator
 )
 
 // tuiCmd contains only values (Palette is executor-only). The executor
 // interprets it off the UI thread.
 type tuiCmd struct {
-	Kind       tuiCmdKind
-	View       tuiView
-	Generation int
-	Backoff    time.Duration
-	DetailID   string
-	Palette    *core.Request
-	Execute    *executeLaunch
-	Search     string // AIRA-252: the raw board search query for cmdBoardSearch
+	Kind        tuiCmdKind
+	View        tuiView
+	Generation  int
+	Backoff     time.Duration
+	DetailID    string
+	Palette     *core.Request
+	Execute     *executeLaunch
+	Search      string // AIRA-252: the raw board search query for cmdBoardSearch
+	TranslateID string // AIRA-257: the ticket id to translate for cmdBoardTranslate
 }
 
 type fetchResult struct {
@@ -264,6 +266,13 @@ type detailResult struct {
 	ID         string
 	Detail     string           // viewTickets/viewFindings: the legacy string detail
 	Board      boardDetailModel // AIRA-254 viewBoard: the readable structured detail
+}
+
+// translateResult is a plain-English rewrite reply for one ticket (AIRA-257),
+// keyed by the id it was requested for so a stale reply is dropped.
+type translateResult struct {
+	ID     string
+	Result boardHumanizeResult
 }
 
 func newTUIState(eventCapacity int) tuiState {

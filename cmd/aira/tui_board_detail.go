@@ -226,11 +226,16 @@ func boardInfoDetail(card boardCard, detail boardDetailState) boardDetailState {
 // for a ticket that is not in a loaded column (an opened grep-only search hit);
 // it reuses the pane's field and body renderers, laid out top-to-bottom for
 // scrolling. No badges here — those are a card affordance the overlay lacks.
-func boardDetailOverlayText(id string, detail boardDetailState) string {
+func boardDetailOverlayText(id string, detail boardDetailState, humanize boardHumanizeState) string {
 	if detail.State != "ready" {
 		return "loading…"
 	}
 	model := detail.Model
+	// AIRA-257: swap in the plain-English rewrite (with a header label) when it is
+	// this ticket's and toggled on; else the original. The rewrite comes from an
+	// independent fetch, so it can be shown even when this overlay's own metadata
+	// read failed — the label keeps it honest.
+	dispTitle, dispBody, label := boardHumanizeDisplay(id, model.Title, boardDetailBodyText(detail), humanize)
 	var b strings.Builder
 
 	header := id
@@ -247,19 +252,22 @@ func boardDetailOverlayText(id string, detail boardDetailState) string {
 		}
 		header = strings.Join(parts, " · ")
 	}
+	if label != "" {
+		header += " · " + label
+	}
 	b.WriteString(header + "\n")
 	switch {
 	case model.ShowCode != "":
 		b.WriteString("(ticket unevaluated: " + model.ShowCode + ")\n")
-	case strings.TrimSpace(model.Title) != "":
-		b.WriteString(model.Title + "\n")
+	case strings.TrimSpace(dispTitle) != "":
+		b.WriteString(dispTitle + "\n")
 	}
 	b.WriteString("\n")
 	for _, line := range boardDetailFetchedLines(model) {
 		b.WriteString(line + "\n")
 	}
 	b.WriteString("\n")
-	b.WriteString(boardDetailBodyText(detail))
+	b.WriteString(dispBody)
 	return b.String()
 }
 
