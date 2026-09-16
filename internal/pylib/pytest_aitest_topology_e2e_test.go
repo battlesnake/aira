@@ -341,9 +341,14 @@ func TestRealPytestAitestNoWholeSuiteKillOnAggregate(t *testing.T) {
 // is absent — its absence means the pool never scoped a worker.
 func readPoolReport(t *testing.T, measureDir, runOutput string) map[string]interface{} {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(measureDir, "pool-report.json"))
+	// AIRA-259: namespaced by supervisor pid; this single-pool run writes one.
+	matches, _ := filepath.Glob(filepath.Join(measureDir, "pool-report-*.json"))
+	if len(matches) != 1 {
+		t.Fatalf("pool-report was not written, or not exactly one, under %s: got %v (the pool scoped no worker?)\nrun output:\n%s", measureDir, matches, runOutput)
+	}
+	raw, err := os.ReadFile(matches[0])
 	if err != nil {
-		t.Fatalf("pool-report.json was not written (the pool scoped no worker?): %v\nrun output:\n%s", err, runOutput)
+		t.Fatalf("pool-report was not written (the pool scoped no worker?): %v\nrun output:\n%s", err, runOutput)
 	}
 	var report map[string]interface{}
 	if err := json.Unmarshal(raw, &report); err != nil {

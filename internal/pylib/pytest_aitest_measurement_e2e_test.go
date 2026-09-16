@@ -114,7 +114,13 @@ func TestRealPytestAitestMeasurementReport(t *testing.T) {
 		t.Fatalf("measurement run unexpectedly fell back to unconfined execution (nothing to measure):\n%s", text)
 	}
 
-	reportPath := filepath.Join(measureDir, "pool-report.json")
+	// AIRA-259: the report is namespaced by supervisor pid so concurrent legs do
+	// not clobber; this single-pool run writes exactly one.
+	reportMatches, _ := filepath.Glob(filepath.Join(measureDir, "pool-report-*.json"))
+	if len(reportMatches) != 1 {
+		t.Fatalf("expected exactly one pool-report-<pid>.json under %s, got %v\nrun output:\n%s", measureDir, reportMatches, text)
+	}
+	reportPath := reportMatches[0]
 	raw, readErr := os.ReadFile(reportPath)
 	if readErr != nil {
 		t.Fatalf("measurement report was not written to %s: %v\nrun output:\n%s", reportPath, readErr, text)
@@ -218,5 +224,48 @@ func TestRealPytestAitestMeasurementReport(t *testing.T) {
 	if !sawRealCurrent {
 		t.Fatalf("every per-test memory.current was 'unevaluated' on a confined run -- "+
 			"the read or the scope path is wrong (sidecars: %v)", tsvs)
+	}
+
+	// AIRA-259: the per-worker Gantt trace must be written (pid-namespaced), and on
+	// a CONFINED run at least one worker span must carry a REAL peak_rss_bytes (from
+	// os.wait4's rusage) AND a real cgroup_peak_bytes (the scope's memory.peak) --
+	// this pins the whole retire→wait4→record→emit path with real forks, the thing
+	// the isolated Python unit tests alone leave porous.
+	traceMatches, _ := filepath.Glob(filepath.Join(measureDir, "aitest-trace-*.json"))
+	if len(traceMatches) != 1 {
+		t.Fatalf("expected exactly one aitest-trace-<pid>.json under %s, got %v", measureDir, traceMatches)
+	}
+	traceRaw, err := os.ReadFile(traceMatches[0])
+	if err != nil {
+		t.Fatalf("worker trace was not readable: %v", err)
+	}
+	var trace struct {
+		TraceEvents []struct {
+			Name string                 `json:"name"`
+			Args map[string]interface{} `json:"args"`
+		} `json:"traceEvents"`
+	}
+	if err := json.Unmarshal(traceRaw, &trace); err != nil {
+		t.Fatalf("worker trace is not valid JSON: %v\n%s", err, traceRaw)
+	}
+	sawRealPeak, sawRealCgroup := false, false
+	for _, ev := range trace.TraceEvents {
+		if ev.Name != "worker" {
+			continue
+		}
+		if v, isNum := ev.Args["peak_rss_bytes"].(float64); isNum && v > 0 {
+			sawRealPeak = true
+		}
+		if v, isNum := ev.Args["cgroup_peak_bytes"].(float64); isNum && v > 0 {
+			sawRealCgroup = true
+		}
+	}
+	if !sawRealPeak {
+		t.Fatalf("no worker span carried a real peak_rss_bytes on a confined run "+
+			"(the rusage from os.wait4 was not folded into the trace):\n%s", traceRaw)
+	}
+	if !sawRealCgroup {
+		t.Fatalf("no worker span carried a real cgroup_peak_bytes on a confined run "+
+			"(the scope memory.peak read is wrong):\n%s", traceRaw)
 	}
 }
