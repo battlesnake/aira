@@ -92,21 +92,30 @@ func boardHumanizeCacheKey(id, title, body string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// boardHumanizePrompt asks for a parseable two-field rewrite. It is deliberately
-// explicit about dropping jargon/shorthand (the "claude-ish" the owner wants gone)
-// while keeping the technical meaning.
+// boardHumanizePrompt asks for a parseable two-field rewrite aimed at a technically
+// literate reader — an undergraduate engineer/scientist or a technical manager — who
+// does not know this codebase's internal jargon. It asks for the FULL description
+// rewritten into readable prose (NOT condensed to a summary), with jargon/shorthand
+// (the "claude-ish" the owner wants gone) unpacked while the technical meaning is
+// preserved (AIRA-258).
 func boardHumanizePrompt(title, body string) string {
 	desc := strings.TrimSpace(body)
 	if desc == "" {
 		desc = "(none)"
 	}
-	return "You are rewriting a software-project ticket so a human skimming a kanban " +
-		"board understands it at a glance. Rewrite it in plain, direct English: keep the " +
-		"technical meaning accurate, but drop internal jargon, shorthand, bare ticket-ID " +
-		"references, and dense compound phrasing.\n\n" +
+	return "You are rewriting a software-project ticket into clear, human-readable English " +
+		"for a technically literate reader — an undergraduate engineer or scientist, or a " +
+		"technical manager — who does not know this codebase's internal jargon. Rewrite it in " +
+		"plain, direct prose: keep ALL the technical meaning and detail, but unpack internal " +
+		"jargon, shorthand, bare ticket-ID references, and dense compound phrasing into " +
+		"readable language.\n\n" +
+		"Rewrite the FULL description — do NOT condense it into a short summary. Preserve " +
+		"every point the original makes; a long description yields a correspondingly full " +
+		"rewrite. You may open the body with a one-sentence summary ONLY as a lead-in above " +
+		"the full rewritten text, never as a replacement for it.\n\n" +
 		"Output EXACTLY this and nothing else:\n" +
-		"TITLE: <one concise plain-English line>\n" +
-		"BODY: <1 to 3 short plain-English sentences>\n\n" +
+		"TITLE: <the ticket title, rewritten as one clear plain-English line>\n" +
+		"BODY: <the full description, rewritten in clear readable English for the reader above>\n\n" +
 		"Ticket to rewrite:\n" +
 		"Title: " + strings.TrimSpace(title) + "\n" +
 		"Description: " + desc + "\n"
@@ -248,10 +257,13 @@ func newAgentmuxTranslator(dir string, argv []string) boardTranslator {
 
 // deepseekTranslatorArgv is the production translator command: the agentmux LLM
 // gateway with Deepseek (cheap, reliable, no rate limit — Gemini is free-tier and
-// flaky per aira's own SKILL). --raw returns the bare answer, not the verdict-first
-// concise format.
+// flaky per aira's own SKILL). --concise=false sends the prompt verbatim — agentmux
+// defaults concise to true, which prepends a verdict-first "answer concise for a
+// machine reader" preamble that would compress the rewrite; a full readable
+// translation is the opposite of that, so it is explicitly disabled. (--concise=false
+// is the same as the --raw alias, spelled out so the intent is self-evident.)
 func deepseekTranslatorArgv() []string {
-	return []string{"agentmux", "ask", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--raw", "--timeout", "90s"}
+	return []string{"agentmux", "ask", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--concise=false", "--timeout", "90s"}
 }
 
 // boardTranslatorFactory builds the translator the executor uses to satisfy a

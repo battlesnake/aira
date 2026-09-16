@@ -38,6 +38,13 @@ func TestBoardHumanizePrompt(t *testing.T) {
 			t.Fatalf("prompt missing %q:\n%s", needle, p)
 		}
 	}
+	// AIRA-258: the prompt must ask for the FULL rewrite (not a short summary) and
+	// name the technical-reader audience — the owner's requirement.
+	for _, needle := range []string{"FULL", "summary", "technical manager"} {
+		if !strings.Contains(p, needle) {
+			t.Fatalf("prompt no longer pins the full-rewrite/audience intent (missing %q):\n%s", needle, p)
+		}
+	}
 	if !strings.Contains(boardHumanizePrompt("T", "   "), "(none)") {
 		t.Fatal("an empty description must render (none), never a blank")
 	}
