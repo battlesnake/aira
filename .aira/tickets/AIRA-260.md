@@ -270,11 +270,87 @@ concurrently, machine-wide (all aitest pools + confine jobs).
    deploy's lane check, NOT an aira claim (the #49 flock-slot design and the current S5
    2×NumCPU ledger are DIFFERENT mechanisms — do not assume from memory).
 
-Status: feasibility scoping only, NO BUILD (no owner greenlight; sits under this held
-ticket). deploy is running a design workflow and will send the detailed contract
-(fastest-ee's forking-test sites + dispatcher contract + CPU-quota-vs-serial-cap plan);
-I size the actual dispatcher change against it when it lands. Answer sent to deploy
-2026-09-17.
+### Contract + adversarial challenge LANDED (2026-09-17, deploy's design workflow)
+
+Full detail is deploy's box artifact `~/tmp/ci-cp/cpu-quota-workflow-output.json`
+(ephemeral); the decision-critical parts are captured HERE so the record survives it.
+
+**Converges with the feasibility read above.** The workflow independently reaches the
+same shape: the `{ram,cpu}` request vector, the 2×NumCPU ledger, the `available_cpu`
+snapshots and the 1-slot growth gate are ALREADY wired end-to-end — aira's build is only
+to promote the hardcoded `DefaultConfineCPUCores=1` charge to a mark-read per-nodeid
+`cpu_need`. I VERIFIED that aira-side structural premise this turn (the CPU ledger
+dimension `admit.go:2251`, the fixed charge `confine.go:25`+`worker_admit.go:424`, the
+`available_cpu<1` gate `supervisor.py:2526`, the request `Cpu` field
+`admission_linux.go:117` all exist) → the challenge's own item-8 caveat ("aira side
+asserted, not shown") is DISCHARGED at the structural level. The finer aira line refs in
+the 5 steps below are deploy's design's citations, NOT each re-verified aira-side.
+
+**The 5-step aira dispatcher contract (the recipe for when/if it is built):**
+1. Register + read `aira_cpu(cores)` in `aitest/__init__.py pytest_configure` beside
+   `aira_mem`, before the `--aitest-workers` early-return; a `_aira_cpu_cores_for_item`
+   accessor reads one positive int, malformed → default + stderr warning (never silent).
+2. Build `cpu_need[nodeid]` in `supervisor.collect()` — **ABSOLUTE, not floor+increment**
+   (RAM is overhead-floor+increment because every worker pays base import cost; CPU peak
+   demand IS N, so default = flat 1, marked = flat N). `_cpu_need_for` mirrors `_need_for`.
+3. Add `--estimated-cpu <cores>` to the worker-admit argv in `_spawn_admit_relay`.
+4. Add `CPUCores` to `WorkerAdmitRequest`, send it, parse `estimated_cpu` in
+   `worker_admit.go` and charge THAT instead of the hardcoded `DefaultConfineCPUCores`.
+5. Gate `cpu_need` against `available_cpu` in the growth check (today `available_cpu<1`),
+   exactly as `_largest_fitting` gates `reservation_need` against `available_bytes`. ONE
+   ATOMIC admit decision across both {ram,cpu} columns — check-and-charge both together,
+   release both together; NEVER grant RAM then block on CPU and leak the RAM reservation.
+
+**Two HARD correctness invariants the contract pins (rules-with-tests, NOT perf calls):**
+- **Admission-accounting ONLY — do NOT write `cpu.max` or an affinity mask.** Per deploy's
+  fork-site analysis the engine runner clamps fork count on `sched_getaffinity` (reported,
+  fastest-ee side), so an affinity-strengthened mark could clamp a byte-identity test's
+  fork below its width → drop an engine parallel test to SERIAL, which PASSES without
+  exercising the parallel path — silently disabling the very tests the mark exists to
+  protect. `cpu.max` is a quota not an affinity mask, so it wouldn't even reduce fork
+  count; it only perturbs timing. Keep CPU soft (`cpu.weight` only, as today).
+- **Fail-OPEN (opposite of RAM).** If the CPU ledger can't be evaluated
+  (`cpu_slots=unevaluated`), degrade to 1-core-per-worker (today's behaviour), never
+  stall — oversubscribing CPU degrades throughput (recoverable) vs under-reserving RAM
+  OOM-kills (fatal). And **N > total 2×NumCPU capacity → clamp charge to capacity, admit
+  ALONE against a drained CPU ledger, warn once — never refuse/stall** (`aira_cpu(8)` on a
+  2–4-core CI runner hits this routinely). N ≤ capacity but > available = ordinary
+  backpressure (the existing blocking admit-relay).
+
+**Adversarial verdict: `aira_cpu` is MEASUREMENT-GATED — do NOT build now.** On current
+evidence the engine fork exposure is a FIXED ~13-invocation set (not core-scaled),
+probably TAIL-DURATION not oversubscription. On 64 cores (128-slot ledger) an
+`aira_cpu(4)` buys back ~3 slots ≈ 2.3% of pool (aira_cpu(8) ≈ 5.5%), only during the
+fork phase — and if the bottleneck is tail-duration, reserving cores makes the tail
+WORSE (drains the pool around a slow test without speeding it; the real fix is
+longest-processing-time-first scheduling, not a CPU ledger). Plus: the mark systematically
+OVER-reserves (held whole-test but forks only the parallel half; flock-blocked children
+reserve idle cores; N=spawned-not-runnable), so on an unsaturated box it worsens makespan;
+CPU-quota beats serial-cap ONLY for must-fork tests on a saturated box with CPU-bound
+forks. Two further design holes: each `aira_cpu(N)` is a hand-maintained structural count
+of the test's fork width with nothing binding it to reality (drifts silently on refactor —
+violates the repo's "write the query, not the numeral" rule; needs a fixture asserting
+mark == actual `max_workers`), and the per-dimension wedge-avoidance does NOT compose (a
+test "admitted alone" on a drained CPU ledger can still block forever on RAM; 2-D
+admission also worsens head-of-line blocking).
+
+**Cheaper ZERO-AIRA wins the challenge recommends instead (fastest-ee's, not aira's):**
+- **Ship now:** `LITE_PARALLEL_CHECKS=1` in the `test-lite` recipe — the ONE genuinely
+  core-scaled amplifier (auto-4 fork on every concurrent copper-board worker);
+  result-neutral, the code already honours the env var.
+- **Also cheap:** drop the engine byte-identity tests' `max_workers` 4→2 — halves engine
+  fork exposure, one line/test, zero aira, zero coverage loss (N≥2 proves the property).
+- Then MEASURE (after serial-cap + 4→2): oversubscription or tail-duration on the critical
+  path? Apply `aira_cpu` only to tests that demonstrably CPU-saturate by clustering —
+  realistically none today, pending measurement.
+
+**Status:** contract + challenge captured. aira side STAYS HELD — no build (the
+measurement-gate verdict aligns with the owner's simplify/challenge + measurement-gated
+discipline; and this is exactly the kind of clean design that passes correctness review yet
+should not be built without necessity). deploy is surfacing to the owner and will relay the
+owner's steer. When/if built, the 5-step contract is the recipe and the two invariants are
+hard rules. The serial-cap + 4→2 wins are fastest-ee's to land. Answer + this capture sent
+to deploy 2026-09-17.
 
 ## Requesters / provenance
 
