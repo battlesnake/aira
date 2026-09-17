@@ -214,3 +214,21 @@ def test_spawn_admit_relay_sends_estimated_cpu(monkeypatch):
     argv = captured["argv"]
     assert "--estimated-cpu" in argv, "the worker-admit argv must carry the cpu reservation"
     assert argv[argv.index("--estimated-cpu") + 1] == "4", "and its value must be the reservation, not dropped/defaulted"
+
+
+def test_collect_emits_the_cpu_warning_once(pytester, capsys):
+    # A malformed aira_cpu must WARN via collect()'s sys.stderr.write, not merely return a
+    # warning string nobody prints. Delete the emission in collect() and this reds (Fable
+    # Phase-B review: this emission site was unpinned, and cpu shares the gap with time).
+    items = _getitems(pytester, '''
+        import pytest
+        @pytest.mark.aira_cpu(0)
+        def test_bad(): pass
+    ''')
+    capsys.readouterr()  # discard collection output
+    sup = Supervisor()
+    sup.collect(items)
+    err = capsys.readouterr().err
+    cpu_lines = [l for l in err.splitlines() if "aira aitest:" in l and "aira_cpu" in l]
+    assert len(cpu_lines) == 1, cpu_lines
+    assert sup.cpu_need[_item(items, "test_bad").nodeid] == _DEFAULT_CPU_CORES

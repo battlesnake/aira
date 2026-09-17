@@ -48,6 +48,15 @@ def pytest_configure(config):
         "fork width); the aitest pool charges it against the cpu ledger so cores-1 fewer "
         "sibling workers run concurrently while it does",
     )
+    # AIRA-261 Phase B: register aira_time (a relative, unitless scheduling-cost rank),
+    # same early-registration reason as aira_mem/aira_cpu.
+    config.addinivalue_line(
+        "markers",
+        "aira_time(cost): declares the test's RELATIVE processing cost (a unitless "
+        "positive-integer rank, default 1) so the aitest pool dispatches longest-first "
+        "(LPT) — ordering ONLY: it reserves nothing, charges no ledger, never changes a "
+        "verdict",
+    )
     workers_option = config.getoption("aitest_workers")
     if workers_option is None:
         return
@@ -147,6 +156,49 @@ def _aira_cpu_cores_for_item(item, default):
         return default, (
             "aira aitest: %s has @pytest.mark.aira_cpu(%r), which is not a positive "
             "integer core count; use e.g. aira_cpu(4). Using the default of %d.\n"
+            % (item.nodeid, raw, default)
+        )
+    return value, None
+
+
+def _aira_time_for_item(item, default):
+    """Resolve one collected test item's aira_time annotation to a positive integer rank.
+
+    Mirrors _aira_cpu_cores_for_item: returns (cost, warning). `warning` is None on success
+    AND for an unannotated item (which silently takes `default` = 1). `warning` is a
+    ready-to-write stderr string, and `cost` is `default`, when the marker is MALFORMED (no
+    positional argument, more than one, or an argument that is not a positive integer) --
+    never silently swallowed (the AIRA-223 discipline).
+
+    aira_time is a RELATIVE, unitless scheduling-cost rank (not bytes, not cores, not
+    wall-seconds, and NOT a timeout): the dispatcher uses it ONLY to order the ready queue
+    longest-first (LPT). A wrong value never wedges a worker or changes a verdict -- at worst
+    the drain tail is slightly longer -- which is why it is soft-failing and safe to consume.
+    """
+    marker = item.get_closest_marker("aira_time")
+    if marker is None:
+        return default, None
+    if len(marker.args) != 1:
+        kwargs_note = (
+            " (aira_time takes a single positional cost, not keyword arguments)"
+            if marker.kwargs else ""
+        )
+        return default, (
+            "aira aitest: %s has @pytest.mark.aira_time with %d positional "
+            "argument(s)%s; it takes exactly one positive integer cost rank "
+            "(e.g. aira_time(50)). Using the default of %d.\n"
+            % (item.nodeid, len(marker.args), kwargs_note, default)
+        )
+    raw = marker.args[0]
+    try:
+        value = int(raw)
+        well_formed = not isinstance(raw, bool) and value >= 1 and float(raw) == value
+    except (TypeError, ValueError, OverflowError):
+        value, well_formed = default, False
+    if not well_formed:
+        return default, (
+            "aira aitest: %s has @pytest.mark.aira_time(%r), which is not a positive "
+            "integer cost rank; use e.g. aira_time(50). Using the default of %d.\n"
             % (item.nodeid, raw, default)
         )
     return value, None
