@@ -101,8 +101,13 @@ Phase A in progress (TDD), on `aira-261-cpu-time-consumers`. Increments:
   (My earlier "GRANTED → ledger goes negative → stalls everything" was a mutation-measurement
   error: I mutated the charge and the pre-check together, so the charge-to-1 mutation made it
   grant cpu=1; with only the pre-check disabled it blocks.)
-- **A.2 TODO:** CLI `--estimated-cpu` (`main.go` parseWorkerAdmitArgs) + `WorkerAdmitClientRequest.EstimatedCPU` + send `"estimated_cpu"` in the frame + re-declare uses `req.EstimatedCPU` (honesty).
-- **A.3 TODO:** proto 12→13 (`protocol.go` + `admission_linux.go`, enforced-equal test).
-- **A.4 TODO:** supervisor — register `aira_cpu`, `cpu_need` map, `--estimated-cpu` on the relay, extend the bootstrap knob-hint.
-- **A.5 TODO:** supervisor 2-D fit — `state["cpu"]`, both `_largest_fitting` sites, growth gate `available_cpu >= cpu_need`, `_pool_covers_the_queue`, probe default cpu.
-- Then `make ci` green → Phase A PR → two-loop → tag v0.16. Phase B (LPT) after.
+- **A.2–A.5 DONE** (`223a3db`, `0d8419c`): CLI `--estimated-cpu` + `WorkerAdmitClientRequest.EstimatedCPU` + the frame's `estimated_cpu` + re-declare honesty; proto 12→13; the supervisor `@aira_cpu` consumer (register + `cpu_need` map + `--estimated-cpu` relay + the 2-D fit at both `_largest_fitting` sites + `_smallest_ready` + `_pool_covers_the_queue` greedy 2-D matching + the cpu knob-hint).
+- **Review (`1728fb1`):** two-loop Fable = BLOCK (porous wire chain) → fixed (4 mutation-killing wire-path tests + P2 wedge-text correction + P3 OverflowError + porous-pool_cover fix + gate simplify) → **APPROVE-WITH-NITS, BLOCK cleared**. `aira confine -- make ci` GREEN (all packages).
+
+**Accepted coverage gaps (v0.16; close in v0.17):**
+- The `workerReDeclareRecord(grant, estimatedCPU)` CALL SITE is unpinned — the builder is unit-tested, but a mutant passing `0` there (→ floors to 1) survives; a keeper-reconnect test decoding the worker re-declare frame end-to-end closes it.
+- `declared_cpu_cores` not yet in the AIRA-259 trace (needs the trace-builder + its test).
+- LATENCY (not under-charge): a small-bytes/high-cpu test tends to run LAST (cpu is a FILTER, bytes the RANK) — the natural fix is Phase B LPT.
+- The widest `@aira_cpu(N)` must fit deploy's CI shape's 2×NumCPU or it is refused/unevaluated there (deploy's lane check).
+
+**Release:** Phase A ships as **v0.16** (proto 12→13, NOT drop-in — atomic reinstall + daemon restart, `aira confine --list` + heads-up first). Then Phase B (`@aira_time` LPT, supervisor-only).
