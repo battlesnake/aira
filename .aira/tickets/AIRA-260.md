@@ -157,6 +157,33 @@ history — the confine pattern), NOT a heavy predictive scheduler. Validation: 
 slice validates against deploy's 1-test-per-worker per-test ground truth (Input 2b);
 the CPU-quota dimension is validatable from the existing Run #2 trace NOW.
 
+### CI operational lifecycle (owner, 2026-09-17)
+
+The intended usage for CI: OCCASIONALLY (periodically / on demand) do a
+one-worker-per-test measurement pass (`AIRA_AITEST_WORKER_MAX_TESTS=1`, uncontested)
+to profile every test individually; that profile then persists for DAYS/WEEKS and is
+consumed by subsequent NORMAL CI jobs to size quotas + pack. So the measurement mode
+is the rare, expensive exception (no batching/packing) and the payoff is continuous on
+every normal batched+packed run — matching the owner's earlier "1-test-per-worker as a
+measurement mode, batch as the default". deploy's pending 1-test run is the first such
+pass.
+
+DESIGN FORK this raises (feasibility-determining): WHERE the profile store lives.
+confine's existing learned peak-RSS history is MACHINE-LOCAL (the daemon's state.db) —
+fine for a persistent box, but deploy's CI is EPHEMERAL, DISTRIBUTED GCP Batch cells,
+so a machine-local store does NOT persist or share across CI jobs. For CI the profile
+must be PORTABLE:
+- **Repo-committed** (a versioned profile file): travels to every runner, is reviewable,
+  and is naturally invalidated when a test changes (the profile diffs alongside the
+  code); the measurement pass becomes a PR that updates it. Appealing for CI.
+- **Central artifact** (e.g. GCS, keyed by signature): decoupled from the repo, but
+  needs its own read/write + auth path on each runner.
+Keying + staleness: nodeid is simplest (with the periodic full re-measure covering
+drift coarsely); a content-signature key invalidates per-test precisely. An
+unprofiled/new/stale test falls back to the floor/default — honest `unevaluated`, never
+a block. NB this portable-store shape is DIFFERENT from confine's machine-local history,
+so the CI path is not just "reuse confine's store".
+
 ## Requesters / provenance
 
 Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
