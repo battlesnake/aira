@@ -82,6 +82,12 @@ type workerAdmitRequest struct {
 	// decision in this slice.
 	signature      string
 	estimatedBytes int64
+	// estimatedCPU is the worker's per-test CPU-core reservation (AIRA-261: the
+	// @aira_cpu admission analogue of estimatedBytes), charged against the per-slice
+	// 2×NumCPU cpu ledger. ABSENT on the wire ⇒ DefaultConfineCPUCores (1), so an
+	// unannotated test and a client that never sends the field both charge one core
+	// exactly as before this wire change.
+	estimatedCPU int64
 	// parentScopeID is the suite confine scope id this worker is a sub-reservation
 	// OF (design §16d). It is an EXPLICIT required wire field — the supervisor's own
 	// AIRA_CONFINE_SCOPE_ID, NOT derived from the outer-scope PATH. A worker DOES
@@ -173,6 +179,18 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_bytes must be at least %d bytes and no larger than %d", CodeProtocol, workerAdmitEstimatedBytesMin, admitMaxReserve)
 	}
 	req.estimatedBytes = estimated
+	// estimated_cpu (AIRA-261): OPTIONAL — absent ⇒ DefaultConfineCPUCores, so a client
+	// that never sends it and an unannotated test both charge one core exactly as before.
+	// Present ⇒ a positive integer (0 would mean "unbounded", which the cpu ledger does
+	// not model); reject <1 rather than silently clamp, mirroring estimated_bytes.
+	req.estimatedCPU = runner.DefaultConfineCPUCores
+	if raw, present := args["estimated_cpu"]; present {
+		cpu, ok := exactAdmitInt64(raw)
+		if !ok || cpu < 1 {
+			return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_cpu must be a positive integer", CodeProtocol)
+		}
+		req.estimatedCPU = cpu
+	}
 	if raw, present := args["max_wait_ms"]; present {
 		value, ok := exactAdmitInt64(raw)
 		if !ok {
@@ -374,6 +392,20 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		})
 		return
 	}
+	// Exceeds-CPU-ceiling fast-fail (AIRA-261), the cpu analogue of the bytes check
+	// above: a per-test @aira_cpu reservation larger than the whole per-slice cpu ledger
+	// (2×NumCPU, cpuCeiling) can never fit, so refuse it up front (terminal,
+	// request-invalid) rather than enqueue a waiter that blocks forever. The supervisor's
+	// empty-pool bootstrap special-cases WorkerAdmitReasonExceedsCeiling (mark the test
+	// unevaluated, pop, continue), so an over-ceiling cpu request cannot wedge a run.
+	if req.estimatedCPU > s.cpuCeiling() {
+		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
+			State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
+			Reason: runner.WorkerAdmitReasonExceedsCeiling,
+			Detail: fmt.Sprintf("estimated %d CPU cores exceeds the slice ceiling of %d", req.estimatedCPU, s.cpuCeiling()),
+		})
+		return
+	}
 
 	// The suite scope-id this worker is a sub-reservation OF — the EXPLICIT wire
 	// field (design §16d), validated non-empty and parseable above. In real mode the
@@ -421,7 +453,7 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 
 	request := admitRequest{
 		reserve:       req.estimatedBytes,
-		cpu:           runner.DefaultConfineCPUCores,
+		cpu:           req.estimatedCPU,
 		scopeID:       scopeID,
 		parentScopeID: parentScopeID,
 		signature:     req.signature,

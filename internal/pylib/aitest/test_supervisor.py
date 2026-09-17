@@ -806,7 +806,7 @@ def test_spawn_worker_closes_dispatch_write_when_placement_ack_is_missing(monkey
         return pid, False
 
     supervisor = Supervisor()
-    supervisor.acquire_worker = lambda estimated_bytes, blocking: (
+    supervisor.acquire_worker = lambda estimated_bytes, estimated_cpu, blocking: (
         {"scope": "/unused", "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module.os, "pipe", recording_pipe)
@@ -859,7 +859,7 @@ def test_spawn_worker_removes_the_granted_scope_dir_on_placement_failure(tmp_pat
     scope_dir = tmp_path / "granted-scope"
     scope_dir.mkdir()
     supervisor = Supervisor()
-    supervisor.acquire_worker = lambda estimated_bytes, blocking: (
+    supervisor.acquire_worker = lambda estimated_bytes, estimated_cpu, blocking: (
         {"scope": str(scope_dir), "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
@@ -1133,7 +1133,7 @@ def test_dispatch_to_idle_workers_dispatches_to_a_same_pass_replacement(monkeypa
     }
     replacement_pid = 999998
 
-    def fake_spawn_worker(estimated_bytes, blocking=True):
+    def fake_spawn_worker(estimated_bytes, estimated_cpu=1, blocking=True):
         supervisor.workers[replacement_pid] = {
             "result_fd": replacement_result_read, "read_buffer": b"", "result_eof": False,
             "in_flight": None,
@@ -1621,7 +1621,7 @@ def test_replace_worker_still_spawns_fallback_when_under_the_pool_cap(monkeypatc
     # the min(2, 1)=1 cap.
     monkeypatch.setattr(
         supervisor, "spawn_worker",
-        lambda estimated_bytes, blocking: (_ for _ in ()).throw(WorkerAdmitUnavailable("daemon gone")),
+        lambda estimated_bytes, estimated_cpu, blocking: (_ for _ in ()).throw(WorkerAdmitUnavailable("daemon gone")),
     )
     fallback_calls = []
     monkeypatch.setattr(supervisor, "_spawn_fallback_worker", lambda: fallback_calls.append(1))
@@ -2674,7 +2674,7 @@ def test_placement_ack_timeout_kills_the_child_and_reports_a_denial(monkeypatch)
 
     monkeypatch.setenv("AIRA_AITEST_PLACEMENT_ACK_TIMEOUT", "1")
     supervisor = Supervisor()
-    supervisor.acquire_worker = lambda estimated_bytes, blocking: (
+    supervisor.acquire_worker = lambda estimated_bytes, estimated_cpu, blocking: (
         {"scope": "/unused", "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
@@ -4018,7 +4018,7 @@ def test_largest_fitting_picks_greatest_need_within_budget():
     supervisor = Supervisor()
     supervisor.reservation_need = {"a": 100, "b": 300, "c": 200}
     supervisor.queue = ["a", "b", "c"]
-    assert supervisor._largest_fitting(250, pop=False) == "c"
+    assert supervisor._largest_fitting(250, 4, pop=False) == "c"
     assert supervisor.queue == ["a", "b", "c"], "peek must not modify the queue"
     assert supervisor.attempts == {}, "peek must not increment attempts"
 
@@ -4027,14 +4027,14 @@ def test_largest_fitting_returns_none_when_smallest_exceeds_budget():
     supervisor = Supervisor()
     supervisor.reservation_need = {"a": 100, "b": 300}
     supervisor.queue = ["a", "b"]
-    assert supervisor._largest_fitting(50, pop=False) is None
+    assert supervisor._largest_fitting(50, 4, pop=False) is None
 
 
 def test_largest_fitting_pop_removes_and_increments_attempts():
     supervisor = Supervisor()
     supervisor.reservation_need = {"a": 100, "b": 300, "c": 200}
     supervisor.queue = ["a", "b", "c"]
-    assert supervisor._largest_fitting(1000, pop=True) == "b"
+    assert supervisor._largest_fitting(1000, 4, pop=True) == "b"
     assert supervisor.queue == ["a", "c"]
     assert supervisor.attempts["b"] == 1, (
         "pop must apply next_nodeid's attempts increment or the crash-retry-once "
@@ -4046,7 +4046,7 @@ def test_smallest_ready_returns_nodeid_and_need():
     supervisor = Supervisor()
     supervisor.reservation_need = {"a": 300, "b": 100, "c": 200}
     supervisor.queue = ["a", "b", "c"]
-    assert supervisor._smallest_ready() == ("b", 100)
+    assert supervisor._smallest_ready() == ("b", 100, 1)
     assert supervisor.queue == ["a", "b", "c"], "peek must not modify the queue"
 
 
@@ -4142,7 +4142,7 @@ def test_confined_dispatch_crash_twice_marks_unevaluated_after_one_requeue(monke
     supervisor.workers[dead_pid] = _confined_worker_state(500 << 20, dead_dw, dead_rr)
     repl_pid = 999802
 
-    def fake_spawn_worker(estimated_bytes, blocking=True):
+    def fake_spawn_worker(estimated_bytes, estimated_cpu=1, blocking=True):
         supervisor.workers[repl_pid] = _confined_worker_state(500 << 20, repl_dw, repl_rr)
         return repl_pid
 

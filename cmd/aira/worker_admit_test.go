@@ -20,10 +20,12 @@ func TestParseWorkerAdmitArgsRequiresJobIDOuterScopeEstimatedBytesAndParentScope
 	}
 	_, options, err := parseWorkerAdmitArgs([]string{
 		"--job-id", "j1", "--outer-scope", "/outer", "--estimated-bytes", "400M",
-		"--parent-scope-id", "CONFINE-suite-111111-1",
+		"--estimated-cpu", "4", "--parent-scope-id", "CONFINE-suite-111111-1",
 	})
+	// AIRA-261: --estimated-cpu is an accepted OPTIONAL flag, carried through to the request.
 	if err != nil || options["job-id"] != "j1" || options["outer-scope"] != "/outer" ||
-		options["estimated-bytes"] != "400M" || options["parent-scope-id"] != "CONFINE-suite-111111-1" {
+		options["estimated-bytes"] != "400M" || options["estimated-cpu"] != "4" ||
+		options["parent-scope-id"] != "CONFINE-suite-111111-1" {
 		t.Fatalf("options=%v err=%v", options, err)
 	}
 }

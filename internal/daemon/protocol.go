@@ -140,8 +140,18 @@ import (
 // daemon. The re-declare (ARDR) frame remains sniffed BEFORE this check, so a
 // suite's held worker leases still re-anchor across the upgrade. Same atomic
 // reinstall+restart requirement as 6-11.
+//
+// ProtocolVersion 13 (was 12): AIRA-261 added estimated_cpu to the worker-admit REQUEST —
+// the per-test @aira_cpu reservation, charged against the daemon's existing per-slice
+// 2×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores. The field is
+// OPTIONAL (absent ⇒ the floor), so the wire shape is purely additive; the bump exists so
+// a NEW client that sends estimated_cpu is refused LOUDLY by an OLD proto-12 daemon rather
+// than silently mis-served — an old daemon would ignore the field and charge one core,
+// re-introducing exactly the CPU oversubscription the reservation prevents. Same atomic
+// reinstall+restart requirement as 6-12; ARDR is sniffed BEFORE the version check, so a
+// suite's held worker leases still re-anchor across the upgrade.
 const (
-	ProtocolVersion = 12
+	ProtocolVersion = 13
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

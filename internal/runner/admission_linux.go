@@ -64,8 +64,11 @@ func (result admissionResult) releaseAdmission() {
 // became a non-blocking snapshot), then 11→12 in LOCKSTEP for aitest v0.7 S2a's
 // wire change (parent_scope_id is a REQUIRED, refuse-empty worker-admit request
 // field; delegate_ram removed from the admit allowlist; scope_ceiling dropped from
-// the grant). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two drift.
-const DaemonProtocolVersion = 12
+// the grant), then 12→13 in LOCKSTEP for AIRA-261's worker-admit wire change
+// (estimated_cpu added to the request — the per-test @aira_cpu reservation, charged
+// against the per-slice 2×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores;
+// OPTIONAL, absent ⇒ the floor). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two drift.
+const DaemonProtocolVersion = 13
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20

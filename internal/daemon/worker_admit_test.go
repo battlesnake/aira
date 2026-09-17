@@ -181,6 +181,70 @@ func TestValidateWorkerAdmitArgsParsesFieldsAndBlockingModes(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-261 — estimated_cpu is an OPTIONAL worker-admit wire field carrying the
+// per-test @aira_cpu reservation. Absent ⇒ the DefaultConfineCPUCores floor (an older
+// client and an unannotated test both charge one core as before); present ⇒ the declared
+// count is carried on the request (charged against the cpu ledger, not the hardcoded 1);
+// a non-positive value is a protocol refusal, never a silent clamp.
+func TestValidateWorkerAdmitArgsParsesEstimatedCPU(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{
+			"job_id": "job-1", "outer_scope": "/outer/scope", "signature": "suite:abc",
+			"estimated_bytes": float64(workerTestMiB), "parent_scope_id": workerTestParentScopeID,
+		}
+	}
+	if req, err := validateWorkerAdmitArgs(base()); err != nil || req.estimatedCPU != runner.DefaultConfineCPUCores {
+		t.Fatalf("absent estimated_cpu: req.estimatedCPU=%d err=%v, want the DefaultConfineCPUCores floor %d", req.estimatedCPU, err, runner.DefaultConfineCPUCores)
+	}
+	args := base()
+	args["estimated_cpu"] = float64(4)
+	if req, err := validateWorkerAdmitArgs(args); err != nil || req.estimatedCPU != 4 {
+		t.Fatalf("estimated_cpu=4: req.estimatedCPU=%d err=%v, want 4 carried on the request", req.estimatedCPU, err)
+	}
+	for _, bad := range []float64{0, -1} {
+		bad := bad
+		args := base()
+		args["estimated_cpu"] = bad
+		if _, err := validateWorkerAdmitArgs(args); err == nil || !strings.Contains(err.Error(), CodeProtocol) || !strings.Contains(err.Error(), "estimated_cpu") {
+			t.Fatalf("estimated_cpu=%v: err=%v, want a %s refusal mentioning estimated_cpu", bad, err, CodeProtocol)
+		}
+	}
+}
+
+// verifies: AIRA-261 — the daemon charges the request's estimated_cpu against the per-slice
+// cpu ledger, not the hardcoded DefaultConfineCPUCores. MUTATION: revert the charge to
+// `cpu: runner.DefaultConfineCPUCores` → cpuOutstanding reads 1 not 3 and this REDS.
+func TestWorkerAdmitChargesEstimatedCPU(t *testing.T) {
+	server := workerAdmitServer(t, "/slice", 4*workerTestMiB) // cpuCeiling = 2*4 = 8
+	args := workerArgs(workerTestOuterScope, workerTestMiB, false, 0)
+	args["estimated_cpu"] = float64(3)
+	resp, client, done := startWorkerAdmit(t, server, args)
+	if resp.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("resp=%+v, want granted", resp)
+	}
+	if _, cpu, jobs := sliceLedger(t, server, "/slice"); jobs != 1 || cpu != 3 {
+		t.Fatalf("after an @aira_cpu(3) worker-admit: cpuOutstanding=%d jobs=%d, want cpu=3 (the charged reservation, not the hardcoded 1)", cpu, jobs)
+	}
+	_ = client.Close()
+	awaitReturn(t, done, "worker handler to return on EOF")
+}
+
+// verifies: AIRA-261 — an estimated_cpu larger than the whole per-slice cpu ceiling
+// (2×NumCPU) is refused up front with exceeds-ceiling, the cpu analogue of the
+// estimated_bytes ceiling fast-fail, so the supervisor's bootstrap marks the test
+// unevaluated instead of wedging on an unadmittable blocking claim. MUTATION: drop the cpu
+// ceiling pre-check → the over-ceiling request enqueues instead of being refused and this REDS.
+func TestWorkerAdmitRefusesEstimatedCPUAboveCeiling(t *testing.T) {
+	server := workerAdmitServer(t, "/slice", 4*workerTestMiB) // cpuCeiling = 2*4 = 8
+	args := workerArgs(workerTestOuterScope, workerTestMiB, false, 0)
+	args["estimated_cpu"] = float64(9) // > ceiling 8
+	resp, client, done := startWorkerAdmit(t, server, args)
+	defer func() { _ = client.Close(); awaitReturn(t, done, "worker handler to return") }()
+	if resp.State != runner.WorkerAdmitStateDenied || resp.Class != runner.WorkerAdmitClassRequestInvalid || resp.Reason != runner.WorkerAdmitReasonExceedsCeiling {
+		t.Fatalf("resp=%+v, want denied/request-invalid/exceeds-ceiling for estimated_cpu=9 > ceiling 8", resp)
+	}
+}
+
 // verifies: S2a Task 2 — parent_scope_id is an explicit REQUIRED wire field. The
 // daemon refuses an empty one (E_DAEMON_PROTOCOL, so a worker can never silently
 // become a job), validates a non-empty one is parseConfineScopeID-parseable (the

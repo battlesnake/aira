@@ -118,9 +118,16 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 // ceiling was retired — a delegate parent's memory.max is its ordinary reserve). An
 // old proto-11 client speaking the pre-collapse contract must be refused loudly,
 // while the ARDR re-declare still crosses versions by its magic.
+//
+// verifies: AIRA-261 — the 12→13 bump. estimated_cpu was added to the worker-admit request
+// (the per-test @aira_cpu reservation, charged against the per-slice 2×NumCPU cpu ledger
+// instead of the hardcoded DefaultConfineCPUCores). The field is OPTIONAL (absent ⇒ the
+// floor) so the wire shape is additive, but a NEW client that sends it must be refused
+// loudly by an OLD proto-12 daemon rather than silently mis-served (charged one core →
+// oversubscription); ARDR still crosses versions.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 12 {
-		t.Fatalf("ProtocolVersion = %d, want 12; a wire-shape or wire-semantics change must "+
+	if ProtocolVersion != 13 {
+		t.Fatalf("ProtocolVersion = %d, want 13; a wire-shape or wire-semantics change must "+
 			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }

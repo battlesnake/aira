@@ -39,6 +39,15 @@ def pytest_configure(config):
         "aira_mem(size): declares the test's incremental peak RSS on top of the "
         "worker warm-import baseline",
     )
+    # AIRA-261: register aira_cpu alongside aira_mem, and for the SAME reason it must
+    # precede the --aitest-workers early return — a --strict-markers suite annotated with
+    # @pytest.mark.aira_cpu must not fail collection on an ordinary, non-aitest run.
+    config.addinivalue_line(
+        "markers",
+        "aira_cpu(cores): declares the test's CPU-core reservation (its peak internal "
+        "fork width); the aitest pool charges it against the cpu ledger so cores-1 fewer "
+        "sibling workers run concurrently while it does",
+    )
     workers_option = config.getoption("aitest_workers")
     if workers_option is None:
         return
@@ -89,6 +98,55 @@ def _aira_mem_bytes_for_item(item, default):
             "aira aitest: %s has @pytest.mark.aira_mem(%r), which is not a valid "
             "size; use a byte count or a 1024-based size like 512M / 1.5G / 512MiB "
             "(K/M/G/T are powers of 1024). Using the %d-byte default.\n"
+            % (item.nodeid, raw, default)
+        )
+    return value, None
+
+
+def _aira_cpu_cores_for_item(item, default):
+    """Resolve one collected test item's aira_cpu annotation to a positive core count.
+
+    Mirrors _aira_mem_bytes_for_item exactly: returns (cores, warning). `warning` is None
+    on success AND for an unannotated item (which silently takes `default` -- an unannotated
+    test reserves one core, exactly as before this marker existed). `warning` is a
+    ready-to-write stderr string, and `cores` is `default`, when the marker is MALFORMED --
+    no positional argument, more than one, or an argument that is not a positive integer.
+    A malformed marker is never silently swallowed (the AIRA-223 discipline).
+
+    aira_cpu declares the test's peak internal fork width as an ABSOLUTE core count (unlike
+    aira_mem's floor+increment), because the worker's peak CPU demand IS N cores. The
+    dispatcher charges it against the per-slice 2xNumCPU cpu ledger, so a marked test
+    displaces cores-1 sibling workers while it runs.
+    """
+    marker = item.get_closest_marker("aira_cpu")
+    if marker is None:
+        return default, None
+    if len(marker.args) != 1:
+        kwargs_note = (
+            " (aira_cpu takes a single positional core count, not keyword arguments)"
+            if marker.kwargs else ""
+        )
+        return default, (
+            "aira aitest: %s has @pytest.mark.aira_cpu with %d positional "
+            "argument(s)%s; it takes exactly one positive integer core count "
+            "(e.g. aira_cpu(4)). Using the default of %d.\n"
+            % (item.nodeid, len(marker.args), kwargs_note, default)
+        )
+    raw = marker.args[0]
+    # Accept an int, an int-valued float, or an int string; reject everything else
+    # (a fractional core, a non-numeric string, a negative or zero) with a warning
+    # rather than silently truncating -- a bad @aira_cpu is a mistake, not a default.
+    try:
+        value = int(raw)
+        well_formed = not isinstance(raw, bool) and value >= 1 and float(raw) == value
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float("inf")) — a non-finite float must WARN, not crash
+        # collection.
+        value, well_formed = default, False
+    if not well_formed:
+        return default, (
+            "aira aitest: %s has @pytest.mark.aira_cpu(%r), which is not a positive "
+            "integer core count; use e.g. aira_cpu(4). Using the default of %d.\n"
             % (item.nodeid, raw, default)
         )
     return value, None

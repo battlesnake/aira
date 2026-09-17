@@ -1165,7 +1165,7 @@ func parseConfineReserveArgs(argv []string) ([]string, map[string]string, error)
 
 func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
-	valid := map[string]bool{"job-id": true, "outer-scope": true, "estimated-bytes": true, "signature": true, "max-wait": true, "parent-scope-id": true}
+	valid := map[string]bool{"job-id": true, "outer-scope": true, "estimated-bytes": true, "estimated-cpu": true, "signature": true, "max-wait": true, "parent-scope-id": true}
 	for i := 0; i < len(argv); i++ {
 		name := strings.TrimPrefix(argv[i], "--")
 		if !valid[name] {
@@ -2001,6 +2001,21 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 			}, nil, "E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
+	// estimated-cpu (AIRA-261): the per-test @aira_cpu reservation. OPTIONAL on the CLI —
+	// absent ⇒ the DefaultConfineCPUCores floor, so an unannotated test / a caller that
+	// omits it charges one core exactly as before. Present ⇒ a positive integer; a
+	// malformed value is argument-invalid (never a silent default that would hide a bug).
+	estimatedCPU := int64(runner.DefaultConfineCPUCores)
+	if raw := options["estimated-cpu"]; raw != "" {
+		parsed, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || parsed < 1 {
+			return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
+				State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
+				Reason: runner.WorkerAdmitReasonArgumentsInvalid, Detail: "--estimated-cpu must be a positive integer",
+			}, nil, "E_CONFINE_ARGUMENT_INVALID")
+		}
+		estimatedCPU = parsed
+	}
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
 		return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
@@ -2014,7 +2029,7 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	outcome := runner.RequestWorkerAdmit(signalCtx, runner.WorkerAdmitClientRequest{
 		SocketPath: paths.SocketPath, JobID: options["job-id"], OuterScope: options["outer-scope"],
 		ParentScopeID: options["parent-scope-id"],
-		Signature:     options["signature"], EstimatedBytes: estimatedBytes, MaxWait: maxWait,
+		Signature:     options["signature"], EstimatedBytes: estimatedBytes, EstimatedCPU: estimatedCPU, MaxWait: maxWait,
 	})
 	if !outcome.Granted() {
 		// The daemon's (or the transport's) own classification is relayed

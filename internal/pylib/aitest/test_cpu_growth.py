@@ -42,6 +42,7 @@ class _RecordingSupervisor(Supervisor):
         self.probe_calls = 0
         self.claim_blocking = []  # the `blocking` flag of each spawn_worker call
         self.claim_bytes = []  # AIRA-235: the estimated_bytes each claim was sized to
+        self.claim_cpu = []  # AIRA-261: the estimated_cpu each claim was sized to
         self._fake_pid = 0
 
     def _probe_available(self):
@@ -51,9 +52,10 @@ class _RecordingSupervisor(Supervisor):
             raise item
         return item
 
-    def spawn_worker(self, estimated_bytes, blocking=True):
+    def spawn_worker(self, estimated_bytes, estimated_cpu=1, blocking=True):
         self.claim_blocking.append(blocking)
         self.claim_bytes.append(estimated_bytes)
+        self.claim_cpu.append(estimated_cpu)
         outcome = self.claim_script.pop(0) if self.claim_script else "grant"
         if outcome == "deny":
             raise WorkerAdmitDenied("worker-admit state=denied class=contended reason=contended")
@@ -372,7 +374,7 @@ def test_startup_fill_dispatches_between_spawns_sizing_each_to_the_next_largest(
         for _pid, state in list(supervisor.workers.items()):
             if state.get("in_flight") is not None:
                 continue
-            nid = supervisor._largest_fitting(state["reservation"], pop=True)
+            nid = supervisor._largest_fitting(state["reservation"], state.get("cpu", 1), pop=True)
             if nid is not None:
                 state["in_flight"] = nid
 
