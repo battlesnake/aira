@@ -80,8 +80,52 @@ fail-fast marker is the single biggest makespan lever (~450s off the 64-cell via
 selfcheck fold) and is trace-independent → strong candidate to sequence FIRST. Owner/
 speed call; the numbers make it an informed one.
 
+## Run #2 measured findings (2026-09-17, deploy's real GCP ci-shim trace)
+
+The AIRA-259 trace emitted cleanly on all 3 cells (16/32/64); format validated on the
+real ci-shim ledger-only lane (worker/admission-wait/startup spans + all args). Key
+measurements that refine the inputs above:
+
+- **admission wait ≈ 0.004s median** on ci-shim (ledger admits immediately with
+  headroom), with RARE outliers (up to ~38s, single workers) that are real RAM-gated
+  waits — almost certainly CAUSED by the over-reservations below (a worker reserving
+  6.5 GB it never uses fills the ledger artificially, so others occasionally wait);
+  tuning reservations down would cut them.
+- **startup ≈ 0.004–0.013s** (fork only; ci-shim skips the cgroup placement-ack). This
+  CONFIRMS input 1's IMPORT-COW half is already cheap → the per-worker respawn cost is
+  NOT re-import/startup, so input 2's ≥10s-batch value is cutting the no-fit
+  bin-packing retirements, NOT startup. PRECISION: startup does NOT measure FIXTURE
+  init (that runs inside the active span, per-test setup), so the fixture-prewarm half
+  of input 1 stays UNMEASURED until the deferred per-test tier exists.
+
+## Input 2b — reservation tuning (NEW owner directive, Run #2)
+
+Owner: tune per-worker reservations toward measured peaks. The trace shows declared
+reservation median 0.50 GB (the 512M floor) + max 6.50 GB, vs ACTUAL peak_rss median
+0.2–1.4 GB / p90 2.0–2.8 GB / max ~5 GB — over-reserved up to 34–38× on some workers.
+
+VERIFIED mechanism: the reservation (`declared_rss_bytes`) =
+`AIRA_AITEST_WORKER_OVERHEAD_BYTES` floor (512 MiB default) + the test's `@aira_mem`
+mark's incremental (0 if unannotated); `reservation_need = overhead + incremental`
+(supervisor.py `collect()`). FIXED floor+annotation, NOT a learned p90 estimate (the
+p90-prior is the confine SLICE reserve, an outer layer).
+
+- fastest-ee knob (deploy's, informed by the trace peaks): the `@aira_mem` marks + the
+  `AIRA_AITEST_WORKER_OVERHEAD_BYTES` floor. It cuts BOTH ways — LOWER the 34–38×
+  over-annotated marks, but many UNANNOTATED tests reserve only 512M yet peak ~2 GB and
+  UNDER-reserve. Harmless on ci-shim (no cgroup kill; container OOM backstops), but on a
+  cgroup-ENFORCED lane or the c4a lower-RAM move an under-reserved worker's cap = its
+  reservation → OOM. Aim for ACCURATE (measured p90, or max for enforced lanes), not
+  merely smaller. admission-wait ≈ 0 across Run #2 confirms RAM was never the bind →
+  the c4a compute-optimised (~2 GB/core) move is sound.
+- OPTIONAL aira-side enhancement (design, not build-now): AUTO-LEARN the per-worker
+  reservation from measured peak_rss — as confine already learns the slice reserve
+  p90-prior — self-correcting over- AND under-reservation and removing the manual
+  @aira_mem toil. The natural aira-side companion to the fastest-ee mark tuning; strong
+  candidate once manual tuning's ceiling is seen.
+
 ## Requesters / provenance
 
-Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis. Fail-fast marker
-also wanted by speed (owns the selfcheck relocation). Trace-first sequencing for
-inputs 1+2 on deploy's AIRA-259 Run #2.
+Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
+Fail-fast marker also wanted by speed (owns the selfcheck relocation). Trace-first
+sequencing for inputs 1+2 was on deploy's AIRA-259 Run #2 — now delivered.
