@@ -411,6 +411,67 @@ detailed contract — three-annotation architecture (mem/cpu/time) + the config-
 the correctness-sensitive dispatch/pick loop). Scoping is unblocked now. Reply + this
 capture sent to deploy 2026-09-17.
 
+## Input 6 — SETTLED: challenge landed, owner INFORMED-override, pinning DROPPED, build sequence (2026-09-17)
+
+deploy's design workflow produced complete `challenge` + `timeDesign` + `configDesign`
+sections (the cpu-design `plan` section came back NULL — never landed). I read the raw
+artifact (`~/tmp/ci-cp/resource-annotation-workflow-output.json`) rather than the relay and
+caught two things deploy then ADOPTED. **This Input is the CURRENT settled state; it
+SUPERSEDES Input 5's "@aira_time/LPT is the higher-value half" priority framing** — the
+challenge + the owner's informed re-steer make `@aira_cpu` the load-bearing annotation and
+`@aira_time`/LPT the deferred/auto-learned follow-on.
+
+**Owner steer is a DELIBERATE INFORMED OVERRIDE (deploy confirmed).** deploy's surface to
+the owner stated plainly that the two biggest measured poles are the SERIAL LEGS (lite
+serial, selfcheck — no annotation touches them), that `@aira_time`/LPT is marginal and best
+auto-learned, and that `@aira_cpu`-for-fork-storm is the only annotation earning its place.
+The owner steered — verbatim — "Have aira add both cpu and time annotations. And use them
+too for scheduling/planning" WITH that in front of him. So: build both, but `@aira_cpu` is
+load-bearing and `@aira_time`/LPT is the deferred follow-on, not the lead.
+
+**Two catches, both adopted by deploy:**
+- **Pinning DROPPED.** The relayed acceptance test `sched_getaffinity(0)==K` (cpuset
+  pinning) came from the null cpu-plan and contradicts the challenge's own H6
+  ("admission accounting, never affinity/cpuset pinning"). It is also REDUNDANT
+  (correctly-annotated admission alone bounds the storm: `@aira_cpu(16)` → ≤8 concurrent on
+  the 128-slot ledger → designed 2×; unannotated width-1 → the 32× storm) and DANGEROUS
+  (re-adds the clamp-to-serial NF-1 landmine on the engine byte-identity tests). Coherent
+  non-pinning shape: config-not-env sets each lite worker's fork WIDTH, `@aira_cpu`
+  admission bounds CONCURRENT workers, nothing pins. Pinning is now a SEPARATE future owner
+  decision, gated on a demonstrated need (a test forking via `sched_getaffinity`/`cpu_count`
+  directly that can't be config-bound or annotated) — NOT built now.
+- **Priority corrected** per the challenge (above).
+
+**SETTLED BUILD SEQUENCE (safe to build against — owner-informed, consistent):**
+- **`@aira_cpu` accounting consumer — the load-bearing annotation.** Wire change:
+  `--estimated-cpu N` on the worker-admit CLI + a `CPUCores` field on the worker-admit
+  REQUEST (the daemon already has the 2×NumCPU cpu-ledger dimension AND the GRANT already
+  echoes charged cores at `worker_admit_client_linux.go:251` — this threads a per-worker
+  value on the SEND side instead of the hardcoded `DefaultConfineCPUCores`); charge it at
+  `worker_admit.go:424`; gate `cpu_need` against `available_cpu`. **Proto bumps 12→13**
+  (`ProtocolVersion`/`DaemonProtocolVersion`, enforced-equal by a test; every prior
+  worker-admit wire change bumped — no-compat so the bump is clean). Admission-only, never
+  affinity. **Acceptance = the ADMISSION invariant** (concurrent admission of `@aira_cpu(N)`
+  tests never exceeds the ledger ceiling), NOT pinning.
+- **`@aira_time` LPT consumer — deferred/lower-priority follow-on.** Supervisor-only, NO Go
+  change (`timeDesign`): re-key `_largest_fitting`'s ORDER to `(time, need, FIFO)`, keep the
+  fit-FILTER, preserve the `attempts[best]+=1` increment. AUTO-LEARNED from the gate's GCS
+  per-test durations (`de1b829c3`); `@aira_time` mark = bootstrap/override. Ordering-only,
+  NEVER a deadline. Sequence: `@aira_cpu` accounting live BEFORE or WITH LPT, never
+  LPT-first (H1).
+- **Cross-session sequencing (deploy owns the fastest-ee half + the image re-pin):**
+  deploy FOUNDATION PR now = register both marks + config seam (unset=serial, reuse the
+  NF-41 resolver) — does NOT apply `@aira_cpu` → my consumer + a proto-13 release (next aira
+  release) → I ping deploy the version → deploy RE-PINS the CI runner image (arm64-builder
+  route, on the critical path) → deploy PHASE-2 PR applies the derived
+  `@aira_cpu(RUNNER_PARALLEL_WORKERS)` + policing test + the H2 fail-closed "a
+  subprocess-spawning test must carry `@aira_cpu`" guard → lite=16 flip. Applied-but-
+  unconsumed marks + the fail-closed guard are why application waits for the live consumer.
+
+**aira BUILD is greenlit (informed owner override).** Two-loop mandatory (Opus builds,
+Fable reviews in a detached worktree — touches the dispatch/wire/ledger). No longer "held";
+the gate now is the build itself + coordinating the proto-13 release with deploy's re-pin.
+
 ## Requesters / provenance
 
 Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
