@@ -352,6 +352,65 @@ owner's steer. When/if built, the 5-step contract is the recipe and the two inva
 hard rules. The serial-cap + 4→2 wins are fastest-ee's to land. Answer + this capture sent
 to deploy 2026-09-17.
 
+## Input 5 — OWNER STEER: build greenlit + NEW @aira_time (relative time-cost) for LPT (via deploy, 2026-09-17)
+
+The owner steered on the Input 4 measurement-gate verdict — and EXPANDED it. This is a
+peer-relayed owner greenlight (handled transparently, surfaced to my own owner; a peer
+relay is not itself the approval), and it is scoping-unblocked but STILL no-build until
+deploy's integrated contract lands + my own challenge/two-loop pass.
+
+1. **`@aira_cpu` — GREENLIT to build, OVERRIDING the measure-first verdict.** Rationale:
+   the mark's DECLARATION value is independent of the consumer — fastest-ee lands the mark
+   + registration NOW; aira builds the accounting consumer when able (cpu first, it's the
+   small one). The admission-only invariant (no cpu.max/affinity) still stands. An
+   unread-but-registered mark is inert-not-wrong, so the declaration can precede the
+   consumer.
+
+2. **NEW `@aira_time` — a RELATIVE time-cost annotation** (a test is 1 unit by default;
+   slow tests declare more). aira builds a SECOND consumer: **time-LPT ordering** of the
+   ready-queue pick (the `_smallest_ready` / `_largest_fitting` area) — order the FITTING
+   candidates longest-processing-time-FIRST so heavy tests launch early across a full pool
+   → short tail. This directly attacks the engine-43% **DRAIN TAIL** that Run #2 **G1**
+   identified (drain-tail, NOT churn), and it is the Input-4 challenge's OWN recommended
+   fix ("the correct fix for tail-clustering is longest-processing-time-first scheduling,
+   not a CPU ledger"). **The higher-value half** — @aira_cpu alone is the 2–5% effect;
+   time-LPT is what moves the measured tail.
+
+3. **Config-not-env:** the owner also wants the parallelism dials to be config, not env.
+
+**Integration seed for the incoming contract (a simplify point, not an objection).**
+`@aira_time` manual-declare is the BOOTSTRAP/override half of a lever the owner ALREADY
+articulated as the LEARN half: the telemetry-feedback scheduling bullet above ("feed
+MEASURED sizes + durations into the SAME bin-packer → order by real size/length,
+longest-first on ground truth"), and the AIRA-259 trace already emits per-worker duration.
+So the clean LPT-consumer shape reads BOTH from day one: order fitting candidates by
+`@aira_time` when marked, else by measured prior-run duration when profiled, else neutral
+(1 unit) — mark as bootstrap/override, measurement as steady-state. That avoids
+hand-maintaining a time unit on every test forever (the exact drift the challenge nailed
+for `@aira_cpu`'s hand-copied fork-width counts). Composition with the existing
+largest-first-by-RAM pick: 2-D fit (mem×cpu) governs ADMISSION; time-LPT governs
+PICK-ORDER among the fitting candidates — they layer, they don't conflict.
+
+deploy CONFIRMED (2026-09-17) this is folded into the contract: the LPT reader takes THREE
+inputs in strict priority — (1) `@aira_time` mark when present (bootstrap before a measured
+prior exists, or a deliberate override), (2) else measured prior-run duration (steady
+state), (3) else neutral = 1 unit. Same declare+learn symmetry now on ALL THREE axes: mem
+(peak_rss learn), cpu (cpu_time/wall learn), time (measured-duration learn) — mark is
+bootstrap/override, measurement is steady state. Consequence for fastest-ee: `@aira_time`
+is applied to only a HANDFUL of known-heavy bootstrap tests (fat corpus scans, the
+copper/SI double-run), NOT hand-maintained on every test — measured duration drives the
+rest. And the composition is exactly two orthogonal stages: 2-D {ram,cpu} fit decides who
+is ALLOWED to run, time-LPT decides who runs FIRST among those that fit; no interaction
+beyond "LPT only ranks what already fits."
+
+**Status:** greenlit to BUILD both consumers (cpu first/small, time-LPT the real tail win),
+but aira STAYS HELD from build until (a) deploy's integrated design workflow sends the
+detailed contract — three-annotation architecture (mem/cpu/time) + the config-not-env move
++ both the cpu-accounting and time-LPT contracts — and (b) my own challenge/simplify pass
+(esp. the mark-vs-measured split and the LPT insertion point) + the two-loop (this touches
+the correctness-sensitive dispatch/pick loop). Scoping is unblocked now. Reply + this
+capture sent to deploy 2026-09-17.
+
 ## Requesters / provenance
 
 Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
