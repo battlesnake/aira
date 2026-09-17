@@ -68,6 +68,11 @@ type WorkerAdmitClientRequest struct {
 	ParentScopeID  string
 	Signature      string
 	EstimatedBytes int64
+	// EstimatedCPU is the worker's per-test CPU-core reservation (AIRA-261), charged
+	// against the daemon's per-slice 2×NumCPU cpu ledger. The CLI always sets it (the
+	// DefaultConfineCPUCores floor when --estimated-cpu is absent), so the frame carries a
+	// uniform positive value; an absent field on the wire the daemon reads as the floor too.
+	EstimatedCPU int64
 	// MaxWait == 0 is a non-blocking PROBE (report current available, reserve
 	// nothing); any positive value is a blocking CLAIM (wait until granted, no
 	// daemon-side or transport timeout — bounded only by ctx). The positive value
@@ -150,11 +155,19 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		_ = conn.Close()
 	}
 
+	// Floor the cpu reservation to DefaultConfineCPUCores so the frame ALWAYS carries a
+	// valid positive value (AIRA-261): the CLI defaults it, but a direct Go caller may leave
+	// EstimatedCPU at the zero value, and the daemon refuses a present-but-zero estimated_cpu.
+	// Charged == requested, so this same value re-anchors the lease on a restart (below).
+	estimatedCPU := req.EstimatedCPU
+	if estimatedCPU < DefaultConfineCPUCores {
+		estimatedCPU = DefaultConfineCPUCores
+	}
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "worker-admit"
 	frame.Request.Args = map[string]any{
 		"job_id": req.JobID, "outer_scope": req.OuterScope, "signature": req.Signature,
-		"estimated_bytes": req.EstimatedBytes, "parent_scope_id": req.ParentScopeID,
+		"estimated_bytes": req.EstimatedBytes, "estimated_cpu": estimatedCPU, "parent_scope_id": req.ParentScopeID,
 	}
 	if probe {
 		// PRESENT and zero → non-blocking probe. A CLAIM omits it → the daemon blocks.
@@ -245,10 +258,15 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		// restart merge-gate's exact-key-set assertion catches this). This is the same
 		// key Task 1's dirname alignment (`confineScopeDirName` / the reaper's
 		// `hasLiveLease`) uses, so the whole worker-lease path lines up across a restart.
+		// CPUCores must be the CHARGED reservation (AIRA-261), not the hardcoded floor:
+		// after a daemon restart the rebuilt ledger re-charges from this re-declare, so a
+		// cpu=N worker that re-declared cpu=1 would under-charge the ledger and oversubscribe
+		// the box. estimatedCPU (floored above) is exactly what the daemon charged, since the
+		// daemon refuses — never clamps — an over-ceiling cpu.
 		reDeclareFrame, _ = redeclare.EncodeFrame(redeclare.Record{
 			ScopeID:       strings.TrimPrefix(filepath.Base(grant.ScopePath), ".aira-"),
 			RAMBytes:      uint64(grant.MemoryMax),
-			CPUCores:      uint32(DefaultConfineCPUCores),
+			CPUCores:      uint32(estimatedCPU),
 			ParentScopeID: grant.ParentScopeID,
 		})
 	}
