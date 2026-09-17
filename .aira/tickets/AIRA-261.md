@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-261","project":"aira","title":"aitest @aira_cpu admission accounting + @aira_time LPT scheduling consumers","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","telemetry"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-261","project":"aira","title":"aitest @aira_cpu admission accounting + @aira_time LPT scheduling consumers","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","telemetry"],"hold":false,"relations":[]}
 ---
 
 Implements the owner-greenlit slice of [[AIRA-260]] (see AIRA-260 Input 6 for the settled
