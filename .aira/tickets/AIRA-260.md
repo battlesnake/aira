@@ -124,6 +124,39 @@ p90-prior is the confine SLICE reserve, an outer layer).
   @aira_mem toil. The natural aira-side companion to the fastest-ee mark tuning; strong
   candidate once manual tuning's ceiling is seen.
 
+## Telemetry-feedback direction (owner, 2026-09-17)
+
+The owner generalises the auto-learn idea into a coherent capability: aira reads a
+PRIOR run's telemetry and feeds it back into three levers. Precedent + data already
+exist — the confine layer ALREADY learns a per-signature peak-RSS history (the
+`reserve-basis=estimate:p90-prior` in confine trailers, AIRA-33/#67), and the
+AIRA-259 trace already emits the RAM *and* CPU signals.
+
+- **RAM reservations** (= Input 2b above): per-worker/per-test sizing from measured
+  peak_rss instead of manual `@aira_mem` — extend confine's slice-level learning to the
+  aitest worker.
+- **CPU quota** (new, and the data is ALREADY there): the trace emits `cpu_user_s +
+  cpu_system_s` AND the span wallclock (`dur`), so **(cpu_user+cpu_system)/wallclock is
+  computable per worker TODAY** — no new instrumentation. A ratio > 1 means the task
+  spent multiple core-seconds per wall-second → it used threads/subprocesses and needs a
+  HIGHER CPU quota (and the scheduler must count it as occupying >1 core, not 1); ≈ 1 =
+  single-threaded. A quick pass over deploy's existing Run #2 trace would surface the
+  multi-core tasks immediately.
+- **Scheduling** (new): aitest already bin-packs LARGEST-FIRST, but by DECLARED
+  `@aira_mem` (`sorted(needs, reverse=True)`, `_largest_fitting`). Feed MEASURED sizes +
+  durations into the SAME bin-packer → order by real size/length (largest/longest-first
+  on ground truth) and place a multi-core task at its true core cost. No new scheduler —
+  the primitive exists; give it measured inputs.
+
+Architecture (keep it a PRIMITIVE, not judgement): aira owns a per-signature
+MEASURED-PROFILE store (peak RSS, CPU/wall, duration), fed by the AIRA-259 trace and
+reusing confine's existing peak-RSS history, plus a clean read API. The auto-tuning
+(reservations, CPU quota) and the scheduling ORDER are POLICIES layered on that
+primitive. Estimates stay honest/bounded (p90 or max + a floor; `unevaluated` with no
+history — the confine pattern), NOT a heavy predictive scheduler. Validation: the RAM
+slice validates against deploy's 1-test-per-worker per-test ground truth (Input 2b);
+the CPU-quota dimension is validatable from the existing Run #2 trace NOW.
+
 ## Requesters / provenance
 
 Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
