@@ -208,6 +208,74 @@ unprofiled/new/stale test falls back to the floor/default — honest `unevaluate
 a block. NB this portable-store shape is DIFFERENT from confine's machine-local history,
 so the CI path is not just "reuse confine's store".
 
+## Input 4 — `@aira_cpu(N)` per-test CPU reservation (NEW owner ask via deploy, 2026-09-17; dispatcher feasibility VERIFIED from source)
+
+The CPU analogue of `@aira_mem`: a test that spawns N internal workers should RESERVE
+N cores from the aitest dispatcher, so the pool admits N-1 fewer sibling workers while
+it runs. This is the MANUAL-declare counterpart to the CPU-quota AUTO-LEARN in the
+telemetry-feedback section above (cpu/wall ratio) — same two-layer (declare + learn)
+story RAM already has (`@aira_mem` ↔ peak_rss learn).
+
+**Feasibility: YES, and the ledger machinery ALREADY EXISTS — only the per-test
+VARIABLE charge is missing.** I first mis-remembered admission as RAM-bytes-only;
+corrected by reading source (2026-09-17):
+
+- The daemon's unified ledger already has a CPU dimension parallel to RAM: per-slice
+  `cpuOutstanding` = Σ(lease cores), ceiling = **2×NumCPU** (design §7, `admit.go:2424-2435`
+  — number read, §7 rationale NOT re-read). This is the AIRA-64 CPU governor, unified
+  into the SAME admission as RAM.
+- Every admit request already carries a `cpu` cores field (`admission_linux.go:117`
+  `Cpu int64`); the daemon does a 2-D fit — `cpuFits := waiter.cpu <= cpuAvailable(ceiling,
+  cpuOutstanding)` (`admit.go:2251`) — alongside the byte fit.
+- Every worker-admit lease already CHARGES CPU, but a FIXED `DefaultConfineCPUCores = 1`
+  (`confine.go:25`), hardcoded at `worker_admit.go:424`. aitest's relay sends only
+  `--estimated-bytes`; the worker-admit CLI's valid-flag set is `{job-id, outer-scope,
+  estimated-bytes, signature, max-wait, parent-scope-id}` (`main.go:1168`) — NO cpu flag.
+- The dispatch loop ALREADY reads `available_cpu` and refuses to grow when
+  `available_cpu < 1` (`supervisor.py:2526`). It is a COUNT/slot budget, NOT
+  cpuset/affinity PINNING (no per-core pinning today; almost certainly YAGNI — count
+  accounting already delivers the "don't oversubscribe" guarantee).
+
+**Shape (mirrors the `@aira_mem`/`reservation_need` path almost line-for-line):**
+`@aira_cpu(N)` mark → aitest computes `cpu_need` (1 default, N annotated), parallel to
+`reservation_need` → relay sends `--cpu N` → worker-admit CLI threads it into the
+request's EXISTING `Cpu` field (daemon already fits+charges it, so NO daemon ledger
+change) → growth gate checks `available_cpu >= N` instead of `>= 1`. Effect: an N-core
+worker charges N against the shared 2×NumCPU ledger → N fewer sibling leases admitted
+concurrently, machine-wide (all aitest pools + confine jobs).
+
+**Four decisions the design cycle / deploy's contract must pin (where the real work is):**
+1. **Units vs the 2×NumCPU ceiling.** The ledger is deliberately 2× (oversubscription is
+   the default packing; a normal 1-core worker ≈ half a physical core reserved). So
+   "reserve N cores" is ambiguous — charging N displaces only ~N/2 physical cores of
+   normal-packed capacity. Whole-physical-core-per-internal-worker ⇒ charge 2N (or the
+   mark means physical cores and aitest ×2 the ledger's oversubscription factor). Units
+   decision, not a mechanism gap; check §7 for intent.
+2. **Two bounds that coincide today and split under `@aira_cpu`:** `_run_worker_count`
+   (pool-local, = NumCPU default, `__init__.py:266`) vs the daemon `available_cpu`
+   (2×NumCPU per-slice). At 1 core/worker they line up. A 4-core test in
+   `--aitest-workers=8`: 8 workers, or 8 cores' worth (5 workers)? Contract must define
+   whether `--aitest-workers` is a WORKER count or a CORE budget.
+3. **The dispatch change lives in the FIT:** `_largest_fitting` (sole byte-fit authority)
+   and `_smallest_ready` (bootstrap picker) become 2-D fits (bytes × cores), and
+   "largest-first" needs an ordering rule across two dimensions. Plus a serial-cap /
+   run-alone fallback for N ≥ ceiling (the CPU analogue of RAM's exceeds-ceiling
+   `_bootstrap_from_empty_pool` branch — mark unevaluated with a knob hint).
+4. **Fail-open = deploy's hold condition.** The CPU dimension fails OPEN
+   (`_note_cpu_slots_state`): on a lane whose grant line carries `cpu_slots=unevaluated`,
+   a per-test CPU reservation is DECORATIVE (RAM-governed, CPU-unbounded, one-time stderr
+   warning). deploy holds the fastest-ee mark until the dispatcher honours it → deploy
+   must check their CI lane's actual worker-admit grant lines for `cpu_slots=unevaluated`
+   before trusting enforcement. What triggers `unevaluated` on the ci-shim lane is
+   deploy's lane check, NOT an aira claim (the #49 flock-slot design and the current S5
+   2×NumCPU ledger are DIFFERENT mechanisms — do not assume from memory).
+
+Status: feasibility scoping only, NO BUILD (no owner greenlight; sits under this held
+ticket). deploy is running a design workflow and will send the detailed contract
+(fastest-ee's forking-test sites + dispatcher contract + CPU-quota-vs-serial-cap plan);
+I size the actual dispatcher change against it when it lands. Answer sent to deploy
+2026-09-17.
+
 ## Requesters / provenance
 
 Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
