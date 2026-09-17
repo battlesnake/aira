@@ -263,6 +263,12 @@ _DEFAULT_ANNOTATION_BYTES = 256 << 20
 # AIRA_AITEST_WORKER_OVERHEAD_BYTES through the shared size grammar.
 _DEFAULT_WORKER_OVERHEAD_BYTES = 512 << 20
 
+# AIRA-261. The per-test CPU-core reservation an UNANNOTATED worker charges — one core,
+# matching the daemon's DefaultConfineCPUCores. An @aira_cpu(N) test charges N (ABSOLUTE,
+# not floor+increment: the worker's peak core demand IS N cores). Kept here so the
+# supervisor and the daemon agree on the unannotated floor without importing the runner.
+_DEFAULT_CPU_CORES = 1
+
 
 def _env_bytes(name, default):
     """A byte-count tunable override using the shared AIRA_AITEST_ESTIMATED_BYTES
@@ -889,6 +895,11 @@ class Supervisor:
         self._worker_overhead_bytes = self._resolve_worker_overhead_bytes()
         self._annotated = set()
         self.reservation_need = {}
+        # AIRA-261: nodeid -> per-test CPU-core reservation (ABSOLUTE, default 1), built in
+        # collect() from each item's aira_cpu marker. The cpu sibling of reservation_need; a
+        # nodeid absent here falls back to _DEFAULT_CPU_CORES (only test doubles that set
+        # self.queue directly, without collect(), reach that fallback).
+        self.cpu_need = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -950,23 +961,34 @@ class Supervisor:
         sized."""
         return self.reservation_need.get(nodeid, self._worker_overhead_bytes)
 
-    def _largest_fitting(self, budget, *, pop):
-        """The ready (still-queued) nodeid whose reservation_need is the GREATEST
-        that still fits `budget` bytes, or None if none fit. Ties keep FIFO order
-        (the earliest-queued nodeid at the greatest fitting need).
+    def _cpu_need_for(self, nodeid):
+        """CPU cores to reserve for a worker that will run `nodeid`: the test's declared
+        aira_cpu (its peak fork width), or _DEFAULT_CPU_CORES when unannotated. The cpu
+        sibling of _need_for; falls back to the default for a nodeid collect() never sized."""
+        return self.cpu_need.get(nodeid, _DEFAULT_CPU_CORES)
 
-        pop=False PEEKS (queue and attempts untouched). pop=True removes the nodeid
-        from the queue AND applies next_nodeid's attempts increment
-        (self.attempts[nodeid] += 1) -- without that increment the crash-retry-once
-        cap (Task 15) breaks and a repeatedly-crashing nodeid requeues forever.
+    def _largest_fitting(self, budget, cpu_budget, *, pop):
+        """The ready (still-queued) nodeid whose reservation_need is the GREATEST that fits
+        `budget` bytes AND whose cpu_need fits `cpu_budget` cores, or None if none fit. Ties
+        keep FIFO order (the earliest-queued nodeid at the greatest fitting need).
 
-        `budget` is always numeric: a None-reservation (unconfined) worker never
+        The fit is 2-D (AIRA-261): a worker sized for `cpu_budget` cores must NOT be handed a
+        test needing MORE cores, or the daemon's cpu ledger -- charged `cpu_budget` for this
+        worker -- would under-count the test's real fork width and oversubscribe the box. The
+        ORDER stays largest-BYTES-first; cpu is a FILTER, not the ranking key.
+
+        pop=False PEEKS (queue and attempts untouched). pop=True removes the nodeid from the
+        queue AND applies next_nodeid's attempts increment (self.attempts[nodeid] += 1) --
+        without that increment the crash-retry-once cap (Task 15) breaks and a
+        repeatedly-crashing nodeid requeues forever.
+
+        `budget`/`cpu_budget` are always numeric: a None-reservation (unconfined) worker never
         calls this -- its dispatch bypasses the fit filter entirely (Task 3)."""
         best = None
         best_need = -1
         for nodeid in self.queue:
             need = self._need_for(nodeid)
-            if need <= budget and need > best_need:
+            if need <= budget and self._cpu_need_for(nodeid) <= cpu_budget and need > best_need:
                 best = nodeid
                 best_need = need
         if best is None:
@@ -977,15 +999,16 @@ class Supervisor:
         return best
 
     def _smallest_ready(self):
-        """(nodeid, reservation_need) for the ready nodeid with the SMALLEST
-        reservation_need (FIFO among ties), or (None, 0) when the queue is empty.
+        """(nodeid, reservation_need, cpu_need) for the ready nodeid with the SMALLEST
+        reservation_need (FIFO among ties), or (None, 0, _DEFAULT_CPU_CORES) when the queue
+        is empty.
 
-        The empty-pool blocking claim (Task 2) sizes itself to this `need` -- the
-        smallest ready test is the one most likely to fit minimal free room on a
-        saturated box -- and, if the daemon refuses it as exceeds-ceiling, marks and
-        pops THIS specific nodeid; a bare byte size would leave that catch site with
-        no nodeid to mark. If even the smallest ready test exceeds the ceiling,
-        every ready test does."""
+        The empty-pool blocking claim (Task 2) sizes itself to this `need` AND `cpu_need`
+        (AIRA-261) -- the smallest ready test is the one most likely to fit minimal free room
+        on a saturated box -- and, if the daemon refuses it as exceeds-ceiling (bytes OR cpu),
+        marks and pops THIS specific nodeid; a bare byte size would leave that catch site with
+        no nodeid to mark. If even the smallest ready test exceeds the ceiling, every ready
+        test does."""
         best = None
         best_need = None
         for nodeid in self.queue:
@@ -994,8 +1017,8 @@ class Supervisor:
                 best = nodeid
                 best_need = need
         if best is None:
-            return None, 0
-        return best, best_need
+            return None, 0, _DEFAULT_CPU_CORES
+        return best, best_need, self._cpu_need_for(best)
 
     def bootstrap(self):
         """Read the launcher-published aitest coordinates (S2a). The confine
@@ -1083,11 +1106,12 @@ class Supervisor:
         # nodeids take AIRA_AITEST_DEFAULT_BYTES (256 MiB starting point; v7-4 sets
         # it). Local import mirrors _env_bytes: __init__ imports Supervisor only
         # inside a function, so the package is fully initialised here.
-        from aitest import _aira_mem_bytes_for_item
+        from aitest import _aira_mem_bytes_for_item, _aira_cpu_cores_for_item
         default_bytes = _env_bytes("AIRA_AITEST_DEFAULT_BYTES", _DEFAULT_ANNOTATION_BYTES)
         mem_map = {}
         annotated = set()
         reservation_need = {}
+        cpu_need = {}
         for item in items:
             value, warning = _aira_mem_bytes_for_item(item, default_bytes)
             mem_map[item.nodeid] = value
@@ -1109,9 +1133,17 @@ class Supervisor:
             # reserves exactly the 512 MiB overhead == today's flat reserve).
             incremental = value if is_annotated else 0
             reservation_need[item.nodeid] = self._worker_overhead_bytes + incremental
+            # AIRA-261: cpu_need is ABSOLUTE (default 1, or the aira_cpu mark's core count),
+            # not floor+increment -- a worker's peak CPU demand IS its fork width. A malformed
+            # marker warns and falls back to the default, never silently mis-charges.
+            cpu_value, cpu_warning = _aira_cpu_cores_for_item(item, _DEFAULT_CPU_CORES)
+            if cpu_warning is not None:
+                sys.stderr.write(cpu_warning)
+            cpu_need[item.nodeid] = cpu_value
         self.aira_mem_bytes = mem_map
         self._annotated = annotated
         self.reservation_need = reservation_need
+        self.cpu_need = cpu_need
 
     def next_nodeid(self):
         if not self.queue:
@@ -1142,18 +1174,23 @@ class Supervisor:
             return _OUTER_SCOPE_SHIM_SENTINEL
         return scope_id
 
-    def _spawn_admit_relay(self, estimated_bytes, probe):
+    def _spawn_admit_relay(self, estimated_bytes, estimated_cpu, probe):
         """Popen `aira worker-admit` for one worker lease. A CLAIM (probe=False)
         omits --max-wait, which the daemon reads as "block until the ledger fits"
         (S15). A PROBE (probe=True) passes --max-wait 0s, the non-blocking snapshot
         that reserves nothing and never grants. Raises WorkerAdmitDenied for a
         transient local fork failure (EAGAIN/ENOMEM) and WorkerAdmitUnavailable for
-        a static one, exactly as the whole admit path documents."""
+        a static one, exactly as the whole admit path documents.
+
+        estimated_cpu (AIRA-261) is the worker's CPU-core reservation, sent as
+        --estimated-cpu; the daemon charges it against the per-slice cpu ledger. The probe
+        passes the default so its snapshot reflects an ordinary single-core admission."""
         command = os.environ.get("AIRA_AITEST_WORKER_ADMIT_CMD", "")
         if not command:
             raise WorkerAdmitUnavailable("AIRA_AITEST_WORKER_ADMIT_CMD is unset")
         argv = [command, "worker-admit", "--job-id", str(os.getpid()),
                 "--outer-scope", self.outer_scope, "--estimated-bytes", str(estimated_bytes),
+                "--estimated-cpu", str(estimated_cpu),
                 "--parent-scope-id", self._parent_scope_id()]
         if probe:
             argv += ["--max-wait", _SPECULATIVE_MAX_WAIT]
@@ -1190,7 +1227,7 @@ class Supervisor:
             fd, _env_seconds("AIRA_AITEST_ADMIT_READ_GRACE", _ADMIT_READ_GRACE_SECONDS)
         )
 
-    def acquire_worker(self, estimated_bytes, blocking=True):
+    def acquire_worker(self, estimated_bytes, estimated_cpu=_DEFAULT_CPU_CORES, blocking=True):
         """Issue a blocking CLAIM for one worker lease and return
         (grant: dict, process: subprocess.Popen). process.stdin stays open as the
         daemon lease -- close it to release. The Go relay holds ONE daemon
@@ -1223,7 +1260,7 @@ class Supervisor:
         as a transient (a daemon-restart dial window), never a disable."""
         if not self.daemon_available:
             raise WorkerAdmitUnavailable("daemon unavailable")
-        process = self._spawn_admit_relay(estimated_bytes, probe=False)
+        process = self._spawn_admit_relay(estimated_bytes, estimated_cpu, probe=False)
         # "replace", not "strict", inside both readers (Sol build-review, AIRA-38
         # review wave): a corrupted/truncated write or a stray binary byte degrades
         # to a line that fails to parse (WorkerAdmitContractViolation below) rather
@@ -1386,7 +1423,7 @@ class Supervisor:
         own policy does, and per S16 only the empty-pool blocking claim may."""
         if not self.daemon_available:
             raise WorkerAdmitUnavailable("daemon unavailable")
-        process = self._spawn_admit_relay(self._run_estimated_bytes, probe=True)
+        process = self._spawn_admit_relay(self._run_estimated_bytes, _DEFAULT_CPU_CORES, probe=True)
         # A probe NEVER grants, so its relay always writes one line and exits; the
         # read is bounded (a live-pool read is never unbounded) and the process is
         # released unconditionally -- no lease is ever held on this path.
@@ -1670,7 +1707,7 @@ class Supervisor:
                         except Exception:
                             pass
 
-    def spawn_worker(self, estimated_bytes, blocking=True):
+    def spawn_worker(self, estimated_bytes, estimated_cpu=_DEFAULT_CPU_CORES, blocking=True):
         """Admits and forks one worker, returning its pid. Raises
         WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, a
         WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid or
@@ -1699,7 +1736,7 @@ class Supervisor:
         # lead-in on the Gantt (the RAM-gated queueing insight). acquire_worker
         # below blocks until the daemon grants.
         request_wall_us = _now_wall_us()
-        grant, admit_process = self.acquire_worker(estimated_bytes, blocking=blocking)
+        grant, admit_process = self.acquire_worker(estimated_bytes, estimated_cpu, blocking=blocking)
         # AIRA-259: admission GRANTED. request→granted is the "admission wait" (the
         # RAM-gated queue — deploy's headline insight; it dominates when the slice
         # is contended, which is exactly the scaling case), separated from the
@@ -1783,6 +1820,11 @@ class Supervisor:
             # worker's real cap; grant["memory_max"] is a STRING (and absent on a
             # ledger-only grant), so estimated_bytes is the numeric authority here.
             "reservation": estimated_bytes,
+            # AIRA-261: the CPU-core budget this worker was SIZED to. The fit filter in
+            # _dispatch_to_idle_workers hands it only tests whose cpu_need fits this, and the
+            # daemon charged exactly this against the cpu ledger, so it is the worker's real
+            # cpu allotment; a test needing more cores must go to a differently-sized worker.
+            "cpu": estimated_cpu,
             # AIRA-259 Gantt timing: requested (spawn entry) → granted (admission)
             # → ready (now — placement ack already passed for a scoped worker).
             "request_wall_us": request_wall_us,
@@ -1991,7 +2033,7 @@ class Supervisor:
                     # AIRA-235: a confined worker is handed the LARGEST ready test
                     # that FITS its reservation (pop=True keeps next_nodeid's attempts
                     # increment, so the crash-retry-once cap survives).
-                    nodeid = self._largest_fitting(reservation, pop=True)
+                    nodeid = self._largest_fitting(reservation, state.get("cpu", _DEFAULT_CPU_CORES), pop=True)
                     if nodeid is None and self.queue:
                         # Nothing fits this worker but ready work remains: retire it
                         # and immediately spawn a replacement so the freed quota is
@@ -2533,14 +2575,14 @@ class Supervisor:
         # GONE: once AIRA_AITEST_WORKER_OVERHEAD_BYTES makes sub-512 needs reachable the
         # old clause would falsely skip a growable tick. pop=False -- the queue is
         # shrunk by the between-spawns dispatch, not here.
-        nodeid = self._largest_fitting(available_bytes, pop=False)
+        nodeid = self._largest_fitting(available_bytes, available_cpu, pop=False)
         if nodeid is None:
-            return False  # no ready test fits the measured headroom this tick
+            return False  # no ready test fits the measured headroom (bytes AND cpu) this tick
         # Room a moment ago -> claim it with a BOUNDED read: a lost race (another job
         # took the room in the gap) times out to a denial and skips the tick, so a
         # growth claim can never freeze the single-threaded dispatch loop.
         try:
-            self.spawn_worker(self._need_for(nodeid), blocking=False)
+            self.spawn_worker(self._need_for(nodeid), self._cpu_need_for(nodeid), blocking=False)
             return True
         except WorkerAdmitDenied:
             return False
@@ -2573,12 +2615,12 @@ class Supervisor:
         isinstance guard keeps a WorkerAdmitContractViolation whole-queue even in the
         (impossible today) event it carried the token."""
         while self.daemon_available and not self.workers and self.queue:
-            nodeid, need = self._smallest_ready()
+            nodeid, need, cpu_need = self._smallest_ready()
             if nodeid is None:
                 return
             try:
                 self._wait_for_admission_or_disable(
-                    lambda: self.spawn_worker(need, blocking=True)
+                    lambda: self.spawn_worker(need, cpu_need, blocking=True)
                 )
             except WorkerAdmitTerminal as exc:
                 if isinstance(exc, WorkerAdmitRequestInvalid) and \
@@ -2586,18 +2628,19 @@ class Supervisor:
                     self.queue.remove(nodeid)
                     self.results.setdefault(nodeid, "unevaluated")
                     if nodeid in self._annotated:
-                        knob = "lower its @aira_mem or raise the slice ceiling"
+                        knob = "lower its @aira_mem, lower any @aira_cpu, or raise the slice ceiling"
                     else:
                         knob = (
-                            "it declares no @aira_mem, so this reservation is the "
+                            "it declares no @aira_mem, so its memory reservation is the "
                             "per-worker overhead -- lower AIRA_AITEST_WORKER_OVERHEAD_BYTES, "
-                            "add an @aira_mem marker, or raise the slice ceiling"
+                            "add an @aira_mem marker, lower any @aira_cpu marker, or raise the "
+                            "slice ceiling"
                         )
                     self._unevaluated_reasons.setdefault(
                         nodeid,
-                        "the daemon refused this test's memory reservation (%d bytes): "
-                        "it exceeds the slice ceiling. If the slice is busy this may "
-                        "clear with less concurrent load; otherwise %s" % (need, knob),
+                        "the daemon refused this test's reservation (%d bytes / %d CPU cores): "
+                        "one of them exceeds the slice ceiling. If the slice is busy this may "
+                        "clear with less concurrent load; otherwise %s" % (need, cpu_need, knob),
                     )
                     continue
                 self._fail_queue_terminal(str(exc))
@@ -3145,20 +3188,41 @@ class Supervisor:
         # nodeid. A too-small idle worker used to count as cover for a big queued test
         # (a pure count), blocking growth while that test starved. The `_UNKNOWN`
         # directional guard stays: a state not in its final shape is NOT idle.
-        idle_caps = [
-            state.get("reservation") for state in self.workers.values()
+        # AIRA-261: fit is 2-D (bytes AND cpu). A worker covers a queued nodeid iff its byte
+        # reservation fits the test's need AND its cpu reservation fits the test's cpu_need.
+        # This is a bipartite matching -- a distinct fitting idle worker per queued nodeid --
+        # which no single sort captures across two dimensions, so use greedy largest-first
+        # first-fit: when it matches EVERY queued nodeid the assignment IS a valid cover (so
+        # True is always correct), and when it cannot, growth is not pointless (return False).
+        # Greedy can only err toward False (allow growth, at worst one wasted spawn), never
+        # toward wrongly claiming cover, so it can never block growth for a starving queued
+        # test. Reduces to the old byte-only Hall's matching when every cpu_need is 1. The
+        # `_UNKNOWN` directional guard stays: a state not in its final shape is NOT idle.
+        idle = [
+            (state.get("reservation"), state.get("cpu"))
+            for state in self.workers.values()
             if state.get("in_flight", _UNKNOWN) is None
         ]
-        if len(self.queue) > len(idle_caps):
+        if len(self.queue) > len(idle):
             return False
-        needs = sorted((self._need_for(nodeid) for nodeid in self.queue), reverse=True)
-        # A worker with reservation is None (unconfined fallback) has no memory.max, so
-        # it fits ANY nodeid -- sort it as +infinity so it is matched to the biggest need.
-        caps = sorted(idle_caps, key=lambda c: float("inf") if c is None else c, reverse=True)
-        # Hall's condition, both sorted DESCENDING: a distinct fitting worker exists for
-        # every queued nodeid iff the i-th largest need fits the i-th largest cap.
-        for need, cap in zip(needs, caps):
-            if cap is not None and cap < need:
+        # Place the hardest (largest-byte, then largest-cpu) needs first. A None
+        # reservation/cpu (unconfined fallback worker) has no cap and fits ANY need.
+        queued = sorted(
+            ((self._need_for(n), self._cpu_need_for(n)) for n in self.queue),
+            reverse=True,
+        )
+        used = [False] * len(idle)
+        for need_bytes, need_cpu in queued:
+            placed = False
+            for i, (cap_bytes, cap_cpu) in enumerate(idle):
+                if used[i]:
+                    continue
+                if (cap_bytes is None or cap_bytes >= need_bytes) and \
+                        (cap_cpu is None or cap_cpu >= need_cpu):
+                    used[i] = True
+                    placed = True
+                    break
+            if not placed:
                 return False
         return True
 
