@@ -124,6 +124,30 @@ p90-prior is the confine SLICE reserve, an outer layer).
   @aira_mem toil. The natural aira-side companion to the fastest-ee mark tuning; strong
   candidate once manual tuning's ceiling is seen.
 
+### Run #2 G1 — no-fit churn is HETEROGENEOUS-legs-only (measured, corrects the framing)
+
+Attributing the engine leg's tests-per-worker decline (155→97→70 at 16→32→64c) from
+the Run #2 Gantt: it is DRAIN/tail, NOT retire-on-no-fit churn. Source: `_largest_fitting`
+returns None only when no queued need ≤ the worker budget, so on a HOMOGENEOUS leg (all
+needs = the 512M floor, no @aira_mem) no-fit CANNOT fire; watermark is cgroup-only
+(moot on ci-shim), MAX_TESTS=200 never hit (155<200); and the trace shows NO worker hit
+the 600s MAX_SECONDS cap (max dur 409s). Every recycle trigger ruled out → workers run
+to drain. The trace's FLOOR-only legs are short with worker-count ≈ their small test
+count (tail: at high concurrency more workers than a short test set keeps batched); the
+one clear mid-run respawn signature (134 workers retiring spread across 419s) is a
+HETEROGENEOUS leg (mixed reservations) — where no-fit DOES fire. So: the engine-43%
+lever is serial POLES + drain TAIL, not respawn churn; **retire-on-no-fit churn is real
+but scoped to the marked/enforced heterogeneous legs (local merge-gate, hosted/services/
+pipeline), NOT the advisory homogeneous engine leg.**
+
+RELAY1 (deploy) — retire-on-no-fit tuning for those enforced heterogeneous legs: a
+min-batch / defer-retire floor (don't retire a fitting worker until it has amortised its
+respawn, keep it for a later fitting test), or LPT-pack the heavy-@aira_mem-marked tail
+onto dedicated big workers so small workers aren't churned by unfittable large tests.
+This is the churn lever (distinct from Input 2's engine-leg drain, which it does NOT
+address). RELAY2 = the auto-learn direction below, which subsumes the manual @aira_mem
+marking burden entirely.
+
 ## Telemetry-feedback direction (owner, 2026-09-17)
 
 The owner generalises the auto-learn idea into a coherent capability: aira reads a
