@@ -83,6 +83,27 @@ it names both re-key sites + the two invariants.
   env/config coordinate that deploy's gate materialises from its GCS capture. **AIRA NEVER
   reads GCS** — keep it a primitive: mark = bootstrap/override, file = steady-state,
   neutral (1) otherwise.
+  **DEFERRED to v0.17+ (NOT in the Phase B build).** The v0.17 Phase B ships the MARK +
+  LPT re-key ONLY (mark-or-neutral); the profile-file auto-learn is a separate follow-on
+  because per-test duration measurement is not yet in aira (the AIRA-259 trace is
+  per-WORKER; per-test spans are themselves a deferred tier). The `@aira_time` mark is the
+  bootstrap/override input that works standalone.
+
+## Phase B DONE (2026-09-18, `f4e2231`)
+
+Register `@aira_time` + `_aira_time_for_item` reader (relative unitless int rank, default 1,
+malformed warns incl OverflowError); `time_cost` map in collect(); `_time_for` accessor;
+re-key `_largest_fitting`'s ORDER to `(aira_time, need, -queue_index)` at its single shared
+definition (both call sites get LPT), keeping the 2-D fit FILTER before the order and the
+`attempts` increment. Byte-identical with zero marks (Fable measured 0 mismatches over 50k
+random queues). Two-loop Fable = **APPROVE-WITH-NITS** (nits: 3 P3 test-gaps ported —
+collect() warning-emission, bool/multi-arg, named FIFO-tie regression — for BOTH time and
+the shared cpu emission gap; docstring de-staled; this deferral note). Accepted design
+trades (documented, not fixed — bounded, slowdown-only, never deadlock): (a) a worker sized
+to a small-RAM heavy-time test is less versatile → at most one extra retire+replace per such
+test (sparse); (b) demoting RAM to the secondary key can fragment a big-RAM/short-time test
+out of a concurrent fit on a saturated box (mitigation: also mark the big-RAM test). Ships as
+v0.17 (supervisor-only, DROP-IN — no proto/wire change).
 
 ## Status
 Phase A in progress (TDD), on `aira-261-cpu-time-consumers`. Increments:

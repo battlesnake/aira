@@ -130,3 +130,56 @@ def test_fit_filter_runs_before_the_time_order():
     sup.reservation_need = {"heavy": 100, "light": 100}
     sup.cpu_need = {"heavy": 8, "light": 1}
     assert sup._largest_fitting(1000, 4, pop=False) == "light"
+
+
+def test_fifo_on_equal_time_and_need():
+    # The TERTIARY key, pinned by name (the compat guarantee's tie-break, not fixture
+    # accident): equal aira_time AND equal reservation_need → the EARLIEST-queued wins.
+    sup = Supervisor()
+    sup.reservation_need = {"first": 100, "mid": 100, "last": 100}
+    sup.cpu_need = {"first": 1, "mid": 1, "last": 1}
+    sup.time_cost = {"first": 5, "mid": 5, "last": 5}
+    sup.queue = ["first", "mid", "last"]
+    assert sup._largest_fitting(1000, 4, pop=False) == "first"
+    sup._largest_fitting(1000, 4, pop=True)  # pop "first"
+    assert sup._largest_fitting(1000, 4, pop=False) == "mid", "next-earliest at the tie wins"
+
+
+# --- reader edge cases (AIRA-223 emission + bool/multi-arg) -----------------
+
+def test_collect_emits_the_time_warning_once(pytester, capsys):
+    # A malformed aira_time must WARN via collect()'s sys.stderr.write, not merely return a
+    # warning string nobody prints. Delete the emission in collect() and this reds.
+    items = _getitems(pytester, '''
+        import pytest
+        @pytest.mark.aira_time(0)
+        def test_bad(): pass
+    ''')
+    capsys.readouterr()  # discard collection output
+    sup = Supervisor()
+    sup.collect(items)
+    err = capsys.readouterr().err
+    time_lines = [l for l in err.splitlines() if "aira aitest:" in l and "aira_time" in l]
+    assert len(time_lines) == 1, time_lines
+    assert "default" in time_lines[0]
+    assert sup.time_cost[_item(items, "test_bad").nodeid] == _DEFAULT_TIME_COST
+
+
+def test_bool_arg_is_rejected(pytester):
+    items = _getitems(pytester, '''
+        import pytest
+        @pytest.mark.aira_time(True)
+        def test_x(): pass
+    ''')
+    value, warning = _aira_time_for_item(_item(items, "test_x"), _DEFAULT_TIME_COST)
+    assert value == _DEFAULT_TIME_COST and warning is not None
+
+
+def test_multiple_positional_args_warns(pytester):
+    items = _getitems(pytester, '''
+        import pytest
+        @pytest.mark.aira_time(50, 60)
+        def test_x(): pass
+    ''')
+    value, warning = _aira_time_for_item(_item(items, "test_x"), _DEFAULT_TIME_COST)
+    assert value == _DEFAULT_TIME_COST and warning is not None

@@ -983,9 +983,10 @@ class Supervisor:
         return self.time_cost.get(nodeid, _DEFAULT_TIME_COST)
 
     def _largest_fitting(self, budget, cpu_budget, *, pop):
-        """The ready (still-queued) nodeid whose reservation_need is the GREATEST that fits
-        `budget` bytes AND whose cpu_need fits `cpu_budget` cores, or None if none fit. Ties
-        keep FIFO order (the earliest-queued nodeid at the greatest fitting need).
+        """The ready (still-queued) nodeid that FITS `budget` bytes AND `cpu_budget` cores and
+        ranks HIGHEST under the LPT order (aira_time DESC, then reservation_need DESC, then
+        earliest-queued), or None if none fit. The name is historical -- since AIRA-261 Phase B
+        the pick is the longest-processing-time fitting test, not merely the largest-RAM one.
 
         The fit is 2-D (AIRA-261): a worker sized for `cpu_budget` cores must NOT be handed a
         test needing MORE cores, or the daemon's cpu ledger -- charged `cpu_budget` for this
