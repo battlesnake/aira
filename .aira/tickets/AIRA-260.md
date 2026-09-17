@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-260","project":"aira","title":"aitest worker-model cycle: warm-fork fixture prewarm, batch-vs-per-test sizing trade, fail-fast leg marker","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["aitest","telemetry"],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-260","project":"aira","title":"aitest worker-model cycle: warm-fork fixture prewarm, batch-vs-per-test sizing trade, fail-fast leg marker","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["aitest","telemetry"],"hold":true,"relations":[{"kind":"relates","from":"AIRA-261","to":"AIRA-260"}]}
 ---
 
 HELD pending owner sign-off. Three aitest worker-model design inputs from the owner
