@@ -12,6 +12,7 @@ _pool_covers_the_queue both account for cpu.
 import pytest
 
 from aitest import _aira_cpu_cores_for_item
+from aitest import supervisor as _supmod
 from aitest.supervisor import Supervisor, _DEFAULT_CPU_CORES
 
 
@@ -88,6 +89,19 @@ def test_multiple_positional_args_warns(pytester):
     assert value == _DEFAULT_CPU_CORES and warning is not None
 
 
+def test_non_finite_float_arg_warns_not_crashes(pytester):
+    # int(float("inf")) raises OverflowError, NOT ValueError -- the reader must warn and
+    # fall back to the default, never crash collection (drop OverflowError from the except
+    # and this raises instead of returning a warning).
+    items = _getitems(pytester, '''
+        import pytest
+        @pytest.mark.aira_cpu(float("inf"))
+        def test_x(): pass
+    ''')
+    value, warning = _aira_cpu_cores_for_item(_item(items, "test_x"), _DEFAULT_CPU_CORES)
+    assert value == _DEFAULT_CPU_CORES and warning is not None
+
+
 # --- collect() builds the cpu_need map ------------------------------------
 
 def test_collect_builds_cpu_need(pytester):
@@ -153,18 +167,50 @@ def test_pool_cover_requires_a_cpu_fitting_idle_worker():
     assert sup._pool_covers_the_queue() is True
 
 
-def test_pool_cover_matches_distinct_workers_across_both_dims():
+def test_pool_cover_is_a_true_2d_matching_not_two_1d_checks():
+    # The False case must be caught by the MATCHING, not the len(queue) > len(idle) count
+    # guard: equal counts (2 vs 2), each dimension independently satisfiable, but NO single
+    # worker fits "big" in BOTH dims. Two independent 1-D Hall's checks (bytes alone, cpu
+    # alone) would each pass and wrongly return True, starving "big"; the greedy 2-D
+    # matching must return False.
     sup = Supervisor()
     sup.reservation_need = {"big": 900, "wide": 100}
-    sup.cpu_need = {"big": 1, "wide": 4}
+    sup.cpu_need = {"big": 4, "wide": 1}
     sup.queue = ["big", "wide"]
-    # Two idle workers: one big-byte/1-core, one small-byte/4-core. A distinct fitting
-    # worker exists for each queued test (big→byte worker, wide→cpu worker), so covered.
     sup.workers = {
-        1: {"in_flight": None, "reservation": 1000, "cpu": 1},
+        1: {"in_flight": None, "reservation": 1000, "cpu": 1},  # the bytes for "big", 1 core
+        2: {"in_flight": None, "reservation": 200, "cpu": 4},   # 4 cores, too few bytes for "big"
+    }
+    # "big" needs 900B AND 4 cores: W1 has the bytes but one core, W2 the cores but 200B.
+    # No single worker fits it in both dims → growth still worthwhile → NOT covered.
+    assert sup._pool_covers_the_queue() is False
+    # Widen W1 to 4 cores: now W1 fits "big" (900B, 4c) and W2 fits "wide" → a distinct
+    # fitting worker exists for each → covered.
+    sup.workers = {
+        1: {"in_flight": None, "reservation": 1000, "cpu": 4},
         2: {"in_flight": None, "reservation": 200, "cpu": 4},
     }
     assert sup._pool_covers_the_queue() is True
-    # Drop the wide-cpu worker: "wide" (4 cores) can no longer be placed → not covered.
-    sup.workers = {1: {"in_flight": None, "reservation": 1000, "cpu": 1}}
-    assert sup._pool_covers_the_queue() is False
+
+
+# --- the wire: the supervisor actually SENDS the cpu reservation -----------
+
+def test_spawn_admit_relay_sends_estimated_cpu(monkeypatch):
+    # The load-bearing false-pass guard: the supervisor's worker-admit argv must carry
+    # --estimated-cpu <N>. Drop it from _spawn_admit_relay and the CLI floors to 1 → a
+    # cpu=N worker is charged one core (silent oversubscription) with the whole suite green.
+    sup = Supervisor()
+    sup.outer_scope = "/slice/.aira-suite"
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", "/nonexistent/aira")
+    monkeypatch.setenv("AIRA_CONFINE_SCOPE_ID", "CONFINE-suite-111111-1")
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+
+    monkeypatch.setattr(_supmod.subprocess, "Popen", _FakePopen)
+    sup._spawn_admit_relay(estimated_bytes=1 << 20, estimated_cpu=4, probe=False)
+    argv = captured["argv"]
+    assert "--estimated-cpu" in argv, "the worker-admit argv must carry the cpu reservation"
+    assert argv[argv.index("--estimated-cpu") + 1] == "4", "and its value must be the reservation, not dropped/defaulted"

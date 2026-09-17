@@ -37,6 +37,13 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 0, workerAdmitEstimatedBytesMin, 0, true, ""
 	}
+	// AIRA-261: a deterministic cpu ceiling (2*4 = 8) so the estimated-cpu grant subtest
+	// below is not flaky on a low-core CI runner. The byte subtests do not read cpu.
+	server.readCPUCores = func() int { return 4 }
+	// The estimated-cpu grant subtest reaches the worker-scope CREATE step (the byte
+	// subtests all deny before it); answer it with the in-memory tree so no real cgroup
+	// is required.
+	server.SetWorkerScopeTreeForTest()
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())
@@ -127,6 +134,47 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 		assertOutcome(t, stdout.String(), stderr.String(),
 			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
 			runner.WorkerAdmitReasonArgumentsInvalid, true)
+	})
+
+	// AIRA-261, proven through the REAL CLI + client: `aira worker-admit --estimated-cpu N`
+	// must charge N cores against the slice cpu ledger, not the hardcoded 1. End-to-end guard
+	// for the whole wire chain (CLI parse → EstimatedCPU in the request → client frame's
+	// estimated_cpu → daemon charge): zeroing EstimatedCPU in main.go, or dropping estimated_cpu
+	// from the client frame args, each REDS this (the ledger reads cpu=1). It holds a grant, so
+	// closing stdin in the cleanup releases the worker before the saturation subtest runs.
+	t.Run("estimated-cpu is charged end-to-end through the CLI", func(t *testing.T) {
+		command := exec.Command(binary, "worker-admit", "--job-id", "job-cpu",
+			"--outer-scope", "/slice/.aira-suite", "--parent-scope-id", workerTestParentScopeID,
+			"--estimated-bytes", strconv.FormatInt(workerAdmitEstimatedBytesMin, 10),
+			"--estimated-cpu", "3", "--max-wait", "5s")
+		stdin, err := command.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		command.Stdout = &stdout
+		command.Stderr = &stderr
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = stdin.Close() // closing the lease connection releases the worker
+			_ = command.Wait()
+		})
+		// The blocking claim grants and holds the lease; poll the ledger until it lands.
+		var cpu int64
+		var jobs int
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, c, j := sliceLedger(t, server, "/test-slice"); j == 1 {
+				cpu, jobs = c, j
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if jobs != 1 || cpu != 3 {
+			t.Fatalf("after `aira worker-admit --estimated-cpu 3` (stdout=%q stderr=%q): ledger cpu=%d jobs=%d, want cpu=3 charged end-to-end", stdout.String(), stderr.String(), cpu, jobs)
+		}
 	})
 
 	// AIRA-63, proven through the REAL client: an admitSlots-saturated worker-admit

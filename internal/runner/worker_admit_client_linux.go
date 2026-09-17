@@ -105,6 +105,25 @@ type workerAdmitGrant struct {
 	AvailableCPU   int64 `json:"available_cpu,omitempty"`
 }
 
+// workerReDeclareRecord builds the ARDR record a worker lease re-anchors with after a
+// daemon restart (AIRA-261). CPUCores MUST be the CHARGED reservation, not the hardcoded
+// floor: the rebuilt ledger re-charges from this record, so a cpu=N worker that re-declared
+// cpu=1 would under-charge the ledger and oversubscribe the box. cpuCores is floored to
+// DefaultConfineCPUCores for any caller that left it 0; charged==requested, since the daemon
+// refuses — never clamps — an over-ceiling cpu. The scope key is the dirname (Base minus the
+// ".aira-" prefix), matching the daemon's fresh-admit lease key so the re-anchor lines up.
+func workerReDeclareRecord(grant workerAdmitGrant, cpuCores int64) redeclare.Record {
+	if cpuCores < DefaultConfineCPUCores {
+		cpuCores = DefaultConfineCPUCores
+	}
+	return redeclare.Record{
+		ScopeID:       strings.TrimPrefix(filepath.Base(grant.ScopePath), ".aira-"),
+		RAMBytes:      uint64(grant.MemoryMax),
+		CPUCores:      uint32(cpuCores),
+		ParentScopeID: grant.ParentScopeID,
+	}
+}
+
 // RequestWorkerAdmit dials the daemon and sends one worker-admit request,
 // reusing admitThroughDaemon's proven local wire types/framing (this package
 // may not import internal/daemon — see admission_linux.go).
@@ -258,17 +277,7 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		// restart merge-gate's exact-key-set assertion catches this). This is the same
 		// key Task 1's dirname alignment (`confineScopeDirName` / the reaper's
 		// `hasLiveLease`) uses, so the whole worker-lease path lines up across a restart.
-		// CPUCores must be the CHARGED reservation (AIRA-261), not the hardcoded floor:
-		// after a daemon restart the rebuilt ledger re-charges from this re-declare, so a
-		// cpu=N worker that re-declared cpu=1 would under-charge the ledger and oversubscribe
-		// the box. estimatedCPU (floored above) is exactly what the daemon charged, since the
-		// daemon refuses — never clamps — an over-ceiling cpu.
-		reDeclareFrame, _ = redeclare.EncodeFrame(redeclare.Record{
-			ScopeID:       strings.TrimPrefix(filepath.Base(grant.ScopePath), ".aira-"),
-			RAMBytes:      uint64(grant.MemoryMax),
-			CPUCores:      uint32(estimatedCPU),
-			ParentScopeID: grant.ParentScopeID,
-		})
+		reDeclareFrame, _ = redeclare.EncodeFrame(workerReDeclareRecord(grant, estimatedCPU))
 	}
 	return WorkerAdmitOutcome{
 		State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,

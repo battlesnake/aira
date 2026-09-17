@@ -2565,8 +2565,9 @@ class Supervisor:
         if available is None:
             return False  # headroom transiently unestablished this tick
         available_bytes, available_cpu = available
-        if available_cpu < 1:
-            return False  # no CPU slot for another worker right now
+        # AIRA-261: no separate available_cpu<1 gate -- the 2-D _largest_fitting below is the
+        # SOLE fit authority for BOTH dimensions (it returns None when nothing fits either
+        # available_bytes OR available_cpu), so zero cpu headroom falls out as "nothing fits".
         # AIRA-235: largest-first. Size the new worker to the LARGEST ready test that
         # FITS the measured headroom; big tests thus get sized workers as soon as room
         # exists, small tests fill the remaining quota. _largest_fitting is now the

@@ -139,7 +139,9 @@ def _aira_cpu_cores_for_item(item, default):
     try:
         value = int(raw)
         well_formed = not isinstance(raw, bool) and value >= 1 and float(raw) == value
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float("inf")) — a non-finite float must WARN, not crash
+        # collection.
         value, well_formed = default, False
     if not well_formed:
         return default, (

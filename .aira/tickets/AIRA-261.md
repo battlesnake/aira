@@ -88,11 +88,19 @@ it names both re-key sites + the two invariants.
 Phase A in progress (TDD), on `aira-261-cpu-time-consumers`. Increments:
 - **A.1 DONE** (`2e27482`): daemon parses + charges worker-admit `estimated_cpu` (optional,
   absent ⇒ DefaultConfineCPUCores floor) + the cpu-ceiling pre-check. 3 tests, both
-  behavioural ones mutation-verified. **Finding worth keeping:** the cpu pre-check is
-  LOAD-BEARING, not redundant with the admit path's own `request.cpu > cpuCeiling` check —
-  the cpu ledger is SIGNED, so WITHOUT the pre-check an over-ceiling worker-admit is GRANTED
-  (charges the ledger negative → every later admission on the slice then stalls). The
-  pre-check refuses it up front with ExceedsCeiling so the supervisor marks it unevaluated.
+  behavioural ones mutation-verified. **Finding worth keeping (CORRECTED by the Fable review
+  — my first measurement was wrong):** the cpu pre-check is LOAD-BEARING because the
+  worker-admit path's ONLY cpu ceiling check is this pre-check (`admit.go:1569`'s
+  `request.cpu > cpuCeiling` sits in the *confine* admit verb path; worker-admit calls
+  `enqueueResolvedConfineAdmit` directly, whose only ceiling check is bytes). WITHOUT the
+  pre-check an over-ceiling cpu claim ENQUEUES AND BLOCKS FOREVER (a claim has no max-wait;
+  `admit.go:2251` is a plain `waiter.cpu <= ceiling−outstanding` wait) — it is NOT granted,
+  the ledger stays 0, and other/later fitting waiters on the slice are UNAFFECTED (the wedge
+  is local to the one supervisor's blocking bootstrap). The pre-check refuses it up front
+  with ExceedsCeiling so the supervisor marks that one test unevaluated + continues.
+  (My earlier "GRANTED → ledger goes negative → stalls everything" was a mutation-measurement
+  error: I mutated the charge and the pre-check together, so the charge-to-1 mutation made it
+  grant cpu=1; with only the pre-check disabled it blocks.)
 - **A.2 TODO:** CLI `--estimated-cpu` (`main.go` parseWorkerAdmitArgs) + `WorkerAdmitClientRequest.EstimatedCPU` + send `"estimated_cpu"` in the frame + re-declare uses `req.EstimatedCPU` (honesty).
 - **A.3 TODO:** proto 12→13 (`protocol.go` + `admission_linux.go`, enforced-equal test).
 - **A.4 TODO:** supervisor — register `aira_cpu`, `cpu_need` map, `--estimated-cpu` on the relay, extend the bootstrap knob-hint.

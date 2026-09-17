@@ -113,6 +113,12 @@ the overhead. Raise the overhead floor for a whole suite with
 that exceeds its reservation is OOM-killed alone rather than taking the suite with
 it, its test requeued once.
 
+A test that forks its own internal worker pool should declare
+`@pytest.mark.aira_cpu(N)`, where N is its peak fork width, so the dispatcher reserves N
+CPU cores for it against the per-slice cpu ledger and admits N-1 fewer sibling workers
+while it runs — admission accounting only, never CPU pinning. An unannotated test reserves
+one core; a malformed value warns rather than being silently ignored.
+
 ### Capture the friction
 
 When something about the workflow is annoying or wrong, `aira rant` records it on the spot, with the git context attached, so papercuts get written down instead of evaporating. Skim the pile later; recurring friction becomes a to-do list, not a vague sense that something's off.

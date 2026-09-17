@@ -96,6 +96,23 @@ func TestLeaseKeeperReDeclaresOnEOFWithVerbatimFrame(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-261 — a worker's post-restart re-declare carries the CHARGED cpu, not the
+// hardcoded floor, so a cpu=N worker re-anchors as cpu=N and the rebuilt ledger re-charges N
+// (a cpu=1 re-declare would under-charge and oversubscribe the box until that worker retires).
+// Mutate the CPUCores line back to DefaultConfineCPUCores and the cpu==3 assertion REDS.
+func TestWorkerReDeclareRecordCarriesTheChargedCPU(t *testing.T) {
+	grant := workerAdmitGrant{ScopePath: "/slice/.aira-CONFINE-w1-111111-x", MemoryMax: 5 << 30, ParentScopeID: "CONFINE-suite-1"}
+	if rec := workerReDeclareRecord(grant, 3); rec.CPUCores != 3 {
+		t.Fatalf("re-declared cpu=%d, want the charged 3 (a restart under-charges if this floors to 1)", rec.CPUCores)
+	}
+	// A 0/omitted cpu floors to the default; the dirname scope key, ram, and parent carry through.
+	rec := workerReDeclareRecord(grant, 0)
+	if rec.CPUCores != uint32(DefaultConfineCPUCores) || rec.RAMBytes != 5<<30 ||
+		rec.ScopeID != "CONFINE-w1-111111-x" || rec.ParentScopeID != "CONFINE-suite-1" {
+		t.Fatalf("rec=%+v: want cpu floored to %d, ram 5GiB, dirname scope-id, parent carried", rec, DefaultConfineCPUCores)
+	}
+}
+
 // verifies: S2a §4/§16 — a --delegate-ram grant is an ordinary confine job, so it
 // declares ONE CPU core (not 0), and the re-declare must reproduce the original
 // admit's declaration.
