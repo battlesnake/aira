@@ -269,6 +269,12 @@ _DEFAULT_WORKER_OVERHEAD_BYTES = 512 << 20
 # supervisor and the daemon agree on the unannotated floor without importing the runner.
 _DEFAULT_CPU_CORES = 1
 
+# AIRA-261 Phase B. The relative scheduling-cost rank an UNANNOTATED test gets -- one unit
+# (a median test). aira_time is a pure ORDERING key (LPT), never a reservation, so unlike the
+# cpu/mem floors this default carries no admission meaning: with every test at 1 the dispatch
+# order is byte-identical to before aira_time existed.
+_DEFAULT_TIME_COST = 1
+
 
 def _env_bytes(name, default):
     """A byte-count tunable override using the shared AIRA_AITEST_ESTIMATED_BYTES
@@ -900,6 +906,9 @@ class Supervisor:
         # nodeid absent here falls back to _DEFAULT_CPU_CORES (only test doubles that set
         # self.queue directly, without collect(), reach that fallback).
         self.cpu_need = {}
+        # AIRA-261 Phase B: nodeid -> relative scheduling-cost rank (default 1), built in
+        # collect(); used only to order the ready-queue pick (LPT). Empty until collect() runs.
+        self.time_cost = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -967,6 +976,12 @@ class Supervisor:
         sibling of _need_for; falls back to the default for a nodeid collect() never sized."""
         return self.cpu_need.get(nodeid, _DEFAULT_CPU_CORES)
 
+    def _time_for(self, nodeid):
+        """The relative scheduling-cost rank of `nodeid` (AIRA-261 Phase B): its declared
+        aira_time, or _DEFAULT_TIME_COST (1) when unannotated. Used ONLY to order the ready
+        queue longest-first (LPT); it reserves nothing and gates no admission."""
+        return self.time_cost.get(nodeid, _DEFAULT_TIME_COST)
+
     def _largest_fitting(self, budget, cpu_budget, *, pop):
         """The ready (still-queued) nodeid whose reservation_need is the GREATEST that fits
         `budget` bytes AND whose cpu_need fits `cpu_budget` cores, or None if none fit. Ties
@@ -974,8 +989,15 @@ class Supervisor:
 
         The fit is 2-D (AIRA-261): a worker sized for `cpu_budget` cores must NOT be handed a
         test needing MORE cores, or the daemon's cpu ledger -- charged `cpu_budget` for this
-        worker -- would under-count the test's real fork width and oversubscribe the box. The
-        ORDER stays largest-BYTES-first; cpu is a FILTER, not the ranking key.
+        worker -- would under-count the test's real fork width and oversubscribe the box.
+
+        The fit (bytes AND cpu) is the FILTER; the ORDER among the fitting candidates is LPT
+        (AIRA-261 Phase B): the ranking key is (aira_time DESC, reservation_need DESC, FIFO).
+        Longest-processing-time-first shortens the drain tail; RAM bin-packing is the secondary
+        key (preserving today's largest-first behaviour within an equal-time band); earliest-
+        queued breaks final ties. With every aira_time == 1 the primary key is constant and
+        this collapses EXACTLY to today's (need DESC, FIFO) order -- a suite with no aira_time
+        marks schedules byte-identically to before.
 
         pop=False PEEKS (queue and attempts untouched). pop=True removes the nodeid from the
         queue AND applies next_nodeid's attempts increment (self.attempts[nodeid] += 1) --
@@ -985,12 +1007,18 @@ class Supervisor:
         `budget`/`cpu_budget` are always numeric: a None-reservation (unconfined) worker never
         calls this -- its dispatch bypasses the fit filter entirely (Task 3)."""
         best = None
-        best_need = -1
-        for nodeid in self.queue:
+        best_key = None
+        for index, nodeid in enumerate(self.queue):
             need = self._need_for(nodeid)
-            if need <= budget and self._cpu_need_for(nodeid) <= cpu_budget and need > best_need:
+            # Fit filter FIRST (both dimensions), so a heavy-time RAM/cpu-oversized test is
+            # excluded and can never block a fitting lighter one.
+            if need > budget or self._cpu_need_for(nodeid) > cpu_budget:
+                continue
+            # LPT primary, RAM bin-pack secondary, FIFO (-index, earliest wins) tertiary.
+            key = (self._time_for(nodeid), need, -index)
+            if best_key is None or key > best_key:
                 best = nodeid
-                best_need = need
+                best_key = key
         if best is None:
             return None
         if pop:
@@ -1106,12 +1134,13 @@ class Supervisor:
         # nodeids take AIRA_AITEST_DEFAULT_BYTES (256 MiB starting point; v7-4 sets
         # it). Local import mirrors _env_bytes: __init__ imports Supervisor only
         # inside a function, so the package is fully initialised here.
-        from aitest import _aira_mem_bytes_for_item, _aira_cpu_cores_for_item
+        from aitest import _aira_mem_bytes_for_item, _aira_cpu_cores_for_item, _aira_time_for_item
         default_bytes = _env_bytes("AIRA_AITEST_DEFAULT_BYTES", _DEFAULT_ANNOTATION_BYTES)
         mem_map = {}
         annotated = set()
         reservation_need = {}
         cpu_need = {}
+        time_cost = {}
         for item in items:
             value, warning = _aira_mem_bytes_for_item(item, default_bytes)
             mem_map[item.nodeid] = value
@@ -1140,10 +1169,19 @@ class Supervisor:
             if cpu_warning is not None:
                 sys.stderr.write(cpu_warning)
             cpu_need[item.nodeid] = cpu_value
+            # AIRA-261 Phase B: time_cost is a RELATIVE rank (default 1, or the aira_time
+            # mark's value), used ONLY to order the ready queue longest-first (LPT). It
+            # reserves nothing and gates no admission, so a malformed value just warns and
+            # falls back -- it can never wedge a worker or change a verdict.
+            time_value, time_warning = _aira_time_for_item(item, _DEFAULT_TIME_COST)
+            if time_warning is not None:
+                sys.stderr.write(time_warning)
+            time_cost[item.nodeid] = time_value
         self.aira_mem_bytes = mem_map
         self._annotated = annotated
         self.reservation_need = reservation_need
         self.cpu_need = cpu_need
+        self.time_cost = time_cost
 
     def next_nodeid(self):
         if not self.queue:
