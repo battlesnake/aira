@@ -472,6 +472,41 @@ load-bearing and `@aira_time`/LPT is the deferred follow-on, not the lead.
 Fable reviews in a detached worktree — touches the dispatch/wire/ledger). No longer "held";
 the gate now is the build itself + coordinating the proto-13 release with deploy's re-pin.
 
+## Run #3 — one-test-per-worker measurement (2026-09-18, deploy, PARTIAL; owner stopped it on a GCP VM-up-8h alert / ~$13/~20h cost)
+
+The first REAL per-test peak-RSS data — the ground truth AIRA-260's RAM auto-learn direction
+(Input 2b + telemetry-feedback) wants. Partial (owner cost-stop) but the METHOD is proven.
+
+- **One-test-per-worker CONFIRMED end-to-end:** `AIRA_AITEST_WORKER_MAX_TESTS=1` through the
+  submit → job-env → run-gate → container chain — 7,345 `worker-*.tsv`, tests-per-worker
+  distribution `{1: 7345}`. Validates the CI-measurement-mode lifecycle above.
+- **Per-test peak_rss (792 of 7,345 captured — see the flush finding):** median 67 MB, p90
+  114 MB, max 1231 MB.
+- **Memory POLE = `fastest_ee/hosted/`:** 46 tests over the 512 MB `@aira_mem` floor, and ALL
+  46 are `hosted/` (`test_worker.py` + `test_profile_runner.py`) at ~1229-1231 MB → `@aira_mem`
+  target ~717-719 MB. The other 746 are ≤512 MB (no reservation needed). fastest-ee's to apply
+  as the `@aira_mem` marks; also the first concrete input the RAM auto-learn would consume.
+  Table: `~/tmp/ci-cp/standard8-per-test-partial.txt`.
+
+### TRACE-FLUSH-FREQUENCY finding (a bounded AIRA-259 improvement; VERIFIED against source)
+
+Why only 792/7,345 (≈11%) peaks were in the trace at the stop: the AIRA-259 per-worker Gantt
+trace accumulates spans in the SUPERVISOR's memory (`_record_worker_trace` appends on each
+worker retirement, `supervisor.py:2174`) but `_emit_worker_trace()` writes
+`aitest-trace-<pid>.json` ONLY ONCE, at `run()`'s end (`supervisor.py:3384`). So a supervisor
+stopped mid-run emits NOTHING; the 792 spans are from supervisor(s) that COMPLETED before the
+stop. The per-worker `worker-<pid>.tsv` files survive a mid-run stop because each WORKER writes
+its own tsv from inside the worker process on sample/exit (`worker.py:321`), independent of
+supervisor completion — hence 7,345 tsvs vs 792 trace-spans.
+
+FIX (candidate, low-priority, HELD): flush the trace INCREMENTALLY, not only at run-end. The
+Chrome Trace JSON is a single array (NOT append-friendly), so the strategy matters: (a) rewrite
+the whole JSON per retirement = O(n²), bad at 7,345; (b) flush every K retirements = bounded
+loss ≤K; (c) per-span JSONL / per-worker span files merged at emit = naturally incremental (the
+tsv model) — LEAN (c). Value: an expensive measurement run that's cost-stopped mid-way still
+yields the full per-test set instead of ~11%. Bounded aitest change; surfaced to the owner as a
+low-priority enhancement (not part of AIRA-261; owner's greenlight to build).
+
 ## Requesters / provenance
 
 Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
