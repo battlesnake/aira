@@ -4,7 +4,8 @@
 
 HELD pending owner sign-off. Three aitest worker-model design inputs from the owner
 (relayed by deploy out of the Run #1 CPU-scaling analysis — the engine leg runs at
-~43% parallel efficiency; fail-fast marker also wanted by speed). Captured together
+~43% parallel efficiency; fail-fast marker also wanted for deploy's selfcheck fold — see the
+Input 3 reattribution note). Captured together
 so the eventual cycle starts from a verified model, not the mis-statements the raw
 asks contained. The sizing/prewarm decisions are TRACE-FIRST: gated on the AIRA-259
 per-worker trace (deploy's Run #2) so respawn overhead + the concurrency↔churn trade
@@ -58,12 +59,15 @@ ci-shim generous sizing is safer (no cgroup kill; only the container OOM backsto
 
 A pytest marker (read at collection exactly like `@aira_mem` via `get_closest_marker`)
 such that a marked pool member's FAILURE aborts the pool immediately — stop admitting,
-kill live workers, exit with a DISTINCT fail-fast code. Use case (speed): fold the
-merge-gate selfcheck into the ONE parallel leg-branch stage while the machinery
-self-checks keep their fail-fast property (a broken gate aborts instead of running the
-full branch). **SEAM:** aitest = pool-abort + distinct exit code (THIS ticket / mine);
-the gate/make orchestration seeing that exit and aborting the parallel branch instead
-of `-k` keep-going = speed's. The aitest side is bounded (marker + abort control points
+kill live workers, exit with a DISTINCT fail-fast code. **REATTRIBUTION (2026-09-18, speed):
+this is DEPLOY's build, not speed's — the owner reassigned the gate-parallelism finish-work to
+deploy on 2026-09-15 (part of deploy's leaf-confine end-state); speed GUARDIAN-REVIEWS it. The
+near-term interim (cheap serial fail-fast prefix) is also deploy's to land, not a speed
+interim.** Use case (deploy's selfcheck fold): fold the merge-gate selfcheck into the ONE
+parallel leg-branch stage while the machinery self-checks keep their fail-fast property (a
+broken gate aborts instead of running the full branch). **SEAM:** aitest = pool-abort +
+distinct exit code (THIS ticket / mine); the gate/make orchestration seeing that exit and
+aborting the parallel branch instead of `-k` keep-going = DEPLOY's. The aitest side is bounded (marker + abort control points
 the supervisor already has; not a hot-path cost). OPEN QUESTION for the cycle: is
 folding selfcheck into the pool worth the pool-abort feature + gate coordination, vs
 keeping selfcheck as a separate lightweight fail-fast pre-stage (status quo)?
@@ -510,5 +514,7 @@ low-priority enhancement (not part of AIRA-261; owner's greenlight to build).
 ## Requesters / provenance
 
 Owner (via deploy), out of the Run #1 16/32/64 CPU-scaling analysis + the Run #2 trace.
-Fail-fast marker also wanted by speed (owns the selfcheck relocation). Trace-first
-sequencing for inputs 1+2 was on deploy's AIRA-259 Run #2 — now delivered.
+Fail-fast marker wanted for DEPLOY's selfcheck fold — deploy owns the gate-parallelism
+finish-work / leaf-confine end-state (reassigned from speed by the owner 2026-09-15; speed
+guardian-reviews; corrected 2026-09-18). Trace-first sequencing for inputs 1+2 was on deploy's
+AIRA-259 Run #2 — now delivered.
