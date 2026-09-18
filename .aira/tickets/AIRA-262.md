@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-262","project":"aira","title":"aitest fail-fast leg marker — pool-abort + distinct exit code on a marked test's failure","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.18","labels":["aitest"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-262","project":"aira","title":"aitest fail-fast leg marker — pool-abort + distinct exit code on a marked test's failure","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.18","labels":["aitest"],"hold":false,"relations":[]}
 ---
 
 # aitest fail-fast leg marker — pool-abort + distinct exit code
