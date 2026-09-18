@@ -57,6 +57,15 @@ def pytest_configure(config):
         "(LPT) — ordering ONLY: it reserves nothing, charges no ledger, never changes a "
         "verdict",
     )
+    # AIRA-262: register aira_failfast (a PRESENCE marker — no argument), same
+    # early-registration reason as aira_mem/aira_cpu/aira_time.
+    config.addinivalue_line(
+        "markers",
+        "aira_failfast: marks a test as a fail-fast leg — if it FAILS (or errors, or its "
+        "worker crashes out and exhausts its one retry) the aitest pool ABORTS at once "
+        "(kills live workers, stops dispatch) and the run exits with a DISTINCT code a "
+        "gate keys on to abort the branch. Presence only; any argument is ignored",
+    )
     workers_option = config.getoption("aitest_workers")
     if workers_option is None:
         return
@@ -204,6 +213,23 @@ def _aira_time_for_item(item, default):
     return value, None
 
 
+def _aira_failfast_for_item(item):
+    """True iff this collected item carries an @aira_failfast marker. Presence
+    only — no positional argument, so unlike _aira_mem/cpu/time_for_item there is
+    no grammar to validate and no (value, warning) pair: any argument is ignored."""
+    return item.get_closest_marker("aira_failfast") is not None
+
+
+# AIRA-262: the process exit code an aira_failfast abort returns. Distinct from
+# pytest's own ExitCodes (0 OK / 1 TESTS_FAILED / 2 INTERRUPTED / 3
+# INTERNAL_ERROR / 4 USAGE_ERROR / 5 NO_TESTS_COLLECTED), from a normal
+# test-failure 1, from shell 126/127, and from signal-terminated 128+N — so a
+# gate can tell "a fail-fast leg failed" apart from any ordinary failure. deploy
+# keys on this exact value (PROPOSED — to be confirmed with deploy in the release
+# notification; the constant, not a magic literal, is the single source of truth).
+_AIRA_FAILFAST_EXIT_CODE = 42
+
+
 def pytest_runtestloop(session):
     """Slice 1 activation: when --aitest-workers is set, replace pytest's
     default per-item loop with the Supervisor-driven fork+admission pool.
@@ -279,7 +305,32 @@ def pytest_runtestloop(session):
     # reads the failure total. Nothing is recomputed there: one count reported
     # in two places, which is why the two lines can never contradict each other.
     session.config.stash[_UNEVALUATED_COUNT_KEY] = unevaluated
+    if supervisor.failfast_triggered is not None:
+        # AIRA-262: a fail-fast leg did not pass and the pool was aborted mid-run.
+        # Every un-run (and killed-in-flight) test became a synthesized unevaluated
+        # above; print one plain line naming the tripping leg and that count, HERE
+        # where the honest word lives. The DISTINCT exit code is applied in
+        # pytest_sessionfinish below, NOT via pytest.exit(returncode=N): an exit
+        # code outside pytest's own 0-5 makes _pytest/terminal.py SKIP the whole
+        # terminal summary (the tripping test's traceback, the "short test summary
+        # info", and the AIRA-161 unevaluated explainer all vanish -- measured, 9.0.3).
+        # Setting session.exitstatus in sessionfinish instead lets the summary run
+        # (the reporter still sees exitstatus=1, printed in full) and wrap_session
+        # returns the mutated session.exitstatus after the hook (main.py: `return
+        # session.exitstatus`), so the process still exits with the distinct code.
+        print("aitest: fail-fast abort by %s; %d test(s) unevaluated" % (supervisor.failfast_triggered, unevaluated))
+        session.config.stash[_FAILFAST_TRIGGERED_KEY] = supervisor.failfast_triggered
     return True
+
+
+def pytest_sessionfinish(session):
+    """AIRA-262: apply the distinct fail-fast exit code, if a marked leg tripped
+    the pool abort. Runs in wrap_session's `finally` AFTER the terminal summary
+    (which sees the ordinary exitstatus=1 and prints in full); wrap_session then
+    returns this mutated session.exitstatus as the process code. See the note in
+    pytest_runtestloop for why this is not pytest.exit(returncode=N)."""
+    if session.config.stash.get(_FAILFAST_TRIGGERED_KEY, None) is not None:
+        session.exitstatus = _AIRA_FAILFAST_EXIT_CODE
 
 
 # Set only by pytest_runtestloop above, and only when the pool actually ran.
@@ -288,6 +339,11 @@ def pytest_runtestloop(session):
 # session's count into the outer session's summary. StashKey is pytest's own
 # public, collision-free way to attach plugin state to a Config.
 _UNEVALUATED_COUNT_KEY = pytest.StashKey()
+
+# AIRA-262: set by pytest_runtestloop to the nodeid of the marked leg that tripped
+# the fail-fast abort; read by pytest_sessionfinish to apply the distinct exit
+# code. Per-Config for the same nested-session reason as the count key above.
+_FAILFAST_TRIGGERED_KEY = pytest.StashKey()
 
 # Why an unevaluated result is reported as a failure at all, and what to do
 # about it -- stated once, next to the count, rather than left to be inferred

@@ -909,6 +909,13 @@ class Supervisor:
         # AIRA-261 Phase B: nodeid -> relative scheduling-cost rank (default 1), built in
         # collect(); used only to order the ready-queue pick (LPT). Empty until collect() runs.
         self.time_cost = {}
+        # AIRA-262: nodeids carrying @aira_failfast (built in collect()), and the nodeid of the
+        # FIRST such leg that did not pass -- a failed/errored result, or a crash that exhausted
+        # its one retry -- which trips the pool abort. failfast_triggered is PUBLIC:
+        # pytest_runtestloop reads it to return the distinct fail-fast exit code. None until a
+        # marked leg trips.
+        self._failfast = set()
+        self.failfast_triggered = None
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -1135,13 +1142,19 @@ class Supervisor:
         # nodeids take AIRA_AITEST_DEFAULT_BYTES (256 MiB starting point; v7-4 sets
         # it). Local import mirrors _env_bytes: __init__ imports Supervisor only
         # inside a function, so the package is fully initialised here.
-        from aitest import _aira_mem_bytes_for_item, _aira_cpu_cores_for_item, _aira_time_for_item
+        from aitest import (
+            _aira_mem_bytes_for_item,
+            _aira_cpu_cores_for_item,
+            _aira_time_for_item,
+            _aira_failfast_for_item,
+        )
         default_bytes = _env_bytes("AIRA_AITEST_DEFAULT_BYTES", _DEFAULT_ANNOTATION_BYTES)
         mem_map = {}
         annotated = set()
         reservation_need = {}
         cpu_need = {}
         time_cost = {}
+        failfast = set()
         for item in items:
             value, warning = _aira_mem_bytes_for_item(item, default_bytes)
             mem_map[item.nodeid] = value
@@ -1178,11 +1191,15 @@ class Supervisor:
             if time_warning is not None:
                 sys.stderr.write(time_warning)
             time_cost[item.nodeid] = time_value
+            # AIRA-262: presence-only -- a marked leg's failure trips the pool abort.
+            if _aira_failfast_for_item(item):
+                failfast.add(item.nodeid)
         self.aira_mem_bytes = mem_map
         self._annotated = annotated
         self.reservation_need = reservation_need
         self.cpu_need = cpu_need
         self.time_cost = time_cost
+        self._failfast = failfast
 
     def next_nodeid(self):
         if not self.queue:
@@ -2056,6 +2073,15 @@ class Supervisor:
         while True:
             crashed_this_pass = False
             for pid, state in list(self.workers.items()):
+                # AIRA-262: once a marked leg has tripped the fail-fast abort,
+                # dispatch NO further work. Checked INSIDE the loop (not just at
+                # entry) because the BrokenPipeError give-up branch below can set
+                # the flag mid-pass -- otherwise the remaining idle workers in this
+                # same snapshot would still be handed queued nodeids (that the abort
+                # is about to kill), and run()'s abort would wait a full select
+                # cycle to fire.
+                if self.failfast_triggered is not None:
+                    return
                 if state["in_flight"] is not None:
                     continue
                 reservation = state.get("reservation")
@@ -2704,6 +2730,14 @@ class Supervisor:
         verdict, daemon left healthy); WorkerAdmitUnavailable/WorkerPlacementFailed
         fall back to an unconfined worker -- the only two classes that mean the
         daemon path is genuinely not going to work."""
+        # AIRA-262 fail-fast: the pool is aborting; never spawn a replacement. A
+        # recycle/crash in the same _service_ready_workers pass reaches here BEFORE
+        # run() regains control to see the flag, and on the LAST worker the
+        # empty-pool branch below is a BLOCKING claim -- on a saturated daemon the
+        # "fail-fast" would then stall indefinitely admitting a worker it is about
+        # to kill. This guard is the seam that makes the run()-level abort prompt.
+        if self.failfast_triggered is not None:
+            return
         if not self.queue:
             return
         if self.daemon_available:
@@ -2891,7 +2925,11 @@ class Supervisor:
             for event in materialized:
                 self._replay_event(event)
             state["pending_events"] = []
-            self.results[nodeid] = outcome
+            # AIRA-262: _record_result also trips the fail-fast abort when this
+            # nodeid is a marked leg that did not pass. Set BEFORE the recycle
+            # branch below so its _replace_worker sees the flag and declines to
+            # spawn; run() checks the flag after this drain and aborts the pool.
+            self._record_result(nodeid, outcome)
             state["in_flight"] = None
             if recycling:
                 self._retire_worker(pid, state)
@@ -3040,6 +3078,50 @@ class Supervisor:
             self.config.hook.pytest_runtest_logfinish(nodeid=nodeid, location=location)
             self._replayed_nodeids.add(nodeid)
 
+    def _record_result(self, nodeid, outcome):
+        """Record a worker's terminating outcome for nodeid, and (AIRA-262) trip
+        the fail-fast abort if nodeid is a marked leg that did not pass. "error"
+        counts (a setup/teardown failure is still "did not pass"); "passed" and
+        "skipped" never trip; an unmarked failure never trips. First-write-wins:
+        the FIRST tripping leg names the abort, so a second marked failure in the
+        same drain pass never overwrites it."""
+        self.results[nodeid] = outcome
+        if (
+            self.failfast_triggered is None
+            and outcome in ("failed", "error")
+            and nodeid in self._failfast
+        ):
+            self.failfast_triggered = nodeid
+
+    def _abort_pool(self):
+        """AIRA-262: a fail-fast leg did not pass -- tear the whole pool down at
+        once. SIGKILL each live worker UP FRONT: an in-flight worker is busy inside
+        a test and never reads its dispatch pipe, so _retire_worker's dispatch-pipe
+        close cannot stop it and _reap_child would wait the full reap timeout (and
+        hold the lease charged) before escalating to SIGKILL. Killing first makes
+        each _retire_worker reap immediately, then release the lease (relay
+        stdin.close) via the very crash-funnel every retirement already uses -- so
+        this adds no new teardown path, only a prompt kill in front of it. The
+        snapshot list() lets _retire_worker's `del self.workers[pid]` run safely
+        under iteration."""
+        for pid, state in list(self.workers.items()):
+            # AIRA-262: give the KILLED in-flight test a self-explaining reason, so
+            # its synthesized unevaluated report (junit + terminal) says WHY it has
+            # no result rather than the generic "no worker ever reported" default.
+            inflight = state.get("in_flight")
+            if inflight is not None:
+                self._unevaluated_reasons.setdefault(
+                    inflight,
+                    "killed by the fail-fast abort (tripped by %s)" % self.failfast_triggered,
+                )
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                # Already gone (reaped/exited); retirement below still reaps and
+                # releases. Never abort the abort over a kill of a dead pid.
+                pass
+            self._retire_worker(pid, state)
+
     def _handle_worker_exit(self, pid, state):
         """A worker stopped reporting without a terminating record for its
         in-flight nodeid: a crash (kernel OOM, host watchdog, any non-reporting
@@ -3067,6 +3149,15 @@ class Supervisor:
         if nodeid is not None and not self.requeue_once(nodeid):
             self.results[nodeid] = "unevaluated"
             self._unevaluated_reasons.setdefault(nodeid, death)
+            # AIRA-262: a marked leg whose worker crashed out (OOM/segfault) and
+            # exhausted its one requeue never emitted a result line, so
+            # _record_result never saw it -- but "the leg did not pass" is the
+            # fail-fast contract, so trip the abort here too. BEFORE _replace_worker
+            # below, which the flag then stops from spawning (a crash of the LAST
+            # worker would otherwise hit the blocking empty-pool claim). First-write
+            # wins, matching _record_result.
+            if self.failfast_triggered is None and nodeid in self._failfast:
+                self.failfast_triggered = nodeid
         self._replace_worker()
 
     def _describe_worker_death(self, pid, state):
@@ -3325,6 +3416,15 @@ class Supervisor:
                 self._spawn_fallback_worker()
         self._dispatch_to_idle_workers()
         while self.workers:
+            # AIRA-262: catch a fail-fast trip that fired late in the PREVIOUS
+            # iteration -- during _dispatch_to_idle_workers' BrokenPipe give-up or
+            # the end-of-queue stop broadcast -- and abort here, before this
+            # iteration's blocking select(), rather than waiting a full cycle. The
+            # post-service check below handles the common (result-line) trip
+            # immediately; this one bounds the abort for every other trip site.
+            if self.failfast_triggered is not None:
+                self._abort_pool()
+                break
             result_fd_owners = {
                 state["result_fd"]: (pid, state) for pid, state in self.workers.items()
             }
@@ -3364,6 +3464,14 @@ class Supervisor:
             if not ready:
                 continue
             self._service_ready_workers(ready, result_fd_owners, pidfd_owners)
+            if self.failfast_triggered is not None:
+                # AIRA-262: a marked leg did not pass during that drain. Abort the
+                # pool (kill live workers, release their leases) and stop -- no
+                # further dispatch, no growth. BEFORE _dispatch_to_idle_workers so
+                # nothing new starts. The post-loop tail below then synthesizes the
+                # un-run queue (and any killed in-flight test) as honest unevaluated.
+                self._abort_pool()
+                break
             self._dispatch_to_idle_workers()
             if not self.queue and all(state["in_flight"] is None for state in self.workers.values()):
                 for pid, state in list(self.workers.items()):
