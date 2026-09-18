@@ -150,6 +150,46 @@ just spawned; `_retire_worker` on a SIGKILLed worker with a live grant (peak
 read before relay close still holds). Standing: what's removable; does the
 crash-path decision match the ticket.
 
+## Build + review record
+
+Built TDD (Opus), reviewed by Fable in a detached worktree. **Fable BLOCK →
+all addressed; full aitest suite 328 passed, exit 0; three porous-hop mutations
+re-confirmed to red.**
+
+- **P1 (BLOCK) — the distinct exit code was hiding WHY it fired.**
+  `pytest.exit(returncode=42)` makes pytest's terminal reporter SKIP the whole
+  summary (the tripping test's traceback, the short-summary, the AIRA-161
+  unevaluated explainer) because 42 is outside its 0–5 range — Fable measured it
+  (marked run → 0 traceback hits vs unmarked → 3; my "sessionfinish still runs"
+  comment was a confident wrong claim about `terminal.py`). **Fix:** stash the
+  tripping nodeid in `pytest_runtestloop`; set `session.exitstatus =
+  _AIRA_FAILFAST_EXIT_CODE` in a new `pytest_sessionfinish`. `wrap_session` hands
+  the reporter the ordinary exitstatus=1 (full summary prints) then returns the
+  mutated `session.exitstatus` — exit 42 WITH the traceback. Regression: the seam
+  test now asserts the tripping test's assertion message reaches the terminal.
+- **Porous hops pinned (mutations that survived the shipped suite):** m4 the
+  run() `_abort_pool()` CALL (a 60s in-flight test must be reaped + lease released
+  on a sibling's failure), m6 crash-path trigger ordering before `_replace_worker`
+  (the no-op stub hid it — record the flag at call time), m7 exit-code
+  distinctness (seam tests import the constant, so 42→1 stayed green — pin the
+  literal). Plus end-to-end Gap-1 (recycling last worker: no respawn) and Gap-2
+  (crash-twice trips / crash-once-then-pass does not) real-fork regressions.
+  Re-confirmed red: m4, m7, and the P1 traceback fix.
+- **Latency (P2):** a give-up trip via `_dispatch_to_idle_workers`' BrokenPipe
+  branch kept dispatching to the other idle workers in the same pass. Guard now
+  checks the flag INSIDE the dispatch loop, and run() re-checks at the top of the
+  loop so any late trip aborts before the next blocking select.
+- **P3s:** killed in-flight tests get a self-explaining unevaluated reason;
+  the plain line says "N unevaluated" not "N not run"; the exit-code comment
+  marks 42 PROPOSED (deploy to confirm), not "confirmed".
+
+**Documented gap (accepted):** a marked leg that never runs — refused admission
+(exceeds ceiling) or a terminal daemon failure draining the queue — is marked
+`unevaluated` WITHOUT tripping, so it exits 1 not 42. That is an infra failure,
+not a leg failure, and a gate still sees non-zero. Kept the two-site detection
+(result-line + crash give-up) over Fable's single-site route to keep the change
+minimal and not expand the trigger to admission-refusal.
+
 ## Provenance
 
 Source design: AIRA-260 Input 3 (fail-fast leg marker), reattributed to
