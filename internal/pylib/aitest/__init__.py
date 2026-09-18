@@ -225,7 +225,8 @@ def _aira_failfast_for_item(item):
 # INTERNAL_ERROR / 4 USAGE_ERROR / 5 NO_TESTS_COLLECTED), from a normal
 # test-failure 1, from shell 126/127, and from signal-terminated 128+N — so a
 # gate can tell "a fail-fast leg failed" apart from any ordinary failure. deploy
-# keys on this exact value (confirmed in the release notification).
+# keys on this exact value (PROPOSED — to be confirmed with deploy in the release
+# notification; the constant, not a magic literal, is the single source of truth).
 _AIRA_FAILFAST_EXIT_CODE = 42
 
 
@@ -306,20 +307,30 @@ def pytest_runtestloop(session):
     session.config.stash[_UNEVALUATED_COUNT_KEY] = unevaluated
     if supervisor.failfast_triggered is not None:
         # AIRA-262: a fail-fast leg did not pass and the pool was aborted mid-run.
-        # Every un-run (and killed-in-flight) test became a synthesized
-        # unevaluated above; print one plain line naming the tripping leg and that
-        # count, HERE where the honest word lives, before ending the session with
-        # the distinct code. pytest.exit(returncode=N) is pytest's documented
-        # mechanism: it sets session.exitstatus = N (the process return), while
-        # pytest_sessionfinish/pytest_terminal_summary still run (they are in
-        # wrap_session's finally), so the summary is not lost.
-        print("aitest: fail-fast abort by %s; %d test(s) not run" % (supervisor.failfast_triggered, unevaluated))
-        pytest.exit(
-            "aira aitest: fail-fast — %s (an @aira_failfast test) did not pass; pool aborted"
-            % supervisor.failfast_triggered,
-            returncode=_AIRA_FAILFAST_EXIT_CODE,
-        )
+        # Every un-run (and killed-in-flight) test became a synthesized unevaluated
+        # above; print one plain line naming the tripping leg and that count, HERE
+        # where the honest word lives. The DISTINCT exit code is applied in
+        # pytest_sessionfinish below, NOT via pytest.exit(returncode=N): an exit
+        # code outside pytest's own 0-5 makes _pytest/terminal.py SKIP the whole
+        # terminal summary (the tripping test's traceback, the "short test summary
+        # info", and the AIRA-161 unevaluated explainer all vanish -- measured, 9.0.3).
+        # Setting session.exitstatus in sessionfinish instead lets the summary run
+        # (the reporter still sees exitstatus=1, printed in full) and wrap_session
+        # returns the mutated session.exitstatus after the hook (main.py: `return
+        # session.exitstatus`), so the process still exits with the distinct code.
+        print("aitest: fail-fast abort by %s; %d test(s) unevaluated" % (supervisor.failfast_triggered, unevaluated))
+        session.config.stash[_FAILFAST_TRIGGERED_KEY] = supervisor.failfast_triggered
     return True
+
+
+def pytest_sessionfinish(session):
+    """AIRA-262: apply the distinct fail-fast exit code, if a marked leg tripped
+    the pool abort. Runs in wrap_session's `finally` AFTER the terminal summary
+    (which sees the ordinary exitstatus=1 and prints in full); wrap_session then
+    returns this mutated session.exitstatus as the process code. See the note in
+    pytest_runtestloop for why this is not pytest.exit(returncode=N)."""
+    if session.config.stash.get(_FAILFAST_TRIGGERED_KEY, None) is not None:
+        session.exitstatus = _AIRA_FAILFAST_EXIT_CODE
 
 
 # Set only by pytest_runtestloop above, and only when the pool actually ran.
@@ -328,6 +339,11 @@ def pytest_runtestloop(session):
 # session's count into the outer session's summary. StashKey is pytest's own
 # public, collision-free way to attach plugin state to a Config.
 _UNEVALUATED_COUNT_KEY = pytest.StashKey()
+
+# AIRA-262: set by pytest_runtestloop to the nodeid of the marked leg that tripped
+# the fail-fast abort; read by pytest_sessionfinish to apply the distinct exit
+# code. Per-Config for the same nested-session reason as the count key above.
+_FAILFAST_TRIGGERED_KEY = pytest.StashKey()
 
 # Why an unevaluated result is reported as a failure at all, and what to do
 # about it -- stated once, next to the count, rather than left to be inferred

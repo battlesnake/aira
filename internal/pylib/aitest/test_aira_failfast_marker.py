@@ -18,12 +18,14 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
 import aitest.worker as worker_module
 from aitest import _AIRA_FAILFAST_EXIT_CODE, _aira_failfast_for_item
 from aitest.supervisor import Supervisor
+from aitest.test_supervisor import _write_stub
 
 
 def _getitems(pytester, source):
@@ -265,7 +267,7 @@ def test_marked_failure_aborts_with_the_distinct_code(pytester):
     completed = _run(pytester, '''
         import pytest
         @pytest.mark.aira_failfast
-        def test_crit(): assert False
+        def test_crit(): assert False, "CRIT-SENTINEL-TRACEBACK"
         def test_a(): pass
         def test_b(): pass
         def test_c(): pass
@@ -273,6 +275,12 @@ def test_marked_failure_aborts_with_the_distinct_code(pytester):
     out = completed.stdout + completed.stderr
     assert completed.returncode == _AIRA_FAILFAST_EXIT_CODE, out
     assert "fail-fast abort by" in out and "test_crit" in out, out
+    # The distinct exit code must NOT cost the terminal diagnostics: pytest's
+    # terminal reporter skips the whole summary (traceback + short summary) for an
+    # exit code outside 0-5, so a pytest.exit(returncode=42) would suppress the
+    # tripping test's traceback. The sessionfinish mechanism keeps it -- pin that
+    # the assertion message actually reaches the terminal.
+    assert "CRIT-SENTINEL-TRACEBACK" in out, out
     # The run() abort stops dispatch: the tail must be UNEVALUATED, not passed.
     # (This pins the run()-level abort specifically -- remove it and test_a runs
     # to "passed", reding here even though the exit code would still be 42.)
@@ -300,3 +308,203 @@ def test_marked_passing_test_does_not_abort(pytester):
     out = completed.stdout + completed.stderr
     assert completed.returncode == 0, out
     assert "fail-fast abort" not in out, out
+
+
+# --- real-fork regressions (Fable build-review) ----------------------------
+# These drive the REAL run() dispatch loop over stub-admitted forked workers, so
+# they pin the CALL SITES the isolated unit tests above cannot: the run()-level
+# _abort_pool() call, the recycle/crash paths through _replace_worker's guard, and
+# the abort's prompt kill of a live in-flight worker.
+
+def _stub_admit(tmp_path, monkeypatch, calls_name="admit-calls"):
+    """Force the daemon-backed admission path with a stub `aira worker-admit` that
+    grants immediately and holds its stdin open (the lease). Every grant appends to
+    the returned calls-file, so a test can count how many workers were admitted."""
+    outer = tmp_path / "outer"
+    outer.mkdir(exist_ok=True)
+    admit_calls = tmp_path / calls_name
+    admit = _write_stub(tmp_path / ("worker-admit-" + calls_name), f"""
+import os, sys
+open({str(admit_calls)!r}, "a").write("x")
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    return admit_calls
+
+
+def test_abort_kills_inflight_worker_and_releases_its_lease(tmp_path, monkeypatch, pytester):
+    # Pins the run()-level _abort_pool() CALL: a live worker running a 60s test
+    # must be killed (reaped) and its relay/lease released the moment a sibling
+    # marked leg fails -- not left orphaned. Deleting the call in run() leaves the
+    # unit _abort_pool test green but reds THIS.
+    _stub_admit(tmp_path, monkeypatch)
+    items = pytester.getitems("""
+        import time, pytest
+        def test_slow():
+            time.sleep(60)
+        @pytest.mark.aira_failfast
+        def test_crit():
+            time.sleep(0.5)
+            assert False
+    """)
+    by_name = {item.name: item for item in items}
+    sup = Supervisor()
+    sup.collect(items)
+    seen = []
+    original_abort = sup._abort_pool
+
+    def snapshot_then_abort():
+        seen.extend((pid, dict(state)) for pid, state in sup.workers.items())
+        return original_abort()
+
+    monkeypatch.setattr(sup, "_abort_pool", snapshot_then_abort)
+    started = time.monotonic()
+    results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+    wall = time.monotonic() - started
+    assert wall < 15, "abort was not prompt: %.1fs" % wall
+    assert sup.failfast_triggered == by_name["test_crit"].nodeid
+    assert results[by_name["test_crit"].nodeid] == "failed"
+    assert results.get(by_name["test_slow"].nodeid, "unevaluated") == "unevaluated"
+    assert len(seen) >= 1, "no live worker was in the pool at abort time"
+    inflight = [s for _, s in seen if s["in_flight"] == by_name["test_slow"].nodeid]
+    assert inflight, "the slow test was not in flight at abort time: %r" % [s["in_flight"] for _, s in seen]
+    for pid, state in seen:
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)  # reaped: no longer our child
+        relay = state["admit_process"]
+        assert relay is not None and relay.poll() is not None, "relay still alive (lease not released) for pid %d" % pid
+    assert sup.workers == {}
+
+
+def test_crash_giveup_trips_before_replace_worker(monkeypatch):
+    # ORDERING pin: the crash-path trip must PRECEDE _replace_worker so its guard
+    # sees the flag (else a last-worker crash hits the blocking empty-pool claim).
+    # The unit crash test stubs _replace_worker to a no-op, so moving the trip
+    # after the call is invisible to it -- this records the flag AT call time.
+    sup = Supervisor()
+    sup._failfast = {"crit"}
+    seen = []
+    monkeypatch.setattr(sup, "_describe_worker_death", lambda pid, state: "died")
+    monkeypatch.setattr(sup, "_retire_worker", lambda pid, state: None)
+    monkeypatch.setattr(sup, "_replace_worker", lambda: seen.append(sup.failfast_triggered))
+    monkeypatch.setattr(sup, "requeue_once", lambda nodeid: False)
+    sup._handle_worker_exit(1234, {"in_flight": "crit"})
+    assert seen == ["crit"], "flag must already be set when _replace_worker runs"
+
+
+def test_exit_code_is_the_documented_literal_and_distinct():
+    # Distinctness IS the feature; the seam tests import the constant, so
+    # `_AIRA_FAILFAST_EXIT_CODE = 1` would leave them green. Pin the literal.
+    assert _AIRA_FAILFAST_EXIT_CODE == 42
+    assert _AIRA_FAILFAST_EXIT_CODE not in range(0, 6), "must differ from pytest's own ExitCodes"
+    assert _AIRA_FAILFAST_EXIT_CODE not in (126, 127) and _AIRA_FAILFAST_EXIT_CODE < 128
+
+
+def test_recycling_last_worker_does_not_respawn_after_trip(tmp_path, monkeypatch, pytester):
+    # Gap 1, end-to-end through _drain_worker's RECYCLE branch (not the unit guard):
+    # a marked failure on a recycling last worker must not admit a replacement.
+    admit_calls = _stub_admit(tmp_path, monkeypatch)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")  # recycle after every test
+    items = pytester.getitems("""
+        import pytest
+        @pytest.mark.aira_failfast
+        def test_crit():
+            assert False
+        def test_a(): pass
+        def test_b(): pass
+    """)
+    by_name = {item.name: item for item in items}
+    sup = Supervisor()
+    sup.collect(items)
+    results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    assert sup.failfast_triggered == by_name["test_crit"].nodeid
+    assert results[by_name["test_crit"].nodeid] == "failed"
+    assert results.get(by_name["test_a"].nodeid, "unevaluated") == "unevaluated"
+    assert admit_calls.read_text().count("x") == 1, "a replacement was admitted after the trip"
+
+
+def test_marked_test_crashing_twice_trips_and_aborts(tmp_path, monkeypatch, pytester):
+    # Gap 2, end-to-end: a marked test whose worker crashes out and exhausts its
+    # one requeue trips fail-fast (lands unevaluated, never a result line). Exactly
+    # initial + one retry admitted, never a third after the give-up.
+    admit_calls = _stub_admit(tmp_path, monkeypatch)
+    items = pytester.getitems("""
+        import os, pytest
+        @pytest.mark.aira_failfast
+        def test_crit():
+            os._exit(137)
+        def test_a(): pass
+        def test_b(): pass
+    """)
+    by_name = {item.name: item for item in items}
+    sup = Supervisor()
+    sup.collect(items)
+    results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    crit = by_name["test_crit"].nodeid
+    assert sup.failfast_triggered == crit
+    assert results[crit] == "unevaluated"
+    assert sup.attempts[crit] == 2
+    assert results.get(by_name["test_a"].nodeid, "unevaluated") == "unevaluated"
+    assert admit_calls.read_text().count("x") == 2, "expected initial + one retry worker only"
+
+
+def test_marked_test_crashing_once_then_passing_does_not_trip(tmp_path, monkeypatch, pytester):
+    # Gap 2 negative: a single transient crash retries; the retry passing must NOT
+    # abort the branch.
+    _stub_admit(tmp_path, monkeypatch)
+    flag = tmp_path / "crashed-once"
+    items = pytester.getitems(f"""
+        import os, pytest
+        @pytest.mark.aira_failfast
+        def test_crit():
+            if not os.path.exists({str(flag)!r}):
+                open({str(flag)!r}, "w").close()
+                os._exit(137)
+        def test_a(): pass
+    """)
+    by_name = {item.name: item for item in items}
+    sup = Supervisor()
+    sup.collect(items)
+    results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    assert sup.failfast_triggered is None
+    assert results[by_name["test_crit"].nodeid] == "passed"
+    assert results[by_name["test_a"].nodeid] == "passed"
+
+
+def test_dispatch_stops_the_moment_a_trip_fires_in_its_own_pass(monkeypatch):
+    # Pins the _dispatch_to_idle_workers guard: a give-up trip reached via the
+    # BrokenPipeError branch (worker 1) must stop dispatch to the OTHER idle worker
+    # (worker 2) IN THE SAME PASS -- else the abort waits a full select cycle and
+    # wastes a dispatch. Remove the in-loop guard and worker 2 gets "other".
+    sup = Supervisor()
+    sup._failfast = {"crit"}
+    sup.queue = ["crit", "other"]
+    sup.attempts = {"crit": 1}  # this dispatch is crit's SECOND attempt
+    r1, w1 = os.pipe()
+    os.close(r1)  # read end closed -> the dispatch write raises BrokenPipeError
+    dead_write = os.fdopen(w1, "w")
+    r2, w2 = os.pipe()
+    live_write = os.fdopen(w2, "w")
+    sup.workers = {
+        1: {"in_flight": None, "reservation": None, "dispatch_write": dead_write, "result_fd": -1, "admit_process": None, "pidfd": None},
+        2: {"in_flight": None, "reservation": None, "dispatch_write": live_write, "result_fd": -1, "admit_process": None, "pidfd": None},
+    }
+    monkeypatch.setattr(sup, "_describe_worker_death", lambda pid, state: "died")
+    monkeypatch.setattr(sup, "_retire_worker", lambda pid, state: sup.workers.pop(pid))
+    monkeypatch.setattr(sup, "_replace_worker", lambda: None)
+    try:
+        sup._dispatch_to_idle_workers()
+    finally:
+        os.close(r2)
+        try:
+            live_write.close()
+        except OSError:
+            pass
+    assert sup.failfast_triggered == "crit"
+    assert sup.workers[2]["in_flight"] is None, "no work may be dispatched after the trip"

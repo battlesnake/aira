@@ -2073,6 +2073,15 @@ class Supervisor:
         while True:
             crashed_this_pass = False
             for pid, state in list(self.workers.items()):
+                # AIRA-262: once a marked leg has tripped the fail-fast abort,
+                # dispatch NO further work. Checked INSIDE the loop (not just at
+                # entry) because the BrokenPipeError give-up branch below can set
+                # the flag mid-pass -- otherwise the remaining idle workers in this
+                # same snapshot would still be handed queued nodeids (that the abort
+                # is about to kill), and run()'s abort would wait a full select
+                # cycle to fire.
+                if self.failfast_triggered is not None:
+                    return
                 if state["in_flight"] is not None:
                     continue
                 reservation = state.get("reservation")
@@ -3096,6 +3105,15 @@ class Supervisor:
         snapshot list() lets _retire_worker's `del self.workers[pid]` run safely
         under iteration."""
         for pid, state in list(self.workers.items()):
+            # AIRA-262: give the KILLED in-flight test a self-explaining reason, so
+            # its synthesized unevaluated report (junit + terminal) says WHY it has
+            # no result rather than the generic "no worker ever reported" default.
+            inflight = state.get("in_flight")
+            if inflight is not None:
+                self._unevaluated_reasons.setdefault(
+                    inflight,
+                    "killed by the fail-fast abort (tripped by %s)" % self.failfast_triggered,
+                )
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
@@ -3398,6 +3416,15 @@ class Supervisor:
                 self._spawn_fallback_worker()
         self._dispatch_to_idle_workers()
         while self.workers:
+            # AIRA-262: catch a fail-fast trip that fired late in the PREVIOUS
+            # iteration -- during _dispatch_to_idle_workers' BrokenPipe give-up or
+            # the end-of-queue stop broadcast -- and abort here, before this
+            # iteration's blocking select(), rather than waiting a full cycle. The
+            # post-service check below handles the common (result-line) trip
+            # immediately; this one bounds the abort for every other trip site.
+            if self.failfast_triggered is not None:
+                self._abort_pool()
+                break
             result_fd_owners = {
                 state["result_fd"]: (pid, state) for pid, state in self.workers.items()
             }
