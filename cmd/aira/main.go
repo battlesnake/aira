@@ -1498,6 +1498,20 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", err)
 		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
+	// AIRA-268. --vram declares the GPU VRAM the job needs; the CLI TRANSCRIBES it
+	// (size parser, same language as --memory-max), the daemon gates admission on
+	// it. Absent → 0 (not a GPU job, ungated).
+	var vramBytes int64
+	if raw, present := options["vram"]; present {
+		vramBytes, err = runner.ParseMemorySize(raw)
+		if err != nil || vramBytes < 1<<20 {
+			if err == nil {
+				err = errors.New("must be at least 1MiB")
+			}
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --vram: %v\n", err)
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+	}
 	request := runner.ConfineRequest{
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
 		Owner:         owner,
@@ -1509,7 +1523,8 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		// false and the detached job's stdin is /dev/null, exactly as before.
 		StdinConnect:   options["stdin-connect"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
-		Timeout: jobTimeout, CPUTimeout: jobCPUTimeout,
+		VRAMBytes: vramBytes,
+		Timeout:   jobTimeout, CPUTimeout: jobCPUTimeout,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {

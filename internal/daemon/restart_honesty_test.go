@@ -42,7 +42,7 @@ func TestGrantedEstablishedFalseWhileFrozen(t *testing.T) {
 		path: path, server: server, kick: make(chan struct{}, 1), stop: make(chan struct{}),
 		waiters: []*admitWaiter{seeded},
 	}
-	queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+	queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 	registerAdmitQueue(server, queue)
 
 	established := func() bool {

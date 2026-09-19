@@ -186,6 +186,17 @@ type Server struct {
 	discoverProject        func(context.Context, string) (app.Project, error)
 	adoptRebuild           func(context.Context, *store.Store) error
 	beforeEjectTransaction func()
+	// AIRA-268. VRAM admission state. vramReader is the GPU-memory seam (nil →
+	// readNvidiaSmiVRAM); tests inject a deterministic reader. vramBudgetBytes is
+	// the configured machine-wide VRAM budget (0 → auto-detect = total). vramSnap
+	// is the atomically-published aggregate reading, refreshed off-lock by the
+	// sampler goroutine so the fit never forks nvidia-smi under queue.mu.
+	vramReader        func() (total, free int64, ok bool)
+	vramBudgetBytes   int64
+	vramHeadroom      int64
+	vramStaleness     time.Duration
+	vramSnap          atomic.Pointer[vramSnapshot]
+	vramEverRequested atomic.Bool // set at the first vram>0 enqueue; the sampler forks only after
 }
 
 func NewServer(paths Paths) *Server {
@@ -207,6 +218,16 @@ func NewServer(paths Paths) *Server {
 	}
 	server.projectCond = sync.NewCond(&server.mu)
 	server.confineMode = runner.ConfineModeReal
+	// AIRA-268. The machine-wide VRAM budget is configured via AIRA_VRAM_BUDGET (a
+	// size string, e.g. "14G"), which `aira install` sets in the daemon service.
+	// Absent/unparseable → 0 = auto-detect (the nvidia-smi total). A malformed value
+	// is IGNORED (falls back to auto-detect) rather than fatal — a bad env must not
+	// wedge the daemon.
+	if raw := os.Getenv("AIRA_VRAM_BUDGET"); raw != "" {
+		if budget, err := runner.ParseMemorySize(raw); err == nil && budget > 0 {
+			server.vramBudgetBytes = budget
+		}
+	}
 	return server
 }
 
@@ -417,6 +438,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(scopeReaperDone)
 		s.runScopeReaper(scopeReaperCtx, scopeReapInterval)
 	}()
+	// AIRA-268. The VRAM sampler refreshes the GPU-memory snapshot off-lock so the
+	// admission fit never forks nvidia-smi under queue.mu. It exits on ctx and forks
+	// only after VRAM has actually been requested (a non-GPU box never forks).
+	go s.runVRAMSampler(ctx)
 	watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
 	watchdogDone := make(chan struct{})
 	watchdogRuntimeDeps := watchdogDeps{}

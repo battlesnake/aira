@@ -244,6 +244,7 @@ type Request struct {
 	DelegateRAM           bool      `json:"delegate_ram,omitempty"`
 	ScopeMemoryMax        int64     `json:"scope_memory_max,omitempty"`
 	ScopeMemoryHigh       int64     `json:"scope_memory_high,omitempty"`
+	VRAMBytes             int64     `json:"vram_bytes,omitempty"` // AIRA-268: declared GPU VRAM, 0 = not a GPU job
 	ConfineScopeID        string    `json:"confine_scope_id,omitempty"`
 	ConfineName           string    `json:"confine_name,omitempty"`
 	ConfineOwner          string    `json:"confine_owner,omitempty"`

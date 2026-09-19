@@ -158,7 +158,7 @@ func TestReconnectRaceBothLockOrders(t *testing.T) {
 		}
 		queue.mu.Lock()
 		queue.waiters = append(queue.waiters, filler)
-		queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+		queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 		queue.mu.Unlock()
 
 		// Connection A's EOF arrives BEFORE any re-declare: A is still the current

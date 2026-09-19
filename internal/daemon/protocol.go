@@ -150,8 +150,25 @@ import (
 // re-introducing exactly the CPU oversubscription the reservation prevents. Same atomic
 // reinstall+restart requirement as 6-12; ARDR is sniffed BEFORE the version check, so a
 // suite's held worker leases still re-anchor across the upgrade.
+// ProtocolVersion 14 (was 13): AIRA-268 added `vram` to the confine-admit REQUEST
+// (the declared GPU VRAM, a third conjunctive admission resource). The admit field
+// is OPTIONAL (absent ⇒ 0, not a GPU job, ungated), so the wire shape is purely
+// additive; the bump exists so a NEW client that declares vram is refused LOUDLY by
+// an OLD proto-13 daemon rather than silently admitted ungated, re-introducing
+// exactly the VRAM oversubscription the gate prevents. Same atomic reinstall+restart
+// requirement as 6-13.
+//
+// ARDR (the daemon-restart re-declare frame) does NOT carry vram in this build — a
+// deliberate deferral (AIRA-248). Across a daemon restart a surviving GPU lease
+// re-anchors with vram=0, so the ledger term under-counts until the job would
+// re-declare; the PHYSICAL-FREE-VRAM floor is the sole post-restart protection, and
+// it holds for the common case: an already-running job's VRAM is reflected in
+// nvidia-smi `free`, so the floor still gates new admissions. The narrow gap is a
+// job admitted just before the restart whose VRAM has not yet ramped — accepted as a
+// documented limitation within the reservation model's bounded-over-admit envelope,
+// not silently. Adding VRAMBytes to the frozen ARDR codec closes it if it ever bites.
 const (
-	ProtocolVersion = 13
+	ProtocolVersion = 14
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )
@@ -165,6 +182,13 @@ const (
 	CodeBusy           = "E_DAEMON_BUSY"
 	CodeAdmitTooLarge  = "E_ADMIT_TOO_LARGE"
 	CodeAdmitSaturated = "E_ADMIT_SATURATED"
+	// AIRA-268. VRAM admission refusals, decided synchronously at enqueue (the
+	// ceiling seam is there), never queued. VRAMTooLarge: declared VRAM > the
+	// configured budget (can never fit). VRAMUnavailable: a job declared VRAM but
+	// the GPU could not be read (no GPU / nvidia-smi absent), so admission could
+	// not be evaluated. Both are in the runner's terminal handling (see the rule above).
+	CodeAdmitVRAMTooLarge    = "E_ADMIT_VRAM_TOO_LARGE"
+	CodeAdmitVRAMUnavailable = "E_ADMIT_VRAM_UNAVAILABLE"
 	// CodeAdmitWaitTooLong refuses a requested admission wait above
 	// runner.AdmitWaitCeiling (AIRA-58). It is a DEDICATED code, not CodeProtocol,
 	// because the runner routes every code it does not explicitly recognise

@@ -742,8 +742,9 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 		// AIRA-138 adds --timeout and --cpu-timeout to the usage line. AIRA-196 adds
 		// --stdin-connect, which is meaningful only with --detach. AIRA-222 adds
 		// --require-admission (fail closed when the job was not admitted). S13 removed
-		// --admit-timeout (the admission wait no longer self-expires).
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--timeout D] [--cpu-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
+		// --admit-timeout (the admission wait no longer self-expires). AIRA-268 adds
+		// --vram (declared GPU VRAM; the daemon gates admission on real free VRAM).
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--timeout D] [--cpu-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}
