@@ -19,15 +19,22 @@ func TestPeakRSSHistoryFiltersAndAggregatesRealProjection(t *testing.T) {
 	}
 	positive100, positive250, zero := int64(100), int64(250), int64(0)
 	partial999, partial888, partial777 := int64(999), int64(888), int64(777)
+	failedPeak, nullExitPeak := int64(5000), int64(6000)
+	exit0, exit1 := 0, 1
 	records := []RunRecord{
-		{ID: "RUN-1", Status: StatusExited, PeakRSS: &positive100, ResourceSignature: "sig"},
+		{ID: "RUN-1", Status: StatusExited, PeakRSS: &positive100, ExitCode: &exit0, ResourceSignature: "sig"},
 		{ID: "RUN-2", Status: StatusOOMKilled, PeakRSS: &positive250, ResourceSignature: "sig"},
-		{ID: "RUN-3", Status: StatusExited, PeakRSS: &zero, ResourceSignature: "sig"},
+		{ID: "RUN-3", Status: StatusExited, PeakRSS: &zero, ExitCode: &exit0, ResourceSignature: "sig"},
 		{ID: "RUN-4", Status: StatusKilled, PeakRSS: &partial999, ResourceSignature: "sig"},
 		{ID: "RUN-5", Status: StatusCancelled, PeakRSS: &partial888, ResourceSignature: "sig"},
 		{ID: "RUN-6", Status: StatusLost, PeakRSS: &partial777, ResourceSignature: "sig"},
-		{ID: "RUN-7", Status: StatusExited, ResourceSignature: "sig"},
-		{ID: "RUN-8", Status: StatusExited, PeakRSS: &partial999, ResourceSignature: "other"},
+		{ID: "RUN-7", Status: StatusExited, ExitCode: &exit0, ResourceSignature: "sig"},
+		{ID: "RUN-8", Status: StatusExited, PeakRSS: &partial999, ExitCode: &exit0, ResourceSignature: "other"},
+		// AIRA-264: a failed workload (non-zero exit) and a record with no
+		// recorded exit code are both excluded, even with a large peak that would
+		// dominate PeakMax if it leaked in.
+		{ID: "RUN-9", Status: StatusExited, PeakRSS: &failedPeak, ExitCode: &exit1, ResourceSignature: "sig"},
+		{ID: "RUN-10", Status: StatusExited, PeakRSS: &nullExitPeak, ResourceSignature: "sig"},
 	}
 	for _, record := range records {
 		record.SchemaVersion = ledgerSchema
@@ -42,7 +49,7 @@ func TestPeakRSSHistoryFiltersAndAggregatesRealProjection(t *testing.T) {
 	if err != nil || !readable {
 		t.Fatalf("PeakRSSHistory readable=%v err=%v", readable, err)
 	}
-	want := PeakRSSStats{TotalCount: 7, SampleCount: 2, PeakMax: 250, OOMCount: 1}
+	want := PeakRSSStats{TotalCount: 9, SampleCount: 2, PeakMax: 250, OOMCount: 1}
 	if stats != want {
 		t.Fatalf("stats=%+v want %+v", stats, want)
 	}
@@ -67,9 +74,10 @@ func TestPeakRSSHistoryZeroPeaksDoNotSatisfyMinimumSamples(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	exit0 := 0
 	for i, value := range []int64{100, 0, 0} {
 		peak := value
-		record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(2, i), Status: StatusExited, PeakRSS: &peak, ResourceSignature: "mixed"}
+		record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(2, i), Status: StatusExited, PeakRSS: &peak, ExitCode: &exit0, ResourceSignature: "mixed"}
 		if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
 			t.Fatal(err)
 		}
@@ -158,9 +166,10 @@ func TestPeakRSSHistoryIsOrderIndependent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		exit0 := 0
 		for n, value := range peaks {
 			peak := value
-			record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(i, n), Status: StatusExited, PeakRSS: &peak, ResourceSignature: "sig"}
+			record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(i, n), Status: StatusExited, PeakRSS: &peak, ExitCode: &exit0, ResourceSignature: "sig"}
 			if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
 				t.Fatal(err)
 			}
@@ -252,7 +261,8 @@ func TestPeakRSSHistoryReadDoesNotGrowMainProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	peak := int64(4242)
-	if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusExited, PeakRSS: &peak, ResourceSignature: "sig"}}); err != nil {
+	exit0 := 0
+	if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusExited, PeakRSS: &peak, ExitCode: &exit0, ResourceSignature: "sig"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.ledger.project(context.Background()); err != nil {

@@ -1340,6 +1340,48 @@ func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-264 -- the send-gate at the report site actually withholds a
+// peak sample for a failed run, and still lets a clean success or an OOM run
+// through. This pins the CALL SITE (not just the predicate): deleting
+// `&& shouldRecordConfinePeak(...)` from confineWithDeps reds the "non-zero exit"
+// row -- reportPeak would fire for exit 23 -- which the isolated predicate unit
+// test cannot catch. The OOM row drives a non-zero exit AND a positive
+// hierarchical OOM counter (an independent cgroup fact), so it isolates the oom
+// arm: the sample is reported because self-heal must keep learning from OOMs.
+func TestConfinePeakReportIsGatedOnRunOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		argv       []string
+		usage      cgroupUsage
+		wantCalled bool
+	}{
+		{name: "clean success is reported", argv: []string{"/bin/true"}, usage: cgroupUsage{}, wantCalled: true},
+		{name: "non-zero workload exit is withheld", argv: []string{"/bin/sh", "-c", "exit 23"}, usage: cgroupUsage{}, wantCalled: false},
+		{name: "OOM overrides a non-zero exit and is reported", argv: []string{"/bin/sh", "-c", "exit 23"}, usage: cgroupUsage{OOMKill: int64ptr(1)}, wantCalled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scope := &confineFakeScope{}
+			deps := confineUnitDeps(scope)
+			usage := tc.usage
+			deps.readUsage = func(string) cgroupUsage { return usage }
+			called := false
+			deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error {
+				called = true
+				return nil
+			}
+			result, err := confineWithDeps(context.Background(), ConfineRequest{
+				Slice: "finite.slice", Argv: tc.argv, SelfPath: os.Args[0], Stderr: io.Discard,
+			}, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if called != tc.wantCalled {
+				t.Fatalf("reportPeak called=%v want=%v (exit=%d)", called, tc.wantCalled, result.Exit)
+			}
+		})
+	}
+}
+
 // verifies: AIRA-104 -- CPUUser/CPUSys reach result.Status from the SAME
 // deps.readUsage call that already yields PeakRSS, with no second read
 // introduced. Also pins that a genuinely-zero CPU reading is preserved

@@ -37,9 +37,15 @@ func (r *Runner) PeakRSSHistory(ctx context.Context, signature string) (PeakRSSS
 	readCtx, cancel := context.WithTimeout(ctx, sampleReadTimeout)
 	defer cancel()
 	var stats PeakRSSStats
+	// AIRA-264: a usable memory sample is a clean success (exited with exit_code
+	// 0) or an OOM (kept -- an OOM is the strongest signal the estimate was too
+	// low, and self-heal keys on OOMCount). A non-zero exit is a failed workload
+	// and teaches the estimator nothing trustworthy; a NULL exit_code (an old
+	// pre-column projection, or a record with no exit code) is conservatively
+	// excluded, since `exit_code = 0` is false for NULL. OOMCount is unchanged.
 	err = db.QueryRowContext(readCtx, `SELECT COUNT(*),
- COALESCE(SUM(CASE WHEN status IN ('exited','oom-killed') AND peak_rss > 0 THEN 1 ELSE 0 END),0),
- COALESCE(MAX(CASE WHEN status IN ('exited','oom-killed') AND peak_rss > 0 THEN peak_rss END),0),
+ COALESCE(SUM(CASE WHEN ((status='exited' AND exit_code = 0) OR status='oom-killed') AND peak_rss > 0 THEN 1 ELSE 0 END),0),
+ COALESCE(MAX(CASE WHEN ((status='exited' AND exit_code = 0) OR status='oom-killed') AND peak_rss > 0 THEN peak_rss END),0),
  COALESCE(SUM(CASE WHEN status='oom-killed' AND peak_rss > 0 THEN 1 ELSE 0 END),0)
 FROM runs WHERE resource_signature = ?`, signature).Scan(&stats.TotalCount, &stats.SampleCount, &stats.PeakMax, &stats.OOMCount)
 	if err != nil {

@@ -149,6 +149,68 @@ func TestClassifyConfineTermination(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-264 -- shouldRecordConfinePeak records a peak sample IFF the run
+// OOM'd (hierarchical, kept for self-heal) or was a clean success, and its clean
+// arm never drifts from the authoritative classifier. Each row asserts the
+// predicate against an explicit `want` (the decision) AND against the classifier
+// oracle `oom || (classify==Normal && exit==0)` (the drift pin): dropping any
+// clause of the predicate, or redefining ConfineTerminatedNormal, reds a row.
+// The oom bit is the SAME hierarchical counter the report sends
+// (`usage.OOMKill != nil && *usage.OOMKill > 0`), so a descendant OOM under a
+// clean parent still records (row "descendant OOM under clean exit") -- the
+// existing deliberate behaviour, not a new decision.
+func TestShouldRecordConfinePeakTracksTheClassifier(t *testing.T) {
+	signalled := func(sig syscall.Signal) confineTermination {
+		return confineTermination{Decoded: true, Signaled: true, Signal: sig}
+	}
+	exited := confineTermination{Decoded: true}
+	readable := func(count int64) cgroupUsage {
+		return cgroupUsage{OOMKill: int64ptr(count), OOMKillLocal: int64ptr(count), OOMGroupKillLocal: int64ptr(0)}
+	}
+	descendantOOM := cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}
+	drainedOOM := cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(1)}
+
+	for _, test := range []struct {
+		name       string
+		term       confineTermination
+		usage      cgroupUsage
+		supervisor os.Signal
+		deadline   deadlineKind
+		exit       int
+		want       bool
+	}{
+		{name: "clean exit 0 records", term: exited, usage: readable(0), exit: 0, want: true},
+		{name: "non-zero workload exit is excluded", term: exited, usage: readable(0), exit: 3, want: false},
+		{name: "child crash signal is excluded", term: signalled(syscall.SIGSEGV), usage: readable(0), exit: 139, want: false},
+		{name: "child SIGTERM is excluded", term: signalled(syscall.SIGTERM), usage: readable(0), exit: 143, want: false},
+		// A signalled termination is excluded even at exit 0. Production never
+		// pairs the two (a signalled job's exit is 128+signal), so this pins that
+		// the predicate mirrors the classifier's !Signaled requirement rather than
+		// relying on the exit-code encoding to imply it.
+		{name: "signalled with a zero exit is still excluded", term: signalled(syscall.SIGTERM), usage: readable(0), exit: 0, want: false},
+		{name: "operator Ctrl-C after clean exit is excluded", term: exited, usage: readable(0), supervisor: syscall.SIGINT, exit: 0, want: false},
+		{name: "own-cap OOM records", term: signalled(syscall.SIGKILL), usage: readable(1), exit: 137, want: true},
+		{name: "descendant OOM under clean exit records", term: exited, usage: descendantOOM, exit: 0, want: true},
+		{name: "drained-leader OOM records", term: signalled(syscall.SIGKILL), usage: drainedOOM, exit: 137, want: true},
+		{name: "undecoded wait status is excluded", term: confineTermination{}, usage: cgroupUsage{}, exit: 3, want: false},
+		{name: "wall-deadline kill is excluded", term: signalled(syscall.SIGKILL), usage: readable(0), deadline: deadlineKindWall, exit: 137, want: false},
+		{name: "unattributed SIGKILL is excluded", term: signalled(syscall.SIGKILL), usage: readable(0), exit: 137, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			oom := test.usage.OOMKill != nil && *test.usage.OOMKill > 0
+			got := shouldRecordConfinePeak(oom, test.term, test.supervisor, test.exit)
+			if got != test.want {
+				t.Fatalf("shouldRecordConfinePeak = %v, want %v", got, test.want)
+			}
+			normal := classifyConfineTermination(test.term, test.usage, test.supervisor, test.deadline) == ConfineTerminatedNormal
+			oracle := oom || (normal && test.exit == 0)
+			if oracle != test.want {
+				t.Fatalf("classifier oracle = %v, want %v -- predicate has drifted from the classifier", oracle, test.want)
+			}
+		})
+	}
+}
+
 // verifies: the terminal facet reaches the operator-facing line, and an unset
 // facet reads as unevaluated rather than as an empty claim.
 func TestFormatConfineStatusReportsTerminatedByFacet(t *testing.T) {
