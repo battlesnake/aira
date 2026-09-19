@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-264","project":"aira","title":"Don't learn memory-reserve estimates from failed (non-OOM nonzero-exit) runs","status":"in-progress","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.19","labels":["confine"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-264","project":"aira","title":"Don't learn memory-reserve estimates from failed (non-OOM nonzero-exit) runs","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.19","labels":["confine"],"hold":false,"relations":[]}
 ---
 Owner (2026-09-19): aira must NOT use ram/cpu/time measurements from a FAILED run (nonzero exit) to adjust limits for subsequent runs. Owner decision: KEEP OOM kills (exit 137) + clean successes; EXCLUDE only non-OOM workload failures (nonzero exit, crashes, timeouts, Ctrl-C).
 
