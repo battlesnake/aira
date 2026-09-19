@@ -29,37 +29,42 @@ Verified insertion points (admit.go): conjunctive fit `ramFits/cpuFits` at ~:225
 - **Derived ledger:** a `vramOutstanding int64` on `sliceQueue`, written ONLY by `rederiveLedgerLocked` (`vram = addClamp(vram, waiter.vram)`), so VRAM-outstanding can never drift from the waiter set. (Note: VRAM is machine-wide, not per-slice; under the current one-slice assertion this coincides. Documented latent mismatch, same as the CPU comment at admit.go:2428 — revisit only if concurrent slices ever appear.)
 - Unit: accept `--vram` in **MiB** (matches `nvidia-smi` reporting and human intent), store **bytes** internally (consistent with `reserve`).
 
-## The admission rule (the fit)
+## The admission rule (the fit) — DERIVED, not a checkedAvailable lookalike
 
-A job is admitted only if EVERY resource fits (extend the existing conjunctive fit):
+`checkedAvailable`'s `current` input is the slice's OWN `memory.current` (aira-scoped); nvidia-smi `free` is MACHINE-WIDE (desktop + every aira job's actual allocation). Because per-process VRAM is `[N/A]` here, we cannot split `used` into aira-vs-desktop, so we derive the fit from first principles rather than reuse the combinator.
+
+A job is admitted only if EVERY resource fits (extend the existing conjunctive fit at admit.go:~2250):
 
 ```
 ramFits  := waiter.reserve <= available                         // unchanged
 cpuFits  := waiter.cpu    <= cpuAvailable(cpuCeiling, cpuOut)    // unchanged
-vramFits := waiter.vram == 0 || waiter.vram <= vramAvailable()   // NEW
+vramFits := waiter.vram == 0 || waiter.vram <= vramAvailable(queue)   // NEW
 admit if ramFits && cpuFits && vramFits
 ```
 
-where
+where (SIGNED, like the RAM/CPU ledgers — a momentary over-subscription yields negative and makes the next new admission wait):
 
 ```
-vramAvailable() = checkedAvailable-shape over VRAM:
-    min( configuredBudget − Σ(granted vram),        // the AIRA ledger
-         physicalFreeVRAM − vramHeadroom )           // the physical floor (non-AIRA consumers)
+vramAvailable = min(configuredBudget, physicalFreeVRAM − vramHeadroom) − vramOutstanding
 ```
 
-`configuredBudget` = the install-configured VRAM budget (this box: 14 GB; default: auto-detected total). `physicalFreeVRAM` is read live at fit time. A `vram == 0` job skips the whole VRAM path.
+**Why this exact form (safe against slow-ramping jobs).** A GPU job ramps its VRAM after admission (model load takes seconds); until it does, `free` does not yet reflect its declared reservation. We cannot tell how much of `used` is already-ramped aira allocation, so the safe worst case treats every declared reservation as still-to-come on top of current physical use: subtract `vramOutstanding` (Σ granted vram, from `rederiveLedgerLocked`) from the effective ceiling `min(budget, free − headroom)`. This never oversubscribes; the cost is mild under-admission when aira jobs have already ramped (their allocation is counted in both `free` and `vramOutstanding`). For a lockup-prevention feature, safe-over-utilization is the right bias — the double-count only bites with MULTIPLE concurrent aira GPU jobs (the single-big-job lockup case has `vramOutstanding == 0` at admit, so no double-count). Documented conservatism; the Fable build-review must scrutinise this formula, and it can be relaxed later on a per-process-capable box.
 
-**Fast-fail (mirrors the cpu-too-large guard at admit.go:1569):** a job whose `vram` exceeds `configuredBudget` is refused at enqueue with a distinct code (`E_ADMIT_VRAM_TOO_LARGE`) — it can never fit, so never queue it.
+`configuredBudget` = install-configured (this box 14 GB; default = auto-detected total). `physicalFreeVRAM` comes from the sampler (below), NOT read in the fit loop.
 
-## The ceiling seam (value-or-unevaluated — the honesty core)
+**Two DISTINCT refusal shapes — do not conflate:**
+- **Over BUDGET → REFUSED at enqueue (never-ran).** `waiter.vram > configuredBudget` can never fit, so fast-fail at enqueue with `E_ADMIT_VRAM_TOO_LARGE` (mirrors the cpu-too-large guard at admit.go:~1569).
+- **Over physical-free → HELD in the queue.** `vramFits == false` because `physicalFreeVRAM` is momentarily low is a TRANSIENT contention (Windows may release VRAM): the waiter stays QUEUED, unbounded-fair like a RAM-contended wait, and the client's periodic waiting message names VRAM as the contended resource. It is NOT a refusal.
 
-A new `vramCeiling()` reads total + free VRAM. Unlike `cpuCeiling` (pure `runtime.NumCPU`), this reads a device:
+## The ceiling seam + off-lock sampler (value-or-unevaluated — the honesty core)
 
-- Mechanism: **`nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits` subprocess** at fit time. NO cgo (NVML is a C lib; the no-cgo / single-static-binary rule holds). Aggregate query works on this box (confirmed).
-- Return type is **value-or-unevaluated** (not a bare int): `{total, free}` on success; `unevaluated` when nvidia-smi is absent, errors, or reports no GPU.
-- **Honesty (fail-closed, never fabricate):** when the ceiling is `unevaluated`, a `vram > 0` job is **refused at enqueue** with a distinct code (`E_ADMIT_VRAM_UNAVAILABLE`) — NEVER a fabricated `0` total (which would silently refuse *all* GPU work) and NEVER an infinite ceiling (which would silently admit *everything*). A `vram == 0` job is completely unaffected — no GPU is required to run non-GPU work.
-- The read is cached briefly (a short TTL, e.g. the poll cadence) to avoid forking nvidia-smi on every fit attempt; a stale-by-one-tick free reading is acceptable within the same bounded-over-admit envelope the reservation model already accepts.
+nvidia-smi is a **subprocess measured at 30–80 ms** — orders of magnitude slower than the microsecond cgroup read RAM uses. It must NEVER be forked inside the fit loop under `queue.mu` (that would stall EVERY admission, including `vram == 0` jobs). So:
+
+- **A sampler goroutine** refreshes an atomically-published snapshot `{total, free, unevaluated, sampledAt}` OFF-lock, on a short cadence. It runs ONLY while a `vram > 0` waiter exists (the `vram == 0` fit short-circuit is not enough on its own — the sampler itself must gate, so a box that never runs GPU work never forks nvidia-smi). The fit reads the last published snapshot, never blocks on a subprocess.
+- Mechanism: **`nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits`** (no cgo; the no-cgo/static-binary rule holds). Multi-GPU returns one line per GPU → this build SUMs to an aggregate (single-GPU here; the multi-GPU non-fungibility gap is documented, see Deferrals).
+- Snapshot type is **value-or-unevaluated**: `{total, free}` on a fresh successful sample; `unevaluated` when nvidia-smi is absent/errors/no-GPU, OR when the newest good sample is **older than a staleness bound** (the sampler stopped/hung).
+- **Fit-time unevaluated → HOLD, never wedge.** At enqueue a `vram > 0` job under an unevaluated ceiling is refused up front (`E_ADMIT_VRAM_UNAVAILABLE`) — nothing ran. But a job already QUEUED when the sampler later goes stale/unevaluated must not silently fail `vramFits` every tick: it HOLDS (unbounded-fair, like RAM contention) and the waiting message names VRAM/ceiling-unevaluated. No new dequeue/timeout path is invented — it reuses the existing queued-wait.
+- **Honesty (fail-closed):** unevaluated is NEVER a fabricated `0` total (silently refuses all GPU work) NOR an infinite ceiling (silently admits everything). `vram == 0` jobs are completely unaffected — no GPU needed to run non-GPU work.
 
 ## Config
 
@@ -79,14 +84,16 @@ A new `vramCeiling()` reads total + free VRAM. Unlike `cpuCeiling` (pure `runtim
 ## Tests (TDD; every load-bearing clause mutation-verified)
 
 1. **Ceiling seam** — GPU readable → `{total, free}`; nvidia-smi absent/error/no-GPU → `unevaluated`. (Inject the nvidia-smi reader as a seam; do not shell out in the unit test.)
-2. **Fit, physical-free floor** — with budget 14 GB but only 2 GB physically free, a 10 GB job is REFUSED. Mutation: drop the physical-free term → the job is wrongly admitted (oversubscribe) → red.
-3. **Fit, budget term** — a job over the configured budget fast-fails at enqueue (`E_ADMIT_VRAM_TOO_LARGE`). Mutation: drop the budget guard → queues forever → red.
-4. **Fit, ledger term** — two 8 GB jobs against a 14 GB budget: the second is refused even if physical-free is momentarily high. Mutation: drop the ledger term → double-grant → red.
+2. **Fit, physical-free floor → HELD (not refused).** Budget 14 GB, a 10 GB job (within budget) but only 2 GB physically free: the job is QUEUED-not-admitted (not never-ran), and the waiting message names VRAM. Mutation: drop the physical-free term → wrongly admitted (oversubscribe) → red. (Asserting "refused" here would be WRONG — this is transient contention, not a never-ran.)
+3. **Fit, budget term → REFUSED at enqueue.** A job over the configured budget fast-fails at enqueue with `E_ADMIT_VRAM_TOO_LARGE` (never-ran, distinct from the held case in test 2). Mutation: drop the budget guard → queues forever instead of failing fast → red.
+4. **Fit, ledger term** — two 8 GB jobs against a 14 GB budget with ample physical-free: the second is HELD even though physical-free alone would admit it. Mutation: drop the `− vramOutstanding` term → double-grant → red.
+4b. **Post-restart floor is the SOLE protection (load-bearing).** VRAM has no cgroup to reconstruct from (RAM rebuilds from scope `memory.max`); between a daemon restart and the ARDR re-declare the VRAM ledger is EMPTY. Test: ledger empty (`vramOutstanding == 0`) + physical-free low → a new GPU job is HELD by the physical-free floor ALONE. Mutation: drop the physical-free term → with an empty ledger the job is wrongly admitted → red. This is why the floor is not optional.
+4c. **Hold-on-stale, not wedge.** A `vram > 0` job admitted-readable, queued, then the sampler goes stale/unevaluated: the waiter HOLDS (stays queued) and the message names ceiling-unevaluated — it does NOT silently fail `vramFits` forever with no signal. Mutation: make stale→hard-refuse-in-fit → the queued job wedges with no dequeue → red.
 5. **Honesty** — ceiling `unevaluated` → a `vram > 0` job refused at enqueue with the distinct code; a `vram == 0` job proceeds. Mutation: fabricate `0`/infinite ceiling → wrong refuse-all / admit-all → red.
 6. **Derived ledger** — `vramOutstanding == Σ waiter.vram` across add/remove; the ONLY writer is `rederiveLedgerLocked`. Mutation: a running-total write → drift → red.
 7. **Socket-liveness release** — holder EOF frees its VRAM (reuse `watchPeerEOF`; assert vramOutstanding drops).
 8. **ARDR** — a granted VRAM budget survives a simulated daemon restart / re-declare.
-9. **Flag parse** — `--vram 4096` → `ConfineRequest.VRAMBytes == 4096<<20`; `--vram` absent → 0 (ungated).
+9. **Flag parse** — `--vram 4G` → `ConfineRequest.VRAMBytes == 4<<30` (existing size parser); `--vram` absent → 0 (ungated).
 10. **Conjunctive interaction** — a job that fits VRAM but not RAM (and vice-versa) is refused; the refusal names the resource (extend the admission diagnostic so a VRAM refusal is not mislabelled as RAM-saturated).
 
 ## Risks (from grounding)
@@ -98,7 +105,15 @@ A new `vramCeiling()` reads total + free VRAM. Unlike `cpuCeiling` (pure `runtim
 
 ## Expected yield
 
-Prevents VRAM-exhaustion lockup for honest declarers — the owner's stated problem — on this box and any GPU box, driver-agnostic (aggregate nvidia-smi read). Un-declared (`vram == 0`) work is byte-for-byte unaffected.
+Prevents VRAM-exhaustion lockup for honest declarers — the owner's stated problem — on this box and any **NVIDIA** GPU box. NOT driver-agnostic: `nvidia-smi` is NVIDIA-only; the ceiling seam is the SINGLE place a future `rocm-smi` (AMD) or other reader is added. Un-declared (`vram == 0`) work is byte-for-byte unaffected.
+
+## Build notes (pin during TDD)
+
+- **`--vram` uses the existing size parser** (like `--memory-max`): accepts `--vram 4G` / `--vram 512M`, stored as bytes. NOT a bare-MiB int. (nvidia-smi reports MiB; convert on read.)
+- **Golden fixtures from REAL nvidia-smi output** (captured 2026-09-19, RTX 5080), never a hand-written stub: success `noheader,nounits` = `16303, 3960`; with units = `16303 MiB, 3960 MiB`; per-GPU adds a leading `index,` column (multi-GPU → one line per GPU, SUM them); per-process `--query-compute-apps=used_memory` = `[N/A]` (why the killer is deferred); no-GPU host → nvidia-smi errors (`No devices were found`) → unevaluated. Parse must tolerate the unit suffix and CSV header presence/absence deterministically.
+- **codes catalogue:** add `E_ADMIT_VRAM_TOO_LARGE` and `E_ADMIT_VRAM_UNAVAILABLE` to `internal/codes` (the tree-wide catalogue check reds `make ci` otherwise).
+- **Config location:** pin where the VRAM budget lives EARLY (candidate: the install-mode record / the daemon config the ceiling seam reads, beside the RAM ceiling model). `aira install` sets it (this box 14 GB); unset → auto-detect (nvidia-smi total). Injected through a seam so tests pin a deterministic budget without a GPU.
+- **Trailer `vram=` facet: DEFERRED** (minimum). The admission `admission=` facet already reflects the outcome; a dedicated `vram=` reservation facet can be added later with the same always-rendered discipline if telemetry wants it. Do not add it in this build.
 
 ## Deferrals (explicit — parked in AIRA-248)
 
