@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-265","project":"aira","title":"aira top: SESSION column showing the confining session's name","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.20","labels":["confine"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-265","project":"aira","title":"aira top: SESSION column showing the confining session's name","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.20","labels":["confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-266","to":"AIRA-265"}]}
 ---
 Owner (2026-09-19): sessions set an env var to their human-friendly name when calling aira confine, but it isn't shown in aira top. Owner decisions: (1) new SESSION column in aira top; (2) KEEP the existing --owner flag + AIRA_CONFINE_OWNER env var (no new param) — just surface it.
 
