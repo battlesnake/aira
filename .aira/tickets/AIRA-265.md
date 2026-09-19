@@ -12,10 +12,11 @@ aira top's table columns are SLOT/NAME/PID/LIVE/AGE/RESERVATION/RAM/CPU CORES/CO
 - KEY UPSTREAM FINDING (deploy+qual verified): the human name ('deploy','qual') is NOT in any env var — it lives only in the Claude session registry (ListAgents/cc-socks). The only stable env id is CLAUDE_CODE_SESSION_ID (a UUID). aira CANNOT map UUID->friendly-name (that registry is the harness's, not aira's). So for the column to populate fleet-wide, each session (or the launcher/harness) must export AIRA_CONFINE_OWNER=<name>. aira reads+displays; populating the env is UPSTREAM of aira.
 - subpipe: a project CLAUDE.md already documents AIRA_CONFINE_OWNER as the intended mechanism.
 
-## Design (approved: keep --owner/AIRA_CONFINE_OWNER)
+## Design (early sketch — SUPERSEDED by "FINALIZED design" below)
+NOTE: the '—'/truncation choices in this section were the early sketch. The BUILT behaviour is the "## FINALIZED design (grounded in live data)" section below: hex → 8-char PREFIX (not '—'), human/@cwd verbatim with NO viewmodel truncation, unset → '#<pid>'. Kept for history; read FINALIZED for what shipped.
 - Add a SESSION column to aira top's table (tui_top.go topViewModel), sourced from record.Owner.
-- SUPPRESS hash-style owners (the discovered default, a 32/64-char hex) — render '—' — so the 50+ char hex never re-crowds the table (the AIRA-135 concern). Show human-friendly owners verbatim (truncated to a sane width).
-- Unset/hash -> '—'; the existing PID column already attributes un-named jobs, so '—' is honest (no fabricated name). (subpipe wanted a non-blank fallback, but PID already attributes.)
+- ~~SUPPRESS hash-style owners — render '—'~~ → BUILT AS: 8-char prefix (groups a worktree's jobs). Show human-friendly owners verbatim (~~truncated~~ → NOT truncated; the table clamps).
+- ~~Unset/hash -> '—'~~ → BUILT AS: hex → 8-prefix, empty/unknown → '#<pid>' (subpipe's non-blank ask honoured with a real handle, per owner's "short scope-id / PID").
 - Column placement: keep COMMAND last (unbounded width); put SESSION as a narrow column (before COMMAND). Watch total width per the AIRA-135 clamp note.
 
 ## Out of scope / upstream (surface to owner, not built here)
@@ -30,8 +31,8 @@ Build after v0.19 (AIRA-264) ships. Small display change; still Opus-builds/Fabl
 - **subpipe**: env DOESN'T persist across its Bash invocations (each re-inits from profile) → can't do one sticky export, will prefix per-command, so mostly UN-ANNOTATED; won't edit the user's profile (correct). Explicitly requests the SESSION cell NOT be blank for un-annotated jobs.
 - **fly / qual**: set nothing; friendly name is not in env (only CLAUDE_CODE_SESSION_ID UUID). qual suggested aira map UUID→friendly-name — INFEASIBLE (that registry is the Claude harness's, aira has no access).
 
-## Fallback for un-annotated jobs (decision needed at build)
-Honest default: DO NOT fabricate a session name. `aira top` already has a PID column that attributes every job. Options: (a) render `—` for un-annotated/hash owners (matches the owner's approved "elided" for hashes; PID attributes); (b) per subpipe's ask, resolve the SESSION cell to a real handle (short scope-id or supervisor-PID) so the column stays useful when most jobs are unset. Leaning (b)-with-a-real-handle to satisfy subpipe without fabricating a name; confirm with owner during the build.
+## Fallback for un-annotated jobs (RESOLVED — see "Fallback decision RESOLVED" below)
+Honest default: DO NOT fabricate a session name. Options considered: (a) render `—`; (b) a real handle (short scope-id or PID). RESOLVED to a hybrid of (b): hex → 8-char grouping prefix, empty/unknown → `#<pid>`. See the "Fallback decision RESOLVED" section below.
 
 ## Strong cross-session recommendation → owner (upstream of aira)
 deploy + fly + qual + speed all point at the same real fleet-wide fix: the HARNESS/launcher injecting `AIRA_CONFINE_OWNER=<friendly-name>` into each session's env, which `aira confine` already auto-reads. aira CANNOT do the injection (the name isn't in the env and the registry is the harness's). Without it the column is mostly `—`/handles. Raise with whoever owns session launching.
@@ -52,3 +53,9 @@ Grounded the actual owner shapes that reach `ConfineRecord.Owner` (resolveOwnerI
 
 ## Fallback decision RESOLVED (was "decision needed at build")
 Chose a hybrid of the two options: NOT a bare `—` (subpipe's ask honoured) and NOT fabricated. Hex → 8-char grouping prefix; empty/unknown → PID handle; `@cwd-` shown through (readable + honest). This is within the owner's AskUserQuestion answer ("Short scope-id / PID") for the unset cell.
+
+## Fable review — APPROVE-WITH-NITS (2026-09-19)
+14/15 mutations red; tree left pristine at db79db1. No false-pass/false-fail/honesty regression. Addressed: (1) REQUIRED — the columns test's hash-prefix pin was porous (owner `9f3ac1de`×8 coincided with the scope-id's own last 8 bytes, so a mutation rendering `ScopeID[-8:]` PASSED, measured M16). Fixed: owner → `4f9ec70c`×8 (decoupled from the scope id), expected prefix `4f9ec70c`; M16 re-confirmed RED then reverted. (2) SKILL prose accuracy — the "worktree-hash prefix / bare PID" fallback describes `aira top` only, not `--list`; reworded. (3) ticket design sections reconciled (early '—'/truncate sketch marked SUPERSEDED by FINALIZED). Kept by design, with reasoning: the 8-char hash prefix (Fable finding 2 — a better handle than a literal scope-id/PID: groups a worktree's jobs incl. aitest workers, kills the AIRA-135 hex; within owner's "short scope-id / PID"); the `#<pid>` arm (declined Fable's simplify-to-`unknown` — the owner explicitly chose PID over blank/—, subpipe explicitly asked non-blank). ACCEPTED gap (Fable finding 3, low): the CLI-only `--owner` help description (enriched) has no regression pin — `confine` isn't an MCP tool, only generated CLI help; the primary agent surface (SKILL) IS pinned. Fable ran the per-package command, not `make ci`; the builder ran the full `aira confine -- make ci` gate (MAKE_EXIT=0) before commit.
+
+## Release hand-off to deploy (owner 2026-09-19)
+On release, notify deploy so it adopts the feature across fastest.ee tooling. Owner confirmed the MECHANISM is the SESSION NAME via the ENV VAR (`AIRA_CONFINE_OWNER`), not per-call flags: a session `export`s it ONCE and it propagates to every descendant `aira confine`, including scripted calls — so deploy sets it once in the fastest.ee tooling environment rather than editing every call site (some may already set it). Jobs then show that name in the `SESSION` column of `aira top`. The MCP/SKILL update (this ticket) is what steers all sessions to start doing this. (Distinct from the still-open, separate `--name`-per-JOB-in-CI-traces offer — the owner's instruction here is the session/owner identity, not a per-job task label.)

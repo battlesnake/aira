@@ -826,7 +826,10 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	record.Command = &command
 	// A discovered worktree owner: app.hashID's 64 lowercase hex characters. This
 	// is the crowding case AIRA-135 removed; AIRA-265 shows only the 8-char prefix.
-	record.Owner = strings.Repeat("9f3ac1de", 8)
+	// The owner is deliberately DECOUPLED from the scope id (which ends in a
+	// different "9f3ac1de" motif) so the expected prefix pins topSessionCell(owner)
+	// specifically — not a coincidence with the scope id's own last 8 bytes.
+	record.Owner = strings.Repeat("4f9ec70c", 8)
 	age := int64(93784) // 1d2h3m4s -> compact "1d2h"
 	record.AgeSeconds = &age
 	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), record))
@@ -845,7 +848,7 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	// record's live memory.current (9 GiB), CPU is unevaluated on this single tick
 	// because a rate needs two samples, and SESSION is the worktree owner's 8-char
 	// prefix (never the full hex).
-	wantCells := []string{"0", "heavy-suite", "4242", "yes", "1d2h", "42160M", "9216M", "unevaluated", "9f3ac1de", command}
+	wantCells := []string{"0", "heavy-suite", "4242", "yes", "1d2h", "42160M", "9216M", "unevaluated", "4f9ec70c", command}
 	if !reflect.DeepEqual(model.Rows[0].Cells, wantCells) {
 		t.Fatalf("cells=%v, want %v", model.Rows[0].Cells, wantCells)
 	}
