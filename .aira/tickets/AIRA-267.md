@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-267","project":"aira","title":"Surface confine --name as a structured field in the trailer + confine --dump (CI-trace analysis)","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.22","labels":["confine","telemetry"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-267","project":"aira","title":"Surface confine --name as a structured field in the trailer + confine --dump (CI-trace analysis)","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.22","labels":["confine","telemetry"],"hold":false,"relations":[]}
 ---
 Owner (2026-09-19): "ticket it and build it" — the caller can already give a task a name via `aira confine --name <label>`, but it doesn't reach the CI trace/dump artifacts as a structured field, so CI can't attribute per-task telemetry (peak-rss/cpu) to a named task. Follow-up to the AIRA-265/266 owner-attribution work (name is the per-TASK axis; owner is the per-SESSION axis).
 
