@@ -68,7 +68,7 @@ func (result admissionResult) releaseAdmission() {
 // (estimated_cpu added to the request — the per-test @aira_cpu reservation, charged
 // against the per-slice 2×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores;
 // OPTIONAL, absent ⇒ the floor). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two drift.
-const DaemonProtocolVersion = 13
+const DaemonProtocolVersion = 14
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20
@@ -407,6 +407,12 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		frame.Request.Args["name"] = req.ConfineName
 		frame.Request.Args["owner"] = req.ConfineOwner
 	}
+	// AIRA-268. vram is the declared GPU VRAM, sent only when >0 so a non-GPU job's
+	// wire is byte-identical to before. proto 14 (this bump) is a coordinated
+	// cutover, so the daemon always understands the field.
+	if req.VRAMBytes > 0 {
+		frame.Request.Args["vram"] = req.VRAMBytes
+	}
 	// AIRA-101. All three are optional and absent-means-off, so an older daemon
 	// is not confused by their presence — it REJECTS them with E_DAEMON_PROTOCOL,
 	// which for an exclusive request is exactly right: admitExclusiveOrRefuse
@@ -483,7 +489,7 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 				basis:    "reject:wait-too-long",
 			}, true, errors.New(message)
 		}
-		if response.Code == "E_ADMIT_TOO_LARGE" || response.Code == "E_ADMIT_SATURATED" {
+		if response.Code == "E_ADMIT_TOO_LARGE" || response.Code == "E_ADMIT_SATURATED" || response.Code == "E_ADMIT_VRAM_TOO_LARGE" || response.Code == "E_ADMIT_VRAM_UNAVAILABLE" {
 			var rejection runnerAdmitRejection
 			if err := json.Unmarshal(response.Data, &rejection); err == nil && validRunnerAdmitRejection(response.Code, rejection) {
 				_ = conn.Close()
@@ -495,6 +501,13 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 				message := response.Error
 				if response.Code == "E_ADMIT_TOO_LARGE" {
 					basis = "reject:too-large"
+				} else if response.Code == "E_ADMIT_VRAM_TOO_LARGE" {
+					// AIRA-268. Keep the daemon's readable VRAM message (message =
+					// response.Error above); only tag the basis. Never enter the
+					// RAM-flavoured saturated rewriting below.
+					basis = "reject:vram-too-large"
+				} else if response.Code == "E_ADMIT_VRAM_UNAVAILABLE" {
+					basis = "reject:vram-unavailable"
 				} else {
 					ceiling := "unknown"
 					if rejection.Ceiling > 0 {
@@ -702,6 +715,13 @@ func validRunnerAdmitRejection(code string, rejection runnerAdmitRejection) bool
 		return rejection.Required > 0 && rejection.Ceiling >= 0 && strings.TrimSpace(rejection.Basis) != ""
 	case "E_ADMIT_SATURATED":
 		return rejection.Basis == "reject:saturated"
+	case "E_ADMIT_VRAM_TOO_LARGE":
+		// AIRA-268. Required (declared VRAM) > 0 and Ceiling (budget) >= 0, like
+		// the RAM too-large payload.
+		return rejection.Required > 0 && rejection.Ceiling >= 0 && strings.TrimSpace(rejection.Basis) != ""
+	case "E_ADMIT_VRAM_UNAVAILABLE":
+		// No GPU to report figures for; the basis alone makes it a valid refusal.
+		return strings.TrimSpace(rejection.Basis) != ""
 	default:
 		return false
 	}

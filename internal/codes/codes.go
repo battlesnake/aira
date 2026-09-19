@@ -298,6 +298,14 @@ var ExitCodes = map[string]int{
 	// actually needs from an exit status alone: 2 means fix the request, 4 means
 	// retry when the box is free.
 	"E_ADMIT_TOO_LARGE": 2, "E_ADMIT_SATURATED": 4,
+	// AIRA-268's two VRAM-admission refusals, on the same 2-vs-4 split.
+	// E_ADMIT_VRAM_TOO_LARGE: the declared VRAM exceeds the configured budget —
+	// it can never fit on this box, a bad request like E_ADMIT_TOO_LARGE, so 2.
+	// E_ADMIT_VRAM_UNAVAILABLE: a job DECLARED VRAM but the GPU could not be read
+	// (no GPU, nvidia-smi absent, or a transient read failure), so admission could
+	// not be evaluated — a host condition that may recover, cured by retrying on a
+	// GPU-capable box rather than by editing the request, so it joins E_ADMIT_SATURATED at 4.
+	"E_ADMIT_VRAM_TOO_LARGE": 2, "E_ADMIT_VRAM_UNAVAILABLE": 4,
 	// AIRA-101's two exclusive-admission refusals. AIRA-101 catalogued
 	// E_ADMIT_EXCLUSIVE_ACTIVE at 1 as "an ordinary refusal — another benchmark
 	// holds the slice, retry later". AIRA-124 moved it to 4, because that reading

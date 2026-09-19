@@ -577,9 +577,15 @@ type ConfineRequest struct {
 	// DIAGNOSTIC ONLY, and IGNORED unless Exclusive is set — see
 	// Request.ExclusiveReason for why forwarding it on a non-exclusive request
 	// would turn a harmless label into a refused launch.
-	ExclusiveReason  string
-	ScopeMemoryMax   int64
-	ScopeMemoryHigh  int64
+	ExclusiveReason string
+	ScopeMemoryMax  int64
+	ScopeMemoryHigh int64
+	// AIRA-268. VRAMBytes is the GPU-memory the job declares it needs (0 = not a
+	// GPU job, ungated). The daemon gates admission on it as a third conjunctive
+	// resource dimension; no GPU limit is ever written (there is no VRAM cgroup) —
+	// it is admission accounting against real free VRAM, exactly as `cpu` is
+	// admission accounting with no cpu.max.
+	VRAMBytes        int64
 	AdmissionMaxWait time.Duration
 	// AIRA-138. Timeout and CPUTimeout are the JOB's two bounds, and neither is
 	// AdmissionMaxWait: that one bounds the ADMISSION WAIT and nothing else.

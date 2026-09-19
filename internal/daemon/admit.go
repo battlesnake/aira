@@ -146,7 +146,12 @@ type admitWaiter struct {
 	// per-slice queue.cpuOutstanding ledger and NO cpu.max is ever written — the
 	// kernel time-shares on cpu.weight. Zero for a lease that declared no cores (a
 	// delegate SUITE reserves 0 cores; §8); the confine client's default is one core.
-	cpu       int64
+	cpu int64
+	// AIRA-268. vram is this lease's declared GPU-VRAM reservation, the third
+	// ledger resource. Like cpu it is accounting-only — no VRAM cgroup is ever
+	// written (there is none); it charges the machine-wide vramOutstanding ledger
+	// and the fit gates against real free VRAM. Zero for a non-GPU lease (ungated).
+	vram      int64
 	state     admitWaiterState
 	grantedCh chan struct{}
 	enqueued  time.Time
@@ -318,16 +323,17 @@ func (w *admitWaiter) ledgerCharge() int64 {
 // on the queue (queue.outstanding and queue.cpuOutstanding); CPU is gated per slice
 // on the one-slice (aira.slice) assertion (D1). jobs counts either resource's
 // granted && accounted waiters (they are the same set).
-func rederiveLedgerLocked(queue *sliceQueue) (outstanding int64, cpu int64, jobs int) {
+func rederiveLedgerLocked(queue *sliceQueue) (outstanding int64, cpu int64, vram int64, jobs int) {
 	for _, waiter := range queue.waiters {
 		if waiter == nil || waiter.state != admitGranted || !waiter.accounted {
 			continue
 		}
 		outstanding += waiter.ledgerCharge()
 		cpu = addClamp(cpu, waiter.cpu)
+		vram = addClamp(vram, waiter.vram) // AIRA-268: third ledger resource
 		jobs++
 	}
-	return outstanding, cpu, jobs
+	return outstanding, cpu, vram, jobs
 }
 
 // exclusiveActive reports whether this waiter currently asserts exclusivity.
@@ -609,8 +615,14 @@ type sliceQueue struct {
 	// concurrent slices are ever introduced, CPU accounting must become machine-wide
 	// (sum across slices) — revisit then. Per-slice keeps it parallel to RAM and
 	// makes cross-slice ledger-clobber unrepresentable.
-	outstanding     int64
-	cpuOutstanding  int64
+	outstanding    int64
+	cpuOutstanding int64
+	// AIRA-268. vramOutstanding is the Σ declared GPU-VRAM over granted leases, the
+	// third ledger resource. Like cpuOutstanding it is a re-derived cache (only
+	// rederiveLedgerLocked writes it). VRAM is machine-wide; under the one-slice
+	// (aira.slice) assertion this per-slice sum coincides with the machine-wide sum
+	// — same latent cross-slice caveat noted for cpuOutstanding above.
+	vramOutstanding int64
 	outstandingJobs int
 	seq             int64
 	kick            chan struct{}
@@ -723,7 +735,13 @@ type admitRequest struct {
 	// none — the confine client sends DefaultConfineCPUCores). A value that exceeds
 	// 2×NumCPU is impossible on this box and is refused fail-fast in admitConnection
 	// before any enqueue (design §7 "RequestInvalid").
-	cpu     int64
+	cpu int64
+	// AIRA-268. vram is the declared GPU-VRAM reservation, the third ledger
+	// resource. OPTIONAL on the wire (absent → 0, not a GPU job, ungated). Only
+	// STRUCTURAL validation at parse (non-negative); the "exceeds the configured
+	// budget" and "GPU unreadable" refusals are decided at enqueue where the
+	// ceiling seam is, exactly as cpu's ceiling is checked in admitConnection.
+	vram    int64
 	maxWait int64
 	// nonBlocking is set when max_wait_ms is present on the wire AND equals 0 (design
 	// §6 non-blocking mode): the request does not wait — a zero deadline returns the
@@ -1572,6 +1590,28 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		})
 		return
 	}
+	// AIRA-268. VRAM enqueue refusals, synchronous like cpu-too-large — decided
+	// HERE, before the request is ever queued, with the ceiling seam (a one-shot
+	// nvidia-smi read, OFF queue.mu; ~50 ms once per GPU job). A vram==0 request
+	// skips this entirely and its wire/behaviour are unchanged.
+	if request.vram > 0 {
+		s.vramEverRequested.Store(true)
+		s.vramSampleOnce() // bootstrap a fresh reading so the first job evaluates immediately
+		snap := s.vramCurrent()
+		if !snap.evaluated {
+			// The GPU could not be read: refuse up front rather than queue a job that
+			// would HOLD forever with no ceiling to fit against. Never fabricate a 0
+			// or infinite ceiling (the honesty rule).
+			s.writeAdmitRejection(conn, CodeAdmitVRAMUnavailable, admitRejection{Basis: "reject:vram-unavailable"})
+			return
+		}
+		if budget := s.vramEffectiveBudget(snap.total); request.vram > budget {
+			s.writeAdmitRejection(conn, CodeAdmitVRAMTooLarge, admitRejection{
+				Required: request.vram, Ceiling: budget, Basis: "reject:vram-too-large",
+			})
+			return
+		}
+	}
 	// AIRA-121 gate condition C6. --exclusive is refused HERE, before the request
 	// is ever queued, and that placement is the whole mechanism.
 	//
@@ -1822,7 +1862,7 @@ func newEstablishedWaiter(seq, reserve, cpu int64, basis string, request admitRe
 	grantedCh := make(chan struct{})
 	close(grantedCh)
 	return &admitWaiter{
-		seq: seq, reserve: reserve, cpu: cpu, basis: basis,
+		seq: seq, reserve: reserve, cpu: cpu, vram: request.vram, basis: basis,
 		state: admitGranted, accounted: true, grantedCh: grantedCh,
 		enqueued: now, grantedAt: now, outcome: "immediate",
 		scopeID: request.scopeID, name: request.name, owner: request.owner,
@@ -1968,8 +2008,9 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 				// is what makes a concurrent stale old-connection EOF a no-op.
 				existing.reserve = reserve
 				existing.cpu = request.cpu
+				existing.vram = request.vram // AIRA-268
 				anchorLeaseLocked(existing, request.conn, request.clientPID, request.processStartTick)
-				queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+				queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 				// A re-declare that SHRINKS the vector frees capacity; wake the queue so
 				// a waiter that now fits is not stalled to the next poll tick (the
 				// fresh-insert path signals for the same reason).
@@ -2014,7 +2055,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			// DERIVED, not incremented (the one ledger writer): folds in this lease's RAM
 			// and cores. An establish CONSUMES capacity, so no signal() is needed — unlike
 			// a re-anchor that may SHRINK the vector and free room for a waiter.
-			queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 			return queue, waiter, "", nil
 		}
 	}
@@ -2049,7 +2090,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, vram: request.vram, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
 	// Anchor the fresh lease to its connection through the same helper a re-declare
 	// uses, so the anchor identity is set uniformly. The connection's EOF release
 	// compares its own conn against this anchor.
@@ -2249,7 +2290,13 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// abandonment — the AIRA-49 v3 defect); nothing but the grant below sets it.
 		ramFits := waiter.reserve <= available
 		cpuFits := waiter.cpu <= cpuAvailable(s.cpuCeiling(), queue.cpuOutstanding)
-		if ramFits && cpuFits {
+		// AIRA-268. The third conjunctive resource. A vram==0 job fits vacuously
+		// (ungated). A vram>0 job fits only against a FRESH ceiling snapshot (read
+		// off-lock by the sampler — never a fork here under queue.mu); an
+		// unevaluated/stale snapshot returns false, so the waiter HOLDS in the queue
+		// (transient contention, unbounded-fair), never a fabricated fit.
+		vramFits := waiter.vram == 0 || s.vramWaiterFitsLocked(waiter.vram, queue.vramOutstanding)
+		if ramFits && cpuFits && vramFits {
 			waiter.state = admitGranted
 			waiter.grantedAt = s.admitNowTime()
 			waiter.accounted = true
@@ -2259,7 +2306,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// evaluated, so a later grant in this same pass reads this one at the
 			// fit-check above — exactly as the old `outstanding +=` did, now for two
 			// resources at once.
-			queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 			if waiter.waited {
 				waiter.outcome = "waited"
 				waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
@@ -2559,7 +2606,7 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 	// S5. Re-derives BOTH resources: the released lease's RAM (outstanding) and its
 	// cores (cpuOutstanding) drop together, so the per-slice CPU sum the fit-check
 	// reads returns the freed cores immediately on the next pass.
-	queue.outstanding, queue.cpuOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+	queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 	return true
 }
 
@@ -2780,6 +2827,14 @@ func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admit
 			message += " -- " + advice
 		}
 	}
+	// AIRA-268. Readable VRAM refusal messages (code-prefixed, so confineErrorCode
+	// extracts the code for the exit-status map exactly as for the RAM refusals).
+	if code == CodeAdmitVRAMTooLarge {
+		message = fmt.Sprintf("%s: declared VRAM %d exceeds the GPU budget %d (basis=%s)", code, rejection.Required, rejection.Ceiling, rejection.Basis)
+	}
+	if code == CodeAdmitVRAMUnavailable {
+		message = fmt.Sprintf("%s: a job declared VRAM but the GPU could not be read — no GPU or nvidia-smi unavailable (basis=%s)", code, rejection.Basis)
+	}
 	frame := errorFrame(code, message)
 	frame.Data, _ = json.Marshal(rejection)
 	_ = write(conn, frame)
@@ -2827,11 +2882,11 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// the count to 13. All prior additions were ADDITIVE: no existing field changed
 	// meaning, and (bar cpu, the second ledger resource) no admission, gate or
 	// emptiness decision reads the others.
-	if len(args) < 3 || len(args) > 13 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/signature/pinned/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	if len(args) < 3 || len(args) > 14 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/vram/signature/pinned/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "cpu" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
+		if name != "slice" && name != "reserve" && name != "cpu" && name != "vram" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -2854,6 +2909,15 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		cpu, ok = exactAdmitInt64(raw)
 		if !ok || cpu < 0 {
 			return admitRequest{}, fmt.Errorf("%s: admit cpu must be a non-negative integer", CodeProtocol)
+		}
+	}
+	// AIRA-268. vram is OPTIONAL (absent → 0, ungated). STRUCTURAL validation only:
+	// non-negative. The budget/ceiling refusals are decided at enqueue.
+	vram := int64(0)
+	if raw, exists := args["vram"]; exists {
+		vram, ok = exactAdmitInt64(raw)
+		if !ok || vram < 0 {
+			return admitRequest{}, fmt.Errorf("%s: admit vram must be a non-negative integer", CodeProtocol)
 		}
 	}
 	// S13: max_wait_ms is OPTIONAL. The confine client no longer sends it (a launch
@@ -3052,7 +3116,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3065,7 +3129,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// exclusive requires the tuple refused just above), and it is transcribed
 	// anyway so that relaxing either rule later cannot silently drop the field
 	// instead of failing a test.
-	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

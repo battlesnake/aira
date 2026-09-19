@@ -126,8 +126,8 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 // loudly by an OLD proto-12 daemon rather than silently mis-served (charged one core →
 // oversubscription); ARDR still crosses versions.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 13 {
-		t.Fatalf("ProtocolVersion = %d, want 13; a wire-shape or wire-semantics change must "+
+	if ProtocolVersion != 14 {
+		t.Fatalf("ProtocolVersion = %d, want 14; a wire-shape or wire-semantics change must "+
 			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }
