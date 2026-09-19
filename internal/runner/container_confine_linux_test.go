@@ -436,11 +436,12 @@ func TestFormatConfineStatusUnchangedWithoutContainer(t *testing.T) {
 		Priorities: ConfinePrioritiesApplied, CPUWeight: ConfineCPUWeightAging,
 		TerminatedBy: ConfineTerminatedNormal,
 	}
-	// AIRA-121 inserted `containment=` immediately after the slice, on the same
-	// always-rendered discipline as terminated-by and scope-swap.max: a trailer
-	// silent about WHAT KIND of containment it had cannot be told apart from a
-	// ci-shim job that had none at all.
-	const base = "confine: slice=aira.slice containment=enforced cap=enforced(64G) reserve=2G reserve-basis=pinned:client " +
+	// AIRA-121 renders `containment=` on the same always-rendered discipline as
+	// terminated-by and scope-swap.max: a trailer silent about WHAT KIND of
+	// containment it had cannot be told apart from a ci-shim job that had none at
+	// all. AIRA-267 then inserted `name=` as its own token between the slice and
+	// containment; this status carries no Name, so it renders name=unevaluated.
+	const base = "confine: slice=aira.slice name=unevaluated containment=enforced cap=enforced(64G) reserve=2G reserve-basis=pinned:client " +
 		"admission=immediate scope=placed scope-integrity=contained oom.group=set priorities=applied " +
 		// AIRA-110's scope-swap.max renders on EVERY trailer, on the same
 		// always-rendered discipline as terminated-by: a trailer silent about swap

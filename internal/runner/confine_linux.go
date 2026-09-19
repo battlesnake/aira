@@ -482,6 +482,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, identityErr
 	}
 	request.Name, request.Owner = normalizedName, normalizedOwner
+	// AIRA-267. Publish the normalized name onto the status so the trailer's
+	// `name=` facet carries it — set BEFORE the ci-shim branch below (which
+	// receives `result` by value), so both the shim and real paths render it. The
+	// early-abort paths above return before identity is validated and so carry no
+	// name (rendered as `name=unevaluated`), which is correct: nothing ran.
+	result.Status.Name = normalizedName
 	// AIRA-121. The ci-shim branch, taken HERE: after every argument, cap,
 	// reserve-bound and identity check (all of which are mode-independent and
 	// must refuse identically in both modes), and BEFORE the first line that

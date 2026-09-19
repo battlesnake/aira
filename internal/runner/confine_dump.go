@@ -103,8 +103,15 @@ type ConfineDumpQueueRow struct {
 // eventual total). A GRANTED or REJECTED waiter reports its daemon-decided
 // terminal Outcome and final WaitMS.
 type ConfineDumpWaiterRow struct {
-	RecordType   string `json:"record_type"`
-	Slice        string `json:"slice"`
+	RecordType string `json:"record_type"`
+	Slice      string `json:"slice"`
+	// Name is the job's --name label (AIRA-267), for per-task CI attribution. The
+	// daemon already carries it on the waiter (parity-checked against the scope
+	// id's embedded name at admit), so it is not a re-derivation. Only WAITER rows
+	// carry it: admission rows are signature-keyed persisted history with no
+	// per-job name, and inventing one there would violate this file's
+	// no-fabrication rule.
+	Name         string `json:"name,omitempty"`
 	ScopeID      string `json:"scope_id,omitempty"`
 	Signature    string `json:"signature,omitempty"`
 	ReserveBytes int64  `json:"reserve_bytes"`

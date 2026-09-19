@@ -477,6 +477,45 @@ func TestConfineDumpWaitersReportRealWaitAndOutcome(t *testing.T) {
 	}
 }
 
+// TestConfineDumpWaiterRowCarriesTaskName pins AIRA-267: a waiter row in the
+// confine --dump JSONL carries the job's --name so CI can attribute per-task
+// telemetry (the dump is archived at per-scope = per-leg granularity). An
+// unnamed waiter omits the field rather than fabricating one — matching the
+// dump's no-fabrication discipline (the daemon already holds waiter.name,
+// parity-checked against the scope id at admit, so this is not a re-derivation).
+//
+// verifies: AIRA-267
+func TestConfineDumpWaiterRowCarriesTaskName(t *testing.T) {
+	server := ciDumpTestServer(t)
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	server.admitNow = func() time.Time { return now }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, 0, 0, false, "no memory reader configured for this test"
+	}
+	injectCIDumpQueue(server, "/aira.slice", func(queue *sliceQueue) {
+		queue.waiters = []*admitWaiter{
+			{state: admitGranted, accounted: true, name: "leg-integration", scopeID: "s-named", signature: "cmd", enqueued: now, reserve: 1 << 20, cpu: 1, outcome: "immediate"},
+			{state: admitGranted, accounted: true, scopeID: "s-unnamed", signature: "cmd2", enqueued: now, reserve: 1 << 20, cpu: 1, outcome: "immediate"},
+		}
+	})
+
+	response := server.confineDump(map[string]any{"owner": "session-a"})
+	if !response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	result := response.Data.(runner.ConfineDumpResult)
+	byScope := map[string]runner.ConfineDumpWaiterRow{}
+	for _, row := range result.Waiters {
+		byScope[row.ScopeID] = row
+	}
+	if got := byScope["s-named"].Name; got != "leg-integration" {
+		t.Fatalf("named waiter row Name = %q, want leg-integration (AIRA-267 per-task attribution)", got)
+	}
+	if got := byScope["s-unnamed"].Name; got != "" {
+		t.Fatalf("unnamed waiter row Name = %q, want empty (omitempty, never fabricated)", got)
+	}
+}
+
 // TestConfineDumpAvailableUsesCurrentJobCountNotAProspectiveNewAdmission
 // pins the headroom-basis fix: the dump reports the CURRENT ledger's own
 // excursion, so its headroom must scale with the queue's OWN outstandingJobs

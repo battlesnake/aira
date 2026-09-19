@@ -248,6 +248,15 @@ func AitestBackendCanFunction(mode string) (string, bool) {
 // drift from a foreground one's.
 type ConfineStatus struct {
 	Slice string `json:"slice,omitempty"`
+	// Name is the job's --name label (AIRA-267), surfaced as the trailer `name=`
+	// facet so CI can attribute the trailer's own peak-rss/cpu/terminated-by to a
+	// named task (the per-TASK axis, as owner is the per-SESSION axis). It is the
+	// NORMALIZED name (an empty caller name defaults to "job"), set once identity
+	// is validated; an empty value here renders `name=unevaluated`, on the same
+	// always-rendered honesty discipline as containment/terminated-by. Safe to
+	// append unescaped to the space-delimited trailer: validateConfineName forbids
+	// spaces, '=' and ':'.
+	Name string `json:"name,omitempty"`
 	// Containment is AIRA-121's kind-of-containment facet. Always rendered on
 	// the trailer (see FormatConfineStatus); empty reads as unevaluated, never
 	// as enforced.
@@ -917,7 +926,14 @@ func FormatConfineStatus(status ConfineStatus) string {
 	if containment == "" {
 		containment = ConfineContainmentUnevaluated
 	}
-	line := "confine: slice=" + slice + " containment=" + string(containment) + " cap=" + string(capFacet)
+	// AIRA-267. The job's --name, rendered right after slice= so CI can attribute
+	// this trailer's peak-rss/cpu to a named task. Empty reads unevaluated (never a
+	// fabricated name), matching the other always-rendered facets.
+	name := status.Name
+	if name == "" {
+		name = "unevaluated"
+	}
+	line := "confine: slice=" + slice + " name=" + name + " containment=" + string(containment) + " cap=" + string(capFacet)
 	if status.CapBytes > 0 {
 		line += "(" + FormatConfineBytes(status.CapBytes) + ")"
 	}
