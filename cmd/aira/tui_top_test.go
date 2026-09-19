@@ -811,18 +811,27 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 // list is asserted with them in place; COMMAND stays LAST, which is the property
 // the width behaviour above depends on.
 //
+// AIRA-265 adds a SESSION column just before COMMAND. This record's owner is a
+// 64-hex worktree id -- exactly the value AIRA-135 dropped for crowding -- so the
+// SESSION cell must render its 8-char PREFIX, and the FULL hex must stay off
+// screen: the column brings the identity back without bringing the hex back.
+//
 // verifies: AIRA-135
 // verifies: AIRA-137
 // verifies: AIRA-233 — AGE re-added (compact) after LIVE; dropped set is now OWNER/SCOPE-ID/RSS
+// verifies: AIRA-265 — SESSION column before COMMAND; a 64-hex worktree owner shows only its prefix
 func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	command := "go test ./... -count=1"
 	record := topTestRecord("CONFINE-heavy-suite-31415-9f3ac1de@session-9f3ac1de", "heavy-suite", 42160*(1<<20), 9*gib)
 	record.Command = &command
+	// A discovered worktree owner: app.hashID's 64 lowercase hex characters. This
+	// is the crowding case AIRA-135 removed; AIRA-265 shows only the 8-char prefix.
+	record.Owner = strings.Repeat("9f3ac1de", 8)
 	age := int64(93784) // 1d2h3m4s -> compact "1d2h"
 	record.AgeSeconds = &age
 	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), record))
 
-	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}
+	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "SESSION", "COMMAND"}
 	if !reflect.DeepEqual(model.Headers, wantHeaders) {
 		t.Fatalf("headers=%v, want %v", model.Headers, wantHeaders)
 	}
@@ -833,14 +842,17 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 		t.Fatalf("rows=%+v, want one", model.Rows)
 	}
 	// AGE is the record's age rendered in the compact two-unit form. RAM is the
-	// record's live memory.current (9 GiB), and CPU is unevaluated on this single
-	// tick because a rate needs two samples.
-	wantCells := []string{"0", "heavy-suite", "4242", "yes", "1d2h", "42160M", "9216M", "unevaluated", command}
+	// record's live memory.current (9 GiB), CPU is unevaluated on this single tick
+	// because a rate needs two samples, and SESSION is the worktree owner's 8-char
+	// prefix (never the full hex).
+	wantCells := []string{"0", "heavy-suite", "4242", "yes", "1d2h", "42160M", "9216M", "unevaluated", "9f3ac1de", command}
 	if !reflect.DeepEqual(model.Rows[0].Cells, wantCells) {
 		t.Fatalf("cells=%v, want %v", model.Rows[0].Cells, wantCells)
 	}
 	// Every cell is present in full: nothing in the viewmodel may pre-truncate a
 	// value, because the table is the only thing that knows the terminal's width.
+	// (The SESSION prefix is a deliberate AIRA-265 identity handle, not a
+	// width-truncation of a value the table would otherwise clamp.)
 	for index, cell := range model.Rows[0].Cells {
 		if cell != wantCells[index] {
 			t.Fatalf("cell %d=%q, want the untruncated %q", index, cell, wantCells[index])
@@ -848,7 +860,8 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	}
 	// The dropped columns must be gone from the header row AND from the data, or
 	// the hex is still on screen under a different name. (AGE was re-added
-	// 2026-09-13 in a compact form and is no longer in this list.)
+	// 2026-09-13 in a compact form and is no longer in this list.) The FULL 64-hex
+	// owner and the full scope id must both be absent: SESSION shows only a prefix.
 	for _, gone := range []string{"OWNER", "SCOPE-ID", "RSS"} {
 		if containsString(model.Headers, gone) {
 			t.Fatalf("headers still carry the dropped column %s: %v", gone, model.Headers)
@@ -891,6 +904,78 @@ func TestTopCommandCellSaysUnevaluatedAndIsTerminalSafe(t *testing.T) {
 	}
 	if !strings.Contains(got, "not-a-tag") {
 		t.Fatalf("topCommandCell=%q, want the rest of the argv intact", got)
+	}
+}
+
+// topSessionCell surfaces the confining session (AIRA-265). Each arm is pinned:
+// an attested name and an inferred "@cwd-" hint show verbatim; a 64-hex worktree
+// owner collapses to its 8-char prefix (the AIRA-135 hex must not return); and a
+// missing/"unknown" owner falls back to the supervisor PID rather than a blank or
+// a fabricated name.
+//
+// verifies: AIRA-265
+func TestTopSessionCellSurfacesTheSessionWithoutTheHex(t *testing.T) {
+	pid := 4242
+	worktree := strings.Repeat("4f9ec70c", 8) // 64 lowercase hex: app.hashID's shape
+
+	cases := []struct {
+		name  string
+		owner string
+		want  string
+	}{
+		{"attested human name shows verbatim", "claude-stoner", "claude-stoner"},
+		{"a short name is not mistaken for a hash", "deploy", "deploy"},
+		{"inferred @cwd hint shows verbatim, @ kept", "@cwd-aira-265", "@cwd-aira-265"},
+		{"64-hex worktree owner collapses to its prefix", worktree, "4f9ec70c"},
+		{"literal unknown falls back to the PID", "unknown", "#4242"},
+		{"an empty owner falls back to the PID", "", "#4242"},
+		{"surrounding whitespace is trimmed", "  claude-stoner  ", "claude-stoner"},
+		// Precision of the hash test: it is EXACTLY 64 lowercase hex, so neither a
+		// 63-char near-miss nor a 64-char value carrying a non-hex rune is collapsed.
+		{"63 hex chars is not a worktree hash", strings.Repeat("a", 63), strings.Repeat("a", 63)},
+		{"64 chars with a non-hex rune is not a hash", "g" + strings.Repeat("a", 63), "g" + strings.Repeat("a", 63)},
+		{"uppercase 64-hex is not app.hashID's output", strings.Repeat("4F9EC70C", 8), strings.Repeat("4F9EC70C", 8)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := topSessionCell(runner.ConfineRecord{Owner: tc.owner, SupervisorPID: &pid})
+			if got != tc.want {
+				t.Fatalf("topSessionCell(%q)=%q, want %q", tc.owner, got, tc.want)
+			}
+		})
+	}
+
+	// The PID fallback is honest about an unestablished PID rather than printing
+	// "#unevaluated": with no owner AND no supervisor PID the cell is "unevaluated".
+	if got := topSessionCell(runner.ConfineRecord{Owner: "unknown"}); got != "unevaluated" {
+		t.Fatalf("topSessionCell(unknown, nil pid)=%q, want unevaluated", got)
+	}
+}
+
+// The whole point of AIRA-265: a session that exports AIRA_CONFINE_OWNER (which
+// reaches ConfineRecord.Owner) is now visible in `aira top`. Resolve the SESSION
+// cell by HEADER NAME, not a fixed index, so the assertion survives column moves.
+//
+// verifies: AIRA-265
+func TestTopViewModelSessionColumnShowsAnAttestedOwner(t *testing.T) {
+	record := topTestRecord("CONFINE-suite-4242-abc@claude-stoner", "suite", 4*gib, 1*gib)
+	record.Owner = "claude-stoner"
+	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), record))
+
+	session := -1
+	for i, header := range model.Headers {
+		if header == "SESSION" {
+			session = i
+		}
+	}
+	if session < 0 {
+		t.Fatalf("no SESSION column in headers: %v", model.Headers)
+	}
+	if len(model.Rows) != 1 {
+		t.Fatalf("rows=%+v, want one", model.Rows)
+	}
+	if got := model.Rows[0].Cells[session]; got != "claude-stoner" {
+		t.Fatalf("SESSION cell=%q, want the attested owner claude-stoner", got)
 	}
 }
 

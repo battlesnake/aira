@@ -35,3 +35,20 @@ Honest default: DO NOT fabricate a session name. `aira top` already has a PID co
 
 ## Strong cross-session recommendation → owner (upstream of aira)
 deploy + fly + qual + speed all point at the same real fleet-wide fix: the HARNESS/launcher injecting `AIRA_CONFINE_OWNER=<friendly-name>` into each session's env, which `aira confine` already auto-reads. aira CANNOT do the injection (the name isn't in the env and the registry is the harness's). Without it the column is mostly `—`/handles. Raise with whoever owns session launching.
+
+## FINALIZED design (grounded in live data, 2026-09-19 — build)
+Grounded the actual owner shapes that reach `ConfineRecord.Owner` (resolveOwnerIn, main.go): (1) an ATTESTED human name from `--owner`/`AIRA_CONFINE_OWNER` (e.g. `claude-stoner`); (2) `project.WorktreeID` = `hashID(gitDir)` = `hex(sha256)` = EXACTLY 64 lowercase hex chars (confirmed: `internal/app/project.go:195,850` + live `confine --list` showed `4f9ec70c…8d7aa`, `37d4080e…e3c6`); (3) `InferConfineOwner` = `@cwd-<sanitized-dir-basename>` (short, HUMAN-READABLE, `@`-prefixed to mark it un-attested — confine.go:736); (4) `ConfineUnknownOwner` = `"unknown"`.
+
+**`topSessionCell(record)` (cmd/aira/tui_top.go), three arms:**
+- **64-hex WorktreeID hash** (`isWorktreeHash` = `len==64 && all-lowercase-hex`, precise match to sha256 — NOT a heuristic): show the **8-char prefix** (`4f9ec70c`). This is the AIRA-135 fix — the full hex crowded the table off screen — and the prefix GROUPS a worktree's un-annotated jobs (two jobs sharing a worktree share a prefix; the PID column can't show that grouping). Within owner's approved "short scope-id / PID".
+- **empty or `unknown`**: `#<supervisor-pid>` (honest, never fabricated, never blank — satisfies subpipe). Rare (resolveOwnerIn almost always yields a name / worktree-hash / @cwd).
+- **otherwise** (attested human name, OR `@cwd-<dir>` inferred hint): show the owner **VERBATIM**. Both are short + human-readable; the `@` stays on screen so an inferred owner is not mistaken for a claimed session. **No truncation in the viewmodel** — the table (tview) clamps to terminal width; tui_top_test.go:843 pins the "viewmodel never pre-truncates" invariant, so a cap here would violate it. A user who sets a long `AIRA_CONFINE_OWNER` gets what they chose, clamped by the table.
+
+**Column placement:** SESSION inserted **before COMMAND** (COMMAND stays last — it is the unbounded-width cell that absorbs the clamp). Headers + row cells at tui_top.go:613/662. Updates the index-based `wantCells` test (tui_top_test.go:838) + the header-order/dropped-columns assertions in the same test.
+
+**SKILL sharpening** (skill.go:318 already documents `export AIRA_CONFINE_OWNER=<stable-session-id>`): add that it is what surfaces the session in the new `aira top` **SESSION** column (and `confine --list`), so agents know WHY to set it. MCP confine descriptor likewise if it carries the same guidance. skill_test.go pin for the new phrase.
+
+**Release:** client-only v0.20 (top + skill are client-side; daemon unchanged). 6 live confine scopes on the box at build time → **NO daemon restart** (would blip peers). SKILL needs a separate `aira skill install`.
+
+## Fallback decision RESOLVED (was "decision needed at build")
+Chose a hybrid of the two options: NOT a bare `—` (subpipe's ask honoured) and NOT fabricated. Hex → 8-char grouping prefix; empty/unknown → PID handle; `@cwd-` shown through (readable + honest). This is within the owner's AskUserQuestion answer ("Short scope-id / PID") for the unset cell.

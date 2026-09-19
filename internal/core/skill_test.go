@@ -57,6 +57,9 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		"Kill the scope, not a bash wrapper",
 		"Never `kill -9` the supervisor",
 		"`export AIRA_CONFINE_OWNER=<stable-session-id>`",
+		// AIRA-265. The guidance must tell agents WHY to set it: it surfaces the
+		// session in the new `aira top` SESSION column (and confine --list).
+		"`SESSION` column of `aira top`",
 		// AIRA-22. The guide must teach the detached form AND its exit-code trap:
 		// `--detach` exits 0 when the supervisor started, which an agent reading
 		// only `$?` would otherwise take as the job having succeeded.

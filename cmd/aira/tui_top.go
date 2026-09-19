@@ -601,16 +601,19 @@ func formatConfineAgeShort(seconds int64) string {
 //
 // previous is the state from the last tick; the returned value replaces it.
 func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel, topTick) {
-	// AIRA-135's column set plus AIRA-137's two live-usage columns. OWNER and
-	// SCOPE-ID stay gone because they rendered as long meaningless hex that crowded
-	// every useful column off a normal terminal — tview sizes columns greedily left
-	// to right and clamps whatever no longer fits, which is why RESERVE was
-	// arriving truncated. RAM sits beside RESERVATION because the pair is one
-	// question ("how much of its grant is it using, and how much is that"), and CPU
-	// beside it because the two live readings belong together. COMMAND is last on
-	// purpose: it is the one cell with no bound on its natural width, so it absorbs
-	// the clamp instead of imposing it.
-	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "COMMAND"}}
+	// AIRA-135's column set plus AIRA-137's two live-usage columns. The raw OWNER
+	// and SCOPE-ID columns stay gone because they rendered as long meaningless hex
+	// that crowded every useful column off a normal terminal — tview sizes columns
+	// greedily left to right and clamps whatever no longer fits, which is why
+	// RESERVE was arriving truncated. AIRA-265 adds a narrow SESSION column that
+	// brings the identity back WITHOUT the hex (topSessionCell): a human-friendly
+	// AIRA_CONFINE_OWNER is shown as-is, a worktree hash as a short prefix. RAM sits
+	// beside RESERVATION because the pair is one question ("how much of its grant is
+	// it using, and how much is that"), and CPU beside it because the two live
+	// readings belong together. COMMAND is last on purpose: it is the one cell with
+	// no bound on its natural width, so it absorbs the clamp instead of imposing it;
+	// SESSION goes just before it.
+	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "SESSION", "COMMAND"}}
 	if result.Verdict == "unevaluated" {
 		reason := strings.TrimSpace(result.Reason)
 		if reason == "" {
@@ -663,7 +666,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
 				topRAMCell(record.RSSBytes),
-				topCPUCell(rate, rateKnown), topCommandCell(record.Command),
+				topCPUCell(rate, rateKnown), topSessionCell(record), topCommandCell(record.Command),
 			},
 		})
 		if reserve.State == topReserveSet {
@@ -875,6 +878,58 @@ func topCommandCell(command *string) string {
 		builder.WriteRune(r)
 	}
 	return tview.Escape(builder.String())
+}
+
+// topSessionCell renders the SESSION column: the session that launched the job,
+// so `aira top` reflects an AIRA_CONFINE_OWNER (or --owner) the way
+// `aira confine --list` already does (AIRA-265).
+//
+// AIRA-135 dropped the raw OWNER column because a discovered worktree owner is a
+// 64-character sha256 hex (app.hashID) that crowded every useful column off a
+// normal terminal. This column brings the identity back WITHOUT that hex:
+//   - an attested session name (AIRA_CONFINE_OWNER / --owner), or the inferred
+//     "@cwd-<dir>" launch-site hint (runner.InferConfineOwner): shown VERBATIM.
+//     Both are short and human-readable, and the leading "@" is kept on screen so
+//     an inferred owner is not mistaken for a claimed session
+//     (runner.ConfineOwnerIsAttested). No width-truncation happens here — the
+//     table clamps a cell to the terminal, and topViewModel's tests pin that the
+//     viewmodel never pre-truncates a value.
+//   - a 64-hex worktree owner: shown as its 8-character PREFIX, enough to GROUP a
+//     worktree's un-annotated jobs (two jobs from one worktree share it, which the
+//     PID column cannot show) without the hex re-crowding the table.
+//   - no owner, or the literal "unknown": the supervisor PID as "#<pid>" (or
+//     "unevaluated" when even that is unknown), so the cell attributes the job
+//     honestly rather than blanking or inventing a name.
+func topSessionCell(record runner.ConfineRecord) string {
+	owner := strings.TrimSpace(record.Owner)
+	switch {
+	case isWorktreeHash(owner):
+		return owner[:8]
+	case owner == "" || owner == runner.ConfineUnknownOwner:
+		if record.SupervisorPID != nil {
+			return "#" + strconv.Itoa(*record.SupervisorPID)
+		}
+		return "unevaluated"
+	default:
+		return owner
+	}
+}
+
+// isWorktreeHash reports whether owner is a discovered worktree id: EXACTLY the
+// 64 lowercase hex characters that app.hashID (hex.EncodeToString of a sha256
+// sum) produces. The exact-length, lowercase-hex test is a precise match for that
+// one shape, not a heuristic — a human session name is short and carries letters
+// or punctuation outside [0-9a-f], so it is never mistaken for a hash.
+func isWorktreeHash(owner string) bool {
+	if len(owner) != 64 {
+		return false
+	}
+	for _, r := range owner {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // topLiveCell renders liveness from the SUBTREE-aware signal, and says so when

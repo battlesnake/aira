@@ -1875,7 +1875,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
-			stringSpec("owner", false, false, "Cooperative owner identity"),
+			stringSpec("owner", false, false, "Cooperative owner (session) identity; the AIRA_CONFINE_OWNER env var sets the same thing. A human-friendly name is shown in the SESSION column of `aira top` and in confine --list, attributing your jobs to your session"),
 			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
