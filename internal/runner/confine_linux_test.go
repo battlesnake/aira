@@ -1382,6 +1382,61 @@ func TestConfinePeakReportIsGatedOnRunOutcome(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-264 (Fable finding 2) — the terminatedBySignal argument at the
+// report site is load-bearing. The ONLY shape that isolates it: the child CATCHES
+// the forwarded SIGTERM and exits 0, so the exit code and the wait status both
+// read "clean" and only the supervisor-signal witness says the operator ended it.
+// A confined clean-looking run that was actually interrupted must NOT teach the
+// estimator. Without the terminatedBySignal wiring at confine_linux.go's report
+// site (e.g. passing nil), reportPeak fires here even though exit==0.
+func TestConfinePeakReportWithheldWhenSupervisorSignalCaughtAndChildExitsZero(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ready")
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	signals := make(chan os.Signal, 1)
+	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
+	called := false
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error {
+		called = true
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.Now().Add(testdeadline.Wait(10 * time.Second))
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(marker); err == nil {
+				signals <- syscall.SIGTERM
+				return
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	var diagnostics bytes.Buffer
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice:    "finite.slice",
+		Argv:     []string{"/bin/sh", "-c", `trap 'exit 0' TERM; echo ready > "$1"; while :; do sleep 0.05; done`, "sh", marker},
+		SelfPath: os.Args[0], Stderr: &diagnostics,
+	}, deps)
+	<-done
+	if err != nil {
+		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
+	}
+	trailer := diagnostics.String()
+	if result.Exit != 0 {
+		t.Fatalf("probe shape not reached: exit=%d trailer=%q", result.Exit, trailer)
+	}
+	if !strings.Contains(trailer, "terminated-by=supervisor-signal:SIGTERM") {
+		t.Fatalf("probe shape not reached: trailer %q lacks supervisor-signal:SIGTERM", trailer)
+	}
+	if called {
+		t.Fatalf("reportPeak fired for a supervisor-signalled run that exited 0 (exit=%d)", result.Exit)
+	}
+}
+
 // verifies: AIRA-104 -- CPUUser/CPUSys reach result.Status from the SAME
 // deps.readUsage call that already yields PeakRSS, with no second read
 // introduced. Also pins that a genuinely-zero CPU reading is preserved

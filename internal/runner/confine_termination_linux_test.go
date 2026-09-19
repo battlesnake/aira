@@ -193,6 +193,13 @@ func TestShouldRecordConfinePeakTracksTheClassifier(t *testing.T) {
 		{name: "descendant OOM under clean exit records", term: exited, usage: descendantOOM, exit: 0, want: true},
 		{name: "drained-leader OOM records", term: signalled(syscall.SIGKILL), usage: drainedOOM, exit: 137, want: true},
 		{name: "undecoded wait status is excluded", term: confineTermination{}, usage: cgroupUsage{}, exit: 3, want: false},
+		// Undecoded paired with exit 0: production never pairs them
+		// (waitConfineCommand returns exit 3 for an undecoded status), exactly as
+		// it never pairs Signaled with exit 0. This pins term.Decoded the same way
+		// the signalled row pins !term.Signaled — without it, dropping the Decoded
+		// clause from the predicate survives (the exit-3 row above does not catch
+		// it). (AIRA-264, Fable finding 2.)
+		{name: "undecoded wait with a zero exit is still excluded", term: confineTermination{}, usage: cgroupUsage{}, exit: 0, want: false},
 		{name: "wall-deadline kill is excluded", term: signalled(syscall.SIGKILL), usage: readable(0), deadline: deadlineKindWall, exit: 137, want: false},
 		{name: "unattributed SIGKILL is excluded", term: signalled(syscall.SIGKILL), usage: readable(0), exit: 137, want: false},
 	} {
