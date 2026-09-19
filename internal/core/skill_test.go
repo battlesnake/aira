@@ -56,10 +56,15 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		"`aira confine --kill <name|supervisor-pid|scope-id>`",
 		"Kill the scope, not a bash wrapper",
 		"Never `kill -9` the supervisor",
-		"`export AIRA_CONFINE_OWNER=<stable-session-id>`",
-		// AIRA-265. The guidance must tell agents WHY to set it: it surfaces the
-		// session in the new `aira top` SESSION column (and confine --list).
+		// AIRA-265. The guidance must tell agents WHY to set the owner: it surfaces
+		// the session in the new `aira top` SESSION column (and confine --list).
 		"`SESSION` column of `aira top`",
+		// AIRA-266. The owner steer must teach the INLINE env-var prefix on the
+		// launch command (propagates into nested aira confine calls) and WARN against
+		// a shared-profile export (which mislabels every session on a shared box) —
+		// NOT a bare `export`, which does not persist per Claude Bash call.
+		"AIRA_CONFINE_OWNER=<name> make -j",
+		"SHARED shell profile",
 		// AIRA-22. The guide must teach the detached form AND its exit-code trap:
 		// `--detach` exits 0 when the supervisor started, which an agent reading
 		// only `$?` would otherwise take as the job having succeeded.
