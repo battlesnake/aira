@@ -93,6 +93,49 @@ func TestShimConfineLaunchesWithoutTouchingAnyCgroupSeam(t *testing.T) {
 	}
 }
 
+// TestShimConfineWiresTheNameOntoTheStatus pins the AIRA-267 ASSEMBLY wiring
+// (confineWithDeps: normalizeConfineIdentity -> result.Status.Name), which the
+// FormatConfineStatus render test cannot reach because it builds a ConfineStatus
+// directly. A mutation dropping `result.Status.Name = normalizedName` reds this.
+// The shim path exercises the same assembly with no cgroup seam.
+//
+// verifies: AIRA-267
+func TestShimConfineWiresTheNameOntoTheStatus(t *testing.T) {
+	// An explicit --name reaches the status AND the emitted trailer verbatim.
+	var stderr bytes.Buffer
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Argv: []string{"/bin/true"}, Name: "leg-integration", SelfPath: os.Args[0],
+		Stderr: &stderr, Stdout: io.Discard,
+	}, shimUnitDeps())
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("shim confine result=%+v err=%v", result, err)
+	}
+	if result.Status.Name != "leg-integration" {
+		t.Fatalf("result.Status.Name = %q, want leg-integration (assembly must publish the normalized name)", result.Status.Name)
+	}
+	// The EMITTED trailer (read from the stderr the supervisor actually wrote, not
+	// one this test re-formats) carries the facet. This pins the emission call
+	// site, which formats result.Status: a mutation that emitted a fresh
+	// ConfineStatus{} there would survive an assert on a locally-formatted line but
+	// reds here.
+	if !strings.Contains(stderr.String(), " name=leg-integration ") {
+		t.Fatalf("emitted trailer %q missing the name=leg-integration facet", stderr.String())
+	}
+
+	// An empty caller name is normalized to "job" by the SAME assembly path and
+	// surfaces as name=job, never name=unevaluated — proving the status carries the
+	// normalized name, not the raw (empty) request value.
+	defaulted, err := confineWithDeps(context.Background(), ConfineRequest{
+		Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard, Stdout: io.Discard,
+	}, shimUnitDeps())
+	if err != nil || defaulted.Exit != 0 {
+		t.Fatalf("shim confine (default name) result=%+v err=%v", defaulted, err)
+	}
+	if defaulted.Status.Name != "job" {
+		t.Fatalf("result.Status.Name = %q, want the default \"job\"", defaulted.Status.Name)
+	}
+}
+
 // verifies: AIRA-121 requirement 6, ticket test (e)
 //
 // The consumer's literal merge-gate invocation shape. The second half is what

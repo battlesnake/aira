@@ -41,6 +41,32 @@ func TestConfineTrailerBeginsOnOwnLineAfterPartialStderr(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-267 — the REAL (non-shim) confineWithDeps path EMITS the name=
+// facet on the supervisor's own stderr trailer, not merely populating
+// result.Status.Name. The shim wiring test covers the ci-shim emission site;
+// this pins the real-path emission — FormatConfineStatus(result.Status) written
+// to the supervisor's diagnostics — which a mutation rebuilding a fresh
+// ConfineStatus at that site would otherwise slip past, since the status-field
+// assertion alone never reaches the emitted line.
+func TestConfineRealPathEmitsTheNameFacet(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.readUsage = func(string) cgroupUsage {
+		return cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}
+	}
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
+	var diagnostics bytes.Buffer
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0],
+		Name: "leg-integration", Stderr: &diagnostics,
+	}, deps); err != nil {
+		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
+	}
+	if !strings.Contains(diagnostics.String(), " name=leg-integration ") {
+		t.Fatalf("real-path trailer %q missing the name=leg-integration facet", diagnostics.String())
+	}
+}
+
 // Case 2 (discriminating): the child writes a partial line to its STDOUT, which
 // is wired RAW -- NOT through the locked writer. With Stdout and Stderr pointing
 // at the SAME *os.File, the raw stdout partial and the locked-writer trailer

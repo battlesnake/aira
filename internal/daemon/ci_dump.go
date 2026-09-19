@@ -214,6 +214,7 @@ func (s *Server) buildConfineDumpQueuesAndWaiters() ([]runner.ConfineDumpQueueRo
 			}
 			waiterRow := runner.ConfineDumpWaiterRow{
 				RecordType: runner.ConfineDumpRecordWaiter, Slice: path,
+				Name:    waiter.name, // AIRA-267: per-task name for CI attribution
 				ScopeID: waiter.scopeID, Signature: waiter.signature,
 				ReserveBytes: waiter.reserve, CPUCores: waiter.cpu,
 				State: waiterStateName(waiter), Outcome: waiterOutcomeName(waiter),

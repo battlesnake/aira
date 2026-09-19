@@ -24,25 +24,35 @@ func TestFormatConfineNeverRan(t *testing.T) {
 			name:   "admission saturated",
 			status: ConfineStatus{Slice: "aira.slice", AdmissionState: "saturated"},
 			err:    errors.New("E_ADMIT_SATURATED: confine: admission rejected after 3m0s — slice contended"),
-			want:   "confine: ran=no code=E_ADMIT_SATURATED slice=aira.slice admission=saturated",
+			want:   "confine: ran=no code=E_ADMIT_SATURATED slice=aira.slice name=unevaluated admission=saturated",
+		},
+		{
+			// AIRA-267: a NAMED leg refused before it ran stays attributable — the
+			// name= facet carries the label even though nothing executed. Distinct
+			// from the unnamed cases so a constant `name=unevaluated` render (which
+			// would satisfy every other case here) reds this one.
+			name:   "a named leg refused admission stays attributable",
+			status: ConfineStatus{Slice: "aira.slice", Name: "leg-integration", AdmissionState: "saturated"},
+			err:    errors.New("E_ADMIT_SATURATED: confine: admission rejected after 3m0s — slice contended"),
+			want:   "confine: ran=no code=E_ADMIT_SATURATED slice=aira.slice name=leg-integration admission=saturated",
 		},
 		{
 			name:   "slice unavailable before any admission attempt",
 			status: ConfineStatus{Slice: "aira.slice", Admission: ConfineAdmissionUnevaluated},
 			err:    errors.New("E_CONFINE_UNAVAILABLE: slice aira.slice: slice-not-found"),
-			want:   "confine: ran=no code=E_CONFINE_UNAVAILABLE slice=aira.slice admission=unevaluated",
+			want:   "confine: ran=no code=E_CONFINE_UNAVAILABLE slice=aira.slice name=unevaluated admission=unevaluated",
 		},
 		{
 			name:   "nothing established at all",
 			status: ConfineStatus{},
 			err:    errors.New("something went wrong with no code at all"),
-			want:   "confine: ran=no code=unevaluated slice=unevaluated admission=unevaluated",
+			want:   "confine: ran=no code=unevaluated slice=unevaluated name=unevaluated admission=unevaluated",
 		},
 		{
 			name:   "structured admission facet stands in for a missing wire state",
 			status: ConfineStatus{Slice: "other.slice", Admission: ConfineAdmissionTimeout},
 			err:    errors.New("E_CONFINE_UNAVAILABLE: slice other.slice: start in scope: boom"),
-			want:   "confine: ran=no code=E_CONFINE_UNAVAILABLE slice=other.slice admission=" + string(ConfineAdmissionTimeout),
+			want:   "confine: ran=no code=E_CONFINE_UNAVAILABLE slice=other.slice name=unevaluated admission=" + string(ConfineAdmissionTimeout),
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
