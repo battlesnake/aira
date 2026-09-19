@@ -690,12 +690,20 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 					return
 				default:
 				}
+				// AIRA-268. When VRAM is declared, name it in the waiting line so an
+				// operator does not misread a VRAM-contended hold as a RAM one. The
+				// client knows its own declared VRAM locally — no wire field needed;
+				// the precise daemon-side "held on: vram" attribution is deferred.
+				vramNote := ""
+				if request.VRAMBytes > 0 {
+					vramNote = ", declared VRAM " + FormatConfineBytes(request.VRAMBytes)
+				}
 				if pinned {
-					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds%s)\n",
-						sliceName, FormatConfineBytes(reserve), waited, queueNote)
+					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s%s, waited %ds%s)\n",
+						sliceName, FormatConfineBytes(reserve), vramNote, waited, queueNote)
 				} else {
-					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds%s)\n",
-						sliceName, FormatConfineBytes(reserve), waited, queueNote)
+					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s%s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds%s)\n",
+						sliceName, FormatConfineBytes(reserve), vramNote, waited, queueNote)
 				}
 			}
 		}

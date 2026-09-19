@@ -167,12 +167,15 @@ func (s *Server) vramCurrent() vramSnapshot {
 }
 
 // vramEffectiveBudget is the configured budget, or the physical total when
-// auto-detecting (budget == 0).
+// auto-detecting (budget == 0). CLAMPED to the physical total: a misconfigured
+// budget larger than the card must not let a job bigger than the card pass the
+// enqueue too-large gate and then HOLD forever (physical free can never reach it).
 func (s *Server) vramEffectiveBudget(total int64) int64 {
-	if s.vramBudgetBytes > 0 {
-		return s.vramBudgetBytes
+	budget := s.vramBudgetBytes
+	if budget <= 0 || (total > 0 && budget > total) {
+		return total
 	}
-	return total
+	return budget
 }
 
 // vramWaiterFitsLocked reports whether a vram>0 waiter fits, reading the atomic

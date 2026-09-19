@@ -218,11 +218,13 @@ func NewServer(paths Paths) *Server {
 	}
 	server.projectCond = sync.NewCond(&server.mu)
 	server.confineMode = runner.ConfineModeReal
-	// AIRA-268. The machine-wide VRAM budget is configured via AIRA_VRAM_BUDGET (a
-	// size string, e.g. "14G"), which `aira install` sets in the daemon service.
-	// Absent/unparseable → 0 = auto-detect (the nvidia-smi total). A malformed value
-	// is IGNORED (falls back to auto-detect) rather than fatal — a bad env must not
-	// wedge the daemon.
+	// AIRA-268. The machine-wide VRAM budget is read from AIRA_VRAM_BUDGET (a size
+	// string, e.g. "14G") on the daemon's environment. `aira install` does NOT yet
+	// bake this Environment= line into the daemon service (a `--vram-budget` install
+	// flag is a deferred fast-follow, AIRA-248); set it manually in the unit for now
+	// (release notes document it). Absent/unparseable → 0 = auto-detect (the
+	// nvidia-smi total). A malformed value is IGNORED (falls back to auto-detect)
+	// rather than fatal — a bad env must not wedge the daemon.
 	if raw := os.Getenv("AIRA_VRAM_BUDGET"); raw != "" {
 		if budget, err := runner.ParseMemorySize(raw); err == nil && budget > 0 {
 			server.vramBudgetBytes = budget
