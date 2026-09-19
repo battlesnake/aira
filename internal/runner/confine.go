@@ -844,7 +844,17 @@ func FormatConfineNeverRan(status ConfineStatus, err error) string {
 	if admission == "" {
 		admission = "unevaluated"
 	}
-	return "confine: " + ConfineNeverRanFacet + " code=" + code + " slice=" + slice + " admission=" + admission
+	// AIRA-267. The name follows the slice, matching the ran trailer's ordering,
+	// so a NAMED leg refused before it ran (admission saturated, slice
+	// unavailable) is still attributable in the CI artifact. Read from
+	// status.Name — set only at the post-validation assembly site — never
+	// request.Name, whose pre-validation raw value could hold a newline; an
+	// early abort leaves status.Name empty and so renders name=unevaluated.
+	name := status.Name
+	if name == "" {
+		name = "unevaluated"
+	}
+	return "confine: " + ConfineNeverRanFacet + " code=" + code + " slice=" + slice + " name=" + name + " admission=" + admission
 }
 
 // confineErrorCode extracts the stable leading error code from a confine error.
