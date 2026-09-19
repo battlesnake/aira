@@ -37,9 +37,24 @@ func (r *Runner) PeakRSSHistory(ctx context.Context, signature string) (PeakRSSS
 	readCtx, cancel := context.WithTimeout(ctx, sampleReadTimeout)
 	defer cancel()
 	var stats PeakRSSStats
-	err = db.QueryRowContext(readCtx, `SELECT COUNT(*),
- COALESCE(SUM(CASE WHEN status IN ('exited','oom-killed') AND peak_rss > 0 THEN 1 ELSE 0 END),0),
- COALESCE(MAX(CASE WHEN status IN ('exited','oom-killed') AND peak_rss > 0 THEN peak_rss END),0),
+	// AIRA-264: a usable memory sample is a clean success (exited with exit_code
+	// 0) or an OOM (kept -- an OOM is the strongest signal the estimate was too
+	// low, and self-heal keys on OOMCount). A non-zero exit is a failed workload
+	// and teaches the estimator nothing trustworthy; a NULL exit_code (an old
+	// pre-column projection, or a record with no exit code) is conservatively
+	// excluded, since `exit_code = 0` is false for NULL.
+	//
+	// TotalCount counts rows with a USABLE OUTCOME (regardless of whether a peak
+	// was captured), NOT every row: EstimateMemoryReserve reads TotalCount>0 &&
+	// SampleCount==0 as "capture-unavailable" (the runs were fine, the peak
+	// reading was not). Counting failed runs in TotalCount would mislabel an
+	// all-failed signature as capture-unavailable when the honest answer is
+	// no-history (AIRA-149: a label names the term that acted). SampleCount and
+	// PeakMax additionally require peak_rss>0; OOMCount is the oom-killed subset.
+	err = db.QueryRowContext(readCtx, `SELECT
+ COALESCE(SUM(CASE WHEN (status='exited' AND exit_code = 0) OR status='oom-killed' THEN 1 ELSE 0 END),0),
+ COALESCE(SUM(CASE WHEN ((status='exited' AND exit_code = 0) OR status='oom-killed') AND peak_rss > 0 THEN 1 ELSE 0 END),0),
+ COALESCE(MAX(CASE WHEN ((status='exited' AND exit_code = 0) OR status='oom-killed') AND peak_rss > 0 THEN peak_rss END),0),
  COALESCE(SUM(CASE WHEN status='oom-killed' AND peak_rss > 0 THEN 1 ELSE 0 END),0)
 FROM runs WHERE resource_signature = ?`, signature).Scan(&stats.TotalCount, &stats.SampleCount, &stats.PeakMax, &stats.OOMCount)
 	if err != nil {

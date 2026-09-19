@@ -1380,7 +1380,10 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// The OPERATOR-facing attribution is a different question and is classified,
 	// never assumed from the hierarchical counter (AIRA-102).
 	oomAttribution := classifyConfineOOM(usage)
-	if signature != "" {
+	// AIRA-264. A run whose WORKLOAD failed must not teach the estimator: only an
+	// OOM (kept, drives self-heal) or a clean success is a trustworthy peak
+	// sample. See shouldRecordConfinePeak.
+	if signature != "" && shouldRecordConfinePeak(oom, termination, terminatedBySignal, exitCode) {
 		reportCtx, cancelReport := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		// AIRA-180. The budget term travels with the sample. Before this, the
 		// reserve/cap a confine job was actually granted was persisted NOWHERE
@@ -2677,6 +2680,39 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 		return ConfineTerminatedDeadlinePrefix + confineDeadlineBound(deadlineKill)
 	}
 	return ConfineTerminatedUnattributedSIGKILL
+}
+
+// shouldRecordConfinePeak is AIRA-264: the send-gate for a peak-RSS learning
+// sample. AIRA sizes a signature's future memory reserve from the peaks of PAST
+// runs (ConfinePeakHistory -> EstimateMemoryReserve, and the machine-wide
+// ConfinePeakP90 cold-start prior), so a run whose WORKLOAD failed must not move
+// a subsequent run's limit: a crash, a non-zero exit, a deadline kill or an
+// operator Ctrl-C says nothing trustworthy about how much memory the command
+// legitimately needs. Exactly two outcomes are trustworthy, and only two:
+//
+//   - oom: an OOM anywhere under the scope (the HIERARCHICAL counter, the same
+//     bit reportPeak sends). Kept DELIBERATELY -- an OOM is the strongest signal
+//     that the estimate was too LOW, and self-heal is built on it:
+//     EstimateMemoryReserve's headroom bump when OOMCount>0 and admit.go's
+//     1.5xMaxOOMPeak escalation. Excluding OOM would break the self-heal chain
+//     the real-cgroup fixture asserts, which the owner ruled must stay
+//     (AIRA-264: "keep OOM, exclude the rest").
+//   - a CLEAN success: decoded, exited by itself (not signalled), not ended by a
+//     supervisor signal, and exit code 0.
+//
+// The clean arm is EXACTLY classifyConfineTermination(...) ==
+// ConfineTerminatedNormal AND exitCode == 0. When a job is not signalled,
+// `killed` is false, so the OOM / deadline / unattributed-SIGKILL arms (all
+// guarded by `killed`) cannot fire, leaving Normal iff decoded, not signalled,
+// and no supervisor signal -- the three terms below, all of which are in scope
+// at the report site (whereas the deadline classification is computed later).
+// TestShouldRecordConfinePeakTracksTheClassifier pins this to the classifier as
+// an oracle so the two cannot drift.
+func shouldRecordConfinePeak(oom bool, term confineTermination, supervisorSignal os.Signal, exitCode int) bool {
+	if oom {
+		return true
+	}
+	return term.Decoded && !term.Signaled && supervisorSignal == nil && exitCode == 0
 }
 
 // confineSignalName renders the kernel's own mnemonic ("SIGTERM"). Note that

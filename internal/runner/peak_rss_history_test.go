@@ -19,15 +19,22 @@ func TestPeakRSSHistoryFiltersAndAggregatesRealProjection(t *testing.T) {
 	}
 	positive100, positive250, zero := int64(100), int64(250), int64(0)
 	partial999, partial888, partial777 := int64(999), int64(888), int64(777)
+	failedPeak, nullExitPeak := int64(5000), int64(6000)
+	exit0, exit1 := 0, 1
 	records := []RunRecord{
-		{ID: "RUN-1", Status: StatusExited, PeakRSS: &positive100, ResourceSignature: "sig"},
+		{ID: "RUN-1", Status: StatusExited, PeakRSS: &positive100, ExitCode: &exit0, ResourceSignature: "sig"},
 		{ID: "RUN-2", Status: StatusOOMKilled, PeakRSS: &positive250, ResourceSignature: "sig"},
-		{ID: "RUN-3", Status: StatusExited, PeakRSS: &zero, ResourceSignature: "sig"},
+		{ID: "RUN-3", Status: StatusExited, PeakRSS: &zero, ExitCode: &exit0, ResourceSignature: "sig"},
 		{ID: "RUN-4", Status: StatusKilled, PeakRSS: &partial999, ResourceSignature: "sig"},
 		{ID: "RUN-5", Status: StatusCancelled, PeakRSS: &partial888, ResourceSignature: "sig"},
 		{ID: "RUN-6", Status: StatusLost, PeakRSS: &partial777, ResourceSignature: "sig"},
-		{ID: "RUN-7", Status: StatusExited, ResourceSignature: "sig"},
-		{ID: "RUN-8", Status: StatusExited, PeakRSS: &partial999, ResourceSignature: "other"},
+		{ID: "RUN-7", Status: StatusExited, ExitCode: &exit0, ResourceSignature: "sig"},
+		{ID: "RUN-8", Status: StatusExited, PeakRSS: &partial999, ExitCode: &exit0, ResourceSignature: "other"},
+		// AIRA-264: a failed workload (non-zero exit) and a record with no
+		// recorded exit code are both excluded, even with a large peak that would
+		// dominate PeakMax if it leaked in.
+		{ID: "RUN-9", Status: StatusExited, PeakRSS: &failedPeak, ExitCode: &exit1, ResourceSignature: "sig"},
+		{ID: "RUN-10", Status: StatusExited, PeakRSS: &nullExitPeak, ResourceSignature: "sig"},
 	}
 	for _, record := range records {
 		record.SchemaVersion = ledgerSchema
@@ -42,7 +49,12 @@ func TestPeakRSSHistoryFiltersAndAggregatesRealProjection(t *testing.T) {
 	if err != nil || !readable {
 		t.Fatalf("PeakRSSHistory readable=%v err=%v", readable, err)
 	}
-	want := PeakRSSStats{TotalCount: 7, SampleCount: 2, PeakMax: 250, OOMCount: 1}
+	// AIRA-264: TotalCount counts USABLE-OUTCOME rows (RUN-1 clean, RUN-2 oom,
+	// RUN-3 clean/zero-peak, RUN-7 clean/no-peak), NOT every row — the failed
+	// (RUN-9), NULL-exit (RUN-10) and killed/cancelled/lost rows are excluded, so
+	// an all-failed signature reads TotalCount==0 (no-history), not
+	// capture-unavailable. SampleCount additionally requires peak_rss>0.
+	want := PeakRSSStats{TotalCount: 4, SampleCount: 2, PeakMax: 250, OOMCount: 1}
 	if stats != want {
 		t.Fatalf("stats=%+v want %+v", stats, want)
 	}
@@ -62,14 +74,54 @@ func TestPeakRSSHistoryFiltersAndAggregatesRealProjection(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-264 (Fable finding 1) — a signature whose every run FAILED
+// (non-zero exit) with a captured peak must NOT read as fallback:capture-unavailable.
+// Capture WAS available; the runs failed. TotalCount now counts usable-outcome
+// rows only, so an all-failed signature is TotalCount==0 → fallback:no-history.
+// Before the TotalCount fix this returned {TotalCount:3,SampleCount:0} and the
+// estimator mislabelled it capture-unavailable (AIRA-149: the label must name
+// the term that acted).
+func TestPeakRSSHistoryAllFailedRunsReadAsNoHistoryNotCaptureUnavailable(t *testing.T) {
+	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit1 := 1
+	for i := 0; i < 3; i++ {
+		peak := int64(1000 + i)
+		record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(9, i), Status: StatusExited, PeakRSS: &peak, ExitCode: &exit1, ResourceSignature: "allfail"}
+		if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.ledger.project(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stats, readable, err := r.PeakRSSHistory(context.Background(), "allfail")
+	if err != nil || !readable {
+		t.Fatalf("PeakRSSHistory readable=%v err=%v", readable, err)
+	}
+	if stats.TotalCount != 0 || stats.SampleCount != 0 {
+		t.Fatalf("all-failed stats=%+v, want TotalCount=0 SampleCount=0", stats)
+	}
+	reserve, override, basis := EstimateMemoryReserve(stats, 0)
+	if override {
+		t.Fatalf("a failed-only history produced a usable estimate: reserve=%d stats=%+v", reserve, stats)
+	}
+	if basis != "fallback:no-history" {
+		t.Fatalf("basis=%q, want fallback:no-history — capture was available, the runs failed (stats=%+v)", basis, stats)
+	}
+}
+
 func TestPeakRSSHistoryZeroPeaksDoNotSatisfyMinimumSamples(t *testing.T) {
 	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	exit0 := 0
 	for i, value := range []int64{100, 0, 0} {
 		peak := value
-		record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(2, i), Status: StatusExited, PeakRSS: &peak, ResourceSignature: "mixed"}
+		record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(2, i), Status: StatusExited, PeakRSS: &peak, ExitCode: &exit0, ResourceSignature: "mixed"}
 		if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
 			t.Fatal(err)
 		}
@@ -158,9 +210,10 @@ func TestPeakRSSHistoryIsOrderIndependent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		exit0 := 0
 		for n, value := range peaks {
 			peak := value
-			record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(i, n), Status: StatusExited, PeakRSS: &peak, ResourceSignature: "sig"}
+			record := RunRecord{SchemaVersion: ledgerSchema, ID: runIDForTest(i, n), Status: StatusExited, PeakRSS: &peak, ExitCode: &exit0, ResourceSignature: "sig"}
 			if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
 				t.Fatal(err)
 			}
@@ -252,7 +305,8 @@ func TestPeakRSSHistoryReadDoesNotGrowMainProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	peak := int64(4242)
-	if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusExited, PeakRSS: &peak, ResourceSignature: "sig"}}); err != nil {
+	exit0 := 0
+	if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusExited, PeakRSS: &peak, ExitCode: &exit0, ResourceSignature: "sig"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.ledger.project(context.Background()); err != nil {
