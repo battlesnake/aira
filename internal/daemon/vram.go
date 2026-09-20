@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"aira/internal/runner"
 )
 
 // AIRA-268. VRAM admission-gating. Agents declare GPU VRAM via `aira confine
@@ -205,5 +207,45 @@ func (s *Server) runVRAMSampler(ctx context.Context) {
 				s.vramSampleOnce()
 			}
 		}
+	}
+}
+
+// fillVRAMFrame stamps the ConfineSliceReserve VRAM display fields for a
+// confine-list reply (AIRA-269): the ledger total + GPU-job count come from the
+// caller's LOCKED admission snapshot; the physical card reading and the four-way
+// honesty state come from a LOCK-FREE atomic load of the sampler's snapshot. It
+// NEVER forks nvidia-smi — a fork on every `aira top` tick is exactly what the
+// off-lock sampler exists to avoid. The byte total/free are published only when a
+// real reading exists (set/stale); the other states leave them zero so the bar
+// renders a Reason, never a fabricated width.
+func (s *Server) fillVRAMFrame(reserve *runner.ConfineSliceReserve, outstanding int64, jobs int) {
+	if reserve == nil {
+		return
+	}
+	reserve.VRAMOutstandingBytes = outstanding
+	reserve.VRAMJobs = jobs
+	raw := s.vramSnap.Load()
+	switch {
+	case raw == nil:
+		// No --vram job has ever armed the sampler, so no reading was taken. A
+		// POSITIVE fact ("no GPU work"), NOT an unreadable GPU.
+		reserve.VRAMState = runner.VRAMStateNoGPUWork
+	case !raw.evaluated:
+		// The sampler ran and could not read a GPU (absent / nvidia-smi errored).
+		reserve.VRAMState = runner.VRAMStateNoGPU
+	case s.admitNowTime().Sub(raw.sampledAt) > s.vramStalenessDur():
+		// A good sample gone stale (the sampler stopped/hung). The last-good
+		// total/free still describe the card, so carry them, but mark it stale.
+		reserve.VRAMState = runner.VRAMStateStale
+		reserve.VRAMTotalBytes = raw.total
+		reserve.VRAMFreeBytes = raw.free
+		reserve.VRAMBudgetBytes = s.vramEffectiveBudget(raw.total)
+		reserve.VRAMHeadroomBytes = s.vramHeadroomBytes()
+	default:
+		reserve.VRAMState = runner.VRAMStateSet
+		reserve.VRAMTotalBytes = raw.total
+		reserve.VRAMFreeBytes = raw.free
+		reserve.VRAMBudgetBytes = s.vramEffectiveBudget(raw.total)
+		reserve.VRAMHeadroomBytes = s.vramHeadroomBytes()
 	}
 }

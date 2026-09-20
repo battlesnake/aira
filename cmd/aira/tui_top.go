@@ -287,8 +287,9 @@ const (
 type topBarKind string
 
 const (
-	topBarRAM topBarKind = "ram"
-	topBarCPU topBarKind = "cpu"
+	topBarRAM  topBarKind = "ram"
+	topBarCPU  topBarKind = "cpu"
+	topBarVRAM topBarKind = "vram"
 )
 
 // topBar is the whole bar as a model: total capacity, the regions that fill it,
@@ -541,6 +542,20 @@ func topRAMCell(rss *int64) string {
 	return topFormatMegabytes(*rss)
 }
 
+// topVRAMCell renders a scope's declared VRAM reservation for the table (AIRA-269).
+// nil is "unevaluated" — the daemon holds no admission record for this scope. 0 is
+// the POSITIVE fact "declared no VRAM / not a GPU job" and renders "—", never a
+// drawn zero and never conflated with unevaluated.
+func topVRAMCell(vram *int64) string {
+	if vram == nil {
+		return "unevaluated"
+	}
+	if *vram <= 0 {
+		return "—"
+	}
+	return topFormatMegabytes(*vram)
+}
+
 // topAgeCell renders a job's age for the table. AIRA-135 dropped this column in
 // the same trim that removed the OWNER/SCOPE-ID hex; the owner asked for it back,
 // so it returns in the COMPACT form below rather than the wide Go-duration string
@@ -613,7 +628,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	// readings belong together. COMMAND is last on purpose: it is the one cell with
 	// no bound on its natural width, so it absorbs the clamp instead of imposing it;
 	// SESSION goes just before it.
-	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "SESSION", "COMMAND"}}
+	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "VRAM", "SESSION", "COMMAND"}}
 	if result.Verdict == "unevaluated" {
 		reason := strings.TrimSpace(result.Reason)
 		if reason == "" {
@@ -621,6 +636,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		}
 		model.Bar = &topBar{Kind: topBarRAM, Reason: "confine list unevaluated: " + reason}
 		model.CPUBar = &topBar{Kind: topBarCPU, Reason: "confine list unevaluated: " + reason}
+		model.VRAMBar = &topBar{Kind: topBarVRAM, Reason: "confine list unevaluated: " + reason}
 		model.Footer = "UNEVALUATED: " + reason
 		// The cross-tick state is carried FORWARD unchanged. An unevaluated listing
 		// is not evidence that anything exited, so freeing every slot on it would
@@ -645,11 +661,13 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	delta := topCPUDeltaBetween(previous.CPU, next.CPU)
 	drawn := make([]topBarRegion, 0, len(next.Slots))
 	cpuDrawn := make([]topBarRegion, 0, len(next.Slots))
+	vramDrawn := make([]topBarRegion, 0, len(next.Slots))
 	notes := make([]string, 0, 2)
 	unevaluated := 0
 	cpuUnevaluated := 0
 	cpuClaimed := int64(0)
 	offset := int64(0)
+	vramOffset := int64(0)
 	for slot, scopeID := range next.Slots {
 		if scopeID == topSlotFree {
 			continue
@@ -666,7 +684,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
 				topRAMCell(record.RSSBytes),
-				topCPUCell(rate, rateKnown), topSessionCell(record), topCommandCell(record.Command),
+				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record), topCommandCell(record.Command),
 			},
 		})
 		if reserve.State == topReserveSet {
@@ -687,6 +705,18 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 			offset += reserve.Bytes
 		} else {
 			unevaluated++
+		}
+		// AIRA-269. The VRAM stack, from the SAME slot/colour, independent of the RAM
+		// and CPU gates: only a scope with a positive declared --vram draws a span
+		// (0 = "not a GPU job" and nil = unevaluated both draw nothing, so the stack
+		// is exactly the GPU jobs). Painted solid, like CPU — a reservation has no
+		// live-used sub-split here.
+		if record.VRAMBytes != nil && *record.VRAMBytes > 0 {
+			vramDrawn = append(vramDrawn, topBarRegion{
+				Kind: topRegionScope, Slot: slot, Label: record.Name, Colour: colour,
+				Start: vramOffset, Size: *record.VRAMBytes,
+			})
+			vramOffset += *record.VRAMBytes
 		}
 		// The CPU stack is built from the SAME slot in the SAME order with the SAME
 		// colour, and is deliberately independent of the RAM stack's own gates: a
@@ -713,6 +743,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	}
 	model.Bar = topBarFor(result.SliceReserve, drawn, offset, notes)
 	model.CPUBar = topCPUBarFor(result.SliceReserve, previous.CPU, next.CPU, delta, cpuDrawn, cpuClaimed, cpuUnevaluated)
+	model.VRAMBar = topVRAMBarFor(result.SliceReserve, vramDrawn, vramOffset, nil)
 	model.Footer = topFooter(result)
 	return model, next
 }
@@ -1011,6 +1042,100 @@ func topBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claim
 	}
 	bar.Markers = topMarkersFor(reserve)
 	return bar
+}
+
+// topVRAMBarFor builds the System VRAM bar (AIRA-269): the physical-card total,
+// aira's reserved VRAM stacked from the left (the scope regions the caller built
+// from each job's declared --vram, plus any scope-less --vram reservation), the
+// rest of the card used OUTSIDE aira (the desktop/compositor) anchored right, and
+// the free gap — with markers for the admission budget and the admit-fit ceiling.
+//
+// It mirrors the RAM ledger bar (topBarFor), NOT the CPU rate bar: VRAM is a real
+// admission ledger. Fail-closed on the four-way VRAMState discriminator — a bar it
+// cannot honestly draw reports a Reason NAMING which state (no GPU work requested,
+// GPU unreadable, or a stale sample), never a fabricated width.
+func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claimed int64, notes []string) *topBar {
+	bar := &topBar{Kind: topBarVRAM, Regions: scopes, Claimed: claimed, Notes: notes}
+	if reserve == nil {
+		bar.Reason = "no slice reserve in the confine listing (the daemon was unreachable)"
+		return bar
+	}
+	if reserve.Containment != "" {
+		bar.Reason = "ci-shim mode: the GPU is not part of a container's measured frame, so no VRAM bar is drawn"
+		return bar
+	}
+	switch reserve.VRAMState {
+	case runner.VRAMStateSet, runner.VRAMStateStale:
+		// drawable — a real card reading exists.
+	case runner.VRAMStateNoGPUWork:
+		bar.Reason = "no GPU work: no --vram job has been admitted, so the sampler took no VRAM reading"
+		return bar
+	case runner.VRAMStateNoGPU:
+		bar.Reason = "GPU unreadable: nvidia-smi is absent or reported no device"
+		return bar
+	default:
+		bar.Reason = "GPU VRAM is unevaluated"
+		return bar
+	}
+	if reserve.VRAMTotalBytes <= 0 {
+		bar.Reason = "total GPU VRAM is unevaluated"
+		return bar
+	}
+	bar.Evaluated = true
+	bar.Total = reserve.VRAMTotalBytes
+	if reserve.VRAMState == runner.VRAMStateStale {
+		bar.Notes = append(bar.Notes, "GPU reading is stale (the sampler stopped or hung); the card figures may be out of date")
+	}
+	// aira's reserved VRAM that belongs to no listed scope (a scope-less --vram
+	// reservation), so the drawn regions sum to the whole VRAMOutstanding ledger.
+	if scopeless := topFloor(reserve.VRAMOutstandingBytes - bar.Claimed); scopeless > 0 {
+		bar.Regions = append(bar.Regions, topBarRegion{
+			Kind: topRegionScopeless, Slot: topScopelessSlot, Colour: topColourScopeless,
+			Label: "scope-less VRAM", Start: bar.Claimed, Size: scopeless,
+		})
+		bar.Claimed += scopeless
+	}
+	// Used OUTSIDE aira (the desktop/compositor holds most of the card here),
+	// anchored RIGHT: physical used − aira's reserved claim. Clamped ≥0 (aira may
+	// have reserved VRAM its jobs have not yet allocated).
+	physicalUsed := topFloor(reserve.VRAMTotalBytes - reserve.VRAMFreeBytes)
+	bar.Outside = topFloor(physicalUsed - reserve.VRAMOutstandingBytes)
+	bar.OutsideKnown = true
+	bar.Free = topFloor(bar.Total - bar.Claimed - bar.Outside)
+	bar.Overcommitted = bar.Claimed+bar.Outside > bar.Total
+	if bar.Free > 0 {
+		bar.Regions = append(bar.Regions, topBarRegion{
+			Kind: topRegionFree, Slot: topScopelessSlot, Label: "free", Start: bar.Claimed, Size: bar.Free,
+		})
+	}
+	if bar.Outside > 0 {
+		start := topFloor(bar.Total - bar.Outside)
+		bar.Regions = append(bar.Regions, topBarRegion{
+			Kind: topRegionOutside, Slot: topScopelessSlot, Colour: topColourOutside,
+			Label: "used outside aira", Start: start, Size: bar.Total - start,
+		})
+	}
+	bar.Markers = topVRAMMarkersFor(reserve)
+	return bar
+}
+
+// topVRAMMarkersFor draws two ticks: the admission BUDGET the ledger honours, and
+// the admit-FIT ceiling a new GPU job actually faces, min(budget, free − headroom)
+// — the reason a job is refused even below the budget when the desktop is hogging
+// the card. Each is emitted only from an established positive reading.
+func topVRAMMarkersFor(reserve *runner.ConfineSliceReserve) []topBarMarker {
+	markers := make([]topBarMarker, 0, 2)
+	if reserve.VRAMBudgetBytes > 0 {
+		markers = append(markers, topBarMarker{Name: topMarkerCeiling, Label: "budget", At: reserve.VRAMBudgetBytes})
+	}
+	fit := reserve.VRAMBudgetBytes
+	if physFit := reserve.VRAMFreeBytes - reserve.VRAMHeadroomBytes; physFit < fit {
+		fit = physFit
+	}
+	if fit > 0 {
+		markers = append(markers, topBarMarker{Name: topMarkerSoft, Label: "fit", At: fit})
+	}
+	return markers
 }
 
 // topMarkersFor is requirement 4: the soft limit, the hard limit, and — when the

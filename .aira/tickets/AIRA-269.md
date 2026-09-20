@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-269","project":"aira","title":"aira top: System VRAM bar + per-job GPU reservations (v0.24). Add a third resource bar to 'aira top' spanning the physical GPU card (aira-reserved VRAM + used-outside-aira/desktop + free, with budget and admit-fit markers), mirroring the RAM bar's ledger semantics + the CPU bar's third-bar plumbing; plus a per-job VRAM column (declared --vram; '—' for non-GPU jobs). Daemon exposes the VRAM ledger (vramOutstanding, effective budget, physical total/free, a VRAMState discriminator for never-sampled/unreadable/stale) + per-scope vram in the confine-list reply (tolerant JSON, SAME proto 14 — no lockstep cutover). Honest: unevaluated when the GPU is unreadable, never a fabricated width; distinguishes 'no GPU work yet' from 'unreadable'.","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.24","labels":[],"hold":false,"relations":[]}
+---
+

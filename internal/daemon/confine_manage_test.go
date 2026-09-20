@@ -186,6 +186,11 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		// including the established-EMPTY arm), so the granted pair is established
 		// in all of them. The absent-ledger case is TestConfineListReserveUnevaluatedWhenLedgerAbsent.
 		want.GrantedEstablished = true
+		// AIRA-269. These fixtures admit no --vram job, so the sampler is never armed
+		// and the builder stamps VRAMState=no-gpu-work with zero card figures. Stamped
+		// here in the ONE frame helper so the new VRAM frame cannot go silently
+		// unasserted in an arm either.
+		want.VRAMState = runner.VRAMStateNoGPUWork
 		return want
 	}
 	setup := func(t *testing.T) (*Server, string) {

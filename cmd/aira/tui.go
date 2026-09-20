@@ -38,6 +38,7 @@ type tuiRuntime struct {
 	detachedStatus *tview.TextView
 	topBar         *tview.TextView
 	topCPUBar      *tview.TextView
+	topVRAMBar     *tview.TextView
 	views          []tuiView
 	// projectless marks a face that resolves NO project/worktree scope (`aira
 	// top`). It changes what the tab line offers, never what a key does.
@@ -252,9 +253,16 @@ func (r *tuiRuntime) buildWidgets() {
 			// equivalent hard CPU limit to draw one for.
 			r.topCPUBar = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 			r.topCPUBar.SetBorder(true).SetTitle(" System CPU ")
+			// AIRA-269. The VRAM bar is a third instance of the SAME renderer/model,
+			// stacked under the CPU bar and above the rows it shares colours with. It
+			// carries marker rows (budget + admit-fit), so it is as tall as the RAM bar
+			// rather than the marker-less CPU bar.
+			r.topVRAMBar = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+			r.topVRAMBar.SetBorder(true).SetTitle(" System VRAM ")
 			content = tview.NewFlex().SetDirection(tview.FlexRow).
 				AddItem(r.topBar, topRAMBarHeight, 0, false).
 				AddItem(r.topCPUBar, topCPUBarHeight, 0, false).
+				AddItem(r.topVRAMBar, topVRAMBarHeight, 0, false).
 				AddItem(table, 0, 1, true).
 				AddItem(footer, 1, 0, false)
 			r.panelPages.AddPage(string(view), content, true, false)
@@ -574,6 +582,7 @@ func (r *tuiRuntime) render() {
 		if view == viewTop {
 			r.renderTopBar(r.topBar, model.Bar, r.state.Panels[view])
 			r.renderTopBar(r.topCPUBar, model.CPUBar, r.state.Panels[view])
+			r.renderTopBar(r.topVRAMBar, model.VRAMBar, r.state.Panels[view])
 		}
 		r.renderTable(view, model, r.state.Panels[view])
 	}
@@ -664,8 +673,11 @@ func topBarLegend(bar *topBar) string {
 }
 
 func topBarResourceNoun(bar *topBar) string {
-	if bar.Kind == topBarCPU {
+	switch bar.Kind {
+	case topBarCPU:
 		return "CPU"
+	case topBarVRAM:
+		return "VRAM"
 	}
 	return "RAM"
 }
@@ -707,6 +719,9 @@ const topBarMinColumns = 20
 const (
 	topRAMBarHeight = 7
 	topCPUBarHeight = 6
+	// AIRA-269. As tall as the RAM bar: the VRAM bar carries a marker legend
+	// (budget + admit-fit) that the marker-less CPU bar does not.
+	topVRAMBarHeight = 7
 )
 
 func topMarkerGlyph(name string) string {

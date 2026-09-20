@@ -116,13 +116,15 @@ type panelModel struct {
 	Footer  string
 	Detail  string
 	Tiles   []gaugeTile
-	// Bar is AIRA-127's system-RAM bar and CPUBar is AIRA-137's system-CPU bar.
-	// Both are nil for every other view — the same view-specific shape Tiles
-	// already has. They are two values of ONE type: the bar is a
-	// capacity/claimed/outside model over an abstract quantity, and RAM and CPU
-	// differ only in that quantity's unit.
-	Bar    *topBar
-	CPUBar *topBar
+	// Bar is AIRA-127's system-RAM bar, CPUBar AIRA-137's system-CPU bar, and
+	// VRAMBar AIRA-269's system-VRAM bar. All nil for every other view — the same
+	// view-specific shape Tiles already has. They are three values of ONE type: the
+	// bar is a capacity/claimed/outside model over an abstract quantity, and RAM,
+	// CPU and VRAM differ only in that quantity's unit (and VRAM, like RAM, is a
+	// ledger while CPU is a live rate).
+	Bar     *topBar
+	CPUBar  *topBar
+	VRAMBar *topBar
 }
 
 type panelState struct {

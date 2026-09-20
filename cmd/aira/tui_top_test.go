@@ -834,7 +834,7 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	record.AgeSeconds = &age
 	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), record))
 
-	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "SESSION", "COMMAND"}
+	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "VRAM", "SESSION", "COMMAND"}
 	if !reflect.DeepEqual(model.Headers, wantHeaders) {
 		t.Fatalf("headers=%v, want %v", model.Headers, wantHeaders)
 	}
@@ -846,9 +846,11 @@ func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
 	}
 	// AGE is the record's age rendered in the compact two-unit form. RAM is the
 	// record's live memory.current (9 GiB), CPU is unevaluated on this single tick
-	// because a rate needs two samples, and SESSION is the worktree owner's 8-char
-	// prefix (never the full hex).
-	wantCells := []string{"0", "heavy-suite", "4242", "yes", "1d2h", "42160M", "9216M", "unevaluated", "4f9ec70c", command}
+	// because a rate needs two samples, VRAM is unevaluated because this fixture
+	// record carries no daemon-stamped VRAM reservation (AIRA-269: a real listing
+	// stamps it via ApplyConfineScopeVRAM), and SESSION is the worktree owner's
+	// 8-char prefix (never the full hex).
+	wantCells := []string{"0", "heavy-suite", "4242", "yes", "1d2h", "42160M", "9216M", "unevaluated", "unevaluated", "4f9ec70c", command}
 	if !reflect.DeepEqual(model.Rows[0].Cells, wantCells) {
 		t.Fatalf("cells=%v, want %v", model.Rows[0].Cells, wantCells)
 	}
