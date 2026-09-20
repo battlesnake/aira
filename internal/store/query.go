@@ -230,6 +230,51 @@ func (s *Store) Get(selector string) (TicketRecord, error) {
 	return s.exactRecord(sel.ExactID, sel.ExactPath)
 }
 
+// TicketAllocationOrigin reports whether the machine-wide ledger holds a ticket
+// allocation (allocated or materialised) for the exact id named by `selector`,
+// and the absolute path it was ORIGINALLY recorded at. It is the `aira get`
+// verb's absence diagnosis (AIRA-270): a caller whose get found no ticket file in
+// THIS worktree can then tell an id that was minted in this project — present on
+// another branch/worktree, or lost when a worktree was removed — apart from one
+// that never existed.
+//
+// It reads the ledger ONLY. It makes NO claim about whether the file is present
+// anywhere or is lost, and it deliberately never stats the recorded path: that
+// path is frozen at the creating worktree (a materialised row's path is never
+// re-pointed — store.go), so a create-in-worktree/commit/merge/remove lifecycle
+// leaves it dangling for a ticket that is committed and present everywhere. The
+// returned path is HISTORICAL FACT for the message ("originally recorded at ..."),
+// never a liveness signal.
+//
+// ok is false for a non-exact selector, a FILE-ANCHOR selector (one that names a
+// path, e.g. `.aira/tickets/AIRA-1.md` — that lookup asks about a specific file,
+// not "where is this id", and its own path already names what is absent), a
+// never-allocated id, or a non-ticket (requirement) allocation. The id match
+// reconstructs the canonical id in SQL exactly as check.go does; suffix is at
+// most one lowercase letter, so prefix-number-suffix is unambiguous. state is
+// restricted to the two minted states that expect a file (a terminal state like
+// 'retired' must not read as "not in worktree").
+func (s *Store) TicketAllocationOrigin(selector string) (id, path string, ok bool, err error) {
+	sel, serr := s.canonicalSelector(selector)
+	// ExactPath!="" is a file-anchor selector: it carries a derived ExactID too, so
+	// guard it out explicitly to keep this scoped to bare `aira get <id>` lookups.
+	if serr != nil || sel.ExactID == "" || sel.ExactPath != "" {
+		return "", "", false, nil
+	}
+	scanErr := s.db.QueryRow(
+		`SELECT path FROM allocations
+		 WHERE project_id=? AND kind='ticket' AND state IN ('allocated', 'materialised')
+		   AND prefix || '-' || CAST(number AS TEXT) || suffix = ?
+		 LIMIT 1`, s.projectID, sel.ExactID).Scan(&path)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if scanErr != nil {
+		return "", "", false, scanErr
+	}
+	return sel.ExactID, path, true, nil
+}
+
 // List returns all current-worktree matches. It does not apply the output cap;
 // the core applies that cap after it has computed the total and distribution.
 func (s *Store) List(selector string) ([]TicketRecord, error) {

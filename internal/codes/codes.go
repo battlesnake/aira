@@ -99,8 +99,21 @@ var ExitCodes = map[string]int{
 	// refusals of the file's serialised form before any field exists to be
 	// judged — and every store site that classifies on E_CONFIG_INVALID accepts
 	// both codes, so a ticket file's classification is identical either way.
-	"E_TICKET_INVALID":  2,
-	"E_COMPUTE_INVALID": 2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
+	"E_TICKET_INVALID": 2,
+	// AIRA-270. The `aira get <id>` verb raises this in place of a bare E_NOT_FOUND
+	// when no ticket file is present in the current worktree BUT the machine-wide
+	// ledger holds a ticket allocation (allocated or materialised) for the id — the
+	// id was minted in this project, it is just not checked out here (it may be
+	// committed on another branch/worktree, or its uncommitted file was lost when a
+	// worktree was removed — the reporter's case). It does NOT assert the ticket is
+	// lost: the store cannot cheaply know that (a git-tracked file's presence is
+	// per-checkout), so the code means only "allocated, not present here", which is
+	// true in every branch. It is a 2 like the E_NOT_FOUND it refines: the request
+	// is well formed and no state reachable from THIS worktree serves it. It is
+	// raised ONLY by the get verb, never by store.Get itself, so the many other
+	// exactRecord/Get callers (list, import-link, relation) keep bare E_NOT_FOUND.
+	"E_TICKET_NOT_IN_WORKTREE": 2,
+	"E_COMPUTE_INVALID":        2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
 	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_RANT_INVALID": 2, "E_RANT_TOO_LARGE": 2, "E_RANT_REF_INVALID": 2,
