@@ -30,10 +30,10 @@ func TestTopVRAMCell(t *testing.T) {
 func TestTopVRAMBarForSetState(t *testing.T) {
 	reserve := &runner.ConfineSliceReserve{
 		VRAMState: runner.VRAMStateSet, VRAMTotalBytes: 16 * gib, VRAMFreeBytes: 3 * gib,
-		VRAMBudgetBytes: 14 * gib, VRAMHeadroomBytes: gib, VRAMOutstandingBytes: 8 * gib, VRAMJobs: 1,
+		VRAMBudgetBytes: 14 * gib, VRAMHeadroomBytes: gib, VRAMOutstandingBytes: 8 * gib,
 	}
 	scopes := []topBarRegion{{Kind: topRegionScope, Slot: 0, Label: "train", Start: 0, Size: 8 * gib}}
-	bar := topVRAMBarFor(reserve, scopes, 8*gib, nil)
+	bar := topVRAMBarFor(reserve, scopes, 8*gib)
 	if !bar.Evaluated || bar.Kind != topBarVRAM {
 		t.Fatalf("bar not evaluated as VRAM: %+v", bar)
 	}
@@ -68,7 +68,7 @@ func TestTopVRAMBarForHonestyStates(t *testing.T) {
 		{runner.VRAMStateNoGPUWork, "no GPU work"},
 		{runner.VRAMStateNoGPU, "unreadable"},
 	} {
-		bar := topVRAMBarFor(&runner.ConfineSliceReserve{VRAMState: tc.state}, nil, 0, nil)
+		bar := topVRAMBarFor(&runner.ConfineSliceReserve{VRAMState: tc.state}, nil, 0)
 		if bar.Evaluated {
 			t.Fatalf("state %q must render a Reason, not a bar", tc.state)
 		}
@@ -89,7 +89,6 @@ func TestTopViewModelWiresVRAMBar(t *testing.T) {
 	reserve.VRAMBudgetBytes = 14 * gib
 	reserve.VRAMHeadroomBytes = gib
 	reserve.VRAMOutstandingBytes = 8 * gib
-	reserve.VRAMJobs = 1
 	rec := topTestRecord("CONFINE-train-1-aa", "train", 8*gib, 2*gib)
 	v := 8 * gib
 	rec.VRAMBytes = &v
@@ -122,5 +121,68 @@ func TestTopViewModelWiresVRAMBar(t *testing.T) {
 	}
 	if cell := model.Rows[0].Cells[vramCol]; cell == "—" || cell == "unevaluated" || cell == "" {
 		t.Fatalf("GPU job's VRAM cell = %q, want a formatted 8G reservation", cell)
+	}
+}
+
+// verifies: AIRA-269 — when aira's reservation exceeds the card's physically-used
+// bytes (a just-admitted, not-yet-ramped GPU job), "used outside aira" CLAMPS to 0
+// (never negative), every region stays within the card, the widths close exactly,
+// and a note says the desktop usage is hidden inside the reservation. Removing the
+// topFloor clamp (Outside going negative, free running past the card) reds this.
+func TestTopVRAMBarForReservedExceedsPhysicalUsed(t *testing.T) {
+	reserve := &runner.ConfineSliceReserve{
+		VRAMState: runner.VRAMStateSet, VRAMTotalBytes: 16 * gib, VRAMFreeBytes: 15 * gib,
+		VRAMBudgetBytes: 14 * gib, VRAMHeadroomBytes: gib, VRAMOutstandingBytes: 8 * gib,
+	}
+	scopes := []topBarRegion{{Kind: topRegionScope, Slot: 0, Label: "train", Start: 0, Size: 8 * gib}}
+	bar := topVRAMBarFor(reserve, scopes, 8*gib)
+	if !bar.Evaluated {
+		t.Fatalf("bar not evaluated: %+v", bar)
+	}
+	if bar.Outside != 0 { // physical-used = 16−15 = 1G, below the 8G reserved → clamp to 0
+		t.Fatalf("Outside=%d want 0 (reserved 8G exceeds physical-used 1G — clamp, not negative)", bar.Outside)
+	}
+	if bar.Free != 8*gib { // 16 − 8 claimed − 0 outside
+		t.Fatalf("Free=%d want 8G", bar.Free)
+	}
+	if bar.Claimed+bar.Outside+bar.Free != bar.Total {
+		t.Fatalf("widths do not close: claimed %d + outside %d + free %d != total %d", bar.Claimed, bar.Outside, bar.Free, bar.Total)
+	}
+	for _, r := range bar.Regions {
+		if r.Start+r.Size > bar.Total {
+			t.Fatalf("region %q runs past the card: start %d + size %d > total %d", r.Label, r.Start, r.Size, bar.Total)
+		}
+	}
+	var noted bool
+	for _, n := range bar.Notes {
+		if strings.Contains(n, "hidden inside aira's reservation") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Fatalf("expected a note that out-of-aira usage is hidden inside the reservation; notes=%v", bar.Notes)
+	}
+}
+
+// verifies: AIRA-269 — a STALE GPU sample still DRAWS (last-good figures describe
+// the card), but carries a note saying it is stale so an operator is not misled
+// into trusting out-of-date figures. Deleting the stale-note append reds this.
+func TestTopVRAMBarForStaleDrawsWithNote(t *testing.T) {
+	reserve := &runner.ConfineSliceReserve{
+		VRAMState: runner.VRAMStateStale, VRAMTotalBytes: 16 * gib, VRAMFreeBytes: 3 * gib,
+		VRAMBudgetBytes: 14 * gib, VRAMHeadroomBytes: gib, VRAMOutstandingBytes: 4 * gib,
+	}
+	bar := topVRAMBarFor(reserve, nil, 4*gib)
+	if !bar.Evaluated {
+		t.Fatalf("a stale bar must still draw (last-good figures describe the card): %+v", bar)
+	}
+	var stale bool
+	for _, n := range bar.Notes {
+		if strings.Contains(n, "stale") {
+			stale = true
+		}
+	}
+	if !stale {
+		t.Fatalf("a stale bar must carry a 'stale' note; notes=%v", bar.Notes)
 	}
 }

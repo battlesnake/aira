@@ -958,11 +958,9 @@ type admitSnapshot struct {
 	// --vram over granted+accounted leases). scopeVRAM maps each granted+accounted
 	// SCOPED waiter's declared --vram (INCLUDING 0 = "declared no VRAM / not a GPU
 	// job"), so every scope row gets an established VRAMBytes; scope-less
-	// reservations fold into vramOutstanding only. vramJobs counts leases with
-	// vram>0 (the real GPU jobs). Reconciliation: Σ scopeVRAM + Σ(scope-less vram)
-	// == vramOutstanding, under the same admitGranted && accounted guard.
+	// reservations fold into vramOutstanding only. Reconciliation: Σ scopeVRAM +
+	// Σ(scope-less vram) == vramOutstanding, under the same admitGranted && accounted guard.
 	vramOutstanding int64
-	vramJobs        int
 	scopeVRAM       map[string]int64
 
 	// AIRA-101. The slice's exclusive state, derived in the SAME locked walk as
@@ -1184,11 +1182,6 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// classifying on the wrong fact.
 		if waiter.state != admitGranted || !waiter.accounted {
 			continue
-		}
-		// AIRA-269. Count real GPU leases (vram>0) across BOTH scoped jobs and
-		// scope-less reservations, in the same granted+accounted pass.
-		if waiter.vram > 0 {
-			snapshot.vramJobs++
 		}
 		// These three sum ledgerCharge(), the same quantity the ledger itself
 		// carries. They must move with queue.outstanding or residualBytes() -- a

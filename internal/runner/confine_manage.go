@@ -620,7 +620,6 @@ type ConfineSliceReserve struct {
 	VRAMTotalBytes       int64  `json:"vram_total_bytes,omitempty"`
 	VRAMFreeBytes        int64  `json:"vram_free_bytes,omitempty"`
 	VRAMHeadroomBytes    int64  `json:"vram_headroom_bytes,omitempty"`
-	VRAMJobs             int    `json:"vram_jobs,omitempty"`
 	VRAMState            string `json:"vram_state,omitempty"`
 
 	// AIRA-121. Containment/BudgetSource carry the ci-shim disposition on the

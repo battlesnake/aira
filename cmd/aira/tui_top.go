@@ -743,7 +743,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	}
 	model.Bar = topBarFor(result.SliceReserve, drawn, offset, notes)
 	model.CPUBar = topCPUBarFor(result.SliceReserve, previous.CPU, next.CPU, delta, cpuDrawn, cpuClaimed, cpuUnevaluated)
-	model.VRAMBar = topVRAMBarFor(result.SliceReserve, vramDrawn, vramOffset, nil)
+	model.VRAMBar = topVRAMBarFor(result.SliceReserve, vramDrawn, vramOffset)
 	model.Footer = topFooter(result)
 	return model, next
 }
@@ -1054,8 +1054,8 @@ func topBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claim
 // admission ledger. Fail-closed on the four-way VRAMState discriminator — a bar it
 // cannot honestly draw reports a Reason NAMING which state (no GPU work requested,
 // GPU unreadable, or a stale sample), never a fabricated width.
-func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claimed int64, notes []string) *topBar {
-	bar := &topBar{Kind: topBarVRAM, Regions: scopes, Claimed: claimed, Notes: notes}
+func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claimed int64) *topBar {
+	bar := &topBar{Kind: topBarVRAM, Regions: scopes, Claimed: claimed}
 	if reserve == nil {
 		bar.Reason = "no slice reserve in the confine listing (the daemon was unreachable)"
 		return bar
@@ -1086,20 +1086,22 @@ func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, c
 	if reserve.VRAMState == runner.VRAMStateStale {
 		bar.Notes = append(bar.Notes, "GPU reading is stale (the sampler stopped or hung); the card figures may be out of date")
 	}
-	// aira's reserved VRAM that belongs to no listed scope (a scope-less --vram
-	// reservation), so the drawn regions sum to the whole VRAMOutstanding ledger.
-	if scopeless := topFloor(reserve.VRAMOutstandingBytes - bar.Claimed); scopeless > 0 {
-		bar.Regions = append(bar.Regions, topBarRegion{
-			Kind: topRegionScopeless, Slot: topScopelessSlot, Colour: topColourScopeless,
-			Label: "scope-less VRAM", Start: bar.Claimed, Size: scopeless,
-		})
-		bar.Claimed += scopeless
-	}
+	// INVARIANT: every --vram reservation carries a scope (`aira confine --vram` is
+	// the only path that sets VRAMBytes, and it always mints a scope id), so
+	// VRAMOutstandingBytes == Σ scoped VRAMBytes == bar.Claimed. Unlike the RAM bar
+	// there is NO scope-less VRAM fold — a scope-less GPU reservation is unreachable.
 	// Used OUTSIDE aira (the desktop/compositor holds most of the card here),
 	// anchored RIGHT: physical used − aira's reserved claim. Clamped ≥0 (aira may
 	// have reserved VRAM its jobs have not yet allocated).
 	physicalUsed := topFloor(reserve.VRAMTotalBytes - reserve.VRAMFreeBytes)
 	bar.Outside = topFloor(physicalUsed - reserve.VRAMOutstandingBytes)
+	if physicalUsed < reserve.VRAMOutstandingBytes {
+		// The clamp fired: aira's reservation exceeds the card's physically-used
+		// bytes, so out-of-aira (desktop) usage is hidden INSIDE aira's reservation
+		// (jobs may not have allocated their full --vram yet). Say so, rather than
+		// let a "rest of system 0M" legend imply the card is otherwise idle.
+		bar.Notes = append(bar.Notes, "out-of-aira GPU usage is hidden inside aira's reservation (jobs may not have allocated their full --vram yet)")
+	}
 	bar.OutsideKnown = true
 	bar.Free = topFloor(bar.Total - bar.Claimed - bar.Outside)
 	bar.Overcommitted = bar.Claimed+bar.Outside > bar.Total

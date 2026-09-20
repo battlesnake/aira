@@ -248,3 +248,73 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 			got, plainCharge, plainCap)
 	}
 }
+
+// verifies: AIRA-269 — the confine-list REPLY carries the VRAM frame end-to-end from
+// the ledger + the sampler snapshot, and per-scope VRAMBytes reconcile with the
+// slice's VRAMOutstandingBytes. This is the ONE test pinning the daemon wiring the
+// piece tests miss: it reds each of fillVRAMFrame's outstanding arg going 0 (MA/MD),
+// ApplyConfineScopeVRAM dropped (MB), and the per-scope scopeVRAM capture zeroed (MC).
+func TestConfineListVRAMFrameAndPerScopeReconcile(t *testing.T) {
+	G := vramTestGiB
+	now := time.Unix(2_100_000, 0)
+	slice := t.TempDir()
+	server := NewServer(Paths{})
+	server.admitResolveSlice = func(string) (string, bool, string) { return slice, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 12 << 30, int64(64) << 30, 0, true, ""
+	}
+	server.vramBudgetBytes = 14 * G
+	server.vramHeadroom = G
+	server.admitNow = func() time.Time { return now }
+	server.vramSnap.Store(&vramSnapshot{total: 16 * G, free: 3 * G, evaluated: true, sampledAt: now})
+
+	gpuID := reserveScopeID(t, "train", 6201)
+	plainID := reserveScopeID(t, "build", 6202)
+	orphanID := reserveScopeID(t, "gone", 6203)
+	reserveScopeDir(t, slice, gpuID, 8<<30, 4<<30)
+	reserveScopeDir(t, slice, plainID, 8<<30, 2<<30)
+	reserveScopeDir(t, slice, orphanID, 8<<30, 1<<30) // a scope dir with NO waiter → unevaluated VRAMBytes
+
+	queue := &sliceQueue{path: slice, server: server, outstanding: 6 << 30, vramOutstanding: 4 * G, outstandingJobs: 2}
+	queue.waiters = []*admitWaiter{
+		{seq: 1, reserve: 4 << 30, vram: 4 * G, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
+			scopeID: gpuID, name: "train", owner: "session-a"},
+		{seq: 2, reserve: 2 << 30, vram: 0, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
+			scopeID: plainID, name: "build", owner: "session-a"},
+	}
+	server.admitQueues[slice] = queue
+
+	result := reserveListing(t, server)
+	sr := result.SliceReserve
+	if sr == nil {
+		t.Fatal("no slice reserve on the reply")
+	}
+	if sr.VRAMState != runner.VRAMStateSet {
+		t.Fatalf("VRAMState=%q, want set", sr.VRAMState)
+	}
+	if sr.VRAMOutstandingBytes != 4*G || sr.VRAMTotalBytes != 16*G || sr.VRAMFreeBytes != 3*G || sr.VRAMBudgetBytes != 14*G {
+		t.Fatalf("VRAM frame = {out %d total %d free %d budget %d}, want {4G 16G 3G 14G}",
+			sr.VRAMOutstandingBytes, sr.VRAMTotalBytes, sr.VRAMFreeBytes, sr.VRAMBudgetBytes)
+	}
+	// GPU job carries its declared 4G; the plain job an ESTABLISHED 0 (declared no
+	// VRAM = not a GPU job); the orphan (no admission record) is nil (unevaluated).
+	if got := reserveScopeByID(t, result, gpuID).VRAMBytes; got == nil || *got != 4*G {
+		t.Fatalf("GPU scope VRAMBytes=%v, want 4G", got)
+	}
+	if got := reserveScopeByID(t, result, plainID).VRAMBytes; got == nil || *got != 0 {
+		t.Fatalf("plain scope VRAMBytes=%v, want an established 0 (declared no VRAM)", got)
+	}
+	if got := reserveScopeByID(t, result, orphanID).VRAMBytes; got != nil {
+		t.Fatalf("orphan scope VRAMBytes=%v, want nil (no admission record)", got)
+	}
+	// Reconciliation: Σ established per-scope VRAMBytes == the slice VRAMOutstanding.
+	var sum int64
+	for _, rec := range result.Scopes {
+		if rec.VRAMBytes != nil {
+			sum += *rec.VRAMBytes
+		}
+	}
+	if sum != sr.VRAMOutstandingBytes {
+		t.Fatalf("Σ per-scope VRAMBytes = %d, want the slice VRAMOutstandingBytes %d", sum, sr.VRAMOutstandingBytes)
+	}
+}

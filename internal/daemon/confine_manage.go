@@ -322,7 +322,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// avoid), the ledger total + job count from the same locked snapshot,
 				// feeding no admission decision, withheld whole in shim mode by this
 				// same `if`.
-				s.fillVRAMFrame(result.SliceReserve, snapshot.vramOutstanding, snapshot.vramJobs)
+				s.fillVRAMFrame(result.SliceReserve, snapshot.vramOutstanding)
 			}
 			// AIRA-121. The advisory wording travels on the SAME line as the
 			// numbers it qualifies. Without it a shim reserve summary is

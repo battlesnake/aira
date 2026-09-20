@@ -25,19 +25,19 @@ func TestFillVRAMFrame(t *testing.T) {
 	set := newServer()
 	set.vramSnap.Store(&vramSnapshot{total: 16 * G, free: 3 * G, evaluated: true, sampledAt: now})
 	var r runner.ConfineSliceReserve
-	set.fillVRAMFrame(&r, 8*G, 2)
+	set.fillVRAMFrame(&r, 8*G)
 	if r.VRAMState != runner.VRAMStateSet {
 		t.Fatalf("state=%q, want set", r.VRAMState)
 	}
 	if r.VRAMTotalBytes != 16*G || r.VRAMFreeBytes != 3*G || r.VRAMBudgetBytes != 14*G ||
-		r.VRAMOutstandingBytes != 8*G || r.VRAMJobs != 2 || r.VRAMHeadroomBytes != G {
+		r.VRAMOutstandingBytes != 8*G || r.VRAMHeadroomBytes != G {
 		t.Fatalf("set frame = %+v", r)
 	}
 
 	// no-gpu-work: the sampler was never armed (nil snapshot) → NOT a failure.
 	work := newServer()
 	var rw runner.ConfineSliceReserve
-	work.fillVRAMFrame(&rw, 0, 0)
+	work.fillVRAMFrame(&rw, 0)
 	if rw.VRAMState != runner.VRAMStateNoGPUWork {
 		t.Fatalf("state=%q, want no-gpu-work", rw.VRAMState)
 	}
@@ -47,9 +47,9 @@ func TestFillVRAMFrame(t *testing.T) {
 
 	// no-gpu: the sampler ran and could not read a device (evaluated=false).
 	nogpu := newServer()
-	nogpu.vramSnap.Store(&vramSnapshot{evaluated: false, sampledAt: now})
+	nogpu.vramSnap.Store(&vramSnapshot{total: 16 * G, evaluated: false, sampledAt: now})
 	var rn runner.ConfineSliceReserve
-	nogpu.fillVRAMFrame(&rn, 0, 0)
+	nogpu.fillVRAMFrame(&rn, 0)
 	if rn.VRAMState != runner.VRAMStateNoGPU {
 		t.Fatalf("state=%q, want no-gpu", rn.VRAMState)
 	}
@@ -61,7 +61,7 @@ func TestFillVRAMFrame(t *testing.T) {
 	stale := newServer()
 	stale.vramSnap.Store(&vramSnapshot{total: 16 * G, free: 5 * G, evaluated: true, sampledAt: now.Add(-time.Hour)})
 	var rs runner.ConfineSliceReserve
-	stale.fillVRAMFrame(&rs, G, 1)
+	stale.fillVRAMFrame(&rs, G)
 	if rs.VRAMState != runner.VRAMStateStale {
 		t.Fatalf("state=%q, want stale", rs.VRAMState)
 	}

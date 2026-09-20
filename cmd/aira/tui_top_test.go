@@ -1829,6 +1829,7 @@ func TestTopBarFitsItsPanelHeight(t *testing.T) {
 	}{
 		{topBarRAM, topRAMBarHeight},
 		{topBarCPU, topCPUBarHeight},
+		{topBarVRAM, topVRAMBarHeight},
 	}
 	for _, testCase := range cases {
 		t.Run(string(testCase.kind), func(t *testing.T) {

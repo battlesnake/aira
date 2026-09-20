@@ -218,12 +218,11 @@ func (s *Server) runVRAMSampler(ctx context.Context) {
 // off-lock sampler exists to avoid. The byte total/free are published only when a
 // real reading exists (set/stale); the other states leave them zero so the bar
 // renders a Reason, never a fabricated width.
-func (s *Server) fillVRAMFrame(reserve *runner.ConfineSliceReserve, outstanding int64, jobs int) {
+func (s *Server) fillVRAMFrame(reserve *runner.ConfineSliceReserve, outstanding int64) {
 	if reserve == nil {
 		return
 	}
 	reserve.VRAMOutstandingBytes = outstanding
-	reserve.VRAMJobs = jobs
 	raw := s.vramSnap.Load()
 	switch {
 	case raw == nil:
