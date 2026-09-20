@@ -278,3 +278,98 @@ func codeOf(err error) string {
 	}
 	return ""
 }
+
+func mustInsertAllocation(t *testing.T, s *Store, prefix string, number int64, kind, state, path string) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		`INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+		 VALUES(?,?,?,?,?,?,?,?,'')`,
+		s.projectID, prefix, number, s.worktreeID, state, path, 900000+number, kind); err != nil {
+		t.Fatalf("insert allocation %s-%d: %v", prefix, number, err)
+	}
+}
+
+// TestTicketAllocationOriginDiagnosesLedgerPresence pins the AIRA-270 get-verb
+// absence predicate: it reports a ticket that was minted in this project (so the
+// get verb can say E_TICKET_NOT_IN_WORKTREE instead of a bare not-found), and it
+// deliberately EXCLUDES rows the honesty surface must not claim — a non-ticket
+// (requirement) allocation, and a terminal-state (retired) allocation, both of
+// which legitimately have no working-tree file and are NOT "not in this worktree".
+func TestTicketAllocationOriginDiagnosesLedgerPresence(t *testing.T) {
+	s := queryTestStore(t)
+	ticket, err := s.CreateTicket(context.Background(), testCreateInput("real", "body"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A materialised ticket allocation is reported, with its recorded path.
+	id, path, ok, err := s.TicketAllocationOrigin(ticket.ID)
+	if err != nil || !ok || id != ticket.ID {
+		t.Fatalf("origin(materialised ticket) = (%q,%q,%v,%v), want ok id=%s", id, path, ok, err, ticket.ID)
+	}
+	if want := filepath.Join(".aira", "tickets", ticket.ID+".md"); !strings.HasSuffix(path, want) {
+		t.Fatalf("recorded path %q must end in %q (it is the historical origin)", path, want)
+	}
+
+	// A never-allocated id is not reported (-> the get verb keeps bare E_NOT_FOUND).
+	if _, _, ok, err := s.TicketAllocationOrigin("AIRA-999"); err != nil || ok {
+		t.Fatalf("origin(never-allocated) ok=%v err=%v, want not-ok", ok, err)
+	}
+
+	// A FILE-ANCHOR selector no-ops even for an allocated ticket: it names a path,
+	// not "where is this id", so `aira get <path>` keeps bare E_NOT_FOUND. Drop the
+	// ExactPath!="" guard and this reddens (the anchor's derived id would match).
+	if _, _, ok, err := s.TicketAllocationOrigin(".aira/tickets/" + ticket.ID + ".md"); err != nil || ok {
+		t.Fatalf("origin(file-anchor for %s) ok=%v err=%v, want not-ok", ticket.ID, ok, err)
+	}
+
+	// A materialised REQUIREMENT-kind allocation must NOT match (get is ticket-only;
+	// drop the kind filter and this reddens).
+	mustInsertAllocation(t, s, "AIRA", 500, "requirement", "materialised", ".aira/requirements/AIRA-500.md")
+	if _, _, ok, _ := s.TicketAllocationOrigin("AIRA-500"); ok {
+		t.Fatal("origin matched a requirement allocation; the kind='ticket' filter is missing")
+	}
+
+	// A RETIRED-state ticket allocation must NOT match (a terminal state is not
+	// "not in this worktree"; broaden the state filter and this reddens).
+	mustInsertAllocation(t, s, "AIRA", 501, "ticket", "retired", ".aira/tickets/AIRA-501.md")
+	if _, _, ok, _ := s.TicketAllocationOrigin("AIRA-501"); ok {
+		t.Fatal("origin matched a retired allocation; the state IN (allocated,materialised) filter is missing")
+	}
+}
+
+// TestTicketAllocationOriginReportsTheCreatingWorktreePath pins the cross-worktree
+// truth the single-worktree test cannot: a ticket created in worktree A, queried
+// from a DIFFERENT worktree B that shares the ledger, is reported by B with A's
+// recorded path — the "originally recorded at ..." historical fact, distinct from
+// B's own would-be path. This is what reveals the removed worktree to the caller.
+func TestTicketAllocationOriginReportsTheCreatingWorktreePath(t *testing.T) {
+	base := t.TempDir()
+	rootA := filepath.Join(base, "A")
+	rootB := filepath.Join(base, "B")
+	for _, r := range []string{rootA, rootB} {
+		if err := os.MkdirAll(filepath.Join(r, ".aira", "tickets"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+
+	a := openTestStore(t, rootA, common, state, "A", "AIRA")
+	if _, err := a.CreateTicket(context.Background(), testCreateInput("born in A", "body")); err != nil {
+		t.Fatalf("create in A: %v", err)
+	}
+
+	b := openTestStore(t, rootB, common, state, "B", "AIRA")
+	id, path, ok, err := b.TicketAllocationOrigin("AIRA-1")
+	if err != nil || !ok || id != "AIRA-1" {
+		t.Fatalf("origin from B = (%q,%q,%v,%v), want ok AIRA-1", id, path, ok, err)
+	}
+	// The reported path is A's (the creating worktree), NOT B's current path.
+	if !strings.HasPrefix(path, rootA) {
+		t.Fatalf("reported path %q must be under the CREATING worktree %q", path, rootA)
+	}
+	if strings.HasPrefix(path, rootB) {
+		t.Fatalf("reported path %q must not be B's own path", path)
+	}
+}

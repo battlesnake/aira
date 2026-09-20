@@ -973,6 +973,64 @@ func marshalRoundTrip(t *testing.T, value any, target any) {
 	}
 }
 
+// TestGetVerbDistinguishesAllocatedButAbsentFromNeverExisted pins the AIRA-270
+// get-verb honesty surface end to end: when the ticket file is present, get
+// succeeds (the ledger diagnosis is never consulted); when the file is absent but
+// the ledger holds the allocation, get reports E_TICKET_NOT_IN_WORKTREE (exit 2,
+// naming the recorded path) instead of a bare E_NOT_FOUND; and a never-allocated
+// id still gets the bare not-found. Removing the get-handler translation, or the
+// predicate, reddens this.
+func TestGetVerbDistinguishesAllocatedButAbsentFromNeverExisted(t *testing.T) {
+	s, root := coreTestStoreWithRoot(t)
+	ticket, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "orphan candidate", Kind: domain.KindFeature, Severity: domain.SeverityP2})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	c := New(s)
+
+	// Present in this worktree: get succeeds and never reaches the ledger diagnosis.
+	if resp := c.Do(context.Background(), Request{Verb: "get", Args: map[string]any{"selector": ticket.ID}}); !resp.OK {
+		t.Fatalf("get(present) = %#v, want ok", resp)
+	}
+
+	// Lose the file, as removing the creating worktree does to an uncommitted ticket.
+	if err := os.Remove(filepath.Join(root, ".aira", "tickets", ticket.ID+".md")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	resp := c.Do(context.Background(), Request{Verb: "get", Args: map[string]any{"selector": ticket.ID}})
+	if resp.OK || resp.Code != "E_TICKET_NOT_IN_WORKTREE" || resp.Exit != 2 {
+		t.Fatalf("get(allocated-but-absent) = %#v, want E_TICKET_NOT_IN_WORKTREE exit 2", resp)
+	}
+	if !strings.Contains(resp.Error, filepath.Join(".aira", "tickets", ticket.ID+".md")) {
+		t.Fatalf("message must name the recorded path (its actionability): %q", resp.Error)
+	}
+
+	// A never-allocated id keeps the bare not-found.
+	resp = c.Do(context.Background(), Request{Verb: "get", Args: map[string]any{"selector": "AIRA-999"}})
+	if resp.Code != "E_NOT_FOUND" {
+		t.Fatalf("get(never-allocated) = %#v, want E_NOT_FOUND", resp)
+	}
+}
+
+type originFaultStore struct{ Store }
+
+func (originFaultStore) TicketAllocationOrigin(string) (string, string, bool, error) {
+	return "", "", false, fmt.Errorf("ledger read failed")
+}
+
+// TestGetVerbSurfacesLedgerDiagnosisFault pins that a fault in the AIRA-270
+// absence diagnosis is SURFACED (E_INTERNAL, exit 4), not masked as a bare
+// not-found. store.Get's not-found can come from a file stat alone, so the
+// diagnosis query is the first DB touch and can fail independently; swallowing
+// its error would hide an infra fault behind a normal-looking exit-2 result.
+func TestGetVerbSurfacesLedgerDiagnosisFault(t *testing.T) {
+	c := New(originFaultStore{Store: coreTestStore(t)})
+	resp := c.Do(context.Background(), Request{Verb: "get", Args: map[string]any{"selector": "AIRA-1"}})
+	if resp.Code != "E_INTERNAL" || resp.Exit != 4 || resp.OK {
+		t.Fatalf("get with a failing ledger diagnosis = %#v, want E_INTERNAL exit 4", resp)
+	}
+}
+
 func coreRawTicket(id, title string) domain.Ticket {
 	return domain.Ticket{Schema: 1, ID: id, Project: "core-project", Title: title,
 		Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}}

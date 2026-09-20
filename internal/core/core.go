@@ -185,6 +185,14 @@ type reviewStore interface {
 	ReviewPolicy() store.ReviewPolicy
 }
 
+// ticketOriginStore lets the get verb turn a bare E_NOT_FOUND into the honest
+// E_TICKET_NOT_IN_WORKTREE when the ledger shows the id was minted here (AIRA-270).
+// A capability interface (not part of Store) so only the get verb consults it and
+// a store lacking it degrades to the plain not-found.
+type ticketOriginStore interface {
+	TicketAllocationOrigin(string) (string, string, bool, error)
+}
+
 type gateStore interface {
 	ListGates() ([]gate.GateDefinition, error)
 	GateCheck(context.Context) (store.GateCheckReport, error)
@@ -910,6 +918,27 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			record, err := c.store.Get(selector)
 			if err != nil {
+				// AIRA-270: a bare E_NOT_FOUND cannot tell an id that never existed
+				// from one that was minted in this project but is not checked out in
+				// this worktree (present on another branch/worktree, or lost with a
+				// removed worktree). Consult the ledger and, when it holds a ticket
+				// allocation for the id, say so honestly instead — without claiming
+				// the ticket is lost, which the store cannot cheaply know.
+				if store.ErrorCode(err) == "E_NOT_FOUND" {
+					if origin, ok := c.store.(ticketOriginStore); ok {
+						id, path, found, oerr := origin.TicketAllocationOrigin(selector)
+						if oerr != nil {
+							// A ledger-read fault during the diagnosis is an infra fault:
+							// surface it (E_INTERNAL, exit 4) rather than mask it as a bare
+							// not-found. store.Get's own not-found can come from a file stat
+							// alone, so this query is the first DB touch and can fail on its own.
+							return nil, oerr
+						}
+						if found {
+							return nil, fmt.Errorf("E_TICKET_NOT_IN_WORKTREE: %s was allocated in this project but no ticket file is present in this worktree; it may be committed on another branch or worktree, or its uncommitted file was lost when a worktree was removed (originally recorded at %s)", id, path)
+						}
+					}
+				}
 				return nil, err
 			}
 			projected := projectRecord(record, fields)
