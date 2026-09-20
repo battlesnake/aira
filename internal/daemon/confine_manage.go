@@ -178,6 +178,10 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// which for a --delegate-ram scope is a containment ceiling many times its
 		// real reserve, and is exactly the number AIRA-192 was raised for.
 		runner.ApplyConfineScopeReserves(result.Scopes, snapshot.scopeReserves)
+		// AIRA-269. The VRAM twin, from the SAME locked snapshot: each granted
+		// scope's declared --vram (0 = "not a GPU job") onto its row, a scope the
+		// ledger holds no record for left unevaluated.
+		runner.ApplyConfineScopeVRAM(result.Scopes, snapshot.scopeVRAM)
 		readMemory := s.memoryReader()
 		sliceCurrent, maximum, sliceReclaimable, ok, _ := readMemory(path)
 		if ok {
@@ -312,6 +316,13 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				result.SliceReserve.SliceCPUKnown = cpu.SliceKnown
 				result.SliceReserve.CPUSampleUnixNano = cpu.SampleUnixNano
 				result.SliceReserve.CPUCores = s.cpuCoreCounter()()
+				// AIRA-269. The VRAM frame — same terms as RAM/CPU: a LOCK-FREE read
+				// of the sampler's atomic snapshot (NEVER a fork here; nvidia-smi on
+				// every `aira top` tick is exactly what the off-lock sampler exists to
+				// avoid), the ledger total + job count from the same locked snapshot,
+				// feeding no admission decision, withheld whole in shim mode by this
+				// same `if`.
+				s.fillVRAMFrame(result.SliceReserve, snapshot.vramOutstanding)
 			}
 			// AIRA-121. The advisory wording travels on the SAME line as the
 			// numbers it qualifies. Without it a shim reserve summary is

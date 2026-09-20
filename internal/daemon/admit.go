@@ -953,6 +953,16 @@ type admitSnapshot struct {
 	reservationJobs  int
 	reservationBytes int64
 
+	// AIRA-269. The VRAM ledger, captured in the SAME locked walk as the RAM/CPU
+	// figures. vramOutstanding is queue.vramOutstanding (the re-derived Σ declared
+	// --vram over granted+accounted leases). scopeVRAM maps each granted+accounted
+	// SCOPED waiter's declared --vram (INCLUDING 0 = "declared no VRAM / not a GPU
+	// job"), so every scope row gets an established VRAMBytes; scope-less
+	// reservations fold into vramOutstanding only. Reconciliation: Σ scopeVRAM +
+	// Σ(scope-less vram) == vramOutstanding, under the same admitGranted && accounted guard.
+	vramOutstanding int64
+	scopeVRAM       map[string]int64
+
 	// AIRA-101. The slice's exclusive state, derived in the SAME locked walk as
 	// everything above so `confine --list` and a blocked launcher's progress line
 	// can never render an exclusive holder alongside counts from another instant.
@@ -1131,7 +1141,9 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	snapshot := admitSnapshot{
 		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
 		phase: phase, present: true,
-		scopeReserves: make(map[string]int64, len(queue.waiters)),
+		scopeReserves:   make(map[string]int64, len(queue.waiters)),
+		vramOutstanding: queue.vramOutstanding, // AIRA-269: the re-derived VRAM ledger total
+		scopeVRAM:       make(map[string]int64, len(queue.waiters)),
 	}
 	queuedBytes := int64(0)
 	// ONE reading of the clock for the whole walk (AIRA-108): ages taken per-row
@@ -1207,6 +1219,10 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// a waiter that contributes to scopeBytes contributes a row and one that
 		// does not contributes neither, and the two can never drift apart.
 		snapshot.scopeReserves[waiter.scopeID] = waiter.ledgerCharge()
+		// AIRA-269. The scope's declared --vram, INCLUDING 0 (= "declared no VRAM /
+		// not a GPU job"), so every scope row gets an established VRAMBytes rather
+		// than an unevaluated one. Same match, same guard as scopeReserves.
+		snapshot.scopeVRAM[waiter.scopeID] = waiter.vram
 	}
 	if s.admitFreezeMaxHold > 0 {
 		snapshot.phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()

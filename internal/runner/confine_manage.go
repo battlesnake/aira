@@ -151,7 +151,15 @@ type ConfineRecord struct {
 	// Summed over one listing's rows it reconciles with that listing's own
 	// ScopeBytes.
 	ReserveBytes *int64 `json:"reserve_bytes"`
-	Pending      bool   `json:"pending,omitempty"`
+	// VRAMBytes is this scope's declared GPU VRAM reservation (AIRA-269), stamped
+	// only by ApplyConfineScopeVRAM from the daemon's locked admission snapshot,
+	// exactly like ReserveBytes. nil is "the daemon holds no admission record for
+	// this scope" (unevaluated — every renderer must say so). A pointer, not an
+	// int64 with a sentinel, because 0 is a REAL established value meaning "declared
+	// no VRAM — NOT a GPU job", which renderers show as "—" and must never collapse
+	// into absence.
+	VRAMBytes *int64 `json:"vram_bytes"`
+	Pending   bool   `json:"pending,omitempty"`
 	// Worker marks an aitest worker sub-scope (S2a §16.1): a first-class sibling
 	// confine scope whose NAME is aitest-w<seq> and whose pid slot is its PARENT
 	// supervisor's pid. It is a display/selector label — the default `--kill`/`--list`
@@ -196,6 +204,40 @@ func ApplyConfineScopeReserves(scopes []ConfineRecord, reserves map[string]int64
 		}
 		record.ReserveBytes = nil
 		record.UnevaluatedFields = withConfineFacet(record.UnevaluatedFields, ConfineReserveFacet)
+	}
+}
+
+// ConfineVRAMFacet is the UnevaluatedFields name for an unestablished per-scope
+// VRAM reservation (AIRA-269), spelled once so producer and consumers cannot drift.
+const ConfineVRAMFacet = "vram"
+
+// VRAMState discriminator values for ConfineSliceReserve.VRAMState (AIRA-269): the
+// four situations vramCurrent() collapses into one "unevaluated" that the System
+// VRAM bar must tell apart.
+const (
+	VRAMStateSet       = "set"
+	VRAMStateNoGPUWork = "no-gpu-work"
+	VRAMStateNoGPU     = "no-gpu"
+	VRAMStateStale     = "stale"
+)
+
+// ApplyConfineScopeVRAM stamps each scope's declared VRAM reservation onto a
+// listing's records, matched by scope id — the VRAM twin of
+// ApplyConfineScopeReserves and the ONE place ConfineRecord.VRAMBytes is set. A
+// scope present in the map (INCLUDING a value of 0, "declared no VRAM") gets an
+// established VRAMBytes; a scope absent from the map gets nil (unevaluated), so no
+// consumer must infer which of the two it holds.
+func ApplyConfineScopeVRAM(scopes []ConfineRecord, vram map[string]int64) {
+	for index := range scopes {
+		record := &scopes[index]
+		if value, ok := vram[record.ScopeID]; ok && record.ScopeID != "" {
+			charge := value
+			record.VRAMBytes = &charge
+			record.UnevaluatedFields = withoutConfineFacet(record.UnevaluatedFields, ConfineVRAMFacet)
+			continue
+		}
+		record.VRAMBytes = nil
+		record.UnevaluatedFields = withConfineFacet(record.UnevaluatedFields, ConfineVRAMFacet)
 	}
 }
 
@@ -546,6 +588,39 @@ type ConfineSliceReserve struct {
 	SliceCPUKnown      bool  `json:"slice_cpu_known,omitempty"`
 	CPUSampleUnixNano  int64 `json:"cpu_sample_unix_nano,omitempty"`
 	CPUCores           int   `json:"cpu_cores,omitempty"`
+
+	// AIRA-269. The VRAM frame `aira top` draws its System VRAM bar in — the
+	// structural mirror of the RAM/CPU frames, published under the same rules
+	// (withheld in shim mode; feeds no admission decision). Unlike CPU (a live
+	// rate) it is a real admission LEDGER, so it mirrors the RAM frame's
+	// granted-vs-total shape: VRAMOutstandingBytes is Σ declared --vram over
+	// granted+accounted leases (the ledger charge), VRAMBudgetBytes the effective
+	// budget (already clamped to the card by vramEffectiveBudget),
+	// VRAMTotalBytes/VRAMFreeBytes the physical card reading from the daemon's
+	// off-lock nvidia-smi snapshot, VRAMHeadroomBytes the admission headroom. The
+	// admit-fit ceiling the operator cares about is
+	// min(VRAMBudgetBytes, VRAMFreeBytes − VRAMHeadroomBytes), computed by the
+	// consumer (never drawn wider than that).
+	//
+	// VRAMState is the honesty discriminator the two-state RAM/reserve bit cannot
+	// express, because the daemon's vramCurrent() collapses FOUR situations the
+	// operator must tell apart. The byte fields are meaningful ONLY under "set"
+	// (VRAMTotalBytes/VRAMFreeBytes also under "stale", carried from the last good
+	// sample); every other state renders a Reason, never a fabricated width:
+	//   VRAMStateSet        a fresh evaluated snapshot.
+	//   VRAMStateNoGPUWork  no --vram job has ever been admitted, so the sampler
+	//                       was never armed. A POSITIVE fact ("no GPU work"), not a
+	//                       read failure.
+	//   VRAMStateNoGPU      the sampler ran and could not read a GPU (absent /
+	//                       nvidia-smi errored) — a genuine unreadable.
+	//   VRAMStateStale      the newest good sample is older than the staleness
+	//                       bound (the sampler stopped/hung).
+	VRAMOutstandingBytes int64  `json:"vram_outstanding_bytes,omitempty"`
+	VRAMBudgetBytes      int64  `json:"vram_budget_bytes,omitempty"`
+	VRAMTotalBytes       int64  `json:"vram_total_bytes,omitempty"`
+	VRAMFreeBytes        int64  `json:"vram_free_bytes,omitempty"`
+	VRAMHeadroomBytes    int64  `json:"vram_headroom_bytes,omitempty"`
+	VRAMState            string `json:"vram_state,omitempty"`
 
 	// AIRA-121. Containment/BudgetSource carry the ci-shim disposition on the
 	// SAME summary line the granted/ceiling numbers are printed on. Without them
