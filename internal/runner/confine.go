@@ -521,6 +521,15 @@ const (
 	// ConfineTerminatedSupervisorSignalPrefix: this confine supervisor itself
 	// received the named signal during the run and tore the job down.
 	ConfineTerminatedSupervisorSignalPrefix = "supervisor-signal:"
+	// ConfineTerminatedFailfastCancelled (AIRA-247): this job was killed by a
+	// slice-wide --fail-fast trip — the daemon sent this supervisor SIGUSR1 after a
+	// sibling fail-fast task failed. It is a DISTINCT terminal state, deliberately
+	// NOT `supervisor-signal:SIGUSR1`, so a CI classifier can tell a fail-fast
+	// VICTIM (which did not itself fail) apart from an OOM-137, a real failure, a
+	// clean exit, and an operator's `supervisor-signal:SIGTERM`. The trigger leg
+	// keeps its own non-zero verdict; the victim carries no trigger name (a signal
+	// has no payload — the trigger is the one leg with a real non-zero verdict).
+	ConfineTerminatedFailfastCancelled = "failfast-cancelled"
 	// ConfineTerminatedChildSignalPrefix: the child died of the named signal,
 	// which is not SIGKILL -- so neither cgroup.kill nor memory.oom.group, both
 	// of which deliver SIGKILL and nothing else, can have been the cause. Who
@@ -562,6 +571,12 @@ type ConfineRequest struct {
 	// warning has no reader) is refused; ordinary launches, and a transient
 	// daemon-restart window, are unaffected.
 	RequireAdmission bool
+	// AIRA-247. FailFast marks this task as a fail-fast trigger: if it exits
+	// non-zero, the client reports a "trip" to the daemon, which (ONLY in ci-shim
+	// mode) stops admitting new tasks and kills the running ones. Opt-in, default
+	// false; a no-op against a Real-mode (shared box) daemon, which is the gate
+	// that keeps a trip from ever touching another session's jobs.
+	FailFast bool
 	// AIRA-101. Exclusive asks the daemon to schedule this job ALONE in its slice,
 	// for uncontended benchmarking. Fail-closed end to end: if exclusivity cannot
 	// be established the launch is REFUSED, never silently downgraded, because a

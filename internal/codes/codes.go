@@ -343,6 +343,20 @@ var ExitCodes = map[string]int{
 	// establish emptiness, which is not the same claim as "the slice is busy" and
 	// must never be reported as one. AIRA-124 did not touch it.
 	"E_ADMIT_EXCLUSIVE_ACTIVE": 4, "U_ADMIT_EXCLUSIVE_UNESTABLISHED": 3,
+	// AIRA-247's fail-fast trip refusal. It is deliberately NOT 4, even though it
+	// is an admission refusal like E_ADMIT_SATURATED / E_ADMIT_EXCLUSIVE_ACTIVE,
+	// because those two are 4 for a reason that does not hold here: they are
+	// temporary capacity exhaustion cured by WAITING — the exclusive job finishes,
+	// the contended reserve frees — with no external action. A fail-fast trip is a
+	// LATCHED durable state: a sibling --fail-fast task failed, so this slice
+	// refuses every further admission until the trip is reset (a new CI gate / a
+	// fresh daemon). Waiting does nothing; the box being idle changes nothing. That
+	// is exactly the 1 side of the package-comment rule — "not in the state the
+	// operation needs; change the state and the same request succeeds" — the same
+	// shape as E_LEASE_HELD and E_TRANSITION_INVALID, not the host-capacity shape
+	// of the 4s. Raised ONLY by a ci-shim daemon (the box daemon never trips), so
+	// it never reaches an interactive operator on the shared slice.
+	"E_ADMIT_FAILFAST_TRIPPED":   1,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
 	"U_CONFINE_NOT_LAUNCHED": 3, "U_CONFINE_KILL_UNCONFIRMED": 3,
 	// AIRA-22's detached confine surface, mirroring the run-detach pair

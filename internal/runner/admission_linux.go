@@ -489,6 +489,27 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 				basis:    "reject:wait-too-long",
 			}, true, errors.New(message)
 		}
+		// AIRA-247. A fail-fast trip is a dedicated TERMINAL refusal, handled here
+		// with the other pre-payload refusals (not the structured saturated block
+		// below) so it never borrows the saturated wording or basis. Post-S13 an
+		// unhandled well-formed code already refuses cleanly rather than launching,
+		// but as an ANONYMOUS reject:daemon-refused; naming it keeps the CI
+		// classifier's signal — `admission=failfast_tripped`, code=E_ADMIT_FAILFAST_TRIPPED
+		// — so a leg refused because a sibling failed is told from one refused for
+		// capacity.
+		if response.Code == "E_ADMIT_FAILFAST_TRIPPED" {
+			_ = conn.Close()
+			message := strings.TrimSpace(response.Error)
+			if message == "" {
+				message = response.Code + ": a --fail-fast task in this slice failed; refusing to admit"
+			}
+			return admissionResult{
+				state:    "failfast_tripped",
+				waitedMS: time.Since(admissionStarted).Milliseconds(),
+				reserve:  effectiveReserve,
+				basis:    "reject:failfast",
+			}, true, errors.New(message)
+		}
 		if response.Code == "E_ADMIT_TOO_LARGE" || response.Code == "E_ADMIT_SATURATED" || response.Code == "E_ADMIT_VRAM_TOO_LARGE" || response.Code == "E_ADMIT_VRAM_UNAVAILABLE" {
 			var rejection runnerAdmitRejection
 			if err := json.Unmarshal(response.Data, &rejection); err == nil && validRunnerAdmitRejection(response.Code, rejection) {
@@ -812,6 +833,50 @@ func ReportPeakSample(ctx context.Context, socketPath string, report ConfinePeak
 			return errors.New(response.Error)
 		}
 		return errors.New("daemon rejected confine report")
+	}
+	return nil
+}
+
+// SendFailfastTrip tells the daemon a --fail-fast task in `slice` has FAILED
+// (AIRA-247), over the same project-less admit socket the peak report uses. It is
+// best-effort: the caller has already finished its own (failed) job, and the
+// trip's real effect — refuse new admissions into the slice, tear down the
+// siblings — is the daemon's, so a transport error is returned for the caller to
+// LOG, not to act on. scopeID is the caller's OWN scope id, which the daemon
+// excludes from the teardown so the trigger keeps its real verdict. No owner is
+// sent: the daemon does not owner-gate a trip (it acts only in single-tenant
+// ci-shim mode), so an owner would be dead wire.
+func SendFailfastTrip(ctx context.Context, socketPath, slice, scopeID string) error {
+	if strings.TrimSpace(socketPath) == "" {
+		return errors.New("daemon fail-fast unavailable: no admit socket")
+	}
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
+	frame.Request.Verb = "confine-failfast"
+	frame.Request.Args = map[string]any{"scope_id": scopeID}
+	if strings.TrimSpace(slice) != "" {
+		frame.Request.Args["slice"] = slice
+	}
+	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
+		return err
+	}
+	var response runnerAdmitResponseFrame
+	if err := readRunnerAdmitFrame(conn, &response); err != nil {
+		return err
+	}
+	if !response.OK {
+		if response.Error != "" {
+			return errors.New(response.Error)
+		}
+		return errors.New("daemon refused fail-fast trip")
 	}
 	return nil
 }

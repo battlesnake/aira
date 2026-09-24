@@ -381,7 +381,9 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	var supervisorSignalMu sync.Mutex
 	var supervisorSignal os.Signal
 	runEnded := false
-	signalEvents, stopSignalSource := deps.signalSource()
+	// AIRA-247: the ci-shim path catches SIGUSR1 — it is the daemon's fail-fast
+	// teardown signal, which the supervisor forwards to the job's process group.
+	signalEvents, stopSignalSource := deps.signalSource(true)
 	// The forwarder's own `deliver` is nil HERE, and only here. This callback
 	// already delivers the received signal to the group synchronously (see the
 	// order argument below), so leaving the forwarder's delivery in place sent a
@@ -480,6 +482,21 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// The pgid cut-off closes the instant the leader is reaped, before anything
 	// else can run: past here signal() delivers nothing.
 	command.markReaped()
+	// AIRA-247. Close the witness cut-off HERE, immediately after the reap and
+	// BEFORE the bounded drains below — matching the real path's "snapshot on the
+	// very next statement after the wait" discipline (confine_linux.go). The drains
+	// can each cost a grace period, and the daemon's fail-fast sweep SIGUSR1s every
+	// granted sibling at cohort-failure time; a signal landing in that multi-second
+	// window would otherwise be RECORDED as this job's witness and falsely stamp an
+	// already-finished sibling as failfast-cancelled — a false terminated-by, the
+	// one honesty invariant this must not break. Past the reap the child is dead, so
+	// a forwarded signal reaches nothing and the witness is meaningless; recording
+	// it is the only remaining effect, which this closes. (markReaped above already
+	// closed signal() delivery; this closes the witness the classifier reads.)
+	supervisorSignalMu.Lock()
+	terminatedBySignal := supervisorSignal
+	runEnded = true
+	supervisorSignalMu.Unlock()
 	// Drain what the job wrote, BOUNDED. On the real path cmd.Wait() joins
 	// os/exec's own copiers, so the trailer written below strictly follows every
 	// byte of the job's output; without this the two could interleave. The bound
@@ -489,10 +506,6 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	drainStdout(shimTeardownGrace)
 	drainStderr(shimTeardownGrace)
 	result.Exit = exitCode
-	supervisorSignalMu.Lock()
-	terminatedBySignal := supervisorSignal
-	runEnded = true
-	supervisorSignalMu.Unlock()
 	// AIRA-121 gate condition C10. NO peak-RSS is reported in shim mode, and
 	// therefore nothing is fed back to the AIRA-67 per-signature estimator.
 	//
@@ -513,6 +526,11 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// AIRA-206: see the real path -- prepend \n so the trailer begins its own line
 	// even after a partial (newline-free) last block from the job.
 	_, _ = fmt.Fprintf(diagnostics, "\n%s\n", FormatConfineStatus(result.Status))
+	// AIRA-247. A FAILED --fail-fast task trips its slice: the daemon refuses new
+	// admissions and tears down the siblings. Sent strictly after runEnded (set
+	// above), so a late SIGUSR1 from the daemon's own sweep reaching this supervisor
+	// cannot restamp this job's verdict. Only the ci-shim path sends it.
+	maybeSendFailfastTrip(deps, request, result.Status.TerminatedBy, exitCode, sliceName, scopeID, diagnostics)
 	return result, nil
 }
 

@@ -137,6 +137,12 @@ const (
 	admitRejected
 )
 
+// admitOutcomeFailfast marks a waiter rejected because its slice tripped
+// fail-fast (AIRA-247), the discriminator the render path reads to answer
+// E_ADMIT_FAILFAST_TRIPPED rather than E_ADMIT_SATURATED. It is set on the same
+// field ("saturated" uses) so the two rejection kinds stay parallel.
+const admitOutcomeFailfast = "failfast"
+
 type admitWaiter struct {
 	seq     int64
 	reserve int64
@@ -639,6 +645,18 @@ type sliceQueue struct {
 	stopped chan struct{}
 	poll    time.Duration
 	server  *Server
+
+	// AIRA-247. failfastTripped latches once a --fail-fast task in this slice has
+	// failed: while set, evaluateAdmitQueue rejects every QUEUED waiter with
+	// E_ADMIT_FAILFAST_TRIPPED and grants nothing (the "no new tasks admitted"
+	// half; running jobs are torn down separately by the SIGUSR1 sweep). Written
+	// under queue.mu. It is a per-queue COPY of the durable Server latch
+	// (Server.failfastTripped), not the master: an empty queue is deleted by
+	// pruneAdmitQueue, so a latch that lived only here would evaporate the instant
+	// the sweep emptied the slice — exactly when a late leg dials in. The Server
+	// map survives the prune and seeds this copy at queue creation, so a queue
+	// rebuilt after the trip is born tripped.
+	failfastTripped bool
 
 	// AIRA-59 fairness-freeze duty cycle, held as a SINGLE anchor instant so the
 	// phase is DERIVED, never stored: idle while zero, hold for the first
@@ -1764,6 +1782,18 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 
 	queue.mu.Lock()
 	if waiter.state == admitRejected {
+		// AIRA-247. A fail-fast trip wins the wording outright — it is neither
+		// saturation nor an exclusive drain but a latched slice abort — and carries
+		// its OWN basis "reject:failfast", never "reject:saturated", so the runner
+		// routes it to the dedicated terminal-refusal block (a distinct code the CI
+		// classifier reads) rather than the saturated one. Placed first so neither
+		// the exclusive nor the saturated arm below can claim a tripped waiter.
+		if waiter.outcome == admitOutcomeFailfast {
+			rejection := admitRejection{Required: reserve, Ceiling: ceiling, Basis: "reject:failfast"}
+			queue.mu.Unlock()
+			s.writeAdmitRejection(conn, CodeAdmitFailfastTripped, rejection)
+			return
+		}
 		// The EXCLUSIVE requester's own expiry. Its state is already admitRejected
 		// by the time the gate is re-derived, so it no longer matches the drain
 		// predicate and would otherwise be reported as plain saturation — "the slice
@@ -1960,6 +1990,13 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			poll = defaultAdmitPollInterval
 		}
 		queue = &sliceQueue{path: path, kick: make(chan struct{}, 1), stop: make(chan struct{}), stopped: make(chan struct{}), poll: poll, server: s}
+		// AIRA-247. A queue rebuilt after a fail-fast trip (the trip emptied the
+		// slice, pruneAdmitQueue deleted the old queue) is born tripped, so a late
+		// leg that dials into the fresh queue is still refused. s.failfastTripped is
+		// read under admitRegistryMu, held here; a nil map reads false.
+		if s.failfastTripped[path] {
+			queue.failfastTripped = true
+		}
 		s.admitQueues[path] = queue
 		go queue.runEvaluator()
 	}
@@ -2155,6 +2192,27 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
+	// AIRA-247. A tripped slice admits NOTHING: reject every queued waiter and
+	// return before the ceiling read, since no ceiling could let one through.
+	// Rejecting a QUEUED waiter is ledger-neutral — only granted && accounted
+	// waiters charge the ledger (rederiveLedgerLocked), so this removes no charge
+	// and leaves the running jobs (torn down by the sweep) to release on their own
+	// connection close. This is the single-writer evaluator, so the state writes
+	// here need no extra synchronisation beyond queue.mu. A newly enqueued waiter
+	// re-signals the queue and is rejected on the next pass; the latch is durable
+	// (Server map) so a queue rebuilt after a prune is born tripped.
+	if queue.failfastTripped {
+		for _, waiter := range queue.waiters {
+			if waiter.state != admitQueued {
+				continue
+			}
+			waiter.state = admitRejected
+			waiter.outcome = admitOutcomeFailfast
+			waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, now)
+			close(waiter.grantedCh)
+		}
+		return
+	}
 	readMemory := s.memoryReader()
 	current, maximum, reclaimable, ok, _ := readMemory(queue.path)
 	if !ok {
@@ -2850,6 +2908,12 @@ func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admit
 	}
 	if code == CodeAdmitVRAMUnavailable {
 		message = fmt.Sprintf("%s: a job declared VRAM but the GPU could not be read — no GPU or nvidia-smi unavailable (basis=%s)", code, rejection.Basis)
+	}
+	// AIRA-247. Code-prefixed like the refusals above, so confineErrorCode extracts
+	// E_ADMIT_FAILFAST_TRIPPED for the exit-status map (bucket 1). It names the
+	// cause rather than any RAM figure — a trip is not a capacity condition.
+	if code == CodeAdmitFailfastTripped {
+		message = fmt.Sprintf("%s: a --fail-fast task in this slice failed; the CI gate is aborting, so no further jobs are admitted (basis=%s)", code, rejection.Basis)
 	}
 	frame := errorFrame(code, message)
 	frame.Data, _ = json.Marshal(rejection)

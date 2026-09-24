@@ -88,7 +88,9 @@ func (r *Runner) shimSignalSource() (<-chan os.Signal, func()) {
 	if r.signalSourceFn != nil {
 		return r.signalSourceFn()
 	}
-	return confineSignalSource()
+	// AIRA-247: `aira run` has no fail-fast, so its supervisor never catches
+	// SIGUSR1 (that is confine's ci-shim teardown signal alone).
+	return confineSignalSource(false)
 }
 
 // confineMode reports this Runner's install mode. Absent a seam it is the

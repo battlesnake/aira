@@ -85,10 +85,18 @@ type Server struct {
 	// fake clock + restartAfter seam, never a real sleep. restartFreezeUntilNanos is the
 	// freeze-end wall-clock UnixNano armed at listen-ready (0 = unarmed); it is atomic
 	// because a concurrent evaluator pass may read it while listen-ready arms it.
-	restartFreeze                time.Duration
-	restartFreezeUntilNanos      atomic.Int64
-	admitRegistryMu              sync.Mutex
-	admitQueues                  map[string]*sliceQueue
+	restartFreeze           time.Duration
+	restartFreezeUntilNanos atomic.Int64
+	admitRegistryMu         sync.Mutex
+	admitQueues             map[string]*sliceQueue
+	// AIRA-247. The DURABLE fail-fast latch, keyed by slice path, guarded by
+	// admitRegistryMu (the mutex that already guards admitQueues, and the outer of
+	// the admitRegistryMu→queue.mu order pruneAdmitQueue establishes). It outlives
+	// any single sliceQueue: pruneAdmitQueue deletes an emptied queue, but a trip
+	// must keep refusing across that prune, so the master latch lives here and each
+	// queue takes a copy at creation. Only ever SET (a trip is terminal for the
+	// gate); a ci-shim daemon is ephemeral per CI run, so it is never cleared.
+	failfastTripped              map[string]bool
 	admitPriorMu                 sync.Mutex
 	admitPriorPeak               int64
 	admitPriorOK                 bool
@@ -165,6 +173,15 @@ type Server struct {
 	workerScopeKill func(context.Context, string, string) error
 	admitNow        func() time.Time
 	admitAfter      func(time.Duration) <-chan time.Time
+	// AIRA-247. failfastSignalPID delivers the fail-fast cancellation to one
+	// victim SUPERVISOR (SIGUSR1 → the supervisor forwards to the job's process
+	// group; unhandled, SIGUSR1's default action is Term). Nil in production →
+	// resolveFailfastSignalPID opens a pidfd and PidfdSendSignal's it, the same
+	// TOCTOU-safe mechanism the watchdog uses. A test injects a recorder so the
+	// sweep's target set (and the trigger exclusion) is asserted without signalling
+	// a real process. Best-effort by contract: it can never confirm a kill (a
+	// shim daemon has no cgroup to read empty), so an error is logged, not fatal.
+	failfastSignalPID func(pid int) error
 	// S13 restart timer seam, SEPARATE from admitAfter (the per-waiter deadline seam):
 	// runRestartFreeze waits the freeze via this, and sharing admitAfter would cross-talk
 	// with a live admitConnection in a Serve-driven test. Nil → time.After.
@@ -819,6 +836,18 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			s.OnRequest(request.Scope, request.Request)
 		}
 		wrote = s.reply(conn, responseFrame(s.confineManagement(ctx, request.Request)))
+		return
+	}
+	// AIRA-247. confine-failfast is NOT ownership-guarded confine management: it is
+	// an internal coordination action (a failed --fail-fast task tripping its
+	// slice), so it takes its own route — like confine-report — and never through
+	// confineManagement's owner gate. A confine job's owner is optional, and a trip
+	// is not a kill an owner authorises.
+	if verb == "confine-failfast" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = s.reply(conn, responseFrame(s.confineFailfast(request.Request.Args)))
 		return
 	}
 	// AIRA (admission-counter rebuild) S18.

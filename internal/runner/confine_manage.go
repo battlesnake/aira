@@ -813,6 +813,19 @@ type ConfineReapResult struct {
 	Skipped int      `json:"skipped"`
 }
 
+// FailfastTripResult is the daemon's answer to a confine-failfast trip (AIRA-247).
+// Applied is false with a real-cgroup daemon — a trip has NO effect there, and
+// this states that explicitly rather than returning a silent success (a fake pass
+// by the honesty discipline). Signalled is a COUNT of best-effort SIGUSR1s sent to
+// victim supervisors, never a claim of confirmed kills: a ci-shim daemon has no
+// cgroup to read empty, so it cannot confirm a death and never asserts one.
+type FailfastTripResult struct {
+	Applied   bool   `json:"applied"`
+	Mode      string `json:"mode"`
+	Signalled int    `json:"signalled"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // orphanedConfineScopeCandidates requires positive proof for every orphan
 // facet. Unknown population, supervisor, or age state is never a candidate. A
 // scope with a live daemon admit lease (hasLiveLease) is NEVER a candidate: that
