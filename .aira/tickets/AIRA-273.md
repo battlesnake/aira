@@ -25,3 +25,8 @@ A alone does not stop the restart cycle (4); B alone still costs ~8 kills per le
 - A signature with 20 cheap rows then one kill at a small cap: next reserve ≥ p90-prior (A). Mutation: drop the max() → 1.5×cap → reds.
 - 20 cheap rows AFTER a big success/kill: the big evidence is still honoured (B). Mutation: restore count-only eviction → reds.
 - A shrinking single-mode command still shrinks under B's decay rule (no permanent ratchet).
+
+## Downstream workaround + reproduction (from qual, 2026-09-25)
+- fastest-ee's pin landed as fastest-ee #1630 (`3261ae022`): the Makefile's `SG_RESERVE.mechanical-lint := 1G` reaches `aira confine` through `scripts/sg_confine.sh`'s new optional 4th argument. The Makefile comment names the measurement and this reproduction.
+- REPRODUCTION of the big mode: `make sg-mechanical-lint BASE=46281aaba…` (in fastest-ee) → measured peak 417–426 MiB. Use it as the replay case when choosing between A / A+B.
+- WHEN A+B SHIP: tell qual, so the 1G pin can be re-evaluated (and removed, if the estimator now learns the big mode in ≤1 kill and keeps it).
