@@ -111,6 +111,16 @@ func TestClassifyConfineTermination(t *testing.T) {
 			why:  "branch 3 before 4: a child that CAUGHT our forwarded SIGTERM and exited cleanly was still terminated by us",
 		},
 		{
+			name: "a supervisor SIGUSR1 is a fail-fast cancellation", term: signalled(syscall.SIGUSR1), usage: readable(0), supervisor: syscall.SIGUSR1,
+			want: ConfineTerminatedFailfastCancelled,
+			why:  "AIRA-247: SIGUSR1 is the daemon's fail-fast teardown signal, classified distinctly (above the generic supervisor-signal branch) so a cancelled sibling is never read as an operator SIGTERM or a real failure",
+		},
+		{
+			name: "an OOM still outranks a fail-fast SIGUSR1", term: signalled(syscall.SIGKILL), usage: readable(1), supervisor: syscall.SIGUSR1,
+			want: "oom",
+			why:  "branch 2 before the SIGUSR1 branch: a real OOM at our own cap is a kernel fact the trip signal cannot mask",
+		},
+		{
 			name: "supervisor signal wins over the SIGKILL our own cleanup delivered", term: signalled(syscall.SIGKILL), usage: unreadable, supervisor: syscall.SIGINT,
 			want: "supervisor-signal:SIGINT",
 			why:  "branch 3 before 7: cleanup()'s cgroup.kill is ours, and the scope it removed is why the counter is unreadable",
@@ -327,7 +337,7 @@ func TestConfineTrailerIgnoresASignalThatArrivesAfterTheRunEnded(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	signals := make(chan os.Signal, 1)
-	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	deps.signalSource = func(bool) (<-chan os.Signal, func()) { return signals, func() {} }
 	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 
 	// Synchronise on the WRITE, not on a poll or a sleep. The earlier version of
@@ -566,7 +576,7 @@ func TestConfineTrailerReportsSupervisorSignal(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	signals := make(chan os.Signal, 1)
-	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	deps.signalSource = func(bool) (<-chan os.Signal, func()) { return signals, func() {} }
 	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
 	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
 

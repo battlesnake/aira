@@ -194,10 +194,15 @@ type confineDeps struct {
 	start                 func(*confineCommand) error
 	readHandshake         func(*os.File, time.Duration) ([]byte, error)
 	readCap               func(string) (int64, bool)
-	signalSource          func() (<-chan os.Signal, func())
+	signalSource          func(withUSR1 bool) (<-chan os.Signal, func())
 	readUsage             func(string) cgroupUsage
 	reportPeak            func(context.Context, ConfineRequest, ConfinePeakReport) error
-	queuePosition         func(context.Context, ConfineRequest, string) (confineQueuePosition, bool)
+	// AIRA-247. sendFailfastTrip notifies the daemon that this --fail-fast job has
+	// failed. Production is SendFailfastTrip; tests substitute a recorder so the
+	// trip's arguments (and the fact that a victim/passing/non-fail-fast job never
+	// trips) are asserted without a live daemon.
+	sendFailfastTrip func(ctx context.Context, socketPath, slice, scopeID string) error
+	queuePosition    func(context.Context, ConfineRequest, string) (confineQueuePosition, bool)
 	// resolveMode is the AIRA-121 confinement-mode seam. Production is
 	// ResolveConfineMode, which reads the durable install-mode record; tests
 	// substitute a constant so the shim path can be exercised without an
@@ -219,6 +224,12 @@ type confineDeps struct {
 // hang. Tests override the interval.
 const defaultAdmitWaitDiagInterval = 15 * time.Second
 
+// confineFailfastTripTimeout bounds the best-effort fail-fast trip send (AIRA-247).
+// The daemon dials, latches, and signals the sibling supervisors before replying,
+// so this covers a connect plus a bounded sweep; a slow or dead daemon must not
+// wedge a supervisor that has already finished its own job.
+const confineFailfastTripTimeout = 3 * time.Second
+
 func defaultConfineDeps() confineDeps {
 	return confineDeps{
 		resolveSlicePath:      resolveSlicePath,
@@ -237,6 +248,7 @@ func defaultConfineDeps() confineDeps {
 		signalSource:          confineSignalSource,
 		readUsage:             readCgroupUsage,
 		reportPeak:            reportConfinePeak,
+		sendFailfastTrip:      SendFailfastTrip,
 		queuePosition:         confineQueuePositionFromDaemon,
 		resolveMode:           ResolveConfineMode,
 	}
@@ -871,7 +883,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	var supervisorSignalMu sync.Mutex
 	var supervisorSignal os.Signal
 	runEnded := false
-	signalEvents, stopSignalSource := deps.signalSource()
+	// AIRA-247: the real-cgroup path never catches SIGUSR1 (fail-fast is ci-shim
+	// only), so a stray SIGUSR1 on the shared box keeps its default action.
+	signalEvents, stopSignalSource := deps.signalSource(false)
 	stopSignalHandler := forwardConfineSignals(signalEvents, deliver, func(received os.Signal) {
 		supervisorSignalMu.Lock()
 		late := runEnded
@@ -1500,7 +1514,48 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if advisory := formatConfineOOMLimitAdvisory(result.Status.TerminatedBy, usage); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
+	// AIRA-247. The real-cgroup path does NOT send a fail-fast trip: fail-fast takes
+	// effect only in ci-shim mode (the daemon gates a real-mode trip to a no-op), so
+	// the trip is sent from confineShim alone. See maybeSendFailfastTrip.
 	return result, nil
+}
+
+// maybeSendFailfastTrip fires the AIRA-247 fail-fast trip to the daemon when a
+// --fail-fast task has FAILED. It is called ONLY from the ci-shim path
+// (confineShim): fail-fast takes effect only in shim mode, where the daemon acts
+// on the trip; a real-cgroup daemon gates it to a no-op, so the real path never
+// sends one.
+//
+// Guards: the job opted in (FailFast), it FAILED (exitCode != 0), and it was NOT
+// itself a fail-fast victim — a cancelled sibling must not re-trip (the daemon
+// latch is idempotent, but this spares a redundant slice-wide re-sweep). Sent with
+// a BACKGROUND context (the job's own ctx may already be cancelled) and
+// best-effort: a transport error is logged to the job's diagnostics and nothing
+// more, since the caller has no live job left to gate on it. It is safe against a
+// late SIGUSR1 from the daemon's own sweep reaching this supervisor, because the
+// caller invokes it strictly AFTER runEnded — past the witness cut-off — so the
+// sweep can never restamp this job's own verdict.
+func maybeSendFailfastTrip(deps confineDeps, request ConfineRequest, terminatedBy string, exitCode int, sliceName, scopeID string, diagnostics io.Writer) {
+	if !request.FailFast || exitCode == 0 || deps.sendFailfastTrip == nil {
+		return
+	}
+	// A job that did not FAIL on its own account never trips the cohort:
+	//   - failfast-cancelled: it is a VICTIM of a trip, not a trigger (re-tripping
+	//     would fire a redundant slice-wide re-sweep);
+	//   - supervisor-signal:*: an operator/Batch SIGINT/SIGTERM tore it down — that
+	//     is a teardown, not "a --fail-fast task failed" (the owner's spec), so it
+	//     must not abort every sibling in the cohort.
+	// A genuine failure (normal non-zero exit, an OOM, a crash, a deadline kill)
+	// still trips.
+	if terminatedBy == ConfineTerminatedFailfastCancelled ||
+		strings.HasPrefix(terminatedBy, ConfineTerminatedSupervisorSignalPrefix) {
+		return
+	}
+	tripCtx, cancel := context.WithTimeout(context.Background(), confineFailfastTripTimeout)
+	defer cancel()
+	if err := deps.sendFailfastTrip(tripCtx, request.AdmitSocketPath, sliceName, scopeID); err != nil {
+		_, _ = fmt.Fprintf(diagnostics, "\nconfine: fail-fast trip not delivered to the daemon: %v\n", err)
+	}
 }
 
 // confineOwnCapAdviceWarranted reports whether "job OOM-killed at its memory
@@ -2291,9 +2346,21 @@ func readConfineHandshake(reader *os.File, timeout time.Duration) ([]byte, error
 	}
 }
 
-func confineSignalSource() (<-chan os.Signal, func()) {
+// confineSignalSource installs the supervisor's signal forwarder. SIGINT and
+// SIGTERM are always caught (operator / Batch teardown). AIRA-247: SIGUSR1 is
+// caught ONLY when withUSR1 is set, which is ci-shim mode — there it is the
+// daemon's fail-fast teardown signal and the supervisor forwards it to the job's
+// process group. A REAL-cgroup supervisor must NOT catch it: real mode never
+// trips (the daemon gates fail-fast to shim mode), so a stray SIGUSR1 on the
+// shared box keeps its default action and is never misattributed as a fail-fast
+// cancellation.
+func confineSignalSource(withUSR1 bool) (<-chan os.Signal, func()) {
 	forward := make(chan os.Signal, 2)
-	signal.Notify(forward, syscall.SIGINT, syscall.SIGTERM)
+	catch := []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	if withUSR1 {
+		catch = append(catch, syscall.SIGUSR1)
+	}
+	signal.Notify(forward, catch...)
 	return forward, func() { signal.Stop(forward) }
 }
 
@@ -2678,6 +2745,12 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 	killed := term.Signaled && term.Signal == syscall.SIGKILL
 	if killed && localOOM {
 		return ConfineTerminatedOOM
+	}
+	if supervisorSignal == syscall.SIGUSR1 {
+		// AIRA-247: the daemon's --fail-fast trip signals this supervisor with
+		// SIGUSR1. Classify it distinctly (above the generic supervisor-signal
+		// branch) so a fail-fast VICTIM is not confused with an operator SIGTERM.
+		return ConfineTerminatedFailfastCancelled
 	}
 	if supervisorSignal != nil {
 		return ConfineTerminatedSupervisorSignalPrefix + confineSignalName(supervisorSignal)

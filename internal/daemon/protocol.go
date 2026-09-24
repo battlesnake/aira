@@ -216,6 +216,13 @@ const (
 	// unaccounted but also NOT exclusive, while its operator believed otherwise.
 	CodeAdmitExclusiveActive = "E_ADMIT_EXCLUSIVE_ACTIVE"
 
+	// CodeAdmitFailfastTripped refuses a NEW admission (and rejects every queued
+	// waiter) once a --fail-fast task has tripped this slice (AIRA-247). Like the
+	// exclusive codes it is a DEDICATED code so the runner does not route it into
+	// the flock fallback — a fail-fast trip means the gate is aborting, so a leg
+	// must NOT launch unaccounted. Raised ONLY by a ci-shim daemon.
+	CodeAdmitFailfastTripped = "E_ADMIT_FAILFAST_TRIPPED"
+
 	// CodeAdmitExclusiveUnestablished refuses an --exclusive request UP FRONT when
 	// the daemon cannot establish that the slice is empty (AIRA-101). After S14 it
 	// is raised in exactly two places, both before the request is queued: ci-shim

@@ -64,7 +64,7 @@ func runShimSignalJob(t *testing.T, dir, script string, sig os.Signal) (ConfineR
 	t.Helper()
 	events := make(chan os.Signal, 1)
 	deps := shimUnitDeps()
-	deps.signalSource = func() (<-chan os.Signal, func()) { return events, func() {} }
+	deps.signalSource = func(bool) (<-chan os.Signal, func()) { return events, func() {} }
 	go func() {
 		// The signal is sent even when readiness never arrives, so a broken job
 		// script fails this test with a clear assertion instead of parking it in

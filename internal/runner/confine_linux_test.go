@@ -1088,7 +1088,7 @@ func TestConfineSignalHandlerInstalledBeforeStartCleansScope(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	signals := make(chan os.Signal, 1)
-	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	deps.signalSource = func(bool) (<-chan os.Signal, func()) { return signals, func() {} }
 	start := deps.start
 	deps.start = func(command *confineCommand) error {
 		if err := start(command); err != nil {
@@ -1394,7 +1394,7 @@ func TestConfinePeakReportWithheldWhenSupervisorSignalCaughtAndChildExitsZero(t 
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
 	signals := make(chan os.Signal, 1)
-	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	deps.signalSource = func(bool) (<-chan os.Signal, func()) { return signals, func() {} }
 	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
 	called := false
 	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error {
