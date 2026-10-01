@@ -44,6 +44,11 @@ func TestFillVRAMFrame(t *testing.T) {
 	if rw.VRAMTotalBytes != 0 || rw.VRAMFreeBytes != 0 {
 		t.Fatalf("no-gpu-work must publish no card figures, got total=%d free=%d", rw.VRAMTotalBytes, rw.VRAMFreeBytes)
 	}
+	// AIRA-274: the CONFIGURED budget is not a card reading, so it is published
+	// even with no sample — `aira top` draws the reservations against it.
+	if rw.VRAMBudgetBytes != 14*G {
+		t.Fatalf("no-gpu-work must still publish the configured budget, got %d", rw.VRAMBudgetBytes)
+	}
 
 	// no-gpu: the sampler ran and could not read a device (evaluated=false).
 	nogpu := newServer()
@@ -55,6 +60,19 @@ func TestFillVRAMFrame(t *testing.T) {
 	}
 	if rn.VRAMTotalBytes != 0 {
 		t.Fatalf("no-gpu must publish no fabricated total, got %d", rn.VRAMTotalBytes)
+	}
+	if rn.VRAMBudgetBytes != 14*G {
+		t.Fatalf("no-gpu must still publish the configured budget, got %d", rn.VRAMBudgetBytes)
+	}
+
+	// AIRA-274: an auto-detect budget (unset = the card total) is UNKNOWN without a
+	// reading, so nothing is published — never a fabricated 0-or-infinite budget.
+	auto := &Server{vramHeadroom: G, vramStaleness: 10 * time.Second}
+	auto.admitNow = func() time.Time { return now }
+	var ra runner.ConfineSliceReserve
+	auto.fillVRAMFrame(&ra, 0)
+	if ra.VRAMBudgetBytes != 0 {
+		t.Fatalf("an unset budget with no card reading must publish no budget, got %d", ra.VRAMBudgetBytes)
 	}
 
 	// stale: a good sample gone old → still carry the last-good card figures, marked stale.

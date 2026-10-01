@@ -314,6 +314,10 @@ type topBar struct {
 	// Outside is system-wide usage minus the slice's own, the right-anchored grey.
 	Outside      int64
 	OutsideKnown bool
+	// TotalIsBudget marks a VRAM bar whose Total is the configured admission
+	// budget rather than a measured card size (AIRA-274: no card reading), so the
+	// legend calls the width a "budget" and never a "total".
+	TotalIsBudget bool
 	// Free is the gap between the two, floored at zero.
 	Free int64
 	// Overcommitted records that the claim and the outside usage together exceed
@@ -1068,11 +1072,9 @@ func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, c
 	case runner.VRAMStateSet, runner.VRAMStateStale:
 		// drawable — a real card reading exists.
 	case runner.VRAMStateNoGPUWork:
-		bar.Reason = "no GPU work: no --vram job has been admitted, so the sampler took no VRAM reading"
-		return bar
+		return topVRAMReservationsBar(bar, reserve, "no GPU work: no --vram job has run yet, so the card has not been read")
 	case runner.VRAMStateNoGPU:
-		bar.Reason = "GPU unreadable: nvidia-smi is absent or reported no device"
-		return bar
+		return topVRAMReservationsBar(bar, reserve, "GPU unreadable: nvidia-smi is absent or reported no device")
 	default:
 		bar.Reason = "GPU VRAM is unevaluated"
 		return bar
@@ -1118,6 +1120,34 @@ func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, c
 		})
 	}
 	bar.Markers = topVRAMMarkersFor(reserve)
+	return bar
+}
+
+// topVRAMReservationsBar is the AIRA-274 degraded bar for a card that has not been
+// read (no GPU work yet, or nvidia-smi unreadable). aira's reservations are a
+// LEDGER fact, known without the card, so they are still drawn — against the
+// configured admission budget, labelled as such, with the card-side figures (usage
+// outside aira, the admit-fit marker) left unevaluated and a note naming why. With
+// no configured budget there is no honest width: a Reason, which still reports what
+// is reserved.
+func topVRAMReservationsBar(bar *topBar, reserve *runner.ConfineSliceReserve, why string) *topBar {
+	if reserve.VRAMBudgetBytes <= 0 {
+		bar.Reason = "no GPU reading (" + why + ") and no VRAM budget is configured, so there is no width to draw"
+		if bar.Claimed > 0 {
+			bar.Reason += "; aira has reserved " + topFormatQuantity(bar.Kind, bar.Claimed)
+		}
+		return bar
+	}
+	bar.Evaluated = true
+	bar.TotalIsBudget = true
+	bar.Total = reserve.VRAMBudgetBytes
+	bar.Free = topFloor(bar.Total - bar.Claimed)
+	if bar.Free > 0 {
+		bar.Regions = append(bar.Regions, topBarRegion{
+			Kind: topRegionFree, Slot: topScopelessSlot, Label: "free", Start: bar.Claimed, Size: bar.Free,
+		})
+	}
+	bar.Notes = append(bar.Notes, "card not read ("+why+"): reservations are drawn against the configured budget, not the card")
 	return bar
 }
 

@@ -683,6 +683,9 @@ func topBarResourceNoun(bar *topBar) string {
 }
 
 func topBarTotalNoun(bar *topBar) string {
+	if bar.TotalIsBudget {
+		return "budget"
+	}
 	if bar.Kind == topBarCPU {
 		return "capacity"
 	}
@@ -790,6 +793,9 @@ func topBarGlyph(cell topBarCell) string {
 // that was never expected, which reads as a fault where there is none.
 func topMarkerLegend(bar *topBar) string {
 	if len(bar.Markers) == 0 {
+		if bar.TotalIsBudget {
+			return "" // the budget IS the bar's width; there is no separate limit to key
+		}
 		if bar.Kind == topBarCPU {
 			return ""
 		}

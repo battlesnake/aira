@@ -216,13 +216,18 @@ func (s *Server) runVRAMSampler(ctx context.Context) {
 // honesty state come from a LOCK-FREE atomic load of the sampler's snapshot. It
 // NEVER forks nvidia-smi — a fork on every `aira top` tick is exactly what the
 // off-lock sampler exists to avoid. The byte total/free are published only when a
-// real reading exists (set/stale); the other states leave them zero so the bar
-// renders a Reason, never a fabricated width.
+// real reading exists (set/stale); the other states leave them zero, never a
+// fabricated width. AIRA-274: the CONFIGURED budget is not a card reading, so it is
+// published in every state where it is set (0 = auto-detect = unknown until a card
+// reading exists), letting `aira top` draw the reservations against it.
 func (s *Server) fillVRAMFrame(reserve *runner.ConfineSliceReserve, outstanding int64) {
 	if reserve == nil {
 		return
 	}
 	reserve.VRAMOutstandingBytes = outstanding
+	if s.vramBudgetBytes > 0 {
+		reserve.VRAMBudgetBytes = s.vramBudgetBytes
+	}
 	raw := s.vramSnap.Load()
 	switch {
 	case raw == nil:
