@@ -1072,7 +1072,7 @@ func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, c
 	case runner.VRAMStateSet, runner.VRAMStateStale:
 		// drawable — a real card reading exists.
 	case runner.VRAMStateNoGPUWork:
-		return topVRAMReservationsBar(bar, reserve, "no GPU work: no --vram job has run yet, so the card has not been read")
+		return topVRAMReservationsBar(bar, reserve, "no GPU work: no --vram job has run yet")
 	case runner.VRAMStateNoGPU:
 		return topVRAMReservationsBar(bar, reserve, "GPU unreadable: nvidia-smi is absent or reported no device")
 	default:
@@ -1133,8 +1133,9 @@ func topVRAMBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, c
 func topVRAMReservationsBar(bar *topBar, reserve *runner.ConfineSliceReserve, why string) *topBar {
 	if reserve.VRAMBudgetBytes <= 0 {
 		bar.Reason = "no GPU reading (" + why + ") and no VRAM budget is configured, so there is no width to draw"
-		if bar.Claimed > 0 {
-			bar.Reason += "; aira has reserved " + topFormatQuantity(bar.Kind, bar.Claimed)
+		if reserve.VRAMOutstandingBytes > 0 {
+			// The LEDGER's figure, not the per-row sum: it is what gates admission.
+			bar.Reason += "; aira has reserved " + topFormatQuantity(bar.Kind, reserve.VRAMOutstandingBytes)
 		}
 		return bar
 	}
@@ -1142,12 +1143,19 @@ func topVRAMReservationsBar(bar *topBar, reserve *runner.ConfineSliceReserve, wh
 	bar.TotalIsBudget = true
 	bar.Total = reserve.VRAMBudgetBytes
 	bar.Free = topFloor(bar.Total - bar.Claimed)
+	bar.Overcommitted = bar.Claimed > bar.Total // e.g. the budget was lowered under running jobs
 	if bar.Free > 0 {
 		bar.Regions = append(bar.Regions, topBarRegion{
-			Kind: topRegionFree, Slot: topScopelessSlot, Label: "free", Start: bar.Claimed, Size: bar.Free,
+			Kind: topRegionFree, Slot: topScopelessSlot, Label: "unreserved", Start: bar.Claimed, Size: bar.Free,
 		})
 	}
-	bar.Notes = append(bar.Notes, "card not read ("+why+"): reservations are drawn against the configured budget, not the card")
+	bar.Notes = append(bar.Notes, why+"; reservations are drawn against the configured budget, not the card")
+	if reserve.VRAMOutstandingBytes != bar.Claimed {
+		// The ledger holds a charge the per-job rows do not account for (a scope with
+		// no VRAM figure on its record): the drawn stack understates the reservation.
+		bar.Notes = append(bar.Notes, "the admission ledger reserves "+topFormatQuantity(bar.Kind, reserve.VRAMOutstandingBytes)+
+			", more or less than the jobs drawn above account for")
+	}
 	return bar
 }
 
