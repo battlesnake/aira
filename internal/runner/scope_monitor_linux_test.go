@@ -310,6 +310,12 @@ func readSyscalls(t *testing.T) int64 {
 // (read → EAGAIN → sleep 1ms), ~200 reads per 200ms idle; the pollable reader
 // parks in epoll and makes none.
 func TestScopeMembershipEventsDeliversModifyAndReleasesFD(t *testing.T) {
+	// The idle-syscall assertion reads /proc/self/io, which a kernel built without
+	// task I/O accounting (this WSL2 kernel, AIRA-275) does not provide: the check
+	// cannot be evaluated there, so skip rather than report a false failure.
+	if _, err := os.Stat("/proc/self/io"); err != nil {
+		t.Skipf("unevaluated: /proc/self/io is unavailable (%v)", err)
+	}
 	path := filepath.Join(t.TempDir(), "cgroup.events")
 	if err := os.WriteFile(path, []byte("populated 1\nfrozen 0\n"), 0o644); err != nil {
 		t.Fatal(err)
