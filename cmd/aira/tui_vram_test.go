@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rivo/tview"
+
 	"aira/internal/runner"
 )
 
@@ -184,5 +186,188 @@ func TestTopVRAMBarForStaleDrawsWithNote(t *testing.T) {
 	}
 	if !stale {
 		t.Fatalf("a stale bar must carry a 'stale' note; notes=%v", bar.Notes)
+	}
+}
+
+// verifies: AIRA-274 — with NO card reading (sampler never armed, or nvidia-smi
+// unreadable) the panel still draws aira's RESERVATIONS against the configured
+// budget: the scope spans stacked left, the rest as free, the total labelled as the
+// budget (not the card), the card-side figures stated unknown, and a note NAMING
+// which honesty state applies. Reverting to "UNEVALUATED" (the AIRA-269 behaviour)
+// or drawing the budget as if it were the card total reds this.
+func TestTopVRAMBarForReservationsOnlyWhenCardUnread(t *testing.T) {
+	for _, tc := range []struct{ state, wantNote string }{
+		{runner.VRAMStateNoGPUWork, "no GPU work: no --vram job has run"},
+		{runner.VRAMStateNoGPU, "nvidia-smi"},
+	} {
+		reserve := &runner.ConfineSliceReserve{
+			VRAMState: tc.state, VRAMBudgetBytes: 14 * gib, VRAMOutstandingBytes: 6 * gib,
+		}
+		scopes := []topBarRegion{{Kind: topRegionScope, Slot: 0, Label: "train", Start: 0, Size: 6 * gib}}
+		bar := topVRAMBarFor(reserve, scopes, 6*gib)
+		if !bar.Evaluated || bar.Kind != topBarVRAM {
+			t.Fatalf("state %q: want a reservations-only bar, got %+v", tc.state, bar)
+		}
+		if bar.Total != 14*gib || !bar.TotalIsBudget {
+			t.Fatalf("state %q: total=%d isBudget=%v, want the 14G budget flagged as a budget", tc.state, bar.Total, bar.TotalIsBudget)
+		}
+		if bar.Claimed != 6*gib || bar.Free != 8*gib {
+			t.Fatalf("state %q: claimed=%d free=%d, want 6G/8G", tc.state, bar.Claimed, bar.Free)
+		}
+		if bar.OutsideKnown || bar.Outside != 0 {
+			t.Fatalf("state %q: the card's outside usage is UNKNOWN, got known=%v outside=%d", tc.state, bar.OutsideKnown, bar.Outside)
+		}
+		var scope, free, outside bool
+		for _, region := range bar.Regions {
+			switch region.Kind {
+			case topRegionScope:
+				scope = region.Size == 6*gib
+			case topRegionFree:
+				free = region.Start == 6*gib && region.Size == 8*gib
+			case topRegionOutside:
+				outside = true
+			}
+		}
+		if !scope || !free || outside {
+			t.Fatalf("state %q: regions scope=%v free=%v outside=%v: %+v", tc.state, scope, free, outside, bar.Regions)
+		}
+		if len(bar.Markers) != 0 {
+			t.Fatalf("state %q: no markers without a card reading, got %+v", tc.state, bar.Markers)
+		}
+		if len(bar.Notes) != 1 || !strings.Contains(bar.Notes[0], tc.wantNote) {
+			t.Fatalf("state %q: notes=%v, want one naming %q", tc.state, bar.Notes, tc.wantNote)
+		}
+		legend := topBarLegend(bar)
+		if !strings.Contains(legend, "budget 14") || strings.Contains(legend, "total") ||
+			!strings.Contains(legend, "unreserved") || strings.Contains(legend, "free") ||
+			!strings.Contains(legend, "rest of system unevaluated") {
+			t.Fatalf("state %q: legend=%q must call the width a budget and leave the rest unevaluated", tc.state, legend)
+		}
+		if got := topMarkerLegend(bar); got != "" {
+			t.Fatalf("state %q: marker legend=%q, want none (not 'no slice limit could be established')", tc.state, got)
+		}
+	}
+}
+
+// verifies: AIRA-274 — an idle box (nothing reserved) with a budget shows an EMPTY
+// reservation stack against the budget: a positive "nothing reserved", the point of
+// the fix. And with NO budget configured and no card reading there is no honest
+// width, so it is a Reason — which still names what IS reserved.
+func TestTopVRAMBarForReservationsOnlyEdges(t *testing.T) {
+	idle := topVRAMBarFor(&runner.ConfineSliceReserve{
+		VRAMState: runner.VRAMStateNoGPUWork, VRAMBudgetBytes: 14 * gib,
+	}, nil, 0)
+	if !idle.Evaluated || idle.Claimed != 0 || idle.Free != 14*gib {
+		t.Fatalf("idle box with a budget: want evaluated, claimed 0, free 14G; got %+v", idle)
+	}
+
+	noBudget := topVRAMBarFor(&runner.ConfineSliceReserve{
+		VRAMState: runner.VRAMStateNoGPU, VRAMOutstandingBytes: 6 * gib,
+	}, nil, 6*gib)
+	if noBudget.Evaluated {
+		t.Fatalf("no budget and no card: there is no width to draw, got %+v", noBudget)
+	}
+	if !strings.Contains(noBudget.Reason, "unreadable") || !strings.Contains(noBudget.Reason, topFormatQuantity(topBarVRAM, 6*gib)) {
+		t.Fatalf("reason=%q must name the state and the reserved amount", noBudget.Reason)
+	}
+}
+
+// verifies: AIRA-274 — the whole chain, listing → topViewModel → renderTopBar text:
+// a box with a budget, one 6G GPU job and NO card reading prints a drawn bar (not
+// "UNEVALUATED"), the budget legend, the card-unread note — inside the panel height.
+func TestTopVRAMPanelRendersReservationsWithoutCardReading(t *testing.T) {
+	reserve := topTestFrame()
+	reserve.VRAMState = runner.VRAMStateNoGPUWork
+	reserve.VRAMBudgetBytes = 14 * gib
+	reserve.VRAMOutstandingBytes = 6 * gib
+	rec := topTestRecord("CONFINE-train-1-aa", "train", 8*gib, 2*gib)
+	v := 6 * gib
+	rec.VRAMBytes = &v
+
+	model, _ := topViewModel(topTick{}, topTestListing(reserve, rec))
+
+	target := tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+	target.SetBorder(true)
+	target.SetRect(0, 0, 100, topVRAMBarHeight)
+	(&tuiRuntime{}).renderTopBar(target, model.VRAMBar, panelState{Status: panelReady})
+	text := target.GetText(true)
+	if strings.Contains(text, "UNEVALUATED") {
+		t.Fatalf("panel must show the reservations, not UNEVALUATED: %q", text)
+	}
+	for _, want := range []string{"budget 14", "reserved 6144M", "unreserved 8192M", "rest of system unevaluated", "configured budget"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("panel text missing %q: %q", want, text)
+		}
+	}
+	if lines := strings.Split(text, "\n"); len(lines) > topVRAMBarHeight-2 {
+		t.Fatalf("%d lines overflow the panel (%d inner): %q", len(lines), topVRAMBarHeight-2, text)
+	}
+}
+
+// verifies: AIRA-274 (review) — only the two KNOWN unread states take the budget
+// bar. An empty/unknown state (an older daemon with no vram_state) stays
+// UNEVALUATED even when a budget figure is present, and a real card bar is never
+// labelled a "budget".
+func TestTopVRAMBarForUnknownStateAndCardBarLabels(t *testing.T) {
+	for _, state := range []string{"", "bogus"} {
+		bar := topVRAMBarFor(&runner.ConfineSliceReserve{
+			VRAMState: state, VRAMBudgetBytes: 14 * gib, VRAMOutstandingBytes: 6 * gib,
+		}, nil, 6*gib)
+		if bar.Evaluated || bar.TotalIsBudget || !strings.Contains(bar.Reason, "unevaluated") {
+			t.Fatalf("state %q: want UNEVALUATED, got %+v", state, bar)
+		}
+	}
+	for _, state := range []string{runner.VRAMStateSet, runner.VRAMStateStale} {
+		bar := topVRAMBarFor(&runner.ConfineSliceReserve{
+			VRAMState: state, VRAMTotalBytes: 16 * gib, VRAMFreeBytes: 3 * gib,
+			VRAMBudgetBytes: 14 * gib, VRAMHeadroomBytes: gib, VRAMOutstandingBytes: 8 * gib,
+		}, nil, 8*gib)
+		legend := topBarLegend(bar)
+		if bar.TotalIsBudget || !strings.Contains(legend, "total 16") || strings.Contains(legend, "budget") ||
+			strings.Contains(legend, "unreserved") {
+			t.Fatalf("state %q: a card bar must say total/free, legend=%q isBudget=%v", state, legend, bar.TotalIsBudget)
+		}
+	}
+}
+
+// verifies: AIRA-274 (review) — reservations beyond the budget (budget lowered
+// under running jobs): free floors at 0 with no free region, the bar says
+// OVER-SUBSCRIBED in BUDGET words (not "exceed the VRAM total"); and a ledger
+// charge the per-job rows do not account for is named, not silently drawn short.
+func TestTopVRAMBarForReservationsOnlyOvercommitAndLedgerGap(t *testing.T) {
+	over := topVRAMBarFor(&runner.ConfineSliceReserve{
+		VRAMState: runner.VRAMStateNoGPU, VRAMBudgetBytes: 4 * gib, VRAMOutstandingBytes: 10 * gib,
+	}, []topBarRegion{{Kind: topRegionScope, Slot: 0, Label: "train", Start: 0, Size: 10 * gib}}, 10*gib)
+	if !over.Evaluated || over.Free != 0 || !over.Overcommitted {
+		t.Fatalf("want evaluated, free 0, overcommitted: %+v", over)
+	}
+	for _, region := range over.Regions {
+		if region.Kind == topRegionFree {
+			t.Fatalf("no free region when over budget: %+v", over.Regions)
+		}
+	}
+	target := tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+	target.SetBorder(true)
+	target.SetRect(0, 0, 100, topVRAMBarHeight)
+	(&tuiRuntime{}).renderTopBar(target, over, panelState{Status: panelReady})
+	if text := target.GetText(true); !strings.Contains(text, "OVER-SUBSCRIBED: reserved VRAM exceeds the budget") ||
+		strings.Contains(text, "VRAM total") {
+		t.Fatalf("over-budget wording: %q", text)
+	}
+
+	gap := topVRAMBarFor(&runner.ConfineSliceReserve{
+		VRAMState: runner.VRAMStateNoGPU, VRAMBudgetBytes: 14 * gib, VRAMOutstandingBytes: 6 * gib,
+	}, nil, 0)
+	var named bool
+	for _, note := range gap.Notes {
+		named = named || strings.Contains(note, "admission ledger reserves")
+	}
+	if !gap.Evaluated || !named {
+		t.Fatalf("a ledger charge with no per-job row must be named: %+v", gap)
+	}
+
+	idle := topVRAMBarFor(&runner.ConfineSliceReserve{VRAMState: runner.VRAMStateNoGPU}, nil, 0)
+	if idle.Evaluated || strings.Contains(idle.Reason, "aira has reserved") {
+		t.Fatalf("nothing reserved and no budget: Reason must not claim a reservation: %q", idle.Reason)
 	}
 }

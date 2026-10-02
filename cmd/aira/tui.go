@@ -640,7 +640,10 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 		if legend := topMarkerLegend(bar); legend != "" {
 			out.WriteString("\n" + legend)
 		}
-		if bar.Overcommitted {
+		if bar.Overcommitted && bar.TotalIsBudget {
+			fmt.Fprintf(&out, "\nOVER-SUBSCRIBED: %s %s exceeds the budget",
+				topBarClaimNoun(bar), topBarResourceNoun(bar))
+		} else if bar.Overcommitted {
 			fmt.Fprintf(&out, "\nOVER-SUBSCRIBED: %s plus out-of-slice usage exceed the %s total",
 				topBarClaimNoun(bar), topBarResourceNoun(bar))
 		}
@@ -683,6 +686,9 @@ func topBarResourceNoun(bar *topBar) string {
 }
 
 func topBarTotalNoun(bar *topBar) string {
+	if bar.TotalIsBudget {
+		return "budget"
+	}
 	if bar.Kind == topBarCPU {
 		return "capacity"
 	}
@@ -697,6 +703,9 @@ func topBarClaimNoun(bar *topBar) string {
 }
 
 func topBarFreeNoun(bar *topBar) string {
+	if bar.TotalIsBudget {
+		return "unreserved" // budget minus reservations: not the card's free VRAM
+	}
 	if bar.Kind == topBarCPU {
 		return "idle"
 	}
@@ -790,7 +799,9 @@ func topBarGlyph(cell topBarCell) string {
 // that was never expected, which reads as a fault where there is none.
 func topMarkerLegend(bar *topBar) string {
 	if len(bar.Markers) == 0 {
-		if bar.Kind == topBarCPU {
+		if bar.Kind != topBarRAM {
+			// Only the RAM bar owes the operator a limit; the CPU bar has none, and a
+			// budget-width VRAM bar's width IS its limit (AIRA-274).
 			return ""
 		}
 		return "no slice limit could be established"
