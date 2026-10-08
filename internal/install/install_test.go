@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"aira/internal/daemon"
+	"aira/internal/runner"
 )
 
 func TestComputeMemoryLimitsPrecedenceAndValidation(t *testing.T) {
@@ -321,6 +322,10 @@ type fakeInstallState struct {
 	cgroup        map[string][]byte
 	daemonRunning bool
 	daemonPID     int
+	// daemonSlotsPerCore is the CPU-slots-per-core ratio the fake live daemon
+	// reports in its lock file (AIRA-283). A fake (re)start adopts the record's
+	// effective ratio, exactly as Serve does; zero means "does not report one".
+	daemonSlotsPerCore int
 }
 
 func (s *fakeInstallState) unitDir() string {
@@ -353,7 +358,15 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 	}
 	d.daemonPaths = func() (daemon.Paths, error) { return daemon.PathsFromEnvironment(stateHome, runtimeDir, state.home) }
 	d.daemonStatus = func(daemon.Paths) daemon.StatusInfo {
-		return daemon.StatusInfo{Running: state.daemonRunning, Ready: state.daemonRunning, Lock: daemon.LockInfo{PID: state.daemonPID}}
+		return daemon.StatusInfo{Running: state.daemonRunning, Ready: state.daemonRunning, Lock: daemon.LockInfo{PID: state.daemonPID, CPUSlotsPerCore: state.daemonSlotsPerCore}}
+	}
+	// adoptRatio models Serve's own record read at daemon start (AIRA-283).
+	adoptRatio := func() {
+		ratio := runner.DefaultCPUSlotsPerCore
+		if record, ok := runner.ReadInstallModeRecord(runner.InstallModePathFor(stateHome)); ok {
+			ratio, _ = record.EffectiveCPUSlotsPerCore()
+		}
+		state.daemonSlotsPerCore = ratio
 	}
 	d.daemonStop = func(daemon.Paths) error { state.daemonRunning = false; return nil }
 	d.sleep = func(time.Duration) {}
@@ -400,6 +413,11 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 			return nil, nil
 		case strings.HasPrefix(joined, "systemctl --user enable --now "):
 			if strings.HasSuffix(joined, defaultDaemonUnit) {
+				// `enable --now` starts a stopped service but does NOT restart a
+				// running one, so only a fresh start re-reads the record.
+				if !state.daemonRunning {
+					adoptRatio()
+				}
 				state.daemonRunning = true
 			}
 			return nil, nil
@@ -407,6 +425,7 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 			return []byte("XDG_RUNTIME_DIR=" + runtimeDir + "\n"), nil
 		case joined == "systemctl --user restart "+defaultDaemonUnit:
 			state.daemonRunning = true
+			adoptRatio()
 			return nil, nil
 		case joined == "timeout 10s loginctl enable-linger "+fmt.Sprint(state.uid):
 			return nil, nil

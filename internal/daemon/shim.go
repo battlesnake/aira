@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"strconv"
@@ -110,9 +111,10 @@ func (s *Server) memAvailableReader() func() (int64, bool, string) {
 // cpuFrameReader and cpuCoreCounter are AIRA-137's CPU-frame seams, on the same
 // nil-checks-to-the-package-default rule as every reader above. Production
 // reaches the real root-cgroup/slice cpu.stat pair and runtime.NumCPU — the same
-// core count the admission ledger's CPU ceiling (2×NumCPU) derives from, so the
-// bar's capacity and the ledger's idea of this machine's width cannot drift
-// apart. Neither is shim-specific: shim mode publishes no CPU frame at all, and
+// PHYSICAL core count the admission ledger's CPU ceiling (R×NumCPU, AIRA-283)
+// multiplies. The `aira top` bar's capacity is that physical count, never the
+// ceiling: the two share a core count, not a unit, so they deliberately differ
+// by R. Neither is shim-specific: shim mode publishes no CPU frame at all, and
 // the withholding is done by confineManagement's own shim gate.
 func (s *Server) cpuFrameReader() func(string) runner.ConfineCPUFrame {
 	if s.readCPUFrame != nil {
@@ -284,6 +286,32 @@ func resolveDaemonConfineMode(paths Paths) (string, shimBudget, error) {
 	return runner.ConfineModeShim, shimBudget{
 		Bytes: record.ShimBudgetBytes, Source: record.ShimBudgetSource, CgroupPath: record.ShimCgroupPath,
 	}, nil
+}
+
+// resolveCPUSlotsPerCore reads AIRA-283's CPU-slots-per-core ratio for THIS
+// daemon process from the durable install-mode record.
+//
+// It is its OWN, unconditional read, deliberately NOT part of
+// resolveDaemonConfineMode (plan E1): that function returns early whenever
+// AIRA_DAEMON_CONFINE_MODE is set, and spawnShimDaemon ALWAYS sets it, so a
+// ratio read there would leave the feature inert in exactly the ci-shim case
+// that asked for it.
+//
+// An absent or unreadable record is the default. A recorded value outside
+// 1..64, or not an integer at all, is ALSO the default, with one log line; it is
+// never allowed to wedge admission (R < 1 would make every request
+// E_ADMIT_TOO_LARGE), and the record itself is left untouched.
+func resolveCPUSlotsPerCore(paths Paths) int {
+	record, ok := runner.ReadInstallModeRecord(runner.InstallModePathFor(paths.StateHome))
+	if !ok {
+		return runner.DefaultCPUSlotsPerCore
+	}
+	ratio, problem := record.EffectiveCPUSlotsPerCore()
+	if problem != "" {
+		log.Printf("aira daemon: %s; using the default of %d CPU slots per core (fix it with `aira install --cpu-slots-per-core=R`)",
+			problem, ratio)
+	}
+	return ratio
 }
 
 func shimBudgetFromEnv() (shimBudget, error) {

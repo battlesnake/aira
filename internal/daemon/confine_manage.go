@@ -305,10 +305,11 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// and withheld whole in shim mode by the same `if` that withholds
 				// the RAM frame.
 				//
-				// Core count comes from runtime.NumCPU(), the same source the
-				// admission ledger's CPU ceiling (2×NumCPU) derives from, so the
-				// bar's capacity and the ledger's own idea of this machine's
-				// width cannot drift apart.
+				// Core count comes from runtime.NumCPU(): PHYSICAL cores, the
+				// bar's real capacity. It is deliberately NOT the admission
+				// ledger's CPU ceiling (R×NumCPU slots, AIRA-283), which shares the
+				// core count but multiplies it by the install-time ratio R; the
+				// bar must not be scaled by R.
 				cpu := s.cpuFrameReader()(path)
 				result.SliceReserve.SystemCPUUsageUsec = cpu.SystemUsageUsec
 				result.SliceReserve.SystemCPUKnown = cpu.SystemKnown

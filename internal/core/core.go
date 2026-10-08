@@ -2108,13 +2108,14 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// AIRA-62 and were simply never described.) Omitting a mode flag PRESERVES
 		// whatever the installed unit declares rather than resetting it, which is
 		// why each description says so.
-		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
+		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--cpu-slots-per-core R] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
 			stringSpec("memory_max", false, false, "aira.slice MemoryMax (<N>G)"),
 			boolSpec("ci", false, false, "Dedicated CI worker: size MemoryMax from a one-time MemAvailable snapshot with zero headroom; refuses with --memory-max"),
 			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
 			stringSpec("watchdog", false, false, "Memory-watchdog mode; omitted keeps the installed value", "off", "observe", "enforce"),
 			stringSpec("watchdog_interval", false, false, "Memory-watchdog sample interval in [1s,30s); omitted keeps the installed value"),
 			stringSpec("slice_ceiling", false, false, "Dynamic slice-ceiling mode; omitted keeps the installed value, or enforce when no installed value is readable", "off", "observe", "enforce"),
+			stringSpec("cpu_slots_per_core", false, false, "CPU admission slots per core R, 1-64 (default 2): the daemon's CPU ceiling is R x NumCPU; omitted keeps the recorded value; refused with --stage=start and --status"),
 			boolSpec("allow_overcommit", false, false, "Acknowledge coexistence with capped whale.slice"),
 			boolSpec("dry_run", false, false, "Render units and planned actions without mutation"),
 			boolSpec("status", false, false, "Report each installed and live facet honestly"),
@@ -2126,6 +2127,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "watchdog")
 			_ = stringArg(args, "watchdog_interval")
 			_ = stringArg(args, "slice_ceiling")
+			_ = stringArg(args, "cpu_slots_per_core")
 			_ = boolArg(args, "allow_overcommit")
 			_ = boolArg(args, "dry_run")
 			_ = boolArg(args, "status")

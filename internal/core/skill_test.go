@@ -1047,3 +1047,45 @@ func TestSkillStatesScopeAndNonGoals(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-283 — the guide states the CPU-slots-per-core ratio (what it is,
+// where it is set, its default and range), the restart rule (the daemon reads it
+// only at start; a ci-shim daemon must be restarted by hand), the refusal of a
+// request larger than the ceiling, and that `--aitest-workers=auto` is still the CPU
+// count and does NOT follow the ratio (a measured 2x pool was no faster).
+func TestSkillTeachesTheCPUSlotsPerCoreRatioAndThatAutoIgnoresIt(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, document := range []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	} {
+		for _, want := range []string{
+			"aira install --cpu-slots-per-core=R",
+			"R × NumCPU",
+			"default 2",
+			"1–64",
+			"keeps the recorded R",
+			"only when it STARTS",
+			"restart required: recorded R=",
+			"E_ADMIT_TOO_LARGE",
+			"physical cores",
+		} {
+			if !strings.Contains(document.body, want) {
+				t.Fatalf("%s does not teach the CPU-slots-per-core ratio: missing %q", document.name, want)
+			}
+		}
+		section := aitestSkillSection(t, document.name, document.body)
+		for _, want := range []string{
+			"(up to the host's CPU count)",
+			"does NOT follow the CPU-slots ratio",
+			"was no faster than `auto`",
+		} {
+			if !strings.Contains(section, want) {
+				t.Fatalf("%s aitest section does not state what auto means: missing %q", document.name, want)
+			}
+		}
+	}
+}

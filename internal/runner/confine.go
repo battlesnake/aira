@@ -19,7 +19,7 @@ const (
 	DefaultConfineMemoryReserve = int64(4 << 30)
 	// DefaultConfineCPUCores is the CPU-core reservation a plain `aira confine`
 	// declares to the admission ledger (design §9). One core is the confine default;
-	// the daemon charges it against the machine-wide 2×NumCPU CPU ceiling (design
+	// the daemon charges it against the machine-wide R×NumCPU CPU ceiling (design
 	// §7). Accounting only — no cpu.max is written. Per-command CPU annotation
 	// (aitest workers) is a later slice; the confine path always sends this.
 	DefaultConfineCPUCores = int64(1)

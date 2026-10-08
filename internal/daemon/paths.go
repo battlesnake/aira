@@ -479,6 +479,11 @@ func canonicalPath(path string) (string, error) {
 type LockInfo struct {
 	PID    int    `json:"pid"`
 	BootID string `json:"boot_id"`
+	// CPUSlotsPerCore is the ratio the LIVE daemon adopted at start (AIRA-283),
+	// so `aira install` can tell a recorded ratio from the one actually in force
+	// and say "restart required" instead of leaving a silently stale daemon. Zero
+	// is an absence (a daemon that predates AIRA-283), never a ratio.
+	CPUSlotsPerCore int `json:"cpu_slots_per_core,omitempty"`
 }
 
 type StatusInfo struct {
@@ -492,14 +497,14 @@ func currentBootID() string {
 	return strings.TrimSpace(string(data))
 }
 
-func writeLockInfo(file *os.File) error {
+func writeLockInfo(file *os.File, cpuSlotsPerCore int) error {
 	if err := file.Truncate(0); err != nil {
 		return err
 	}
 	if _, err := file.Seek(0, 0); err != nil {
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(LockInfo{PID: os.Getpid(), BootID: currentBootID()}); err != nil {
+	if err := json.NewEncoder(file).Encode(LockInfo{PID: os.Getpid(), BootID: currentBootID(), CPUSlotsPerCore: cpuSlotsPerCore}); err != nil {
 		return err
 	}
 	return file.Sync()
