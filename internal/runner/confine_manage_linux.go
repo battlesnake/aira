@@ -31,6 +31,10 @@ type confineScanDeps struct {
 	// readCwd is the seam for the supervisor's working directory (AIRA-276),
 	// with readCmdline's nil-falls-back-to-/proc contract.
 	readCwd func(pid int) (string, error)
+	// readEnviron and tmuxNames are the AIRA-277 seams for the launching tmux
+	// window; nil falls back to /proc and the tmux binary respectively.
+	readEnviron func(pid int) ([]byte, error)
+	tmuxNames   func(ctx context.Context, socket string) (map[string]string, error)
 	// supervisorLive is the AIRA-183 seam for the supervisor-liveness reading,
 	// tri-state: alive, dead, or unestablished. Nil falls back to the real
 	// kill(pid, 0) probe on exactly the same reasoning as readCmdline above.
@@ -46,7 +50,7 @@ const confineReapMaxDepth = 32
 var confineReapOpenat = unix.Openat
 
 func defaultConfineScanDeps() confineScanDeps {
-	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty, readCmdline: readProcCmdline, readCwd: readProcCwd, supervisorLive: probeSupervisorLive}
+	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty, readCmdline: readProcCmdline, readCwd: readProcCwd, readEnviron: readProcEnviron, tmuxNames: tmuxWindowNames, supervisorLive: probeSupervisorLive}
 }
 
 func ResolveConfineManagementSlice(slice string) (string, string, error) {
@@ -174,6 +178,13 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 	if readCwd == nil {
 		readCwd = readProcCwd
 	}
+	readEnviron := deps.readEnviron
+	if readEnviron == nil {
+		readEnviron = readProcEnviron
+	}
+	paneRefs := make(map[string]confineTmuxRef)
+	paneNone := make(map[string]bool)
+	paneUnknown := make(map[string]bool)
 	supervisorLive := deps.supervisorLive
 	if supervisorLive == nil {
 		supervisorLive = probeSupervisorLive
@@ -227,6 +238,21 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			record.Cwd = &dir
 		} else {
 			record.UnevaluatedFields = append(record.UnevaluatedFields, "cwd")
+		}
+		// AIRA-277. The launching tmux window, from the supervisor's environment.
+		// Only the two tmux variables are kept; resolving them to a name happens
+		// once per server after the loop.
+		if environ, envErr := readEnviron(pid); envErr != nil {
+			paneUnknown[scopeID] = true
+		} else {
+			switch ref, state := parseConfineTmuxRef(environ); state {
+			case paneInTmux:
+				paneRefs[scopeID] = ref
+			case paneNotInTmux:
+				paneNone[scopeID] = true
+			default:
+				paneUnknown[scopeID] = true
+			}
 		}
 		// AIRA-183. Whether the SUPERVISOR still exists, read beside its argv from
 		// the same PID and, like it, independently of whether the scope directory
@@ -335,6 +361,7 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		_ = scope.fd.Close()
 		byID[scopeID] = record
 	}
+	resolveConfinePanes(ctx, byID, paneRefs, paneNone, paneUnknown, deps.tmuxNames)
 	mergeConfineRegistry(byID, registry)
 	result := ConfineListResult{Verdict: "pass", Scopes: make([]ConfineRecord, 0, len(byID))}
 	for _, record := range byID {
@@ -349,7 +376,7 @@ func ReapOrphanedConfineScopes(ctx context.Context, slicePath string, grace time
 }
 
 func reapOrphanedConfineScopesWithDeps(ctx context.Context, slicePath string, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool, deps confineScanDeps) (ConfineReapResult, error) {
-	listed, err := listConfinesWithDeps(ctx, slicePath, nil, deps)
+	listed, err := listConfinesWithDeps(ctx, slicePath, nil, withoutPaneLookup(deps))
 	if err != nil {
 		return ConfineReapResult{}, err
 	}
@@ -642,7 +669,7 @@ func killConfine(ctx context.Context, slicePath, selector, callerOwner string, s
 }
 
 func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, timeout time.Duration, deps confineScanDeps) (ConfineKillResult, error) {
-	listed, err := listConfinesWithDeps(ctx, slicePath, registry, deps)
+	listed, err := listConfinesWithDeps(ctx, slicePath, registry, withoutPaneLookup(deps))
 	if err != nil {
 		return ConfineKillResult{}, err
 	}

@@ -632,7 +632,8 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	// greedily left to right and clamps whatever no longer fits, which is why
 	// RESERVE was arriving truncated. AIRA-265 adds a narrow SESSION column that
 	// brings the identity back WITHOUT the hex (topSessionCell): a human-friendly
-	// AIRA_CONFINE_OWNER is shown as-is, a worktree hash as a short prefix. RAM sits
+	// AIRA_CONFINE_OWNER is shown as-is, else the tmux window the job was launched
+	// from (AIRA-277), else a worktree hash as a short prefix. RAM sits
 	// beside RESERVATION because the pair is one question ("how much of its grant is
 	// it using, and how much is that"), and CPU beside it because the two live
 	// readings belong together. COMMAND is last on purpose: it is the one cell with
@@ -960,8 +961,21 @@ func topUntrustedCell(text *string) string {
 //   - no owner, or the literal "unknown": the supervisor PID as "#<pid>" (or
 //     "unevaluated" when even that is unknown), so the cell attributes the job
 //     honestly rather than blanking or inventing a name.
+//
+// AIRA-277: when the job was launched from a tmux pane, the pane's window name
+// replaces the last three (hash prefix, "@cwd-" hint, PID) — see the body.
 func topSessionCell(record runner.ConfineRecord) string {
 	owner := strings.TrimSpace(record.Owner)
+	// AIRA-277. A name the operator chose beats everything below it, and the tmux
+	// window the job was launched from beats the identifiers that carry no name:
+	// the worktree hash, the inferred "@cwd-<dir>" hint, and the bare PID. Only a
+	// non-empty label counts — empty is an established "not launched from tmux"
+	// and nil an unestablished one, and both fall through to the owner-based cell
+	// exactly as before.
+	chosen := runner.ConfineOwnerIsAttested(owner) && !isWorktreeHash(owner)
+	if !chosen && record.Pane != nil && *record.Pane != "" {
+		return topUntrustedCell(record.Pane)
+	}
 	switch {
 	case isWorktreeHash(owner):
 		return owner[:8]

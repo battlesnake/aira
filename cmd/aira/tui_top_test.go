@@ -1959,3 +1959,34 @@ func TestTopControllerCKeyTogglesTheLastColumn(t *testing.T) {
 		t.Fatalf("'c' off the top view changed state: flag=%v commands=%+v", other.Top.ShowCwd, commands)
 	}
 }
+
+// AIRA-277. SESSION prefers a name the operator chose, then the tmux window the
+// job was launched from, over the identifiers that carry no name (worktree hash,
+// inferred "@cwd-" hint, bare PID). An empty or absent pane changes nothing.
+//
+// verifies: AIRA-277
+func TestTopSessionCellPrefersPaneOverNamelessIdentifiers(t *testing.T) {
+	pid := 4242
+	hash := strings.Repeat("4f9ec70c", 8)
+	pane := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name  string
+		owner string
+		pane  *string
+		want  string
+	}{
+		{"hash owner, pane", hash, pane("deploy"), "deploy"},
+		{"inferred owner, pane", "@cwd-proj", pane("deploy"), "deploy"},
+		{"unknown owner, pane", runner.ConfineUnknownOwner, pane("deploy"), "deploy"},
+		{"attested owner beats pane", "claude-stoner", pane("deploy"), "claude-stoner"},
+		{"hash owner, not in tmux", hash, pane(""), "4f9ec70c"},
+		{"hash owner, pane unestablished", hash, nil, "4f9ec70c"},
+		{"unknown owner, no pane", runner.ConfineUnknownOwner, nil, "#4242"},
+		{"hostile pane label is escaped", hash, pane("a[red]b\x1b"), tview.Escape("a[red]b'\\x1b'")},
+	} {
+		got := topSessionCell(runner.ConfineRecord{Owner: tc.owner, SupervisorPID: &pid, Pane: tc.pane})
+		if got != tc.want {
+			t.Errorf("%s: topSessionCell=%q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
