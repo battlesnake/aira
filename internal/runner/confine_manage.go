@@ -119,6 +119,16 @@ type ConfineRecord struct {
 	// no decision. The kernel appends " (deleted)" to a removed directory and
 	// that is kept: it is true.
 	Cwd *string `json:"cwd"`
+	// Pane is the label of the tmux window the job's supervisor was launched from
+	// (AIRA-277), read live like Cwd: the TMUX / TMUX_PANE variables from
+	// /proc/<SupervisorPID>/environ, resolved against that tmux server.
+	//
+	// Three states, not two. nil is "could not be established" (environ
+	// unreadable, tmux gone or too slow, the pane no longer exists) and is named
+	// "pane" in UnevaluatedFields. A non-nil EMPTY string is an established
+	// "not launched from tmux". Anything else is the window's name with a trailing
+	// status glyph removed. A display facet only; it participates in no decision.
+	Pane *string `json:"pane"`
 	// CPUUsageUsec is the scope's CUMULATIVE cpu.stat `usage_usec` — total CPU
 	// time charged to this cgroup and its descendants since the cgroup was
 	// created, in microseconds — read live at listing time exactly as RSSBytes
