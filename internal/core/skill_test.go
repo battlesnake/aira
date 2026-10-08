@@ -51,7 +51,7 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		"MUST be run under `aira confine",
 		"project-less and needs no `.aira/config`",
 		"Coordination is opt-in per project",
-		"return `E_CONFIG_MISSING`",
+		"return `E_NOT_PROJECT`",
 		"`aira confine --list`",
 		"`aira confine --kill <name|supervisor-pid|scope-id>`",
 		"Kill the scope, not a bash wrapper",
@@ -1015,6 +1015,35 @@ func TestSkillTeachesTheWorktreeRitualAndHowToReadItsUnevaluatedFacts(t *testing
 			if !strings.Contains(document.body, want.text) {
 				t.Errorf("%s no longer teaches %q (%s)", document.name, want.text, want.why)
 			}
+		}
+	}
+}
+
+// AIRA-278. The guide must state what AIRA is NOT and where each verb family
+// works, because a sibling session nearly acted on a belief that AIRA could
+// offload to the cloud and that confine had an MCP launch tool.
+func TestSkillStatesScopeAndNonGoals(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, doc := range map[string]string{"skill": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"What AIRA is, and is not",
+			"NOT a cloud or remote executor",
+			"there is no `aira cloud` verb",
+			"there is NO MCP tool that launches a confined job",
+			"`E_NOT_PROJECT`",
+			"`aira list` rows carry no readiness",
+			"`@pytest.mark.aira_failfast`",
+			"exit with the DISTINCT code 42",
+		} {
+			if !strings.Contains(doc, want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+		if strings.Contains(doc, "can still appear in the listing with `ready:false`") {
+			t.Errorf("%s still claims aira list rows carry ready:false", name)
 		}
 	}
 }
