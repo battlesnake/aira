@@ -428,18 +428,8 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
 
 def _resolve_worker_count(workers_option):
-    """N for --aitest-workers=N; None for 'auto'.
-
-    AIRA-283: 'auto' is None, i.e. NO cap of the pool's own. The worker count is
-    only ever a CAP: each worker is admitted individually through the daemon's RAM
-    and CPU ledgers (the CPU ceiling is R x NumCPU slots, R set once by `aira
-    install --cpu-slots-per-core`), and the pool regrows once a second. So under a
-    live daemon 'auto' is the queue length and the ledgers alone decide how many
-    run at once; the supervisor resolves None to that in run(). With the daemon
-    down the fallback cap (AIRA_AITEST_MAX_WORKERS_FALLBACK) applies. It is no
-    longer os.cpu_count(), and the ratio is deliberately not mirrored here."""
     if workers_option == "auto":
-        return None
+        return max(1, os.cpu_count() or 1)
     try:
         count = int(workers_option)
     except ValueError:

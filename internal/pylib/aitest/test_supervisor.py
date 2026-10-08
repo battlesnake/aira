@@ -23,7 +23,6 @@ from aitest.supervisor import (
 )
 from aitest.supervisor import _OUTCOME_CLASS_EXCEPTIONS, _parse_worker_admit_outcome
 from aitest.worker import _EVENT_LINE_PREFIX, _tag_tuples, run_one
-from aitest import _resolve_worker_count as aitest_resolve_worker_count
 
 
 # S16: a worker-admit relay is now called in two modes. A CLAIM (no --max-wait) is
@@ -1692,113 +1691,6 @@ sys.exit(1)
     # The fallback pool is capped at min(worker_count=3, max_workers_fallback=5),
     # NOT grown to max_workers_fallback=5 -- --aitest-workers is honoured.
     assert 1 <= len(fallback_spawns) <= 3
-
-
-def _granting_admit_stub(tmp_path, name):
-    """A worker-admit relay that grants every CLAIM (and, via _write_stub's probe
-    wrapper, answers every PROBE with plentiful headroom), appending one byte per
-    claim to a counter file so a test can count individual admissions."""
-    outer = tmp_path / ("outer-" + name)
-    outer.mkdir()
-    calls = tmp_path / ("admit-calls-" + name)
-    admit = _write_stub(tmp_path / ("worker-admit-" + name), f"""
-import os, sys
-open({str(calls)!r}, "a").write("x")
-scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
-os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
-sys.stdout.flush()
-sys.stdin.buffer.read()
-""")
-    return outer, calls, admit
-
-
-def test_auto_worker_count_under_a_live_daemon_is_the_queue_length_not_cpu_count(tmp_path, monkeypatch, pytester):
-    """AIRA-283 (plan 3.2, E4): --aitest-workers=auto has NO cap of its own under a
-    live daemon. worker_count is only a CAP on the pool -- each worker is admitted
-    individually through the daemon's RAM+CPU ledgers -- so auto means the queue
-    length and the ledgers alone decide how many run at once. Before AIRA-283 it
-    meant os.cpu_count(); pinned to 1 here, that old meaning admits exactly ONE
-    worker for four queued tests, while auto must admit one per test."""
-    monkeypatch.setattr(os, "cpu_count", lambda: 1)
-    outer, calls, admit = _granting_admit_stub(tmp_path, "auto")
-    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
-    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
-
-    items = pytester.getitems("""
-        def test_one():
-            assert True
-
-        def test_two():
-            assert True
-
-        def test_three():
-            assert True
-
-        def test_four():
-            assert True
-    """)
-    supervisor = Supervisor()
-    supervisor.collect(items)
-    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=aitest_resolve_worker_count("auto"))
-
-    assert len(results) == 4
-    assert all(outcome == "passed" for outcome in results.values())
-    assert supervisor.daemon_available is True
-    assert supervisor._run_worker_count == 4, "auto must cap the pool at the queue length, not os.cpu_count()"
-    assert len(calls.read_text()) == 4, (
-        "auto under a live daemon must admit one worker per queued test (got %d admissions); "
-        "os.cpu_count()=1 would admit exactly one" % len(calls.read_text())
-    )
-
-
-@pytest.mark.parametrize(
-    "fallback, workers_option, want_cap, want_why",
-    [
-        # Default fallback (the finite-parent-cap launch): ONE worker, and the note
-        # names the fallback cap -- never os.cpu_count() (pinned to 64 below).
-        (None, "auto", 1, "AIRA_AITEST_MAX_WORKERS_FALLBACK=1"),
-        # A larger fallback with only three queued tests: the cap actually USED is
-        # 3, so the note must say 3, not the fallback's 5 (invariant 4).
-        ("5", "auto", 3, "--aitest-workers=auto"),
-        # Explicit N below the fallback: N is the effective cap and the reason.
-        ("5", "2", 2, "--aitest-workers=2"),
-    ],
-)
-def test_daemon_down_note_prints_the_effective_cap(tmp_path, monkeypatch, pytester, capsys, fallback, workers_option, want_cap, want_why):
-    """AIRA-283 (plan 3.2, E5): with the daemon down the effective cap is
-    min(worker_count, max_workers_fallback), and the one-line stderr note prints
-    THAT number and why -- never os.cpu_count(), and never the fallback when the
-    cap actually used is lower."""
-    monkeypatch.setattr(os, "cpu_count", lambda: 64)
-    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)  # bootstrap disables the daemon
-    if fallback is None:
-        monkeypatch.delenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", raising=False)
-    else:
-        monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", fallback)
-
-    items = pytester.getitems("""
-        def test_one():
-            assert True
-
-        def test_two():
-            assert True
-
-        def test_three():
-            assert True
-    """)
-    supervisor = Supervisor()
-    supervisor.collect(items)
-    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=aitest_resolve_worker_count(workers_option))
-
-    assert all(outcome == "passed" for outcome in results.values())
-    assert supervisor.daemon_available is False
-    notes = [line for line in capsys.readouterr().err.splitlines() if "falling back to" in line]
-    assert len(notes) == 1, notes
-    assert "n_workers<=%d " % want_cap in notes[0], notes[0]
-    assert want_why in notes[0], notes[0]
-    assert "64" not in notes[0], "the note reported os.cpu_count(): %s" % notes[0]
 
 
 def test_startup_never_admits_more_workers_than_there_is_queued_work(tmp_path, monkeypatch, pytester):

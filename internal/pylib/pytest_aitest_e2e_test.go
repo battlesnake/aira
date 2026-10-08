@@ -271,52 +271,6 @@ func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-283 (plan §3.2, E5) — `--aitest-workers=auto` on the
-// daemon-down path, end to end through real pytest. The other fallback e2e
-// tests pass an explicit N; this is the `auto` case. With the daemon down the
-// pool is capped at the fallback (default ONE worker under a finite parent cap),
-// and the single stderr note must print THAT effective cap and why -- never the
-// host's CPU count, which is what `auto` meant before AIRA-283.
-func TestRealPytestAitestEndToEndFallbackAutoNotesTheEffectiveCap(t *testing.T) {
-	pytest := requireRealPytest(t)
-	aitestDir, err := filepath.Abs("aitest")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pythonDir, err := pylib.ExtractAitest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-
-	command := exec.Command(pytest, "-q", "--aitest-workers=auto", "test_pass.py")
-	command.Dir = filepath.Join(aitestDir, "testdata")
-	command.Env = append(environWithoutAiraRealCgroup(),
-		"PYTHONPATH="+filepath.Dir(aitestDir),
-		"PYTHONDONTWRITEBYTECODE=1",
-		"AIRA_AITEST_LIB="+pythonDir,
-		// Bootstrap succeeds; the worker-admit relay binary is missing, so the
-		// suite falls back to the unconfined pool with one note (S2a).
-		"AIRA_AITEST_OUTER_SCOPE="+t.TempDir(),
-		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
-		"AIRA_AITEST_WORKER_ADMIT_CMD="+filepath.Join(t.TempDir(), "missing-aira"),
-	)
-	output, err := command.CombinedOutput()
-	text := string(output)
-	if err != nil {
-		t.Fatalf("daemon-down auto run exited nonzero: %v\n%s", err, text)
-	}
-	if !strings.Contains(text, "test_pass.py::test_one passed") || !strings.Contains(text, "test_pass.py::test_two passed") {
-		t.Fatalf("pytest output missing expected passing lines:\n%s", text)
-	}
-	if strings.Count(text, "aira aitest:") != 1 {
-		t.Fatalf("expected exactly one fallback note:\n%s", text)
-	}
-	if !strings.Contains(text, "falling back to n_workers<=1 (the daemon-down fallback cap AIRA_AITEST_MAX_WORKERS_FALLBACK=1)") {
-		t.Fatalf("the daemon-down note does not print the effective cap of 1 and why:\n%s", text)
-	}
-}
-
 func shortE2ERuntimeDir(t *testing.T) string {
 	t.Helper()
 	// A daemon socket path must fit the 108-byte AF_UNIX sun_path limit;

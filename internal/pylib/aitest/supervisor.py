@@ -925,8 +925,6 @@ class Supervisor:
         self.results = {}
         self._run_estimated_bytes = 0
         self._run_worker_count = 1
-        # AIRA-283: True when run() was given worker_count=None (--aitest-workers=auto).
-        self._run_worker_count_auto = False
         # AIRA-180 pool-usage accumulator. One sample per RUN, folded from every
         # worker retirement -- see _observe_worker_usage for why the fold lives
         # in _retire_worker and why the report is emitted once at the end.
@@ -1105,20 +1103,9 @@ class Supervisor:
         self.daemon_available = False
         if not self._fallback_warned:
             self._fallback_warned = True
-            # AIRA-283 (E5): the cap the fallback pool ACTUALLY uses is
-            # min(worker_count, max_workers_fallback) -- the same min every fallback
-            # spawn site enforces -- so that is the number printed, with its reason,
-            # never the fallback (or os.cpu_count()) when the cap used is lower.
-            cap = min(self._run_worker_count, self.max_workers_fallback)
-            if self.max_workers_fallback <= self._run_worker_count:
-                why = "the daemon-down fallback cap AIRA_AITEST_MAX_WORKERS_FALLBACK=%d" % self.max_workers_fallback
-            elif self._run_worker_count_auto:
-                why = "--aitest-workers=auto: one per queued test"
-            else:
-                why = "--aitest-workers=%d" % self._run_worker_count
             sys.stderr.write(
-                "aira aitest: %s -- falling back to n_workers<=%d (%s), UNCONFINED (no per-worker RAM containment)\n"
-                % (reason, cap, why)
+                "aira aitest: %s -- falling back to n_workers<=%d, UNCONFINED (no per-worker RAM containment)\n"
+                % (reason, self.max_workers_fallback)
             )
 
     def _fail_queue_terminal(self, reason):
@@ -3376,21 +3363,12 @@ class Supervisor:
         select() over each worker's result pipe, until the queue is drained
         and every worker has retired. Recycle (Task 14), crash/retry (Task 15),
         the daemon-down fallback (Task 16), and the S15/S16 probe-sized pool
-        growth extend this method in place.
-
-        worker_count=None is --aitest-workers=auto (AIRA-283): no cap of the
-        pool's own, i.e. the queue length -- every worker is still admitted
-        individually by the daemon's RAM+CPU ledgers, which are the real bound.
-        Resolved BEFORE bootstrap() so a daemon-down note raised there already
-        prints the cap actually used."""
-        self._run_worker_count_auto = worker_count is None
-        if worker_count is None:
-            worker_count = max(1, len(self.queue))
-        self._run_worker_count = worker_count
+        growth extend this method in place."""
         self.bootstrap()
         import gc
         gc.freeze()
         self._run_estimated_bytes = estimated_bytes
+        self._run_worker_count = worker_count
         if self.daemon_available:
             # Fill the pool as fast as admission allows, sizing each slot LARGEST-FIRST
             # from a probe snapshot (AIRA-235: _try_grow_one sizes to the largest ready

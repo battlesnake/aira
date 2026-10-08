@@ -1,3 +1,4 @@
+import os
 import types
 
 import pytest
@@ -13,10 +14,7 @@ from aitest import (
 
 
 def test_resolve_worker_count_accepts_auto_and_positive_integer():
-    # AIRA-283: "auto" is UNCAPPED (None) -- the pool's only bound is the daemon's
-    # RAM+CPU ledgers, which admit each worker individually; it is no longer
-    # os.cpu_count(). Explicit N is unchanged.
-    assert _resolve_worker_count("auto") is None
+    assert _resolve_worker_count("auto") == max(1, os.cpu_count() or 1)
     assert _resolve_worker_count("4") == 4
 
 
