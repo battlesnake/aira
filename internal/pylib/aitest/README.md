@@ -6,7 +6,11 @@ containment, in place of `pytest-xdist`'s execnet-spawned, ungoverned
 workers.
 
 Activate with `--aitest-workers=N` (a fixed worker count) or
-`--aitest-workers=auto` (up to the host's CPU count). This is a NEW, explicit
+`--aitest-workers=auto` (no cap of the pool's own: under a live daemon every
+worker is admitted individually against the daemon's RAM and CPU ledgers, whose
+CPU ceiling is R x NumCPU slots with R set once by `aira install
+--cpu-slots-per-core`, default 2; with the daemon down it is the fallback cap,
+normally ONE worker). This is a NEW, explicit
 flag rather than a reinterpretation of `-n` — a project with `pytest-xdist`
 installed for unrelated reasons must not have its flag silently hijacked.
 
