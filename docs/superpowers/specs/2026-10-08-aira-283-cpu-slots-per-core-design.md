@@ -89,12 +89,11 @@ No flag to declare a job's own slot count, no `many`, no jobserver (AIRA-279). N
 
 ## 4. Invariants
 
-1. R unset => the ceiling is unchanged (2 x NumCPU). Only default `auto` under a live
-   daemon changes, from `cpu_count` to ledger-governed.
+1. R unset => the ceiling is unchanged (2 x NumCPU). `auto` is unchanged (v3).
 2. The ceiling is read from ONE function; every consumer follows it.
 3. A bad ratio can never wedge admission (R < 1 would make every request
    `E_ADMIT_TOO_LARGE`): install rejects it, the daemon clamps it.
-4. `auto` never reports a cap it did not use (daemon-down note prints the effective cap).
+4. (dropped in v3 with part b)
 
 ## 5. Tests (TDD; each must fail against the wrong implementation)
 
@@ -112,12 +111,8 @@ No flag to declare a job's own slot count, no `many`, no jobserver (AIRA-279). N
 - Go admission: NumCPU and RAM pinned so only CPU binds; with R=3 a request of
   2 x NumCPU + 1 slots is admitted (or waits only on CPU), above 3 x NumCPU is
   `cpu-too-large`; distinguish admit / wait / terminal refusal.
-- Wiring: install flag -> record -> Serve -> ceiling -> a pool run with `auto` grows past
-  `cpu_count` given enough queued tests (not a stubbed probe).
-- Python: `auto` under a live daemon gives cap = len(queue); daemon-down prints the
-  effective cap (default 1); explicit N unchanged; update `test_init.py` expectation;
-  add an `auto` case to a daemon-down e2e (the existing junit/failfast tests use
-  `--aitest-workers=2/1`, not `auto`).
+- (v3) The `auto` wiring and Python tests of plan v2 are DROPPED with part b; `auto` is untouched.
+- Review fix: a running daemon that reports no ratio is compared as R=2 (restart when the recorded R differs).
 
 ## 6. Expected yield and deferrals
 

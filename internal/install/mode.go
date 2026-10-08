@@ -455,15 +455,21 @@ func reportRecordedCPUSlotsPerCore(d installDeps, opts installOpts, record runne
 // liveCPUSlotsPerCoreStale reports the ratio the RUNNING daemon adopted at start
 // (from its lock file) and whether it differs from the recorded effective one.
 // The daemon reads its ratio only at start, so a differing live value means the
-// install's change is not in force yet. A daemon that is not running, or that
-// does not report a ratio, is never stale: there is no live value to compare.
+// install's change is not in force yet. A daemon that is not running is never stale: there is no live value to compare. A running
+// daemon that reports no ratio predates the setting and can only be running the
+// historical default, so it is compared as R=2 (otherwise the first install that
+// sets R on top of an older daemon would stay green with the old ceiling live).
 func liveCPUSlotsPerCoreStale(d installDeps, paths daemon.Paths, record runner.InstallModeRecord) (int, int, bool) {
 	effective, _ := record.EffectiveCPUSlotsPerCore()
 	status := d.daemonStatus(paths)
-	if !status.Running || status.Lock.CPUSlotsPerCore == 0 {
+	if !status.Running {
 		return effective, 0, false
 	}
-	return effective, status.Lock.CPUSlotsPerCore, status.Lock.CPUSlotsPerCore != effective
+	live := status.Lock.CPUSlotsPerCore
+	if live == 0 {
+		live = runner.DefaultCPUSlotsPerCore
+	}
+	return effective, live, live != effective
 }
 
 // reportCPUSlotsPerCoreStatus is `aira install --status`'s ratio line: the

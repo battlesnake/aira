@@ -266,3 +266,32 @@ func TestReexecForwardsTheCPUSlotsPerCoreFlag(t *testing.T) {
 		t.Fatalf("re-exec args %q forward a ratio that was not given (it would stop preservation working)", args)
 	}
 }
+
+// verifies: AIRA-283 review fix -- a running daemon that predates the setting
+// reports no ratio in its lock; it can only be running the historical R=2, so a
+// real install that sets R=3 must restart it rather than stay green with the old
+// ceiling live.
+func TestRealInstallRestartsALegacyDaemonThatReportsNoRatio(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	state.daemonSlotsPerCore = 0 // a pre-AIRA-283 daemon reports no ratio
+	before := countDaemonRestarts(state)
+	if err := runInstall(d, installOpts{memoryMax: "16G", cpuSlotsPerCore: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if countDaemonRestarts(state) != before+1 {
+		t.Fatalf("a legacy daemon (no reported ratio) was left on R=2 after recording R=3 (restarts %d -> %d)",
+			before, countDaemonRestarts(state))
+	}
+	// And a recorded R of 2 (the legacy value) must NOT bounce it.
+	state.daemonSlotsPerCore = 0
+	before = countDaemonRestarts(state)
+	if err := runInstall(d, installOpts{memoryMax: "16G", cpuSlotsPerCore: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if countDaemonRestarts(state) != before {
+		t.Fatal("recording the default R=2 restarted a legacy daemon that is already on R=2")
+	}
+}
