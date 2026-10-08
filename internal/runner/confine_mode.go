@@ -3,8 +3,10 @@ package runner
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -70,6 +72,46 @@ type InstallModeRecord struct {
 	// claims and a bare byte count cannot tell them apart.
 	ShimBudgetSource string `json:"shim_budget_source,omitempty"`
 	ShimCgroupPath   string `json:"shim_cgroup_path,omitempty"`
+	// CPUSlotsPerCore is AIRA-283's ratio R: the daemon's CPU admission ceiling
+	// is R x NumCPU slots. Zero (absent, i.e. every record written before
+	// AIRA-283, or omitted at install) means DefaultCPUSlotsPerCore -- never
+	// "zero slots". Read it through EffectiveCPUSlotsPerCore, which normalises.
+	CPUSlotsPerCore int `json:"cpu_slots_per_core,omitempty"`
+	// cpuSlotsPerCoreUnparsed is the raw recorded text when the field was
+	// present but was not a JSON integer in int range (a string, a fraction, an
+	// overflow). Kept only so EffectiveCPUSlotsPerCore can say what was wrong.
+	cpuSlotsPerCoreUnparsed string
+}
+
+// AIRA-283. The CPU-slots-per-core ratio's default and bounds. 64 keeps
+// R x NumCPU far below 2^31 on any real machine (a re-declared lease's
+// cpu_cores is uint32 on the wire).
+const (
+	DefaultCPUSlotsPerCore = 2
+	MinCPUSlotsPerCore     = 1
+	MaxCPUSlotsPerCore     = 64
+)
+
+// EffectiveCPUSlotsPerCore normalises the recorded ratio to the one the daemon
+// uses. Absent or 0 is the default with no problem. Anything outside
+// MinCPUSlotsPerCore..MaxCPUSlotsPerCore, or not an integer at all, is ALSO the
+// default, but with a non-empty problem the caller logs: a bad ratio must never
+// wedge admission (R < 1 would make every request E_ADMIT_TOO_LARGE), and it
+// must never invalidate the record either (that would flip a ci-shim box onto
+// the real path).
+func (r InstallModeRecord) EffectiveCPUSlotsPerCore() (int, string) {
+	if r.cpuSlotsPerCoreUnparsed != "" {
+		return DefaultCPUSlotsPerCore, fmt.Sprintf("recorded cpu_slots_per_core %s is not an integer in %d..%d",
+			r.cpuSlotsPerCoreUnparsed, MinCPUSlotsPerCore, MaxCPUSlotsPerCore)
+	}
+	switch {
+	case r.CPUSlotsPerCore == 0:
+		return DefaultCPUSlotsPerCore, ""
+	case r.CPUSlotsPerCore < MinCPUSlotsPerCore || r.CPUSlotsPerCore > MaxCPUSlotsPerCore:
+		return DefaultCPUSlotsPerCore, fmt.Sprintf("recorded cpu_slots_per_core %d is outside %d..%d",
+			r.CPUSlotsPerCore, MinCPUSlotsPerCore, MaxCPUSlotsPerCore)
+	}
+	return r.CPUSlotsPerCore, ""
 }
 
 // The closed set of shim budget provenances.
@@ -159,9 +201,25 @@ func ReadInstallModeRecord(path string) (InstallModeRecord, bool) {
 	if err != nil {
 		return InstallModeRecord{}, false
 	}
-	var record InstallModeRecord
-	if err := json.Unmarshal(data, &record); err != nil {
+	// AIRA-283 lenient decode: cpu_slots_per_core is captured RAW (the outer,
+	// shallower field shadows the embedded record's own), so a hand-edited
+	// string, fraction or overflow there cannot fail the whole Unmarshal and
+	// thereby invalidate the record -- which would flip a ci-shim box onto the
+	// real path. The ratio alone degrades, through EffectiveCPUSlotsPerCore.
+	var wire struct {
+		InstallModeRecord
+		CPUSlotsPerCore json.RawMessage `json:"cpu_slots_per_core,omitempty"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
 		return InstallModeRecord{}, false
+	}
+	record := wire.InstallModeRecord
+	if raw := strings.TrimSpace(string(wire.CPUSlotsPerCore)); raw != "" && raw != "null" {
+		if ratio, err := strconv.Atoi(raw); err == nil {
+			record.CPUSlotsPerCore = ratio
+		} else {
+			record.cpuSlotsPerCoreUnparsed = raw
+		}
 	}
 	if record.Schema != 1 {
 		return InstallModeRecord{}, false
