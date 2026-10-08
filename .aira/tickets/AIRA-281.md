@@ -6,3 +6,7 @@
 ## Request (field/Stoner, 2026-10-08; blocks Stoner + flavour Makefile CI)
 
 Foreground `confine --json` is refused and the trailer is one text line of `key=value` facets, so Makefiles must sed it. Add `--summary-file <path>`: append ONE JSON line per job (append-safe under `make -j`), with at least: name, owner, command (or its hash), exit code, ran, admission, terminated-by, peak-rss, reserve, wall time, cpu time, and an optional caller-supplied tree hash. A never-ran job (refused admission) still writes a line (ran=false). Unreadable fields are `unevaluated`, never 0. Challenge first: is the greenfield minimum just a JSON rendering of the existing trailer facets? Resumable-gate caching stays in the repo (aira does not replay passes).
+
+## Addition (spice/flavour CI via field, 2026-10-08)
+
+In `aira install --ci=shim` mode inside a container the trailer reports peak-rss, cpu and cap as `unevaluated` (terminated-by=normal), and `aira confine --dump` wrote 0 records in spice's container test, so in CI there is nothing to summarise. Asks: (1) peak memory and wall time per step in ci-shim mode (peak may need a no-cgroup source, e.g. rusage of the waited child; else honest `unevaluated`); (2) wall time in the trailer generally (a `wall=` facet, all modes); (3) the shared confine macro include (AIRA-282). spice keeps make concurrency low itself until CPU gating (AIRA-279) exists. Check whether the shim `--dump` emitting 0 records is the same defect as AIRA-280.
