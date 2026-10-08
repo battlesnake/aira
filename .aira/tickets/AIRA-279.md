@@ -3,7 +3,19 @@
 ---
 
 
-## Request (owner, 2026-10-08)
+## Current state (corrected 2026-10-08; supersedes the original request text below)
+
+A CPU admission ledger ALREADY EXISTS (AIRA-261, v0.16): per slice, ceiling = 2 x NumCPU slots, hardcoded (`cpuCeiling()`, internal/daemon/admit.go; not configurable; runtime.NumCPU). A plain `aira confine` charges `DefaultConfineCPUCores` = 1; an aitest worker charges 1 or `@aira_cpu(N)`. Accounting only: no cpu.max, no pinning. Unverified: whether it applies in ci-shim mode.
+
+Still missing (this ticket):
+- a `confine` flag to declare N slots (name TBD), with `many` = exclusive of other `many` jobs (original owner ask);
+- a configurable ceiling/ratio (deploy asked for aitest workers-per-CPU in ci-shim containers; today `--aitest-workers=$((2*$(nproc)))` already reaches the ceiling);
+- cargo/make blind spot (field): one confined `cargo build` fans out to NumCPU rustc via cargo's jobserver but charges 1 slot, so 3 sessions = 48 compile jobs on 16 cores. Option to weigh: a machine-wide jobserver (FIFO, tokens = CPU budget) exported to each confined job via MAKEFLAGS/CARGO_MAKEFLAGS `--jobserver-auth=fifo:PATH`, so cargo/make/rustc share one pool with no tool-side change; a job holding K tokens might be charged K slots. Open: env/fd pass-through by confine, FIFO lifecycle across daemon restart, ci-shim, nested make.
+- Challenge pass first (greenfield minimum): is the flag + `many` alone enough? Is a jobserver a big general mechanism for one case (cargo)? Cheaper: document `CARGO_BUILD_JOBS` / `make -j` per step.
+
+Held. Do not build until the owner clears the hold.
+
+## Original request (owner, 2026-10-08) - premise partly wrong, see above
 
 Today CPU "slots" exist only for aitest (`@aira_cpu(N)`: admission accounting for the worker pool; the older pytest flock slot dir). `aira confine` admits on RAM and VRAM only. Make CPU a system-wide admission dimension.
 
