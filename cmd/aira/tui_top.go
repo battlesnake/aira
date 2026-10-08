@@ -370,9 +370,15 @@ func topFormatCores(value int64) string {
 // live CPU percentage to read. A rate is a difference between two samples over
 // the wall-clock between them — exactly what top(1) and htop do — and the only
 // place two consecutive samples exist is here, between ticks.
+//
+// ShowCwd (AIRA-276) is which text the last column carries: false is the wrapped
+// command (COMMAND), true is the directory it was launched from (DIRECTORY). It
+// lives here because it is operator-chosen view state that must survive the tick
+// that rebuilds the model, exactly as the slot table does.
 type topTick struct {
-	Slots []string
-	CPU   topCPUSample
+	Slots   []string
+	CPU     topCPUSample
+	ShowCwd bool
 }
 
 // topCPUSample is one tick's CPU counters plus the SERVER's instant for them.
@@ -404,7 +410,7 @@ type topCPUSample struct {
 // shallow copy would leave two states sharing one map, and the reducer's whole
 // contract is that a transition cannot mutate the state it was handed.
 func cloneTopTick(tick topTick) topTick {
-	next := topTick{Slots: append([]string(nil), tick.Slots...), CPU: tick.CPU}
+	next := topTick{Slots: append([]string(nil), tick.Slots...), CPU: tick.CPU, ShowCwd: tick.ShowCwd}
 	if tick.CPU.Scopes == nil {
 		return next
 	}
@@ -631,8 +637,15 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	// it using, and how much is that"), and CPU beside it because the two live
 	// readings belong together. COMMAND is last on purpose: it is the one cell with
 	// no bound on its natural width, so it absorbs the clamp instead of imposing it;
-	// SESSION goes just before it.
-	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "VRAM", "SESSION", "COMMAND"}}
+	// SESSION goes just before it. AIRA-276: that last column is COMMAND or, when
+	// the operator has toggled it, DIRECTORY — the two are the same kind of cell
+	// (an unbounded untrusted string from the supervisor), so the swap keeps the
+	// column last and changes nothing about the layout.
+	lastHeader := "COMMAND"
+	if previous.ShowCwd {
+		lastHeader = "DIRECTORY"
+	}
+	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "AGE", "RESERVATION", "RAM", "CPU CORES", "VRAM", "SESSION", lastHeader}}
 	if result.Verdict == "unevaluated" {
 		reason := strings.TrimSpace(result.Reason)
 		if reason == "" {
@@ -658,7 +671,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		byID[record.ScopeID] = record
 		live = append(live, record.ScopeID)
 	}
-	next := topTick{Slots: assignTopSlots(previous.Slots, live), CPU: topCPUSampleFrom(result)}
+	next := topTick{Slots: assignTopSlots(previous.Slots, live), CPU: topCPUSampleFrom(result), ShowCwd: previous.ShowCwd}
 	// ONE interval for the whole tick, so a job's rate, the slice's and the
 	// machine's are all divided by the same number and the parts add up to the
 	// whole by construction rather than by coincidence.
@@ -683,12 +696,16 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		reserve := topReserveFor(record)
 		colour := topSlotColour(slot)
 		rate, rateKnown := topScopeCPURate(previous.CPU, next.CPU, delta, scopeID)
+		lastText := record.Command
+		if previous.ShowCwd {
+			lastText = record.Cwd
+		}
 		model.Rows = append(model.Rows, tableRow{
 			ID: scopeID, Colour: colour, Cells: []string{
 				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
 				topRAMCell(record.RSSBytes),
-				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record), topCommandCell(record.Command),
+				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record), topUntrustedCell(lastText),
 			},
 		})
 		if reserve.State == topReserveSet {
@@ -901,11 +918,19 @@ func topPeakWithin(peak *int64, used int64, reserved int64) (int64, bool) {
 // table already clamps a cell that does not fit, and a second scheme layered on
 // top of it would only disagree with it.
 func topCommandCell(command *string) string {
-	if command == nil {
+	return topUntrustedCell(command)
+}
+
+// topUntrustedCell is the render boundary for the last column's text (AIRA-276:
+// the command, or the launch directory — both arbitrary bytes from another
+// process), with topCommandCell's rules: "unevaluated" when unknown, and
+// non-printing runes and tview colour tags neutralised.
+func topUntrustedCell(text *string) string {
+	if text == nil {
 		return "unevaluated"
 	}
 	var builder strings.Builder
-	for _, r := range *command {
+	for _, r := range *text {
 		if r == unicode.ReplacementChar || !unicode.IsPrint(r) {
 			builder.WriteString(strconv.QuoteRune(r))
 			continue

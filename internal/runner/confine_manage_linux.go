@@ -28,6 +28,9 @@ type confineScanDeps struct {
 	// field-by-field keeps the production behaviour rather than silently losing
 	// the field.
 	readCmdline func(pid int) ([]byte, error)
+	// readCwd is the seam for the supervisor's working directory (AIRA-276),
+	// with readCmdline's nil-falls-back-to-/proc contract.
+	readCwd func(pid int) (string, error)
 	// supervisorLive is the AIRA-183 seam for the supervisor-liveness reading,
 	// tri-state: alive, dead, or unestablished. Nil falls back to the real
 	// kill(pid, 0) probe on exactly the same reasoning as readCmdline above.
@@ -43,7 +46,7 @@ const confineReapMaxDepth = 32
 var confineReapOpenat = unix.Openat
 
 func defaultConfineScanDeps() confineScanDeps {
-	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty, readCmdline: readProcCmdline, supervisorLive: probeSupervisorLive}
+	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty, readCmdline: readProcCmdline, readCwd: readProcCwd, supervisorLive: probeSupervisorLive}
 }
 
 func ResolveConfineManagementSlice(slice string) (string, string, error) {
@@ -86,6 +89,16 @@ func readProcCmdline(pid int) ([]byte, error) {
 	}
 	defer file.Close()
 	return io.ReadAll(io.LimitReader(file, ConfineCommandWireLimit+1))
+}
+
+// readProcCwd is AIRA-276's live working-directory read: the target of the
+// /proc/<pid>/cwd link. An error (the process exited, or the link is unreadable
+// from here) is the caller's "unevaluated", never an empty directory.
+func readProcCwd(pid int) (string, error) {
+	if pid <= 0 {
+		return "", errors.New("no supervisor pid")
+	}
+	return os.Readlink("/proc/" + strconv.Itoa(pid) + "/cwd")
 }
 
 // confineCPUStatReadLimit bounds every cpu.stat read. cpu.stat is at most a
@@ -157,6 +170,10 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 	if readCmdline == nil {
 		readCmdline = readProcCmdline
 	}
+	readCwd := deps.readCwd
+	if readCwd == nil {
+		readCwd = readProcCwd
+	}
 	supervisorLive := deps.supervisorLive
 	if supervisorLive == nil {
 		supervisorLive = probeSupervisorLive
@@ -203,6 +220,13 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			}
 		} else {
 			record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
+		}
+		// AIRA-276. The supervisor's working directory, read live beside its argv
+		// and, like it, independently of whether the scope directory can be opened.
+		if dir, cwdErr := readCwd(pid); cwdErr == nil && dir != "" {
+			record.Cwd = &dir
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "cwd")
 		}
 		// AIRA-183. Whether the SUPERVISOR still exists, read beside its argv from
 		// the same PID and, like it, independently of whether the scope directory

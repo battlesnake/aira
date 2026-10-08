@@ -105,6 +105,20 @@ type ConfineRecord struct {
 	// that killConfine's pid selector already accepts); this field inherits it and
 	// widens nothing, and it participates in no decision — it is a display facet.
 	Command *string `json:"command"`
+	// Cwd is the SUPERVISOR's working directory — the directory `aira confine`
+	// was launched from, which is where the wrapped command starts — read live
+	// from the /proc/<SupervisorPID>/cwd link at listing time, beside Command. A
+	// job that later chdirs is still reported at its launch directory, because the
+	// supervisor (whose link this is) does not follow it.
+	//
+	// nil is "could not be established", never "no directory": the supervisor may
+	// have exited, /proc may be unreadable, or the link may belong to another
+	// user. It is a display facet with exactly Command's trust level (the SupervisorPID
+	// it is read through is decoded from the scope directory name, so a reused
+	// PID can carry an unrelated process's directory), and it participates in
+	// no decision. The kernel appends " (deleted)" to a removed directory and
+	// that is kept: it is true.
+	Cwd *string `json:"cwd"`
 	// CPUUsageUsec is the scope's CUMULATIVE cpu.stat `usage_usec` — total CPU
 	// time charged to this cgroup and its descendants since the cgroup was
 	// created, in microseconds — read live at listing time exactly as RSSBytes
