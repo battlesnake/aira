@@ -1135,3 +1135,72 @@ func TestReadConfineCPUFrameKeepsEachSideIndependent(t *testing.T) {
 		t.Fatalf("frame=%+v, want no system number without the known bit", frame)
 	}
 }
+
+// AIRA-276. The listing carries the supervisor's working directory, read live
+// from /proc/<pid>/cwd. A real child with a known, distinct directory is listed
+// with NO seam, so the production readlink is what is exercised (a seam-only
+// test would pass against a reader that returned the daemon's own cwd). The
+// failure case goes through the seam and must be a NAMED absence, never an empty
+// directory, while costing no other facet.
+//
+// verifies: AIRA-276
+func TestConfineScanReadsTheSupervisorCwdAndSaysUnevaluatedWhenItCannot(t *testing.T) {
+	slice := t.TempDir()
+	// EvalSymlinks: the kernel reports the resolved path, and t.TempDir may sit
+	// behind a symlink.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := exec.Command("/bin/sh", "-c", "while :; do sleep 1; done")
+	live.Dir = dir
+	if err := live.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = live.Process.Kill()
+		_, _ = live.Process.Wait()
+	})
+	pid := live.Process.Pid
+	scope := confineTestScopeID("live-cwd", pid, time.Now().Add(-time.Minute).UnixNano())
+	writeConfineTestScope(t, slice, scope, strconv.Itoa(pid)+"\n")
+
+	result, err := ListConfines(context.Background(), slice, nil)
+	if err != nil || len(result.Scopes) != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	record := result.Scopes[0]
+	if record.Cwd == nil || *record.Cwd != dir {
+		t.Fatalf("cwd=%v, want %q (the child's directory, not this process's)", record.Cwd, dir)
+	}
+	if confineContainsString(record.UnevaluatedFields, "cwd") {
+		t.Fatalf("an established cwd was also named unevaluated: %+v", record)
+	}
+
+	failed, err := listConfinesWithDeps(context.Background(), slice, nil, confineScanDeps{
+		now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty,
+		readCwd: func(int) (string, error) { return "", errors.New("no such process") },
+	})
+	if err != nil || len(failed.Scopes) != 1 {
+		t.Fatalf("failed-read result=%+v err=%v", failed, err)
+	}
+	gone := failed.Scopes[0]
+	if gone.Cwd != nil || !confineContainsString(gone.UnevaluatedFields, "cwd") {
+		t.Fatalf("unreadable cwd record=%+v, want a nil cwd named unevaluated", gone)
+	}
+	pending := ShimConfineList([]ConfineRegistryEntry{{ScopeID: scope}}).Scopes
+	if len(pending) != 1 || pending[0].Cwd != nil || !confineContainsString(pending[0].UnevaluatedFields, "cwd") {
+		t.Fatalf("registry-only row=%+v, want a nil cwd named unevaluated", pending)
+	}
+	if gone.RSSBytes == nil || gone.Cap == nil {
+		t.Fatalf("a failed cwd read also lost a cgroup facet: %+v", gone)
+	}
+	// An empty link target establishes nothing: unevaluated, not "".
+	empty, err := listConfinesWithDeps(context.Background(), slice, nil, confineScanDeps{
+		now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty,
+		readCwd: func(int) (string, error) { return "", nil },
+	})
+	if err != nil || len(empty.Scopes) != 1 || empty.Scopes[0].Cwd != nil || !confineContainsString(empty.Scopes[0].UnevaluatedFields, "cwd") {
+		t.Fatalf("empty-target result=%+v err=%v, want a nil cwd named unevaluated", empty, err)
+	}
+}

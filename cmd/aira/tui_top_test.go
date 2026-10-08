@@ -1864,3 +1864,98 @@ func TestTopBarFitsItsPanelHeight(t *testing.T) {
 		})
 	}
 }
+
+// AIRA-276. The last column is COMMAND by default and DIRECTORY once the flag is
+// set, header AND cells together, and nothing else about the row changes. The
+// directory carries a newline and a tview colour tag: it is untrusted bytes with
+// the same render-boundary treatment as the command.
+//
+// verifies: AIRA-276
+func TestTopViewModelLastColumnSwapsBetweenCommandAndDirectory(t *testing.T) {
+	command := "go test ./..."
+	cwd := "/work/[red]proj\nx"
+	record := topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib)
+	record.Command = &command
+	record.Cwd = &cwd
+	listing := topTestListing(topTestFrame(), record)
+
+	byCommand, tick := topViewModel(topTick{}, listing)
+	if got := byCommand.Headers[len(byCommand.Headers)-1]; got != "COMMAND" {
+		t.Fatalf("default last header=%q, want COMMAND", got)
+	}
+	cells := byCommand.Rows[0].Cells
+	if cells[len(cells)-1] != command {
+		t.Fatalf("default last cell=%q, want the command", cells[len(cells)-1])
+	}
+	if tick.ShowCwd {
+		t.Fatalf("a tick built with the default flag turned it on")
+	}
+
+	byDir, tick := topViewModel(topTick{ShowCwd: true}, listing)
+	if got := byDir.Headers[len(byDir.Headers)-1]; got != "DIRECTORY" {
+		t.Fatalf("toggled last header=%q, want DIRECTORY", got)
+	}
+	dirCells := byDir.Rows[0].Cells
+	if want := tview.Escape("/work/[red]proj" + `'\n'` + "x"); dirCells[len(dirCells)-1] != want {
+		t.Fatalf("toggled last cell=%q, want %q", dirCells[len(dirCells)-1], want)
+	}
+	if !reflect.DeepEqual(dirCells[:len(dirCells)-1], cells[:len(cells)-1]) {
+		t.Fatalf("toggling the column changed another cell: %v vs %v", dirCells, cells)
+	}
+	if !tick.ShowCwd {
+		t.Fatalf("the next tick dropped the flag, so the column would flip back on the following refresh")
+	}
+
+	// An unknown directory is named, never blank, and the flag survives an
+	// UNEVALUATED listing (which returns the previous tick unchanged).
+	record.Cwd = nil
+	unknown, _ := topViewModel(topTick{ShowCwd: true}, topTestListing(topTestFrame(), record))
+	if got := unknown.Rows[0].Cells[len(unknown.Rows[0].Cells)-1]; got != "unevaluated" {
+		t.Fatalf("unknown directory cell=%q, want unevaluated", got)
+	}
+	bad, kept := topViewModel(topTick{ShowCwd: true}, runner.ConfineListResult{Verdict: "unevaluated", Reason: "x"})
+	if !kept.ShowCwd || bad.Headers[len(bad.Headers)-1] != "DIRECTORY" {
+		t.Fatalf("an unevaluated listing lost the toggle: tick=%+v headers=%v", kept, bad.Headers)
+	}
+}
+
+// The 'c' key flips the flag on the top view only, fetches afresh so the model
+// is rebuilt, and the flag survives the reducer's state clone and the landing
+// fetch (the two places a new field is most easily dropped).
+//
+// verifies: AIRA-276
+func TestTopControllerCKeyTogglesTheLastColumn(t *testing.T) {
+	state := newTUIStateForViews(8, topOnlyViews, nil)
+	state, _ = requestPanelRefresh(state, viewTop)
+	command, cwd := "make ci", "/work/proj"
+	record := topTestRecord("CONFINE-alpha-101-aa", "alpha", 2*gib, gib)
+	record.Command, record.Cwd = &command, &cwd
+	listing := topTestListing(topTestFrame(), record)
+	state, _ = onTUIFetchResult(state, fetchResult{View: viewTop, Generation: state.Panels[viewTop].InFlightGeneration, Top: &listing})
+
+	state, commands := onTUIKey(state, 'c', nil)
+	if !state.Top.ShowCwd {
+		t.Fatalf("'c' on the top view did not set the flag")
+	}
+	if len(commands) != 1 || commands[0].Kind != cmdFetch || commands[0].View != viewTop {
+		t.Fatalf("commands=%+v, want one top fetch so the model is rebuilt", commands)
+	}
+	state, _ = onTUIFetchResult(state, fetchResult{View: viewTop, Generation: state.Panels[viewTop].InFlightGeneration, Top: &listing})
+	model := state.Panels[viewTop].Model
+	if model.Headers[len(model.Headers)-1] != "DIRECTORY" || model.Rows[0].Cells[len(model.Rows[0].Cells)-1] != cwd {
+		t.Fatalf("after 'c' + fetch: headers=%v cells=%v, want the DIRECTORY column", model.Headers, model.Rows[0].Cells)
+	}
+
+	state, _ = onTUIKey(state, 'c', nil)
+	if state.Top.ShowCwd {
+		t.Fatalf("a second 'c' did not toggle back")
+	}
+
+	// Off the top view the key is inert.
+	other := newTUIState(8)
+	other.Active = viewTickets
+	other, commands = onTUIKey(other, 'c', nil)
+	if other.Top.ShowCwd || len(commands) != 0 {
+		t.Fatalf("'c' off the top view changed state: flag=%v commands=%+v", other.Top.ShowCwd, commands)
+	}
+}

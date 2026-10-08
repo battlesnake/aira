@@ -537,6 +537,18 @@ func onTUIKey(state tuiState, key rune, descriptors []core.DispatchDescriptor) (
 	case ':':
 		state.PaletteOpen = true
 		return state, nil
+	case 'c':
+		// AIRA-276. On the top view alone, flip the last column between the job's
+		// command and its launch directory. The model is rebuilt from a fresh
+		// fetch (requestPanelRefresh; a fetch already in flight is re-run once it
+		// lands) rather than patched in place, so the header and every cell
+		// change together and the flag has exactly one reader, topViewModel.
+		// Elsewhere 'c' is not a global key (the leases/ready tabs bind it to
+		// claim, above), so it falls through to nothing.
+		if state.Active == viewTop && !state.PaletteOpen && !state.PaletteDispatching {
+			state.Top.ShowCwd = !state.Top.ShowCwd
+			return requestPanelRefresh(state, viewTop)
+		}
 	case 'x':
 		// Deliberately NOT gated on CanExecute. TestTUIExecuteCapabilityAbsentIsVisible
 		// pins the rule this rests on: a capability that is absent must SAY so when

@@ -45,7 +45,7 @@ func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegis
 		// the AIRA-49 stale-lease sweep exists precisely because it does — so lease
 		// membership is grounds for refusing to call a scope orphaned, and nothing
 		// more.
-		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap", "command", "cpu", "supervisor_live"}}
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap", "command", "cwd", "cpu", "supervisor_live"}}
 		if age := time.Since(time.Unix(0, stamp)); age >= 0 {
 			seconds := int64(age / time.Second)
 			record.AgeSeconds = &seconds

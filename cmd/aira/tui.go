@@ -567,6 +567,10 @@ func (r *tuiRuntime) render() {
 	case !r.canExecute:
 		keys = "    r refresh  : palette  q quit"
 	}
+	if r.state.Active == viewTop {
+		// AIRA-276. Advertised only on the tab it works on.
+		keys = "    c command/dir" + keys
+	}
 	r.tabs.SetText(strings.Join(tabNames, "  ") + keys)
 	r.detachedStatus.SetText(r.state.DetachedReport)
 	r.panelPages.SwitchToPage(string(r.state.Active))
