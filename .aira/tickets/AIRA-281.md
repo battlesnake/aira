@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-281","project":"aira","title":"confine --summary-file \u003cpath\u003e: append one JSON line per job (name, owner, cmd/hash, exit, ran, admission, terminated-by, peak-rss, reserve, wall/cpu, optional tree hash)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.29","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-281","project":"aira","title":"confine --summary-file \u003cpath\u003e: append one JSON line per job (name, owner, cmd/hash, exit, ran, admission, terminated-by, peak-rss, reserve, wall/cpu, optional tree hash)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.29","labels":[],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-281","to":"AIRA-282"}]}
 ---
 
 
