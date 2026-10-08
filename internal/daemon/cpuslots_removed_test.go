@@ -11,8 +11,14 @@ import (
 
 // verifies: S6 — the AIRA-64 cpuslots flock CPU slot-governor is fully removed
 // from production source. CPU is now governed by the admission ledger (S5's
-// per-slice cpuOutstanding vs the 2×NumCPU ceiling), so the old flock slot-dir
+// per-slice cpuOutstanding vs the R×NumCPU ceiling), so the old flock slot-dir
 // governor and every symbol, wire field and comment that named it must be gone.
+//
+// AIRA-283's CPU-slots-per-core ratio R is NOT that governor: it is the ledger
+// ceiling's multiplier, and its spec-mandated names (the --cpu-slots-per-core
+// flag, the cpu_slots_per_core record/lock key, the CPUSlotsPerCore field) are
+// masked out before the scan. Only those exact compound spellings are exempt; a
+// bare CPUSlots field, cpu_slots tag or cpu-slots flag still reds this guard.
 //
 // This is the S6 mutation pin the compiler cannot provide: a half-deletion that
 // left the CPUSlots wire field on a struct, the cpu_slots render block, or a
@@ -23,6 +29,15 @@ import (
 // It walks non-test .go source only. supervisor.py (go:embedded into the binary)
 // keeps its own cpu_slots reader and is S16's to retire — a .py file, so this
 // .go-only walk never sees it, and the embed directive names a path, not the token.
+// cpuSlotsPerCoreNames blanks AIRA-283's ratio names, the only legitimate
+// production spellings that contain an S6 residual token.
+var cpuSlotsPerCoreNames = strings.NewReplacer(
+	"cpu-slots-per-core", "",
+	"cpu_slots_per_core", "",
+	"CPUSlotsPerCore", "",
+	"cpuSlotsPerCore", "",
+)
+
 func TestS6CPUSlotsGovernorFullyRemovedFromSource(t *testing.T) {
 	// The residual tokens a compiling half-deletion could leave behind. Symbol
 	// references to the deleted cpuslots.go internals (cpuSlotsDecide,
@@ -49,7 +64,7 @@ func TestS6CPUSlotsGovernorFullyRemovedFromSource(t *testing.T) {
 			if readErr != nil {
 				return readErr
 			}
-			body := string(data)
+			body := cpuSlotsPerCoreNames.Replace(string(data))
 			for _, token := range tokens {
 				if strings.Contains(body, token) {
 					offenders[path] = append(offenders[path], token)
