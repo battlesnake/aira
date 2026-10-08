@@ -97,3 +97,19 @@ func TestInstallParseArgsAcceptsCIAsAValuelessFlag(t *testing.T) {
 		t.Fatalf("--ci=32G err=%v, want a valueless-flag refusal", err)
 	}
 }
+
+// AIRA-283. --cpu-slots-per-core is on the install descriptor's allowlist, as a
+// VALUED option (both spellings). The range check itself lives in the install
+// parser, which the CLI reaches first; this pins only that the CLI face does not
+// reject the flag before it gets there.
+func TestInstallParseArgsAcceptsCPUSlotsPerCore(t *testing.T) {
+	for _, argv := range [][]string{{"--cpu-slots-per-core=3"}, {"--cpu-slots-per-core", "3"}} {
+		positionals, options, err := parseArgs("install", argv)
+		if err != nil || len(positionals) != 0 || options["cpu-slots-per-core"] != "3" {
+			t.Fatalf("%q: positionals=%q options=%q err=%v", argv, positionals, options, err)
+		}
+	}
+	if _, _, err := parseArgs("install", []string{"--cpu-slots-per-core"}); err == nil || !strings.Contains(err.Error(), "requires a value") {
+		t.Fatalf("a bare --cpu-slots-per-core err=%v, want a requires-a-value refusal", err)
+	}
+}

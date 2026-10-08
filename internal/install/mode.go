@@ -202,8 +202,10 @@ func runShimInstall(d installDeps, opts installOpts, report CapabilityReport, re
 			RecordedAt: d.now().UTC().Format(time.RFC3339), Home: home, UID: uid,
 			ResolvedBy: resolvedBy, Capability: capabilityMap(report),
 			ShimBudgetBytes: budget, ShimBudgetSource: source, ShimCgroupPath: cgroupPath,
+			CPUSlotsPerCore: installCPUSlotsPerCore(opts, recordPath),
 		}
 		reportShimMode(d, record)
+		reportRecordedCPUSlotsPerCore(d, opts, record)
 		if opts.dryRun {
 			d.logf("planned: write %s (build stage: places bytes only)", recordPath)
 			d.logf("planned: start `aira daemon serve` detached, with no inherited pipe and no wait (start stage)")
@@ -251,6 +253,13 @@ func runShimInstall(d installDeps, opts installOpts, report CapabilityReport, re
 	}
 	if status := d.daemonStatus(paths); status.Running {
 		d.logf("aira daemon: already running; leaving it alone")
+		// AIRA-283 (E2). Left alone because it holds the in-memory ledger -- but
+		// it read its CPU-slots-per-core ratio at start, so a recorded ratio it is
+		// not running must be SAID, never left to look applied.
+		if recorded, live, stale := liveCPUSlotsPerCoreStale(d, paths, record); stale {
+			d.logf("restart required: recorded R=%d, live R=%d -- the running daemon read its CPU slots per core at start; stop it and re-run `aira install --ci=shim --stage=start` to apply R=%d",
+				recorded, live, recorded)
+		}
 	} else if err := d.spawnShimDaemon(shimDaemonSpec{
 		executable: executable, stateHome: paths.StateHome, record: record,
 		environ: shimDaemonEnvironment(d, record),
@@ -398,16 +407,100 @@ func waitShimDaemonReachable(d installDeps, paths daemon.Paths) error {
 
 // writeRealInstallModeRecord records a REAL install with the same schema the
 // shim uses, so that "which mode is this box in" has exactly one answer and one
-// place to read it, whichever mode was installed.
-func writeRealInstallModeRecord(d installDeps, paths daemon.Paths, home string, uid int, resolvedBy string) error {
+// place to read it, whichever mode was installed. It returns the record written.
+func writeRealInstallModeRecord(d installDeps, opts installOpts, paths daemon.Paths, home string, uid int, resolvedBy string) (runner.InstallModeRecord, error) {
+	recordPath := runner.InstallModePathFor(paths.StateHome)
 	record := runner.InstallModeRecord{
 		Schema: 1, Mode: runner.ConfineModeReal,
 		RecordedAt: d.now().UTC().Format(time.RFC3339), Home: home, UID: uid, ResolvedBy: resolvedBy,
+		CPUSlotsPerCore: installCPUSlotsPerCore(opts, recordPath),
 	}
-	if err := runner.WriteInstallModeRecord(runner.InstallModePathFor(paths.StateHome), record); err != nil {
-		return unavailable(fmt.Errorf("record install mode: %w", err))
+	if err := runner.WriteInstallModeRecord(recordPath, record); err != nil {
+		return record, unavailable(fmt.Errorf("record install mode: %w", err))
 	}
-	return nil
+	return record, nil
+}
+
+// installCPUSlotsPerCore picks the CPU-slots-per-core ratio this install records
+// (AIRA-283): the flag when given, else whatever the existing record already
+// holds -- a reinstall without the flag PRESERVES it, as an omitted --watchdog
+// preserves the unit's mode -- else zero, i.e. absent, which means the default.
+// A preserved value is carried as recorded, never re-judged here: the daemon
+// normalises it (and logs) at start, and --status shows both numbers.
+func installCPUSlotsPerCore(opts installOpts, recordPath string) int {
+	if opts.cpuSlotsPerCore != 0 {
+		return opts.cpuSlotsPerCore
+	}
+	if previous, ok := runner.ReadInstallModeRecord(recordPath); ok {
+		return previous.CPUSlotsPerCore
+	}
+	return 0
+}
+
+// reportRecordedCPUSlotsPerCore prints the ratio an install just recorded.
+func reportRecordedCPUSlotsPerCore(d installDeps, opts installOpts, record runner.InstallModeRecord) {
+	effective, problem := record.EffectiveCPUSlotsPerCore()
+	source := "kept from the existing record"
+	switch {
+	case opts.cpuSlotsPerCore != 0:
+		source = "set by --cpu-slots-per-core"
+	case problem != "":
+		source = problem + "; the daemon uses the default"
+	case record.CPUSlotsPerCore == 0:
+		source = "the default"
+	}
+	d.logf("cpu slots per core: %d (%s); the daemon's CPU admission ceiling is %d x NumCPU slots", effective, source, effective)
+}
+
+// liveCPUSlotsPerCoreStale reports the ratio the RUNNING daemon adopted at start
+// (from its lock file) and whether it differs from the recorded effective one.
+// The daemon reads its ratio only at start, so a differing live value means the
+// install's change is not in force yet. A daemon that is not running, or that
+// does not report a ratio, is never stale: there is no live value to compare.
+func liveCPUSlotsPerCoreStale(d installDeps, paths daemon.Paths, record runner.InstallModeRecord) (int, int, bool) {
+	effective, _ := record.EffectiveCPUSlotsPerCore()
+	status := d.daemonStatus(paths)
+	if !status.Running || status.Lock.CPUSlotsPerCore == 0 {
+		return effective, 0, false
+	}
+	return effective, status.Lock.CPUSlotsPerCore, status.Lock.CPUSlotsPerCore != effective
+}
+
+// reportCPUSlotsPerCoreStatus is `aira install --status`'s ratio line: the
+// recorded value, the effective (normalised) value, and the live one the daemon
+// reports, with "restart required" when live and effective differ (AIRA-283).
+func reportCPUSlotsPerCoreStatus(d installDeps) {
+	paths, err := d.daemonPaths()
+	if err != nil {
+		d.logf("cpu slots per core: unevaluated (resolve daemon paths: %v)", err)
+		return
+	}
+	record, ok := runner.ReadInstallModeRecord(runner.InstallModePathFor(paths.StateHome))
+	effective, problem := record.EffectiveCPUSlotsPerCore()
+	recorded, effectiveNote := strconv.Itoa(record.CPUSlotsPerCore), ""
+	switch {
+	case !ok:
+		recorded, effectiveNote = "unevaluated (no usable install record)", " (the default)"
+	case problem != "":
+		if record.CPUSlotsPerCore == 0 {
+			recorded = "unusable"
+		}
+		effectiveNote = " (" + problem + "; the daemon uses the default)"
+	case record.CPUSlotsPerCore == 0:
+		recorded, effectiveNote = "absent", " (the default)"
+	}
+	live := "unevaluated (no daemon running)"
+	if status := d.daemonStatus(paths); status.Running {
+		switch reported := status.Lock.CPUSlotsPerCore; {
+		case reported == 0:
+			live = "unevaluated (the running daemon does not report one)"
+		case reported != effective:
+			live = fmt.Sprintf("%d (restart required: the daemon reads its ratio only at start)", reported)
+		default:
+			live = strconv.Itoa(reported)
+		}
+	}
+	d.logf("cpu slots per core: recorded %s, effective %d%s, live %s", recorded, effective, effectiveNote, live)
 }
 
 // reportInstallMode prints the recorded install mode for `aira install --status`.

@@ -171,6 +171,10 @@ type installOpts struct {
 	// bytes only -- safe inside a `docker build` RUN layer: no network, no
 	// systemd, no daemon contact, no /etc write, no linger) or "start".
 	stage string
+	// AIRA-283. cpuSlotsPerCore is --cpu-slots-per-core: the ratio R recorded in
+	// the install-mode record (the daemon's CPU ceiling is R x NumCPU). Zero means
+	// NOT GIVEN, which keeps whatever the existing record holds.
+	cpuSlotsPerCore int
 }
 
 // AIRA-106. An ABSENT daemon-mode option is now the ZERO VALUE all the way from
@@ -431,7 +435,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				return opts, argumentInvalid("--stage must be build or start")
 			}
 			opts.stage = value
-		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core":
 			if !hasValue {
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 					return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
@@ -443,6 +447,16 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
 			}
 			switch name {
+			case "cpu-slots-per-core":
+				// AIRA-283. R < 1 would make every CPU request E_ADMIT_TOO_LARGE
+				// (invariant 3); 64 keeps R x NumCPU far below 2^31.
+				ratio, parseErr := strconv.Atoi(value)
+				if parseErr != nil || ratio < runner.MinCPUSlotsPerCore || ratio > runner.MaxCPUSlotsPerCore {
+					return opts, argumentInvalid(fmt.Sprintf(
+						"--cpu-slots-per-core must be a whole number from %d to %d (CPU admission slots per core; the daemon's CPU ceiling is R x NumCPU, default %d), got %q",
+						runner.MinCPUSlotsPerCore, runner.MaxCPUSlotsPerCore, runner.DefaultCPUSlotsPerCore, value))
+				}
+				opts.cpuSlotsPerCore = ratio
 			case "memory-max":
 				opts.memoryMax = value
 			case "memory-high":
@@ -491,8 +505,13 @@ func parseInstallArgs(args []string) (installOpts, error) {
 	}
 	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || opts.ci ||
 		opts.ciValue != "" || opts.stage != "" ||
-		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"]) {
+		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"] || seen["cpu-slots-per-core"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
+	}
+	// AIRA-283 (E8). The start stage never rewrites the install-mode record, so a
+	// ratio given there would be silently ignored: refuse it rather than lie.
+	if opts.stage == installStageStart && seen["cpu-slots-per-core"] {
+		return opts, argumentInvalid("--cpu-slots-per-core cannot be combined with --stage=start: the start stage does not rewrite the install record; pass it at --stage=build (or with no --stage)")
 	}
 	return opts, nil
 }
@@ -763,6 +782,11 @@ func reexecRequestFor(executable string, target installTarget, opts installOpts)
 	if opts.stage != "" {
 		args = append(args, "--stage="+opts.stage)
 	}
+	// AIRA-283. Forwarded ONLY when given: an absent ratio means "keep the
+	// recorded one", and the unprivileged leg is the one that writes the record.
+	if opts.cpuSlotsPerCore != 0 {
+		args = append(args, "--cpu-slots-per-core="+strconv.Itoa(opts.cpuSlotsPerCore))
+	}
 	// AIRA-106. Each daemon-mode option is forwarded ONLY when it was given
 	// explicitly. Forwarding them unconditionally (as this did) meant the
 	// re-exec'd unprivileged process always saw an explicit flag, so the
@@ -961,6 +985,8 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		}
 		d.logf("planned: stop incumbent daemon and wait; publish and enable --now %s", d.daemonUnit)
 		d.logf("planned: loginctl enable-linger %d; verify active/running MainPID equals daemon lock PID", uid)
+		planned, _ := runner.InstallModeRecord{CPUSlotsPerCore: installCPUSlotsPerCore(opts, runner.InstallModePathFor(paths.StateHome))}.EffectiveCPUSlotsPerCore()
+		d.logf("planned: record cpu slots per core %d; restart a present daemon running another ratio", planned)
 		return nil
 	}
 
@@ -1049,11 +1075,13 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	if resolvedBy == "" {
 		resolvedBy = "default"
 	}
-	if err := writeRealInstallModeRecord(d, paths, home, uid, resolvedBy); err != nil {
+	record, err := writeRealInstallModeRecord(d, opts, paths, home, uid, resolvedBy)
+	if err != nil {
 		return err
 	}
 	d.logf("install mode: real-slice (resolved by %s)", resolvedBy)
 	d.logf("containment: enforced — per-job cgroup scope under %s", d.sliceUnit)
+	reportRecordedCPUSlotsPerCore(d, opts, record)
 
 	// AIRA-121 requirement 9. The BUILD stage stops here: everything above places
 	// bytes on disk (unit files and one record) and nothing above contacts
@@ -1159,6 +1187,19 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	if daemonPresent && daemonChanged {
 		if _, err := d.run([]string{"systemctl", "--user", "restart", d.daemonUnit}, nil); err != nil {
 			return unavailable(fmt.Errorf("restart %s to apply changed unit: %w", d.daemonUnit, err))
+		}
+	} else if daemonPresent {
+		// AIRA-283 (E2). The CPU-slots-per-core ratio lives in the install record,
+		// not in the unit, so a changed ratio leaves the unit bytes identical and
+		// the branch above never fires; the live daemon would keep its OLD ratio
+		// behind a green install. Restart exactly when the ratio it reports (read
+		// once, at its start) differs from the one just recorded -- a convergence
+		// re-run with the same ratio still never bounces it.
+		if recorded, live, stale := liveCPUSlotsPerCoreStale(d, paths, record); stale {
+			if _, err := d.run([]string{"systemctl", "--user", "restart", d.daemonUnit}, nil); err != nil {
+				return unavailable(fmt.Errorf("restart %s to apply cpu slots per core %d (live daemon is on %d): %w", d.daemonUnit, recorded, live, err))
+			}
+			d.logf("%s: restarted to apply cpu slots per core %d (the live daemon was on %d)", d.daemonUnit, recorded, live)
 		}
 	}
 	if d.getenv("AIRA_INSTALL_REEXEC") == "1" {
@@ -2192,6 +2233,7 @@ func runStatus(d installDeps) error {
 	// an operator reading a shim box's status without this line would see a
 	// screenful of absences and conclude the install had failed.
 	reportInstallMode(d)
+	reportCPUSlotsPerCoreStatus(d)
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	var content, anchorContent, daemonContent, whaleContent []byte
 	var unitErr, anchorErr, daemonErr, whaleErr error
