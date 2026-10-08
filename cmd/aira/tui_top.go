@@ -632,7 +632,8 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	// greedily left to right and clamps whatever no longer fits, which is why
 	// RESERVE was arriving truncated. AIRA-265 adds a narrow SESSION column that
 	// brings the identity back WITHOUT the hex (topSessionCell): a human-friendly
-	// AIRA_CONFINE_OWNER is shown as-is, a worktree hash as a short prefix. RAM sits
+	// AIRA_CONFINE_OWNER is shown as-is, else the tmux window the job was launched
+	// from (AIRA-277), else a worktree hash as a short prefix. RAM sits
 	// beside RESERVATION because the pair is one question ("how much of its grant is
 	// it using, and how much is that"), and CPU beside it because the two live
 	// readings belong together. COMMAND is last on purpose: it is the one cell with

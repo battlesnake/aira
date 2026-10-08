@@ -40,7 +40,22 @@ const (
 // confineTmuxRef is the allow-listed part of a supervisor's environment.
 type confineTmuxRef struct {
 	socket string
-	pane   string
+	// serverPID is the tmux server's pid, the second field of TMUX. Pane ids are a
+	// per-server counter restarting at %0, so (pid, pane) is the key: after the
+	// server is restarted on the same socket path an old job's "%0" must not
+	// resolve to whatever the new server's %0 happens to be.
+	serverPID string
+	pane      string
+}
+
+// key is how a ref is looked up in tmuxWindowNames's result.
+func (r confineTmuxRef) key() string { return r.serverPID + " " + r.pane }
+
+// withoutPaneLookup is for callers that never read Pane (the orphan reaper and
+// --kill): it makes every pane unestablished without a /proc read or a tmux fork.
+func withoutPaneLookup(deps confineScanDeps) confineScanDeps {
+	deps.readEnviron = func(int) ([]byte, error) { return nil, os.ErrPermission }
+	return deps
 }
 
 type confinePaneLookup int
@@ -64,7 +79,13 @@ func readProcEnviron(pid int) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	return io.ReadAll(io.LimitReader(file, confineEnvironReadLimit+1))
+	return readBoundedEnviron(file)
+}
+
+// readBoundedEnviron reads one byte PAST the limit, which is how parseConfineTmuxRef
+// tells a block that exactly filled the budget from one that overran it.
+func readBoundedEnviron(r io.Reader) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r, confineEnvironReadLimit+1))
 }
 
 // parseConfineTmuxRef extracts the tmux variables from a raw environ block.
@@ -75,7 +96,12 @@ func parseConfineTmuxRef(environ []byte) (confineTmuxRef, confinePaneLookup) {
 	}
 	var tmuxVar, pane string
 	var haveTmux, havePane bool
-	for _, entry := range bytes.Split(environ, []byte{0}) {
+	entries := bytes.Split(environ, []byte{0})
+	if truncated {
+		// The last element ends where the read did, not where its variable does.
+		entries = entries[:len(entries)-1]
+	}
+	for _, entry := range entries {
 		switch {
 		case bytes.HasPrefix(entry, []byte("TMUX=")):
 			tmuxVar, haveTmux = string(entry[len("TMUX="):]), true
@@ -90,17 +116,39 @@ func parseConfineTmuxRef(environ []byte) (confineTmuxRef, confinePaneLookup) {
 		}
 		return confineTmuxRef{}, paneNotInTmux
 	case haveTmux && havePane:
-		socket, _, _ := strings.Cut(tmuxVar, ",")
-		if !filepath.IsAbs(socket) || !strings.HasPrefix(pane, "%") || pane == "%" {
+		fields := strings.Split(tmuxVar, ",")
+		if len(fields) < 2 {
 			return confineTmuxRef{}, paneUnestablished
 		}
-		return confineTmuxRef{socket: filepath.Clean(socket), pane: pane}, paneInTmux
+		socket, serverPID := fields[0], fields[1]
+		if _, err := strconv.ParseUint(serverPID, 10, 32); err != nil || !filepath.IsAbs(socket) || !strings.HasPrefix(pane, "%") || pane == "%" {
+			return confineTmuxRef{}, paneUnestablished
+		}
+		return confineTmuxRef{socket: filepath.Clean(socket), serverPID: serverPID, pane: pane}, paneInTmux
 	}
 	return confineTmuxRef{}, paneUnestablished
 }
 
-// tmuxWindowNames returns pane id -> raw window name for every pane on the
-// server behind socket.
+// confineTmuxOutputLimit caps what one `tmux list-panes` may hand back. The
+// socket path comes from another process's environment, so the peer behind it is
+// not necessarily tmux.
+const confineTmuxOutputLimit = 1 << 20
+
+// cappedBuffer is an io.Writer that fails once it would exceed max.
+type cappedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.buf.Len()+len(p) > c.max {
+		return 0, io.ErrShortWrite
+	}
+	return c.buf.Write(p)
+}
+
+// tmuxWindowNames returns "<server pid> <pane id>" -> raw window name for every
+// pane on the server behind socket.
 func tmuxWindowNames(ctx context.Context, socket string) (map[string]string, error) {
 	path, err := exec.LookPath("tmux")
 	if err != nil {
@@ -108,15 +156,24 @@ func tmuxWindowNames(ctx context.Context, socket string) (map[string]string, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, confineTmuxTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "-S", socket, "list-panes", "-a", "-F", "#{pane_id} #{window_name}").Output()
-	if err != nil {
+	cmd := exec.CommandContext(ctx, path, "-S", socket, "list-panes", "-a", "-F", "#{pid} #{pane_id} #{window_name}")
+	// Without WaitDelay, a killed tmux whose stdout is still held open by a child
+	// would keep Output() waiting past the timeout.
+	cmd.WaitDelay = 100 * time.Millisecond
+	out := &cappedBuffer{max: confineTmuxOutputLimit}
+	cmd.Stdout = out
+	if err := cmd.Run(); err != nil {
 		return nil, err
 	}
 	names := make(map[string]string)
-	for _, line := range strings.Split(string(out), "\n") {
-		id, name, ok := strings.Cut(line, " ")
+	for _, line := range strings.Split(out.buf.String(), "\n") {
+		serverPID, rest, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		id, name, ok := strings.Cut(rest, " ")
 		if ok && strings.HasPrefix(id, "%") {
-			names[id] = name
+			names[serverPID+" "+id] = name
 		}
 	}
 	return names, nil
@@ -162,11 +219,8 @@ func resolveConfinePanes(ctx context.Context, byID map[string]ConfineRecord, ref
 				failed[ref.socket] = true
 			}
 		}
-		record, present := byID[scopeID]
-		if !present {
-			continue
-		}
-		if name, ok := bySocket[ref.socket][ref.pane]; ok {
+		record := byID[scopeID]
+		if name, ok := bySocket[ref.socket][ref.key()]; ok {
 			label := confinePaneLabel(name, ref.pane)
 			record.Pane = &label
 		} else {
@@ -175,19 +229,13 @@ func resolveConfinePanes(ctx context.Context, byID map[string]ConfineRecord, ref
 		byID[scopeID] = record
 	}
 	for scopeID := range notInTmux {
-		record, present := byID[scopeID]
-		if !present {
-			continue
-		}
+		record := byID[scopeID]
 		none := ""
 		record.Pane = &none
 		byID[scopeID] = record
 	}
 	for scopeID := range unestablished {
-		record, present := byID[scopeID]
-		if !present {
-			continue
-		}
+		record := byID[scopeID]
 		record.UnevaluatedFields = append(record.UnevaluatedFields, "pane")
 		byID[scopeID] = record
 	}

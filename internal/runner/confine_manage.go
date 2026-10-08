@@ -127,7 +127,9 @@ type ConfineRecord struct {
 	// unreadable, tmux gone or too slow, the pane no longer exists) and is named
 	// "pane" in UnevaluatedFields. A non-nil EMPTY string is an established
 	// "not launched from tmux". Anything else is the window's name with a trailing
-	// status glyph removed. A display facet only; it participates in no decision.
+	// status glyph removed. A display facet only; it participates in no decision, and
+	// it inherits Command's known gap: SupervisorPID comes from the scope directory
+	// name, so a reused PID could carry another process's environment.
 	Pane *string `json:"pane"`
 	// CPUUsageUsec is the scope's CUMULATIVE cpu.stat `usage_usec` — total CPU
 	// time charged to this cgroup and its descendants since the cgroup was

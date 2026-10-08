@@ -376,7 +376,7 @@ func ReapOrphanedConfineScopes(ctx context.Context, slicePath string, grace time
 }
 
 func reapOrphanedConfineScopesWithDeps(ctx context.Context, slicePath string, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool, deps confineScanDeps) (ConfineReapResult, error) {
-	listed, err := listConfinesWithDeps(ctx, slicePath, nil, deps)
+	listed, err := listConfinesWithDeps(ctx, slicePath, nil, withoutPaneLookup(deps))
 	if err != nil {
 		return ConfineReapResult{}, err
 	}
@@ -669,7 +669,7 @@ func killConfine(ctx context.Context, slicePath, selector, callerOwner string, s
 }
 
 func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, timeout time.Duration, deps confineScanDeps) (ConfineKillResult, error) {
-	listed, err := listConfinesWithDeps(ctx, slicePath, registry, deps)
+	listed, err := listConfinesWithDeps(ctx, slicePath, registry, withoutPaneLookup(deps))
 	if err != nil {
 		return ConfineKillResult{}, err
 	}
