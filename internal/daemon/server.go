@@ -159,6 +159,11 @@ type Server struct {
 	// depending on this host's real, ever-moving CPU counters and core count.
 	readCPUFrame func(string) runner.ConfineCPUFrame
 	readCPUCores func() int
+	// cpuSlotsPerCore is AIRA-283's ratio R: the CPU admission ceiling is
+	// R x NumCPU (cpuCeiling). Set once, in Serve, by resolveCPUSlotsPerCore's own
+	// unconditional record read; NewServer starts it at the default so a server a
+	// test builds without Serve behaves exactly as before AIRA-283.
+	cpuSlotsPerCore int
 	// workerScopeCreate is worker-admit's cgroupfs seam (S15): it makes the
 	// per-worker sub-scope after a grant (production: runner.CreateWorkerScope).
 	// Tests substitute a fake so the grant flow runs without a real delegated
@@ -235,6 +240,7 @@ func NewServer(paths Paths) *Server {
 	}
 	server.projectCond = sync.NewCond(&server.mu)
 	server.confineMode = runner.ConfineModeReal
+	server.cpuSlotsPerCore = runner.DefaultCPUSlotsPerCore
 	// AIRA-268. The machine-wide VRAM budget is read from AIRA_VRAM_BUDGET (a size
 	// string, e.g. "14G") on the daemon's environment. `aira install` does NOT yet
 	// bake this Environment= line into the daemon service (a `--vram-budget` install
@@ -296,6 +302,12 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.confineMode, s.shimBudget = confineMode, budget
+	// AIRA-283. The CPU ceiling's ratio, from the SAME durable record but through
+	// its OWN unconditional read: resolveDaemonConfineMode returns early on the
+	// AIRA_DAEMON_CONFINE_MODE override every shim daemon is started with (E1).
+	s.cpuSlotsPerCore = resolveCPUSlotsPerCore(s.Paths)
+	log.Printf("aira daemon: CPU admission ceiling %d slots (%d per core x %d cores)",
+		s.cpuCeiling(), s.cpuSlotsPerCore, s.cpuCoreCounter()())
 	if s.shimMode() {
 		// AIRA-121 gate condition C12. EVERY cgroup-walking loop is switched off in
 		// shim mode, enumerated rather than assumed:
@@ -379,7 +391,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	lockHeld = true
-	if err := writeLockInfo(lock); err != nil {
+	if err := writeLockInfo(lock, s.cpuSlotsPerCore); err != nil {
 		return err
 	}
 	if err := os.Remove(s.Paths.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {

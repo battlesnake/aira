@@ -751,7 +751,7 @@ type admitRequest struct {
 	// S5. cpu is the declared CPU-core reservation, the second ledger resource. It
 	// is optional on the wire (absent → 0; a lease that declares no cores is charged
 	// none — the confine client sends DefaultConfineCPUCores). A value that exceeds
-	// 2×NumCPU is impossible on this box and is refused fail-fast in admitConnection
+	// R×NumCPU is impossible on this box and is refused fail-fast in admitConnection
 	// before any enqueue (design §7 "RequestInvalid").
 	cpu int64
 	// AIRA-268. vram is the declared GPU-VRAM reservation, the third ledger
@@ -1602,10 +1602,10 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 	// S5 fail-fast (design §7 "RequestInvalid"): a request for more cores than this
-	// box can EVER provide (cpu > 2×NumCPU) is permanently impossible — retrying
+	// box can EVER provide (cpu > R×NumCPU) is permanently impossible — retrying
 	// never helps — so refuse it up front, before any enqueue, rather than queue a
 	// waiter that can never fit and would sit until its max_wait. Placed here rather
-	// than in validateAdmitArgs because the ceiling is machine-specific (2×NumCPU via
+	// than in validateAdmitArgs because the ceiling is machine-specific (R×NumCPU via
 	// the cpuCoreCounter seam), which the pure validator does not have — the same
 	// split reserve uses (RANGE in the validator, CEILING here).
 	//
@@ -2356,7 +2356,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		// S5 CONJUNCTIVE FIT (design §7): admit only if EVERY resource fits — RAM
 		// AND CPU. Both are PER-SLICE ledgers: `available` is RAM (ceiling − Σreserve),
-		// and CPU is this queue's own cpuOutstanding against the 2×NumCPU ceiling. CPU
+		// and CPU is this queue's own cpuOutstanding against the R×NumCPU ceiling. CPU
 		// is treated per slice on the one-slice (aira.slice) assertion (D1); cores are
 		// machine-wide, so if concurrent slices are ever introduced this must become a
 		// sum across slices. grantedAt marks "the daemon just decided this job may
@@ -2542,19 +2542,29 @@ func ledgerAvailable(maximum, outstanding, headroom int64) int64 {
 	return checkedAvailable(0, maximum, 0, outstanding, headroom)
 }
 
-// cpuCeiling is the CPU ceiling: 2 × NumCPU cores (design §7). It is an INTEGER
+// cpuCeiling is the CPU ceiling: R × NumCPU slots (design §7; AIRA-283), where R
+// is the CPU-slots-per-core ratio recorded at install (`aira install
+// --cpu-slots-per-core=R`, default 2) and read once in Serve. It is THE one
+// ceiling function: every consumer (the up-front cpu-too-large refusal, the fit,
+// worker-admit's probe and refusal, the CI dump) follows it. It is an INTEGER
 // derived purely from the core count — no cgroup read, and no cpu.max is ever
-// written; the 2× over-provision caps admission busyness while the kernel
+// written; the R× over-provision caps admission busyness while the kernel
 // time-shares on cpu.weight. The core count comes through the cpuCoreCounter seam
 // so a test can pin a deterministic ceiling. This is the ONLY per-resource code
 // CPU adds — admit/available/fit/release/wake are otherwise resource-agnostic.
 //
 // The ceiling is applied PER SLICE against queue.cpuOutstanding (D1, resolved to
 // per-slice on the one-slice aira.slice assertion). Cores are a machine-wide
-// resource; a second concurrent slice would let Σ across slices exceed 2×NumCPU,
+// resource; a second concurrent slice would let Σ across slices exceed R×NumCPU,
 // so if concurrent slices are ever introduced this must become machine-wide.
 func (s *Server) cpuCeiling() int64 {
-	return 2 * int64(s.cpuCoreCounter()())
+	ratio := s.cpuSlotsPerCore
+	if ratio < runner.MinCPUSlotsPerCore || ratio > runner.MaxCPUSlotsPerCore {
+		// Only a Server literal built without NewServer reaches this; Serve
+		// normalises the recorded ratio before storing it.
+		ratio = runner.DefaultCPUSlotsPerCore
+	}
+	return int64(ratio) * int64(s.cpuCoreCounter()())
 }
 
 // cpuAvailable is the signed CPU-ledger availability, the sibling of
@@ -2981,7 +2991,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	}
 	// S5. cpu is optional (absent → 0 cores, charged nothing). Only STRUCTURAL
 	// validation here — a non-integer or negative value is malformed. The
-	// machine-specific "impossible on this box" refusal (cpu > 2×NumCPU) is
+	// machine-specific "impossible on this box" refusal (cpu > R×NumCPU) is
 	// fail-fast in admitConnection, which has the core count; done there, exactly as
 	// reserve's RANGE is checked here but its CEILING is checked in admitConnection.
 	cpu := int64(0)

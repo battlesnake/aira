@@ -69,7 +69,7 @@ type WorkerAdmitClientRequest struct {
 	Signature      string
 	EstimatedBytes int64
 	// EstimatedCPU is the worker's per-test CPU-core reservation (AIRA-261), charged
-	// against the daemon's per-slice 2×NumCPU cpu ledger. The CLI always sets it (the
+	// against the daemon's per-slice R×NumCPU cpu ledger. The CLI always sets it (the
 	// DefaultConfineCPUCores floor when --estimated-cpu is absent), so the frame carries a
 	// uniform positive value; an absent field on the wire the daemon reads as the floor too.
 	EstimatedCPU int64

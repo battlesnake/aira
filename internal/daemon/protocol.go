@@ -143,7 +143,7 @@ import (
 //
 // ProtocolVersion 13 (was 12): AIRA-261 added estimated_cpu to the worker-admit REQUEST —
 // the per-test @aira_cpu reservation, charged against the daemon's existing per-slice
-// 2×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores. The field is
+// R×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores. The field is
 // OPTIONAL (absent ⇒ the floor), so the wire shape is purely additive; the bump exists so
 // a NEW client that sends estimated_cpu is refused LOUDLY by an OLD proto-12 daemon rather
 // than silently mis-served — an old daemon would ignore the field and charge one core,

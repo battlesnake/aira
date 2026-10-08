@@ -66,7 +66,7 @@ func (result admissionResult) releaseAdmission() {
 // field; delegate_ram removed from the admit allowlist; scope_ceiling dropped from
 // the grant), then 12→13 in LOCKSTEP for AIRA-261's worker-admit wire change
 // (estimated_cpu added to the request — the per-test @aira_cpu reservation, charged
-// against the per-slice 2×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores;
+// against the per-slice R×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores;
 // OPTIONAL, absent ⇒ the floor). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two drift.
 const DaemonProtocolVersion = 14
 
@@ -382,11 +382,11 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// `aira confine` job — INCLUDING a `--delegate-ram` job since S2a collapsed it into
 	// an ordinary confine job (spec §4/§16) — and an `aira confine-reserve` sub-reservation
 	// declare the one-core default (design §9); the daemon charges each against the
-	// per-slice 2×NumCPU ceiling at admission.
+	// per-slice R×NumCPU ceiling at admission.
 	//
 	// aitest pytest workers are bounded too, since S15: they reach the daemon via
 	// worker-admit, which now charges each worker's one core against the SAME per-slice
-	// 2×NumCPU ledger (the worker lease is an ordinary signed-ledger lease). Accounting
+	// R×NumCPU ledger (the worker lease is an ordinary signed-ledger lease). Accounting
 	// only — no cpu.max is written. The S5 `cpu` arg's ProtocolVersion bump landed in S7;
 	// DaemonProtocolVersion and daemon.ProtocolVersion have since moved together to 12
 	// (S2a's worker-admit/confine wire change), in lockstep as this constant's doc requires.

@@ -133,7 +133,7 @@ def _aira_cpu_cores_for_item(item, default):
 
     aira_cpu declares the test's peak internal fork width as an ABSOLUTE core count (unlike
     aira_mem's floor+increment), because the worker's peak CPU demand IS N cores. The
-    dispatcher charges it against the per-slice 2xNumCPU cpu ledger, so a marked test
+    dispatcher charges it against the per-slice R x NumCPU cpu ledger (R = `aira install --cpu-slots-per-core`, default 2), so a marked test
     displaces cores-1 sibling workers while it runs.
     """
     marker = item.get_closest_marker("aira_cpu")

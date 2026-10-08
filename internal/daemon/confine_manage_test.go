@@ -219,6 +219,10 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 				}
 			},
 			func() int { return cpuCores })
+		// AIRA-283: a NON-default CPU-slots-per-core ratio. The `aira top` CPU bar's
+		// total is PHYSICAL cores, never the admission ceiling R x NumCPU, so the
+		// CPUCores expectation below (cpuCores, not 3 x cpuCores) must hold with it.
+		server.cpuSlotsPerCore = 3
 		// A REAL memory.high in the fixture slice, so the default reader's parse is
 		// what produces the "set" state below rather than an injected constant. The
 		// aggregate arm deliberately leaves the file absent and pins "unevaluated",

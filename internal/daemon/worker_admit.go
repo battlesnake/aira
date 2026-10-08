@@ -84,7 +84,7 @@ type workerAdmitRequest struct {
 	estimatedBytes int64
 	// estimatedCPU is the worker's per-test CPU-core reservation (AIRA-261: the
 	// @aira_cpu admission analogue of estimatedBytes), charged against the per-slice
-	// 2×NumCPU cpu ledger. ABSENT on the wire ⇒ DefaultConfineCPUCores (1), so an
+	// R×NumCPU cpu ledger. ABSENT on the wire ⇒ DefaultConfineCPUCores (1), so an
 	// unannotated test and a client that never sends the field both charge one core
 	// exactly as before this wire change.
 	estimatedCPU int64
@@ -394,7 +394,7 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	}
 	// Exceeds-CPU-ceiling fast-fail (AIRA-261), the cpu analogue of the bytes check
 	// above: a per-test @aira_cpu reservation larger than the whole per-slice cpu ledger
-	// (2×NumCPU, cpuCeiling) can never fit, so refuse it up front (terminal,
+	// (R×NumCPU, cpuCeiling) can never fit, so refuse it up front (terminal,
 	// request-invalid) rather than enqueue a waiter that blocks forever. The supervisor's
 	// empty-pool bootstrap special-cases WorkerAdmitReasonExceedsCeiling (mark the test
 	// unevaluated, pop, continue), so an over-ceiling cpu request cannot wedge a run.
