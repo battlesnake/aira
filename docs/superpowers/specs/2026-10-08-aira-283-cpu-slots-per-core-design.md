@@ -1,6 +1,6 @@
 # AIRA-283: CPU slots per core (persisted ratio) and `--aitest-workers=auto`
 
-Status: PLAN v2 (plan-review applied: Sol, Fable code-read; Gemini unavailable; Fable gate PASS_WITH_CHANGES E1-E9). Ticket: AIRA-283. Requested by deploy
+Status: PLAN v3 (owner chose option A on 2026-10-09 after deploy measured no gain from 2 workers/CPU; part b DROPPED, see 3.2). Was PLAN v2 (plan-review applied: Sol, Fable code-read; Gemini unavailable; Fable gate PASS_WITH_CHANGES E1-E9). Ticket: AIRA-283. Requested by deploy
 (fastest.ee merge gate), relaying the owner: "worker count: this would be set on aira,
 not on pytest invocations."
 
@@ -70,22 +70,17 @@ Rejected, with reasons:
 - `--cpu-slots-per-core` and any hand-edited record value bounded at 64 keeps
   `R x NumCPU` far below 2^31 (lease cpu_cores is uint32 on the redeclare wire).
 
-### 3.2 `--aitest-workers=auto` (part b)
+### 3.2 `--aitest-workers=auto` — DROPPED (v3)
 
-- `worker_count` is only a CAP on the pool: the supervisor admits each worker through
-  the daemon's RAM + CPU ledgers and grows the pool once a second
-  (`_maybe_grow_pool`). So under a live daemon `auto` means UNCAPPED: the queue length,
-  governed entirely by the ledgers. No probe, no new coordinate, no wire field, no
-  second ratio on the Python side (E4). The ratio lives only in the daemon.
-- Daemon down: the effective cap is `min(worker_count, max_workers_fallback)` (default
-  1 with a finite parent cap). The one-line stderr note prints that EFFECTIVE cap and
-  why, never `cpu_count` when the real cap is lower (E5).
-- Explicit `--aitest-workers=N` is unchanged. A launch without `--delegate-ram` has no
-  aitest coordinates and still cannot use the option (unchanged, documented).
-- Honest limits, stated in the skill: the 512M-per-worker RAM floor and the RAM ledger
-  may bind first, in which case a higher R buys nothing; extra workers beyond what the
-  ledgers admit simply wait. Default `auto` therefore CHANGES under a live daemon
-  (from `cpu_count` to ledger-governed), which is the point of the ticket.
+deploy measured two full 32-CPU arm64 gates: auto (32 workers) 1331 s, explicit 64
+workers 1366 s (+2.6%), peak memory 56.2 -> 65.7 GB, two extra contention failures. The
+engine pool is not CPU-slot-limited, and the v2 design (auto uncapped, ledger-governed)
+would have turned default `auto` into that regressed run. Owner chose option A: ship the
+install-time ratio only. `auto` is unchanged (host CPU count; every worker is still
+admitted against the RAM and CPU ledgers). The skill says so and quotes the measurement.
+The ratio lives in aira; callers who want more workers pass an explicit N. Revisit an
+admission-driven `auto` only with a RAM-pressure stop rule and evidence of a
+CPU-slot-limited gate.
 
 ### 3.3 Out of scope
 

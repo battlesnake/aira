@@ -1051,10 +1051,9 @@ func TestSkillStatesScopeAndNonGoals(t *testing.T) {
 // verifies: AIRA-283 — the guide states the CPU-slots-per-core ratio (what it is,
 // where it is set, its default and range), the restart rule (the daemon reads it
 // only at start; a ci-shim daemon must be restarted by hand), the refusal of a
-// request larger than the ceiling, and what `--aitest-workers=auto` now means
-// (no cap of its own; the ledgers govern; the fallback cap with the daemon down).
-// The retired "up to the host's CPU count" meaning of auto is pinned as FORBIDDEN.
-func TestSkillTeachesTheCPUSlotsPerCoreRatioAndWhatAutoMeans(t *testing.T) {
+// request larger than the ceiling, and that `--aitest-workers=auto` is still the CPU
+// count and does NOT follow the ratio (a measured 2x pool was no faster).
+func TestSkillTeachesTheCPUSlotsPerCoreRatioAndThatAutoIgnoresIt(t *testing.T) {
 	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
 	if err != nil {
 		t.Fatal(err)
@@ -1080,16 +1079,13 @@ func TestSkillTeachesTheCPUSlotsPerCoreRatioAndWhatAutoMeans(t *testing.T) {
 		}
 		section := aitestSkillSection(t, document.name, document.body)
 		for _, want := range []string{
-			"`--aitest-workers=auto` sets NO worker cap of its own",
-			"RAM and CPU ledgers",
-			"fallback cap",
+			"(up to the host's CPU count)",
+			"does NOT follow the CPU-slots ratio",
+			"was no faster than `auto`",
 		} {
 			if !strings.Contains(section, want) {
 				t.Fatalf("%s aitest section does not state what auto means: missing %q", document.name, want)
 			}
-		}
-		if strings.Contains(document.body, "up to the host's CPU count") {
-			t.Fatalf("%s still says auto means 'up to the host's CPU count' (retired by AIRA-283)", document.name)
 		}
 	}
 }
