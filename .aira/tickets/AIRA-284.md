@@ -37,3 +37,17 @@ abtop is a pure 2 s poller. It pushes nothing and needs no hook for per-session 
 Minimal field set per sample: ts, agent kind, pid + start time, session_id (+ source: pidfile | transcript-scan | rollout-meta), cwd, git branch, model, cli version, input / output / cache_read / cache_write tokens (nullable), context tokens (nullable), turn count, per-field status (ok | absent | unevaluated). Per event: session_start / end, sid_change, model_change, compaction, counter_reset, plus the aira ticket id and from->to transition that coincided.
 
 Held (backlog capture; owner asked for a ticket, not a build). Needs a plan + challenge pass and the spec fork resolved before any build. Source of this analysis: ~/tmp/abtop-src/repo (graykode/abtop @ 4b96568); do not run it.
+
+## Update 2026-10-09: the mod route is the preferred design (verified by a probe)
+
+Claude Code (2.1.294) has a second plugin system, "mods" / function hooks (skill `plugin-authoring`; `claude plugin validate|test`; hot-reloaded from a mods folder or `--plugin-dir`; API marked early access). A mod runs INSIDE the harness and gets pushed, normalised data, so no transcript scraping:
+
+- `$.session.id()` = the transcript file name = the session id (matches `~/.claude/sessions/<pid>.json`); `$.session.model()/cwd()/root()/repo()`.
+- `turn.complete` carries `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `model`), `reason`, `durationMs`, `turnId`, `agentId` (subagents). Per-call usage on `turn.step` results.
+- `session.measure` fires after each turn and when a rate-limit window moves: context tokens/window/percent, `rateLimits` (five_hour, seven_day, with reset times; ACCOUNT-wide), `cost.usd`.
+- `session.start` / `session.end` (reason incl. clear/resume). `classic.Stop` etc. carry `transcript_path`.
+- `$.process.run(argv)` (no shell) / `$.process.spawn` / `$.http.fetch` can call `aira`. No session NAME accessor was found.
+
+Probe (`~/.claude/dev-mods/<session>/aira-usage-probe`, logs ids + counters to ~/tmp/aira-usage-probe.jsonl; tiny, no prompt text) confirmed it works. EVIDENCE vs abtop: for one real turn the mod reported (in 6, out 932, cache_read 1,089,759, cache_write 13,129) which EXACTLY equals the transcript summed once per `message.id` (last usage per id). abtop's per-line sum (no dedupe) gave (10, 1782, 1,824,029, 14,049): 1.9x too many output tokens, 1.7x too many cache reads; over six recent prompts the naive sum overshot 1.3x-2.3x. Transcript scraping the abtop way over-counts on this box; the mod does not.
+
+Resolves the spec fork: a mod is out-of-core and hands aira already-normalised numbers, so "never the transcript / never scrapes" is honoured with no spec amendment. Remaining design: mod -> `aira spend add` (or a small ingest verb) in an aira project; link to ticket transitions by stamping the session id when a ticket is claimed/moved (aira side) rather than from the mod; rate limits are account-wide so log once, not per session; the mod needs the user to install it (`/plugin install ... --marketplace`) and, under `claude -p`, mods may not load; Codex/OpenCode still need their own sources. Unverified: `/clear` and subagent behaviour, `session.end` completing within its short bound, whether `-p` runs load the mod. Still held; needs a plan + challenge pass.
