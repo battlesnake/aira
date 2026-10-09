@@ -197,7 +197,7 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 				return err
 			}
 			if found {
-				if !sameComputePayload(existing, input, buckets, total) {
+				if !sameComputePayload(existing, input, buckets, total, reasoningSubset) {
 					return fmt.Errorf("%s: turn %q already recorded as %s with different counters or model; the first payload stands", domain.ComputeCodeTurnConflict, input.TurnID, existing.ID)
 				}
 				result = ComputeEventAddResult{Event: existing, ID: existing.ID, Duplicate: true}
@@ -266,16 +266,22 @@ func lookupComputeTurn(ctx context.Context, conn *sql.Conn, project string, inpu
 	return event, true, nil
 }
 
-// sameComputePayload compares what a retry could legitimately differ in: it
-// must carry the same model, provider and normalised counters. Ticket stamp,
-// time and git context are NOT compared: a retry is allowed to observe a
-// different lease or clock, and the first stamp stands.
-func sameComputePayload(existing domain.ComputeEvent, input domain.ComputeEventInput, buckets domain.ComputeBuckets, total *int64) bool {
+// sameComputePayload compares everything the caller supplied that is stored and
+// summed or reported: model, provider, the normalised counters, cost_usd, the
+// reasoning-subset flag (it decides whether reasoning adds to output), a
+// declared --ticket, and the phase. A retry that differs in any of them is a
+// conflict, not a duplicate. NOT compared: a ticket resolved from a lease (a
+// retry is allowed to observe a different lease; the first stamp stands), time
+// and git context.
+func sameComputePayload(existing domain.ComputeEvent, input domain.ComputeEventInput, buckets domain.ComputeBuckets, total *int64, reasoningSubset bool) bool {
 	same := func(a, b *int64) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
+	sameCost := (existing.CostUSD == nil) == (input.CostUSD == nil) && (existing.CostUSD == nil || *existing.CostUSD == *input.CostUSD)
 	return existing.Model == input.Model && existing.Provider == input.Provider &&
 		same(existing.Buckets.FreshInput, buckets.FreshInput) && same(existing.Buckets.CacheRead, buckets.CacheRead) &&
 		same(existing.Buckets.CacheWrite, buckets.CacheWrite) && same(existing.Buckets.Output, buckets.Output) &&
-		same(existing.Buckets.Reasoning, buckets.Reasoning) && same(existing.ReportedTotal, total)
+		same(existing.Buckets.Reasoning, buckets.Reasoning) && same(existing.ReportedTotal, total) &&
+		sameCost && existing.ReasoningSubset == reasoningSubset && existing.Phase == input.Phase &&
+		(input.TicketID == "" && existing.TicketStatus != domain.TicketStatusDeclared || existing.TicketID == input.TicketID)
 }
 
 // resolveLiveLeaseTicket stamps a ticket from the leases held by THIS worktree
@@ -387,33 +393,53 @@ func nextComputeNumbers(ctx context.Context, conn *sql.Conn, project string) (in
 // computeModSource is the fixed source of the Claude usage mod (AIRA-284).
 const computeModSource = "claude-mod"
 
+// computePartitions are the two retention pools. The predicates are literals on
+// purpose: SQLite uses a partial index only when the query repeats its WHERE
+// term verbatim, and both pools have one (see store.go), so each pool's cap
+// check is an ordered index walk, not a sort of every project row.
+var computePartitions = [...]string{
+	"source = '" + computeModSource + "'",
+	"source <> '" + computeModSource + "'",
+}
+
 // evictComputeEvents applies the SAME count cap and age cutoff to two
 // partitions: rows with source = claude-mod, and every other row. A per-turn
 // feed can therefore only evict its own rows, and arbitrary --source text
 // cannot mint further pools: the total is bounded by twice the cap.
+//
+// This runs on every Claude turn inside the single-writer transaction, so the
+// cap check must stay cheap: find the at_seq of the first row beyond the cap by
+// walking the pool's partial index, and delete at or below it.
 func (s *Store) evictComputeEvents(ctx context.Context, conn *sql.Conn) (int, error) {
 	evicted := 0
 	cutoff := ""
 	if s.maxComputeAgeDays > 0 {
 		cutoff = time.Now().UTC().AddDate(0, 0, -s.maxComputeAgeDays).Format(time.RFC3339Nano)
 	}
-	for _, partition := range []string{"source = ?", "source <> ?"} {
-		result, err := conn.ExecContext(ctx, `DELETE FROM compute_events WHERE project_id=? AND `+partition+` AND at_seq NOT IN (SELECT at_seq FROM compute_events WHERE project_id=? AND `+partition+` ORDER BY at_seq DESC LIMIT ?)`,
-			s.projectID, computeModSource, s.projectID, computeModSource, s.maxComputeEvents)
-		if err != nil {
+	for _, partition := range computePartitions {
+		var overflowSeq int64
+		err := conn.QueryRowContext(ctx, computeCapProbeSQL(partition), s.projectID, s.maxComputeEvents).Scan(&overflowSeq)
+		switch {
+		case errors.Is(err, sql.ErrNoRows): // at or under the cap
+		case err != nil:
 			return 0, err
-		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return 0, err
-		}
-		evicted += int(count)
-		if cutoff != "" {
-			result, err = conn.ExecContext(ctx, `DELETE FROM compute_events WHERE project_id=? AND `+partition+` AND at < ?`, s.projectID, computeModSource, cutoff)
+		default:
+			result, err := conn.ExecContext(ctx, computeCapDeleteSQL(partition), s.projectID, overflowSeq)
 			if err != nil {
 				return 0, err
 			}
-			count, err = result.RowsAffected()
+			count, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			evicted += int(count)
+		}
+		if cutoff != "" {
+			result, err := conn.ExecContext(ctx, `DELETE FROM compute_events WHERE project_id=? AND `+partition+` AND at < ?`, s.projectID, cutoff)
+			if err != nil {
+				return 0, err
+			}
+			count, err := result.RowsAffected()
 			if err != nil {
 				return 0, err
 			}
@@ -421,6 +447,16 @@ func (s *Store) evictComputeEvents(ctx context.Context, conn *sql.Conn) (int, er
 		}
 	}
 	return evicted, nil
+}
+
+func computeCapDeleteSQL(partition string) string {
+	return `DELETE FROM compute_events WHERE project_id=? AND ` + partition + ` AND at_seq <= ?`
+}
+
+// computeCapProbeSQL selects the at_seq of the newest row BEYOND the cap (the
+// (cap+1)th newest) in one pool; no row means the pool is within its cap.
+func computeCapProbeSQL(partition string) string {
+	return `SELECT at_seq FROM compute_events WHERE project_id=? AND ` + partition + ` ORDER BY at_seq DESC LIMIT 1 OFFSET ?`
 }
 
 const computeSelect = `SELECT id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,head_hash,head_hash_status,head_ref,head_ref_status,worktree_id,worktree_id_status,at_seq,turn_id,ticket_status FROM compute_events`

@@ -68,6 +68,27 @@ func claudeModShippedFiles() (map[string][]byte, error) {
 	return files, nil
 }
 
+// claudeModSubdirs are the two sub-directories the mod's files live in.
+var claudeModSubdirs = []string{".claude-plugin", "hooks"}
+
+// plainClaudeModSubdirs reports, per sub-directory, whether it is a real
+// directory (not a symlink, not a file). lstat on a path BELOW a symlinked
+// sub-directory follows that symlink, so every walk over the shipped files must
+// check this first or it will treat the symlink target's files as aira's own.
+func plainClaudeModSubdirs(d installDeps, dir string) map[string]bool {
+	plain := map[string]bool{}
+	for _, sub := range claudeModSubdirs {
+		info, err := d.lstat(filepath.Join(dir, sub))
+		plain[sub] = err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
+	}
+	return plain
+}
+
+func claudeModSubdirOf(rel string) string {
+	sub, _, _ := strings.Cut(rel, "/")
+	return sub
+}
+
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for key := range m {
@@ -163,7 +184,7 @@ func writeClaudeUsageMod(d installDeps, dir string, dryRun bool) error {
 	if err != nil {
 		return err
 	}
-	for _, sub := range []string{".claude-plugin", "hooks"} {
+	for _, sub := range claudeModSubdirs {
 		if err := d.mkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			return unavailable(fmt.Errorf("create %s: %w", filepath.Join(dir, sub), err))
 		}
@@ -223,7 +244,7 @@ func checkClaudeModTargets(d installDeps, dir string, shipped map[string][]byte)
 			return nil, unavailable(fmt.Errorf("%s exists, is not empty and has no aira marker; refusing to overwrite a directory aira did not write", dir))
 		}
 	}
-	for _, sub := range []string{".claude-plugin", "hooks"} {
+	for _, sub := range claudeModSubdirs {
 		subInfo, subErr := d.lstat(filepath.Join(dir, sub))
 		if errors.Is(subErr, fs.ErrNotExist) {
 			continue
@@ -304,11 +325,18 @@ func removeClaudeUsageMod(d installDeps, dir string, dryRun bool) error {
 	}
 	// Only a path that is BOTH in the shipped set and in the marker is ever
 	// removed, so a doctored marker cannot aim a removal elsewhere.
+	plain := plainClaudeModSubdirs(d, dir)
 	for _, rel := range sortedKeys(shipped) {
 		if marker.Files[rel] == "" {
 			continue
 		}
 		target := filepath.Join(dir, filepath.FromSlash(rel))
+		if sub := claudeModSubdirOf(rel); !plain[sub] {
+			if _, subErr := d.lstat(filepath.Join(dir, sub)); !errors.Is(subErr, fs.ErrNotExist) {
+				d.logf("claude usage mod: left %s (%s is not a plain directory aira wrote; not following it)", target, filepath.Join(dir, sub))
+			}
+			continue
+		}
 		fileInfo, fileErr := d.lstat(target)
 		if errors.Is(fileErr, fs.ErrNotExist) {
 			continue
@@ -326,9 +354,12 @@ func removeClaudeUsageMod(d installDeps, dir string, dryRun bool) error {
 	}
 	// Empty directories go (os.Remove refuses a non-empty one); whatever is left
 	// was not written by aira and is reported.
-	for _, sub := range []string{filepath.Join(dir, ".claude-plugin"), filepath.Join(dir, "hooks"), dir} {
-		_ = d.remove(sub)
+	for _, sub := range claudeModSubdirs {
+		if plain[sub] {
+			_ = d.remove(filepath.Join(dir, sub))
+		}
 	}
+	_ = d.remove(dir)
 	var left []string
 	if _, statErr := d.lstat(dir); statErr == nil {
 		_ = filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -386,7 +417,16 @@ func reportClaudeUsageModStatus(d installDeps) {
 		return
 	}
 	var problems []string
+	plain := plainClaudeModSubdirs(d, dir)
+	for _, sub := range claudeModSubdirs {
+		if _, subErr := d.lstat(filepath.Join(dir, sub)); !plain[sub] && !errors.Is(subErr, fs.ErrNotExist) {
+			problems = append(problems, sub+" is not a plain directory")
+		}
+	}
 	for _, rel := range sortedKeys(shipped) {
+		if sub := claudeModSubdirOf(rel); !plain[sub] {
+			continue
+		}
 		want := marker.Files[rel]
 		target := filepath.Join(dir, filepath.FromSlash(rel))
 		fileInfo, fileErr := d.lstat(target)

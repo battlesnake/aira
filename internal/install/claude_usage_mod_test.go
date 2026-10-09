@@ -469,14 +469,28 @@ func TestClaudeUsageModOffCleanAndForeign(t *testing.T) {
 	if err := os.MkdirAll(modDir(state), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(modDir(state), "register.ts"), []byte("foreign"), 0o644); err != nil {
-		t.Fatal(err)
+	// The foreign files sit at SHIPPED paths (what a user's own mod of the same
+	// name would use), so only the no-marker guard stands between them and a
+	// removal.
+	for _, rel := range []string{"hooks/register.ts", "hooks/hooks.json", ".claude-plugin/plugin.json"} {
+		path := filepath.Join(modDir(state), filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("foreign"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := installMod(t, d, claudeModOff); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(listTree(t, modDir(state)), ","); got != "register.ts" {
+	if got := strings.Join(listTree(t, modDir(state)), ","); got != ".claude-plugin/,.claude-plugin/plugin.json,hooks/,hooks/hooks.json,hooks/register.ts" {
 		t.Fatalf("off touched a foreign directory: %s", got)
+	}
+	for _, rel := range []string{"hooks/register.ts", "hooks/hooks.json", ".claude-plugin/plugin.json"} {
+		if data, _ := os.ReadFile(filepath.Join(modDir(state), filepath.FromSlash(rel))); string(data) != "foreign" {
+			t.Fatalf("%s was removed or rewritten: %q", rel, data)
+		}
 	}
 }
 
@@ -504,6 +518,109 @@ func TestClaudeUsageModOffDoesNotRemoveASymlinkedMarkedPath(t *testing.T) {
 	}
 	if info, err := os.Lstat(hooks); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("the symlink was removed (err=%v)", err)
+	}
+}
+
+// symlinkSubdir replaces the mod's sub-directory with a symlink to a directory
+// holding the user's own copies of the shipped files, and returns that target.
+func symlinkSubdir(t *testing.T, state *fakeInstallState, sub string) string {
+	t.Helper()
+	target := t.TempDir()
+	files := map[string][]string{"hooks": {"register.ts", "hooks.json"}, ".claude-plugin": {"plugin.json"}}[sub]
+	for _, name := range files {
+		if err := os.WriteFile(filepath.Join(target, name), []byte("precious"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(modDir(state), sub)
+	if err := os.RemoveAll(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	return target
+}
+
+func assertSubdirTargetUntouched(t *testing.T, state *fakeInstallState, sub, target string) {
+	t.Helper()
+	entries, err := os.ReadDir(target)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("%s: the symlink target lost its files (entries=%v err=%v)", sub, entries, err)
+	}
+	for _, entry := range entries {
+		if data, _ := os.ReadFile(filepath.Join(target, entry.Name())); string(data) != "precious" {
+			t.Fatalf("%s: %s in the symlink target was rewritten: %q", sub, entry.Name(), data)
+		}
+	}
+	if info, err := os.Lstat(filepath.Join(modDir(state), sub)); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s: the user's symlink was removed or replaced (err=%v)", sub, err)
+	}
+}
+
+// verifies: AIRA-284 §3.6 — a symlinked SUB-directory is refused on install and
+// left alone (with everything under it) by `off` and reported by status; none of
+// them follow it.
+func TestClaudeUsageModSubdirectorySymlinks(t *testing.T) {
+	for _, sub := range []string{"hooks", ".claude-plugin"} {
+		t.Run("install refuses symlinked "+sub, func(t *testing.T) {
+			d, state := newFakeInstall(t)
+			if err := installMod(t, d, claudeModOn); err != nil {
+				t.Fatal(err)
+			}
+			target := symlinkSubdir(t, state, sub)
+			if err := installMod(t, d, claudeModOn); err == nil || !strings.Contains(err.Error(), CodeUnavailable) || !strings.Contains(err.Error(), sub) {
+				t.Fatalf("err=%v, want %s naming %s", err, CodeUnavailable, sub)
+			}
+			assertSubdirTargetUntouched(t, state, sub, target)
+		})
+		t.Run("off leaves symlinked "+sub+" and its files alone", func(t *testing.T) {
+			d, state := newFakeInstall(t)
+			if err := installMod(t, d, claudeModOn); err != nil {
+				t.Fatal(err)
+			}
+			target := symlinkSubdir(t, state, sub)
+			state.logs = nil
+			if err := installMod(t, d, claudeModOff); err != nil {
+				t.Fatal(err)
+			}
+			assertSubdirTargetUntouched(t, state, sub, target)
+			logs := strings.Join(state.logs, "\n")
+			if strings.Contains(logs, "removed "+modDir(state)) || !strings.Contains(logs, sub) {
+				t.Fatalf("off claimed a clean removal / did not report the symlinked %s:\n%s", sub, logs)
+			}
+			// The other (plain) sub-directory's marked file is still ours to remove.
+			other := map[string]string{"hooks": ".claude-plugin/plugin.json", ".claude-plugin": "hooks/hooks.json"}[sub]
+			if _, err := os.Lstat(filepath.Join(modDir(state), filepath.FromSlash(other))); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("off did not remove the marked %s (err=%v)", other, err)
+			}
+		})
+		t.Run("status does not read through symlinked "+sub, func(t *testing.T) {
+			d, state := newFakeInstall(t)
+			if err := installMod(t, d, claudeModOn); err != nil {
+				t.Fatal(err)
+			}
+			// The target holds the IDENTICAL shipped bytes, so only the symlink
+			// check (not the hash) can make status say anything but ok.
+			link := filepath.Join(modDir(state), sub)
+			target := t.TempDir()
+			entries, _ := os.ReadDir(link)
+			for _, entry := range entries {
+				data, _ := os.ReadFile(filepath.Join(link, entry.Name()))
+				if err := os.WriteFile(filepath.Join(target, entry.Name()), data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.RemoveAll(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			if got := statusLines(t, d, state); !strings.Contains(got, "claude usage mod: modified") || strings.Contains(got, "mod: ok") {
+				t.Fatalf("status read through a symlinked %s:\n%s", sub, got)
+			}
+		})
 	}
 }
 

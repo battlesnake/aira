@@ -1116,7 +1116,7 @@ func TestSkillDescribesTheClaudeUsageModInstallFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
-		for _, want := range []string{"--claude-usage-mod", "~/.claude/skills/aira-usage/", "removes only the files aira wrote", "never prompts or file contents", "refused with --stage=start and --status"} {
+		for _, want := range []string{"--claude-usage-mod", "~/.claude/skills/aira-usage/", "removes only the files aira wrote", "never prompts or file contents", "refused with --stage=start and --status", "aira heartbeat", "the session's own worktree"} {
 			if !strings.Contains(body, want) {
 				t.Errorf("%s lacks %q", name, want)
 			}

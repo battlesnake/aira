@@ -89,6 +89,20 @@ nor that the turn happened under that lease; a turn that ran just before a claim
 after a release gets the neighbouring state. The read view and the skill say so. `ticket_status`
 is a new nullable column; legacy rows AND new rows written without `--resolve-ticket` and without `--ticket` read as `unknown` (not `none`).
 
+Two operating conditions follow from "live lease, this worktree", and are written down
+rather than fixed (nothing heartbeats automatically today: `lease.heartbeat_seconds` is
+validated but unused):
+
+- The lease must be kept alive. A lease expires after its TTL (default 900 s) unless the
+  agent runs `aira heartbeat`; a ticket worked for an hour without one reads `none` from
+  minute 15, and `spend ls --by session` then shows that spend in the (session, '', none)
+  group. The skill and `spend add` help tell agents to heartbeat.
+- The lease must be held by the worktree the Claude session was launched in (the mod
+  keys on `$.session.cwd()`). In a workflow where the session runs in the main checkout
+  and the claim is made from a feature worktree, every turn reads `none`. The skill and
+  help say to claim from the session's own worktree. Resolving across worktrees was
+  rejected: it would attribute by guesswork.
+
 The `ticket.update` event is NOT changed. The read view joins nothing on seq or time.
 
 ### 3.4 Retention
@@ -183,4 +197,12 @@ with the user's privileges. Executable-file ownership contract:
   turn (seconds apart); measure.
 - Protocol bump: the runner pins DaemonProtocolVersion, so release notes carry the daemon-restart trap.
 - Per-partition retention changes a shared table's behaviour: a regression test pins it.
+- Yield: attribution depends on agents heartbeating their lease and claiming from the
+  session's own worktree (3.3). Missing either yields honest `none` rows, not wrong ones;
+  the loss is per-ticket coverage. Accepted for v1; an automatic heartbeat or a
+  cross-worktree rule is deferred until the yield is measured.
+- Latency: the per-turn eviction is an ordered walk of a partial index per pool
+  (`compute_events_mod_seq`, `compute_events_other_seq`), measured ~17-30 ms per turn at
+  2 x 20000 rows (it was ~200 ms per pass with a temp B-tree sort), inside the single
+  writer transaction.
 - Trust: opt-in, fixed source, hash-checked, removable.

@@ -98,6 +98,82 @@ func TestComputeTurnConflictRefusesAndFirstPayloadStands(t *testing.T) {
 	}
 }
 
+// A retry that differs in ANY stored, caller-supplied field is a conflict, not a
+// duplicate: cost_usd and reasoning_subset feed the totals, and a declared
+// ticket or phase is what the caller said the turn was.
+func TestComputeTurnConflictCoversEveryCallerSuppliedField(t *testing.T) {
+	ctx := context.Background()
+	cost := func(v float64) *float64 { return &v }
+	subsetInput := func(subset bool) domain.ComputeEventInput {
+		return domain.ComputeEventInput{
+			Model: "gpt-x", Provider: "openai", Source: "claude-mod", Session: "s1", TurnID: "t1",
+			Raw: domain.RawUsage{Buckets: &domain.ComputeBuckets{Output: computeI64(10), Reasoning: computeI64(4)}, ReasoningSubset: subset},
+		}
+	}
+	declared := func(ticket, phase string) domain.ComputeEventInput {
+		in := anthropicTurn("s1", "t1", 10, 5)
+		in.TicketID, in.Phase = ticket, phase
+		return in
+	}
+	withCost := func(c *float64) domain.ComputeEventInput {
+		in := anthropicTurn("s1", "t1", 10, 5)
+		in.CostUSD = c
+		return in
+	}
+	for _, tc := range []struct {
+		name          string
+		first, second domain.ComputeEventInput
+	}{
+		{"cost differs", withCost(cost(1)), withCost(cost(9))},
+		{"cost now absent", withCost(cost(1)), withCost(nil)},
+		{"cost newly present", withCost(nil), withCost(cost(1))},
+		{"reasoning subset newly set", subsetInput(false), subsetInput(true)},
+		{"reasoning subset cleared", subsetInput(true), subsetInput(false)},
+		{"declared ticket differs", declared("AIRA-1", "implement"), declared("AIRA-2", "implement")},
+		{"declared ticket newly given", declared("", ""), declared("AIRA-1", "")},
+		{"phase differs", declared("AIRA-1", "plan"), declared("AIRA-1", "implement")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := turnStore(t, 0, 0)
+			first, err := s.AddComputeEvent(ctx, tc.first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.AddComputeEvent(ctx, tc.second)
+			if ErrorCode(err) != domain.ComputeCodeTurnConflict {
+				t.Fatalf("err=%v code=%q, want %s (a differing retry must not be answered duplicate)", err, ErrorCode(err), domain.ComputeCodeTurnConflict)
+			}
+			rows, err := s.ListComputeEvents("")
+			if err != nil || len(rows) != 1 || rows[0].ID != first.ID {
+				t.Fatalf("first payload did not stand: rows=%+v err=%v", rows, err)
+			}
+		})
+	}
+	t.Run("identical retry of every field is a duplicate", func(t *testing.T) {
+		s, _, _ := turnStore(t, 0, 0)
+		in := declared("AIRA-1", "implement")
+		in.CostUSD = cost(2.5)
+		if _, err := s.AddComputeEvent(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+		dup, err := s.AddComputeEvent(ctx, in)
+		if err != nil || !dup.Duplicate {
+			t.Fatalf("identical retry = %+v err=%v, want duplicate", dup, err)
+		}
+	})
+	t.Run("a retry that drops a declared ticket is a conflict", func(t *testing.T) {
+		s, _, _ := turnStore(t, 0, 0)
+		if _, err := s.AddComputeEvent(ctx, declared("AIRA-1", "")); err != nil {
+			t.Fatal(err)
+		}
+		retry := anthropicTurn("s1", "t1", 10, 5)
+		retry.ResolveTicket = true
+		if _, err := s.AddComputeEvent(ctx, retry); ErrorCode(err) != domain.ComputeCodeTurnConflict {
+			t.Fatalf("err=%v, want %s", err, domain.ComputeCodeTurnConflict)
+		}
+	})
+}
+
 func TestComputeTurnKeyIsPerSourceSessionAgent(t *testing.T) {
 	s, _, _ := turnStore(t, 0, 0)
 	ctx := context.Background()
@@ -456,6 +532,67 @@ func TestComputeRetentionOtherPoolIsBoundedAcrossDistinctSources(t *testing.T) {
 	}
 }
 
+// The cap check runs on every Claude turn inside the single-writer transaction,
+// so it must not sort every project row (measured: ~200 ms per eviction pass at
+// 20000 rows with a temp B-tree). Pin the plan: each pool's probe and delete use
+// that pool's partial index and never a temp B-tree for ORDER BY.
+func TestComputeEvictionUsesPartialIndexNotSort(t *testing.T) {
+	s, _, _ := turnStore(t, 0, 0)
+	for i, partition := range computePartitions {
+		for name, query := range map[string]string{"probe": computeCapProbeSQL(partition), "delete": computeCapDeleteSQL(partition)} {
+			args := []any{s.projectID, 1}
+			rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+query, args...)
+			if err != nil {
+				t.Fatalf("pool %d %s: %v", i, name, err)
+			}
+			var plan []string
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				plan = append(plan, detail)
+			}
+			_ = rows.Close()
+			joined := strings.Join(plan, " | ")
+			if strings.Contains(joined, "TEMP B-TREE") || !strings.Contains(joined, "INDEX "+[]string{"compute_events_mod_seq", "compute_events_other_seq"}[i]) {
+				t.Fatalf("pool %d %s plan = %q, want an ordered partial-index walk with no temp B-tree", i, name, joined)
+			}
+		}
+	}
+}
+
+// Exactly at the cap nothing is evicted; one over evicts exactly the oldest row
+// of that pool and nothing in the other.
+func TestComputeEvictionCapBoundary(t *testing.T) {
+	s, _, _ := turnStore(t, 3, 0)
+	ctx := context.Background()
+	if _, err := s.AddComputeEvent(ctx, computeInput(domain.RawUsage{})); err != nil { // one "other" row, seq 1
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		added, err := s.AddComputeEvent(ctx, anthropicTurn("s1", fmt.Sprintf("t%d", i), 1, 1))
+		if err != nil || added.EvictedCount != 0 {
+			t.Fatalf("add %d at/under the cap: evicted=%d err=%v, want 0", i, added.EvictedCount, err)
+		}
+	}
+	added, err := s.AddComputeEvent(ctx, anthropicTurn("s1", "t3", 1, 1))
+	if err != nil || added.EvictedCount != 1 || added.Remaining != 4 {
+		t.Fatalf("one over the cap: evicted=%d remaining=%d err=%v, want 1 and 4", added.EvictedCount, added.Remaining, err)
+	}
+	rows, _ := s.ListComputeEvents("")
+	var turns []string
+	for _, r := range rows {
+		if r.Source == "claude-mod" {
+			turns = append(turns, r.TurnID)
+		}
+	}
+	if strings.Join(turns, ",") != "t3,t2,t1" || len(rows) != 4 {
+		t.Fatalf("surviving mod turns = %v of %d rows, want t3,t2,t1 and the other row intact", turns, len(rows))
+	}
+}
+
 func TestComputeRetentionAgeCutoffAppliesToBothPartitions(t *testing.T) {
 	for _, inserter := range []string{"claude-mod", "manual"} {
 		t.Run("insert from "+inserter, func(t *testing.T) {
@@ -558,6 +695,55 @@ func TestSpendBySessionSumsPerSessionTicketStatusNullAware(t *testing.T) {
 	}
 	if partial.Output != nil || partial.CacheRead != nil || partial.CacheWrite != nil {
 		t.Fatalf("a bucket with no contributor must stay NULL, not 0: %+v", partial)
+	}
+}
+
+// One session that works two tickets one after the other, both lease-held, must
+// get one group per ticket: a GROUP BY that drops ticket_id would merge them
+// into a fake per-ticket attribution.
+func TestSpendBySessionSplitsTwoTicketsUnderTheSameStatus(t *testing.T) {
+	s, _, _ := turnStore(t, 0, 0)
+	ctx := context.Background()
+	a, b := m3Ticket(t, s, "first"), m3Ticket(t, s, "second")
+	claimA, err := s.Claim(ctx, a.ID, false, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, turn := range []string{"a0", "a1"} {
+		in := resolveInput("s1", turn)
+		in.Raw.InputTokens = computeI64(int64(10 + i))
+		if _, err := s.AddComputeEvent(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Release(ctx, a.ID, claimA.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(ctx, b.ID, false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	inB := resolveInput("s1", "b0")
+	inB.Raw.InputTokens = computeI64(100)
+	if _, err := s.AddComputeEvent(ctx, inB); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.SpendBySession(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("groups = %+v, want one per ticket", got)
+	}
+	byTicket := map[string]ComputeSessionSummary{}
+	for _, row := range got {
+		byTicket[row.TicketID] = row
+	}
+	ga, gb := byTicket[a.ID], byTicket[b.ID]
+	if ga.Turns != 2 || ga.FreshInput == nil || *ga.FreshInput != 21 || ga.TicketStatus != domain.TicketStatusLeaseHeld {
+		t.Fatalf("ticket %s group = %+v, want 2 turns fresh_input 21", a.ID, ga)
+	}
+	if gb.Turns != 1 || gb.FreshInput == nil || *gb.FreshInput != 100 || gb.TicketStatus != domain.TicketStatusLeaseHeld {
+		t.Fatalf("ticket %s group = %+v, want 1 turn fresh_input 100", b.ID, gb)
 	}
 }
 
