@@ -292,8 +292,8 @@ func TestInstallClaudeUsageModRefusesSymlinkedAndForeignTargets(t *testing.T) {
 		if err := os.Symlink(elsewhere, modDir(state)); err != nil {
 			t.Fatal(err)
 		}
-		if err := installMod(t, d, claudeModOn); err == nil || !strings.Contains(err.Error(), CodeUnavailable) {
-			t.Fatalf("err=%v, want %s", err, CodeUnavailable)
+		if err := installMod(t, d, claudeModOn); err == nil || !strings.Contains(err.Error(), CodeUnavailable) || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("err=%v, want %s naming the symlink", err, CodeUnavailable)
 		}
 		if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
 			t.Fatalf("wrote through a symlinked directory: %v", entries)
