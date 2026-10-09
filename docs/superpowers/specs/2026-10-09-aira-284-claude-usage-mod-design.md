@@ -1,6 +1,6 @@
 # AIRA-284: Claude session usage via a harness mod, linked to tickets
 
-Status: PLAN v1 (2026-10-09). Ticket: AIRA-284. Requested by the owner after reviewing
+Status: PLAN v2 (2026-10-09; Sol review BLOCK applied: live-lease only, conflict on mismatched duplicate, two retention pools, install ownership contract, observed-subtotal wording; Gemini noted, read-time resolution rejected because the lease row is overwritten in place). Was PLAN v1. Ticket: AIRA-284. Requested by the owner after reviewing
 `abtop`. Evidence: a probe mod on Claude Code 2.1.294 (reported usage == transcript summed
 once per `message.id`, exactly; `/clear` mints a new session id; subagent turns arrive as
 separate records with `agentId`). Three read-only scouts (aira ingest path, ticket/session
@@ -51,58 +51,79 @@ is the common case and must stay silent and cheap.
 
 ### 3.2 Idempotency (`spend add --turn-id`)
 
-- New column `turn_id TEXT NOT NULL DEFAULT ''` on `compute_events`, added by the existing
-  `ensureColumnAdded` pattern. `CREATE UNIQUE INDEX IF NOT EXISTS ... (project_id, source,
-  session, agent, turn_id) WHERE turn_id <> ''`.
-- A duplicate insert returns the existing row's id with `duplicate:true`; it allocates no
-  counter number, journals no event, touches no retention. Rows without `--turn-id`
-  behave exactly as today.
-- `--turn-id` is a free-text id (bounded length, charset-checked like `--session`).
+- New column `turn_id TEXT NOT NULL DEFAULT ''` on `compute_events` (existing
+  `ensureColumnAdded` pattern) and `CREATE UNIQUE INDEX IF NOT EXISTS ... (project_id,
+  source, session, agent, turn_id) WHERE turn_id <> ''`.
+- `--turn-id` requires a non-empty `--session` (refused otherwise); free text, bounded
+  length, charset-checked like `--session`.
+- A duplicate with IDENTICAL counters returns the existing id with `duplicate:true`: no
+  counter number, no journal event, no retention pass. A duplicate key with DIFFERENT
+  counters or model is refused with a stable code (`E_COMPUTE_TURN_CONFLICT`), never
+  silently accepted; the first payload stands.
+- The guarantee lasts while the row is retained: eviction deletes the key. v1 has no replay
+  source (no offline buffer), so a replay can only be an immediate retry; documented, and a
+  future buffer must bound its replay age below the retention horizon.
+- Rows without `--turn-id` behave exactly as today. Legacy rows keep `turn_id=''`.
+- Protocol: the daemon strictly decodes spend-add payloads, so the new fields bump the wire
+  protocol version (aira has no compat obligation; client and daemon install together).
 
-### 3.3 Ticket resolution at write time
+### 3.3 Ticket association at write time (opt-in `--resolve-ticket`)
 
-When `--ticket` is omitted, the daemon resolves it inside the insert transaction:
+The mod passes `--resolve-ticket`; existing producers (`run` auto-ingest, hand entry) are
+unchanged. With the flag and no `--ticket`, the daemon resolves inside the insert
+transaction, using the SAME liveness test the lease machinery uses (boot id + monotonic
+clock sampled inside the transaction; an expired-but-unreleased `held` row does not count):
 
-| State of this worktree | `ticket_id` | `ticket_status` |
+| Live `held` leases for this worktree | `ticket_id` | `ticket_status` |
 |---|---|---|
-| exactly one `held` lease for this worktree | that ticket | `declared` |
-| no held lease, exactly one worktree binding | that ticket | `declared-binding` |
+| exactly one | that ticket | `lease-held` |
 | none | empty | `none` |
-| two or more candidates | empty | `unevaluated` |
+| two or more | empty | `unevaluated` |
 
-An explicit `--ticket` stays `declared`. `ticket_status` follows the existing
-`value|none|unevaluated` pattern (`worktree_id_status`). The lease row is overwritten in
-place, so the write-time stamp is the only honest record of "who held it then". A lease
-that expired between turns resolves to the binding or `none`, never to a guess.
+Worktree bindings are NOT used (they never expire or unregister, so they would attribute
+spend to a ticket nobody is working). An explicit `--ticket` stays `declared`.
 
-Per-session ticket changes ("session S moved from AIRA-X to AIRA-Y") fall out of the rows:
-group by (session, ticket). The `ticket.update` event itself is NOT changed (its actor stays
-`aira`; no session column). The read view joins nothing on seq or time (`at_seq` comes from a
-different counter than `events.seq`).
+What this claims, and no more: "at ingest time this worktree held a live lease on ticket T".
+It does NOT claim that this session did the work (two Claude sessions can share a worktree),
+nor that the turn happened under that lease; a turn that ran just before a claim or just
+after a release gets the neighbouring state. The read view and the skill say so. `ticket_status`
+is a new nullable column; legacy rows read as `unknown` (not `none`).
+
+The `ticket.update` event is NOT changed. The read view joins nothing on seq or time.
 
 ### 3.4 Retention
 
-The compute table is count-capped (20000, oldest by `at_seq`), shared by all sources: a
-per-turn feed would evict `run`-sourced and hand-entered rows that review-loop economics
-depend on. v1: the cap is applied PER `source` (each source keeps its own newest N), so
-`claude-mod` volume can only evict `claude-mod` rows. Age cutoff unchanged.
+The count cap (20000, oldest by `at_seq`) and the age cutoff are global today; a per-turn
+feed would evict `run`-sourced and hand-entered rows. v1: two bounded pools, `claude-mod`
+and everything else, each with its own count cap and age cutoff, so mod volume can only
+evict mod rows and arbitrary `--source` text cannot create unbounded pools. The mod's source
+value is fixed (`claude-mod`); a caller passing it by hand lands in the mod pool.
 
 ### 3.5 Query
 
-`spend ls` gains `--session`, `--source`, `--agent` filters (today only ticket|phase|
-provider), and `--by session` joins the `--by` list. Enough for "tokens per session per
-ticket" without a new verb.
+`spend ls --session <id>` filter, and `--by session`: sum each of the four buckets per
+(session, ticket), NULL-aware (a bucket with no non-NULL contributor stays NULL, not 0; the
+row carries a count of contributing turns). All totals are labelled OBSERVED subtotals:
+dropped deliveries, missing counters and retention mean they are lower bounds, and "no
+rows" cannot distinguish "never ran" from "mod not loaded". No completeness claim, and no
+"last row time" doctor line in v1. Other filters (`--agent`, `--source`) are deferred.
 
 ### 3.6 Delivery and consent (opt-in)
 
-`aira install --claude-usage-mod` writes the embedded mod to
-`~/.claude/skills/aira-usage/` (the folder pattern the aira skill already uses; auto-loaded
-and watched). Not installed by default: a mod runs with the user's privileges, so it is an
-opt-in trust grant. The install receipt records the mod's sha256; `aira doctor` (or
-`install --status`) re-checks it and reports `modified` if it drifted. `aira install
---claude-usage-mod=off` removes it. `plugin validate` and `plugin test` run in CI over the
-embedded source; a Go test pins the source's allowed-`$`-surface (grep-level: the forbidden
-names above must not appear).
+`aira install --claude-usage-mod` installs the embedded mod to `~/.claude/skills/aira-usage/`
+(manifest at `.claude-plugin/plugin.json`, per the mods reference). Opt-in only: a mod runs
+with the user's privileges. Executable-file ownership contract:
+
+- Files are written atomically (temp file in the same directory, then rename), refusing a
+  symlinked or foreign (not aira-written) target; the directory carries an aira marker file
+  naming the sha256 of each file.
+- `off` and reinstall touch only files listed in the marker; unknown files are left and
+  reported. An ordinary reinstall without the flag preserves an installed mod.
+- The mod invokes aira by the absolute path of the installed binary, recorded at install
+  time (argv, no shell, no PATH lookup), so a PATH-planted `aira` is not run per turn.
+- `install --status` re-hashes against the marker and reports `ok | modified | absent`.
+  A hash check detects drift after the fact; it is not a sandbox, and the forbidden-name
+  grep (below) is a review aid, not proof.
 
 ## 4. Invariants
 
@@ -110,28 +131,35 @@ names above must not appear).
 2. A missing counter is NULL / `unevaluated`, never 0. A turn that was not delivered leaves
    no row (a gap), never a fabricated one.
 3. A duplicate delivery never changes a total.
-4. Ticket attribution is stamped at write time; ambiguity is `unevaluated`, never a pick.
-5. `claude-mod` volume cannot evict other sources' rows.
+4. Ticket association is stamped at write time from a LIVE lease only; ambiguity is `unevaluated`, never a pick; it is never described as session causality.
+5. `claude-mod` volume cannot evict other rows, and the total row count stays bounded.
 6. The mod never changes Claude's behaviour: it returns `next(e)` and swallows its errors.
 
 ## 5. Tests (TDD; each must fail against the wrong implementation)
 
-- Go store: duplicate (project, source, session, agent, turn_id) returns the original id,
-  `duplicate:true`, no new counter number, no journal event; same turn id with a different
-  agent or session inserts. Mutation: drop the unique index => RED.
-- Go: ticket resolution table above, all four rows, plus expired lease, plus explicit
-  `--ticket`. Mutation: pick the first of two candidates => RED.
-- Go: retention per source: 20001 `claude-mod` rows leave 100 `run` rows intact.
-  Mutation: global cap => RED.
-- Go: `--turn-id` charset/length refusal; `spend ls --session/--source/--agent`; `--by
-  session` totals.
-- Go install: flag writes the files, records sha256; `off` removes; a tampered file is
-  reported; `--stage=start`/`--status` rejection like AIRA-283.
-- Go: mod source scan (forbidden `$` names absent; `return next(e)` present on every path).
-- `claude plugin validate` / `claude plugin test` of the embedded mod in a make target that
-  is skipped (reported `unevaluated`, not green) when `claude` is absent.
-- Manual acceptance (recorded in the PR): a real session in an aira worktree produces rows
-  that equal the deduped transcript; a non-aira cwd produces no rows and no visible delay.
+- Store: identical duplicate returns the original id, `duplicate:true`, no counter number, no
+  journal event; same key with different counters => `E_COMPUTE_TURN_CONFLICT`; different
+  agent or session inserts; `--turn-id` without `--session` refused. Mutation: drop the
+  unique index => RED; accept-first-silently => RED.
+- Ticket association: one live lease, none, two live, EXPIRED-held lease (must be `none`),
+  released lease, binding-only (must be `none`), explicit `--ticket`, and no flag (existing
+  producers unchanged). Mutation: count expired leases / fall back to binding / pick first
+  => RED.
+- Retention: 20001 `claude-mod` rows leave 100 other rows intact; unlimited distinct
+  `--source` values stay in one bounded pool; age cutoff per pool. Mutation: global cap => RED.
+- Query: `--by session` sums per (session, ticket), NULL bucket stays NULL, turn count shown;
+  `--session` filter.
+- Wire: protocol version bump; old-shape payload refused with the stable code.
+- Install: atomic write, symlink/foreign-file refusal, marker + sha256, `off` removes only
+  marked files, reinstall preserves, tamper => `modified`, absolute binary path embedded,
+  `--stage=start`/`--status` flag rejection like AIRA-283.
+- Mod runtime (`claude plugin test`, reported `unevaluated` not green when `claude` is
+  absent): payload contains only the allowed fields; non-zero exit and timeout are swallowed;
+  `next(e)` is called exactly once on every path (success, error, timeout); a missing counter
+  is omitted, not 0. Source scan for forbidden `$` names as a review aid.
+- Manual acceptance (recorded in the PR): a real session in an aira worktree yields rows equal
+  to the deduped transcript; a non-aira cwd yields no rows and no visible delay; measured
+  end-of-turn latency added.
 
 ## 6. Deferred (written down on purpose)
 
