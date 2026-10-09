@@ -1,6 +1,6 @@
 # AIRA-284: Claude session usage via a harness mod, linked to tickets
 
-Status: PLAN v2 (2026-10-09; Sol review BLOCK applied: live-lease only, conflict on mismatched duplicate, two retention pools, install ownership contract, observed-subtotal wording; Gemini noted, read-time resolution rejected because the lease row is overwritten in place). Was PLAN v1. Ticket: AIRA-284. Requested by the owner after reviewing
+Status: PLAN v3 (Fable gate PASS_WITH_CHANGES applied: no `--at`, own turn-id validation, group by ticket_status, duplicate lookup before counter, retention wording, binary-path status). Was PLAN v2 (2026-10-09; Sol review BLOCK applied: live-lease only, conflict on mismatched duplicate, two retention pools, install ownership contract, observed-subtotal wording; Gemini noted, read-time resolution rejected because the lease row is overwritten in place). Was PLAN v1. Ticket: AIRA-284. Requested by the owner after reviewing
 `abtop`. Evidence: a probe mod on Claude Code 2.1.294 (reported usage == transcript summed
 once per `message.id`, exactly; `/clear` mints a new session id; subagent turns arrive as
 separate records with `agentId`). Three read-only scouts (aira ingest path, ticket/session
@@ -39,7 +39,7 @@ ids and counters (never prompts, messages, tool arguments, file contents) and ru
 `timeoutMs: 2000`:
 
     aira --scope-dir <cwd> spend add --provider anthropic --model <m> --source claude-mod \
-         --session <sid> --agent <agentId or ""> --turn-id <turnId> --at <UTC RFC3339> \
+         --session <sid> --agent <agentId or ""> --turn-id <turnId> --resolve-ticket \
          [--wall-ms <durationMs>]            # counters on stdin as the four Anthropic fields
 
 Rules: always `return next(e)` unchanged; the whole body is inside try/catch; the mod never
@@ -54,9 +54,9 @@ is the common case and must stay silent and cheap.
 - New column `turn_id TEXT NOT NULL DEFAULT ''` on `compute_events` (existing
   `ensureColumnAdded` pattern) and `CREATE UNIQUE INDEX IF NOT EXISTS ... (project_id,
   source, session, agent, turn_id) WHERE turn_id <> ''`.
-- `--turn-id` requires a non-empty `--session` (refused otherwise); free text, bounded
-  length, charset-checked like `--session`.
-- A duplicate with IDENTICAL counters returns the existing id with `duplicate:true`: no
+- `--turn-id` requires a non-empty `--session` (refused otherwise). Today NO validation exists on `--session`/`--agent`/`--source`/`--at`; this change adds one: `--turn-id`, `--session` and `--agent` (when set) must match `[A-Za-z0-9._:-]{1,128}`, else a stable argument error.
+- `--at` is NOT passed by the mod: the daemon stamps its own clock (ingest is within seconds of turn end). Age eviction compares `at` as RFC3339Nano text, so a caller-supplied non-UTC offset would mis-age rows.
+- The duplicate lookup runs BEFORE the counter number is allocated. A duplicate with IDENTICAL counters returns the existing id with `duplicate:true`: no
   counter number, no journal event, no retention pass. A duplicate key with DIFFERENT
   counters or model is refused with a stable code (`E_COMPUTE_TURN_CONFLICT`), never
   silently accepted; the first payload stands.
@@ -87,22 +87,21 @@ What this claims, and no more: "at ingest time this worktree held a live lease o
 It does NOT claim that this session did the work (two Claude sessions can share a worktree),
 nor that the turn happened under that lease; a turn that ran just before a claim or just
 after a release gets the neighbouring state. The read view and the skill say so. `ticket_status`
-is a new nullable column; legacy rows read as `unknown` (not `none`).
+is a new nullable column; legacy rows AND new rows written without `--resolve-ticket` and without `--ticket` read as `unknown` (not `none`).
 
 The `ticket.update` event is NOT changed. The read view joins nothing on seq or time.
 
 ### 3.4 Retention
 
-The count cap (20000, oldest by `at_seq`) and the age cutoff are global today; a per-turn
-feed would evict `run`-sourced and hand-entered rows. v1: two bounded pools, `claude-mod`
-and everything else, each with its own count cap and age cutoff, so mod volume can only
+The count cap (`maxComputeEvents`, 20000, oldest by `at_seq`) and the age cutoff (`maxComputeAgeDays`) are global today; a per-turn
+feed would evict `run`-sourced and hand-entered rows. v1: the SAME cap and age are applied per partition (`source='claude-mod'` vs everything else), so the total bound is 2x the cap, so mod volume can only
 evict mod rows and arbitrary `--source` text cannot create unbounded pools. The mod's source
 value is fixed (`claude-mod`); a caller passing it by hand lands in the mod pool.
 
 ### 3.5 Query
 
 `spend ls --session <id>` filter, and `--by session`: sum each of the four buckets per
-(session, ticket), NULL-aware (a bucket with no non-NULL contributor stays NULL, not 0; the
+(session, ticket, ticket_status) (empty `ticket_id` covers none/unevaluated/unknown, which must not merge), NULL-aware (a bucket with no non-NULL contributor stays NULL, not 0; the
 row carries a count of contributing turns). All totals are labelled OBSERVED subtotals:
 dropped deliveries, missing counters and retention mean they are lower bounds, and "no
 rows" cannot distinguish "never ran" from "mod not loaded". No completeness claim, and no
@@ -121,7 +120,7 @@ with the user's privileges. Executable-file ownership contract:
   reported. An ordinary reinstall without the flag preserves an installed mod.
 - The mod invokes aira by the absolute path of the installed binary, recorded at install
   time (argv, no shell, no PATH lookup), so a PATH-planted `aira` is not run per turn.
-- `install --status` re-hashes against the marker and reports `ok | modified | absent`.
+- `install --status` re-hashes against the marker and reports `ok | modified | absent`, and `binary: ok | absent` for the recorded aira path (a moved binary would otherwise look like "mod not loaded").
   A hash check detects drift after the fact; it is not a sandbox, and the forbidden-name
   grep (below) is a review aid, not proof.
 
@@ -139,13 +138,13 @@ with the user's privileges. Executable-file ownership contract:
 
 - Store: identical duplicate returns the original id, `duplicate:true`, no counter number, no
   journal event; same key with different counters => `E_COMPUTE_TURN_CONFLICT`; different
-  agent or session inserts; `--turn-id` without `--session` refused. Mutation: drop the
+  agent or session inserts; a duplicate does not burn a CE number (mutation: lookup after allocation => RED); turn-id/session/agent charset validation; `--turn-id` without `--session` refused. Mutation: drop the
   unique index => RED; accept-first-silently => RED.
 - Ticket association: one live lease, none, two live, EXPIRED-held lease (must be `none`),
   released lease, binding-only (must be `none`), explicit `--ticket`, and no flag (existing
   producers unchanged). Mutation: count expired leases / fall back to binding / pick first
   => RED.
-- Retention: 20001 `claude-mod` rows leave 100 other rows intact; unlimited distinct
+- Retention: 20001 `claude-mod` rows leave 100 other rows intact (mutation: drop the `source` filter in the eviction subquery => RED); unlimited distinct
   `--source` values stay in one bounded pool; age cutoff per pool. Mutation: global cap => RED.
 - Query: `--by session` sums per (session, ticket), NULL bucket stays NULL, turn count shown;
   `--session` filter.
@@ -176,12 +175,12 @@ with the user's privileges. Executable-file ownership contract:
 ## 7. Risks
 
 - Mod API is early access and moves between Claude Code releases; a skipped hook is silent.
-  Mitigation: `aira` reports `unevaluated` (no rows) rather than zero; a doctor line shows
-  the last row time per session.
+  Mitigation: `aira` reports `unevaluated` (no rows) rather than zero; no completeness doctor line in v1 (see 3.5).
 - Hook await semantics for `turn.complete` are undocumented: a slow `aira` may delay the end
   of a turn. Mitigation: `timeoutMs: 2000`; measure end-of-turn latency with the real mod
   before release and record the number.
 - Per-call cost: process spawn + git context + daemon round trip per turn. Acceptable per
   turn (seconds apart); measure.
-- Per-source retention changes a shared table's behaviour: a regression test pins it.
+- Protocol bump: the runner pins DaemonProtocolVersion, so release notes carry the daemon-restart trap.
+- Per-partition retention changes a shared table's behaviour: a regression test pins it.
 - Trust: opt-in, fixed source, hash-checked, removable.
