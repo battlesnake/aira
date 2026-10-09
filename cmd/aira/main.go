@@ -790,7 +790,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") || (name == "hold" && (verb == "create" || verb == "new")) {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || ((name == "reasoning-subset" || name == "resolve-ticket") && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") || (name == "hold" && (verb == "create" || verb == "new")) {
 			options[name] = "true"
 			continue
 		}
@@ -850,7 +850,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"find":              {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
 		"req":               {"status": true, "fields": true},
 		"test-report":       {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
-		"spend":             {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
+		"spend":             {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "turn-id": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "resolve-ticket": true, "by": true},
 		"quota":             {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
 		"insights":          {},
 		"lease":             {},
@@ -2848,12 +2848,13 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			if len(positional) != 1 {
 				return core.Request{}, fmt.Errorf("spend add accepts no positional arguments")
 			}
-			for option, argument := range map[string]string{"provider": "provider", "model": "model", "source": "source", "ticket": "ticket", "phase": "phase", "at": "at", "session": "session", "agent": "agent", "total": "total", "cost-usd": "cost-usd"} {
+			for option, argument := range map[string]string{"provider": "provider", "model": "model", "source": "source", "ticket": "ticket", "phase": "phase", "at": "at", "session": "session", "agent": "agent", "turn-id": "turn-id", "total": "total", "cost-usd": "cost-usd"} {
 				if value, ok := options[option]; ok {
 					args[argument] = value
 				}
 			}
 			args["reasoning-subset"] = options["reasoning-subset"] == "true"
+			args["resolve-ticket"] = options["resolve-ticket"] == "true"
 			if value, ok := options["bucket"]; ok {
 				args["bucket"] = splitOptionList(value)
 			}
@@ -2862,6 +2863,9 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				args["query"] = strings.Join(positional[1:], " ")
 			}
 			args["by"] = options["by"]
+			if value, ok := options["session"]; ok {
+				args["session"] = value
+			}
 		default:
 			return core.Request{}, fmt.Errorf("spend requires add|ls")
 		}

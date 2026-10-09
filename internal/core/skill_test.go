@@ -1089,3 +1089,20 @@ func TestSkillTeachesTheCPUSlotsPerCoreRatioAndThatAutoIgnoresIt(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-284 — the generated Skill and agent guide carry the spend honesty
+// caveats (observed subtotal, lease-held meaning) and the new conflict code, so an
+// agent reading only the skill cannot mistake a per-session total for a complete one.
+func TestSkillStatesSpendObservedSubtotalAndLeaseHeldCaveats(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{"OBSERVED subtotal", "lower bound", "never-ran from mod-not-loaded", "lease-held", "does NOT say this session did the work", "E_COMPUTE_TURN_CONFLICT", "--turn-id", "--resolve-ticket", "--by session"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+	}
+}

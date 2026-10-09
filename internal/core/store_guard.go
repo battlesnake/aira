@@ -139,6 +139,9 @@ func (unexpectedCarvedStore) ListComputeEvents(string) ([]domain.ComputeEvent, e
 func (unexpectedCarvedStore) SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error) {
 	return nil, errUnexpectedCarvedStore
 }
+func (unexpectedCarvedStore) SpendBySession(context.Context, string) ([]store.ComputeSessionSummary, error) {
+	return nil, errUnexpectedCarvedStore
+}
 func (unexpectedCarvedStore) AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error) {
 	return store.CommandEventAddResult{}, errUnexpectedCarvedStore
 }
