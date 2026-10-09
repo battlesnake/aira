@@ -624,6 +624,41 @@ func TestClaudeUsageModSubdirectorySymlinks(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-284 §3.6 — a DELETED sub-directory (hooks/ or .claude-plugin/)
+// is reported modified, naming its missing files; a missing subdir is not
+// "nothing to check" (a mod without hooks/ loads nothing, so ok would be a fake
+// pass on the one line that tells "not loaded" from "never ran").
+func TestClaudeUsageModStatusReportsDeletedSubdirectory(t *testing.T) {
+	cases := map[string][]string{
+		"hooks":          {"hooks"},
+		".claude-plugin": {".claude-plugin"},
+		"both":           {"hooks", ".claude-plugin"},
+	}
+	wantMissing := map[string]string{"hooks": "hooks/hooks.json is missing", ".claude-plugin": ".claude-plugin/plugin.json is missing"}
+	for name, subs := range cases {
+		t.Run(name, func(t *testing.T) {
+			d, state := newFakeInstall(t)
+			if err := installMod(t, d, claudeModOn); err != nil {
+				t.Fatal(err)
+			}
+			for _, sub := range subs {
+				if err := os.RemoveAll(filepath.Join(modDir(state), sub)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := statusLines(t, d, state)
+			if !strings.Contains(got, "claude usage mod: modified") || strings.Contains(got, "mod: ok") {
+				t.Fatalf("status after deleting %v:\n%s", subs, got)
+			}
+			for _, sub := range subs {
+				if !strings.Contains(got, wantMissing[sub]) {
+					t.Fatalf("status did not name %q:\n%s", wantMissing[sub], got)
+				}
+			}
+		})
+	}
+}
+
 // verifies: AIRA-284 §3.6 — an ordinary reinstall (no flag) preserves an
 // installed mod, modified or not; only the flag touches it.
 func TestOrdinaryReinstallPreservesTheInstalledMod(t *testing.T) {

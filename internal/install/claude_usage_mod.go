@@ -424,8 +424,13 @@ func reportClaudeUsageModStatus(d installDeps) {
 		}
 	}
 	for _, rel := range sortedKeys(shipped) {
+		// Skip the files under a sub-directory that EXISTS but is not plain
+		// (reported above; never read through it). A MISSING sub-directory
+		// falls through so each of its files is reported "is missing".
 		if sub := claudeModSubdirOf(rel); !plain[sub] {
-			continue
+			if _, subErr := d.lstat(filepath.Join(dir, sub)); !errors.Is(subErr, fs.ErrNotExist) {
+				continue
+			}
 		}
 		want := marker.Files[rel]
 		target := filepath.Join(dir, filepath.FromSlash(rel))
