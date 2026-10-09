@@ -16,6 +16,26 @@ type ComputeEventAddResult struct {
 	ID           string              `json:"id"`
 	EvictedCount int                 `json:"evicted_count"`
 	Remaining    int                 `json:"remaining"`
+	// Duplicate (AIRA-284) is true when --turn-id matched a retained row with
+	// identical counters: Event is that original row and nothing was written.
+	Duplicate bool `json:"duplicate,omitempty"`
+}
+
+// ComputeSessionSummary is one (session, ticket, ticket_status) group of the
+// `spend ls --by session` view. The buckets are present-only SUMs: nil means no
+// contributing turn established that bucket, never an observed zero. Every total
+// is an OBSERVED subtotal (a lower bound): dropped deliveries, missing counters
+// and retention all subtract from it.
+type ComputeSessionSummary struct {
+	Session      string `json:"session"`
+	TicketID     string `json:"ticket_id,omitempty"`
+	TicketStatus string `json:"ticket_status"`
+	Turns        int    `json:"turns"`
+	FreshInput   *int64 `json:"fresh_input,omitempty"`
+	CacheRead    *int64 `json:"cache_read,omitempty"`
+	CacheWrite   *int64 `json:"cache_write,omitempty"`
+	Output       *int64 `json:"output,omitempty"`
+	AtSeq        int64  `json:"at_seq"`
 }
 
 type QuotaSnapshotAddResult struct {
@@ -56,7 +76,7 @@ func (s *Store) SpendByPhase(ctx context.Context, query string) ([]ComputePhaseS
 	where := "project_id=?"
 	args := []any{s.projectID}
 	for _, filter := range filters {
-		column := map[string]string{"ticket": "ticket_id", "phase": "phase", "provider": "provider"}[filter.field]
+		column := map[string]string{"ticket": "ticket_id", "phase": "phase", "provider": "provider", "session": "session"}[filter.field]
 		where += " AND " + column + "=?"
 		args = append(args, filter.value)
 	}
@@ -87,6 +107,51 @@ func (s *Store) SpendByPhase(ctx context.Context, query string) ([]ComputePhaseS
 	return result, nil
 }
 
+// SpendBySession groups by (session, ticket_id, ticket_status) in one read
+// transaction. Empty ticket_id rows are NOT merged across statuses: none,
+// unevaluated and unknown mean different things.
+func (s *Store) SpendBySession(ctx context.Context, query string) ([]ComputeSessionSummary, error) {
+	filters, err := computeFilters(query)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	where := "project_id=?"
+	args := []any{s.projectID}
+	for _, filter := range filters {
+		column := map[string]string{"ticket": "ticket_id", "phase": "phase", "provider": "provider", "session": "session"}[filter.field]
+		where += " AND " + column + "=?"
+		args = append(args, filter.value)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT session,ticket_id,COALESCE(ticket_status,'unknown'),COUNT(*),SUM(fresh_input),SUM(cache_read),SUM(cache_write),SUM(output),MAX(at_seq)
+		FROM compute_events WHERE `+where+` GROUP BY session,ticket_id,COALESCE(ticket_status,'unknown') ORDER BY session,ticket_id,COALESCE(ticket_status,'unknown')`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ComputeSessionSummary
+	for rows.Next() {
+		var summary ComputeSessionSummary
+		var fresh, cacheRead, cacheWrite, output sql.NullInt64
+		if err := rows.Scan(&summary.Session, &summary.TicketID, &summary.TicketStatus, &summary.Turns, &fresh, &cacheRead, &cacheWrite, &output, &summary.AtSeq); err != nil {
+			return nil, err
+		}
+		summary.FreshInput, summary.CacheRead, summary.CacheWrite, summary.Output = nullInt64(fresh), nullInt64(cacheRead), nullInt64(cacheWrite), nullInt64(output)
+		result = append(result, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventInput) (ComputeEventAddResult, error) {
 	input.TicketID = strings.TrimSpace(input.TicketID)
 	input.Phase = strings.TrimSpace(input.Phase)
@@ -96,6 +161,7 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 	input.Session = strings.TrimSpace(input.Session)
 	input.Agent = strings.TrimSpace(input.Agent)
 	input.Source = strings.TrimSpace(input.Source)
+	input.TurnID = strings.TrimSpace(input.TurnID)
 	if input.Model == "" {
 		input.Model = "unknown"
 	}
@@ -123,23 +189,52 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 	input.GitContext = s.crossCheckGitContext(input.GitContext)
 	var result ComputeEventAddResult
 	err := s.withImmediate(ctx, func(conn *sql.Conn) error {
+		// The duplicate lookup runs BEFORE any counter is allocated, so a retry
+		// burns neither a CE number nor an at_seq.
+		if input.TurnID != "" {
+			existing, found, err := lookupComputeTurn(ctx, conn, s.projectID, input)
+			if err != nil {
+				return err
+			}
+			if found {
+				if !sameComputePayload(existing, input, buckets, total) {
+					return fmt.Errorf("%s: turn %q already recorded as %s with different counters or model; the first payload stands", domain.ComputeCodeTurnConflict, input.TurnID, existing.ID)
+				}
+				result = ComputeEventAddResult{Event: existing, ID: existing.ID, Duplicate: true}
+				return conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM compute_events WHERE project_id=?`, s.projectID).Scan(&result.Remaining)
+			}
+		}
+		ticketID, ticketStatus := input.TicketID, ""
+		switch {
+		case input.TicketID != "":
+			ticketStatus = domain.TicketStatusDeclared
+		case input.ResolveTicket:
+			ticketID, ticketStatus = s.resolveLiveLeaseTicket(ctx, conn)
+		}
 		number, sequence, err := nextComputeNumbers(ctx, conn, s.projectID)
 		if err != nil {
 			return err
 		}
 		event := domain.ComputeEvent{
-			ID: fmt.Sprintf("CE-%d", number), TicketID: input.TicketID, Phase: input.Phase,
+			ID: fmt.Sprintf("CE-%d", number), TicketID: ticketID, Phase: input.Phase,
 			Model: input.Model, Provider: input.Provider, At: input.At, Session: input.Session,
 			Agent: input.Agent, Source: input.Source, Resources: cloneResourceUsage(input.Raw.Resources), Buckets: buckets, ReportedTotal: total,
 			CostUSD: cloneFloat64(input.CostUSD), ReasoningSubset: reasoningSubset, Conservation: conservation, AtSeq: sequence,
-			GitContext: domain.ComputeGitContextFrom(input.GitContext),
+			GitContext: domain.ComputeGitContextFrom(input.GitContext), TurnID: input.TurnID, TicketStatus: ticketStatus,
+		}
+		if event.TicketStatus == "" {
+			event.TicketStatus = domain.TicketStatusUnknown
+		}
+		var statusColumn any // NULL = unknown: legacy and unflagged rows
+		if ticketStatus != "" {
+			statusColumn = ticketStatus
 		}
 		git := event.GitContext
-		if _, err := conn.ExecContext(ctx, `INSERT INTO compute_events(project_id,id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,head_hash,head_hash_status,head_ref,head_ref_status,worktree_id,worktree_id_status,at_seq)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.projectID, event.ID, event.TicketID, event.Phase,
+		if _, err := conn.ExecContext(ctx, `INSERT INTO compute_events(project_id,id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,head_hash,head_hash_status,head_ref,head_ref_status,worktree_id,worktree_id_status,at_seq,turn_id,ticket_status)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.projectID, event.ID, event.TicketID, event.Phase,
 			event.Model, event.Provider, event.At, event.Session, event.Agent, event.Source,
 			optionalInt64(event.Buckets.FreshInput), optionalInt64(event.Buckets.CacheRead), optionalInt64(event.Buckets.CacheWrite), optionalInt64(event.Buckets.Output), optionalInt64(event.Buckets.Reasoning), optionalInt64(event.ReportedTotal), optionalFloat64(event.CostUSD), event.Conservation, boolInt(event.ReasoningSubset), optionalInt64(event.Resources.WallMS), optionalInt64(event.Resources.CPUUser), optionalInt64(event.Resources.CPUSys), optionalInt64(event.Resources.PeakRSS),
-			git.HeadHash.Value, git.HeadHash.Status, git.HeadRef.Value, git.HeadRef.Status, git.WorktreeID.Value, git.WorktreeID.Status, event.AtSeq); err != nil {
+			git.HeadHash.Value, git.HeadHash.Status, git.HeadRef.Value, git.HeadRef.Status, git.WorktreeID.Value, git.WorktreeID.Status, event.AtSeq, event.TurnID, statusColumn); err != nil {
 			return err
 		}
 		evicted, err := s.evictComputeEvents(ctx, conn)
@@ -156,6 +251,90 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 		return nil
 	})
 	return result, err
+}
+
+// lookupComputeTurn finds the retained row, if any, holding input's idempotency key.
+func lookupComputeTurn(ctx context.Context, conn *sql.Conn, project string, input domain.ComputeEventInput) (domain.ComputeEvent, bool, error) {
+	event, err := scanComputeEvent(conn.QueryRowContext(ctx, computeSelect+` WHERE project_id=? AND source=? AND session=? AND agent=? AND turn_id=?`,
+		project, input.Source, input.Session, input.Agent, input.TurnID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ComputeEvent{}, false, nil
+	}
+	if err != nil {
+		return domain.ComputeEvent{}, false, err
+	}
+	return event, true, nil
+}
+
+// sameComputePayload compares what a retry could legitimately differ in: it
+// must carry the same model, provider and normalised counters. Ticket stamp,
+// time and git context are NOT compared: a retry is allowed to observe a
+// different lease or clock, and the first stamp stands.
+func sameComputePayload(existing domain.ComputeEvent, input domain.ComputeEventInput, buckets domain.ComputeBuckets, total *int64) bool {
+	same := func(a, b *int64) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
+	return existing.Model == input.Model && existing.Provider == input.Provider &&
+		same(existing.Buckets.FreshInput, buckets.FreshInput) && same(existing.Buckets.CacheRead, buckets.CacheRead) &&
+		same(existing.Buckets.CacheWrite, buckets.CacheWrite) && same(existing.Buckets.Output, buckets.Output) &&
+		same(existing.Buckets.Reasoning, buckets.Reasoning) && same(existing.ReportedTotal, total)
+}
+
+// resolveLiveLeaseTicket stamps a ticket from the leases held by THIS worktree
+// that are live at one clock sample taken inside the insert transaction, using
+// the lease machinery's own HeldLease.IsLive. Exactly one live lease names the
+// ticket; none is "none"; two or more is "unevaluated" (never a pick). Anything
+// that prevents establishing the answer (no clock, a malformed lease row) is
+// "unevaluated" too, so a usage row is kept rather than dropped or guessed.
+// Worktree bindings are deliberately not consulted: they never expire.
+func (s *Store) resolveLiveLeaseTicket(ctx context.Context, conn *sql.Conn) (string, string) {
+	bootID, monoNS, err := s.sampleClock()
+	if err != nil {
+		return "", domain.TicketStatusUnevaluated
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT ticket_id, state, generation, holder_token_hash, boot_id,
+		last_heartbeat_mono_ns, ttl_ns, actor, worktree_id FROM leases WHERE project_id=? AND state='held' AND worktree_id=? ORDER BY ticket_id`, s.projectID, s.worktreeID)
+	if err != nil {
+		return "", domain.TicketStatusUnevaluated
+	}
+	type candidate struct {
+		ticket string
+		row    leaseRow
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.ticket, &c.row.state, &c.row.generation, &c.row.holderTokenHash, &c.row.bootID, &c.row.lastHeartbeatMonoNS, &c.row.ttlNS, &c.row.actor, &c.row.worktree); err != nil {
+			_ = rows.Close()
+			return "", domain.TicketStatusUnevaluated
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", domain.TicketStatusUnevaluated
+	}
+	if err := rows.Close(); err != nil {
+		return "", domain.TicketStatusUnevaluated
+	}
+	live := ""
+	count := 0
+	for _, c := range candidates {
+		lease, err := leaseFromRow(c.ticket, c.row)
+		if err != nil {
+			return "", domain.TicketStatusUnevaluated
+		}
+		held, ok := lease.Held()
+		if ok && held.IsLive(bootID, monoNS) {
+			live, count = c.ticket, count+1
+		}
+	}
+	switch count {
+	case 0:
+		return "", domain.TicketStatusNone
+	case 1:
+		return live, domain.TicketStatusLeaseHeld
+	default:
+		return "", domain.TicketStatusUnevaluated
+	}
 }
 
 func cloneFloat64(value *float64) *float64 {
@@ -205,33 +384,46 @@ func nextComputeNumbers(ctx context.Context, conn *sql.Conn, project string) (in
 	return number, sequence, nil
 }
 
+// computeModSource is the fixed source of the Claude usage mod (AIRA-284).
+const computeModSource = "claude-mod"
+
+// evictComputeEvents applies the SAME count cap and age cutoff to two
+// partitions: rows with source = claude-mod, and every other row. A per-turn
+// feed can therefore only evict its own rows, and arbitrary --source text
+// cannot mint further pools: the total is bounded by twice the cap.
 func (s *Store) evictComputeEvents(ctx context.Context, conn *sql.Conn) (int, error) {
 	evicted := 0
-	result, err := conn.ExecContext(ctx, `DELETE FROM compute_events WHERE project_id=? AND at_seq NOT IN (SELECT at_seq FROM compute_events WHERE project_id=? ORDER BY at_seq DESC LIMIT ?)`, s.projectID, s.projectID, s.maxComputeEvents)
-	if err != nil {
-		return 0, err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	evicted += int(count)
+	cutoff := ""
 	if s.maxComputeAgeDays > 0 {
-		cutoff := time.Now().UTC().AddDate(0, 0, -s.maxComputeAgeDays).Format(time.RFC3339Nano)
-		result, err = conn.ExecContext(ctx, `DELETE FROM compute_events WHERE project_id=? AND at < ?`, s.projectID, cutoff)
+		cutoff = time.Now().UTC().AddDate(0, 0, -s.maxComputeAgeDays).Format(time.RFC3339Nano)
+	}
+	for _, partition := range []string{"source = ?", "source <> ?"} {
+		result, err := conn.ExecContext(ctx, `DELETE FROM compute_events WHERE project_id=? AND `+partition+` AND at_seq NOT IN (SELECT at_seq FROM compute_events WHERE project_id=? AND `+partition+` ORDER BY at_seq DESC LIMIT ?)`,
+			s.projectID, computeModSource, s.projectID, computeModSource, s.maxComputeEvents)
 		if err != nil {
 			return 0, err
 		}
-		count, err = result.RowsAffected()
+		count, err := result.RowsAffected()
 		if err != nil {
 			return 0, err
 		}
 		evicted += int(count)
+		if cutoff != "" {
+			result, err = conn.ExecContext(ctx, `DELETE FROM compute_events WHERE project_id=? AND `+partition+` AND at < ?`, s.projectID, computeModSource, cutoff)
+			if err != nil {
+				return 0, err
+			}
+			count, err = result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			evicted += int(count)
+		}
 	}
 	return evicted, nil
 }
 
-const computeSelect = `SELECT id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,head_hash,head_hash_status,head_ref,head_ref_status,worktree_id,worktree_id_status,at_seq FROM compute_events`
+const computeSelect = `SELECT id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,head_hash,head_hash_status,head_ref,head_ref_status,worktree_id,worktree_id_status,at_seq,turn_id,ticket_status FROM compute_events`
 
 func (s *Store) ListComputeEvents(query string) ([]domain.ComputeEvent, error) {
 	filters, err := computeFilters(query)
@@ -269,7 +461,7 @@ func computeFilters(query string) ([]computeFilter, error) {
 	var result []computeFilter
 	for _, term := range strings.Fields(query) {
 		field, value, ok := strings.Cut(term, ":")
-		if !ok || value == "" || (field != "ticket" && field != "phase" && field != "provider") {
+		if !ok || value == "" || (field != "ticket" && field != "phase" && field != "provider" && field != "session") {
 			return nil, fmt.Errorf("E_SELECTOR_INVALID: invalid compute query %q", term)
 		}
 		result = append(result, computeFilter{field, value})
@@ -287,6 +479,8 @@ func matchesComputeFilters(event domain.ComputeEvent, filters []computeFilter) b
 			value = event.Phase
 		case "provider":
 			value = event.Provider
+		case "session":
+			value = event.Session
 		}
 		if value != filter.value {
 			return false
@@ -300,10 +494,15 @@ func scanComputeEvent(row interface{ Scan(...any) error }) (domain.ComputeEvent,
 	var fresh, cacheRead, cacheWrite, output, reasoning, total sql.NullInt64
 	var wall, cpuUser, cpuSys, peakRSS sql.NullInt64
 	var cost sql.NullFloat64
+	var ticketStatus sql.NullString
 	var subset int
 	if err := row.Scan(&event.ID, &event.TicketID, &event.Phase, &event.Model, &event.Provider, &event.At, &event.Session, &event.Agent, &event.Source, &fresh, &cacheRead, &cacheWrite, &output, &reasoning, &total, &cost, &event.Conservation, &subset, &wall, &cpuUser, &cpuSys, &peakRSS,
-		&event.GitContext.HeadHash.Value, &event.GitContext.HeadHash.Status, &event.GitContext.HeadRef.Value, &event.GitContext.HeadRef.Status, &event.GitContext.WorktreeID.Value, &event.GitContext.WorktreeID.Status, &event.AtSeq); err != nil {
+		&event.GitContext.HeadHash.Value, &event.GitContext.HeadHash.Status, &event.GitContext.HeadRef.Value, &event.GitContext.HeadRef.Status, &event.GitContext.WorktreeID.Value, &event.GitContext.WorktreeID.Status, &event.AtSeq, &event.TurnID, &ticketStatus); err != nil {
 		return domain.ComputeEvent{}, err
+	}
+	event.TicketStatus = domain.TicketStatusUnknown
+	if ticketStatus.Valid {
+		event.TicketStatus = ticketStatus.String
 	}
 	event.ReasoningSubset = subset != 0
 	event.Buckets = domain.ComputeBuckets{FreshInput: nullInt64(fresh), CacheRead: nullInt64(cacheRead), CacheWrite: nullInt64(cacheWrite), Output: nullInt64(output), Reasoning: nullInt64(reasoning)}

@@ -114,7 +114,13 @@ var ExitCodes = map[string]int{
 	// exactRecord/Get callers (list, import-link, relation) keep bare E_NOT_FOUND.
 	"E_TICKET_NOT_IN_WORKTREE": 2,
 	"E_COMPUTE_INVALID":        2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
-	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
+	// AIRA-284. `spend add --turn-id` found a retained row holding the same
+	// (source, session, agent, turn-id) key but with different counters or model.
+	// The request is well formed and the stored row is observable state that
+	// refuses it now, so this is the 1 side of the rule above, like
+	// E_RANT_IDEMPOTENCY_CONFLICT: the first payload stands, nothing is merged.
+	"E_COMPUTE_TURN_CONFLICT": 1,
+	"E_IMPORT_INVALID":        2, "E_ARGUMENT_INVALID": 2,
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_RANT_INVALID": 2, "E_RANT_TOO_LARGE": 2, "E_RANT_REF_INVALID": 2,
 	// AIRA-125 moved this from 2 to 1, splitting it off the E_RANT_* bad-request
