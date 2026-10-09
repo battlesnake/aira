@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-284","project":"aira","title":"Agent session usage log: capture session name/id + token/cache usage alongside ticket state changes (abtop-inspired)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-284","project":"aira","title":"Agent session usage log: capture session name/id + token/cache usage alongside ticket state changes (abtop-inspired)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
 ---
 
 
