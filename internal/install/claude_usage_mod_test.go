@@ -654,3 +654,67 @@ func TestClaudeUsageModStatusIsPartOfRunStatus(t *testing.T) {
 		t.Fatalf("runStatus lacks the mod line:\n%s", got)
 	}
 }
+
+// verifies: AIRA-284 §3.6 — a failure on a FRESH install (the first file's
+// rename) leaves a directory aira can prove is its own: status says modified,
+// and re-running the install repairs it instead of refusing it as foreign.
+func TestFailedFreshInstallIsRepairableByRerunning(t *testing.T) {
+	d, state := newFakeInstall(t)
+	realRename := d.rename
+	failing := true
+	d.rename = func(from, to string) error {
+		if failing && strings.HasSuffix(to, filepath.Join(".claude-plugin", "plugin.json")) {
+			return errors.New("injected rename failure")
+		}
+		return realRename(from, to)
+	}
+	if err := installMod(t, d, claudeModOn); err == nil {
+		t.Fatal("the injected failure was swallowed")
+	}
+	if got := statusLines(t, d, state); !strings.Contains(got, "claude usage mod: modified") {
+		t.Fatalf("a half-installed mod must read modified:\n%s", got)
+	}
+	failing = false
+	if err := installMod(t, d, claudeModOn); err != nil {
+		t.Fatalf("re-running did not repair the half-installed directory: %v", err)
+	}
+	if got := statusLines(t, d, state); !strings.Contains(got, "claude usage mod: ok") {
+		t.Fatalf("after the repair:\n%s", got)
+	}
+}
+
+// verifies: AIRA-284 §3.6 — a directory aira did not write reads `absent`, never
+// `ok`, and a marker that lists a path outside the shipped set cannot aim a
+// removal at it.
+func TestClaudeUsageModForeignDirectoryAndDoctoredMarker(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := os.MkdirAll(modDir(state), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modDir(state), "notes.txt"), []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusLines(t, d, state); !strings.Contains(got, "claude usage mod: absent") || strings.Contains(got, "mod: ok") {
+		t.Fatalf("foreign directory:\n%s", got)
+	}
+	d2, state2 := newFakeInstall(t)
+	if err := installMod(t, d2, claudeModOn); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(state2.home, "outside.txt")
+	if err := os.WriteFile(outside, []byte("precious"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := readMarker(t, state2)
+	marker.Files["../../../outside.txt"] = "00"
+	data, _ := json.Marshal(marker)
+	if err := os.WriteFile(filepath.Join(modDir(state2), claudeModMarkerName), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := installMod(t, d2, claudeModOff); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "precious" {
+		t.Fatal("a doctored marker aimed `off` at a file outside the mod")
+	}
+}
