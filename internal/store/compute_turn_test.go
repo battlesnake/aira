@@ -120,10 +120,23 @@ func TestComputeTurnConflictCoversEveryCallerSuppliedField(t *testing.T) {
 		in.CostUSD = c
 		return in
 	}
+	// Explicit buckets keep every normalisation path out of the way, so each case
+	// below differs from its first call in exactly one field.
+	explicit := func(provider string, total *int64, reasoning *int64) domain.ComputeEventInput {
+		return domain.ComputeEventInput{
+			Model: "claude-x", Provider: provider, Source: "claude-mod", Session: "s1", TurnID: "t1",
+			Raw: domain.RawUsage{Buckets: &domain.ComputeBuckets{FreshInput: computeI64(5), Output: computeI64(5), Reasoning: reasoning}, ReportedTotal: total},
+		}
+	}
 	for _, tc := range []struct {
 		name          string
 		first, second domain.ComputeEventInput
 	}{
+		{"provider differs", explicit("anthropic", nil, nil), explicit("google", nil, nil)},
+		{"reported total differs", explicit("anthropic", computeI64(10), nil), explicit("anthropic", computeI64(11), nil)},
+		{"reported total now absent", explicit("anthropic", computeI64(10), nil), explicit("anthropic", nil, nil)},
+		{"reasoning bucket differs", explicit("anthropic", nil, computeI64(2)), explicit("anthropic", nil, computeI64(3))},
+		{"reasoning bucket newly present", explicit("anthropic", nil, nil), explicit("anthropic", nil, computeI64(3))},
 		{"cost differs", withCost(cost(1)), withCost(cost(9))},
 		{"cost now absent", withCost(cost(1)), withCost(nil)},
 		{"cost newly present", withCost(nil), withCost(cost(1))},
@@ -174,6 +187,32 @@ func TestComputeTurnConflictCoversEveryCallerSuppliedField(t *testing.T) {
 	})
 }
 
+// A duplicate returns before any counter is allocated and before any retention
+// pass: replaying a turn must not evict anything.
+func TestComputeTurnDuplicateRunsNoRetentionPass(t *testing.T) {
+	s, _, _ := turnStore(t, 100, 30)
+	ctx := context.Background()
+	in := anthropicTurn("s1", "t1", 10, 5)
+	if _, err := s.AddComputeEvent(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO compute_events(project_id,id,model,provider,at,source,conservation,at_seq) VALUES(?,?,?,?,?,?,?,?)`,
+		s.projectID, "CE-old", "m", "anthropic", "2020-01-01T00:00:00Z", "claude-mod", "unevaluated", 1000); err != nil {
+		t.Fatal(err)
+	}
+	dup, err := s.AddComputeEvent(ctx, in)
+	if err != nil || !dup.Duplicate {
+		t.Fatalf("replay = %+v err=%v, want duplicate", dup, err)
+	}
+	if dup.EvictedCount != 0 || dup.Remaining != 2 {
+		t.Fatalf("a duplicate ran a retention pass: evicted=%d remaining=%d, want 0 and 2", dup.EvictedCount, dup.Remaining)
+	}
+	rows, _ := s.ListComputeEvents("")
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d after a duplicate, want 2 (the aged row is only evicted by a real insert)", len(rows))
+	}
+}
+
 func TestComputeTurnKeyIsPerSourceSessionAgent(t *testing.T) {
 	s, _, _ := turnStore(t, 0, 0)
 	ctx := context.Background()
@@ -207,6 +246,17 @@ func TestComputeTurnIDRequiresSessionAndHasCharset(t *testing.T) {
 	in = anthropicTurn("s1", "bad turn", 1, 1)
 	if _, err := s.AddComputeEvent(context.Background(), in); ErrorCode(err) != domain.ComputeCodeInvalid {
 		t.Fatalf("turn-id with space err=%v", err)
+	}
+	// A whitespace-only turn-id must be refused, not trimmed to "" (which would
+	// silently turn an idempotent add into a plain, non-idempotent one).
+	for _, blank := range []string{" ", "\t", "  \n "} {
+		in = anthropicTurn("s1", blank, 1, 1)
+		if _, err := s.AddComputeEvent(context.Background(), in); ErrorCode(err) != domain.ComputeCodeInvalid {
+			t.Fatalf("whitespace-only turn-id %q err=%v, want %s", blank, err, domain.ComputeCodeInvalid)
+		}
+	}
+	if rows, _ := s.ListComputeEvents(""); len(rows) != 0 {
+		t.Fatalf("a refused turn-id stored %d rows", len(rows))
 	}
 }
 

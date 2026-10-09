@@ -37,8 +37,9 @@ const (
 	ComputeCodeConservation    = "E_COMPUTE_CONSERVATION"
 	ComputeCodeUnevaluated     = "U_COMPUTE_UNEVALUATED"
 	// ComputeCodeTurnConflict (AIRA-284) is raised when a turn-id that already
-	// exists for (source, session, agent) arrives with different counters or
-	// model. The first payload stands; the retry is refused, never merged.
+	// exists for (source, session, agent) arrives with a different payload
+	// (counters, model, provider, reported total, cost, reasoning subset, declared
+	// ticket or phase). The first payload stands; the retry is refused, never merged.
 	ComputeCodeTurnConflict = "E_COMPUTE_TURN_CONFLICT"
 )
 

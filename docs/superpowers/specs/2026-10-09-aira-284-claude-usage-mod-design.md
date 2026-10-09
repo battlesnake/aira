@@ -57,8 +57,8 @@ is the common case and must stay silent and cheap.
 - `--turn-id` requires a non-empty `--session` (refused otherwise). Today NO validation exists on `--session`/`--agent`/`--source`/`--at`; this change adds one: `--turn-id`, `--session` and `--agent` (when set) must match `[A-Za-z0-9._:-]{1,128}`, else a stable argument error.
 - `--at` is NOT passed by the mod: the daemon stamps its own clock (ingest is within seconds of turn end). Age eviction compares `at` as RFC3339Nano text, so a caller-supplied non-UTC offset would mis-age rows.
 - The duplicate lookup runs BEFORE the counter number is allocated. A duplicate with IDENTICAL counters returns the existing id with `duplicate:true`: no
-  counter number, no journal event, no retention pass. A duplicate key with DIFFERENT
-  counters or model is refused with a stable code (`E_COMPUTE_TURN_CONFLICT`), never
+  counter number, no journal event, no retention pass. A duplicate key whose payload DIFFERS
+  (counters, model, provider, reported total, cost_usd, reasoning subset, declared ticket or phase) is refused with a stable code (`E_COMPUTE_TURN_CONFLICT`), never
   silently accepted; the first payload stands.
 - The guarantee lasts while the row is retained: eviction deletes the key. v1 has no replay
   source (no offline buffer), so a replay can only be an immediate retry; documented, and a
@@ -151,7 +151,7 @@ with the user's privileges. Executable-file ownership contract:
 ## 5. Tests (TDD; each must fail against the wrong implementation)
 
 - Store: identical duplicate returns the original id, `duplicate:true`, no counter number, no
-  journal event; same key with different counters => `E_COMPUTE_TURN_CONFLICT`; different
+  journal event; same key with a different payload (counters, model, provider, total, cost, subset, declared ticket, phase) => `E_COMPUTE_TURN_CONFLICT`; different
   agent or session inserts; a duplicate does not burn a CE number (mutation: lookup after allocation => RED); turn-id/session/agent charset validation; `--turn-id` without `--session` refused. Mutation: drop the
   unique index => RED; accept-first-silently => RED.
 - Ticket association: one live lease, none, two live, EXPIRED-held lease (must be `none`),
@@ -206,3 +206,21 @@ with the user's privileges. Executable-file ownership contract:
   2 x 20000 rows (it was ~200 ms per pass with a temp B-tree sort), inside the single
   writer transaction.
 - Trust: opt-in, fixed source, hash-checked, removable.
+
+## 8. Known limits (accepted for v1, written down on purpose)
+
+- (a) Ticket association keys on the worktree of `$.session.cwd()`. A session launched in
+  the main checkout (or any directory that is not the worktree holding the lease) gets
+  `none` or `unevaluated`, never a guessed ticket.
+- (b) `lease-held` needs a LIVE lease. The lease TTL is 900 s and heartbeats are manual, so
+  long idle work (no `aira heartbeat`) can read `none` for turns that were in fact under a
+  claim.
+- (c) Possible double count: if `aira run --usage` also ingests the same Claude run while
+  the mod is loaded, the same tokens can be recorded twice (different `source`, so the
+  turn-id key does not collapse them). Nothing de-duplicates across sources.
+- (d) Manual acceptance is still to be recorded by the owner-approved install step: real
+  session rows compared with the de-duplicated transcript, and the end-of-turn latency
+  from a non-aira working directory.
+- (e) `aira install --status` reports `ok` even if extra plugin components were added to
+  the managed directory: only the shipped files are re-hashed, and anything else in the
+  directory is unreported (deferred).

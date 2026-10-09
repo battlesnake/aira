@@ -161,6 +161,11 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 	input.Session = strings.TrimSpace(input.Session)
 	input.Agent = strings.TrimSpace(input.Agent)
 	input.Source = strings.TrimSpace(input.Source)
+	// A turn-id is an idempotency key: trimming a blank one to "" would silently
+	// turn an idempotent add into a plain insert, so a blank key is refused.
+	if input.TurnID != "" && strings.TrimSpace(input.TurnID) == "" {
+		return ComputeEventAddResult{}, errors.New(domain.ComputeCodeInvalid + ": turn-id must not be blank")
+	}
 	input.TurnID = strings.TrimSpace(input.TurnID)
 	if input.Model == "" {
 		input.Model = "unknown"
@@ -198,7 +203,7 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 			}
 			if found {
 				if !sameComputePayload(existing, input, buckets, total, reasoningSubset) {
-					return fmt.Errorf("%s: turn %q already recorded as %s with different counters or model; the first payload stands", domain.ComputeCodeTurnConflict, input.TurnID, existing.ID)
+					return fmt.Errorf("%s: turn %q already recorded as %s with a different payload (counters, model, provider, total, cost, reasoning subset, declared ticket or phase); the first payload stands", domain.ComputeCodeTurnConflict, input.TurnID, existing.ID)
 				}
 				result = ComputeEventAddResult{Event: existing, ID: existing.ID, Duplicate: true}
 				return conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM compute_events WHERE project_id=?`, s.projectID).Scan(&result.Remaining)

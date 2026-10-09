@@ -791,6 +791,35 @@ func TestClaudeUsageModStatus(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-284 §3.6 — a marked file replaced by a symlink to a file with
+// IDENTICAL bytes still reads modified: reading through a link would hash equal,
+// so only the lstat check can tell, and a link is not a file aira wrote.
+func TestClaudeUsageModStatusSymlinkToIdenticalBytesIsModified(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := installMod(t, d, claudeModOn); err != nil {
+		t.Fatal(err)
+	}
+	hooks := filepath.Join(modDir(state), "hooks", "hooks.json")
+	same, err := os.ReadFile(hooks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	twin := filepath.Join(t.TempDir(), "twin.json")
+	if err := os.WriteFile(twin, same, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(hooks); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(twin, hooks); err != nil {
+		t.Fatal(err)
+	}
+	got := statusLines(t, d, state)
+	if !strings.Contains(got, "claude usage mod: modified") || strings.Contains(got, "mod: ok") {
+		t.Fatalf("a symlink to identical bytes:\n%s", got)
+	}
+}
+
 // verifies: AIRA-284 §3.6 — a directory aira did not write is reported absent,
 // never ok, and status is part of runStatus.
 func TestClaudeUsageModStatusIsPartOfRunStatus(t *testing.T) {
@@ -853,12 +882,17 @@ func TestClaudeUsageModForeignDirectoryAndDoctoredMarker(t *testing.T) {
 	if err := installMod(t, d2, claudeModOn); err != nil {
 		t.Fatal(err)
 	}
-	outside := filepath.Join(state2.home, "outside.txt")
+	// The traversal key starts with a SHIPPED sub-directory name, so the
+	// sub-directory guard does not skip it: only the shipped-set guard stops it.
+	traversal := "hooks/../../outside.txt"
+	outside := filepath.Join(modDir(state2), filepath.FromSlash(traversal))
 	if err := os.WriteFile(outside, []byte("precious"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	marker := readMarker(t, state2)
-	marker.Files["../../../outside.txt"] = "00"
+	marker.Files[traversal] = "00"
+	// A shipped file the marker does not list is not aira's to remove.
+	delete(marker.Files, "hooks/register.ts")
 	data, _ := json.Marshal(marker)
 	if err := os.WriteFile(filepath.Join(modDir(state2), claudeModMarkerName), data, 0o644); err != nil {
 		t.Fatal(err)
@@ -868,5 +902,8 @@ func TestClaudeUsageModForeignDirectoryAndDoctoredMarker(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(outside); string(got) != "precious" {
 		t.Fatal("a doctored marker aimed `off` at a file outside the mod")
+	}
+	if _, err := os.Stat(filepath.Join(modDir(state2), "hooks", "register.ts")); err != nil {
+		t.Fatalf("`off` removed a shipped file the marker does not list: %v", err)
 	}
 }

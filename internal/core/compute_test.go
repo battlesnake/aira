@@ -214,4 +214,18 @@ func TestSpendLsBySessionAndSessionFilter(t *testing.T) {
 	if spaced.OK || spaced.Code != "E_SELECTOR_INVALID" {
 		t.Fatalf("whitespace session = ok:%v code:%q", spaced.OK, spaced.Code)
 	}
+	// An explicitly empty --session is an ambiguous selector: refused, never
+	// silently read as "no filter" (which would list every session).
+	for _, by := range []string{"", "session"} {
+		empty := c.Do(context.Background(), Request{Verb: "spend", Args: map[string]any{"subverb": "ls", "session": "", "by": by}})
+		if empty.OK || empty.Code != "E_SELECTOR_INVALID" {
+			t.Fatalf("empty --session (by=%q) = ok:%v code:%q, want E_SELECTOR_INVALID", by, empty.OK, empty.Code)
+		}
+	}
+	if absent := c.Do(context.Background(), Request{Verb: "spend", Args: map[string]any{"subverb": "ls"}}); !absent.OK {
+		t.Fatalf("an absent --session must stay valid: %+v", absent)
+	}
+	if !strings.Contains(data.Note, "older aira") || strings.Contains(data.Note, "never asked for a ticket") {
+		t.Fatalf("the unknown definition must cover legacy rows that carry an explicit ticket: %q", data.Note)
+	}
 }

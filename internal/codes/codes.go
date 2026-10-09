@@ -115,7 +115,8 @@ var ExitCodes = map[string]int{
 	"E_TICKET_NOT_IN_WORKTREE": 2,
 	"E_COMPUTE_INVALID":        2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
 	// AIRA-284. `spend add --turn-id` found a retained row holding the same
-	// (source, session, agent, turn-id) key but with different counters or model.
+	// (source, session, agent, turn-id) key but a different payload (counters, model, provider, reported total,
+	// cost_usd, reasoning subset, declared ticket or phase).
 	// The request is well formed and the stored row is observable state that
 	// refuses it now, so this is the 1 side of the rule above, like
 	// E_RANT_IDEMPOTENCY_CONFLICT: the first payload stands, nothing is merged.
