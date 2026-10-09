@@ -509,6 +509,11 @@ func TestSpendBySessionSumsPerSessionTicketStatusNullAware(t *testing.T) {
 	if _, err := s.AddComputeEvent(ctx, resolveInput("s1", "b0")); err != nil {
 		t.Fatal(err)
 	}
+	// s1 again, unflagged: same session and same empty ticket as the none row above,
+	// but unknown must not merge with none.
+	if _, err := s.AddComputeEvent(ctx, anthropicTurn("s1", "u0", 2, 2)); err != nil {
+		t.Fatal(err)
+	}
 	// s2: unflagged (unknown), and one turn lacking the output counter entirely.
 	if _, err := s.AddComputeEvent(ctx, anthropicTurn("s2", "c0", 10, 1)); err != nil {
 		t.Fatal(err)
@@ -528,8 +533,8 @@ func TestSpendBySessionSumsPerSessionTicketStatusNullAware(t *testing.T) {
 	for _, row := range got {
 		byKey[key{row.Session, row.TicketID, row.TicketStatus}] = row
 	}
-	if len(got) != 4 {
-		t.Fatalf("groups = %d (%+v), want 4", len(got), got)
+	if len(got) != 5 {
+		t.Fatalf("groups = %d (%+v), want 5", len(got), got)
 	}
 	held := byKey[key{"s1", ticket.ID, domain.TicketStatusLeaseHeld}]
 	if held.Turns != 2 || held.FreshInput == nil || *held.FreshInput != 6 || held.Output == nil || *held.Output != 8 || held.CacheRead == nil || *held.CacheRead != 2 || held.CacheWrite == nil || *held.CacheWrite != 4 {
@@ -538,6 +543,10 @@ func TestSpendBySessionSumsPerSessionTicketStatusNullAware(t *testing.T) {
 	none := byKey[key{"s1", "", domain.TicketStatusNone}]
 	if none.Turns != 1 {
 		t.Fatalf("s1 none group = %+v (none/unknown/lease-held must not merge)", none)
+	}
+	s1unknown := byKey[key{"s1", "", domain.TicketStatusUnknown}]
+	if s1unknown.Turns != 1 || s1unknown.FreshInput == nil || *s1unknown.FreshInput != 2 {
+		t.Fatalf("s1 unknown group = %+v (unknown must not merge into none)", s1unknown)
 	}
 	unknown := byKey[key{"s2", "", domain.TicketStatusUnknown}]
 	if unknown.Turns != 1 {
