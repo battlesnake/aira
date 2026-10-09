@@ -910,6 +910,15 @@ func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, err
 				return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s does not take a value", name)
 			}
 			options[name] = "true"
+		case "claude-usage-mod":
+			// AIRA-284. Bare installs the mod, =off removes it; nothing else.
+			if hasValue && value != "off" {
+				return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s takes no value, or =off", name)
+			}
+			options[name] = "true"
+			if hasValue {
+				options[name] = value
+			}
 		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core":
 			if !hasValue {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {

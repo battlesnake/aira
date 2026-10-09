@@ -175,6 +175,10 @@ type installOpts struct {
 	// the install-mode record (the daemon's CPU ceiling is R x NumCPU). Zero means
 	// NOT GIVEN, which keeps whatever the existing record holds.
 	cpuSlotsPerCore int
+	// AIRA-284. claudeUsageMod is --claude-usage-mod: "" (not given: an installed
+	// mod is left exactly as it is), claudeModOn (bare flag: install it) or
+	// claudeModOff (=off: remove the files aira wrote).
+	claudeUsageMod string
 }
 
 // AIRA-106. An ABSENT daemon-mode option is now the ZERO VALUE all the way from
@@ -397,6 +401,16 @@ func parseInstallArgs(args []string) (installOpts, error) {
 		}
 		seen[name] = true
 		switch name {
+		case "claude-usage-mod":
+			// AIRA-284. Bare installs the mod; the only value is =off.
+			switch {
+			case !hasValue:
+				opts.claudeUsageMod = claudeModOn
+			case value == "off":
+				opts.claudeUsageMod = claudeModOff
+			default:
+				return opts, argumentInvalid("--claude-usage-mod takes no value, or =off to remove the mod")
+			}
 		case "allow-overcommit", "dry-run", "status":
 			if hasValue {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s does not take a value", name))
@@ -505,13 +519,18 @@ func parseInstallArgs(args []string) (installOpts, error) {
 	}
 	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || opts.ci ||
 		opts.ciValue != "" || opts.stage != "" ||
-		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"] || seen["cpu-slots-per-core"]) {
+		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"] || seen["cpu-slots-per-core"] || seen["claude-usage-mod"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
 	}
 	// AIRA-283 (E8). The start stage never rewrites the install-mode record, so a
 	// ratio given there would be silently ignored: refuse it rather than lie.
 	if opts.stage == installStageStart && seen["cpu-slots-per-core"] {
 		return opts, argumentInvalid("--cpu-slots-per-core cannot be combined with --stage=start: the start stage does not rewrite the install record; pass it at --stage=build (or with no --stage)")
+	}
+	// AIRA-284. The start stage installs nothing a mod could ride on, so the flag
+	// there would be silently ignored: refuse it rather than lie.
+	if opts.stage == installStageStart && seen["claude-usage-mod"] {
+		return opts, argumentInvalid("--claude-usage-mod cannot be combined with --stage=start: the start stage installs no files; pass it at --stage=build (or with no --stage)")
 	}
 	return opts, nil
 }
@@ -787,6 +806,14 @@ func reexecRequestFor(executable string, target installTarget, opts installOpts)
 	if opts.cpuSlotsPerCore != 0 {
 		args = append(args, "--cpu-slots-per-core="+strconv.Itoa(opts.cpuSlotsPerCore))
 	}
+	// AIRA-284. The unprivileged leg owns the user's HOME, so it is the one that
+	// writes (or removes) the mod; forwarded ONLY when given.
+	switch opts.claudeUsageMod {
+	case claudeModOn:
+		args = append(args, "--claude-usage-mod")
+	case claudeModOff:
+		args = append(args, "--claude-usage-mod=off")
+	}
 	// AIRA-106. Each daemon-mode option is forwarded ONLY when it was given
 	// explicitly. Forwarding them unconditionally (as this did) meant the
 	// re-exec'd unprivileged process always saw an explicit flag, so the
@@ -838,7 +865,10 @@ func runInstall(d installDeps, opts installOpts) error {
 		return err
 	}
 	if mode == runner.ConfineModeShim {
-		return runShimInstall(d, opts, report, resolvedBy)
+		if err := runShimInstall(d, opts, report, resolvedBy); err != nil {
+			return err
+		}
+		return installClaudeUsageMod(d, opts)
 	}
 	// --ci=auto that resolved to the real path IS the --ci path from here on: one
 	// code path, one MemAvailable snapshot, and the resolution is reported either
@@ -853,7 +883,10 @@ func runInstall(d installDeps, opts installOpts) error {
 	if d.geteuid() == 0 {
 		return runRootInstall(d, opts)
 	}
-	return runUserInstall(d, opts)
+	if err := runUserInstall(d, opts); err != nil {
+		return err
+	}
+	return installClaudeUsageMod(d, opts)
 }
 
 func runUserInstall(d installDeps, opts installOpts) error {
@@ -2234,6 +2267,7 @@ func runStatus(d installDeps) error {
 	// screenful of absences and conclude the install had failed.
 	reportInstallMode(d)
 	reportCPUSlotsPerCoreStatus(d)
+	reportClaudeUsageModStatus(d)
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	var content, anchorContent, daemonContent, whaleContent []byte
 	var unitErr, anchorErr, daemonErr, whaleErr error

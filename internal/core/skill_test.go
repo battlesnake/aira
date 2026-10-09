@@ -1106,3 +1106,20 @@ func TestSkillStatesSpendObservedSubtotalAndLeaseHeldCaveats(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-284 §3.6 — the generated guide and skill tell an agent the mod is
+// opt-in, where it lands, that =off removes only aira's own files, and what it
+// reports (counters and ids, never prompts or file contents).
+func TestSkillDescribesTheClaudeUsageModInstallFlag(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{"--claude-usage-mod", "~/.claude/skills/aira-usage/", "removes only the files aira wrote", "never prompts or file contents", "refused with --stage=start and --status"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+	}
+}
