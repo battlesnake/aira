@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 
 	"aira/internal/gitcontext"
@@ -35,7 +36,28 @@ const (
 	ComputeCodeProviderUnknown = "E_COMPUTE_PROVIDER_UNKNOWN"
 	ComputeCodeConservation    = "E_COMPUTE_CONSERVATION"
 	ComputeCodeUnevaluated     = "U_COMPUTE_UNEVALUATED"
+	// ComputeCodeTurnConflict (AIRA-284) is raised when a turn-id that already
+	// exists for (source, session, agent) arrives with a different payload
+	// (counters, model, provider, reported total, cost, reasoning subset, declared
+	// ticket or phase). The first payload stands; the retry is refused, never merged.
+	ComputeCodeTurnConflict = "E_COMPUTE_TURN_CONFLICT"
 )
+
+// ticket_status values (AIRA-284). They say HOW a compute row's ticket_id was
+// established, so a reader never has to guess whether an empty id means "no
+// ticket" or "never asked". An empty/NULL stored status reads as Unknown.
+const (
+	TicketStatusLeaseHeld   = "lease-held"
+	TicketStatusNone        = "none"
+	TicketStatusUnevaluated = "unevaluated"
+	TicketStatusDeclared    = "declared"
+	TicketStatusUnknown     = "unknown"
+)
+
+// computeIdentityPattern bounds --turn-id, --session and --agent. The values are
+// compared as text in a unique index and echoed into reports, so the charset is
+// closed rather than sanitised.
+var computeIdentityPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
 var computePhases = map[string]struct{}{
 	"plan": {}, "plan-review": {}, "plan-fix": {}, "implement": {},
@@ -81,6 +103,13 @@ type ComputeEvent struct {
 	Conservation    Conservation      `json:"conservation"`
 	AtSeq           int64             `json:"at_seq"`
 	GitContext      ComputeGitContext `json:"git_context"`
+	// TurnID is the caller's idempotency key (AIRA-284); empty for rows that
+	// were not written with one.
+	TurnID string `json:"turn_id,omitempty"`
+	// TicketStatus says how TicketID was established: one of the TicketStatus*
+	// constants. Rows written before AIRA-284, or without --ticket and
+	// --resolve-ticket, read as "unknown", never "none".
+	TicketStatus string `json:"ticket_status"`
 }
 
 // ComputeGitContext is the lean, status-preserving compute provenance view.
@@ -111,6 +140,14 @@ type ComputeEventInput struct {
 	Raw        RawUsage
 	CostUSD    *float64
 	GitContext gitcontext.GitContext
+	// TurnID (AIRA-284) is an optional idempotency key, unique per
+	// (project, source, session, agent) while the row is retained. It requires
+	// a Session.
+	TurnID string
+	// ResolveTicket (AIRA-284) asks the store to stamp TicketID from the live
+	// lease on this worktree when TicketID is empty. Callers that do not set it
+	// are unchanged.
+	ResolveTicket bool
 }
 
 // ResourceUsage contains process/cgroup observations. Nil means the runner
@@ -226,6 +263,14 @@ func (e ComputeEventInput) Validate() error {
 	if err := ValidatePhase(e.Phase); err != nil {
 		return err
 	}
+	for name, value := range map[string]string{"turn-id": e.TurnID, "session": e.Session, "agent": e.Agent} {
+		if value != "" && !computeIdentityPattern.MatchString(value) {
+			return fmt.Errorf("%s: %s must match [A-Za-z0-9._:-]{1,128}", ComputeCodeInvalid, name)
+		}
+	}
+	if e.TurnID != "" && e.Session == "" {
+		return errors.New(ComputeCodeInvalid + ": turn-id requires a session")
+	}
 	if e.CostUSD != nil && (*e.CostUSD < 0 || math.IsNaN(*e.CostUSD) || math.IsInf(*e.CostUSD, 0)) {
 		return errors.New(ComputeCodeInvalid + ": cost_usd must be finite and non-negative")
 	}
@@ -241,8 +286,21 @@ func (e ComputeEvent) Validate() error {
 	if e.ID == "" || e.At == "" || e.AtSeq < 1 {
 		return errors.New(ComputeCodeInvalid + ": compute event identity is incomplete")
 	}
-	if err := (ComputeEventInput{TicketID: e.TicketID, Phase: e.Phase, Model: e.Model, Provider: e.Provider, At: e.At, Session: e.Session, Agent: e.Agent, Source: e.Source, Raw: RawUsage{Resources: e.Resources}, CostUSD: e.CostUSD}).Validate(); err != nil {
+	if err := (ComputeEventInput{TicketID: e.TicketID, Phase: e.Phase, Model: e.Model, Provider: e.Provider, At: e.At, Session: e.Session, Agent: e.Agent, Source: e.Source, Raw: RawUsage{Resources: e.Resources}, CostUSD: e.CostUSD, TurnID: e.TurnID}).Validate(); err != nil {
 		return err
+	}
+	switch e.TicketStatus {
+	case "", TicketStatusUnknown:
+	case TicketStatusLeaseHeld, TicketStatusDeclared:
+		if e.TicketID == "" {
+			return fmt.Errorf("%s: ticket_status %s requires a ticket_id", ComputeCodeInvalid, e.TicketStatus)
+		}
+	case TicketStatusNone, TicketStatusUnevaluated:
+		if e.TicketID != "" {
+			return fmt.Errorf("%s: ticket_status %s forbids a ticket_id", ComputeCodeInvalid, e.TicketStatus)
+		}
+	default:
+		return fmt.Errorf("%s: invalid ticket_status %q", ComputeCodeInvalid, e.TicketStatus)
 	}
 	if err := validateBuckets(e.Buckets); err != nil {
 		return err

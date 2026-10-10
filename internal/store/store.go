@@ -1123,6 +1123,32 @@ func (s *Store) initDB(ctx context.Context) error {
 			return err
 		}
 	}
+	// AIRA-284: turn_id is the idempotency key, ticket_status says how ticket_id
+	// was established. ticket_status is NULLABLE on purpose: NULL (legacy rows and
+	// writes that asked for neither --ticket nor --resolve-ticket) reads as
+	// "unknown", which must never be confused with a resolved "none".
+	for _, column := range []struct{ name, definition string }{
+		{"turn_id", `turn_id TEXT NOT NULL DEFAULT ''`},
+		{"ticket_status", `ticket_status TEXT CHECK(ticket_status IS NULL OR ticket_status IN ('lease-held','none','unevaluated','declared'))`},
+	} {
+		if err := s.ensureColumnAdded(ctx, "compute_events", column.name, `ALTER TABLE compute_events ADD COLUMN `+column.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS compute_events_turn_key ON compute_events(project_id, source, session, agent, turn_id) WHERE turn_id <> ''`); err != nil {
+		return translateDBError(err)
+	}
+	// AIRA-284: one partial index per retention pool so the per-turn count-cap
+	// check is an ordered walk (see evictComputeEvents). The WHERE terms must
+	// match computePartitions exactly.
+	for _, index := range []string{
+		`CREATE INDEX IF NOT EXISTS compute_events_mod_seq ON compute_events(project_id, at_seq) WHERE ` + computePartitions[0],
+		`CREATE INDEX IF NOT EXISTS compute_events_other_seq ON compute_events(project_id, at_seq) WHERE ` + computePartitions[1],
+	} {
+		if _, err := s.db.ExecContext(ctx, index); err != nil {
+			return translateDBError(err)
+		}
+	}
 	if err := s.ensureAreaHintsGeneration(ctx); err != nil {
 		return err
 	}

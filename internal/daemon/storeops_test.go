@@ -381,3 +381,44 @@ func TestRegisterWorktreeBindingStoreOpEnvelopeIsValidated(t *testing.T) {
 		t.Fatalf("a well-formed frame was rejected: %v", err)
 	}
 }
+
+// verifies: AIRA-284 — the 14→15 bump. The turn-id / resolve-ticket fields cross the
+// strictly-decoded add-compute-event payload, the duplicate verdict crosses back, and a
+// proto-14 frame carrying the same op is refused loudly.
+func TestStoreOpComputeTurnIDAndResolveTicketCrossTheWire(t *testing.T) {
+	server, scope := storeOpTestServer(t)
+	one := int64(1)
+	input := domain.ComputeEventInput{
+		Model: "claude-x", Provider: "anthropic", Source: "claude-mod", Session: "s1", TurnID: "t1", ResolveTicket: true,
+		Raw: domain.RawUsage{InputTokens: &one, CacheReadInputTokens: &one, CacheCreationInputTokens: &one, OutputTokens: &one},
+	}
+	send := func(frame StoreOpFrame) (ResponseFrame, store.ComputeEventAddResult) {
+		response := exchangeStoreOpOverPipe(t, server, frame)
+		var result store.ComputeEventAddResult
+		if response.OK {
+			if err := json.Unmarshal(response.Data, &result); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return response, result
+	}
+	frame := StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: "add-compute-event", Payload: payloadForTest(t, input)}
+	first, firstResult := send(frame)
+	if !first.OK || firstResult.Duplicate || firstResult.Event.TurnID != "t1" || firstResult.Event.TicketStatus != domain.TicketStatusNone {
+		t.Fatalf("first = %+v result=%+v (turn id lost, or resolve-ticket ignored)", first, firstResult)
+	}
+	second, secondResult := send(frame)
+	if !second.OK || !secondResult.Duplicate || secondResult.ID != firstResult.ID {
+		t.Fatalf("second = %+v result=%+v, want the duplicate verdict across the wire", second, secondResult)
+	}
+	conflicting := input
+	conflicting.Raw.OutputTokens = func() *int64 { v := int64(2); return &v }()
+	refused := exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: "add-compute-event", Payload: payloadForTest(t, conflicting)})
+	if refused.OK || refused.Code != domain.ComputeCodeTurnConflict {
+		t.Fatalf("conflict response = %+v, want %s", refused, domain.ComputeCodeTurnConflict)
+	}
+	old := exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion - 1, Scope: scope, Op: "add-compute-event", Payload: payloadForTest(t, input)})
+	if old.OK || old.Code != CodeProtocol {
+		t.Fatalf("proto-%d store-op response = %+v, want %s", ProtocolVersion-1, old, CodeProtocol)
+	}
+}

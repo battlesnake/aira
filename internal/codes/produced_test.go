@@ -402,6 +402,7 @@ func TestStateConflictCodesExitOne(t *testing.T) {
 		"E_PREFIX_OWNERSHIP_CONFLICT": 1, // ...and this one, raised by the same PreflightAdoption call.
 		"E_WRITE_CONFLICT":            1, // E_RANT_IDEMPOTENCY_CONFLICT is the same stored-state conflict.
 		"E_RUN_TELEMETRY_CONFLICT":    1, // ...as is this one, which named the rant code as the precedent it declined.
+		"E_COMPUTE_TURN_CONFLICT":     1, // AIRA-284: a retained turn-id row refuses a retry carrying different counters.
 	}
 	for code, exit := range family {
 		catalogued, ok := ExitCodes[code]

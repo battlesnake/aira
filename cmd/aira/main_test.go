@@ -349,6 +349,38 @@ func TestSpendRequestPreservesRepeatedBuckets(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-284 — --turn-id and --resolve-ticket (a value-less boolean flag) reach
+// the request, and spend ls takes --session.
+func TestSpendRequestCarriesTurnIDResolveTicketAndSession(t *testing.T) {
+	positional, options, err := parseArgs("spend", []string{"add", "--provider", "anthropic", "--model", "m", "--source", "claude-mod", "--session", "s1", "--turn-id", "t1", "--resolve-ticket", "--bucket", "output=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("spend", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["turn-id"] != "t1" || request.Args["resolve-ticket"] != true || request.Args["session"] != "s1" {
+		t.Fatalf("spend add request = %#v", request.Args)
+	}
+	positional, options, err = parseArgs("spend", []string{"add", "--provider", "anthropic", "--model", "m", "--source", "x", "--bucket", "output=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err = buildRequest("spend", positional, options)
+	if err != nil || request.Args["resolve-ticket"] != false {
+		t.Fatalf("unflagged add request = %#v err=%v, want resolve-ticket false", request.Args, err)
+	}
+	positional, options, err = parseArgs("spend", []string{"ls", "--session", "s1", "--by", "session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err = buildRequest("spend", positional, options)
+	if err != nil || request.Args["session"] != "s1" || request.Args["by"] != "session" {
+		t.Fatalf("spend ls request = %#v err=%v", request.Args, err)
+	}
+}
+
 func TestGrepRequestParsesQueryAndOptions(t *testing.T) {
 	positional, options, err := parseArgs("grep", []string{`alpha AND beta`, "--kind", "finding", "--by", "kind", "--fields", "id,snippet"})
 	if err != nil {

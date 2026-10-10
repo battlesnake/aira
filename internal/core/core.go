@@ -171,6 +171,7 @@ type Store interface {
 	AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
 	ListComputeEvents(string) ([]domain.ComputeEvent, error)
 	SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error)
+	SpendBySession(context.Context, string) ([]store.ComputeSessionSummary, error)
 	AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error)
 	ListCommandEvents(string) ([]domain.CommandEvent, error)
 	CommandDistribution(string, string) (store.CommandDistributionResult, error)
@@ -1251,12 +1252,13 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("subverb", true, true, "Command telemetry operation", "ls", "count"), stringSpec("query", false, true, "Command event query"), stringSpec("by", false, false, "Distribution field", "program", "key", "status", "branch", "ticket"),
 		}, MCPTool: "aira_commands", MCPOperation: "subverb", Run: c.runCommands},
 		"spend": {Name: "spend", Usage: "spend add|ls ...", Args: []ArgSpec{
-			stringSpec("subverb", true, true, "Spend operation", "add", "ls"), stringSpec("provider", false, false, "LLM provider"), stringSpec("model", false, false, "Model"), stringSpec("source", false, false, "Ingest source"), stringSpec("ticket", false, false, "Ticket ID"), stringSpec("phase", false, false, "Work phase"), stringSpec("at", false, false, "Timestamp"), stringSpec("session", false, false, "Session"), stringSpec("agent", false, false, "Agent"), stringSpec("total", false, false, "Reported total"), stringSpec("cost-usd", false, false, "Caller-supplied cost"), stringSpec("query", false, false, "Event query"), stringSpec("by", false, false, "Live distribution field"), boolSpec("reasoning-subset", false, false, "Reasoning is a subset of output"), listSpec("bucket", false, false, "Explicit disjoint bucket K=V"), stringSpec("raw", false, false, "Provider usage payload"), stringSpec("usage-file", false, false, "Provider usage file"),
+			stringSpec("subverb", true, true, "Spend operation", "add", "ls"), stringSpec("provider", false, false, "LLM provider"), stringSpec("model", false, false, "Model"), stringSpec("source", false, false, "Ingest source"), stringSpec("ticket", false, false, "Ticket ID"), stringSpec("phase", false, false, "Work phase"), stringSpec("at", false, false, "Timestamp"), stringSpec("session", false, false, "Session (add: the session id; ls: filter to this session)"), stringSpec("agent", false, false, "Agent"), stringSpec("turn-id", false, false, "Idempotency key for add: unique per source+session+agent while the row is retained; needs --session; [A-Za-z0-9._:-]{1,128}"), boolSpec("resolve-ticket", false, false, "Add: when no --ticket, stamp the ticket from the one LIVE lease this worktree holds (ticket_status lease-held), else none/unevaluated"), stringSpec("total", false, false, "Reported total"), stringSpec("cost-usd", false, false, "Caller-supplied cost"), stringSpec("query", false, false, "Event query"), stringSpec("by", false, false, "Live distribution field; session sums the four buckets per session+ticket+ticket_status as OBSERVED subtotals"), boolSpec("reasoning-subset", false, false, "Reasoning is a subset of output"), listSpec("bucket", false, false, "Explicit disjoint bucket K=V"), stringSpec("raw", false, false, "Provider usage payload"), stringSpec("usage-file", false, false, "Provider usage file"),
 		}, MCPTool: "aira_spend", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			store, ok := c.store.(interface {
 				AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
 				ListComputeEvents(string) ([]domain.ComputeEvent, error)
 				SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error)
+				SpendBySession(context.Context, string) ([]store.ComputeSessionSummary, error)
 			})
 			if !ok {
 				return nil, errors.New("E_COMPUTE_INVALID: compute store is unavailable")
@@ -1268,7 +1270,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if err != nil {
 					return nil, err
 				}
-				input := domain.ComputeEventInput{TicketID: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Model: stringArg(args, "model"), Provider: stringArg(args, "provider"), At: stringArg(args, "at"), Session: stringArg(args, "session"), Agent: stringArg(args, "agent"), Source: stringArg(args, "source"), Raw: raw}
+				input := domain.ComputeEventInput{TicketID: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Model: stringArg(args, "model"), Provider: stringArg(args, "provider"), At: stringArg(args, "at"), Session: stringArg(args, "session"), Agent: stringArg(args, "agent"), Source: stringArg(args, "source"), Raw: raw,
+					TurnID: stringArg(args, "turn-id"), ResolveTicket: boolArg(args, "resolve-ticket")}
 				if cost, present, err := optionalFloatArg(args, "cost-usd"); err != nil {
 					return nil, err
 				} else if present {
@@ -1284,8 +1287,29 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				}
 				return handlerData{Data: result, Warnings: warnings}, nil
 			case "ls", "list":
+				query := stringArg(args, "query")
+				if args.present("session") && strings.TrimSpace(stringArg(args, "session")) == "" {
+					return nil, errors.New("E_SELECTOR_INVALID: --session must not be empty (omit it to list every session)")
+				}
+				if session := stringArg(args, "session"); session != "" {
+					if strings.ContainsAny(session, " \t\r\n") {
+						return nil, fmt.Errorf("E_SELECTOR_INVALID: --session %q must not contain whitespace", session)
+					}
+					query = strings.TrimSpace(query + " session:" + session)
+				}
+				if by := stringArg(args, "by"); by == "session" {
+					rows, err := store.SpendBySession(ctx, query)
+					if err != nil {
+						return nil, err
+					}
+					turns := 0
+					for _, row := range rows {
+						turns += row.Turns
+					}
+					return map[string]any{"total": turns, "rows": rows, "basis": spendObservedBasis, "note": spendObservedNote}, nil
+				}
 				if by := stringArg(args, "by"); by == "phase" {
-					rows, err := store.SpendByPhase(ctx, stringArg(args, "query"))
+					rows, err := store.SpendByPhase(ctx, query)
 					if err != nil {
 						return nil, err
 					}
@@ -1295,7 +1319,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					}
 					return map[string]any{"total": total, "rows": rows}, nil
 				}
-				rows, err := store.ListComputeEvents(stringArg(args, "query"))
+				rows, err := store.ListComputeEvents(query)
 				if err != nil {
 					return nil, err
 				}
@@ -2108,7 +2132,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// AIRA-62 and were simply never described.) Omitting a mode flag PRESERVES
 		// whatever the installed unit declares rather than resetting it, which is
 		// why each description says so.
-		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--cpu-slots-per-core R] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
+		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--cpu-slots-per-core R] [--claude-usage-mod[=off]] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
 			stringSpec("memory_max", false, false, "aira.slice MemoryMax (<N>G)"),
 			boolSpec("ci", false, false, "Dedicated CI worker: size MemoryMax from a one-time MemAvailable snapshot with zero headroom; refuses with --memory-max"),
 			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
@@ -2116,6 +2140,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("watchdog_interval", false, false, "Memory-watchdog sample interval in [1s,30s); omitted keeps the installed value"),
 			stringSpec("slice_ceiling", false, false, "Dynamic slice-ceiling mode; omitted keeps the installed value, or enforce when no installed value is readable", "off", "observe", "enforce"),
 			stringSpec("cpu_slots_per_core", false, false, "CPU admission slots per core R, 1-64 (default 2): the daemon's CPU ceiling is R x NumCPU; omitted keeps the recorded value; refused with --stage=start and --status"),
+			boolSpec("claude_usage_mod", false, false, "Opt in: install the fixed aira-usage Claude Code mod into ~/.claude/skills/aira-usage/ (--claude-usage-mod=off removes only the files aira wrote). The mod reports each turn's token counters and the session id (never prompts or file contents) to `aira spend add`; omitted leaves an installed mod untouched; refused with --stage=start and --status"),
 			boolSpec("allow_overcommit", false, false, "Acknowledge coexistence with capped whale.slice"),
 			boolSpec("dry_run", false, false, "Render units and planned actions without mutation"),
 			boolSpec("status", false, false, "Report each installed and live facet honestly"),
@@ -2128,6 +2153,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "watchdog_interval")
 			_ = stringArg(args, "slice_ceiling")
 			_ = stringArg(args, "cpu_slots_per_core")
+			_ = boolArg(args, "claude_usage_mod")
 			_ = boolArg(args, "allow_overcommit")
 			_ = boolArg(args, "dry_run")
 			_ = boolArg(args, "status")
@@ -2509,8 +2535,8 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
 		}},
 		"spend": {summary: "Record and list raw compute events", safety: SafetyMutate, operations: []OperationSpec{
-			{Name: "add", Summary: "Ingest one compute event", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "model", Required: true}, {Name: "source", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "at"}, {Name: "session"}, {Name: "agent"}, {Name: "raw"}, {Name: "usage-file"}, {Name: "bucket"}, {Name: "total"}, {Name: "cost-usd"}, {Name: "reasoning-subset"}}, Example: []string{"add", "--provider", "openai", "--model", "gpt-5", "--source", "manual", "--bucket", "fresh_input=700", "--bucket", "cache_read=300", "--bucket", "output=200", "--total", "1200", "--reasoning-subset"}},
-			{Name: "ls", Summary: "List raw compute events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "provider:openai", "--by", "phase"}},
+			{Name: "add", Summary: "Ingest one compute event. --turn-id (needs --session) makes the add idempotent per source+session+agent while the row is retained: an identical retry returns the original row with duplicate:true, a retry that differs in counters, model, provider, reported total, cost, reasoning subset, declared ticket or phase is refused with E_COMPUTE_TURN_CONFLICT. --resolve-ticket (when no --ticket) stamps the ticket from the one LIVE lease this worktree holds: ticket_status lease-held means only that, at ingest time, this worktree held a live lease on that ticket; it does NOT say this session did the work, and a turn just before a claim or after a release gets the neighbouring state. A lease expires after its TTL unless `aira heartbeat` renews it, and only leases held by the worktree of the --scope-dir count, so an unrenewed or other-worktree claim reads none. No live lease is none, two or more is unevaluated (never a pick); rows written without --ticket or --resolve-ticket read as unknown", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "model", Required: true}, {Name: "source", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "at"}, {Name: "session"}, {Name: "agent"}, {Name: "turn-id"}, {Name: "resolve-ticket"}, {Name: "raw"}, {Name: "usage-file"}, {Name: "bucket"}, {Name: "total"}, {Name: "cost-usd"}, {Name: "reasoning-subset"}}, Example: []string{"add", "--provider", "openai", "--model", "gpt-5", "--source", "manual", "--bucket", "fresh_input=700", "--bucket", "cache_read=300", "--bucket", "output=200", "--total", "1200", "--reasoning-subset"}},
+			{Name: "ls", Summary: "List raw compute events. --session filters to one session. --by session sums the four buckets per session+ticket+ticket_status (a bucket no turn reported stays absent, not 0; turns counts the rows); every total is an OBSERVED subtotal, a lower bound: dropped deliveries, missing counters and retention all subtract, and no rows cannot tell never-ran from mod-not-loaded", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}, {Name: "session"}}, Example: []string{"ls", "provider:openai", "--by", "phase"}},
 		}},
 		"quota": {summary: "Record and list raw quota snapshots", safety: SafetyMutate, operations: []OperationSpec{
 			{Name: "add", Summary: "Record one quota snapshot", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "source"}, {Name: "at"}, {Name: "used"}, {Name: "limit"}, {Name: "remaining"}, {Name: "reset-at"}, {Name: "window"}}, Example: []string{"add", "--provider", "openai", "--source", "manual", "--used", "10", "--limit", "100"}},
@@ -2728,6 +2754,15 @@ func optionalFloatArg(args *argAccessor, name string) (float64, bool, error) {
 	}
 	return parsed, true, nil
 }
+
+// spendObservedBasis labels every per-session total. They are lower bounds on
+// what the session spent: a delivery that was dropped (daemon down, timeout), a
+// counter the source never reported, and retention eviction all subtract. "No
+// rows" cannot distinguish "never ran" from "mod not loaded".
+const (
+	spendObservedBasis = "observed-subtotal"
+	spendObservedNote  = "Totals are OBSERVED subtotals (lower bounds): dropped deliveries, missing counters and retention evict or omit turns. ticket_status lease-held means only that this worktree held ONE live lease on that ticket when the row was written; it does not say this session did the work, and a turn just before a claim or after a release gets the neighbouring state. unknown means the row did not record how its ticket was chosen: it was written without --ticket or --resolve-ticket, or by an older aira that did not record it (such a legacy row may still carry an explicit ticket); it is not the same as none."
+)
 
 func computeDistribution(rows []domain.ComputeEvent, by string) (map[string]int, error) {
 	if by != "provider" && by != "ticket" && by != "phase" && by != "conservation" {

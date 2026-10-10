@@ -167,8 +167,17 @@ import (
 // job admitted just before the restart whose VRAM has not yet ramped — accepted as a
 // documented limitation within the reservation model's bounded-over-admit envelope,
 // not silently. Adding VRAMBytes to the frozen ARDR codec closes it if it ever bites.
+//
+// ProtocolVersion 15 (was 14): AIRA-284 added `turn_id` and `resolve_ticket` to the
+// add-compute-event store-op payload (domain.ComputeEventInput: TurnID, ResolveTicket)
+// and `duplicate` to its result. The daemon decodes store-op payloads STRICTLY, so an
+// OLD proto-14 daemon would reject a NEW client's spend-add outright; the bump makes
+// that a loud E_DAEMON_PROTOCOL instead of an opaque decode failure, and stops an OLD
+// client from silently writing mod rows with no idempotency key to a NEW daemon. Same
+// atomic reinstall+restart requirement as 6-14; ARDR is sniffed BEFORE the version
+// check, so a suite's held worker leases still re-anchor across the upgrade.
 const (
-	ProtocolVersion = 14
+	ProtocolVersion = 15
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

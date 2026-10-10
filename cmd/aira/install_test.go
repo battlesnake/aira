@@ -113,3 +113,21 @@ func TestInstallParseArgsAcceptsCPUSlotsPerCore(t *testing.T) {
 		t.Fatalf("a bare --cpu-slots-per-core err=%v, want a requires-a-value refusal", err)
 	}
 }
+
+// AIRA-284. --claude-usage-mod is on the install descriptor's allowlist: bare
+// (install) or =off (remove). The install parser, which the CLI reaches first,
+// owns the --status / --stage=start refusals; this pins only that the CLI face
+// does not reject the flag before it gets there, and rejects any other value.
+func TestInstallParseArgsAcceptsClaudeUsageMod(t *testing.T) {
+	for argv, want := range map[string]string{"--claude-usage-mod": "true", "--claude-usage-mod=off": "off"} {
+		positionals, options, err := parseArgs("install", []string{argv})
+		if err != nil || len(positionals) != 0 || options["claude-usage-mod"] != want {
+			t.Fatalf("%q: positionals=%q options=%q err=%v, want %q", argv, positionals, options, err, want)
+		}
+	}
+	for _, bad := range []string{"--claude-usage-mod=on", "--claude-usage-mod=", "--claude-usage-mod=yes"} {
+		if _, _, err := parseArgs("install", []string{bad}); err == nil || !strings.Contains(err.Error(), "E_INSTALL_ARGUMENT_INVALID") {
+			t.Fatalf("%s err=%v, want E_INSTALL_ARGUMENT_INVALID", bad, err)
+		}
+	}
+}

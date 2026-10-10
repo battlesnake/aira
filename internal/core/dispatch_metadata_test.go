@@ -337,6 +337,9 @@ func (metadataProbeStore) ListComputeEvents(string) ([]domain.ComputeEvent, erro
 func (metadataProbeStore) SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error) {
 	return nil, nil
 }
+func (metadataProbeStore) SpendBySession(context.Context, string) ([]store.ComputeSessionSummary, error) {
+	return nil, nil
+}
 func (metadataProbeStore) AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error) {
 	return store.CommandEventAddResult{}, nil
 }

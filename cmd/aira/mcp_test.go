@@ -97,6 +97,24 @@ func TestMCPRunKillDeclaresStealBoolean(t *testing.T) {
 	}
 }
 
+func TestMCPSpendDeclaresTurnIDAndResolveTicket(t *testing.T) {
+	server := newMCPServer(nil)
+	binding, ok := server.byName["aira_spend"]
+	if !ok {
+		t.Fatal("missing aira_spend tool")
+	}
+	schema, ok := binding.tool.InputSchema.(mcpInputSchema)
+	if !ok {
+		t.Fatalf("spend schema type=%T", binding.tool.InputSchema)
+	}
+	if p, ok := schema.Properties["resolve-ticket"]; !ok || p.Type != "boolean" {
+		t.Fatalf("resolve-ticket property=%+v present=%v", p, ok)
+	}
+	if p, ok := schema.Properties["turn-id"]; !ok || p.Type != "string" {
+		t.Fatalf("turn-id property=%+v present=%v", p, ok)
+	}
+}
+
 func TestMCPConfineToolsAreSeparateAndSafetyAnnotated(t *testing.T) {
 	server := newMCPServer(nil)
 	list, listOK := server.byName["aira_confine_list"]
@@ -478,6 +496,8 @@ func TestMCPGroupedOperationsBuildTheSameCanonicalRequestsAsCLI(t *testing.T) {
 		{name: "requirement ls", tool: "aira_requirement", arguments: map[string]any{"operation": "ls", "fields": []any{"id"}}, cli: mustCLIRequest(t, "req", []string{"ls"}, map[string]string{"fields": "id"})},
 		{name: "requirement show", tool: "aira_requirement", arguments: map[string]any{"operation": "show", "selector": "AR-1"}, cli: mustCLIRequest(t, "req", []string{"show", "AR-1"}, nil)},
 		{name: "requirement set", tool: "aira_requirement", arguments: map[string]any{"operation": "set", "selector": "AR-1", "status": "built"}, cli: mustCLIRequest(t, "req", []string{"set", "AR-1"}, map[string]string{"status": "built"})},
+		{name: "spend add turn-id resolve-ticket", tool: "aira_spend", arguments: map[string]any{"operation": "add", "provider": "anthropic", "model": "claude-x", "source": "claude-mod", "session": "s1", "turn-id": "t1", "resolve-ticket": true, "reasoning-subset": false, "bucket": []any{"output=1"}}, cli: mustCLIRequest(t, "spend", []string{"add"}, map[string]string{"provider": "anthropic", "model": "claude-x", "source": "claude-mod", "session": "s1", "turn-id": "t1", "resolve-ticket": "true", "bucket": "output=1"})},
+		{name: "spend ls session", tool: "aira_spend", arguments: map[string]any{"operation": "ls", "session": "s1", "by": "session"}, cli: mustCLIRequest(t, "spend", []string{"ls"}, map[string]string{"session": "s1", "by": "session"})},
 		{name: "git clone", tool: "aira_git", arguments: map[string]any{"operation": "clone", "url": "git@github.com:o/r.git", "dir": "repo"}, cli: mustCLIRequest(t, "git", []string{"clone", "git@github.com:o/r.git", "repo"}, nil)},
 		{name: "git fetch", tool: "aira_git", arguments: map[string]any{"operation": "fetch", "remote": "origin"}, cli: mustCLIRequest(t, "git", []string{"fetch", "origin"}, nil)},
 		{name: "git push", tool: "aira_git", arguments: map[string]any{"operation": "push", "remote": "origin", "refspecs": []any{"HEAD:main"}}, cli: mustCLIRequest(t, "git", []string{"push", "origin", "--", "HEAD:main"}, nil)},

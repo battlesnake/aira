@@ -1,0 +1,1 @@
+{ "name": "aira-usage", "version": "0.1.0", "description": "Reports each turn's token counters and the session id to the local aira daemon (aira spend add). Counters and ids only; never prompts, messages, tool arguments or file contents.", "author": { "name": "aira" } }

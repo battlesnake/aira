@@ -5,7 +5,7 @@ GO ?= go
 GO_BIN := $(shell $(GO) env GOROOT 2>/dev/null)/bin
 export PATH := $(GO_BIN):$(HOME)/.local/bin:$(PATH)
 
-.PHONY: fmt fmt-check vet lint build dist test race cover fuzz tidy ci install-hooks
+.PHONY: fmt fmt-check vet lint build dist test race cover fuzz tidy ci install-hooks claude-mod-check
 
 # AIRA-205. The file set every gofmt-driving target shares, defined ONCE. It was
 # previously spelled out at three sites, and a nested-worktree exclusion added to
@@ -98,7 +98,35 @@ fuzz:
 tidy:
 	$(GO) mod tidy
 
-ci: fmt-check vet build test
+# AIRA-284. `claude plugin validate` and `claude plugin test` on the Claude Code
+# mod that `aira install --claude-usage-mod` embeds (internal/install/claudemod).
+# Both run against a COPY under ~/tmp (the repo tree is never the plugin folder,
+# and nothing is installed into ~/.claude). With no `claude` CLI, or one without
+# `plugin test`, nothing was checked: the target says UNEVALUATED in capitals and
+# exits 0 so a CI box without claude is not red, but it is never reported as a
+# pass. A validate or test failure is a real failure (exit non-zero).
+CLAUDE_MOD_SRC := internal/install/claudemod
+
+claude-mod-check:
+	@if ! command -v claude >/dev/null 2>&1; then \
+		echo "claude-mod-check: UNEVALUATED (the claude CLI is not installed; the embedded aira-usage mod was neither validated nor tested)"; \
+		exit 0; \
+	fi; \
+	if ! claude plugin --help 2>&1 | grep -Eq '^ +test( |$$)' || ! claude plugin --help 2>&1 | grep -Eq '^ +validate( |$$)'; then \
+		echo "claude-mod-check: UNEVALUATED (this claude has no 'plugin validate' / 'plugin test'; the embedded aira-usage mod was neither validated nor tested)"; \
+		exit 0; \
+	fi; \
+	set -e; \
+	mkdir -p "$$HOME/tmp"; \
+	stage="$$(mktemp -d "$$HOME/tmp/aira-claude-mod.XXXXXX")"; \
+	trap 'rm -rf "$$stage"' EXIT; \
+	mkdir -p "$$stage/aira-usage"; \
+	cp -R $(CLAUDE_MOD_SRC)/. "$$stage/aira-usage/"; \
+	claude plugin validate "$$stage/aira-usage"; \
+	(cd "$$stage/aira-usage" && claude plugin test .); \
+	echo "claude-mod-check: ok (plugin validate and plugin test passed on a copy of $(CLAUDE_MOD_SRC))"
+
+ci: fmt-check vet build test claude-mod-check
 
 install-hooks:
 	git config core.hooksPath .githooks

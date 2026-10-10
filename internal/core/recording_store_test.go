@@ -179,6 +179,9 @@ func (s *recordingStore) ListComputeEvents(string) ([]domain.ComputeEvent, error
 func (s *recordingStore) SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error) {
 	return nil, s.fail("SpendByPhase")
 }
+func (s *recordingStore) SpendBySession(context.Context, string) ([]store.ComputeSessionSummary, error) {
+	return nil, s.fail("SpendBySession")
+}
 func (s *recordingStore) AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error) {
 	return store.CommandEventAddResult{}, s.fail("AddCommandEvent")
 }

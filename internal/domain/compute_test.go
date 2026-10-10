@@ -181,3 +181,63 @@ func TestComputeEventGitContextViewSurvivesValidationReconstruction(t *testing.T
 		t.Fatalf("lean git context retained reasons: %#v", event.GitContext)
 	}
 }
+
+// verifies: AIRA-284 — turn-id/session/agent charset and the turn-id-needs-session rule.
+func TestComputeInputValidatesIdentityTokens(t *testing.T) {
+	base := ComputeEventInput{Model: "m", Provider: "anthropic", Source: "claude-mod", Session: "sess-1", Agent: "ag.1", TurnID: "turn:1_a-b.c"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid identity refused: %v", err)
+	}
+	bad := map[string]func(*ComputeEventInput){
+		"turn-id with space":        func(in *ComputeEventInput) { in.TurnID = "a b" },
+		"turn-id with slash":        func(in *ComputeEventInput) { in.TurnID = "a/b" },
+		"turn-id over 128":          func(in *ComputeEventInput) { in.TurnID = strings.Repeat("a", 129) },
+		"session with space":        func(in *ComputeEventInput) { in.Session = "s s" },
+		"session with newline":      func(in *ComputeEventInput) { in.Session = "s\n" },
+		"agent with quote":          func(in *ComputeEventInput) { in.Agent = "a'b" },
+		"turn-id without session":   func(in *ComputeEventInput) { in.Session = "" },
+		"session over 128 no turn":  func(in *ComputeEventInput) { in.TurnID = ""; in.Session = strings.Repeat("s", 129) },
+		"agent non-ascii":           func(in *ComputeEventInput) { in.Agent = "agént" },
+		"turn-id only whitespace":   func(in *ComputeEventInput) { in.TurnID = "  " },
+		"turn-id with unicode dash": func(in *ComputeEventInput) { in.TurnID = "a–b" },
+	}
+	for name, mutate := range bad {
+		in := base
+		mutate(&in)
+		if err := in.Validate(); err == nil || !strings.HasPrefix(err.Error(), ComputeCodeInvalid) {
+			t.Errorf("%s: err=%v, want %s", name, err, ComputeCodeInvalid)
+		}
+	}
+	// A 128-character value is the boundary and is accepted.
+	edge := base
+	edge.TurnID, edge.Session, edge.Agent = strings.Repeat("t", 128), strings.Repeat("s", 128), strings.Repeat("a", 128)
+	if err := edge.Validate(); err != nil {
+		t.Fatalf("128-char boundary refused: %v", err)
+	}
+	// Legacy producers (no turn id, no session/agent) are unaffected.
+	if err := (ComputeEventInput{Model: "m", Source: "run"}).Validate(); err != nil {
+		t.Fatalf("legacy shape refused: %v", err)
+	}
+}
+
+func TestComputeEventValidateTicketStatus(t *testing.T) {
+	ok := ComputeEvent{ID: "CE-1", At: "2026-10-09T00:00:00Z", AtSeq: 1, Model: "m", Source: "claude-mod", Provider: "anthropic", Conservation: ConservationUnevaluated}
+	for _, tc := range []struct {
+		status, ticket string
+		wantErr        bool
+	}{
+		{"", "", false}, {"unknown", "", false}, {"unknown", "T-1", false},
+		{"lease-held", "T-1", false}, {"lease-held", "", true},
+		{"declared", "T-1", false}, {"declared", "", true},
+		{"none", "", false}, {"none", "T-1", true},
+		{"unevaluated", "", false}, {"unevaluated", "T-1", true},
+		{"bogus", "", true},
+	} {
+		e := ok
+		e.TicketStatus, e.TicketID = tc.status, tc.ticket
+		err := e.Validate()
+		if (err != nil) != tc.wantErr {
+			t.Errorf("status=%q ticket=%q err=%v wantErr=%v", tc.status, tc.ticket, err, tc.wantErr)
+		}
+	}
+}

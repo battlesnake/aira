@@ -67,8 +67,11 @@ func (result admissionResult) releaseAdmission() {
 // the grant), then 12→13 in LOCKSTEP for AIRA-261's worker-admit wire change
 // (estimated_cpu added to the request — the per-test @aira_cpu reservation, charged
 // against the per-slice R×NumCPU cpu ledger instead of the hardcoded DefaultConfineCPUCores;
-// OPTIONAL, absent ⇒ the floor). TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two drift.
-const DaemonProtocolVersion = 14
+// OPTIONAL, absent ⇒ the floor), then 13→14 for AIRA-268 (vram) and 14→15 for AIRA-284
+// (turn_id / resolve_ticket on the add-compute-event store-op). The runner does not speak
+// spend, but it pins the daemon's single version number, so it moves in lockstep.
+// TestRunnerDaemonProtocolVersionMatchesTheDaemon fails if the two drift.
+const DaemonProtocolVersion = 15
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20
