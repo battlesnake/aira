@@ -39,6 +39,7 @@ const (
 	detachLaunchArgvEnv     = "AIRA_CONFINE_TEST_ARGV"
 	detachLaunchSliceEnv    = "AIRA_CONFINE_TEST_SLICE"
 	detachLaunchNoAckEnv    = "AIRA_CONFINE_TEST_SKIP_ACK"
+	detachLaunchSummaryEnv  = "AIRA_CONFINE_TEST_SUMMARY_FILE"
 	detachSuperviseHoldEnv  = "AIRA_CONFINE_TEST_HOLD"
 	detachLaunchDoneMarker  = "AIRA_CONFINE_TEST_LAUNCH_MARKER"
 	detachSuperviseRealMode = ""
@@ -188,6 +189,7 @@ func runConfineDetachLauncher() int {
 		// memory.max, and a token cap OOM-kills the child at launch ("pid absent"),
 		// which is the trap confine.go's MinPinnedScopeCap comment describes.
 		MemoryReserve: 64 << 20, MemoryReservePinned: true,
+		SummaryFile: os.Getenv(detachLaunchSummaryEnv),
 	}
 	launch, err := LaunchConfineDetached(context.Background(), request)
 	if err != nil {
