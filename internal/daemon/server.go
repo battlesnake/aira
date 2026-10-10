@@ -178,6 +178,13 @@ type Server struct {
 	workerScopeKill func(context.Context, string, string) error
 	admitNow        func() time.Time
 	admitAfter      func(time.Duration) <-chan time.Time
+	// admitManualEvaluation is a test seam. When true, a slice queue born in
+	// enqueueAdmitInternal gets no evaluator goroutine and its stopped channel is
+	// closed at birth, so the test drives every pass itself and is the queue's only
+	// evaluator from the moment the queue exists (otherwise the queue's own goroutine
+	// can grant a waiter between the enqueue and the test seeding its precondition).
+	// Production never sets it.
+	admitManualEvaluation bool
 	// AIRA-247. failfastSignalPID delivers the fail-fast cancellation to one
 	// victim SUPERVISOR (SIGUSR1 → the supervisor forwards to the job's process
 	// group; unhandled, SIGUSR1's default action is Term). Nil in production →

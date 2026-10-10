@@ -30,6 +30,7 @@ func workerExclusiveLedgerServer(t *testing.T) *Server {
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 1 << 40, 0, true, "" }
 	server.readCPUCores = func() int { return 8 }
+	server.admitManualEvaluation = true
 	return server
 }
 
