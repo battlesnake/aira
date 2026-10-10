@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-214","project":"aira","title":"confine's management verbs print a human ASCII table to a pipe, so aira confine --list | json.load raises","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-214","project":"aira","title":"confine's management verbs print a human ASCII table to a pipe, so aira confine --list | json.load raises","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are

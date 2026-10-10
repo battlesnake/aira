@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-212","project":"aira","title":"aira skill install --force with \u003cdir\u003e omitted swallows the flag as the destination path, creates ./--force/ and reports success","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-212","project":"aira","title":"aira skill install --force with \u003cdir\u003e omitted swallows the flag as the destination path, creates ./--force/ and reports success","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
