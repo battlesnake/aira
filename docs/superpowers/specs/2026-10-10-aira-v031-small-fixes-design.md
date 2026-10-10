@@ -261,12 +261,18 @@ whose `writeResponse` refuses a body over `StoreOpBodyMax` at `protocol.go:430`,
   that the caller renders as above. A value position is never inspected, so
   `create T --body -h` and `gate ... --argv -h` keep `-h` as a value. This closes
   `create Fix the bug -h` (today a ticket titled "Fix the bug -h") and
-  `list --by status --help`.
+  `list --by status --help`. **Exit code (build review):** the sentinel only fires when
+  the help token came WITH other arguments (a bare `<verb> -h|--help` is answered by the
+  pre-parse), so the help is printed but the exit is 2 and stderr carries
+  `E_SELECTOR_INVALID`: master refused `aira gate add G --argv df -h` (exit 2), and an
+  exit-0 no-op would let `... || die` carry on as if the gate were registered. Only
+  `<verb> -h|--help` alone (including `worktree register --help`) exits 0.
 - One renderer, `renderVerbHelp(entries, renderJSON, stdout, stderr)`, used by the
   pre-parse, the sentinel, `aira help <verb>`, and `runConfineHelpCommand` (which becomes a
   call to it). Piped output is the JSON envelope, like `aira help`.
 - `aira help <verb>` prints only that verb's entries; an unknown verb is refused
-  `E_UNKNOWN_VERB: no verb named "<x>"`; more than one argument is refused
+  `E_UNKNOWN_VERB: no verb named "<x>"`; a dispatched verb with no help entry (the list
+  above) is refused `E_SELECTOR_INVALID: no help entry for <x> ...`, never "unknown"; more than one argument is refused
   `E_SELECTOR_INVALID`. `aira -h` joins `aira --help` (main.go:157).
 - Did-you-mean: the generic "not valid" refusal appends
   `optionDidYouMean(name, sortedKeys(allowed[verb]))`, the helper confine already uses
@@ -328,6 +334,9 @@ push, docs-only included, because tests read repository content files.
   fails. Management requests never get a `ran=no` line: nothing was being launched.
 - Refusals in `runWithInputDispatcher` that return before `runConfineCommand` is reached
   write the extra stderr lines when `isConfineLaunch(args)`:
+  - (build review) `isConfineLaunch` skips leading global options (`--scope-dir`, `--json`,
+    tolerating a malformed one), because a refused `--scope-dir` returns argv unchanged and
+    the verb is then not at `argv[0]`;
   - the global scope refusals: the malformed `--scope-dir` (main.go:110-113) and the
     unresolvable scope directory (main.go:128-131) (`confine` accepts `--scope-dir`,
     scope_dir.go:154, so the "not valid for" refusal at 117-126 cannot fire for it);
@@ -359,6 +368,12 @@ the printed `exit=` (or, with `--json` or from a pipe, the `state`, `exit` and
 `error_code` fields) rather than `$?`". Update the committed measurement script
 `docs/dev/aira68-ledger-sample.sh`, which parses the table from `$(aira confine --list)`, to
 read the JSON `slice_reserve` fields instead.
+
+(Build review.) A management FAILURE on a pipe is the JSON envelope on stdout and ALSO its
+text on stderr (`renderConfineManagement`), as before the pipe default.
+`in-container-gate.sh:342` runs `aira confine --dump "$out/aira-confine-dump.jsonl"
+2>>"$out/aira-archival.err" || log WARNING ...`; without the stderr echo that file stays
+empty on failure.
 
 One peer script **executes** a piped management form (plan review, verified):
 `fastest-ee/deploy/ci/internal/jobspec/runner/in-container-gate.sh:234` runs

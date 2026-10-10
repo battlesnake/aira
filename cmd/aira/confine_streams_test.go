@@ -47,7 +47,12 @@ func TestConfineLaunchRefusalsAlwaysReachStderr(t *testing.T) {
 		"scope-dir-empty":   {"confine", "--scope-dir=", "--", "true"},
 		"scope-dir-missing": {"confine", "--scope-dir", missing, "--", "true"},
 		"after-dashes-list": {"confine", "--memory-reserve", "4Q", "--", "printf", "--list"},
-		"bare-confine":      {"confine"},
+		// The documented GLOBAL position: --scope-dir before the verb.
+		"global-scope-dir-empty":    {"--scope-dir=", "confine", "--", "true"},
+		"global-scope-dir-twice":    {"--scope-dir", "/a", "--scope-dir", "/b", "confine", "--", "true"},
+		"global-scope-dir-missing":  {"--scope-dir", missing, "confine", "--", "true"},
+		"global-json-scope-dir-bad": {"--json", "--scope-dir=", "confine", "--", "true"},
+		"bare-confine":              {"confine"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -133,6 +138,15 @@ func TestConfineManagementRefusalsGetNoNeverRanLine(t *testing.T) {
 		"":                                   false,
 		"confine --budget -- true":           false,
 		"confine --exclusive --list -- true": false,
+		// Leading GLOBAL options (--scope-dir, --json) are not the verb.
+		"--scope-dir= confine -- true":               true,
+		"--scope-dir /a --scope-dir /b confine -- x": true,
+		"--json confine -- true":                     true,
+		"--scope-dir=/a --json confine -- true":      true,
+		"--scope-dir= confine --list":                false,
+		"--scope-dir= confine-list":                  false,
+		"--scope-dir= list --list":                   false,
+		"--scope-dir":                                false,
 	} {
 		if got := isConfineLaunch(strings.Fields(argv)); got != want {
 			t.Fatalf("isConfineLaunch(%q) = %v, want %v", argv, got, want)
@@ -218,5 +232,50 @@ func TestConfineTableRenderersStillRenderTables(t *testing.T) {
 	exit := renderConfineListResponse(core.Response{OK: true, Code: "OK", Data: runner.ConfineListResult{Verdict: "ok"}}, &stdout, &stderr)
 	if exit != 0 || !strings.Contains(stdout.String(), "NAME") {
 		t.Fatalf("list table: exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+}
+
+// verifies: AIRA-214 / peer compatibility. A confine MANAGEMENT failure on a pipe
+// is still the JSON envelope on stdout, and ALSO its text on stderr, exactly as
+// before the pipe default: fastest-ee's in-container-gate.sh runs
+// `aira confine --dump FILE 2>>aira-archival.err || log WARNING ...`, so the
+// error must reach stderr or that file stays empty on failure.
+func TestConfineManagementFailureOnAPipeAlsoReachesStderr(t *testing.T) {
+	failing := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+		return core.Response{Code: "E_DAEMON_UNAVAILABLE", Error: "E_DAEMON_UNAVAILABLE: EOF", Exit: 4}
+	})
+	dumpPath := filepath.Join(t.TempDir(), "dump.jsonl")
+	for _, argv := range [][]string{
+		{"confine", "--dump", dumpPath},
+		{"confine-dump", "--dump", dumpPath},
+		{"confine", "--list"},
+		{"confine-list"},
+		{"confine", "--budget"},
+		{"confine-budget"},
+		{"confine", "--kill", "x"},
+		{"confine-kill", "x"},
+	} {
+		var stdout, stderr bytes.Buffer
+		exit := RunWithDispatcher(argv, &stdout, &stderr, failing)
+		if exit != 4 {
+			t.Fatalf("%q exit=%d, want 4 (stdout=%q stderr=%q)", argv, exit, stdout.String(), stderr.String())
+		}
+		var envelope struct {
+			OK   bool   `json:"ok"`
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &envelope); err != nil || envelope.OK || envelope.Code != "E_DAEMON_UNAVAILABLE" {
+			t.Fatalf("%q: stdout is not the failure envelope: %q (%v)", argv, stdout.String(), err)
+		}
+		if strings.TrimSpace(stderr.String()) != "E_DAEMON_UNAVAILABLE: EOF" {
+			t.Fatalf("%q: stderr = %q, want the error text", argv, stderr.String())
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	// And the write-failure arm of the dump (the file path is unwritable).
+	ok := okDispatcher(runner.ConfineDumpResult{Verdict: "ok"})
+	bad := filepath.Join(t.TempDir(), "no-such-dir", "dump.jsonl")
+	if exit := RunWithDispatcher([]string{"confine", "--dump", bad}, &stdout, &stderr, ok); exit == 0 || !strings.Contains(stderr.String(), "E_CONFINE_DUMP_WRITE") {
+		t.Fatalf("dump write failure exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 }

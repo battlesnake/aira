@@ -173,6 +173,10 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
 		}
 		response, found := verbHelpResponse(args[1])
+		if !found && verbExistsWithoutHelpEntry(args[1]) {
+			message := fmt.Sprintf("E_SELECTOR_INVALID: no help entry for %s (it is a verb, but the help table has no text for it)", strings.ToLower(args[1]))
+			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+		}
 		if !found {
 			message := fmt.Sprintf("E_UNKNOWN_VERB: no verb named %q", args[1])
 			return render(core.Response{Code: "E_UNKNOWN_VERB", Error: message, Exit: codes.ExitForCode("E_UNKNOWN_VERB")}, renderJSON, stdout, stderr)
@@ -205,7 +209,18 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if err != nil {
 		if request, isHelp := asHelpRequest(err); isHelp {
 			if response, found := verbHelpResponse(verb); found {
-				return renderVerbHelp(response, renderJSON, stdout, stderr)
+				exit := renderVerbHelp(response, renderJSON, stdout, stderr)
+				if len(args) == 2 {
+					// Bare `<verb> -h|--help` (after the subverb rewrite): clean help.
+					return exit
+				}
+				// Other arguments came with it, so this was a command that master
+				// refused (`gate add G --argv df -h`), not a request for help. Show
+				// the help but refuse with exit 2, so a script's `|| die` still fires
+				// and nothing is registered or changed.
+				refusal := request.otherArgumentsRefusal(verb)
+				_, _ = fmt.Fprintln(stderr, refusal)
+				return codes.ExitForCode("E_SELECTOR_INVALID")
 			}
 			err = request.refusal(verb)
 		}
@@ -348,11 +363,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			if code == "E_INTERNAL" {
 				code = "E_CONFINE_ARGUMENT_INVALID"
 			}
-			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+			return renderConfineManagement(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		owner, ownerErr := resolveConfineOwner(context.Background(), options["owner"])
 		if ownerErr != nil {
-			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
+			return renderConfineManagement(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
 		}
 		request.Args["owner"] = owner
 		return dispatchConfineManagementRequest(context.Background(), request, renderJSON, stdout, stderr, injected)
@@ -368,7 +383,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if verb == "confine-dump" {
 		dumpPath := options["dump"]
 		if dumpPath == "" {
-			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
+			return renderConfineManagement(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
 		}
 		return runConfineDumpCommand(context.Background(), options, dumpPath, renderJSON, stdout, stderr, injected)
 	}
@@ -2243,7 +2258,7 @@ func resolveOwnerIn(ctx context.Context, explicit, dir string) (string, error) {
 func runConfineManagementCommand(ctx context.Context, options map[string]string, jsonOutput bool, stdout, stderr io.Writer, injected Dispatcher) int {
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
-		return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		return renderConfineManagement(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
 	}
 	verb := "confine-list"
 	args := map[string]any{"slice": options["slice"], "owner": owner}
@@ -2269,7 +2284,7 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 	if dispatcher == nil {
 		dispatcher, err = newDaemonDispatcher(nil, stdout, stderr, jsonOutput)
 		if err != nil {
-			return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+			return renderConfineManagement(transportErrorResponse(err), jsonOutput, stdout, stderr)
 		}
 	}
 	response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, request)
@@ -2279,7 +2294,7 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 	if request.Verb == "confine-budget" && !jsonOutput && response.OK {
 		return renderConfineBudgetResponse(response, stdout, stderr)
 	}
-	return render(response, jsonOutput, stdout, stderr)
+	return renderConfineManagement(response, jsonOutput, stdout, stderr)
 }
 
 // dispatchConfineJobIORequest runs `confine-log` / `confine-input` (AIRA-196).

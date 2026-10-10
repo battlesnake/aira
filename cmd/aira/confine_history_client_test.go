@@ -320,3 +320,91 @@ func TestJoinedBudgetIsResortedAndKeepsHonesty(t *testing.T) {
 		t.Fatalf("joined result: verdict=%q next=%v", result.Verdict, result.Next)
 	}
 }
+
+// verifies: AIRA-280 invariant 3 — an `unevaluated` answer on a LATER page is the
+// whole answer, exactly as on page 1: exit 3, the unevaluated message, and no
+// (silently truncated) dump file. This window is real: AIRA-203 restarts the
+// daemon on every binary install, so the daemon can vanish between two pages.
+func TestUnevaluatedOnALaterPageIsTheWholeAnswerAndWritesNothing(t *testing.T) {
+	first, err := json.Marshal(runner.ConfineDumpResult{Verdict: "ok", Scope: "s",
+		Admissions: []runner.ConfineDumpAdmissionRow{dumpRow("a", i64(10))},
+		Next:       &runner.ConfineHistoryCursor{Kind: "confine", Signature: "a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &daemonDispatcher{}
+	calls := 0
+	d.exchange = func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error) {
+		calls++
+		if calls == 1 {
+			return daemon.ResponseFrame{OK: true, Code: "OK", Data: first}, nil
+		}
+		return daemon.ResponseFrame{}, &daemon.RequestNotSentError{Err: errors.New(daemon.CodeUnavailable + ": restarting")}
+	}
+	path := filepath.Join(t.TempDir(), "dump.jsonl")
+	exit, stdout, stderr := runDump(t, d, path)
+	if calls != 2 {
+		t.Fatalf("exchanges = %d, want 2 (page 1 then the vanished daemon)", calls)
+	}
+	if exit != 3 || !strings.Contains(stdout, `"verdict":"unevaluated"`) {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want exit 3 and the unevaluated message", exit, stdout, stderr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a partial dump file exists after an unevaluated later page (err=%v)", err)
+	}
+}
+
+// verifies: AIRA-280 — the same for the budget join: an unevaluated later page
+// returns the unevaluated verdict, never a one-page budget.
+func TestUnevaluatedOnALaterBudgetPageIsTheWholeAnswer(t *testing.T) {
+	first, err := json.Marshal(runner.ConfineBudgetResult{Verdict: "ok", Scope: "s",
+		Subjects: []runner.ConfineBudgetRow{budgetRow("a", "well-fitted", i64(1), i64(2), false)},
+		Next:     &runner.ConfineHistoryCursor{Kind: "confine", Signature: "a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &daemonDispatcher{}
+	calls := 0
+	d.exchange = func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error) {
+		calls++
+		if calls == 1 {
+			return daemon.ResponseFrame{OK: true, Code: "OK", Data: first}, nil
+		}
+		return daemon.ResponseFrame{}, &daemon.RequestNotSentError{Err: errors.New(daemon.CodeUnavailable + ": restarting")}
+	}
+	response := d.Dispatch(context.Background(), daemon.WorktreeScope{},
+		core.Request{Verb: "confine-budget", Args: map[string]any{"owner": "session-a"}})
+	data, err := json.Marshal(response.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result runner.ConfineBudgetResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Verdict != "unevaluated" || len(result.Subjects) != 0 {
+		t.Fatalf("verdict=%q subjects=%d, want the whole answer unevaluated (response %+v)", result.Verdict, len(result.Subjects), response)
+	}
+}
+
+// verifies: AIRA-280 — the cursor advances across a KIND boundary: the history
+// holds both `confine` and `pytest-worker` subjects, and a pytest-worker
+// signature can sort below the last confine signature. Comparing signatures
+// alone would call that crossing "did not advance" and fail every full dump.
+func TestCursorAdvancesAcrossAKindBoundary(t *testing.T) {
+	peer := &historyPeer{t: t, pages: []any{
+		runner.ConfineDumpResult{Verdict: "ok", Scope: "s", Admissions: []runner.ConfineDumpAdmissionRow{dumpRow("zzz", nil)},
+			Next: &runner.ConfineHistoryCursor{Kind: "confine", Signature: "zzz"}},
+		runner.ConfineDumpResult{Verdict: "ok", Scope: "s", Admissions: []runner.ConfineDumpAdmissionRow{dumpRow("aaa", nil)},
+			Next: &runner.ConfineHistoryCursor{Kind: "pytest-worker", Signature: "aaa"}},
+		runner.ConfineDumpResult{Verdict: "ok", Scope: "s"},
+	}}
+	path := filepath.Join(t.TempDir(), "dump.jsonl")
+	exit, stdout, stderr := runDump(t, peer.dispatcher(), path)
+	if exit != 0 {
+		t.Fatalf("exit=%d stdout=%q stderr=%q (a kind crossing is progress)", exit, stdout, stderr)
+	}
+	if rows := readDump(t, path); len(rows) != 2 {
+		t.Fatalf("rows = %v, want both pages", rows)
+	}
+}

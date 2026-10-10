@@ -53,6 +53,23 @@ func (e *helpRequestError) refusal(verb string) error {
 	return fmt.Errorf("E_SELECTOR_INVALID: option --help is not valid for %s", verb)
 }
 
+// otherArgumentsRefusal is the stderr line printed when the help token arrived
+// with other arguments: the help is shown, nothing ran, and the exit is 2.
+func (e *helpRequestError) otherArgumentsRefusal(verb string) string {
+	return fmt.Sprintf("E_SELECTOR_INVALID: %s was given with other arguments, so %s was refused and nothing ran (help is shown above; to pass %s as an option VALUE put it directly after its option, e.g. --argv %s)", e.flag, verb, e.flag, e.flag)
+}
+
+// verbsWithoutHelpEntry are the dispatched verbs that have no help-table entry
+// (the spec's list). `aira help <one of these>` must not say the verb is unknown.
+var verbsWithoutHelpEntry = map[string]bool{
+	"skill": true, "top": true, "board": true, "tui": true, "mcp": true, "daemon": true,
+	"version": true, "watch": true, "worker-admit": true, "confine-report": true, "drain-hold": true,
+}
+
+func verbExistsWithoutHelpEntry(verb string) bool {
+	return verbsWithoutHelpEntry[strings.ToLower(verb)]
+}
+
 // preParseHelpVerb reports whether argv is `<verb> --help|-h` and returns the
 // lower-cased verb and whether --json was given. The global --scope-dir and
 // --json are stripped first (with the existing strippers) to find the verb; a
@@ -138,10 +155,28 @@ var confineManagementFlags = map[string]bool{"--list": true, "--kill": true, "--
 // management request never gets one (nothing was being launched) and a `--list`
 // after `--` (the child's argument) does not hide a launch.
 func isConfineLaunch(argv []string) bool {
-	if len(argv) == 0 || argv[0] != "confine" {
+	// Skip the GLOBAL options that may precede the verb (`aira --scope-dir X
+	// confine ...`). A refused --scope-dir returns argv unchanged (removeScopeDir),
+	// so the verb is not at argv[0] on exactly the path that refuses it; the skip
+	// tolerates a malformed one (empty value, repeated, missing value).
+	start := 0
+	for start < len(argv) {
+		name, _, hasInline := strings.Cut(argv[start], "=")
+		if argv[start] == "--json" {
+			start++
+		} else if name == scopeDirFlag {
+			start++
+			if !hasInline && start < len(argv) && !strings.HasPrefix(argv[start], "--") && strings.TrimSpace(argv[start]) != "" {
+				start++
+			}
+		} else {
+			break
+		}
+	}
+	if start >= len(argv) || argv[start] != "confine" {
 		return false
 	}
-	for _, arg := range argv[1:] {
+	for _, arg := range argv[start+1:] {
 		if arg == "--" {
 			break
 		}
@@ -177,6 +212,20 @@ func renderConfineRefusal(args []string, response core.Response, renderJSON bool
 		if renderJSON {
 			_, _ = fmt.Fprintln(stderr, response.Error)
 		}
+	}
+	return render(response, renderJSON, stdout, stderr)
+}
+
+// renderConfineManagement renders a confine MANAGEMENT result (--list, --kill,
+// --budget, --dump and their hyphenated spellings). The rendering follows the
+// pipe default (JSON on stdout, AIRA-214), but a FAILURE also puts its text on
+// stderr -- where these forms printed it before the pipe default. A peer script
+// that captures stderr to a file and tests only the exit status
+// (fastest-ee in-container-gate.sh: `aira confine --dump F 2>>err || log ...`)
+// would otherwise see an empty error file and the failure only in its stdout log.
+func renderConfineManagement(response core.Response, renderJSON bool, stdout, stderr io.Writer) int {
+	if renderJSON && !response.OK && response.Error != "" {
+		_, _ = fmt.Fprintln(stderr, response.Error)
 	}
 	return render(response, renderJSON, stdout, stderr)
 }

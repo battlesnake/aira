@@ -152,12 +152,90 @@ func TestGenericParserHelpSentinelNeverReadsValues(t *testing.T) {
 	if err != nil || !strings.HasSuffix(options["argv"], "-h") || !strings.Contains(options["argv"], "df") {
 		t.Fatalf("gate --argv -h: options=%v err=%v", options, err)
 	}
-	// Through Run: no dispatch, exit 0, the verb's own entry.
-	if got := helpVerbs(t, []string{"list", "--by", "status", "--help"}); !reflect.DeepEqual(got, []string{"list"}) {
+	// Through Run: no dispatch, the verb's own entry is shown, but the exit is 2
+	// (the request carried other arguments, so it is a refusal, not a clean help).
+	if got := helpShownButRefused(t, []string{"list", "--by", "status", "--help"}); !reflect.DeepEqual(got, []string{"list"}) {
 		t.Fatalf("list --by status --help = %v", got)
 	}
-	if got := helpVerbs(t, []string{"create", "Fix", "it", "-h"}); !reflect.DeepEqual(got, []string{"create"}) {
+	if got := helpShownButRefused(t, []string{"create", "Fix", "it", "-h"}); !reflect.DeepEqual(got, []string{"create"}) {
 		t.Fatalf("create Fix it -h = %v", got)
+	}
+}
+
+// helpShownButRefused runs argv, requires exit 2 with the verb's help envelope on
+// stdout and an E_SELECTOR_INVALID line on stderr, and returns the help verbs.
+func helpShownButRefused(t *testing.T, argv []string) []string {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher(argv, &stdout, &stderr, failDispatcher{t})
+	if exit != 2 {
+		t.Fatalf("%q exit=%d, want 2 (stdout=%q stderr=%q)", argv, exit, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "E_SELECTOR_INVALID") {
+		t.Fatalf("%q: stderr has no refusal: %q", argv, stderr.String())
+	}
+	var envelope struct {
+		Data []struct {
+			Verb string `json:"verb"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("%q: stdout is not the help envelope: %q (%v)", argv, stdout.String(), err)
+	}
+	var verbs []string
+	for _, entry := range envelope.Data {
+		verbs = append(verbs, entry.Verb)
+	}
+	sort.Strings(verbs)
+	return verbs
+}
+
+// verifies: AIRA-211. A `-h` / `--help` that is NOT the bare request must never
+// turn a malformed command into an exit-0 no-op: master refused these (exit 2),
+// and a script's `aira gate add G --argv df -h || die` relies on that. Help is
+// still shown, nothing is dispatched, the exit is 2. A bare `<verb> -h` stays 0.
+func TestHelpAmongOtherArgumentsIsARefusalNotASuccess(t *testing.T) {
+	for _, argv := range [][]string{
+		{"gate", "add", "G", "--argv", "df", "-h"},
+		{"gate", "add", "G", "--argv", "df", "--help"},
+		{"mv", "AIRA-1", "-h"},
+		{"claim", "AIRA-1", "-h"},
+		{"link", "A", "B", "-h"},
+		{"list", "--by", "status", "--help"},
+	} {
+		if got := helpShownButRefused(t, argv); len(got) == 0 {
+			t.Fatalf("%q: refusal printed no help", argv)
+		}
+	}
+	// Bare requests, and the worktree subverb spelling, are clean help (exit 0).
+	for _, argv := range [][]string{
+		{"gate", "-h"}, {"mv", "--help"}, {"worktree", "register", "--help"}, {"worktree", "audit", "-h"},
+	} {
+		if got := helpVerbs(t, argv); len(got) == 0 {
+			t.Fatalf("%q: no help", argv)
+		}
+	}
+	// The value-position carve-out is untouched: -h is data after its option.
+	_, options, err := parseArgs("gate", []string{"add", "G", "--argv", "df", "--argv", "-h"})
+	if err != nil || !strings.Contains(options["argv"], "-h") {
+		t.Fatalf("gate --argv -h: options=%v err=%v", options, err)
+	}
+}
+
+// verifies: AIRA-211. `aira help <verb>` for a verb that EXISTS but has no help
+// entry must not claim the verb is unknown: E_UNKNOWN_VERB is reserved for a
+// verb that does not exist (a script may use it to test existence).
+func TestHelpForAVerbWithoutAnEntryIsNotUnknown(t *testing.T) {
+	for _, verb := range []string{"top", "board", "tui", "skill", "mcp", "daemon", "version", "watch", "worker-admit", "confine-report", "drain-hold"} {
+		var stdout, stderr bytes.Buffer
+		exit := RunWithDispatcher([]string{"help", verb}, &stdout, &stderr, failDispatcher{t})
+		if exit != 2 || strings.Contains(stdout.String(), "E_UNKNOWN_VERB") || !strings.Contains(stdout.String(), "no help entry for") {
+			t.Fatalf("help %s exit=%d stdout=%q", verb, exit, stdout.String())
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if exit := RunWithDispatcher([]string{"help", "nosuchverb"}, &stdout, &stderr, failDispatcher{t}); exit != 2 || !strings.Contains(stdout.String(), "E_UNKNOWN_VERB") {
+		t.Fatalf("help nosuchverb exit=%d stdout=%q", exit, stdout.String())
 	}
 }
 
