@@ -440,15 +440,44 @@ func resourceBudgetCell(verdict ResourceBudgetVerdict) GaugeCell {
 // eleven waiters need), then the quiet band, then unevaluated. Ties break on the
 // rendered subject so the order is stable.
 func SortResourceBudgetVerdicts(verdicts []ResourceBudgetVerdict) {
-	rank := map[string]int{
-		ResourceBudgetUnderProvisioned: 0, ResourceBudgetOverProvisioned: 1,
-		ResourceBudgetAcceptable: 2, ResourceBudgetWellFitted: 3, ResourceBudgetUnevaluated: 4,
-	}
 	sort.SliceStable(verdicts, func(i, j int) bool {
-		if rank[verdicts[i].Direction] != rank[verdicts[j].Direction] {
-			return rank[verdicts[i].Direction] < rank[verdicts[j].Direction]
+		if resourceBudgetDirectionRank(verdicts[i].Direction) != resourceBudgetDirectionRank(verdicts[j].Direction) {
+			return resourceBudgetDirectionRank(verdicts[i].Direction) < resourceBudgetDirectionRank(verdicts[j].Direction)
 		}
 		return renderResourceBudgetSubject(verdicts[i].Kind, verdicts[i].Signature) <
 			renderResourceBudgetSubject(verdicts[j].Kind, verdicts[j].Signature)
+	})
+}
+
+// resourceBudgetDirectionRank is the one worst-first rank both sorts share:
+// under-provisioned (a job dies), then over-provisioned (a job holds headroom
+// eleven waiters need), then the quiet band, then unevaluated.
+func resourceBudgetDirectionRank(direction string) int {
+	switch direction {
+	case ResourceBudgetUnderProvisioned:
+		return 0
+	case ResourceBudgetOverProvisioned:
+		return 1
+	case ResourceBudgetAcceptable:
+		return 2
+	case ResourceBudgetWellFitted:
+		return 3
+	case ResourceBudgetUnevaluated:
+		return 4
+	default:
+		return 0
+	}
+}
+
+// SortConfineBudgetRows orders wire rows exactly as SortResourceBudgetVerdicts
+// orders the verdicts they came from (same rank, ties on the rendered subject,
+// stable), so a client that joins paged replies reproduces the unpaged order
+// (AIRA-280). Subject is the rendered subject the daemon wrote.
+func SortConfineBudgetRows(rows []runner.ConfineBudgetRow) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		if resourceBudgetDirectionRank(rows[i].Direction) != resourceBudgetDirectionRank(rows[j].Direction) {
+			return resourceBudgetDirectionRank(rows[i].Direction) < resourceBudgetDirectionRank(rows[j].Direction)
+		}
+		return rows[i].Subject < rows[j].Subject
 	})
 }

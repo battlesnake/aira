@@ -934,7 +934,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		// its own design, deliberately out of AIRA-84's scope. It already obeys
 		// rule (3) — stamped immediately before the write.
 		_ = conn.SetWriteDeadline(time.Now().Add(watchWriteTimeout))
-		wrote = writeFrame(conn, responseFrame(response)) == nil
+		wrote = writeOrRefuseTooLarge(conn, func() error { return writeFrame(conn, responseFrame(response)) })
 		return
 	} else if s.Handle != nil {
 		response = s.Handle(ctx, request.Scope, request.Request)

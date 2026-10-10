@@ -36,6 +36,13 @@ func (s *Server) confineBudget(args map[string]any) core.Response {
 	// admit.go for why this must not reuse the hot path's admitHistoryTimeout.
 	ctx, cancel := context.WithTimeout(context.Background(), dumpHistoryTimeout)
 	defer cancel()
+	page, pageErr := parseHistoryPage(args)
+	if pageErr != nil {
+		return confineManagementError(pageErr)
+	}
+	if page.paged {
+		return s.confineBudgetPage(page)
+	}
 	subjects, err := s.db.ResourceBudgetSubjects(ctx)
 	if err != nil {
 		return core.Response{Code: CodeInternal, Error: CodeInternal + ": read usage history: " + err.Error()}
@@ -44,20 +51,29 @@ func (s *Server) confineBudget(args map[string]any) core.Response {
 	for _, subject := range subjects {
 		verdicts = append(verdicts, store.ClassifyResourceBudget(subject, nil))
 	}
+	return core.Response{OK: true, Code: "OK", Data: confineBudgetResult(verdicts, nil)}
+}
+
+// confineBudgetRow maps one verdict onto the wire row.
+func confineBudgetRow(verdict store.ResourceBudgetVerdict) runner.ConfineBudgetRow {
+	return runner.ConfineBudgetRow{
+		Kind: string(verdict.Kind), Subject: store.RenderResourceBudgetSubject(verdict.Kind, verdict.Signature),
+		Direction: verdict.Direction, Unevaluated: verdict.Unevaluated,
+		UnevaluatedReason: verdict.UnevaluatedReason,
+		Budget:            verdict.CurrentBudget, BudgetBasis: verdict.CurrentBudgetBasis,
+		ObservedMax: verdict.ObservedMax, UsableSamples: verdict.UsableSamples,
+		TotalSamples: verdict.TotalSamples, Buckets: verdict.Buckets,
+		Recommendation: verdict.Recommendation, RecommendedBudget: verdict.RecommendedBudget,
+	}
+}
+
+// confineBudgetResult sorts the verdicts worst-first and maps them to the wire
+// reply (next is set only on a paged page).
+func confineBudgetResult(verdicts []store.ResourceBudgetVerdict, next *runner.ConfineHistoryCursor) runner.ConfineBudgetResult {
 	store.SortResourceBudgetVerdicts(verdicts)
 	rows := make([]runner.ConfineBudgetRow, 0, len(verdicts))
 	for _, verdict := range verdicts {
-		rows = append(rows, runner.ConfineBudgetRow{
-			Kind: string(verdict.Kind), Subject: store.RenderResourceBudgetSubject(verdict.Kind, verdict.Signature),
-			Direction: verdict.Direction, Unevaluated: verdict.Unevaluated,
-			UnevaluatedReason: verdict.UnevaluatedReason,
-			Budget:            verdict.CurrentBudget, BudgetBasis: verdict.CurrentBudgetBasis,
-			ObservedMax: verdict.ObservedMax, UsableSamples: verdict.UsableSamples,
-			TotalSamples: verdict.TotalSamples, Buckets: verdict.Buckets,
-			Recommendation: verdict.Recommendation, RecommendedBudget: verdict.RecommendedBudget,
-		})
+		rows = append(rows, confineBudgetRow(verdict))
 	}
-	return core.Response{OK: true, Code: "OK", Data: runner.ConfineBudgetResult{
-		Verdict: "ok", Scope: store.ResourceBudgetUniverseScope(), Subjects: rows,
-	}}
+	return runner.ConfineBudgetResult{Verdict: "ok", Scope: store.ResourceBudgetUniverseScope(), Subjects: rows, Next: next}
 }

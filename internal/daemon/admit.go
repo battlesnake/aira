@@ -50,16 +50,18 @@ const (
 	// --dump` fail once the table grew: the daemon logs
 	// "E_DAEMON_INTERNAL: read usage history: context deadline exceeded", and
 	// the CLIENT reports "E_DAEMON_UNAVAILABLE: EOF" rather than that structured
-	// error (measured on the live box; confineBudget hit the SAME reused
-	// deadline on the SAME query and did not reproduce this at the time it was
-	// observed — why the two diverged, and why the client sees a bare EOF
-	// instead of the daemon's own structured response, are NOT established
-	// here, only that the reused 250ms deadline is provably too tight for this
-	// read: TestConfineDumpSucceedsOnHistoryThatWouldTripTheAdmitHotPathDeadline
+	// error (measured on the live box). The deadline was real and is fixed here:
+	// TestConfineDumpSucceedsOnHistoryThatWouldTripTheAdmitHotPathDeadline
 	// reproduces the deadline-exceeded failure in-process at volume and shows
-	// dumpHistoryTimeout below fixes it). Neither confineDump nor confineBudget
-	// sits on any caller-blocking admission path, so a generous deadline costs
-	// nothing there; it must NEVER be used for admitHistoryTimeout's hot-path
+	// dumpHistoryTimeout below fixes it. The bare EOF was a SEPARATE defect
+	// (AIRA-280): once the history grew past what one 16 MiB reply frame can
+	// carry, the daemon refused to write the frame and dropped the connection, so
+	// the client saw EOF with no structured error. That is fixed by naming an
+	// oversized reply (CodeResponseTooLarge) and by paging these two verbs
+	// (confine_history_page.go); a unit test per cause keeps them apart. Neither
+	// confineDump nor confineBudget sits on any caller-blocking admission path, so
+	// a generous deadline costs nothing there; it must NEVER be used for
+	// admitHistoryTimeout's hot-path
 	// callers.
 	dumpHistoryTimeout                        = 30 * time.Second
 	admitPriorRefresh                         = time.Minute

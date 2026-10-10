@@ -68,6 +68,13 @@ func (s *Server) confineDump(args map[string]any) core.Response {
 	// admitHistoryTimeout (see dumpHistoryTimeout's doc comment in admit.go).
 	ctx, cancel := context.WithTimeout(context.Background(), dumpHistoryTimeout)
 	defer cancel()
+	page, pageErr := parseHistoryPage(args)
+	if pageErr != nil {
+		return confineManagementError(pageErr)
+	}
+	if page.paged {
+		return s.confineDumpPage(page)
+	}
 	subjects, err := s.db.ResourceBudgetSubjects(ctx)
 	if err != nil {
 		return core.Response{Code: CodeInternal, Error: CodeInternal + ": read usage history: " + err.Error()}

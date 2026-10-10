@@ -79,8 +79,11 @@ var ExitCodes = map[string]int{
 	"E_GLOB_INVALID":        2,
 	"E_DAEMON_UNAVAILABLE":  4, "E_DAEMON_BUSY": 4, "E_DAEMON_TIMEOUT": 3,
 	"E_DAEMON_PROJECT_INVALID": 2, "E_DAEMON_PROTOCOL": 2, "E_DAEMON_INTERNAL": 4,
-	"U_DAEMON_OUTCOME_UNKNOWN": 3,
-	"E_DB_BUSY":                4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
+	// AIRA-280. A reply the daemon built but could not send (over the frame limit),
+	// answered in its place. A transport-class failure like its neighbours.
+	"E_DAEMON_RESPONSE_TOO_LARGE": 4,
+	"U_DAEMON_OUTCOME_UNKNOWN":    3,
+	"E_DB_BUSY":                   4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
 	"E_SCHEMA_INVALID":  4, "E_EJECT_LIVE_STATE": 1, "E_EJECT_UNVERIFIED": 3, "E_PURGE_DIRTY": 1,

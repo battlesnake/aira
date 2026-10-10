@@ -62,6 +62,15 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 }
 
 func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Reader, injected Dispatcher) int {
+	// AIRA-211. `<verb> --help` / `<verb> -h` is answered from the help table
+	// before ANY verb parser or intercept below can refuse or swallow it. Only the
+	// token right after the verb is read (preParseHelpVerb), and a verb with no
+	// help-table entry falls through to its current behaviour.
+	if helpVerb, helpJSON, ok := preParseHelpVerb(argv); ok {
+		if response, found := verbHelpResponse(helpVerb); found {
+			return renderVerbHelp(response, helpJSON || !stdoutIsTerminal(stdout), stdout, stderr)
+		}
+	}
 	if len(argv) > 0 && argv[0] == "__slice-anchor" {
 		return runSliceAnchor()
 	}
@@ -102,14 +111,20 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	// genuine human-readable text (AIRA-57). Verbs whose current behaviour
 	// doesn't route through the generic (previously JSON-dump-as-"human")
 	// rendering decision at all deliberately keep using the explicit
-	// jsonOutput flag below, unaffected by this default: confine and friends
-	// (which reject --json outright), watch, run/git/time's live byte
-	// streaming during dispatch, and the deliberate non-JSON suppression
-	// contracts of time's and run-log's trailing summaries (see below).
+	// jsonOutput flag below, unaffected by this default: the confine LAUNCH form,
+	// confine-reserve, drain and the other forms that reject --json outright,
+	// watch, run/git/time's live byte streaming during dispatch, and the
+	// deliberate non-JSON suppression contracts of time's and run-log's trailing
+	// summaries (see below). The confine MANAGEMENT forms (--list, --budget,
+	// --status, --kill, --dump) follow renderJSON like every other verb
+	// (AIRA-214); confine-log and confine-input stay byte-transparent.
 	renderJSON := jsonOutput || !stdoutIsTerminal(stdout)
 	if scopeDirErr != nil {
 		code := store.ErrorCode(scopeDirErr)
-		return render(core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+		// argv, not args: removeScopeDir returned argv unchanged, and the --json strip
+		// above can leave a bare `--scope-dir` followed by the verb, which the launch
+		// check would then read as the option's value.
+		return renderConfineRefusal(argv, core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// A verb that resolves no project/worktree scope refuses the override rather
 	// than accepting and discarding it: silently ignoring an explicit scope is
@@ -121,13 +136,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		if !verbAcceptsScopeDir(target) {
 			message := fmt.Sprintf("E_SELECTOR_INVALID: option %s is not valid for %s", scopeDirFlag, target)
-			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+			return renderConfineRefusal(args, core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
 		}
 	}
 	scopeDir, scopeDirResolveErr := resolveScopeDir(scopeDirOption)
 	if scopeDirResolveErr != nil {
 		code := store.ErrorCode(scopeDirResolveErr)
-		return render(core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return renderConfineRefusal(args, core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// AIRA-202. Intercepted HERE, beside help, rather than added to buildRequest's
 	// switch: version resolves no project, opens no store, and must answer with
@@ -154,7 +169,24 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runVersionCommand(context.Background(), dispatcher, dispatcherErr, renderJSON, stdout, stderr)
 	}
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
+	if len(args) > 0 && args[0] == "help" && len(args) > 1 {
+		// AIRA-211. `aira help <verb>` prints only that verb's entries.
+		if len(args) > 2 {
+			message := "E_SELECTOR_INVALID: help takes at most one verb"
+			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+		}
+		response, found := verbHelpResponse(args[1])
+		if !found && verbExistsWithoutHelpEntry(args[1]) {
+			message := fmt.Sprintf("E_SELECTOR_INVALID: no help entry for %s (it is a verb, but the help table has no text for it)", strings.ToLower(args[1]))
+			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+		}
+		if !found {
+			message := fmt.Sprintf("E_UNKNOWN_VERB: no verb named %q", args[1])
+			return render(core.Response{Code: "E_UNKNOWN_VERB", Error: message, Exit: codes.ExitForCode("E_UNKNOWN_VERB")}, renderJSON, stdout, stderr)
+		}
+		return renderVerbHelp(response, renderJSON, stdout, stderr)
+	}
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
 		if !renderJSON && response.OK {
 			return renderHelp(response, stdout, stderr)
@@ -178,6 +210,36 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	positional, options, err := parseArgs(verb, args[1:])
 	if err != nil {
+		if request, isHelp := asHelpRequest(err); isHelp {
+			if response, found := verbHelpResponse(verb); found {
+				if len(args) == 2 {
+					// Bare `<verb> -h|--help` (after the subverb rewrite): clean help.
+					return renderVerbHelp(response, renderJSON, stdout, stderr)
+				}
+				// Other arguments came with it, so this was a command that master
+				// refused (`gate add G --argv df -h`), not a request for help. Refuse
+				// with exit 2 so a script's `|| die` still fires and nothing is
+				// registered or changed, and make the refusal visible on EVERY channel:
+				// piped, the stdout envelope is the REFUSAL (ok:false, the stable code)
+				// carrying the verb's help entries in data, so a `.ok`/`.code` consumer
+				// never reads success for a refused command; on a terminal the help
+				// listing precedes the stderr refusal line.
+				refusal := request.otherArgumentsRefusal(verb)
+				code := helpRefusalCode(verb)
+				if renderJSON {
+					response.OK, response.Code, response.Error = false, code, refusal
+					response.Exit = codes.ExitForCode(code)
+					// JSON mode writes only stdout, so the text also goes to stderr:
+					// a script that captures stderr and tests the exit status sees it.
+					_, _ = fmt.Fprintln(stderr, refusal)
+					return render(response, true, stdout, stderr)
+				}
+				_ = renderVerbHelp(response, false, stdout, stderr)
+				_, _ = fmt.Fprintln(stderr, refusal)
+				return codes.ExitForCode(code)
+			}
+			err = request.refusal(verb)
+		}
 		if verb == "worker-admit" {
 			// worker-admit's caller is the aitest supervisor, which reads
 			// one structured stdout line and nothing else. An argument
@@ -197,7 +259,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			code = "E_SELECTOR_INVALID"
 		}
 		response := core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
-		return render(response, renderJSON, stdout, stderr)
+		return renderConfineRefusal(args, response, renderJSON, stdout, stderr)
 	}
 	if (verb == "tui" || verb == "board") && jsonOutput {
 		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for " + verb, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
@@ -233,7 +295,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		// project, and no --json branching, and must work whatever else was also
 		// typed alongside it.
 		if options["help"] == "true" {
-			return runConfineHelpCommand(stdout, stderr)
+			return runConfineHelpCommand(renderJSON, stdout, stderr)
 		}
 		// AIRA-22: --status joins --list/--kill as a management form. Unlike those
 		// two it is answered LOCALLY rather than through the daemon: it reads a
@@ -246,19 +308,19 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true" || dumpPath != ""
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
-			return render(response, true, stdout, stderr)
+			return renderConfineRefusal(args, response, true, stdout, stderr)
 		}
 		if status {
-			return runConfineStatusCommand(context.Background(), options, jsonOutput, stdout, stderr)
+			return runConfineStatusCommand(context.Background(), options, renderJSON, stdout, stderr)
 		}
 		// --dump writes a LOCAL FILE (the caller's own filesystem), which is not
 		// something the generic render()-based runConfineManagementCommand does
 		// for any other management flag, so it gets its own command function.
 		if dumpPath != "" {
-			return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
+			return runConfineDumpCommand(context.Background(), options, dumpPath, renderJSON, stdout, stderr, injected)
 		}
 		if management {
-			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
+			return runConfineManagementCommand(context.Background(), options, renderJSON, stdout, stderr, injected)
 		}
 		return runConfineCommand(context.Background(), positional, options, stdin, stdout, stderr)
 	}
@@ -317,14 +379,14 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			if code == "E_INTERNAL" {
 				code = "E_CONFINE_ARGUMENT_INVALID"
 			}
-			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return renderConfineManagement(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		owner, ownerErr := resolveConfineOwner(context.Background(), options["owner"])
 		if ownerErr != nil {
-			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+			return renderConfineManagement(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
 		}
 		request.Args["owner"] = owner
-		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
+		return dispatchConfineManagementRequest(context.Background(), request, renderJSON, stdout, stderr, injected)
 	}
 	// AIRA (admission-counter rebuild) S18. The hyphenated spelling of
 	// `confine --dump <file>`, on the SAME two-spellings-must-both-work
@@ -337,9 +399,9 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if verb == "confine-dump" {
 		dumpPath := options["dump"]
 		if dumpPath == "" {
-			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+			return renderConfineManagement(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
 		}
-		return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
+		return runConfineDumpCommand(context.Background(), options, dumpPath, renderJSON, stdout, stderr, injected)
 	}
 	// AIRA-196. Handled HERE, beside the rest of the confine family and BEFORE
 	// project discovery, for the reason the family shares: a detached confine job
@@ -743,6 +805,11 @@ func removeJSON(argv []string) ([]string, bool) {
 // (AIRA-57). A non-*os.File writer (a buffer, a pipe abstraction in tests)
 // is never a terminal.
 func stdoutIsTerminal(w io.Writer) bool {
+	// A writer may state its own answer (a pty wrapper, a test double standing in
+	// for a terminal); the process's own *os.File is asked of the OS.
+	if known, ok := w.(interface{ IsTerminal() bool }); ok {
+		return known.IsTerminal()
+	}
 	file, ok := w.(*os.File)
 	if !ok {
 		return false
@@ -785,11 +852,19 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	var positional []string
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
+		if arg == "-h" {
+			// A POSITIONAL position (a value is consumed with its option below and
+			// never reaches here), so `create T --body -h` keeps -h as the body.
+			return nil, nil, &helpRequestError{flag: "-h"}
+		}
 		if !strings.HasPrefix(arg, "--") {
 			positional = append(positional, arg)
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
+		if name == "help" {
+			return nil, nil, &helpRequestError{flag: "--help"}
+		}
 		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || ((name == "reasoning-subset" || name == "resolve-ticket") && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") || (name == "hold" && (verb == "create" || verb == "new")) {
 			options[name] = "true"
 			continue
@@ -799,10 +874,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			if strings.HasPrefix(verb, "run-") {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
 			}
-			if verb == "git" {
-				return nil, nil, fmt.Errorf("E_GIT_ARG_INVALID: option --%s is not permitted", name)
-			}
-			return nil, nil, fmt.Errorf("option --%s requires a value", name)
+			return nil, nil, fmt.Errorf("E_SELECTOR_INVALID: option --%s requires a value", name)
 		}
 		i++
 		if name == "label" {
@@ -879,15 +951,15 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"watch":         {"from": true, "from-start": true, "verb": true},
 		"gate":          {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
-	for name := range options {
+	// Sorted, so which bad option is named does not depend on map order.
+	for _, name := range sortedKeys(options) {
 		if !allowed[verb][name] {
 			if strings.HasPrefix(verb, "run-") {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s is not valid for %s", name, verb)
 			}
-			if verb == "git" {
-				return nil, nil, fmt.Errorf("E_GIT_ARG_INVALID: option --%s is not valid for git", name)
-			}
-			return nil, nil, fmt.Errorf("option --%s is not valid for %s", name, verb)
+			// The suggestion is drawn from the verb's own allowed set, so it can
+			// never name an option this parser would refuse (AIRA-211).
+			return nil, nil, fmt.Errorf("E_SELECTOR_INVALID: option --%s is not valid for %s%s", name, verb, optionDidYouMean(name, sortedKeys(allowed[verb])))
 		}
 	}
 	return positional, options, nil
@@ -1456,41 +1528,23 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 // part of the two modes AIRA-243 is about.
 var confineHelpVerbs = []string{"confine", "confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-status"}
 
-// runConfineHelpCommand answers `aira confine --help`. It prints EXACTLY the
-// confine-family rows of the generated dispatch-table help (renderHelp, the
-// same renderer and the same descriptor Usage/Summary strings `aira help`
-// itself uses) rather than a hand-written second copy of the same text: the
-// two can now never drift apart, and every launch option (--memory-reserve
-// and friends) is named because confine's own Usage string already carries
-// the whole launch-form option list.
-//
-// Always plain text, and always exit 0: --help ignores --json exactly like
-// --help ignores every other confine option, matching the top-level `aira
-// --help`/`aira help` convention (AIRA-243).
-func runConfineHelpCommand(stdout, stderr io.Writer) int {
-	response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
-	entries, ok := response.Data.([]map[string]string)
-	if !ok {
-		return render(response, false, stdout, stderr)
+// runConfineHelpCommand answers `aira confine --help` when the request reaches
+// the parser (e.g. `confine --list --help`); the common spelling is answered by
+// the pre-parse. Both use the one renderer, renderVerbHelp, so the confine
+// family rows (the launch form plus its five management subcommands, the same
+// generated dispatch-table text `aira help` prints) can never drift from it.
+func runConfineHelpCommand(renderJSON bool, stdout, stderr io.Writer) int {
+	response, found := verbHelpResponse("confine")
+	if !found {
+		return render(core.New(nil).Do(context.Background(), core.Request{Verb: "help"}), renderJSON, stdout, stderr)
 	}
-	wanted := make(map[string]bool, len(confineHelpVerbs))
-	for _, verb := range confineHelpVerbs {
-		wanted[verb] = true
-	}
-	filtered := make([]map[string]string, 0, len(confineHelpVerbs))
-	for _, entry := range entries {
-		if wanted[entry["verb"]] {
-			filtered = append(filtered, entry)
-		}
-	}
-	return renderHelp(core.Response{OK: true, Data: filtered}, stdout, stderr)
+	return renderVerbHelp(response, renderJSON, stdout, stderr)
 }
 
 func runConfineCommand(ctx context.Context, target []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
 	maximum, high, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID")
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return refuseConfineLaunch(stderr, err)
 	}
 	reserveRaw, reservePinned := options["memory-reserve"]
 	if !reservePinned {
@@ -1504,8 +1558,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 			if err == nil {
 				err = errors.New("must be at least 1MiB")
 			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %v", err))
 		}
 	}
 	// AIRA-62: the CLI TRANSCRIBES, it does not resolve. This used to be
@@ -1531,15 +1584,13 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		}
 		parsed, boundErr := parseConfineJobBound(raw)
 		if boundErr != nil {
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --%s: %v\n", bound.name, boundErr)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s: %v", bound.name, boundErr))
 		}
 		*bound.value = parsed
 	}
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", err)
-		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %v", err))
 	}
 	// AIRA-268. --vram declares the GPU VRAM the job needs; the CLI TRANSCRIBES it
 	// (size parser, same language as --memory-max), the daemon gates admission on
@@ -1551,8 +1602,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 			if err == nil {
 				err = errors.New("must be at least 1MiB")
 			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --vram: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --vram: %v", err))
 		}
 	}
 	// AIRA-281. The summary path is made absolute HERE, once, so a detached
@@ -2224,7 +2274,7 @@ func resolveOwnerIn(ctx context.Context, explicit, dir string) (string, error) {
 func runConfineManagementCommand(ctx context.Context, options map[string]string, jsonOutput bool, stdout, stderr io.Writer, injected Dispatcher) int {
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
-		return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		return renderConfineManagement(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
 	}
 	verb := "confine-list"
 	args := map[string]any{"slice": options["slice"], "owner": owner}
@@ -2250,7 +2300,7 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 	if dispatcher == nil {
 		dispatcher, err = newDaemonDispatcher(nil, stdout, stderr, jsonOutput)
 		if err != nil {
-			return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+			return renderConfineManagement(transportErrorResponse(err), jsonOutput, stdout, stderr)
 		}
 	}
 	response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, request)
@@ -2260,7 +2310,7 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 	if request.Verb == "confine-budget" && !jsonOutput && response.OK {
 		return renderConfineBudgetResponse(response, stdout, stderr)
 	}
-	return render(response, jsonOutput, stdout, stderr)
+	return renderConfineManagement(response, jsonOutput, stdout, stderr)
 }
 
 // dispatchConfineJobIORequest runs `confine-log` / `confine-input` (AIRA-196).

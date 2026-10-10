@@ -37,7 +37,8 @@ func renderConfineList(t *testing.T, scopes []runner.ConfineRecord) string {
 	dispatch := dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, _ core.Request) core.Response {
 		return core.Response{OK: true, Code: "OK", Data: result}
 	})
-	var stdout, stderr bytes.Buffer
+	var stdout terminalBuffer
+	var stderr bytes.Buffer
 	if exit := runWithInputDispatcher([]string{"confine", "--list"}, &stdout, &stderr, strings.NewReader(""), dispatch); exit != 0 {
 		t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
 	}

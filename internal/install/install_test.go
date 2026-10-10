@@ -326,6 +326,18 @@ type fakeInstallState struct {
 	// reports in its lock file (AIRA-283). A fake (re)start adopts the record's
 	// effective ratio, exactly as Serve does; zero means "does not report one".
 	daemonSlotsPerCore int
+
+	// AIRA-203 binary-staleness fixtures. The fake's sameFileContent records
+	// every comparison it is asked for and answers from these fields. The
+	// "pre-restart" quirks apply only until the fake sees a restart, so the
+	// install's own final MainPID/lock verification still sees a healthy daemon.
+	compareCalls   [][2]string
+	binaryDiffers  bool
+	compareErr     error
+	restartSeen    bool
+	mainPIDOut     string // non-empty: `show -p MainPID` prints this before a restart
+	mainPIDErr     error  // non-nil: `show -p MainPID` fails before a restart
+	lockUnreadable bool   // true: daemonStatus reports the corrupt-metadata shape before a restart
 }
 
 func (s *fakeInstallState) unitDir() string {
@@ -357,7 +369,19 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 		return ""
 	}
 	d.daemonPaths = func() (daemon.Paths, error) { return daemon.PathsFromEnvironment(stateHome, runtimeDir, state.home) }
+	d.sameFileContent = func(a, b string) (bool, error) {
+		state.compareCalls = append(state.compareCalls, [2]string{a, b})
+		if state.compareErr != nil {
+			return false, state.compareErr
+		}
+		return !state.binaryDiffers, nil
+	}
 	d.daemonStatus = func(daemon.Paths) daemon.StatusInfo {
+		if state.lockUnreadable && !state.restartSeen {
+			// The shape daemon.Status really produces for a held lock whose metadata
+			// is missing or corrupt: not Running, no PID.
+			return daemon.StatusInfo{}
+		}
 		return daemon.StatusInfo{Running: state.daemonRunning, Ready: state.daemonRunning, Lock: daemon.LockInfo{PID: state.daemonPID, CPUSlotsPerCore: state.daemonSlotsPerCore}}
 	}
 	// adoptRatio models Serve's own record read at daemon start (AIRA-283).
@@ -424,6 +448,8 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 		case joined == "systemctl --user show-environment":
 			return []byte("XDG_RUNTIME_DIR=" + runtimeDir + "\n"), nil
 		case joined == "systemctl --user restart "+defaultDaemonUnit:
+			state.restartSeen = true
+			state.binaryDiffers, state.compareErr = false, nil
 			state.daemonRunning = true
 			adoptRatio()
 			return nil, nil
@@ -436,6 +462,14 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 		case joined == "systemctl --user show -p SubState --value "+defaultDaemonUnit:
 			return []byte("running\n"), nil
 		case joined == "systemctl --user show -p MainPID --value "+defaultDaemonUnit:
+			if !state.restartSeen {
+				if state.mainPIDErr != nil {
+					return nil, state.mainPIDErr
+				}
+				if state.mainPIDOut != "" {
+					return []byte(state.mainPIDOut + "\n"), nil
+				}
+			}
 			return []byte(fmt.Sprintf("%d\n", state.daemonPID)), nil
 		case strings.HasPrefix(joined, "systemctl --user is-active "):
 			return []byte("active\n"), nil

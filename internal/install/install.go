@@ -244,6 +244,9 @@ type installDeps struct {
 	spawnShimDaemon func(shimDaemonSpec) error
 	lstat           func(string) (os.FileInfo, error)
 	readFile        func(string) ([]byte, error)
+	// sameFileContent reports whether two files hold the same bytes (AIRA-203):
+	// the running daemon's /proc/<pid>/exe against the installed binary.
+	sameFileContent func(a, b string) (bool, error)
 	writeFile       func(string, []byte, os.FileMode) error
 	mkdirAll        func(string, os.FileMode) error
 	mkdirTemp       func(string, string) (string, error)
@@ -316,7 +319,7 @@ func realInstallDeps() installDeps {
 			// privilege boundary; os/exec closes all other descriptors.
 			return cmd.Run()
 		},
-		stat: os.Stat, lstat: os.Lstat, readFile: os.ReadFile, writeFile: os.WriteFile,
+		stat: os.Stat, lstat: os.Lstat, readFile: os.ReadFile, sameFileContent: defaultSameFileContent, writeFile: os.WriteFile,
 		lookPath: exec.LookPath, spawnShimDaemon: spawnShimDaemonProcess,
 		mkdirAll: os.MkdirAll, mkdirTemp: os.MkdirTemp, remove: os.Remove, rename: os.Rename,
 		openat: unix.Openat, fstat: unix.Fstat, close: unix.Close,
@@ -1020,6 +1023,7 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		d.logf("planned: loginctl enable-linger %d; verify active/running MainPID equals daemon lock PID", uid)
 		planned, _ := runner.InstallModeRecord{CPUSlotsPerCore: installCPUSlotsPerCore(opts, runner.InstallModePathFor(paths.StateHome))}.EffectiveCPUSlotsPerCore()
 		d.logf("planned: record cpu slots per core %d; restart a present daemon running another ratio", planned)
+		d.logf("planned: restart a present daemon whose running binary differs from %s", executable)
 		return nil
 	}
 
@@ -1222,17 +1226,29 @@ func runUserInstall(d installDeps, opts installOpts) error {
 			return unavailable(fmt.Errorf("restart %s to apply changed unit: %w", d.daemonUnit, err))
 		}
 	} else if daemonPresent {
+		// Two reasons a present daemon with an UNCHANGED unit is still stale, both
+		// invisible to the unit bytes; collected so a single restart serves both.
+		var reasons []string
+		// AIRA-203. It is running a binary other than the one just installed (or
+		// that cannot be compared, which counts: unevaluated means restart).
+		if stale, reason := liveDaemonBinaryStale(d, executable); stale {
+			reasons = append(reasons, reason)
+		}
 		// AIRA-283 (E2). The CPU-slots-per-core ratio lives in the install record,
 		// not in the unit, so a changed ratio leaves the unit bytes identical and
 		// the branch above never fires; the live daemon would keep its OLD ratio
 		// behind a green install. Restart exactly when the ratio it reports (read
-		// once, at its start) differs from the one just recorded -- a convergence
-		// re-run with the same ratio still never bounces it.
+		// once, at its start) differs from the one just recorded.
 		if recorded, live, stale := liveCPUSlotsPerCoreStale(d, paths, record); stale {
+			reasons = append(reasons, fmt.Sprintf("cpu slots per core %d (the live daemon was on %d)", recorded, live))
+		}
+		// A byte-identical convergence run with neither reason never bounces it.
+		if len(reasons) > 0 {
+			why := strings.Join(reasons, "; ")
 			if _, err := d.run([]string{"systemctl", "--user", "restart", d.daemonUnit}, nil); err != nil {
-				return unavailable(fmt.Errorf("restart %s to apply cpu slots per core %d (live daemon is on %d): %w", d.daemonUnit, recorded, live, err))
+				return unavailable(fmt.Errorf("restart %s (%s): %w", d.daemonUnit, why, err))
 			}
-			d.logf("%s: restarted to apply cpu slots per core %d (the live daemon was on %d)", d.daemonUnit, recorded, live)
+			d.logf("%s: restarted: %s", d.daemonUnit, why)
 		}
 	}
 	if d.getenv("AIRA_INSTALL_REEXEC") == "1" {

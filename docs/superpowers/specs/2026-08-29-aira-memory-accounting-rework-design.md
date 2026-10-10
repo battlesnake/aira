@@ -268,7 +268,7 @@ neither touches pylib). Discriminating test `TestRealPytestRAMReservationUsesMea
 (marker 10, RSS 40, headroom 10 → `--bytes 50`) revert-checked against raw estimate.
 
 Deploy: governor is `go:embed`ded + sizing is client-side → binary rebuild+swap
-(+ `aira skill install --force`), **no daemon restart**.
+(+ `aira skill install ~/.claude/skills/aira --force`), **no daemon restart**.
 
 STILL DEFERRED (focused daemon milestone, box-quiet): per-worker STANDING reserve
 + daemon-side atomic ADJUST (round-trip amortise; fixes fail-open hole), keyed

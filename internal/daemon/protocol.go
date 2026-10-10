@@ -187,10 +187,15 @@ const (
 	CodeTimeout        = "E_DAEMON_TIMEOUT"
 	CodeProjectInvalid = "E_DAEMON_PROJECT_INVALID"
 	CodeProtocol       = "E_DAEMON_PROTOCOL"
-	CodeInternal       = "E_DAEMON_INTERNAL"
-	CodeBusy           = "E_DAEMON_BUSY"
-	CodeAdmitTooLarge  = "E_ADMIT_TOO_LARGE"
-	CodeAdmitSaturated = "E_ADMIT_SATURATED"
+	// CodeResponseTooLarge (AIRA-280) answers a reply the daemon built but could
+	// not send because it exceeds the frame limit. Sent INSTEAD of the reply, as
+	// the only frame on the connection, so the client reads a named refusal rather
+	// than EOF.
+	CodeResponseTooLarge = "E_DAEMON_RESPONSE_TOO_LARGE"
+	CodeInternal         = "E_DAEMON_INTERNAL"
+	CodeBusy             = "E_DAEMON_BUSY"
+	CodeAdmitTooLarge    = "E_ADMIT_TOO_LARGE"
+	CodeAdmitSaturated   = "E_ADMIT_SATURATED"
 	// AIRA-268. VRAM admission refusals, decided synchronously at enqueue (the
 	// ceiling seam is there), never queued. VRAMTooLarge: declared VRAM > the
 	// configured budget (can never fit). VRAMUnavailable: a job declared VRAM but
@@ -380,13 +385,26 @@ func readFrame(r io.Reader, value any) error {
 	return nil
 }
 
+// frameTooLargeError is what writeFrame and writeResponse return when they
+// REFUSE for size. Both refuse before writing any byte, so a caller that gets one
+// knows nothing was sent and the connection is still clean for a replacement
+// frame (AIRA-280). Every other write failure is a plain error.
+type frameTooLargeError struct {
+	What        string
+	Size, Limit uint64
+}
+
+func (e *frameTooLargeError) Error() string {
+	return fmt.Sprintf("%s: %s is too large", CodeProtocol, e.What)
+}
+
 func writeFrame(w io.Writer, value any) error {
 	payload, err := marshalNoEscape(value)
 	if err != nil {
 		return err
 	}
 	if len(payload) > MaxFrameBytes {
-		return fmt.Errorf("%s: frame is too large", CodeProtocol)
+		return &frameTooLargeError{What: "frame", Size: uint64(len(payload)), Limit: MaxFrameBytes}
 	}
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
@@ -428,7 +446,7 @@ func writeResponse(w io.Writer, frame ResponseFrame) error {
 		return fmt.Errorf("%s: declared response body length %d does not match %d bytes", CodeProtocol, frame.BodyLen, len(frame.Body))
 	}
 	if frame.BodyLen > StoreOpBodyMax {
-		return fmt.Errorf("%s: response body is too large", CodeProtocol)
+		return &frameTooLargeError{What: "response body", Size: frame.BodyLen, Limit: StoreOpBodyMax}
 	}
 	if err := writeFrame(w, frame); err != nil {
 		return err

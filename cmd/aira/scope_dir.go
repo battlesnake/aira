@@ -167,7 +167,7 @@ func verbAcceptsScopeDir(verb string) bool {
 		// discarded -- silently discarding it is the confidently-wrong shape this
 		// list exists to prevent.
 		"version", "--version", "-v",
-		"help", "--help":
+		"help", "--help", "-h":
 		return false
 	}
 	return true

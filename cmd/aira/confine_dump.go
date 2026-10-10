@@ -20,7 +20,7 @@ import (
 func runConfineDumpCommand(ctx context.Context, options map[string]string, dumpPath string, jsonOutput bool, stdout, stderr io.Writer, injected Dispatcher) int {
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
-		return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		return renderConfineManagement(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
 	}
 	request := core.Request{Verb: "confine-dump", Args: map[string]any{"slice": options["slice"], "owner": owner}}
 	return runConfineDumpExchange(ctx, request, dumpPath, jsonOutput, stdout, stderr, injected)
@@ -42,12 +42,12 @@ func runConfineDumpExchange(ctx context.Context, request core.Request, dumpPath 
 	if dispatcher == nil {
 		dispatcher, dispatchErr = newDaemonDispatcher(nil, stdout, stderr, jsonOutput)
 		if dispatchErr != nil {
-			return render(transportErrorResponse(dispatchErr), jsonOutput, stdout, stderr)
+			return renderConfineManagement(transportErrorResponse(dispatchErr), jsonOutput, stdout, stderr)
 		}
 	}
 	response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, request)
 	if !response.OK {
-		return render(response, jsonOutput, stdout, stderr)
+		return renderConfineManagement(response, jsonOutput, stdout, stderr)
 	}
 	var result runner.ConfineDumpResult
 	data := response.RawData
@@ -55,7 +55,7 @@ func runConfineDumpExchange(ctx context.Context, request core.Request, dumpPath 
 		data, _ = json.Marshal(response.Data)
 	}
 	if err := json.Unmarshal(data, &result); err != nil {
-		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-dump response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
+		return renderConfineManagement(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-dump response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
 	}
 	// AIRA-201-style honesty: an UNEVALUATED verdict (daemon unreachable) must
 	// be reported as "we could not look", never silently written as an empty
@@ -77,7 +77,7 @@ func runConfineDumpExchange(ctx context.Context, request core.Request, dumpPath 
 		return 3
 	}
 	if err := runner.WriteConfineDumpJSONL(dumpPath, result); err != nil {
-		return render(core.Response{Code: "E_CONFINE_DUMP_WRITE", Error: "E_CONFINE_DUMP_WRITE: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_DUMP_WRITE")}, jsonOutput, stdout, stderr)
+		return renderConfineManagement(core.Response{Code: "E_CONFINE_DUMP_WRITE", Error: "E_CONFINE_DUMP_WRITE: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_DUMP_WRITE")}, jsonOutput, stdout, stderr)
 	}
 	// AIRA-82 discipline: --json is accepted for this verb (dispatchConfineManagementRequest's
 	// generic render() path would honour it for a failure above), so the SUCCESS

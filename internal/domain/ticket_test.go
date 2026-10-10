@@ -486,3 +486,37 @@ func TestInvalidTicketFieldNamesFieldValueAndAllowedSet(t *testing.T) {
 		t.Fatalf("ParseTicket refusal = %v, want %s naming severity \"P9\"", parseErr, CodeTicketInvalid)
 	}
 }
+
+// verifies: AIRA-215. A refused transition names the legal next statuses, never
+// calls a non-terminal or unknown status terminal, and is stable across runs
+// (the table is a map; the listing must be sorted).
+func TestValidateTransitionRefusalNamesLegalNextStatuses(t *testing.T) {
+	cases := []struct {
+		from, to Status
+		want     string
+	}{
+		{StatusPlanned, StatusDone, "E_TRANSITION_INVALID: planned -> done is not a legal transition; from planned the legal next statuses are: in-progress, retired, superseded"},
+		{StatusDraft, StatusDone, "E_TRANSITION_INVALID: draft -> done is not a legal transition; from draft the legal next statuses are: planned, retired, superseded"},
+		{StatusDone, StatusPlanned, "E_TRANSITION_INVALID: done -> planned is not a legal transition; from done the legal next statuses are: in-progress, retired, superseded"},
+		{StatusRetired, StatusDone, "E_TRANSITION_INVALID: retired -> done is not a legal transition; retired is terminal and has no legal next status"},
+		{StatusSuperseded, StatusPlanned, "E_TRANSITION_INVALID: superseded -> planned is not a legal transition; superseded is terminal and has no legal next status"},
+		{Status("bogus"), StatusDone, "E_TRANSITION_INVALID: bogus -> done: bogus is not a known status"},
+	}
+	for _, tc := range cases {
+		for run := 0; run < 2; run++ {
+			err := ValidateTransition(tc.from, tc.to)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("run %d: ValidateTransition(%s,%s) = %v; want %q", run, tc.from, tc.to, err, tc.want)
+			}
+		}
+	}
+	if err := ValidateTransition(StatusRetired, StatusDone); strings.Contains(err.Error(), "legal next statuses") {
+		t.Fatalf("terminal refusal must not carry an (empty) successor list: %v", err)
+	}
+	if err := ValidateTransition(Status("bogus"), StatusDone); strings.Contains(err.Error(), "terminal") {
+		t.Fatalf("unknown status must not be called terminal: %v", err)
+	}
+	if err := ValidateTransition(StatusPlanned, StatusInProgress); err != nil {
+		t.Fatalf("legal edge refused: %v", err)
+	}
+}
