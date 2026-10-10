@@ -452,7 +452,9 @@ func TestFormatConfineStatusUnchangedWithoutContainer(t *testing.T) {
 	// AIRA-104's resource facets render on every trailer, container or not, and
 	// (per FormatConfineStatus's own ordering) land AFTER container/container-memory
 	// -- both nil here, so both read as unevaluated.
-	const resources = " peak-rss=unevaluated cpu=unevaluated"
+	// AIRA-281 adds wall=, directly after cpu=, on the same unevaluated-when-unset
+	// discipline.
+	const resources = " peak-rss=unevaluated cpu=unevaluated wall=unevaluated"
 	const want = base + resources
 	if got := FormatConfineStatus(status); got != want {
 		t.Fatalf("trailer drifted for a non-container job:\n got %q\nwant %q", got, want)

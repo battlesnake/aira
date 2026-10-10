@@ -148,6 +148,12 @@ func TestAIRA138ConfineFaceParity(t *testing.T) {
 		if arg.Name == "stdin_connect" {
 			argv = append(argv, "--detach")
 		}
+		// AIRA-281. --summary-tree-hash is refused without --summary-file by design
+		// (a hash with no file to carry it would be silently dropped), so it is
+		// offered with its companion -- the same carve-out, for the same reason.
+		if arg.Name == "summary_tree_hash" {
+			argv = append(argv, "--summary-file", "out.jsonl")
+		}
 		argv = append(argv, "--", "true")
 		if _, _, err := parseArgs("confine", argv); err != nil {
 			t.Fatalf("the core table declares %q but the CLI refuses %s: %v", arg.Name, flag, err)
