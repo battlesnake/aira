@@ -121,7 +121,10 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	renderJSON := jsonOutput || !stdoutIsTerminal(stdout)
 	if scopeDirErr != nil {
 		code := store.ErrorCode(scopeDirErr)
-		return renderConfineRefusal(args, core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+		// argv, not args: removeScopeDir returned argv unchanged, and the --json strip
+		// above can leave a bare `--scope-dir` followed by the verb, which the launch
+		// check would then read as the option's value.
+		return renderConfineRefusal(argv, core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// A verb that resolves no project/worktree scope refuses the override rather
 	// than accepting and discarding it: silently ignoring an explicit scope is
@@ -222,7 +225,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 				// never reads success for a refused command; on a terminal the help
 				// listing precedes the stderr refusal line.
 				refusal := request.otherArgumentsRefusal(verb)
-				code := "E_SELECTOR_INVALID"
+				code := helpRefusalCode(verb)
 				if renderJSON {
 					response.OK, response.Code, response.Error = false, code, refusal
 					response.Exit = codes.ExitForCode(code)

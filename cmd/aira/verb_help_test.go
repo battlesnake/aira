@@ -355,3 +355,101 @@ func suggestedNames(message string) []string {
 	}
 	return names
 }
+
+// verifies: AIRA-211. The TERMINAL branch of the help-among-other-arguments
+// refusal: help listed on stdout, the refusal line on stderr, exit 2. Mutation:
+// replace that branch's tail with `return renderVerbHelp(response, false, stdout,
+// stderr)` (the help-and-succeed shape) -> exit 0 -> RED.
+func TestHelpAmongOtherArgumentsOnATerminalIsARefusal(t *testing.T) {
+	for _, argv := range [][]string{
+		{"gate", "add", "G", "--argv", "df", "-h"},
+		{"mv", "AIRA-1", "--help"},
+	} {
+		var stdout terminalBuffer
+		var stderr bytes.Buffer
+		exit := RunWithDispatcher(argv, &stdout, &stderr, failDispatcher{t})
+		if exit != 2 {
+			t.Fatalf("%q terminal exit=%d, want 2 (stdout=%q stderr=%q)", argv, exit, stdout.String(), stderr.String())
+		}
+		if strings.HasPrefix(strings.TrimSpace(stdout.String()), "{") || !strings.Contains(stdout.String(), argv[0]) {
+			t.Fatalf("%q: terminal stdout is not the human help listing: %q", argv, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "E_SELECTOR_INVALID") {
+			t.Fatalf("%q: terminal stderr has no refusal: %q", argv, stderr.String())
+		}
+	}
+}
+
+// verifies: AIRA-211 / spec 3.3. run-* verbs keep E_RUN_ARGUMENT_INVALID for the
+// help-among-arguments refusal, on a pipe (envelope + stderr) and on a terminal.
+// Mutation: hard-code E_SELECTOR_INVALID in the refusal -> RED.
+func TestHelpAmongOtherArgumentsKeepsRunCodeForRunVerbs(t *testing.T) {
+	argv := []string{"run-log", "RUN-1", "--help"}
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher(argv, &stdout, &stderr, failDispatcher{t})
+	if exit != 2 || !strings.Contains(stdout.String(), `"code":"E_RUN_ARGUMENT_INVALID"`) ||
+		!strings.Contains(stderr.String(), "E_RUN_ARGUMENT_INVALID") || strings.Contains(stdout.String()+stderr.String(), "E_SELECTOR_INVALID") {
+		t.Fatalf("%q piped: exit=%d stdout=%q stderr=%q", argv, exit, stdout.String(), stderr.String())
+	}
+	var terminal terminalBuffer
+	stderr.Reset()
+	exit = RunWithDispatcher(argv, &terminal, &stderr, failDispatcher{t})
+	if exit != 2 || !strings.Contains(stderr.String(), "E_RUN_ARGUMENT_INVALID") || strings.Contains(stderr.String(), "E_SELECTOR_INVALID") {
+		t.Fatalf("%q terminal: exit=%d stderr=%q", argv, exit, stderr.String())
+	}
+}
+
+// verifies: AIRA-211. The "put the flag directly after its option" hint is only
+// true where a flag is accepted as an option value (gate --argv / --env-allow);
+// everywhere else it is omitted rather than offered falsely.
+// Mutation: print the hint for every verb -> RED.
+func TestHelpAmongOtherArgumentsHintOnlyWhereItHolds(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if exit := RunWithDispatcher([]string{"gate", "add", "G", "--argv", "df", "--help"}, &stdout, &stderr, failDispatcher{t}); exit != 2 ||
+		!strings.Contains(stderr.String(), "--argv --help") {
+		t.Fatalf("gate: exit=%d stderr=%q, want the --argv hint", exit, stderr.String())
+	}
+	for _, argv := range [][]string{{"mv", "AIRA-1", "-h"}, {"list", "--by", "status", "--help"}, {"claim", "AIRA-1", "-h"}} {
+		stdout.Reset()
+		stderr.Reset()
+		if exit := RunWithDispatcher(argv, &stdout, &stderr, failDispatcher{t}); exit != 2 {
+			t.Fatalf("%q: exit=%d", argv, exit)
+		}
+		if strings.Contains(stderr.String(), "--argv") || strings.Contains(stderr.String(), "option VALUE") {
+			t.Fatalf("%q: false hint: %q", argv, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "nothing ran") {
+			t.Fatalf("%q: refusal text lost: %q", argv, stderr.String())
+		}
+	}
+}
+
+// verifies: AIRA-82/211. The help/version verbs resolve no scope, so --scope-dir
+// is refused for them; `-h` is spelled the same as `--help`.
+// Mutation: drop "-h" from verbAcceptsScopeDir's refused list -> RED.
+func TestScopeDirIsRefusedForDashH(t *testing.T) {
+	for _, verb := range []string{"help", "--help", "-h"} {
+		if verbAcceptsScopeDir(verb) {
+			t.Fatalf("verbAcceptsScopeDir(%q) = true", verb)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher([]string{"--scope-dir", t.TempDir(), "-h"}, &stdout, &stderr, failDispatcher{t})
+	if exit != 2 || !strings.Contains(stdout.String(), "E_SELECTOR_INVALID") {
+		t.Fatalf("--scope-dir D -h: exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+}
+
+// verifies: AIRA-207. A malformed --scope-dir on a confine launch gets the
+// ran=no line even when --json follows the option: the launch check must read the
+// ORIGINAL argv (removeScopeDir returns it unchanged), not the --json-stripped
+// copy in which `--scope-dir confine` looks like an option and its value.
+// Mutation: pass the stripped args to renderConfineRefusal on that path -> RED.
+func TestMalformedScopeDirConfineLaunchWithJSONSaysNeverRan(t *testing.T) {
+	defer mustNotLaunch(t)()
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher([]string{"--scope-dir", "--json", "confine", "--", "true"}, &stdout, &stderr, failDispatcher{t})
+	if exit == 0 || !strings.Contains(stderr.String(), runner.ConfineNeverRanFacet) {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want a refusal with the ran=no line", exit, stdout.String(), stderr.String())
+	}
+}

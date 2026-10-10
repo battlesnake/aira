@@ -158,13 +158,28 @@ func TestUnpagedConfineDumpAndBudgetAreUnchanged(t *testing.T) {
 		recordLongSubject(t, server.db, letter, 100, base.Add(time.Duration(i)*time.Minute))
 	}
 	dump := decodeDumpPage(t, server.confineDump(map[string]any{"owner": "session-a"}))
-	if len(dump.Admissions) != 3 || dump.Next != nil {
-		t.Fatalf("unpaged dump: %d rows, next=%v", len(dump.Admissions), dump.Next)
+	if len(dump.Admissions) != 3 || dump.Next != nil || dump.Paged {
+		t.Fatalf("unpaged dump: %d rows, next=%v paged=%v", len(dump.Admissions), dump.Next, dump.Paged)
 	}
 	response := server.confineBudget(map[string]any{"owner": "session-a"})
 	budget := response.Data.(runner.ConfineBudgetResult)
-	if len(budget.Subjects) != 3 || budget.Next != nil {
-		t.Fatalf("unpaged budget: %d rows, next=%v", len(budget.Subjects), budget.Next)
+	if len(budget.Subjects) != 3 || budget.Next != nil || budget.Paged {
+		t.Fatalf("unpaged budget: %d rows, next=%v paged=%v", len(budget.Subjects), budget.Next, budget.Paged)
+	}
+}
+
+// verifies: AIRA-280 protocol skew — every PAGED reply, the last (no next) and an
+// empty one included, echoes `paged`, which is the client's proof that a later
+// page really was served as a page. Mutation: drop Paged from either handler -> RED.
+func TestPagedRepliesEchoPaged(t *testing.T) {
+	server := ciDumpTestServer(t)
+	dump := decodeDumpPage(t, server.confineDump(dumpPageArgs("", "")))
+	if !dump.Paged {
+		t.Fatalf("empty paged dump did not echo paged: %+v", dump)
+	}
+	budget := server.confineBudget(dumpPageArgs("", "")).Data.(runner.ConfineBudgetResult)
+	if !budget.Paged {
+		t.Fatalf("empty paged budget did not echo paged: %+v", budget)
 	}
 }
 

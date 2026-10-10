@@ -25,6 +25,10 @@ type historyPeer struct {
 	requests []map[string]any
 }
 
+// prePaging wraps a reply as a daemon that predates AIRA-280 would send it: no
+// `paged` echo, and the whole history regardless of the cursor asked for.
+type prePaging struct{ reply any }
+
 func (p *historyPeer) dispatcher() *daemonDispatcher {
 	d := &daemonDispatcher{}
 	d.exchange = func(_ context.Context, _ string, frame daemon.RequestFrame) (daemon.ResponseFrame, error) {
@@ -36,7 +40,20 @@ func (p *historyPeer) dispatcher() *daemonDispatcher {
 		if index >= len(p.pages) {
 			index = len(p.pages) - 1
 		}
-		switch page := p.pages[index].(type) {
+		page := p.pages[index]
+		// A paging daemon echoes `paged` on every page it serves; a page wrapped in
+		// prePaging is a pre-paging daemon's reply (no echo, whatever was asked).
+		switch typed := page.(type) {
+		case runner.ConfineDumpResult:
+			typed.Paged = true
+			page = typed
+		case runner.ConfineBudgetResult:
+			typed.Paged = true
+			page = typed
+		case prePaging:
+			page = typed.reply
+		}
+		switch page := page.(type) {
 		case daemon.ResponseFrame:
 			return page, nil
 		default:
@@ -406,5 +423,40 @@ func TestCursorAdvancesAcrossAKindBoundary(t *testing.T) {
 	}
 	if rows := readDump(t, path); len(rows) != 2 {
 		t.Fatalf("rows = %v, want both pages", rows)
+	}
+}
+
+// verifies: AIRA-280 protocol skew — the daemon is replaced by a pre-paging one
+// between two page reads (AIRA-203 restarts it on every install). Its page-2
+// reply is the WHOLE history with no cursor; joining it onto page 1 would
+// duplicate every row page 1 already held. The client must refuse it as
+// E_DAEMON_PROTOCOL and write no dump. Mutation: drop the later-page `paged`
+// check in dispatchConfineHistory -> RED (duplicate rows, exit 0).
+func TestLaterPageWithoutThePagedEchoIsAProtocolError(t *testing.T) {
+	peer := &historyPeer{t: t, pages: []any{
+		runner.ConfineDumpResult{Verdict: "ok", Scope: "s", Admissions: []runner.ConfineDumpAdmissionRow{dumpRow("a", i64(10))},
+			Next: &runner.ConfineHistoryCursor{Kind: "confine", Signature: "a"}},
+		prePaging{runner.ConfineDumpResult{Verdict: "ok", Scope: "s", Admissions: []runner.ConfineDumpAdmissionRow{dumpRow("a", i64(10)), dumpRow("b", i64(20))}}},
+	}}
+	path := filepath.Join(t.TempDir(), "dump.jsonl")
+	exit, stdout, stderr := runDump(t, peer.dispatcher(), path)
+	if exit == 0 || !strings.Contains(stdout+stderr, daemon.CodeProtocol) {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want E_DAEMON_PROTOCOL", exit, stdout, stderr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a dump file exists after a protocol error (err=%v)", err)
+	}
+	// The budget twin: the same skew must not join duplicate subjects.
+	budgetPeer := &historyPeer{t: t, pages: []any{
+		runner.ConfineBudgetResult{Verdict: "ok", Scope: "s",
+			Subjects: []runner.ConfineBudgetRow{budgetRow("a", "well-fitted", i64(100), i64(120), false)},
+			Next:     &runner.ConfineHistoryCursor{Kind: "confine", Signature: "a"}},
+		prePaging{runner.ConfineBudgetResult{Verdict: "ok", Scope: "s",
+			Subjects: []runner.ConfineBudgetRow{budgetRow("a", "well-fitted", i64(100), i64(120), false), budgetRow("b", "well-fitted", i64(100), i64(120), false)}}},
+	}}
+	response := budgetPeer.dispatcher().Dispatch(context.Background(), daemon.WorktreeScope{},
+		core.Request{Verb: "confine-budget", Args: map[string]any{"owner": "session-a"}})
+	if response.OK || response.Code != daemon.CodeProtocol {
+		t.Fatalf("budget: ok=%v code=%q, want E_DAEMON_PROTOCOL", response.OK, response.Code)
 	}
 }

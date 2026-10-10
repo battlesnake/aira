@@ -134,6 +134,11 @@ type ConfineDumpResult struct {
 	// Next is set only on a PAGED reply (AIRA-280); see ConfineBudgetResult.Next.
 	// On a paged dump, Waiters and Queues (live state) ride on the first page only.
 	Next *ConfineHistoryCursor `json:"next,omitempty"`
+	// Paged is the daemon echoing that it served this reply as a page (AIRA-280).
+	// A pre-paging daemon ignores the request's `paged` and answers the whole
+	// history, so the client requires this echo on every page after the first: a
+	// later page without it is a skewed daemon and would duplicate every row.
+	Paged bool `json:"paged,omitempty"`
 }
 
 // WriteConfineDumpJSONL writes result's rows as JSONL (Admissions, then

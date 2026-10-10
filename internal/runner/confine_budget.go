@@ -136,6 +136,9 @@ type ConfineBudgetResult struct {
 	// subject first recorded while the pages are being read, sorting before the
 	// cursor, is absent from the joined result.
 	Next *ConfineHistoryCursor `json:"next,omitempty"`
+	// Paged echoes that the daemon served this reply as a page; see
+	// ConfineDumpResult.Paged.
+	Paged bool `json:"paged,omitempty"`
 }
 
 // ConfineHistoryCursor names the last (kind, signature) subject a paged

@@ -45,18 +45,34 @@ func isHelpRequest(err error) bool {
 	return ok
 }
 
+// helpRefusalCode is the stable code of a refused help token: run-* verbs keep
+// their own family code (spec 3.3), every other verb E_SELECTOR_INVALID.
+func helpRefusalCode(verb string) string {
+	if strings.HasPrefix(verb, "run-") {
+		return "E_RUN_ARGUMENT_INVALID"
+	}
+	return "E_SELECTOR_INVALID"
+}
+
 // refusal is what a verb with no help-table entry reports instead.
 func (e *helpRequestError) refusal(verb string) error {
+	code := helpRefusalCode(verb)
 	if e.flag == "-h" {
-		return fmt.Errorf("E_SELECTOR_INVALID: unexpected argument -h for %s", verb)
+		return fmt.Errorf("%s: unexpected argument -h for %s", code, verb)
 	}
-	return fmt.Errorf("E_SELECTOR_INVALID: option --help is not valid for %s", verb)
+	return fmt.Errorf("%s: option --help is not valid for %s", code, verb)
 }
 
 // otherArgumentsRefusal is the stderr line printed when the help token arrived
-// with other arguments: the help is shown, nothing ran, and the exit is 2.
+// with other arguments: the help is shown, nothing ran, and the exit is 2. The
+// "pass it as an option value" hint is offered only where it is true: gate's
+// --argv / --env-allow take a following `--`-prefixed token as their value.
 func (e *helpRequestError) otherArgumentsRefusal(verb string) string {
-	return fmt.Sprintf("E_SELECTOR_INVALID: %s was given with other arguments, so %s was refused and nothing ran (`aira help %s` shows its usage; to pass %s as an option VALUE put it directly after its option, e.g. --argv %s)", e.flag, verb, verb, e.flag, e.flag)
+	text := fmt.Sprintf("%s: %s was given with other arguments, so %s was refused and nothing ran (`aira help %s` shows its usage", helpRefusalCode(verb), e.flag, verb, verb)
+	if verb == "gate" {
+		text += fmt.Sprintf("; to pass %s as an option VALUE put it directly after its option, e.g. --argv %s", e.flag, e.flag)
+	}
+	return text + ")"
 }
 
 // verbsWithoutHelpEntry are the dispatched verbs that have no help-table entry

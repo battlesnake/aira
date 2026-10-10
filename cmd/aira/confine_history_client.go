@@ -29,6 +29,9 @@ const maxConfineHistoryPages = 1 << 20
 //     daemon-down UNEVALUATED answer) is returned as the whole answer;
 //   - a `next` cursor that does not sort strictly after the previous one is
 //     E_DAEMON_PROTOCOL, so a stuck daemon cannot spin the client;
+//   - every page after the first must carry the daemon's `paged` echo, so a
+//     pre-paging daemon taking over mid-read (its whole-history reply) is
+//     E_DAEMON_PROTOCOL rather than a join of duplicate rows;
 //   - a page without `next` ends the join, even an empty one: history deleted
 //     between two page reads can leave nothing after the cursor.
 //
@@ -57,6 +60,7 @@ func (d *daemonDispatcher) dispatchConfineHistory(ctx context.Context, request c
 		}
 		var next *runner.ConfineHistoryCursor
 		var verdict string
+		var echoedPaged bool
 		data := response.RawData
 		if len(data) == 0 {
 			// The daemon-down fallback carries a typed value, not wire bytes.
@@ -71,7 +75,10 @@ func (d *daemonDispatcher) dispatchConfineHistory(ctx context.Context, request c
 			if err := json.Unmarshal(data, &result); err != nil {
 				return historyProtocolError("invalid confine-dump response")
 			}
-			verdict, next = result.Verdict, result.Next
+			verdict, next, echoedPaged = result.Verdict, result.Next, result.Paged
+			if verdict == "ok" && haveFirst && !echoedPaged {
+				return notPagedError()
+			}
 			if verdict == "ok" {
 				if !haveFirst {
 					dump = result
@@ -84,7 +91,10 @@ func (d *daemonDispatcher) dispatchConfineHistory(ctx context.Context, request c
 			if err := json.Unmarshal(data, &result); err != nil {
 				return historyProtocolError("invalid confine-budget response")
 			}
-			verdict, next = result.Verdict, result.Next
+			verdict, next, echoedPaged = result.Verdict, result.Next, result.Paged
+			if verdict == "ok" && haveFirst && !echoedPaged {
+				return notPagedError()
+			}
 			if verdict == "ok" {
 				if !haveFirst {
 					budget = result
@@ -121,6 +131,14 @@ func joinedHistoryResponse(isDump bool, dump runner.ConfineDumpResult, budget ru
 	budget.Next = nil
 	store.SortConfineBudgetRows(budget.Subjects)
 	return core.Response{OK: true, Code: "OK", Data: budget}
+}
+
+// notPagedError refuses a later page that does not prove it was served as a page.
+// A daemon replaced by a pre-paging one between two reads ignores the cursor and
+// answers the whole history; joining that onto the earlier pages would duplicate
+// every row, so it is a protocol error, never a join.
+func notPagedError() core.Response {
+	return historyProtocolError("confine history page was not served as a page (daemon changed mid-read)")
 }
 
 func historyProtocolError(why string) core.Response {

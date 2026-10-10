@@ -143,6 +143,7 @@ func (s *Server) confineDumpPage(page historyPage) core.Response {
 		Waiters:    waiters,
 		Queues:     queues,
 		Next:       next,
+		Paged:      true,
 	}}
 }
 
@@ -157,5 +158,13 @@ func (s *Server) confineBudgetPage(page historyPage) core.Response {
 	if err != nil {
 		return core.Response{Code: CodeInternal, Error: CodeInternal + ": read usage history: " + err.Error()}
 	}
-	return core.Response{OK: true, Code: "OK", Data: confineBudgetResult(verdicts, next)}
+	return core.Response{OK: true, Code: "OK", Data: pagedBudgetResult(verdicts, next)}
+}
+
+// pagedBudgetResult is confineBudgetResult plus the `paged` echo the client
+// requires on every page after the first.
+func pagedBudgetResult(verdicts []store.ResourceBudgetVerdict, next *runner.ConfineHistoryCursor) runner.ConfineBudgetResult {
+	result := confineBudgetResult(verdicts, next)
+	result.Paged = true
+	return result
 }
