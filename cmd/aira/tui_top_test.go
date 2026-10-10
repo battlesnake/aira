@@ -14,6 +14,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -717,24 +718,14 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 	go func() { done <- runtime.run() }()
 	select {
 	case <-drawn:
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("initial draw timed out")
 	}
-	deadline := time.Now().Add(2 * time.Second)
 	var rendered string
-	for time.Now().Before(deadline) {
-		text := make(chan string, 1)
-		go runtime.app.QueueUpdateDraw(func() { text <- runtime.topBar.GetText(true) })
-		select {
-		case rendered = <-text:
-		case <-time.After(200 * time.Millisecond):
-			t.Fatal("the tview loop stopped answering")
-		}
-		if strings.Contains(rendered, "total ") {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	eventuallyOnUI(t, runtime, 2*time.Second, func() bool {
+		rendered = runtime.topBar.GetText(true)
+		return strings.Contains(rendered, "total ")
+	}, "the top bar never rendered its totals")
 	if !strings.Contains(rendered, "total 65536M") || !strings.Contains(rendered, "soft (memory.high) 28672M") {
 		t.Fatalf("bar text=%q, want the totals and the soft-limit legend", rendered)
 	}
@@ -756,28 +747,14 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 	// The single-colour rule, checked with the tags LEFT IN (GetText(false)): the
 	// ONE slot colour must tag both alpha's used █ and its idle ▒, so the job reads
 	// as one bar rather than the two the old bright/dark shades produced.
-	tagged := make(chan string, 1)
-	go runtime.app.QueueUpdateDraw(func() { tagged <- runtime.topBar.GetText(false) })
-	var markup string
-	select {
-	case markup = <-tagged:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("the tview loop stopped answering the tagged read")
-	}
+	markup := onUI(t, runtime, func() string { return runtime.topBar.GetText(false) })
 	alpha := topSlotColour(0)
 	if !strings.Contains(markup, "["+alpha+"]"+topBarSolidGlyph+"[-]") ||
 		!strings.Contains(markup, "["+alpha+"]"+topBarIdleGlyph+"[-]") {
 		t.Fatalf("tagged bar=%q, want alpha's used █ and idle ▒ BOTH in the one colour %s", markup, alpha)
 	}
-	rows := make(chan int, 1)
-	go runtime.app.QueueUpdateDraw(func() { rows <- runtime.tables[viewTop].GetRowCount() })
-	select {
-	case count := <-rows:
-		if count != 3 { // one header plus two scopes
-			t.Fatalf("table rows=%d, want a header and two scopes", count)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("table read timed out")
+	if count := onUI(t, runtime, func() int { return runtime.tables[viewTop].GetRowCount() }); count != 3 { // one header plus two scopes
+		t.Fatalf("table rows=%d, want a header and two scopes", count)
 	}
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
@@ -785,7 +762,7 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("run=%v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("quit timed out")
 	}
 	calls, unwanted := dispatcher.snapshot()

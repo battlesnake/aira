@@ -16,6 +16,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/testdeadline"
 )
 
 func executeEntryMap(entries []executeEntry) map[string]executeEntry {
@@ -293,7 +294,7 @@ func TestDetachedConfirmIsAsyncGuardedAndTerminalIndependent(t *testing.T) {
 	}
 	select {
 	case <-dispatcher.started:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("detached executor job did not dispatch")
 	}
 	// Re-present the exact same immutable confirmation while the first job is
@@ -305,7 +306,7 @@ func TestDetachedConfirmIsAsyncGuardedAndTerminalIndependent(t *testing.T) {
 	select {
 	case <-dispatcher.started:
 		t.Fatal("double confirm enqueued a second detached dispatch")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond): // negative wait: contention can only make this pass
 	}
 	if got := dispatcher.dispatches.Load(); got != 1 {
 		t.Fatalf("double confirm dispatched %d times", got)
@@ -315,7 +316,7 @@ func TestDetachedConfirmIsAsyncGuardedAndTerminalIndependent(t *testing.T) {
 	}
 	close(dispatcher.release)
 	var message tuiMessage
-	deadline := time.After(time.Second)
+	deadline := testdeadline.After(time.Second)
 	for message.Kind != msgExecuteDetachedResult {
 		select {
 		case message = <-runtime.executor.messages:
@@ -517,7 +518,7 @@ func TestTUISignalLoopSwallowsDuringExecuteAndCancelsWhenIdle(t *testing.T) {
 	signals <- syscall.SIGINT
 	select {
 	case <-processed:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("signal loop did not process SIGINT while execute was running")
 	}
 	mu.Lock()
@@ -530,7 +531,7 @@ func TestTUISignalLoopSwallowsDuringExecuteAndCancelsWhenIdle(t *testing.T) {
 	signals <- syscall.SIGINT
 	select {
 	case <-processed:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("signal loop did not process SIGINT while idle")
 	}
 	mu.Lock()
@@ -542,7 +543,7 @@ func TestTUISignalLoopSwallowsDuringExecuteAndCancelsWhenIdle(t *testing.T) {
 	stop()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("signal loop did not stop with context")
 	}
 }

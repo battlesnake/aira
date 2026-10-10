@@ -15,6 +15,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -91,7 +92,7 @@ func TestOverviewSmokeRendersCardsAndOpens(t *testing.T) {
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("overview did not quit after Enter")
 	}
 	if rt.state.Overview == nil || rt.state.Overview.Chosen == nil {
@@ -109,17 +110,14 @@ func TestOverviewSmokeFilter(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	rt := newOverviewRuntime(ctx, overviewFixtureDispatcher{}, nil, nil, nil, screen)
+	keys := trackKeys(rt, screen)
 	done := make(chan int, 1)
 	go func() { done <- runTUIRuntime(rt, nil) }()
 	waitForSimulationText(t, rt, screen, "beta")
 	resizeBoardScreen(t, rt, screen, 160, 40)
 
-	screen.InjectKey(tcell.KeyRune, '/', tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
-	for _, ch := range "beta" {
-		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
-		time.Sleep(10 * time.Millisecond)
-	}
+	keys.press(t, runeKey('/'))
+	keys.typeText("beta")
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
 	// Wait for the filter to be APPLIED (the footer's active-filter marker appears
 	// only once Search is active + submitted) — not merely for the beta CARD, which
@@ -134,7 +132,7 @@ func TestOverviewSmokeFilter(t *testing.T) {
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("overview filter smoke did not quit")
 	}
 }
@@ -181,7 +179,7 @@ func TestBoardOuterLoopTransitions(t *testing.T) {
 		select {
 		case r := <-done:
 			return r.scope, r.code
-		case <-time.After(4 * time.Second):
+		case <-testdeadline.After(4 * time.Second):
 			t.Fatal("overview hop did not return")
 			return nil, 0
 		}
@@ -207,7 +205,7 @@ func TestBoardOuterLoopTransitions(t *testing.T) {
 		select {
 		case r := <-done:
 			return r.to, r.code
-		case <-time.After(4 * time.Second):
+		case <-testdeadline.After(4 * time.Second):
 			t.Fatal("board hop did not return")
 			return false, 0
 		}
@@ -233,7 +231,7 @@ func TestBoardOuterLoopTransitions(t *testing.T) {
 	settle := func() {
 		for i := 0; i < 20; i++ {
 			runtime.GC()
-			time.Sleep(15 * time.Millisecond)
+			time.Sleep(15 * time.Millisecond) // poll pacing for the GC settle loop, not synchronisation
 		}
 	}
 	settle()
@@ -303,7 +301,7 @@ func TestOverviewLazyCountFetchedOnce(t *testing.T) {
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("overview lazy-count smoke did not quit")
 	}
 }
@@ -346,7 +344,7 @@ func TestBoardHopsQuitAndSignal(t *testing.T) {
 		select {
 		case r := <-done:
 			return r.to, r.code
-		case <-time.After(4 * time.Second):
+		case <-testdeadline.After(4 * time.Second):
 			t.Fatal("board hop did not return")
 			return false, 0
 		}
@@ -376,7 +374,7 @@ func TestBoardHopsQuitAndSignal(t *testing.T) {
 		select {
 		case r := <-done:
 			return r.scope, r.code
-		case <-time.After(4 * time.Second):
+		case <-testdeadline.After(4 * time.Second):
 			t.Fatal("overview hop did not return")
 			return nil, 0
 		}
@@ -452,7 +450,7 @@ func TestBoardRunLoopFullCycle(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("runBoard full cycle exited %d, want 0", code)
 		}
-	case <-time.After(6 * time.Second):
+	case <-testdeadline.After(6 * time.Second):
 		t.Fatal("runBoard full cycle did not exit")
 	}
 }
