@@ -643,7 +643,11 @@ func (r *Runner) forceDetachedQuiesce(ctx context.Context, id string, record Run
 	killErr := scope.Kill()
 	var emptyErr error
 	if killErr == nil {
-		emptyErr = waitEmpty(ctx, scope, r.grace)
+		confirm := r.grace
+		if r.quiesceConfirmBound > 0 {
+			confirm = r.quiesceConfirmBound
+		}
+		emptyErr = waitEmpty(ctx, scope, confirm)
 	} else {
 		empty, checkErr := scope.Empty()
 		if checkErr != nil {
