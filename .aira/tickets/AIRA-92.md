@@ -144,6 +144,6 @@ evidence). ## Deployed
 
 Binary rebuilt from merged master (`ac901cb` + the follow-up ticket-bookkeeping
 commit `3694bc2`, confined build, smoke-tested before install), skill
-reinstalled (`aira skill install --force`), `aira-daemon.service` restarted.
+reinstalled (`aira skill install --force` [as recorded; that spelling had no directory and installed into `./--force/` (AIRA-212), not the real skill directory]), `aira-daemon.service` restarted.
 AIRA-91 remains open and is explicitly NOT closed by this — its root cause
 is separate and unestablished; see AIRA-91.

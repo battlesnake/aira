@@ -331,3 +331,98 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-212. `skill install --force` with no directory used to treat
+// "--force" as the directory and create ./--force/. Each case runs in its own
+// temp cwd with a filesystem assertion.
+func TestSkillInstallFlagHandling(t *testing.T) {
+	inTempCWD := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		t.Chdir(dir)
+		return dir
+	}
+	assertNoFlagDirs := func(t *testing.T, cwd string) {
+		t.Helper()
+		for _, name := range []string{"--force", "--"} {
+			if _, err := os.Stat(filepath.Join(cwd, name)); !os.IsNotExist(err) {
+				t.Fatalf("a directory named %q was created (err=%v)", name, err)
+			}
+		}
+	}
+	for _, args := range [][]string{
+		{"skill", "install", "--force"},
+		{"skill", "install", "--"},
+		{"skill", "install", "--force", "--force"},
+		{"skill", "install", "-x"},
+		{"skill", "install"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			cwd := inTempCWD(t)
+			var out, stderr bytes.Buffer
+			if exit := Run(args, &out, &stderr); exit != 2 {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", exit, out.String(), stderr.String())
+			}
+			if strings.Contains(out.String(), "version:") {
+				t.Fatalf("install ran: %q", out.String())
+			}
+			if !strings.Contains(stderr.String(), "usage: aira skill install <dir> [--force]") {
+				t.Fatalf("no usage line: %q", stderr.String())
+			}
+			assertNoFlagDirs(t, cwd)
+			entries, _ := os.ReadDir(cwd)
+			if len(entries) != 0 {
+				t.Fatalf("cwd not empty after refusal: %v", entries)
+			}
+		})
+	}
+	for name, build := range map[string]func(dir string) []string{
+		"force_first": func(dir string) []string { return []string{"skill", "install", "--force", dir} },
+		"force_last":  func(dir string) []string { return []string{"skill", "install", dir, "--force"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			inTempCWD(t)
+			target := filepath.Join(t.TempDir(), "skill")
+			var out, stderr bytes.Buffer
+			if exit := Run(build(target), &out, &stderr); exit != 0 {
+				t.Fatalf("fresh install exit=%d stderr=%q", exit, stderr.String())
+			}
+			for _, f := range []string{"SKILL.md", "aira.skill.json"} {
+				if _, err := os.Stat(filepath.Join(target, f)); err != nil {
+					t.Fatalf("%s missing: %v", f, err)
+				}
+			}
+			good, err := os.ReadFile(filepath.Join(target, "SKILL.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(target, "SKILL.md"), []byte("different\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			out.Reset()
+			stderr.Reset()
+			if exit := Run(build(target), &out, &stderr); exit != 0 {
+				t.Fatalf("forced overwrite exit=%d stderr=%q", exit, stderr.String())
+			}
+			now, err := os.ReadFile(filepath.Join(target, "SKILL.md"))
+			if err != nil || !bytes.Equal(now, good) {
+				t.Fatalf("--force did not overwrite the differing SKILL.md (err=%v)", err)
+			}
+		})
+	}
+	t.Run("no_force_refuses_differing", func(t *testing.T) {
+		inTempCWD(t)
+		target := filepath.Join(t.TempDir(), "skill")
+		var out, stderr bytes.Buffer
+		if exit := Run([]string{"skill", "install", target}, &out, &stderr); exit != 0 {
+			t.Fatalf("fresh install exit=%d stderr=%q", exit, stderr.String())
+		}
+		if err := os.WriteFile(filepath.Join(target, "SKILL.md"), []byte("different\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stderr.Reset()
+		if exit := Run([]string{"skill", "install", target}, &out, &stderr); exit == 0 || !strings.Contains(stderr.String(), "without --force") {
+			t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
+		}
+	})
+}

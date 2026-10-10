@@ -13,6 +13,8 @@ import (
 
 const skillUsage = "usage: aira skill guide | install <dir> [--force]"
 
+const skillInstallUsage = "usage: aira skill install <dir> [--force] (<dir> is required; a directory really named like a flag can be written ./-name)"
+
 func runSkill(argv []string, stdout, stderr io.Writer) int {
 	if len(argv) == 1 && strings.ToLower(argv[0]) == "guide" {
 		artifacts, err := core.GenerateSkillArtifacts(core.New(nil).DispatchDescriptors())
@@ -22,12 +24,22 @@ func runSkill(argv []string, stdout, stderr io.Writer) int {
 		_, _ = stdout.Write(artifacts.Guide)
 		return 0
 	}
-	if len(argv) >= 2 && strings.ToLower(argv[0]) == "install" {
-		if len(argv) > 3 || (len(argv) == 3 && argv[2] != "--force") {
-			return skillUsageError(stderr)
+	if len(argv) >= 1 && strings.ToLower(argv[0]) == "install" {
+		// --force is a flag wherever it appears, never the directory (AIRA-212).
+		force := false
+		var rest []string
+		for _, arg := range argv[1:] {
+			if arg == "--force" {
+				force = true
+				continue
+			}
+			rest = append(rest, arg)
 		}
-		force := len(argv) == 3
-		return installSkill(argv[1], force, stdout, stderr)
+		if len(rest) != 1 || strings.HasPrefix(rest[0], "-") {
+			_, _ = fmt.Fprintln(stderr, skillInstallUsage)
+			return 2
+		}
+		return installSkill(rest[0], force, stdout, stderr)
 	}
 	return skillUsageError(stderr)
 }
