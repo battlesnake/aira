@@ -89,9 +89,13 @@ func TestTUIKeyBarrierReturnsOnlyAfterEveryEarlierHandlerReturned(t *testing.T) 
 		t.Fatalf("press returned before every earlier handler returned: X=%v Y=%v", handledX.Load(), handledY.Load())
 	}
 
-	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	// The test's own capture swallows every key (including q), so stop the app directly.
 	rt.app.Stop()
-	<-done
+	select {
+	case <-done:
+	case <-testdeadline.After(3 * time.Second):
+		t.Fatal("TUI did not stop")
+	}
 }
 
 // TestTUIUIReadsTolerateASlowLoop stalls the loop for 300 ms (a fault injection)
