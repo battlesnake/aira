@@ -1143,28 +1143,20 @@ func (r confineReadiness) String() string {
 // confineKillReadiness classifies the one record named exactly name in the output of
 // an aira_confine_list MCP call. More than one record with that exact name is an
 // error (the kill selector would be refused as ambiguous), as is output that does not
-// decode. A neighbour whose name merely contains or extends ours is not ours.
+// decode. A decodable reply that lists no scopes (ok:false, a protocol error) names no
+// record: readinessAbsent, so an environment that cannot list confines ends the poll
+// unevaluated at its deadline rather than failing. A neighbour whose name merely
+// contains or extends ours is not ours.
 func confineKillReadiness(output []byte, name string) (confineReadiness, runner.ConfineRecord, error) {
 	var envelope struct {
 		Result struct {
 			StructuredContent struct {
-				OK   bool                     `json:"ok"`
-				Code string                   `json:"code"`
 				Data runner.ConfineListResult `json:"data"`
 			} `json:"structuredContent"`
 		} `json:"result"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(output), &envelope); err != nil {
 		return readinessAbsent, runner.ConfineRecord{}, fmt.Errorf("undecodable confine list output: %w", err)
-	}
-	if envelope.Error != nil {
-		return readinessAbsent, runner.ConfineRecord{}, fmt.Errorf("confine list returned a protocol error: %s", envelope.Error.Message)
-	}
-	if !envelope.Result.StructuredContent.OK {
-		return readinessAbsent, runner.ConfineRecord{}, fmt.Errorf("confine list was not ok (code %q)", envelope.Result.StructuredContent.Code)
 	}
 	var ours []runner.ConfineRecord
 	for _, record := range envelope.Result.StructuredContent.Data.Scopes {
@@ -1239,7 +1231,10 @@ func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.
 		{"ours placed beside a neighbour", list(onDisk("other", &no), onDisk(name, &yes)), readinessPlaced, false},
 		{"two named ours", list(onDisk(name, &yes), onDisk(name, &yes)), readinessAbsent, true},
 		{"garbage", []byte("not json"), readinessAbsent, true},
-		{"not ok", []byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":false,"code":"E_X"}}}`), readinessAbsent, true},
+		// A list that cannot be produced (no aira.slice, daemon unavailable) names no
+		// record: absent, so the poll keeps going and its expiry reports unevaluated.
+		{"not ok", []byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":false,"code":"E_X"}}}`), readinessAbsent, false},
+		{"protocol error", []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}`), readinessAbsent, false},
 	} {
 		got, _, err := confineKillReadiness(tc.output, name)
 		if (err != nil) != tc.fail {

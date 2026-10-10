@@ -335,7 +335,11 @@ func TestTUIDestructiveConfirmationRequiresExactResolvedID(t *testing.T) {
 	tabToPaletteSubmit(t, runtime, keys)
 	keys.press(t, specialKey(tcell.KeyEnter))
 	eventuallyOnUI(t, runtime, time.Second, func() bool { return runtime.paletteConfirmForm != nil }, "the destructive confirmation form was never built")
-	waitForSimulationText(t, runtime, screen, "Confirm DESTRUCTIVE mutation")
+	// The modal is 90 columns wide: resize so it is not clipped, then require the
+	// "Type <ID>:" field itself to be visible (focus starts on Cancel, so a form
+	// that is too short scrolls that row off screen).
+	resizeBoardScreen(t, runtime, screen, 110, 36)
+	waitForSimulationText(t, runtime, screen, "Type RANT-7")
 
 	checkDisabled := func(want bool) {
 		t.Helper()

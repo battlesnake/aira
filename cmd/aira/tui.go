@@ -1107,7 +1107,7 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	form.SetFocus(form.GetFormItemCount() + 1)
 	content := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(details, 0, 1, false).
-		AddItem(form, form.GetFormItemCount()+5, 0, true)
+		AddItem(form, form.GetFormItemCount()+6, 0, true) // border 2 + padding 2 + item + gap + buttons: one row short hides the focused-Cancel form's "Type <ID>:" input
 	r.outerPages.RemovePage(paletteConfirmPage).
 		AddPage(paletteConfirmPage, centeredPrimitive(content, 90, 26), true, true).
 		SwitchToPage(paletteConfirmPage)
