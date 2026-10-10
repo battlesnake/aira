@@ -257,6 +257,9 @@ type ConfineStatus struct {
 	// append unescaped to the space-delimited trailer: validateConfineName forbids
 	// spaces, '=' and ':'.
 	Name string `json:"name,omitempty"`
+	// Owner is the normalised owner (AIRA-281), set beside Name once identity is
+	// validated; it exists for the --summary-file line and is not on the trailer.
+	Owner string `json:"owner,omitempty"`
 	// Containment is AIRA-121's kind-of-containment facet. Always rendered on
 	// the trailer (see FormatConfineStatus); empty reads as unevaluated, never
 	// as enforced.
@@ -318,6 +321,24 @@ type ConfineStatus struct {
 	PeakRSS *int64 `json:"peak_rss,omitempty"`
 	CPUUser *int64 `json:"cpu_user,omitempty"`
 	CPUSys  *int64 `json:"cpu_sys,omitempty"`
+	// AIRA-281. WallUS is the job's wall time in microseconds, from the release
+	// write (the instant the setup shim may exec the target) to the return of
+	// cmd.Wait(). It therefore excludes the admission wait and the setup handshake.
+	// "Release to wait completion", not "to the reap": on the real path Go's Wait
+	// also drains the job's stderr copier, so a descendant that keeps stderr open
+	// lengthens it; in ci-shim mode the streams are files and it is the reap. Nil
+	// means not established (never a fabricated zero).
+	WallUS *int64 `json:"wall_us,omitempty"`
+	// RusageUserUS, RusageSysUS and RusageMaxRSS come from the wait4 the supervisor
+	// already makes, in BOTH modes. They cover the job's process and every
+	// descendant some process waited for (orphaned or daemonised descendants are
+	// missing, so CPU is a lower bound); RusageMaxRSS is the peak of the single
+	// largest such process (ru_maxrss KiB * 1024), NOT a tree total. They are
+	// deliberately separate from PeakRSS/CPUUser/CPUSys, which are the whole-subtree
+	// cgroup counters, and never reach the reserve estimator (AIRA-121 gate C10).
+	RusageUserUS *int64 `json:"rusage_user_us,omitempty"`
+	RusageSysUS  *int64 `json:"rusage_sys_us,omitempty"`
+	RusageMaxRSS *int64 `json:"rusage_maxrss,omitempty"`
 	// TerminatedBy is the terminal-attribution facet (AIRA-70, AIRA-91 Part A).
 	// It carries a json tag like its siblings because AIRA-22's durable record
 	// stores this struct, and this is the facet such a record most needs.
@@ -571,6 +592,16 @@ type ConfineRequest struct {
 	// warning has no reader) is refused; ordinary launches, and a transient
 	// daemon-restart window, are unaffected.
 	RequireAdmission bool
+	// AIRA-281. SummaryFile is the ABSOLUTE path of a file to which Confine appends
+	// exactly one JSON line (schema ConfineSummarySchema) when the job ends,
+	// including a ran:false line for a job refused before it ran. Opened UP FRONT,
+	// before admission, so a bad path refuses the launch instead of losing the line
+	// after a long job. It is an exported field so a detached supervisor, which
+	// receives the request through its control file, writes to the same file the
+	// launcher named. SummaryTreeHash is an opaque caller-supplied label copied
+	// into the line verbatim; it requires SummaryFile.
+	SummaryFile     string
+	SummaryTreeHash string
 	// AIRA-247. FailFast marks this task as a fail-fast trigger: if it exits
 	// non-zero, the client reports a "trip" to the daemon, which (ONLY in ci-shim
 	// mode) stops admitting new tasks and kills the running ones. Opt-in, default
@@ -858,10 +889,7 @@ func FormatConfineNeverRan(status ConfineStatus, err error) string {
 	// separates "the box was full, retry when it frees up" from "this launch was
 	// never admissible as asked" — the same distinction the exit-code bucketing
 	// in internal/codes already draws, made legible without parsing prose.
-	admission := status.AdmissionState
-	if admission == "" {
-		admission = string(status.Admission)
-	}
+	admission := confineAdmissionFacet(status)
 	if admission == "" {
 		admission = "unevaluated"
 	}
@@ -913,15 +941,84 @@ func confineErrorCode(err error) string {
 // exit-code passthrough contract (AIRA-138 §5.4) is untouched: this adds one
 // diagnostic line and changes no exit code, on any arm.
 func Confine(ctx context.Context, request ConfineRequest) (ConfineResult, error) {
-	result, err := confine(ctx, request)
+	diagnostics := request.Stderr
+	if diagnostics == nil {
+		diagnostics = os.Stderr
+	}
+	// AIRA-281. Everything that can refuse the launch because of the summary file
+	// happens HERE, before confineImpl runs: no admission, no daemon contact, no
+	// child. A bad path discovered after a long job would lose the job's line.
+	summaryFD, result, err := prepareConfineSummary(request)
+	if err == nil {
+		result, err = confineImpl(ctx, request)
+	}
 	if err != nil {
-		diagnostics := request.Stderr
-		if diagnostics == nil {
-			diagnostics = os.Stderr
-		}
 		_, _ = fmt.Fprintln(diagnostics, FormatConfineNeverRan(result.Status, err))
 	}
+	if summaryFD >= 0 {
+		// One attempted append, after the outcome is final. The summary never
+		// changes the return value: a failed write is a stderr diagnostic only.
+		line, formatErr := FormatConfineSummary(request, result, err)
+		if formatErr == nil {
+			formatErr = appendConfineSummary(summaryFD, line)
+		}
+		closeConfineSummaryFile(summaryFD)
+		if formatErr != nil {
+			_, _ = fmt.Fprintf(diagnostics, "confine: %s path=%s cause=%v\n", ConfineSummaryUnwrittenFacet, request.SummaryFile, formatErr)
+		}
+	}
 	return result, err
+}
+
+// confineImpl is the launch implementation the funnel calls. A package variable
+// only so a test can substitute a canned (result, error) and prove what the
+// funnel does with it.
+var confineImpl = confine
+
+// ConfineSummaryUnwrittenFacet is the fixed token on the one stderr diagnostic
+// printed when the --summary-file line could not be written. A reader may key on
+// it as a fixed string, the way it keys on `ran=no`.
+const ConfineSummaryUnwrittenFacet = "summary-file=unwritten"
+
+// prepareConfineSummary validates the --summary-file / --summary-tree-hash pair
+// and opens the file up front. It returns the open fd (or -1 when no summary was
+// asked for or the launch is refused) and, on refusal, a result whose status
+// names the slice that was attempted -- exactly as every early abort in
+// confineWithDeps does -- so the never-ran trailer is as informative as any other.
+func prepareConfineSummary(request ConfineRequest) (int, ConfineResult, error) {
+	refuse := func(err error) (int, ConfineResult, error) {
+		slice := ResolveConfineSlice(request.Slice)
+		if slice == "" {
+			slice = DefaultConfineSlice
+		}
+		return -1, ConfineResult{Status: ConfineStatus{Slice: slice}}, err
+	}
+	// Unconditional, so a programmatic caller gets the CLI's answer: a hash with no
+	// file to carry it is refused, not silently dropped.
+	if request.SummaryTreeHash != "" {
+		if err := ValidateConfineSummaryTreeHash(request.SummaryTreeHash); err != nil {
+			return refuse(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", err))
+		}
+		if request.SummaryFile == "" {
+			return refuse(errors.New("E_CONFINE_ARGUMENT_INVALID: --summary-tree-hash requires --summary-file"))
+		}
+	}
+	if request.SummaryFile == "" {
+		return -1, ConfineResult{}, nil
+	}
+	// The runner only ever writes to an absolute path, so a detached supervisor
+	// (whose cwd is not the launcher's) names the same file as the foreground path.
+	if !filepath.IsAbs(request.SummaryFile) {
+		return refuse(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --summary-file %s: path must be absolute", request.SummaryFile))
+	}
+	fd, err := openConfineSummaryFile(request.SummaryFile)
+	if err != nil {
+		if confineErrorCode(err) != "" {
+			return refuse(err)
+		}
+		return refuse(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --summary-file %s: %w", request.SummaryFile, err))
+	}
+	return fd, ConfineResult{}, nil
 }
 
 func FormatConfineBytes(value int64) string {
@@ -974,10 +1071,7 @@ func FormatConfineStatus(status ConfineStatus) string {
 			line += " reserve-basis=" + status.ReserveBasis
 		}
 	}
-	admissionFacet := status.AdmissionState
-	if admissionFacet == "" {
-		admissionFacet = string(status.Admission)
-	}
+	admissionFacet := confineAdmissionFacet(status)
 	if admissionFacet != "" {
 		line += " admission=" + admissionFacet
 	}
@@ -1091,6 +1185,14 @@ func FormatConfineStatus(status ConfineStatus) string {
 		line += " cpu=" + formatConfineCPUUsec(*status.CPUUser) + "+" + formatConfineCPUUsec(*status.CPUSys)
 	} else {
 		line += " cpu=unevaluated"
+	}
+	// AIRA-281. Wall time, release to wait completion (see ConfineStatus.WallUS).
+	// Always rendered for a job that ran, on the same discipline as cpu= above: an
+	// unestablished value reads unevaluated, never a fabricated zero.
+	if status.WallUS != nil && *status.WallUS > 0 {
+		line += " wall=" + formatConfineCPUUsec(*status.WallUS)
+	} else {
+		line += " wall=unevaluated"
 	}
 	return line
 }
