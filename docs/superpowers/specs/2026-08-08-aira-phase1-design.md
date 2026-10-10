@@ -385,7 +385,7 @@ draft       → planned | retired | superseded
 planned     → in-progress | retired | superseded
 in-progress → in-review | planned | retired | superseded
 in-review   → in-progress | done | retired | superseded
-done        → retired | superseded
+done        → in-progress | retired | superseded
 retired     → (terminal)
 superseded  → (terminal)
 ```

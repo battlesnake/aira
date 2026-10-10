@@ -183,10 +183,22 @@ func ValidateTransition(from, to Status) error {
 		StatusRetired:    {},
 		StatusSuperseded: {},
 	}
-	if !allowed[from][to] {
-		return fmt.Errorf("E_TRANSITION_INVALID: %s -> %s", from, to)
+	successors, known := allowed[from]
+	if successors[to] {
+		return nil
 	}
-	return nil
+	if !known {
+		return fmt.Errorf("E_TRANSITION_INVALID: %s -> %s: %s is not a known status", from, to, from)
+	}
+	if len(successors) == 0 {
+		return fmt.Errorf("E_TRANSITION_INVALID: %s -> %s is not a legal transition; %s is terminal and has no legal next status", from, to, from)
+	}
+	next := make([]string, 0, len(successors))
+	for s := range successors {
+		next = append(next, string(s))
+	}
+	sort.Strings(next)
+	return fmt.Errorf("E_TRANSITION_INVALID: %s -> %s is not a legal transition; from %s the legal next statuses are: %s", from, to, from, strings.Join(next, ", "))
 }
 
 // invalidFieldError is the one shape every enum refusal takes: it names the

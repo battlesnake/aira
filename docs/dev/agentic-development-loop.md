@@ -57,6 +57,15 @@ own workflow checkpoint, not an AIRA prompt; AIRA never nags during ordinary
 commands. Capture the friction and continue the task rather than polishing the
 wording or attempting diagnosis in the rant.
 
+## Closing a ticket
+
+The close path is `aira mv <id> in-progress`, then `in-review`, then `done`, in
+that order. A ticket file's `status` is never hand-edited. A refused transition
+(`E_TRANSITION_INVALID`) names the legal next statuses from where the ticket is.
+
+The pre-push hook runs the full `make ci` on every push, docs-only pushes
+included, because tests read repository content files.
+
 ## Lighter path for trivial changes
 
 A typo, link correction, comment-only edit, or mechanical change with no
