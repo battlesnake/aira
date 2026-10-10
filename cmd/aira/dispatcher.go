@@ -149,7 +149,10 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	// and `confine-budget`) converge here, so the verb was wholly unreachable and
 	// the daemon's own handler at internal/daemon/server.go:785 was dead code.
 	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" || canonical == "confine-dump" {
-		return d.dispatchConfineManagement(ctx, request)
+		if canonical == "confine-budget" || canonical == "confine-dump" {
+			return d.dispatchConfineHistory(ctx, request)
+		}
+		return d.dispatchConfineManagementOnce(ctx, request)
 	}
 	// AIRA-202. `version` asks the daemon what IT is, so it must reach the daemon
 	// without resolving a project -- the same shape as the confine family above,
@@ -198,7 +201,7 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	return response.CoreResponse()
 }
 
-func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, request core.Request) core.Response {
+func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, request core.Request) core.Response {
 	owner, _ := request.Args["owner"].(string)
 	if err := runner.ValidateConfineOwner(owner); err != nil {
 		return confineClientError(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err))
