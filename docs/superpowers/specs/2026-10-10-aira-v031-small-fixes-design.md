@@ -263,10 +263,16 @@ whose `writeResponse` refuses a body over `StoreOpBodyMax` at `protocol.go:430`,
   `create Fix the bug -h` (today a ticket titled "Fix the bug -h") and
   `list --by status --help`. **Exit code (build review):** the sentinel only fires when
   the help token came WITH other arguments (a bare `<verb> -h|--help` is answered by the
-  pre-parse), so the help is printed but the exit is 2 and stderr carries
-  `E_SELECTOR_INVALID`: master refused `aira gate add G --argv df -h` (exit 2), and an
-  exit-0 no-op would let `... || die` carry on as if the gate were registered. Only
-  `<verb> -h|--help` alone (including `worktree register --help`) exits 0.
+  pre-parse), so the exit is 2 and stderr carries `E_SELECTOR_INVALID`: master refused
+  `aira gate add G --argv df -h` (exit 2), and an exit-0 no-op would let `... || die`
+  carry on as if the gate were registered. The pre-parse itself requires the help token to
+  be the ONLY token after the verb (`len(args)==2`): `confine --help -- true` and
+  `gate -h add G` fall to the parser and are refused, never answered as exit-0 help. In
+  JSON (piped) mode the stdout envelope is the REFUSAL envelope (`ok:false`,
+  `code:E_SELECTOR_INVALID`, `exit:2`) carrying the verb's help entries in `data`, so a
+  `.ok`/`.code` consumer never sees success for a refused command; on a terminal the help
+  text is listed and the refusal line goes to stderr. Only `<verb> -h|--help` alone
+  (including `worktree register --help`) exits 0.
 - One renderer, `renderVerbHelp(entries, renderJSON, stdout, stderr)`, used by the
   pre-parse, the sentinel, `aira help <verb>`, and `runConfineHelpCommand` (which becomes a
   call to it). Piped output is the JSON envelope, like `aira help`.
@@ -474,7 +480,10 @@ MainPID --value` as in `install_test.go:438`, and the `daemonStatus` fake, as in
   unchanged. Mutations: drop the byte cut (a long-signature fixture then overflows the
   frame); omit `Next` on a cut page (rows go missing); send waiters on every page
   (duplicates); leave live state out of the first page's budget (a fixture with a large
-  waiter set then exceeds 4 MiB -> RED).
+  waiter set then exceeds 4 MiB -> RED); drop the `taken > 0` guard in `readHistoryPage` (a
+  middle subject bigger than the whole page budget, a 1.1 MiB signature x 5 samples, is
+  refused as its page's first subject, the page comes back empty and `Next`-less, and the
+  join ends as complete with subjects missing -> RED).
 - equivalence: joined pages equal the unpaged result for a fixture whose under-provisioned
   subjects fall on different pages. Mutation: no client re-sort.
 - end to end (in-process daemon over its socket, the existing `seedLargeConfinePeakHistory`

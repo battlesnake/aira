@@ -12,6 +12,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/runner"
 )
 
 // failDispatcher fails the test if any verb handler is reached: --help must be
@@ -175,12 +176,18 @@ func helpShownButRefused(t *testing.T, argv []string) []string {
 		t.Fatalf("%q: stderr has no refusal: %q", argv, stderr.String())
 	}
 	var envelope struct {
+		OK   bool   `json:"ok"`
+		Code string `json:"code"`
 		Data []struct {
 			Verb string `json:"verb"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
 		t.Fatalf("%q: stdout is not the help envelope: %q (%v)", argv, stdout.String(), err)
+	}
+	// The machine contract on a pipe: a refused command is never ok:true.
+	if envelope.OK || envelope.Code != "E_SELECTOR_INVALID" {
+		t.Fatalf("%q: stdout envelope says ok=%v code=%q for a refused command (exit 2): %q", argv, envelope.OK, envelope.Code, stdout.String())
 	}
 	var verbs []string
 	for _, entry := range envelope.Data {
@@ -219,6 +226,41 @@ func TestHelpAmongOtherArgumentsIsARefusalNotASuccess(t *testing.T) {
 	_, options, err := parseArgs("gate", []string{"add", "G", "--argv", "df", "--argv", "-h"})
 	if err != nil || !strings.Contains(options["argv"], "-h") {
 		t.Fatalf("gate --argv -h: options=%v err=%v", options, err)
+	}
+}
+
+// verifies: AIRA-211. The pre-parse answers exit-0 help ONLY when the help token
+// is the sole token after the verb. A help token in position 2 followed by other
+// arguments is a command master refused (exit 2), and must never become an exit-0
+// no-op: `aira confine --help -- true` would otherwise exit 0 having run nothing
+// and printed no ran=no line. Mutation: `len(args) < 2` in preParseHelpVerb -> RED.
+func TestHelpTokenFollowedByOtherArgumentsIsNotCleanHelp(t *testing.T) {
+	for _, argv := range [][]string{
+		{"confine", "--help", "--", "true"},
+		{"confine", "-h", "--", "true"},
+		{"gate", "-h", "add", "G", "--argv", "df"},
+		{"mv", "-h", "AIRA-1", "done"},
+		{"create", "--help", "Fix", "it"},
+		{"--json", "list", "--help", "x"},
+	} {
+		if verb, _, ok := preParseHelpVerb(argv); ok {
+			t.Fatalf("%q was read as a bare help request for %q", argv, verb)
+		}
+		var stdout, stderr bytes.Buffer
+		exit := RunWithDispatcher(argv, &stdout, &stderr, failDispatcher{t})
+		if exit == 0 {
+			t.Fatalf("%q exited 0 (stdout=%q stderr=%q): a command with a stray help token is a refusal", argv, stdout.String(), stderr.String())
+		}
+	}
+}
+
+// verifies: AIRA-211. `confine --help -- true` is a launch that never ran, so its
+// refusal carries the ran=no line like every other confine launch refusal.
+func TestConfineHelpAmongLaunchArgumentsSaysNeverRan(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher([]string{"confine", "--help", "--", "true"}, &stdout, &stderr, failDispatcher{t})
+	if exit == 0 || !strings.Contains(stderr.String(), runner.ConfineNeverRanFacet) {
+		t.Fatalf("exit=%d stderr=%q, want a refusal with the ran=no line", exit, stderr.String())
 	}
 }
 

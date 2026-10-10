@@ -154,6 +154,33 @@ func TestConfineManagementRefusalsGetNoNeverRanLine(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-207. An empty or blank global --scope-dir value (the shape a
+// script produces from `aira --scope-dir "$WT" confine -- ...` with WT unset) is
+// still the option's value, never the verb, so the request is a confine launch and
+// its refusal gets the ran=no line. strings.Fields cannot spell an empty token, so
+// this table is built from slices. Mutation: consume only a non-blank value -> RED.
+func TestIsConfineLaunchToleratesEmptyScopeDirValue(t *testing.T) {
+	for _, tc := range []struct {
+		argv []string
+		want bool
+	}{
+		{[]string{"--scope-dir", "", "confine", "--", "true"}, true},
+		{[]string{"--scope-dir", " ", "confine", "--", "true"}, true},
+		{[]string{"--json", "--scope-dir", "", "confine", "--", "true"}, true},
+		{[]string{"--scope-dir", "", "confine", "--list"}, false},
+		{[]string{"--scope-dir", "", "list", "--", "true"}, false},
+	} {
+		if got := isConfineLaunch(tc.argv); got != tc.want {
+			t.Fatalf("isConfineLaunch(%q) = %v, want %v", tc.argv, got, tc.want)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	exit := RunWithDispatcher([]string{"--scope-dir", "", "confine", "--", "true"}, &stdout, &stderr, failDispatcher{t})
+	if exit == 0 || !strings.Contains(stderr.String(), runner.ConfineNeverRanFacet) {
+		t.Fatalf("exit=%d stderr=%q, want a refusal with the ran=no line", exit, stderr.String())
+	}
+}
+
 func okDispatcher(data any) Dispatcher {
 	return dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, _ core.Request) core.Response {
 		return core.Response{OK: true, Code: "OK", Data: data}

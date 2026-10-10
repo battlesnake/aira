@@ -209,18 +209,31 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if err != nil {
 		if request, isHelp := asHelpRequest(err); isHelp {
 			if response, found := verbHelpResponse(verb); found {
-				exit := renderVerbHelp(response, renderJSON, stdout, stderr)
 				if len(args) == 2 {
 					// Bare `<verb> -h|--help` (after the subverb rewrite): clean help.
-					return exit
+					return renderVerbHelp(response, renderJSON, stdout, stderr)
 				}
 				// Other arguments came with it, so this was a command that master
-				// refused (`gate add G --argv df -h`), not a request for help. Show
-				// the help but refuse with exit 2, so a script's `|| die` still fires
-				// and nothing is registered or changed.
+				// refused (`gate add G --argv df -h`), not a request for help. Refuse
+				// with exit 2 so a script's `|| die` still fires and nothing is
+				// registered or changed, and make the refusal visible on EVERY channel:
+				// piped, the stdout envelope is the REFUSAL (ok:false, the stable code)
+				// carrying the verb's help entries in data, so a `.ok`/`.code` consumer
+				// never reads success for a refused command; on a terminal the help
+				// listing precedes the stderr refusal line.
 				refusal := request.otherArgumentsRefusal(verb)
+				code := "E_SELECTOR_INVALID"
+				if renderJSON {
+					response.OK, response.Code, response.Error = false, code, refusal
+					response.Exit = codes.ExitForCode(code)
+					// JSON mode writes only stdout, so the text also goes to stderr:
+					// a script that captures stderr and tests the exit status sees it.
+					_, _ = fmt.Fprintln(stderr, refusal)
+					return render(response, true, stdout, stderr)
+				}
+				_ = renderVerbHelp(response, false, stdout, stderr)
 				_, _ = fmt.Fprintln(stderr, refusal)
-				return codes.ExitForCode("E_SELECTOR_INVALID")
+				return codes.ExitForCode(code)
 			}
 			err = request.refusal(verb)
 		}

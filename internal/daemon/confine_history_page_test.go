@@ -223,3 +223,39 @@ func TestPagedHistoryArgumentsAreValidated(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-280 — a page always holds at least one subject: a single subject
+// bigger than the whole page budget is still taken as the first (and only)
+// subject of its page, never refused into an empty Next-less page that the client
+// would read as the clean end of the join (a silently truncated dump, exit 0).
+// Mutation: drop the `taken > 0` guard in readHistoryPage -> RED.
+func TestConfineDumpPageAlwaysTakesOneSubjectEvenIfOversized(t *testing.T) {
+	server := ciDumpTestServer(t)
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	small := recordLongSubject(t, server.db, "a", 10, base)
+	// 1.1 MiB signature x 5 samples: about 5.5 MiB of dump rows, over the 4 MiB budget alone.
+	huge := recordLongSubject(t, server.db, "b", 1100*1024, base.Add(time.Minute))
+	for i := 1; i < 5; i++ {
+		recordLongSubject(t, server.db, "b", 1100*1024, base.Add(time.Minute+time.Duration(i)*time.Second))
+	}
+	last := recordLongSubject(t, server.db, "c", 10, base.Add(2*time.Minute))
+
+	pages := dumpPages(t, server)
+	var got []string
+	seen := map[string]bool{}
+	for index, page := range pages {
+		if index < len(pages)-1 && page.Next == nil {
+			t.Fatalf("page %d has no next but is not the last", index)
+		}
+		for _, row := range page.Admissions {
+			if !seen[row.Signature] {
+				seen[row.Signature] = true
+				got = append(got, row.Signature)
+			}
+		}
+	}
+	want := []string{small, huge, last}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("subjects through the paged dump = %d (pages=%d), want all 3 (a subject over the page budget was dropped)", len(got), len(pages))
+	}
+}

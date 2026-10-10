@@ -56,7 +56,7 @@ func (e *helpRequestError) refusal(verb string) error {
 // otherArgumentsRefusal is the stderr line printed when the help token arrived
 // with other arguments: the help is shown, nothing ran, and the exit is 2.
 func (e *helpRequestError) otherArgumentsRefusal(verb string) string {
-	return fmt.Sprintf("E_SELECTOR_INVALID: %s was given with other arguments, so %s was refused and nothing ran (help is shown above; to pass %s as an option VALUE put it directly after its option, e.g. --argv %s)", e.flag, verb, e.flag, e.flag)
+	return fmt.Sprintf("E_SELECTOR_INVALID: %s was given with other arguments, so %s was refused and nothing ran (`aira help %s` shows its usage; to pass %s as an option VALUE put it directly after its option, e.g. --argv %s)", e.flag, verb, verb, e.flag, e.flag)
 }
 
 // verbsWithoutHelpEntry are the dispatched verbs that have no help-table entry
@@ -82,7 +82,11 @@ func preParseHelpVerb(argv []string) (verb string, jsonOutput bool, ok bool) {
 		return "", false, false
 	}
 	args, jsonOutput = removeJSON(args)
-	if len(args) < 2 || (args[1] != "--help" && args[1] != "-h") {
+	// The help token must be the ONLY thing after the verb. With anything else
+	// alongside it the request is a command carrying a stray help token, which
+	// master refused (exit 2): it falls through to the parsers, never to exit-0
+	// help (`confine --help -- true` would otherwise exit 0 without running).
+	if len(args) != 2 || (args[1] != "--help" && args[1] != "-h") {
 		return "", false, false
 	}
 	return strings.ToLower(args[0]), jsonOutput, true
@@ -166,7 +170,10 @@ func isConfineLaunch(argv []string) bool {
 			start++
 		} else if name == scopeDirFlag {
 			start++
-			if !hasInline && start < len(argv) && !strings.HasPrefix(argv[start], "--") && strings.TrimSpace(argv[start]) != "" {
+			// Any next token that is not option-like is the (possibly empty or
+			// blank) value: an empty token can never be the verb, so
+			// `--scope-dir "$UNSET" confine -- ...` is still a confine launch.
+			if !hasInline && start < len(argv) && !strings.HasPrefix(argv[start], "--") {
 				start++
 			}
 		} else {
