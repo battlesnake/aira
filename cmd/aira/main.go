@@ -62,6 +62,15 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 }
 
 func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Reader, injected Dispatcher) int {
+	// AIRA-211. `<verb> --help` / `<verb> -h` is answered from the help table
+	// before ANY verb parser or intercept below can refuse or swallow it. Only the
+	// token right after the verb is read (preParseHelpVerb), and a verb with no
+	// help-table entry falls through to its current behaviour.
+	if helpVerb, helpJSON, ok := preParseHelpVerb(argv); ok {
+		if response, found := verbHelpResponse(helpVerb); found {
+			return renderVerbHelp(response, helpJSON || !stdoutIsTerminal(stdout), stdout, stderr)
+		}
+	}
 	if len(argv) > 0 && argv[0] == "__slice-anchor" {
 		return runSliceAnchor()
 	}
@@ -154,7 +163,20 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runVersionCommand(context.Background(), dispatcher, dispatcherErr, renderJSON, stdout, stderr)
 	}
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
+	if len(args) > 0 && args[0] == "help" && len(args) > 1 {
+		// AIRA-211. `aira help <verb>` prints only that verb's entries.
+		if len(args) > 2 {
+			message := "E_SELECTOR_INVALID: help takes at most one verb"
+			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+		}
+		response, found := verbHelpResponse(args[1])
+		if !found {
+			message := fmt.Sprintf("E_UNKNOWN_VERB: no verb named %q", args[1])
+			return render(core.Response{Code: "E_UNKNOWN_VERB", Error: message, Exit: codes.ExitForCode("E_UNKNOWN_VERB")}, renderJSON, stdout, stderr)
+		}
+		return renderVerbHelp(response, renderJSON, stdout, stderr)
+	}
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
 		if !renderJSON && response.OK {
 			return renderHelp(response, stdout, stderr)
@@ -178,6 +200,12 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	positional, options, err := parseArgs(verb, args[1:])
 	if err != nil {
+		if request, isHelp := asHelpRequest(err); isHelp {
+			if response, found := verbHelpResponse(verb); found {
+				return renderVerbHelp(response, renderJSON, stdout, stderr)
+			}
+			err = request.refusal(verb)
+		}
 		if verb == "worker-admit" {
 			// worker-admit's caller is the aitest supervisor, which reads
 			// one structured stdout line and nothing else. An argument
@@ -233,7 +261,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		// project, and no --json branching, and must work whatever else was also
 		// typed alongside it.
 		if options["help"] == "true" {
-			return runConfineHelpCommand(stdout, stderr)
+			return runConfineHelpCommand(renderJSON, stdout, stderr)
 		}
 		// AIRA-22: --status joins --list/--kill as a management form. Unlike those
 		// two it is answered LOCALLY rather than through the daemon: it reads a
@@ -785,11 +813,19 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	var positional []string
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
+		if arg == "-h" {
+			// A POSITIONAL position (a value is consumed with its option below and
+			// never reaches here), so `create T --body -h` keeps -h as the body.
+			return nil, nil, &helpRequestError{flag: "-h"}
+		}
 		if !strings.HasPrefix(arg, "--") {
 			positional = append(positional, arg)
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
+		if name == "help" {
+			return nil, nil, &helpRequestError{flag: "--help"}
+		}
 		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || ((name == "reasoning-subset" || name == "resolve-ticket") && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") || (name == "hold" && (verb == "create" || verb == "new")) {
 			options[name] = "true"
 			continue
@@ -799,10 +835,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			if strings.HasPrefix(verb, "run-") {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
 			}
-			if verb == "git" {
-				return nil, nil, fmt.Errorf("E_GIT_ARG_INVALID: option --%s is not permitted", name)
-			}
-			return nil, nil, fmt.Errorf("option --%s requires a value", name)
+			return nil, nil, fmt.Errorf("E_SELECTOR_INVALID: option --%s requires a value", name)
 		}
 		i++
 		if name == "label" {
@@ -879,15 +912,15 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"watch":         {"from": true, "from-start": true, "verb": true},
 		"gate":          {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
-	for name := range options {
+	// Sorted, so which bad option is named does not depend on map order.
+	for _, name := range sortedKeys(options) {
 		if !allowed[verb][name] {
 			if strings.HasPrefix(verb, "run-") {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s is not valid for %s", name, verb)
 			}
-			if verb == "git" {
-				return nil, nil, fmt.Errorf("E_GIT_ARG_INVALID: option --%s is not valid for git", name)
-			}
-			return nil, nil, fmt.Errorf("option --%s is not valid for %s", name, verb)
+			// The suggestion is drawn from the verb's own allowed set, so it can
+			// never name an option this parser would refuse (AIRA-211).
+			return nil, nil, fmt.Errorf("E_SELECTOR_INVALID: option --%s is not valid for %s%s", name, verb, optionDidYouMean(name, sortedKeys(allowed[verb])))
 		}
 	}
 	return positional, options, nil
@@ -1456,34 +1489,17 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 // part of the two modes AIRA-243 is about.
 var confineHelpVerbs = []string{"confine", "confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-status"}
 
-// runConfineHelpCommand answers `aira confine --help`. It prints EXACTLY the
-// confine-family rows of the generated dispatch-table help (renderHelp, the
-// same renderer and the same descriptor Usage/Summary strings `aira help`
-// itself uses) rather than a hand-written second copy of the same text: the
-// two can now never drift apart, and every launch option (--memory-reserve
-// and friends) is named because confine's own Usage string already carries
-// the whole launch-form option list.
-//
-// Always plain text, and always exit 0: --help ignores --json exactly like
-// --help ignores every other confine option, matching the top-level `aira
-// --help`/`aira help` convention (AIRA-243).
-func runConfineHelpCommand(stdout, stderr io.Writer) int {
-	response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
-	entries, ok := response.Data.([]map[string]string)
-	if !ok {
-		return render(response, false, stdout, stderr)
+// runConfineHelpCommand answers `aira confine --help` when the request reaches
+// the parser (e.g. `confine --list --help`); the common spelling is answered by
+// the pre-parse. Both use the one renderer, renderVerbHelp, so the confine
+// family rows (the launch form plus its five management subcommands, the same
+// generated dispatch-table text `aira help` prints) can never drift from it.
+func runConfineHelpCommand(renderJSON bool, stdout, stderr io.Writer) int {
+	response, found := verbHelpResponse("confine")
+	if !found {
+		return render(core.New(nil).Do(context.Background(), core.Request{Verb: "help"}), renderJSON, stdout, stderr)
 	}
-	wanted := make(map[string]bool, len(confineHelpVerbs))
-	for _, verb := range confineHelpVerbs {
-		wanted[verb] = true
-	}
-	filtered := make([]map[string]string, 0, len(confineHelpVerbs))
-	for _, entry := range entries {
-		if wanted[entry["verb"]] {
-			filtered = append(filtered, entry)
-		}
-	}
-	return renderHelp(core.Response{OK: true, Data: filtered}, stdout, stderr)
+	return renderVerbHelp(response, renderJSON, stdout, stderr)
 }
 
 func runConfineCommand(ctx context.Context, target []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
