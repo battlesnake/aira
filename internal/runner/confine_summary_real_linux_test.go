@@ -250,3 +250,65 @@ func TestConfineSummaryTrappedSIGTERMIsNotNormal(t *testing.T) {
 		t.Fatalf("line = %v", values)
 	}
 }
+
+// verifies: AIRA-281 -- ci-shim wall_us is release-to-wait-completion and
+// EXCLUDES the admission wait, exactly as on the real path (test 13(a)). The
+// shim clock is stamped after the release write; a mutation moving it before
+// admission would add the whole queue wait to wall_us and wall=, which is the
+// error ci-shim cohorts (admission queueing behind siblings) would show.
+func TestShimWallClockExcludesTheAdmissionWait(t *testing.T) {
+	deps := shimUnitDeps()
+	deps.admit = func(ctx context.Context, _ string, _ ConfineRequest, _ int64) (admissionResult, error) {
+		select {
+		case <-time.After(1500 * time.Millisecond):
+		case <-ctx.Done():
+		}
+		return admissionResult{state: "immediate", reserve: 1 << 20, basis: "test"}, nil
+	}
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard, Stdout: io.Discard,
+	}, deps)
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("shim confine result=%+v err=%v", result, err)
+	}
+	if result.Status.WallUS == nil {
+		t.Fatalf("WallUS not established: %+v", result.Status)
+	}
+	if *result.Status.WallUS >= time.Second.Microseconds() {
+		t.Fatalf("shim WallUS = %dus includes the 1.5s admission wait", *result.Status.WallUS)
+	}
+}
+
+// verifies: AIRA-281 -- the normalized owner reaches the status (and so the
+// summary line) on BOTH launch paths, not only through a hand-built
+// ConfineStatus. Dropping `result.Status.Owner = normalizedOwner` leaves every
+// line reading owner:"unevaluated".
+func TestConfineWiresTheOwnerOntoTheStatus(t *testing.T) {
+	launch := func(t *testing.T, deps confineDeps, owner string) ConfineStatus {
+		t.Helper()
+		result, err := confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", Argv: []string{"/bin/true"}, Owner: owner, SelfPath: os.Args[0],
+			Stderr: io.Discard, Stdout: io.Discard,
+		}, deps)
+		if err != nil || result.Exit != 0 {
+			t.Fatalf("confine result=%+v err=%v", result, err)
+		}
+		return result.Status
+	}
+	realDeps := func() confineDeps {
+		deps := confineUnitDeps(&confineFakeScope{})
+		deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
+		deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
+		return deps
+	}
+	for name, deps := range map[string]confineDeps{"shim": shimUnitDeps(), "real": realDeps()} {
+		t.Run(name, func(t *testing.T) {
+			if got := launch(t, deps, "deploy").Owner; got != "deploy" {
+				t.Fatalf("Status.Owner = %q, want deploy", got)
+			}
+			if got := launch(t, deps, "").Owner; got != ConfineUnknownOwner {
+				t.Fatalf("Status.Owner = %q, want the normalized default %q", got, ConfineUnknownOwner)
+			}
+		})
+	}
+}

@@ -118,3 +118,64 @@ func TestConfineHelpNamesSummaryAndFailFastOptions(t *testing.T) {
 	}
 	t.Fatal("confine descriptor missing")
 }
+
+// verifies: AIRA-281 -- a relative --summary-file resolves the way the shell's
+// `>>` would: the kernel resolves `..` against the PHYSICAL cwd, so the CLI
+// must join the physical cwd and must not clean `..` as text against the
+// logical $PWD (filepath.Abs does, and sends the line to a different file).
+// The same holds for an already-absolute path containing `..`.
+func TestConfineSummaryFileResolvesDotDotPhysicallyNotTextually(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	deep := filepath.Join(root, "real", "deep")
+	other := filepath.Join(root, "real", "x")
+	for _, dir := range []string{deep, other, filepath.Join(root, "logical")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(root, "logical", "link")
+	if err := os.Symlink(deep, link); err != nil {
+		t.Fatal(err)
+	}
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldwd) })
+	if err := os.Chdir(link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PWD", link) // what the shell does after `cd logical/link`
+
+	original := runConfined
+	t.Cleanup(func() { runConfined = original })
+	var seen runner.ConfineRequest
+	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+		seen = request
+		return runner.ConfineResult{}, nil
+	}
+	resolve := func(path string) string {
+		t.Helper()
+		// Not filepath.Dir: it cleans `..` as text, which is the very bug under test.
+		resolved, err := filepath.EvalSymlinks(path[:strings.LastIndex(path, "/")])
+		if err != nil {
+			t.Fatalf("%q does not resolve: %v", path, err)
+		}
+		return resolved
+	}
+	for _, option := range []string{"../x/out.jsonl", link + "/../x/out.jsonl"} {
+		seen = runner.ConfineRequest{}
+		if exit := runWithInput([]string{"confine", "--summary-file", option, "--", "true"}, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
+			t.Fatalf("%q: exit=%d (a path the shell can write to was refused)", option, exit)
+		}
+		if !filepath.IsAbs(seen.SummaryFile) {
+			t.Fatalf("%q: SummaryFile %q is not absolute", option, seen.SummaryFile)
+		}
+		if got := resolve(seen.SummaryFile); got != other {
+			t.Fatalf("%q: SummaryFile %q resolves to %s, want %s (where `>>` writes)", option, seen.SummaryFile, got, other)
+		}
+	}
+}

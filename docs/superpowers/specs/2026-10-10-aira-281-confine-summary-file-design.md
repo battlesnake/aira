@@ -81,8 +81,12 @@ Two new valued launch options. Both are refused in the management form (`--list`
 the others) by `parseConfineManagementArgs`, which already rejects unknown options.
 
 - `--summary-file <path>`. A value is required, and an empty string is refused. The CLI makes
-  the path absolute with `filepath.Abs` when it builds the request (`runConfineCommand`), so a
-  detached supervisor and the foreground path name the same file. The runner refuses a relative
+  the path absolute when it builds the request (`runConfineCommand`), so a detached supervisor
+  and the foreground path name the same file. It joins the PHYSICAL cwd (`getcwd(2)`) and the
+  path as a plain string and never cleans it: `filepath.Abs` cleans `..` as text against the
+  logical `$PWD`, which names a different file than the shell's `>>` writes when the cwd is
+  reached through a symlink (review R3.3). The kernel resolves every `..` at open time. An
+  already-absolute path is passed through untouched. The runner refuses a relative
   path (`E_CONFINE_ARGUMENT_INVALID`), so the absolute-path rule is enforced in the runner and
   does not depend on the CLI remembering it.
 - `--summary-tree-hash <value>`. Requires `--summary-file`; without it the option is refused,
@@ -137,10 +141,13 @@ key, renaming it or changing what it means does bump `schema`.
 
 What the `rusage_*` fields mean (also written into the help text and the Skill text): they
 cover the job's process and every descendant that some process waited for. Descendants that
-were orphaned or daemonised are missing, so the CPU figures are a lower bound. `maxrss` is the
-peak of the single largest of those processes, not the tree total. Both include the AIRA setup
-shim that `exec`s the target, which sets a floor of a few MiB and a few ms. The builder
-measures that floor and records it in the PR. These fields are populated in both modes, since
+were orphaned or daemonised are missing. `maxrss` is the peak of the single largest of those
+processes, not the tree total. Both include the AIRA setup shim that `exec`s the target
+(Linux keeps `ru_maxrss` and CPU across `exec`), so the CPU figures are NOT a strict lower
+bound: the shim adds a floor. Measured on this box (2026-10-10, real `aira` binary as the shim,
+ci-shim harness, `/bin/true` and `sh -c 'exit 0'`, 10 runs): `ru_maxrss` 12.8 to 13.9 MB (about
+13 MiB) and 3 to 7 ms of user plus system CPU. For any job smaller than about 13 MiB the
+`maxrss` field is the shim's. The help text and the Skill text state this floor (review R3.1). These fields are populated in both modes, since
 the same `wait4` happens in both, so the keys never depend on the mode. They never reach the
 reserve estimator (invariant 6).
 
@@ -155,8 +162,11 @@ reader rules follow from that, and they are written into the help text and the S
   trailing `\n`; the next job's append then lands on the end of it, so one failed write can
   damage the following record too. A reader skips a line that does not parse and treats it as
   unknown, never as a pass.
-- Select the current attempt: use one fresh file per CI run (the caller removes or truncates it
-  when the run starts; AIRA only appends), so an older attempt's success cannot be in it. A
+- Select the current attempt: use one fresh file per CI run (the caller UNLINKS AND RECREATES it when the run starts, or uses a per-run unique path; AIRA
+  only appends), so an older attempt's success cannot be in it. NEVER truncate in place: the
+  fd is held for the job's whole life (8(d)), so an earlier run's job that is still queued,
+  running or detached would append its line at the current end of the truncated file, inside
+  the new run's file. After an unlink the stale line goes to the old inode (review R3.2). A
   consumer that caches passes treats a file containing any malformed line as unable to vouch
   for a pass, because the damaged line could be the current attempt of any step.
 - A reusable pass needs `ran == true and exit == 0 and terminated_by == "normal"`. `exit == 0`
@@ -298,7 +308,7 @@ The Skill guide (`internal/core/skill.go`, the outcome paragraphs at about lines
   file per run, missing or malformed line is unknown, the three-part pass predicate, the jq type
   guard).
 - In ci-shim mode `peak_rss_bytes` and `cpu_*_us` are `unevaluated` by design, and the
-  `rusage_*` fields are a per-process lower bound.
+  `rusage_*` fields are per-process figures that include the setup-shim floor (about 13 MiB, about 5 ms; 3.2).
 - The `wall=` facet.
 - One sentence on `--fail-fast`, which the Skill text never mentions today: in a CI shim
   cohort, the first failing job aborts its queued siblings (`E_ADMIT_FAILFAST_TRIPPED`) and
@@ -317,7 +327,7 @@ The Skill change needs a separate `aira skill install` at cutover.
 | `internal/runner/confine_stub.go` | `!linux` stubs for the two functions above. |
 | `internal/runner/confine_linux.go` | `confineTermination.WaitReturnedAt` and `Rusage`. `waitConfineCommand` fills them on every arm. `applyConfineRusage`. `releasedAt` and `WallUS` in `confineWithDeps`. `Status.Owner` at line 502. |
 | `internal/runner/confine_shim_linux.go` | `releasedAt`, `WallUS` and `applyConfineRusage` beside the `TerminatedBy` assignment. The C10 comment gains a sentence pointing to the separately named `rusage_*` fields. |
-| `cmd/aira/main.go` | The `parseConfineArgs` checks (tree hash needs the file; the validator; non-empty values). `filepath.Abs` transcription in `runConfineCommand`. |
+| `cmd/aira/main.go` | The `parseConfineArgs` checks (tree hash needs the file; the validator; non-empty values). Uncleaned physical-cwd absolute transcription in `runConfineCommand` (`summaryFileAbsolutePath`). |
 | `cmd/aira/option_suggest.go` | Both options. |
 | `internal/core/core.go`, `internal/core/skill.go` | 3.6, including the `--fail-fast` spec, Usage token and Skill sentence. |
 
@@ -363,14 +373,16 @@ gate's exact command is `aira confine -- make ci`.
 | 10 | Funnel: write failure | the seam returns `EIO`, or a short write of n < m; result and error are unchanged (`Exit` 0 stays 0, `err` stays nil); stderr has `summary-file=unwritten`; on the short write the seam is still called exactly once | propagating the error; changing `Exit`; retrying the remainder |
 | 11 | Funnel: ran and never-ran via the seam | a canned `(result, nil)` gives `ran:true` with `exit`; a canned `(status, E_ADMIT_FAILFAST_TRIPPED)` gives `ran:false` with that code and `admission:"failfast_tripped"` | deriving `ran` from `Exit` |
 | 12 | Shim, real launch (`confine_shim_linux_test.go` harness, whose `reportPeak` is a panic seam) | a child that burns about 200 ms of CPU and touches 64 MiB gives `rusage_user_us` of at least 100000, `rusage_maxrss_largest_process_bytes` of at least 64 MiB, `wall_us` above 0, `peak_rss_bytes` and `cpu_user_us` `"unevaluated"`, and the advisory `containment`; the run does not panic | forgetting `*1024` (KiB); copying rusage into `PeakRSS` or `CPUUser`; `RUSAGE_SELF` of the supervisor |
-| 13 | Real path wall clock (`confine_linux_test.go` deps seam) | (a) the `deps.admit` seam sleeps 1 s and the target is `true`: `WallUS` is under 1 s. (b) the target is `sleep 0.3`: `WallUS` is at least 300 ms. (c) the target backgrounds `sh -c 'sleep 0.3' >&2` holding stderr and exits at once: `WallUS` is at least 300 ms, pinning the documented "release to wait completion" meaning on the real path | starting the clock before admission (or at invocation); stamping before `cmd.Wait()` returns (arm c); the release stamp moved after the wait |
+| 13 | Real path and ci-shim wall clock (`confine_summary_real_linux_test.go` deps seam; the shim arm is `TestShimWallClockExcludesTheAdmissionWait`) | (a) the `deps.admit` seam sleeps 1 s and the target is `true`: `WallUS` is under 1 s. (b) the target is `sleep 0.3`: `WallUS` is at least 300 ms. (c) the target backgrounds `sh -c 'sleep 0.3' >&2` holding stderr and exits at once: `WallUS` is at least 300 ms, pinning the documented "release to wait completion" meaning on the real path | starting the clock before admission (or at invocation); stamping before `cmd.Wait()` returns (arm c); the release stamp moved after the wait |
 | 14 | Trailer `wall=` | nil gives `wall=unevaluated`; 1.5 s gives `wall=1.5s`, placed after `cpu=` | omitting the facet when nil |
 | 15 | Output-copy error (`waitConfineCommand`, real `exec.Cmd`) | a command `sh -c 'echo x >&2; exit 0'` whose `Stderr` is a writer that returns an error: `Wait` returns the copy error with `ProcessState` set; the function returns exit 3, `Decoded:false`, and a non-nil `Rusage`; the summary from that termination has `exit:3, terminated_by:"unevaluated"` and numeric `rusage_*` | `Rusage` filled only on the decoded arms |
 | 16 | CLI parse (`cmd/aira`) | `--summary-tree-hash` without `--summary-file` is refused; an empty `--summary-file` is refused; `--summary-file` with `--list` is refused | removing the requires-check |
-| 17 | CLI transcription (`runConfined` seam) | `--summary-file rel.jsonl` becomes `filepath.Join(cwd, "rel.jsonl")` | passing it through raw |
+| 17 | CLI transcription (`runConfined` seam) | `--summary-file rel.jsonl` becomes `filepath.Join(cwd, "rel.jsonl")`; with the cwd reached through a symlink (`$PWD` logical), `../x/out.jsonl` and `<link>/../x/out.jsonl` resolve to the file the shell's `>>` writes (the physical sibling), not to the textually cleaned logical one | passing it through raw; `filepath.Abs` (cleans `..` as text) |
 | 18 | Help (`cmd/aira`) | the confine dispatch Args contain `summary_file`, `summary_tree_hash` and `fail_fast`; the pinned Usage string (`confine_test.go:747`) contains `--summary-file`, `--summary-tree-hash` and `--fail-fast` | removing any of the three specs or Usage tokens (`fail_fast` is RED today) |
 | 19 | Detached end to end (`confine_detach_linux_test.go` harness) | a detached job with a summary file: no line before it finishes, exactly one `ran:true` line after; a detached launch with an unwritable path exits 2 synchronously with no record of a running job | the supervisor resolving a relative path against its own cwd; opening after `BeforeAdmit` |
 | 20 | Trapped SIGTERM (`confine_linux_test.go`, the deps-seam shape of `TestConfinePeakReportWithheldWhenSupervisorSignalCaughtAndChildExitsZero`) | with a summary file, a child that traps SIGTERM and exits 0 after the supervisor is signalled writes `ran:true, exit:0, terminated_by:"supervisor-signal:SIGTERM"` | rendering `terminated_by` as `normal` when `exit == 0`; omitting `terminated_by` when `exit == 0` |
+| 22 | Owner wiring (`TestConfineWiresTheOwnerOntoTheStatus`, shim and real) | `Status.Owner` is the normalized owner (`deploy`, or the default when empty) after a real launch | deleting `result.Status.Owner = normalizedOwner` |
+| 23 | Docs (`internal/core`) | the help and Skill text state the setup-shim floor and the unlink-and-recreate, never-truncate rule, and no longer call rusage CPU a bare lower bound | reverting the wording |
 | 21 | Stress (evidence, not a mutation guard) | 32 helper processes each append 200 lines of about 1.3 KiB (the worst-case record size) to one file; every line parses and the count is 6400 | n/a (probabilistic; test 9 is the deterministic guard) |
 
 ## 6. Expected yield
@@ -399,7 +411,7 @@ gate's exact command is `aira confine -- make ci`.
 | Lines for refusals before the funnel | The CLI's own argument refusals (bad `--memory-max`, owner, VRAM) happen before a request exists, and so do detached-supervisor failures before `Confine` (control file, record store). Those steps exit non-zero, and a missing line never reads as a pass. |
 | NFS, FUSE, FIFO or `/dev/stderr` targets | Regular files on a local filesystem only (3.4). |
 | `waitConfineCommand` discarding a real `ProcessState` exit when `Wait` returns an output-copy error (it reports exit 3) | Existing behaviour seen while planning. v1 said it could not happen from the CLI; that was wrong. On the real path the job's stderr is the `confineLockedWriter` wrapper, so Go copies it through a pipe, and a write error on the supervisor's own stderr (a full disk behind `2>file`, for example) surfaces as a copy error. The summary reports it honestly (`exit:3`, `terminated_by:"unevaluated"`, test 15), so this change does not make it worse. Fixing the exit-code loss is its own ticket, not done here. |
-| AIRA-282 macro | A separate ticket, held until this ships. Notes for it: omit `--summary-tree-hash` rather than pass an empty one; create a fresh summary file per run. |
+| AIRA-282 macro | A separate ticket, held until this ships. Notes for it: omit `--summary-tree-hash` rather than pass an empty one; create a fresh summary file per run by unlinking and recreating it (or a per-run unique path), never truncating in place (3.2.1). |
 
 ## 8. Risks and known limits
 
@@ -470,3 +482,13 @@ before it was applied.
 | R2.5 | `exit` wording is wrong under `--detach` | `confine_detach_linux.go:763-764` | Accepted. Reworded to the job's status as the foreground form returns it. |
 | R2.6 | Line references drift | `confine_shim_linux.go:73` (cap comment), `skill.go:328-330`, `internal/install/install.go:1996-1999` (`O_RDONLY|O_NONBLOCK|O_NOFOLLOW`) | Accepted. References corrected; 3.4 now says only `O_NONBLOCK` is shared with install, and why this open follows symlinks and creates. |
 | R2.7 | Use the raw fd from `unix.Open` with one `unix.Write`, not `os.NewFile` | Go's poller registration of non-blocking fds | Accepted. 3.4 holds a raw fd; the seam takes an `int` fd. |
+
+Build review (round 3, Opus reviewers on `022fb59`); each finding verified against the code.
+
+| # | Finding | Checked against | Decision |
+|---|---|---|---|
+| R3.1 | rusage fields include the setup shim; the floor was not documented or measured | Reproduced: real binary as shim, `/bin/true` and `sh -c 'exit 0'`, 10 runs: `ru_maxrss` 12.8 to 13.9 MB, 3 to 7 ms CPU | Accepted. Measured floor recorded in 3.2; help and Skill text state it and drop the bare "lower bound"; test 23. |
+| R3.2 | "remove or truncate" is unsafe: the held O_APPEND fd of an earlier run's live job appends into a truncated file | O_APPEND semantics and 8(d) | Accepted. Spec 3.2.1, help, Skill and the AIRA-282 note say unlink and recreate, or a per-run path, never truncate in place; test 23. |
+| R3.3 | `filepath.Abs` cleans `..` against the logical `$PWD`, naming a different file than `>>` | Reproduced with a symlinked cwd (new test red against `filepath.Abs`) | Accepted. `summaryFileAbsolutePath` joins `getcwd(2)` uncleaned; test 17 extended; help text says `..` is resolved by the kernel. |
+| R3.4 | No test that ci-shim `wall_us` excludes the admission wait | Mutation moving the shim `releasedAt` before admission stayed green | Accepted. `TestShimWallClockExcludesTheAdmissionWait` (test 13); mutation RED. |
+| R3.5 | No test that `owner` reaches the summary status | Mutation deleting `result.Status.Owner = ...` stayed green | Accepted. `TestConfineWiresTheOwnerOntoTheStatus` (test 22); mutation RED. |

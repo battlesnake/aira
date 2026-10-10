@@ -938,6 +938,23 @@ func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, err
 	return nil, options, nil
 }
 
+// summaryFileAbsolutePath makes a --summary-file path absolute WITHOUT
+// cleaning it. A relative path is joined onto the PHYSICAL cwd (getcwd(2), not
+// $PWD) and every `..` is left for the kernel to resolve at open time, which is
+// exactly what the shell's `>>` does; filepath.Abs / filepath.Join clean `..` as
+// text against the logical $PWD and can name a different file. An absolute path
+// is passed through untouched. covers: AIRA-281
+func summaryFileAbsolutePath(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+	cwd, err := syscall.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(cwd, "/") + "/" + path, nil
+}
+
 func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	delimiter := -1
@@ -1542,9 +1559,11 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	// supervisor (whose cwd is not this one) and the foreground path name the same
 	// file. The runner refuses a relative path regardless, so the rule does not
 	// depend on this transcription being remembered.
+	// Never filepath.Abs: it cleans `..` as text against the logical $PWD, which
+	// sends the line to a different file than the shell's `>>` would write.
 	summaryFile := options["summary-file"]
 	if summaryFile != "" {
-		absolute, absErr := filepath.Abs(summaryFile)
+		absolute, absErr := summaryFileAbsolutePath(summaryFile)
 		if absErr != nil {
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --summary-file: %v\n", absErr)
 			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")

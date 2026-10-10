@@ -332,7 +332,8 @@ type ConfineStatus struct {
 	// RusageUserUS, RusageSysUS and RusageMaxRSS come from the wait4 the supervisor
 	// already makes, in BOTH modes. They cover the job's process and every
 	// descendant some process waited for (orphaned or daemonised descendants are
-	// missing, so CPU is a lower bound); RusageMaxRSS is the peak of the single
+	// missing) PLUS AIRA's own setup shim that execs the job (measured floor about
+	// 13 MiB maxrss and about 5 ms CPU, so CPU is not a strict lower bound); RusageMaxRSS is the peak of the single
 	// largest such process (ru_maxrss KiB * 1024), NOT a tree total. They are
 	// deliberately separate from PeakRSS/CPUUser/CPUSys, which are the whole-subtree
 	// cgroup counters, and never reach the reserve estimator (AIRA-121 gate C10).
