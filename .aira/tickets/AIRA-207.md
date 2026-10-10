@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-207","project":"aira","title":"confine's CLI-layer argument refusal writes only to stdout when stdout is not a TTY, so a script capturing stderr sees an empty diagnostic for a launch that never ran","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-207","project":"aira","title":"confine's CLI-layer argument refusal writes only to stdout when stdout is not a TTY, so a script capturing stderr sees an empty diagnostic for a launch that never ran","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are

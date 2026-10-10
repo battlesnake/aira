@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-211","project":"aira","title":"aira \u003cverb\u003e --help is refused as a malformed option in twelve separate argv parsers, -h is swallowed as a positional, and an unknown option gets no did-you-mean outside confine","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-211","project":"aira","title":"aira \u003cverb\u003e --help is refused as a malformed option in twelve separate argv parsers, -h is swallowed as a positional, and an unknown option gets no did-you-mean outside confine","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
