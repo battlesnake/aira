@@ -241,7 +241,8 @@ func TestConfineDumpUnevaluatedDoesNotWriteAFile(t *testing.T) {
 //
 // verifies: AIRA (admission-counter rebuild) S18
 func TestConfineDumpHyphenatedVerbRequiresDumpFlag(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	var stdout terminalBuffer
+	var stderr bytes.Buffer
 	exit := RunWithDispatcher([]string{"confine-dump"}, &stdout, &stderr,
 		dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
 			t.Fatal("must not reach the dispatcher with no --dump")

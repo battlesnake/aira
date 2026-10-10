@@ -8,7 +8,10 @@ import (
 	"sort"
 	"strings"
 
+	"aira/internal/codes"
 	"aira/internal/core"
+	"aira/internal/runner"
+	"aira/internal/store"
 )
 
 // AIRA-211. One `--help` for every verb that has a help-table entry.
@@ -121,4 +124,59 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// confineManagementFlags are the `confine` options that make a request a
+// management request (list/kill/status/budget/dump) rather than a launch.
+var confineManagementFlags = map[string]bool{"--list": true, "--kill": true, "--status": true, "--budget": true, "--dump": true}
+
+// isConfineLaunch reports whether argv (verb first) is a request to LAUNCH a
+// confine job: the verb is exactly `confine` (the hyphenated confine-* verbs are
+// management, never launches) and no management flag, with or without =value,
+// appears before the first `--`. It reads tokens only, so it works before, and
+// when, option parsing fails. AIRA-207 keys the stderr `ran=no` line on it, so a
+// management request never gets one (nothing was being launched) and a `--list`
+// after `--` (the child's argument) does not hide a launch.
+func isConfineLaunch(argv []string) bool {
+	if len(argv) == 0 || argv[0] != "confine" {
+		return false
+	}
+	for _, arg := range argv[1:] {
+		if arg == "--" {
+			break
+		}
+		name, _, _ := strings.Cut(arg, "=")
+		if confineManagementFlags[name] {
+			return false
+		}
+	}
+	return true
+}
+
+// refuseConfineLaunch reports a confine launch refused before it reached the
+// launcher: the same two stderr lines, in the same order, an in-flight refusal
+// prints (the fixed `ran=no` line, then the error), so a script has ONE string
+// to key on for "this confine launch never ran", whatever layer refused it.
+func refuseConfineLaunch(stderr io.Writer, err error) int {
+	_, _ = fmt.Fprintln(stderr, runner.FormatConfineNeverRan(runner.ConfineStatus{}, err))
+	_, _ = fmt.Fprintln(stderr, err)
+	code := store.ErrorCode(err)
+	if code == "E_INTERNAL" {
+		code = "E_CONFINE_ARGUMENT_INVALID"
+	}
+	return codes.ExitForCode(code)
+}
+
+// renderConfineRefusal renders a refusal exactly as render does and, when the
+// request is a confine launch (isConfineLaunch), also puts the `ran=no` line on
+// stderr -- and the error text itself when render would not have (JSON mode
+// writes only stdout). stdout is unchanged.
+func renderConfineRefusal(args []string, response core.Response, renderJSON bool, stdout, stderr io.Writer) int {
+	if isConfineLaunch(args) {
+		_, _ = fmt.Fprintln(stderr, runner.FormatConfineNeverRan(runner.ConfineStatus{}, errors.New(response.Error)))
+		if renderJSON {
+			_, _ = fmt.Fprintln(stderr, response.Error)
+		}
+	}
+	return render(response, renderJSON, stdout, stderr)
 }

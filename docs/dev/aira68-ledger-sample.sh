@@ -17,6 +17,7 @@
 # the table's row count is what produced AIRA-68's P0 misdiagnosis.
 #
 # Usage: docs/dev/aira68-ledger-sample.sh [samples] [interval-seconds]
+# Needs jq. GRANTED and CEILING are bytes (read from the JSON slice_reserve).
 # Read-only: it starts nothing, kills nothing, and never restarts the daemon.
 
 set -uo pipefail
@@ -28,12 +29,11 @@ printf '%-12s %-16s %-10s %-6s %-8s %-8s %-8s\n' \
   EPOCH GRANTED CEILING JOBS RESERVE CONFINE CLIENTS
 
 for ((i = 0; i < samples; i++)); do
-  listing=$(aira confine --list 2>/dev/null)
-  summary=$(printf '%s\n' "$listing" | grep -F 'slice reserve:')
-  # "slice reserve: <granted> granted / <ceiling> ceiling across <n> admitted jobs"
-  granted=$(printf '%s\n' "$summary" | awk '{print $3}')
-  ceiling=$(printf '%s\n' "$summary" | awk '{print $6}')
-  jobs=$(printf '%s\n' "$summary" | awk '{print $9}')
+  # AIRA-214: piped, `aira confine --list` is the JSON envelope (the table is for
+  # a terminal), so read the ledger summary from its slice_reserve object. Bytes.
+  listing=$(aira confine --list --json 2>/dev/null)
+  read -r granted ceiling jobs < <(printf '%s\n' "$listing" |
+    jq -r '.data.slice_reserve // empty | "\(.granted_bytes) \(.ceiling_bytes) \(.jobs)"')
 
   # Live admission clients, counted from the process table, independently of
   # anything the daemon reports.

@@ -270,7 +270,8 @@ func TestConfineStatusExitCodeReportsTheQueryNotTheJob(t *testing.T) {
 			confineDetachStatusFor = func(_, _, _ string) (runner.ConfineDetachStatus, error) {
 				return test.status, test.err
 			}
-			var stdout, stderr bytes.Buffer
+			var stdout terminalBuffer
+			var stderr bytes.Buffer
 			exit := runWithInput([]string{"confine", "--status", "gate"}, &stdout, &stderr, strings.NewReader(""))
 			if exit != test.wantExit {
 				t.Fatalf("exit=%d want %d (stdout=%q stderr=%q)", exit, test.wantExit, stdout.String(), stderr.String())
@@ -313,7 +314,8 @@ func TestConfineStatusWithNoSelectorListsTheCallersOwnJobs(t *testing.T) {
 		return []runner.ConfineDetachStatus{detachStatus(runner.ConfineDetachRunning, nil)}, nil
 	}
 	t.Setenv("AIRA_CONFINE_OWNER", "session-a")
-	var stdout, stderr bytes.Buffer
+	var stdout terminalBuffer
+	var stderr bytes.Buffer
 	if exit := runWithInput([]string{"confine", "--status"}, &stdout, &stderr, strings.NewReader("")); exit != 0 {
 		t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
 	}

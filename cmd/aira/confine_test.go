@@ -190,7 +190,8 @@ func TestConfineListRendersHumanTableAndAllowsJSON(t *testing.T) {
 		}
 		return core.Response{OK: true, Code: "OK", Data: result}
 	})
-	var stdout, stderr bytes.Buffer
+	var stdout terminalBuffer
+	var stderr bytes.Buffer
 	if exit := runWithInputDispatcher([]string{"confine", "--list"}, &stdout, &stderr, strings.NewReader(""), dispatch); exit != 0 || !strings.Contains(stdout.String(), "SUPERVISOR-PID") || !strings.Contains(stdout.String(), "husk") || !strings.Contains(stdout.String(), "  0") {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
@@ -225,7 +226,8 @@ func TestRenderConfineListLiveColumnUsesSubtreePopulation(t *testing.T) {
 		dispatch := dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, _ core.Request) core.Response {
 			return core.Response{OK: true, Code: "OK", Data: result}
 		})
-		var stdout, stderr bytes.Buffer
+		var stdout terminalBuffer
+		var stderr bytes.Buffer
 		if exit := runWithInputDispatcher([]string{"confine", "--list"}, &stdout, &stderr, strings.NewReader(""), dispatch); exit != 0 {
 			t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
 		}
@@ -284,7 +286,8 @@ func TestRenderConfineListShowsTheReserveBesideTheCap(t *testing.T) {
 		dispatch := dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, _ core.Request) core.Response {
 			return core.Response{OK: true, Code: "OK", Data: result}
 		})
-		var stdout, stderr bytes.Buffer
+		var stdout terminalBuffer
+		var stderr bytes.Buffer
 		if exit := runWithInputDispatcher([]string{"confine", "--list"}, &stdout, &stderr, strings.NewReader(""), dispatch); exit != 0 {
 			t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
 		}

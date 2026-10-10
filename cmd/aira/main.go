@@ -111,14 +111,17 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	// genuine human-readable text (AIRA-57). Verbs whose current behaviour
 	// doesn't route through the generic (previously JSON-dump-as-"human")
 	// rendering decision at all deliberately keep using the explicit
-	// jsonOutput flag below, unaffected by this default: confine and friends
-	// (which reject --json outright), watch, run/git/time's live byte
-	// streaming during dispatch, and the deliberate non-JSON suppression
-	// contracts of time's and run-log's trailing summaries (see below).
+	// jsonOutput flag below, unaffected by this default: the confine LAUNCH form,
+	// confine-reserve, drain and the other forms that reject --json outright,
+	// watch, run/git/time's live byte streaming during dispatch, and the
+	// deliberate non-JSON suppression contracts of time's and run-log's trailing
+	// summaries (see below). The confine MANAGEMENT forms (--list, --budget,
+	// --status, --kill, --dump) follow renderJSON like every other verb
+	// (AIRA-214); confine-log and confine-input stay byte-transparent.
 	renderJSON := jsonOutput || !stdoutIsTerminal(stdout)
 	if scopeDirErr != nil {
 		code := store.ErrorCode(scopeDirErr)
-		return render(core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return renderConfineRefusal(args, core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// A verb that resolves no project/worktree scope refuses the override rather
 	// than accepting and discarding it: silently ignoring an explicit scope is
@@ -130,13 +133,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		if !verbAcceptsScopeDir(target) {
 			message := fmt.Sprintf("E_SELECTOR_INVALID: option %s is not valid for %s", scopeDirFlag, target)
-			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+			return renderConfineRefusal(args, core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
 		}
 	}
 	scopeDir, scopeDirResolveErr := resolveScopeDir(scopeDirOption)
 	if scopeDirResolveErr != nil {
 		code := store.ErrorCode(scopeDirResolveErr)
-		return render(core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return renderConfineRefusal(args, core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// AIRA-202. Intercepted HERE, beside help, rather than added to buildRequest's
 	// switch: version resolves no project, opens no store, and must answer with
@@ -225,7 +228,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			code = "E_SELECTOR_INVALID"
 		}
 		response := core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
-		return render(response, renderJSON, stdout, stderr)
+		return renderConfineRefusal(args, response, renderJSON, stdout, stderr)
 	}
 	if (verb == "tui" || verb == "board") && jsonOutput {
 		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for " + verb, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
@@ -274,19 +277,19 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true" || dumpPath != ""
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
-			return render(response, true, stdout, stderr)
+			return renderConfineRefusal(args, response, true, stdout, stderr)
 		}
 		if status {
-			return runConfineStatusCommand(context.Background(), options, jsonOutput, stdout, stderr)
+			return runConfineStatusCommand(context.Background(), options, renderJSON, stdout, stderr)
 		}
 		// --dump writes a LOCAL FILE (the caller's own filesystem), which is not
 		// something the generic render()-based runConfineManagementCommand does
 		// for any other management flag, so it gets its own command function.
 		if dumpPath != "" {
-			return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
+			return runConfineDumpCommand(context.Background(), options, dumpPath, renderJSON, stdout, stderr, injected)
 		}
 		if management {
-			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
+			return runConfineManagementCommand(context.Background(), options, renderJSON, stdout, stderr, injected)
 		}
 		return runConfineCommand(context.Background(), positional, options, stdin, stdout, stderr)
 	}
@@ -345,14 +348,14 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			if code == "E_INTERNAL" {
 				code = "E_CONFINE_ARGUMENT_INVALID"
 			}
-			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		owner, ownerErr := resolveConfineOwner(context.Background(), options["owner"])
 		if ownerErr != nil {
-			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
 		}
 		request.Args["owner"] = owner
-		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
+		return dispatchConfineManagementRequest(context.Background(), request, renderJSON, stdout, stderr, injected)
 	}
 	// AIRA (admission-counter rebuild) S18. The hyphenated spelling of
 	// `confine --dump <file>`, on the SAME two-spellings-must-both-work
@@ -365,9 +368,9 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if verb == "confine-dump" {
 		dumpPath := options["dump"]
 		if dumpPath == "" {
-			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-dump requires --dump <file>", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, renderJSON, stdout, stderr)
 		}
-		return runConfineDumpCommand(context.Background(), options, dumpPath, jsonOutput, stdout, stderr, injected)
+		return runConfineDumpCommand(context.Background(), options, dumpPath, renderJSON, stdout, stderr, injected)
 	}
 	// AIRA-196. Handled HERE, beside the rest of the confine family and BEFORE
 	// project discovery, for the reason the family shares: a detached confine job
@@ -771,6 +774,11 @@ func removeJSON(argv []string) ([]string, bool) {
 // (AIRA-57). A non-*os.File writer (a buffer, a pipe abstraction in tests)
 // is never a terminal.
 func stdoutIsTerminal(w io.Writer) bool {
+	// A writer may state its own answer (a pty wrapper, a test double standing in
+	// for a terminal); the process's own *os.File is asked of the OS.
+	if known, ok := w.(interface{ IsTerminal() bool }); ok {
+		return known.IsTerminal()
+	}
 	file, ok := w.(*os.File)
 	if !ok {
 		return false
@@ -1505,8 +1513,7 @@ func runConfineHelpCommand(renderJSON bool, stdout, stderr io.Writer) int {
 func runConfineCommand(ctx context.Context, target []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
 	maximum, high, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID")
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return refuseConfineLaunch(stderr, err)
 	}
 	reserveRaw, reservePinned := options["memory-reserve"]
 	if !reservePinned {
@@ -1520,8 +1527,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 			if err == nil {
 				err = errors.New("must be at least 1MiB")
 			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %v", err))
 		}
 	}
 	// AIRA-62: the CLI TRANSCRIBES, it does not resolve. This used to be
@@ -1547,15 +1553,13 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		}
 		parsed, boundErr := parseConfineJobBound(raw)
 		if boundErr != nil {
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --%s: %v\n", bound.name, boundErr)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s: %v", bound.name, boundErr))
 		}
 		*bound.value = parsed
 	}
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", err)
-		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %v", err))
 	}
 	// AIRA-268. --vram declares the GPU VRAM the job needs; the CLI TRANSCRIBES it
 	// (size parser, same language as --memory-max), the daemon gates admission on
@@ -1567,8 +1571,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 			if err == nil {
 				err = errors.New("must be at least 1MiB")
 			}
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --vram: %v\n", err)
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return refuseConfineLaunch(stderr, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --vram: %v", err))
 		}
 	}
 	// AIRA-281. The summary path is made absolute HERE, once, so a detached
