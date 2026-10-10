@@ -130,4 +130,26 @@ type ConfineBudgetResult struct {
 	Reason   string             `json:"reason,omitempty"`
 	Scope    string             `json:"scope"`
 	Subjects []ConfineBudgetRow `json:"subjects"`
+	// Next is set only on a PAGED reply (AIRA-280), exactly when at least one more
+	// subject existed when the page was read. The CLI joins the pages, so a joined
+	// result never carries it. Pages are separate reads, not one snapshot: a
+	// subject first recorded while the pages are being read, sorting before the
+	// cursor, is absent from the joined result.
+	Next *ConfineHistoryCursor `json:"next,omitempty"`
+}
+
+// ConfineHistoryCursor names the last (kind, signature) subject a paged
+// confine-dump or confine-budget reply held; the next page starts strictly after
+// it. Subjects are ordered bytewise by kind then signature.
+type ConfineHistoryCursor struct {
+	Kind      string `json:"kind"`
+	Signature string `json:"signature"`
+}
+
+// After reports whether c sorts strictly after other.
+func (c ConfineHistoryCursor) After(other ConfineHistoryCursor) bool {
+	if c.Kind != other.Kind {
+		return c.Kind > other.Kind
+	}
+	return c.Signature > other.Signature
 }

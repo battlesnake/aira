@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"time"
 )
@@ -156,12 +158,42 @@ func (s *Server) resolvedDeadlines() deadlinePolicy {
 // than the handshake it failed (plan-review finding, accepted).
 func (s *Server) reply(conn net.Conn, frame any) bool {
 	_ = conn.SetWriteDeadline(time.Now().Add(s.resolvedDeadlines().Write))
-	return writeFrame(conn, frame) == nil
+	return writeOrRefuseTooLarge(conn, func() error { return writeFrame(conn, frame) })
 }
 
 // replyStoreOp is reply for the store-op path, whose response carries a
 // separately framed body.
 func (s *Server) replyStoreOp(conn net.Conn, frame ResponseFrame) bool {
 	_ = conn.SetWriteDeadline(time.Now().Add(s.resolvedDeadlines().Write))
-	return writeResponse(conn, frame) == nil
+	return writeOrRefuseTooLarge(conn, func() error { return writeResponse(conn, frame) })
+}
+
+// writeOrRefuseTooLarge runs one post-handler response write. If the write
+// refused for SIZE (a *frameTooLargeError, which both writers raise before
+// sending a byte), it answers with a CodeResponseTooLarge error frame instead:
+// the connection is still clean, so that fallback is the first and only frame
+// the client sees, and it reads as a normal named refusal rather than as EOF
+// (AIRA-280; previously the daemon dropped the connection silently and the
+// client could only report E_DAEMON_UNAVAILABLE: EOF).
+//
+// It returns true whenever the original write or the fallback write succeeded,
+// and false only when the bytes actually sent failed, so serveConnection's
+// panic-recovery writer can never put a second frame on the connection after a
+// fallback. It chooses no deadline: each caller stamps its own immediately before
+// calling it (rule 3 above), and the fallback frame is tiny.
+//
+// Used by the three post-handler writers: reply, replyStoreOp and watch's
+// answer. Handshake rejections and the panic frame are fixed short strings and
+// keep their direct writes.
+func writeOrRefuseTooLarge(conn net.Conn, write func() error) bool {
+	err := write()
+	if err == nil {
+		return true
+	}
+	var tooLarge *frameTooLargeError
+	if !errors.As(err, &tooLarge) {
+		return false
+	}
+	message := fmt.Sprintf("%s: the %s is %d bytes, over the %d-byte limit; nothing was sent", CodeResponseTooLarge, tooLarge.What, tooLarge.Size, tooLarge.Limit)
+	return writeFrame(conn, errorFrame(CodeResponseTooLarge, message)) == nil
 }

@@ -251,28 +251,39 @@ type ResourceBudgetSubjectRows struct {
 const resourceBudgetSelect = `SELECT kind,signature,peak_rss,oom,budget,budget_basis,at
 FROM confine_peak_history`
 
+// scanResourceBudgetRow reads the current row of a resourceBudgetSelect query.
+// Shared by the unpaged and the streaming reader so the nullable-field handling
+// (a NULL or non-positive peak or budget stays nil, never 0) cannot diverge.
+func scanResourceBudgetRow(rows *sql.Rows) (kind, signature string, sample ResourceBudgetSample, err error) {
+	var at string
+	var peak, budget sql.NullInt64
+	var basis sql.NullString
+	var oom int
+	if err := rows.Scan(&kind, &signature, &peak, &oom, &budget, &basis, &at); err != nil {
+		return "", "", ResourceBudgetSample{}, translateDBError(err)
+	}
+	sample = ResourceBudgetSample{OOM: oom == 1, At: at}
+	if peak.Valid && peak.Int64 > 0 {
+		value := peak.Int64
+		sample.Peak = &value
+	}
+	if budget.Valid && budget.Int64 > 0 {
+		value := budget.Int64
+		sample.Budget = &value
+		if basis.Valid {
+			sample.BudgetBasis = basis.String
+		}
+	}
+	return kind, signature, sample, nil
+}
+
 func scanResourceBudgetRows(rows *sql.Rows) ([]ResourceBudgetSubjectRows, error) {
 	order := []string{}
 	byKey := map[string]*ResourceBudgetSubjectRows{}
 	for rows.Next() {
-		var kind, signature, at string
-		var peak, budget sql.NullInt64
-		var basis sql.NullString
-		var oom int
-		if err := rows.Scan(&kind, &signature, &peak, &oom, &budget, &basis, &at); err != nil {
-			return nil, translateDBError(err)
-		}
-		sample := ResourceBudgetSample{OOM: oom == 1, At: at}
-		if peak.Valid && peak.Int64 > 0 {
-			value := peak.Int64
-			sample.Peak = &value
-		}
-		if budget.Valid && budget.Int64 > 0 {
-			value := budget.Int64
-			sample.Budget = &value
-			if basis.Valid {
-				sample.BudgetBasis = basis.String
-			}
+		kind, signature, sample, err := scanResourceBudgetRow(rows)
+		if err != nil {
+			return nil, err
 		}
 		key := kind + "\x00" + signature
 		subject := byKey[key]
@@ -291,6 +302,57 @@ func scanResourceBudgetRows(rows *sql.Rows) ([]ResourceBudgetSubjectRows, error)
 		result = append(result, *byKey[key])
 	}
 	return result, nil
+}
+
+// StreamResourceBudgetSubjects reads the retained history ONE ROW AT A TIME, in
+// (kind, signature) order, starting strictly after the cursor (afterKind,
+// afterSignature; empty means the beginning -- every row has a non-empty
+// signature and kind by the table's CHECKs), and offers each COMPLETE subject to
+// take. take returning true keeps going; false stops at once, closes the cursor
+// and returns more=true (the subject just offered exists and was not taken). End
+// of rows returns the last subject to take and then more=false, so more is exact:
+// true if and only if a subject after the last one taken existed when it was read.
+//
+// Memory is bounded by what take keeps plus the one subject in flight (at most
+// confinePeakHistoryLimit rows): there is no LIMIT and no slice of every row.
+// Ordering is SQLite's BINARY collation, which is Go's bytewise string order, so
+// a client may compare cursors with Go's < on strings. A subject is never split.
+//
+// AIRA-280. This is the reader behind the paged confine dump and budget.
+func (db *DB) StreamResourceBudgetSubjects(ctx context.Context, afterKind, afterSignature string, take func(ResourceBudgetSubjectRows) bool) (bool, error) {
+	if db == nil || db.db == nil {
+		return false, errors.New("E_DAEMON_UNAVAILABLE: state database is unavailable")
+	}
+	rows, err := db.db.QueryContext(ctx, resourceBudgetSelect+` WHERE (kind,signature) > (?,?) ORDER BY kind ASC,signature ASC,at DESC,rowid DESC`,
+		afterKind, afterSignature)
+	if err != nil {
+		return false, translateDBError(err)
+	}
+	defer rows.Close()
+	var current *ResourceBudgetSubjectRows
+	for rows.Next() {
+		kind, signature, sample, err := scanResourceBudgetRow(rows)
+		if err != nil {
+			return false, err
+		}
+		if current != nil && (string(current.Kind) != kind || current.Signature != signature) {
+			if !take(*current) {
+				return true, nil
+			}
+			current = nil
+		}
+		if current == nil {
+			current = &ResourceBudgetSubjectRows{Kind: ResourcePeakKind(kind), Signature: signature}
+		}
+		current.Samples = append(current.Samples, sample)
+	}
+	if err := rows.Err(); err != nil {
+		return false, translateDBError(err)
+	}
+	if current != nil && !take(*current) {
+		return true, nil
+	}
+	return false, nil
 }
 
 // ResourceBudgetSubjects returns every retained subject with its window, newest

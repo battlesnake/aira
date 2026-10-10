@@ -131,6 +131,9 @@ type ConfineDumpResult struct {
 	Admissions []ConfineDumpAdmissionRow `json:"admissions,omitempty"`
 	Queues     []ConfineDumpQueueRow     `json:"queues,omitempty"`
 	Waiters    []ConfineDumpWaiterRow    `json:"waiters,omitempty"`
+	// Next is set only on a PAGED reply (AIRA-280); see ConfineBudgetResult.Next.
+	// On a paged dump, Waiters and Queues (live state) ride on the first page only.
+	Next *ConfineHistoryCursor `json:"next,omitempty"`
 }
 
 // WriteConfineDumpJSONL writes result's rows as JSONL (Admissions, then
