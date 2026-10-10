@@ -34,6 +34,7 @@ var (
 		"memory-reserve", "memory-max", "memory-high",
 		"vram",
 		"timeout", "cpu-timeout",
+		"summary-file", "summary-tree-hash",
 	}
 	confineLaunchValuelessOptions = []string{"delegate-ram", "detach", "exclusive", "fail-fast", "require-admission", "stdin-connect"}
 )

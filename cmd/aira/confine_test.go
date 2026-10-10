@@ -744,7 +744,9 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 		// --require-admission (fail closed when the job was not admitted). S13 removed
 		// --admit-timeout (the admission wait no longer self-expires). AIRA-268 adds
 		// --vram (declared GPU VRAM; the daemon gates admission on real free VRAM).
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--timeout D] [--cpu-timeout D] [--delegate-ram] [--exclusive] [--require-admission] [--detach] [--stdin-connect] -- <argv...>" {
+		// AIRA-281 adds --summary-file/--summary-tree-hash and (a pre-existing gap)
+		// --fail-fast, which the parser accepted but the help never named.
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--timeout D] [--cpu-timeout D] [--summary-file PATH] [--summary-tree-hash H] [--delegate-ram] [--exclusive] [--require-admission] [--fail-fast] [--detach] [--stdin-connect] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

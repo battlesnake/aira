@@ -500,6 +500,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// early-abort paths above return before identity is validated and so carry no
 	// name (rendered as `name=unevaluated`), which is correct: nothing ran.
 	result.Status.Name = normalizedName
+	// AIRA-281. The owner travels beside the name for the --summary-file line, on
+	// both the shim and real paths.
+	result.Status.Owner = normalizedOwner
 	// AIRA-121. The ci-shim branch, taken HERE: after every argument, cap,
 	// reserve-bound and identity check (all of which are mode-independent and
 	// must refuse identically in both modes), and BEFORE the first line that
@@ -1298,6 +1301,10 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return abortStarted(fmt.Errorf("release confined target: %w", writeErr))
 	}
 	_ = releaseWrite.Close()
+	// AIRA-281. Wall time starts at the successful release write: it excludes the
+	// admission wait and the setup handshake, for the same reason the job bounds
+	// do (a clock started at invocation would report time the job never had).
+	releasedAt := time.Now()
 	// AIRA-138. The wait moves behind a channel so ONE select can race it against
 	// ONE deadline source. waitConfineCommand itself is unchanged and still shared
 	// with the shim path.
@@ -1446,6 +1453,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		deadlineKillKind = fired.Kind
 	}
 	result.Status.TerminatedBy = classifyConfineTermination(termination, usage, terminatedBySignal, deadlineKillKind)
+	applyConfineRusage(&result.Status, releasedAt, termination)
 	// AIRA-138. The two bound facets, each derived by the one total rule in
 	// decisions.go and each rendered only if that bound was requested.
 	//
@@ -2432,6 +2440,13 @@ type confineTermination struct {
 	Decoded  bool
 	Signaled bool
 	Signal   syscall.Signal
+	// AIRA-281. WaitReturnedAt is stamped on the statement after cmd.Wait()
+	// returns (so wall time is release to wait completion, not to the reap), and
+	// Rusage is the wait4 rusage of the job's process and the descendants it
+	// waited for. Both are filled on EVERY return arm, the undecoded one included,
+	// because cmd.ProcessState is still set when Wait returns an output-copy error.
+	WaitReturnedAt time.Time
+	Rusage         *syscall.Rusage
 }
 
 // confineWaitOutcome carries waitConfineCommand's two return values across the
@@ -2635,19 +2650,53 @@ func confineDeadlineReason(err error, fallback string) string {
 
 func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 	err := cmd.Wait()
+	// AIRA-281. Stamped on the statement after Wait returns and BEFORE anything
+	// else, so wall time never includes the decoding below.
+	term := confineTermination{WaitReturnedAt: time.Now()}
+	if cmd.ProcessState != nil {
+		if usage, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
+			term.Rusage = usage
+		}
+	}
 	if err == nil {
-		return 0, confineTermination{Decoded: true}
+		term.Decoded = true
+		return 0, term
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		if wait, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			term.Decoded = true
 			if wait.Signaled() {
-				return 128 + int(wait.Signal()), confineTermination{Decoded: true, Signaled: true, Signal: wait.Signal()}
+				term.Signaled, term.Signal = true, wait.Signal()
+				return 128 + int(wait.Signal()), term
 			}
-			return wait.ExitStatus(), confineTermination{Decoded: true}
+			return wait.ExitStatus(), term
 		}
 	}
-	return 3, confineTermination{}
+	return 3, term
+}
+
+// applyConfineRusage records the wait4 rusage and the wall time onto the status
+// (AIRA-281). The values live in their OWN fields and never touch PeakRSS,
+// CPUUser or CPUSys: those are the whole-subtree cgroup counters and ru_maxrss
+// is only the largest single process (AIRA-121 gate C10). Nil means not
+// established; a wall time or a maxrss that is <= 0 is also left nil, matching
+// the PeakRSS clamp, while an observed CPU of 0 stays 0.
+func applyConfineRusage(status *ConfineStatus, releasedAt time.Time, term confineTermination) {
+	if !releasedAt.IsZero() && !term.WaitReturnedAt.IsZero() {
+		if wall := term.WaitReturnedAt.Sub(releasedAt).Microseconds(); wall > 0 {
+			status.WallUS = &wall
+		}
+	}
+	if term.Rusage == nil {
+		return
+	}
+	user := term.Rusage.Utime.Sec*1_000_000 + int64(term.Rusage.Utime.Usec)
+	sys := term.Rusage.Stime.Sec*1_000_000 + int64(term.Rusage.Stime.Usec)
+	status.RusageUserUS, status.RusageSysUS = &user, &sys
+	if maxrss := int64(term.Rusage.Maxrss) * 1024; maxrss > 0 {
+		status.RusageMaxRSS = &maxrss
+	}
 }
 
 // classifyConfineTermination answers AIRA-70's question -- what killed this job?

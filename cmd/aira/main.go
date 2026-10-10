@@ -938,6 +938,23 @@ func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, err
 	return nil, options, nil
 }
 
+// summaryFileAbsolutePath makes a --summary-file path absolute WITHOUT
+// cleaning it. A relative path is joined onto the PHYSICAL cwd (getcwd(2), not
+// $PWD) and every `..` is left for the kernel to resolve at open time, which is
+// exactly what the shell's `>>` does; filepath.Abs / filepath.Join clean `..` as
+// text against the logical $PWD and can name a different file. An absolute path
+// is passed through untouched. covers: AIRA-281
+func summaryFileAbsolutePath(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+	cwd, err := syscall.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(cwd, "/") + "/" + path, nil
+}
+
 func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	delimiter := -1
@@ -1004,6 +1021,23 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	// silently discarded. Refused here, synchronously, rather than ignored.
 	if options["stdin-connect"] == "true" && options["detach"] != "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --stdin-connect requires --detach; a foreground confine already reads the caller's own stdin")
+	}
+	// AIRA-281. --summary-file takes a real path (an empty string would otherwise
+	// pass the generic "requires a value" check, which only rejects a following
+	// option), and --summary-tree-hash is meaningful only with a file to carry it,
+	// the same requires-pattern as --stdin-connect above. The hash is validated here
+	// by the SAME function the runner funnel calls, so a bad value is refused
+	// synchronously and the two can never accept different languages.
+	if raw, present := options["summary-file"]; present && raw == "" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --summary-file requires a non-empty path")
+	}
+	if raw, present := options["summary-tree-hash"]; present {
+		if _, hasFile := options["summary-file"]; !hasFile {
+			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --summary-tree-hash requires --summary-file")
+		}
+		if err := runner.ValidateConfineSummaryTreeHash(raw); err != nil {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", err)
+		}
 	}
 	if _, _, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID"); err != nil {
 		return nil, nil, err
@@ -1521,9 +1555,25 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
+	// AIRA-281. The summary path is made absolute HERE, once, so a detached
+	// supervisor (whose cwd is not this one) and the foreground path name the same
+	// file. The runner refuses a relative path regardless, so the rule does not
+	// depend on this transcription being remembered.
+	// Never filepath.Abs: it cleans `..` as text against the logical $PWD, which
+	// sends the line to a different file than the shell's `>>` would write.
+	summaryFile := options["summary-file"]
+	if summaryFile != "" {
+		absolute, absErr := summaryFileAbsolutePath(summaryFile)
+		if absErr != nil {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --summary-file: %v\n", absErr)
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		summaryFile = absolute
+	}
 	request := runner.ConfineRequest{
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
-		Owner:         owner,
+		Owner:       owner,
+		SummaryFile: summaryFile, SummaryTreeHash: options["summary-tree-hash"],
 		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
 		DelegateRAM:      options["delegate-ram"] == "true",
 		Exclusive:        options["exclusive"] == "true",

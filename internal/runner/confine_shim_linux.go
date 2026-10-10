@@ -478,6 +478,9 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		return result, confineUnavailable(sliceName, fmt.Errorf("release confined target: %w", writeErr))
 	}
 	_ = releaseWrite.Close()
+	// AIRA-281. Wall time starts at the successful release write, as on the real
+	// path; in ci-shim mode the job's streams are files, so Wait returns at the reap.
+	releasedAt := time.Now()
 	exitCode, termination := waitConfineCommand(cmd)
 	// The pgid cut-off closes the instant the leader is reaped, before anything
 	// else can run: past here signal() delivers nothing.
@@ -518,11 +521,20 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// simultaneous total like memory.peak, so a job whose peak comes from many
 	// concurrent children is under-measured in the PERMISSIVE direction.
 	//
+	// (AIRA-281 reports ru_maxrss under its own, explicitly named key
+	// `rusage_maxrss_largest_process_bytes` on the --summary-file line, never as
+	// peak-rss and never to the estimator.)
+	//
 	// The cost is small in the deployment shape this ticket targets: a fresh
 	// Batch container starts with an empty history, so the estimator would not
 	// have learned anything usable within one container's life either way. Recorded
 	// as an accepted residual; peak-rss reads `unevaluated` on the trailer.
 	result.Status.TerminatedBy = classifyConfineTermination(termination, cgroupUsage{}, terminatedBySignal, deadlineKindUnset)
+	// AIRA-281. The wait4 rusage (and wall time) go in their OWN separately named
+	// fields, never PeakRSS/CPUUser/CPUSys: ru_maxrss is the largest single
+	// process, not a simultaneous total, so it must not stand in for peak-rss
+	// above (C10) or reach the estimator.
+	applyConfineRusage(&result.Status, releasedAt, termination)
 	// AIRA-206: see the real path -- prepend \n so the trailer begins its own line
 	// even after a partial (newline-free) last block from the job.
 	_, _ = fmt.Fprintf(diagnostics, "\n%s\n", FormatConfineStatus(result.Status))

@@ -52,3 +52,17 @@ func ConfineDetachStatusFor(string, string, string) (ConfineDetachStatus, error)
 func ConfineDetachStatusList(string, string) ([]ConfineDetachStatus, error) {
 	return nil, errors.New(CodeConfineOutcomeUnknown + ": detached confinement is supported only on Linux")
 }
+
+// The --summary-file surface is Linux-only for the same reason confinement is:
+// there is nothing here to write a summary about. Opening refuses with the code
+// confine already returns on this platform, so the funnel passes it through.
+
+func openConfineSummaryFile(string) (int, error) {
+	return -1, errors.New("E_CONFINE_UNAVAILABLE: cgroup-v2 confinement is supported only on Linux")
+}
+
+func appendConfineSummary(int, []byte) error {
+	return errors.New("E_CONFINE_UNAVAILABLE: cgroup-v2 confinement is supported only on Linux")
+}
+
+func closeConfineSummaryFile(int) {}
