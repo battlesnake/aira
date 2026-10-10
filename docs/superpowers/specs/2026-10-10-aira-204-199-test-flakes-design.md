@@ -7,7 +7,7 @@ its own descriptor). Two flakes seen this week join them: `internal/daemon`
 `TestM20RealForcedQuiescePreservesLeaderExitAndIsNotClean`. Base: master `d13ef3b`. Both
 tickets report `ready:true`.
 
-**Production files touched: two, each by one test seam that is unset in production
+**Production code: two test seams, unset in production, across four files
 (`internal/daemon/admit.go` + `server.go`, `internal/runner/detach_linux.go` +
 `runner_linux.go`).** Neither flake is a product race (measured, section 1). The seams get
 their own review pass (section 8). Everything else is `_test.go` plus one committed
@@ -161,6 +161,10 @@ are also used by the board tests):
   waits with `testdeadline.Eventually` until the counter reaches the number of keys
   injected so far, then does one `onUI` round trip, so the last key's handler has
   returned before `press` returns. Keys are FIFO, so this proves every earlier key ran.
+  Keys that stop or suspend the loop (`q`, the execute launcher's run/confirm that
+  suspends) are injected raw and followed by the existing `done` (or resume) wait:
+  `press`'s final round trip would never run and its backstop would report a false
+  "deadlocked".
 - `waitForSimulationText` keeps its signature and its 10 s budget, now
   `testdeadline.Wait(10*time.Second)`, and **fails** with the last screen text on expiry
   instead of returning it silently.
@@ -211,7 +215,8 @@ only when the property is false or the loop is truly stuck.
   the pid line is in `result.Stdout` before the deadline fires.
 - Backstop: `time.AfterFunc(testdeadline.Wait(5*time.Second), ...)` that marks
   "backstop fired" and expires the context, so a child that never prints still ends the
-  subject; the test then fails "pid line never observed", never passes.
+  subject; the test then fails "pid line never observed", never passes. The timer is
+  stopped when `realRun` returns.
 - The script gains a fixed `sleep 0.2;` before `trap` (child-side startup delay, a
   fixture, not synchronisation): a regression to a deadline armed at start goes RED on
   every run instead of under load only.
@@ -271,19 +276,23 @@ Prototype: plain, 2 CPUs + 6 burners, x 300: **0/300**, wall 108 s (104 s before
 
 - Pass `dupTestFD(t, readyW)` and `dupTestFD(t, ackR)` (the existing helper,
   `supervisor_relay_store_test.go:51`): the callee owns the duplicates. `defer
-  readyW.Close()`, and close `readyW` explicitly right after `runSupervisor` returns and
-  before `Decode`, so a supervisor that wrote nothing gives an immediate `EOF` instead of a
-  read that blocks while the test still holds a write end.
-- Permanent exposure window between building the arguments and calling `runSupervisor`:
-  `runtime.GC()` twice, then a 20 ms window for the finalizer goroutine. It can only make
-  the wrong shape fail (measured 50/50 EOF); it cannot fail the right one.
+  readyW.Close()`.
+- Right after `runSupervisor` returns and before `Decode`, close `readyW` explicitly and
+  **assert the close succeeds**: `if err := readyW.Close(); err != nil {
+  t.Fatalf("the callee closed a descriptor this test owns: %v", err) }`. This is the pin:
+  a callee that closed the test's own descriptor makes the close fail with `EBADF` on
+  every run, with no GC timing involved. It also means a supervisor that wrote nothing
+  gives an immediate `EOF` instead of a read that blocks while the test holds a write end.
 - Delete `itoaFD` (`:67`), the only raw-fd hand-off helper in the package.
 - The `ackR` duplicate is not closed by the callee on this path (it returns before
   `SuperviseRequest`) and leaks one descriptor per run: accepted, as in
   `supervisor_relay_store_test.go:428`, because closing a raw int the callee may also
   close is this ticket's bug.
 
-Prototype: plain + forced GC 50/50 pass; `-race` x 400: 0/400.
+Prototype: the dup shape with a forced-GC window 50/50 pass and `-race` x 400 0/400;
+the close assertion with the mutation "pass `readyW.Fd()` again" 5/5 RED
+(`m20b_test.go:55: the callee closed a descriptor this test owns: close |1: bad file
+descriptor`) and without it 5/5 GREEN.
 
 ## 4. Invariants
 
@@ -293,7 +302,9 @@ Prototype: plain + forced GC 50/50 pass; `-race` x 400: 0/400.
 2. No retrying loop contains a short inner `t.Fatal`.
 3. No `time.Sleep` orders a test action after an injected key or an asynchronous effect;
    a barrier or a predicate does. The only remaining sleeps in scope are labelled
-   negative waits or poll pacing.
+   negative waits, poll pacing, or deliberate fault-injection delays (C's child-side
+   `sleep 0.2`, the barrier pin's 50 ms release, the 300 ms UI stall) that can only make
+   the wrong shape fail; each carries a comment saying which.
 4. A negative wait can only false-pass under contention, never false-fail.
 5. A fixture duration the test needs to expire is never also a backstop it needs not to
    expire (F; C's subject deadline is armed only after its precondition).
@@ -379,9 +390,11 @@ observed"). Load: before 1/60; after 0/60.
   preserved, `QuiesceForced`, `U_RUN_QUIESCE_FORCED`, not clean, never
   `ScopeDescendantKilled`). Load: before 3/200 and 6/300; after 0/300.
 
-**199.** The forced-GC exposure window makes the test RED against the old shape on every
-run (50/50 measured). Mutation: pass `readyW.Fd()` again -> RED. Load: `-race` x 400:
-before 8/400; after 0/400.
+**199.** The pin is the close assertion. Mutation: pass `readyW.Fd()` again -> RED on
+every run (5/5 measured on the new shape). The old test shape is RED under a forced-GC
+window (two `runtime.GC()` plus 20 ms before `runSupervisor`: 50/50 EOF measured); that
+window is a measurement only and is not committed. Load: `-race` x 400: before 8/400;
+after 0/400.
 
 **Gate.** `aira confine -- make ci` (the gate's exact command), then `go test -race` on
 `cmd/aira`, `internal/daemon`, `internal/runner`, `internal/gitremote`. The load runs
@@ -394,7 +407,7 @@ fail and the failure lines, before and after, in the PR.
 |---|---|---|
 | E exclusive | 9/24000 (`-race`, 2 CPUs + 6 burners); witnessed once in `make ci` on 2026-10-10 | 0 (prototype 0/54000) |
 | F M20 forced quiesce | 3/200, 6/300 (2 CPUs + 6 burners); witnessed once on 2026-10-10 | 0 (prototype 0/300) |
-| 199 m20b | 8/400 (`-race`) | 0 (prototype 0/400 with forced GC) |
+| 199 m20b | 8/400 (`-race`) | 0 (prototype 0/400) |
 | B TUI | 9/400 + a package-killing panic (`-race`, 2 CPUs + 6 burners) | 0 failures, no panic |
 | C gitremote | 1/60 (2 CPUs + 6 burners) | 0 |
 | A MCP kill | 0/40 (not reproduced; three historical sightings) | 0; the race window is closed by construction |
@@ -453,5 +466,7 @@ aira confine --name <unique> -- docs/dev/aira204-loadloop.sh excl-race "$PWD/int
 Same pattern for each row of section 6: `cmd/aira` (`aira.test`, `aira.race.test`),
 `internal/runner` (`runner.test`), `internal/gitremote` (`gitremote.test`), with the
 regex, CPU list, burner count and count given there. The deterministic variants (20 ms
-gap, pre-trap sleep, 300 ms UI stall, forced GC) are one-line edits of the test named in
-section 5.
+gap, pre-trap sleep, 300 ms UI stall, forced GC on the old m20b shape) are one-line edits
+of the test named in section 5. The prototype and diagnostic edits used for this plan
+are saved, mixed, in `~/tmp/aira-flakes/prototype-and-diag.diff` (scratch, for the
+builder's reference only).
