@@ -93,7 +93,7 @@ func (d *daemonDispatcher) doStoreOpExchange(ctx context.Context, frame daemon.S
 }
 
 func (d *daemonDispatcher) spawnDaemon() (<-chan childResult, error) {
-	if service, managed := daemon.ManagedServicePaths(daemon.DefaultServiceUnit, d.systemctl(), d.reader(), d.environment()); managed && service.StateID == d.paths.StateID {
+	if service, managed := daemon.ManagedServiceForState(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader()); managed {
 		if service.SocketPath != d.paths.SocketPath {
 			// The enabled service owns this state.db and serves it where this
 			// client cannot reach. A daemon forked here would win the state lock,
@@ -919,8 +919,7 @@ func unreachableDaemonError(paths daemon.Paths, systemctl daemon.SystemctlRun, r
 	if status.Running && status.Lock.PID > 0 && status.Lock.Socket != "" && status.Lock.Socket != paths.SocketPath {
 		return mismatchedRuntimeError(paths, status.Lock.PID, status.Lock.Socket, runtimeDir)
 	}
-	if service, managed := daemon.ManagedServicePaths(daemon.DefaultServiceUnit, systemctl, readFile, getenv); managed &&
-		service.StateID == paths.StateID && service.SocketPath != paths.SocketPath {
+	if service, managed := daemon.ManagedServiceForState(paths, daemon.DefaultServiceUnit, systemctl, readFile); managed && service.SocketPath != paths.SocketPath {
 		return fmt.Errorf("%s: no daemon is listening at %s; aira-daemon.service serves this state at %s, so this process's "+
 			"XDG_RUNTIME_DIR (%s) differs from the daemon's; run with the daemon's XDG_RUNTIME_DIR "+
 			"(a gate command that calls aira needs it in env_allow)",
@@ -987,7 +986,7 @@ func releaseStartupLock(file *os.File) {
 // the real service is enabled), and a positive "is the running PID inside the
 // unit's cgroup" proof is new machinery this mechanical fix does not add.
 func (d *daemonDispatcher) replaceOlderDaemon(ctx context.Context) error {
-	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader(), d.environment()) {
+	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader()) {
 		// The remedy names BOTH steps on purpose. `aira install` publishes this
 		// binary but restarts the unit only when the unit's own content changed
 		// (internal/install/install.go:670-675) — and swapping the ExecStart

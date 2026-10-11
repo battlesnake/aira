@@ -18,20 +18,28 @@ import (
 )
 
 // userManagerSystemctlOnPath puts a `systemctl` first on PATH that behaves like
-// the real `systemctl --user`: it reaches the user manager only with a D-Bus
-// address or an XDG_RUNTIME_DIR equal to the manager's /run/user/<uid>, and
-// otherwise fails with the real tool's words. The tests that use it leave the
-// dispatcher's systemctl seam unset, so the production runner is what runs.
+// the real `systemctl --user` (measured, systemd 255): with
+// DBUS_SESSION_BUS_ADDRESS present, even empty, it reaches the user manager only
+// if that is the manager's bus; otherwise only when XDG_RUNTIME_DIR is the
+// manager's /run/user/<uid>. It fails with the real tool's words. The tests that
+// use it leave the dispatcher's systemctl seam unset, so the production runner
+// is what runs.
 func userManagerSystemctlOnPath(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	script := `#!/bin/sh
-if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ "$XDG_RUNTIME_DIR" != "$STUB_MANAGER_RUNTIME" ]; then
+if [ "${DBUS_SESSION_BUS_ADDRESS+set}" = set ]; then
+  if [ "$DBUS_SESSION_BUS_ADDRESS" != "$STUB_GOOD_BUS" ]; then
+    echo "Failed to connect to bus: No such file or directory" >&2
+    exit 1
+  fi
+elif [ "$XDG_RUNTIME_DIR" != "$STUB_MANAGER_RUNTIME" ]; then
   echo "Failed to connect to bus: No medium found" >&2
   exit 1
 fi
 case "$*" in
   "--user is-enabled aira-daemon.service") echo enabled ;;
+  "--user show -p FragmentPath aira-daemon.service") echo "FragmentPath=/home/agent/.config/systemd/user/aira-daemon.service" ;;
   "--user show-environment") echo "XDG_RUNTIME_DIR=$STUB_MANAGER_RUNTIME" ;;
 esac
 exit 0
@@ -41,13 +49,33 @@ exit 0
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("STUB_MANAGER_RUNTIME", fmt.Sprintf("/run/user/%d", os.Getuid()))
-	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
-	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("STUB_GOOD_BUS", fmt.Sprintf("unix:path=/run/user/%d/bus", os.Getuid()))
+	unsetenvForTest(t, "DBUS_SESSION_BUS_ADDRESS")
+	unsetenvForTest(t, "XDG_RUNTIME_DIR")
 }
 
-// serviceServing is an enabled aira-managed unit whose socket directory comes
-// from the user manager (the production shape: no baked XDG_RUNTIME_DIR), seen
-// by a client whose HOME is `home`.
+// unsetenvForTest removes name for this test and restores it afterwards.
+func unsetenvForTest(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv(name, "")
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fragmentPathAnswer answers the unit-file query the way the user manager does
+// for a unit installed under HOME (where these tests write it), so a stub that
+// models only is-enabled, show-environment and start still identifies the unit.
+func fragmentPathAnswer(argv []string) ([]byte, bool) {
+	if strings.Join(argv, " ") != "systemctl --user show -p FragmentPath "+daemon.DefaultServiceUnit {
+		return nil, false
+	}
+	return []byte("FragmentPath=" + filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", daemon.DefaultServiceUnit) + "\n"), true
+}
+
+// serviceReader reads, whatever path the manager names, an enabled
+// aira-managed unit whose socket directory comes from the user manager (the
+// production shape: no baked XDG_RUNTIME_DIR) and which serves stateHome.
 func serviceReader(stateHome string) func(string) ([]byte, error) {
 	return func(string) ([]byte, error) {
 		return []byte("# aira-managed: aira-daemon.service\n[Service]\nEnvironment=XDG_STATE_HOME=" + stateHome + "\n"), nil
@@ -195,16 +223,19 @@ func TestAnAnsweringSocketIsNeverRefusedByTheLaunchCheck(t *testing.T) {
 // WAIT guards a mutation that would refuse a correctly configured client while
 // its daemon restarts; every row that must REFUSE guards the opposite.
 func TestConfineLaunchCheckDecisionTable(t *testing.T) {
-	unit := func(stateHome string) func([]string) ([]byte, error) {
-		return func(argv []string) ([]byte, error) {
-			switch strings.Join(argv, " ") {
-			case "systemctl --user is-enabled aira-daemon.service":
-				return []byte("enabled\n"), nil
-			case "systemctl --user show-environment":
-				return []byte("XDG_RUNTIME_DIR=" + os.Getenv("STUB_SERVICE_RUNTIME") + "\n"), nil
-			}
-			return nil, errors.New("unexpected: " + strings.Join(argv, " "))
+	// An enabled unit; the state it serves comes from serviceReader(unitState),
+	// its socket directory from STUB_SERVICE_RUNTIME.
+	enabledUnit := func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
 		}
+		switch strings.Join(argv, " ") {
+		case "systemctl --user is-enabled aira-daemon.service":
+			return []byte("enabled\n"), nil
+		case "systemctl --user show-environment":
+			return []byte("XDG_RUNTIME_DIR=" + os.Getenv("STUB_SERVICE_RUNTIME") + "\n"), nil
+		}
+		return nil, errors.New("unexpected: " + strings.Join(argv, " "))
 	}
 	type row struct {
 		name   string
@@ -230,15 +261,15 @@ func TestConfineLaunchCheckDecisionTable(t *testing.T) {
 		}},
 		{"enabled unit for this state at another socket, service down: refuse", true, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
 			t.Setenv("STUB_SERVICE_RUNTIME", filepath.Dir(filepath.Dir(filepath.Dir(other.SocketPath))))
-			return unit(own.StateHome), own.StateHome
+			return enabledUnit, own.StateHome
 		}},
 		{"enabled unit for this state at this client's own socket, service down: wait", false, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
 			t.Setenv("STUB_SERVICE_RUNTIME", filepath.Dir(filepath.Dir(filepath.Dir(own.SocketPath))))
-			return unit(own.StateHome), own.StateHome
+			return enabledUnit, own.StateHome
 		}},
 		{"enabled unit for another state: wait", false, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
 			t.Setenv("STUB_SERVICE_RUNTIME", filepath.Dir(filepath.Dir(filepath.Dir(other.SocketPath))))
-			return unit(""), filepath.Join(t.TempDir(), "another-state")
+			return enabledUnit, filepath.Join(t.TempDir(), "another-state")
 		}},
 		{"unit not enabled and no holder: wait", false, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
 			return func([]string) ([]byte, error) { return []byte("disabled\n"), errors.New("exit 1") }, own.StateHome

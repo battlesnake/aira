@@ -126,3 +126,57 @@ func TestStaleRelationPreconditionIsRefusedWithoutLeavingAPendingIntent(t *testi
 		t.Fatalf("relations = %#v, want both links", views)
 	}
 }
+
+// Section 3.7's idempotent clause: a writer whose precondition is stale only
+// because a peer already wrote EXACTLY the bytes it intends (two identical
+// `aira link` calls racing from one read) has nothing to conflict with. Both
+// return OK, the file holds those bytes, and no pending row is left (build
+// review round 3: refusing it E_WRITE_CONFLICT left the package green).
+func TestAnIdenticalRacedWriteIsNotAConflict(t *testing.T) {
+	s, _, _ := m3Store(t)
+	a := m3Ticket(t, s, "a")
+	b := m3Ticket(t, s, "b")
+	ctx := context.Background()
+	path := s.ticketPath(domain.CanonicalRelationOwner(a.ID, b.ID))
+
+	// Both writers read the same file and compute the same new bytes.
+	read, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, body, err := domain.ParseTicket(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Relations = append(ticket.Relations, domain.Relation{Kind: domain.RelationRelates, From: a.ID, To: b.ID})
+	intended, err := domain.RenderTicket(ticket, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, writer := range []string{"first", "second"} {
+		intent, err := s.preparePathMutationEvent(ctx, path, digestBytes(read), intended, "relation.add", writer)
+		if err != nil {
+			t.Fatalf("%s writer prepare: %v", writer, err)
+		}
+		if err := s.materialiseIntent(ctx, intent); err != nil {
+			t.Fatalf("%s writer materialise: %v", writer, err)
+		}
+	}
+	if n := pendingAt(t, s, path); n != 0 {
+		t.Fatalf("%d pending intent(s) left after two identical writes", n)
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digestBytes(onDisk) != digestBytes(intended) {
+		t.Fatal("the file does not hold the bytes both writers intended")
+	}
+	views, err := s.Relations(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("relations = %#v, want the one relation", views)
+	}
+}

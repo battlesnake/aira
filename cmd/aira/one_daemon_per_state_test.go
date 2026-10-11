@@ -311,6 +311,9 @@ func TestClientNeverForksAStrayWhenTheServiceServesThisStateElsewhere(t *testing
 	d := &daemonDispatcher{
 		paths: pathsB, startWait: time.Second, lockWait: time.Second, spawn: noSpawn(t),
 		systemctlRun: func(argv []string) ([]byte, error) {
+			if answer, ok := fragmentPathAnswer(argv); ok {
+				return answer, nil
+			}
 			systemctl = append(systemctl, strings.Join(argv, " "))
 			if strings.Join(argv, " ") == "systemctl --user is-enabled aira-daemon.service" {
 				return []byte("enabled\n"), nil
@@ -357,6 +360,9 @@ func TestClientStillForksItsOwnDaemonWhenTheServiceServesAnotherState(t *testing
 	d := &daemonDispatcher{
 		paths: paths, startWait: 300 * time.Millisecond, lockWait: time.Second,
 		systemctlRun: func(argv []string) ([]byte, error) {
+			if answer, ok := fragmentPathAnswer(argv); ok {
+				return answer, nil
+			}
 			if strings.Join(argv, " ") == "systemctl --user is-enabled aira-daemon.service" {
 				return []byte("enabled\n"), nil
 			}
