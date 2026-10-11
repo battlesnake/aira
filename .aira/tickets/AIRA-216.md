@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-216","project":"aira","title":"Ticket and finding front-matter writers HTML-escape \u003c \u003e \u0026 through json.Marshal, so a status-only mv rewrites unrelated title bytes","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-216","project":"aira","title":"Ticket and finding front-matter writers HTML-escape < > & through json.Marshal, so a status-only mv rewrites unrelated title bytes","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are

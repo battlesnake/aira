@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-209","project":"aira","title":"Registry discovery re-logs every dead-root breadcrumb every ~33 s forever (97.5 % of the daemon journal) and burns 3 git forks + 75 ms of retry sleep per dead root per pass","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-209","project":"aira","title":"Registry discovery re-logs every dead-root breadcrumb every ~33 s forever (97.5 % of the daemon journal) and burns 3 git forks + 75 ms of retry sleep per dead root per pass","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are

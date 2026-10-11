@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-199","project":"aira","title":"cmd/aira m20b test hands its own os.File fds to a callee that closes them, so the finalizer double-closes a recycled descriptor -- a -race CI flake and a package-wide cross-test hazard","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flake","test-hygiene"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-204","to":"AIRA-199"}]}
+{"schema":1,"id":"AIRA-199","project":"aira","title":"cmd/aira m20b test hands its own os.File fds to a callee that closes them, so the finalizer double-closes a recycled descriptor -- a -race CI flake and a package-wide cross-test hazard","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flake","test-hygiene"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-204","to":"AIRA-199"}]}
 ---
 Found while gating AIRA-196 (PR #123, 2026-09-09). The `race` CI job failed
 on a branch whose own changes were green, with a single unrelated failure:

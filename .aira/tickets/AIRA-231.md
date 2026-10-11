@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-231","project":"aira","title":"AIRA-180 _pool_budget gauge is inert on real grants: isinstance(memory_max, int) never true (grant fields are strings)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","porous-test","telemetry"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-231","project":"aira","title":"AIRA-180 _pool_budget gauge is inert on real grants: isinstance(memory_max, int) never true (grant fields are strings)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","porous-test","telemetry"],"hold":false,"relations":[]}
 ---
 > Found + CONFIRMED 2026-09-12 during the v7-1 (AIRA-229) build-review (Fable, code-grounded). Same porous-string shape as the v7-1 guard's own original inert bug, which the v7-1 real-cgroup e2e caught; this sibling was traced but lives in AIRA-180's telemetry, so filed separately.
 
