@@ -289,7 +289,7 @@ func TestDetachedConfirmIsAsyncGuardedAndTerminalIndependent(t *testing.T) {
 
 	startedAt := time.Now()
 	runtime.confirmExecuteOnUI()
-	if time.Since(startedAt) > time.Second {
+	if testdeadline.Exceeded(time.Since(startedAt), time.Second) {
 		t.Fatal("detached confirm blocked the UI caller")
 	}
 	select {
