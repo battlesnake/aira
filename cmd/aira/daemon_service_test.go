@@ -328,7 +328,7 @@ func TestManagedDaemonLockLossReportsHolderPID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(paths.RuntimeDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(paths.LockPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(paths.LockPath, []byte(`{"pid":777,"boot_id":"fixture"}`), 0o600); err != nil {

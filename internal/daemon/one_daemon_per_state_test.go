@@ -166,3 +166,14 @@ func TestStatusFromAMismatchedRuntimeSeesTheLockHolder(t *testing.T) {
 		t.Fatalf("status from the other runtime dir = %+v, want running, not ready, pid %d", status, os.Getpid())
 	}
 }
+
+// closeLocksForTest releases both single-instance locks a timed-out drain
+// retains (the state lock and the legacy runtime-directory lock), as a real
+// daemon does by exiting.
+func (e *ErrDrainTimeout) closeLocksForTest() error {
+	first := e.lock.Close()
+	if err := e.legacyLock.Close(); err != nil {
+		return err
+	}
+	return first
+}
