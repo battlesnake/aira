@@ -256,16 +256,18 @@ func TestSystemctlIsFoundWithoutPATH(t *testing.T) {
 	}
 }
 
-// The same with the real tool and the real fallback list (no stub anywhere).
+// The same with the real tool and the production fallback list (no stub
+// anywhere). Where the tool lives is checked independently of that list, so an
+// emptied list fails here rather than skipping.
 func TestRealSystemctlIsFoundWithoutPATH(t *testing.T) {
 	found := false
-	for _, candidate := range systemctlFallbacks {
+	for _, candidate := range []string{"/usr/bin/systemctl", "/bin/systemctl"} {
 		if _, err := os.Stat(candidate); err == nil {
 			found = true
 		}
 	}
 	if !found {
-		t.Skip("unevaluated: no systemctl at any distribution path on this machine")
+		t.Skip("unevaluated: no systemctl at /usr/bin or /bin on this machine")
 	}
 	unsetenv(t, "PATH")
 	out, err := RunSystemctl([]string{"systemctl", "--version"})
