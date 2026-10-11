@@ -290,3 +290,127 @@ func TestTwoClientsWithDifferentRuntimeDirsGetOneDaemon(t *testing.T) {
 		t.Fatalf("after the unset-runtime client: %d daemons, want 1", got)
 	}
 }
+
+// managedUnitFor is the unit file of an enabled aira-daemon.service that serves
+// the given state home through the given runtime directory.
+func managedUnitFor(stateHome, runtimeDir string) []byte {
+	return []byte("# aira-managed: aira-daemon.service\n[Service]\n" +
+		"Environment=XDG_STATE_HOME=" + stateHome + "\n" +
+		"Environment=XDG_RUNTIME_DIR=" + runtimeDir + "\n")
+}
+
+// An enabled service that serves THIS state through another runtime directory
+// owns the state. While it is down (a restart, boot) a client that disagrees
+// about XDG_RUNTIME_DIR used to fork its own daemon: that stray won the state
+// lock, the service then lost it, exited 0 and was restarted every 2 s, and
+// every correctly configured client was refused. The client must refuse instead,
+// without forking and without starting the unit (it could not reach it anyway).
+func TestClientNeverForksAStrayWhenTheServiceServesThisStateElsewhere(t *testing.T) {
+	pathsA, pathsB, runtimeA, runtimeB := oneStateTwoRuntimes(t)
+	var systemctl []string
+	d := &daemonDispatcher{
+		paths: pathsB, startWait: time.Second, lockWait: time.Second, spawn: noSpawn(t),
+		systemctlRun: func(argv []string) ([]byte, error) {
+			systemctl = append(systemctl, strings.Join(argv, " "))
+			if strings.Join(argv, " ") == "systemctl --user is-enabled aira-daemon.service" {
+				return []byte("enabled\n"), nil
+			}
+			return nil, errors.New("unexpected command: " + strings.Join(argv, " "))
+		},
+		readFile: func(string) ([]byte, error) { return managedUnitFor(pathsA.StateHome, runtimeA), nil },
+		getenv: func(name string) string {
+			switch name {
+			case "HOME":
+				return "/home/agent"
+			case "XDG_RUNTIME_DIR":
+				return runtimeB
+			}
+			return ""
+		},
+	}
+	_, err := d.exchangeOrStart(context.Background(), daemon.RequestFrame{Proto: daemon.ProtocolVersion})
+	if err == nil {
+		t.Fatal("no daemon is reachable from this client, yet it reported success")
+	}
+	response := transportErrorResponse(err)
+	if response.Code != daemon.CodeUnavailable || response.Exit != 4 {
+		t.Fatalf("code=%q exit=%d (%v), want %s exit 4", response.Code, response.Exit, err, daemon.CodeUnavailable)
+	}
+	for _, want := range []string{pathsA.SocketPath, pathsB.SocketPath, "aira-daemon.service", "XDG_RUNTIME_DIR"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("message %q lacks %q", err.Error(), want)
+		}
+	}
+	for _, call := range systemctl {
+		if strings.Contains(call, " start ") {
+			t.Fatalf("the client started the unit it cannot reach: %v", systemctl)
+		}
+	}
+}
+
+// The fence is per STATE: an enabled service that serves another state home is
+// no reason to refuse (a developer's own daemon on a private XDG_STATE_HOME).
+func TestClientStillForksItsOwnDaemonWhenTheServiceServesAnotherState(t *testing.T) {
+	_, paths, _, runtimeB := oneStateTwoRuntimes(t)
+	otherState := filepath.Join(t.TempDir(), "other-state")
+	var spawned atomic.Bool
+	d := &daemonDispatcher{
+		paths: paths, startWait: 300 * time.Millisecond, lockWait: time.Second,
+		systemctlRun: func(argv []string) ([]byte, error) {
+			if strings.Join(argv, " ") == "systemctl --user is-enabled aira-daemon.service" {
+				return []byte("enabled\n"), nil
+			}
+			return nil, errors.New("unexpected command: " + strings.Join(argv, " "))
+		},
+		readFile: func(string) ([]byte, error) { return managedUnitFor(otherState, runtimeB), nil },
+		getenv: func(name string) string {
+			if name == "HOME" {
+				return "/home/agent"
+			}
+			return ""
+		},
+		spawn: func() (<-chan childResult, error) {
+			spawned.Store(true)
+			done := make(chan childResult, 1)
+			done <- childResult{}
+			return done, nil
+		},
+	}
+	_, _ = d.exchangeOrStart(context.Background(), daemon.RequestFrame{Proto: daemon.ProtocolVersion})
+	if !spawned.Load() {
+		t.Fatal("a service for another state stopped this client from starting its own daemon")
+	}
+}
+
+// confine admission dials the socket directly and, on a transport failure,
+// waits for the daemon with no deadline. A process whose XDG_RUNTIME_DIR
+// differs from the daemon's can never reach it, so the wait is forever: refuse
+// at launch, with the same words the daemon-routed verbs use (AIRA-289b).
+func TestConfineWithAMismatchedRuntimeDirIsRefusedNotHeld(t *testing.T) {
+	pathsA, pathsB, _, runtimeB := oneStateTwoRuntimes(t)
+	startCommandDaemon(t, daemon.NewServer(pathsA))
+	t.Setenv("XDG_STATE_HOME", pathsB.StateHome)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeB)
+	t.Setenv("AIRA_CONFINE_OWNER", "")
+	// No unit is enabled here: the holder's recorded socket alone decides.
+	originalRun := daemonSystemctlRun
+	t.Cleanup(func() { daemonSystemctlRun = originalRun })
+	daemonSystemctlRun = func([]string) ([]byte, error) { return nil, errors.New("not enabled") }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	exit := runConfineCommand(ctx, []string{"/bin/true"}, map[string]string{}, strings.NewReader(""), &stdout, &stderr)
+	if exit != 4 {
+		t.Fatalf("exit=%d, want 4 (E_DAEMON_UNAVAILABLE); stderr=%q", exit, stderr.String())
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("refusal took %s; a launch that cannot reach any daemon must refuse at once", elapsed)
+	}
+	for _, want := range []string{daemon.CodeUnavailable, pathsB.SocketPath, pathsA.SocketPath, "XDG_RUNTIME_DIR", "ran=no"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr %q lacks %q", stderr.String(), want)
+		}
+	}
+}

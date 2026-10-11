@@ -863,7 +863,11 @@ func TestRebuildResurrectsARetiredIntentOnlyAsMaterialised(t *testing.T) {
 		t.Fatalf("eject's durability guard counts %d pending intents after rebuild, want 0", pending)
 	}
 	// And the path is still free for a new writer.
-	if _, err := f.store.preparePathMutation(ctx, f.intent.Path, digestBytes([]byte("x")), []byte("y"), "ticket.update"); err != nil {
+	onDisk, err := fileDigest(f.intent.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.preparePathMutation(ctx, f.intent.Path, onDisk, []byte("y"), "ticket.update"); err != nil {
 		t.Fatalf("the path is still busy after rebuild: %v", err)
 	}
 }

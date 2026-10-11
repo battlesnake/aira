@@ -54,7 +54,13 @@ writes never diverge.
    finding and `aira check` reports `relation-integrity: pass`.
 2. **Parallel links to one owner file are refused, not diverged.** 11 concurrent
    `aira link PY-1 relates PY-n` -> 2 `OK`, 9 `E_PATH_INTENT_BUSY` (exit 1, bare message),
-   and no divergence afterwards (measured).
+   and no divergence afterwards (measured). Review of the build re-measured it at 60 ways
+   (private daemon, about 9 bursts): 2 `OK`, 57 `E_PATH_INTENT_BUSY` and, in 3 of the 9
+   bursts, one `E_WRITE_CONFLICT`; the 11-way run never produced it. A writer that read
+   the owner file before a peer materialised and prepared its own intent after it left a
+   pending outbox row whose precondition could never hold, which wedged the path
+   (`E_PATH_INTENT_BUSY` for every later write, `reconcile` itself `E_WRITE_CONFLICT`)
+   until `aira intent-retire`. Fixed in 3.7: the refusal now comes before the row exists.
 3. **The divergence comes from git, not from aira.** The relation index is per worktree. A
    ticket file changed by git (merge, pull, checkout, rebase) leaves that worktree's index
    behind the file until something reconciles. Measured: links made and committed in a
@@ -133,12 +139,20 @@ the second daemon, whose ledger knows none of the first daemon's grants. On the 
 would mean a job admitted against an empty ledger while the slice is full (the slice cap
 still binds, so it would be an in-slice OOM, not a box OOM).
 
-Not reproduced: the "hang". On this box no second daemon has ever run with the default
-state: `~/.local/state/aira/run/` does not exist, and the daemon never deletes its runtime
-directory. Before v0.33 a failing gate showed no output (AIRA-288), and a queued confine
-inside a gate looks like a hang until `timeout_ms` fires (289(c)); either may explain the
-report. The peer's gate now lists `DBUS_SESSION_BUS_ADDRESS`, `HOME` and `XDG_RUNTIME_DIR`
-(sorted), so it reaches the box daemon.
+The "hang" was not reproduced by the probe above, which ran `aira create` first: that call
+started the second daemon, and the confine that followed was admitted by it. Review of the
+build reproduced it by code and by measurement when the nested `aira confine` is the ONLY
+`aira` call: `aira confine` dials `paths.SocketPath` itself (`cmd/aira/main.go`,
+`internal/runner/admission_linux.go` `admitThroughDaemon`), never goes through the daemon
+dispatcher, and on a transport failure reconnects every 500 ms with no deadline, printing
+`waiting for the memory-admission daemon to become reachable`. With a state lock that fences
+a second daemon, a mismatched `XDG_RUNTIME_DIR` therefore means waiting forever (a gate
+reads `U_GATE_COMMAND_TIMEOUT`; a cron job never returns). Fixed in 3.5 step 6: the confine
+launch refuses first. On this box no second daemon has ever run with the default state:
+`~/.local/state/aira/run/` does not exist. Before v0.33 a failing gate showed no output
+(AIRA-288), and a queued confine inside a gate looks like a hang until `timeout_ms` fires
+(289(c)). The peer's gate now lists `DBUS_SESSION_BUS_ADDRESS`, `HOME` and
+`XDG_RUNTIME_DIR` (sorted), so it reaches the box daemon.
 
 Mixed binaries (by read, from both reviews). Moving the lock alone is not enough while
 older binaries run on the box (worktree builds, an `aira mcp` server that keeps the binary
@@ -386,6 +400,32 @@ outside it until the cutover restart and the rebuild of old binaries.
    state id), `ServiceIdentityMatches`, install's `daemon SocketPath divergence` check
    (`install.go:2154-2160`) and AIRA-203's `MainPID` comparison.
 
+6. `cmd/aira/dispatcher.go`, `spawnDaemon`, and `daemon.ManagedServicePaths` (new;
+   `ServiceIdentityMatches` is now `ManagedServicePaths` plus a socket comparison). The state
+   lock fences a RUNNING daemon only. While the enabled `aira-daemon.service` is down (a
+   restart, a crash, boot, the cutover restart), a client with a different or unset
+   `XDG_RUNTIME_DIR` used to fork its own daemon: that stray won the state lock, the service
+   then lost it, exited 0 and was restarted every 2 s indefinitely, every correctly
+   configured client was refused, and the stray ran without the unit's
+   `AIRA_DAEMON_WATCHDOG_MODE=enforce` and `SLICE_CEILING_MODE=enforce` (the box watchdog
+   off for as long as it lived). Now, when the enabled aira-managed unit serves THIS state
+   (same state id) through a socket other than the client's, `spawnDaemon` refuses
+   (`E_DAEMON_UNAVAILABLE`, request not sent: `aira-daemon.service serves this state at
+   <socket>, which this process (looking at <socket>, XDG_RUNTIME_DIR <value>) cannot
+   reach; start the service or run with its XDG_RUNTIME_DIR`). A client whose identity
+   matches the service still runs `systemctl --user start`; a service serving another state
+   is ignored (a developer's own daemon on a private `XDG_STATE_HOME` still forks). Its
+   cost: a client that cannot establish the unit's identity (no `HOME`, `systemctl`
+   failing) still forks, as before.
+7. `cmd/aira/main.go`, `runConfineCommand`: after resolving paths, and before any
+   admission, `unreachableDaemonError` returns `E_DAEMON_UNAVAILABLE` (the same
+   `ran=no` refusal as an argument error, exit 4) when the socket is absent and either the
+   state's running lock holder recorded a different socket, or the enabled unit serves this
+   state elsewhere. It dials nothing and returns nil whenever it cannot establish that, so a
+   daemon that is restarting or starting stays a wait (admission is unbounded by design,
+   S13). Same wording as step 4. `aira drain wait` and `confine-reserve` dial the same way
+   and are not covered (open, section 7).
+
 Consequences, stated: `aira daemon status` from a mismatched process now reports the
 lock holder as running and the socket as not ready (true), and `aira daemon stop` from
 such a process stops the daemon that owns this state (it is that state's daemon).
@@ -420,8 +460,10 @@ placed after "Coordination is opt-in per project":
   `cgroup_linux.go:173-192`; ci-build's config does not set it). If the command itself
   calls `aira` (for example a nested `aira confine`, which puts its queue wait back inside
   `timeout_ms`), `env_allow` must include `HOME` and `XDG_RUNTIME_DIR` so the inner call
-  reaches this machine's daemon; without `XDG_RUNTIME_DIR` it now fails with
-  `E_DAEMON_UNAVAILABLE` naming the daemon's socket. `DBUS_SESSION_BUS_ADDRESS` is not
+  reaches this machine's daemon; without `XDG_RUNTIME_DIR` it is refused with
+  `E_DAEMON_UNAVAILABLE` naming the daemon's socket (for the nested `aira confine` itself,
+  at launch with `ran=no`, by 3.5 step 7; this needs `HOME` visible so the unit can be
+  found, or the holder's recorded socket). `DBUS_SESSION_BUS_ADDRESS` is not
   needed (measured: a scope is placed without it).
   **Build precondition (not yet measured):** before this paragraph is written, the builder
   runs `aira confine -- aira gate run <id>` against a private daemon (private `HOME`,
@@ -434,6 +476,23 @@ placed after "Coordination is opt-in per project":
   queued for admission. A timed-out gate reads `U_GATE_COMMAND_TIMEOUT` (unevaluated);
   `aira run-log <RUN-id> --stream err` (the run id is in the gate result) shows
   `confine: waiting for memory admission` lines when the time went to queueing.
+
+### 3.7 Stale precondition refused before a row exists (found by build review)
+
+`preparePathMutationEventKind` (`internal/store/store.go`) inserts a pending outbox row
+whose `precondition_digest` is the digest the caller read. Callers (`Link`, `Unlink`,
+`UpdateTicketContent`, finding and requirement writes, import) read the file, compute the
+new bytes, and only then prepare, outside any transaction. A peer that materialised in
+between left the precondition stale; materialise could then only refuse the row
+(`E_WRITE_CONFLICT`) and the row stayed pending, so every later write to the path was
+`E_PATH_INTENT_BUSY` and `reconcile` itself `E_WRITE_CONFLICT`, until `aira intent-retire`.
+Inside the immediate transaction that would insert the row, after the existing pending-row
+check, prepare now compares the on-disk digest to the precondition and returns
+`E_WRITE_CONFLICT` without inserting (an on-disk digest equal to the intended one passes,
+the idempotent re-run). A file is written only while its writer's row is pending, so this
+closes the window between the read and the insert for AIRA writers; a non-cooperative
+editor is still caught at materialise as before. Nothing is lost silently: the refused
+writer stores no relation and the caller re-runs.
 
 ## 4. Invariants
 
@@ -597,7 +656,8 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race`
 - Once the box daemon runs v0.34 and callers use v0.34 binaries, a second daemon on one
   `state.db` cannot start (and older binaries sharing the daemon's `XDG_RUNTIME_DIR` are
   fenced off). A gate, cron job or `ssh` session without the daemon's `XDG_RUNTIME_DIR`
-  gets an actionable `E_DAEMON_UNAVAILABLE` naming the daemon's socket in at most 5 s,
+  gets an actionable `E_DAEMON_UNAVAILABLE` naming the daemon's socket (the daemon-routed
+  verbs within their start wait, at most 5 s; a nested `aira confine` at launch),
   instead of being admitted silently by a daemon whose ledger cannot see the box's jobs.
 - Gate authors learn the snapshot, environment and timeout rules from the skill; if the
   wrap precondition (3.6) holds, the wrap form removes both the environment requirement
@@ -616,6 +676,7 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race`
 | `mv --through`, a delete/void verb, normalising inverse kinds on input | Rejected (section 2). |
 | Bare `E_PATH_INTENT_BUSY` message (no path, no "retry") | Small, separate; the skill now explains it. Suggest folding into the next small batch. |
 | **New finding: client-started daemon dies on SIGPIPE after its client exits (1.3)** | Measured symptom, mechanism assumed; affects machines without the systemd service. Suggest a held ticket: give the spawned daemon a stderr that outlives the client (a log file under the state directory, or `/dev/null` plus its existing logging), and a regression test that a client-spawned daemon survives its spawner and later logs. |
+| `aira drain wait` / `aira confine-reserve` with a mismatched `XDG_RUNTIME_DIR` still wait for a daemon they cannot reach (3.5 step 7 covers `aira confine` only) | Same defect, other verbs; the finding was about `aira confine`. Suggest a held ticket: reuse `unreachableDaemonError` at their launch. |
 | `aira check` reports a lagging index as `relation-integrity: fail` and then heals it in the same call | Existing decision; unchanged. |
 
 ## 8. Risks
@@ -641,6 +702,11 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race`
   notes say "rebuild worktree binaries and restart `aira mcp` servers". The restart itself
   is the owner's or the release session's cutover step, never this build's (no box daemon
   restart from a build session).
+- **Service down, mismatched client.** While the unit is down, a mismatched client is now
+  refused instead of starting a stray (3.5 step 6); the restart window of the cutover
+  therefore refuses such callers rather than forking. A mismatched client whose `HOME`
+  is not visible cannot identify the unit and still forks; that residual is the pre-v0.34
+  behaviour and ends when the unit is up (the state lock then fences it).
 - **Lock-file record.** `LockInfo.Socket` is new; a lock file written by an older daemon
   has none, and the client then keeps today's `E_DAEMON_TIMEOUT`. No compat obligation
   beyond that.
@@ -673,7 +739,8 @@ restart `aira mcp` servers: a pre-v0.34 binary run with a different `XDG_RUNTIME
 the daemon's can still start a second daemon.
 Release note for every peer: a process that runs `aira` with a different
 `XDG_RUNTIME_DIR` from the daemon's (or none) now fails with `E_DAEMON_UNAVAILABLE` naming
-the cause, instead of starting a second daemon; export `XDG_RUNTIME_DIR` in cron jobs, and
+the cause, instead of starting a second daemon (and `aira confine` refuses at launch
+instead of waiting for a daemon it cannot reach); export `XDG_RUNTIME_DIR` in cron jobs, and
 list it in a gate's `env_allow` when the gate command calls `aira`. Reply to ci-build per
 ticket: 290(a) use `aira mv <id> retired`, no delete by design; 290(b) refusal now names
 the command; 290(c) close path stays three hops by decision (AIRA-215); 290(d) already
@@ -681,7 +748,7 @@ shipped in v0.31; 291 the UNEVALUATED was the gate subject, fixed in v0.33, and 
 divergence after `git pull` is cleared by `aira reconcile --rebuild` (or `aira check`),
 not plain `aira reconcile`, and never changes readiness;
 292 read `scope-integrity`, prefer non-snap tools; 289 skill section, wrap form, and the
-new loud refusal. Notify deploy and speed per the release rule.
+new loud refusal (daemon-routed verbs after at most 5 s; `aira confine` at launch, `ran=no`). Notify deploy and speed per the release rule.
 
 ## 11. Review log
 
@@ -728,3 +795,14 @@ recorded here and are reversible.
   file for `aira confine` to resolve the slice; that is a property of the probe, not of the wrap.)
 - Built as planned: no deviations from the plan's design. The plan's `E_DAEMON_UNAVAILABLE`
   wording is the test-pinned message; the exact string is the one in `lockHolderError`.
+
+### Build review, round 1 (on `1d562c6`) and fixes
+
+Three P2 findings from the build reviewers; each was checked against the code and the first
+two re-measured before the fix. All three accepted.
+
+| # | Finding | Checked against | Disposition |
+|---|---|---|---|
+| 1 | Concurrent `aira link` to one owner file can fail `E_WRITE_CONFLICT` and leave a pending row; every later write is `E_PATH_INTENT_BUSY` until `aira intent-retire`, which the skill never mentions. | `relation_ready.go` (read, then prepare), `store.go` `preparePathMutationEventKind` (checks only for a pending row), `materialiseIntent` (`ErrWriteConflict`). True; the pre-fix tests are RED. | **Fixed (3.7)** at the root, not by documenting `intent-retire`: prepare refuses a stale precondition before inserting. Tests `TestStalePreconditionIsRefusedWithoutLeavingAPendingIntent`, `TestStaleRelationPreconditionIsRefusedWithoutLeavingAPendingIntent`. The skill names `E_WRITE_CONFLICT` and says a refused write leaves nothing pending. Two existing fixtures that built a conflict through this very window (`seedConflictedRoutingIntent`, `TestRebuildResurrectsARetiredIntentOnlyAsMaterialised`) now build it from an occupied path / the real digest. |
+| 2 | A nested `aira confine` without the daemon's `XDG_RUNTIME_DIR` is not refused; it waits with no deadline. The skill, 3.6, 6, 10 and the ci-build reply claimed otherwise; 1.2's "not reproduced" was an artefact of the probe. | `cmd/aira/main.go` (`AdmitSocketPath = paths.SocketPath`), `admission_linux.go` (`warnDaemonWait`, reconnect without deadline). True. | **Fixed (3.5 step 7), option (a):** refuse at launch when the holder or the unit is known to serve another socket. 1.2, 3.6, 6 and 10 corrected; test `TestConfineWithAMismatchedRuntimeDirIsRefusedNotHeld`. `drain wait`/`confine-reserve` left open (section 7). |
+| 3 | While the service is down, a mismatched client forks a stray that takes the state lock; the service then restarts every 2 s and the box watchdog stays off. | `daemon_command.go:47-52` (ErrAlreadyRunning exits 0), unit `Restart=always`, `spawnDaemon`. True by reading; the first half reproduced in-process by the reviewer. | **Fixed (3.5 step 6)**: `spawnDaemon` refuses when the enabled unit serves this state through another socket. Tests `TestClientNeverForksAStrayWhenTheServiceServesThisStateElsewhere`, `TestClientStillForksItsOwnDaemonWhenTheServiceServesAnotherState`; `TestSpawnDaemonDefersOnlyWhenEnabledAndIdentityMatches` row "identity divergent" now expects the refusal. Residual in section 8. |

@@ -1638,6 +1638,11 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {
+		// Admission dials the socket directly and waits for a daemon with no
+		// deadline, so a socket no daemon will ever serve must be refused here.
+		if unreachable := unreachableDaemonError(paths, daemonSystemctlRun, os.ReadFile, os.Getenv); unreachable != nil {
+			return refuseConfineLaunch(stderr, unreachable)
+		}
 		request.RuntimeDir = paths.RuntimeDir
 		request.AdmitSocketPath = paths.SocketPath
 	} else if stderr != nil {

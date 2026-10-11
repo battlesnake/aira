@@ -1239,6 +1239,8 @@ func TestSkillTeachesV034Rules(t *testing.T) {
 		}},
 		{"291 bulk links and the lagging index", []string{
 			"`E_PATH_INTENT_BUSY`",
+			"`E_WRITE_CONFLICT`",
+			"A refused write leaves nothing pending",
 			"`E_RELATION_INDEX_DIVERGENCE`",
 			"`aira reconcile --rebuild`",
 			"plain `aira reconcile` does not",
@@ -1268,6 +1270,7 @@ func TestSkillTeachesV034Rules(t *testing.T) {
 			"`run.cgroup_parent`",
 			"`XDG_RUNTIME_DIR`",
 			"`E_DAEMON_UNAVAILABLE`",
+			"the nested `aira confine` itself (refused at launch",
 			"`DBUS_SESSION_BUS_ADDRESS` is not needed",
 			"`U_GATE_COMMAND_TIMEOUT`",
 			"`aira run-log <RUN-id> --stream err`",

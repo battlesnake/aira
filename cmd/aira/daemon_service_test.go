@@ -33,10 +33,13 @@ func TestSpawnDaemonDefersOnlyWhenEnabledAndIdentityMatches(t *testing.T) {
 	for _, test := range []struct {
 		name, enabled, managerRuntime string
 		wantStart, wantFork           bool
+		wantRefused                   bool
 	}{
 		{name: "enabled match", enabled: "enabled\n", wantStart: true},
 		{name: "not enabled", enabled: "disabled\n", wantFork: true},
-		{name: "identity divergent", enabled: "enabled\n", managerRuntime: "divergent", wantFork: true},
+		// Same state.db, another runtime directory: the service owns the state
+		// (AIRA-289), so a daemon forked here would take the state lock from it.
+		{name: "same state, other runtime dir", enabled: "enabled\n", managerRuntime: "divergent", wantRefused: true},
 		{name: "systemctl absent", wantFork: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -64,7 +67,12 @@ func TestSpawnDaemonDefersOnlyWhenEnabledAndIdentityMatches(t *testing.T) {
 					return nil, errors.New("unexpected command")
 				}
 			}
-			if _, err := d.spawnDaemon(); err != nil {
+			_, err := d.spawnDaemon()
+			if test.wantRefused {
+				if err == nil || !strings.Contains(err.Error(), "aira-daemon.service serves this state at") {
+					t.Fatalf("err=%v, want a refusal naming the service's socket", err)
+				}
+			} else if err != nil {
 				t.Fatal(err)
 			}
 			if started != test.wantStart || forked != test.wantFork {

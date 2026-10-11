@@ -36,8 +36,20 @@ func ServiceIsEnabled(unit string, run SystemctlRun) bool {
 // XDG_RUNTIME_DIR comes from an explicit test override in the unit or from the
 // user manager environment used to launch production services.
 func ServiceIdentityMatches(paths Paths, unit string, run SystemctlRun, readFile func(string) ([]byte, error), getenv func(string) string) bool {
+	servicePaths, ok := ManagedServicePaths(unit, run, readFile, getenv)
+	return ok && servicePaths.SocketPath == paths.SocketPath
+}
+
+// ManagedServicePaths resolves the paths the enabled, aira-managed unit serves:
+// its baked XDG_STATE_HOME, with XDG_RUNTIME_DIR from the unit or the user
+// manager's environment. ok is false when the unit is not enabled, is not
+// aira's, or its identity cannot be established (never a guess).
+//
+// A caller that compares StateID but not SocketPath learns that the unit owns
+// its state.db through a runtime directory the caller cannot reach (AIRA-289).
+func ManagedServicePaths(unit string, run SystemctlRun, readFile func(string) ([]byte, error), getenv func(string) string) (Paths, bool) {
 	if !ServiceIsEnabled(unit, run) {
-		return false
+		return Paths{}, false
 	}
 	if readFile == nil {
 		readFile = os.ReadFile
@@ -47,15 +59,15 @@ func ServiceIdentityMatches(paths Paths, unit string, run SystemctlRun, readFile
 	}
 	home := strings.TrimSpace(getenv("HOME"))
 	if home == "" {
-		return false
+		return Paths{}, false
 	}
 	content, err := readFile(filepath.Join(home, ".config", "systemd", "user", unit))
 	if err != nil || !bytes.HasPrefix(content, []byte("# aira-managed: "+unit+"\n")) {
-		return false
+		return Paths{}, false
 	}
 	stateHome, ok := unitEnvironment(content, "XDG_STATE_HOME")
 	if !ok || stateHome == "" {
-		return false
+		return Paths{}, false
 	}
 	runtimeDir, runtimeBaked := unitEnvironment(content, "XDG_RUNTIME_DIR")
 	if !runtimeBaked {
@@ -64,15 +76,15 @@ func ServiceIdentityMatches(paths Paths, unit string, run SystemctlRun, readFile
 		}
 		managerEnv, managerErr := run([]string{"systemctl", "--user", "show-environment"})
 		if managerErr != nil {
-			return false
+			return Paths{}, false
 		}
 		runtimeDir, ok = environmentValue(managerEnv, "XDG_RUNTIME_DIR")
 		if !ok || runtimeDir == "" {
-			return false
+			return Paths{}, false
 		}
 	}
 	servicePaths, err := PathsFromEnvironment(stateHome, runtimeDir, home)
-	return err == nil && servicePaths.SocketPath == paths.SocketPath
+	return servicePaths, err == nil
 }
 
 func unitEnvironment(content []byte, name string) (string, bool) {

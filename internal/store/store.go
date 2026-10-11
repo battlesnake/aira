@@ -2258,6 +2258,23 @@ func (s *Store) preparePathMutationEventKind(ctx context.Context, path, precondi
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		// The caller read the file, computed `intended` from it and only now
+		// prepares. A peer that wrote the file in between has already
+		// materialised its own row (a pending one was refused above), so the
+		// precondition is stale and materialise could only ever refuse this
+		// intent. Refuse it HERE, before a row exists: a pending row whose
+		// precondition can never hold wedges the path (every later write is
+		// E_PATH_INTENT_BUSY) until `aira intent-retire`. A file is written only
+		// while its writer's row is pending, and this read is inside the
+		// immediate transaction that would insert ours, so it cannot go stale
+		// between this check and the insert.
+		current, err := fileDigest(path)
+		if err != nil {
+			return err
+		}
+		if current != precondition && current != digestBytes(intended) {
+			return fmt.Errorf("%w: %s", ErrWriteConflict, path)
+		}
 		seq, err := nextSequence(ctx, conn, s.projectID)
 		if err != nil {
 			return err
