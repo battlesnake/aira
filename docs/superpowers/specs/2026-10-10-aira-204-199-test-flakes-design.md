@@ -223,8 +223,13 @@ the only test seam in production code; F needs none (section 3.6).
     place the child) has not failed. A job that never enters a working scope is then a
     product failure. (Limit: a scheduling stall longer than the scaled backstop between
     scope creation and child placement would also land here; section 4.)
-  - only `readinessUnlistable`, `readinessAbsent`, `readinessPending` or
-    `readinessUnreadable` -> `cgrouptest.SkipOrFailRealCgroup` naming the last state
+  - `readinessPending` was observed (and never anything stronger) -> `t.Fatalf`: a
+    `Pending` row is emitted only for a GRANTED waiter, so the launcher was admitted yet
+    never created the scope while still running (it returns an error when the
+    environment cannot create or place the scope, read above). That is a stall, the same
+    class as a scope that stays empty.
+  - only `readinessUnlistable`, `readinessAbsent` or `readinessUnreadable` ->
+    `cgrouptest.SkipOrFailRealCgroup` naming the last state
     (containment was never established: unevaluated, not a product verdict).
 
   The 20 ms poll pacing stays (it is pacing, not synchronisation).
@@ -481,9 +486,10 @@ descriptor`) and without it 5/5 GREEN.
    queue's birth.
 8. Unevaluated stays unevaluated: an environment that cannot run a real-cgroup test
    skips (or fails under `AIRA_REAL_CGROUP=1`) as today; a failure after the environment
-   is established (A: the scope was on disk and read empty, the launcher did not fail,
-   and the child never entered it) is a hard failure. Listing alone (a `Pending` row, or
-   an on-disk scope whose population cannot be read) establishes nothing.
+   is established (A: the launcher did not fail and either the scope was on disk and read
+   empty, or the admitted waiter's `Pending` row never became a scope; the child never
+   entered a populated scope) is a hard failure. An absent record, or an on-disk scope
+   whose population cannot be read, establishes nothing.
 9. With E's seam unset, and with production's grace (always 2 s), production behaviour
    is unchanged (same call, same bound). The one visible production change is the
    destructive-confirmation form's height (`tui.go:1110`, one row taller).
@@ -525,11 +531,10 @@ unlistable; `E_DAEMON_TIMEOUT` -> unlistable; and each of these -> error: garbag
 with the production `protocolResponse`), a `result` with no `structuredContent`, an
 empty `code`, `ok:false` with another code (for example `E_DAEMON_PROTOCOL`), `OK` with
 no `scopes` array. A second table pins the expiry decision (`readinessIsProductFailure`
-over every state below placed): unlistable, absent, pending, unreadable -> skip-or-fail;
-empty -> hard fail. Mutations, each RED: today's substring predicate (pending, nil and
+over every state below placed): unlistable, absent, unreadable -> skip-or-fail;
+pending, empty -> hard fail. Mutations, each RED: today's substring predicate (pending, nil and
 false cases); `strings.Contains` name match (neighbour case); nil read as true; pending
-read as on disk (pending case, and the expiry table); "listed -> hard fail" (pending and
-unreadable rows of the expiry table); duplicates ignored; **envelope not validated (the
+read as on disk (pending case, and the expiry table); "listed -> hard fail" (unreadable row of the expiry table); pending dropped from the product-failure set (pending row of the expiry table); duplicates ignored; **envelope not validated (the
 `e5c1223` shape: every non-`OK` reply read as absent) -> the `{}`, protocol-error and
 other-code rows**. The expiry ordering (drain `done` before deciding) is a three-line
 straight-line sequence checked in review, not by a test.

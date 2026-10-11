@@ -1097,7 +1097,7 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 			default:
 			}
 			if readinessIsProductFailure(strongest) {
-				t.Fatalf("the confine scope is on disk and reads empty, but the launched job never entered it: %+v", strongestRecord)
+				t.Fatalf("the launcher is running and containment was never established (strongest state %s): the job was admitted but never entered a populated scope: %+v", strongest, strongestRecord)
 			}
 			cgrouptest.SkipOrFailRealCgroup(t, "containment was never established for %s (strongest state %s)", name, strongest)
 		}
@@ -1233,13 +1233,16 @@ func confineKillReadiness(output []byte, name string) (confineReadiness, runner.
 }
 
 // readinessIsProductFailure decides what the poll's expiry means given the strongest
-// state it saw. Only a scope that is on disk and reads empty establishes that
-// containment works while the job never entered it (the launcher returns an error when
-// it cannot place the child, and the poll already treated that as unevaluated). Listing
-// alone (unlistable, absent, pending, unreadable) establishes nothing, so those are
-// unevaluated.
+// state it saw, once the launcher has been drained without an error. Two states are
+// product failures: a scope that is on disk and reads empty (containment works while the
+// job never entered it), and a Pending row (a Pending row is emitted only for a GRANTED
+// waiter, so the launcher was admitted yet never created the scope while still running:
+// a stall). The launcher returns an error when the environment cannot create or place
+// the scope, and the poll already treated that as unevaluated. Unlistable and absent
+// (not admitted, or no listing) and unreadable (the scope's population cannot be read)
+// establish nothing, so those are unevaluated.
 func readinessIsProductFailure(strongest confineReadiness) bool {
-	return strongest == readinessEmpty
+	return strongest == readinessPending || strongest == readinessEmpty
 }
 
 func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.T) {
@@ -1316,7 +1319,7 @@ func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.
 	}
 	// What the poll's expiry means for each strongest state it saw.
 	for state, want := range map[confineReadiness]bool{
-		readinessUnlistable: false, readinessAbsent: false, readinessPending: false, readinessUnreadable: false, readinessEmpty: true,
+		readinessUnlistable: false, readinessAbsent: false, readinessPending: true, readinessUnreadable: false, readinessEmpty: true,
 	} {
 		if got := readinessIsProductFailure(state); got != want {
 			t.Fatalf("expiry with strongest=%s: product failure=%v, want %v", state, got, want)
