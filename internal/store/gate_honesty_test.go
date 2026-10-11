@@ -28,6 +28,21 @@ func newGateHonestyStore(t *testing.T) (*Store, string) {
 // fired canary, so the false-fail direction can be asserted.
 func newProvenGateStore(t *testing.T) (*Store, gate.GateDefinition) {
 	t.Helper()
+	s, definition, _ := provenGateFixture(t)
+	result, err := s.RunGate(context.Background(), definition.ID)
+	if err != nil {
+		t.Fatalf("run gate: %v", err)
+	}
+	if result.Verdict != gate.VerdictPass || !result.Trusted {
+		t.Fatalf("fixture gate did not pass: %#v", result)
+	}
+	return s, definition
+}
+
+// provenGateFixture is newProvenGateStore's tree and gate files without the
+// RunGate, so a test can forge the ledger for a gate that has never run.
+func provenGateFixture(t *testing.T) (*Store, gate.GateDefinition, gate.CanaryDeclaration) {
+	t.Helper()
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
 	if err := os.MkdirAll(filepath.Join(root, ".aira", "requirements"), 0o755); err != nil {
@@ -52,16 +67,9 @@ func newProvenGateStore(t *testing.T) (*Store, gate.GateDefinition) {
 		t.Fatal(err)
 	}
 	gitRun(t, root, "add", ".")
-	definition, _ := testTraceGate(t, root)
+	definition, canary := testTraceGate(t, root)
 	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
-	result, err := s.RunGate(context.Background(), definition.ID)
-	if err != nil {
-		t.Fatalf("run gate: %v", err)
-	}
-	if result.Verdict != gate.VerdictPass || !result.Trusted {
-		t.Fatalf("fixture gate did not pass: %#v", result)
-	}
-	return s, definition
+	return s, definition, canary
 }
 
 // verifies: AIRA-54

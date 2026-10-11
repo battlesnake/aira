@@ -44,9 +44,39 @@ func gateResultFields(def gate.GateDefinition, definitionDigest, declarationDige
 	return fields
 }
 
-func appendCanaryUnevaluated(audit *GateAudit, def gate.GateDefinition, definitionDigest, declarationDigest, subject string, runErr error) (GateAuditRecord, error) {
+// addRunIDs records a command gate's runner run ids on a result record
+// (AIRA-288), each only when a run exists. They are references for `aira
+// run-log`, never bindings: no comparison in GateCheck reads them, and they are
+// never added to a proof-of-fire record.
+func addRunIDs(fields map[string]string, subjectRunID, canaryRunID string) {
+	if subjectRunID != "" {
+		fields["run_id"] = subjectRunID
+	}
+	if canaryRunID != "" {
+		fields["canary_run_id"] = canaryRunID
+	}
+}
+
+// withRunIDs appends the run ids that exist to an error's text, after its
+// CODE: prefix, so ErrorCode still classifies it.
+func withRunIDs(err error, subjectRunID, canaryRunID string) error {
+	var refs []string
+	if subjectRunID != "" {
+		refs = append(refs, "subject run "+subjectRunID)
+	}
+	if canaryRunID != "" {
+		refs = append(refs, "canary run "+canaryRunID)
+	}
+	if len(refs) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w (%s)", err, strings.Join(refs, ", "))
+}
+
+func appendCanaryUnevaluated(audit *GateAudit, def gate.GateDefinition, definitionDigest, declarationDigest, subject, subjectRunID, canaryRunID string, runErr error) (GateAuditRecord, error) {
 	fields := gateResultFields(def, definitionDigest, declarationDigest, subject, "", "")
 	fields["gate_id"], fields["subject"] = def.ID, subject
+	addRunIDs(fields, subjectRunID, canaryRunID)
 	code := "U_GATE_CANARY_UNEVALUATED"
 	if candidate := ErrorCode(runErr); strings.HasPrefix(candidate, "U_GATE_") {
 		code = candidate
@@ -177,6 +207,13 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		}
 		return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subjectDigest, Verdict: gate.VerdictUnevaluated, Code: "U_GATE_UNPROVEN", Suspect: true, Seq: record.Seq}, nil
 	}
+	// AIRA-286: one prose warning, for a command gate that allow-lists PATH.
+	// Every definition reaches RunGate, hand-authored or not, so this is the one
+	// call site. Delete it with the read-time env comparison change (D1).
+	var warnings []string
+	if def.Command != nil {
+		warnings = def.Command.EnvAllowWarnings()
+	}
 	canary, err := s.canaryFor(def)
 	if err != nil {
 		return GateCheckResult{}, err
@@ -192,6 +229,11 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		return GateCheckResult{}, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: capture subject: %w", captureErr)
 	}
 	subjectEval, subjectErr := s.evaluateChecker(ctx, def, subject)
+	// This early return records nothing, so it would lose a subject run id
+	// (AIRA-288). It is unreachable for the command lane: every error return in
+	// runCommandChecker carries PredicateUnevaluated, so a command-lane error
+	// continues down the main path below, which records run_id. The dimension
+	// lane launches nothing.
 	if subjectErr != nil && subjectEval.Predicate != gate.PredicateUnevaluated {
 		return GateCheckResult{}, subjectErr
 	}
@@ -209,7 +251,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		if auditErr != nil {
 			return GateCheckResult{}, auditErr
 		}
-		record, appendErr := appendCanaryUnevaluated(audit, def, found.Digest, declarationDigest, subjectDigest, err)
+		record, appendErr := appendCanaryUnevaluated(audit, def, found.Digest, declarationDigest, subjectDigest, subjectEval.RunID, canaryEval.RunID, err)
 		if appendErr != nil {
 			return GateCheckResult{}, appendErr
 		}
@@ -217,14 +259,11 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		if candidate := ErrorCode(err); strings.HasPrefix(candidate, "U_GATE_") {
 			code = candidate
 		}
-		return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subjectDigest, Verdict: gate.VerdictUnevaluated, Code: code, Suspect: true, Seq: record.Seq}, err
+		// The reply to an error carries no data, so the run ids travel in the
+		// error text; `gate check` also reads them back from the record.
+		return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subjectDigest, Verdict: gate.VerdictUnevaluated, Code: code, Suspect: true, Seq: record.Seq, RunID: subjectEval.RunID, CanaryRunID: canaryEval.RunID, Warnings: warnings}, withRunIDs(err, subjectEval.RunID, canaryEval.RunID)
 	}
-	canaryHealth := gate.CanaryUnevaluated
-	if canaryEval.Predicate == gate.PredicateFail {
-		canaryHealth = gate.CanaryPass
-	} else if canaryEval.Predicate == gate.PredicatePass {
-		canaryHealth = gate.CanaryFail
-	}
+	canaryHealth := gate.CanaryHealthFor(canaryEval.Predicate)
 	audit, err := OpenGateAudit(s.commonDir, true)
 	if err != nil {
 		return GateCheckResult{}, err
@@ -252,6 +291,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	if subjectEval.EnvDigest != "" {
 		fields["env_digest"] = subjectEval.EnvDigest
 	}
+	addRunIDs(fields, subjectEval.RunID, canaryEval.RunID)
 	fields["gate_id"], fields["subject"] = def.ID, subjectEval.Root.Digest
 	fields["verdict"], fields["code"] = fold.Verdict, fold.Code
 	fields["trusted"], fields["suspect"] = fmt.Sprintf("%t", fold.Trusted), fmt.Sprintf("%t", fold.Suspect)
@@ -260,7 +300,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	if err != nil {
 		return GateCheckResult{}, err
 	}
-	return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subjectEval.Root.Digest, Verdict: fold.Verdict, Code: fold.Code, Trusted: fold.Trusted, Suspect: fold.Suspect, Seq: record.Seq}, nil
+	return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subjectEval.Root.Digest, Verdict: fold.Verdict, Code: fold.Code, Trusted: fold.Trusted, Suspect: fold.Suspect, Seq: record.Seq, RunID: subjectEval.RunID, CanaryRunID: canaryEval.RunID, Warnings: warnings}, nil
 }
 
 // AttestGate consumes an AIRA-issued manual challenge. A negative challenge
@@ -430,7 +470,7 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 		for _, definition := range gates {
 			for _, id := range definition.Definition.CanaryIDs {
 				if id == canaryID {
-					return s.canaryFor(definition.Definition)
+					return s.namedCanary(definition.Definition, canaryID)
 				}
 			}
 		}
@@ -445,7 +485,7 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 				if id != canaryID {
 					continue
 				}
-				canary, canaryErr := s.canaryFor(definition.Definition)
+				canary, canaryErr := s.namedCanary(definition.Definition, canaryID)
 				if canaryErr != nil {
 					return nil, canaryErr
 				}
@@ -463,9 +503,23 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 				}
 				evaluation, root, runErr := s.runCanary(ctx, canary, definition.Definition, subject)
 				if runErr != nil {
-					return nil, runErr
+					// The reply to an error carries no data, so the canary run id
+					// travels in the error text, as on RunGate's canary-error path.
+					return nil, withRunIDs(runErr, "", evaluation.RunID)
 				}
-				return map[string]any{"canary_id": canaryID, "verdict": evaluation.Predicate, "tree_digest": root.Digest, "findings": evaluation.Findings}, nil
+				// AIRA-287: the canary's own verdict, from the mapping RunGate
+				// uses, beside the gate's result on the canary tree it observed.
+				// Fired stays nil (JSON null) unless that result is established.
+				health := gate.CanaryHealthFor(evaluation.Predicate)
+				var fired *bool
+				switch health {
+				case gate.CanaryPass:
+					fired = new(bool)
+					*fired = true
+				case gate.CanaryFail:
+					fired = new(bool)
+				}
+				return CanaryRunResult{CanaryID: canary.ID, GateID: definition.Definition.ID, Verdict: string(health), Fired: fired, GateResult: evaluation.Predicate, Code: evaluation.Code, RunID: evaluation.RunID, TreeDigest: root.Digest, Findings: evaluation.Findings}, nil
 			}
 		}
 		return nil, errors.New("E_NOT_FOUND: canary not found")
@@ -515,8 +569,7 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 		if !gate.SafeRelativePath(c.Seed.Path) {
 			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
 		}
-		source := filepath.Join(s.root, filepath.FromSlash(c.Seed.Path))
-		if err := copyFixtureSeed(source, dir); err != nil {
+		if err := copyFixtureSeed(s.root, dir, c.Seed.Path); err != nil {
 			return DimensionEvaluation{}, EvaluationRoot{}, err
 		}
 	}
@@ -659,13 +712,33 @@ func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, 
 	return s.runCanary(ctx, c, def, capturedSubject{})
 }
 
-func copyFixtureSeed(source, destination string) error {
-	info, err := os.Lstat(source)
-	if err != nil {
-		return fmt.Errorf("U_GATE_CANARY_UNEVALUATED: fixture seed: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("E_GATE_CANARY_INVALID: symlink seed is not allowed")
+// copyFixtureSeed copies the live directory root/seedPath (the canary's
+// Seed.Path) into the fixture tree. It skips every entry whose LIVE
+// root-relative path is AIRA bookkeeping (AIRA-285): a Seed.Path that is an
+// ancestor of .aira/tickets/ or .aira/findings/ (".aira", ".") would otherwise
+// re-root those files where ExcludedFromSubject no longer matches, and the
+// canary's fire could then depend on bytes no subject digest covers. Skipping
+// the directory skips every file below it; ValidateCanary refuses a Seed.Path
+// at or below those directories, so the root is never one of them.
+//
+// Both of those checks reason about the DECLARED path, so they hold only while
+// the declared path is the resolved one: every component of seedPath is
+// refused if it is a symlink, not just the last (os.Lstat follows intermediate
+// components, so "lnk/tickets" with lnk -> .aira would otherwise read the live
+// tickets). Symlinks inside the seed are refused by the walk below.
+func copyFixtureSeed(root, destination, seedPath string) error {
+	seedRoot := filepath.Clean(filepath.FromSlash(seedPath))
+	source := filepath.Join(root, seedRoot)
+	component := root
+	for _, part := range strings.Split(seedRoot, string(filepath.Separator)) {
+		component = filepath.Join(component, part)
+		info, err := os.Lstat(component)
+		if err != nil {
+			return fmt.Errorf("U_GATE_CANARY_UNEVALUATED: fixture seed: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("E_GATE_CANARY_INVALID: symlink seed is not allowed")
+		}
 	}
 	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -674,6 +747,10 @@ func copyFixtureSeed(source, destination string) error {
 		rel, err := filepath.Rel(source, path)
 		if err != nil || (rel != "." && !gate.SafeRelativePath(rel)) {
 			return errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
+		}
+		live := filepath.ToSlash(filepath.Join(seedRoot, rel))
+		if entry.IsDir() && gate.ExcludedFromSubject(live+"/") {
+			return filepath.SkipDir
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			return errors.New("E_GATE_CANARY_INVALID: symlink seed is not allowed")
@@ -752,20 +829,49 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 			report.Results = append(report.Results, GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: currentSubjectDigest, Verdict: gate.VerdictUnevaluated, Code: "U_GATE_NO_RESULT", Suspect: true})
 			continue
 		}
-		result := GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: currentSubjectDigest, Verdict: record.Fields["verdict"], Code: record.Fields["code"], Trusted: record.Fields["trusted"] == "true", Suspect: record.Fields["suspect"] == "true", Seq: record.Seq}
+		// RunID and CanaryRunID are references for `aira run-log` (AIRA-288),
+		// copied for every found record; no comparison below reads them.
+		result := GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: currentSubjectDigest, Verdict: record.Fields["verdict"], Code: record.Fields["code"], Trusted: record.Fields["trusted"] == "true", Suspect: record.Fields["suspect"] == "true", Seq: record.Seq, RunID: record.Fields["run_id"], CanaryRunID: record.Fields["canary_run_id"]}
 		if result.Verdict == gate.VerdictPass {
 			canary, canaryErr := s.canaryFor(d.Definition)
 			declarationDigest, digestErr := canary.DeclarationDigest()
 			currentDefinitionDigest, definitionErr := gate.DigestGate(d.Definition)
-			bindingMismatch := canaryErr != nil || digestErr != nil || definitionErr != nil ||
-				currentDefinitionDigest != record.Fields["definition_digest"] ||
-				declarationDigest != record.Fields["declaration_digest"] ||
-				record.Fields["subject_scope"] != currentSubjectDigest ||
-				record.Fields["lane"] != d.Definition.Lane.Name ||
-				record.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion ||
-				record.Fields["canary_tree_digest"] == ""
-			if bindingMismatch {
+			// Binding site 1 (AIRA-286). Each term of what was one long ||
+			// expression is its own test, in the original order, appending the
+			// name of the binding it compares; the pass is stale iff any term
+			// holds, exactly as before. Control flow, precedence between the four
+			// sites and the codes are unchanged; only the names are new.
+			var mismatch []string
+			if canaryErr != nil {
+				mismatch = append(mismatch, "declaration")
+			}
+			if digestErr != nil {
+				mismatch = append(mismatch, "declaration")
+			}
+			if definitionErr != nil {
+				mismatch = append(mismatch, "definition")
+			}
+			if currentDefinitionDigest != record.Fields["definition_digest"] {
+				mismatch = append(mismatch, "definition")
+			}
+			if declarationDigest != record.Fields["declaration_digest"] {
+				mismatch = append(mismatch, "declaration")
+			}
+			if record.Fields["subject_scope"] != currentSubjectDigest {
+				mismatch = append(mismatch, "subject")
+			}
+			if record.Fields["lane"] != d.Definition.Lane.Name {
+				mismatch = append(mismatch, "lane")
+			}
+			if record.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion {
+				mismatch = append(mismatch, "lane")
+			}
+			if record.Fields["canary_tree_digest"] == "" {
+				mismatch = append(mismatch, "proof")
+			}
+			if len(mismatch) > 0 {
 				result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
+				result.Mismatch = orderedMismatch(mismatch)
 			} else {
 				proofSeq, parseErr := strconv.ParseUint(record.Fields["proof_seq"], 10, 64)
 				if parseErr != nil || proofSeq == 0 {
@@ -780,21 +886,64 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 					}
 					if linked == nil {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_UNPROVEN", false, true
-					} else if linked.Fields["gate_id"] != d.Definition.ID || linked.Fields["canary_id"] != canary.ID || linked.Fields["definition_digest"] != record.Fields["definition_digest"] || linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] || linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] || linked.Fields["subject_scope"] != currentSubjectDigest || linked.Fields["lane"] != d.Definition.Lane.Name || linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion || (d.Definition.Command != nil && linked.Fields["env_digest"] != record.Fields["env_digest"]) {
-						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
+					} else {
+						// Binding site 2: the linked proof-of-fire against the
+						// result and the current state, one named term each.
+						var proofMismatch []string
+						if linked.Fields["gate_id"] != d.Definition.ID {
+							proofMismatch = append(proofMismatch, "proof")
+						}
+						if linked.Fields["canary_id"] != canary.ID {
+							proofMismatch = append(proofMismatch, "declaration")
+						}
+						if linked.Fields["definition_digest"] != record.Fields["definition_digest"] {
+							proofMismatch = append(proofMismatch, "definition")
+						}
+						if linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] {
+							proofMismatch = append(proofMismatch, "declaration")
+						}
+						if linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] {
+							proofMismatch = append(proofMismatch, "proof")
+						}
+						if linked.Fields["subject_scope"] != currentSubjectDigest {
+							proofMismatch = append(proofMismatch, "subject")
+						}
+						if linked.Fields["lane"] != d.Definition.Lane.Name {
+							proofMismatch = append(proofMismatch, "lane")
+						}
+						if linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion {
+							proofMismatch = append(proofMismatch, "lane")
+						}
+						if d.Definition.Command != nil && linked.Fields["env_digest"] != record.Fields["env_digest"] {
+							proofMismatch = append(proofMismatch, "env")
+						}
+						if len(proofMismatch) > 0 {
+							result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
+							result.Mismatch = orderedMismatch(proofMismatch)
+						}
 					}
 				}
 				if result.Verdict == gate.VerdictPass && d.Definition.Command != nil {
+					// Binding site 3: the allow-listed environment of THIS process,
+					// which is the daemon for ready, gate check and gate prove
+					// (deferral D1). currentCommandEnvDigest can also fail on
+					// command.Validate(), a definition-shaped error, but that is
+					// unreachable here: every definition discoverGates returns went
+					// through ParseGate -> ValidateGate -> Command.Validate. So
+					// both terms name env.
 					currentEnvDigest, envErr := currentCommandEnvDigest(*d.Definition.Command)
 					if envErr != nil || currentEnvDigest != record.Fields["env_digest"] {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
+						result.Mismatch = []string{"env"}
 					}
 				}
 			}
 			if result.Verdict == gate.VerdictPass && d.Definition.ProofPolicy.MaxAgeSecs > 0 {
+				// Binding site 4: the result's age.
 				when, parseErr := time.Parse(time.RFC3339Nano, record.Fields["at"])
 				if parseErr != nil || time.Since(when) > time.Duration(d.Definition.ProofPolicy.MaxAgeSecs)*time.Second {
 					result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
+					result.Mismatch = []string{"age"}
 				}
 			}
 		}
@@ -865,7 +1014,7 @@ func (s *Store) checkGatesReadOnly(report *CheckReport) error {
 		if result.Verdict == gate.VerdictPass {
 			continue
 		}
-		finding := CheckFinding{Code: result.Code, Subject: result.GateID, Message: result.Verdict, Kind: "unevaluated"}
+		finding := CheckFinding{Code: result.Code, Subject: result.GateID, Message: gateFindingMessage(result), Kind: "unevaluated"}
 		if result.Verdict == gate.VerdictFail {
 			finding.Kind = "fail"
 			if finding.Code == "" {

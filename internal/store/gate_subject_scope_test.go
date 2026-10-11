@@ -187,6 +187,18 @@ func TestSubjectDigestCoversEveryTrackedFile(t *testing.T) {
 		"README.md":            "# readme\n",
 		"nested/deep/conf.yml": "key: value\n",
 		"schema.sql":           "CREATE TABLE t (id INT);\n",
+		// AIRA-285 excludes exactly .aira/tickets/ and .aira/findings/. Every
+		// other .aira/ file stays in the subject -- requirements are read by the
+		// traceability checker, and config and gate files are what a checker
+		// is configured by -- and so do the near misses of the two prefixes.
+		".aira/config":                       "{\"project\":\"x\"}\n",
+		".aira/requirements/AR-1.md":         "requirement\n",
+		".aira/gates/g.json":                 "{}\n",
+		".aira/gates/canaries/g-canary.json": "{}\n",
+		".aira/tickets-archive/x.md":         "archived\n",
+		".aira/ticketsx/y.md":                "near miss\n",
+		"docs/.aira/tickets/x.md":            "nested\n",
+		"nested/.aira/findings/f.md":         "nested\n",
 	}
 	_, original := subjectFixture(t, base)
 	for name := range base {

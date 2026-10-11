@@ -2386,7 +2386,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if err != nil {
 					return nil, err
 				}
-				return handlerData{Data: result, Verdict: result.Verdict}, nil
+				// AIRA-286: the env_allow PATH warning rides the response
+				// envelope, where the human renderer prints it.
+				return handlerData{Data: result, Verdict: result.Verdict, Warnings: result.Warnings}, nil
 			case "check":
 				report, err := gs.GateCheck(ctx)
 				if err != nil {
@@ -2422,6 +2424,12 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				// unwrapped reported OK/exit 0 for an unevaluated or failing
 				// gate, so the verdict is plumbed to the exit code here.
 				if result, ok := value.(store.GateCheckResult); ok {
+					return handlerData{Data: result, Verdict: result.Verdict}, nil
+				}
+				// AIRA-287: canary-run carries the canary's own verdict (pass =
+				// fired, fail = did not fire, unevaluated), so its exit code has
+				// the same three-state meaning as gate run.
+				if result, ok := value.(store.CanaryRunResult); ok {
 					return handlerData{Data: result, Verdict: result.Verdict}, nil
 				}
 				return value, nil
@@ -2527,7 +2535,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "ls", Summary: "List gate definitions", Safety: SafetyRead, Args: nil, Example: []string{"ls"}},
 			{Name: "show", Summary: "Show a gate definition", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"show", "traceability"}},
 			{Name: "set", Summary: "Set gate policy", Safety: SafetyMutate, Args: gateDefinitionOperationArgs(), Example: []string{"set", "unit-tests", "--timeout-ms", "60000"}},
-			{Name: "run", Summary: "Evaluate a gate", Safety: SafetyReconcile, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"run", "traceability"}},
+			{Name: "run", Summary: "Evaluate a gate; a command gate's reply carries RunID and CanaryRunID, read its output with aira run-log <run id>", Safety: SafetyReconcile, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"run", "traceability"}},
 			{Name: "check", Summary: "Read the latest gate result", Safety: SafetyRead, Args: nil, Example: []string{"check"}},
 			{Name: "attest", Summary: "Answer a manual gate challenge", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "verdict", Required: true}, {Name: "actor", Required: true}}, Example: []string{"attest", "review", "--verdict", "pass", "--actor", "human"}},
 			// Safety stays SafetyMutate: the operation is read-only in fact, but
@@ -2537,7 +2545,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			// canary evidence, which is the point of the security model.
 			{Name: "prove", Summary: "Read back the latest gate result and its proof linkage", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"prove", "traceability"}},
 			{Name: "review", Summary: "Request manual gate review", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
-			{Name: "canary-run", Summary: "Run a named canary", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
+			{Name: "canary-run", Summary: "Run a named canary and report whether it fired: verdict pass (exit 0) means the checker failed on the canary tree, an observed failure rather than proof of its cause, fail (exit 1) means it did not fire, unevaluated (exit 3) means it could not tell; gate_result is the gate's own result on that tree; read a command canary's output with aira run-log <run id>", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
 			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
 		}},
 		"spend": {summary: "Record and list raw compute events", safety: SafetyMutate, operations: []OperationSpec{

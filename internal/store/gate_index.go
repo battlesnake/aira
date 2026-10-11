@@ -15,15 +15,91 @@ import (
 	"aira/internal/gate"
 )
 
+// GateCheckResult is one gate's verdict.
+//
+// Mismatch names the bindings that refused a stored pass, and is set if and
+// only if Code is U_GATE_PROOF_STALE (AIRA-286). Its vocabulary is closed and
+// always listed in this order, without duplicates:
+//
+//	definition   the gate definition's digest or parse
+//	declaration  the canary declaration: its file, digest, or the proof's canary id
+//	subject      the subject digest the pass or its proof was recorded against
+//	lane         the lane name or evaluator version
+//	env          the command gate's allow-listed environment
+//	age          the result is older than proof_policy.max_age_secs, or its time is unreadable
+//	proof        the linked proof-of-fire: its gate, its canary tree, or a missing canary tree
+//
+// Only the names of the comparison site that refused the pass are listed; a
+// later site is not evaluated once an earlier one has refused.
+//
+// RunID and CanaryRunID (AIRA-288) are the runner run ids of a command gate's
+// subject run and canary run, read with `aira run-log <id>`. They are
+// references, never bindings: they play no part in the verdict, and their
+// absence (a dimension or manual gate launches nothing) never means "no
+// output". Warnings is set by RunGate only.
 type GateCheckResult struct {
-	GateID  string
-	Kind    string
-	Subject string
-	Verdict string
-	Code    string
-	Trusted bool
-	Suspect bool
-	Seq     uint64
+	GateID      string
+	Kind        string
+	Subject     string
+	Verdict     string
+	Code        string
+	Trusted     bool
+	Suspect     bool
+	Seq         uint64
+	Mismatch    []string `json:",omitempty"`
+	RunID       string   `json:",omitempty"`
+	CanaryRunID string   `json:",omitempty"`
+	Warnings    []string `json:",omitempty"`
+}
+
+// gateBindingNames is the Mismatch vocabulary, in its fixed output order.
+var gateBindingNames = []string{"definition", "declaration", "subject", "lane", "env", "age", "proof"}
+
+// orderedMismatch returns the distinct names in names in vocabulary order.
+func orderedMismatch(names []string) []string {
+	ordered := make([]string, 0, len(names))
+	for _, candidate := range gateBindingNames {
+		for _, name := range names {
+			if name == candidate {
+				ordered = append(ordered, candidate)
+				break
+			}
+		}
+	}
+	return ordered
+}
+
+// gateFindingMessage is the one message the ready and check gate findings
+// carry: the verdict, plus the refusing bindings for a stale proof.
+func gateFindingMessage(r GateCheckResult) string {
+	message := "gate " + r.GateID + " is " + r.Verdict
+	if len(r.Mismatch) > 0 {
+		message += " (does not match: " + strings.Join(r.Mismatch, ", ") + ")"
+	}
+	return message
+}
+
+// CanaryRunResult is what `aira gate canary-run` reports (AIRA-287).
+//
+// Verdict is the canary's OWN verdict, from gate.CanaryHealthFor: pass means
+// the canary fired -- the checker FAILED on the canary tree -- fail means it
+// did not fire, and unevaluated means the canary-tree result was not
+// established. "Fired" is an observed failure, not a proof that the mutation or
+// fixture caused it: canary-run does not evaluate the unmutated subject, so on
+// a subject that already fails, fired:true says nothing about the canary.
+// `aira gate run` evaluates both. GateResult is the gate's own result on the
+// canary tree. Fired is null whenever that result is not established.
+// canary-run writes nothing to the gate ledger and mints no proof.
+type CanaryRunResult struct {
+	CanaryID   string              `json:"canary_id"`
+	GateID     string              `json:"gate_id"`
+	Verdict    string              `json:"verdict"`
+	Fired      *bool               `json:"fired"`
+	GateResult gate.PredicateState `json:"gate_result"`
+	Code       string              `json:"code,omitempty"`
+	RunID      string              `json:"run_id,omitempty"`
+	TreeDigest string              `json:"tree_digest"`
+	Findings   []CheckFinding      `json:"findings"`
 }
 
 // GateCheckReport carries the folded gate verdict. Code is the report-level
@@ -124,8 +200,28 @@ func (s *Store) ListGates() ([]gate.GateDefinition, error) {
 }
 
 func (s *Store) canaryFor(def gate.GateDefinition) (gate.CanaryDeclaration, error) {
-	candidates := make([]string, 0, len(def.CanaryIDs)*2)
-	for _, id := range def.CanaryIDs {
+	return s.loadCanary(def, def.CanaryIDs)
+}
+
+// namedCanary loads the canary declared at id's own path, for the verbs that
+// act on one canary by name (canary-show, canary-run). canaryFor serves the
+// gate's FIRST declared canary, which on a gate with several canaries is
+// another canary's declaration under the requested label. A file at id's path
+// that declares a different id is refused, not served under id.
+func (s *Store) namedCanary(def gate.GateDefinition, id string) (gate.CanaryDeclaration, error) {
+	declaration, err := s.loadCanary(def, []string{id})
+	if err != nil {
+		return gate.CanaryDeclaration{}, err
+	}
+	if declaration.ID != id {
+		return gate.CanaryDeclaration{}, fmt.Errorf("E_GATE_CANARY_INVALID: canary file for %q declares id %q", id, declaration.ID)
+	}
+	return declaration, nil
+}
+
+func (s *Store) loadCanary(def gate.GateDefinition, ids []string) (gate.CanaryDeclaration, error) {
+	candidates := make([]string, 0, len(ids)*2)
+	for _, id := range ids {
 		candidates = append(candidates, filepath.Join(s.gateRoot(), "canaries", id+".json"), filepath.Join(s.gateRoot(), id+".canary.json"))
 	}
 	for _, path := range candidates {

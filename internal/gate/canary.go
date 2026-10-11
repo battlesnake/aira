@@ -30,6 +30,14 @@ type Isolation string
 const IsolationTempGit Isolation = "isolated-temp-git"
 
 type Seed struct {
+	// Path names a directory of the LIVE worktree copied into a fixture
+	// canary's tree. Boundary (spec 2026-10-11 section 3.1.1): the copy reads
+	// the live directory, not the captured subject, so it carries untracked
+	// bytes and hard-link aliases that no subject or proof digest covers; the
+	// bookkeeping skip compares the literal ".aira/" prefixes, which a
+	// case-insensitive filesystem can bypass with another casing. A symlink at
+	// any component of Path or below it is refused. Seeding from the captured
+	// entries instead is the held follow-up AIRA-300.
 	Path   string            `json:"path,omitempty"`
 	Files  map[string]string `json:"files,omitempty"`
 	Digest string            `json:"digest,omitempty"`
@@ -163,7 +171,61 @@ func ValidateCanary(c CanaryDeclaration) error {
 			return fmt.Errorf("E_GATE_CANARY_INVALID: seed path escapes fixture root: %q", path)
 		}
 	}
+	return refuseBookkeepingTargets(c)
+}
+
+// refuseBookkeepingTargets refuses a canary that writes into, or seeds from,
+// AIRA's own ticket and finding files (AIRA-285). Those paths are left out of
+// every gate subject's capture, so a mutation landing there is discarded by the
+// re-capture and a seed file there is dropped from the fixture tree: the canary
+// could then only "fire" for some other reason, and RunGate reads any failure
+// on the canary tree as a fire and mints proof-of-fire from it. A Seed.Path
+// there is also a live-worktree read (runCanary copies it from the caller's
+// root) that no subject digest covers any more. Directory-valued fields are
+// tested with a trailing slash, so the directory itself is caught as well as
+// anything below it.
+func refuseBookkeepingTargets(c CanaryDeclaration) error {
+	refuse := func(field string) error {
+		return fmt.Errorf("E_GATE_CANARY_INVALID: %s targets AIRA bookkeeping, which is not part of any gate subject (AIRA-285)", field)
+	}
+	if m := c.Mutation; m != nil {
+		if m.File != "" && ExcludedFromSubject(cleanSlashPath(m.File)) {
+			return refuse("mutation file")
+		}
+		if m.PkgDir != "" && ExcludedFromSubject(cleanSlashPath(m.PkgDir)+"/") {
+			return refuse("mutation pkgdir")
+		}
+	}
+	for _, path := range c.SortedSeedFiles() {
+		if ExcludedFromSubject(cleanSlashPath(path)) {
+			return refuse("seed file")
+		}
+	}
+	if c.Seed.Path != "" && ExcludedFromSubject(cleanSlashPath(c.Seed.Path)+"/") {
+		return refuse("seed path")
+	}
 	return nil
+}
+
+func cleanSlashPath(path string) string {
+	return filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+}
+
+// ExcludedFromSubject reports whether a root-relative slash path is AIRA's own
+// workflow bookkeeping (AIRA-285), which is left out of every gate subject's
+// CAPTURE: absent from the digest and from every tree a checker is given,
+// alike.
+//
+// Exactly two directories, matched as literal prefixes anchored at the root
+// and ending in a slash: .aira/tickets/ and .aira/findings/. They are what the
+// routine workflow verbs (create, set, mv, link, claim, find) write, and no
+// AIRA checker reads them. Everything else under .aira/ stays in, deliberately:
+// requirements are read by the traceability checker, so a requirement edit must
+// still invalidate, and config, gate definitions, canaries and any .aira/ file
+// added later default to "in", the safe direction. So .aira/tickets-archive/x,
+// a tracked file named .aira/tickets, and docs/.aira/tickets/x all stay in.
+func ExcludedFromSubject(path string) bool {
+	return strings.HasPrefix(path, ".aira/tickets/") || strings.HasPrefix(path, ".aira/findings/")
 }
 
 func validateMutation(m MutationSeed) error {
