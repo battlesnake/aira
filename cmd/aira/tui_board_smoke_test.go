@@ -9,6 +9,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/testdeadline"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -61,50 +62,31 @@ func (boardSmokeDispatcher) Dispatch(ctx context.Context, _ daemon.WorktreeScope
 // 80x25 — so a pre-Run SetSize never takes; P2.12).
 func resizeBoardScreen(t *testing.T, runtime *tuiRuntime, screen tcell.SimulationScreen, w, h int) {
 	t.Helper()
-	done := make(chan struct{})
-	go runtime.app.QueueUpdateDraw(func() { screen.SetSize(w, h); close(done) })
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("resize deadlocked")
-	}
-	time.Sleep(30 * time.Millisecond) // let the resize-driven relayout settle
+	onUIDraw(t, runtime, func() struct{} { screen.SetSize(w, h); return struct{}{} })
+	// The draw that applies the new size ran inside the update above; a second round
+	// trip proves the resize-driven relayout (the width seam runs in that draw) has
+	// finished before the caller reads or types.
+	onUI(t, runtime, func() struct{} { return struct{}{} })
 }
 
 func readBoardStripWindow(t *testing.T, runtime *tuiRuntime) (int, int) {
 	t.Helper()
-	result := make(chan [2]int, 1)
-	go runtime.app.QueueUpdate(func() { result <- [2]int{runtime.boardUI.lastStart, runtime.boardUI.lastEnd} })
-	select {
-	case window := <-result:
-		return window[0], window[1]
-	case <-time.After(time.Second):
-		t.Fatal("reading strip window deadlocked")
-		return 0, 0
-	}
+	window := onUI(t, runtime, func() [2]int { return [2]int{runtime.boardUI.lastStart, runtime.boardUI.lastEnd} })
+	return window[0], window[1]
 }
 
 // readBoardSelectedID reads the reducer's authoritative selected-card id on the UI
 // goroutine — the ground truth that Home/End must keep in sync with the cursor.
 func readBoardSelectedID(t *testing.T, runtime *tuiRuntime) string {
 	t.Helper()
-	result := make(chan string, 1)
-	go runtime.app.QueueUpdate(func() { result <- boardSelectedCardID(*runtime.state.Board) })
-	select {
-	case id := <-result:
-		return id
-	case <-time.After(time.Second):
-		t.Fatal("reading selected card deadlocked")
-		return ""
-	}
+	return onUI(t, runtime, func() string { return boardSelectedCardID(*runtime.state.Board) })
 }
 
 // readBoardFocusedCards reads the focused column's card ids in order (ground truth
 // for first/last, so the test needn't assume how the board orders cards).
 func readBoardFocusedCards(t *testing.T, runtime *tuiRuntime) []string {
 	t.Helper()
-	result := make(chan []string, 1)
-	go runtime.app.QueueUpdate(func() {
+	return onUI(t, runtime, func() []string {
 		b := runtime.state.Board
 		var ids []string
 		if b != nil && b.FocusedCol >= 0 && b.FocusedCol < len(b.Model.Columns) {
@@ -112,15 +94,8 @@ func readBoardFocusedCards(t *testing.T, runtime *tuiRuntime) []string {
 				ids = append(ids, c.ID)
 			}
 		}
-		result <- ids
-	})
-	select {
-	case ids := <-result:
 		return ids
-	case <-time.After(time.Second):
-		t.Fatal("reading focused cards deadlocked")
-		return nil
-	}
+	})
 }
 
 // TestBoardHomeEndUpdateSelection is the AIRA-256 regression on the real tview
@@ -133,6 +108,7 @@ func TestBoardHomeEndUpdateSelection(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	runtime := newBoardRuntime(ctx, boardSmokeDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
@@ -140,35 +116,29 @@ func TestBoardHomeEndUpdateSelection(t *testing.T) {
 	resizeBoardScreen(t, runtime, screen, 120, 40)
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
 	// Focus the planned column (draft -> planned); the smoke fixture gives it 3 cards.
-	screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone)
-	time.Sleep(30 * time.Millisecond)
+	keys.press(t, runeKey('l'))
 	cards := readBoardFocusedCards(t, runtime)
 	if len(cards) < 3 {
 		t.Fatalf("expected the planned column to have >=3 cards, got %v", cards)
 	}
 
 	// Move off the first card, then Home: the selection must be the first card.
-	screen.InjectKey(tcell.KeyDown, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
-	screen.InjectKey(tcell.KeyHome, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, specialKey(tcell.KeyDown))
+	keys.press(t, specialKey(tcell.KeyHome))
 	if id := readBoardSelectedID(t, runtime); id != cards[0] {
 		t.Fatalf("Home did not select the first card: got %q, want %q", id, cards[0])
 	}
 	// The next Down must move to the SECOND card, not snap back to the pre-Home one.
-	screen.InjectKey(tcell.KeyDown, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, specialKey(tcell.KeyDown))
 	if id := readBoardSelectedID(t, runtime); id != cards[1] {
 		t.Fatalf("Down after Home snapped back instead of moving from the first card: got %q, want %q", id, cards[1])
 	}
 	// End -> last card; the next Up moves to the second-to-last.
-	screen.InjectKey(tcell.KeyEnd, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, specialKey(tcell.KeyEnd))
 	if id := readBoardSelectedID(t, runtime); id != cards[len(cards)-1] {
 		t.Fatalf("End did not select the last card: got %q, want %q", id, cards[len(cards)-1])
 	}
-	screen.InjectKey(tcell.KeyUp, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, specialKey(tcell.KeyUp))
 	if id := readBoardSelectedID(t, runtime); id != cards[len(cards)-2] {
 		t.Fatalf("Up after End snapped back instead of moving from the last card: got %q, want %q", id, cards[len(cards)-2])
 	}
@@ -179,7 +149,7 @@ func TestBoardHomeEndUpdateSelection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("board Home/End smoke did not quit")
 	}
 }
@@ -189,6 +159,7 @@ func TestBoardSmokeRendersBadgesAndDrillIn(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	runtime := newBoardRuntime(ctx, boardSmokeDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
@@ -206,8 +177,7 @@ func TestBoardSmokeRendersBadgesAndDrillIn(t *testing.T) {
 	// A blank hold/ready/blocked negative is never fabricated: AIRA-50 (done) has
 	// no badges. Its column shows once scrolled to, but the honesty is unit-tested;
 	// here we drill into AIRA-1.
-	screen.InjectKey(tcell.KeyRight, 0, tcell.ModNone) // focus draft→planned
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, specialKey(tcell.KeyRight))          // focus draft→planned
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // drill into AIRA-1
 	if detail := waitForSimulationText(t, runtime, screen, "Esc to close"); !strings.Contains(detail, "AIRA-1") {
 		t.Fatalf("drill-in detail did not open for AIRA-1:\n%s", detail)
@@ -219,7 +189,7 @@ func TestBoardSmokeRendersBadgesAndDrillIn(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("board smoke did not quit")
 	}
 }
@@ -232,6 +202,7 @@ func TestBoardSmokeHorizontalScroll(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	runtime := newBoardRuntime(ctx, boardSmokeDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
@@ -249,8 +220,7 @@ func TestBoardSmokeHorizontalScroll(t *testing.T) {
 	}
 	// Move focus right toward `done`, scrolling the strip.
 	for i := 0; i < 4; i++ {
-		screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone)
-		time.Sleep(15 * time.Millisecond)
+		keys.press(t, runeKey('l'))
 	}
 	if scrolled := waitForSimulationText(t, runtime, screen, "AIRA-50"); !strings.Contains(scrolled, "AIRA-50") {
 		t.Fatalf("done card never scrolled into view at 40 columns:\n%s", scrolled)
@@ -261,7 +231,7 @@ func TestBoardSmokeHorizontalScroll(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("board scroll smoke did not quit")
 	}
 }
@@ -274,13 +244,13 @@ func TestBoardSearchOverlayUnevaluated(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	runtime := newBoardRuntime(ctx, boardSearchDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
 	resizeBoardScreen(t, runtime, screen, 120, 40) // the results overlay is 90 wide
 
-	screen.InjectKey(tcell.KeyRune, '/', tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, runeKey('/'))
 	for _, ch := range "parser" {
 		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
 	}
@@ -291,7 +261,7 @@ func TestBoardSearchOverlayUnevaluated(t *testing.T) {
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("board search smoke did not quit")
 	}
 }
@@ -304,13 +274,13 @@ func TestBoardSearchResultsJump(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	runtime := newBoardRuntime(ctx, boardResultsDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
 	resizeBoardScreen(t, runtime, screen, 120, 40)
 
-	screen.InjectKey(tcell.KeyRune, '/', tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, runeKey('/'))
 	for _, ch := range "prereq" {
 		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
 	}
@@ -319,24 +289,11 @@ func TestBoardSearchResultsJump(t *testing.T) {
 	// overlay is open (the board itself never prints it).
 	waitForSimulationText(t, runtime, screen, "Search:")
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // open selected result → jump to AIRA-2's column
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		focus := make(chan int, 1)
-		go runtime.app.QueueUpdate(func() { focus <- runtime.state.Board.FocusedCol })
-		if <-focus == 1 { // planned column
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	focus := make(chan int, 1)
-	go runtime.app.QueueUpdate(func() { focus <- runtime.state.Board.FocusedCol })
-	if got := <-focus; got != 1 {
-		t.Fatalf("Enter on a loaded result did not jump to its column: focus=%d", got)
-	}
+	eventuallyOnUI(t, runtime, 2*time.Second, func() bool { return runtime.state.Board.FocusedCol == 1 }, "Enter on a loaded result did not jump to its column (the planned column)")
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("board results smoke did not quit")
 	}
 }
@@ -385,6 +342,7 @@ func TestBoardInfoPaneRendersFullDetail(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	runtime := newBoardRuntime(ctx, boardInfoDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
@@ -393,8 +351,7 @@ func TestBoardInfoPaneRendersFullDetail(t *testing.T) {
 	resizeBoardScreen(t, runtime, screen, 120, 56)
 	waitForSimulationText(t, runtime, screen, "AIRA-1") // let the resize settle before input
 	// Focus draft→planned so AIRA-1 is selected and the pane fetches its detail.
-	screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone)
-	time.Sleep(30 * time.Millisecond)
+	keys.press(t, runeKey('l'))
 	// Wait on a body word — unique to the loaded pane detail (unlike "opus", which
 	// also appears in the sessions strip's lease row).
 	text := waitForSimulationText(t, runtime, screen, "BODYWORD")
@@ -410,13 +367,11 @@ func TestBoardInfoPaneRendersFullDetail(t *testing.T) {
 	}
 
 	// Full-width toggle: 'f' collapses the strip to the single focused column.
-	screen.InjectKey(tcell.KeyRune, 'f', tcell.ModNone)
-	time.Sleep(30 * time.Millisecond)
+	keys.press(t, runeKey('f'))
 	if start, end := readBoardStripWindow(t, runtime); end-start != 1 {
 		t.Fatalf("'f' full-width did not collapse to one column: window [%d,%d)", start, end)
 	}
-	screen.InjectKey(tcell.KeyRune, 'f', tcell.ModNone) // back to multi-column
-	time.Sleep(30 * time.Millisecond)
+	keys.press(t, runeKey('f')) // back to multi-column
 
 	// Shrink to the common 80x24 and open the expand overlay: its box must be
 	// clamped to fit, so its border title and the full title/body are on-screen
@@ -437,7 +392,7 @@ func TestBoardInfoPaneRendersFullDetail(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("board info pane smoke did not quit")
 	}
 }
@@ -452,14 +407,14 @@ func TestBoardInfoPaneSurvivesResize(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	runtime := newBoardRuntime(ctx, boardInfoDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
 	resizeBoardScreen(t, runtime, screen, 120, 56)
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
-	screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone) // select AIRA-1
-	time.Sleep(30 * time.Millisecond)
+	keys.press(t, runeKey('l')) // select AIRA-1
 	wide := waitForSimulationText(t, runtime, screen, "BODYWORD")
 	if strings.Contains(wide, "↵") {
 		t.Fatalf("false clip disclosure at 120x56 where everything fits:\n%s", wide)
@@ -493,7 +448,7 @@ func TestBoardInfoPaneSurvivesResize(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("board info resize smoke did not quit")
 	}
 }

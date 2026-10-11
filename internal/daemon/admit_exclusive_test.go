@@ -83,6 +83,12 @@ func seedRunningLease(queue *sliceQueue, seq int64) *admitWaiter {
 // queue.mu, which is sound only under the single-writer property it documents;
 // driving passes from a test while the goroutine was still live would break that
 // invariant and race, and a racy test is not evidence of anything.
+//
+// Retiring a LIVE goroutine only helps from this call onward: the goroutine may
+// already have granted a waiter before the test seeded its precondition. For a
+// server built by the exclusive constructors (admitManualEvaluation) the queue is
+// born with no evaluator, so the single-evaluator property holds from the queue's
+// birth and this call returns at once.
 func stopEvaluator(t *testing.T, queue *sliceQueue) {
 	t.Helper()
 	queue.stopOnce.Do(func() { close(queue.stop) })
@@ -145,7 +151,30 @@ func exclusiveTestServer(t *testing.T) (*Server, *atomic.Int64) {
 	var maximum atomic.Int64
 	maximum.Store(1 << 40)
 	server := admitTestServer(&maximum)
+	server.admitManualEvaluation = true
 	return server, &maximum
+}
+
+// A queue born under admitManualEvaluation has no evaluator of its own: the test is
+// the only caller of evaluateAdmitQueue from the moment the queue exists, so it can
+// seed its precondition (a running lease) without racing a background grant.
+func TestManualEvaluationQueueIsBornWithoutAnEvaluator(t *testing.T) {
+	server, _ := exclusiveTestServer(t)
+	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
+		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 90), name: "bench", owner: "mark",
+	})
+	// negative wait: a live evaluator would grant an exclusive waiter on an empty
+	// slice at once (the queue is kicked at enqueue). Contention can only delay that
+	// grant past this window, so it can only false-pass, never false-fail.
+	time.Sleep(50 * time.Millisecond)
+	if state, outcome, _ := waiterState(queue, exclusive); state != admitQueued {
+		t.Fatalf("a manual-evaluation queue granted a waiter on its own: state=%d outcome=%q", state, outcome)
+	}
+	// stopEvaluator must return at once: stopped is closed at birth. (It fails the
+	// test on its own backstop if nothing ever closes stopped.)
+	stopEvaluator(t, queue)
+	server.evaluateAdmitQueue(queue)
+	requireGranted(t, queue, exclusive, "the exclusive waiter after the test's own pass")
 }
 
 func TestExclusiveDrainBlocksAnOrdinaryWaiterThatWouldFit(t *testing.T) {

@@ -608,6 +608,16 @@ func killDetachedInputChild(scope Scope, cmd *exec.Cmd) {
 	_ = cmd.Process.Kill()
 }
 
+// forcedQuiesceConfirmBound bounds the emptiness confirmation after the forced
+// cgroup.kill in forceDetachedQuiesce. It is deliberately independent of the
+// configurable r.grace, which is the wait BEFORE the kill (the natural-quiesce wait
+// that must be able to expire so the force runs): a shortened grace must not also
+// shorten the confirmation, a backstop that must not expire. It equals the grace
+// production always uses (runner_linux.go defaults it to 2s and no production caller
+// sets Config.Grace), so production behaviour is unchanged. ScopeKill.GraceMS keeps
+// recording r.grace: it is the grace allowed before the forced kill, not this bound.
+const forcedQuiesceConfirmBound = 2 * time.Second
+
 func (r *Runner) forceDetachedQuiesce(ctx context.Context, id string, record RunRecord, scope Scope) (*RunRecord, error) {
 	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {
@@ -643,7 +653,7 @@ func (r *Runner) forceDetachedQuiesce(ctx context.Context, id string, record Run
 	killErr := scope.Kill()
 	var emptyErr error
 	if killErr == nil {
-		emptyErr = waitEmpty(ctx, scope, r.grace)
+		emptyErr = waitEmpty(ctx, scope, forcedQuiesceConfirmBound)
 	} else {
 		empty, checkErr := scope.Empty()
 		if checkErr != nil {

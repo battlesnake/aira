@@ -2000,7 +2000,13 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			queue.failfastTripped = true
 		}
 		s.admitQueues[path] = queue
-		go queue.runEvaluator()
+		if s.admitManualEvaluation {
+			// Test seam (unset in production): no evaluator goroutine, and stopped is
+			// closed so a caller's "the evaluator is gone" wait returns at once.
+			close(queue.stopped)
+		} else {
+			go queue.runEvaluator()
+		}
 	}
 	queue.mu.Lock()
 	defer queue.mu.Unlock()

@@ -2,9 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"aira/internal/codes"
@@ -34,20 +34,31 @@ func TestM20bSupervisorRejectsMalformedSidecarBeforeOpeningProject(t *testing.T)
 		t.Fatal(err)
 	}
 	defer readyR.Close()
-	ackR, ackW, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ackR.Close()
-	defer ackW.Close()
+	// runSupervisor takes ownership of the descriptor NUMBER it is given and closes
+	// it. Hand it a duplicate, so that closing it cannot close a number this test's
+	// *os.File still owns (whose finalizer would otherwise close it a second time,
+	// possibly after another test has been handed the same number: AIRA-199).
+	//
+	// ACK: this path only parses --ack-fd (a nonnegative integer) before it rejects
+	// the malformed wiring sidecar; the descriptor itself is consumed later, by
+	// SuperviseRequest, which is never reached. 2147483647 passes the parse and is
+	// above the kernel's descriptor ceiling, so it can never name an open descriptor
+	// even if a regression wrote to it or closed it.
 	exit := runSupervisor([]string{
 		"--control", control,
-		"--ready-fd", itoaFD(readyW),
-		"--ack-fd", itoaFD(ackR),
+		"--ready-fd", strconv.Itoa(dupTestFD(t, readyW)),
+		"--ack-fd", "2147483647",
 		"--wiring", wiring,
 	}, nil)
 	if exit != codes.ExitForCode("E_RUN_ARGUMENT_INVALID") {
 		t.Fatalf("exit=%d", exit)
+	}
+	// Close the write end now, exactly once, and assert it succeeds: a callee that
+	// closed the descriptor this test owns makes this close fail with EBADF on every
+	// run, with no GC timing involved. Closing also turns a supervisor that wrote
+	// nothing into an immediate EOF instead of a read that blocks on our own write end.
+	if err := readyW.Close(); err != nil {
+		t.Fatalf("the callee closed a descriptor this test owns: %v", err)
 	}
 	var ready map[string]string
 	if err := json.NewDecoder(readyR).Decode(&ready); err != nil {
@@ -63,8 +74,6 @@ func TestM20bSupervisorRejectsMalformedSidecarBeforeOpeningProject(t *testing.T)
 		t.Fatalf("the child launched despite a malformed sidecar (marker present): %v", err)
 	}
 }
-
-func itoaFD(file *os.File) string { return fmt.Sprintf("%d", file.Fd()) }
 
 func TestM20bDetachedWiringRequiresTerminalRecord(t *testing.T) {
 	for name, record := range map[string]*runner.RunRecord{

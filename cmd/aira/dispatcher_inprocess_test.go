@@ -30,6 +30,7 @@ import (
 	"aira/internal/gitcontext"
 	"aira/internal/runner"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 
 	"golang.org/x/sys/unix"
 )
@@ -1054,12 +1055,26 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 		return output.String()
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait for the fact the next step needs: the record with exactly this name is
+	// placed (its scope is on disk and its cgroup subtree reads populated). "Listed"
+	// proves only admission: a Pending registry row carries the name and owner before
+	// the scope exists, and the --steal kill below is gated on cgroup.events.
+	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
+	strongest, strongestRecord := readinessUnlistable, runner.ConfineRecord{}
 	for {
 		input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_confine_list","arguments":{}}}` + "\n")
-		var output bytes.Buffer
-		_ = runMCPWithDispatcher(context.Background(), input, &output, io.Discard, nil)
-		if strings.Contains(output.String(), name) && strings.Contains(output.String(), "session-a") {
+		var output, diagnostics bytes.Buffer
+		if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, nil); exit != 0 {
+			t.Fatalf("confine list MCP exit=%d output=%q diagnostics=%q", exit, output.String(), diagnostics.String())
+		}
+		state, record, readErr := confineKillReadiness(output.Bytes(), name)
+		if readErr != nil {
+			t.Fatalf("confine list: %v; output=%q", readErr, output.String())
+		}
+		if state > strongest {
+			strongest, strongestRecord = state, record
+		}
+		if state == readinessPlaced {
 			break
 		}
 		select {
@@ -1071,9 +1086,22 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 		default:
 		}
 		if time.Now().After(deadline) {
-			cgrouptest.SkipOrFailRealCgroup(t, "confine registry did not become visible")
+			// Read the launcher once more before the verdict: an error that landed
+			// since the receive above is the environment probe, not a product failure.
+			select {
+			case launchErr := <-done:
+				if launchErr != nil {
+					cgrouptest.SkipOrFailRealCgroup(t, "real MCP confine launch unavailable: %v", launchErr)
+				}
+				t.Fatal("confined workload exited before kill")
+			default:
+			}
+			if readinessIsProductFailure(strongest) {
+				t.Fatalf("the launcher is running and containment was never established (strongest state %s): the job was admitted but never entered a populated scope: %+v", strongest, strongestRecord)
+			}
+			cgrouptest.SkipOrFailRealCgroup(t, "containment was never established for %s (strongest state %s)", name, strongest)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond) // poll pacing, not synchronisation
 	}
 	withoutSteal := call(fmt.Sprintf(`{"selector":%q}`, name))
 	if !strings.Contains(withoutSteal, runner.CodeConfineOwnerUnverified) {
@@ -1085,8 +1113,217 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 	}
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("confine supervisor did not finish after scope kill")
+	}
+}
+
+// confineReadiness is how far a named confine job has got, as the MCP list shows it.
+// The states are ordered by strength so the strongest one seen can be kept.
+type confineReadiness int
+
+const (
+	// readinessUnlistable: no listing could be produced (an identified environmental
+	// answer: unevaluated, slice unavailable, a transient daemon transport code).
+	readinessUnlistable confineReadiness = iota
+	// readinessAbsent: no record with this name (not admitted, or already gone).
+	readinessAbsent
+	// readinessPending: admitted (a registry row); the scope is not on disk.
+	readinessPending
+	// readinessUnreadable: the scope is on disk, population not established (nil).
+	readinessUnreadable
+	// readinessEmpty: the scope is on disk and its cgroup subtree reads empty.
+	readinessEmpty
+	// readinessPlaced: the scope is on disk and its subtree reads populated, which is
+	// the fact the --steal kill's gate (cgroup.events) needs.
+	readinessPlaced
+)
+
+func (r confineReadiness) String() string {
+	switch r {
+	case readinessUnlistable:
+		return "unlistable"
+	case readinessAbsent:
+		return "absent"
+	case readinessPending:
+		return "pending"
+	case readinessUnreadable:
+		return "unreadable"
+	case readinessEmpty:
+		return "empty"
+	case readinessPlaced:
+		return "placed"
+	}
+	return "unknown"
+}
+
+// confineKillReadiness classifies the one record named exactly name in the output of
+// an aira_confine_list MCP call. It validates the MCP envelope first and classifies the
+// reply by its code: only answers the code base names as environmental (UNEVALUATED,
+// E_CONFINE_UNAVAILABLE, and the daemon transport codes, transient under load) are
+// readinessUnlistable. Anything else that is not a listing (undecodable output, {}, a
+// JSON-RPC error, no structuredContent, an empty or unknown code, OK with no scopes
+// array) is an error, so a broken reply can never end as an environmental skip. More
+// than one record with the exact name is an error too (the kill selector would be
+// refused as ambiguous). A neighbour whose name merely contains or extends ours is not ours.
+func confineKillReadiness(output []byte, name string) (confineReadiness, runner.ConfineRecord, error) {
+	fail := func(format string, args ...any) (confineReadiness, runner.ConfineRecord, error) {
+		return readinessUnlistable, runner.ConfineRecord{}, fmt.Errorf(format, args...)
+	}
+	var envelope struct {
+		JSONRPC string          `json:"jsonrpc"`
+		Error   json.RawMessage `json:"error"`
+		Result  *struct {
+			StructuredContent *struct {
+				OK   bool            `json:"ok"`
+				Code string          `json:"code"`
+				Data json.RawMessage `json:"data"`
+			} `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(output), &envelope); err != nil {
+		return fail("undecodable confine list output: %v", err)
+	}
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return fail("JSON-RPC error reply: %s", envelope.Error)
+	}
+	if envelope.JSONRPC != "2.0" || envelope.Result == nil || envelope.Result.StructuredContent == nil {
+		return fail("reply is not an MCP tools/call result with structuredContent")
+	}
+	reply := envelope.Result.StructuredContent
+	switch {
+	case reply.Code == "":
+		return fail("reply carries no code")
+	case reply.OK && reply.Code == "UNEVALUATED":
+		return readinessUnlistable, runner.ConfineRecord{}, nil
+	case !reply.OK && (reply.Code == "E_CONFINE_UNAVAILABLE" || reply.Code == daemon.CodeUnavailable ||
+		reply.Code == daemon.CodeTimeout || reply.Code == daemon.CodeBusy):
+		return readinessUnlistable, runner.ConfineRecord{}, nil
+	case !reply.OK || reply.Code != "OK":
+		return fail("unexpected reply ok=%v code=%q", reply.OK, reply.Code)
+	}
+	var list struct {
+		Scopes *[]runner.ConfineRecord `json:"scopes"`
+	}
+	if err := json.Unmarshal(reply.Data, &list); err != nil || list.Scopes == nil {
+		return fail("OK reply has no scopes array (err=%v)", err)
+	}
+	var ours []runner.ConfineRecord
+	for _, record := range *list.Scopes {
+		if record.Name == name {
+			ours = append(ours, record)
+		}
+	}
+	switch {
+	case len(ours) > 1:
+		return fail("%d confine records are named %q: the kill selector would be ambiguous", len(ours), name)
+	case len(ours) == 0:
+		return readinessAbsent, runner.ConfineRecord{}, nil
+	}
+	record := ours[0]
+	switch {
+	case record.Pending:
+		return readinessPending, record, nil
+	case record.SubtreePopulated == nil:
+		return readinessUnreadable, record, nil
+	case !*record.SubtreePopulated:
+		return readinessEmpty, record, nil
+	}
+	return readinessPlaced, record, nil
+}
+
+// readinessIsProductFailure decides what the poll's expiry means given the strongest
+// state it saw, once the launcher has been drained without an error. Two states are
+// product failures: a scope that is on disk and reads empty (containment works while the
+// job never entered it), and a Pending row (a Pending row is emitted only for a GRANTED
+// waiter, so the launcher was admitted yet never created the scope while still running:
+// a stall). The launcher returns an error when the environment cannot create or place
+// the scope, and the poll already treated that as unevaluated. Unlistable and absent
+// (not admitted, or no listing) and unreadable (the scope's population cannot be read)
+// establish nothing, so those are unevaluated.
+func readinessIsProductFailure(strongest confineReadiness) bool {
+	return strongest == readinessPending || strongest == readinessEmpty
+}
+
+func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.T) {
+	const name = "mcp-e2e-x"
+	scopeID := func(n string, pid int) string { return "CONFINE-" + n + "-" + strconv.Itoa(pid) + "-1@session-a" }
+	yes, no := true, false
+	onDisk := func(n string, populated *bool) runner.ConfineRecord {
+		pid := 4242
+		return runner.ConfineRecord{Name: n, Owner: "session-a", ScopeID: scopeID(n, pid), SupervisorPID: &pid, SubtreePopulated: populated}
+	}
+	encodeResponse := func(response core.Response) []byte {
+		t.Helper()
+		encoded, err := json.Marshal(toolResponse(1, response))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+	encode := func(list runner.ConfineListResult) []byte {
+		return encodeResponse(core.Response{OK: true, Code: "OK", Data: list})
+	}
+	// The Pending row is the production shape: built by ShimConfineList from a registry entry.
+	pending := runner.ShimConfineList([]runner.ConfineRegistryEntry{{ScopeID: scopeID(name, 4242)}})
+	if len(pending.Scopes) != 1 || !pending.Scopes[0].Pending || pending.Scopes[0].Name != name {
+		t.Fatalf("fixture: the production Pending row is not what this test assumes: %+v", pending.Scopes)
+	}
+	list := func(records ...runner.ConfineRecord) []byte {
+		records = append([]runner.ConfineRecord{}, records...) // production lists an empty slice, never null
+		return encode(runner.ConfineListResult{Verdict: "ok", Scopes: records})
+	}
+	protocolError, err := json.Marshal(protocolResponse(1, -32000, "boom", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		label  string
+		output []byte
+		want   confineReadiness
+		fail   bool
+	}{
+		{"no record", list(), readinessAbsent, false},
+		{"only a neighbour", list(onDisk("mcp-e2e-x-other", &yes)), readinessAbsent, false},
+		{"ours pending", encode(pending), readinessPending, false},
+		{"ours unreadable", list(onDisk(name, nil)), readinessUnreadable, false},
+		{"ours empty", list(onDisk(name, &no)), readinessEmpty, false},
+		{"neighbour populated, ours empty", list(onDisk("mcp-e2e-x-other", &yes), onDisk(name, &no)), readinessEmpty, false},
+		{"ours placed", list(onDisk(name, &yes)), readinessPlaced, false},
+		{"ours placed beside a neighbour", list(onDisk("other", &no), onDisk(name, &yes)), readinessPlaced, false},
+		{"two named ours", list(onDisk(name, &yes), onDisk(name, &yes)), 0, true},
+		// Identified environmental answers: unlistable (the poll retries; only a
+		// persistent one reaches the expiry, as unevaluated).
+		{"unevaluated list", encodeResponse(core.Response{OK: true, Code: "UNEVALUATED", Data: runner.ConfineListResult{Verdict: "unevaluated", Reason: "slice unreadable", Scopes: []runner.ConfineRecord{}}}), readinessUnlistable, false},
+		{"slice unavailable", encodeResponse(confineClientError(errors.New("E_CONFINE_UNAVAILABLE: no aira.slice"))), readinessUnlistable, false},
+		{"daemon unavailable", encodeResponse(core.Response{Code: daemon.CodeUnavailable, Error: "daemon down"}), readinessUnlistable, false},
+		{"daemon timeout", encodeResponse(core.Response{Code: daemon.CodeTimeout, Error: "slow"}), readinessUnlistable, false},
+		{"daemon busy", encodeResponse(core.Response{Code: daemon.CodeBusy, Error: "busy"}), readinessUnlistable, false},
+		// Everything else is not an answer this test knows to be environmental.
+		{"garbage", []byte("not json"), 0, true},
+		{"empty object", []byte(`{}`), 0, true},
+		{"protocol error", protocolError, 0, true},
+		{"no structuredContent", []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`), 0, true},
+		{"empty code", []byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":true,"data":{"scopes":[]}}}}`), 0, true},
+		{"other code", encodeResponse(core.Response{Code: daemon.CodeProtocol, Error: "bad frame"}), 0, true},
+		{"not ok with OK code", []byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":false,"code":"OK","data":{"scopes":[]}}}}`), 0, true},
+		{"OK without scopes", encodeResponse(core.Response{OK: true, Code: "OK", Data: map[string]any{"verdict": "ok"}}), 0, true},
+	} {
+		got, _, err := confineKillReadiness(tc.output, name)
+		if (err != nil) != tc.fail {
+			t.Fatalf("%s: err=%v, want error=%v", tc.label, err, tc.fail)
+		}
+		if err == nil && got != tc.want {
+			t.Fatalf("%s: readiness=%s, want %s", tc.label, got, tc.want)
+		}
+	}
+	// What the poll's expiry means for each strongest state it saw.
+	for state, want := range map[confineReadiness]bool{
+		readinessUnlistable: false, readinessAbsent: false, readinessPending: true, readinessUnreadable: false, readinessEmpty: true,
+	} {
+		if got := readinessIsProductFailure(state); got != want {
+			t.Fatalf("expiry with strongest=%s: product failure=%v, want %v", state, got, want)
+		}
 	}
 }
 

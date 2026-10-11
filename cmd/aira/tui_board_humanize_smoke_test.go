@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aira/internal/daemon"
+	"aira/internal/testdeadline"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -52,18 +53,19 @@ func TestBoardHumanizeToggleSmoke(t *testing.T) {
 	screen := tcell.NewSimulationScreen("UTF-8")
 	// The factory is read at runtime construction, so it must be set BEFORE this.
 	runtime := newBoardRuntime(ctx, boardInfoDispatcher{}, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	keys := trackKeys(runtime, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
 	resizeBoardScreen(t, runtime, screen, 120, 56)
 	waitForSimulationText(t, runtime, screen, "AIRA-1")
-	screen.InjectKey(tcell.KeyRune, 'l', tcell.ModNone) // draft→planned selects AIRA-1
+	keys.press(t, runeKey('l')) // draft→planned selects AIRA-1
 	// The ORIGINAL body renders before any translation.
 	waitForSimulationText(t, runtime, screen, "BODYWORD")
 
 	// 't' shows the plain-English rewrite, labelled as an AI paraphrase.
-	screen.InjectKey(tcell.KeyRune, 't', tcell.ModNone)
+	keys.press(t, runeKey('t'))
 	shown := waitForSimulationText(t, runtime, screen, "REWRITTENBODY")
 	if !strings.Contains(shown, "plain-English (AI)") {
 		t.Fatalf("the plain view is not labelled as an AI paraphrase:\n%s", shown)
@@ -75,17 +77,16 @@ func TestBoardHumanizeToggleSmoke(t *testing.T) {
 	}
 
 	// Enter opens the expand overlay, which carries the same plain rewrite + label.
-	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	keys.press(t, specialKey(tcell.KeyEnter))
 	overlay := waitForSimulationText(t, runtime, screen, "Esc to close")
 	if !strings.Contains(overlay, "REWRITTENBODY") || !strings.Contains(overlay, "plain-English (AI)") {
 		t.Fatalf("the expand overlay did not carry the plain rewrite:\n%s", overlay)
 	}
-	screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	keys.press(t, specialKey(tcell.KeyEscape))
 
 	// 't' again restores the original — the owner's "original always one keystroke
 	// away".
-	screen.InjectKey(tcell.KeyRune, 't', tcell.ModNone)
+	keys.press(t, runeKey('t'))
 	back := waitForSimulationText(t, runtime, screen, "BODYWORD")
 	if strings.Contains(back, "REWRITTENBODY") {
 		t.Fatalf("a second 't' did not restore the original:\n%s", back)
@@ -97,7 +98,7 @@ func TestBoardHumanizeToggleSmoke(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("humanize smoke did not quit")
 	}
 }

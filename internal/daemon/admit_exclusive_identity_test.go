@@ -33,6 +33,7 @@ func exclusiveWireServer(t *testing.T) (*Server, string) {
 	maximum.Store(1 << 40)
 	server := admitTestServer(&maximum)
 	server.admitResolveSlice = func(string) (string, bool, string) { return slicePath, true, "" }
+	server.admitManualEvaluation = true
 	return server, slicePath
 }
 

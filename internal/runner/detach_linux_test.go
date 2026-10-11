@@ -1189,13 +1189,77 @@ func TestM20RealDetachedDup2MergeIsFaithfulAndCompleteAfterQuiesce(t *testing.T)
 	}
 }
 
+// lingerScope reports populated until Kill has been called and then for lingerReads
+// more Empty reads, modelling a cgroup.kill whose members take a few poll ticks to
+// leave. It is the kill-to-empty latency the real-cgroup test cannot control.
+type lingerScope struct {
+	members     []int
+	killed      bool
+	lingerReads int
+}
+
+func (s *lingerScope) Reference() string       { return "/linger-scope" }
+func (s *lingerScope) FD() int                 { return -1 }
+func (s *lingerScope) Members() ([]int, error) { return append([]int(nil), s.members...), nil }
+func (s *lingerScope) Empty() (bool, error) {
+	if !s.killed {
+		return false, nil
+	}
+	if s.lingerReads > 0 {
+		s.lingerReads--
+		return false, nil
+	}
+	return true, nil
+}
+func (s *lingerScope) Terminate([]int) error { return nil }
+func (s *lingerScope) Kill() error           { s.killed = true; return nil }
+func (s *lingerScope) Remove() error         { return nil }
+
+// The emptiness confirmation after the forced kill has its own bound, separate from
+// the grace the natural-quiesce wait uses. With r.grace at 1ns and a scope that takes
+// three poll ticks to empty after the kill, only a confirmation bounded by
+// forcedQuiesceConfirmBound succeeds; one bounded by r.grace reports U_RUN_CAPTURE_INCOMPLETE.
+func TestForcedQuiesceConfirmationUsesItsOwnBound(t *testing.T) {
+	scope := &lingerScope{members: []int{44}, lingerReads: 3}
+	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, Grace: time.Nanosecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.grace = time.Nanosecond
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, Detached: true, CgroupScope: scope.Reference(), ScopeIntegrity: ScopeContained, OutputRefs: map[string]OutputRef{}}
+	appendRunEvent(t, r, "starting", run)
+	zero := 0
+	if err := r.appendDetachedLeaderExit(run.ID, &zero, ""); err != nil {
+		t.Fatal(err)
+	}
+	result, forceErr := r.forceDetachedQuiesce(context.Background(), run.ID, run, scope)
+	if result != nil || forceErr != nil {
+		t.Fatalf("forced quiesce result=%+v err=%v", result, forceErr)
+	}
+	current, err := r.ledger.current(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.QuiesceForced || !current.ScopeKill.Completed {
+		t.Fatalf("forced quiesce was not recorded as completed: %+v", current)
+	}
+	if got, want := current.ScopeKill.GraceMS, r.grace.Milliseconds(); got != want {
+		t.Fatalf("GraceMS=%d, want the pre-kill grace %d", got, want)
+	}
+}
+
 func TestM20RealForcedQuiescePreservesLeaderExitAndIsNotClean(t *testing.T) {
 	r := realRunner(t)
+	// r.grace is the wait that must EXPIRE so the forced quiesce runs (a negative
+	// wait: contention only makes it more certain). The emptiness confirmation after
+	// the forced kill is a different role, a backstop that must NOT expire, so it runs
+	// on the product's own forcedQuiesceConfirmBound (2s): kill-to-empty measured p99
+	// 100.8 ms, max 240 ms on 2 CPUs under load, inside a 100 ms grace's tail.
 	r.grace = 100 * time.Millisecond
 	_, result := startRealDetached(t, r, Request{Argv: []string{"/bin/sh", "-c", "sleep 30 & exit 0"}, Merge: true})
 	outcome := <-result
 	if outcome.err != nil || outcome.record == nil {
-		t.Fatalf("detach outcome=%+v", outcome)
+		t.Fatalf("detach outcome: err=%v record=%+v", outcome.err, outcome.record)
 	}
 	record := outcome.record
 	// The leader (sh) exited 0 while a real descendant (sleep) lingered and was
