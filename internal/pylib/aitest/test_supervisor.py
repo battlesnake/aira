@@ -3647,7 +3647,7 @@ def _worker_scope(tmp_path, name, peak=None, oom_group_kill=None):
     return scope
 
 
-def _retirable_state(scope, memory_max=104857600):
+def _retirable_state(scope, memory_max="104857600"):
     """The narrowest worker state _retire_worker will accept, with a grant."""
     dispatch_read, dispatch_write = os.pipe()
     result_read, result_write = os.pipe()
@@ -3700,9 +3700,46 @@ def test_a_scope_already_gone_records_nothing(tmp_path):
     not a zero."""
     scope = tmp_path / "already-gone"
     supervisor = Supervisor()
-    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": 104857600})
+    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": "104857600"})
     assert supervisor._pool_peak_max is None
     assert supervisor._pool_peak_samples == 0
+
+
+def test_string_memory_max_from_a_real_grant_sets_the_pool_budget(tmp_path):
+    """AIRA-231. A REAL enforced grant carries memory_max as a STRING (the
+    worker-admit outcome parser stores every field as a string). The gauge used to
+    check isinstance(..., int), so on a real run _pool_budget stayed None and the
+    budget never reached confine-report. The fixtures were int, which is why no
+    test noticed."""
+    scope = _worker_scope(tmp_path, "worker-string", peak=300 * 1024 * 1024)
+    supervisor = Supervisor()
+    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": "104857600"})
+    assert supervisor._pool_budget == 104857600
+    # Padding is tolerated, and the LARGEST per-worker cap still wins.
+    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": " 209715200\n"})
+    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": "52428800"})
+    assert supervisor._pool_budget == 209715200
+    # An int (some fixtures) still converts.
+    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": 314572800})
+    assert supervisor._pool_budget == 314572800
+
+
+def test_unparseable_or_non_positive_memory_max_never_fabricates_a_budget(tmp_path, monkeypatch):
+    """AIRA-231. None means "could not be established": an unreadable cap leaves
+    the gauge absent (never a fabricated 0) and the measurement record's cap None."""
+    measure_dir = tmp_path / "measure"
+    measure_dir.mkdir()
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure_dir))
+    scope = _worker_scope(tmp_path, "worker-bad-cap", peak=300 * 1024 * 1024)
+    supervisor = Supervisor()
+    for bad in ("abc", "", None, "0", "-5"):
+        supervisor._observe_worker_usage({"scope": str(scope), "memory_max": bad})
+    assert supervisor._pool_budget is None
+    caps = [record["memory_max"] for record in supervisor._pool_peak_records]
+    assert caps == [None, None, None, 0, -5]
+    supervisor._observe_worker_usage({"scope": str(scope), "memory_max": "104857600"})
+    assert supervisor._pool_budget == 104857600
+    assert supervisor._pool_peak_records[-1]["memory_max"] == 104857600
 
 
 def test_retire_worker_records_pool_peak_on_the_recycle_and_stop_paths_too(tmp_path):

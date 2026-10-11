@@ -21,7 +21,7 @@ The obvious way to keep a backlog in a repo — a `BACKLOG.md`, or a counter fil
 AIRA sidesteps this by not sharing a file to fight over. Adopt a repo and it becomes the authority for tickets and their IDs: each ticket is its own markdown file (`.aira/tickets/FOO-42.md`), so two agents on different tickets never touch the same file. IDs are handed out atomically by a machine-local allocator — not an in-repo counter — so two sessions can't land on the same one, even from separate worktrees. Human-readable indexes like a backlog or roadmap are rendered on demand and never committed, so they can't merge-conflict. The database is only an index; the git files are the truth, and it rebuilds itself from them. Already tracking a backlog elsewhere? `aira import` pulls it in.
 
 ```sh
-aira init                                   # adopt this repo
+aira init --prefixes FOO                    # adopt this repo (FOO: your ID prefix)
 aira create "Fix the parser" --kind bug --severity P1
 aira list --by status                       # what's open, grouped
 aira grep "parser"                          # full-text search across tickets

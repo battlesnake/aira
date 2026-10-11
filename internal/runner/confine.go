@@ -1037,6 +1037,26 @@ func FormatConfineBytes(value int64) string {
 	return strconv.FormatInt(value, 10)
 }
 
+// FormatConfineMegabytes renders a byte quantity in whole MiB, rounded to the
+// nearest (half up), as "<n>M"; "0M" for a non-positive value. It is the ONE unit
+// the owner chose for at-a-glance comparison of live figures (`aira top`, and the
+// admission-wait line since AIRA-193): live cgroup, ledger and RSS readings are
+// essentially never round in any unit, so FormatConfineBytes -- exact units, raw
+// bytes otherwise, right for a trailer's cap= and peak-rss= facets -- mostly prints
+// an eleven-digit integer there. The rounding is overflow-safe: quotient and
+// remainder, never value+mib/2.
+func FormatConfineMegabytes(value int64) string {
+	if value <= 0 {
+		return "0M"
+	}
+	const mib = int64(1) << 20
+	q, r := value/mib, value%mib
+	if r >= mib/2 {
+		q++
+	}
+	return strconv.FormatInt(q, 10) + "M"
+}
+
 // FormatConfineStatus is the single operator-facing honesty projection.
 func FormatConfineStatus(status ConfineStatus) string {
 	capFacet := status.Cap

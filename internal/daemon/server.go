@@ -70,6 +70,12 @@ type Server struct {
 	// reached Register and failed. Retrying those entries would append another
 	// registry breadcrumb on every discovery pass.
 	discoveryFailed map[string]struct{}
+	// discoverySkipLogged remembers, per (worktree id, root) key, the last skip
+	// reason text printed, so a persistent skip logs once per change of reason
+	// instead of once per pass (AIRA-209). discoveryLastSummary is the last
+	// (discovered, registered, skipped) triple printed. Both guarded by mu.
+	discoverySkipLogged  map[string]string
+	discoveryLastSummary [3]int
 	// stopping closes when Serve stops accepting. Watch handlers observe it
 	// directly so their terminal event drain remains distinct from peer-close.
 	stopping           chan struct{}

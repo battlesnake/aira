@@ -711,14 +711,14 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 				// the precise daemon-side "held on: vram" attribution is deferred.
 				vramNote := ""
 				if request.VRAMBytes > 0 {
-					vramNote = ", declared VRAM " + FormatConfineBytes(request.VRAMBytes)
+					vramNote = ", declared VRAM " + FormatConfineMegabytes(request.VRAMBytes)
 				}
 				if pinned {
 					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s%s, waited %ds%s)\n",
-						sliceName, FormatConfineBytes(reserve), vramNote, waited, queueNote)
+						sliceName, FormatConfineMegabytes(reserve), vramNote, waited, queueNote)
 				} else {
 					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s%s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds%s)\n",
-						sliceName, FormatConfineBytes(reserve), vramNote, waited, queueNote)
+						sliceName, FormatConfineMegabytes(reserve), vramNote, waited, queueNote)
 				}
 			}
 		}
@@ -1418,6 +1418,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// AIRA-264. A run whose WORKLOAD failed must not teach the estimator: only an
 	// OOM (kept, drives self-heal) or a clean success is a trustworthy peak
 	// sample. See shouldRecordConfinePeak.
+	// AIRA-217. The OOM advisory may say the kill was recorded only when the daemon
+	// ACKNOWLEDGED this report: ReportPeakSample returns nil only on the daemon's OK
+	// reply, sent after the sample commits. An error means "unconfirmed" (the daemon
+	// commits before it replies, so a lost reply follows a persisted sample), and no
+	// signature means no report was attempted.
+	peakAcknowledged := false
 	if signature != "" && shouldRecordConfinePeak(oom, termination, terminatedBySignal, exitCode) {
 		reportCtx, cancelReport := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		// AIRA-180. The budget term travels with the sample. Before this, the
@@ -1428,10 +1434,10 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// unevaluable. Read off result.Status rather than re-derived, so the
 		// reported budget is the same number the trailer prints.
 		budget, budgetBasis := ConfineBudgetTerm(result.Status)
-		_ = deps.reportPeak(reportCtx, request, ConfinePeakReport{
+		peakAcknowledged = deps.reportPeak(reportCtx, request, ConfinePeakReport{
 			Signature: signature, Peak: usage.PeakRSS, OOM: oom,
 			Budget: budget, BudgetBasis: budgetBasis,
-		})
+		}) == nil
 		cancelReport()
 	}
 	close(monitorStop)
@@ -1503,7 +1509,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// before this job launched (and a launch precondition, so it is set on every
 	// path that can reach a kill here) -- deliberately not ScopeMemoryMax, which is
 	// this job's own cap and is already the advisory's first argument.
-	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, confineOwnCapAdviceWarranted(usage), result.Status.ScopeMemoryCapSource, result.Status.CapBytes); advisory != "" {
+	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, confineOwnCapAdviceWarranted(usage), result.Status.ScopeMemoryCapSource, result.Status.CapBytes, peakAcknowledged); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
 	// The remaining attributions get their OWN line, deliberately NOT gated on
@@ -1687,7 +1693,7 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 // Whether the identical re-run is itself refused is admission's to decide and
 // not this client's to assert — see the branch's own comment for why the two
 // conditions are not the same one.
-func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool, capSource string, sliceCapBytes int64) string {
+func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool, capSource string, sliceCapBytes int64, peakAcknowledged bool) string {
 	if scopeMemoryMax <= 0 {
 		return ""
 	}
@@ -1695,6 +1701,12 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 	if peakRSS != nil {
 		peak = FormatConfineBytes(*peakRSS)
 	}
+	// recorded: the daemon acknowledged a report that carried a known, positive
+	// peak -- the only record admission escalates from (RecordConfinePeak stores an
+	// OOM with an unknown peak as NULL, and admit.go escalates only from
+	// MaxOOMPeak > 0). Even then the next run is NOT promised a higher reserve: the
+	// escalation can be clamped to the slice's fit or refused E_ADMIT_TOO_LARGE.
+	recorded := peakAcknowledged && peakRSS != nil && *peakRSS > 0
 	if oom {
 		head := fmt.Sprintf("confine: job OOM-killed at its memory cap %s (peak RSS %s)", FormatConfineBytes(scopeMemoryMax), peak)
 		switch capSource {
@@ -1742,9 +1754,15 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 				// ledger has granted -- so it states the condition and leaves the
 				// verdict to admission, which announces it in its own words and names
 				// both numbers when it does refuse.
-				return estimate + ", but the pin AIRA would otherwise suggest — 1.5x this run's own figure, " +
+				overCeiling := estimate + ", but the pin AIRA would otherwise suggest — 1.5x this run's own figure, " +
 					FormatConfineBytes(suggested) + " — is at or above this slice's own cap of " + FormatConfineBytes(sliceCapBytes) +
-					", so no pin is offered. The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL " +
+					", so no pin is offered. "
+				if !recorded {
+					// Never names a pin (the AIRA-184 BLOCK), and claims neither recorded nor not-recorded.
+					return overCeiling + "AIRA could not confirm that this kill was recorded with its peak, so automatic resizing is " +
+						"unevaluated: run aira confine --budget to see what was recorded; split heavy work, or run where the slice is larger."
+				}
+				return overCeiling + "The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL " +
 					"COMMAND — admission sizes the next run itself, fitting it under this slice's cap where the recorded peak " +
 					"leaves room, and refusing it E_ADMIT_TOO_LARGE (naming both required and cap_minus_headroom) only where " +
 					"that peak is already at what this slice can give. Split heavy work, or run where the slice is larger, " +
@@ -1765,13 +1783,19 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 				room = ", and this slice's own cap is " + FormatConfineBytes(sliceCapBytes) +
 					", so what bound this job was the estimate and not the slice ceiling"
 			}
-			return estimate + room + ". The kill is now recorded against this command's signature: RE-RUN THE IDENTICAL COMMAND " +
-				"and the next admission is sized higher on its own, or pin --memory-reserve " + FormatConfineBytes(suggested) +
-				" now to skip the cycle. If an identical re-run is killed at the same cap again, that is a genuine bug worth reporting."
+			if !recorded {
+				return estimate + room + ". AIRA could not confirm that this kill was recorded with its peak against the command's " +
+					"signature, so do not rely on the next admission being sized from it: run aira confine --budget to see what was " +
+					"recorded, or pin --memory-reserve " + FormatConfineBytes(suggested) + " to size the re-run yourself."
+			}
+			return estimate + room + ". The kill and its peak are recorded against this command's signature: RE-RUN THE IDENTICAL COMMAND " +
+				"and admission sizes the next run from that record on its own, or pin --memory-reserve " + FormatConfineBytes(suggested) +
+				" now to skip the cycle. If an identical re-run is admitted at the same cap and killed again, that is a genuine bug worth reporting."
 		default:
 			return head + "; cap-source=" + ConfineCapSourceUnevaluated + " — where this cap came from could not be established. " +
-				"If you set --memory-max/--memory-reserve yourself, raise it; if AIRA estimated it, re-running the identical " +
-				"command admits at a higher reserve. Either way, splitting heavy work also helps."
+				"If you set --memory-max/--memory-reserve yourself, raise it; if AIRA estimated it, run aira confine --budget " +
+				"to see whether this kill was recorded against the command, which is what lets admission size an identical " +
+				"re-run from it. Either way, splitting heavy work also helps."
 		}
 	}
 	// Overflow-safe threshold: never multiply a byte count that the input domain

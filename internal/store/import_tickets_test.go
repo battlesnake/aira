@@ -684,3 +684,68 @@ func TestRequirementVerbsCanonicalizeUnderNamespacing(t *testing.T) {
 		t.Fatalf("finding requirement id stored = %q; want FEE-VR-1", rows[0].Finding.RequirementID)
 	}
 }
+
+// verifies: AIRA-175 -- `check` decides "this allocated ID has a ticket file" from the
+// path recorded for the allocation, which can point into whichever worktree a
+// rebuild scanned last. The report was that deleting that worktree fails the check
+// although the file is in the checkout being checked. It does not reproduce:
+// Check runs Rebuild first, and Rebuild re-points a still-`allocated` row at the
+// scanned file. This is the permanent pin of that behaviour; it fails if the
+// re-point UPDATE in Rebuild is removed.
+func TestCheckResolvesAnAllocatedIDFromTheCheckingWorktreeAfterTheRecordedOneIsRemoved(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := namespacedStoreSharing(t, base, "wt-a", "FEE", "BL")
+	b := namespacedStoreSharing(t, base, "wt-b", "FEE", "BL")
+	c := namespacedStoreSharing(t, base, "wt-c", "FEE", "BL")
+
+	if _, err := a.AllocateID(ctx, "BL"); err != nil {
+		t.Fatalf("AllocateID: %v", err)
+	}
+	if _, err := b.ImportTicketsBytes(ctx, []byte(`{"id":"BL-1","title":"adopted","status":"planned","kind":"chore","severity":"P2","body":"b"}`), true, nil); err != nil {
+		t.Fatalf("B materialise: %v", err)
+	}
+	_, bFile, ok := allocationRow(t, b, "FEE-BL", 1)
+	if !ok || !strings.Contains(bFile, filepath.Join("wt-b", ".aira")) {
+		t.Fatalf("allocation row for FEE-BL-1 = %q ok=%v, want a path in wt-b", bFile, ok)
+	}
+	// C holds a copy of the file, as a checkout of the same branch would.
+	data, err := os.ReadFile(bFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cFile := filepath.Join(c.root, ".aira", "tickets", "FEE-BL-1.md")
+	if err := os.MkdirAll(filepath.Dir(cFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cFile, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Force the stale shape the report describes: still `allocated`, pointing at B.
+	if _, err := b.db.Exec(`UPDATE allocations SET state='allocated', path=? WHERE project_id=? AND prefix=? AND number=?`,
+		bFile, b.projectID, "FEE-BL", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(b.root); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := c.Check(ctx)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	for _, f := range report.Findings {
+		if f.Code == "E_ID_UNRESOLVED" {
+			t.Fatalf("Check reports E_ID_UNRESOLVED for a file present in the checking worktree: %+v", f)
+		}
+	}
+	if got := report.Dimensions["allocated-id-file"]; got != "pass" {
+		t.Fatalf("allocated-id-file = %q, want pass: %v", got, report.Dimensions)
+	}
+	if _, path, ok := allocationRow(t, c, "FEE-BL", 1); !ok || path != cFile {
+		t.Fatalf("allocation path after Check = %q ok=%v, want re-pointed to C's file %q", path, ok, cFile)
+	}
+}

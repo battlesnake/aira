@@ -2,12 +2,16 @@
 
 ## Adopt a project
 
-Run `aira init` in a Git worktree. For a new project, optionally choose its
-slug and ticket prefixes:
+Run `aira init` in a Git worktree. A new project must name at least one ticket
+prefix (`--prefix DEMO`, repeatable, or `--prefixes A,B`); its slug is optional:
 
 ```sh
 aira init --project demo --prefix DEMO
 ```
+
+A bare `aira init` on a new project is refused rather than defaulted: prefixes
+are exclusive across every project on this machine, so AIRA never picks one for
+you.
 
 If the repository already contains committed `.aira/` files, `aira init`
 adopts that record instead of replacing it. It validates the committed config,

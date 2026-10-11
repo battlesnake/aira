@@ -647,3 +647,26 @@ func readShimRecord(t *testing.T, d installDeps) runner.InstallModeRecord {
 }
 
 var _ = fmt.Sprintf
+
+// verifies: AIRA-227 -- `aira install` as root with no sudo identity (the
+// `docker build` default) said only "run 'sudo aira install' from an active login
+// session", which is useless inside a container; it must also name the shim door.
+func TestRootInstallWithoutSudoIdentityNamesTheCIShimRemedy(t *testing.T) {
+	d, state := newFakeInstall(t)
+	d.geteuid = func() int { return 0 }
+	d.getenv = func(name string) string {
+		if name == "SUDO_USER" || name == "SUDO_UID" || name == "SUDO_GID" {
+			return ""
+		}
+		return installTestEnv(state, name)
+	}
+	_, err := validateSudoIdentity(d)
+	if err == nil {
+		t.Fatal("validateSudoIdentity accepted a root install with no sudo identity")
+	}
+	for _, want := range []string{"sudo aira install", "active login session", "--ci=shim", "--ci=auto"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error does not mention %q: %v", want, err)
+		}
+	}
+}

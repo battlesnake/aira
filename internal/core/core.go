@@ -2436,7 +2436,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 
 func applyDispatchMetadata(verbs map[string]verbSpec) {
 	metadata := map[string]verbMetadata{
-		"init":   {summary: "Initialise AIRA for the current project", safety: SafetyReconcile, example: []string{"--project", "demo", "--prefix", "AIRA"}},
+		"init":   {summary: "Initialise AIRA for the current project", safety: SafetyReconcile, example: []string{"--project", "demo", "--prefix", "DEMO"}},
 		"eject":  {summary: "Deregister a project after durability and live-state checks", safety: SafetyReconcile, destructive: true, example: []string{"--prefix", "AIRA", "--force"}},
 		"id":     {summary: "Allocate the next ticket identifier", safety: SafetyMutate, example: []string{"AIRA"}},
 		"create": {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},

@@ -97,13 +97,13 @@ func TestConfineAdmissionWaitLineCarriesTheQueuePosition(t *testing.T) {
 	// "queued ahead", not "reserved ahead": the figure counts the queued
 	// waiters in front, NOT the much larger reserve already granted to running
 	// jobs. Build review found the looser wording invited exactly that misread.
-	if !strings.Contains(got, "8G queued ahead") {
+	if !strings.Contains(got, "8192M queued ahead") {
 		t.Fatalf("progress line does not state the reserve queued ahead; stderr=%q", got)
 	}
 	if strings.Contains(got, "reserved ahead") {
 		t.Fatalf("the ahead-figure must not read as all reserve ahead of the job; stderr=%q", got)
 	}
-	if !strings.Contains(got, "reserve 4G") {
+	if !strings.Contains(got, "reserve 4096M") {
 		t.Fatalf("the existing pinned wording must survive; stderr=%q", got)
 	}
 	if asked.Load() == 0 {
@@ -123,7 +123,7 @@ func TestConfineAdmissionWaitLineKeepsTheUnpinnedHedgeWithAPosition(t *testing.T
 		return confineQueuePosition{position: 1, queued: 4, aheadBytes: 0}, true
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{})
-	if !strings.Contains(got, "unpinned") || !strings.Contains(got, "requested reserve 4G") {
+	if !strings.Contains(got, "unpinned") || !strings.Contains(got, "requested reserve 4096M") {
 		t.Fatalf("unpinned hedge lost; stderr=%q", got)
 	}
 	if !strings.Contains(got, "queue position 1 of 4") {
@@ -131,7 +131,7 @@ func TestConfineAdmissionWaitLineKeepsTheUnpinnedHedgeWithAPosition(t *testing.T
 	}
 	// Head of the queue: nothing is ahead, and that is a fact worth stating as
 	// 0B rather than omitting, since the absent case means something else.
-	if !strings.Contains(got, "0B queued ahead") {
+	if !strings.Contains(got, "0M queued ahead") {
 		t.Fatalf("head-of-queue line must state an empty ahead-figure; stderr=%q", got)
 	}
 }
@@ -152,7 +152,7 @@ func TestConfineAdmissionWaitLineOmitsAnUnestablishedPosition(t *testing.T) {
 		return confineQueuePosition{}, false
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
-	if !strings.Contains(got, "confine: waiting for memory admission on finite.slice (reserve 4G, waited ") {
+	if !strings.Contains(got, "confine: waiting for memory admission on finite.slice (reserve 4096M, waited ") {
 		t.Fatalf("the daemon-less line must be exactly the pre-AIRA-24 line; stderr=%q", got)
 	}
 	if strings.Contains(got, "queue position") || strings.Contains(got, "queued ahead") {
@@ -306,14 +306,14 @@ func TestConfineAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{})
 	// The head-of-queue reading that misled four sessions, now with the other
 	// population beside it.
-	if !strings.Contains(got, "queue position 1 of 9 by enqueue order, 0B queued ahead, 52G already granted across 9 admitted jobs / 64G slice ceiling") {
+	if !strings.Contains(got, "queue position 1 of 9 by enqueue order, 0M queued ahead, 53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 		t.Fatalf("progress line does not put the queued and the granted populations side by side; stderr=%q", got)
 	}
 	// The printed figure is the unpinned hint (4G); the daemon is gating on 35G.
-	if !strings.Contains(got, "requested reserve 4G") {
+	if !strings.Contains(got, "requested reserve 4096M") {
 		t.Fatalf("the AIRA-51 hedge must survive; stderr=%q", got)
 	}
-	if !strings.Contains(got, "this job's own reserve resolves to 35G") {
+	if !strings.Contains(got, "this job's own reserve resolves to 35840M") {
 		t.Fatalf("the unpinned line must name the reserve the daemon actually resolved; stderr=%q", got)
 	}
 }
@@ -338,13 +338,13 @@ func TestConfineAdmissionWaitLineDoesNotRepeatAPinnedReserve(t *testing.T) {
 		}, true
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
-	if !strings.Contains(got, "reserve 4G, waited ") {
+	if !strings.Contains(got, "reserve 4096M, waited ") {
 		t.Fatalf("the pinned wording must survive; stderr=%q", got)
 	}
 	if strings.Contains(got, "this job's own reserve") {
 		t.Fatalf("a pinned figure already on the line must not be restated; stderr=%q", got)
 	}
-	if !strings.Contains(got, "52G already granted across 9 admitted jobs / 64G slice ceiling") {
+	if !strings.Contains(got, "53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 		t.Fatalf("the AIRA-181 clause must still be rendered; stderr=%q", got)
 	}
 }
@@ -375,10 +375,10 @@ func TestShimAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing.T)
 		if !strings.Contains(got, "waiting for advisory memory admission") {
 			t.Fatalf("the shim's own wait line was never printed; stderr=%q", got)
 		}
-		if !strings.Contains(got, "0B queued ahead, 52G already granted across 9 admitted jobs / 64G slice ceiling") {
+		if !strings.Contains(got, "0M queued ahead, 53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 			t.Fatalf("the shim line does not name the admitted jobs' held reserve; stderr=%q", got)
 		}
-		if !strings.Contains(got, "this job's own reserve resolves to 35G") {
+		if !strings.Contains(got, "this job's own reserve resolves to 35840M") {
 			t.Fatalf("the shim line does not name the resolved reserve; stderr=%q", got)
 		}
 	})
@@ -387,13 +387,13 @@ func TestShimAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing.T)
 		// reserve in hand the clause is suppressed, and with anything else — 0
 		// included — it says "resolves to 4G" beside a line that already says 4G.
 		got := waitForConfineDiagnostic(t, shimDeps(4<<30), ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
-		if !strings.Contains(got, "reserve 4G, waited ") {
+		if !strings.Contains(got, "reserve 4096M, waited ") {
 			t.Fatalf("the shim's pinned wording must survive; stderr=%q", got)
 		}
 		if strings.Contains(got, "this job's own reserve") {
 			t.Fatalf("a pinned figure already on the shim line must not be restated; stderr=%q", got)
 		}
-		if !strings.Contains(got, "52G already granted across 9 admitted jobs / 64G slice ceiling") {
+		if !strings.Contains(got, "53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 			t.Fatalf("the AIRA-181 clause must still be rendered on the shim line; stderr=%q", got)
 		}
 	})

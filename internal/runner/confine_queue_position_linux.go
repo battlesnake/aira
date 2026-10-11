@@ -190,7 +190,7 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 		case "system-pressure":
 			pressure = ", slice ceiling reduced to keep the configured system free-memory reserve"
 			if position.memAvailable > 0 {
-				pressure += " (system MemAvailable " + FormatConfineBytes(position.memAvailable) + ")"
+				pressure += " (system MemAvailable " + FormatConfineMegabytes(position.memAvailable) + ")"
 			}
 		case "machine-reserve":
 			pressure = ", slice ceiling reduced to keep the configured share of this machine outside the slice"
@@ -202,12 +202,9 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 		return pressure + exclusiveNote
 	}
 	// A known-zero ahead-figure is the head of the queue and must read as the
-	// fact it is; FormatConfineBytes renders any non-positive value as
-	// "unknown", which is the one thing this is not.
-	ahead := "0B"
-	if position.aheadBytes > 0 {
-		ahead = FormatConfineBytes(position.aheadBytes)
-	}
+	// fact it is: FormatConfineMegabytes renders it "0M", where
+	// FormatConfineBytes would say "unknown", which is the one thing this is not.
+	ahead := FormatConfineMegabytes(position.aheadBytes)
 	// Two words earn their place here. "enqueue order" because the daemon's
 	// fairness duty cycle can backfill a smaller waiter ahead of a stuck head,
 	// so this is a place in the evaluation order and not a promise of being
@@ -235,48 +232,31 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 // carried the position, so this costs no round trip.
 //
 // It prints nothing at all when the daemon did not establish the pair. A zero
-// it DID establish is printed as "0B ... across 0 admitted jobs", because on a
+// it DID establish is printed as "0M ... across 0 admitted jobs", because on a
 // slice that is closed for some other reason — a drain, a fairness freeze, a
 // ceiling collapsed by outside pressure — an empty running set is the single
 // most useful thing the line can say, and suppressing it would leave the
 // operator with the same "nothing is blocking me" reading this clause exists to
 // end.
 //
-// ACCEPTED GAP, stated rather than left for a reader to discover. Both figures
-// go through FormatConfineBytes, which picks whichever of T/G/M/K divides the
-// value EXACTLY and otherwise prints raw bytes. A granted total is a sum of live
-// ledger charges and is essentially never round in any unit, so this clause
-// routinely renders as an eleven-digit integer beside a rounded ceiling —
-// verified live: "54116871208 already granted across 5 admitted jobs / 52608M
-// slice ceiling". That still fixes what AIRA-181 is about (the blocker is now
-// NAMED, where before the line said only "0B queued ahead"), but it makes the
-// magnitude comparison harder than it should be on a line whose whole purpose is
-// being read at a glance.
-//
-// It is deliberately not fixed here. The remedy is the one the owner already
-// chose for the same problem on `aira top` — one fixed unit, rounded
-// (topFormatMegabytes, cmd/aira/tui_top.go) — and applying it to this line means
-// also moving AIRA-24's existing "queued ahead" figure, since two unit systems
-// in one sentence would be worse than either. That is a decision about what unit
-// the admission-wait line speaks, not part of the reporting these two tickets
-// asked for, so it is filed rather than smuggled in. See AIRA-193.
+// Every byte figure on this line is whole MiB (FormatConfineMegabytes, the unit
+// `aira top` uses), so the granted total, the ceiling and the queued-ahead figure
+// compare at a glance (AIRA-193). An ESTABLISHED zero reads "0M"; an unestablished
+// figure is omitted, never printed as zero.
 func confineHeldNote(position confineQueuePosition) string {
 	if !position.heldEstablished {
 		return ""
 	}
-	held := "0B"
-	if position.heldBytes > 0 {
-		held = FormatConfineBytes(position.heldBytes)
-	}
+	held := FormatConfineMegabytes(position.heldBytes)
 	jobs := "jobs"
 	if position.heldJobs == 1 {
 		jobs = "job"
 	}
 	note := fmt.Sprintf(", %s already granted across %d admitted %s", held, position.heldJobs, jobs)
 	// A ceiling that could not be established is left out rather than printed as
-	// "0B", which would state that the slice can admit nothing.
+	// "0M", which would state that the slice can admit nothing.
 	if position.ceilingBytes > 0 {
-		note += " / " + FormatConfineBytes(position.ceilingBytes) + " slice ceiling"
+		note += " / " + FormatConfineMegabytes(position.ceilingBytes) + " slice ceiling"
 	}
 	return note
 }
@@ -318,12 +298,12 @@ func confineOwnReserveNote(position confineQueuePosition, clientReserve int64) s
 	}
 	if position.ceilingBytes > 0 && position.resolvedReserve > position.ceilingBytes {
 		return fmt.Sprintf(", this job's own reserve %s %s — larger than the whole %s slice ceiling, so it is blocked by its own size and not by the jobs ahead of it; pin a smaller --memory-reserve",
-			verb, FormatConfineBytes(position.resolvedReserve), FormatConfineBytes(position.ceilingBytes))
+			verb, FormatConfineMegabytes(position.resolvedReserve), FormatConfineMegabytes(position.ceilingBytes))
 	}
 	if position.resolvedReserve == clientReserve {
 		return ""
 	}
-	return fmt.Sprintf(", this job's own reserve %s %s", verb, FormatConfineBytes(position.resolvedReserve))
+	return fmt.Sprintf(", this job's own reserve %s %s", verb, FormatConfineMegabytes(position.resolvedReserve))
 }
 
 // describeExclusiveJob names the exclusive job for the progress line. An unnamed

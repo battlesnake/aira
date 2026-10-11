@@ -271,7 +271,7 @@ func TestConfineQueueNoteReportsAReducedCeilingOnlyWhenEnforced(t *testing.T) {
 	}{
 		{
 			name: "enforced-throttle", mode: "enforce", state: "throttled", basis: "system-pressure", memAvailable: 6 << 30,
-			want: "slice ceiling reduced to keep the configured system free-memory reserve (system MemAvailable 6G)",
+			want: "slice ceiling reduced to keep the configured system free-memory reserve (system MemAvailable 6144M)",
 		},
 		{
 			name: "enforced-throttle-without-a-reading", mode: "enforce", state: "throttled", basis: "system-pressure",
@@ -340,7 +340,7 @@ func queueNoteFor(t *testing.T, clientReserve int64, reserve *ConfineSliceReserv
 	return confineQueueNote(ctx, deps, request, "/slice", clientReserve, make(chan struct{}))
 }
 
-// AIRA-181. At the head of the queue "0B queued ahead" is true by definition and
+// AIRA-181. At the head of the queue "0M queued ahead" is true by definition and
 // says nothing about what is actually blocking the job — the reserve already
 // GRANTED to the admitted jobs, which is a different population entirely. Four
 // independent sessions read the head-of-queue line as "nothing is blocking me"
@@ -360,16 +360,16 @@ func TestConfineQueueNoteNamesTheReserveHeldByAdmittedJobs(t *testing.T) {
 		Queued: 9, QueuePosition: 1, QueuedAheadBytes: 0,
 		GrantedBytes: 52 << 30, Jobs: 9, CeilingBytes: 64 << 30, GrantedEstablished: true,
 	})
-	if !strings.Contains(note, "queue position 1 of 9 by enqueue order, 0B queued ahead") {
+	if !strings.Contains(note, "queue position 1 of 9 by enqueue order, 0M queued ahead") {
 		t.Fatalf("note=%q, want the AIRA-24 queue clause unchanged", note)
 	}
-	if !strings.Contains(note, "52G already granted across 9 admitted jobs / 64G slice ceiling") {
+	if !strings.Contains(note, "53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 		t.Fatalf("note=%q, want the running set's held reserve, its job count and the ceiling", note)
 	}
 	// The whole failure being fixed is one population being read as the other.
 	// The two figures must never share a label: a line that said "52G queued
 	// ahead" or "0B granted" would be worse than the line it replaced.
-	if strings.Contains(note, "52G queued ahead") || strings.Contains(note, "0B already granted") {
+	if strings.Contains(note, "53248M queued ahead") || strings.Contains(note, "0M already granted") {
 		t.Fatalf("note=%q, the queued and granted populations must not be confused", note)
 	}
 	if strings.Contains(note, "reserved ahead") {
@@ -378,7 +378,7 @@ func TestConfineQueueNoteNamesTheReserveHeldByAdmittedJobs(t *testing.T) {
 }
 
 // The false-fail direction. A held figure the daemon did not establish must
-// print NOTHING: a fabricated "0B already granted across 0 admitted jobs" on a
+// print NOTHING: a fabricated "0M already granted across 0 admitted jobs" on a
 // slice that is in fact full would state the exact opposite of the truth, and
 // would be the same class of defect as the misreading this ticket fixes — only
 // now asserted by AIRA itself rather than inferred by a reader.
@@ -414,7 +414,7 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
 			Queued: 2, QueuePosition: 1, GrantedBytes: 8 << 30, Jobs: 2, CeilingBytes: 0, GrantedEstablished: true,
 		})
-		if !strings.Contains(note, "8G already granted across 2 admitted jobs") {
+		if !strings.Contains(note, "8192M already granted across 2 admitted jobs") {
 			t.Fatalf("note=%q, an unreadable ceiling must not suppress the held reserve", note)
 		}
 		if strings.Contains(note, "slice ceiling") {
@@ -430,7 +430,7 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
 			Queued: 1, QueuePosition: 1, GrantedBytes: 0, Jobs: 0, CeilingBytes: 64 << 30, GrantedEstablished: true,
 		})
-		if !strings.Contains(note, "0B already granted across 0 admitted jobs / 64G slice ceiling") {
+		if !strings.Contains(note, "0M already granted across 0 admitted jobs / 65536M slice ceiling") {
 			t.Fatalf("note=%q, an established empty running set is a fact and must be stated", note)
 		}
 	})
@@ -439,7 +439,7 @@ func TestConfineQueueNoteWithholdsAnUnestablishedHeldReserve(t *testing.T) {
 		// for the slice at all (a fresh/restarted daemon before its first admission,
 		// or a long-idle slice whose queue was pruned) -- distinct from the
 		// established-empty case above. The fabricated 0/0 must be WITHHELD, never
-		// printed as "0B already granted across 0 admitted jobs" on the surface
+		// printed as "0M already granted across 0 admitted jobs" on the surface
 		// AIRA-178 tells a blocked launcher to trust.
 		note := queueNoteFor(t, 4<<30, &ConfineSliceReserve{
 			Queued: 1, QueuePosition: 1, GrantedBytes: 0, Jobs: 0, CeilingBytes: 64 << 30, GrantedEstablished: false,
@@ -474,12 +474,12 @@ func TestConfineQueueNoteNamesTheJobsOwnResolvedReserve(t *testing.T) {
 			Queued: 1, QueuePosition: 1, GrantedBytes: 40 << 30, Jobs: 3, CeilingBytes: 61 << 30, GrantedEstablished: true,
 			ResolvedReserveBytes: 35 << 30,
 		})
-		if !strings.Contains(note, "this job's own reserve resolves to 35G") {
+		if !strings.Contains(note, "this job's own reserve resolves to 35840M") {
 			t.Fatalf("note=%q, want the resolved reserve the daemon is actually gating on", note)
 		}
 		// The hint is not the number the slice is contending over, and must not
 		// be presented as though it were.
-		if strings.Contains(note, "own reserve resolves to 2G") || strings.Contains(note, "own reserve is 2G") {
+		if strings.Contains(note, "own reserve resolves to 2048M") || strings.Contains(note, "own reserve is 2048M") {
 			t.Fatalf("note=%q, the client's replaced hint must never be named as this job's reserve", note)
 		}
 	})
@@ -495,7 +495,7 @@ func TestConfineQueueNoteNamesTheJobsOwnResolvedReserve(t *testing.T) {
 		if strings.Contains(note, "this job's own reserve") {
 			t.Fatalf("note=%q, a figure already on the line must not be repeated", note)
 		}
-		if !strings.Contains(note, "52G already granted across 9 admitted jobs / 64G slice ceiling") {
+		if !strings.Contains(note, "53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 			t.Fatalf("note=%q, the AIRA-181 clause still has to carry the comparison", note)
 		}
 	})
@@ -529,7 +529,7 @@ func TestConfineQueueNoteDistinguishesAnUngrantableReserveFromContention(t *test
 			Queued: 1, QueuePosition: 1, GrantedBytes: 8 << 30, Jobs: 2, CeilingBytes: 61 << 30,
 			ResolvedReserveBytes: 70 << 30,
 		})
-		if !strings.Contains(note, "this job's own reserve resolves to 70G — larger than the whole 61G slice ceiling") {
+		if !strings.Contains(note, "this job's own reserve resolves to 71680M — larger than the whole 62464M slice ceiling") {
 			t.Fatalf("note=%q, want the oversize case named with both numbers", note)
 		}
 		if !strings.Contains(note, "blocked by its own size and not by the jobs ahead of it") {
@@ -546,7 +546,7 @@ func TestConfineQueueNoteDistinguishesAnUngrantableReserveFromContention(t *test
 			Queued: 1, QueuePosition: 1, GrantedBytes: 8 << 30, Jobs: 2, CeilingBytes: 61 << 30,
 			ResolvedReserveBytes: 70 << 30,
 		})
-		if !strings.Contains(note, "this job's own reserve is 70G — larger than the whole 61G slice ceiling") {
+		if !strings.Contains(note, "this job's own reserve is 71680M — larger than the whole 62464M slice ceiling") {
 			t.Fatalf("note=%q, an ungrantable pinned reserve must still be called out", note)
 		}
 		if strings.Contains(note, "resolves to") {
@@ -566,7 +566,7 @@ func TestConfineQueueNoteDistinguishesAnUngrantableReserveFromContention(t *test
 		if strings.Contains(note, "larger than the whole") || strings.Contains(note, "blocked by its own size") {
 			t.Fatalf("note=%q, a reserve that fits the ceiling must not be called ungrantable", note)
 		}
-		if !strings.Contains(note, "this job's own reserve resolves to 35G") {
+		if !strings.Contains(note, "this job's own reserve resolves to 35840M") {
 			t.Fatalf("note=%q, it must still be stated so the caller can weigh it", note)
 		}
 	})
@@ -591,7 +591,7 @@ func TestConfineQueueNoteDistinguishesAnUngrantableReserveFromContention(t *test
 		if strings.Contains(note, "larger than the whole") {
 			t.Fatalf("note=%q, an unestablished ceiling supports no verdict", note)
 		}
-		if !strings.Contains(note, "this job's own reserve resolves to 70G") {
+		if !strings.Contains(note, "this job's own reserve resolves to 71680M") {
 			t.Fatalf("note=%q, the reserve itself is still a fact worth stating", note)
 		}
 	})
@@ -621,5 +621,33 @@ func TestConfineQueueNoteAddsNothingWithoutAPosition(t *testing.T) {
 				t.Fatalf("note=%q, want an empty clause for an unestablished position", note)
 			}
 		})
+	}
+}
+
+// verifies: AIRA-193 -- the admission-wait line speaks one unit. The ticket's own
+// live line printed 49744607K / 51098094182 beside a rounded 49984M ceiling and a
+// 57704764K MemAvailable: three unit systems in one sentence. Every byte figure is
+// now whole MiB, so "am I near the ceiling?" reads at a glance.
+func TestConfineQueueNoteSpeaksWholeMebibytesThroughout(t *testing.T) {
+	note := queueNoteFor(t, 1510111*1024, &ConfineSliceReserve{
+		Queued: 6, QueuePosition: 2, QueuedAheadBytes: 5769372876,
+		GrantedBytes: 54194584616, Jobs: 5, CeilingBytes: 52608 << 20, GrantedEstablished: true,
+		ResolvedReserveBytes: 1510111 * 1024 * 2,
+		CeilingMode:          "enforce", CeilingState: "throttled", CeilingBasis: "system-pressure", MemAvailableBytes: 57704764 * 1024,
+	})
+	for _, want := range []string{
+		"5502M queued ahead, 51684M already granted across 5 admitted jobs / 52608M slice ceiling",
+		"(system MemAvailable 56352M)",
+		"this job's own reserve resolves to 2949M",
+	} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("note=%q, want %q", note, want)
+		}
+	}
+	// No raw-byte figure (eleven digits) and no K/G/T-suffixed byte figure may remain.
+	for _, forbidden := range []string{"5769372876", "54194584616", "57704764K", "52608M slice ceiling G", "0B "} {
+		if strings.Contains(note, forbidden) {
+			t.Fatalf("note=%q, still carries %q", note, forbidden)
+		}
 	}
 }

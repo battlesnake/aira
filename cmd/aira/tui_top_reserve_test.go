@@ -98,7 +98,7 @@ func TestTopBarDrawsTheGrantedReserveNotTheDelegateScopeCeiling(t *testing.T) {
 			model.Bar.Claimed, model.Bar.Outside, model.Bar.Total)
 	}
 	// The table must agree with the bar: one number, one source.
-	if got, want := topReservationCells(model)["CONFINE-suite-101-aa"], topFormatMegabytes(suite); got != want {
+	if got, want := topReservationCells(model)["CONFINE-suite-101-aa"], runner.FormatConfineMegabytes(suite); got != want {
 		t.Fatalf("RESERVATION cell=%q, want %q (the reserve, not the %d ceiling)", got, want, int64(ceiling))
 	}
 }
@@ -196,7 +196,7 @@ func TestTopBarIsUnchangedWhereCapAndReserveCoincide(t *testing.T) {
 	if model.Bar.Claimed != size {
 		t.Fatalf("claimed=%d, want %d", model.Bar.Claimed, int64(size))
 	}
-	if got, want := topReservationCells(model)["CONFINE-build-101-aa"], topFormatMegabytes(size); got != want {
+	if got, want := topReservationCells(model)["CONFINE-build-101-aa"], runner.FormatConfineMegabytes(size); got != want {
 		t.Fatalf("RESERVATION cell=%q, want %q", got, want)
 	}
 }

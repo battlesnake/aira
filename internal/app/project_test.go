@@ -410,3 +410,41 @@ func TestOpenWithoutStoreBuildsExecutionDependenciesWithoutStateDB(t *testing.T)
 		}
 	}
 }
+
+// verifies: AIRA-188 -- a bare init on a new project used to claim the
+// machine-exclusive prefix AIRA silently. It is now refused, before any file is
+// written, with a message naming both flags.
+func TestInitWithoutPrefixesIsRefusedAndWritesNothing(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	for name, args := range map[string]map[string]any{
+		"no args":         {},
+		"slug only":       {"project": "demo"},
+		"empty prefixes":  {"project": "demo", "prefixes": ""},
+		"id_prefix alone": {"project": "demo", "id_prefix": "DEMO"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Init(context.Background(), root, args)
+			if err == nil {
+				t.Fatal("init without prefixes succeeded")
+			}
+			if !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+				t.Fatalf("code = %v, want E_CONFIG_INVALID", err)
+			}
+			for _, want := range []string{"--prefixes", "--prefix <P>", "exclusive"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error does not mention %q: %v", want, err)
+				}
+			}
+			if _, statErr := os.Stat(filepath.Join(root, ".aira", "config")); !os.IsNotExist(statErr) {
+				t.Fatalf("refused init left a config: %v", statErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(root, ".aira")); !os.IsNotExist(statErr) {
+				t.Fatalf("refused init left .aira: %v", statErr)
+			}
+		})
+	}
+}

@@ -771,6 +771,69 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 	}
 }
 
+// TestGuideHedgesTheOOMRerunPromiseOnTheAdvisoryRecordedClaim is the AIRA-217
+// follow-up for the generated guide.
+//
+// AIRA-217 made the runtime OOM advisory say "AIRA could not confirm that this
+// kill was recorded ... do not rely on the next admission being sized from it"
+// when the peak report fails. The guide kept promising unconditionally that the
+// next identical invocation is admitted at a materially higher reserve, and that
+// a repeat kill at the same cap IS a genuine bug to report. An agent reading the
+// guide first, then seeing the hedged advisory, would re-run at the same prior,
+// be killed again, and file a false AIRA bug (RANT-19).
+//
+// verifies: AIRA-217
+func TestGuideHedgesTheOOMRerunPromiseOnTheAdvisoryRecordedClaim(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, document := range []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	} {
+		for _, stale := range []string{
+			"and admits the very NEXT identical invocation at a materially higher reserve",
+			"so RE-RUN THE IDENTICAL COMMAND — and if that identical re-run is killed at the same cap again, that IS a genuine bug",
+			"So the response to `terminated-by=oom` on a first run is to RE-RUN the identical command",
+		} {
+			if strings.Contains(document.body, stale) {
+				t.Errorf("%s still makes the unconditional re-run promise %q", document.name, stale)
+			}
+		}
+		// The stale-sentence list above only catches the three exact pre-fix
+		// strings; the defect put back in other words would pass it. Pin the
+		// SHAPE instead: every sentence that promises a higher next reserve, a
+		// re-run, or "genuine bug" must itself be conditional on the advisory
+		// saying the kill was recorded.
+		for _, sentence := range strings.Split(document.body, ". ") {
+			promises := false
+			for _, marker := range []string{"materially higher reserve", "genuine bug", "RE-RUN THE IDENTICAL COMMAND", "RE-RUN the identical command"} {
+				if strings.Contains(sentence, marker) {
+					promises = true
+				}
+			}
+			if !promises || strings.Contains(sentence, "says the kill was recorded") {
+				continue
+			}
+			if strings.Contains(sentence, "the RE-RUN advice below DOES self-heal") {
+				continue // cross-reference, not a promise
+			}
+			t.Errorf("%s makes an OOM re-run promise not conditional on the advisory saying the kill was recorded: %q", document.name, sentence)
+		}
+		for _, want := range []string{
+			"NOTHING is promised about the next admission",
+			"AIRA could not confirm that this kill was recorded",
+			"is NOT evidence of an AIRA bug",
+			"aira confine --budget",
+		} {
+			if !strings.Contains(document.body, want) {
+				t.Errorf("%s no longer states the hedge %q", document.name, want)
+			}
+		}
+	}
+}
+
 // TestSkillTeachesBothColdStartBases is AIRA-166.
 //
 // The guide taught ONE cold-start basis — "a FIRST run ... is capped at a
@@ -1119,6 +1182,28 @@ func TestSkillDescribesTheClaudeUsageModInstallFlag(t *testing.T) {
 		for _, want := range []string{"--claude-usage-mod", "~/.claude/skills/aira-usage/", "removes only the files aira wrote", "never prompts or file contents", "refused with --stage=start and --status", "aira heartbeat", "the session's own worktree"} {
 			if !strings.Contains(body, want) {
 				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+	}
+}
+
+// verifies: AIRA-219 -- the guide's MUST-confine rule had no carve-out for a command
+// already inside a confine scope, while the runtime nested-launch warning says to
+// drop the inner wrapper. The guide now agrees with the warning.
+func TestSkillTeachesToWrapOnceAtTheOutermostCommand(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"already running inside an `aira confine` scope",
+			"wrap ONCE, at the outermost heavy command",
+			"must fit beside every reservation already granted there, its parent's included",
+			"admission has no time limit",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not teach %q", name, want)
 			}
 		}
 	}

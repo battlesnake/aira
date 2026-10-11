@@ -163,3 +163,22 @@ func TestAIRA187ADetachedNestedLaunchWarns(t *testing.T) {
 		t.Fatalf("a detached nested launch was not warned about: %q", stderr.String())
 	}
 }
+
+// verifies: AIRA-219 -- the warning says what the nested request is up against: on
+// the parent's slice it must fit beside every reservation already granted there,
+// the parent's own included, and the admission wait has no time limit. The
+// sentence is conditional ("When it requests the parent's slice"), so it stays true
+// for a nested launch that names a different --slice.
+func TestAIRA219NestedWarningNamesTheParentsOwnGrantAndTheUnboundedWait(t *testing.T) {
+	for _, options := range []map[string]string{{}, {"slice": "other.slice"}} {
+		got := nestedConfineWarning(options, testParentScopeID)
+		for _, want := range []string{"When it requests the parent's slice", "the parent's own included", "no time limit", "until it is cancelled"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("options=%v: warning lacks %q: %q", options, want, got)
+			}
+		}
+	}
+	if got := nestedConfineWarning(map[string]string{"exclusive": "true"}, testParentScopeID); got != "" {
+		t.Fatalf("exemption changed: %q", got)
+	}
+}
