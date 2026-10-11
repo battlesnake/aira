@@ -533,17 +533,36 @@ func readLockInfo(path string) LockInfo {
 	return info
 }
 
-// Status checks both the lock holder identity and socket acceptability.
+// lockHeldElsewhere reports whether another open file description holds the
+// flock on path. A missing or unopenable lock file reads as not held.
+func lockHeldElsewhere(path string) bool {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	lockErr := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if lockErr == nil {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		return false
+	}
+	return errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN)
+}
+
+// Status checks both the lock holder identity and socket acceptability. The
+// state lock (beside state.db) is the daemon's identity; a pre-v0.34 daemon
+// holds only the legacy runtime-directory lock, so it is consulted too, which
+// keeps `aira daemon status|stop` and `aira install` truthful across the
+// upgrade window (a v0.34 daemon holds both, with the same record).
 func Status(paths Paths) StatusInfo {
 	info := StatusInfo{Lock: readLockInfo(paths.LockPath)}
-	file, err := os.OpenFile(paths.LockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err == nil {
-		if lockErr := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr == nil {
-			_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-		} else if errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN) {
-			info.Running = info.Lock.PID > 0 && info.Lock.BootID != "" && info.Lock.BootID == currentBootID()
-		}
-		_ = file.Close()
+	held := lockHeldElsewhere(paths.LockPath)
+	if !held && paths.LegacyLockPath != "" && paths.LegacyLockPath != paths.LockPath && lockHeldElsewhere(paths.LegacyLockPath) {
+		held = true
+		info.Lock = readLockInfo(paths.LegacyLockPath)
+	}
+	if held {
+		info.Running = info.Lock.PID > 0 && info.Lock.BootID != "" && info.Lock.BootID == currentBootID()
 	}
 	conn, err := net.DialTimeout("unix", paths.SocketPath, 100*time.Millisecond)
 	if err == nil {

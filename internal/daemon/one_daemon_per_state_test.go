@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -176,4 +177,28 @@ func (e *ErrDrainTimeout) closeLocksForTest() error {
 		return err
 	}
 	return first
+}
+
+// A pre-v0.34 daemon holds only the legacy lock. Status (and so `aira daemon
+// stop` and `aira install`'s reachability check) must still see it as running,
+// or a v0.34 `aira install` run before the cutover restart fails its verify.
+func TestStatusSeesAPreV034DaemonHoldingOnlyTheLegacyLock(t *testing.T) {
+	state, runtimes := stateAndRuntimes(t, 1)
+	paths := pathsFor(t, state, runtimes[0])
+	if err := os.MkdirAll(filepath.Dir(paths.LegacyLockPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info := LockInfo{PID: 4242, BootID: currentBootID()}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.LegacyLockPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	holdFlock(t, paths.LegacyLockPath)
+	status := Status(paths)
+	if !status.Running || status.Lock.PID != 4242 {
+		t.Fatalf("status = %+v, want a running pre-v0.34 daemon with pid 4242", status)
+	}
 }
