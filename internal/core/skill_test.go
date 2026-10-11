@@ -801,7 +801,28 @@ func TestGuideHedgesTheOOMRerunPromiseOnTheAdvisoryRecordedClaim(t *testing.T) {
 				t.Errorf("%s still makes the unconditional re-run promise %q", document.name, stale)
 			}
 		}
+		// The stale-sentence list above only catches the three exact pre-fix
+		// strings; the defect put back in other words would pass it. Pin the
+		// SHAPE instead: every sentence that promises a higher next reserve, a
+		// re-run, or "genuine bug" must itself be conditional on the advisory
+		// saying the kill was recorded.
+		for _, sentence := range strings.Split(document.body, ". ") {
+			promises := false
+			for _, marker := range []string{"materially higher reserve", "genuine bug", "RE-RUN THE IDENTICAL COMMAND", "RE-RUN the identical command"} {
+				if strings.Contains(sentence, marker) {
+					promises = true
+				}
+			}
+			if !promises || strings.Contains(sentence, "says the kill was recorded") {
+				continue
+			}
+			if strings.Contains(sentence, "the RE-RUN advice below DOES self-heal") {
+				continue // cross-reference, not a promise
+			}
+			t.Errorf("%s makes an OOM re-run promise not conditional on the advisory saying the kill was recorded: %q", document.name, sentence)
+		}
 		for _, want := range []string{
+			"NOTHING is promised about the next admission",
 			"AIRA could not confirm that this kill was recorded",
 			"is NOT evidence of an AIRA bug",
 			"aira confine --budget",
