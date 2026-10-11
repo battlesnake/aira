@@ -716,3 +716,15 @@ P1. Every finding was checked against the code before it was accepted.
 No finding was rejected. Owner-level forks: none irreversible. D1 (PASS on a diverged
 index, following the Phase-1 decision) and the legacy lock (temporary, removable) are
 recorded here and are reversible.
+
+### Build record (2026-10-11)
+
+- **3.6 wrap precondition: held.** Against a private daemon (private `HOME`, `XDG_STATE_HOME`,
+  `XDG_RUNTIME_DIR` under `~/tmp/cli34/`; probe `~/tmp/cli34/probe_wrap.sh`),
+  `aira confine -- aira gate run g1` returned `PASS` (trusted, RUN-3, canary RUN-4), and the
+  gate's run scope was `.../aira.slice/.aira-CONFINE-<outer>/.aira-RUN-3`, nested under the outer
+  confine scope. A plain `gate run` nests under the caller's own cgroup (RUN-1). The wrap
+  recommendation is therefore kept. (The private `HOME` needed a copy of `aira.slice`'s unit
+  file for `aira confine` to resolve the slice; that is a property of the probe, not of the wrap.)
+- Built as planned: no deviations from the plan's design. The plan's `E_DAEMON_UNAVAILABLE`
+  wording is the test-pinned message; the exact string is the one in `lockHolderError`.
