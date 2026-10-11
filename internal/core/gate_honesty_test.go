@@ -99,3 +99,43 @@ func TestGateProveOnUnprovenGateExitsUnevaluated(t *testing.T) {
 
 // verifies: AIRA-53
 // A refused add must not report success and must not leave a definition.
+
+// canaryRunStore answers canary-run with a canned result, so the envelope's
+// mapping can be checked without running a canary.
+type canaryRunStore struct {
+	*store.Store
+	result store.CanaryRunResult
+}
+
+func (c canaryRunStore) GateActionWithFields(_ context.Context, operation, _, _ string, _ map[string]any) (any, error) {
+	if operation != "canary-run" {
+		return nil, nil
+	}
+	return c.result, nil
+}
+
+// verifies: AIRA-287 -- canary-run's exit code follows the canary's own
+// verdict, with the same three-state meaning as gate run: fired is PASS/0, did
+// not fire is FAIL/1, could not tell is UNEVALUATED/3. Returned unwrapped, every
+// outcome read OK/0, including a canary that did not fire.
+func TestCanaryRunEnvelope(t *testing.T) {
+	fired, notFired := true, false
+	for _, row := range []struct {
+		result   store.CanaryRunResult
+		wantCode string
+		wantExit int
+	}{
+		{store.CanaryRunResult{CanaryID: "c", Verdict: "pass", Fired: &fired, GateResult: gate.PredicateFail}, "PASS", 0},
+		{store.CanaryRunResult{CanaryID: "c", Verdict: "fail", Fired: &notFired, GateResult: gate.PredicatePass}, "FAIL", 1},
+		{store.CanaryRunResult{CanaryID: "c", Verdict: "unevaluated", GateResult: gate.PredicateUnevaluated}, "UNEVALUATED", 3},
+	} {
+		c := New(canaryRunStore{Store: coreTestStore(t), result: row.result})
+		response := c.Do(context.Background(), Request{Verb: "gate", Args: map[string]any{"subverb": "canary-run", "canary_id": "c"}})
+		if response.Code != row.wantCode || response.Exit != row.wantExit {
+			t.Fatalf("verdict %q -> code=%q exit=%d, want %s/%d", row.result.Verdict, response.Code, response.Exit, row.wantCode, row.wantExit)
+		}
+		if got, ok := response.Data.(store.CanaryRunResult); !ok || got.Verdict != row.result.Verdict {
+			t.Fatalf("data = %#v", response.Data)
+		}
+	}
+}

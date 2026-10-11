@@ -631,7 +631,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 				if code == "" {
 					code = "E_GATE_FAILED"
 				}
-				result[i].Findings = appendUniqueFinding(result[i].Findings, CheckFinding{Code: code, Subject: gateResult.GateID, Message: "gate " + gateResult.GateID + " is " + gateResult.Verdict, Kind: gateResult.Verdict})
+				result[i].Findings = appendUniqueFinding(result[i].Findings, CheckFinding{Code: code, Subject: gateResult.GateID, Message: gateFindingMessage(gateResult), Kind: gateResult.Verdict})
 				result[i].Ready = false
 				if gateResult.Verdict == "fail" {
 					result[i].Verdict = "fail"

@@ -320,3 +320,21 @@ func CanonicalEnvAllow(names []string) []string {
 	sort.Strings(copy)
 	return copy
 }
+
+// PathEnvAllowWarning is the one warning EnvAllowWarnings can return (AIRA-286).
+// The env binding is re-checked at read time in the process that evaluates the
+// read, and `aira ready`, `gate check` and `gate prove` run inside the daemon,
+// whose PATH is not the caller's. Delete this, and its call site in RunGate,
+// once the read-time env comparison is changed (the plan's deferral D1).
+const PathEnvAllowWarning = "env_allow includes PATH, but aira ready and gate check compare it with the aira daemon's PATH, which usually differs from your shell's, so this proof will read U_GATE_PROOF_STALE (does not match: env); set PATH inside the command instead"
+
+// EnvAllowWarnings returns PathEnvAllowWarning when env_allow names PATH
+// exactly (case-sensitive, as environment names are), and nothing otherwise.
+func (c Command) EnvAllowWarnings() []string {
+	for _, name := range c.EnvAllow {
+		if name == "PATH" {
+			return []string{PathEnvAllowWarning}
+		}
+	}
+	return nil
+}

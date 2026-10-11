@@ -127,6 +127,22 @@ func TestGateCommandHelperProcess(t *testing.T) {
 			os.Exit(0)
 		}
 		os.Exit(1)
+	case "list-tree":
+		// AIRA-288: prints every file under the cwd and fails, so a subject run's
+		// output and a canary run's output differ by exactly the injected file.
+		_ = filepath.WalkDir(".", func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if entry.IsDir() && entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			if !entry.IsDir() {
+				_, _ = os.Stdout.WriteString(filepath.ToSlash(path) + "\n")
+			}
+			return nil
+		})
+		os.Exit(1)
 	case "source-go-test-json":
 		injected := false
 		files, _ := filepath.Glob("*.go")
@@ -518,4 +534,114 @@ func injectFileGateFixture(canaryPath, marker string) (gate.GateDefinition, gate
 			Content: "#[test]\nfn aira_canary() { panic!(\"" + marker + "\"); }\n", ExpectedResult: gate.VerdictFail},
 		ExpectedGateResult: gate.VerdictFail, LaneBinding: "rust", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand}
 	return def, canary
+}
+
+// verifies: AIRA-285 -- a command gate is never given AIRA's ticket files, and
+// so a ticket edit cannot change what it observes. The tracked ticket carries
+// the marker the checker fails on: if the snapshot held it, the subject run
+// would fail. The canary injects the same marker into an ordinary path, so the
+// gate can still fire and reach a trusted pass.
+func TestCommandGateNeverSeesAiraBookkeeping(t *testing.T) {
+	const marker = "AIRA-285 bookkeeping marker"
+	s, root := nonGoCommandSubject(t, "")
+	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ticket := filepath.Join(root, ".aira", "tickets", "AIRA-1.md")
+	if err := os.WriteFile(ticket, []byte("---\nstatus: planned\n---\n"+marker+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	def, canary := injectFileGateFixture("tests/aira_canary.rs", marker)
+	writeGateFixture(t, root, def, canary)
+	result, err := s.RunGate(context.Background(), def.ID)
+	if err != nil || result.Verdict != gate.VerdictPass || !result.Trusted {
+		t.Fatalf("the command saw the ticket file: result=%#v err=%v", result, err)
+	}
+	if err := os.WriteFile(ticket, []byte("---\nstatus: done\n---\n"+marker+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checked, err := s.GateCheck(context.Background())
+	if err != nil || len(checked.Results) != 1 || checked.Results[0].Verdict != gate.VerdictPass || !checked.Results[0].Trusted {
+		t.Fatalf("a ticket edit cost the command gate's pass: %#v err=%v", checked, err)
+	}
+}
+
+// verifies: AIRA-288 -- a command gate's result records and returns both run
+// ids, GateCheck hands them back, and they point at the right runs: the subject
+// run's output does not list the injected canary file and the canary run's
+// does. Swapping or dropping either id fails here.
+func TestGateRunRecordsAndReturnsRunIDs(t *testing.T) {
+	const canaryPath = "tests/aira_canary_listed.rs"
+	s, root := nonGoCommandSubject(t, "")
+	def, canary := injectFileGateFixture(canaryPath, "unused marker")
+	def.Command.Argv = gateHelperArgv("list-tree")
+	writeGateFixture(t, root, def, canary)
+	result, err := s.RunGate(context.Background(), def.ID)
+	if err != nil || result.Verdict != gate.VerdictFail || result.Code != "E_GATE_COMMAND_FAILED" {
+		t.Fatalf("failing gate result=%#v err=%v", result, err)
+	}
+	if result.RunID == "" || result.CanaryRunID == "" || result.RunID == result.CanaryRunID {
+		t.Fatalf("returned run ids: %#v", result)
+	}
+	audit, err := OpenGateAudit(s.commonDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := audit.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var latest GateAuditRecord
+	for _, record := range records {
+		if record.Type == "result" && record.Fields["gate_id"] == def.ID && record.Seq > latest.Seq {
+			latest = record
+		}
+	}
+	if latest.Fields["run_id"] != result.RunID || latest.Fields["canary_run_id"] != result.CanaryRunID {
+		t.Fatalf("recorded ids %q/%q, returned %q/%q", latest.Fields["run_id"], latest.Fields["canary_run_id"], result.RunID, result.CanaryRunID)
+	}
+	checked, err := s.GateCheck(context.Background())
+	if err != nil || len(checked.Results) != 1 || checked.Results[0].RunID != result.RunID || checked.Results[0].CanaryRunID != result.CanaryRunID {
+		t.Fatalf("gate check ids: %#v err=%v", checked, err)
+	}
+	output := func(id string) string {
+		t.Helper()
+		chunk, err := s.runner.ReadOutput(context.Background(), runner.OutputRequest{RunID: id, Stream: "out", Full: true})
+		if err != nil || chunk == nil {
+			t.Fatalf("read output of %s: %v", id, err)
+		}
+		return string(chunk.Bytes)
+	}
+	subjectOut, canaryOut := output(result.RunID), output(result.CanaryRunID)
+	if !strings.Contains(subjectOut, "Cargo.toml") || strings.Contains(subjectOut, canaryPath) {
+		t.Fatalf("subject run output:\n%s", subjectOut)
+	}
+	if !strings.Contains(canaryOut, canaryPath) {
+		t.Fatalf("canary run output lacks the injected file:\n%s", canaryOut)
+	}
+}
+
+// verifies: AIRA-286 -- a command gate that allow-lists PATH is warned at gate
+// run, which every definition reaches; one that does not is not.
+func TestRunGateWarnsWhenEnvAllowIncludesPath(t *testing.T) {
+	s, root := nonGoCommandSubject(t, "")
+	def, canary := injectFileGateFixture("tests/aira_canary.rs", "AIRA mutation")
+	writeGateFixture(t, root, def, canary)
+	result, err := s.RunGate(context.Background(), def.ID)
+	if err != nil || result.Verdict != gate.VerdictPass {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("a gate without PATH was warned: %#v", result.Warnings)
+	}
+	def.Command.EnvAllow = []string{"PATH"}
+	writeGateFixture(t, root, def, canary)
+	result, err = s.RunGate(context.Background(), def.ID)
+	if err != nil || result.Verdict != gate.VerdictPass {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != gate.PathEnvAllowWarning {
+		t.Fatalf("warnings = %#v", result.Warnings)
+	}
 }

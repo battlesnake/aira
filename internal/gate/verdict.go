@@ -91,3 +91,25 @@ func proofVerdict(proof ProofState) FoldedVerdict {
 	}
 	return FoldedVerdict{Verdict: VerdictUnevaluated, Code: code, Suspect: true}
 }
+
+// CanaryHealthFor maps the gate's result on a canary tree to the canary's own
+// health (AIRA-287). Every proof-eligible canary expects the gate to FAIL on its
+// tree (ValidateCanary), and a synthetic ratchet's fail is its "regressed", so
+// fail means the canary fired and pass means it did not. Anything else --
+// unevaluated, empty, or a value outside the enum -- is not established and
+// reads unevaluated: never "did not fire" (a hard gate failure) and never
+// "fired" (proof). RunGate and canary-run share this one mapping so they cannot
+// disagree about what a canary did.
+//
+// "Fired" is an observed failure of the checker on the canary tree, not a proof
+// that the mutation or fixture caused it.
+func CanaryHealthFor(p PredicateState) CanaryHealth {
+	switch p {
+	case PredicateFail:
+		return CanaryPass
+	case PredicatePass:
+		return CanaryFail
+	default:
+		return CanaryUnevaluated
+	}
+}

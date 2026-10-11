@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"aira/internal/gate"
 )
 
 // subjectEntryKind is what a tracked entry is, so two trees differing only in
@@ -51,10 +53,24 @@ func (e subjectEntry) regular() bool {
 // design has always specified the subject as the commit/tree digest; this
 // restores that.
 //
-// The scope is deliberately "every tracked file, full stop" rather than an
-// allowlist. An allowlist over the subject is the exact mechanism that produced
-// AIRA-72: it cannot be kept true as a project grows. Over-invalidation is the
-// safe direction -- it yields unevaluated, never a fabricated pass.
+// The scope is deliberately "every tracked file" rather than an allowlist,
+// with exactly two fixed, AIRA-owned exclusions (AIRA-285): .aira/tickets/ and
+// .aira/findings/, AIRA's own workflow bookkeeping (gate.ExcludedFromSubject).
+// An allowlist over the subject is the exact mechanism that produced AIRA-72:
+// it cannot be kept true as a project grows. Over-invalidation is the safe
+// direction -- it yields unevaluated, never a fabricated pass.
+//
+// Why the two exclusions cannot reintroduce AIRA-72's false pass: that defect
+// was a digest narrower than what the checker evaluated. Here the exclusion is
+// applied once, in captureSubjectEntries, before both the digest and the
+// materialised snapshot are built from the same entries, so no checker is ever
+// given a bookkeeping byte the digest does not bind. What a command reads
+// OUTSIDE its snapshot (an absolute path into the live worktree, untracked
+// files, $HOME, the network) has never been inside any proof; after AIRA-285
+// that includes the live ticket and finding files. The rule version in
+// digestSubjectEntries (gateSubjectRule) makes every digest under this rule
+// differ from every digest under the previous one, so no result recorded under
+// the old rule is ever found.
 //
 // Why not git's own `git write-tree` as the identity: it would encode path,
 // mode, symlink and gitlink natively and needs no framing of ours. It is
@@ -86,6 +102,9 @@ func subjectTreeDigest(root string) (string, error) {
 // are constructible and collided -- a stale pass servable against a genuinely
 // different tree, without breaking SHA-256. Length prefixes remove the whole
 // ambiguity class rather than patching one case.
+//
+// The first framed field is gateSubjectRule, so the rule that chose the entries
+// is part of every subject and canary-tree digest.
 func digestSubjectEntries(entries []subjectEntry) string {
 	h := sha256.New()
 	var length [8]byte
@@ -94,6 +113,7 @@ func digestSubjectEntries(entries []subjectEntry) string {
 		_, _ = h.Write(length[:])
 		_, _ = h.Write(data)
 	}
+	write([]byte(gateSubjectRule))
 	for _, entry := range entries {
 		write([]byte(entry.path))
 		_, _ = h.Write([]byte{byte(entry.kind)})
@@ -102,7 +122,29 @@ func digestSubjectEntries(entries []subjectEntry) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// captureSubjectEntries reads every tracked path once, in sorted order.
+// gateSubjectRule names the rule that decides which tracked bytes form a gate
+// subject. Bump it whenever that rule or the digest framing changes: a result
+// recorded under one rule must never be found under another, because the
+// checker would now be given a different tree for the same files. GateCheck
+// compares a result's canary_tree_digest with its linked proof's, never with a
+// freshly derived canary tree, so without the tag a proof-of-fire minted under
+// the old rule could be served after the upgrade in any repository whose entry
+// set is the same under both rules. AIRA-285 is rule 2 (rule 1, untagged, was
+// every tracked file).
+const gateSubjectRule = "aira-gate-subject/2"
+
+// captureSubjectEntries reads every tracked path once, in sorted order, except
+// AIRA's own ticket and finding files (gate.ExcludedFromSubject, AIRA-285).
+//
+// This is the single function behind both subjectTreeDigest (GateCheck, the
+// manual lane, review challenges, attestation) and captureSubject (RunGate and
+// every canary lane), and materializeSubject writes only the entries it
+// returns, so filtering here -- and only here -- keeps the digest and every
+// tree a checker is given one set (AIRA-285 invariant I1). The excluded paths
+// are skipped before the Lstat: they are never read, so nothing is claimed
+// about them, including a gitlink or symlink placed under them, and a ticket
+// written during a long RunGate capture cannot trip the double-read agreement
+// check.
 func captureSubjectEntries(root string) ([]subjectEntry, error) {
 	paths, err := trackedSnapshotPaths(root)
 	if err != nil {
@@ -110,6 +152,9 @@ func captureSubjectEntries(root string) ([]subjectEntry, error) {
 	}
 	entries := make([]subjectEntry, 0, len(paths))
 	for _, path := range paths {
+		if gate.ExcludedFromSubject(path) {
+			continue
+		}
 		absolute := filepath.Join(root, filepath.FromSlash(path))
 		info, err := os.Lstat(absolute)
 		if err != nil {
