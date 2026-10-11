@@ -44,9 +44,13 @@ def pytest_configure(config):
     # @pytest.mark.aira_cpu must not fail collection on an ordinary, non-aitest run.
     config.addinivalue_line(
         "markers",
-        "aira_cpu(cores): declares the test's CPU-core reservation (its peak internal "
-        "fork width); the aitest pool charges it against the cpu ledger so cores-1 fewer "
-        "sibling workers run concurrently while it does",
+        "aira_cpu(cores): declares the test's CPU-core reservation: the peak number of "
+        "execution streams (processes or threads) that are simultaneously runnable AND "
+        "CPU-bound, each really occupying a core. Streams serialised by the GIL or blocked "
+        "on a lock (e.g. 16 SQLite writers where one holds the write lock) count as about "
+        "one core: mark 1 or leave unmarked. The aitest pool charges it against the cpu "
+        "ledger so cores-1 fewer sibling workers run concurrently while it does; "
+        "over-declaring starves the test's own admission and displaces other workers",
     )
     # AIRA-261 Phase B: register aira_time (a relative, unitless scheduling-cost rank),
     # same early-registration reason as aira_mem/aira_cpu.
@@ -70,8 +74,8 @@ def pytest_configure(config):
     if workers_option is None:
         return
     _resolve_worker_count(workers_option)
-    # Real activation (pytest_runtestloop) is wired in Task 17; this task
-    # only establishes the flag and its inert default.
+    # Activation happens in pytest_runtestloop below; this only resolves and
+    # validates the worker count so a bad --aitest-workers fails at configure time.
     return
 
 
@@ -88,9 +92,10 @@ def _aira_mem_bytes_for_item(item, default):
     warning at most once per nodeid.
 
     `aira_mem` declares a test's INCREMENTAL peak RSS (spec 4.1). This reader is
-    a DOCUMENTED-INERT foundation in S1 (plan D5): the value is stored in the
-    supervisor's nodeid->bytes map but drives no admission sizing yet -- the
-    per-class consumer is S2.
+    consumed by the supervisor (S2b, AIRA-235): an annotated test's worker is
+    reserved overhead (AIRA_AITEST_WORKER_OVERHEAD_BYTES, default 512M) plus this
+    value, via Supervisor.reservation_need and _need_for; an unannotated test
+    reserves the bare overhead. AIRA_AITEST_ESTIMATED_BYTES does not size workers.
     """
     marker = item.get_closest_marker("aira_mem")
     if marker is None:
@@ -131,9 +136,13 @@ def _aira_cpu_cores_for_item(item, default):
     no positional argument, more than one, or an argument that is not a positive integer.
     A malformed marker is never silently swallowed (the AIRA-223 discipline).
 
-    aira_cpu declares the test's peak internal fork width as an ABSOLUTE core count (unlike
-    aira_mem's floor+increment), because the worker's peak CPU demand IS N cores. The
-    dispatcher charges it against the per-slice R x NumCPU cpu ledger (R = `aira install --cpu-slots-per-core`, default 2), so a marked test
+    aira_cpu declares the test's peak CPU demand as an ABSOLUTE core count (unlike
+    aira_mem's floor+increment), because the worker's peak CPU demand IS N cores. N is the
+    peak number of execution streams (processes or threads) that are simultaneously
+    runnable AND CPU-bound, each really occupying a core. Streams serialised by the GIL or
+    blocked on a lock (for example 16 SQLite writers where one holds the write lock) count
+    as about one core: mark N=1 or leave unmarked. Over-declaring starves the test's own
+    admission and displaces N-1 cores of other workers. The dispatcher charges it against the per-slice R x NumCPU cpu ledger (R = `aira install --cpu-slots-per-core`, default 2), so a marked test
     displaces cores-1 sibling workers while it runs.
     """
     marker = item.get_closest_marker("aira_cpu")
