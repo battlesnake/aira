@@ -486,33 +486,6 @@ func TestAssignTopSlots(t *testing.T) {
 	}
 }
 
-// The top view shows every quantity in one fixed unit (M) rather than the
-// shared confine formatter's auto-scaling T/G/M/K-or-bytes, because a live
-// cgroup/RSS reading is essentially never round in any unit and would mostly
-// fall through to raw bytes there. Rounds to the nearest MiB; never negative,
-// never a fabricated non-zero for a non-positive input.
-func TestTopFormatMegabytesRoundsToTheNearestMiBInOneFixedUnit(t *testing.T) {
-	const mib = 1 << 20
-	for _, testCase := range []struct {
-		name  string
-		value int64
-		want  string
-	}{
-		{"zero", 0, "0M"},
-		{"negative", -1, "0M"},
-		{"exact", 2 * mib, "2M"},
-		{"rounds down", 2*mib + mib/2 - 1, "2M"},
-		{"rounds up", 2*mib + mib/2, "3M"},
-		{"large, not a round G/T value", 47*mib*1024 + 12345, "48128M"},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			if got := topFormatMegabytes(testCase.value); got != testCase.want {
-				t.Fatalf("topFormatMegabytes(%d)=%q, want %q", testCase.value, got, testCase.want)
-			}
-		})
-	}
-}
-
 // The reserve column reads the ledger's per-scope charge (AIRA-192), and keeps
 // its two states apart: an established number, or nothing at all. A zero is a
 // REAL charge and must not collapse into the absence beside it.

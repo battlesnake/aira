@@ -711,14 +711,14 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 				// the precise daemon-side "held on: vram" attribution is deferred.
 				vramNote := ""
 				if request.VRAMBytes > 0 {
-					vramNote = ", declared VRAM " + FormatConfineBytes(request.VRAMBytes)
+					vramNote = ", declared VRAM " + FormatConfineMegabytes(request.VRAMBytes)
 				}
 				if pinned {
 					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s%s, waited %ds%s)\n",
-						sliceName, FormatConfineBytes(reserve), vramNote, waited, queueNote)
+						sliceName, FormatConfineMegabytes(reserve), vramNote, waited, queueNote)
 				} else {
 					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s%s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds%s)\n",
-						sliceName, FormatConfineBytes(reserve), vramNote, waited, queueNote)
+						sliceName, FormatConfineMegabytes(reserve), vramNote, waited, queueNote)
 				}
 			}
 		}

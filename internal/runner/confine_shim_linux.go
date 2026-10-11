@@ -151,7 +151,7 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 				default:
 				}
 				fmt.Fprintf(admitDiag, "confine: waiting for advisory memory admission on %s (reserve %s, waited %ds%s)\n",
-					sliceName, FormatConfineBytes(reserve), waited, queueNote)
+					sliceName, FormatConfineMegabytes(reserve), waited, queueNote)
 			}
 		}
 	}()

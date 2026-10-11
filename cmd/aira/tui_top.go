@@ -155,25 +155,9 @@ func topReserveFor(record runner.ConfineRecord) topReserve {
 
 func (r topReserve) String() string {
 	if r.State == topReserveSet {
-		return topFormatMegabytes(r.Bytes)
+		return runner.FormatConfineMegabytes(r.Bytes)
 	}
 	return "unevaluated"
-}
-
-// topFormatMegabytes renders a byte quantity in whole megabytes, for
-// consistent at-a-glance comparison across the top view's rows and bar. The
-// shared confine formatter (formatReserveBytes) picks whichever of T/G/M/K
-// divides the value EXACTLY, falling back to raw bytes otherwise -- exact for
-// a round operator-typed cap, but live cgroup/RSS readings are essentially
-// never round in any unit, so that formatter mostly prints bytes here. One
-// fixed unit, rounded to the nearest MiB, is what the owner asked this view
-// to show instead.
-func topFormatMegabytes(value int64) string {
-	if value <= 0 {
-		return "0M"
-	}
-	const mib = 1 << 20
-	return strconv.FormatInt((value+mib/2)/mib, 10) + "M"
 }
 
 type topBarRegionKind uint8
@@ -337,7 +321,7 @@ func topFormatQuantity(kind topBarKind, value int64) string {
 	if kind == topBarCPU {
 		return topFormatCores(value) + " cores"
 	}
-	return topFormatMegabytes(value)
+	return runner.FormatConfineMegabytes(value)
 }
 
 // topCPUMicroCores is one core's worth of CPU time per unit wall-clock, as an
@@ -549,7 +533,7 @@ func topRAMCell(rss *int64) string {
 	if rss == nil || *rss < 0 {
 		return "unevaluated"
 	}
-	return topFormatMegabytes(*rss)
+	return runner.FormatConfineMegabytes(*rss)
 }
 
 // topVRAMCell renders a scope's declared VRAM reservation for the table (AIRA-269).
@@ -563,7 +547,7 @@ func topVRAMCell(vram *int64) string {
 	if *vram <= 0 {
 		return "—"
 	}
-	return topFormatMegabytes(*vram)
+	return runner.FormatConfineMegabytes(*vram)
 }
 
 // topAgeCell renders a job's age for the table. AIRA-135 dropped this column in
@@ -1416,11 +1400,11 @@ func topFooter(result runner.ConfineListResult) string {
 	// for the slice; show the ceiling (an independent read) but never a
 	// fabricated "granted 0 across 0 jobs".
 	grantedClause := fmt.Sprintf("granted %s / ceiling %s across %d admitted %s",
-		topFormatMegabytes(reserve.GrantedBytes), topFormatMegabytes(reserve.CeilingBytes),
+		runner.FormatConfineMegabytes(reserve.GrantedBytes), runner.FormatConfineMegabytes(reserve.CeilingBytes),
 		reserve.Jobs, confinePlural(reserve.Jobs, "job", "jobs"))
 	if !reserve.GrantedEstablished {
 		grantedClause = fmt.Sprintf("granted unevaluated / ceiling %s",
-			topFormatMegabytes(reserve.CeilingBytes))
+			runner.FormatConfineMegabytes(reserve.CeilingBytes))
 	}
 	populationClause := fmt.Sprintf("%d %s, %d scope-less %s",
 		reserve.ScopeJobs, confinePlural(reserve.ScopeJobs, "scope", "scopes"),
