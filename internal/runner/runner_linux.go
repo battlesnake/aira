@@ -63,14 +63,6 @@ type Runner struct {
 	failBeforeLaunchFn       func(context.Context, RunRecord, string, error) (*RunRecord, error)
 	writeScopeMemoryCapFn    func(Scope, int64, int64, bool) error
 	writeScopeSwapCapFn      func(Scope) (string, error)
-	// quiesceConfirmBound is a test seam: the bound on the emptiness confirmation
-	// after the forced cgroup.kill in forceDetachedQuiesce. Zero (always, in
-	// production) means r.grace, the value that confirmation has always used. The
-	// wait BEFORE the kill (r.grace in the caller) must be able to expire so the
-	// force runs, so a test that shortens r.grace for that needs a separate, generous
-	// bound here. ScopeKill.GraceMS keeps recording r.grace: it is the grace allowed
-	// before the forced kill, not this confirmation bound.
-	quiesceConfirmBound time.Duration
 	// beforeRunningAppendFn is a test seam that fires inside the launch flock,
 	// after a successful Start and before the "running" append, to prove the
 	// per-run lock is held through the running append (not released after Start).

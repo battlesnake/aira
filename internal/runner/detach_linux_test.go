@@ -1218,7 +1218,7 @@ func (s *lingerScope) Remove() error         { return nil }
 // The emptiness confirmation after the forced kill has its own bound, separate from
 // the grace the natural-quiesce wait uses. With r.grace at 1ns and a scope that takes
 // three poll ticks to empty after the kill, only a confirmation bounded by
-// quiesceConfirmBound succeeds; one bounded by r.grace reports U_RUN_CAPTURE_INCOMPLETE.
+// forcedQuiesceConfirmBound succeeds; one bounded by r.grace reports U_RUN_CAPTURE_INCOMPLETE.
 func TestForcedQuiesceConfirmationUsesItsOwnBound(t *testing.T) {
 	scope := &lingerScope{members: []int{44}, lingerReads: 3}
 	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, Grace: time.Nanosecond})
@@ -1226,7 +1226,6 @@ func TestForcedQuiesceConfirmationUsesItsOwnBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.grace = time.Nanosecond
-	r.quiesceConfirmBound = testdeadline.Wait(time.Second)
 	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, Detached: true, CgroupScope: scope.Reference(), ScopeIntegrity: ScopeContained, OutputRefs: map[string]OutputRef{}}
 	appendRunEvent(t, r, "starting", run)
 	zero := 0
@@ -1253,11 +1252,10 @@ func TestM20RealForcedQuiescePreservesLeaderExitAndIsNotClean(t *testing.T) {
 	r := realRunner(t)
 	// r.grace is the wait that must EXPIRE so the forced quiesce runs (a negative
 	// wait: contention only makes it more certain). The emptiness confirmation after
-	// the forced kill is a different role, a backstop that must NOT expire, so it has
-	// its own generous bound: kill-to-empty measured p99 100.8 ms, max 240 ms on 2
-	// CPUs under load, inside a 100 ms grace's tail.
+	// the forced kill is a different role, a backstop that must NOT expire, so it runs
+	// on the product's own forcedQuiesceConfirmBound (2s): kill-to-empty measured p99
+	// 100.8 ms, max 240 ms on 2 CPUs under load, inside a 100 ms grace's tail.
 	r.grace = 100 * time.Millisecond
-	r.quiesceConfirmBound = testdeadline.Wait(time.Second)
 	_, result := startRealDetached(t, r, Request{Argv: []string{"/bin/sh", "-c", "sleep 30 & exit 0"}, Merge: true})
 	outcome := <-result
 	if outcome.err != nil || outcome.record == nil {
