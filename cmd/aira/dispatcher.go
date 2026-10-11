@@ -870,13 +870,14 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 // E_DAEMON_UNAVAILABLE and it names both sockets. Anything else, a holder that
 // listens where this client looked but has not bound yet (a restart, a slow
 // database open) or one that recorded nothing, stays the plain timeout with the
-// holder's PID added. Nothing is dialled from the recorded path.
+// holder's PID added. Only this client's own socket is dialled, never the recorded path.
 func (d *daemonDispatcher) lockHolderError(timeout error) error {
-	if _, err := os.Lstat(d.paths.SocketPath); !errors.Is(err, os.ErrNotExist) {
-		return timeout
-	}
+	// A FILE at the client's socket path is not a daemon: a stray killed
+	// uncleanly leaves its socket file behind, under the state directory when
+	// XDG_RUNTIME_DIR is unset, across reboots. Only a socket that answers
+	// (Ready) means this client can reach something.
 	status := daemon.Status(d.paths)
-	if !status.Running || status.Lock.PID <= 0 {
+	if status.Ready || !status.Running || status.Lock.PID <= 0 {
 		return timeout
 	}
 	holder := status.Lock.Socket
@@ -895,8 +896,8 @@ func mismatchedRuntimeError(paths daemon.Paths, pid int, holderSocket, runtimeDi
 		daemon.CodeUnavailable, paths.SocketPath, pid, holderSocket, runtimeDir)
 }
 
-// unreachableDaemonError reports, without dialling anything, that this
-// process's daemon socket can never be served: this state's running daemon (or
+// unreachableDaemonError reports, dialling only this process's own socket, that
+// this process's daemon socket can never be served: this state's running daemon (or
 // its enabled aira-daemon.service) is bound to a different socket, because this
 // process's XDG_RUNTIME_DIR differs from the daemon's. It returns nil whenever
 // it cannot establish that, so a daemon that is merely starting or restarting
@@ -904,14 +905,18 @@ func mismatchedRuntimeError(paths daemon.Paths, pid int, holderSocket, runtimeDi
 // without a deadline, so without this check such a launch is held forever
 // (AIRA-289b).
 func unreachableDaemonError(paths daemon.Paths, systemctl daemon.SystemctlRun, readFile func(string) ([]byte, error), getenv func(string) string) error {
-	if _, err := os.Lstat(paths.SocketPath); !errors.Is(err, os.ErrNotExist) {
+	// Status dials only this process's own socket (100 ms): a socket that
+	// answers is reachable, and a stale socket FILE left by a killed stray is
+	// not a daemon (it must not switch the refusals off).
+	status := daemon.Status(paths)
+	if status.Ready {
 		return nil
 	}
 	runtimeDir := "unset"
 	if value := strings.TrimSpace(getenv("XDG_RUNTIME_DIR")); value != "" {
 		runtimeDir = value
 	}
-	if status := daemon.Status(paths); status.Running && status.Lock.PID > 0 && status.Lock.Socket != "" && status.Lock.Socket != paths.SocketPath {
+	if status.Running && status.Lock.PID > 0 && status.Lock.Socket != "" && status.Lock.Socket != paths.SocketPath {
 		return mismatchedRuntimeError(paths, status.Lock.PID, status.Lock.Socket, runtimeDir)
 	}
 	if service, managed := daemon.ManagedServicePaths(daemon.DefaultServiceUnit, systemctl, readFile, getenv); managed &&

@@ -14,11 +14,37 @@ const DefaultServiceUnit = "aira-daemon.service"
 
 type SystemctlRun func([]string) ([]byte, error)
 
+// RunSystemctl runs argv and returns its stdout. `systemctl --user` addresses
+// the user's own systemd manager, whose runtime directory is /run/user/<uid>
+// whatever XDG_RUNTIME_DIR the caller exports (that variable is aira's choice
+// of socket directory, not a statement about the manager). A process with
+// neither XDG_RUNTIME_DIR nor DBUS_SESSION_BUS_ADDRESS (cron, `env -i`, a gate
+// whose env_allow omits them), or one with a different XDG_RUNTIME_DIR, gets
+// "Failed to connect to bus" from the real tool. So a run that fails in the
+// caller's environment is repeated once with the manager's own runtime
+// directory; a caller that already reaches the manager costs one run
+// (AIRA-289: the service-identity probe must not depend on the caller's
+// session variables).
 func RunSystemctl(argv []string) ([]byte, error) {
 	if len(argv) == 0 {
 		return nil, errors.New("empty command")
 	}
-	return exec.Command(argv[0], argv[1:]...).Output()
+	out, err := exec.Command(argv[0], argv[1:]...).Output()
+	managerRuntime := "/run/user/" + strconv.Itoa(os.Getuid())
+	if err == nil || os.Getenv("XDG_RUNTIME_DIR") == managerRuntime {
+		return out, err
+	}
+	retry := exec.Command(argv[0], argv[1:]...)
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "XDG_RUNTIME_DIR=") {
+			retry.Env = append(retry.Env, entry)
+		}
+	}
+	retry.Env = append(retry.Env, "XDG_RUNTIME_DIR="+managerRuntime)
+	if retried, retryErr := retry.Output(); retryErr == nil {
+		return retried, nil
+	}
+	return out, err
 }
 
 // ServiceIsEnabled intentionally uses only systemctl is-enabled. Unit-file

@@ -378,8 +378,9 @@ outside it until the cutover restart and the rebuild of old binaries.
      not sent). `tryStartupLock` itself is unchanged (a failed open still reads as "not
      won" and the client polls).
    - at the deadline, before the existing generic `E_DAEMON_TIMEOUT`, if this client never
-     won the lock (`!spawned`) and `os.Lstat(d.paths.SocketPath)` reports not-exist, read
-     the lock info (`readLockInfo(d.paths.LockPath)`):
+     won the lock (`!spawned`) and the client's own socket does not answer (`Status.Ready` false;
+     a socket FILE left by a killed stray is not a daemon), read the lock info
+     (`readLockInfo(d.paths.LockPath)`):
      - **holder's recorded socket differs from this client's:** return
        (request-not-sent wrapped, as the surrounding returns are)
        `E_DAEMON_UNAVAILABLE` (exit 4): `no daemon is listening at <SocketPath>; this
@@ -415,13 +416,18 @@ outside it until the cutover restart and the rebuild of old binaries.
    reach; start the service or run with its XDG_RUNTIME_DIR`). A client whose identity
    matches the service still runs `systemctl --user start`; a service serving another state
    is ignored (a developer's own daemon on a private `XDG_STATE_HOME` still forks). Its
-   cost: a client that cannot establish the unit's identity (no `HOME`, `systemctl`
-   failing) still forks, as before.
+   cost: a client that cannot establish the unit's identity (no `HOME`, no reachable user
+   manager at `/run/user/<uid>`) still forks, as before. The identity probe does not depend
+   on the caller's session variables: `daemon.RunSystemctl` repeats a failed `systemctl
+   --user` once with `XDG_RUNTIME_DIR=/run/user/<uid>`, the manager's own runtime directory,
+   because a cron job, `env -i`, or a gate whose `env_allow` omits the session variables
+   otherwise gets "Failed to connect to bus" and would fork (build review round 2).
 7. `cmd/aira/main.go`, `runConfineCommand`: after resolving paths, and before any
    admission, `unreachableDaemonError` returns `E_DAEMON_UNAVAILABLE` (the same
-   `ran=no` refusal as an argument error, exit 4) when the socket is absent and either the
-   state's running lock holder recorded a different socket, or the enabled unit serves this
-   state elsewhere. It dials nothing and returns nil whenever it cannot establish that, so a
+   `ran=no` refusal as an argument error, exit 4) when the client's own socket does not
+   answer and either the state's running lock holder recorded a different socket, or the
+   enabled unit serves this state elsewhere. It dials only the client's own socket (100 ms,
+   through `Status`; never the recorded path) and returns nil whenever it cannot establish that, so a
    daemon that is restarting or starting stays a wait (admission is unbounded by design,
    S13). Same wording as step 4. `aira drain wait` and `confine-reserve` dial the same way
    and are not covered (open, section 7).
@@ -704,9 +710,12 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race`
   restart from a build session).
 - **Service down, mismatched client.** While the unit is down, a mismatched client is now
   refused instead of starting a stray (3.5 step 6); the restart window of the cutover
-  therefore refuses such callers rather than forking. A mismatched client whose `HOME`
-  is not visible cannot identify the unit and still forks; that residual is the pre-v0.34
-  behaviour and ends when the unit is up (the state lock then fences it).
+  therefore refuses such callers rather than forking. A mismatched client that cannot
+  identify the unit still forks: its `HOME` is not visible (no unit file to read), or the
+  user manager is not reachable at `/run/user/<uid>` (a container without the user's
+  systemd). A missing `XDG_RUNTIME_DIR` or session bus is NOT such a case (the probe
+  retries against `/run/user/<uid>`, 3.5 step 6). That residual is the pre-v0.34 behaviour
+  and ends when the unit is up (the state lock then fences it).
 - **Lock-file record.** `LockInfo.Socket` is new; a lock file written by an older daemon
   has none, and the client then keeps today's `E_DAEMON_TIMEOUT`. No compat obligation
   beyond that.
@@ -741,7 +750,7 @@ Release note for every peer: a process that runs `aira` with a different
 `XDG_RUNTIME_DIR` from the daemon's (or none) now fails with `E_DAEMON_UNAVAILABLE` naming
 the cause, instead of starting a second daemon (and `aira confine` refuses at launch
 instead of waiting for a daemon it cannot reach); export `XDG_RUNTIME_DIR` in cron jobs, and
-list it in a gate's `env_allow` when the gate command calls `aira`. Reply to ci-build per
+list it in a gate's `env_allow` when the gate command calls `aira`. The service is identified from `HOME` (its unit file), `XDG_STATE_HOME` if set, and the user's systemd manager at `/run/user/<uid>`: a missing `XDG_RUNTIME_DIR` or session bus does not hide it. Reply to ci-build per
 ticket: 290(a) use `aira mv <id> retired`, no delete by design; 290(b) refusal now names
 the command; 290(c) close path stays three hops by decision (AIRA-215); 290(d) already
 shipped in v0.31; 291 the UNEVALUATED was the gate subject, fixed in v0.33, and the
@@ -806,3 +815,16 @@ two re-measured before the fix. All three accepted.
 | 1 | Concurrent `aira link` to one owner file can fail `E_WRITE_CONFLICT` and leave a pending row; every later write is `E_PATH_INTENT_BUSY` until `aira intent-retire`, which the skill never mentions. | `relation_ready.go` (read, then prepare), `store.go` `preparePathMutationEventKind` (checks only for a pending row), `materialiseIntent` (`ErrWriteConflict`). True; the pre-fix tests are RED. | **Fixed (3.7)** at the root, not by documenting `intent-retire`: prepare refuses a stale precondition before inserting. Tests `TestStalePreconditionIsRefusedWithoutLeavingAPendingIntent`, `TestStaleRelationPreconditionIsRefusedWithoutLeavingAPendingIntent`. The skill names `E_WRITE_CONFLICT` and says a refused write leaves nothing pending. Two existing fixtures that built a conflict through this very window (`seedConflictedRoutingIntent`, `TestRebuildResurrectsARetiredIntentOnlyAsMaterialised`) now build it from an occupied path / the real digest. |
 | 2 | A nested `aira confine` without the daemon's `XDG_RUNTIME_DIR` is not refused; it waits with no deadline. The skill, 3.6, 6, 10 and the ci-build reply claimed otherwise; 1.2's "not reproduced" was an artefact of the probe. | `cmd/aira/main.go` (`AdmitSocketPath = paths.SocketPath`), `admission_linux.go` (`warnDaemonWait`, reconnect without deadline). True. | **Fixed (3.5 step 7), option (a):** refuse at launch when the holder or the unit is known to serve another socket. 1.2, 3.6, 6 and 10 corrected; test `TestConfineWithAMismatchedRuntimeDirIsRefusedNotHeld`. `drain wait`/`confine-reserve` left open (section 7). |
 | 3 | While the service is down, a mismatched client forks a stray that takes the state lock; the service then restarts every 2 s and the box watchdog stays off. | `daemon_command.go:47-52` (ErrAlreadyRunning exits 0), unit `Restart=always`, `spawnDaemon`. True by reading; the first half reproduced in-process by the reviewer. | **Fixed (3.5 step 6)**: `spawnDaemon` refuses when the enabled unit serves this state through another socket. Tests `TestClientNeverForksAStrayWhenTheServiceServesThisStateElsewhere`, `TestClientStillForksItsOwnDaemonWhenTheServiceServesAnotherState`; `TestSpawnDaemonDefersOnlyWhenEnabledAndIdentityMatches` row "identity divergent" now expects the refusal. Residual in section 8. |
+
+### Build review, round 2 (on `d8bc5b3`) and fixes
+
+Five P2 findings from four reviewers; each was checked against the code, and the first
+three were re-measured by the reviewers against the real `systemctl`. All accepted.
+
+| # | Finding | Checked against | Disposition |
+|---|---|---|---|
+| 1 | Round-1 finding 3 (stray daemon while the service is down) is fixed only for a client that reaches the user bus. The fence and the confine launch check both start with `systemctl --user is-enabled`, which fails with "Failed to connect to bus: No medium found" when `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` are both unset (cron, `env -i`, a gate whose `env_allow` omits them), so `managed=false` and the client forks a stray, as before. Three reviewers measured it with the real `systemctl`. Round-1 finding 2 stays open for a confine launched while the service is down (no holder, unit invisible). The spec and the skill overclaimed ("HOME not visible" was named the only residual). | `internal/daemon/service.go` (`ServiceIsEnabled`, `ManagedServicePaths`, `RunSystemctl`). True. The production unit does not bake `XDG_RUNTIME_DIR`, so the `show-environment` call needed the same reach. | **Fixed at the runner:** `daemon.RunSystemctl` repeats a failed run once with `XDG_RUNTIME_DIR=/run/user/<uid>` (the manager's own directory) when the caller's differs or is unset; one run when the caller already reaches the manager. Covers `is-enabled`, `show-environment` and `start`. Tests (a `systemctl` stub on `PATH` that fails like the real tool without the bus, not a stub that answers "enabled" whatever the environment): `TestSystemctlProbeReachesTheUserManagerWithoutARuntimeDirOrBus`, `...FromAnotherRuntimeDir`, `...RunsOnceWhenTheCallerEnvironmentWorks`, `...KeepsADisabledUnitDisabled`, `TestManagedServicePathsResolvesTheUnitWithoutARuntimeDirOrBus`, `TestClientWithNoBusNeverForksAStrayWhenTheServiceServesThisState`, `TestConfineLaunchWithNoBusIsRefusedWhenTheServiceServesThisState`. Spec 3.5 step 6, section 8, the skill and the release note state the real residual. |
+| 2 | `os.Lstat(paths.SocketPath)` in `unreachableDaemonError` and `lockHolderError` skips the refusal whenever any file sits at the client's socket path. With `XDG_RUNTIME_DIR` unset that path is under the state directory, so a stray killed uncleanly leaves it across reboots; every confine then waits forever again. Mutation MC2 (delete the guard) stayed green. | `dispatcher.go` both guards; `Status` dials the socket (100 ms) and sets `Ready`. True. | **Fixed:** both guards use `Status.Ready` (a socket that answers is reachable; a file is not a daemon). Tests `TestADeadSocketFileDoesNotHideAnUnreachableDaemonFromConfine`, `...FromAVerb`, `TestAnAnsweringSocketIsNeverRefusedByTheLaunchCheck` (mutation: restore the Lstat guard, or drop the Ready guard, -> RED). |
+| 3 | Mutations MC3 (service branch disabled), MC4 (empty-recorded-socket guard dropped), MC5 (`Running` guard dropped), MC6 (state-id check dropped), MC7 (holder that recorded the client's own socket refused), MC8 (unit serving the client's own socket refused) all survived the confine launch check. | `dispatcher.go` `unreachableDaemonError`. True (measured by the reviewer). | **Fixed:** `TestConfineLaunchCheckDecisionTable`, eight rows, each a mutation's target (holder elsewhere refuse; holder on own socket wait; holder recording nothing wait; stale record with no lock wait; unit for this state elsewhere refuse; unit on own socket wait; unit for another state wait; unit not enabled wait). Each of MC3-MC8 is now RED. |
+
+Findings 1 and 2 of the round are one root cause (reviewer duplicates), noted once.
