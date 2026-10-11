@@ -748,6 +748,11 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 	if err := os.MkdirAll(d.paths.RuntimeDir, 0o700); err != nil {
 		return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: %w", daemon.CodeUnavailable, err))
 	}
+	// The daemon lock lives beside state.db (AIRA-289), whose directory a fresh
+	// machine may not have yet.
+	if err := os.MkdirAll(filepath.Dir(d.paths.LockPath), 0o700); err != nil {
+		return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: %w", daemon.CodeUnavailable, err))
+	}
 	// One loop interleaves two ways to succeed: (a) connect to a daemon a racing
 	// client already started, or (b) win the startup lock and start one ourselves.
 	// A client that cannot win the lock — because a bound daemon (or another
@@ -836,10 +841,46 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 		return daemon.ResponseFrame{}, err
 	}
 	err = errors.New(daemon.CodeTimeout + ": daemon did not accept before deadline")
+	if !spawned {
+		// This client never won the lock, so someone else holds it: say who, and
+		// whether that holder listens where this client looked.
+		err = d.lockHolderError(err)
+	}
 	if requestNotSent {
 		err = &daemon.RequestNotSentError{Err: err}
 	}
 	return daemon.ResponseFrame{}, err
+}
+
+// lockHolderError words the start-wait failure of a client that never won the
+// daemon lock (AIRA-289). The lock is per state directory, so its holder serves
+// this state's database; the daemon records the socket it serves in the lock
+// file. A holder whose recorded socket is not this client's is a daemon the
+// client can never reach from here (a different XDG_RUNTIME_DIR): that is
+// E_DAEMON_UNAVAILABLE and it names both sockets. Anything else, a holder that
+// listens where this client looked but has not bound yet (a restart, a slow
+// database open) or one that recorded nothing, stays the plain timeout with the
+// holder's PID added. Nothing is dialled from the recorded path.
+func (d *daemonDispatcher) lockHolderError(timeout error) error {
+	if _, err := os.Lstat(d.paths.SocketPath); !errors.Is(err, os.ErrNotExist) {
+		return timeout
+	}
+	status := daemon.Status(d.paths)
+	if !status.Running || status.Lock.PID <= 0 {
+		return timeout
+	}
+	holder := status.Lock.Socket
+	if holder != "" && holder != d.paths.SocketPath {
+		runtimeDir := strings.TrimSpace(d.environment()("XDG_RUNTIME_DIR"))
+		if runtimeDir == "" {
+			runtimeDir = "unset"
+		}
+		return fmt.Errorf("%s: no daemon is listening at %s; this state's daemon (pid %d) listens at %s, so this process's "+
+			"XDG_RUNTIME_DIR (%s) differs from the daemon's; run with the daemon's XDG_RUNTIME_DIR "+
+			"(a gate command that calls aira needs it in env_allow)",
+			daemon.CodeUnavailable, d.paths.SocketPath, status.Lock.PID, holder, runtimeDir)
+	}
+	return fmt.Errorf("%w; the daemon lock is held by pid %d, which has not bound %s yet", timeout, status.Lock.PID, d.paths.SocketPath)
 }
 
 // tryStartupLock makes a single non-blocking attempt to take the shared daemon

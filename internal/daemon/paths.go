@@ -35,6 +35,7 @@ type Paths struct {
 	RuntimeDir       string
 	SocketPath       string
 	LockPath         string
+	LegacyLockPath   string
 }
 
 const (
@@ -440,7 +441,15 @@ func PathsFromEnvironment(stateHome, runtimeDir, home string) (Paths, error) {
 		DBPath: filepath.Join(stateDir, "state.db"), RegistryPath: filepath.Join(stateDir, "registry.jsonl"),
 		LeaseStateDir:    filepath.Join(stateDir, "leases"),
 		ConfineDetachDir: filepath.Join(stateDir, "confine"), RuntimeDir: daemonDir,
-		SocketPath: filepath.Join(daemonDir, "daemon.sock"), LockPath: filepath.Join(daemonDir, "daemon.lock"),
+		SocketPath: filepath.Join(daemonDir, "daemon.sock"),
+		// One daemon per state.db (AIRA-289): the single-instance lock lives with
+		// the database, not beside the socket, so processes that disagree about
+		// XDG_RUNTIME_DIR still contend for the same lock.
+		LockPath: filepath.Join(stateDir, "daemon.lock"),
+		// Until pre-v0.34 binaries are gone, a running daemon also holds the old
+		// runtime-directory lock, so an older client sharing its runtime directory
+		// cannot win that lock and start a second daemon on this state.
+		LegacyLockPath: filepath.Join(daemonDir, "daemon.lock"),
 	}, nil
 }
 
@@ -484,6 +493,10 @@ type LockInfo struct {
 	// and say "restart required" instead of leaving a silently stale daemon. Zero
 	// is an absence (a daemon that predates AIRA-283), never a ratio.
 	CPUSlotsPerCore int `json:"cpu_slots_per_core,omitempty"`
+	// Socket is the socket path the holder serves (AIRA-289). It is read only to
+	// choose and word a client's error when it cannot reach the lock holder;
+	// nothing dials it.
+	Socket string `json:"socket,omitempty"`
 }
 
 type StatusInfo struct {
@@ -497,14 +510,14 @@ func currentBootID() string {
 	return strings.TrimSpace(string(data))
 }
 
-func writeLockInfo(file *os.File, cpuSlotsPerCore int) error {
+func writeLockInfo(file *os.File, cpuSlotsPerCore int, socket string) error {
 	if err := file.Truncate(0); err != nil {
 		return err
 	}
 	if _, err := file.Seek(0, 0); err != nil {
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(LockInfo{PID: os.Getpid(), BootID: currentBootID(), CPUSlotsPerCore: cpuSlotsPerCore}); err != nil {
+	if err := json.NewEncoder(file).Encode(LockInfo{PID: os.Getpid(), BootID: currentBootID(), CPUSlotsPerCore: cpuSlotsPerCore, Socket: socket}); err != nil {
 		return err
 	}
 	return file.Sync()
