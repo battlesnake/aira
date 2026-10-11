@@ -1,6 +1,7 @@
 # AIRA v0.32 small-bugs batch: discovery log flood, check, ledger diagnosis, init, advisories, text
 
-Status: PLAN v2 (2026-10-10; v1 revised after plan review, see section 10, Review log).
+Status: PLAN v3 (2026-10-11; v2 revised after the second plan review, see section 10, Review log;
+v2 was v1 revised after the first).
 Batch of ready bug/chore tickets in one change (owner rule: batch small independent fixes,
 one review and test cycle). Base: master `d13ef3b` (v0.31 + ticket
 close), protocol 15.
@@ -27,7 +28,7 @@ used below.
 | AIRA-175 | `aira check` decides "this allocated ID has a ticket file" by looking only at the absolute path recorded for the allocation, which points into whichever worktree a rebuild scanned last; the ticket says deleting that worktree fails the check although the file is in the checkout being checked. | No (measured) | `Check` calls `s.Rebuild` (`internal/store/check.go:245`) before the allocation loop, and Rebuild re-points every `allocated` ticket row to the scanned file (`internal/store/store.go:3110`, guarded `state='allocated' AND path<>?`); every registered worktree that exists is scanned, the checking one included. Probe (throwaway test, deleted): worktrees a, b, c share one state; a mints `FEE-BL-1`, b imports it, c holds a copy; the row is forced to `state='allocated', path=<b's file>`; b's directory is removed; `c.Check` -> `allocated-id-file: pass`, no `E_ID_UNRESOLVED`, row re-pointed to c's file. Live: the root checkout's only `allocated-id-file` failures are AIRA-198 and AIRA-240, which have no file on any branch (`git log --all -- .aira/tickets/AIRA-{198,240}.md` empty): true positives. | Drop (no build); add the probe as a regression pin, section 3.2 |
 | AIRA-218 | A ledger record carrying a field this build does not know (another aira build wrote it) is reported as corruption, and the schema-version check that exists for that case can never run because the strict decode fails first. | Yes, by code | `internal/runner/ledger.go:309` `DisallowUnknownFields`; `ledgerRecordDefect` (`:389`) tests `decodeErr` before `SchemaVersion`. `ledgerSchema` is still `1` (`:25`). AIRA-172 already degrades `check`/`reconcile` to `unevaluated`, so only the diagnosis remains. | Build (diagnosis only; see 3.3) |
 | AIRA-188 | `aira init` on a new project with no `--prefixes` silently claims the prefix `AIRA`, which is exclusive machine-wide and already owned by this repo, so it fails everywhere else with a confusing ownership conflict. | Yes, by code | `internal/app/project.go:473-476`: `if len(prefixes) == 0 { prefixes = []string{"AIRA"} }`. `docs/project-lifecycle.md:5` says prefixes are optional; `README.md:24` shows bare `aira init`. | Build |
-| AIRA-217 | After an OOM at an AIRA-estimated cap, confine says "The kill is now recorded ... re-run and the next admission is sized higher", even when it has no confirmation that the daemon recorded the kill (the report errored, timed out, or was never sent). | Yes, by code | `internal/runner/confine_linux.go:1431` `_ = deps.reportPeak(...)` discards the error; `ReportPeakSample` (`internal/runner/admission_linux.go:797-840`) also errors when the reply is lost after the daemon already committed the sample (`internal/daemon/confine_report.go:99-105` writes before replying), so an error means "unconfirmed", not "not recorded"; `formatConfineReserveAdvisory` (`:1690`) has no recorded parameter; the claim is in both daemon-reserve arms (`:1747`, `:1768`) and the unevaluated arm's "re-running ... admits at a higher reserve" (`:1773`). | Build |
+| AIRA-217 | After an OOM at an AIRA-estimated cap, confine says "The kill is now recorded ... re-run and the next admission is sized higher", even when it has no confirmation that the daemon recorded the kill (the report errored, timed out, or was never sent). | Yes, by code | `internal/runner/confine_linux.go:1431` `_ = deps.reportPeak(...)` discards the error; `ReportPeakSample` (`internal/runner/admission_linux.go:797-840`) also errors when the reply is lost after the daemon already committed the sample (`internal/daemon/confine_report.go:99-105` writes before replying), so an error means "unconfirmed", not "not recorded"; `formatConfineReserveAdvisory` (`:1690`) has no recorded parameter; the claim is in both daemon-reserve arms (`:1747`, `:1768`) and the unevaluated arm's "re-running ... admits at a higher reserve" (`:1773`). An acknowledgement alone does not establish the resize either: `RecordConfinePeak` stores an OOM with a nil peak (`internal/store/confine_peak_history.go:99-113`, a non-positive peak becomes NULL), and admission escalates only when `stats.OOMCount > 0 && stats.MaxOOMPeak > 0` (`internal/daemon/admit.go:1393`); an escalation above the ceiling is clamped to the fit or refused (`admit.go:1430-1496`). | Build |
 | AIRA-216 | Ticket and finding files are written with `json.Marshal`, which turns `<`, `>`, `&` in a title into `\u003c` etc., so a status-only move rewrites the title bytes. | Yes, measured | 15 ticket files carry the escapes today (`grep -l '\\u003c\|\\u003e\|\\u0026' .aira/tickets/*.md`, e.g. AIRA-182 `--reserve -\u003e --memory-reserve`). Code: `internal/domain/ticket.go:561`, `finding.go:282`, `requirement.go:101`. | Build |
 | AIRA-193 | The admission-wait line prints its live totals as raw byte counts beside a rounded ceiling, so "am I near the ceiling?" cannot be read at a glance. | Yes, measured | This plan's own commit hook waited for admission and printed, 15 s apart: `49744607K already granted across 9 admitted jobs / 50048M slice ceiling`, then `51098094182 already granted across 10 admitted jobs / 49984M slice ceiling`, with `system MemAvailable 57704764K` and `own reserve resolves to 1510111K`: three unit systems on one line. Code: `internal/runner/confine_queue_position_linux.go:209, 269, 279, 322-326` and `confine_linux.go:714-721` use `FormatConfineBytes`, which falls back to raw bytes for any non-round value; the file's own ACCEPTED GAP comment (`:245-262`) defers to this ticket. | Build |
 | AIRA-227 | (1) After a daemon upgrade, a long-lived client (an `aira mcp` server) fails every call with `E_DAEMON_PROTOCOL: daemon protocol is N, client requested M` and no hint that this process is the stale part. (2) `aira install` as root in a container says only "run 'sudo aira install' from an active login session", never `--ci=shim`. | Yes, by code | (1) `cmd/aira/dispatcher.go:664-666` returns the daemon's frame unchanged when the daemon is newer. (2) `internal/install/install.go:662` `sudoIdentityHint`, used by `validateSudoIdentity` (`:723-736`), which a root container without `SUDO_USER` reaches through `runRootInstall`. | Build |
@@ -42,14 +43,17 @@ used below.
 If each problem had to be solved alone, from nothing:
 
 - **209:** before running git discovery on a registry root, check that the directory exists;
-  print a skip line only when that entry's reason changes.
+  print a skip line only when that entry's reason changes, and the pass summary only when its
+  counts change.
 - **175:** nothing: the rebuild `check` already runs re-points the row (measured).
 - **218:** when a strict decode fails, decode the whole payload once more without the
   unknown-field rule (one value, nothing after it); if that succeeds, say the record carries
   an unrecognised field (and check its schema version first).
 - **188:** a new project with no prefixes is refused, naming `--prefixes` / `--prefix`.
-- **217:** keep whether the daemon acknowledged the peak report and choose the sentence from
-  it; without an acknowledgement, claim nothing about recording.
+- **217:** claim the kill is recorded only when the daemon acknowledged a report that carried
+  a peak (the only record admission escalates from), and never promise that the next run is
+  sized higher; otherwise claim nothing about recording and point at `aira confine --budget`,
+  which shows what was recorded.
 - **216:** one encoder with HTML escaping off, used by the three front-matter writers.
 - **193:** render every byte figure on the admission-wait line in one unit, the nearest MiB
   rule the owner already chose for `aira top`.
@@ -68,7 +72,7 @@ shared by `aira top` and the wait line (193), and one cap conversion in
 | 209 | Latch a dead root (never retry) | Breaks `TestRunRegistryDiscoveryRetriesTransientEntry`, which requires a transiently failing root to be retried and covered. The stat costs microseconds, so retrying an absent root forever is free once git is not forked. |
 | 209 | Stat inside `discoverProjectAt`'s production branch only (the ticket's option b) | Leaves every hook-driven test unable to observe the short-cut, so the "git discovery not called for an absent root" test cannot be written. Option (a) with real-directory fixtures keeps every test meaningful. |
 | 209 | Add a log level and demote the line to debug | There is no log-level concept in `internal/daemon`; inventing one is more machinery than a transition map, and the first occurrence of each reason is real information. |
-| 209 | Also make the aggregate "discovered/registered/skipped" line transition-only | The ticket asks to leave it; it is the one per-pass heartbeat. Its cadence rises from one per ~150 s to one per 30 s (2 lines/min), stated under Risks. |
+| 209 | Leave the aggregate "discovered/registered/skipped" line printing every pass (v2, the ticket's wording) | Once passes are fast it prints every 30 s with identical counts on this box (`discovered 0 new / 2250 registered, 1363 skipped`, about 2,880 lines a day), again most of the journal. Print-on-change loses no information: every change of count is still printed. The daemon's liveness is systemd's, not this line's. |
 | 175 | v1's own-checkout fallback in the allocation loop | No reproduction: `check`'s own rebuild already re-points the row (probe, section 1). A fallback would add a second resolution path that can only ever pass what the first already passes, plus its twin tests. |
 | 175 | Bound `check` to the invoking worktree only (the ticket's "second finding") | Changes what `check` covers across all dimensions; the ticket calls it an owner decision. Section 7. |
 | 175 | Delete stale `tickets` rows in Rebuild (the 2026-09-09 amendment) | A separate data-model change to the rebuild; no live finding needs it today. Section 7. |
@@ -81,6 +85,7 @@ shared by `aira top` and the wait line (193), and one cap conversion in
 | 217 | Retry, spool, or widen the 250 ms report deadline | The ticket rules these out; the fix is to stop asserting what the client cannot establish. |
 | 217 | Say "the kill was NOT recorded" on a report error (v1) | False negative: the reply can be lost after the daemon committed the sample, and with no signature no report is sent at all. An error establishes only "unconfirmed". |
 | 217 | A `peak-report=recorded\|failed` trailer facet | Optional in the ticket; changes the trailer peers parse. Section 7. |
+| 217 | One unconditional hedged sentence, no acknowledgement flag (review, v3) | Smaller, but every OOM would then lose the zero-action remedy (re-run the identical command) and send the operator to `--budget`, although the client holds the one signal that decides it in the common case: an acknowledged report carrying a peak. The flag is one boolean computed at the existing call site. The unevaluated arm, where the cap's origin is unknown anyway, does take the unconditional wording. |
 | 216 | Rewrite the 15 escaped files now | Not needed: they parse, and each unescapes on its next write. |
 | 216 | Also fix `internal/gate/gate.go:225` (`json.MarshalIndent`, same escaping) | Gate files are bound by `definition_digest` in attestations and proofs (`internal/store/gate_eval.go`), so a byte change there has consequences this batch has not reviewed. New observation, section 7. |
 | 193 | One-decimal GiB (`51.7G`) | The owner chose whole MiB for `aira top` (`4ea6b86`, authored by the owner); one rule for both faces. |
@@ -109,15 +114,21 @@ shared by `aira top` and the wait line (193), and one cap conversion in
   `storeForScope` error) goes through it, so all reasons are transition-logged.
 - On the success path (the entry is covered), delete its key, so a later failure logs again.
   No separate recovery line: the aggregate line's `discovered N new` already reports it.
-- The aggregate line (`discovery.go:80-82`) is unchanged.
+- The aggregate line (`discovery.go:80-82`) keeps its text and its existing condition
+  (`discovered > 0 || skipped > 0`) and is additionally printed only when the
+  (discovered, registered, skipped) triple differs from the last one printed. One more `Server`
+  field beside the map, `discoveryLastSummary [3]int`, under `s.mu`. A pass whose triple
+  repeats prints nothing; the first pass after a daemon start always prints (the zero triple
+  never matches a printable one).
 - Fixture change in `TestDiscoverRegistryPassSkipsBadEntriesAndGuardsIdentity`
   (`discovery_test.go:141-142`): `/reused` becomes a real directory under `t.TempDir()` so the
   identity-mismatch branch is still reached through the hook (otherwise the stat would skip it
   and the test would pass vacuously); `/missing` becomes an absent path under `t.TempDir()`.
   The test also asserts the hook was called for the reused root.
 
-Effect on the box: 1,363 skip lines per pass become 194 lines once per daemon start; git forks
-for absent roots drop from about 4,100 per pass to 0; a pass takes milliseconds.
+Effect on the box: 1,363 skip lines per pass become 194 lines once per daemon start, and the
+summary line prints once per change of counts instead of every pass; git forks for absent
+roots drop from about 4,100 per pass to 0; a pass takes milliseconds.
 
 ### 3.2 AIRA-175: no build; pin the behaviour that already holds
 
@@ -128,9 +139,16 @@ file; b's directory is removed; `Check` from c, which holds the file, reports
 `allocated-id-file: pass`, no `E_ID_UNRESOLVED`, and the row now points at c's file. It
 passes today; it fails if the rebuild re-point (`store.go:3110`) is removed. Note for the
 record: `Check` is not read-only (it runs reconcile and `Rebuild`, which can write
-projections and recovery receipts), and requirement rows have no equivalent re-point
-(their allocation turns `materialised` on create, `requirement.go:291`, so no live path
-leaves one `allocated` beside a file). Section 7.
+projections and recovery receipts). Requirement allocation rows have no equivalent re-point
+(Rebuild's requirement loop, `store.go:3124-3184`, upserts the projection but never updates
+the allocation's path), and a requirement row CAN stay `allocated` beside its file: the crash
+window between the file write and `markRequirementMaterialised` (`requirement.go:275`), which
+`TestCheckResolvesCrashWindowRequirementAllocation` (`check_requirement_test.go:86`) covers in
+the allocating worktree. Whether such a row resolves from another worktree after the
+allocating one is removed is unevaluated, and the missing re-point is a possible false-fail
+direction (`E_ID_UNRESOLVED` for a requirement file present in the checking worktree). Not
+built here (no reproduction, and it needs a crash plus a removed worktree); recorded in
+section 7 with its one-statement fix.
 
 ### 3.3 AIRA-218: say what an unknown ledger field is; make the schema arm reachable
 
@@ -144,8 +162,11 @@ leaves one `allocated` beside a file). Section 7.
   result counts as "decoded" only if both hold.
   - lenient decode or its EOF check fails -> today's message, `payload did not decode as a
     ledger event: <strict error>`;
-  - lenient decoded and `SchemaVersion != ledgerSchema` -> `schema_version is X, want Y` (the
-    arm is now reachable for a record that also carries new fields);
+  - lenient decoded and `SchemaVersion != ledgerSchema` -> `schema_version is X, want Y
+    (<strict error, which names the field>)` (the arm is now reachable for a record that also
+    carries new fields; the strict error is appended so the field name is not lost, including
+    for a record with no `schema_version`, which reads as 0). A strictly decoded record with a
+    wrong schema keeps today's message unchanged;
   - lenient decoded with the expected schema -> `record carries a field this aira build does
     not recognise (<strict error, which names the field>); possibly a record shape from a
     different aira build: run one aira build on this machine`. It claims nothing about who
@@ -181,7 +202,7 @@ project on this machine, so AIRA does not choose one for you.` (The CLI folds re
   explains why; the help example at `internal/core/core.go:2439` uses `DEMO` instead of
   `AIRA` (this machine's AIRA prefix is owned).
 
-### 3.5 AIRA-217: the OOM advisory claims recording only on an acknowledgement
+### 3.5 AIRA-217: the OOM advisory claims recording only for an acknowledged report with a peak, and never promises "higher"
 
 `internal/runner/confine_linux.go`:
 
@@ -189,21 +210,38 @@ project on this machine, so AIRA does not choose one for you.` (The CLI folds re
   shouldRecordConfinePeak(...)` block, `peakAcknowledged = deps.reportPeak(...) == nil`
   (`ReportPeakSample` returns nil only on the daemon's `OK` reply, sent after
   `RecordConfinePeak` commits). Not attempted (no signature) is not acknowledged.
-- `formatConfineReserveAdvisory` gains `peakAcknowledged bool`. With `true`, every output is
-  byte-identical to today. With `false`, the advisory makes no claim either way about the
-  recording, because an error can follow a committed sample (lost reply) and the client cannot
-  tell:
-  - daemon-reserve, ordinary arm: `... AIRA could not confirm that this kill was recorded
-    against the command's signature, so do not rely on the next admission being sized from
-    it: pin --memory-reserve <suggested> to size the re-run yourself.` No "genuine bug worth
+- `formatConfineReserveAdvisory` gains `peakAcknowledged bool` and derives one local:
+  `recorded := peakAcknowledged && peakRSS != nil && *peakRSS > 0`. The peak term is needed
+  because the daemon stores an OOM with an unknown peak as NULL and admission escalates only
+  from `MaxOOMPeak > 0` (`admit.go:1393`): an acknowledged report without a peak is recorded
+  but drives no resize. The peak the advisory sees is the same `usage.PeakRSS` the report
+  carried.
+- Even `recorded` does not establish "sized higher": the escalation can be clamped to the
+  slice's fit or refused `E_ADMIT_TOO_LARGE` (`admit.go:1430-1496`). So no arm says "sized
+  higher" any more.
+  - daemon-reserve, ordinary arm, `recorded`: `... The kill and its peak are recorded against
+    this command's signature: RE-RUN THE IDENTICAL COMMAND and admission sizes the next run
+    from that record on its own, or pin --memory-reserve <suggested> now to skip the cycle. If
+    an identical re-run is admitted at the same cap and killed again, that is a genuine bug
+    worth reporting.` (Today's text with "is sized higher" replaced and "admitted at" added:
+    a clamped or refused re-run is not one admitted at the same cap.)
+  - daemon-reserve, ordinary arm, not `recorded`: `... AIRA could not confirm that this kill
+    was recorded with its peak against the command's signature, so do not rely on the next
+    admission being sized from it: run aira confine --budget to see what was recorded, or pin
+    --memory-reserve <suggested> to size the re-run yourself.` No "genuine bug worth
     reporting" clause.
-  - daemon-reserve, over-ceiling arm (`suggested >= sliceCapBytes`): `... so no pin is
-    offered. AIRA could not confirm that this kill was recorded, so automatic resizing is
-    unevaluated: split heavy work, or run where the slice is larger.` It never names a pin
-    (the AIRA-184 BLOCK).
-  - unevaluated cap source: the clause "if AIRA estimated it, re-running the identical command
-    admits at a higher reserve" becomes "if AIRA estimated it, AIRA could not confirm the kill
-    was recorded, so do not rely on a re-run being sized from it".
+  - daemon-reserve, over-ceiling arm (`suggested >= sliceCapBytes`), `recorded`: today's text,
+    byte-identical (it already names both outcomes, fitted or refused, and claims no
+    "higher").
+  - over-ceiling arm, not `recorded`: `... so no pin is offered. AIRA could not confirm that
+    this kill was recorded with its peak, so automatic resizing is unevaluated: run aira
+    confine --budget to see what was recorded; split heavy work, or run where the slice is
+    larger.` It never names a pin (the AIRA-184 BLOCK).
+  - unevaluated cap source, one wording whatever the flag (the cap's origin is unknown, so
+    the record's effect is too): the clause "if AIRA estimated it, re-running the identical
+    command admits at a higher reserve" becomes "if AIRA estimated it, run aira confine
+    --budget to see whether this kill was recorded against the command, which is what lets
+    admission size an identical re-run from it".
   - `--memory-max` / `--memory-reserve` arms and the near-cap line: unchanged (they assert no
     recording).
 
@@ -227,9 +265,13 @@ write.
 ### 3.7 AIRA-193: one unit on the admission-wait line
 
 - Move `topFormatMegabytes` (`cmd/aira/tui_top.go:171`) to `internal/runner` as
-  `FormatConfineMegabytes(value int64) string` (unchanged rule: nearest MiB, `"0M"` for
-  `value <= 0`); `aira top`'s call sites in `cmd/aira/tui_top.go` call it; the cmd/aira copy
-  and its test move to runner. One implementation for both faces.
+  `FormatConfineMegabytes(value int64) string` (unchanged rule: nearest MiB, half up, `"0M"`
+  for `value <= 0`); `aira top`'s call sites in `cmd/aira/tui_top.go` call it; the cmd/aira
+  copy and its test move to runner. One implementation for both faces.
+- The rounding is made overflow-safe while moving it: today's `(value+mib/2)/mib`
+  (`tui_top.go:176`) overflows for `value > MaxInt64 - 2^19` and prints a negative figure.
+  New form: `q, r := value/mib, value%mib; if r >= mib/2 { q++ }` (same result everywhere
+  else; `q++` cannot overflow, since `q <= 2^43 - 1`).
 - Every byte figure on the admission-wait line uses it: the head reserve and declared VRAM
   (`confine_linux.go:714-721`), the MemAvailable note (`confine_queue_position_linux.go:193`),
   `queued ahead` (`:209`), `already granted` and `slice ceiling` in `confineHeldNote`
@@ -309,7 +351,8 @@ Replace the four stale sites (`__init__.py:73-74`, `:90-93`; `supervisor.py:892-
    that exists is discovered exactly as today, every pass (no latch).
 2. (209) For one (worktree id, root) key, a skip line is printed only when the reason text
    differs from the last one printed for that key; a key that is covered is forgotten. The
-   `skipped` count still counts every skipped entry every pass.
+   `skipped` count still counts every skipped entry every pass. The summary line is printed
+   only when its (discovered, registered, skipped) triple differs from the last one printed.
 3. (175) No production change; `check`'s rebuild keeps re-pointing an `allocated` ticket row
    to a live file (pinned by a test).
 4. (218) The set of ledger records accepted is unchanged; only the message of a rejection
@@ -319,14 +362,16 @@ Replace the four stale sites (`__init__.py:73-74`, `:90-93`; `supervisor.py:892-
    decodes leniently.
 6. (188) A fresh init with no prefixes writes no file and claims no prefix.
 7. (217) The OOM advisory asserts that a kill was recorded only when `reportPeak` returned
-   nil (the daemon's acknowledgement) for this run; without it, it asserts neither recorded
-   nor not-recorded, and the over-ceiling arm never names a pin.
+   nil (the daemon's acknowledgement) for this run AND the run's peak was known and positive;
+   otherwise it asserts neither recorded nor not-recorded. No arm promises that the next run
+   is sized higher, and the over-ceiling arm never names a pin.
 8. (216) Rendered front matter contains no `\u003c`, `\u003e` or `\u0026`; for content without
    those characters the rendered bytes are identical to today's; a render followed by a parse
    round-trips.
 9. (193) Every byte figure on the admission-wait line is in whole MiB, established zeros
    included (`0M`); the trailer and every other surface keep `FormatConfineBytes`. An
-   unestablished figure is omitted, never `0M`.
+   unestablished figure is omitted, never `0M`. The MiB formatter never prints a negative
+   figure for a positive input (no overflow up to `MaxInt64`).
 10. (231) `_pool_budget` is set from a real (string) grant and stays `None` for a cap that
     does not parse; never a fabricated 0.
 11. (227, 219, 263, 255) Codes, exits and behaviour unchanged; only text.
@@ -351,9 +396,14 @@ fail today). Each listed mutation must turn at least one test RED.
 - `TestRunRegistryDiscoveryRetriesTransientEntry` passes unmodified.
 - The converted `TestDiscoverRegistryPassSkipsBadEntriesAndGuardsIdentity` asserts the hook
   was called for the reused root.
+- Summary line: three passes over one absent root -> exactly one `registry discovery:`
+  summary line; a fourth pass after a second absent entry is appended to the registry
+  (registered and skipped change) -> exactly one more (RED today: three, then four).
 - Mutations: log every pass (first test RED); stat after the hook (second RED); key on
   worktree id only (two-roots RED); never delete the key on success (transition test RED);
-  latch an absent root (the transition test's last step never reaches the hook, RED).
+  latch an absent root (the transition test's last step never reaches the hook, RED); print
+  the summary every pass (summary test RED); never print it again after the first (summary
+  test's fourth pass RED).
 
 **AIRA-175** (`internal/store`): the regression pin of section 3.2 (passes today). Mutation:
 drop the re-point `UPDATE` in Rebuild (RED).
@@ -363,8 +413,12 @@ drop the re-point `UPDATE` in Rebuild (RED).
 - schema 1 record plus an unknown field -> `E_JOURNAL_CORRUPT`, message names the field and
   says "does not recognise", does not contain "did not decode", "newer" or "written by"
   (RED today);
-- schema 2 record plus an unknown field -> `schema_version is 2, want 1` (RED today: "did not
-  decode");
+- schema 2 record plus an unknown field -> `schema_version is 2, want 1` and the field name
+  (RED today: "did not decode");
+- record with no `schema_version` plus an unknown field -> `schema_version is 0, want 1` and
+  the field name (pins the precedence choice: schema first, field name kept);
+- schema 2 record with no unknown field -> exactly today's `schema_version is 2, want 1`
+  (strict path unchanged);
 - malformed JSON with a valid checksum -> `payload did not decode` (unchanged);
 - schema 1 record plus an unknown field, followed by trailing content in the same payload
   (a second JSON value; garbage bytes) -> `payload did not decode`, not the unknown-field
@@ -374,7 +428,8 @@ drop the re-point `UPDATE` in Rebuild (RED).
   `run-ledger: unevaluated` and every other dimension exactly as a healthy ledger
   (regression guard; passes today).
 - Mutations: drop the lenient re-decode (first two RED); check the schema after the
-  unknown-field branch (second RED); drop the lenient EOF check (trailing-content case RED);
+  unknown-field branch (second and third RED); drop the appended strict error from the schema
+  arm (second and third RED); drop the lenient EOF check (trailing-content case RED);
   classify with the lenient decode on the hot path and accept unknown fields (a strict-reject
   test RED). Coverage gap, accepted: that the lenient
   decode runs only on the failure path is a code-reading item for the build review.
@@ -388,21 +443,35 @@ drop the re-point `UPDATE` in Rebuild (RED).
 - Mutations: restore the default (both RED); refuse in the adopt path too (adopt tests RED).
 
 **AIRA-217** (`internal/runner`):
-- `formatConfineReserveAdvisory` table: every existing golden gains `peakAcknowledged: true`
-  and is byte-identical; new `false` rows for the daemon-reserve ordinary arm, the
-  over-ceiling arm and the unevaluated arm: full expected strings; each asserts no "The kill
-  is now recorded", no "NOT recorded"/"was not recorded", and no "genuine bug worth
-  reporting"; the over-ceiling `false` row asserts no `--memory-reserve` pin.
+- `formatConfineReserveAdvisory` table, full expected strings. The existing goldens are
+  updated, not kept: the daemon-reserve ordinary rows and the unevaluated row change text
+  (they carried the "sized higher" / "admits at a higher reserve" promise); the over-ceiling
+  rows with `peakAcknowledged: true` and a known peak stay byte-identical. New rows:
+  - ordinary arm and over-ceiling arm, `peakAcknowledged: false`, known peak -> hedged text;
+  - ordinary arm and over-ceiling arm, `peakAcknowledged: true`, peak `nil` -> the same
+    hedged text (acknowledged, but a record admission cannot escalate from);
+  - unevaluated arm with each flag value -> the same string.
+  Every row asserts no "sized higher" and no "admits at a higher reserve"; every hedged row
+  asserts no "The kill and its peak are recorded", no "NOT recorded"/"was not recorded", no
+  "genuine bug worth reporting", and contains `aira confine --budget`; the over-ceiling hedged
+  rows assert no `--memory-reserve` pin.
 - Plumbing, through `confineWithDeps`, own-cap OOM at a daemon-reserve cap:
-  - `deps.reportPeak` returns an error -> the advisory carries the "could not confirm" text
-    (RED against a build that ignores the result);
+  - `deps.reportPeak` returns an error -> the advisory carries the hedged text (RED against a
+    build that ignores the result);
   - acknowledgement lost after persistence: the stub appends the sample to a fake history,
     then returns `context.DeadlineExceeded` -> the history holds the sample AND the advisory
-    carries the "could not confirm" text, never a not-recorded claim;
-  - `deps.reportPeak` returns nil -> today's recorded text.
-- Mutations: `peakAcknowledged = true` unconditionally (plumbing RED); invert the flag
-  (goldens RED); name a pin in the over-ceiling `false` arm (RED); say "was not recorded" in
-  a `false` arm (RED).
+    carries the hedged text, never a not-recorded claim;
+  - `deps.reportPeak` returns nil with a known peak -> the recorded text;
+  - `deps.reportPeak` returns nil with the peak unreadable (usage `PeakRSS == nil`) -> the
+    hedged text;
+  - no signature (an argv `ResourceSignature` rejects, if the existing deps can reach the
+    OOM path with one) -> `reportPeak` is not called and the advisory carries the hedged text.
+    If no fixture can reach it, it is a recorded coverage gap: the `false` default of the flag
+    is read in the build review.
+- Mutations: `peakAcknowledged = true` unconditionally (plumbing RED); drop the peak term
+  from `recorded` (nil-peak rows RED); invert the flag (goldens RED); name a pin in the
+  over-ceiling hedged arm (RED); say "was not recorded" in a hedged arm (RED); keep "sized
+  higher" in the recorded arm (golden RED).
 
 **AIRA-216** (`internal/domain`):
 - rendered bytes for a ticket titled `planned -> done & <id> handling`: no `\u003c`,
@@ -418,7 +487,9 @@ drop the re-point `UPDATE` in Rebuild (RED).
 
 **AIRA-193** (`internal/runner`, `cmd/aira`):
 - `FormatConfineMegabytes`: zero, negative, exact, round-down, round-up, large (the moved
-  `aira top` test).
+  `aira top` test); boundary: `MaxInt64` -> `8796093022208M`, `MaxInt64 - 2^19 + 1` (the
+  first value today's form overflows) -> `8796093022208M`, and exactly half a MiB above a
+  whole MiB rounds up (RED today on the two boundary rows: negative output).
 - queue line: held 54194584616 B over 5 jobs, ceiling 52608 MiB, ahead 5769372876 B ->
   contains `5502M queued ahead, 51684M already granted across 5 admitted jobs / 52608M slice
   ceiling` (RED today); own-reserve over-ceiling note in M; head reserve `12288M` for a 12 GiB
@@ -430,7 +501,8 @@ drop the re-point `UPDATE` in Rebuild (RED).
   passes.
 - `aira top` render test (`TestTopRuntimeRendersAndQuits`) still shows `65536M`/`28672M`.
 - Mutations: leave one figure on `FormatConfineBytes` (RED); leave either zero literal at
-  `"0B"` (RED); change `FormatConfineBytes` instead (trailer golden RED).
+  `"0B"` (RED); change `FormatConfineBytes` instead (trailer golden RED); restore
+  `(value+mib/2)/mib` (boundary RED); round half down (`r > mib/2`, half-MiB row RED).
 
 **AIRA-227** (`cmd/aira/dispatcher_inprocess_test.go`, `internal/install`):
 - exchange returns `Proto: daemon.ProtocolVersion+1, Code: E_DAEMON_PROTOCOL` -> response code
@@ -478,12 +550,13 @@ Gate: `aira confine -- make ci` (the gate's exact command, foreground on a quiet
 |---|---|
 | AIRA-244 | Fixed in `9e210d7` (v0.10). Close as done. |
 | AIRA-175: bound `check` to the invoking worktree; Rebuild deleting stale `tickets` rows | Owner decision and a data-model change respectively (the ticket says so). |
-| AIRA-175: requirement allocation rows have no rebuild re-point; `allocated-id-file` runs on unreconciled rows when `check`'s rebuild itself fails | Not reproduced on any live path (a requirement row turns `materialised` on create; a failed rebuild already fails or unevaluates `rebuild-integrity`). Recorded, not built. |
+| AIRA-175: requirement allocation rows have no rebuild re-point, so a crash-window requirement row (`allocated` beside its file) whose allocating worktree is later removed can fail `allocated-id-file` from a worktree that holds the file (possible false-fail, unevaluated); `allocated-id-file` runs on unreconciled rows when `check`'s rebuild itself fails | Not reproduced (needs a crash in the write-to-materialise window plus a removed worktree; a failed rebuild already fails or unevaluates `rebuild-integrity`). The fix, if wanted, is the ticket loop's guarded re-point `UPDATE` (`store.go:3110`) mirrored into the requirement loop, with a test like section 3.2's. Suggest a ticket. |
 | `check`'s 7 `E_RELATION_INDEX_DIVERGENCE` and 2 `E_FINDING_INDEX_DIVERGENCE` on the root checkout today | Not triaged; they may be a stale index or another false-positive class. Suggest a ticket. |
 | AIRA-209: `registry.jsonl` growth (2,247 records; AIRA-88 decided append-only on a 131-record premise) | AIRA-88's decision stands until the owner revisits it; open question. |
 | AIRA-218: a distinct code; the ~13 replay-integrity `E_JOURNAL_CORRUPT` sites without record coordinates (`ledger.go:211-225`, `:461-495`, `internal/store/gate_audit.go:69-83`) | Owner question / coverage gap recorded (RANT-22 recurs only on a replay failure). |
 | AIRA-188: telemetry-only projects (zero prefixes, a named mode) and the enable-tickets transition hazard | A new project mode read by several verbs; belongs with AIRA-190. |
 | AIRA-217: `peak-report=acknowledged\|unconfirmed` trailer facet | Optional; changes a parsed surface. |
+| AIRA-217: the ordinary arm's pin checked against the slice's whole cap, not cap minus headroom | The existing ACCEPTED GAP (`confine_linux.go`, AIRA-184), unchanged. |
 | AIRA-216: `internal/gate/gate.go:225` gate files escape `&`/`<`/`>` too | Gate files are digest-bound in attestations; needs its own review. Suggest a ticket. |
 | AIRA-193: `E_ADMIT_SATURATED` terminal message and `confine --list` figures | Different surfaces, not asked for. |
 | AIRA-219: the ticket's `--admit-timeout` remedy and "name the budget" | Moot since S13 (no admission timeout exists). |
@@ -492,9 +565,10 @@ Gate: `aira confine -- make ci` (the gate's exact command, foreground on a quiet
 ## 8. Risks
 
 - **Discovery (209).** A root that exists but is not a project still forks git every pass
-  (rare; logged once). The aggregate line's cadence rises to one per 30 s (2 lines/min)
-  because passes become fast. On each daemon start the 194 dead keys log once (a burst, then
-  silence). Review: the map is read and written under `s.mu` only.
+  (rare; logged once). The summary line no longer prints every pass, so a journal reader no
+  longer sees a per-pass heartbeat; any change of counts is still printed. On each daemon
+  start the 194 dead keys log once (a burst, then silence). Review: the map and the last
+  summary are read and written under `s.mu` only.
 - **Init (188).** Any script running bare `aira init` on a new repository now fails with exit
   2 and the remedy. No compat obligation (owner rule); the README and lifecycle doc are
   updated. Repositories with a committed config are unaffected.
@@ -504,7 +578,8 @@ Gate: `aira confine -- make ci` (the gate's exact command, foreground on a quiet
   backlog import is the one peer that re-imports; mention it in the release notes.
 - **Wait-line format (193).** Peers that parse the admission-wait line see `M` figures
   instead of raw bytes; it is a human progress line, not a contract (the trailer is
-  unchanged).
+  unchanged). A pinned round reserve now reads in MiB on the head line too: `--memory-reserve
+  12G` echoes `12288M` (release notes).
 - **Message text (217, 218, 219, 227).** Codes and exits unchanged; tests pinning exact text
   are updated, not added beside.
 - **Daemon restart.** 209, 188 and 216 run inside the daemon; `aira install` restarts it
@@ -516,12 +591,17 @@ Build in this order (independent; correctness-sensitive first so the two-loop re
 most time): 209, 218, 188, 217, 175 (pin only), 216, 193, 227, 219, 231, 263, 255. Proto unchanged
 (15). Daemon restart via `aira install`; `aira skill install ~/.claude/skills/aira --force`
 for the skill text; the embedded aitest pylib changes (231, 263, 255) ship with the binary.
-Close AIRA-244 as done. AIRA-175: close the path-lookup report as not reproducing (pin
+Release notes also name: the admission-wait line's figures are whole MiB (a pinned
+`--memory-reserve 12G` echoes `12288M`); the daemon's discovery summary line prints on change
+only; the OOM advisory no longer promises a higher reserve and points at `aira confine
+--budget` when it cannot confirm the record. Close AIRA-244 as done. AIRA-175: close the path-lookup report as not reproducing (pin
 landed); whether to keep it open for its two owner decisions (section 7) is an owner question. Notify deploy and speed per the release rule; tell deploy that the
 `@aira_cpu` text changed (AIRA-263; their `pytest.ini` copy) and that bare `aira init` on a
 new repository is now refused.
 
-## 10. Review log (plan v1 -> v2)
+## 10. Review log
+
+### Plan v1 -> v2
 
 Two plan reviews (one BLOCK, one PASS_WITH_CHANGES). Each claim was checked against the code.
 
@@ -538,3 +618,22 @@ Two plan reviews (one BLOCK, one PASS_WITH_CHANGES). Each claim was checked agai
 | R2.4 | AIRA-218 is the one removable item; keep it, confirm single decode on the hot path. | Accepted as a build-review item | Already invariant 4; the lenient decode is on the failure path only. |
 | R2.5 | `check.go:303` drifted to `:306`. | Moot | The 175 section that cited it is gone. |
 
+
+### Plan v2 -> v3
+
+Two plan reviews (PASS_WITH_CHANGES, PASS). Each claim was checked against the code at
+`9233601`.
+
+| # | Claim | Verdict | Evidence / change |
+|---|---|---|---|
+| R3.1 (P1) | AIRA-217: an acknowledgement does not establish "next admission sized higher": `RecordConfinePeak` accepts an OOM with a nil peak, admission escalates only from `MaxOOMPeak > 0`. Keeping every golden keeps false claims; test acknowledged-with-unreadable-peak and no-signature. | Accepted | `confine_peak_history.go:109-112` (non-positive peak -> NULL), `admit.go:1393` (`stats.OOMCount > 0 && stats.MaxOOMPeak > 0`); also the clamp/refusal at `admit.go:1430-1496`. "Recorded" now needs acknowledgement AND a known peak; no arm says "sized higher"; the ordinary and unevaluated goldens change; nil-peak and no-signature tests added (3.5, section 5). |
+| R3.2 (P2) | AIRA-175: "no live path leaves a requirement `allocated` beside its file" is false; `TestCheckResolvesCrashWindowRequirementAllocation` covers that window. Describe cross-worktree requirement resolution as unevaluated; possible false-fail. | Accepted | `check_requirement_test.go:86`; Rebuild's requirement loop (`store.go:3124-3184`) has no re-point. 3.2 and section 7 corrected; the one-statement fix recorded as a suggested ticket, not built. |
+| R3.3 (P2) | AIRA-193: `topFormatMegabytes`'s `(value+mib/2)/mib` overflows near `MaxInt64`. | Accepted | `tui_top.go:176`; overflows for `value > MaxInt64 - 2^19`. Quotient/remainder rounding and boundary tests added (3.7, section 5). |
+| R3.4 (info) | AIRA-217: an unconditional hedge without the acknowledgement flag is the from-scratch minimum; keep the flag only if confirmed-record feedback matters. | Partly accepted | The unevaluated arm takes one unconditional wording. The flag is kept for the daemon-reserve arms: it is the signal that keeps the zero-action re-run remedy in the common case (section 2 table). |
+| R3.5 (info) | Requirement rendering under AIRA-216 is optional consistency work. | Noted, kept | One call-site change keeps all three front-matter writers on one encoder; its delimiter test is shared with the other two. |
+| R3.6 (P3) | AIRA-218 is the one removable item (ticket offers wont-fix; today's message already names the field). | Kept; owner question stands | `ledger.go:392` does print `json: unknown field "x"` today. What the build adds is the unreachable schema arm made reachable and the remedy sentence; the drop remains an owner question. |
+| R3.7 (P3) | AIRA-217: the hedged arms should point at `aira confine --budget`, which classifies a recorded OOM under-provisioned on the first occurrence. | Accepted | `skill.go:321` documents exactly that. Every hedged arm and the unevaluated arm name it (3.5). |
+| R3.8 (P3) | AIRA-209: the summary line still prints every ~30 s with identical counts (~2,880 lines/day). | Accepted | `discovery.go:80` prints whenever `skipped > 0`, which holds every pass while dead roots are registered. Summary now print-on-change (3.1, invariant 2, tests); deviates from the ticket's "leave it", which predates fast passes. |
+| R3.9 (P3) | AIRA-218: a record with no `schema_version` plus an unknown field would report only `schema_version is 0, want 1`, losing the field name; pin it. | Accepted, improved | The lenient-path schema message now appends the strict error, so the field name is kept; test pins the schema-0 case and that the strict-path schema message is unchanged (3.3, section 5). |
+| R3.10 (P3) | AIRA-193: a pinned `--memory-reserve 12G` now echoes `12288M`; release notes. | Accepted | Already a test (section 5); now in Risks and release notes. |
+| R3.11 (info) | Static-review limits; verified claims (209 re-measured, 244 fixed, 216 safety, hook-test fixtures). | Noted | No change. |
