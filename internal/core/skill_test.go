@@ -1208,3 +1208,80 @@ func TestSkillTeachesToWrapOnceAtTheOutermostCommand(t *testing.T) {
 		}
 	}
 }
+
+// TestSkillTeachesV034Rules pins the v0.34 skill paragraphs (AIRA-289..292), one
+// row per paragraph, asserting the facts an agent acts on. Every behavioural
+// claim a row pins was measured or read in code by the plan; deleting a
+// paragraph turns its row red. Both documents are checked because the guide and
+// SKILL.md share one body.
+func TestSkillTeachesV034Rules(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		name  string
+		wants []string
+	}{
+		{"290 close path and void", []string{
+			"`aira mv <id> in-progress`, then `in-review`, then `done`",
+			"There is no `planned -> done` shortcut",
+			"`aira mv <id> retired`",
+			"There is no delete",
+			"`E_TICKET_NOT_IN_WORKTREE`",
+			"`E_RELATION_TARGET_MISSING`",
+			"relations stored in the deleted file vanish with it",
+		}},
+		{"290 inverse kinds", []string{
+			"read-only views",
+			"`blocked-by`",
+			"names the forward command to run instead",
+		}},
+		{"291 bulk links and the lagging index", []string{
+			"`E_PATH_INTENT_BUSY`",
+			"`E_RELATION_INDEX_DIVERGENCE`",
+			"`aira reconcile --rebuild`",
+			"plain `aira reconcile` does not",
+			"Relation blockers are always computed from the ticket files",
+		}},
+		{"292 scope-integrity", []string{
+			"`containment=enforced` describes the scope AIRA created",
+			"`scope-integrity=`",
+			"`migrated`",
+			"`descendant-escaped`",
+			"`unverified`",
+			"a child that leaves and exits between two checks is not seen",
+			"snap",
+			"`aira confine -- terraform version`",
+			"AIRA-225",
+		}},
+		{"289 what a gate command sees", []string{
+			"no commits, branches, remotes or history",
+			"`git merge-base`",
+			"`git ls-files`",
+			"`env_allow`",
+			"sorted and unique",
+		}},
+		{"289 confining a gate and its timeout", []string{
+			"`aira confine -- aira gate run <id>`",
+			"outside `timeout_ms`",
+			"`run.cgroup_parent`",
+			"`XDG_RUNTIME_DIR`",
+			"`E_DAEMON_UNAVAILABLE`",
+			"`DBUS_SESSION_BUS_ADDRESS` is not needed",
+			"`U_GATE_COMMAND_TIMEOUT`",
+			"`aira run-log <RUN-id> --stream err`",
+		}},
+	} {
+		for _, document := range []struct{ name, body string }{
+			{"SKILL.md", string(artifacts.SkillMD)},
+			{"guide", string(artifacts.Guide)},
+		} {
+			for _, want := range row.wants {
+				if !strings.Contains(document.body, want) {
+					t.Errorf("%s: %s: no longer teaches %q", document.name, row.name, want)
+				}
+			}
+		}
+	}
+}
