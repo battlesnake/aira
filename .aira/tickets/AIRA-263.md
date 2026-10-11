@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-263","project":"aira","title":"Clarify @aira_cpu docstring: N = real CPU cores demanded, not concurrency slots","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":"v0.19","labels":["aitest"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-263","project":"aira","title":"Clarify @aira_cpu docstring: N = real CPU cores demanded, not concurrency slots","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":"v0.19","labels":["aitest"],"hold":false,"relations":[]}
 ---
 The aira_cpu registration + reader docstrings (internal/pylib/aitest/__init__.py) say "peak internal fork width" / "peak CPU demand IS N cores" — correct, but they don't spell out the GIL/lock-wait EXCLUSION, and that ambiguity bit deploy (a careful reader) when marking the FIRST real @aira_cpu tests.
 

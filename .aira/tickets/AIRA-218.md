@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-218","project":"aira","title":"A newer binary's additive ledger field is classified as E_JOURNAL_CORRUPT, and the schema check that exists for exactly this is unreachable","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-218","project":"aira","title":"A newer binary's additive ledger field is classified as E_JOURNAL_CORRUPT, and the schema check that exists for exactly this is unreachable","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are

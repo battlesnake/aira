@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-193","project":"aira","title":"Admission-wait line renders live ledger totals as raw byte counts, defeating the at-a-glance comparison the line exists for","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-193","project":"aira","title":"Admission-wait line renders live ledger totals as raw byte counts, defeating the at-a-glance comparison the line exists for","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine","ux"],"hold":false,"relations":[]}
 ---
 Filed from the AIRA-181/AIRA-186 build (see the ACCEPTED GAP comment on
 `confineHeldNote`, internal/runner/confine_queue_position_linux.go).

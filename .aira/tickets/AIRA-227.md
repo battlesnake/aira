@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-227","project":"aira","title":"Unhelpful errors on daemon/client protocol skew and on install-refusal in a container: neither points at its fix","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","dx","install","mcp"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-227","project":"aira","title":"Unhelpful errors on daemon/client protocol skew and on install-refusal in a container: neither points at its fix","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["dogfood","dx","install","mcp"],"hold":false,"relations":[]}
 ---
 From RANT-40 (dogfood, 2026-09-09), CI-image work. Two error-message clarity papercuts; the reporter judged neither worth its own ticket, but item 1 has since bitten a SECOND session (speed) blocking direct MCP filing, so it is filed as one small ticket.
 

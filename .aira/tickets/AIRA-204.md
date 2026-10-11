@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-204","project":"aira","title":"Finish AIRA-20's deadline discipline in the packages it excluded: four witnessed merge-gate flakes, each a different defect class","status":"planned","kind":"chore","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-204","project":"aira","title":"Finish AIRA-20's deadline discipline in the packages it excluded: four witnessed merge-gate flakes, each a different defect class","status":"done","kind":"chore","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
