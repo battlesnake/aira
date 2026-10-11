@@ -659,7 +659,9 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	return opts, nil
 }
 
-const sudoIdentityHint = "run 'sudo aira install' from an active login session as a non-root account"
+const sudoIdentityHint = "run 'sudo aira install' from an active login session as a non-root account; " +
+	"in a container or on a host without systemd, run 'aira install --ci=shim' instead " +
+	"(or --ci=auto, which chooses it when no systemd user manager is reachable)"
 
 func runRootInstall(d installDeps, opts installOpts) error {
 	target, err := validateSudoIdentity(d)

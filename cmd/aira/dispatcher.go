@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"aira/internal/app"
+	"aira/internal/buildid"
 	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
@@ -662,6 +663,10 @@ func (d *daemonDispatcher) exchangeWithReplacement(ctx context.Context, exchange
 		return response, nil
 	}
 	if daemon.ProtocolVersion <= response.Proto {
+		// AIRA-227. The daemon is NEWER than this process, so this process is the stale
+		// part (a long-lived `aira mcp` server keeps the binary it started with). Say so
+		// and name the remedy; the code, exit and Proto stay as the daemon sent them.
+		response.Error += staleClientProtocolHint()
 		return response, nil
 	}
 	if err := d.replaceOlderDaemon(ctx); err != nil {
@@ -672,6 +677,19 @@ func (d *daemonDispatcher) exchangeWithReplacement(ctx context.Context, exchange
 		return daemon.ResponseFrame{}, err
 	}
 	return retry, nil
+}
+
+// staleClientProtocolHint is appended to a newer daemon's E_DAEMON_PROTOCOL: it
+// names this process, its binary, its build and its protocol, and the remedy.
+func staleClientProtocolHint() string {
+	executable, err := os.Executable()
+	if err != nil {
+		executable = "unevaluated"
+	}
+	return fmt.Sprintf("; this aira process (pid %d, %s, build %s) speaks protocol %d, older than the daemon: "+
+		"it is running an older aira than the daemon. Restart this process (an `aira mcp` server keeps the binary it "+
+		"started with until it is restarted), or put the installed aira first on PATH; `aira version` compares the two.",
+		os.Getpid(), executable, buildid.Current().String(), daemon.ProtocolVersion)
 }
 
 func prepareRoutedRequest(request *core.Request) {
