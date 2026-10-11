@@ -687,3 +687,51 @@ func TestSeedPathAncestorOfBookkeepingCannotFireOnTickets(t *testing.T) {
 		t.Fatalf("a ticket edit changed the gate outcome: %#v then %#v", first, again)
 	}
 }
+
+// verifies: AIRA-285 -- the residual through a symlink: an untracked symlink
+// lnk -> .aira makes Seed.Path "lnk/tickets" (which ValidateCanary accepts)
+// resolve to the live .aira/tickets/. Before the fix the canary fired on the
+// ticket marker read through the link, the gate held a trusted pass, and a
+// ticket edit (invisible to the subject digest) left that stored pass standing
+// while a re-run on the same subject returned E_GATE_CANARY_DID_NOT_FIRE.
+func TestSeedPathThroughSymlinkCannotFireOnTickets(t *testing.T) {
+	const marker = "ZZ<PROBE>" // "<" and ">" are JSON-escaped in the gate file, so only the ticket carries the literal
+	ctx := context.Background()
+	s, root := nonGoCommandSubject(t, "")
+	ticket := filepath.Join(root, ".aira", "tickets", "AIRA-1.md")
+	if err := os.MkdirAll(filepath.Dir(ticket), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ticket, []byte("---\nstatus: planned\n---\n"+marker+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	// Untracked, so the command lane's materialiser does not refuse the subject.
+	if err := os.Symlink(".aira", filepath.Join(root, "lnk")); err != nil {
+		t.Fatal(err)
+	}
+	def, _ := injectFileGateFixture("tests/unused.rs", marker)
+	canary := gate.CanaryDeclaration{SchemaVersion: 1, ID: def.CanaryIDs[0], GateID: def.ID, Mode: gate.CanaryFixture,
+		Seed: gate.Seed{Path: "lnk/tickets"}, ExpectedGateResult: gate.VerdictFail, LaneBinding: def.Lane.Name,
+		Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand}
+	writeGateFixture(t, root, def, canary)
+	gitRun(t, root, "add", ".aira/gates")
+	first, firstErr := s.RunGate(ctx, def.ID)
+	if first.Verdict == gate.VerdictPass || first.Trusted {
+		t.Fatalf("first RunGate = %#v err=%v, want no trusted pass from a canary seeded through a symlink", first, firstErr)
+	}
+	if err := os.WriteFile(ticket, []byte("---\nstatus: done\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again, againErr := s.RunGate(ctx, def.ID)
+	if again.Verdict != first.Verdict || again.Code != first.Code || again.Trusted != first.Trusted || ErrorCode(againErr) != ErrorCode(firstErr) {
+		t.Fatalf("a ticket edit changed the gate outcome: %#v (%v) then %#v (%v)", first, firstErr, again, againErr)
+	}
+	if checked, err := s.GateCheck(ctx); err == nil {
+		for _, r := range checked.Results {
+			if r.Verdict == gate.VerdictPass && r.Trusted {
+				t.Fatalf("GateCheck serves a trusted pass for a canary seeded through a symlink: %#v", r)
+			}
+		}
+	}
+}

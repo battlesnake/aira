@@ -567,8 +567,7 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 		if !gate.SafeRelativePath(c.Seed.Path) {
 			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
 		}
-		source := filepath.Join(s.root, filepath.FromSlash(c.Seed.Path))
-		if err := copyFixtureSeed(source, dir, c.Seed.Path); err != nil {
+		if err := copyFixtureSeed(s.root, dir, c.Seed.Path); err != nil {
 			return DimensionEvaluation{}, EvaluationRoot{}, err
 		}
 	}
@@ -711,22 +710,33 @@ func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, 
 	return s.runCanary(ctx, c, def, capturedSubject{})
 }
 
-// copyFixtureSeed copies the live directory source (the canary's Seed.Path,
-// root-relative seedPath) into the fixture tree. It skips every entry whose
-// LIVE root-relative path is AIRA bookkeeping (AIRA-285): a Seed.Path that is
-// an ancestor of .aira/tickets/ or .aira/findings/ (".aira", ".") would
-// otherwise re-root those files where ExcludedFromSubject no longer matches,
-// and the canary's fire could then depend on bytes no subject digest covers.
-// Skipping the directory skips every file below it; ValidateCanary refuses a
-// Seed.Path at or below those directories, so the root is never one of them.
-func copyFixtureSeed(source, destination, seedPath string) error {
-	seedRoot := filepath.FromSlash(seedPath)
-	info, err := os.Lstat(source)
-	if err != nil {
-		return fmt.Errorf("U_GATE_CANARY_UNEVALUATED: fixture seed: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("E_GATE_CANARY_INVALID: symlink seed is not allowed")
+// copyFixtureSeed copies the live directory root/seedPath (the canary's
+// Seed.Path) into the fixture tree. It skips every entry whose LIVE
+// root-relative path is AIRA bookkeeping (AIRA-285): a Seed.Path that is an
+// ancestor of .aira/tickets/ or .aira/findings/ (".aira", ".") would otherwise
+// re-root those files where ExcludedFromSubject no longer matches, and the
+// canary's fire could then depend on bytes no subject digest covers. Skipping
+// the directory skips every file below it; ValidateCanary refuses a Seed.Path
+// at or below those directories, so the root is never one of them.
+//
+// Both of those checks reason about the DECLARED path, so they hold only while
+// the declared path is the resolved one: every component of seedPath is
+// refused if it is a symlink, not just the last (os.Lstat follows intermediate
+// components, so "lnk/tickets" with lnk -> .aira would otherwise read the live
+// tickets). Symlinks inside the seed are refused by the walk below.
+func copyFixtureSeed(root, destination, seedPath string) error {
+	seedRoot := filepath.Clean(filepath.FromSlash(seedPath))
+	source := filepath.Join(root, seedRoot)
+	component := root
+	for _, part := range strings.Split(seedRoot, string(filepath.Separator)) {
+		component = filepath.Join(component, part)
+		info, err := os.Lstat(component)
+		if err != nil {
+			return fmt.Errorf("U_GATE_CANARY_UNEVALUATED: fixture seed: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("E_GATE_CANARY_INVALID: symlink seed is not allowed")
+		}
 	}
 	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {

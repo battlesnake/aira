@@ -872,7 +872,7 @@ func TestFixtureSeedSkipsBookkeepingBelowTheSeedPath(t *testing.T) {
 	for _, row := range rows {
 		t.Run(row.seed, func(t *testing.T) {
 			dest := t.TempDir()
-			if err := copyFixtureSeed(filepath.Join(live, filepath.FromSlash(row.seed)), dest, row.seed); err != nil {
+			if err := copyFixtureSeed(live, dest, row.seed); err != nil {
 				t.Fatal(err)
 			}
 			for _, name := range row.present {
@@ -884,6 +884,32 @@ func TestFixtureSeedSkipsBookkeepingBelowTheSeedPath(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(dest, filepath.FromSlash(name))); !errors.Is(err, os.ErrNotExist) {
 					t.Errorf("seed %q: %s copied into the fixture tree (err=%v)", row.seed, name, err)
 				}
+			}
+		})
+	}
+	// AIRA-285 residual: a symlink ANCESTOR of the Seed.Path ("lnk" -> ".aira")
+	// makes the declared path "lnk/tickets" resolve to the live .aira/tickets/:
+	// os.Lstat follows intermediate components and the skip reasons about the
+	// declared path, so the ticket bytes would be copied. Every symlinked
+	// component below the root is refused, not only the final one.
+	if err := os.Symlink(".aira", filepath.Join(live, "lnk")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(live, "src", "deep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "..", ".aira"), filepath.Join(live, "src", "deep", "up")); err != nil {
+		t.Fatal(err)
+	}
+	for _, seed := range []string{"lnk/tickets", "lnk", "src/deep/up/tickets", "./lnk/findings/"} {
+		t.Run("symlink-ancestor:"+seed, func(t *testing.T) {
+			dest := t.TempDir()
+			err := copyFixtureSeed(live, dest, seed)
+			if ErrorCode(err) != "E_GATE_CANARY_INVALID" {
+				t.Fatalf("seed %q through a symlink: err = %v, want E_GATE_CANARY_INVALID", seed, err)
+			}
+			if entries, _ := os.ReadDir(dest); len(entries) != 0 {
+				t.Fatalf("seed %q through a symlink copied %d entries into the fixture tree", seed, len(entries))
 			}
 		})
 	}
