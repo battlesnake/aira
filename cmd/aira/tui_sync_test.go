@@ -17,7 +17,6 @@ package main
 
 import (
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -74,9 +73,9 @@ func runeKey(r rune) tuiKey { return tuiKey{key: tcell.KeyRune, r: r} }
 
 func specialKey(k tcell.Key) tuiKey { return tuiKey{key: k} }
 
-// keySentinelBase is the first rune of the barrier sentinels: a supplementary
-// private-use rune, which the TUI binds nowhere and a terminal cannot type.
-const keySentinelBase rune = 0xF0000
+// keySentinel is the barrier's sentinel rune: a supplementary private-use rune, which
+// the TUI binds nowhere and a terminal cannot type.
+const keySentinel rune = 0xF0000
 
 // keyTracker is the key-completion barrier.
 //
@@ -88,6 +87,10 @@ const keySentinelBase rune = 0xF0000
 // press, or raw through screen.InjectKey) has had its handler return. There is no
 // counting, so a key injected outside press cannot make a later press return early.
 //
+// Not safe for concurrent use: press and barrier are called serially, each waits for
+// its own sentinel before returning, so at most one sentinel is ever in flight. A
+// press that times out fails the test, so no stale acknowledgement is read by a later one.
+//
 // Keys that stop or suspend the loop (q, the execute launcher's run) must be injected
 // raw and followed by the existing done/resume wait: a sentinel behind them is never
 // processed.
@@ -95,18 +98,19 @@ const keySentinelBase rune = 0xF0000
 // trackKeys must be called after the runtime is constructed (which installs the
 // application's capture) and before run().
 type keyTracker struct {
-	screen  tcell.SimulationScreen
-	mu      sync.Mutex
-	seq     rune
-	waiters map[rune]chan struct{}
+	screen tcell.SimulationScreen
+	ack    chan struct{}
 }
 
 func trackKeys(rt *tuiRuntime, screen tcell.SimulationScreen) *keyTracker {
-	tracker := &keyTracker{screen: screen, waiters: map[rune]chan struct{}{}}
+	tracker := &keyTracker{screen: screen, ack: make(chan struct{}, 1)}
 	inner := rt.app.GetInputCapture()
 	rt.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyRune && event.Rune() >= keySentinelBase {
-			tracker.reached(event.Rune())
+		if event.Key() == tcell.KeyRune && event.Rune() == keySentinel {
+			select {
+			case tracker.ack <- struct{}{}:
+			default:
+			}
 			return nil // the sentinel never reaches a primitive
 		}
 		if inner != nil {
@@ -115,16 +119,6 @@ func trackKeys(rt *tuiRuntime, screen tcell.SimulationScreen) *keyTracker {
 		return event
 	})
 	return tracker
-}
-
-func (k *keyTracker) reached(sentinel rune) {
-	k.mu.Lock()
-	waiter := k.waiters[sentinel]
-	delete(k.waiters, sentinel)
-	k.mu.Unlock()
-	if waiter != nil {
-		close(waiter)
-	}
 }
 
 // press injects the keys and returns once every one of them (and every key injected
@@ -140,15 +134,9 @@ func (k *keyTracker) press(tb testing.TB, keys ...tuiKey) {
 // barrier returns once every key injected so far has been handled.
 func (k *keyTracker) barrier(tb testing.TB) {
 	tb.Helper()
-	k.mu.Lock()
-	k.seq++
-	sentinel := keySentinelBase + k.seq
-	waiter := make(chan struct{})
-	k.waiters[sentinel] = waiter
-	k.mu.Unlock()
-	k.screen.InjectKey(tcell.KeyRune, sentinel, tcell.ModNone)
+	k.screen.InjectKey(tcell.KeyRune, keySentinel, tcell.ModNone)
 	select {
-	case <-waiter:
+	case <-k.ack:
 	case <-testdeadline.After(time.Second):
 		tb.Fatal("the tview loop did not reach the key barrier: deadlocked")
 	}
