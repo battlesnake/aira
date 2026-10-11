@@ -22,6 +22,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// ledgerSchema is the record schema this build reads and writes. Bump it only for
+// an INCOMPATIBLE record change (a field whose meaning changes, or one removed): an
+// additive omitempty field needs no bump, because an older build names the field it
+// does not know (AIRA-218) instead of reporting anonymous corruption.
 const ledgerSchema = 1
 
 type ledgerEvent struct {
@@ -308,10 +312,24 @@ func (l *ledger) read() ([]ledgerEvent, error) {
 		dec := json.NewDecoder(bytesReader(payload))
 		dec.DisallowUnknownFields()
 		decodeErr := dec.Decode(&event)
+		// AIRA-218: only when the strict decode fails, decode the payload again
+		// without the unknown-field rule. The hot path (every valid record) is
+		// still one strict decode. The lenient result is used only to diagnose;
+		// it never makes a record acceptable.
+		lenientOK := false
+		if decodeErr != nil {
+			if lenientEvent, ok := decodeLedgerEventLenient(payload); ok {
+				event, lenientOK = lenientEvent, true
+			}
+		}
 		// One condition, five distinct causes. Report WHICH one and WHERE, so a
 		// corrupt ledger is locatable instead of merely announced (AIRA-145).
-		if defect := ledgerRecordDefect(decodeErr, event, prior); defect != "" {
-			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid run ledger record: %s (%s; %s)", defect, site, ledgerRecordIdentity(decodeErr, event))
+		if defect := ledgerRecordDefect(decodeErr, lenientOK, event, prior); defect != "" {
+			identityErr := decodeErr
+			if lenientOK {
+				identityErr = nil // the whole payload decoded; only a field is unknown
+			}
+			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid run ledger record: %s (%s; %s)", defect, site, ledgerRecordIdentity(identityErr, event))
 		}
 		var extra any
 		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
@@ -375,21 +393,50 @@ func (s ledgerRecordSite) String() string {
 	return fmt.Sprintf("record %d at byte offset %d, %d-byte payload, of %s", s.index, s.offset, s.payload, s.path)
 }
 
+// decodeLedgerEventLenient decodes a payload WITHOUT the unknown-field rule and
+// reports ok only when the payload is exactly one JSON value that decoded (the
+// same no-trailing-content rule the strict path applies). It runs only after a
+// strict decode failed, to tell "a field this build does not know" from real
+// malformation.
+//
+// covers: AIRA-218
+func decodeLedgerEventLenient(payload []byte) (ledgerEvent, bool) {
+	var event ledgerEvent
+	dec := json.NewDecoder(bytesReader(payload))
+	if err := dec.Decode(&event); err != nil {
+		return ledgerEvent{}, false
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return ledgerEvent{}, false
+	}
+	return event, true
+}
+
 // ledgerRecordDefect names the ONE validation that rejects a decoded ledger
 // record, or "" when the record is valid. It is the exact predicate read()
 // applied before AIRA-145 -- decode failure, wrong schema version, zero
 // sequence, non-advancing sequence, or empty kind -- with the same evaluation
 // order, so the accept/reject decision is bit-for-bit unchanged and only the
-// diagnostic improves. Notably the decode branch surfaces encoding/json's own
-// message, which under DisallowUnknownFields names the offending field: an
-// unknown field written by a NEWER aira binary into a shared ledger reads as
-// `json: unknown field "..."` rather than as anonymous corruption.
+// diagnostic improves.
 //
-// covers: AIRA-145
-func ledgerRecordDefect(decodeErr error, event ledgerEvent, prior uint64) string {
+// A strict-decode failure is split by lenientOK (AIRA-218): when the payload is
+// exactly one JSON value that decodes once the unknown-field rule is dropped,
+// the schema version is checked FIRST (so that arm is reachable for a record
+// that also carries new fields) and the strict error, which names the field, is
+// appended; otherwise the record says it carries a field this build does not
+// recognise. Neither wording claims who wrote the record: a matching checksum
+// shows only that payload and checksum agree. The code stays E_JOURNAL_CORRUPT.
+//
+// covers: AIRA-145, AIRA-218
+func ledgerRecordDefect(decodeErr error, lenientOK bool, event ledgerEvent, prior uint64) string {
 	switch {
-	case decodeErr != nil:
+	case decodeErr != nil && !lenientOK:
 		return fmt.Sprintf("payload did not decode as a ledger event: %v", decodeErr)
+	case decodeErr != nil && event.SchemaVersion != ledgerSchema:
+		return fmt.Sprintf("schema_version is %d, want %d (%v)", event.SchemaVersion, ledgerSchema, decodeErr)
+	case decodeErr != nil:
+		return fmt.Sprintf("record carries a field this aira build does not recognise (%v); possibly a record shape from a different aira build: run one aira build on this machine", decodeErr)
 	case event.SchemaVersion != ledgerSchema:
 		return fmt.Sprintf("schema_version is %d, want %d", event.SchemaVersion, ledgerSchema)
 	case event.Sequence == 0:

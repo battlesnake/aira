@@ -144,12 +144,13 @@ func TestLedgerCorruptRecordNamesReasonAndOffset(t *testing.T) {
 // verifies: AIRA-145
 func TestLedgerCorruptRecordMarksPartialDecodeHonestly(t *testing.T) {
 	valid := synthLedgerEvent(ledgerSchema, 1, "starting", "RUN-1")
-	// sequence and kind parse; the run object then fails on an unknown field.
-	broken := []byte(`{"schema_version":1,"sequence":2,"kind":"terminal","run":{"id":"RUN-2","not_a_real_field":1}}`)
+	// sequence and kind parse; the run object then fails on a type mismatch, which
+	// the lenient re-decode (AIRA-218) cannot rescue either.
+	broken := []byte(`{"schema_version":1,"sequence":2,"kind":"terminal","run":{"id":5}}`)
 	l, _ := writeSynthLedger(t, valid, broken)
 	_, err := l.read()
 	if err == nil {
-		t.Fatal("read accepted a record with an unknown nested field")
+		t.Fatal("read accepted a record with a mistyped nested field")
 	}
 	got := err.Error()
 	if !strings.Contains(got, `partially decoded sequence=2 kind="terminal"`) {
@@ -262,5 +263,102 @@ func TestLedgerFramingFailuresAreLocated(t *testing.T) {
 	}
 	if want := fmt.Sprintf("record 1 at byte offset %d", offsets2[1]); !strings.Contains(got2, want) {
 		t.Fatalf("torn error is not located (%q): %q", want, got2)
+	}
+}
+
+// verifies: AIRA-218 -- a record carrying a field this build does not know was
+// reported as anonymous corruption, and the schema-version arm could never run
+// because the strict decode failed first. The set of accepted records is
+// unchanged; only the message differs.
+func TestLedgerUnknownFieldDiagnostics(t *testing.T) {
+	valid := synthLedgerEvent(ledgerSchema, 1, "starting", "RUN-1")
+	tests := []struct {
+		name     string
+		bad      []byte
+		want     []string
+		forbid   []string
+		identity string
+	}{
+		{
+			name:     "schema 1 plus an unknown field",
+			bad:      []byte(`{"schema_version":1,"sequence":2,"kind":"starting","run":{"id":"RUN-2"},"field_from_the_future":true}`),
+			want:     []string{"does not recognise", `unknown field "field_from_the_future"`, "run one aira build on this machine"},
+			forbid:   []string{"did not decode", "newer", "written by", "schema_version is"},
+			identity: `decoded sequence=2 kind="starting" run="RUN-2"`,
+		},
+		{
+			name:   "schema 2 plus an unknown field",
+			bad:    []byte(`{"schema_version":2,"sequence":2,"kind":"starting","run":{"id":"RUN-2"},"field_from_the_future":true}`),
+			want:   []string{"schema_version is 2, want 1", `unknown field "field_from_the_future"`},
+			forbid: []string{"did not decode", "does not recognise"},
+		},
+		{
+			name:   "no schema_version plus an unknown field",
+			bad:    []byte(`{"sequence":2,"kind":"starting","run":{"id":"RUN-2"},"field_from_the_future":true}`),
+			want:   []string{"schema_version is 0, want 1", `unknown field "field_from_the_future"`},
+			forbid: []string{"did not decode", "does not recognise"},
+		},
+		{
+			name:   "schema 2 and no unknown field keeps today's message exactly",
+			bad:    synthLedgerEvent(2, 2, "starting", "RUN-2"),
+			want:   []string{"schema_version is 2, want 1 ("},
+			forbid: []string{"unknown field", "does not recognise", "did not decode"},
+		},
+		{
+			name:   "malformed json is unchanged",
+			bad:    []byte(`{"schema_version":1,"sequence":`),
+			want:   []string{"payload did not decode as a ledger event"},
+			forbid: []string{"does not recognise"},
+		},
+		{
+			name:   "unknown field followed by a second value in the same payload",
+			bad:    []byte(`{"schema_version":1,"sequence":2,"kind":"starting","run":{"id":"RUN-2"},"field_from_the_future":true}{"x":1}`),
+			want:   []string{"payload did not decode as a ledger event"},
+			forbid: []string{"does not recognise"},
+		},
+		{
+			name:   "unknown field followed by garbage bytes in the same payload",
+			bad:    []byte(`{"schema_version":1,"sequence":2,"kind":"starting","run":{"id":"RUN-2"},"field_from_the_future":true} garbage`),
+			want:   []string{"payload did not decode as a ledger event"},
+			forbid: []string{"does not recognise"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			l, _ := writeSynthLedger(t, valid, test.bad)
+			events, err := l.read()
+			if err == nil {
+				t.Fatalf("read accepted the record: %+v", events)
+			}
+			got := err.Error()
+			if code, _, _ := strings.Cut(got, ":"); code != "E_JOURNAL_CORRUPT" {
+				t.Fatalf("code changed to %q: %q", code, got)
+			}
+			for _, w := range test.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("error lacks %q: %q", w, got)
+				}
+			}
+			for _, f := range test.forbid {
+				if strings.Contains(got, f) {
+					t.Errorf("error wrongly contains %q: %q", f, got)
+				}
+			}
+			if test.identity != "" && !strings.Contains(got, test.identity) {
+				t.Errorf("error lacks identity %q: %q", test.identity, got)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-218 -- accepting a record is unchanged: an unknown field is still
+// a rejection, never silently accepted by the lenient re-decode.
+func TestLedgerUnknownFieldIsStillRejected(t *testing.T) {
+	l, _ := writeSynthLedger(t,
+		synthLedgerEvent(ledgerSchema, 1, "starting", "RUN-1"),
+		[]byte(`{"schema_version":1,"sequence":2,"kind":"running","run":{"id":"RUN-1"},"extra":1}`),
+	)
+	if events, err := l.read(); err == nil {
+		t.Fatalf("read accepted a record with an unknown field: %+v", events)
 	}
 }
