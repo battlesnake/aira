@@ -771,6 +771,48 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 	}
 }
 
+// TestGuideHedgesTheOOMRerunPromiseOnTheAdvisoryRecordedClaim is the AIRA-217
+// follow-up for the generated guide.
+//
+// AIRA-217 made the runtime OOM advisory say "AIRA could not confirm that this
+// kill was recorded ... do not rely on the next admission being sized from it"
+// when the peak report fails. The guide kept promising unconditionally that the
+// next identical invocation is admitted at a materially higher reserve, and that
+// a repeat kill at the same cap IS a genuine bug to report. An agent reading the
+// guide first, then seeing the hedged advisory, would re-run at the same prior,
+// be killed again, and file a false AIRA bug (RANT-19).
+//
+// verifies: AIRA-217
+func TestGuideHedgesTheOOMRerunPromiseOnTheAdvisoryRecordedClaim(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, document := range []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	} {
+		for _, stale := range []string{
+			"and admits the very NEXT identical invocation at a materially higher reserve",
+			"so RE-RUN THE IDENTICAL COMMAND — and if that identical re-run is killed at the same cap again, that IS a genuine bug",
+			"So the response to `terminated-by=oom` on a first run is to RE-RUN the identical command",
+		} {
+			if strings.Contains(document.body, stale) {
+				t.Errorf("%s still makes the unconditional re-run promise %q", document.name, stale)
+			}
+		}
+		for _, want := range []string{
+			"AIRA could not confirm that this kill was recorded",
+			"is NOT evidence of an AIRA bug",
+			"aira confine --budget",
+		} {
+			if !strings.Contains(document.body, want) {
+				t.Errorf("%s no longer states the hedge %q", document.name, want)
+			}
+		}
+	}
+}
+
 // TestSkillTeachesBothColdStartBases is AIRA-166.
 //
 // The guide taught ONE cold-start basis — "a FIRST run ... is capped at a
