@@ -43,6 +43,19 @@ _POOL_KEY_SEPARATOR = "\x1f"
 _POOL_REPORT_TIMEOUT_SECONDS = 10.0
 
 
+def _cap_bytes(value):
+    """A worker grant's memory cap as an int, or None when it cannot be read.
+
+    The grant carries a STRING in production and an int in some fixtures; both
+    convert. None (never 0) means "could not be established"."""
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _read_cgroup_int(path):
     """One non-negative integer from a cgroup file, or None.
 
@@ -890,8 +903,8 @@ class Supervisor:
         self._pidfd_warned = set()
         self.items_by_nodeid = {}
         # AIRA-230 v7-2: nodeid -> incremental-peak-RSS bytes, from each item's
-        # aira_mem marker (or the default). Built in collect(); DOCUMENTED-INERT
-        # in S1 -- no admission consumer yet (plan D5). Empty until collect() runs.
+        # aira_mem marker (or the default). Built in collect(); the live consumer is
+        # reservation_need below (via _need_for), not this map. Empty until collect() runs.
         self.aira_mem_bytes = {}
         # AIRA-235 (v0.7 S2b): per-nodeid RESERVATION need (overhead + incremental)
         # and the set of nodeids carrying a real, well-formed aira_mem marker, both
@@ -1137,10 +1150,11 @@ class Supervisor:
         self.queue = [item.nodeid for item in items]
         # AIRA-230 v7-2: read each item's aira_mem annotation into a nodeid->bytes
         # map alongside items_by_nodeid (inherited by forked workers via COW).
-        # DOCUMENTED-INERT in S1: built but with NO admission consumer -- per-class
-        # worker sizing reads it in S2 (plan D5). Unannotated (and malformed-marker)
-        # nodeids take AIRA_AITEST_DEFAULT_BYTES (256 MiB starting point; v7-4 sets
-        # it). Local import mirrors _env_bytes: __init__ imports Supervisor only
+        # Worker sizing does NOT read this map: reservation_need (below) = worker
+        # overhead (AIRA_AITEST_WORKER_OVERHEAD_BYTES, default 512M) + the aira_mem
+        # value when annotated, else 0, consumed by _need_for; AIRA_AITEST_ESTIMATED_BYTES
+        # does not size workers. Unannotated (and malformed-marker) nodeids take
+        # AIRA_AITEST_DEFAULT_BYTES (256 MiB starting point; v7-4 sets it). Local import mirrors _env_bytes: __init__ imports Supervisor only
         # inside a function, so the package is fully initialised here.
         from aitest import (
             _aira_mem_bytes_for_item,
@@ -2240,14 +2254,18 @@ class Supervisor:
         if not scope:
             return
         self._pool_scoped_workers += 1
-        memory_max = grant.get("memory_max")
+        # A REAL enforced grant carries the cap as a STRING (the worker-admit outcome
+        # parser stores every field as a string), so it is converted ONCE here and the
+        # one value feeds both the pool-budget gauge and the measurement record. None
+        # where it cannot be read -- never a fabricated 0 (AIRA-231).
+        memory_max = _cap_bytes(grant.get("memory_max"))
         # The budget recorded is the cap the daemon actually WROTE on this
         # worker's scope, not what was asked for. Since S2b workers are sized
         # PER-TEST (overhead + @aira_mem), so the pool is heterogeneously capped;
         # this reports the LARGEST per-worker cap in the pool -- a coarse
         # pool-level gauge, not a per-test figure -- because that is the cap an
         # observed peak could actually have grown into.
-        if isinstance(memory_max, int) and memory_max > 0:
+        if memory_max is not None and memory_max > 0:
             if self._pool_budget is None or memory_max > self._pool_budget:
                 self._pool_budget = memory_max
         peak = _read_cgroup_int(os.path.join(scope, "memory.peak"))
@@ -2259,24 +2277,14 @@ class Supervisor:
         if scope_oom:
             self._pool_peak_oom = True
         # AIRA-230 v7-4: retain this worker's (peak, cap, oom, scope_path) for the
-        # measurement report, ONLY when enabled. The cap is coerced from the grant's
-        # memory_max, which a REAL enforced grant carries as a STRING (the worker-admit
-        # outcome parser stores every field as a string; v7-1 learned this the hard
-        # way) -- None where it cannot be read, NEVER a fabricated 0. The scope_path is
+        # measurement report, ONLY when enabled. The cap is the converted memory_max
+        # above (None where it cannot be read, NEVER a fabricated 0). The scope_path is
         # the grant's own worker-scope path (S2a/T8): the DETERMINISTIC anchor Task 9's
         # Gate A asserts sibling placement against, so it needs no read and is always a
-        # real path here (this method already returned for a scope-less grant). This
-        # deliberately does NOT touch the AIRA-180 _pool_budget gauge above (its
-        # string-cap behaviour is AIRA-231, out of this slice's scope).
+        # real path here (this method already returned for a scope-less grant).
         if os.environ.get("AIRA_AITEST_MEASURE_DIR", "").strip():
-            cap = memory_max
-            if not isinstance(cap, int):
-                try:
-                    cap = int(str(cap).strip())
-                except (TypeError, ValueError):
-                    cap = None
             self._pool_peak_records.append(
-                {"peak": peak, "memory_max": cap, "oom": scope_oom, "scope_path": scope}
+                {"peak": peak, "memory_max": memory_max, "oom": scope_oom, "scope_path": scope}
             )
 
     def _record_worker_trace(self, grant, state, pid, rusage):
