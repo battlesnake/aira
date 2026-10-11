@@ -18,11 +18,15 @@ import (
 // precondition it must not race against has been observed. Err is derived from the
 // same channel as Done, never from a flag written after the close: realRun reads
 // ctx.Err() as soon as <-ctx.Done() fires, so Err must be non-nil the instant Done
-// is closed.
+// is closed. expire records WHICH event expired the context, and when, inside the
+// same once that closes the channel, so exactly one cause wins and the time is the
+// instant of the actual expiry.
 type armedDeadline struct {
 	context.Context
-	done chan struct{}
-	once sync.Once
+	done      chan struct{}
+	once      sync.Once
+	cause     string
+	expiredAt time.Time
 }
 
 func newArmedDeadline() *armedDeadline {
@@ -40,36 +44,35 @@ func (a *armedDeadline) Err() error {
 	}
 }
 
-func (a *armedDeadline) expire() { a.once.Do(func() { close(a.done) }) }
+func (a *armedDeadline) expire(cause string) {
+	a.once.Do(func() {
+		a.cause, a.expiredAt = cause, time.Now()
+		close(a.done)
+	})
+}
 
-// firstLineTrigger expires the deadline on the first live write carrying text, and
-// records when it did. The live face sits behind lineRedactor, which releases a line
+// winner reports the cause that expired the context and when. Call it only after
+// realRun has returned (which happens after Done closed), so the once has completed.
+func (a *armedDeadline) winner() (string, time.Time) {
+	a.once.Do(func() {}) // a no-op if expire already ran; otherwise marks "never expired"
+	return a.cause, a.expiredAt
+}
+
+// firstLineTrigger expires the deadline, with cause "pid line", on the first live
+// write carrying text. The live face sits behind lineRedactor, which releases a line
 // only once it is complete and passes it through redact (whose URL pass trims the
 // trailing newline), so a live write is a complete pid line without its terminator.
 // The drain writes the captured tail before the live face, so by then the line is
 // already in result.Stdout.
 type firstLineTrigger struct {
-	deadline  *armedDeadline
-	mu        sync.Mutex
-	expiredAt time.Time
+	deadline *armedDeadline
 }
 
 func (w *firstLineTrigger) Write(p []byte) (int, error) {
 	if len(bytes.TrimSpace(p)) > 0 {
-		w.mu.Lock()
-		if w.expiredAt.IsZero() {
-			w.expiredAt = time.Now()
-		}
-		w.mu.Unlock()
-		w.deadline.expire()
+		w.deadline.expire("pid line")
 	}
 	return len(p), nil
-}
-
-func (w *firstLineTrigger) at() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.expiredAt
 }
 
 // verifies: cancellation signals the entire process group and has bounded shutdown.
@@ -82,8 +85,8 @@ func TestRealRunTimeoutKillsProcessGroup(t *testing.T) {
 	deadline := newArmedDeadline()
 	trigger := &firstLineTrigger{deadline: deadline}
 	// Backstop: a child that never prints still ends the subject; the test then
-	// fails below, it never passes.
-	backstop := time.AfterFunc(testdeadline.Wait(5*time.Second), deadline.expire)
+	// fails below (the pid line did not win), it never passes.
+	backstop := time.AfterFunc(testdeadline.Wait(5*time.Second), func() { deadline.expire("backstop") })
 	defer backstop.Stop()
 	// negative-wait fixture: the child-side delay before the trap makes a deadline
 	// armed at start (the old shape) fail on every run instead of only under load.
@@ -92,13 +95,16 @@ func TestRealRunTimeoutKillsProcessGroup(t *testing.T) {
 		LiveStdout: trigger,
 	})
 	backstop.Stop()
-	if trigger.at().IsZero() {
-		t.Fatalf("pid line never observed before the backstop: result=%+v", result)
+	cause, expiredAt := deadline.winner()
+	if cause != "pid line" {
+		t.Fatalf("the context was expired by %q, not by the pid line: cancellation began before its precondition; result=%+v", cause, result)
 	}
 	if !errors.Is(result.Err, context.DeadlineExceeded) {
 		t.Fatalf("result=%+v", result)
 	}
-	if elapsed := time.Since(trigger.at()); testdeadline.Exceeded(elapsed, 5*time.Second) {
+	// realRun's worst case after expiry is three processGrace waits (TERM, KILL, then
+	// the drains); the expected path is one (the trap ignores TERM, KILL reaps both).
+	if elapsed := time.Since(expiredAt); testdeadline.Exceeded(elapsed, 3*processGrace+time.Second) {
 		t.Fatalf("bounded cancellation took %s after the deadline", elapsed)
 	}
 	fields := strings.Fields(result.Stdout)
