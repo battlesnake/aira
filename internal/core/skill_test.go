@@ -1123,3 +1123,25 @@ func TestSkillDescribesTheClaudeUsageModInstallFlag(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-219 -- the guide's MUST-confine rule had no carve-out for a command
+// already inside a confine scope, while the runtime nested-launch warning says to
+// drop the inner wrapper. The guide now agrees with the warning.
+func TestSkillTeachesToWrapOnceAtTheOutermostCommand(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"already running inside an `aira confine` scope",
+			"wrap ONCE, at the outermost heavy command",
+			"must fit beside every reservation already granted there, its parent's included",
+			"admission has no time limit",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not teach %q", name, want)
+			}
+		}
+	}
+}

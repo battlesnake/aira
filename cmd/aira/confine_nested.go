@@ -57,6 +57,9 @@ func nestedConfineWarning(options map[string]string, parentScopeID string) strin
 	return fmt.Sprintf("confine: this launch is nested inside confine scope %s; "+
 		"it requests slice admission of its own and does not draw on the parent's already-granted reservation, "+
 		"so it queues independently of the job it is running inside. "+
+		"When it requests the parent's slice, it must fit beside every reservation already granted there, "+
+		"the parent's own included; admission has no time limit, so a request that cannot fit beside its parent "+
+		"can wait until it is cancelled. "+
 		"Running the command WITHOUT an inner `aira confine` would instead leave it in the parent's scope, "+
 		"charged to the reservation the parent already holds.",
 		parentScopeID)
