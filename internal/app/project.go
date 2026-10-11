@@ -472,7 +472,9 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 		}
 		prefixes := stringSlice(args, "prefixes")
 		if len(prefixes) == 0 {
-			prefixes = []string{"AIRA"}
+			// AIRA-188: prefixes are exclusive across every project on this machine, so
+			// a silent default (it used to be AIRA) claims a name the caller never chose.
+			return InitPlan{}, errors.New("E_CONFIG_INVALID: a new project needs at least one ID prefix: pass --prefixes <P,...> or --prefix <P> (repeatable), for example --prefix DEMO. Prefixes are exclusive across every project on this machine, so AIRA does not choose one for you")
 		}
 		for i := range prefixes {
 			prefixes[i] = strings.ToUpper(prefixes[i])
