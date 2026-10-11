@@ -114,6 +114,23 @@ func (s *Store) scanStoredRelations() ([]storedRelation, map[string]domain.Ticke
 	return scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
 }
 
+// relationKindRefusal is the E_RELATION_INVALID refusal for a kind that cannot be
+// stored. An inverse kind (blocked-by, child, ...) is a query projection: the
+// message names the command that stores the same relation, the forward kind with
+// the endpoints swapped. Any other kind is unreachable through the CLI and MCP
+// enums but stays correct. from and to are the canonical IDs.
+func relationKindRefusal(verb, from string, kind domain.RelationKind, to string) error {
+	if forward, ok := kind.Forward(); ok {
+		lead := "write the same relation as"
+		if verb == "unlink" {
+			lead = "remove it as"
+		}
+		return fmt.Errorf("E_RELATION_INVALID: %s is a query-only inverse kind and is never stored; %s: aira %s %s %s %s",
+			kind, lead, verb, to, forward, from)
+	}
+	return fmt.Errorf("E_RELATION_INVALID: unknown relation kind %q; the writable kinds are: blocks, duplicates, parent, relates, resolves, supersedes", string(kind))
+}
+
 func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind, to string) (EventKey, error) {
 	// Both endpoints are namespaced on ingress: a bare BL-1 typed under
 	// id_prefix=FEE keys the stored FEE-BL-1 (AIRA-237 Task 1).
@@ -125,7 +142,7 @@ func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind,
 		return EventKey{}, err
 	}
 	if !kind.IsForward() {
-		return EventKey{}, errors.New("E_RELATION_INVALID: inverse relation kinds are query-only")
+		return EventKey{}, relationKindRefusal("link", from, kind, to)
 	}
 	fromTicket, err := s.Get(from)
 	if err != nil {
@@ -220,7 +237,7 @@ func (s *Store) Unlink(ctx context.Context, from string, kind domain.RelationKin
 		return EventKey{}, err
 	}
 	if !kind.IsForward() {
-		return EventKey{}, errors.New("E_RELATION_INVALID: inverse relation kinds are query-only")
+		return EventKey{}, relationKindRefusal("unlink", from, kind, to)
 	}
 	if _, _, _, err := s.scanStoredRelations(); err != nil {
 		if isUnestablishedError(err) {
@@ -387,6 +404,18 @@ func (s *Store) indexedRelations() ([]storedRelation, error) {
 	return result, rows.Err()
 }
 
+// relationIndexLagAdvice ends both divergence messages (`check` and `ready`).
+// The index is derived and lags the ticket files after anything that edits them
+// outside aira (a git merge, pull or checkout). Plain `aira reconcile` does not
+// touch the relation index: only --rebuild (and `aira check`) rebuild it, so the
+// message names that command, in backticks so a test can run it.
+const relationIndexLagAdvice = "; the derived index lags the ticket files (for example after a git merge, pull or checkout); " +
+	"run `aira reconcile --rebuild` (or `aira check`) to rebuild it"
+
+// relationIndexReadyClause is appended to a divergence finding only in `ready`,
+// where it says the warning is harmless: blockers are read from the files.
+const relationIndexReadyClause = "; ready computed relation blockers from the ticket files, so this warning does not change them"
+
 func (s *Store) relationIndexDivergence(snapshot relationScanSnapshot) ([]CheckFinding, error) {
 	canonical := snapshot.relations
 	indexed, err := s.indexedRelations()
@@ -405,13 +434,13 @@ func (s *Store) relationIndexDivergence(snapshot relationScanSnapshot) ([]CheckF
 	for key, relation := range expected {
 		if _, ok := actual[key]; !ok {
 			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
-				Message: "canonical relation is missing from the derived index", Kind: relationIndexFindingKind(s.root, snapshot, relation)})
+				Message: "canonical relation is missing from the derived index" + relationIndexLagAdvice, Kind: relationIndexFindingKind(s.root, snapshot, relation)})
 		}
 	}
 	for key, relation := range actual {
 		if _, ok := expected[key]; !ok {
 			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
-				Message: "derived relation index row is absent from canonical files", Kind: relationIndexFindingKind(s.root, snapshot, relation)})
+				Message: "derived relation index row is absent from canonical files" + relationIndexLagAdvice, Kind: relationIndexFindingKind(s.root, snapshot, relation)})
 		}
 	}
 	sort.Slice(findings, func(i, j int) bool {
@@ -498,6 +527,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		// surfaced here as a warning, but must not make a canonical-ready
 		// ticket fail or become blocked.
 		indexFindings[i].Kind = "warning"
+		indexFindings[i].Message += relationIndexReadyClause
 	}
 	findings := append(append(append([]CheckFinding(nil), scanFindings...), relationFindings...), indexFindings...)
 	result := make([]ReadyRecord, 0, len(rows)+len(findings))
