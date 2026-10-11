@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-300","project":"aira","title":"Fixture canary Seed.Path: seed from the captured subject entries, not the live worktree (untracked bytes, hard-link aliases, case-insensitive .aira/ bypass)","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":[],"hold":true,"relations":[]}
+---
+Follow-up to AIRA-285 (gate family, spec 2026-10-11 section 3.1.1). copyFixtureSeed walks the LIVE worktree under Seed.Path, so a fixture canary copies untracked bytes and hard-link aliases that no proof digest covers, and on a case-insensitive filesystem a differently-cased .AIRA/ path bypasses the literal ".aira/" prefix compare in ExcludedFromSubject. Alternative recorded during review, not built in the gate-family batch: seed the fixture tree from the captured subject entries (captureSubject), which already apply the exclusion and cover only tracked bytes. Held: build only when the owner opens it.

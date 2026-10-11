@@ -2386,7 +2386,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if err != nil {
 					return nil, err
 				}
-				return handlerData{Data: result, Verdict: result.Verdict}, nil
+				// AIRA-286: the env_allow PATH warning rides the response
+				// envelope, where the human renderer prints it.
+				return handlerData{Data: result, Verdict: result.Verdict, Warnings: result.Warnings}, nil
 			case "check":
 				report, err := gs.GateCheck(ctx)
 				if err != nil {

@@ -100,6 +100,30 @@ func TestGateProveOnUnprovenGateExitsUnevaluated(t *testing.T) {
 // verifies: AIRA-53
 // A refused add must not report success and must not leave a definition.
 
+// gateRunStore answers gate run with a canned result.
+type gateRunStore struct {
+	*store.Store
+	result store.GateCheckResult
+}
+
+func (g gateRunStore) RunGate(context.Context, string) (store.GateCheckResult, error) {
+	return g.result, nil
+}
+
+// verifies: AIRA-286 -- the env_allow PATH warning RunGate sets reaches the
+// response envelope's warnings list, which the human renderer and every face
+// print; carried only inside Data it was never shown.
+func TestGateRunWarningsReachTheResponse(t *testing.T) {
+	result := store.GateCheckResult{GateID: "g", Verdict: gate.VerdictPass, Warnings: []string{gate.PathEnvAllowWarning}}
+	response := New(gateRunStore{Store: coreTestStore(t), result: result}).Do(context.Background(), Request{Verb: "gate", Args: map[string]any{"subverb": "run", "gate_id": "g"}})
+	if response.Code != "PASS" || response.Exit != 0 {
+		t.Fatalf("code=%q exit=%d", response.Code, response.Exit)
+	}
+	if len(response.Warnings) != 1 || response.Warnings[0] != gate.PathEnvAllowWarning {
+		t.Fatalf("response warnings = %#v, want the PATH warning", response.Warnings)
+	}
+}
+
 // canaryRunStore answers canary-run with a canned result, so the envelope's
 // mapping can be checked without running a canary.
 type canaryRunStore struct {

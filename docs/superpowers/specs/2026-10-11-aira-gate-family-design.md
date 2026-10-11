@@ -200,6 +200,17 @@ accepted, section 7 D3).
   command's proof was already unsound for every other path it read outside its snapshot,
   and the stale-PASS case needs the command to deliberately escape its working directory.
   The release note and peer notice say: a gate must read only its working directory.
+- **A fixture `Seed.Path` copies live bytes no proof digest covers.** `copyFixtureSeed`
+  walks the live worktree under `Seed.Path`, not the captured subject, so the fixture tree
+  can carry untracked files and hard-link aliases of files elsewhere (including bookkeeping
+  files linked in under another name); no subject or proof digest covers those bytes, and
+  editing them can change whether the canary fires without invalidating anything. The
+  bookkeeping skip compares the literal `.aira/tickets/` and `.aira/findings/` prefixes,
+  so on a case-insensitive filesystem a differently-cased path (`.AIRA/tickets/`) reaches
+  the same files and is not skipped. A symlink at any `Seed.Path` component or below it is
+  refused. Accepted, not enforced here: the seeding design is unchanged in this batch. The
+  alternative (seed the fixture from the captured subject entries, which already apply the
+  exclusion and cover only tracked bytes) is the held follow-up AIRA-300.
 - **A gitlink or symlink under an excluded directory** is no longer refused
   (`TestSubjectDigestGitlinkFailsClosed`'s rule applies to subject entries); it is never
   read, so nothing is claimed about it.

@@ -699,6 +699,38 @@ func TestCanaryErrorRecordsCanaryRunID(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-288 -- canary-run's error path names the canary run, as
+// RunGate's canary-error path does: the reply to an error carries no data, so
+// without the id in the error text the unreadable run could not be found with
+// `aira run-log`. The error still classifies by its code.
+func TestCanaryRunErrorNamesTheCanaryRunID(t *testing.T) {
+	const name = "AIRA_GATE_FAMILY_STUB_ENV"
+	t.Setenv(name, "one")
+	s, definition, canary := commandGateFiles(t, name)
+	envDigest, err := currentCommandEnvDigest(*definition.Command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetRunner(&sequencedExecution{
+		records:    []runner.RunRecord{cleanStubRecord("RUN-7", envDigest)},
+		incomplete: map[string]bool{"RUN-7": true},
+	})
+	before := ledgerBytes(t, s)
+	_, err = s.GateAction(context.Background(), "canary-run", "", canary.ID)
+	if err == nil {
+		t.Fatal("an unreadable canary run did not surface as an error")
+	}
+	if ErrorCode(err) != "U_GATE_COMMAND_RUN_UNEVALUATED" {
+		t.Fatalf("error code = %q (%v)", ErrorCode(err), err)
+	}
+	if !strings.Contains(err.Error(), "canary run RUN-7") || strings.Contains(err.Error(), "subject run") {
+		t.Fatalf("error does not name only the canary run: %v", err)
+	}
+	if after := ledgerBytes(t, s); !bytes.Equal(before, after) {
+		t.Fatal("canary-run changed the gate ledger")
+	}
+}
+
 // --- AIRA-287 ---------------------------------------------------------------
 
 func ledgerBytes(t *testing.T, s *Store) []byte {
@@ -848,6 +880,7 @@ func TestFixtureSeedSkipsBookkeepingBelowTheSeedPath(t *testing.T) {
 		".aira/findings/F-1.md":       "finding",
 		".aira/requirements/AR-1.md":  "requirement",
 		".aira/tickets-archive/x.md":  "archive",
+		"docs/fix/a.txt":              "fixture",
 		"src/a.go":                    "package a",
 		"src/.aira/tickets/nested.md": "nested",
 	} {
@@ -868,6 +901,10 @@ func TestFixtureSeedSkipsBookkeepingBelowTheSeedPath(t *testing.T) {
 		{seed: ".", present: []string{".aira/requirements/AR-1.md", ".aira/tickets-archive/x.md", "src/a.go", "src/.aira/tickets/nested.md"}, absent: []string{".aira/tickets", ".aira/findings"}},
 		{seed: "./.aira/", present: []string{"requirements/AR-1.md"}, absent: []string{"tickets", "findings"}},
 		{seed: "src", present: []string{"a.go", ".aira/tickets/nested.md"}},
+		// A nested seed below plain directories (no symlink anywhere) copies:
+		// the per-component walk refuses only a symlinked ancestor, never a
+		// plain directory one.
+		{seed: "docs/fix", present: []string{"a.txt"}},
 	}
 	for _, row := range rows {
 		t.Run(row.seed, func(t *testing.T) {

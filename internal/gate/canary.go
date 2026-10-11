@@ -30,6 +30,14 @@ type Isolation string
 const IsolationTempGit Isolation = "isolated-temp-git"
 
 type Seed struct {
+	// Path names a directory of the LIVE worktree copied into a fixture
+	// canary's tree. Boundary (spec 2026-10-11 section 3.1.1): the copy reads
+	// the live directory, not the captured subject, so it carries untracked
+	// bytes and hard-link aliases that no subject or proof digest covers; the
+	// bookkeeping skip compares the literal ".aira/" prefixes, which a
+	// case-insensitive filesystem can bypass with another casing. A symlink at
+	// any component of Path or below it is refused. Seeding from the captured
+	// entries instead is the held follow-up AIRA-300.
 	Path   string            `json:"path,omitempty"`
 	Files  map[string]string `json:"files,omitempty"`
 	Digest string            `json:"digest,omitempty"`

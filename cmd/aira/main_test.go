@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"aira/internal/core"
+	"aira/internal/gate"
 	"aira/internal/runner"
 )
 
@@ -132,6 +133,18 @@ func TestHumanRenderingIncludesWarnings(t *testing.T) {
 	renderHuman(core.Response{OK: true, Data: map[string]any{"id": "AIRA-1"}, Warnings: []string{"W_STALE_INDEX"}}, &stdout)
 	if !strings.Contains(stdout.String(), "warning: W_STALE_INDEX") {
 		t.Fatalf("human warning output = %q", stdout.String())
+	}
+}
+
+// verifies: AIRA-286 -- a verdict-coded reply (gate run) prints its envelope
+// warnings too, so the env_allow PATH warning reaches a human reader.
+func TestHumanRenderingOfAVerdictIncludesWarnings(t *testing.T) {
+	var stdout bytes.Buffer
+	if err := renderHuman(core.Response{OK: true, Code: "PASS", Data: map[string]any{"GateID": "g"}, Warnings: []string{gate.PathEnvAllowWarning}}, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "verdict: pass") || !strings.Contains(stdout.String(), "warning: "+gate.PathEnvAllowWarning) {
+		t.Fatalf("human verdict output = %q", stdout.String())
 	}
 }
 

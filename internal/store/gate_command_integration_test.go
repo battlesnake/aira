@@ -622,6 +622,32 @@ func TestGateRunRecordsAndReturnsRunIDs(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-288 -- canary-run on a command canary returns the canary
+// run's id, and that id reads back the run's real output (the injected file is
+// listed), so a fired or silent canary can be inspected with `aira run-log`.
+func TestCanaryRunReturnsReadableRunID(t *testing.T) {
+	const canaryPath = "tests/aira_canary_listed.rs"
+	s, root := nonGoCommandSubject(t, "")
+	def, canary := injectFileGateFixture(canaryPath, "unused marker")
+	def.Command.Argv = gateHelperArgv("list-tree")
+	writeGateFixture(t, root, def, canary)
+	value, err := s.GateAction(context.Background(), "canary-run", "", canary.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.(CanaryRunResult)
+	if !ok || result.RunID == "" {
+		t.Fatalf("canary-run result = %#v", value)
+	}
+	chunk, err := s.runner.ReadOutput(context.Background(), runner.OutputRequest{RunID: result.RunID, Stream: "out", Full: true})
+	if err != nil || chunk == nil {
+		t.Fatalf("read output of %s: %v", result.RunID, err)
+	}
+	if !strings.Contains(string(chunk.Bytes), canaryPath) {
+		t.Fatalf("canary run output lacks the injected file:\n%s", chunk.Bytes)
+	}
+}
+
 // verifies: AIRA-286 -- a command gate that allow-lists PATH is warned at gate
 // run, which every definition reaches; one that does not is not.
 func TestRunGateWarnsWhenEnvAllowIncludesPath(t *testing.T) {

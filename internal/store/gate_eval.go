@@ -503,7 +503,9 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 				}
 				evaluation, root, runErr := s.runCanary(ctx, canary, definition.Definition, subject)
 				if runErr != nil {
-					return nil, runErr
+					// The reply to an error carries no data, so the canary run id
+					// travels in the error text, as on RunGate's canary-error path.
+					return nil, withRunIDs(runErr, "", evaluation.RunID)
 				}
 				// AIRA-287: the canary's own verdict, from the mapping RunGate
 				// uses, beside the gate's result on the canary tree it observed.
