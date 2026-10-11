@@ -558,7 +558,7 @@ func RenderTicket(ticket Ticket, body string) ([]byte, error) {
 	if !strings.HasSuffix(body, "\n") {
 		body += "\n"
 	}
-	header, err := json.Marshal(ticket)
+	header, err := marshalFrontmatter(ticket)
 	if err != nil {
 		return nil, err
 	}
@@ -642,4 +642,18 @@ func splitID(id string) (string, string) {
 		return id, ""
 	}
 	return id[:idx], id[idx+1:]
+}
+
+// marshalFrontmatter encodes a front-matter header exactly as json.Marshal would,
+// except that <, > and & are written literally instead of as \u003c, \u003e,
+// \u0026 (AIRA-216): a status-only move must not rewrite the bytes of a title. The
+// encoder's trailing newline is trimmed, because the callers add "\n---\n".
+func marshalFrontmatter(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }

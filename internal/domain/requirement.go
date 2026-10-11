@@ -98,7 +98,7 @@ func RenderRequirement(requirement Requirement) ([]byte, error) {
 	if !strings.HasSuffix(body, "\n") {
 		body += "\n"
 	}
-	header, err := json.Marshal(requirementFrontmatter{Schema: 1, ID: requirement.ID, Status: requirement.Status})
+	header, err := marshalFrontmatter(requirementFrontmatter{Schema: 1, ID: requirement.ID, Status: requirement.Status})
 	if err != nil {
 		return nil, err
 	}

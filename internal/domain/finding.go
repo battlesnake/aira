@@ -279,7 +279,7 @@ func RenderFinding(finding Finding) ([]byte, error) {
 	if finding.Subtype != FindingSubtypeReview {
 		return nil, errors.New("E_FINDING_INVALID: only review findings have git files")
 	}
-	front, err := json.Marshal(findingFrontmatter{Schema: 1, ID: finding.Key, Subtype: finding.Subtype,
+	front, err := marshalFrontmatter(findingFrontmatter{Schema: 1, ID: finding.Key, Subtype: finding.Subtype,
 		TicketID: finding.TicketID, Category: finding.Category, Severity: finding.Severity,
 		Verdict: finding.Verdict, Source: finding.Source, RequirementID: finding.RequirementID,
 		File: finding.File, Line: finding.Line, Disposition: finding.Disposition,
