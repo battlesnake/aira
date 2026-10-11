@@ -976,8 +976,8 @@ func releaseStartupLock(file *os.File) {
 // KNOWN, ACCEPTED GAP (recorded on AIRA-83, not silently held): the branch is
 // chosen by ServiceIdentityMatches, which reports plain false both for "this is
 // not the managed service" and for "the probe could not be evaluated" (a
-// transient `systemctl is-enabled`/`show-environment` failure, an unreadable unit
-// file, an empty HOME — internal/daemon/service.go:38-75). In the unevaluable
+// transient `systemctl is-enabled`/`show`/`show-environment` failure, an
+// unreadable unit file — daemon.ManagedServicePaths). In the unevaluable
 // case this falls through to `daemon.Stop`, and the managed unit's Restart=always
 // then brings the shared daemon back — a bounce, not the deliberate restart
 // deleted here, but still collateral. It is left as-is deliberately: refusing

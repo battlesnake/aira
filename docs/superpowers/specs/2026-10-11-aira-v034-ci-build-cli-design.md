@@ -30,7 +30,7 @@ or the box `state.db`. The probe scripts are `~/tmp/aira291/probe1.sh` to `probe
 
 | Item | Still reproduces? | Evidence (2026-10-11) | Verdict |
 |---|---|---|---|
-| 290(a) no way to delete or void a throwaway ticket | No: the void exists, it is undocumented | `aira mv PX-8 retired` from `planned` -> `ok`, rc 0 (measured). `retired` is a legal next status from every open status and from `done` (`internal/domain/ticket.go:174-182`); a retired ticket is never ready (`workable`, `relation_ready.go:433-435`) and satisfies any `blocks` edge pointing at it (`satisfied`, `relation_ready.go:437-439`). The design already rules out deletion: "an allocated ID resolves to a live ticket or an explicit `retired`/`superseded` one, never nothing" (`2026-08-07-aira-design.md:106`). Deleting a file instead (measured, `rm .aira/tickets/PX-7.md`, where PX-7 was the *target* of relations stored in other files): `aira get PX-7` -> `E_TICKET_NOT_IN_WORKTREE`; `aira check` -> `fail` (`E_RELATION_TARGET_MISSING` on two relations, `E_RELATION_INDEX_DIVERGENCE`); `aira ready` -> `FAIL`. Deleting a ticket that *owns* a relation instead drops that relation with the file: the ticket it blocked becomes `ready:true` with verdict `pass` and only a divergence warning (by read, pinned by `TestReadyCanonicalReadinessIgnoresDivergenceForDeletedRelationOwner`, `internal/store/m3_test.go:1022`). The installed skill never mentions `retired` (0 hits). | Skill text only; no delete verb |
+| 290(a) no way to delete or void a throwaway ticket | No: the void exists, it is undocumented | `aira mv PX-8 retired` from `planned` -> `ok`, rc 0 (measured). `retired` is a legal next status from every open status and from `done` (`internal/domain/ticket.go:174-182`); a retired ticket is never ready (`workable`, `relation_ready.go:433-435`) and no longer blocks: in `A blocks B`, retiring the blocker `A` unblocks `B` (`satisfied` applied to the relation's `From`, `relation_ready.go:437-439`; direction corrected in build review round 3). The design already rules out deletion: "an allocated ID resolves to a live ticket or an explicit `retired`/`superseded` one, never nothing" (`2026-08-07-aira-design.md:106`). Deleting a file instead (measured, `rm .aira/tickets/PX-7.md`, where PX-7 was the *target* of relations stored in other files): `aira get PX-7` -> `E_TICKET_NOT_IN_WORKTREE`; `aira check` -> `fail` (`E_RELATION_TARGET_MISSING` on two relations, `E_RELATION_INDEX_DIVERGENCE`); `aira ready` -> `FAIL`. Deleting a ticket that *owns* a relation instead drops that relation with the file: the ticket it blocked becomes `ready:true` with verdict `pass` and only a divergence warning (by read, pinned by `TestReadyCanonicalReadinessIgnoresDivergenceForDeletedRelationOwner`, `internal/store/m3_test.go:1022`). The installed skill never mentions `retired` (0 hits). | Skill text only; no delete verb |
 | 290(b) `aira link A blocked-by B` refusal does not say what to type | Yes, measured | `link PX-3 blocked-by PX-5` and `unlink PX-2 blocked-by PX-1` -> `E_RELATION_INVALID: inverse relation kinds are query-only`, exit 1; same text for `child`, `duplicated-by`, `superseded-by`, `resolved-by`. Source: `Store.Link` and `Store.Unlink`, `internal/store/relation_ready.go:127-129` and `222-224`. | Build |
 | 290(c) closing a ticket takes three `aira mv` calls | Yes, by design | `mv PX-8 done` from `planned` -> `E_TRANSITION_INVALID: planned -> done is not a legal transition; from planned the legal next statuses are: in-progress, retired, superseded` (measured; successor list shipped in v0.31). AIRA-215 decided "the `planned -> done` edge stays refused (decided, not deferred)". `mv` enforces nothing beyond the transition table (`core.go:1686-1696`), so the table is the whole lifecycle gate. | Skill text only; no shortcut |
 | 290(d) `aira <verb> --help` errors | No: fixed in v0.31 (AIRA-211) | `link --help`, `mv --help`, `create --help`, `ready --help`, `reconcile --help` each print the verb's usage (measured). | Drop |
@@ -245,8 +245,8 @@ section (`skill.go:350-358`) gains one paragraph, "Closing, voiding and linking 
   call; each hop is journalled. There is no `planned -> done` shortcut (decided in
   AIRA-215). A refused move names the legal next statuses.
 - A throwaway or mistaken ticket is voided with `aira mv <id> retired`: one hop from any
-  open status (and from `done`). `retired` is terminal, never ready, and satisfies any
-  `blocks` relation that points at it. There is no delete: IDs are never reused, and every
+  open status (and from `done`). `retired` is terminal and never ready, and a retired
+  blocker no longer blocks: in `A blocks B`, retiring `A` unblocks `B`. There is no delete: IDs are never reused, and every
   allocated ID must resolve to a live, retired or superseded ticket. Deleting the file
   instead leaves `aira get` answering `E_TICKET_NOT_IN_WORKTREE`; relations stored in
   other tickets' files that point at it dangle, so `aira ready` fails with
@@ -416,12 +416,24 @@ outside it until the cutover restart and the rebuild of old binaries.
    reach; start the service or run with its XDG_RUNTIME_DIR`). A client whose identity
    matches the service still runs `systemctl --user start`; a service serving another state
    is ignored (a developer's own daemon on a private `XDG_STATE_HOME` still forks). Its
-   cost: a client that cannot establish the unit's identity (no `HOME`, no reachable user
-   manager at `/run/user/<uid>`) still forks, as before. The identity probe does not depend
-   on the caller's session variables: `daemon.RunSystemctl` repeats a failed `systemctl
-   --user` once with `XDG_RUNTIME_DIR=/run/user/<uid>`, the manager's own runtime directory,
-   because a cron job, `env -i`, or a gate whose `env_allow` omits the session variables
-   otherwise gets "Failed to connect to bus" and would fork (build review round 2).
+   cost: a client that cannot establish the unit's identity (no user manager reachable
+   either through its own environment or at `/run/user/<uid>`, no `systemctl` on `PATH`,
+   `/usr/bin` or `/bin`, or an unreadable unit file) still forks, as before. The identity
+   probe does not depend on the caller's session variables: `daemon.RunSystemctl` repeats a
+   failed `systemctl --user` once in the manager's own environment
+   (`XDG_RUNTIME_DIR=/run/user/<uid>` and no `DBUS_SESSION_BUS_ADDRESS`, because the real
+   tool goes through that address whenever it is present, even empty or stale: measured,
+   systemd 255), because a cron job, `env -i`, or a gate whose `env_allow` omits the
+   session variables otherwise gets "Failed to connect to bus" and would fork (build review
+   rounds 2 and 3); it finds `systemctl` at `/usr/bin` or `/bin` when `PATH` has none. The
+   unit file read is the one the manager has loaded (`systemctl --user show -p
+   FragmentPath`), never one chosen from the caller's `HOME`: is-enabled, show-environment
+   and `start` all reach the uid's real manager, so a private-`HOME` sandbox holding an
+   aira-managed unit of its own must not take that file for the manager's unit (round 3).
+   The same rule, "the enabled unit serving this state owns it"
+   (`daemon.ManagedServiceForState`: same state id, any socket), also guards `aira daemon
+   serve` (refused, exit 4, when the unit serves this state at another socket) and `aira
+   daemon stop` (redirected to `systemctl --user stop`) (round 3).
 7. `cmd/aira/main.go`, `runConfineCommand`: after resolving paths, and before any
    admission, `unreachableDaemonError` returns `E_DAEMON_UNAVAILABLE` (the same
    `ran=no` refusal as an argument error, exit 4) when the client's own socket does not
@@ -433,10 +445,15 @@ outside it until the cutover restart and the rebuild of old binaries.
    and are not covered (open, section 7).
 
 Consequences, stated: `aira daemon status` from a mismatched process now reports the
-lock holder as running and the socket as not ready (true), and `aira daemon stop` from
-such a process stops the daemon that owns this state (it is that state's daemon).
-`aira daemon` started by hand while a daemon owns the state gets `ErrAlreadyRunning` and
-exits 0 without serving (`daemon_command.go:47-52`), instead of starting a second one.
+lock holder as running and the socket as not ready (true). `aira daemon stop` from such a
+process is redirected to `systemctl --user stop` when the enabled unit serves this state
+(round 3); when no enabled unit serving this state can be identified from that process, it
+SIGTERMs the state's lock holder (it is that state's daemon, which on a box with the
+service is the service's daemon: release note, section 10). `aira daemon` started by hand
+while a daemon owns the state gets `ErrAlreadyRunning` and exits 0 without serving
+(`daemon_command.go:47-52`), instead of starting a second one; started by hand from
+another runtime directory for the enabled unit's state, it is refused (exit 4) whether or
+not the service is up.
 
 ### 3.6 AIRA-289(a), (c) and the env half of (b): command gates in the skill
 
@@ -468,8 +485,9 @@ placed after "Coordination is opt-in per project":
   `timeout_ms`), `env_allow` must include `HOME` and `XDG_RUNTIME_DIR` so the inner call
   reaches this machine's daemon; without `XDG_RUNTIME_DIR` it is refused with
   `E_DAEMON_UNAVAILABLE` naming the daemon's socket (for the nested `aira confine` itself,
-  at launch with `ran=no`, by 3.5 step 7; this needs `HOME` visible so the unit can be
-  found, or the holder's recorded socket). `DBUS_SESSION_BUS_ADDRESS` is not
+  at launch with `ran=no`, by 3.5 step 7; this needs the holder's recorded socket, or the
+  user manager reachable so the unit can be identified; `HOME` and `XDG_STATE_HOME` are
+  needed anyway for the inner `aira` to find this machine's state). `DBUS_SESSION_BUS_ADDRESS` is not
   needed (measured: a scope is placed without it).
   **Build precondition (not yet measured):** before this paragraph is written, the builder
   runs `aira confine -- aira gate run <id>` against a private daemon (private `HOME`,
@@ -498,7 +516,12 @@ check, prepare now compares the on-disk digest to the precondition and returns
 the idempotent re-run). A file is written only while its writer's row is pending, so this
 closes the window between the read and the insert for AIRA writers; a non-cooperative
 editor is still caught at materialise as before. Nothing is lost silently: the refused
-writer stores no relation and the caller re-runs.
+writer stores no relation and the caller re-runs. That materialise-time refusal is the one
+`E_WRITE_CONFLICT` that still leaves its row pending, and the path then answers
+`E_PATH_INTENT_BUSY` until `aira intent-retire <path>`: a non-aira change (git, an editor)
+between prepare and materialise, or `aira create` onto a path a file already occupies
+(create prepares through its own path, which this check does not cover). The skill says
+so (round 3).
 
 ## 4. Invariants
 
@@ -711,16 +734,21 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race`
 - **Service down, mismatched client.** While the unit is down, a mismatched client is now
   refused instead of starting a stray (3.5 step 6); the restart window of the cutover
   therefore refuses such callers rather than forking. A mismatched client that cannot
-  identify the unit still forks: its `HOME` is not visible (no unit file to read), or the
-  user manager is not reachable at `/run/user/<uid>` (a container without the user's
-  systemd). A missing `XDG_RUNTIME_DIR` or session bus is NOT such a case (the probe
-  retries against `/run/user/<uid>`, 3.5 step 6). That residual is the pre-v0.34 behaviour
-  and ends when the unit is up (the state lock then fences it).
+  identify the unit still forks: the user manager is reachable neither through the
+  caller's environment nor at `/run/user/<uid>` (a container without the user's systemd),
+  `systemctl` is on neither `PATH`, `/usr/bin` nor `/bin`, or the loaded unit file cannot
+  be read. A missing, empty or stale `XDG_RUNTIME_DIR` or `DBUS_SESSION_BUS_ADDRESS`, a
+  missing `PATH` and a missing or private `HOME` are NOT such cases (3.5 step 6). That
+  residual is the pre-v0.34 behaviour and ends when the unit is up (the state lock then
+  fences it).
 - **Lock-file record.** `LockInfo.Socket` is new; a lock file written by an older daemon
   has none, and the client then keeps today's `E_DAEMON_TIMEOUT`. No compat obligation
   beyond that.
-- **`aira daemon stop` reach.** From a mismatched process it now stops the state's real
-  daemon (it reads the state's lock). Correct, but new; noted in release notes.
+- **`aira daemon stop` reach.** The lock is per state, so from a mismatched process
+  `daemon.Stop` would SIGTERM the state's real daemon. When the enabled unit serves that
+  state, `stop` redirects to `systemctl --user stop` instead (round 3); when the unit cannot
+  be identified from that process, it still SIGTERMs the lock holder, which on the box is
+  the shared service daemon (systemd restarts it after 2 s). Release notes warn (10).
 - **Message text.** `E_RELATION_INVALID` and the divergence message change text; codes and
   exits do not. Tests pinning the old strings are updated.
 - **Skill length.** About 30 lines of new skill text; each paragraph is pinned by one row
@@ -746,11 +774,20 @@ rely on `aira install` to do it. Skill reinstall required
 (`aira skill install ~/.claude/skills/aira --force`). Rebuild worktree `aira` binaries and
 restart `aira mcp` servers: a pre-v0.34 binary run with a different `XDG_RUNTIME_DIR` from
 the daemon's can still start a second daemon.
+Warn every peer: **stop the service with `systemctl --user stop aira-daemon.service`, never
+with `aira daemon stop` from a process whose `XDG_RUNTIME_DIR` differs from the
+service's (or is unset).** The daemon lock is now per state directory, so such a process
+reads the service's own lock record; v0.34 redirects it to systemctl when it can identify
+the enabled unit, but where it cannot (no user manager reachable from that process) it
+SIGTERMs the shared service daemon, interrupting every session's daemon work until systemd
+restarts it 2 s later. Likewise `aira daemon`
+run by hand from another runtime directory for the service's state is now refused (exit 4)
+instead of serving a stray.
 Release note for every peer: a process that runs `aira` with a different
 `XDG_RUNTIME_DIR` from the daemon's (or none) now fails with `E_DAEMON_UNAVAILABLE` naming
 the cause, instead of starting a second daemon (and `aira confine` refuses at launch
 instead of waiting for a daemon it cannot reach); export `XDG_RUNTIME_DIR` in cron jobs, and
-list it in a gate's `env_allow` when the gate command calls `aira`. The service is identified from `HOME` (its unit file), `XDG_STATE_HOME` if set, and the user's systemd manager at `/run/user/<uid>`: a missing `XDG_RUNTIME_DIR` or session bus does not hide it. Reply to ci-build per
+list it in a gate's `env_allow` when the gate command calls `aira`. The service is identified through the user's systemd manager (the unit file it has loaded, its `FragmentPath`), reached through the caller's environment or else at `/run/user/<uid>` with `systemctl` from `PATH` or `/usr/bin`, `/bin`: a missing, empty or stale `XDG_RUNTIME_DIR` or session bus address, a missing `PATH`, or a private `HOME` does not hide it. Reply to ci-build per
 ticket: 290(a) use `aira mv <id> retired`, no delete by design; 290(b) refusal now names
 the command; 290(c) close path stays three hops by decision (AIRA-215); 290(d) already
 shipped in v0.31; 291 the UNEVALUATED was the gate subject, fixed in v0.33, and the
@@ -828,3 +865,61 @@ three were re-measured by the reviewers against the real `systemctl`. All accept
 | 3 | Mutations MC3 (service branch disabled), MC4 (empty-recorded-socket guard dropped), MC5 (`Running` guard dropped), MC6 (state-id check dropped), MC7 (holder that recorded the client's own socket refused), MC8 (unit serving the client's own socket refused) all survived the confine launch check. | `dispatcher.go` `unreachableDaemonError`. True (measured by the reviewer). | **Fixed:** `TestConfineLaunchCheckDecisionTable`, eight rows, each a mutation's target (holder elsewhere refuse; holder on own socket wait; holder recording nothing wait; stale record with no lock wait; unit for this state elsewhere refuse; unit on own socket wait; unit for another state wait; unit not enabled wait). Each of MC3-MC8 is now RED. |
 
 Findings 1 and 2 of the round are one root cause (reviewer duplicates), noted once.
+
+### Build review, round 3 (on `1a6685a`) and fixes
+
+Fourteen P3 items from three reviewers, several of them correctness-relevant. Each was
+checked against the code, and the `systemctl` claims against the real tool (systemd 255,
+read-only `is-enabled`/`show` queries only). The measured connection rule of `systemctl
+--user`: with `DBUS_SESSION_BUS_ADDRESS` present it goes through that address only (a stale
+address fails even with `XDG_RUNTIME_DIR=/run/user/1000`, and an EMPTY address fails too,
+"Connection refused"); without it, it reaches the manager only with
+`XDG_RUNTIME_DIR=/run/user/<uid>`. `is-enabled` of a missing unit exits 4 (`not-found`);
+`show -p FragmentPath` of a missing unit prints `FragmentPath=` and exits 0. The test stubs
+now model this rule (round 2's stub counted any non-empty address as reachable). Each
+mutation below was applied alone to the committed fix and turned the named test RED
+(harness `~/tmp/c34fix/mut.py`, scratch).
+
+| # | Finding | Checked against | Disposition |
+|---|---|---|---|
+| 1 | The retry keeps a wrong `DBUS_SESSION_BUS_ADDRESS`, so it fails too and the client forks; the short-circuit also skips it when `XDG_RUNTIME_DIR` is already the manager's. | Real tool: stale and empty addresses fail with the manager's runtime dir (measured). True. | **Fixed:** the retry runs with `XDG_RUNTIME_DIR=/run/user/<uid>` and no bus address, and is skipped only when the caller's environment is already exactly that. `TestSystemctlProbeDropsAStaleBusAddressOnTheRetry` (4 rows). Mutations b1 (retry keeps the address) and b2 (old short-circuit) RED. |
+| 2, 13 | The probe reads the unit FILE from `$HOME` but asks the real manager, so a private-`HOME` sandbox with its own aira-managed unit makes the serve guard `systemctl --user start` the box's real unit. | `service.go` (`readFile(home/.config/...)`), the `daemon_command.go` serve guard; the reviewer's three real starts. True. | **Fixed (the cleaner form, item 13):** the unit file read is the manager's `FragmentPath`; `HOME` no longer identifies the unit, which also removes the "no HOME" residual. Measured end to end with the built binary in a private-`HOME` sandbox (real `systemctl` behind a logging wrapper that refuses start/stop/restart; stale bus address): is-enabled, show FragmentPath and show-environment each failed once and succeeded on the retry; the FragmentPath named the box's unit (another state); the sandbox served its own daemon; no `start` was attempted. Tests `TestManagedServicePathsReadsTheUnitTheManagerLoaded`, `TestDaemonServeInAPrivateHomeNeverStartsTheManagersUnit`; mutation a1 (read the unit under `HOME`) RED in both. |
+| 3 | 3.7's idempotent clause is unpinned (MS2 green). | `store.go` `preparePathMutationEventKind`. True. | **Fixed:** `TestAnIdenticalRacedWriteIsNotAConflict` (two writers, same bytes from one stale read: both OK, no pending row). Mutation d1 (MS2) RED. |
+| 4 | The skill says, unqualified, that a refused write leaves nothing pending. A materialise-time `E_WRITE_CONFLICT` (a non-aira change, or `aira create` onto an occupied path) leaves the row pending until `aira intent-retire`, which the skill never names. "Satisfies any `blocks` relation that points at it" has the direction backwards. | `materialiseIntent`; `seedConflictedRoutingIntent`; `satisfied(prerequisite.Status)` with the prerequisite being `relation.From`. True. | **Fixed:** the skill names the pending case and `aira intent-retire <path>` (the path selector of `resolvePendingIntent`); the retired wording is now "after `aira link A blocks B`, `B` stops being held back once `A` is retired". Spec 1, 3.1 and 3.7 corrected. Skill-test rows added; mutations e1 and e2 RED. |
+| 5, 9 | With no `PATH` the probe is blind (`exec.LookPath` fails at once), the gate shape the skill recommends. | `RunSystemctl` runs a bare `"systemctl"`. True. | **Fixed:** fall back to `/usr/bin/systemctl`, then `/bin/systemctl`. `TestSystemctlIsFoundWithoutPATH` (stub at a fallback path, NOT on `PATH`, `PATH` unset) and `TestRealSystemctlIsFoundWithoutPATH` (real tool, `PATH` unset, location checked independently of the list). Mutations c1 (no fallback) and c2 (empty list) RED. c2 was GREEN at first because the test skipped on the very list it tests; fixed. |
+| 6, 10 | The `status.Ready` guard in `lockHolderError` is unpinned (MB/D1 green). | `dispatcher.go` `lockHolderError`. True. | **Fixed:** `TestAnAnsweringSocketKeepsThePlainTimeout` (the socket answers, the exchange times out, the holder recorded another socket or this one: plain `E_DAEMON_TIMEOUT`, exit 3, no false "has not bound"). Mutation d2 (MB) RED. |
+| 7 | `aira daemon stop` from another `XDG_RUNTIME_DIR` SIGTERMs the box service daemon, and the release note does not warn. | `daemon_command.go` stop (`ServiceIdentityMatches` compares sockets); `daemon.Stop` reads the state lock. True. | **Fixed in code, and warned:** stop redirects to systemctl whenever the enabled unit serves this state (`ManagedServiceForState`); the release note warns about the residual where the unit cannot be identified. `TestDaemonStopFromAnotherRuntimeDirNeverSignalsTheServicesDaemon` (a child `sleep` plays the daemon and must survive); mutation f2 RED. The same rule now guards serve (a reviewer gap: a hand-run serve from another runtime dir served a stray while the service was down): `TestDaemonServeFromAnotherRuntimeDirRefusesTheServicesState`, mutation f1 RED. |
+| 8 | The comment and round-2 row 1 ("one run when the caller already reaches the manager") overstate: a disabled or missing unit always costs two runs. | `is-enabled` exits 1 or 4 for a disabled or missing unit (measured). True. | **Fixed:** the comment states the real cost (one run on success; two on failure unless the caller's environment is already the manager's). Round-2 row 1 is history and stays as written; this row corrects it. |
+| 11 | When both runs fail an error must be returned; S6 (the retry swallows it) was green. | `RunSystemctl`. True. | **Fixed:** `TestSystemctlFailureInBothEnvironmentsIsReported` (an error is returned, and it is the first run's). Mutations S6 and S6b (return the retry's error) RED. |
+| 12 | Simplification: S3 (no short-circuit) and S4b (always one forced run) were green; pin the reason for trying the caller's environment first, or reduce to one run. | `RunSystemctl`. True. | **Pinned, not reduced:** the caller's environment is the only way to a manager that is not at `/run/user/<uid>` (`TestSystemctlProbeTriesTheCallersEnvironmentFirst`, S4b RED); the short-circuit skips only an identical retry (`TestSystemctlProbeDoesNotRepeatAnIdenticalRun`, S3 RED). |
+| 14 | Nit: an unused parameter in `TestConfineLaunchCheckDecisionTable`'s `unit`. | True. | **Fixed:** one `enabledUnit` stub value. |
+
+### Accepted residuals (v0.34)
+
+Left on purpose; each is bounded and stated:
+
+- **Unit identity not establishable** from a process: no user manager reachable through
+  its own environment or at `/run/user/<uid>`, no `systemctl` on `PATH`, `/usr/bin` or
+  `/bin`, or the loaded unit file unreadable. While the service is down such a client
+  forks as before v0.34; `aira daemon serve` serves; `aira daemon stop` SIGTERMs the
+  state's lock holder (release-noted). All three end once the unit is up and the state
+  lock fences.
+- **A stray already holding the service's state** (forked by such a process) cannot be
+  stopped with `aira daemon stop` from a process that does identify the unit: that is
+  redirected to systemctl, which does not own the stray. Kill it by the PID that `aira
+  daemon status` prints.
+- **A materialise-time `E_WRITE_CONFLICT` leaves its row pending** until `aira
+  intent-retire <path>` (3.7): non-aira edits in the prepare-to-materialise window, and
+  `aira create` onto an occupied path. The skill says so.
+- **Status's momentary flock probe** (now on every confine launch whose socket does not
+  answer) can make a daemon starting at that instant read `ErrAlreadyRunning` and exit 0;
+  systemd restarts the service 2 s later. Same pattern as the client's startup lock; not
+  measured.
+- **Two `systemctl` execs** for a disabled or missing unit when the caller's environment
+  is not exactly the manager's (milliseconds; only at spawn and at a confine launch whose
+  socket does not answer).
+- **Drop-ins are not read:** the identity comes from the loaded unit's main file
+  (`FragmentPath`); an `Environment=XDG_STATE_HOME` override in a drop-in is not seen.
+  `aira install` writes none.
+- `aira drain wait` and `aira confine-reserve` (section 7) are still not covered by the
+  launch refusal.
