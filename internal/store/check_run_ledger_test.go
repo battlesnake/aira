@@ -98,6 +98,7 @@ func TestCheckGradesRunLedgerUnevaluatedAndSuppressesNothingElse(t *testing.T) {
 	for _, want := range []string{
 		"invalid run ledger record",
 		fmt.Sprintf("unknown field %q", runnertest.FutureField),
+		"does not recognise",
 		fmt.Sprintf("record 1 at byte offset %d", badOffset),
 		ledgerPath,
 	} {

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/app"
 	"aira/internal/domain"
 	"aira/internal/store"
 )
@@ -180,5 +181,44 @@ func TestAdoptionPrefixConflictNamesOwnerAndEject(t *testing.T) {
 	response := server.bootstrap(context.Background(), bootstrap, map[string]any{})
 	if response.OK || response.Code != "E_PREFIX_OWNERSHIP_CONFLICT" || !strings.Contains(response.Error, owner.ProjectID) || !strings.Contains(response.Error, "aira eject") {
 		t.Fatalf("response=%+v", response)
+	}
+}
+
+// verifies: AIRA-188 -- the daemon face of a bare init on a fresh repository is
+// refused too, and claims no prefix (it used to claim AIRA).
+func TestBootstrapWithoutPrefixesIsRefusedAndClaimsNoPrefix(t *testing.T) {
+	server, paths := newDiscoveryTestServer(t)
+	root := filepath.Join(filepath.Dir(paths.StateHome), "bare-init")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	project, err := app.DiscoverBootstrap(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := WorktreeScope{
+		Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
+		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
+		StateID: paths.StateID, Bootstrap: true,
+	}
+	response := server.bootstrap(context.Background(), scope, map[string]any{"project": "bare"})
+	if response.OK {
+		t.Fatalf("bare bootstrap succeeded: %+v", response)
+	}
+	if response.Code != "E_CONFIG_INVALID" || !strings.Contains(response.Error, "--prefixes") {
+		t.Fatalf("bare bootstrap response = %+v", response)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ".aira", "config")); !os.IsNotExist(statErr) {
+		t.Fatalf("refused bootstrap left a config: %v", statErr)
+	}
+	var owned int
+	if err := lifecycleSQL(t, paths.DBPath).QueryRow(`SELECT count(*) FROM prefix_ownership WHERE prefix='AIRA'`).Scan(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if owned != 0 {
+		t.Fatalf("refused bootstrap claimed AIRA (%d rows)", owned)
 	}
 }

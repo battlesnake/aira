@@ -137,18 +137,28 @@ func TestDiscoverRegistryPassSkipsBadEntriesAndGuardsIdentity(t *testing.T) {
 	wrong := projectForDiscoveryScope(independentScope(t, paths, "wrong", "WRONG"))
 	invalid := projectForDiscoveryScope(independentScope(t, paths, "invalid", "INVALID"))
 	invalid.Config.Project.Review = []byte(`null`)
+	// /missing is absent (the daemon never forks git for it); /reused is a real
+	// directory so the identity-mismatch branch is reached through the hook.
+	base := t.TempDir()
+	missingRoot := filepath.Join(base, "missing")
+	reusedRoot := filepath.Join(base, "reused")
+	if err := os.MkdirAll(reusedRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	entries := []store.RegistryEntry{
-		{ProjectID: "missing-project", WorktreeID: "missing-worktree", Root: "/missing"},
-		{ProjectID: "stale-project", WorktreeID: "stale-worktree", Root: "/reused"},
+		{ProjectID: "missing-project", WorktreeID: "missing-worktree", Root: missingRoot},
+		{ProjectID: "stale-project", WorktreeID: "stale-worktree", Root: reusedRoot},
 		registryEntryForProject(invalid),
 		registryEntryForProject(valid),
 	}
 	server.listRegistryEntries = func(string) ([]store.RegistryEntry, error) { return entries, nil }
+	reusedCalled := false
 	server.discoverProject = func(_ context.Context, root string) (app.Project, error) {
 		switch root {
-		case "/missing":
+		case missingRoot:
 			return app.Project{}, errors.New("E_NOT_PROJECT: gone")
-		case "/reused":
+		case reusedRoot:
+			reusedCalled = true
 			return wrong, nil
 		case invalid.Root:
 			return invalid, nil
@@ -166,6 +176,9 @@ func TestDiscoverRegistryPassSkipsBadEntriesAndGuardsIdentity(t *testing.T) {
 	discovered, registered, skipped := server.discoverRegistryPass(context.Background())
 	if discovered != 1 || registered != 4 || skipped != 3 {
 		t.Fatalf("summary discovered=%d registered=%d skipped=%d", discovered, registered, skipped)
+	}
+	if !reusedCalled {
+		t.Fatal("identity-mismatch branch not reached: the hook was never called for the reused root")
 	}
 	server.mu.Lock()
 	_, validCovered := server.coveredWorktrees[valid.WorktreeID]
@@ -744,5 +757,178 @@ func TestServeDiscoveryReapsPriorLifetimeProjectWithoutRequest(t *testing.T) {
 		}
 	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not stop")
+	}
+}
+
+// absentRegistryEntry is a registry entry whose root does not exist on disk.
+func absentRegistryEntry(t *testing.T, worktreeID, name string) store.RegistryEntry {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), name)
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fixture root %s exists: %v", root, err)
+	}
+	return store.RegistryEntry{ProjectID: "p-" + worktreeID, WorktreeID: worktreeID, Root: root}
+}
+
+func countLines(output, substr string) int {
+	n := 0
+	for _, line := range bytes.Split([]byte(output), []byte{'\n'}) {
+		if bytes.Contains(line, []byte(substr)) {
+			n++
+		}
+	}
+	return n
+}
+
+// verifies: AIRA-209 -- a registry root that no longer exists logs ONE skip line,
+// not one per pass, and every pass still counts it as skipped.
+func TestDiscoveryLogsAMissingRootOncePerTransition(t *testing.T) {
+	server, _ := newDiscoveryTestServer(t)
+	entry := absentRegistryEntry(t, "wt-gone", "gone")
+	server.listRegistryEntries = func(string) ([]store.RegistryEntry, error) {
+		return []store.RegistryEntry{entry}, nil
+	}
+	out := captureDaemonLog(t, func() {
+		for pass := 1; pass <= 3; pass++ {
+			if _, registered, skipped := server.discoverRegistryPass(context.Background()); registered != 1 || skipped != 1 {
+				t.Fatalf("pass %d registered=%d skipped=%d, want 1/1", pass, registered, skipped)
+			}
+		}
+	})
+	if got := countLines(out, "registry discovery skip"); got != 1 {
+		t.Fatalf("skip lines=%d, want 1; log:\n%s", got, out)
+	}
+}
+
+// verifies: AIRA-209 -- git discovery is never forked for a root os.Stat reports
+// absent.
+func TestDiscoverySkipsGitDiscoveryForAnAbsentRoot(t *testing.T) {
+	server, _ := newDiscoveryTestServer(t)
+	entry := absentRegistryEntry(t, "wt-gone", "gone")
+	server.listRegistryEntries = func(string) ([]store.RegistryEntry, error) {
+		return []store.RegistryEntry{entry}, nil
+	}
+	var calls atomic.Int32
+	server.discoverProject = func(context.Context, string) (app.Project, error) {
+		calls.Add(1)
+		return app.Project{}, errors.New("E_NOT_PROJECT: gone")
+	}
+	captureDaemonLog(t, func() {
+		server.discoverRegistryPass(context.Background())
+		server.discoverRegistryPass(context.Background())
+	})
+	if calls.Load() != 0 {
+		t.Fatalf("git discovery ran %d times for an absent root, want 0", calls.Load())
+	}
+}
+
+// verifies: AIRA-209 -- one entry over successive passes: a changed reason logs
+// again, a root that reappears is NOT latched out, and a covered entry's key is
+// forgotten.
+func TestDiscoverySkipLogTransitionsAndForgetsCoveredKey(t *testing.T) {
+	server, paths := newDiscoveryTestServer(t)
+	project := projectForDiscoveryScope(independentScope(t, paths, "transition", "TRANS"))
+	entry := registryEntryForProject(project)
+	entry.Root = filepath.Join(t.TempDir(), "later")
+	server.listRegistryEntries = func(string) ([]store.RegistryEntry, error) {
+		return []store.RegistryEntry{entry}, nil
+	}
+	server.reapScope = func(context.Context, *store.Store) (int, error) { return 0, nil }
+	var calls atomic.Int32
+	failWith := errors.New("E_NOT_PROJECT: reason B")
+	server.discoverProject = func(context.Context, string) (app.Project, error) {
+		calls.Add(1)
+		if failWith != nil {
+			return app.Project{}, failWith
+		}
+		return project, nil
+	}
+	key := entry.WorktreeID + "\x00" + entry.Root
+	logged := func() (string, bool) {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		reason, ok := server.discoverySkipLogged[key]
+		return reason, ok
+	}
+	out := captureDaemonLog(t, func() {
+		server.discoverRegistryPass(context.Background()) // absent: reason A
+		server.discoverRegistryPass(context.Background()) // absent: reason A again
+	})
+	if got := countLines(out, "registry discovery skip"); got != 1 {
+		t.Fatalf("absent twice: skip lines=%d, want 1; log:\n%s", got, out)
+	}
+	if _, ok := logged(); !ok {
+		t.Fatal("absent root's reason was not remembered")
+	}
+	if err := os.MkdirAll(entry.Root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out = captureDaemonLog(t, func() {
+		server.discoverRegistryPass(context.Background()) // exists, hook fails: reason B
+		server.discoverRegistryPass(context.Background()) // reason B again
+	})
+	if got := countLines(out, "registry discovery skip"); got != 1 {
+		t.Fatalf("reason changed: skip lines=%d, want exactly 1 more; log:\n%s", got, out)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("hook calls=%d, want 2 (a reappeared root must reach git discovery, no latch)", calls.Load())
+	}
+	failWith = nil
+	captureDaemonLog(t, func() { server.discoverRegistryPass(context.Background()) })
+	server.mu.Lock()
+	_, covered := server.coveredWorktrees[entry.WorktreeID]
+	server.mu.Unlock()
+	if !covered {
+		t.Fatal("entry was not covered after the hook recovered")
+	}
+	if reason, ok := logged(); ok {
+		t.Fatalf("covered entry's key still in discoverySkipLogged (%q)", reason)
+	}
+}
+
+// verifies: AIRA-209 -- the key includes the root: two entries sharing a worktree
+// id with different roots each log, even when their reason text is identical
+// (real directories and a hook error with no path in it, so only the key can
+// tell them apart).
+func TestDiscoverySkipLogKeyIncludesTheRoot(t *testing.T) {
+	server, _ := newDiscoveryTestServer(t)
+	base := t.TempDir()
+	first := store.RegistryEntry{ProjectID: "p", WorktreeID: "wt-same", Root: filepath.Join(base, "one")}
+	second := store.RegistryEntry{ProjectID: "p", WorktreeID: "wt-same", Root: filepath.Join(base, "two")}
+	for _, entry := range []store.RegistryEntry{first, second} {
+		if err := os.MkdirAll(entry.Root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.listRegistryEntries = func(string) ([]store.RegistryEntry, error) {
+		return []store.RegistryEntry{first, second}, nil
+	}
+	server.discoverProject = func(context.Context, string) (app.Project, error) {
+		return app.Project{}, errors.New("E_NOT_PROJECT: same reason for both roots")
+	}
+	out := captureDaemonLog(t, func() { server.discoverRegistryPass(context.Background()) })
+	if got := countLines(out, "registry discovery skip"); got != 2 {
+		t.Fatalf("skip lines=%d, want 2; log:\n%s", got, out)
+	}
+}
+
+// verifies: AIRA-209 -- the aggregate line prints only when its
+// (discovered, registered, skipped) triple changes.
+func TestDiscoverySummaryLinePrintsOnlyOnChange(t *testing.T) {
+	server, _ := newDiscoveryTestServer(t)
+	entries := []store.RegistryEntry{absentRegistryEntry(t, "wt-one", "one")}
+	server.listRegistryEntries = func(string) ([]store.RegistryEntry, error) { return entries, nil }
+	out := captureDaemonLog(t, func() {
+		for pass := 0; pass < 3; pass++ {
+			server.discoverRegistryPass(context.Background())
+		}
+	})
+	if got := countLines(out, "registry discovery: discovered"); got != 1 {
+		t.Fatalf("summary lines after three identical passes=%d, want 1; log:\n%s", got, out)
+	}
+	entries = append(entries, absentRegistryEntry(t, "wt-two", "two"))
+	out = captureDaemonLog(t, func() { server.discoverRegistryPass(context.Background()) })
+	if got := countLines(out, "registry discovery: discovered"); got != 1 {
+		t.Fatalf("summary lines after the counts changed=%d, want 1 more; log:\n%s", got, out)
 	}
 }
