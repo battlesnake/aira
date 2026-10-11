@@ -1,18 +1,23 @@
 # AIRA-204 + AIRA-199: remove six merge-gate flake classes
 
-Status: PLAN v1.2 (2026-10-10; v1.2 applies the first plan review, section 10). Test
-hardening, one change. Tickets: AIRA-204 (P1, four
+Status: PLAN v1.3 (2026-10-11; v1.2 applied plan review 1, v1.3 applies plan review 2,
+both in section 10; section 10.3 lists what the build already on this branch must change
+to match). Test hardening, one change. Tickets: AIRA-204 (P1, four
 witnessed flakes, each a different defect class) and AIRA-199 (P2, a test hands a callee
 its own descriptor). Two flakes seen this week join them: `internal/daemon`
 `TestExclusiveIsNotGrantedWhileALeaseIsHeld` and `internal/runner`
 `TestM20RealForcedQuiescePreservesLeaderExitAndIsNotClean`. Base: master `d13ef3b`. Both
 tickets report `ready:true`.
 
-**Production code: two test seams, unset in production, across four files
-(`internal/daemon/admit.go` + `server.go`, `internal/runner/detach_linux.go` +
-`runner_linux.go`).** Neither flake is a product race (measured, section 1). The seams get
-their own review pass (section 8). Everything else is `_test.go` plus one committed
-measurement script.
+**Production code: four files, three changes.** (1) E: one test seam, unset in
+production (`internal/daemon/admit.go` + `server.go`). (2) F: the post-kill emptiness
+confirmation in `internal/runner/detach_linux.go` gets its own named 2 s bound instead of
+reusing the configurable grace; identical in production, where the grace is always 2 s
+(no seam). (3) B: `cmd/aira/tui.go` makes the destructive-confirmation form one row
+taller, a **visible product fix**: today the form is one row short and, with focus on
+Cancel, the "Type <ID>:" input is scrolled out of view (section 1, B). Neither E nor F is
+a product race (section 1). All four files get their own review pass (section 8).
+Everything else is `_test.go` plus one committed measurement script.
 
 ## 1. Problem, in plain terms, and what still reproduces
 
@@ -54,12 +59,26 @@ holding the proposed change; the builder re-measures on committed code.
   themselves; a key and a later `QueueUpdate` are NOT ordered. A test that injects a key,
   sleeps 20 ms, then reads state through `QueueUpdate` can read the state from before the
   key. The `:272` and board `:156/162/168` failures are reads of exactly that kind.
-  The panic is established only from its stack: `waitForSimulationText("Type RANT-7")`
-  returned without the text and `checkDisabled` (`:341`) dereferenced a nil
-  `paletteConfirmForm` on the UI goroutine. The likely route (inferred, not traced) is
-  the same ordering: `tabToPaletteSubmit` (`:429-446`) reads focus, Tabs, sleeps, reads
-  again; a read that overtakes its Tab sends a second Tab, the stale Tab then moves focus
-  off Submit, and Enter lands on Cancel.
+  The panic is established from its stack: `checkDisabled` (`:341`) dereferenced a nil
+  `paletteConfirmForm` on the UI goroutine after `waitForSimulationText("Type RANT-7")`
+  returned without the text. Two separate facts sit behind it:
+  - **The needle was never on screen, on any run.** Every passing run of
+    `TestTUIDestructiveConfirmationRequiresExactResolvedID` on `d13ef3b` took 10.28-11.39 s
+    (11 runs, `~/tmp/aira-flakes/runs/tuiall-before-race.log`) against 0.44-1.21 s after
+    the change (20 runs, `after-B-tuiall-race.log`): the 10 s wait expired silently every
+    time. Cause (found by the build once the wait failed loudly, commit `e5c1223`):
+    `showPaletteConfirmation` (`tui.go:1110`) sizes the form `GetFormItemCount()+5` rows,
+    one short of border 2 + padding 2 + item + gap + buttons; with focus starting on
+    Cancel, tview scrolls the form and the "Type <ID>:" row is not drawn. A product bug
+    (the operator cannot see the field they must fill), fixed with `+6`. So plan v1.2's
+    explanation (an ordering race made the text late) was wrong: the wait never
+    synchronised anything.
+  - **The form was nil: the confirmation was never built.** Enter did not reach Submit.
+    The likely route (inferred, not traced) is the key/read ordering above:
+    `tabToPaletteSubmit` (`:429-446`) reads focus, Tabs, sleeps, reads again; a read that
+    overtakes its Tab sends a second Tab, the stale Tab then moves focus off Submit, and
+    Enter lands elsewhere. With the old silent wait the test reached the dereference
+    10 s later regardless.
 - **E.** `enqueueAdmitInternal` creates a queue, starts `go queue.runEvaluator()`
   (`admit.go:2003`) and kicks it (`queue.signal()`, `:2154`). The evaluator grants the
   exclusive waiter on an empty slice before the test calls `seedRunningLease` or sets
@@ -102,13 +121,15 @@ Solving each alone, from nothing:
   still as a deadline.
 - **E:** a test that drives admission passes by hand must be the queue's only evaluator
   from the moment the queue exists.
-- **F:** give the "must expire" wait and the "must not expire" backstop separate values.
+- **F:** give the "must expire" wait and the "must not expire" bound separate values.
 - **199:** give the callee a descriptor it may own; close your own ends yourself.
 
 The concrete minimum: an exact-name population predicate (A); one bounded UI-read helper
 and a key-completion barrier (B); cancellation armed after the pid line (C); one evaluator
-per queue (E); separate expire/backstop bounds (F); explicit descriptor ownership (199).
-Two parts of the plan go beyond it and are chosen, not required:
+per queue (E); separate expire/confirm bounds (F); explicit descriptor ownership (199).
+The key barrier at its minimum is one sentinel and one acknowledgement: `press` is only
+ever called serially, so v1.2's per-press sequence numbers and waiter map are dropped
+(section 3.2). Three parts of the plan go beyond the minimum and are chosen, not required:
 
 - **B's breadth.** The minimum converts the witnessed sites (`tui_smoke_test.go` `:87`,
   `:272`, `:297`, `:341`/`tabToPaletteSubmit`, `:529`, and the board `:156/162/168`).
@@ -117,11 +138,14 @@ Two parts of the plan go beyond it and are chosen, not required:
   change; leaving known instances of a measured class costs a later batch.
 - **The load matrix.** The minimum evidence is a deterministic RED/GREEN per item. The
   before/after load runs are corroboration of the measured rates, not the proof.
+- **C's permanent `sleep 0.2` before the trap.** Regression scaffolding: without it, a
+  regression to a deadline armed at start is RED only under load. Kept: it is the only
+  thing that makes that regression RED on every run, for 0.2 s per run.
 
 E's seam versus a granted "keeper" lease is a real trade (table below): the keeper needs
 no production line, the seam needs fewer fixture edits and removes the class at its
-source. The plan keeps the seam (one bool, default branch is today's statement). Two small
-test seams (E, F) are the only production lines.
+source. The plan keeps the seam (one bool, default branch is today's statement). It is
+the only test seam in production code; F needs none (section 3.6).
 
 | Item | Alternative | Why rejected |
 |---|---|---|
@@ -138,7 +162,10 @@ test seams (E, F) are the only production lines.
 | E | Pre-register an evaluator-less queue from test code | `pruneAdmitQueue` deletes it when it empties, and the next enqueue births a live one; it also duplicates the queue constructor in test code. |
 | F | `r.grace = testdeadline.Wait(r.grace)` (the precedent at `detach_linux_test.go:1080`) | Phase 1 always waits the full grace (the `sleep 30` never exits), so every run costs >= 5 s, 20 s under `-race`. |
 | F | `r.grace = time.Second` (the fixture default) | +0.9 s per run, and a fixed unscaled 1 s backstop on a kernel latency whose measured maximum is already 240 ms on 2 CPUs: the same class with a wider margin. |
+| F | A test seam `quiesceConfirmBound` on `Runner` (plan v1.2; built in `7890531`), set by the test to `testdeadline.Wait(time.Second)` | Production would carry a field only tests set, and the dual role would stay in the product (the confirmation still defaults to the configurable grace). A named constant at the one site gives identical production behaviour (production never sets `Config.Grace`, so `r.grace` is always 2 s: `runner_linux.go:188-190`, only `runner.Config{}` literal outside tests is `internal/app/project.go:305`, no `Grace`), removes the seam, and removes the dual role in the product. Cost: the real-cgroup test runs on the product's unscaled 2 s bound (8x the measured 240 ms maximum); a kernel slower than that fails production identically and is reported honestly. Plan review 2 (Sol P2) |
+| F | Pass `0` and rely on `waitEmpty`'s `timeout <= 0 -> 2 s` default (`cgroup_linux.go:396-397`) | Same behaviour, but a magic zero hides the decision; a named constant says it |
 | F | Use one post-kill bound for every `waitEmpty` site in the runner | Not witnessed elsewhere; production uses 2 s everywhere. Minimal change: the one site this test exercises. |
+| A | Treat every listing that names no record (`{}`, a JSON-RPC `error`, any `ok:false`) as `absent` (built in `e5c1223`) | Porous: a broken MCP reply then never exercises ownership or the kill and ends as an environmental skip. Only identified environmental answers are unevaluated (section 3.1); anything else fails. Plan review 2 (High) |
 | 199 | `runtime.KeepAlive(readyW)` | Measured insufficient in the ticket (1 failure in 400) and does nothing for the later cross-test close. |
 | all | A lint/CI guard against raw `time.After` | AIRA-204 already decided against it (about half the raw sites are correct negative waits; the allowlist is the complexity). |
 
@@ -147,14 +174,30 @@ test seams (E, F) are the only production lines.
 ### 3.1 A: `cmd/aira/dispatcher_inprocess_test.go`
 
 - New test helper `confineKillReadiness(output []byte, name string) (confineReadiness, runner.ConfineRecord, error)`:
-  decode the MCP `tools/call` envelope (`result.structuredContent.data`) into
-  `runner.ConfineListResult`; collect the records whose `Name == name` (exact equality).
-  More than one -> `err` naming the count (ambiguous; the kill selector would be refused
-  `E_SELECTOR_AMBIGUOUS`). Undecodable output -> `err`. Otherwise one of five states,
-  kept distinct because they mean different things:
+  decode and **validate** the MCP `tools/call` envelope before reading any record. The
+  envelope is the production encoder's (`toolResponse`, `cmd/aira/mcp.go:643`): `jsonrpc`
+  `"2.0"`, a `result` holding `structuredContent` (a `core.Response`: `ok`, `code`,
+  `data`). The reply is classified by its `code`, and only answers the code base already
+  names as environmental are unevaluated:
+
+  | Reply | Where it comes from | Result |
+  |---|---|---|
+  | `ok:true`, `code:"OK"`, `data.scopes` a JSON array (possibly empty) | a listing was produced | classify records (below) |
+  | `ok:true`, `code:"UNEVALUATED"` (`data.verdict:"unevaluated"`) | slice directory unreadable (`confine_manage_linux.go:169-171`), ci-shim with no daemon (`dispatcher.go:258-266`), non-Linux (`confine_manage_stub.go:15-16`); returned by the daemon (`internal/daemon/confine_manage.go:156-157`) and the daemon-down fallback (`dispatcher.go:290-291`) alike | `readinessUnlistable` |
+  | `ok:false`, `code:"E_CONFINE_UNAVAILABLE"` | the slice cannot be resolved (`confine_manage_linux.go:62-67`, `internal/daemon/confine_manage.go:124`) | `readinessUnlistable` |
+  | `ok:false`, `code` one of `E_DAEMON_UNAVAILABLE`, `E_DAEMON_TIMEOUT`, `E_DAEMON_BUSY` | a transport failure between the client and the test's private daemon (`transportErrorResponse`, `dispatcher.go:214-215`, `:688-694`); transient under load, so fatal would be a new false failure | `readinessUnlistable` (the poll retries; only a persistent one reaches the expiry, as unevaluated) |
+  | anything else: undecodable, `{}`, a JSON-RPC `error` member, no `result.structuredContent`, an empty `code`, any other code, `OK` without a `scopes` array | not an answer this test knows to be environmental | `err` |
+
+  The helper's caller also treats a non-zero `runMCPWithDispatcher` exit as `err` (today
+  the poll discards it with `_ =`). For an `OK` reply, collect the records whose
+  `Name == name` (exact equality). More than one -> `err` naming the count (ambiguous;
+  the kill selector would be refused `E_SELECTOR_AMBIGUOUS`). Otherwise one of five
+  record states, kept distinct because they mean different things (with
+  `readinessUnlistable` below them all, six states ordered by strength):
 
   | State | Record | Means |
   |---|---|---|
+  | `readinessUnlistable` | (no listing) | the environment cannot list confines |
   | `readinessAbsent` | none | not admitted (or already gone) |
   | `readinessPending` | `Pending: true` | admitted; the scope is not on disk |
   | `readinessUnreadable` | on disk, `SubtreePopulated == nil` | the scope exists; population not established |
@@ -167,16 +210,22 @@ test seams (E, F) are the only production lines.
   The `done` arm stays and is the environment probe: a launch that returns an error means
   the environment could not run a contained job -> `cgrouptest.SkipOrFailRealCgroup`
   (unevaluated, as today); a launch that returns nil -> `t.Fatal` (exited before the
-  kill, as today). Backstop `testdeadline.Wait(5*time.Second)`; on expiry the decision
-  uses the strongest state seen during the poll, not "listed":
+  kill, as today). Backstop `testdeadline.Wait(5*time.Second)`. Order within each
+  iteration: list and classify; break on `readinessPlaced`; a non-blocking receive on
+  `done`; then the deadline check. On expiry, **receive from `done` once more
+  (non-blocking) before deciding**, so a launcher error that lands between the earlier
+  receive and the deadline check is still read as the environment probe it is, never as
+  a product failure. Then the decision uses the strongest state seen during the poll,
+  not "listed":
   - `readinessEmpty` was observed -> `t.Fatalf` with that record. Containment capability
     is established separately from listing: the scope directory exists, its
     `cgroup.events` is readable, and the launcher (which returns an error when it cannot
     place the child) has not failed. A job that never enters a working scope is then a
-    product failure.
-  - only `readinessAbsent`, `readinessPending` or `readinessUnreadable` -> 
-    `cgrouptest.SkipOrFailRealCgroup` naming the last state (containment was never
-    established: unevaluated, not a product verdict).
+    product failure. (Limit: a scheduling stall longer than the scaled backstop between
+    scope creation and child placement would also land here; section 4.)
+  - only `readinessUnlistable`, `readinessAbsent`, `readinessPending` or
+    `readinessUnreadable` -> `cgrouptest.SkipOrFailRealCgroup` naming the last state
+    (containment was never established: unevaluated, not a product verdict).
 
   The 20 ms poll pacing stays (it is pacing, not synchronisation).
 - `:1086-1090`: `time.After(3*time.Second)` -> `testdeadline.After(3*time.Second)`.
@@ -201,12 +250,18 @@ are also used by the board tests):
   be called after the constructor and before `run()`. `(*keyTracker).press(t, screen,
   keys...)` injects the keys, then injects one sentinel key through the SAME path
   (`screen.InjectKey`, never `app.QueueEvent`, which would bypass the screen's queue and
-  could overtake keys still in it): `tcell.KeyRune` with a private-use rune carrying a
-  per-press sequence number (`U+F0000 + seq`). The wrapper recognises the sentinel,
-  signals that sequence number and returns `nil` (the sentinel never reaches a
-  primitive); every other key goes to the wrapped capture unchanged. `press` waits for its
-  own sequence number with a `testdeadline.After(time.Second)` backstop ("the tview loop
-  did not reach the key barrier: deadlocked"). Why this proves completion: screen events
+  could overtake keys still in it): `tcell.KeyRune` with one fixed supplementary
+  private-use rune (`U+F0000`). The wrapper recognises the sentinel, sends on the
+  tracker's acknowledgement channel (`chan struct{}`, buffer 1) and returns `nil` (the
+  sentinel never reaches a primitive); every other key goes to the wrapped capture
+  unchanged. `press` waits for that acknowledgement with a
+  `testdeadline.After(time.Second)` backstop ("the tview loop did not reach the key
+  barrier: deadlocked"). No sequence numbers and no waiter map (plan v1.2 had both;
+  built in `864aefa`): `press` and `barrier` are called serially from one goroutine at a
+  time (the pin's `press` runs in a goroutine, but nothing else presses meanwhile), each
+  waits for its own sentinel before returning, so at most one sentinel is ever in
+  flight; a `press` that times out fails the test, so no stale acknowledgement can be
+  read by a later one. The doc comment states "not safe for concurrent use". Why this proves completion: screen events
   are FIFO into `a.events`, and tview's loop (`tview@v0.42.0/application.go:391-450`)
   runs one key event to completion (capture, root handler, draw) before taking the next.
   So when the sentinel reaches the capture, every key injected before it, by `press` or
@@ -255,7 +310,17 @@ Rules applied to every TUI test file in `cmd/aira` (`tui_smoke_test.go`,
 6. `:293-295` (unbounded receive) -> `onUI`.
 
 The assertions' meaning is unchanged: every test checks the same property, and now fails
-only when the property is false or the loop is truly stuck.
+only when the property is false, the loop is truly stuck, or a stall outlasts the scaled
+backstop (>= 1 s inner round trip floored to 5 s, x4 under `-race`; section 4).
+
+7. **The destructive-confirmation form height (production, `tui.go:1110`).**
+   `TestTUIDestructiveConfirmationRequiresExactResolvedID` waits for the "Type RANT-7"
+   field itself after the form is built (an `eventuallyOnUI` on `paletteConfirmForm !=
+   nil`, then `waitForSimulationText`). With the now-loud wait it is expected to fail on
+   every run against `GetFormItemCount()+5` (the base timings in section 1 show the text
+   never appeared; the build reports the same in `e5c1223`, not re-run for this
+   revision) and to pass with `+6`. That is the pin for the product fix (mutation: `+5`
+   -> RED; the builder records the counts; section 5).
 
 ### 3.3 C: `internal/gitremote/exec_test.go`
 
@@ -265,23 +330,35 @@ only when the property is false or the loop is truly stuck.
   same channel (`select { case <-done: return context.DeadlineExceeded; default: return
   nil }`), never from a flag written after the close: `realRun` reads `ctx.Err()`
   after `<-ctx.Done()` fires (`exec.go:51` waits on it, `:63` reads `ctx.Err()`), so `Err()` must be non-nil the
-  instant `Done()` is closed.
+  instant `Done()` is closed. **`expire(cause)` records which event expired the context**:
+  inside the same `once` that closes the channel it stores the cause (`"pid line"` or
+  `"backstop"`) and the expiry time, so exactly one cause wins and `expiredAt` is the
+  instant of the actual expiry, not of a later event.
 - `realRun(ctx, runRequest{..., LiveStdout: w})` where `w` is a small writer that, on the
-  first `'\n'`, records the time and calls `expire()`. `realRun` already plumbs
-  `LiveStdout` into its stdout drain (`exec.go:41-44`, captured tail first, then live), so
-  the pid line is in `result.Stdout` before the deadline fires.
-- Backstop: `time.AfterFunc(testdeadline.Wait(5*time.Second), ...)` that marks
-  "backstop fired" and expires the context, so a child that never prints still ends the
-  subject; the test then fails "pid line never observed", never passes. The timer is
-  stopped when `realRun` returns.
+  first non-blank live write (a complete pid line: the live face sits behind
+  `lineRedactor`), calls `expire("pid line")`. `realRun` already plumbs `LiveStdout` into
+  its stdout drain (`exec.go:41-44`, captured tail first, then live), so the pid line is
+  in `result.Stdout` before the deadline fires.
+- Backstop: `time.AfterFunc(testdeadline.Wait(5*time.Second), func() {
+  expire("backstop") })`, so a child that never prints still ends the subject. The timer
+  is stopped when `realRun` returns. **The test fails unless the winning cause is
+  `"pid line"`.** Checking only that a pid line was seen is porous (plan review 2,
+  Medium; the build at `f20d597` has exactly that hole): if the backstop fires after
+  the trap but before `printf`, the children ignore TERM, the line is still printed
+  after the expiry, the writer records a time, and the test passes although
+  cancellation began before its precondition.
 - The script gains a fixed `sleep 0.2;` before `trap` (child-side startup delay, a
   fixture, not synchronisation): a regression to a deadline armed at start goes RED on
   every run instead of under load only.
-- Assertions: `errors.Is(result.Err, context.DeadlineExceeded)` (unchanged); backstop did
-  not fire; two pids parsed; bounded cancellation now measured from expiry:
-  `testdeadline.Exceeded(time.Since(expiredAt), 5*time.Second)` fails the test (realRun's
-  worst case after expiry is 3 x `processGrace`; the expected path is one 2 s TERM grace
-  then KILL, because the trap makes both processes ignore TERM); each pid reaches `ESRCH`
+- Assertions: `errors.Is(result.Err, context.DeadlineExceeded)` (unchanged); the winning
+  cause is `"pid line"`; two pids parsed; bounded cancellation now measured from expiry:
+  `testdeadline.Exceeded(time.Since(expiredAt), 3*processGrace+time.Second)` fails the
+  test. The budget covers realRun's whole worst case after expiry, which is three
+  `processGrace` waits (`exec.go:14`): TERM then up to 2 s for the wait (`:55`), KILL then
+  up to 2 s (`:59`), then up to 2 s for the drains (`:71`). The expected path is shorter:
+  the trap makes both processes ignore TERM, so one 2 s grace, then KILL reaps both and
+  the drains finish at once. (Plan v1.2 and today's test used 5 s, under the 6 s worst
+  case; a slow-but-correct drain could fail it.) Each pid reaches `ESRCH`
   within `testdeadline.Wait(time.Second)` (`testdeadline.Eventually`), replacing the fixed
   1 s poll (an orphaned `sleep` is reaped by init or a subreaper, a latency the test does
   not own).
@@ -305,7 +382,7 @@ only when the property is false or the loop is truly stuck.
   `admit_exclusive_test.go`, `worker_admit_exclusive_test.go`,
   `admit_exclusive_identity_test.go` (its one `waitAdmitGrant`, `:242`, runs on
   `startExclusiveTestDaemon`, not on these constructors) and `admit_drain_reason_test.go`
-  (`exclusiveWireServer` at `:132`, `:203`; 11 `evaluate()` calls, no background-grant
+  (`exclusiveWireServer` at `:132`, `:203`; 10 `evaluate(` calls at `d13ef3b`, `grep -o`, no background-grant
   wait). The builder re-greps for constructor consumers before the change. Not in `admitTestServer` (tests such as
   `TestAdmitFIFOOrderAndMidstreamArrival` rely on its live evaluator through `waitAdmitGrant`) and not in
   `startExclusiveTestDaemon` (real daemon; `NewServer` directly).
@@ -320,23 +397,39 @@ pass; whole `internal/daemon` under `-race` once: PASS; the mutation
 
 ### 3.6 F: `internal/runner`
 
-- `runner_linux.go`, `Runner` struct: `quiesceConfirmBound time.Duration`, with a comment:
-  test seam; the bound on the emptiness confirmation after the forced `cgroup.kill` in
-  `forceDetachedQuiesce`; zero (always, in production) means `r.grace`, today's value.
-- `detach_linux.go:646`: `waitEmpty(ctx, scope, confirm)` where `confirm` is
-  `r.quiesceConfirmBound` when positive, else `r.grace`. Line 591 is unchanged. The
-  `quiesce-forced` record's `ScopeKill.GraceMS` (`:663`) keeps recording `r.grace`: it is
-  the grace allowed before the forced kill (line 591's wait, the same meaning `GraceMS`
-  has at `:561` and in `runner_linux.go`, the grace before escalation), not the
-  post-kill confirmation bound. The seam comment says so.
+No test seam (plan v1.2's `quiesceConfirmBound` field is dropped; plan review 2, Sol P2).
+
+- `detach_linux.go`: a named constant `forcedQuiesceConfirmBound = 2 * time.Second`,
+  commented: the bound on the emptiness confirmation after the forced `cgroup.kill` in
+  `forceDetachedQuiesce`; deliberately independent of the configurable grace, which is
+  the wait BEFORE the kill; equal to the production grace (`runner_linux.go:188-190`;
+  production never sets `Config.Grace`: the one `runner.Config{}` literal outside tests,
+  `internal/app/project.go:305`, has no `Grace`), so production behaviour is unchanged.
+- `detach_linux.go:646`: `waitEmpty(ctx, scope, forcedQuiesceConfirmBound)`. Line 591
+  is unchanged (`r.grace`, the natural-quiesce wait). The `quiesce-forced` record's
+  `ScopeKill.GraceMS` (`:663`) keeps recording `r.grace`: it is the grace allowed before
+  the forced kill (line 591's wait, the same meaning `GraceMS` has at `:561` and in
+  `runner_linux.go`, the grace before escalation), not the post-kill confirmation bound.
+  The constant's comment says so.
+- Other tests that call `forceDetachedQuiesce` with a small `Grace`
+  (`detach_linux_test.go:775-905`, `Grace: 10ms`) are unaffected on a pass: their scopes
+  empty on the first read after a successful kill, and the kill-failed case takes the
+  `else` branch that never calls `waitEmpty`. The builder re-greps for callers.
 - `detach_linux_test.go:1194`: keep `r.grace = 100 * time.Millisecond` (the wait that
-  must expire; a negative wait, contention only makes it more certain) and add
-  `r.quiesceConfirmBound = testdeadline.Wait(time.Second)` (the backstop; returns as soon
-  as the scope is empty, so it costs nothing on a pass).
+  must expire: a negative wait, which contention makes more certain **up to a 30 s
+  stall**: if supervision stalls longer than the `sleep 30` descendant lives, the
+  descendant exits by itself, the scope quiesces naturally, and the test fails because
+  no quiesce was forced; section 4). The confirmation now runs on the product's own
+  unscaled 2 s bound, which returns as soon as the scope is empty, so it costs nothing on
+  a pass. It is not scaled for `-race`: it is the product's bound, and a kill-to-empty
+  slower than 2 s fails production identically (reported `U_RUN_CAPTURE_INCOMPLETE`).
 - The failure message at `:1197-1198` prints `outcome.err` and `*outcome.record` (today it
   prints two pointers, which is why the witnessed failure carried no diagnosis).
 
-Prototype: plain, 2 CPUs + 6 burners, x 300: **0/300**, wall 108 s (104 s before).
+Prototype (seam shape, confirmation bound `testdeadline.Wait(time.Second)` = 5 s, so a
+looser bound than the constant's 2 s; the builder re-measures the constant): plain,
+2 CPUs + 6 burners, x 300: **0/300**, wall 108 s (104 s before). The measured
+kill-to-empty maximum (240 ms) is under the constant by 8x.
 
 ### 3.7 AIRA-199: `cmd/aira/m20b_test.go`
 
@@ -391,8 +484,25 @@ descriptor`) and without it 5/5 GREEN.
    is established (A: the scope was on disk and read empty, the launcher did not fail,
    and the child never entered it) is a hard failure. Listing alone (a `Pending` row, or
    an on-disk scope whose population cannot be read) establishes nothing.
-9. With both seams unset, production behaviour is unchanged (same call, same bound).
+9. With E's seam unset, and with production's grace (always 2 s), production behaviour
+   is unchanged (same call, same bound). The one visible production change is the
+   destructive-confirmation form's height (`tui.go:1110`, one row taller).
 10. Every test still fails against the wrong implementation (section 5 mutations).
+
+**Scope of these guarantees (plan review 2).** "Cannot false-fail" in this plan means
+"cannot false-fail unless a stall outlasts a bound", not "never":
+
+- A positive wait false-fails only when a stall outlasts its scaled backstop (>= 5 s, x4
+  under `-race`). Specific cases: A's expiry verdict (a stall between scope creation and
+  child placement longer than the backstop reads as `readinessEmpty`, a hard failure);
+  F's forced path (a supervision stall longer than the `sleep 30` descendant's life
+  quiesces the scope naturally and the test fails); F's confirmation runs on the
+  product's unscaled 2 s bound; C's cancellation budget is 7 s, unscaled base.
+- A bounded negative window (B's 200 ms barrier-pin hold and 300 ms UI stall, E's 50 ms
+  window, C's `sleep 0.2`) can false-pass under contention. So a mutation that REDs
+  through such a window is **evidence, not deterministic proof**: the builder records
+  the mutation runs as counts (for example 20/20), and a GREEN mutation run is
+  re-run, not explained away.
 
 ## 5. Tests (TDD; each must fail against the wrong implementation)
 
@@ -404,15 +514,25 @@ GREEN (exit code and counts) in the PR.
 cgroup): outputs built with the production encoder (`toolResponse(1, core.Response{OK:
 true, Code: "OK", Data: runner.ConfineListResult{...}})`, then `json.Marshal`); the
 `Pending` row is built by the production `ShimConfineList` from a registry entry, so its
-shape is the real one. Cases: no record -> absent; ours `Pending` -> pending; ours on
-disk with `subtree_populated` nil -> unreadable; ours false -> empty; neighbour
+shape is the real one; the environmental replies are built the same way
+(`core.Response{OK: true, Code: "UNEVALUATED", Data: runner.ConfineListResult{Verdict:
+"unevaluated", ...}}`, and the production `confineClientError` of an
+`E_CONFINE_UNAVAILABLE` error). Cases: no record -> absent; ours `Pending` -> pending;
+ours on disk with `subtree_populated` nil -> unreadable; ours false -> empty; neighbour
 `mcp-e2e-x-other` populated true and ours false -> empty; ours true -> placed; two
-records named ours -> error; garbage -> error. A second table pins the expiry decision
-(`readinessExpiryVerdict(strongest)`): absent, pending, unreadable -> skip-or-fail;
+records named ours -> error; `UNEVALUATED` -> unlistable; `E_CONFINE_UNAVAILABLE` ->
+unlistable; `E_DAEMON_TIMEOUT` -> unlistable; and each of these -> error: garbage, `{}`, a JSON-RPC `error` reply (built
+with the production `protocolResponse`), a `result` with no `structuredContent`, an
+empty `code`, `ok:false` with another code (for example `E_DAEMON_PROTOCOL`), `OK` with
+no `scopes` array. A second table pins the expiry decision (`readinessIsProductFailure`
+over every state below placed): unlistable, absent, pending, unreadable -> skip-or-fail;
 empty -> hard fail. Mutations, each RED: today's substring predicate (pending, nil and
 false cases); `strings.Contains` name match (neighbour case); nil read as true; pending
 read as on disk (pending case, and the expiry table); "listed -> hard fail" (pending and
-unreadable rows of the expiry table); duplicates ignored.
+unreadable rows of the expiry table); duplicates ignored; **envelope not validated (the
+`e5c1223` shape: every non-`OK` reply read as absent) -> the `{}`, protocol-error and
+other-code rows**. The expiry ordering (drain `done` before deciding) is a three-line
+straight-line sequence checked in review, not by a test.
 The e2e keeps its shape; under load it must stay 0/40 (it was 0/40 before, so the load
 run is a no-regression check, not evidence of the fix).
 
@@ -452,7 +572,11 @@ run is a no-regression check, not evidence of the fix).
   (`TestTUIKeypressAndQuit...`); `y` dispatches from the confirmation (confirmation test:
   `PaletteDispatching` true after `press`); Escape does not cancel the destructive
   confirmation; Space at default focus dispatches; board Home does not select the first
-  card (`TestBoardHomeEndUpdateSelection`).
+  card (`TestBoardHomeEndUpdateSelection`); the confirmation form back at
+  `GetFormItemCount()+5` (`TestTUIDestructiveConfirmationRequiresExactResolvedID`: the
+  "Type RANT-7" wait fails; the production fix's pin).
+- Barrier simplification (single sentinel, one acknowledgement channel): the barrier pin
+  above and its three required mutations are unchanged and must still RED.
 - Load: the four-test set (`^(TestTUIKeypressAndQuitWhileFetchAndQueueUpdateAreInFlight|TestTUIRendersTruncatedErrorAndUnevaluatedStates|TestTUIPaletteOpensOnColon|TestTUIConfirmationRequiresFocusedConfirmEnterAndDispatchesOnce)$`)
   x 100 and the whole TUI set x 20, both `-race`, 2 CPUs + 6 burners: before 9/400 and
   6 + a package panic; after 0 failures, no panic.
@@ -462,8 +586,13 @@ delay) is RED against today's shape (deadline armed at start): 10/10 measured. M
 of `realRun` (`exec.go`), each RED: TERM/KILL sent to the leader pid instead of the
 process group (`sleep` survives: ESRCH wait fails); no SIGKILL escalation (both ignore
 TERM: ESRCH wait fails); return the wait error instead of `ctx.Err()` (`errors.Is`
-fails); `LiveStdout` not plumbed to the drain (backstop fires: "pid line never
-observed"). Load: before 1/60; after 0/60.
+fails); `LiveStdout` not plumbed to the drain (backstop wins: "expired by backstop, not
+by the pid line"). Check of the test's own guard (a one-off variant, not committed): put
+`sleep 1;` between the `trap` and the `printf` and shorten the backstop to 0.5 s, so the
+backstop expires the context after the trap and before the line, and the line is still
+printed (TERM is ignored). The winning-cause assertion must RED; the `f20d597` guard
+("a pid line was seen") passes on this variant, which is the plan-review-2 hole. Load:
+before 1/60; after 0/60.
 
 **E.**
 - `TestManualEvaluationQueueIsBornWithoutAnEvaluator`: with `admitManualEvaluation`,
@@ -482,12 +611,13 @@ observed"). Load: before 1/60; after 0/60.
 **F.**
 - `TestForcedQuiesceConfirmationUsesItsOwnBound` (no real cgroup): a memory runner and a
   fake scope that reports populated until its `Kill()` has been called and then for 3
-  more `Empty()` reads; `r.grace = time.Nanosecond`; `r.quiesceConfirmBound =
-  testdeadline.Wait(time.Second)`; call `forceDetachedQuiesce` directly. It returns
-  `(nil, nil)` and the ledger holds `quiesce-forced` with `ScopeKill.Completed`.
-  Mutation: ignore the seam (confirm with `r.grace`) -> `U_RUN_CAPTURE_INCOMPLETE` (RED;
-  the 1 ns deadline wins against the 10 ms tick on all but a vanishing fraction of
-  runs).
+  more `Empty()` reads (about 30 ms of the 10 ms tick, inside the 2 s constant);
+  `r.grace = time.Nanosecond`; no seam to set; call `forceDetachedQuiesce` directly. It
+  returns `(nil, nil)` and the ledger holds `quiesce-forced` with `ScopeKill.Completed`
+  and `ScopeKill.GraceMS` equal to `r.grace` (the pre-kill grace, unchanged meaning).
+  Mutation: confirm with `r.grace` again (today's line) -> `U_RUN_CAPTURE_INCOMPLETE`
+  (RED; the 1 ns deadline wins against the 10 ms tick on all but a vanishing fraction of
+  runs). The test name stays; its comment names the constant instead of the seam.
 - The real-cgroup test keeps every existing assertion (status EXITED, leader exit 0
   preserved, `QuiesceForced`, `U_RUN_QUIESCE_FORCED`, not clean, never
   `ScopeDescendantKilled`). Load: before 3/200 and 6/300; after 0/300.
@@ -518,7 +648,7 @@ A finite clean sample after the change supports "no failure observed in N runs",
 | Flake | Before (measured) | After |
 |---|---|---|
 | E exclusive | 9/24000 (`-race`, 2 CPUs + 6 burners); witnessed once in `make ci` on 2026-10-10 | expected 0; prototype 0/54000 |
-| F M20 forced quiesce | 3/200, 6/300 (2 CPUs + 6 burners); witnessed once on 2026-10-10 | expected 0; prototype 0/300 |
+| F M20 forced quiesce | 3/200, 6/300 (2 CPUs + 6 burners); witnessed once on 2026-10-10 | expected 0; prototype (seam shape, 5 s confirmation bound, not the 2 s constant) 0/300 |
 | 199 m20b | 8/400 (`-race`) | expected 0; prototype (v1 shape, ACK duplicated) 0/400 |
 | B TUI | 9/400 + a package-killing panic (`-race`, 2 CPUs + 6 burners) | expected 0 failures, no panic (not prototyped) |
 | C gitremote | 1/60 (2 CPUs + 6 burners) | expected 0 (not prototyped) |
@@ -526,8 +656,11 @@ A finite clean sample after the change supports "no failure observed in N runs",
 
 The merge gate stops refusing correct pushes for these six classes; one TUI failure can
 no longer take down every `cmd/aira` test with it; and the M20 failure, if it ever
-recurs, prints its error instead of two pointers. Cost on a passing run: C +0.2 s; the
-others unchanged (the backstops return as soon as their event happens).
+recurs, prints its error instead of two pointers. An operator confirming a destructive
+palette action can see the "Type <ID>:" field they must fill. Cost on a passing run: C
++0.2 s; `TestTUIDestructiveConfirmationRequiresExactResolvedID` about 10 s faster (its
+silent 10 s wait is gone); the others unchanged (the backstops return as soon as their
+event happens).
 
 ## 7. Deferrals and "not in this batch"
 
@@ -535,7 +668,7 @@ others unchanged (the backstops return as soon as their event happens).
 |---|---|
 | D (`TestRealCgroupDynamicCharge...`) | Its test and feature were deleted in `9a2f65c`. Dropped from AIRA-204. |
 | `TestCLIRunRealCgroupOrClearSkip` `bad file descriptor` (AIRA-199 amendment) | Not reproduced: interleaved with m20b, `-race`, 300 rounds -> 0/600. The fix removes the only known in-package closer of a test-owned descriptor, so the attribution is plausible but **unevaluated**; it is not claimed fixed. |
-| Production finding: `cmd/aira/main.go:660-664` | With an unparseable `--ready-fd` (or none), `strconv.Atoi` returns 0 and `writeSupervisorFailure(readyFD, ...)` writes to and **closes fd 0**; it should use `readyForFailure` (`supervisorReadyFD` returns -1 for an unparseable value). No test reaches it in-process today. A product bug, not a flake; suggest a ticket. |
+| Production finding: `cmd/aira/main.go:660-664` | With an unparseable `--ready-fd` (or none), `strconv.Atoi` returns 0 and `writeSupervisorFailure(readyFD, ...)` writes to and **closes fd 0**; it should use `readyForFailure` (`supervisorReadyFD` returns -1 for an unparseable value). No test reaches it in-process today. A product bug, not a flake: filed held as **AIRA-294** (P3, bug) in this batch, not built here. |
 | Phantom `outstandingJobs = 1` setups in the exclusive tests | The S14 comments prefer real leases (`seedRunningLease`). With E's seam they are no longer racy; converting them is a test-quality change, not a flake fix. |
 | Other short-grace real-cgroup fixtures in `internal/runner` (`memory_cap_linux_test.go:294` grace 100 ms, `livetee_test.go:507` grace 200 ms) | Same single-knob shape is possible; not witnessed; production grace is 2 s. Recorded. |
 | Raw waits in `cmd/aira` outside the TUI tests and test A (`dispatcher_inprocess_test.go` others, `watch_test.go`, `drain_hold_test.go`, `confine_test.go`) and in `internal/store`, `internal/install`, `internal/core` | Not witnessed; AIRA-204 records them as not scheduled. |
@@ -543,12 +676,18 @@ others unchanged (the backstops return as soon as their event happens).
 
 ## 8. Risks
 
-- **Production seams (E, F).** Two fields and two `if`s in `internal/daemon/admit.go` and
-  `internal/runner/detach_linux.go` (declarations in `server.go` and `runner_linux.go`).
-  Unset in production; the default branch is today's statement. Route these four files
-  to a separate review pass: check that production never sets either field (grep), that
-  the default path is unchanged, and that `admitManualEvaluation` cannot leave a
-  production queue without an evaluator.
+- **Production changes (E, F, B).** Four files: E's one field and one `if`
+  (`internal/daemon/server.go`, `admit.go`); F's named constant at one call site
+  (`internal/runner/detach_linux.go`; `runner_linux.go` is no longer touched, and the
+  build's `quiesceConfirmBound` is removed); B's form height (`cmd/aira/tui.go:1110`).
+  Route these four files to a separate review pass: production never sets
+  `admitManualEvaluation` (grep) and it cannot leave a production queue without an
+  evaluator; the default E path is today's statement; F's constant equals the only
+  grace production ever uses, and `GraceMS` keeps its meaning; the `tui.go` change is a
+  visible layout fix (one more form row inside the same 90x26 centred modal) and nothing
+  else, checked against the other confirmation shapes that share
+  `showPaletteConfirmation`: the details pane above the form (proportional height) gets
+  one row less, and a non-destructive confirmation (no input item) gets one blank row.
 - **E coverage.** A test built on one of the three constructors that relied on a
   background grant would now wait for its backstop and fail loudly (not silently). The
   prototype ran the whole daemon package under `-race` once with no failure.
@@ -590,7 +729,9 @@ builder's reference only).
 
 ## 10. Review log
 
-Plan review 1 (two independent read-only reviews of plan v1.1, both PASS_WITH_CHANGES).
+### 10.1 Plan review 1
+
+Two independent read-only reviews of plan v1.1, both PASS_WITH_CHANGES.
 Each claim was checked against the code on this branch before it was accepted.
 
 | # | Finding | Check | Disposition |
@@ -605,7 +746,7 @@ Each claim was checked against the code on this branch before it was accepted.
 | R2-2 (P3) | C: `Err()` must be derived from the `Done` channel | True: `exec.go:51` waits on `ctx.Done()` and `:60`, `:63` then read `ctx.Err()` | Accepted (section 3.3) |
 | R2-3 (P3) | F: `GraceMS: r.grace` at `detach_linux.go:663` drifts from the bound actually used | Checked: `GraceMS` records the grace allowed BEFORE the kill (line 591's natural-quiesce wait, still `r.grace`), the same meaning as at `:561` and in `runner_linux.go` (`termGrace`, the grace before escalation). It is not the post-kill confirmation bound | Rejected: recording the confirmation bound there would change the field's meaning. The seam comment says `GraceMS` stays the pre-kill grace. Also corrected plan v1's wording: line 591 is in the caller, not in `forceDetachedQuiesce` |
 | R2-4 (P3) | 199: `defer readyW.Close()` plus the asserted close double-closes | True | Accepted: no defer; one explicit asserted close (the finalizer covers an early failure, safely) |
-| R2-5 (P3) | E: `admit_drain_reason_test.go` is an unlisted consumer of `exclusiveWireServer` | True: `:132`, `:203`; 11 `evaluate()` calls, no background-grant wait | Accepted: listed in section 3.5 with the other consumers |
+| R2-5 (P3) | E: `admit_drain_reason_test.go` is an unlisted consumer of `exclusiveWireServer` | True: `:132`, `:203`; no background-grant wait (v1.2 said 11 `evaluate()` calls; there are 10, corrected in v1.3) | Accepted: listed in section 3.5 with the other consumers |
 | R2-6, R2-7 (info) | Line references, measurements and necessity verified | — | No change |
 
 Script check after the R1-3 fix (`internal/gitremote` binary, no burners, each under
@@ -614,3 +755,43 @@ aborted=0`, exit 0; a regex matching nothing -> exit 2 before any burner starts;
 killed by `-test.timeout 1ms` -> `evaluated=0 aborted=1`, exit 2 (the binary's own
 status). The `evaluated = 0` with exit-0 binary path (exit 3) was not exercised. `shellcheck`:
 clean.
+
+### 10.2 Plan review 2
+
+Two independent read-only reviews of plan v1.2 (with the build at `e5c1223` on this
+branch), both PASS_WITH_CHANGES. Reviewer 1 (findings 2-1..2-6) and Sol (S-1..S-6). Each
+claim was checked against the code (base `d13ef3b` for line numbers, HEAD `e5c1223` for
+the build) before it was accepted.
+
+| # | Finding | Check | Disposition |
+|---|---|---|---|
+| 2-1 (high) | A: `confineKillReadiness` (`dispatcher_inprocess_test.go:1150`, built) reads `{}`, missing fields and any protocol error as `absent`, so a broken MCP reply ends as an environmental skip without exercising ownership or the kill | True. `e5c1223` deleted the envelope checks; its own table pins `ok:false code:"E_X"` and a JSON-RPC `error` as absent, and `{}` unmarshals to no scopes. The poll also discards the MCP exit status | Accepted. Section 3.1 validates the envelope and classifies by `code`: only the identified environmental answers (`UNEVALUATED`, `E_CONFINE_UNAVAILABLE`, and the three transport codes from the test's private daemon, which are transient under load) become a new weakest state `readinessUnlistable`; everything else is an error. Unit cases and the "envelope not validated" mutation added (section 5) |
+| 2-2 (medium) | C: the backstop records nothing; a pid line delivered after a backstop expiry satisfies the assertions | True: `exec_test.go:86` is `time.AfterFunc(..., deadline.expire)`; the only guard is `trigger.at().IsZero()`, set by any later line. Plan v1.2 had promised a "backstop fired" mark | Accepted. `expire(cause)` records the winning cause and the expiry time inside the one `once`; the test fails unless the pid line won (section 3.3), with a one-off variant that REDs the new guard and passes the old one (section 5) |
+| 2-3 (medium) | The production-scope claim is false: `cmd/aira/tui.go:1110` changes the confirmation form height; revisit the explanation for the missing "Type ID" text | True (`git diff d13ef3b HEAD --stat`: `tui.go` 2 +-). And the base timings settle the explanation: every passing run of the destructive test took 10.28-11.39 s on `d13ef3b` (the silent 10 s wait expired every time), 0.44-1.21 s after | Accepted. Header and section 8 list the `tui.go` fix as a visible product change with its own review; section 1's B mechanism now says the text was never on screen (a layout bug, on every run) and keeps the nil form's ordering route as inferred; section 3.2 rule 7 and a section 5 mutation pin the fix |
+| 2-4 (medium) | Qualify the false-failure guarantees: backstops still permit false failures under long stalls; F's finite `sleep 30` can exit first; bounded windows and fault-injection mutations can false-pass, so RED runs are evidence | True | Accepted. Section 4 gains "Scope of these guarantees"; section 3.6's "contention only makes it more certain" is bounded at a 30 s stall; section 3.1 names A's long-stall case; section 3.2's closing sentence names the backstop |
+| 2-5 (low) | The from-scratch minimum is smaller; broad TUI conversion and load matrix are optional; the serial barrier could use one sentinel acknowledgement instead of sequence numbers and a waiter map; C's permanent startup delay is optional scaffolding | Barrier: true, `press`/`barrier` are only called serially and each waits for its own sentinel (`tui_sync_test.go:100-150`, built) | Barrier: accepted, simplified to one sentinel rune and one buffered acknowledgement channel (section 3.2). Breadth and load matrix: already chosen extras. C's delay: kept as a chosen extra (section 2), since it is the only thing that makes the "deadline armed at start" regression RED on every run, for 0.2 s |
+| 2-6 (info) | Pending-row semantics, tview ordering, E's lifecycle, F's grace/default, READY ownership, seams unset in production, script status handling verified; measurements and mutation outcomes not re-verified | — | No change |
+| S-1 (P2) | F's seam is avoidable: a fixed post-kill bound (production's 2 s) gives identical production behaviour, removes the field, and removes the dual role in the product | True: `waitEmpty` maps `timeout <= 0` to 2 s (`cgroup_linux.go:396-397`); production's grace is 2 s (`runner_linux.go:188-190`); the only `runner.Config{}` outside tests (`internal/app/project.go:305`) sets no `Grace`. The other forced-quiesce unit tests do not reach `waitEmpty` with a stuck scope | Accepted, with a named constant `forcedQuiesceConfirmBound` rather than a magic `0` (section 3.6, table in section 2). `runner_linux.go` leaves the change set. The trade (the real-cgroup test runs on the unscaled 2 s product bound) is stated |
+| S-2 (P3) | A: on expiry with `readinessEmpty`, drain `done` once more before deciding | Partly: in the build the `done` receive immediately precedes the deadline check in the same iteration, so the gap is the two statements between them, not a 20 ms poll gap. Still nonzero, and the plan did not fix the order | Accepted: section 3.1 specifies the in-iteration order and a final non-blocking receive before the verdict |
+| S-3 (P3) | `admit_drain_reason_test.go` has 10 `evaluate(` calls, not 11 | True (`git show d13ef3b:... \| grep -o 'evaluate(' \| wc -l` = 10) | Accepted: corrected in section 3.5 and in the R2-5 row |
+| S-4 (P3) | C: worst case after expiry is 3 x `processGrace` = 6 s, but the budget is 5 s | True: `exec.go:14`, `:55`, `:59`, `:71` | Accepted: budget `3*processGrace + time.Second` and the path is named (section 3.3) |
+| S-5 (P3) | File the `main.go:660-664` product bug as a held ticket rather than "suggest a ticket" | True: `strconv.Atoi` yields 0 on error, `writeSupervisorFailure` (`main.go:752-762`) wraps, writes and closes that fd; `readyForFailure` (`:642`, from `supervisorReadyFD`, `:739-750`) returns -1 | Accepted: filed **AIRA-294** (held, P3 bug); section 7 updated |
+| S-6 (P3) | Verification record of every cited file:line at `d13ef3b` | — | No change |
+
+### 10.3 What the build on this branch must change to match v1.3
+
+The build (`ee653a4..e5c1223`) predates this revision. The build-fix pass changes:
+
+1. **A** (`cmd/aira/dispatcher_inprocess_test.go`): restore and extend envelope
+   validation per section 3.1 (`readinessUnlistable`, the code table, MCP exit status
+   checked); flip the built table's `not ok` and `protocol error` rows to errors; add
+   the section 5 rows; final non-blocking `done` receive before the expiry verdict.
+2. **B** (`cmd/aira/tui_sync_test.go`): single sentinel rune and one buffered
+   acknowledgement channel; delete `seq` and `waiters`; doc comment says not safe for
+   concurrent use. Record the `+5` mutation RED for the `tui.go` fix.
+3. **C** (`internal/gitremote/exec_test.go`): `expire(cause)` with the winning cause
+   recorded inside the `once`; assert the pid line won; budget
+   `3*processGrace + time.Second`; run the one-off guard check from section 5.
+4. **F** (`internal/runner`): remove `quiesceConfirmBound` from `runner_linux.go` and
+   `detach_linux.go`; add `forcedQuiesceConfirmBound`; drop the field's use in
+   `detach_linux_test.go`; re-measure the real-cgroup test under load (section 6 row).
