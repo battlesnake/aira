@@ -1060,11 +1060,13 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 	// proves only admission: a Pending registry row carries the name and owner before
 	// the scope exists, and the --steal kill below is gated on cgroup.events.
 	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
-	strongest, strongestRecord := readinessAbsent, runner.ConfineRecord{}
+	strongest, strongestRecord := readinessUnlistable, runner.ConfineRecord{}
 	for {
 		input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_confine_list","arguments":{}}}` + "\n")
-		var output bytes.Buffer
-		_ = runMCPWithDispatcher(context.Background(), input, &output, io.Discard, nil)
+		var output, diagnostics bytes.Buffer
+		if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, nil); exit != 0 {
+			t.Fatalf("confine list MCP exit=%d output=%q diagnostics=%q", exit, output.String(), diagnostics.String())
+		}
 		state, record, readErr := confineKillReadiness(output.Bytes(), name)
 		if readErr != nil {
 			t.Fatalf("confine list: %v; output=%q", readErr, output.String())
@@ -1084,6 +1086,16 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 		default:
 		}
 		if time.Now().After(deadline) {
+			// Read the launcher once more before the verdict: an error that landed
+			// since the receive above is the environment probe, not a product failure.
+			select {
+			case launchErr := <-done:
+				if launchErr != nil {
+					cgrouptest.SkipOrFailRealCgroup(t, "real MCP confine launch unavailable: %v", launchErr)
+				}
+				t.Fatal("confined workload exited before kill")
+			default:
+			}
 			if readinessIsProductFailure(strongest) {
 				t.Fatalf("the confine scope is on disk and reads empty, but the launched job never entered it: %+v", strongestRecord)
 			}
@@ -1111,8 +1123,11 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 type confineReadiness int
 
 const (
+	// readinessUnlistable: no listing could be produced (an identified environmental
+	// answer: unevaluated, slice unavailable, a transient daemon transport code).
+	readinessUnlistable confineReadiness = iota
 	// readinessAbsent: no record with this name (not admitted, or already gone).
-	readinessAbsent confineReadiness = iota
+	readinessAbsent
 	// readinessPending: admitted (a registry row); the scope is not on disk.
 	readinessPending
 	// readinessUnreadable: the scope is on disk, population not established (nil).
@@ -1126,6 +1141,8 @@ const (
 
 func (r confineReadiness) String() string {
 	switch r {
+	case readinessUnlistable:
+		return "unlistable"
 	case readinessAbsent:
 		return "absent"
 	case readinessPending:
@@ -1141,32 +1158,65 @@ func (r confineReadiness) String() string {
 }
 
 // confineKillReadiness classifies the one record named exactly name in the output of
-// an aira_confine_list MCP call. More than one record with that exact name is an
-// error (the kill selector would be refused as ambiguous), as is output that does not
-// decode. A decodable reply that lists no scopes (ok:false, a protocol error) names no
-// record: readinessAbsent, so an environment that cannot list confines ends the poll
-// unevaluated at its deadline rather than failing. A neighbour whose name merely
-// contains or extends ours is not ours.
+// an aira_confine_list MCP call. It validates the MCP envelope first and classifies the
+// reply by its code: only answers the code base names as environmental (UNEVALUATED,
+// E_CONFINE_UNAVAILABLE, and the daemon transport codes, transient under load) are
+// readinessUnlistable. Anything else that is not a listing (undecodable output, {}, a
+// JSON-RPC error, no structuredContent, an empty or unknown code, OK with no scopes
+// array) is an error, so a broken reply can never end as an environmental skip. More
+// than one record with the exact name is an error too (the kill selector would be
+// refused as ambiguous). A neighbour whose name merely contains or extends ours is not ours.
 func confineKillReadiness(output []byte, name string) (confineReadiness, runner.ConfineRecord, error) {
+	fail := func(format string, args ...any) (confineReadiness, runner.ConfineRecord, error) {
+		return readinessUnlistable, runner.ConfineRecord{}, fmt.Errorf(format, args...)
+	}
 	var envelope struct {
-		Result struct {
-			StructuredContent struct {
-				Data runner.ConfineListResult `json:"data"`
+		JSONRPC string          `json:"jsonrpc"`
+		Error   json.RawMessage `json:"error"`
+		Result  *struct {
+			StructuredContent *struct {
+				OK   bool            `json:"ok"`
+				Code string          `json:"code"`
+				Data json.RawMessage `json:"data"`
 			} `json:"structuredContent"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(output), &envelope); err != nil {
-		return readinessAbsent, runner.ConfineRecord{}, fmt.Errorf("undecodable confine list output: %w", err)
+		return fail("undecodable confine list output: %v", err)
+	}
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return fail("JSON-RPC error reply: %s", envelope.Error)
+	}
+	if envelope.JSONRPC != "2.0" || envelope.Result == nil || envelope.Result.StructuredContent == nil {
+		return fail("reply is not an MCP tools/call result with structuredContent")
+	}
+	reply := envelope.Result.StructuredContent
+	switch {
+	case reply.Code == "":
+		return fail("reply carries no code")
+	case reply.OK && reply.Code == "UNEVALUATED":
+		return readinessUnlistable, runner.ConfineRecord{}, nil
+	case !reply.OK && (reply.Code == "E_CONFINE_UNAVAILABLE" || reply.Code == daemon.CodeUnavailable ||
+		reply.Code == daemon.CodeTimeout || reply.Code == daemon.CodeBusy):
+		return readinessUnlistable, runner.ConfineRecord{}, nil
+	case !reply.OK || reply.Code != "OK":
+		return fail("unexpected reply ok=%v code=%q", reply.OK, reply.Code)
+	}
+	var list struct {
+		Scopes *[]runner.ConfineRecord `json:"scopes"`
+	}
+	if err := json.Unmarshal(reply.Data, &list); err != nil || list.Scopes == nil {
+		return fail("OK reply has no scopes array (err=%v)", err)
 	}
 	var ours []runner.ConfineRecord
-	for _, record := range envelope.Result.StructuredContent.Data.Scopes {
+	for _, record := range *list.Scopes {
 		if record.Name == name {
 			ours = append(ours, record)
 		}
 	}
 	switch {
 	case len(ours) > 1:
-		return readinessAbsent, runner.ConfineRecord{}, fmt.Errorf("%d confine records are named %q: the kill selector would be ambiguous", len(ours), name)
+		return fail("%d confine records are named %q: the kill selector would be ambiguous", len(ours), name)
 	case len(ours) == 0:
 		return readinessAbsent, runner.ConfineRecord{}, nil
 	}
@@ -1186,7 +1236,8 @@ func confineKillReadiness(output []byte, name string) (confineReadiness, runner.
 // state it saw. Only a scope that is on disk and reads empty establishes that
 // containment works while the job never entered it (the launcher returns an error when
 // it cannot place the child, and the poll already treated that as unevaluated). Listing
-// alone (absent, pending, unreadable) establishes nothing, so those are unevaluated.
+// alone (unlistable, absent, pending, unreadable) establishes nothing, so those are
+// unevaluated.
 func readinessIsProductFailure(strongest confineReadiness) bool {
 	return strongest == readinessEmpty
 }
@@ -1199,13 +1250,16 @@ func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.
 		pid := 4242
 		return runner.ConfineRecord{Name: n, Owner: "session-a", ScopeID: scopeID(n, pid), SupervisorPID: &pid, SubtreePopulated: populated}
 	}
-	encode := func(list runner.ConfineListResult) []byte {
+	encodeResponse := func(response core.Response) []byte {
 		t.Helper()
-		encoded, err := json.Marshal(toolResponse(1, core.Response{OK: true, Code: "OK", Data: list}))
+		encoded, err := json.Marshal(toolResponse(1, response))
 		if err != nil {
 			t.Fatal(err)
 		}
 		return encoded
+	}
+	encode := func(list runner.ConfineListResult) []byte {
+		return encodeResponse(core.Response{OK: true, Code: "OK", Data: list})
 	}
 	// The Pending row is the production shape: built by ShimConfineList from a registry entry.
 	pending := runner.ShimConfineList([]runner.ConfineRegistryEntry{{ScopeID: scopeID(name, 4242)}})
@@ -1213,7 +1267,12 @@ func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.
 		t.Fatalf("fixture: the production Pending row is not what this test assumes: %+v", pending.Scopes)
 	}
 	list := func(records ...runner.ConfineRecord) []byte {
+		records = append([]runner.ConfineRecord{}, records...) // production lists an empty slice, never null
 		return encode(runner.ConfineListResult{Verdict: "ok", Scopes: records})
+	}
+	protocolError, err := json.Marshal(protocolResponse(1, -32000, "boom", nil))
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, tc := range []struct {
 		label  string
@@ -1229,12 +1288,23 @@ func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.
 		{"neighbour populated, ours empty", list(onDisk("mcp-e2e-x-other", &yes), onDisk(name, &no)), readinessEmpty, false},
 		{"ours placed", list(onDisk(name, &yes)), readinessPlaced, false},
 		{"ours placed beside a neighbour", list(onDisk("other", &no), onDisk(name, &yes)), readinessPlaced, false},
-		{"two named ours", list(onDisk(name, &yes), onDisk(name, &yes)), readinessAbsent, true},
-		{"garbage", []byte("not json"), readinessAbsent, true},
-		// A list that cannot be produced (no aira.slice, daemon unavailable) names no
-		// record: absent, so the poll keeps going and its expiry reports unevaluated.
-		{"not ok", []byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":false,"code":"E_X"}}}`), readinessAbsent, false},
-		{"protocol error", []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}`), readinessAbsent, false},
+		{"two named ours", list(onDisk(name, &yes), onDisk(name, &yes)), 0, true},
+		// Identified environmental answers: unlistable (the poll retries; only a
+		// persistent one reaches the expiry, as unevaluated).
+		{"unevaluated list", encodeResponse(core.Response{OK: true, Code: "UNEVALUATED", Data: runner.ConfineListResult{Verdict: "unevaluated", Reason: "slice unreadable", Scopes: []runner.ConfineRecord{}}}), readinessUnlistable, false},
+		{"slice unavailable", encodeResponse(confineClientError(errors.New("E_CONFINE_UNAVAILABLE: no aira.slice"))), readinessUnlistable, false},
+		{"daemon unavailable", encodeResponse(core.Response{Code: daemon.CodeUnavailable, Error: "daemon down"}), readinessUnlistable, false},
+		{"daemon timeout", encodeResponse(core.Response{Code: daemon.CodeTimeout, Error: "slow"}), readinessUnlistable, false},
+		{"daemon busy", encodeResponse(core.Response{Code: daemon.CodeBusy, Error: "busy"}), readinessUnlistable, false},
+		// Everything else is not an answer this test knows to be environmental.
+		{"garbage", []byte("not json"), 0, true},
+		{"empty object", []byte(`{}`), 0, true},
+		{"protocol error", protocolError, 0, true},
+		{"no structuredContent", []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`), 0, true},
+		{"empty code", []byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":true,"data":{"scopes":[]}}}}`), 0, true},
+		{"other code", encodeResponse(core.Response{Code: daemon.CodeProtocol, Error: "bad frame"}), 0, true},
+		{"not ok with OK code", []byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":false,"code":"OK","data":{"scopes":[]}}}}`), 0, true},
+		{"OK without scopes", encodeResponse(core.Response{OK: true, Code: "OK", Data: map[string]any{"verdict": "ok"}}), 0, true},
 	} {
 		got, _, err := confineKillReadiness(tc.output, name)
 		if (err != nil) != tc.fail {
@@ -1246,7 +1316,7 @@ func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.
 	}
 	// What the poll's expiry means for each strongest state it saw.
 	for state, want := range map[confineReadiness]bool{
-		readinessAbsent: false, readinessPending: false, readinessUnreadable: false, readinessEmpty: true,
+		readinessUnlistable: false, readinessAbsent: false, readinessPending: false, readinessUnreadable: false, readinessEmpty: true,
 	} {
 		if got := readinessIsProductFailure(state); got != want {
 			t.Fatalf("expiry with strongest=%s: product failure=%v, want %v", state, got, want)
