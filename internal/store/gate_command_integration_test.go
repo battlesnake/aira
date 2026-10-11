@@ -645,3 +645,45 @@ func TestRunGateWarnsWhenEnvAllowIncludesPath(t *testing.T) {
 		t.Fatalf("warnings = %#v", result.Warnings)
 	}
 }
+
+// verifies: AIRA-285 -- end to end on a real cgroup: a fixture canary seeded
+// from ".aira" cannot fire on a live ticket's bytes. Before the fix the ticket
+// landed in the fixture tree as tickets/AIRA-1.md, the canary fired on it and
+// the gate held a trusted pass that a ticket edit (invisible to the subject
+// digest) silently turned into a canary that no longer fires.
+func TestSeedPathAncestorOfBookkeepingCannotFireOnTickets(t *testing.T) {
+	const marker = "ZZ<PROBE>" // "<" and ">" are JSON-escaped in the gate file, so only the ticket carries the literal
+	ctx := context.Background()
+	s, root := nonGoCommandSubject(t, "")
+	ticket := filepath.Join(root, ".aira", "tickets", "AIRA-1.md")
+	if err := os.MkdirAll(filepath.Dir(ticket), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ticket, []byte("---\nstatus: planned\n---\n"+marker+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	def, _ := injectFileGateFixture("tests/unused.rs", marker)
+	canary := gate.CanaryDeclaration{SchemaVersion: 1, ID: def.CanaryIDs[0], GateID: def.ID, Mode: gate.CanaryFixture,
+		Seed: gate.Seed{Path: ".aira"}, ExpectedGateResult: gate.VerdictFail, LaneBinding: def.Lane.Name,
+		Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand}
+	writeGateFixture(t, root, def, canary)
+	gitRun(t, root, "add", ".")
+	first, err := s.RunGate(ctx, def.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Verdict == gate.VerdictPass || first.Trusted || first.Code != "E_GATE_CANARY_DID_NOT_FIRE" {
+		t.Fatalf("first RunGate = %#v, want the canary not to fire on the live ticket marker", first)
+	}
+	if err := os.WriteFile(ticket, []byte("---\nstatus: done\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.RunGate(ctx, def.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Verdict != first.Verdict || again.Code != first.Code || again.Trusted != first.Trusted {
+		t.Fatalf("a ticket edit changed the gate outcome: %#v then %#v", first, again)
+	}
+}

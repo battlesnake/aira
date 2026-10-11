@@ -775,3 +775,116 @@ func TestCanaryRunReportsFired(t *testing.T) {
 		})
 	}
 }
+
+// verifies: AIRA-287 -- canary-run and canary-show act on the canary they are
+// named with. A gate may declare several canaries; resolving the gate's first
+// declared canary instead reported that canary's fire (verdict pass, exit 0)
+// under the requested id.
+func TestCanaryRunUsesTheNamedCanary(t *testing.T) {
+	s, definition, canary := provenGateFixture(t)
+	requirement, err := domain.NewRequirement(domain.RequirementInput{ID: "AR-1", Text: "fixture", Status: domain.RequirementBuilt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirementData, err := domain.RenderRequirement(requirement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition.CanaryIDs = append(definition.CanaryIDs, "fixture-b")
+	// fixture-b's seed resolves every link, so it cannot fire; the first
+	// declared canary (canary.ID) fires.
+	quiet := gate.CanaryDeclaration{SchemaVersion: 1, ID: "fixture-b", GateID: definition.ID, Mode: gate.CanaryFixture,
+		Seed: gate.Seed{Files: map[string]string{
+			".aira/requirements/AR-1.md": string(requirementData),
+			"implementation.go":          "package fixture\n// covers: AR-1\nfunc Fixture() {}\n",
+			"implementation_test.go":     "package fixture\n// verifies: AR-1\nfunc TestFixture(t *testing.T) {}\n",
+		}}, ExpectedGateResult: gate.VerdictFail, LaneBinding: canary.LaneBinding, Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand}
+	writeGateFixture(t, s.root, definition, quiet)
+	run := func(id string) CanaryRunResult {
+		t.Helper()
+		value, err := s.GateAction(context.Background(), "canary-run", "", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value.(CanaryRunResult)
+	}
+	if got := run("fixture-b"); got.CanaryID != "fixture-b" || got.Verdict != "fail" || got.Fired == nil || *got.Fired || got.GateResult != gate.PredicatePass {
+		t.Fatalf("canary-run fixture-b = %#v, want fixture-b not fired", got)
+	}
+	if got := run(canary.ID); got.CanaryID != canary.ID || got.Verdict != "pass" || got.Fired == nil || !*got.Fired {
+		t.Fatalf("canary-run %s = %#v, want fired", canary.ID, got)
+	}
+	shown, err := s.GateAction(context.Background(), "canary-show", "", "fixture-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if declaration, ok := shown.(gate.CanaryDeclaration); !ok || declaration.ID != "fixture-b" {
+		t.Fatalf("canary-show fixture-b = %#v", shown)
+	}
+	// A file at the requested id's path that declares another (referenced) id
+	// is refused rather than run under the requested label.
+	mislabelled := canary
+	data, err := json.MarshalIndent(mislabelled, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "gates", "canaries", "fixture-b.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GateAction(context.Background(), "canary-run", "", "fixture-b"); err == nil || !strings.Contains(err.Error(), "E_GATE_CANARY_INVALID") {
+		t.Fatalf("mislabelled canary-run err = %v, want E_GATE_CANARY_INVALID", err)
+	}
+}
+
+// verifies: AIRA-285 -- a fixture canary seeded from an ANCESTOR of the
+// bookkeeping directories (".aira", ".") does not carry the live ticket and
+// finding files into its fixture tree, where they would land under a path
+// ExcludedFromSubject no longer matches and make the canary's fire depend on
+// bytes no subject digest covers. Everything else under the seed is kept.
+func TestFixtureSeedSkipsBookkeepingBelowTheSeedPath(t *testing.T) {
+	live := t.TempDir()
+	for name, body := range map[string]string{
+		".aira/tickets/AIRA-1.md":     "ticket",
+		".aira/findings/F-1.md":       "finding",
+		".aira/requirements/AR-1.md":  "requirement",
+		".aira/tickets-archive/x.md":  "archive",
+		"src/a.go":                    "package a",
+		"src/.aira/tickets/nested.md": "nested",
+	} {
+		path := filepath.Join(live, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := []struct {
+		seed    string
+		present []string
+		absent  []string
+	}{
+		{seed: ".aira", present: []string{"requirements/AR-1.md", "tickets-archive/x.md"}, absent: []string{"tickets/AIRA-1.md", "findings/F-1.md", "tickets", "findings"}},
+		{seed: ".", present: []string{".aira/requirements/AR-1.md", ".aira/tickets-archive/x.md", "src/a.go", "src/.aira/tickets/nested.md"}, absent: []string{".aira/tickets", ".aira/findings"}},
+		{seed: "./.aira/", present: []string{"requirements/AR-1.md"}, absent: []string{"tickets", "findings"}},
+		{seed: "src", present: []string{"a.go", ".aira/tickets/nested.md"}},
+	}
+	for _, row := range rows {
+		t.Run(row.seed, func(t *testing.T) {
+			dest := t.TempDir()
+			if err := copyFixtureSeed(filepath.Join(live, filepath.FromSlash(row.seed)), dest, row.seed); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range row.present {
+				if _, err := os.Stat(filepath.Join(dest, filepath.FromSlash(name))); err != nil {
+					t.Errorf("seed %q: %s missing: %v", row.seed, name, err)
+				}
+			}
+			for _, name := range row.absent {
+				if _, err := os.Lstat(filepath.Join(dest, filepath.FromSlash(name))); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("seed %q: %s copied into the fixture tree (err=%v)", row.seed, name, err)
+				}
+			}
+		})
+	}
+}

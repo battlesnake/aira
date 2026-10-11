@@ -470,7 +470,7 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 		for _, definition := range gates {
 			for _, id := range definition.Definition.CanaryIDs {
 				if id == canaryID {
-					return s.canaryFor(definition.Definition)
+					return s.namedCanary(definition.Definition, canaryID)
 				}
 			}
 		}
@@ -485,7 +485,7 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 				if id != canaryID {
 					continue
 				}
-				canary, canaryErr := s.canaryFor(definition.Definition)
+				canary, canaryErr := s.namedCanary(definition.Definition, canaryID)
 				if canaryErr != nil {
 					return nil, canaryErr
 				}
@@ -517,7 +517,7 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 				case gate.CanaryFail:
 					fired = new(bool)
 				}
-				return CanaryRunResult{CanaryID: canaryID, GateID: definition.Definition.ID, Verdict: string(health), Fired: fired, GateResult: evaluation.Predicate, Code: evaluation.Code, RunID: evaluation.RunID, TreeDigest: root.Digest, Findings: evaluation.Findings}, nil
+				return CanaryRunResult{CanaryID: canary.ID, GateID: definition.Definition.ID, Verdict: string(health), Fired: fired, GateResult: evaluation.Predicate, Code: evaluation.Code, RunID: evaluation.RunID, TreeDigest: root.Digest, Findings: evaluation.Findings}, nil
 			}
 		}
 		return nil, errors.New("E_NOT_FOUND: canary not found")
@@ -568,7 +568,7 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
 		}
 		source := filepath.Join(s.root, filepath.FromSlash(c.Seed.Path))
-		if err := copyFixtureSeed(source, dir); err != nil {
+		if err := copyFixtureSeed(source, dir, c.Seed.Path); err != nil {
 			return DimensionEvaluation{}, EvaluationRoot{}, err
 		}
 	}
@@ -711,7 +711,16 @@ func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, 
 	return s.runCanary(ctx, c, def, capturedSubject{})
 }
 
-func copyFixtureSeed(source, destination string) error {
+// copyFixtureSeed copies the live directory source (the canary's Seed.Path,
+// root-relative seedPath) into the fixture tree. It skips every entry whose
+// LIVE root-relative path is AIRA bookkeeping (AIRA-285): a Seed.Path that is
+// an ancestor of .aira/tickets/ or .aira/findings/ (".aira", ".") would
+// otherwise re-root those files where ExcludedFromSubject no longer matches,
+// and the canary's fire could then depend on bytes no subject digest covers.
+// Skipping the directory skips every file below it; ValidateCanary refuses a
+// Seed.Path at or below those directories, so the root is never one of them.
+func copyFixtureSeed(source, destination, seedPath string) error {
+	seedRoot := filepath.FromSlash(seedPath)
 	info, err := os.Lstat(source)
 	if err != nil {
 		return fmt.Errorf("U_GATE_CANARY_UNEVALUATED: fixture seed: %w", err)
@@ -726,6 +735,10 @@ func copyFixtureSeed(source, destination string) error {
 		rel, err := filepath.Rel(source, path)
 		if err != nil || (rel != "." && !gate.SafeRelativePath(rel)) {
 			return errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
+		}
+		live := filepath.ToSlash(filepath.Join(seedRoot, rel))
+		if entry.IsDir() && gate.ExcludedFromSubject(live+"/") {
+			return filepath.SkipDir
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			return errors.New("E_GATE_CANARY_INVALID: symlink seed is not allowed")

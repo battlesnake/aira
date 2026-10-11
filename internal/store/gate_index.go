@@ -200,8 +200,28 @@ func (s *Store) ListGates() ([]gate.GateDefinition, error) {
 }
 
 func (s *Store) canaryFor(def gate.GateDefinition) (gate.CanaryDeclaration, error) {
-	candidates := make([]string, 0, len(def.CanaryIDs)*2)
-	for _, id := range def.CanaryIDs {
+	return s.loadCanary(def, def.CanaryIDs)
+}
+
+// namedCanary loads the canary declared at id's own path, for the verbs that
+// act on one canary by name (canary-show, canary-run). canaryFor serves the
+// gate's FIRST declared canary, which on a gate with several canaries is
+// another canary's declaration under the requested label. A file at id's path
+// that declares a different id is refused, not served under id.
+func (s *Store) namedCanary(def gate.GateDefinition, id string) (gate.CanaryDeclaration, error) {
+	declaration, err := s.loadCanary(def, []string{id})
+	if err != nil {
+		return gate.CanaryDeclaration{}, err
+	}
+	if declaration.ID != id {
+		return gate.CanaryDeclaration{}, fmt.Errorf("E_GATE_CANARY_INVALID: canary file for %q declares id %q", id, declaration.ID)
+	}
+	return declaration, nil
+}
+
+func (s *Store) loadCanary(def gate.GateDefinition, ids []string) (gate.CanaryDeclaration, error) {
+	candidates := make([]string, 0, len(ids)*2)
+	for _, id := range ids {
 		candidates = append(candidates, filepath.Join(s.gateRoot(), "canaries", id+".json"), filepath.Join(s.gateRoot(), id+".canary.json"))
 	}
 	for _, path := range candidates {
