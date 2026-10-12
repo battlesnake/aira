@@ -116,7 +116,7 @@ const confineCPUStatReadLimit = 4096
 // counters as one timestamped pair (AIRA-137).
 //
 // The root cgroup is the cgroup2 mount itself, resolved through the SAME
-// unifiedMount() every other cgroup path in this package resolves through — not
+// UnifiedCgroupMount() every other cgroup path in this package resolves through — not
 // a hard-coded /sys/fs/cgroup, which is right on this box and wrong in a
 // container or on a host that mounted the hierarchy elsewhere.
 //
@@ -132,7 +132,7 @@ func readConfineCPUFrame(slicePath string) ConfineCPUFrame {
 	// cannot show and the counters themselves (kernel accounting, updated on
 	// scheduler ticks) do not have.
 	frame := ConfineCPUFrame{SampleUnixNano: time.Now().UnixNano()}
-	if mount, err := unifiedMount(); err == nil {
+	if mount, err := UnifiedCgroupMount(); err == nil {
 		if value := readCgroupCPUUsageUsec(filepath.Join(mount, "cpu.stat")); value != nil {
 			frame.SystemUsageUsec, frame.SystemKnown = *value, true
 		}

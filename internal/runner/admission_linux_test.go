@@ -90,11 +90,11 @@ func (c *instantClock) After(d time.Duration) <-chan time.Time {
 
 func currentSliceForTest(t *testing.T) string {
 	t.Helper()
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := currentCgroupPath(mount)
+	current, err := CurrentCgroupPath(mount)
 	if err != nil {
 		t.Fatal(err)
 	}

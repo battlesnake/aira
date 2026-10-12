@@ -54,7 +54,7 @@ func swapUncappedMemoryParent(t *testing.T, maximum string) string {
 // cgroup2 mount root, and whether any finite bound exists. memory.swap.max is
 // hierarchical, so a scope under a swap-bounded ancestor is bounded too.
 func effectiveSwapCeiling(path string) (int64, bool) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return 0, false
 	}

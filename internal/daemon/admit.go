@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -3373,11 +3372,11 @@ func parseAdmitMemory(data []byte) (int64, bool) {
 }
 
 func resolveAdmitSlicePath(slice string) (string, bool, string) {
-	mount, err := admitUnifiedMount()
+	mount, err := runner.UnifiedCgroupMount()
 	if err != nil {
 		return "", false, "slice-not-found"
 	}
-	current, err := admitCurrentCgroupPath(mount)
+	current, err := runner.CurrentCgroupPath(mount)
 	if err != nil {
 		return "", false, "slice-not-found"
 	}
@@ -3427,47 +3426,6 @@ func resolveAdmitSlicePathAt(slice, mount, current string) (string, bool, string
 		}
 	}
 	return "", false, "slice-not-found"
-}
-
-func admitUnifiedMount() (string, error) {
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), " - ", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		post, pre := strings.Fields(parts[1]), strings.Fields(parts[0])
-		if len(post) < 1 || len(pre) < 5 || post[0] != "cgroup2" {
-			continue
-		}
-		mount := pre[4]
-		for _, item := range []struct{ from, to string }{{"\\040", " "}, {"\\011", "\t"}, {"\\134", "\\"}} {
-			mount = strings.ReplaceAll(mount, item.from, item.to)
-		}
-		return mount, nil
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", errors.New("cgroup-v2 unified mount not found")
-}
-
-func admitCurrentCgroupPath(mount string) (string, error) {
-	data, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			return filepath.Join(mount, strings.TrimPrefix(strings.TrimPrefix(line, "0::"), "/")), nil
-		}
-	}
-	return "", errors.New("unified cgroup membership not found")
 }
 
 func admitHasParentComponent(path string) bool {

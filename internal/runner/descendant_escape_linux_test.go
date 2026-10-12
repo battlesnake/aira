@@ -190,11 +190,11 @@ func (s *migratingTeardownScope) Kill() error          { s.killed = true; return
 func (*migratingTeardownScope) Remove() error          { return nil }
 
 func TestTeardownMemberAliveOutsideAfterKillIsEscapeNotKilled(t *testing.T) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		t.Skip(err)
 	}
-	current, err := currentCgroupPath(mount)
+	current, err := CurrentCgroupPath(mount)
 	if err != nil {
 		t.Skip(err)
 	}

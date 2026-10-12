@@ -1075,8 +1075,8 @@ func (r *Runner) appendTerminalLocked(id string, candidate RunRecord) (RunRecord
 func (r *Runner) intendedScope(id string) string {
 	if b, ok := r.backend.(*linuxScopeBackend); ok {
 		if b.parent == "" {
-			if mount, err := unifiedMount(); err == nil {
-				if parent, parentErr := currentCgroupPath(mount); parentErr == nil {
+			if mount, err := UnifiedCgroupMount(); err == nil {
+				if parent, parentErr := CurrentCgroupPath(mount); parentErr == nil {
 					b.parent = parent
 				}
 			}
@@ -1898,7 +1898,7 @@ func observeProcessCgroup(identity PIDIdentity, scopePath string) processCgroupO
 	}
 	observation.StartTickAfter, _ = processStartTickFromStat(after)
 	observation.Live = processLivenessFromStat(after)
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return observation
 	}

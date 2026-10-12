@@ -3072,11 +3072,11 @@ func RunConfineSetup(argv []string, diagnostics io.Writer) int {
 }
 
 func verifyConfineSetupScope() error {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return err
 	}
-	path, err := currentCgroupPath(mount)
+	path, err := CurrentCgroupPath(mount)
 	if err != nil {
 		return err
 	}
@@ -3112,7 +3112,7 @@ func hasFiniteCapAncestor(mount, path string) bool {
 // hierarchical, so the effective ceiling is the minimum finite value in the
 // ancestry — an uncapped slice under a capped parent is still bounded.
 func effectiveConfineCap(path string) (int64, bool) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return 0, false
 	}

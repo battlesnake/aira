@@ -911,11 +911,11 @@ func (r *Runner) warnAdmission(state, reason string) {
 }
 
 func resolveSlicePath(slice string) (string, bool, string) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return "", false, "slice-not-found"
 	}
-	current, err := currentCgroupPath(mount)
+	current, err := CurrentCgroupPath(mount)
 	if err != nil {
 		return "", false, "slice-not-found"
 	}
@@ -927,11 +927,11 @@ func resolveSlicePath(slice string) (string, bool, string) {
 // failure for admission callers; default confinement must distinguish definite
 // ENOENT from permission and evaluation failures.
 func resolveSlicePathExact(slice string) (string, error) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return "", err
 	}
-	current, err := currentCgroupPath(mount)
+	current, err := CurrentCgroupPath(mount)
 	if err != nil {
 		return "", err
 	}
