@@ -887,7 +887,7 @@ var parseArgsAllowedOptions = map[string]map[string]bool{
 	"confine-log":   {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true, "owner": true},
 	"confine-input": {"close": true, "steal": true, "owner": true},
 	"watch":         {"from": true, "from-start": true, "verb": true},
-	"gate":          {"canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
+	"gate":          {"canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "dimension": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
 }
 
 func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
@@ -3327,7 +3327,7 @@ func buildRequestArgs(verb string, positional []string, options map[string]strin
 		default:
 			return core.Request{}, fmt.Errorf("unknown gate operation %q", args["subverb"])
 		}
-		for option, argument := range map[string]string{"checker": "checker", "predicate": "predicate", "cwd": "cwd", "timeout-ms": "timeout_ms", "output-cap-bytes": "output_cap_bytes", "parser": "parser", "mutation-kind": "mutation_kind", "mutation-file": "mutation_file", "mutation-test": "mutation_test", "mutation-occurrence": "mutation_occurrence", "mutation-pkgdir": "mutation_pkgdir", "mutation-testname": "mutation_testname", "mutation-content": "mutation_content", "mutation-seed": "mutation_seed", "mutation-expected-result": "mutation_expected_result"} {
+		for option, argument := range map[string]string{"checker": "checker", "predicate": "predicate", "dimension": "dimension", "cwd": "cwd", "timeout-ms": "timeout_ms", "output-cap-bytes": "output_cap_bytes", "parser": "parser", "mutation-kind": "mutation_kind", "mutation-file": "mutation_file", "mutation-test": "mutation_test", "mutation-occurrence": "mutation_occurrence", "mutation-pkgdir": "mutation_pkgdir", "mutation-testname": "mutation_testname", "mutation-content": "mutation_content", "mutation-seed": "mutation_seed", "mutation-expected-result": "mutation_expected_result"} {
 			if value := options[option]; value != "" {
 				args[argument] = value
 			}

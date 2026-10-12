@@ -14,6 +14,11 @@ import (
 // --gate_id` was dropped). The matrix is built from parseArgsAllowedOptions
 // itself, so a newly admitted option with no consumer fails here without anyone
 // remembering to list it.
+//
+// SCOPE: "consumed" means the builder forwards the option into Request.Args. It
+// does not prove the store or a checker then uses it; a store that drops a
+// forwarded option stays green here (canary-run's mutation_* options did, and
+// were removed from its declaration in round 4).
 
 // optionBaseArgvs are minimal valid invocations, per verb, one per subverb that
 // takes options. The probe appends `--<option> <value>` to each.

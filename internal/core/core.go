@@ -2366,8 +2366,6 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			switch subverb {
 			case "add", "set":
 				inputFields = gateDefinitionInputFields(args)
-			case "canary-run", "canary-show":
-				inputFields = mutationInputFields(args)
 			}
 			gs, ok := c.store.(gateStore)
 			if !ok {
@@ -2556,8 +2554,8 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			// canary evidence, which is the point of the security model.
 			{Name: "prove", Summary: "Read back the latest gate result and its proof linkage", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"prove", "traceability"}},
 			{Name: "review", Summary: "Request manual gate review", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
-			{Name: "canary-run", Summary: "Run a named canary and report whether it fired: verdict pass (exit 0) means the checker failed on the canary tree, an observed failure rather than proof of its cause, fail (exit 1) means it did not fire, unevaluated (exit 3) means it could not tell; gate_result is the gate's own result on that tree; read a command canary's output with aira run-log <run id>", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
-			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
+			{Name: "canary-run", Summary: "Run a named canary and report whether it fired: verdict pass (exit 0) means the checker failed on the canary tree, an observed failure rather than proof of its cause, fail (exit 1) means it did not fire, unevaluated (exit 3) means it could not tell; gate_result is the gate's own result on that tree; read a command canary's output with aira run-log <run id>", Safety: SafetyReconcile, Args: []OperationArg{{Name: "canary_id", Required: true}}, Example: []string{"canary-run", "unit-tests-mutation"}},
+			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: []OperationArg{{Name: "canary_id", Required: true}}, Example: []string{"canary-show", "unit-tests-mutation"}},
 		}},
 		"spend": {summary: "Record and list raw compute events", safety: SafetyMutate, operations: []OperationSpec{
 			{Name: "add", Summary: "Ingest one compute event. --turn-id (needs --session) makes the add idempotent per source+session+agent while the row is retained: an identical retry returns the original row with duplicate:true, a retry that differs in counters, model, provider, reported total, cost, reasoning subset, declared ticket or phase is refused with E_COMPUTE_TURN_CONFLICT. --resolve-ticket (when no --ticket) stamps the ticket from the one LIVE lease this worktree holds: ticket_status lease-held means only that, at ingest time, this worktree held a live lease on that ticket; it does NOT say this session did the work, and a turn just before a claim or after a release gets the neighbouring state. A lease expires after its TTL unless `aira heartbeat` renews it, and only leases held by the worktree of the --scope-dir count, so an unrenewed or other-worktree claim reads none. No live lease is none, two or more is unevaluated (never a pick); rows written without --ticket or --resolve-ticket read as unknown", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "model", Required: true}, {Name: "source", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "at"}, {Name: "session"}, {Name: "agent"}, {Name: "turn-id"}, {Name: "resolve-ticket"}, {Name: "raw"}, {Name: "usage-file"}, {Name: "bucket"}, {Name: "total"}, {Name: "cost-usd"}, {Name: "reasoning-subset"}}, Example: []string{"add", "--provider", "openai", "--model", "gpt-5", "--source", "manual", "--bucket", "fresh_input=700", "--bucket", "cache_read=300", "--bucket", "output=200", "--total", "1200", "--reasoning-subset"}},
@@ -2905,16 +2903,6 @@ func gateDefinitionInputFields(args *argAccessor) map[string]any {
 	}
 	if values := stringSlice(args, "env_allow"); len(values) > 0 {
 		fields["env_allow"] = values
-	}
-	return fields
-}
-
-func mutationInputFields(args *argAccessor) map[string]any {
-	fields := map[string]any{}
-	for _, name := range []string{"mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"} {
-		if value := stringArg(args, name); value != "" {
-			fields[name] = value
-		}
 	}
 	return fields
 }

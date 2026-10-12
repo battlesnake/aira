@@ -25,7 +25,7 @@ are used below.
 | AIRA-253 A cancel that lands before `app.Run()` has a screen leaves a live screen that nothing stops | Yes, measured | `coordinateShutdown` (`cmd/aira/tui.go:517-528`) calls `app.Stop()` from its own goroutine. tview v0.42 `Stop()` returns at once when `a.screen == nil` (pre-Run), and when a screen was injected it discards that screen. `Run()` then makes a **new** screen (`application.go:279-300`), and nothing will ever stop it. Probe (in-process: injected SimulationScreen, ctx cancelled, coordinator run to completion before `Run`, `TERM` unresolvable): `Run returned err=couldn't open terminfo ($TERM) file ...`. The injected screen was gone and Run tried to bring up a real terminal. In production (no injected screen) the pre-Run `Stop()` is a no-op, and `Run` brings up a screen whose pump, coordinator and signal loop have all exited. | Build |
 | AIRA-293 `confine --help` lists `confine-status`, but that spelling is refused | Yes, measured | `aira confine --help` lists `"verb":"confine-status"` (`confineHelpVerbs`, `cmd/aira/main.go:1529`). `aira confine-status` gives `E_UNKNOWN_VERB: unknown verb "confine-status"`, rc 2, from `buildRequest`'s default arm (`:3253`). The other four listed spellings (`confine-list/-kill/-budget/-dump`) are routed (`:375-403`). | Build (accept it) |
 | AIRA-294 `__supervise` with an unparseable `--ready-fd` writes to fd 0 and closes it | Yes, by code | `runSupervisor` (`cmd/aira/main.go:661-664`): `strconv.Atoi("x")` returns `0` with an error, and the malformed-arguments branch calls `writeSupervisorFailure(readyFD=0, ...)`, which wraps fd 0, writes JSON to it and closes it (`:752-762`). A **missing** `--ready-fd` takes the same path (`Atoi("")` is `0`). `readyForFailure := supervisorReadyFD(argv)` (`:642`, returns -1 here) is already in scope. | Build |
-| AIRA-299 Gate files escape `&`, `<`, `>` | Yes, measured | `aira gate add probe-gate ... --argv 'test 1 -lt 2 && echo "<ok>"'` wrote `"test 1 -lt 2 \u0026\u0026 echo \"\u003cok\u003e\""` into `.aira/gates/probe-gate.json`. `RenderGate` uses `json.MarshalIndent` (`internal/gate/gate.go:225`). The canary writer `renderCanary` does the same (`internal/store/gate_write.go:23`), and canary `mutation_content` bodies are source code, full of `&` and `<`. No committed gate or canary file exists in aira or fastest-ee (checked), so no file on disk changes. | Build (gate and canary files) |
+| AIRA-299 Gate files escape `&`, `<`, `>` | Yes, measured | `aira gate add probe-gate ... --argv 'test 1 -lt 2 && echo "<ok>"'` wrote `"test 1 -lt 2 \u0026\u0026 echo \"\u003cok\u003e\""` into `.aira/gates/probe-gate.json`. `RenderGate` uses `json.MarshalIndent` (`internal/gate/gate.go:225`). The canary writer `renderCanary` does the same (`internal/store/gate_write.go:23`), and canary `mutation_content` bodies are source code, full of `&` and `<`. No committed gate or canary file exists in aira or fastest-ee (checked); the tooling repo has `.aira/gates/clops-gate.json` and `.aira/canaries/clops-gate-canary.json`, neither containing a `\u00xx` escape or a whole-tree marker scan, so no file on disk changes. | Build (gate and canary files) |
 
 Nothing is dropped whole. Sub-items dropped or replaced are listed in section 7.
 
@@ -346,7 +346,8 @@ output equals `json.MarshalIndent` except for the three characters. It is export
    PASSES on its own definition (trusted false pass, when no source file carries X and the
    canary does not seed one). Both existed on base for markers with none of `&<>"\`; this
    change removes the accidental exemption for `&<>`. No gate or canary file exists in aira or
-   fastest-ee, so nothing changes today. Recorded in the skill text (command-gate paragraph) and
+   fastest-ee; the tooling repo's `clops-gate.json` and `clops-gate-canary.json` carry no `\u00xx`
+   escape and no whole-tree scan, so nothing changes today. Recorded in the skill text (command-gate paragraph) and
    release notes; pinned both ways, with the mitigation (scan a source directory, never `.`),
    by `TestWholeTreeMarkerGateSeesItsOwnDefinitionFiles`. Root-cause fix (leave gate and canary
    files out of the checker's tree, a change to AIRA-285's recorded decision) is not in this
@@ -440,6 +441,12 @@ test runs in `make ci`.
   `TestCLIStillAcceptsEveryDeclaredOption` pins the false-refuse direction (every real option in
   its real spelling still builds). This narrows invariant 3 for options: an option that was
   accepted and discarded by a sibling subverb is now refused; no option that had an effect is.
+  Wording of invariant 3 (round 4): "changes the built request or is refused" means the builder
+  forwards it, not that the store uses it. The matrix cannot see a store that drops a forwarded
+  option; `gate canary-run`/`canary-show` did exactly that with the nine `mutation_*` options and
+  now no longer declare them (`TestCanaryRunShowRefuseDiscardedMutationOptions`). An empty
+  `--canary_id ''` still means absent (the CLI's existing empty-value rule). `gate add|set
+  --dimension` is now admitted by `parseArgs` (MCP already declared it).
   `link A blocked-by B` still gives AIRA-291's forward-command refusal (twin: the check must
   accept inverse kinds).
 - Consumed-or-refused matrix (build round 3): `TestEveryAcceptedOptionIsConsumedOrRefused` walks

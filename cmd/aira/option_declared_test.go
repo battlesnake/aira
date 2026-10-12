@@ -141,8 +141,9 @@ func TestCLIStillAcceptsEveryDeclaredOption(t *testing.T) {
 		{"gate", "attest", "G", "--verdict", "pass", "--actor", "human"},
 		{"gate", "prove", "G"},
 		{"gate", "review", "G"},
-		{"gate", "canary-run", "C", "--mutation-kind", "k", "--mutation-file", "f", "--mutation-test", "t", "--mutation-occurrence", "1", "--mutation-pkgdir", ".", "--mutation-testname", "T", "--mutation-content", "c", "--mutation-seed", "1", "--mutation-expected-result", "fail"},
-		{"gate", "canary-show", "C", "--mutation-kind", "k"},
+		{"gate", "canary-run", "C"},
+		{"gate", "canary-show", "C"},
+		{"gate", "add", "G", "--checker", "check-dimension", "--dimension", "traceability"},
 		{"commands", "ls", "--by", "key"},
 		{"commands", "count", "--by", "key"},
 	}
@@ -249,5 +250,31 @@ func TestUndeclaredOptionWinsOverBuilderValueCheck(t *testing.T) {
 	_, err = buildFromArgv("test-report", "add", "r.json")
 	if err == nil || !strings.Contains(err.Error(), "requires --format") {
 		t.Fatalf("err=%v, want the --format builder check", err)
+	}
+}
+
+// verifies: AIRA-210 -- canary-run / canary-show used to declare the nine
+// mutation_* options and the store discarded them (the canary's own declaration
+// is what runs): `gate canary-run C --mutation-file other` exited 0 as if it had
+// retargeted the canary. Refused by name now; and `gate add --dimension` (which
+// MCP declares) is reachable from the CLI.
+func TestCanaryRunShowRefuseDiscardedMutationOptions(t *testing.T) {
+	for _, subverb := range []string{"canary-run", "canary-show"} {
+		for _, option := range []string{"mutation-kind", "mutation-file", "mutation-test", "mutation-occurrence", "mutation-pkgdir", "mutation-testname", "mutation-content", "mutation-seed", "mutation-expected-result"} {
+			_, err := buildFromArgv("gate", subverb, "C", "--"+option, "1")
+			if err == nil || !strings.HasPrefix(err.Error(), "E_SELECTOR_INVALID: option --"+option+" is not valid for gate "+subverb) {
+				t.Fatalf("gate %s --%s: err=%v, want E_SELECTOR_INVALID", subverb, option, err)
+			}
+		}
+	}
+}
+
+func TestGateAddForwardsDimension(t *testing.T) {
+	req, err := buildFromArgv("gate", "add", "G", "--checker", "check-dimension", "--dimension", "traceability")
+	if err != nil {
+		t.Fatalf("gate add --dimension: %v", err)
+	}
+	if got := req.Args["dimension"]; got != "traceability" {
+		t.Fatalf("dimension = %v, want traceability", got)
 	}
 }
