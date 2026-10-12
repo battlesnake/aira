@@ -17,7 +17,7 @@ import (
 // binary is a refusal rather than a silently half-applied request.
 //
 // AIRA-22 generalised these from Request-specific to any value. The behaviour is
-// unchanged for the run path -- writeDetachControl/consumeDetachControl are now
+// unchanged for the run path -- writeDetachControl/ConsumeDetachControl are now
 // one-line wrappers, so the existing M20 tests keep proving the contract they
 // always proved.
 func writeControlValue(dir, pattern string, value any) (string, error) {
@@ -87,12 +87,10 @@ func writeDetachControl(outputDir string, req Request) (string, error) {
 	return writeControlValue(outputDir, "detach-*.ctrl", req)
 }
 
-func consumeDetachControl(path string) (Request, error) {
+func ConsumeDetachControl(path string) (Request, error) {
 	var req Request
 	if err := consumeControlValue(path, &req); err != nil {
 		return Request{}, err
 	}
 	return req, nil
 }
-
-func ConsumeDetachControl(path string) (Request, error) { return consumeDetachControl(path) }

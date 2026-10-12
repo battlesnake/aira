@@ -114,19 +114,6 @@ func (r *Runner) LaunchDetached(ctx context.Context, req Request, wiringPath str
 	return launch, nil
 }
 
-func (r *Runner) Supervise(ctx context.Context, control string, readyFD, ackFD int) error {
-	req, err := consumeDetachControl(control)
-	if err != nil {
-		ready := os.NewFile(uintptr(readyFD), "detach-ready")
-		if ready != nil {
-			_ = (&detachSignal{file: ready}).send(detachReadyMessage{Code: "E_RUN_ARGUMENT_INVALID", Error: err.Error()})
-		}
-		return launchErr("E_RUN_ARGUMENT_INVALID", err)
-	}
-	_, err = r.SuperviseRequest(ctx, req, readyFD, ackFD)
-	return err
-}
-
 func (r *Runner) SuperviseRequest(ctx context.Context, req Request, readyFD, ackFD int) (*RunRecord, error) {
 	ready := os.NewFile(uintptr(readyFD), "detach-ready")
 	ack := os.NewFile(uintptr(ackFD), "detach-ack")

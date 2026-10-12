@@ -322,7 +322,7 @@ func TestM20ControlFileIs0600AndConsumedBeforeLaunch(t *testing.T) {
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("control mode = %o", info.Mode().Perm())
 	}
-	req, err := consumeDetachControl(path)
+	req, err := ConsumeDetachControl(path)
 	if err != nil {
 		t.Fatal(err)
 	}

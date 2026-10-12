@@ -17,8 +17,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const cloneIntoCgroup = uintptr(1 << 33)
-
 type linuxScopeBackend struct{ parent string }
 type linuxScope struct {
 	path              string

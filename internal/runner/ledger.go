@@ -653,17 +653,6 @@ func LedgerIntegrity(commonDir string) error {
 	return nil
 }
 
-func (l *ledger) nextSequence() (uint64, error) {
-	events, err := l.read()
-	if err != nil {
-		return 0, err
-	}
-	if len(events) == 0 {
-		return 1, nil
-	}
-	return events[len(events)-1].Sequence + 1, nil
-}
-
 func (l *ledger) project(ctx context.Context) error {
 	events, err := l.read()
 	if err != nil {

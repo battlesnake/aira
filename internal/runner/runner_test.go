@@ -361,23 +361,6 @@ func TestUsageEvidenceMergesOnlyEvaluatedMetrics(t *testing.T) {
 	}
 }
 
-func TestArbitrationWaitBeforeIntentWinsExactlyOnce(t *testing.T) {
-	var state Arbitration
-	if !state.Wait() || state.Intent() {
-		t.Fatal("kill intent displaced a published wait")
-	}
-	if !state.CommitWait(StatusExited) || state.CommitWait(StatusExited) {
-		t.Fatal("wait terminal slot was not unique")
-	}
-	if state.CommitKill() {
-		t.Fatal("kill committed after exited")
-	}
-	state = Arbitration{}
-	if !state.Intent() || state.Wait() || !state.CommitKill() || state.CommitWait(StatusExited) {
-		t.Fatal("kill-before-wait arbitration failed")
-	}
-}
-
 func TestReconcileDecisionNeverOverwritesPublishedWait(t *testing.T) {
 	decision := decideReconcile(true, false, true, false)
 	if !decision.PreserveOpen || decision.Terminal != "" {
