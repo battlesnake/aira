@@ -582,19 +582,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	go monitorScopeMembership(scope, record.PIDIdentity, members, monitorStop, monitorResult)
 
 	captureCh := make(chan captureResult, len(readers))
-	liveStreams = make(map[string]*liveStream)
-	if req.Merge {
-		if req.LiveStdout != nil {
-			liveStreams["log"] = newLiveStream(req.LiveStdout)
-		}
-	} else {
-		if req.LiveStdout != nil {
-			liveStreams["out"] = newLiveStream(req.LiveStdout)
-		}
-		if req.LiveStderr != nil {
-			liveStreams["err"] = newLiveStream(req.LiveStderr)
-		}
-	}
+	liveStreams = newLiveStreams(req)
 	for name, rd := range readers {
 		var captureReader io.ReadCloser = rd
 		if req.PTY {
@@ -776,15 +764,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	} else {
 		captures, forced, capComplete = collectCapture(ctx, captureCh, len(readers), r.grace)
 	}
-	for _, result := range captures {
-		if ref, ok := record.OutputRefs[result.Name]; ok {
-			ref.Bytes, ref.Digest, ref.State = result.Bytes, result.Digest, result.State
-			record.OutputRefs[result.Name] = ref
-		}
-		if result.Err != nil {
-			record.ErrorCodes = appendUnique(record.ErrorCodes, captureCode(result.Err))
-		}
-	}
+	applyCaptureResults(&record, captures)
 	// Capture completion is evidence about the capture streams only. Scope/lifecycle
 	// errors must not turn a fully drained (including zero-byte) capture into
 	// E_RUN_CAPTURE_FAILED; drain reports real read/write/disk failures itself.
@@ -793,38 +773,6 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if forced {
 		for _, rd := range readers {
 			_ = rd.Close()
-		}
-	}
-	finishLive := func() {
-		if len(liveStreams) == 0 {
-			return
-		}
-		disable := func() {
-			for _, stream := range liveStreams {
-				stream.gate.disable()
-			}
-		}
-		if forced || ctx.Err() != nil {
-			disable()
-			return
-		}
-		writersDone := make(chan struct{})
-		stopJoin := make(chan struct{})
-		go func() {
-			for _, stream := range liveStreams {
-				select {
-				case <-stream.done:
-				case <-stopJoin:
-					return
-				}
-			}
-			close(writersDone)
-		}()
-		select {
-		case <-writersDone:
-		case <-ctx.Done():
-			close(stopJoin)
-			disable()
 		}
 	}
 	if !capComplete && !forced && !containsPrefix(record.ErrorCodes, "E_RUN_CAPTURE_FAILED") && !containsPrefix(record.ErrorCodes, "E_RUN_OUTPUT_DISK_FULL") {
@@ -950,7 +898,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	latest, latestErr := r.ledger.current(id)
 	if latestErr == nil && latest.Status.Terminal() {
 		_ = unlockFile(terminalLock)
-		finishLive()
+		finishLiveStreams(ctx, liveStreams, forced)
 		if ptyCleanupErr != nil {
 			return &latest, launchErr("U_RUN_RECONCILE_REQUIRED", ptyCleanupErr)
 		}
@@ -993,7 +941,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	_ = unlockFile(terminalLock)
 	_ = r.ledger.project(ctx)
-	finishLive()
+	finishLiveStreams(ctx, liveStreams, forced)
 	if ptyCleanupErr != nil {
 		return &committed, launchErr("U_RUN_RECONCILE_REQUIRED", ptyCleanupErr)
 	}
@@ -1335,6 +1283,74 @@ func closePipes(readers, writers map[string]*os.File) {
 	}
 	for _, f := range writers {
 		_ = f.Close()
+	}
+}
+
+// newLiveStreams builds the live tee for each requested capture stream: "log"
+// when stdout and stderr are merged, else "out" and "err".
+func newLiveStreams(req Request) map[string]*liveStream {
+	liveStreams := make(map[string]*liveStream)
+	if req.Merge {
+		if req.LiveStdout != nil {
+			liveStreams["log"] = newLiveStream(req.LiveStdout)
+		}
+	} else {
+		if req.LiveStdout != nil {
+			liveStreams["out"] = newLiveStream(req.LiveStdout)
+		}
+		if req.LiveStderr != nil {
+			liveStreams["err"] = newLiveStream(req.LiveStderr)
+		}
+	}
+	return liveStreams
+}
+
+// finishLiveStreams waits for every live writer to drain, or disables them
+// all when capture was force-closed, ctx is done, or ctx ends mid-join.
+func finishLiveStreams(ctx context.Context, liveStreams map[string]*liveStream, forced bool) {
+	if len(liveStreams) == 0 {
+		return
+	}
+	disable := func() {
+		for _, stream := range liveStreams {
+			stream.gate.disable()
+		}
+	}
+	if forced || ctx.Err() != nil {
+		disable()
+		return
+	}
+	writersDone := make(chan struct{})
+	stopJoin := make(chan struct{})
+	go func() {
+		for _, stream := range liveStreams {
+			select {
+			case <-stream.done:
+			case <-stopJoin:
+				return
+			}
+		}
+		close(writersDone)
+	}()
+	select {
+	case <-writersDone:
+	case <-ctx.Done():
+		close(stopJoin)
+		disable()
+	}
+}
+
+// applyCaptureResults folds each drained stream's byte count, digest and state
+// into its output ref, and each capture error into the record's error codes.
+func applyCaptureResults(record *RunRecord, captures []captureResult) {
+	for _, result := range captures {
+		if ref, ok := record.OutputRefs[result.Name]; ok {
+			ref.Bytes, ref.Digest, ref.State = result.Bytes, result.Digest, result.State
+			record.OutputRefs[result.Name] = ref
+		}
+		if result.Err != nil {
+			record.ErrorCodes = appendUnique(record.ErrorCodes, captureCode(result.Err))
+		}
 	}
 }
 

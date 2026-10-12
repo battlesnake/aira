@@ -399,19 +399,7 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	}
 
 	captureCh := make(chan captureResult, len(readers))
-	liveStreams = make(map[string]*liveStream)
-	if req.Merge {
-		if req.LiveStdout != nil {
-			liveStreams["log"] = newLiveStream(req.LiveStdout)
-		}
-	} else {
-		if req.LiveStdout != nil {
-			liveStreams["out"] = newLiveStream(req.LiveStdout)
-		}
-		if req.LiveStderr != nil {
-			liveStreams["err"] = newLiveStream(req.LiveStderr)
-		}
-	}
+	liveStreams = newLiveStreams(req)
 	for name, rd := range readers {
 		var captureReader io.ReadCloser = rd
 		if req.PTY {
@@ -528,15 +516,7 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	} else {
 		captures, forced, capComplete = collectCapture(ctx, captureCh, len(readers), r.grace)
 	}
-	for _, result := range captures {
-		if ref, ok := record.OutputRefs[result.Name]; ok {
-			ref.Bytes, ref.Digest, ref.State = result.Bytes, result.Digest, result.State
-			record.OutputRefs[result.Name] = ref
-		}
-		if result.Err != nil {
-			record.ErrorCodes = appendUnique(record.ErrorCodes, captureCode(result.Err))
-		}
-	}
+	applyCaptureResults(&record, captures)
 	record.CaptureComplete = capComplete
 	record.CaptureForcedClosed = forced
 	if forced {
@@ -546,38 +526,6 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	}
 	if !capComplete && !forced && !containsPrefix(record.ErrorCodes, "E_RUN_CAPTURE_FAILED") && !containsPrefix(record.ErrorCodes, "E_RUN_OUTPUT_DISK_FULL") {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_CAPTURE_FAILED")
-	}
-	finishLive := func() {
-		if len(liveStreams) == 0 {
-			return
-		}
-		disable := func() {
-			for _, stream := range liveStreams {
-				stream.gate.disable()
-			}
-		}
-		if forced || ctx.Err() != nil {
-			disable()
-			return
-		}
-		writersDone := make(chan struct{})
-		stopJoin := make(chan struct{})
-		go func() {
-			for _, stream := range liveStreams {
-				select {
-				case <-stream.done:
-				case <-stopJoin:
-					return
-				}
-			}
-			close(writersDone)
-		}()
-		select {
-		case <-writersDone:
-		case <-ctx.Done():
-			close(stopJoin)
-			disable()
-		}
 	}
 
 	if timedOut {
@@ -630,7 +578,7 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	latest, latestErr := r.ledger.current(id)
 	if latestErr == nil && latest.Status.Terminal() {
 		_ = unlockFile(terminalLock)
-		finishLive()
+		finishLiveStreams(ctx, liveStreams, forced)
 		return &latest, nil
 	}
 	honourNotExecuted := decideNotExecutedDisposition(intentNotExecuted, latestErr, latest.KillIntent, timeoutKill.IntentSequence)
@@ -657,7 +605,7 @@ func (r *Runner) launchShim(ctx context.Context, req Request, prefix []string, c
 	}
 	_ = unlockFile(terminalLock)
 	_ = r.ledger.project(ctx)
-	finishLive()
+	finishLiveStreams(ctx, liveStreams, forced)
 	return &committed, nil
 }
 
