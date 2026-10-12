@@ -118,7 +118,7 @@ func (s *Store) notOwnerError(owner auditOwner, tail string) error {
 	var message string
 	switch owner.kind {
 	case auditOwnerOther:
-		message = fmt.Sprintf("E_STATE_NOT_OWNER: %s belongs to the AIRA state at %s; this process uses %s (HOME or XDG_STATE_HOME differ). If this is not the repository you meant, check your working directory. To move this repository to this state on purpose, stop the other state's daemon, then remove %s.",
+		message = fmt.Sprintf("E_STATE_NOT_OWNER: %s belongs to the AIRA state at %s; this process uses %s (HOME or XDG_STATE_HOME differ). If this is not the repository you meant, check your working directory. To move this repository to this state on purpose: run 'aira check' here with the other state first (it appends that state's deferred lines to the log), stop its daemon, then remove %s.",
 			s.auditDir, owner.stateDir, owner.ours, path)
 	case auditOwnerUnreadable:
 		message = fmt.Sprintf("E_STATE_NOT_OWNER: the owner marker %s is unreadable (%s); refusing to write. If no AIRA process is claiming this repository right now, remove %s by hand.",
@@ -130,10 +130,11 @@ func (s *Store) notOwnerError(owner auditOwner, tail string) error {
 	return errors.New(strings.TrimSpace(message + " " + tail))
 }
 
-// appendRefusalTail is the text of an append-time refusal. These checks fire
-// only when the marker changed while a command was running (registration has
-// already decided ownership), after this state's own database and, for an
-// update, the ticket file may already hold the operation.
+// appendRefusalTail is the text of an append-time refusal. Registration has
+// already decided ownership (claimed, or demoted so nothing can be minted), so
+// these checks fire only when the marker changed while a command was running,
+// or on a replay of rows written before such a change; the state's own
+// database and, for an update, the ticket file may already hold the operation.
 const appendRefusalTail = "The shared log was not changed. This state's own database, and for an update the ticket file, may already hold this operation (a create commits its allocation before its receipt; an update writes its file before its journal line); run 'aira check' once ownership is resolved."
 
 // requireAuditOwner is the append-time check: the marker must name this state.
@@ -197,26 +198,29 @@ func (s *Store) counterSeed() int64 {
 
 // holdsAuditLog reports whether this state's database holds every line the
 // shared log holds for the project: each journal line as an event with the same
-// sequence number, verb, target and digest, and each receipt Rebuild would
+// sequence number and the same identity (actor, time, verb, target, digest: the
+// line identity appendEventIfMissing compares), and each receipt Rebuild would
 // adopt (valid ID, positive sequence number) as an allocation with the same
 // sequence number. A counter above the high water alone does not prove this: a
 // state whose appends were refused advances its counter with numbers the log
 // never received, and can pass another state's lines without reading them
-// (review finding, AIRA-301).
+// (review finding, AIRA-301). The digest covers only verb and target, so two
+// updates of one ticket at one sequence number by two states differ only in
+// actor and time (review round 4).
 func (s *Store) holdsAuditLog(ctx context.Context, receipts []AllocationReceipt, journal []eventRecord) (bool, error) {
 	for _, event := range journal {
 		if event.ProjectID != s.projectID {
 			continue
 		}
-		var verb, target, digest string
-		err := s.db.QueryRowContext(ctx, `SELECT verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, s.projectID, event.Seq).Scan(&verb, &target, &digest)
+		var at, actor, verb, target, digest string
+		err := s.db.QueryRowContext(ctx, `SELECT at_wall, actor, verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, s.projectID, event.Seq).Scan(&at, &actor, &verb, &target, &digest)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		if err != nil {
 			return false, translateDBError(err)
 		}
-		if verb != event.Verb || target != event.Target || digest != event.PayloadDigest {
+		if !sameJournalLine(eventRecord{At: at, Actor: actor, Verb: verb, Target: target, PayloadDigest: digest}, event) {
 			return false, nil
 		}
 	}
@@ -332,14 +336,17 @@ func (s *Store) claimAuditOwnerIfEligible(ctx context.Context, counter int64) (b
 // refuses; an absent marker over a log that cannot be read refuses (whether this
 // state may write there is unknown, so nothing is claimed or demoted); an absent
 // marker is claimed when claimAuditOwnerIfEligible allows it. Otherwise the
-// registration proceeds without claiming, and a counter not above the log's
-// high water is demoted to 0 (it must rebuild before it can mint). A counter
-// above the high water whose database does not hold the log is left as it is:
-// it cannot append while the marker is absent, and its Rebuild meets the line
-// it lacks. demote carries the high water the demotion is conditioned on.
+// registration proceeds without claiming and demotes the counter to 0, so the
+// state must rebuild before it can mint: whether its counter is not above the
+// log's high water, or is above it but its database does not hold the log
+// (left as it was, such a state minted, committed to its own database and
+// worktree, and was refused only at the append; review round 4, AIRA-301).
+// bound is the value the demotion is conditioned on (next_seq <= bound): the
+// larger of the high water and the counter read here, so a concurrent
+// Rebuild's lift above both is never undone.
 type registrationOwnership struct {
 	demote bool
-	high   int64
+	bound  int64
 }
 
 const registrationRefusalTail = "Nothing was written."
@@ -373,5 +380,9 @@ func (s *Store) decideRegistrationOwnership(ctx context.Context) (registrationOw
 	if claimed {
 		return registrationOwnership{}, nil
 	}
-	return registrationOwnership{demote: true, high: high}, nil
+	bound := high
+	if counter > bound {
+		bound = counter
+	}
+	return registrationOwnership{demote: true, bound: bound}, nil
 }

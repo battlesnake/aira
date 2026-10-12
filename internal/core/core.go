@@ -2227,7 +2227,22 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return outputReadData{Chunk: chunk, Err: readErr}, nil
 		}},
 		"reconcile": {Name: "reconcile", Usage: "reconcile [--rebuild]", Args: []ArgSpec{boolSpec("rebuild", false, false, "Rebuild derived indexes")}, MCPTool: "aira_reconcile", Run: func(ctx context.Context, args *argAccessor) (any, error) {
-			if err := c.store.Reconcile(ctx); err != nil {
+			err := c.store.Reconcile(ctx)
+			if err != nil && boolArg(args, "rebuild") && store.ErrorCode(err) == "E_STATE_NOT_OWNER" {
+				// AIRA-301: in a repository with no owner marker the replay is
+				// refused until a Rebuild has absorbed the log and claimed it,
+				// which is what --rebuild is for, so it runs first here. Over
+				// another state's or an unreadable marker, Rebuild refuses with
+				// its own text.
+				if rebuildErr := c.store.Rebuild(ctx); rebuildErr != nil {
+					if store.ErrorCode(rebuildErr) == "U_INDEX_UNESTABLISHED" {
+						return handlerData{Data: map[string]any{"reconciled": false}, Verdict: "unevaluated"}, nil
+					}
+					return nil, rebuildErr
+				}
+				err = c.store.Reconcile(ctx)
+			}
+			if err != nil {
 				return nil, err
 			}
 			if boolArg(args, "rebuild") {

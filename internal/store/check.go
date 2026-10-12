@@ -186,6 +186,22 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		}
 	}
 	establishDimension(&report, "finding-integrity")
+	// AIRA-301: in a repository with no owner marker, no state may append to the
+	// shared log until a Rebuild has absorbed it and claimed it, so reconcile's
+	// replay of a pending row would be refused. Rebuild runs first there (the
+	// claim 'aira check' is documented to make); if it cannot claim, its error
+	// is the rebuild-integrity finding below, naming the line that stops it.
+	claimRebuilt := false
+	var claimRebuildErr error
+	if owner, err := s.readAuditOwner(); err != nil {
+		return CheckReport{}, err
+	} else if owner.kind == auditOwnerAbsent {
+		claimRebuilt = true
+		claimRebuildErr = s.Rebuild(ctx)
+		if claimRebuildErr != nil && ErrorCode(claimRebuildErr) != "U_INDEX_UNESTABLISHED" && !isIntegrityError(claimRebuildErr) {
+			return CheckReport{}, claimRebuildErr
+		}
+	}
 	// `check` may refresh disposable SQLite projections from durable truth, but
 	// it never mints gate trust: no gate evaluator, audit append, or HMAC-key
 	// creation occurs on this path.
@@ -242,7 +258,11 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := flakyRows.Close(); err != nil {
 		return CheckReport{}, err
 	}
-	if err := s.Rebuild(ctx); err != nil {
+	rebuildErr := claimRebuildErr
+	if !claimRebuilt || claimRebuildErr == nil {
+		rebuildErr = s.Rebuild(ctx)
+	}
+	if err := rebuildErr; err != nil {
 		if ErrorCode(err) == "U_INDEX_UNESTABLISHED" {
 			addUnestablishedCheckFinding(&report, "rebuild-integrity", err)
 		} else if isIntegrityError(err) {
@@ -625,7 +645,11 @@ func isIntegrityError(err error) bool {
 	// broken ticket into a hard error out of `aira check`, which reports
 	// nothing at all instead of naming the file — a strictly worse answer
 	// produced as a side effect of renaming a code.
-	case "E_CONFIG_INVALID", domain.CodeTicketInvalid, "E_FINDING_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
+	case "E_CONFIG_INVALID", domain.CodeTicketInvalid, "E_FINDING_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS",
+		// AIRA-301: this state may not write the repository's shared log, so
+		// its replay or Rebuild could not complete: a finding naming the
+		// marker, beside the rest of the report, not a bare error instead of it.
+		"E_STATE_NOT_OWNER":
 		return true
 	default:
 		return false

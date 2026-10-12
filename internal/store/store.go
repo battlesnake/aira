@@ -2077,11 +2077,11 @@ func (s *Store) registerDB(ctx context.Context, bootstrap bool, ownership regist
 		// known to hold nothing for this project; otherwise at 0, "not yet set
 		// from the log", which nextSequence refuses until Rebuild lifts it. An
 		// existing row is left as it is, except that a registration in an
-		// unmarked repository whose counter is not above the log's high water
-		// demotes it to 0 (a pre-upgrade or stale counter cannot prove that this
-		// state has read the log). The demotion is conditioned on the counter
-		// still not being above the high water, so a concurrent Rebuild's lift
-		// is never undone.
+		// unmarked repository that could not claim demotes it to 0 (a
+		// pre-upgrade, stale or burned counter cannot prove that this state has
+		// read the log). The demotion is conditioned on the counter still not
+		// being above ownership.bound, so a concurrent Rebuild's lift is never
+		// undone.
 		var existing int64
 		err := conn.QueryRowContext(ctx, `SELECT next_seq FROM event_counters WHERE project_id=?`, s.projectID).Scan(&existing)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2095,7 +2095,7 @@ func (s *Store) registerDB(ctx context.Context, bootstrap bool, ownership regist
 		if !ownership.demote {
 			return nil
 		}
-		_, err = conn.ExecContext(ctx, `UPDATE event_counters SET next_seq=0 WHERE project_id=? AND next_seq<=?`, s.projectID, ownership.high)
+		_, err = conn.ExecContext(ctx, `UPDATE event_counters SET next_seq=0 WHERE project_id=? AND next_seq<=?`, s.projectID, ownership.bound)
 		return err
 	})
 }
@@ -3077,7 +3077,11 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				}
 			} else if err != nil {
 				return err
-			} else if existing.PayloadDigest != event.PayloadDigest || existing.Verb != event.Verb || existing.Target != event.Target {
+			} else if !sameJournalLine(existing, event) {
+				// Actor and time included: the digest covers only verb and
+				// target, so another state's update of the same ticket at a
+				// sequence number this database burned matches on those alone
+				// (review round 4, AIRA-301).
 				return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", event.ProjectID, event.Seq)
 			}
 		}
@@ -3176,6 +3180,19 @@ func (s *Store) Rebuild(ctx context.Context) error {
                 CASE WHEN id_counters.next_number < excluded.next_number THEN excluded.next_number ELSE id_counters.next_number END`,
 				s.projectID, prefix, maxNumber+1); err != nil {
 				return err
+			}
+		}
+		// The counter also stays above every sequence number this database
+		// already holds: a demoted state (counter 0) may hold numbers it burned
+		// while its appends were refused, which the log never received and its
+		// replay after the claim below appends (review round 4, AIRA-301).
+		for _, table := range []string{"events", "outbox", "allocations"} {
+			var own int64
+			if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM `+table+` WHERE project_id=?`, s.projectID).Scan(&own); err != nil {
+				return err
+			}
+			if own > maxSeq {
+				maxSeq = own
 			}
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
@@ -3923,6 +3940,12 @@ func appendEventIfMissingBounded(ctx context.Context, path string, event eventRe
 	return appendEventIfMissingLocked(path, event)
 }
 
+// sameJournalLine reports whether two records of one project and sequence
+// number are the same journal line: actor, time, verb, target and digest.
+func sameJournalLine(a, b eventRecord) bool {
+	return a.At == b.At && a.Actor == b.Actor && a.Verb == b.Verb && a.Target == b.Target && a.PayloadDigest == b.PayloadDigest
+}
+
 func appendEventIfMissingLocked(path string, event eventRecord) error {
 	f, err := openAppendFile(path)
 	if err != nil {
@@ -3950,7 +3973,7 @@ func appendEventIfMissingLocked(path string, event eventRecord) error {
 			return fmt.Errorf("%w: %v", errJournalMalformed, err)
 		}
 		if existing.ProjectID == event.ProjectID && existing.Seq == event.Seq {
-			if existing.PayloadDigest != event.PayloadDigest || existing.Verb != event.Verb || existing.Target != event.Target || existing.Actor != event.Actor || existing.At != event.At {
+			if !sameJournalLine(existing, event) {
 				return fmt.Errorf("%w: duplicate project/seq %s/%d has different identity", errJournalKeyConflict, event.ProjectID, event.Seq)
 			}
 			found = true
