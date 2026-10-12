@@ -863,6 +863,14 @@ func TestAppendsRequireTheMarkerToNameThisState(t *testing.T) {
 				t.Fatalf("append refusal text = %q", err)
 			}
 			f.requireAuditUnchanged(t, before, "a refused journal append")
+			// The refused update left its event unjournaled; the daemon's
+			// deferred flush (the bounded journal writer) must refuse it too.
+			flushed, err := s.FlushDeferredJournal(ctx)
+			requireCode(t, err, "E_STATE_NOT_OWNER", "FlushDeferredJournal")
+			if flushed != 0 {
+				t.Fatalf("FlushDeferredJournal flushed %d events over a foreign marker", flushed)
+			}
+			f.requireAuditUnchanged(t, before, "a refused deferred flush")
 		})
 	}
 }
