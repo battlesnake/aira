@@ -23,9 +23,9 @@ var aitestEnvironmentKeys = map[string]struct{}{
 	"AIRA_AITEST_OUTER_SCOPE":          {},
 }
 
-// IsAitestEnvironmentKey reports whether key is aitest launch coordination
+// isAitestEnvironmentKey reports whether key is aitest launch coordination
 // rather than part of the tested child environment identity.
-func IsAitestEnvironmentKey(key string) bool {
+func isAitestEnvironmentKey(key string) bool {
 	_, ok := aitestEnvironmentKeys[key]
 	return ok
 }
@@ -37,7 +37,7 @@ func StripAitestEnvironment(env []string) []string {
 	result := make([]string, 0, len(env))
 	for _, entry := range env {
 		key, _, ok := strings.Cut(entry, "=")
-		if ok && IsAitestEnvironmentKey(key) {
+		if ok && isAitestEnvironmentKey(key) {
 			continue
 		}
 		result = append(result, entry)

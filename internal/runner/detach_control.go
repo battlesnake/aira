@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -71,7 +72,7 @@ func consumeControlValue(path string, into any) error {
 	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 		return removeErr
 	}
-	dec := json.NewDecoder(bytesReader(data))
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(into); err != nil {
 		return err

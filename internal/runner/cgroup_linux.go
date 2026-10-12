@@ -180,7 +180,7 @@ func (b *linuxScopeBackend) Create(ctx context.Context, id string) (Scope, error
 			return nil, err
 		}
 	}
-	if filepath.IsAbs(parent) == false {
+	if !filepath.IsAbs(parent) {
 		return nil, errors.New("cgroup parent must be absolute")
 	}
 	cleanParent := filepath.Clean(parent)
