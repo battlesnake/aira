@@ -426,8 +426,8 @@ func TestAdmissionProvenanceStampedOnForegroundRecords(t *testing.T) {
 		want       *int64
 		basis      string
 	}{
-		{name: "override", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig", MemoryReserveOverride: int64Pointer(70), MemoryReserveBasis: "estimate:max=60,n=3,f=115"}, want: int64Pointer(70), basis: "estimate:max=60,n=3,f=115"},
-		{name: "static nil override", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig"}, want: int64Pointer(40)},
+		{name: "override", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig", MemoryReserveOverride: i64(70), MemoryReserveBasis: "estimate:max=60,n=3,f=115"}, want: i64(70), basis: "estimate:max=60,n=3,f=115"},
+		{name: "static nil override", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig"}, want: i64(40)},
 		{name: "no admit", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig", NoAdmit: true}, basis: "disabled:no-admit"},
 		{name: "disabled config", request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig"}, basis: "disabled:config"},
 	} {
@@ -471,8 +471,6 @@ func TestAdmissionProvenanceStampedOnForegroundRecords(t *testing.T) {
 		})
 	}
 }
-
-func int64Pointer(value int64) *int64 { return &value }
 
 func equalInt64Pointer(left, right *int64) bool {
 	return left == nil && right == nil || left != nil && right != nil && *left == *right

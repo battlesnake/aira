@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -355,7 +356,7 @@ func TestHooksRefuseWhenConfinementIsUnavailable(t *testing.T) {
 			t.Skipf("%s unavailable: %v", tool, err)
 		}
 		dir := filepath.Dir(p)
-		if !containsString(dirs, dir) {
+		if !slices.Contains(dirs, dir) {
 			dirs = append(dirs, dir)
 		}
 	}

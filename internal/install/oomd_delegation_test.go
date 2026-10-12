@@ -22,7 +22,7 @@ import (
 // is transitional, not fatal: install all user units and report it honestly.
 func TestInstallWithoutDelegationStillInstallsUserUnitsAndReportsPending(t *testing.T) {
 	d, state := newFakeInstall(t)
-	controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+itoa(state.uid)+".slice", "user@"+itoa(state.uid)+".service", "cgroup.controllers")
+	controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+strconv.Itoa(state.uid)+".slice", "user@"+strconv.Itoa(state.uid)+".service", "cgroup.controllers")
 	state.cgroup[controllers] = []byte("pids\n")
 	installFakeDelegationDropin(t, &d, state.home)
 
@@ -278,7 +278,7 @@ func TestMemoryEnforcementTriStateRequiresControllerAndCapReadback(t *testing.T)
 
 	t.Run("pending", func(t *testing.T) {
 		d, state := newFakeInstall(t)
-		controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+itoa(state.uid)+".slice", "user@"+itoa(state.uid)+".service", "cgroup.controllers")
+		controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+strconv.Itoa(state.uid)+".slice", "user@"+strconv.Itoa(state.uid)+".service", "cgroup.controllers")
 		state.cgroup[controllers] = []byte("pids\n")
 		installFakeDelegationDropin(t, &d, state.home)
 		if got := memoryEnforcementState(d, state.uid, "16G"); got != enforcementPending {
@@ -288,7 +288,7 @@ func TestMemoryEnforcementTriStateRequiresControllerAndCapReadback(t *testing.T)
 
 	t.Run("not installed", func(t *testing.T) {
 		d, state := newFakeInstall(t)
-		controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+itoa(state.uid)+".slice", "user@"+itoa(state.uid)+".service", "cgroup.controllers")
+		controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+strconv.Itoa(state.uid)+".slice", "user@"+strconv.Itoa(state.uid)+".service", "cgroup.controllers")
 		state.cgroup[controllers] = []byte("pids\n")
 		d.etcRoot = filepath.Join(state.home, "empty-etc")
 		if got := memoryEnforcementState(d, state.uid, "16G"); got != enforcementNotInstalled {
@@ -310,7 +310,7 @@ func TestStatusReportsHonestMemoryEnforcementTriState(t *testing.T) {
 		t.Fatalf("active status missing: %q", logs)
 	}
 
-	controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+itoa(state.uid)+".slice", "user@"+itoa(state.uid)+".service", "cgroup.controllers")
+	controllers := filepath.Join(d.cgroupRoot, "user.slice", "user-"+strconv.Itoa(state.uid)+".slice", "user@"+strconv.Itoa(state.uid)+".service", "cgroup.controllers")
 	state.cgroup[controllers] = []byte("pids\n")
 	installFakeDelegationDropin(t, &d, state.home)
 	state.logs = nil
@@ -900,17 +900,4 @@ func (info ownedFileInfo) Sys() any {
 		stat.Uid, stat.Gid = info.uid, info.gid
 	}
 	return stat
-}
-
-func containsString(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
-	}
-	return false
-}
-
-func itoa(value int) string {
-	return strconv.Itoa(value)
 }

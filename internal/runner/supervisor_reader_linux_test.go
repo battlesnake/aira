@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -89,7 +90,7 @@ func TestSupervisorLeaseReconcileUninspectableDeadPreScopePreserves(t *testing.T
 	appendRunEvent(t, r, "starting", run)
 	r.backend = &openErrorBackend{err: errors.New("scope unreadable")}
 	got := reconcileOne(t, r)
-	if got.Status.Terminal() || !containsString(got.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if got.Status.Terminal() || !slices.Contains(got.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("R1 did not preserve/surface dead pre-scope run: %+v", got)
 	}
 }
@@ -124,7 +125,7 @@ func TestSupervisorLeaseReconcileUnknownFailingLeaseReadPreserves(t *testing.T) 
 	if !consulted {
 		t.Fatal("R4/unknown did not consult the supervisor lease reader")
 	}
-	if got.Status.Terminal() || !containsString(got.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if got.Status.Terminal() || !slices.Contains(got.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("failing lease read did not preserve the unknown run: %+v", got)
 	}
 }

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,23 +25,11 @@ import (
 // canonical round-trip, so these are built rather than hand-spelled.
 func exclusiveScopeID(t *testing.T, name string, pid int) string {
 	t.Helper()
-	id := "CONFINE-" + name + "-" + itoa(pid) + "-1@mark"
+	id := "CONFINE-" + name + "-" + strconv.Itoa(pid) + "-1@mark"
 	if _, _, _, _, ok := runner.ParseConfineScopeID(id); !ok {
 		t.Fatalf("test built a non-canonical scope id: %s", id)
 	}
 	return id
-}
-
-func itoa(value int) string {
-	if value == 0 {
-		return "0"
-	}
-	digits := ""
-	for value > 0 {
-		digits = string(rune('0'+value%10)) + digits
-		value /= 10
-	}
-	return digits
 }
 
 // enqueueExclusiveTest enqueues one waiter described by request. It deliberately
@@ -520,7 +509,7 @@ func TestRepeatedExclusiveRequestAndAbandonNeverWedgesTheSlice(t *testing.T) {
 
 		queue, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
 		evaluate(t, server, queue)
-		requireGranted(t, queue, ordinary, "an ordinary waiter after round "+itoa(round))
+		requireGranted(t, queue, ordinary, "an ordinary waiter after round "+strconv.Itoa(round))
 		server.releaseAdmitWaiter(queue, ordinary)
 	}
 }

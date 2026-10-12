@@ -5,6 +5,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -48,7 +49,7 @@ func aira146LaunchQuiescedPTY(t *testing.T, scope *ptyNestedScope) *RunRecord {
 	if record == nil {
 		t.Fatalf("no record was published: err=%v", err)
 	}
-	if containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("vacuous: the PTY quiesce did not complete, so this is AIRA-143's capture-teardown path and not the quiesce report under test: err=%v record=%+v", err, record)
 	}
 	if kills, _, _ := scope.state(); kills != 1 {
@@ -76,7 +77,7 @@ func TestAIRA146PTYQuiesceReportsAReclaimedNestedDescendant(t *testing.T) {
 	if _, _, populated := scope.state(); populated {
 		t.Fatalf("vacuous: the nested descendant was never reclaimed, so there was nothing to report: record=%+v", record)
 	}
-	if record.ScopeIntegrity != ScopeDescendantKilled || !containsString(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
+	if record.ScopeIntegrity != ScopeDescendantKilled || !slices.Contains(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
 		t.Fatalf("a reclaimed nested descendant was not reported: integrity=%q codes=%v — a leaf-only read calls a busy nested workload empty, so its reclamation is silent", record.ScopeIntegrity, record.ErrorCodes)
 	}
 	if !record.ScopeKill.Requested || !record.ScopeKill.Started || !record.ScopeKill.Completed {
@@ -100,7 +101,7 @@ func TestAIRA146PTYQuiesceReportsNoDescendantWhenBothReadsCallTheScopeEmpty(t *t
 	scope := &ptyNestedScope{}
 	record := aira146LaunchQuiescedPTY(t, scope)
 
-	if record.ScopeIntegrity == ScopeDescendantKilled || containsString(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
+	if record.ScopeIntegrity == ScopeDescendantKilled || slices.Contains(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
 		t.Fatalf("a descendant kill was fabricated for a scope that had nothing in it: integrity=%q codes=%v", record.ScopeIntegrity, record.ErrorCodes)
 	}
 	if record.ScopeKill.Requested || record.ScopeKill.Started || record.ScopeKill.Completed {

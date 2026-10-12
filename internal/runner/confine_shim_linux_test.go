@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -427,7 +428,7 @@ func TestShimConfineKillRefusesAndNamesTheSupervisorPID(t *testing.T) {
 	if !strings.Contains(err.Error(), CodeConfineKillUnconfirmed) {
 		t.Fatalf("error=%v, want %s", err, CodeConfineKillUnconfirmed)
 	}
-	if !strings.Contains(err.Error(), "kill "+itoa(os.Getpid())) {
+	if !strings.Contains(err.Error(), "kill "+strconv.Itoa(os.Getpid())) {
 		t.Fatalf("error=%v does not name this process's pid as the supervisor to signal", err)
 	}
 	if result.Status != "" {
@@ -441,7 +442,7 @@ func TestShimConfineKillRefusesAndNamesTheSupervisorPID(t *testing.T) {
 	if foreignErr == nil || !strings.Contains(foreignErr.Error(), CodeConfineOwnerUnverified) {
 		t.Fatalf("cross-owner kill error=%v, want %s", foreignErr, CodeConfineOwnerUnverified)
 	}
-	if strings.Contains(foreignErr.Error(), "kill "+itoa(os.Getpid())) {
+	if strings.Contains(foreignErr.Error(), "kill "+strconv.Itoa(os.Getpid())) {
 		t.Fatalf("ownership refusal leaked the supervisor pid: %v", foreignErr)
 	}
 
@@ -449,18 +450,6 @@ func TestShimConfineKillRefusesAndNamesTheSupervisorPID(t *testing.T) {
 		!strings.Contains(err.Error(), CodeConfineNotFound) {
 		t.Fatalf("unmatched selector error=%v, want %s", err, CodeConfineNotFound)
 	}
-}
-
-func itoa(value int) string {
-	if value == 0 {
-		return "0"
-	}
-	digits := ""
-	for value > 0 {
-		digits = string(rune('0'+value%10)) + digits
-		value /= 10
-	}
-	return digits
 }
 
 // verifies: AIRA-121 requirement 2
