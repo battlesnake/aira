@@ -223,17 +223,9 @@ func (s *Server) verifyEjectDurability(ctx context.Context, target store.Project
 }
 
 func (s *Server) unregisteredScope(scope WorktreeScope) (*store.Store, error) {
-	scope.ReviewPolicy.Configured = scope.ReviewConfigured
-	return store.NewUnregisteredScope(s.db, store.ScopeOptions{
-		Root: scope.Root, CommonDir: scope.CommonDir, GitDir: scope.GitDir,
-		ProjectID: scope.ProjectID, WorktreeID: scope.WorktreeID, ProjectSlug: scope.Slug,
-		Prefixes: scope.Prefixes, RequirementPrefixes: scope.RequirementPrefixes, IDPrefix: scope.IDPrefix,
-		ReviewPolicy: scope.ReviewPolicy, LeaseStateDir: filepath.Join(s.Paths.LeaseStateDir, scope.WorktreeID), LeaseTTLNS: scope.LeaseTTLNS,
-		MaxReports: scope.MaxReports, MaxAgeDays: scope.MaxAgeDays,
-		MaxComputeEvents: scope.MaxComputeEvents, MaxComputeAgeDays: scope.MaxComputeAgeDays,
-		MaxCommandEvents: scope.MaxCommandEvents, MaxCommandAgeDays: scope.MaxCommandAgeDays,
-		MaxQuotaSnapshots: scope.MaxQuotaSnapshots, ConfigDigest: scope.ConfigDigest,
-	})
+	options := scope.StoreOptions()
+	options.LeaseStateDir = filepath.Join(s.Paths.LeaseStateDir, scope.WorktreeID)
+	return store.NewUnregisteredScope(s.db, options)
 }
 
 func ejectDurabilityFinding(report store.CheckReport) string {

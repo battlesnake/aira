@@ -283,6 +283,24 @@ type WorktreeScope struct {
 	Bootstrap         bool               `json:"bootstrap,omitempty"`
 }
 
+// StoreOptions maps the scope onto store.ScopeOptions, carrying
+// ReviewConfigured into ReviewPolicy.Configured. LeaseStateDir is left empty
+// for the caller to set where it owns lease state.
+func (s WorktreeScope) StoreOptions() store.ScopeOptions {
+	policy := s.ReviewPolicy
+	policy.Configured = s.ReviewConfigured
+	return store.ScopeOptions{
+		Root: s.Root, CommonDir: s.CommonDir, GitDir: s.GitDir,
+		ProjectID: s.ProjectID, WorktreeID: s.WorktreeID, ProjectSlug: s.Slug,
+		Prefixes: s.Prefixes, RequirementPrefixes: s.RequirementPrefixes, IDPrefix: s.IDPrefix,
+		ReviewPolicy: policy, LeaseTTLNS: s.LeaseTTLNS,
+		MaxReports: s.MaxReports, MaxAgeDays: s.MaxAgeDays,
+		MaxComputeEvents: s.MaxComputeEvents, MaxComputeAgeDays: s.MaxComputeAgeDays,
+		MaxCommandEvents: s.MaxCommandEvents, MaxCommandAgeDays: s.MaxCommandAgeDays,
+		MaxQuotaSnapshots: s.MaxQuotaSnapshots, ConfigDigest: s.ConfigDigest,
+	}
+}
+
 type RequestFrame struct {
 	Proto   int           `json:"proto"`
 	Scope   WorktreeScope `json:"scope"`

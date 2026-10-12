@@ -1403,18 +1403,11 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 		<-cached.ready
 		return cached.view, true, nil
 	}
-	leaseDir := filepath.Join(s.Paths.LeaseStateDir, worktreeID)
-	scope.ReviewPolicy.Configured = scope.ReviewConfigured
-	view, err := store.NewScope(s.db, store.ScopeOptions{
-		Root: root, CommonDir: common, GitDir: gitDir,
-		ProjectID: projectID, WorktreeID: worktreeID, ProjectSlug: scope.Slug,
-		Prefixes: scope.Prefixes, RequirementPrefixes: scope.RequirementPrefixes, IDPrefix: scope.IDPrefix,
-		ReviewPolicy: scope.ReviewPolicy, LeaseStateDir: leaseDir, LeaseTTLNS: scope.LeaseTTLNS,
-		MaxReports: scope.MaxReports, MaxAgeDays: scope.MaxAgeDays,
-		MaxComputeEvents: scope.MaxComputeEvents, MaxComputeAgeDays: scope.MaxComputeAgeDays,
-		MaxCommandEvents: scope.MaxCommandEvents, MaxCommandAgeDays: scope.MaxCommandAgeDays,
-		MaxQuotaSnapshots: scope.MaxQuotaSnapshots, ConfigDigest: scope.ConfigDigest,
-	})
+	options := scope.StoreOptions()
+	options.Root, options.CommonDir, options.GitDir = root, common, gitDir
+	options.ProjectID, options.WorktreeID = projectID, worktreeID
+	options.LeaseStateDir = filepath.Join(s.Paths.LeaseStateDir, worktreeID)
+	view, err := store.NewScope(s.db, options)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, false, err
