@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-208","project":"aira","title":"confine's cpu-weight=aging carries no number, so the weight a job ran at (100→10 over 30 min) is observable on no AIRA surface, and a mistyped schedule is discarded silently","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-208","project":"aira","title":"confine's cpu-weight=aging carries no number, so the weight a job ran at (100→10 over 30 min) is observable on no AIRA surface, and a mistyped schedule is discarded silently","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are

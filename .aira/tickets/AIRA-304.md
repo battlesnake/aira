@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-304","project":"aira","title":"Lower the unpinned confine reserve default from 4 GiB to 1 GiB","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.35","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-304","project":"aira","title":"Lower the unpinned confine reserve default from 4 GiB to 1 GiB","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.35","labels":[],"hold":false,"relations":[]}
 ---
 
 

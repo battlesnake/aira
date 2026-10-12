@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-210","project":"aira","title":"Declared closed enums are enforced by five incompatible copies and by none of them on the CLI/core dispatch path, so a wrong value gets a message naming neither the value nor the allowed set","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-210","project":"aira","title":"Declared closed enums are enforced by five incompatible copies and by none of them on the CLI/core dispatch path, so a wrong value gets a message naming neither the value nor the allowed set","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
