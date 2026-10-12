@@ -374,32 +374,14 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	// AIRA-293. `confine --help` lists "confine-status" (confineHelpVerbs) and the
 	// four sibling management verbs each have a hyphenated spelling that works
-	// (AIRA-201's both-spellings discipline), so this one must too. It is
-	// `confine --status [<selector>] [--owner ID]` rebuilt as that argv and fed to
-	// the SAME management parser and the SAME runConfineStatusCommand, so the two
-	// spellings cannot drift: every validation the flag form applies (the owner
-	// identity check included) and every way it renders a refusal is shared by
-	// construction rather than copied.
+	// (AIRA-201's both-spellings discipline), so this one must too. parseArgs hands
+	// its argv to parseConfineManagementArgs as `--status <argv>`, the SAME parser
+	// `confine --status` uses, and the options go to the SAME
+	// runConfineStatusCommand, so the two spellings share every validation (empty,
+	// duplicate and inline `--owner=`, unknown options, --slice, the owner identity
+	// check) and every refusal text because there is one code path, not two copies.
 	if verb == "confine-status" {
-		if len(positional) > 1 {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-status takes at most one selector", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
-			return renderConfineManagement(response, renderJSON, stdout, stderr)
-		}
-		flagArgv := []string{"--status"}
-		flagArgv = append(flagArgv, positional...)
-		if owner := options["owner"]; owner != "" {
-			flagArgv = append(flagArgv, "--owner", owner)
-		}
-		_, statusOptions, parseErr := parseConfineManagementArgs(flagArgv)
-		if parseErr != nil {
-			code := store.ErrorCode(parseErr)
-			if code == "E_INTERNAL" {
-				code = "E_SELECTOR_INVALID"
-			}
-			response := core.Response{Code: code, Error: parseErr.Error(), Exit: codes.ExitForCode(code)}
-			return renderConfineRefusal(args, response, renderJSON, stdout, stderr)
-		}
-		return runConfineStatusCommand(context.Background(), statusOptions, renderJSON, stdout, stderr)
+		return runConfineStatusCommand(context.Background(), options, renderJSON, stdout, stderr)
 	}
 	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-budget" {
 		request, requestErr := buildRequest(verb, positional, options)
@@ -860,6 +842,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "confine-reserve" {
 		return parseConfineReserveArgs(argv)
 	}
+	if verb == "confine-status" {
+		return parseConfineStatusSpellingArgs(argv)
+	}
 	if verb == "drain" {
 		return parseDrainArgs(argv)
 	}
@@ -965,15 +950,13 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"board": nil,
 		// AIRA-127. `top` takes no options today; the entry exists so an unknown
 		// one is refused by name rather than silently accepted and discarded.
-		"top":          nil,
-		"commands":     {"by": true},
-		"git":          {},
-		"run-kill":     {"steal": true},
-		"run-input":    {"close": true, "steal": true},
-		"run-log":      {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
-		"confine-list": {"slice": true, "owner": true},
-		// AIRA-293. The same single option `confine --status` honours.
-		"confine-status": {"owner": true},
+		"top":            nil,
+		"commands":       {"by": true},
+		"git":            {},
+		"run-kill":       {"steal": true},
+		"run-input":      {"close": true, "steal": true},
+		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
+		"confine-list":   {"slice": true, "owner": true},
 		"confine-budget": {"slice": true, "owner": true},
 		// AIRA (admission-counter rebuild) S18.
 		"confine-dump": {"dump": true, "slice": true, "owner": true},
@@ -998,6 +981,27 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		}
 	}
 	return positional, options, nil
+}
+
+// parseConfineStatusSpellingArgs is parseArgs' arm for the hyphenated
+// `confine-status` (AIRA-293): the argument list is `confine --status <argv>`
+// handed to parseConfineManagementArgs, so both spellings are one parser. A bare
+// `-h`/`--help` is still the verb's own help request, as for every other verb.
+func parseConfineStatusSpellingArgs(argv []string) ([]string, map[string]string, error) {
+	for i := 0; i < len(argv); i++ {
+		switch argv[i] {
+		case "-h":
+			return nil, nil, &helpRequestError{flag: "-h"}
+		case "--help":
+			return nil, nil, &helpRequestError{flag: "--help"}
+		case "--owner":
+			// The next token is --owner's value even when it reads as a help flag.
+			if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "--") {
+				i++
+			}
+		}
+	}
+	return parseConfineManagementArgs(append([]string{"--status"}, argv...))
 }
 
 func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, error) {
@@ -2973,12 +2977,12 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				return core.Request{}, fmt.Errorf("req ls accepts no positional arguments")
 			}
 			args["fields"] = splitComma(options["fields"])
-			// AIRA-210: a mistyped --status is a usage error, not a silently
-			// ignored flag. ls does not filter on it; the value is forwarded
-			// only so the dispatch enum check validates it like every other
-			// declared enum.
-			if status, given := options["status"]; given {
-				args["status"] = status
+			// AIRA-210: ls does not filter on status, so --status here is refused
+			// whatever its value: accepting a correctly typed one and returning every
+			// row would read as if the filter had applied. MCP's aira_requirement ls
+			// declares no status argument either, so both faces refuse it.
+			if _, given := options["status"]; given {
+				return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: option --status is not valid for req ls: ls lists every requirement and does not filter by status")
 			}
 		case "show":
 			if len(positional) != 2 {

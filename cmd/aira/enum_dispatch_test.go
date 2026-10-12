@@ -100,7 +100,7 @@ func TestEnumFaultsHaveNamedRefusalsOnTheCLI(t *testing.T) {
 	}
 	refused(`E_ARGUMENT_INVALID: mv status "in_progress" is invalid; allowed: draft, planned, in-progress, in-review, done, retired, superseded`, "mv", "AIRA-1", "in_progress")
 	refused(`E_ARGUMENT_INVALID: rant severity "P1" is invalid; allowed: papercut, annoyance, blocker`, "rant", "x", "--severity", "P1")
-	refused(`E_ARGUMENT_INVALID: req status "Bogus" is invalid; allowed: built, partial, designed, planned, boundary, retired, superseded`, "req", "ls", "--status", "Bogus")
+	refused(`E_ARGUMENT_INVALID: req status "Bogus" is invalid; allowed: built, partial, designed, planned, boundary, retired, superseded`, "req", "add", "The system must X", "--status", "Bogus")
 	refused(`E_ARGUMENT_INVALID: create severity "P9" is invalid; allowed: P0, P1, P2, P3`, "create", "bad severity", "--severity", "P9")
 	exit, env, _ := run("link", "AIRA-1", "blockz", "AIRA-2")
 	if exit != 2 || env["code"] != "E_ARGUMENT_INVALID" || !strings.Contains(envelopeError(env), `"blockz"`) || !strings.Contains(envelopeError(env), "blocked-by") {
@@ -239,5 +239,28 @@ func TestEnumRefusalIdenticalAcrossFaces(t *testing.T) {
 				t.Fatalf("palette: outcome=%v text=%q\nwant REJECTED E_ARGUMENT_INVALID\\n%s", result.Outcome, result.Text, cliText)
 			}
 		})
+	}
+}
+
+// `req ls` does not filter on status, so --status is refused whatever its value:
+// a mistyped one used to be accepted and ignored, and a CORRECT one still is
+// accept-and-discard (every row comes back as if the filter had applied).
+func TestReqLsRefusesStatusWhatEverItsValue(t *testing.T) {
+	_, run := enumCLIProject(t)
+	for _, value := range []string{"built", "planned", "Bogus"} {
+		exit, env, _ := run("req", "ls", "--status", value)
+		if exit != 2 || env["ok"] != false || env["code"] != "E_SELECTOR_INVALID" || !strings.Contains(envelopeError(env), "--status is not valid for req ls") {
+			t.Fatalf("req ls --status %s: exit=%d env=%v, want exit 2 E_SELECTOR_INVALID naming req ls", value, exit, env)
+		}
+	}
+	// Twin: the unfiltered list, and the statuses req add/set still take, work.
+	exit, env, errText := run("req", "ls")
+	if exit != 0 || env["ok"] != true {
+		t.Fatalf("req ls: exit=%d env=%v err=%q", exit, env, errText)
+	}
+	// The enum check still lets a declared status through where it is used (the
+	// project owns no requirement prefix, so a LATER, domain refusal is expected).
+	if exit, env, errText := run("req", "add", "The system must X", "--status", "planned"); env["code"] == "E_ARGUMENT_INVALID" {
+		t.Fatalf("req add --status planned refused by the enum check: exit=%d env=%v err=%q", exit, env, errText)
 	}
 }

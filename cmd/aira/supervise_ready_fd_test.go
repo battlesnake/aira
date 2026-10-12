@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -86,15 +87,29 @@ func TestSupervisorMalformedReadyFDNeverTouchesStdin(t *testing.T) {
 	}
 }
 
-// Twin: the failure channel still works when --ready-fd IS valid and another
-// argument is what is malformed.
-func TestSupervisorMalformedAckFDStillReportsOnTheParsedReadyFD(t *testing.T) {
+// ackFDTwin runs the twin invocation and fails the test if the failure is not
+// written to the parsed ready fd. runSupervisor's writeSupervisorFailure wraps
+// the fd NUMBER it was given in a new os.File and closes it, so the caller must
+// hand it a descriptor that no other *os.File owns: a dup, with the pipe's own
+// *os.File closed straight away. Handing it writer.Fd() left writer's finalizer
+// to close the same number again at a later GC, after the kernel had given it to
+// some other file, which closed another test's fd at random.
+func ackFDTwin(t *testing.T) {
+	t.Helper()
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	argv := []string{"--control", "c", "--ready-fd", strconv.Itoa(int(writer.Fd())), "--ack-fd", "x"}
+	readyFD, err := syscall.Dup(int(writer.Fd()))
+	if err != nil {
+		_ = writer.Close()
+		t.Fatalf("dup ready fd: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	argv := []string{"--control", "c", "--ready-fd", strconv.Itoa(readyFD), "--ack-fd", "x"}
 	exit := runSupervisor(argv, io.Discard)
 	if exit == 0 {
 		t.Fatal("malformed supervisor invocation exited 0")
@@ -108,5 +123,40 @@ func TestSupervisorMalformedAckFDStillReportsOnTheParsedReadyFD(t *testing.T) {
 	data, err := io.ReadAll(reader)
 	if err != nil || !strings.Contains(string(data), "E_RUN_ARGUMENT_INVALID") {
 		t.Fatalf("failure was not written to the parsed ready fd: %q err=%v", data, err)
+	}
+}
+
+// Twin: the failure channel still works when --ready-fd IS valid and another
+// argument is what is malformed.
+func TestSupervisorMalformedAckFDStillReportsOnTheParsedReadyFD(t *testing.T) {
+	ackFDTwin(t)
+}
+
+// The twin must not leave a stale *os.File behind whose finalizer closes a
+// descriptor number the kernel has since reused. After it runs and the GC has
+// had every chance to finalize, fresh files opened afterwards must all be open.
+func TestSupervisorAckFDTwinLeavesNoStaleFinalizer(t *testing.T) {
+	ackFDTwin(t)
+	victims := make([]*os.File, 0, 16)
+	defer func() {
+		for _, victim := range victims {
+			_ = victim.Close()
+		}
+	}()
+	for i := 0; i < 16; i++ {
+		victim, err := os.Open(os.DevNull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		victims = append(victims, victim)
+	}
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, victim := range victims {
+		if !fdIsOpen(int(victim.Fd())) {
+			t.Fatalf("fd %d was closed behind its owner's back: a stale *os.File from the twin was finalized", victim.Fd())
+		}
 	}
 }

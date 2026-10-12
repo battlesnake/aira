@@ -213,3 +213,42 @@ func TestSkillDocumentsTheArmedCPUWeightCurve(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-210 -- the audit rule: a declared enum must accept every value
+// the system itself prints for that argument. A merged run's only output ref is
+// named "log" (runner openOutputs), `run-log --stream merged` answers with
+// "stream":"log" and `show RUN-n` lists output_refs key "log", and the run-log
+// handler looks that name up directly, so "log" was accepted at the CLI before the
+// dispatch check existed and must still be.
+func TestRunLogStreamEnumAcceptsTheNameTheSystemPrints(t *testing.T) {
+	c := New(nil)
+	spec := c.verbs["run-log"]
+	for _, stream := range []string{"out", "err", "merged", "log", "LOG"} {
+		out, err := canonicalEnumArgs(spec, map[string]any{"stream": stream})
+		if err != nil {
+			t.Fatalf("run-log --stream %s refused: %v", stream, err)
+		}
+		if want := strings.ToLower(stream); out["stream"] != want {
+			t.Fatalf("run-log --stream %s canonicalised to %#v, want %q", stream, out["stream"], want)
+		}
+	}
+	if _, err := canonicalEnumArgs(spec, map[string]any{"stream": "stdout"}); err == nil {
+		t.Fatal("run-log --stream stdout must stay refused")
+	}
+}
+
+// verifies: AIRA-299 -- the generated Skill tells a gate author that the
+// command gate's tree holds the gate's own definition and canary files (now
+// written with `&<>` literally), so a whole-tree marker scan sees its own argv.
+func TestSkillDocumentsTheGateTreeHoldsItsOwnDefinitionFiles(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill := string(artifacts.SkillMD)
+	for _, want := range []string{"gate's own definition and canary files", "Point the scan at a source directory, never at `.`"} {
+		if !strings.Contains(skill, want) {
+			t.Fatalf("generated Skill does not document %q", want)
+		}
+	}
+}

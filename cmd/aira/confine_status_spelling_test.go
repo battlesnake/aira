@@ -48,6 +48,14 @@ func TestConfineStatusHyphenSpellingMatchesTheFlagSpelling(t *testing.T) {
 		{"json, unknown selector", []string{"confine-status", "nosuch", "--json"}, []string{"confine", "--status", "nosuch", "--json"}},
 		{"bad owner", []string{"confine-status", "--owner", "not an owner!"}, []string{"confine", "--status", "--owner", "not an owner!"}},
 		{"explicit owner", []string{"confine-status", "--owner", "session-b"}, []string{"confine", "--status", "--owner", "session-b"}},
+		// The two spellings share ONE parser, so a malformed or ambiguous argument
+		// list is refused (or accepted) identically, not just a well-formed one.
+		{"empty owner", []string{"confine-status", "--owner", ""}, []string{"confine", "--status", "--owner", ""}},
+		{"duplicate owner", []string{"confine-status", "--owner", "alpha", "--owner", "beta"}, []string{"confine", "--status", "--owner", "alpha", "--owner", "beta"}},
+		{"inline owner", []string{"confine-status", "--owner=alpha"}, []string{"confine", "--status", "--owner=alpha"}},
+		{"unknown option", []string{"confine-status", "--bogus"}, []string{"confine", "--status", "--bogus"}},
+		{"slice option", []string{"confine-status", "--slice", "x"}, []string{"confine", "--status", "--slice", "x"}},
+		{"two selectors", []string{"confine-status", "a", "b"}, []string{"confine", "--status", "a", "b"}},
 	}
 	for _, pair := range pairs {
 		for _, terminal := range []bool{false, true} {
@@ -72,8 +80,19 @@ func TestConfineStatusHyphenSpellingMatchesTheFlagSpelling(t *testing.T) {
 func TestConfineStatusHyphenSpellingRefusesTwoSelectors(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
 	exit, stdout, stderr := confineStatusRun(t, false, "confine-status", "a", "b")
-	if exit != 2 || !strings.Contains(stdout+stderr, "E_CONFINE_ARGUMENT_INVALID") || !strings.Contains(stdout+stderr, "at most one selector") {
+	if exit != 2 || !strings.Contains(stdout+stderr, "E_CONFINE_ARGUMENT_INVALID") {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+}
+
+// The shared parser must not swallow the verb's own help request.
+func TestConfineStatusHyphenSpellingStillAnswersHelp(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	for _, flag := range []string{"--help", "-h"} {
+		exit, stdout, stderr := confineStatusRun(t, true, "confine-status", flag)
+		if exit != 0 || !strings.Contains(stdout, "confine-status") {
+			t.Fatalf("confine-status %s: exit=%d stdout=%q stderr=%q", flag, exit, stdout, stderr)
+		}
 	}
 }
 

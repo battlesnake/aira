@@ -2191,7 +2191,10 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}},
 		"run-log": {Name: "run-log", Usage: "run-log <run-id> [--stream out|err|merged] [--follow --from N --tail N --full --grep PATTERN]", Args: []ArgSpec{
 			stringSpec("run_id", true, true, "Run identifier"),
-			stringSpec("stream", false, false, "Captured stream", "out", "err", "merged"),
+			// "log" is the name a merged run's single output is stored and reported
+			// under (run-log's own response and `show`'s output_refs), the same stream
+			// "merged" selects; the system must accept the name it prints.
+			stringSpec("stream", false, false, "Captured stream (log is the stored name of a merged run's output, the same stream as merged)", "out", "err", "merged", "log"),
 			boolSpec("follow", false, false, "Observe until terminal"),
 			stringSpec("from", false, false, "Byte offset"),
 			stringSpec("tail", false, false, "Number of bytes from the end"),

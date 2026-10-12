@@ -336,6 +336,21 @@ output equals `json.MarshalIndent` except for the three characters. It is export
    file exists in aira or fastest-ee.
 3. The rebuildable `gates.definition_json` index text changes form at the next reindex. Nothing
    compares it (grep: only the `INSERT`, `gate_index.go:302`).
+4. **Verdicts, not only bytes (found at build review, v3).** The same fact as item 2 reaches the
+   checker: a command gate is given every tracked file except `.aira/tickets/` and
+   `.aira/findings/` (AIRA-285 deliberately left gate and canary files in), so a whole-tree
+   marker scan reads the gate's own argv and the canary's mutation body. With `&<>` escaped a
+   marker holding one of those characters happened not to match its own definition; with them
+   literal it does, like every other marker already did. Measured: a "no X anywhere" gate over
+   `.` now FAILS on a clean tree (false fail), and an "X must be present" gate over `.` now
+   PASSES on its own definition (trusted false pass, when no source file carries X and the
+   canary does not seed one). Both existed on base for markers with none of `&<>"\`; this
+   change removes the accidental exemption for `&<>`. No gate or canary file exists in aira or
+   fastest-ee, so nothing changes today. Recorded in the skill text (command-gate paragraph) and
+   release notes; pinned both ways, with the mitigation (scan a source directory, never `.`),
+   by `TestWholeTreeMarkerGateSeesItsOwnDefinitionFiles`. Root-cause fix (leave gate and canary
+   files out of the checker's tree, a change to AIRA-285's recorded decision) is not in this
+   batch.
 
 There is no compatibility obligation (AIRA not live). This section exists so the reader knows
 the attestation chain is untouched.
@@ -569,6 +584,10 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race 
   path blocks the event loop forever while a stop is queued; the executor and pump are joined
   before queuing, as today. Known and unchanged: a foreground execute blocks the loop on
   `Press Enter` with signals swallowed, so the stop waits for the operator (3.4, invariant 8).
+- **Gate verdicts (299).** Literal `&<>` in gate and canary files means a whole-tree marker gate
+  sees its own definition for markers holding those characters too (3.7 item 4): a clean tree
+  can fail a "none of X" gate and a "X must be present" gate can pass on its own argv. Scan a
+  source directory, not `.`. No such gate exists in aira or fastest-ee.
 - **Skill text** (208's sentence) needs a separate `aira skill install ~/.claude/skills/aira
   --force` at release.
 
@@ -592,7 +611,10 @@ speed, naming these changes:
 - the `cpu-weight=` facet format;
 - `LIVE=unsupervised`;
 - exit 1 to exit 2 for `mv`, `link` and `set status` token typos;
-- MCP enum faults now arriving as tool errors.
+- MCP enum faults now arriving as tool errors;
+- gate and canary files now write `&`, `<`, `>` literally, so whole-tree marker gates see their
+  own definition for such markers (scan a source directory, not `.`; 3.7 item 4);
+- `req ls --status <anything>` is refused (ls never filtered by status; MCP already refused it).
 
 ## 11. Review log (v1 -> v2)
 
