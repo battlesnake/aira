@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-237","project":"aira","title":"aira: id-accepting ticket-import verb + configurable project-prefix (fastest.ee coordination substrate)","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["import"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-237","project":"aira","title":"aira: id-accepting ticket-import verb + configurable project-prefix (fastest.ee coordination substrate)","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["import"],"hold":false,"relations":[]}
 ---
 PLANNED — captured from a live owner+peer design reconciliation (2026-09-13). DEFERRED behind the owner's shape decision; do NOT build until greenlit AND the shape is chosen. Peers: subpipe (fastest.ee-side extractor/adoption), speed (routing/mgmt). This ticket is the aira-SIDE substrate (aira development = my lane); the fastest.ee-side extractor is subpipe's.
 
@@ -41,3 +41,11 @@ The import verb is needed in ALL three (nothing throwaway); (3) is a pure additi
 - The shape (b/2/3) — owner's call via speed. Spec to the chosen shape.
 - Status-vocabulary mapping (fastest.ee statuses -> aira 7-state enum): extractor emits aira-canonical, or aira config carries a map.
 - Per-topic ownership: aira has per-TICKET leases only; hard topic->session enforcement is net-new machinery — recommend CONVENTION (prefix/label = topic + lease) over building it, unless a concrete need arises.
+
+## Triage 2026-10-12 (goal: clear remaining known issues)
+
+**Disposition:** done. **State on master v0.34:** already-fixed.
+
+All three components and the build checklist shipped in v0.8 with tests; the owner's shape decision (b/2/3) was made (shape 2, allocator-migration). Nothing remains to build. The two deferred items in the ticket (status-vocabulary mapping, per-topic ownership enforcement) were explicitly recommended as convention or extractor-side, and building them would violate 'primitives not judgement'. Just close the ticket as done.
+
+**Evidence:** Built and merged in v0.8 (PR #140, merge 7dbc985; commits 7fdb10d, 4a02dd4, 5fd1281, 1ec7349, 50d4d39, cd26ff7). Component 1 import verb: `aira import --tickets <file.jsonl>` in internal/store/import_tickets.go and internal/core/import_tickets_verb_test.go; CLI flags in cmd/aira/main.go:868/910 (`tickets`, `strict`, `allocated-max`). Component 2 id_prefix: internal/app/project.go:89-94 (IDPrefix config) with strip/prepend in internal/core/display_id.go. Component 3 allocator HWM seed: upsertImportedCounter at internal/store/import_tickets.go:725-731 (MAX(current, N+1) upsert on id_counters). Checklist tests exist: TestE2ESeedMintForwardRoundTrip (import_tickets_e2e_test.go:24, round-trip no-stomp), TestImportTicketsReadMergePreservesCoordination (import_tickets_test.go:210, idempotent re-import keeps relations/lease), TestImportTicketsStatusForceSetBypassesTransition (:295), TestImportTicketsUnchangedAndDisappearReport (:258, disappear reports not deletes), TestImportTicketsTwoPassLinksGroupedByOwner (:313). The ticket file still says status "planned" only because it was never closed (git log of the ticket file shows only the plan commit and the bulk chore commit 5b15bd8).

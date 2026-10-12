@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-190","project":"aira","title":"No reserved-but-not-allocatable prefix mode -- a project wanting aira to recognise its own external ids has to either own allocation or own nothing","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["init","ownership"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-190","project":"aira","title":"No reserved-but-not-allocatable prefix mode -- a project wanting aira to recognise its own external ids has to either own allocation or own nothing","status":"retired","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["init","ownership"],"hold":false,"relations":[]}
 ---
 
 Peer proposal (devproc, 2026-09-08, refined via an adversarial review from
@@ -52,3 +52,11 @@ would likely serve both.
 ## Status
 
 Not designed. Evidence and a sketch only, for whoever picks this up next.
+
+## Triage 2026-10-12 (goal: clear remaining known issues)
+
+**Disposition:** retired. **State on master v0.34:** still-open.
+
+The need is already satisfied: the one named consumer (fastest-ee) cites its own BL-N ids through the id_prefix + import path, and aira never allocates for them. Building the mode would add a third project mode that `id`, `create`, import, `gate` and `lease` must all refuse on, plus counter-transition rules (the AIRA-188 hazard), for a consumer that no longer exists. That is a large, correctness-adjacent new mechanism (ID allocation) with no live need. It runs against "primitives not judgement", architectural simplicity and "keep the primitive + document the gap". Close as won't-fix/satisfied-by-AIRA-237. Re-file with a concrete consumer if one appears, and fold it together with the deferred AIRA-188 `--tickets none` mode (one named project mode, not two booleans), under the two-loop.
+
+**Evidence:** No reserved-only/references-only prefix mode exists. A grep for references-only, reserved prefix and reserved-only finds no code. prefix_ownership (internal/store/store.go:768, 2041-2060) carries only an entity-kind column (ticket/finding/...), and registerDB always creates an id_counters row, so every registered prefix is allocatable. Newly-created prefixes are explicit-only since AIRA-188 (internal/app/project.go:475-478 refuses an unset --prefixes). The reporter's actual use case (fastest-ee owns BL-N allocation externally, wants aira to recognise its ids) was met by AIRA-237/v0.8. Project.id_prefix composes FEE-BL-N (internal/app/project.go:89-94), and `aira import --tickets` preserves externally-allocated ids and never mints them (internal/store/import_tickets.go:15-24). The ticket is status planned, "Not designed here", and carries no relations. The v0.32 spec (docs/superpowers/specs/2026-10-10-aira-v032-small-bugs-design.md:84,557) explicitly deferred the AIRA-188 `--tickets none` mode as "belongs with AIRA-190". No consumer has asked for it since.
