@@ -1,7 +1,8 @@
 # AIRA ledger and receipt integrity: foreign-state writers, requirement re-point, registry growth
 
-Status: PLAN v1 (2026-10-12). Tickets: AIRA-301 (P2 bug), AIRA-297 (P3 bug), AIRA-296 (P3
-chore, rescoped by triage). Base: master `4098ad9` (v0.34 plus ticket-housekeeping merges).
+Status: PLAN v2 (2026-10-12; v1 reviewed by two lineages, findings applied or rejected in
+section 11). Tickets: AIRA-301 (P2 bug), AIRA-297 (P3 bug), AIRA-296 (P3 chore, rescoped by
+triage). Base: master `4098ad9` (v0.34 plus ticket-housekeeping merges).
 
 **Correctness-critical: all of AIRA-301 (ID allocation, the shared audit log) and AIRA-297
 (Rebuild's allocation projection).** Both go through the two-loop adversarial build review.
@@ -30,9 +31,10 @@ lines kept). Agents cannot do that repair: they are blocked from editing `.git`.
 mechanism, reproduced below: the private database had never seen this repository, so its
 counters started at 1 and handed out AIRA-1, AIRA-2, ... with sequence numbers 1, 2, ....
 A create appends its receipt *before* it writes the ticket file, so a create that then fails
-`E_WRITE_CONFLICT` (the file already exists) still leaves its receipt. A receipt that is
-byte-identical to a real one is deduplicated, which is consistent with 71 creates leaving 68
-lines (inferred, not checked against the truncated file).
+`E_WRITE_CONFLICT` (the file already exists) still leaves its receipt. The receipt writer
+skips a receipt whose project, ID and sequence number all match an existing line
+(`store.go:2540`; other fields are not compared). Why 71 creates left 68 lines was not
+established; the truncated file is gone.
 
 **Root cause: two rules the design states but nothing enforces.**
 
@@ -41,7 +43,8 @@ lines (inferred, not checked against the truncated file).
    `E_RECONCILE_REQUIRED` (`2026-08-08-aira-phase1-design.md:567`, `:624`), and that a new
    machine database is rebuilt from the common-dir journals and receipts (`:205`). Nothing
    implements it: `registerDB` seeds a never-seen project's sequence counter at 1
-   (`store.go:2064-2065`) whatever the log already holds, and `E_RECONCILE_REQUIRED` is
+   (`store.go:2064-2065`) whatever the log already holds, `nextSequence` invents a counter
+   row at 1 when none exists (`store.go:3434-3438`), and `E_RECONCILE_REQUIRED` is
    catalogued but produced nowhere (`internal/codes/produced_test.go:86`).
 2. *One state writes a repository's audit log.* AIRA's design is one machine-wide state
    (one daemon per state directory, AIRA-289), but nothing stops a second state from
@@ -49,28 +52,36 @@ lines (inferred, not checked against the truncated file).
 
 | Ticket | Still reproduces? | Evidence (2026-10-12, `4098ad9`) | Verdict |
 |---|---|---|---|
-| AIRA-301 foreign state appends receipts | Yes, measured | Store-level reproduction (probe in `~/tmp`, not committed): owner state creates 3 tickets, updates one twice, creates 2 more. A second state (different `state.db`, same common dir, same checkout) runs 5 creates: all 5 return `E_WRITE_CONFLICT`, yet `receipts.jsonl` grows from 5 to 7 lines (AIRA-4 seq 4, AIRA-5 seq 5; the first three were byte-identical twins of the owner's receipts and were deduplicated). Owner `Rebuild`: `E_JOURNAL_CORRUPT: receipt AIRA-4 has seq 4 but allocation has seq 6`; owner `Check`: verdict fail, `rebuild-integrity` fail. Variant from an empty checkout of the same repository: the second state writes 4 ticket files and 4 receipts, its journal appends are refused (`journal key conflict`, the existing guard at `store.go:3882-3885`), and the owner's Rebuild fails the same way. | Build |
+| AIRA-301 foreign state appends receipts | Yes, measured | Store-level reproduction (probe in `~/tmp`, not committed): owner state creates 3 tickets, updates one twice, creates 2 more. A second state (different `state.db`, same common dir, same checkout) runs 5 creates: all 5 return `E_WRITE_CONFLICT`, yet `receipts.jsonl` grows from 5 to 7 lines (AIRA-4 seq 4, AIRA-5 seq 5; the first three matched the owner's receipts on project, ID and sequence number and were skipped). Owner `Rebuild`: `E_JOURNAL_CORRUPT: receipt AIRA-4 has seq 4 but allocation has seq 6`; owner `Check`: verdict fail, `rebuild-integrity` fail. Variant from an empty checkout of the same repository: the second state writes 4 ticket files and 4 receipts, its journal appends are refused (`journal key conflict`, the existing guard at `store.go:3882-3885`), and the owner's Rebuild fails the same way. | Build |
 | AIRA-297 requirement allocation never re-pointed | Yes, measured | Requirement AR-1 allocated in `wt-a` (`AllocateID("AR")`), a valid `AR-1.md` only in `wt-c`; `c.Check()` reports `E_ID_UNRESOLVED AR-1 allocation has no materialised requirement file`, and the allocation path still names `wt-a`. Control in the same test: ticket AIRA-1 in the identical shape is re-pointed to `wt-c` and resolves (the ticket loop's guarded UPDATE, `store.go:3127-3131`; the requirement loop, `store.go:3141-3201`, has none). No crash and no worktree removal are needed to show it. | Build |
-| AIRA-296 registry growth | Growth is real; the cheap remainder has a cost | On a copy of `~/.local/state/aira/registry.jsonl` taken 2026-10-12: 2,366 records, 738,108 bytes, 232 distinct identities, 228 roots of which 33 still exist. 2,134 records (90.2 %) are identical to the latest earlier record for the same project and root. Last 7 days: 42-151 records per day, 38-150 of them such duplicates. A prototype that skips an identical breadcrumb removes that growth but breaks three tests that use the registry line count as their registration counter (section 7). | Drop from this batch, design recorded |
+| AIRA-296 registry growth | Growth is real; the cheap remainder has a cost | On a copy of `~/.local/state/aira/registry.jsonl` taken 2026-10-12: 2,366 records, 738,108 bytes, 14 distinct project ids (and 14 common directories), 228 distinct worktree ids and 228 distinct roots, of which 33 roots still exist. 2,134 records (90.2 %) are identical, apart from `at`, to the latest earlier record for the same project and root. Last 7 days: 42-151 records per day, 38-150 of them such duplicates. A prototype that skips an identical breadcrumb removes that growth but breaks three tests that use the registry line count as their registration counter (section 7). | Drop from this batch, design recorded |
 
 ## 2. Greenfield minimum, and rejected alternatives
 
-If AIRA-301 had to be solved alone, from nothing: **a database whose counters were never set
-from the log must not hand out a number.** One "not yet set" value in the counter row and
-one refusal where numbers are handed out. A 21-line prototype of exactly that (section 5.4)
-stops the incident: the foreign state writes zero receipt lines, zero journal lines and zero
-ticket files, and the owner's Rebuild stays clean.
+If AIRA-301 had to be solved alone, from nothing, the minimum is three pieces:
 
-That alone leaves one gap that this batch also closes, because the fix itself would open it:
-the refusal tells the caller to run `aira reconcile --rebuild`. An agent in the wrong
-directory that follows that advice turns its private state into an up-to-date *second
-writer* of the real log. A second writer that is up to date collides with the owner later,
-in the sequence-number space: the owner's next event gets a sequence number the foreign
-state already journaled, the journal refuses the owner's line, and the owner's own database
-then disagrees with the journal, so the **owner's** Rebuild fails. The only recovery is to
-move the machine-wide `state.db` aside, which loses every project's leases and telemetry. So
-the second rule (one writer per log) is built too, as a small marker file naming the owning
-state.
+1. **A counter that was never set from the log is explicit, and refused.** A missing counter
+   row or the value 0 means "not yet set"; the one place numbers are handed out refuses it
+   with `E_RECONCILE_REQUIRED`, inside the minting transaction, before any side effect.
+2. **One atomic ownership claim per repository, decided before side effects.** A marker file
+   names the owning state. It is created with an exclusive create, never overwritten, and is
+   decided at registration, before the registration writes anything.
+3. **A claim needs proof that the state has absorbed the log**, not just a positive counter.
+   A database written before this change may hold a counter seeded at 1 against a populated
+   log (`store.go:2064`), indistinguishable from an honest counter by its value. The proof is
+   cheap and needs no new column: the counter must exceed the highest sequence number the
+   log holds for the project (the "high water"). The state that wrote the log always passes;
+   a stale state does not. The test runs only while a repository is unmarked, so its full
+   log read happens once per repository for the owner.
+
+Why piece 1 alone is not enough: its refusal advises `aira reconcile --rebuild`. An agent in
+the wrong directory that follows that advice turns its private state into an up-to-date
+*second writer*, which collides with the owner later in sequence-number space (the owner's
+next event gets a sequence number the foreign state already journaled; the journal refuses
+the owner's line; the owner's Rebuild fails; the only recovery is moving the machine-wide
+`state.db` aside, which loses every project's leases and telemetry). Pieces 2 and 3 close
+that for every repository the owner has claimed. They do not close it for a repository that
+is still unmarked (section 7, residual 1).
 
 AIRA-297's minimum is the one guarded UPDATE the ticket loop already has. The two Rebuild
 loops are 60-line near-duplicates, so the UPDATE goes into one shared helper both loops call,
@@ -79,12 +90,19 @@ which deletes the duplicate and a one-line alias.
 | Item | Alternative | Why rejected |
 |---|---|---|
 | 301 | Only refuse a receipt whose ID or sequence number already appears with a different partner (check at append) | Fires only after the foreign database has committed its allocation, so that database is left inconsistent; misses a sequence number that collides with a journal line rather than a receipt; does nothing for non-ID writes (`aira set` writes the ticket file before its journal append). The counter rule refuses inside the minting transaction, before anything is committed. |
-| 301 | Before every mint, read the log's highest sequence number and refuse if the counter is not above it | Also catches a database restored from an old copy, but adds a full journal read to every mutation (the journal append already does one), and still allows an up-to-date second writer. |
-| 301 | Rebuild automatically when a database first meets a project (the phase-1 spec's "full scan during machine DB creation") | A foreign state would then silently adopt the real repository and become the up-to-date second writer described above. Refuse instead; rebuilding stays an explicit act. |
-| 301 | Identify the owner by a random token stored in the database instead of the state directory path | Would also catch a recreated database in the owner's own directory, but then every database-loss recovery needs a takeover step. The counter rule already covers a recreated database, so the path is enough and keeps recovery as it is (`aira reconcile --rebuild`). |
-| 301 | Claim the marker only at `aira init` | Every existing repository would stay unguarded until someone runs init in it. Claiming at the owner's first registration covers them all at cutover. |
+| 301 | Before every mint, read the log's high water and refuse if the counter is not above it | Also catches a database restored from an old copy, but adds a full log read to every mutation. v2 does this read only while a repository is unmarked (the claim test), not per mint. |
+| 301 | Claim when the counter is merely set (`next_seq >= 1`), as v1 did | A pre-upgrade database seeded at 1 against a populated log passes it and could claim an unmarked repository and mint colliding numbers (review finding, section 11). Replaced by "counter above the log's high water". |
+| 301 | A "hydrated" column, set only by Rebuild or by a first registration on an empty log | Equivalent proof, but every existing counter row on the box would start un-hydrated, so the owner's daemon would refuse every mutation in every repository until someone runs `aira check` there. The high-water test gives the same proof with no schema change and no cutover outage. |
+| 301 | Rebuild automatically when a database first meets a project (the phase-1 spec's "full scan during machine DB creation") | A foreign state would then silently adopt the real repository and become the up-to-date second writer. Refuse instead; rebuilding stays an explicit act. |
+| 301 | Identify the owner by a random token stored in the database instead of the state directory path | Would also catch a recreated database in the owner's own directory and states at the same path in different mount namespaces, but then every database-loss recovery needs a takeover step. The counter rule already covers a recreated database; the path residual is stated (section 7). |
+| 301 | Claim at the first audit append (v1) | Lets any append path, including Rebuild under `aira check`, take ownership, and puts claims in three places. v2 claims in one function, called at registration and once inside Rebuild (3.2), under one rule. |
+| 301 | Claim only at registration, never inside Rebuild (a review suggestion) | Rebuild appends recovered receipts after its transaction commits. With appends requiring the marker, a recovering owner in an unmarked repository would fail its first Rebuild and succeed only on the next command. Calling the same claim function after Rebuild's commit changes nothing about who may claim (Rebuild has just made the counter exceed the high water, so the next registration would claim anyway) and removes the failing first run. |
+| 301 | Claim only at `aira init` | Every existing repository would stay unguarded until someone runs init in it. Claiming at the owner's first registration covers them all at cutover. |
+| 301 | Write the marker to a temporary file and hard-link it into place (v1) | Hard links are doubtful on DrvFS. An exclusive create (`O_CREAT|O_EXCL`) is simpler; the price is a zero-length file visible for the moment between create and write, handled in 3.2. |
+| 301 | A mint-time marker read in `nextSequence` | Every CLI command re-runs `Register` before it acts (cached daemon scopes too, `server.go:1357-1358`), so ownership is already decided before each command's first mutation. A per-mint file read would only cover a marker changed by hand in the middle of one command; the append-time refusals cover the shared log in that window (3.2). |
 | 301 | A takeover verb (`aira init --take-ownership`) | Needed only when the owner deliberately moves their state directory. A documented manual step is enough; a verb would also be a verb a wrong-directory agent could run. |
-| 301 | Make Rebuild skip a contradicting receipt and report it as a finding | Deferred with its design recorded (section 7). After both rules ship, no current writer can produce a contradiction; today's behaviour on one is already fail-closed and named in `aira check`; tolerance needs a precedence rule (first line wins, journal wins over receipts) inside the correctness-critical Rebuild. Instead, the existing refusal is made to name the contradicting receipt's worktree, path and time (3.1 A.3), so a hand repair is a one-line search. |
+| 301 | Make Rebuild skip a contradicting receipt and report it as a finding | Deferred with its design recorded (section 7). Today's behaviour on one is already fail-closed and named in `aira check`; tolerance needs a precedence rule inside the correctness-critical Rebuild. Instead, the existing refusal is made to name the contradicting receipt's worktree, path and time (3.1 A.4), so a hand repair is a one-line search. |
+| 301 | Keep `nextSequence`'s no-row branch (v1) | It contradicts rule 1 directly: a row that does not exist was never set from the log, yet it hands out 1. Deleted (3.1 A.2). Measured on a probe: `internal/core`, `internal/app` and `cmd/aira` stay `ok`; the one store test found to depend on it builds a `Store` by hand without a counter row (`watch_test.go:107`) and is fixed by seeding the row (section 5.4). |
 | 297 | Copy the guarded UPDATE into the requirement loop | Two copies of a 60-line block that must stay identical. One helper, and one mutation then reds both kinds' pins. |
 | 296 | Compact or prune dead breadcrumbs | Declined by triage: AIRA-88 and AIRA-209 decided a dead breadcrumb stays as recoverable evidence. |
 | 296 | Skip writing a breadcrumb identical to the latest one for the same project and root | Measured and prototyped; deferred for its test-seam cost (section 7). |
@@ -95,52 +113,51 @@ which deletes the duplicate and a one-line alias.
 
 Files: `internal/store/store.go`, `internal/codes/produced_test.go`.
 
-**A.1 Honest counter seed.** `registerDB` (`store.go:2021`) computes, before its transaction,
-`seed := 1`, or `0` when `auditLogPresent(s.auditDir)` is true, and inserts
-`event_counters(project_id, next_seq) VALUES(?, seed) ON CONFLICT(project_id) DO NOTHING`
-(today the literal `1`, `store.go:2064-2065`).
+**A.1 The log's high water.** New helper
+`auditHighWater(auditDir, projectID string) (h int64, known bool)`: the largest `seq` over the
+lines of `receipts.jsonl` and `journal.jsonl` whose project id is `projectID`, using the same
+decoders Rebuild uses. Both files absent: `(0, true)`. Any other read or decode error:
+`known=false`, which every caller treats in the conservative direction (no seed of 1, no
+claim). It reads the whole log, so it is called only where 3.2 says: for a counter row about
+to be created, and while a repository is unmarked.
 
-- New helper `auditLogPresent(auditDir string) bool`: true when `receipts.jsonl` or
-  `journal.jsonl` in `auditDir` has size > 0, or when either cannot be `stat`ed for any
-  reason other than "does not exist" (an unreadable log is treated as present: the
-  conservative direction, which costs at most one rebuild).
-- It does not filter by project id. In production one common directory is one project (the
-  project id is the hash of the canonical common directory, `store.go:595`), so a non-empty
-  log there is this project's. A test that shares a common directory between two project ids
-  would see a conservative "rebuild first"; the prototype run found none.
-- Existing rows are untouched (`DO NOTHING`): the box's database already has a counter row
-  for every project it serves, so there is no upgrade step.
+**A.2 Honest counter seed, and no invented counter.**
+
+- `registerDB` (`store.go:2021`) seeds a new `event_counters` row with 1 when the high water
+  is known and 0, otherwise with 0 (today the literal `1`, `store.go:2064-2065`). Existing
+  rows are untouched by the seed (`DO NOTHING`); the one change to an existing row is the
+  demotion in 3.2.
+- `nextSequence` (`store.go:3431`): no row, or `next < 1`, returns
+  `E_RECONCILE_REQUIRED: this AIRA state has not read the audit log of project <id>, so its counters cannot be trusted. If this is your repository and your usual AIRA state, run 'aira reconcile --rebuild' (or 'aira check'). If you did not expect to be in this repository, stop: rebuilding would make this state a writer of its log. Nothing was committed.`
+  The no-row branch that inserts 2 and returns 1 (`store.go:3434-3438`) is deleted.
 - The value 0 is not a valid next sequence number (sequence numbers start at 1), so it reads
-  as "not yet set from the log" without a new column. Rebuild's existing counter upsert
+  as "not yet set from the log" without a new column. Rebuild's counter upsert
   (`store.go:2990-2994`, `CASE WHEN event_counters.next_seq < excluded.next_seq`) lifts 0 to
-  the log's high water plus one, which is what "absorbed" means. `aira check` and
-  `aira reconcile --rebuild` both run Rebuild; init adoption runs Rebuild before
-  `RegisterBootstrap`, whose `DO NOTHING` keeps Rebuild's value.
-
-**A.2 Refuse at the one place numbers are handed out.** `nextSequence` (`store.go:3431`):
-after reading the row, `next < 1` returns
-`E_RECONCILE_REQUIRED: this AIRA state has not read the audit log of project <id> yet, so its counters cannot be trusted; run 'aira reconcile --rebuild' (or 'aira check') first. Nothing was written.`
-
+  the log's high water plus one, which is what "absorbed" means. That upsert runs *before*
+  Rebuild's scanned-file loops, which themselves mint recovered allocations
+  (`store.go:3089`, `:3164`); the order is load-bearing and gets its own test and mutation
+  (5.1). `aira check` and `aira reconcile --rebuild` both run Rebuild.
 - Every sequence number in the store comes from `nextSequence` (20 call sites, all in
   `internal/store`: tickets, IDs, requirements, imports, leases, supervisor leases, rants,
-  retire, watch). So one check covers ID allocation and every journaled event. The refusal
-  happens inside the caller's `BEGIN IMMEDIATE` transaction, which rolls back, so nothing is
-  committed: no allocation row, no receipt, no ticket file, no journal line.
-- The no-row branch (`INSERT ... 2`, return 1) is left as it is: every production path that
-  mints runs in a registered scope (whose `registerDB` seeded the row) or after Rebuild's
-  upsert created it.
-- Because of part B, a *foreign* state never reaches this refusal (it is stopped at
-  registration). This message is seen only by the owner's own recreated database, where its
-  advice is right.
+  retire, watch). The refusal happens inside the caller's `BEGIN IMMEDIATE` transaction,
+  which rolls back. "Nothing was committed" holds only if each call site mints before it
+  writes a file or a log line; the creates and path mutations read for this plan do
+  (`prepareCreate`, `preparePathMutation` run before `appendReceiptIfMissing` and
+  `materialiseIntent`, `store.go:2151-2160`, `:2337-2345`). The build checks the remaining
+  sites one by one, and any site that writes before minting is a finding, not a silent pass.
 
-**A.3 Name the contradicting receipt.** `ensureReceiptAllocation`'s seq-mismatch refusal
+**A.3 Codes.** Delete `E_RECONCILE_REQUIRED` from `cataloguedNotProduced`
+(`produced_test.go:86`); measured: `TestDivergenceTablesAreCurrent` fails until it is
+removed. Its exit stays 4. That is a deliberate carry-over, not the 1-versus-2 rule of
+`codes.go:25-30` (by that rule a refusal that succeeds once the state changes would be 1):
+the code is pinned at 4 in the store-integrity family with its runner analogue
+`E_RUN_RECONCILE_REQUIRED` (`produced_test.go:282`, `codes.go:203`, `:265`), and moving it
+would move that family.
+
+**A.4 Name the contradicting receipt.** `ensureReceiptAllocation`'s seq-mismatch refusal
 (`store.go:3267`) appends the receipt's `worktree_id`, `path` and `at` and the file it came
 from (`inspect <common>/aira/receipts.jsonl`), as the AIRA-93 message in
 `ensureAllocationEvent` already does for the journal (`store.go:3329`). Code unchanged.
-
-**Codes.** Delete `E_RECONCILE_REQUIRED` from `cataloguedNotProduced`
-(`produced_test.go:86`); measured: `TestDivergenceTablesAreCurrent` fails until it is
-removed. Its exit bucket stays 4 (pinned at `produced_test.go:282`).
 
 ### 3.2 AIRA-301 part B: one owner per audit log
 
@@ -151,51 +168,77 @@ New file `internal/store/audit_owner.go`; call sites in `store.go`; a new code.
 `canonicalPath(filepath.Dir(s.dbPath))` (symlinks resolved, `store.go:682`), the same for
 the daemon and for an in-process store on the same state.
 
-**Functions.**
+**Reading it.** `readAuditOwner()` returns one of: absent (does not exist), ours, other
+(names a different directory), unreadable (read error, invalid JSON, empty `state_dir`, a
+directory in its place). A zero-length file is re-read up to three times 20 ms apart, because
+an exclusive create is visible for a moment before its content is written; still empty after
+that, it is unreadable (a claim that crashed between create and write). Unreadable is never
+treated as absent.
 
-- `readAuditOwner() (owner string, present bool, err error)`: "does not exist" is absent. A
-  read error, invalid JSON, an empty `state_dir`, or a directory in place of the file is an
-  error, never "absent": `E_STATE_NOT_OWNER: the owner marker <path> is unreadable (<detail>); refusing to write. Nothing was written.`
-- `refuseForeignOwner() error`: present and not equal to this state's directory returns
-  `E_STATE_NOT_OWNER` (message below).
-- `claimAuditOwner() error`: write the JSON to a temporary file in the audit directory,
-  `fsync`, then `os.Link` it to `owner.json` (atomic and never overwrites), remove the
-  temporary file, `fsync` the directory. On "already exists", re-read and compare
-  (`refuseForeignOwner`). Never `os.WriteFile`/truncate.
-- `requireAuditOwner(ctx) error`: `refuseForeignOwner`; if the marker is absent and this
-  state's counter for the project is set (`event_counters.next_seq >= 1`), claim; if absent
-  and the counter is not set, return nil (part A stops that state from minting, so it can
-  never append).
+**Claiming it.** `claimAuditOwnerIfEligible(ctx, counter int64) (claimed bool, err error)`, the
+only function that creates the marker:
 
-**Call sites (the guard is the two writers of the log, plus an early door).**
+1. Eligible only if the high water is known and `counter > highWater` (3.1 A.1). Not
+   eligible: return `false, nil`.
+2. `os.MkdirAll(<common>/aira)` (a fresh repository may register before anything else has
+   created the directory), then `open(owner.json, O_CREAT|O_EXCL|O_WRONLY)`, write the line,
+   `fsync` the file, `fsync` the directory.
+3. "Already exists" (another process won the race): re-read; ours is success, anything else
+   is `E_STATE_NOT_OWNER`. Nothing ever truncates or rewrites the marker.
 
-1. `Register` (`store.go:1975`) and `RegisterBootstrap` (`store.go:2003`): call
-   `refuseForeignOwner` first (after the ejection check, before the breadcrumb), then, after
-   `registerDB`, `requireAuditOwner`. A foreign state is therefore refused before it writes
-   anything: no breadcrumb, no database row, no worktree file, no audit line. Every verb
-   that opens a project scope, reads included, fails with the reason. That is intended: the
-   incident was an agent that did not know it was in the real repository.
-2. `appendReceiptIfMissing` (`store.go:2506`, the only writer of `receipts.jsonl`, verified
-   by grep), before it takes the receipts lock.
-3. `journalEvent` and `journalEventBounded` (`store.go:2469`, `:2488`, the only callers of
-   `appendEventIfMissing*`, the only writers of `journal.jsonl`), before the append.
+**Refusal text.** `E_STATE_NOT_OWNER: <common>/aira belongs to the AIRA state at <owner>; this process uses <ours> (HOME or XDG_STATE_HOME differ). If this is not the repository you meant, check your working directory. To move this repository to this state on purpose, stop the other state's daemon, then remove <common>/aira/owner.json.` For an unreadable marker: `E_STATE_NOT_OWNER: the owner marker <path> is unreadable (<detail>); refusing to write. If no AIRA process is claiming this repository right now, remove <path> by hand.` Each call site below adds what it did and did not write.
 
-The append-time checks are what make the rule structural: they also cover
-`NewUnregisteredScope` (init adoption runs Rebuild, which may append recovered receipts,
-before `RegisterBootstrap`) and a daemon's cached scope if the marker changes underneath it.
+**Call sites.**
 
-**The claim rule, in one sentence:** a state whose counter is set claims an unowned log at its
-first registration or first append, whichever comes first; a state whose counter is not set
-never claims; nothing ever overwrites the marker. At cutover the box daemon's discovery pass
-re-registers every registered worktree, so every live repository is claimed by the owner
-within one pass (about 33 s).
+1. **Registration decides ownership before it writes anything.** `Register`
+   (`store.go:1975`) and `RegisterBootstrap` (`store.go:2003`), after the ejection check and
+   before the breadcrumb:
 
-**Refusal text.** `E_STATE_NOT_OWNER: <common>/aira belongs to the AIRA state at <owner>; this process uses <ours> (HOME or XDG_STATE_HOME differ). Nothing was written. If this is not the repository you meant, check your working directory. To move this repository to this state on purpose, stop the other state's daemon, then remove <common>/aira/owner.json.`
+   | Marker | Action | What this registration writes |
+   |---|---|---|
+   | unreadable or other | refuse `E_STATE_NOT_OWNER` ("Nothing was written.") | nothing |
+   | ours | proceed | breadcrumb, rows; a new counter row is seeded by A.2 |
+   | absent | `counter` = the existing row's value, or for a new row the A.2 seed; call `claimAuditOwnerIfEligible(counter)`; if it refuses, refuse ("Nothing was written."); if it claims, proceed | breadcrumb, rows (only after the claim succeeded) |
+   | absent, and not eligible | proceed without claiming, and **demote**: `registerDB` sets this project's counter to 0 | breadcrumb, rows, counter = 0 |
+
+   Demotion is what makes a stale pre-upgrade counter safe: a state whose counter is not
+   above the log's high water cannot mint (A.2) until it rebuilds. The loser of a concurrent
+   claim is refused before its breadcrumb, so two racing states never both write a
+   registration. Since every CLI command re-runs `Register` before it acts
+   (`server.go:1357-1358` for cached daemon scopes; `NewScope` for fresh ones), a foreign
+   state is refused at the start of every command, reads included. That read refusal is a
+   policy choice, not a requirement of write integrity: it is kept because ownership has to
+   be decided at registration anyway, so refusing there is the one cheapest site, and
+   because the incident was an agent that did not know it was in the real repository. Its
+   false-fail cost is listed in section 8.
+2. **Rebuild never touches a foreign log, and claims only after it has absorbed it.** At its
+   start, Rebuild refuses an unreadable or other marker (read only, before its own database
+   is touched; this covers init adoption, which runs Rebuild in an unregistered scope before
+   `RegisterBootstrap`, and `aira check`). After its transaction commits and before it
+   appends recovered receipts (`store.go:3220-3224`), if the marker is absent it calls
+   `claimAuditOwnerIfEligible` with its freshly upserted counter. Not eligible is then a bug
+   in Rebuild's own counter, and is refused rather than appended.
+3. **Every append requires the marker to name this state.** `appendReceiptIfMissing`
+   (`store.go:2506`, the only writer of `receipts.jsonl`, verified by grep), before it takes
+   the receipts lock, and `journalEvent` / `journalEventBounded` (`store.go:2469`, `:2488`,
+   the only callers of `appendEventIfMissing*`, the only writers of `journal.jsonl`), before
+   the append. Absent, other or unreadable: `E_STATE_NOT_OWNER`. These checks never claim.
+   With sites 1 and 2 in place they fire only when the marker changed by hand while a
+   command was running, so their message is narrower: `... The shared log was not changed.
+   This state's own database, and for an update the ticket file, may already hold this
+   operation (a create commits its allocation before its receipt; an update writes its file
+   before its journal line, store.go:2151-2160, :2337-2345); run 'aira check' once ownership
+   is resolved.`
+
+**The claim rule, in one sentence:** the marker is created only by a state whose counter for
+the project exceeds the log's high water, at registration or after Rebuild's commit, by one
+exclusive create that never overwrites; every other state is either refused (marker names
+someone else) or demoted to "must rebuild first" (marker absent).
 
 **Daemon.** The check runs in the store, i.e. in the process that owns the database. A client
 with a foreign `XDG_STATE_HOME` runs its own daemon on its own state (AIRA-289), and that
 daemon is refused. Read-only stores (`OpenReadOnly`) and `NewUnregisteredScope` lifecycle
-checks write nothing and are not checked.
+checks that write nothing are not checked.
 
 **What the marker guards.** `receipts.jsonl` and `journal.jsonl` only. Other common-directory
 writers (the runner's `runs/` ledger, the gate audit, `locks/`) are outside it (section 7).
@@ -231,25 +274,31 @@ writers (the runner's `runs/` ledger, the gate audit, `locks/`) are outside it (
 
 ## 4. Invariants
 
-1. A state whose counter for a project was never set from that project's audit log hands
-   out no sequence number for it, and therefore no ID, event, receipt or journal line. The
-   refusal is inside the minting transaction: nothing is committed anywhere.
+1. A state hands out a sequence number for a project only from a counter row that exists
+   and is at least 1. The refusal is inside the minting transaction, which rolls back.
 2. A counter is set from the log only by Rebuild (which reads every receipt, journal line,
-   scanned file and ref) or by the first registration of a project whose log is empty.
-3. `receipts.jsonl` and `journal.jsonl` are appended to only by the state named in
-   `owner.json`. Nothing overwrites `owner.json`; a missing one is claimed only by a state
-   whose counter is set.
-4. An unreadable or malformed marker refuses every registration and append; it is never
-   treated as missing.
-5. A foreign state is refused at registration, before it writes a breadcrumb, a database
-   row, a worktree file or an audit line.
-6. Rebuild's receipt handling is otherwise unchanged: a contradicting receipt still aborts
-   it with `E_JOURNAL_CORRUPT`, now naming that receipt's worktree, path and time. No
-   receipt is ever skipped.
-7. A scanned entity file re-points its allocation row only while the row is `allocated`, by
+   scanned file and ref) or by the first registration of a project whose log high water is
+   known to be 0. A registration in an unmarked repository whose counter is not above the
+   high water sets it to 0.
+3. `receipts.jsonl` and `journal.jsonl` are appended to only by a process whose state is
+   named in `owner.json` at the time of the append.
+4. `owner.json` is created only by `claimAuditOwnerIfEligible`, by an exclusive create, by a
+   state whose counter exceeds the log's high water; nothing overwrites or truncates it.
+5. An unreadable, malformed or (after retries) empty marker refuses registration, Rebuild
+   and every append; it is never treated as missing.
+6. A state refused at registration (marker names another state or is unreadable, including
+   the loser of a concurrent claim) has written no breadcrumb, database row, worktree file
+   or audit line.
+7. Rebuild's handling of a current-project receipt that contradicts an allocation is
+   unchanged: it aborts with `E_JOURNAL_CORRUPT`, now naming that receipt's worktree, path and
+   time. Not changed by this batch, and stated so it is not mistaken for a guarantee:
+   Rebuild still skips, without a finding, receipts of another project and current-project
+   receipts with an invalid ID or a sequence number of 0 or less (`store.go:3016-3018`;
+   section 7).
+8. A scanned entity file re-points its allocation row only while the row is `allocated`, by
    one code path for tickets and requirements.
-8. No existing database needs a migration. Set counters and unmarked logs keep working; the
-   owner's first registration after the upgrade claims the marker.
+9. No schema migration. Existing counter rows keep their values except for the demotion in
+   invariant 2; unmarked repositories are claimed by the first eligible registration.
 
 ## 5. Tests (TDD; each must fail against the wrong implementation)
 
@@ -267,52 +316,79 @@ private `HOME`/`XDG_*`; no aira verb runs in a real checkout.
   claim and a rant each return `E_RECONCILE_REQUIRED`; `receipts.jsonl` and `journal.jsonl`
   are byte-identical before and after; no new file under `.aira/`. Then `Rebuild`;
   `CreateTicket` returns the ID after the log's highest and its allocation seq is after the
-  log's highest; a second `Rebuild` is clean. RED on `4098ad9` (the mint succeeds and its
-  receipt contradicts the log). Mutations: seed 1 always; delete the `next < 1` check.
+  log's highest; a second `Rebuild` is clean. RED on `4098ad9`. Mutations: seed 1 always;
+  delete the `next < 1` check.
+- `TestRebuildOnARecreatedStateMintsRecoveredAllocations` (the real crash-recovery shape,
+  false-fail guard): log present, a ticket file with no receipt (the crash window), database
+  recreated (counter 0). `Rebuild` succeeds, mints the recovered allocation with a seq above
+  the log's high water and appends its receipt; a second `Rebuild` is clean. Mutation: move
+  the `store.go:2990-2994` counter upsert after the scanned-file loops (Rebuild then fails
+  `E_RECONCILE_REQUIRED` exactly when it is the advised remedy).
+- `TestNoCounterRowIsRefused`: a store whose project has no `event_counters` row (built the
+  way `watch_test.go:107` builds one): a mint returns `E_RECONCILE_REQUIRED` and no row is
+  created. Mutation: restore the no-row branch.
 - `TestAJournalOnlyLogAlsoBlocksMinting`: the log holds only journal lines (a rant), no
-  `receipts.jsonl`; a recreated database's create is refused. Mutation: `auditLogPresent`
-  looks at `receipts.jsonl` only.
+  `receipts.jsonl`; a recreated database's create is refused. Mutation: the high water
+  reads `receipts.jsonl` only.
 - `TestFirstRegistrationOnAnEmptyLogMintsAtOnce` (false-fail twin): a new project creates
   without a rebuild. Mutation: seed 0 always.
 - `TestInitAdoptionLeavesTheCounterSet`: `NewUnregisteredScope` + `Rebuild` +
   `RegisterBootstrap` on a repository with a log, then a create succeeds. Mutation:
   `registerDB` uses `DO UPDATE SET next_seq=excluded.next_seq`.
-- `TestRebuildContradictionNamesTheReceipt` (A.3): a hand-written contradicting receipt
+- `TestRebuildContradictionNamesTheReceipt` (A.4): a hand-written contradicting receipt
   makes Rebuild fail with a message containing that receipt's path, worktree and `at`.
   Mutation: drop the fields.
 - Codes: `TestDivergenceTablesAreCurrent` is RED until the `cataloguedNotProduced` entry is
-  removed (measured on the prototype).
+  removed (measured on the v1 prototype).
 
 ### 5.2 Part B (`internal/store`, plus one `cmd/aira` e2e)
 
 - `TestAForeignStateIsRefusedAtRegistration`: owner (state X) creates a ticket (claims);
   state Y with the same common directory and checkout: `Open` returns `E_STATE_NOT_OWNER`;
-  both audit files byte-identical; Y's `registry.jsonl` gains no line; no file written. RED
+  both audit files byte-identical; Y's `registry.jsonl` gains no line and Y's database has
+  no `projects`, `worktrees` or `event_counters` row for the project; no file written. RED
   on `4098ad9`. Mutation: drop the `Register` check (Open succeeds).
-- `TestAnUpToDateForeignStateCannotAppend`: Y through `NewUnregisteredScope` + `Rebuild`
-  (counter set, never registered): `CreateTicket` returns `E_STATE_NOT_OWNER` at the receipt
-  append and `receipts.jsonl` is byte-identical; `UpdateTicket` on an existing ticket returns
-  `E_STATE_NOT_OWNER` at the journal append and `journal.jsonl` is byte-identical. (The
-  ticket file `UpdateTicket` writes before its journal append is the residual of this
-  unregistered test seam; production scopes are registered and refused earlier.) Mutations:
-  drop the receipt-append check; drop the journal-append check.
-- `TestTheOwnerMarkerIsClaimedOnlyByAStateWithASetCounter`: (a) new project: after the first
-  registration `owner.json` names the canonical state directory, also when the state
-  directory is reached through a symlink; (b) unmarked repository with a log: the owner
-  (counter set) reopens and the marker is created at registration; (c) a database in another
-  directory, log present, marker absent: `Open` succeeds, no marker is created,
-  `CreateTicket` returns `E_RECONCILE_REQUIRED`, the marker is still absent. Mutation: claim
-  regardless of the counter (RED in c).
-- `TestConcurrentClaimsLeaveOneOwner`: two states race `claimAuditOwner` (goroutines,
-  repeated over fresh common directories): exactly one marker, its content never changes,
-  the loser gets `E_STATE_NOT_OWNER`. Mutation: write the marker with `os.WriteFile`.
+- `TestAPreUpgradeCounterDoesNotProveReconciliation` (review P1): unmarked repository whose
+  log high water is 6; state Y's database holds a counter row of 1 inserted directly (the
+  pre-upgrade seed). Y registers: no marker is created, Y's counter is 0, `CreateTicket` and
+  `AllocateID` return `E_RECONCILE_REQUIRED`, both audit files byte-identical. Mutations:
+  eligibility tests `counter >= 1` instead of `counter > highWater` (Y claims and mints);
+  drop the demotion (Y mints seq 1).
+- `TestTheOwnerClaimsAtItsFirstRegistrationAfterUpgrade` (false-fail twin): unmarked
+  repository, owner database with a counter of high water + 1: registration creates the
+  marker naming the canonical state directory (also when the state directory is reached
+  through a symlink); a create succeeds; the counter was not demoted. Mutation: demote always.
+- `TestANewProjectIsClaimedAtItsFirstRegistration`: empty log, no `<common>/aira`
+  directory: registration creates the directory and the marker. Mutation: drop the
+  `MkdirAll`.
+- `TestConcurrentRegistrationsLeaveOneOwnerAndOneRegistration` (review P1): two states,
+  both eligible (empty log), race `Open` on fresh common directories, repeated: exactly one
+  marker, its content never changes after creation, the loser gets `E_STATE_NOT_OWNER` and
+  has no breadcrumb and no database rows for the project. Mutations: write the marker with
+  `os.WriteFile`; write the breadcrumb before the claim.
+- `TestAForeignStateCannotRegisterWhileTheOwnerCreates`: the owner creates tickets in a
+  loop while Y repeatedly tries to register: every Y attempt is refused, every owner create
+  succeeds, the owner's `Rebuild` afterwards is clean.
+- `TestAppendsRequireTheMarkerToNameThisState`: a registered owner scope; the marker is then
+  replaced by hand with one naming another directory, or removed. `CreateTicket` returns
+  `E_STATE_NOT_OWNER` at the receipt append and `receipts.jsonl` is byte-identical;
+  `UpdateTicket` returns it at the journal append and `journal.jsonl` is byte-identical; the
+  refusal text says the shared log was not changed and does not say nothing was written.
+  Mutations: drop the receipt-append check; drop the journal-append check; let an absent
+  marker pass at append.
+- `TestRebuildRefusesAForeignMarkerBeforeTouchingItsDatabase`: Y (counter set, never
+  registered) through `NewUnregisteredScope` + `Rebuild` on a marked repository: refused;
+  Y's database unchanged; audit files byte-identical. Mutation: drop Rebuild's start check
+  (Rebuild then appends Y's recovered receipts, or reaches the append refusal after
+  changing Y's database).
+- `TestAdoptionClaimsAnUnmarkedRepositoryAfterRebuild`: `NewUnregisteredScope` + `Rebuild`
+  + `RegisterBootstrap` on an unmarked repository with a receipt-less ticket file: Rebuild
+  claims, appends the recovered receipt, `RegisterBootstrap` proceeds. Mutation: drop
+  Rebuild's claim (Rebuild fails at its append).
 - `TestAnUnreadableOwnerMarkerRefusesWrites`: invalid JSON, an empty `state_dir`, a
-  directory named `owner.json`: registration and appends refused, marker unchanged.
-  Mutation: treat an unreadable marker as absent.
-- `TestAForeignInitAdoptionIsRefused`: Y runs `NewUnregisteredScope` + `Rebuild` +
-  `RegisterBootstrap` with no receipt-less files (so Rebuild appends nothing):
-  `RegisterBootstrap` returns `E_STATE_NOT_OWNER`, the marker is unchanged. Mutation: drop
-  the `RegisterBootstrap` check.
+  directory named `owner.json`, and a zero-length file (the torn claim): registration,
+  Rebuild and appends refused, marker unchanged, the message names the hand step. Mutations:
+  treat an unreadable marker as absent; treat a zero-length marker as absent.
 - e2e, `cmd/aira` (in-process dispatcher with a test daemon, as
   `TestStoreFreeRealCLIRegistersOnlyThroughDaemon` does): a temp repository initialised and
   one ticket created under `XDG_STATE_HOME=A`; then with `XDG_STATE_HOME=B` and a separate
@@ -335,11 +411,11 @@ private `HOME`/`XDG_*`; no aira verb runs in a real checkout.
   new requirement pin both go RED.
 - Every existing Rebuild test stays green unchanged (the ticket path is a pure extraction).
 
-### 5.4 Prototype measurement (evidence for this plan; not the build)
+### 5.4 Measurements behind this plan (not the build)
 
-In a detached throwaway worktree of `4098ad9` under `~/tmp`, parts A and B were prototyped
-(A as in 3.1; B with the marker checked at `Register`, `RegisterBootstrap`, the receipt
-append and both journal appends, claiming at append):
+v1 prototype, in a detached throwaway worktree of `4098ad9` under `~/tmp` (A as in v1; B with
+the marker checked at `Register`, `RegisterBootstrap`, the receipt append and both journal
+appends, claiming at append):
 
 - the two AIRA-301 probes: every foreign create refused; zero bytes added to either audit
   file; zero ticket files; owner Rebuild clean (A alone: `E_RECONCILE_REQUIRED`; A+B: refused
@@ -348,54 +424,86 @@ append and both journal appends, claiming at append):
 - `internal/codes`: only the two expected catalogue edits (the stale entry; the new code);
 - `internal/daemon` (3 tests) and `internal/runner` (20 tests) fail identically on unmodified
   `4098ad9` when run inside an `aira confine` job on this box (exclusive-drain and
-  confine-admission tests): environmental, not this batch. The build gate is `make ci`, and
-  any failure must be compared against the base before it is attributed.
+  confine-admission tests): environmental, not this batch.
+
+v2 changes the claim rule (high water instead of "counter set"; claim before the breadcrumb;
+no claim at append), so the v1 prototype numbers are evidence for the mechanism, not for the
+v2 code; the build re-measures.
+
+No-row branch deletion, measured for v2 on `4098ad9` in a throwaway worktree with private
+`HOME`/`XDG_*` (the branch replaced by an `E_RECONCILE_REQUIRED` return):
+`internal/core`, `internal/app`, `cmd/aira`: `ok`. `internal/store`: timed out at 10 min in
+`TestEventSequenceCommitOrderAcrossIndependentHandles` (`watch_test.go:107`), which inserts
+a `projects` row by hand and no counter row, then waits on a commit hook that the refused
+mint never reaches. The rest of `internal/store` with that test skipped (`-skip`): `ok` (404.9 s, exit 0).
+The build seeds the counter row in that test's setup (a test-seam fix, not a behaviour
+change).
 
 ## 6. Expected yield
 
-- The 2026-10-11 incident cannot recur: on the prototype the foreign state writes nothing,
-  where master writes 2 bogus receipts (same checkout) or 4 receipts and 4 ticket files
-  (another checkout of the same repository) and leaves Rebuild failing in every worktree.
-- A recreated state database can no longer write into a repository's log before its first
-  rebuild (the same mechanism as the incident, without any foreign state).
+- In both measured incident shapes (same checkout; another checkout of the same
+  repository), a foreign state writes nothing to the shared log, no ticket file, and no
+  registration, where master writes 2 bogus receipts (same checkout) or 4 receipts and 4
+  ticket files (another checkout) and leaves Rebuild failing in every worktree. This holds
+  for every repository with a marker; the residuals in section 7 are where it does not.
+- A pre-upgrade or recreated state database can no longer write into a repository's log
+  before its first rebuild (the incident's mechanism without any foreign state).
 - An agent in the wrong directory, or with a private `HOME`, is told so by name at its first
-  aira command in a real repository, and writes nothing.
+  aira command in a claimed repository, and writes nothing.
 - `E_RECONCILE_REQUIRED`, specified in phase 1, is produced for the first time.
 - AIRA-297: one false `E_ID_UNRESOLVED` class removed, with a net deletion of the duplicated
-  allocation block and the alias.
+  allocation block, the alias and `nextSequence`'s no-row branch.
 
-## 7. Deferrals and "not in this batch"
+## 7. Residuals, deferrals and "not in this batch"
 
 | Item | Why not here |
 |---|---|
+| **Residual 1: an unmarked repository can be claimed by an up-to-date foreign state.** | A foreign state that rebuilds an unmarked repository (`aira check`, or `aira reconcile --rebuild` following the `E_RECONCILE_REQUIRED` advice) gets a counter above the high water and then claims at its next registration. Nothing distinguishes it from the owner at that point. Bounded by: the owner's daemon registers every registry root that still exists and matches its identity on each discovery pass (`discovery.go:58-72`), so every repository the owner has a live worktree registration for is claimed in the first pass after cutover; a repository with no live registry root stays unmarked until the owner's next aira command there. The `E_RECONCILE_REQUIRED` text tells a wrong-directory agent not to rebuild. |
+| **Residual 2: the owner identity is a path string.** | Two states at the same canonical path in different mount namespaces (containers sharing a bind-mounted checkout, each with its own state at an identical path) look like one owner: an ownership false pass. fastest-ee's containers use their own clones, with their own common directory, and run only machine-level verbs. A random owner token was rejected (section 2). |
+| **Residual 3: a database restored from an old copy, in the owner's own directory.** | The marker names it, its counter is set, so neither part stops it; its numbers would collide. Rebuild still fails closed, now naming the receipt. No backup feature exists to produce this. |
+| **Residual 4: the append-time refusal is after side effects in the state's own database and worktree.** | Only reachable when the marker is changed by hand during a command (3.2 site 3). The shared log is protected; the refusal says so and does not claim nothing was written. |
+| Rebuild silently skips malformed current-project receipts (`store.go:3016-3018`) | Pre-existing false pass (review finding): a current-project receipt with an invalid ID or a sequence number of 0 or less is skipped without a finding, and `aira check` can still report `rebuild-integrity` pass. Not changed here: turning it fail-closed inside the correctness-critical Rebuild could fail every box `aira check` if such lines exist, and the box logs have not been measured (this plan does not read the real `.git`). Suggest a ticket: measure the box's logs, then report such lines as a failing reconciliation finding. |
+| Discovery reports `(0, 0, 0)` when the registry cannot be read (`discovery.go:34-37`) | Pre-existing: an unknown reported as a measured zero (review finding). Its counters are observability-only today, but the residual-1 bound above depends on discovery having read the registry, so the release step checks the markers directly (section 10). Suggest a ticket: report the pass as unevaluated. |
 | AIRA-296: skip a breadcrumb identical to the latest one for its project and root | Measured yield 90.2 % of records. Cost: three tests count registry lines as registrations (`TestStoreFreeRealCLIRegistersOnlyThroughDaemon`, `cmd/aira/dispatcher_inprocess_test.go:1364`, a cross-process e2e with no equally cheap counter; `TestDiscoverRegistryPassQuarantinesPersistentStoreFailure`, `discovery_test.go:314`; `TestEnsureScopeRegistersFreshAndRefreshesCachedScopeExactlyOnce`, `server_test.go:143`; all three RED on the prototype). Present cost is small: about 740 KB decoded five times per `aira check` (`readRegistry` callers: `Rebuild`, `checkDuplicateIDs`, `findingIndexDivergence`, `relationFindings`, traceability) and once per discovery pass. Suggested trigger: registry over 5 MB (about a year at the measured rate), or when a registration-counter seam exists. Compaction by deadness stays declined (AIRA-88, AIRA-209). Recommend: keep AIRA-296 held with this record. |
-| Rebuild tolerance for contradicting receipts | Design recorded so it is not re-derived: a pure pass over receipts and journal in file order adopts a receipt only if no journal line holds its sequence number for a different ID and no earlier adopted receipt pairs its ID or its sequence number differently; the rest are skipped with a failing `E_RECEIPT_CONFLICT` reconciliation finding (cleared and recomputed each Rebuild) reported under `rebuild-integrity`; high-water marks keep counting the skipped lines; the log is never rewritten. Safety property: it changes the outcome only for logs that fail today. Deferred because after parts A and B no current writer can produce a contradiction. |
-| A database restored from an old copy | Its counter is set, so part A passes it, and its numbers would collide. Rebuild still fails closed, now naming the receipt. No backup feature exists to produce this. |
-| Upgrade window | An up-to-date foreign state could claim an unmarked repository before the owner's first registration after cutover. The owner's daemon claims every registered worktree in its first discovery pass. |
+| Rebuild tolerance for contradicting receipts | Design recorded so it is not re-derived: a pure pass over receipts and journal in file order adopts a receipt only if no journal line holds its sequence number for a different ID and no earlier adopted receipt pairs its ID or its sequence number differently; the rest are skipped with a failing `E_RECEIPT_CONFLICT` reconciliation finding (cleared and recomputed each Rebuild) reported under `rebuild-integrity`; high-water marks keep counting the skipped lines; the log is never rewritten. Safety property: it changes the outcome only for logs that fail today. Deferred because after parts A and B no current writer in a claimed repository can produce a contradiction. |
 | `aira eject` releasing `owner.json` | Not needed for the bug; moving a repository between states is a manual step. |
 | Other common-directory writers (`runs/` ledger, gate audit, `locks/`) | Not part of the receipt/journal audit log the incident corrupted. |
-| Refusing reads from a state that has not read the log | Reads show that state's own (empty or stale) index; part B already stops foreign states at registration. |
+| Refusing reads from a state that has not read the log (counter 0, marker absent or ours) | Reads show that state's own (empty or stale) index; it cannot write. Foreign states are already refused at registration. |
 | `readRegistry` called five times per `aira check` | A performance clean-up, independent of growth. |
 | The daemon and runner test failures under `aira confine` (5.4) | Pre-existing on `4098ad9`; suggest a ticket if none exists. |
 
 ## 8. Risks
 
-- **A legitimate second state is now refused** (the owner changes `HOME` or
-  `XDG_STATE_HOME`; a container bind-mounting the same checkout path with its own state).
-  Checked: fastest-ee's in-container gate runs only machine-level verbs
-  (`aira install --ci=shim`, `aira confine`) and containers use their own clones, which have
-  their own common directory. The refusal names the manual step.
+- **False fails (stated limits).** Refused at every command, reads included, once a
+  repository is claimed: the owner after changing `HOME` or `XDG_STATE_HOME`, or after
+  moving the state directory; a legitimate second state on the same repository (a second
+  user account, a container bind-mounting the same checkout with its own state). Each gets
+  `E_STATE_NOT_OWNER` naming both states and the manual step. Tests are unaffected: they use
+  temporary repositories, each claimed by its own test state. Not refused: a different clone
+  of the same project (its own common directory).
+- **Cutover demotion.** A repository whose log holds a higher sequence number than the
+  owner's counter (only possible if the log already contains another state's lines) is
+  demoted at the owner's first registration: the owner then gets `E_RECONCILE_REQUIRED` there
+  until `aira check`, whose Rebuild either absorbs the log or fails `E_JOURNAL_CORRUPT`
+  naming the bad receipt. That is the honest outcome: those numbers would collide.
 - **Takeover is a hand step inside `.git`** (agents cannot do it). It is needed only for a
-  deliberate state move, or if a foreign state wins the upgrade window.
-- **Fixture churn:** none measured on the prototype; the final code may differ.
-- **Exit codes:** `E_RECONCILE_REQUIRED` stays 4 (pinned). `E_STATE_NOT_OWNER` is 1 by the
-  catalogue's rule (`codes.go:25-30`): a well-formed request refused by durable state, which
-  succeeds once the state changes.
-- **Cost:** one small-file read per audit append and per registration; two `stat` calls per
-  registration. Both are noise beside the full journal decode every journal append already
-  does (`store.go:3871-3888`).
-- **Cutover:** store code runs in the daemon, so the daemon must restart (`aira install`
-  does it since AIRA-203). The first discovery pass then writes `owner.json` into every live
+  deliberate state move, a torn marker, or if a foreign state claimed an unmarked repository
+  (residual 1).
+- **Fixture churn:** one measured (`watch_test.go:107` needs a counter row); the final code
+  may find more hand-built stores.
+- **Exit codes:** `E_RECONCILE_REQUIRED` stays 4, a deliberate carry-over (3.1 A.3).
+  `E_STATE_NOT_OWNER` is 1 by the catalogue's rule (`codes.go:25-30`): a well-formed request
+  refused by durable state, which succeeds once the state changes.
+- **Cost:** one small-file read per registration, per Rebuild and per audit append. A full log
+  read (the high water) only when a counter row is created and while a repository is
+  unmarked; a non-owner state that keeps running commands in an unmarked repository repeats
+  it per command, which is acceptable for a state that cannot write. Both are noise beside
+  the full journal decode every journal append already does (`store.go:3871-3888`).
+- **Cutover:** store code runs in the daemon, so the daemon must run the new binary.
+  `aira install` restarts a daemon whose running binary differs from the installed one
+  (AIRA-203, `install.go:1234`), but a 2026-10-08 release recorded a client install that left
+  the old daemon running; the release step therefore checks and restarts explicitly
+  (section 10). The first discovery pass then writes `owner.json` into every live
   repository's common directory. Protocol unchanged; old clients unaffected.
 - **Build and review isolation:** the incident came from an agent running aira verbs in the
   real checkout. Builders and reviewers run probes only in throwaway worktrees under `~/tmp`
@@ -406,22 +514,42 @@ append and both journal appends, claiming at append):
 
 | Code | Status | Exit | Where |
 |---|---|---|---|
-| `E_RECONCILE_REQUIRED` | existing, now produced | 4 | `nextSequence` on a counter not yet set from the log |
-| `E_STATE_NOT_OWNER` | new | 1 | registration and the two audit-log writers, when `owner.json` names another state or cannot be read |
+| `E_RECONCILE_REQUIRED` | existing, now produced | 4 (carry-over) | `nextSequence` on a missing counter row or a counter not yet set from the log |
+| `E_STATE_NOT_OWNER` | new | 1 | registration, Rebuild's start, and the two audit-log writers, when `owner.json` names another state or cannot be read; the writers also when it is absent |
 | `E_JOURNAL_CORRUPT` | existing, message only | 4 | `ensureReceiptAllocation` now names the receipt's worktree, path and time |
 
 No other code changes. Protocol unchanged.
 
 ## 10. Release notes (for the build)
 
-Protocol unchanged. Daemon restart required (performed by `aira install`). After cutover,
-verify on the box that `<common>/aira/owner.json` exists in the aira and fastest-ee
-repositories and names `~/.local/state/aira`. Skill: add one line to the agent guide's
+Protocol unchanged. Daemon must run the new binary: after `aira install`, confirm the running
+daemon's binary is the new one and otherwise run `systemctl --user restart
+aira-daemon.service` (owner step; agents do not restart the shared daemon). Then verify on
+the box that `<common>/aira/owner.json` exists in the aira and fastest-ee repositories and
+names `~/.local/state/aira`, and that `aira check` passes in each (a demoted repository shows
+`E_RECONCILE_REQUIRED` on writes until then). Skill: add one line to the agent guide's
 isolation advice: a probe in a private state that lands in a real repository is now refused
-with `E_STATE_NOT_OWNER`, and `aira reconcile --rebuild` must not be run to "fix" it.
-Notify deploy and speed per the release rule (new code `E_STATE_NOT_OWNER`;
-`E_RECONCILE_REQUIRED` now produced).
+with `E_STATE_NOT_OWNER`, and `aira reconcile --rebuild` must not be run to "fix" it or an
+`E_RECONCILE_REQUIRED` in a repository you did not expect to be in. Notify deploy and speed
+per the release rule (new code `E_STATE_NOT_OWNER`; `E_RECONCILE_REQUIRED` now produced).
 
 ## 11. Review log
 
-(empty: plan v1)
+v1 was reviewed by two lineages (both PASS_WITH_CHANGES). Each finding was checked against
+the code at `4098ad9` before it was accepted.
+
+| # | Finding (severity) | Verified | Disposition |
+|---|---|---|---|
+| R1.1 | A positive counter does not prove reconciliation: a pre-upgrade row seeded at 1 against a populated log could claim an unmarked repository and mint colliding numbers (P1) | Yes: `store.go:2064-2065` seeds 1 regardless of the log, and v1's claim test was `next_seq >= 1` | Accepted. Claim needs `counter > log high water` (2, 3.2); an ineligible registration demotes the counter to 0; new tests `TestAPreUpgradeCounterDoesNotProveReconciliation` and its owner twin. A "hydrated" column was considered and rejected (cutover outage, section 2). |
+| R1.2 | "Nothing was written" is false at append-time refusals; concurrent registrations can write breadcrumbs and rows before losing the claim (P1) | Yes: create commits its allocation before its receipt (`store.go:2151-2160`); update writes its file before its journal line (`:2337-2345`); v1 claimed after the breadcrumb | Accepted. The claim is decided before the breadcrumb (3.2 site 1); append-time refusals never claim and say only that the shared log was not changed; racing tests added (5.2). A per-mint marker read was considered and rejected (section 2). |
+| R1.3 | Rebuild silently skips current-project receipts with invalid IDs or non-positive seq, so "no receipt is ever skipped" is untrue; discovery returns `(0,0,0)` on a registry read failure (P2) | Yes: `store.go:3016-3018`; `discovery.go:34-37` | Accepted as wording: invariant 7 now states the skip; both recorded as pre-existing, with suggested tickets (section 7). Not fixed here: changing Rebuild's skip to fail-closed is unmeasured against the box logs. |
+| R1.4 | False-fail exposure needs explicit limits; identical path strings across mount namespaces may be different databases; avoid "cannot recur" (P2) | Yes (design reasoning) | Accepted: section 8 lists the false fails; residual 2 states the namespace false pass; section 6 no longer claims the incident cannot recur. |
+| R1.5 | Receipt dedup compares only project, ID and seq, not bytes, so the "byte-identical twins" explanation is unsupported (P2) | Yes: `store.go:2540` | Accepted: section 1 corrected; the 71-to-68 gap is now stated as not established. |
+| R1.6 | From-scratch minimum (P3) | n/a | Adopted as the section 2 minimum. |
+| R1.7 | Read refusal is optional policy, not needed for write integrity; keep registry compaction, receipt tolerance and takeover out of scope (P3) | n/a | Partly accepted: the read refusal is kept but now stated as a deliberate policy with its reasons and false-fail cost (3.2 site 1, section 8); the out-of-scope items were already deferred. |
+| R2.1 | All cited code claims true; AIRA-296's "232 identities" is not project ids (14); say what was counted (INFO) | Re-measured on a fresh registry copy: 14 project ids, 14 common directories, 228 worktree ids, 228 roots, 33 roots existing; 2,134 of 2,366 records (90.2 %) duplicates | Accepted: section 1 now gives the measured counts; "232" was not reproduced and is removed. |
+| R2.2 | `nextSequence`'s no-row branch contradicts invariant 1; delete it and run the suite (P2) | Yes: `store.go:3434-3438` | Accepted and measured (5.4): one store test depends on it through a hand-built store; fixed by seeding its row. |
+| R2.3 | No test pins that a Rebuild on a recreated database mints recovered allocations; moving the early counter upsert after the loops would break the advised remedy (P2) | Yes: upsert at `store.go:2990-2994`, mints at `:3089`, `:3164` | Accepted: `TestRebuildOnARecreatedStateMintsRecoveredAllocations` with that mutation (5.1). |
+| R2.4 | A counter-0 foreign state can seize any unmarked repository by rebuilding; state the residual; consider one claim site (P2) | Yes: `discovery.go:58-72` registers only live, matching roots | Residual accepted and stated (section 7, residual 1). Claim sites: one function, no claim at append; it is also called after Rebuild's commit, for the reason in section 2 (a claim-only-at-registration design makes a recovering owner's first Rebuild fail). |
+| R2.5 | Fresh init may register before the audit directory exists; prefer `O_CREAT|O_EXCL` to tmp+link; add a torn-marker test (P3) | Plausible (not traced end to end); `MkdirAll` is harmless either way | Accepted: `MkdirAll` before the claim, exclusive create with a bounded re-read of a zero-length marker, torn-marker and new-directory tests (3.2, 5.2). |
+| R2.6 | "`aira install` restarts the daemon since AIRA-203" needs checking; `E_RECONCILE_REQUIRED` at exit 4 contradicts `codes.go:25-30` (P3) | AIRA-203 restarts a daemon whose running binary differs (`install.go:1234`); a 2026-10-08 release recorded an install that did not restart. Exit 4 is pinned in the store-integrity family (`produced_test.go:282`) | Accepted: section 10 checks and restarts explicitly; exit 4 stated as a deliberate carry-over (3.1 A.3). |
