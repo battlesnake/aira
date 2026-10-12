@@ -40,11 +40,6 @@ func asHelpRequest(err error) (*helpRequestError, bool) {
 	return nil, false
 }
 
-func isHelpRequest(err error) bool {
-	_, ok := asHelpRequest(err)
-	return ok
-}
-
 // helpRefusalCode is the stable code of a refused help token: run-* verbs keep
 // their own family code (spec 3.3), every other verb E_SELECTOR_INVALID.
 func helpRefusalCode(verb string) string {

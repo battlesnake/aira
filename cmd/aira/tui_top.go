@@ -687,7 +687,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		}
 		model.Rows = append(model.Rows, tableRow{
 			ID: scopeID, Colour: colour, Cells: []string{
-				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
+				fmt.Sprint(slot), record.Name, confineNum(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
 				topRAMCell(record.RSSBytes),
 				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record), topUntrustedCell(lastText),

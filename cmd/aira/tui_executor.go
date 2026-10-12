@@ -111,10 +111,6 @@ type tuiExecutor struct {
 	translator boardTranslator
 }
 
-func newTUIExecutor(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, workers int) *tuiExecutor {
-	return newTUIExecutorWithWatch(ctx, dispatcher, executeDispatcher, scope, workers, true)
-}
-
 // newTUIExecutorWithWatch adds one decision to the constructor: whether to run
 // the project event-watch loop at all.
 //

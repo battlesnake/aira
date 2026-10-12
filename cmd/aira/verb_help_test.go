@@ -141,7 +141,8 @@ func TestGenericParserHelpSentinelNeverReadsValues(t *testing.T) {
 		{"create", []string{"Fix", "it", "-h"}, "create"},
 		{"count", []string{"-h"}, "count"},
 	} {
-		if _, _, err := parseArgs(tc.verb, tc.argv); err == nil || !isHelpRequest(err) {
+		_, _, err := parseArgs(tc.verb, tc.argv)
+		if _, ok := asHelpRequest(err); err == nil || !ok {
 			t.Fatalf("parseArgs(%s, %q) err=%v, want the help sentinel", tc.verb, tc.argv, err)
 		}
 	}

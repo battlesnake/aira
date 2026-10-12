@@ -277,10 +277,6 @@ type translateResult struct {
 	Result boardHumanizeResult
 }
 
-func newTUIState(eventCapacity int) tuiState {
-	return newTUIStateForViews(eventCapacity, allViews, dataViews)
-}
-
 // newTUIStateForViews builds a state over an explicit view set. `aira top` uses
 // it to run the same controller over one project-less panel.
 func newTUIStateForViews(eventCapacity int, views, data []tuiView) tuiState {

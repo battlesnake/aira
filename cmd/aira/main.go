@@ -42,7 +42,6 @@ var superviseConfineDetached = runner.SuperviseConfineDetached
 var confineDetachStatusFor = runner.ConfineDetachStatusFor
 var confineDetachStatusList = runner.ConfineDetachStatusList
 var runInstaller = installcmd.Run
-var runSliceAnchor = installcmd.RunSliceAnchor
 
 // Run is the deliberately small CLI adapter: argv parsing, core request
 // construction, and rendering. It contains no ticket or consistency logic.
@@ -57,10 +56,6 @@ func RunWithDispatcher(argv []string, stdout, stderr io.Writer, dispatcher Dispa
 	return runWithInputDispatcher(argv, stdout, stderr, os.Stdin, dispatcher)
 }
 
-func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int {
-	return runWithInputDispatcher(argv, stdout, stderr, stdin, nil)
-}
-
 func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Reader, injected Dispatcher) int {
 	// AIRA-211. `<verb> --help` / `<verb> -h` is answered from the help table
 	// before ANY verb parser or intercept below can refuse or swallow it. Only the
@@ -72,7 +67,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 	}
 	if len(argv) > 0 && argv[0] == "__slice-anchor" {
-		return runSliceAnchor()
+		return installcmd.RunSliceAnchor()
 	}
 	if len(argv) > 0 && strings.EqualFold(argv[0], "install") {
 		if err := runInstaller(argv[1:], stdout); err != nil {
@@ -475,7 +470,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		project, discoverErr := app.DiscoverBootstrap(context.Background(), scopeDir)
 		if discoverErr != nil {
-			code := appErrorCode(discoverErr)
+			code := store.ErrorCode(discoverErr)
 			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		dispatcher := injected
@@ -560,11 +555,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		boardScope, scopeErr := scopeForCWD(context.Background(), scopeDir, paths)
 		startOverview := false
 		if scopeErr != nil {
-			switch appErrorCode(scopeErr) {
+			switch store.ErrorCode(scopeErr) {
 			case "E_NOT_PROJECT", "E_CONFIG_MISSING":
 				startOverview = true
 			default:
-				code := appErrorCode(scopeErr)
+				code := store.ErrorCode(scopeErr)
 				return render(core.Response{Code: code, Error: scopeErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 			}
 		}
@@ -579,7 +574,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	scope, err := scopeForCWD(context.Background(), scopeDir, paths)
 	if err != nil {
-		code := appErrorCode(err)
+		code := store.ErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// AIRA-176. Identity is stamped from the RESOLVED SCOPE ROOT, not the process
@@ -2416,7 +2411,7 @@ func renderConfineLog(response core.Response, stdout, stderr io.Writer) int {
 		return response.Exit
 	}
 	if !response.OK {
-		return exitForError(response.Code)
+		return codes.ExitForCode(response.Code)
 	}
 	return 0
 }
@@ -3541,7 +3536,7 @@ func renderHelp(response core.Response, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\n", entry["verb"], entry["usage"], entry["summary"])
 	}
 	if err := table.Flush(); err != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	// Face-level globals belong to this adapter, not to the core dispatch table
 	// the listing above is generated from, so they are named here (AIRA-82).
@@ -3573,11 +3568,11 @@ func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) i
 	if response.AfterWrite != nil {
 		if err := response.AfterWrite(response.OK && writeErr == nil); err != nil {
 			_, _ = fmt.Fprintf(stderr, "E_RUN_DETACH_FAILED: %v\n", err)
-			return exitForError("E_RUN_DETACH_FAILED")
+			return codes.ExitForCode("E_RUN_DETACH_FAILED")
 		}
 	}
 	if writeErr != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	if response.Exit != 0 {
 		return response.Exit
@@ -3585,7 +3580,7 @@ func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) i
 	if response.OK {
 		return 0
 	}
-	return exitForError(response.Code)
+	return codes.ExitForCode(response.Code)
 }
 
 func renderConfineListResponse(response core.Response, stdout, stderr io.Writer) int {
@@ -3640,13 +3635,13 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			name += " (worker)"
 		}
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
+			name, record.Owner, confineNum(record.SupervisorPID), record.ScopeID,
 			confineLiveStatus(record),
-			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds),
-			confineInt64(record.ReserveBytes), confineString(record.Cap))
+			confineNum(record.Populated), confineNum(record.RSSBytes), confineAge(record.AgeSeconds),
+			confineNum(record.ReserveBytes), confineString(record.Cap))
 	}
 	if err := table.Flush(); err != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	// AIRA-183. The legend for the two states AIRA-102's "no" used to conflate,
 	// printed ONLY when a row actually shows one of them and naming only the
@@ -3844,11 +3839,11 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	return 0
 }
 
-func confineInt(value *int) string {
+func confineNum[T int | int64](value *T) string {
 	if value == nil {
 		return "unevaluated"
 	}
-	return strconv.Itoa(*value)
+	return strconv.FormatInt(int64(*value), 10)
 }
 
 // confineBoolYesNo renders a subtree-population reading (AIRA-102). A nil is
@@ -4094,13 +4089,6 @@ func confinePlural(count int, singular, plural string) string {
 	return plural
 }
 
-func confineInt64(value *int64) string {
-	if value == nil {
-		return "unevaluated"
-	}
-	return strconv.FormatInt(*value, 10)
-}
-
 // formatReserveBytes renders a KNOWN reserve/ceiling byte count. Unlike
 // FormatConfineBytes (which maps 0 to "unknown" for the optional trailer facets),
 // a slice-reserve summary value of 0 is a genuine zero (an idle slice, or a cap
@@ -4263,7 +4251,7 @@ func renderRunLog(response core.Response, stdout, stderr io.Writer) int {
 		return response.Exit
 	}
 	if !response.OK {
-		return exitForError(response.Code)
+		return codes.ExitForCode(response.Code)
 	}
 	return 0
 }
@@ -4288,11 +4276,11 @@ func renderTime(response core.Response, stdout, stderr io.Writer) int {
 	if response.AfterWrite != nil {
 		if err := response.AfterWrite(response.OK && writeErr == nil); err != nil {
 			_, _ = fmt.Fprintf(stderr, "E_RUN_DETACH_FAILED: %v\n", err)
-			return exitForError("E_RUN_DETACH_FAILED")
+			return codes.ExitForCode("E_RUN_DETACH_FAILED")
 		}
 	}
 	if writeErr != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	if response.Exit != 0 {
 		return response.Exit
@@ -4300,13 +4288,5 @@ func renderTime(response core.Response, stdout, stderr io.Writer) int {
 	if response.OK {
 		return 0
 	}
-	return exitForError(response.Code)
-}
-
-func appErrorCode(err error) string {
-	return store.ErrorCode(err)
-}
-
-func exitForError(code string) int {
-	return codes.ExitForCode(code)
+	return codes.ExitForCode(response.Code)
 }

@@ -1410,20 +1410,6 @@ func executeRequestText(request core.Request) string {
 	return out.String()
 }
 
-func (r *tuiRuntime) executeLaunchOnUI(launch executeLaunch) {
-	if launch.Detached {
-		if !r.detachedSubmitting.CompareAndSwap(false, true) {
-			return
-		}
-		r.executeDetachedLaunchOnUIGuarded(launch)
-		return
-	}
-	if !r.executeRunning.CompareAndSwap(false, true) {
-		return
-	}
-	r.executeLaunchOnUIGuarded(launch)
-}
-
 func (r *tuiRuntime) confirmExecuteOnUI() {
 	pending := r.state.ExecuteConfirm
 	if pending != nil && pending.Detached {
