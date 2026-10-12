@@ -372,6 +372,17 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runConfineReportCommand(context.Background(), options, stderr)
 	}
+	// AIRA-293. `confine --help` lists "confine-status" (confineHelpVerbs) and the
+	// four sibling management verbs each have a hyphenated spelling that works
+	// (AIRA-201's both-spellings discipline), so this one must too. parseArgs hands
+	// its argv to parseConfineManagementArgs as `--status <argv>`, the SAME parser
+	// `confine --status` uses, and the options go to the SAME
+	// runConfineStatusCommand, so the two spellings share every validation (empty,
+	// duplicate and inline `--owner=`, unknown options, --slice, the owner identity
+	// check) and every refusal text because there is one code path, not two copies.
+	if verb == "confine-status" {
+		return runConfineStatusCommand(context.Background(), options, renderJSON, stdout, stderr)
+	}
 	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-budget" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
@@ -660,7 +671,11 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
 	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
 	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
-		writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
+		// readyForFailure, NOT readyFD: strconv.Atoi returns 0 for an unparseable
+		// or missing --ready-fd, and writing the failure to "fd 0" wrapped the
+		// caller's stdin, wrote JSON to it and closed it (AIRA-294).
+		// supervisorReadyFD is -1 unless --ready-fd parsed as a non-negative fd.
+		writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
 		return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 	}
 	request, err := runner.ConsumeDetachControl(values["control"])
@@ -817,6 +832,64 @@ func stdoutIsTerminal(w io.Writer) bool {
 	return term.IsTerminal(int(file.Fd()))
 }
 
+// parseArgsAllowedOptions is parseArgs' per-VERB option set for the shared
+// positional parser. A test walks it: every option it admits must reach a
+// builder that consumes it, or be refused (an accepted-and-discarded option
+// reads as applied).
+var parseArgsAllowedOptions = map[string]map[string]bool{
+	"init":   {"project": true, "prefixes": true, "id-prefix": true},
+	"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
+	"create": {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
+	"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
+	"new":    {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
+	"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
+	"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
+	"grep":   {"kind": true, "by": true, "fields": true},
+	"import": {"strict": true, "tickets": true, "allocated-max": true},
+	"count":  {"by": true}, "reconcile": {"rebuild": true},
+	"claim":   {"steal": true, "actor": true},
+	"release": {"token": true}, "heartbeat": {"token": true},
+	"touch": {"token": true},
+	"ready": {"list": true},
+	// AIRA-176. --owner is accepted on register only; audit has no identity of
+	// its own to declare. Neither takes --owner-attested: attestation is
+	// DERIVED from the resolved owner by the face and can never be asserted on
+	// the command line, or the evidence grade would be forgeable.
+	"worktree-register": {"base": true, "owner": true},
+	"worktree-audit":    {"base": true},
+	"find":              {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
+	"req":               {"status": true, "fields": true},
+	"test-report":       {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
+	"spend":             {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "turn-id": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "resolve-ticket": true, "by": true},
+	"quota":             {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
+	"insights":          {},
+	"lease":             {},
+	"tui":               nil,
+	// AIRA-252. `board` takes no options today; the nil entry refuses an unknown
+	// one by name rather than silently accepting and discarding it.
+	"board": nil,
+	// AIRA-127. `top` takes no options today; the entry exists so an unknown
+	// one is refused by name rather than silently accepted and discarded.
+	"top":            nil,
+	"commands":       {"by": true},
+	"git":            {},
+	"run-kill":       {"steal": true},
+	"run-input":      {"close": true, "steal": true},
+	"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
+	"confine-list":   {"slice": true, "owner": true},
+	"confine-budget": {"slice": true, "owner": true},
+	// AIRA (admission-counter rebuild) S18.
+	"confine-dump": {"dump": true, "slice": true, "owner": true},
+	"confine-kill": {"steal": true, "slice": true, "owner": true},
+	// AIRA-196. No --slice on either: both address a job through the durable
+	// record store, never a cgroup slice, and an accepted-and-ignored --slice
+	// is exactly the silently discarded scope AIRA-82 refuses.
+	"confine-log":   {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true, "owner": true},
+	"confine-input": {"close": true, "steal": true, "owner": true},
+	"watch":         {"from": true, "from-start": true, "verb": true},
+	"gate":          {"canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "dimension": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
+}
+
 func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
 	if verb == "install" {
 		return parseInstallDescriptorArgs(argv)
@@ -826,6 +899,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	}
 	if verb == "confine-reserve" {
 		return parseConfineReserveArgs(argv)
+	}
+	if verb == "confine-status" {
+		return parseConfineStatusSpellingArgs(argv)
 	}
 	if verb == "drain" {
 		return parseDrainArgs(argv)
@@ -898,59 +974,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			options[name] = argv[i]
 		}
 	}
-	allowed := map[string]map[string]bool{
-		"init":   {"project": true, "prefixes": true, "id-prefix": true},
-		"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
-		"create": {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
-		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
-		"new":    {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
-		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
-		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
-		"grep":   {"kind": true, "by": true, "fields": true},
-		"import": {"strict": true, "tickets": true, "allocated-max": true},
-		"count":  {"by": true}, "reconcile": {"rebuild": true},
-		"claim":   {"steal": true, "actor": true},
-		"release": {"token": true}, "heartbeat": {"token": true},
-		"touch": {"token": true},
-		"ready": {"list": true},
-		// AIRA-176. --owner is accepted on register only; audit has no identity of
-		// its own to declare. Neither takes --owner-attested: attestation is
-		// DERIVED from the resolved owner by the face and can never be asserted on
-		// the command line, or the evidence grade would be forgeable.
-		"worktree-register": {"base": true, "owner": true},
-		"worktree-audit":    {"base": true},
-		"find":              {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
-		"req":               {"status": true, "fields": true},
-		"test-report":       {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
-		"spend":             {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "turn-id": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "resolve-ticket": true, "by": true},
-		"quota":             {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
-		"insights":          {},
-		"lease":             {},
-		"tui":               nil,
-		// AIRA-252. `board` takes no options today; the nil entry refuses an unknown
-		// one by name rather than silently accepting and discarding it.
-		"board": nil,
-		// AIRA-127. `top` takes no options today; the entry exists so an unknown
-		// one is refused by name rather than silently accepted and discarded.
-		"top":            nil,
-		"commands":       {"by": true},
-		"git":            {},
-		"run-kill":       {"steal": true},
-		"run-input":      {"close": true, "steal": true},
-		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
-		"confine-list":   {"slice": true, "owner": true},
-		"confine-budget": {"slice": true, "owner": true},
-		// AIRA (admission-counter rebuild) S18.
-		"confine-dump": {"dump": true, "slice": true, "owner": true},
-		"confine-kill": {"steal": true, "slice": true, "owner": true},
-		// AIRA-196. No --slice on either: both address a job through the durable
-		// record store, never a cgroup slice, and an accepted-and-ignored --slice
-		// is exactly the silently discarded scope AIRA-82 refuses.
-		"confine-log":   {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true, "owner": true},
-		"confine-input": {"close": true, "steal": true, "owner": true},
-		"watch":         {"from": true, "from-start": true, "verb": true},
-		"gate":          {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
-	}
+	allowed := parseArgsAllowedOptions
 	// Sorted, so which bad option is named does not depend on map order.
 	for _, name := range sortedKeys(options) {
 		if !allowed[verb][name] {
@@ -963,6 +987,27 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		}
 	}
 	return positional, options, nil
+}
+
+// parseConfineStatusSpellingArgs is parseArgs' arm for the hyphenated
+// `confine-status` (AIRA-293): the argument list is `confine --status <argv>`
+// handed to parseConfineManagementArgs, so both spellings are one parser. A bare
+// `-h`/`--help` is still the verb's own help request, as for every other verb.
+func parseConfineStatusSpellingArgs(argv []string) ([]string, map[string]string, error) {
+	for i := 0; i < len(argv); i++ {
+		switch argv[i] {
+		case "-h":
+			return nil, nil, &helpRequestError{flag: "-h"}
+		case "--help":
+			return nil, nil, &helpRequestError{flag: "--help"}
+		case "--owner":
+			// The next token is --owner's value even when it reads as a help flag.
+			if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "--") {
+				i++
+			}
+		}
+	}
+	return parseConfineManagementArgs(append([]string{"--status"}, argv...))
 }
 
 func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, error) {
@@ -2550,6 +2595,21 @@ func canonicalOptionList(value string) []string {
 
 func buildRequest(verb string, positional []string, options map[string]string) (core.Request, error) {
 	args := map[string]any{}
+	request, err := buildRequestArgs(verb, positional, options, args)
+	// The undeclared-option refusal runs even when a builder value check failed
+	// first: otherwise one bad invocation is reported under that value check's
+	// code, and under E_SELECTOR_INVALID on the next round trip. A builder that
+	// fails before it chose a subverb leaves args without one, so this is a no-op
+	// for it (AIRA-210).
+	if refuseErr := refuseOptionsNotDeclared(verb, args, options); refuseErr != nil {
+		return core.Request{}, refuseErr
+	}
+	return request, err
+}
+
+// buildRequestArgs is buildRequest's per-verb switch. It fills the caller's args
+// map even on a failing return, so buildRequest can still check the options.
+func buildRequestArgs(verb string, positional []string, options map[string]string, args map[string]any) (core.Request, error) {
 	switch verb {
 	case "init":
 		if len(positional) != 0 {
@@ -2882,6 +2942,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("find requires add|ls|show|set")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -2956,6 +3021,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("spend requires add|ls")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -2988,6 +3058,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("quota requires add|ls")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -3035,6 +3110,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("test-report requires add|ls|show|flaky")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -3221,6 +3301,13 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				return core.Request{}, fmt.Errorf("gate %s requires <gate-id>", args["subverb"])
 			}
 			args["gate_id"] = positional[1]
+			if args["subverb"] == "add" || args["subverb"] == "set" {
+				// An explicit canary id override, bound into canary_ids by the
+				// materializing store (core.go gate add/set).
+				if value := options["canary_id"]; value != "" {
+					args["canary_id"] = value
+				}
+			}
 			if args["subverb"] == "attest" {
 				if options["verdict"] == "" || options["actor"] == "" {
 					return core.Request{}, fmt.Errorf("gate attest requires --verdict and --actor")
@@ -3232,10 +3319,15 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				return core.Request{}, fmt.Errorf("gate %s requires <canary-id>", args["subverb"])
 			}
 			args["canary_id"] = positional[1]
+			if options["canary_id"] != "" {
+				// The id is positional here; a second spelling would be one of two
+				// competing values, one of them silently dropped.
+				return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: option --canary_id is not valid for gate %s (give the canary id positionally)", args["subverb"])
+			}
 		default:
 			return core.Request{}, fmt.Errorf("unknown gate operation %q", args["subverb"])
 		}
-		for option, argument := range map[string]string{"checker": "checker", "predicate": "predicate", "cwd": "cwd", "timeout-ms": "timeout_ms", "output-cap-bytes": "output_cap_bytes", "parser": "parser", "mutation-kind": "mutation_kind", "mutation-file": "mutation_file", "mutation-test": "mutation_test", "mutation-occurrence": "mutation_occurrence", "mutation-pkgdir": "mutation_pkgdir", "mutation-testname": "mutation_testname", "mutation-content": "mutation_content", "mutation-seed": "mutation_seed", "mutation-expected-result": "mutation_expected_result"} {
+		for option, argument := range map[string]string{"checker": "checker", "predicate": "predicate", "dimension": "dimension", "cwd": "cwd", "timeout-ms": "timeout_ms", "output-cap-bytes": "output_cap_bytes", "parser": "parser", "mutation-kind": "mutation_kind", "mutation-file": "mutation_file", "mutation-test": "mutation_test", "mutation-occurrence": "mutation_occurrence", "mutation-pkgdir": "mutation_pkgdir", "mutation-testname": "mutation_testname", "mutation-content": "mutation_content", "mutation-seed": "mutation_seed", "mutation-expected-result": "mutation_expected_result"} {
 			if value := options[option]; value != "" {
 				args[argument] = value
 			}
@@ -3253,6 +3345,63 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		return core.Request{}, fmt.Errorf("E_UNKNOWN_VERB: unknown verb %q", verb)
 	}
 	return core.Request{Verb: verb, Args: args}, nil
+}
+
+// cliOptionArgumentNames are the dispatch arguments a CLI option can feed. Most
+// options are their argument's name, kebab or snake as the declaration spells
+// it; these are the ones the CLI renames.
+func cliOptionArgumentNames(verb, option string) []string {
+	names := []string{option, strings.ReplaceAll(option, "-", "_")}
+	switch {
+	case verb == "rant" && option == "tag":
+		names = append(names, "tags")
+	case verb == "rant" && option == "ref":
+		names = append(names, "refs")
+	case verb == "rant" && option == "idem":
+		names = append(names, "idempotency_key")
+	case verb == "test-report" && option == "config-env":
+		names = append(names, "env_digest")
+	}
+	return names
+}
+
+// refuseOptionsNotDeclared refuses an option that the selected subverb does not
+// declare. parseArgs' allowed set is per VERB, so an option declared by one
+// subverb (`--severity` on `rant capture`) passed parseArgs on a sibling whose
+// builder never forwards it, bypassed Do's enum check, and exited 0 as if it had
+// applied. The declared set is makeMCPOperation's, the very table MCP validates
+// against, so the two faces refuse the same faults (AIRA-210). A verb with no
+// operations, or a request with no subverb, is untouched. Every subverb a
+// builder sets is a declared operation (each builder's switch refuses the
+// rest), so no "unknown subverb" case exists here.
+//
+// No did-you-mean clause: an option that reached here passed parseArgs' per-verb
+// set, and no such option is a near miss of a declared argument of its subverb
+// (checked over the whole table; a table change that makes one reachable is the
+// moment to add the clause back).
+func refuseOptionsNotDeclared(verb string, args map[string]any, options map[string]string) error {
+	subverb, _ := args["subverb"].(string)
+	if subverb == "" || len(options) == 0 {
+		return nil
+	}
+	descriptor, ok := descriptorNamed(core.New(nil).DispatchDescriptors(), verb)
+	if !ok || len(descriptor.Operations) == 0 {
+		return nil
+	}
+	declared := map[string]bool{}
+	for _, arg := range makeMCPOperation(descriptor, subverb).declaredArgs {
+		declared[arg.Name] = true
+	}
+	for _, name := range sortedKeys(options) {
+		accepted := false
+		for _, candidate := range cliOptionArgumentNames(verb, name) {
+			accepted = accepted || declared[candidate]
+		}
+		if !accepted {
+			return fmt.Errorf("E_SELECTOR_INVALID: option --%s is not valid for %s %s", name, verb, subverb)
+		}
+	}
+	return nil
 }
 
 func splitComma(value string) []string {
@@ -3723,6 +3872,13 @@ func confineBoolYesNo(value *bool) string {
 const (
 	confineLiveIdle     = "idle"
 	confineLiveOrphaned = "orphaned"
+	// confineLiveUnsupervised is AIRA-195's refinement of the POPULATED arm:
+	// processes are running in the scope but the supervisor PID is gone. It is
+	// not "orphaned" (that word means "empty, the reaper removes it, nothing to
+	// kill") and not a healthy "yes" (nothing is waiting on the job or will
+	// report its outcome). The usual way to get one is killing an outer confine
+	// around a nested one, whose work lives in a sibling scope.
+	confineLiveUnsupervised = "unsupervised"
 )
 
 // confineLiveStatus renders the LIVE column.
@@ -3740,15 +3896,27 @@ const (
 // whoever launched it, and a population that could not be read is unevaluated no
 // matter what the supervisor is doing.
 //
-// The supervisor reading only refines the EMPTY case, and when it is itself
+// The supervisor reading refines the EMPTY case, and when it is itself
 // unestablished the column falls back to exactly the "no" AIRA-102 printed —
 // the same true statement about the subtree, with no claim about the supervisor
 // attached to it.
+//
+// AIRA-195 refines the POPULATED case the same way. The supervisor reading
+// cannot make a populated scope "not running", but it can say nothing is
+// waiting on it: "unsupervised" is shown only when the subtree is populated AND
+// the supervisor read dead. supervisor_live is false only on ESRCH, so the word
+// is established when shown; an unread supervisor (nil) makes no claim and
+// shows "yes". A recycled PID can make a dead supervisor read alive, which also
+// shows "yes": the AIRA-183 caveat, unchanged. The word is a listing claim
+// about the supervisor only; it says nothing about the admission reserve.
 func confineLiveStatus(record runner.ConfineRecord) string {
 	if record.SubtreePopulated == nil {
 		return "unevaluated"
 	}
 	if *record.SubtreePopulated {
+		if record.SupervisorLive != nil && !*record.SupervisorLive {
+			return confineLiveUnsupervised
+		}
 		return "yes"
 	}
 	if record.SupervisorLive == nil {
@@ -3765,21 +3933,26 @@ func confineLiveStatus(record runner.ConfineRecord) string {
 // record fields a second time, so the legend cannot describe a state the table
 // did not render.
 func confineLiveLegend(scopes []runner.ConfineRecord) string {
-	idle, orphaned := false, false
+	idle, orphaned, unsupervised := false, false, false
 	for _, record := range scopes {
 		switch confineLiveStatus(record) {
 		case confineLiveIdle:
 			idle = true
 		case confineLiveOrphaned:
 			orphaned = true
+		case confineLiveUnsupervised:
+			unsupervised = true
 		}
 	}
-	clauses := make([]string, 0, 2)
+	clauses := make([]string, 0, 3)
 	if idle {
 		clauses = append(clauses, confineLiveIdle+" = the scope subtree has no process right now but its supervisor is alive (mid fork/exec, or a genuinely idle moment) — nothing to investigate")
 	}
 	if orphaned {
 		clauses = append(clauses, confineLiveOrphaned+" = the supervisor PID is gone and the scope is empty — the daemon's reaper removes it once it is past the reap grace, so there is nothing left to kill")
+	}
+	if unsupervised {
+		clauses = append(clauses, confineLiveUnsupervised+" = processes are still running in the scope but its supervisor PID is gone, so nothing is waiting on the job or will report its outcome (for example an outer confine was killed around a nested one); it runs until it exits or is killed")
 	}
 	if len(clauses) == 0 {
 		return ""

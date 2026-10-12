@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -95,11 +96,13 @@ func TestAIRA183ConfineListLiveColumnStates(t *testing.T) {
 		supervisor *bool
 		want       string
 	}{
-		// A populated subtree is running whoever launched it: the supervisor
-		// reading may not downgrade it, and a dead supervisor over a POPULATED
-		// scope is emphatically not an orphan — there are processes in there.
+		// A populated subtree is running whoever launched it, and a dead
+		// supervisor over a POPULATED scope is emphatically not an orphan —
+		// there are processes in there. AIRA-195 refines that arm exactly as
+		// AIRA-183 refined the empty one: it is "running", but nothing is
+		// waiting on it, so it gets its own word instead of the healthy "yes".
 		{"running with a live supervisor", &running, &live, "yes"},
-		{"running with a dead supervisor", &running, &dead, "yes"},
+		{"running with a dead supervisor", &running, &dead, "unsupervised"},
 		{"running with no supervisor reading", &running, nil, "yes"},
 		// An unreadable population stays unevaluated whatever the supervisor did.
 		{"unreadable population", nil, &live, "unevaluated"},
@@ -183,5 +186,94 @@ func TestAIRA183TopKeepsTheUnsplitLivenessCell(t *testing.T) {
 	record := confineLiveRecord(t, "killed", 4242, &empty, &dead)
 	if got := topLiveCell(record); got != "no" {
 		t.Fatalf("top's live cell = %q, want the unsplit \"no\"", got)
+	}
+}
+
+// AIRA-195. A nested confine moves its work to a sibling scope, so killing the
+// outer scope leaves running processes whose supervisor PID is gone. The table
+// said LIVE=yes for them, exactly as for a healthy job; `--list --json` already
+// carried supervisor_live:false but the human faces hid it.
+//
+// verifies: AIRA-195 (listing half)
+func TestAIRA195UnsupervisedIsItsOwnWordOnBothHumanFaces(t *testing.T) {
+	t.Parallel()
+	live, dead, running := true, false, true
+	for _, test := range []struct {
+		name       string
+		subtree    *bool
+		supervisor *bool
+		pending    bool
+		want       string
+	}{
+		{"running, supervisor gone", &running, &dead, false, "unsupervised"},
+		{"running, supervisor alive", &running, &live, false, "yes"},
+		// An unestablished supervisor makes no claim: never "unsupervised".
+		{"running, supervisor unread", &running, nil, false, "yes"},
+		{"unreadable population, supervisor gone", nil, &dead, false, "unevaluated"},
+		{"pending waiter", nil, nil, true, "pending"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			record := confineLiveRecord(t, "job", 4242, test.subtree, test.supervisor)
+			record.Pending = test.pending
+			if got := topLiveCell(record); got != test.want {
+				t.Fatalf("top live cell = %q, want %q", got, test.want)
+			}
+			if test.pending {
+				return
+			}
+			if got := confineLiveStatus(record); got != test.want {
+				t.Fatalf("confine --list LIVE = %q, want %q", got, test.want)
+			}
+		})
+	}
+	// The empty arm is untouched on top: still the unsplit "no".
+	empty := false
+	if got := topLiveCell(confineLiveRecord(t, "gone", 4242, &empty, &dead)); got != "no" {
+		t.Fatalf("empty scope, dead supervisor: top cell = %q, want no", got)
+	}
+}
+
+func TestAIRA195LegendExplainsUnsupervisedOnlyWhenARowShowsIt(t *testing.T) {
+	t.Parallel()
+	live, dead, running := true, false, true
+	healthy := renderConfineList(t, []runner.ConfineRecord{confineLiveRecord(t, "busy", 4242, &running, &live)})
+	if strings.Contains(healthy, "unsupervised") || strings.Contains(healthy, "LIVE:") {
+		t.Fatalf("a healthy listing must carry no unsupervised word or legend:\n%s", healthy)
+	}
+	output := renderConfineList(t, []runner.ConfineRecord{
+		confineLiveRecord(t, "orphan-run", 4242, &running, &dead),
+		confineLiveRecord(t, "busy", 4243, &running, &live),
+	})
+	if got := liveCell(t, output, "orphan-run"); got != "unsupervised" {
+		t.Fatalf("LIVE=%q, want unsupervised:\n%s", got, output)
+	}
+	if got := liveCell(t, output, "busy"); got != "yes" {
+		t.Fatalf("healthy sibling LIVE=%q, want yes:\n%s", got, output)
+	}
+	if !strings.Contains(output, "unsupervised = processes are still running in the scope but its supervisor PID is gone") {
+		t.Fatalf("an unsupervised row must be explained:\n%s", output)
+	}
+	// The clause must not claim anything about the reserve, and must not call
+	// the scope removable: it is running.
+	clause := output[strings.Index(output, "unsupervised = "):]
+	for _, forbidden := range []string{"reaper", "nothing left to kill", "reserve"} {
+		if strings.Contains(clause, forbidden) {
+			t.Fatalf("unsupervised legend clause contains %q: %s", forbidden, clause)
+		}
+	}
+}
+
+// The machine-readable record is unchanged: supervisor_live was already there.
+func TestAIRA195JSONRecordIsUnchanged(t *testing.T) {
+	t.Parallel()
+	dead, running := false, true
+	record := confineLiveRecord(t, "orphan-run", 4242, &running, &dead)
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"supervisor_live":false`) || strings.Contains(string(data), "unsupervised") {
+		t.Fatalf("record JSON changed: %s", data)
 	}
 }

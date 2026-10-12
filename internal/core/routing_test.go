@@ -668,6 +668,10 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 			base["branch"] = "main"
 			base["config"] = "default"
 			base["env_digest"] = "env"
+		case "gate":
+			// gate's verdict is the closed pass|fail set (the shared probe
+			// input carries find's "confirmed", which dispatch now refuses).
+			base["verdict"] = "pass"
 		case "run-log":
 			base["from"] = "0"
 			base["tail"] = "0"

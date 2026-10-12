@@ -2325,14 +2325,18 @@ func (s *Store) UpdateTicketContent(ctx context.Context, id string, update func(
 	if err != nil {
 		return EventKey{}, err
 	}
+	// RenderTicket validates the ticket (every enum field) BEFORE the transition
+	// is judged, so an unreadable status (`set X status=in_progress`) is
+	// reported as the invalid ticket field it is and E_TRANSITION_INVALID is
+	// left for a known status on a forbidden edge (AIRA-210).
+	newData, err := domain.RenderTicket(updated, body)
+	if err != nil {
+		return EventKey{}, err
+	}
 	if updated.Status != ticket.Status {
 		if err := domain.ValidateTransition(ticket.Status, updated.Status); err != nil {
 			return EventKey{}, err
 		}
-	}
-	newData, err := domain.RenderTicket(updated, body)
-	if err != nil {
-		return EventKey{}, err
 	}
 	intent, err := s.preparePathMutation(ctx, path, digestBytes(data), newData, "ticket.update")
 	if err != nil {

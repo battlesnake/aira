@@ -260,10 +260,16 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 func makeMCPOperation(descriptor core.DispatchDescriptor, operation string) mcpOperation {
 	operationArgs := map[string]bool{}
 	operationRequired := map[string]bool{}
+	// A declared operation restricts the arguments even when it declares none
+	// (gate ls, gate check, lease ls, insights ls): without this an operation
+	// with no Args fell back to the verb's whole ArgSpec list and accepted every
+	// argument, the same accept-and-discard as an undeclared option on the CLI.
+	operationDeclared := false
 	for _, spec := range descriptor.Operations {
 		if spec.Name != operation {
 			continue
 		}
+		operationDeclared = true
 		for _, arg := range spec.Args {
 			operationArgs[arg.Name] = true
 			operationRequired[arg.Name] = arg.Required
@@ -275,7 +281,7 @@ func makeMCPOperation(descriptor core.DispatchDescriptor, operation string) mcpO
 		if arg.Name == "subverb" || (descriptor.Name == "link" && arg.Name == "list") {
 			continue
 		}
-		if len(operationArgs) > 0 {
+		if operationDeclared {
 			if !operationArgs[arg.Name] {
 				continue
 			}
@@ -620,24 +626,10 @@ func decodeMCPValue(arg core.ArgSpec, raw json.RawMessage) (any, error) {
 	default:
 		return nil, fmt.Errorf("E_ARGUMENT_INVALID: argument %q has unsupported kind", arg.Name)
 	}
-	if len(arg.Enum) > 0 {
-		stringValue, ok := value.(string)
-		// An optional enum permits the empty (absent) value; a present value must match.
-		// This mirrors the CLI, which does not enum-reject an omitted optional flag.
-		if !ok || (!(stringValue == "" && !arg.Required) && !contains(arg.Enum, stringValue)) {
-			return nil, fmt.Errorf("E_ARGUMENT_INVALID: argument %q is outside its closed enum", arg.Name)
-		}
-	}
+	// AIRA-210: a declared closed enum is NOT checked here. core.Do is the one
+	// enforcement point for every face, so an MCP enum fault comes back as an
+	// ordinary tool result carrying Do's text instead of a JSON-RPC error.
 	return value, nil
-}
-
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func toolResponse(id any, response core.Response) mcpResponse {

@@ -564,9 +564,17 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		code := "E_UNKNOWN_VERB"
 		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: codes.ExitForCode(code)}
 	}
-	args := newArgAccessor(req.Args)
+	// AIRA-210: the one place a declared closed enum is enforced, for every
+	// face. It runs before any accessor is built or handler runs, and rewrites a
+	// case-variant member to its declared spelling.
+	canonical, enumErr := canonicalEnumArgs(spec, req.Args)
+	if enumErr != nil {
+		code := "E_ARGUMENT_INVALID"
+		return Response{Code: code, Error: enumErr.Error(), Exit: codes.ExitForCode(code)}
+	}
+	args := newArgAccessor(canonical)
 	if req.HasContent || req.Content != nil {
-		args = newArgAccessor(req.Args, req.Content)
+		args = newArgAccessor(canonical, req.Content)
 	}
 	args.gitContext = req.GitContext
 	args.actor, args.session, args.model = req.Actor, req.Session, req.Model
@@ -791,7 +799,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
 		"rant": {Name: "rant", Usage: "rant [--project ID | --prefix P] <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls|get|review|redact ...", GitContext: true,
-			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", "papercut", "annoyance", "blocker"), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference"), stringSpec("project", false, false, "Target project: exact or unambiguous project ID"), stringSpec("prefix", false, false, "Target project: an ID prefix it owns")},
+			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", string(domain.RantSeverityPapercut), string(domain.RantSeverityAnnoyance), string(domain.RantSeverityBlocker)), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference"), stringSpec("project", false, false, "Target project: exact or unambiguous project ID"), stringSpec("prefix", false, false, "Target project: an ID prefix it owns")},
 			MCPTool: "aira_rant", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 				// A target selector names ANOTHER project's store, which only the
 				// daemon can resolve and build (AIRA-179): it owns the machine-wide
@@ -1683,7 +1691,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(projectRecord(updated, nil), event), nil
 		}},
-		"mv": {Name: "mv", Usage: "mv <selector> <status>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("status", true, true, "Target status", "draft", "planned", "in-progress", "in-review", "done", "retired", "superseded")}, MCPTool: "aira_transition", MCPOperation: "mv", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"mv": {Name: "mv", Usage: "mv <selector> <status>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("status", true, true, "Target status", domain.AllowedStatusStrings()...)}, MCPTool: "aira_transition", MCPOperation: "mv", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -2183,7 +2191,10 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}},
 		"run-log": {Name: "run-log", Usage: "run-log <run-id> [--stream out|err|merged] [--follow --from N --tail N --full --grep PATTERN]", Args: []ArgSpec{
 			stringSpec("run_id", true, true, "Run identifier"),
-			stringSpec("stream", false, false, "Captured stream", "out", "err", "merged"),
+			// "log" is the name a merged run's single output is stored and reported
+			// under (run-log's own response and `show`'s output_refs), the same stream
+			// "merged" selects; the system must accept the name it prints.
+			stringSpec("stream", false, false, "Captured stream (log is the stored name of a merged run's output, the same stream as merged)", "out", "err", "merged", "log"),
 			boolSpec("follow", false, false, "Observe until terminal"),
 			stringSpec("from", false, false, "Byte offset"),
 			stringSpec("tail", false, false, "Number of bytes from the end"),
@@ -2333,7 +2344,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			listSpec("argv", false, false, "Exact command argv tokens"), stringSpec("cwd", false, false, "Command root or relative subdirectory"), listSpec("env_allow", false, false, "Allow-listed environment names; a relative argv[0] such as make resolves only when PATH is listed here, and a definition without it is refused E_GATE_INVALID"),
 			stringSpec("timeout_ms", false, false, "Command timeout in milliseconds"), stringSpec("output_cap_bytes", false, false, "Combined output cap in bytes"), stringSpec("parser", false, false, "Command output parser; required by predicate tests-green and refused with predicate exit-zero", "go-test-json-v1"),
 			stringSpec("mutation_kind", false, false, "Typed mutation kind; the go- kinds parse Go source, inject-file is the language-agnostic kind and should inject a compiling, failing test in the subject's own language, because a body that merely breaks the build proves only that the build breaks", "go-negate-assertion", "go-inject-failing-test", "inject-file"), stringSpec("mutation_file", false, false, "Mutation target file"), stringSpec("mutation_test", false, false, "Mutation target test"),
-			stringSpec("mutation_occurrence", false, false, "Mutation assertion occurrence"), stringSpec("mutation_pkgdir", false, false, "Mutation package directory"), stringSpec("mutation_testname", false, false, "Injected mutation test name"), stringSpec("mutation_content", false, false, "Literal file body of an inject-file mutation; gate add and gate set materialize a canary declaration from the mutation_ fields under .aira/gates/canaries, and the other gate verbs carry them for transport parity only"), stringSpec("mutation_seed", false, false, "Mutation numeric seed"), stringSpec("mutation_expected_result", false, false, "Mutation expected result", "fail"),
+			stringSpec("mutation_occurrence", false, false, "Mutation assertion occurrence"), stringSpec("mutation_pkgdir", false, false, "Mutation package directory"), stringSpec("mutation_testname", false, false, "Injected mutation test name"), stringSpec("mutation_content", false, false, "Literal file body of an inject-file mutation; only gate add and gate set accept the mutation_ fields, which they materialize into a canary declaration under .aira/gates/canaries; every other gate verb refuses them"), stringSpec("mutation_seed", false, false, "Mutation numeric seed"), stringSpec("mutation_expected_result", false, false, "Mutation expected result", "fail"),
 		}, MCPTool: "aira_gate", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))
 			switch subverb {
@@ -2355,8 +2366,6 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			switch subverb {
 			case "add", "set":
 				inputFields = gateDefinitionInputFields(args)
-			case "canary-run", "canary-show":
-				inputFields = mutationInputFields(args)
 			}
 			gs, ok := c.store.(gateStore)
 			if !ok {
@@ -2545,8 +2554,8 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			// canary evidence, which is the point of the security model.
 			{Name: "prove", Summary: "Read back the latest gate result and its proof linkage", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"prove", "traceability"}},
 			{Name: "review", Summary: "Request manual gate review", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
-			{Name: "canary-run", Summary: "Run a named canary and report whether it fired: verdict pass (exit 0) means the checker failed on the canary tree, an observed failure rather than proof of its cause, fail (exit 1) means it did not fire, unevaluated (exit 3) means it could not tell; gate_result is the gate's own result on that tree; read a command canary's output with aira run-log <run id>", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
-			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
+			{Name: "canary-run", Summary: "Run a named canary and report whether it fired: verdict pass (exit 0) means the checker failed on the canary tree, an observed failure rather than proof of its cause, fail (exit 1) means it did not fire, unevaluated (exit 3) means it could not tell; gate_result is the gate's own result on that tree; read a command canary's output with aira run-log <run id>", Safety: SafetyReconcile, Args: []OperationArg{{Name: "canary_id", Required: true}}, Example: []string{"canary-run", "unit-tests-mutation"}},
+			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: []OperationArg{{Name: "canary_id", Required: true}}, Example: []string{"canary-show", "unit-tests-mutation"}},
 		}},
 		"spend": {summary: "Record and list raw compute events", safety: SafetyMutate, operations: []OperationSpec{
 			{Name: "add", Summary: "Ingest one compute event. --turn-id (needs --session) makes the add idempotent per source+session+agent while the row is retained: an identical retry returns the original row with duplicate:true, a retry that differs in counters, model, provider, reported total, cost, reasoning subset, declared ticket or phase is refused with E_COMPUTE_TURN_CONFLICT. --resolve-ticket (when no --ticket) stamps the ticket from the one LIVE lease this worktree holds: ticket_status lease-held means only that, at ingest time, this worktree held a live lease on that ticket; it does NOT say this session did the work, and a turn just before a claim or after a release gets the neighbouring state. A lease expires after its TTL unless `aira heartbeat` renews it, and only leases held by the worktree of the --scope-dir count, so an unrenewed or other-worktree claim reads none. No live lease is none, two or more is unevaluated (never a pick); rows written without --ticket or --resolve-ticket read as unknown", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "model", Required: true}, {Name: "source", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "at"}, {Name: "session"}, {Name: "agent"}, {Name: "turn-id"}, {Name: "resolve-ticket"}, {Name: "raw"}, {Name: "usage-file"}, {Name: "bucket"}, {Name: "total"}, {Name: "cost-usd"}, {Name: "reasoning-subset"}}, Example: []string{"add", "--provider", "openai", "--model", "gpt-5", "--source", "manual", "--bucket", "fresh_input=700", "--bucket", "cache_read=300", "--bucket", "output=200", "--total", "1200", "--reasoning-subset"}},
@@ -2898,30 +2907,11 @@ func gateDefinitionInputFields(args *argAccessor) map[string]any {
 	return fields
 }
 
-func mutationInputFields(args *argAccessor) map[string]any {
-	fields := map[string]any{}
-	for _, name := range []string{"mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"} {
-		if value := stringArg(args, name); value != "" {
-			fields[name] = value
-		}
-	}
-	return fields
-}
-
 func gateDefinitionOperationArgs() []OperationArg {
 	names := []string{"gate_id", "checker", "predicate", "dimension", "canary_id", "argv", "cwd", "env_allow", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"}
 	args := make([]OperationArg, 0, len(names))
 	for _, name := range names {
 		args = append(args, OperationArg{Name: name, Required: name == "gate_id"})
-	}
-	return args
-}
-
-func mutationOperationArgs() []OperationArg {
-	names := []string{"mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"}
-	args := make([]OperationArg, 0, len(names))
-	for _, name := range names {
-		args = append(args, OperationArg{Name: name})
 	}
 	return args
 }

@@ -433,7 +433,7 @@ func TestFormatConfineStatusUnchangedWithoutContainer(t *testing.T) {
 		ReserveBytes: 2 << 30, ReserveBasis: "pinned:client",
 		AdmissionState: "immediate", Scope: ConfineScopePlaced,
 		ScopeIntegrity: ScopeContained, OOMGroup: ConfineOOMGroupSet,
-		Priorities: ConfinePrioritiesApplied, CPUWeight: ConfineCPUWeightAging,
+		Priorities: ConfinePrioritiesApplied, CPUWeight: ConfineCPUWeightAging, CPUWeightCurve: "100->10@30m0s",
 		TerminatedBy: ConfineTerminatedNormal,
 	}
 	// AIRA-121 renders `containment=` on the same always-rendered discipline as
@@ -448,7 +448,8 @@ func TestFormatConfineStatusUnchangedWithoutContainer(t *testing.T) {
 		// is indistinguishable from one whose cap really is the whole footprint
 		// bound. This status was built without a ScopeSwapCap, so it reads
 		// unevaluated -- never as a claim that swap is bounded.
-		"cpu-weight=aging scope-memory.max=not-requested scope-swap.max=unevaluated terminated-by=normal"
+		// AIRA-208: the aging facet carries the ARMED schedule in parentheses.
+		"cpu-weight=aging(100->10@30m0s) scope-memory.max=not-requested scope-swap.max=unevaluated terminated-by=normal"
 	// AIRA-104's resource facets render on every trailer, container or not, and
 	// (per FormatConfineStatus's own ordering) land AFTER container/container-memory
 	// -- both nil here, so both read as unevaluated.

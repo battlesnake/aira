@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"aira/internal/gitremote"
@@ -36,7 +37,11 @@ func TestGitDispatchBuildsClosedRequestAndSuccessPayload(t *testing.T) {
 
 func TestGitDispatchUnknownAndNilSeamHaveStableCodes(t *testing.T) {
 	response := New(nil).Do(context.Background(), Request{Verb: "git", Args: map[string]any{"subverb": "pull"}})
-	if response.OK || response.Code != gitremote.CodeArgInvalid || response.Exit != 2 {
+	// AIRA-210: an undeclared subverb is refused by the dispatch enum check
+	// (E_ARGUMENT_INVALID, naming the value and the declared set) before the
+	// git handler runs; the handler's own gitremote.CodeArgInvalid arm is the
+	// backstop for a caller that does not pass through Do.
+	if response.OK || response.Code != "E_ARGUMENT_INVALID" || response.Exit != 2 || !strings.Contains(response.Error, `"pull"`) || !strings.Contains(response.Error, "clone, fetch, push, ls-remote") {
 		t.Fatalf("unknown response=%+v", response)
 	}
 	response = New(nil).Do(context.Background(), Request{Verb: "git", Args: map[string]any{"subverb": "fetch"}})

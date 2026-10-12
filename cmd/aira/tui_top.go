@@ -997,13 +997,20 @@ func isWorktreeHash(owner string) bool {
 // AIRA-183 deliberately did NOT bring its idle/orphaned split here. That split
 // exists to stop an operator MISREADING one static listing and acting on it —
 // `confine --list` is a snapshot, so a momentarily empty scope and a dead one
-// look identical in it. `top` redraws every second: a scope whose supervisor has
-// died simply stops changing and then disappears when the reaper takes it, which
-// is the distinction the split has to spell out in a snapshot. Adding the words
-// here would be a second spelling of a state this face already shows over time.
+// look identical in it. `top` redraws every second: an EMPTY scope whose
+// supervisor has died simply stops changing and then disappears when the reaper
+// takes it, which is the distinction the split has to spell out in a snapshot.
+//
+// The POPULATED arm is different (AIRA-195). A running scope whose supervisor
+// is gone keeps changing and is never reaped, so waiting for it to disappear
+// would wait forever, and the row reads exactly like a healthy job. That state
+// gets its own word here, shared with `confine --list`.
 func topLiveCell(record runner.ConfineRecord) string {
 	if record.Pending {
 		return "pending"
+	}
+	if record.SubtreePopulated != nil && *record.SubtreePopulated && record.SupervisorLive != nil && !*record.SupervisorLive {
+		return confineLiveUnsupervised
 	}
 	return confineBoolYesNo(record.SubtreePopulated)
 }

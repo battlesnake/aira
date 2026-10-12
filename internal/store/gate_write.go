@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -20,7 +19,7 @@ func renderCanary(declaration gate.CanaryDeclaration) ([]byte, error) {
 	if err := gate.ValidateCanary(declaration); err != nil {
 		return nil, err
 	}
-	data, err := json.MarshalIndent(declaration, "", "  ")
+	data, err := gate.MarshalIndentLiteral(declaration)
 	if err != nil {
 		return nil, fmt.Errorf("E_GATE_CANARY_INVALID: %w", err)
 	}
