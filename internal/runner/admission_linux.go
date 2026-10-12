@@ -761,24 +761,10 @@ func writeRunnerAdmitFrame(w io.Writer, value any) error {
 	}
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
-	if err := writeRunnerAdmitBytes(w, header[:]); err != nil {
+	if err := writeAll(w, header[:]); err != nil {
 		return err
 	}
-	return writeRunnerAdmitBytes(w, payload)
-}
-
-func writeRunnerAdmitBytes(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
+	return writeAll(w, payload)
 }
 
 func reportConfinePeak(ctx context.Context, request ConfineRequest, report ConfinePeakReport) error {
@@ -1020,50 +1006,14 @@ func resolveSlicePathAtExact(slice, mount, current string) (string, error) {
 	return "", fs.ErrNotExist
 }
 
+// resolveSlicePathAt is resolveSlicePathAtExact with every failure collapsed to
+// "slice-not-found", which is all an admission caller needs.
 func resolveSlicePathAt(slice, mount, current string) (string, bool, string) {
-	slice = strings.TrimSpace(slice)
-	if slice == "" || hasParentComponent(slice) {
-		return "", false, "slice-not-found"
-	}
-	mountAbs, err := filepath.Abs(mount)
+	path, err := resolveSlicePathAtExact(slice, mount, current)
 	if err != nil {
 		return "", false, "slice-not-found"
 	}
-	mountCanonical, err := filepath.EvalSymlinks(mountAbs)
-	if err != nil {
-		return "", false, "slice-not-found"
-	}
-	var candidates []string
-	if filepath.IsAbs(slice) {
-		candidates = []string{slice}
-	} else if !strings.ContainsRune(slice, filepath.Separator) && strings.HasSuffix(slice, ".slice") {
-		for cursor := filepath.Clean(current); pathWithin(mountCanonical, cursor); cursor = filepath.Dir(cursor) {
-			if filepath.Base(cursor) == slice {
-				candidates = append(candidates, cursor)
-			}
-			candidates = append(candidates, filepath.Join(cursor, slice))
-			if filepath.Clean(cursor) == filepath.Clean(mountCanonical) {
-				break
-			}
-		}
-	} else {
-		candidates = []string{filepath.Join(mountCanonical, slice)}
-	}
-	for _, candidate := range candidates {
-		candidateAbs, absErr := filepath.Abs(candidate)
-		if absErr != nil || !pathWithin(mountCanonical, candidateAbs) {
-			continue
-		}
-		canonical, evalErr := filepath.EvalSymlinks(candidateAbs)
-		if evalErr != nil || !pathWithin(mountCanonical, canonical) {
-			continue
-		}
-		st, statErr := os.Stat(canonical)
-		if statErr == nil && st.IsDir() {
-			return canonical, true, ""
-		}
-	}
-	return "", false, "slice-not-found"
+	return path, true, ""
 }
 
 func hasParentComponent(path string) bool {

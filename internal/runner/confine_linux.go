@@ -3148,17 +3148,7 @@ func writeConfineHandshake(writer io.Writer, result confineHandshake) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	for len(payload) > 0 {
-		n, writeErr := writer.Write(payload)
-		if writeErr != nil {
-			return writeErr
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		payload = payload[n:]
-	}
-	return nil
+	return writeAll(writer, payload)
 }
 
 // confineIOPriority encodes the ioprio_set value: the I/O class in the high bits

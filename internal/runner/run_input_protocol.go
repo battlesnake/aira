@@ -43,24 +43,10 @@ func writeRunInputFrame(w io.Writer, opcode byte, payload []byte) error {
 	var header [5]byte
 	header[0] = opcode
 	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
-	if err := writeRunInputBytes(w, header[:]); err != nil {
+	if err := writeAll(w, header[:]); err != nil {
 		return err
 	}
-	return writeRunInputBytes(w, payload)
-}
-
-func writeRunInputBytes(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
+	return writeAll(w, payload)
 }
 
 func readRunInputFrame(r io.Reader) (byte, []byte, error) {
