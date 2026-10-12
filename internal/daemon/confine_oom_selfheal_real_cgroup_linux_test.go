@@ -80,11 +80,11 @@ import (
 // provenance the number did not have.
 // With one OOM sample there is no usable ordinary estimate, so
 // resolveAdmitReserve's max(estimate, 1.5x OOM peak) keeps the unpinned client
-// default (runner.DefaultConfineMemoryReserve, 4 GiB) -- far above the ~80 MiB
+// default (runner.DefaultConfineMemoryReserve, 1 GiB) -- far above the ~80 MiB
 // 1.5x figure -- and that default is what the second run then succeeds at. It
 // was already so before AIRA-139; that ticket only made the resolution stop
 // landing on the fixture ceiling. Driving the ARITHMETIC would need an OOM peak
-// above 2.7 GiB, i.e. a multi-gigabyte real workload on a shared box; the
+// above ~700 MiB (1.5x of which exceeds the 1 GiB default), i.e. a real workload of that size on a shared box; the
 // arithmetic is pinned instead, at unit cost, by
 // TestConfineEstimatorAndOOMEscalationClamp and
 // TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins.
@@ -100,7 +100,7 @@ const (
 	// so the reserve it carries to the daemon is exactly that default, and
 	// resolveAdmitReserve's OOM-escalation branch takes max(estimate, 1.5x the
 	// OOM peak): with a single OOM sample there is no usable ordinary estimate,
-	// so the default (4 GiB) survives, dwarfs the 1.5x escalation (~80 MiB
+	// so the default (1 GiB) survives, dwarfs the 1.5x escalation (~80 MiB
 	// here), and is then clamped to EXACTLY the ceiling by the branch's
 	// too-large clamp. A reserve equal to the ceiling is grantable only while
 	// the slice's own charge reads byte-exact zero -- checkedAvailable charges

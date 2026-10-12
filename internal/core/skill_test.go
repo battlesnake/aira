@@ -862,7 +862,7 @@ func TestSkillTeachesBothColdStartBases(t *testing.T) {
 		{"fallback:insufficient-samples", "the sibling for a signature with fewer than three usable samples"},
 		{"three or more recorded peaks", "WHEN the p90 exists at all — the condition the old sentence assumed silently"},
 		{"is NOT a sign that something is wrong", "the whole point: a fallback basis on a first run is the documented cold start"},
-		{"unpinned default (4 GiB)", "AIRA-166: what the fallback NUMBER actually is, not just what it is called"},
+		{"unpinned default (1 GiB)", "AIRA-166: what the fallback NUMBER actually is, not just what it is called"},
 		{"`,ceiling-fitted` form of it described below on a slice too small to grant the whole default",
 			"AIRA-153 made the fitted form the ordinary basis to see on a small slice, so the cold-start clause must name it"},
 	} {

@@ -14,9 +14,9 @@ import (
 
 const (
 	DefaultConfineSlice = "aira.slice"
-	// A project-less invocation has no per-project peak-RSS history. Four GiB is
-	// a conservative #50 no-history fallback; injected callers may override it.
-	DefaultConfineMemoryReserve = int64(4 << 30)
+	// A project-less invocation has no per-project peak-RSS history. One GiB is
+	// a no-history fallback hint; injected callers may override it.
+	DefaultConfineMemoryReserve = int64(1 << 30)
 	// DefaultConfineCPUCores is the CPU-core reservation a plain `aira confine`
 	// declares to the admission ledger (design §9). One core is the confine default;
 	// the daemon charges it against the machine-wide R×NumCPU CPU ceiling (design

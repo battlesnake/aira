@@ -568,7 +568,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	//     token reserve without declaring it (several tests pass 1) must never
 	//     have it enforced as a cap — that contains nothing and kills the job.
 	//   - validity: a caller that pins WITHOUT a usable number has its reserve
-	//     replaced by the 4GiB default inside ResolveConfineReserve, and capping at
+	//     replaced by the 1GiB default inside ResolveConfineReserve, and capping at
 	//     that default would be capping at a guess while calling it declared —
 	//     exactly what the unpinned branch deliberately refuses to do.
 	// A declared-but-too-small reserve was already refused above, so a positive

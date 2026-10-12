@@ -1404,7 +1404,7 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 					// here, which is true of exactly ONE of this branch's five outcomes.
 					// In the commonest state right after a first OOM -- one sample, so no
 					// usable ordinary estimate, and a 1.5x escalation far below the
-					// unpinned 4 GiB client default -- the value returned is the client's
+					// unpinned 1 GiB client default -- the value returned is the client's
 					// own default (or the ceiling it was clamped to), and nothing derived
 					// from the OOM peak appears in it.
 					//

@@ -123,7 +123,7 @@ func TestConfineAdmissionWaitLineKeepsTheUnpinnedHedgeWithAPosition(t *testing.T
 		return confineQueuePosition{position: 1, queued: 4, aheadBytes: 0}, true
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{})
-	if !strings.Contains(got, "unpinned") || !strings.Contains(got, "requested reserve 4096M") {
+	if !strings.Contains(got, "unpinned") || !strings.Contains(got, "requested reserve 1024M") {
 		t.Fatalf("unpinned hedge lost; stderr=%q", got)
 	}
 	if !strings.Contains(got, "queue position 1 of 4") {
@@ -309,8 +309,8 @@ func TestConfineAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing
 	if !strings.Contains(got, "queue position 1 of 9 by enqueue order, 0M queued ahead, 53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 		t.Fatalf("progress line does not put the queued and the granted populations side by side; stderr=%q", got)
 	}
-	// The printed figure is the unpinned hint (4G); the daemon is gating on 35G.
-	if !strings.Contains(got, "requested reserve 4096M") {
+	// The printed figure is the unpinned hint (1G); the daemon is gating on 35G.
+	if !strings.Contains(got, "requested reserve 1024M") {
 		t.Fatalf("the AIRA-51 hedge must survive; stderr=%q", got)
 	}
 	if !strings.Contains(got, "this job's own reserve resolves to 35840M") {
