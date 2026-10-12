@@ -342,8 +342,17 @@ func (s *Store) claimAuditOwnerIfEligible(ctx context.Context, counter int64) (b
 // (left as it was, such a state minted, committed to its own database and
 // worktree, and was refused only at the append; review round 4, AIRA-301).
 // bound is the value the demotion is conditioned on (next_seq <= bound): the
-// larger of the high water and the counter read here, so a concurrent
-// Rebuild's lift above both is never undone.
+// larger of the high water and the counter read here. It keeps a concurrent
+// Rebuild of the same state from being undone only when that Rebuild raised
+// the counter above both, i.e. when the counter read here was not above the
+// high water (or the log grew meanwhile). When it was already above (a state
+// that does not hold the log), Rebuild's lift leaves it unchanged, so a
+// registration racing that Rebuild can still demote it after Rebuild's
+// commit. Both outcomes of that race fail closed, never a colliding number:
+// Rebuild's claim step reads 0 and refuses (E_INTERNAL, not eligible), or the
+// claim has landed and the state holds the marker with counter 0, so its next
+// mint is E_RECONCILE_REQUIRED until its next 'aira check' (review round 5;
+// reasoned, not reproduced).
 type registrationOwnership struct {
 	demote bool
 	bound  int64

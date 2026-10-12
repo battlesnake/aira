@@ -137,7 +137,10 @@ to be created, and while a repository is unmarked.
   the log's high water plus one, which is what "absorbed" means. That upsert runs *before*
   Rebuild's scanned-file loops, which themselves mint recovered allocations
   (`store.go:3089`, `:3164`); the order is load-bearing and gets its own test and mutation
-  (5.1). `aira check` and `aira reconcile --rebuild` both run Rebuild.
+  (5.1). The same early upsert also lifts the counter above the largest sequence number the
+  state's own database holds (`events`, `outbox`, `allocations`), so a demoted state that
+  burned numbers while its appends were refused never mints a recovered allocation at one
+  of them (build review R5.1). `aira check` and `aira reconcile --rebuild` both run Rebuild.
 - Every sequence number in the store comes from `nextSequence` (20 call sites, all in
   `internal/store`: tickets, IDs, requirements, imports, leases, supervisor leases, rants,
   retire, watch). The refusal happens inside the caller's `BEGIN IMMEDIATE` transaction,
@@ -209,7 +212,20 @@ only function that creates the marker:
    | ours | proceed | breadcrumb, rows; a new counter row is seeded by A.2 |
    | absent | `counter` = the existing row's value, or for a new row the A.2 seed; call `claimAuditOwnerIfEligible(counter)`; if it refuses, refuse ("Nothing was written."); if it claims, proceed | breadcrumb, rows (only after the claim succeeded) |
    | absent, and the log cannot be read | refuse with the read error ("Nothing was written."); ownership is unknown, so nothing is claimed or demoted | nothing |
-   | absent, not eligible (counter not above the high water, or the database does not hold the log) | proceed without claiming, and **demote**: `registerDB` sets this project's counter to 0 (guarded by `next_seq <= max(high, counter read)`, so a concurrent Rebuild's lift above both is not undone) | breadcrumb, rows, counter = 0 |
+   | absent, not eligible (counter not above the high water, or the database does not hold the log) | proceed without claiming, and **demote**: `registerDB` sets this project's counter to 0, guarded by `next_seq <= max(high, counter read)` (what that guard does and does not protect: below the table) | breadcrumb, rows, counter = 0 |
+
+   The demotion guard `next_seq <= max(high, counter read)` keeps a concurrent Rebuild of the
+   same state from being undone only when that Rebuild raised the counter above both: when
+   the counter read was not above the high water, or the log grew meanwhile. When the counter
+   read was already above the high water (a state that does not hold the log, the R4.4
+   shape), a Rebuild that absorbs the missing lines leaves the counter where it was, and a
+   registration racing it can still demote it after Rebuild's commit. Both outcomes fail
+   closed and neither hands out a colliding number: Rebuild's claim step reads 0 and refuses
+   (`E_INTERNAL`, not eligible, whose text says to run `aira check` again), or the claim has
+   landed and the state holds the marker with counter 0, so its next mint is
+   `E_RECONCILE_REQUIRED` until its next `aira check`. Reasoned, not reproduced (build review
+   R5.4); closing it would need the registration and Rebuild serialised (for example under
+   `rebuild.lock`), which this batch does not add.
 
    A counter above the high water whose database does not hold the log is demoted too (build
    review R4.4): left as it was, it minted, committed to its own database and worktree, and
@@ -499,6 +515,8 @@ change).
 | Other common-directory writers (`runs/` ledger, gate audit, `locks/`) | Not part of the receipt/journal audit log the incident corrupted. |
 | Refusing reads from a state that has not read the log (counter 0, marker absent or ours) | Reads show that state's own (empty or stale) index; it cannot write. Foreign states are already refused at registration. |
 | `readRegistry` called five times per `aira check` | A performance clean-up, independent of growth. |
+| Demotion racing a Rebuild of the same state (build review R5.4) | Fails closed (3.2 site 1, after the table); serialising registration with Rebuild is not added. |
+| `Check`'s second Rebuild after a successful claiming Rebuild is unpinned (mutation M16) | Measured as an equivalent mutant: with and without it, three shapes (pending create, pending create over a conflicting file, deferred update; each in an unmarked repository with a demoting foreign receipt) give an identical report, identical `tickets`, `allocations`, `outbox`, `events` and counter rows, and byte-identical log files (hashes normalised). The reconcile step between the two Rebuilds keeps the index itself (`markTicketMaterialised`, `markRequirementMaterialised`). Kept as the post-reconcile verification the marked path already has; deleting it is an option if a reviewer prefers. |
 | The daemon and runner test failures under `aira confine` (5.4) | Pre-existing on `4098ad9`; suggest a ticket if none exists. |
 
 ## 8. Risks
@@ -591,3 +609,9 @@ the code at `4098ad9` before it was accepted.
 | R4.2 | Build review: R3.3 was fixed for a direct Rebuild only; `aira check` and `aira reconcile --rebuild` run reconcile first, whose replay is refused in an unmarked repository, so neither remedy could claim (P2) | Yes, reproduced (`TestCheckClaimsAnUnmarkedRepositoryWithADeferredLine`, `TestCheckNamesTheLineThatStopsTheClaim`, `TestReconcileRebuildClaimsAnUnmarkedRepositoryWithADeferredLine` RED on `ab7c0c48`) | Fixed: `check` rebuilds first in an unmarked repository; `reconcile --rebuild` rebuilds first when its reconcile is refused `E_STATE_NOT_OWNER`; `check` classifies `E_STATE_NOT_OWNER` as an integrity finding. |
 | R4.3, R4.5 | Build review: the receipt half of `holdsAuditLog` and most of its sub-checks were unpinned (P2, test gap) | Yes (mutations survived the suite) | Pinned: `TestEveryHoldsAuditLogComparisonIsPinned`, one refused case per comparison (receipt ID, receipt seq, journal digest, verb, target, actor, time, missing event row) and false-fail guards (seq-0 receipt, another project's lines). |
 | R4.4 | Build review: a counter above the high water whose database does not hold the log was neither claimed nor demoted, so it minted and was refused only at the append, after side effects (P2) | Yes, reproduced (`TestAStateThatDoesNotHoldTheLogIsDemotedBeforeItWrites` RED on `ab7c0c48`) | Fixed: such a state is demoted too; Rebuild's counter also stays above the database's own sequence numbers (`TestRebuildAfterADemotionCountsAboveItsOwnEvents`). Residual 4 and the claim rule restated. |
+| R5.1 | Build review: the R4.4 own-sequence lift ran after Rebuild's scanned-file loops, so a demoted state's Rebuild minted a recovered allocation from the log's high water, at a number its own database already held (P2, regression from R4.4) | Yes, reproduced (`TestARecoveredAllocationAfterADemotionIsMintedAboveItsOwnEvents` RED on `6ea33bf5`: `E_JOURNAL_CORRUPT ... /3 has different payload`) | Fixed: the own-table lift moved into the early counter upsert, before the loops (3.1 A.2). |
+| R5.2 | Build review: the `events` member of the own-table lift was unpinned (mutation B5 survived) (P2, test gap) | Yes | Pinned: `TestRebuildAfterADemotionCountsAboveItsOwnWatchdogEvents` (watchdog events are the one producer whose numbers live only in `events`); B5 RED. |
+| R5.3 | Build review: `reconcile --rebuild`'s second reconcile after the claiming Rebuild was unpinned (mutation C8 answered ok with a refused create's receipt and file still pending); the refusal over another state's or an unreadable marker was untested (P2, test gap) | Yes | Pinned in `internal/core`: `TestReconcileRebuildCompletesAPendingCreateAfterItClaims` (C8 RED), `TestReconcileRebuildOverAForeignOrUnreadableMarkerIsRefused` (RED when the Rebuild refusal is answered as unevaluated). |
+| R5.4 | Build review: the demotion bound `max(high, counter)` does not protect a concurrent Rebuild in the R4.4 shape (P3) | Re-derived: true; both race outcomes fail closed | Documented (3.2 site 1, section 7); code comments and the `E_INTERNAL` text corrected. Not reproduced. |
+| R5.5 | Build review: `readJournal`'s same-file duplicate check compared verb, target and digest only, unlike every other journal comparison (P3) | Yes (`TestReadJournalUsesTheFullLineIdentity` RED on `6ea33bf5`) | Fixed: it uses `sameJournalLine`. Exposure: such a pair can only come from two databases at one sequence number (since 2026-08-17 the append guard compares the full identity, and before that each line's time came from its database row), which Rebuild already refuses since R4.1; the change moves that refusal earlier, to registration in an unmarked repository. |
+| R5.6 | Build review: mutations M15 (demotion dropped) and M16 (Check's second Rebuild skipped after a successful claim) never run (P3) | Run | M15 RED on seven tests (five that predate round 5). M16 survives the whole `internal/store` suite and is an equivalent mutant on every shape tried (section 7). |

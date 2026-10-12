@@ -2080,8 +2080,9 @@ func (s *Store) registerDB(ctx context.Context, bootstrap bool, ownership regist
 		// unmarked repository that could not claim demotes it to 0 (a
 		// pre-upgrade, stale or burned counter cannot prove that this state has
 		// read the log). The demotion is conditioned on the counter still not
-		// being above ownership.bound, so a concurrent Rebuild's lift is never
-		// undone.
+		// being above ownership.bound, so a concurrent Rebuild that raised it
+		// above the high water and the counter read is not undone (the limits
+		// of that guard are on registrationOwnership).
 		var existing int64
 		err := conn.QueryRowContext(ctx, `SELECT next_seq FROM event_counters WHERE project_id=?`, s.projectID).Scan(&existing)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3055,6 +3056,21 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				return err
 			}
 		}
+		// The counter also stays above every sequence number this database
+		// already holds: a demoted state (counter 0) may hold numbers it burned
+		// while its appends were refused, which the log never received and its
+		// replay after the claim below appends (review round 4, AIRA-301). This
+		// lift precedes the scanned-file loops below, which mint recovered
+		// allocations from this counter (review round 5).
+		for _, table := range []string{"events", "outbox", "allocations"} {
+			var own int64
+			if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM `+table+` WHERE project_id=?`, s.projectID).Scan(&own); err != nil {
+				return err
+			}
+			if own > maxSeq {
+				maxSeq = own
+			}
+		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
 			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,
 			s.projectID, maxSeq+1); err != nil {
@@ -3182,19 +3198,6 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				return err
 			}
 		}
-		// The counter also stays above every sequence number this database
-		// already holds: a demoted state (counter 0) may hold numbers it burned
-		// while its appends were refused, which the log never received and its
-		// replay after the claim below appends (review round 4, AIRA-301).
-		for _, table := range []string{"events", "outbox", "allocations"} {
-			var own int64
-			if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM `+table+` WHERE project_id=?`, s.projectID).Scan(&own); err != nil {
-				return err
-			}
-			if own > maxSeq {
-				maxSeq = own
-			}
-		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
 			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,
 			s.projectID, maxSeq+1); err != nil {
@@ -3207,8 +3210,10 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	}
 	// AIRA-301: a Rebuild has just lifted this state's counter above the log's
 	// high water, so it may claim an unmarked log, and must before it appends
-	// its recovered receipts. Not eligible here would be a bug in the counter
-	// this Rebuild wrote, and is refused rather than appended.
+	// its recovered receipts. Not eligible here is a bug in the counter this
+	// Rebuild wrote, or a race (a registration of this same state demoting the
+	// counter after the commit, see registrationOwnership, or a line appended to
+	// the log meanwhile), and is refused rather than appended.
 	if owner, err = s.readAuditOwner(); err != nil {
 		return err
 	}
@@ -3222,7 +3227,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			return err
 		}
 		if !claimed {
-			return fmt.Errorf("E_INTERNAL: Rebuild absorbed the audit log of project %s but is not eligible to claim it (counter %d, log high water %d, or a log line its database does not hold); refusing to claim %s or append to the shared log", s.projectID, counter, high, s.auditOwnerPath())
+			return fmt.Errorf("E_INTERNAL: Rebuild absorbed the audit log of project %s but is not eligible to claim it (counter %d, log high water %d, or a log line its database does not hold); refusing to claim %s or append to the shared log. If another aira command of this state ran meanwhile, run 'aira check' again", s.projectID, counter, high, s.auditOwnerPath())
 		}
 	}
 	if !replayed {
@@ -4326,7 +4331,10 @@ func readJournal(path string) ([]eventRecord, error) {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: %w", err)
 		}
 		key := fmt.Sprintf("%s\x00%d", event.ProjectID, event.Seq)
-		if prior, ok := seen[key]; ok && (prior.PayloadDigest != event.PayloadDigest || prior.Verb != event.Verb || prior.Target != event.Target) {
+		// The full line identity, as every other journal comparison uses it
+		// (sameJournalLine): two lines at one sequence number that differ only
+		// in actor or time are two events, not one line written twice.
+		if prior, ok := seen[key]; ok && !sameJournalLine(prior, event) {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", event.ProjectID, event.Seq)
 		}
 		seen[key] = event
