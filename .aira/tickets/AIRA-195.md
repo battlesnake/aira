@@ -101,3 +101,5 @@ sessions an invisible orphan holding an engine-suite-sized footprint is
 everyone's problem, not just the originating caller's -- recorded here
 as the argument for sequencing this ticket first if only one is picked
 up soon.
+
+2026-10-12: the listing half shipped in v0.36 (`confine --list` / `aira top` show LIVE=unsupervised for a scope whose supervisor is gone). The remainder (reaper reach, group kill, AIRA-194) is NOT done; ticket stays open.
