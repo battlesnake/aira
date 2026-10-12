@@ -319,24 +319,9 @@ func responseFrame(response core.Response) ResponseFrame {
 	if len(response.RawData) > 0 {
 		frame.Data = append(json.RawMessage(nil), response.RawData...)
 	} else if response.Data != nil {
-		frame.Data, _ = marshalNoEscape(response.Data)
+		frame.Data, _ = core.MarshalNoEscape(response.Data)
 	}
 	return frame
-}
-
-// marshalNoEscape mirrors json.Marshal but disables Go's default HTML
-// escaping of '<', '>', and '&'. The wire frame is a length-prefixed binary
-// protocol between the CLI and its own daemon, never an HTML document, so
-// that escaping only survives into terminal/JSON-pipe output and makes it
-// harder to read (AIRA-57).
-func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 func errorFrame(code, message string) ResponseFrame {
@@ -399,7 +384,7 @@ func (e *frameTooLargeError) Error() string {
 }
 
 func writeFrame(w io.Writer, value any) error {
-	payload, err := marshalNoEscape(value)
+	payload, err := core.MarshalNoEscape(value)
 	if err != nil {
 		return err
 	}

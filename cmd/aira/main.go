@@ -3463,26 +3463,12 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 			*path = filepath.ToSlash(relative)
 		}
 	}
-	encoded, err := marshalNoEscape(result)
+	encoded, err := core.MarshalNoEscape(result)
 	if err != nil {
 		return
 	}
 	response.Data = result
 	response.RawData = encoded
-}
-
-// marshalNoEscape mirrors json.Marshal but disables Go's default HTML
-// escaping of '<', '>', and '&'. There's no HTML context on a terminal or in
-// a JSON pipe, so that escaping only makes selector placeholders like "<id>"
-// harder to read (AIRA-57).
-func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // marshalIndentNoEscape mirrors json.MarshalIndent without HTML escaping.
@@ -3531,7 +3517,7 @@ func renderHelp(response core.Response, stdout, stderr io.Writer) int {
 func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {
 	var writeErr error
 	if jsonOutput {
-		data, _ := marshalNoEscape(response)
+		data, _ := core.MarshalNoEscape(response)
 		_, writeErr = fmt.Fprintln(stdout, string(data))
 	} else if response.OK {
 		writeErr = renderHuman(response, stdout)
@@ -4176,7 +4162,7 @@ func renderHuman(response core.Response, out io.Writer) error {
 		if report, ok := response.Data.(interface{}); ok {
 			data := response.RawData
 			if len(data) == 0 {
-				data, _ = marshalNoEscape(report)
+				data, _ = core.MarshalNoEscape(report)
 			}
 			if _, err := fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data); err != nil {
 				return err

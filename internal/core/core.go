@@ -53,7 +53,7 @@ func (response Response) MarshalJSON() ([]byte, error) {
 	data := response.RawData
 	if len(data) == 0 && response.Data != nil {
 		var err error
-		data, err = marshalNoEscape(response.Data)
+		data, err = MarshalNoEscape(response.Data)
 		if err != nil {
 			return nil, err
 		}
@@ -66,20 +66,20 @@ func (response Response) MarshalJSON() ([]byte, error) {
 		Warnings []string        `json:"warnings,omitempty"`
 		Exit     int             `json:"exit,omitempty"`
 	}
-	return marshalNoEscape(responseJSON{
+	return MarshalNoEscape(responseJSON{
 		OK: response.OK, Code: response.Code, Data: data, Error: response.Error,
 		Warnings: response.Warnings, Exit: response.Exit,
 	})
 }
 
-// marshalNoEscape mirrors json.Marshal but disables Go's default HTML
+// MarshalNoEscape mirrors json.Marshal but disables Go's default HTML
 // escaping of '<', '>', and '&'. Neither the daemon wire protocol nor a
 // terminal/JSON-pipe consumer is an HTML context, so that escaping only
 // makes selector placeholders like "<id>" harder to read (AIRA-57). Escaping
 // applied at any single hop in a marshal chain survives every later hop, so
 // every place that (re-)marshals response data — here and in the CLI's
 // render/renderHuman and the daemon's wire encoder — must use this.
-func marshalNoEscape(v any) ([]byte, error) {
+func MarshalNoEscape(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
