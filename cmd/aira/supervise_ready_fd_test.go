@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -74,6 +75,9 @@ func TestSupervisorMalformedReadyFDNeverTouchesStdin(t *testing.T) {
 			}
 			// Restore fd 0 and drop every write end, then the pipe must be empty.
 			restore()
+			if err := reader.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
 			data, err := io.ReadAll(reader)
 			if err != nil || len(data) != 0 {
 				t.Fatalf("runSupervisor wrote %q to fd 0 (err=%v)", data, err)
@@ -95,7 +99,12 @@ func TestSupervisorMalformedAckFDStillReportsOnTheParsedReadyFD(t *testing.T) {
 	if exit == 0 {
 		t.Fatal("malformed supervisor invocation exited 0")
 	}
-	// writeSupervisorFailure closed the write end (it wraps the fd and closes it).
+	// writeSupervisorFailure closed the write end (it wraps the fd and closes it),
+	// so the read ends at EOF. If it never wrote or closed, fail at the deadline
+	// instead of hanging the package.
+	if err := reader.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	data, err := io.ReadAll(reader)
 	if err != nil || !strings.Contains(string(data), "E_RUN_ARGUMENT_INVALID") {
 		t.Fatalf("failure was not written to the parsed ready fd: %q err=%v", data, err)
