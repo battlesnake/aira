@@ -15,7 +15,7 @@ import (
 // .aira/gates/ and the canary files IN: "any .aira/ file defaults to in, the safe
 // direction"). So a whole-tree scan for a marker also reads the gate's own argv
 // and the canary's mutation body. Gate and canary files used to escape `&`, `<`
-// and `>` as &, < and >, which made a marker holding one of those
+// and `>` as \u0026, \u003c and \u003e, which made a marker holding one of those
 // characters accidentally invisible to its own definition. They are now written
 // literally, so that accident is gone and the self-reference is the SAME for
 // every marker, whatever characters it holds.

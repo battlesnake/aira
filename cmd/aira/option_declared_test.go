@@ -71,6 +71,17 @@ func TestCLIRefusesOptionsTheOperationDoesNotDeclare(t *testing.T) {
 		{[]string{"test-report", "ls", "--format", "go-json"}, "test-report", "ls", "format", "format"},
 		{[]string{"test-report", "show", "TR-1", "--ticket", "AIRA-1"}, "test-report", "show", "ticket", "ticket"},
 		{[]string{"test-report", "flaky", "--config-env", "A=B"}, "test-report", "flaky", "config-env", "env_digest"},
+		// A BARE FLAG is an undeclared option too (it carries "true", not a value).
+		{[]string{"test-report", "ls", "--all"}, "test-report", "ls", "all", "all"},
+		{[]string{"rant", "capture", "text", "--unreviewed"}, "rant", "capture", "unreviewed", "unreviewed"},
+		{[]string{"spend", "ls", "--reasoning-subset"}, "spend", "ls", "reasoning-subset", "reasoning_subset"},
+		// The undeclared option among declared ones, in each SORTED position
+		// (declared: by, fields; options sort as the loop visits them).
+		{[]string{"find", "ls", "--actor", "a", "--by", "source", "--fields", "id"}, "find", "ls", "actor", "actor"},
+		{[]string{"find", "ls", "--by", "source", "--category", "bug", "--fields", "id"}, "find", "ls", "category", "category"},
+		{[]string{"find", "ls", "--by", "source", "--fields", "id", "--verdict", "pass"}, "find", "ls", "verdict", "verdict"},
+		// Verbs where the verb's allowed set is shared by sibling subverbs.
+		{[]string{"gate", "show", "G", "--canary_id", "C"}, "gate", "show", "canary_id", "canary_id"},
 	}
 	for _, tc := range cases {
 		t.Run(strings.Join(tc.argv, " "), func(t *testing.T) {
@@ -176,5 +187,67 @@ func TestMCPOperationWithNoArgsDeclaresNone(t *testing.T) {
 		"verdict": json.RawMessage(`"pass"`), "actor": json.RawMessage(`"human"`),
 	}); err != nil {
 		t.Fatalf("gate attest: %v", err)
+	}
+}
+
+// verifies: AIRA-210 -- gate's `--canary_id` is the add/set override and is
+// FORWARDED (the store binds it into canary_ids); `--gate_id` is not an option
+// at all (the gate id is positional), so it is refused rather than accepted and
+// dropped. Counterexample on 6fa7b3c9: `gate add G ... --canary_id my-canary`
+// exited 0 with the default canary id G-canary.
+func TestGateCanaryIDOptionForwardedAndGateIDRefused(t *testing.T) {
+	base := []string{"gate", "add", "G", "--checker", "command", "--predicate", "exit-zero", "--argv", "true", "--env-allow", "PATH", "--timeout-ms", "1000", "--output-cap-bytes", "4096"}
+	for _, subverb := range []string{"add", "set"} {
+		argv := append([]string{"gate", subverb}, base[2:]...)
+		without, err := buildFromArgv(argv...)
+		if err != nil {
+			t.Fatalf("gate %s without --canary_id: %v", subverb, err)
+		}
+		if _, present := without.Args["canary_id"]; present {
+			t.Fatalf("gate %s without --canary_id carries canary_id %v", subverb, without.Args["canary_id"])
+		}
+		with, err := buildFromArgv(append(append([]string(nil), argv...), "--canary_id", "my-own-canary")...)
+		if err != nil {
+			t.Fatalf("gate %s --canary_id: %v", subverb, err)
+		}
+		if got := with.Args["canary_id"]; got != "my-own-canary" {
+			t.Fatalf("gate %s --canary_id: request canary_id = %v, want my-own-canary (accepted and discarded)", subverb, got)
+		}
+	}
+	for _, argv := range [][]string{
+		append(append([]string(nil), base...), "--gate_id", "other"),
+		{"gate", "show", "G", "--gate_id", "other"},
+		{"gate", "run", "G", "--gate_id", "other"},
+		{"gate", "canary-run", "C", "--gate_id", "other"},
+	} {
+		_, err := buildFromArgv(argv...)
+		if err == nil || !strings.HasPrefix(err.Error(), "E_SELECTOR_INVALID: option --gate_id is not valid for gate") {
+			t.Fatalf("%v: err=%v, want E_SELECTOR_INVALID naming --gate_id", argv, err)
+		}
+	}
+	// canary-run / canary-show take the id positionally; a second spelling is
+	// refused rather than one of two competing ids silently winning.
+	for _, subverb := range []string{"canary-run", "canary-show"} {
+		_, err := buildFromArgv("gate", subverb, "C", "--canary_id", "D")
+		if err == nil || !strings.HasPrefix(err.Error(), "E_SELECTOR_INVALID: option --canary_id is not valid for gate "+subverb) {
+			t.Fatalf("gate %s C --canary_id D: err=%v, want E_SELECTOR_INVALID", subverb, err)
+		}
+	}
+}
+
+// One fault, one code: an undeclared option is reported as itself even when a
+// builder value check would also have failed, so the operator is not told one
+// code now and E_SELECTOR_INVALID after fixing it.
+func TestUndeclaredOptionWinsOverBuilderValueCheck(t *testing.T) {
+	// `test-report add` without --format fails a builder check; --all is
+	// undeclared on add.
+	_, err := buildFromArgv("test-report", "add", "r.json", "--all")
+	if err == nil || !strings.HasPrefix(err.Error(), "E_SELECTOR_INVALID: option --all is not valid for test-report add") {
+		t.Fatalf("err=%v, want the undeclared-option refusal, not the missing --format check", err)
+	}
+	// Twin: with no undeclared option the builder's own check still speaks.
+	_, err = buildFromArgv("test-report", "add", "r.json")
+	if err == nil || !strings.Contains(err.Error(), "requires --format") {
+		t.Fatalf("err=%v, want the --format builder check", err)
 	}
 }

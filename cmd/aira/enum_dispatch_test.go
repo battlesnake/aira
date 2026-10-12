@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -80,11 +81,21 @@ func TestUpperCaseEnumValuesStillAccepted(t *testing.T) {
 	ok("quota", "list")
 	ok("test-report", "list")
 	// `test-report ls` declares no --format (MCP's ls takes only a selector), so
-	// the upper-case enum is exercised where the option is declared: on add. The
-	// enum check lets GO-JSON through, so any LATER refusal (this run feeds it no
-	// report) is not the enum's.
-	if exit, env, errText := run("test-report", "add", "--format", "GO-JSON"); env["code"] == "E_ARGUMENT_INVALID" {
-		t.Fatalf("test-report add --format GO-JSON refused by the enum check: exit=%d env=%v err=%q", exit, env, errText)
+	// the upper-case enum is exercised where the option is declared: on add. A
+	// real, minimal report goes in so the run reaches the store, whose record
+	// keeps whatever spelling the dispatch layer handed it: format "go-json"
+	// means GO-JSON was canonicalised, while "GO-JSON" (or a refusal) would mean
+	// it was passed through unchanged or narrowed.
+	if err := os.WriteFile("upper-case-report.json", []byte(`{"Action":"start","Package":"p"}
+{"Action":"run","Package":"p","Test":"TestX"}
+{"Action":"pass","Package":"p","Test":"TestX","Elapsed":0.1}
+{"Action":"pass","Package":"p","Elapsed":0.1}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reportEnv := ok("test-report", "add", "upper-case-report.json", "--format", "GO-JSON")
+	if got := reportEnv["data"].(map[string]any)["report"].(map[string]any)["format"]; got != "go-json" {
+		t.Fatalf("stored report format = %v, want go-json (declared spelling, canonicalised from GO-JSON)", got)
 	}
 	// Widening: a case-variant status now moves the ticket.
 	ok("mv", "AIRA-1", "IN-PROGRESS")

@@ -368,7 +368,15 @@ the attestation chain is untouched.
    every face.
 3. No CLI spelling accepted on `4098ad9` for a subverb is refused (`list` is preserved). For
    non-subverb enums the CLI now refuses exactly what MCP refused, except that matching is
-   case-insensitive on both.
+   case-insensitive on both. The one deliberate narrowing is options: the CLI now refuses an
+   option the selected subverb's operation does not declare (`req ls --status`, `rant ls
+   --severity`, `gate ls --checker`, `spend ls --provider`, `test-report ls --format`, and
+   `gate add --gate_id`, which no builder consumed), because each was accepted and discarded
+   with exit 0. No option that had an effect is refused. `gate add|set --canary_id` is now
+   forwarded (it was accepted and dropped). MCP narrows in step: an operation that declares no
+   arguments (`gate ls`, `gate check`) accepts none. Every option parseArgs admits either
+   changes the built request or is refused by name (`TestEveryAcceptedOptionIsConsumedOrRefused`;
+   the two options consumed outside the builder are listed there with their reason).
 4. Rant severity has one list: the declaration is built from the domain constants, and a test
    pins the SQLite `CHECK` to it.
 5. `E_TRANSITION_INVALID` is returned only for two known statuses on a forbidden edge.
@@ -434,6 +442,28 @@ test runs in `make ci`.
   accepted and discarded by a sibling subverb is now refused; no option that had an effect is.
   `link A blocked-by B` still gives AIRA-291's forward-command refusal (twin: the check must
   accept inverse kinds).
+- Consumed-or-refused matrix (build round 3): `TestEveryAcceptedOptionIsConsumedOrRefused` walks
+  `parseArgsAllowedOptions` (the per-verb set `parseArgs` admits) against a base invocation per
+  subverb. For each (verb, subverb, option) pair it builds with and without the option and
+  requires a refusal naming the option or a different `Request.Args`; a documented allowlist
+  covers options consumed after `buildRequest` (`spend add --usage-file`, `init --id-prefix`) or
+  whose only effect is a builder check (`ready --list`). Counterexample it pins: `gate add G ...
+  --canary_id mine` exited 0 and bound `G-canary`. Mutations RED: re-admit `gate_id` and drop the
+  `canary_id` forward. `TestGateCanaryIDOptionForwardedAndGateIDRefused` pins the gate cases
+  directly (`canary-run C --canary_id D` is refused: the id is positional there).
+- Refusal-table shape (build round 3): the table includes bare flags (`test-report ls --all`,
+  `rant capture --unreviewed`, `spend ls --reasoning-subset`) and an undeclared option among
+  declared ones in first, middle and last sorted position (`find ls`). Mutations RED: exempt
+  `value == "true"`; inspect only the first or only the last sorted option.
+- One fault, one code (build round 3): the undeclared-option refusal now runs even when a builder
+  value check failed first (`test-report add r.json --all` reports `--all`, not the missing
+  `--format`), so a fix is not followed by a second refusal under a second code. Mutation RED:
+  run the refusal only after a successful build. A builder that fails before choosing a subverb
+  leaves none to check, so its own text stands.
+- `--format GO-JSON` (build round 3): `TestUpperCaseEnumValuesStillAccepted` ingests a real
+  report and requires the stored `report.format` to be `go-json`, so a canonicalised value is
+  distinguished from `GO-JSON` passed through. Mutation RED: skip the canonical rewrite in
+  `canonicalEnumArgs`.
 - `TestEnumRefusalIdenticalAcrossFaces`: the same faults (`rant` severity `P1`, `mv` status
   `in_progress`, `create` severity `p9`) through the CLI JSON envelope, the MCP `tools/call`
   result and the TUI palette submission give byte-identical `error` strings. Mutations: keep
@@ -598,6 +628,16 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race 
   sees its own definition for markers holding those characters too (3.7 item 4): a clean tree
   can fail a "none of X" gate and a "X must be present" gate can pass on its own argv. Scan a
   source directory, not `.`. No such gate exists in aira or fastest-ee.
+- **Per-face code difference (210).** The same undeclared option is `E_SELECTOR_INVALID` (exit 2)
+  on the CLI and `E_ARGUMENT_INVALID` (JSON-RPC `-32602`, `unknown argument`) on MCP, because
+  the CLI refuses in its builder before a request exists and MCP refuses in `decodeMCPRequest`.
+  Both refuse the same set (the same table); the text and code differ. Accepted, not unified.
+- **`supervisorReadyFD` argv scan (294).** It scans the whole `__supervise` argv for
+  `--ready-fd N` and returns the last non-negative match, not just the one aira placed. aira
+  builds that argv itself (`detach_linux.go:42`: `--control`, `--ready-fd 3`, `--ack-fd 4`; the
+  supervised command travels in the control file, not argv), so a second `--ready-fd` can only
+  come from a hand-invoked `__supervise`. Accepted residual: the scan is a convention, not a
+  parser boundary, and `supervisorReadyFD` is deliberately not changed in this batch.
 - **Skill text** (208's sentence) needs a separate `aira skill install ~/.claude/skills/aira
   --force` at release.
 
@@ -624,7 +664,15 @@ speed, naming these changes:
 - MCP enum faults now arriving as tool errors;
 - gate and canary files now write `&`, `<`, `>` literally, so whole-tree marker gates see their
   own definition for such markers (scan a source directory, not `.`; 3.7 item 4);
-- `req ls --status <anything>` is refused (ls never filtered by status; MCP already refused it).
+- `req ls --status <anything>` is refused (ls never filtered by status; MCP already refused it);
+- the CLI now refuses every option the selected subverb does not declare (`rant ls --severity`,
+  `find ls --verdict`, `gate ls --checker`, `spend ls --provider`, `test-report ls --format`,
+  `gate <op> --gate_id`), each of which used to exit 0 and be discarded; `gate add|set
+  --canary_id` is now honoured (it used to be discarded). A script that passed such an option
+  and relied on exit 0 now gets `E_SELECTOR_INVALID`, exit 2;
+- MCP narrows in step: an operation that declares no arguments (`gate ls`, `gate check`) rejects
+  every argument (`unknown argument`, `-32602`); the CLI code for the same fault is
+  `E_SELECTOR_INVALID`, MCP's is `E_ARGUMENT_INVALID`/`-32602` (3.3, section 8).
 
 ## 11. Review log (v1 -> v2)
 
