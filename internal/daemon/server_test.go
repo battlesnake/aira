@@ -231,7 +231,11 @@ func TestServerRoutedResponseIsByteIdenticalToInProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	private, err := store.OpenDB(filepath.Join(filepath.Dir(paths.StateHome), "private", "state.db"), filepath.Join(filepath.Dir(paths.StateHome), "private", "registry.jsonl"))
+	// The in-process view opens a second handle on the daemon's own state: the
+	// repository's audit log now belongs to that one state (AIRA-301), so a
+	// separate private state over the same repository is refused at
+	// registration with E_STATE_NOT_OWNER.
+	private, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
 	if err != nil {
 		t.Fatal(err)
 	}

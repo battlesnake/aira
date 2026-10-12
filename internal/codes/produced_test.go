@@ -83,7 +83,6 @@ var producedNotCatalogued = map[string]string{
 // decision this layering move deliberately does not make.
 var cataloguedNotProduced = map[string]string{
 	"E_DB_CORRUPT":            "Designed in the phase-1 spec (\"the DB cannot be opened or schema integrity fails\") and bucketed at 4 by the M10 gates spec. No producer is wired: store surfaces driver failures as E_INTERNAL today.",
-	"E_RECONCILE_REQUIRED":    "Designed in the phase-1 spec as the refusal to proceed on a stale projection. The runner analogue E_RUN_RECONCILE_REQUIRED is produced; this store-level one is not.",
 	"E_RELATION_UNOBSERVABLE": "Consumed but not produced: five non-test sites in store match on it (check.go:330, check.go:584, relation_ready.go:350, :552, :727) and W_RELATION_UNOBSERVABLE is derived from it, but no site emits it. Its producer is gone while the guards remain.",
 	"E_TOKEN_WORKTREE":        "Registered with the lease-token family when domain failure codes were documented. No lease path emits it; a token bound to the wrong worktree fails as E_LEASE_TOKEN.",
 	"U_INSIGHT_UNEVALUATED":   "Registered ahead of its producer by the M15 insights design, which specifies it for a gauge value that cannot be established. The insight gauges do not raise it yet.",
@@ -378,6 +377,10 @@ func TestStateConflictCodesExitOne(t *testing.T) {
 		// A stored rant already claims this idempotency key with different input
 		// (store/rant.go:66). The key is the caller's to choose.
 		"E_RANT_IDEMPOTENCY_CONFLICT": 1,
+		// AIRA-301: <common>/aira/owner.json names another AIRA state or cannot be
+		// read (store/audit_owner.go). Move the marker on purpose and the same
+		// request succeeds.
+		"E_STATE_NOT_OWNER": 1,
 	}
 	for code, exit := range want {
 		catalogued, ok := ExitCodes[code]

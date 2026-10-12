@@ -409,6 +409,12 @@ var ExitCodes = map[string]int{
 	"E_RELATION_TARGET_MISSING": 1, "E_RELATION_UNOBSERVABLE": 1,
 	"E_WRITE_CONFLICT": 1, "E_PROJECT_MISMATCH": 1,
 	"E_ID_UNRESOLVED": 1, "E_DUPLICATE_ID": 1, "E_PREFIX_OWNERSHIP_CONFLICT": 1,
+	// AIRA-301. <common>/aira/owner.json names another AIRA state, or cannot be
+	// read, so this state may not register in the repository or write its shared
+	// audit log. A well-formed request refused by durable state that succeeds
+	// once the state changes (the owner marker is moved on purpose), so 1 by the
+	// rule in the package comment, beside E_PREFIX_OWNERSHIP_CONFLICT.
+	"E_STATE_NOT_OWNER": 1,
 	// E_PATH_INTENT_UNRESOLVED is deliberately absent (AIRA-73): it meant "this
 	// intent needs explicit materialise/retire resolution", the vocabulary of
 	// the deleted outbox.resolution mechanism. Nothing ever produced it, and
