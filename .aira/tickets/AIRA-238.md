@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-238","project":"aira","title":"aitest v0.7 S2b follow-ups: growth-path per-nodeid ExceedsCeiling + stale docstrings + telemetry-adequacy gauge","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["aitest"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-238","project":"aira","title":"aitest v0.7 S2b follow-ups: growth-path per-nodeid ExceedsCeiling + stale docstrings + telemetry-adequacy gauge","status":"retired","kind":"chore","severity":"P3","assignee":null,"milestone":null,"labels":["aitest"],"hold":false,"relations":[]}
 ---
 Non-blocking items deferred from the S2b build-review (wf_9f54130b, verdict FIX-THEN-MERGE). The HIGH honesty cluster + the retire-on-no-fit coverage guard were fixed IN the S2b PR (AIRA-235); these LOW items were explicitly allowed as follow-up.
 
@@ -12,3 +12,11 @@ Non-blocking items deferred from the S2b build-review (wf_9f54130b, verdict FIX-
 4. Pool-usage adequacy gauge (LOW): under per-test sizing the pool is heterogeneously capped, so the adequacy gauge conflating max-cap and max-peak across the pool is coarser than before. The S2b PR corrected the --budget-basis provenance label + the 'uniformly sized' comment; this is the deeper gauge-semantics refinement (report per-worker or note the heterogeneity in the gauge).
 
 All LOW / non-blocking; batch when convenient. Source refs in wf_9f54130b build-review output.
+
+## Triage 2026-10-12 (goal: clear remaining known issues)
+
+**Disposition:** retired. **State on master v0.34:** still-open.
+
+The only behavioural item (1) is judged effectively unreachable by the original reviewer. If it ever fires it still gives an honest 'unevaluated' for the queued tests, never a fake pass. Fixing it means duplicating the per-nodeid pop/mark/reason block into the growth path, or extracting a helper, for a window that cannot realistically be hit. That is machinery added for a case that does not occur, so the primitive stays and the gap is documented. Items 2 and 3 are prose nits. Item 4 is a telemetry-only gauge refinement, already documented in the supervisor.py:2416 comment, and per-worker reporting would be new machinery for an advisory number. Closing as wontfix. If anyone touches supervisor.py or test_supervisor.py near these lines anyway, they can fold in the two one-line comment/docstring corrections (supervisor.py:628-632 and test_supervisor.py:1383-1398) at no extra cost.
+
+**Evidence:** git log --all --grep AIRA-238 finds no fix commit. Items 1-3 are still as filed. (1) internal/pylib/aitest/supervisor.py:2663-2665: _try_grow_one's claim except-block still calls _fail_queue_terminal(str(exc)) for any WorkerAdmitTerminal, with no exceeds-ceiling split. Only _bootstrap_from_empty_pool (supervisor.py:2705-2720) has the per-nodeid branch. (2) supervisor.py:628-632 comment says a jobs-scaled exceeds-ceiling 'MAY be per-nodeid unevaluated' and does not say the growth path is whole-queue. (3) internal/pylib/aitest/test_supervisor.py:1383-1398 docstring still describes _replace_worker's deleted nested try/except. (4) Partly addressed: supervisor.py:2416-2425 documents that the --budget value is the LARGEST cap across the heterogeneous pool, with a cap: basis label. No per-worker gauge exists. The ticket says S2b review judged (1) effectively unreachable (needs 8+ cross-session admissions in a sub-ms probe-to-enqueue window with >=512MiB outstanding). Ticket status is 'planned', P3, kind chore, unheld, no milestone, no relations.

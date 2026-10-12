@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-189","project":"aira","title":"aira spend records a model field on write but computeDistribution's --by never supports grouping by it","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["spend"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-189","project":"aira","title":"aira spend records a model field on write but computeDistribution's --by never supports grouping by it","status":"retired","kind":"bug","severity":"P3","assignee":null,"milestone":null,"labels":["spend"],"hold":false,"relations":[]}
 ---
 
 Peer report (devproc, 2026-09-08), verified from source.
@@ -46,3 +46,11 @@ per-model cost is only correctly computable as an event-level
 aggregation, which is exactly what `--by model` would give directly.
 This makes the fix a genuine correctness gap for that use case, not
 merely a convenience the join already covers.
+
+## Triage 2026-10-12 (goal: clear remaining known issues)
+
+**Disposition:** retired. **State on master v0.34:** still-open.
+
+The minimal fix (add a `model` case) is a 3-line change but yields only event counts, which is not the per-model cost the ticket claims it needs; the real need is met today by grouping the event-level `rows` that `spend ls` already returns (model + cost_usd + buckets per row), and a proper SpendByModel cost aggregation would be a new feature with a missing-cost honesty design for a P3 reporter convenience. Under 'primitives not judgement' and 'keep the primitive, document the gap', close as wontfix and add one line to the `spend ls` help noting that rows carry model/cost_usd for client-side grouping. If the owner wants allowlist parity anyway, it is a trivial `case "model": value = row.Model` plus the allowlist entry and a test, but it should not be sold as a correctness fix.
+
+**Evidence:** Still reproduces on master. internal/core/core.go:2781-2784 computeDistribution rejects any `by` not in provider/ticket/phase/conservation with E_SELECTOR_INVALID; `model` is only a write-side field (domain/compute.go:92, required at :257). Query filters (internal/store/compute.go ~line 497) also accept only ticket/phase/provider/session, so there is no `model:` filter either. git log --all --grep AIRA-189 shows only the two filing commits (24e39b6, 6d61c5e); no fix commit. Facts that undercut the ticket's justification: (1) the `spend ls` response always returns the full event-level `rows` (core.go:1322-1333 returns total+rows+distribution; ListComputeEvents has no limit), and every row carries model, cost_usd and the four buckets, so event-level per-model aggregation is already possible client-side with one group-by; the follow-up's 'only computable event-level' is satisfied by `rows`. (2) The distribution is an event COUNT map[string]int (core.go:2785-2803), so adding a `model` case would give events-per-model, not per-model cost; the reporter's stated need (cost comparison) would still need a sum. (3) cost_usd is optional/caller-supplied, so a true per-model cost sum would need an honesty design (missing cost = unevaluated, not 0) like SpendBySession's lower-bound note (core.go ~2775). (4) `--by phase` is intercepted at core.go:1311 before computeDistribution, so that case is already dead code; the list is already uneven.

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-221","project":"aira","title":"A daemon restart discards the AIRA-29 peak ratchet: adoption re-derives from live RSS with no memory of a job's demonstrated peak","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-221","project":"aira","title":"A daemon restart discards the AIRA-29 peak ratchet: adoption re-derives from live RSS with no memory of a job's demonstrated peak","status":"superseded","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood"],"hold":false,"relations":[]}
 ---
 > Found during the 2026-09-09 deploy of PR #125, alongside AIRA-220. Distinct
 > defect, same trigger (a daemon restart), opposite axis: AIRA-220 is a reporting
@@ -99,3 +99,11 @@ The magnitude was established from source only — the mechanism is certain, but
 instance was measured, because measuring it needs a deliberate restart while a
 job with a known peak-then-release profile is running. The command that would
 settle it is in HOW TO TEST above.
+
+## Triage 2026-10-12 (goal: clear remaining known issues)
+
+**Disposition:** superseded. **State on master v0.34:** already-fixed.
+
+The AIRA-29 dynamic live-charge and its ratchet were deliberately deleted in S1 of the v0.6 admission-counter rebuild, and scan-adoption in S12/S14. Restart recovery now re-declares each job's declared reserve through the signed ledger, so the failure mode "adoption re-derives from live RSS and forgets the peak" cannot occur. Proposed options 1 and 2 (adopt at max(RSS, memory.peak) or at cap) would re-add exactly the live-usage machinery that was removed. Close as superseded by the v0.6 rebuild (AIRA-221 relates to AIRA-220, which is done). No code change needed.
+
+**Evidence:** Both code paths the ticket names were deleted by the admission-counter rebuild (v0.6). Commit 9a2f65c (S1, 2026-09-11) removed recomputeWaiterCharge, refreshWaiterCharge, the trackedRatchet/peakSoFar/chargeTracked fields and the dynamicReserve flag. Its message: "ledgerCharge() returns w.reserve, with no live-usage tracking (declared-only model)". Current ledgerCharge is at internal/daemon/admit.go:300; grep for trackedRatchet|peakSoFar|dynamicReserve over *.go returns nothing. The scan-adoption path (admit.go:2574-2586) was deleted in S12/S14: admit.go:2345 says "The AIRA-74 scan-adoption addend is gone; a post-restart survivor is counted ONCE via S11's reload + re-declare" and admit.go:962 says "scan-adopted scopes. S11's reload + re-declare re-seeds ... " Survivors re-declare their DECLARED reserve (internal/daemon/redeclare_frame.go:40-70, redeclareCharge{RAM: RAMBytes}), not live RSS + margin. Under a declared-only model a job is charged its declared reserve for its whole lease before and after a restart, so no ratchet exists to lose. The restart-honesty tests (restart_honesty_test.go, restart_freeze_test.go, scan_removed_test.go) cover the new path. The ticket was never closed (status "planned") and the only commit mentioning it is 954cc95, which filed it on 2026-09-09, before the rebuild.

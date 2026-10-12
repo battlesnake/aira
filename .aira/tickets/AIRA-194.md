@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-194","project":"aira","title":"A zero-reserve pass-through confine mode -- group-kill + cgroup grouping for an orchestrator whose children all self-confine, contributing nothing to the admission ledger","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-194","to":"AIRA-195"}]}
+{"schema":1,"id":"AIRA-194","project":"aira","title":"A zero-reserve pass-through confine mode -- group-kill + cgroup grouping for an orchestrator whose children all self-confine, contributing nothing to the admission ledger","status":"retired","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-194","to":"AIRA-195"}]}
 ---
 
 Peer proposal (fastest-ee-4b, 2026-09-09), designing per-sub-job `aira
@@ -71,3 +71,11 @@ be achievable at all without new machinery beyond a zero-reserve flag.
 Architecturally significant enough to need its own plan and two-loop gate
 before building, matching how [[AIRA-178]] was handled tonight (evidence
 + sketch, not built).
+
+## Triage 2026-10-12 (goal: clear remaining known issues)
+
+**Disposition:** retired. **State on master v0.34:** still-open.
+
+Greenfield minimum: the only problem is an outer wrapper that over-reserves for children that account for themselves. That is already solved by not wrapping, or by --memory-reserve 1M, with zero new code. A true zero-reserve pass-through would add a mode whose safety rests on an invariant AIRA cannot verify (every byte was reserved by a child), and it makes unnoticed orphans strictly worse. The group-kill benefit is structurally impossible without new sibling-to-child cgroup nesting or parent-tracking machinery, which is exactly the per-feature complexity AIRA rejects ("keep the primitive + document the gap"). Close as wontfix with a note: use --memory-reserve 1M (or drop the outer wrapper) for self-confining orchestrators; the orphan visibility/kill problem lives in AIRA-195 and should be judged there on its own merits.
+
+**Evidence:** Ticket status=planned, no commit beyond filing (git log --all --grep AIRA-194: only e136e69, 18e77ff). No pass-through/zero-reserve flag exists (grep over *.go finds none). Ledger half is already reachable: cmd/aira/main.go:1117-1123 and :1549-1561 accept --memory-reserve down to a 1MiB floor, and internal/runner/confine.go:108-119 ResolveConfineReserve honours a pinned value, so `aira confine --memory-reserve 1M -- make merge-gate` charges ~nothing (assumed, not run: a pinned reserve with no --memory-max sets no sub-cap). Group-kill half is not achievable by a flag: nested confine makes a SIBLING scope (cmd/aira/confine_nested.go:7-14; AIRA-187 done), so cgroup.kill on the outer scope cannot reach children; that is AIRA-195 (planned, P2 bug), which the reporter says gates 194. Peer's repo-side mitigation (stop wrapping self-confining legs) already removes the originating need, and the AIRA-187 fix (PR #117 warning) records that dropping the inner/outer wrapper costs nothing.
