@@ -88,8 +88,8 @@ func (s *Server) SetWorkerScopeTreeForTest() {
 // with NewServer and never call Serve (which is where production resolves the
 // mode from the durable record).
 //
-// It sets the mode ONLY. The three re-sourced seams are resolved lazily at each
-// point of use (sliceResolver, memoryReader, confineScan), so a test may still
+// It sets the mode ONLY. The two re-sourced seams are resolved lazily at each
+// point of use (sliceResolver, memoryReader), so a test may still
 // override any of them afterwards and its override wins — which is what lets a
 // ledger test inject a small synthetic budget without a container cgroup.
 func (s *Server) SetConfineShimModeForTest(budgetBytes int64, source, cgroupPath string) {

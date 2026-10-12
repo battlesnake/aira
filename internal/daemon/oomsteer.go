@@ -94,7 +94,7 @@ const (
 
 const (
 	// defaultOOMSteerInterval must be FASTER than the admission scan cadence
-	// (admitConfineScanIntervalDefault, <=1s). A loop no faster could not sample
+	// (oomSteerIntervalCeiling, <=1s). A loop no faster could not sample
 	// a burst before it drives the slice into an OOM, and the admission scan
 	// reads only declared reserves in any case.
 	defaultOOMSteerInterval = 250 * time.Millisecond

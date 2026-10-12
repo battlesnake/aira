@@ -241,7 +241,7 @@ func oomSteerModeFromEnv() (oomSteerMode, error) {
 }
 
 // oomSteerIntervalFromEnv bounds the cadence BELOW the admission charge refresh
-// (admitConfineScanIntervalDefault, 1s). A slower loop would only ever see RSS
+// (oomSteerIntervalCeiling, 1s). A slower loop would only ever see RSS
 // readings the ledger had already absorbed into the charge, which is precisely
 // the inertness AIRA-29 §3.6 refused to ship — so an interval at or above one
 // second is a configuration error, not a slow but working setting.
@@ -251,8 +251,8 @@ func oomSteerIntervalFromEnv() (time.Duration, error) {
 		return defaultOOMSteerInterval, nil
 	}
 	interval, err := time.ParseDuration(value)
-	if err != nil || interval < 50*time.Millisecond || interval >= admitConfineScanIntervalDefault {
-		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_OOM_STEER_INTERVAL must be a Go duration in [50ms,%s)", admitConfineScanIntervalDefault)
+	if err != nil || interval < 50*time.Millisecond || interval >= oomSteerIntervalCeiling {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_OOM_STEER_INTERVAL must be a Go duration in [50ms,%s)", oomSteerIntervalCeiling)
 	}
 	return interval, nil
 }
