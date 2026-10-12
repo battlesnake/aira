@@ -3072,11 +3072,11 @@ func RunConfineSetup(argv []string, diagnostics io.Writer) int {
 }
 
 func verifyConfineSetupScope() error {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return err
 	}
-	path, err := currentCgroupPath(mount)
+	path, err := CurrentCgroupPath(mount)
 	if err != nil {
 		return err
 	}
@@ -3112,7 +3112,7 @@ func hasFiniteCapAncestor(mount, path string) bool {
 // hierarchical, so the effective ceiling is the minimum finite value in the
 // ancestry — an uncapped slice under a capped parent is still bounded.
 func effectiveConfineCap(path string) (int64, bool) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return 0, false
 	}
@@ -3148,17 +3148,7 @@ func writeConfineHandshake(writer io.Writer, result confineHandshake) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	for len(payload) > 0 {
-		n, writeErr := writer.Write(payload)
-		if writeErr != nil {
-			return writeErr
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		payload = payload[n:]
-	}
-	return nil
+	return writeAll(writer, payload)
 }
 
 // confineIOPriority encodes the ioprio_set value: the I/O class in the high bits

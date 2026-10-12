@@ -17,8 +17,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const cloneIntoCgroup = uintptr(1 << 33)
-
 type linuxScopeBackend struct{ parent string }
 type linuxScope struct {
 	path              string
@@ -29,7 +27,9 @@ type linuxScope struct {
 
 func newDefaultBackend(parent string) ScopeBackend { return &linuxScopeBackend{parent: parent} }
 
-func unifiedMount() (string, error) {
+// UnifiedCgroupMount returns the cgroup-v2 unified mount point from
+// /proc/self/mountinfo, with mountinfo's octal escapes undone.
+func UnifiedCgroupMount() (string, error) {
 	f, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
 		return "", err
@@ -63,7 +63,9 @@ func unescapeMount(s string) string {
 	return s
 }
 
-func currentCgroupPath(mount string) (string, error) {
+// CurrentCgroupPath returns this process's unified-hierarchy cgroup directory
+// under mount, read from the "0::" line of /proc/self/cgroup.
+func CurrentCgroupPath(mount string) (string, error) {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		return "", err
@@ -118,13 +120,13 @@ func (b *linuxScopeBackend) Probe(ctx context.Context) error {
 	if !kernelAtLeast514() {
 		return errors.New("kernel < 5.14")
 	}
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return err
 	}
 	parent := b.parent
 	if parent == "" {
-		parent, err = currentCgroupPath(mount)
+		parent, err = CurrentCgroupPath(mount)
 		if err != nil {
 			return err
 		}
@@ -171,18 +173,18 @@ func ensureParent(parent string) error {
 }
 
 func (b *linuxScopeBackend) Create(ctx context.Context, id string) (Scope, error) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		return nil, err
 	}
 	parent := b.parent
 	if parent == "" {
-		parent, err = currentCgroupPath(mount)
+		parent, err = CurrentCgroupPath(mount)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if filepath.IsAbs(parent) == false {
+	if !filepath.IsAbs(parent) {
 		return nil, errors.New("cgroup parent must be absolute")
 	}
 	cleanParent := filepath.Clean(parent)

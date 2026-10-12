@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -392,7 +393,7 @@ func TestAIRA126TimeoutAgainstAlreadyExitedLeaderArbitratesToExited(t *testing.T
 		if !record.KillIntent.NotExecuted || record.KillIntent.Completed || record.ScopeKill.Started {
 			t.Fatalf("iteration %d: undisposed or over-claimed intent: %+v", i, record)
 		}
-		if containsString(record.ErrorCodes, "E_RUN_TIMEOUT") || containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+		if slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") || slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 			t.Fatalf("iteration %d: a kill that delivered nothing was reported as a timeout: %+v", i, record)
 		}
 		if terminated, killed := h.scope.signalled(); terminated || killed {
@@ -441,7 +442,7 @@ func TestAIRA126LiveLeaderAtDeadlineStillTimesOut(t *testing.T) {
 	if !record.KillIntent.Present || record.KillIntent.Completed {
 		t.Fatalf("the deadline's intent evidence was lost: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") || !containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") || !slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("the breached deadline lost its evidence codes: %+v", record)
 	}
 	if got := terminalRecords(t, h.r); got != 0 {
@@ -559,7 +560,7 @@ func TestAIRA126DetachedFinaliserDoesNotReportKilledForNotExecutedIntent(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.Status != StatusExited || final.KillIntent.Completed || containsString(final.ErrorCodes, "E_RUN_KILLED") {
+	if final.Status != StatusExited || final.KillIntent.Completed || slices.Contains(final.ErrorCodes, "E_RUN_KILLED") {
 		t.Fatalf("a not-executed intent was read as a kill: %+v", final)
 	}
 	if !final.KillIntent.NotExecuted {
@@ -579,7 +580,7 @@ func TestAIRA126DetachedNoChildDoesNotReportKilledForNotExecutedIntent(t *testin
 	if final == nil {
 		t.Fatal("no record was published")
 	}
-	if final.Status == StatusKilled || final.KillIntent.Completed || containsString(final.ErrorCodes, "E_RUN_KILLED") {
+	if final.Status == StatusKilled || final.KillIntent.Completed || slices.Contains(final.ErrorCodes, "E_RUN_KILLED") {
 		t.Fatalf("a not-executed intent was read as a kill: %+v", final)
 	}
 }
@@ -629,13 +630,13 @@ func TestAIRA126RealCgroupDeadlineStraddleSoak(t *testing.T) {
 				if !record.KillIntent.NotExecuted || record.KillIntent.Completed || record.ScopeKill.Started {
 					t.Fatalf("iteration %d: undisposed or over-claimed intent: %+v", i, record)
 				}
-				if containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+				if slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 					t.Fatalf("iteration %d: a kill that delivered nothing was reported as a timeout: %+v", i, record)
 				}
 			}
 		case StatusKilled:
 			straddled++
-			if !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") || !record.KillIntent.Completed || !record.ScopeKill.Completed {
+			if !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") || !record.KillIntent.Completed || !record.ScopeKill.Completed {
 				t.Fatalf("iteration %d: timeout evidence=%+v", i, record)
 			}
 		default:

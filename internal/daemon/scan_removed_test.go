@@ -28,9 +28,8 @@ func TestS14ScanAndVanishedLeaseReleaseRemovedFromSource(t *testing.T) {
 	// Each fails to compile if referenced from a deleted definition, but a struct
 	// field, a dotted field access, a JSON tag, a const or prose could survive a
 	// half-deletion — these are those survivors. None is a substring of a KEPT
-	// symbol: in particular the retained const admitConfineScanIntervalDefault is
-	// matched by none of them (the seam is caught by the dotted ".admitConfineScan"
-	// and the "func (s *Server) confineScan(" definition, never the bare const).
+	// symbol (the seam is caught by the dotted ".admitConfineScan" and the
+	// "func (s *Server) confineScan(" definition).
 	tokens := []string{
 		".admitConfineScan",             // the deleted scan seam field access (field + Interval field)
 		"func (s *Server) confineScan(", // the deleted scan entry-point method

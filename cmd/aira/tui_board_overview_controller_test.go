@@ -258,8 +258,7 @@ func TestOverviewClearSearchEmitsLazyFetch(t *testing.T) {
 	ov := newOverviewState()
 	ov.Cards = []overviewCard{availableCard("P1", "alpha", "/a")} // unloaded (no Data)
 	ov.Search = overviewSearchState{Active: true, Query: "zzz"}   // filters everything out
-	state := overviewTUIState(ov)
-	state, cmds := onOverviewSearchSubmit(state, "")
+	_, cmds := onOverviewSearchSubmit(overviewTUIState(ov), "")
 	if len(cmds) != 1 || cmds[0].Kind != cmdFetch || cmds[0].View != overviewCardView("/a") {
 		t.Fatalf("clearing the filter onto an unloaded card must emit its lazy fetch (the shell must submit it), got %+v", cmds)
 	}

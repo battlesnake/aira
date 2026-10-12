@@ -48,6 +48,15 @@ func TestTUIScreenInitFailureExitsCleanlyWithoutPanic(t *testing.T) {
 		tuiScreenInitFailureChild()
 		return
 	}
+	runScreenInitFailureChild(t, tuiScreenInitChildEnv, "the TUI")
+}
+
+// runScreenInitFailureChild re-runs the calling test as a terminal-less child
+// with envName=1 set and asserts the child failed cleanly: the honest
+// E_INTERNAL line and exit code, no panic. subject names the entry point in
+// the panic failure message.
+func runScreenInitFailureChild(t *testing.T, envName, subject string) {
+	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatalf("locating the test binary: %v", err)
@@ -59,7 +68,7 @@ func TestTUIScreenInitFailureExitsCleanlyWithoutPanic(t *testing.T) {
 	// compiled-in database. Without it an unset/unknown TERM would fail EARLIER,
 	// in NewScreen rather than Init, which leaves tview holding NO screen and so
 	// never reaches the bug — a false pass. Later duplicates win in Cmd.Env.
-	command.Env = append(os.Environ(), tuiScreenInitChildEnv+"=1", "TERM=xterm")
+	command.Env = append(os.Environ(), envName+"=1", "TERM=xterm")
 	// Setsid detaches the child from any controlling terminal this test may have
 	// inherited, and every standard stream below is /dev/null or a pipe, so the
 	// child cannot acquire a new one: exactly the terminal-less context of the
@@ -87,7 +96,7 @@ func TestTUIScreenInitFailureExitsCleanlyWithoutPanic(t *testing.T) {
 		t.Skipf("unevaluated: %s", strings.TrimSpace(text))
 	}
 	if strings.Contains(text, "panic:") {
-		t.Fatalf("the TUI panicked on a screen-init failure instead of failing cleanly; output:\n%s", text)
+		t.Fatalf("%s panicked on a screen-init failure instead of failing cleanly; output:\n%s", subject, text)
 	}
 	if !strings.Contains(text, "E_INTERNAL: tui:") {
 		t.Fatalf("the honest E_INTERNAL error was not printed; output:\n%s", text)

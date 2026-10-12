@@ -123,7 +123,7 @@ func (s *referencePathScope) Reference() string { return s.ref }
 func TestScopeMembershipLeaderRelocatesIntoNestedSubScopeIsNotMigrated(t *testing.T) {
 	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
 	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		t.Skip(err)
 	}
@@ -162,7 +162,7 @@ func TestScopeMembershipLeaderRelocatesIntoNestedSubScopeIsNotMigrated(t *testin
 func TestScopeMembershipLeaderRelocatesOutOfScopeIsStillMigrated(t *testing.T) {
 	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
 	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		t.Skip(err)
 	}
@@ -194,7 +194,7 @@ func TestScopeMembershipLeaderRelocatesOutOfScopeIsStillMigrated(t *testing.T) {
 func TestScopeMembershipLeaderAbsentWithUnreadableCgroupIsGapNotMigrated(t *testing.T) {
 	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
 	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		t.Skip(err)
 	}

@@ -357,7 +357,7 @@ func cloneFloat64(value *float64) *float64 {
 }
 
 func cloneResourceUsage(value domain.ResourceUsage) domain.ResourceUsage {
-	return domain.ResourceUsage{WallMS: cloneInt64(value.WallMS), CPUUser: cloneInt64(value.CPUUser), CPUSys: cloneInt64(value.CPUSys), PeakRSS: cloneInt64(value.PeakRSS)}
+	return domain.ResourceUsage{WallMS: domain.CloneInt64(value.WallMS), CPUUser: domain.CloneInt64(value.CPUUser), CPUSys: domain.CloneInt64(value.CPUSys), PeakRSS: domain.CloneInt64(value.PeakRSS)}
 }
 
 func optionalInt64(value *int64) any {
@@ -375,24 +375,7 @@ func optionalFloat64(value *float64) any {
 }
 
 func nextComputeNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {
-	var number, sequence int64
-	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM compute_event_counter WHERE project_id=?`, project).Scan(&number, &sequence)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO compute_event_counter(project_id,next_number,next_seq) VALUES(?,?,?)`, project, 2, 2); err != nil {
-			return 0, 0, err
-		}
-		return 1, 1, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	if number < 1 || sequence < 1 {
-		return 0, 0, errors.New(domain.ComputeCodeInvalid + ": compute event counter is invalid")
-	}
-	if _, err := conn.ExecContext(ctx, `UPDATE compute_event_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
-		return 0, 0, err
-	}
-	return number, sequence, nil
+	return nextCounterNumbers(ctx, conn, project, "compute_event_counter", domain.ComputeCodeInvalid+": compute event counter is invalid")
 }
 
 // computeModSource is the fixed source of the Claude usage mod (AIRA-284).
@@ -637,7 +620,7 @@ func (s *Store) AddQuotaSnapshot(ctx context.Context, input domain.QuotaSnapshot
 		if err != nil {
 			return err
 		}
-		snapshot := domain.QuotaSnapshot{ID: fmt.Sprintf("QS-%d", number), Provider: input.Provider, At: input.At, Window: input.Window, Used: cloneInt64(input.Used), Limit: cloneInt64(input.Limit), Remaining: cloneInt64(input.Remaining), ResetAt: input.ResetAt, Source: input.Source, AtSeq: sequence}
+		snapshot := domain.QuotaSnapshot{ID: fmt.Sprintf("QS-%d", number), Provider: input.Provider, At: input.At, Window: input.Window, Used: domain.CloneInt64(input.Used), Limit: domain.CloneInt64(input.Limit), Remaining: domain.CloneInt64(input.Remaining), ResetAt: input.ResetAt, Source: input.Source, AtSeq: sequence}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO quota_snapshots(project_id,id,provider,at,window,used,limit_value,remaining,reset_at,source,at_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, s.projectID, snapshot.ID, snapshot.Provider, snapshot.At, snapshot.Window, optionalInt64(snapshot.Used), optionalInt64(snapshot.Limit), optionalInt64(snapshot.Remaining), snapshot.ResetAt, snapshot.Source, snapshot.AtSeq); err != nil {
 			return err
 		}
@@ -654,33 +637,8 @@ func (s *Store) AddQuotaSnapshot(ctx context.Context, input domain.QuotaSnapshot
 	return result, err
 }
 
-func cloneInt64(value *int64) *int64 {
-	if value == nil {
-		return nil
-	}
-	v := *value
-	return &v
-}
-
 func nextQuotaNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {
-	var number, sequence int64
-	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM quota_snapshot_counter WHERE project_id=?`, project).Scan(&number, &sequence)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO quota_snapshot_counter(project_id,next_number,next_seq) VALUES(?,?,?)`, project, 2, 2); err != nil {
-			return 0, 0, err
-		}
-		return 1, 1, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	if number < 1 || sequence < 1 {
-		return 0, 0, errors.New(domain.ComputeCodeInvalid + ": quota snapshot counter is invalid")
-	}
-	if _, err := conn.ExecContext(ctx, `UPDATE quota_snapshot_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
-		return 0, 0, err
-	}
-	return number, sequence, nil
+	return nextCounterNumbers(ctx, conn, project, "quota_snapshot_counter", domain.ComputeCodeInvalid+": quota snapshot counter is invalid")
 }
 
 func (s *Store) evictQuotaSnapshots(ctx context.Context, conn *sql.Conn) (int, error) {

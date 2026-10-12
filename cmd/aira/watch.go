@@ -26,7 +26,6 @@ func runWatchLoop(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 	if request.Args == nil {
 		request.Args = map[string]any{}
 	}
-	cursor := watchRequestInt64(request.Args["from"])
 	backoff := watchBackoffMin
 	for {
 		if ctx.Err() != nil {
@@ -70,11 +69,10 @@ func runWatchLoop(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 				return codes.ExitForCode("E_INTERNAL")
 			}
 		}
-		cursor = batch.Cursor
 		request.Args["from_now"] = false
 		// Send the cursor as a decimal STRING so a > 2^53 sequence is never
 		// rounded through float64 on the daemon's request decode (Sol build r1 #3).
-		request.Args["from"] = strconv.FormatInt(cursor, 10)
+		request.Args["from"] = strconv.FormatInt(batch.Cursor, 10)
 		if batch.EOF {
 			// A watch is durable across daemon restarts. eof means THIS daemon
 			// instance is stopping — do NOT exit. Reconnect and continue from the
@@ -99,19 +97,7 @@ func runWatchLoop(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 }
 
 func decodeWatchResponse(response core.Response) (daemon.WatchResponse, error) {
-	var batch daemon.WatchResponse
-	data := response.RawData
-	if len(data) == 0 {
-		var err error
-		data, err = json.Marshal(response.Data)
-		if err != nil {
-			return batch, err
-		}
-	}
-	if err := json.Unmarshal(data, &batch); err != nil {
-		return batch, err
-	}
-	return batch, nil
+	return decodeResponseData[daemon.WatchResponse](response)
 }
 
 func printWatchEvent(out io.Writer, event store.WatchEvent, jsonOutput bool) error {
@@ -148,21 +134,5 @@ func waitWatchBackoff(ctx context.Context, upper time.Duration) bool {
 		return true
 	case <-ctx.Done():
 		return false
-	}
-}
-
-func watchRequestInt64(value any) int64 {
-	switch value := value.(type) {
-	case int64:
-		return value
-	case int:
-		return int64(value)
-	case float64:
-		return int64(value)
-	case string:
-		parsed, _ := strconv.ParseInt(value, 10, 64)
-		return parsed
-	default:
-		return 0
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -358,23 +359,6 @@ func TestUsageEvidenceMergesOnlyEvaluatedMetrics(t *testing.T) {
 	mergeUsage(&base, RunRecord{CPUSys: &sys})
 	if base.PeakRSS == nil || *base.PeakRSS != 100 || base.CPUUser == nil || *base.CPUUser != 7 || base.CPUSys == nil || *base.CPUSys != 9 {
 		t.Fatalf("partial usage merge=%+v", base)
-	}
-}
-
-func TestArbitrationWaitBeforeIntentWinsExactlyOnce(t *testing.T) {
-	var state Arbitration
-	if !state.Wait() || state.Intent() {
-		t.Fatal("kill intent displaced a published wait")
-	}
-	if !state.CommitWait(StatusExited) || state.CommitWait(StatusExited) {
-		t.Fatal("wait terminal slot was not unique")
-	}
-	if state.CommitKill() {
-		t.Fatal("kill committed after exited")
-	}
-	state = Arbitration{}
-	if !state.Intent() || state.Wait() || !state.CommitKill() || state.CommitWait(StatusExited) {
-		t.Fatal("kill-before-wait arbitration failed")
 	}
 }
 
@@ -819,7 +803,7 @@ func TestRealCgroupTimeoutUsesDurableKillAndKillsGrandchild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.Status != StatusKilled || !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") || record.CleanSuccess() {
+	if record.Status != StatusKilled || !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") || record.CleanSuccess() {
 		t.Fatalf("timeout record=%+v", record)
 	}
 	if !record.KillIntent.Present || !record.KillIntent.Completed || !record.ScopeKill.Completed {
@@ -843,7 +827,7 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exited.Status != StatusExited || exited.CleanSuccess() && containsString(exited.ErrorCodes, "E_RUN_TIMEOUT") {
+	if exited.Status != StatusExited || exited.CleanSuccess() && slices.Contains(exited.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("natural exit was rewritten by timeout: %+v", exited)
 	}
 	assertHonestExitScope(t, r, exited)
@@ -856,7 +840,7 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if timedOut.Status != StatusKilled || !containsString(timedOut.ErrorCodes, "E_RUN_TIMEOUT") || timedOut.CleanSuccess() {
+	if timedOut.Status != StatusKilled || !slices.Contains(timedOut.ErrorCodes, "E_RUN_TIMEOUT") || timedOut.CleanSuccess() {
 		t.Fatalf("timeout arbitration record=%+v", timedOut)
 	}
 	if got := terminalRecords(t, r); got != 1 {
@@ -879,7 +863,7 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	switch nearDeadline.Status {
 	case StatusExited:
 		assertHonestExitScope(t, r, nearDeadline)
-		if nearDeadline.ExitCode == nil || *nearDeadline.ExitCode != 0 || containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || !nearDeadline.CleanSuccess() {
+		if nearDeadline.ExitCode == nil || *nearDeadline.ExitCode != 0 || slices.Contains(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || !nearDeadline.CleanSuccess() {
 			t.Fatalf("near-deadline clean exit evidence=%+v", nearDeadline)
 		}
 		// AIRA-126: when the deadline DID fire against an already-empty scope,
@@ -890,7 +874,7 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 			t.Fatalf("near-deadline exit carries an undisposed or over-claimed kill intent: %+v", nearDeadline)
 		}
 	case StatusKilled:
-		if !containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || nearDeadline.CleanSuccess() || !nearDeadline.KillIntent.Present || !nearDeadline.KillIntent.Completed {
+		if !slices.Contains(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || nearDeadline.CleanSuccess() || !nearDeadline.KillIntent.Present || !nearDeadline.KillIntent.Completed {
 			t.Fatalf("near-deadline timeout evidence=%+v", nearDeadline)
 		}
 	default:
@@ -1448,7 +1432,7 @@ exit 0`
 	if record.DescendantEscape.PIDIdentity.PID != pid || record.DescendantEscape.Cgroup != target {
 		t.Fatalf("escape evidence=%+v want pid=%d cgroup=%q", record.DescendantEscape, pid, target)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") || record.CleanSuccess() {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") || record.CleanSuccess() {
 		t.Fatalf("escaped record has dishonest terminal evidence: %+v", record)
 	}
 }
@@ -1486,15 +1470,6 @@ func TestCaptureCodeDistinguishesENOSPC(t *testing.T) {
 	if got := captureCode(syscall.ENOSPC); got != "E_RUN_OUTPUT_DISK_FULL" {
 		t.Fatal(got)
 	}
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 func assertHonestExitScope(t *testing.T, r *Runner, record *RunRecord) {

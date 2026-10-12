@@ -345,9 +345,9 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		MaxCommandEvents: opts.MaxCommandEvents, MaxCommandAgeDays: opts.MaxCommandAgeDays,
 		MaxQuotaSnapshots: opts.MaxQuotaSnapshots, Clock: opts.Clock,
 	}
-	// GitDir did not exist in the pre-M21 Options API. Keep that source-level
-	// compatibility for isolated in-process callers; production discovery and
-	// every daemon descriptor provide GitDir and take the checked path.
+	// An empty GitDir selects the unchecked path used by isolated in-process
+	// callers and tests; production discovery and every daemon descriptor
+	// provide GitDir and take the checked path.
 	s, err := newScopeContext(ctx, db, scopeOpts, opts.GitDir != "", true)
 	if err != nil {
 		_ = db.Close()
@@ -368,15 +368,15 @@ func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := canonicalPath(opts.Root)
+	root, err := CanonicalPath(opts.Root)
 	if err != nil {
 		return nil, err
 	}
-	common, err := canonicalPath(opts.CommonDir)
+	common, err := CanonicalPath(opts.CommonDir)
 	if err != nil {
 		return nil, err
 	}
-	gitDir, err := canonicalPath(opts.GitDir)
+	gitDir, err := CanonicalPath(opts.GitDir)
 	if err != nil {
 		return nil, err
 	}
@@ -576,11 +576,11 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	if err != nil {
 		return nil, err
 	}
-	root, err := canonicalPath(opts.Root)
+	root, err := CanonicalPath(opts.Root)
 	if err != nil {
 		return nil, err
 	}
-	common, err := canonicalPath(opts.CommonDir)
+	common, err := CanonicalPath(opts.CommonDir)
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +588,7 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	if gitDir == "" {
 		gitDir = root
 	}
-	gitDir, err = canonicalPath(gitDir)
+	gitDir, err = CanonicalPath(gitDir)
 	if err != nil {
 		return nil, err
 	}
@@ -679,7 +679,9 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	return nil, lastErr
 }
 
-func canonicalPath(path string) (string, error) {
+// CanonicalPath returns path made absolute and clean, with symlinks resolved
+// through its deepest existing ancestor and any missing tail re-joined.
+func CanonicalPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -719,11 +721,11 @@ func hashPath(path string) string {
 // CanonicalScopeIdentity returns the path-derived identity used by NewScope and
 // by daemon-side descriptor validation.
 func CanonicalScopeIdentity(commonDir, gitDir string) (string, string, error) {
-	common, err := canonicalPath(commonDir)
+	common, err := CanonicalPath(commonDir)
 	if err != nil {
 		return "", "", err
 	}
-	git, err := canonicalPath(gitDir)
+	git, err := CanonicalPath(gitDir)
 	if err != nil {
 		return "", "", err
 	}
@@ -2612,12 +2614,6 @@ func (s *Store) recordFinding(ctx context.Context, intent Intent, cause error) e
 	})
 }
 
-func (s *Store) recordRebuildFinding(ctx context.Context, entry registryEntry, reason string) error {
-	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		return recordRebuildFindingConn(ctx, conn, s.projectID, entry, reason)
-	})
-}
-
 func (s *Store) reconcile(ctx context.Context) error {
 	findingLock, err := s.acquireFindingMutationLock()
 	if err != nil {
@@ -3418,7 +3414,7 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 		if fromJournal.PayloadDigest != allocationEventDigest(fromJournal.Verb, fromJournal.Target, kind) {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
 		}
-		verb, target, payload = fromJournal.Verb, fromJournal.Target, fromJournal.PayloadDigest
+		verb = fromJournal.Verb
 	} else {
 		var existing eventRecord
 		err := conn.QueryRowContext(ctx, `SELECT project_id, seq, at_wall, actor, verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, project, seq).
@@ -3435,7 +3431,7 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 		} else if existing.PayloadDigest != allocationEventDigest(existing.Verb, existing.Target, kind) {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
 		} else {
-			verb, target, payload = existing.Verb, existing.Target, existing.PayloadDigest
+			verb = existing.Verb
 		}
 	}
 	_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO outbox(project_id,seq,worktree_id,path,verb,precondition_digest,intended_digest,intended_bytes,materialised,journaled,allocation_id)
@@ -3898,10 +3894,6 @@ func acquireLockBounded(ctx context.Context, path string, timeout time.Duration)
 		case <-ticker.C:
 		}
 	}
-}
-
-func (s *Store) appendReceiptForIntent(intent Intent) error {
-	return s.appendReceiptIfMissing(intent.Receipt)
 }
 
 func appendJSONLine(path string, value any, lockPath string) error {
@@ -4374,15 +4366,6 @@ func readJSONLRecords(path string) ([][]byte, error) {
 		records = append(records, append([]byte(nil), record...))
 	}
 	return records, nil
-}
-
-func sortedKeys(values map[string]bool) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func recordScanFindingConn(ctx context.Context, conn *sql.Conn, project, root string, entry registryEntry, finding CheckFinding) error {

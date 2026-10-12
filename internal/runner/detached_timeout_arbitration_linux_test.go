@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
@@ -121,7 +122,7 @@ func TestAIRA131DetachedTimeoutAgainstAlreadyExitedLeaderArbitratesToExited(t *t
 	if !record.KillIntent.NotExecuted || record.KillIntent.Completed || record.ScopeKill.Started {
 		t.Fatalf("undisposed or over-claimed intent: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "E_RUN_TIMEOUT") || containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") || slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("a kill that delivered nothing was reported as a timeout: %+v", record)
 	}
 	if terminated, killed := scope.signalled(); terminated || killed {
@@ -736,7 +737,7 @@ func TestAIRA131DetachedTimeoutAgainstLiveLeaderStillKills(t *testing.T) {
 	if !record.ScopeKill.Completed || record.ScopeKill.Actor != "run-timeout" {
 		t.Fatalf("the proven kill lost its scope-kill evidence: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("a genuine timeout kill lost E_RUN_TIMEOUT: %+v", record)
 	}
 	if got := terminalRecords(t, r); got != 1 {

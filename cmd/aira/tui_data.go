@@ -28,13 +28,9 @@ func decodeTUIResponse(response core.Response, target any) string {
 		}
 		return "E_TUI_UNKNOWN"
 	}
-	raw := response.RawData
-	if len(raw) == 0 {
-		var err error
-		raw, err = json.Marshal(response.Data)
-		if err != nil {
-			return tuiDecodeError
-		}
+	raw, err := responsePayload(response)
+	if err != nil {
+		return tuiDecodeError
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {

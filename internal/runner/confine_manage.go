@@ -217,19 +217,26 @@ const ConfineReserveFacet = "reserve"
 // covers: AIRA-191
 // covers: AIRA-192
 func ApplyConfineScopeReserves(scopes []ConfineRecord, reserves map[string]int64) {
+	applyConfineScopeCharge(scopes, reserves, ConfineReserveFacet, func(record *ConfineRecord) **int64 { return &record.ReserveBytes })
+}
+
+// applyConfineScopeCharge sets the field selected by field on each record from
+// values, matched by scope id: an established value for a scope in the map, else
+// nil plus facet in UnevaluatedFields.
+func applyConfineScopeCharge(scopes []ConfineRecord, values map[string]int64, facet string, field func(*ConfineRecord) **int64) {
 	for index := range scopes {
 		record := &scopes[index]
-		if value, ok := reserves[record.ScopeID]; ok && record.ScopeID != "" {
+		if value, ok := values[record.ScopeID]; ok && record.ScopeID != "" {
 			// An established reading also clears any earlier "unevaluated" mark, so a
 			// second pass over the same records cannot leave a record contradicting
 			// itself.
 			charge := value
-			record.ReserveBytes = &charge
-			record.UnevaluatedFields = withoutConfineFacet(record.UnevaluatedFields, ConfineReserveFacet)
+			*field(record) = &charge
+			record.UnevaluatedFields = withoutConfineFacet(record.UnevaluatedFields, facet)
 			continue
 		}
-		record.ReserveBytes = nil
-		record.UnevaluatedFields = withConfineFacet(record.UnevaluatedFields, ConfineReserveFacet)
+		*field(record) = nil
+		record.UnevaluatedFields = appendUnique(record.UnevaluatedFields, facet)
 	}
 }
 
@@ -254,26 +261,7 @@ const (
 // established VRAMBytes; a scope absent from the map gets nil (unevaluated), so no
 // consumer must infer which of the two it holds.
 func ApplyConfineScopeVRAM(scopes []ConfineRecord, vram map[string]int64) {
-	for index := range scopes {
-		record := &scopes[index]
-		if value, ok := vram[record.ScopeID]; ok && record.ScopeID != "" {
-			charge := value
-			record.VRAMBytes = &charge
-			record.UnevaluatedFields = withoutConfineFacet(record.UnevaluatedFields, ConfineVRAMFacet)
-			continue
-		}
-		record.VRAMBytes = nil
-		record.UnevaluatedFields = withConfineFacet(record.UnevaluatedFields, ConfineVRAMFacet)
-	}
-}
-
-func withConfineFacet(facets []string, facet string) []string {
-	for _, existing := range facets {
-		if existing == facet {
-			return facets
-		}
-	}
-	return append(facets, facet)
+	applyConfineScopeCharge(scopes, vram, ConfineVRAMFacet, func(record *ConfineRecord) **int64 { return &record.VRAMBytes })
 }
 
 // withoutConfineFacet returns a NEW slice when it has to drop something, and the

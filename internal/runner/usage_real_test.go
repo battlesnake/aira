@@ -202,11 +202,11 @@ done
 // per test so concurrent/adjacent tests never collide on a fixed dir.
 func writableMemoryParent(t *testing.T, memMax string) string {
 	t.Helper()
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		skipOrFailRealCgroup(t, "cgroup-v2 unavailable: %v", err)
 	}
-	current, err := currentCgroupPath(mount)
+	current, err := CurrentCgroupPath(mount)
 	if err != nil {
 		skipOrFailRealCgroup(t, "current cgroup unavailable: %v", err)
 	}

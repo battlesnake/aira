@@ -26,17 +26,6 @@ type FindingRecord struct {
 	Error       string         `json:"error,omitempty"`
 }
 
-type FindingSetInput struct {
-	Key         string
-	Disposition domain.Disposition
-	Reason      string
-	Actor       string
-}
-
-// FindingCountResult is kept as a named compatibility alias for callers that
-// want to distinguish the finding read while retaining the CountResult shape.
-type FindingCountResult = CountResult
-
 type scannedFinding struct {
 	WorktreeID string
 	Root       string
@@ -70,17 +59,7 @@ func (s *Store) findingPath(key string) string {
 }
 
 func readRegularFinding(path string) ([]byte, scanReadOutcome, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, scanReadInconclusive, nil
-		}
-		return nil, scanReadStable, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, scanReadStable, errors.New("E_FINDING_INVALID: finding path is not a regular file")
-	}
-	return stableReadFile(path)
+	return readRegularFile(path, "E_FINDING_INVALID: finding path is not a regular file")
 }
 
 func (s *Store) prepareFindingMutation(ctx context.Context, path, precondition string, intended []byte, verb string, finding domain.Finding) (Intent, error) {
@@ -348,17 +327,17 @@ func (s *Store) ListFindings(query string) ([]FindingRecord, error) {
 // CountFindings counts every finding matching query and distributes the
 // result by one supported finding field. It deliberately shares ListFindings
 // so the gauge and CLI use the same live, uncapped read semantics.
-func (s *Store) CountFindings(query, by string) (FindingCountResult, error) {
+func (s *Store) CountFindings(query, by string) (CountResult, error) {
 	if !validFindingDistributionField(by) {
-		return FindingCountResult{}, fmt.Errorf("E_SELECTOR_INVALID: unsupported finding distribution field %q", by)
+		return CountResult{}, fmt.Errorf("E_SELECTOR_INVALID: unsupported finding distribution field %q", by)
 	}
 	rows, err := s.ListFindings(query)
 	if err != nil {
-		return FindingCountResult{}, err
+		return CountResult{}, err
 	}
-	result := FindingCountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
+	result := CountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
 	for _, row := range rows {
-		for _, value := range findingDistributionValues(row.Finding, by) {
+		for _, value := range FindingDistributionValues(row.Finding, by) {
 			result.Distribution[value]++
 		}
 		for _, warning := range row.Warnings {
@@ -437,7 +416,9 @@ func validFindingDistributionField(field string) bool {
 // finding distributions.
 func ValidFindingDistributionField(field string) bool { return validFindingDistributionField(field) }
 
-func findingDistributionValues(finding domain.Finding, by string) []string {
+// FindingDistributionValues returns the bucket(s) a finding counts in for a
+// distribution by field by; an empty value is "(none)".
+func FindingDistributionValues(finding domain.Finding, by string) []string {
 	value := ""
 	switch by {
 	case "subtype":

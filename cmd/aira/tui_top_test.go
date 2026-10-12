@@ -963,14 +963,14 @@ func TestTopBarRegionSplitsUsedFromReservedButUnused(t *testing.T) {
 		wantIdle    int
 		wantUnknown int
 	}{
-		{"half-used", 8 * gib, int64Pointer(4 * gib), 4 * gib, true, 4, 4, 0},
-		{"fully-used", 8 * gib, int64Pointer(8 * gib), 8 * gib, true, 8, 0, 0},
+		{"half-used", 8 * gib, i64(4 * gib), 4 * gib, true, 4, 4, 0},
+		{"fully-used", 8 * gib, i64(8 * gib), 8 * gib, true, 8, 0, 0},
 		// A monitoring-lag overshoot right before an OOM. The used span is CLAMPED
 		// to this region; it must never bleed into the next slot's. Clamped over-use
 		// draws the whole span solid — honest "using at least its whole charge".
-		{"used-exceeds-the-reservation", 8 * gib, int64Pointer(11 * gib), 8 * gib, true, 8, 0, 0},
+		{"used-exceeds-the-reservation", 8 * gib, i64(11 * gib), 8 * gib, true, 8, 0, 0},
 		// An established zero is not an absence: the whole region is shaded idle.
-		{"used-is-zero", 8 * gib, int64Pointer(0), 0, true, 0, 8, 0},
+		{"used-is-zero", 8 * gib, i64(0), 0, true, 0, 8, 0},
 		// Unevaluated usage draws the unevaluated mark across the whole span, never
 		// the all-solid or all-shaded fill a nil-means-zero build would paint.
 		{"usage-unevaluated", 8 * gib, nil, 0, false, 0, 0, 8},
@@ -1058,40 +1058,40 @@ func TestTopBarRegionSplitsCurrentPeakAndQuota(t *testing.T) {
 	}{
 		// (a) current < peak < quota: solid...peak-band...idle-remainder at the
 		// exact GiB boundaries.
-		{"current-lt-peak-lt-quota", int64Pointer(3 * gib), int64Pointer(6 * gib), 6 * gib, true, 3, 3, 2, 0},
+		{"current-lt-peak-lt-quota", i64(3 * gib), i64(6 * gib), 6 * gib, true, 3, 3, 2, 0},
 		// An equal-width peak and idle band. A mutation that swapped which
 		// boundary comparison feeds which fill (peakEnd/idle vs usedEnd/peak)
 		// would still produce solid=2/peak=3/idle=3 here -- the SAME per-tier
 		// counts as the correct output -- so only the sequence-order check
 		// below, not the counts above, can catch that particular mutation.
-		{"peak-and-idle-bands-equal-width", int64Pointer(2 * gib), int64Pointer(5 * gib), 5 * gib, true, 2, 3, 3, 0},
+		{"peak-and-idle-bands-equal-width", i64(2 * gib), i64(5 * gib), 5 * gib, true, 2, 3, 3, 0},
 		// (b) peak unevaluated: NO peak band at all -- byte-identical to the old
 		// two-tier fill (solid to current, idle for the rest). The pre-existing
 		// TestTopBarRegionSplitsUsedFromReservedButUnused, run unmodified against
 		// this same implementation, is the stronger version of this proof: it
 		// asserts the exact two-tier output with no knowledge of Peak at all.
-		{"peak-nil-is-byte-identical-to-two-tier", int64Pointer(4 * gib), nil, 0, false, 4, 0, 4, 0},
+		{"peak-nil-is-byte-identical-to-two-tier", i64(4 * gib), nil, 0, false, 4, 0, 4, 0},
 		// (c) peak == current: zero-width band, so no peak glyph is drawn, but
 		// Peak/PeakKnown still carry the real reading (PeakKnown=true).
-		{"peak-equals-current-no-band", int64Pointer(5 * gib), int64Pointer(5 * gib), 5 * gib, true, 5, 0, 3, 0},
+		{"peak-equals-current-no-band", i64(5 * gib), i64(5 * gib), 5 * gib, true, 5, 0, 3, 0},
 		// A stale/skewed peak reading BELOW current is raised to it (the max()
 		// half of the clamp): the MODEL's Peak is pinned to `used`, not the raw
 		// reading, which is what stops a swapped-back clamp from reading as
 		// "no band" for the wrong reason.
-		{"peak-below-current-clamped-up-to-it", int64Pointer(6 * gib), int64Pointer(2 * gib), 6 * gib, true, 6, 0, 2, 0},
+		{"peak-below-current-clamped-up-to-it", i64(6 * gib), i64(2 * gib), 6 * gib, true, 6, 0, 2, 0},
 		// (d) peak >= quota: the band runs to the region's right edge and there
 		// is no idle remainder at all -- both an exact-match and an over-shoot.
 		// The MODEL's Peak is pinned to `reserved` (not the raw over-shoot
 		// reading) so a removed upper clamp is caught even though the cell
 		// output alone cannot distinguish it (the column loop is itself bounded
 		// by the region's own width).
-		{"peak-exactly-quota-no-idle-remainder", int64Pointer(2 * gib), int64Pointer(8 * gib), 8 * gib, true, 2, 6, 0, 0},
-		{"peak-exceeds-quota-clamped-to-it", int64Pointer(2 * gib), int64Pointer(11 * gib), 8 * gib, true, 2, 6, 0, 0},
+		{"peak-exactly-quota-no-idle-remainder", i64(2 * gib), i64(8 * gib), 8 * gib, true, 2, 6, 0, 0},
+		{"peak-exceeds-quota-clamped-to-it", i64(2 * gib), i64(11 * gib), 8 * gib, true, 2, 6, 0, 0},
 		// (e) current unevaluated: the WHOLE region is the unknown glyph, even
 		// though the MODEL still carries a real, known Peak (computed from
 		// Used=0 since UsedKnown is false) -- current gates the RENDERED split,
 		// not whether Peak itself gets computed.
-		{"current-unevaluated-ignores-peak", nil, int64Pointer(6 * gib), 6 * gib, true, 0, 0, 0, 8},
+		{"current-unevaluated-ignores-peak", nil, i64(6 * gib), 6 * gib, true, 0, 0, 0, 8},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			record := topTestRecord("CONFINE-alpha-101-aa", "alpha", reserved, 0)
@@ -1242,8 +1242,6 @@ func TestTopBarGlyphIsOneCharacterPerFillState(t *testing.T) {
 	}
 }
 
-func int64Pointer(value int64) *int64 { return &value }
-
 // The block-character scheme gets a key on the summary line, and each clause of
 // it appears only when the glyph it names can be on screen: the solid/idle pair
 // for an established-usage scope, and the "usage unevaluated" mark for one whose
@@ -1272,7 +1270,7 @@ func TestTopShadeLegendKeysTheGlyphsActuallyDrawn(t *testing.T) {
 		t.Fatalf("a bar with no peak band's key=%q named the peak glyph it does not draw", got)
 	}
 	peaked := topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)
-	peaked.PeakRSS = int64Pointer(3 * gib)
+	peaked.PeakRSS = i64(3 * gib)
 	withPeak, _ := topViewModel(topTick{}, topTestListing(frame, peaked))
 	if got := topShadeLegend(withPeak.Bar); !strings.Contains(got, topBarPeakGlyph) {
 		t.Fatalf("a bar with a real peak band's key=%q, want the peak glyph named", got)

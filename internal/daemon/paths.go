@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"aira/internal/runner"
+	"aira/internal/store"
 )
 
 type Paths struct {
@@ -241,7 +242,7 @@ func oomSteerModeFromEnv() (oomSteerMode, error) {
 }
 
 // oomSteerIntervalFromEnv bounds the cadence BELOW the admission charge refresh
-// (admitConfineScanIntervalDefault, 1s). A slower loop would only ever see RSS
+// (oomSteerIntervalCeiling, 1s). A slower loop would only ever see RSS
 // readings the ledger had already absorbed into the charge, which is precisely
 // the inertness AIRA-29 §3.6 refused to ship — so an interval at or above one
 // second is a configuration error, not a slow but working setting.
@@ -251,8 +252,8 @@ func oomSteerIntervalFromEnv() (time.Duration, error) {
 		return defaultOOMSteerInterval, nil
 	}
 	interval, err := time.ParseDuration(value)
-	if err != nil || interval < 50*time.Millisecond || interval >= admitConfineScanIntervalDefault {
-		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_OOM_STEER_INTERVAL must be a Go duration in [50ms,%s)", admitConfineScanIntervalDefault)
+	if err != nil || interval < 50*time.Millisecond || interval >= oomSteerIntervalCeiling {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_OOM_STEER_INTERVAL must be a Go duration in [50ms,%s)", oomSteerIntervalCeiling)
 	}
 	return interval, nil
 }
@@ -420,7 +421,7 @@ func PathsFromEnvironment(stateHome, runtimeDir, home string) (Paths, error) {
 		}
 		stateHome = filepath.Join(home, ".local", "state")
 	}
-	stateHome, err := canonicalPath(stateHome)
+	stateHome, err := store.CanonicalPath(stateHome)
 	if err != nil {
 		return Paths{}, err
 	}
@@ -451,38 +452,6 @@ func PathsFromEnvironment(stateHome, runtimeDir, home string) (Paths, error) {
 		// cannot win that lock and start a second daemon on this state.
 		LegacyLockPath: filepath.Join(daemonDir, "daemon.lock"),
 	}, nil
-}
-
-func canonicalPath(path string) (string, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	abs = filepath.Clean(abs)
-	candidate := abs
-	remainder := []string(nil)
-	for {
-		_, statErr := os.Lstat(candidate)
-		if statErr == nil {
-			resolved, resolveErr := filepath.EvalSymlinks(candidate)
-			if resolveErr != nil {
-				return "", resolveErr
-			}
-			for index := len(remainder) - 1; index >= 0; index-- {
-				resolved = filepath.Join(resolved, remainder[index])
-			}
-			return filepath.Clean(resolved), nil
-		}
-		if !errors.Is(statErr, os.ErrNotExist) {
-			return "", statErr
-		}
-		parent := filepath.Dir(candidate)
-		if parent == candidate {
-			return "", statErr
-		}
-		remainder = append(remainder, filepath.Base(candidate))
-		candidate = parent
-	}
 }
 
 type LockInfo struct {

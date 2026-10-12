@@ -153,17 +153,6 @@ type sliceCeilingSnapshot struct {
 	At   time.Time
 }
 
-// sliceCeilingReading is one torn-read-guarded observation of the slice's own
-// accounting. currentBefore/currentAfter bracket the MemAvailable read.
-type sliceCeilingReading struct {
-	currentBefore int64
-	currentAfter  int64
-	reclaimable   int64 // inactive_file + active_file + slab_reclaimable
-	maximum       int64
-	ok            bool
-	reason        string
-}
-
 type sliceCeilingDeps struct {
 	resolveSlice     func() (string, bool, string)
 	readSliceParts   func(string) (current, reclaimable, maximum int64, ok bool, reason string)

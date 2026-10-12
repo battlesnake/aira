@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -340,19 +339,11 @@ func TestRoutingCompletenessWithRecordingSentinels(t *testing.T) {
 func routingTestStore(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	base := t.TempDir()
-	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
-	s, err := store.Open(context.Background(), store.Options{
-		Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"),
-		RegistryPath: filepath.Join(base, "state", "registry.jsonl"), ProjectID: "routing-project", WorktreeID: "routing-worktree",
-		ProjectSlug: "routing", Prefixes: []string{"AIRA"}, RequirementPrefixes: []string{"AR"},
-		LeaseTTLNS: uint64(15 * time.Minute), LeaseStateDir: filepath.Join(base, "lease-state"),
+	s := openCoreTestStore(t, base, func(options *store.Options) {
+		options.ProjectID, options.WorktreeID, options.ProjectSlug = "routing-project", "routing-worktree", "routing"
+		options.Prefixes, options.RequirementPrefixes = []string{"AIRA"}, []string{"AR"}
+		options.LeaseTTLNS = uint64(15 * time.Minute)
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 	return s, base
 }
 

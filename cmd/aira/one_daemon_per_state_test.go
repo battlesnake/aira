@@ -227,9 +227,7 @@ func TestTwoClientsWithDifferentRuntimeDirsGetOneDaemon(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := exec.Command("git", "-C", project, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, project)
 	t.Cleanup(func() {
 		for _, pid := range daemonPIDs(t, binary) {
 			_ = syscall.Kill(pid, syscall.SIGTERM)

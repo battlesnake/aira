@@ -42,7 +42,6 @@ var superviseConfineDetached = runner.SuperviseConfineDetached
 var confineDetachStatusFor = runner.ConfineDetachStatusFor
 var confineDetachStatusList = runner.ConfineDetachStatusList
 var runInstaller = installcmd.Run
-var runSliceAnchor = installcmd.RunSliceAnchor
 
 // Run is the deliberately small CLI adapter: argv parsing, core request
 // construction, and rendering. It contains no ticket or consistency logic.
@@ -57,10 +56,6 @@ func RunWithDispatcher(argv []string, stdout, stderr io.Writer, dispatcher Dispa
 	return runWithInputDispatcher(argv, stdout, stderr, os.Stdin, dispatcher)
 }
 
-func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int {
-	return runWithInputDispatcher(argv, stdout, stderr, stdin, nil)
-}
-
 func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Reader, injected Dispatcher) int {
 	// AIRA-211. `<verb> --help` / `<verb> -h` is answered from the help table
 	// before ANY verb parser or intercept below can refuse or swallow it. Only the
@@ -72,7 +67,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 	}
 	if len(argv) > 0 && argv[0] == "__slice-anchor" {
-		return runSliceAnchor()
+		return installcmd.RunSliceAnchor()
 	}
 	if len(argv) > 0 && strings.EqualFold(argv[0], "install") {
 		if err := runInstaller(argv[1:], stdout); err != nil {
@@ -475,7 +470,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		project, discoverErr := app.DiscoverBootstrap(context.Background(), scopeDir)
 		if discoverErr != nil {
-			code := appErrorCode(discoverErr)
+			code := store.ErrorCode(discoverErr)
 			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		dispatcher := injected
@@ -560,11 +555,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		boardScope, scopeErr := scopeForCWD(context.Background(), scopeDir, paths)
 		startOverview := false
 		if scopeErr != nil {
-			switch appErrorCode(scopeErr) {
+			switch store.ErrorCode(scopeErr) {
 			case "E_NOT_PROJECT", "E_CONFIG_MISSING":
 				startOverview = true
 			default:
-				code := appErrorCode(scopeErr)
+				code := store.ErrorCode(scopeErr)
 				return render(core.Response{Code: code, Error: scopeErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 			}
 		}
@@ -579,7 +574,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	scope, err := scopeForCWD(context.Background(), scopeDir, paths)
 	if err != nil {
-		code := appErrorCode(err)
+		code := store.ErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// AIRA-176. Identity is stamped from the RESOLVED SCOPE ROOT, not the process
@@ -1787,9 +1782,8 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 		ExclusiveReason: strings.TrimSpace(options["reason"]),
 		// Timeout bounds the HELD duration only (it starts at the release write, after
 		// admission and setup); zero means "no hold bound — until you interrupt it".
-		// S13 removed --admit-timeout: the wait to be ADMITTED is no longer client-bounded
-		// (design §4/§6 — a blocking wait ends on the grant or on interrupting the
-		// command; there is no admission timeout).
+		// The wait to be ADMITTED is not client-bounded (design §4/§6 — a blocking
+		// wait ends on the grant or on interrupting the command).
 		Timeout: holdFor,
 		Stdin:   stdin, Stdout: stdout, Stderr: stderr,
 	}
@@ -2132,22 +2126,13 @@ func writeWorkerAdmitOutcome(stdout, stderr io.Writer, outcome runner.WorkerAdmi
 }
 
 func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
-	// Mirrors --memory-reserve's identical 1MiB floor (parseConfineArgs,
-	// above) -- this used to only reject <=0, so an out-of-range value below
-	// the daemon's own workerAdmitEstimatedBytesMin floor reached a live,
-	// healthy daemon, got rejected at the protocol level, and was wrapped by
-	// RequestWorkerAdmit as a generic "request rejected" message matching
-	// none of supervisor.py's denied/timeout/unevaluated substrings --
-	// misclassified as total daemon unavailability instead of a client
-	// argument mistake (found by Sol build-review, AIRA-38 review wave).
-	// The 1<<50 (1 PiB) top end mirrors the daemon's own admitMaxReserve
-	// (internal/daemon/admit.go, unexported -- hardcoded here exactly as
-	// the floor already is, matching --memory-reserve's own precedent): an
-	// oversized value used to sail through this check and hit the daemon's
-	// protocol-level rejection (E_DAEMON_PROTOCOL) instead, which ALSO
-	// matched none of the classifier's substrings -- the identical
-	// misclassification bug at the opposite extreme (found by Fable
-	// re-gate).
+	// The 1MiB floor mirrors --memory-reserve's (parseConfineArgs, above) and
+	// the daemon's workerAdmitEstimatedBytesMin; the 1<<50 (1 PiB) top end
+	// mirrors the daemon's unexported admitMaxReserve (internal/daemon/admit.go).
+	// A value outside either bound must be refused HERE as a client argument
+	// mistake: the daemon's protocol-level rejection would reach supervisor.py
+	// as a generic "request rejected" matching none of its denied/timeout/
+	// unevaluated substrings, misclassified as daemon unavailability (AIRA-38).
 	estimatedBytes, err := runner.ParseMemorySize(options["estimated-bytes"])
 	if err != nil || estimatedBytes < 1<<20 || estimatedBytes > 1<<50 {
 		if err == nil {
@@ -2162,13 +2147,10 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	maxWait := runner.DefaultConfineReserveMaxWait
 	if raw := options["max-wait"]; raw != "" {
 		// AIRA-64: zero is VALID and means "speculative" -- answer from what can
-		// be obtained without waiting. It used to be refused here as
-		// argument-invalid/request-invalid, which the aitest supervisor treats
-		// as TERMINAL and responds to by draining its remaining queue to
-		// `unevaluated`. The daemon's own validator has always accepted zero
-		// (validateWorkerAdmitArgs); only this side disagreed, so a speculative
-		// pool-growth probe would have destroyed the run it was trying to help
-		// (found by Sol plan-review round 2). Negatives are still refused.
+		// be obtained without waiting, as the daemon's validator
+		// (validateWorkerAdmitArgs) accepts. Refusing it would be argument-invalid,
+		// which the aitest supervisor treats as TERMINAL (draining its queue to
+		// `unevaluated`). Negatives are refused.
 		if maxWait, err = time.ParseDuration(raw); err != nil || maxWait < 0 {
 			return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
 				State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
@@ -2213,23 +2195,14 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 		// human sentence is the AIRA-42 defect this whole channel removes.
 		return writeWorkerAdmitOutcome(stdout, stderr, outcome, nil, "E_CONFINE_UNAVAILABLE")
 	}
-	// AIRA-39: the DAEMON creates the worker scope now, inside the same
-	// critical section that decided to grant, so there is no local
-	// CreateWorkerScope call here any more and no grant->creation window for a
-	// dying client to leave open. The scope named below already exists, with
-	// its memory.max, memory.swap.max and memory.oom.group verified daemon-side
-	// (AIRA-35 retired the memory.high this used to name).
+	// AIRA-39: the DAEMON creates the worker scope inside the same critical
+	// section that decided to grant, so there is no grant->creation window for
+	// a dying client to leave open. The scope named below already exists, with
+	// its memory.max, memory.swap.max and memory.oom.group verified daemon-side.
+	// A scope-creation failure is the daemon's own `worker-scope-create-failed`
+	// denial, classified daemon-side like every other verdict.
 	//
-	// AIRA-42 merge note: this fix was built against the pre-AIRA-39 shape,
-	// where a LOCAL CreateWorkerScope failure here produced the
-	// `placement-failed` class. That call site is gone, so the CLI has no
-	// placement path left to classify; a scope-creation failure is now the
-	// daemon's own `worker-scope-create-failed` denial, classified daemon-side
-	// like every other verdict. `placement-failed` survives in the catalogue
-	// because supervisor.py still raises WorkerPlacementFailed from its own
-	// fork/ack path -- it is simply no longer produced by this relay.
-	//
-	// A failed write here therefore leaves the daemon-created scope on the
+	// A failed write here leaves the daemon-created scope on the
 	// tree, charging the AIRA-39 ledger until the outer confine job's teardown
 	// removes the subtree. Not removing it is deliberate and matches the
 	// symmetric decision the daemon itself makes on its own failed response
@@ -2416,7 +2389,7 @@ func renderConfineLog(response core.Response, stdout, stderr io.Writer) int {
 		return response.Exit
 	}
 	if !response.OK {
-		return exitForError(response.Code)
+		return codes.ExitForCode(response.Code)
 	}
 	return 0
 }
@@ -3466,13 +3439,9 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 		}
 		result = *data
 	default:
-		encoded := response.RawData
-		if len(encoded) == 0 {
-			var err error
-			encoded, err = json.Marshal(response.Data)
-			if err != nil {
-				return
-			}
+		encoded, err := responsePayload(*response)
+		if err != nil {
+			return
 		}
 		if err := json.Unmarshal(encoded, &result); err != nil {
 			return
@@ -3490,26 +3459,12 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 			*path = filepath.ToSlash(relative)
 		}
 	}
-	encoded, err := marshalNoEscape(result)
+	encoded, err := core.MarshalNoEscape(result)
 	if err != nil {
 		return
 	}
 	response.Data = result
 	response.RawData = encoded
-}
-
-// marshalNoEscape mirrors json.Marshal but disables Go's default HTML
-// escaping of '<', '>', and '&'. There's no HTML context on a terminal or in
-// a JSON pipe, so that escaping only makes selector placeholders like "<id>"
-// harder to read (AIRA-57).
-func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // marshalIndentNoEscape mirrors json.MarshalIndent without HTML escaping.
@@ -3541,7 +3496,7 @@ func renderHelp(response core.Response, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\n", entry["verb"], entry["usage"], entry["summary"])
 	}
 	if err := table.Flush(); err != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	// Face-level globals belong to this adapter, not to the core dispatch table
 	// the listing above is generated from, so they are named here (AIRA-82).
@@ -3555,10 +3510,31 @@ func renderHelp(response core.Response, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// responsePayload returns a response's data as JSON bytes: the wire bytes when
+// it came over the daemon socket, else the in-process typed value re-encoded.
+func responsePayload(response core.Response) ([]byte, error) {
+	if len(response.RawData) > 0 {
+		return response.RawData, nil
+	}
+	return json.Marshal(response.Data)
+}
+
+// decodeResponseData decodes a response's payload into T. Like json.Unmarshal,
+// a decode error still returns whatever was filled before it.
+func decodeResponseData[T any](response core.Response) (T, error) {
+	var value T
+	data, err := responsePayload(response)
+	if err != nil {
+		return value, err
+	}
+	err = json.Unmarshal(data, &value)
+	return value, err
+}
+
 func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {
 	var writeErr error
 	if jsonOutput {
-		data, _ := marshalNoEscape(response)
+		data, _ := core.MarshalNoEscape(response)
 		_, writeErr = fmt.Fprintln(stdout, string(data))
 	} else if response.OK {
 		writeErr = renderHuman(response, stdout)
@@ -3573,11 +3549,11 @@ func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) i
 	if response.AfterWrite != nil {
 		if err := response.AfterWrite(response.OK && writeErr == nil); err != nil {
 			_, _ = fmt.Fprintf(stderr, "E_RUN_DETACH_FAILED: %v\n", err)
-			return exitForError("E_RUN_DETACH_FAILED")
+			return codes.ExitForCode("E_RUN_DETACH_FAILED")
 		}
 	}
 	if writeErr != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	if response.Exit != 0 {
 		return response.Exit
@@ -3585,15 +3561,12 @@ func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) i
 	if response.OK {
 		return 0
 	}
-	return exitForError(response.Code)
+	return codes.ExitForCode(response.Code)
 }
 
 func renderConfineListResponse(response core.Response, stdout, stderr io.Writer) int {
 	var result runner.ConfineListResult
-	data := response.RawData
-	if len(data) == 0 {
-		data, _ = json.Marshal(response.Data)
-	}
+	data, _ := responsePayload(response)
 	if err := json.Unmarshal(data, &result); err != nil {
 		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-list response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
 	}
@@ -3640,13 +3613,13 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			name += " (worker)"
 		}
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
+			name, record.Owner, confineNum(record.SupervisorPID), record.ScopeID,
 			confineLiveStatus(record),
-			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds),
-			confineInt64(record.ReserveBytes), confineString(record.Cap))
+			confineNum(record.Populated), confineNum(record.RSSBytes), confineAge(record.AgeSeconds),
+			confineNum(record.ReserveBytes), confineString(record.Cap))
 	}
 	if err := table.Flush(); err != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	// AIRA-183. The legend for the two states AIRA-102's "no" used to conflate,
 	// printed ONLY when a row actually shows one of them and naming only the
@@ -3844,11 +3817,11 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	return 0
 }
 
-func confineInt(value *int) string {
+func confineNum[T int | int64](value *T) string {
 	if value == nil {
 		return "unevaluated"
 	}
-	return strconv.Itoa(*value)
+	return strconv.FormatInt(int64(*value), 10)
 }
 
 // confineBoolYesNo renders a subtree-population reading (AIRA-102). A nil is
@@ -4094,13 +4067,6 @@ func confinePlural(count int, singular, plural string) string {
 	return plural
 }
 
-func confineInt64(value *int64) string {
-	if value == nil {
-		return "unevaluated"
-	}
-	return strconv.FormatInt(*value, 10)
-}
-
 // formatReserveBytes renders a KNOWN reserve/ceiling byte count. Unlike
 // FormatConfineBytes (which maps 0 to "unknown" for the optional trailer facets),
 // a slice-reserve summary value of 0 is a genuine zero (an idle slice, or a cap
@@ -4210,7 +4176,7 @@ func renderHuman(response core.Response, out io.Writer) error {
 		if report, ok := response.Data.(interface{}); ok {
 			data := response.RawData
 			if len(data) == 0 {
-				data, _ = marshalNoEscape(report)
+				data, _ = core.MarshalNoEscape(report)
 			}
 			if _, err := fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data); err != nil {
 				return err
@@ -4263,7 +4229,7 @@ func renderRunLog(response core.Response, stdout, stderr io.Writer) int {
 		return response.Exit
 	}
 	if !response.OK {
-		return exitForError(response.Code)
+		return codes.ExitForCode(response.Code)
 	}
 	return 0
 }
@@ -4288,11 +4254,11 @@ func renderTime(response core.Response, stdout, stderr io.Writer) int {
 	if response.AfterWrite != nil {
 		if err := response.AfterWrite(response.OK && writeErr == nil); err != nil {
 			_, _ = fmt.Fprintf(stderr, "E_RUN_DETACH_FAILED: %v\n", err)
-			return exitForError("E_RUN_DETACH_FAILED")
+			return codes.ExitForCode("E_RUN_DETACH_FAILED")
 		}
 	}
 	if writeErr != nil {
-		return exitForError("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	if response.Exit != 0 {
 		return response.Exit
@@ -4300,13 +4266,5 @@ func renderTime(response core.Response, stdout, stderr io.Writer) int {
 	if response.OK {
 		return 0
 	}
-	return exitForError(response.Code)
-}
-
-func appErrorCode(err error) string {
-	return store.ErrorCode(err)
-}
-
-func exitForError(code string) int {
-	return codes.ExitForCode(code)
+	return codes.ExitForCode(response.Code)
 }

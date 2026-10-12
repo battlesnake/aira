@@ -105,14 +105,6 @@ func opError(code, message string, details map[string]any) error {
 	return &Error{StableCode: code, Message: redact(message), Details: redactDetails(details)}
 }
 
-func errorCode(err error) string {
-	var target *Error
-	if errors.As(err, &target) {
-		return target.StableCode
-	}
-	return ""
-}
-
 type runRequest struct {
 	Name       string
 	Args       []string
@@ -149,12 +141,6 @@ func New(config Config) *Client {
 		config.OpTimeout = defaultOpTimeout
 	}
 	return &Client{config: config, run: realRun}
-}
-
-func newWithRun(config Config, run runFn) *Client {
-	c := New(config)
-	c.run = run
-	return c
 }
 
 type endpoint struct {

@@ -75,8 +75,6 @@ func ValidatePhase(phase string) error {
 	return nil
 }
 
-func ValidPhase(phase string) bool { return ValidatePhase(phase) == nil }
-
 type ComputeEvent struct {
 	ID string `json:"id"`
 	// TicketID is an opaque, project-scoped external reference: trimmed on
@@ -229,11 +227,7 @@ type RawUsage struct {
 }
 
 func (b ComputeBuckets) clone() ComputeBuckets {
-	return ComputeBuckets{FreshInput: cloneInt64(b.FreshInput), CacheRead: cloneInt64(b.CacheRead), CacheWrite: cloneInt64(b.CacheWrite), Output: cloneInt64(b.Output), Reasoning: cloneInt64(b.Reasoning)}
-}
-
-func (r ResourceUsage) clone() ResourceUsage {
-	return ResourceUsage{WallMS: cloneInt64(r.WallMS), CPUUser: cloneInt64(r.CPUUser), CPUSys: cloneInt64(r.CPUSys), PeakRSS: cloneInt64(r.PeakRSS)}
+	return ComputeBuckets{FreshInput: CloneInt64(b.FreshInput), CacheRead: CloneInt64(b.CacheRead), CacheWrite: CloneInt64(b.CacheWrite), Output: CloneInt64(b.Output), Reasoning: CloneInt64(b.Reasoning)}
 }
 
 // HasUsage reports whether the raw value contains any token authority.
@@ -245,7 +239,8 @@ func (r RawUsage) HasUsage() bool {
 		r.Buckets != nil || r.ReportedTotal != nil
 }
 
-func cloneInt64(value *int64) *int64 {
+// CloneInt64 returns a copy of *value in a new pointer, or nil for nil.
+func CloneInt64(value *int64) *int64 {
 	if value == nil {
 		return nil
 	}
@@ -355,20 +350,20 @@ func NormalizeUsage(provider string, raw RawUsage) (ComputeBuckets, *int64, Cons
 	subset := false
 	switch provider {
 	case "anthropic":
-		buckets.FreshInput = cloneInt64(raw.InputTokens)
-		buckets.CacheRead = cloneInt64(raw.CacheReadInputTokens)
-		buckets.CacheWrite = cloneInt64(raw.CacheCreationInputTokens)
-		buckets.Output = cloneInt64(raw.OutputTokens)
-		total = cloneInt64(raw.ReportedTotal)
+		buckets.FreshInput = CloneInt64(raw.InputTokens)
+		buckets.CacheRead = CloneInt64(raw.CacheReadInputTokens)
+		buckets.CacheWrite = CloneInt64(raw.CacheCreationInputTokens)
+		buckets.Output = CloneInt64(raw.OutputTokens)
+		total = CloneInt64(raw.ReportedTotal)
 		complete = raw.InputTokens != nil && raw.CacheReadInputTokens != nil && raw.CacheCreationInputTokens != nil && raw.OutputTokens != nil
 	case "openai":
-		buckets.Output = cloneInt64(raw.CompletionTokens)
-		buckets.Reasoning = cloneInt64(raw.ReasoningTokens)
+		buckets.Output = CloneInt64(raw.CompletionTokens)
+		buckets.Reasoning = CloneInt64(raw.ReasoningTokens)
 		total = firstInt64(raw.ReportedTotal, raw.TotalTokens)
 		if raw.PromptTokens != nil && raw.CachedTokens != nil {
 			if *raw.CachedTokens <= *raw.PromptTokens {
 				fresh := *raw.PromptTokens - *raw.CachedTokens
-				buckets.FreshInput, buckets.CacheRead = &fresh, cloneInt64(raw.CachedTokens)
+				buckets.FreshInput, buckets.CacheRead = &fresh, CloneInt64(raw.CachedTokens)
 			} else if total != nil {
 				return buckets, total, ConservationMismatch, nil
 			}
@@ -376,15 +371,15 @@ func NormalizeUsage(provider string, raw RawUsage) (ComputeBuckets, *int64, Cons
 		complete = raw.PromptTokens != nil && raw.CachedTokens != nil && raw.CompletionTokens != nil
 		subset = true
 	case "codex":
-		buckets.Output = cloneInt64(raw.CodexOutputTokens)
-		buckets.Reasoning = cloneInt64(raw.CodexReasoningOutputTokens)
+		buckets.Output = CloneInt64(raw.CodexOutputTokens)
+		buckets.Reasoning = CloneInt64(raw.CodexReasoningOutputTokens)
 		// Codex's cache-write count is already disjoint from input.
-		buckets.CacheWrite = cloneInt64(raw.CodexCacheWriteInputTokens)
+		buckets.CacheWrite = CloneInt64(raw.CodexCacheWriteInputTokens)
 		total = firstInt64(raw.ReportedTotal, raw.CodexTotalTokens)
 		if raw.CodexInputTokens != nil && raw.CodexCachedInputTokens != nil {
 			if *raw.CodexCachedInputTokens <= *raw.CodexInputTokens {
 				fresh := *raw.CodexInputTokens - *raw.CodexCachedInputTokens
-				buckets.FreshInput, buckets.CacheRead = &fresh, cloneInt64(raw.CodexCachedInputTokens)
+				buckets.FreshInput, buckets.CacheRead = &fresh, CloneInt64(raw.CodexCachedInputTokens)
 			} else if total != nil {
 				return buckets, total, ConservationMismatch, nil
 			}
@@ -392,13 +387,13 @@ func NormalizeUsage(provider string, raw RawUsage) (ComputeBuckets, *int64, Cons
 		complete = raw.CodexInputTokens != nil && raw.CodexCachedInputTokens != nil && raw.CodexCacheWriteInputTokens != nil && raw.CodexOutputTokens != nil
 		subset = true
 	case "gemini":
-		buckets.Output = cloneInt64(raw.CandidatesTokenCount)
-		buckets.Reasoning = cloneInt64(raw.ThoughtsTokenCount)
+		buckets.Output = CloneInt64(raw.CandidatesTokenCount)
+		buckets.Reasoning = CloneInt64(raw.ThoughtsTokenCount)
 		total = firstInt64(raw.ReportedTotal, raw.TotalTokenCount)
 		if raw.PromptTokenCount != nil && raw.CachedContentTokenCount != nil {
 			if *raw.CachedContentTokenCount <= *raw.PromptTokenCount {
 				fresh := *raw.PromptTokenCount - *raw.CachedContentTokenCount
-				buckets.FreshInput, buckets.CacheRead = &fresh, cloneInt64(raw.CachedContentTokenCount)
+				buckets.FreshInput, buckets.CacheRead = &fresh, CloneInt64(raw.CachedContentTokenCount)
 			} else if total != nil {
 				return buckets, total, ConservationMismatch, nil
 			}
@@ -431,7 +426,7 @@ func EffectiveReasoningSubset(provider string, raw RawUsage) bool {
 func firstInt64(values ...*int64) *int64 {
 	for _, value := range values {
 		if value != nil {
-			return cloneInt64(value)
+			return CloneInt64(value)
 		}
 	}
 	return nil
@@ -473,15 +468,15 @@ func conserve(b ComputeBuckets, total *int64, reasoningSubset, complete bool) (C
 		add(b.Reasoning)
 	}
 	if overflow || sum > *total {
-		return b, cloneInt64(total), ConservationMismatch, nil
+		return b, CloneInt64(total), ConservationMismatch, nil
 	}
 	if !complete || count == 0 {
-		return b, cloneInt64(total), ConservationUnevaluated, nil
+		return b, CloneInt64(total), ConservationUnevaluated, nil
 	}
 	if sum != *total {
-		return b, cloneInt64(total), ConservationMismatch, nil
+		return b, CloneInt64(total), ConservationMismatch, nil
 	}
-	return b, cloneInt64(total), ConservationChecked, nil
+	return b, CloneInt64(total), ConservationChecked, nil
 }
 
 // PresentBucketSum returns the sum of the buckets actually established by the

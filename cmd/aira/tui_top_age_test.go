@@ -47,7 +47,7 @@ func TestFormatConfineAgeShortShowsAtMostTwoUnitsDroppingAZeroSecond(t *testing.
 }
 
 // topAgeCell must render an unreadable age as "unevaluated" (the table's honesty
-// convention, shared with topRAMCell/topCPUCell/confineInt), never as "0s": a
+// convention, shared with topRAMCell/topCPUCell/confineNum), never as "0s": a
 // scope whose age could not be read is not a zero-second-old scope.
 //
 // verifies: AIRA-233

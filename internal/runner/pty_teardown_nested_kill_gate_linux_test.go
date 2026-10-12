@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -197,7 +198,7 @@ func aira143LaunchPTY(t *testing.T, r *Runner) *RunRecord {
 	if record == nil {
 		t.Fatalf("no record was published: err=%v", err)
 	}
-	if err == nil || !containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if err == nil || !slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("vacuous: the PTY quiesce did not fail, so the capture-teardown branch was never entered with a live scope: err=%v record=%+v", err, record)
 	}
 	return record
@@ -233,7 +234,7 @@ func TestAIRA143PTYCaptureTeardownKillsALeafEmptySubtreePopulatedScope(t *testin
 	if !record.ScopeKill.Requested || !record.ScopeKill.Started || !record.ScopeKill.Completed {
 		t.Fatalf("a delivered kill was not attested: %+v", record.ScopeKill)
 	}
-	if record.ScopeIntegrity != ScopeDescendantKilled || !containsString(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
+	if record.ScopeIntegrity != ScopeDescendantKilled || !slices.Contains(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
 		t.Fatalf("a reclaimed nested descendant was not reported: integrity=%q codes=%v", record.ScopeIntegrity, record.ErrorCodes)
 	}
 	if record.CleanSuccess() {
@@ -257,13 +258,13 @@ func TestAIRA143PTYCaptureTeardownStillRefusesToSignalAScopeBothReadsCallEmpty(t
 	if kills != 1 || terminated {
 		t.Fatalf("the teardown signalled a scope both reads call empty: cgroup.kill writes=%d (want 1, the quiesce's own) terminated=%v", kills, terminated)
 	}
-	if record.ScopeKill.Started || record.ScopeKill.Completed || containsString(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
+	if record.ScopeKill.Started || record.ScopeKill.Completed || slices.Contains(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
 		t.Fatalf("a kill that delivered nothing was reported as a reclaimed descendant: ScopeKill=%+v codes=%v", record.ScopeKill, record.ErrorCodes)
 	}
 	// The old pre-check's `else if forced` arm: a forced capture abandon over a
 	// scope we cannot attest is a handoff we cannot verify. It must survive the
 	// pre-check's removal.
-	if record.ScopeIntegrity == ScopeDescendantKilled || !containsString(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF") {
+	if record.ScopeIntegrity == ScopeDescendantKilled || !slices.Contains(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF") {
 		t.Fatalf("the unverified-handoff arm was lost with the pre-check: integrity=%q codes=%v", record.ScopeIntegrity, record.ErrorCodes)
 	}
 }

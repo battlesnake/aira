@@ -61,7 +61,7 @@ func (c *Core) projectDisplayIDs(verb string, data any) json.RawMessage {
 	if idPrefix == "" || ns == nil {
 		return nil
 	}
-	raw, err := marshalNoEscape(data)
+	raw, err := MarshalNoEscape(data)
 	if err != nil {
 		return nil
 	}
@@ -135,7 +135,7 @@ func stripDisplayIDs(raw []byte, strip func(string) string) ([]byte, error) {
 		}
 	}
 	writeString := func(s string) error {
-		encoded, err := marshalNoEscape(s)
+		encoded, err := MarshalNoEscape(s)
 		if err != nil {
 			return err
 		}

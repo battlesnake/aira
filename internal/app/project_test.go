@@ -17,9 +17,7 @@ import (
 
 func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	state := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", state)
 	result, err := Init(context.Background(), root, map[string]any{"project": "demo", "prefixes": "DEMO"})
@@ -47,9 +45,7 @@ func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
 
 func TestOpenWiresNonemptyWorktreeOwnerIntoRunner(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	if _, err := Init(context.Background(), root, map[string]any{"project": "demo", "prefixes": "DEMO"}); err != nil {
 		t.Fatal(err)
@@ -209,9 +205,7 @@ func TestInitPrefixConflictDoesNotLeaveConfigScaffold(t *testing.T) {
 	first := t.TempDir()
 	second := t.TempDir()
 	for _, root := range []string{first, second} {
-		if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-			t.Fatal(err)
-		}
+		gitInit(t, root)
 	}
 	if _, err := Init(context.Background(), first, map[string]any{"project": "first", "prefixes": "SHARED"}); err != nil {
 		t.Fatal(err)
@@ -226,9 +220,7 @@ func TestInitPrefixConflictDoesNotLeaveConfigScaffold(t *testing.T) {
 
 func TestInitFromSubdirectoryReportsPathsRelativeToCWD(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	cwd := filepath.Join(root, "subdir")
 	if err := os.Mkdir(cwd, 0o755); err != nil {
 		t.Fatal(err)
@@ -365,9 +357,7 @@ func TestGitConfigExplicitNonpositiveTimeoutFailsEagerly(t *testing.T) {
 
 func TestOpenBuildsGitOpsFromProjectConfig(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	if _, err := Init(context.Background(), root, map[string]any{"project": "demo", "prefixes": "DEMO"}); err != nil {
 		t.Fatal(err)
@@ -384,9 +374,7 @@ func TestOpenBuildsGitOpsFromProjectConfig(t *testing.T) {
 
 func TestOpenWithoutStoreBuildsExecutionDependenciesWithoutStateDB(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -416,9 +404,7 @@ func TestOpenWithoutStoreBuildsExecutionDependenciesWithoutStateDB(t *testing.T)
 // written, with a message naming both flags.
 func TestInitWithoutPrefixesIsRefusedAndWritesNothing(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	for name, args := range map[string]map[string]any{
 		"no args":         {},
@@ -446,5 +432,13 @@ func TestInitWithoutPrefixesIsRefusedAndWritesNothing(t *testing.T) {
 				t.Fatalf("refused init left .aira: %v", statErr)
 			}
 		})
+	}
+}
+
+// gitInit makes dir a git repository, failing the test if git init fails.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if err := exec.Command("git", "-C", dir, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -305,11 +306,11 @@ func (l *ledger) read() ([]ledgerEvent, error) {
 			return nil, fmt.Errorf("U_RUN_RECONCILE_REQUIRED: torn ledger checksum (%s): %w", site, err)
 		}
 		got := sha256.Sum256(payload)
-		if !equalBytes(got[:], want[:]) {
+		if got != want {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: run ledger checksum mismatch (%s)", site)
 		}
 		var event ledgerEvent
-		dec := json.NewDecoder(bytesReader(payload))
+		dec := json.NewDecoder(bytes.NewReader(payload))
 		dec.DisallowUnknownFields()
 		decodeErr := dec.Decode(&event)
 		// AIRA-218: only when the strict decode fails, decode the payload again
@@ -402,7 +403,7 @@ func (s ledgerRecordSite) String() string {
 // covers: AIRA-218
 func decodeLedgerEventLenient(payload []byte) (ledgerEvent, bool) {
 	var event ledgerEvent
-	dec := json.NewDecoder(bytesReader(payload))
+	dec := json.NewDecoder(bytes.NewReader(payload))
 	if err := dec.Decode(&event); err != nil {
 		return ledgerEvent{}, false
 	}
@@ -462,32 +463,6 @@ func ledgerRecordIdentity(decodeErr error, event ledgerEvent) string {
 		state = "partially decoded"
 	}
 	return fmt.Sprintf("%s sequence=%d kind=%q run=%q", state, event.Sequence, event.Kind, event.Run.ID)
-}
-
-// tiny reader avoids exposing bytes.Buffer in the protocol code.
-type byteReader struct {
-	data []byte
-	off  int
-}
-
-func bytesReader(data []byte) io.Reader { return &byteReader{data: data} }
-func (r *byteReader) Read(p []byte) (int, error) {
-	if r.off == len(r.data) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.data[r.off:])
-	r.off += n
-	return n, nil
-}
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var x byte
-	for i := range a {
-		x |= a[i] ^ b[i]
-	}
-	return x == 0
 }
 
 func replay(events []ledgerEvent) (map[string]RunRecord, error) {
@@ -653,17 +628,6 @@ func LedgerIntegrity(commonDir string) error {
 	return nil
 }
 
-func (l *ledger) nextSequence() (uint64, error) {
-	events, err := l.read()
-	if err != nil {
-		return 0, err
-	}
-	if len(events) == 0 {
-		return 1, nil
-	}
-	return events[len(events)-1].Sequence + 1, nil
-}
-
 func (l *ledger) project(ctx context.Context) error {
 	events, err := l.read()
 	if err != nil {
@@ -695,7 +659,7 @@ func (l *ledger) project(ctx context.Context) error {
 	for _, r := range runs {
 		data, _ := json.Marshal(r)
 		refs, _ := json.Marshal(r.TelemetryRefs)
-		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,owner,stolen_by,peak_rss,cpu_user,cpu_sys,admission,admission_reason,admission_waited_ms,telemetry,telemetry_refs,resource_signature,admission_reserve,admission_reserve_basis,exit_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,owner=excluded.owner,stolen_by=excluded.stolen_by,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys,admission=excluded.admission,admission_reason=excluded.admission_reason,admission_waited_ms=excluded.admission_waited_ms,telemetry=excluded.telemetry,telemetry_refs=excluded.telemetry_refs,resource_signature=excluded.resource_signature,admission_reserve=excluded.admission_reserve,admission_reserve_basis=excluded.admission_reserve_basis,exit_code=excluded.exit_code`, r.ID, r.Status, r.Status.Terminal(), data, nullableString(r.Owner), nullableString(r.StolenBy), nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys), r.Admission, nullableString(r.AdmissionReason), r.AdmissionWaitedMS, nullableString(r.Telemetry), refs, nullableString(r.ResourceSignature), nullableMetric(r.AdmissionReserve), nullableString(r.AdmissionReserveBasis), nullableInt(r.ExitCode)); err != nil {
+		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,owner,stolen_by,peak_rss,cpu_user,cpu_sys,admission,admission_reason,admission_waited_ms,telemetry,telemetry_refs,resource_signature,admission_reserve,admission_reserve_basis,exit_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,owner=excluded.owner,stolen_by=excluded.stolen_by,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys,admission=excluded.admission,admission_reason=excluded.admission_reason,admission_waited_ms=excluded.admission_waited_ms,telemetry=excluded.telemetry,telemetry_refs=excluded.telemetry_refs,resource_signature=excluded.resource_signature,admission_reserve=excluded.admission_reserve,admission_reserve_basis=excluded.admission_reserve_basis,exit_code=excluded.exit_code`, r.ID, r.Status, r.Status.Terminal(), data, nullableString(r.Owner), nullableString(r.StolenBy), nullable(r.PeakRSS), nullable(r.CPUUser), nullable(r.CPUSys), r.Admission, nullableString(r.AdmissionReason), r.AdmissionWaitedMS, nullableString(r.Telemetry), refs, nullableString(r.ResourceSignature), nullable(r.AdmissionReserve), nullableString(r.AdmissionReserveBasis), nullable(r.ExitCode)); err != nil {
 			return err
 		}
 	}
@@ -732,17 +696,10 @@ func ensureRunColumn(ctx context.Context, db *sql.DB, name, kind string) error {
 	return err
 }
 
-func nullableMetric(value *int64) any {
-	if value == nil {
-		return nil
-	}
-	return *value
-}
-
-// nullableInt projects an optional exit code (AIRA-264). A recorded exit code
-// is written as an INTEGER; an unset one is NULL, which the peak-RSS history
+// nullable projects an optional metric or exit code to its value, or NULL when
+// unset. An unset exit code (AIRA-264) is NULL, which the peak-RSS history
 // reader treats as "not a proven clean success" and excludes.
-func nullableInt(value *int) any {
+func nullable[T any](value *T) any {
 	if value == nil {
 		return nil
 	}

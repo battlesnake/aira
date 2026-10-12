@@ -675,9 +675,7 @@ func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
 
 func TestReviewConfiguredPolicyRealCLIIntegration(t *testing.T) {
 	dir := t.TempDir()
-	if err := exec.Command("git", "-C", dir, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, dir)
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)

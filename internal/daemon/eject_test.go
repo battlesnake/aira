@@ -26,9 +26,7 @@ func lifecycleFixture(t *testing.T) (*Server, WorktreeScope, *store.Store) {
 	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	config := `{"schema":1,"project":{"slug":"life","prefixes":["LIFE"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}` + "\n"
 	if err := os.WriteFile(filepath.Join(root, ".aira", "config"), []byte(config), 0o644); err != nil {
 		t.Fatal(err)
@@ -297,9 +295,7 @@ func TestEjectPurgePreservesWorktreeIdentityGuard(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(replacementRoot, ".aira", "tickets"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "-C", replacementRoot, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, replacementRoot)
 	config := `{"schema":1,"project":{"slug":"replacement","prefixes":["REPLACED"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}` + "\n"
 	if err := os.WriteFile(filepath.Join(replacementRoot, ".aira", "config"), []byte(config), 0o644); err != nil {
 		t.Fatal(err)

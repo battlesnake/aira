@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -139,7 +140,7 @@ func TestSupervisorLeaseUnhealthyRetriesUntilDurable(t *testing.T) {
 	}
 	manager := &supervisorLeaseManager{runner: r, runID: record.ID, identity: record.SupervisorPID, ttl: 60 * time.Second, generation: 1, token: "token"}
 	manager.cadence()
-	if current, _ := r.ledger.current(record.ID); containsString(current.ErrorCodes, "U_RUN_SUPERVISOR_LEASE_UNHEALTHY") {
+	if current, _ := r.ledger.current(record.ID); slices.Contains(current.ErrorCodes, "U_RUN_SUPERVISOR_LEASE_UNHEALTHY") {
 		t.Fatal("diagnostic recorded despite the injected first-append failure")
 	}
 	if !manager.unhealthy {
@@ -156,7 +157,7 @@ func TestSupervisorLeaseUnhealthyRetriesUntilDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsString(current.ErrorCodes, "U_RUN_SUPERVISOR_LEASE_UNHEALTHY") || manager.unhealthy {
+	if !slices.Contains(current.ErrorCodes, "U_RUN_SUPERVISOR_LEASE_UNHEALTHY") || manager.unhealthy {
 		t.Fatalf("cadence auto-retry did not durably record the diagnostic: codes=%v pending=%v", current.ErrorCodes, manager.unhealthy)
 	}
 }

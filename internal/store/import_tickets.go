@@ -113,7 +113,8 @@ type importedLink struct {
 	To   string
 }
 
-type ticketAllocation struct {
+// importAllocation is one allocations-table row as the import paths read it.
+type importAllocation struct {
 	WorktreeID string
 	State      string
 	Path       string
@@ -412,13 +413,13 @@ func (s *Store) importTicketRow(ctx context.Context, row importedTicket) (string
 	if err != nil {
 		return "", err
 	}
-	alloc, allocExists, err := s.findTicketAllocation(ctx, row.Prefix, row.Number, row.Suffix)
+	alloc, allocExists, err := s.findAllocation(ctx, row.Prefix, row.Number, row.Suffix)
 	if err != nil {
 		return "", err
 	}
 
 	// A materialised/recovered allocation in ANOTHER worktree is the SAME ticket,
-	// never a genuine number collision: findTicketAllocation keys on the exact
+	// never a genuine number collision: findAllocation keys on the exact
 	// (project,prefix,number,suffix), so alloc.Path != path can only mean a
 	// different worktree of this one id. It is therefore adopted here — file
 	// present → refresh path; file absent → materialise via registerImportedTicket
@@ -456,7 +457,7 @@ func (s *Store) createImportedTicket(ctx context.Context, row importedTicket, pa
 // file. aira-owned frontmatter (Relations, Hold, Assignee, Milestone) is left
 // untouched; the digest is computed POST-merge so an unchanged re-import is a
 // true no-op.
-func (s *Store) refreshImportedTicket(ctx context.Context, row importedTicket, path, localDigest string, alloc ticketAllocation, allocExists bool) (string, error) {
+func (s *Store) refreshImportedTicket(ctx context.Context, row importedTicket, path, localDigest string, alloc importAllocation, allocExists bool) (string, error) {
 	data, outcome, err := readRegularTicket(path)
 	if outcome == scanReadInconclusive {
 		return "", indexUnestablishedError()
@@ -515,16 +516,16 @@ func (s *Store) freshImportTicket(row importedTicket) domain.Ticket {
 	}
 }
 
-func (s *Store) findTicketAllocation(ctx context.Context, prefix string, number int64, suffix string) (ticketAllocation, bool, error) {
-	var a ticketAllocation
+func (s *Store) findAllocation(ctx context.Context, prefix string, number int64, suffix string) (importAllocation, bool, error) {
+	var a importAllocation
 	err := s.db.QueryRowContext(ctx, `SELECT worktree_id, state, path, seq, kind
         FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, s.projectID, prefix, number, suffix).Scan(
 		&a.WorktreeID, &a.State, &a.Path, &a.Seq, &a.Kind)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ticketAllocation{}, false, nil
+		return importAllocation{}, false, nil
 	}
 	if err != nil {
-		return ticketAllocation{}, false, err
+		return importAllocation{}, false, err
 	}
 	return a, true, nil
 }
@@ -591,16 +592,16 @@ func (s *Store) registerImportedTicket(ctx context.Context, row importedTicket, 
 	return intent, receipt, nil
 }
 
-func scanAllocationTx(ctx context.Context, conn *sql.Conn, projectID, prefix string, number int64, suffix string) (ticketAllocation, bool, error) {
-	var a ticketAllocation
+func scanAllocationTx(ctx context.Context, conn *sql.Conn, projectID, prefix string, number int64, suffix string) (importAllocation, bool, error) {
+	var a importAllocation
 	err := conn.QueryRowContext(ctx, `SELECT worktree_id, state, path, seq, kind
         FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, projectID, prefix, number, suffix).Scan(
 		&a.WorktreeID, &a.State, &a.Path, &a.Seq, &a.Kind)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ticketAllocation{}, false, nil
+		return importAllocation{}, false, nil
 	}
 	if err != nil {
-		return ticketAllocation{}, false, err
+		return importAllocation{}, false, err
 	}
 	return a, true, nil
 }

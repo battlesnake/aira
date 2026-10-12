@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -65,7 +64,7 @@ const (
 	// callers.
 	dumpHistoryTimeout                        = 30 * time.Second
 	admitPriorRefresh                         = time.Minute
-	admitConfineScanIntervalDefault           = time.Second
+	oomSteerIntervalCeiling                   = time.Second
 	admitSliceHeadroomBaseDefault       int64 = 2 << 30
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
 
@@ -462,23 +461,21 @@ func sliceProvablyEmpty(queue *sliceQueue) bool {
 	return queue.outstandingJobs == 0
 }
 
-// AIRA-149. The three-valued contention lattice, and the ONE reading that
-// writes it. Diagnosis only: nothing here takes part in any admission or grant
-// decision, and this file's readings are consumed, never computed or altered.
+// AIRA-149. The contention lattice, and the ONE reading that writes it.
+// Diagnosis only: nothing here takes part in any admission or grant decision,
+// and this file's readings are consumed, never computed or altered.
 //
 // The lattice is MONOTONE and joined with max(), which is the whole transition
 // rule:
 //
-//	observed > unevaluated > none-observed
+//	observed > none-observed > unset (renders `unevaluated`)
 //
 // so `observed` is sticky (a wait spent behind a real job is reported as such
-// even if the slice is empty when the timer fires), a single pass that could
-// not establish solitude forbids `none-observed` for the whole wait, and
-// `none-observed` survives only when EVERY pass positively established it.
+// even if the slice is empty when the timer fires), and `none-observed`
+// survives only when no pass observed another job.
 const (
 	contentionUnset        = 0
 	contentionNoneObserved = 1
-	contentionUnevaluated  = 2
 	contentionObserved     = 3
 )
 
@@ -1830,12 +1827,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if s.admitBeforeWrite != nil {
 		s.admitBeforeWrite(waiter)
 	}
-	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-	write := s.admitWriteFrame
-	if write == nil {
-		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
-	}
-	if err := write(conn, responseFrame(core.Response{OK: true, Code: "OK", Data: grant})); err != nil {
+	if err := s.writeAdmitFrame(conn, responseFrame(core.Response{OK: true, Code: "OK", Data: grant})); err != nil {
 		return
 	}
 
@@ -1949,14 +1941,6 @@ func (s *Server) peerCredentialOf(conn net.Conn) (uid, pid int, err error) {
 		credential = unixPeerCredential
 	}
 	return credential(conn)
-}
-
-func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWaiter, string, error) {
-	return s.enqueueAdmitInternal(path, reserve, "", 0, false, admitRequest{})
-}
-
-func (s *Server) enqueueResolvedAdmit(path string, reserve int64, basis string, maximum int64) (*sliceQueue, *admitWaiter, string, error) {
-	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true, admitRequest{})
 }
 
 func (s *Server) enqueueResolvedConfineAdmit(path string, reserve int64, basis string, maximum int64, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
@@ -2746,13 +2730,14 @@ func (s *Server) pruneAdmitRegistry() {
 	s.admitRegistryMu.Unlock()
 }
 
-func (s *Server) writeAdmitGrant(conn net.Conn, grant AdmitResponse) {
+// writeAdmitFrame writes one admit reply under admitWriteTimeout, through the
+// admitWriteFrame test seam when one is installed.
+func (s *Server) writeAdmitFrame(conn net.Conn, frame any) error {
 	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-	write := s.admitWriteFrame
-	if write == nil {
-		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
+	if s.admitWriteFrame != nil {
+		return s.admitWriteFrame(conn, frame)
 	}
-	_ = write(conn, responseFrame(core.Response{OK: true, Code: "OK", Data: grant}))
+	return writeFrame(conn, frame)
 }
 
 // writeAdmitFailClosed refuses a NEW admission the daemon cannot evaluate
@@ -2781,12 +2766,7 @@ func (s *Server) writeAdmitFailClosed(conn net.Conn, exclusive bool, reason stri
 }
 
 func (s *Server) writeAdmitError(conn net.Conn, code, message string) {
-	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-	write := s.admitWriteFrame
-	if write == nil {
-		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
-	}
-	_ = write(conn, errorFrame(code, message))
+	_ = s.writeAdmitFrame(conn, errorFrame(code, message))
 }
 
 // saturatedDiagnosisLocked builds the AIRA-149 diagnosis half of a saturated
@@ -2904,11 +2884,6 @@ func tooLargeRefusalAdvice(basis string) string {
 }
 
 func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admitRejection) {
-	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-	write := s.admitWriteFrame
-	if write == nil {
-		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
-	}
 	message := code + ": " + rejection.Basis
 	if code == CodeAdmitTooLarge {
 		message = fmt.Sprintf("%s: required=%d cap_minus_headroom=%d basis=%s", code, rejection.Required, rejection.Ceiling, rejection.Basis)
@@ -2935,7 +2910,7 @@ func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admit
 	}
 	frame := errorFrame(code, message)
 	frame.Data, _ = json.Marshal(rejection)
-	_ = write(conn, frame)
+	_ = s.writeAdmitFrame(conn, frame)
 }
 
 func (s *Server) admitNowTime() time.Time {
@@ -3393,11 +3368,11 @@ func parseAdmitMemory(data []byte) (int64, bool) {
 }
 
 func resolveAdmitSlicePath(slice string) (string, bool, string) {
-	mount, err := admitUnifiedMount()
+	mount, err := runner.UnifiedCgroupMount()
 	if err != nil {
 		return "", false, "slice-not-found"
 	}
-	current, err := admitCurrentCgroupPath(mount)
+	current, err := runner.CurrentCgroupPath(mount)
 	if err != nil {
 		return "", false, "slice-not-found"
 	}
@@ -3447,47 +3422,6 @@ func resolveAdmitSlicePathAt(slice, mount, current string) (string, bool, string
 		}
 	}
 	return "", false, "slice-not-found"
-}
-
-func admitUnifiedMount() (string, error) {
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), " - ", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		post, pre := strings.Fields(parts[1]), strings.Fields(parts[0])
-		if len(post) < 1 || len(pre) < 5 || post[0] != "cgroup2" {
-			continue
-		}
-		mount := pre[4]
-		for _, item := range []struct{ from, to string }{{"\\040", " "}, {"\\011", "\t"}, {"\\134", "\\"}} {
-			mount = strings.ReplaceAll(mount, item.from, item.to)
-		}
-		return mount, nil
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", errors.New("cgroup-v2 unified mount not found")
-}
-
-func admitCurrentCgroupPath(mount string) (string, error) {
-	data, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			return filepath.Join(mount, strings.TrimPrefix(strings.TrimPrefix(line, "0::"), "/")), nil
-		}
-	}
-	return "", errors.New("unified cgroup membership not found")
 }
 
 func admitHasParentComponent(path string) bool {

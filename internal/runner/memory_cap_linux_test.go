@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -109,7 +110,7 @@ func TestDetachedScopeMemoryCapFailureDoesNotLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_CAP_UNAVAILABLE") || record.PIDIdentity.PID != 0 {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_CAP_UNAVAILABLE") || record.PIDIdentity.PID != 0 {
 		t.Fatalf("terminal record=%+v", record)
 	}
 }

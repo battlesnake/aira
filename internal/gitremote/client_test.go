@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -226,7 +227,7 @@ func (f *fakeExec) run(_ context.Context, req runRequest) runResult {
 			return runResult{ExitCode: 1}
 		}
 		return runResult{Stdout: f.remoteConfig}
-	case req.Name == "git" && len(req.Args) > 0 && req.Args[0] == "ls-remote" && contains(req.Args, "--heads"):
+	case req.Name == "git" && len(req.Args) > 0 && req.Args[0] == "ls-remote" && slices.Contains(req.Args, "--heads"):
 		return f.probe
 	case req.Name == "git":
 		f.opCalls++
@@ -234,15 +235,6 @@ func (f *fakeExec) run(_ context.Context, req runRequest) runResult {
 	default:
 		return runResult{ExitCode: -1, Err: errors.New("unexpected command")}
 	}
-}
-
-func contains(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
-	}
-	return false
 }
 
 func codeOf(t *testing.T, err error) string {
@@ -325,14 +317,14 @@ func TestNativeGitHubHTTPSRunsAnonymouslyWhenGHAbsent(t *testing.T) {
 	}
 	sawOp := false
 	for _, call := range fake.calls {
-		if call.Name != "git" || !contains(call.Args, "fetch") {
+		if call.Name != "git" || !slices.Contains(call.Args, "fetch") {
 			continue
 		}
 		sawOp = true
-		if !contains(call.Args, "credential.helper=") {
+		if !slices.Contains(call.Args, "credential.helper=") {
 			t.Fatalf("anonymous github op did not clear inherited helpers: %#v", call.Args)
 		}
-		if contains(call.Args, "credential.helper="+credentialHelper) {
+		if slices.Contains(call.Args, "credential.helper="+credentialHelper) {
 			t.Fatalf("gh helper injected despite gh being unavailable: %#v", call.Args)
 		}
 	}
@@ -397,7 +389,7 @@ func TestSSHPasswordRemoteRefusedBeforeProbe(t *testing.T) {
 			t.Errorf("%s: err=%v (want ARG_INVALID)", verb, err)
 		}
 		for _, call := range fake.calls {
-			if contains(call.Args, "--heads") || strings.Contains(strings.Join(call.Args, " "), "s3cr3t") {
+			if slices.Contains(call.Args, "--heads") || strings.Contains(strings.Join(call.Args, " "), "s3cr3t") {
 				t.Errorf("%s: password reached a child argv (probe ran before rejection): %#v", verb, call.Args)
 			}
 		}
@@ -420,7 +412,7 @@ func TestExplicitPushURLStillHonoursOrdinaryInsteadOf(t *testing.T) {
 		t.Fatalf("ordinary insteadOf was not applied to the explicit pushurl: %+v", result)
 	}
 	for _, call := range fake.calls {
-		if contains(call.Args, "--heads") && !contains(call.Args, "ssh://git@moved.example/owner/push.git") {
+		if slices.Contains(call.Args, "--heads") && !slices.Contains(call.Args, "ssh://git@moved.example/owner/push.git") {
 			t.Fatalf("probe did not use the insteadOf-rewritten pushurl: %#v", call.Args)
 		}
 	}
@@ -475,10 +467,10 @@ func TestSyntheticRemoteFallbackArgvAndAllowList(t *testing.T) {
 	}
 	var op runRequest
 	for _, call := range fake.calls {
-		if call.Name == "git" && contains(call.Args, "aira-fallback") {
+		if call.Name == "git" && slices.Contains(call.Args, "aira-fallback") {
 			op = call
 		}
-		if len(call.Args) > 1 && call.Args[0] == "config" && !contains(call.Args, "--get-all") && !contains(call.Args, "--get-regexp") {
+		if len(call.Args) > 1 && call.Args[0] == "config" && !slices.Contains(call.Args, "--get-all") && !slices.Contains(call.Args, "--get-regexp") {
 			t.Fatalf("git config write appeared: %#v", call.Args)
 		}
 	}
@@ -494,7 +486,7 @@ func TestSyntheticRemoteFallbackArgvAndAllowList(t *testing.T) {
 			t.Errorf("missing %q in %#v", wanted, op.Args)
 		}
 	}
-	if strings.Count(joined, "remote.aira-fallback.url=") != 1 || strings.Contains(joined, "remote.origin.url=") || contains(op.Args, "https://github.com/owner/repo.git") {
+	if strings.Count(joined, "remote.aira-fallback.url=") != 1 || strings.Contains(joined, "remote.origin.url=") || slices.Contains(op.Args, "https://github.com/owner/repo.git") {
 		t.Fatalf("fallback did not use exactly one synthetic URL: %#v", op.Args)
 	}
 	// url and pushurl are recognised for validation but must NEVER be copied onto the
@@ -513,7 +505,7 @@ func TestSyntheticRemoteNameAvoidsExistingRemote(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, call := range fake.calls {
-		if contains(call.Args, "aira-fallback-1") {
+		if slices.Contains(call.Args, "aira-fallback-1") {
 			return
 		}
 	}
@@ -535,7 +527,7 @@ func TestNativeAndFallbackFetchPreserveSameRefAndTagSettings(t *testing.T) {
 	}
 	var fallback []string
 	for _, call := range fake.calls {
-		if contains(call.Args, "aira-fallback") {
+		if slices.Contains(call.Args, "aira-fallback") {
 			fallback = call.Args
 		}
 	}
@@ -544,7 +536,7 @@ func TestNativeAndFallbackFetchPreserveSameRefAndTagSettings(t *testing.T) {
 		"remote.aira-fallback.fetch=+refs/tags/release:refs/tags/release",
 		"remote.aira-fallback.tagOpt=--tags", "remote.aira-fallback.prune=true",
 	} {
-		if !contains(fallback, semantic) {
+		if !slices.Contains(fallback, semantic) {
 			t.Fatalf("fallback lost native semantic %q: %#v", semantic, fallback)
 		}
 	}
@@ -665,7 +657,7 @@ func TestFallbackPushRefspecContract(t *testing.T) {
 			}
 			joined := ""
 			for _, call := range fake.calls {
-				if contains(call.Args, "push") && contains(call.Args, "aira-fallback") {
+				if slices.Contains(call.Args, "push") && slices.Contains(call.Args, "aira-fallback") {
 					joined = strings.Join(call.Args, "\n")
 				}
 			}
@@ -687,18 +679,18 @@ func TestCloneFallbackSpecialCase(t *testing.T) {
 	}
 	var argv []string
 	for _, call := range fake.calls {
-		if contains(call.Args, "clone") {
+		if slices.Contains(call.Args, "clone") {
 			argv = call.Args
 		}
 	}
-	if !contains(argv, "https://github.com/owner/repo.git") || !contains(argv, "dst") || contains(argv, "aira-fallback") {
+	if !slices.Contains(argv, "https://github.com/owner/repo.git") || !slices.Contains(argv, "dst") || slices.Contains(argv, "aira-fallback") {
 		t.Fatalf("clone argv=%#v", argv)
 	}
 	for _, call := range fake.calls {
-		if contains(call.Args, "^remote\\.") {
+		if slices.Contains(call.Args, "^remote\\.") {
 			t.Fatalf("clone enumerated repo remote config: %#v", call.Args)
 		}
-		if contains(call.Args, "^url\\..*") && call.Dir != "/" {
+		if slices.Contains(call.Args, "^url\\..*") && call.Dir != "/" {
 			t.Fatalf("clone rewrite enumeration used repo cwd: %#v dir=%q", call.Args, call.Dir)
 		}
 	}
@@ -743,7 +735,7 @@ func TestPushProbesExplicitPushURLWithoutRewrite(t *testing.T) {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}
 	for _, call := range fake.calls {
-		if contains(call.Args, "--heads") && !contains(call.Args, fake.pushURL) {
+		if slices.Contains(call.Args, "--heads") && !slices.Contains(call.Args, fake.pushURL) {
 			t.Fatalf("probe=%#v", call.Args)
 		}
 	}
@@ -765,8 +757,8 @@ func TestResolvedProbeAndReportedEndpointAgreeWithoutChainedReapplication(t *tes
 		t.Fatalf("result=%+v", result)
 	}
 	for _, call := range fake.calls {
-		if contains(call.Args, "--heads") {
-			if !contains(call.Args, want) || contains(call.Args, "https://must-not-chain.example/owner/repo") {
+		if slices.Contains(call.Args, "--heads") {
+			if !slices.Contains(call.Args, want) || slices.Contains(call.Args, "https://must-not-chain.example/owner/repo") {
 				t.Fatalf("probe=%#v", call.Args)
 			}
 		}
@@ -789,10 +781,10 @@ func TestCloneChainedRewriteUsesRawForCommitAndEffectiveForProbeReport(t *testin
 		t.Fatalf("result=%+v", result)
 	}
 	for _, call := range fake.calls {
-		if contains(call.Args, "--heads") && !contains(call.Args, want) {
+		if slices.Contains(call.Args, "--heads") && !slices.Contains(call.Args, want) {
 			t.Fatalf("probe=%#v", call.Args)
 		}
-		if contains(call.Args, "clone") && (!contains(call.Args, "gh:owner/repo") || contains(call.Args, want)) {
+		if slices.Contains(call.Args, "clone") && (!slices.Contains(call.Args, "gh:owner/repo") || slices.Contains(call.Args, want)) {
 			t.Fatalf("commit=%#v", call.Args)
 		}
 	}
@@ -827,7 +819,7 @@ func TestGHChecksAreScopedAndRequireCredential(t *testing.T) {
 				t.Fatalf("error=%v opCalls=%d", err, fake.opCalls)
 			}
 			for _, call := range fake.calls {
-				if call.Name == "gh" && contains(call.Args, "status") && !contains(call.Args, "github.com") {
+				if call.Name == "gh" && slices.Contains(call.Args, "status") && !slices.Contains(call.Args, "github.com") {
 					t.Fatalf("unscoped gh call %#v", call.Args)
 				}
 			}
@@ -853,7 +845,7 @@ func TestEveryChildEnvironmentIsNonInteractiveAndProbeIsRewriteFree(t *testing.T
 				t.Errorf("%s %#v missing %s", call.Name, call.Args, wanted)
 			}
 		}
-		if contains(call.Args, "--heads") {
+		if slices.Contains(call.Args, "--heads") {
 			if call.Dir != "/" || !strings.Contains(env, "GIT_CONFIG_GLOBAL=/dev/null") || !strings.Contains(env, "GIT_CONFIG_SYSTEM=/dev/null") || strings.Contains(env, "GIT_CONFIG_COUNT=") || strings.Contains(env, "GIT_CONFIG_KEY_0=") || strings.Contains(env, "GIT_CONFIG_VALUE_0=") || strings.Contains(env, "GIT_CONFIG_PARAMETERS=") {
 				t.Fatalf("probe was not rewrite-free: dir=%q env=%s", call.Dir, env)
 			}
@@ -925,4 +917,18 @@ func TestRedactURLScrubsTokensOnEveryPath(t *testing.T) {
 	if got := RedactURL("https://github.com/ghp_tools/repo.git"); got != "https://github.com/ghp_tools/repo.git" {
 		t.Fatalf("short ghp_ lookalike over-redacted: %q", got)
 	}
+}
+
+func errorCode(err error) string {
+	var target *Error
+	if errors.As(err, &target) {
+		return target.StableCode
+	}
+	return ""
+}
+
+func newWithRun(config Config, run runFn) *Client {
+	c := New(config)
+	c.run = run
+	return c
 }

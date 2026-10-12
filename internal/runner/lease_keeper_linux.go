@@ -296,7 +296,7 @@ func (k *leaseKeeper) reDeclareOnCurrent() reDeclareOutcome {
 		return reDeclareStopped
 	}
 	_ = conn.SetDeadline(time.Now().Add(leaseKeeperExchangeGrace))
-	if err := writeRunnerAdmitBytes(conn, k.frame); err != nil {
+	if err := writeAll(conn, k.frame); err != nil {
 		return k.retryUnlessStopped()
 	}
 	var ack [1]byte

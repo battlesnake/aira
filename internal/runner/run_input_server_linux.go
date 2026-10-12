@@ -72,7 +72,7 @@ func prepareRunInputPlane(runtimeDir, runID, owner string) (*runInputPlane, erro
 		}
 		path := filepath.Join(dir, runID+"-"+nonce+".sock")
 		if len(path) > unixSocketPathMax {
-			return nil, &RunInputError{Code: "E_RUN_INPUT_PATH_TOO_LONG", Err: fmt.Errorf("Unix socket path is %d bytes; maximum is %d", len(path), unixSocketPathMax)}
+			return nil, &RunInputError{Code: "E_RUN_INPUT_PATH_TOO_LONG", Err: fmt.Errorf("unix socket path is %d bytes; maximum is %d", len(path), unixSocketPathMax)}
 		}
 		listener, listenErr := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 		if listenErr != nil {

@@ -65,17 +65,7 @@ func openSupervisorRelayStore(project app.Project, paths daemon.Paths, relay sto
 	if err != nil {
 		return nil, err
 	}
-	readScope := scope
-	readScope.ReviewPolicy.Configured = readScope.ReviewConfigured
-	readOnly, err := store.OpenReadOnly(filepath.Join(project.StateDir, "state.db"), store.ScopeOptions{
-		Root: readScope.Root, CommonDir: readScope.CommonDir, GitDir: readScope.GitDir,
-		ProjectID: readScope.ProjectID, WorktreeID: readScope.WorktreeID, ProjectSlug: readScope.Slug,
-		Prefixes: readScope.Prefixes, RequirementPrefixes: readScope.RequirementPrefixes, IDPrefix: readScope.IDPrefix, ReviewPolicy: readScope.ReviewPolicy,
-		LeaseTTLNS: readScope.LeaseTTLNS, MaxReports: readScope.MaxReports, MaxAgeDays: readScope.MaxAgeDays,
-		MaxComputeEvents: readScope.MaxComputeEvents, MaxComputeAgeDays: readScope.MaxComputeAgeDays,
-		MaxCommandEvents: readScope.MaxCommandEvents, MaxCommandAgeDays: readScope.MaxCommandAgeDays,
-		MaxQuotaSnapshots: readScope.MaxQuotaSnapshots, ConfigDigest: readScope.ConfigDigest,
-	})
+	readOnly, err := store.OpenReadOnly(filepath.Join(project.StateDir, "state.db"), scope.StoreOptions())
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -115,7 +116,7 @@ func TestClaudeUsageModFlagSurvivesTheSudoReexec(t *testing.T) {
 	target := installTarget{uid: 1000, gid: 1000, home: "/home/u", username: "u"}
 	for opts, want := range map[string]string{claudeModOn: "--claude-usage-mod", claudeModOff: "--claude-usage-mod=off"} {
 		got := reexecRequestFor("/opt/aira", target, installOpts{claudeUsageMod: opts}).args
-		if !containsArg(got, want) {
+		if !slices.Contains(got, want) {
 			t.Fatalf("mod=%q: reexec args %q lack %q", opts, got, want)
 		}
 	}
@@ -124,15 +125,6 @@ func TestClaudeUsageModFlagSurvivesTheSudoReexec(t *testing.T) {
 			t.Fatalf("a flag that was not given was forwarded: %q", arg)
 		}
 	}
-}
-
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
 }
 
 // verifies: AIRA-284 §3.1 — the shipped mod: exactly the three files, the

@@ -46,14 +46,10 @@ type FoldedVerdict struct {
 	Suspect bool   `json:"suspect"`
 }
 
-// FoldVerdict is fail-closed. In particular, proof validity is a prerequisite
-// for pass and a canary which does not fire is an established failure.
-func FoldVerdict(predicate PredicateState, proof ProofState, canary CanaryHealth, evidence EvidenceAvailability) FoldedVerdict {
-	return FoldVerdictWithCode(predicate, "", proof, canary, evidence)
-}
-
-// FoldVerdictWithCode preserves evaluator-specific failure codes while
-// retaining the established fail-closed proof/canary ordering.
+// FoldVerdictWithCode is fail-closed: proof validity is a prerequisite for
+// pass and a canary which does not fire is an established failure. It
+// preserves evaluator-specific failure codes (predicateCode) while retaining
+// the established fail-closed proof/canary ordering.
 func FoldVerdictWithCode(predicate PredicateState, predicateCode string, proof ProofState, canary CanaryHealth, evidence EvidenceAvailability) FoldedVerdict {
 	if canary == CanaryFail {
 		return FoldedVerdict{Verdict: VerdictFail, Code: "E_GATE_CANARY_DID_NOT_FIRE"}
@@ -69,9 +65,6 @@ func FoldVerdictWithCode(predicate PredicateState, predicateCode string, proof P
 	}
 	if evidence == EvidenceMissing || predicate == PredicateUnevaluated {
 		return FoldedVerdict{Verdict: VerdictUnevaluated, Code: "U_GATE_EVIDENCE_UNAVAILABLE", Suspect: true}
-	}
-	if canary == CanaryNotRun && proof != ProofValid {
-		return proofVerdict(proof)
 	}
 	if proof != ProofValid {
 		return proofVerdict(proof)

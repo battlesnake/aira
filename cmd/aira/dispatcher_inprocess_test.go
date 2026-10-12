@@ -41,9 +41,7 @@ func runInProcess(argv []string, stdout, stderr io.Writer) int {
 
 func TestTimeCLIExitPassthroughHumanSuppressionAndStructuredRead(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	t.Chdir(root)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
@@ -76,9 +74,7 @@ func TestCommandsRoutedDaemonParityAndPairedDrillRealSocket(t *testing.T) {
 		t.Skip("real Unix-socket parity requires AIRA_REAL_SOCKET=1")
 	}
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -741,9 +737,7 @@ func TestStoreFreeDispatchFailsClosedWhenConfigChangesDuringHandshake(t *testing
 	}
 
 	owner := t.TempDir()
-	if err := exec.Command("git", "-C", owner, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, owner)
 	if _, err := app.Init(context.Background(), owner, map[string]any{"project": "owner", "prefixes": "SHARED"}); err != nil {
 		t.Fatal(err)
 	}
@@ -927,9 +921,7 @@ func storeFreeDispatcherFixture(t *testing.T) (*daemonDispatcher, daemon.Worktre
 func writeStoreFreeProject(t *testing.T, paths daemon.Paths) (string, daemon.WorktreeScope) {
 	t.Helper()
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -975,9 +967,7 @@ func startCommandDaemon(t *testing.T, server *daemon.Server) {
 // socket instead of opening a project store itself.
 func TestMCPMutationUsesRealDaemonSocket(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1329,9 +1319,7 @@ func TestConfineKillReadinessRequiresAPopulatedRecordForTheExactName(t *testing.
 
 func TestStoreFreeRealCLIRegistersOnlyThroughDaemon(t *testing.T) {
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1399,9 +1387,7 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 		t.Skip("real Unix-socket D7b e2e requires AIRA_REAL_SOCKET=1")
 	}
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("launch\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1551,9 +1537,7 @@ func TestMCPRoutedStructuredResponseIsRenderedByteIdentically(t *testing.T) {
 
 func TestRoutedInitRenderingMatchesInProcessFieldOrder(t *testing.T) {
 	cwd := t.TempDir()
-	if err := exec.Command("git", "-C", cwd, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, cwd)
 	t.Chdir(cwd)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(cwd, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
@@ -1643,9 +1627,7 @@ func TestMCPEjectUsesProjectlessDaemonRouteAndPreservesSelectors(t *testing.T) {
 
 func TestEjectWithoutSelectorAndWithoutCurrentConfigIsENoProject(t *testing.T) {
 	cwd := t.TempDir()
-	if err := exec.Command("git", "-C", cwd, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, cwd)
 	t.Chdir(cwd)
 	called := false
 	dispatcher := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {

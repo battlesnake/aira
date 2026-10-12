@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -213,7 +214,7 @@ func TestM20MergeEvidenceCarriesDetachedLeaseAndWriteOnceExitZero(t *testing.T) 
 
 	// A genuinely different second payload is diagnosed and the first remains.
 	got = mergeEvidence(got, RunRecord{ID: "RUN-1", LeaderExitObserved: true, ExitCode: intPointer(7)})
-	if got.ExitCode == nil || *got.ExitCode != 0 || !containsString(got.ErrorCodes, "U_RUN_EXIT_CONFLICT") {
+	if got.ExitCode == nil || *got.ExitCode != 0 || !slices.Contains(got.ErrorCodes, "U_RUN_EXIT_CONFLICT") {
 		t.Fatalf("conflicting exit was not preserved+diagnosed: %+v", got)
 	}
 }
@@ -322,7 +323,7 @@ func TestM20ControlFileIs0600AndConsumedBeforeLaunch(t *testing.T) {
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("control mode = %o", info.Mode().Perm())
 	}
-	req, err := consumeDetachControl(path)
+	req, err := ConsumeDetachControl(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +728,7 @@ func TestM20ReconcileAndKillBoundedLockNeverFabricateTerminal(t *testing.T) {
 	}
 	defer unlockFile(lock)
 	runs, err := r.Reconcile(context.Background())
-	if err != nil || len(runs) != 1 || !containsString(runs[0].ErrorCodes, "U_RUN_LAUNCH_STALLED") || runs[0].Status.Terminal() {
+	if err != nil || len(runs) != 1 || !slices.Contains(runs[0].ErrorCodes, "U_RUN_LAUNCH_STALLED") || runs[0].Status.Terminal() {
 		t.Fatalf("reconcile runs=%+v err=%v", runs, err)
 	}
 	if killed, err := r.Kill(context.Background(), run.ID, false); err == nil || killed != nil {
@@ -795,7 +796,7 @@ func TestM20ForceAttemptDoesNotClaimDescendantKillWhenScopeEmptiesNaturally(t *t
 	// attributable to us: the run is force-attempted (U_RUN_QUIESCE_FORCED, not
 	// clean), never claimed a descendant-kill, and the leader's exit (0) is kept.
 	// Forced-quiesce alone leaves the status as the leader's exit, not killed.
-	if final.Status != StatusExited || final.ScopeIntegrity == ScopeDescendantKilled || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
+	if final.Status != StatusExited || final.ScopeIntegrity == ScopeDescendantKilled || !slices.Contains(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
 		t.Fatalf("force-attempt was over-claimed: %+v", final)
 	}
 	if final.ExitCode == nil || *final.ExitCode != 0 {
@@ -840,7 +841,7 @@ func TestM20ForcedQuiesceIsDurableBeforeKillAndClassificationIsHonest(t *testing
 			if killErr != nil {
 				// The scope stayed populated after a failed kill: capture-incomplete,
 				// non-terminal, no descendant-kill claim.
-				if forceErr == nil || !containsString(current.ErrorCodes, "U_RUN_CAPTURE_INCOMPLETE") {
+				if forceErr == nil || !slices.Contains(current.ErrorCodes, "U_RUN_CAPTURE_INCOMPLETE") {
 					t.Fatalf("stuck kill mis-reported: record=%+v err=%v", current, forceErr)
 				}
 				return
@@ -857,7 +858,7 @@ func TestM20ForcedQuiesceIsDurableBeforeKillAndClassificationIsHonest(t *testing
 			// Forced-quiesce keeps the leader's exit (0) and status exited (§3 —
 			// killed only on an explicit KillIntent), stays not-clean via the code,
 			// and never claims a descendant-kill.
-			if final.Status != StatusExited || final.ExitCode == nil || *final.ExitCode != 0 || final.CleanSuccess() || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.ScopeIntegrity == ScopeDescendantKilled {
+			if final.Status != StatusExited || final.ExitCode == nil || *final.ExitCode != 0 || final.CleanSuccess() || !slices.Contains(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.ScopeIntegrity == ScopeDescendantKilled {
 				t.Fatalf("forced terminal=%+v", final)
 			}
 		})
@@ -900,7 +901,7 @@ func TestM20ForcedQuiescePublishesResultBeforeRacingReconcile(t *testing.T) {
 	if final == nil {
 		t.Fatalf("reconcile did not return the run: %+v", runs)
 	}
-	if final.Status != StatusExited || final.ExitCode == nil || *final.ExitCode != 0 || final.ScopeIntegrity == ScopeDescendantKilled || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
+	if final.Status != StatusExited || final.ExitCode == nil || *final.ExitCode != 0 || final.ScopeIntegrity == ScopeDescendantKilled || !slices.Contains(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
 		t.Fatalf("racing finalizer lost forced result: %+v", final)
 	}
 }
@@ -1089,7 +1090,7 @@ func TestRunInputRealDescendantReceivesEOFAfterLeaderExit(t *testing.T) {
 		if outcome.err != nil || outcome.record == nil || outcome.record.Status != StatusExited {
 			t.Fatalf("descendant EOF outcome=%+v", outcome)
 		}
-		if outcome.record.QuiesceForced || containsString(outcome.record.ErrorCodes, "U_RUN_QUIESCE_FORCED") {
+		if outcome.record.QuiesceForced || slices.Contains(outcome.record.ErrorCodes, "U_RUN_QUIESCE_FORCED") {
 			t.Fatalf("descendant was force-quiesced, not EOF-drained: %+v", outcome.record)
 		}
 		if elapsed := time.Since(started); elapsed >= r.grace {
@@ -1267,7 +1268,7 @@ func TestM20RealForcedQuiescePreservesLeaderExitAndIsNotClean(t *testing.T) {
 	// killed — §3), U_RUN_QUIESCE_FORCED makes it not-clean, and we NEVER claim a
 	// descendant-kill (the emptiness is not provably attributable to our kill).
 	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 || !record.LeaderExitObserved || !record.QuiesceForced ||
-		record.ScopeIntegrity == ScopeDescendantKilled || !containsString(record.ErrorCodes, "U_RUN_QUIESCE_FORCED") || record.CleanSuccess() {
+		record.ScopeIntegrity == ScopeDescendantKilled || !slices.Contains(record.ErrorCodes, "U_RUN_QUIESCE_FORCED") || record.CleanSuccess() {
 		t.Fatalf("forced quiesce record=%+v", record)
 	}
 }
@@ -1340,7 +1341,7 @@ func TestM20ReconcileDetachedSupervisorLeaseAndExitEvidence(t *testing.T) {
 		run := detachedRunForTest(scope, processDead)
 		appendRunEvent(t, r, "starting", run)
 		got := reconcileOne(t, r)
-		if got.Status != StatusLost || !containsString(got.ErrorCodes, "U_RUN_EXIT_UNKNOWN") {
+		if got.Status != StatusLost || !slices.Contains(got.ErrorCodes, "U_RUN_EXIT_UNKNOWN") {
 			t.Fatalf("dead supervisor outcome: %+v", got)
 		}
 	})
@@ -1351,7 +1352,7 @@ func TestM20ReconcileDetachedSupervisorLeaseAndExitEvidence(t *testing.T) {
 		appendRunEvent(t, r, "starting", run)
 		appendRunEvent(t, r, "scope-created", run)
 		got := reconcileOne(t, r)
-		if got.Status.Terminal() || !containsString(got.ErrorCodes, "U_RUN_SUPERVISOR_STALLED") {
+		if got.Status.Terminal() || !slices.Contains(got.ErrorCodes, "U_RUN_SUPERVISOR_STALLED") {
 			t.Fatalf("stalled supervisor outcome: %+v", got)
 		}
 	})
@@ -1364,7 +1365,7 @@ func TestM20ReconcileDetachedSupervisorLeaseAndExitEvidence(t *testing.T) {
 		run := detachedRunForTest(scope, processAlive)
 		appendRunEvent(t, r, "starting", run)
 		got := reconcileOne(t, r)
-		if got.Status.Terminal() || containsString(got.ErrorCodes, "U_RUN_SUPERVISOR_STALLED") {
+		if got.Status.Terminal() || slices.Contains(got.ErrorCodes, "U_RUN_SUPERVISOR_STALLED") {
 			t.Fatalf("queued run was mislabelled stalled: %+v", got)
 		}
 	})
@@ -1414,7 +1415,7 @@ func TestM20ReconcileUninspectableScopeNeverFinalizes(t *testing.T) {
 	if got.Status.Terminal() {
 		t.Fatalf("uninspectable scope was terminalized (false-pass): %+v", got)
 	}
-	if !containsString(got.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if !slices.Contains(got.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("uninspectable scope was not surfaced: %+v", got)
 	}
 	if got.OutputRefs["out"].State == OutputComplete {
@@ -1543,7 +1544,7 @@ func TestM20ReconcileAbsentScopeFinalizesFromEvidenceOrLost(t *testing.T) {
 		appendRunEvent(t, r, "scope-created", run)
 		r.backend = &openErrorBackend{err: os.ErrNotExist}
 		got := reconcileOne(t, r)
-		if got.Status != StatusLost || !containsString(got.ErrorCodes, "U_RUN_EXIT_UNKNOWN") {
+		if got.Status != StatusLost || !slices.Contains(got.ErrorCodes, "U_RUN_EXIT_UNKNOWN") {
 			t.Fatalf("absent scope + dead supervisor not lost: %+v", got)
 		}
 	})
@@ -1597,7 +1598,7 @@ func TestM20FinalizeKilledAndForceQuiescedRecordsBoth(t *testing.T) {
 	}
 	// Both facts must appear: kill wins the status (killed + E_RUN_KILLED) AND the
 	// forced-quiesce diagnostic is folded independently (U_RUN_QUIESCE_FORCED).
-	if final.Status != StatusKilled || !containsString(final.ErrorCodes, "E_RUN_KILLED") || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
+	if final.Status != StatusKilled || !slices.Contains(final.ErrorCodes, "E_RUN_KILLED") || !slices.Contains(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
 		t.Fatalf("mixed killed+force-quiesced terminal dropped a fact: %+v", final)
 	}
 }

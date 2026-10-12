@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,9 +22,7 @@ import (
 func enumCLIProject(t *testing.T) (root string, run func(argv ...string) (int, map[string]any, string)) {
 	t.Helper()
 	root = t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	t.Chdir(root)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))

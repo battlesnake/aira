@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"aira/internal/runner"
 )
 
 const (
@@ -652,7 +653,7 @@ func emitWatchdog(ctx context.Context, deps watchdogDeps, event watchdogEvent) {
 }
 
 func realWatchdogDeps(s *Server) watchdogDeps {
-	mount, mountErr := watchdogUnifiedMount()
+	mount, mountErr := runner.UnifiedCgroupMount()
 	daemonGroup, _, _ := watchdogCgroupForPID(os.Getpid(), mount, mountErr)
 	return watchdogDeps{
 		readPressure:        readHostPressureFull,
@@ -785,34 +786,6 @@ func parseProcStartTime(data []byte) (uint64, bool) {
 	return value, err == nil
 }
 
-func watchdogUnifiedMount() (string, error) {
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), " - ", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		pre, post := strings.Fields(parts[0]), strings.Fields(parts[1])
-		if len(pre) < 5 || len(post) < 1 || post[0] != "cgroup2" {
-			continue
-		}
-		mount := pre[4]
-		for _, replacement := range []struct{ from, to string }{{"\\040", " "}, {"\\011", "\t"}, {"\\134", "\\"}} {
-			mount = strings.ReplaceAll(mount, replacement.from, replacement.to)
-		}
-		return mount, nil
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", errors.New("cgroup-v2 unified mount not found")
-}
-
 func watchdogCgroupForPID(pid int, mount string, mountErr error) (watchdogCgroup, bool, string) {
 	if mountErr != nil {
 		return watchdogCgroup{}, false, "cgroup-mount-unavailable"
@@ -850,11 +823,6 @@ func classifyWatchdogCgroup(mount, rel string) (watchdogCgroup, bool, string) {
 		return watchdogCgroup{path: rel}, false, "memory-max-unevaluated"
 	}
 	return watchdogCgroup{path: rel, uncapped: !finite}, true, ""
-}
-
-func effectiveWatchdogCapFrom(mount, path string) (int64, bool) {
-	cap, finite, _ := effectiveWatchdogCapEvaluated(mount, path)
-	return cap, finite
 }
 
 func effectiveWatchdogCapEvaluated(mount, path string) (int64, bool, bool) {

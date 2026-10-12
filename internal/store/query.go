@@ -298,8 +298,6 @@ func (s *Store) List(selector string) ([]TicketRecord, error) {
 	return s.records(selectorFilter{Terms: sel.Terms})
 }
 
-func (s *Store) Find(selector string) ([]TicketRecord, error) { return s.List(selector) }
-
 type selectorFilter struct {
 	Terms []queryTerm
 }
@@ -442,6 +440,12 @@ func repoAbsolutePath(root, path string) string {
 }
 
 func readRegularTicket(path string) ([]byte, scanReadOutcome, error) {
+	return readRegularFile(path, "E_CONFIG_INVALID: ticket path is not a regular file")
+}
+
+// readRegularFile stably reads path, refusing a non-regular file with
+// notRegular. A missing file is an inconclusive read, not an error.
+func readRegularFile(path, notRegular string) ([]byte, scanReadOutcome, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -450,7 +454,7 @@ func readRegularTicket(path string) ([]byte, scanReadOutcome, error) {
 		return nil, scanReadStable, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, scanReadStable, errors.New("E_CONFIG_INVALID: ticket path is not a regular file")
+		return nil, scanReadStable, errors.New(notRegular)
 	}
 	return stableReadFile(path)
 }
@@ -526,7 +530,7 @@ func (s *Store) Count(selector, by string) (CountResult, error) {
 func countRows(rows []TicketRecord, by string) CountResult {
 	result := CountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
 	for _, row := range rows {
-		for _, value := range distributionValues(row, by) {
+		for _, value := range DistributionValues(row, by) {
 			result.Distribution[value]++
 		}
 	}
@@ -568,7 +572,9 @@ func validDistributionField(field string) bool {
 	}
 }
 
-func distributionValues(row TicketRecord, by string) []string {
+// DistributionValues returns the bucket(s) a ticket counts in for a
+// distribution by field by; an unknown field is "(unknown)".
+func DistributionValues(row TicketRecord, by string) []string {
 	switch by {
 	case "status":
 		return []string{string(row.Ticket.Status)}

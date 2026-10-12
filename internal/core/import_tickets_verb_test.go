@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,20 +17,10 @@ import (
 func namespacedReqCore(t *testing.T) (*Core, string) {
 	t.Helper()
 	base := t.TempDir()
-	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
-	s, err := store.Open(context.Background(), store.Options{
-		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
-		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-fee",
-		WorktreeID: "main", ProjectSlug: "fee", Prefixes: []string{"BL"},
-		RequirementPrefixes: []string{"VR"}, IDPrefix: "FEE",
-		LeaseStateDir: filepath.Join(base, "lease-state"),
+	s := openCoreTestStore(t, base, func(options *store.Options) {
+		options.ProjectID, options.WorktreeID, options.ProjectSlug = "project-fee", "main", "fee"
+		options.Prefixes, options.RequirementPrefixes, options.IDPrefix = []string{"BL"}, []string{"VR"}, "FEE"
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 	return New(s), base
 }
 

@@ -53,7 +53,7 @@ func (response Response) MarshalJSON() ([]byte, error) {
 	data := response.RawData
 	if len(data) == 0 && response.Data != nil {
 		var err error
-		data, err = marshalNoEscape(response.Data)
+		data, err = MarshalNoEscape(response.Data)
 		if err != nil {
 			return nil, err
 		}
@@ -66,20 +66,20 @@ func (response Response) MarshalJSON() ([]byte, error) {
 		Warnings []string        `json:"warnings,omitempty"`
 		Exit     int             `json:"exit,omitempty"`
 	}
-	return marshalNoEscape(responseJSON{
+	return MarshalNoEscape(responseJSON{
 		OK: response.OK, Code: response.Code, Data: data, Error: response.Error,
 		Warnings: response.Warnings, Exit: response.Exit,
 	})
 }
 
-// marshalNoEscape mirrors json.Marshal but disables Go's default HTML
+// MarshalNoEscape mirrors json.Marshal but disables Go's default HTML
 // escaping of '<', '>', and '&'. Neither the daemon wire protocol nor a
 // terminal/JSON-pipe consumer is an HTML context, so that escaping only
 // makes selector placeholders like "<id>" harder to read (AIRA-57). Escaping
 // applied at any single hop in a marshal chain survives every later hop, so
 // every place that (re-)marshals response data — here and in the CLI's
 // render/renderHuman and the daemon's wire encoder — must use this.
-func marshalNoEscape(v any) ([]byte, error) {
+func MarshalNoEscape(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -144,7 +144,7 @@ type Store interface {
 	GetFinding(string) (store.FindingRecord, error)
 	SetFinding(context.Context, string, domain.Disposition, string, string) (store.EventKey, error)
 	Count(string, string) (store.CountResult, error)
-	CountFindings(string, string) (store.FindingCountResult, error)
+	CountFindings(string, string) (store.CountResult, error)
 	ComputeGauge(string) (store.GaugeResult, error)
 	ComputeAllGauges() ([]store.GaugeResult, error)
 	SetTicket(context.Context, string, string, string) (store.EventKey, error)
@@ -167,7 +167,6 @@ type Store interface {
 	GetTestReport(string) (domain.TestReport, error)
 	FlakyTests(string) ([]domain.FlakyTest, error)
 	FlakyCellSummary(context.Context) (store.FlakyCellSummary, error)
-	ReconcileFlaky(context.Context) error
 	AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
 	ListComputeEvents(string) ([]domain.ComputeEvent, error)
 	SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error)
@@ -175,7 +174,6 @@ type Store interface {
 	AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error)
 	ListCommandEvents(string) ([]domain.CommandEvent, error)
 	CommandDistribution(string, string) (store.CommandDistributionResult, error)
-	CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error)
 	AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error)
 	ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error)
 }
@@ -3028,7 +3026,7 @@ func projectRequirementRecord(record store.RequirementRecord, fields []string) m
 func findingDistribution(records []store.FindingRecord, by string) map[string]int {
 	result := map[string]int{}
 	for _, record := range records {
-		for _, value := range storeFindingDistributionValues(record.Finding, by) {
+		for _, value := range store.FindingDistributionValues(record.Finding, by) {
 			result[value]++
 		}
 	}
@@ -3044,30 +3042,6 @@ func requirementDistribution(records []store.RequirementRecord, by string) map[s
 		result[string(record.Requirement.Status)]++
 	}
 	return result
-}
-
-func storeFindingDistributionValues(finding domain.Finding, by string) []string {
-	value := ""
-	switch by {
-	case "subtype":
-		value = string(finding.Subtype)
-	case "category":
-		value = finding.Category
-	case "source":
-		value = finding.Source
-	case "verdict":
-		value = string(finding.Verdict)
-	case "disposition":
-		value = string(finding.Disposition)
-	case "severity":
-		value = string(finding.Severity)
-	case "ticket":
-		value = finding.TicketID
-	}
-	if value == "" {
-		value = "(none)"
-	}
-	return []string{value}
 }
 
 func findingRecordWarnings(records []store.FindingRecord) []string {
@@ -3174,39 +3148,7 @@ func readyDistribution(records []store.ReadyRecord) map[string]int {
 func distribution(rows []store.TicketRecord, by string) map[string]int {
 	result := map[string]int{}
 	for _, row := range rows {
-		values := []string{}
-		switch by {
-		case "status":
-			values = []string{string(row.Ticket.Status)}
-		case "kind":
-			values = []string{string(row.Ticket.Kind)}
-		case "severity":
-			values = []string{string(row.Ticket.Severity)}
-		case "hold":
-			values = []string{fmt.Sprint(row.Ticket.Hold)}
-		case "project":
-			values = []string{row.Ticket.Project}
-		case "assignee":
-			if row.Ticket.Assignee == nil {
-				values = []string{"(none)"}
-			} else {
-				values = []string{*row.Ticket.Assignee}
-			}
-		case "milestone":
-			if row.Ticket.Milestone == nil {
-				values = []string{"(none)"}
-			} else {
-				values = []string{*row.Ticket.Milestone}
-			}
-		case "label":
-			values = row.Ticket.Labels
-			if len(values) == 0 {
-				values = []string{"(none)"}
-			}
-		default:
-			values = []string{"(unknown)"}
-		}
-		for _, value := range values {
+		for _, value := range store.DistributionValues(row, by) {
 			result[value]++
 		}
 	}

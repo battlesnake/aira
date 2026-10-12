@@ -3,6 +3,7 @@ package runner
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -26,7 +27,7 @@ func TestApplyConfineScopeReservesEstablishesOnlyWhatTheDaemonKnows(t *testing.T
 		t.Fatalf("known scope reserve=%v, want the daemon's 512 MiB charge, never the 45 GiB cap beside it",
 			scopes[0].ReserveBytes)
 	}
-	if contains(scopes[0].UnevaluatedFields, "reserve") {
+	if slices.Contains(scopes[0].UnevaluatedFields, "reserve") {
 		t.Fatalf("an ESTABLISHED reserve was also named unevaluated: %v", scopes[0].UnevaluatedFields)
 	}
 	// The false-pass direction, and the whole point of the field: a scope the
@@ -36,7 +37,7 @@ func TestApplyConfineScopeReservesEstablishesOnlyWhatTheDaemonKnows(t *testing.T
 		t.Fatalf("an unknown scope was given a reserve of %d; a cap is not a reserve and absence is not a number",
 			*scopes[1].ReserveBytes)
 	}
-	if !contains(scopes[1].UnevaluatedFields, "reserve") {
+	if !slices.Contains(scopes[1].UnevaluatedFields, "reserve") {
 		t.Fatalf("an unestablished reserve was not named in UnevaluatedFields: %v", scopes[1].UnevaluatedFields)
 	}
 }
@@ -52,7 +53,7 @@ func TestApplyConfineScopeReservesWithNoDaemonKnowledgeMarksEveryScope(t *testin
 		if record.ReserveBytes != nil {
 			t.Fatalf("scope %d got reserve %d from a daemon that knew nothing", index, *record.ReserveBytes)
 		}
-		if !contains(record.UnevaluatedFields, "reserve") {
+		if !slices.Contains(record.UnevaluatedFields, "reserve") {
 			t.Fatalf("scope %d unevaluated fields=%v, want `reserve` named", index, record.UnevaluatedFields)
 		}
 	}
@@ -85,7 +86,7 @@ func TestApplyConfineScopeReservesKeepsAZeroChargeDistinctFromAbsence(t *testing
 	if *scopes[0].ReserveBytes != 0 {
 		t.Fatalf("reserve=%d, want the established 0", *scopes[0].ReserveBytes)
 	}
-	if contains(scopes[0].UnevaluatedFields, "reserve") {
+	if slices.Contains(scopes[0].UnevaluatedFields, "reserve") {
 		t.Fatal("an established zero was named unevaluated")
 	}
 }
@@ -126,10 +127,6 @@ func TestApplyConfineScopeReservesLeavesAnEmptyListingAlone(t *testing.T) {
 	if !reflect.DeepEqual(scopes, []ConfineRecord(nil)) {
 		t.Fatalf("scopes=%+v", scopes)
 	}
-}
-
-func contains(values []string, want string) bool {
-	return countString(values, want) > 0
 }
 
 func countString(values []string, want string) int {

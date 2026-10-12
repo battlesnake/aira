@@ -78,10 +78,6 @@ func (r *Runner) LaunchDetached(context.Context, Request, string) (*DetachLaunch
 
 func (r *Runner) DetachOutputDir() string { return r.outputDir }
 
-func (r *Runner) Supervise(context.Context, string, int, int) error {
-	return nonLinuxRunError()
-}
-
 func (r *Runner) SuperviseRequest(context.Context, Request, int, int) (*RunRecord, error) {
 	return nil, nonLinuxRunError()
 }

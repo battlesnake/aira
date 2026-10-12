@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -798,13 +799,13 @@ func TestRetireRepairsAMissingAllocationReceiptAndTheIDIsNeverReused(t *testing.
 	f := newAllocationFixture(t, false)
 	ctx := context.Background()
 
-	if receipts := readReceiptIDs(t, f.store); contains(receipts, f.intent.AllocationID) {
+	if receipts := readReceiptIDs(t, f.store); slices.Contains(receipts, f.intent.AllocationID) {
 		t.Fatalf("the fixture already wrote a receipt for %s; the missing-receipt case is not being tested", f.intent.AllocationID)
 	}
 	if _, err := f.store.RetireIntent(ctx, fmt.Sprint(f.intent.Seq)); err != nil {
 		t.Fatalf("retire: %v", err)
 	}
-	if receipts := readReceiptIDs(t, f.store); !contains(receipts, f.intent.AllocationID) {
+	if receipts := readReceiptIDs(t, f.store); !slices.Contains(receipts, f.intent.AllocationID) {
 		t.Fatalf("retire did not repair the missing receipt; receipts=%v", receipts)
 	}
 
@@ -1320,15 +1321,6 @@ func readReceiptIDs(t *testing.T, s *Store) []string {
 		ids = append(ids, receipt.ID)
 	}
 	return ids
-}
-
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 // reopenAfterDatabaseLoss deletes the state database and opens a fresh store on

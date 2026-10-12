@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func TestAIRA136RealCgroupSleepingJobIsNotKilledByCPUBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run A (wall bound) launch error=%v record=%+v", err, wall)
 	}
-	if wall.Status != StatusKilled || !containsString(wall.ErrorCodes, "E_RUN_TIMEOUT") {
+	if wall.Status != StatusKilled || !slices.Contains(wall.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("run A: a 0.5s sleep survived a 100ms WALL bound: %+v", wall)
 	}
 	if got := terminalRecords(t, wallRunner); got != 1 {
@@ -60,10 +61,10 @@ func TestAIRA136RealCgroupSleepingJobIsNotKilledByCPUBudget(t *testing.T) {
 	if cpu.Status != StatusExited || cpu.ExitCode == nil || *cpu.ExitCode != 0 {
 		t.Fatalf("run B: the same sleep was killed by a 100ms CPU-TIME budget: %+v", cpu)
 	}
-	if containsString(cpu.ErrorCodes, "E_RUN_CPU_TIMEOUT") || containsString(cpu.ErrorCodes, "E_RUN_TIMEOUT") {
+	if slices.Contains(cpu.ErrorCodes, "E_RUN_CPU_TIMEOUT") || slices.Contains(cpu.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("run B: a run nothing terminated carries a deadline code: %+v", cpu)
 	}
-	if containsString(cpu.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+	if slices.Contains(cpu.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 		t.Fatalf("run B: a measured, under-budget run was reported as unenforced: %+v", cpu)
 	}
 	// CleanSuccess() itself is deliberately not asserted: it also requires
@@ -107,10 +108,10 @@ func TestAIRA136RealCgroupSpinnerExceedsCPUBudgetAndIsKilled(t *testing.T) {
 	if record.CleanSuccess() {
 		t.Fatalf("a killed run reported clean success: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
 		t.Fatalf("the CPU-budget kill lost its code: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+	if slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("the wall backstop claimed the CPU budget's kill: %+v", record)
 	}
 	if !record.KillIntent.Present || !record.KillIntent.Completed || record.KillIntent.NotExecuted {
@@ -153,10 +154,10 @@ func TestAIRA136RealCgroupWallBoundStillWinsOnASpinner(t *testing.T) {
 	if record.Status != StatusKilled {
 		t.Fatalf("the wall bound did not terminate the spinner: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("the wall kill lost its code: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
+	if slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
 		t.Fatalf("a 30s CPU budget claimed a 100ms wall kill: %+v", record)
 	}
 	if record.ScopeKill.Actor != "run-timeout" {
@@ -164,7 +165,7 @@ func TestAIRA136RealCgroupWallBoundStillWinsOnASpinner(t *testing.T) {
 	}
 	// The 30s budget was measured and provably not reached, so nothing is
 	// unenforced here.
-	if containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+	if slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 		t.Fatalf("a measured, far-under-budget run was reported as unenforced: %+v", record)
 	}
 }
@@ -195,17 +196,17 @@ func TestAIRA136RealCgroupWallKillOverTheCPUBudgetCarriesBothCodes(t *testing.T)
 	if record.Status != StatusKilled {
 		t.Fatalf("the wall bound did not terminate the spinner: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") || record.ScopeKill.Actor != "run-timeout" {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") || record.ScopeKill.Actor != "run-timeout" {
 		t.Fatalf("the wall kill lost its attribution: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
+	if slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
 		t.Fatalf("a blind sampler still claimed a CPU-budget kill: %+v", record)
 	}
 	used := recordCPUTotal(t, record)
 	if used < budget {
 		t.Fatalf("vacuous: the spinner consumed %v, under its %v budget, so nothing was breached", used, budget)
 	}
-	if !containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+	if !slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 		t.Fatalf("a measured, breached, unenforced CPU budget was reported as evaluated: %+v", record)
 	}
 }
@@ -243,7 +244,7 @@ func TestAIRA136RealCgroupBudgetIsCumulativeAcrossTheScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch error=%v record=%+v", err, record)
 	}
-	if record.Status != StatusKilled || !containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
+	if record.Status != StatusKilled || !slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
 		t.Fatalf("four spinners outlived their cumulative CPU budget: %+v", record)
 	}
 	used := recordCPUTotal(t, record)
@@ -314,25 +315,25 @@ func TestAIRA136RealCgroupCPUBudgetStraddleSoak(t *testing.T) {
 				if !record.KillIntent.NotExecuted || record.KillIntent.Completed || record.ScopeKill.Started {
 					t.Fatalf("iteration %d: undisposed or over-claimed intent: %+v", i, record)
 				}
-				if containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
+				if slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
 					t.Fatalf("iteration %d: a kill that delivered nothing was reported as a CPU timeout: %+v", i, record)
 				}
 			}
 			// Whether or not the fire happened, an exited run's budget claim must
 			// match its measured total exactly.
 			used := recordCPUTotal(t, record)
-			if got := containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED"); got != (used >= budget) {
+			if got := slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED"); got != (used >= budget) {
 				t.Fatalf("iteration %d: unenforced=%v but cpu=%v budget=%v: %+v", i, got, used, budget, record)
 			}
 		case StatusKilled:
 			fired++
-			if !containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") || !record.KillIntent.Completed || !record.ScopeKill.Completed {
+			if !slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") || !record.KillIntent.Completed || !record.ScopeKill.Completed {
 				t.Fatalf("iteration %d: CPU timeout evidence=%+v", i, record)
 			}
 			if record.ScopeKill.Actor != "run-cpu-timeout" {
 				t.Fatalf("iteration %d: kill actor=%q: %+v", i, record.ScopeKill.Actor, record)
 			}
-			if containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+			if slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 				t.Fatalf("iteration %d: an enforced budget also claimed to be unenforced: %+v", i, record)
 			}
 		default:

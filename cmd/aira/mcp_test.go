@@ -199,9 +199,6 @@ func (s *mcpCommandStore) ListCommandEvents(string) ([]domain.CommandEvent, erro
 func (s *mcpCommandStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
 	return store.CommandDistributionResult{}, nil
 }
-func (s *mcpCommandStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
-	return nil, nil
-}
 
 func TestMCPTimeReturnsStructuredOutcomeAndCannotConsumeNextFrame(t *testing.T) {
 	input := strings.NewReader(strings.Join([]string{

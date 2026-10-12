@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -231,7 +232,7 @@ exec sleep 30
 	if record.ExitCode != nil && *record.ExitCode == 9 {
 		skipOrFailRealCgroup(t, "this environment cannot nest a child cgroup inside a run scope")
 	}
-	if record.Status != StatusKilled || !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+	if record.Status != StatusKilled || !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("nested-cgroup timeout record=%+v", record)
 	}
 	if !record.ScopeKill.Started || !record.ScopeKill.Completed {
@@ -240,7 +241,7 @@ exec sleep 30
 	if !record.KillIntent.Present || !record.KillIntent.Completed {
 		t.Fatalf("the kill intent was published but never executed: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("the timeout landed in the unevaluated arm against a job it was supposed to end: %+v", record)
 	}
 	// Independent of every field above: ask the kernel whether anything of this

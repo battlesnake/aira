@@ -13,9 +13,8 @@
 // aira/internal/daemon from pytest_aitest_e2e_test.go / imports
 // aira/internal/core from admit.go / imports aira/internal/pylib from
 // command.go: import cycle not allowed in test"), so this file follows the
-// same established fix: external test package, qualified pylib.* calls, and
-// its own local requireRealPytest (pylib's is unexported and lives in the
-// internal pylib_test files, unreachable from here by design).
+// same established fix: external test package and qualified pylib.* calls,
+// including pylib.RequireRealPytest (exported to tests by realpytest_test.go).
 package pylib_test
 
 import (
@@ -35,19 +34,6 @@ import (
 	"aira/internal/pylib"
 	"aira/internal/testdeadline"
 )
-
-func requireRealPytest(t *testing.T) string {
-	t.Helper()
-	path, err := exec.LookPath("pytest")
-	if err == nil {
-		return path
-	}
-	if os.Getenv("AIRA_REAL_PYTEST") == "1" {
-		t.Fatalf("AIRA_REAL_PYTEST=1 but pytest is unavailable: %v", err)
-	}
-	t.Skipf("real pytest integration requires pytest: %v", err)
-	return ""
-}
 
 // environWithoutAiraRealCgroup returns os.Environ() with AIRA_REAL_CGROUP
 // filtered out (found by Fable's re-gate: a FALLBACK-mode e2e run must never
@@ -130,7 +116,7 @@ func TestEnvironWithoutAiraRealCgroupFiltersItOut(t *testing.T) {
 }
 
 func TestRealPytestAitestEndToEndFallback(t *testing.T) {
-	pytest := requireRealPytest(t)
+	pytest := pylib.RequireRealPytest(t)
 	aitestDir, err := filepath.Abs("aitest")
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +206,7 @@ func TestRealPytestAitestEndToEndFallback(t *testing.T) {
 }
 
 func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
-	pytest := requireRealPytest(t)
+	pytest := pylib.RequireRealPytest(t)
 	aitestDir, err := filepath.Abs("aitest")
 	if err != nil {
 		t.Fatal(err)
@@ -294,7 +280,7 @@ type realDaemonAndCgroupTestHarness struct {
 
 func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarness {
 	t.Helper()
-	pytest := requireRealPytest(t)
+	pytest := pylib.RequireRealPytest(t)
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)

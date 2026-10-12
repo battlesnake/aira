@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/runner"
 	"aira/internal/store"
 	"aira/internal/testdeadline"
 
@@ -1284,7 +1285,7 @@ func TestRealProcObserveSelectsClaudeChildWithoutSignalling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mount, mountErr := watchdogUnifiedMount()
+	mount, mountErr := runner.UnifiedCgroupMount()
 	var procs map[int]watchdogProc
 	foundTree := false
 	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))

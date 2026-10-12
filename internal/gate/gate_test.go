@@ -367,7 +367,7 @@ func TestVerdictTable(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := FoldVerdict(tt.predicate, tt.proof, tt.canary, tt.evidence)
+			got := FoldVerdictWithCode(tt.predicate, "", tt.proof, tt.canary, tt.evidence)
 			if got.Verdict != tt.verdict || got.Code != tt.code || got.Trusted != tt.trusted || got.Suspect != tt.suspect {
 				t.Fatalf("got=%#v", got)
 			}

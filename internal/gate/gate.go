@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -253,21 +252,6 @@ func ParseGate(data []byte, filename string) (GateDefinition, error) {
 		return GateDefinition{}, err
 	}
 	return g, nil
-}
-
-// CanonicalSelectorFields is useful to callers constructing stable digests.
-func CanonicalSelectorFields(s AppliesTo) []string {
-	fields := []string{}
-	if s.All {
-		fields = append(fields, "all=true")
-	}
-	fields = append(fields, "lifecycle_step="+s.LifecycleStep, "ticket="+s.Ticket, "milestone="+s.Milestone)
-	labels := append([]string{}, s.Labels...)
-	paths := append([]string{}, s.Paths...)
-	sort.Strings(labels)
-	sort.Strings(paths)
-	fields = append(fields, "labels="+strings.Join(labels, "\x00"), "paths="+strings.Join(paths, "\x00"))
-	return fields
 }
 
 // MarshalIndentLiteral is json.MarshalIndent(v, "", "  ") without HTML

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -401,7 +402,7 @@ func TestPTYSetupFailureFailsClosedAndForcesMergedRecord(t *testing.T) {
 	if getErr != nil {
 		t.Fatal(getErr)
 	}
-	if !current.Status.Terminal() || current.Merge != true || current.Buffering == "pty" || !containsString(current.ErrorCodes, "E_RUN_PTY_UNAVAILABLE") {
+	if !current.Status.Terminal() || current.Merge != true || current.Buffering == "pty" || !slices.Contains(current.ErrorCodes, "E_RUN_PTY_UNAVAILABLE") {
 		t.Fatalf("failed PTY left dishonest or nonterminal ledger evidence: %+v", current)
 	}
 	rawLedger, readErr := os.ReadFile(r.ledger.ledger)

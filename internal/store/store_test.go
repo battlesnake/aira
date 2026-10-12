@@ -1016,7 +1016,7 @@ func TestReconcileRedrivesJournalAfterMaterialisation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.appendReceiptForIntent(intent); err != nil {
+	if err := s.appendReceiptIfMissing(intent.Receipt); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeAtomic(intent.Path, intent.Intended, intent.Seq); err != nil {
@@ -1045,7 +1045,7 @@ func TestMaterialiseIntentTreatsAlreadyAppliedAsSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.appendReceiptForIntent(intent); err != nil {
+	if err := s.appendReceiptIfMissing(intent.Receipt); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeAtomic(intent.Path, intent.Intended, intent.Seq); err != nil {

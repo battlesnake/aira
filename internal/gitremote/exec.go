@@ -51,13 +51,12 @@ func realRun(ctx context.Context, request runRequest) runResult {
 	case <-ctx.Done():
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		select {
-		case waitErr = <-waited:
+		case <-waited:
 		case <-time.After(processGrace):
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			select {
-			case waitErr = <-waited:
+			case <-waited:
 			case <-time.After(processGrace):
-				waitErr = ctx.Err()
 			}
 		}
 		waitErr = ctx.Err()

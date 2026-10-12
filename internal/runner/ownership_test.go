@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -258,7 +259,7 @@ func TestStealIsDurableBeforeScopeForFreshIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.Status != StatusKilled || record.StolenBy != "B" || !containsString(record.ErrorCodes, "E_RUN_KILLED") {
+	if record.Status != StatusKilled || record.StolenBy != "B" || !slices.Contains(record.ErrorCodes, "E_RUN_KILLED") {
 		t.Fatalf("steal result=%+v", record)
 	}
 	assertRunEventsOwner(t, b, "RUN-1", "A")

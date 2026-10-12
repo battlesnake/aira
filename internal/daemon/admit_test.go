@@ -29,15 +29,6 @@ func admitTestServer(maximum *atomic.Int64) *Server {
 	return server
 }
 
-func enqueueAdmitTest(t *testing.T, server *Server, reserve int64) (*sliceQueue, *admitWaiter) {
-	t.Helper()
-	queue, waiter, code, err := server.enqueueAdmit("/slice", reserve)
-	if err != nil {
-		t.Fatalf("enqueue: code=%s err=%v", code, err)
-	}
-	return queue, waiter
-}
-
 func waitAdmitGrant(t *testing.T, waiter *admitWaiter) {
 	t.Helper()
 	select {
@@ -59,15 +50,15 @@ func requireAdmitQueued(t *testing.T, waiter *admitWaiter) {
 func TestAdmitFIFOOrderAndMidstreamArrival(t *testing.T) {
 	var maximum atomic.Int64
 	server := admitTestServer(&maximum)
-	queue, a := enqueueAdmitTest(t, server, 60)
-	_, b := enqueueAdmitTest(t, server, 60)
-	_, c := enqueueAdmitTest(t, server, 60)
+	queue, a := enqueueOn(t, server, "/slice", 60)
+	_, b := enqueueOn(t, server, "/slice", 60)
+	_, c := enqueueOn(t, server, "/slice", 60)
 	maximum.Store(100)
 	queue.signal()
 	waitAdmitGrant(t, a)
 	requireAdmitQueued(t, b)
 	requireAdmitQueued(t, c)
-	_, d := enqueueAdmitTest(t, server, 60)
+	_, d := enqueueOn(t, server, "/slice", 60)
 	if !(a.seq < b.seq && b.seq < c.seq && c.seq < d.seq) {
 		t.Fatalf("arrival sequence=%d,%d,%d,%d", a.seq, b.seq, c.seq, d.seq)
 	}
@@ -288,8 +279,8 @@ func TestAdmitWeightedReservationsBoundConcurrentSumAcrossSuites(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
-	queue, suiteAHeavy := enqueueAdmitTest(t, server, 70)
-	_, suiteBHeavy := enqueueAdmitTest(t, server, 70)
+	queue, suiteAHeavy := enqueueOn(t, server, "/slice", 70)
+	_, suiteBHeavy := enqueueOn(t, server, "/slice", 70)
 	waitAdmitGrant(t, suiteAHeavy)
 	requireAdmitQueued(t, suiteBHeavy)
 	queue.mu.Lock()
@@ -303,7 +294,7 @@ func TestAdmitWeightedReservationsBoundConcurrentSumAcrossSuites(t *testing.T) {
 
 	var lights []*admitWaiter
 	for index := 0; index < 5; index++ {
-		lightQueue, waiter := enqueueAdmitTest(t, server, 20)
+		lightQueue, waiter := enqueueOn(t, server, "/slice", 20)
 		if index == 0 {
 			queue = lightQueue
 		}
@@ -326,9 +317,9 @@ func TestAdmitReservationAtomicProgressUnderChurn(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
-	queue, a := enqueueAdmitTest(t, server, 100)
+	queue, a := enqueueOn(t, server, "/slice", 100)
 	waitAdmitGrant(t, a)
-	_, b := enqueueAdmitTest(t, server, 100)
+	_, b := enqueueOn(t, server, "/slice", 100)
 	requireAdmitQueued(t, b)
 
 	var churn sync.WaitGroup
@@ -371,7 +362,7 @@ func TestAdmitReservationAtomicProgressUnderChurn(t *testing.T) {
 func TestAdmitReleaseAndDeathLifecycle(t *testing.T) {
 	var maximum atomic.Int64
 	server := admitTestServer(&maximum)
-	queue, queued := enqueueAdmitTest(t, server, 10)
+	queue, queued := enqueueOn(t, server, "/slice", 10)
 	server.releaseAdmitWaiter(queue, queued)
 	if queued.state != admitReleased {
 		t.Fatalf("queued death state=%v", queued.state)
@@ -379,7 +370,7 @@ func TestAdmitReleaseAndDeathLifecycle(t *testing.T) {
 	requireAdmitQueued(t, queued)
 
 	maximum.Store(10)
-	queue, granted := enqueueAdmitTest(t, server, 10)
+	queue, granted := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, granted)
 	server.releaseAdmitWaiter(queue, granted)
 	server.releaseAdmitWaiter(queue, granted)
@@ -443,7 +434,7 @@ func TestAdmitOneShotGrantHandoffCannotDrop(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(1)
 	server := admitTestServer(&maximum)
-	queue, waiter := enqueueAdmitTest(t, server, 1)
+	queue, waiter := enqueueOn(t, server, "/slice", 1)
 	// Let the evaluator commit before this test starts receiving.
 	time.Sleep(10 * time.Millisecond)
 	waitAdmitGrant(t, waiter)
@@ -679,9 +670,9 @@ func TestAdmitValidationAndCaps(t *testing.T) {
 
 	var maximum atomic.Int64
 	server := admitTestServer(&maximum)
-	queue, first := enqueueAdmitTest(t, server, 1)
+	queue, first := enqueueOn(t, server, "/slice", 1)
 	for index := 1; index < admitMaxWaiters; index++ {
-		enqueueAdmitTest(t, server, 1)
+		enqueueOn(t, server, "/slice", 1)
 	}
 	if _, _, code, err := server.enqueueAdmit("/slice", 1); err == nil || code != CodeBusy {
 		t.Fatalf("per-slice cap code=%q err=%v", code, err)

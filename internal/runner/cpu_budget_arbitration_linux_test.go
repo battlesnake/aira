@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -101,7 +102,7 @@ func TestAIRA136CPUBudgetAgainstAlreadyExitedLeaderArbitratesToExited(t *testing
 		// the nil counters below are the evidence for it. An implementation that
 		// suppressed the code merely because the CPU deadline FIRED reports a
 		// clean, fully-evaluated run here and fails this assertion.
-		if !containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+		if !slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 			t.Fatalf("iteration %d: an unenforced CPU budget was reported as evaluated: %+v", i, record)
 		}
 		if record.CPUUser != nil || record.CPUSys != nil {
@@ -117,10 +118,10 @@ func TestAIRA136CPUBudgetAgainstAlreadyExitedLeaderArbitratesToExited(t *testing
 		if !record.KillIntent.NotExecuted || record.KillIntent.Completed || record.ScopeKill.Started {
 			t.Fatalf("iteration %d: undisposed or over-claimed intent: %+v", i, record)
 		}
-		if containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") || containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+		if slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") || slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 			t.Fatalf("iteration %d: a kill that delivered nothing was reported as a termination: %+v", i, record)
 		}
-		if containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+		if slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 			t.Fatalf("iteration %d: the arbitration did not commit: %+v", i, record)
 		}
 		if terminated, killed := h.scope.signalled(); terminated || killed {
@@ -173,16 +174,16 @@ func TestAIRA136CPUBudgetWithLiveLeaderStillKills(t *testing.T) {
 	if !record.KillIntent.Present || record.KillIntent.Completed {
 		t.Fatalf("the CPU budget's intent evidence was lost: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") || !containsString(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") || !slices.Contains(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatalf("the breached CPU budget lost its evidence codes: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+	if slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("the CPU bound claimed the wall bound's kill: %+v", record)
 	}
 	// The complement of gate condition C1: an EXECUTED CPU-budget termination is
 	// the one state that suppresses the unenforced code, because the record
 	// already asserts the bound ended the run.
-	if containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+	if slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 		t.Fatalf("a run reported as terminated by its CPU budget also claimed the budget was unenforced: %+v", record)
 	}
 	if got := terminalRecords(t, h.r); got != 0 {
@@ -246,10 +247,10 @@ func TestAIRA136DeadlineBranchTakenOnceUnderBothBounds(t *testing.T) {
 	if record.Status != StatusKilled {
 		t.Fatalf("the breached CPU budget did not terminate the run: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
+	if !slices.Contains(record.ErrorCodes, "E_RUN_CPU_TIMEOUT") {
 		t.Fatalf("the CPU bound's kill lost its code: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "E_RUN_TIMEOUT") {
+	if slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("the wall bound also fired, so the two bounds are separate triggers: %+v", record)
 	}
 	if record.ScopeKill.Actor != "run-cpu-timeout" {
@@ -289,7 +290,7 @@ func TestAIRA136UnenforcedIsDerivedFromTheNilCounters(t *testing.T) {
 	if record.CPUUser != nil || record.CPUSys != nil {
 		t.Fatalf("the teardown read established a counter this harness cannot have: %+v", record)
 	}
-	if !containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+	if !slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 		t.Fatalf("an unmeasurable CPU budget was reported as evaluated: %+v", record)
 	}
 	if record.CleanSuccess() {
@@ -307,7 +308,7 @@ func TestAIRA136NoRequestedBudgetRaisesNoCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch error=%v record=%+v", err, record)
 	}
-	if containsString(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
+	if slices.Contains(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED") {
 		t.Fatalf("a run that requested no CPU bound was told its bound was unenforced: %+v", record)
 	}
 	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {

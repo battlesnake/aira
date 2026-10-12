@@ -36,9 +36,6 @@ func (s *commandCoreStore) ListCommandEvents(string) ([]domain.CommandEvent, err
 func (s *commandCoreStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
 	return store.CommandDistributionResult{}, nil
 }
-func (s *commandCoreStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
-	return nil, nil
-}
 
 func TestCommandKeyNormaliserWrapperArgumentGoldensAndPairs(t *testing.T) {
 	tests := []struct {

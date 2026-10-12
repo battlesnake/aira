@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -190,11 +191,11 @@ func (s *migratingTeardownScope) Kill() error          { s.killed = true; return
 func (*migratingTeardownScope) Remove() error          { return nil }
 
 func TestTeardownMemberAliveOutsideAfterKillIsEscapeNotKilled(t *testing.T) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		t.Skip(err)
 	}
-	current, err := currentCgroupPath(mount)
+	current, err := CurrentCgroupPath(mount)
 	if err != nil {
 		t.Skip(err)
 	}
@@ -287,7 +288,7 @@ exit 0`
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.ScopeIntegrity != ScopeDescendantKilled || !containsString(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
+	if record.ScopeIntegrity != ScopeDescendantKilled || !slices.Contains(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED") {
 		t.Fatalf("outliving in-scope descendant=%+v, want descendant-killed", record)
 	}
 	if !record.ScopeKill.Completed || record.CleanSuccess() {
@@ -360,7 +361,7 @@ exit 0`
 	if record.ScopeIntegrity == ScopeMigrated || record.ScopeIntegrity == ScopeDescendantEscaped {
 		t.Fatalf("leader self-relocation into its own nested sub-scope was falsely called migrated: %+v", record)
 	}
-	if containsString(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") {
+	if slices.Contains(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") {
 		t.Fatalf("leader self-relocation into its own nested sub-scope carried E_RUN_SCOPE_MIGRATION: %+v", record)
 	}
 	// The honest best case is ScopeContained (this run has no descendants and a
@@ -416,7 +417,7 @@ exit 0`
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.ScopeIntegrity != ScopeMigrated || !containsString(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") {
+	if record.ScopeIntegrity != ScopeMigrated || !slices.Contains(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") {
 		t.Fatalf("leader self-relocation out of the scope tree=%+v, want migrated + E_RUN_SCOPE_MIGRATION", record)
 	}
 }

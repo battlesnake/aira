@@ -99,7 +99,7 @@ func TestClassifyLaunchScopeIntegrityWorkerMigrationIsUnverifiedNotEscaped(t *te
 // own worker scope after Kill() must attest neither escaped (Escape==nil) nor
 // descendant-killed. It reads as a residual read-gap, which is honest.
 func TestAttestScopeTeardownExemptsOwnAitestWorkerMigration(t *testing.T) {
-	mount, err := unifiedMount()
+	mount, err := UnifiedCgroupMount()
 	if err != nil {
 		t.Skip(err)
 	}

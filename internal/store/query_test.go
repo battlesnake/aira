@@ -39,33 +39,33 @@ func TestGetAndFindUsePhaseOneSelectors(t *testing.T) {
 		t.Fatalf("anchor lookup = %#v, %v", anchor, err)
 	}
 
-	rows, err := s.Find(`kind:bug severity:P1`)
+	rows, err := s.List(`kind:bug severity:P1`)
 	if err != nil || len(rows) != 1 || rows[0].Ticket.ID != second.ID {
 		t.Fatalf("field query = %#v, %v", rows, err)
 	}
-	rows, err = s.Find(`text:"queue body"`)
+	rows, err = s.List(`text:"queue body"`)
 	if err != nil || len(rows) != 1 || rows[0].Ticket.ID != first.ID {
 		t.Fatalf("text query = %#v, %v", rows, err)
 	}
-	if _, err := s.Find("status:"); codeOf(err) != "E_SELECTOR_INVALID" {
+	if _, err := s.List("status:"); codeOf(err) != "E_SELECTOR_INVALID" {
 		t.Fatalf("invalid query code = %q, err=%v", codeOf(err), err)
 	}
-	if _, err := s.Find(`kind=bug`); codeOf(err) != "E_SELECTOR_INVALID" {
+	if _, err := s.List(`kind=bug`); codeOf(err) != "E_SELECTOR_INVALID" {
 		t.Fatalf("equals query code = %q, err=%v", codeOf(err), err)
 	}
 	// AIRA-249 deliberately makes `hold` a selectable field so the held backlog
 	// is reviewable (`aira list hold:true`). It was previously refused here; the
 	// exclusion was incidental (hold was already a distribution field, and the
 	// nullable milestone/assignee fields are selectable) rather than principled.
-	holdRows, err := s.Find(`hold:true`)
+	holdRows, err := s.List(`hold:true`)
 	if err != nil || len(holdRows) != 1 || holdRows[0].Ticket.ID != second.ID {
 		t.Fatalf("hold:true query = %#v, %v", holdRows, err)
 	}
-	unheldRows, err := s.Find(`hold:false`)
+	unheldRows, err := s.List(`hold:false`)
 	if err != nil || len(unheldRows) != 1 || unheldRows[0].Ticket.ID != first.ID {
 		t.Fatalf("hold:false query = %#v, %v", unheldRows, err)
 	}
-	if _, err := s.Find(`text:queue`); codeOf(err) != "E_SELECTOR_INVALID" {
+	if _, err := s.List(`text:queue`); codeOf(err) != "E_SELECTOR_INVALID" {
 		t.Fatalf("unquoted text query code = %q, err=%v", codeOf(err), err)
 	}
 }
@@ -177,7 +177,7 @@ func TestRecordsSkipLocalTicketFindingsAndUseCanonicalIDOrder(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", "duplicate.md"), duplicate, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rows, err = s.Find("")
+	rows, err = s.List("")
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("duplicate pair find = rows=%#v err=%v", rows, err)
 	}

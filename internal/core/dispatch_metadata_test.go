@@ -258,8 +258,8 @@ func (metadataProbeStore) SetFinding(context.Context, string, domain.Disposition
 func (metadataProbeStore) Count(string, string) (store.CountResult, error) {
 	return store.CountResult{}, nil
 }
-func (metadataProbeStore) CountFindings(string, string) (store.FindingCountResult, error) {
-	return store.FindingCountResult{}, nil
+func (metadataProbeStore) CountFindings(string, string) (store.CountResult, error) {
+	return store.CountResult{}, nil
 }
 func (metadataProbeStore) AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error) {
 	return store.RantAddResult{Rant: domain.Rant{ID: "RANT-1"}, ID: "RANT-1"}, nil
@@ -329,7 +329,6 @@ func (metadataProbeStore) FlakyTests(string) ([]domain.FlakyTest, error) { retur
 func (metadataProbeStore) FlakyCellSummary(context.Context) (store.FlakyCellSummary, error) {
 	return store.FlakyCellSummary{}, nil
 }
-func (metadataProbeStore) ReconcileFlaky(context.Context) error { return nil }
 func (metadataProbeStore) AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error) {
 	return store.ComputeEventAddResult{}, nil
 }
@@ -346,9 +345,6 @@ func (metadataProbeStore) AddCommandEvent(context.Context, domain.CommandEventIn
 func (metadataProbeStore) ListCommandEvents(string) ([]domain.CommandEvent, error) { return nil, nil }
 func (metadataProbeStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
 	return store.CommandDistributionResult{}, nil
-}
-func (metadataProbeStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
-	return nil, nil
 }
 func (metadataProbeStore) AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error) {
 	return store.QuotaSnapshotAddResult{}, nil

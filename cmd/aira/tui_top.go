@@ -687,7 +687,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		}
 		model.Rows = append(model.Rows, tableRow{
 			ID: scopeID, Colour: colour, Cells: []string{
-				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
+				fmt.Sprint(slot), record.Name, confineNum(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
 				topRAMCell(record.RSSBytes),
 				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record), topUntrustedCell(lastText),
@@ -818,11 +818,21 @@ func topCPUBarFor(reserve *runner.ConfineSliceReserve, previous, current topCPUS
 		bar.Outside = topFloor(systemRate - sliceRate)
 		bar.OutsideKnown = true
 	}
+	bar.closeStack("idle")
+	return bar
+}
+
+// closeStack finishes a CPU or RAM bar after its claimed regions: the free
+// remainder (labelled freeLabel) and, when out-of-slice usage is known, the
+// "rest of system" region. That region is anchored to the right edge by
+// construction: its start is the total minus its own width, never "wherever
+// the stack happened to end".
+func (bar *topBar) closeStack(freeLabel string) {
 	bar.Free = topFloor(bar.Total - bar.Claimed - bar.Outside)
 	bar.Overcommitted = bar.Claimed+bar.Outside > bar.Total
 	if bar.Free > 0 {
 		bar.Regions = append(bar.Regions, topBarRegion{
-			Kind: topRegionFree, Slot: topScopelessSlot, Label: "idle", Start: bar.Claimed, Size: bar.Free,
+			Kind: topRegionFree, Slot: topScopelessSlot, Label: freeLabel, Start: bar.Claimed, Size: bar.Free,
 		})
 	}
 	if bar.OutsideKnown && bar.Outside > 0 {
@@ -832,7 +842,6 @@ func topCPUBarFor(reserve *runner.ConfineSliceReserve, previous, current topCPUS
 			Label: "rest of system", Start: start, Size: bar.Total - start,
 		})
 	}
-	return bar
 }
 
 // topUsedWithin turns a scope's optional live usage reading into the bar
@@ -1058,22 +1067,7 @@ func topBarFor(reserve *runner.ConfineSliceReserve, scopes []topBarRegion, claim
 	} else {
 		bar.Notes = append(bar.Notes, "system MemAvailable is unevaluated, so out-of-slice usage is not drawn")
 	}
-	bar.Free = topFloor(bar.Total - bar.Claimed - bar.Outside)
-	bar.Overcommitted = bar.Claimed+bar.Outside > bar.Total
-	if bar.Free > 0 {
-		bar.Regions = append(bar.Regions, topBarRegion{
-			Kind: topRegionFree, Slot: topScopelessSlot, Label: "free", Start: bar.Claimed, Size: bar.Free,
-		})
-	}
-	if bar.OutsideKnown && bar.Outside > 0 {
-		// Anchored to the right edge by construction: its start is the total minus
-		// its own width, never "wherever the stack happened to end".
-		start := topFloor(bar.Total - bar.Outside)
-		bar.Regions = append(bar.Regions, topBarRegion{
-			Kind: topRegionOutside, Slot: topScopelessSlot, Colour: topColourOutside,
-			Label: "rest of system", Start: start, Size: bar.Total - start,
-		})
-	}
+	bar.closeStack("free")
 	bar.Markers = topMarkersFor(reserve)
 	return bar
 }
