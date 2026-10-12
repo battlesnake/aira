@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -31,15 +30,7 @@ import (
 // hookSourceDir returns this repository's own .githooks directory.
 func hookSourceDir(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	dir := filepath.Join(filepath.Dir(thisFile), "..", "..", ".githooks")
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		t.Fatalf("resolve .githooks: %v", err)
-	}
+	abs := filepath.Join(repositoryRoot(t), ".githooks")
 	if _, err := os.Stat(filepath.Join(abs, "pre-commit")); err != nil {
 		t.Fatalf("locate .githooks/pre-commit: %v", err)
 	}
