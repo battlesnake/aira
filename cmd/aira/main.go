@@ -1782,9 +1782,8 @@ func runDrainWaitCommand(ctx context.Context, options map[string]string, stdin i
 		ExclusiveReason: strings.TrimSpace(options["reason"]),
 		// Timeout bounds the HELD duration only (it starts at the release write, after
 		// admission and setup); zero means "no hold bound — until you interrupt it".
-		// S13 removed --admit-timeout: the wait to be ADMITTED is no longer client-bounded
-		// (design §4/§6 — a blocking wait ends on the grant or on interrupting the
-		// command; there is no admission timeout).
+		// The wait to be ADMITTED is not client-bounded (design §4/§6 — a blocking
+		// wait ends on the grant or on interrupting the command).
 		Timeout: holdFor,
 		Stdin:   stdin, Stdout: stdout, Stderr: stderr,
 	}
@@ -2127,22 +2126,13 @@ func writeWorkerAdmitOutcome(stdout, stderr io.Writer, outcome runner.WorkerAdmi
 }
 
 func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
-	// Mirrors --memory-reserve's identical 1MiB floor (parseConfineArgs,
-	// above) -- this used to only reject <=0, so an out-of-range value below
-	// the daemon's own workerAdmitEstimatedBytesMin floor reached a live,
-	// healthy daemon, got rejected at the protocol level, and was wrapped by
-	// RequestWorkerAdmit as a generic "request rejected" message matching
-	// none of supervisor.py's denied/timeout/unevaluated substrings --
-	// misclassified as total daemon unavailability instead of a client
-	// argument mistake (found by Sol build-review, AIRA-38 review wave).
-	// The 1<<50 (1 PiB) top end mirrors the daemon's own admitMaxReserve
-	// (internal/daemon/admit.go, unexported -- hardcoded here exactly as
-	// the floor already is, matching --memory-reserve's own precedent): an
-	// oversized value used to sail through this check and hit the daemon's
-	// protocol-level rejection (E_DAEMON_PROTOCOL) instead, which ALSO
-	// matched none of the classifier's substrings -- the identical
-	// misclassification bug at the opposite extreme (found by Fable
-	// re-gate).
+	// The 1MiB floor mirrors --memory-reserve's (parseConfineArgs, above) and
+	// the daemon's workerAdmitEstimatedBytesMin; the 1<<50 (1 PiB) top end
+	// mirrors the daemon's unexported admitMaxReserve (internal/daemon/admit.go).
+	// A value outside either bound must be refused HERE as a client argument
+	// mistake: the daemon's protocol-level rejection would reach supervisor.py
+	// as a generic "request rejected" matching none of its denied/timeout/
+	// unevaluated substrings, misclassified as daemon unavailability (AIRA-38).
 	estimatedBytes, err := runner.ParseMemorySize(options["estimated-bytes"])
 	if err != nil || estimatedBytes < 1<<20 || estimatedBytes > 1<<50 {
 		if err == nil {
@@ -2157,13 +2147,10 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	maxWait := runner.DefaultConfineReserveMaxWait
 	if raw := options["max-wait"]; raw != "" {
 		// AIRA-64: zero is VALID and means "speculative" -- answer from what can
-		// be obtained without waiting. It used to be refused here as
-		// argument-invalid/request-invalid, which the aitest supervisor treats
-		// as TERMINAL and responds to by draining its remaining queue to
-		// `unevaluated`. The daemon's own validator has always accepted zero
-		// (validateWorkerAdmitArgs); only this side disagreed, so a speculative
-		// pool-growth probe would have destroyed the run it was trying to help
-		// (found by Sol plan-review round 2). Negatives are still refused.
+		// be obtained without waiting, as the daemon's validator
+		// (validateWorkerAdmitArgs) accepts. Refusing it would be argument-invalid,
+		// which the aitest supervisor treats as TERMINAL (draining its queue to
+		// `unevaluated`). Negatives are refused.
 		if maxWait, err = time.ParseDuration(raw); err != nil || maxWait < 0 {
 			return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
 				State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
@@ -2208,23 +2195,14 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 		// human sentence is the AIRA-42 defect this whole channel removes.
 		return writeWorkerAdmitOutcome(stdout, stderr, outcome, nil, "E_CONFINE_UNAVAILABLE")
 	}
-	// AIRA-39: the DAEMON creates the worker scope now, inside the same
-	// critical section that decided to grant, so there is no local
-	// CreateWorkerScope call here any more and no grant->creation window for a
-	// dying client to leave open. The scope named below already exists, with
-	// its memory.max, memory.swap.max and memory.oom.group verified daemon-side
-	// (AIRA-35 retired the memory.high this used to name).
+	// AIRA-39: the DAEMON creates the worker scope inside the same critical
+	// section that decided to grant, so there is no grant->creation window for
+	// a dying client to leave open. The scope named below already exists, with
+	// its memory.max, memory.swap.max and memory.oom.group verified daemon-side.
+	// A scope-creation failure is the daemon's own `worker-scope-create-failed`
+	// denial, classified daemon-side like every other verdict.
 	//
-	// AIRA-42 merge note: this fix was built against the pre-AIRA-39 shape,
-	// where a LOCAL CreateWorkerScope failure here produced the
-	// `placement-failed` class. That call site is gone, so the CLI has no
-	// placement path left to classify; a scope-creation failure is now the
-	// daemon's own `worker-scope-create-failed` denial, classified daemon-side
-	// like every other verdict. `placement-failed` survives in the catalogue
-	// because supervisor.py still raises WorkerPlacementFailed from its own
-	// fork/ack path -- it is simply no longer produced by this relay.
-	//
-	// A failed write here therefore leaves the daemon-created scope on the
+	// A failed write here leaves the daemon-created scope on the
 	// tree, charging the AIRA-39 ledger until the outer confine job's teardown
 	// removes the subtree. Not removing it is deliberate and matches the
 	// symmetric decision the daemon itself makes on its own failed response
