@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,9 +17,7 @@ import (
 func namespacedReqCore(t *testing.T) (*Core, string) {
 	t.Helper()
 	base := t.TempDir()
-	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, base)
 	s, err := store.Open(context.Background(), store.Options{
 		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
 		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-fee",

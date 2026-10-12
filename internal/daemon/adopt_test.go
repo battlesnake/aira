@@ -192,9 +192,7 @@ func TestBootstrapWithoutPrefixesIsRefusedAndClaimsNoPrefix(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	project, err := app.DiscoverBootstrap(context.Background(), root)
 	if err != nil {
 		t.Fatal(err)
@@ -220,5 +218,13 @@ func TestBootstrapWithoutPrefixesIsRefusedAndClaimsNoPrefix(t *testing.T) {
 	}
 	if owned != 0 {
 		t.Fatalf("refused bootstrap claimed AIRA (%d rows)", owned)
+	}
+}
+
+// gitInit makes dir a git repository, failing the test if git init fails.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if err := exec.Command("git", "-C", dir, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
 	}
 }

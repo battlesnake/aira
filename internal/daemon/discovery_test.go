@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -61,9 +60,7 @@ func createConfiguredGitProject(t *testing.T, base, name, prefix string) app.Pro
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	config := `{"schema":1,"project":{"slug":"` + name + `","prefixes":["` + prefix + `"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
 	if err := os.WriteFile(filepath.Join(root, ".aira", "config"), []byte(config+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -107,9 +104,7 @@ func TestBootstrapRecordsCoveredWorktree(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	project, err := app.DiscoverBootstrap(context.Background(), root)
 	if err != nil {
 		t.Fatal(err)
@@ -214,9 +209,7 @@ func TestDiscoverRegistryPassUsesRealDiscoveryAndContinuesPastUnavailableEntries
 	if err := os.MkdirAll(filepath.Join(invalidRoot, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "-C", invalidRoot, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, invalidRoot)
 	invalidIdentity, err := app.DiscoverBootstrap(context.Background(), invalidRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -704,9 +697,7 @@ func TestServeDiscoveryReapsPriorLifetimeProjectWithoutRequest(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}

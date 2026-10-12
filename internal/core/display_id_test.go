@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -62,9 +61,7 @@ func TestBareTicketPrefixes(t *testing.T) {
 func namespacedCore(t *testing.T) *Core {
 	t.Helper()
 	base := t.TempDir()
-	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, base)
 	s, err := store.Open(context.Background(), store.Options{
 		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
 		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-fee",

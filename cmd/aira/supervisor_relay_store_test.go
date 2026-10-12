@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -64,9 +63,7 @@ func dupTestFD(t *testing.T, file *os.File) int {
 func supervisorProjectFixture(t *testing.T) daemon.Paths {
 	t.Helper()
 	root := t.TempDir()
-	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}

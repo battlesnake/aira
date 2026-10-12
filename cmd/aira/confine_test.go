@@ -67,9 +67,7 @@ func TestConfineOwnerDerivationChain(t *testing.T) {
 	}
 	t.Setenv("AIRA_CONFINE_OWNER", "")
 	projectRoot := t.TempDir()
-	if err := exec.Command("git", "-C", projectRoot, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, projectRoot)
 	if err := os.MkdirAll(filepath.Join(projectRoot, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1018,5 +1016,13 @@ func TestRenderConfineListCeilingLine(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// gitInit makes dir a git repository, failing the test if git init fails.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if err := exec.Command("git", "-C", dir, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
 	}
 }

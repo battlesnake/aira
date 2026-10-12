@@ -921,9 +921,7 @@ func coreTestStoreWithRoot(t *testing.T) (*store.Store, string) {
 func coreTestStoreWithClock(t *testing.T) (*store.Store, *testCoreClock, string) {
 	t.Helper()
 	base := t.TempDir()
-	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, base)
 	clock := &testCoreClock{boot: "boot-core", mono: 100}
 	s, err := store.Open(context.Background(), store.Options{
 		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
@@ -947,9 +945,7 @@ func (c *testCoreClock) Now() (string, uint64, error) { return c.boot, c.mono, n
 
 func coreTestStoreAt(t *testing.T, base string) (*store.Store, string) {
 	t.Helper()
-	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
-		t.Fatal(err)
-	}
+	gitInit(t, base)
 	s, err := store.Open(context.Background(), store.Options{
 		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
 		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-core",
@@ -1143,5 +1139,13 @@ func TestTicketEnumsInTheDispatchTableAreTheDomainsOwn(t *testing.T) {
 	}
 	if !found {
 		t.Error("aira create must offer P3; seven merged tickets already carry it")
+	}
+}
+
+// gitInit makes dir a git repository, failing the test if git init fails.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if err := exec.Command("git", "-C", dir, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
 	}
 }
