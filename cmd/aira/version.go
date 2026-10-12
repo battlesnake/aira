@@ -78,12 +78,9 @@ func daemonIdentityFrom(response core.Response) buildid.Identity {
 	}
 	// Over the wire the reply arrives as RawData, so both shapes are decoded the
 	// way renderConfineBudgetResponse does it.
-	data := response.RawData
-	if len(data) == 0 {
-		var err error
-		if data, err = json.Marshal(response.Data); err != nil {
-			return buildid.Identity{Reason: "the daemon's version reply could not be re-encoded: " + err.Error()}
-		}
+	data, err := responsePayload(response)
+	if err != nil {
+		return buildid.Identity{Reason: "the daemon's version reply could not be re-encoded: " + err.Error()}
 	}
 	var identity buildid.Identity
 	if err := json.Unmarshal(data, &identity); err != nil {

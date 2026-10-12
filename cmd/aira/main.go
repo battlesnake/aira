@@ -3439,13 +3439,9 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 		}
 		result = *data
 	default:
-		encoded := response.RawData
-		if len(encoded) == 0 {
-			var err error
-			encoded, err = json.Marshal(response.Data)
-			if err != nil {
-				return
-			}
+		encoded, err := responsePayload(*response)
+		if err != nil {
+			return
 		}
 		if err := json.Unmarshal(encoded, &result); err != nil {
 			return
@@ -3514,6 +3510,27 @@ func renderHelp(response core.Response, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// responsePayload returns a response's data as JSON bytes: the wire bytes when
+// it came over the daemon socket, else the in-process typed value re-encoded.
+func responsePayload(response core.Response) ([]byte, error) {
+	if len(response.RawData) > 0 {
+		return response.RawData, nil
+	}
+	return json.Marshal(response.Data)
+}
+
+// decodeResponseData decodes a response's payload into T. Like json.Unmarshal,
+// a decode error still returns whatever was filled before it.
+func decodeResponseData[T any](response core.Response) (T, error) {
+	var value T
+	data, err := responsePayload(response)
+	if err != nil {
+		return value, err
+	}
+	err = json.Unmarshal(data, &value)
+	return value, err
+}
+
 func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {
 	var writeErr error
 	if jsonOutput {
@@ -3549,10 +3566,7 @@ func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) i
 
 func renderConfineListResponse(response core.Response, stdout, stderr io.Writer) int {
 	var result runner.ConfineListResult
-	data := response.RawData
-	if len(data) == 0 {
-		data, _ = json.Marshal(response.Data)
-	}
+	data, _ := responsePayload(response)
 	if err := json.Unmarshal(data, &result); err != nil {
 		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-list response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
 	}

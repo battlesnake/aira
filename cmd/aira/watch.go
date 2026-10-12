@@ -97,19 +97,7 @@ func runWatchLoop(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 }
 
 func decodeWatchResponse(response core.Response) (daemon.WatchResponse, error) {
-	var batch daemon.WatchResponse
-	data := response.RawData
-	if len(data) == 0 {
-		var err error
-		data, err = json.Marshal(response.Data)
-		if err != nil {
-			return batch, err
-		}
-	}
-	if err := json.Unmarshal(data, &batch); err != nil {
-		return batch, err
-	}
-	return batch, nil
+	return decodeResponseData[daemon.WatchResponse](response)
 }
 
 func printWatchEvent(out io.Writer, event store.WatchEvent, jsonOutput bool) error {

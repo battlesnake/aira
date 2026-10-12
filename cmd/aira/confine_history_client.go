@@ -61,14 +61,10 @@ func (d *daemonDispatcher) dispatchConfineHistory(ctx context.Context, request c
 		var next *runner.ConfineHistoryCursor
 		var verdict string
 		var echoedPaged bool
-		data := response.RawData
-		if len(data) == 0 {
-			// The daemon-down fallback carries a typed value, not wire bytes.
-			encoded, err := json.Marshal(response.Data)
-			if err != nil {
-				return historyProtocolError("invalid response data")
-			}
-			data = encoded
+		// The daemon-down fallback carries a typed value, not wire bytes.
+		data, err := responsePayload(response)
+		if err != nil {
+			return historyProtocolError("invalid response data")
 		}
 		if isDump {
 			var result runner.ConfineDumpResult

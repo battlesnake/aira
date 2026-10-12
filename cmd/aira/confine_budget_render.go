@@ -20,10 +20,7 @@ import (
 // the "NOT applied" clause the classifier writes; nothing here applies anything.
 func renderConfineBudgetResponse(response core.Response, stdout, stderr io.Writer) int {
 	var result runner.ConfineBudgetResult
-	data := response.RawData
-	if len(data) == 0 {
-		data, _ = json.Marshal(response.Data)
-	}
+	data, _ := responsePayload(response)
 	if err := json.Unmarshal(data, &result); err != nil {
 		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-budget response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
 	}

@@ -50,10 +50,7 @@ func runConfineDumpExchange(ctx context.Context, request core.Request, dumpPath 
 		return renderConfineManagement(response, jsonOutput, stdout, stderr)
 	}
 	var result runner.ConfineDumpResult
-	data := response.RawData
-	if len(data) == 0 {
-		data, _ = json.Marshal(response.Data)
-	}
+	data, _ := responsePayload(response)
 	if err := json.Unmarshal(data, &result); err != nil {
 		return renderConfineManagement(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-dump response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
 	}

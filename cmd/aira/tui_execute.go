@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -516,22 +515,12 @@ type gitExecuteData struct {
 }
 
 func decodeExecuteData(response core.Response) executeData {
-	raw := response.RawData
-	if len(raw) == 0 && response.Data != nil {
-		raw, _ = json.Marshal(response.Data)
-	}
-	var data executeData
-	_ = json.Unmarshal(raw, &data)
+	data, _ := decodeResponseData[executeData](response)
 	return data
 }
 
 func decodeGitExecuteData(response core.Response) gitExecuteData {
-	raw := response.RawData
-	if len(raw) == 0 && response.Data != nil {
-		raw, _ = json.Marshal(response.Data)
-	}
-	var data gitExecuteData
-	_ = json.Unmarshal(raw, &data)
+	data, _ := decodeResponseData[gitExecuteData](response)
 	return data
 }
 
