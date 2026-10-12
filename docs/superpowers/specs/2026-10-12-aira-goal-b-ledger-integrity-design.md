@@ -114,11 +114,12 @@ which deletes the duplicate and a one-line alias.
 Files: `internal/store/store.go`, `internal/codes/produced_test.go`.
 
 **A.1 The log's high water.** New helper
-`auditHighWater(auditDir, projectID string) (h int64, known bool)`: the largest `seq` over the
+`auditHighWater(auditDir, projectID string) (h int64, known bool)` (built as `readAuditLog` plus `logHighWater`, the read error returned as itself): the largest `seq` over the
 lines of `receipts.jsonl` and `journal.jsonl` whose project id is `projectID`, using the same
 decoders Rebuild uses. Both files absent: `(0, true)`. Any other read or decode error:
 `known=false`, which every caller treats in the conservative direction (no seed of 1, no
-claim). It reads the whole log, so it is called only where 3.2 says: for a counter row about
+claim, and at registration in an unmarked repository a refusal carrying the read error,
+"Nothing was written", never a demotion: build review R3.2). It reads the whole log, so it is called only where 3.2 says: for a counter row about
 to be created, and while a repository is unmarked.
 
 **A.2 Honest counter seed, and no invented counter.**
@@ -175,11 +176,16 @@ an exclusive create is visible for a moment before its content is written; still
 that, it is unreadable (a claim that crashed between create and write). Unreadable is never
 treated as absent.
 
-**Claiming it.** `claimAuditOwnerIfEligible(ctx, counter int64) (claimed bool, err error)`, the
+**Claiming it.** `claimAuditOwnerIfEligible(ctx, counter int64) (claimed bool, high int64, err error)`, the
 only function that creates the marker:
 
-1. Eligible only if the high water is known and `counter > highWater` (3.1 A.1). Not
-   eligible: return `false, nil`.
+1. Eligible only if the high water is known, `counter > highWater` (3.1 A.1), and this
+   state's database holds every line of the log for the project: each journal line as an
+   event with the same sequence number, verb, target and digest, and each receipt Rebuild
+   would adopt (valid ID, positive sequence number) as an allocation with the same sequence
+   number (`holdsAuditLog`; build review R3.1: a counter advanced by appends that were
+   refused can pass the high water without the state having read another state's lines).
+   Not eligible: return `false, nil`.
 2. `os.MkdirAll(<common>/aira)` (a fresh repository may register before anything else has
    created the directory), then `open(owner.json, O_CREAT|O_EXCL|O_WRONLY)`, write the line,
    `fsync` the file, `fsync` the directory.
@@ -199,7 +205,9 @@ only function that creates the marker:
    | unreadable or other | refuse `E_STATE_NOT_OWNER` ("Nothing was written.") | nothing |
    | ours | proceed | breadcrumb, rows; a new counter row is seeded by A.2 |
    | absent | `counter` = the existing row's value, or for a new row the A.2 seed; call `claimAuditOwnerIfEligible(counter)`; if it refuses, refuse ("Nothing was written."); if it claims, proceed | breadcrumb, rows (only after the claim succeeded) |
-   | absent, and not eligible | proceed without claiming, and **demote**: `registerDB` sets this project's counter to 0 | breadcrumb, rows, counter = 0 |
+   | absent, and the log cannot be read | refuse with the read error ("Nothing was written."); ownership is unknown, so nothing is claimed or demoted | nothing |
+   | absent, not eligible, counter not above the high water | proceed without claiming, and **demote**: `registerDB` sets this project's counter to 0 (guarded by `next_seq <= high`) | breadcrumb, rows, counter = 0 |
+   | absent, counter above the high water, but the database does not hold the log | proceed without claiming or demoting: it cannot append while the marker is absent, and its Rebuild meets the line it lacks (adopts it, or fails `E_JOURNAL_CORRUPT` naming it) | breadcrumb, rows |
 
    Demotion is what makes a stale pre-upgrade counter safe: a state whose counter is not
    above the log's high water cannot mint (A.2) until it rebuilds. The loser of a concurrent
@@ -217,7 +225,11 @@ only function that creates the marker:
    `RegisterBootstrap`, and `aira check`). After its transaction commits and before it
    appends recovered receipts (`store.go:3220-3224`), if the marker is absent it calls
    `claimAuditOwnerIfEligible` with its freshly upserted counter. Not eligible is then a bug
-   in Rebuild's own counter, and is refused rather than appended.
+   in Rebuild's own counter, and is refused rather than appended. Rebuild's replay of
+   deferred journal lines (`replayUnjournaledEvents`) runs at its start only when the marker
+   is already ours; in an unmarked repository it runs after the claim, since an append
+   before it would be refused and leave the recovering state unable to ever claim (build
+   review R3.3).
 3. **Every append requires the marker to name this state.** `appendReceiptIfMissing`
    (`store.go:2506`, the only writer of `receipts.jsonl`, verified by grep), before it takes
    the receipts lock, and `journalEvent` / `journalEventBounded` (`store.go:2469`, `:2488`,
@@ -283,7 +295,9 @@ writers (the runner's `runs/` ledger, the gate audit, `locks/`) are outside it (
 3. `receipts.jsonl` and `journal.jsonl` are appended to only by a process whose state is
    named in `owner.json` at the time of the append.
 4. `owner.json` is created only by `claimAuditOwnerIfEligible`, by an exclusive create, by a
-   state whose counter exceeds the log's high water; nothing overwrites or truncates it.
+   state whose counter exceeds the log's high water and whose database holds every line of
+   the log; nothing overwrites or truncates it. A log that cannot be read is never claimed
+   and never demotes a counter.
 5. An unreadable, malformed or (after retries) empty marker refuses registration, Rebuild
    and every append; it is never treated as missing.
 6. A state refused at registration (marker names another state or is unreadable, including
@@ -553,3 +567,8 @@ the code at `4098ad9` before it was accepted.
 | R2.4 | A counter-0 foreign state can seize any unmarked repository by rebuilding; state the residual; consider one claim site (P2) | Yes: `discovery.go:58-72` registers only live, matching roots | Residual accepted and stated (section 7, residual 1). Claim sites: one function, no claim at append; it is also called after Rebuild's commit, for the reason in section 2 (a claim-only-at-registration design makes a recovering owner's first Rebuild fail). |
 | R2.5 | Fresh init may register before the audit directory exists; prefer `O_CREAT|O_EXCL` to tmp+link; add a torn-marker test (P3) | Plausible (not traced end to end); `MkdirAll` is harmless either way | Accepted: `MkdirAll` before the claim, exclusive create with a bounded re-read of a zero-length marker, torn-marker and new-directory tests (3.2, 5.2). |
 | R2.6 | "`aira install` restarts the daemon since AIRA-203" needs checking; `E_RECONCILE_REQUIRED` at exit 4 contradicts `codes.go:25-30` (P3) | AIRA-203 restarts a daemon whose running binary differs (`install.go:1234`); a 2026-10-08 release recorded an install that did not restart. Exit 4 is pinned in the store-integrity family (`produced_test.go:282`) | Accepted: section 10 checks and restarts explicitly; exit 4 stated as a deliberate carry-over (3.1 A.3). |
+| R3.1 | Build review: the claim test (counter above the high water) is satisfied by sequence numbers burned in the state's own database while its appends were refused, so a state that never read another state's lines could claim and append (P2) | Yes, reproduced (`TestABurnedCounterDoesNotProveAbsorption` RED on `e3aebfa`) | Fixed: the claim also needs the database to hold every log line (`holdsAuditLog`). Such a state is neither claimed nor demoted; the state that did absorb the log still claims (same test). Mutation: drop the check, RED. |
+| R3.2 | Build review: an unreadable log at registration wrote an unconditional counter 0 (a durable value for an unknown) (P2) | Yes, reproduced (`TestAnUnreadableLogRefusesRegistrationAndKeepsTheCounter` RED on `e3aebfa`) | Fixed: registration in an unmarked repository refuses with the read error and writes nothing; the unguarded demotion is deleted. Mutation: treat the read error as not eligible, RED. |
+| R3.3 | Build review: Rebuild replayed deferred journal lines before its claim, so a demoted state with one in an unmarked repository was refused forever by the remedy the refusal advises (P2) | Yes, reproduced (`TestRebuildClaimsBeforeItReplaysDeferredJournalLines` RED on `e3aebfa`) | Fixed: replay at the start only when the marker is ours, otherwise after the claim; the absent-marker append text now names `aira check` as the step that claims. Mutation: replay first again, RED. |
+| R3.4 | Build review: no test for invariant 6 with a state that cannot claim over an unreadable marker (P2, test gap) | Yes (mutation O13 survived the suite) | Test added: `TestAnUnreadableMarkerRefusesAFreshState`; O13 RED. |
+| R3.5 | Build review: no test pins counting invalid-ID receipts toward Rebuild's counter (P2, test gap) | Yes (mutation O01 survived the suite) | Tests added: `TestAnInvalidIDReceiptAtTheHighWaterStillLetsRebuildClaim`, `TestAnInvalidIDReceiptSequenceNumberIsNotReissued`; O01 RED on both. |

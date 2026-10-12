@@ -8,7 +8,8 @@ package store
 // hand out the IDs and sequence numbers they record). <common>/aira/owner.json
 // names that state. It is created only by claimAuditOwnerIfEligible, with one
 // exclusive create that never overwrites, by a state whose counter for the
-// project is above the log's high water (proof that it has absorbed the log).
+// project is above the log's high water and whose database holds every line of
+// the log (together, proof that it has absorbed the log).
 // Registration decides ownership before it writes anything; Rebuild refuses a
 // foreign marker before it touches its database and claims an unmarked log only
 // after it has absorbed it; every append requires the marker to name this
@@ -24,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"aira/internal/domain"
 )
 
 const auditOwnerFileName = "owner.json"
@@ -121,7 +124,7 @@ func (s *Store) notOwnerError(owner auditOwner, tail string) error {
 		message = fmt.Sprintf("E_STATE_NOT_OWNER: the owner marker %s is unreadable (%s); refusing to write. If no AIRA process is claiming this repository right now, remove %s by hand.",
 			path, owner.detail, path)
 	default:
-		message = fmt.Sprintf("E_STATE_NOT_OWNER: %s has no owner marker (%s), so this AIRA state (%s) may not append to its shared log; the next aira command in this repository decides ownership.",
+		message = fmt.Sprintf("E_STATE_NOT_OWNER: %s has no owner marker (%s), so this AIRA state (%s) may not append to its shared log until it claims it: 'aira check' rebuilds from the log and claims it, or fails naming the line that stops it.",
 			s.auditDir, path, owner.ours)
 	}
 	return errors.New(strings.TrimSpace(message + " " + tail))
@@ -146,21 +149,25 @@ func (s *Store) requireAuditOwner() error {
 	return nil
 }
 
-// auditHighWater is the largest sequence number the shared log holds for
-// projectID, over receipts.jsonl and journal.jsonl, read with Rebuild's
-// decoders. Both files absent is (0, true). Any read or decode error is
-// known=false, which every caller treats conservatively (no seed of 1, no
-// claim). It reads the whole log, so it is called only where a counter row is
-// about to be created and while a repository is unmarked.
-func auditHighWater(auditDir, projectID string) (int64, bool) {
+// readAuditLog reads both shared log files with Rebuild's decoders. Both files
+// absent is two empty slices. A read or decode error is returned as it is: the
+// high water is then unknown, and every caller refuses rather than guess.
+func readAuditLog(auditDir string) ([]AllocationReceipt, []eventRecord, error) {
 	receipts, err := readReceipts(filepath.Join(auditDir, "receipts.jsonl"))
 	if err != nil {
-		return 0, false
+		return nil, nil, err
 	}
 	journal, err := readJournal(filepath.Join(auditDir, "journal.jsonl"))
 	if err != nil {
-		return 0, false
+		return nil, nil, err
 	}
+	return receipts, journal, nil
+}
+
+// logHighWater is the largest sequence number the log holds for projectID, over
+// every receipt and journal line of that project (the same set Rebuild's
+// counter counts, invalid-ID receipts included).
+func logHighWater(receipts []AllocationReceipt, journal []eventRecord, projectID string) int64 {
 	high := int64(0)
 	for _, receipt := range receipts {
 		if receipt.ProjectID == projectID && receipt.Seq > high {
@@ -172,89 +179,167 @@ func auditHighWater(auditDir, projectID string) (int64, bool) {
 			high = event.Seq
 		}
 	}
-	return high, true
+	return high
 }
 
 // counterSeed is the next_seq a brand-new event_counters row starts at: 1 only
 // when the log is known to hold nothing for this project, otherwise 0 ("not yet
-// set from the log", which nextSequence refuses until Rebuild lifts it).
+// set from the log", which nextSequence refuses until Rebuild lifts it). It
+// reads the whole log, so it is called only where a counter row is about to be
+// created.
 func (s *Store) counterSeed() int64 {
-	if high, known := auditHighWater(s.auditDir, s.projectID); known && high == 0 {
+	receipts, journal, err := readAuditLog(s.auditDir)
+	if err == nil && logHighWater(receipts, journal, s.projectID) == 0 {
 		return 1
 	}
 	return 0
 }
 
+// holdsAuditLog reports whether this state's database holds every line the
+// shared log holds for the project: each journal line as an event with the same
+// sequence number, verb, target and digest, and each receipt Rebuild would
+// adopt (valid ID, positive sequence number) as an allocation with the same
+// sequence number. A counter above the high water alone does not prove this: a
+// state whose appends were refused advances its counter with numbers the log
+// never received, and can pass another state's lines without reading them
+// (review finding, AIRA-301).
+func (s *Store) holdsAuditLog(ctx context.Context, receipts []AllocationReceipt, journal []eventRecord) (bool, error) {
+	for _, event := range journal {
+		if event.ProjectID != s.projectID {
+			continue
+		}
+		var verb, target, digest string
+		err := s.db.QueryRowContext(ctx, `SELECT verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, s.projectID, event.Seq).Scan(&verb, &target, &digest)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, translateDBError(err)
+		}
+		if verb != event.Verb || target != event.Target || digest != event.PayloadDigest {
+			return false, nil
+		}
+	}
+	for _, receipt := range receipts {
+		if receipt.ProjectID != s.projectID || domain.ValidateID(receipt.ID) != nil || receipt.Seq <= 0 {
+			continue
+		}
+		prefix, number, suffix := splitTicketID(receipt.ID)
+		var seq int64
+		err := s.db.QueryRowContext(ctx, `SELECT seq FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, s.projectID, prefix, number, suffix).Scan(&seq)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, translateDBError(err)
+		}
+		if seq != receipt.Seq {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// auditLogUnreadableError is a claim decision that could not read the log of an
+// unmarked repository: whether this state may claim it is unknown, so nothing
+// is claimed and nothing is demoted.
+type auditLogUnreadableError struct {
+	err error
+	dir string
+}
+
+func (e auditLogUnreadableError) Error() string {
+	return fmt.Sprintf("%s; %s has no owner marker and its log cannot be read, so this AIRA state cannot decide whether it may write there (fix or inspect the log, then retry).", e.err, e.dir)
+}
+
+func (e auditLogUnreadableError) Unwrap() error { return e.err }
+
 // claimAuditOwnerIfEligible is the only function that creates owner.json. It
 // claims only when counter (this state's next sequence number for the project)
-// is above the log's high water. Not eligible returns (false, nil). Another
-// process winning the exclusive create is success when it named this state and
-// E_STATE_NOT_OWNER otherwise. Nothing ever truncates or rewrites the marker.
-func (s *Store) claimAuditOwnerIfEligible(ctx context.Context, counter int64) (bool, error) {
+// is above the log's high water and this state's database holds every line of
+// the log (holdsAuditLog). Not eligible returns (false, high, nil). An
+// unreadable log is an auditLogUnreadableError. Another process winning the
+// exclusive create is success when it named this state and E_STATE_NOT_OWNER
+// otherwise. Nothing ever truncates or rewrites the marker.
+func (s *Store) claimAuditOwnerIfEligible(ctx context.Context, counter int64) (bool, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return false, 0, err
 	}
-	high, known := auditHighWater(s.auditDir, s.projectID)
-	if !known || counter <= high {
-		return false, nil
+	receipts, journal, err := readAuditLog(s.auditDir)
+	if err != nil {
+		return false, 0, auditLogUnreadableError{err: err, dir: s.auditDir}
+	}
+	high := logHighWater(receipts, journal, s.projectID)
+	if counter <= high {
+		return false, high, nil
+	}
+	holds, err := s.holdsAuditLog(ctx, receipts, journal)
+	if err != nil {
+		return false, high, err
+	}
+	if !holds {
+		return false, high, nil
 	}
 	ours, err := s.stateIdentity()
 	if err != nil {
-		return false, fmt.Errorf("E_INTERNAL: cannot resolve this AIRA state's directory: %w", err)
+		return false, high, fmt.Errorf("E_INTERNAL: cannot resolve this AIRA state's directory: %w", err)
 	}
 	if err := os.MkdirAll(s.auditDir, 0o755); err != nil {
-		return false, fmt.Errorf("E_RECEIPT_IO: create %s: %w", s.auditDir, err)
+		return false, high, fmt.Errorf("E_RECEIPT_IO: create %s: %w", s.auditDir, err)
 	}
 	path := s.auditOwnerPath()
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if errors.Is(err, os.ErrExist) {
 		owner, readErr := s.readAuditOwner()
 		if readErr != nil {
-			return false, readErr
+			return false, high, readErr
 		}
 		if owner.kind == auditOwnerOurs {
-			return true, nil
+			return true, high, nil
 		}
 		if owner.kind == auditOwnerAbsent {
 			owner = auditOwner{kind: auditOwnerUnreadable, ours: ours, detail: "it existed at the exclusive create and was gone when re-read"}
 		}
-		return false, s.notOwnerError(owner, "")
+		return false, high, s.notOwnerError(owner, "")
 	}
 	if err != nil {
-		return false, fmt.Errorf("E_RECEIPT_IO: claim %s: %w", path, err)
+		return false, high, fmt.Errorf("E_RECEIPT_IO: claim %s: %w", path, err)
 	}
 	line, err := json.Marshal(auditOwnerRecord{StateDir: ours})
 	if err != nil {
 		_ = file.Close()
-		return false, err
+		return false, high, err
 	}
 	if _, err := file.Write(append(line, '\n')); err != nil {
 		_ = file.Close()
-		return false, fmt.Errorf("E_RECEIPT_IO: write %s: %w", path, err)
+		return false, high, fmt.Errorf("E_RECEIPT_IO: write %s: %w", path, err)
 	}
 	if err := syncFile(file); err != nil {
 		_ = file.Close()
-		return false, fmt.Errorf("E_RECEIPT_IO: sync %s: %w", path, err)
+		return false, high, fmt.Errorf("E_RECEIPT_IO: sync %s: %w", path, err)
 	}
 	if err := file.Close(); err != nil {
-		return false, fmt.Errorf("E_RECEIPT_IO: close %s: %w", path, err)
+		return false, high, fmt.Errorf("E_RECEIPT_IO: close %s: %w", path, err)
 	}
 	if err := syncDir(s.auditDir); err != nil {
-		return false, fmt.Errorf("E_RECEIPT_IO: sync %s: %w", s.auditDir, err)
+		return false, high, fmt.Errorf("E_RECEIPT_IO: sync %s: %w", s.auditDir, err)
 	}
-	return true, nil
+	return true, high, nil
 }
 
 // registrationOwnership decides, before registration writes anything, whether
 // this state may register: ours proceeds; another state or an unreadable marker
-// refuses; an absent marker is claimed when this state's counter is above the
-// log's high water, and otherwise the registration proceeds with the counter
-// demoted to 0 (it must rebuild before it can mint). demote carries the high
-// water the demotion is conditioned on.
+// refuses; an absent marker over a log that cannot be read refuses (whether this
+// state may write there is unknown, so nothing is claimed or demoted); an absent
+// marker is claimed when claimAuditOwnerIfEligible allows it. Otherwise the
+// registration proceeds without claiming, and a counter not above the log's
+// high water is demoted to 0 (it must rebuild before it can mint). A counter
+// above the high water whose database does not hold the log is left as it is:
+// it cannot append while the marker is absent, and its Rebuild meets the line
+// it lacks. demote carries the high water the demotion is conditioned on.
 type registrationOwnership struct {
-	demote    bool
-	high      int64
-	highKnown bool
+	demote bool
+	high   int64
 }
 
 const registrationRefusalTail = "Nothing was written."
@@ -277,9 +362,10 @@ func (s *Store) decideRegistrationOwnership(ctx context.Context) (registrationOw
 	} else if err != nil {
 		return registrationOwnership{}, translateDBError(err)
 	}
-	claimed, err := s.claimAuditOwnerIfEligible(ctx, counter)
+	claimed, high, err := s.claimAuditOwnerIfEligible(ctx, counter)
 	if err != nil {
-		if ErrorCode(err) == "E_STATE_NOT_OWNER" {
+		var unreadable auditLogUnreadableError
+		if ErrorCode(err) == "E_STATE_NOT_OWNER" || errors.As(err, &unreadable) {
 			return registrationOwnership{}, errors.New(err.Error() + " " + registrationRefusalTail)
 		}
 		return registrationOwnership{}, err
@@ -287,6 +373,5 @@ func (s *Store) decideRegistrationOwnership(ctx context.Context) (registrationOw
 	if claimed {
 		return registrationOwnership{}, nil
 	}
-	high, known := auditHighWater(s.auditDir, s.projectID)
-	return registrationOwnership{demote: true, high: high, highKnown: known}, nil
+	return registrationOwnership{demote: true, high: high}, nil
 }

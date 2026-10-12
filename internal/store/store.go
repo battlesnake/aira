@@ -2095,10 +2095,6 @@ func (s *Store) registerDB(ctx context.Context, bootstrap bool, ownership regist
 		if !ownership.demote {
 			return nil
 		}
-		if !ownership.highKnown {
-			_, err = conn.ExecContext(ctx, `UPDATE event_counters SET next_seq=0 WHERE project_id=?`, s.projectID)
-			return err
-		}
 		_, err = conn.ExecContext(ctx, `UPDATE event_counters SET next_seq=0 WHERE project_id=? AND next_seq<=?`, s.projectID, ownership.high)
 		return err
 	})
@@ -2837,8 +2833,16 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
-	if err := s.replayUnjournaledEvents(ctx); err != nil {
-		return err
+	// Deferred journal lines are appended here only when this state already owns
+	// the log. In an unmarked repository the append would be refused, so they are
+	// appended after the claim below instead (review finding, AIRA-301); until
+	// then the events table they live in is what the allocation steps read.
+	replayed := false
+	if owner.kind == auditOwnerOurs {
+		if err := s.replayUnjournaledEvents(ctx); err != nil {
+			return err
+		}
+		replayed = true
 	}
 	entries, err := readRegistry(s.registryPath)
 	if err != nil {
@@ -2881,7 +2885,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			continue
 		}
 		// Every current-project line counts toward the sequence high water, the
-		// same set auditHighWater reads, so the counter this Rebuild leaves is
+		// same set logHighWater counts, so the counter this Rebuild leaves is
 		// above the log's high water and can claim an unmarked log (AIRA-301).
 		if receipt.Seq > maxSeq {
 			maxSeq = receipt.Seq
@@ -3196,12 +3200,17 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if err := s.db.QueryRowContext(ctx, `SELECT next_seq FROM event_counters WHERE project_id=?`, s.projectID).Scan(&counter); err != nil {
 			return translateDBError(err)
 		}
-		claimed, err := s.claimAuditOwnerIfEligible(ctx, counter)
+		claimed, high, err := s.claimAuditOwnerIfEligible(ctx, counter)
 		if err != nil {
 			return err
 		}
 		if !claimed {
-			return fmt.Errorf("E_INTERNAL: Rebuild absorbed the audit log of project %s but its counter %d is not above the log's high water; refusing to claim %s or append to the shared log", s.projectID, counter, s.auditOwnerPath())
+			return fmt.Errorf("E_INTERNAL: Rebuild absorbed the audit log of project %s but is not eligible to claim it (counter %d, log high water %d, or a log line its database does not hold); refusing to claim %s or append to the shared log", s.projectID, counter, high, s.auditOwnerPath())
+		}
+	}
+	if !replayed {
+		if err := s.replayUnjournaledEvents(ctx); err != nil {
+			return err
 		}
 	}
 	for _, receipt := range recovered {
