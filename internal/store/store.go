@@ -1984,6 +1984,14 @@ func (s *Store) Register(ctx context.Context) error {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return translateDBError(err)
 	}
+	// AIRA-301: ownership of the repository's shared audit log is decided
+	// before this registration writes anything, so a refused state (another
+	// state's marker, an unreadable marker, the loser of a concurrent claim)
+	// leaves no breadcrumb and no rows.
+	ownership, err := s.decideRegistrationOwnership(ctx)
+	if err != nil {
+		return err
+	}
 	entry := registryEntry{
 		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: s.worktreeID,
 		Root: s.root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),
@@ -1994,13 +2002,17 @@ func (s *Store) Register(ctx context.Context) error {
 	if err := appendJSONLine(s.registryPath, entry, s.registryPath+".lock"); err != nil {
 		return err
 	}
-	return s.registerDB(ctx, false)
+	return s.registerDB(ctx, false, ownership)
 }
 
 // RegisterBootstrap is the only registration path allowed to clear an eject
 // tombstone. It is called by explicit init after any adoption rebuild has
 // succeeded; ordinary discovery and verbs always use Register.
 func (s *Store) RegisterBootstrap(ctx context.Context) error {
+	ownership, err := s.decideRegistrationOwnership(ctx)
+	if err != nil {
+		return err
+	}
 	entry := registryEntry{
 		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: s.worktreeID,
 		Root: s.root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),
@@ -2009,7 +2021,7 @@ func (s *Store) RegisterBootstrap(ctx context.Context) error {
 	if err := appendJSONLine(s.registryPath, entry, s.registryPath+".lock"); err != nil {
 		return err
 	}
-	if err := s.registerDB(ctx, true); err != nil {
+	if err := s.registerDB(ctx, true, ownership); err != nil {
 		if trimErr := TrimRegistryProject(s.registryPath, s.projectID); trimErr != nil {
 			return fmt.Errorf("%w; bootstrap registry rollback failed: %v", err, trimErr)
 		}
@@ -2018,7 +2030,7 @@ func (s *Store) RegisterBootstrap(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) registerDB(ctx context.Context, bootstrap bool) error {
+func (s *Store) registerDB(ctx context.Context, bootstrap bool, ownership registrationOwnership) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		if bootstrap {
@@ -2061,8 +2073,33 @@ func (s *Store) registerDB(ctx context.Context, bootstrap bool) error {
 				return err
 			}
 		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id, next_seq)
-            VALUES(?, 1) ON CONFLICT(project_id) DO NOTHING`, s.projectID)
+		// AIRA-301: a new counter row starts at 1 only when the shared log is
+		// known to hold nothing for this project; otherwise at 0, "not yet set
+		// from the log", which nextSequence refuses until Rebuild lifts it. An
+		// existing row is left as it is, except that a registration in an
+		// unmarked repository whose counter is not above the log's high water
+		// demotes it to 0 (a pre-upgrade or stale counter cannot prove that this
+		// state has read the log). The demotion is conditioned on the counter
+		// still not being above the high water, so a concurrent Rebuild's lift
+		// is never undone.
+		var existing int64
+		err := conn.QueryRowContext(ctx, `SELECT next_seq FROM event_counters WHERE project_id=?`, s.projectID).Scan(&existing)
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err = conn.ExecContext(ctx, `INSERT INTO event_counters(project_id, next_seq)
+            VALUES(?, ?) ON CONFLICT(project_id) DO NOTHING`, s.projectID, s.counterSeed())
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		if !ownership.demote {
+			return nil
+		}
+		if !ownership.highKnown {
+			_, err = conn.ExecContext(ctx, `UPDATE event_counters SET next_seq=0 WHERE project_id=?`, s.projectID)
+			return err
+		}
+		_, err = conn.ExecContext(ctx, `UPDATE event_counters SET next_seq=0 WHERE project_id=? AND next_seq<=?`, s.projectID, ownership.high)
 		return err
 	})
 }
@@ -2477,6 +2514,9 @@ func (s *Store) journalEvent(ctx context.Context, projectID string, seq int64) e
 	if err != nil {
 		return err
 	}
+	if err := s.requireAuditOwner(); err != nil {
+		return err
+	}
 	if err := appendEventIfMissing(filepath.Join(s.auditDir, "journal.jsonl"), event, filepath.Join(s.auditDir, "journal.lock")); err != nil {
 		return err
 	}
@@ -2495,6 +2535,9 @@ func (s *Store) journalEventBounded(ctx context.Context, projectID string, seq i
 	if err := row.Scan(&event.ProjectID, &event.Seq, &event.At, &event.Actor, &event.Verb, &event.Target, &event.PayloadDigest); err != nil {
 		return err
 	}
+	if err := s.requireAuditOwner(); err != nil {
+		return err
+	}
 	if err := appendEventIfMissingBounded(ctx, filepath.Join(s.auditDir, "journal.jsonl"), event, filepath.Join(s.auditDir, "journal.lock"), timeout); err != nil {
 		return err
 	}
@@ -2511,6 +2554,9 @@ func (s *Store) appendReceiptIfMissing(receipt AllocationReceipt) error {
 	path := filepath.Join(s.auditDir, "receipts.jsonl")
 	if receipt.At == "" {
 		receipt.At = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if err := s.requireAuditOwner(); err != nil {
+		return err
 	}
 	lock, err := acquireLock(path + ".lock")
 	if err != nil {
@@ -2775,6 +2821,17 @@ func (s *Store) FlushDeferredJournal(ctx context.Context) (int, error) {
 }
 
 func (s *Store) Rebuild(ctx context.Context) error {
+	// AIRA-301: never rebuild from (and later append to) a log another state
+	// owns, or one whose owner marker cannot be read. Read only, before this
+	// state's database is touched; this covers init adoption, which runs Rebuild
+	// in an unregistered scope before RegisterBootstrap.
+	owner, err := s.readAuditOwner()
+	if err != nil {
+		return err
+	}
+	if owner.kind == auditOwnerOther || owner.kind == auditOwnerUnreadable {
+		return s.notOwnerError(owner, "Rebuild changed neither this state's database nor the shared log.")
+	}
 	lock, err := acquireLock(filepath.Join(filepath.Dir(s.dbPath), "rebuild.lock"))
 	if err != nil {
 		return err
@@ -2823,15 +2880,18 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if receipt.ProjectID != s.projectID {
 			continue
 		}
+		// Every current-project line counts toward the sequence high water, the
+		// same set auditHighWater reads, so the counter this Rebuild leaves is
+		// above the log's high water and can claim an unmarked log (AIRA-301).
+		if receipt.Seq > maxSeq {
+			maxSeq = receipt.Seq
+		}
 		if domain.ValidateID(receipt.ID) != nil {
 			continue
 		}
 		prefix, number, _ := splitTicketID(receipt.ID) // HWM is number-only (no minted suffix)
 		if int64(number) > maxima[prefix] {
 			maxima[prefix] = int64(number)
-		}
-		if receipt.Seq > maxSeq {
-			maxSeq = receipt.Seq
 		}
 		receiptKeys[receiptKey(receipt.ProjectID, receipt.ID, receipt.Seq)] = true
 	}
@@ -3064,7 +3124,6 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			}
 		}
 		for _, ticket := range scanned {
-			prefix, number, suffix := splitTicketID(ticket.Ticket.ID)
 			if _, err := conn.ExecContext(ctx, `INSERT INTO tickets(project_id, worktree_id, id, path, digest, status, hold, title, kind, severity)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
@@ -3076,74 +3135,18 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if err := replaceRelationIndex(ctx, conn, s.projectID, ticket.WorktreeID, ticket.Ticket, ticket.Root, ticket.Path); err != nil {
 				return err
 			}
-			var allocationSeq int64
-			var allocationWorktree, allocationPath, allocationState, allocationKind string
-			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`,
-				s.projectID, prefix, number, suffix).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
-			if errors.Is(err, sql.ErrNoRows) {
-				// A scanned file lives under .aira/tickets/, so it is ticket-kind by
-				// path. Cross-validate before manufacturing a durable recovery:
-				// refuse a requirement-prefixed ID masquerading as a ticket file
-				// rather than poisoning the append-only journal with a mis-kinded
-				// "recovered" receipt.
-				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, kindTicket, ticket.Path)
-				if kindErr != nil {
-					return kindErr
-				}
-				allocationSeq, err = nextSequence(ctx, conn, s.projectID)
-				if err != nil {
-					return err
-				}
-				allocationWorktree, allocationPath, allocationState = ticket.WorktreeID, ticket.Path, "recovered"
-				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind, suffix); err != nil {
-					return err
-				}
-				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
-					ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: reconciledKind})
-				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
-					return err
-				}
-			} else if err != nil {
+			allocationSeq, recoveredReceipt, err := s.reconcileScannedAllocation(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, kindTicket, journal, receiptKeys)
+			if err != nil {
 				return err
-			} else {
-				// An allocation row already exists; a scanned ticket file for the
-				// same ID must not disagree with the recorded kind (e.g. a fake
-				// ticket file shadowing a real requirement allocation).
-				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), ticket.Path)
-				if kindErr != nil {
-					return kindErr
-				}
-				// Validate (or reconstruct) the allocation event against the
-				// reconciled kind even when the receipt is absent, so a mis-kinded
-				// or downgraded journal event cannot survive a rebuild undetected.
-				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
-					return err
-				}
-				// A cross-worktree-adopted ticket (aira id in A, aira import in B)
-				// replays from the mint receipt as state='allocated' at A's path,
-				// but the file is scanned here in B. Re-point the still-allocated
-				// row at the scanned file's path/worktree — the same allocated→file
-				// resolution markTicketMaterialised's CASE performs — so Check does
-				// not fabricate an E_ID_UNRESOLVED against the empty A path. Guarded
-				// to state='allocated' (never advances a materialised/retired row)
-				// and to a genuine path change (no-op otherwise).
-				if _, err := conn.ExecContext(ctx, `UPDATE allocations SET path=?, worktree_id=?
-                        WHERE project_id=? AND prefix=? AND number=? AND suffix=? AND state='allocated' AND path<>?`,
-					ticket.Path, ticket.WorktreeID, s.projectID, prefix, number, suffix, ticket.Path); err != nil {
-					return err
-				}
-				if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
-					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
-						ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)})
-				}
+			}
+			if recoveredReceipt != nil {
+				recovered = append(recovered, *recoveredReceipt)
 			}
 			if allocationSeq > maxSeq {
 				maxSeq = allocationSeq
 			}
 		}
 		for _, req := range scannedRequirements {
-			prefix, number, suffix := splitTicketID(req.Requirement.ID)
 			if _, err := conn.ExecContext(ctx, `INSERT INTO requirements(project_id, worktree_id, id, path, digest, status, text)
                     VALUES(?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
@@ -3152,52 +3155,12 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				string(req.Requirement.Status), req.Requirement.Text); err != nil {
 				return err
 			}
-			var allocationSeq int64
-			var allocationWorktree, allocationPath, allocationState, allocationKind string
-			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`,
-				s.projectID, prefix, number, suffix).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
-			if errors.Is(err, sql.ErrNoRows) {
-				// A scanned file lives under .aira/requirements/, so it is
-				// requirement-kind by path. Cross-validate before manufacturing a
-				// durable recovery: refuse a ticket-prefixed ID masquerading as a
-				// requirement file rather than poisoning the append-only journal.
-				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, kindRequirement, req.Path)
-				if kindErr != nil {
-					return kindErr
-				}
-				allocationSeq, err = nextSequence(ctx, conn, s.projectID)
-				if err != nil {
-					return err
-				}
-				allocationWorktree, allocationPath, allocationState = req.WorktreeID, req.Path, "recovered"
-				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind, suffix); err != nil {
-					return err
-				}
-				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
-					ID: req.Requirement.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: reconciledKind})
-				if err := ensureRecoveredEvent(ctx, conn, req.Requirement.ID, req.WorktreeID, req.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
-					return err
-				}
-			} else if err != nil {
+			allocationSeq, recoveredReceipt, err := s.reconcileScannedAllocation(ctx, conn, req.Requirement.ID, req.WorktreeID, req.Path, kindRequirement, journal, receiptKeys)
+			if err != nil {
 				return err
-			} else {
-				// An allocation row already exists; a scanned requirement file for
-				// the same ID must not disagree with the recorded kind.
-				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), req.Path)
-				if kindErr != nil {
-					return kindErr
-				}
-				// Validate (or reconstruct) the allocation event against the
-				// reconciled kind even when the receipt is absent, so a mis-kinded
-				// or downgraded journal event cannot survive a rebuild undetected.
-				if err := ensureRecoveredEvent(ctx, conn, req.Requirement.ID, req.WorktreeID, req.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
-					return err
-				}
-				if !receiptKeys[receiptKey(s.projectID, req.Requirement.ID, allocationSeq)] {
-					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
-						ID: req.Requirement.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)})
-				}
+			}
+			if recoveredReceipt != nil {
+				recovered = append(recovered, *recoveredReceipt)
 			}
 			if allocationSeq > maxSeq {
 				maxSeq = allocationSeq
@@ -3220,6 +3183,26 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	})
 	if err != nil {
 		return err
+	}
+	// AIRA-301: a Rebuild has just lifted this state's counter above the log's
+	// high water, so it may claim an unmarked log, and must before it appends
+	// its recovered receipts. Not eligible here would be a bug in the counter
+	// this Rebuild wrote, and is refused rather than appended.
+	if owner, err = s.readAuditOwner(); err != nil {
+		return err
+	}
+	if owner.kind == auditOwnerAbsent {
+		var counter int64
+		if err := s.db.QueryRowContext(ctx, `SELECT next_seq FROM event_counters WHERE project_id=?`, s.projectID).Scan(&counter); err != nil {
+			return translateDBError(err)
+		}
+		claimed, err := s.claimAuditOwnerIfEligible(ctx, counter)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return fmt.Errorf("E_INTERNAL: Rebuild absorbed the audit log of project %s but its counter %d is not above the log's high water; refusing to claim %s or append to the shared log", s.projectID, counter, s.auditOwnerPath())
+		}
 	}
 	for _, receipt := range recovered {
 		if err := s.appendReceiptIfMissing(receipt); err != nil {
@@ -3268,7 +3251,8 @@ func (s *Store) ensureReceiptAllocation(ctx context.Context, conn *sql.Conn, rec
 			receipt.ProjectID, prefix, number, receipt.WorktreeID, receipt.State, receipt.Path, allocationSeq, kind, suffix)
 	} else if err == nil {
 		if allocationSeq != receipt.Seq {
-			return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s has seq %d but allocation has seq %d", receipt.ID, receipt.Seq, allocationSeq)
+			return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s has seq %d but allocation has seq %d (receipt worktree %s, path %s, at %s; inspect %s)",
+				receipt.ID, receipt.Seq, allocationSeq, receipt.WorktreeID, receipt.Path, receipt.At, filepath.Join(s.auditDir, "receipts.jsonl"))
 		}
 		if normaliseKind(allocationKind) != kind {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s kind %s but allocation row kind %s", receipt.ID, kind, normaliseKind(allocationKind))
@@ -3307,8 +3291,76 @@ func (s *Store) reconcileAllocationKind(prefix, receiptKind, path string) (strin
 	return kind, nil
 }
 
-func ensureRecoveredEvent(ctx context.Context, conn *sql.Conn, id, worktreeID, path string, seq int64, project, kind string, journal []eventRecord) error {
-	return ensureAllocationEvent(ctx, conn, project, id, worktreeID, path, seq, kind, journal)
+// reconcileScannedAllocation is Rebuild's one "scanned entity file to
+// allocation" step, shared by tickets and requirements (AIRA-297). pathKind is
+// the kind the file's directory implies. With no allocation row it mints a
+// `recovered` row and its event and returns the recovered receipt. With a row it
+// reconciles the kind, validates or reconstructs the allocation event, re-points
+// a still-`allocated` row at the scanned file (the AIRA-175 resolution; a
+// materialised or retired row is never moved), and returns a recovered receipt
+// when the receipts log lacks this allocation's key.
+func (s *Store) reconcileScannedAllocation(ctx context.Context, conn *sql.Conn, id, worktreeID, path, pathKind string, journal []eventRecord, receiptKeys map[string]bool) (int64, *AllocationReceipt, error) {
+	prefix, number, suffix := splitTicketID(id)
+	var allocationSeq int64
+	var allocationWorktree, allocationPath, allocationState, allocationKind string
+	err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`,
+		s.projectID, prefix, number, suffix).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
+	if errors.Is(err, sql.ErrNoRows) {
+		// A scanned file's directory names its kind. Cross-validate before
+		// manufacturing a durable recovery: refuse an ID of the other kind
+		// masquerading as this kind's file rather than poisoning the
+		// append-only journal with a mis-kinded "recovered" receipt.
+		reconciledKind, err := s.reconcileAllocationKind(prefix, pathKind, path)
+		if err != nil {
+			return 0, nil, err
+		}
+		allocationSeq, err = nextSequence(ctx, conn, s.projectID)
+		if err != nil {
+			return 0, nil, err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind, suffix)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, worktreeID, "recovered", path, allocationSeq, reconciledKind, suffix); err != nil {
+			return 0, nil, err
+		}
+		if err := ensureAllocationEvent(ctx, conn, s.projectID, id, worktreeID, path, allocationSeq, reconciledKind, journal); err != nil {
+			return 0, nil, err
+		}
+		return allocationSeq, &AllocationReceipt{ProjectID: s.projectID, WorktreeID: worktreeID,
+			ID: id, Path: path, Seq: allocationSeq, State: "recovered", Kind: reconciledKind}, nil
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	// An allocation row already exists; a scanned file for the same ID must not
+	// disagree with the recorded kind (e.g. a fake ticket file shadowing a real
+	// requirement allocation).
+	reconciledKind, err := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), path)
+	if err != nil {
+		return 0, nil, err
+	}
+	// Validate (or reconstruct) the allocation event against the reconciled kind
+	// even when the receipt is absent, so a mis-kinded or downgraded journal
+	// event cannot survive a rebuild undetected.
+	if err := ensureAllocationEvent(ctx, conn, s.projectID, id, worktreeID, path, allocationSeq, reconciledKind, journal); err != nil {
+		return 0, nil, err
+	}
+	// A cross-worktree-adopted entity (aira id in A, a file in B) replays from
+	// the mint receipt as state='allocated' at A's path, but the file is scanned
+	// here in B. Re-point the still-allocated row at the scanned file's
+	// path/worktree -- the same allocated->file resolution the materialise step
+	// performs -- so Check does not fabricate an E_ID_UNRESOLVED against the
+	// empty A path. Guarded to state='allocated' (never moves a
+	// materialised/retired row) and to a genuine path change (no-op otherwise).
+	if _, err := conn.ExecContext(ctx, `UPDATE allocations SET path=?, worktree_id=?
+        WHERE project_id=? AND prefix=? AND number=? AND suffix=? AND state='allocated' AND path<>?`,
+		path, worktreeID, s.projectID, prefix, number, suffix, path); err != nil {
+		return 0, nil, err
+	}
+	if !receiptKeys[receiptKey(s.projectID, id, allocationSeq)] {
+		return allocationSeq, &AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
+			ID: id, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)}, nil
+	}
+	return allocationSeq, nil, nil
 }
 
 // ensureAllocationEvent validates or reconstructs the allocation event for a
@@ -3435,11 +3487,12 @@ func nextNumber(ctx context.Context, conn *sql.Conn, project, prefix string) (in
 func nextSequence(ctx context.Context, conn *sql.Conn, project string) (int64, error) {
 	var next int64
 	err := conn.QueryRowContext(ctx, `SELECT next_seq FROM event_counters WHERE project_id=?`, project).Scan(&next)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id, next_seq) VALUES(?, 2)`, project); err != nil {
-			return 0, err
-		}
-		return 1, nil
+	// AIRA-301: a counter row that does not exist, or is below 1, was never set
+	// from the shared audit log, so a number handed out from it could collide
+	// with one the log already holds. Refuse inside the caller's transaction,
+	// which rolls back.
+	if errors.Is(err, sql.ErrNoRows) || err == nil && next < 1 {
+		return 0, reconcileRequiredError(project)
 	}
 	if err != nil {
 		return 0, err
@@ -3448,6 +3501,10 @@ func nextSequence(ctx context.Context, conn *sql.Conn, project string) (int64, e
 		return 0, err
 	}
 	return next, nil
+}
+
+func reconcileRequiredError(project string) error {
+	return fmt.Errorf("E_RECONCILE_REQUIRED: this AIRA state has not read the audit log of project %s, so its counters cannot be trusted. If this is your repository and your usual AIRA state, run 'aira reconcile --rebuild' (or 'aira check'). If you did not expect to be in this repository, stop: rebuilding would make this state a writer of its log. Nothing was committed.", project)
 }
 
 func insertEvent(ctx context.Context, conn *sql.Conn, project string, seq int64, verb, target string) error {
