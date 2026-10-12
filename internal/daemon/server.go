@@ -1238,12 +1238,12 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 		code := store.ErrorCode(err)
 		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
-	planRoot, _ := canonicalPath(plan.Project.Root)
-	planCommon, _ := canonicalPath(plan.Project.CommonDir)
-	planGit, _ := canonicalPath(plan.Project.GitDir)
-	scopeRoot, _ := canonicalPath(scope.Root)
-	scopeCommon, _ := canonicalPath(scope.CommonDir)
-	scopeGit, _ := canonicalPath(scope.GitDir)
+	planRoot, _ := store.CanonicalPath(plan.Project.Root)
+	planCommon, _ := store.CanonicalPath(plan.Project.CommonDir)
+	planGit, _ := store.CanonicalPath(plan.Project.GitDir)
+	scopeRoot, _ := store.CanonicalPath(scope.Root)
+	scopeCommon, _ := store.CanonicalPath(scope.CommonDir)
+	scopeGit, _ := store.CanonicalPath(scope.GitDir)
 	if planRoot != scopeRoot || planCommon != scopeCommon || planGit != scopeGit || plan.Project.ProjectID != projectID || plan.Project.WorktreeID != worktreeID {
 		return core.Response{Code: CodeProjectInvalid, Error: CodeProjectInvalid + ": bootstrap git discovery disagrees with descriptor", Exit: codes.ExitForCode(CodeProjectInvalid)}
 	}
@@ -1373,15 +1373,15 @@ func (s *Server) ensureScope(ctx context.Context, scope WorktreeScope) core.Resp
 // NewScope has already registered exactly once; callers use cached to decide
 // whether an explicit refresh is required.
 func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) {
-	root, err := canonicalPath(scope.Root)
+	root, err := store.CanonicalPath(scope.Root)
 	if err != nil {
 		return nil, false, err
 	}
-	common, err := canonicalPath(scope.CommonDir)
+	common, err := store.CanonicalPath(scope.CommonDir)
 	if err != nil {
 		return nil, false, err
 	}
-	gitDir, err := canonicalPath(scope.GitDir)
+	gitDir, err := store.CanonicalPath(scope.GitDir)
 	if err != nil {
 		return nil, false, err
 	}

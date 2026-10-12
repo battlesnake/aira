@@ -65,7 +65,7 @@ func (s *Store) auditOwnerPath() string { return filepath.Join(s.auditDir, audit
 // stateIdentity is the canonical directory holding this store's state.db: the
 // same for the daemon and for an in-process store on the same state.
 func (s *Store) stateIdentity() (string, error) {
-	return canonicalPath(filepath.Dir(s.dbPath))
+	return CanonicalPath(filepath.Dir(s.dbPath))
 }
 
 // readAuditOwner classifies owner.json. Unreadable is never reported as absent.

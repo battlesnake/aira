@@ -368,15 +368,15 @@ func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := canonicalPath(opts.Root)
+	root, err := CanonicalPath(opts.Root)
 	if err != nil {
 		return nil, err
 	}
-	common, err := canonicalPath(opts.CommonDir)
+	common, err := CanonicalPath(opts.CommonDir)
 	if err != nil {
 		return nil, err
 	}
-	gitDir, err := canonicalPath(opts.GitDir)
+	gitDir, err := CanonicalPath(opts.GitDir)
 	if err != nil {
 		return nil, err
 	}
@@ -576,11 +576,11 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	if err != nil {
 		return nil, err
 	}
-	root, err := canonicalPath(opts.Root)
+	root, err := CanonicalPath(opts.Root)
 	if err != nil {
 		return nil, err
 	}
-	common, err := canonicalPath(opts.CommonDir)
+	common, err := CanonicalPath(opts.CommonDir)
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +588,7 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	if gitDir == "" {
 		gitDir = root
 	}
-	gitDir, err = canonicalPath(gitDir)
+	gitDir, err = CanonicalPath(gitDir)
 	if err != nil {
 		return nil, err
 	}
@@ -679,7 +679,9 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	return nil, lastErr
 }
 
-func canonicalPath(path string) (string, error) {
+// CanonicalPath returns path made absolute and clean, with symlinks resolved
+// through its deepest existing ancestor and any missing tail re-joined.
+func CanonicalPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -719,11 +721,11 @@ func hashPath(path string) string {
 // CanonicalScopeIdentity returns the path-derived identity used by NewScope and
 // by daemon-side descriptor validation.
 func CanonicalScopeIdentity(commonDir, gitDir string) (string, string, error) {
-	common, err := canonicalPath(commonDir)
+	common, err := CanonicalPath(commonDir)
 	if err != nil {
 		return "", "", err
 	}
-	git, err := canonicalPath(gitDir)
+	git, err := CanonicalPath(gitDir)
 	if err != nil {
 		return "", "", err
 	}

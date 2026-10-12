@@ -50,8 +50,8 @@ func newLedgerFixture(t *testing.T) ledgerFixture {
 func (f ledgerFixture) state(name string) string { return filepath.Join(f.base, name) }
 
 func (f ledgerFixture) options(state string) Options {
-	common, _ := canonicalPath(f.common)
-	gitDir, _ := canonicalPath(f.root)
+	common, _ := CanonicalPath(f.common)
+	gitDir, _ := CanonicalPath(f.root)
 	return Options{
 		Root: f.root, CommonDir: f.common, GitDir: f.root,
 		ProjectID: hashPath(common), WorktreeID: hashPath(gitDir),
