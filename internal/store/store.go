@@ -345,9 +345,9 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		MaxCommandEvents: opts.MaxCommandEvents, MaxCommandAgeDays: opts.MaxCommandAgeDays,
 		MaxQuotaSnapshots: opts.MaxQuotaSnapshots, Clock: opts.Clock,
 	}
-	// GitDir did not exist in the pre-M21 Options API. Keep that source-level
-	// compatibility for isolated in-process callers; production discovery and
-	// every daemon descriptor provide GitDir and take the checked path.
+	// An empty GitDir selects the unchecked path used by isolated in-process
+	// callers and tests; production discovery and every daemon descriptor
+	// provide GitDir and take the checked path.
 	s, err := newScopeContext(ctx, db, scopeOpts, opts.GitDir != "", true)
 	if err != nil {
 		_ = db.Close()
@@ -3414,7 +3414,7 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 		if fromJournal.PayloadDigest != allocationEventDigest(fromJournal.Verb, fromJournal.Target, kind) {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
 		}
-		verb, target, payload = fromJournal.Verb, fromJournal.Target, fromJournal.PayloadDigest
+		verb = fromJournal.Verb
 	} else {
 		var existing eventRecord
 		err := conn.QueryRowContext(ctx, `SELECT project_id, seq, at_wall, actor, verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, project, seq).
@@ -3431,7 +3431,7 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 		} else if existing.PayloadDigest != allocationEventDigest(existing.Verb, existing.Target, kind) {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
 		} else {
-			verb, target, payload = existing.Verb, existing.Target, existing.PayloadDigest
+			verb = existing.Verb
 		}
 	}
 	_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO outbox(project_id,seq,worktree_id,path,verb,precondition_digest,intended_digest,intended_bytes,materialised,journaled,allocation_id)

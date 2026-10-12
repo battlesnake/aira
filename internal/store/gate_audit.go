@@ -187,13 +187,13 @@ func (a *GateAudit) Append(kind string, fields map[string]string) (GateAuditReco
 	var prev string
 	if len(records) == 0 {
 		genesis := GateAuditRecord{SchemaVersion: gateAuditSchema, Type: "genesis", Nonce: "genesis", Fields: map[string]string{"format": "aira-gate-audit-v1"}}
-		digest, payload, e := gateDigest(genesis)
+		digest, _, e := gateDigest(genesis)
 		if e != nil {
 			return GateAuditRecord{}, e
 		}
 		genesis.Digest = digest
 		genesis.Tag = gateTag(key, gateRecordPayload(genesis))
-		payload, e = json.Marshal(genesis)
+		payload, e := json.Marshal(genesis)
 		if e != nil {
 			return GateAuditRecord{}, e
 		}
@@ -219,13 +219,13 @@ func (a *GateAudit) Append(kind string, fields map[string]string) (GateAuditReco
 		}
 	}
 	record := GateAuditRecord{SchemaVersion: gateAuditSchema, Seq: seq, Type: kind, Nonce: nonce, PrevDigest: prev, Fields: cloneFields(fields)}
-	digest, payload, err := gateDigest(record)
+	digest, _, err := gateDigest(record)
 	if err != nil {
 		return GateAuditRecord{}, err
 	}
 	record.Digest = digest
 	record.Tag = gateTag(key, gateRecordPayload(record))
-	payload, err = json.Marshal(record)
+	payload, err := json.Marshal(record)
 	if err != nil {
 		return GateAuditRecord{}, err
 	}
