@@ -232,24 +232,7 @@ func (s *Store) gitValue(ctx context.Context, args ...string) string {
 }
 
 func nextTestReportNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {
-	var number, sequence int64
-	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM test_report_counter WHERE project_id=?`, project).Scan(&number, &sequence)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO test_report_counter(project_id,next_number,next_seq) VALUES(?,?,?)`, project, 2, 2); err != nil {
-			return 0, 0, err
-		}
-		return 1, 1, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	if number < 1 || sequence < 1 {
-		return 0, 0, errors.New("E_TESTREPORT_INVALID: report counter is invalid")
-	}
-	if _, err := conn.ExecContext(ctx, `UPDATE test_report_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
-		return 0, 0, err
-	}
-	return number, sequence, nil
+	return nextCounterNumbers(ctx, conn, project, "test_report_counter", "E_TESTREPORT_INVALID: report counter is invalid")
 }
 
 func (s *Store) findIdempotentReport(ctx context.Context, conn *sql.Conn, input domain.TestReportInput) (domain.TestReport, bool, error) {

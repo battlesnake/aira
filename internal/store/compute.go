@@ -375,24 +375,7 @@ func optionalFloat64(value *float64) any {
 }
 
 func nextComputeNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {
-	var number, sequence int64
-	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM compute_event_counter WHERE project_id=?`, project).Scan(&number, &sequence)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO compute_event_counter(project_id,next_number,next_seq) VALUES(?,?,?)`, project, 2, 2); err != nil {
-			return 0, 0, err
-		}
-		return 1, 1, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	if number < 1 || sequence < 1 {
-		return 0, 0, errors.New(domain.ComputeCodeInvalid + ": compute event counter is invalid")
-	}
-	if _, err := conn.ExecContext(ctx, `UPDATE compute_event_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
-		return 0, 0, err
-	}
-	return number, sequence, nil
+	return nextCounterNumbers(ctx, conn, project, "compute_event_counter", domain.ComputeCodeInvalid+": compute event counter is invalid")
 }
 
 // computeModSource is the fixed source of the Claude usage mod (AIRA-284).
@@ -663,24 +646,7 @@ func cloneInt64(value *int64) *int64 {
 }
 
 func nextQuotaNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {
-	var number, sequence int64
-	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM quota_snapshot_counter WHERE project_id=?`, project).Scan(&number, &sequence)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO quota_snapshot_counter(project_id,next_number,next_seq) VALUES(?,?,?)`, project, 2, 2); err != nil {
-			return 0, 0, err
-		}
-		return 1, 1, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	if number < 1 || sequence < 1 {
-		return 0, 0, errors.New(domain.ComputeCodeInvalid + ": quota snapshot counter is invalid")
-	}
-	if _, err := conn.ExecContext(ctx, `UPDATE quota_snapshot_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
-		return 0, 0, err
-	}
-	return number, sequence, nil
+	return nextCounterNumbers(ctx, conn, project, "quota_snapshot_counter", domain.ComputeCodeInvalid+": quota snapshot counter is invalid")
 }
 
 func (s *Store) evictQuotaSnapshots(ctx context.Context, conn *sql.Conn) (int, error) {

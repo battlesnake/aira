@@ -109,10 +109,24 @@ func (s *Store) AddCommandEvent(ctx context.Context, input domain.CommandEventIn
 }
 
 func nextCommandNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {
+	// Not E_COMMAND_INVALID (AIRA-107): that code is the caller-facing
+	// "your command-language program is malformed" answer, catalogued at
+	// exit 2, and nothing about this failure is the caller's request. The
+	// counter row is state AIRA itself wrote and can no longer trust, so it
+	// is an infrastructure failure (exit 4) and must not send an agent off
+	// to fix an argument that was fine.
+	return nextCounterNumbers(ctx, conn, project, "command_event_counter", "E_COMMAND_COUNTER_CORRUPT: command event counter is invalid")
+}
+
+// nextCounterNumbers allocates the next (number, sequence) pair from a
+// per-project counter table, creating the row on first use. table is always a
+// compile-time constant at the call site. corrupt is the error text for a row
+// holding a value below 1.
+func nextCounterNumbers(ctx context.Context, conn *sql.Conn, project, table, corrupt string) (int64, int64, error) {
 	var number, sequence int64
-	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM command_event_counter WHERE project_id=?`, project).Scan(&number, &sequence)
+	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM `+table+` WHERE project_id=?`, project).Scan(&number, &sequence)
 	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO command_event_counter(project_id,next_number,next_seq) VALUES(?,?,?)`, project, 2, 2); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO `+table+`(project_id,next_number,next_seq) VALUES(?,?,?)`, project, 2, 2); err != nil {
 			return 0, 0, err
 		}
 		return 1, 1, nil
@@ -121,15 +135,9 @@ func nextCommandNumbers(ctx context.Context, conn *sql.Conn, project string) (in
 		return 0, 0, err
 	}
 	if number < 1 || sequence < 1 {
-		// Not E_COMMAND_INVALID (AIRA-107): that code is the caller-facing
-		// "your command-language program is malformed" answer, catalogued at
-		// exit 2, and nothing about this failure is the caller's request. The
-		// counter row is state AIRA itself wrote and can no longer trust, so it
-		// is an infrastructure failure (exit 4) and must not send an agent off
-		// to fix an argument that was fine.
-		return 0, 0, errors.New("E_COMMAND_COUNTER_CORRUPT: command event counter is invalid")
+		return 0, 0, errors.New(corrupt)
 	}
-	if _, err := conn.ExecContext(ctx, `UPDATE command_event_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
+	if _, err := conn.ExecContext(ctx, `UPDATE `+table+` SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project); err != nil {
 		return 0, 0, err
 	}
 	return number, sequence, nil

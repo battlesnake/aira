@@ -423,22 +423,7 @@ func (s *Store) CountRants(query, by string) (RantCountResult, error) {
 }
 
 func nextRantNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {
-	var number, sequence int64
-	err := conn.QueryRowContext(ctx, `SELECT next_number,next_seq FROM rant_counter WHERE project_id=?`, project).Scan(&number, &sequence)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO rant_counter(project_id,next_number,next_seq) VALUES(?,2,2)`, project); err != nil {
-			return 0, 0, err
-		}
-		return 1, 1, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	if number < 1 || sequence < 1 {
-		return 0, 0, errors.New(domain.CodeRantInvalid + ": rant counter is invalid")
-	}
-	_, err = conn.ExecContext(ctx, `UPDATE rant_counter SET next_number=?,next_seq=? WHERE project_id=?`, number+1, sequence+1, project)
-	return number, sequence, err
+	return nextCounterNumbers(ctx, conn, project, "rant_counter", domain.CodeRantInvalid+": rant counter is invalid")
 }
 
 func (s *Store) loadRant(ctx context.Context, queryer interface {
