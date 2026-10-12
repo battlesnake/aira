@@ -415,13 +415,23 @@ test runs in `make ci`.
   `"BLOCKERX"`, not `"blockerx"`. Mutations: no write-back; echo the folded value; skip empty
   values even when required.
 - `TestUpperCaseEnumValuesStillAccepted` (CLI, in-process dispatcher): `rant "x" --severity
-  Annoyance` stores `annoyance`; `rant LS`; `test-report ls --format GO-JSON`; `find list`,
+  Annoyance` stores `annoyance`; `rant LS`; `test-report add --format GO-JSON` (build round 2: `ls`
+  declares no `--format`, so the enum is exercised on `add`); `find list`,
   `spend list`, `quota list`, `test-report list`, `rant list` all succeed. Write it **before**
   the check and record it GREEN; it must stay GREEN. Also `mv X IN-PROGRESS` moves to
   `in-progress` (RED today; widening). Mutation: drop the CLI `list -> ls` mapping (four RED).
 - CLI messages: `mv X in_progress` gives the full text in 3.3 and exit 2 (today: exit 1,
   `E_TRANSITION_INVALID`). `rant "x" --severity P1` names `P1` and the three severities. `req ls
   --status Bogus` is refused (today rc 0). `link A blockz B` gives `E_ARGUMENT_INVALID` exit 2.
+- Declared options (build round 2): the CLI refuses any option the selected subverb's operation
+  does not declare (`rant ls --severity P1`, `find ls --verdict nope`, `gate ls --checker command`,
+  `spend ls --provider x`, `test-report ls --format x`; `E_SELECTOR_INVALID`, exit 2), read from
+  `makeMCPOperation`, the table MCP validates against. That table now restricts an operation that
+  declares no arguments (`gate ls`, `gate check`) to none, instead of falling back to the verb's
+  whole argument list, so `aira_gate {operation: ls, verdict: pass}` is `unknown argument` too.
+  `TestCLIStillAcceptsEveryDeclaredOption` pins the false-refuse direction (every real option in
+  its real spelling still builds). This narrows invariant 3 for options: an option that was
+  accepted and discarded by a sibling subverb is now refused; no option that had an effect is.
   `link A blocked-by B` still gives AIRA-291's forward-command refusal (twin: the check must
   accept inverse kinds).
 - `TestEnumRefusalIdenticalAcrossFaces`: the same faults (`rant` severity `P1`, `mv` status

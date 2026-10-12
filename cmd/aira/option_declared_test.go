@@ -1,0 +1,180 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"aira/internal/core"
+)
+
+// verifies: AIRA-210 -- the CLI refuses an option its operation does not declare,
+// by the SAME table MCP validates against (OperationSpec.Args intersected with
+// the verb's ArgSpec list), so an enum-bearing option that a subverb's builder
+// does not forward can no longer bypass Do's enum check and exit 0.
+
+func buildFromArgv(argv ...string) (core.Request, error) {
+	positional, options, err := parseArgs(argv[0], argv[1:])
+	if err != nil {
+		return core.Request{}, err
+	}
+	return buildRequest(argv[0], positional, options)
+}
+
+// mcpDeclares reports whether MCP's aira_<tool> would accept `argument` on
+// `operation`, read from the same helper decodeMCPRequest validates against.
+func mcpDeclares(t *testing.T, verb, operation, argument string) bool {
+	t.Helper()
+	descriptor, ok := descriptorNamed(core.New(nil).DispatchDescriptors(), verb)
+	if !ok {
+		t.Fatalf("no descriptor for %s", verb)
+	}
+	for _, arg := range makeMCPOperation(descriptor, operation).declaredArgs {
+		if arg.Name == argument {
+			return true
+		}
+	}
+	return false
+}
+
+// Every counterexample reported against b48adc5: an option the operation does
+// not declare is accepted-and-discarded on the base, exit 0.
+func TestCLIRefusesOptionsTheOperationDoesNotDeclare(t *testing.T) {
+	cases := []struct {
+		argv      []string
+		verb, op  string
+		option    string
+		mcpAbsent string // the MCP argument name that is not declared
+	}{
+		{[]string{"rant", "ls", "--severity", "P1"}, "rant", "ls", "severity", "severity"},
+		{[]string{"rant", "ls", "--severity", "annoyance"}, "rant", "ls", "severity", "severity"},
+		{[]string{"rant", "ls", "--outcome", "bogus"}, "rant", "ls", "outcome", "outcome"},
+		{[]string{"rant", "get", "RANT-1", "--by", "bogus"}, "rant", "get", "by", "by"},
+		{[]string{"rant", "another rant", "--outcome", "bogus"}, "rant", "capture", "outcome", "outcome"},
+		{[]string{"rant", "capture", "another rant", "--note", "x"}, "rant", "capture", "note", "note"},
+		{[]string{"rant", "review", "RANT-1", "--severity", "blocker"}, "rant", "review", "severity", "severity"},
+		{[]string{"find", "ls", "--severity", "P9"}, "find", "ls", "severity", "severity"},
+		{[]string{"find", "ls", "--verdict", "nope"}, "find", "ls", "verdict", "verdict"},
+		{[]string{"find", "ls", "--disposition", "nope"}, "find", "ls", "disposition", "disposition"},
+		{[]string{"find", "add", "AIRA-1", "--disposition", "waived"}, "find", "add", "disposition", "disposition"},
+		{[]string{"find", "set", "F-1", "--severity", "P1"}, "find", "set", "severity", "severity"},
+		{[]string{"gate", "ls", "--verdict", "bogus"}, "gate", "ls", "verdict", "verdict"},
+		// A VALID value is refused too: accepted-and-discarded reads as applied.
+		{[]string{"gate", "ls", "--checker", "command"}, "gate", "ls", "checker", "checker"},
+		{[]string{"gate", "ls", "--checker", "bogus"}, "gate", "ls", "checker", "checker"},
+		{[]string{"gate", "show", "G", "--verdict", "pass"}, "gate", "show", "verdict", "verdict"},
+		{[]string{"req", "ls", "--status", "built"}, "req", "ls", "status", "status"},
+		{[]string{"req", "show", "AR-1", "--fields", "id"}, "req", "show", "fields", "fields"},
+		{[]string{"spend", "ls", "--provider", "openai"}, "spend", "ls", "provider", "provider"},
+		{[]string{"quota", "ls", "--provider", "openai"}, "quota", "ls", "provider", "provider"},
+		{[]string{"test-report", "ls", "--format", "go-json"}, "test-report", "ls", "format", "format"},
+		{[]string{"test-report", "show", "TR-1", "--ticket", "AIRA-1"}, "test-report", "show", "ticket", "ticket"},
+		{[]string{"test-report", "flaky", "--config-env", "A=B"}, "test-report", "flaky", "config-env", "env_digest"},
+	}
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.argv, " "), func(t *testing.T) {
+			_, err := buildFromArgv(tc.argv...)
+			if err == nil {
+				t.Fatalf("%v: accepted; want a refusal naming --%s for %s %s", tc.argv, tc.option, tc.verb, tc.op)
+			}
+			want := "E_SELECTOR_INVALID: option --" + tc.option + " is not valid for " + tc.verb + " " + tc.op
+			if !strings.HasPrefix(err.Error(), want) {
+				t.Fatalf("%v: error %q, want prefix %q", tc.argv, err.Error(), want)
+			}
+			// The refusal is MCP's: the same table does not declare the argument.
+			if mcpDeclares(t, tc.verb, tc.op, tc.mcpAbsent) {
+				t.Fatalf("MCP declares %s on %s %s, so the CLI refusal is stricter than MCP", tc.mcpAbsent, tc.verb, tc.op)
+			}
+		})
+	}
+}
+
+// The false-refuse direction: every option a subverb really uses, in its real
+// spelling (kebab, aliased or snake), still builds a request. Without this the
+// stricter check could silently disable a working flag.
+func TestCLIStillAcceptsEveryDeclaredOption(t *testing.T) {
+	valid := [][]string{
+		{"rant", "text", "--tag", "t", "--severity", "blocker", "--ref", "r", "--idem", "k", "--project", "p"},
+		{"rant", "capture", "text", "--tag", "t", "--severity", "papercut", "--ref", "r", "--idem", "k", "--prefix", "AIRA"},
+		{"rant", "ls", "--by", "tag", "--unreviewed", "--since", "5", "--tag", "t", "--prefix", "AIRA"},
+		{"rant", "list", "--project", "p"},
+		{"rant", "get", "RANT-1", "--project", "p"},
+		{"rant", "review", "RANT-1", "--outcome", "planned", "--note", "n", "--resolved-by", "ticket:AIRA-1", "--prefix", "AIRA"},
+		{"rant", "redact", "RANT-1", "--prefix", "AIRA"},
+		{"find", "add", "AIRA-1", "--category", "bug", "--severity", "P1", "--verdict", "confirmed", "--source", "s", "--message", "m", "--file", "x.go:3", "--requirement", "AR-1"},
+		{"find", "ls", "query", "--by", "source", "--fields", "id"},
+		{"find", "list", "--by", "source"},
+		{"find", "show", "F-1"},
+		{"find", "set", "F-1", "--disposition", "waived", "--reason", "r", "--actor", "a"},
+		{"req", "add", "The system must X", "--status", "planned"},
+		{"req", "ls", "--fields", "id"},
+		{"req", "show", "AR-1"},
+		{"req", "set", "AR-1", "--status", "built"},
+		{"req", "import", "REQUIREMENTS.md"},
+		{"spend", "add", "--provider", "openai", "--model", "m", "--source", "manual", "--ticket", "AIRA-1", "--phase", "plan", "--at", "2026-01-01T00:00:00Z", "--session", "s", "--agent", "a", "--turn-id", "t1", "--total", "5", "--cost-usd", "0.1", "--usage-file", "u.json", "--bucket", "output=5", "--reasoning-subset", "--resolve-ticket"},
+		{"spend", "ls", "provider:openai", "--by", "phase", "--session", "s"},
+		{"quota", "add", "--provider", "openai", "--source", "manual", "--at", "2026-01-01T00:00:00Z", "--window", "5h", "--used", "1", "--limit", "2", "--remaining", "1", "--reset-at", "2026-01-01T05:00:00Z"},
+		{"quota", "ls", "provider:openai"},
+		{"test-report", "add", "r.json", "--format", "go-json", "--ticket", "AIRA-1", "--phase", "p", "--commit", "c", "--branch", "b", "--suite", "s", "--config", "c", "--config-env", "A=B", "--shard", "1/2", "--retry", "1"},
+		{"test-report", "ls"},
+		{"test-report", "show", "TR-1"},
+		{"test-report", "flaky", "--explain", "TestX"},
+		{"test-report", "flaky", "--all"},
+		{"gate", "add", "G", "--checker", "command", "--predicate", "p", "--argv", "a", "--cwd", "root", "--env-allow", "PATH", "--timeout-ms", "5", "--output-cap-bytes", "5", "--parser", "go-test-json-v1"},
+		{"gate", "set", "G", "--timeout-ms", "9"},
+		{"gate", "show", "G"},
+		{"gate", "run", "G"},
+		{"gate", "ls"},
+		{"gate", "check"},
+		{"gate", "attest", "G", "--verdict", "pass", "--actor", "human"},
+		{"gate", "prove", "G"},
+		{"gate", "review", "G"},
+		{"gate", "canary-run", "C", "--mutation-kind", "k", "--mutation-file", "f", "--mutation-test", "t", "--mutation-occurrence", "1", "--mutation-pkgdir", ".", "--mutation-testname", "T", "--mutation-content", "c", "--mutation-seed", "1", "--mutation-expected-result", "fail"},
+		{"gate", "canary-show", "C", "--mutation-kind", "k"},
+		{"commands", "ls", "--by", "key"},
+		{"commands", "count", "--by", "key"},
+	}
+	for _, argv := range valid {
+		t.Run(strings.Join(argv, " "), func(t *testing.T) {
+			if _, err := buildFromArgv(argv...); err != nil {
+				t.Fatalf("%v: refused: %v", argv, err)
+			}
+		})
+	}
+}
+
+// MCP's own table had the matching hole: an operation that declares NO arguments
+// (gate ls, gate check) fell back to the verb's whole argument list, so
+// aira_gate {operation: ls, verdict: pass} was accepted and discarded. A declared
+// operation now restricts the arguments even when it declares none.
+func TestMCPOperationWithNoArgsDeclaresNone(t *testing.T) {
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) { return nil, func() {}, nil })
+	binding, ok := server.byName["aira_gate"]
+	if !ok {
+		t.Fatal("no aira_gate binding")
+	}
+	for _, operation := range []string{"ls", "check"} {
+		for _, argument := range []string{"verdict", "checker", "actor"} {
+			values := map[string]json.RawMessage{
+				"operation": json.RawMessage(`"` + operation + `"`),
+				argument:    json.RawMessage(`"pass"`),
+			}
+			_, _, err := decodeMCPRequest(binding, values)
+			if err == nil || !strings.Contains(err.Error(), `unknown argument "`+argument+`"`) {
+				t.Fatalf("gate %s %s: err=%v, want unknown argument", operation, argument, err)
+			}
+		}
+		// Twin: the bare operation still decodes.
+		if _, _, err := decodeMCPRequest(binding, map[string]json.RawMessage{"operation": json.RawMessage(`"` + operation + `"`)}); err != nil {
+			t.Fatalf("gate %s: %v", operation, err)
+		}
+	}
+	// Twin: an operation that declares an argument keeps accepting it.
+	if _, _, err := decodeMCPRequest(binding, map[string]json.RawMessage{
+		"operation": json.RawMessage(`"attest"`), "gate_id": json.RawMessage(`"G"`),
+		"verdict": json.RawMessage(`"pass"`), "actor": json.RawMessage(`"human"`),
+	}); err != nil {
+		t.Fatalf("gate attest: %v", err)
+	}
+}

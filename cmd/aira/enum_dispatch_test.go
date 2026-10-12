@@ -79,7 +79,13 @@ func TestUpperCaseEnumValuesStillAccepted(t *testing.T) {
 	ok("spend", "list")
 	ok("quota", "list")
 	ok("test-report", "list")
-	ok("test-report", "ls", "--format", "GO-JSON")
+	// `test-report ls` declares no --format (MCP's ls takes only a selector), so
+	// the upper-case enum is exercised where the option is declared: on add. The
+	// enum check lets GO-JSON through, so any LATER refusal (this run feeds it no
+	// report) is not the enum's.
+	if exit, env, errText := run("test-report", "add", "--format", "GO-JSON"); env["code"] == "E_ARGUMENT_INVALID" {
+		t.Fatalf("test-report add --format GO-JSON refused by the enum check: exit=%d env=%v err=%q", exit, env, errText)
+	}
 	// Widening: a case-variant status now moves the ticket.
 	ok("mv", "AIRA-1", "IN-PROGRESS")
 	_, env, _ = run("show", "AIRA-1")

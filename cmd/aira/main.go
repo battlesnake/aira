@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -2977,13 +2978,6 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				return core.Request{}, fmt.Errorf("req ls accepts no positional arguments")
 			}
 			args["fields"] = splitComma(options["fields"])
-			// AIRA-210: ls does not filter on status, so --status here is refused
-			// whatever its value: accepting a correctly typed one and returning every
-			// row would read as if the filter had applied. MCP's aira_requirement ls
-			// declares no status argument either, so both faces refuse it.
-			if _, given := options["status"]; given {
-				return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: option --status is not valid for req ls: ls lists every requirement and does not filter by status")
-			}
 		case "show":
 			if len(positional) != 2 {
 				return core.Request{}, fmt.Errorf("req show requires <selector>")
@@ -3318,7 +3312,75 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 	default:
 		return core.Request{}, fmt.Errorf("E_UNKNOWN_VERB: unknown verb %q", verb)
 	}
+	if err := refuseOptionsNotDeclared(verb, args, options); err != nil {
+		return core.Request{}, err
+	}
 	return core.Request{Verb: verb, Args: args}, nil
+}
+
+var (
+	dispatchDescriptorsOnce sync.Once
+	dispatchDescriptors     []core.DispatchDescriptor
+)
+
+// cliOptionArgumentNames are the dispatch arguments a CLI option can feed. Most
+// options are their argument's name, kebab or snake as the declaration spells
+// it; these are the ones the CLI renames.
+func cliOptionArgumentNames(verb, option string) []string {
+	names := []string{option, strings.ReplaceAll(option, "-", "_")}
+	switch {
+	case verb == "rant" && option == "tag":
+		names = append(names, "tags")
+	case verb == "rant" && option == "ref":
+		names = append(names, "refs")
+	case verb == "rant" && option == "idem":
+		names = append(names, "idempotency_key")
+	case verb == "test-report" && option == "config-env":
+		names = append(names, "env_digest")
+	}
+	return names
+}
+
+// refuseOptionsNotDeclared refuses an option that the selected subverb does not
+// declare. parseArgs' allowed set is per VERB, so an option declared by one
+// subverb (`--severity` on `rant capture`) passed parseArgs on a sibling whose
+// builder never forwards it, bypassed Do's enum check, and exited 0 as if it had
+// applied. The declared set is makeMCPOperation's, the very table MCP validates
+// against, so the two faces refuse the same faults (AIRA-210). A verb with no
+// operations, or a request with no subverb, is untouched.
+func refuseOptionsNotDeclared(verb string, args map[string]any, options map[string]string) error {
+	subverb, _ := args["subverb"].(string)
+	if subverb == "" || len(options) == 0 {
+		return nil
+	}
+	dispatchDescriptorsOnce.Do(func() { dispatchDescriptors = core.New(nil).DispatchDescriptors() })
+	descriptor, ok := descriptorNamed(dispatchDescriptors, verb)
+	if !ok || len(descriptor.Operations) == 0 {
+		return nil
+	}
+	known := false
+	for _, operation := range descriptor.Operations {
+		known = known || operation.Name == subverb
+	}
+	if !known {
+		return nil
+	}
+	declared := map[string]bool{}
+	var declaredOptions []string
+	for _, arg := range makeMCPOperation(descriptor, subverb).declaredArgs {
+		declared[arg.Name] = true
+		declaredOptions = append(declaredOptions, arg.Name)
+	}
+	for _, name := range sortedKeys(options) {
+		accepted := false
+		for _, candidate := range cliOptionArgumentNames(verb, name) {
+			accepted = accepted || declared[candidate]
+		}
+		if !accepted {
+			return fmt.Errorf("E_SELECTOR_INVALID: option --%s is not valid for %s %s%s", name, verb, subverb, optionDidYouMean(name, declaredOptions))
+		}
+	}
+	return nil
 }
 
 func splitComma(value string) []string {
