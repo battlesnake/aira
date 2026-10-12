@@ -1,6 +1,7 @@
 # AIRA goal-a small-faces batch: enum dispatch, TUI shutdown, confine listing and trailer, gate escaping
 
-Status: PLAN v1 (2026-10-12). Batch of small independent tickets in one change (owner rule:
+Status: PLAN v2 (2026-10-12), revised after plan review (Sol, high; second reviewer); see
+section 11, Review log. Batch of small independent tickets in one change (owner rule:
 batch small fixes, one review and test cycle). Tickets: AIRA-195 (listing-signal half only),
 AIRA-208, AIRA-210, AIRA-253, AIRA-293, AIRA-294, AIRA-299. Base: master `4098ad9`, whose code
 is identical to tag `v0.34` (`ec16b22`); the commits since touch only `.aira/` ticket files.
@@ -24,7 +25,7 @@ are used below.
 | AIRA-253 A cancel that lands before `app.Run()` has a screen leaves a live screen that nothing stops | Yes, measured | `coordinateShutdown` (`cmd/aira/tui.go:517-528`) calls `app.Stop()` from its own goroutine. tview v0.42 `Stop()` returns at once when `a.screen == nil` (pre-Run), and when a screen was injected it discards that screen. `Run()` then makes a **new** screen (`application.go:279-300`), and nothing will ever stop it. Probe (in-process: injected SimulationScreen, ctx cancelled, coordinator run to completion before `Run`, `TERM` unresolvable): `Run returned err=couldn't open terminfo ($TERM) file ...`. The injected screen was gone and Run tried to bring up a real terminal. In production (no injected screen) the pre-Run `Stop()` is a no-op, and `Run` brings up a screen whose pump, coordinator and signal loop have all exited. | Build |
 | AIRA-293 `confine --help` lists `confine-status`, but that spelling is refused | Yes, measured | `aira confine --help` lists `"verb":"confine-status"` (`confineHelpVerbs`, `cmd/aira/main.go:1529`). `aira confine-status` gives `E_UNKNOWN_VERB: unknown verb "confine-status"`, rc 2, from `buildRequest`'s default arm (`:3253`). The other four listed spellings (`confine-list/-kill/-budget/-dump`) are routed (`:375-403`). | Build (accept it) |
 | AIRA-294 `__supervise` with an unparseable `--ready-fd` writes to fd 0 and closes it | Yes, by code | `runSupervisor` (`cmd/aira/main.go:661-664`): `strconv.Atoi("x")` returns `0` with an error, and the malformed-arguments branch calls `writeSupervisorFailure(readyFD=0, ...)`, which wraps fd 0, writes JSON to it and closes it (`:752-762`). A **missing** `--ready-fd` takes the same path (`Atoi("")` is `0`). `readyForFailure := supervisorReadyFD(argv)` (`:642`, returns -1 here) is already in scope. | Build |
-| AIRA-299 Gate files escape `&`, `<`, `>` | Yes, measured | `aira gate add probe-gate ... --argv 'test 1 -lt 2 && echo "<ok>"'` wrote `"test 1 -lt 2 && echo \"<ok>\""` into `.aira/gates/probe-gate.json`. `RenderGate` uses `json.MarshalIndent` (`internal/gate/gate.go:225`). The canary writer `renderCanary` does the same (`internal/store/gate_write.go:23`), and canary `mutation_content` bodies are source code, full of `&` and `<`. No committed gate or canary file exists in aira or fastest-ee (checked), so no file on disk changes. | Build (gate and canary files) |
+| AIRA-299 Gate files escape `&`, `<`, `>` | Yes, measured | `aira gate add probe-gate ... --argv 'test 1 -lt 2 && echo "<ok>"'` wrote `"test 1 -lt 2 \u0026\u0026 echo \"\u003cok\u003e\""` into `.aira/gates/probe-gate.json`. `RenderGate` uses `json.MarshalIndent` (`internal/gate/gate.go:225`). The canary writer `renderCanary` does the same (`internal/store/gate_write.go:23`), and canary `mutation_content` bodies are source code, full of `&` and `<`. No committed gate or canary file exists in aira or fastest-ee (checked), so no file on disk changes. | Build (gate and canary files) |
 
 Nothing is dropped whole. Sub-items dropped or replaced are listed in section 7.
 
@@ -34,11 +35,12 @@ The bare-minimum build for each problem, solved alone and from nothing:
 
 - **195:** the data exists (`supervisor_live`). Give "running, but its supervisor is gone" its
   own LIVE word in the one table and the one `top` cell that hide it.
-- **208:** carry the curve that was actually installed into the trailer facet that already
+- **208:** carry the schedule that was actually armed into the trailer facet that already
   exists, and name a rejected schedule there. No new surface.
 - **210:** one check, in the one place every core-routed request passes (`Do`), driven by the
   declarations that already exist. It folds case, rewrites to the declared spelling, and
-  refuses naming the value and the set. Then delete the per-face copies.
+  refuses naming the value and the set. Then delete the two face copies (MCP, TUI palette).
+  Domain-layer checks stay as backstops for callers that do not pass through `Do`.
 - **253:** call `Stop()` only from inside tview's event loop. A queued update runs only once
   `Run()` is driving a live screen, so it cannot be lost to an early cancel. It also never runs
   after a failed screen init.
@@ -48,9 +50,11 @@ The bare-minimum build for each problem, solved alone and from nothing:
 - **299:** the AIRA-216 encoder (`SetEscapeHTML(false)`) in the two file writers. Leave the
   digests alone.
 
-The plan below is this minimum. Its consolidations delete code: four enum copies are removed;
-the subverb `"list"` handler arms become dead and are removed; one domain message formatter
-replaces two.
+The plan below is this minimum. v2 cut the v1 extras that the minimum does not need (review
+log, section 11): no shared domain message formatter, no change to finding-import or install
+messages, no deletion of rant's domain validation, no deletion of the handlers' `"list"` arms.
+The two face enum copies (MCP, palette) are removed, and `mv`'s and rant's declarations are
+built from the domain lists.
 
 | Item | Alternative | Why rejected |
 |---|---|---|
@@ -60,7 +64,7 @@ replaces two.
 | 208 | Separate `cpu-weight-curve=` facet | Two facets for one control. Keeping the enum as the leading token of the existing facet (`aging(...)`) leaves every substring/prefix reader working (checked: in-repo tests use `strings.Contains(..., "cpu-weight=aging")`; fastest-ee has one fixture string and no parser of this facet). |
 | 208 | List every step in the facet | Long, and the default curve is documented (section 3.2). The endpoints plus `wall=` answer RANT-32's question for the default. A custom schedule is the caller's own input. |
 | 208 | Refuse a bad schedule | The Slice-1 plan decided "never inert-by-accident": keep the compiled default. Only the silence changes. |
-| 208 | Report each step's write outcome | Steps are fail-open writes to an open scope fd. Recording each needs a result channel out of the decay goroutine for a failure seen nowhere. The facet claims "this curve was installed (its first write succeeded) and armed", no more. Written down as a gap. |
+| 208 | Report each step's write outcome | Steps are fail-open writes to an open scope fd. Recording each needs a result channel out of the decay goroutine for a failure seen nowhere. The facet claims "this schedule was armed: its first write succeeded and the decay goroutine was started", no more. Later step writes are discarded (`_ = write(scope, step.Weight)`, `confine_linux.go:2311`), so whether the scope actually reached any later weight is unevaluated, and the docs say so. Written down as a gap. |
 | 208 | An extra diagnostics line for a rejected schedule | The trailer already goes to stderr. One place, not two. |
 | 208 | `CPU-WT` column on `confine --list` | Deferred by the ticket. |
 | 210 | Widen the five subverb declarations with `"list"` (the ticket's suggestion for handler-accepted values) | Subverb enum values become MCP operations (`cmd/aira/mcp.go:138-146`), so `aira_finding`, `aira_spend`, `aira_quota`, `aira_test_report` and `aira_commands` would each gain a duplicate `list` operation, and help would advertise both spellings. Instead the CLI builders, which already lower-case the subverb, also map `list` to `ls`. No CLI spelling that works today is refused. |
@@ -68,7 +72,10 @@ replaces two.
 | 210 | Check in `daemonDispatcher.Dispatch` | It misses in-process `Do` callers (tests, the daemon's own handling). `Do` is the only caller of `spec.Run` (grep: `core.go:573`). |
 | 210 | A second call for `confine-log` (the one enum-bearing verb answered client-side, never via `Do`, `cmd/aira/dispatcher.go:183-185`) | Its runner check (`internal/runner/confine_log.go:96`) already names the value and explains the set, and every face reaches it through the same dispatcher arm, so faces agree. A second call site for one verb is not worth it. Recorded as the one exception. |
 | 210 | Reorder `MoveTicket` (`internal/store/mutate.go:69`, the ticket's `:58`) | Its only caller is the `mv` handler, which sits behind `Do`, so the new check refuses first. The same misreport on `set status=` comes from the shared write path `UpdateTicketContent` (`store.go:2328-2332`), which is fixed instead (3.3). |
-| 210 | Delete the ten handler-side `strings.ToLower(subverb)` folds | Not enforcement copies. After `Do` canonicalises they are no-ops. Deleting them changes no behaviour and adds risk if a future path reaches a handler another way. |
+| 210 | Delete the ten handler-side `strings.ToLower(subverb)` folds, or the handlers' `case "ls", "list":` aliases | Not enforcement copies. After `Do` canonicalises, the folds are no-ops and the `"list"` arms are unreachable. Deleting them changes no behaviour, is not needed for the fix, and adds risk if a future path reaches a handler another way. (v1 deleted the `"list"` arms; dropped in v2.) |
+| 210 | A shared exported domain formatter replacing `invalidFieldError` (the ticket's suggestion) | Not needed: `Do` formats its own refusal in the same shape (`<code>: <subject> "<value>" is invalid; allowed: a, b, c`), and `invalidFieldError` is left alone, so no ticket message changes and no refactor needs pinning. Dropped in v2. |
+| 210 | Delete rant's domain severity check (`internal/domain/rant.go:148-151`) | It is a domain backstop for any caller that does not pass through `Do`, not a face copy. Kept. Through `Do` it only ever sees a canonical value, so its text is unreachable from a face. Dropped from the plan in v2. |
+| 210 | Value-naming messages for findings import (`finding.go:182-184`) and `install --watchdog/--slice-ceiling` (`install.go:482-488`) | Neither path reaches `Do`, so neither is part of dispatch enforcement. Moved to a follow-up ticket (section 7). Dropped in v2. |
 | 210 | Exact-case matching | Would refuse `--severity Annoyance`, `--format GO-JSON` and `rant LS`, which work today (measured for the first). |
 | 253 | Retry `Stop()` until `Run()` returns | Polling. It also does not fix the injected-screen case: the first pre-Run `Stop()` already discarded the screen, so `Run()` tries to open a real terminal before any retry lands. That is the probe's failure, and on a developer's tty it would grab the terminal. |
 | 253 | Check `ctx.Err()` before `Run()` | A window remains between the check and `Run` taking tview's lock. Not deterministic. |
@@ -110,7 +117,13 @@ and is never reaped.
 
 JSON output is unchanged. No new probe, no new field, no actuator.
 
-### 3.2 AIRA-208: the installed curve on the trailer
+### 3.2 AIRA-208: the armed schedule on the trailer
+
+What the facet reports is the schedule that was **armed**: the start weight was written
+successfully and the decay goroutine was started with these steps. It does not report the
+trajectory: each later step write is fail-open and its result is discarded
+(`confine_linux.go:2311`), and intermediate steps are not listed. Whether a later weight was
+reached, or whether aging slowed a job, is unevaluated, and the docs say so.
 
 `internal/runner/confine_linux.go`:
 
@@ -119,7 +132,7 @@ JSON output is unchanged. No new probe, no new field, no actuator.
   The steps stay the compiled default, as today.
 - New method `(c cpuWeightConfig) curve() string`: `fmt.Sprintf("%d->%d@%s", c.Start,
   c.Steps[len(c.Steps)-1].Weight, c.Steps[len(c.Steps)-1].After)`, plus `",schedule-rejected"`
-  when `ScheduleRejected`. It is built from the **post-clamp** steps that are written, and the
+  when `ScheduleRejected`. It is built from the **post-clamp** steps handed to the decay goroutine, and the
   last step's weight is the floor (`:2219`). Durations print with `time.Duration.String()`, as
   the deadline facets do (`confine.go:1238`), so the default is `100->10@30m0s`.
 - Arming (`:846-851`): when the first write succeeds, also set
@@ -136,19 +149,22 @@ JSON output is unchanged. No new probe, no new field, no actuator.
 
 Docs: `internal/core/skill.go`, next to the trailer facets (`:329`), one sentence. Every confine
 scope ages `cpu.weight` from 100 to 10 over 30 minutes (steps at 10s, 30s, 1m, 5m, 10m, 30m).
-The trailer's `cpu-weight=aging(START->FLOOR@WHEN)` is the curve actually installed, with
-`,schedule-rejected` when `AIRA_CONFINE_CPUWEIGHT_SCHEDULE` did not parse and the default ran.
-Weight arbitrates between scopes only, so workers inside one scope share equally.
-`AIRA_CONFINE_CPUWEIGHT_FLOOR=100` turns aging off. The aitest worker scopes' static floor
-write (`worker_scope_linux.go:139`) is unchanged and not reported (deferred).
+The trailer's `cpu-weight=aging(START->FLOOR@WHEN)` is the schedule armed (start weight
+written, decay started), with `,schedule-rejected` when `AIRA_CONFINE_CPUWEIGHT_SCHEDULE` did
+not parse and the default ran. Later step writes are not checked, so whether the scope reached
+a given weight is not reported. Weight arbitrates between scopes only, so workers inside one
+scope share equally. `AIRA_CONFINE_CPUWEIGHT_FLOOR=100` turns aging off; the decay is still
+armed with a flat curve, so the facet then reads `aging(100->100@30m0s)`, not a separate `off`
+token. The aitest worker scopes' static floor write (`worker_scope_linux.go:139`) is unchanged
+and not reported (deferred). The existing ci-shim sentence (`skill.go:327`) is **not** edited
+in this batch (section 7).
 
 ### 3.3 AIRA-210: one enum check in `Do`
 
-**Shared formatter.** `internal/domain` gains `EnumValueError(code, subject, value string,
-allowed []string) error`, which returns `"<code>: <subject> %q is invalid; allowed: a, b, c"`.
-It is the exact shape of today's `invalidFieldError` (`ticket.go:209-211`), which is deleted.
-Its three callers (`:227/:230/:233`) pass `CodeTicketInvalid, "ticket "+field`, so their text is
-byte-identical to today (pinned).
+**No shared formatter (v2).** `Do`'s refusal is formatted in `internal/core` in the same shape
+as today's ticket `invalidFieldError` (`internal/domain/ticket.go:209-211`):
+`"<code>: <subject> %q is invalid; allowed: a, b, c"`. `invalidFieldError` and its callers are
+not touched, so every ticket-validation message is unchanged and no refactor needs pinning.
 
 **The check.** `internal/core` (new file `enum_args.go`): `canonicalEnumArgs(spec verbSpec, in
 map[string]any) (map[string]any, error)`. For each `spec.Args` entry with `len(Enum) > 0` whose
@@ -160,10 +176,10 @@ key is present in `in` with a non-nil value:
 - otherwise the first member equal under `strings.EqualFold` to the trimmed value is written
   back in its **declared** spelling; no match: refuse.
 
-A refusal is `domain.EnumValueError("E_ARGUMENT_INVALID", spec.Name+" "+arg.Name, raw,
-arg.Enum)`. `raw` is the value exactly as received (untrimmed, unfolded), `spec.Name` is the
+A refusal is `E_ARGUMENT_INVALID: <spec.Name> <arg.Name> "<raw>" is invalid; allowed: <arg.Enum
+joined by ", ">`. `raw` is the value exactly as received (untrimmed, unfolded), `spec.Name` is the
 canonical verb, and `arg.Name` is the declared name (as MCP names it). The function writes into
-a shallow copy, so the caller's map is never mutated. Measured examples:
+a shallow copy, so the caller's map is never mutated. Target text (not yet built):
 `E_ARGUMENT_INVALID: mv status "in_progress" is invalid; allowed: draft, planned, in-progress,
 in-review, done, retired, superseded` and `E_ARGUMENT_INVALID: rant severity "P1" is invalid;
 allowed: papercut, annoyance, blocker`.
@@ -178,25 +194,44 @@ route), so every face inherits it.
 
 - `cmd/aira/mcp.go:623-629`: the enum block in `decodeMCPValue`. The type checks stay. An MCP
   enum fault now reaches `Do` and comes back as an ordinary tool result (`isError:true`) with
-  the shared text, not a JSON-RPC `-32602`. The tool schema keeps advertising `enum`.
+  `Do`'s text, not a JSON-RPC `-32602`. The tool schema keeps advertising `enum`.
 - `cmd/aira/tui_palette.go:174-176`: the palette's pre-check. A bad value is submitted, and the
   palette shows `Do`'s refusal.
-- `internal/domain/rant.go:149-151`: the severity fold and check. `AddRant`'s only caller is the
-  rant handler behind `Do` (grep). The SQLite `CHECK` (`store.go:938`) remains the storage
-  backstop. The rant declaration (`core.go:794`) is built from `domain.RantSeverity*`
-  constants, so the domain constants and the declaration are one list.
+
+**Kept, not deleted (v2).** Rant's domain severity fold and check (`internal/domain/rant.go:148-151`)
+stays as a domain backstop for any caller that does not pass through `Do`; through `Do` it only
+sees canonical values. The SQLite `CHECK` (`store.go:938`) remains the storage backstop.
+
+**One list per enum.**
+
+- The rant declaration (`core.go:794`) today spells its severities as **string literals**
+  (`"papercut", "annoyance", "blocker"`), not domain constants. It is changed to
+  `string(domain.RantSeverityPapercut), ...` so the declaration and the domain constants are
+  one list, and a test pins the SQLite `CHECK` to it (ticket: pin, do not make the DDL dynamic).
 - `mv`'s hand-written status list (`core.go:1686`) becomes `domain.AllowedStatusStrings()...`
   (same order).
 
 **No CLI spelling is narrowed.** `cmd/aira/main.go` `buildRequest`: in the `find` (`:2884`),
 `spend` (`:2958`), `quota` (`:2990`) and `test-report` (`:3037`) arms, which lower-case
 `positional[0]` and accept `list` today, the subverb is mapped `list -> ls` before it is stored.
-The `"list"` arms in the core handlers become unreachable and are removed: rant `:839`, find
-`:1130`, spend `:1289`, quota `:1363`, test-report `:1396`, `command.go:348`. MCP never sends
-`list` (operations come from the declarations), and the CLI `rant` arm already maps it.
+The handlers' `case "ls", "list":` arms (rant `:839`, find `:1130`, spend `:1289`, quota
+`:1363`, test-report `:1396`, `command.go:348`) become unreachable through `Do` and are **left in
+place** (v2; section 2). MCP never sends `list` (operations come from the declarations), the CLI
+`rant` arm already maps it, and the CLI `commands` arm already accepts only `ls|count`
+(`main.go:2686`).
+
+**CLI subverb faults are refused before `Do` (pre-existing, unchanged).** The CLI builders
+reject an unknown subverb with their own text before any request exists (for example `find
+requires add|ls|show|set`, `main.go:2882/2917`; likewise `req`, `spend`, `quota`, `test-report`,
+`commands`, `git`, `gate`). Those texts are kept. A subverb is never caller-supplied on MCP
+(`mcp.go` injects it from the binding), so no cross-face disagreement arises from them. The
+"one text on every face" claim (invariant 2) covers values that reach `Do`.
 
 **Declaration audit (constraint b).** Before the check is added, the builder records, for each
-of the 41 declarations, the handler-accepted set against the declared set, in the build record.
+enum-bearing declaration (41 by the planning probe and by a lexical grep of `stringSpec` calls
+with an enum tail; one reviewer counted 40; the audit test prints the real number and the build
+record carries that printed number, not either estimate), the handler-accepted set against
+the declared set, in the build record.
 Planning checked `commands.by` (store `valid` map = declaration), `run.report_stream`
 (`run_wiring.go:318-339` = declaration), `test-report.format` (`testreport_parse.go:236-238`),
 `create.kind/severity`, `mv.status`, `rant.severity`, `link/unlink.kind` (all 11 declared kinds
@@ -204,7 +239,7 @@ are known; the five inverse kinds are accepted by the vocabulary and refused by 
 AIRA-291's forward-command message, which must survive), and the subverbs. The only mismatch
 found is the `list` alias, handled above. If the audit finds another, widen the declaration.
 
-**Non-dispatch paths keep their own checks, with the shared text.**
+**Non-dispatch paths.**
 
 - `internal/store/store.go:2328-2332` (`UpdateTicketContent`): move the transition check
   **after** `domain.RenderTicket` (`:2333`), which validates the ticket. `aira set X
@@ -212,13 +247,10 @@ found is the `list` alias, handled above. If the audit finds another, widen the 
   allowed: ...` (exit 2), and `E_TRANSITION_INVALID` is left for a legal token on a forbidden
   edge. `MoveTicket`'s own pre-check (`mutate.go:69`) stays: it is what refuses a same-status
   `mv`.
-- `internal/domain/finding.go:182-184`: split the collapsed `finding enum is invalid` into three
-  `EnumValueError("E_FINDING_INVALID", "finding severity|verdict|disposition", ...)` calls
-  (`:209` included). These are reached by findings import, which bypasses dispatch.
-- `internal/install/install.go:482-488`: install is intercepted before any request exists
-  (`main.go:77`), so its parser stays the enforcer. Its two messages become
-  `domain.EnumValueError(CodeArgumentInvalid, "install --watchdog"|"install --slice-ceiling",
-  value, []string{"off","observe","enforce"})`, which names the value.
+- Findings import (`internal/domain/finding.go:182-184`, collapsed `finding enum is invalid`) and
+  `install --watchdog/--slice-ceiling` (`internal/install/install.go:482-488`; install is
+  intercepted before any request exists, `main.go:77`) keep their enforcement **and** their
+  current text in this batch. Making them name the value is a follow-up ticket (section 7).
 - `confine-log --stream` keeps its runner check (section 2).
 
 ### 3.4 AIRA-253: stop from inside the event loop
@@ -232,13 +264,28 @@ pump) and the existing `appRunDone` pre-check, replace `r.app.Stop()` with
   draws, enters its loop, and runs `Stop()`. `Run()` returns `nil`. Deterministic exit, no dead
   screen.
 - Cancelled while `Run()` is live (q, SIGINT, SIGTERM): same as today. The stop now runs on the
-  loop goroutine instead of the coordinator's.
+  loop goroutine instead of the coordinator's, at the loop's next update.
+- A foreground execute holds the loop, by design and unchanged: `executeLaunchOnUIGuarded` runs
+  on the UI goroutine and blocks on `Press Enter to return to AIRA…` (`cmd/aira/tui.go:1465`),
+  and `runTUISignalLoop` swallows SIGINT/SIGTERM while it runs (`tui_execute.go:541`). A
+  queued stop therefore cannot run there; it runs when the operator returns and the loop takes
+  its next update. Today's coordinator also waits for the executor first (`r.executor.wait()`),
+  so this is not a regression. The guarantee is narrowed accordingly (invariant 8).
 - `Run()` failed at screen init (AIRA-134): the loop never runs, so `Stop()` never touches the
   uninitialised screen, whatever the timing. The pre-check still skips the queue in the common
   order (Run returned before the cancel), so no goroutine is left waiting.
 - `Run()` exits by itself after the update is queued (for example tview's built-in Ctrl-C
-  `Stop`): the helper goroutine stays blocked on `QueueUpdate`'s reply in a process that is
-  exiting. This is the same accepted, abandonable pattern as the pump (`:418-424`).
+  `Stop`), or returns in the window between the `appRunDone` pre-check (`:522-526`) and the
+  queueing: the helper goroutine stays blocked on `QueueUpdate`'s reply (tview v0.42.0
+  `application.go:876-880`) in a process that is exiting. This is the same accepted, abandonable
+  pattern as the pump (`:418-424`). The doc comment says so in one sentence. Consequence for
+  tests: an in-process test that builds many runtimes can accumulate these goroutines, so any
+  goroutine-leak check must exclude a goroutine parked in `QueueUpdate`.
+
+Verified against tview v0.42.0 source (second reviewer): `updates` is a 100-deep buffered channel
+made in `NewApplication` (`:140`); `update.f()` runs with no lock held (`:509-513`); `Stop()`
+takes the lock itself (`:624-634`), and its `screenReplacement <- nil` ends the event goroutine
+(`:351-355`). A pre-Run queued `Stop` therefore ends `Run()` with `nil`.
 
 The doc comment is rewritten. `appRunDone` remains, as the pre-check only; its "Stop is unsafe
 after Run" role is now structural.
@@ -279,7 +326,7 @@ output equals `json.MarshalIndent` except for the three characters. It is export
 
 1. `definition_digest` and `declaration_digest` do not change. Both hash `json.Marshal` of the
    parsed struct (`digest.go:24,31`), with default escaping, independent of the file's bytes.
-   `ParseGate` decodes `&` and `&` to the same Go string. Existing attestations and proofs
+   `ParseGate` decodes `\u0026` and `&` to the same Go string. Existing attestations and proofs
    stay valid. Pinned by golden digests computed on `4098ad9`.
 2. Subject tree digests. Gate and canary files are inside every gate subject (only
    `.aira/tickets/` and `.aira/findings/` are excluded, `internal/gate/canary.go:227`). A gate or
@@ -299,8 +346,11 @@ the attestation chain is untouched.
    things: absent (or empty and optional); a case-insensitive member rewritten to its declared
    spelling; or refused `E_ARGUMENT_INVALID` naming the verb, the argument, the value as typed
    and the whole declared set.
-2. One fault, one refusal text, on the CLI, MCP and TUI faces (the text is `Do`'s). `confine-log
-   --stream` is the documented exception: its own text, the same on every face.
+2. For a value that reaches `Do`, one fault gives one refusal text on the CLI, MCP and TUI
+   faces (the text is `Do`'s). Not covered: CLI subverb faults, which the CLI builders refuse
+   before a request exists, with their own pre-existing text (3.3; a subverb is never
+   caller-supplied on MCP); and `confine-log --stream`, which keeps its own text, the same on
+   every face.
 3. No CLI spelling accepted on `4098ad9` for a subverb is refused (`list` is preserved). For
    non-subverb enums the CLI now refuses exactly what MCP refused, except that matching is
    case-insensitive on both.
@@ -309,11 +359,15 @@ the attestation chain is untouched.
 5. `E_TRANSITION_INVALID` is returned only for two known statuses on a forbidden edge.
 6. `LIVE=unsupervised` appears only when the subtree is populated **and** the supervisor read
    `ESRCH`. An unestablished supervisor makes no claim (`yes`). The JSON is unchanged.
-7. The `cpu-weight` facet reports the curve actually installed (after clamping and the floor
-   overwrite), only when the first write succeeded. A rejected schedule is named, and the
-   compiled default still runs. An unknown curve reads `unevaluated`.
-8. The TUI coordinator never calls `app.Stop()` outside tview's event loop. A cancellation at any
-   time ends `Run()`, and a `Run()` that failed at screen init is never stopped.
+7. The `cpu-weight` facet reports the schedule **armed** (after clamping and the floor
+   overwrite), only when the first write succeeded. It makes no claim about later step writes
+   or the weight actually reached. A rejected schedule is named, and the compiled default still
+   runs. An unknown curve reads `unevaluated`.
+8. The TUI coordinator never calls `app.Stop()` outside tview's event loop. A cancellation ends
+   `Run()` at the event loop's next update, including a cancellation that lands before `Run()`
+   has a screen. A foreground execute holds the loop (and swallows SIGINT/SIGTERM) until the
+   operator returns, as today, so the stop runs after it. A `Run()` that failed at screen init is
+   never stopped.
 9. `aira confine-status [sel]` and `aira confine --status [sel]` give byte-identical stdout,
    stderr and exit for the same arguments and environment.
 10. `__supervise` never writes to or closes an fd it did not parse as a non-negative
@@ -331,9 +385,13 @@ test runs in `make ci`.
 
 - `TestEveryDeclaredEnumIsEnforcedAtDispatch`: walk `New(nil).verbs`. For each enum-bearing
   arg, `Do` with only `{arg: "__not-a-member__"}` must return `E_ARGUMENT_INVALID`, exit 2, with
-  text containing `spec.Name`, `arg.Name`, `"__not-a-member__"` and every declared value. A nil
-  store makes any handler call panic, so the test also proves no handler ran. RED today for all
-  41. Mutations: skip `subverb` args (12 RED); check only `Required` args (RED); compare
+  text containing `spec.Name`, `arg.Name`, `"__not-a-member__"` and every declared value. The
+  proof that the check ran first is that code and exit: `E_ARGUMENT_INVALID`, exit 2. A nil store
+  is **not** relied on to prove no handler ran: some handlers type-assert the store and return
+  their own error instead of panicking (rant returns `E_RANT_INVALID: rant store is unavailable`,
+  `core.go:818-821`). Each case recovers a panic and records it as "not refused", so one
+  panicking handler cannot abort the walk. The test prints the number of enum-bearing args it
+  walked (section 3.3). RED today for every one. Mutations: skip `subverb` args (12 RED); check only `Required` args (RED); compare
   case-sensitively (next test RED).
 - `TestEnumValuesCanonicalisedAtDispatch` (unit on `canonicalEnumArgs`): for every declared
   value `v`, `strings.ToUpper(v)` and `" "+v+" "` come back as exactly `v`. The input map is
@@ -357,16 +415,20 @@ test runs in `make ci`.
   MCP's `decodeMCPValue` enum block (MCP returns `-32602`, RED); keep the palette check (RED).
 - `TestRantSeverityOneList`: the rant declaration's enum equals `{papercut, annoyance, blocker}`
   built from the `domain.RantSeverity*` constants, and the `rants` table SQL from
-  `sqlite_master` contains `CHECK(severity IN ('',` plus those values in order.
+  `sqlite_master` contains `CHECK(severity IN ('',` plus those values in order. This is a
+  three-way agreement pin (GREEN today, as the ticket asks); mutation: change one domain
+  constant or one DDL value (RED).
 - `set X status=in_progress` gives `E_TICKET_INVALID: ticket status "in_progress" is invalid;
   allowed: ...`, exit 2 (RED today). `set X status=done` from planned still gives
   `E_TRANSITION_INVALID` with the legal-next list (twin). Mutation: leave the transition check
   before `RenderTicket` (RED).
-- Ticket messages are byte-identical to today: `create --severity P9` gives `E_TICKET_INVALID:
-  ticket severity "P9" is invalid; allowed: P0, P1, P2, P3` (pins the formatter refactor).
-- Findings import with severity `P9`, verdict `maybe`, disposition `gone`: each refusal names its
-  field, value and set (RED today: `finding enum is invalid`).
-- `install --watchdog bogus` names `"bogus"` and the three modes (RED today).
+- `create --severity P9` is now refused at dispatch: `E_ARGUMENT_INVALID: create severity "P9"
+  is invalid; allowed: P0, P1, P2, P3`, exit 2 (today `E_TICKET_INVALID: ticket severity "P9"
+  ...`, from domain validation). v1 also required the old `E_TICKET_INVALID` text on this call,
+  which contradicted the dispatch check; dropped. The domain ticket-validation text is not
+  changed (no formatter refactor) and is still exercised through `set X status=in_progress`
+  above. Existing tests that pin `E_TICKET_INVALID` for a bad `create` enum through a face are
+  updated to the dispatch text, and the update is listed in the build record.
 
 **AIRA-253** (`cmd/aira`):
 
@@ -378,6 +440,10 @@ test runs in `make ci`.
   terminfo error (measured).
 - Mutations: restore the direct `r.app.Stop()` (RED). `TestTUIScreenInitFailureExitsCleanlyWithoutPanic`
   (AIRA-134, subprocess) and the existing smoke and quit tests stay GREEN.
+- Skip evidence: a `t.Skip` keeps `make ci` at exit 0, so exit 0 alone is not evidence. The
+  build record quotes `go test -v -count=1 -run 'TestTUICancelBeforeRunStillExits' ./cmd/aira/`
+  from the gate machine showing `--- PASS`. A `--- SKIP` there means AIRA-253's coverage is
+  unevaluated on that machine, and the build is not described as covered.
 - Accepted gap: the production variant (no injected screen, real terminal) cannot be reached
   safely in CI without allocating a pty. The in-process test exercises the same coordinator
   decision.
@@ -400,7 +466,7 @@ test runs in `make ci`.
 - `confineCPUWeightConfig` with `SCHEDULE=garbage`: `ScheduleRejected` is true **and** the steps
   equal the clamped compiled default. The curve ends `,schedule-rejected` (first half RED today;
   second half pins the fail-safe).
-- `SCHEDULE=1s:100,2s:50`, no FLOOR: curve `100->10@2s` (the installed floor overwrite).
+- `SCHEDULE=1s:100,2s:50`, no FLOOR: curve `100->10@2s` (the armed floor overwrite).
   Mutation: build the curve from the unclamped parse (RED).
 - `FLOOR=100`: every step weight is 100 and the curve is `100->100@30m0s` (the kill switch, at
   config level).
@@ -432,8 +498,8 @@ test runs in `make ci`.
 **AIRA-299** (`internal/gate`, `internal/store`):
 
 - `RenderGate` on a definition whose argv, name and description hold `a && b < c > d` writes
-  those characters literally, and the bytes contain no `&`, `<`, `>` (RED
-  today). The output equals `json.MarshalIndent` for a definition with no such characters
+  those characters literally, and the bytes contain none of the escape sequences `\u0026`,
+  `\u003c`, `\u003e` (RED today). The output equals `json.MarshalIndent` for a definition with no such characters
   (byte-for-byte; guards indentation and newlines).
 - `renderCanary` with `mutation_content` `if a < b && c > d {}`: same (RED today).
 - Golden digests: for a fixed definition and a fixed canary containing `&<>`, `DigestGate` and
@@ -448,14 +514,17 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race 
 ## 6. Expected yield
 
 - A mistyped token anywhere (`mv X in_progress`, `--severity P1`, `--kind tickets`) is refused
-  naming what was typed and what is allowed, in the same words on every face. 41 declarations
-  stop being decoration on the CLI. `req ls --status Bogus` no longer silently returns nothing.
+  naming what was typed and what is allowed, in the same words on every face (for values that
+  reach `Do`; CLI subverb typos keep the builders' existing text). The enum declarations stop
+  being decoration on the CLI. `req ls --status Bogus` no longer silently returns nothing.
 - `E_TRANSITION_INVALID` (exit 1) again means only "a forbidden move", not "I could not read
   your status".
 - An operator who kills an outer gate can find its still-running nested legs: `confine --list`
   and `aira top` say `unsupervised` instead of `yes`.
-- The next RANT-32-style question ("did aging starve this job?") is answerable from the CI log:
-  the trailer carries the curve, and a mistyped schedule is visible.
+- Part of the next RANT-32-style question is answerable from the CI log: which aging schedule
+  was armed for this job, and whether a mistyped schedule was replaced by the default. Whether
+  aging actually starved the job is **not** answerable from the trailer (later step writes are
+  unchecked and no CPU measurement is added); that stays unevaluated.
 - `aira tui/top/board` cannot be left on a dead screen by an early Ctrl-C or SIGTERM.
 - `confine --help` no longer lists a spelling that fails.
 - `__supervise` can no longer close its own stdin on a malformed call.
@@ -468,9 +537,10 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race 
 | AIRA-195 remainder: a faster reaper state for "populated, supervisor dead", group-kill reaching self-confined siblings, AIRA-194's zero-reserve orchestrator | Out of the brief (listing signal only). The ticket stays open for them; this batch removes AIRA-194's "orphans are invisible" precondition only for the human faces (JSON already had it). |
 | `CPU-WT` column on `confine --list`; aitest worker scopes' static floor on any surface; a `cpu_weight` key in the AIRA-281 summary file | Ticket defers the column; the other two are new surfaces. |
 | AIRA-208: per-step write outcomes | Accepted gap (2). |
-| AIRA-210: deleting handler-side subverb folds; `confine-log --stream` routed through the shared check | Section 2. |
+| AIRA-210: deleting handler-side subverb folds and the handlers' `"list"` arms; a shared exported domain formatter; deleting rant's domain severity check; `confine-log --stream` routed through the shared check | Section 2. Not needed for dispatch enforcement. |
+| AIRA-210 remainder: findings import (`finding enum is invalid`, `finding.go:182-184`) and `install --watchdog/--slice-ceiling` (`install.go:482-488`) naming the value and the set | Neither path reaches `Do`. Split out of this batch (plan review). At build time, file a follow-up ticket linked to AIRA-210 carrying both, so closing AIRA-210 does not lose them. |
 | AIRA-210 (ticket's `mutate.go:58` reorder) | Replaced by the `UpdateTicketContent` reorder, the shared write path. |
-| Skill text says ci-shim trailers read `cpu-weight=unevaluated` (`skill.go:327`); by code the shim shares `confineWithDeps`'s initial status (`confine_linux.go:462-466`) and never sets the weight, so it prints `unavailable` | Observed by code reading only, not run in a shim. The 3.2 sentence states `unavailable` for cpu-weight. The other facets in that sentence are unverified; suggest a ticket. |
+| Skill text says ci-shim trailers read `cpu-weight=unevaluated` (`skill.go:327`); by code the shim shares `confineWithDeps`'s initial status (`confine_linux.go:462-466`) and never sets the weight, so it would print `unavailable` | Observed by code reading only, not run in a shim. **Not edited in this batch** (v1 proposed changing the word; dropped in v2: replacing one unverified word with another is not a fix). The whole sentence, all its facets, goes to a follow-up ticket filed at build time, whose first step is to run one shim trailer. |
 | AIRA-253 production variant under a real pty | Accepted test gap (section 5). |
 
 ## 8. Risks
@@ -478,8 +548,8 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race 
 - **Exit and code changes (210).** `mv` with a bad status and `link`/`unlink` with an unknown
   kind move from exit 1 (`E_TRANSITION_INVALID`, `E_RELATION_INVALID`) to exit 2
   (`E_ARGUMENT_INVALID`). `set status=<bad>` moves from exit 1 to exit 2 (`E_TICKET_INVALID`).
-  Rant severity, grep kind/by, and the TUI palette move to `E_ARGUMENT_INVALID` (exit 2
-  throughout). Peers were not grepped for these exact codes. They are usage errors that only a
+  Rant severity, `create --kind/--severity` (from `E_TICKET_INVALID`), grep kind/by, and the
+  TUI palette move to `E_ARGUMENT_INVALID` (exit 2 throughout). Peers were not grepped for these exact codes. They are usage errors that only a
   typo reaches.
 - **MCP error channel (210).** An enum fault becomes a tool result with `isError:true` instead of
   a JSON-RPC `-32602`. MCP clients show both. Any test pinning `outside its closed enum` is
@@ -497,15 +567,17 @@ Gate: `aira confine -- make ci` (the gate's exact command), plus `go test -race 
   space would miss: none found in aira, fastest-ee or stoner.
 - **TUI shutdown (253).** The stop moves to the loop goroutine. Review should confirm that no
   path blocks the event loop forever while a stop is queued; the executor and pump are joined
-  before queuing, as today.
+  before queuing, as today. Known and unchanged: a foreground execute blocks the loop on
+  `Press Enter` with signals swallowed, so the stop waits for the operator (3.4, invariant 8).
 - **Skill text** (208's sentence) needs a separate `aira skill install ~/.claude/skills/aira
   --force` at release.
 
 ## 9. Stable codes
 
 No new codes. `E_ARGUMENT_INVALID` (exit 2, already catalogued, already MCP's code) is now
-emitted by `Do` for every declared-enum fault on every face. `E_TICKET_INVALID`,
-`E_FINDING_INVALID` and `E_INSTALL_ARGUMENT_INVALID` keep their codes with value-naming text.
+emitted by `Do` for every declared-enum fault that reaches it, on every face. `E_TICKET_INVALID`,
+`E_FINDING_INVALID` and `E_INSTALL_ARGUMENT_INVALID` keep their codes and their current text in
+this batch.
 `E_TRANSITION_INVALID` keeps its code, with a narrower meaning (invariant 5).
 `confine-status` refusals reuse `E_CONFINE_ARGUMENT_INVALID` and the codes `confine --status`
 already returns. AIRA-195 adds the LIVE token `unsupervised`. AIRA-208 adds the facet suffix
@@ -521,3 +593,28 @@ speed, naming these changes:
 - `LIVE=unsupervised`;
 - exit 1 to exit 2 for `mv`, `link` and `set status` token typos;
 - MCP enum faults now arriving as tool errors.
+
+## 11. Review log (v1 -> v2)
+
+Two plan reviews of v1 (Sol at `high`, and a second reviewer). Each finding was checked against
+the code on `4098ad9` before it was accepted or rejected.
+
+| # | Finding | Check | Disposition |
+|---|---|---|---|
+| S1 | `create --severity P9` is required to give both `E_ARGUMENT_INVALID` (dispatch) and the old `E_TICKET_INVALID` (formatter pin): contradictory | `create` declares `severity` with `domain.AllowedSeverityStrings()` (`core.go:785`), so `Do` refuses first | Accepted. The formatter refactor is dropped, so nothing needs that pin; the test now expects the dispatch text (section 5). |
+| S2 | The gate test requires `&<>` written literally, then forbids those same bytes | The v1 file held literal `&`, `<`, `>` where the JSON escapes `&`, `<`, `>` were meant (three places: section 1 row, 3.7 item 1, section 5) | Accepted. The escapes are restored; the test forbids the escape sequences. |
+| S3 | "A cancellation at any time ends `Run()`" is too broad: a foreground execute blocks the UI goroutine on `Press Enter`, and SIGINT/SIGTERM are swallowed while it runs | Verified: `cmd/aira/tui.go:1465` (on the UI goroutine via `executeLaunchOnUIGuarded`), `tui_execute.go:541` | Accepted. Invariant 8, 3.4 and section 8 narrowed. No code change for that path: it is by design, and today's coordinator also waits for the executor. |
+| S4 | The CPU facet can only report an armed schedule, not the trajectory or starvation | Verified: later step writes are discarded (`confine_linux.go:2311`) | Accepted. Facet meaning, skill sentence, invariant 7 and the yield bullet now say "armed", with later steps unevaluated. No new facet token: the facet never claims later steps, and the docs say they are unchecked. |
+| S5 | Removable scope: shared formatter, finding/import and install messages, deleting handler `list` aliases, deleting rant's domain validation | Each is outside dispatch enforcement | Accepted, all five dropped (section 2 table, section 7). Findings/install messages go to a follow-up ticket filed at build time. "Split into separate changes" is **not** adopted: the owner's rule is to batch small independent fixes into one change with one review cycle; separate commits per ticket are a build detail. |
+| S6 | From-scratch minimum is seven small patches | Compared item by item | Accepted as the yardstick. Two items stay above it, both from the ticket: `mv`'s and rant's declarations built from the domain lists (one list per enum), and the `UpdateTicketContent` reorder (the ticket's `mv` misreport, on the `set` path). |
+| S7a | The rant declaration uses string literals, not domain constants | Verified: `core.go:794` spells `"papercut", "annoyance", "blocker"` | Accepted. v1's claim was wrong; v2 changes the declaration to the constants (3.3). |
+| S7b | "Identical refusal text everywhere" is overstated: CLI builders already reject unknown subverbs before `Do` | Verified: e.g. `find requires add\|ls\|show\|set` (`main.go:2882/2917`), likewise `req`, `spend`, `quota`, `test-report`, `commands`, `gate` | Accepted. Invariant 2 and the yield now cover values that reach `Do`; builder texts are kept and recorded as out of scope. |
+| S8 | `t.Skip("unevaluated...")` leaves `make ci` at exit 0, a false pass | True of `go test` | Accepted. The build record must quote a `-v` run showing `--- PASS` (section 5). |
+| R1a | "A nil store makes any handler call panic" is false (rant type-asserts and returns `E_RANT_INVALID`) | Verified: `core.go:818-821` | Accepted. The proof is the code and exit; each case recovers panics. |
+| R1b | 40 enum declarations, not 41 | A lexical grep of `stringSpec` calls with an enum tail finds 41 (12 `subverb`); v1's probe also said 41 | Partly accepted: the count is unsettled between reviewers, so the audit test prints it and the build record carries the printed number. |
+| R2 | `FLOOR=100` "turns aging off" while the facet still reads `aging(100->100@30m0s)` | Verified: `confineCPUWeightConfig` still arms a flat curve | Accepted. The skill sentence says so. |
+| R3 | Do not change the ci-shim skill word (`skill.go:327`) on an unrun code reading | Agreed | Accepted. Not edited; follow-up ticket whose first step is a real shim trailer. |
+| R4 | The window between the `appRunDone` pre-check and the queued stop can leave one goroutine parked in `QueueUpdate` | Consistent with tview v0.42.0 `application.go:876-880` as cited | Accepted. One sentence in the doc comment; leak checks must exclude it (3.4). |
+
+No finding was rejected outright. Partial dispositions: S5 (batching kept), S4 (no facet marker),
+R1b (count left to the audit).
