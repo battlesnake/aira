@@ -93,7 +93,17 @@ func (d *daemonDispatcher) doStoreOpExchange(ctx context.Context, frame daemon.S
 }
 
 func (d *daemonDispatcher) spawnDaemon() (<-chan childResult, error) {
-	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader(), d.environment()) {
+	if service, managed := daemon.ManagedServiceForState(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader()); managed {
+		if service.SocketPath != d.paths.SocketPath {
+			// The enabled service owns this state.db and serves it where this
+			// client cannot reach. A daemon forked here would win the state lock,
+			// the service would lose it and be restarted every 2 s, and every
+			// correctly configured client would be refused: refuse instead
+			// (AIRA-289). The state lock only ever fences a RUNNING daemon.
+			return nil, fmt.Errorf("aira-daemon.service serves this state at %s, which this process (looking at %s, XDG_RUNTIME_DIR %s) cannot reach; "+
+				"start the service or run with its XDG_RUNTIME_DIR (a gate command that calls aira needs it in env_allow)",
+				service.SocketPath, d.paths.SocketPath, d.runtimeDirForMessage())
+		}
 		done := make(chan childResult, 1)
 		_, err := d.systemctl()([]string{"systemctl", "--user", "start", daemon.DefaultServiceUnit})
 		if err != nil {
@@ -748,6 +758,11 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 	if err := os.MkdirAll(d.paths.RuntimeDir, 0o700); err != nil {
 		return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: %w", daemon.CodeUnavailable, err))
 	}
+	// The daemon lock lives beside state.db (AIRA-289), whose directory a fresh
+	// machine may not have yet.
+	if err := os.MkdirAll(filepath.Dir(d.paths.LockPath), 0o700); err != nil {
+		return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: %w", daemon.CodeUnavailable, err))
+	}
 	// One loop interleaves two ways to succeed: (a) connect to a daemon a racing
 	// client already started, or (b) win the startup lock and start one ourselves.
 	// A client that cannot win the lock — because a bound daemon (or another
@@ -836,10 +851,90 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 		return daemon.ResponseFrame{}, err
 	}
 	err = errors.New(daemon.CodeTimeout + ": daemon did not accept before deadline")
+	if !spawned {
+		// This client never won the lock, so someone else holds it: say who, and
+		// whether that holder listens where this client looked.
+		err = d.lockHolderError(err)
+	}
 	if requestNotSent {
 		err = &daemon.RequestNotSentError{Err: err}
 	}
 	return daemon.ResponseFrame{}, err
+}
+
+// lockHolderError words the start-wait failure of a client that never won the
+// daemon lock (AIRA-289). The lock is per state directory, so its holder serves
+// this state's database; the daemon records the socket it serves in the lock
+// file. A holder whose recorded socket is not this client's is a daemon the
+// client can never reach from here (a different XDG_RUNTIME_DIR): that is
+// E_DAEMON_UNAVAILABLE and it names both sockets. Anything else, a holder that
+// listens where this client looked but has not bound yet (a restart, a slow
+// database open) or one that recorded nothing, stays the plain timeout with the
+// holder's PID added. Only this client's own socket is dialled, never the recorded path.
+func (d *daemonDispatcher) lockHolderError(timeout error) error {
+	// A FILE at the client's socket path is not a daemon: a stray killed
+	// uncleanly leaves its socket file behind, under the state directory when
+	// XDG_RUNTIME_DIR is unset, across reboots. Only a socket that answers
+	// (Ready) means this client can reach something.
+	status := daemon.Status(d.paths)
+	if status.Ready || !status.Running || status.Lock.PID <= 0 {
+		return timeout
+	}
+	holder := status.Lock.Socket
+	if holder != "" && holder != d.paths.SocketPath {
+		return mismatchedRuntimeError(d.paths, status.Lock.PID, holder, d.runtimeDirForMessage())
+	}
+	return fmt.Errorf("%w; the daemon lock is held by pid %d, which has not bound %s yet", timeout, status.Lock.PID, d.paths.SocketPath)
+}
+
+// mismatchedRuntimeError is the one wording for "this state's daemon listens
+// somewhere this process cannot reach" (AIRA-289).
+func mismatchedRuntimeError(paths daemon.Paths, pid int, holderSocket, runtimeDir string) error {
+	return fmt.Errorf("%s: no daemon is listening at %s; this state's daemon (pid %d) listens at %s, so this process's "+
+		"XDG_RUNTIME_DIR (%s) differs from the daemon's; run with the daemon's XDG_RUNTIME_DIR "+
+		"(a gate command that calls aira needs it in env_allow)",
+		daemon.CodeUnavailable, paths.SocketPath, pid, holderSocket, runtimeDir)
+}
+
+// unreachableDaemonError reports, dialling only this process's own socket, that
+// this process's daemon socket can never be served: this state's running daemon (or
+// its enabled aira-daemon.service) is bound to a different socket, because this
+// process's XDG_RUNTIME_DIR differs from the daemon's. It returns nil whenever
+// it cannot establish that, so a daemon that is merely starting or restarting
+// stays a wait. `aira confine` admission dials the socket itself and reconnects
+// without a deadline, so without this check such a launch is held forever
+// (AIRA-289b).
+func unreachableDaemonError(paths daemon.Paths, systemctl daemon.SystemctlRun, readFile func(string) ([]byte, error), getenv func(string) string) error {
+	// Status dials only this process's own socket (100 ms): a socket that
+	// answers is reachable, and a stale socket FILE left by a killed stray is
+	// not a daemon (it must not switch the refusals off).
+	status := daemon.Status(paths)
+	if status.Ready {
+		return nil
+	}
+	runtimeDir := "unset"
+	if value := strings.TrimSpace(getenv("XDG_RUNTIME_DIR")); value != "" {
+		runtimeDir = value
+	}
+	if status.Running && status.Lock.PID > 0 && status.Lock.Socket != "" && status.Lock.Socket != paths.SocketPath {
+		return mismatchedRuntimeError(paths, status.Lock.PID, status.Lock.Socket, runtimeDir)
+	}
+	if service, managed := daemon.ManagedServiceForState(paths, daemon.DefaultServiceUnit, systemctl, readFile); managed && service.SocketPath != paths.SocketPath {
+		return fmt.Errorf("%s: no daemon is listening at %s; aira-daemon.service serves this state at %s, so this process's "+
+			"XDG_RUNTIME_DIR (%s) differs from the daemon's; run with the daemon's XDG_RUNTIME_DIR "+
+			"(a gate command that calls aira needs it in env_allow)",
+			daemon.CodeUnavailable, paths.SocketPath, service.SocketPath, runtimeDir)
+	}
+	return nil
+}
+
+// runtimeDirForMessage is this process's XDG_RUNTIME_DIR for an error message:
+// the value, or the word "unset".
+func (d *daemonDispatcher) runtimeDirForMessage() string {
+	if value := strings.TrimSpace(d.environment()("XDG_RUNTIME_DIR")); value != "" {
+		return value
+	}
+	return "unset"
 }
 
 // tryStartupLock makes a single non-blocking attempt to take the shared daemon
@@ -881,8 +976,8 @@ func releaseStartupLock(file *os.File) {
 // KNOWN, ACCEPTED GAP (recorded on AIRA-83, not silently held): the branch is
 // chosen by ServiceIdentityMatches, which reports plain false both for "this is
 // not the managed service" and for "the probe could not be evaluated" (a
-// transient `systemctl is-enabled`/`show-environment` failure, an unreadable unit
-// file, an empty HOME — internal/daemon/service.go:38-75). In the unevaluable
+// transient `systemctl is-enabled`/`show`/`show-environment` failure, an
+// unreadable unit file — daemon.ManagedServicePaths). In the unevaluable
 // case this falls through to `daemon.Stop`, and the managed unit's Restart=always
 // then brings the shared daemon back — a bounce, not the deliberate restart
 // deleted here, but still collateral. It is left as-is deliberately: refusing
@@ -891,7 +986,7 @@ func releaseStartupLock(file *os.File) {
 // the real service is enabled), and a positive "is the running PID inside the
 // unit's cgroup" proof is new machinery this mechanical fix does not add.
 func (d *daemonDispatcher) replaceOlderDaemon(ctx context.Context) error {
-	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader(), d.environment()) {
+	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader()) {
 		// The remedy names BOTH steps on purpose. `aira install` publishes this
 		// binary but restarts the unit only when the unit's own content changed
 		// (internal/install/install.go:670-675) — and swapping the ExecStart

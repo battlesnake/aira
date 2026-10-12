@@ -341,6 +341,18 @@ func (k RelationKind) Inverse() RelationKind {
 
 func (k RelationKind) IsForward() bool { return validRelation(k) }
 
+// Forward returns the stored forward kind whose query-only inverse is k, and
+// whether k is one of the five inverse kinds. relates is its own inverse and is
+// forward, so it is not in the list.
+func (k RelationKind) Forward() (RelationKind, bool) {
+	for _, forward := range []RelationKind{RelationBlocks, RelationParent, RelationDuplicates, RelationSupersedes, RelationResolves} {
+		if forward.Inverse() == k {
+			return forward, true
+		}
+	}
+	return "", false
+}
+
 // CanonicalRelationOwner is the lower-ID endpoint according to the Phase-1
 // prefix/numeric ordering. It is the only ticket file allowed to store a
 // relation between from and to.

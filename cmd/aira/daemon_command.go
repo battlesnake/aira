@@ -35,11 +35,28 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	switch operation {
 	case "serve":
-		if strings.TrimSpace(os.Getenv("AIRA_DAEMON_MANAGED")) == "" && daemon.ServiceIdentityMatches(paths, daemon.DefaultServiceUnit, daemonSystemctlRun, os.ReadFile, os.Getenv) {
-			// Best effort: the enabled service is authoritative. Exiting without
-			// taking the flock prevents a race-forked stray daemon from stranding it.
-			_, _ = daemonSystemctlRun([]string{"systemctl", "--user", "start", daemon.DefaultServiceUnit})
-			return 0
+		if strings.TrimSpace(os.Getenv("AIRA_DAEMON_MANAGED")) == "" {
+			if service, managed := daemon.ManagedServiceForState(paths, daemon.DefaultServiceUnit, daemonSystemctlRun, os.ReadFile); managed {
+				if service.SocketPath != paths.SocketPath {
+					// The enabled service owns this state.db and serves it at a
+					// socket this process would not bind. Serving here would take
+					// the state lock from it while it is down (it then exits and is
+					// restarted every 2 s) and leave the box without the unit's
+					// watchdog: refuse, as spawnDaemon does (AIRA-289).
+					runtimeDir := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
+					if runtimeDir == "" {
+						runtimeDir = "unset"
+					}
+					_, _ = fmt.Fprintf(stderr, "%s: %s serves this state at %s; this process (XDG_RUNTIME_DIR %s) would serve it at %s and take it from the service; "+
+						"start the service (`systemctl --user start %s`) or run with its XDG_RUNTIME_DIR\n",
+						daemon.CodeUnavailable, daemon.DefaultServiceUnit, service.SocketPath, runtimeDir, paths.SocketPath, daemon.DefaultServiceUnit)
+					return codes.ExitForCode(daemon.CodeUnavailable)
+				}
+				// Best effort: the enabled service is authoritative. Exiting without
+				// taking the flock prevents a race-forked stray daemon from stranding it.
+				_, _ = daemonSystemctlRun([]string{"systemctl", "--user", "start", daemon.DefaultServiceUnit})
+				return 0
+			}
 		}
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 		defer cancel()
@@ -69,12 +86,15 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		return codes.ExitForCode(daemon.CodeUnavailable)
 	case "stop":
-		// Refuse (and redirect to systemctl) ONLY when this invocation's own daemon
-		// IS the managed service — identity-matched, not merely is-enabled. A
+		// Refuse (and redirect to systemctl) ONLY when the managed service owns
+		// this invocation's state — same state directory, not merely is-enabled. A
 		// divergent-identity caller (a temp-XDG_STATE_HOME harness that forked its
 		// own daemon) must be able to stop ITS daemon via daemon.Stop(paths), and
 		// must never be misdirected to `systemctl stop` the unrelated machine service.
-		if daemon.ServiceIdentityMatches(paths, daemon.DefaultServiceUnit, daemonSystemctlRun, nil, nil) {
+		// The socket is not compared: the daemon lock is per state directory
+		// (AIRA-289), so from a process whose XDG_RUNTIME_DIR differs from the
+		// service's, daemon.Stop would SIGTERM the service's own daemon.
+		if _, managed := daemon.ManagedServiceForState(paths, daemon.DefaultServiceUnit, daemonSystemctlRun, nil); managed {
 			_, _ = fmt.Fprintf(stderr, "%s: %s is enabled; use `systemctl --user stop %s` (or disable it)\n", daemon.CodeUnavailable, daemon.DefaultServiceUnit, daemon.DefaultServiceUnit)
 			return codes.ExitForCode(daemon.CodeUnavailable)
 		}

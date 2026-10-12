@@ -34,7 +34,38 @@ var ErrAlreadyRunning = errors.New("daemon already running")
 // not drain. Production treats this as process-terminal: releasing this value
 // could allow a second writer while the original goroutines still use the DB.
 type ErrDrainTimeout struct {
-	lock *os.File
+	lock       *os.File
+	legacyLock *os.File
+}
+
+// acquireInstanceLock takes one single-instance flock without blocking and
+// records this daemon's identity in it. A held lock is ErrAlreadyRunning.
+func acquireInstanceLock(path string, cpuSlotsPerCore int, socket string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return nil, ErrAlreadyRunning
+		}
+		return nil, err
+	}
+	if err := writeLockInfo(file, cpuSlotsPerCore, socket); err != nil {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func releaseInstanceLock(file *os.File) {
+	if file == nil {
+		return
+	}
+	_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+	_ = file.Close()
 }
 
 func (e *ErrDrainTimeout) Error() string { return CodeTimeout + ": graceful drain timed out" }
@@ -382,29 +413,32 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if err := os.Chmod(s.Paths.RuntimeDir, 0o700); err != nil {
 		return err
 	}
-	lock, err := os.OpenFile(s.Paths.LockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
+	// One daemon per state directory (AIRA-289). The state lock lives beside
+	// state.db, so two processes with different XDG_RUNTIME_DIRs cannot both
+	// serve one database. The state directory may not exist yet on a fresh
+	// machine (the runtime directory above may).
+	if err := os.MkdirAll(filepath.Dir(s.Paths.LockPath), 0o700); err != nil {
 		return err
 	}
 	retainInstance := false
-	lockHeld := false
+	var lock, legacyLock *os.File
 	defer func() {
 		if retainInstance {
 			return
 		}
-		if lockHeld {
-			_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-		}
-		_ = lock.Close()
+		releaseInstanceLock(legacyLock)
+		releaseInstanceLock(lock)
 	}()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
-			return ErrAlreadyRunning
-		}
+	// Fixed order, state lock first, so two daemons cannot deadlock.
+	if lock, err = acquireInstanceLock(s.Paths.LockPath, s.cpuSlotsPerCore, s.Paths.SocketPath); err != nil {
 		return err
 	}
-	lockHeld = true
-	if err := writeLockInfo(lock, s.cpuSlotsPerCore); err != nil {
+	// The legacy lock is the old runtime-directory lock. Holding it keeps a
+	// pre-v0.34 client that shares this runtime directory from winning it and
+	// starting a second daemon; finding it held means a pre-v0.34 daemon already
+	// serves this state from this runtime directory. Remove with the last
+	// pre-v0.34 binary.
+	if legacyLock, err = acquireInstanceLock(s.Paths.LegacyLockPath, s.cpuSlotsPerCore, s.Paths.SocketPath); err != nil {
 		return err
 	}
 	if err := os.Remove(s.Paths.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -619,7 +653,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	case <-drained:
 	case <-time.After(timeout):
 		retainInstance = true
-		return &ErrDrainTimeout{lock: lock}
+		return &ErrDrainTimeout{lock: lock, legacyLock: legacyLock}
 	}
 	return serveErr
 }

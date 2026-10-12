@@ -33,10 +33,13 @@ func TestSpawnDaemonDefersOnlyWhenEnabledAndIdentityMatches(t *testing.T) {
 	for _, test := range []struct {
 		name, enabled, managerRuntime string
 		wantStart, wantFork           bool
+		wantRefused                   bool
 	}{
 		{name: "enabled match", enabled: "enabled\n", wantStart: true},
 		{name: "not enabled", enabled: "disabled\n", wantFork: true},
-		{name: "identity divergent", enabled: "enabled\n", managerRuntime: "divergent", wantFork: true},
+		// Same state.db, another runtime directory: the service owns the state
+		// (AIRA-289), so a daemon forked here would take the state lock from it.
+		{name: "same state, other runtime dir", enabled: "enabled\n", managerRuntime: "divergent", wantRefused: true},
 		{name: "systemctl absent", wantFork: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -45,6 +48,9 @@ func TestSpawnDaemonDefersOnlyWhenEnabledAndIdentityMatches(t *testing.T) {
 			forked, started := false, false
 			d.spawn = func() (<-chan childResult, error) { forked = true; return make(chan childResult, 1), nil }
 			d.systemctlRun = func(argv []string) ([]byte, error) {
+				if answer, ok := fragmentPathAnswer(argv); ok {
+					return answer, nil
+				}
 				switch strings.Join(argv, " ") {
 				case "systemctl --user is-enabled aira-daemon.service":
 					if test.enabled == "" {
@@ -64,7 +70,12 @@ func TestSpawnDaemonDefersOnlyWhenEnabledAndIdentityMatches(t *testing.T) {
 					return nil, errors.New("unexpected command")
 				}
 			}
-			if _, err := d.spawnDaemon(); err != nil {
+			_, err := d.spawnDaemon()
+			if test.wantRefused {
+				if err == nil || !strings.Contains(err.Error(), "aira-daemon.service serves this state at") {
+					t.Fatalf("err=%v, want a refusal naming the service's socket", err)
+				}
+			} else if err != nil {
 				t.Fatal(err)
 			}
 			if started != test.wantStart || forked != test.wantFork {
@@ -79,6 +90,9 @@ func TestSpawnDaemonServiceStartFailureIsReported(t *testing.T) {
 	managedServiceFixture(t, d)
 	d.spawn = func() (<-chan childResult, error) { t.Fatal("must not fork"); return nil, nil }
 	d.systemctlRun = func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
+		}
 		switch strings.Join(argv, " ") {
 		case "systemctl --user is-enabled aira-daemon.service":
 			return []byte("enabled\n"), nil
@@ -109,6 +123,9 @@ func TestAutoStartServiceFailureSurfacesAtBoundedFailure(t *testing.T) {
 	}
 	d.spawn = func() (<-chan childResult, error) { t.Fatal("must not fork"); return nil, nil }
 	d.systemctlRun = func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
+		}
 		switch strings.Join(argv, " ") {
 		case "systemctl --user is-enabled aira-daemon.service":
 			return []byte("enabled\n"), nil
@@ -131,6 +148,9 @@ func TestPersistentOldProtocolUnderServiceRequiresReinstall(t *testing.T) {
 	managedServiceFixture(t, d)
 	var commands []string
 	d.systemctlRun = func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
+		}
 		joined := strings.Join(argv, " ")
 		commands = append(commands, joined)
 		switch joined {
@@ -195,6 +215,9 @@ func TestDaemonServeDoesNotDeferOnDivergentIdentity(t *testing.T) {
 	t.Cleanup(func() { daemonSystemctlRun, serveDaemon = originalRun, originalServe })
 	var starts, serves int
 	daemonSystemctlRun = func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
+		}
 		switch strings.Join(argv, " ") {
 		case "systemctl --user is-enabled aira-daemon.service":
 			return []byte("enabled\n"), nil
@@ -235,6 +258,9 @@ func TestDaemonStopDoesNotMisdirectWhenIdentityDivergent(t *testing.T) {
 	original := daemonSystemctlRun
 	t.Cleanup(func() { daemonSystemctlRun = original })
 	daemonSystemctlRun = func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
+		}
 		if strings.Join(argv, " ") == "systemctl --user is-enabled aira-daemon.service" {
 			return []byte("enabled\n"), nil
 		}
@@ -262,6 +288,9 @@ func TestDaemonServeSelfDefersUnlessManaged(t *testing.T) {
 	t.Cleanup(func() { daemonSystemctlRun, serveDaemon = originalRun, originalServe })
 	var starts, serves int
 	daemonSystemctlRun = func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
+		}
 		switch strings.Join(argv, " ") {
 		case "systemctl --user is-enabled aira-daemon.service":
 			return []byte("enabled\n"), nil
@@ -308,6 +337,9 @@ func TestDaemonStopRefusesWhenServiceEnabled(t *testing.T) {
 	original := daemonSystemctlRun
 	t.Cleanup(func() { daemonSystemctlRun = original })
 	daemonSystemctlRun = func(argv []string) ([]byte, error) {
+		if answer, ok := fragmentPathAnswer(argv); ok {
+			return answer, nil
+		}
 		if strings.Join(argv, " ") == "systemctl --user is-enabled aira-daemon.service" {
 			return []byte("enabled\n"), nil
 		}
@@ -328,7 +360,7 @@ func TestManagedDaemonLockLossReportsHolderPID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(paths.RuntimeDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(paths.LockPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(paths.LockPath, []byte(`{"pid":777,"boot_id":"fixture"}`), 0o600); err != nil {

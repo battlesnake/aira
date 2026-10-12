@@ -35,6 +35,7 @@ type Paths struct {
 	RuntimeDir       string
 	SocketPath       string
 	LockPath         string
+	LegacyLockPath   string
 }
 
 const (
@@ -440,7 +441,15 @@ func PathsFromEnvironment(stateHome, runtimeDir, home string) (Paths, error) {
 		DBPath: filepath.Join(stateDir, "state.db"), RegistryPath: filepath.Join(stateDir, "registry.jsonl"),
 		LeaseStateDir:    filepath.Join(stateDir, "leases"),
 		ConfineDetachDir: filepath.Join(stateDir, "confine"), RuntimeDir: daemonDir,
-		SocketPath: filepath.Join(daemonDir, "daemon.sock"), LockPath: filepath.Join(daemonDir, "daemon.lock"),
+		SocketPath: filepath.Join(daemonDir, "daemon.sock"),
+		// One daemon per state.db (AIRA-289): the single-instance lock lives with
+		// the database, not beside the socket, so processes that disagree about
+		// XDG_RUNTIME_DIR still contend for the same lock.
+		LockPath: filepath.Join(stateDir, "daemon.lock"),
+		// Until pre-v0.34 binaries are gone, a running daemon also holds the old
+		// runtime-directory lock, so an older client sharing its runtime directory
+		// cannot win that lock and start a second daemon on this state.
+		LegacyLockPath: filepath.Join(daemonDir, "daemon.lock"),
 	}, nil
 }
 
@@ -484,6 +493,10 @@ type LockInfo struct {
 	// and say "restart required" instead of leaving a silently stale daemon. Zero
 	// is an absence (a daemon that predates AIRA-283), never a ratio.
 	CPUSlotsPerCore int `json:"cpu_slots_per_core,omitempty"`
+	// Socket is the socket path the holder serves (AIRA-289). It is read only to
+	// choose and word a client's error when it cannot reach the lock holder;
+	// nothing dials it.
+	Socket string `json:"socket,omitempty"`
 }
 
 type StatusInfo struct {
@@ -497,14 +510,14 @@ func currentBootID() string {
 	return strings.TrimSpace(string(data))
 }
 
-func writeLockInfo(file *os.File, cpuSlotsPerCore int) error {
+func writeLockInfo(file *os.File, cpuSlotsPerCore int, socket string) error {
 	if err := file.Truncate(0); err != nil {
 		return err
 	}
 	if _, err := file.Seek(0, 0); err != nil {
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(LockInfo{PID: os.Getpid(), BootID: currentBootID(), CPUSlotsPerCore: cpuSlotsPerCore}); err != nil {
+	if err := json.NewEncoder(file).Encode(LockInfo{PID: os.Getpid(), BootID: currentBootID(), CPUSlotsPerCore: cpuSlotsPerCore, Socket: socket}); err != nil {
 		return err
 	}
 	return file.Sync()
@@ -520,17 +533,36 @@ func readLockInfo(path string) LockInfo {
 	return info
 }
 
-// Status checks both the lock holder identity and socket acceptability.
+// lockHeldElsewhere reports whether another open file description holds the
+// flock on path. A missing or unopenable lock file reads as not held.
+func lockHeldElsewhere(path string) bool {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	lockErr := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if lockErr == nil {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		return false
+	}
+	return errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN)
+}
+
+// Status checks both the lock holder identity and socket acceptability. The
+// state lock (beside state.db) is the daemon's identity; a pre-v0.34 daemon
+// holds only the legacy runtime-directory lock, so it is consulted too, which
+// keeps `aira daemon status|stop` and `aira install` truthful across the
+// upgrade window (a v0.34 daemon holds both, with the same record).
 func Status(paths Paths) StatusInfo {
 	info := StatusInfo{Lock: readLockInfo(paths.LockPath)}
-	file, err := os.OpenFile(paths.LockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err == nil {
-		if lockErr := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); lockErr == nil {
-			_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-		} else if errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN) {
-			info.Running = info.Lock.PID > 0 && info.Lock.BootID != "" && info.Lock.BootID == currentBootID()
-		}
-		_ = file.Close()
+	held := lockHeldElsewhere(paths.LockPath)
+	if !held && paths.LegacyLockPath != "" && paths.LegacyLockPath != paths.LockPath && lockHeldElsewhere(paths.LegacyLockPath) {
+		held = true
+		info.Lock = readLockInfo(paths.LegacyLockPath)
+	}
+	if held {
+		info.Running = info.Lock.PID > 0 && info.Lock.BootID != "" && info.Lock.BootID == currentBootID()
 	}
 	conn, err := net.DialTimeout("unix", paths.SocketPath, 100*time.Millisecond)
 	if err == nil {

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -442,35 +444,39 @@ func prepareRoutingFixture(t *testing.T, seed *Core, s *store.Store, root string
 	return request
 }
 
-// seedConflictedRoutingIntent builds a real write conflict through the exported
-// API only: UpdateTicketContent reads the file, calls the update callback, and
-// only then records the intent, so a third-party write from inside the callback
-// leaves the intent pending with the path owned by someone else — exactly the
-// production shape AIRA-73 exists for. It returns the path to retire.
+// seedConflictedRoutingIntent builds a real conflicted pending intent through
+// the exported API only: a third party owns the path the next create is about to
+// write, so create records its intent (and the allocation) and then refuses
+// E_WRITE_CONFLICT at materialise, leaving the intent pending with the path
+// owned by someone else -- the production shape AIRA-73 exists for. A write
+// that merely read a stale file can no longer reach this state (the refusal now
+// comes before a row exists), so the conflict is manufactured where the
+// precondition is the empty file. It returns the path to retire.
 func seedConflictedRoutingIntent(t *testing.T, seed *Core, s *store.Store, root string) string {
 	t.Helper()
-	response := seed.Do(context.Background(), Request{Verb: "create", Args: map[string]any{
+	first := seed.Do(context.Background(), Request{Verb: "create", Args: map[string]any{
 		"title": "routing retire fixture", "kind": "feature", "severity": "P2", "body": "", "labels": []string{},
 	}})
-	mustRoutingOK(t, response, "seed retire ticket")
-	data, ok := response.Data.(map[string]any)
+	mustRoutingOK(t, first, "seed retire ticket")
+	data, ok := first.Data.(map[string]any)
 	if !ok {
-		t.Fatalf("seed retire ticket data type = %T", response.Data)
+		t.Fatalf("seed retire ticket data type = %T", first.Data)
 	}
 	id, _ := data["id"].(string)
-	if id == "" {
-		t.Fatalf("seed retire ticket data = %#v", data)
+	prefix, numberText, found := strings.Cut(id, "-")
+	number, convErr := strconv.Atoi(numberText)
+	if !found || convErr != nil {
+		t.Fatalf("seed retire ticket id = %q", id)
 	}
-	path := filepath.Join(root, ".aira", "tickets", id+".md")
-	_, err := s.UpdateTicketContent(context.Background(), id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
-		if writeErr := os.WriteFile(path, []byte("--- a third party got here first ---\n"), 0o644); writeErr != nil {
-			return domain.Ticket{}, "", writeErr
-		}
-		ticket.Title = "never written"
-		return ticket, body, nil
-	})
-	if !errors.Is(err, store.ErrWriteConflict) {
-		t.Fatalf("seeding a conflicted intent returned %v, want ErrWriteConflict", err)
+	path := filepath.Join(root, ".aira", "tickets", fmt.Sprintf("%s-%d.md", prefix, number+1))
+	if err := os.WriteFile(path, []byte("--- a third party got here first ---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	conflicted := seed.Do(context.Background(), Request{Verb: "create", Args: map[string]any{
+		"title": "never written", "kind": "feature", "severity": "P2", "body": "", "labels": []string{},
+	}})
+	if conflicted.OK || !strings.Contains(conflicted.Error, "E_WRITE_CONFLICT") {
+		t.Fatalf("seeding a conflicted intent: ok=%v code=%q err=%q, want E_WRITE_CONFLICT", conflicted.OK, conflicted.Code, conflicted.Error)
 	}
 	return path
 }

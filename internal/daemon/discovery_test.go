@@ -675,7 +675,7 @@ func TestServeDiscoveryDrainTimeoutRetainsInstance(t *testing.T) {
 	cancel()
 	serveErr := <-done
 	var drainTimeout *ErrDrainTimeout
-	if !errors.As(serveErr, &drainTimeout) || drainTimeout.lock == nil {
+	if !errors.As(serveErr, &drainTimeout) || drainTimeout.lock == nil || drainTimeout.legacyLock == nil {
 		t.Fatalf("Serve error=%T %v, want lock-owning ErrDrainTimeout", serveErr, serveErr)
 	}
 	if closes.Load() != 0 {
@@ -691,7 +691,7 @@ func TestServeDiscoveryDrainTimeoutRetainsInstance(t *testing.T) {
 	if err := server.db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := drainTimeout.lock.Close(); err != nil {
+	if err := drainTimeout.closeLocksForTest(); err != nil {
 		t.Fatal(err)
 	}
 	_ = os.Remove(paths.SocketPath)

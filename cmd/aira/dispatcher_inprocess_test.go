@@ -385,7 +385,7 @@ func TestProtocolDaemonHelperProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(paths.RuntimeDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(paths.LockPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	lock, err := os.OpenFile(paths.LockPath, os.O_CREATE|os.O_RDWR, 0o600)
