@@ -3026,7 +3026,7 @@ func projectRequirementRecord(record store.RequirementRecord, fields []string) m
 func findingDistribution(records []store.FindingRecord, by string) map[string]int {
 	result := map[string]int{}
 	for _, record := range records {
-		for _, value := range storeFindingDistributionValues(record.Finding, by) {
+		for _, value := range store.FindingDistributionValues(record.Finding, by) {
 			result[value]++
 		}
 	}
@@ -3042,30 +3042,6 @@ func requirementDistribution(records []store.RequirementRecord, by string) map[s
 		result[string(record.Requirement.Status)]++
 	}
 	return result
-}
-
-func storeFindingDistributionValues(finding domain.Finding, by string) []string {
-	value := ""
-	switch by {
-	case "subtype":
-		value = string(finding.Subtype)
-	case "category":
-		value = finding.Category
-	case "source":
-		value = finding.Source
-	case "verdict":
-		value = string(finding.Verdict)
-	case "disposition":
-		value = string(finding.Disposition)
-	case "severity":
-		value = string(finding.Severity)
-	case "ticket":
-		value = finding.TicketID
-	}
-	if value == "" {
-		value = "(none)"
-	}
-	return []string{value}
 }
 
 func findingRecordWarnings(records []store.FindingRecord) []string {
@@ -3172,39 +3148,7 @@ func readyDistribution(records []store.ReadyRecord) map[string]int {
 func distribution(rows []store.TicketRecord, by string) map[string]int {
 	result := map[string]int{}
 	for _, row := range rows {
-		values := []string{}
-		switch by {
-		case "status":
-			values = []string{string(row.Ticket.Status)}
-		case "kind":
-			values = []string{string(row.Ticket.Kind)}
-		case "severity":
-			values = []string{string(row.Ticket.Severity)}
-		case "hold":
-			values = []string{fmt.Sprint(row.Ticket.Hold)}
-		case "project":
-			values = []string{row.Ticket.Project}
-		case "assignee":
-			if row.Ticket.Assignee == nil {
-				values = []string{"(none)"}
-			} else {
-				values = []string{*row.Ticket.Assignee}
-			}
-		case "milestone":
-			if row.Ticket.Milestone == nil {
-				values = []string{"(none)"}
-			} else {
-				values = []string{*row.Ticket.Milestone}
-			}
-		case "label":
-			values = row.Ticket.Labels
-			if len(values) == 0 {
-				values = []string{"(none)"}
-			}
-		default:
-			values = []string{"(unknown)"}
-		}
-		for _, value := range values {
+		for _, value := range store.DistributionValues(row, by) {
 			result[value]++
 		}
 	}

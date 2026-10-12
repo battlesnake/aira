@@ -526,7 +526,7 @@ func (s *Store) Count(selector, by string) (CountResult, error) {
 func countRows(rows []TicketRecord, by string) CountResult {
 	result := CountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
 	for _, row := range rows {
-		for _, value := range distributionValues(row, by) {
+		for _, value := range DistributionValues(row, by) {
 			result.Distribution[value]++
 		}
 	}
@@ -568,7 +568,9 @@ func validDistributionField(field string) bool {
 	}
 }
 
-func distributionValues(row TicketRecord, by string) []string {
+// DistributionValues returns the bucket(s) a ticket counts in for a
+// distribution by field by; an unknown field is "(unknown)".
+func DistributionValues(row TicketRecord, by string) []string {
 	switch by {
 	case "status":
 		return []string{string(row.Ticket.Status)}

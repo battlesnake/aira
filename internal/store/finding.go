@@ -351,7 +351,7 @@ func (s *Store) CountFindings(query, by string) (FindingCountResult, error) {
 	}
 	result := FindingCountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
 	for _, row := range rows {
-		for _, value := range findingDistributionValues(row.Finding, by) {
+		for _, value := range FindingDistributionValues(row.Finding, by) {
 			result.Distribution[value]++
 		}
 		for _, warning := range row.Warnings {
@@ -430,7 +430,9 @@ func validFindingDistributionField(field string) bool {
 // finding distributions.
 func ValidFindingDistributionField(field string) bool { return validFindingDistributionField(field) }
 
-func findingDistributionValues(finding domain.Finding, by string) []string {
+// FindingDistributionValues returns the bucket(s) a finding counts in for a
+// distribution by field by; an empty value is "(none)".
+func FindingDistributionValues(finding domain.Finding, by string) []string {
 	value := ""
 	switch by {
 	case "subtype":
