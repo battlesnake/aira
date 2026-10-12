@@ -372,6 +372,35 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runConfineReportCommand(context.Background(), options, stderr)
 	}
+	// AIRA-293. `confine --help` lists "confine-status" (confineHelpVerbs) and the
+	// four sibling management verbs each have a hyphenated spelling that works
+	// (AIRA-201's both-spellings discipline), so this one must too. It is
+	// `confine --status [<selector>] [--owner ID]` rebuilt as that argv and fed to
+	// the SAME management parser and the SAME runConfineStatusCommand, so the two
+	// spellings cannot drift: every validation the flag form applies (the owner
+	// identity check included) and every way it renders a refusal is shared by
+	// construction rather than copied.
+	if verb == "confine-status" {
+		if len(positional) > 1 {
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: confine-status takes at most one selector", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			return renderConfineManagement(response, renderJSON, stdout, stderr)
+		}
+		flagArgv := []string{"--status"}
+		flagArgv = append(flagArgv, positional...)
+		if owner := options["owner"]; owner != "" {
+			flagArgv = append(flagArgv, "--owner", owner)
+		}
+		_, statusOptions, parseErr := parseConfineManagementArgs(flagArgv)
+		if parseErr != nil {
+			code := store.ErrorCode(parseErr)
+			if code == "E_INTERNAL" {
+				code = "E_SELECTOR_INVALID"
+			}
+			response := core.Response{Code: code, Error: parseErr.Error(), Exit: codes.ExitForCode(code)}
+			return renderConfineRefusal(args, response, renderJSON, stdout, stderr)
+		}
+		return runConfineStatusCommand(context.Background(), statusOptions, renderJSON, stdout, stderr)
+	}
 	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-budget" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
@@ -660,7 +689,11 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
 	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
 	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
-		writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
+		// readyForFailure, NOT readyFD: strconv.Atoi returns 0 for an unparseable
+		// or missing --ready-fd, and writing the failure to "fd 0" wrapped the
+		// caller's stdin, wrote JSON to it and closed it (AIRA-294).
+		// supervisorReadyFD is -1 unless --ready-fd parsed as a non-negative fd.
+		writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
 		return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 	}
 	request, err := runner.ConsumeDetachControl(values["control"])
@@ -932,13 +965,15 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"board": nil,
 		// AIRA-127. `top` takes no options today; the entry exists so an unknown
 		// one is refused by name rather than silently accepted and discarded.
-		"top":            nil,
-		"commands":       {"by": true},
-		"git":            {},
-		"run-kill":       {"steal": true},
-		"run-input":      {"close": true, "steal": true},
-		"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
-		"confine-list":   {"slice": true, "owner": true},
+		"top":          nil,
+		"commands":     {"by": true},
+		"git":          {},
+		"run-kill":     {"steal": true},
+		"run-input":    {"close": true, "steal": true},
+		"run-log":      {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
+		"confine-list": {"slice": true, "owner": true},
+		// AIRA-293. The same single option `confine --status` honours.
+		"confine-status": {"owner": true},
 		"confine-budget": {"slice": true, "owner": true},
 		// AIRA (admission-counter rebuild) S18.
 		"confine-dump": {"dump": true, "slice": true, "owner": true},
@@ -2882,6 +2917,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("find requires add|ls|show|set")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -2933,6 +2973,13 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				return core.Request{}, fmt.Errorf("req ls accepts no positional arguments")
 			}
 			args["fields"] = splitComma(options["fields"])
+			// AIRA-210: a mistyped --status is a usage error, not a silently
+			// ignored flag. ls does not filter on it; the value is forwarded
+			// only so the dispatch enum check validates it like every other
+			// declared enum.
+			if status, given := options["status"]; given {
+				args["status"] = status
+			}
 		case "show":
 			if len(positional) != 2 {
 				return core.Request{}, fmt.Errorf("req show requires <selector>")
@@ -2956,6 +3003,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("spend requires add|ls")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -2988,6 +3040,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("quota requires add|ls")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -3035,6 +3092,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("test-report requires add|ls|show|flaky")
 		}
 		subverb := strings.ToLower(positional[0])
+		if subverb == "list" {
+			// AIRA-210: "list" is a CLI alias of the declared "ls" operation; the
+			// dispatch enum only knows the declared spelling.
+			subverb = "ls"
+		}
 		args["subverb"] = subverb
 		switch subverb {
 		case "add":
@@ -3723,6 +3785,13 @@ func confineBoolYesNo(value *bool) string {
 const (
 	confineLiveIdle     = "idle"
 	confineLiveOrphaned = "orphaned"
+	// confineLiveUnsupervised is AIRA-195's refinement of the POPULATED arm:
+	// processes are running in the scope but the supervisor PID is gone. It is
+	// not "orphaned" (that word means "empty, the reaper removes it, nothing to
+	// kill") and not a healthy "yes" (nothing is waiting on the job or will
+	// report its outcome). The usual way to get one is killing an outer confine
+	// around a nested one, whose work lives in a sibling scope.
+	confineLiveUnsupervised = "unsupervised"
 )
 
 // confineLiveStatus renders the LIVE column.
@@ -3740,15 +3809,27 @@ const (
 // whoever launched it, and a population that could not be read is unevaluated no
 // matter what the supervisor is doing.
 //
-// The supervisor reading only refines the EMPTY case, and when it is itself
+// The supervisor reading refines the EMPTY case, and when it is itself
 // unestablished the column falls back to exactly the "no" AIRA-102 printed —
 // the same true statement about the subtree, with no claim about the supervisor
 // attached to it.
+//
+// AIRA-195 refines the POPULATED case the same way. The supervisor reading
+// cannot make a populated scope "not running", but it can say nothing is
+// waiting on it: "unsupervised" is shown only when the subtree is populated AND
+// the supervisor read dead. supervisor_live is false only on ESRCH, so the word
+// is established when shown; an unread supervisor (nil) makes no claim and
+// shows "yes". A recycled PID can make a dead supervisor read alive, which also
+// shows "yes": the AIRA-183 caveat, unchanged. The word is a listing claim
+// about the supervisor only; it says nothing about the admission reserve.
 func confineLiveStatus(record runner.ConfineRecord) string {
 	if record.SubtreePopulated == nil {
 		return "unevaluated"
 	}
 	if *record.SubtreePopulated {
+		if record.SupervisorLive != nil && !*record.SupervisorLive {
+			return confineLiveUnsupervised
+		}
 		return "yes"
 	}
 	if record.SupervisorLive == nil {
@@ -3765,21 +3846,26 @@ func confineLiveStatus(record runner.ConfineRecord) string {
 // record fields a second time, so the legend cannot describe a state the table
 // did not render.
 func confineLiveLegend(scopes []runner.ConfineRecord) string {
-	idle, orphaned := false, false
+	idle, orphaned, unsupervised := false, false, false
 	for _, record := range scopes {
 		switch confineLiveStatus(record) {
 		case confineLiveIdle:
 			idle = true
 		case confineLiveOrphaned:
 			orphaned = true
+		case confineLiveUnsupervised:
+			unsupervised = true
 		}
 	}
-	clauses := make([]string, 0, 2)
+	clauses := make([]string, 0, 3)
 	if idle {
 		clauses = append(clauses, confineLiveIdle+" = the scope subtree has no process right now but its supervisor is alive (mid fork/exec, or a genuinely idle moment) — nothing to investigate")
 	}
 	if orphaned {
 		clauses = append(clauses, confineLiveOrphaned+" = the supervisor PID is gone and the scope is empty — the daemon's reaper removes it once it is past the reap grace, so there is nothing left to kill")
+	}
+	if unsupervised {
+		clauses = append(clauses, confineLiveUnsupervised+" = processes are still running in the scope but its supervisor PID is gone, so nothing is waiting on the job or will report its outcome (for example an outer confine was killed around a nested one); it runs until it exits or is killed")
 	}
 	if len(clauses) == 0 {
 		return ""

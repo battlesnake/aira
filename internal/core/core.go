@@ -564,9 +564,17 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		code := "E_UNKNOWN_VERB"
 		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: codes.ExitForCode(code)}
 	}
-	args := newArgAccessor(req.Args)
+	// AIRA-210: the one place a declared closed enum is enforced, for every
+	// face. It runs before any accessor is built or handler runs, and rewrites a
+	// case-variant member to its declared spelling.
+	canonical, enumErr := canonicalEnumArgs(spec, req.Args)
+	if enumErr != nil {
+		code := "E_ARGUMENT_INVALID"
+		return Response{Code: code, Error: enumErr.Error(), Exit: codes.ExitForCode(code)}
+	}
+	args := newArgAccessor(canonical)
 	if req.HasContent || req.Content != nil {
-		args = newArgAccessor(req.Args, req.Content)
+		args = newArgAccessor(canonical, req.Content)
 	}
 	args.gitContext = req.GitContext
 	args.actor, args.session, args.model = req.Actor, req.Session, req.Model
@@ -791,7 +799,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
 		"rant": {Name: "rant", Usage: "rant [--project ID | --prefix P] <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls|get|review|redact ...", GitContext: true,
-			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", "papercut", "annoyance", "blocker"), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference"), stringSpec("project", false, false, "Target project: exact or unambiguous project ID"), stringSpec("prefix", false, false, "Target project: an ID prefix it owns")},
+			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", string(domain.RantSeverityPapercut), string(domain.RantSeverityAnnoyance), string(domain.RantSeverityBlocker)), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference"), stringSpec("project", false, false, "Target project: exact or unambiguous project ID"), stringSpec("prefix", false, false, "Target project: an ID prefix it owns")},
 			MCPTool: "aira_rant", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 				// A target selector names ANOTHER project's store, which only the
 				// daemon can resolve and build (AIRA-179): it owns the machine-wide
@@ -1683,7 +1691,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(projectRecord(updated, nil), event), nil
 		}},
-		"mv": {Name: "mv", Usage: "mv <selector> <status>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("status", true, true, "Target status", "draft", "planned", "in-progress", "in-review", "done", "retired", "superseded")}, MCPTool: "aira_transition", MCPOperation: "mv", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"mv": {Name: "mv", Usage: "mv <selector> <status>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("status", true, true, "Target status", domain.AllowedStatusStrings()...)}, MCPTool: "aira_transition", MCPOperation: "mv", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err

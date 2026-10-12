@@ -263,23 +263,30 @@ type ConfineStatus struct {
 	// Containment is AIRA-121's kind-of-containment facet. Always rendered on
 	// the trailer (see FormatConfineStatus); empty reads as unevaluated, never
 	// as enforced.
-	Containment          ConfineContainment        `json:"containment,omitempty"`
-	Cap                  ConfineCap                `json:"cap,omitempty"`
-	Admission            ConfineAdmission          `json:"admission,omitempty"`
-	AdmissionState       string                    `json:"admission_state,omitempty"`
-	AdmissionWaitedMS    int64                     `json:"admission_waited_ms,omitempty"`
-	CapBytes             int64                     `json:"cap_bytes,omitempty"`
-	ReserveBytes         int64                     `json:"reserve_bytes,omitempty"`
-	Scope                ConfineScope              `json:"scope,omitempty"`
-	ScopeIntegrity       ScopeIntegrity            `json:"scope_integrity,omitempty"`
-	DescendantEscape     *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
-	OOMGroup             ConfineOOMGroup           `json:"oom_group,omitempty"`
-	Priorities           ConfinePriorities         `json:"priorities,omitempty"`
-	CPUWeight            ConfineCPUWeight          `json:"cpu_weight,omitempty"`
-	ScopeMemoryMax       int64                     `json:"scope_memory_max,omitempty"`
-	ScopeMemoryHigh      int64                     `json:"scope_memory_high,omitempty"`
-	ScopeMemoryBinding   string                    `json:"scope_memory_binding,omitempty"`
-	ScopeMemoryEffective int64                     `json:"scope_memory_effective,omitempty"`
+	Containment       ConfineContainment        `json:"containment,omitempty"`
+	Cap               ConfineCap                `json:"cap,omitempty"`
+	Admission         ConfineAdmission          `json:"admission,omitempty"`
+	AdmissionState    string                    `json:"admission_state,omitempty"`
+	AdmissionWaitedMS int64                     `json:"admission_waited_ms,omitempty"`
+	CapBytes          int64                     `json:"cap_bytes,omitempty"`
+	ReserveBytes      int64                     `json:"reserve_bytes,omitempty"`
+	Scope             ConfineScope              `json:"scope,omitempty"`
+	ScopeIntegrity    ScopeIntegrity            `json:"scope_integrity,omitempty"`
+	DescendantEscape  *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
+	OOMGroup          ConfineOOMGroup           `json:"oom_group,omitempty"`
+	Priorities        ConfinePriorities         `json:"priorities,omitempty"`
+	CPUWeight         ConfineCPUWeight          `json:"cpu_weight,omitempty"`
+	// CPUWeightCurve is AIRA-208's record of the schedule that was ARMED (start
+	// weight written, decay goroutine started): "START->FLOOR@WHEN" with a
+	// ",schedule-rejected" suffix when AIRA_CONFINE_CPUWEIGHT_SCHEDULE did not
+	// parse and the compiled default ran. It is empty unless CPUWeight is aging.
+	// It does NOT report later step writes (fail-open, unchecked) or the weight
+	// the scope actually reached.
+	CPUWeightCurve       string `json:"cpu_weight_curve,omitempty"`
+	ScopeMemoryMax       int64  `json:"scope_memory_max,omitempty"`
+	ScopeMemoryHigh      int64  `json:"scope_memory_high,omitempty"`
+	ScopeMemoryBinding   string `json:"scope_memory_binding,omitempty"`
+	ScopeMemoryEffective int64  `json:"scope_memory_effective,omitempty"`
 	// ScopeMemoryCapSource is AIRA-133's cap-PROVENANCE facet: WHOSE number the
 	// enforced scope memory.max is. One of the ConfineCapSource* values below.
 	//
@@ -1111,6 +1118,15 @@ func FormatConfineStatus(status ConfineStatus) string {
 		cpuWeight = ConfineCPUWeightUnavailable
 	}
 	line += " cpu-weight=" + string(cpuWeight)
+	if cpuWeight == ConfineCPUWeightAging {
+		// AIRA-208: the schedule ARMED, as aging(START->FLOOR@WHEN). A record
+		// from an older binary has no curve; say so rather than guess one.
+		curve := status.CPUWeightCurve
+		if curve == "" {
+			curve = "unevaluated"
+		}
+		line += "(" + curve + ")"
+	}
 	if status.ScopeMemoryMax <= 0 {
 		line += " scope-memory.max=not-requested"
 	} else {

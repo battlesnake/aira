@@ -99,6 +99,11 @@ type tuiRuntime struct {
 	// queueUpdateStarted is a test-only observation seam. It never carries
 	// state and is nil in production.
 	queueUpdateStarted chan<- struct{}
+	// beforeAppRun is a test-only seam, nil in production. run() calls it
+	// between starting the shutdown coordinator and app.Run(), which is the
+	// only point where a cancellation can land before Run() has a screen
+	// (AIRA-253).
+	beforeAppRun func()
 }
 
 func runTUI(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -194,6 +199,9 @@ func (r *tuiRuntime) run() error {
 	r.render()
 	go r.pump()
 	go r.coordinateShutdown()
+	if r.beforeAppRun != nil {
+		r.beforeAppRun()
+	}
 	err := r.app.Run()
 	// Publish "Run() is over" BEFORE cancelling, so that the coordinator woken by
 	// this very cancel observes it. The coordinator's Stop() is only correct
@@ -492,28 +500,42 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 }
 
 // coordinateShutdown joins the executor and the pump off the UI goroutine, then
-// unblocks the tview event loop.
+// asks the tview event loop to stop itself.
 //
-// ctx.Done() wakes it for two structurally different reasons, and only one of
-// them wants an app.Stop():
+// The stop is QUEUED into the event loop (QueueUpdate), never called directly
+// from this goroutine (AIRA-253). tview's Stop() returns at once when
+// app.screen is still nil (before Run() has made one), and when a screen was
+// injected it DISCARDS that screen: Run() then builds a new one that nothing
+// will ever stop, so a cancel that lands before Run() has a live screen left a
+// terminal-owning event loop with no coordinator, pump or signal loop alive. A
+// queued update runs only once Run() is driving a live screen, so it cannot be
+// lost to an early cancel, and it never runs after a Run() that failed at
+// screen initialisation.
+//
+// ctx.Done() wakes it for two structurally different reasons:
 //
 //   - An EXTERNAL cancellation (SIGINT/SIGTERM, or the q key's cmdQuit) while
-//     app.Run() is genuinely still driving a live screen. Stop() is what makes
-//     Run() return, so it is load-bearing here and must not be skipped.
+//     app.Run() is, or is about to be, driving a live screen. The queued Stop
+//     is what makes Run() return, so it is load-bearing and must not be
+//     skipped. It runs at the event loop's next update; a foreground execute
+//     holds the loop (and swallows SIGINT/SIGTERM) until the operator returns,
+//     as before.
 //   - run()'s OWN r.cancel(), which fires unconditionally AFTER app.Run() has
-//     already returned by itself. Then Stop() is not merely redundant, it is
-//     unsafe: when tview's Run() fails at screen initialisation (no controlling
-//     terminal — `open /dev/tty: no such device or address`) it returns the
-//     error while LEAVING a.screen set to the screen it never initialised, so
-//     Stop() calls Fini() on it and tcell's tScreen.finish() closes a quit
-//     channel a failed Init() never allocated: `panic: close of nil channel`.
-//     That turned `aira tui`/`aira top` in a terminal-less context into a crash
-//     that replaced the honest E_INTERNAL entirely (AIRA-134).
+//     already returned by itself. Queueing is then pointless, and a direct
+//     Stop() was unsafe: when tview's Run() fails at screen initialisation (no
+//     controlling terminal, `open /dev/tty: no such device or address`) it
+//     returns the error while LEAVING a.screen set to the screen it never
+//     initialised, so Stop() calls Fini() on it and tcell's tScreen.finish()
+//     closes a quit channel a failed Init() never allocated: `panic: close of
+//     nil channel` (AIRA-134).
 //
-// appRunDone distinguishes them. Skipping Stop() once Run() has returned is
-// always correct: a Run() that returned normally already nil'd tview's screen,
-// making Stop() a no-op, and a Run() that returned on a screen-init failure
-// never brought a terminal up to restore.
+// appRunDone is therefore only a pre-check that skips the queue in the common
+// order (Run() returned before the cancel). The helper goroutine is
+// abandonable: if Run() exits by itself after the update was queued, or in the
+// window between the pre-check and the queueing, QueueUpdate's reply never
+// comes and the goroutine stays parked in a process that is exiting, the same
+// accepted pattern as the pump. A goroutine-leak check in an in-process test
+// must exclude one parked in QueueUpdate.
 func (r *tuiRuntime) coordinateShutdown() {
 	defer close(r.coordDone)
 	<-r.ctx.Done()
@@ -524,7 +546,7 @@ func (r *tuiRuntime) coordinateShutdown() {
 		return
 	default:
 	}
-	r.app.Stop()
+	go r.app.QueueUpdate(r.app.Stop)
 }
 
 // runtimeViews is the view set this runtime was built for, defaulting to the

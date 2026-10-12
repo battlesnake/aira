@@ -171,9 +171,8 @@ func parsePaletteRequest(entry paletteEntry, values map[string]string) (core.Req
 			}
 			continue
 		}
-		if len(arg.Spec.Enum) > 0 && !containsString(arg.Spec.Enum, raw) {
-			return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: %s must be one of %s", arg.Spec.Name, strings.Join(arg.Spec.Enum, ", "))
-		}
+		// AIRA-210: no enum pre-check here. core.Do is the one enforcement
+		// point; the palette shows its refusal (naming the value and the set).
 		switch arg.Spec.Kind {
 		case core.ArgKindBool:
 			value, err := strconv.ParseBool(raw)

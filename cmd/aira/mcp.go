@@ -620,24 +620,10 @@ func decodeMCPValue(arg core.ArgSpec, raw json.RawMessage) (any, error) {
 	default:
 		return nil, fmt.Errorf("E_ARGUMENT_INVALID: argument %q has unsupported kind", arg.Name)
 	}
-	if len(arg.Enum) > 0 {
-		stringValue, ok := value.(string)
-		// An optional enum permits the empty (absent) value; a present value must match.
-		// This mirrors the CLI, which does not enum-reject an omitted optional flag.
-		if !ok || (!(stringValue == "" && !arg.Required) && !contains(arg.Enum, stringValue)) {
-			return nil, fmt.Errorf("E_ARGUMENT_INVALID: argument %q is outside its closed enum", arg.Name)
-		}
-	}
+	// AIRA-210: a declared closed enum is NOT checked here. core.Do is the one
+	// enforcement point for every face, so an MCP enum fault comes back as an
+	// ordinary tool result carrying Do's text instead of a JSON-RPC error.
 	return value, nil
-}
-
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func toolResponse(id any, response core.Response) mcpResponse {

@@ -222,7 +222,7 @@ func RenderGate(g GateDefinition) ([]byte, error) {
 	if err := ValidateGate(g, g.ID+".json"); err != nil {
 		return nil, err
 	}
-	data, err := json.MarshalIndent(g, "", "  ")
+	data, err := MarshalIndentLiteral(g)
 	if err != nil {
 		return nil, fmt.Errorf("E_GATE_INVALID: %w", err)
 	}
@@ -268,4 +268,28 @@ func CanonicalSelectorFields(s AppliesTo) []string {
 	sort.Strings(paths)
 	fields = append(fields, "labels="+strings.Join(labels, "\x00"), "paths="+strings.Join(paths, "\x00"))
 	return fields
+}
+
+// MarshalIndentLiteral is json.MarshalIndent(v, "", "  ") without HTML
+// escaping: `&`, `<` and `>` are written as themselves instead of \u0026,
+// \u003c and \u003e (AIRA-299), the same encoder choice AIRA-216 made for ticket
+// frontmatter. Gate argv and canary mutation bodies are shell and source text
+// full of those characters, and the escaped form is unreadable and diffs badly.
+//
+// Output is byte-identical to json.MarshalIndent except for those three
+// characters: Encoder.Encode appends a newline, which is trimmed here.
+//
+// It is for FILE rendering only. DigestGate and DigestCanary deliberately keep
+// json.Marshal: they hash the parsed struct, not the file bytes, so changing the
+// file encoding moves no definition_digest or declaration_digest and no existing
+// attestation or proof reads stale.
+func MarshalIndentLiteral(v any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }

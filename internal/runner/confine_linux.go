@@ -64,6 +64,30 @@ type cpuWeightConfig struct {
 	Start int64
 	Floor int64
 	Steps []cpuWeightStep
+	// ScheduleRejected is set when AIRA_CONFINE_CPUWEIGHT_SCHEDULE was non-empty
+	// and did not parse. Steps are then the compiled default (never
+	// inert-by-accident), and the trailer says so (AIRA-208).
+	ScheduleRejected bool
+}
+
+// curve renders the schedule that is ARMED for the trailer, as
+// START->FLOOR@WHEN[,schedule-rejected]. It is built from the post-clamp steps
+// handed to the decay goroutine, so the last step's weight is the floor, and
+// durations print as time.Duration does (the deadline facets' spelling). It
+// states what was armed, not what was reached: later step writes are fail-open
+// and unchecked.
+func (c cpuWeightConfig) curve() string {
+	if len(c.Steps) == 0 {
+		// Unreachable from confineCPUWeightConfig (the default is non-empty and
+		// a parsed schedule has at least one step); never panic on a zero value.
+		return ""
+	}
+	last := c.Steps[len(c.Steps)-1]
+	out := fmt.Sprintf("%d->%d@%s", c.Start, last.Weight, last.After)
+	if c.ScheduleRejected {
+		out += ",schedule-rejected"
+	}
+	return out
 }
 
 var defaultCPUWeightSteps = []cpuWeightStep{
@@ -847,6 +871,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		config := confineCPUWeightConfig()
 		if deps.writeScopeCPUWeight(scope, config.Start) {
 			result.Status.CPUWeight = ConfineCPUWeightAging
+			result.Status.CPUWeightCurve = config.curve()
 			cpuWeightStop = startCPUWeightDecay(scope, config.Steps, deps.writeScopeCPUWeight)
 		}
 	}
@@ -2198,9 +2223,14 @@ func confineCPUWeightConfig() cpuWeightConfig {
 		floor = start
 	}
 	steps := append([]cpuWeightStep(nil), defaultCPUWeightSteps...)
+	scheduleRejected := false
 	if raw := strings.TrimSpace(os.Getenv("AIRA_CONFINE_CPUWEIGHT_SCHEDULE")); raw != "" {
 		if parsed, err := parseCPUWeightSchedule(raw); err == nil {
 			steps = parsed
+		} else {
+			// Keep the compiled default (never inert-by-accident), but do not
+			// drop the operator's typo silently: the trailer names it.
+			scheduleRejected = true
 		}
 	}
 	previous := start
@@ -2218,7 +2248,7 @@ func confineCPUWeightConfig() cpuWeightConfig {
 	// proportional-share mitigation for a finite runnable set, not an
 	// anti-starvation guarantee for an unbounded stream of fresh scopes.
 	steps[len(steps)-1].Weight = floor
-	return cpuWeightConfig{Start: start, Floor: floor, Steps: steps}
+	return cpuWeightConfig{Start: start, Floor: floor, Steps: steps, ScheduleRejected: scheduleRejected}
 }
 
 func parseCPUWeightEnv(name string, fallback int64) int64 {

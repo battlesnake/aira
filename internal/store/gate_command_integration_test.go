@@ -678,7 +678,11 @@ func TestRunGateWarnsWhenEnvAllowIncludesPath(t *testing.T) {
 // the gate held a trusted pass that a ticket edit (invisible to the subject
 // digest) silently turned into a canary that no longer fires.
 func TestSeedPathAncestorOfBookkeepingCannotFireOnTickets(t *testing.T) {
-	const marker = "ZZ<PROBE>" // "<" and ">" are JSON-escaped in the gate file, so only the ticket carries the literal
+	// The marker holds a double quote, which a JSON gate file ALWAYS escapes (\"),
+	// so only the ticket carries the literal. It used to hold "<" and ">", which
+	// the gate writer escaped too until AIRA-299 made it write them literally:
+	// the gate's own argv would then match its own marker.
+	const marker = `ZZ"PROBE"`
 	ctx := context.Background()
 	s, root := nonGoCommandSubject(t, "")
 	ticket := filepath.Join(root, ".aira", "tickets", "AIRA-1.md")
@@ -721,7 +725,11 @@ func TestSeedPathAncestorOfBookkeepingCannotFireOnTickets(t *testing.T) {
 // ticket edit (invisible to the subject digest) left that stored pass standing
 // while a re-run on the same subject returned E_GATE_CANARY_DID_NOT_FIRE.
 func TestSeedPathThroughSymlinkCannotFireOnTickets(t *testing.T) {
-	const marker = "ZZ<PROBE>" // "<" and ">" are JSON-escaped in the gate file, so only the ticket carries the literal
+	// The marker holds a double quote, which a JSON gate file ALWAYS escapes (\"),
+	// so only the ticket carries the literal. It used to hold "<" and ">", which
+	// the gate writer escaped too until AIRA-299 made it write them literally:
+	// the gate's own argv would then match its own marker.
+	const marker = `ZZ"PROBE"`
 	ctx := context.Background()
 	s, root := nonGoCommandSubject(t, "")
 	ticket := filepath.Join(root, ".aira", "tickets", "AIRA-1.md")
