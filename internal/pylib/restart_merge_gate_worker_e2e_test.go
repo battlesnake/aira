@@ -4,8 +4,8 @@
 // aira/internal/daemon, and internal/daemon transitively imports internal/core
 // -> internal/pylib, so an internal `package pylib` file importing daemon hits
 // an import cycle. The S16 e2e (pytest_aitest_e2e_test.go) solved this exact
-// situation the same way; this file reuses that file's requireRealPytest and
-// shortE2ERuntimeDir helpers directly (same package).
+// situation the same way; this file reuses that file's shortE2ERuntimeDir
+// helper directly (same package) and pylib.RequireRealPytest.
 package pylib_test
 
 import (
@@ -124,7 +124,7 @@ func newRestartGateHarness(t *testing.T, needPytest bool) *restartGateHarness {
 	t.Helper()
 	pytest := ""
 	if needPytest {
-		pytest = requireRealPytest(t)
+		pytest = pylib.RequireRealPytest(t)
 	}
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {

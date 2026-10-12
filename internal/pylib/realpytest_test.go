@@ -31,3 +31,7 @@ func requireRealPytest(t *testing.T) string {
 	t.Skipf("real pytest integration requires pytest: %v", err)
 	return ""
 }
+
+// RequireRealPytest exports requireRealPytest to the external pylib_test
+// package, which cannot import internal/pylib's test files any other way.
+var RequireRealPytest = requireRealPytest
