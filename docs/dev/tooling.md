@@ -6,7 +6,11 @@ The repository Makefile contains the common local and CI commands:
 `make fmt-check` checks formatting without changing files. `make vet`, `make lint`,
 `make build`, `make test`, `make race`, and `make cover` run the corresponding
 verification or build task. `make tidy` updates module metadata, and `make ci`
-runs formatting checks, vet, build, and tests.
+runs formatting checks, vet, build, tests, and `make claude-mod-check`.
+`make claude-mod-check` validates and tests the embedded Claude Code usage mod
+on a copy under `~/tmp` (it reports UNEVALUATED when no capable `claude` CLI is
+installed). `make dist` builds the static linux amd64 and arm64 release binaries
+with SHA-256 sums into `dist/`.
 
 Install the hooks with:
 
@@ -51,7 +55,7 @@ Building with `-race` applies a further built-in ×4, because race instrumentati
 stretches every interval.
 
 `goimports` and `golangci-lint` are optional. If they are unavailable, the
-the Makefile skips the corresponding step with an install hint. The configured
+Makefile skips the corresponding step with an install hint. The configured
 lint checks require a golangci-lint v2 build compatible with Go 1.25; an older
 binary, such as v1 built with Go 1.24, is skipped. Install the tools with:
 
