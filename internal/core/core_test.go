@@ -921,18 +921,11 @@ func coreTestStoreWithRoot(t *testing.T) (*store.Store, string) {
 func coreTestStoreWithClock(t *testing.T) (*store.Store, *testCoreClock, string) {
 	t.Helper()
 	base := t.TempDir()
-	gitInit(t, base)
 	clock := &testCoreClock{boot: "boot-core", mono: 100}
-	s, err := store.Open(context.Background(), store.Options{
-		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
-		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-core",
-		WorktreeID: "main", ProjectSlug: "core-project", Prefixes: []string{"AIRA"}, Clock: clock, LeaseTTLNS: 900,
-		LeaseStateDir: filepath.Join(base, "lease-state"),
+	s := openCoreTestStore(t, base, func(options *store.Options) {
+		options.ProjectID, options.WorktreeID, options.ProjectSlug = "project-core", "main", "core-project"
+		options.Prefixes, options.Clock, options.LeaseTTLNS = []string{"AIRA"}, clock, 900
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 	return s, clock, base
 }
 
@@ -945,17 +938,31 @@ func (c *testCoreClock) Now() (string, uint64, error) { return c.boot, c.mono, n
 
 func coreTestStoreAt(t *testing.T, base string) (*store.Store, string) {
 	t.Helper()
-	gitInit(t, base)
-	s, err := store.Open(context.Background(), store.Options{
-		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
-		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-core",
-		WorktreeID: "main", ProjectSlug: "core-project", Prefixes: []string{"AIRA"}, LeaseStateDir: filepath.Join(base, "lease-state"),
+	s := openCoreTestStore(t, base, func(options *store.Options) {
+		options.ProjectID, options.WorktreeID, options.ProjectSlug = "project-core", "main", "core-project"
+		options.Prefixes = []string{"AIRA"}
 	})
+	return s, base
+}
+
+// openCoreTestStore git-inits base and opens a store over the shared test
+// layout under it (common, state/state.db, state/registry.jsonl, lease-state);
+// mutate sets the identity and policy fields that differ per fixture. The
+// store is closed at test cleanup.
+func openCoreTestStore(t *testing.T, base string, mutate func(*store.Options)) *store.Store {
+	t.Helper()
+	gitInit(t, base)
+	options := store.Options{
+		Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"),
+		RegistryPath: filepath.Join(base, "state", "registry.jsonl"), LeaseStateDir: filepath.Join(base, "lease-state"),
+	}
+	mutate(&options)
+	s, err := store.Open(context.Background(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s, base
+	return s
 }
 
 func marshalRoundTrip(t *testing.T, value any, target any) {

@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -60,18 +59,10 @@ func TestBareTicketPrefixes(t *testing.T) {
 
 func namespacedCore(t *testing.T) *Core {
 	t.Helper()
-	base := t.TempDir()
-	gitInit(t, base)
-	s, err := store.Open(context.Background(), store.Options{
-		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
-		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-fee",
-		WorktreeID: "main", ProjectSlug: "fee", Prefixes: []string{"BL"}, IDPrefix: "FEE",
-		LeaseStateDir: filepath.Join(base, "lease-state"),
+	s := openCoreTestStore(t, t.TempDir(), func(options *store.Options) {
+		options.ProjectID, options.WorktreeID, options.ProjectSlug = "project-fee", "main", "fee"
+		options.Prefixes, options.IDPrefix = []string{"BL"}, "FEE"
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 	return New(s)
 }
 
