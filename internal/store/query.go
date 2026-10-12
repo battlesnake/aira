@@ -298,8 +298,6 @@ func (s *Store) List(selector string) ([]TicketRecord, error) {
 	return s.records(selectorFilter{Terms: sel.Terms})
 }
 
-func (s *Store) Find(selector string) ([]TicketRecord, error) { return s.List(selector) }
-
 type selectorFilter struct {
 	Terms []queryTerm
 }
@@ -442,6 +440,12 @@ func repoAbsolutePath(root, path string) string {
 }
 
 func readRegularTicket(path string) ([]byte, scanReadOutcome, error) {
+	return readRegularFile(path, "E_CONFIG_INVALID: ticket path is not a regular file")
+}
+
+// readRegularFile stably reads path, refusing a non-regular file with
+// notRegular. A missing file is an inconclusive read, not an error.
+func readRegularFile(path, notRegular string) ([]byte, scanReadOutcome, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -450,7 +454,7 @@ func readRegularTicket(path string) ([]byte, scanReadOutcome, error) {
 		return nil, scanReadStable, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, scanReadStable, errors.New("E_CONFIG_INVALID: ticket path is not a regular file")
+		return nil, scanReadStable, errors.New(notRegular)
 	}
 	return stableReadFile(path)
 }

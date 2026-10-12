@@ -144,7 +144,7 @@ type Store interface {
 	GetFinding(string) (store.FindingRecord, error)
 	SetFinding(context.Context, string, domain.Disposition, string, string) (store.EventKey, error)
 	Count(string, string) (store.CountResult, error)
-	CountFindings(string, string) (store.FindingCountResult, error)
+	CountFindings(string, string) (store.CountResult, error)
 	ComputeGauge(string) (store.GaugeResult, error)
 	ComputeAllGauges() ([]store.GaugeResult, error)
 	SetTicket(context.Context, string, string, string) (store.EventKey, error)

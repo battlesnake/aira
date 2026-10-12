@@ -119,17 +119,7 @@ func (s *Store) acquireRequirementMutationLock() (*os.File, error) {
 }
 
 func readRegularRequirement(path string) ([]byte, scanReadOutcome, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, scanReadInconclusive, nil
-		}
-		return nil, scanReadStable, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, scanReadStable, errors.New("E_REQUIREMENT_INVALID: requirement path is not a regular file")
-	}
-	return stableReadFile(path)
+	return readRegularFile(path, "E_REQUIREMENT_INVALID: requirement path is not a regular file")
 }
 
 func (s *Store) defaultRequirementPrefix() (string, error) {

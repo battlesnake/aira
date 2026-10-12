@@ -34,14 +34,6 @@ type importedRequirement struct {
 	Suffix string
 }
 
-type requirementAllocation struct {
-	WorktreeID string
-	State      string
-	Path       string
-	Seq        int64
-	Kind       string
-}
-
 // ImportRequirements opens and imports a GitHub markdown-table requirement
 // registry. The table is parsed completely before any durable mutation starts.
 // Each newly discovered ID is registered in its own immediate transaction so a
@@ -207,7 +199,7 @@ func allRequirementTableDashes(cells []string) bool {
 
 func (s *Store) importRequirementRow(ctx context.Context, row importedRequirement) (string, error) {
 	path := s.requirementPath(row.ID)
-	allocation, exists, err := s.findRequirementAllocation(ctx, row.Prefix, row.Number, row.Suffix)
+	allocation, exists, err := s.findAllocation(ctx, row.Prefix, row.Number, row.Suffix)
 	if err != nil {
 		return "", err
 	}
@@ -300,20 +292,6 @@ func (s *Store) importRequirementRow(ctx context.Context, row importedRequiremen
 		return "", err
 	}
 	return "updated", nil
-}
-
-func (s *Store) findRequirementAllocation(ctx context.Context, prefix string, number int64, suffix string) (requirementAllocation, bool, error) {
-	var allocation requirementAllocation
-	err := s.db.QueryRowContext(ctx, `SELECT worktree_id, state, path, seq, kind
-        FROM allocations WHERE project_id=? AND prefix=? AND number=? AND suffix=?`, s.projectID, prefix, number, suffix).Scan(
-		&allocation.WorktreeID, &allocation.State, &allocation.Path, &allocation.Seq, &allocation.Kind)
-	if errors.Is(err, sql.ErrNoRows) {
-		return requirementAllocation{}, false, nil
-	}
-	if err != nil {
-		return requirementAllocation{}, false, err
-	}
-	return allocation, true, nil
 }
 
 func (s *Store) requirementIndexMatches(ctx context.Context, id, digest string) (bool, error) {

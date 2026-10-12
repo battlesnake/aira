@@ -80,7 +80,7 @@ func (s *Store) AddCommandEvent(ctx context.Context, input domain.CommandEventIn
 			ID: fmt.Sprintf("CMD-%d", number), At: input.At, AtSeq: sequence,
 			Key: input.Key, KeySource: input.KeySource, Program: input.Program,
 			ArgvPreview: input.ArgvPreview, ArgvDigest: input.ArgvDigest, PrefixPreview: input.PrefixPreview,
-			Status: input.Status, ExitCode: cloneInt64(input.ExitCode), Signal: input.Signal, WallMS: cloneInt64(input.WallMS),
+			Status: input.Status, ExitCode: domain.CloneInt64(input.ExitCode), Signal: input.Signal, WallMS: domain.CloneInt64(input.WallMS),
 			TicketID: input.TicketID, Phase: input.Phase, Actor: input.Actor, Session: input.Session, Cwd: input.Cwd,
 			GitContext: domain.CommandGitContextFrom(input.GitContext),
 		}

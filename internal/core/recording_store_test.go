@@ -86,8 +86,8 @@ func (s *recordingStore) SetFinding(context.Context, string, domain.Disposition,
 func (s *recordingStore) Count(string, string) (store.CountResult, error) {
 	return store.CountResult{}, s.fail("Count")
 }
-func (s *recordingStore) CountFindings(string, string) (store.FindingCountResult, error) {
-	return store.FindingCountResult{}, s.fail("CountFindings")
+func (s *recordingStore) CountFindings(string, string) (store.CountResult, error) {
+	return store.CountResult{}, s.fail("CountFindings")
 }
 func (s *recordingStore) AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error) {
 	return store.RantAddResult{}, s.fail("AddRant")

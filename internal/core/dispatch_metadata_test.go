@@ -258,8 +258,8 @@ func (metadataProbeStore) SetFinding(context.Context, string, domain.Disposition
 func (metadataProbeStore) Count(string, string) (store.CountResult, error) {
 	return store.CountResult{}, nil
 }
-func (metadataProbeStore) CountFindings(string, string) (store.FindingCountResult, error) {
-	return store.FindingCountResult{}, nil
+func (metadataProbeStore) CountFindings(string, string) (store.CountResult, error) {
+	return store.CountResult{}, nil
 }
 func (metadataProbeStore) AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error) {
 	return store.RantAddResult{Rant: domain.Rant{ID: "RANT-1"}, ID: "RANT-1"}, nil

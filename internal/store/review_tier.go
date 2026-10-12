@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -210,7 +211,7 @@ func ValidateReviewPolicy(policy ReviewPolicy) (ReviewPolicy, error) {
 		}
 		result.PathTiers[i].Glob = glob
 	}
-	result.KindFloor = copyKindFloors(policy.KindFloor)
+	result.KindFloor = maps.Clone(policy.KindFloor)
 	for key, value := range result.KindFloor {
 		if !domain.ValidKind(key) {
 			return ReviewPolicy{}, fmt.Errorf("E_CONFIG_INVALID: unknown review kind %q", key)
@@ -219,7 +220,7 @@ func ValidateReviewPolicy(policy ReviewPolicy) (ReviewPolicy, error) {
 			return ReviewPolicy{}, fmt.Errorf("E_CONFIG_INVALID: review floor %q is outside 0..3", key)
 		}
 	}
-	result.SeverityFloor = copySeverityFloors(policy.SeverityFloor)
+	result.SeverityFloor = maps.Clone(policy.SeverityFloor)
 	for key, value := range result.SeverityFloor {
 		if !domain.ValidSeverity(key) {
 			return ReviewPolicy{}, fmt.Errorf("E_CONFIG_INVALID: unknown review severity %q", key)
@@ -229,28 +230,6 @@ func ValidateReviewPolicy(policy ReviewPolicy) (ReviewPolicy, error) {
 		}
 	}
 	return result, nil
-}
-
-func copyKindFloors(values map[domain.Kind]int) map[domain.Kind]int {
-	if values == nil {
-		return nil
-	}
-	result := make(map[domain.Kind]int, len(values))
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
-}
-
-func copySeverityFloors(values map[domain.Severity]int) map[domain.Severity]int {
-	if values == nil {
-		return nil
-	}
-	result := make(map[domain.Severity]int, len(values))
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
 }
 
 func reviewPolicyHasConfiguration(policy ReviewPolicy) bool {
@@ -368,8 +347,8 @@ func (s *Store) ReviewPolicy() ReviewPolicy {
 	policy := s.reviewPolicy
 	policy.DefaultTier = reviewTierPointer(*s.reviewPolicy.DefaultTier)
 	policy.PathTiers = append([]ReviewPathTier(nil), s.reviewPolicy.PathTiers...)
-	policy.KindFloor = copyKindFloors(s.reviewPolicy.KindFloor)
-	policy.SeverityFloor = copySeverityFloors(s.reviewPolicy.SeverityFloor)
+	policy.KindFloor = maps.Clone(s.reviewPolicy.KindFloor)
+	policy.SeverityFloor = maps.Clone(s.reviewPolicy.SeverityFloor)
 	return policy
 }
 

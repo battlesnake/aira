@@ -357,7 +357,7 @@ func cloneFloat64(value *float64) *float64 {
 }
 
 func cloneResourceUsage(value domain.ResourceUsage) domain.ResourceUsage {
-	return domain.ResourceUsage{WallMS: cloneInt64(value.WallMS), CPUUser: cloneInt64(value.CPUUser), CPUSys: cloneInt64(value.CPUSys), PeakRSS: cloneInt64(value.PeakRSS)}
+	return domain.ResourceUsage{WallMS: domain.CloneInt64(value.WallMS), CPUUser: domain.CloneInt64(value.CPUUser), CPUSys: domain.CloneInt64(value.CPUSys), PeakRSS: domain.CloneInt64(value.PeakRSS)}
 }
 
 func optionalInt64(value *int64) any {
@@ -620,7 +620,7 @@ func (s *Store) AddQuotaSnapshot(ctx context.Context, input domain.QuotaSnapshot
 		if err != nil {
 			return err
 		}
-		snapshot := domain.QuotaSnapshot{ID: fmt.Sprintf("QS-%d", number), Provider: input.Provider, At: input.At, Window: input.Window, Used: cloneInt64(input.Used), Limit: cloneInt64(input.Limit), Remaining: cloneInt64(input.Remaining), ResetAt: input.ResetAt, Source: input.Source, AtSeq: sequence}
+		snapshot := domain.QuotaSnapshot{ID: fmt.Sprintf("QS-%d", number), Provider: input.Provider, At: input.At, Window: input.Window, Used: domain.CloneInt64(input.Used), Limit: domain.CloneInt64(input.Limit), Remaining: domain.CloneInt64(input.Remaining), ResetAt: input.ResetAt, Source: input.Source, AtSeq: sequence}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO quota_snapshots(project_id,id,provider,at,window,used,limit_value,remaining,reset_at,source,at_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, s.projectID, snapshot.ID, snapshot.Provider, snapshot.At, snapshot.Window, optionalInt64(snapshot.Used), optionalInt64(snapshot.Limit), optionalInt64(snapshot.Remaining), snapshot.ResetAt, snapshot.Source, snapshot.AtSeq); err != nil {
 			return err
 		}
@@ -635,14 +635,6 @@ func (s *Store) AddQuotaSnapshot(ctx context.Context, input domain.QuotaSnapshot
 		return nil
 	})
 	return result, err
-}
-
-func cloneInt64(value *int64) *int64 {
-	if value == nil {
-		return nil
-	}
-	v := *value
-	return &v
 }
 
 func nextQuotaNumbers(ctx context.Context, conn *sql.Conn, project string) (int64, int64, error) {

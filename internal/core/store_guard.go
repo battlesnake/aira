@@ -64,8 +64,8 @@ func (unexpectedCarvedStore) SetFinding(context.Context, string, domain.Disposit
 func (unexpectedCarvedStore) Count(string, string) (store.CountResult, error) {
 	return store.CountResult{}, errUnexpectedCarvedStore
 }
-func (unexpectedCarvedStore) CountFindings(string, string) (store.FindingCountResult, error) {
-	return store.FindingCountResult{}, errUnexpectedCarvedStore
+func (unexpectedCarvedStore) CountFindings(string, string) (store.CountResult, error) {
+	return store.CountResult{}, errUnexpectedCarvedStore
 }
 func (unexpectedCarvedStore) ComputeGauge(string) (store.GaugeResult, error) {
 	return store.GaugeResult{}, errUnexpectedCarvedStore
