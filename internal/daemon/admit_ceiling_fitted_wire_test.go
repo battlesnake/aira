@@ -150,10 +150,13 @@ func TestSmallSliceUnpinnedRequestIsAdmittedAndGrantedInsteadOfRefused(t *testin
 // `aira install` with no --memory-max sizes the slice at
 // MemTotal - min(MemTotal/4, 16 GiB), floored to whole GiB. On an 8 GiB box that
 // is a 6 GiB slice, whose entry ceiling under PRODUCTION headroom (2 GiB +
-// 64 MiB, NOT the fixture's) is 4227858432 -- below the 4 GiB unpinned default.
-// So on master every unpinned `aira confine -- <cmd>` on a default install of an
-// ordinary box is refused E_ADMIT_TOO_LARGE, and SKILL.md mandates exactly that
-// unpinned form for every heavy command.
+// 64 MiB, NOT the fixture's) is 4227858432. When this test was written that was
+// below the 4 GiB unpinned default, so every unpinned `aira confine -- <cmd>` on
+// a default install of an ordinary box was refused E_ADMIT_TOO_LARGE. The
+// unpinned default is now 1 GiB, which sits far below the smallest ceiling a
+// default install can produce (the 4 GiB install floor leaves about 1.9 GiB), so
+// the default is granted UNFITTED; the fit path itself is exercised on sub-GiB
+// slices by the tests above.
 //
 // The command here is NOVEL: no per-signature history and no machine-wide p90 at
 // all, so this row never touches the OOM branch.
@@ -163,8 +166,8 @@ func TestDefaultInstallCeilingAdmitsANovelUnpinnedCommand(t *testing.T) {
 	const (
 		maximum     = int64(6) << 30
 		wantCeiling = int64(4227858432)
-		wantReserve = int64(3676398636) // FIT(4227858432)
-		wantBasis   = "fallback:no-history,ceiling-fitted"
+		wantReserve = runner.DefaultConfineMemoryReserve
+		wantBasis   = "fallback:no-history"
 	)
 	server := saturatedServer(t)
 	// PRODUCTION headroom, not the fixture's: the claim is about a real install.

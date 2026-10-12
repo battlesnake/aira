@@ -34,17 +34,26 @@ import (
 // aira.slice is never touched: the whole fixture lives under a throwaway
 // cgrouptest.IsolatedScopeParent, torn down in t.Cleanup.
 const (
-	// The T9 fixture slice. DERIVED, not picked: one whole GiB BELOW
-	// runner.DefaultConfineMemoryReserve, so the unpinned prior is unambiguously
-	// over this slice's ceiling and the fit is what is being exercised. Its
-	// margins are asserted by TestSmallSliceSelfHealFixtureActuallyExercisesTheFit
-	// AndStaysOffTheCeiling rather than left to a reader.
-	smallSliceMax = runner.DefaultConfineMemoryReserve - (1 << 30) // 3 GiB
+	// The T9 fixture slice. DERIVED, not picked: 128 MiB BELOW
+	// runner.DefaultConfineMemoryReserve, so the unpinned prior is over this
+	// slice's ceiling and the fit is what is being exercised. (With the 4 GiB
+	// default this was a whole GiB below it; the 1 GiB default leaves room for no
+	// more than this and still a slack the cold-start run's leftovers fit in.)
+	// Its margins are asserted by
+	// TestSmallSliceSelfHealFixtureActuallyExercisesTheFitAndStaysOffTheCeiling
+	// rather than left to a reader.
+	smallSliceMax = runner.DefaultConfineMemoryReserve - (128 << 20) // 896 MiB
+	// The least ceiling-minus-fit slack the fixture may have. Phase 3's
+	// admission must not depend on the slice's residual charge, which is at most
+	// the cold-start run's own footprint at the kill: its cap is the seeds' p90
+	// prior, about 1.5x the 40 MiB seed plus a Go runtime. Not the 320 MiB target
+	// workload, which the cold start never reaches.
+	smallSliceMinSlack = int64(96 << 20)
 	// The T9 entry ceiling and the reserve the fit produces for it, spelled out
 	// so a change to either constant fails against a number rather than against
 	// a recomputation of itself.
-	smallSliceCeiling = int64(3179282432) // smallSliceMax - (32 MiB + 8 MiB)
-	smallSliceFit     = int64(2764593419) // FIT(smallSliceCeiling)
+	smallSliceCeiling = int64(897581056) // smallSliceMax - (32 MiB + 8 MiB)
+	smallSliceFit     = int64(780505266) // FIT(smallSliceCeiling)
 
 	// The T13 fixture. A 640 MiB slice, whose ceiling is 629145600 and whose fit
 	// is 547083130.
@@ -68,7 +77,7 @@ const (
 // arithmetic.
 //
 // On master phase 3 is refused E_ADMIT_TOO_LARGE (`confine: ran=no`), because
-// the unpinned 4 GiB prior alone exceeds this slice's ceiling, so the completion
+// the unpinned default alone exceeds this slice's ceiling, so the completion
 // marker never appears -- the exact self-heal AIRA-151 recorded as broken and
 // deferred to this ticket.
 //
@@ -127,7 +136,7 @@ func TestSmallSliceOOMSelfHealConvergesOnTheFittedBaseline(t *testing.T) {
 	// and therefore the exact fitted reserve asserted below -- deterministic
 	// rather than a race with that release. (Measured: without this, phase 3
 	// sometimes arrives with one job still outstanding and resolves against
-	// 3170893824 instead of 3179282432.)
+	// a lower ceiling instead of the fixture's.)
 	waitForDrainedAdmitLedger(t, server)
 
 	// PHASE 3 -- the self-heal. Same argv, therefore the same signature, and no
@@ -135,7 +144,7 @@ func TestSmallSliceOOMSelfHealConvergesOnTheFittedBaseline(t *testing.T) {
 	//
 	// The unpinned prior is over this slice's ceiling, so on master this request
 	// never reaches a scope at all. Here it is fitted to the largest prior the
-	// slice can grant, which is 8.6x what the workload needs, and the job runs.
+	// slice can grant, which is about 2.4x what the workload needs, and the job runs.
 	second := run("small-target", oomSelfHealTargetBytes, 0, 90*time.Second)
 	if second.err != nil {
 		t.Fatalf("second confine run: %v (stderr %q) — master refuses this with E_ADMIT_TOO_LARGE, which is the defect", second.err, second.stderr)
@@ -265,20 +274,20 @@ func TestSmallSliceSelfHealFixtureActuallyExercisesTheFitAndStaysOffTheCeiling(t
 	}
 
 	// (i) the fit actually fires: the ceiling is at or below the unpinned prior,
-	// with a whole GiB of drift margin before it stops doing so.
+	// with the margin the fixture was built with before it stops doing so.
 	if ceiling > runner.DefaultConfineMemoryReserve {
 		t.Fatalf("fixture ceiling %d is ABOVE the unpinned default %d, so the fit never fires and T9 proves nothing; drift margin was %d bytes",
 			ceiling, runner.DefaultConfineMemoryReserve, runner.DefaultConfineMemoryReserve-smallSliceCeiling)
 	}
 
-	// (ii) the fitted reserve stays clear of the ceiling by more than one whole
-	// target workload, so admission can never come to depend on the slice's
-	// residual charge.
-	if slack := ceiling - fit; slack < oomSelfHealTargetBytes {
-		t.Fatalf("fitted reserve %d leaves %d below the fixture ceiling %d, want at least one whole target workload %d "+
+	// (ii) the fitted reserve stays clear of the ceiling by more than the
+	// cold-start run's footprint, so admission can never come to depend on the
+	// slice's residual charge.
+	if slack := ceiling - fit; slack < smallSliceMinSlack {
+		t.Fatalf("fitted reserve %d leaves %d below the fixture ceiling %d, want at least %d "+
 			"(the fixture's designed margin is %d bytes, i.e. %d bytes of slack)",
-			fit, slack, ceiling, oomSelfHealTargetBytes,
-			smallSliceCeiling-smallSliceFit, (smallSliceCeiling-smallSliceFit)-oomSelfHealTargetBytes)
+			fit, slack, ceiling, smallSliceMinSlack,
+			smallSliceCeiling-smallSliceFit, (smallSliceCeiling-smallSliceFit)-smallSliceMinSlack)
 	}
 
 	// (iii) the phase-3 resolution is exactly what T9 asserts, basis included.

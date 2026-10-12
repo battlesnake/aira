@@ -2911,7 +2911,7 @@ func TestConfineAdmissionWaitDiagnosticHedgesUnpinnedReserve(t *testing.T) {
 		defer close(done)
 		// No MemoryReserve/MemoryReservePinned set: this is the unpinned,
 		// no-signature-history default path that falls back to
-		// DefaultConfineMemoryReserve (4G) purely as a request hint.
+		// DefaultConfineMemoryReserve (1G) purely as a request hint.
 		_, _ = confineWithDeps(context.Background(), ConfineRequest{
 			Slice: "finite.slice", Argv: []string{"/bin/true"},
 			SelfPath: os.Args[0], Stderr: sink,
@@ -2935,7 +2935,7 @@ func TestConfineAdmissionWaitDiagnosticHedgesUnpinnedReserve(t *testing.T) {
 		t.Fatalf("no admission-wait progress diagnostic emitted; stderr=%q", buf.String())
 	}
 	got := buf.String()
-	if !strings.Contains(got, "requested reserve 4096M") {
+	if !strings.Contains(got, "requested reserve 1024M") {
 		t.Fatalf("unpinned line must label the figure as a requested hint, not a bare reserve; stderr=%q", got)
 	}
 	if !strings.Contains(got, "unpinned") {
