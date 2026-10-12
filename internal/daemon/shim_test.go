@@ -34,18 +34,6 @@ func shimTestServer(t *testing.T, budget int64) *Server {
 	return server
 }
 
-// enqueueShimAdmit enqueues on the SENTINEL path, which is the only queue a shim
-// daemon has: resolveShimSlicePath maps every requested slice name onto it, and
-// confineManagement looks the registry up by that same key.
-func enqueueShimAdmit(t *testing.T, server *Server, reserve int64) (*sliceQueue, *admitWaiter) {
-	t.Helper()
-	queue, waiter, code, err := server.enqueueAdmit(runner.ShimConfineSlice, reserve)
-	if err != nil {
-		t.Fatalf("enqueue: code=%s err=%v", code, err)
-	}
-	return queue, waiter
-}
-
 // shimTestScopeID mints an id in the canonical grammar parseConfineScopeID
 // accepts: an owner is an "@" SUFFIX, never another "-" segment.
 func shimTestScopeID() string {
@@ -80,10 +68,10 @@ func TestShimLedgerQueuesASecondJobUntilTheFirstReleases(t *testing.T) {
 	const budget = int64(1000)
 	server := shimTestServer(t, budget)
 
-	queueOne, first := enqueueShimAdmit(t, server, 700)
+	queueOne, first := enqueueOn(t, server, runner.ShimConfineSlice, 700)
 	waitAdmitGrant(t, first)
 
-	queueTwo, second := enqueueShimAdmit(t, server, 700)
+	queueTwo, second := enqueueOn(t, server, runner.ShimConfineSlice, 700)
 	if queueOne != queueTwo {
 		t.Fatalf("shim mode resolved two different queues (%p, %p); every slice name must map to the one container budget", queueOne, queueTwo)
 	}
@@ -149,7 +137,7 @@ func TestShimRefusesExclusiveUpFront(t *testing.T) {
 func TestShimConfineManagementListsAndRefusesToKill(t *testing.T) {
 	server := shimTestServer(t, 4<<30)
 	scopeID := shimTestScopeID()
-	queue, waiter := enqueueShimAdmit(t, server, 1<<20)
+	queue, waiter := enqueueOn(t, server, runner.ShimConfineSlice, 1<<20)
 	waitAdmitGrant(t, waiter)
 	queue.mu.Lock()
 	waiter.scopeID = scopeID

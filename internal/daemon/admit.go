@@ -1943,10 +1943,6 @@ func (s *Server) peerCredentialOf(conn net.Conn) (uid, pid int, err error) {
 	return credential(conn)
 }
 
-func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWaiter, string, error) {
-	return s.enqueueAdmitInternal(path, reserve, "", 0, false, admitRequest{})
-}
-
 func (s *Server) enqueueResolvedConfineAdmit(path string, reserve int64, basis string, maximum int64, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true, request)
 }

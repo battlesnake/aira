@@ -825,11 +825,6 @@ func classifyWatchdogCgroup(mount, rel string) (watchdogCgroup, bool, string) {
 	return watchdogCgroup{path: rel, uncapped: !finite}, true, ""
 }
 
-func effectiveWatchdogCapFrom(mount, path string) (int64, bool) {
-	cap, finite, _ := effectiveWatchdogCapEvaluated(mount, path)
-	return cap, finite
-}
-
 func effectiveWatchdogCapEvaluated(mount, path string) (int64, bool, bool) {
 	current, root := filepath.Clean(path), filepath.Clean(mount)
 	if current != root && !strings.HasPrefix(current, root+string(filepath.Separator)) {
