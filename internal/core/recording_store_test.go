@@ -169,7 +169,6 @@ func (s *recordingStore) FlakyTests(string) ([]domain.FlakyTest, error) {
 func (s *recordingStore) FlakyCellSummary(context.Context) (store.FlakyCellSummary, error) {
 	return store.FlakyCellSummary{}, s.fail("FlakyCellSummary")
 }
-func (s *recordingStore) ReconcileFlaky(context.Context) error { return s.fail("ReconcileFlaky") }
 func (s *recordingStore) AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error) {
 	return store.ComputeEventAddResult{}, s.fail("AddComputeEvent")
 }
@@ -190,9 +189,6 @@ func (s *recordingStore) ListCommandEvents(string) ([]domain.CommandEvent, error
 }
 func (s *recordingStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
 	return store.CommandDistributionResult{}, s.fail("CommandDistribution")
-}
-func (s *recordingStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
-	return nil, s.fail("CommandLatencyByKeyPair")
 }
 func (s *recordingStore) AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error) {
 	return store.QuotaSnapshotAddResult{}, s.fail("AddQuotaSnapshot")

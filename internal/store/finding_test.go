@@ -178,7 +178,9 @@ func TestFindingQueryHasDistinctFieldsAndSubtypeWidening(t *testing.T) {
 	if _, _, err := s.AddFinding(context.Background(), reviewFindingInput("race in worker")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.recordRebuildFinding(context.Background(), registryEntry{Root: root, WorktreeID: s.worktreeID}, "broken root"); err != nil {
+	if err := s.withImmediate(context.Background(), func(conn *sql.Conn) error {
+		return recordRebuildFindingConn(context.Background(), conn, s.projectID, registryEntry{Root: root, WorktreeID: s.worktreeID}, "broken root")
+	}); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := s.ListFindings(`subtype:review category:flaky-test text:"worker"`)

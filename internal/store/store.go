@@ -2614,12 +2614,6 @@ func (s *Store) recordFinding(ctx context.Context, intent Intent, cause error) e
 	})
 }
 
-func (s *Store) recordRebuildFinding(ctx context.Context, entry registryEntry, reason string) error {
-	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		return recordRebuildFindingConn(ctx, conn, s.projectID, entry, reason)
-	})
-}
-
 func (s *Store) reconcile(ctx context.Context) error {
 	findingLock, err := s.acquireFindingMutationLock()
 	if err != nil {
@@ -3902,10 +3896,6 @@ func acquireLockBounded(ctx context.Context, path string, timeout time.Duration)
 	}
 }
 
-func (s *Store) appendReceiptForIntent(intent Intent) error {
-	return s.appendReceiptIfMissing(intent.Receipt)
-}
-
 func appendJSONLine(path string, value any, lockPath string) error {
 	lock, err := acquireLock(lockPath)
 	if err != nil {
@@ -4376,15 +4366,6 @@ func readJSONLRecords(path string) ([][]byte, error) {
 		records = append(records, append([]byte(nil), record...))
 	}
 	return records, nil
-}
-
-func sortedKeys(values map[string]bool) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func recordScanFindingConn(ctx context.Context, conn *sql.Conn, project, root string, entry registryEntry, finding CheckFinding) error {

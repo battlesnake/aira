@@ -129,7 +129,6 @@ func (unexpectedCarvedStore) FlakyTests(string) ([]domain.FlakyTest, error) {
 func (unexpectedCarvedStore) FlakyCellSummary(context.Context) (store.FlakyCellSummary, error) {
 	return store.FlakyCellSummary{}, errUnexpectedCarvedStore
 }
-func (unexpectedCarvedStore) ReconcileFlaky(context.Context) error { return errUnexpectedCarvedStore }
 func (unexpectedCarvedStore) AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error) {
 	return store.ComputeEventAddResult{}, errUnexpectedCarvedStore
 }
@@ -150,9 +149,6 @@ func (unexpectedCarvedStore) ListCommandEvents(string) ([]domain.CommandEvent, e
 }
 func (unexpectedCarvedStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
 	return store.CommandDistributionResult{}, errUnexpectedCarvedStore
-}
-func (unexpectedCarvedStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
-	return nil, errUnexpectedCarvedStore
 }
 func (unexpectedCarvedStore) AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error) {
 	return store.QuotaSnapshotAddResult{}, errUnexpectedCarvedStore

@@ -926,3 +926,17 @@ func TestRedactURLScrubsTokensOnEveryPath(t *testing.T) {
 		t.Fatalf("short ghp_ lookalike over-redacted: %q", got)
 	}
 }
+
+func errorCode(err error) string {
+	var target *Error
+	if errors.As(err, &target) {
+		return target.StableCode
+	}
+	return ""
+}
+
+func newWithRun(config Config, run runFn) *Client {
+	c := New(config)
+	c.run = run
+	return c
+}

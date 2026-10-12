@@ -460,3 +460,14 @@ func runTraceabilityCheck(t *testing.T, s *Store) CheckReport {
 	}
 	return report
 }
+
+// scanTraceability discovers annotation edges from the tracked-file snapshot.
+// Parsing the Go syntax first is intentional: a string containing
+// "covers: AR-1" is data, not an annotation.
+func scanTraceability(root string) (traceScanResult, error) {
+	snapshot, err := captureTraceSnapshot(root, nil)
+	if err != nil {
+		return traceScanResult{}, err
+	}
+	return parseTraceabilitySnapshot(root, snapshot)
+}

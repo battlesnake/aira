@@ -34,6 +34,7 @@ func TestRealCgroupPeakRSSHistoryDrivesEstimatedAdmission(t *testing.T) {
 	c := NewWithRunner(nil, r).WithMemoryEstimate(true)
 	argv := []string{"python3", "-c", "x=bytearray(8*1024*1024); x[-1]=1"}
 	args := map[string]any{"argv": argv}
+	const minSamples = 3 // runner.memoryEstimateMinSamples: the history the estimator needs
 	for i := 0; i < minSamples; i++ {
 		record := runRealEstimateCommand(t, c, args)
 		if record.PeakRSS == nil || *record.PeakRSS <= 0 || record.AdmissionReserve == nil || *record.AdmissionReserve != headroom || !strings.HasPrefix(record.AdmissionReserveBasis, "fallback:") {

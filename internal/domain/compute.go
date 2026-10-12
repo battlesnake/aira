@@ -75,8 +75,6 @@ func ValidatePhase(phase string) error {
 	return nil
 }
 
-func ValidPhase(phase string) bool { return ValidatePhase(phase) == nil }
-
 type ComputeEvent struct {
 	ID string `json:"id"`
 	// TicketID is an opaque, project-scoped external reference: trimmed on
@@ -230,10 +228,6 @@ type RawUsage struct {
 
 func (b ComputeBuckets) clone() ComputeBuckets {
 	return ComputeBuckets{FreshInput: cloneInt64(b.FreshInput), CacheRead: cloneInt64(b.CacheRead), CacheWrite: cloneInt64(b.CacheWrite), Output: cloneInt64(b.Output), Reasoning: cloneInt64(b.Reasoning)}
-}
-
-func (r ResourceUsage) clone() ResourceUsage {
-	return ResourceUsage{WallMS: cloneInt64(r.WallMS), CPUUser: cloneInt64(r.CPUUser), CPUSys: cloneInt64(r.CPUSys), PeakRSS: cloneInt64(r.PeakRSS)}
 }
 
 // HasUsage reports whether the raw value contains any token authority.

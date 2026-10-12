@@ -89,12 +89,12 @@ func TestEstimateReserveAllBranches(t *testing.T) {
 		{name: "malformed negative peak", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: -1}, headroom: 100, basis: "fallback:malformed"},
 		{name: "ordinary exact", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: 100}, headroom: 500, reserve: 115, override: true, basis: "estimate:max=100,n=3,f=115"},
 		{name: "integer rounding", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: 101}, headroom: 500, reserve: 116, override: true, basis: "estimate:max=101,n=3,f=115"},
-		{name: "peak exactly cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: maxEstimateReserve}, headroom: 1, reserve: maxEstimateReserve, override: true, basis: "estimate:capped"},
-		{name: "peak above cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: maxEstimateReserve + 1}, headroom: 1, reserve: maxEstimateReserve, override: true, basis: "estimate:capped"},
-		{name: "growth crosses cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: maxEstimateReserve - 1}, headroom: 1, reserve: maxEstimateReserve, override: true, basis: "estimate:capped"},
+		{name: "peak exactly cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: runner.MaxMemoryEstimateReserve}, headroom: 1, reserve: runner.MaxMemoryEstimateReserve, override: true, basis: "estimate:capped"},
+		{name: "peak above cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: runner.MaxMemoryEstimateReserve + 1}, headroom: 1, reserve: runner.MaxMemoryEstimateReserve, override: true, basis: "estimate:capped"},
+		{name: "growth crosses cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: runner.MaxMemoryEstimateReserve - 1}, headroom: 1, reserve: runner.MaxMemoryEstimateReserve, override: true, basis: "estimate:capped"},
 		{name: "oom floors at headroom", stats: runner.PeakRSSStats{TotalCount: 4, SampleCount: 4, PeakMax: 100, OOMCount: 1}, headroom: 500, reserve: 500, override: true, basis: "estimate:oom:max=100,n=4,oom=1,f=115"},
 		{name: "oom estimate above headroom", stats: runner.PeakRSSStats{TotalCount: 4, SampleCount: 4, PeakMax: 1000, OOMCount: 2}, headroom: 500, reserve: 1150, override: true, basis: "estimate:oom:max=1000,n=4,oom=2,f=115"},
-		{name: "oom headroom exactly cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: 1, OOMCount: 1}, headroom: maxEstimateReserve, reserve: maxEstimateReserve, override: true, basis: "estimate:oom:max=1,n=3,oom=1,f=115"},
+		{name: "oom headroom exactly cap", stats: runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: 1, OOMCount: 1}, headroom: runner.MaxMemoryEstimateReserve, reserve: runner.MaxMemoryEstimateReserve, override: true, basis: "estimate:oom:max=1,n=3,oom=1,f=115"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -102,7 +102,7 @@ func TestEstimateReserveAllBranches(t *testing.T) {
 			if reserve != test.reserve || override != test.override || basis != test.basis {
 				t.Fatalf("estimateReserve(%+v,%d)=(%d,%v,%q), want (%d,%v,%q)", test.stats, test.headroom, reserve, override, basis, test.reserve, test.override, test.basis)
 			}
-			if override && (reserve <= 0 || reserve > maxEstimateReserve) {
+			if override && (reserve <= 0 || reserve > runner.MaxMemoryEstimateReserve) {
 				t.Fatalf("override reserve outside defended range: %d", reserve)
 			}
 		})

@@ -26,13 +26,6 @@ type FindingRecord struct {
 	Error       string         `json:"error,omitempty"`
 }
 
-type FindingSetInput struct {
-	Key         string
-	Disposition domain.Disposition
-	Reason      string
-	Actor       string
-}
-
 // FindingCountResult is kept as a named compatibility alias for callers that
 // want to distinguish the finding read while retaining the CountResult shape.
 type FindingCountResult = CountResult

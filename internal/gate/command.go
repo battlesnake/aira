@@ -9,7 +9,6 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -311,14 +310,6 @@ func setPaused(tests map[string]testEventState, pkg, test string, paused bool) b
 
 func utf8Valid(data []byte) bool {
 	return utf8.Valid(data)
-}
-
-// CanonicalEnvAllow returns a detached sorted copy for callers building lane
-// identities without changing the committed definition in place.
-func CanonicalEnvAllow(names []string) []string {
-	copy := append([]string(nil), names...)
-	sort.Strings(copy)
-	return copy
 }
 
 // PathEnvAllowWarning is the one warning EnvAllowWarnings can return (AIRA-286).

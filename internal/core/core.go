@@ -167,7 +167,6 @@ type Store interface {
 	GetTestReport(string) (domain.TestReport, error)
 	FlakyTests(string) ([]domain.FlakyTest, error)
 	FlakyCellSummary(context.Context) (store.FlakyCellSummary, error)
-	ReconcileFlaky(context.Context) error
 	AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
 	ListComputeEvents(string) ([]domain.ComputeEvent, error)
 	SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error)
@@ -175,7 +174,6 @@ type Store interface {
 	AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error)
 	ListCommandEvents(string) ([]domain.CommandEvent, error)
 	CommandDistribution(string, string) (store.CommandDistributionResult, error)
-	CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error)
 	AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error)
 	ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error)
 }

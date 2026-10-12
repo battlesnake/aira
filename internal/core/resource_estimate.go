@@ -7,9 +7,6 @@ import (
 	"aira/internal/runner"
 )
 
-const maxEstimateReserve int64 = runner.MaxMemoryEstimateReserve
-const minSamples = 3 // retained for the real-history fixture; estimator lives in runner
-
 func resourceSignature(commandPrefix, reqPrefix, argv []string) (string, error) {
 	return runner.ResourceSignature(commandPrefix, reqPrefix, argv)
 }
