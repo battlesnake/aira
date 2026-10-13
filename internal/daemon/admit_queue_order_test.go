@@ -447,7 +447,11 @@ func TestConfineFrontResolutionAndOwnerGuard(t *testing.T) {
 	worker := frontWaiter(7, "aitest-w1", "s-1")
 	worker.parentScopeID = running.scopeID
 	unowned := frontWaiter(8, "unowned", "")
-	queue := queueOf(server, mine, inferred, theirs, twinA, twinB, running, worker, unowned)
+	// A worker-named scope that is NOT a sub-reservation: the name/pid selector
+	// still skips it, as the kill selector filters worker rows (an aitest worker
+	// embeds its parent's pid and a non-unique name).
+	looseWorker := frontWaiter(9, "aitest-w2", "s-1")
+	queue := queueOf(server, mine, inferred, theirs, twinA, twinB, running, worker, unowned, looseWorker)
 
 	code := func(err error) string {
 		if err == nil {
@@ -471,6 +475,9 @@ func TestConfineFrontResolutionAndOwnerGuard(t *testing.T) {
 		{name: "unknown selector", selector: "nobody", caller: "s-1", want: runner.CodeConfineNotFound},
 		{name: "already admitted", selector: "running", caller: "s-1", want: runner.CodeConfineNotQueued},
 		{name: "worker by name is not a job-level selector", selector: "aitest-w1", caller: "s-1", want: runner.CodeConfineNotFound},
+		{name: "non-sub-reservation worker by name", selector: "aitest-w2", caller: "s-1", want: runner.CodeConfineNotFound},
+		{name: "non-sub-reservation worker by pid", selector: "6009", caller: "s-1", want: runner.CodeConfineNotFound},
+		{name: "non-sub-reservation worker by scope id", selector: looseWorker.scopeID, caller: "s-1", want: "OK"},
 		{name: "sub-reservation by scope id", selector: worker.scopeID, caller: "s-1", steal: true, want: runner.CodeConfineNotQueued},
 	} {
 		t.Run(test.name, func(t *testing.T) {
