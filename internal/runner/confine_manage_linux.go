@@ -170,21 +170,7 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 	if err != nil {
 		return ConfineListResult{Verdict: "unevaluated", Reason: err.Error(), Scopes: []ConfineRecord{}}, nil
 	}
-	readCmdline := deps.readCmdline
-	if readCmdline == nil {
-		readCmdline = readProcCmdline
-	}
-	readCwd := deps.readCwd
-	if readCwd == nil {
-		readCwd = readProcCwd
-	}
-	readEnviron := deps.readEnviron
-	if readEnviron == nil {
-		readEnviron = readProcEnviron
-	}
-	paneRefs := make(map[string]confineTmuxRef)
-	paneNone := make(map[string]bool)
-	paneUnknown := make(map[string]bool)
+	panes := newConfinePaneSets()
 	supervisorLive := deps.supervisorLive
 	if supervisorLive == nil {
 		supervisorLive = probeSupervisorLive
@@ -218,42 +204,14 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			owner = ConfineUnknownOwner
 		}
 		record := ConfineRecord{Name: name, Owner: owner, ScopeID: scopeID, SupervisorPID: &pid, Worker: IsAitestWorkerScopeName(name)}
-		// AIRA-135. The supervisor's own argv, read live from /proc exactly as
-		// memory.current and memory.max are read live from the cgroup below. It is
-		// deliberately read HERE, before the scope-directory open, because the two
-		// readings are independent: a scope whose directory has become unopenable
-		// can still have a live, readable supervisor, and vice versa.
-		if data, cmdErr := readCmdline(pid); cmdErr == nil {
-			if text, ok := confineCommandFromCmdline(data); ok {
-				record.Command = &text
-			} else {
-				record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
-			}
-		} else {
-			record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
-		}
-		// AIRA-276. The supervisor's working directory, read live beside its argv
-		// and, like it, independently of whether the scope directory can be opened.
-		if dir, cwdErr := readCwd(pid); cwdErr == nil && dir != "" {
-			record.Cwd = &dir
-		} else {
-			record.UnevaluatedFields = append(record.UnevaluatedFields, "cwd")
-		}
-		// AIRA-277. The launching tmux window, from the supervisor's environment.
-		// Only the two tmux variables are kept; resolving them to a name happens
-		// once per server after the loop.
-		if environ, envErr := readEnviron(pid); envErr != nil {
-			paneUnknown[scopeID] = true
-		} else {
-			switch ref, state := parseConfineTmuxRef(environ); state {
-			case paneInTmux:
-				paneRefs[scopeID] = ref
-			case paneNotInTmux:
-				paneNone[scopeID] = true
-			default:
-				paneUnknown[scopeID] = true
-			}
-		}
+		// AIRA-135 / AIRA-276 / AIRA-277. The supervisor's argv, working directory
+		// and launching tmux window, read live from /proc. Read HERE, before the
+		// scope-directory open, because the readings are independent: a scope whose
+		// directory has become unopenable can still have a live, readable
+		// supervisor, and vice versa. Shared with the queued-row builder
+		// (readConfineSupervisorFacets), which reads the same facets for a job that
+		// has no scope yet.
+		readConfineSupervisorFacets(&record, scopeID, pid, deps, panes)
 		// AIRA-183. Whether the SUPERVISOR still exists, read beside its argv from
 		// the same PID and, like it, independently of whether the scope directory
 		// can be opened at all.
@@ -361,7 +319,7 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		_ = scope.fd.Close()
 		byID[scopeID] = record
 	}
-	resolveConfinePanes(ctx, byID, paneRefs, paneNone, paneUnknown, deps.tmuxNames)
+	resolveConfinePanes(ctx, byID, panes.refs, panes.none, panes.unknown, deps.tmuxNames)
 	mergeConfineRegistry(byID, registry)
 	result := ConfineListResult{Verdict: "pass", Scopes: make([]ConfineRecord, 0, len(byID))}
 	for _, record := range byID {
@@ -369,6 +327,108 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 	}
 	sort.Slice(result.Scopes, func(i, j int) bool { return result.Scopes[i].ScopeID < result.Scopes[j].ScopeID })
 	return result, nil
+}
+
+// confinePaneSets collects, per scope id, what the environ read established about
+// the launching tmux pane; resolveConfinePanes turns it into labels once per tmux
+// server after the scan loop.
+type confinePaneSets struct {
+	refs    map[string]confineTmuxRef
+	none    map[string]bool
+	unknown map[string]bool
+}
+
+func newConfinePaneSets() confinePaneSets {
+	return confinePaneSets{refs: make(map[string]confineTmuxRef), none: make(map[string]bool), unknown: make(map[string]bool)}
+}
+
+// readConfineSupervisorFacets reads the three live facets that belong to a
+// confine SUPERVISOR process rather than to its cgroup scope: the wrapped command
+// (AIRA-135), the launch directory (AIRA-276) and, via its environment, the
+// launching tmux window (AIRA-277). It is the ONE place those reads and their
+// "unevaluated rather than fabricated" rules live, shared by the live scan and the
+// queued-row builder so the two cannot drift.
+//
+// A nil seam falls back to the real /proc reader. Each unreadable facet is named
+// in UnevaluatedFields; the pane is recorded in panes and named only once
+// resolveConfinePanes has tried to resolve it.
+func readConfineSupervisorFacets(record *ConfineRecord, scopeID string, pid int, deps confineScanDeps, panes confinePaneSets) {
+	readCmdline := deps.readCmdline
+	if readCmdline == nil {
+		readCmdline = readProcCmdline
+	}
+	readCwd := deps.readCwd
+	if readCwd == nil {
+		readCwd = readProcCwd
+	}
+	readEnviron := deps.readEnviron
+	if readEnviron == nil {
+		readEnviron = readProcEnviron
+	}
+	if data, cmdErr := readCmdline(pid); cmdErr == nil {
+		if text, ok := confineCommandFromCmdline(data); ok {
+			record.Command = &text
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
+		}
+	} else {
+		record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
+	}
+	if dir, cwdErr := readCwd(pid); cwdErr == nil && dir != "" {
+		record.Cwd = &dir
+	} else {
+		record.UnevaluatedFields = append(record.UnevaluatedFields, "cwd")
+	}
+	// Only the two tmux variables are kept; resolving them to a name happens once
+	// per server after the loop.
+	if environ, envErr := readEnviron(pid); envErr != nil {
+		panes.unknown[scopeID] = true
+	} else {
+		switch ref, state := parseConfineTmuxRef(environ); state {
+		case paneInTmux:
+			panes.refs[scopeID] = ref
+		case paneNotInTmux:
+			panes.none[scopeID] = true
+		default:
+			panes.unknown[scopeID] = true
+		}
+	}
+}
+
+func listQueuedConfines(ctx context.Context, entries []ConfineQueuedEntry) []ConfineRecord {
+	return listQueuedConfinesWithDeps(ctx, entries, defaultConfineScanDeps())
+}
+
+// listQueuedConfinesWithDeps reads each queued job's supervisor facets through the
+// SAME helper and seams the live scan uses (AIRA-308), so a queued row's command,
+// cwd and pane carry exactly a live row's trust level and honesty rules. There is
+// no scope directory, so none of the cgroup reads happen.
+func listQueuedConfinesWithDeps(ctx context.Context, entries []ConfineQueuedEntry, deps confineScanDeps) []ConfineRecord {
+	now := time.Now
+	if deps.now != nil {
+		now = deps.now
+	}
+	panes := newConfinePaneSets()
+	byID := make(map[string]ConfineRecord, len(entries))
+	order := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		record, pid, ok := queuedConfineRecord(entry, now())
+		if !ok {
+			continue
+		}
+		if _, seen := byID[entry.ScopeID]; seen {
+			continue
+		}
+		readConfineSupervisorFacets(&record, entry.ScopeID, pid, deps, panes)
+		byID[entry.ScopeID] = record
+		order = append(order, entry.ScopeID)
+	}
+	resolveConfinePanes(ctx, byID, panes.refs, panes.none, panes.unknown, deps.tmuxNames)
+	var rows []ConfineRecord
+	for _, scopeID := range order {
+		rows = append(rows, byID[scopeID])
+	}
+	return rows
 }
 
 func ReapOrphanedConfineScopes(ctx context.Context, slicePath string, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool) (ConfineReapResult, error) {

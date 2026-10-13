@@ -378,9 +378,18 @@ func confineCommandFromCmdline(data []byte) (string, bool) {
 }
 
 type ConfineListResult struct {
-	Verdict      string               `json:"verdict"`
-	Reason       string               `json:"reason,omitempty"`
-	Scopes       []ConfineRecord      `json:"scopes"`
+	Verdict string          `json:"verdict"`
+	Reason  string          `json:"reason,omitempty"`
+	Scopes  []ConfineRecord `json:"scopes"`
+	// Queued are the jobs still waiting in the admission queue (AIRA-308), in the
+	// daemon's enqueue order and bounded by ConfineQueuedRowLimit. A queued job
+	// holds no scope, so it is NEVER in Scopes and every consumer of Scopes is
+	// unaffected. Absent (omitted) when none are queued, when the caller was the
+	// blocked launcher's own position probe, or when the daemon predates the field;
+	// ConfineSliceReserve.Queued remains the true total waiting, so Queued shorter
+	// than that is a truncation (or a scope-less per-test reservation, which has no
+	// row) and a renderer must say so rather than present the list as complete.
+	Queued       []ConfineRecord      `json:"queued,omitempty"`
 	SliceReserve *ConfineSliceReserve `json:"slice_reserve,omitempty"`
 }
 
