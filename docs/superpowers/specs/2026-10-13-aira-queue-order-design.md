@@ -50,6 +50,13 @@ more job is the ceiling minus the granted total.
    in both hold windows and was granted at the first yield edge after its last one.
    - The one yield window it sat through fell while the ledger was full, so the duty cycle helped
      neither side.
+   - **CPU was checked and is unlikely to be the blocker.** The CPU admission ceiling was 32 slots
+     (the journal logs "2 per core x 16 cores"). There were 14-19 admitted jobs, and the default
+     declaration is 1 core per job (`DefaultConfineCPUCores`).
+     - Jobs that declared more cores cannot be ruled out from the saved data, because the wait line
+       carries no CPU figure.
+     - A CPU-blocked job would also have had to clear its CPU block exactly at the 19:28:10
+       hold-to-yield edge. The timing points to the freeze.
    - The longest small-job wait in the saved logs is at least 345 seconds. The "1 GiB job waited
      about 20 minutes" in AIRA-307 is **reported as** such; it is not in the saved logs.
    - The 20-30 minute waits in the logs belong to the **12 GiB heads**: seq=3419 at least 23m38s,
@@ -146,10 +153,18 @@ In each pass, the head is the first waiter in `admitOrderLocked` order that meet
 - it is not blocked by the exclusivity gate;
 - it is not a sub-reservation;
 - it is refused on capacity (RAM, CPU or VRAM);
-- it **could fit an empty slice now**: `reserve <= effectiveMaximum - admitSliceHeadroom(1)`.
+- it **could fit an empty slice now, in every resource**:
+  - RAM: `reserve <= effectiveMaximum - admitSliceHeadroom(1)`;
+  - CPU: `cpu <= cpuCeiling()`;
+  - VRAM: `vram == 0`, or the VRAM snapshot is fresh and evaluated and `vram` is within its
+    ceiling. An unevaluated or stale VRAM reading means **not a head**.
 
-**The last clause is new.** A job larger than the current, possibly throttled, ceiling cannot be
-helped by freezing anyone, so it never freezes. This applies to pushed and unpushed jobs alike.
+**The last clause is new.** A job that could not fit even an empty slice at the current, possibly
+throttled, ceilings cannot be helped by freezing anyone, so it never freezes. This applies to pushed
+and unpushed jobs alike.
+- The VRAM arm matters on its own. `vramWaiterFitsLocked` returns false on an unevaluated snapshot.
+  Without the arm, a pushed GPU job would freeze the whole machine for as long as nvidia-smi was
+  failing, and a pushed head has no backstop.
 - It closes the "pushed job that can never fit wedges the machine" hole.
   `E_ADMIT_TOO_LARGE` is decided against the unthrottled maximum (`admit.go`, the comment at the
   `admitEffectiveMaximum` call), so such a job can be queued and pushed.
@@ -172,7 +187,7 @@ For each later waiter W in the pass, in order:
    - Today only the yield windows rescue them.
 3. **Pushed head:** W waits. No budget, no yield, no anchor.
 4. **Unpushed head H:**
-   - **Yield phase:** W is granted if it fits.
+   - **Yield (the single backstop pass):** W is granted if it fits.
    - **Hold or idle phase:** W is granted if it fits **and** `H.bypassed + W.reserve <= H.reserve/2`.
    - Every grant past H, in any phase, adds W.reserve to `H.bypassed`.
    - If W fits but the budget refuses it, the freeze is now actually withholding a grant. That is
@@ -184,17 +199,43 @@ diagnostic.
 
 ### 3.5 Interaction with the AIRA-59 duty cycle (decision)
 
-**The budget replaces the time-based backfill windows. The duty cycle remains only as a backstop.**
-- **Deleted: `admitBackfillGrace`** (AIRA-4's 1-minute "backfill freely before freezing" window) and
-  its `AIRA_DAEMON_ADMIT_BACKFILL_GRACE` setting. The budget expresses the same allowance in bytes
-  instead of minutes.
-  - Keeping both would let a head be bypassed without limit for its first minute and by up to H/2
-    more after that.
-  - AIRA has no compatibility obligation, so deleting is preferred to layering.
-- **Kept unchanged:** `admitFreezePhaseAt`, the single anchor, the two writes and
-  `AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD`.
-- **Changed:** the anchor now arms when the budget first withholds a fitting grant, instead of when a
-  head past the grace is first refused.
+**The budget replaces the time-based backfill windows. A time cap remains only as a backstop.**
+
+**Deleted: `admitBackfillGrace`** (AIRA-4's 1-minute "backfill freely before freezing" window) and
+its `AIRA_DAEMON_ADMIT_BACKFILL_GRACE` setting. The budget expresses the same allowance in bytes
+instead of minutes.
+- Keeping both would let a head be bypassed without limit for its first minute and by up to H/2
+  more after that.
+- AIRA has no compatibility obligation, so deleting is preferred to layering.
+- This goes beyond the owner's decisions and can be vetoed at the plan gate.
+
+**Deleted: the yield window.** `admitFreezePhaseAt` keeps the single anchor and returns `hold` for
+`[armed, armed+maxHold)` and `idle` after that.
+- There is no longer a `maxHold`-long unrestricted yield.
+- The existing completed-cycle clear turns the first pass after a hold into exactly **one**
+  backfilling pass (phase = yield for that pass alone, anchor cleared). That clear exists today, and
+  it is now the whole backstop.
+
+**Why not keep the 2-minute yield window.** The replay shows it reproduces the starvation it is
+meant to bound.
+- A full 2-minute strict hold (19:26:09 to 19:28:10) raised ledger room only from about 0 to
+  8.5 GB. The 12 GiB head needed 12.9 GB.
+- So with a 2-minute hold, the backstop would fire on every big head. Its 2-minute unrestricted yield
+  would then refill the slice from the 53 GB backlog, exactly as on 2026-10-12.
+- A single pass still breaks any wedge, because everything that fits at that instant is admitted.
+  But it hands the saved-up room away only once per hold, not for two minutes.
+
+**Default `maxHold`: 2 minutes, proposed to rise to 5 minutes.** This is an open decision for the
+plan gate.
+- The basis is the replay's release rate. In the 19:26-19:28 hold, the granted total fell by
+  7.3 GB in 2 minutes, about 3.6 GB per minute.
+- At that rate, a 12 GiB head starting from a full ledger needs about 3.6 minutes of strict hold.
+- In the 19:22-19:24 hold, the granted total was flat for 90 seconds, so the rate varies. 5 minutes
+  leaves margin without letting a stuck head freeze others for a long time.
+- `AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD` remains the owner's tuning knob.
+
+**Changed:** the anchor arms when the budget first withholds a fitting grant, instead of when a head
+past the grace is first refused.
 
 **Why a backstop is still needed.**
 - S13 removed waiter timeouts, so a strict freeze would otherwise end only when its head is granted
@@ -206,22 +247,37 @@ diagnostic.
 
 **Bounds, one line each:**
 - **Head (unpushed):** it is bypassed by at most H/2 bytes before strict protection begins. After
-  that, only by the backstop's yield passes.
-- **Everyone else:** the slice is never strictly frozen for longer than `maxHold` without a full
+  that, only by one backfilling pass per `maxHold` of strict hold.
+- **Everyone else:** the slice is never strictly frozen for longer than `maxHold` without one full
   backfill pass, and the budget phase admits up to H/2 before any freeze starts.
 - **Pushed head:** it is never bypassed by new job-level work. It is not covered by the backstop;
   only a later push, a kill or its client leaving ends it. That is the owner's "drain the slice".
-  The §3.3 empty-slice clause and the §3.4 sub-reservation exemption are what keep a pushed head
-  from wedging the slice by construction.
+
+**Hazards a pushed head can still hit.**
+- **Closed:**
+  - by the §3.3 conjunctive empty-slice clause: a job too big for the current ceilings, or a job
+    whose VRAM cannot be evaluated;
+  - by the §3.4 exemption: a deadlock against sub-reservations.
+- **Accepted gaps, not "by construction"** (no freeze can drain these):
+  - the physical floor in `checkedAvailable` (slice memory the ledger did not grant);
+  - a long-lived granted lease, such as a confined dev server.
+
+  In both cases a pushed head stays frozen until the operator kills it, pushes another job, or the
+  blocker goes away. `aira top` shows the row as pushed.
 
 **What changes for heads.** This protects the head differently, not more than today.
 - Today a head gets 2-minute strict holds and loses everything in 2-minute yields.
-- Under this design it gets a bounded bypass first, then strict protection that ends only at its
-  grant or at a backstop cycle.
-- In the incident, the 12 GiB heads would have been bypassed by at most 6 GiB and then held
-  strictly, instead of being refilled every 2 minutes.
+- Under this design it gets:
+  1. a bounded bypass first;
+  2. then strict protection;
+  3. which `maxHold` interrupts only with single backfill passes.
+- The incident improves only if `maxHold` is longer than the time releases take to make room for the
+  head. That is the reason for the proposed 5-minute default.
+- At the current 2-minute default, the replayed 12 GiB head would still be refilled once per hold,
+  by a single pass rather than by a 2-minute window. Head starvation would be reduced, not removed.
 
-**The three defects listed in the `freezeArmedAt` comment stay impossible to write:**
+**The three defects listed in the `freezeArmedAt` comment stay impossible to write.** This is
+re-checked against the yield-less `admitFreezePhaseAt`:
 1. **Renewing an active hold every pass.** The arm is still guarded by derived phase == idle, and
    the budget refusal only reaches the arm through that guard.
 2. **Clearing the anchor when the head fits.** Nothing new writes the anchor. A head granted
@@ -230,9 +286,12 @@ diagnostic.
 3. **Re-anchoring on a change of holder.** A new head exhausting its budget during an active hold
    finds phase != idle and does not re-arm.
 
-The completed-cycle clear ("at least one backfilling pass per cycle") is untouched.
+**The completed-cycle clear still runs only from derived idle.** It now fires on the first pass at
+or after `armed + maxHold` rather than at `armed + 2*maxHold`. As today, that pass is the forced
+backfilling pass. The next pass with a withheld fitting grant re-arms from idle.
 
-`maxHold <= 0` (disabled) keeps its meaning: an unbounded strict freeze once the budget is spent.
+`maxHold <= 0` (disabled) keeps its meaning: the anchor is never written, so once the budget is spent
+the strict freeze is unbounded.
 
 ### 3.6 The verb: `aira confine --front`
 
@@ -282,9 +341,12 @@ The completed-cycle clear ("at least one backfilling pass per cycle") is untouch
 - **The `f` key ("push to front")** is the only queued-row action. It opens the existing confirmation
   page.
   - The page shows the job's name, owner, requested reserve and position.
-  - If the row's owner is not the viewer's attested owner, the page says so ("owned by X; confirming
-    overrides the owner check") and confirming sends `steal=true`. That page is the explicit steal
-    acknowledgement a human gives in `top`.
+  - **`aira top` has no owner identity.** It dispatches confine verbs as `ConfineUnknownOwner`
+    (`tui_data.go`), which is unattested, so every push from `top` is a steal.
+  - The page says so plainly: "aira top has no owner identity; confirming overrides the owner check
+    (--steal) for <owner>'s job". Confirming always sends `steal=true`.
+  - That page is the explicit steal acknowledgement a human gives in `top`. The ownership check
+    without `--steal` still applies to the CLI and MCP.
 - **Stale target.** If the job was admitted between selection and confirmation, the row is now live,
   and the kind check or the daemon's `E_CONFINE_NOT_QUEUED` refuses the action visibly.
 
@@ -339,11 +401,18 @@ shared daemon-restart care memory).
    and never counted.
 8. **Unfittable head.** A head larger than the empty-slice ceiling freezes nobody. The next waiter
    that fits is granted. When the ceiling rises, it becomes head again.
+   - Repeat for CPU (`cpu > cpuCeiling`).
+   - Repeat for VRAM: with an unevaluated or stale VRAM snapshot, a **pushed** GPU job is not a
+     head, and a fitting non-GPU waiter behind it is granted. Mutation: drop the VRAM arm, and the
+     queue freezes.
 9. **Backstop.**
    - Budget exhausted plus a withheld fitting grant arms the anchor.
-   - After `maxHold`, one yield pass grants freely, and those grants are counted.
-   - The existing AIRA-59 tests (no renew, no clear-on-fit, no re-anchor, at least one yield pass)
-     still pass, adapted from grace to budget.
+   - At `armed + maxHold`, exactly one pass grants freely, and those grants are counted.
+   - The pass after that, with a withheld fitting grant, re-arms the strict hold.
+   - Mutation: restore the `maxHold`-long yield window, and a second pass inside it grants freely,
+     which fails the test.
+   - The existing AIRA-59 tests (no renew, no clear-on-fit, no re-anchor, at least one backfilling
+     pass) still pass, adapted from grace to budget and from the yield window to the single pass.
 10. **Grace deleted.** The setting and its parser are removed, and a test pins that a just-enqueued
     head already limits jumpers to its budget.
 11. **Incident replay.** A deterministic scenario using the 19:22 window's figures: ceiling net of
@@ -376,8 +445,8 @@ shared daemon-restart care memory).
     `confine-front` with the scope id.
 17. `f` on a live row is refused by the kind check.
 18. A synthetic live-only action is refused on a queued row (the default-deny is pinned).
-19. The confirmation sends `steal=true` only when the row's owner differs from the viewer's, and
-    says so.
+19. The confirmation always sends `steal=true` and states that `top` has no owner identity. The
+    CLI without `--steal` is still refused for another session's job (test 13).
 
 ## 7. The from-scratch minimum, and the gap
 
@@ -389,16 +458,20 @@ shared daemon-restart care memory).
 - one `top` key.
 
 **Additions beyond it, each with its reason:**
-- **Empty-slice head clause (§3.3):** without it a pushed job larger than the throttled ceiling
-  wedges every session. One predicate, reused for unpushed heads, so there is no second rule.
+- **Empty-slice head clause (§3.3):** without it, a pushed job larger than the throttled ceiling, or
+  one whose VRAM cannot be evaluated, wedges every session. It is one conjunctive predicate, reused
+  for unpushed heads, so there is no second rule.
 - **Sub-reservation exemption (§3.4):** without it a pushed head can deadlock against running
   `--delegate-ram` suites. One `isSubReservation()` branch, the same as the exclusivity drain.
-- **Keeping the duty cycle as a backstop (§3.5):** without a timeout, a strict freeze with no
-  backstop has no end. The machinery already exists and only its arm condition moves.
+- **Keeping a time backstop (§3.5):** S13 removed waiter timeouts, so a strict freeze with no
+  backstop has no end. It reuses the existing anchor and completed-cycle clear. The yield window is
+  removed, so the duty cycle gets smaller.
 - **Row-kind default-deny in `top` (§3.7):** turns AIRA-308's "remember to guard" into
   "impossible by default". One field and one check.
 
-**Removed:** `admitBackfillGrace` and its setting.
+**Removed:**
+- `admitBackfillGrace` and its setting;
+- the `maxHold`-long yield window.
 
 **Not built:**
 - a separate queue-level "pushed" flag or list;
@@ -412,9 +485,14 @@ shared daemon-restart care memory).
 - **A pushed head stalls the slice for as long as it takes running jobs to finish.** That can be a
   12-minute `make ci`. This is the owner's intended cost. `aira top` marks the row as pushed, so an
   operator can see why the slice is frozen.
-- **Strict protection after the budget can stall small jobs for up to `maxHold` per cycle,** which
-  is the same as today's hold. The budget phase in front of it is new capacity for small jobs, not a
-  loss.
+- **Strict protection after the budget can stall small jobs for up to `maxHold` at a time,** and then
+  they get one backfilling pass.
+  - At 5 minutes this is a longer stall per cycle than today's 2-on, 2-off cycle.
+  - The trade is deliberate: big heads stop starving.
+  - The budget phase in front of the stall is new capacity for small jobs.
+  - The `maxHold` default is an open decision (§3.5).
+- **A pushed head stays frozen behind the physical floor or a long-lived lease.** These are the
+  accepted gaps listed in §3.5.
 - **Sub-reservations behind a big head can slow it.** They are bounded by the lifetimes of running
   suites. Accepted, and noted on the exemption.
 
