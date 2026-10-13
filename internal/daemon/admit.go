@@ -1337,9 +1337,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// than an unevaluated one. Same match, same guard as scopeReserves.
 		snapshot.scopeVRAM[waiter.scopeID] = waiter.vram
 	}
-	if s.admitFreezeMaxHold > 0 {
-		snapshot.phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
-	}
+	snapshot.phase = s.admitReportedPhaseLocked(queue, now)
 	// AIRA-101, in the same locked pass as the counts above.
 	if gate := exclusiveGateLocked(queue); gate.holder != nil || gate.draining != nil {
 		exclusive := gate.holder
@@ -2560,6 +2558,32 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// unbounded-freeze defect as re-anchoring, by another route.
 		queue.freezeHolderSeq = 0
 	}
+}
+
+// admitFreezePhasePushed is the reported phase while a PUSHED head (AIRA-309) is
+// holding every job-level waiter behind it. A pushed head never arms the duty
+// cycle's anchor, so the derived phase alone would read "idle" — the opposite of
+// the truth, on exactly the surfaces (`confine --list`, `aira top`'s footer,
+// `--dump`) an operator reads to learn why the slice is frozen.
+const admitFreezePhasePushed = "pushed"
+
+// admitReportedPhaseLocked is the freeze phase every diagnostic surface reports:
+// "pushed" while the last pass's protected head (freezeHolderSeq) is a pushed,
+// still-queued waiter; otherwise "disabled" with the duty cycle off (a freeze may
+// be blocking, so "idle" would state the opposite), else the derived phase.
+// Diagnosis only; queue.mu must be held.
+func (s *Server) admitReportedPhaseLocked(queue *sliceQueue, now time.Time) string {
+	if queue.freezeHolderSeq != 0 {
+		for _, waiter := range queue.waiters {
+			if waiter != nil && waiter.seq == queue.freezeHolderSeq && waiter.state == admitQueued && waiter.pushSeq > 0 {
+				return admitFreezePhasePushed
+			}
+		}
+	}
+	if s.admitFreezeMaxHold <= 0 {
+		return "disabled"
+	}
+	return admitFreezePhaseAt(queue.freezeArmedAt, now, s.admitFreezeMaxHold).String()
 }
 
 // admitCouldFitEmptyLocked is the AIRA-307/309 empty-slice clause of "who is the

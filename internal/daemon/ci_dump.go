@@ -233,11 +233,7 @@ func (s *Server) buildConfineDumpQueuesAndWaiters() ([]runner.ConfineDumpQueueRo
 			}
 			waiterRows = append(waiterRows, waiterRow)
 		}
-		if s.admitFreezeMaxHold > 0 {
-			row.Phase = admitFreezePhaseAt(queue.freezeArmedAt, now, s.admitFreezeMaxHold).String()
-		} else {
-			row.Phase = "disabled"
-		}
+		row.Phase = s.admitReportedPhaseLocked(queue, now)
 		queue.mu.Unlock()
 
 		if row.QueuedCount > 0 {

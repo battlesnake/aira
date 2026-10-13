@@ -3676,8 +3676,8 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			switch result.SliceReserve.FreezePhase {
 			case "hold":
 				note = " (fairness freeze holding capacity for the head waiter: its bypass budget is spent; one backfilling pass follows the hold)"
-			case "yield":
-				note = " (fairness freeze yielding; fitting waiters are being admitted)"
+			case "pushed":
+				note = " (a job pushed to the front with `aira confine --front` is holding every job behind it until it fits)"
 			}
 			_, _ = fmt.Fprintf(stdout, "slice queue: %d queued %s, freeze %s%s\n",
 				result.SliceReserve.Queued, waiterLabel, result.SliceReserve.FreezePhase, note)

@@ -663,3 +663,44 @@ func TestAdmitDrainPrecedesQueueOrder(t *testing.T) {
 	waitAdmitGrant(t, drain)
 	requireAdmitQueued(t, pushed)
 }
+
+// verifies: AIRA-309 — while a PUSHED head holds the queue, every diagnostic
+// surface reports phase "pushed", not "idle": a pushed head never arms the
+// anchor, so the derived phase alone would say nothing is frozen. Once the
+// pushed job is admitted the phase is the ordinary derived one again.
+func TestAdmitPushedHeadIsReportedAsPushedPhase(t *testing.T) {
+	for _, maxHold := range []time.Duration{time.Minute, 0} {
+		t.Run(maxHold.String(), func(t *testing.T) {
+			now := time.Unix(56000, 0)
+			server := queueOrderServer(t, 64*qGiB, &now)
+			server.admitFreezeMaxHold = maxHold
+			held := heldLease(1, 44*qGiB)
+			head := frontWaiter(2, "head", "s-1")
+			head.reserve = 24 * qGiB
+			small := frontWaiter(3, "small", "s-1")
+			queue := queueOf(server, held, head, small)
+			server.admitQueues["/slice"] = queue
+			mustPush(t, queue, head.scopeID)
+
+			server.evaluateAdmitQueue(queue)
+			requireAdmitQueued(t, small)
+			if phase := server.admitSliceSnapshot("/slice").phase; phase != admitFreezePhasePushed {
+				t.Fatalf("snapshot phase=%q while a pushed head holds the queue, want %q", phase, admitFreezePhasePushed)
+			}
+			queue.mu.Lock()
+			dumped := server.admitReportedPhaseLocked(queue, now)
+			queue.mu.Unlock()
+			if dumped != admitFreezePhasePushed {
+				t.Fatalf("dump phase=%q, want %q", dumped, admitFreezePhasePushed)
+			}
+
+			server.releaseAdmitWaiter(queue, held)
+			server.evaluateAdmitQueue(queue)
+			waitAdmitGrant(t, head)
+			want := map[bool]string{true: "idle", false: "disabled"}[maxHold > 0]
+			if phase := server.admitSliceSnapshot("/slice").phase; phase != want {
+				t.Fatalf("after the pushed job was admitted phase=%q, want %q", phase, want)
+			}
+		})
+	}
+}
