@@ -38,6 +38,8 @@ type ConfineQueuedEntry struct {
 	ReserveBytes int64
 	// VRAMBytes is its declared --vram request (0 = "declared no VRAM").
 	VRAMBytes int64
+	// Pushed is whether an operator pushed this waiter to the front (AIRA-309).
+	Pushed bool
 }
 
 // queuedConfineRecord builds the facets of a queued row that need no live read,
@@ -66,7 +68,7 @@ func queuedConfineRecord(entry ConfineQueuedEntry, now time.Time) (ConfineRecord
 	record := ConfineRecord{
 		Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid,
 		Worker:       IsAitestWorkerScopeName(name), // classified exactly as a live row is
-		ReserveBytes: &reserve, VRAMBytes: &vram,
+		ReserveBytes: &reserve, VRAMBytes: &vram, Pushed: entry.Pushed,
 		UnevaluatedFields: []string{"populated", "rss", "cap", "cpu", "supervisor_live"},
 	}
 	if age := now.Sub(time.Unix(0, stamp)); age >= 0 {
@@ -101,7 +103,7 @@ func shimQueuedConfines(entries []ConfineQueuedEntry, now time.Time) []ConfineRe
 
 // ListQueuedConfines builds queued rows, reading each supervisor's command, cwd
 // and tmux window live exactly as ListConfines does for a scope. entries are taken
-// in the order given (the daemon's enqueue order) and the result keeps it; a
+// in the order given (the daemon's evaluation order) and the result keeps it; a
 // nil result means no row could be established, never a fabricated one.
 func ListQueuedConfines(ctx context.Context, entries []ConfineQueuedEntry) []ConfineRecord {
 	return listQueuedConfines(ctx, entries)

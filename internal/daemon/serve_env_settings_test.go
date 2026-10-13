@@ -64,13 +64,6 @@ func serveEnvSettingRows() []serveEnvSetting {
 			get:   func(s *Server) any { return s.admitPollInterval },
 		},
 		{
-			field: "admitBackfillGrace",
-			env:   "AIRA_DAEMON_ADMIT_BACKFILL_GRACE",
-			value: "37s",
-			want:  37 * time.Second,
-			get:   func(s *Server) any { return s.admitBackfillGrace },
-		},
-		{
 			field: "admitFreezeMaxHold",
 			env:   "AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD",
 			value: "91s",

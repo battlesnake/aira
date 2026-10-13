@@ -165,6 +165,12 @@ func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher
 		stdin: stdin, stdout: stdout, stderr: stderr,
 	}
 	runtime.state.CanExecute = runtime.canExecute
+	// AIRA-309. Resolved once, like the CLI's own owner, so a push from `top` is
+	// attributed. An unresolvable identity (an invalid AIRA_CONFINE_OWNER) leaves
+	// it unknown, which the confirmation states and which always sends --steal.
+	if owner, err := resolveConfineOwner(ctx, ""); err == nil {
+		runtime.state.ConfineOwner = owner
+	}
 	if board != nil {
 		runtime.isBoard = true
 		runtime.state.Board = board
@@ -372,6 +378,16 @@ func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 	}
 	if key == 0 {
 		return event
+	}
+	if r.state.Active == viewTop {
+		// AIRA-309. The top table refreshes every tick and tview keeps its
+		// highlight by row INDEX, so a selection recorded when the cursor last
+		// moved can name a different job by now. The target of a row action is
+		// re-read from the highlighted row at the keypress itself.
+		if table := r.tables[viewTop]; table != nil {
+			row, _ := table.GetSelection()
+			r.state = onTopHighlight(r.state, row)
+		}
 	}
 	var commands []tuiCmd
 	r.state, commands = onTUIKey(r.state, key, r.descriptors)
@@ -590,8 +606,8 @@ func (r *tuiRuntime) render() {
 		keys = "    r refresh  : palette  q quit"
 	}
 	if r.state.Active == viewTop {
-		// AIRA-276. Advertised only on the tab it works on.
-		keys = "    c command/dir" + keys
+		// AIRA-276 / AIRA-309. Advertised only on the tab they work on.
+		keys = "    c command/dir  f push queued job to front" + keys
 	}
 	r.tabs.SetText(strings.Join(tabNames, "  ") + keys)
 	r.detachedStatus.SetText(r.state.DetachedReport)

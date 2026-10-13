@@ -300,7 +300,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		status := options["status"] == "true"
 		// AIRA (admission-counter rebuild) S18.
 		dumpPath := options["dump"]
-		management := options["list"] == "true" || options["kill"] != "" || status || options["budget"] == "true" || dumpPath != ""
+		management := options["list"] == "true" || options["kill"] != "" || options["front"] != "" || status || options["budget"] == "true" || dumpPath != ""
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return renderConfineRefusal(args, response, true, stdout, stderr)
@@ -378,7 +378,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if verb == "confine-status" {
 		return runConfineStatusCommand(context.Background(), options, renderJSON, stdout, stderr)
 	}
-	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-budget" {
+	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" || verb == "confine-budget" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
 			code := store.ErrorCode(requestErr)
@@ -876,6 +876,8 @@ var parseArgsAllowedOptions = map[string]map[string]bool{
 	// AIRA (admission-counter rebuild) S18.
 	"confine-dump": {"dump": true, "slice": true, "owner": true},
 	"confine-kill": {"steal": true, "slice": true, "owner": true},
+	// AIRA-309, the kill verb's option set: same selector, same owner guard.
+	"confine-front": {"steal": true, "slice": true, "owner": true},
 	// AIRA-196. No --slice on either: both address a job through the durable
 	// record store, never a cgroup slice, and an accepted-and-ignored --slice
 	// is exactly the silently discarded scope AIRA-82 refuses.
@@ -1489,7 +1491,7 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 			}
 		// AIRA (admission-counter rebuild) S18. --dump joins kill/slice/owner in
 		// the value-required group: the archival target file path.
-		case "kill", "slice", "owner", "dump":
+		case "kill", "front", "slice", "owner", "dump":
 			value := inline
 			if !hasInline {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
@@ -1511,7 +1513,7 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 			// delimiter (the reported case: no `--cpu-timeout` error implied to a
 			// peer that the flag did not exist at all). Named explicitly instead.
 			if confineLaunchOptionValueless(name) || confineLaunchOptionTakesValue(name) {
-				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s is a confine LAUNCH option and requires the -- <cmd> delimiter, e.g. aira confine --%s ... -- <cmd>; it is not valid for confine management (--list/--budget/--dump/--kill/--status) on its own (run 'aira confine --help' for the full option list)", name, name)
+				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s is a confine LAUNCH option and requires the -- <cmd> delimiter, e.g. aira confine --%s ... -- <cmd>; it is not valid for confine management (--list/--budget/--dump/--kill/--front/--status) on its own (run 'aira confine --help' for the full option list)", name, name)
 			}
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine management", name)
 		}
@@ -1524,11 +1526,12 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	}
 	list := options["list"] == "true"
 	kill := options["kill"] != ""
+	front := options["front"] != ""
 	status := options["status"] == "true"
 	budget := options["budget"] == "true"
 	dump := options["dump"] != ""
 	selected := 0
-	for _, chosen := range []bool{list, kill, status, budget, dump} {
+	for _, chosen := range []bool{list, kill, front, status, budget, dump} {
 		if chosen {
 			selected++
 		}
@@ -1538,13 +1541,13 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 		// operator who typed a bare `aira confine` (or a launch attempt that
 		// mis-parsed to zero recognised management flags) with no hint that a
 		// launch form exists at all.
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine requires either a management flag (--list, --budget, --dump <file>, --kill <selector>, or --status [<selector>]) or a launch target after the -- delimiter (e.g. aira confine --memory-reserve 4G -- make test); run 'aira confine --help' for the full option list")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine requires either a management flag (--list, --budget, --dump <file>, --kill <selector>, --front <selector>, or --status [<selector>]) or a launch target after the -- delimiter (e.g. aira confine --memory-reserve 4G -- make test); run 'aira confine --help' for the full option list")
 	}
 	if selected != 1 {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --dump <file>, --kill <selector>, or --status [<selector>]")
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --dump <file>, --kill <selector>, --front <selector>, or --status [<selector>]")
 	}
-	if !kill && options["steal"] == "true" {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")
+	if !kill && !front && options["steal"] == "true" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill or --front")
 	}
 	// --status reads a durable filesystem record and never touches a cgroup
 	// slice, so an accepted-and-ignored --slice would be exactly the silently
@@ -1561,17 +1564,17 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 }
 
 // confineHelpVerbs is every dispatch-table verb `aira confine --help` prints:
-// the launch form itself plus its five management subcommands. Deliberately a
+// the launch form itself plus its six management subcommands. Deliberately a
 // fixed, named list rather than "every verb whose name starts with confine" —
 // confine-reserve/confine-log/confine-input/confine-report are real, separate
 // features with their own callers (aitest, a detached job's own handle), not
 // part of the two modes AIRA-243 is about.
-var confineHelpVerbs = []string{"confine", "confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-status"}
+var confineHelpVerbs = []string{"confine", "confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-front", "confine-status"}
 
 // runConfineHelpCommand answers `aira confine --help` when the request reaches
 // the parser (e.g. `confine --list --help`); the common spelling is answered by
 // the pre-parse. Both use the one renderer, renderVerbHelp, so the confine
-// family rows (the launch form plus its five management subcommands, the same
+// family rows (the launch form plus its six management subcommands, the same
 // generated dispatch-table text `aira help` prints) can never drift from it.
 func runConfineHelpCommand(renderJSON bool, stdout, stderr io.Writer) int {
 	response, found := verbHelpResponse("confine")
@@ -2309,6 +2312,11 @@ func runConfineManagementCommand(ctx context.Context, options map[string]string,
 		args["selector"] = selector
 		args["steal"] = options["steal"] == "true"
 	}
+	if selector := options["front"]; selector != "" {
+		verb = "confine-front"
+		args["selector"] = selector
+		args["steal"] = options["steal"] == "true"
+	}
 	return dispatchConfineManagementRequest(ctx, core.Request{Verb: verb, Args: args}, jsonOutput, stdout, stderr, injected)
 }
 
@@ -2697,9 +2705,9 @@ func buildRequestArgs(verb string, positional []string, options map[string]strin
 			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-budget accepts no selector")
 		}
 		args["slice"], args["owner"] = options["slice"], options["owner"]
-	case "confine-kill":
+	case "confine-kill", "confine-front":
 		if len(positional) != 1 || positional[0] == "" {
-			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-kill requires one selector")
+			return core.Request{}, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s requires one selector", verb)
 		}
 		args["selector"] = positional[0]
 		args["steal"] = options["steal"] == "true"
@@ -3667,9 +3675,9 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			note := ""
 			switch result.SliceReserve.FreezePhase {
 			case "hold":
-				note = " (fairness freeze holding capacity for the head waiter; it yields shortly)"
-			case "yield":
-				note = " (fairness freeze yielding; fitting waiters are being admitted)"
+				note = " (fairness freeze holding capacity for the head waiter: its bypass budget is spent; one backfilling pass follows the hold)"
+			case "pushed":
+				note = " (a job pushed to the front with `aira confine --front` is holding every job behind it until it fits)"
 			}
 			_, _ = fmt.Fprintf(stdout, "slice queue: %d queued %s, freeze %s%s\n",
 				result.SliceReserve.Queued, waiterLabel, result.SliceReserve.FreezePhase, note)

@@ -11,8 +11,13 @@ import (
 	"aira/internal/testdeadline"
 )
 
-// verifies: AIRA-59 end-to-end at the REAL entry point, reproducing the live
-// incident rather than a resemblance of it.
+// verifies: AIRA-59 and AIRA-307 end-to-end at the REAL entry point,
+// reproducing the live incident rather than a resemblance of it.
+//
+// AIRA-307 reshaped the expectation: the first reservations behind the head are
+// now admitted AT ONCE, within the head's budget (half its reserve); only once
+// that budget is spent does the strict hold protect the head, and the hold ends
+// in one backfilling pass.
 //
 // Shape taken from the observed failure: one unrelated 32G-class head waiter on
 // the shared machine-wide aira.slice queue, and behind it many ~1G pinned
@@ -46,7 +51,6 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 	server := admitTestServer(&maximum)
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 	server.admitPollInterval = time.Hour // passes are driven explicitly below
 
@@ -128,19 +132,17 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// The unrelated neighbour: a 32G-class request that cannot fit in ~30G.
+	// The unrelated neighbour: a 32G-class request that cannot fit in ~30G. Its
+	// AIRA-307 budget is 16G: sixteen of the 1G reservations below pass at once.
 	head := start("merge-gate-32G", validAdmitArgs(32*gib, int64(30*time.Minute/time.Millisecond)))
 	defer head.conn.Close()
 	settle()
 
-	// Past the backfill grace the freeze arms and protects the head.
-	advance(11 * time.Second)
-	settle()
-
 	// The small pinned reservations arrive behind it. Each would fit comfortably
-	// in the ~30G of real headroom.
-	perTest := make([]*call, 0, 8)
-	for index := 0; index < 8; index++ {
+	// in the ~30G of real headroom; 20 of them is 4 more than the budget.
+	const withinBudget = 16
+	perTest := make([]*call, 0, 20)
+	for index := 0; index < 20; index++ {
 		perTest = append(perTest, start(
 			fmt.Sprintf("pytest-reserve-%d", index),
 			map[string]any{
@@ -154,9 +156,9 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 	}
 	settle()
 
-	// All eight must actually be ENQUEUED before the clock advances, or scheduling
-	// could let them arrive during the yield and the test would prove nothing
-	// about the freeze at all.
+	// All twenty must actually have REACHED the daemon (granted or queued)
+	// before the clock advances, or scheduling could let them arrive during the
+	// backstop pass and the test would prove nothing about the freeze at all.
 	queuedNow := func() int {
 		server.admitRegistryMu.Lock()
 		queue := server.admitQueues["/slice"]
@@ -175,22 +177,26 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 		return count
 	}
 	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
-	for queuedNow() < len(perTest) && time.Now().Before(deadline) {
+	for queuedNow()+grantsOf(gib) < len(perTest) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 		settle()
 	}
-	if got := queuedNow(); got != len(perTest) {
-		t.Fatalf("only %d/%d per-test reservations were queued before the clock advanced; the freeze was never actually exercised", got, len(perTest))
+	if got := queuedNow() + grantsOf(gib); got != len(perTest) {
+		t.Fatalf("only %d/%d per-test reservations reached the daemon before the clock advanced; the freeze was never actually exercised", got, len(perTest))
 	}
 
-	// While the freeze holds, they are blocked. This is the CORRECT half of the
-	// mechanism — head-of-line protection — and must survive the fix.
-	if granted := grantsOf(gib); granted != 0 {
-		t.Fatalf("%d per-test reservations were admitted during the protective hold; head-of-line protection was removed, not bounded", granted)
+	// AIRA-307: the head's budget lets exactly sixteen 1G reservations past it at
+	// once — no stall on a slice with ~30G free. The rest are held: that is the
+	// CORRECT half of the mechanism — head-of-line protection — and must survive.
+	if granted := grantsOf(gib); granted != withinBudget {
+		t.Fatalf("%d per-test reservations were admitted past the 32G head, want exactly its 16G budget (16)", granted)
+	}
+	if queued := queuedNow(); queued != len(perTest)-withinBudget {
+		t.Fatalf("%d per-test reservations held behind the head, want %d", queued, len(perTest)-withinBudget)
 	}
 
-	// Once the hold is spent the queue yields and every fitting per-test
-	// reservation is admitted, on a slice that had the room all along.
+	// Once the hold is spent the backstop's one backfilling pass admits every
+	// fitting per-test reservation, on a slice that had the room all along.
 	advance(61 * time.Second)
 	settle()
 	settle()

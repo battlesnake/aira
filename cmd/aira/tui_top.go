@@ -744,8 +744,8 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	// no memory, CPU or VRAM, so drawing it in a bar would state a claim nothing
 	// has. Nor do they pass through assignTopSlots, so a queued job taking a place
 	// in the queue (or leaving it) cannot move a live row's slot or colour.
-	for _, record := range result.Queued {
-		model.Rows = append(model.Rows, topQueuedRow(record, previous.ShowCwd))
+	for index, record := range result.Queued {
+		model.Rows = append(model.Rows, topQueuedRow(record, previous.ShowCwd, index+1))
 	}
 	// AIRA-192. ONE undrawn category now, because there is one reason: the daemon
 	// published no reserve for that scope. The note says so rather than leaving an
@@ -768,20 +768,33 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 // is neither the live rows' "unevaluated" (could not be read) nor a drawn zero.
 //
 // RESERVATION and VRAM show what the job ASKED for, marked "req" so a request is
-// never read as a held charge. ID is deliberately empty: the live rows' ID is the
-// scope id, and a not-yet-admitted scope must never be a selectable target for any
-// row action (the selection and inline-action paths both ignore an empty ID).
-// A FUTURE row action added to `aira top` must guard on an empty ID the same way,
-// or a queued row becomes its target.
-func topQueuedRow(record runner.ConfineRecord, showCwd bool) tableRow {
+// never read as a held charge. The LIVE column reads "pushed" for a job an
+// operator pushed to the front (AIRA-309), which then holds every job behind it.
+//
+// ID is the scope id, the same id the row keeps once admitted, so a queued row is
+// selectable (AIRA-309). It is marked Queued, and that ROW KIND is what keeps it
+// from being any other action's target: an inline action targets live rows only
+// unless it opts in to queued rows (inlineAction.QueuedRow), and `f` (push to
+// front) is the only one that does. position is the row's 1-based place among
+// the LISTED queued rows, which are in evaluation order; it undercounts the true
+// queue position when scope-less reservations are queued ahead, so it is worded
+// as the listed position.
+func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) tableRow {
 	lastText := record.Command
 	if showCwd {
 		lastText = record.Cwd
 	}
+	state := "queued"
+	if record.Pushed {
+		state = "pushed"
+	}
 	return tableRow{
+		ID: record.ScopeID, Queued: true,
+		ConfirmText: fmt.Sprintf("push %s (owner %s, requested %s, listed queue position %d) to the front of the admission queue",
+			record.Name, record.Owner, topQueuedBytesCell(record.ReserveBytes, "0M req"), position),
 		Colour: topColourQueued, Cells: []string{
 			"-", record.Name, confineNum(record.SupervisorPID),
-			"queued", topAgeCell(record.AgeSeconds), topQueuedBytesCell(record.ReserveBytes, "0M req"),
+			state, topAgeCell(record.AgeSeconds), topQueuedBytesCell(record.ReserveBytes, "0M req"),
 			"-", "-", topQueuedBytesCell(record.VRAMBytes, topVRAMCell(new(int64))), topSessionCell(record), topUntrustedCell(lastText),
 		},
 	}

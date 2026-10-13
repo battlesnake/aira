@@ -907,7 +907,6 @@ func TestSliceCeilingThrottleReachesCapacityOnly(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = 10 * time.Millisecond
-	server.admitBackfillGrace = 0
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
@@ -1264,7 +1263,6 @@ func TestSliceCeilingDoesNotReachTheOOMEscalationClamp(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = 10 * time.Millisecond
-	server.admitBackfillGrace = 0
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }

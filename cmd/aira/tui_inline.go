@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"aira/internal/core"
+	"aira/internal/runner"
 )
 
 type inlineValueSource uint8
@@ -37,6 +38,13 @@ type inlineAction struct {
 	EnumArg     string
 	Field       string
 	Fixed       string
+	// QueuedRow is the ROW KIND this action targets (AIRA-309). False — the
+	// default every action gets by omission — means LIVE rows only; true means
+	// queued (`aira top` waiting-job) rows only. onInlineActionStart refuses a
+	// mismatch, so a queued row can never become the target of an action written
+	// for running jobs: AIRA-308's "a future row action must guard on an empty ID"
+	// became "an action targets queued rows only by opting in".
+	QueuedRow bool
 }
 
 type inlineActionState struct {
@@ -84,8 +92,63 @@ func inlineActionFor(view tuiView, key rune) (inlineAction, bool) {
 		case 's':
 			action = inlineAction{Key: key, Label: "start work", Verb: "mv", Safety: core.SafetyMutate, ValueSource: inlineValueFixed, ValueArg: "status", Fixed: "in-progress"}
 		}
+	case viewTop:
+		// AIRA-309. The only queued-row action: push the waiting job to the front
+		// of the admission queue, behind a confirmation (topFrontConfirm).
+		if key == 'f' {
+			action = inlineAction{Key: key, Label: "push to front", Verb: "confine-front", Safety: core.SafetyExecute, ValueSource: inlineValueFixed, QueuedRow: true}
+		}
 	}
 	return action, action.Verb != ""
+}
+
+// topFrontConfirm builds the confirmation page for `aira top`'s `f` key
+// (AIRA-309) directly, rather than through the palette: confine-front is a
+// client-routed SafetyExecute verb, which the palette deliberately never admits
+// (paletteOperationAdmitted), and it addresses the machine-wide slice rather
+// than a project.
+//
+// The push is sent as state.ConfineOwner (the CLI's owner chain, resolved at
+// startup), so the daemon's audit line names the pusher. It sends steal=false
+// only for the caller's OWN job under an attested identity, exactly the case the
+// shared guard passes without --steal; every other push (another session's job,
+// an inferred "@cwd-…" or unknown caller) sends steal=true, and the page says so
+// in plain words. That page is the explicit steal acknowledgement a human gives
+// in `top`; the CLI and MCP still need --steal for another session's job.
+func topFrontConfirm(state tuiState, row tableRow) (tuiState, []tuiCmd) {
+	caller := state.ConfineOwner
+	if caller == "" {
+		caller = runner.ConfineUnknownOwner
+	}
+	jobOwner := ""
+	if _, _, _, parsed, ok := runner.ParseConfineScopeID(row.ID); ok {
+		jobOwner = parsed
+	}
+	owner := jobOwner
+	if owner == "" {
+		owner = "an unknown owner"
+	}
+	own := runner.ConfineOwnerIsAttested(caller) && caller == jobOwner
+	request := core.Request{Verb: "confine-front", Args: map[string]any{
+		"selector": row.ID, "steal": !own,
+		"slice": runner.ResolveConfineSlice(""), "owner": caller,
+	}}
+	summary := row.ConfirmText
+	if summary == "" {
+		summary = "push " + row.ID + " to the front of the admission queue"
+	}
+	summary += ". It then holds every job behind it until it fits. "
+	switch {
+	case own:
+		summary += "It is your job (" + caller + ")."
+	case caller == runner.ConfineUnknownOwner:
+		summary += "aira top has no owner identity; confirming overrides the owner check (--steal) for " + owner + "'s job."
+	default:
+		summary += "You are " + caller + "; confirming overrides the owner check (--steal) for " + owner + "'s job, and the push is logged as yours."
+	}
+	state.PaletteOpen = true
+	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: "confine-front"}
+	return state, nil
 }
 
 func onInlineActionStart(state tuiState, action inlineAction, descriptors []core.DispatchDescriptor) (tuiState, []tuiCmd) {
@@ -101,9 +164,28 @@ func onInlineActionStart(state tuiState, action inlineAction, descriptors []core
 	if !ok {
 		return state, nil
 	}
+	// AIRA-309 row-kind default-deny: an action reaches a queued row only if it
+	// opted in, and a queued-row action never reaches a live one. Refused
+	// visibly, never silently: the selected job may have been admitted between
+	// selection and keypress, and the operator must see why nothing happened.
+	if row.Queued != action.QueuedRow {
+		kind := "running (admitted) jobs"
+		if action.QueuedRow {
+			kind = "jobs still waiting in the admission queue"
+		}
+		state.InlineError = fmt.Sprintf("E_TUI_INLINE_ROW_KIND: %s applies only to %s", action.Label, kind)
+		state.InlineAction = nil
+		return state, nil
+	}
 	pending := &inlineActionState{
 		Action: action, TargetID: panel.SelectedID, LeaseToken: row.LeaseToken,
 		LeaseVersion: row.LeaseVersion, Values: map[string]string{"selector": panel.SelectedID},
+	}
+	if action.Verb == "confine-front" {
+		state.InlineError = ""
+		state.InlineAction = pending
+		pending.Stage = inlineStageConfirm
+		return topFrontConfirm(state, row)
 	}
 	state.PaletteOpen = true
 	state.InlineError = ""

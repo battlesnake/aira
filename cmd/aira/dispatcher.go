@@ -159,7 +159,7 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	// invocation in every directory. Both shipped spellings (`confine --budget`
 	// and `confine-budget`) converge here, so the verb was wholly unreachable and
 	// the daemon's own handler at internal/daemon/server.go:785 was dead code.
-	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" || canonical == "confine-dump" {
+	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-budget" || canonical == "confine-dump" {
 		if canonical == "confine-budget" || canonical == "confine-dump" {
 			return d.dispatchConfineHistory(ctx, request)
 		}
@@ -220,6 +220,9 @@ func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, re
 	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
 	response, err := d.doExchange(ctx, frame)
 	if err == nil {
+		if request.Verb == "confine-front" {
+			return withOldDaemonFrontHint(response.CoreResponse())
+		}
 		return response.CoreResponse()
 	}
 	if daemon.IsRequestOutcomeUnknown(err) || !daemon.IsRequestNotSent(err) && store.ErrorCode(err) != daemon.CodeUnavailable {
@@ -256,6 +259,18 @@ func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, re
 			Reason: "the daemon is unreachable, and it is the only holder of both the peak-RSS history and the live admission " +
 				"queues this dump reads; nothing here can be established from the cgroup directory alone",
 		}}
+	}
+	// Default-deny: only confine-list and confine-kill have a daemon-down
+	// fallback. Everything past this point that is not confine-list falls through
+	// to KillConfine, so any other management verb is refused HERE, before the
+	// ci-shim and slice-resolution steps, never silently turned into a kill.
+	// AIRA-309 found confine-front heading there: without this return an
+	// operator's "push this job to the front" would KILL that job whenever the
+	// daemon was unreachable. The queue a push reorders exists only inside the
+	// daemon, so with the daemon down there is nothing to push; the transport
+	// error says so.
+	if request.Verb != "confine-list" && request.Verb != "confine-kill" {
+		return transportErrorResponse(err)
 	}
 	// AIRA-121. The daemon-down fallback below enumerates the REAL slice cgroup
 	// directory. In ci-shim mode there is no such directory and no cgroup record
@@ -504,6 +519,27 @@ func (d *daemonDispatcher) TUILeaseToken(scope daemon.WorktreeScope, ticketID st
 func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.WorktreeScope, request core.Request) paletteDispatchAttempt {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
+	if canonical == "confine-front" {
+		// AIRA-309. `aira top`'s `f` key (topFrontConfirm) is the one confirmed
+		// row action that is client-routed: confine-front is project-less confine
+		// management and goes through the same management exchange as the CLI's
+		// `confine --front` (dispatchConfineManagementOnce), never through a
+		// project store. The verb is named exactly, so no other client-routed
+		// verb is admitted by this arm. It has no daemon-down fallback (nothing
+		// to push without the daemon's queue), so it is one exchange, classified
+		// exactly like the routed path below: a transport failure keeps its send
+		// evidence, and only a daemon-answered error code is a rejection.
+		owner, _ := request.Args["owner"].(string)
+		if err := runner.ValidateConfineOwner(owner); err != nil {
+			return paletteDispatchAttempt{Err: fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err), Send: paletteSendNotSent}
+		}
+		frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
+		attempt := paletteAttemptFrom(d.doExchange(ctx, frame))
+		if attempt.Err == nil {
+			attempt.Response = withOldDaemonFrontHint(attempt.Response)
+		}
+		return attempt
+	}
 	if route != core.RouteDaemon {
 		// The palette is a routed-only, read-only-store face: it must NEVER execute
 		// a client-routed verb locally (Sol build-review P0). A client route here can
@@ -519,9 +555,14 @@ func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.Wor
 	stampGitContext(scope, &request)
 	prepareRoutedRequest(&request)
 	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: scope, Request: request}
-	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+	return paletteAttemptFrom(d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
 		return d.exchangeOrStart(ctx, frame)
-	})
+	}))
+}
+
+// paletteAttemptFrom classifies one palette exchange: a transport failure
+// keeps whatever send evidence it carries, and a reply is checked for shape.
+func paletteAttemptFrom(response daemon.ResponseFrame, err error) paletteDispatchAttempt {
 	if err != nil {
 		send := paletteSendUnprovable
 		if daemon.IsRequestNotSent(err) {
@@ -701,6 +742,21 @@ func prepareRoutedRequest(request *core.Request) {
 	if raw, ok := request.Args["raw"].([]byte); ok {
 		request.Args["raw"] = string(raw)
 	}
+}
+
+// withOldDaemonFrontHint (AIRA-309) explains a confine-front refusal whose code
+// is outside the verb's own vocabulary. The protocol version did not change, so
+// a daemon that predates the verb accepts the frame and answers with an
+// unrelated code (an empty-scope project lookup's, most likely), which on its own
+// reads as nonsense for "push this job to the front". The daemon's code and words
+// are kept; only the likely cause is appended. Every code the verb itself can
+// produce (E_CONFINE_*, E_SELECTOR_AMBIGUOUS) passes through untouched.
+func withOldDaemonFrontHint(response core.Response) core.Response {
+	if response.OK || strings.HasPrefix(response.Code, "E_CONFINE_") || response.Code == "E_SELECTOR_AMBIGUOUS" {
+		return response
+	}
+	response.Error += " (the running aira daemon may predate `aira confine --front`; restart it with `systemctl --user restart aira-daemon.service`)"
+	return response
 }
 
 func transportErrorResponse(err error) core.Response {

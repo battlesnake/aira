@@ -360,7 +360,7 @@ func TestConfineQueueNoteNamesTheReserveHeldByAdmittedJobs(t *testing.T) {
 		Queued: 9, QueuePosition: 1, QueuedAheadBytes: 0,
 		GrantedBytes: 52 << 30, Jobs: 9, CeilingBytes: 64 << 30, GrantedEstablished: true,
 	})
-	if !strings.Contains(note, "queue position 1 of 9 by enqueue order, 0M queued ahead") {
+	if !strings.Contains(note, "queue position 1 of 9 in evaluation order, 0M queued ahead") {
 		t.Fatalf("note=%q, want the AIRA-24 queue clause unchanged", note)
 	}
 	if !strings.Contains(note, "53248M already granted across 9 admitted jobs / 65536M slice ceiling") {

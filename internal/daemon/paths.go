@@ -45,16 +45,25 @@ const (
 	defaultJournalFlushInterval = 60 * time.Second
 	defaultWatchPollInterval    = 500 * time.Millisecond
 	defaultAdmitPollInterval    = 250 * time.Millisecond
-	defaultAdmitBackfillGrace   = time.Minute
 	// defaultAdmitFreezeMaxHold bounds how long the fairness freeze may block the
-	// whole queue CONTINUOUSLY before it must yield for the same duration — so
-	// fairness never costs more than half of wall time (AIRA-59). Before this, a
-	// freeze lasted until its head waiter's own timeout, so one ordinary
-	// oversized request stalled every session on the machine for up to 30 minutes
-	// on a visibly idle box. Crucially the bound is INDEPENDENT of max_wait_ms,
-	// which is what makes AIRA-58's far more generous wait ceiling safe rather
-	// than catastrophic. 0/"disabled" restores the old unbounded behaviour.
-	defaultAdmitFreezeMaxHold = 2 * time.Minute
+	// whole queue CONTINUOUSLY before the evaluator must make one backfilling pass
+	// (AIRA-59; AIRA-307 replaced the maxHold-long yield window that used to follow
+	// each hold with that single pass). Before AIRA-59 a freeze lasted until its
+	// head waiter's own timeout, so one ordinary oversized request stalled every
+	// session on the machine for up to 30 minutes on a visibly idle box.
+	// Crucially the bound is INDEPENDENT of max_wait_ms, which is what makes
+	// AIRA-58's far more generous wait ceiling safe rather than catastrophic.
+	// 0/"disabled" makes the strict freeze (once a head's AIRA-307 budget is
+	// spent) unbounded. It applies only to UNPUSHED heads: a pushed head (AIRA-309)
+	// has no backstop.
+	//
+	// 5 minutes (AIRA-307; was 2): the hold now ends in ONE backfilling pass
+	// rather than a 2-minute yield, so it must outlast the time releases take to
+	// make room for a big head. The 2026-10-12 replay released about 3.6 GB per
+	// minute, so a 12 GiB head starting from a full ledger needs about 3.6
+	// minutes of strict hold; at 2 minutes every such head would still be refilled
+	// once per hold.
+	defaultAdmitFreezeMaxHold = 5 * time.Minute
 	defaultWatchdogInterval   = 2 * time.Second
 	// AIRA-103 samples on the SAME cadence as the watchdog so the daemon has one
 	// notion of "sustained memory pressure", differing only in what it measures
@@ -285,25 +294,13 @@ func admitPollIntervalFromEnv() (time.Duration, error) {
 	return interval, nil
 }
 
-func admitBackfillGraceFromEnv() (time.Duration, error) {
-	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_BACKFILL_GRACE")
-	if !set || value == "" {
-		return defaultAdmitBackfillGrace, nil
-	}
-	if value == "disabled" || value == "0" {
-		return 0, nil
-	}
-	grace, err := time.ParseDuration(value)
-	if err != nil || grace <= 0 {
-		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_BACKFILL_GRACE must be a positive Go duration, disabled, or 0")
-	}
-	return grace, nil
-}
-
-// admitFreezeMaxHoldFromEnv follows the admitBackfillGraceFromEnv convention
-// exactly, including "disabled"/"0". Disabled means the fairness freeze is
-// UNBOUNDED again — the pre-AIRA-59 behaviour — and the evaluator then leaves the
-// phase anchor untouched rather than writing state nothing reads.
+// admitFreezeMaxHoldFromEnv accepts a Go duration of at least 1s, or
+// "disabled"/"0". Disabled means the strict fairness freeze is UNBOUNDED again —
+// the pre-AIRA-59 behaviour once a head's AIRA-307 budget is spent — and the
+// evaluator then leaves the phase anchor untouched rather than writing state
+// nothing reads. (AIRA-307 deleted the AIRA_DAEMON_ADMIT_BACKFILL_GRACE setting
+// whose convention this followed: the head's byte budget replaced that
+// time-based backfill window.)
 func admitFreezeMaxHoldFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD")
 	if !set || value == "" {
@@ -316,8 +313,8 @@ func admitFreezeMaxHoldFromEnv() (time.Duration, error) {
 	// Floor at one second, comfortably above any permitted poll interval
 	// (admitPollIntervalFromEnv caps at 10s but defaults to 250ms). A hold shorter
 	// than a poll interval is refused rather than merely tolerated: the evaluator
-	// would then routinely leap a whole hold/yield cycle between passes, which the
-	// duty cycle handles but which makes the setting meaningless.
+	// would then routinely leap a whole hold between passes, which the duty cycle
+	// handles but which makes the setting meaningless.
 	if err != nil || hold < time.Second {
 		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD must be a Go duration of at least 1s, disabled, or 0")
 	}
