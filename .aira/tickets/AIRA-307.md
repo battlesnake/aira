@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-307","project":"aira","title":"Admission: let small jobs pass a frozen head-of-line waiter when the ceiling has room for them","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":[],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-307","project":"aira","title":"Admission: let small jobs pass a frozen head-of-line waiter when the ceiling has room for them","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.37","labels":[],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-309","to":"AIRA-307"}]}
 ---
 
 
