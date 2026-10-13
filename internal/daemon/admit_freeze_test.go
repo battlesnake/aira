@@ -486,6 +486,10 @@ func TestValidateAdmitArgsRefusesOverCeilingWaitAndNamesTheCeiling(t *testing.T)
 // verifies: AIRA-59 — the freeze hold is configurable and fails closed on a
 // malformed setting (the AIRA-307 backfill grace it once mirrored is deleted).
 func TestAdmitFreezeMaxHoldFromEnv(t *testing.T) {
+	// AIRA-307 decision: the default hold is 5 minutes (see paths.go).
+	if defaultAdmitFreezeMaxHold != 5*time.Minute {
+		t.Fatalf("defaultAdmitFreezeMaxHold=%v, want 5m", defaultAdmitFreezeMaxHold)
+	}
 	for _, test := range []struct {
 		name, value string
 		want        time.Duration

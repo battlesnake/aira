@@ -56,7 +56,14 @@ const (
 	// 0/"disabled" makes the strict freeze (once a head's AIRA-307 budget is
 	// spent) unbounded. It applies only to UNPUSHED heads: a pushed head (AIRA-309)
 	// has no backstop.
-	defaultAdmitFreezeMaxHold = 2 * time.Minute
+	//
+	// 5 minutes (AIRA-307; was 2): the hold now ends in ONE backfilling pass
+	// rather than a 2-minute yield, so it must outlast the time releases take to
+	// make room for a big head. The 2026-10-12 replay released about 3.6 GB per
+	// minute, so a 12 GiB head starting from a full ledger needs about 3.6
+	// minutes of strict hold; at 2 minutes every such head would still be refilled
+	// once per hold.
+	defaultAdmitFreezeMaxHold = 5 * time.Minute
 	defaultWatchdogInterval   = 2 * time.Second
 	// AIRA-103 samples on the SAME cadence as the watchdog so the daemon has one
 	// notion of "sustained memory pressure", differing only in what it measures
