@@ -533,3 +533,26 @@ shared daemon-restart care memory).
   `confine-front` reaches `coreForRequest` with an empty scope and is refused
   with an error code; the client renders any such refusal as a failure (pinned by
   `TestConfineFrontOldDaemonRefusalRendersAsAnError`).
+- **Sub-reservations are exempt behind UNPUSHED heads too** (§3.4 step 2), not
+  only behind pushed ones: a behaviour change for every head.
+- **Freeze phase `pushed`.** A pushed head never arms the anchor, so the derived
+  phase read `idle` while it held the queue. `confine --list`, `aira top`'s
+  footer and `--dump` now report `pushed` (one function,
+  `admitReportedPhaseLocked`). The derived phase never reads `yield` any more;
+  the `--list` text note for `yield` was replaced by one for `pushed`.
+
+**Defects found at build review and fixed** (each has a regression test that
+was mutation-checked RED):
+- With the daemon unreachable, the CLI's management fallback sent every verb
+  other than `confine-list` to `KillConfine`, so `aira confine --front job`
+  would have KILLED the job. `confine-front` now refuses with the transport
+  error, and the kill fallback is default-deny (only `confine-kill` reaches it).
+  Test: `TestConfineFrontDaemonDownIsRefusedAndNeverKills`.
+- `DispatchPalette` refused every client-routed verb, so `aira top`'s `f`
+  failed after its confirmation. It now admits exactly `confine-front` through
+  the project-less management exchange. Test:
+  `TestTopFrontPushReachesTheDaemonThroughThePalette`.
+
+**Rollout.** The admission change is daemon-side: it takes effect only after
+`systemctl --user restart aira-daemon.service`. The skill text needs
+`aira skill install`.
