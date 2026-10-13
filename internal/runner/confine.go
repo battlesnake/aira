@@ -1064,6 +1064,74 @@ func FormatConfineMegabytes(value int64) string {
 	return strconv.FormatInt(q, 10) + "M"
 }
 
+// AIRA-310. The over-reservation hint's fixed terms. RAM only: confine measures
+// no per-job peak VRAM (per-process VRAM is unreadable on WSL2, and --vram is
+// admission accounting with nothing written or sampled), so a VRAM hint would
+// have to fabricate its peak and is deliberately not offered.
+const (
+	// ConfineNoHintsEnv set to exactly "1" silences the hint.
+	ConfineNoHintsEnv = "AIRA_CONFINE_NO_HINTS"
+	// confineHintMinReserve: a declared reserve below this is too small for its
+	// slack to matter to anyone else in the slice.
+	confineHintMinReserve = int64(2) << 30
+	// confineHintUnit is both the rounding step and the floor of the suggestion.
+	confineHintUnit = int64(256) << 20
+)
+
+// confineReserveHintSuggestion is peak + 50% headroom, rounded UP to a whole
+// confineHintUnit, never below one unit. Integer arithmetic throughout.
+func confineReserveHintSuggestion(peak int64) int64 {
+	headroom := peak/2 + peak%2 // ceil(peak/2)
+	want := peak + headroom
+	units := want / confineHintUnit
+	if want%confineHintUnit != 0 {
+		units++
+	}
+	if units < 1 {
+		units = 1
+	}
+	return units * confineHintUnit
+}
+
+// formatConfineReserveHint (AIRA-310) returns the one stderr line telling the
+// caller that a reserve they PINNED was far larger than the job used, or "" when
+// no hint is warranted. It reads only facts already on the status, so it can never
+// say more than the trailer above it established:
+//
+//   - containment=enforced only: a ci-shim run measures no peak and must stay
+//     silent even if one were somehow present;
+//   - terminated-by=normal AND exit 0: a failed, killed or OOM run says nothing
+//     about what the job needs;
+//   - peak-rss established (nil = unevaluated, never read as zero);
+//   - declaredBytes > 0 (the caller pinned --memory-reserve / AIRA_CONFINE_RESERVE;
+//     a history estimate has no knob to turn) AND equal to the reserve actually
+//     charged (with --memory-max the ledger charges the max instead, and lowering
+//     --memory-reserve would change nothing);
+//   - that reserve >= 2 GiB, peak strictly below 60% of it, and the suggestion
+//     strictly below it (otherwise the advice is a no-op).
+func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes int64, optOut bool) string {
+	if optOut || status.Containment != ConfineContainmentEnforced {
+		return ""
+	}
+	if status.TerminatedBy != ConfineTerminatedNormal || exitCode != 0 || status.PeakRSS == nil {
+		return ""
+	}
+	reserve, peak := status.ReserveBytes, *status.PeakRSS
+	if declaredBytes <= 0 || reserve != declaredBytes || reserve < confineHintMinReserve || peak < 0 {
+		return ""
+	}
+	if peak*5 >= reserve*3 {
+		return ""
+	}
+	suggestion := confineReserveHintSuggestion(peak)
+	if suggestion >= reserve {
+		return ""
+	}
+	percent := (peak*100 + reserve/2) / reserve
+	return fmt.Sprintf("confine: hint: peak %s of %s reserved (%d%%); consider --memory-reserve %s so more jobs fit",
+		FormatConfineMegabytes(peak), FormatConfineMegabytes(reserve), percent, FormatConfineMegabytes(suggestion))
+}
+
 // FormatConfineStatus is the single operator-facing honesty projection.
 func FormatConfineStatus(status ConfineStatus) string {
 	capFacet := status.Cap

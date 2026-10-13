@@ -1294,3 +1294,29 @@ func TestSkillTeachesV034Rules(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-310 -- the skill teaches the over-reservation hint: what draws
+// it, what never does, that it is RAM only, and the opt-out. Deleting the
+// paragraph, or any of these terms from it, reds this.
+func TestSkillTeachesTheReserveHint(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"`confine: hint: peak 310M of 4096M reserved (8%); consider --memory-reserve 512M so more jobs fit`",
+			"at least 2 GiB that the job used less than 60% of",
+			"peak plus 50% headroom, rounded up to a whole 256M, never below 256M",
+			"never prints for a history-estimated reserve",
+			"in ci-shim mode, or when `peak-rss=unevaluated`",
+			"never goes to stdout",
+			"RAM only: confine measures no per-job peak VRAM",
+			"`AIRA_CONFINE_NO_HINTS=1`",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not teach %q", name, want)
+			}
+		}
+	}
+}

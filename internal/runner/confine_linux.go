@@ -1553,6 +1553,17 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if advisory := formatConfineOOMLimitAdvisory(result.Status.TerminatedBy, usage); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
+	// AIRA-310. The over-reservation hint, last, on diagnostics (stderr) only. The
+	// declared reserve is the provenance captured before ResolveConfineReserve
+	// widened `pinned`; the ci-shim path never reaches here and the function also
+	// refuses any containment but enforced.
+	declaredHintBytes := int64(0)
+	if declaredReserve {
+		declaredHintBytes = declaredReserveBytes
+	}
+	if hint := formatConfineReserveHint(result.Status, exitCode, declaredHintBytes, os.Getenv(ConfineNoHintsEnv) == "1"); hint != "" {
+		_, _ = fmt.Fprintln(diagnostics, hint)
+	}
 	// AIRA-247. The real-cgroup path does NOT send a fail-fast trip: fail-fast takes
 	// effect only in ci-shim mode (the daemon gates a real-mode trip to a no-op), so
 	// the trip is sent from confineShim alone. See maybeSendFailfastTrip.
