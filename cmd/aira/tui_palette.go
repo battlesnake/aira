@@ -60,6 +60,15 @@ const (
 	// topColourOutside is the grey of requirement 5 — memory used by the rest of
 	// the system, anchored to the bar's right edge.
 	topColourOutside = "#6c6c6c"
+	// topColourQueued greys the rows of jobs that are queued, not running
+	// (AIRA-308): a waiting job has no slot, no bar region and nothing held, so it
+	// is drawn in no slot colour and visibly recessed. It is deliberately NOT
+	// topColourOutside (#6c6c6c, the bar's rest-of-system grey): a queued row has
+	// no span anywhere, and sharing that grey would suggest it maps to one. It is
+	// the lighter of the two so it stays legible on a dark terminal (about 5:1
+	// against black) while still reading as dim beside the saturated slot colours,
+	// none of which is a grey.
+	topColourQueued = "#808080"
 	// topColourMarker draws the soft/hard/ceiling limit ticks.
 	topColourMarker = "#ffffff"
 )
