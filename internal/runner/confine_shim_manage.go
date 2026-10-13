@@ -130,8 +130,8 @@ func ShimConfineKill(selector, callerOwner string, steal bool, registry []Confin
 	// The ownership guard runs BEFORE the PID is disclosed, exactly as on the
 	// real path: a refusal that leaks another session's supervisor PID would let
 	// an unauthorised caller do by hand what the guard just refused to do for it.
-	if !steal && (!ConfineOwnerIsAttested(owner) || !ConfineOwnerIsAttested(callerOwner) || owner != callerOwner) {
-		return ConfineKillResult{}, fmt.Errorf("%s: scope=%s owner=%s caller=%s; pass --steal to override", CodeConfineOwnerUnverified, record.ScopeID, owner, callerOwner)
+	if err := CheckConfineOwner(record.ScopeID, owner, callerOwner, steal); err != nil {
+		return ConfineKillResult{}, err
 	}
 	pid := 0
 	if record.SupervisorPID != nil {

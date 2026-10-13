@@ -787,8 +787,8 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	if owner == "" {
 		owner = ConfineUnknownOwner
 	}
-	if !steal && (!ConfineOwnerIsAttested(owner) || !ConfineOwnerIsAttested(callerOwner) || owner != callerOwner) {
-		return ConfineKillResult{}, fmt.Errorf("%s: scope=%s owner=%s caller=%s; pass --steal to override", CodeConfineOwnerUnverified, record.ScopeID, owner, callerOwner)
+	if err := CheckConfineOwner(record.ScopeID, owner, callerOwner, steal); err != nil {
+		return ConfineKillResult{}, err
 	}
 	if !validConfineScopeID(record.ScopeID) {
 		return ConfineKillResult{}, fmt.Errorf("%s: invalid resolved scope id", CodeConfineNotFound)

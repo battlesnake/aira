@@ -256,6 +256,26 @@ type admitWaiter struct {
 	contention    int
 	lastGrantable *int64
 
+	// AIRA-309 / AIRA-307 (queue order). Both are properties of THIS waiter, on the
+	// AIRA-101 pattern: neither can outlive it, a daemon restart begins with an
+	// empty queue map so both are dropped (fail-OPEN: a re-enqueued job is unpushed
+	// with a fresh budget), and no operator-clearable state exists. Written only
+	// under queue.mu — pushSeq by the confine-front handler, bypassed by the
+	// evaluator.
+	//
+	// pushSeq is zero for a waiter nobody pushed. A push sets it from queue.seq
+	// (incremented first), so push order is a counter, never wall time, and
+	// admitOrderLocked puts the LATEST push first. Re-pushing moves it to the front
+	// again.
+	//
+	// bypassed is the AIRA-307 budget counter: the reserve bytes of job-level
+	// grants admitted past this waiter while it was the head. The budget is
+	// reserve/2. "Reset when the head is granted" needs no code: the next head is a
+	// different waiter whose counter starts at zero. A head displaced by a push and
+	// later head again resumes its counter (its whole time as head is counted).
+	pushSeq  int64
+	bypassed int64
+
 	// S8 (restart/anchor state — design §3 compare-and-release, §4 restart).
 	//
 	// anchor is the connection that CURRENTLY owns this lease (design §3 Inv 4): a
@@ -361,6 +381,51 @@ func (w *admitWaiter) exclusiveActive() bool {
 // internal sub-reservation rather than new job-level work. See parentScopeID.
 func (w *admitWaiter) isSubReservation() bool {
 	return w != nil && w.parentScopeID != ""
+}
+
+// admitOrderLocked is THE admission evaluation order (AIRA-309), derived on
+// every call and never stored: pushed waiters first, LATEST push first
+// (descending pushSeq), then every other queued waiter in enqueue order — the
+// order queue.waiters already holds. queue.waiters itself is never reordered.
+// queue.mu must be held.
+//
+// It has three readers and must stay their only source, or the client's "queue
+// position N of M" line, the queued-ahead total and the `aira top` row order
+// would describe a queue the evaluator does not run: the evaluator, and
+// admitSliceSnapshotFor (position, queued-ahead bytes, queuedEntries), which
+// feeds the AIRA-308 rows.
+func admitOrderLocked(queue *sliceQueue) []*admitWaiter {
+	var pushed, rest []*admitWaiter
+	for _, waiter := range queue.waiters {
+		if waiter == nil || waiter.state != admitQueued {
+			continue
+		}
+		if waiter.pushSeq > 0 {
+			pushed = append(pushed, waiter)
+			continue
+		}
+		rest = append(rest, waiter)
+	}
+	// pushSeq values are distinct (each push takes a fresh queue.seq), so this
+	// order is total; insertion sort keeps it allocation-free for the handful of
+	// pushes a queue ever carries.
+	for i := 1; i < len(pushed); i++ {
+		for j := i; j > 0 && pushed[j].pushSeq > pushed[j-1].pushSeq; j-- {
+			pushed[j], pushed[j-1] = pushed[j-1], pushed[j]
+		}
+	}
+	return append(pushed, rest...)
+}
+
+// admitBypassBudget is the AIRA-307 budget of a head: half its own requested
+// reserve, the owner's decision of 2026-10-13. Counted in RAM bytes for every
+// head, including one refused on CPU or VRAM — a documented proxy, the same
+// RAM-only simplification lastGrantable already makes.
+func admitBypassBudget(head *admitWaiter) int64 {
+	if head == nil || head.reserve <= 0 {
+		return 0
+	}
+	return head.reserve / 2
 }
 
 // exclusiveGate is the derived drain/hold state of one queue, recomputed under
@@ -658,15 +723,30 @@ type sliceQueue struct {
 	failfastTripped bool
 
 	// AIRA-59 fairness-freeze duty cycle, held as a SINGLE anchor instant so the
-	// phase is DERIVED, never stored: idle while zero, hold for the first
-	// maxHold after it, yield for the second, idle again after.
+	// phase is DERIVED, never stored: idle while zero, hold for maxHold after it,
+	// idle again after.
+	//
+	// AIRA-307 changed WHAT the hold does and WHEN it arms, not its
+	// representation. A head's AIRA-307 budget (half its reserve) is what lets
+	// smaller jobs past it; the hold is the STRICT protection once that budget is
+	// spent. The arm fires when the budget first withholds a grant that fits
+	// (before AIRA-307: when a head past the 1-minute backfill grace was first
+	// refused; that grace is deleted, the budget replaces it in bytes). The
+	// maxHold-long YIELD window is deleted too: the completed-cycle clear below
+	// makes the first pass after a hold exactly ONE backfilling pass, which is now
+	// the whole time backstop. Replaying the 2026-10-12 incident showed a 2-minute
+	// unrestricted yield refilled the slice from the backlog and starved the
+	// 12 GiB heads it was meant to protect.
 	//
 	// There are exactly TWO writes, and neither can lengthen a hold:
 	//   1. the arm, guarded by derived phase == idle;
 	//   2. the completed-cycle clear, taken ONLY when the derived phase is already
-	//      idle (the cycle is over), which forces one backfilling pass before the
+	//      idle (the hold is over), which forces one backfilling pass before the
 	//      next arm. Because it fires only from derived-idle it can shorten the
 	//      gap between cycles, never extend a freeze.
+	//
+	// A PUSHED head (AIRA-309) never arms and is never covered by the backstop:
+	// nothing but another push goes ahead of it.
 	//
 	// That representation is load-bearing, not stylistic. With a stored phase plus
 	// a mutable deadline, three separate defects were expressible and had to be
@@ -680,30 +760,29 @@ type sliceQueue struct {
 	// full hold.
 	//
 	// Lifetime note: an empty queue is deleted by pruneAdmitQueue, so this anchor
-	// lives only as long as the queue. A yield cut short by quiescence is not a
-	// fairness leak — an empty queue has nobody to starve — but it does mean the
-	// 50% bound is over intervals where the queue is continuously non-empty.
+	// lives only as long as the queue. A hold cut short by quiescence is not a
+	// fairness leak — an empty queue has nobody to starve.
 	freezeArmedAt   time.Time
 	freezeHolderSeq int64            // diagnostics only; never affects timing
 	freezeLogged    admitFreezePhase // last phase logged, so logs are transitions
 }
 
-// admitFreezePhaseAt derives the duty-cycle phase from the anchor instant. Held
-// separate and pure so it is directly testable and so no caller can invent a
-// fourth state. maxHold <= 0 means the duty cycle is disabled entirely.
+// admitFreezePhaseAt derives the duty-cycle phase from the anchor instant: hold
+// for [armed, armed+maxHold), idle otherwise. Held separate and pure so it is
+// directly testable and so no caller can invent another state. maxHold <= 0
+// means the duty cycle is disabled entirely.
+//
+// It never returns admitFreezeYield (AIRA-307 deleted the maxHold-long yield
+// window). Yield survives only as the evaluator's PASS-LOCAL value for the one
+// backfilling pass the completed-cycle clear forces.
 func admitFreezePhaseAt(armedAt, now time.Time, maxHold time.Duration) admitFreezePhase {
 	if maxHold <= 0 || armedAt.IsZero() {
 		return admitFreezeIdle
 	}
-	elapsed := now.Sub(armedAt)
-	if elapsed < maxHold {
+	if now.Sub(armedAt) < maxHold {
 		// Includes a negative elapsed (clock moved backwards): treat as
 		// just-armed rather than silently skipping the protective hold.
 		return admitFreezeHold
-	}
-	// Subtracting first avoids overflowing on 2*maxHold for an absurd setting.
-	if elapsed-maxHold < maxHold {
-		return admitFreezeYield
 	}
 	return admitFreezeIdle
 }
@@ -931,7 +1010,8 @@ type admitSnapshot struct {
 
 	// AIRA-24. One waiter's own place in the queue, answered only when a
 	// caller named its own scope id. queuePosition is 1-based and counts ONLY
-	// queued waiters, in enqueue-sequence (evaluation) order; queuedAheadBytes
+	// queued waiters, in evaluation order (admitOrderLocked: pushed jobs first,
+	// then enqueue order — AIRA-309); queuedAheadBytes
 	// is the sum of the reserves of the queued waiters ahead of it. Zero is
 	// "no position established" — the scope id is not a queued waiter here
 	// (granted, released, unknown, or never asked) — never "position zero".
@@ -941,7 +1021,8 @@ type admitSnapshot struct {
 	queuePosition    int
 	queuedAheadBytes int64
 	// AIRA-308. The QUEUED waiters themselves, copied out in the same locked walk
-	// that counts them, in enqueue order and bounded by runner.ConfineQueuedRowLimit.
+	// that counts them, in evaluation order (AIRA-309) and bounded by
+	// runner.ConfineQueuedRowLimit.
 	// Scope-less waiters (per-test `confine-reserve` holds) carry no scope id to
 	// decode a name and supervisor from, so they are counted in `queued` and
 	// listed nowhere: len(queuedEntries) < queued is how a renderer sees that.
@@ -1175,34 +1256,37 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	now := s.admitNowTime()
 	// S11. The freeze state at this same instant — part of the GrantedEstablished bit.
 	snapshot.restartFrozen = s.restartFrozenAt(now)
-	for _, waiter := range queue.waiters {
-		if waiter == nil {
-			continue
+	// AIRA-309. The QUEUED half is walked in EVALUATION order (admitOrderLocked),
+	// so the position, the queued-ahead total and the AIRA-308 rows describe the
+	// queue the evaluator actually runs — a pushed job is position 1.
+	for _, waiter := range admitOrderLocked(queue) {
+		snapshot.queued++
+		// AIRA-24. The position is an index among QUEUED waiters only, so it
+		// is taken here and nowhere else: counting granted or released
+		// waiters would report a place in a line that no longer exists. The
+		// first match wins — enqueueAdmitInternal refuses a second queued (or
+		// rejected) waiter for a scope id (CodeProtocol) and re-anchors a granted
+		// one in place rather than adding a waiter, so a second match is not
+		// reachable.
+		if queuedScopeID != "" && snapshot.queuePosition == 0 && waiter.scopeID == queuedScopeID {
+			snapshot.queuePosition = snapshot.queued
+			snapshot.queuedAheadBytes = queuedBytes
+			// AIRA-186. Taken BEFORE queuedBytes absorbs this waiter's own
+			// reserve, from the matched waiter and not from the running sum:
+			// this is what THIS job is asking for, never what is ahead of it.
+			snapshot.queuedReserveBytes = waiter.reserve
 		}
-		if waiter.state == admitQueued {
-			snapshot.queued++
-			// AIRA-24. The position is an index among QUEUED waiters only, so it
-			// is taken here and nowhere else: counting granted or released
-			// waiters would report a place in a line that no longer exists. The
-			// first match wins — enqueueAdmitInternal refuses a second queued (or
-			// rejected) waiter for a scope id (CodeProtocol) and re-anchors a granted
-			// one in place rather than adding a waiter, so a second match is not
-			// reachable.
-			if queuedScopeID != "" && snapshot.queuePosition == 0 && waiter.scopeID == queuedScopeID {
-				snapshot.queuePosition = snapshot.queued
-				snapshot.queuedAheadBytes = queuedBytes
-				// AIRA-186. Taken BEFORE queuedBytes absorbs this waiter's own
-				// reserve, from the matched waiter and not from the running sum:
-				// this is what THIS job is asking for, never what is ahead of it.
-				snapshot.queuedReserveBytes = waiter.reserve
-			}
-			queuedBytes = addClamp(queuedBytes, waiter.reserve)
-			if waiter.scopeID != "" && len(snapshot.queuedEntries) < runner.ConfineQueuedRowLimit {
-				// Values, never the waiter: the entry outlives queue.mu.
-				snapshot.queuedEntries = append(snapshot.queuedEntries, runner.ConfineQueuedEntry{
-					ScopeID: waiter.scopeID, ReserveBytes: waiter.reserve, VRAMBytes: waiter.vram,
-				})
-			}
+		queuedBytes = addClamp(queuedBytes, waiter.reserve)
+		if waiter.scopeID != "" && len(snapshot.queuedEntries) < runner.ConfineQueuedRowLimit {
+			// Values, never the waiter: the entry outlives queue.mu.
+			snapshot.queuedEntries = append(snapshot.queuedEntries, runner.ConfineQueuedEntry{
+				ScopeID: waiter.scopeID, ReserveBytes: waiter.reserve, VRAMBytes: waiter.vram,
+				Pushed: waiter.pushSeq > 0,
+			})
+		}
+	}
+	for _, waiter := range queue.waiters {
+		if waiter == nil || waiter.state == admitQueued {
 			continue
 		}
 		// The classifier is scopeID and nothing else. name/owner cannot be used:
@@ -2233,21 +2317,22 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// return above, so a transient unreadable-slice pass can never advance or
 	// restart a phase — a blip must not hand anyone a fresh exclusive window.
 	maxHold := s.admitFreezeMaxHold
-	// Derived, not stored. Uses pass-start `now`, the same instant the grace check
-	// below uses, so hold and yield shift symmetrically if anything delays the pass.
+	// Derived, not stored. Uses pass-start `now`, the same instant the arm below
+	// uses.
 	phase := admitFreezePhaseAt(queue.freezeArmedAt, now, maxHold)
 	if maxHold > 0 && phase == admitFreezeIdle && !queue.freezeArmedAt.IsZero() {
-		// A completed cycle must YIELD AT LEAST ONE EVALUATION before re-arming.
-		// The phase is derived from wall time, but grants only happen during an
-		// evaluator pass, so a yield window that elapses entirely BETWEEN passes
-		// would let the queue go hold -> idle -> re-armed in a single pass and
-		// backfill nothing at all — freezing forever while looking well-behaved.
-		// That happens whenever maxHold approaches the poll interval (any positive
-		// duration is accepted) or anything else delays a pass past a whole cycle.
-		// Clearing the anchor and treating THIS pass as a yield
-		// makes the guarantee "at least one backfilling pass per cycle", which is
-		// what actually admits waiters, rather than merely "some wall time spent
-		// nominally yielding".
+		// The hold is over: this is the TIME BACKSTOP (AIRA-307 §3.5). Clearing
+		// the anchor and treating THIS pass as a yield makes the first pass at or
+		// after armed+maxHold exactly ONE backfilling pass, in which every waiter
+		// behind an UNPUSHED head that fits is granted regardless of the head's
+		// budget. It is a single pass, never a window: the maxHold-long yield that
+		// used to follow a hold refilled the slice from the backlog and starved the
+		// heads on 2026-10-12. Grants are only ever made by an evaluator pass, so a
+		// hold that elapsed entirely between passes still yields this one pass
+		// before the next arm — "at least one backfilling pass per hold", which is
+		// what actually admits waiters, rather than wall time spent nominally
+		// yielding. The next pass whose budget withholds a fitting grant re-arms
+		// from idle.
 		queue.freezeArmedAt = time.Time{}
 		phase = admitFreezeYield
 	}
@@ -2275,7 +2360,13 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	if !s.shimMode() {
 		effectiveMaximum = s.admitEffectiveMaximum(queue.path, maximum)
 	}
-	frozen := false
+	// AIRA-307/309. head is the queue's protected waiter for THIS pass, derived
+	// fresh every pass and never stored: the first waiter in admitOrderLocked order
+	// that the exclusivity gate lets through, that is job-level work (not a
+	// sub-reservation), that is refused on capacity, and that could fit an EMPTY
+	// slice at the current ceilings (admitCouldFitEmptyLocked). Every later
+	// job-level waiter is judged against it below.
+	var head *admitWaiter
 	// S11 restart freeze (design §4): a per-pass fact like `phase`. While active, NO
 	// NEW admission is granted — survivors must re-declare (re-anchor / establish) their
 	// leases before a new admission can take space they are about to re-claim. Re-declares
@@ -2285,14 +2376,11 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
 	queuedAhead := 0
-	for _, waiter := range queue.waiters {
-		if waiter.state != admitQueued {
-			continue
-		}
+	for _, waiter := range admitOrderLocked(queue) {
 		// S11 restart-freeze gate (design §4). Placed BEFORE the exclusivity gate and the
 		// fit/grant so a NEW admission during the freeze simply WAITS — it never grants
 		// (never fail-opens), never arms the AIRA-59 fairness anchor (that arm lives in the
-		// refused-on-capacity block below, which this skips), and records NO contention and
+		// budget-refusal branch below, which this skips), and records NO contention and
 		// NO grantable. The no-contention part is load-bearing honesty: a non-blocking
 		// (max_wait_ms==0) admit that times out during the freeze must then read
 		// Contention "unevaluated" (the unset AIRA-149 latch) — the slice is not saturated,
@@ -2307,10 +2395,10 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// exclusivity is an ADDITIONAL orthogonal gate: a waiter it lets through
 		// still has to pass every existing check on its own merits.
 		//
-		// Blocked waiters `continue` from here, BEFORE the freeze branch below, so
-		// a drain never arms or advances the AIRA-59 fairness anchor: that duty
-		// cycle exists to stop backfill starvation of a head, and during a drain
-		// there is no backfill to stop.
+		// Blocked waiters `continue` from here, BEFORE the head/budget logic below,
+		// so a drain never becomes a head and never arms or advances the AIRA-59
+		// fairness anchor: that duty cycle exists to stop backfill starvation of a
+		// head, and during a drain there is no backfill to stop.
 		if gate.blocks(queue, waiter) {
 			waiter.waited = true
 			// AIRA-149. A waiter that is not the drain head is blocked because
@@ -2348,16 +2436,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		} else {
 			available = checkedAvailable(current, effectiveMaximum, reclaimable, outstanding, headroom)
 		}
-		if frozen {
-			waiter.waited = true
-			// AIRA-149. `frozen` is only ever set by a waiter AHEAD in this same
-			// pass that was refused on capacity, so queuedAhead is already >= 1 and
-			// the shared reading cannot return none-observed here.
-			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
-			waiter.noteGrantableLocked(available)
-			queuedAhead++
-			continue
-		}
 		// S5 CONJUNCTIVE FIT (design §7): admit only if EVERY resource fits — RAM
 		// AND CPU. Both are PER-SLICE ledgers: `available` is RAM (ceiling − Σreserve),
 		// and CPU is this queue's own cpuOutstanding against the R×NumCPU ceiling. CPU
@@ -2374,7 +2452,32 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// unevaluated/stale snapshot returns false, so the waiter HOLDS in the queue
 		// (transient contention, unbounded-fair), never a fabricated fit.
 		vramFits := waiter.vram == 0 || s.vramWaiterFitsLocked(waiter.vram, queue.vramOutstanding)
-		if ramFits && cpuFits && vramFits {
+		fits := ramFits && cpuFits && vramFits
+		// AIRA-307/309. The head's protection, applied to every LATER job-level
+		// waiter. A sub-reservation is exempt from every form of it and judged on
+		// fit alone, on exclusiveGate.blocks' drain argument: it is an admitted
+		// job's internal progress, and blocking it deadlocks a head (a running
+		// --delegate-ram suite cannot finish, so its lease never releases, so the
+		// head never fits). Its grants are not counted against the budget either.
+		//
+		//   pushed head:   the waiter waits — no budget, no backstop pass, no anchor.
+		//                  Only another push goes ahead of it (admitOrderLocked).
+		//   unpushed head: the backstop pass (phase == yield) grants on fit alone;
+		//                  otherwise a fit is granted only within the head's
+		//                  remaining budget, bypassed + reserve <= reserve/2.
+		budgetWithheld := false
+		protected := head != nil && !waiter.isSubReservation()
+		if protected && fits {
+			switch {
+			case head.pushSeq > 0:
+				fits = false
+			case phase == admitFreezeYield:
+			case addClamp(head.bypassed, waiter.reserve) > admitBypassBudget(head):
+				fits = false
+				budgetWithheld = true
+			}
+		}
+		if fits {
 			waiter.state = admitGranted
 			waiter.grantedAt = s.admitNowTime()
 			waiter.accounted = true
@@ -2385,6 +2488,12 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// fit-check above — exactly as the old `outstanding +=` did, now for two
 			// resources at once.
 			queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			if protected {
+				// Every job-level grant past an unpushed head counts against its
+				// budget, the backstop pass's included (a pushed head grants nothing
+				// past itself, so it never reaches here).
+				head.bypassed = addClamp(head.bypassed, waiter.reserve)
+			}
 			if waiter.waited {
 				waiter.outcome = "waited"
 				waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
@@ -2394,65 +2503,47 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			close(waiter.grantedCh)
 			continue
 		}
-		{
-			// Refused on capacity — RAM short OR CPU short — takes the same FIFO tail:
-			// record the RAM grantable figure and arm the AIRA-59 backfill freeze so a
-			// later smaller waiter cannot jump the head.
-			//
-			// ACCEPTED GAP (S5, out of scope): noteGrantableLocked records the RAM
-			// `available` figure even for a CPU-only refusal, and there is no CPU
-			// diagnostic field — so a job blocked purely on CPU is rejected with
-			// E_ADMIT_SATURATED rendering the RAM-flavoured "no memory admission within
-			// the wait". Diagnosis only (no admission decision reads it); a dedicated CPU
-			// diagnostic is deferred. The contention latch below still tells the honest
-			// truth (observed, never a fabricated solitude).
-			waiter.waited = true
-			// AIRA-149 contention latch, S5-aware. A RAM refusal (ramFits == false) is a
-			// fact about THIS slice's ledger, so it takes the honest solo reading — which
-			// may legitimately be none-observed (the residual-page case). A CPU refusal
-			// (ramFits but !cpuFits) latches `observed` directly: this slice's own cores
-			// are held, so something IS in the way by construction. (It would read
-			// `observed` via soloReadingLocked anyway — a CPU-full slice has
-			// outstandingJobs ≥ 1, so it is never provablyEmpty — but stating it here is
-			// the direct, intent-revealing guard against ever rendering a fabricated
-			// RAM-solitude diagnosis for a CPU refusal.) soloReadingLocked is the ONLY
-			// site that may latch none-observed, and only the RAM arm may reach it.
-			if ramFits {
-				waiter.joinContentionLocked(contentionObserved)
-			} else {
-				waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
-			}
-			waiter.noteGrantableLocked(available)
-			queuedAhead++
-			// now is pass-start time, so anything delaying the pass defers this freeze by its duration.
-			if s.admitBackfillGrace <= 0 || now.Sub(waiter.enqueued) >= s.admitBackfillGrace {
-				switch {
-				case maxHold <= 0:
-					// Duty cycle disabled: freeze exactly as before, and write NO phase
-					// state, so the anchor stays meaningless in this mode rather than
-					// accumulating values nothing reads.
-					//
-					// Note this branch is behaviourally equivalent to falling through
-					// (admitFreezePhaseAt returns idle when maxHold <= 0); it exists to
-					// keep the anchor untouched, not because freezing differs. An
-					// earlier comment here claimed disabled mode differed by protecting
-					// a successor younger than the backfill grace — that was wrong: the
-					// grace check above gates this switch in EVERY mode, so a young head
-					// never freezes either way.
-					frozen = true
-				case phase != admitFreezeYield:
-					frozen = true
-					if phase == admitFreezeIdle {
-						// The arm: one of the two anchor writes (see the struct). Guarded
-						// by idle, so an active hold cannot renew itself and a departing
-						// holder cannot buy a fresh window.
-						queue.freezeArmedAt = now
-						phase = admitFreezeHold
-					}
-					queue.freezeHolderSeq = waiter.seq
-				}
-			}
-			continue
+		// Refused on capacity (RAM, CPU or VRAM short), or held behind the head.
+		//
+		// ACCEPTED GAP (S5, out of scope): noteGrantableLocked records the RAM
+		// `available` figure even for a CPU-only refusal, and there is no CPU
+		// diagnostic field — so a job blocked purely on CPU is rejected with
+		// E_ADMIT_SATURATED rendering the RAM-flavoured "no memory admission within
+		// the wait". Diagnosis only (no admission decision reads it); a dedicated CPU
+		// diagnostic is deferred. The contention latch below still tells the honest
+		// truth (observed, never a fabricated solitude).
+		waiter.waited = true
+		// AIRA-149 contention latch, S5-aware. A RAM refusal (ramFits == false) is a
+		// fact about THIS slice's ledger, so it takes the honest solo reading — which
+		// may legitimately be none-observed (the residual-page case). A CPU refusal
+		// (ramFits but !cpuFits), or a waiter held behind a head, latches `observed`
+		// directly: something IS in the way by construction. soloReadingLocked is
+		// the ONLY site that may latch none-observed, and only the RAM arm may reach
+		// it — and never behind a head, which is itself queued ahead.
+		if ramFits {
+			waiter.joinContentionLocked(contentionObserved)
+		} else {
+			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
+		}
+		waiter.noteGrantableLocked(available)
+		queuedAhead++
+		if budgetWithheld && maxHold > 0 && phase == admitFreezeIdle {
+			// The arm: one of the two anchor writes (see the struct). It fires only
+			// when the budget is actually withholding a grant that FITS, and it is
+			// guarded by idle, so an active hold cannot renew itself and a new head
+			// exhausting its own budget mid-hold cannot buy a fresh window.
+			queue.freezeArmedAt = now
+			phase = admitFreezeHold
+		}
+		if head == nil && !waiter.isSubReservation() && s.admitCouldFitEmptyLocked(waiter, effectiveMaximum) {
+			// This waiter becomes the head. A waiter that could not fit even an
+			// EMPTY slice at the current (possibly throttled) ceilings is never a
+			// head: freezing others cannot help it, and a pushed one would otherwise
+			// wedge every session (E_ADMIT_TOO_LARGE is decided against the
+			// UNthrottled maximum, so such a job can be queued and pushed). It
+			// becomes a head again on the first pass after the ceiling recovers.
+			head = waiter
+			queue.freezeHolderSeq = waiter.seq
 		}
 	}
 	// Log BEFORE clearing the diagnostics holder: a hold->yield transition is
@@ -2462,13 +2553,44 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		s.logAdmitFreezeTransition(queue, phase, now)
 		queue.freezeLogged = phase
 	}
-	if !frozen {
-		// The head fitted, was granted, or left. Clear only the DIAGNOSTICS seq —
-		// the anchor deliberately survives, because clearing it here would let
+	if head == nil {
+		// No waiter is protected this pass. Clear only the DIAGNOSTICS seq — the
+		// anchor deliberately survives, because clearing it here would let
 		// repeated holder-fit churn restart fresh holds, which is the same
 		// unbounded-freeze defect as re-anchoring, by another route.
 		queue.freezeHolderSeq = 0
 	}
+}
+
+// admitCouldFitEmptyLocked is the AIRA-307/309 empty-slice clause of "who is the
+// head": whether this waiter could be granted on an EMPTY ledger at the CURRENT
+// ceilings, in every resource. queue.mu must be held.
+//
+//   - RAM: reserve <= effectiveMaximum − headroom(1), the possibly
+//     pressure-throttled ceiling this pass gates on.
+//   - CPU: cpu <= cpuCeiling().
+//   - VRAM: vram == 0, or a FRESH evaluated snapshot whose ceiling (the
+//     configured budget, or the card's total, less headroom) holds it. This is
+//     deliberately NOT the current free figure: other AIRA GPU jobs hold free
+//     VRAM, and a pushed GPU head must still drain them. An unevaluated or stale
+//     reading means NOT a head — without this arm a pushed GPU job would freeze
+//     the whole machine for as long as nvidia-smi was failing, and a pushed head
+//     has no backstop.
+func (s *Server) admitCouldFitEmptyLocked(waiter *admitWaiter, effectiveMaximum int64) bool {
+	if waiter.reserve > subtractFloor(effectiveMaximum, s.admitSliceHeadroom(1)) {
+		return false
+	}
+	if waiter.cpu > s.cpuCeiling() {
+		return false
+	}
+	if waiter.vram == 0 {
+		return true
+	}
+	snap := s.vramCurrent()
+	if !snap.evaluated {
+		return false
+	}
+	return waiter.vram <= vramAdmitAvailable(s.vramBudgetBytes, snap.total, snap.total, s.vramHeadroomBytes(), 0)
 }
 
 // logAdmitFreezeTransition reports ONLY phase transitions, never a steady state:

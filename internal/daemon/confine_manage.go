@@ -418,6 +418,17 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// close reaches the same state-guarded releaseAdmitWaiter path.
 		s.releaseActiveConfine(path, result.ScopeID)
 		return core.Response{OK: true, Code: "OK", Data: result}
+	case "confine-front":
+		// AIRA-309. Pure queue state, so it works the same in ci-shim mode: the
+		// shim's queue is the one keyed on the sentinel path resolved above.
+		selector := stringArg(request.Args, "selector")
+		steal, _ := request.Args["steal"].(bool)
+		result, frontErr := s.pushQueuedConfine(path, selector, callerOwner, steal)
+		if frontErr != nil {
+			return confineManagementError(frontErr)
+		}
+		logConfineFront(callerOwner, steal, result, path)
+		return core.Response{OK: true, Code: "OK", Data: result}
 	default:
 		return confineManagementError(errors.New("E_UNKNOWN_VERB: unknown confine management verb"))
 	}

@@ -22,6 +22,11 @@ func freezeTestServer(t *testing.T, maximum *atomic.Int64, current *int64, now *
 	return server
 }
 
+// AIRA-307 fixture note. Every test below uses a 60-byte head that does not fit
+// the 50 bytes of room, so its budget is 30. A follower of 35 FITS the room but
+// exceeds that budget: it is the waiter whose withheld grant arms the hold. A
+// follower of 30 or less would be admitted at once within the budget, and a
+// queue holding only a head never arms at all (nothing fitting is withheld).
 func queuedWaiter(seq, reserve int64, enqueued time.Time) *admitWaiter {
 	return &admitWaiter{seq: seq, reserve: reserve, state: admitQueued, grantedCh: make(chan struct{}), enqueued: enqueued}
 }
@@ -30,23 +35,28 @@ func queuedWaiter(seq, reserve int64, enqueued time.Time) *admitWaiter {
 // waiter that fits is admitted instead of being blocked for the head's entire
 // timeout. Before this, the freeze re-armed every pass for as long as the head
 // stayed queued, so one oversized request stalled the whole machine.
+// AIRA-307: the yield is ONE backfilling pass, and its grants count against the
+// head's budget.
 func TestAdmitFreezeYieldsAfterMaxHoldSoFittingWaitersProceed(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	current := int64(50)
 	now := time.Unix(5000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second)) // 60 > available 50
-	small := queuedWaiter(2, 30, now)                     // fits in available 50
+	small := queuedWaiter(2, 35, now)                     // fits in available 50, exceeds the 30 budget
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
 
-	// Head is past its grace and does not fit: the freeze arms and blocks small.
+	// The head does not fit and small exceeds its budget: the freeze arms and
+	// blocks small.
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, head)
 	requireAdmitQueued(t, small)
+	if queue.freezeArmedAt.IsZero() {
+		t.Fatal("a budget-withheld fitting grant did not arm the hold")
+	}
 
 	// One second before the hold expires it must STILL be frozen — otherwise this
 	// test would pass against an implementation that never froze at all.
@@ -60,8 +70,11 @@ func TestAdmitFreezeYieldsAfterMaxHoldSoFittingWaitersProceed(t *testing.T) {
 	waitAdmitGrant(t, small)
 	requireAdmitQueued(t, head)
 
-	if queue.outstanding != 30 || queue.outstandingJobs != 1 {
-		t.Fatalf("yield ledger outstanding=%d jobs=%d, want exactly the granted 30/1", queue.outstanding, queue.outstandingJobs)
+	if queue.outstanding != 35 || queue.outstandingJobs != 1 {
+		t.Fatalf("yield ledger outstanding=%d jobs=%d, want exactly the granted 35/1", queue.outstanding, queue.outstandingJobs)
+	}
+	if head.bypassed != 35 {
+		t.Fatalf("head.bypassed=%d, want the backstop pass's 35 counted against the head", head.bypassed)
 	}
 	if ceiling := maximum.Load() - server.admitSliceHeadroom(queue.outstandingJobs+1); queue.outstanding > ceiling {
 		t.Fatalf("yield exceeded cap-headroom: outstanding=%d ceiling=%d", queue.outstanding, ceiling)
@@ -71,46 +84,53 @@ func TestAdmitFreezeYieldsAfterMaxHoldSoFittingWaitersProceed(t *testing.T) {
 // verifies: AIRA-59 — the freeze RE-ARMS after its yield. Without this a "fix"
 // that simply deletes the freeze would pass the yield test above while removing
 // head-of-line protection entirely.
+//
+// AIRA-307: the yield is exactly ONE pass. The very next pass with a withheld
+// fitting grant re-arms the strict hold; a maxHold-long yield window (the
+// pre-AIRA-307 duty cycle) would grant that second arrival freely instead.
 func TestAdmitFreezeReArmsAfterYieldSoHeadKeepsProtection(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	current := int64(50)
 	now := time.Unix(6000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
-	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head}}
+	first := queuedWaiter(2, 35, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, first}}
 	server.evaluateAdmitQueue(queue) // arms at t0
 	requireAdmitQueued(t, head)
-
-	// Inside the yield window a fitting arrival is admitted.
-	now = now.Add(61 * time.Second)
-	duringYield := queuedWaiter(2, 30, now)
-	queue.waiters = append(queue.waiters, duringYield)
-	server.evaluateAdmitQueue(queue)
-	waitAdmitGrant(t, duringYield)
-	server.releaseAdmitWaiter(queue, duringYield)
-
-	// Past the full hold+yield cycle, the first pass is the guaranteed
-	// backfilling pass (a completed cycle always yields at least one evaluation
-	// before re-arming, so a cycle that elapsed entirely between passes still
-	// admits somebody). It clears the anchor without arming.
-	now = now.Add(60 * time.Second)
-	server.evaluateAdmitQueue(queue)
-	if !queue.freezeArmedAt.IsZero() {
-		t.Fatalf("completed cycle re-armed in the same pass (%v); it must yield one evaluation first", queue.freezeArmedAt)
+	requireAdmitQueued(t, first)
+	if queue.freezeArmedAt.IsZero() {
+		t.Fatal("the withheld 35 did not arm the hold")
 	}
 
-	// The NEXT pass arms again and blocks a new fitting arrival, holding capacity
+	// Past the hold, the first pass is the guaranteed backfilling pass (a
+	// completed hold always yields at least one evaluation before re-arming, so
+	// a hold that elapsed entirely between passes still admits somebody). It
+	// clears the anchor without arming.
+	now = now.Add(61 * time.Second)
+	server.evaluateAdmitQueue(queue)
+	waitAdmitGrant(t, first)
+	if !queue.freezeArmedAt.IsZero() {
+		t.Fatalf("the backstop pass re-armed in the same pass (%v); it must yield one evaluation first", queue.freezeArmedAt)
+	}
+	server.releaseAdmitWaiter(queue, first)
+
+	// One second later — well inside what used to be a 60-second yield window —
+	// the NEXT pass arms again and blocks a new fitting arrival, holding capacity
 	// for the still-starved head. This is the half of the mechanism that must
 	// survive: bounded, not deleted.
-	afterCycle := queuedWaiter(3, 30, now)
-	queue.waiters = append(queue.waiters, afterCycle)
+	now = now.Add(time.Second)
+	afterBackstop := queuedWaiter(3, 35, now)
+	queue.waiters = append(queue.waiters, afterBackstop)
 	server.evaluateAdmitQueue(queue)
-	requireAdmitQueued(t, afterCycle)
+	requireAdmitQueued(t, afterBackstop)
 	requireAdmitQueued(t, head)
+	if !queue.freezeArmedAt.Equal(now) {
+		t.Fatalf("anchor=%v, want re-armed at %v by the withheld grant", queue.freezeArmedAt, now)
+	}
 }
 
 // verifies: AIRA-59 — an ACTIVE hold never renews its own deadline. Repeated
@@ -124,13 +144,16 @@ func TestAdmitFreezeHoldDeadlineDoesNotSlideAcrossRepeatedPasses(t *testing.T) {
 	current := int64(50)
 	now := time.Unix(7000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
-	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head}}
+	fitting := queuedWaiter(2, 35, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, fitting}}
 	server.evaluateAdmitQueue(queue)
 	armedAt := queue.freezeArmedAt
+	if armedAt.IsZero() {
+		t.Fatal("test premise: the hold did not arm")
+	}
 
 	// Thirty passes spread across the hold, the shape a real 4/s evaluator produces.
 	for step := 0; step < 30; step++ {
@@ -141,10 +164,10 @@ func TestAdmitFreezeHoldDeadlineDoesNotSlideAcrossRepeatedPasses(t *testing.T) {
 		}
 	}
 
+	requireAdmitQueued(t, fitting)
+
 	// The yield must begin on the original schedule, not 30 seconds later.
 	now = armedAt.Add(61 * time.Second)
-	fitting := queuedWaiter(2, 30, now)
-	queue.waiters = append(queue.waiters, fitting)
 	server.evaluateAdmitQueue(queue)
 	waitAdmitGrant(t, fitting)
 }
@@ -160,17 +183,23 @@ func TestAdmitFreezeHolderChurnDoesNotExtendTheFreeze(t *testing.T) {
 	current := int64(50)
 	now := time.Unix(8000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	headA := queuedWaiter(1, 60, now.Add(-10*time.Second))
 	// A tail waiter keeps the queue non-empty, so releasing headA below does not
 	// trip pruneAdmitQueue into destroying the queue underneath the test — which
 	// would make this assert against a stale object rather than live behaviour.
+	// It does not fit either, so after headA leaves IT is the head (budget 35).
 	tail := queuedWaiter(99, 70, now.Add(-10*time.Second))
-	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{headA, tail}}
+	// 36 exceeds every head's budget in this test (30, then 35), so it is the
+	// withheld fitting grant that arms the hold and keeps it relevant.
+	fitting := queuedWaiter(3, 36, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{headA, tail, fitting}}
 	server.evaluateAdmitQueue(queue)
 	armedAt := queue.freezeArmedAt
+	if armedAt.IsZero() {
+		t.Fatal("test premise: the hold did not arm")
+	}
 
 	// Halfway through the hold headA leaves and an equally old, equally
 	// unfittable headB replaces it.
@@ -182,11 +211,10 @@ func TestAdmitFreezeHolderChurnDoesNotExtendTheFreeze(t *testing.T) {
 	if !queue.freezeArmedAt.Equal(armedAt) {
 		t.Fatalf("successor head re-anchored the phase (%v -> %v): the duty bound must not reset on holder change", armedAt, queue.freezeArmedAt)
 	}
+	requireAdmitQueued(t, fitting)
 
 	// The yield must still start on the ORIGINAL schedule.
 	now = armedAt.Add(61 * time.Second)
-	fitting := queuedWaiter(3, 30, now)
-	queue.waiters = append(queue.waiters, fitting)
 	server.evaluateAdmitQueue(queue)
 	waitAdmitGrant(t, fitting)
 }
@@ -200,20 +228,24 @@ func TestAdmitFreezePhasePersistsWhenHeadBecomesFitting(t *testing.T) {
 	current := int64(50)
 	now := time.Unix(9000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
-	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head}}
+	arming := queuedWaiter(4, 35, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, arming}}
 	server.evaluateAdmitQueue(queue)
 	armedAt := queue.freezeArmedAt
+	if armedAt.IsZero() {
+		t.Fatal("test premise: the hold did not arm")
+	}
 
-	// The head fits and is granted; the diagnostics holder clears but the phase
-	// anchor must survive.
+	// The head fits and is granted (and the 35 behind it, with no head left);
+	// the diagnostics holder clears but the phase anchor must survive.
 	now = now.Add(30 * time.Second)
 	current = 0
 	server.evaluateAdmitQueue(queue)
 	waitAdmitGrant(t, head)
+	waitAdmitGrant(t, arming)
 	if !queue.freezeArmedAt.Equal(armedAt) {
 		t.Fatalf("phase anchor was cleared when the head fitted (%v -> %v): fit/unfit churn would then restart holds forever", armedAt, queue.freezeArmedAt)
 	}
@@ -223,10 +255,11 @@ func TestAdmitFreezePhasePersistsWhenHeadBecomesFitting(t *testing.T) {
 
 	// Yield still begins on the original schedule.
 	server.releaseAdmitWaiter(queue, head)
+	server.releaseAdmitWaiter(queue, arming)
 	current = 50
 	now = armedAt.Add(40 * time.Second)
 	newHead := queuedWaiter(2, 60, now.Add(-40*time.Second))
-	fitting := queuedWaiter(3, 30, now)
+	fitting := queuedWaiter(3, 35, now)
 	queue.waiters = append(queue.waiters, newHead, fitting)
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, fitting) // still inside the original hold
@@ -236,11 +269,10 @@ func TestAdmitFreezePhasePersistsWhenHeadBecomesFitting(t *testing.T) {
 	waitAdmitGrant(t, fitting)
 }
 
-// verifies: AIRA-59 — maxHold disabled reproduces the PRE-EXISTING stateless
-// behaviour exactly, not an approximation of it. The discriminating case is a
-// successor younger than the backfill grace: the original loop recomputes the
-// freeze from each blocked waiter's own age every pass and so leaves it
-// unprotected, whereas a persistent-phase implementation would keep freezing.
+// verifies: AIRA-59 — maxHold disabled bypasses the phase machine: no anchor is
+// ever written and, once a head's AIRA-307 budget is spent, the strict freeze is
+// unbounded. The budget itself still applies (it is per head, not per phase):
+// a successor head lets a waiter within ITS budget past at once.
 func TestAdmitFreezeDisabledBypassesThePhaseMachineEntirely(t *testing.T) {
 	for _, value := range []string{"0", "disabled"} {
 		t.Run(value, func(t *testing.T) {
@@ -255,15 +287,14 @@ func TestAdmitFreezeDisabledBypassesThePhaseMachineEntirely(t *testing.T) {
 			current := int64(50)
 			now := time.Unix(11000, 0)
 			server := freezeTestServer(t, &maximum, &current, &now)
-			server.admitBackfillGrace = 10 * time.Second
 			server.admitFreezeMaxHold = maxHold
 
 			headA := queuedWaiter(1, 60, now.Add(-10*time.Second))
-			// A fitting follower behind the aged head. Without it, an implementation
-			// that disabled FREEZING altogether (rather than disabling only the duty
-			// cycle) would also pass this test — disabled must reproduce the original
-			// unbounded freeze, not the absence of one.
-			blocked := queuedWaiter(2, 30, now)
+			// A fitting follower behind the head, over its budget. Without it, an
+			// implementation that disabled FREEZING altogether (rather than
+			// disabling only the duty cycle) would also pass this test — disabled
+			// must reproduce the original unbounded freeze, not the absence of one.
+			blocked := queuedWaiter(2, 35, now)
 			queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{headA, blocked}}
 			server.evaluateAdmitQueue(queue)
 			if !queue.freezeArmedAt.IsZero() {
@@ -275,17 +306,21 @@ func TestAdmitFreezeDisabledBypassesThePhaseMachineEntirely(t *testing.T) {
 			server.evaluateAdmitQueue(queue)
 			requireAdmitQueued(t, blocked)
 
-			// headA departs; its successor is YOUNGER than the grace, so the
-			// original stateless rule does not freeze for it and a fitting waiter
-			// must be admitted immediately.
+			// headA departs: nothing is ahead of the blocked follower, so it is
+			// admitted. A successor head arrives; a waiter within ITS budget (60/2
+			// = 30, and the 10 fits the 15 left) is admitted immediately.
 			now = now.Add(time.Second)
 			server.releaseAdmitWaiter(queue, headA)
-			youngHead := queuedWaiter(2, 60, now)
-			fitting := queuedWaiter(3, 30, now)
+			youngHead := queuedWaiter(3, 60, now)
+			fitting := queuedWaiter(4, 10, now)
 			queue.waiters = append(queue.waiters, youngHead, fitting)
 			server.evaluateAdmitQueue(queue)
+			waitAdmitGrant(t, blocked)
 			waitAdmitGrant(t, fitting)
 			requireAdmitQueued(t, youngHead)
+			if !queue.freezeArmedAt.IsZero() {
+				t.Fatalf("disabled mode wrote phase state (%v)", queue.freezeArmedAt)
+			}
 		})
 	}
 }
@@ -299,14 +334,16 @@ func TestAdmitFreezeUnreadableSliceDoesNotDisturbThePhase(t *testing.T) {
 	current := int64(50)
 	now := time.Unix(12000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
-	fitting := queuedWaiter(2, 30, now)
+	fitting := queuedWaiter(2, 35, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, fitting}}
 	server.evaluateAdmitQueue(queue)
 	armedAt := queue.freezeArmedAt
+	if armedAt.IsZero() {
+		t.Fatal("test premise: the hold did not arm")
+	}
 
 	readable := false
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
@@ -344,13 +381,13 @@ func TestAdmitFreezeYieldRespectsCeilingWhenOutstandingDominates(t *testing.T) {
 	server := freezeTestServer(t, &maximum, &current, &now)
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	// A granted lease already holds 60 of the 100-byte slice: this is what makes
-	// the head unfittable (available = 100 - 60 = 40 < 95).
+	// the head unfittable (available = 100 - 60 = 40 < 50). Its AIRA-307 budget
+	// is 25, so the 30 below fits the room but waits for the backstop pass.
 	held := &admitWaiter{seq: 1, reserve: 60, state: admitGranted, accounted: true}
-	head := queuedWaiter(2, 95, now.Add(-10*time.Second))
+	head := queuedWaiter(2, 50, now.Add(-10*time.Second))
 	small := queuedWaiter(3, 30, now)
 	// A trailing waiter that does NOT fit even after the yield. Without it, an
 	// implementation that skipped the fit test for backfill candidates would still
@@ -387,12 +424,11 @@ func TestAdmitFreezeYieldRespectsCeilingWhenEffectiveCurrentDominates(t *testing
 	current := int64(70) // live usage, with an empty ledger
 	now := time.Unix(14000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
-	head := queuedWaiter(1, 95, now.Add(-10*time.Second))
-	small := queuedWaiter(2, 20, now)  // fits in available 30
-	tooBig := queuedWaiter(3, 40, now) // does not fit even after the yield
+	head := queuedWaiter(1, 31, now.Add(-10*time.Second)) // 31 > available 30; budget 15
+	small := queuedWaiter(2, 20, now)                     // fits in available 30, over budget
+	tooBig := queuedWaiter(3, 40, now)                    // does not fit even after the yield
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small, tooBig}}
 
 	server.evaluateAdmitQueue(queue)
@@ -448,7 +484,7 @@ func TestValidateAdmitArgsRefusesOverCeilingWaitAndNamesTheCeiling(t *testing.T)
 // daemon-side timeout (design §4/§6), exactly like the confine admit path.
 
 // verifies: AIRA-59 — the freeze hold is configurable and fails closed on a
-// malformed setting, following the admitBackfillGrace precedent exactly.
+// malformed setting (the AIRA-307 backfill grace it once mirrored is deleted).
 func TestAdmitFreezeMaxHoldFromEnv(t *testing.T) {
 	for _, test := range []struct {
 		name, value string
@@ -504,17 +540,19 @@ func TestAdmitFreezeYieldsAPassEvenWhenAWholeCycleElapsesBetweenPasses(t *testin
 	current := int64(50)
 	now := time.Unix(16000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
-	fitting := queuedWaiter(2, 30, now)
+	fitting := queuedWaiter(2, 35, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, fitting}}
 
 	server.evaluateAdmitQueue(queue) // arms
 	requireAdmitQueued(t, fitting)
+	if queue.freezeArmedAt.IsZero() {
+		t.Fatal("test premise: the hold did not arm")
+	}
 
-	// Leap clean past hold AND yield in one step, as a delayed pass would.
+	// Leap clean past the hold in one step, as a delayed pass would.
 	now = now.Add(10 * time.Minute)
 	server.evaluateAdmitQueue(queue)
 	waitAdmitGrant(t, fitting)
@@ -529,24 +567,32 @@ func TestAdmitFreezeMakesProgressWhenMaxHoldIsShorterThanThePollInterval(t *test
 	current := int64(50)
 	now := time.Unix(17000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = time.Second
 	server.admitFreezeMaxHold = time.Millisecond // far below any real poll interval
 
 	head := queuedWaiter(1, 60, now.Add(-time.Second))
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head}}
 
+	// Every follower is 35: over the head's 30 budget, so only a backstop pass
+	// can admit one. Each granted follower is released so room stays 50.
 	granted := 0
+	var pending []*admitWaiter
 	for step := 0; step < 6; step++ {
-		fitting := queuedWaiter(int64(100+step), 30, now)
+		fitting := queuedWaiter(int64(100+step), 35, now)
 		queue.waiters = append(queue.waiters, fitting)
+		pending = append(pending, fitting)
 		now = now.Add(250 * time.Millisecond) // a realistic poll interval
 		server.evaluateAdmitQueue(queue)
-		select {
-		case <-fitting.grantedCh:
-			granted++
-			server.releaseAdmitWaiter(queue, fitting)
-		default:
+		still := pending[:0]
+		for _, waiter := range pending {
+			select {
+			case <-waiter.grantedCh:
+				granted++
+				server.releaseAdmitWaiter(queue, waiter)
+			default:
+				still = append(still, waiter)
+			}
 		}
+		pending = still
 	}
 	if granted == 0 {
 		t.Fatal("no fitting waiter was ever admitted: every pass skipped the yield, so the freeze was permanent despite a bounded maxHold")
@@ -566,7 +612,6 @@ func TestAdmitQueueDiagnosticsReportQueuedAndFreezePhase(t *testing.T) {
 	current := int64(50)
 	now := time.Unix(15000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	if queued, phase := server.admitQueueDiagnostics("/slice"); queued != 0 || phase != "idle" {
@@ -574,7 +619,7 @@ func TestAdmitQueueDiagnosticsReportQueuedAndFreezePhase(t *testing.T) {
 	}
 
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
-	small := queuedWaiter(2, 30, now)
+	small := queuedWaiter(2, 35, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
 	server.admitRegistryMu.Lock()
 	server.admitQueues["/slice"] = queue
@@ -586,11 +631,13 @@ func TestAdmitQueueDiagnosticsReportQueuedAndFreezePhase(t *testing.T) {
 		t.Fatalf("during the freeze: queued=%d phase=%q, want 2/hold — this is the state that was invisible during the incident", queued, phase)
 	}
 
+	// AIRA-307: the yield is one pass, not a window, so once that pass has run
+	// (clearing the anchor) the derived phase a snapshot reports is idle.
 	now = now.Add(61 * time.Second)
 	server.evaluateAdmitQueue(queue)
 	queued, phase = server.admitQueueDiagnostics("/slice")
-	if phase != "yield" {
-		t.Fatalf("after the hold: phase=%q, want yield", phase)
+	if phase != "idle" {
+		t.Fatalf("after the backstop pass: phase=%q, want idle", phase)
 	}
 	if queued != 1 {
 		t.Fatalf("after the yield admitted the fitting waiter: queued=%d, want 1 (only the unfittable head)", queued)
@@ -614,11 +661,10 @@ func TestAdmitFreezeLogsTransitionsOnlyAndNamesTheHead(t *testing.T) {
 	current := int64(50)
 	now := time.Unix(18000, 0)
 	server := freezeTestServer(t, &maximum, &current, &now)
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitFreezeMaxHold = time.Minute
 
 	head := queuedWaiter(7, 60, now.Add(-10*time.Second))
-	fitting := queuedWaiter(8, 30, now)
+	fitting := queuedWaiter(8, 35, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, fitting}}
 
 	server.evaluateAdmitQueue(queue) // idle -> hold: exactly one line
@@ -666,8 +712,11 @@ func TestAdmitFreezePhaseAtDerivesTheDutyCycle(t *testing.T) {
 	}{
 		{name: "at arm", at: anchor, want: admitFreezeHold},
 		{name: "inside hold", at: anchor.Add(59 * time.Second), want: admitFreezeHold},
-		{name: "hold boundary", at: anchor.Add(time.Minute), want: admitFreezeYield},
-		{name: "inside yield", at: anchor.Add(119 * time.Second), want: admitFreezeYield},
+		// AIRA-307: no maxHold-long yield window. The derived phase is idle
+		// from the hold boundary on; the evaluator's completed-cycle clear turns
+		// the first pass after it into the ONE backfilling (yield) pass.
+		{name: "hold boundary", at: anchor.Add(time.Minute), want: admitFreezeIdle},
+		{name: "where the yield window was", at: anchor.Add(119 * time.Second), want: admitFreezeIdle},
 		{name: "cycle complete", at: anchor.Add(2 * time.Minute), want: admitFreezeIdle},
 		{name: "clock went backwards", at: anchor.Add(-time.Second), want: admitFreezeHold},
 	} {

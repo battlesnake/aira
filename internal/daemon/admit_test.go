@@ -167,7 +167,6 @@ func TestAdmitPrefixConcurrencyAndNoJumpAhead(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
-	server.admitBackfillGrace = 0
 	queue := &sliceQueue{path: "/slice", server: server}
 	a := &admitWaiter{seq: 1, reserve: 40, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
 	b := &admitWaiter{seq: 2, reserve: 40, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
@@ -181,13 +180,17 @@ func TestAdmitPrefixConcurrencyAndNoJumpAhead(t *testing.T) {
 		t.Fatalf("outstanding=%d, want 80", queue.outstanding)
 	}
 
-	large := &admitWaiter{seq: 4, reserve: 120, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
-	small := &admitWaiter{seq: 5, reserve: 1, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
-	blocked := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{large, small}}
+	// No jump ahead: a held lease leaves 70 free, so the 80 head does not fit;
+	// the 41 behind it fits the room but exceeds the head's AIRA-307 budget
+	// (80/2 = 40), so it must wait behind the head.
+	held := &admitWaiter{seq: 6, reserve: 30, state: admitGranted, accounted: true}
+	large := &admitWaiter{seq: 4, reserve: 80, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
+	small := &admitWaiter{seq: 5, reserve: 41, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
+	blocked := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{held, large, small}, outstanding: 30, outstandingJobs: 1}
 	server.evaluateAdmitQueue(blocked)
 	requireAdmitQueued(t, large)
 	requireAdmitQueued(t, small)
-	maximum.Store(121)
+	maximum.Store(200)
 	server.evaluateAdmitQueue(blocked)
 	waitAdmitGrant(t, large)
 	waitAdmitGrant(t, small)
@@ -199,11 +202,13 @@ func TestAdmitBackfillsSmallWaitersPastBlockedHeadAndAccountsExactly(t *testing.
 	server := admitTestServer(&maximum)
 	now := time.Unix(1000, 0)
 	server.admitNow = func() time.Time { return now }
-	server.admitBackfillGrace = time.Minute
 	server.admitSliceHeadroomBase = 10
-	head := &admitWaiter{seq: 1, reserve: 101, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
-	smallA := &admitWaiter{seq: 2, reserve: 30, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
-	smallB := &admitWaiter{seq: 3, reserve: 40, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
+	// 5 bytes of live use make the 90 head (which fits the empty 90 ceiling) not
+	// fit now; its AIRA-307 budget is 45, exactly smallA + smallB.
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 5, maximum.Load(), 0, true, "" }
+	head := &admitWaiter{seq: 1, reserve: 90, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
+	smallA := &admitWaiter{seq: 2, reserve: 20, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
+	smallB := &admitWaiter{seq: 3, reserve: 25, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, smallA, smallB}}
 
 	server.evaluateAdmitQueue(queue)
@@ -211,25 +216,29 @@ func TestAdmitBackfillsSmallWaitersPastBlockedHeadAndAccountsExactly(t *testing.
 	requireAdmitQueued(t, head)
 	waitAdmitGrant(t, smallA)
 	waitAdmitGrant(t, smallB)
-	if queue.outstanding != 70 || queue.outstandingJobs != 2 {
-		t.Fatalf("backfill ledger outstanding=%d jobs=%d, want exact granted sum 70/2", queue.outstanding, queue.outstandingJobs)
+	if queue.outstanding != 45 || queue.outstandingJobs != 2 {
+		t.Fatalf("backfill ledger outstanding=%d jobs=%d, want exact granted sum 45/2", queue.outstanding, queue.outstandingJobs)
+	}
+	if head.bypassed != 45 {
+		t.Fatalf("head.bypassed=%d, want the 45 granted past it", head.bypassed)
 	}
 	if ceiling := maximum.Load() - server.admitSliceHeadroom(queue.outstandingJobs+1); queue.outstanding > ceiling {
 		t.Fatalf("backfill exceeded ceiling: outstanding=%d ceiling=%d", queue.outstanding, ceiling)
 	}
 }
 
-func TestAdmitBackfillFreezesForAnOldBlockedHead(t *testing.T) {
+// AIRA-307: the head freezes a fitting waiter once that waiter would exceed the
+// head's budget (60/2 = 30; the follower asks 31).
+func TestAdmitBackfillFreezesForABlockedHeadPastItsBudget(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
 	now := time.Unix(2000, 0)
 	current := int64(50)
 	server.admitNow = func() time.Time { return now }
-	server.admitBackfillGrace = 10 * time.Second
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return current, maximum.Load(), 0, true, "" }
 	head := &admitWaiter{seq: 1, reserve: 60, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now.Add(-10 * time.Second)}
-	small := &admitWaiter{seq: 2, reserve: 30, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
+	small := &admitWaiter{seq: 2, reserve: 31, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
 
 	server.evaluateAdmitQueue(queue)
@@ -242,37 +251,6 @@ func TestAdmitBackfillFreezesForAnOldBlockedHead(t *testing.T) {
 	current = 0
 	server.evaluateAdmitQueue(queue)
 	waitAdmitGrant(t, head)
-}
-
-func TestAdmitBackfillGraceZeroAndDisabledAreStrictFIFO(t *testing.T) {
-	for _, test := range []struct {
-		name, value string
-	}{{name: "zero", value: "0"}, {name: "disabled", value: "disabled"}} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("AIRA_DAEMON_ADMIT_BACKFILL_GRACE", test.value)
-			grace, err := admitBackfillGraceFromEnv()
-			if err != nil || grace != 0 {
-				t.Fatalf("grace=%v err=%v, want disabled", grace, err)
-			}
-			var maximum atomic.Int64
-			maximum.Store(100)
-			server := admitTestServer(&maximum)
-			server.admitBackfillGrace = grace
-			now := time.Unix(3000, 0)
-			server.admitNow = func() time.Time { return now }
-			head := &admitWaiter{seq: 1, reserve: 101, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
-			small := &admitWaiter{seq: 2, reserve: 1, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
-			queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
-
-			server.evaluateAdmitQueue(queue)
-
-			requireAdmitQueued(t, head)
-			requireAdmitQueued(t, small)
-			if queue.outstanding != 0 || queue.outstandingJobs != 0 {
-				t.Fatalf("strict FIFO granted past blocked head: outstanding=%d jobs=%d", queue.outstanding, queue.outstandingJobs)
-			}
-		})
-	}
 }
 
 func TestAdmitWeightedReservationsBoundConcurrentSumAcrossSuites(t *testing.T) {
@@ -822,7 +800,6 @@ func TestGrantSetsGrantedAtDistinctFromEnqueuedUnderQueueingDelay(t *testing.T) 
 	enqueuedAt := time.Unix(5000, 0)
 	now := enqueuedAt
 	server.admitNow = func() time.Time { return now }
-	server.admitBackfillGrace = 0
 	current := int64(90)
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return current, maximum.Load(), 0, true, ""

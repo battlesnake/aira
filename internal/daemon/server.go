@@ -114,7 +114,6 @@ type Server struct {
 	watchPollInterval  time.Duration
 	admitSlots         chan struct{}
 	admitPollInterval  time.Duration
-	admitBackfillGrace time.Duration
 	admitFreezeMaxHold time.Duration
 	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
 	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
@@ -270,7 +269,7 @@ func NewServer(paths Paths) *Server {
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, ejecting: map[string]struct{}{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		projectUses: map[string]int{},
 		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
-		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
+		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
 		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
 		restartFreeze:                defaultRestartFreeze,
 		admitQueues:                  map[string]*sliceQueue{},
@@ -390,11 +389,6 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.admitPollInterval = admitPollInterval
-	admitBackfillGrace, err := admitBackfillGraceFromEnv()
-	if err != nil {
-		return err
-	}
-	s.admitBackfillGrace = admitBackfillGrace
 	admitFreezeMaxHold, err := admitFreezeMaxHoldFromEnv()
 	if err != nil {
 		return err
@@ -890,7 +884,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = s.reply(conn, responseFrame(s.confineBudget(request.Request.Args)))
 		return
 	}
-	if verb == "confine-list" || verb == "confine-kill" {
+	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}

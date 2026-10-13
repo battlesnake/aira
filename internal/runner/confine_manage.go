@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -11,7 +12,31 @@ const (
 	CodeConfineNotFound        = "E_CONFINE_NOT_FOUND"
 	CodeConfineNotLaunched     = "U_CONFINE_NOT_LAUNCHED"
 	CodeConfineKillUnconfirmed = "U_CONFINE_KILL_UNCONFIRMED"
+	// CodeConfineNotQueued refuses `aira confine --front` (AIRA-309) for a job
+	// that is not waiting in the admission queue: it is already admitted, or it is
+	// a sub-reservation, whose place follows its parent's.
+	CodeConfineNotQueued = "E_CONFINE_NOT_QUEUED"
 )
+
+// CheckConfineOwner is the ONE ownership guard every owner-checked confine
+// management action applies — `--kill` on the real and the ci-shim paths, and
+// `--front` (AIRA-309) — so the rule cannot drift between them.
+//
+// Both sides must be ATTESTED for the guard to open. An inferred owner
+// (AIRA-23, '@'-prefixed) reads as unattested on purpose: two sessions in one
+// directory infer the same value, so honouring it would let either act on the
+// other's job without --steal — the exact weakening AIRA-23 forbids. An empty
+// owner is ConfineUnknownOwner, which is unattested too.
+func CheckConfineOwner(scopeID, owner, callerOwner string, steal bool) error {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		owner = ConfineUnknownOwner
+	}
+	if !steal && (!ConfineOwnerIsAttested(owner) || !ConfineOwnerIsAttested(callerOwner) || owner != callerOwner) {
+		return fmt.Errorf("%s: scope=%s owner=%s caller=%s; pass --steal to override", CodeConfineOwnerUnverified, scopeID, owner, callerOwner)
+	}
+	return nil
+}
 
 // ConfineRegistryEntry names a scope with a held daemon admission lease. It
 // never establishes filesystem existence — its only job is to surface a scope
@@ -192,7 +217,13 @@ type ConfineRecord struct {
 	// pid/name selector filters these rows out (a worker is reachable only by its
 	// explicit scope-id, or by killing its parent), so `--kill <supervisor-pid>`
 	// resolves to the parent job rather than matching every one of its siblings.
-	Worker            bool     `json:"worker,omitempty"`
+	Worker bool `json:"worker,omitempty"`
+	// Pushed marks a QUEUED row (ConfineListResult.Queued) that an operator pushed
+	// to the front of the admission queue with `aira confine --front` (AIRA-309).
+	// Queued rows are already in evaluation order, so a pushed row is listed
+	// first; the flag says WHY, since a pushed head freezes the jobs behind it.
+	// Never set on a live (Scopes) row. Additive: an old client ignores it.
+	Pushed            bool     `json:"pushed,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
 }
 
@@ -382,7 +413,7 @@ type ConfineListResult struct {
 	Reason  string          `json:"reason,omitempty"`
 	Scopes  []ConfineRecord `json:"scopes"`
 	// Queued are the jobs still waiting in the admission queue (AIRA-308), in the
-	// daemon's enqueue order and bounded by ConfineQueuedRowLimit. A queued job
+	// daemon's evaluation order (pushed jobs first, AIRA-309) and bounded by ConfineQueuedRowLimit. A queued job
 	// holds no scope, so it is NEVER in Scopes and every consumer of Scopes is
 	// unaffected. Absent (omitted) when none are queued, when the caller was the
 	// blocked launcher's own position probe, or when the daemon predates the field;
@@ -827,6 +858,17 @@ type ConfineKillResult struct {
 	ScopeID string `json:"scope_id"`
 	Name    string `json:"name"`
 	Owner   string `json:"owner"`
+}
+
+// ConfineFrontResult is the reply to `aira confine --front` (AIRA-309): the job
+// pushed to the head of the admission queue and its new 1-based position in the
+// evaluation order (1 unless another push lands between the push and the read).
+type ConfineFrontResult struct {
+	Status   string `json:"status"`
+	ScopeID  string `json:"scope_id"`
+	Name     string `json:"name"`
+	Owner    string `json:"owner"`
+	Position int    `json:"position"`
 }
 
 type ConfineReapResult struct {

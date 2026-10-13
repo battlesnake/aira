@@ -368,6 +368,11 @@ var ExitCodes = map[string]int{
 	// it never reaches an interactive operator on the shared slice.
 	"E_ADMIT_FAILFAST_TRIPPED":   1,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
+	// AIRA-309. `confine --front` names a job that exists but is not waiting in
+	// the admission queue (already admitted, or a sub-reservation that follows
+	// its parent): the state is wrong, not the selector, so 1 — the same side of
+	// the rule as E_CONFINE_OWNER_UNVERIFIED.
+	"E_CONFINE_NOT_QUEUED":   1,
 	"U_CONFINE_NOT_LAUNCHED": 3, "U_CONFINE_KILL_UNCONFIRMED": 3,
 	// AIRA-22's detached confine surface, mirroring the run-detach pair
 	// (E_RUN_DETACH_FAILED: 4, U_RUN_DETACH_CANCELLED: 3) so a caller that knows
