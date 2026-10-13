@@ -940,6 +940,12 @@ type admitSnapshot struct {
 	// two different instants, which is the whole reason admitSnapshot exists.
 	queuePosition    int
 	queuedAheadBytes int64
+	// AIRA-308. The QUEUED waiters themselves, copied out in the same locked walk
+	// that counts them, in enqueue order and bounded by runner.ConfineQueuedRowLimit.
+	// Scope-less waiters (per-test `confine-reserve` holds) carry no scope id to
+	// decode a name and supervisor from, so they are counted in `queued` and
+	// listed nowhere: len(queuedEntries) < queued is how a renderer sees that.
+	queuedEntries []runner.ConfineQueuedEntry
 	// AIRA-186. That same waiter's OWN resolved reserve — `waiter.reserve`, the
 	// figure admission is gating on, which is also the quantity queuedAheadBytes
 	// sums for the waiters in front. Taken at the SAME match, so "how much is
@@ -1191,6 +1197,12 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 				snapshot.queuedReserveBytes = waiter.reserve
 			}
 			queuedBytes = addClamp(queuedBytes, waiter.reserve)
+			if waiter.scopeID != "" && len(snapshot.queuedEntries) < runner.ConfineQueuedRowLimit {
+				// Values, never the waiter: the entry outlives queue.mu.
+				snapshot.queuedEntries = append(snapshot.queuedEntries, runner.ConfineQueuedEntry{
+					ScopeID: waiter.scopeID, ReserveBytes: waiter.reserve, VRAMBytes: waiter.vram,
+				})
+			}
 			continue
 		}
 		// The classifier is scopeID and nothing else. name/owner cannot be used:

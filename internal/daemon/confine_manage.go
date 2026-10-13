@@ -126,6 +126,32 @@ func (s *Server) resolveConfineManagementPath(slice string) (string, error) {
 	return path, nil
 }
 
+// queuedConfineRows turns the snapshot's queued waiters into listing rows.
+//
+// A scope id already present in live is dropped: the scan and the snapshot are two
+// instants, and a job granted between them must not be drawn both as running and
+// as waiting. Shim mode builds the rows with no live reads, exactly as it builds
+// its Scopes rows (ShimConfineList).
+func (s *Server) queuedConfineRows(ctx context.Context, entries []runner.ConfineQueuedEntry, live []runner.ConfineRecord) []runner.ConfineRecord {
+	if len(entries) == 0 {
+		return nil
+	}
+	liveIDs := make(map[string]struct{}, len(live))
+	for _, record := range live {
+		liveIDs[record.ScopeID] = struct{}{}
+	}
+	waiting := make([]runner.ConfineQueuedEntry, 0, len(entries))
+	for _, entry := range entries {
+		if _, running := liveIDs[entry.ScopeID]; !running {
+			waiting = append(waiting, entry)
+		}
+	}
+	if s.shimMode() {
+		return runner.ShimQueuedConfines(waiting)
+	}
+	return runner.ListQueuedConfines(ctx, waiting)
+}
+
 func (s *Server) confineManagement(ctx context.Context, request core.Request) core.Response {
 	callerOwner := stringArg(request.Args, "owner")
 	if err := runner.ValidateConfineOwner(callerOwner); err != nil {
@@ -182,6 +208,14 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// scope's declared --vram (0 = "not a GPU job") onto its row, a scope the
 		// ledger holds no record for left unevaluated.
 		runner.ApplyConfineScopeVRAM(result.Scopes, snapshot.scopeVRAM)
+		// AIRA-308. The queued jobs as rows, from the same snapshot. A caller that
+		// names its own scope id is the blocked launcher's position probe, which
+		// reads SliceReserve and nothing else, so it is not made to pay for a
+		// /proc read per queued job on every diagnostic tick (the cost
+		// confine_queue_position_linux.go sized without them).
+		if stringArg(request.Args, "scope_id") == "" {
+			result.Queued = s.queuedConfineRows(ctx, snapshot.queuedEntries, result.Scopes)
+		}
 		readMemory := s.memoryReader()
 		sliceCurrent, maximum, sliceReclaimable, ok, _ := readMemory(path)
 		if ok {
