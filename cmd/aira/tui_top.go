@@ -771,6 +771,8 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 // never read as a held charge. ID is deliberately empty: the live rows' ID is the
 // scope id, and a not-yet-admitted scope must never be a selectable target for any
 // row action (the selection and inline-action paths both ignore an empty ID).
+// A FUTURE row action added to `aira top` must guard on an empty ID the same way,
+// or a queued row becomes its target.
 func topQueuedRow(record runner.ConfineRecord, showCwd bool) tableRow {
 	lastText := record.Command
 	if showCwd {
@@ -780,15 +782,16 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool) tableRow {
 		Colour: topColourQueued, Cells: []string{
 			"-", record.Name, confineNum(record.SupervisorPID),
 			"queued", topAgeCell(record.AgeSeconds), topQueuedBytesCell(record.ReserveBytes, "0M req"),
-			"-", "-", topQueuedBytesCell(record.VRAMBytes, "-"), topSessionCell(record), topUntrustedCell(lastText),
+			"-", "-", topQueuedBytesCell(record.VRAMBytes, topVRAMCell(new(int64))), topSessionCell(record), topUntrustedCell(lastText),
 		},
 	}
 }
 
 // topQueuedBytesCell renders a REQUESTED byte count. nil is unevaluated (the
 // daemon did not say); a request of zero renders as zeroText — "0M req" for a
-// reserve, but "-" for VRAM, where "asked for no VRAM" is a fact about a non-GPU
-// job and not something to print as a request.
+// reserve, but for VRAM the live rows' own non-GPU glyph (topVRAMCell of 0), where
+// "asked for no VRAM" is a fact about a non-GPU job and not something to print as
+// a request.
 func topQueuedBytesCell(value *int64, zeroText string) string {
 	if value == nil || *value < 0 {
 		return "unevaluated"
@@ -1466,14 +1469,15 @@ func topFooter(result runner.ConfineListResult) string {
 	}
 	if reserve.FreezePhase != "" {
 		parts = append(parts, fmt.Sprintf("%d queued, freeze %s", reserve.Queued, reserve.FreezePhase))
-		// AIRA-308. The queued ROWS are a bounded list and exclude scope-less
-		// per-test reservations, so fewer rows than the queue's own count is stated,
-		// never left to read as "that is everything waiting". An old daemon sends no
-		// rows at all and lands here too, with a true "showing 0 of N".
-		if len(result.Queued) < reserve.Queued {
-			parts = append(parts, fmt.Sprintf("showing %d of %d queued (per-test reservations have no row; at most %d are listed)",
-				len(result.Queued), reserve.Queued, runner.ConfineQueuedRowLimit))
-		}
+	}
+	// AIRA-308. Fewer queued ROWS than the queue's own count is stated, never left
+	// to read as "that is everything waiting". It is independent of FreezePhase: the
+	// count is what it is checked against. The reason is deliberately not a closed
+	// list (scope-less per-test reservations, the row cap, a supervisor whose id did
+	// not decode, an old daemon that sends no rows): it says only that some have none.
+	if len(result.Queued) < reserve.Queued {
+		parts = append(parts, fmt.Sprintf("showing %d of %d queued (some queued jobs have no row, e.g. per-test reservations; at most %d are listed)",
+			len(result.Queued), reserve.Queued, runner.ConfineQueuedRowLimit))
 	}
 	if reserve.Exclusive != nil {
 		exclusive := "EXCLUSIVE " + reserve.Exclusive.State

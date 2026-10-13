@@ -43,10 +43,14 @@ func queuedRowWaiter(seq int64, state admitWaiterState, scopeID string, reserve,
 // between them, a released waiter and a rejected waiter.
 //
 //   - listing every waiter                       -> granted/released/rejected rows appear
-//   - listing scope-less queued reservations     -> a row with no decodable identity
 //   - sorting by scope id (as Scopes is)         -> the order flips
 //   - reading the granted charge, not the request-> reserves differ
-//   - dropping the count                         -> Queued != 4
+//   - dropping the count                         -> Queued != 3
+//
+// Copying a scope-less waiter into the entries is NOT caught here: its empty id
+// does not decode, so the runner drops it and no row appears either way. What
+// that mutant does break is the row cap, which a run of scope-less waiters would
+// fill — pinned by TestConfineListScopelessWaitersDoNotConsumeTheRowCap.
 func TestConfineListPublishesQueuedWaitersInEnqueueOrder(t *testing.T) {
 	grantedID := queuedTestID("granted", os.Getpid())
 	lateID := queuedTestID("zulu", 7101)   // sorts AFTER first by id, enqueued BEFORE it
@@ -112,6 +116,29 @@ func TestConfineListQueuedRowsAreBoundedAndTheTotalStaysTrue(t *testing.T) {
 	}
 	if result.SliceReserve == nil || result.SliceReserve.Queued != total {
 		t.Fatalf("SliceReserve.Queued=%+v, want the true total %d", result.SliceReserve, total)
+	}
+}
+
+// Scope-less waiters (per-test confine-reserve holds) take no place in the
+// bounded row list: a full cap's worth of them queued AHEAD of one scoped job
+// still leaves that job its row. Without the scopeID guard on the copy-out, the
+// scope-less entries fill the cap, the runner drops them as undecodable, and the
+// scoped job has no row at all.
+func TestConfineListScopelessWaitersDoNotConsumeTheRowCap(t *testing.T) {
+	waiters := make([]*admitWaiter, 0, runner.ConfineQueuedRowLimit+1)
+	for i := 0; i < runner.ConfineQueuedRowLimit; i++ {
+		waiters = append(waiters, queuedRowWaiter(int64(i+1), admitQueued, "", 1<<20, 0))
+	}
+	scoped := queuedTestID("scoped", 8500)
+	waiters = append(waiters, queuedRowWaiter(int64(runner.ConfineQueuedRowLimit+1), admitQueued, scoped, 2<<20, 0))
+	server, _ := queuedTestServer(t, waiters)
+
+	result := reserveListing(t, server)
+	if len(result.Queued) != 1 || result.Queued[0].ScopeID != scoped {
+		t.Fatalf("queued rows=%+v, want exactly the one scoped waiter behind %d scope-less ones", result.Queued, runner.ConfineQueuedRowLimit)
+	}
+	if result.SliceReserve == nil || result.SliceReserve.Queued != runner.ConfineQueuedRowLimit+1 {
+		t.Fatalf("SliceReserve.Queued=%+v, want the true total %d", result.SliceReserve, runner.ConfineQueuedRowLimit+1)
 	}
 }
 

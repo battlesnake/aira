@@ -403,6 +403,10 @@ func listQueuedConfines(ctx context.Context, entries []ConfineQueuedEntry) []Con
 // SAME helper and seams the live scan uses (AIRA-308), so a queued row's command,
 // cwd and pane carry exactly a live row's trust level and honesty rules. There is
 // no scope directory, so none of the cgroup reads happen.
+//
+// entries carry no repeated scope id: they come from one slice queue, and
+// enqueueAdmitInternal refuses a second queued (or rejected) waiter for a scope id
+// it already holds (leaseByScopeIDLocked), so no dedupe is done here.
 func listQueuedConfinesWithDeps(ctx context.Context, entries []ConfineQueuedEntry, deps confineScanDeps) []ConfineRecord {
 	now := time.Now
 	if deps.now != nil {
@@ -414,9 +418,6 @@ func listQueuedConfinesWithDeps(ctx context.Context, entries []ConfineQueuedEntr
 	for _, entry := range entries {
 		record, pid, ok := queuedConfineRecord(entry, now())
 		if !ok {
-			continue
-		}
-		if _, seen := byID[entry.ScopeID]; seen {
 			continue
 		}
 		readConfineSupervisorFacets(&record, entry.ScopeID, pid, deps, panes)

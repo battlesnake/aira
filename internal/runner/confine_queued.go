@@ -65,6 +65,7 @@ func queuedConfineRecord(entry ConfineQueuedEntry, now time.Time) (ConfineRecord
 	reserve, vram := entry.ReserveBytes, entry.VRAMBytes
 	record := ConfineRecord{
 		Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid,
+		Worker:       IsAitestWorkerScopeName(name), // classified exactly as a live row is
 		ReserveBytes: &reserve, VRAMBytes: &vram,
 		UnevaluatedFields: []string{"populated", "rss", "cap", "cpu", "supervisor_live"},
 	}

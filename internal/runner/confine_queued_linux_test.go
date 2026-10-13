@@ -127,23 +127,33 @@ func TestQueuedConfineRowsFallBackToTheRealReadersWhenSeamsAreUnset(t *testing.T
 	}
 }
 
-// One id queued twice (a retried probe, a hostile client) is one row: the first
-// wins, so the table can never show the same scope id twice.
-func TestQueuedConfineRowsDropARepeatedScopeID(t *testing.T) {
+// A queued aitest worker is flagged Worker exactly as its live row is, so a
+// consumer that filters workers out of a default listing filters the queued
+// one too. Asserted through BOTH builders, with a non-worker beside it whose
+// name merely starts the same way, so a constant true or false fails.
+func TestQueuedConfineRowsFlagAitestWorkersLikeLiveRows(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_800_000_000, 0)
-	id := confineTestScopeID("alpha", 7001, now.Add(-time.Second).UnixNano())
-	rows := listQueuedConfinesWithDeps(context.Background(), []ConfineQueuedEntry{
-		{ScopeID: id, ReserveBytes: 1 << 30}, {ScopeID: id, ReserveBytes: 9 << 30},
-	}, queuedTestDeps(now))
-	if len(rows) != 1 || *rows[0].ReserveBytes != 1<<30 {
-		t.Fatalf("rows=%+v, want the first entry only", rows)
+	worker := confineTestOwnedScopeID("aitest-w3", "session-a", 7001, now.Add(-time.Second).UnixNano())
+	plain := confineTestOwnedScopeID("aitest-wrapper", "session-a", 7002, now.Add(-time.Second).UnixNano())
+	entries := []ConfineQueuedEntry{{ScopeID: worker, ReserveBytes: 1}, {ScopeID: plain, ReserveBytes: 1}}
+	for builder, rows := range map[string][]ConfineRecord{
+		"live": listQueuedConfinesWithDeps(context.Background(), entries, queuedTestDeps(now)),
+		"shim": shimQueuedConfines(entries, now),
+	} {
+		if len(rows) != 2 || rows[0].Name != "aitest-w3" || rows[1].Name != "aitest-wrapper" {
+			t.Fatalf("%s: rows=%+v", builder, rows)
+		}
+		if !rows[0].Worker || rows[1].Worker {
+			t.Fatalf("%s: worker flags=%v,%v, want true,false", builder, rows[0].Worker, rows[1].Worker)
+		}
 	}
 }
 
-// Shim mode / non-Linux: NO live read of any kind. Counting the readers invoked
-// is the pin, because a builder that reused the live path would "work" here too
-// (the pids are fakes, so every read would fail into the same unevaluated names).
+// Shim mode / non-Linux: NO live read of any kind. The pin is the supervisor pid:
+// it is this very test process, whose /proc entries ARE readable, so a builder
+// that reused the live path would produce a Command/Cwd and fail the nil check
+// below rather than falling into the same unevaluated names.
 func TestShimQueuedConfinesMakeNoLiveRead(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_800_000_000, 0)

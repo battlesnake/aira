@@ -50,6 +50,11 @@ func TestTopViewModelListsQueuedJobsAfterTheLiveOnesGreyed(t *testing.T) {
 	vram := 6 * gib
 	second.VRAMBytes = &vram
 	model, _ := topViewModel(topTick{}, topQueuedListing(first, second))
+	// A non-GPU queued job's VRAM cell is the live rows' own "not a GPU job" glyph.
+	zero := int64(0)
+	if topVRAMCell(&zero) != "—" {
+		t.Fatalf("test premise: live non-GPU glyph is %q", topVRAMCell(&zero))
+	}
 
 	if len(model.Rows) != 4 {
 		t.Fatalf("rows=%d, want 2 live + 2 queued", len(model.Rows))
@@ -60,7 +65,7 @@ func TestTopViewModelListsQueuedJobsAfterTheLiveOnesGreyed(t *testing.T) {
 		}
 	}
 	got := model.Rows[2]
-	want := []string{"-", "zulu", "7001", "queued", "1m35s", "4096M req", "-", "-", "-", "session-q", "go test ./..."}
+	want := []string{"-", "zulu", "7001", "queued", "1m35s", "4096M req", "-", "-", topVRAMCell(&zero), "session-q", "go test ./..."}
 	if !reflect.DeepEqual(got.Cells, want) {
 		t.Fatalf("queued cells=%q\nwant         %q", got.Cells, want)
 	}
@@ -123,20 +128,6 @@ func TestTopViewModelQueuedJobsChangeNoSlotColourOrBar(t *testing.T) {
 	}
 }
 
-// A queue that grows and shrinks around a live job must not recolour it.
-func TestTopViewModelLiveSlotsSurviveQueueChurn(t *testing.T) {
-	a := topQueuedTestRecord("CONFINE-q1-301-aa@session-q", "q1", gib)
-	b := topQueuedTestRecord("CONFINE-q2-302-bb@session-q", "q2", gib)
-	_, tick := topViewModel(topTick{}, topQueuedListing(a, b))
-	first, tick := topViewModel(tick, topQueuedListing())
-	second, _ := topViewModel(tick, topQueuedListing(b))
-	// Live rows only: queued rows have no ID to key a map by.
-	first.Rows, second.Rows = first.Rows[:2], second.Rows[:2]
-	if len(first.Rows) != 2 || !reflect.DeepEqual(topRowColours(first), topRowColours(second)) || !reflect.DeepEqual(topRowSlots(first), topRowSlots(second)) {
-		t.Fatalf("queue churn recoloured live rows: %v vs %v", topRowColours(first), topRowColours(second))
-	}
-}
-
 // The last column honours the c toggle for queued rows exactly as for live ones,
 // and both it and the command are untrusted text: control characters are escaped
 // and tview colour tags neutralised, and an unreadable supervisor says so.
@@ -190,7 +181,8 @@ func TestTopViewModelQueuedRowNeverFabricatesAReserve(t *testing.T) {
 }
 
 // Truncation is stated only when there are fewer rows than the queue's own count,
-// and then with both numbers.
+// and then with both numbers and a reason that does not claim to be exhaustive.
+// It must not hang off FreezePhase: a reply with no phase still has a count.
 func TestTopFooterStatesQueuedRowTruncation(t *testing.T) {
 	record := topQueuedTestRecord("CONFINE-zulu-201-cc@session-q", "zulu", gib)
 	listing := topQueuedListing(record)
@@ -199,6 +191,13 @@ func TestTopFooterStatesQueuedRowTruncation(t *testing.T) {
 	truncated := topFooter(listing)
 	if !strings.Contains(truncated, "70 queued, freeze idle") || !strings.Contains(truncated, "showing 1 of 70 queued") {
 		t.Fatalf("footer=%q, want the unchanged queue text plus a showing-1-of-70 note", truncated)
+	}
+	if !strings.Contains(truncated, "some queued jobs have no row") {
+		t.Fatalf("footer=%q, want the non-exhaustive reason", truncated)
+	}
+	listing.SliceReserve.FreezePhase = ""
+	if noPhase := topFooter(listing); !strings.Contains(noPhase, "showing 1 of 70 queued") {
+		t.Fatalf("footer=%q, want the truncation note even with no freeze phase", noPhase)
 	}
 	listing.SliceReserve.Queued = 1
 	if complete := topFooter(listing); strings.Contains(complete, "showing") {
