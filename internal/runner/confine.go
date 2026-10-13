@@ -1105,12 +1105,15 @@ func confineReserveHintSuggestion(peak int64) int64 {
 //   - peak-rss established (nil = unevaluated, never read as zero);
 //   - declaredBytes > 0 (the caller pinned --memory-reserve / AIRA_CONFINE_RESERVE;
 //     a history estimate has no knob to turn) AND equal to the reserve actually
-//     charged (with --memory-max the ledger charges the max instead, and lowering
-//     --memory-reserve would change nothing);
+//     charged and the cap is not operator:--memory-max (with --memory-max the
+//     ledger charges the max, so lowering --memory-reserve changes nothing, even
+//     when the two happen to be equal);
 //   - that reserve >= 2 GiB, peak strictly below 60% of it, and the suggestion
 //     strictly below it (otherwise the advice is a no-op).
 func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes int64, optOut bool) string {
-	if optOut || status.Containment != ConfineContainmentEnforced {
+	// --memory-max sets the charge whatever --memory-reserve says, so a
+	// --memory-reserve suggestion would be a no-op even when the two are equal.
+	if optOut || status.Containment != ConfineContainmentEnforced || status.ScopeMemoryCapSource == ConfineCapSourceMemoryMax {
 		return ""
 	}
 	if status.TerminatedBy != ConfineTerminatedNormal || exitCode != 0 || status.PeakRSS == nil {

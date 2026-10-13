@@ -56,6 +56,14 @@ func TestConfineReserveHintGates(t *testing.T) {
 			// --memory-reserve is not the knob in force.
 			s.ReserveBytes, *d = 8*hintGiB, 4*hintGiB
 		}, false},
+		{"--memory-max equal to the declared reserve never hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			// --memory-max 4G --memory-reserve 4G: charged == declared, but the max
+			// sets the charge, so the --memory-reserve advice would be a no-op.
+			s.ScopeMemoryCapSource = ConfineCapSourceMemoryMax
+		}, false},
+		{"--memory-reserve cap source still hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.ScopeMemoryCapSource = ConfineCapSourceMemoryReserve
+		}, true},
 		{"non-zero exit never hints", func(_ *ConfineStatus, e *int, _ *int64, _ *bool) {
 			*e = 1
 		}, false},
