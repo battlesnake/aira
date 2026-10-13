@@ -78,10 +78,17 @@ func TestTopViewModelListsQueuedJobsAfterTheLiveOnesGreyed(t *testing.T) {
 	if model.Rows[3].Colour != topColourQueued {
 		t.Fatalf("second row colour=%q", model.Rows[3].Colour)
 	}
-	// A queued row can never be an action target: the live rows' ID is a scope id.
-	for _, row := range model.Rows[2:] {
-		if row.ID != "" {
-			t.Fatalf("queued row carries ID %q; a not-yet-admitted scope must not be selectable", row.ID)
+	// AIRA-309: a queued row is selectable by its scope id (the id it keeps once
+	// admitted) and is marked as the QUEUED row kind, which is what keeps every
+	// live-row action off it (TestTopFrontRowKindDefaultDeny).
+	for index, row := range model.Rows[2:] {
+		if want := []string{first.ScopeID, second.ScopeID}[index]; row.ID != want || !row.Queued {
+			t.Fatalf("queued row %d ID=%q queued=%v, want ID %q and the queued kind", index, row.ID, row.Queued, want)
+		}
+	}
+	for _, row := range model.Rows[:2] {
+		if row.Queued {
+			t.Fatalf("live row %q marked queued", row.ID)
 		}
 	}
 	// The footer's queue text is unchanged and carries no truncation note.

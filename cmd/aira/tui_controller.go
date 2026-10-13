@@ -98,6 +98,17 @@ type tableRow struct {
 	// top view sets it from topSlotColour so a row and its bar region are the same
 	// colour BY CONSTRUCTION rather than by two call sites agreeing.
 	Colour string
+	// Queued marks an `aira top` row for a job still WAITING in the admission
+	// queue (AIRA-308/309), as opposed to a live (admitted) row. It is the row
+	// KIND every inline action is checked against: an action targets live rows
+	// only unless it opts in to queued rows (inlineAction.QueuedRow), so a
+	// queued row can never become the target of an action written for running
+	// jobs by forgetting a guard.
+	Queued bool
+	// ConfirmText describes the row's job for a confirmation page, in words an
+	// operator needs before acting on it (AIRA-309: name, owner, requested
+	// reserve, listed position). Display only; empty on every other row.
+	ConfirmText string
 }
 
 type gaugeTile struct {
@@ -747,6 +758,22 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 		return state, []tuiCmd{{Kind: cmdScheduleRefresh, View: viewTop, Backoff: topRefreshInterval}}
 	}
 	return state, nil
+}
+
+// onTopHighlight records the `aira top` row the table cursor is on (AIRA-309) as
+// the panel selection. tableRow is the 1-based table row (row 0 is the header);
+// anything outside the model's rows clears the selection rather than keeping a
+// stale one, so a row action can never land on a job the cursor has left.
+func onTopHighlight(state tuiState, tableRow int) tuiState {
+	state = cloneTUIState(state)
+	panel := state.Panels[viewTop]
+	id := ""
+	if tableRow >= 1 && tableRow <= len(panel.Model.Rows) {
+		id = panel.Model.Rows[tableRow-1].ID
+	}
+	panel.SelectedID = id
+	state.Panels[viewTop] = panel
+	return state
 }
 
 func onTUISelect(state tuiState, view tuiView, id string) (tuiState, []tuiCmd) {
