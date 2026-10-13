@@ -501,7 +501,7 @@ func TestConfineFrontResolutionAndOwnerGuard(t *testing.T) {
 
 // verifies: AIRA-309 test 14 — through the real management handler: the audit
 // line is written only on success, a push kicks an evaluation, the reply names
-// the job at position 1, and the same works in ci-shim mode (pure queue state).
+// the pushed job, and the same works in ci-shim mode (pure queue state).
 func TestConfineFrontHandlerLogsOnlyOnSuccessAndKicksTheQueue(t *testing.T) {
 	for _, shim := range []bool{false, true} {
 		t.Run(map[bool]string{false: "real", true: "ci-shim"}[shim], func(t *testing.T) {
@@ -537,8 +537,8 @@ func TestConfineFrontHandlerLogsOnlyOnSuccessAndKicksTheQueue(t *testing.T) {
 			var accepted core.Response
 			logged = captureDaemonLog(t, func() { accepted = server.confineManagement(t.Context(), request("s-1")) })
 			result, ok := accepted.Data.(runner.ConfineFrontResult)
-			if !accepted.OK || !ok || result.ScopeID != target.scopeID || result.Position != 1 {
-				t.Fatalf("push response=%+v, want target at position 1", accepted)
+			if !accepted.OK || !ok || result.ScopeID != target.scopeID {
+				t.Fatalf("push response=%+v, want the target pushed", accepted)
 			}
 			if !strings.Contains(logged, "confine-front: pusher=s-1 steal=false target-scope="+target.scopeID) {
 				t.Fatalf("missing audit line:\n%s", logged)
@@ -702,5 +702,98 @@ func TestAdmitPushedHeadIsReportedAsPushedPhase(t *testing.T) {
 				t.Fatalf("after the pushed job was admitted phase=%q, want %q", phase, want)
 			}
 		})
+	}
+}
+
+// verifies: AIRA-307 — the budget REPLACES the time window: the hold arms only
+// at the instant the budget withholds a grant that FITS, never on the head's own
+// first capacity refusal. A head refused alone leaves the anchor zero; a fitting
+// over-budget follower that arrives 30s later arms it at THAT pass's instant.
+// Arming on the head's refusal would start the maxHold clock while the budget is
+// still being consumed, shrinking the strict hold that follows it.
+func TestAdmitHoldArmsWhenTheBudgetWithholdsAFitNotWhenTheHeadIsRefused(t *testing.T) {
+	now := time.Unix(57000, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	head := queuedWaiter(2, 24*qGiB, now)
+	queue := queueOf(server, heldLease(1, 44*qGiB), head) // room 20 GiB, budget 12 GiB
+
+	server.evaluateAdmitQueue(queue)
+
+	requireAdmitQueued(t, head)
+	if !queue.freezeArmedAt.IsZero() {
+		t.Fatalf("freezeArmedAt=%v after the head's own refusal, want zero: nothing was withheld", queue.freezeArmedAt)
+	}
+
+	now = now.Add(30 * time.Second)
+	follower := queuedWaiter(3, 14*qGiB, now) // fits the 20 GiB room, over the 12 GiB budget
+	queue.waiters = append(queue.waiters, follower)
+	queue.seq = 3
+	server.evaluateAdmitQueue(queue)
+
+	requireAdmitQueued(t, follower)
+	if !queue.freezeArmedAt.Equal(now) {
+		t.Fatalf("freezeArmedAt=%v, want %v: the hold arms when the budget first withholds a fitting grant", queue.freezeArmedAt, now)
+	}
+}
+
+// verifies: AIRA-307/309 §3.4 — a head is job-level work only. A capacity-refused
+// sub-reservation first in order is never a head: it charges no budget and
+// freezes nobody, so a fitting job-level follower larger than half the
+// sub-reservation is granted at once, with no anchor and no protected holder.
+func TestAdmitSubReservationIsNeverAHead(t *testing.T) {
+	now := time.Unix(58000, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	sub := queuedWaiter(2, 24*qGiB, now) // refused: room is 20 GiB
+	sub.parentScopeID = "CONFINE-suite-77-aa@s-1"
+	follower := queuedWaiter(3, 14*qGiB, now) // > sub.reserve/2, fits the room
+	queue := queueOf(server, heldLease(1, 44*qGiB), sub, follower)
+
+	server.evaluateAdmitQueue(queue)
+
+	requireAdmitQueued(t, sub)
+	waitAdmitGrant(t, follower)
+	if !queue.freezeArmedAt.IsZero() {
+		t.Fatalf("freezeArmedAt=%v, want zero: a sub-reservation is never a head", queue.freezeArmedAt)
+	}
+	if queue.freezeHolderSeq != 0 {
+		t.Fatalf("freezeHolderSeq=%d, want 0: a sub-reservation is never a head", queue.freezeHolderSeq)
+	}
+	if sub.bypassed != 0 {
+		t.Fatalf("sub.bypassed=%d, want 0: no budget is charged to a sub-reservation", sub.bypassed)
+	}
+}
+
+// verifies: AIRA-309 — "pushed" is reported only while the pushed holder is still
+// QUEUED. A waiter rejected outside the evaluator (its max-wait timeout, or a
+// fail-fast trip) stays in queue.waiters, and freezeHolderSeq still names it, until
+// the next pass; in that window the surfaces must not claim a pushed job is
+// holding the queue.
+func TestAdmitRejectedPushedHolderIsNotReportedAsPushed(t *testing.T) {
+	now := time.Unix(59000, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	head := frontWaiter(2, "head", "s-1")
+	head.reserve = 24 * qGiB
+	queue := queueOf(server, heldLease(1, 44*qGiB), head)
+	server.admitQueues["/slice"] = queue
+	mustPush(t, queue, head.scopeID)
+	server.evaluateAdmitQueue(queue)
+	queue.mu.Lock()
+	before := server.admitReportedPhaseLocked(queue, now)
+	queue.mu.Unlock()
+	if before != admitFreezePhasePushed {
+		t.Fatalf("phase=%q while the pushed head is queued, want %q", before, admitFreezePhasePushed)
+	}
+
+	server.timeoutAdmitWaiter(queue, head)
+
+	queue.mu.Lock()
+	after := server.admitReportedPhaseLocked(queue, now)
+	holder := queue.freezeHolderSeq
+	queue.mu.Unlock()
+	if holder != head.seq {
+		t.Fatalf("freezeHolderSeq=%d, want %d: the window this pins needs the stale holder seq", holder, head.seq)
+	}
+	if after == admitFreezePhasePushed {
+		t.Fatalf("phase=%q after the pushed holder was rejected: a job no longer waiting is reported as holding the queue", after)
 	}
 }

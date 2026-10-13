@@ -324,7 +324,9 @@ the strict freeze is unbounded.
   - `queue.signal()`;
   - one audit log line, `confine-front: pusher=… steal=… target-scope=… target-name=…
     target-owner=…`, written only after success, like `confine-kill`.
-  - The reply carries the scope id and the new position (1).
+  - The reply carries the scope id, name and owner. It carries no position: the push takes the
+    fresh maximum `pushSeq` under the same lock as the reply, so the pushed job is always first
+    (build review: a computed position could only ever be 1).
 - **Display:**
   - Queued rows gain `pushed` (bool, omitempty).
   - `confine --list` and `aira top` mark pushed rows, which are already in evaluation order (§3.1).
@@ -341,10 +343,14 @@ the strict freeze is unbounded.
 - **The `f` key ("push to front")** is the only queued-row action. It opens the existing confirmation
   page.
   - The page shows the job's name, owner, requested reserve and position.
-  - **`aira top` has no owner identity.** It dispatches confine verbs as `ConfineUnknownOwner`
-    (`tui_data.go`), which is unattested, so every push from `top` is a steal.
-  - The page says so plainly: "aira top has no owner identity; confirming overrides the owner check
-    (--steal) for <owner>'s job". Confirming always sends `steal=true`.
+  - **The push is attributed** (build review): `top` resolves the caller identity once at startup
+    by the CLI's own chain (`AIRA_CONFINE_OWNER`, the worktree id, else an inferred `@cwd-…`) and
+    sends it as `owner`, so the daemon's audit line names the pusher. `confine-list` reads keep
+    the fixed `ConfineUnknownOwner` marker; they filter nothing by owner.
+  - `steal=false` only for the caller's own job under an attested identity (what the shared
+    guard passes without `--steal`); every other push sends `steal=true`. The page says which:
+    "It is your job (<caller>)", "You are <caller>; confirming overrides the owner check (--steal)
+    for <owner>'s job", or, with no identity at all, "aira top has no owner identity; …".
   - That page is the explicit steal acknowledgement a human gives in `top`. The ownership check
     without `--steal` still applies to the CLI and MCP.
 - **Stale target.** If the job was admitted between selection and confirmation, the row is now live,
@@ -545,13 +551,38 @@ shared daemon-restart care memory).
 was mutation-checked RED):
 - With the daemon unreachable, the CLI's management fallback sent every verb
   other than `confine-list` to `KillConfine`, so `aira confine --front job`
-  would have KILLED the job. `confine-front` now refuses with the transport
-  error, and the kill fallback is default-deny (only `confine-kill` reaches it).
+  would have KILLED the job. One default-deny now refuses every management verb
+  other than `confine-list` and `confine-kill` with the transport error, before
+  the ci-shim and slice-resolution steps (second review: the explicit
+  `confine-front` branch it replaced was redundant with a later default-deny).
   Test: `TestConfineFrontDaemonDownIsRefusedAndNeverKills`.
 - `DispatchPalette` refused every client-routed verb, so `aira top`'s `f`
   failed after its confirmation. It now admits exactly `confine-front` through
   the project-less management exchange. Test:
   `TestTopFrontPushReachesTheDaemonThroughThePalette`.
+
+**Second build review (advisories applied):**
+- `top`'s push is attributed to the caller (§3.7). Test:
+  `TestTopFrontPushIsAttributedToTheCaller`, `TestTopRuntimeResolvesTheConfineOwner`.
+- An old daemon answers `confine-front` with an unrelated code (an empty-scope
+  project lookup's, most likely `E_NOT_PROJECT`, rather than `E_UNKNOWN_VERB`).
+  The client keeps the daemon's code and words and appends the likely cause and
+  the restart command, for any code outside the verb's own vocabulary
+  (`E_CONFINE_*`, `E_SELECTOR_AMBIGUOUS`). Test:
+  `TestConfineFrontOldDaemonReplyNamesTheLikelyCause`.
+- The reply's `position` was dropped: it could only ever be 1 (§3.6).
+- Pinned, previously untested (mutation survivors): the hold arms only when the
+  budget withholds a fitting grant, never on the head's own refusal
+  (`TestAdmitHoldArmsWhenTheBudgetWithholdsAFitNotWhenTheHeadIsRefused`); a
+  sub-reservation is never a head (`TestAdmitSubReservationIsNeverAHead`); and
+  "pushed" is not reported for a holder rejected outside the evaluator
+  (`TestAdmitRejectedPushedHolderIsNotReportedAsPushed`; the queued-state check
+  is reachable, so it stays).
+- Not changed: `admitFreezeYield` stays a phase value rather than a pass-local
+  bool, because the transition log ("fairness-freeze yield", pinned by
+  `admit_freeze_test.go`) reads it. A name or pid selector that matches a
+  RUNNING foreign job names its scope id before the owner guard runs; `confine
+  --list` shows every scope id to everyone, so nothing is disclosed.
 
 **Rollout.** The admission change is daemon-side: it takes effect only after
 `systemctl --user restart aira-daemon.service`. The skill text needs

@@ -193,6 +193,14 @@ type tuiState struct {
 	DetachedReport        string
 	ShuttingDown          bool
 	ReconnectAttempt      int
+	// ConfineOwner is the caller identity a confine WRITE from this face (today
+	// only `aira top`'s `f` push, AIRA-309) sends, resolved once at startup by the
+	// CLI's own chain (AIRA_CONFINE_OWNER, the worktree id, else an inferred
+	// "@cwd-…" name). It attributes the push in the daemon's audit line and tells
+	// the confirmation whether the job is the caller's own. "" reads as
+	// ConfineUnknownOwner. confine-list reads keep the fixed unknown marker: they
+	// filter nothing by owner.
+	ConfineOwner string
 }
 
 // paletteConfirm is the immutable, resolved request snapshot displayed by the

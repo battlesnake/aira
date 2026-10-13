@@ -165,6 +165,12 @@ func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher
 		stdin: stdin, stdout: stdout, stderr: stderr,
 	}
 	runtime.state.CanExecute = runtime.canExecute
+	// AIRA-309. Resolved once, like the CLI's own owner, so a push from `top` is
+	// attributed. An unresolvable identity (an invalid AIRA_CONFINE_OWNER) leaves
+	// it unknown, which the confirmation states and which always sends --steal.
+	if owner, err := resolveConfineOwner(ctx, ""); err == nil {
+		runtime.state.ConfineOwner = owner
+	}
 	if board != nil {
 		runtime.isBoard = true
 		runtime.state.Board = board

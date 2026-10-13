@@ -862,14 +862,14 @@ type ConfineKillResult struct {
 }
 
 // ConfineFrontResult is the reply to `aira confine --front` (AIRA-309): the job
-// pushed to the head of the admission queue and its new 1-based position in the
-// evaluation order (1 unless another push lands between the push and the read).
+// pushed to the head of the admission queue. It carries no position: a push
+// always takes the fresh maximum pushSeq under the same lock as the reply, so the
+// pushed job is always first in the evaluation order.
 type ConfineFrontResult struct {
-	Status   string `json:"status"`
-	ScopeID  string `json:"scope_id"`
-	Name     string `json:"name"`
-	Owner    string `json:"owner"`
-	Position int    `json:"position"`
+	Status  string `json:"status"`
+	ScopeID string `json:"scope_id"`
+	Name    string `json:"name"`
+	Owner   string `json:"owner"`
 }
 
 type ConfineReapResult struct {

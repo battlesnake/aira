@@ -108,26 +108,44 @@ func inlineActionFor(view tuiView, key rune) (inlineAction, bool) {
 // (paletteOperationAdmitted), and it addresses the machine-wide slice rather
 // than a project.
 //
-// `aira top` has NO owner identity: it dispatches confine verbs as
-// ConfineUnknownOwner, which is unattested, so the daemon's ownership guard
-// would refuse every push without --steal. The page therefore says so in plain
-// words and confirming ALWAYS sends steal=true. That page is the explicit steal
-// acknowledgement a human gives in `top`; the CLI and MCP still need --steal for
-// another session's job.
+// The push is sent as state.ConfineOwner (the CLI's owner chain, resolved at
+// startup), so the daemon's audit line names the pusher. It sends steal=false
+// only for the caller's OWN job under an attested identity, exactly the case the
+// shared guard passes without --steal; every other push (another session's job,
+// an inferred "@cwd-…" or unknown caller) sends steal=true, and the page says so
+// in plain words. That page is the explicit steal acknowledgement a human gives
+// in `top`; the CLI and MCP still need --steal for another session's job.
 func topFrontConfirm(state tuiState, row tableRow) (tuiState, []tuiCmd) {
-	owner := "an unknown owner"
-	if _, _, _, parsed, ok := runner.ParseConfineScopeID(row.ID); ok && parsed != "" {
-		owner = parsed
+	caller := state.ConfineOwner
+	if caller == "" {
+		caller = runner.ConfineUnknownOwner
 	}
+	jobOwner := ""
+	if _, _, _, parsed, ok := runner.ParseConfineScopeID(row.ID); ok {
+		jobOwner = parsed
+	}
+	owner := jobOwner
+	if owner == "" {
+		owner = "an unknown owner"
+	}
+	own := runner.ConfineOwnerIsAttested(caller) && caller == jobOwner
 	request := core.Request{Verb: "confine-front", Args: map[string]any{
-		"selector": row.ID, "steal": true,
-		"slice": runner.ResolveConfineSlice(""), "owner": runner.ConfineUnknownOwner,
+		"selector": row.ID, "steal": !own,
+		"slice": runner.ResolveConfineSlice(""), "owner": caller,
 	}}
 	summary := row.ConfirmText
 	if summary == "" {
 		summary = "push " + row.ID + " to the front of the admission queue"
 	}
-	summary += ". It then holds every job behind it until it fits. aira top has no owner identity; confirming overrides the owner check (--steal) for " + owner + "'s job."
+	summary += ". It then holds every job behind it until it fits. "
+	switch {
+	case own:
+		summary += "It is your job (" + caller + ")."
+	case caller == runner.ConfineUnknownOwner:
+		summary += "aira top has no owner identity; confirming overrides the owner check (--steal) for " + owner + "'s job."
+	default:
+		summary += "You are " + caller + "; confirming overrides the owner check (--steal) for " + owner + "'s job, and the push is logged as yours."
+	}
 	state.PaletteOpen = true
 	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: "confine-front"}
 	return state, nil

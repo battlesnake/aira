@@ -28,7 +28,7 @@ import (
 
 // pushQueuedConfine resolves selector to exactly one queued waiter on path,
 // applies the shared ownership guard, and pushes it to the front. It returns the
-// result with the job's new 1-based position, or a coded error. It signals the
+// pushed job, or a coded error. It signals the
 // queue (outside queue.mu) on success so the new order is evaluated at once.
 func (s *Server) pushQueuedConfine(path, selector, callerOwner string, steal bool) (runner.ConfineFrontResult, error) {
 	selector = strings.TrimSpace(selector)
@@ -122,14 +122,7 @@ func pushQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, st
 	}
 	queue.seq++
 	target.pushSeq = queue.seq
-	position := 0
-	for index, waiter := range admitOrderLocked(queue) {
-		if waiter == target {
-			position = index + 1
-			break
-		}
-	}
-	return runner.ConfineFrontResult{Status: "pushed", ScopeID: target.scopeID, Name: name, Owner: owner, Position: position}, nil
+	return runner.ConfineFrontResult{Status: "pushed", ScopeID: target.scopeID, Name: name, Owner: owner}, nil
 }
 
 // logConfineFront writes the audit line for a push the daemon applied. Called

@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/gdamore/tcell/v2"
 
 	"aira/internal/core"
 	"aira/internal/runner"
 )
 
 // AIRA-309. `aira top`'s `f` key pushes a QUEUED job to the front of the
-// admission queue, behind a confirmation that states `top` has no owner identity
-// and therefore always overrides the owner check.
+// admission queue, behind a confirmation that names the caller's identity and
+// states whose owner check confirming overrides.
 //
 // verifies: AIRA-309
 
@@ -132,5 +135,73 @@ func TestTopQueuedRowMarksAPushedJob(t *testing.T) {
 	plain, _ := topFrontState(t, false)
 	if cell := plain.Panels[viewTop].Model.Rows[2].Cells[3]; cell != "queued" {
 		t.Fatalf("unpushed row LIVE cell=%q, want queued", cell)
+	}
+}
+
+// verifies: AIRA-309 review advisory — a push from `top` is attributed: the
+// request carries the caller identity resolved at startup, so the daemon's
+// audit line names the pusher. steal=false only for the caller's OWN job under
+// an attested identity (what the shared guard passes without --steal); every
+// other push sends steal=true and the page says whose job it overrides.
+func TestTopFrontPushIsAttributedToTheCaller(t *testing.T) {
+	descriptors := core.New(nil).DispatchDescriptors()
+	for _, test := range []struct {
+		name, caller, scopeID string
+		wantOwner             string
+		wantSteal             bool
+		wantText, notText     string
+	}{
+		{name: "another session's job", caller: "session-a", scopeID: "CONFINE-zulu-201-cc@session-q",
+			wantOwner: "session-a", wantSteal: true, wantText: "You are session-a; confirming overrides the owner check (--steal) for session-q's job"},
+		{name: "own job", caller: "session-q", scopeID: "CONFINE-zulu-201-cc@session-q",
+			wantOwner: "session-q", wantSteal: false, wantText: "It is your job (session-q)", notText: "--steal"},
+		{name: "inferred caller", caller: "@cwd-session-q", scopeID: "CONFINE-zulu-201-cc@session-q",
+			wantOwner: "@cwd-session-q", wantSteal: true, wantText: "You are @cwd-session-q; confirming overrides the owner check (--steal)"},
+		{name: "unknown caller on an unknown-owned job", caller: "", scopeID: "CONFINE-zulu-201-cc@" + runner.ConfineUnknownOwner,
+			wantOwner: runner.ConfineUnknownOwner, wantSteal: true, wantText: "aira top has no owner identity"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			queued := topQueuedTestRecord(test.scopeID, "zulu", 4*gib)
+			model, _ := topViewModel(topTick{}, topQueuedListing(queued))
+			state := newTUIState(8)
+			state.Active = viewTop
+			state.ConfineOwner = test.caller
+			panel := state.Panels[viewTop]
+			panel.Status = panelReady
+			panel.Model = model
+			state.Panels[viewTop] = panel
+			state = onTopHighlight(state, 3)
+			if got := state.Panels[viewTop].SelectedID; got != test.scopeID {
+				t.Fatalf("test premise: selected %q, want %q", got, test.scopeID)
+			}
+			state, _ = onTUIKey(state, 'f', descriptors)
+			confirm := state.PaletteConfirm
+			if confirm == nil {
+				t.Fatal("no confirmation")
+			}
+			args := confirm.Request.Args
+			if args["owner"] != test.wantOwner || args["steal"] != test.wantSteal {
+				t.Fatalf("owner=%v steal=%v, want owner=%s steal=%v", args["owner"], args["steal"], test.wantOwner, test.wantSteal)
+			}
+			if !strings.Contains(confirm.Summary, test.wantText) {
+				t.Fatalf("confirmation %q does not say %q", confirm.Summary, test.wantText)
+			}
+			if test.notText != "" && strings.Contains(confirm.Summary, test.notText) {
+				t.Fatalf("confirmation %q says %q for the caller's own job", confirm.Summary, test.notText)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-309 review advisory — the runtime resolves the caller identity
+// once at startup by the CLI's own chain, so `top`'s push carries it.
+func TestTopRuntimeResolvesTheConfineOwner(t *testing.T) {
+	t.Setenv("AIRA_CONFINE_OWNER", "session-z")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	runtime := newTopRuntime(ctx, &tuiSmokeDispatcher{started: make(chan struct{})}, nil, nil, nil, screen)
+	if runtime.state.ConfineOwner != "session-z" {
+		t.Fatalf("ConfineOwner=%q, want the AIRA_CONFINE_OWNER identity", runtime.state.ConfineOwner)
 	}
 }
