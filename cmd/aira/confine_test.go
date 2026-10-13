@@ -585,6 +585,39 @@ func TestConfineReserveTranscriptionAndResolvedChargeAcrossFlagsAndEnvironment(t
 	}
 }
 
+// verifies: AIRA-310 the CLI records whether a pinned reserve came from the
+// AIRA_CONFINE_RESERVE environment rather than --memory-reserve, so the runner
+// can withhold the over-reservation hint from an inherited environment pin.
+func TestConfineReserveFromEnvTranscription(t *testing.T) {
+	original := runConfined
+	t.Cleanup(func() { runConfined = original })
+	for _, test := range []struct {
+		name, env   string
+		argv        []string
+		wantFromEnv bool
+	}{
+		{"environment only", "8G", []string{"confine", "--", "true"}, true},
+		{"flag overrides the environment", "8G", []string{"confine", "--memory-reserve", "4G", "--", "true"}, false},
+		{"flag only", "", []string{"confine", "--memory-reserve", "4G", "--", "true"}, false},
+		{"neither", "", []string{"confine", "--", "true"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AIRA_CONFINE_RESERVE", test.env)
+			var captured runner.ConfineRequest
+			runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+				captured = request
+				return runner.ConfineResult{}, nil
+			}
+			if exit := runWithInput(test.argv, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
+				t.Fatalf("exit=%d", exit)
+			}
+			if captured.MemoryReserveFromEnv != test.wantFromEnv {
+				t.Fatalf("MemoryReserveFromEnv=%v, want %v (request %+v)", captured.MemoryReserveFromEnv, test.wantFromEnv, captured)
+			}
+		})
+	}
+}
+
 // verifies: task-57 confine rejects invalid cap relationships before launch.
 func TestConfineMemoryFlagValidation(t *testing.T) {
 	for _, argv := range [][]string{

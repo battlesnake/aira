@@ -590,7 +590,13 @@ type ConfineRequest struct {
 	AdmitSocketPath     string
 	MemoryReserve       int64
 	MemoryReservePinned bool
-	DelegateRAM         bool
+	// MemoryReserveFromEnv (AIRA-310) records that the pinned reserve came from
+	// AIRA_CONFINE_RESERVE rather than --memory-reserve. It changes no charge: it
+	// only withholds the over-reservation hint, because an environment pin is
+	// inherited by every nested confine and one per-job number is the wrong
+	// advice for the variable.
+	MemoryReserveFromEnv bool
+	DelegateRAM          bool
 	// AIRA-222. RequireAdmission fails the launch CLOSED when memory admission
 	// could not be evaluated (admission=unevaluated), instead of running the job
 	// UNGOVERNED and exiting 0 — the defect where "governed, slice was empty" and
@@ -1062,6 +1068,88 @@ func FormatConfineMegabytes(value int64) string {
 		q++
 	}
 	return strconv.FormatInt(q, 10) + "M"
+}
+
+// AIRA-310. The over-reservation hint's fixed terms. RAM only: confine measures
+// no per-job peak VRAM (per-process VRAM is unreadable on WSL2, and --vram is
+// admission accounting with nothing written or sampled), so a VRAM hint would
+// have to fabricate its peak and is deliberately not offered.
+const (
+	// ConfineNoHintsEnv set to exactly "1" silences the hint.
+	ConfineNoHintsEnv = "AIRA_CONFINE_NO_HINTS"
+	// confineHintMinReserve: a declared reserve below this is too small for its
+	// slack to matter to anyone else in the slice.
+	confineHintMinReserve = int64(2) << 30
+	// confineHintUnit is both the rounding step and the floor of the suggestion.
+	confineHintUnit = int64(256) << 20
+)
+
+// confineReserveHintSuggestion is peak + 50% headroom, rounded UP to a whole
+// confineHintUnit, never below one unit. Integer arithmetic throughout.
+func confineReserveHintSuggestion(peak int64) int64 {
+	headroom := peak/2 + peak%2 // ceil(peak/2)
+	want := peak + headroom
+	units := want / confineHintUnit
+	if want%confineHintUnit != 0 {
+		units++
+	}
+	if units < 1 {
+		units = 1
+	}
+	return units * confineHintUnit
+}
+
+// formatConfineReserveHint (AIRA-310) returns the one stderr line telling the
+// caller that a reserve they PINNED was far larger than the job used, or "" when
+// no hint is warranted. It reads only facts already on the status, so it can never
+// say more than the trailer above it established:
+//
+//   - containment=enforced only: a ci-shim run measures no peak and must stay
+//     silent even if one were somehow present;
+//   - terminated-by=normal AND exit 0: a failed, killed or OOM run says nothing
+//     about what the job needs;
+//   - peak-rss established (nil = unevaluated, never read as zero);
+//   - declaredBytes > 0 (the caller pinned --memory-reserve; a history estimate
+//     has no knob to turn, and an inherited AIRA_CONFINE_RESERVE is shared by every
+//     nested job, so the caller passes 0 for both) AND equal to the reserve actually
+//     charged and the cap is not operator:--memory-max (with --memory-max the
+//     ledger charges the max, so lowering --memory-reserve changes nothing, even
+//     when the two happen to be equal);
+//   - no container outside the job scope: a docker container runs under the
+//     system docker daemon and a caller-placed podman container is not known to be
+//     nested, so peak-rss leaves the workload out and the advice would under-charge
+//     the shared ledger. Only podman's injected --cgroups=split nests provably;
+//   - that reserve >= 2 GiB, peak strictly below 60% of it, and the suggestion
+//     strictly below it (otherwise the advice is a no-op).
+//
+// The percentage is truncated, so a peak just under the 60% line never reads 60%.
+func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes int64, optOut bool) string {
+	// --memory-max sets the charge whatever --memory-reserve says, so a
+	// --memory-reserve suggestion would be a no-op even when the two are equal.
+	if optOut || status.Containment != ConfineContainmentEnforced || status.ScopeMemoryCapSource == ConfineCapSourceMemoryMax {
+		return ""
+	}
+	if status.TerminatedBy != ConfineTerminatedNormal || exitCode != 0 || status.PeakRSS == nil {
+		return ""
+	}
+	if status.Container != "" && status.Container != ContainerPlacementPodmanSplitInjected {
+		return ""
+	}
+	reserve, peak := status.ReserveBytes, *status.PeakRSS
+	// reserve >= 2 GiB with reserve == declaredBytes also proves declaredBytes > 0.
+	if reserve != declaredBytes || reserve < confineHintMinReserve {
+		return ""
+	}
+	if peak*5 >= reserve*3 {
+		return ""
+	}
+	suggestion := confineReserveHintSuggestion(peak)
+	if suggestion >= reserve {
+		return ""
+	}
+	percent := peak * 100 / reserve
+	return fmt.Sprintf("confine: hint: peak %s of %s reserved (%d%%); consider --memory-reserve %s so more jobs fit",
+		FormatConfineMegabytes(peak), FormatConfineMegabytes(reserve), percent, FormatConfineMegabytes(suggestion))
 }
 
 // FormatConfineStatus is the single operator-facing honesty projection.

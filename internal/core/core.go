@@ -1935,7 +1935,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
 			stringSpec("owner", false, false, "Cooperative owner (session) identity; the AIRA_CONFINE_OWNER env var sets the same thing. A human-friendly name is shown in the SESSION column of `aira top` and in confine --list, attributing your jobs to your session"),
-			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB); a bare number is bytes"),
+			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB); a bare number is bytes. A --memory-reserve of 2G or more that a normally-ended exit-0 job used under 60% of gets one `confine: hint:` stderr line suggesting a smaller value (RAM only; not for AIRA_CONFINE_RESERVE or a docker container; silence with AIRA_CONFINE_NO_HINTS=1)"),
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("vram", false, false, "GPU VRAM the job declares it needs (1024-based; e.g. 4G). The daemon gates admission on real free VRAM (a third resource dimension beside RAM and CPU); no GPU limit is written. Absent = not a GPU job (ungated). NVIDIA only"),
