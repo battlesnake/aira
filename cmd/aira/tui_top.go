@@ -739,6 +739,14 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		})
 		cpuClaimed += rate
 	}
+	// AIRA-308. Queued jobs, AFTER every live row. They are appended here, after
+	// the slot loop and with no bar contribution of any kind: a waiting job holds
+	// no memory, CPU or VRAM, so drawing it in a bar would state a claim nothing
+	// has. Nor do they pass through assignTopSlots, so a queued job taking a place
+	// in the queue (or leaving it) cannot move a live row's slot or colour.
+	for _, record := range result.Queued {
+		model.Rows = append(model.Rows, topQueuedRow(record, previous.ShowCwd))
+	}
 	// AIRA-192. ONE undrawn category now, because there is one reason: the daemon
 	// published no reserve for that scope. The note says so rather than leaving an
 	// operator to read a shorter stack as a quieter machine — the stack understates
@@ -752,6 +760,46 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	model.VRAMBar = topVRAMBarFor(result.SliceReserve, vramDrawn, vramOffset)
 	model.Footer = topFooter(result)
 	return model, next
+}
+
+// topQueuedRow renders one job that is still waiting in the admission queue
+// (AIRA-308). The column set is the live rows' own so the table stays one table;
+// every cell a waiting job cannot have is "-" — a positive "holds nothing", which
+// is neither the live rows' "unevaluated" (could not be read) nor a drawn zero.
+//
+// RESERVATION and VRAM show what the job ASKED for, marked "req" so a request is
+// never read as a held charge. ID is deliberately empty: the live rows' ID is the
+// scope id, and a not-yet-admitted scope must never be a selectable target for any
+// row action (the selection and inline-action paths both ignore an empty ID).
+// A FUTURE row action added to `aira top` must guard on an empty ID the same way,
+// or a queued row becomes its target.
+func topQueuedRow(record runner.ConfineRecord, showCwd bool) tableRow {
+	lastText := record.Command
+	if showCwd {
+		lastText = record.Cwd
+	}
+	return tableRow{
+		Colour: topColourQueued, Cells: []string{
+			"-", record.Name, confineNum(record.SupervisorPID),
+			"queued", topAgeCell(record.AgeSeconds), topQueuedBytesCell(record.ReserveBytes, "0M req"),
+			"-", "-", topQueuedBytesCell(record.VRAMBytes, topVRAMCell(new(int64))), topSessionCell(record), topUntrustedCell(lastText),
+		},
+	}
+}
+
+// topQueuedBytesCell renders a REQUESTED byte count. nil is unevaluated (the
+// daemon did not say); a request of zero renders as zeroText — "0M req" for a
+// reserve, but for VRAM the live rows' own non-GPU glyph (topVRAMCell of 0), where
+// "asked for no VRAM" is a fact about a non-GPU job and not something to print as
+// a request.
+func topQueuedBytesCell(value *int64, zeroText string) string {
+	if value == nil || *value < 0 {
+		return "unevaluated"
+	}
+	if *value == 0 {
+		return zeroText
+	}
+	return runner.FormatConfineMegabytes(*value) + " req"
 }
 
 // topCPUBarFor assembles the CPU bar. It is the RAM bar's exact shape over a
@@ -1421,6 +1469,15 @@ func topFooter(result runner.ConfineListResult) string {
 	}
 	if reserve.FreezePhase != "" {
 		parts = append(parts, fmt.Sprintf("%d queued, freeze %s", reserve.Queued, reserve.FreezePhase))
+	}
+	// AIRA-308. Fewer queued ROWS than the queue's own count is stated, never left
+	// to read as "that is everything waiting". It is independent of FreezePhase: the
+	// count is what it is checked against. The reason is deliberately not a closed
+	// list (scope-less per-test reservations, the row cap, a supervisor whose id did
+	// not decode, an old daemon that sends no rows): it says only that some have none.
+	if len(result.Queued) < reserve.Queued {
+		parts = append(parts, fmt.Sprintf("showing %d of %d queued (some queued jobs have no row, e.g. per-test reservations; at most %d are listed)",
+			len(result.Queued), reserve.Queued, runner.ConfineQueuedRowLimit))
 	}
 	if reserve.Exclusive != nil {
 		exclusive := "EXCLUSIVE " + reserve.Exclusive.State

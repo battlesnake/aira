@@ -16,6 +16,12 @@ func listConfines(context.Context, string, []ConfineRegistryEntry) (ConfineListR
 	return ConfineListResult{Verdict: "unevaluated", Reason: "confine management requires Linux", Scopes: []ConfineRecord{}}, nil
 }
 
+// listQueuedConfines has no /proc to read on a non-Linux build, so queued rows are
+// built with every live facet named unevaluated (AIRA-308).
+func listQueuedConfines(_ context.Context, entries []ConfineQueuedEntry) []ConfineRecord {
+	return ShimQueuedConfines(entries)
+}
+
 // readConfineCPUFrame has no non-Linux reading to make: cpu.stat is a cgroup-v2
 // interface file. It reports an all-unknown frame — every Known bit false and no
 // sample instant — which is what makes a consumer render the CPU bar as

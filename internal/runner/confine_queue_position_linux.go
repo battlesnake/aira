@@ -108,6 +108,11 @@ const confineQueueProbeTimeout = 2 * time.Second
 // still well clear of AIRA-61's class, so the cadence stays at one probe per
 // printed line and no cache is introduced.
 //
+// AIRA-308 added queued ROWS to that reply (up to ConfineQueuedRowLimit, each a
+// live /proc read of the supervisor's argv, cwd and environ). The probe is
+// exempted: the daemon builds no queued rows for a request that names a
+// scope_id, so none of the cost above grew.
+//
 // Accepted waste, named rather than hidden: the probe pays for the whole
 // ConfineListResult and reads only SliceReserve. Avoiding that means a second
 // daemon verb for one diagnostic — new machinery for a cost measured in tens
