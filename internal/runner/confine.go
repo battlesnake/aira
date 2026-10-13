@@ -590,7 +590,13 @@ type ConfineRequest struct {
 	AdmitSocketPath     string
 	MemoryReserve       int64
 	MemoryReservePinned bool
-	DelegateRAM         bool
+	// MemoryReserveFromEnv (AIRA-310) records that the pinned reserve came from
+	// AIRA_CONFINE_RESERVE rather than --memory-reserve. It changes no charge: it
+	// only withholds the over-reservation hint, because an environment pin is
+	// inherited by every nested confine and one per-job number is the wrong
+	// advice for the variable.
+	MemoryReserveFromEnv bool
+	DelegateRAM          bool
 	// AIRA-222. RequireAdmission fails the launch CLOSED when memory admission
 	// could not be evaluated (admission=unevaluated), instead of running the job
 	// UNGOVERNED and exiting 0 — the defect where "governed, slice was empty" and
@@ -1103,13 +1109,20 @@ func confineReserveHintSuggestion(peak int64) int64 {
 //   - terminated-by=normal AND exit 0: a failed, killed or OOM run says nothing
 //     about what the job needs;
 //   - peak-rss established (nil = unevaluated, never read as zero);
-//   - declaredBytes > 0 (the caller pinned --memory-reserve / AIRA_CONFINE_RESERVE;
-//     a history estimate has no knob to turn) AND equal to the reserve actually
+//   - declaredBytes > 0 (the caller pinned --memory-reserve; a history estimate
+//     has no knob to turn, and an inherited AIRA_CONFINE_RESERVE is shared by every
+//     nested job, so the caller passes 0 for both) AND equal to the reserve actually
 //     charged and the cap is not operator:--memory-max (with --memory-max the
 //     ledger charges the max, so lowering --memory-reserve changes nothing, even
 //     when the two happen to be equal);
+//   - no container outside the job scope: a docker container runs under the
+//     system docker daemon and a caller-placed podman container is not known to be
+//     nested, so peak-rss leaves the workload out and the advice would under-charge
+//     the shared ledger. Only podman's injected --cgroups=split nests provably;
 //   - that reserve >= 2 GiB, peak strictly below 60% of it, and the suggestion
 //     strictly below it (otherwise the advice is a no-op).
+//
+// The percentage is truncated, so a peak just under the 60% line never reads 60%.
 func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes int64, optOut bool) string {
 	// --memory-max sets the charge whatever --memory-reserve says, so a
 	// --memory-reserve suggestion would be a no-op even when the two are equal.
@@ -1119,9 +1132,12 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 	if status.TerminatedBy != ConfineTerminatedNormal || exitCode != 0 || status.PeakRSS == nil {
 		return ""
 	}
+	if status.Container != "" && status.Container != ContainerPlacementPodmanSplitInjected {
+		return ""
+	}
 	reserve, peak := status.ReserveBytes, *status.PeakRSS
 	// reserve >= 2 GiB with reserve == declaredBytes also proves declaredBytes > 0.
-	if reserve != declaredBytes || reserve < confineHintMinReserve || peak < 0 {
+	if reserve != declaredBytes || reserve < confineHintMinReserve {
 		return ""
 	}
 	if peak*5 >= reserve*3 {
@@ -1131,7 +1147,7 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 	if suggestion >= reserve {
 		return ""
 	}
-	percent := (peak*100 + reserve/2) / reserve
+	percent := peak * 100 / reserve
 	return fmt.Sprintf("confine: hint: peak %s of %s reserved (%d%%); consider --memory-reserve %s so more jobs fit",
 		FormatConfineMegabytes(peak), FormatConfineMegabytes(reserve), percent, FormatConfineMegabytes(suggestion))
 }

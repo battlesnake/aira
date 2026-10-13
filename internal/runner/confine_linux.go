@@ -1556,9 +1556,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// AIRA-310. The over-reservation hint, last, on diagnostics (stderr) only. The
 	// declared reserve is the provenance captured before ResolveConfineReserve
 	// widened `pinned`; the ci-shim path never reaches here and the function also
-	// refuses any containment but enforced.
+	// refuses any containment but enforced. A reserve pinned only by an inherited
+	// AIRA_CONFINE_RESERVE counts as undeclared here: every nested confine shares
+	// it, so one per-job number is the wrong advice for the variable.
 	declaredHintBytes := int64(0)
-	if declaredReserve {
+	if declaredReserve && !request.MemoryReserveFromEnv {
 		declaredHintBytes = declaredReserveBytes
 	}
 	if hint := formatConfineReserveHint(result.Status, exitCode, declaredHintBytes, os.Getenv(ConfineNoHintsEnv) == "1"); hint != "" {

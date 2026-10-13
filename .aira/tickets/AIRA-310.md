@@ -16,9 +16,17 @@ Build notes (2026-10-13):
   only (no VRAM cgroup, nothing sampled) and per-process VRAM reads [N/A] on WSL2,
   so a VRAM hint would fabricate its peak. Not built; documented in the skill text
   and the --memory-reserve help.
-- "Pinned" = the declared reserve (`--memory-reserve` or `AIRA_CONFINE_RESERVE`,
-  the existing `declaredReserve` provenance), and only when the reserve actually
-  charged equals it (with `--memory-max` the ledger charges the max: no hint).
+- "Pinned" = the declared `--memory-reserve` (the existing `declaredReserve`
+  provenance), and only when the reserve actually charged equals it (with
+  `--memory-max` the ledger charges the max: no hint). A reserve pinned only by an
+  inherited `AIRA_CONFINE_RESERVE` gets no hint: every nested confine shares the
+  variable, so one per-job number is the wrong advice (build review P3).
+- No hint for a container outside the job scope (docker, or podman with a
+  caller-chosen placement): peak-rss is then the client alone and the advice would
+  under-charge the shared ledger (build review P1). Podman with the injected
+  `--cgroups=split` nests in the scope and still hints.
+- The percentage is truncated, so a peak just under 60% never reads "(60%)"; the
+  owner's example line therefore prints 7% for 310M of 4096M (build review P3).
 - Suggestion = ceil(1.5 x peak) rounded up to a whole 256M, floor 256M; no hint
   when that suggestion is not below the reserve. Threshold strict: peak*5 < reserve*3.
 - Opt-out: AIRA_CONFINE_NO_HINTS exactly "1". Real path only (the ci-shim path

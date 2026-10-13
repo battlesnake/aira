@@ -21,7 +21,20 @@ func hintStatus() ConfineStatus {
 // verifies: AIRA-310 -- the eligible baseline prints the owner's exact line shape.
 func TestConfineReserveHintBaselineText(t *testing.T) {
 	got := formatConfineReserveHint(hintStatus(), 0, 4*hintGiB, false)
-	want := "confine: hint: peak 310M of 4096M reserved (8%); consider --memory-reserve 512M so more jobs fit"
+	want := "confine: hint: peak 310M of 4096M reserved (7%); consider --memory-reserve 512M so more jobs fit"
+	if got != want {
+		t.Fatalf("hint = %q\nwant  %q", got, want)
+	}
+}
+
+// verifies: AIRA-310 -- the percentage is truncated, so a peak just under the
+// strict 60% line never prints "(60%)" (build review P3).
+func TestConfineReserveHintPercentNeverReads60(t *testing.T) {
+	status := hintStatus()
+	// 3070M of 5120M is 59.96%: rounding to nearest would print "(60%)".
+	status.ReserveBytes, status.PeakRSS = 5*hintGiB, hintPeak(3070*hintMiB)
+	got := formatConfineReserveHint(status, 0, 5*hintGiB, false)
+	want := "confine: hint: peak 3070M of 5120M reserved (59%); consider --memory-reserve 4608M so more jobs fit"
 	if got != want {
 		t.Fatalf("hint = %q\nwant  %q", got, want)
 	}
@@ -88,6 +101,21 @@ func TestConfineReserveHintGates(t *testing.T) {
 		{"opt-out never hints", func(_ *ConfineStatus, _ *int, _ *int64, o *bool) {
 			*o = true
 		}, false},
+		{"docker container (outside the job scope) never hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			// The container runs under the system docker daemon, so peak-rss is the
+			// docker CLI alone; the advice would under-charge the ledger.
+			s.Container = ContainerPlacementDockerNotContained
+		}, false},
+		{"podman with caller placement never hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.Container = ContainerPlacementPodmanCallerCgroup
+		}, false},
+		{"podman caller-split never hints (nesting not established)", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			// --cgroups=split alongside --cgroup-parent/--pod is not nested.
+			s.Container = ContainerPlacementPodmanCallerSplit
+		}, false},
+		{"podman split-injected (nested in the job scope) still hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.Container = ContainerPlacementPodmanSplitInjected
+		}, true},
 		{"suggestion not below the reserve never hints", func(s *ConfineStatus, _ *int, d *int64, _ *bool) {
 			// 59.96% of 2 GiB: 1.5x = 1842M, rounded up to 2048M == the reserve.
 			s.ReserveBytes, *d, s.PeakRSS = 2*hintGiB, 2*hintGiB, hintPeak(1228*hintMiB)

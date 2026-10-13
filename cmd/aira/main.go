@@ -1590,9 +1590,11 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		return refuseConfineLaunch(stderr, err)
 	}
 	reserveRaw, reservePinned := options["memory-reserve"]
+	reserveFromEnv := false
 	if !reservePinned {
 		reserveRaw = os.Getenv("AIRA_CONFINE_RESERVE")
 		reservePinned = reserveRaw != ""
+		reserveFromEnv = reservePinned
 	}
 	var reserve int64
 	if reservePinned {
@@ -1667,7 +1669,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
 		Owner:       owner,
 		SummaryFile: summaryFile, SummaryTreeHash: options["summary-tree-hash"],
-		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
+		MemoryReserve: reserve, MemoryReservePinned: reservePinned, MemoryReserveFromEnv: reserveFromEnv,
 		DelegateRAM:      options["delegate-ram"] == "true",
 		Exclusive:        options["exclusive"] == "true",
 		RequireAdmission: options["require-admission"] == "true",
