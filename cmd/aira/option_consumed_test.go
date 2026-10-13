@@ -60,6 +60,7 @@ var optionBaseArgvs = map[string][][]string{
 	// confine-dump is not a CLI verb (buildRequest: E_UNKNOWN_VERB); --dump is a
 	// confine management flag parsed by parseConfineArgs.
 	"confine-kill":  {{"confine-kill", "x"}},
+	"confine-front": {{"confine-front", "x"}},
 	"confine-log":   {{"confine-log", "x"}},
 	"confine-input": {{"confine-input", "x"}},
 	"watch":         {{"watch"}},

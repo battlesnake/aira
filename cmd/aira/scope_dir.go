@@ -151,7 +151,7 @@ func refuseAmbiguousImportPath(request core.Request, scopeDirOverride string) er
 // override instead of accepting and discarding it.
 func verbAcceptsScopeDir(verb string) bool {
 	switch verb {
-	case "confine", "confine-reserve", "confine-list", "confine-kill", "confine-budget", "confine-dump", "confine-status",
+	case "confine", "confine-reserve", "confine-list", "confine-kill", "confine-front", "confine-budget", "confine-dump", "confine-status",
 		// AIRA-196. A detached confine job lives in a machine-wide record store
 		// and resolves no project, exactly like the rest of the family.
 		"confine-log", "confine-input",
@@ -183,7 +183,7 @@ func verbAcceptsScopeDir(verb string) bool {
 // no discovery for eject at all and requires an explicit selector.
 func toolAcceptsScopeDir(tool string) bool {
 	switch tool {
-	case "aira_eject", "aira_confine_list", "aira_confine_kill", "aira_confine_budget",
+	case "aira_eject", "aira_confine_list", "aira_confine_kill", "aira_confine_front", "aira_confine_budget",
 		"aira_confine_log", "aira_confine_input":
 		return false
 	}

@@ -159,7 +159,7 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	// invocation in every directory. Both shipped spellings (`confine --budget`
 	// and `confine-budget`) converge here, so the verb was wholly unreachable and
 	// the daemon's own handler at internal/daemon/server.go:785 was dead code.
-	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-budget" || canonical == "confine-dump" {
+	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-budget" || canonical == "confine-dump" {
 		if canonical == "confine-budget" || canonical == "confine-dump" {
 			return d.dispatchConfineHistory(ctx, request)
 		}

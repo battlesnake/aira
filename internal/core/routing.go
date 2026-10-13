@@ -48,7 +48,7 @@ func Classify(verb, selector string) (string, Route) {
 	// Both reach the machine-wide detached-record store directly (the read half
 	// reaches no daemon at all, deliberately: AIRA-22 survivability), so neither
 	// can be served from inside the pure-store daemon.
-	case canonical == "confine" || canonical == "confine-reserve" || canonical == "confine-list" || canonical == "confine-kill" ||
+	case canonical == "confine" || canonical == "confine-reserve" || canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" ||
 		canonical == "confine-budget" || canonical == "confine-dump" || canonical == "confine-status" || canonical == "confine-log" ||
 		canonical == "confine-input" || canonical == "eject":
 		return canonical, RouteClient
@@ -132,7 +132,7 @@ func StoreFreeCarved(verb string, args map[string]any) bool {
 			}
 		}
 		return true
-	case "run-kill", "run-log", "run-input", "git", "confine", "confine-reserve", "confine-list", "confine-kill",
+	case "run-kill", "run-log", "run-input", "git", "confine", "confine-reserve", "confine-list", "confine-kill", "confine-front",
 		"confine-budget", "confine-dump", "confine-status", "confine-log", "confine-input", "drain", "eject":
 		return true
 	case "show":

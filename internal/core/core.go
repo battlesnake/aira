@@ -2137,6 +2137,23 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-kill requires the project-less daemon transport")
 		}},
+		// AIRA-309. Push one QUEUED confine job to the head of the admission
+		// queue. Owner-checked exactly like confine-kill (one shared guard), and
+		// answered by the same project-less daemon transport. Not destructive:
+		// nothing is killed and nothing is charged — only the evaluation order
+		// changes, and the push dies with the waiter (a daemon restart drops it).
+		"confine-front": {Name: "confine-front", Usage: "confine --front <name|supervisor-pid|scope-id> [--steal] [--slice S] [--owner ID]", Args: []ArgSpec{
+			stringSpec("selector", true, true, "Exact confine name, supervisor PID, or scope ID of a job waiting in the admission queue"),
+			boolSpec("steal", false, false, "Override unknown or foreign ownership"),
+			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, MCPTool: "aira_confine_front", Summary: "Push one ownership-checked queued confine job to the front of the admission queue; it then holds every job behind it until it fits (latest push goes first; a daemon restart drops pushes).", Safety: SafetyExecute, Include: true, Example: []string{"job"}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "selector")
+			_ = boolArg(args, "steal")
+			_ = stringArg(args, "slice")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-front requires the project-less daemon transport")
+		}},
 		// AIRA-106. The daemon-subsystem mode flags are listed here because this
 		// table IS the generated help: an operator reading `aira help install` could
 		// not otherwise discover how to flip either memory subsystem. (--watchdog
@@ -2515,6 +2532,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// process's own filesystem.
 		"confine-dump":   {summary: "Write the daemon's admission/utilisation records as JSONL for CI archival", safety: SafetyRead, example: []string{}},
 		"confine-kill":   {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
+		"confine-front":  {summary: "Push one ownership-checked queued confine job to the front of the admission queue", safety: SafetyExecute, example: []string{"job"}},
 		"confine-status": {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		// AIRA-196. Unlike confine/confine-status these ARE included: reading a
 		// captured file and writing to a job's stdin socket both have honest
