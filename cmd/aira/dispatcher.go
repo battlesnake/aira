@@ -250,6 +250,15 @@ func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, re
 	// placed before: the dump reads the daemon's own peak-history table AND
 	// its live admission-queue registry, neither of which exists outside the
 	// daemon process.
+	// AIRA-309. confine-front has no daemon-down fallback, and MUST be refused
+	// here: everything past this point that is not confine-list falls through to
+	// KillConfine, so without this return an operator's "push this job to the
+	// front" would KILL that job whenever the daemon was unreachable. The queue a
+	// push reorders exists only inside the daemon, so with the daemon down there
+	// is nothing to push; the transport error says so.
+	if request.Verb == "confine-front" {
+		return transportErrorResponse(err)
+	}
 	if request.Verb == "confine-dump" {
 		return core.Response{OK: true, Code: "UNEVALUATED", Exit: 3, Data: runner.ConfineDumpResult{
 			Verdict: "unevaluated",
@@ -310,6 +319,13 @@ func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, re
 		// charged to whom.
 		runner.ApplyConfineScopeReserves(result.Scopes, nil)
 		return core.Response{OK: true, Code: "OK", Data: result}
+	}
+	// Default-deny: only confine-kill may reach the kill fallback. A management
+	// verb added to the routing above without its own branch here is refused,
+	// never silently turned into a kill (AIRA-309 found confine-front heading
+	// there).
+	if request.Verb != "confine-kill" {
+		return transportErrorResponse(err)
 	}
 	selector, _ := request.Args["selector"].(string)
 	steal, _ := request.Args["steal"].(bool)
@@ -504,6 +520,23 @@ func (d *daemonDispatcher) TUILeaseToken(scope daemon.WorktreeScope, ticketID st
 func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.WorktreeScope, request core.Request) paletteDispatchAttempt {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
+	if canonical == "confine-front" {
+		// AIRA-309. `aira top`'s `f` key (topFrontConfirm) is the one confirmed
+		// row action that is client-routed: confine-front is project-less confine
+		// management and goes through the same management exchange as the CLI's
+		// `confine --front` (dispatchConfineManagementOnce), never through a
+		// project store. The verb is named exactly, so no other client-routed
+		// verb is admitted by this arm. It has no daemon-down fallback (nothing
+		// to push without the daemon's queue), so it is one exchange, classified
+		// exactly like the routed path below: a transport failure keeps its send
+		// evidence, and only a daemon-answered error code is a rejection.
+		owner, _ := request.Args["owner"].(string)
+		if err := runner.ValidateConfineOwner(owner); err != nil {
+			return paletteDispatchAttempt{Err: fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err), Send: paletteSendNotSent}
+		}
+		frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
+		return paletteAttemptFrom(d.doExchange(ctx, frame))
+	}
 	if route != core.RouteDaemon {
 		// The palette is a routed-only, read-only-store face: it must NEVER execute
 		// a client-routed verb locally (Sol build-review P0). A client route here can
@@ -519,9 +552,14 @@ func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.Wor
 	stampGitContext(scope, &request)
 	prepareRoutedRequest(&request)
 	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: scope, Request: request}
-	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+	return paletteAttemptFrom(d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
 		return d.exchangeOrStart(ctx, frame)
-	})
+	}))
+}
+
+// paletteAttemptFrom classifies one palette exchange: a transport failure
+// keeps whatever send evidence it carries, and a reply is checked for shape.
+func paletteAttemptFrom(response daemon.ResponseFrame, err error) paletteDispatchAttempt {
 	if err != nil {
 		send := paletteSendUnprovable
 		if daemon.IsRequestNotSent(err) {

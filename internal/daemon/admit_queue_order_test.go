@@ -554,3 +554,112 @@ func TestConfineFrontHandlerLogsOnlyOnSuccessAndKicksTheQueue(t *testing.T) {
 		})
 	}
 }
+
+// verifies: AIRA-309 — a push survives re-evaluation. It is waiter state, not a
+// per-pass value: across passes with grants and releases elsewhere in the
+// queue, the pushed head keeps its pushSeq and keeps holding the jumper.
+func TestAdmitPushSurvivesReEvaluation(t *testing.T) {
+	now := time.Unix(53000, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	held := heldLease(1, 44*qGiB)
+	other := heldLease(2, 2*qGiB)
+	head := queuedWaiter(3, 24*qGiB, now)
+	jumper := queuedWaiter(4, 1*qGiB, now)
+	queue := queueOf(server, held, other, head, jumper)
+	queue.seq++
+	head.pushSeq = queue.seq
+	pushed := head.pushSeq
+
+	for pass := 0; pass < 3; pass++ {
+		server.evaluateAdmitQueue(queue)
+		if head.pushSeq != pushed {
+			t.Fatalf("pass %d: pushSeq=%d, want %d: the push did not survive re-evaluation", pass, head.pushSeq, pushed)
+		}
+		requireAdmitQueued(t, jumper)
+		requireAdmitQueued(t, head)
+		switch pass {
+		case 0:
+			server.releaseAdmitWaiter(queue, other) // a release elsewhere: room 20 GiB
+		case 1:
+			now = now.Add(10 * time.Minute) // well past any hold
+		}
+	}
+	if order := admitOrderLocked(queue); order[0] != head {
+		t.Fatal("the pushed head is no longer first")
+	}
+}
+
+// verifies: AIRA-309 — a daemon restart fails OPEN. A restarted daemon starts
+// with no queue at all, so a push names nothing; and a waiter built by either
+// real entry path (a fresh admission, or a survivor's re-declare) starts
+// unpushed with a fresh budget.
+func TestAdmitRestartDropsPushesAndBudgets(t *testing.T) {
+	now := time.Unix(54000, 0)
+	before := queueOrderServer(t, 64*qGiB, &now)
+	pushedWaiter := frontWaiter(1, "pushed", "s-1")
+	queue := queueOf(before, pushedWaiter)
+	before.admitQueues["/slice"] = queue
+	mustPush(t, queue, pushedWaiter.scopeID)
+
+	restarted := queueOrderServer(t, 64*qGiB, &now)
+	if _, err := restarted.pushQueuedConfine("/slice", "pushed", "s-1", false); store.ErrorCode(err) != runner.CodeConfineNotFound {
+		t.Fatalf("push on a restarted daemon err=%v, want %s (no queue survives a restart)", err, runner.CodeConfineNotFound)
+	}
+	readFields := func(q *sliceQueue, w *admitWaiter) (int64, int64) {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return w.pushSeq, w.bypassed
+	}
+	q1, fresh, code, err := restarted.enqueueResolvedConfineAdmit("/slice", 2*qGiB, "pinned:client", 64*qGiB, admitRequest{
+		scopeID: pushedWaiter.scopeID, name: "pushed", owner: "s-1", cpu: 1,
+	})
+	if err != nil || code != "" {
+		t.Fatalf("fresh admit code=%q err=%v", code, err)
+	}
+	if pushSeq, bypassed := readFields(q1, fresh); pushSeq != 0 || bypassed != 0 {
+		t.Fatalf("fresh waiter pushSeq=%d bypassed=%d, want 0/0", pushSeq, bypassed)
+	}
+	q2, survivor, code, err := restarted.enqueueReDeclare("/slice", 2*qGiB, "pinned:client", admitRequest{
+		scopeID: frontWaiter(2, "survivor", "s-1").scopeID, name: "survivor", owner: "s-1", cpu: 1, peerSameUID: true,
+	})
+	if err != nil || code != "" {
+		t.Fatalf("re-declare code=%q err=%v", code, err)
+	}
+	if pushSeq, bypassed := readFields(q2, survivor); pushSeq != 0 || bypassed != 0 {
+		t.Fatalf("re-declared waiter pushSeq=%d bypassed=%d, want 0/0", pushSeq, bypassed)
+	}
+}
+
+// verifies: AIRA-307/309 — the exclusivity gate still comes first, unchanged. A
+// pushed job queued behind an active drain stays blocked by the drain, and the
+// drain head never becomes the AIRA-307 head: it is never charged a bypass,
+// never named as the freeze holder, and never arms the anchor.
+func TestAdmitDrainPrecedesQueueOrder(t *testing.T) {
+	now := time.Unix(55000, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	held := heldLease(1, 8*qGiB) // keeps the slice non-empty, so the drain waits
+	drain := frontWaiter(2, "drain", "s-1")
+	drain.exclusive = true
+	pushed := frontWaiter(3, "pushed", "s-1")
+	small := frontWaiter(4, "small", "s-1")
+	queue := queueOf(server, held, drain, pushed, small)
+	mustPush(t, queue, pushed.scopeID)
+
+	for pass := 0; pass < 2; pass++ {
+		server.evaluateAdmitQueue(queue)
+		requireAdmitQueued(t, drain)
+		requireAdmitQueued(t, pushed)
+		requireAdmitQueued(t, small)
+		now = now.Add(2 * time.Minute)
+	}
+	if drain.bypassed != 0 || pushed.bypassed != 0 || queue.freezeHolderSeq != 0 || !queue.freezeArmedAt.IsZero() {
+		t.Fatalf("drain interacted with queue order: drain.bypassed=%d pushed.bypassed=%d holder=%d armed=%v",
+			drain.bypassed, pushed.bypassed, queue.freezeHolderSeq, queue.freezeArmedAt)
+	}
+
+	// The slice empties: the drain head is granted first, despite the push.
+	server.releaseAdmitWaiter(queue, held)
+	server.evaluateAdmitQueue(queue)
+	waitAdmitGrant(t, drain)
+	requireAdmitQueued(t, pushed)
+}
