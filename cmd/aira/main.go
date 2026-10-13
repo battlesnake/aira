@@ -3675,7 +3675,7 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			note := ""
 			switch result.SliceReserve.FreezePhase {
 			case "hold":
-				note = " (fairness freeze holding capacity for the head waiter; it yields shortly)"
+				note = " (fairness freeze holding capacity for the head waiter: its bypass budget is spent; one backfilling pass follows the hold)"
 			case "yield":
 				note = " (fairness freeze yielding; fitting waiters are being admitted)"
 			}

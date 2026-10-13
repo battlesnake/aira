@@ -19,9 +19,10 @@ import (
 // next".
 //
 // position is 1-based within the queued waiters, in the daemon's evaluation
-// order — NOT a promise of grant order, because the AIRA-59 fairness duty
-// cycle's yield phase can admit a later, smaller waiter that fits while the
-// head is still too large. aheadBytes is the summed reserve of the waiters
+// order (pushed jobs first, then enqueue order — AIRA-309) — NOT a promise of
+// grant order, because a later, smaller waiter that fits can be admitted past a
+// head that is still too large, within the head's AIRA-307 budget or in the
+// backstop's backfilling pass. aheadBytes is the summed reserve of the waiters
 // ahead: a fact, never an ETA, which nothing in this system can establish.
 type confineQueuePosition struct {
 	position   int
@@ -210,10 +211,11 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// fact it is: FormatConfineMegabytes renders it "0M", where
 	// FormatConfineBytes would say "unknown", which is the one thing this is not.
 	ahead := FormatConfineMegabytes(position.aheadBytes)
-	// Two words earn their place here. "enqueue order" because the daemon's
-	// fairness duty cycle can backfill a smaller waiter ahead of a stuck head,
-	// so this is a place in the evaluation order and not a promise of being
-	// admitted second. "queued ahead" because the figure counts ONLY the queued
+	// Two words earn their place here. "evaluation order" because a pushed job
+	// (AIRA-309) goes first and the daemon can admit a smaller waiter past a
+	// stuck head (AIRA-307's budget, or the backstop pass), so this is a place
+	// in the order the daemon evaluates and not a promise of being admitted
+	// second. "queued ahead" because the figure counts ONLY the queued
 	// waiters in front — the reserve already GRANTED to running jobs is much
 	// larger and is not in it; a bare "reserved ahead" invites reading it as
 	// "the memory standing between me and admission", which it is not.
@@ -228,7 +230,7 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// `confine --list`'s own ("granted", "admitted jobs", "ceiling"), so an
 	// operator who cross-checks with that command reads the same nouns.
 	return pressure +
-		fmt.Sprintf(", queue position %d of %d by enqueue order, %s queued ahead", position.position, position.queued, ahead) +
+		fmt.Sprintf(", queue position %d of %d in evaluation order, %s queued ahead", position.position, position.queued, ahead) +
 		confineHeldNote(position) + confineOwnReserveNote(position, clientReserve) + exclusiveNote
 }
 

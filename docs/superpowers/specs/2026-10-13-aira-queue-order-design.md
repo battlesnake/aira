@@ -1,6 +1,6 @@
 # Admission queue order: manual push to front (AIRA-309) and a bounded small-job bypass (AIRA-307)
 
-Status: design, awaiting plan review. Release v0.37. Owner decisions (A) and (B) of 2026-10-13 are
+Status: built (see §10 for the decisions taken at build time). Release v0.37. Owner decisions (A) and (B) of 2026-10-13 are
 final and are restated here, not reopened. Builds on AIRA-308 (queued confine rows), merged at
 e0f3eeca.
 
@@ -507,3 +507,29 @@ shared daemon-restart care memory).
 
   This should be its own ticket, measured from the peak-RSS history against the granted reserves. It
   is outside queue order.
+
+## 10. Build-time decisions and deviations
+
+- **`maxHold` default: 5 minutes** (was 2). Taken in its own commit so it reverts
+  cleanly. Basis: §3.5's replay release rate (about 3.6 GB per minute in the
+  19:26 hold), so a 12 GiB head starting from a full ledger needs about 3.6
+  minutes of strict hold. At 2 minutes every big head would still be refilled by
+  the backstop pass once per hold. `AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD` remains
+  the tuning knob.
+- **`AIRA_DAEMON_ADMIT_BACKFILL_GRACE` is removed outright**, not refused: a set
+  value is now ignored like any unknown variable. Nothing on the box set it.
+- **`confine --list` text output still shows no queued rows** (AIRA-308 added
+  them to `aira top` and to the JSON only). The `pushed` flag is therefore
+  visible in `aira top` (LIVE column reads `pushed`) and in
+  `confine --list --json`, not in the text table.
+- **`aira top` selection is re-read at the keypress** from the highlighted table
+  row, because the table refreshes every tick and tview keeps its highlight by
+  row index. The confirmation names the job's *listed* position, which can
+  undercount when scope-less reservations are queued ahead.
+- **The VRAM empty-slice clause** compares against the card's configured budget
+  (or total) less headroom, not against current free VRAM, so a pushed GPU job
+  still drains other AIRA GPU jobs (§3.3).
+- **Old-daemon fall-through** was checked by reading `server.go`: an unrouted
+  `confine-front` reaches `coreForRequest` with an empty scope and is refused
+  with an error code; the client renders any such refusal as a failure (pinned by
+  `TestConfineFrontOldDaemonRefusalRendersAsAnError`).

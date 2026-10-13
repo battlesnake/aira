@@ -91,7 +91,7 @@ func TestConfineAdmissionWaitLineCarriesTheQueuePosition(t *testing.T) {
 		return confineQueuePosition{position: 2, queued: 3, aheadBytes: 8 << 30}, true
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
-	if !strings.Contains(got, "queue position 2 of 3 by enqueue order") {
+	if !strings.Contains(got, "queue position 2 of 3 in evaluation order") {
 		t.Fatalf("progress line does not state the caller's own place in the queue; stderr=%q", got)
 	}
 	// "queued ahead", not "reserved ahead": the figure counts the queued
@@ -306,7 +306,7 @@ func TestConfineAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{})
 	// The head-of-queue reading that misled four sessions, now with the other
 	// population beside it.
-	if !strings.Contains(got, "queue position 1 of 9 by enqueue order, 0M queued ahead, 53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
+	if !strings.Contains(got, "queue position 1 of 9 in evaluation order, 0M queued ahead, 53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
 		t.Fatalf("progress line does not put the queued and the granted populations side by side; stderr=%q", got)
 	}
 	// The printed figure is the unpinned hint (1G); the daemon is gating on 35G.

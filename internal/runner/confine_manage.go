@@ -468,10 +468,11 @@ type ConfineSliceReserve struct {
 	// Both are derived in the SAME locked pass as Queued, so position, total,
 	// and bytes-ahead can never describe different instants.
 	//
-	// Position is an index in the daemon's EVALUATION order (by enqueue
-	// sequence), not a promise of grant order: the AIRA-59 fairness duty
-	// cycle's yield phase can admit a later, smaller waiter that fits while
-	// the head is still too large. QueuedAheadBytes is the sum of the reserves
+	// Position is an index in the daemon's EVALUATION order (pushed jobs
+	// first, latest push first, then enqueue sequence — AIRA-309), not a
+	// promise of grant order: a later, smaller waiter that fits can be admitted
+	// past a head that is still too large, within that head's AIRA-307 budget
+	// or in the backstop's backfilling pass. QueuedAheadBytes is the sum of the reserves
 	// of the queued waiters ahead — a fact about the queue, never an ETA,
 	// which the daemon cannot establish.
 	//
