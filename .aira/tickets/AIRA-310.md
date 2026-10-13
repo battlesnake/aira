@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-310","project":"aira","title":"confine: on exit, hint on stderr when peak RAM/VRAM was far below an explicit (pinned) reservation","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.38","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-310","project":"aira","title":"confine: on exit, hint on stderr when peak RAM/VRAM was far below an explicit (pinned) reservation","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.38","labels":[],"hold":false,"relations":[]}
 ---
 
 
