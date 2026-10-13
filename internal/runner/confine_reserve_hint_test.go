@@ -104,10 +104,12 @@ func TestConfineReserveHintSuggestionRounding(t *testing.T) {
 		peak int64
 		want int64
 	}{
+		{0, 256 * hintMiB},                // floor (a measured zero peak)
 		{1, 256 * hintMiB},                // floor
 		{100 * hintMiB, 256 * hintMiB},    // 150M -> floor 256M
 		{310 * hintMiB, 512 * hintMiB},    // 465M -> 512M
 		{512 * hintMiB, 768 * hintMiB},    // 768M exactly, no extra step
+		{178956971, 512 * hintMiB},        // odd peak: 1.5x is 256M + 0.5 byte, so ceil -> next unit
 		{512*hintMiB + 1, 1024 * hintMiB}, // just over -> next multiple
 		{1024 * hintMiB, 1536 * hintMiB},  // exact
 		{2000 * hintMiB, 3072 * hintMiB},  // 3000M -> 3072M

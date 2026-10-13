@@ -1117,7 +1117,8 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 		return ""
 	}
 	reserve, peak := status.ReserveBytes, *status.PeakRSS
-	if declaredBytes <= 0 || reserve != declaredBytes || reserve < confineHintMinReserve || peak < 0 {
+	// reserve >= 2 GiB with reserve == declaredBytes also proves declaredBytes > 0.
+	if reserve != declaredBytes || reserve < confineHintMinReserve || peak < 0 {
 		return ""
 	}
 	if peak*5 >= reserve*3 {

@@ -22,6 +22,8 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 		peak := int64(300) << 20
 		deps.readUsage = func(string) cgroupUsage { return cgroupUsage{PeakRSS: &peak} }
 		deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
+		// A fake scope has no cgroup FD; a declared reserve becomes the scope cap.
+		deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
 		var stdout, stderr bytes.Buffer
 		result, err := confineWithDeps(context.Background(), ConfineRequest{
 			Slice: "finite.slice", Argv: []string{"/bin/sh", "-c", "echo job-stdout"},
