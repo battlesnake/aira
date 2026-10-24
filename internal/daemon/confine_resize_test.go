@@ -170,11 +170,15 @@ func TestConfineResizeEveryRefusalLeavesTheLedgerByteIdentical(t *testing.T) {
 	looseWorker := runningJob(7, "aitest-w2", "s-1", qGiB) // worker-named, not a sub-reservation
 	blind := runningJob(8, "blind", "s-1", 8*qGiB)
 	gone := runningJob(9, "gone", "s-1", 4*qGiB)
-	queue := queueOf(server, mine, theirs, twinA, twinB, waiting, sub, looseWorker, blind, gone)
+	// A sub-reservation that is NOT worker-named, so the sub-reservation rule is
+	// the only thing that refuses it.
+	child := runningJob(10, "child", "s-1", qGiB)
+	child.parentScopeID = mine.scopeID
+	queue := queueOf(server, mine, theirs, twinA, twinB, waiting, sub, looseWorker, blind, gone, child)
 	registerAdmitQueue(server, queue)
 	usageSeam(server, map[string]int64{
 		mine.scopeID: 2 * qGiB, theirs.scopeID: qGiB, twinA.scopeID: 0, twinB.scopeID: 0,
-		sub.scopeID: 0, looseWorker.scopeID: 0, gone.scopeID: 0,
+		sub.scopeID: 0, looseWorker.scopeID: 0, gone.scopeID: 0, child.scopeID: 0,
 	})
 	server.releaseAdmitWaiter(queue, gone) // a released job: gone from the ledger
 	drainKick(queue)
@@ -188,7 +192,9 @@ func TestConfineResizeEveryRefusalLeavesTheLedgerByteIdentical(t *testing.T) {
 		{name: "ambiguous", selector: "twin", reserve: "1G", caller: "s-1", want: "E_SELECTOR_AMBIGUOUS"},
 		{name: "queued job", selector: "waiting", reserve: "1G", caller: "s-1", want: runner.CodeConfineNotRunning},
 		{name: "released job", selector: "gone", reserve: "1G", caller: "s-1", want: runner.CodeConfineNotFound},
-		{name: "sub-reservation by scope id", selector: sub.scopeID, reserve: "1M", caller: "s-1", steal: true, want: runner.CodeConfineNotRunning},
+		{name: "worker sub-reservation by scope id", selector: sub.scopeID, reserve: "1M", caller: "s-1", steal: true, want: runner.CodeConfineNotRunning},
+		{name: "sub-reservation by scope id", selector: child.scopeID, reserve: "1M", caller: "s-1", steal: true, want: runner.CodeConfineNotRunning},
+		{name: "sub-reservation by name", selector: "child", reserve: "1M", caller: "s-1", steal: true, want: runner.CodeConfineNotFound},
 		{name: "worker by scope id", selector: looseWorker.scopeID, reserve: "1M", caller: "s-1", steal: true, want: runner.CodeConfineNotRunning},
 		{name: "worker by name", selector: "aitest-w2", reserve: "1M", caller: "s-1", want: runner.CodeConfineNotFound},
 		{name: "worker by pid", selector: "6007", reserve: "1M", caller: "s-1", want: runner.CodeConfineNotFound},
