@@ -298,7 +298,7 @@ func formatConfineWaitLine(verb, sliceName string, request ConfineRequest, reser
 		// with a digit string, and the daemon refuses it rather than guessing.
 		sliceFlag := ""
 		if sliceName != DefaultConfineSlice {
-			sliceFlag = " --slice " + sliceName
+			sliceFlag = " --slice " + shellWord(sliceName)
 		}
 		line += fmt.Sprintf(". Push to front: aira confine --front %d --steal%s", pid, sliceFlag)
 	}
@@ -463,4 +463,21 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	}
 	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead
 	return exclusive, true
+}
+
+// shellWord quotes s for a POSIX shell only when it needs it, so the command the
+// wait line prints can be pasted verbatim (a slice name such as team\x2djobs.slice
+// would otherwise lose its backslash, and a spaced path would split).
+func shellWord(s string) string {
+	plain := s != ""
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._/@:+-", r)) {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

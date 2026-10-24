@@ -58,6 +58,19 @@ func TestFormatConfineWaitLine(t *testing.T) {
 			t.Fatalf("line = %q, the default slice needs no flag", def)
 		}
 	})
+	t.Run("slice-name-is-shell-quoted-only-when-needed", func(t *testing.T) {
+		for slice, want := range map[string]string{
+			"custom.slice":       "--slice custom.slice",
+			`team\x2djobs.slice`: `--slice 'team\x2djobs.slice'`,
+			"my slice":           "--slice 'my slice'",
+			"it's.slice":         `--slice 'it'\''s.slice'`,
+		} {
+			got := formatConfineWaitLine("waiting for memory admission", slice, request, 6144<<20, true, 15, "", queued, true)
+			if !strings.HasSuffix(got, want+"\n") {
+				t.Fatalf("slice %q: line = %q, want suffix %q", slice, got, want)
+			}
+		}
+	})
 	t.Run("shim-verb-and-vram", func(t *testing.T) {
 		got := formatConfineWaitLine("waiting for advisory memory admission", "ci.slice", request, 1<<30, true, 5, ", declared VRAM 2048M", "", false)
 		if !strings.HasPrefix(got, "confine: waiting for advisory memory admission on ci.slice:") || !strings.Contains(got, "declared VRAM 2048M") {
