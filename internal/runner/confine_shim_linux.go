@@ -143,15 +143,14 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 			case <-ticker.C:
 				// The shim line prints `reserve` verbatim too, so the same
 				// AIRA-186 "already on the line" test applies here.
-				queueNote := confineQueueNote(ctx, deps, request, ShimConfineSlice, reserve, admitWaitDone)
+				queueNote, queued := confineQueueNote(ctx, deps, request, ShimConfineSlice, reserve, admitWaitDone)
 				waited := int64(time.Since(start).Seconds())
 				select {
 				case <-admitWaitDone:
 					return
 				default:
 				}
-				fmt.Fprintf(admitDiag, "confine: waiting for advisory memory admission on %s (reserve %s, waited %ds%s)\n",
-					sliceName, FormatConfineMegabytes(reserve), waited, queueNote)
+				fmt.Fprint(admitDiag, formatConfineWaitLine("waiting for advisory memory admission", sliceName, request, reserve, true, waited, "", queueNote, queued))
 			}
 		}
 	}()

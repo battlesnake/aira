@@ -5,6 +5,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -90,18 +91,26 @@ func TestConfineAdmissionWaitLineCarriesTheQueuePosition(t *testing.T) {
 		}
 		return confineQueuePosition{position: 2, queued: 3, aheadBytes: 8 << 30}, true
 	}
-	got := waitForConfineDiagnostic(t, deps, ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
-	if !strings.Contains(got, "queue position 2 of 3 in evaluation order") {
+	got := waitForConfineDiagnostic(t, deps, ConfineRequest{Name: "build-x", MemoryReserve: 4 << 30, MemoryReservePinned: true})
+	if !strings.Contains(got, ", 2 of 3 queued") {
 		t.Fatalf("progress line does not state the caller's own place in the queue; stderr=%q", got)
 	}
-	// "queued ahead", not "reserved ahead": the figure counts the queued
-	// waiters in front, NOT the much larger reserve already granted to running
-	// jobs. Build review found the looser wording invited exactly that misread.
-	if !strings.Contains(got, "8192M queued ahead") {
-		t.Fatalf("progress line does not state the reserve queued ahead; stderr=%q", got)
+	// The queued-ahead byte figure was dropped from the line (owner 2026-10-24:
+	// too long); it must not creep back as a misleading "reserved ahead".
+	if strings.Contains(got, "ahead") {
+		t.Fatalf("the line is meant to be short; no ahead-figure; stderr=%q", got)
 	}
-	if strings.Contains(got, "reserved ahead") {
-		t.Fatalf("the ahead-figure must not read as all reserve ahead of the job; stderr=%q", got)
+	// The job is named and the operator is handed the command that pushes it to
+	// the front. The selector is the supervisor PID (unique, unlike the default
+	// name "job"), and --steal is needed because the typist is not the attested owner.
+	if !strings.Contains(got, `"build-x"`) {
+		t.Fatalf("the line must name the job; stderr=%q", got)
+	}
+	if want := fmt.Sprintf("Push to front: aira confine --front %d --steal", os.Getpid()); !strings.Contains(got, want) {
+		t.Fatalf("the line must carry the front command %q; stderr=%q", want, got)
+	}
+	if strings.Contains(got, "evaluation order") || strings.Contains(got, "admitted jobs") {
+		t.Fatalf("the long-form wording must be gone; stderr=%q", got)
 	}
 	if !strings.Contains(got, "reserve 4096M") {
 		t.Fatalf("the existing pinned wording must survive; stderr=%q", got)
@@ -123,16 +132,11 @@ func TestConfineAdmissionWaitLineKeepsTheUnpinnedHedgeWithAPosition(t *testing.T
 		return confineQueuePosition{position: 1, queued: 4, aheadBytes: 0}, true
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{})
-	if !strings.Contains(got, "unpinned") || !strings.Contains(got, "requested reserve 1024M") {
+	if !strings.Contains(got, "unpinned") || !strings.Contains(got, "requested ~1024M") {
 		t.Fatalf("unpinned hedge lost; stderr=%q", got)
 	}
-	if !strings.Contains(got, "queue position 1 of 4") {
+	if !strings.Contains(got, ", 1 of 4 queued") {
 		t.Fatalf("unpinned line lost its queue position; stderr=%q", got)
-	}
-	// Head of the queue: nothing is ahead, and that is a fact worth stating as
-	// 0B rather than omitting, since the absent case means something else.
-	if !strings.Contains(got, "0M queued ahead") {
-		t.Fatalf("head-of-queue line must state an empty ahead-figure; stderr=%q", got)
 	}
 }
 
@@ -152,11 +156,11 @@ func TestConfineAdmissionWaitLineOmitsAnUnestablishedPosition(t *testing.T) {
 		return confineQueuePosition{}, false
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
-	if !strings.Contains(got, "confine: waiting for memory admission on finite.slice (reserve 4096M, waited ") {
+	if !strings.Contains(got, `confine: waiting for memory admission on finite.slice: "job" reserve 4096M, waited `) {
 		t.Fatalf("the daemon-less line must be exactly the pre-AIRA-24 line; stderr=%q", got)
 	}
-	if strings.Contains(got, "queue position") || strings.Contains(got, "queued ahead") {
-		t.Fatalf("an unestablished position must print nothing at all; stderr=%q", got)
+	if strings.Contains(got, "queued") || strings.Contains(got, "--front") {
+		t.Fatalf("an unestablished position must print no queue note and no front command (the daemon holds no queued job to push); stderr=%q", got)
 	}
 }
 
@@ -306,14 +310,14 @@ func TestConfineAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{})
 	// The head-of-queue reading that misled four sessions, now with the other
 	// population beside it.
-	if !strings.Contains(got, "queue position 1 of 9 in evaluation order, 0M queued ahead, 53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
+	if !strings.Contains(got, "1 of 9 queued, 53248M of 65536M granted") {
 		t.Fatalf("progress line does not put the queued and the granted populations side by side; stderr=%q", got)
 	}
 	// The printed figure is the unpinned hint (1G); the daemon is gating on 35G.
-	if !strings.Contains(got, "requested reserve 1024M") {
+	if !strings.Contains(got, "requested ~1024M") {
 		t.Fatalf("the AIRA-51 hedge must survive; stderr=%q", got)
 	}
-	if !strings.Contains(got, "this job's own reserve resolves to 35840M") {
+	if !strings.Contains(got, "reserve resolves to 35840M") {
 		t.Fatalf("the unpinned line must name the reserve the daemon actually resolved; stderr=%q", got)
 	}
 }
@@ -341,10 +345,10 @@ func TestConfineAdmissionWaitLineDoesNotRepeatAPinnedReserve(t *testing.T) {
 	if !strings.Contains(got, "reserve 4096M, waited ") {
 		t.Fatalf("the pinned wording must survive; stderr=%q", got)
 	}
-	if strings.Contains(got, "this job's own reserve") {
+	if strings.Contains(got, "resolves to") {
 		t.Fatalf("a pinned figure already on the line must not be restated; stderr=%q", got)
 	}
-	if !strings.Contains(got, "53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
+	if !strings.Contains(got, "53248M of 65536M granted") {
 		t.Fatalf("the AIRA-181 clause must still be rendered; stderr=%q", got)
 	}
 }
@@ -375,10 +379,10 @@ func TestShimAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing.T)
 		if !strings.Contains(got, "waiting for advisory memory admission") {
 			t.Fatalf("the shim's own wait line was never printed; stderr=%q", got)
 		}
-		if !strings.Contains(got, "0M queued ahead, 53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
+		if !strings.Contains(got, "1 of 9 queued, 53248M of 65536M granted") {
 			t.Fatalf("the shim line does not name the admitted jobs' held reserve; stderr=%q", got)
 		}
-		if !strings.Contains(got, "this job's own reserve resolves to 35840M") {
+		if !strings.Contains(got, "reserve resolves to 35840M") {
 			t.Fatalf("the shim line does not name the resolved reserve; stderr=%q", got)
 		}
 	})
@@ -390,10 +394,10 @@ func TestShimAdmissionWaitLineNamesTheBlockerAndTheResolvedReserve(t *testing.T)
 		if !strings.Contains(got, "reserve 4096M, waited ") {
 			t.Fatalf("the shim's pinned wording must survive; stderr=%q", got)
 		}
-		if strings.Contains(got, "this job's own reserve") {
+		if strings.Contains(got, "resolves to") {
 			t.Fatalf("a pinned figure already on the shim line must not be restated; stderr=%q", got)
 		}
-		if !strings.Contains(got, "53248M already granted across 9 admitted jobs / 65536M slice ceiling") {
+		if !strings.Contains(got, "53248M of 65536M granted") {
 			t.Fatalf("the AIRA-181 clause must still be rendered on the shim line; stderr=%q", got)
 		}
 	})

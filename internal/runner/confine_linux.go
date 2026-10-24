@@ -713,7 +713,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 				// AIRA-186's clause can tell "the daemon resolved a different
 				// number" from "it honoured the one you pinned". It is never
 				// used as a stand-in for the resolved reserve itself.
-				queueNote := confineQueueNote(ctx, deps, request, path, reserve, admitWaitDone)
+				queueNote, queued := confineQueueNote(ctx, deps, request, path, reserve, admitWaitDone)
 				// Sampled AFTER the probe, which can take up to its own
 				// timeout: reading the clock first would under-report the wait
 				// by however long the daemon took to answer.
@@ -737,13 +737,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 				if request.VRAMBytes > 0 {
 					vramNote = ", declared VRAM " + FormatConfineMegabytes(request.VRAMBytes)
 				}
-				if pinned {
-					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s%s, waited %ds%s)\n",
-						sliceName, FormatConfineMegabytes(reserve), vramNote, waited, queueNote)
-				} else {
-					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s%s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds%s)\n",
-						sliceName, FormatConfineMegabytes(reserve), vramNote, waited, queueNote)
-				}
+				fmt.Fprint(admitDiag, formatConfineWaitLine("waiting for memory admission", sliceName, request, reserve, pinned, waited, vramNote, queueNote, queued))
 			}
 		}
 	}()

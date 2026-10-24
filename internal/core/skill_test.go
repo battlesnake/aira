@@ -1307,7 +1307,8 @@ func TestSkillTeachesTheReserveHint(t *testing.T) {
 	}
 	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
 		for _, want := range []string{
-			"`confine: hint: peak 310M of 4096M reserved (7%); consider --memory-reserve 512M so more jobs fit`",
+			"`confine: ACTION REQUIRED: over-reserved -- this job peaked at 310M, only 7% of the 4096M you pinned`",
+			"It is an instruction, not an FYI",
 			"the percentage is truncated, so it never reads 60%",
 			"for a reserve pinned only by an inherited `AIRA_CONFINE_RESERVE`",
 			"for a `docker run` or a podman container whose placement you chose yourself",
