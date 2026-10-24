@@ -2935,13 +2935,13 @@ func TestConfineAdmissionWaitDiagnosticHedgesUnpinnedReserve(t *testing.T) {
 		t.Fatalf("no admission-wait progress diagnostic emitted; stderr=%q", buf.String())
 	}
 	got := buf.String()
-	if !strings.Contains(got, "requested reserve 1024M") {
+	if !strings.Contains(got, "requested ~1024M") {
 		t.Fatalf("unpinned line must label the figure as a requested hint, not a bare reserve; stderr=%q", got)
 	}
 	if !strings.Contains(got, "unpinned") {
 		t.Fatalf("unpinned line must say so explicitly; stderr=%q", got)
 	}
-	if !strings.Contains(got, "daemon resolves the actual grant") {
+	if !strings.Contains(got, "the daemon sizes the real grant") {
 		t.Fatalf("unpinned line must warn the daemon's grant may differ; stderr=%q", got)
 	}
 }

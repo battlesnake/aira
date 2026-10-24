@@ -121,7 +121,18 @@ const confineQueueProbeTimeout = 2 * time.Second
 // build.
 
 // confineQueueNote renders the queue clause of one admission-wait progress
-// line, or "" when no position could be established.
+// line, or "" when nothing could be established. The bool reports whether the
+// daemon placed this job in its queue (a real position), which is the precondition
+// for offering the `--front` command: a push of a job the daemon does not hold
+// queued is refused.
+//
+// The line is deliberately short (owner 2026-10-24: the long form, with queued-ahead
+// bytes and a job count, was unreadable). It states only what lets a reader decide
+// what to do: where the job stands, how full the slice is, and any NON-ordinary
+// reason for the wait. The full picture is `aira confine --list` / `aira top`.
+//
+// The bool is "offer the front command": the daemon holds this job queued AND a
+// push could help it.
 //
 // The probe is bounded twice over: by its own short timeout, and by the end of
 // the admission wait itself. The launch path joins this goroutine before it
@@ -129,19 +140,17 @@ const confineQueueProbeTimeout = 2 * time.Second
 // otherwise hold an already-granted job at the starting line for the whole
 // timeout. waitDone is the same channel that stops the ticker.
 //
-// An absent position prints NOTHING — not "position unknown", which would put
-// a line no operator can act on onto every tick of a daemon-less wait, and
-// certainly not a zero, which would state that nothing is queued while this
-// very job waits in the queue.
+// An absent position prints NOTHING -- not "position unknown", and certainly not
+// a zero, which would state that nothing is queued while this very job waits in
+// the queue.
 //
-// clientReserve is the figure the progress line ALREADY prints ahead of this
-// clause. It is passed in for one purpose (AIRA-186): to keep the resolved
-// reserve off the line when it is byte-for-byte the number already there, so a
-// pinned job is not told twice, while an unpinned job — whose printed figure is
-// a hint the daemon has already replaced — is told the real one.
-func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequest, slicePath string, clientReserve int64, waitDone <-chan struct{}) string {
+// clientReserve is the figure the progress line ALREADY prints. It is passed in
+// for one purpose (AIRA-186): to keep the resolved reserve off the line when it is
+// the number already there, while an unpinned job -- whose printed figure is a
+// hint the daemon has already replaced -- is told the real one.
+func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequest, slicePath string, clientReserve int64, waitDone <-chan struct{}) (string, bool) {
 	if deps.queuePosition == nil {
-		return ""
+		return "", false
 	}
 	timeout := deps.admitQueueProbeTimeout
 	if timeout <= 0 {
@@ -161,13 +170,12 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	cancelProbe()
 	<-watcherStopped
 	if !ok {
-		return ""
+		return "", false
 	}
-	// AIRA-101. The exclusivity clause stands on its own. A job blocked behind a
-	// drain often has NO queue position to report — during a hold it may be the
-	// only waiter, and a position of "1 of 1" explains nothing — so tying this
-	// clause to a valid position would hide the one fact that actually explains
-	// the wait.
+	// AIRA-101. The exclusivity clause stands on its own: a job blocked behind a
+	// drain often has NO queue position to report, and a position of "1 of 1"
+	// explains nothing, so tying this clause to a valid position would hide the one
+	// fact that actually explains the wait.
 	exclusiveNote := ""
 	switch position.exclusiveState {
 	case "draining":
@@ -175,142 +183,126 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	case "held":
 		exclusiveNote = ", slice held exclusively by " + describeExclusiveJob(position)
 	}
-	// AIRA-103. Stated BEFORE the position, and standing on its own for the same
-	// reason the exclusivity clause does: it changes what the position means.
-	// Under a reduced ceiling the queue may not be moving because of anything
-	// AIRA is doing, and an operator reading only "position 4 of 9" would go
-	// looking for the wrong cause.
+	// AIRA-103/106. Stated before the position, standing on its own: it changes what
+	// the position means. The cause is named from the basis, never assumed -- the
+	// static machine-reserve term can bind on an idle box, so the MemAvailable
+	// figure is printed only beside the system-pressure basis, where it is the
+	// cause, and withheld from the others, where it would send a reader looking for
+	// memory nothing is using.
 	pressure := ""
 	if position.ceilingThrottled {
-		// AIRA-106. The cause is named from the basis, never assumed. Before it,
-		// this line asserted external memory pressure for every reduced ceiling;
-		// the static machine-reserve term makes that false on an idle box.
-		// The basis names WHICH POLICY TERM bound the ceiling, which is what the
-		// daemon actually established. It is deliberately not restated as a fact
-		// about the machine: the dynamic term can bind on a perfectly idle box if
-		// the configured free-memory reserve is large, so "reduced by memory used
-		// outside the slice" would be an assertion the comparison does not support.
-		// The MemAvailable figure beside it is what lets a launcher tell an idle
-		// machine from a loaded one.
 		switch position.ceilingBasis {
 		case "system-pressure":
-			pressure = ", slice ceiling reduced to keep the configured system free-memory reserve"
+			pressure = ", ceiling cut to keep system free memory"
 			if position.memAvailable > 0 {
-				pressure += " (system MemAvailable " + FormatConfineMegabytes(position.memAvailable) + ")"
+				pressure += " (MemAvailable " + FormatConfineMegabytes(position.memAvailable) + ")"
 			}
 		case "machine-reserve":
-			pressure = ", slice ceiling reduced to keep the configured share of this machine outside the slice"
+			pressure = ", ceiling cut to keep the machine-share reserve"
 		default:
-			pressure = ", slice ceiling reduced below the configured ceiling"
+			pressure = ", ceiling cut below the configured ceiling"
 		}
 	}
 	if position.position <= 0 || position.queued < position.position {
-		return pressure + exclusiveNote
+		return pressure + exclusiveNote, false
 	}
-	// A known-zero ahead-figure is the head of the queue and must read as the
-	// fact it is: FormatConfineMegabytes renders it "0M", where
-	// FormatConfineBytes would say "unknown", which is the one thing this is not.
-	ahead := FormatConfineMegabytes(position.aheadBytes)
-	// Two words earn their place here. "evaluation order" because a pushed job
-	// (AIRA-309) goes first and the daemon can admit a smaller waiter past a
-	// stuck head (AIRA-307's budget, or the backstop pass), so this is a place
-	// in the order the daemon evaluates and not a promise of being admitted
-	// second. "queued ahead" because the figure counts ONLY the queued
-	// waiters in front — the reserve already GRANTED to running jobs is much
-	// larger and is not in it; a bare "reserved ahead" invites reading it as
-	// "the memory standing between me and admission", which it is not.
-	//
-	// AIRA-181 closes the gap that wording could only warn about. The warning was
-	// correct and insufficient: naming what the figure is NOT left the reader to
-	// supply the figure it is, and four sessions supplied "nothing". The two
-	// clauses now sit together, each naming its own population in its own words —
-	// "queued ahead" for the waiters, "already granted across N admitted jobs"
-	// for the running set — so neither number can be mistaken for the other and
-	// the larger one is no longer missing. The vocabulary is deliberately
-	// `confine --list`'s own ("granted", "admitted jobs", "ceiling"), so an
-	// operator who cross-checks with that command reads the same nouns.
-	return pressure +
-		fmt.Sprintf(", queue position %d of %d in evaluation order, %s queued ahead", position.position, position.queued, ahead) +
-		confineHeldNote(position) + confineOwnReserveNote(position, clientReserve) + exclusiveNote
+	// "of N queued" is the daemon's evaluation order, not a promise of grant order:
+	// a pushed job (AIRA-309) goes first and a smaller waiter can pass a stuck head
+	// (AIRA-307). The figure the old line led with -- the reserve queued ahead -- is
+	// gone; "granted/ceiling" is the number that says how full the slice is.
+	// A job blocked by its own size is not helped by a push (it cannot fit however
+	// early it is evaluated, and it would hold every smaller job behind it), so the
+	// front command is withheld for it.
+	pushable := position.ceilingBytes <= 0 || position.resolvedReserve <= position.ceilingBytes
+	return fmt.Sprintf(", %d of %d queued", position.position, position.queued) +
+		confineHeldNote(position) + pressure + confineOwnReserveNote(position, clientReserve) + exclusiveNote, pushable
 }
 
 // confineHeldNote states what the ADMITTED jobs hold, against the ceiling one
 // more job faces (AIRA-181). Both figures come from the same probe reply that
 // carried the position, so this costs no round trip.
 //
-// It prints nothing at all when the daemon did not establish the pair. A zero
-// it DID establish is printed as "0M ... across 0 admitted jobs", because on a
-// slice that is closed for some other reason — a drain, a fairness freeze, a
-// ceiling collapsed by outside pressure — an empty running set is the single
-// most useful thing the line can say, and suppressing it would leave the
-// operator with the same "nothing is blocking me" reading this clause exists to
-// end.
+// It prints nothing at all when the daemon did not establish the figure. A zero it
+// DID establish is printed as "0M granted", because on a slice that is closed for
+// another reason -- a drain, a fairness freeze, a ceiling collapsed by outside
+// pressure -- an empty running set is the single most useful thing the line can
+// say. A ceiling that could not be established is left out rather than printed as
+// "0M", which would state that the slice can admit nothing.
 //
-// Every byte figure on this line is whole MiB (FormatConfineMegabytes, the unit
-// `aira top` uses), so the granted total, the ceiling and the queued-ahead figure
-// compare at a glance (AIRA-193). An ESTABLISHED zero reads "0M"; an unestablished
-// figure is omitted, never printed as zero.
+// Every byte figure on the line is whole MiB (FormatConfineMegabytes, the unit
+// `aira top` uses), so the granted total and the ceiling compare at a glance.
 func confineHeldNote(position confineQueuePosition) string {
 	if !position.heldEstablished {
 		return ""
 	}
 	held := FormatConfineMegabytes(position.heldBytes)
-	jobs := "jobs"
-	if position.heldJobs == 1 {
-		jobs = "job"
-	}
-	note := fmt.Sprintf(", %s already granted across %d admitted %s", held, position.heldJobs, jobs)
-	// A ceiling that could not be established is left out rather than printed as
-	// "0M", which would state that the slice can admit nothing.
 	if position.ceilingBytes > 0 {
-		note += " / " + FormatConfineMegabytes(position.ceilingBytes) + " slice ceiling"
+		return fmt.Sprintf(", %s of %s granted", held, FormatConfineMegabytes(position.ceilingBytes))
 	}
-	return note
+	return ", " + held + " granted"
 }
 
-// confineOwnReserveNote states this job's OWN resolved reserve against that same
-// ceiling (AIRA-186).
+// confineOwnReserveNote states this job's OWN resolved reserve (AIRA-186).
 //
-// Two different silences, on purpose:
+// Two different silences, on purpose: a reserve the daemon did not report is an
+// absence and prints nothing (the client's own figure is NOT substituted -- while
+// unpinned it is a hint the daemon has already replaced); a resolved reserve
+// identical to the figure already on the line adds nothing.
 //
-//   - A reserve the daemon did not report is an absence and prints nothing. The
-//     client's own figure is NOT substituted: while unpinned it is a hint the
-//     daemon has already replaced, and printing it as "this job's own reserve"
-//     would name a number nothing is gating on — the fabrication this ticket is
-//     about, restated in the fix.
-//   - A resolved reserve identical to the figure already on the line (every
-//     pinned request) adds nothing, so it is not repeated. The comparison it
-//     would support is already available: the pinned figure is at the head of
-//     the line and the ceiling is in the clause above.
-//
-// The one case that always speaks is a reserve larger than the ceiling itself.
-// That is reachable while queued even though admission refuses `reserve >
-// ceiling` outright at enqueue: the ceiling is not fixed, and falls under
-// outside memory pressure or as more jobs are admitted and each takes its own
-// headroom. It is also the one state where waiting is futile in a way ordinary
-// contention is not, and it is exactly the distinction AIRA-186 asks the wait
-// site to make — so it is stated in full, with its own numbers, even when the
-// figure duplicates one already on the line.
+// The one case that always speaks is a reserve larger than the ceiling itself: the
+// job is blocked by its own size and not by the jobs ahead of it, so waiting is
+// futile in a way ordinary contention is not.
 func confineOwnReserveNote(position confineQueuePosition, clientReserve int64) string {
 	if position.resolvedReserve <= 0 {
 		return ""
 	}
-	// "resolves to" is the news that the daemon chose a different number from the
-	// one printed at the head of the line; "is" states a figure the caller pinned
-	// itself. Saying "resolves to" for a pinned request would imply the daemon
-	// moved a number it honours verbatim.
-	verb := "is"
-	if position.resolvedReserve != clientReserve {
-		verb = "resolves to"
-	}
 	if position.ceilingBytes > 0 && position.resolvedReserve > position.ceilingBytes {
-		return fmt.Sprintf(", this job's own reserve %s %s — larger than the whole %s slice ceiling, so it is blocked by its own size and not by the jobs ahead of it; pin a smaller --memory-reserve",
-			verb, FormatConfineMegabytes(position.resolvedReserve), FormatConfineMegabytes(position.ceilingBytes))
+		return fmt.Sprintf(", reserve %s exceeds the whole %s ceiling -- blocked by its own size; pin a smaller --memory-reserve",
+			FormatConfineMegabytes(position.resolvedReserve), FormatConfineMegabytes(position.ceilingBytes))
 	}
 	if position.resolvedReserve == clientReserve {
 		return ""
 	}
-	return fmt.Sprintf(", this job's own reserve %s %s", verb, FormatConfineMegabytes(position.resolvedReserve))
+	return ", reserve resolves to " + FormatConfineMegabytes(position.resolvedReserve)
+}
+
+// formatConfineWaitLine is the one place the periodic admission-wait line is
+// composed, for the real and ci-shim paths alike (they differ only in verb and
+// the advisory wording). It names the job and, when the daemon holds it queued,
+// the minimal command an operator runs to push it to the front.
+//
+// The selector is the supervisor PID: a name need not be unique ("job" is the
+// default for every unnamed launch, and a reused name is refused as ambiguous),
+// whereas a PID is unique among live processes and short. `--steal` is part of the
+// command because the person typing it is not the job's attested owner, and without
+// the flag the push is refused (CheckConfineOwner).
+func formatConfineWaitLine(verb, sliceName string, request ConfineRequest, reserve int64, pinned bool, waited int64, vramNote, queueNote string, queued bool) string {
+	name, pid := request.Name, 0
+	if parsedName, parsedPID, _, _, ok := parseConfineScopeID(request.ScopeID); ok {
+		name, pid = parsedName, parsedPID
+	}
+	if name == "" {
+		name = "job"
+	}
+	reserveText := "reserve " + FormatConfineMegabytes(reserve)
+	if !pinned {
+		// The daemon resolves the actual grant, so the client's figure is only an
+		// estimate and says so.
+		reserveText = "requested ~" + FormatConfineMegabytes(reserve) + " (unpinned; the daemon sizes the real grant)"
+	}
+	line := fmt.Sprintf("confine: %s on %s: %q %s%s, waited %ds%s", verb, sliceName, name, reserveText, vramNote, waited, queueNote)
+	if queued && pid > 0 {
+		// --slice only when the job is not on the default slice, or a plain shell's
+		// push would query the wrong queue. A numeric job name equal to this PID
+		// would make the selector ambiguous; that needs a second queued job named
+		// with a digit string, and the daemon refuses it rather than guessing.
+		sliceFlag := ""
+		if sliceName != DefaultConfineSlice {
+			sliceFlag = " --slice " + shellWord(sliceName)
+		}
+		line += fmt.Sprintf(". Push to front: aira confine --front %d --steal%s", pid, sliceFlag)
+	}
+	return line + "\n"
 }
 
 // describeExclusiveJob names the exclusive job for the progress line. An unnamed
@@ -471,4 +463,21 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	}
 	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead
 	return exclusive, true
+}
+
+// shellWord quotes s for a POSIX shell only when it needs it, so the command the
+// wait line prints can be pasted verbatim (a slice name such as team\x2djobs.slice
+// would otherwise lose its backslash, and a spaced path would split).
+func shellWord(s string) string {
+	plain := s != ""
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._/@:+-", r)) {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

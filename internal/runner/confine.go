@@ -1148,8 +1148,14 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 		return ""
 	}
 	percent := peak * 100 / reserve
-	return fmt.Sprintf("confine: hint: peak %s of %s reserved (%d%%); consider --memory-reserve %s so more jobs fit",
-		FormatConfineMegabytes(peak), FormatConfineMegabytes(reserve), percent, FormatConfineMegabytes(suggestion))
+	// An imperative, not a suggestion: the earlier "hint: ... consider" wording was
+	// read as optional and ignored by the agents it was written for (owner
+	// 2026-10-24). It states the cost (the reserve is held against the shared slice
+	// for the whole job, so it queues other sessions), the exact next-run value, the
+	// alternative that needs no number, and where the fix belongs.
+	return fmt.Sprintf("confine: ACTION REQUIRED: over-reserved -- this job peaked at %s, only %d%% of the %s you pinned; an unused reserve like that can delay other jobs on the shared slice. "+
+		"Next run use --memory-reserve %s, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins %s",
+		FormatConfineMegabytes(peak), percent, FormatConfineMegabytes(reserve), FormatConfineMegabytes(suggestion), FormatConfineMegabytes(reserve))
 }
 
 // FormatConfineStatus is the single operator-facing honesty projection.
