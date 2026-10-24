@@ -90,3 +90,43 @@ key) is a thin face over that verb, shaped exactly like `confine-front` (AIRA-30
 
 Lowering `memory.max`; raising a reserve; CPU/VRAM edits; persisting a resize
 across a daemon restart; per-worker (aitest) resizes.
+
+## Build-time decisions (recorded by the implementer)
+
+* **Wire argument name.** The verb's size argument is `memory_reserve`, a
+  string in the `--memory-reserve` size grammar, not `reserve_bytes`. The
+  dispatch table has only string, bool and list argument kinds, and the MCP
+  schema is generated from it, so a `reserve_bytes` argument would have been an
+  opaque decimal-bytes string for MCP callers. One parser,
+  `runner.ParseConfineResizeReserve` (`ParseMemorySize` plus the launch form's
+  1 MiB floor), is applied by the CLI (synchronous refusal), by `aira top`
+  before its confirmation, and by the daemon (authoritative).
+* **Codes.** The three named in Surface are `E_CONFINE_NOT_RUNNING` (exit 1),
+  `E_CONFINE_RESIZE_NOT_REDUCTION` (2) and `E_CONFINE_RESIZE_BELOW_USAGE` (2).
+  The floor-unreadable case (malformed or unreadable `memory.current`, a scope
+  that is missing or still being created, and every resize in ci-shim mode)
+  needed a fourth, unevaluated code: `U_CONFINE_RESIZE_USAGE_UNEVALUATED`
+  (exit 3), with the stated reason in the message. A zero, sub-MiB or malformed
+  size is `E_CONFINE_ARGUMENT_INVALID`.
+* **Refusal order.** Argument checks, then resolution among granted waiters
+  (a selector naming only a queued job answers `E_CONFINE_NOT_RUNNING`
+  pointing at `--front`/`--kill`), then sub-reservation/worker refusal, then the
+  ownership guard, then "not a reduction", then the floor read and check. Both
+  sub-reservations and aitest-worker-named scopes are refused, even one reached
+  by its explicit scope id.
+* **Floor read.** The daemon reads `<slice>/.aira-<scope-id>/memory.current`
+  with `readSliceCeilingCurrent` under `queue.mu` (the evaluator already reads
+  slice memory under that lock); on failure an `Lstat` tells a missing scope
+  apart from an unreadable one, for the message only.
+* **`aira top` key and input.** `e` is free in `onTUIKey` and the top view's
+  inline actions, and is used. The size is typed into the existing inline
+  mini-form (`inlineStageMiniForm`, the one `find set waived` uses for its
+  reason/actor), whose submit builds the confirmation page (`topResizeConfirm`,
+  the same `paletteConfirm` page `topFrontConfirm` uses). So the size is
+  entered on the step before the confirmation rather than on the confirmation
+  page itself; the confirmation then shows the job, owner, current reserve and
+  live usage (captured at the keypress), the proposed size, the caveats and the
+  `--steal` acknowledgement. The ownership rule and wording are one helper
+  shared with `f` (`topOwnerCheckClause`). The palette's management arm admits
+  `confine-resize` beside `confine-front`, and the old-daemon hint passes the
+  verb's own `U_CONFINE_` code through untouched.
