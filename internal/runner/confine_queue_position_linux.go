@@ -131,6 +131,9 @@ const confineQueueProbeTimeout = 2 * time.Second
 // what to do: where the job stands, how full the slice is, and any NON-ordinary
 // reason for the wait. The full picture is `aira confine --list` / `aira top`.
 //
+// The bool is "offer the front command": the daemon holds this job queued AND a
+// push could help it.
+//
 // The probe is bounded twice over: by its own short timeout, and by the end of
 // the admission wait itself. The launch path joins this goroutine before it
 // continues, so a daemon that accepts a query and never answers would
@@ -207,8 +210,12 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// a pushed job (AIRA-309) goes first and a smaller waiter can pass a stuck head
 	// (AIRA-307). The figure the old line led with -- the reserve queued ahead -- is
 	// gone; "granted/ceiling" is the number that says how full the slice is.
+	// A job blocked by its own size is not helped by a push (it cannot fit however
+	// early it is evaluated, and it would hold every smaller job behind it), so the
+	// front command is withheld for it.
+	pushable := position.ceilingBytes <= 0 || position.resolvedReserve <= position.ceilingBytes
 	return fmt.Sprintf(", %d of %d queued", position.position, position.queued) +
-		confineHeldNote(position) + pressure + confineOwnReserveNote(position, clientReserve) + exclusiveNote, true
+		confineHeldNote(position) + pressure + confineOwnReserveNote(position, clientReserve) + exclusiveNote, pushable
 }
 
 // confineHeldNote states what the ADMITTED jobs hold, against the ceiling one
@@ -285,7 +292,15 @@ func formatConfineWaitLine(verb, sliceName string, request ConfineRequest, reser
 	}
 	line := fmt.Sprintf("confine: %s on %s: %q %s%s, waited %ds%s", verb, sliceName, name, reserveText, vramNote, waited, queueNote)
 	if queued && pid > 0 {
-		line += fmt.Sprintf(". Push to front: aira confine --front %d --steal", pid)
+		// --slice only when the job is not on the default slice, or a plain shell's
+		// push would query the wrong queue. A numeric job name equal to this PID
+		// would make the selector ambiguous; that needs a second queued job named
+		// with a digit string, and the daemon refuses it rather than guessing.
+		sliceFlag := ""
+		if sliceName != DefaultConfineSlice {
+			sliceFlag = " --slice " + sliceName
+		}
+		line += fmt.Sprintf(". Push to front: aira confine --front %d --steal%s", pid, sliceFlag)
 	}
 	return line + "\n"
 }

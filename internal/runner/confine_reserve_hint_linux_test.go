@@ -62,7 +62,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 	// 2 GiB minimum and the 60% line, so ONLY the pinned-provenance gate can keep
 	// an unpinned run silent (build review P2: the 1 GiB default never reached it).
 	historyGrant := &admissionResult{state: "immediate", release: &confineCountingCloser{}, reserve: 4 << 30, basis: "estimate:history"}
-	const want = "confine: ACTION REQUIRED: over-reserved -- this job peaked at 300M, only 7% of the 4096M you pinned, and the unused reserve was held against the shared slice and delays other jobs. Next run use --memory-reserve 512M, or drop --memory-reserve so aira sizes it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
+	const want = "confine: ACTION REQUIRED: over-reserved -- this job peaked at 300M, only 7% of the 4096M you pinned; an unused reserve like that can delay other jobs on the shared slice. Next run use --memory-reserve 512M, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
 
 	t.Run("pinned 4G hints on stderr only", func(t *testing.T) {
 		t.Setenv(ConfineNoHintsEnv, "")
@@ -73,7 +73,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 		if !strings.Contains(stdout, "job-stdout") {
 			t.Fatalf("harness shape not reached: job stdout = %q", stdout)
 		}
-		if strings.Contains(stdout, "hint") {
+		if strings.Contains(stdout, "ACTION REQUIRED") {
 			t.Fatalf("hint leaked onto stdout: %q", stdout)
 		}
 		trailer := strings.Index(stderr, "terminated-by=normal")

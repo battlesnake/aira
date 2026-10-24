@@ -1,3 +1,5 @@
+//go:build linux
+
 package runner
 
 import (
@@ -45,6 +47,15 @@ func TestFormatConfineWaitLine(t *testing.T) {
 			ConfineRequest{Name: "gate-x", ScopeID: "garbage"}, 6144<<20, true, 15, "", queued, true)
 		if strings.Contains(got, "--front") || !strings.Contains(got, `"gate-x"`) {
 			t.Fatalf("line = %q, want the name but no command built from a PID that was never established", got)
+		}
+	})
+	t.Run("non-default-slice-names-the-slice-in-the-command", func(t *testing.T) {
+		got := formatConfineWaitLine("waiting for memory admission", "custom.slice", request, 6144<<20, true, 15, "", queued, true)
+		if !strings.Contains(got, "--front 4242 --steal --slice custom.slice") {
+			t.Fatalf("line = %q, a push without --slice queries the default queue", got)
+		}
+		if def := formatConfineWaitLine("waiting for memory admission", DefaultConfineSlice, request, 6144<<20, true, 15, "", queued, true); strings.Contains(def, "--slice") {
+			t.Fatalf("line = %q, the default slice needs no flag", def)
 		}
 	})
 	t.Run("shim-verb-and-vram", func(t *testing.T) {

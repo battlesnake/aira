@@ -1153,8 +1153,8 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 	// 2026-10-24). It states the cost (the reserve is held against the shared slice
 	// for the whole job, so it queues other sessions), the exact next-run value, the
 	// alternative that needs no number, and where the fix belongs.
-	return fmt.Sprintf("confine: ACTION REQUIRED: over-reserved -- this job peaked at %s, only %d%% of the %s you pinned, and the unused reserve was held against the shared slice and delays other jobs. "+
-		"Next run use --memory-reserve %s, or drop --memory-reserve so aira sizes it from this command's history; also fix the script, Makefile or agent brief that pins %s",
+	return fmt.Sprintf("confine: ACTION REQUIRED: over-reserved -- this job peaked at %s, only %d%% of the %s you pinned; an unused reserve like that can delay other jobs on the shared slice. "+
+		"Next run use --memory-reserve %s, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins %s",
 		FormatConfineMegabytes(peak), percent, FormatConfineMegabytes(reserve), FormatConfineMegabytes(suggestion), FormatConfineMegabytes(reserve))
 }
 

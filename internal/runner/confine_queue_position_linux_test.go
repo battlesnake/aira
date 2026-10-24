@@ -329,6 +329,13 @@ func TestConfineQueueNoteReportsAReducedCeilingOnlyWhenEnforced(t *testing.T) {
 // field the probe drops on the floor cannot pass by being set in the fixture.
 func queueNoteFor(t *testing.T, clientReserve int64, reserve *ConfineSliceReserve) string {
 	t.Helper()
+	note, _ := queueNoteAndPushable(t, clientReserve, reserve)
+	return note
+}
+
+// queueNoteAndPushable is queueNoteFor plus the "offer the front command" verdict.
+func queueNoteAndPushable(t *testing.T, clientReserve int64, reserve *ConfineSliceReserve) (string, bool) {
+	t.Helper()
 	socket, _ := fakeConfineListDaemon(t, func(map[string]any) runnerAdmitResponseFrame {
 		return confineListReply(t, reserve)
 	})
@@ -337,8 +344,24 @@ func queueNoteFor(t *testing.T, clientReserve int64, reserve *ConfineSliceReserv
 	deps.queuePosition = confineQueuePositionFromDaemon
 	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(5*time.Second))
 	defer cancel()
-	note, _ := confineQueueNote(ctx, deps, request, "/slice", clientReserve, make(chan struct{}))
-	return note
+	return confineQueueNote(ctx, deps, request, "/slice", clientReserve, make(chan struct{}))
+}
+
+// verifies: AIRA-311 -- the front command is offered for a job that is queued and
+// could be helped by a push, and withheld for one blocked by its own size (a push
+// cannot make it fit and would hold every smaller job behind it).
+func TestConfineQueueNoteOffersThePushOnlyWhereItCanHelp(t *testing.T) {
+	fits := &ConfineSliceReserve{Queued: 4, QueuePosition: 3, GrantedBytes: 8 << 30, Jobs: 2, CeilingBytes: 61 << 30, GrantedEstablished: true, ResolvedReserveBytes: 35 << 30}
+	if _, pushable := queueNoteAndPushable(t, 2<<30, fits); !pushable {
+		t.Fatal("a queued job that fits the ceiling must be offered the push")
+	}
+	oversize := &ConfineSliceReserve{Queued: 4, QueuePosition: 3, GrantedBytes: 8 << 30, Jobs: 2, CeilingBytes: 61 << 30, GrantedEstablished: true, ResolvedReserveBytes: 70 << 30}
+	if note, pushable := queueNoteAndPushable(t, 2<<30, oversize); pushable || !strings.Contains(note, "blocked by its own size") {
+		t.Fatalf("pushable=%v note=%q, an oversize job must say so and not be offered the push", pushable, note)
+	}
+	if _, pushable := queueNoteAndPushable(t, 2<<30, nil); pushable {
+		t.Fatal("a job with no established position must not be offered the push")
+	}
 }
 
 // AIRA-181. At the head of the queue "0M queued ahead" is true by definition and
