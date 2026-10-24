@@ -17,9 +17,9 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// AIRA-309 added confine-front (77 -> 78).
-	if len(artifacts.Actions) != 78 {
-		t.Fatalf("actions=%d, want 78", len(artifacts.Actions))
+	// AIRA-309 added confine-front (77 -> 78); AIRA-312 confine-resize (-> 79).
+	if len(artifacts.Actions) != 79 {
+		t.Fatalf("actions=%d, want 79", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -196,6 +196,8 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"confine-list": SafetyRead, "confine-kill": SafetyExecute, "confine-budget": SafetyRead,
 		// AIRA-309. Not destructive: a push kills nothing and charges nothing.
 		"confine-front": SafetyExecute,
+		// AIRA-312. Not destructive either: the job keeps running under its cap.
+		"confine-resize": SafetyExecute,
 		// AIRA-176. The asymmetry is the point: register is the only writer of a
 		// binding, audit writes nothing at all and must stay SafetyRead.
 		"worktree-register": SafetyMutate, "worktree-audit": SafetyRead,
@@ -1320,6 +1322,43 @@ func TestSkillTeachesTheReserveHint(t *testing.T) {
 			if !strings.Contains(text, want) {
 				t.Fatalf("%s does not teach %q", name, want)
 			}
+		}
+	}
+}
+
+// verifies: AIRA-312 -- the skill and the generated verb summary both state the
+// resize honesty caveats: ledger only (cap unchanged), the OOM-steering budget
+// drops with the reserve, and any re-declare restores the original. Deleting any
+// one of them from either reds this.
+func TestSkillAndSummaryStateTheResizeCaveats(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"`aira confine --resize <name|supervisor-pid|scope-id> --memory-reserve SZ`",
+			"in `aira top` it is `e` on a running row",
+			"never below the job's live memory use",
+			"the job's `memory.max` cap is unchanged",
+			"lowers the job's OOM-steering budget",
+			"any re-declare of the lease (a daemon reconnect or restart) restores the original reserve",
+			"keep the reserve it was admitted with",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not state %q", name, want)
+			}
+		}
+	}
+	var summary string
+	for _, descriptor := range New(nil).DispatchDescriptors() {
+		if descriptor.Name == "confine-resize" {
+			summary = descriptor.Summary
+		}
+	}
+	for _, want := range []string{"reduce only", "memory.max cap is unchanged", "OOM-steering budget drops", "any re-declare", "restores the original reserve"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("confine-resize summary %q does not state %q", summary, want)
 		}
 	}
 }
