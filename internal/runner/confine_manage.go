@@ -16,11 +16,49 @@ const (
 	// that is not waiting in the admission queue: it is already admitted, or it is
 	// a sub-reservation, whose place follows its parent's.
 	CodeConfineNotQueued = "E_CONFINE_NOT_QUEUED"
+	// CodeConfineNotRunning refuses `aira confine --resize` (AIRA-312) for a job
+	// that does not hold a job-level grant: it is still waiting in the admission
+	// queue (use --front or --kill), or it is a sub-reservation or aitest worker,
+	// whose charge follows its parent's.
+	CodeConfineNotRunning = "E_CONFINE_NOT_RUNNING"
+	// CodeConfineResizeNotReduction refuses a resize whose new reserve is not
+	// strictly below the job's current one. A resize only ever hands capacity
+	// back; asking for more is a queueing question, not an edit.
+	CodeConfineResizeNotReduction = "E_CONFINE_RESIZE_NOT_REDUCTION"
+	// CodeConfineResizeBelowUsage refuses a resize below the job's own live
+	// memory use (its scope's memory.current, read by the daemon at the resize).
+	CodeConfineResizeBelowUsage = "E_CONFINE_RESIZE_BELOW_USAGE"
+	// CodeConfineResizeUsageUnevaluated refuses a resize whose floor — the job's
+	// live memory use — could not be established: ci-shim mode (no per-job
+	// cgroup), a scope that is not present yet or any more, or an unreadable or
+	// malformed memory.current. Never a guessed floor.
+	CodeConfineResizeUsageUnevaluated = "U_CONFINE_RESIZE_USAGE_UNEVALUATED"
 )
 
+// ConfineResizeMinimumReserve is the smallest reserve a resize may name. It is
+// the launch form's own --memory-reserve floor (parseConfineArgs), so the two
+// size languages are one.
+const ConfineResizeMinimumReserve = int64(1) << 20
+
+// ParseConfineResizeReserve is the ONE parser of `aira confine --resize`'s
+// --memory-reserve value (AIRA-312), shared by the CLI's synchronous refusal and
+// the daemon's handler: ParseMemorySize's grammar with the launch form's 1MiB
+// floor. A zero, negative or sub-MiB value is an argument error.
+func ParseConfineResizeReserve(raw string) (int64, error) {
+	value, err := ParseMemorySize(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, err
+	}
+	if value < ConfineResizeMinimumReserve {
+		return 0, fmt.Errorf("must be at least 1MiB")
+	}
+	return value, nil
+}
+
 // CheckConfineOwner is the ONE ownership guard every owner-checked confine
-// management action applies — `--kill` on the real and the ci-shim paths, and
-// `--front` (AIRA-309) — so the rule cannot drift between them.
+// management action applies — `--kill` on the real and the ci-shim paths,
+// `--front` (AIRA-309) and `--resize` (AIRA-312) — so the rule cannot drift
+// between them.
 //
 // Both sides must be ATTESTED for the guard to open. An inferred owner
 // (AIRA-23, '@'-prefixed) reads as unattested on purpose: two sessions in one
@@ -870,6 +908,19 @@ type ConfineFrontResult struct {
 	ScopeID string `json:"scope_id"`
 	Name    string `json:"name"`
 	Owner   string `json:"owner"`
+}
+
+// ConfineResizeResult is the reply to `aira confine --resize` (AIRA-312): the
+// running job whose admission-ledger reserve was lowered, and the reserve before
+// and after. It describes the LEDGER only: the job's memory.max cap is not
+// touched, and any later re-declare of the lease restores OldReserveBytes.
+type ConfineResizeResult struct {
+	Status          string `json:"status"`
+	ScopeID         string `json:"scope_id"`
+	Name            string `json:"name"`
+	Owner           string `json:"owner"`
+	OldReserveBytes int64  `json:"old_reserve_bytes"`
+	NewReserveBytes int64  `json:"new_reserve_bytes"`
 }
 
 type ConfineReapResult struct {

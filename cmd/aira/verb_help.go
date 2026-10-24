@@ -159,8 +159,8 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 // confineManagementFlags are the `confine` options that make a request a
-// management request (list/kill/front/status/budget/dump) rather than a launch.
-var confineManagementFlags = map[string]bool{"--list": true, "--kill": true, "--front": true, "--status": true, "--budget": true, "--dump": true}
+// management request (list/kill/front/resize/status/budget/dump) rather than a launch.
+var confineManagementFlags = map[string]bool{"--list": true, "--kill": true, "--front": true, "--resize": true, "--status": true, "--budget": true, "--dump": true}
 
 // isConfineLaunch reports whether argv (verb first) is a request to LAUNCH a
 // confine job: the verb is exactly `confine` (the hyphenated confine-* verbs are

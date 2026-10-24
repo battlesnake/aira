@@ -2154,6 +2154,25 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-front requires the project-less daemon transport")
 		}},
+		// AIRA-312. Lower the admission-ledger reserve of one RUNNING confine job,
+		// owner-checked like confine-kill (one shared guard) and answered by the
+		// same project-less daemon transport. Ledger only: the job's memory.max is
+		// never written. Not destructive: nothing is killed; the job keeps running
+		// under the cap it was launched with.
+		"confine-resize": {Name: "confine-resize", Usage: "confine --resize <name|supervisor-pid|scope-id> --memory-reserve SZ [--steal] [--slice S] [--owner ID]", Args: []ArgSpec{
+			stringSpec("selector", true, true, "Exact confine name, supervisor PID, or scope ID of a running (admitted) job"),
+			stringSpec("memory_reserve", true, false, "New admission reserve, the --memory-reserve size grammar (1024-based; e.g. 2G/512M; a bare number is bytes; at least 1MiB): strictly below the job's current reserve and at or above its live memory use, which the daemon reads from the job's cgroup (refused when that cannot be read)"),
+			boolSpec("steal", false, false, "Override unknown or foreign ownership"),
+			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, MCPTool: "aira_confine_resize", Summary: "Lower one ownership-checked running confine job's admission reserve.", Safety: SafetyExecute, Include: true, Example: []string{"job", "--memory-reserve", "2G"}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "selector")
+			_ = stringArg(args, "memory_reserve")
+			_ = boolArg(args, "steal")
+			_ = stringArg(args, "slice")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-resize requires the project-less daemon transport")
+		}},
 		// AIRA-106. The daemon-subsystem mode flags are listed here because this
 		// table IS the generated help: an operator reading `aira help install` could
 		// not otherwise discover how to flip either memory subsystem. (--watchdog
@@ -2530,9 +2549,13 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// AIRA (admission-counter rebuild) S18. CLI-only (see the Include
 		// exclusion list below): the target file belongs to the invoking
 		// process's own filesystem.
-		"confine-dump":   {summary: "Write the daemon's admission/utilisation records as JSONL for CI archival", safety: SafetyRead, example: []string{}},
-		"confine-kill":   {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
-		"confine-front":  {summary: "Push one ownership-checked queued confine job to the front of the admission queue", safety: SafetyExecute, example: []string{"job"}},
+		"confine-dump":  {summary: "Write the daemon's admission/utilisation records as JSONL for CI archival", safety: SafetyRead, example: []string{}},
+		"confine-kill":  {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
+		"confine-front": {summary: "Push one ownership-checked queued confine job to the front of the admission queue", safety: SafetyExecute, example: []string{"job"}},
+		// AIRA-312. The caveats live in the summary because this is the text every
+		// generated face publishes: ledger only, the cap is unchanged, the
+		// OOM-steering budget drops with the reserve, and any re-declare undoes it.
+		"confine-resize": {summary: "Lower one ownership-checked running confine job's admission reserve (reduce only, never below its live memory use). Ledger only: its memory.max cap is unchanged, so the ledger can under-count what it may still use by up to the reduction; its OOM-steering budget drops with it, so a later overrun makes it the preferred OOM victim; any re-declare (a daemon reconnect or restart) restores the original reserve", safety: SafetyExecute, example: []string{"job", "--memory-reserve", "2G"}},
 		"confine-status": {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		// AIRA-196. Unlike confine/confine-status these ARE included: reading a
 		// captured file and writing to a job's stdin socket both have honest

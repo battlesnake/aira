@@ -151,7 +151,7 @@ func TestMCPScopeDirIsDeclaredOnProjectScopedToolsOnly(t *testing.T) {
 	server := newMCPServer(nil)
 	// AIRA-196 adds the two detached-confine job I/O tools: both address a
 	// machine-wide record store and resolve no project.
-	projectLess := map[string]bool{"aira_eject": true, "aira_confine_list": true, "aira_confine_kill": true, "aira_confine_front": true,
+	projectLess := map[string]bool{"aira_eject": true, "aira_confine_list": true, "aira_confine_kill": true, "aira_confine_front": true, "aira_confine_resize": true,
 		"aira_confine_budget": true, "aira_confine_log": true, "aira_confine_input": true}
 	for _, tool := range server.tools {
 		schema, ok := tool.InputSchema.(mcpInputSchema)

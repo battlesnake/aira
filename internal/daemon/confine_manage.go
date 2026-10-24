@@ -429,6 +429,18 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		}
 		logConfineFront(callerOwner, steal, result, path)
 		return core.Response{OK: true, Code: "OK", Data: result}
+	case "confine-resize":
+		// AIRA-312. Ledger-only: lowers one running job's reserve and re-derives
+		// the ledger; the job's memory.max is never written. ci-shim mode reaches
+		// the same handler and is refused at the floor read (no per-job cgroup).
+		selector := stringArg(request.Args, "selector")
+		steal, _ := request.Args["steal"].(bool)
+		result, usage, resizeErr := s.resizeRunningConfine(path, selector, stringArg(request.Args, "memory_reserve"), callerOwner, steal)
+		if resizeErr != nil {
+			return confineManagementError(resizeErr)
+		}
+		logConfineResize(callerOwner, steal, result, usage, path)
+		return core.Response{OK: true, Code: "OK", Data: result}
 	default:
 		return confineManagementError(errors.New("E_UNKNOWN_VERB: unknown confine management verb"))
 	}

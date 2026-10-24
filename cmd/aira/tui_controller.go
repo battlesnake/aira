@@ -106,8 +106,10 @@ type tableRow struct {
 	// jobs by forgetting a guard.
 	Queued bool
 	// ConfirmText describes the row's job for a confirmation page, in words an
-	// operator needs before acting on it (AIRA-309: name, owner, requested
-	// reserve, listed position). Display only; empty on every other row.
+	// operator needs before acting on it: for a queued row (AIRA-309) its name,
+	// owner, requested reserve and listed position; for a live `aira top` row
+	// (AIRA-312) its name, owner, current reserve and live usage. Display only;
+	// empty on every other view's rows.
 	ConfirmText string
 }
 

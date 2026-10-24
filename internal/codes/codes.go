@@ -372,8 +372,17 @@ var ExitCodes = map[string]int{
 	// the admission queue (already admitted, or a sub-reservation that follows
 	// its parent): the state is wrong, not the selector, so 1 — the same side of
 	// the rule as E_CONFINE_OWNER_UNVERIFIED.
-	"E_CONFINE_NOT_QUEUED":   1,
-	"U_CONFINE_NOT_LAUNCHED": 3, "U_CONFINE_KILL_UNCONFIRMED": 3,
+	"E_CONFINE_NOT_QUEUED": 1,
+	// AIRA-312. `confine --resize` names a job that is not a running job-level
+	// grant (still queued, or a sub-reservation/worker that follows its parent):
+	// the state is wrong, not the request, so 1 like E_CONFINE_NOT_QUEUED. A
+	// size that is not a reduction, or that is below the job's live memory use,
+	// is a request to fix (pick another size), so 2. A floor the daemon could not
+	// read is unevaluated, so 3 with the rest of the U_ vocabulary.
+	"E_CONFINE_NOT_RUNNING":          1,
+	"E_CONFINE_RESIZE_NOT_REDUCTION": 2, "E_CONFINE_RESIZE_BELOW_USAGE": 2,
+	"U_CONFINE_RESIZE_USAGE_UNEVALUATED": 3,
+	"U_CONFINE_NOT_LAUNCHED":             3, "U_CONFINE_KILL_UNCONFIRMED": 3,
 	// AIRA-22's detached confine surface, mirroring the run-detach pair
 	// (E_RUN_DETACH_FAILED: 4, U_RUN_DETACH_CANCELLED: 3) so a caller that knows
 	// one knows the other. U_CONFINE_OUTCOME_UNKNOWN is the unevaluated verdict
