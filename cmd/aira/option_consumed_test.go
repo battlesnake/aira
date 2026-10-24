@@ -61,9 +61,12 @@ var optionBaseArgvs = map[string][][]string{
 	// confine management flag parsed by parseConfineArgs.
 	"confine-kill":  {{"confine-kill", "x"}},
 	"confine-front": {{"confine-front", "x"}},
-	"confine-log":   {{"confine-log", "x"}},
-	"confine-input": {{"confine-input", "x"}},
-	"watch":         {{"watch"}},
+	// AIRA-312. --memory-reserve is required, so the base carries it; the probe
+	// then exercises steal/slice/owner on top.
+	"confine-resize": {{"confine-resize", "x", "--memory-reserve", "2G"}},
+	"confine-log":    {{"confine-log", "x"}},
+	"confine-input":  {{"confine-input", "x"}},
+	"watch":          {{"watch"}},
 	"gate": {
 		{"gate", "add", "G"}, {"gate", "set", "G"}, {"gate", "show", "G"}, {"gate", "run", "G"}, {"gate", "attest", "G", "--verdict", "pass", "--actor", "a"},
 		{"gate", "prove", "G"}, {"gate", "review", "G"}, {"gate", "ls"}, {"gate", "check"}, {"gate", "canary-run", "C"}, {"gate", "canary-show", "C"},

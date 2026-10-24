@@ -685,8 +685,16 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		if previous.ShowCwd {
 			lastText = record.Cwd
 		}
+		owner := record.Owner
+		if owner == "" {
+			owner = runner.ConfineUnknownOwner
+		}
 		model.Rows = append(model.Rows, tableRow{
-			ID: scopeID, Colour: colour, Cells: []string{
+			ID: scopeID, Colour: colour,
+			// AIRA-312: what `e` (lower reserve) names on its mini-form and
+			// confirmation, as of this tick.
+			ConfirmText: fmt.Sprintf("%s (owner %s, current reserve %s, live usage %s)", record.Name, owner, reserve.String(), topRAMCell(record.RSSBytes)),
+			Cells: []string{
 				fmt.Sprint(slot), record.Name, confineNum(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
 				topRAMCell(record.RSSBytes),

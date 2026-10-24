@@ -69,7 +69,7 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 				}
 				request.Args["owner"] = owner
 			}
-		} else if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-budget" {
+		} else if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-resize" || canonical == "confine-budget" {
 			// Confine management is machine-local and project-less. Ownership,
 			// destructive confirmation, and populated-gate checks remain in the
 			// management handler; this bypasses project discovery only.

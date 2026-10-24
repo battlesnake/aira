@@ -78,7 +78,7 @@ func TestVerbHelpIsAnsweredForEveryVerbBeforeDispatch(t *testing.T) {
 		"ls":           {"list"},
 		"new":          {"create"},
 		"get":          {"show"},
-		"confine":      {"confine", "confine-budget", "confine-dump", "confine-front", "confine-kill", "confine-list", "confine-status"},
+		"confine":      {"confine", "confine-budget", "confine-dump", "confine-front", "confine-kill", "confine-list", "confine-resize", "confine-status"},
 		"worktree":     {"worktree-audit", "worktree-register"},
 		"confine-list": {"confine-list"},
 	}

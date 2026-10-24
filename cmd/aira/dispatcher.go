@@ -159,7 +159,7 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	// invocation in every directory. Both shipped spellings (`confine --budget`
 	// and `confine-budget`) converge here, so the verb was wholly unreachable and
 	// the daemon's own handler at internal/daemon/server.go:785 was dead code.
-	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-budget" || canonical == "confine-dump" {
+	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-resize" || canonical == "confine-budget" || canonical == "confine-dump" {
 		if canonical == "confine-budget" || canonical == "confine-dump" {
 			return d.dispatchConfineHistory(ctx, request)
 		}
@@ -220,8 +220,8 @@ func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, re
 	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
 	response, err := d.doExchange(ctx, frame)
 	if err == nil {
-		if request.Verb == "confine-front" {
-			return withOldDaemonFrontHint(response.CoreResponse())
+		if request.Verb == "confine-front" || request.Verb == "confine-resize" {
+			return withOldDaemonManagementHint(request.Verb, response.CoreResponse())
 		}
 		return response.CoreResponse()
 	}
@@ -268,7 +268,8 @@ func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, re
 	// operator's "push this job to the front" would KILL that job whenever the
 	// daemon was unreachable. The queue a push reorders exists only inside the
 	// daemon, so with the daemon down there is nothing to push; the transport
-	// error says so.
+	// error says so. AIRA-312's confine-resize is refused here by the same rule:
+	// the ledger it edits exists only inside the daemon.
 	if request.Verb != "confine-list" && request.Verb != "confine-kill" {
 		return transportErrorResponse(err)
 	}
@@ -519,16 +520,17 @@ func (d *daemonDispatcher) TUILeaseToken(scope daemon.WorktreeScope, ticketID st
 func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.WorktreeScope, request core.Request) paletteDispatchAttempt {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
-	if canonical == "confine-front" {
-		// AIRA-309. `aira top`'s `f` key (topFrontConfirm) is the one confirmed
-		// row action that is client-routed: confine-front is project-less confine
-		// management and goes through the same management exchange as the CLI's
-		// `confine --front` (dispatchConfineManagementOnce), never through a
-		// project store. The verb is named exactly, so no other client-routed
-		// verb is admitted by this arm. It has no daemon-down fallback (nothing
-		// to push without the daemon's queue), so it is one exchange, classified
-		// exactly like the routed path below: a transport failure keeps its send
-		// evidence, and only a daemon-answered error code is a rejection.
+	if canonical == "confine-front" || canonical == "confine-resize" {
+		// AIRA-309. `aira top`'s `f` key (topFrontConfirm) and AIRA-312's `e` key
+		// (topResizeConfirm) are the confirmed row actions that are client-routed:
+		// both verbs are project-less confine management and go through the same
+		// management exchange as the CLI's `confine --front` / `--resize`
+		// (dispatchConfineManagementOnce), never through a project store. The
+		// verbs are named exactly, so no other client-routed verb is admitted by
+		// this arm. Neither has a daemon-down fallback (the queue and the ledger
+		// exist only in the daemon), so it is one exchange, classified exactly like
+		// the routed path below: a transport failure keeps its send evidence, and
+		// only a daemon-answered error code is a rejection.
 		owner, _ := request.Args["owner"].(string)
 		if err := runner.ValidateConfineOwner(owner); err != nil {
 			return paletteDispatchAttempt{Err: fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err), Send: paletteSendNotSent}
@@ -536,7 +538,7 @@ func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.Wor
 		frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
 		attempt := paletteAttemptFrom(d.doExchange(ctx, frame))
 		if attempt.Err == nil {
-			attempt.Response = withOldDaemonFrontHint(attempt.Response)
+			attempt.Response = withOldDaemonManagementHint(canonical, attempt.Response)
 		}
 		return attempt
 	}
@@ -744,18 +746,24 @@ func prepareRoutedRequest(request *core.Request) {
 	}
 }
 
-// withOldDaemonFrontHint (AIRA-309) explains a confine-front refusal whose code
-// is outside the verb's own vocabulary. The protocol version did not change, so
-// a daemon that predates the verb accepts the frame and answers with an
-// unrelated code (an empty-scope project lookup's, most likely), which on its own
-// reads as nonsense for "push this job to the front". The daemon's code and words
-// are kept; only the likely cause is appended. Every code the verb itself can
-// produce (E_CONFINE_*, E_SELECTOR_AMBIGUOUS) passes through untouched.
-func withOldDaemonFrontHint(response core.Response) core.Response {
-	if response.OK || strings.HasPrefix(response.Code, "E_CONFINE_") || response.Code == "E_SELECTOR_AMBIGUOUS" {
+// withOldDaemonManagementHint (AIRA-309, extended to confine-resize by AIRA-312)
+// explains a confine-front or confine-resize refusal whose code is outside the
+// verb's own vocabulary. The protocol version did not change, so a daemon that
+// predates the verb accepts the frame and answers with an unrelated code (an
+// empty-scope project lookup's, most likely), which on its own reads as nonsense
+// for "push this job to the front" or "lower this job's reserve". The daemon's
+// code and words are kept; only the likely cause is appended. Every code the
+// verbs themselves can produce (E_CONFINE_*, U_CONFINE_*, E_SELECTOR_AMBIGUOUS)
+// passes through untouched.
+func withOldDaemonManagementHint(verb string, response core.Response) core.Response {
+	if response.OK || strings.HasPrefix(response.Code, "E_CONFINE_") || strings.HasPrefix(response.Code, "U_CONFINE_") || response.Code == "E_SELECTOR_AMBIGUOUS" {
 		return response
 	}
-	response.Error += " (the running aira daemon may predate `aira confine --front`; restart it with `systemctl --user restart aira-daemon.service`)"
+	flag := "--front"
+	if verb == "confine-resize" {
+		flag = "--resize"
+	}
+	response.Error += " (the running aira daemon may predate `aira confine " + flag + "`; restart it with `systemctl --user restart aira-daemon.service`)"
 	return response
 }
 

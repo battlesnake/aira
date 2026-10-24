@@ -56,6 +56,11 @@ type inlineActionState struct {
 	FormArgs     []string
 	Values       map[string]string
 	Stage        inlineStage
+	// Summary is the target row's ConfirmText captured AT THE KEYPRESS
+	// (AIRA-312): `aira top` refreshes the table every tick, so the job's
+	// reserve and live usage shown on the confirmation page are the figures the
+	// operator acted on, not a later tick's. Display only.
+	Summary string
 }
 
 // inlineActionFor is the closed, panel-scoped row-action table. It describes
@@ -95,8 +100,14 @@ func inlineActionFor(view tuiView, key rune) (inlineAction, bool) {
 	case viewTop:
 		// AIRA-309. The only queued-row action: push the waiting job to the front
 		// of the admission queue, behind a confirmation (topFrontConfirm).
-		if key == 'f' {
+		// AIRA-312. `e` (edit reserve) is a LIVE-row action: lower a running job's
+		// admission reserve, the new size typed into the inline mini-form, then a
+		// confirmation (topResizeConfirm). Not `r`: that is the global refresh.
+		switch key {
+		case 'f':
 			action = inlineAction{Key: key, Label: "push to front", Verb: "confine-front", Safety: core.SafetyExecute, ValueSource: inlineValueFixed, QueuedRow: true}
+		case 'e':
+			action = inlineAction{Key: key, Label: "lower reserve", Verb: "confine-resize", Safety: core.SafetyExecute, ValueSource: inlineValueFixed}
 		}
 	}
 	return action, action.Verb != ""
@@ -116,19 +127,8 @@ func inlineActionFor(view tuiView, key rune) (inlineAction, bool) {
 // in plain words. That page is the explicit steal acknowledgement a human gives
 // in `top`; the CLI and MCP still need --steal for another session's job.
 func topFrontConfirm(state tuiState, row tableRow) (tuiState, []tuiCmd) {
-	caller := state.ConfineOwner
-	if caller == "" {
-		caller = runner.ConfineUnknownOwner
-	}
-	jobOwner := ""
-	if _, _, _, parsed, ok := runner.ParseConfineScopeID(row.ID); ok {
-		jobOwner = parsed
-	}
-	owner := jobOwner
-	if owner == "" {
-		owner = "an unknown owner"
-	}
-	own := runner.ConfineOwnerIsAttested(caller) && caller == jobOwner
+	caller := topConfineCaller(state)
+	own, clause := topOwnerCheckClause(caller, row.ID, "push")
 	request := core.Request{Verb: "confine-front", Args: map[string]any{
 		"selector": row.ID, "steal": !own,
 		"slice": runner.ResolveConfineSlice(""), "owner": caller,
@@ -137,18 +137,114 @@ func topFrontConfirm(state tuiState, row tableRow) (tuiState, []tuiCmd) {
 	if summary == "" {
 		summary = "push " + row.ID + " to the front of the admission queue"
 	}
-	summary += ". It then holds every job behind it until it fits. "
-	switch {
-	case own:
-		summary += "It is your job (" + caller + ")."
-	case caller == runner.ConfineUnknownOwner:
-		summary += "aira top has no owner identity; confirming overrides the owner check (--steal) for " + owner + "'s job."
-	default:
-		summary += "You are " + caller + "; confirming overrides the owner check (--steal) for " + owner + "'s job, and the push is logged as yours."
-	}
+	summary += ". It then holds every job behind it until it fits. " + clause
 	state.PaletteOpen = true
 	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: "confine-front"}
 	return state, nil
+}
+
+// topConfineCaller is the identity a confine write from `aira top` is sent as:
+// the CLI's owner chain resolved at startup, or the unknown marker.
+func topConfineCaller(state tuiState) string {
+	if state.ConfineOwner == "" {
+		return runner.ConfineUnknownOwner
+	}
+	return state.ConfineOwner
+}
+
+// topOwnerCheckClause is the ONE rule `aira top`'s confine writes (`f` push,
+// `e` resize) apply to ownership: steal=false (own) only for the caller's OWN
+// job under an attested identity, exactly the case the shared daemon guard
+// passes without --steal; every other write sends steal=true, and the returned
+// sentence says so in plain words. action names the write in the
+// logged-as-yours clause.
+func topOwnerCheckClause(caller, scopeID, action string) (bool, string) {
+	jobOwner := ""
+	if _, _, _, parsed, ok := runner.ParseConfineScopeID(scopeID); ok {
+		jobOwner = parsed
+	}
+	owner := jobOwner
+	if owner == "" {
+		owner = "an unknown owner"
+	}
+	own := runner.ConfineOwnerIsAttested(caller) && caller == jobOwner
+	switch {
+	case own:
+		return true, "It is your job (" + caller + ")."
+	case caller == runner.ConfineUnknownOwner:
+		return false, "aira top has no owner identity; confirming overrides the owner check (--steal) for " + owner + "'s job."
+	default:
+		return false, "You are " + caller + "; confirming overrides the owner check (--steal) for " + owner + "'s job, and the " + action + " is logged as yours."
+	}
+}
+
+// topResizeMemoryArg is the one mini-form field `e` asks for: the new reserve,
+// sent as the confine-resize verb's memory_reserve argument.
+const topResizeMemoryArg = "memory_reserve"
+
+// topResizeConfirm builds the confirmation page for `aira top`'s `e` key
+// (AIRA-312) once the new size has been typed into the inline mini-form. It is
+// built directly, not through the palette, for the reason topFrontConfirm is:
+// confine-resize is a client-routed SafetyExecute verb the palette never admits.
+//
+// The size is validated here by the parser the CLI and the daemon apply
+// (runner.ParseConfineResizeReserve), so a typo is refused before any page
+// claims a request; the daemon still decides "smaller than now" and "not below
+// live usage" at the moment of the resize. The page names the job, its owner,
+// current reserve and live usage as of the keypress, the proposed size, what a
+// resize does NOT do, and the --steal acknowledgement, exactly as
+// topFrontConfirm states it.
+func topResizeConfirm(state tuiState, raw string) (tuiState, []tuiCmd) {
+	pending := state.InlineAction
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: lower reserve requires the new reserve, e.g. 2G"
+		return state, nil
+	}
+	size, err := runner.ParseConfineResizeReserve(raw)
+	if err != nil {
+		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: new reserve " + strconv.Quote(raw) + ": " + err.Error()
+		return state, nil
+	}
+	caller := topConfineCaller(state)
+	own, clause := topOwnerCheckClause(caller, pending.TargetID, "resize")
+	request := core.Request{Verb: "confine-resize", Args: map[string]any{
+		"selector": pending.TargetID, topResizeMemoryArg: raw, "steal": !own,
+		"slice": runner.ResolveConfineSlice(""), "owner": caller,
+	}}
+	job := pending.Summary
+	if job == "" {
+		job = pending.TargetID
+	}
+	summary := fmt.Sprintf("lower the admission reserve of %s to %s (%d bytes). ", job, raw, size) +
+		"This edits the admission ledger only: the job's memory.max cap is unchanged; its OOM-steering budget drops to the new reserve, so an overrun past it makes the job the preferred OOM victim under pressure; and any re-declare (a daemon reconnect or restart) restores the original reserve. " +
+		"The daemon refuses a size that is not smaller than the current reserve or is below the job's live memory use at that moment. " + clause
+	pending.Stage = inlineStageConfirm
+	state.InlineError = ""
+	state.PaletteOpen = true
+	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: "confine-resize"}
+	return state, nil
+}
+
+// inlineMiniFormTitle and inlineMiniFormLabel word the inline mini-form for
+// the action that opened it: `find set waived`'s reason/actor, or `aira top`'s
+// `e` new-reserve field (AIRA-312).
+func inlineMiniFormTitle(pending *inlineActionState) string {
+	if pending.Action.Verb == "confine-resize" {
+		job := pending.Summary
+		if job == "" {
+			job = pending.TargetID
+		}
+		return " lower reserve: " + job + " "
+	}
+	return " waive " + pending.TargetID + " "
+}
+
+func inlineMiniFormLabel(pending *inlineActionState, name string) string {
+	if pending.Action.Verb == "confine-resize" && name == topResizeMemoryArg {
+		return "new reserve, e.g. 2G *: "
+	}
+	return name + " *: "
 }
 
 func onInlineActionStart(state tuiState, action inlineAction, descriptors []core.DispatchDescriptor) (tuiState, []tuiCmd) {
@@ -186,6 +282,19 @@ func onInlineActionStart(state tuiState, action inlineAction, descriptors []core
 		state.InlineAction = pending
 		pending.Stage = inlineStageConfirm
 		return topFrontConfirm(state, row)
+	}
+	if action.Verb == "confine-resize" {
+		// AIRA-312. The new size is typed into the existing inline mini-form (the
+		// one `find set waived` uses for its reason/actor); its submit builds the
+		// confirmation (onInlineMiniFormSubmit -> topResizeConfirm). The row's
+		// description is captured now, at the keypress.
+		state.InlineError = ""
+		state.PaletteOpen = true
+		pending.Summary = row.ConfirmText
+		pending.Stage = inlineStageMiniForm
+		pending.FormArgs = []string{topResizeMemoryArg}
+		state.InlineAction = pending
+		return state, nil
 	}
 	state.PaletteOpen = true
 	state.InlineError = ""
@@ -248,6 +357,9 @@ func onInlineMiniFormSubmit(state tuiState, values map[string]string, descriptor
 	pending := state.InlineAction
 	if pending == nil || pending.Stage != inlineStageMiniForm {
 		return state, nil
+	}
+	if pending.Action.Verb == "confine-resize" {
+		return topResizeConfirm(state, values[topResizeMemoryArg])
 	}
 	for _, name := range pending.FormArgs {
 		value := values[name]

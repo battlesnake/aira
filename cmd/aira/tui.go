@@ -606,8 +606,8 @@ func (r *tuiRuntime) render() {
 		keys = "    r refresh  : palette  q quit"
 	}
 	if r.state.Active == viewTop {
-		// AIRA-276 / AIRA-309. Advertised only on the tab they work on.
-		keys = "    c command/dir  f push queued job to front" + keys
+		// AIRA-276 / AIRA-309 / AIRA-312. Advertised only on the tab they work on.
+		keys = "    c command/dir  f push queued job to front  e lower running job's reserve" + keys
 	}
 	r.tabs.SetText(strings.Join(tabNames, "  ") + keys)
 	r.detachedStatus.SetText(r.state.DetachedReport)
@@ -1256,10 +1256,10 @@ func (r *tuiRuntime) showInlineMiniForm() {
 		return
 	}
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" waive " + pending.TargetID + " ")
+	form.SetBorder(true).SetTitle(inlineMiniFormTitle(pending))
 	fields := make(map[string]*tview.InputField, len(pending.FormArgs))
 	for _, name := range pending.FormArgs {
-		field := tview.NewInputField().SetLabel(name + " *: ")
+		field := tview.NewInputField().SetLabel(inlineMiniFormLabel(pending, name))
 		fields[name] = field
 		form.AddFormItem(field)
 	}
