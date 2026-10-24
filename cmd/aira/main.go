@@ -1542,6 +1542,14 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 			selected++
 		}
 	}
+	// AIRA-312. --memory-reserve is a management option only beside --resize;
+	// anywhere else it is the launch option typed without its -- <cmd>
+	// delimiter, and that refusal (AIRA-243 (c)) must name the delimiter even
+	// when no management flag was selected at all, so it precedes the
+	// zero-selection check below.
+	if _, present := options["memory-reserve"]; present && !resize {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --memory-reserve is a confine LAUNCH option and requires the -- <cmd> delimiter, e.g. aira confine --memory-reserve 4G -- <cmd>; in confine management it is valid only with --resize <selector>")
+	}
 	if selected == 0 {
 		// AIRA-243. Previously documented ONLY the management form, leaving an
 		// operator who typed a bare `aira confine` (or a launch attempt that
@@ -1556,11 +1564,9 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill, --front or --resize")
 	}
 	// AIRA-312. --resize names the job and --memory-reserve the new, smaller
-	// reserve: each is meaningless without the other here, and the size is
-	// validated synchronously by the same parser the daemon applies.
-	if _, present := options["memory-reserve"]; present && !resize {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --memory-reserve is a confine LAUNCH option and requires the -- <cmd> delimiter, e.g. aira confine --memory-reserve 4G -- <cmd>; in confine management it is valid only with --resize <selector>")
-	}
+	// reserve: --resize is meaningless without the size (the converse is
+	// refused above), and the size is validated synchronously by the same
+	// parser the daemon applies.
 	if resize {
 		raw, present := options["memory-reserve"]
 		if !present {
