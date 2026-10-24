@@ -195,6 +195,11 @@ type Server struct {
 	// depending on this host's real, ever-moving CPU counters and core count.
 	readCPUFrame func(string) runner.ConfineCPUFrame
 	readCPUCores func() int
+	// confineScopeUsage is AIRA-312's job-scope live-usage seam (the resize
+	// floor): nil in production, which resolves through scopeUsageReader to
+	// readConfineScopeUsage (or the ci-shim refusal). A test injects a fixed
+	// reading so the floor is exercised without a real job cgroup.
+	confineScopeUsage func(string) (int64, bool, string)
 	// cpuSlotsPerCore is AIRA-283's ratio R: the CPU admission ceiling is
 	// R x NumCPU (cpuCeiling). Set once, in Serve, by resolveCPUSlotsPerCore's own
 	// unconditional record read; NewServer starts it at the default so a server a
@@ -884,7 +889,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = s.reply(conn, responseFrame(s.confineBudget(request.Request.Args)))
 		return
 	}
-	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" {
+	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" || verb == "confine-resize" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}
