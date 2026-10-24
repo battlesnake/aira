@@ -101,7 +101,10 @@ func resizeRunningConfineLocked(queue *sliceQueue, selector string, newReserve i
 	}
 	target := matches[0]
 	name, _, _, owner, parsed := runner.ParseConfineScopeID(target.scopeID)
-	if target.isSubReservation() || !parsed || runner.IsAitestWorkerScopeName(name) || strings.Contains(target.scopeID, "/") {
+	if !parsed {
+		return runner.ConfineResizeResult{}, 0, fmt.Errorf("%s: %q is not a decodable confine scope id, so there is no job to resize", runner.CodeConfineNotRunning, target.scopeID)
+	}
+	if target.isSubReservation() || runner.IsAitestWorkerScopeName(name) {
 		// Reached only by an explicit scope id. A sub-reservation or an aitest
 		// worker is an admitted job's internal progress; its charge follows its
 		// parent's, so resizing one alone would mean nothing.

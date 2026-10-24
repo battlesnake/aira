@@ -299,6 +299,55 @@ func TestConfineResizeIsRefusedInShimMode(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-312 — the PRODUCTION floor reader is wired. Every other resize
+// test injects the confineScopeUsage seam, so a slip that made the default reader
+// refuse every resize as "ci-shim" (or read the wrong directory) would leave the
+// suite green. Here the seam is nil, the mode is real, and the usage is a real
+// memory.current file under <slice>/.aira-<scope-id>: a resize at/above it
+// succeeds, a malformed file is refused as unevaluated, and a size below it is
+// refused as below-usage.
+func TestConfineResizeUsesTheRealScopeReaderInRealMode(t *testing.T) {
+	now := time.Unix(60600, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	if server.confineScopeUsage != nil || server.shimMode() {
+		t.Fatalf("fixture must be real mode with no usage seam (seam=%v shim=%v)", server.confineScopeUsage != nil, server.shimMode())
+	}
+	job := runningJob(1, "job", "s-1", 8*qGiB)
+	queue := queueOf(server, job)
+	slice := t.TempDir()
+	queue.path = slice
+	registerAdmitQueue(server, queue)
+	scopeDir := filepath.Join(slice, confineScopeDirName(job.scopeID))
+	if err := os.MkdirAll(scopeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	current := filepath.Join(scopeDir, "memory.current")
+	write := func(text string) {
+		t.Helper()
+		if err := os.WriteFile(current, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("garbage\n")
+	before := ledgerFingerprint(queue)
+	if _, _, err := server.resizeRunningConfine(slice, "job", "2G", "s-1", false); errorCode(err) != runner.CodeConfineResizeUsageUnevaluated || strings.Contains(err.Error(), "ci-shim") {
+		t.Fatalf("malformed memory.current err=%v, want %s (not the shim refusal)", err, runner.CodeConfineResizeUsageUnevaluated)
+	}
+	if ledgerFingerprint(queue) != before {
+		t.Fatal("a refused resize changed the ledger")
+	}
+
+	write(fmt.Sprintf("%d\n", 3*qGiB))
+	if _, _, err := server.resizeRunningConfine(slice, "job", "2G", "s-1", false); errorCode(err) != runner.CodeConfineResizeBelowUsage {
+		t.Fatalf("2G against 3G live err=%v, want %s", err, runner.CodeConfineResizeBelowUsage)
+	}
+	result, usage, err := server.resizeRunningConfine(slice, "job", "4G", "s-1", false)
+	if err != nil || usage != 3*qGiB || result.NewReserveBytes != 4*qGiB {
+		t.Fatalf("4G against 3G live: result=%+v usage=%d err=%v", result, usage, err)
+	}
+}
+
 // verifies: AIRA-312 — the default floor reader. It reads the scope's
 // memory.current with the existing reader; a measured 0 is a reading; a missing
 // scope, a missing file and a malformed value are each refused with a stated
