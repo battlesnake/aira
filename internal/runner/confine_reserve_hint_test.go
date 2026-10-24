@@ -18,10 +18,10 @@ func hintStatus() ConfineStatus {
 	}
 }
 
-// verifies: AIRA-310 -- the eligible baseline prints the owner's exact line shape.
+// verifies: AIRA-310 -- the eligible baseline prints the imperative line shape.
 func TestConfineReserveHintBaselineText(t *testing.T) {
 	got := formatConfineReserveHint(hintStatus(), 0, 4*hintGiB, false)
-	want := "confine: hint: peak 310M of 4096M reserved (7%); consider --memory-reserve 512M so more jobs fit"
+	want := "confine: ACTION REQUIRED: over-reserved -- this job peaked at 310M, only 7% of the 4096M you pinned, and the unused reserve was held against the shared slice and delays other jobs. Next run use --memory-reserve 512M, or drop --memory-reserve so aira sizes it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
 	if got != want {
 		t.Fatalf("hint = %q\nwant  %q", got, want)
 	}
@@ -34,7 +34,7 @@ func TestConfineReserveHintPercentNeverReads60(t *testing.T) {
 	// 3070M of 5120M is 59.96%: rounding to nearest would print "(60%)".
 	status.ReserveBytes, status.PeakRSS = 5*hintGiB, hintPeak(3070*hintMiB)
 	got := formatConfineReserveHint(status, 0, 5*hintGiB, false)
-	want := "confine: hint: peak 3070M of 5120M reserved (59%); consider --memory-reserve 4608M so more jobs fit"
+	want := "confine: ACTION REQUIRED: over-reserved -- this job peaked at 3070M, only 59% of the 5120M you pinned, and the unused reserve was held against the shared slice and delays other jobs. Next run use --memory-reserve 4608M, or drop --memory-reserve so aira sizes it from this command's history; also fix the script, Makefile or agent brief that pins 5120M"
 	if got != want {
 		t.Fatalf("hint = %q\nwant  %q", got, want)
 	}

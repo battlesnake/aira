@@ -62,7 +62,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 	// 2 GiB minimum and the 60% line, so ONLY the pinned-provenance gate can keep
 	// an unpinned run silent (build review P2: the 1 GiB default never reached it).
 	historyGrant := &admissionResult{state: "immediate", release: &confineCountingCloser{}, reserve: 4 << 30, basis: "estimate:history"}
-	const want = "confine: hint: peak 300M of 4096M reserved (7%); consider --memory-reserve 512M so more jobs fit"
+	const want = "confine: ACTION REQUIRED: over-reserved -- this job peaked at 300M, only 7% of the 4096M you pinned, and the unused reserve was held against the shared slice and delays other jobs. Next run use --memory-reserve 512M, or drop --memory-reserve so aira sizes it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
 
 	t.Run("pinned 4G hints on stderr only", func(t *testing.T) {
 		t.Setenv(ConfineNoHintsEnv, "")
@@ -81,7 +81,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 		if trailer < 0 || hint < 0 || hint < trailer {
 			t.Fatalf("want the hint line after the trailer on stderr; trailer@%d hint@%d stderr=%q", trailer, hint, stderr)
 		}
-		if strings.Count(stderr, "confine: hint:") != 1 {
+		if strings.Count(stderr, "confine: ACTION REQUIRED:") != 1 {
 			t.Fatalf("want exactly one hint line: %q", stderr)
 		}
 	})
@@ -101,7 +101,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 		if !strings.Contains(stderr, "reserve=4G") {
 			t.Fatalf("harness shape not reached: charged reserve is not the 4G grant: %q", stderr)
 		}
-		if strings.Contains(stderr, "confine: hint:") {
+		if strings.Contains(stderr, "confine: ACTION REQUIRED:") {
 			t.Fatalf("unpinned daemon-granted 4G hinted: %q", stderr)
 		}
 	})
@@ -113,7 +113,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 		if exit != 3 || !strings.Contains(stderr, "terminated-by=normal") {
 			t.Fatalf("harness shape not reached: exit=%d stderr=%q", exit, stderr)
 		}
-		if strings.Contains(stderr, "confine: hint:") {
+		if strings.Contains(stderr, "confine: ACTION REQUIRED:") {
 			t.Fatalf("failed job hinted: %q", stderr)
 		}
 	})
@@ -123,7 +123,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 		t.Setenv(ConfineNoHintsEnv, "")
 		in := pinned4G
 		in.fromEnv = true
-		if _, stderr, _ := run(t, in); strings.Contains(stderr, "confine: hint:") {
+		if _, stderr, _ := run(t, in); strings.Contains(stderr, "confine: ACTION REQUIRED:") {
 			t.Fatalf("env-pinned run hinted: %q", stderr)
 		}
 	})
@@ -141,13 +141,13 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 		if exit != 0 || !strings.Contains(stderr, "container="+ContainerPlacementDockerNotContained) {
 			t.Fatalf("harness shape not reached: exit=%d stderr=%q", exit, stderr)
 		}
-		if strings.Contains(stderr, "confine: hint:") {
+		if strings.Contains(stderr, "confine: ACTION REQUIRED:") {
 			t.Fatalf("docker run hinted: %q", stderr)
 		}
 	})
 	t.Run("opt-out silences it", func(t *testing.T) {
 		t.Setenv(ConfineNoHintsEnv, "1")
-		if _, stderr, _ := run(t, pinned4G); strings.Contains(stderr, "confine: hint:") {
+		if _, stderr, _ := run(t, pinned4G); strings.Contains(stderr, "confine: ACTION REQUIRED:") {
 			t.Fatalf("opted-out run printed a hint: %q", stderr)
 		}
 	})
