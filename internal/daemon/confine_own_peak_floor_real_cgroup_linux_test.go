@@ -34,6 +34,17 @@ const ownPeakFloorTargetBytes = int64(1181116006)
 //
 // verifies: AIRA-314 I1, T15
 func TestOwnPeakFloorRealCgroup(t *testing.T) {
+	// The fixture is calibrated to the ABSOLUTE 1 GiB unpinned default: the
+	// workload must need more than it, and a run at 1.15x its own peak must fit
+	// the 3 GiB fixture slice. The re-exec'd workload is this test binary, and
+	// under -race its touched pages carry race-detector shadow memory, which
+	// roughly doubles the measured peak (measured: a 1.1 GiB workload peaked at
+	// the 2 GiB pinned cap and was OOM-killed). The floor itself is covered
+	// under -race by the real-store unit tests (TestOwnPeakFloorTable and
+	// TestOwnPeakFloorWithNoReadablePrior, the RANT-55 replay).
+	if raceDetectorEnabled {
+		t.Skip("calibrated to absolute memory sizes; -race shadow memory distorts the workload's peak")
+	}
 	slice := newOOMSelfHealSlice(t)
 	paths := testPaths(t)
 	server := NewServer(paths)
