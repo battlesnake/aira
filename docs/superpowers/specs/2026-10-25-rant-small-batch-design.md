@@ -369,3 +369,73 @@ item-1 pytest run and the item-4 `-count=3` run above.
 - Item 2: an operator can see which project and which roots block an eject, and the one verb
   that clears it.
 - Item 6: over-pinned reservations are visible in the human table, using data already read.
+
+## 11. Build record (2026-10-25)
+
+The plan above served as the light-path plan section (scope, invariants, risks, tests,
+deferrals); no separate plan file was written.
+
+Deviations from the sketch, each within section 5's "the builder may restructure":
+
+- Item 5: the classifier reads all of stdin into a variable before looping. `read` drops a
+  final line with no trailing newline, which would let a code ref go unjudged; an empty
+  stdin becomes one empty line and is refused by the field check. The unused first field is
+  `_local_ref` (shellcheck clean). Extra cases beyond the table: `lookalike-tickets-sibling`
+  (`.aira/tickets-old/`), and four cases feeding the real hook crafted stdin
+  (`stdin-empty`, `stdin-unterminated-last-line`, `stdin-extra-field`, and the
+  `stdin-docs-control` that shows the same well-formed line alone does skip). The
+  two-ref helper gives every branch a `docs/` file of its own: a code-only branch is
+  already refused by the empty-path-set check, which hid a classifier judging only the
+  last ref line (measured: that mutation survived until the fixture changed). git orders
+  the ref lines itself, so `two-refs-code-docs` names the code branch to sort first.
+  `TestMakefileTestStoreTargetRunsTheStoreTests` (`make -n test-store`) pins the target
+  the tickets tier calls. `docs/dev/agentic-development-loop.md` and `docs/dev/tooling.md`
+  described the old always-full hook and now describe the two tiers.
+- Item 2: both ejects in T2a/T2b pass `force: true` (the partial-roots check runs before
+  the force test, so force does not mask it, and it keeps the post-remedy eject free of
+  unrelated live-state refusals). T2a asserts the exact
+  `missing: <root>; present: <root>. ` substring.
+
+Mutation runs (each: apply, run the named tests, restore; runner under `~/tmp`, not
+committed). Every mutation turned at least one new test red, except as noted:
+
+| Item | Mutation | Red tests |
+|---|---|---|
+| 1 | drop `option.collectonly or` | T1a |
+| 1 | drop the `testsfailed` clause | T1b |
+| 1 | revert the `collection_errors +` carry | T1c |
+| 1 | return None on any `testsfailed` regardless of the flag | T1c |
+| 2 | restore the old message | T2a, T2b |
+| 2 | drop the present-roots list | T2a |
+| 2 | `Rebuild` skips `markWorktreeActive` | T2b |
+| 4 | the confine-reserve hold returns at `time.After(maxWait)` | T4 |
+| 6 | nil peak renders `0` | T6a, T6b |
+| 6 | peak clamped to RESERVE | T6a |
+| 6 | PEAK cell shows RSS | T6a, T6b |
+| 6 | no PEAK column (the pre-fix code) | T6a, T6b |
+| 5 | hook always runs ci (also the pre-fix hook) | docs-add, docs-delete, docs-rename-within, tickets, docs+tickets, two-refs-docs, head-refspec, stdin-docs-control |
+| 5 | tickets tier sent to skip / to ci | tickets, docs+tickets (both) |
+| 5 | match `.aira/` instead of `.aira/tickets/` | aira-config, lookalike-tickets-sibling |
+| 5 | classify only the first path | docs+code, rename-into-docs, code-then-docs, stale-origin-master |
+| 5 | allowlist `*.md` | root-md, lookalike-docsx, -Docs, -nested-docs, -tickets-sibling |
+| 5 | `docs*` / `[dD]ocs/` / `*docs/` prefix | lookalike-docsx + file-named-docs / lookalike-Docs / lookalike-nested-docs |
+| 5 | porcelain `git diff --name-only` | rename-into-docs |
+| 5 | ignore deletions (`--diff-filter=d`) | docs-delete, rename-into-docs |
+| 5 | diff only `<local>^..<local>` | code-then-docs, stale-origin-master |
+| 5 | unresolvable base treated as docs | no-origin-master |
+| 5 | orphan diffed against the empty tree | orphan |
+| 5 | empty path set treated as docs | empty-diff |
+| 5 | drop the `refs/heads/` check | lightweight-tag |
+| 5 | drop `refs/heads/` and the commit-type check | lightweight-tag, annotated-tag |
+| 5 | deletion treated as nothing to check (zero check, type check and merge-base failure all bypassed) | ref-delete, orphan |
+| 5 | classify only the first ref / only the last ref | two-refs-docs-code (+ stdin-unterminated-last-line) / two-refs-code-docs |
+| 5 | require exactly one ref | two-refs-docs |
+| 5 | key eligibility on the local ref name | head-refspec |
+| 5 | read stdin directly (no full read) | stdin-unterminated-last-line |
+| 5 | read stdin directly and drop the `refs > 0` check | stdin-empty, stdin-unterminated-last-line |
+| 5 | accept an extra field | stdin-extra-field |
+
+Survivor, expected: dropping only the all-zero check leaves every test green, because
+`git cat-file -t 000…` fails and the type check refuses the deletion anyway (defence in
+depth; the zero check is kept as I5 lists it, and the combined mutation above shows the
+ref-delete case does guard the property).
