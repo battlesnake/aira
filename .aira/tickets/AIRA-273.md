@@ -30,3 +30,6 @@ A alone does not stop the restart cycle (4); B alone still costs ~8 kills per le
 - fastest-ee's pin landed as fastest-ee #1630 (`3261ae022`): the Makefile's `SG_RESERVE.mechanical-lint := 1G` reaches `aira confine` through `scripts/sg_confine.sh`'s new optional 4th argument. The Makefile comment names the measurement and this reproduction.
 - REPRODUCTION of the big mode: `make sg-mechanical-lint BASE=46281aaba…` (in fastest-ee) → measured peak 417–426 MiB. Use it as the replay case when choosing between A / A+B.
 - WHEN A+B SHIP: tell qual, so the 1G pin can be re-evaluated (and removed, if the estimator now learns the big mode in ≤1 kill and keeps it).
+
+## Third instance (RANT-54, 2026-10-24, flavour-kernel; triage 2026-10-25)
+`cargo clippy -p fk-fixtures --all-targets`: estimate from three small warm-cache samples, then OOM-killed at 1.15x that max, escalating 1.5x per kill (80M -> 121M ...), ~5 kills to reach ~650M. Same censored-kill creep. Option A (escalation = max(1.5 x MaxOOMPeak, p90-prior)) would cut it to one kill but only helps once AIRA-314 fix 2 makes the p90 prior reliably readable. Still held: clearing it is the owner's call.

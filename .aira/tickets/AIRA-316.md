@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-316","project":"aira","title":"aira projects: read-only listing of projects, prefixes and worktree-root state (RANT-45)","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":"later","labels":[],"hold":true,"relations":[]}
+---
+Held capture from the 2026-10-25 triage. No read-only way to see who owns a prefix or to diagnose E_EJECT_UNVERIFIED without reading state.db. The small batch (v0.40) makes the eject error itself name the project and the missing/present roots, which answers the reported question. This verb would go through the daemon (it owns state.db): rows with project_id, slug, common_dir, prefixes[{prefix,kind}], worktrees[{id,root,root_state: present|missing|unevaluated}] (unevaluated for any stat error other than ENOENT); optional --prefix filter. Costs a dispatch entry, MCP schema, skill action count and codes surface for one report that had a workaround; build only if a second need appears.
