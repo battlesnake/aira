@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-314","project":"aira","title":"Admission reserve ignores a command's own recorded peak below 3 samples; machine-wide p90 prior read times out (RANT-52/55, RANT-54 note)","status":"in-progress","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[{"kind":"relates","from":"AIRA-318","to":"AIRA-314"}]}
+{"schema":1,"id":"AIRA-314","project":"aira","title":"Admission reserve ignores a command's own recorded peak below 3 samples: floor the unpinned reserve at the own clean peak (fix 1 only; p90 prior read split to AIRA-320) (RANT-52/55, RANT-54 note)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[{"kind":"relates","from":"AIRA-318","to":"AIRA-314"},{"kind":"relates","from":"AIRA-320","to":"AIRA-314"}]}
 ---
 From the 2026-10-25 rant triage; verified by the investigator against admit.go.
 
@@ -16,3 +16,9 @@ Correctness-critical (admission ledger): two-loop. Daemon-side change: shared-da
 ## Build note 2026-10-25: fix 2 deferred
 
 Built: fix 1 only (the own clean peak floor, `estimate:own-max=<peak>,n=<samples>,f=115`, at every sample count, never ceiling-fitted), per spec `docs/superpowers/specs/2026-10-25-own-peak-floor-design.md` revision 3. Fix 2 (covering `(kind, signature, peak_rss)` index and keep-last-good p90 cache) is NOT built: making the p90 rung reliable raises ~96k signatures' cold-start reserves from the 1 GiB default to ~1.71 GiB, which pre-empts the owner's held AIRA-317(2) decision (keep or delete the p90 rung). If the answer is keep, build spec Appendix A as its own change; if delete, Appendix A is moot. Measurements recorded on AIRA-246 and AIRA-242.
+
+## Closing note 2026-10-26: scope as shipped
+
+This ticket closes with fix 1 only (the own clean peak floor). The "Fix 2" paragraph above is the original triage scope, not what shipped: fix 2 (covering p90 index plus keep-last-good cache) is split to held AIRA-320, blocked by the owner's AIRA-317 decision on the p90 rung. The "AIRA-273 option A is worthless until fix 2" remark therefore still stands.
+
+Cutover note: the end-to-end test T15 (`TestOwnPeakFloorRealCgroup`, the RANT-55 shape on a real cgroup) runs only without `-race` and skips where cgroup delegation is absent; under `-race` the floor is covered by T1, T5, T8 and T9. Run T15 by hand, without `-race`, on the box before the daemon cutover.
