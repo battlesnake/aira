@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/app"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
@@ -181,5 +182,29 @@ func TestRelayedBindingMustDescribeTheRequestedWrite(t *testing.T) {
 		if err := validateRelayedWorktreeBinding(bad, input, "w"); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+// TestWorktreeRegisterOwnerIgnoresClaudeSession pins AIRA-313's boundary: the
+// Claude Code session step belongs to the CONFINE owner chain only. A worktree
+// binding is per checkout by design (AIRA-176), so with CLAUDE_CODE_SESSION_ID
+// set, `worktree register` still records the worktree id of the scope root.
+//
+// verifies: AIRA-313
+func TestWorktreeRegisterOwnerIgnoresClaudeSession(t *testing.T) {
+	t.Setenv("AIRA_CONFINE_OWNER", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", testClaudeSessionX)
+	root := t.TempDir()
+	makeConfineTestProject(t, root)
+	project, err := app.Discover(context.Background(), root)
+	if err != nil || project.WorktreeID == "" {
+		t.Fatalf("discover: %+v err=%v", project, err)
+	}
+	request := core.Request{Verb: "worktree-register", Args: map[string]any{"selector": "AIRA-1"}}
+	if err := stampWorktreeOwner(context.Background(), daemon.WorktreeScope{Root: root}, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["owner"] != project.WorktreeID {
+		t.Fatalf("owner=%v, want the worktree id %q (never the Claude Code session)", request.Args["owner"], project.WorktreeID)
 	}
 }

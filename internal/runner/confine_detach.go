@@ -331,8 +331,10 @@ func ResolveConfineDetachStatus(records []ConfineDetachRecord, selector, callerO
 	}
 	if len(matches) == 0 {
 		if foreign > 0 {
+			// Never suggest --owner here (AIRA-313): the remedy must not be "copy the
+			// other owner's identity", only "name the scope id" or "be the launcher".
 			return ConfineDetachStatus{}, fmt.Errorf(
-				"%s: selector %q matched no detached confine record for owner %q (%d matched other owners; name the scope id, or pass --owner)",
+				"%s: selector %q matched no detached confine record for owner %q (%d matched other owners; name the scope id, or run this from the session, or with the AIRA_CONFINE_OWNER name, that launched it)",
 				CodeConfineNotFound, selector, callerOwner, foreign)
 		}
 		return ConfineDetachStatus{}, fmt.Errorf("%s: selector %q matched no detached confine record", CodeConfineNotFound, selector)

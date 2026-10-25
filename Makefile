@@ -5,7 +5,7 @@ GO ?= go
 GO_BIN := $(shell $(GO) env GOROOT 2>/dev/null)/bin
 export PATH := $(GO_BIN):$(HOME)/.local/bin:$(PATH)
 
-.PHONY: fmt fmt-check vet lint build dist test race cover fuzz tidy ci install-hooks claude-mod-check
+.PHONY: fmt fmt-check vet lint build dist test test-store race cover fuzz tidy ci install-hooks claude-mod-check
 
 # AIRA-205. The file set every gofmt-driving target shares, defined ONCE. It was
 # previously spelled out at three sites, and a nested-worktree exclusion added to
@@ -78,6 +78,12 @@ dist:
 # exist to produce. -race multiplies both the run time and the backstops.
 test:
 	$(GO) test ./... -count=1 -timeout 20m
+
+# AIRA-315. Called by .githooks/pre-push when every pushed path is under docs/
+# or .aira/tickets/: internal/store is the package that parses the repository's
+# own ticket files (TestTheRepositorysOwnTicketFilesAreReadable).
+test-store:
+	$(GO) test ./internal/store -count=1 -timeout 20m
 
 race:
 	$(GO) test ./... -race -count=1 -timeout 40m

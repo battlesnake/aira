@@ -7,7 +7,8 @@ The repository Makefile contains the common local and CI commands:
 `make build`, `make test`, `make race`, and `make cover` run the corresponding
 verification or build task. `make tidy` updates module metadata, and `make ci`
 runs formatting checks, vet, build, tests, and `make claude-mod-check`.
-`make claude-mod-check` validates and tests the embedded Claude Code usage mod
+`make test-store` runs only the `internal/store` tests (the pre-push hook's
+tickets-only tier). `make claude-mod-check` validates and tests the embedded Claude Code usage mod
 on a copy under `~/tmp` (it reports UNEVALUATED when no capable `claude` CLI is
 installed). `make dist` builds the static linux amd64 and arm64 release binaries
 with SHA-256 sums into `dist/`.

@@ -829,6 +829,59 @@ func InferConfineOwner(cwd string) string {
 	return inferred
 }
 
+// ConfineSessionOwnerPrefix marks an owner derived from a Claude Code session
+// id (AIRA-313): "cc-" followed by the canonical lowercase UUID the harness
+// puts in CLAUDE_CODE_SESSION_ID. 39 bytes, inside maxConfineOwnerLen and the
+// identity alphabet, and with no '@', so it is an ATTESTED owner.
+const ConfineSessionOwnerPrefix = "cc-"
+
+// ConfineSessionOwner maps a raw CLAUDE_CODE_SESSION_ID value to the confine
+// owner for that session (AIRA-313). The value is trimmed of surrounding
+// whitespace and must then be exactly a canonical lowercase UUID; anything else
+// (empty, whitespace inside, the wrong case or length, path or '@' characters)
+// returns ok=false so the caller's owner chain continues unchanged. It never
+// errors: a harness variable AIRA does not recognise is not the caller's fault.
+//
+// The session, not the directory, is the identity because an agent's cwd is
+// not stable (subagent Bash calls reset it; sessions move between worktrees),
+// while subagents inherit their parent's session id.
+func ConfineSessionOwner(raw string) (string, bool) {
+	id := strings.TrimSpace(raw)
+	if !isCanonicalLowerUUID(id) {
+		return "", false
+	}
+	return ConfineSessionOwnerPrefix + id, true
+}
+
+// IsConfineSessionOwner reports whether owner is exactly a Claude Code session
+// owner ("cc-" + a canonical lowercase UUID). A human-chosen owner that merely
+// starts with "cc-" (e.g. "cc-deploy") is not one.
+func IsConfineSessionOwner(owner string) bool {
+	id, ok := strings.CutPrefix(owner, ConfineSessionOwnerPrefix)
+	return ok && isCanonicalLowerUUID(id)
+}
+
+// isCanonicalLowerUUID accepts only the 8-4-4-4-12 lowercase-hex form.
+func isCanonicalLowerUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // ConfineOwnerIsAttested reports whether owner is an identity its holder
 // actually claimed, and is therefore usable as the kill guard's ownership
 // proof. An empty owner, the literal "unknown", and any inferred owner are all

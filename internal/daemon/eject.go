@@ -166,12 +166,12 @@ func (s *Server) endProjectUse(projectID string) {
 
 func (s *Server) verifyEjectDurability(ctx context.Context, target store.ProjectRegistration, skipDurabilityCheck bool) ([]string, bool, error) {
 	roots := make([]string, 0, len(target.Worktrees))
-	missing := 0
+	var missing []string
 	for _, worktree := range target.Worktrees {
 		root := filepath.Clean(worktree.Root)
 		info, err := os.Stat(root)
 		if errors.Is(err, os.ErrNotExist) {
-			missing++
+			missing = append(missing, root)
 			continue
 		}
 		if err != nil {
@@ -182,11 +182,19 @@ func (s *Server) verifyEjectDurability(ctx context.Context, target store.Project
 		}
 		roots = append(roots, root)
 	}
-	if len(target.Worktrees) == 0 || missing == len(target.Worktrees) {
+	if len(target.Worktrees) == 0 || len(missing) == len(target.Worktrees) {
 		return roots, true, nil
 	}
-	if missing != 0 {
-		return nil, false, errors.New("E_EJECT_UNVERIFIED: only some registered worktree roots are available")
+	if len(missing) != 0 {
+		// AIRA-315 (RANT-45): name the project and both root lists, so an
+		// operator can tell a forgotten scratch project from a live one with one
+		// removed checkout. The remedy is the verb that always rebuilds: `aira
+		// check` runs Store.Rebuild, which marks a root whose directory is gone
+		// inactive, and only active roots are registered (pinned by
+		// TestEjectPartialRootsRemedyInTheMessageWorks). Plain `aira reconcile`
+		// rebuilds only with --rebuild.
+		return nil, false, fmt.Errorf("E_EJECT_UNVERIFIED: project %s (%s): %d of %d registered worktree roots are missing: %s; present: %s. Run 'aira check' in a present worktree to retire the missing roots, then eject again",
+			target.Slug, target.ProjectID, len(missing), len(target.Worktrees), strings.Join(missing, ", "), strings.Join(roots, ", "))
 	}
 	for _, root := range roots {
 		project, err := app.Discover(ctx, root)

@@ -1393,3 +1393,63 @@ func TestSkillAndSummaryStateTheResizeCaveats(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-313 -- the skill teaches the new default confine owner (the
+// Claude Code session, shared by subagents), its consequences (parallel
+// subagents are one owner, so distinct --name values; /clear and /resume change
+// the id; the MCP server keeps its spawn-time id), the unchanged @-rule, and how
+// to end a QUEUED job only when its owner is yours; the stale "set
+// AIRA_CONFINE_OWNER to get an attested owner" sentence is gone; the generated
+// owner flag help names the session default, and worktree register's says it
+// never uses the session.
+func TestSkillTeachesTheClaudeSessionConfineOwner(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"else your Claude Code session (`cc-<session id>`, shared by your subagents",
+			"else the git worktree of the CURRENT directory, else an inferred `@cwd-...` owner",
+			"Parallel subagents of one conversation are ONE owner",
+			"give every job a distinct `--name`",
+			"`/clear` and `/resume` change this session's id",
+			"The `aira` MCP server keeps the id it was started with",
+			"never counts as ownership, so killing such a job always needs `--steal` even from the same directory",
+			"a job still waiting for admission gives `E_CONFINE_NOT_FOUND`",
+			"Only when that queued row's OWNER is yours",
+			"bypasses the ownership guard",
+			"`aira top` shows it on the greyed queued row, and `aira confine --list --json` carries it as `queued[].owner` with the supervisor pid as `queued[].supervisor_pid`; the plain `--list` table lists running jobs only",
+			"back to the default owner (your Claude Code session, else the worktree)",
+			"prefer the CLI face (Bash) for confine management then, or restart the MCP connection",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not teach %q", name, want)
+			}
+		}
+		for _, stale := range []string{
+			"Set `AIRA_CONFINE_OWNER` to get a real, attested owner you can kill without `--steal`.",
+			"gives it a NEW session id",
+			"`aira confine --list` shows it, `--list --json` carries it as `queued[].owner`",
+			"back to unowned",
+		} {
+			if strings.Contains(text, stale) {
+				t.Fatalf("%s still says %q", name, stale)
+			}
+		}
+	}
+	help := map[string]string{}
+	for _, descriptor := range New(nil).DispatchDescriptors() {
+		for _, arg := range descriptor.Args {
+			if arg.Name == "owner" {
+				help[descriptor.Name] = arg.Description
+			}
+		}
+	}
+	if !strings.Contains(help["confine"], "default: your Claude Code session (cc-<session id>), else the worktree of the current directory") {
+		t.Fatalf("confine --owner help %q does not name the session default", help["confine"])
+	}
+	if !strings.Contains(help["worktree-register"], "never the Claude Code session") {
+		t.Fatalf("worktree register --owner help %q does not say it never uses the session", help["worktree-register"])
+	}
+}

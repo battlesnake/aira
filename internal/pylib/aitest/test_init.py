@@ -297,3 +297,80 @@ def test_unevaluated_count_reaches_the_terminal_summary_from_a_real_session(pyte
     result = pytester.runpytest("--aitest-workers=1")
 
     result.stdout.fnmatch_lines(["*1 result this run is UNEVALUATED*"])
+
+
+def _recording_fake_run(monkeypatch, outcome="passed"):
+    """Stub Supervisor.run (in-process pytester session, so the monkeypatch
+    crosses into it) and record every call: AIRA-315's tests need to know
+    whether the pool ran at all, not only what it reported."""
+    from aitest.supervisor import Supervisor
+
+    calls = []
+
+    def fake_run(self, estimated_bytes, worker_count=1, max_wait="30s"):
+        calls.append(sorted(self.items_by_nodeid))
+        return {nodeid: outcome for nodeid in self.items_by_nodeid}
+
+    monkeypatch.setattr(Supervisor, "run", fake_run)
+    return calls
+
+
+_BROKEN_MODULE = """
+    import a_module_that_does_not_exist_aira315
+    def test_never():
+        assert True
+"""
+
+
+def test_collect_only_hands_back_to_pytest_and_never_runs_the_pool(pytester, monkeypatch):
+    """AIRA-315 (RANT-41): --collect-only must stay pytest's own collect-only
+    under --aitest-workers -- the pool never runs and pytest's listing and exit
+    code stand."""
+    pytester.makeconftest('pytest_plugins = ("aitest",)')
+    pytester.makepyfile(test_ok="""
+        def test_one():
+            assert True
+    """)
+    calls = _recording_fake_run(monkeypatch)
+
+    result = pytester.runpytest("--aitest-workers=1", "--collect-only", "-q")
+
+    assert calls == [], "the aitest pool ran under --collect-only"
+    assert result.ret == 0, result.stdout.str()
+    result.stdout.fnmatch_lines(["*test_ok.py::test_one*"])
+
+
+def test_collection_error_interrupts_before_the_pool_runs(pytester, monkeypatch):
+    """AIRA-315 (RANT-41): a module that fails to import stops the run exactly
+    as plain pytest does (Interrupted, exit 2) instead of the pool running
+    everything else."""
+    pytester.makeconftest('pytest_plugins = ("aitest",)')
+    pytester.makepyfile(test_ok="""
+        def test_one():
+            assert True
+    """, test_bad=_BROKEN_MODULE)
+    calls = _recording_fake_run(monkeypatch)
+
+    result = pytester.runpytest("--aitest-workers=1")
+
+    assert calls == [], "the aitest pool ran past a collection error"
+    assert result.ret == pytest.ExitCode.INTERRUPTED, result.stdout.str()
+    result.stdout.fnmatch_lines(["*error during collection*"])
+
+
+def test_continue_on_collection_errors_runs_the_pool_and_keeps_the_error_in_the_exit_code(pytester, monkeypatch):
+    """AIRA-315: with --continue-on-collection-errors the pool runs, and the
+    collection error still makes the exit code nonzero. Before the fix aitest
+    overwrote session.testsfailed with the pool's own count and a run with a
+    broken module and otherwise green tests exited 0 -- a false pass."""
+    pytester.makeconftest('pytest_plugins = ("aitest",)')
+    pytester.makepyfile(test_ok="""
+        def test_one():
+            assert True
+    """, test_bad=_BROKEN_MODULE)
+    calls = _recording_fake_run(monkeypatch, outcome="passed")
+
+    result = pytester.runpytest("--aitest-workers=1", "--continue-on-collection-errors")
+
+    assert calls == [["test_ok.py::test_one"]], calls
+    assert result.ret == pytest.ExitCode.TESTS_FAILED, result.stdout.str()
