@@ -63,8 +63,12 @@ The close path is `aira mv <id> in-progress`, then `in-review`, then `done`, in
 that order. A ticket file's `status` is never hand-edited. A refused transition
 (`E_TRANSITION_INVALID`) names the legal next statuses from where the ticket is.
 
-The pre-push hook runs the full `make ci` on every push, docs-only pushes
-included, because tests read repository content files.
+The pre-push hook runs the full `make ci` on every push except two proven
+cases (AIRA-315): when every pushed path, measured from the merge-base with
+`origin/master`, is under `docs/` it skips `make ci`; when every path is under
+`docs/` or `.aira/tickets/` it runs only `make test-store` (the package that
+parses the repository's own tickets). Any doubt (a tag, a deletion, a missing
+`origin/master`, any other path) runs the full `make ci`.
 
 ## Lighter path for trivial changes
 
