@@ -327,14 +327,10 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 	}
 
 	binary := filepath.Join(t.TempDir(), "aira")
-	// aira confine -- wraps this build, per this plan's own Global
-	// Constraints ("every go build/go test ... MUST be prefixed with aira
-	// confine --"). It nests under the confinement the outer `aira confine
-	// -- go test ...` invocation (Step 2/4/5's Run: lines) already applies
-	// to this whole test binary -- a normal, supported nested scope, not a
-	// circular dependency: this is the machine's already-installed `aira`
-	// on PATH wrapping a build of a FRESH `aira` binary into a temp dir.
-	build := exec.Command("aira", "confine", "--", "go", "build", "-o", binary, "aira/cmd/aira")
+	// A plain build: it runs inside the outer `aira confine -- go test` scope and
+	// is charged to it (AIRA-315; a nested confine queued for its own admission
+	// with no time limit inside the package's go-test timeout).
+	build := exec.Command("go", "build", "-o", binary, "aira/cmd/aira")
 	if buildOutput, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build aira binary: %v\n%s", err, buildOutput)
 	}
