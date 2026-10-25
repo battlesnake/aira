@@ -283,6 +283,12 @@ type PeakRSSStats struct {
 	PeakMax     int64
 	OOMCount    int
 	MaxOOMPeak  int64
+	// MaxCleanPeak is the largest known peak among CLEAN (non-OOM) rows, 0 when
+	// there is none. PeakMax spans OOM rows too, so it cannot stand in for this:
+	// a clean peak can sit beside a larger OOM peak. Filled only by the confine
+	// peak-history reader, where it floors an unpinned admission reserve
+	// (AIRA-314); every other producer leaves it 0.
+	MaxCleanPeak int64
 }
 
 type PeakRSSHistorian interface {

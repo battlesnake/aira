@@ -181,9 +181,10 @@ func (db *DB) ResourcePeakHistory(ctx context.Context, kind ResourcePeakKind, si
  COALESCE(SUM(CASE WHEN peak_rss>0 THEN 1 ELSE 0 END),0),
  COALESCE(MAX(CASE WHEN peak_rss>0 THEN peak_rss END),0),
  COALESCE(SUM(CASE WHEN oom=1 THEN 1 ELSE 0 END),0),
- COALESCE(MAX(CASE WHEN oom=1 AND peak_rss>0 THEN peak_rss END),0)
+ COALESCE(MAX(CASE WHEN oom=1 AND peak_rss>0 THEN peak_rss END),0),
+ COALESCE(MAX(CASE WHEN oom=0 AND peak_rss>0 THEN peak_rss END),0)
 FROM confine_peak_history WHERE kind=? AND signature=?`, string(kind), signature).Scan(
-		&stats.TotalCount, &stats.SampleCount, &stats.PeakMax, &stats.OOMCount, &stats.MaxOOMPeak)
+		&stats.TotalCount, &stats.SampleCount, &stats.PeakMax, &stats.OOMCount, &stats.MaxOOMPeak, &stats.MaxCleanPeak)
 	if err != nil {
 		return runner.PeakRSSStats{}, translateDBError(err)
 	}
