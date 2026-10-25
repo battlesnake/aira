@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-317","project":"aira","title":"Owner decision: admission charging for pinned reserves, the machine-wide p90 prior, and queued-wait top-holder line (RANT-47)","status":"planned","kind":"spike","severity":"P2","assignee":null,"milestone":"later","labels":[],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-317","project":"aira","title":"Owner decision: admission charging for pinned reserves, the machine-wide p90 prior, and queued-wait top-holder line (RANT-47)","status":"planned","kind":"spike","severity":"P2","assignee":null,"milestone":"later","labels":[],"hold":true,"relations":[{"kind":"blocks","from":"AIRA-317","to":"AIRA-320"}]}
 ---
 Held capture from the 2026-10-25 triage; changes what admission charges, so owner sign-off first.
 (1) Live (track-actual) charge for client-PINNED reserves: reverses the owner-signed admission-counter spec (S1 deleted the AIRA-29 live charge). Recommendation: reject; AIRA-312 --resize is the release valve for a stale pin. v0.40 adds a PEAK column to --list so over-pinning is visible.

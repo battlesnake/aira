@@ -1399,232 +1399,265 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	if request.pinned {
 		return request.reserve, "pinned:client"
 	}
-	// AIRA-153. ONE quantity governs every auto-sized value this function can
-	// place against `ceiling`: the largest reserve the slice can actually GRANT
-	// one job. `ceiling` is only the largest ADMISSIBLE one — the grant gate is
-	// strictly tighter (AIRA-150) — so anything AIRA sizes for ITSELF is bounded
-	// by `fit`, never by `ceiling`.
+	// AIRA-314. A command's own largest CLEAN recorded peak floors its unpinned
+	// reserve, at every sample count. The pre-AIRA-314 resolution runs unchanged
+	// inside the closure below, which hands back the per-signature stats its own
+	// read returned (own, left zero unless the read succeeded); the floor is ONE
+	// max() over the closure's result, so no return can escape it. It is applied
+	// AFTER the whole resolution, never inside the AIRA-153 fit or AIRA-151 clamp,
+	// so their guards (including the clamp's MaxOOMPeak < fit) see today's inputs.
 	//
-	// Three sites, below: the client's unpinned prior, the machine-wide p90
-	// prior, and AIRA-151's OOM-escalation clamp. `fit` is 0 when the slice is
-	// too small for any viable reserve, and every site then leaves the value
-	// alone so the existing terminal E_ADMIT_TOO_LARGE answers, naming both
-	// numbers.
-	fit := runner.SliceFittedReserve(ceiling)
+	// The floor is a MEASUREMENT, so it is never fitted to the slice: over the
+	// ceiling it is returned as is and admitConnection refuses it
+	// E_ADMIT_TOO_LARGE, exactly as an over-ceiling ordinary estimate is.
+	//
+	// The label names the term that acted (AIRA-149): the floor's own basis only
+	// when the floor STRICTLY raised the value (a tie keeps today's basis), with
+	// ,ceiling-fitted and ,ceiling-clamped dropped (the value is neither the fitted
+	// prior nor the clamp), and ,oom-on-record under exactly the OOM branch's own
+	// entry condition, so nothing outside that branch names an OOM record.
+	var own runner.PeakRSSStats
+	reserve, basis := func() (int64, string) {
+		// AIRA-153. ONE quantity governs every auto-sized value this function can
+		// place against `ceiling`: the largest reserve the slice can actually GRANT
+		// one job. `ceiling` is only the largest ADMISSIBLE one — the grant gate is
+		// strictly tighter (AIRA-150) — so anything AIRA sizes for ITSELF is bounded
+		// by `fit`, never by `ceiling`.
+		//
+		// Three sites, below: the client's unpinned prior, the machine-wide p90
+		// prior, and AIRA-151's OOM-escalation clamp. `fit` is 0 when the slice is
+		// too small for any viable reserve, and every site then leaves the value
+		// alone so the existing terminal E_ADMIT_TOO_LARGE answers, naming both
+		// numbers.
+		fit := runner.SliceFittedReserve(ceiling)
 
-	// SITE 1 — the client's unpinned prior. runner.ResolveConfineReserve hands
-	// the daemon a compiled-in constant with no relationship to this command or
-	// to this slice, and that function is pure and portable precisely so the
-	// reserve decision has ONE home (AIRA-62); the daemon is the only party that
-	// knows the ceiling, so the bounding happens here.
-	//
-	// GATED on `>= ceiling`: only a prior that is REFUSED today (`>`), or that
-	// lands exactly on the ungrantable ceiling (`==`, AIRA-150 route 3), is
-	// touched. Where the default already fits and is already granted, this
-	// function returns byte-for-byte what it returns today — lowering a working
-	// job's kernel-enforced memory.max by 13% would be silent under-provisioning.
-	//
-	// Applied BEFORE anything reads `request.reserve`, which is load-bearing in
-	// two directions: all six sites that return the hint verbatim inherit it, and
-	// the OOM escalation's `escalated > reserve` comparison sees the fitted value
-	// as its FLOOR, so the escalation can still raise the reserve to whatever
-	// this command's own OOM evidence justifies. Fitting AFTER the resolution
-	// instead would let a blind prior beat an escalation the job's own kill
-	// earned, sizing the job BELOW what its own evidence says it needs.
-	//
-	// `request` is a value copy (see the signature), so this cannot escape.
-	fitted := ""
-	if fit > 0 && request.reserve >= ceiling {
-		request.reserve, fitted = fit, ",ceiling-fitted"
-	}
-	readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
-	defer cancel()
-	historyUnavailable := false
-	insufficientSamples := false
-	if request.signature != "" {
-		read := s.admitPeakHistory
-		if read == nil && s.db != nil {
-			read = s.db.ConfinePeakHistory
+		// SITE 1 — the client's unpinned prior. runner.ResolveConfineReserve hands
+		// the daemon a compiled-in constant with no relationship to this command or
+		// to this slice, and that function is pure and portable precisely so the
+		// reserve decision has ONE home (AIRA-62); the daemon is the only party that
+		// knows the ceiling, so the bounding happens here.
+		//
+		// GATED on `>= ceiling`: only a prior that is REFUSED today (`>`), or that
+		// lands exactly on the ungrantable ceiling (`==`, AIRA-150 route 3), is
+		// touched. Where the default already fits and is already granted, this
+		// function returns byte-for-byte what it returns today — lowering a working
+		// job's kernel-enforced memory.max by 13% would be silent under-provisioning.
+		//
+		// Applied BEFORE anything reads `request.reserve`, which is load-bearing in
+		// two directions: all six sites that return the hint verbatim inherit it, and
+		// the OOM escalation's `escalated > reserve` comparison sees the fitted value
+		// as its FLOOR, so the escalation can still raise the reserve to whatever
+		// this command's own OOM evidence justifies. Fitting AFTER the resolution
+		// instead would let a blind prior beat an escalation the job's own kill
+		// earned, sizing the job BELOW what its own evidence says it needs.
+		//
+		// `request` is a value copy (see the signature), so this cannot escape.
+		fitted := ""
+		if fit > 0 && request.reserve >= ceiling {
+			request.reserve, fitted = fit, ",ceiling-fitted"
 		}
-		if read != nil {
-			stats, err := read(readCtx, request.signature)
-			if err != nil {
-				// The read itself could not be established (timeout / DB error).
-				// Distinguish this from genuine absence of history so the basis is
-				// honest; the reserve value still falls back safely below.
-				historyUnavailable = true
-			} else {
-				reserve := request.reserve
-				ordinary := stats
-				ordinary.OOMCount = 0
-				// AIRA-149 (D4). The estimator's OWN basis is kept in BOTH arms. This
-				// local used to start at a hardcoded "fallback:insufficient-samples"
-				// that survived whenever ok == false, which is a false label the moment
-				// the real reason was something else (fallback:malformed, reachable
-				// through the injected history seam). The VALUE path is unchanged:
-				// reserve still moves only when the estimate is usable.
-				estimated, estimateUsable, basis := runner.EstimateMemoryReserve(ordinary, 0)
-				// AIRA-153. The fit token travels by PROVENANCE, never by comparing
-				// numbers: `suffix` carries it only while `reserve` still holds the
-				// fitted PRIOR, and is cleared the moment this command's own measured
-				// evidence takes over. An ORDINARY ESTIMATE is never fitted — over the
-				// ceiling it is refused terminally, naming both numbers, because a
-				// measurement may not be silently reduced to fit an established fact
-				// the way a guess may. (AIRA-149's rule: a label must name the term
-				// that acted, and two terms can coincide on a value.)
-				suffix := fitted
-				if estimateUsable {
-					reserve, suffix = estimated, ""
-				}
-				if stats.TotalCount > 0 {
-					// Some observations exist but did not yield a usable estimate
-					// (fewer than three usable samples): not genuine "no history".
-					insufficientSamples = true
-				}
-				if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
-					escalated := stats.MaxOOMPeak
-					if escalated > math.MaxInt64-escalated/2 {
-						escalated = math.MaxInt64
-					} else {
-						escalated += escalated / 2
+		readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
+		defer cancel()
+		historyUnavailable := false
+		insufficientSamples := false
+		if request.signature != "" {
+			read := s.admitPeakHistory
+			if read == nil && s.db != nil {
+				read = s.db.ConfinePeakHistory
+			}
+			if read != nil {
+				stats, err := read(readCtx, request.signature)
+				if err != nil {
+					// The read itself could not be established (timeout / DB error).
+					// Distinguish this from genuine absence of history so the basis is
+					// honest; the reserve value still falls back safely below.
+					historyUnavailable = true
+				} else {
+					own = stats
+					reserve := request.reserve
+					ordinary := stats
+					ordinary.OOMCount = 0
+					// AIRA-149 (D4). The estimator's OWN basis is kept in BOTH arms. This
+					// local used to start at a hardcoded "fallback:insufficient-samples"
+					// that survived whenever ok == false, which is a false label the moment
+					// the real reason was something else (fallback:malformed, reachable
+					// through the injected history seam). The VALUE path is unchanged:
+					// reserve still moves only when the estimate is usable.
+					estimated, estimateUsable, basis := runner.EstimateMemoryReserve(ordinary, 0)
+					// AIRA-153. The fit token travels by PROVENANCE, never by comparing
+					// numbers: `suffix` carries it only while `reserve` still holds the
+					// fitted PRIOR, and is cleared the moment this command's own measured
+					// evidence takes over. An ORDINARY ESTIMATE is never fitted — over the
+					// ceiling it is refused terminally, naming both numbers, because a
+					// measurement may not be silently reduced to fit an established fact
+					// the way a guess may. (AIRA-149's rule: a label must name the term
+					// that acted, and two terms can coincide on a value.)
+					suffix := fitted
+					if estimateUsable {
+						reserve, suffix = estimated, ""
 					}
-					// AIRA-149 (D1). reserve-basis names the provenance of the number
-					// actually RETURNED, not the branch that was entered.
-					//
-					// "estimate:oom-escalated" used to be returned unconditionally from
-					// here, which is true of exactly ONE of this branch's five outcomes.
-					// In the commonest state right after a first OOM -- one sample, so no
-					// usable ordinary estimate, and a 1.5x escalation far below the
-					// unpinned 1 GiB client default -- the value returned is the client's
-					// own default (or the ceiling it was clamped to), and nothing derived
-					// from the OOM peak appears in it.
-					//
-					// ",oom-on-record" is NOT decoration. "estimate:oom-escalated" carried
-					// two meanings welded together: ATTRIBUTION ("an OOM record for THIS
-					// signature was found and consulted") and PROVENANCE ("the number is
-					// 1.5x the OOM peak"). Only the provenance half was ever false, and the
-					// attribution half is load-bearing: AIRA-128's real-cgroup fixture uses
-					// it as the proof that a real kernel OOM travelled memory.events ->
-					// confine teardown -> RecordConfinePeak -> ConfinePeakHistory -> here.
-					// Reporting a bare fallback basis would have deleted a verified
-					// property while fixing a false one.
-					//
-					// The tie-break is stated rather than accidental: the escalation is
-					// deemed to have determined the value only when it STRICTLY raised it,
-					// which is the existing condition, unchanged. On an exact tie both
-					// terms produce the same number and the source basis is reported.
-					//
-					// The grammar is the existing one: family:name[:params] with
-					// COMMA-separated params, as estimate:max=%d,n=%d,f=115 already uses.
-					// No space, which the trailer's key=value field forbids.
-					oomBasis := basis + ",oom-on-record"
-					if escalated > reserve {
-						reserve = escalated
-						oomBasis = "estimate:oom-escalated"
-						// AIRA-151. The clamp lives INSIDE this branch, which is
-						// the whole change.
-						//
-						// An OOM observed at the present ceiling is genuinely too
-						// large. Earlier censored caps are allowed to climb to the
-						// ceiling so a runnable job is never permanently wedged.
-						//
-						// That justification is about a value DERIVED FROM THE OOM
-						// PEAK. It does not apply to the blind unpinned client
-						// default, nor to an ordinary peak-history estimate: for
-						// those the no-OOM path already refuses an over-ceiling
-						// value terminally with E_ADMIT_TOO_LARGE (the reserve >
-						// ceiling boundary in admitConnection), naming both
-						// numbers, and an OOM record must not make the same number
-						// behave differently. A clamped reserve is exactly the
-						// ENTRY ceiling, and such a reserve is grantable only while
-						// the slice's charge stays inside a band of one per-job
-						// headroom term per job the request entered behind --
-						// byte-exact zero when it entered an empty slice
-						// (AIRA-150) -- so what the clamp bought those rows was
-						// usually a wait that ends in a refusal anyway, not a run.
-						//
-						// Nesting rather than an escalationDetermined flag is
-						// deliberate: it makes "clamped without the escalation
-						// having set the value" unrepresentable rather than merely
-						// untrue, and keeps ONE condition governing both the basis
-						// and the value, so the label and the number can never
-						// disagree about which term acted. The comparison stays
-						// STRICT: on an exact tie the escalation raised nothing.
-						//
-						// SITE 3 — AIRA-153 retargets both halves of this clamp
-						// from `ceiling` to `fit`, and changes nothing else about
-						// it. The rule, the nesting, the strict tie-break and the
-						// STATIC ceiling (AIRA-103) are AIRA-151's, untouched; the
-						// condition to ENTER is still `reserve > ceiling`, so an
-						// escalation that lands in (fit, ceiling] is left exactly
-						// as it is — it is this command's own evidence and it is
-						// admissible.
-						//
-						// The TARGET moves because AIRA-151 kept this clamp so
-						// "earlier censored caps are allowed to climb ... so a
-						// runnable job is never permanently wedged", and a value
-						// equal to the entry ceiling is not one such a job can be
-						// GRANTED. Every clamped value is now simultaneously
-						// strictly above the OOM peak that produced it (the guard)
-						// and strictly below the ceiling by ~13% (the quantity), so
-						// the rung is a real one.
-						//
-						// The GUARD moves because a job OOM-killed AT a fitted cap
-						// records MaxOOMPeak ~= fit, and FIT(c)/c = 0.8696 lies
-						// inside the clamp band (2/3, 1) BY CONSTRUCTION. Left at
-						// `ceiling` it would clamp that job onto the ceiling every
-						// time, where it is ungrantable, so it waits out the default
-						// 30-minute window, is refused E_ADMIT_SATURATED ("owed a
-						// RETRY, nothing about the request is wrong"), never runs,
-						// and therefore records no new peak — a permanent wedge, not
-						// a rung. Its meaning is unchanged in words: an OOM already
-						// observed at or above what this slice can give is genuinely
-						// too large, so do not pretend otherwise.
-						if fit > 0 && stats.MaxOOMPeak < fit && reserve > ceiling {
-							reserve = fit
-							oomBasis += ",ceiling-clamped"
+					if stats.TotalCount > 0 {
+						// Some observations exist but did not yield a usable estimate
+						// (fewer than three usable samples): not genuine "no history".
+						insufficientSamples = true
+					}
+					if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
+						escalated := stats.MaxOOMPeak
+						if escalated > math.MaxInt64-escalated/2 {
+							escalated = math.MaxInt64
+						} else {
+							escalated += escalated / 2
 						}
-						return reserve, oomBasis
+						// AIRA-149 (D1). reserve-basis names the provenance of the number
+						// actually RETURNED, not the branch that was entered.
+						//
+						// "estimate:oom-escalated" used to be returned unconditionally from
+						// here, which is true of exactly ONE of this branch's five outcomes.
+						// In the commonest state right after a first OOM -- one sample, so no
+						// usable ordinary estimate, and a 1.5x escalation far below the
+						// unpinned 1 GiB client default -- the value returned is the client's
+						// own default (or the ceiling it was clamped to), and nothing derived
+						// from the OOM peak appears in it.
+						//
+						// ",oom-on-record" is NOT decoration. "estimate:oom-escalated" carried
+						// two meanings welded together: ATTRIBUTION ("an OOM record for THIS
+						// signature was found and consulted") and PROVENANCE ("the number is
+						// 1.5x the OOM peak"). Only the provenance half was ever false, and the
+						// attribution half is load-bearing: AIRA-128's real-cgroup fixture uses
+						// it as the proof that a real kernel OOM travelled memory.events ->
+						// confine teardown -> RecordConfinePeak -> ConfinePeakHistory -> here.
+						// Reporting a bare fallback basis would have deleted a verified
+						// property while fixing a false one.
+						//
+						// The tie-break is stated rather than accidental: the escalation is
+						// deemed to have determined the value only when it STRICTLY raised it,
+						// which is the existing condition, unchanged. On an exact tie both
+						// terms produce the same number and the source basis is reported.
+						//
+						// The grammar is the existing one: family:name[:params] with
+						// COMMA-separated params, as estimate:max=%d,n=%d,f=115 already uses.
+						// No space, which the trailer's key=value field forbids.
+						oomBasis := basis + ",oom-on-record"
+						if escalated > reserve {
+							reserve = escalated
+							oomBasis = "estimate:oom-escalated"
+							// AIRA-151. The clamp lives INSIDE this branch, which is
+							// the whole change.
+							//
+							// An OOM observed at the present ceiling is genuinely too
+							// large. Earlier censored caps are allowed to climb to the
+							// ceiling so a runnable job is never permanently wedged.
+							//
+							// That justification is about a value DERIVED FROM THE OOM
+							// PEAK. It does not apply to the blind unpinned client
+							// default, nor to an ordinary peak-history estimate: for
+							// those the no-OOM path already refuses an over-ceiling
+							// value terminally with E_ADMIT_TOO_LARGE (the reserve >
+							// ceiling boundary in admitConnection), naming both
+							// numbers, and an OOM record must not make the same number
+							// behave differently. A clamped reserve is exactly the
+							// ENTRY ceiling, and such a reserve is grantable only while
+							// the slice's charge stays inside a band of one per-job
+							// headroom term per job the request entered behind --
+							// byte-exact zero when it entered an empty slice
+							// (AIRA-150) -- so what the clamp bought those rows was
+							// usually a wait that ends in a refusal anyway, not a run.
+							//
+							// Nesting rather than an escalationDetermined flag is
+							// deliberate: it makes "clamped without the escalation
+							// having set the value" unrepresentable rather than merely
+							// untrue, and keeps ONE condition governing both the basis
+							// and the value, so the label and the number can never
+							// disagree about which term acted. The comparison stays
+							// STRICT: on an exact tie the escalation raised nothing.
+							//
+							// SITE 3 — AIRA-153 retargets both halves of this clamp
+							// from `ceiling` to `fit`, and changes nothing else about
+							// it. The rule, the nesting, the strict tie-break and the
+							// STATIC ceiling (AIRA-103) are AIRA-151's, untouched; the
+							// condition to ENTER is still `reserve > ceiling`, so an
+							// escalation that lands in (fit, ceiling] is left exactly
+							// as it is — it is this command's own evidence and it is
+							// admissible.
+							//
+							// The TARGET moves because AIRA-151 kept this clamp so
+							// "earlier censored caps are allowed to climb ... so a
+							// runnable job is never permanently wedged", and a value
+							// equal to the entry ceiling is not one such a job can be
+							// GRANTED. Every clamped value is now simultaneously
+							// strictly above the OOM peak that produced it (the guard)
+							// and strictly below the ceiling by ~13% (the quantity), so
+							// the rung is a real one.
+							//
+							// The GUARD moves because a job OOM-killed AT a fitted cap
+							// records MaxOOMPeak ~= fit, and FIT(c)/c = 0.8696 lies
+							// inside the clamp band (2/3, 1) BY CONSTRUCTION. Left at
+							// `ceiling` it would clamp that job onto the ceiling every
+							// time, where it is ungrantable, so it waits out the default
+							// 30-minute window, is refused E_ADMIT_SATURATED ("owed a
+							// RETRY, nothing about the request is wrong"), never runs,
+							// and therefore records no new peak — a permanent wedge, not
+							// a rung. Its meaning is unchanged in words: an OOM already
+							// observed at or above what this slice can give is genuinely
+							// too large, so do not pretend otherwise.
+							if fit > 0 && stats.MaxOOMPeak < fit && reserve > ceiling {
+								reserve = fit
+								oomBasis += ",ceiling-clamped"
+							}
+							return reserve, oomBasis
+						}
+						return reserve, oomBasis + suffix
 					}
-					return reserve, oomBasis + suffix
-				}
-				if stats.SampleCount >= 3 && reserve > 0 {
-					return reserve, basis + suffix
+					if stats.SampleCount >= 3 && reserve > 0 {
+						return reserve, basis + suffix
+					}
 				}
 			}
 		}
-	}
-	if peak, ok := s.cachedAdmitPeakP90(readCtx); ok {
-		stats := runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: peak}
-		if reserve, usable, _ := runner.EstimateMemoryReserve(stats, 0); usable {
-			// SITE 2 — AIRA-153. The p90 is a PRIOR about commands OTHER than this
-			// one — it is consulted precisely because this signature has no history
-			// — so it is bounded exactly as the client's default is, and only where
-			// it would otherwise be refused or land on the ceiling.
-			//
-			// Without this, AIRA-128's cold start (which the agent guide teaches as
-			// `estimate:p90-prior`) is still terminally refused on any slice whose
-			// ceiling is below the box's p90 — the ordinary shape of a small ci-shim
-			// budget beside a large aira.slice, since one machine-wide state.db
-			// serves both.
-			if fit > 0 && reserve >= ceiling {
-				return fit, "estimate:p90-prior,ceiling-fitted"
+		if peak, ok := s.cachedAdmitPeakP90(readCtx); ok {
+			stats := runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: peak}
+			if reserve, usable, _ := runner.EstimateMemoryReserve(stats, 0); usable {
+				// SITE 2 — AIRA-153. The p90 is a PRIOR about commands OTHER than this
+				// one — it is consulted precisely because this signature has no history
+				// — so it is bounded exactly as the client's default is, and only where
+				// it would otherwise be refused or land on the ceiling.
+				//
+				// Without this, AIRA-128's cold start (which the agent guide teaches as
+				// `estimate:p90-prior`) is still terminally refused on any slice whose
+				// ceiling is below the box's p90 — the ordinary shape of a small ci-shim
+				// budget beside a large aira.slice, since one machine-wide state.db
+				// serves both.
+				if fit > 0 && reserve >= ceiling {
+					return fit, "estimate:p90-prior,ceiling-fitted"
+				}
+				return reserve, "estimate:p90-prior"
 			}
-			return reserve, "estimate:p90-prior"
 		}
+		// The four post-block fallbacks each return the client's own hint verbatim,
+		// so each inherits SITE 1's fit and must name it (AIRA-153 §3.5).
+		if request.signature == "" {
+			return request.reserve, "fallback:no-signature" + fitted
+		}
+		if historyUnavailable {
+			return request.reserve, "fallback:history-unavailable" + fitted
+		}
+		if insufficientSamples {
+			return request.reserve, "fallback:insufficient-samples" + fitted
+		}
+		return request.reserve, "fallback:no-history" + fitted
+	}()
+	if own.MaxCleanPeak <= 0 {
+		return reserve, basis
 	}
-	// The four post-block fallbacks each return the client's own hint verbatim,
-	// so each inherits SITE 1's fit and must name it (AIRA-153 §3.5).
-	if request.signature == "" {
-		return request.reserve, "fallback:no-signature" + fitted
+	floor := runner.GrowByEstimatorMargin(own.MaxCleanPeak)
+	if floor <= reserve {
+		return reserve, basis
 	}
-	if historyUnavailable {
-		return request.reserve, "fallback:history-unavailable" + fitted
+	floorBasis := fmt.Sprintf("estimate:own-max=%d,n=%d,f=115", own.MaxCleanPeak, own.SampleCount)
+	if own.OOMCount > 0 && own.MaxOOMPeak > 0 {
+		floorBasis += ",oom-on-record"
 	}
-	if insufficientSamples {
-		return request.reserve, "fallback:insufficient-samples" + fitted
-	}
-	return request.reserve, "fallback:no-history" + fitted
+	return floor, floorBasis
 }
 
 func (s *Server) cachedAdmitPeakP90(ctx context.Context) (int64, bool) {

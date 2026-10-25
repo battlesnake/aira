@@ -275,22 +275,31 @@ func TestCeilingFittedNamesOnlyAPriorAndNeverAppearsBesideCeilingClamped(t *test
 		}
 	})
 
+	// AIRA-314 T17: shapes are built from row lists through the real store (see
+	// storeShape), so MaxCleanPeak is the store's true answer and the own-peak
+	// floor is live in this grid; the two malformed seam shapes stay on the seam.
 	t.Run("no basis ever carries both tokens", func(t *testing.T) {
 		nonWhitespace := regexp.MustCompile(`^\S+$`)
 		shapes := []runner.PeakRSSStats{
-			{},
-			{TotalCount: 1, SampleCount: 1, PeakMax: 56360960},
-			{TotalCount: 5, SampleCount: 5, PeakMax: 0},
-			{TotalCount: 5, SampleCount: 5, PeakMax: 2147483648},
-			{TotalCount: 1, SampleCount: 1, PeakMax: 56360960, OOMCount: 1, MaxOOMPeak: 56360960},
-			{TotalCount: 5, SampleCount: 5, PeakMax: 0, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
-			{TotalCount: 4, SampleCount: 4, PeakMax: 40 * gibBasis, OOMCount: 1, MaxOOMPeak: 40 * gibBasis},
-			{TotalCount: 5, SampleCount: 5, PeakMax: 2147483648, OOMCount: 1, MaxOOMPeak: 671088640},
+			storeShape(t, nil),
+			storeShape(t, []ownFloorRow{{peak: 56360960}}),
+			{TotalCount: 5, SampleCount: 5, PeakMax: 0}, // malformed, seam only
+			storeShape(t, ownFloorHistory("clean", 5, 2147483648)),
+			storeShape(t, []ownFloorRow{{peak: 56360960, oom: true}}),
+			{TotalCount: 5, SampleCount: 5, PeakMax: 0, OOMCount: 1, MaxOOMPeak: 10 * gibBasis}, // malformed, seam only
+			storeShape(t, []ownFloorRow{{peak: 40 * gibBasis, oom: true}, {peak: 40 * gibBasis}, {peak: 40 * gibBasis}, {peak: 40 * gibBasis}}),
+			storeShape(t, append(ownFloorHistory("clean", 4, 2147483648), ownFloorRow{peak: 671088640, oom: true})),
+			// AIRA-314 X3, RANT-52 (an escalation below a later clean peak) and the
+			// n=1 "OOM with no peak beside a clean row" shape.
+			storeShape(t, []ownFloorRow{{peak: 6979321856}, {peak: 7247757312, oom: true}}),
+			storeShape(t, []ownFloorRow{{peak: 1778917376, oom: true}, {peak: 2947493888}}),
+			storeShape(t, []ownFloorRow{{oom: true}, {peak: 2947493888}}),
 		}
 		ceilings := []int64{
 			1205862, 629145600, fittedSmallCeiling, 2684354560, fittedInstallCeiling,
 			4294967296, 4294967297, 6400507904, 55 * gibBasis, 100 * gibBasis,
 		}
+		ownMaxRows, ownMaxOOMRows := 0, 0
 		for _, stats := range shapes {
 			for _, ceiling := range ceilings {
 				for _, p90 := range []int64{0, fittedP90Peak} {
@@ -308,11 +317,31 @@ func TestCeilingFittedNamesOnlyAPriorAndNeverAppearsBesideCeilingClamped(t *test
 					if strings.Contains(basis, ",ceiling-fitted") && strings.Contains(basis, "oom-escalated") {
 						t.Fatalf("stats=%+v ceiling=%d basis=%q fits an escalation-determined value", stats, ceiling, basis)
 					}
+					// AIRA-314 I6: a floor win is neither the fitted prior nor the
+					// clamp, and names an OOM record only under the OOM branch's own
+					// entry condition.
+					if strings.HasPrefix(basis, "estimate:own-max=") {
+						ownMaxRows++
+						if strings.Contains(basis, ",ceiling-fitted") || strings.Contains(basis, ",ceiling-clamped") {
+							t.Fatalf("stats=%+v ceiling=%d basis=%q: a floor win carries a fit/clamp token", stats, ceiling, basis)
+						}
+						if strings.Contains(basis, ",oom-on-record") != (stats.OOMCount > 0 && stats.MaxOOMPeak > 0) {
+							t.Fatalf("stats=%+v ceiling=%d basis=%q: ,oom-on-record must appear iff OOMCount > 0 && MaxOOMPeak > 0", stats, ceiling, basis)
+						}
+						if strings.Contains(basis, ",oom-on-record") {
+							ownMaxOOMRows++
+						}
+					}
 					if !nonWhitespace.MatchString(basis) {
 						t.Fatalf("basis=%q contains whitespace", basis)
 					}
 				}
 			}
+		}
+		// Both label directions must actually be exercised, or the AIRA-314
+		// assertions above pass vacuously.
+		if ownMaxRows == ownMaxOOMRows || ownMaxOOMRows == 0 {
+			t.Fatalf("own-max rows=%d, with ,oom-on-record=%d: the grid must reach the floor both with and without an OOM record", ownMaxRows, ownMaxOOMRows)
 		}
 	})
 }
@@ -381,22 +410,41 @@ func masterAdmitReserve(stats runner.PeakRSSStats, hint, ceiling int64) int64 {
 //     executable evidence rather than a note.
 //
 // verifies: AIRA-153 I3, R3
+//
+// AIRA-314 AMENDED it (spec §6.4, T13): the own-peak floor deliberately grants
+// MORE than master where this command's own clean peak demands it. So the I3
+// half "never larger than master" now holds only OFF the floor, and the floor's
+// rows are classified from the INPUTS (MaxCleanPeak), never from the returned
+// basis. Shapes are built from ROW LISTS through the real store (storeShape), so
+// a shape the store cannot produce -- one that would leave MaxCleanPeak at a
+// hand-set 0 beside clean rows -- cannot be expressed. The two deliberately
+// malformed seam shapes (SampleCount > 0 with PeakMax 0) cannot come from the
+// store at all; they stay on the seam, named, with MaxCleanPeak 0, and get only
+// the original pre-AIRA-314 I3 check.
+//
+// verifies: AIRA-153 I3, R3; AIRA-314 I1, I2, §6.4, T13
 func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 	shapes := []runner.PeakRSSStats{
-		{},
-		{TotalCount: 1, SampleCount: 1, PeakMax: 56360960},
-		{TotalCount: 2, SampleCount: 2, PeakMax: 1 << 20},
-		{TotalCount: 5, SampleCount: 5, PeakMax: 0},
-		{TotalCount: 5, SampleCount: 5, PeakMax: 2147483648},
-		{TotalCount: 5, SampleCount: 5, PeakMax: 40 * gibBasis},
-		{TotalCount: 1, SampleCount: 1, PeakMax: 56360960, OOMCount: 1, MaxOOMPeak: 56360960},
-		{TotalCount: 1, SampleCount: 1, PeakMax: 671088640, OOMCount: 1, MaxOOMPeak: 671088640},
-		{TotalCount: 4, SampleCount: 4, PeakMax: 40 * gibBasis, OOMCount: 1, MaxOOMPeak: 40 * gibBasis},
-		{TotalCount: 5, SampleCount: 5, PeakMax: 0, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
-		{TotalCount: 5, SampleCount: 5, PeakMax: 40 * gibBasis, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
+		storeShape(t, nil),
+		storeShape(t, []ownFloorRow{{peak: 56360960}}),
+		storeShape(t, []ownFloorRow{{peak: 1 << 20}, {peak: 1 << 20}}),
+		storeShape(t, ownFloorHistory("clean", 5, 2147483648)),
+		storeShape(t, ownFloorHistory("clean", 5, 40*gibBasis)),
+		storeShape(t, []ownFloorRow{{peak: 56360960, oom: true}}),
+		storeShape(t, []ownFloorRow{{peak: 671088640, oom: true}}),
+		storeShape(t, []ownFloorRow{{peak: 40 * gibBasis, oom: true}, {peak: 40 * gibBasis}, {peak: 40 * gibBasis}, {peak: 40 * gibBasis}}),
+		storeShape(t, append(ownFloorHistory("clean", 4, 40*gibBasis), ownFloorRow{peak: 10 * gibBasis, oom: true})),
+		// AIRA-314 X3 (a clean peak below a larger OOM peak) and X4 (the clamp
+		// firing below a clean peak at three samples).
+		storeShape(t, []ownFloorRow{{peak: 6979321856}, {peak: 7247757312, oom: true}}),
+		storeShape(t, []ownFloorRow{{peak: 7247757312}, {peak: 7247757312}, {peak: 6442450944, oom: true}}),
+		// AIRA-314 X9: F > E > ceiling with the clamp guard failing (at 1.5 GiB,
+		// MaxOOMPeak 1778917376 >= FIT = 1400532813), so E is returned unclamped
+		// unless the floor acts.
+		storeShape(t, []ownFloorRow{{peak: 1778917376, oom: true}, {peak: 2947493888}}),
 	}
 	ceilings := []int64{
-		1205862, 1205863, 629145600, fittedSmallCeiling, 2684354560, 3179282432,
+		1205862, 1205863, 629145600, fittedSmallCeiling, 1610612736, 2684354560, 3179282432,
 		fittedInstallCeiling, 4294967296, 4294967297, 6400507904,
 		8 * gibBasis, 10 * gibBasis, 44 * gibBasis, 55 * gibBasis, 100 * gibBasis,
 	}
@@ -404,16 +452,51 @@ func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 		1 << 20, 512 << 20, 1031798783, fittedSmallCeiling, 2 * gibBasis,
 		fittedHint, 40 * gibBasis, 200 * gibBasis,
 	}
+	floorRows := 0
 	for _, stats := range shapes {
+		floor := runner.GrowByEstimatorMargin(stats.MaxCleanPeak)
+		// E, the OOM escalation, from the INPUTS (0 when the OOM branch is not
+		// entered). The test values are far from overflow.
+		var escalated int64
+		if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
+			escalated = stats.MaxOOMPeak + stats.MaxOOMPeak/2
+		}
 		for _, ceiling := range ceilings {
 			for _, hint := range hints {
 				server := fittedServer(t, staticHistory(stats), 0)
 				got, basis := server.resolveAdmitReserve(
 					admitRequest{reserve: hint, signature: "sig"}, ceiling)
 				master := masterAdmitReserve(stats, hint, ceiling)
-				if got <= ceiling && master <= ceiling && got > master {
-					t.Fatalf("stats=%+v ceiling=%d hint=%d: resolved %d (%s) where master resolved %d — both are admissible, so this change would GRANT more than today",
+				// (a) I1: never below this command's own clean peak x 1.15.
+				if stats.MaxCleanPeak > 0 && got < floor {
+					t.Fatalf("stats=%+v ceiling=%d hint=%d: resolved %d (%s), below the own-peak floor %d",
+						stats, ceiling, hint, got, basis, floor)
+				}
+				// (b) AIRA-153 I3 survives OFF the floor.
+				if floor <= master && got <= ceiling && master <= ceiling && got > master {
+					t.Fatalf("stats=%+v ceiling=%d hint=%d: resolved %d (%s) where master resolved %d — both are admissible and the floor does not demand it, so this change would GRANT more than today",
 						stats, ceiling, hint, got, basis, master)
+				}
+				// (c) Where the floor demands more than master, the floor IS the
+				// value and the basis names it -- except the AIRA-153 R3 band, where
+				// an unclamped escalation over the ceiling is refused anyway. The
+				// band is decided from the INPUTS (E over the ceiling, E not below
+				// F, and E is what came back), never from the returned basis: a
+				// basis-keyed exemption would excuse a floor that failed to act on
+				// an F > E > ceiling shape (X9).
+				if floor > master {
+					r3 := escalated > ceiling && escalated >= floor && got == escalated
+					if !r3 && (got != floor || !strings.HasPrefix(basis, "estimate:own-max=")) {
+						t.Fatalf("stats=%+v ceiling=%d hint=%d: resolved %d (%s), want the floor %d under an estimate:own-max= basis (master %d)",
+							stats, ceiling, hint, got, basis, floor, master)
+					}
+					if r3 && basis != "estimate:oom-escalated" {
+						t.Fatalf("stats=%+v ceiling=%d hint=%d: resolved the unclamped escalation %d under basis %q, want %q (the floor did not strictly raise it)",
+							stats, ceiling, hint, got, basis, "estimate:oom-escalated")
+					}
+					if !r3 {
+						floorRows++
+					}
 				}
 				// And the containment half of I3: an admissible auto-sized value is
 				// simultaneously the ledger booking and the job's own kernel-enforced
@@ -427,6 +510,44 @@ func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 			}
 		}
 	}
+	// (d) A grid where the floor never took the value would pass (c) vacuously.
+	if floorRows == 0 {
+		t.Fatal("no grid row took the own-peak floor's value; the amended property is vacuous")
+	}
+	// The malformed seam shapes: no store write can produce them, MaxCleanPeak is
+	// 0 (no floor), and the original pre-AIRA-314 I3 check applies unchanged.
+	exemptMalformedShapes := []runner.PeakRSSStats{
+		{TotalCount: 5, SampleCount: 5, PeakMax: 0},
+		{TotalCount: 5, SampleCount: 5, PeakMax: 0, OOMCount: 1, MaxOOMPeak: 10 * gibBasis},
+	}
+	for _, stats := range exemptMalformedShapes {
+		for _, ceiling := range ceilings {
+			for _, hint := range hints {
+				server := fittedServer(t, staticHistory(stats), 0)
+				got, basis := server.resolveAdmitReserve(
+					admitRequest{reserve: hint, signature: "sig"}, ceiling)
+				master := masterAdmitReserve(stats, hint, ceiling)
+				if got <= ceiling && master <= ceiling && got > master {
+					t.Fatalf("malformed stats=%+v ceiling=%d hint=%d: resolved %d (%s) where master resolved %d",
+						stats, ceiling, hint, got, basis, master)
+				}
+			}
+		}
+	}
+}
+
+// storeShape writes rows through the real RecordConfinePeak into a fresh
+// t.TempDir() store and returns what the real ConfinePeakHistory reads back, so
+// a grid's history shape is one the store can actually produce (AIRA-314 T13).
+// Rows are recorded in order, one second apart.
+func storeShape(t *testing.T, rows []ownFloorRow) runner.PeakRSSStats {
+	t.Helper()
+	_, db := ownFloorServer(t, false, rows...)
+	stats, err := db.ConfinePeakHistory(context.Background(), "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stats
 }
 
 // TestTheAcceptedR3BandReturnsMoreThanMasterAndIsRefused is the executable form
