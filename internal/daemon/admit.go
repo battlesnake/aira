@@ -1402,7 +1402,7 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	// AIRA-314. A command's own largest CLEAN recorded peak floors its unpinned
 	// reserve, at every sample count. The pre-AIRA-314 resolution runs unchanged
 	// inside the closure below, which hands back the per-signature stats its own
-	// read returned (own/ownRead, set only on a successful read); the floor is ONE
+	// read returned (own, left zero unless the read succeeded); the floor is ONE
 	// max() over the closure's result, so no return can escape it. It is applied
 	// AFTER the whole resolution, never inside the AIRA-153 fit or AIRA-151 clamp,
 	// so their guards (including the clamp's MaxOOMPeak < fit) see today's inputs.
@@ -1417,7 +1417,6 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	// prior nor the clamp), and ,oom-on-record under exactly the OOM branch's own
 	// entry condition, so nothing outside that branch names an OOM record.
 	var own runner.PeakRSSStats
-	ownRead := false
 	reserve, basis := func() (int64, string) {
 		// AIRA-153. ONE quantity governs every auto-sized value this function can
 		// place against `ceiling`: the largest reserve the slice can actually GRANT
@@ -1474,7 +1473,7 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 					// honest; the reserve value still falls back safely below.
 					historyUnavailable = true
 				} else {
-					own, ownRead = stats, true
+					own = stats
 					reserve := request.reserve
 					ordinary := stats
 					ordinary.OOMCount = 0
@@ -1647,7 +1646,7 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 		}
 		return request.reserve, "fallback:no-history" + fitted
 	}()
-	if !ownRead || own.MaxCleanPeak <= 0 {
+	if own.MaxCleanPeak <= 0 {
 		return reserve, basis
 	}
 	floor := runner.GrowByEstimatorMargin(own.MaxCleanPeak)

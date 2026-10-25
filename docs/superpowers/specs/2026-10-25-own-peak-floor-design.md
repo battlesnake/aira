@@ -39,9 +39,15 @@ is on record and `1.5 x` the OOM peak is over the slice ceiling, AIRA-153 clamps
 the reserve to `fit` (the largest reserve the slice can grant one job), which can
 be below a clean peak the command already reached. Only reachable on fixtures and
 small real slices: no signature on the live box can reach it on the 60 GiB
-`aira.slice` (table below), and ci-shim mode records no peak at all (AIRA-121 C10,
-`confine_shim_linux.go:511-529`), so there is no row, no floor and no clamp band
-there.
+`aira.slice` (table below). ci-shim mode records no peak of its own (AIRA-121 C10,
+`confine_shim_linux.go:511-529`), but its admissions READ the same per-signature
+rows, so on a state DB that holds real-mode rows for the same argv the floor
+applies to a shim admission too, against the shim's ledger budget. On a small
+ledger budget that floor can be over the ceiling and the shim admission is then
+refused `E_ADMIT_TOO_LARGE`. Accepted explicitly: it is AIRA-153's rule for this
+command's own measured evidence (AIRA-153 §0.2 row E1 and I2; the §3.2 fit applies
+to priors only), which already refuses an over-ceiling ordinary estimate in shim
+mode the same way.
 
 **A second, separate problem, NOT fixed here.** The machine-wide guess is itself
 unreliable. Its query is a full-table `GROUP BY` over ~185k rows / ~124k
@@ -319,7 +325,10 @@ Today it teaches that one or two recorded observations get a prior or a fallback
 basis ("fewer than three usable"). New text, in the same paragraph:
 
 - once a command has a recorded CLEAN peak (even one, including a pinned run), its
-  unpinned reserve is never below `1.15 x` that peak, and when that figure is what
+  unpinned reserve is never below `1.15 x` that peak while that peak is among its
+  20 most recent records and its history read succeeds (a
+  `fallback:history-unavailable` basis means the read failed and the default was
+  used), and when that figure is what
   set the reserve the basis is `estimate:own-max=<peak>,n=<samples>,f=115`
   (plus `,oom-on-record` when an OOM record was consulted);
 - from three usable samples the ordinary estimate (`estimate:max=...`) normally
@@ -364,9 +373,12 @@ basis ("fewer than three usable"). New text, in the same paragraph:
   a clean peak above `fit` where today the clamp granted `fit` below that clean
   peak. Both now refused immediately, naming both numbers. This is AIRA-153's rule
   for ordinary estimates. On the live data the count above 60 GiB is 0 and no
-  signature can reach the clamp band on `aira.slice` (§1); ci-shim mode records no
-  peak. So new refusals are confined to **fixtures and small real slices**. T1 X6,
-  T8.
+  signature can reach the clamp band on `aira.slice` (§1). ci-shim mode records no
+  peak, but it reads real-mode rows under the same argv, so the floor's
+  `E_ADMIT_TOO_LARGE` also reaches shim admissions against a small ledger budget;
+  accepted explicitly under AIRA-153's rule for measured evidence (§1). So new
+  refusals are confined to **fixtures, small real slices, and shim admissions over
+  real-mode rows against a small ledger budget**. T1 X6, T8.
 - **At-cap peaks (page cache), accepted explicitly.** `peak_rss` is `memory.peak`,
   which counts page cache, and the kernel holds `memory.current` at `memory.max`,
   so a cache-heavy run records a peak near its cap however small its anonymous
@@ -499,7 +511,7 @@ at n=1/2, whose `F` beats `H`);
 | T9 | `TestHintEligibleRunFloorsTheNextUnpinnedReserve` (daemon, real producer) | Record a pinned clean run through the real `confineReport` handler (`peak_rss` 1181116006, budget 3 GiB, `cap:operator:--memory-reserve`), then resolve the same signature unpinned (ceiling 8 GiB), with and without a readable prior: result `>=` 1358283406 (`1.15 x` peak) after one, two and three such runs. Second sub-case, an OLDER LARGER clean row: first an unpinned clean run at 2947493888 through the same handler, then the hint-eligible pinned run → result 3389617971, basis `estimate:own-max=2947493888,n=2,f=115`, asserted `>=` 1.15 x the older row and `>=` 1358283406. Pairs with the existing runner test that the hint fires for that status. | Delete the floor; key the floor on the newest row instead of the maximum (second sub-case). |
 | T13 | `TestNoAdmissibleResolutionIsLargerThanMasters` (amended) | Shapes are built from **row lists through the real store**: a helper `storeShape(t, rows)` writes the rows to a `t.TempDir()` DB with `RecordConfinePeak` and returns `ConfinePeakHistory`; the grid then runs over `staticHistory(thatStats)` as today (one store write per shape, not per cell). Row lists for every current store-expressible shape (for example `{clean 56360960}`; `{clean 40 GiB x4, OOM 10 GiB}`; `{OOM 40 GiB, clean 40 GiB x3}`), plus X3, X4 and X9 (with ceiling 1610612736 in the grid). The deliberately malformed seam shapes (`{5,5,PeakMax 0}`, `{5,5,PeakMax 0,OOM 10 GiB}`) move to a named `exemptMalformedShapes` list, kept on the seam with `MaxCleanPeak = 0`, and are excluded from (a)-(d). Per row, `F = GrowByEstimatorMargin(MaxCleanPeak)` from the inputs: (a) `MaxCleanPeak > 0` ⇒ `got >= F`; (b) `F <= master` (or no clean peak) and both admissible ⇒ `got <= master` (AIRA-153 I3 survives off the floor); (c) `F > master` ⇒ `got == F` with an `estimate:own-max=` basis, unless the row is in the R3 band, decided from the INPUTS: `OOMCount > 0 && MaxOOMPeak > 0`, `E = MaxOOMPeak + MaxOOMPeak/2 > ceiling`, `E >= F` and `got == E` (refused anyway), where the basis must then be `estimate:oom-escalated`; (d) the number of rows that took (c)'s equality branch is `> 0`. | Delete the floor ((a) and (c) red); key on `PeakMax` ((b) red on OOM-only shapes); an empty floor-row set ((d) red); hand-set `MaxCleanPeak = 0` in the helper (store-built shapes then disagree with the reader: (a) and (d) red). |
 | T14 | skill text test (`internal/core/skill_test.go`) | The guide names `estimate:own-max` and states that a recorded clean peak floors the reserve from the first sample. | Drop the sentence. |
-| T15 | `TestOwnPeakFloorRealCgroup` (daemon, real cgroup, skips without delegation like `TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission`) | RANT-55 end to end: pinned run of a workload allocating ~1.1x of 1 GiB (anonymous memory, not page cache), then the identical argv unpinned: no OOM, trailer `reserve-basis=estimate:own-max=...`. | Delete the floor (the second run is OOM-killed at 1 GiB). |
+| T15 | `TestOwnPeakFloorRealCgroup` (daemon, real cgroup, skips without delegation like `TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission`) | RANT-55 end to end: pinned run of a workload allocating ~1.1x of 1 GiB (anonymous memory, not page cache), then the identical argv unpinned: no OOM, trailer `reserve-basis=estimate:own-max=...`. T15 runs only without `-race` (race-detector shadow memory distorts its absolute sizes); under `-race` the floor is covered by T1, T5, T8 and T9. Run T15 by hand without `-race` before cutover. | Delete the floor (the second run is OOM-killed at 1 GiB). |
 | T16 | `TestTooLargeAdviceIsDecidedByTheTermNotTheTrailingTokens` (amended, `admit_too_large_advice_test.go:233`) | New rows `estimate:own-max=2947493888,n=2,f=115` and `estimate:own-max=2947493888,n=2,f=115,oom-on-record`, both `measuredAdvicePhrase`. | Route `estimate:own-max` to the blind or p90 arm. |
 | T17 | `TestCeilingFittedNamesOnlyAPriorAndNeverAppearsBesideCeilingClamped` "no basis ever carries both tokens" grid (amended) | Shapes built through `storeShape` exactly as T13 (same exempt list), plus X3's shape; new assertion: a basis starting `estimate:own-max=` never carries `,ceiling-fitted` or `,ceiling-clamped`, and carries `,oom-on-record` only when `OOMCount > 0 && MaxOOMPeak > 0`. | (f) and (e) above. |
 | T18 | `TestResourcePeakHistoryReportsTheLargestCleanPeak` (store) | Real rows: clean 6979321856 + OOM 7247757312 → `MaxCleanPeak` 6979321856, `PeakMax` 7247757312; OOM with no peak + clean → `MaxOOMPeak` 0, `MaxCleanPeak` = clean; OOM-only → 0; an aitest-kind clean row under the same signature string is not counted by `ConfinePeakHistory`; after 21 clean writes the evicted oldest (largest) row no longer counts (retention window). | Drop `oom=0` from the CASE (returns `PeakMax`); omit the Scan target. |
@@ -513,7 +525,10 @@ example in `internal/store/confine_peak_history_test.go`,
 literals; that is the field's arrival, not a behaviour change.
 
 Gate: `aira confine -- make ci` from the worktree, exact exit code recorded;
-`-race` on `./internal/daemon/... ./internal/store/...`.
+`-race` on `./internal/daemon/... ./internal/store/...`. T15 runs only without
+`-race`: `make ci` has no `-race` leg and runs it wherever cgroup delegation exists
+(it skips otherwise); in the `-race` run it skips and the floor is covered by T1,
+T5, T8 and T9. Run T15 by hand without `-race` before cutover.
 
 ## 8. Risks
 
@@ -577,6 +592,16 @@ Gate: `aira confine -- make ci` from the worktree, exact exit code recorded;
   (held). (D3 and D5 are retired numbers.)
 
 ## 11. Change log
+
+### Build review round 3 fix
+
+| Finding | Change |
+|---|---|
+| P3 false-pass: the guide and the hint comment state the floor unconditionally; it holds only when the history read succeeds and the peak is within the 20-row window | `skill.go` sentence, `confine.go` hint comment and §5.3 qualified ("while that peak is among its 20 most recent records and its history read succeeds (a `fallback:history-unavailable` basis means the read failed and the default was used)"); T14's expected substring updated. T14 red against the pre-fix sentence, green at the fix. |
+| P3 porous: T18 never pinned largest-not-newest (every multi-row subcase had rising peaks) | T18 subcase "the largest clean peak, not the newest": 2947493888 at t0, then 524288000 at t0+1s, expects 2947493888. Mutation (newest clean row: `SELECT peak_rss ... AND oom=0 AND peak_rss>0 ORDER BY at DESC,rowid DESC LIMIT 1`) red in that subcase only (got 524288000), green at the fix. |
+| P3 simplify: `ownRead` redundant | Dropped; the guard is `own.MaxCleanPeak <= 0` (`own` is assigned only on a successful read). No behaviour change; the floor family stays green. |
+| P3 T15 skipped under `-race`, unstated | T15 row and gate line say T15 runs only without `-race`, the floor is covered under `-race` by T1, T5, T8, T9, and T15 is run by hand without `-race` before cutover. `make ci` itself has no `-race` leg and runs T15 where delegation exists. Doc only. |
+| P3 false-fail: shim reads real-mode rows, so the floor's `E_ADMIT_TOO_LARGE` reaches shim admissions | §1 and §6.2 shim sentences amended and the population accepted explicitly under AIRA-153's measured-evidence rule. Doc only. |
 
 ### Build review round 2 fix
 

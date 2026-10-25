@@ -1157,7 +1157,10 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 	// "let aira estimate it from this command's history" holds from the FIRST
 	// such run: this clean run is recorded, and the daemon never sizes the next
 	// unpinned run of the same argv below 1.15x its largest recorded clean peak
-	// (AIRA-314; pinned by TestHintEligibleRunFloorsTheNextUnpinnedReserve).
+	// while that peak is among the argv's 20 most recent records and its history
+	// read succeeds (a fallback:history-unavailable basis means the read failed
+	// and the default was used) (AIRA-314; pinned by
+	// TestHintEligibleRunFloorsTheNextUnpinnedReserve).
 	return fmt.Sprintf("confine: ACTION REQUIRED: over-reserved -- this job peaked at %s, only %d%% of the %s you pinned; an unused reserve like that can delay other jobs on the shared slice. "+
 		"Next run use --memory-reserve %s, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins %s",
 		FormatConfineMegabytes(peak), percent, FormatConfineMegabytes(reserve), FormatConfineMegabytes(suggestion), FormatConfineMegabytes(reserve))

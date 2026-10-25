@@ -907,8 +907,8 @@ func TestSkillTeachesTheOwnPeakFloor(t *testing.T) {
 	}
 	for _, want := range []struct{ text, why string }{
 		{"estimate:own-max=<peak>,n=<samples>,f=115", "the basis the floor carries when it set the reserve"},
-		{"a recorded CLEAN peak — even one, including a run where you pinned `--memory-reserve` — its unpinned reserve is never below 1.15x that peak",
-			"the floor applies from the first clean sample"},
+		{"a recorded CLEAN peak — even one, including a run where you pinned `--memory-reserve` — its unpinned reserve is never below 1.15x that peak while that peak is among its 20 most recent records and its history read succeeds (a `fallback:history-unavailable` basis means the read failed and the default was used)",
+			"the floor applies from the first clean sample, and the guide states it only where it holds (history read succeeded, peak inside the 20-row window)"},
 		{"the machine-wide p90 could not be read within the admission deadline", "a fallback basis on a box with history"},
 		{"after even one or two clean runs whose peak x1.15 exceeds the ceiling", "the new E_ADMIT_TOO_LARGE population"},
 	} {

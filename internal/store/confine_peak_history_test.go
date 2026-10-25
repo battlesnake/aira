@@ -121,6 +121,18 @@ func TestResourcePeakHistoryReportsTheLargestCleanPeak(t *testing.T) {
 		}
 	})
 
+	t.Run("the largest clean peak, not the newest", func(t *testing.T) {
+		db := openConfineHistoryTestDB(t)
+		// The LARGER clean row is recorded first, so an aggregate that took the
+		// newest clean row would report 524288000.
+		record(t, db, ResourcePeakKindConfine, "sig", 2947493888, false, base)
+		record(t, db, ResourcePeakKindConfine, "sig", 524288000, false, base.Add(time.Second))
+		stats, err := db.ConfinePeakHistory(ctx, "sig")
+		if err != nil || stats.MaxCleanPeak != 2947493888 {
+			t.Fatalf("stats=%+v err=%v, want MaxCleanPeak 2947493888 (the larger, older clean row)", stats, err)
+		}
+	})
+
 	t.Run("a row evicted from the retention window no longer counts", func(t *testing.T) {
 		db := openConfineHistoryTestDB(t)
 		// The OLDEST row is the largest; 20 smaller rows follow, so the 21st write
