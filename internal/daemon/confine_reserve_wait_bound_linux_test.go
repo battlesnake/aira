@@ -354,15 +354,22 @@ func TestConfineReserveWaitIsBoundedByTheClientAlone(t *testing.T) {
 func TestConfineReserveGrantOutlivesTheDeclaredBound(t *testing.T) {
 	const ceiling = 256 << 20
 	const reserve = 64 << 20
-	const bound = 2 * time.Second
-	// Three times the declared bound. Honest about what this proves: that the
-	// lease is still held at 3xD, NOT that it is held until stdin EOF — a
-	// regression releasing it at ten minutes survives. That is the identical,
-	// already-accepted bound on grantedRelayHoldDwell in
+	// The declared --max-wait is also the whole window a real subprocess has to
+	// be granted by the in-process daemon, so it is generous (AIRA-315, RANT-43:
+	// a 2s window missed on a loaded box and failed "no grant line").
+	bound := testdeadline.Wait(10 * time.Second)
+	// The dwell is measured from the GRANT (the select below starts after
+	// awaitGrant). The client's --max-wait deadline starts before the grant
+	// (confineReserveWithRunner's ctx), so an expiry tied to --max-wait fires at
+	// most `bound` after the grant, whether it counts from the client's start or
+	// from the grant itself; bound + 2s still catches both. Honest about what
+	// this proves: that the lease is still held at bound + 2s, NOT that it is
+	// held until stdin EOF — a regression releasing it at ten minutes survives.
+	// That is the identical, already-accepted bound on grantedRelayHoldDwell in
 	// worker_admit_cli_granted_linux_test.go, and closing it needs a production
 	// seam announcing lease state, which this project does not add for a
 	// telemetry-grade signal.
-	const dwell = 3 * bound
+	dwell := bound + 2*time.Second
 	const signature = "pytest:tools/correctness/test_dispatch_coverage.py::test_board_temp_range"
 
 	server, slice := reserveWaitBoundFixture(t, ceiling)
