@@ -893,6 +893,36 @@ func TestSkillTeachesBothColdStartBases(t *testing.T) {
 	}
 }
 
+// TestSkillTeachesTheOwnPeakFloor is AIRA-314 T14: the guide must name the
+// `estimate:own-max` basis and state that a recorded clean peak floors the
+// unpinned reserve from the FIRST sample, not from the third. Leaving the old
+// "fewer than three usable" rule as the only statement would teach a false
+// threshold.
+//
+// verifies: AIRA-314 §5.3, T14
+func TestSkillTeachesTheOwnPeakFloor(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ text, why string }{
+		{"estimate:own-max=<peak>,n=<samples>,f=115", "the basis the floor carries when it set the reserve"},
+		{"a recorded CLEAN peak — even one, including a run where you pinned `--memory-reserve` — its unpinned reserve is never below 1.15x that peak",
+			"the floor applies from the first clean sample"},
+		{"the machine-wide p90 could not be read within the admission deadline", "a fallback basis on a box with history"},
+		{"after even one or two clean runs whose peak x1.15 exceeds the ceiling", "the new E_ADMIT_TOO_LARGE population"},
+	} {
+		for _, document := range []struct{ name, body string }{
+			{"SKILL.md", string(artifacts.SkillMD)},
+			{"guide", string(artifacts.Guide)},
+		} {
+			if !strings.Contains(document.body, want.text) {
+				t.Errorf("%s does not teach %q (%s)", document.name, want.text, want.why)
+			}
+		}
+	}
+}
+
 // TestSkillTeachesTheNeverRanEnvelope is the documentation half of AIRA-147.
 //
 // AIRA-128 (above) taught agents to read `terminated-by=` before a job's own
