@@ -1565,7 +1565,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		"worktree-register": {Name: "worktree-register", Usage: "worktree register <id> [--base <ref>] [--owner ID]", Args: []ArgSpec{
 			stringSpec("selector", true, true, "Ticket selector for the ticket this checkout is for"),
 			stringSpec("base", false, false, "Integration ref this work branched from (e.g. origin/master). Overrides .aira/config's git.integration_ref; never guessed when neither is set"),
-			stringSpec("owner", false, false, "Caller owner identity, resolved from the AIRA_CONFINE_OWNER chain by the face"),
+			stringSpec("owner", false, false, "Caller owner identity, resolved from the AIRA_CONFINE_OWNER chain by the face (never the Claude Code session: a worktree binding is per checkout)"),
 			boolSpec("owner_attested", false, false, "Whether the resolved owner is attested rather than inferred from the launch directory"),
 		}, MCPTool: "aira_worktree_register", Summary: "Declare which ticket this checkout is being worked for.", Safety: SafetyMutate, Include: true, Example: []string{"AIRA-1"},
 			Run: func(ctx context.Context, args *argAccessor) (any, error) {
@@ -1934,7 +1934,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
-			stringSpec("owner", false, false, "Cooperative owner (session) identity; the AIRA_CONFINE_OWNER env var sets the same thing. A human-friendly name is shown in the SESSION column of `aira top` and in confine --list, attributing your jobs to your session"),
+			stringSpec("owner", false, false, "Cooperative owner (session) identity; the AIRA_CONFINE_OWNER env var sets the same thing (default: your Claude Code session (cc-<session id>), else the worktree of the current directory). A human-friendly name is shown in the SESSION column of `aira top` and in confine --list, attributing your jobs to your session"),
 			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB); a bare number is bytes. A --memory-reserve of 2G or more that a normally-ended exit-0 job used under 60% of gets one `confine: hint:` stderr line suggesting a smaller value (RAM only; not for AIRA_CONFINE_RESERVE or a docker container; silence with AIRA_CONFINE_NO_HINTS=1)"),
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
