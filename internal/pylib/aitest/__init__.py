@@ -252,6 +252,18 @@ def pytest_runtestloop(session):
     workers_option = session.config.getoption("aitest_workers")
     if workers_option is None:
         return None
+    # AIRA-315 (RANT-41): pytest's own loop has two preconditions this hook must
+    # not skip -- --collect-only runs nothing, and a collection error without
+    # --continue-on-collection-errors stops the run (Interrupted, exit 2).
+    # Returning None hands both back to pytest's own pytest_runtestloop
+    # (firstresult), so pytest decides them exactly as it does without aitest.
+    option = session.config.option
+    if option.collectonly or (session.testsfailed and not option.continue_on_collection_errors):
+        return None
+    # Nothing has run yet, so this is exactly the collection-error count
+    # (Session.pytest_collectreport counts into testsfailed). It is carried into
+    # the final count below, never overwritten: a broken module must not exit 0.
+    collection_errors = session.testsfailed
 
     from aitest.supervisor import Supervisor
 
@@ -308,7 +320,7 @@ def pytest_runtestloop(session):
         else:
             unevaluated += 1
     print("aitest: %d passed, %d failed, %d skipped, %d error, %d unevaluated" % (passed, failed, skipped, error, unevaluated))
-    session.testsfailed = failed + error + unevaluated
+    session.testsfailed = collection_errors + failed + error + unevaluated
     # AIRA-161: hand the SAME count to pytest_terminal_summary below, so the
     # distinction survives to the bottom of the log, where a consumer actually
     # reads the failure total. Nothing is recomputed there: one count reported
