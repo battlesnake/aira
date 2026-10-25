@@ -299,7 +299,7 @@ Table test `TestPrePushHookFastPathIsFailClosed`, one subtest per case:
 | docs+code | `docs/a.md` + `src/b.txt` | `ci` | classify only the first path |
 | root-md | edit `REQUIREMENTS.md` | `ci` | allowlist `*.md` |
 | lookalikes | each of `docsx/a.md`, `Docs/a.md`, `src/docs/a.md`, a file `docs` (separate subtests) | `ci` | `docs*` prefix without the slash, or substring match |
-| rename-into-docs | `git mv src/thing.txt docs/thing.txt` | `ci` | replace `diff-tree --no-renames` with porcelain `git diff --name-only` |
+| rename-into-docs | `git mv REQUIREMENTS.md docs/REQUIREMENTS.md` (Markdown, content unchanged; round 2) | `ci` | replace `diff-tree --no-renames` with porcelain `git diff -M --name-only` |
 | code-delete | delete `src/thing.txt` | `ci` | ignore deletions |
 | code-then-docs | commit `src/b.txt`, then commit `docs/a.md`, push the branch | `ci` | diff only `<local>^..<local>`, or against the remote sha |
 | stale-origin-master | push a code commit C to remote master (`--no-verify`), move `refs/remotes/origin/master` back to the base, push branch C + docs commit | `ci` | (same as above; proves staleness only widens) |
@@ -311,6 +311,8 @@ Table test `TestPrePushHookFastPathIsFailClosed`, one subtest per case:
 | ref-delete | `git push origin --delete <docs-branch>` | `ci` | skip the all-zero check |
 | two-refs-docs-code | `git push origin docsA codeB` | `ci` | classify only the first ref line |
 | two-refs-code-docs | `git push origin codeB docsA` | `ci` | classify only the last ref line |
+| two-refs-tickets-docs | tickets branch (sorts first) + docs branch in one push (round 2) | `test-store` | reset the tickets count on every ref line |
+| two-refs-docs-tickets | docs branch (sorts first) + tickets branch in one push (round 2) | `test-store` | count tickets on the first ref line only |
 | two-refs-docs | two docs-only branches in one push | skip + notice | require exactly one ref |
 | head-refspec | `git push origin HEAD:refs/heads/x` from a docs-only branch | skip + notice | key eligibility on the local ref name |
 | docs-go-file | add `docs/zz/fail_test.go` | `ci` | prefix-only `docs/?*` (round 1) |
@@ -432,10 +434,10 @@ committed). Every mutation turned at least one new test red, except as noted:
 | 5 | hook always runs ci (also the pre-fix hook) | docs-add, docs-delete, docs-rename-within, tickets, docs+tickets, two-refs-docs, head-refspec, stdin-docs-control |
 | 5 | tickets tier sent to skip / to ci | tickets, docs+tickets (both) |
 | 5 | match `.aira/` instead of `.aira/tickets/` | aira-config, lookalike-tickets-sibling |
-| 5 | classify only the first path | docs+code, rename-into-docs, code-then-docs, stale-origin-master |
+| 5 | classify only the first path | docs+code, code-then-docs, stale-origin-master (rename-into-docs no longer: see round 2) |
 | 5 | allowlist `*.md` | root-md, lookalike-docsx, -Docs, -nested-docs, -tickets-sibling |
 | 5 | `docs*` / `[dD]ocs/` / `*docs/` prefix | lookalike-docsx + file-named-docs / lookalike-Docs / lookalike-nested-docs |
-| 5 | porcelain `git diff --name-only` | rename-into-docs |
+| 5 | porcelain `git diff --name-only` | rename-into-docs (stale after round 1: survived until the round-2 case change, see below) |
 | 5 | ignore deletions (`--diff-filter=d`) | docs-delete, rename-into-docs |
 | 5 | diff only `<local>^..<local>` | code-then-docs, stale-origin-master |
 | 5 | unresolvable base treated as docs | no-origin-master |
@@ -488,3 +490,48 @@ Note on the ancestry check: the tree diff from the tip alone already lists every
 difference (so intermediate-master-commit is caught by it too, through `src/c.txt`); the
 ancestry check is the stated I5 condition that the pushed commits sit on the vetted tip, and
 behind-origin-master-tip pins it.
+
+### Round-2 build-review fixes (2026-10-25)
+
+Confirmed findings (Codex lens), each reproduced before the fix:
+
+- P2 porous test: once round 1 limited the skip tier to Markdown, `rename-into-docs`
+  (`src/thing.txt` → `docs/thing.txt`) fell to full `make ci` on its `.txt` destination
+  alone, so swapping `diff-tree --no-renames` for porcelain `git diff -M --name-only` left
+  the suite green. The case now moves a Markdown file into `docs/` with its content unchanged
+  (`git mv REQUIREMENTS.md docs/REQUIREMENTS.md`; the real REQUIREMENTS.md is read by
+  `internal/store` tests). Only listing both sides of the rename runs `make ci`.
+- P2 porous test: no multi-ref case mixed a tickets ref with a docs ref, so resetting the
+  tickets count on every ref line survived. Added `two-refs-tickets-docs` and
+  `two-refs-docs-tickets` (each expects exactly `test-store`; git writes branch-one's line
+  first, so each order appears on stdin).
+
+No hook change: both findings were test gaps, and the hook already behaved correctly.
+
+Mutation runs (runner under `~/tmp`, not committed; `go test -run
+'^TestPrePushHookFastPathIsFailClosed$' ./internal/install -count=1`, unmutated hook green
+before and after):
+
+| Item | Mutation | Red tests |
+|---|---|---|
+| 5 | `diff-tree -r --no-renames` → porcelain `git diff -M --name-only` | rename-into-docs |
+| 5 | `paths=0` → `paths=0 tickets=0` (reset per ref line) | two-refs-tickets-docs |
+| 5 | count tickets only while `refs` is 0 (first ref line only) | two-refs-docs-tickets |
+| 5 | `--diff-filter=d` (re-measured with the new rename case) | docs-delete, rename-into-docs |
+| 5 | classify only the first path (re-measured) | docs+code, code-then-docs, stale-origin-master, existing-branch-code-then-docs, two-refs-docs-code, two-refs-code-docs, stdin-unterminated-last-line |
+
+The first-path mutation no longer reddens rename-into-docs: `--no-renames` lists
+`REQUIREMENTS.md` before `docs/REQUIREMENTS.md`, so the first path is already non-docs.
+
+Verification record (worktree `/home/mark/claude/aira-worktrees/aira-315`):
+
+- Item 3: `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/pylib -count=1`: the first
+  run was OOM-killed at aira's own learned reserve (376M, exit 137; this is the section 8
+  risk that the link step now counts against the outer scope); the identical re-run, admitted
+  at the escalated 565M reserve, passed: `ok aira/internal/pylib 151.446s`, exit 0, peak RSS
+  444M.
+- Item 1: `aira confine -- python3 -m pytest -p pytester aitest/test_init.py -q` from
+  `internal/pylib`: 32 passed, exit 0.
+- Gate: `aira confine -- make ci` from the worktree, on the tree of this round's commit
+  (every code and test change in place; only this line added after): exit 0 (`go test ./...`
+  all `ok`, `internal/install` 8.901s; claude-mod-check ok; wall 8m50s).

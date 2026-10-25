@@ -233,7 +233,11 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 			return fx.push(t, "origin", "linked-branch")
 		}},
 		{"rename-into-docs", "ci", func(t *testing.T, fx pushFixture) string {
-			fx.git(t, fx.worktree, "mv", "src/thing.txt", "docs/thing.txt")
+			// A Markdown file moved from outside docs/ into docs/ with its
+			// content unchanged: the destination alone is docs-only, so only
+			// listing BOTH sides of the rename (--no-renames) runs make ci. The
+			// real repo's REQUIREMENTS.md is read by internal/store tests.
+			fx.git(t, fx.worktree, "mv", "REQUIREMENTS.md", "docs/REQUIREMENTS.md")
 			fx.commitAll(t, "rename into docs")
 			return fx.push(t, "origin", "linked-branch")
 		}},
@@ -353,6 +357,17 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 			// then LAST on stdin, the mirror of the case above.
 			codeA, docsB := twoBranches(t, fx, "src/b.txt", "docs/a.md")
 			return fx.push(t, "origin", codeA, docsB)
+		}},
+		// The tickets count spans every ref line: one tickets ref anywhere in
+		// the push selects the store tier, whichever order git writes the lines
+		// (branch-one sorts first on stdin).
+		{"two-refs-tickets-docs", "test-store", func(t *testing.T, fx pushFixture) string {
+			ticketsA, docsB := twoBranches(t, fx, ".aira/tickets/T-2.md", "docs/a.md")
+			return fx.push(t, "origin", ticketsA, docsB)
+		}},
+		{"two-refs-docs-tickets", "test-store", func(t *testing.T, fx pushFixture) string {
+			docsA, ticketsB := twoBranches(t, fx, "docs/a.md", ".aira/tickets/T-2.md")
+			return fx.push(t, "origin", docsA, ticketsB)
 		}},
 		{"two-refs-docs", "skip", func(t *testing.T, fx pushFixture) string {
 			first, second := twoBranches(t, fx, "docs/a.md", "docs/b.md")
