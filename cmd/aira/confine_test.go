@@ -1059,3 +1059,231 @@ func gitInit(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 }
+
+// Two distinct Claude Code session ids, in the canonical form the harness puts in
+// CLAUDE_CODE_SESSION_ID (AIRA-313).
+const (
+	testClaudeSessionX = "b6b9daa7-4e9b-4de2-b1be-fff8ea5fb6d2"
+	testClaudeSessionY = "0d4c5f1e-9a2b-4c3d-8e7f-001122334455"
+)
+
+// makeConfineTestProject turns dir into an aira project (a git repo with a
+// .aira/config), so app.Discover yields an attested worktree id for it.
+func makeConfineTestProject(t *testing.T, dir string) {
+	t.Helper()
+	gitInit(t, dir)
+	writeConfineTestConfig(t, dir)
+}
+
+func writeConfineTestConfig(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".aira"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"schema":1,"project":{"slug":"demo","prefixes":["AIRA"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	if err := os.WriteFile(filepath.Join(dir, ".aira", "config"), []byte(config+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// makeConfineTestWorktrees builds a real repository A and a linked worktree B of
+// it (`git worktree add`), each with a .aira/config, and returns both paths and
+// their (distinct, attested) worktree ids. The commit uses a per-invocation
+// identity, which writes no git config file.
+func makeConfineTestWorktrees(t *testing.T) (a, b, idA, idB string) {
+	t.Helper()
+	base := t.TempDir()
+	a = filepath.Join(base, "a")
+	b = filepath.Join(base, "b")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, a)
+	commit := exec.Command("git", "-C", a, "-c", "user.name=aira-test", "-c", "user.email=aira-test@invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "base")
+	if output, err := commit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v: %s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", a, "worktree", "add", "-q", "--detach", b).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v: %s", err, output)
+	}
+	writeConfineTestConfig(t, a)
+	writeConfineTestConfig(t, b)
+	for _, side := range []struct {
+		dir string
+		id  *string
+	}{{a, &idA}, {b, &idB}} {
+		project, err := app.Discover(context.Background(), side.dir)
+		if err != nil || project.WorktreeID == "" {
+			t.Fatalf("discover %s: %+v err=%v", side.dir, project, err)
+		}
+		*side.id = project.WorktreeID
+	}
+	if idA == idB {
+		t.Fatalf("setup: worktrees A and B share id %q", idA)
+	}
+	return a, b, idA, idB
+}
+
+// TestConfineOwnerClaudeSessionStep pins the new owner-chain step (AIRA-313)
+// through the real resolveConfineOwner: a valid CLAUDE_CODE_SESSION_ID (padding
+// trimmed) gives the attested owner cc-<id>; --owner and AIRA_CONFINE_OWNER still
+// win, and an invalid AIRA_CONFINE_OWNER still errors; every other value falls
+// through to exactly the result the variable's absence gives, without error.
+//
+// verifies: AIRA-313
+func TestConfineOwnerClaudeSessionStep(t *testing.T) {
+	ctx := context.Background()
+	want := "cc-" + testClaudeSessionX
+	projectRoot := t.TempDir()
+	makeConfineTestProject(t, projectRoot)
+	outside := t.TempDir()
+	t.Setenv("AIRA_CONFINE_OWNER", "")
+
+	resolveUnset := func() string {
+		t.Helper()
+		if err := os.Unsetenv("CLAUDE_CODE_SESSION_ID"); err != nil {
+			t.Fatal(err)
+		}
+		owner, err := resolveConfineOwner(ctx, "")
+		if err != nil {
+			t.Fatalf("unset: err=%v", err)
+		}
+		return owner
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "") // registers the restore for the Unsetenv calls
+
+	for _, dir := range []string{projectRoot, outside} {
+		t.Chdir(dir)
+		baseline := resolveUnset()
+		if dir == projectRoot && !runner.ConfineOwnerIsAttested(baseline) {
+			t.Fatalf("setup: project baseline %q is not the attested worktree id", baseline)
+		}
+		if dir == outside && !strings.HasPrefix(baseline, runner.ConfineInferredOwnerPrefix) {
+			t.Fatalf("setup: outside baseline %q is not an inferred owner", baseline)
+		}
+		for _, raw := range []string{testClaudeSessionX, " " + testClaudeSessionX, testClaudeSessionX + " ", "\t" + testClaudeSessionX + "\t", testClaudeSessionX + "\n"} {
+			t.Setenv("CLAUDE_CODE_SESSION_ID", raw)
+			owner, err := resolveConfineOwner(ctx, "")
+			if err != nil || owner != want || !runner.ConfineOwnerIsAttested(owner) {
+				t.Fatalf("dir=%s session=%q: owner=%q err=%v, want attested %q", dir, raw, owner, err, want)
+			}
+		}
+
+		t.Setenv("CLAUDE_CODE_SESSION_ID", testClaudeSessionX)
+		if owner, err := resolveConfineOwner(ctx, "flag-owner"); err != nil || owner != "flag-owner" {
+			t.Fatalf("--owner must win: owner=%q err=%v", owner, err)
+		}
+		t.Setenv("AIRA_CONFINE_OWNER", "environment-owner")
+		if owner, err := resolveConfineOwner(ctx, ""); err != nil || owner != "environment-owner" {
+			t.Fatalf("AIRA_CONFINE_OWNER must win: owner=%q err=%v", owner, err)
+		}
+		t.Setenv("AIRA_CONFINE_OWNER", " environment-owner ")
+		if owner, err := resolveConfineOwner(ctx, ""); err != nil || owner != "environment-owner" {
+			t.Fatalf("padded AIRA_CONFINE_OWNER must win: owner=%q err=%v", owner, err)
+		}
+		t.Setenv("AIRA_CONFINE_OWNER", "bad/owner")
+		if owner, err := resolveConfineOwner(ctx, ""); err == nil {
+			t.Fatalf("an invalid AIRA_CONFINE_OWNER was masked by the session id: owner=%q", owner)
+		}
+		t.Setenv("AIRA_CONFINE_OWNER", "")
+
+		for _, raw := range []string{
+			"",
+			"   ",
+			"\t \n",
+			strings.ToUpper(testClaudeSessionX),
+			"B6b9daa7-4e9b-4de2-b1be-fff8ea5fb6d2",
+			testClaudeSessionX[:35],
+			testClaudeSessionX + "0",
+			testClaudeSessionX + "x",
+			strings.Replace(testClaudeSessionX, "-", "", 1) + "0",
+			"b6b9daa74-e9b-4de2-b1be-fff8ea5fb6d2",
+			"../x",
+			"b6b9daa7@4e9b-4de2-b1be-fff8ea5fb6d2",
+			"b6b9daa7/4e9b-4de2-b1be-fff8ea5fb6d2",
+			testClaudeSessionX[:8] + " " + testClaudeSessionX[8:],
+			testClaudeSessionX[:8] + "\t" + testClaudeSessionX[8:],
+			strings.Repeat("a", 200),
+		} {
+			t.Setenv("CLAUDE_CODE_SESSION_ID", raw)
+			owner, err := resolveConfineOwner(ctx, "")
+			if err != nil || owner != baseline {
+				t.Fatalf("dir=%s session=%q: owner=%q err=%v, want the unset result %q", dir, raw, owner, err, baseline)
+			}
+		}
+	}
+}
+
+// TestConfineSessionOwnerIsCwdIndependentAndSessionDistinct is the regression
+// for RANT-50/51/53 and the shared-worktree false pass (AIRA-313), over a real
+// repository and a real linked worktree: one session id resolves to the same
+// owner in both, so the guard opens; two session ids in ONE worktree resolve to
+// different owners, so the guard refuses without --steal.
+//
+// verifies: AIRA-313
+func TestConfineSessionOwnerIsCwdIndependentAndSessionDistinct(t *testing.T) {
+	ctx := context.Background()
+	a, b, _, _ := makeConfineTestWorktrees(t)
+	t.Setenv("AIRA_CONFINE_OWNER", "")
+	resolveIn := func(dir, session string) string {
+		t.Helper()
+		t.Chdir(dir)
+		t.Setenv("CLAUDE_CODE_SESSION_ID", session)
+		owner, err := resolveConfineOwner(ctx, "")
+		if err != nil {
+			t.Fatalf("resolve in %s: %v", dir, err)
+		}
+		return owner
+	}
+
+	launched := resolveIn(a, testClaudeSessionX)
+	caller := resolveIn(b, testClaudeSessionX)
+	if launched != caller {
+		t.Fatalf("one session resolved %q in A and %q in B", launched, caller)
+	}
+	if err := runner.CheckConfineOwner("CONFINE-job-1-a", launched, caller, false); err != nil {
+		t.Fatalf("same session, different worktree: %v", err)
+	}
+
+	x := resolveIn(a, testClaudeSessionX)
+	y := resolveIn(a, testClaudeSessionY)
+	if x == y {
+		t.Fatalf("two sessions in one worktree share owner %q", x)
+	}
+	if err := runner.CheckConfineOwner("CONFINE-job-1-a", x, y, false); err == nil {
+		t.Fatal("another session in the same worktree opened the guard without --steal")
+	}
+	if err := runner.CheckConfineOwner("CONFINE-job-1-a", x, y, true); err != nil {
+		t.Fatalf("--steal: %v", err)
+	}
+}
+
+// TestConfineSessionOwnerOutsideAnyProject is RANT-48's outcome for a Claude
+// session (AIRA-313): launched from a directory that is not an aira project, the
+// job gets an attested cc- owner instead of an inferred @cwd one, so the same
+// session can act on it from another non-project directory without --steal.
+//
+// verifies: AIRA-313
+func TestConfineSessionOwnerOutsideAnyProject(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("AIRA_CONFINE_OWNER", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", testClaudeSessionX)
+	var owners []string
+	for _, dir := range []string{filepath.Join(t.TempDir(), "kit-fix"), filepath.Join(t.TempDir(), "elsewhere")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(dir)
+		owner, err := resolveConfineOwner(ctx, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		owners = append(owners, owner)
+	}
+	if owners[0] != owners[1] || owners[0] != "cc-"+testClaudeSessionX {
+		t.Fatalf("owners=%q, want both cc-%s", owners, testClaudeSessionX)
+	}
+	if err := runner.CheckConfineOwner("CONFINE-job-1-a", owners[0], owners[1], false); err != nil {
+		t.Fatalf("same session, two non-project directories: %v", err)
+	}
+}

@@ -2270,13 +2270,33 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	return 0
 }
 
+// resolveConfineOwner is the ONE confine owner chain, used at launch and by every
+// management face (CLI and MCP): --owner, else AIRA_CONFINE_OWNER, else the
+// Claude Code session (AIRA-313), else the worktree id of ".", else an inferred
+// @cwd owner.
+//
+// The session step comes before the worktree id because an agent's cwd is not
+// stable (subagent Bash calls reset it, sessions move between worktrees), so a
+// per-directory owner made one session present two identities and refused its
+// own job, while letting every session sharing a worktree act on the others'.
+// CLAUDE_CODE_SESSION_ID is shared by a session's subagents and differs between
+// sessions. A value that is not a canonical session id is ignored (never an
+// error), so the chain behaves exactly as if it were unset.
+//
+// It lives here and NOT in resolveOwnerIn, whose dir != "" form `worktree
+// register` uses: a worktree binding is per checkout by design (AIRA-176).
 func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {
+	if explicit == "" && strings.TrimSpace(os.Getenv("AIRA_CONFINE_OWNER")) == "" {
+		if owner, ok := runner.ConfineSessionOwner(os.Getenv("CLAUDE_CODE_SESSION_ID")); ok {
+			return owner, nil
+		}
+	}
 	return resolveOwnerIn(ctx, explicit, "")
 }
 
-// resolveOwnerIn is resolveConfineOwner's chain rooted at an explicit
-// directory. dir == "" preserves the historical behaviour exactly: discover
-// from ".", and infer from the process cwd.
+// resolveOwnerIn is the owner chain WITHOUT the Claude Code session step,
+// rooted at an explicit directory. dir == "" preserves the historical behaviour
+// exactly: discover from ".", and infer from the process cwd.
 //
 // AIRA-176 needs the parameterised form because `worktree register` must
 // resolve identity for the WORKTREE BEING REGISTERED. Over MCP the server
