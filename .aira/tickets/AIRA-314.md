@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-314","project":"aira","title":"Admission reserve ignores a command's own recorded peak below 3 samples; machine-wide p90 prior read times out (RANT-52/55, RANT-54 note)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-314","project":"aira","title":"Admission reserve ignores a command's own recorded peak below 3 samples; machine-wide p90 prior read times out (RANT-52/55, RANT-54 note)","status":"in-progress","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[]}
 ---
 From the 2026-10-25 rant triage; verified by the investigator against admit.go.
 
