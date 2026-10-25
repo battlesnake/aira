@@ -1663,6 +1663,11 @@ func runInProcessWithInput(argv []string, stdout, stderr io.Writer, stdin io.Rea
 // --steal-kills a survivor, so a mutation that breaks one leg still reaches the
 // other's assertions.
 //
+// The mcp leg runs the MCP face in-process with CLAUDE_CODE_SESSION_ID set, so it
+// pins that the MCP code path resolves the caller through resolveConfineOwner; it
+// does not pin that a spawned `aira mcp` child actually carries the variable
+// (an accepted gap, measured in the spec).
+//
 // verifies: AIRA-313
 func TestConfineKillSameClaudeSessionFromAnotherWorktree(t *testing.T) {
 	a, b, _, _ := makeConfineTestWorktrees(t)
@@ -1713,6 +1718,18 @@ func TestConfineKillSameClaudeSessionFromAnotherWorktree(t *testing.T) {
 			}
 		case exit := <-done:
 			done <- exit // leave it for the cleanup
+			// runConfined sends the owner before it launches anything, so an
+			// empty channel here means the CLI refused before runConfined was
+			// entered: that is a product failure (for example an owner
+			// resolution error), never a host limitation to skip.
+			select {
+			case owner := <-owners:
+				if owner != wantOwner {
+					t.Errorf("launch owner=%q, want %q (the Claude Code session, not worktree A)", owner, wantOwner)
+				}
+			default:
+				t.Fatalf("the CLI refused before reaching runConfined: exit=%d stderr=%q", exit, launchStderr.String())
+			}
 			cgrouptest.SkipOrFailRealCgroup(t, "real confine launch ended before admission: exit=%d stderr=%q", exit, launchStderr.String())
 		case <-testdeadline.After(10 * time.Second):
 			t.Fatal("the CLI never reached runConfined")

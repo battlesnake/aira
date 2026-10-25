@@ -25,23 +25,13 @@ func TestConfineSessionOwnerShape(t *testing.T) {
 		testSessionID + "\n",
 		"\n " + testSessionID + " \r\n",
 	} {
-		owner, ok := ConfineSessionOwner(raw)
-		if !ok || owner != want {
-			t.Fatalf("ConfineSessionOwner(%q) = %q, %v; want %q, true", raw, owner, ok, want)
-		}
-		if err := ValidateConfineIdentity(owner); err != nil {
-			t.Fatalf("accepted owner %q fails ValidateConfineIdentity: %v", owner, err)
-		}
-		if err := ValidateConfineOwner(owner); err != nil {
-			t.Fatalf("accepted owner %q fails ValidateConfineOwner: %v", owner, err)
-		}
-		if !ConfineOwnerIsAttested(owner) {
-			t.Fatalf("accepted owner %q is not attested", owner)
-		}
-		if !IsConfineSessionOwner(owner) {
-			t.Fatalf("IsConfineSessionOwner(%q) = false for an accepted owner", owner)
-		}
+		assertAcceptedSessionOwner(t, raw, want)
 	}
+	// The contract is any canonical lowercase 8-4-4-4-12 UUID, not only v4: a
+	// v7 id (version nibble '7', variant 'b') must be accepted too, so a
+	// recogniser that pins the v4 version nibble fails here.
+	const v7SessionID = "01890a5d-ac96-774b-bcce-b302099a8057"
+	assertAcceptedSessionOwner(t, v7SessionID, "cc-"+v7SessionID)
 
 	refused := []string{
 		"",
@@ -130,5 +120,25 @@ func TestConfineScopeIDRoundTripsSessionOwner(t *testing.T) {
 	_, _, _, workerOwner, ok := ParseConfineScopeID(worker)
 	if !ok || workerOwner != owner {
 		t.Fatalf("worker scope %q owner %q ok %v; want %q", worker, workerOwner, ok, owner)
+	}
+}
+
+func assertAcceptedSessionOwner(t *testing.T, raw, want string) {
+	t.Helper()
+	owner, ok := ConfineSessionOwner(raw)
+	if !ok || owner != want {
+		t.Fatalf("ConfineSessionOwner(%q) = %q, %v; want %q, true", raw, owner, ok, want)
+	}
+	if err := ValidateConfineIdentity(owner); err != nil {
+		t.Fatalf("accepted owner %q fails ValidateConfineIdentity: %v", owner, err)
+	}
+	if err := ValidateConfineOwner(owner); err != nil {
+		t.Fatalf("accepted owner %q fails ValidateConfineOwner: %v", owner, err)
+	}
+	if !ConfineOwnerIsAttested(owner) {
+		t.Fatalf("accepted owner %q is not attested", owner)
+	}
+	if !IsConfineSessionOwner(owner) {
+		t.Fatalf("IsConfineSessionOwner(%q) = false for an accepted owner", owner)
 	}
 }

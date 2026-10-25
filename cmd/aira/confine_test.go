@@ -1168,6 +1168,12 @@ func TestConfineOwnerClaudeSessionStep(t *testing.T) {
 				t.Fatalf("dir=%s session=%q: owner=%q err=%v, want attested %q", dir, raw, owner, err, want)
 			}
 		}
+		// Any canonical lowercase UUID, not only v4 (a v7 id here).
+		const v7SessionID = "01890a5d-ac96-774b-bcce-b302099a8057"
+		t.Setenv("CLAUDE_CODE_SESSION_ID", v7SessionID)
+		if owner, err := resolveConfineOwner(ctx, ""); err != nil || owner != "cc-"+v7SessionID || !runner.ConfineOwnerIsAttested(owner) {
+			t.Fatalf("dir=%s v7 session: owner=%q err=%v, want attested %q", dir, owner, err, "cc-"+v7SessionID)
+		}
 
 		t.Setenv("CLAUDE_CODE_SESSION_ID", testClaudeSessionX)
 		if owner, err := resolveConfineOwner(ctx, "flag-owner"); err != nil || owner != "flag-owner" {
