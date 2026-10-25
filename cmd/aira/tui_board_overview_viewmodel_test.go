@@ -296,3 +296,40 @@ func TestOverviewJobsRowsHonesty(t *testing.T) {
 		t.Fatalf("empty confine: %q", rows[0].Text)
 	}
 }
+
+// TestOverviewSessionOwnerNeverCorrelates pins accepted gap G2 (AIRA-313) on the
+// overview: a Claude Code session-owned job adds nothing to a project's owned-job
+// count and reads "project unknown" in the jobs strip, while a control job owned
+// by the project's worktree still counts and correlates.
+//
+// verifies: AIRA-313
+func TestOverviewSessionOwnerNeverCorrelates(t *testing.T) {
+	worktree := strings.Repeat("a", 64)
+	session := "cc-b6b9daa7-4e9b-4de2-b1be-fff8ea5fb6d2"
+	sessionOnly := &runner.ConfineListResult{Verdict: "ok", Scopes: []runner.ConfineRecord{{Name: "job-session", Owner: session}}}
+	if got := overviewOwnedJobs([]string{worktree}, sessionOnly); got != 0 {
+		t.Fatalf("session-owned job counted as owned: %d", got)
+	}
+	both := &runner.ConfineListResult{Verdict: "ok", Scopes: []runner.ConfineRecord{
+		{Name: "job-session", Owner: session},
+		{Name: "job-worktree", Owner: worktree},
+	}}
+	if got := overviewOwnedJobs([]string{worktree}, both); got != 1 {
+		t.Fatalf("control: owned jobs=%d, want 1 (the worktree-owned job only)", got)
+	}
+	var sessionRow, worktreeRow string
+	for _, row := range overviewJobsRows(both, "", map[string]string{worktree: "aira"}) {
+		switch {
+		case strings.HasPrefix(row.Text, "job job-session "):
+			sessionRow = row.Text
+		case strings.HasPrefix(row.Text, "job job-worktree "):
+			worktreeRow = row.Text
+		}
+	}
+	if !strings.Contains(sessionRow, "project unknown") {
+		t.Fatalf("session-owned job row %q, want project unknown", sessionRow)
+	}
+	if !strings.Contains(worktreeRow, "project aira") {
+		t.Fatalf("control: worktree-owned job row %q, want project aira", worktreeRow)
+	}
+}

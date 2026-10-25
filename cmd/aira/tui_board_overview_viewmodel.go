@@ -162,9 +162,12 @@ type overviewCard struct {
 }
 
 // overviewOwnedJobs counts confine jobs owned by any of the project's worktree
-// ids. Correlation is per spec §9: ONLY an ATTESTED owner (a 64-hex worktree
-// id) correlates; a label / @cwd-inferred / unknown owner is left uncorrelated
-// (rendered in the jobs strip, never attributed to a card).
+// ids. Correlation is per spec §9: ONLY a worktree-id owner (an attested 64-hex
+// id) correlates. A Claude Code session owner (cc-<uuid>, AIRA-313) and an
+// AIRA_CONFINE_OWNER label are attested but never correlate, and a @cwd-inferred
+// or unknown owner is unattested; all are left uncorrelated (rendered in the jobs
+// strip as "project unknown", never attributed to a card). Accepted gap G2 of the
+// AIRA-313 spec.
 func overviewOwnedJobs(worktreeIDs []string, confine *runner.ConfineListResult) int {
 	if confine == nil {
 		return 0
