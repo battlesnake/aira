@@ -1,0 +1,7 @@
+---
+{"schema":1,"id":"AIRA-317","project":"aira","title":"Owner decision: admission charging for pinned reserves, the machine-wide p90 prior, and queued-wait top-holder line (RANT-47)","status":"planned","kind":"spike","severity":"P2","assignee":null,"milestone":"later","labels":[],"hold":true,"relations":[]}
+---
+Held capture from the 2026-10-25 triage; changes what admission charges, so owner sign-off first.
+(1) Live (track-actual) charge for client-PINNED reserves: reverses the owner-signed admission-counter spec (S1 deleted the AIRA-29 live charge). Recommendation: reject; AIRA-312 --resize is the release valve for a stale pin. v0.40 adds a PEAK column to --list so over-pinning is visible.
+(2) Delete the machine-wide p90-prior rung (internal/daemon/admit.go ~1597-1614, cachedAdmitPeakP90, store.ConfinePeakP90, skill p90 prose): it sits ahead of the owner-chosen 1 GiB default (AIRA-304) so the v0.35 lowering stops taking effect once the box has history; ~1.6-1.75G charged to ~2,800 auto-cap runs/7 days whose average peak was ~200M. Cost: heavy new commands peaking 1-1.75G OOM once then self-heal. NOTE the tension with AIRA-314 fix 2, which makes the p90 reliable; decide delete-vs-keep first.
+(3) Queued-wait line clause naming the largest idle hold (reserve>=2GiB, peak<60%, same rule as the AIRA-310 hint). Goes against the AIRA-311 deliberate shortening; spec in the 2026-10-25 triage record.
