@@ -44,6 +44,13 @@
 #   peaks came from a pinned run; unpinned clean rows with a budget 65889, of
 #   which 897 at >= 95% of the cap;
 #   BEFORE 0.182 / 0.180 / 0.272 s; build 0.586 s; AFTER 0.061 / 0.050 / 0.045 s
+# Build run (2026-10-25, rows 185738, signatures 124316, single-row 102903,
+# p90-qualifying 8656), exit 0; the figures quoted in the AIRA-246/AIRA-242 notes:
+#   p90 peak 1599184896, p 1839062630; 1-2 peaks 104022; F > 1 GiB 12312; F > p 6954;
+#   F > 60 GiB 0; clean <= OOM 165; fix 2 population 96397 / F < 1 GiB 91117;
+#   kills 1-2 before 40, 3+ before 211; at-cap 259 (204 pinned); pinned 5291;
+#   unpinned clean rows with a budget 65927, 897 at >= 95% of the cap;
+#   BEFORE 0.209 / 0.209 / 0.204 s; build 0.503 s; AFTER 0.038 / 0.061 / 0.091 s
 set -euo pipefail
 src="${1:?usage: $0 <source state.db> <scratch dir under ~/tmp>}"
 scratch="${2:?usage: $0 <source state.db> <scratch dir under ~/tmp>}"

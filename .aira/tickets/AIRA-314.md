@@ -12,3 +12,7 @@ Fix 1: when 0 < SampleCount < 3 and PeakMax > 0, floor the unpinned reserve at G
 RANT-54 (cargo clippy 78M->118M first-run kills) is the documented bimodal gap = AIRA-273 (held; the hold is the owner's to clear). AIRA-273 option A is worthless until fix 2 makes the p90 readable.
 
 Correctness-critical (admission ledger): two-loop. Daemon-side change: shared-daemon restart care applies.
+
+## Build note 2026-10-25: fix 2 deferred
+
+Built: fix 1 only (the own clean peak floor, `estimate:own-max=<peak>,n=<samples>,f=115`, at every sample count, never ceiling-fitted), per spec `docs/superpowers/specs/2026-10-25-own-peak-floor-design.md` revision 3. Fix 2 (covering `(kind, signature, peak_rss)` index and keep-last-good p90 cache) is NOT built: making the p90 rung reliable raises ~96k signatures' cold-start reserves from the 1 GiB default to ~1.71 GiB, which pre-empts the owner's held AIRA-317(2) decision (keep or delete the p90 rung). If the answer is keep, build spec Appendix A as its own change; if delete, Appendix A is moot. Measurements recorded on AIRA-246 and AIRA-242.
