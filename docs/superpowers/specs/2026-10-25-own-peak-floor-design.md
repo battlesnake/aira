@@ -272,7 +272,8 @@ Outcome table, every sample count, `C > 0`:
 | no usable estimate, no OOM branch, p90 unreadable | hint (or `fit`) | `max(that, F)` | own-max iff `F >` it |
 | OOM branch, escalation did not raise | hint / `fit` (n<3), ordinary (n>=3, `>= F`) | `max(that, F)` | own-max`,oom-on-record` iff `F >` it (never at n>=3) |
 | OOM branch, `E` raised, `E <= ceiling` | `E` | `max(E, F)` | own-max`,oom-on-record` iff `F > E` (RANT-52: `E` = 2.49 GiB, `F` = 3.16 GiB); never at n>=3 |
-| OOM branch, `E > ceiling`, guard `MaxOOMPeak < fit` holds | `fit` (`,ceiling-clamped`) | `max(fit, F)`; refused if `F > ceiling` | own-max`,oom-on-record` iff `F > fit` (any n) |
+| OOM branch, `E > ceiling`, guard `MaxOOMPeak < fit` holds, `F > fit` | `fit` (`,ceiling-clamped`) | `F`; refused if `F > ceiling` | own-max`,oom-on-record` (any n) |
+| OOM branch, `E > ceiling`, guard holds, floor below the clamp value (`F <= fit`) | `fit` (`,ceiling-clamped`) | `fit`: clamp value and basis unchanged (I2; X10, X11) | `estimate:oom-escalated,ceiling-clamped` |
 | OOM branch, `E > ceiling`, guard fails | `E` (refused) | `max(E, F)` (refused) | `E`'s basis unless `F > E` |
 | usable ordinary estimate, no OOM branch | `>= F` | unchanged | unchanged (tie or loss) |
 
@@ -467,6 +468,8 @@ does not apply). Explicit extra cells, ceiling 8 GiB unless stated:
 | X7 tie | n=1 clean at 1610612736 (`F` == `p`) | 1852204646 `estimate:p90-prior` | unchanged |
 | X8 pinned | clean 8053063680 n=1; pinned request 2147483648 | 2147483648 `pinned:client` | unchanged |
 | X9 `F > E > ceiling`, guard fails | ceiling 1610612736 (`fit` 1400532813); n=2: OOM 1778917376, clean 2947493888 | 2668376064 `estimate:oom-escalated` (refused) | 3389617971 `estimate:own-max=2947493888,n=2,f=115,oom-on-record` (refused, T8) |
+| X10 floor below the clamp value | n=2: clean 1073741824, OOM 6442450944 | 7469508340 `estimate:oom-escalated,ceiling-clamped` | unchanged |
+| X11 floor below the clamp value | n=3: clean 1073741824 x2, OOM 6442450944 | 7469508340 `estimate:oom-escalated,ceiling-clamped` | unchanged |
 
 Mutations that must each turn T1 red:
 (a) delete the floor (n=1/2 above and over-ceiling clean and mixed cells, X2-X6);
@@ -481,6 +484,8 @@ at n=1/2, whose `F` beats `H`);
 (h) move the floor above the pinned return (X8).
 (i) skip the floor where the unclamped escalation is over the ceiling,
 `if floor <= reserve || (basis == "estimate:oom-escalated" && reserve > ceiling)` (X9).
+(j) let the floor replace any clamped value, shrinking it below today's `fit`,
+`if floor <= reserve && !strings.Contains(basis, ",ceiling-clamped")` (X10, X11).
 
 ### Other tests
 
@@ -572,6 +577,12 @@ Gate: `aira confine -- make ci` from the worktree, exact exit code recorded;
   (held). (D3 and D5 are retired numbers.)
 
 ## 11. Change log
+
+### Build review round 2 fix
+
+| Finding | Change |
+|---|---|
+| P2 porous: I2 (never below today) untested in the clamp band when `F < fit`; every clamp cell had `F > fit` and T13 (b) bounds only from above | Cells X10 (n=2) and X11 (n=3) added to T1 (clean 1073741824, OOM 6442450944, ceiling 8 GiB: `fit` with `,ceiling-clamped`); clamp row of the §5.1 outcome table split; mutation (j) added. Mutation (j) red in T1 X10 and X11 (reserve 1234803097, own-max basis); green at the fix. |
 
 ### Build review round 1 fix
 

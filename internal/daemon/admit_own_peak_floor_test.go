@@ -128,7 +128,7 @@ type ownFloorWant struct {
 }
 
 // TestOwnPeakFloorTable is AIRA-314 T1: the grid over (samples) x (history kind)
-// x (peak class), plus the explicit cells X1-X8. Each cell asserts the exact
+// x (peak class), plus the explicit cells X1-X11. Each cell asserts the exact
 // value AND the exact basis.
 //
 // verifies: AIRA-314 I1, I2, I3, I4, I5, I6; T1
@@ -227,6 +227,21 @@ func TestOwnPeakFloorTable(t *testing.T) {
 			rows:    []ownFloorRow{{peak: 1778917376, oom: true}, {peak: 2947493888}},
 			ceiling: 1610612736,
 			want:    ownFloorWant{3389617971, "estimate:own-max=2947493888,n=2,f=115,oom-on-record"},
+		},
+		{
+			// The outcome-table row "floor below the clamp value": E = 9663676416 >
+			// ceiling, the guard MaxOOMPeak 6442450944 < FIT holds, so the clamp
+			// fires at FIT. F = 1234803097 < FIT, so the clamp value AND basis stand
+			// (I2: never below today). A floor that replaced a clamped value would
+			// shrink a just-OOM-killed 6 GiB job to 1.15 GiB.
+			name: "X10 n=2 floor below the clamp value",
+			rows: []ownFloorRow{{peak: 1073741824}, {peak: 6442450944, oom: true}},
+			want: ownFloorWant{ownFloorFit, "estimate:oom-escalated,ceiling-clamped"},
+		},
+		{
+			name: "X11 n=3 floor below the clamp value",
+			rows: []ownFloorRow{{peak: 1073741824}, {peak: 1073741824}, {peak: 6442450944, oom: true}},
+			want: ownFloorWant{ownFloorFit, "estimate:oom-escalated,ceiling-clamped"},
 		},
 		{
 			// Case C: OOM-only, censored evidence; AIRA-153's clamp stands.
