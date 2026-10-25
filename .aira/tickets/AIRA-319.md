@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-319","project":"aira","title":"confine --kill/--front/--resize not-found message should say the job may be queued, already exited, or in another slice (RANT-49 E_CONFINE_NOT_FOUND half)","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":"later","labels":[],"hold":true,"relations":[]}
+---
+Follow-up split from AIRA-313. AIRA-313 fixed the owner-mismatch refusals (RANT-48/50/51/53) but NOT the RANT-49 E_CONFINE_NOT_FOUND half: it was not reproduced. A queued (not yet admitted), already-exited, or other-slice job returns E_CONFINE_NOT_FOUND before any owner check runs, so the owner change cannot explain or fix it. Proposed scope: keep the code, make the message name the likely causes (queued / exited / other slice, with the --slice hint) so an agent does not misread it as an ownership problem. Verify the actual RANT-49 path first; do not fabricate a cause the lookup cannot establish.

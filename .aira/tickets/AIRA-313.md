@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-313","project":"aira","title":"confine --kill/--front/--resize refuse a session's own job: default owner is per-worktree, so launch and kill from different cwds disagree (RANT-48/49/50/51/53)","status":"in-progress","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-313","project":"aira","title":"confine --kill/--front/--resize refuse a session's own job: default owner is per-worktree, so launch and kill from different cwds disagree (RANT-48/49/50/51/53)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[{"kind":"relates","from":"AIRA-319","to":"AIRA-313"}]}
 ---
 From the 2026-10-25 rant triage; mechanism verified by reproduction.
 
