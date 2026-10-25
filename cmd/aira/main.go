@@ -3677,7 +3677,12 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	//
 	// An unestablished reserve prints "unevaluated" like every other facet here —
 	// never the cap standing in for it.
-	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tLIVE\tLEAF-PROCS\tRSS\tAGE\tRESERVE\tCAP")
+	//
+	// AIRA-315. PEAK is the scope's lifetime memory.peak (display-only, the
+	// --json peak_rss), so an over-pinned RESERVE is visible beside what the
+	// job ever used. An unread peak is "unevaluated", never 0 and never RSS
+	// standing in; a read peak is never clamped to RESERVE.
+	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tLIVE\tLEAF-PROCS\tRSS\tPEAK\tAGE\tRESERVE\tCAP")
 	for _, record := range result.Scopes {
 		// S2a §16.1: mark aitest worker sub-scopes so an operator can tell them from
 		// their parent job — they share the parent's supervisor pid, and the pid/name
@@ -3687,10 +3692,10 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		if record.Worker {
 			name += " (worker)"
 		}
-		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			name, record.Owner, confineNum(record.SupervisorPID), record.ScopeID,
 			confineLiveStatus(record),
-			confineNum(record.Populated), confineNum(record.RSSBytes), confineAge(record.AgeSeconds),
+			confineNum(record.Populated), confineNum(record.RSSBytes), confineNum(record.PeakRSS), confineAge(record.AgeSeconds),
 			confineNum(record.ReserveBytes), confineString(record.Cap))
 	}
 	if err := table.Flush(); err != nil {
