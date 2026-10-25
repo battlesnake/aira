@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-315","project":"aira","title":"Rant-triage small batch: aitest --collect-only, eject diagnostic, pylib nested confine, flake bound, docs-only pre-push, confine --list PEAK (RANT-41/43/44/45/46/47)","status":"in-progress","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-315","project":"aira","title":"Rant-triage small batch: aitest --collect-only, eject diagnostic, pylib nested confine, flake bound, docs-only pre-push, confine --list PEAK (RANT-41/43/44/45/46/47)","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.40","labels":[],"hold":false,"relations":[]}
 ---
 From the 2026-10-25 rant triage; each item verified.
 1. RANT-41: internal/pylib/aitest/__init__.py pytest_runtestloop ignores --collect-only and collection errors; return None (hand back to pytest's own loop) when option.collectonly or (session.testsfailed and not continue_on_collection_errors). Pin with a test.
