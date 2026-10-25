@@ -438,9 +438,13 @@ func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 		// firing below a clean peak at three samples).
 		storeShape(t, []ownFloorRow{{peak: 6979321856}, {peak: 7247757312, oom: true}}),
 		storeShape(t, []ownFloorRow{{peak: 7247757312}, {peak: 7247757312}, {peak: 6442450944, oom: true}}),
+		// AIRA-314 X9: F > E > ceiling with the clamp guard failing (at 1.5 GiB,
+		// MaxOOMPeak 1778917376 >= FIT = 1400532813), so E is returned unclamped
+		// unless the floor acts.
+		storeShape(t, []ownFloorRow{{peak: 1778917376, oom: true}, {peak: 2947493888}}),
 	}
 	ceilings := []int64{
-		1205862, 1205863, 629145600, fittedSmallCeiling, 2684354560, 3179282432,
+		1205862, 1205863, 629145600, fittedSmallCeiling, 1610612736, 2684354560, 3179282432,
 		fittedInstallCeiling, 4294967296, 4294967297, 6400507904,
 		8 * gibBasis, 10 * gibBasis, 44 * gibBasis, 55 * gibBasis, 100 * gibBasis,
 	}
@@ -451,6 +455,12 @@ func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 	floorRows := 0
 	for _, stats := range shapes {
 		floor := runner.GrowByEstimatorMargin(stats.MaxCleanPeak)
+		// E, the OOM escalation, from the INPUTS (0 when the OOM branch is not
+		// entered). The test values are far from overflow.
+		var escalated int64
+		if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
+			escalated = stats.MaxOOMPeak + stats.MaxOOMPeak/2
+		}
 		for _, ceiling := range ceilings {
 			for _, hint := range hints {
 				server := fittedServer(t, staticHistory(stats), 0)
@@ -469,12 +479,20 @@ func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 				}
 				// (c) Where the floor demands more than master, the floor IS the
 				// value and the basis names it -- except the AIRA-153 R3 band, where
-				// an unclamped escalation over the ceiling is refused anyway.
+				// an unclamped escalation over the ceiling is refused anyway. The
+				// band is decided from the INPUTS (E over the ceiling, E not below
+				// F, and E is what came back), never from the returned basis: a
+				// basis-keyed exemption would excuse a floor that failed to act on
+				// an F > E > ceiling shape (X9).
 				if floor > master {
-					r3 := got > ceiling && basis == "estimate:oom-escalated"
+					r3 := escalated > ceiling && escalated >= floor && got == escalated
 					if !r3 && (got != floor || !strings.HasPrefix(basis, "estimate:own-max=")) {
 						t.Fatalf("stats=%+v ceiling=%d hint=%d: resolved %d (%s), want the floor %d under an estimate:own-max= basis (master %d)",
 							stats, ceiling, hint, got, basis, floor, master)
+					}
+					if r3 && basis != "estimate:oom-escalated" {
+						t.Fatalf("stats=%+v ceiling=%d hint=%d: resolved the unclamped escalation %d under basis %q, want %q (the floor did not strictly raise it)",
+							stats, ceiling, hint, got, basis, "estimate:oom-escalated")
 					}
 					if !r3 {
 						floorRows++

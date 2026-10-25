@@ -212,11 +212,22 @@ func TestOwnPeakFloorTable(t *testing.T) {
 	}
 
 	for _, test := range []struct {
-		name   string
-		rows   []ownFloorRow
-		pinned int64
-		want   ownFloorWant
+		name    string
+		rows    []ownFloorRow
+		pinned  int64
+		ceiling int64 // 0 means ownFloorCeiling
+		want    ownFloorWant
 	}{
+		{
+			// The outcome-table row "OOM branch, E > ceiling, clamp guard fails":
+			// E = 2668376064 > ceiling 1610612736, and MaxOOMPeak 1778917376 is not
+			// below FIT(1610612736) = 1400532813, so the clamp does not fire and E is
+			// returned unclamped. F = 3389617971 > E, so the floor is the value.
+			name:    "X9 E over the ceiling, clamp guard fails, F above E",
+			rows:    []ownFloorRow{{peak: 1778917376, oom: true}, {peak: 2947493888}},
+			ceiling: 1610612736,
+			want:    ownFloorWant{3389617971, "estimate:own-max=2947493888,n=2,f=115,oom-on-record"},
+		},
 		{
 			// Case C: OOM-only, censored evidence; AIRA-153's clamp stands.
 			name: "X1 case C, OOM-only n=1 in the clamp band",
@@ -271,7 +282,11 @@ func TestOwnPeakFloorTable(t *testing.T) {
 			if test.pinned > 0 {
 				request = admitRequest{reserve: test.pinned, signature: "target", pinned: true}
 			}
-			reserve, basis := server.resolveAdmitReserve(request, ownFloorCeiling)
+			ceiling := test.ceiling
+			if ceiling == 0 {
+				ceiling = ownFloorCeiling
+			}
+			reserve, basis := server.resolveAdmitReserve(request, ceiling)
 			if reserve != test.want.reserve || basis != test.want.basis {
 				t.Fatalf("reserve=%d basis=%q, want %d/%q", reserve, basis, test.want.reserve, test.want.basis)
 			}
@@ -387,19 +402,29 @@ func TestOwnPeakFloorWithNoReadablePrior(t *testing.T) {
 // TestOwnPeakFloorOverTheCeilingIsRefusedWithTheOwnHistoryAdvice is AIRA-314 T8:
 // through the real admitConnection over net.Pipe, a floor over the ceiling is
 // refused at request entry, naming both numbers, with the "OWN measured peak
-// history" advice, and nothing is enqueued (I5, I8).
+// history" advice, and nothing is enqueued (I5, I8). X9 pins the unclamped
+// escalation over the ceiling (clamp guard failing) that the floor must replace.
 //
 // verifies: AIRA-314 I5, I8; T8
 func TestOwnPeakFloorOverTheCeilingIsRefusedWithTheOwnHistoryAdvice(t *testing.T) {
 	// One job's headroom on this server is 32 MiB + 8 MiB, so cap - headroom is
-	// exactly 8 GiB.
-	const maximum = ownFloorCeiling + (32 << 20) + (8 << 20)
+	// exactly the cell's ceiling (8 GiB unless the cell names another).
 	for _, test := range []struct {
 		name     string
 		rows     []ownFloorRow
+		ceiling  int64 // 0 means ownFloorCeiling
 		required int64
 		basis    string
 	}{
+		{
+			// X9: E = 2668376064 over the 1.5 GiB ceiling with the clamp guard
+			// failing; F = 3389617971 > E, so the refusal must name F and the
+			// own-history advice, not E and the OOM-escalated arm.
+			name:     "X9: unclamped escalation over the ceiling, below the clean peak",
+			rows:     []ownFloorRow{{peak: 1778917376, oom: true}, {peak: 2947493888}},
+			ceiling:  1610612736,
+			required: 3389617971, basis: "estimate:own-max=2947493888,n=2,f=115,oom-on-record",
+		},
 		{
 			name: "one clean run over the ceiling", rows: []ownFloorRow{{peak: ownFloorOver}},
 			required: 9261023232, basis: "estimate:own-max=8053063680,n=1,f=115",
@@ -411,6 +436,11 @@ func TestOwnPeakFloorOverTheCeilingIsRefusedWithTheOwnHistoryAdvice(t *testing.T
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			ceiling := test.ceiling
+			if ceiling == 0 {
+				ceiling = ownFloorCeiling
+			}
+			maximum := ceiling + (32 << 20) + (8 << 20)
 			server, _ := ownFloorServer(t, false, test.rows...)
 			server.admitPollInterval = time.Hour
 			server.admitSliceHeadroomBase = 32 << 20
@@ -467,9 +497,9 @@ func TestOwnPeakFloorOverTheCeilingIsRefusedWithTheOwnHistoryAdvice(t *testing.T
 			if err := json.Unmarshal(frame.Data, &rejection); err != nil {
 				t.Fatalf("rejection payload: %v", err)
 			}
-			if rejection.Required != test.required || rejection.Ceiling != ownFloorCeiling || rejection.Basis != test.basis {
+			if rejection.Required != test.required || rejection.Ceiling != ceiling || rejection.Basis != test.basis {
 				t.Fatalf("rejection=%+v, want required=%d cap_minus_headroom=%d basis=%q",
-					rejection, test.required, ownFloorCeiling, test.basis)
+					rejection, test.required, ceiling, test.basis)
 			}
 			if !strings.Contains(frame.Error, measuredAdvicePhrase) {
 				t.Fatalf("error=%q, want the %q advice arm", frame.Error, measuredAdvicePhrase)
