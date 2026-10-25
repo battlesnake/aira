@@ -403,6 +403,79 @@ func TestEjectChecksEveryRegisteredWorktree(t *testing.T) {
 	}
 }
 
+// partialRootsFixture registers a second git worktree of the lifecycle project
+// and then removes it from disk, leaving one present and one missing root.
+func partialRootsFixture(t *testing.T) (*Server, WorktreeScope, string) {
+	t.Helper()
+	server, scope, _ := lifecycleFixture(t)
+	commitAIRA(t, scope.Root)
+	secondRoot := filepath.Join(filepath.Dir(scope.Root), "second")
+	if output, err := exec.Command("git", "-C", scope.Root, "worktree", "add", "-q", "-b", "second", secondRoot).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v: %s", err, output)
+	}
+	secondProject, err := app.Discover(context.Background(), secondRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondScope, err := ScopeFromProject(secondProject, server.Paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := server.storeForScope(secondScope); err != nil {
+		t.Fatal(err)
+	}
+	registration, err := server.db.ProjectRegistration(context.Background(), scope.ProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registration.Worktrees) != 2 {
+		t.Fatalf("registered worktrees=%+v, want both roots active", registration.Worktrees)
+	}
+	if err := os.RemoveAll(secondRoot); err != nil {
+		t.Fatal(err)
+	}
+	return server, scope, filepath.Clean(secondRoot)
+}
+
+// verifies: AIRA-315 (RANT-45) the partial-roots refusal names the project and
+// every missing and present root, keeping its stable code.
+func TestEjectPartialRootsNamesTheProjectAndEveryRoot(t *testing.T) {
+	server, scope, missingRoot := partialRootsFixture(t)
+	got := server.eject(context.Background(), map[string]any{"project": scope.ProjectID, "force": true})
+	if got.Code != "E_EJECT_UNVERIFIED" || !strings.HasPrefix(got.Error, "E_EJECT_UNVERIFIED: ") {
+		t.Fatalf("partial-roots eject=%+v, want E_EJECT_UNVERIFIED", got)
+	}
+	if want := "project life (" + scope.ProjectID + ")"; !strings.Contains(got.Error, want) {
+		t.Fatalf("partial-roots message %q does not name the project (%q)", got.Error, want)
+	}
+	if want := "1 of 2 registered worktree roots are missing: " + missingRoot + "; present: " + filepath.Clean(scope.Root) + ". "; !strings.Contains(got.Error, want) {
+		t.Fatalf("partial-roots message %q does not list the missing and present roots (%q)", got.Error, want)
+	}
+}
+
+// verifies: AIRA-315 (RANT-45) the remedy the refusal names ('aira check' in a
+// present worktree) really retires the missing root, so a second eject is no
+// longer the partial-roots refusal. Driven through the same Store.Check the
+// daemon's check storeop calls.
+func TestEjectPartialRootsRemedyInTheMessageWorks(t *testing.T) {
+	server, scope, _ := partialRootsFixture(t)
+	first := server.eject(context.Background(), map[string]any{"project": scope.ProjectID, "force": true})
+	if first.Code != "E_EJECT_UNVERIFIED" || !strings.Contains(first.Error, "aira check") {
+		t.Fatalf("first eject=%+v, want the partial-roots refusal naming 'aira check'", first)
+	}
+	view, _, err := server.storeForScope(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := view.Check(context.Background()); err != nil {
+		t.Fatalf("aira check in the present worktree: %v", err)
+	}
+	second := server.eject(context.Background(), map[string]any{"project": scope.ProjectID, "force": true})
+	if !second.OK {
+		t.Fatalf("eject after 'aira check' = %+v, want success", second)
+	}
+}
+
 func TestEjectNonENOENTStatFailureIsNotTreatedAsGone(t *testing.T) {
 	server, scope, _ := lifecycleFixture(t)
 	component := filepath.Join(scope.Root, "not-a-directory")
