@@ -229,7 +229,7 @@ func TestTooLargeRefusalAdviceIsCaseSplitByPopulation(t *testing.T) {
 // on the same rule that makes an unestablished check `unevaluated` rather than
 // a pass: the refusal still names both numbers and the basis.
 //
-// verifies: AIRA-165
+// verifies: AIRA-165; AIRA-314 T16
 func TestTooLargeAdviceIsDecidedByTheTermNotTheTrailingTokens(t *testing.T) {
 	for _, test := range []struct {
 		basis  string
@@ -244,6 +244,9 @@ func TestTooLargeAdviceIsDecidedByTheTermNotTheTrailingTokens(t *testing.T) {
 		{"estimate:max=2147483648,n=5,f=115,oom-on-record", measuredAdvicePhrase},
 		{"estimate:oom:max=2147483648,n=5,oom=1,f=115", measuredAdvicePhrase},
 		{"estimate:capped", measuredAdvicePhrase},
+		// AIRA-314 T16: the own-peak floor is this command's own measurement.
+		{"estimate:own-max=2947493888,n=2,f=115", measuredAdvicePhrase},
+		{"estimate:own-max=2947493888,n=2,f=115,oom-on-record", measuredAdvicePhrase},
 		{"fallback:no-history", blindAdvicePhrase},
 		{"fallback:no-history,ceiling-fitted", blindAdvicePhrase},
 		{"fallback:no-signature", blindAdvicePhrase},
