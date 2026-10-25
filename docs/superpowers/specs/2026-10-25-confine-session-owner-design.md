@@ -14,6 +14,21 @@ mandatory real-cgroup gate evidence; T10 uses the real status reader; T1/T5/T8
 wording fixed; RANT-49 softened; two missed text touch points added; the runtime
 assert and the `internal/daemon` scrub are removed.
 
+Revision 3 (2026-10-25): answers the second plan review and plan gate (both
+REVISE, P2/P3 spec edits only). Changes: the `aira board` ticket/project
+correlation loss for session-owned jobs is recorded as accepted gap G2, with
+doc-comment updates and a pin test (T12); T11 (iv), the detached leg, is
+dropped (wrong seam; T10 + T6 cover it); T11's launch-owner check moves to the
+test goroutine and its legs become independent subtests so each mutation
+reaches its assertion; T10 asserts the exact exit and stdout; the
+`--status` NOT_FOUND text in `confine_detach.go` stops suggesting `--owner`
+(I8 now holds); the skill's queued-job advice is conditioned on the row's owner
+being yours; the CLI dual-process row and the parallel-subagents row are
+explicit; compaction keeping the id is recorded; `/resume` wording corrected;
+the skill bullets are shortened; the new `cmd/aira` `TestMain` also plays
+`__confine-setup`, so T11 runs the code under test instead of the installed
+helper.
+
 ## Problem, restated
 
 `aira confine --kill/--front/--resize` refuse a session's OWN job.
@@ -48,9 +63,16 @@ Measured on this box (2026-10-25):
   (`CLAUDE_CODE_CHILD_SESSION=1`, same `CLAUDE_PID`). Subagents inherit the
   parent session's id.
 * All live `aira mcp` servers carry `CLAUDE_CODE_SESSION_ID`, each a different
-  value. The plan gate re-measured 13 of 13 servers agreeing with their parent
-  claude process's current id in `~/.claude/sessions/<pid>.json`. So the MCP face
-  and the CLI face of one claude process agree, until the id changes (below).
+  value. Measured three times against the parent claude process's current id in
+  `~/.claude/sessions/<pid>.json`: 13 of 13 (revision-2 gate), 13 of 13 including
+  7 processes about 11 days old (revision-3 review), 9 of 9 (revision-3 gate).
+  One reviewer's own MCP server (pid 2148926) carried the same id as its Bash
+  env. So the MCP face and the CLI face of one claude process agree, until the id
+  changes (below).
+* **Compaction keeps the id** (reported measured by the revision-3 plan review):
+  transcript `d025c70e` (73 MB, 38594 rows) has 25 `compact_boundary` entries
+  and exactly one `sessionId`. Long auto-compacted sessions, normal on this box,
+  were the largest false-fail risk; they are not one.
 * The `claude` processes' own exec environ does NOT carry it. Claude Code injects
   it into each child when the child is spawned.
 * **The id does change.** In `~/.claude/history.jsonl` (18602 rows, sorted by
@@ -58,9 +80,16 @@ Measured on this box (2026-10-25):
   next row in the same project carries a different `sessionId` in 16 of 16
   `/clear` cases and 139 of 148 `/resume` cases (3 had no next row). Heuristic
   caveat: the next row in a project may come from a concurrent session, but the
-  16/16 rate leaves no doubt that `/clear` issues a new id. And `claude --resume
-  X` in another process makes that process present id X again, so **one id can be
-  live in two processes at once**.
+  16/16 rate leaves no doubt that `/clear` issues a new id. `/resume` CHANGES the
+  process's id to the resumed conversation's EXISTING id (it does not mint a new
+  one). And `claude --resume X` in another process makes that process present id
+  X again, so **one id can be live in two processes at once**.
+* `claude --help` (documented, not measured): `--fork-session` "when resuming,
+  create[s] a new session ID instead of reusing the original"; the background
+  launcher, given `--resume <id>` of a session that is already running, "starts a
+  copy and says so". Whether an interactive `claude --resume X` of a LIVE X also
+  copies is not verified; the false-pass table assumes the worse case (it does
+  not).
 * **Not verified:** whether a running claude process's Bash tool env picks up the
   new id after `/clear` (no `/clear` on a live process was observed). Either way
   the CLI resolves whatever its env holds.
@@ -87,8 +116,11 @@ make `CheckConfineOwner`'s refusal explain itself.
 | Strict shape check on the session id (canonical lowercase UUID), with fall-through to the old chain | Requirement (e): an empty, padded, oversized or odd value must never error or panic, and must behave exactly like today. The exact shape also gives `aira top` an exact recognizer instead of a "starts with cc-" heuristic that would swallow a human owner named `cc-deploy`. |
 | `aira top` SESSION cell treats a `cc-<uuid>` owner like a worktree hash (tmux window name first, else `cc-` + 8 hex) | Without it every Claude-launched job shows a 39-character id in SESSION instead of the tmux window name, undoing AIRA-277 for the most common launcher on this box. One condition in `topSessionCell`. |
 | Skill text (`internal/core/skill.go`) and the generated `owner` flag text (`internal/core/core.go`) and two stale doc comments | The current texts say the default is the worktree and that only `AIRA_CONFINE_OWNER` gives an attested owner. After this change that is false, and the skill and generated help/MCP schema are where agents learn the owner rules. Text only. |
-| `TestMain` in `cmd/aira` that unsets `CLAUDE_CODE_SESSION_ID` | The gate is run from inside Claude sessions, where the variable is set; GitHub CI has none. Without the scrub `TestConfineOwnerDerivationChain` (`cmd/aira/confine_test.go:83`, asserts the worktree id with `AIRA_CONFINE_OWNER` empty) fails whenever the suite runs inside a Claude session. Same pattern as `internal/app/git_env_test.go`'s `GIT_*` scrub (AIRA-93). New tests set the variable explicitly with `t.Setenv`. |
-| Skill sentences: the G1 gap, and how to end a queued job | G1 is an accepted gap and must be written where agents read it. The queued-job sentence answers the RANT-49 `E_CONFINE_NOT_FOUND` half (see "RANT-49 finding"). Text only. |
+| `TestMain` in `cmd/aira` (new `cmd/aira/main_test.go`) that unsets `CLAUDE_CODE_SESSION_ID` | The gate is run from inside Claude sessions, where the variable is set; GitHub CI has none. Without the scrub `TestConfineOwnerDerivationChain` (`cmd/aira/confine_test.go:83`, asserts the worktree id with `AIRA_CONFINE_OWNER` empty) fails whenever the suite runs inside a Claude session. Same pattern as `internal/app/git_env_test.go`'s `GIT_*` scrub (AIRA-93). New tests set the variable explicitly with `t.Setenv`. |
+| Skill sentences: the G1 gap, and how to end a queued job you own | G1 is an accepted gap and must be written where agents read it. The queued-job sentence answers the RANT-49 `E_CONFINE_NOT_FOUND` half (see "RANT-49 finding"). Text only. |
+| `--status` NOT_FOUND text (`internal/runner/confine_detach.go:ResolveConfineDetachStatus`, line 335) stops saying "or pass --owner" | The same override-by-copying-the-victim's-owner pattern the guard text avoids (I8), on exactly the path agents hit after `/clear`. One string. |
+| G2: `aira board` correlation doc comments + pin test T12, no correlation code | The change silently drops ticket/project correlation for session-owned jobs on the board (gap G2). Under the simplicity rule the answer is to write the gap down, not to add a second correlation key; T12 makes the gap visible in tests so it cannot change silently either way. |
+| `TestMain` in `cmd/aira` also plays `__confine-setup` | Lets T11 launch a real confined job with the default `SelfPath` (`/proc/self/exe` = the test binary), so the real-cgroup leg runs the code under test and has no installed-helper skip or version skew. Two lines, the same guard `internal/daemon/main_test.go` already uses. |
 
 Removed from revision 1 (no live justification): the runtime assert inside
 `ConfineSessionOwner` (validity is by construction and pinned by T6/T8, so it was
@@ -112,8 +144,10 @@ sides attested and equal, or `--steal`) does not change.
 2. `CheckConfineOwner` refusal text distinguishes three cases and says what to do.
    It stays the ONE guard for `--kill` (real and ci-shim), `--front`, `--resize`.
 3. `aira top` SESSION cell for a session owner.
-4. Skill text, generated owner-flag text, two doc comments.
-5. Test environment scrub in `cmd/aira`.
+4. Skill text, generated owner-flag text, doc comments (including the two
+   `aira board` correlation comments, G2).
+5. The `--status` NOT_FOUND text in `confine_detach.go`.
+6. `cmd/aira` `TestMain`: environment scrub plus the `__confine-setup` role.
 
 ## Design
 
@@ -232,31 +266,69 @@ tmux pane has no session id, so Claude-launched jobs are foreign there and `f` /
 `e` show the existing `--steal` confirmation. Intended (it is the
 shared-worktree false pass closed).
 
+### `aira board` correlation (accepted gap G2)
+
+`aira board` links a running confine job to a ticket and a project by looking
+its `record.Owner` up in maps keyed by worktree id:
+
+* `cmd/aira/tui_board_viewmodel.go:boardSessionRows` (336-395):
+  `ticketByWorktree[owner]`, else "ticket unknown";
+* `cmd/aira/tui_board_overview_viewmodel.go:overviewOwnedJobs` (168-182): counts
+  only owners in the project's worktree-id set;
+* `cmd/aira/tui_board_overview_viewmodel.go:overviewJobsRows` (398-404):
+  `ownerProject[record.Owner]`, else "project unknown".
+
+After this change nearly every job is launched from a Claude session and owned
+by `cc-<uuid>`, so on the board its session row reads "ticket unknown", the
+project card's owned-job count does not include it, and the jobs strip reads
+"project unknown". The same already happens today to every job launched with an
+`AIRA_CONFINE_OWNER` name (a label is not a worktree id), so G2 widens an
+existing gap rather than opening a new kind.
+
+**Decision: accept and document; no correlation code in this ticket.** A second
+correlation key (the launch directory, which `ConfineRecord` does not carry, or
+the lease actor) is new machinery for a display-only feature, which the
+architectural-simplicity rule says telemetry alone never justifies. Changes:
+
+* the doc comments of `boardSessionRows` and `overviewOwnedJobs` say: ONLY a
+  worktree-id owner correlates; a Claude Code session owner (`cc-<uuid>`) and an
+  `AIRA_CONFINE_OWNER` label are attested but never correlate (rendered
+  uncorrelated, never attributed to a ticket, card or project);
+* T12 pins the exact uncorrelated output for a `cc-` owner;
+* deferral: link by launch directory or lease actor later, if the board's
+  correlation is missed.
+
 ### Skill text (`internal/core/skill.go:320`, the confine paragraph)
 
 Replace "Set `AIRA_CONFINE_OWNER` to get a real, attested owner you can kill
-without `--steal`." and update the SESSION-fallback parenthesis to say:
+without `--steal`." and update the SESSION-fallback parenthesis. Kept short (the
+paragraph is already long): four bullets' worth of sentences.
 
-* the default chain: `--owner` / `AIRA_CONFINE_OWNER`, else your Claude Code
+* **Chain.** Owner is `--owner` / `AIRA_CONFINE_OWNER`, else your Claude Code
   session (`cc-<session id>`, shared by your subagents, so from any directory you
-  can manage your own and your subagents' jobs), else the git worktree of the
-  CURRENT directory, else an inferred `@cwd-...` owner;
-* outside a Claude session, a job launched from one worktree is not yours when
-  you run `--kill` from another: run it from the launch worktree or set the owner
-  inline at launch;
-* `/clear` and resuming a conversation give it a NEW session id, so jobs launched
-  before that are no longer yours by default: use `--steal` (recorded) to act on
-  them, or launch long or detached jobs with an `AIRA_CONFINE_OWNER` name (and
-  keep the scope id for `--status`);
-* the MCP face (G1): the `aira` MCP server keeps the session id it was started
-  with; after `/clear` or a resume, manage jobs from the CLI face (Bash) or
-  restart the MCP connection, because the MCP face still acts as the OLD session;
-* the `@` rule unchanged (still "never counts as ownership", `--steal` even from
-  the same directory);
-* `--kill` acts on running jobs only: a job still waiting for admission has no
-  scope and gives `E_CONFINE_NOT_FOUND`; end it by finding its supervisor pid in
-  the queued rows of `aira confine --list` and running plain `kill <pid>` on that
-  supervisor (never `kill -9`).
+  manage your own and your subagents' jobs), else the git worktree of the CURRENT
+  directory, else an inferred `@cwd-...` owner. Outside a Claude session that
+  means a job launched from one worktree is not yours from another: run `--kill`
+  from the launch worktree or set `AIRA_CONFINE_OWNER` inline at launch. Parallel
+  subagents of one conversation are ONE owner, even on different tickets and
+  worktrees: give every job a distinct `--name`, which is what keeps a sibling's
+  `--kill <name>` off your job.
+* **Id changes.** `/clear` and `/resume` change this session's id, so jobs
+  launched before that are no longer yours by default: act on them with
+  `--steal` (recorded), or launch long or detached jobs with an
+  `AIRA_CONFINE_OWNER` name (and keep the scope id for `--status`). The `aira`
+  MCP server keeps the id it was started with, so after `/clear` or `/resume` the
+  MCP confine tools may act as the OLD id (G1): prefer the CLI face (Bash) for
+  management, or restart the MCP connection.
+* **`@` rule** unchanged: an inferred `@...` owner never counts as ownership,
+  `--steal` even from the same directory.
+* **Queued jobs.** `--kill` acts on running jobs only: a job still waiting for
+  admission gives `E_CONFINE_NOT_FOUND`. Only when that queued row's OWNER is
+  yours (`cc-<your CLAUDE_CODE_SESSION_ID>` or your `AIRA_CONFINE_OWNER` name;
+  `aira confine --list` shows it, `--list --json` carries it as `queued[].owner`)
+  end it with plain `kill <supervisor pid>` (never `kill -9`). A plain kill
+  bypasses the ownership guard and the audit line, so never use it on a row you
+  do not own.
 
 ### Generated text and doc comments
 
@@ -270,6 +342,13 @@ without `--steal`." and update the SESSION-fallback parenthesis to say:
   AIRA_CONFINE_OWNER, Claude Code session, worktree id, `@cwd`.
 * `cmd/aira/tui_top.go:619` and the `topSessionCell` doc comment (1006-1028):
   mention the session-owner arm.
+* `cmd/aira/tui_board_viewmodel.go:boardSessionRows` and
+  `cmd/aira/tui_board_overview_viewmodel.go:overviewOwnedJobs` doc comments: G2
+  wording above.
+* `internal/runner/confine_detach.go:ResolveConfineDetachStatus` (335): the
+  NOT_FOUND text becomes "... (%d matched other owners; name the scope id, or run
+  this from the session, or with the AIRA_CONFINE_OWNER name, that launched it)".
+  Code and leading fields unchanged.
 
 ## Invariants
 
@@ -287,7 +366,13 @@ without `--steal`." and update the SESSION-fallback parenthesis to say:
 * I6. An inferred owner (`@...`) is still never attested.
 * I7. A `cc-` owner round-trips through the scope id (`MintConfineScopeID`,
   `MintWorkerScopeID`, `ParseConfineScopeID`, `bindConfineScopeID`) unchanged.
-* I8. No refusal text suggests `--owner` as a remedy.
+* I8. No refusal text suggests `--owner` as a remedy: neither
+  `CheckConfineOwner`'s three texts nor `ResolveConfineDetachStatus`'s
+  "matched other owners" text. (`internal/core/worktree.go:124`'s worktree-register
+  note "set AIRA_CONFINE_OWNER or pass --owner" is about the caller naming
+  ITSELF, not copying another's owner, and is out of scope.)
+* I9. `aira board` never attributes a `cc-` owned job to a ticket, card or project
+  (G2; changes only together with the gap record).
 
 ## Code touch points (opened and checked on `origin/master` ff03d8aa)
 
@@ -302,7 +387,10 @@ without `--steal`." and update the SESSION-fallback parenthesis to say:
 | `internal/core/skill.go` (line 320 paragraph) | text |
 | `internal/core/skill_test.go` | pins for the new phrases |
 | `internal/core/core.go` (1937 `confine` owner; 1568 `worktree-register` owner) | ArgSpec help text |
-| `cmd/aira/main_test.go` (new file; no `TestMain` exists in `cmd/aira` today) | `TestMain` scrubbing `CLAUDE_CODE_SESSION_ID` |
+| `cmd/aira/main_test.go` (new file; no `TestMain` exists in `cmd/aira` today) | `TestMain`: scrub `CLAUDE_CODE_SESSION_ID`; when `os.Args[1] == "__confine-setup"`, `os.Exit(runner.RunConfineSetup(os.Args[2:], os.Stderr))` (as `internal/daemon/main_test.go`) |
+| `internal/runner/confine_detach.go:ResolveConfineDetachStatus` (335) | NOT_FOUND text without `--owner` |
+| `cmd/aira/tui_board_viewmodel.go:boardSessionRows` (330-335 comment), `cmd/aira/tui_board_overview_viewmodel.go:overviewOwnedJobs` (164-167 comment) | G2 comment text only |
+| `cmd/aira/tui_board_viewmodel_test.go`, `cmd/aira/tui_board_overview_viewmodel_test.go` | T12 |
 
 Unchanged but on the path, checked:
 
@@ -346,12 +434,15 @@ Unchanged but on the path, checked:
 |---|---|---|
 | Two Claude sessions, distinct ids, same worktree (repo root) | **refused** (today: allowed) | The shared-root hole closes for Claude sessions. Test T3. |
 | Two Claude sessions, distinct ids, different worktrees | refused | as today |
-| Coordinator and its subagents (same id) | allowed | Intended unit: fixes RANT-49 part 2. Consequence: one subagent can kill a sibling subagent's job. Accepted (same conversation). |
+| Coordinator and its subagents (same id) | allowed | Intended unit: fixes RANT-49 part 2. |
+| Parallel workflow subagents of one conversation on different tickets and worktrees (same id; e.g. this spec's reviewer and builder share `b6b9daa7`) | allowed | **Accepted.** Before, separate worktrees kept a sibling's `--kill gate` off a builder's `gate`; now only distinct `--name` values do. The skill's chain bullet says so. One conversation is one owner. |
+| One id live in two CLI processes: P still running with id X (no `/clear`) while Q runs interactive `claude --resume X` | allowed both ways | **Accepted**: the harness presents both as one conversation, so both are that conversation's work. Whether interactive resume of a live id copies instead (as the background launcher documents) is unverified; `--fork-session` is documented to give a new id, which closes this case for users who pass it. |
 | Non-Claude shells sharing a worktree | allowed (unchanged) | Residual false pass; deleting the worktree default is deferred. |
 | Process passing `--owner cc-<other id>` or `--owner <other worktree hash>` | allowed | Same as copying a worktree hash today. The guard prevents accidents, it does not authenticate (AIRA-23). AIRA itself never suggests this (I8, T4). |
 | A non-Claude tool (codex, make, a script) run from a Claude Bash call | owns as that session | It inherits the id. It is that session's work. |
 | A nested `claude` started from a Claude Bash call | not verified whether it injects its own id or inherits | The plan gate tried to measure it; the candidate processes exited first. Either outcome keeps the identity inside one human-launched tree. Not load-bearing. |
 | **G1. MCP owner fixed for the MCP server's life**, combined with `claude --resume` of an old id elsewhere | **allowed** (accepted gap) | See G1 below. |
+| Board correlation (G2) | n/a (display only) | Session-owned jobs are never attributed on the board; see "`aira board` correlation". Not a guard path. |
 
 #### G1 (accepted gap): the MCP face keeps its spawn-time session id
 
@@ -380,13 +471,14 @@ Unchanged but on the path, checked:
 
 | Case | Result | Disposition |
 |---|---|---|
-| Same session, launch and kill from different cwds | **allowed** (today: refused) | the fix; tests T3, T11 |
+| Same session, launch and kill from different cwds | **allowed** (today: refused) | the fix; tests T3, T11 subtest `cli` |
 | Same session, two non-project directories (RANT-48 shape, e.g. `~/tmp/kit-fix`) | **allowed** (today: refused, `@cwd` owner) | T3b |
 | Coordinator kills its subagent's job | allowed | |
-| `--status` / `confine-log` / `confine-input` by name from another cwd, same session | **found** (today: "matched other owners") | same resolved caller; tests T10 and T11 (iv). `confine-input` covered by the shared resolver only (accepted coverage gap, see Test plan). |
-| CLI-launched job managed over MCP, same session, no id change since the MCP server started | allowed | MCP server carries the same id (measured 13/13); test T11 (iii) |
-| After `/clear` or a resume (id changes, measured): jobs launched before it | refused; needs `--steal` (recorded) | Fail-safe. Remedy in the skill and refusal case 3: `--steal`, or launch long jobs with an `AIRA_CONFINE_OWNER` name. For `--status`, a scope-id selector always matches. |
-| After `/clear` or a resume: jobs the CLI launches under the new id, managed over the still-old MCP face | refused (G1 reverse) | Fail-safe; skill says use the CLI face or restart the MCP connection. Whether the Bash env follows the new id is not verified; if it does not, CLI and MCP agree on the old id and nothing is refused. |
+| `--status` / `confine-log` / `confine-input` by name from another cwd, same session | **found** (today: "matched other owners") | same resolved caller; test T10 (real reader, real CLI entry). `confine-log` and `confine-input` covered by the shared resolver only (accepted coverage gap, see Test plan). |
+| CLI-launched job managed over MCP, same session, no id change since the MCP server started | allowed | MCP server carries the same id (measured 13/13, 13/13, 9/9); test T11 subtest `mcp` |
+| Long session across auto-compaction | allowed | compaction keeps the id (measured) |
+| After `/clear` or `/resume` (id changes, measured): jobs launched before it | refused; needs `--steal` (recorded) | Fail-safe. Remedy in the skill and refusal case 3: `--steal`, or launch long jobs with an `AIRA_CONFINE_OWNER` name. For `--status`, a scope-id selector always matches. |
+| After `/clear` or `/resume`: jobs the CLI launches under the new id, managed over the still-old MCP face | refused (G1 reverse), IF the Bash env follows the new id | Fail-safe. Whether the Bash env follows the new id is not verified; if it does not, CLI and MCP agree on the old id and nothing is refused. The skill says to prefer the CLI face or restart the MCP connection. |
 | A detached job managed from a LATER session | refused by name; `--status` with no selector no longer lists it | Today this worked if the later session sat in the same worktree. Remedy: launch long detached jobs with `AIRA_CONFINE_OWNER=<name>`, or keep the scope id (a scope-id selector always matches in `--status`). Stated in the skill. |
 | Jobs launched before the upgrade (owner = worktree id), killed after it by a Claude session | refused (case 3 text) | One-off transition; jobs are short-lived; `--steal`. |
 | A human in a plain tmux pane (no id) managing Claude-launched jobs in the same worktree | refused (today: allowed) | Intended; this was the false pass. `aira top` already offers a `--steal` confirmation. |
@@ -421,9 +513,16 @@ session owns both. Not a new hole (the guard still applies), and distinct names
 are already the skill's advice for detached jobs; recorded in the deferred
 friendlier-not-found follow-up.
 
-No mechanism changes here. The skill gains the queued-job sentence (how to end
-one: its supervisor pid from the queued rows of `aira confine --list`, then plain
-`kill <pid>`).
+Re-checked by both revision-3 reviewers: the owner guard runs only AFTER a
+selector match, so an owner can never produce `E_CONFINE_NOT_FOUND`; nested
+confines are sibling scopes on the same slice (`confine_linux.go:1962`), so they
+are not hidden from `--kill`. `--front` already acts on pure queue state, so a
+guarded queued-job cancel is feasible later (deferred, not this ticket).
+
+No mechanism changes here. The skill gains the queued-job sentence, conditioned
+on the queued row's owner being the caller's own (end it by its supervisor pid
+from `aira confine --list`, plain `kill <pid>`, which bypasses the guard and the
+audit line).
 
 ## Test plan
 
@@ -442,15 +541,24 @@ named) and green against the fix; the commit message records each mutation run
 | T6 | `TestConfineScopeIDRoundTripsSessionOwner` (`internal/runner/confine_scope_bind_test.go` or neighbour) | `MintConfineScopeID` and `MintWorkerScopeID` with `cc-<uuid>` -> `ParseConfineScopeID` returns it; `bindConfineScopeID` accepts; `ValidateConfineIdentity` and `ValidateConfineOwner` accept; `.aira-` + id with a 100-char name is <= 255 bytes | set `maxConfineOwnerLen` to 38 |
 | T7 | `TestTopSessionCellClaudeSessionOwner` (`cmd/aira/tui_top_test.go`) | `cc-<uuid>` + pane `deploy` -> `deploy`; no pane -> `cc-` + 8 hex; human owner `cc-deploy` + pane -> `cc-deploy` (a chosen name beats the pane) | (a) drop the recognizer from `chosen`; (b) render the session owner verbatim; (c) recognize by `HasPrefix("cc-")` only |
 | T8 | `TestConfineSessionOwnerShape` (`internal/runner/confine_test.go` or neighbour) | calls `ConfineSessionOwner` and `IsConfineSessionOwner` DIRECTLY: accepted values (canonical, padded); every fall-through value including a NUL byte, an embedded newline, an embedded space and an embedded tab inside the id (separate cases from trimmed padding) -> `ok == false`, no panic; every `ok == true` result passes both validators | loosen to a prefix or length check; trim inner whitespace (embedded space accepted) |
-| T9 | `internal/core/skill_test.go` pins | new phrases present (session default, subagents, `/clear`-or-resume new id, MCP face keeps its id, queued job ended by its supervisor pid); the `@`-rule phrase still present; the removed sentence absent; `core.go` `confine` owner help mentions the session default | revert `skill.go`; revert the `core.go` help text |
-| T10 | `TestConfineStatusSameSessionAcrossWorktrees` (`cmd/aira/confine_detach_test.go`) | the `confineDetachStatusFor` seam is NOT replaced: the real `runner.ConfineDetachStatusFor` reads a detach directory on disk under a private `XDG_STATE_HOME`, named with `runner.MintConfineScopeID` and the owner returned by `resolveConfineOwner` in worktree A with id X (the directory name is the authoritative owner the real reader parses); the caller comes from the real CLI entry `runWithInput(["confine","--status",name])` run in worktree B: id X -> found (exit not 2, no NOT_FOUND); id Y -> `E_CONFINE_NOT_FOUND ... matched other owners`; the scope-id selector with id Y -> found | delete the step (X from B no longer matches) |
-| T11 | `TestConfineKillSameClaudeSessionFromAnotherWorktree` (`cmd/aira/dispatcher_inprocess_test.go`, the real-cgroup tier of `TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks`) | private daemon (`XDG_STATE_HOME`, `XDG_RUNTIME_DIR` under the test dir), installed helper as `SelfPath`; `CLAUDE_CODE_SESSION_ID=X`, `AIRA_CONFINE_OWNER` unset, cwd = worktree A; launch through the CLI entry `runWithInput(["confine","--name",n,"--","sleep","60"])` with `runConfined` wrapped only to set `SelfPath` / private paths (it asserts `request.Owner == "cc-X"` and never sets it); wait for the placed state; `chdir` to worktree B; (i) id Y -> CLI `confine --kill n` -> `E_CONFINE_OWNER_UNVERIFIED` with the case-3 phrase; (ii) id X -> killed; (iii) a second job, killed over MCP (`runMCPWithDispatcher`) from B with id X -> killed; (iv) a third job launched with `--detach` from A with id X (real detach writer), `--status <name>` from B with id X -> found, with id Y -> matched other owners; then killed. Skips through `cgrouptest.SkipOrFailRealCgroup` like its neighbour, and with a plain skip when the installed helper `~/.local/bin/aira` is absent | delete the step ((ii), (iii) and (iv)-found refuse) |
+| T9 | `internal/core/skill_test.go` pins | new phrases present (session default, subagents, parallel subagents are one owner + distinct `--name`, `/clear` and `/resume` change the id, MCP face keeps its id, queued job: the "OWNER is yours" condition AND "bypasses the ownership guard"); the `@`-rule phrase still present; the removed sentence absent; no "gives it a NEW session id"; `core.go` `confine` owner help mentions the session default | revert `skill.go`; drop the queued-job owner condition; revert the `core.go` help text |
+| T10 | `TestConfineStatusSameSessionAcrossWorktrees` (`cmd/aira/confine_detach_test.go`) | the `confineDetachStatusFor` seam is NOT replaced: the real `runner.ConfineDetachStatusFor` reads a detach directory on disk under a private `XDG_STATE_HOME`. The directory is named with `runner.MintConfineScopeID` and the owner returned by `resolveConfineOwner` in worktree A with id X (the directory name is the authoritative owner the real reader parses); the record file inside is a marshalled `runner.ConfineDetachRecord` (the writer `confineDetachJob.write` is unexported) with `Schema: runner.ConfineDetachSchema`, matching scope id/name/owner/pid (the reader's identity cross-check still applies), `Terminal: true`, `Exit: 0`. The caller comes from the real CLI entry `runWithInput(["confine","--status",name])` run in worktree B. Id X -> **exit 0** and stdout contains `scope=<minted id>`, `owner=cc-X` and `state=finished`. Id Y -> exit `codes.ExitForCode("E_CONFINE_NOT_FOUND")`, stderr contains `matched other owners` and does NOT contain `--owner`. Scope-id selector with id Y -> exit 0 and the same stdout facts. | (a) delete the session step (X from B gets NOT_FOUND); (b) restore "or pass --owner" in `confine_detach.go:335` (id-Y leg red) |
+| T11 | `TestConfineKillSameClaudeSessionFromAnotherWorktree` (`cmd/aira/dispatcher_inprocess_test.go`, beside its real-cgroup neighbour `TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks`) | private daemon (`XDG_STATE_HOME`, `XDG_RUNTIME_DIR` under the test dir, as the neighbour); default `SelfPath` (`/proc/self/exe` = this test binary, which plays `__confine-setup` via the new `TestMain`, so the code under test mints the scope id: `confine_linux.go:652`); `AIRA_CONFINE_OWNER` unset. Two **independent subtests**, each with its own job and a `t.Cleanup` that `--steal`-kills a survivor: **`cli`**: `CLAUDE_CODE_SESSION_ID=X`, `t.Chdir(A)`; launch through the CLI entry `runWithInput(["confine","--name",n1,"--","sleep","60"])` in a goroutine, with `runConfined` wrapped only to set the private paths and to SEND `request.Owner` on a buffered channel (it never sets the owner and never calls `t.Fatal`); the test goroutine receives it and checks `== "cc-X"` with **`t.Errorf`** (continues); wait for the placed state; `t.Chdir(B)`; (i) id Y -> CLI `confine --kill n1` -> `E_CONFINE_OWNER_UNVERIFIED` with the case-3 phrase; (ii) id X -> killed, exit 0. **`mcp`**: same launch of n2 from A with id X (owner captured and checked the same way); `t.Chdir(B)`; (iii) `aira_confine_kill selector=n2` through `runMCPWithDispatcher` with id X -> killed. Skips through `cgrouptest.SkipOrFailRealCgroup` like its neighbour (no installed-helper dependency). | delete the session step: red = the owner capture in BOTH subtests (got worktree A's 64-hex id), (ii) refused `E_CONFINE_OWNER_UNVERIFIED`, (iii) refused. (i) is refused either way; its mutation sensitivity is T3's (ids X/Y in one worktree) and T4's (phrase). |
+| T12 | `TestBoardSessionOwnerNeverCorrelates` (`cmd/aira/tui_board_viewmodel_test.go`) and `TestOverviewSessionOwnerNeverCorrelates` (`cmd/aira/tui_board_overview_viewmodel_test.go`) | pins G2 exactly. Board: the ONLY lease is AIRA-9 in worktree W; one job owned by `cc-<uuid>` -> its row contains `owner cc-<uuid> · ticket unknown` and no `ticket AIRA-9`. Overview: `overviewOwnedJobs([W], {cc- job}) == 0`; `overviewJobsRows` with `ownerProject{W: "aira"}` -> the row contains `project unknown`. A control job owned by W in the same input still correlates (`ticket AIRA-9`, count 1, `project aira`), so the test cannot pass on a broken board. | (a) fall back to the sole lease's ticket / sole project when the owner is not a worktree id (red: gap changed silently); (b) drop the map lookup entirely (red: control job) |
 
-Accepted coverage gap: `confine-input` by name from another cwd has no dedicated
-test. It resolves its caller through the same `resolveConfineOwner`
-(`main.go:426`) and the run-input server compares the same string
-(`run_input_server_linux.go:199`); T1/T3 pin the resolver and T10/T11 pin the
-equality path for `--status`. Low risk; written down here rather than silent.
+Accepted coverage gaps, written down rather than silent:
+
+* `confine-input` and `confine-log` by name from another cwd have no dedicated
+  test. They resolve their caller through the same `resolveConfineOwner`
+  (`main.go:426` for input) and compare by plain string equality
+  (`run_input_server_linux.go:199`); T1/T3 pin the resolver and T10 pins the
+  equality path for `--status`. Low risk.
+* The detached writer's owner handling (`SuperviseConfineDetached` mints the
+  scope id in the supervisor from the decoded request) has no real-launch test
+  here: a CLI `--detach` re-execs `__confine-supervise`, which this test binary
+  would have to play as well, for a writer path this ticket does not change. T6
+  pins the mint/parse round trip of a `cc-` owner and T10 drives the real reader.
+  (Revision 2's T11 (iv) was dropped for this reason.)
 
 ### Gate evidence (all recorded with exact exit codes)
 
@@ -462,13 +570,12 @@ equality path for `--status`. Low risk; written down here rather than silent.
    (`.github/workflows/ci.yml:43,72`), and `make ci` neither, so T11 can skip
    while 1 and 2 exit 0; a skip is unevaluated. Required:
    `AIRA_REAL_CGROUP=1 aira confine -- go test -count=1 -run 'TestConfineKillSameClaudeSessionFromAnotherWorktree' -v ./cmd/aira`,
-   with `--- PASS: TestConfineKillSameClaudeSessionFromAnotherWorktree` (not
-   `SKIP`) in the recorded output and exit 0. Precondition, recorded: the
-   installed helper `~/.local/bin/aira` exists (the test skips without it, and
-   `AIRA_REAL_CGROUP=1` does not turn that skip into a failure).
-4. The T11 mutation under the same command: delete the session step, re-run, and
-   record (ii), (iii) and (iv)-found red (non-zero exit, the failing assertions
-   quoted), then restore.
+   with `--- PASS: TestConfineKillSameClaudeSessionFromAnotherWorktree/cli` and
+   `.../mcp` (not `SKIP`) in the recorded output and exit 0.
+4. The T11 mutation under the same command: delete the session step, re-run,
+   record a non-zero exit and quote the failing assertions by name: the owner
+   capture in `cli` and in `mcp`, the (ii) refusal in `cli`, the (iii) refusal in
+   `mcp`; then restore and re-run green.
 
 ## Risks
 
@@ -477,6 +584,8 @@ equality path for `--status`. Low risk; written down here rather than silent.
   failure.
 * **G1** (MCP id fixed for the server's life; one id live in two processes after
   a resume). Accepted, narrow, documented in the skill.
+* **G2** (`aira board` no longer correlates session-owned jobs to a ticket or
+  project). Accepted, display only, pinned by T12, deferred.
 * **Test environment leakage.** Mitigated by the `TestMain` scrub and by running
   the gate both with and without the variable.
 * **Behaviour change for shared-worktree workflows.** A second session (or a human
@@ -508,6 +617,14 @@ equality path for `--status`. Low risk; written down here rather than silent.
 * **Closing G1** (follow the live session id in the MCP server): needs either
   dropping the session step from MCP (brings back the false fail) or reading
   Claude Code's private sessions file. Not worth it for the narrow trigger.
+* **Board correlation for session owners (G2)**: link a job to a ticket/project
+  by its launch directory or the lease actor. A second correlation key for a
+  display-only feature; revisit if the board's job-to-ticket link is missed.
+* **Detached-launch real test** (revision 2's T11 (iv)): needs the test binary to
+  play `__confine-supervise` too, for a writer path not changed here.
+* **Guarded cancel of a queued job** via `--kill` (the `--front` path already
+  acts on queue state): would replace the skill's plain-kill advice with a guarded
+  verb. Separate ticket with the friendlier-not-found follow-up.
 * **Launch-directory hint in the refusal** (`record.Cwd`). Adds a parameter to the
   one guard at four call sites; after this change the cwd mismatch is mostly a
   non-Claude case. Revisit if rants continue.
