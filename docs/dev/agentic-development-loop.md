@@ -64,11 +64,13 @@ that order. A ticket file's `status` is never hand-edited. A refused transition
 (`E_TRANSITION_INVALID`) names the legal next statuses from where the ticket is.
 
 The pre-push hook runs the full `make ci` on every push except two proven
-cases (AIRA-315): when every pushed path, measured from the merge-base with
-`origin/master`, is under `docs/` it skips `make ci`; when every path is under
-`docs/` or `.aira/tickets/` it runs only `make test-store` (the package that
-parses the repository's own tickets). Any doubt (a tag, a deletion, a missing
-`origin/master`, any other path) runs the full `make ci`.
+cases (AIRA-315), judged only when the pushed commit sits on top of the
+`origin/master` tip and measured from that tip: when every pushed path is
+Markdown under `docs/` (`docs/**/*.md`) it skips `make ci`; when every path is
+Markdown under `docs/` or `.aira/tickets/` it runs only `make test-store` (the
+package that parses the repository's own tickets). Any doubt (a tag, a
+deletion, a missing `origin/master`, a branch behind it, any other path or file
+type, such as a `.go` or `.sh` file under `docs/`) runs the full `make ci`.
 
 ## Lighter path for trivial changes
 

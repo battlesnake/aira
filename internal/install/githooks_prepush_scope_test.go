@@ -208,6 +208,30 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 			fx.commitAll(t, "tickets sibling")
 			return fx.push(t, "origin", "linked-branch")
 		}},
+		// The Go toolchain walks docs/ (`go list ./...` lists a package
+		// there), and fmt-check's `find . -name '*.go'` walks .aira/ too, so
+		// only Markdown is invisible to the gate: any other file type under
+		// either tree runs the full make ci.
+		{"docs-go-file", "ci", func(t *testing.T, fx pushFixture) string {
+			fx.write(t, "docs/zz/fail_test.go", "package zz\n\nimport \"testing\"\n\nfunc TestFail(t *testing.T) { t.Fatal(\"x\") }\n")
+			fx.commitAll(t, "go under docs")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"docs-non-md", "ci", func(t *testing.T, fx pushFixture) string {
+			fx.write(t, "docs/dev/x.sh", "#!/bin/sh\n")
+			fx.commitAll(t, "script under docs")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"docs-go-under-md-dir", "ci", func(t *testing.T, fx pushFixture) string {
+			fx.write(t, "docs/a.md/b.go", "package b\n")
+			fx.commitAll(t, "go under a .md directory")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"tickets-go-file", "ci", func(t *testing.T, fx pushFixture) string {
+			fx.write(t, ".aira/tickets/probe.go", "package   tickets\n")
+			fx.commitAll(t, "go under tickets")
+			return fx.push(t, "origin", "linked-branch")
+		}},
 		{"rename-into-docs", "ci", func(t *testing.T, fx pushFixture) string {
 			fx.git(t, fx.worktree, "mv", "src/thing.txt", "docs/thing.txt")
 			fx.commitAll(t, "rename into docs")
@@ -232,6 +256,57 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 			fx.git(t, fx.worktree, "update-ref", "refs/remotes/origin/master", fx.base)
 			fx.write(t, "docs/a.md", "a\n")
 			fx.commitAll(t, "docs on top")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"existing-branch-code-then-docs", "ci", func(t *testing.T, fx pushFixture) string {
+			// The remote branch already holds an unchecked code commit, so
+			// diffing from the line's remote sha would see only the docs.
+			fx.write(t, "src/b.txt", "b\n")
+			fx.commitAll(t, "code")
+			fx.git(t, fx.worktree, "push", "-q", "--no-verify", "origin", "linked-branch")
+			fx.write(t, "docs/a.md", "a\n")
+			fx.commitAll(t, "docs on top")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"intermediate-master-commit", "ci", func(t *testing.T, fx pushFixture) string {
+			// C is in origin/master's history but was only ever pushed
+			// together with its fix F, so no gate tested C's tree alone. A
+			// docs branch off C is behind origin/master's tip: full make ci.
+			fx.write(t, "src/c.txt", "broken\n")
+			fx.commitAll(t, "C: broken")
+			broken := fx.head(t)
+			fx.write(t, "src/c.txt", "fixed\n")
+			fx.commitAll(t, "F: fix")
+			fx.git(t, fx.worktree, "push", "-q", "--no-verify", "origin", "HEAD:refs/heads/master")
+			fx.git(t, fx.worktree, "fetch", "-q", "origin")
+			fx.git(t, fx.worktree, "checkout", "-q", "-b", "off-broken", broken)
+			fx.write(t, "docs/a.md", "a\n")
+			fx.commitAll(t, "docs on C")
+			return fx.push(t, "origin", "off-broken")
+		}},
+		{"behind-origin-master-tip", "ci", func(t *testing.T, fx pushFixture) string {
+			// master moved on by a docs-only commit; a docs branch off the old
+			// tip differs from the new tip only in Markdown, but the tip is
+			// not its ancestor, so it is not judged (I5): full make ci.
+			fx.git(t, fx.worktree, "checkout", "-q", "-b", "newer-master", fx.base)
+			fx.write(t, "docs/master-only.md", "m\n")
+			fx.commitAll(t, "newer master, docs only")
+			fx.git(t, fx.worktree, "push", "-q", "--no-verify", "origin", "HEAD:refs/heads/master")
+			fx.git(t, fx.worktree, "fetch", "-q", "origin")
+			fx.git(t, fx.worktree, "checkout", "-q", "-b", "old-docs", fx.base)
+			fx.write(t, "docs/a.md", "a\n")
+			fx.commitAll(t, "docs off the old tip")
+			return fx.push(t, "origin", "old-docs")
+		}},
+		{"docs-on-current-master-tip", "skip", func(t *testing.T, fx pushFixture) string {
+			// Control for the case above: after master moves and is fetched,
+			// a docs commit on the NEW tip does skip.
+			fx.write(t, "src/b.txt", "b\n")
+			fx.commitAll(t, "newer master")
+			fx.git(t, fx.worktree, "push", "-q", "--no-verify", "origin", "HEAD:refs/heads/master")
+			fx.git(t, fx.worktree, "fetch", "-q", "origin")
+			fx.write(t, "docs/a.md", "a\n")
+			fx.commitAll(t, "docs on the new tip")
 			return fx.push(t, "origin", "linked-branch")
 		}},
 		{"no-origin-master", "ci", func(t *testing.T, fx pushFixture) string {

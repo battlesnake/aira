@@ -69,13 +69,16 @@ In: the six items above plus 1c. Out: see section 9.
   - the remote ref is under `refs/heads/` (tags, notes, anything else → full);
   - the local object id is non-zero (a ref deletion → full) and `git cat-file -t` says
     `commit` (an annotated tag object → full);
-  - `refs/remotes/origin/master` resolves to a commit, and `git merge-base <local> origin/master`
-    succeeds (unrelated history → full);
-  - `git diff-tree -r --no-renames --name-only <merge-base> <local>` succeeds and lists at
-    least one path for this ref (empty → full);
-  - every listed path begins with `docs/` (skip tier) or with `docs/` or `.aira/tickets/`
-    (store tier). A quoted path (git quotes paths with control characters, `"` or `\`) begins
-    with `"` and so falls to full.
+  - `refs/remotes/origin/master` resolves to a commit (the tip), and the tip is an ancestor of
+    the local commit (`git merge-base --is-ancestor <tip> <local>`; unrelated history, or a
+    branch off an older master commit → full);
+  - `git diff-tree -r --no-renames --name-only <tip> <local>` succeeds and lists at least one
+    path for this ref (empty → full);
+  - every listed path is Markdown under `docs/` (matches `docs/?*.md`; skip tier), or Markdown
+    under `docs/` or `.aira/tickets/` (`.aira/tickets/?*.md`; store tier). Any other file
+    type under either tree (a `.go` file, a `docs/dev/*.sh` script) falls to full. A quoted
+    path (git quotes paths with control characters, `"` or `\`) begins with `"` and so falls
+    to full.
   - at least one ref line was read (empty stdin → full).
   The classifier prints exactly `docs` or `tickets` and returns 0 only when proven; the caller
   treats a non-zero return, or any other output, as full.
@@ -140,22 +143,21 @@ In: the six items above plus 1c. Out: see section 9.
    	local root="$1" base_ref=refs/remotes/origin/master
    	local local_ref local_sha remote_ref remote_sha extra base changed path
    	local refs=0 tickets=0 paths
-   	git -C "$root" rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null || return 1
+   	base="$(git -C "$root" rev-parse --verify --quiet "$base_ref^{commit}")" || return 1
    	while IFS=' ' read -r local_ref local_sha remote_ref remote_sha extra; do
    		[ -n "$remote_sha" ] && [ -z "$extra" ] || return 1
    		case "$remote_ref" in refs/heads/?*) ;; *) return 1 ;; esac
    		case "$local_sha" in "" | *[!0-9a-f]*) return 1 ;; esac
    		case "$local_sha" in *[!0]*) ;; *) return 1 ;; esac
    		[ "$(git -C "$root" cat-file -t "$local_sha" 2>/dev/null)" = commit ] || return 1
-   		base="$(git -C "$root" merge-base "$local_sha" "$base_ref")" || return 1
-   		[ -n "$base" ] || return 1
+   		git -C "$root" merge-base --is-ancestor "$base" "$local_sha" || return 1
    		changed="$(git -C "$root" diff-tree -r --no-renames --name-only "$base" "$local_sha")" || return 1
    		paths=0
    		while IFS= read -r path; do
    			case "$path" in
    			"") ;;
-   			docs/?*) paths=$((paths + 1)) ;;
-   			.aira/tickets/?*) paths=$((paths + 1)); tickets=$((tickets + 1)) ;;
+   			docs/?*.md) paths=$((paths + 1)) ;;
+   			.aira/tickets/?*.md) paths=$((paths + 1)); tickets=$((tickets + 1)) ;;
    			*) return 1 ;;
    			esac
    		done <<<"$changed"
@@ -185,11 +187,17 @@ In: the six items above plus 1c. Out: see section 9.
    not.) Makefile: `test-store:` → `$(GO) test ./internal/store -count=1 -timeout 20m`, with a
    comment naming the hook as its caller and why `internal/store` (the repo-ticket parse
    test). `.githooks/common.sh` is not changed.
-   - Why `merge-base` with `origin/master` and not the remote sha on the line: one base rule
-     for every ref, no "remote branch already had unchecked code" hole (a docs commit on top
-     of a code branch diffs the code too, so it runs full), no dependence on whether the
-     remote sha exists locally. A stale `origin/master` only moves the merge-base further
-     back, which widens the path set (safe direction); it can never narrow it.
+   - Why `origin/master`'s tip, required to be an ancestor, and not the remote sha on the line
+     or the merge-base (round-1 build review, both measured): the remote sha would open a
+     "remote branch already had unchecked code" hole (a code commit pushed with
+     `--no-verify`, then a docs commit on top, would diff only the docs); the merge-base can
+     be an older master commit that no gate ever tested on its own (it was pushed together
+     with its fix), so a docs branch off it would carry that untested tree. The tip is the
+     tree master's gate vetted, and requiring it to be an ancestor means the pushed commits
+     sit on top of it; a docs branch behind a freshly fetched master runs full (fail-closed).
+     One base for every ref, no dependence on whether the remote sha exists locally. A stale
+     local `origin/master` is an older tip that was itself vetted when it was the tip; the
+     diff from it is wider (safe direction).
    - Why `diff-tree` with `--no-renames`: porcelain `git diff --name-only` detects renames by
      default and lists only the destination path, so `git mv internal/x docs/x` would read as
      docs-only. `diff-tree` is plumbing (ignores `diff.renames`), and `--no-renames` is explicit
@@ -213,7 +221,7 @@ In: the six items above plus 1c. Out: see section 9.
 | 2 | Message only; the refusal itself is unchanged, so no new pass. The remedy sentence could become a false instruction if Rebuild stopped retiring missing roots: T2b executes it so that cannot drift silently. | None: same code, same conditions. |
 | 3 | The build is still checked (`t.Fatalf` on failure). It now runs inside the outer scope, so it is still confined (the outer `go test` is confined per CLAUDE.md). | Removes a busy-box false fail (the unbounded nested admission wait). New exposure: the link step (a few hundred MB) now counts against the outer `make ci` scope's learned memory.max; history re-learns from an OOM, and the build was already serial. |
 | 4 | Sensitivity kept: an expiry at `--max-wait` (from start or from grant) fires by `grant + bound`, before `dwell = bound + 2s` (T4 mutation). Residual (pre-existing, accepted in the test's own comment): a release at, say, ten minutes still passes. | Admission window 2 s → 10 s (×4 under race, plus `AIRA_TEST_DEADLINE_SCALE`): the measured failure mode ("no grant line") needs a 5× slower grant. Cost: about 9 s more runtime. |
-| 5 | **The hazard.** Enumerated attacks and where each lands: mixed paths → full; rename from outside into `docs/` → both sides listed → full; delete of a non-docs file → that path listed → full; delete of a `docs/` file → skip (no test reads `docs/`, below); a ref deletion → full; a tag push (lightweight or annotated) → full; several refs in one push, any one non-docs → full (every ref must pass); a docs commit on top of an unpushed code commit → the merge-base diff includes the code → full; stale `origin/master` → wider diff → full or still-correct; `origin/master` missing → full; unrelated history (orphan branch) → merge-base fails → full; empty stdin or a ref with no changed paths → full; a path with quoting → full; look-alike prefixes (`docsx/`, `Docs/`, `internal/docs/`, a file named `docs`) → full; `.aira/config` or `.aira/findings/` → full; `REQUIREMENTS.md` and every other `*.md` outside `docs/` → full (REQUIREMENTS.md is read by `internal/store/import_requirements_test.go:390`). **Why `docs/` is safe to skip** (verified by grep at `ff03d8aa`): no test reads the repo's `docs/`; the repo-walking tests filter to `*.go` (`internal/codes/produced_test.go: forEachSourceFile`, `internal/runner/protocol_pin_linux_test.go`) or walk `internal/` and `cmd/` only (`internal/daemon/*_removed_test.go`); the `go:embed` sets are `internal/pylib/aitest/*.py`, `internal/install/assets`, `internal/install/claudemod/...`; `fmt-check`/`vet`/`build` see only Go; `claude-mod-check` reads only `internal/install/claudemod`. **Assumption, not verified:** no test outside `internal/store` reads the repo's `.aira/tickets/` (e.g. a cmd/aira test running a ticket verb from its package directory against a private daemon). Backstop: GitHub CI runs `make test` (every pure-Go test) on every pull request (`.github/workflows/ci.yml` `pull_request:`), and no real-cgroup test (the only class the hook alone runs) reads repo tickets. Bash pitfall: errexit is suspended inside a function called from `$(...) ||`, so a missing `|| return 1` would let a failed git call through; the review checks every fallible command, and the caller additionally accepts only the two exact words. | A legitimate docs-only push still runs full `make ci` when `origin/master` is absent or stale, on a ref deletion, on a tag push, on a mixed push: conservative by design, never worse than today. |
+| 5 | **The hazard.** Enumerated attacks and where each lands: mixed paths → full; rename from outside into `docs/` → both sides listed → full; delete of a non-docs file → that path listed → full; delete of a `docs/` file → skip (no test reads `docs/`, below); a ref deletion → full; a tag push (lightweight or annotated) → full; several refs in one push, any one non-docs → full (every ref must pass); a docs commit on top of an unpushed code commit, or on top of a code commit already pushed to the same remote branch with `--no-verify` → the diff from the tip includes the code → full; a branch off an older master commit (the tip is not its ancestor) → full; stale `origin/master` → wider diff → full or still-correct; `origin/master` missing → full; unrelated history (orphan branch) → the tip is not an ancestor → full; empty stdin or a ref with no changed paths → full; a path with quoting → full; look-alike prefixes (`docsx/`, `Docs/`, `internal/docs/`, a file named `docs`) → full; any non-Markdown file under `docs/` or `.aira/tickets/` (a `.go` file, `docs/dev/*.sh`, `docs/a.md/b.go`) → full; `.aira/config` or `.aira/findings/` → full; `REQUIREMENTS.md` and every other `*.md` outside `docs/` → full (REQUIREMENTS.md is read by `internal/store/import_requirements_test.go:390`). **Why Markdown under `docs/` is safe to skip** (verified by grep at `ff03d8aa`; narrowed to Markdown in the round-1 build review): no test reads the repo's `docs/`; the repo-walking tests filter to `*.go` (`internal/codes/produced_test.go: forEachSourceFile`, `internal/runner/protocol_pin_linux_test.go`) or walk `internal/` and `cmd/` only (`internal/daemon/*_removed_test.go`); the `go:embed` sets are `internal/pylib/aitest/*.py`, `internal/install/assets`, `internal/install/claudemod/...`; `fmt-check`/`vet`/`build`/`test` see only Go files, but Go files under `docs/` ARE Go (`go list ./...` lists a package at `docs/zz`, measured), and fmt-check's `GO_SRC_FIND` (`find . -name '*.go'`, excluding only vendor/.worktrees/.claude) also walks `.aira/` (the go tool itself skips dot-directories), so only `*.md` paths are invisible to the gate and every other file type under either tree falls to full; the committed `docs/dev/*.sh` scripts therefore now run full `make ci` (safe direction; nothing in `make ci` executes them); `claude-mod-check` reads only `internal/install/claudemod`. **Assumption, not verified:** no test outside `internal/store` reads the repo's `.aira/tickets/` (e.g. a cmd/aira test running a ticket verb from its package directory against a private daemon). Backstop: GitHub CI runs `make test` (every pure-Go test) on every pull request (`.github/workflows/ci.yml` `pull_request:`), and no real-cgroup test (the only class the hook alone runs) reads repo tickets. Bash pitfall: errexit is suspended inside a function called from `$(...) ||`, so a missing `|| return 1` would let a failed git call through; the review checks every fallible command, and the caller additionally accepts only the two exact words. | A legitimate docs-only push still runs full `make ci` when `origin/master` is absent or stale, when the branch is behind a freshly fetched `origin/master` (rebase or merge master to get the skip), when it touches a non-Markdown file under `docs/` (e.g. `docs/dev/*.sh`), on a ref deletion, on a tag push, on a mixed push: conservative by design, never worse than today. |
 | 6 | The column could fabricate a 0 for an unread peak: `confineNum` returns `unevaluated` for nil (T6a pins it). | None: display only. |
 
 ## 7. Test plan
@@ -296,7 +304,7 @@ Table test `TestPrePushHookFastPathIsFailClosed`, one subtest per case:
 | code-then-docs | commit `src/b.txt`, then commit `docs/a.md`, push the branch | `ci` | diff only `<local>^..<local>`, or against the remote sha |
 | stale-origin-master | push a code commit C to remote master (`--no-verify`), move `refs/remotes/origin/master` back to the base, push branch C + docs commit | `ci` | (same as above; proves staleness only widens) |
 | no-origin-master | delete `refs/remotes/origin/master`, push docs-only branch | `ci` | treat an unresolvable base as "nothing changed" |
-| orphan | `git checkout --orphan` with only `docs/x.md`, push | `ci` | drop the merge-base guard and diff against an empty tree |
+| orphan | `git checkout --orphan` with only `docs/x.md`, push | `ci` | drop the ancestry guard and diff against an empty tree |
 | empty-diff | new branch at `origin/master`'s commit, push | `ci` | treat an empty path set as docs-only |
 | lightweight-tag | tag a docs-only commit, push the tag | `ci` | drop the `refs/heads/` check |
 | annotated-tag | `git tag -a` on a docs-only commit, push the tag | `ci` | (same) |
@@ -305,6 +313,14 @@ Table test `TestPrePushHookFastPathIsFailClosed`, one subtest per case:
 | two-refs-code-docs | `git push origin codeB docsA` | `ci` | classify only the last ref line |
 | two-refs-docs | two docs-only branches in one push | skip + notice | require exactly one ref |
 | head-refspec | `git push origin HEAD:refs/heads/x` from a docs-only branch | skip + notice | key eligibility on the local ref name |
+| docs-go-file | add `docs/zz/fail_test.go` | `ci` | prefix-only `docs/?*` (round 1) |
+| docs-non-md | add `docs/dev/x.sh` | `ci` | (same) |
+| docs-go-under-md-dir | add `docs/a.md/b.go` | `ci` | match `.md` anywhere in the path (`docs/?*.md*`) |
+| tickets-go-file | add `.aira/tickets/probe.go` (unformatted) | `ci` | prefix-only `.aira/tickets/?*` |
+| existing-branch-code-then-docs | push `src/b.txt` to the remote branch with `--no-verify`, then a docs commit, push the same branch | `ci` | base = the line's remote sha when non-zero |
+| intermediate-master-commit | C (`src/c.txt` broken), F (fix) pushed to master and fetched; branch off C + `docs/a.md`, push | `ci` | base = merge-base with `origin/master` |
+| behind-origin-master-tip | master advances by a docs-only commit and is fetched; docs branch off the old tip, push | `ci` | drop the `--is-ancestor` check |
+| docs-on-current-master-tip | master advances (code) and is fetched; docs commit on the new tip, push | skip + notice | control for the two above |
 
 Item 6 (`cmd/aira/confine_live_status_test.go` style, reading the cell by the header's
 `PEAK` index, never a bare `strings.Contains`):
@@ -439,3 +455,36 @@ Survivor, expected: dropping only the all-zero check leaves every test green, be
 `git cat-file -t 000…` fails and the type check refuses the deletion anyway (defence in
 depth; the zero check is kept as I5 lists it, and the combined mutation above shows the
 ref-delete case does guard the property).
+
+### Round-1 build-review fixes (2026-10-25)
+
+Confirmed findings (Codex and Fable lenses), each reproduced red against the round-0 hook
+before the fix:
+
+- P1 false pass: the skip tier matched any path under `docs/`, the store tier any path under
+  `.aira/tickets/`. A `.go` file under `docs/` is a package `go test ./...` builds; an
+  unformatted `.go` under `.aira/tickets/` fails fmt-check. Fix: Markdown only
+  (`docs/?*.md`, `.aira/tickets/?*.md`). Red before the fix: docs-go-file, docs-non-md,
+  docs-go-under-md-dir (skipped), tickets-go-file (ran only test-store).
+- P2 false pass: the merge-base with `origin/master` can be an older master commit never
+  tested on its own. Fix: base = the `origin/master` tip, judged only when the tip is an
+  ancestor of the pushed commit. Red before the fix: intermediate-master-commit,
+  behind-origin-master-tip (both skipped).
+- P2 porous test: no case updated an existing remote branch, so a remote-sha base survived.
+  Added existing-branch-code-then-docs.
+
+Mutation runs on the fixed hook (runner under `~/tmp`, not committed):
+
+| Item | Mutation | Red tests |
+|---|---|---|
+| 5 | `docs/?*.md` → `docs/?*` (prefix only) | docs-go-file, docs-non-md, docs-go-under-md-dir |
+| 5 | `.aira/tickets/?*.md` → `.aira/tickets/?*` | tickets-go-file |
+| 5 | `docs/?*.md` → `docs/?*.md*` | docs-go-under-md-dir |
+| 5 | `--is-ancestor` check → base = merge-base (the round-0 rule) | intermediate-master-commit, behind-origin-master-tip |
+| 5 | drop the `--is-ancestor` check (diff from the tip only) | behind-origin-master-tip |
+| 5 | base = the line's remote sha when non-zero, else the merge-base | existing-branch-code-then-docs, intermediate-master-commit, behind-origin-master-tip |
+
+Note on the ancestry check: the tree diff from the tip alone already lists every non-Markdown
+difference (so intermediate-master-commit is caught by it too, through `src/c.txt`); the
+ancestry check is the stated I5 condition that the pushed commits sit on the vetted tip, and
+behind-origin-master-tip pins it.
