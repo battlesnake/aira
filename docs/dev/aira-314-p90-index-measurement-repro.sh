@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# AIRA-314: reproduce every figure the spec publishes
-# (docs/superpowers/specs/2026-10-25-own-peak-floor-design.md §1 and §6.2):
-#   1. the yield counts for fix 1 (own clean peak floor) and the population fix 2
-#      (the p90 prior read stops timing out) moves;
+# AIRA-314: reproduce every sqlite3-measured figure the spec publishes
+# (docs/superpowers/specs/2026-10-25-own-peak-floor-design.md §1, §6.2, Appendix A):
+#   1. the yield counts for fix 1 (own clean peak floor), the at-cap population
+#      (memory.peak includes page cache; AIRA-318), and the population the
+#      DEFERRED fix 2 (the p90 prior read stops timing out) would move;
 #   2. the machine-wide p90 prior read cost before and after replacing the
 #      confine_peak_history indexes with one covering (kind, signature, peak_rss)
-#      index.
+#      index (deferred fix 2, gated on the owner's AIRA-317(2) answer).
 #
 # It works on a COPY: the source database is opened read-only and copied with
 # sqlite3's online .backup, then every change is made to the copy. Run it confined:
@@ -34,6 +35,15 @@
 #   per-signature history read ~0.001 s both before and after
 # Third run (revision, rows 185490, signatures 124134, p90-qualifying 8647):
 #   BEFORE 0.152 / 0.207 / 0.204 s; build 0.599 s; AFTER 0.064 / 0.057 / 0.064 s
+# Revision 3 run (2026-10-25, rows 185624, signatures 124231, p90-qualifying 8651), exit 0:
+#   p90 peak 1599184896, p 1839062630; 1-2 peaks 103961; F > 1 GiB 12288; F > p 6937;
+#   F > 60 GiB 0; clean <= OOM 163; fix 2 population 96354 / F < 1 GiB 91080;
+#   kills 1-2 before 40, 3+ before 211;
+#   at-cap: of the 6937 F > p signatures, 258 have their largest clean peak >= 90%
+#   of that run's cap (203 of those rows pinned); 5274 of the 6937 largest clean
+#   peaks came from a pinned run; unpinned clean rows with a budget 65889, of
+#   which 897 at >= 95% of the cap;
+#   BEFORE 0.182 / 0.180 / 0.272 s; build 0.586 s; AFTER 0.061 / 0.050 / 0.045 s
 set -euo pipefail
 src="${1:?usage: $0 <source state.db> <scratch dir under ~/tmp>}"
 scratch="${2:?usage: $0 <source state.db> <scratch dir under ~/tmp>}"
@@ -80,6 +90,35 @@ FROM confine_peak_history o
 WHERE o.kind='confine' AND o.oom=1 AND o.budget_basis='cap:auto:daemon-reserve' AND o.budget IS NOT NULL;
 SELECT 'unpinned OOM below 1.15x an earlier clean peak, 1-2 peaks before', COUNT(DISTINCT signature) FROM kills WHERE before_n BETWEEN 1 AND 2 AND before_clean>0 AND budget < before_clean + before_clean*15/100;
 SELECT '... same, 3+ peaks before', COUNT(DISTINCT signature) FROM kills WHERE before_n >= 3 AND before_clean>0 AND budget < before_clean + before_clean*15/100;
+-- At-cap population (spec §4 I7, §6.2): peak_rss is cgroup memory.peak, which
+-- counts page cache, and the kernel holds memory.current at memory.max by
+-- reclaim, so a cache-heavy run records a peak near its cap (the row's budget)
+-- whatever its anonymous need. For each raised signature (1-2 peaks, F > p) take
+-- the row holding its largest clean peak and count it when peak >= 90% of that
+-- row's budget.
+SELECT '... of the F > p signatures, largest clean peak >= 90% of its run''s cap', COUNT(*)
+FROM s, prior
+WHERE s.n BETWEEN 1 AND 2 AND s.mclean>0 AND s.mclean + s.mclean*15/100 > prior.p
+  AND EXISTS (SELECT 1 FROM confine_peak_history b
+              WHERE b.kind='confine' AND b.signature=s.signature AND b.oom=0
+                AND b.peak_rss=s.mclean AND b.budget>0 AND b.peak_rss*10 >= b.budget*9);
+SELECT '... of those, the at-cap row was pinned (--memory-reserve)', COUNT(*)
+FROM s, prior
+WHERE s.n BETWEEN 1 AND 2 AND s.mclean>0 AND s.mclean + s.mclean*15/100 > prior.p
+  AND EXISTS (SELECT 1 FROM confine_peak_history b
+              WHERE b.kind='confine' AND b.signature=s.signature AND b.oom=0
+                AND b.peak_rss=s.mclean AND b.budget>0 AND b.peak_rss*10 >= b.budget*9
+                AND b.budget_basis='cap:operator:--memory-reserve');
+SELECT '... of the F > p signatures, largest clean peak came from a pinned run', COUNT(*)
+FROM s, prior
+WHERE s.n BETWEEN 1 AND 2 AND s.mclean>0 AND s.mclean + s.mclean*15/100 > prior.p
+  AND EXISTS (SELECT 1 FROM confine_peak_history b
+              WHERE b.kind='confine' AND b.signature=s.signature AND b.oom=0
+                AND b.peak_rss=s.mclean AND b.budget_basis='cap:operator:--memory-reserve');
+SELECT 'unpinned clean rows with a budget / of those peak >= 95% of the cap (the existing n>=3 ratchet)',
+       COUNT(*), SUM(CASE WHEN peak_rss*20 >= budget*19 THEN 1 ELSE 0 END)
+FROM confine_peak_history
+WHERE kind='confine' AND oom=0 AND peak_rss>0 AND budget>0 AND budget_basis='cap:auto:daemon-reserve';
 SQL
 
 p90="SELECT MAX(peak_rss) AS peak_max FROM confine_peak_history WHERE kind='confine' AND peak_rss>0 GROUP BY signature HAVING COUNT(peak_rss)>=3 ORDER BY peak_max ASC;"
