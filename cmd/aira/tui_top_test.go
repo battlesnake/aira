@@ -1938,3 +1938,33 @@ func TestTopSessionCellPrefersPaneOverNamelessIdentifiers(t *testing.T) {
 		}
 	}
 }
+
+// AIRA-313. A Claude Code session owner (cc-<uuid>) is a long, nameless
+// identifier like a worktree hash: SESSION shows the tmux window the job was
+// launched from when there is one, else "cc-" plus the first 8 hex digits (short,
+// groups one session's jobs, visibly not a worktree hash). A human-chosen owner
+// that merely starts with "cc-" is still a chosen name and beats the pane.
+//
+// verifies: AIRA-313
+func TestTopSessionCellClaudeSessionOwner(t *testing.T) {
+	pid := 4242
+	session := "cc-b6b9daa7-4e9b-4de2-b1be-fff8ea5fb6d2"
+	pane := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name  string
+		owner string
+		pane  *string
+		want  string
+	}{
+		{"session owner, pane", session, pane("deploy"), "deploy"},
+		{"session owner, not in tmux", session, pane(""), "cc-b6b9daa7"},
+		{"session owner, pane unestablished", session, nil, "cc-b6b9daa7"},
+		{"chosen cc- name beats pane", "cc-deploy", pane("deploy-pane"), "cc-deploy"},
+		{"chosen cc- name, no pane", "cc-deploy", nil, "cc-deploy"},
+	} {
+		got := topSessionCell(runner.ConfineRecord{Owner: tc.owner, SupervisorPID: &pid, Pane: tc.pane})
+		if got != tc.want {
+			t.Errorf("%s: topSessionCell=%q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

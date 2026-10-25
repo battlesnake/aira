@@ -1650,3 +1650,161 @@ func runInProcessWithInput(argv []string, stdout, stderr io.Writer, stdin io.Rea
 	dispatcher := &inProcessDispatcher{stdin: stdin, stdout: stdout, diagnostics: stderr}
 	return runWithInputDispatcher(argv, stdout, stderr, stdin, dispatcher)
 }
+
+// TestConfineKillSameClaudeSessionFromAnotherWorktree is AIRA-313's real-cgroup
+// regression for RANT-49/50/51/53: a job launched through the real CLI entry from
+// worktree A by Claude Code session X is killed by the same session from worktree
+// B, over the CLI face and over the MCP face, without --steal; another session in
+// B is refused with the "different session or worktree" reason. A private daemon
+// serves admission, and the confine setup child is this test binary (TestMain), so
+// the code under test mints the scope id and its owner.
+//
+// The two legs are independent subtests, each with its own job and a cleanup that
+// --steal-kills a survivor, so a mutation that breaks one leg still reaches the
+// other's assertions.
+//
+// The mcp leg runs the MCP face in-process with CLAUDE_CODE_SESSION_ID set, so it
+// pins that the MCP code path resolves the caller through resolveConfineOwner; it
+// does not pin that a spawned `aira mcp` child actually carries the variable
+// (an accepted gap, measured in the spec).
+//
+// verifies: AIRA-313
+func TestConfineKillSameClaudeSessionFromAnotherWorktree(t *testing.T) {
+	a, b, _, _ := makeConfineTestWorktrees(t)
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(state, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	t.Setenv("AIRA_CONFINE_OWNER", "")
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCommandDaemon(t, daemon.NewServer(paths))
+	wantOwner := "cc-" + testClaudeSessionX
+
+	// launch starts `sleep 60` through the real CLI entry from worktree A as session
+	// X, checks the owner the CLI put in the request (Errorf: the legs must still
+	// run), and waits until the job's scope is placed and populated.
+	launch := func(t *testing.T, name string) {
+		t.Helper()
+		t.Setenv("CLAUDE_CODE_SESSION_ID", testClaudeSessionX)
+		t.Chdir(a)
+		owners := make(chan string, 1)
+		original := runConfined
+		t.Cleanup(func() { runConfined = original })
+		runConfined = func(ctx context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+			request.RuntimeDir = paths.RuntimeDir
+			request.AdmitSocketPath = paths.SocketPath
+			owners <- request.Owner
+			return original(ctx, request)
+		}
+		var launchStderr bytes.Buffer
+		done := make(chan int, 1)
+		go func() {
+			done <- runWithInput([]string{"confine", "--slice", "aira.slice", "--name", name, "--memory-reserve", "64M", "--", "sleep", "60"}, io.Discard, &launchStderr, strings.NewReader(""))
+		}()
+		t.Cleanup(func() {
+			_ = runWithInput([]string{"confine", "--kill", name, "--steal"}, io.Discard, io.Discard, strings.NewReader(""))
+			select {
+			case <-done:
+			case <-testdeadline.After(5 * time.Second):
+				t.Errorf("confine launcher for %s did not finish after the cleanup kill", name)
+			}
+		})
+		select {
+		case owner := <-owners:
+			if owner != wantOwner {
+				t.Errorf("launch owner=%q, want %q (the Claude Code session, not worktree A)", owner, wantOwner)
+			}
+		case exit := <-done:
+			done <- exit // leave it for the cleanup
+			// runConfined sends the owner before it launches anything, so an
+			// empty channel here means the CLI refused before runConfined was
+			// entered: that is a product failure (for example an owner
+			// resolution error), never a host limitation to skip.
+			select {
+			case owner := <-owners:
+				if owner != wantOwner {
+					t.Errorf("launch owner=%q, want %q (the Claude Code session, not worktree A)", owner, wantOwner)
+				}
+			default:
+				t.Fatalf("the CLI refused before reaching runConfined: exit=%d stderr=%q", exit, launchStderr.String())
+			}
+			cgrouptest.SkipOrFailRealCgroup(t, "real confine launch ended before admission: exit=%d stderr=%q", exit, launchStderr.String())
+		case <-testdeadline.After(10 * time.Second):
+			t.Fatal("the CLI never reached runConfined")
+		}
+		deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
+		strongest, strongestRecord := readinessUnlistable, runner.ConfineRecord{}
+		for {
+			input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_confine_list","arguments":{}}}` + "\n")
+			var output, diagnostics bytes.Buffer
+			if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, nil); exit != 0 {
+				t.Fatalf("confine list MCP exit=%d output=%q diagnostics=%q", exit, output.String(), diagnostics.String())
+			}
+			readiness, record, readErr := confineKillReadiness(output.Bytes(), name)
+			if readErr != nil {
+				t.Fatalf("confine list: %v; output=%q", readErr, output.String())
+			}
+			if readiness > strongest {
+				strongest, strongestRecord = readiness, record
+			}
+			if readiness == readinessPlaced {
+				return
+			}
+			select {
+			case exit := <-done:
+				done <- exit // leave it for the cleanup
+				cgrouptest.SkipOrFailRealCgroup(t, "real confine launch ended before placement: exit=%d stderr=%q", exit, launchStderr.String())
+			default:
+			}
+			if time.Now().After(deadline) {
+				if readinessIsProductFailure(strongest) {
+					t.Fatalf("the launcher is running and containment was never established (strongest state %s): %+v", strongest, strongestRecord)
+				}
+				cgrouptest.SkipOrFailRealCgroup(t, "containment was never established for %s (strongest state %s)", name, strongest)
+			}
+			time.Sleep(20 * time.Millisecond) // poll pacing, not synchronisation
+		}
+	}
+	unique := strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	t.Run("cli", func(t *testing.T) {
+		name := "a313-cli-" + unique
+		launch(t, name)
+		t.Chdir(b)
+		kill := func(session string) (int, string) {
+			t.Helper()
+			t.Setenv("CLAUDE_CODE_SESSION_ID", session)
+			var stdout, stderr bytes.Buffer
+			exit := runWithInput([]string{"confine", "--kill", name}, &stdout, &stderr, strings.NewReader(""))
+			return exit, stdout.String() + stderr.String()
+		}
+		// (i) another session in B is refused, with the reason that says why.
+		exit, output := kill(testClaudeSessionY)
+		if exit == 0 || !strings.Contains(output, runner.CodeConfineOwnerUnverified) || !strings.Contains(output, "belongs to a different session or worktree") {
+			t.Errorf("session Y from B: exit=%d output=%q, want the different-session refusal", exit, output)
+		}
+		// (ii) the launching session, from B, kills it without --steal.
+		exit, output = kill(testClaudeSessionX)
+		if exit != 0 || !strings.Contains(output, "killed") {
+			t.Fatalf("session X from B: exit=%d output=%q, want killed", exit, output)
+		}
+	})
+
+	t.Run("mcp", func(t *testing.T) {
+		name := "a313-mcp-" + unique
+		launch(t, name)
+		t.Chdir(b)
+		t.Setenv("CLAUDE_CODE_SESSION_ID", testClaudeSessionX)
+		// (iii) the MCP face of the same session, from B, kills it without --steal.
+		input := strings.NewReader(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_confine_kill","arguments":{"selector":%q}}}`, name) + "\n")
+		var output, diagnostics bytes.Buffer
+		if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, nil); exit != 0 {
+			t.Fatalf("MCP exit=%d output=%q diagnostics=%q", exit, output.String(), diagnostics.String())
+		}
+		if !strings.Contains(output.String(), `"code":"OK"`) || !strings.Contains(output.String(), `"status":"killed"`) {
+			t.Fatalf("MCP kill by session X from B=%q, want killed", output.String())
+		}
+	})
+}

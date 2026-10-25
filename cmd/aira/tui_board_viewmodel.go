@@ -333,6 +333,12 @@ func buildBoardModel(data boardData) boardModel {
 // shown as unknown, never fabricated. A confine owner correlates to a ticket
 // only when it is an ATTESTED worktree id that also holds a lease in THIS
 // project — the cross-project registry walk is Increment 2.
+//
+// ONLY a worktree-id owner correlates. A Claude Code session owner (cc-<uuid>,
+// the default for a job launched from a Claude session since AIRA-313) and an
+// AIRA_CONFINE_OWNER label are attested but never correlate: their rows read
+// "ticket unknown", never a guessed ticket. Accepted gap G2 of the AIRA-313
+// spec; linking by launch directory or lease actor is deferred.
 func boardSessionRows(data boardData) []boardSessionRow {
 	ticketByWorktree := map[string]string{}
 	rows := make([]boardSessionRow, 0)

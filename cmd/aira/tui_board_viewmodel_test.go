@@ -382,3 +382,37 @@ func TestBoardColumnHeaderTruncationDisclosed(t *testing.T) {
 		t.Fatalf("untruncated header = %q, want 'draft · 3'", got)
 	}
 }
+
+// TestBoardSessionOwnerNeverCorrelates pins accepted gap G2 (AIRA-313): a job
+// owned by a Claude Code session (cc-<uuid>) is attested but is not a worktree
+// id, so the board never attributes it to a ticket, even when the project holds
+// exactly one lease. A control job owned by the lease's worktree still
+// correlates, so this cannot pass on a board that correlates nothing.
+//
+// verifies: AIRA-313
+func TestBoardSessionOwnerNeverCorrelates(t *testing.T) {
+	worktree := strings.Repeat("a", 64)
+	session := "cc-b6b9daa7-4e9b-4de2-b1be-fff8ea5fb6d2"
+	data := boardData{
+		Leases: []store.HeldLeaseRow{{TicketID: "AIRA-9", WorktreeID: worktree, Actor: "opus", AgeNote: "2m ago"}},
+		Confine: &runner.ConfineListResult{Verdict: "ok", Scopes: []runner.ConfineRecord{
+			{Name: "job-session", Owner: session},
+			{Name: "job-worktree", Owner: worktree},
+		}},
+	}
+	var sessionRow, worktreeRow string
+	for _, row := range boardSessionRows(data) {
+		switch {
+		case strings.HasPrefix(row.Text, "job job-session "):
+			sessionRow = row.Text
+		case strings.HasPrefix(row.Text, "job job-worktree "):
+			worktreeRow = row.Text
+		}
+	}
+	if !strings.Contains(sessionRow, "owner "+session+" · ticket unknown") || strings.Contains(sessionRow, "ticket AIRA-9") {
+		t.Fatalf("session-owned job row %q, want it uncorrelated (ticket unknown)", sessionRow)
+	}
+	if !strings.Contains(worktreeRow, "ticket AIRA-9") {
+		t.Fatalf("control: worktree-owned job row %q, want ticket AIRA-9", worktreeRow)
+	}
+}

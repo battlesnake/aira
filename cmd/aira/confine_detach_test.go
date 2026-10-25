@@ -6,9 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"aira/internal/codes"
+	"aira/internal/daemon"
 	"aira/internal/runner"
 )
 
@@ -368,5 +373,97 @@ func TestConfineSuperviseVerbRejectsMalformedArguments(t *testing.T) {
 	if exit := runWithInput([]string{"__confine-supervise", "--control", "/c", "--ready-fd", "3", "--ack-fd", "4"},
 		io.Discard, io.Discard, strings.NewReader("")); exit != 0 || !called {
 		t.Fatalf("a well-formed invocation did not reach the supervisor (exit=%d called=%v)", exit, called)
+	}
+}
+
+// TestConfineStatusSameSessionAcrossWorktrees drives `aira confine --status
+// <name>` through the real CLI entry and the REAL record reader (the
+// confineDetachStatusFor seam is not replaced) under a private XDG_STATE_HOME
+// (AIRA-313). The record's directory is named from a scope id minted with the
+// owner resolveConfineOwner gives in worktree A for session X; that directory
+// name is the authoritative owner the reader parses. From worktree B the same
+// session finds it by name; another session gets the not-found refusal, which
+// never suggests --owner; a scope-id selector always matches.
+//
+// verifies: AIRA-313
+func TestConfineStatusSameSessionAcrossWorktrees(t *testing.T) {
+	a, b, _, _ := makeConfineTestWorktrees(t)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	t.Setenv("AIRA_CONFINE_OWNER", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", testClaudeSessionX)
+	t.Chdir(a)
+	owner, err := resolveConfineOwner(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner != "cc-"+testClaudeSessionX {
+		// Errorf, not Fatalf: the CLI legs below must still run, so deleting the
+		// session step is also seen where it matters (X from B is not found).
+		t.Errorf("launch owner in A = %q, want cc-%s", owner, testClaudeSessionX)
+	}
+	const name = "a313-status"
+	scopeID, err := runner.MintConfineScopeID(runner.ConfineRequest{Name: name, Owner: owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(paths.ConfineDetachDir, scopeID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	payload, err := json.Marshal(runner.ConfineDetachRecord{
+		Schema: runner.ConfineDetachSchema, ScopeID: scopeID, Name: name, Owner: owner,
+		Supervisor: runner.PIDIdentity{PID: os.Getpid()}, Phase: runner.ConfineDetachPhaseRunning,
+		StartedAt: time.Now().UTC().Format(time.RFC3339Nano), Terminal: true, Exit: &zero,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "record.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(b)
+	status := func(session, selector string) (int, string, string) {
+		t.Helper()
+		t.Setenv("CLAUDE_CODE_SESSION_ID", session)
+		var stdout terminalBuffer
+		var stderr bytes.Buffer
+		exit := runWithInput([]string{"confine", "--status", selector}, &stdout, &stderr, strings.NewReader(""))
+		return exit, stdout.String(), stderr.String()
+	}
+	wantFacts := []string{"scope=" + scopeID, "owner=cc-" + testClaudeSessionX, "state=finished"}
+
+	exit, stdout, stderr := status(testClaudeSessionX, name)
+	if exit != 0 {
+		t.Fatalf("same session from B: exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+	for _, fact := range wantFacts {
+		if !strings.Contains(stdout, fact) {
+			t.Fatalf("same session from B: stdout %q lacks %q", stdout, fact)
+		}
+	}
+
+	exit, stdout, stderr = status(testClaudeSessionY, name)
+	if want := codes.ExitForCode("E_CONFINE_NOT_FOUND"); exit != want {
+		t.Fatalf("other session: exit=%d want %d stdout=%q stderr=%q", exit, want, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "matched other owners") || strings.Contains(stderr, "--owner") {
+		t.Fatalf("other session: stderr %q must say it matched other owners and never suggest --owner", stderr)
+	}
+
+	exit, stdout, stderr = status(testClaudeSessionY, scopeID)
+	if exit != 0 {
+		t.Fatalf("other session by scope id: exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+	for _, fact := range wantFacts {
+		if !strings.Contains(stdout, fact) {
+			t.Fatalf("other session by scope id: stdout %q lacks %q", stdout, fact)
+		}
 	}
 }

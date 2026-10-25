@@ -65,16 +65,51 @@ func ParseConfineResizeReserve(raw string) (int64, error) {
 // directory infer the same value, so honouring it would let either act on the
 // other's job without --steal — the exact weakening AIRA-23 forbids. An empty
 // owner is ConfineUnknownOwner, which is unattested too.
+//
+// The refusal keeps its stable leading fields and appends WHY it refused and
+// what to do (AIRA-313), checked in this order: the job's owner was inferred;
+// the caller's identity was inferred; both are attested but differ. No reason
+// ever suggests --owner: the printed owner is the victim's identity, and
+// passing it back would be an override the daemon audits as steal=false under
+// the victim's name. --steal does the same job and is recorded as a steal.
 func CheckConfineOwner(scopeID, owner, callerOwner string, steal bool) error {
 	owner = strings.TrimSpace(owner)
 	if owner == "" {
 		owner = ConfineUnknownOwner
 	}
-	if !steal && (!ConfineOwnerIsAttested(owner) || !ConfineOwnerIsAttested(callerOwner) || owner != callerOwner) {
-		return fmt.Errorf("%s: scope=%s owner=%s caller=%s; pass --steal to override", CodeConfineOwnerUnverified, scopeID, owner, callerOwner)
+	if steal {
+		return nil
 	}
-	return nil
+	var reason string
+	switch {
+	case !ConfineOwnerIsAttested(owner):
+		reason = confineOwnerReasonJobInferred
+	case !ConfineOwnerIsAttested(callerOwner):
+		reason = confineOwnerReasonCallerInferred
+	case owner != callerOwner:
+		reason = confineOwnerReasonDifferent
+	default:
+		return nil
+	}
+	return fmt.Errorf("%s: scope=%s owner=%s caller=%s; %s", CodeConfineOwnerUnverified, scopeID, owner, callerOwner, reason)
 }
+
+// The three refusal reasons CheckConfineOwner appends (AIRA-313). None names
+// --owner (see CheckConfineOwner).
+const (
+	confineOwnerReasonJobInferred = "the job's owner was inferred from its launch directory (or is unknown), " +
+		"which never proves ownership, even to a caller in the same directory; if it is your job, pass --steal. " +
+		"Launch with AIRA_CONFINE_OWNER=<name> (or from a Claude Code session) to get an owner you can manage without --steal"
+	confineOwnerReasonCallerInferred = "your own identity was inferred from this directory " +
+		"(no AIRA_CONFINE_OWNER, Claude Code session or aira project worktree applies here), so it cannot match any owner; " +
+		"run this from the Claude Code session or worktree that launched the job, or with the AIRA_CONFINE_OWNER name " +
+		"you launched it with, or pass --steal to act on it deliberately"
+	confineOwnerReasonDifferent = "the job belongs to a different session or worktree. Unless AIRA_CONFINE_OWNER was set, " +
+		"an owner defaults to the Claude Code session that launched the job (shared with its subagents), " +
+		"else to the git worktree of the directory it was launched from. If you launched it, run this from that " +
+		"session or worktree, or with the AIRA_CONFINE_OWNER name you launched it with. If it is another session's job, " +
+		"--steal acts on it deliberately and is recorded as a steal"
+)
 
 // ConfineRegistryEntry names a scope with a held daemon admission lease. It
 // never establishes filesystem existence — its only job is to surface a scope
