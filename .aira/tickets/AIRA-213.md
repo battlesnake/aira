@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-213","project":"aira","title":"Owner decision: is a confine estimator subject the argv alone, or argv + directory?","status":"planned","kind":"spike","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-213","project":"aira","title":"Owner decision: is a confine estimator subject the argv alone, or argv + directory?","status":"done","kind":"spike","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","rant-triage"],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-213","to":"AIRA-321"}]}
 ---
 > Filed from the 2026-09-09 global rant triage (35 rants, adversarially reviewed).
 > Evidence below survived an independent refutation pass; claims that did not are
@@ -28,3 +28,11 @@ Owner decision: is a confine estimator subject the argv alone, or argv + directo
 **Evidence hygiene.** Do not file RANT-29's draft as written: its "every worktree cold-starts at the 4 GiB default … ~6.5×" is the wrong branch (the p90 prior fires first; measured ~1.04 GiB), and its claim that fragmentation is "the direct cause" of the 12-deep queue wait is unproven — that job had `n=20` and was not cold-starting. The sharper, provable symptom is the **pre-push** shape: 120 distinct `make -C <path> ... ci` signatures, 65 % below the 3-sample threshold, max recorded peak 1360 MiB against a ~1.2 GiB prior grant, **2 recorded OOMs**.
 
 ---
+
+**DECISION (owner, 2026-10-31).** An estimator subject is **argv + the git repository identity derived from the caller's working directory** (if the cwd is inside a repo or worktree; otherwise argv alone). This is a variant of option B, chosen over the A + C recommendation above.
+
+Recorded reading, to be confirmed or corrected in the plan for AIRA-321: "repo identity" means the git **common dir**, not `--show-toplevel`. All worktrees of one repo then share one key (fixes RANT-29's fragmentation: the 96-worktree key explosion) and different repos with the same argv split (fixes RANT-34: `make test` in unrelated repos sharing a key). `--show-toplevel` would re-fragment to one key per worktree and is not what was asked for.
+
+Consequences carried to the implementation ticket: option A (hooks must stop putting `$root` in argv, or the key forks again) becomes a prerequisite, option C (name the subject in the trailer) comes with it, and the cold-start cost of points 1-2 above now applies per repo rather than per worktree. Option D (retention) is unaffected and stays separate.
+
+Implementation: AIRA-321 (held, milestone `later`).
