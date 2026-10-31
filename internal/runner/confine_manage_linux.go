@@ -54,10 +54,22 @@ func defaultConfineScanDeps() confineScanDeps {
 }
 
 func ResolveConfineManagementSlice(slice string) (string, string, error) {
-	deps := fillConfineDeps(confineDeps{})
+	return resolveConfineManagementSlice(slice, fillConfineDeps(confineDeps{}))
+}
+
+// resolveConfineManagementSlice is ResolveConfineManagementSlice over injected
+// deps. Every way the slice can be unusable is E_CONFINE_UNAVAILABLE, the default
+// slice's as well as an explicit one's (AIRA-322): the raw default-slice error was
+// reported by the daemon as E_INTERNAL, which callers that tolerate an unavailable
+// slice read as a product failure.
+func resolveConfineManagementSlice(slice string, deps confineDeps) (string, string, error) {
 	explicit := ResolveConfineSlice(slice)
 	if explicit == "" {
-		return resolveDefaultConfineSlice(deps)
+		name, path, err := resolveDefaultConfineSlice(deps)
+		if err != nil {
+			return name, "", confineUnavailable(name, err)
+		}
+		return name, path, nil
 	}
 	path, ok, reason := deps.resolveSlicePath(explicit)
 	if !ok {
