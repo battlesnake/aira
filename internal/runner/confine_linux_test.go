@@ -128,6 +128,55 @@ func TestDefaultConfineResolutionDistinguishesDeadAnchorFromNeverInstalled(t *te
 	}
 }
 
+// AIRA-322: the management (list/kill) resolver reports every "the default slice
+// cannot be used" answer as the stable E_CONFINE_UNAVAILABLE code, as its
+// explicit-slice branch already does. A raw error reached the daemon as E_INTERNAL,
+// so a host with no aira.slice (CI) looked like a product bug to callers that
+// already skip on E_CONFINE_UNAVAILABLE.
+func TestResolveConfineManagementSliceDefaultUnavailableCode(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		managed bool
+		airaErr error
+		whale   error
+		want    string
+	}{
+		{"no slice anywhere", false, fs.ErrNotExist, fs.ErrNotExist, "aira.slice not found"},
+		{"installed but inactive", true, fs.ErrNotExist, fs.ErrNotExist, "installed but not active"},
+		{"cgroup active, unit absent", false, nil, nil, "aira-managed unit is absent"},
+		{"slice unreadable", false, errors.New("boom"), nil, "cannot evaluate aira.slice"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deps := confineDeps{
+				managedUnitPresent: func(string) (bool, error) { return test.managed, nil },
+				resolveSlicePathExact: func(name string) (string, error) {
+					if name == "aira.slice" {
+						return "/cg/aira.slice", test.airaErr
+					}
+					return "/cg/whale.slice", test.whale
+				},
+			}
+			_, path, err := resolveConfineManagementSlice("", deps)
+			if err == nil || path != "" {
+				t.Fatalf("resolution=(%q,%v), want an error and no path", path, err)
+			}
+			if !strings.HasPrefix(err.Error(), "E_CONFINE_UNAVAILABLE: ") || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%q, want the E_CONFINE_UNAVAILABLE code carrying %q", err, test.want)
+			}
+		})
+	}
+	t.Run("usable slice is unchanged", func(t *testing.T) {
+		deps := confineDeps{
+			managedUnitPresent:    func(string) (bool, error) { return true, nil },
+			resolveSlicePathExact: func(string) (string, error) { return "/cg/aira.slice", nil },
+		}
+		name, path, err := resolveConfineManagementSlice("", deps)
+		if err != nil || name != "aira.slice" || path != "/cg/aira.slice" {
+			t.Fatalf("resolution=(%q,%q,%v), want (aira.slice,/cg/aira.slice,nil)", name, path, err)
+		}
+	})
+}
+
 func TestDefaultConfinePresentButUncappedFailsOnAIRA(t *testing.T) {
 	deps := confineUnitDeps(&confineFakeScope{})
 	deps.managedUnitPresent = func(string) (bool, error) { return true, nil }

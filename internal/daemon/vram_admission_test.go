@@ -141,6 +141,18 @@ func TestVRAMEnqueueRefusalsAreClientTerminalAndNeverEnqueue(t *testing.T) {
 func TestVRAMContendedJobIsHeldNotRefused(t *testing.T) {
 	G := vramTestGiB
 	server := vramAdmitServer(t, 14*G, 16*G, 3*G, true) // only 3G free → 2G available
+	// The queue count is sampled as the reply is written, on the handler goroutine:
+	// the waiter is released by a defer AFTER the handler returns, and releasing the
+	// last waiter prunes the now-empty queue, so counting after readFrame races that
+	// prune (AIRA-322: red under -race).
+	var queuesAtReply atomic.Int64
+	queuesAtReply.Store(-1)
+	server.admitWriteFrame = func(conn net.Conn, frame any) error {
+		server.admitRegistryMu.Lock()
+		queuesAtReply.Store(int64(len(server.admitQueues)))
+		server.admitRegistryMu.Unlock()
+		return writeFrame(conn, frame)
+	}
 	serverConn, clientConn := net.Pipe()
 	args := validAdmitArgs(1<<20, 0) // max_wait_ms=0 → non-blocking
 	args["vram"] = 10 * G
@@ -158,11 +170,8 @@ func TestVRAMContendedJobIsHeldNotRefused(t *testing.T) {
 	if frame.Code != CodeAdmitSaturated {
 		t.Fatalf("a non-blocking VRAM-contended job = %q, want %s (held, then saturated)", frame.Code, CodeAdmitSaturated)
 	}
-	server.admitRegistryMu.Lock()
-	queues := len(server.admitQueues)
-	server.admitRegistryMu.Unlock()
-	if queues != 1 {
-		t.Fatalf("a contended (not refused) VRAM job must ENQUEUE; %d queue(s)", queues)
+	if queues := queuesAtReply.Load(); queues != 1 {
+		t.Fatalf("a contended (not refused) VRAM job must ENQUEUE; %d queue(s) when the reply was written", queues)
 	}
 	_ = clientConn.Close()
 }
