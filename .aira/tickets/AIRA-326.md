@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-326","project":"aira","title":"admission queue: fast-lane ordering (class frozen at enqueue) for historically quick, low-RAM jobs","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.41","labels":["backlog"],"hold":true,"relations":[]}
+---
+Section 5.4 of docs/superpowers/specs/2026-11-13-history-charge-design.md (rev 2). Fast = key has 3+ clean samples, no OOM in window, p90 wall < 5 min, p90 peak < 4 GiB AND own ledger charge <= 4 GiB; class and bonus frozen on the waiter at enqueue from the existing pre-lock history read. admitOrderLocked second tier sorts by enqueued - bonus x fast (default 10 min, 0 = today). Workers never fast. Claim is bounded overtaking, not no-delay; gate on fast-class and heavy-class p95 wait_ms. Needs wall_ms and key from AIRA-323.
