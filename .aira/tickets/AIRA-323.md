@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-323","project":"aira","title":"confine history: record wall time, queue wait, start time and normalised command key per finished job (prerequisite)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.41","labels":["backlog"],"hold":true,"relations":[{"kind":"blocks","from":"AIRA-323","to":"AIRA-324"},{"kind":"blocks","from":"AIRA-323","to":"AIRA-326"}]}
+---
+Section 5.1 of docs/superpowers/specs/2026-11-13-history-charge-design.md (rev 2). Add wall_ms, wait_ms, started_at and key to confine_peak_history, written at the existing teardown site; nullable, index (kind,key,at); per-key 20-row window query, one indexed read. Key function: unwrap only env and time (known options), keep aitest-parent as its own namespace, mask paths/numbers/hashes, three levels. Pure data collection, no admission change. Un-hold FIRST: data needs weeks to accrue.
