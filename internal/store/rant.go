@@ -194,43 +194,119 @@ func (s *Store) GetRant(id string) (domain.Rant, error) {
 	return s.loadRant(context.Background(), s.db, id)
 }
 
-func (s *Store) ListRants(options domain.RantListOptions) ([]domain.Rant, error) {
-	query := `SELECT id FROM rants WHERE project_id=? AND seq>?`
+// RantPage is one page of a rant listing (AIRA-327). Total counts every rant
+// matching ALL the filters (the cursor included) before the limit, so a page
+// never silently drops rows: Truncated says more exist, and NextSince — set
+// only for an oldest-first page — is the cursor that continues from it.
+type RantPage struct {
+	Rows      []domain.Rant
+	Total     int
+	Truncated bool
+	NextSince *int64
+	// UnsearchedRedacted is set only for a --grep listing: the redacted rants
+	// that match every OTHER filter. Their text was scrubbed, so whether they
+	// matched cannot be established; they are counted here, never as misses.
+	UnsearchedRedacted *int
+}
+
+// escapeLike makes every byte of a user string literal inside a LIKE pattern
+// using '\' as the ESCAPE character.
+func escapeLike(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
+}
+
+func (s *Store) ListRants(options domain.RantListOptions) (RantPage, error) {
+	if err := options.Validate(); err != nil {
+		return RantPage{}, err
+	}
+	limit := options.Limit
+	if limit == 0 {
+		limit = domain.DefaultRantListLimit
+	}
+	where := ` FROM rants WHERE project_id=? AND seq>?`
 	args := []any{s.projectID, options.Since}
-	if options.Unreviewed {
-		query += ` AND NOT EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)`
+	switch options.Status {
+	case "", domain.RantStatusUnreviewed:
+		where += ` AND NOT EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)`
+	case domain.RantStatusReviewed:
+		where += ` AND EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)`
+	}
+	switch options.Severity {
+	case "":
+	case domain.RantSeverityUnset:
+		where += ` AND severity=''`
+	default:
+		where += ` AND severity=?`
+		args = append(args, options.Severity)
 	}
 	if options.Tag != "" {
-		query += ` AND EXISTS(SELECT 1 FROM rant_tags rt WHERE rt.project_id=rants.project_id AND rt.rant_id=rants.id AND rt.tag=?)`
+		where += ` AND EXISTS(SELECT 1 FROM rant_tags rt WHERE rt.project_id=rants.project_id AND rt.rant_id=rants.id AND rt.tag=?)`
 		args = append(args, options.Tag)
 	}
-	query += ` ORDER BY seq ASC LIMIT ?`
-	args = append(args, ListLimit)
-	rows, err := s.db.Query(query, args...)
+	if options.Actor != "" {
+		where += ` AND actor=?`
+		args = append(args, options.Actor)
+	}
+	ctx := context.Background()
+	// One read transaction, so the total, the page and every row it loads come
+	// from the same snapshot.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, translateDBError(err)
+		return RantPage{}, translateDBError(err)
+	}
+	defer tx.Rollback()
+	var page RantPage
+	if options.Grep != "" {
+		var unsearched int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)`+where+` AND redacted<>0`, args...).Scan(&unsearched); err != nil {
+			return RantPage{}, translateDBError(err)
+		}
+		page.UnsearchedRedacted = &unsearched
+		where += ` AND redacted=0 AND body LIKE ? ESCAPE '\'`
+		args = append(args, "%"+escapeLike(options.Grep)+"%")
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&page.Total); err != nil {
+		return RantPage{}, translateDBError(err)
+	}
+	order := ` ORDER BY seq ASC LIMIT ?`
+	if options.Newest {
+		order = ` ORDER BY seq DESC LIMIT ?`
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id`+where+order, append(args, limit)...)
+	if err != nil {
+		return RantPage{}, translateDBError(err)
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return nil, err
+			return RantPage{}, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return RantPage{}, err
 	}
-	result := make([]domain.Rant, 0, len(ids))
-	for _, id := range ids {
-		rant, err := s.GetRant(id)
-		if err != nil {
-			return nil, err
+	if options.Newest {
+		for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
+			ids[i], ids[j] = ids[j], ids[i]
 		}
-		result = append(result, rant)
 	}
-	return result, nil
+	page.Rows = make([]domain.Rant, 0, len(ids))
+	for _, id := range ids {
+		rant, err := s.loadRant(ctx, tx, id)
+		if err != nil {
+			return RantPage{}, err
+		}
+		page.Rows = append(page.Rows, rant)
+	}
+	page.Truncated = page.Total > len(page.Rows)
+	if page.Truncated && !options.Newest && len(page.Rows) > 0 {
+		next := page.Rows[len(page.Rows)-1].Seq
+		page.NextSince = &next
+	}
+	return page, nil
 }
 
 func (s *Store) ReviewRant(ctx context.Context, id string, input domain.RantReviewInput) (RantReviewResult, error) {

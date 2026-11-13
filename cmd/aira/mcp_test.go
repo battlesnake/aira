@@ -79,6 +79,11 @@ func TestRantMCPIsCaptureOnlyWithApprovedAdvertisement(t *testing.T) {
 	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(schema.Required, []string{"text"}) {
 		t.Fatalf("schema properties=%v required=%v", got, schema.Required)
 	}
+	// AIRA-327: ls filters on severity `unset`, which capture refuses; the
+	// capture advertisement must not offer it.
+	if enum := schema.Properties["severity"].Enum; !reflect.DeepEqual(enum, []string{"papercut", "annoyance", "blocker"}) {
+		t.Fatalf("capture severity enum = %v", enum)
+	}
 }
 
 func TestMCPRunKillDeclaresStealBoolean(t *testing.T) {

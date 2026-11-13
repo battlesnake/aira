@@ -111,7 +111,8 @@ owner's "if appropriate" case); `worktree_id` replaces neither.
   (`head_hash`, `head_ref`, `remote_url`) is stored **verbatim, unvalidated** (the daemon cannot know the
   caller's commit).
 - **CLI:** `aira rant "<text>" [--tag T]… [--severity S] [--ref run:RUN-n|ticket:…]… [--idem KEY]`;
-  `aira rant ls [--by tag|actor] [--unreviewed] [--since <seq>]`; `aira rant get RANT-n`;
+  `aira rant ls [--by tag|actor] [--unreviewed] [--since <seq>]` (superseded by AIRA-327: `--status`
+  replaces `--unreviewed`, unreviewed is the default, and ls returns a paged envelope); `aira rant get RANT-n`;
   `aira rant review RANT-n [--outcome O] [--note "…"] [--resolved-by ticket:X]`.
 - **MCP:** `aira_rant({ text, tags?, severity?, refs?, idempotency_key? })`. Tool description = the only
   permitted prompt: *"Ranting welcome: slow tests, linter noise, flaky infra, confusing setup — dump it

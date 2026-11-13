@@ -108,13 +108,112 @@ type Rant struct {
 	Reviews         []RantReview          `json:"reviews,omitempty"`
 }
 
+// Rant listing bounds and filter vocabulary (AIRA-327).
+const (
+	DefaultRantListLimit = 50
+	MaxRantListLimit     = 200
+	RantPreviewRunes     = 240
+
+	RantStatusUnreviewed = "unreviewed"
+	RantStatusReviewed   = "reviewed"
+	RantStatusAll        = "all"
+
+	// RantSeverityUnset is a LISTING filter value only: it selects rants that
+	// recorded no severity. Capture refuses it; severity is never inferred.
+	RantSeverityUnset = "unset"
+)
+
+// RantListOptions selects one page of a project's rants. The zero value is the
+// work queue: unreviewed rants, oldest first, DefaultRantListLimit rows.
 type RantListOptions struct {
-	By         string
-	Unreviewed bool
-	Since      int64
+	// Status is unreviewed (also the zero value's meaning), reviewed or all.
+	// "Reviewed" means at least one append-only review row exists.
+	Status string
+	// Severity is papercut, annoyance, blocker, unset (no severity recorded),
+	// or empty for any.
+	Severity string
 	// Tag, when non-empty, restricts the listing to rants carrying this
 	// (already-normalised) recorded tag.
 	Tag string
+	// Actor, when non-empty, is an exact match on the recorded actor.
+	Actor string
+	// Grep, when non-empty, is a substring of the body, case-insensitive for
+	// ASCII letters only. A redacted rant has no searchable text: it is never
+	// a match, and the listing counts it as unsearched instead.
+	Grep string
+	// Since is the exclusive rant-sequence cursor.
+	Since int64
+	// Limit is 1..MaxRantListLimit; zero means DefaultRantListLimit.
+	Limit int
+	// Newest takes the LAST Limit matches (still returned ascending).
+	Newest bool
+}
+
+// Validate refuses an option set that cannot be listed honestly, naming the
+// field and the offending value.
+func (options RantListOptions) Validate() error {
+	switch options.Status {
+	case "", RantStatusUnreviewed, RantStatusReviewed, RantStatusAll:
+	default:
+		return fmt.Errorf("%s: rant ls --status %q is invalid; allowed: unreviewed, reviewed, all", CodeRantInvalid, options.Status)
+	}
+	switch RantSeverity(options.Severity) {
+	case "", RantSeverityPapercut, RantSeverityAnnoyance, RantSeverityBlocker, RantSeverityUnset:
+	default:
+		return fmt.Errorf("%s: rant ls --severity %q is invalid; allowed: papercut, annoyance, blocker, unset", CodeRantInvalid, options.Severity)
+	}
+	if options.Limit < 0 || options.Limit > MaxRantListLimit {
+		return fmt.Errorf("%s: rant ls --limit %d is out of range; allowed: 1..%d", CodeRantInvalid, options.Limit, MaxRantListLimit)
+	}
+	if options.Since < 0 {
+		return fmt.Errorf("%s: rant ls --since %d is invalid; it must be a non-negative integer", CodeRantInvalid, options.Since)
+	}
+	return nil
+}
+
+// RantSummary is the compact row `rant ls` returns by default: the metadata a
+// triage pass sorts on plus a bounded body preview, never the git context or
+// review prose (those stay behind `rant get` and `rant ls --full`).
+type RantSummary struct {
+	ID         string       `json:"id"`
+	Seq        int64        `json:"seq"`
+	ReceivedAt string       `json:"received_at"`
+	Severity   RantSeverity `json:"severity"`
+	Tags       []string     `json:"tags"`
+	Refs       []RantRef    `json:"refs"`
+	Actor      string       `json:"actor"`
+	Reviewed   bool         `json:"reviewed"`
+	// Outcome is the most recent typed outcome any review recorded, or empty
+	// when no review recorded one.
+	Outcome  RantOutcome `json:"outcome"`
+	Redacted bool        `json:"redacted,omitempty"`
+	// Body is the first RantPreviewRunes runes. When it was cut, BodyTruncated
+	// is set and BodyBytes is the full body's length in bytes.
+	Body          string `json:"body"`
+	BodyTruncated bool   `json:"body_truncated,omitempty"`
+	BodyBytes     int    `json:"body_bytes,omitempty"`
+}
+
+// Summary projects a rant onto its compact listing row.
+func (rant Rant) Summary() RantSummary {
+	summary := RantSummary{ID: rant.ID, Seq: rant.Seq, ReceivedAt: rant.ReceivedAt, Severity: rant.Severity,
+		Tags: append([]string{}, rant.Tags...), Refs: append([]RantRef{}, rant.Refs...), Actor: rant.Actor,
+		Reviewed: rant.Reviewed, Redacted: rant.Redacted, Body: rant.Body}
+	for i := len(rant.Reviews) - 1; i >= 0; i-- {
+		if rant.Reviews[i].Outcome != "" {
+			summary.Outcome = rant.Reviews[i].Outcome
+			break
+		}
+	}
+	runes := 0
+	for cut := range rant.Body {
+		if runes == RantPreviewRunes {
+			summary.Body, summary.BodyTruncated, summary.BodyBytes = rant.Body[:cut], true, len(rant.Body)
+			break
+		}
+		runes++
+	}
+	return summary
 }
 
 var rantTagBreaks = regexp.MustCompile(`[^a-z0-9]+`)
@@ -147,7 +246,7 @@ func (input RantInput) Normalised() (RantInput, error) {
 	input.Session, input.Model = strings.TrimSpace(input.Session), strings.TrimSpace(input.Model)
 	input.Severity = RantSeverity(strings.ToLower(strings.TrimSpace(string(input.Severity))))
 	if input.Severity != "" && input.Severity != RantSeverityPapercut && input.Severity != RantSeverityAnnoyance && input.Severity != RantSeverityBlocker {
-		return RantInput{}, errors.New(CodeRantInvalid + ": severity is invalid")
+		return RantInput{}, fmt.Errorf("%s: rant --severity %q is invalid; allowed: papercut, annoyance, blocker", CodeRantInvalid, input.Severity)
 	}
 	tags := make(map[string]struct{}, len(input.Tags))
 	for _, raw := range input.Tags {

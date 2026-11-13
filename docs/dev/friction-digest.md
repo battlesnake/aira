@@ -11,10 +11,19 @@ only the rants needed for triage:
 ```sh
 aira rant ls --by tag
 aira rant ls --by actor
-aira rant ls --unreviewed --since 0
+aira rant ls
+aira rant ls --grep flaky --status all
 aira grep 'flaky OR slow' --kind rant
 aira rant get RANT-1
 ```
+
+`aira rant ls` lists one page of the work queue: unreviewed rants, oldest
+first, 50 compact rows (metadata plus a 240-rune body preview; `--full` for the
+whole row). The envelope says how many matched (`total`) and whether the page
+was cut (`truncated`); continue with `--since <next_since>`. Narrow with
+`--status unreviewed|reviewed|all`, `--severity S|unset`, `--tag T`,
+`--actor A` and `--grep TEXT`; `--newest` takes the last page instead, and
+`--limit N` (1..200) sizes it.
 
 `--since` is the last processed rant sequence, not an assertion that earlier
 rants are resolved. “Reviewed” means only that at least one append-only review
@@ -42,7 +51,7 @@ an explicit target selector:
 
 ```sh
 aira rant --prefix AIRA "confine's admission wait says nothing while it waits"
-aira rant ls --prefix AIRA --unreviewed
+aira rant ls --prefix AIRA
 aira rant get --prefix AIRA RANT-7
 aira rant review --prefix AIRA RANT-7 --outcome planned
 ```

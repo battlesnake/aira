@@ -92,8 +92,8 @@ func TestRantCoreRefusesATargetSelectorItCannotResolve(t *testing.T) {
 		if response.OK || response.Code != "E_DAEMON_UNAVAILABLE" {
 			t.Fatalf("%s: code=%q ok=%v error=%q, want E_DAEMON_UNAVAILABLE", name, response.Code, response.OK, response.Error)
 		}
-		if rants, err := s.ListRants(domain.RantListOptions{}); err != nil || len(rants) != 0 {
-			t.Fatalf("%s: a refused target selector filed %d local rant(s) (err=%v)", name, len(rants), err)
+		if rants, err := s.ListRants(domain.RantListOptions{Status: domain.RantStatusAll}); err != nil || rants.Total != 0 {
+			t.Fatalf("%s: a refused target selector filed %d local rant(s) (err=%v)", name, rants.Total, err)
 		}
 	}
 	// Without a selector the same core still captures locally, so the refusal
