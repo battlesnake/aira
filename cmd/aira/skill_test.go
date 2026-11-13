@@ -55,8 +55,8 @@ func TestSkillExamplesMatchMCPRequestsForEveryAction(t *testing.T) {
 	})
 	for _, action := range artifacts.Actions {
 		t.Run(action.Verb+"/"+action.Operation, func(t *testing.T) {
-			if action.Verb == "rant" && action.Operation != "capture" {
-				t.Skip("v1 MCP intentionally exposes capture only")
+			if action.Verb == "rant" && action.Operation != "capture" && action.Operation != "ls" {
+				t.Skip("MCP exposes rant capture and ls only")
 			}
 			argv := action.Argv
 			positional, options, err := parseArgs(argv[0], argv[1:])

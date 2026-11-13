@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"aira/internal/gitcontext"
@@ -137,9 +138,10 @@ type RantListOptions struct {
 	Tag string
 	// Actor, when non-empty, is an exact match on the recorded actor.
 	Actor string
-	// Grep, when non-empty, is a substring of the body, case-insensitive for
-	// ASCII letters only. A redacted rant has no searchable text: it is never
-	// a match, and the listing counts it as unsearched instead.
+	// Grep, when non-empty, is a literal substring of the body matched under
+	// Unicode simple case folding (RantGrepMatches). A redacted rant has no
+	// searchable text: it is never a match, and the listing counts it as
+	// unsearched instead.
 	Grep string
 	// Since is the exclusive rant-sequence cursor.
 	Since int64
@@ -171,6 +173,29 @@ func (options RantListOptions) Validate() error {
 	return nil
 }
 
+// RantGrepMatches reports whether pattern occurs in body as a literal
+// substring, case-insensitively under Unicode simple case folding: two runes
+// match when strings.EqualFold would equate them ("TÖÖ" contains "töö", "Σ",
+// "σ" and "ς" are one letter). Full folding is not applied ("ß" does not
+// match "ss"), and nothing is a wildcard. Any non-empty pattern, whitespace
+// included, is searched as given.
+func RantGrepMatches(body, pattern string) bool {
+	return strings.Contains(strings.Map(foldRune, body), strings.Map(foldRune, pattern))
+}
+
+// foldRune maps a rune to the smallest member of its simple case-folding
+// orbit, so two runes fold to the same value exactly when they are equal
+// under simple case folding.
+func foldRune(r rune) rune {
+	least := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < least {
+			least = f
+		}
+	}
+	return least
+}
+
 // RantSummary is the compact row `rant ls` returns by default: the metadata a
 // triage pass sorts on plus a bounded body preview, never the git context or
 // review prose (those stay behind `rant get` and `rant ls --full`).
@@ -187,7 +212,9 @@ type RantSummary struct {
 	OriginProjectID string `json:"origin_project_id,omitempty"`
 	Reviewed        bool   `json:"reviewed"`
 	// Outcome is the most recent typed outcome any review recorded, or empty
-	// when no review recorded one.
+	// when no review recorded one. A later note-only review does not erase
+	// it: this is the same outcome capture's sharing_recorded_tags
+	// loop-closer reports (store.sharingRecordedTags, outcome<>'').
 	Outcome  RantOutcome `json:"outcome"`
 	Redacted bool        `json:"redacted,omitempty"`
 	// Body is the first RantPreviewRunes runes. When it was cut, BodyTruncated

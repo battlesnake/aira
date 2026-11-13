@@ -114,7 +114,9 @@ owner's "if appropriate" case); `worktree_id` replaces neither.
   `aira rant ls [--by tag|actor] [--unreviewed] [--since <seq>]` (superseded by AIRA-327: `--status`
   replaces `--unreviewed`, unreviewed is the default, and ls returns a paged envelope); `aira rant get RANT-n`;
   `aira rant review RANT-n [--outcome O] [--note "…"] [--resolved-by ticket:X]`.
-- **MCP:** `aira_rant({ text, tags?, severity?, refs?, idempotency_key? })`. Tool description = the only
+- **MCP:** `aira_rant({ text, tags?, severity?, refs?, idempotency_key? })` (AIRA-327 adds an optional
+  `operation`: omitted = this capture; `"ls"` = the paged listing with its ls arguments; get/review/redact
+  stay CLI-only). Tool description = the only
   permitted prompt: *"Ranting welcome: slow tests, linter noise, flaky infra, confusing setup — dump it
   unfiltered; logged for later review, you won't be asked to format it."* Never nagged per-turn.
 - **Loop-closer (Q5 = v1; Sol/Opus-5 converge):** capture returns, **post-commit**, a small deterministic

@@ -209,12 +209,6 @@ type RantPage struct {
 	UnsearchedRedacted *int
 }
 
-// escapeLike makes every byte of a user string literal inside a LIKE pattern
-// using '\' as the ESCAPE character.
-func escapeLike(value string) string {
-	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
-}
-
 func (s *Store) ListRants(options domain.RantListOptions) (RantPage, error) {
 	if err := options.Validate(); err != nil {
 		return RantPage{}, err
@@ -255,43 +249,50 @@ func (s *Store) ListRants(options domain.RantListOptions) (RantPage, error) {
 		return RantPage{}, translateDBError(err)
 	}
 	defer tx.Rollback()
-	var page RantPage
+	// Every id matching the SQL filters, oldest first. --grep is applied here
+	// in Go rather than with LIKE, whose case folding is ASCII-only: the
+	// match is domain.RantGrepMatches (Unicode simple case folding, literal
+	// text). The total and the page are then cut from one matched list.
+	body := `''`
 	if options.Grep != "" {
-		var unsearched int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)`+where+` AND redacted<>0`, args...).Scan(&unsearched); err != nil {
-			return RantPage{}, translateDBError(err)
-		}
-		page.UnsearchedRedacted = &unsearched
-		where += ` AND redacted=0 AND body LIKE ? ESCAPE '\'`
-		args = append(args, "%"+escapeLike(options.Grep)+"%")
+		body = `body`
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&page.Total); err != nil {
-		return RantPage{}, translateDBError(err)
-	}
-	order := ` ORDER BY seq ASC LIMIT ?`
-	if options.Newest {
-		order = ` ORDER BY seq DESC LIMIT ?`
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT id`+where+order, append(args, limit)...)
+	rows, err := tx.QueryContext(ctx, `SELECT id,redacted,`+body+where+` ORDER BY seq ASC`, args...)
 	if err != nil {
 		return RantPage{}, translateDBError(err)
 	}
+	var page RantPage
+	unsearched := 0
 	var ids []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, text string
+		var redacted int
+		if err := rows.Scan(&id, &redacted, &text); err != nil {
 			rows.Close()
 			return RantPage{}, err
+		}
+		if options.Grep != "" {
+			if redacted != 0 {
+				unsearched++
+				continue
+			}
+			if !domain.RantGrepMatches(text, options.Grep) {
+				continue
+			}
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Close(); err != nil {
 		return RantPage{}, err
 	}
+	if options.Grep != "" {
+		page.UnsearchedRedacted = &unsearched
+	}
+	page.Total = len(ids)
 	if options.Newest {
-		for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
-			ids[i], ids[j] = ids[j], ids[i]
-		}
+		ids = ids[max(0, len(ids)-limit):]
+	} else {
+		ids = ids[:min(limit, len(ids))]
 	}
 	page.Rows = make([]domain.Rant, 0, len(ids))
 	for _, id := range ids {

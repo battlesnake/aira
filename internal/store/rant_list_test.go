@@ -177,8 +177,8 @@ func TestRantListFiltersAloneAndCombined(t *testing.T) {
 	}
 }
 
-// LIKE treats % and _ as wildcards; --grep must not. Each probe matches
-// exactly one body only if the wildcard is escaped.
+// --grep is literal text: % and _ (LIKE wildcards) and \ match only
+// themselves. Each probe matches exactly one body.
 func TestRantListGrepTreatsLikeWildcardsLiterally(t *testing.T) {
 	s, _ := rantTestStore(t)
 	percent := mustAddRant(t, s, domain.RantInput{Body: "coverage stuck at 100% done", Actor: "t"}).ID
@@ -200,6 +200,34 @@ func TestRantListGrepTreatsLikeWildcardsLiterally(t *testing.T) {
 		if got := rantIDs(page.Rows); fmt.Sprint(got) != fmt.Sprint(want) || page.Total != len(want) {
 			t.Fatalf("grep %q = %v (total %d), want %v", grep, got, page.Total, want)
 		}
+	}
+}
+
+// --grep folds Unicode case (SQLite LIKE folds ASCII only), searches a
+// whitespace pattern as given, and its total and cursor count every match
+// beyond the limit, not just the page.
+func TestRantListGrepFoldsUnicodeAndPagesHonestly(t *testing.T) {
+	s, _ := rantTestStore(t)
+	var matches []domain.Rant
+	for i := range 5 {
+		matches = append(matches, mustAddRant(t, s, domain.RantInput{Body: fmt.Sprintf("TÖÖ number %d is slow", i), Actor: "t"}).Rant)
+		mustAddRant(t, s, domain.RantInput{Body: fmt.Sprintf("too number %d", i), Actor: "t"})
+	}
+	spaced := mustAddRant(t, s, domain.RantInput{Body: "one  two", Actor: "t"}).ID
+	page := mustListRants(t, s, domain.RantListOptions{Grep: "töö", Limit: 2})
+	if got := rantIDs(page.Rows); fmt.Sprint(got) != fmt.Sprint([]string{matches[0].ID, matches[1].ID}) || page.Total != 5 || !page.Truncated || page.NextSince == nil || *page.NextSince != matches[1].Seq {
+		t.Fatalf("grep töö limit 2 = %v total=%d truncated=%v next=%v", got, page.Total, page.Truncated, page.NextSince)
+	}
+	next := mustListRants(t, s, domain.RantListOptions{Grep: "töö", Limit: 2, Since: *page.NextSince})
+	if got := rantIDs(next.Rows); fmt.Sprint(got) != fmt.Sprint([]string{matches[2].ID, matches[3].ID}) || next.Total != 3 {
+		t.Fatalf("grep töö page 2 = %v total=%d", got, next.Total)
+	}
+	newest := mustListRants(t, s, domain.RantListOptions{Grep: "TÖÖ", Limit: 2, Newest: true})
+	if got := rantIDs(newest.Rows); fmt.Sprint(got) != fmt.Sprint([]string{matches[3].ID, matches[4].ID}) || newest.Total != 5 || !newest.Truncated || newest.NextSince != nil {
+		t.Fatalf("grep TÖÖ newest 2 = %v total=%d", got, newest.Total)
+	}
+	if got := rantIDs(mustListRants(t, s, domain.RantListOptions{Grep: "  "}).Rows); fmt.Sprint(got) != fmt.Sprint([]string{spaced}) {
+		t.Fatalf("grep two spaces = %v, want only %s", got, spaced)
 	}
 }
 

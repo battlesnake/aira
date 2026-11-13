@@ -49,7 +49,8 @@ func rantCapture(t *testing.T, c *Core, body string) string {
 
 func TestRantLsEnvelopeAndCompactRows(t *testing.T) {
 	c := New(coreTestStore(t))
-	long := strings.Repeat("ß", domain.RantPreviewRunes+10)
+	// 250 two-byte runes; the preview is the literal 240 runes (480 bytes).
+	long := strings.Repeat("ß", 250)
 	first := rantCapture(t, c, "first")
 	second := rantCapture(t, c, long)
 	third := rantCapture(t, c, "third")
@@ -74,7 +75,7 @@ func TestRantLsEnvelopeAndCompactRows(t *testing.T) {
 			t.Fatalf("compact row carries %q: %v", absent, compact)
 		}
 	}
-	if compact["body"] != strings.Repeat("ß", domain.RantPreviewRunes) || compact["body_truncated"] != true || compact["body_bytes"] != float64(len(long)) {
+	if compact["body"] != strings.Repeat("ß", 240) || compact["body_truncated"] != true || compact["body_bytes"] != float64(500) {
 		t.Fatalf("compact preview: body_truncated=%v body_bytes=%v", compact["body_truncated"], compact["body_bytes"])
 	}
 	if compact["reviewed"] != false || compact["outcome"] != "" || compact["actor"] != "opus" {
@@ -92,25 +93,84 @@ func TestRantLsEnvelopeAndCompactRows(t *testing.T) {
 	}
 }
 
-// --full returns exactly the row `rant get` returns (the pre-AIRA-327 ls row).
+// --full returns exactly the row `rant get` returns (the pre-AIRA-327 ls row),
+// reviews included: every row of a --status all --full listing over reviewed
+// and unreviewed rants equals its `rant get`.
 func TestRantLsFullRowsMatchGet(t *testing.T) {
 	s := coreTestStore(t)
 	c := New(s)
-	id := rantCapture(t, c, strings.Repeat("x", domain.RantPreviewRunes*3))
-	response := rantLs(c, map[string]any{"full": true})
+	reviewedTwice := rantCapture(t, c, strings.Repeat("x", 720))
+	unreviewed := rantCapture(t, c, "short")
+	reviewedOnce := rantCapture(t, c, "noted")
+	ticket := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": "fix it"}})
+	if !ticket.OK {
+		t.Fatalf("create: %#v", ticket)
+	}
+	for _, review := range []map[string]any{
+		{"selector": reviewedTwice, "outcome": "planned", "note": "examined", "resolved_by": "ticket:" + ticket.Data.(map[string]any)["id"].(string)},
+		{"selector": reviewedTwice, "note": "still seen"},
+		{"selector": reviewedOnce, "outcome": "wont-fix"},
+	} {
+		review["subverb"] = "review"
+		if r := c.Do(context.Background(), Request{Verb: "rant", Args: review, Actor: "owner"}); !r.OK {
+			t.Fatalf("review %v: %#v", review, r)
+		}
+	}
+	response := rantLs(c, map[string]any{"status": "all", "full": true})
 	if !response.OK {
 		t.Fatalf("ls --full: %#v", response)
 	}
 	rows, ok := response.Data.(map[string]any)["rows"].([]domain.Rant)
-	if !ok || len(rows) != 1 {
+	if !ok || len(rows) != 3 {
 		t.Fatalf("ls --full rows = %#v", response.Data)
 	}
-	want, err := s.GetRant(id)
-	if err != nil {
-		t.Fatal(err)
+	reviews := map[string]int{}
+	for i, id := range []string{reviewedTwice, unreviewed, reviewedOnce} {
+		want, err := s.GetRant(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(rows[i], want) {
+			t.Fatalf("ls --full row %s differs from rant get:\n got %#v\nwant %#v", id, rows[i], want)
+		}
+		reviews[id] = len(rows[i].Reviews)
 	}
-	if !reflect.DeepEqual(rows[0], want) {
-		t.Fatalf("ls --full row differs from rant get:\n got %#v\nwant %#v", rows[0], want)
+	// The fixture must actually carry reviews, or the parity above is vacuous.
+	if reviews[reviewedTwice] != 2 || reviews[reviewedOnce] != 1 || reviews[unreviewed] != 0 || rows[0].Reviews[0].Note != "examined" || rows[0].Reviews[0].ResolvedBy == nil {
+		t.Fatalf("--full reviews = %v (first %#v), want 2/0/1 with the note and resolved_by", reviews, rows[0].Reviews)
+	}
+	if len(rows[0].Body) != 720 {
+		t.Fatalf("--full body = %d bytes, want the whole 720", len(rows[0].Body))
+	}
+}
+
+// The compact outcome is the outcome a rant is known by elsewhere: capture's
+// sharing_recorded_tags loop-closer reports the latest TYPED outcome, so a
+// later note-only review does not erase it. ls must agree with it.
+func TestRantLsOutcomeAgreesWithTheCaptureLoopCloser(t *testing.T) {
+	c := New(coreTestStore(t))
+	capture := func(body string) store.RantAddResult {
+		t.Helper()
+		response := c.Do(context.Background(), Request{Verb: "rant", Args: map[string]any{"subverb": "capture", "text": body, "tags": []string{"infra"}}, Actor: "opus"})
+		if !response.OK {
+			t.Fatalf("capture: %#v", response)
+		}
+		return response.Data.(store.RantAddResult)
+	}
+	first := capture("flaky infra").ID
+	for _, review := range []map[string]any{{"outcome": "planned"}, {"note": "seen again"}} {
+		review["subverb"], review["selector"] = "review", first
+		if r := c.Do(context.Background(), Request{Verb: "rant", Args: review, Actor: "owner"}); !r.OK {
+			t.Fatalf("review: %#v", r)
+		}
+	}
+	shared := capture("flaky infra again").SharingRecordedTags
+	if len(shared) != 1 || shared[0].RantID != first || shared[0].Outcome != domain.RantOutcomePlanned {
+		t.Fatalf("loop-closer = %#v, want %s planned", shared, first)
+	}
+	row := rantLsWire(t, rantLs(c, map[string]any{"status": "reviewed"}))["rows"].([]any)[0].(map[string]any)
+	if row["id"] != first || row["outcome"] != string(shared[0].Outcome) {
+		t.Fatalf("ls outcome = %v, loop-closer outcome = %q", row["outcome"], shared[0].Outcome)
 	}
 }
 
@@ -126,7 +186,6 @@ func TestRantLsRefusesOutOfRangeValuesNamingTheField(t *testing.T) {
 		"limit -1":         {map[string]any{"limit": "-1"}, domain.CodeRantInvalid, `--limit "-1"`},
 		"limit text":       {map[string]any{"limit": "lots"}, domain.CodeRantInvalid, `--limit "lots"`},
 		"since text":       {map[string]any{"since": "x"}, domain.CodeRantInvalid, `--since "x"`},
-		"grep blank":       {map[string]any{"grep": "  "}, domain.CodeRantInvalid, "--grep"},
 		"two tags":         {map[string]any{"tags": []string{"a", "b"}}, domain.CodeRantInvalid, "a, b"},
 		"status bogus":     {map[string]any{"status": "open"}, "E_ARGUMENT_INVALID", `"open"`},
 		"severity bogus":   {map[string]any{"severity_filter": "P1"}, "E_ARGUMENT_INVALID", `"P1"`},
@@ -148,6 +207,10 @@ func TestRantLsRefusesOutOfRangeValuesNamingTheField(t *testing.T) {
 		if response := rantLs(c, map[string]any{"limit": limit}); !response.OK {
 			t.Fatalf("limit %s refused: %#v", limit, response)
 		}
+	}
+	// A whitespace pattern is a real substring, searched as given.
+	if response := rantLs(c, map[string]any{"grep": "  "}); !response.OK {
+		t.Fatalf("grep of two spaces refused: %#v", response)
 	}
 	if response := rantLs(c, map[string]any{"severity_filter": "unset", "status": "ALL"}); !response.OK {
 		t.Fatalf("severity unset / status ALL refused: %#v", response)
