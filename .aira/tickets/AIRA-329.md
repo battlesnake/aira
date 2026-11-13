@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-329","project":"aira","title":"confine reserve too small: OOM on a repeat command sized fallback:no-history (diagnose, then fix or split)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.41","labels":["rant-triage"],"hold":false,"relations":[]}
+---
+11 rants (RANT-64,67,69,70,78,81,109,116,124,128,129), all dated AFTER the v0.40 own-peak floor (AIRA-314) shipped on 2026-10-26. Questions to answer with evidence: is the floor live on the box daemon; why was a command sized fallback:no-history when the same argv ran minutes earlier (RANT-78: only --name differed); is the first admission after a WSL reboot (RANT-129 history-unavailable) the 250 ms history read deadline from AIRA-314; does a pinned run record a usable peak for the later unpinned run. Output: a measured diagnosis, then fix tickets or a fix. Relates to AIRA-323..326 (history plan) but is a bug, not the plan.

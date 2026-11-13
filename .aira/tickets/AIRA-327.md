@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-327","project":"aira","title":"rant ls: a sane default (unreviewed, oldest first, honest truncation) and useful flags","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.41","labels":["rant-triage"],"hold":false,"relations":[]}
+---
+Owner request 2026-11-14. Today rant ls returns a bare array of the FIRST 50 rants oldest-first with no total and no truncation signal, so 81 of 131 rants (76 unreviewed) were invisible until read from the DB. Wanted: default = unreviewed rants; envelope {rows,total,returned,truncated,next_since} like the other list verbs; compact rows (body preview, full body behind a flag); flags: --status unreviewed|reviewed|all, --severity, --tag, --actor, --grep, --since SEQ (cursor), --limit N, --newest, --full. Evidence: RANT-56..131 triage 2026-11-14.
