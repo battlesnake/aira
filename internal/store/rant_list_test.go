@@ -68,6 +68,7 @@ func TestRantListPagingWalksEveryRantExactlyOnce(t *testing.T) {
 		want = append(want, mustAddRant(t, s, domain.RantInput{Body: fmt.Sprintf("rant %d", i), Actor: "t"}).ID)
 	}
 	var seen []string
+	var sizes []int
 	since, pages := int64(0), 0
 	for {
 		page := mustListRants(t, s, domain.RantListOptions{Since: since})
@@ -76,6 +77,7 @@ func TestRantListPagingWalksEveryRantExactlyOnce(t *testing.T) {
 			t.Fatalf("page %d: total=%d, want %d (every match after the cursor, before the limit)", pages, page.Total, remaining)
 		}
 		seen = append(seen, rantIDs(page.Rows)...)
+		sizes = append(sizes, len(page.Rows))
 		if page.Truncated != (page.Total > len(page.Rows)) {
 			t.Fatalf("page %d: truncated=%v with total=%d returned=%d", pages, page.Truncated, page.Total, len(page.Rows))
 		}
@@ -85,9 +87,6 @@ func TestRantListPagingWalksEveryRantExactlyOnce(t *testing.T) {
 			}
 			break
 		}
-		if len(page.Rows) != domain.DefaultRantListLimit {
-			t.Fatalf("page %d: %d rows, want the default limit %d", pages, len(page.Rows), domain.DefaultRantListLimit)
-		}
 		if page.NextSince == nil || *page.NextSince != page.Rows[len(page.Rows)-1].Seq {
 			t.Fatalf("page %d: next_since=%v, want the last row's seq", pages, page.NextSince)
 		}
@@ -96,8 +95,10 @@ func TestRantListPagingWalksEveryRantExactlyOnce(t *testing.T) {
 			t.Fatal("paging did not terminate")
 		}
 	}
-	if pages != 3 || fmt.Sprint(seen) != fmt.Sprint(want) {
-		t.Fatalf("walked %d pages, saw %d rants; want 3 pages and every rant once in order", pages, len(seen))
+	// The default limit is the literal 50 the ticket decided, asserted here
+	// independently of the implementation constant: 130 = 50 + 50 + 30.
+	if fmt.Sprint(sizes) != "[50 50 30]" || fmt.Sprint(seen) != fmt.Sprint(want) {
+		t.Fatalf("walked page sizes %v, saw %d rants; want [50 50 30] and every rant once in order", sizes, len(seen))
 	}
 
 	// --newest: the LAST limit matches, displayed ascending, no cursor.
@@ -257,5 +258,37 @@ func TestRantListGrepCountsRedactedRantsAsUnsearched(t *testing.T) {
 	// Without --grep the redacted rant is listed like any other.
 	if plain := mustListRants(t, s, domain.RantListOptions{}); len(plain.Rows) != 2 || plain.UnsearchedRedacted != nil {
 		t.Fatalf("plain: rows=%v unsearched=%v", rantIDs(plain.Rows), plain.UnsearchedRedacted)
+	}
+}
+
+// A fault while stepping the result set must surface as an error, never as a
+// short page that claims to be complete (total=1, truncated=false). The
+// rants table is swapped for a view whose redacted column raises a SQLite
+// runtime error on the second row, so rows.Next stops early with rows.Err set.
+func TestRantListIterationErrorIsNotASuccess(t *testing.T) {
+	s, _ := rantTestStore(t)
+	for i := 0; i < 3; i++ {
+		mustAddRant(t, s, domain.RantInput{Body: fmt.Sprintf("rant %d", i), Actor: "t"})
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE rants RENAME TO rants_real`,
+		`CREATE VIEW rants AS SELECT project_id,id,body,severity,idempotency_key,actor,session,model,observed_at,received_at,resolver_version,seq,
+		    CASE WHEN seq=2 THEN json('{') ELSE redacted END AS redacted,origin_project_id FROM rants_real`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	// Prove the fault fires at all, so a pass below is not vacuous.
+	var probe int
+	if err := s.db.QueryRow(`SELECT redacted FROM rants WHERE seq=2`).Scan(&probe); err == nil {
+		t.Fatal("fault view did not raise on the second row")
+	}
+	for _, status := range []string{domain.RantStatusAll, domain.RantStatusUnreviewed} {
+		page, err := s.ListRants(domain.RantListOptions{Status: status})
+		if err == nil {
+			t.Fatalf("status %s: iteration fault reported as success: total=%d returned=%d truncated=%v next=%v",
+				status, page.Total, len(page.Rows), page.Truncated, page.NextSince)
+		}
 	}
 }

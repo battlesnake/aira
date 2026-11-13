@@ -282,6 +282,12 @@ func (s *Store) ListRants(options domain.RantListOptions) (RantPage, error) {
 		}
 		ids = append(ids, id)
 	}
+	// rows.Next stops on a step error as well as at the end; without
+	// rows.Err the remainder would vanish behind a "complete" short page.
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RantPage{}, translateDBError(err)
+	}
 	if err := rows.Close(); err != nil {
 		return RantPage{}, err
 	}
