@@ -46,12 +46,12 @@ func TestRantSummaryOutcomeIsTheLatestTypedOutcome(t *testing.T) {
 		"later untyped is moot":  {[]RantReview{{ID: 1, Outcome: RantOutcomePlanned}, {ID: 2, Note: "seen"}}, RantOutcomePlanned},
 		"reviewed flag survives": {[]RantReview{{ID: 1, Outcome: RantOutcomeWontFix}}, RantOutcomeWontFix},
 	} {
-		rant := Rant{ID: "RANT-1", Seq: 7, Reviewed: len(tc.reviews) > 0, Reviews: tc.reviews, Tags: []string{"x"}, Refs: []RantRef{{Kind: RantRefTicket, ID: "AIRA-1"}}, Actor: "a", Severity: RantSeverityBlocker, ReceivedAt: "now", Redacted: true}
+		rant := Rant{ID: "RANT-1", Seq: 7, Reviewed: len(tc.reviews) > 0, Reviews: tc.reviews, Tags: []string{"x"}, Refs: []RantRef{{Kind: RantRefTicket, ID: "AIRA-1"}}, Actor: "a", Severity: RantSeverityBlocker, ReceivedAt: "now", Redacted: true, OriginProjectID: "other"}
 		summary := rant.Summary()
 		if summary.Outcome != tc.want {
 			t.Fatalf("%s: outcome=%q, want %q", name, summary.Outcome, tc.want)
 		}
-		if summary.ID != rant.ID || summary.Seq != rant.Seq || summary.Reviewed != rant.Reviewed || summary.Actor != "a" || summary.Severity != RantSeverityBlocker || summary.ReceivedAt != "now" || !summary.Redacted || len(summary.Tags) != 1 || len(summary.Refs) != 1 {
+		if summary.ID != rant.ID || summary.Seq != rant.Seq || summary.Reviewed != rant.Reviewed || summary.Actor != "a" || summary.Severity != RantSeverityBlocker || summary.ReceivedAt != "now" || summary.OriginProjectID != "other" || !summary.Redacted || len(summary.Tags) != 1 || len(summary.Refs) != 1 {
 			t.Fatalf("%s: metadata not carried: %#v", name, summary)
 		}
 	}

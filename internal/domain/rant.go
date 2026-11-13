@@ -182,7 +182,10 @@ type RantSummary struct {
 	Tags       []string     `json:"tags"`
 	Refs       []RantRef    `json:"refs"`
 	Actor      string       `json:"actor"`
-	Reviewed   bool         `json:"reviewed"`
+	// OriginProjectID is carried so a cross-project rant is never
+	// indistinguishable from a local one in a listing (AIRA-179).
+	OriginProjectID string `json:"origin_project_id,omitempty"`
+	Reviewed        bool   `json:"reviewed"`
 	// Outcome is the most recent typed outcome any review recorded, or empty
 	// when no review recorded one.
 	Outcome  RantOutcome `json:"outcome"`
@@ -197,7 +200,7 @@ type RantSummary struct {
 // Summary projects a rant onto its compact listing row.
 func (rant Rant) Summary() RantSummary {
 	summary := RantSummary{ID: rant.ID, Seq: rant.Seq, ReceivedAt: rant.ReceivedAt, Severity: rant.Severity,
-		Tags: append([]string{}, rant.Tags...), Refs: append([]RantRef{}, rant.Refs...), Actor: rant.Actor,
+		Tags: append([]string{}, rant.Tags...), Refs: append([]RantRef{}, rant.Refs...), Actor: rant.Actor, OriginProjectID: rant.OriginProjectID,
 		Reviewed: rant.Reviewed, Redacted: rant.Redacted, Body: rant.Body}
 	for i := len(rant.Reviews) - 1; i >= 0; i-- {
 		if rant.Reviews[i].Outcome != "" {
