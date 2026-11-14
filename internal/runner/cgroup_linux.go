@@ -5,12 +5,17 @@ package runner
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -156,20 +161,71 @@ func ensureParent(parent string) error {
 	if !st.IsDir() {
 		return errors.New("cgroup parent is not a directory")
 	}
-	// A delegated parent must permit private children. Probe creation is
-	// removed before returning; no process is ever moved by this probe.
-	probe := filepath.Join(parent, ".aira-probe-"+strconv.FormatInt(time.Now().UnixNano(), 10))
-	if err := os.Mkdir(probe, 0o755); err != nil {
+	return probeDelegation(parent, os.Mkdir, openCgroupKill)
+}
+
+// probeDelegation proves a delegated parent permits private children: it
+// creates a uniquely named probe child, checks the child exposes cgroup.kill,
+// and removes the child before returning on every path. No process is ever
+// moved by this probe. mkdir and openKill are seams for tests.
+func probeDelegation(parent string, mkdir func(string, os.FileMode) error, openKill func(string) error) error {
+	probe, err := mkdirProbe(parent, mkdir)
+	if err != nil {
 		return err
 	}
 	defer os.Remove(probe)
-	kill := filepath.Join(probe, "cgroup.kill")
-	f, err := os.OpenFile(kill, os.O_WRONLY, 0)
+	return openKill(filepath.Join(probe, "cgroup.kill"))
+}
+
+func openCgroupKill(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
 	_ = f.Close()
 	return nil
+}
+
+// probeMkdirAttempts bounds how many fresh names mkdirProbe tries when a name
+// already exists (AIRA-330).
+const probeMkdirAttempts = 8
+
+var (
+	probeSeq      atomic.Uint64
+	probeRandRead = rand.Read // seam: a test forces the fallback path
+	probeNow      = time.Now  // seam: a test forces one shared timestamp
+)
+
+// newProbeName returns a probe child name unique per call without depending
+// on the clock (AIRA-330: concurrent starters in one coarse clock tick used to
+// mint the same name and the loser's mkdir refused the whole start). The pid
+// separates processes, the counter separates calls in one process, and the
+// random suffix separates a recycled pid from a stale probe left by a killed
+// process. If the random source fails, the clock stands in for it.
+func newProbeName() string {
+	name := ".aira-probe-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatUint(probeSeq.Add(1), 10) + "-"
+	var b [8]byte
+	if _, err := probeRandRead(b[:]); err != nil {
+		return name + strconv.FormatInt(probeNow().UnixNano(), 36)
+	}
+	return name + hex.EncodeToString(b[:])
+}
+
+// mkdirProbe creates a fresh probe child under parent and returns its path. A
+// name that already exists is not a refusal: it picks a new name and retries,
+// up to probeMkdirAttempts, then fails naming the last path tried.
+func mkdirProbe(parent string, mkdir func(string, os.FileMode) error) (string, error) {
+	var err error
+	for range probeMkdirAttempts {
+		probe := filepath.Join(parent, newProbeName())
+		if err = mkdir(probe, 0o755); err == nil {
+			return probe, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("probe name exists after %d attempts with fresh names: %w", probeMkdirAttempts, err)
 }
 
 func (b *linuxScopeBackend) Create(ctx context.Context, id string) (Scope, error) {
