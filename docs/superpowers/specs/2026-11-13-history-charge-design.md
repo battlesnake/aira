@@ -994,7 +994,7 @@ Sequence notes (verified where marked):
   so neither takes a protocol number from the other. 326 must compose its bonus with 340's
   tiers (section 5.4).
 - **AIRA-341** (delete the machine-wide p90 prior; backlog plan B#3a). Its ticket file is on
-  branch `origin/aira-housekeeping-2` (commit `eeb752f9`), not on master (verified). It
+  master (merged with PR #231, `0ea1582e`). It
   interacts with 323 only through the shared table: 323 adds nothing to `ConfinePeakP90`
   (`confine_peak_history.go:201`), and deleting it removes the AIRA-314 full-table `GROUP BY`
   that section 5.1.5 warns readers against.
@@ -1035,3 +1035,44 @@ Sequence notes (verified where marked):
   starvation claim corrected; `aitest-parent` namespace kept, `time` flags handled; replay
   corrected (OOM veto, `memory.peak`, leakage and retention caveats stated); gates rebuilt
   (counterfactual replay, memory.high/PSI, explicit rollback); monthly re-selection removed.
+
+
+## Plan-gate record and binding build amendments (coordinator, 2026-11-14)
+
+Review history: rev 3 went through six review rounds (two workflows, Sol high plus Fable). The
+design was accepted: four raw facts only (`wall_ms`, `wait_ms`, `started_at_ms`, `repo`), no key
+columns, no protocol bump, optional fields with one re-send against an old daemon (AIRA-340's
+measured pattern). The remaining findings were test-plan completeness points, not design flaws,
+and the owner's non-convergence rule applies: no further document-only rounds. The plan is
+APPROVED for build with the following amendments, which are binding on the build brief and are
+checked in the build review (the code review is the real gate):
+
+1. **T4 clock**: the fake clock must advance AFTER `deps.start` returns and during the teardown
+   usage read; the captured report must carry both increments (kills an early `wall_ms` snapshot).
+2. **Production seam values**: add one test (T4b) that takes `defaultConfineDeps()` with the
+   three new seams (`wallNow`, `monoNow`, `repoIdentity`) UN-faked and asserts values: `monoNow`
+   increases by at least a slept interval and by less than a loose bound; `wallNow().UnixMilli()`
+   is within a few seconds of `time.Now()` and carries no monotonic reading; `repoIdentity` run
+   with `t.Chdir` into a temp repo equals `RepoIdentity(that dir)` and is 16 hex. Mutations red:
+   `processEpoch` never assigned, default `repoIdentity` returns `("", false)`, `wallNow` in
+   seconds. The cutover smoke test must assert values: run a unique argv (`sleep 1`), select
+   `where signature = <that argv>`, require `wall_ms` between 1000 and about 10000, `wait_ms >= 0`,
+   `started_at_ms` within about 60 s of `date +%s%3N`. (A simpler alternative that removes the
+   class: one `now func() time.Time` seam with durations by `Sub`; the builder may choose it if it
+   deletes `processEpoch`, and must then correct the sentence in section 9 about tests catching
+   bugs.)
+3. **T9(g)**: a report carrying `WallMS` against a server with no store (E_DAEMON_UNAVAILABLE)
+   returns the error with exactly one request sent; mutation: re-send on any refusal code.
+4. **T6**: the `ok=false` fake returns a non-empty id (`("0123456789abcdef", false)`) and the test
+   expects an empty `Repo`.
+5. **T8** names its mutations: omit one column from the `ensureConfinePeakHistorySubject` list; give
+   the ALTER a `DEFAULT 0` so old rows read 0 instead of NULL.
+6. **Supersession statements**: this spec supersedes the backlog plan's proto-bump statements for
+   323 (`docs/plans/2026-11-14-backlog-plan.md` lines mentioning a proto bump or an old client's
+   report being "simply refused") and the AIRA-323 ticket body's "normalised command key" and
+   index text; the build PR updates both.
+7. Re-measure any mutation count the final text keeps (the earlier "39 cases"/"40 mutations"
+   statements describe cut machinery; delete or re-run them).
+
+Sequencing: build after the v0.42 batch (AIRA-340, the aira top dialogs, the small batch, the
+aitest dispatch work) has merged, so the report-sender files are stable.
