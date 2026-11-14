@@ -17,6 +17,57 @@ with the `governor-slot` relay and the daemon-side park/active-set scheduler.
 [`docs/superpowers/specs/2026-09-01-aitest-design.md`](../../../docs/superpowers/specs/2026-09-01-aitest-design.md)
 for the full design and staging (the retirement plan is §3.8).
 
+## Dispatch cost and the pool summary line (AIRA-343, AIRA-344)
+
+The supervisor hands every test out from one thread. Each hand-out picks the
+test that fits the worker (its memory reservation and CPU cores) and ranks
+highest by `aira_time` (longest first), then by memory need (largest first),
+then by queue order. Since AIRA-343 that pick no longer scans the whole ready
+queue. The queue keeps one heap per (memory need, CPU need) class, and a pick
+looks only at the top of each class that fits, so its cost depends on the
+number of classes, not on the number of queued tests. The order it picks in is
+exactly the old order, which `test_ready_queue.py` checks against the old
+full-scan picker over random queues and operation sequences. Measured with
+`AIRA_AITEST_BENCH=1 pytest -s test_ready_queue.py -k bench` (Python 3.12.3,
+65,164 queued tests in 20 classes, 200 successful picks timed for each picker):
+27-32 ms per pick before and about 0.01 ms after. Building the index takes
+80-110 ms once per queue.
+
+After the per-test lines and the `aitest: N passed, ...` count, every run
+prints one more line:
+
+```text
+aitest: pool: live workers peak 64, mean 60.00 over 2020.1 s; supervisor CPU 1500.2 s (74% of one core); workers idle waiting for dispatch 812.3 s, 12.5 ms per test (measured on 65164 of 65164 tests)
+```
+
+- **Live workers.** A worker counts as live from its ready signal to its
+  retirement. The time it spends waiting for admission does not count. The
+  mean is live-worker time divided by the run's wall time.
+- **Supervisor CPU.** The supervisor process's own CPU time (`time.process_time()`)
+  from the start of the run to the end of the dispatch loop. Collection, which
+  happens before the run starts, is not included.
+- **Idle waiting for dispatch.** Each worker measures this for itself, for every
+  test it receives. The wait starts when the worker begins sending its previous
+  result, or when it enters its loop if this is its first test, and ends when it
+  has read the next test's id. So the figure includes the time a result sits
+  unread while the supervisor is busy. A worker's wait before `__stop__` is not
+  counted, because no test follows it. The worker sends the figure on the
+  result line, so the denominator in "measured on N of M tests" is the number
+  of completed results, and N is less than M only when a test double sends a
+  result line without the figure (a test whose worker died before reporting is
+  in neither count). If no test was measured, the figure reads `unevaluated`,
+  never 0. One case counts time that is not a dispatch delay: a worker that went
+  idle because the queue was empty, and later receives a test requeued after
+  another worker crashed, counts its whole idle period as waiting for dispatch.
+
+With `AIRA_AITEST_MEASURE_DIR` set, the same figures go into
+`pool-report-<pid>.json` (`live_workers_peak`, `live_workers_mean`,
+`run_wall_s`, `supervisor_cpu_s`, `dispatch_wait_s`, `dispatches_measured`,
+`tests_completed`). Each worker span in `aitest-trace-<pid>.json` also carries
+`dispatch_wait_s` and `dispatches_measured`. Per-dispatch timestamps are not
+recorded. The per-worker totals give the trace the resolution of one worker's
+lifetime.
+
 ## Reporting (Slice 2, AIRA-31)
 
 Each worker streams its real pytest `TestReport` objects — plus
