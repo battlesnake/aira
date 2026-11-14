@@ -1974,8 +1974,10 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("vram", false, false, "GPU VRAM the job declares it needs (1024-based; e.g. 4G). The daemon gates admission on real free VRAM (a third resource dimension beside RAM and CPU); no GPU limit is written. Absent = not a GPU job (ungated). NVIDIA only"),
-			// AIRA-340. The description IS the agent guidance (ConfinePriorityGuidance),
-			// so help, the skill and the MCP instructions cannot drift apart.
+			// AIRA-340. The description is the long agent guidance
+			// (ConfinePriorityGuidance), the same text as the skill's paragraph; the
+			// verb summary and the MCP instructions carry the short form
+			// (ConfinePrioritySummary). See the comment above those constants.
 			stringSpec("priority", false, false, ConfinePriorityGuidance, "high", "normal"),
 			// AIRA-138. The two timeout-suffixed options are disambiguated HERE, in the
 			// generated help, because --timeout reads as an overall deadline and is not

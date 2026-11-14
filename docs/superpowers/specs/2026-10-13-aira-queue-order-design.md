@@ -106,7 +106,11 @@ more job is the ceiling minus the granted total.
 
 `admitOrderLocked(queue) []*admitWaiter` returns the queued waiters in this order:
 1. pushed waiters, latest push first (descending `pushSeq`);
-2. then every other waiter in enqueue order, the order `queue.waiters` already holds.
+2. then `high` waiters (`aira confine --priority high`, added by AIRA-340) in enqueue order;
+3. then every other waiter in enqueue order, the order `queue.waiters` already holds.
+
+A `high` head is an ordinary unpushed head (bypass budget and backstop pass, §3.4), not a pushed one;
+see AIRA-340 (`.aira/tickets/AIRA-340.md`, decision 3).
 
 It is derived on every call. `queue.waiters` is never reordered.
 

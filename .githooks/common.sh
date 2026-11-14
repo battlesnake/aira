@@ -43,10 +43,12 @@ aira_hook_scrub_git_env() {
 # worktree, confined, with a clean environment. It never returns.
 #
 # The second argument is the admission queue priority (AIRA-340): `high` only
-# for a SHORT step (the pre-commit quick checks: `make fmt-check vet build`
-# measured 6-10 s on the confine trailer's wall=, warm build cache; re-measure
-# with `aira confine -- make -C <worktree> fmt-check vet build`), so a
-# commit does not wait behind slow jobs on a busy box; `normal` for anything
+# for a SHORT step (the pre-commit quick checks, `make fmt-check vet build`:
+# the confine trailer's wall= measured about 9 s with a warm build cache, and
+# about 40 s on the first run in a new worktree on a loaded box, load average
+# about 65; re-measure with `aira confine -- make -C <worktree> fmt-check vet
+# build`). Both are under a minute, so `high` stays defensible: a commit does
+# not wait behind slow jobs on a busy box. `normal` for anything
 # long (`make ci`, the store tests). Version skew degrades, never refuses
 # commits: an installed CLIENT that predates `--priority` is detected from its
 # own help and the step runs at normal priority with a one-line note; a new

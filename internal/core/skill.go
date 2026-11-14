@@ -299,18 +299,23 @@ func shellQuote(token string) string {
 	return "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
 }
 
-// ConfinePriorityGuidance is the ONE text for `aira confine --priority`
-// (AIRA-340). It is the option's help description in the confine dispatch spec,
-// a paragraph of the generated skill and guide, and part of the MCP server
-// instructions, so the owner's rule (high is for short automated steps wired
-// into hooks and Makefiles; agents avoid it in direct calls) reads the same on
-// every face.
+// The owner's rule for `aira confine --priority` (AIRA-340: high is for short
+// automated steps wired into hooks and Makefiles; agents avoid it in direct
+// calls; never for a long job) is carried by TWO texts, not one.
+// ConfinePriorityGuidance, the long form, is the option's help description in the
+// confine dispatch spec and a paragraph of the generated skill and guide.
+// ConfinePrioritySummary, the short form, is appended to the confine verb's
+// one-line summary and to the MCP server instructions (cmd/aira/mcp.go). The two
+// are kept in step only by TestConfinePriorityGuidanceIsOnEveryFace's keyword list
+// (cmd/aira/confine_priority_test.go), so an edit to one must be checked against
+// the other.
 const ConfinePriorityGuidance = "Admission QUEUE ORDER only, `high` or `normal` (default `normal`); it is not CPU, I/O or memory priority and does not change what a job reserves. A `high` job waits only behind jobs pushed with `aira confine --front` and EARLIER `high` jobs (high jobs go first-in first-out among themselves), ahead of every `normal` job. It exists so SHORT automated steps (pre-commit hooks, quick pre-gate checks) do not wait behind slow jobs, so it belongs in the hook or Makefile itself, decided once for the project, never chosen per call. Agents: do NOT pass `--priority high` in a direct `aira confine` call unless it is strongly justified, which should be rare (for example a human is blocked right now on a one-off short command that no hook or Makefile could carry). Never mark a long job `high` (a full test suite, a build, `make ci`): a `high` job that does not fit becomes the head of the queue and holds the jobs behind it, letting them past only up to half its own reserve, so a long or large `high` job stalls everyone. Queued `high` jobs show as `high` in `aira top` and carry `\"priority\": \"high\"` in `aira confine --list --json`; a daemon restart keeps a job's priority (the client re-sends it), unlike a `--front` push"
 
-// ConfinePrioritySummary is the short form of ConfinePriorityGuidance carried in
+// ConfinePrioritySummary is the short form of ConfinePriorityGuidance. It is in
 // the confine verb's one-line summary, which is what `aira help confine` and
-// `aira confine --help` print (the option descriptions are not rendered there).
-const ConfinePrioritySummary = "--priority high|normal is admission queue order only: set it in a project's hooks or Makefiles for SHORT automated steps; agents avoid it in a direct `aira confine` call unless strongly justified (rare), and never use it for a long job such as a test suite, a build or `make ci`"
+// `aira confine --help` print (the option descriptions are not rendered there),
+// and it is the MCP server instructions' priority sentence.
+const ConfinePrioritySummary = "`aira confine --priority high|normal` is admission queue order only: set it in a project's hooks or Makefiles for SHORT automated steps; agents avoid `--priority high` in a direct `aira confine` call unless strongly justified (rare), and never use it for a long job such as a test suite, a build or `make ci`, because a `high` job that does not fit holds the jobs behind it"
 
 func renderSkillMarkdown(actions []SkillAction, contract ResponseContractSpec) string {
 	var out strings.Builder
