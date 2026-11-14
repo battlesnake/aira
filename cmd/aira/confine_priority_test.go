@@ -123,8 +123,8 @@ func TestConfinePriorityGuidanceIsOnEveryFace(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(help.String(), "--priority high|normal") {
-		t.Errorf("confine usage line does not name --priority high|normal:\n%s", help.String())
+	if !strings.Contains(help.String(), "[--priority high|normal]") {
+		t.Errorf("confine usage line does not name [--priority high|normal]:\n%s", help.String())
 	}
 }
 
