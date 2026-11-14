@@ -395,6 +395,18 @@ def test_bench_dispatch_old_vs_new():
         )
         if n == 65164:
             assert new_s < 0.1e-3, "acceptance: under 0.1 ms per dispatch at a 65k queue"
+            # _pool_covers_the_queue (called every loop iteration via _maybe_grow_pool) needs
+            # no index: its len(queue) > idle-workers guard returns before any sort while the
+            # queue is longer than the pool. Measured here with 64 idle workers.
+            sup.workers = {i: {"in_flight": None, "reservation": 1 << 40, "cpu": 64} for i in range(64)}
+            start = time.perf_counter()
+            for _ in range(2000):
+                assert sup._pool_covers_the_queue() is False
+            sys.stdout.write(
+                "python %s queue=%d: _pool_covers_the_queue %.4f ms/call (64 idle workers)\n"
+                % (sys.version.split()[0], len(sup.queue), (time.perf_counter() - start) / 2000 * 1e3)
+            )
+            sup.workers = {}
     # The full drain at 65k, new picker only (the old one would take ~15 minutes).
     names, need, cpu, tcost, overhead = _bench_queue(65164)
     sup = Supervisor()

@@ -11,7 +11,15 @@ import sys
 import time
 import urllib.parse
 
-from aitest.worker import _EVENT_LINE_PREFIX, _RECYCLE_SUFFIX, _exit_child, _untag_tuples, fork_worker, run_worker_loop
+from aitest.worker import (
+    _DISPATCH_WAIT_TOKEN,
+    _EVENT_LINE_PREFIX,
+    _RECYCLE_SUFFIX,
+    _exit_child,
+    _untag_tuples,
+    fork_worker,
+    run_worker_loop,
+)
 
 
 _STOP_LINE = "__stop__"
@@ -104,11 +112,75 @@ def _trace_args(record):
         "pid", "declared_rss_bytes", "peak_rss_bytes", "cgroup_peak_bytes",
         "cpu_user_s", "cpu_system_s", "io_read_bytes", "io_write_bytes",
         "scope_path", "oom",
+        # AIRA-344 (additive): this worker's measured wait for dispatch.
+        "dispatch_wait_s", "dispatches_measured",
     ):
         value = record.get(key)
         if value is not None:
             args[key] = value
     return args
+
+
+def _split_dispatch_wait(line):
+    """(line without the AIRA-344 wait token, the wait in µs or None).
+
+    Only the LAST space-separated field can be the token -- the worker puts it right
+    after the outcome -- so the token's text inside a nodeid is never mistaken for it.
+    A line without the token (a test double, an older fake) comes back unchanged with
+    None: unmeasured, never a 0 wait. A malformed value is stripped (it must not reach
+    the outcome field) and also reads None."""
+    head, sep, tail = line.rpartition(" ")
+    marker = _DISPATCH_WAIT_TOKEN.lstrip(" ")
+    if not sep or not tail.startswith(marker):
+        return line, None
+    value = tail[len(marker):]
+    return head, (int(value) if value.isdigit() else None)
+
+
+def _pool_occupancy(spans, run_start_us, run_end_us):
+    """(peak live workers, time-weighted mean live workers or None, run wall s or None)
+    over (start_us, end_us) worker spans. Ends sort before starts at the same instant, so
+    a retire-and-replace is one live worker, not two. Spans are clipped to the run window;
+    without a positive window the mean and wall are None (unevaluated)."""
+    edges = sorted([(start, 1) for start, _ in spans] + [(end, -1) for _, end in spans])
+    live = peak = 0
+    for _, delta in edges:
+        live += delta
+        peak = max(peak, live)
+    if run_start_us is None or run_end_us is None or run_end_us <= run_start_us:
+        return peak, None, None
+    busy_us = sum(max(0, min(end, run_end_us) - max(start, run_start_us)) for start, end in spans)
+    return peak, busy_us / (run_end_us - run_start_us), (run_end_us - run_start_us) / 1e6
+
+
+def format_pool_summary(spans, run_start_us, run_end_us, cpu_s, wait_us, measured, completed):
+    """The one-line pool summary (AIRA-344), PURE. spans: (start_us, end_us) per worker
+    life (ready to retired, wall-clock µs); the run window is [run_start_us, run_end_us];
+    cpu_s is the supervisor's own CPU over that window; wait_us/measured: the summed
+    worker-measured dispatch wait and how many completed tests carried one.
+
+    Honest: a figure that was not established reads "unevaluated", never 0 -- the mean
+    without a run window, the CPU when it was not read, the wait when no test was
+    measured. Peak counts a retire and a start at the same instant as a replacement
+    (ends sort before starts), not as two live workers."""
+    peak, mean, wall_s = _pool_occupancy(spans, run_start_us, run_end_us)
+    if mean is not None:
+        workers = "live workers peak %d, mean %.2f over %.1f s" % (peak, mean, wall_s)
+    else:
+        workers = "live workers peak %d, mean unevaluated" % peak
+    if cpu_s is None:
+        cpu = "supervisor CPU unevaluated"
+    elif wall_s:
+        cpu = "supervisor CPU %.1f s (%.0f%% of one core)" % (cpu_s, 100.0 * cpu_s / wall_s)
+    else:
+        cpu = "supervisor CPU %.1f s" % cpu_s
+    if measured:
+        wait = "workers idle waiting for dispatch %.1f s, %.1f ms per test (measured on %d of %d tests)" % (
+            wait_us / 1e6, wait_us / 1e3 / measured, measured, completed,
+        )
+    else:
+        wait = "workers idle waiting for dispatch unevaluated (measured on 0 of %d tests)" % completed
+    return "aitest: pool: %s; %s; %s" % (workers, cpu, wait)
 
 
 def build_worker_trace_events(records, pid, process_label):
@@ -1130,6 +1202,15 @@ class Supervisor:
         # is set. One span per worker (recycles are separate spans), interval-packed
         # into lanes at emit time.
         self._worker_trace_records = []
+        # AIRA-344: the default pool summary line's inputs. Kept on every run (they are
+        # one tuple per worker life and three counters), not only under the measure dir.
+        self._worker_spans = []  # (ready wall-µs, retired wall-µs) per worker life
+        self._tests_completed = 0  # result lines accepted
+        self._dispatches_measured = 0  # ...of which carried the worker's wait token
+        self._dispatch_wait_us = 0  # summed worker-measured wait over those
+        self._run_start_wall_us = None
+        self._run_end_wall_us = None
+        self._run_cpu_s = None
         # AIRA-64 growth probe bookkeeping.
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
@@ -2368,6 +2449,10 @@ class Supervisor:
         # child's rusage here — real even for a crashed/SIGKILLed worker — which is
         # the per-worker RSS/CPU/IO the Gantt trace records below.
         rusage = _reap_child(pid)
+        # AIRA-344: this worker's live span for the pool summary (ready -> retired).
+        ready_us = state.get("start_wall_us")
+        if ready_us is not None:
+            self._worker_spans.append((ready_us, _now_wall_us()))
         grant = state.get("grant")
         if grant is not None:
             # AIRA-180 §5s.1. The fold happens HERE, not beside
@@ -2502,6 +2587,12 @@ class Supervisor:
             "scope_path": scope,
             "cgroup_peak_bytes": _read_cgroup_int(os.path.join(scope, "memory.peak")) if scope else None,
             "oom": _scope_oom_group_killed(scope) if scope else None,
+            # AIRA-344: this worker's summed measured wait for dispatch (None when no
+            # result of its carried one -- absent from the span, never 0) and the count.
+            "dispatch_wait_s": (
+                state["dispatch_wait_us"] / 1e6 if state.get("dispatches_measured") else None
+            ),
+            "dispatches_measured": state.get("dispatches_measured", 0),
         }
         if rusage is not None:
             record["peak_rss_bytes"] = rusage.ru_maxrss * 1024  # Linux ru_maxrss is KiB
@@ -2682,6 +2773,9 @@ class Supervisor:
             "worker_budget": honest(self._pool_budget),
             "oom_group_killed": self._pool_peak_oom,
         }
+        # AIRA-344 (additive): the pool summary line's figures, unevaluated when the run
+        # window or the measurement was not established.
+        report.update(self._pool_summary_fields(honest))
         try:
             os.makedirs(measure_dir, exist_ok=True)
             with open(
@@ -2696,6 +2790,27 @@ class Supervisor:
                 "aira aitest: could not write measurement report under %s: %s\n"
                 % (measure_dir, exc)
             )
+
+    def _pool_summary_fields(self, honest):
+        peak, mean, wall_s = _pool_occupancy(self._worker_spans, self._run_start_wall_us, self._run_end_wall_us)
+        return {
+            "live_workers_peak": peak,
+            "live_workers_mean": honest(mean),
+            "run_wall_s": honest(wall_s),
+            "supervisor_cpu_s": honest(self._run_cpu_s),
+            "dispatch_wait_s": honest(self._dispatch_wait_us / 1e6 if self._dispatches_measured else None),
+            "dispatches_measured": self._dispatches_measured,
+            "tests_completed": self._tests_completed,
+        }
+
+    def pool_summary(self):
+        """The one-line pool summary (AIRA-344) printed after every run; see
+        format_pool_summary for what each figure means."""
+        return format_pool_summary(
+            self._worker_spans, self._run_start_wall_us, self._run_end_wall_us,
+            self._run_cpu_s, self._dispatch_wait_us, self._dispatches_measured,
+            self._tests_completed,
+        )
 
     def _forget_worker_scope(self, scope):
         """Remove one worker's cgroup scope directory, remembering it for a hygiene
@@ -3076,6 +3191,8 @@ class Supervisor:
             recycling = line.endswith(_RECYCLE_SUFFIX)
             if recycling:
                 line = line[: -len(_RECYCLE_SUFFIX)]
+            # AIRA-344: the worker-measured dispatch wait rides after the outcome.
+            line, waited_us = _split_dispatch_wait(line)
             # rpartition, not partition: a parametrized pytest nodeid can
             # legitimately contain a space (e.g. test_p[a b]) -- outcome
             # never does (always one of passed/failed/skipped/error), so
@@ -3119,6 +3236,14 @@ class Supervisor:
             # spawn; run() checks the flag after this drain and aborts the pool.
             self._record_result(nodeid, outcome)
             state["in_flight"] = None
+            # AIRA-344: counted only once the result is accepted (after the batch check),
+            # so a result taking the crash path above never counts as completed.
+            self._tests_completed += 1
+            if waited_us is not None:
+                self._dispatches_measured += 1
+                self._dispatch_wait_us += waited_us
+                state["dispatch_wait_us"] = state.get("dispatch_wait_us", 0) + waited_us
+                state["dispatches_measured"] = state.get("dispatches_measured", 0) + 1
             if recycling:
                 self._retire_worker(pid, state)
                 self._replace_worker()
@@ -3552,6 +3677,10 @@ class Supervisor:
         and every worker has retired. Recycle (Task 14), crash/retry (Task 15),
         the daemon-down fallback (Task 16), and the S15/S16 probe-sized pool
         growth extend this method in place."""
+        # AIRA-344: the pool summary's run window and the supervisor's own CPU over it
+        # (collection ran before this call and is not included).
+        self._run_start_wall_us = _now_wall_us()
+        cpu_start = time.process_time()
         self.bootstrap()
         import gc
         gc.freeze()
@@ -3669,6 +3798,8 @@ class Supervisor:
                     except BrokenPipeError:
                         pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
+        self._run_end_wall_us = _now_wall_us()
+        self._run_cpu_s = time.process_time() - cpu_start
         # AIRA-180. After the dispatch loop, so every worker has retired and
         # folded its usage in. Fail-open: see _report_pool_usage.
         self._report_pool_usage()

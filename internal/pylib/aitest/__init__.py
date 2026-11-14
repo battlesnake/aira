@@ -320,6 +320,10 @@ def pytest_runtestloop(session):
         else:
             unevaluated += 1
     print("aitest: %d passed, %d failed, %d skipped, %d error, %d unevaluated" % (passed, failed, skipped, error, unevaluated))
+    # AIRA-344: one line on every run (not only under AIRA_AITEST_MEASURE_DIR): its
+    # inputs cost a token per result line and a tuple per worker, and it is the
+    # reading that tells dispatch starvation from tests waiting off-CPU.
+    print(supervisor.pool_summary())
     session.testsfailed = collection_errors + failed + error + unevaluated
     # AIRA-161: hand the SAME count to pytest_terminal_summary below, so the
     # distinction survives to the bottom of the log, where a consumer actually
