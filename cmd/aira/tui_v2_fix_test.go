@@ -32,7 +32,7 @@ func TestDispatchPaletteRejectsClientRoutedRequestWithoutLocalExecution(t *testi
 		if attempt.Send != paletteSendNotSent || attempt.Err == nil || !strings.Contains(attempt.Err.Error(), "E_SELECTOR_INVALID") {
 			t.Fatalf("client route %q dispatch=%#v, want E_SELECTOR_INVALID not-sent rejection before any I/O", verb.Verb, attempt)
 		}
-		if classifyPaletteDispatch(core.Request{}, attempt).Outcome != paletteRejected {
+		if classifyPaletteDispatch(attempt).Outcome != paletteRejected {
 			t.Fatalf("client route %q not classified rejected", verb.Verb)
 		}
 	}

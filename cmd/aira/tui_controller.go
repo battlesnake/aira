@@ -105,10 +105,12 @@ type tableRow struct {
 	// queued row can never become the target of an action written for running
 	// jobs by forgetting a guard.
 	Queued bool
-	// Job is the `aira top` job the row shows (AIRA-342), as of the tick that
-	// built it: what a row action's size form and confirmation say about it.
-	// Display only; nil on every other view's rows.
-	Job *topJob
+	// ConfirmText describes the row's job for a confirmation page, in words an
+	// operator needs before acting on it: for a queued row (AIRA-309) its name,
+	// owner, requested reserve and listed position; for a live `aira top` row
+	// (AIRA-312) its name, owner, current reserve and live usage. Display only;
+	// empty on every other view's rows.
+	ConfirmText string
 }
 
 type gaugeTile struct {
@@ -207,15 +209,8 @@ type tuiState struct {
 // paletteConfirm is the immutable, resolved request snapshot displayed by the
 // confirmation page. TypedID is the sole mutable confirmation buffer.
 type paletteConfirm struct {
-	Request core.Request
-	// Summary is what the confirmation says the request will do.
-	Summary string
-	// Title names the dialog; empty = the palette's generic "Confirm mutation".
-	Title string
-	// ArgsInDetails moves the request's exact arguments behind the dialog's `d`
-	// toggle, for a confirmation (an `aira top` row action, AIRA-342) whose
-	// Summary already says in words everything the arguments carry.
-	ArgsInDetails        bool
+	Request              core.Request
+	Summary              string
 	Safety               core.SafetyClass
 	Destructive          bool
 	ConfirmIDTarget      string

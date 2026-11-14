@@ -382,7 +382,7 @@ func TestTUIPaletteResultDoesNotPopAfterFlowWasClosed(t *testing.T) {
 	runtime.state.PaletteOpen = false
 	runtime.state.PaletteDispatching = true
 	runtime.state.PaletteDispatchedVerb = "spend.add"
-	runtime.applyAsync(tuiMessage{Kind: msgPaletteResult, PaletteResult: paletteResult{Outcome: paletteApplied, Text: "APPLIED"}})
+	runtime.applyAsync(tuiMessage{Kind: msgPaletteResult, PaletteOutcome: paletteApplied, PaletteResult: "APPLIED"})
 	if page, _ := runtime.outerPages.GetFrontPage(); page != dashboardPage {
 		t.Fatalf("late palette result popped page %q over dashboard", page)
 	}

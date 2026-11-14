@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -38,7 +39,9 @@ type tuiMessage struct {
 	Events         []store.WatchEvent
 	Cursor         int64
 	Code           string
-	PaletteResult  paletteResult
+	PaletteResult  string
+	PaletteDetails string
+	PaletteOutcome paletteOutcome
 	View           tuiView
 	Detail         detailResult
 	DetachedResult executeDetachedResult
@@ -67,9 +70,8 @@ type paletteDispatchAttempt struct {
 	Evidenceless bool
 }
 
-// paletteResult is what a palette or row action did, worded by the one result
-// formatter (tui_result.go): Text is the plain-English verdict shown by default,
-// Details the raw payload shown only behind the result dialog's `d` toggle.
+// paletteResult is what a palette or row action did: Text is shown, Details
+// (the raw reply, AIRA-342) only behind the result dialog's `d`.
 type paletteResult struct {
 	Outcome paletteOutcome
 	Text    string
@@ -310,7 +312,7 @@ func (e *tuiExecutor) worker() {
 			}
 			if job.Palette != nil {
 				result := executePaletteRequest(e.ctx, e.dispatcher, e.scope, *job.Palette)
-				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: result})
+				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: result.Text, PaletteDetails: result.Details, PaletteOutcome: result.Outcome})
 				continue
 			}
 			if job.Search != "" {
@@ -409,49 +411,49 @@ func waitTUIReconnect(ctx context.Context, reconnect <-chan struct{}) bool {
 
 func executePaletteRequest(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, request core.Request) paletteResult {
 	if outcomeDispatcher, ok := dispatcher.(paletteOutcomeDispatcher); ok {
-		return classifyPaletteDispatch(request, outcomeDispatcher.DispatchPalette(ctx, scope, request))
+		return classifyPaletteDispatch(outcomeDispatcher.DispatchPalette(ctx, scope, request))
 	}
 	// No send-evidence: never label a non-success as rejected (Sol P0).
-	return classifyPaletteDispatch(request, paletteDispatchAttempt{
+	return classifyPaletteDispatch(paletteDispatchAttempt{
 		Response: dispatcher.Dispatch(ctx, scope, request), Send: paletteSendMayHaveBeenSent, Evidenceless: true,
 	})
 }
 
-// classifyPaletteDispatch decides the outcome (the honesty rules below are the
-// load-bearing part) and hands the words to the one result formatter.
-func classifyPaletteDispatch(request core.Request, attempt paletteDispatchAttempt) paletteResult {
+func classifyPaletteDispatch(attempt paletteDispatchAttempt) paletteResult {
 	if attempt.Err != nil {
 		if attempt.Send == paletteSendNotSent {
-			return rejectedResult("nothing was sent", "", attempt.Err.Error())
+			return paletteResult{Outcome: paletteRejected, Text: fmt.Sprintf("REJECTED (not sent)\n%s", attempt.Err)}
 		}
-		return unknownResult(attempt.Err.Error())
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: fmt.Sprintf("UNEVALUATED — outcome unknown\n%s", attempt.Err)}
 	}
 	if attempt.Malformed {
-		return unknownResult("malformed daemon response")
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response"}
 	}
 	response := attempt.Response
+	data, ok := paletteResponseData(response)
 	if !response.OK {
 		// Only a send-evidenced daemon error Code is a provable rejection. Without
 		// send-evidence, a flattened error may be a committed-then-lost write, so it
 		// is outcome-unknown, never rejected (Sol P0).
 		if !attempt.Evidenceless && response.Code != "" && response.Code != "OK" {
-			return rejectedResult("", response.Code, response.Error)
+			return rejectedResult(response, data)
 		}
-		return unknownResult("missing terminal daemon response")
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmissing terminal daemon response"}
 	}
-	if response.Code != "OK" {
-		return unknownResult("malformed daemon response")
+	// A success carries OK, or a verdict in its place (core.Do: PASS, FAIL or
+	// UNEVALUATED, AIRA-342); any other code is a malformed reply.
+	if _, verdict := verdictMeaning[response.Code]; response.Code != "OK" && !verdict {
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response"}
 	}
-	data, ok := paletteSuccessData(response)
 	if !ok {
-		return unknownResult("malformed daemon response data")
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response data"}
 	}
-	return appliedResult(request, data)
+	return appliedResult(response, data)
 }
 
-// paletteSuccessData is a success response's payload as JSON, or false when it is
-// not valid JSON (then the outcome is unknown, never a guessed success).
-func paletteSuccessData(response core.Response) (json.RawMessage, bool) {
+// paletteResponseData is a response's payload as JSON (nil when it has none),
+// or false when it is not valid JSON: then the outcome is unknown, never guessed.
+func paletteResponseData(response core.Response) (json.RawMessage, bool) {
 	data := response.RawData
 	if len(data) == 0 && response.Data != nil {
 		var err error
@@ -460,10 +462,7 @@ func paletteSuccessData(response core.Response) (json.RawMessage, bool) {
 			return nil, false
 		}
 	}
-	if len(data) == 0 {
-		return nil, true
-	}
-	if !json.Valid(data) {
+	if len(data) > 0 && !json.Valid(data) {
 		return nil, false
 	}
 	return data, true

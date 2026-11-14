@@ -69,8 +69,8 @@ func topResizeOpen(t *testing.T, state tuiState) tuiState {
 func TestTopResizeKeyOnARunningRowConfirmsThenDispatchesTheExactRequest(t *testing.T) {
 	descriptors := core.New(nil).DispatchDescriptors()
 	state := topResizeOpen(t, topResizeState(t, "session-a"))
-	if context := inlineMiniFormContext(state.InlineAction); !strings.Contains(context, "alpha") || !strings.Contains(context, "Reserve: 8G now") {
-		t.Fatalf("size form context %q does not name the job and its reserve", context)
+	if body := inlineMiniFormBody(state.InlineAction); !strings.Contains(body, "alpha") || !strings.Contains(body, "current reserve 8192M") {
+		t.Fatalf("size form %q does not name the job and its reserve", body)
 	}
 	state, commands := onInlineMiniFormSubmit(state, map[string]string{"memory_reserve": " 2G "}, descriptors)
 	if len(commands) != 0 || state.InlineError != "" {
@@ -112,7 +112,7 @@ func TestTopResizeConfirmationStatesTheJobAndTheCaveats(t *testing.T) {
 	}
 	summary := state.PaletteConfirm.Summary
 	for _, want := range []string{
-		"alpha", "owner session-a", "Reserve: 8G now", "live use 1G", "8G → 2G, frees 6G",
+		"alpha", "owner session-a", "current reserve 8192M", "live usage 1024M", "to 2G (2147483648 bytes)",
 		"memory.max cap is unchanged", "OOM-steering budget drops", "any re-declare", "restores the original reserve",
 		"below the job's live memory use", "It is your job (session-a)",
 	} {
@@ -212,7 +212,7 @@ func TestTopResizeDescriptionIsCapturedAtTheKeypress(t *testing.T) {
 	panel.Model = panelModel{}
 	state.Panels[viewTop] = panel
 	state, _ = onInlineMiniFormSubmit(state, map[string]string{"memory_reserve": "2G"}, core.New(nil).DispatchDescriptors())
-	if state.PaletteConfirm == nil || !strings.Contains(state.PaletteConfirm.Summary, "Reserve: 8G now") || state.PaletteConfirm.Request.Args["selector"] != topResizeJobID {
+	if state.PaletteConfirm == nil || !strings.Contains(state.PaletteConfirm.Summary, "current reserve 8192M") || state.PaletteConfirm.Request.Args["selector"] != topResizeJobID {
 		t.Fatalf("confirm=%+v, want the keypress-time description and the original scope id", state.PaletteConfirm)
 	}
 }
