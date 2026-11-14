@@ -134,7 +134,9 @@ def _split_dispatch_wait(line):
     if not sep or not tail.startswith(marker):
         return line, None
     value = tail[len(marker):]
-    return head, (int(value) if value.isdigit() else None)
+    # isascii() too: str.isdigit() accepts digits int() refuses (e.g. "²"), and a
+    # ValueError here would escape _drain_worker and end the whole run.
+    return head, (int(value) if value.isascii() and value.isdigit() else None)
 
 
 def _pool_occupancy(spans, run_start_us, run_end_us):

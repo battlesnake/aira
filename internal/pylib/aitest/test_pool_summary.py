@@ -45,6 +45,8 @@ def test_split_strips_a_malformed_token_but_measures_nothing():
     # A malformed value must not leak into the outcome field, and must not count as 0.
     assert _split_dispatch_wait("pkg/t.py::a passed" + _DISPATCH_WAIT_TOKEN + "x1") == ("pkg/t.py::a passed", None)
     assert _split_dispatch_wait("pkg/t.py::a passed" + _DISPATCH_WAIT_TOKEN + "-5") == ("pkg/t.py::a passed", None)
+    # A non-ASCII digit passes str.isdigit() but not int(): it must read None, not raise.
+    assert _split_dispatch_wait("pkg/t.py::a passed" + _DISPATCH_WAIT_TOKEN + "²") == ("pkg/t.py::a passed", None)
 
 
 def test_worker_sends_the_wait_before_the_recycle_suffix(pytester, monkeypatch):
