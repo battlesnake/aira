@@ -1,0 +1,296 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"aira/internal/core"
+	"aira/internal/runner"
+)
+
+// AIRA-342. The ONE formatter of what a palette or row action did. Every result
+// the TUI shows (applied, rejected, outcome unknown, or refused before sending)
+// becomes paletteResult.Text: plain sentences that say what happened to which
+// job, and for a refusal the stable code, the message with its byte counts shown
+// as sizes, and what to do about it. The raw payload is kept in Details, shown
+// only behind the dialog's `d` toggle.
+//
+// The outcome labels stay the classifier's mutually exclusive APPLIED /
+// REJECTED / UNEVALUATED words: they are what the honesty tests pin, and they
+// lead every result, so the sentence after them can never be read as a
+// different verdict.
+
+// paletteRemedies is what to do about a refusal, for the codes an `aira top`
+// row action (or the input that feeds one) can produce. A code with no entry
+// gets no remedy line rather than a generic guess.
+var paletteRemedies = map[string]string{
+	runner.CodeConfineOwnerUnverified:        "it is another session's job (or this session's identity is not attested), so the change has to override the owner check: aira top does that when you confirm a job that is not yours; from the CLI add --steal.",
+	runner.CodeConfineNotFound:               "the job has finished, or left the queue, since the screen was drawn: refresh (r) and pick it again.",
+	runner.CodeConfineNotQueued:              "the job is no longer waiting (it has been admitted, or it is a sub-reservation that follows its parent), so there is nothing to push.",
+	runner.CodeConfineNotRunning:             "the job is still waiting for admission and holds no reserve to lower yet: push it to the front (f) or wait until it runs.",
+	runner.CodeConfineResizeNotReduction:     "a resize only ever lowers a reserve: enter a size smaller than the job's current reserve.",
+	runner.CodeConfineResizeBelowUsage:       "the job already uses more than that: enter a size at or above its live memory use.",
+	runner.CodeConfineResizeUsageUnevaluated: "the daemon could not read the job's live memory use, so it refused rather than guess: try again in a moment.",
+	"E_CONFINE_ARGUMENT_INVALID":             "sizes look like 512M, 2G or 1.5G (the unit is required) and must be at least 1M.",
+	"E_TUI_INLINE_ROW_KIND":                  "f works on jobs still waiting in the queue, e on running jobs: pick a row of the right kind.",
+}
+
+// appliedResult words a request the daemon applied; data is its reply payload.
+func appliedResult(request core.Request, data json.RawMessage) paletteResult {
+	return paletteResult{Outcome: paletteApplied, Text: "APPLIED — " + appliedSentence(request, data), Details: prettyPayload(data)}
+}
+
+// rejectedResult words a provable refusal: effect says what that means ("nothing
+// was changed" for a daemon refusal, "nothing was sent" for a request that never
+// left this process).
+func rejectedResult(effect, code, message string) paletteResult {
+	return paletteResult{Outcome: paletteRejected, Text: refusalText("REJECTED", effect, code, message), Details: rawRefusal(code, message)}
+}
+
+// unknownResult words an outcome this face cannot establish. It never guesses:
+// the request may or may not have taken effect, and it says so.
+func unknownResult(reason string) paletteResult {
+	return paletteResult{
+		Outcome: paletteOutcomeUnknown,
+		Text:    "UNEVALUATED — outcome unknown: " + reason + ".\nThe request may or may not have taken effect; refresh (r) to check.",
+		Details: reason,
+	}
+}
+
+// clientRefusalResult words a refusal the TUI made itself, before sending
+// anything (an invalid size, an action on the wrong kind of row): text is the
+// usual "CODE: message" error string.
+func clientRefusalResult(text string) paletteResult {
+	code, message := splitCodedError(text)
+	return paletteResult{Outcome: paletteRejected, Text: refusalText("NOT SENT", "nothing was sent", code, message), Details: rawRefusal(code, message)}
+}
+
+// pendingResult is the placeholder shown while a request is in flight.
+func pendingResult() paletteResult {
+	return paletteResult{Text: "Sending the request…"}
+}
+
+func refusalText(label, effect, code, message string) string {
+	var out strings.Builder
+	out.WriteString(label)
+	if code != "" {
+		fmt.Fprintf(&out, " (%s)", code)
+	}
+	out.WriteString(": " + effect + ".")
+	if message = humanizeDaemonMessage(code, message); message != "" {
+		out.WriteString("\n" + message)
+	}
+	if remedy := paletteRemedies[code]; remedy != "" {
+		out.WriteString("\nWhat to do: " + remedy)
+	}
+	return out.String()
+}
+
+func rawRefusal(code, message string) string {
+	if code == "" {
+		return message
+	}
+	return "code: " + code + "\nmessage: " + message
+}
+
+// splitCodedError splits "E_CODE: message" into its code and message. Text with
+// no leading code is all message.
+func splitCodedError(text string) (string, string) {
+	text = strings.TrimSpace(text)
+	head, rest, found := strings.Cut(text, ":")
+	if found && codedErrorPattern.MatchString(head) {
+		return head, strings.TrimSpace(rest)
+	}
+	return "", text
+}
+
+var (
+	codedErrorPattern = regexp.MustCompile(`^[EU]_[A-Z0-9_]+$`)
+	scopeIDPattern    = regexp.MustCompile(`CONFINE-[^\s;,()]+`)
+	// byteCountPattern finds the byte counts the confine refusals print: "N
+	// bytes", "(asked for N)" and "reserve (N)".
+	byteCountPattern = regexp.MustCompile(`(\d+) bytes|\(asked for (\d+)\)|reserve \((\d+)\)`)
+)
+
+// humanizeDaemonMessage makes a refusal's message readable without changing what
+// it says: the duplicated leading code goes, a confine scope id becomes its job
+// name, and a byte count becomes a size. The untouched text stays in Details.
+func humanizeDaemonMessage(code, message string) string {
+	message = strings.TrimSpace(message)
+	if code != "" {
+		message = strings.TrimSpace(strings.TrimPrefix(message, code+":"))
+	}
+	message = scopeIDPattern.ReplaceAllStringFunc(message, func(scopeID string) string {
+		if name, _, _, _, ok := runner.ParseConfineScopeID(scopeID); ok && name != "" {
+			return name
+		}
+		return scopeID
+	})
+	return byteCountPattern.ReplaceAllStringFunc(message, func(match string) string {
+		groups := byteCountPattern.FindStringSubmatch(match)
+		for index, digits := range groups[1:] {
+			if digits == "" {
+				continue
+			}
+			value, err := strconv.ParseInt(digits, 10, 64)
+			if err != nil {
+				return match
+			}
+			size := humanSize(value)
+			switch index {
+			case 0:
+				return size
+			case 1:
+				return "(asked for " + size + ")"
+			default:
+				return "reserve (" + size + ")"
+			}
+		}
+		return match
+	})
+}
+
+// humanSize shows a byte count the way an operator types one: 512M, 2G, 1.5G.
+func humanSize(value int64) string {
+	const (
+		mib = int64(1) << 20
+		gib = int64(1) << 30
+	)
+	switch {
+	case value >= gib:
+		whole := float64(value) / float64(gib)
+		text := strconv.FormatFloat(whole, 'f', 1, 64)
+		return strings.TrimSuffix(text, ".0") + "G"
+	case value >= mib:
+		return runner.FormatConfineMegabytes(value)
+	case value >= 1<<10:
+		return strconv.FormatInt(value>>10, 10) + "K"
+	default:
+		return strconv.FormatInt(value, 10) + "B"
+	}
+}
+
+// appliedSentence says what an applied request did. The two `aira top` row
+// actions say it in their own words; every other verb names itself and its
+// target and lists what the daemon returned as a plain outline.
+func appliedSentence(request core.Request, data json.RawMessage) string {
+	switch request.Verb {
+	case "confine-resize":
+		var result runner.ConfineResizeResult
+		if json.Unmarshal(data, &result) == nil && result.Name != "" {
+			freed := result.OldReserveBytes - result.NewReserveBytes
+			text := fmt.Sprintf("the reserve of %s (owner %s) is now %s, down from %s", result.Name, result.Owner, humanSize(result.NewReserveBytes), humanSize(result.OldReserveBytes))
+			if freed > 0 {
+				text += "; " + humanSize(freed) + " went back to the pool for queued jobs"
+			}
+			return text + ".\nIts memory cap is unchanged, and a daemon restart restores the original reserve."
+		}
+	case "confine-front":
+		var result runner.ConfineFrontResult
+		if json.Unmarshal(data, &result) == nil && result.Name != "" {
+			return fmt.Sprintf("%s (owner %s) is now first in the admission queue: it is admitted as soon as it fits, and every job behind it waits until then.", result.Name, result.Owner)
+		}
+	}
+	verb := request.Verb
+	if operation, ok := request.Args["subverb"].(string); ok && operation != "" {
+		verb += " " + operation
+	}
+	text := verb + " succeeded"
+	if selector, ok := request.Args["selector"].(string); ok && selector != "" {
+		text = verb + " " + selector + " succeeded"
+	}
+	if outline := plainOutline(data); outline != "" {
+		return text + ":\n" + outline
+	}
+	return text + "."
+}
+
+// plainOutline renders a JSON payload as indented "key: value" lines, with no
+// braces, quotes or commas: what a palette read returned, readable as text.
+func plainOutline(data json.RawMessage) string {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return ""
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil {
+		return ""
+	}
+	var out strings.Builder
+	writeOutline(&out, value, "")
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func writeOutline(out *strings.Builder, value any, indent string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			writeOutlineEntry(out, indent, key+":", typed[key])
+		}
+	case []any:
+		if len(typed) == 0 {
+			out.WriteString(indent + "(none)\n")
+		}
+		for _, item := range typed {
+			writeOutlineEntry(out, indent, "-", item)
+		}
+	default:
+		out.WriteString(indent + outlineScalar(typed) + "\n")
+	}
+}
+
+func writeOutlineEntry(out *strings.Builder, indent, label string, value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if len(typed) == 0 {
+			out.WriteString(indent + label + " (none)\n")
+			return
+		}
+		out.WriteString(indent + label + "\n")
+		writeOutline(out, typed, indent+"  ")
+	case []any:
+		if len(typed) == 0 {
+			out.WriteString(indent + label + " (none)\n")
+			return
+		}
+		out.WriteString(indent + label + "\n")
+		writeOutline(out, typed, indent+"  ")
+	default:
+		out.WriteString(indent + label + " " + outlineScalar(typed) + "\n")
+	}
+}
+
+func outlineScalar(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "(not set)"
+	case string:
+		return typed
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+// prettyPayload is the raw payload for Details: indented JSON, which is what an
+// operator who asked for the raw reply wants to see.
+func prettyPayload(data json.RawMessage) string {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return ""
+	}
+	var out bytes.Buffer
+	if json.Indent(&out, data, "", "  ") != nil {
+		return string(data)
+	}
+	return out.String()
+}

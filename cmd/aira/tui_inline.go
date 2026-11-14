@@ -56,11 +56,11 @@ type inlineActionState struct {
 	FormArgs     []string
 	Values       map[string]string
 	Stage        inlineStage
-	// Summary is the target row's ConfirmText captured AT THE KEYPRESS
-	// (AIRA-312): `aira top` refreshes the table every tick, so the job's
-	// reserve and live usage shown on the confirmation page are the figures the
+	// Job is the target row's job captured AT THE KEYPRESS (AIRA-312/342):
+	// `aira top` refreshes the table every tick, so the job's reserve and live
+	// usage shown on the size form and the confirmation are the figures the
 	// operator acted on, not a later tick's. Display only.
-	Summary string
+	Job *topJob
 }
 
 // inlineActionFor is the closed, panel-scoped row-action table. It describes
@@ -126,6 +126,9 @@ func inlineActionFor(view tuiView, key rune) (inlineAction, bool) {
 // an inferred "@cwd-…" or unknown caller) sends steal=true, and the page says so
 // in plain words. That page is the explicit steal acknowledgement a human gives
 // in `top`; the CLI and MCP still need --steal for another session's job.
+//
+// AIRA-342: the page is worded for a person (the job, what it asked for, what a
+// push does, whose check it overrides); the exact request is behind `d`.
 func topFrontConfirm(state tuiState, row tableRow) (tuiState, []tuiCmd) {
 	caller := topConfineCaller(state)
 	own, clause := topOwnerCheckClause(caller, row.ID, "push")
@@ -133,14 +136,33 @@ func topFrontConfirm(state tuiState, row tableRow) (tuiState, []tuiCmd) {
 		"selector": row.ID, "steal": !own,
 		"slice": runner.ResolveConfineSlice(""), "owner": caller,
 	}}
-	summary := row.ConfirmText
-	if summary == "" {
-		summary = "push " + row.ID + " to the front of the admission queue"
+	var summary strings.Builder
+	if job := row.Job; job != nil {
+		fmt.Fprintf(&summary, "Job: %s, owner %s\n", job.Name, topJobOwner(job))
+		fmt.Fprintf(&summary, "Requested: %s · listed queue position %d\n\n", topJobSize(job.Reserve), job.Position)
+		fits := "it fits"
+		if job.Reserve != nil {
+			fits = humanSize(*job.Reserve) + " fits"
+		}
+		fmt.Fprintf(&summary, "Pushing it moves it to the front of the admission queue: it is admitted as soon as %s, and it holds every job behind it until then.\n", fits)
+	} else {
+		summary.WriteString("Job: " + row.ID + "\n\nPushing it moves it to the front of the admission queue, and it holds every job behind it until it fits.\n")
 	}
-	summary += ". It then holds every job behind it until it fits. " + clause
+	summary.WriteString(clause)
 	state.PaletteOpen = true
-	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: "confine-front"}
+	state.PaletteConfirm = &paletteConfirm{
+		Request: request, Summary: summary.String(), Safety: core.SafetyExecute, Verb: "confine-front",
+		Title: "Push to the front of the queue?", ArgsInDetails: true,
+	}
 	return state, nil
+}
+
+// topJobOwner is a job's owner for a dialog, never an empty string.
+func topJobOwner(job *topJob) string {
+	if job.Owner == "" {
+		return runner.ConfineUnknownOwner
+	}
+	return job.Owner
 }
 
 // topConfineCaller is the identity a confine write from `aira top` is sent as:
@@ -190,20 +212,22 @@ const topResizeMemoryArg = "memory_reserve"
 // The size is validated here by the parser the CLI and the daemon apply
 // (runner.ParseConfineResizeReserve), so a typo is refused before any page
 // claims a request; the daemon still decides "smaller than now" and "not below
-// live usage" at the moment of the resize. The page names the job, its owner,
-// current reserve and live usage as of the keypress, the proposed size, what a
+// live usage" at the moment of the resize (the form only warns about those, from
+// the keypress-time figures, because a stale figure must not refuse a request
+// the daemon would accept). The page names the job, its owner, current reserve
+// and live usage as of the keypress, the proposed size and its effect, what a
 // resize does NOT do, and the --steal acknowledgement, exactly as
 // topFrontConfirm states it.
 func topResizeConfirm(state tuiState, raw string) (tuiState, []tuiCmd) {
 	pending := state.InlineAction
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: lower reserve requires the new reserve, e.g. 2G"
+		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: enter the new reserve, e.g. 2G"
 		return state, nil
 	}
 	size, err := runner.ParseConfineResizeReserve(raw)
 	if err != nil {
-		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: new reserve " + strconv.Quote(raw) + ": " + err.Error()
+		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: " + topResizeParseError(raw, err)
 		return state, nil
 	}
 	caller := topConfineCaller(state)
@@ -212,37 +236,108 @@ func topResizeConfirm(state tuiState, raw string) (tuiState, []tuiCmd) {
 		"selector": pending.TargetID, topResizeMemoryArg: raw, "steal": !own,
 		"slice": runner.ResolveConfineSlice(""), "owner": caller,
 	}}
-	job := pending.Summary
-	if job == "" {
-		job = pending.TargetID
+	var summary strings.Builder
+	job := pending.Job
+	if job != nil {
+		fmt.Fprintf(&summary, "Job: %s, owner %s\n", job.Name, topJobOwner(job))
+		fmt.Fprintf(&summary, "Reserve: %s now, live use %s\n", topJobSize(job.Reserve), topJobSize(job.Usage))
+	} else {
+		summary.WriteString("Job: " + pending.TargetID + "\n")
 	}
-	summary := fmt.Sprintf("lower the admission reserve of %s to %s (%d bytes). ", job, raw, size) +
-		"This edits the admission ledger only: the job's memory.max cap is unchanged; its OOM-steering budget drops to the new reserve, so an overrun past it makes the job the preferred OOM victim under pressure; and any re-declare (a daemon reconnect or restart) restores the original reserve. " +
-		"The daemon refuses a size that is not smaller than the current reserve or is below the job's live memory use at that moment. " + clause
+	_, effect := topResizePreview(job, raw)
+	summary.WriteString("Change: " + effect + "\n\n")
+	fmt.Fprintf(&summary, "Only the admission ledger changes. The job's memory.max cap is unchanged; its OOM-steering budget drops to %s, so going past that makes it the preferred OOM victim under pressure; and any re-declare (a daemon reconnect or restart) restores the original reserve. ", humanSize(size))
+	summary.WriteString("The daemon refuses a size that is not smaller than the current reserve, or is below the job's live memory use at that moment.\n")
+	summary.WriteString(clause)
 	pending.Stage = inlineStageConfirm
 	state.InlineError = ""
 	state.PaletteOpen = true
-	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: "confine-resize"}
+	state.PaletteConfirm = &paletteConfirm{
+		Request: request, Summary: summary.String(), Safety: core.SafetyExecute, Verb: "confine-resize",
+		Title: "Lower this job's reserve?", ArgsInDetails: true,
+	}
 	return state, nil
 }
 
-// inlineMiniFormTitle and inlineMiniFormLabel word the inline mini-form for
-// the action that opened it: `find set waived`'s reason/actor, or `aira top`'s
-// `e` new-reserve field (AIRA-312).
+// topResizeParseError words a size the shared parser refused. A bare number is
+// bytes to that parser, so "2" is refused for being under 1M; say that a unit is
+// what is missing rather than quoting the minimum.
+func topResizeParseError(raw string, err error) string {
+	if strings.Trim(raw, "0123456789") == "" {
+		return strconv.Quote(raw) + " is a number of bytes: add a unit, e.g. " + raw + "G or " + raw + "M"
+	}
+	return "new reserve " + strconv.Quote(raw) + ": " + err.Error()
+}
+
+// dialogTone is how a form's status line reads: a neutral prompt, a value that
+// is fine, one the daemon is expected to refuse, or one that cannot be sent.
+type dialogTone uint8
+
+const (
+	toneInfo dialogTone = iota
+	toneOK
+	toneWarn
+	toneError
+)
+
+// topResizePreview is the `e` size form's live status line and the
+// confirmation's "Change:" line (AIRA-342): what the typed size would do to the
+// job's reserve as of the keypress. A value the parser refuses is an error (it
+// cannot be sent); a value the daemon is expected to refuse is only a warning,
+// because the daemon decides against its own figures at the moment of the resize.
+func topResizePreview(job *topJob, raw string) (dialogTone, string) {
+	var current, usage *int64
+	if job != nil {
+		current, usage = job.Reserve, job.Usage
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if current != nil {
+			return toneInfo, "enter a size smaller than " + humanSize(*current) + ", with a unit: 512M, 2G, 1.5G"
+		}
+		return toneInfo, "enter the new reserve, with a unit: 512M, 2G, 1.5G"
+	}
+	size, err := runner.ParseConfineResizeReserve(raw)
+	if err != nil {
+		return toneError, topResizeParseError(raw, err)
+	}
+	switch {
+	case current == nil:
+		return toneOK, "new reserve " + humanSize(size) + " (the current reserve is unevaluated; the daemon checks it)"
+	case size >= *current:
+		return toneWarn, humanSize(*current) + " → " + humanSize(size) + " is not smaller: the daemon will refuse it (a resize only lowers a reserve)"
+	case usage != nil && size < *usage:
+		return toneWarn, humanSize(size) + " is below the job's live use of " + humanSize(*usage) + ": the daemon will refuse it"
+	default:
+		return toneOK, humanSize(*current) + " → " + humanSize(size) + ", frees " + humanSize(*current-size) + " for queued jobs"
+	}
+}
+
+// inlineMiniFormTitle, inlineMiniFormContext and inlineMiniFormLabel word the
+// inline mini-form for the action that opened it: `find set waived`'s
+// reason/actor, or `aira top`'s `e` new-reserve field (AIRA-312/342).
 func inlineMiniFormTitle(pending *inlineActionState) string {
 	if pending.Action.Verb == "confine-resize" {
-		job := pending.Summary
-		if job == "" {
-			job = pending.TargetID
-		}
-		return " lower reserve: " + job + " "
+		return "Lower reserve"
 	}
-	return " waive " + pending.TargetID + " "
+	return "Waive " + pending.TargetID
+}
+
+func inlineMiniFormContext(pending *inlineActionState) string {
+	if pending.Action.Verb != "confine-resize" {
+		return "A waived finding needs a reason and who waived it."
+	}
+	job := pending.Job
+	if job == nil {
+		return "Job: " + pending.TargetID
+	}
+	return fmt.Sprintf("Job: %s, owner %s\nReserve: %s now, live use %s\nA lower reserve hands the difference back to jobs waiting in the queue.",
+		job.Name, topJobOwner(job), topJobSize(job.Reserve), topJobSize(job.Usage))
 }
 
 func inlineMiniFormLabel(pending *inlineActionState, name string) string {
 	if pending.Action.Verb == "confine-resize" && name == topResizeMemoryArg {
-		return "new reserve, e.g. 2G *: "
+		return "New reserve: "
 	}
 	return name + " *: "
 }
@@ -290,7 +385,7 @@ func onInlineActionStart(state tuiState, action inlineAction, descriptors []core
 		// description is captured now, at the keypress.
 		state.InlineError = ""
 		state.PaletteOpen = true
-		pending.Summary = row.ConfirmText
+		pending.Job = row.Job
 		pending.Stage = inlineStageMiniForm
 		pending.FormArgs = []string{topResizeMemoryArg}
 		state.InlineAction = pending

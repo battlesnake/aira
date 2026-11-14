@@ -77,7 +77,7 @@ func TestTopFrontConfirmationStatesTheSteal(t *testing.T) {
 		t.Fatal("no confirmation")
 	}
 	summary := state.PaletteConfirm.Summary
-	for _, want := range []string{"zulu", "owner session-q", "4096M req", "listed queue position 1", "aira top has no owner identity", "--steal", "session-q's job", "holds every job behind it"} {
+	for _, want := range []string{"zulu", "owner session-q", "Requested: 4G", "listed queue position 1", "aira top has no owner identity", "--steal", "session-q's job", "holds every job behind it"} {
 		if !strings.Contains(summary, want) {
 			t.Fatalf("confirmation %q does not say %q", summary, want)
 		}

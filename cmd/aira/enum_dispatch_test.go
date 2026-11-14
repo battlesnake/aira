@@ -249,8 +249,12 @@ func TestEnumRefusalIdenticalAcrossFaces(t *testing.T) {
 				return
 			}
 			result := executePaletteRequest(context.Background(), coreOutcomeDispatcher{c}, daemon.WorktreeScope{}, f.palette(t, entries))
-			if result.Outcome != paletteRejected || result.Text != "REJECTED E_ARGUMENT_INVALID\n"+cliText {
-				t.Fatalf("palette: outcome=%v text=%q\nwant REJECTED E_ARGUMENT_INVALID\\n%s", result.Outcome, result.Text, cliText)
+			// AIRA-342: the palette words the refusal (code in the verdict line,
+			// the message under it) and keeps Do's exact text behind Details.
+			message := strings.TrimPrefix(cliText, "E_ARGUMENT_INVALID: ")
+			if result.Outcome != paletteRejected || !strings.HasPrefix(result.Text, "REJECTED (E_ARGUMENT_INVALID)") ||
+				!strings.Contains(result.Text, "\n"+message) || !strings.Contains(result.Details, cliText) {
+				t.Fatalf("palette: outcome=%v text=%q details=%q\nwant REJECTED (E_ARGUMENT_INVALID) with %q, Do's text in details", result.Outcome, result.Text, result.Details, cliText)
 			}
 		})
 	}

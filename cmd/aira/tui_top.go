@@ -692,9 +692,9 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		}
 		model.Rows = append(model.Rows, tableRow{
 			ID: scopeID, Colour: colour,
-			// AIRA-312: what `e` (lower reserve) names on its mini-form and
-			// confirmation, as of this tick.
-			ConfirmText: fmt.Sprintf("%s (owner %s, current reserve %s, live usage %s)", record.Name, owner, reserve.String(), topRAMCell(record.RSSBytes)),
+			// AIRA-312/342: what `e` (lower reserve) says about the job on its
+			// size form and confirmation, as of this tick.
+			Job: topLiveJob(record, owner, reserve),
 			Cells: []string{
 				fmt.Sprint(slot), record.Name, confineNum(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
@@ -771,6 +771,52 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	return model, next
 }
 
+// topJob is what `aira top`'s row actions say about the job a row shows
+// (AIRA-342; it replaces AIRA-309/312's pre-formatted ConfirmText string), as of
+// the tick that built the row. The dialogs compute sizes and effects from it, so
+// the size form can show "8G → 2G, frees 6G" as the operator types.
+type topJob struct {
+	Name  string
+	Owner string
+	// Queued is a job still waiting for admission.
+	Queued bool
+	// Reserve is a running job's granted reserve or a queued job's requested
+	// one; nil when the daemon did not say (never a drawn zero).
+	Reserve *int64
+	// Usage is a running job's live memory use; nil when unread, and for a
+	// queued job, which holds none.
+	Usage *int64
+	// Position is a queued job's 1-based place among the LISTED queued rows.
+	Position int
+}
+
+func topLiveJob(record runner.ConfineRecord, owner string, reserve topReserve) *topJob {
+	job := &topJob{Name: record.Name, Owner: owner, Usage: topKnownBytes(record.RSSBytes)}
+	if reserve.State == topReserveSet {
+		held := reserve.Bytes
+		job.Reserve = &held
+	}
+	return job
+}
+
+// topKnownBytes copies a byte count the daemon published, or nil when it did
+// not (nil or negative).
+func topKnownBytes(value *int64) *int64 {
+	if value == nil || *value < 0 {
+		return nil
+	}
+	known := *value
+	return &known
+}
+
+// topJobSize is a job byte count for a dialog: a size, or "unevaluated".
+func topJobSize(value *int64) string {
+	if value == nil {
+		return "unevaluated"
+	}
+	return humanSize(*value)
+}
+
 // topQueuedRow renders one job that is still waiting in the admission queue
 // (AIRA-308). The column set is the live rows' own so the table stays one table;
 // every cell a waiting job cannot have is "-" — a positive "holds nothing", which
@@ -799,8 +845,7 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 	}
 	return tableRow{
 		ID: record.ScopeID, Queued: true,
-		ConfirmText: fmt.Sprintf("push %s (owner %s, requested %s, listed queue position %d) to the front of the admission queue",
-			record.Name, record.Owner, topQueuedBytesCell(record.ReserveBytes, "0M req"), position),
+		Job:    &topJob{Name: record.Name, Owner: record.Owner, Queued: true, Reserve: topKnownBytes(record.ReserveBytes), Position: position},
 		Colour: topColourQueued, Cells: []string{
 			"-", record.Name, confineNum(record.SupervisorPID),
 			state, topAgeCell(record.AgeSeconds), topQueuedBytesCell(record.ReserveBytes, "0M req"),

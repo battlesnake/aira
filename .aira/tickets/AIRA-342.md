@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-342","project":"aira","title":"aira top: make the job-edit dialogs (reserve size, front, confirmations, results) clear and pleasant: obvious button focus, plain-English results, no raw JSON","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-342","project":"aira","title":"aira top: make the job-edit dialogs (reserve size, front, confirmations, results) clear and pleasant: obvious button focus, plain-English results, no raw JSON","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
 ---
 
 ## Owner complaint (2026-11-14, verbatim)

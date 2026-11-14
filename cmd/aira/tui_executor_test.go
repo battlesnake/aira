@@ -35,7 +35,7 @@ func TestPaletteResultClassification(t *testing.T) {
 		text    string
 	}{
 		{name: "success", attempt: paletteDispatchAttempt{Response: core.Response{OK: true, Code: "OK", RawData: []byte(`{"id":"AIRA-1"}`)}}, want: paletteApplied, text: "APPLIED"},
-		{name: "daemon rejection", attempt: paletteDispatchAttempt{Response: core.Response{Code: "E_SELECTOR_INVALID", Error: "bad selector"}}, want: paletteRejected, text: "REJECTED E_SELECTOR_INVALID"},
+		{name: "daemon rejection", attempt: paletteDispatchAttempt{Response: core.Response{Code: "E_SELECTOR_INVALID", Error: "bad selector"}}, want: paletteRejected, text: "REJECTED (E_SELECTOR_INVALID)"},
 		{name: "provable pre-send write failure", attempt: paletteDispatchAttempt{Err: errors.New("write failed"), Send: paletteSendNotSent}, want: paletteRejected, text: "REJECTED"},
 		{name: "eof after send", attempt: paletteDispatchAttempt{Err: io.EOF, Send: paletteSendMayHaveBeenSent}, want: paletteOutcomeUnknown, text: "UNEVALUATED"},
 		{name: "timeout after send", attempt: paletteDispatchAttempt{Err: context.DeadlineExceeded, Send: paletteSendMayHaveBeenSent}, want: paletteOutcomeUnknown, text: "UNEVALUATED"},

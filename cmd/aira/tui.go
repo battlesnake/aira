@@ -56,15 +56,18 @@ type tuiRuntime struct {
 	// boardUI holds AIRA-252's kanban widgets. overviewUI holds Increment 2's
 	// overview widgets. Each is nil for every other face, so a face's layout lives
 	// entirely in its own file and adds one field here.
-	boardUI              *boardWidgets
-	overviewUI           *overviewWidgets
-	tables               map[tuiView]*tview.Table
-	details              map[tuiView]*tview.TextView
-	footers              map[tuiView]*tview.TextView
-	insights             *tview.TextView
-	paletteList          *tview.List
-	paletteConfirmForm   *tview.Form
-	paletteSubmitButton  *tview.Button
+	boardUI             *boardWidgets
+	overviewUI          *overviewWidgets
+	tables              map[tuiView]*tview.Table
+	details             map[tuiView]*tview.TextView
+	footers             map[tuiView]*tview.TextView
+	insights            *tview.TextView
+	paletteList         *tview.List
+	paletteConfirmForm  *tview.Form
+	paletteSubmitButton *tview.Button
+	// paletteSubmitField is the open form's last text field: Enter there submits
+	// the form, as Enter on its submit button does (AIRA-342).
+	paletteSubmitField   *tview.InputField
 	paletteSubmit        func()
 	paletteConfirmButton *tview.Button
 	paletteCancelButton  *tview.Button
@@ -366,7 +369,8 @@ func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 		// Consume keyboard form submission at the application capture layer.
 		// This prevents tview's old form child from restoring its focus after a
 		// page replacement performed by its Enter handler.
-		if event.Key() == tcell.KeyEnter && r.paletteSubmit != nil && r.paletteSubmitButton != nil && r.paletteSubmitButton.HasFocus() {
+		if event.Key() == tcell.KeyEnter && r.paletteSubmit != nil && (r.paletteSubmitButton != nil && r.paletteSubmitButton.HasFocus() ||
+			r.paletteSubmitField != nil && r.paletteSubmitField.HasFocus()) {
 			r.paletteSubmit()
 			return nil
 		}
@@ -400,7 +404,7 @@ func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 	} else if key == 'x' && r.state.ExecuteOpen {
 		r.showExecuteList()
 	} else if r.state.InlineError != "" {
-		r.showPaletteResult("ERROR " + r.state.InlineError)
+		r.showPaletteResult(clientRefusalResult(r.state.InlineError))
 	} else if r.state.InlineAction != nil {
 		switch {
 		case r.state.PaletteConfirm != nil:
@@ -498,7 +502,7 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 	case msgBoardTranslateResult:
 		r.state, commands = onBoardTranslateResult(r.state, message.Translate)
 	case msgPaletteResult:
-		r.state, commands = onPaletteResult(r.state, message.PaletteOutcome, r.descriptors)
+		r.state, commands = onPaletteResult(r.state, message.PaletteResult.Outcome, r.descriptors)
 		// The result still drives controller convergence after the operator
 		// closes the flow, but must not pop a modal over the dashboard.
 		if r.state.PaletteOpen {
@@ -986,7 +990,7 @@ func (r *tuiRuntime) renderInsights(panel panelState) {
 
 func (r *tuiRuntime) makePaletteList() *tview.List {
 	list := tview.NewList().ShowSecondaryText(true)
-	list.SetBorder(true).SetTitle(" Command palette ")
+	list.SetBorder(true).SetTitle(" Command palette · Enter opens · Esc closes ")
 	for _, item := range buildPalette(r.descriptors) {
 		entry := item
 		marker := string(entry.Safety)
@@ -1005,27 +1009,101 @@ func (r *tuiRuntime) makePaletteList() *tview.List {
 	return list
 }
 
+// dialogPages is every page a dialog is shown on. A dialog is drawn OVER the
+// dashboard (AIRA-342: the job being acted on stays visible around it), so
+// showing one hides only the other dialogs, never the dashboard.
+var dialogPages = []string{palettePage, paletteConfirmPage, paletteResultPage, inlinePage, executePage, executeConfirmPage}
+
+// showDialogPage puts frame on page name, above the dashboard, hides every other
+// dialog, and focuses focus.
+func (r *tuiRuntime) showDialogPage(name string, frame tview.Primitive, focus tview.Primitive) {
+	for _, page := range dialogPages {
+		if page != name {
+			r.outerPages.HidePage(page)
+		}
+	}
+	r.outerPages.RemovePage(name).AddPage(name, frame, true, true)
+	r.app.SetFocus(focus)
+}
+
+// newDialog builds one dialog of the shared family (tui_dialog.go) for this
+// runtime: `d` toggles details unless the focus is in a text field.
+func (r *tuiRuntime) newDialog(spec dialogSpec) *dialogView {
+	return newDialog(spec, func() bool {
+		_, typing := r.app.GetFocus().(*tview.InputField)
+		return typing
+	})
+}
+
 func (r *tuiRuntime) showPaletteList() {
 	r.state.InlineAction = nil
 	r.state.InlineError = ""
 	r.state.PaletteOpen = true
-	r.outerPages.HidePage(paletteConfirmPage).HidePage(paletteResultPage).ShowPage(palettePage).SwitchToPage(palettePage)
-	r.app.SetFocus(r.paletteList)
+	r.clearPaletteForm()
+	r.showDialogPage(palettePage, centeredPrimitive(r.paletteList, 80, 22), r.paletteList)
+}
+
+// clearPaletteForm forgets the widgets of the palette's last form, so a stale
+// Enter can never submit a form that is no longer on screen.
+func (r *tuiRuntime) clearPaletteForm() {
+	r.paletteSubmit = nil
+	r.paletteSubmitButton = nil
+	r.paletteSubmitField = nil
+	r.paletteConfirmAction = nil
+	r.paletteCancelAction = nil
+	r.paletteConfirmButton = nil
+	r.paletteCancelButton = nil
+}
+
+// setDialogStatus writes a form's status line. The tone shows as a leading mark
+// as well as a colour, so it reads on a terminal without colour. The colour is a
+// style tag because the form resets the item's own text style on every draw;
+// the message itself is escaped, so it can never carry a tag of its own.
+func setDialogStatus(status *tview.TextView, tone dialogTone, text string) {
+	if status == nil {
+		return
+	}
+	mark, colour := "", ""
+	switch tone {
+	case toneOK:
+		mark, colour = "✓ ", "green"
+	case toneWarn:
+		mark, colour = "! ", "yellow"
+	case toneError:
+		mark, colour = "✗ ", "red"
+	}
+	text = tview.Escape(mark + text)
+	if colour != "" {
+		text = "[" + colour + "]" + text + "[-]"
+	}
+	status.SetText(text)
+}
+
+// inlineErrorStatus words a client-side refusal ("E_CODE: message") for a form's
+// status line: the message first, the code after it.
+func inlineErrorStatus(text string) string {
+	code, message := splitCodedError(text)
+	if code == "" {
+		return message
+	}
+	return message + " (" + code + ")"
 }
 
 func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 	if len(entry.Args) == 0 {
 		request, err := parsePaletteRequest(entry, map[string]string{})
 		if err != nil {
-			r.showPaletteResult("ERROR " + err.Error())
+			r.showPaletteResult(clientRefusalResult(err.Error()))
 			return
 		}
 		r.submitPaletteEntry(entry, request)
 		return
 	}
+	r.clearPaletteForm()
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" " + entryKey(entry) + " ")
+	status := newDialogStatus()
 	fields := make(map[string]*tview.InputField, len(entry.Args))
+	var last *tview.InputField
 	for _, arg := range entry.Args {
 		label := arg.Spec.Name
 		if arg.Required {
@@ -1037,7 +1115,9 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 		}
 		fields[arg.Spec.Name] = field
 		form.AddFormItem(field)
+		last = field
 	}
+	form.AddFormItem(status)
 	buttonLabel := "Run"
 	if entry.Safety != core.SafetyRead {
 		buttonLabel = "Continue"
@@ -1052,16 +1132,19 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 		}
 		request, err := parsePaletteRequest(entry, values)
 		if err != nil {
-			r.showPaletteResult("ERROR " + err.Error())
+			setDialogStatus(status, toneError, inlineErrorStatus(err.Error()))
 			return
 		}
 		r.submitPaletteEntry(entry, request)
 	}
-	r.paletteSubmitButton = form.GetButton(0)
 	form.AddButton("Cancel", r.showPaletteList)
 	form.SetCancelFunc(r.showPaletteList)
-	r.outerPages.RemovePage(palettePage).AddPage(palettePage, centeredPrimitive(form, 80, len(entry.Args)+6), true, true)
-	r.app.SetFocus(form)
+	styleDialogForm(form)
+	r.paletteSubmitButton = form.GetButton(0)
+	r.paletteSubmitField = last
+	setDialogStatus(status, toneInfo, "fields marked * are required")
+	view := r.newDialog(dialogSpec{Title: entryKey(entry), Body: entry.Summary, Form: form})
+	r.showDialogPage(palettePage, view.frame, form)
 }
 
 func (r *tuiRuntime) submitPaletteEntry(entry paletteEntry, request core.Request) {
@@ -1073,7 +1156,7 @@ func (r *tuiRuntime) submitPaletteEntry(entry paletteEntry, request core.Request
 		return
 	}
 	if len(commands) > 0 {
-		r.showPaletteResult("dispatching…")
+		r.showPaletteResult(pendingResult())
 	}
 }
 
@@ -1082,17 +1165,9 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	if confirm == nil || r.state.PaletteDispatching {
 		return
 	}
-	details := tview.NewTextView().SetWrap(true).SetText(paletteConfirmationText(confirm))
-	details.SetBorder(true).SetTitle(" Resolved request ")
 	form := tview.NewForm()
-	r.paletteSubmit = nil
-	r.paletteSubmitButton = nil
+	r.clearPaletteForm()
 	r.paletteConfirmForm = form
-	if confirm.Destructive {
-		form.SetBorder(true).SetTitle(" Confirm DESTRUCTIVE mutation ")
-	} else {
-		form.SetBorder(true).SetTitle(" Confirm mutation ")
-	}
 	var idField *tview.InputField
 	if confirm.Destructive && confirm.ConfirmIDTarget != "" {
 		idField = tview.NewInputField().SetLabel("Type " + confirm.ConfirmIDTarget + ": ")
@@ -1105,7 +1180,7 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 			return
 		}
 		r.submitCommands(commands)
-		r.showPaletteResult("dispatching…")
+		r.showPaletteResult(pendingResult())
 	}
 	r.paletteCancelAction = func() {
 		if r.state.InlineAction != nil {
@@ -1140,17 +1215,42 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 		}
 		return event
 	})
+	styleDialogForm(form)
 	// Buttons follow form items. Confirm is first and Cancel second; focus Cancel
 	// so a stray/form-submit Enter cannot affirm the mutation.
 	form.SetFocus(form.GetFormItemCount() + 1)
-	content := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(details, 0, 1, false).
-		AddItem(form, form.GetFormItemCount()+6, 0, true) // border 2 + padding 2 + item + gap + buttons: one row short hides the focused-Cancel form's "Type <ID>:" input
-	r.outerPages.RemovePage(paletteConfirmPage).
-		AddPage(paletteConfirmPage, centeredPrimitive(content, 90, 26), true, true).
-		SwitchToPage(paletteConfirmPage)
-	r.app.SetFocus(form)
+	body, details := paletteConfirmationBody(confirm)
+	view := r.newDialog(dialogSpec{Title: paletteConfirmTitle(confirm), Body: body, Form: form, Details: details})
+	r.showDialogPage(paletteConfirmPage, view.frame, form)
 	r.app.SetFocus(form.GetButton(1))
+}
+
+// paletteConfirmTitle names a confirmation: its own title (an `aira top` row
+// action), else the palette's generic wording.
+func paletteConfirmTitle(confirm *paletteConfirm) string {
+	switch {
+	case confirm.Title != "":
+		return confirm.Title
+	case confirm.Destructive:
+		return "Confirm DESTRUCTIVE mutation"
+	default:
+		return "Confirm mutation"
+	}
+}
+
+// paletteConfirmationBody is a confirmation's text and its details. A row
+// action's Summary already says everything in words, so its exact request goes
+// behind `d`; a palette entry's arguments ARE what it does, so they stay in the
+// body.
+func paletteConfirmationBody(confirm *paletteConfirm) (string, string) {
+	if !confirm.ArgsInDetails {
+		return paletteConfirmationText(confirm), ""
+	}
+	body := confirm.Summary
+	if confirm.ConfirmBlockedReason != "" {
+		body += "\n\n⚠ cannot confirm: " + confirm.ConfirmBlockedReason
+	}
+	return body, executeRequestText(confirm.Request)
 }
 
 func paletteConfirmationText(confirm *paletteConfirm) string {
@@ -1173,41 +1273,35 @@ func paletteConfirmationText(confirm *paletteConfirm) string {
 	if confirm.ConfirmBlockedReason != "" {
 		fmt.Fprintf(&out, "\n⚠ cannot confirm: %s\n", confirm.ConfirmBlockedReason)
 	}
-	return out.String()
+	return strings.TrimRight(out.String(), "\n")
 }
 
-func (r *tuiRuntime) showPaletteResult(text string) {
-	r.paletteSubmit = nil
-	r.paletteSubmitButton = nil
-	r.paletteConfirmAction = nil
-	r.paletteCancelAction = nil
-	r.paletteConfirmButton = nil
-	r.paletteCancelButton = nil
-	result := tview.NewTextView().SetWrap(true).SetScrollable(true).SetText(text)
-	result.SetBorder(true).SetTitle(" Palette result (Esc to close) ")
-	result.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape {
-			r.closePalette()
-			return nil
-		}
-		return event
-	})
+// showPaletteResult shows what a palette or row action did, worded by the one
+// result formatter (tui_result.go); the raw payload is behind `d`.
+func (r *tuiRuntime) showPaletteResult(result paletteResult) {
+	r.clearPaletteForm()
+	view := r.newDialog(dialogSpec{Title: paletteResultTitle(result), Body: result.Text, Details: result.Details, OnClose: r.closePalette})
 	r.state.PaletteOpen = true
-	r.outerPages.RemovePage(paletteResultPage).
-		AddPage(paletteResultPage, centeredPrimitive(result, 90, 24), true, true).
-		SwitchToPage(paletteResultPage)
-	r.app.SetFocus(result)
+	r.showDialogPage(paletteResultPage, view.frame, view.focus)
+}
+
+func paletteResultTitle(result paletteResult) string {
+	switch result.Outcome {
+	case paletteApplied:
+		return "Applied"
+	case paletteRejected:
+		return "Not applied"
+	case paletteOutcomeUnknown:
+		return "Outcome unknown"
+	default:
+		return "Working…"
+	}
 }
 
 func (r *tuiRuntime) closePalette() {
 	r.state, _ = onPaletteCancel(r.state)
 	r.state.PaletteOpen = false
-	r.paletteSubmit = nil
-	r.paletteSubmitButton = nil
-	r.paletteConfirmAction = nil
-	r.paletteCancelAction = nil
-	r.paletteConfirmButton = nil
-	r.paletteCancelButton = nil
+	r.clearPaletteForm()
 	r.outerPages.HidePage(palettePage).HidePage(paletteConfirmPage).HidePage(paletteResultPage).HidePage(inlinePage).SwitchToPage(dashboardPage)
 	if table := r.tables[r.state.Active]; table != nil {
 		r.app.SetFocus(table)
@@ -1222,7 +1316,7 @@ func (r *tuiRuntime) showInlinePicker() {
 		return
 	}
 	list := tview.NewList().ShowSecondaryText(false)
-	list.SetBorder(true).SetTitle(" " + pending.Action.Label + " — " + pending.TargetID + " ")
+	list.SetBorder(true).SetTitle(" " + pending.Action.Label + " — " + pending.TargetID + " · Enter picks · Esc cancels ")
 	for _, option := range pending.Options {
 		value := option
 		list.AddItem(value, "", 0, func() {
@@ -1231,7 +1325,7 @@ func (r *tuiRuntime) showInlinePicker() {
 			r.submitCommands(commands)
 			switch {
 			case r.state.InlineError != "":
-				r.showPaletteResult("ERROR " + r.state.InlineError)
+				r.showPaletteResult(clientRefusalResult(r.state.InlineError))
 			case r.state.PaletteConfirm != nil:
 				r.showPaletteConfirmation()
 			case r.state.InlineAction != nil && r.state.InlineAction.Stage == inlineStageMiniForm:
@@ -1246,23 +1340,38 @@ func (r *tuiRuntime) showInlinePicker() {
 		}
 		return event
 	})
-	r.outerPages.RemovePage(inlinePage).AddPage(inlinePage, centeredPrimitive(list, 72, len(pending.Options)+4), true, true).SwitchToPage(inlinePage)
-	r.app.SetFocus(list)
+	r.showDialogPage(inlinePage, centeredPrimitive(list, 72, len(pending.Options)+2), list)
 }
 
+// showInlineMiniForm is the row action's small form: the `e` new reserve, or a
+// waiver's reason and actor. Its status line under the fields previews the
+// value as it is typed (for `e`) and reports a refused value in place, instead
+// of a pop-up (AIRA-342). Enter in the last field submits.
 func (r *tuiRuntime) showInlineMiniForm() {
 	pending := r.state.InlineAction
 	if pending == nil || pending.Stage != inlineStageMiniForm {
 		return
 	}
+	r.clearPaletteForm()
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(inlineMiniFormTitle(pending))
+	status := newDialogStatus()
+	resize := pending.Action.Verb == "confine-resize"
 	fields := make(map[string]*tview.InputField, len(pending.FormArgs))
+	var last *tview.InputField
 	for _, name := range pending.FormArgs {
 		field := tview.NewInputField().SetLabel(inlineMiniFormLabel(pending, name))
+		if resize && name == topResizeMemoryArg {
+			field.SetPlaceholder("e.g. 2G or 512M").SetFieldWidth(16)
+			field.SetChangedFunc(func(text string) {
+				tone, line := topResizePreview(pending.Job, text)
+				setDialogStatus(status, tone, line)
+			})
+		}
 		fields[name] = field
 		form.AddFormItem(field)
+		last = field
 	}
+	form.AddFormItem(status)
 	r.paletteSubmit = func() {
 		values := make(map[string]string, len(fields))
 		for name, field := range fields {
@@ -1272,7 +1381,7 @@ func (r *tuiRuntime) showInlineMiniForm() {
 		r.state, commands = onInlineMiniFormSubmit(r.state, values, r.descriptors)
 		r.submitCommands(commands)
 		if r.state.InlineError != "" {
-			r.showPaletteResult("ERROR " + r.state.InlineError)
+			setDialogStatus(status, toneError, inlineErrorStatus(r.state.InlineError))
 			return
 		}
 		if r.state.PaletteConfirm != nil {
@@ -1280,21 +1389,24 @@ func (r *tuiRuntime) showInlineMiniForm() {
 		}
 	}
 	form.AddButton("Continue", func() { r.paletteSubmit() })
-	r.paletteSubmitButton = form.GetButton(0)
 	form.AddButton("Cancel", r.closeInline)
 	form.SetCancelFunc(r.closeInline)
-	r.outerPages.RemovePage(inlinePage).AddPage(inlinePage, centeredPrimitive(form, 80, len(fields)+6), true, true).SwitchToPage(inlinePage)
-	r.app.SetFocus(form)
+	styleDialogForm(form)
+	r.paletteSubmitButton = form.GetButton(0)
+	r.paletteSubmitField = last
+	if resize {
+		tone, line := topResizePreview(pending.Job, "")
+		setDialogStatus(status, tone, line)
+	} else {
+		setDialogStatus(status, toneInfo, "both fields are required")
+	}
+	view := r.newDialog(dialogSpec{Title: inlineMiniFormTitle(pending), Body: inlineMiniFormContext(pending), Form: form})
+	r.showDialogPage(inlinePage, view.frame, form)
 }
 
 func (r *tuiRuntime) closeInline() {
 	r.state, _ = onInlineActionCancel(r.state)
-	r.paletteSubmit = nil
-	r.paletteSubmitButton = nil
-	r.paletteConfirmAction = nil
-	r.paletteCancelAction = nil
-	r.paletteConfirmButton = nil
-	r.paletteCancelButton = nil
+	r.clearPaletteForm()
 	r.outerPages.HidePage(inlinePage).HidePage(paletteConfirmPage).HidePage(paletteResultPage).SwitchToPage(dashboardPage)
 	if table := r.tables[r.state.Active]; table != nil {
 		r.app.SetFocus(table)
@@ -1304,7 +1416,7 @@ func (r *tuiRuntime) closeInline() {
 func (r *tuiRuntime) showExecuteList() {
 	r.state = onExecuteOpen(r.state)
 	list := tview.NewList().ShowSecondaryText(true)
-	list.SetBorder(true).SetTitle(" Foreground execute ")
+	list.SetBorder(true).SetTitle(" Foreground execute · Enter opens · Esc closes ")
 	for _, item := range buildExecuteList(r.descriptors, r.canExecute) {
 		entry := item
 		label := entry.Verb
@@ -1333,8 +1445,7 @@ func (r *tuiRuntime) showExecuteList() {
 		}
 		return event
 	})
-	r.outerPages.RemovePage(executePage).AddPage(executePage, centeredPrimitive(list, 84, 12), true, true).SwitchToPage(executePage)
-	r.app.SetFocus(list)
+	r.showDialogPage(executePage, centeredPrimitive(list, 84, 12), list)
 }
 
 func (r *tuiRuntime) showExecuteArgForm() {
@@ -1343,26 +1454,29 @@ func (r *tuiRuntime) showExecuteArgForm() {
 		return
 	}
 	form := tview.NewForm()
+	status := newDialogStatus()
 	field := tview.NewInputField().SetLabel("arguments (include --): ")
 	field.SetPlaceholder("-- command arg")
 	form.AddFormItem(field)
-	form.SetBorder(true).SetTitle(" " + entry.Verb + " foreground arguments ")
+	form.AddFormItem(status)
 	r.executeSubmit = func() {
 		var err error
 		r.state, err = onExecuteSubmit(r.state, field.GetText())
 		if err != nil {
-			form.SetTitle(" " + entry.Verb + " — " + err.Error() + " ")
+			setDialogStatus(status, toneError, inlineErrorStatus(err.Error()))
 			return
 		}
 		r.showExecuteConfirmation()
 	}
 	form.AddButton("Continue", func() { r.executeSubmit() })
-	r.executeSubmitButton = form.GetButton(0)
 	r.executeCancelAction = r.closeExecute
 	form.AddButton("Cancel", r.closeExecute)
 	form.SetCancelFunc(r.closeExecute)
-	r.outerPages.RemovePage(executePage).AddPage(executePage, centeredPrimitive(form, 92, 8), true, true).SwitchToPage(executePage)
-	r.app.SetFocus(form)
+	styleDialogForm(form)
+	r.executeSubmitButton = form.GetButton(0)
+	setDialogStatus(status, toneInfo, "the arguments run as `aira "+entry.Verb+" <arguments>`")
+	view := r.newDialog(dialogSpec{Title: entry.Verb + " foreground arguments", Body: entry.Summary, Form: form})
+	r.showDialogPage(executePage, view.frame, form)
 }
 
 func (r *tuiRuntime) showExecuteConfirmation() {
@@ -1380,10 +1494,7 @@ func (r *tuiRuntime) showExecuteConfirmation() {
 	if launch.Detached {
 		mode = "detached"
 	}
-	details := tview.NewTextView().SetWrap(true).SetText(text)
-	details.SetBorder(true).SetTitle(" Resolved " + mode + " request ")
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" Confirm " + mode + " action ")
 	r.executeSubmit = nil
 	r.executeSubmitButton = nil
 	r.executeConfirmAction = r.confirmExecuteOnUI
@@ -1403,12 +1514,11 @@ func (r *tuiRuntime) showExecuteConfirmation() {
 		}
 		return event
 	})
+	styleDialogForm(form)
 	// As with palette mutations, a stray Enter defaults to Cancel.
 	form.SetFocus(1)
-	content := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(details, 0, 1, false).
-		AddItem(form, 5, 0, true)
-	r.outerPages.RemovePage(executeConfirmPage).AddPage(executeConfirmPage, centeredPrimitive(content, 94, 24), true, true).SwitchToPage(executeConfirmPage)
+	view := r.newDialog(dialogSpec{Title: "Confirm " + mode + " action", Body: strings.TrimRight(text, "\n"), Form: form})
+	r.showDialogPage(executeConfirmPage, view.frame, form)
 	r.app.SetFocus(form.GetButton(1))
 }
 
@@ -1544,14 +1654,4 @@ func (r *tuiRuntime) executeStderr() io.Writer {
 		return io.Discard
 	}
 	return r.stderr
-}
-
-func centeredPrimitive(primitive tview.Primitive, width, height int) tview.Primitive {
-	return tview.NewFlex().
-		AddItem(nil, 0, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(nil, 0, 1, false).
-			AddItem(primitive, height, 0, true).
-			AddItem(nil, 0, 1, false), width, 0, true).
-		AddItem(nil, 0, 1, false)
 }
