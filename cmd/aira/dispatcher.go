@@ -953,9 +953,11 @@ func mismatchedRuntimeError(paths daemon.Paths, pid int, holderSocket, runtimeDi
 // unreachableDaemonError reports, dialling only this process's own socket, that
 // this process's daemon socket can never be served: this state's running daemon (or
 // its enabled aira-daemon.service) is bound to a different socket, because this
-// process's XDG_RUNTIME_DIR differs from the daemon's. It returns nil whenever
-// it cannot establish that, so a daemon that is merely starting or restarting
-// stays a wait. `aira confine` admission dials the socket itself and reconnects
+// process's XDG_RUNTIME_DIR differs from the daemon's; or no daemon answers or holds
+// this state's lock while the enabled service serves a different state, because
+// this process's XDG_STATE_HOME or HOME differs from the service's (AIRA-335). It
+// returns nil whenever it cannot establish that, so a daemon that is merely
+// starting or restarting stays a wait. `aira confine` admission dials the socket itself and reconnects
 // without a deadline, so without this check such a launch is held forever
 // (AIRA-289b).
 func unreachableDaemonError(paths daemon.Paths, systemctl daemon.SystemctlRun, readFile func(string) ([]byte, error), getenv func(string) string) error {
@@ -973,11 +975,37 @@ func unreachableDaemonError(paths daemon.Paths, systemctl daemon.SystemctlRun, r
 	if status.Running && status.Lock.PID > 0 && status.Lock.Socket != "" && status.Lock.Socket != paths.SocketPath {
 		return mismatchedRuntimeError(paths, status.Lock.PID, status.Lock.Socket, runtimeDir)
 	}
-	if service, managed := daemon.ManagedServiceForState(paths, daemon.DefaultServiceUnit, systemctl, readFile); managed && service.SocketPath != paths.SocketPath {
-		return fmt.Errorf("%s: no daemon is listening at %s; aira-daemon.service serves this state at %s, so this process's "+
-			"XDG_RUNTIME_DIR (%s) differs from the daemon's; run with the daemon's XDG_RUNTIME_DIR "+
-			"(a gate command that calls aira needs it in env_allow)",
-			daemon.CodeUnavailable, paths.SocketPath, service.SocketPath, runtimeDir)
+	service, managed := daemon.ManagedServicePaths(daemon.DefaultServiceUnit, systemctl, readFile)
+	if !managed {
+		return nil
+	}
+	if service.StateID == paths.StateID {
+		if service.SocketPath != paths.SocketPath {
+			return fmt.Errorf("%s: no daemon is listening at %s; aira-daemon.service serves this state at %s, so this process's "+
+				"XDG_RUNTIME_DIR (%s) differs from the daemon's; run with the daemon's XDG_RUNTIME_DIR "+
+				"(a gate command that calls aira needs it in env_allow)",
+				daemon.CodeUnavailable, paths.SocketPath, service.SocketPath, runtimeDir)
+		}
+		// The service serves this very socket and is starting or restarting: wait.
+		return nil
+	}
+	// AIRA-335. No daemon answers for this state and none is established as running for it
+	// (its lock is not held with a live, same-boot record), while the
+	// installed service serves ANOTHER state: this process's XDG_STATE_HOME (or the
+	// HOME it defaults from) points away from the installed aira, so no daemon will
+	// ever serve this socket. An override with a reachable daemon never gets here
+	// (Ready returned above), and one whose daemon holds the lock is Running.
+	if !status.Running {
+		envOrUnset := func(name string) string {
+			if value := strings.TrimSpace(getenv(name)); value != "" {
+				return value
+			}
+			return "unset"
+		}
+		return fmt.Errorf("%s: no daemon serves this process's state %s (socket %s); aira-daemon.service serves the state %s, "+
+			"so this process's XDG_STATE_HOME (%s) or HOME (%s) points away from the installed aira; run aira with the daemon's "+
+			"XDG_STATE_HOME and HOME, and set an override the job needs inside it (aira confine -- env XDG_STATE_HOME=... <cmd>)",
+			daemon.CodeUnavailable, paths.StateHome, paths.SocketPath, service.StateHome, envOrUnset("XDG_STATE_HOME"), envOrUnset("HOME"))
 	}
 	return nil
 }

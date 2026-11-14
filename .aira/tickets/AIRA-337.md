@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-337","project":"aira","title":"De-flake two internal/runner tests: confine scan reads cmdline before exec completes; AIRA-138 CPU reader fires on a zombie","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-337","project":"aira","title":"De-flake two internal/runner tests: confine scan reads cmdline before exec completes; AIRA-138 CPU reader fires on a zombie","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
 ---
 
 
