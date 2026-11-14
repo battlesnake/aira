@@ -56,6 +56,10 @@ type mcpToolAnnotations struct {
 type mcpToolBinding struct {
 	tool        mcpTool
 	byOperation map[string]mcpOperation
+	// defaultOperation is the operation a call without an `operation`
+	// argument runs; empty means the argument is required whenever the tool
+	// has more than one operation. Only aira_rant sets it (capture).
+	defaultOperation string
 	// acceptsScopeDir mirrors what the schema advertises: a project-less tool
 	// neither declares nor accepts the per-call scope override (AIRA-82).
 	acceptsScopeDir bool
@@ -156,14 +160,22 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 			operations[operation] = makeMCPOperation(descriptor, operation)
 		}
 	}
+	// aira_rant keeps capture zero-ceremony: a call without `operation` is a
+	// capture under the approved advertisement. The one other operation it
+	// exposes is the read-only ls listing (AIRA-327); get, review and redact
+	// stay CLI-only.
+	defaultOperation := ""
 	if len(descriptors) == 1 && descriptors[0].Name == "rant" {
 		capture := makeMCPOperation(descriptors[0], "capture")
-		operations = map[string]mcpOperation{"": capture}
+		list := makeMCPOperation(descriptors[0], "ls")
+		operations = map[string]mcpOperation{"capture": capture, "ls": list}
 		allArgs = map[string]core.ArgSpec{}
-		for _, arg := range capture.declaredArgs {
-			allArgs[arg.Name] = arg
+		for _, operation := range []mcpOperation{capture, list} {
+			for _, arg := range operation.declaredArgs {
+				allArgs[arg.Name] = arg
+			}
 		}
-		multiple = false
+		defaultOperation = "capture"
 	}
 	// `link ls <id>` is the third operation of the grouped link tool.
 	if link, ok := descriptorNamed(descriptors, "link"); ok {
@@ -187,6 +199,9 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 	}
 	if len(operations) > 1 {
 		allArgs["operation"] = core.ArgSpec{Name: "operation", Kind: core.ArgKindString, Required: true, Enum: sortedOperationNames(operations), Description: "Operation"}
+		if defaultOperation != "" {
+			allArgs["operation"] = core.ArgSpec{Name: "operation", Kind: core.ArgKindString, Enum: sortedOperationNames(operations), Description: "Operation; omit it to capture. ls lists one page of this project's rants (default: unreviewed, oldest first, 50 compact rows) with total, truncated and next_since"}
+		}
 	}
 	propertyNames := make([]string, 0, len(allArgs))
 	for arg := range allArgs {
@@ -229,7 +244,7 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 				}
 			}
 		}
-	} else {
+	} else if defaultOperation == "" {
 		schema.Required = []string{"operation"}
 	}
 	sort.Strings(schema.Required)
@@ -251,9 +266,10 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 		}
 	}
 	return mcpToolBinding{
-		tool:            mcpTool{Name: name, Description: description, InputSchema: schema, Annotations: mcpToolAnnotations{ReadOnlyHint: readOnly, DestructiveHint: destructive}},
-		byOperation:     operations,
-		acceptsScopeDir: acceptsScopeDir,
+		tool:             mcpTool{Name: name, Description: description, InputSchema: schema, Annotations: mcpToolAnnotations{ReadOnlyHint: readOnly, DestructiveHint: destructive}},
+		byOperation:      operations,
+		defaultOperation: defaultOperation,
+		acceptsScopeDir:  acceptsScopeDir,
 	}
 }
 
@@ -424,6 +440,9 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 	operation := ""
 	if len(binding.byOperation) > 1 {
 		raw, ok := values["operation"]
+		if !ok && binding.defaultOperation != "" {
+			raw, ok = json.RawMessage(strconv.Quote(binding.defaultOperation)), true
+		}
 		if !ok {
 			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: operation is required")
 		}

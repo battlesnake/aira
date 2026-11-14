@@ -47,8 +47,13 @@ func TestCLIRefusesOptionsTheOperationDoesNotDeclare(t *testing.T) {
 		option    string
 		mcpAbsent string // the MCP argument name that is not declared
 	}{
-		{[]string{"rant", "ls", "--severity", "P1"}, "rant", "ls", "severity", "severity"},
-		{[]string{"rant", "ls", "--severity", "annoyance"}, "rant", "ls", "severity", "severity"},
+		// AIRA-327 made --severity an ls FILTER; get and review still do not declare it.
+		{[]string{"rant", "get", "RANT-1", "--severity", "annoyance"}, "rant", "get", "severity", "severity"},
+		{[]string{"rant", "review", "RANT-1", "--severity", "P1"}, "rant", "review", "severity", "severity"},
+		// The ls filters and page options are refused on the other subverbs.
+		{[]string{"rant", "get", "RANT-1", "--limit", "5"}, "rant", "get", "limit", "limit"},
+		{[]string{"rant", "review", "RANT-1", "--status", "all"}, "rant", "review", "status", "status"},
+		{[]string{"rant", "capture", "text", "--grep", "x"}, "rant", "capture", "grep", "grep"},
 		{[]string{"rant", "ls", "--outcome", "bogus"}, "rant", "ls", "outcome", "outcome"},
 		{[]string{"rant", "get", "RANT-1", "--by", "bogus"}, "rant", "get", "by", "by"},
 		{[]string{"rant", "another rant", "--outcome", "bogus"}, "rant", "capture", "outcome", "outcome"},
@@ -73,7 +78,8 @@ func TestCLIRefusesOptionsTheOperationDoesNotDeclare(t *testing.T) {
 		{[]string{"test-report", "flaky", "--config-env", "A=B"}, "test-report", "flaky", "config-env", "env_digest"},
 		// A BARE FLAG is an undeclared option too (it carries "true", not a value).
 		{[]string{"test-report", "ls", "--all"}, "test-report", "ls", "all", "all"},
-		{[]string{"rant", "capture", "text", "--unreviewed"}, "rant", "capture", "unreviewed", "unreviewed"},
+		{[]string{"rant", "capture", "text", "--newest"}, "rant", "capture", "newest", "newest"},
+		{[]string{"rant", "capture", "text", "--full"}, "rant", "capture", "full", "full"},
 		{[]string{"spend", "ls", "--reasoning-subset"}, "spend", "ls", "reasoning-subset", "reasoning_subset"},
 		// The undeclared option among declared ones, in each SORTED position
 		// (declared: by, fields; options sort as the loop visits them).
@@ -108,7 +114,8 @@ func TestCLIStillAcceptsEveryDeclaredOption(t *testing.T) {
 	valid := [][]string{
 		{"rant", "text", "--tag", "t", "--severity", "blocker", "--ref", "r", "--idem", "k", "--project", "p"},
 		{"rant", "capture", "text", "--tag", "t", "--severity", "papercut", "--ref", "r", "--idem", "k", "--prefix", "AIRA"},
-		{"rant", "ls", "--by", "tag", "--unreviewed", "--since", "5", "--tag", "t", "--prefix", "AIRA"},
+		{"rant", "ls", "--by", "tag", "--since", "5", "--tag", "t", "--prefix", "AIRA"},
+		{"rant", "ls", "--status", "all", "--severity", "unset", "--tag", "t", "--actor", "a", "--grep", "g", "--since", "5", "--limit", "10", "--newest", "--full", "--project", "p"},
 		{"rant", "list", "--project", "p"},
 		{"rant", "get", "RANT-1", "--project", "p"},
 		{"rant", "review", "RANT-1", "--outcome", "planned", "--note", "n", "--resolved-by", "ticket:AIRA-1", "--prefix", "AIRA"},

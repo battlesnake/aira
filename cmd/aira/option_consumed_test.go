@@ -193,7 +193,7 @@ func optionIsBareFlag(verb, name string) bool {
 		(name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log"),
 		(name == "reasoning-subset" || name == "resolve-ticket") && verb == "spend",
 		name == "all" && verb == "test-report",
-		name == "unreviewed" && verb == "rant",
+		(name == "newest" || name == "full") && verb == "rant",
 		name == "hold" && (verb == "create" || verb == "new"):
 		return true
 	}

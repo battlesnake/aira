@@ -1081,7 +1081,7 @@ func TestRantListGuardsRejectDishonestFiltersThroughDispatch(t *testing.T) {
 	// Multiple tags must be rejected, not silently reduced to the first.
 	rejects("ls --tag a --tag b", map[string]any{"tags": []string{"a", "b"}})
 	// A distribution combined with a filter must be rejected, not silently ignored.
-	rejects("ls --by severity --unreviewed", map[string]any{"by": "severity", "unreviewed": true})
+	rejects("ls --by severity --status all", map[string]any{"by": "severity", "status": "all"})
 	// The valid forms still work.
 	if r := ls(map[string]any{"tags": []string{"infra"}}); !r.OK {
 		t.Fatalf("ls --tag infra: %#v", r)

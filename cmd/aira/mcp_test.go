@@ -50,7 +50,10 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	}
 }
 
-func TestRantMCPIsCaptureOnlyWithApprovedAdvertisement(t *testing.T) {
+// verifies: AIRA-327 — aira_rant captures by default (no operation argument,
+// the approved advertisement) and exposes the ls listing with its arguments;
+// get, review and redact stay CLI-only.
+func TestRantMCPCapturesByDefaultAndListsRants(t *testing.T) {
 	server := newMCPServer(nil)
 	binding, ok := server.byName["aira_rant"]
 	if !ok {
@@ -71,13 +74,71 @@ func TestRantMCPIsCaptureOnlyWithApprovedAdvertisement(t *testing.T) {
 	sort.Strings(got)
 	// scope_dir is the face-level per-call scope override (AIRA-82), injected by
 	// makeToolBinding rather than declared by the rant descriptor. project and
-	// prefix are the rant target selector (AIRA-179): they name the project a
-	// capture applies to, so friction about a shared tool can be filed where its
-	// own maintainers read it. Both are listed here so this guard still refuses
-	// any OTHER property leaking into the capture-only advertisement.
-	want := []string{"idempotency_key", "prefix", "project", "refs", "scope_dir", "severity", "tags", "text"}
-	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(schema.Required, []string{"text"}) {
-		t.Fatalf("schema properties=%v required=%v", got, schema.Required)
+	// prefix are the rant target selector (AIRA-179). The ls arguments are
+	// AIRA-327's listing; nothing else (selector, outcome, note, resolved_by,
+	// the retired unreviewed) may leak into the advertisement.
+	want := []string{"actor", "by", "full", "grep", "idempotency_key", "limit", "newest", "operation", "prefix", "project", "refs", "scope_dir", "severity", "severity_filter", "since", "status", "tags", "text"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("schema properties=%v\nwant %v", got, want)
+	}
+	// Nothing is schema-required: capture needs text, ls does not, and the
+	// operation argument is optional (absent = capture).
+	if len(schema.Required) != 0 {
+		t.Fatalf("schema required=%v, want none", schema.Required)
+	}
+	if enum := schema.Properties["operation"].Enum; !reflect.DeepEqual(enum, []string{"capture", "ls"}) {
+		t.Fatalf("operation enum = %v", enum)
+	}
+	// ls filters on severity `unset`, which capture refuses; the capture
+	// argument must not offer it, the listing argument must.
+	if enum := schema.Properties["severity"].Enum; !reflect.DeepEqual(enum, []string{"papercut", "annoyance", "blocker"}) {
+		t.Fatalf("capture severity enum = %v", enum)
+	}
+	if enum := schema.Properties["severity_filter"].Enum; !reflect.DeepEqual(enum, []string{"papercut", "annoyance", "blocker", "unset"}) {
+		t.Fatalf("ls severity_filter enum = %v", enum)
+	}
+	for name, kind := range map[string]string{"status": "string", "actor": "string", "grep": "string", "since": "string", "limit": "string", "newest": "boolean", "full": "boolean"} {
+		if property := schema.Properties[name]; property.Type != kind {
+			t.Fatalf("%s type = %q, want %q", name, property.Type, kind)
+		}
+	}
+
+	decode := func(raw string) (core.Request, error) {
+		t.Helper()
+		values := map[string]json.RawMessage{}
+		if err := json.Unmarshal([]byte(raw), &values); err != nil {
+			t.Fatal(err)
+		}
+		request, _, err := decodeMCPRequest(binding, values)
+		return request, err
+	}
+	// No operation: a capture, exactly as before.
+	capture, err := decode(`{"text":"slow tests","severity":"annoyance"}`)
+	if err != nil || capture.Args["subverb"] != "capture" || capture.Args["text"] != "slow tests" || capture.Args["severity"] != "annoyance" {
+		t.Fatalf("default capture = %#v err=%v", capture.Args, err)
+	}
+	if _, err := decode(`{"severity":"annoyance"}`); err == nil || !strings.Contains(err.Error(), `"text" is required`) {
+		t.Fatalf("capture without text err = %v", err)
+	}
+	// A listing argument without operation:"ls" is a capture argument it does
+	// not declare: refused, never silently dropped.
+	if _, err := decode(`{"text":"x","status":"all"}`); err == nil || !strings.Contains(err.Error(), `unknown argument "status"`) {
+		t.Fatalf("capture with status err = %v", err)
+	}
+	list, err := decode(`{"operation":"ls","status":"all","severity_filter":"unset","tags":["infra"],"actor":"opus","grep":"töö","since":"4","limit":"20","newest":true,"full":true}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := map[string]any{"subverb": "ls", "status": "all", "severity_filter": "unset", "tags": []string{"infra"}, "actor": "opus", "grep": "töö", "since": "4", "limit": "20", "newest": true, "full": true}
+	if list.Verb != "rant" || !reflect.DeepEqual(list.Args, wantArgs) {
+		t.Fatalf("ls request = %s %#v\nwant %#v", list.Verb, list.Args, wantArgs)
+	}
+	// ls refuses capture-only arguments; get stays CLI-only.
+	if _, err := decode(`{"operation":"ls","text":"x"}`); err == nil || !strings.Contains(err.Error(), `unknown argument "text"`) {
+		t.Fatalf("ls with text err = %v", err)
+	}
+	if _, err := decode(`{"operation":"get","selector":"RANT-1"}`); err == nil || !strings.Contains(err.Error(), `unknown operation "get"`) {
+		t.Fatalf("get err = %v", err)
 	}
 }
 

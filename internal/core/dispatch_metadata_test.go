@@ -135,7 +135,7 @@ func metadataProbeInputs(name string) []map[string]any {
 		values = cloneMetadataInputs(values, "note", "note")
 		values = cloneMetadataInputs(values, "reviewer", "reviewer")
 		values = cloneMetadataInputs(values, "since", "0")
-		values = cloneMetadataInputs(values, "unreviewed", true)
+		values = cloneMetadataInputs(values, "limit", "10")
 		return []map[string]any{
 			cloneMetadataInputs(values, "subverb", "capture"),
 			cloneMetadataInputs(values, "subverb", "ls"),
@@ -264,8 +264,8 @@ func (metadataProbeStore) CountFindings(string, string) (store.CountResult, erro
 func (metadataProbeStore) AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error) {
 	return store.RantAddResult{Rant: domain.Rant{ID: "RANT-1"}, ID: "RANT-1"}, nil
 }
-func (metadataProbeStore) ListRants(domain.RantListOptions) ([]domain.Rant, error) {
-	return []domain.Rant{}, nil
+func (metadataProbeStore) ListRants(domain.RantListOptions) (store.RantPage, error) {
+	return store.RantPage{Rows: []domain.Rant{}}, nil
 }
 func (metadataProbeStore) GetRant(string) (domain.Rant, error) {
 	return domain.Rant{ID: "RANT-1"}, nil

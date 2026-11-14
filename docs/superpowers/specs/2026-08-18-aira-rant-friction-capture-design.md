@@ -1,5 +1,7 @@
 # RANT — agent friction capture + git-context provenance (design / plan)
 
+**Superseded in part (AIRA-327, 2026-11-14):** `rant ls --unreviewed` was replaced by `--status unreviewed|reviewed|all` (default `unreviewed`), and `rant ls` now returns a paged envelope (`rows`, `total`, `returned`, `truncated`, `next_since`) with compact rows; every `--unreviewed` mention below means that default. `--since <seq>` is unchanged.
+
 **Status:** v5 — APPROVED + operator forks resolved (2026-08-18): hook→skill-only; digest→owner-triggered/on-demand. Ready to build.
 **Milestone:** Phase 5 · rant (task #43). Follows D1–D6 (all merged; master `59596b5`).
 **Loop:** multi-model design → Fable final gate → committed spec → Sol plan-review → Fable plan-gate
@@ -111,9 +113,12 @@ owner's "if appropriate" case); `worktree_id` replaces neither.
   (`head_hash`, `head_ref`, `remote_url`) is stored **verbatim, unvalidated** (the daemon cannot know the
   caller's commit).
 - **CLI:** `aira rant "<text>" [--tag T]… [--severity S] [--ref run:RUN-n|ticket:…]… [--idem KEY]`;
-  `aira rant ls [--by tag|actor] [--unreviewed] [--since <seq>]`; `aira rant get RANT-n`;
+  `aira rant ls [--by tag|actor] [--unreviewed] [--since <seq>]` (superseded by AIRA-327: `--status`
+  replaces `--unreviewed`, unreviewed is the default, and ls returns a paged envelope); `aira rant get RANT-n`;
   `aira rant review RANT-n [--outcome O] [--note "…"] [--resolved-by ticket:X]`.
-- **MCP:** `aira_rant({ text, tags?, severity?, refs?, idempotency_key? })`. Tool description = the only
+- **MCP:** `aira_rant({ text, tags?, severity?, refs?, idempotency_key? })` (AIRA-327 adds an optional
+  `operation`: omitted = this capture; `"ls"` = the paged listing with its ls arguments; get/review/redact
+  stay CLI-only). Tool description = the only
   permitted prompt: *"Ranting welcome: slow tests, linter noise, flaky infra, confusing setup — dump it
   unfiltered; logged for later review, you won't be asked to format it."* Never nagged per-turn.
 - **Loop-closer (Q5 = v1; Sol/Opus-5 converge):** capture returns, **post-commit**, a small deterministic

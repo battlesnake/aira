@@ -194,43 +194,126 @@ func (s *Store) GetRant(id string) (domain.Rant, error) {
 	return s.loadRant(context.Background(), s.db, id)
 }
 
-func (s *Store) ListRants(options domain.RantListOptions) ([]domain.Rant, error) {
-	query := `SELECT id FROM rants WHERE project_id=? AND seq>?`
+// RantPage is one page of a rant listing (AIRA-327). Total counts every rant
+// matching ALL the filters (the cursor included) before the limit, so a page
+// never silently drops rows: Truncated says more exist, and NextSince — set
+// only for an oldest-first page — is the cursor that continues from it.
+type RantPage struct {
+	Rows      []domain.Rant
+	Total     int
+	Truncated bool
+	NextSince *int64
+	// UnsearchedRedacted is set only for a --grep listing: the redacted rants
+	// that match every OTHER filter. Their text was scrubbed, so whether they
+	// matched cannot be established; they are counted here, never as misses.
+	UnsearchedRedacted *int
+}
+
+func (s *Store) ListRants(options domain.RantListOptions) (RantPage, error) {
+	if err := options.Validate(); err != nil {
+		return RantPage{}, err
+	}
+	limit := options.Limit
+	if limit == 0 {
+		limit = domain.DefaultRantListLimit
+	}
+	where := ` FROM rants WHERE project_id=? AND seq>?`
 	args := []any{s.projectID, options.Since}
-	if options.Unreviewed {
-		query += ` AND NOT EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)`
+	switch options.Status {
+	case "", domain.RantStatusUnreviewed:
+		where += ` AND NOT EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)`
+	case domain.RantStatusReviewed:
+		where += ` AND EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)`
+	}
+	switch options.Severity {
+	case "":
+	case domain.RantSeverityUnset:
+		where += ` AND severity=''`
+	default:
+		where += ` AND severity=?`
+		args = append(args, options.Severity)
 	}
 	if options.Tag != "" {
-		query += ` AND EXISTS(SELECT 1 FROM rant_tags rt WHERE rt.project_id=rants.project_id AND rt.rant_id=rants.id AND rt.tag=?)`
+		where += ` AND EXISTS(SELECT 1 FROM rant_tags rt WHERE rt.project_id=rants.project_id AND rt.rant_id=rants.id AND rt.tag=?)`
 		args = append(args, options.Tag)
 	}
-	query += ` ORDER BY seq ASC LIMIT ?`
-	args = append(args, ListLimit)
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, translateDBError(err)
+	if options.Actor != "" {
+		where += ` AND actor=?`
+		args = append(args, options.Actor)
 	}
+	ctx := context.Background()
+	// One read transaction, so the total, the page and every row it loads come
+	// from the same snapshot.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return RantPage{}, translateDBError(err)
+	}
+	defer tx.Rollback()
+	// Every id matching the SQL filters, oldest first. --grep is applied here
+	// in Go rather than with LIKE, whose case folding is ASCII-only: the
+	// match is domain.RantGrepMatches (Unicode simple case folding, literal
+	// text). The total and the page are then cut from one matched list.
+	body := `''`
+	if options.Grep != "" {
+		body = `body`
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id,redacted,`+body+where+` ORDER BY seq ASC`, args...)
+	if err != nil {
+		return RantPage{}, translateDBError(err)
+	}
+	var page RantPage
+	unsearched := 0
 	var ids []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, text string
+		var redacted int
+		if err := rows.Scan(&id, &redacted, &text); err != nil {
 			rows.Close()
-			return nil, err
+			return RantPage{}, err
+		}
+		if options.Grep != "" {
+			if redacted != 0 {
+				unsearched++
+				continue
+			}
+			if !domain.RantGrepMatches(text, options.Grep) {
+				continue
+			}
 		}
 		ids = append(ids, id)
 	}
+	// rows.Next stops on a step error as well as at the end; without
+	// rows.Err the remainder would vanish behind a "complete" short page.
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RantPage{}, translateDBError(err)
+	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return RantPage{}, err
 	}
-	result := make([]domain.Rant, 0, len(ids))
+	if options.Grep != "" {
+		page.UnsearchedRedacted = &unsearched
+	}
+	page.Total = len(ids)
+	if options.Newest {
+		ids = ids[max(0, len(ids)-limit):]
+	} else {
+		ids = ids[:min(limit, len(ids))]
+	}
+	page.Rows = make([]domain.Rant, 0, len(ids))
 	for _, id := range ids {
-		rant, err := s.GetRant(id)
+		rant, err := s.loadRant(ctx, tx, id)
 		if err != nil {
-			return nil, err
+			return RantPage{}, err
 		}
-		result = append(result, rant)
+		page.Rows = append(page.Rows, rant)
 	}
-	return result, nil
+	page.Truncated = page.Total > len(page.Rows)
+	if page.Truncated && !options.Newest && len(page.Rows) > 0 {
+		next := page.Rows[len(page.Rows)-1].Seq
+		page.NextSince = &next
+	}
+	return page, nil
 }
 
 func (s *Store) ReviewRant(ctx context.Context, id string, input domain.RantReviewInput) (RantReviewResult, error) {
