@@ -956,9 +956,8 @@ func mismatchedRuntimeError(paths daemon.Paths, pid int, holderSocket, runtimeDi
 // process's XDG_RUNTIME_DIR differs from the daemon's; or no daemon answers or holds
 // this state's lock while the enabled service serves a different state, because
 // this process's XDG_STATE_HOME or HOME differs from the service's (AIRA-335). It
-// returns nil whenever
-// it cannot establish that, so a daemon that is merely starting or restarting
-// stays a wait. `aira confine` admission dials the socket itself and reconnects
+// returns nil whenever it cannot establish that, so a daemon that is merely
+// starting or restarting stays a wait. `aira confine` admission dials the socket itself and reconnects
 // without a deadline, so without this check such a launch is held forever
 // (AIRA-289b).
 func unreachableDaemonError(paths daemon.Paths, systemctl daemon.SystemctlRun, readFile func(string) ([]byte, error), getenv func(string) string) error {
