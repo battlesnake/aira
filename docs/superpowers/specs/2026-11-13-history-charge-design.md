@@ -32,14 +32,13 @@ What was **cut**, and why:
 
 1. **The three key columns (`key_masked`, `key_first4`, `key_cmd`), the Go `CommandKeys`
    function, the Python/Go parity contract, the committed golden table
-   (`docs/dev/aira-history-charge-keys.golden.json`, 39 cases), its mutation check
-   (`docs/dev/aira-history-charge-key-mutations.py`, 40 mutations), the replay script's
+   (`docs/dev/aira-history-charge-keys.golden.json`), its mutation check
+   (`docs/dev/aira-history-charge-key-mutations.py`), the replay script's
    `--self-test`, and tests T6 (key golden table) and T7 (no key without established inputs).**
    Nothing in 323 reads a key, and every key is a function of two columns the same row stores.
    Freezing the function now meant guessing the level and the masking rules before any
    repo-keyed row existed, and three review rounds kept finding mutations of `keys()` and
-   `unwrap()` that the table did not pin (reported by the reviews as 5, then 8, then 5 more);
-   each fix produced new findings. The key function, its level, its index and its backfill move
+   `unwrap()` that the table did not pin; each fix produced new findings. The key function, its level, its index and its backfill move
    to the first reader ticket (section 10, "Hand-off"). Test numbers are reused: T6 is now the
    repo-identity seam at the launch site, T7 and T8 are the old T8 and T9, and T9 (version skew
    and the re-send) replaces the old T10 protocol-bump pin.
@@ -1076,3 +1075,11 @@ checked in the build review (the code review is the real gate):
 
 Sequencing: build after the v0.42 batch (AIRA-340, the aira top dialogs, the small batch, the
 aitest dispatch work) has merged, so the report-sender files are stable.
+
+Build record (AIRA-323 build, 2026-11-14): amendment 2's two-seam form is kept (`wallNow`,
+`monoNow` with `processEpoch`, `repoIdentity`), because one `now` seam cannot step the wall clock
+without the monotonic one in a test, which T4's clock-step case needs; section 9's sentence
+therefore stands, and T4b pins the production seams. Amendment 7: the cut machinery's counts
+are deleted above, and no count is carried forward. Every mutation named in section 8 and in
+the amendments is listed in `docs/dev/aira-323-mutation-check.py`, which applies each one, runs
+its tests and fails if any survives; the build PR records that script's result.

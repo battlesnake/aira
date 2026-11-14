@@ -14,14 +14,34 @@ import (
 // because the reserve/cap a job was actually granted was persisted NOWHERE — so
 // the over-provisioned direction, this feature's own headline evidence, was
 // unevaluable. Anything outside this set is still refused rather than ignored.
+//
+// AIRA-323 added four OPTIONAL completion facts (wall_ms, wait_ms,
+// started_at_ms, repo) without a protocol bump: a daemon that predates them
+// refuses a frame carrying any of them with E_DAEMON_PROTOCOL before it writes,
+// and the client (runner.ReportPeakSample) then re-sends once without them.
 var confineReportFields = map[string]bool{
 	"signature": true, "peak_rss": true, "oom": true,
 	"kind": true, "budget": true, "budget_basis": true,
+	"wall_ms": true, "wait_ms": true, "started_at_ms": true, "repo": true,
 }
+
+// AIRA-323 bounds. The handler is the ONE layer that validates the four
+// completion facts; the store writes what passed here without re-checking.
+const (
+	// confineReportMaxDurationMS is 366 days in milliseconds: the inclusive
+	// upper bound of wall_ms and wait_ms.
+	confineReportMaxDurationMS = int64(366 * 24 * 60 * 60 * 1000)
+	// started_at_ms is a Unix-millisecond wall reading in
+	// [2000-01-01T00:00:00Z, 2100-01-01T00:00:00Z). It is deliberately NOT
+	// compared with the daemon's clock: a clock step makes a disagreement a true
+	// record of the clocks.
+	confineReportMinStartedAtMS = int64(946_684_800_000)
+	confineReportEndStartedAtMS = int64(4_102_444_800_000)
+)
 
 func (s *Server) confineReport(args map[string]any) core.Response {
 	if len(args) < 2 || len(args) > len(confineReportFields) {
-		return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": confine-report requires signature and oom, plus optional peak_rss, kind, budget and budget_basis"}
+		return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": confine-report requires signature and oom, plus optional peak_rss, kind, budget, budget_basis, wall_ms, wait_ms, started_at_ms and repo"}
 	}
 	for name := range args {
 		if !confineReportFields[name] {
@@ -91,6 +111,33 @@ func (s *Server) confineReport(args map[string]any) core.Response {
 	if basis != "" && store.ResourceBudgetFamily(basis) == "" {
 		return core.Response{Code: CodeProtocol, Error: fmt.Sprintf("%s: confine-report budget_basis %q names no cap:/reserve: family", CodeProtocol, basis)}
 	}
+	// AIRA-323. Refuse, never repair: a present fact that breaks its rule
+	// refuses the whole report (nothing is written), and an absent one is stored
+	// NULL, never 0. No kind gate: the rules are the same for every subject kind.
+	wallMS, refusal := confineReportDuration(args, "wall_ms")
+	if refusal != nil {
+		return *refusal
+	}
+	waitMS, refusal := confineReportDuration(args, "wait_ms")
+	if refusal != nil {
+		return *refusal
+	}
+	var startedAtMS *int64
+	if raw, exists := args["started_at_ms"]; exists {
+		value, valid := exactAdmitInt64(raw)
+		if !valid || value < confineReportMinStartedAtMS || value >= confineReportEndStartedAtMS {
+			return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": confine-report started_at_ms must be an integer Unix-millisecond time in [2000-01-01, 2100-01-01)"}
+		}
+		startedAtMS = &value
+	}
+	repo := ""
+	if raw, exists := args["repo"]; exists {
+		named, valid := raw.(string)
+		if !valid || !validConfineReportRepo(named) {
+			return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": confine-report repo must be \"none\" or 16 lowercase hex digits"}
+		}
+		repo = named
+	}
 	if s.db == nil {
 		return core.Response{Code: CodeUnavailable, Error: CodeUnavailable + ": state database is unavailable"}
 	}
@@ -99,8 +146,41 @@ func (s *Server) confineReport(args map[string]any) core.Response {
 	if err := s.db.RecordConfinePeak(ctx, store.ResourcePeakObservation{
 		Kind: kind, Signature: signature, Peak: peak, OOM: oom,
 		Budget: budget, BudgetBasis: basis, At: time.Now(),
+		WallMS: wallMS, WaitMS: waitMS, StartedAtMS: startedAtMS, Repo: repo,
 	}); err != nil {
 		return core.Response{Code: CodeInternal, Error: CodeInternal + ": record confine peak: " + err.Error()}
 	}
 	return core.Response{OK: true, Code: "OK", Data: map[string]any{"recorded": true}}
+}
+
+// confineReportDuration reads one optional AIRA-323 duration: absent is nil (NULL
+// in the store), present must be an integer in [0, 366 days] in milliseconds. 0
+// is a real measurement (a sub-millisecond interval), never "unknown".
+func confineReportDuration(args map[string]any, name string) (*int64, *core.Response) {
+	raw, exists := args[name]
+	if !exists {
+		return nil, nil
+	}
+	value, valid := exactAdmitInt64(raw)
+	if !valid || value < 0 || value > confineReportMaxDurationMS {
+		return nil, &core.Response{Code: CodeProtocol, Error: fmt.Sprintf("%s: confine-report %s must be an integer number of milliseconds in [0, %d]", CodeProtocol, name, confineReportMaxDurationMS)}
+	}
+	return &value, nil
+}
+
+// validConfineReportRepo is the repo rule: exactly "none" (established: not in
+// any git repository) or exactly 16 lowercase hex digits (runner.RepoIdentity).
+func validConfineReportRepo(repo string) bool {
+	if repo == "none" {
+		return true
+	}
+	if len(repo) != 16 {
+		return false
+	}
+	for _, r := range repo {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }

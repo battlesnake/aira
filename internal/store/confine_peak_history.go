@@ -83,6 +83,11 @@ func ResourceBudgetFamily(basis string) string {
 // absent: the term could not be established for this run. Neither is ever
 // written as a zero standing in for "unknown" — a fabricated zero would make an
 // over-provisioned subject look infinitely over-provisioned.
+//
+// WallMS, WaitMS, StartedAtMS and Repo are AIRA-323's four raw completion facts
+// (how long the job ran, how long it waited for admission, when it started, and
+// which repository it ran in). Nil or "" means the fact was not established and
+// is stored as NULL, never as 0 or "": a 0 duration is a real measurement.
 type ResourcePeakObservation struct {
 	Kind        ResourcePeakKind
 	Signature   string
@@ -91,11 +96,21 @@ type ResourcePeakObservation struct {
 	Budget      *int64
 	BudgetBasis string
 	At          time.Time
+	WallMS      *int64
+	WaitMS      *int64
+	StartedAtMS *int64
+	Repo        string
 }
 
 // RecordConfinePeak appends one project-less machine-wide observation and
 // retains only the newest observations for that exact (kind, signature).
 // A nil peak is durable evidence that a run happened but capture was unknown.
+//
+// AIRA-323 precondition: WallMS, WaitMS, StartedAtMS and Repo have already
+// passed the confine-report handler's rules (daemon.confineReport, their one
+// owner and this writer's only production caller). The writer stores them as
+// given -- nil or "" as NULL -- and deliberately does not re-check or repair
+// them; the peak/budget repairs below are pre-existing and are not a precedent.
 func (db *DB) RecordConfinePeak(ctx context.Context, observation ResourcePeakObservation) error {
 	if db == nil || db.db == nil {
 		return errors.New("E_DAEMON_UNAVAILABLE: state database is unavailable")
@@ -146,9 +161,15 @@ func (db *DB) RecordConfinePeak(ctx context.Context, observation ResourcePeakObs
 	if observation.OOM {
 		oomValue = 1
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO confine_peak_history(kind,signature,peak_rss,oom,at,budget,budget_basis) VALUES(?,?,?,?,?,?,?)`,
+	var repoValue any
+	if observation.Repo != "" {
+		repoValue = observation.Repo
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO confine_peak_history(kind,signature,peak_rss,oom,at,budget,budget_basis,wall_ms,wait_ms,started_at_ms,repo) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 		string(observation.Kind), observation.Signature, peakValue, oomValue,
-		observation.At.UTC().Format(time.RFC3339Nano), budgetValue, basisValue); err != nil {
+		observation.At.UTC().Format(time.RFC3339Nano), budgetValue, basisValue,
+		nullableInt64(observation.WallMS), nullableInt64(observation.WaitMS),
+		nullableInt64(observation.StartedAtMS), repoValue); err != nil {
 		return translateDBError(err)
 	}
 	// Retention is per (kind, signature), not per signature: an aitest pool and a
@@ -161,6 +182,15 @@ WHERE kind=? AND signature=? AND rowid NOT IN (
 		return translateDBError(err)
 	}
 	return translateDBError(tx.Commit())
+}
+
+// nullableInt64 maps an unestablished (nil) measurement to SQL NULL. A non-nil
+// pointer is stored as its value, 0 included: 0 is a real measurement.
+func nullableInt64(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 // ConfinePeakHistory returns aggregate confine observations for one exact

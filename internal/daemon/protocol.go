@@ -189,6 +189,17 @@ import (
 // carrying `--priority high` keeps working until the daemon is restarted (queue
 // order is never a safety property; contrast `exclusive`, which refuses). An old
 // client never sends the field, and absent means normal.
+//
+// AIRA-323 added four optional fields to the confine-report REQUEST (`wall_ms`,
+// `wait_ms`, `started_at_ms`, `repo`: a finished job's run time, admission wait,
+// start time and repository identity) WITHOUT a bump, following AIRA-340. A daemon
+// that predates them refuses such a frame with E_DAEMON_PROTOCOL from its count
+// guard or its field allowlist, before it writes anything; the client
+// (runner.ReportPeakSample) answers that code by re-sending the report ONCE
+// without the four fields, so the peak/OOM/budget sample is kept and only the four
+// facts of that run are lost until the daemon restarts. An old client never sends
+// them, and absent is stored NULL. Admission frames are unchanged, so a bump would
+// only add refusals at the cutover.
 const (
 	ProtocolVersion = 15
 	MaxFrameBytes   = 16 << 20
