@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-195","project":"aira","title":"Killing an outer confine scope orphans self-confined children in sibling scopes -- no window to react, no listing signal to find them afterwards","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","reaper","safety"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-195","project":"aira","title":"Killing an outer confine scope orphans self-confined children in sibling scopes -- no window to react, no listing signal to find them afterwards","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":["confine","reaper","safety"],"hold":false,"relations":[]}
 ---
 
 Peer report (fastest-ee-4b, 2026-09-09), derived from [[AIRA-187]]'s own
@@ -103,3 +103,5 @@ as the argument for sequencing this ticket first if only one is picked
 up soon.
 
 2026-10-12: the listing half shipped in v0.36 (`confine --list` / `aira top` show LIVE=unsupervised for a scope whose supervisor is gone). The remainder (reaper reach, group kill, AIRA-194) is NOT done; ticket stays open.
+
+Plan 2026-11-14: retire after the accepted gap is recorded in the skill text (internal/core/skill.go has no sentence about it today): 'killing an outer job does not reach scopes its children confined themselves; find them in `confine --list` as LIVE=unsupervised and kill them by scope id'. The sentence ships in the v0.42 small batch; then this ticket is retired (an automatic reaper would be judgement, not a primitive).

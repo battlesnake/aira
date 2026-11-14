@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-226","project":"aira","title":"Admission surfaces no warning when a requested memory reserve greatly exceeds the signature's peak-RSS history (14x over-reserve -\u003e 30-min saturation wait)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","ux"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-226","project":"aira","title":"Admission surfaces no warning when a requested memory reserve greatly exceeds the signature's peak-RSS history (14x over-reserve -> 30-min saturation wait)","status":"retired","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","ux"],"hold":false,"relations":[]}
 ---
 From RANT-38 (dogfood, 2026-09-09), measured incident.
 
@@ -12,3 +12,5 @@ ASK: on admission (especially on a saturation-wait), when the requested reserve 
 DESIGN PRINCIPLE captured here (load-bearing): NEVER wire a cloud-offload / escalation trigger to admission pressure. The demand for cloud offload in this incident was MANUFACTURED by a sizing gap, not a real local-compute shortage; a naive "offload when admission saturates" trigger would have spent money to work around a 14x over-reservation. This belongs in the cloud-command-family proposal's non-goals when the owner adjudicates it (PR #127).
 
 refs: RANT-38. Relates to AIRA-24 (saturation-wait UX, done) and AIRA-25 (class-split, done) — both adjacent but neither delivered the admission-time over-reserve hint.
+
+Closed 2026-11-14 (owner approved the retirement list in the backlog plan, docs/plans/2026-11-14-backlog-plan.md). The load-bearing design principle was copied into the non-goals of docs/proposals/2026-09-09-aira-cloud-command-family-proposal.md section 7. The warning itself is answered by the confine exit hint (AIRA-310/311), `--resize` (AIRA-312) and the pinned-reserve charge discount (AIRA-324).

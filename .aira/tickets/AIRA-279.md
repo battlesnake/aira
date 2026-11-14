@@ -25,3 +25,5 @@ Today CPU "slots" exist only for aitest (`@aira_cpu(N)`: admission accounting fo
 - Open for the plan: total slot budget (NumCPU minus reserve?), accounting only vs enforcement (`cpu.max`/affinity were deliberately excluded for `@aira_cpu`), wire/proto bump, `aira top` display, honesty when core count is unreadable, ci-shim behaviour, relation to `--exclusive`.
 
 Held: backlog capture only. Do not build until the owner clears the hold. Needs a plan + challenge pass first (greenfield minimum: is accounting-only enough?). Prior art: AIRA-268 (`--vram` as the third dimension), AIRA-260 / `@aira_cpu`.
+
+Plan 2026-11-14: RANT-60 (flavour DEV-5b, 2026-10-26) is further evidence: load average 38-80 on 16 cores while 8-14 confine jobs were queued on memory, and a `make -k -j` gate booked 6 slots. Interim answer shipping in v0.42: a skill sentence telling agents to set CARGO_BUILD_JOBS / `make -j` explicitly. The `--cpus N` flag stays held. Option raised by the rant: an automatic CPU estimate from each command's cpu-time/wall-time history.
