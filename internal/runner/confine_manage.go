@@ -302,9 +302,23 @@ type ConfineRecord struct {
 	// Queued rows are already in evaluation order, so a pushed row is listed
 	// first; the flag says WHY, since a pushed head freezes the jobs behind it.
 	// Never set on a live (Scopes) row. Additive: an old client ignores it.
-	Pushed            bool     `json:"pushed,omitempty"`
+	Pushed bool `json:"pushed,omitempty"`
+	// Priority is a QUEUED row's launch priority (AIRA-340): ConfinePriorityHigh
+	// for a job launched with `aira confine --priority high`, ConfinePriorityNormal
+	// otherwise. Every queued row from a daemon that knows priority carries it, so
+	// misuse of `high` is observable; empty on a live (Scopes) row, where queue
+	// order no longer means anything, and on a row from an older daemon.
+	Priority          string   `json:"priority,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
 }
+
+// The `aira confine --priority` vocabulary (AIRA-340), spelled once: the CLI
+// accepts exactly these, the daemon's admit field takes the same words, and a
+// queued row reports one of them.
+const (
+	ConfinePriorityHigh   = "high"
+	ConfinePriorityNormal = "normal"
+)
 
 // ConfineReserveFacet is the UnevaluatedFields name for an unestablished
 // per-scope reserve, spelled once so the producer and every consumer cannot

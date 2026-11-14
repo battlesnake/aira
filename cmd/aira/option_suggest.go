@@ -33,6 +33,7 @@ var (
 		"slice", "name", "owner",
 		"memory-reserve", "memory-max", "memory-high",
 		"vram",
+		"priority",
 		"timeout", "cpu-timeout",
 		"summary-file", "summary-tree-hash",
 	}

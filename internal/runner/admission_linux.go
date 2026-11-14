@@ -441,6 +441,15 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	if req.ParentScopeID != "" {
 		frame.Request.Args["parent_scope_id"] = req.ParentScopeID
 	}
+	// AIRA-340. Sent ONLY when high, so a normal launch's wire is byte-identical to
+	// before and keeps working against an older daemon. This frame is rebuilt from
+	// req on every exchange, so a reconnect after a daemon restart re-sends it. An
+	// older daemon refuses the unknown field with E_DAEMON_PROTOCOL, which lands in
+	// the terminal refusal below: the launch is refused loudly, never run at a
+	// priority it did not get.
+	if req.HighPriority {
+		frame.Request.Args["priority"] = ConfinePriorityHigh
+	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return fail()
 	}
@@ -631,6 +640,12 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		}
 		if message == "" {
 			message = "the daemon refused admission"
+		}
+		// AIRA-340. The one refusal a NEW client meets against an OLDER daemon:
+		// it does not know the `priority` field. Name the fix beside the daemon's
+		// own words; the launch is still refused, never retried at normal.
+		if req.HighPriority && response.Code == "E_DAEMON_PROTOCOL" {
+			message += " (--priority high needs an admission daemon that knows it: run `systemctl --user restart aira-daemon.service` after installing this aira, or drop --priority)"
 		}
 		return admissionResult{state: "refused", waitedMS: time.Since(admissionStarted).Milliseconds(), reserve: effectiveReserve, basis: "reject:daemon-refused"}, false,
 			fmt.Errorf("%s; refusing to launch ungoverned", message)

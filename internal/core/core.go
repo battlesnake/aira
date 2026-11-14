@@ -1965,7 +1965,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--timeout D] [--cpu-timeout D] [--summary-file PATH] [--summary-tree-hash H] [--delegate-ram] [--exclusive] [--require-admission] [--fail-fast] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--priority high|normal] [--timeout D] [--cpu-timeout D] [--summary-file PATH] [--summary-tree-hash H] [--delegate-ram] [--exclusive] [--require-admission] [--fail-fast] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1974,6 +1974,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("vram", false, false, "GPU VRAM the job declares it needs (1024-based; e.g. 4G). The daemon gates admission on real free VRAM (a third resource dimension beside RAM and CPU); no GPU limit is written. Absent = not a GPU job (ungated). NVIDIA only"),
+			// AIRA-340. The description IS the agent guidance (ConfinePriorityGuidance),
+			// so help, the skill and the MCP instructions cannot drift apart.
+			stringSpec("priority", false, false, ConfinePriorityGuidance, "high", "normal"),
 			// AIRA-138. The two timeout-suffixed options are disambiguated HERE, in the
 			// generated help, because --timeout reads as an overall deadline and is not
 			// one. Each says where its clock starts. (The admission WAIT was once bounded
@@ -1999,6 +2002,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_max")
 			_ = stringArg(args, "memory_high")
 			_ = stringArg(args, "vram")
+			_ = stringArg(args, "priority")
 			_ = stringArg(args, "timeout")
 			_ = stringArg(args, "cpu_timeout")
 			_ = boolArg(args, "delegate_ram")
