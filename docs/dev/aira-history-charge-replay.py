@@ -16,19 +16,6 @@ predicted only from jobs that finished EARLIER. Two parts:
           against history and the combination, on --memory-reserve pins only.
 
 Run (confined, ~1G):  aira confine --memory-reserve 1G -- python3 -I docs/dev/aira-history-charge-replay.py
-Key self-test (no database; validates the committed golden table's inputs against the wire
-rules, checks keys() against it, and checks the repo-split coverage counterexample; the Go key
-function must reproduce the same table, docs/dev/aira-history-charge-keys.golden.json):
-                      python3 -I docs/dev/aira-history-charge-replay.py --self-test
-Mutation check of the table (each named mutation of keys() must turn --self-test red):
-                      python3 -I docs/dev/aira-history-charge-key-mutations.py
-
-Rev 3 (AIRA-323): the key carries the repo identity the client sends (`repo` column: exactly
-16 lowercase hex digits, or "none" outside any git repository). Rows written before AIRA-323 have no repo; the
-replay keys them under the legacy placeholder "?", which groups them exactly as rev 2 did (every
-legacy key is "?" + US + the rev-2 key, by construction), so the rev-2 grouping is unchanged;
-printed numbers move only as the store grows.
-The Go build never writes a key for a row without a repo (it stores NULL); "?" is replay-only.
 
 Measured 2026-11-13/14 on the live box. LIMITS: the table holds job-END rows only (no
 start time or duration), so (a) real clustering in time is NOT captured -- jobs are
@@ -37,27 +24,21 @@ is predicted from rows that finished while it was still running (optimistic, wor
 same-command bursts); (c) store retention is 20 rows per EXACT signature, so a coarse key
 sees more history here than the build's window query would. A peak is the cgroup's
 memory.peak. "Above" is not an OOM: the pin stays the hard cap. After AIRA-323, replay by
-started_at_ms and weight by duration.
+started_at and weight by duration.
 """
 import collections
-import json
 import os
 import random
 import re
 import sqlite3
-import sys
 
 DB = os.path.expanduser("~/.local/state/aira/state.db")
 RECENT = "2026-10-20"
-GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aira-history-charge-keys.golden.json")
-c = None  # opened in main, so --self-test needs no database
-US = "\x1f"  # separates the repo identity from the argv part of a key
-LEGACY_REPO = "?"  # replay-only: a row written before AIRA-323 (repo unknown)
+c = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+
 
 
 def base(t):
-    # The text after the last "/" ("" for a trailing slash). Not Go's filepath.Base, which
-    # strips a trailing slash; a golden case pins the difference.
     return t.rsplit("/", 1)[-1]
 
 
@@ -102,23 +83,18 @@ def unwrap(tk):
     return tk[i:] or tk
 
 
-def keys(sig, repo=None):
-    """The command keys of one confine row. N1..N3 are the three levels the build stores
-    (key_masked, key_first4, key_cmd); N0 is the exact signature (today's estimator subject,
-    argv-only until AIRA-321) and N4 the bare command name, both replay-only. `repo` is the
-    row's repo identity, or None for a legacy row (keyed under LEGACY_REPO)."""
+def keys(sig):
     tk = sig.split("\x00")
     u = unwrap(tk)
     a0 = base(u[0])
     rest = [mask(t) for t in u[1:]]
     pos = [t for t in rest if not t.startswith("-")]
-    r = (LEGACY_REPO if repo is None else repo) + US
     return {
         "N0_exact": sig,
-        "N1_masked_all": r + a0 + "|" + " ".join(rest[:14]),
-        "N2_first4": r + a0 + "|" + " ".join(rest[:3]),
-        "N3_cmd+sub": r + a0 + "|" + (pos[0] if pos else ""),
-        "N4_cmd": r + a0,
+        "N1_masked_all": a0 + "|" + " ".join(rest[:14]),
+        "N2_first4": a0 + "|" + " ".join(rest[:3]),
+        "N3_cmd+sub": a0 + "|" + (pos[0] if pos else ""),
+        "N4_cmd": a0,
     }
 
 
@@ -143,12 +119,8 @@ CHAINS = {
 }
 # OOM rows are INCLUDED: a key with any OOM in its last 20 rows is vetoed (charged its pin), as the
 # spec requires. Only clean rows (oom=0, peak and budget known) are scored.
-def history_sql():
-    """Rows in end order. `repo` is read when the column exists (AIRA-323), else NULL."""
-    cols = {r[1] for r in c.execute("pragma table_info(confine_peak_history)")}
-    repo = "repo" if "repo" in cols else "NULL"
-    return ("select signature,peak_rss,budget,budget_basis,oom,at,%s from confine_peak_history "
-            "where kind='confine' order by at,rowid" % repo)
+SQL = ("select signature,peak_rss,budget,budget_basis,oom,at from confine_peak_history "
+       "where kind='confine' order by at,rowid")
 
 
 def push(hist, ks, peak, oom):
@@ -172,8 +144,8 @@ def part1():
     hist = {l: collections.defaultdict(list) for l in LV}
     res = collections.defaultdict(list)
     tot = collections.Counter()
-    for sig, peak, bud, bb, oom, _at, repo in c.execute(history_sql()):
-        ks = keys(sig, repo)
+    for sig, peak, bud, bb, oom, _at in c.execute(SQL):
+        ks = keys(sig)
         scored = peak is not None and bud and not oom
         if scored:
             cls = "pinned" if "operator" in bb else "auto"
@@ -193,8 +165,8 @@ def part1():
 def part2():
     hist = {l: collections.defaultdict(list) for l in LV}
     out = collections.defaultdict(list)
-    for sig, peak, bud, bb, oom, at, repo in c.execute(history_sql()):
-        ks = keys(sig, repo)
+    for sig, peak, bud, bb, oom, at in c.execute(SQL):
+        ks = keys(sig)
         scored = peak is not None and bud and not oom
         cls = "pinned" if scored and "operator" in bb else "auto"
         if scored and at >= RECENT:
@@ -246,8 +218,8 @@ def part3():
     """Challenge row: flat discount vs history, --memory-reserve pins only."""
     hist = {l: collections.defaultdict(list) for l in LV}
     rows = []
-    for sig, peak, bud, bb, oom, at, repo in c.execute(history_sql()):
-        ks = keys(sig, repo)
+    for sig, peak, bud, bb, oom, at in c.execute(SQL):
+        ks = keys(sig)
         scored = peak is not None and bud and not oom
         if scored and at >= RECENT and "operator:--memory-reserve" in bb:
             pred = None
@@ -285,91 +257,7 @@ def part3():
         stats("min(%.1f x pin, history)" % f, lambda b, pr, f=f: min(b * f, pr) if pr else b * f)
 
 
-REPO_RE = re.compile(r"[0-9a-f]{16}|none")  # the wire rule for `repo` (spec 5.1.2)
-WANT_KEYS = {"key_masked", "key_first4", "key_cmd"}
-
-
-def fixture_errors(golden):
-    """Every way the golden table's INPUTS break the wire contract; empty when the table is valid.
-    A case the real handler would refuse cannot be reproduced through it (spec T1), so it must
-    not be in the table."""
-    errs = []
-    cases = golden.get("cases") if isinstance(golden, dict) else None
-    if not isinstance(cases, list) or not cases:
-        return ["no cases"]
-    names = set()
-    for i, case in enumerate(cases):
-        name = case.get("name") if isinstance(case, dict) else None
-        tag = "case %d (%r)" % (i, name)
-        if not isinstance(case, dict) or set(case) != {"name", "argv", "repo", "want"}:
-            errs.append(tag + ": fields must be exactly name, argv, repo, want")
-            continue
-        if not isinstance(name, str) or not name or name in names:
-            errs.append(tag + ": name must be a non-empty unique string")
-        names.add(name)
-        argv = case["argv"]
-        if (not isinstance(argv, list) or not argv
-                or not all(isinstance(t, str) and t and "\x00" not in t for t in argv)):
-            errs.append(tag + ": argv must be a non-empty list of non-empty strings without NUL")
-        repo = case["repo"]
-        if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
-            errs.append(tag + ": repo %r is not 16 lowercase hex digits or none" % (repo,))
-        want = case["want"]
-        if not isinstance(want, dict) or set(want) != WANT_KEYS or not all(isinstance(v, str) for v in want.values()):
-            errs.append(tag + ": want must hold exactly key_masked, key_first4, key_cmd as strings")
-    return errs
-
-
-def coverage_counterexample():
-    """Spec section 2: splitting keys by repo does NOT only shrink coverage. One OOM by repo A
-    then three clean runs by repo B: the merged (argv-only) window is vetoed by the OOM, the
-    repo-B window is usable. Returns an error string, or None when the example holds."""
-    sig = "./runall.sh"
-    rows = [("aaaaaaaaaaaaaaaa", 6 << 30, True)] + [("bbbbbbbbbbbbbbbb", 2 << 30, False)] * 3
-    merged, split = collections.defaultdict(list), collections.defaultdict(list)
-    for repo, peak, oom in rows:
-        merged[keys(sig)["N3_cmd+sub"]].append((peak, oom))
-        split[keys(sig, repo)["N3_cmd+sub"]].append((peak, oom))
-    if usable(merged[keys(sig)["N3_cmd+sub"]]) is not None:
-        return "merged history should be vetoed by repo A's OOM"
-    if usable(split[keys(sig, "bbbbbbbbbbbbbbbb")["N3_cmd+sub"]]) is None:
-        return "repo B's split history should be usable"
-    return None
-
-
-def self_test():
-    """Fixture validation, keys() against the committed golden table, and the coverage
-    counterexample; exit status 0 only if all hold."""
-    with open(GOLDEN) as f:
-        golden = json.load(f)
-    errs = fixture_errors(golden)
-    for e in errs:
-        print("INVALID FIXTURE " + e)
-    if errs:
-        print("self-test: %d invalid fixture inputs" % len(errs))
-        return 1
-    bad = 0
-    for case in golden["cases"]:
-        sig = "\x00".join(case["argv"])
-        k = keys(sig, case["repo"])
-        got = {"key_masked": k["N1_masked_all"], "key_first4": k["N2_first4"], "key_cmd": k["N3_cmd+sub"]}
-        if got != case["want"]:
-            bad += 1
-            print("MISMATCH %s: got %r want %r" % (case["name"], got, case["want"]))
-    ce = coverage_counterexample()
-    if ce:
-        print("COUNTEREXAMPLE FAILED: " + ce)
-    print("self-test: %d cases, %d mismatches, coverage counterexample %s" % (
-        len(golden["cases"]), bad, "FAILED" if ce else "holds"))
-    return 1 if bad or ce else 0
-
-
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--self-test"]:
-        sys.exit(self_test())
-    if sys.argv[1:]:
-        sys.exit("usage: aira-history-charge-replay.py [--self-test]")
-    c = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
     part1()
     part2()
     part3()
