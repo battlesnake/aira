@@ -428,21 +428,114 @@ func TestPaletteRefusalClaimsNoRollback(t *testing.T) {
 }
 
 // verifies: AIRA-342 — an applied request of any verb other than the two `aira
-// top` row actions is ONE sentence; its reply (a ticket record and event
-// metadata, for set) is in Details only.
+// top` row actions is ONE sentence naming what it was about and what it sent
+// (set's field and value; a create's new id and its arguments); its reply (a
+// ticket record and event metadata) is in Details only.
 func TestPaletteAppliedRecordIsASentence(t *testing.T) {
-	request := core.Request{Verb: "set", Args: map[string]any{"selector": "AIRA-1", "field": "status", "value": "done"}}
-	data := json.RawMessage(`{"record":{"id":"AIRA-1","title":"a ticket","status":"done"},"event":{"seq":7,"actor":"me"}}`)
-	result := classifyPaletteDispatch(request, paletteDispatchAttempt{Response: core.Response{OK: true, Code: "OK", RawData: data}, Send: paletteSendMayHaveBeenSent})
-	if want := "APPLIED — set AIRA-1 succeeded. Press d to see what the daemon returned."; result.Text != want {
+	applied := func(request core.Request, data json.RawMessage) paletteResult {
+		return classifyPaletteDispatch(request, paletteDispatchAttempt{Response: core.Response{OK: true, Code: "OK", RawData: data}, Send: paletteSendMayHaveBeenSent})
+	}
+	set := core.Request{Verb: "set", Args: map[string]any{"selector": "AIRA-1", "field": "status", "value": "done"}}
+	result := applied(set, json.RawMessage(`{"record":{"id":"AIRA-1","title":"a ticket","status":"done"},"event":{"seq":7,"actor":"me"}}`))
+	if want := "APPLIED — set AIRA-1 succeeded (status = done). Press d to see what the daemon returned."; result.Text != want {
 		t.Fatalf("text = %q, want %q", result.Text, want)
 	}
 	if !strings.Contains(result.Details, `"title": "a ticket"`) {
 		t.Fatalf("details = %q, want the reply", result.Details)
 	}
-	empty := classifyPaletteDispatch(request, paletteDispatchAttempt{Response: core.Response{OK: true, Code: "OK"}, Send: paletteSendMayHaveBeenSent})
-	if empty.Text != "APPLIED — set AIRA-1 succeeded." || empty.Details != "" {
-		t.Fatalf("an empty reply = %+v, want the bare sentence and no details", empty)
+	if empty := applied(set, nil); empty.Text != "APPLIED — set AIRA-1 succeeded (status = done)." || empty.Details != "" {
+		t.Fatalf("an empty reply = %+v, want the sentence and no details", empty)
+	}
+
+	create := core.Request{Verb: "create", Args: map[string]any{"title": "Fix the  dialog\nfocus", "kind": "feature", "labels": []any{"ui", "top"}, "hold": true}}
+	result = applied(create, json.RawMessage(`{"id":"AIRA-123","path":".aira/tickets/AIRA-123.md","ticket":{"id":"AIRA-123"}}`))
+	if want := `APPLIED — create succeeded, id AIRA-123 (hold = true, kind = feature, labels = "ui,top", title = "Fix the dialog focus"). Press d to see what the daemon returned.`; result.Text != want {
+		t.Fatalf("text = %q, want %q", result.Text, want)
+	}
+	long := core.Request{Verb: "create", Args: map[string]any{"title": strings.Repeat("x", 100)}}
+	if text := applied(long, nil).Text; !strings.Contains(text, `title = `+strings.Repeat("x", requestValueRunes-1)+`…).`) {
+		t.Fatalf("a long value is not cut to %d runes: %q", requestValueRunes, text)
+	}
+}
+
+// verifies: AIRA-342 — the dialog text views show text verbatim: they parse no
+// style tags, so a bracketed job name, an array and a payload's last line read
+// exactly as sent (an escape would show as "[1,2[]" and push the tail out).
+func TestDialogTextKeepsBracketsVerbatim(t *testing.T) {
+	runtime, screen, keys := startTopDialogRuntime(t, &topDialogDispatcher{}, 100, 32)
+	body := "APPLIED — build[arm64] got [1,2] and [x]."
+	details := `["a","b"]` + "\n" + `{"ids":[1,2]} [tail]`
+	onUIDraw(t, runtime, func() struct{} {
+		runtime.showPaletteResult(paletteResult{Outcome: paletteApplied, Text: body, Details: details})
+		return struct{}{}
+	})
+	text := waitForSimulationText(t, runtime, screen, "Esc closes")
+	if !strings.Contains(text, body) {
+		t.Fatalf("the body is not shown verbatim (want %q):\n%s", body, text)
+	}
+	keys.press(t, runeKey('d'))
+	text = simulationTextOnUI(t, runtime, screen)
+	for _, want := range []string{`["a","b"]`, `{"ids":[1,2]} [tail]`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the details do not show %q verbatim:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "[]") {
+		t.Fatalf("an escape is on screen:\n%s", text)
+	}
+}
+
+// verifies: AIRA-342 item 4 — a dialog narrower than its buttons side by side
+// stacks them, so the focused one keeps its whole ▶ label ◀ and reverse video,
+// and the key hint wraps whole keys onto further rows, so every key the dialog
+// takes (and the scroll keys when text is cut off) stays on screen.
+func TestDialogNarrowKeepsFocusAndKeys(t *testing.T) {
+	for _, width := range []int{28, 32, 40, 60} {
+		t.Run(fmt.Sprint(width), func(t *testing.T) {
+			dispatcher := &topDialogDispatcher{}
+			runtime, screen, keys := startTopDialogRuntime(t, dispatcher, 100, 32)
+			openResizeConfirmation(t, runtime, screen, keys, "2G")
+			resizeBoardScreen(t, runtime, screen, width, 24)
+			text := simulationTextOnUI(t, runtime, screen)
+			for _, want := range []string{"▶ Cancel ◀", "Confirm", "Tab/←→ move", "Enter presses ▶", "Esc cancels", "d details"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("%q is not on the %d-column screen:\n%s", want, width, text)
+				}
+			}
+			if strings.Contains(text, "PgUp") && !strings.Contains(text, "PgUp/PgDn scroll") {
+				t.Fatalf("the scroll key is cut:\n%s", text)
+			}
+			assertFocusedButton(t, runtime, screen, "Cancel", "Confirm", "narrow, initial")
+			keys.press(t, specialKey(tcell.KeyLeft))
+			assertFocusedButton(t, runtime, screen, "Confirm", "Cancel", "narrow, after Left")
+			if text = simulationTextOnUI(t, runtime, screen); !strings.Contains(text, "▶ Confirm ◀") {
+				t.Fatalf("the focused Confirm is not whole:\n%s", text)
+			}
+			keys.press(t, specialKey(tcell.KeyEnter))
+			testdeadline.Eventually(t, time.Second, func() bool { return len(dispatcher.writes()) == 1 }, "Enter on the stacked Confirm sent nothing")
+		})
+	}
+}
+
+// verifies: AIRA-342 — the remedy for a resize refused because the job's live
+// use could not be read depends on why: ci-shim mode can never read it (no
+// retry offered), a missing scope or a failed read may clear on a retry.
+func TestUsageUnevaluatedRemedyFollowsTheCause(t *testing.T) {
+	code := runner.CodeConfineResizeUsageUnevaluated
+	refusal := func(reason string) string {
+		return rejectedResult("", code, code+": the live memory use of "+dialogTestJob+" could not be established, so no floor exists to check the new reserve against: "+reason).Text
+	}
+	shim := refusal(runner.ConfineUsageReasonShim)
+	if !strings.Contains(shim, "not available in this mode") || strings.Contains(shim, "try again") {
+		t.Fatalf("the ci-shim remedy = %q, want unavailable and no retry", shim)
+	}
+	for _, reason := range []string{runner.ConfineUsageReasonNoScope, "the job's scope memory.current could not be read or parsed"} {
+		if text := refusal(reason); !strings.Contains(text, "try again in a moment") || strings.Contains(text, "not available") {
+			t.Fatalf("the remedy for %q = %q, want a retry", reason, text)
+		}
+	}
+	if text := refusal(runner.ConfineUsageReasonNoScope); !strings.Contains(text, "refresh (r)") {
+		t.Fatalf("the missing-scope remedy = %q, want refresh", text)
 	}
 }
 

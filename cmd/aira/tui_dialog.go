@@ -23,17 +23,20 @@ import (
 //     and the hint says so;
 //   - buttons whose focus reads without colour: the focused one is reverse video
 //     and bold AND carries a ▶ ◀ marker, the others are dim and unmarked; Tab,
-//     Shift-Tab, Left and Right move between them.
+//     Shift-Tab, Left and Right move between them; on a dialog too narrow for
+//     them side by side they stack, one per row, and the key hint wraps whole
+//     keys onto further rows, so neither the focus marker nor a key is cut.
 //
 // Nothing here decides what a dialog does: Enter, Esc and the safe default focus
 // stay with the callers (and with the runtime's application-level capture).
 
 const (
-	// The hints fit one row of the narrowest dialog an 80-column terminal gets.
-	dialogHintButtons = "Tab/←→ move · Enter presses ▶ · Esc cancels"
-	dialogHintResult  = "Esc closes"
-	dialogHintDetails = " · d details"
-	dialogHintScroll  = " · PgUp/PgDn scroll"
+	// The key hint is built from these parts. Each part is one key and what it
+	// does and is never split: a dialog too narrow for the hint on one row puts
+	// whole parts on further rows (dialogHintLines).
+	dialogHintDetails = "d details"
+	dialogHintScroll  = "PgUp/PgDn scroll"
+	dialogHintJoin    = " · "
 	// dialogDetailsHeader heads the open details panel.
 	dialogDetailsHeader = "Details (d hides):\n"
 
@@ -45,6 +48,11 @@ const (
 )
 
 var (
+	// dialogHintButtons and dialogHintResult lead the hint of a dialog with
+	// buttons and of a result.
+	dialogHintButtons = []string{"Tab/←→ move", "Enter presses ▶", "Esc cancels"}
+	dialogHintResult  = []string{"Esc closes"}
+
 	// dialogButtonFocused is the focused button: reverse video plus bold over the
 	// dialog's own colours. Neither attribute depends on a colour, so it survives
 	// 8/16-colour terminals and NO_COLOR (tcell drops colours there, never
@@ -156,19 +164,22 @@ type dialogSpec struct {
 // dialogView is a built dialog: the frame to add as a page, the primitive to
 // focus first, and the details toggle's state.
 type dialogView struct {
-	frame       *dialogFrame
-	root        *tview.Flex
-	body        *tview.TextView
-	details     *tview.TextView
-	hint        *tview.TextView
-	form        *tview.Form
+	frame   *dialogFrame
+	root    *tview.Flex
+	body    *tview.TextView
+	details *tview.TextView
+	hint    *tview.TextView
+	form    *tview.Form
+	// formBox draws form, stacking its buttons when the dialog is too narrow
+	// for them side by side; nil without a form.
+	formBox     *dialogFormBox
 	title       string
 	bodyText    string
 	detailsText string
 	detailsOpen bool
-	// baseHint is the key hint before the scroll suffix, which size adds only
-	// while something is cut off.
-	baseHint string
+	// baseHint is the key hint's parts before the scroll part, which size adds
+	// only while something is cut off.
+	baseHint []string
 	focus    tview.Primitive
 }
 
@@ -177,7 +188,9 @@ func newDialog(spec dialogSpec, focusIsTextField func() bool) *dialogView {
 		form: spec.Form, title: spec.Title,
 		bodyText: spec.Body, detailsText: spec.Details,
 	}
-	view.body = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetScrollable(true).SetText(tview.Escape(spec.Body))
+	// Neither text view parses style tags (dynamic colours are off), so the text
+	// is set verbatim: escaping it would show the escape ("[1,2[]").
+	view.body = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetScrollable(true).SetText(spec.Body)
 	view.details = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetScrollable(true)
 	view.details.SetTextColor(tview.Styles.SecondaryTextColor)
 	hint := dialogHintResult
@@ -185,16 +198,17 @@ func newDialog(spec dialogSpec, focusIsTextField func() bool) *dialogView {
 		hint = dialogHintButtons
 	}
 	if spec.Details != "" {
-		hint += dialogHintDetails
+		hint = append(append([]string(nil), hint...), dialogHintDetails)
 	}
 	view.baseHint = hint
-	view.hint = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetText(hint).SetTextStyle(tcell.StyleDefault.Dim(true))
+	view.hint = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetText(strings.Join(hint, dialogHintJoin)).SetTextStyle(tcell.StyleDefault.Dim(true))
 	view.root = tview.NewFlex().SetDirection(tview.FlexRow)
 	view.root.SetBorder(true).SetTitle(" "+strings.TrimSpace(spec.Title)+" ").SetBorderPadding(0, 0, 1, 1)
 	view.root.AddItem(view.body, 1, 0, spec.Form == nil)
 	view.root.AddItem(view.details, 0, 0, false)
 	if spec.Form != nil {
-		view.root.AddItem(spec.Form, dialogFormHeight(spec.Form, 1), 0, true)
+		view.formBox = &dialogFormBox{Form: spec.Form}
+		view.root.AddItem(view.formBox, dialogFormHeight(spec.Form, 1), 0, true)
 	}
 	view.root.AddItem(view.hint, 1, 0, false)
 	view.root.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -232,7 +246,7 @@ func newDialog(spec dialogSpec, focusIsTextField func() bool) *dialogView {
 func (view *dialogView) toggleDetails() {
 	view.detailsOpen = !view.detailsOpen
 	if view.detailsOpen {
-		view.details.SetText(tview.Escape(dialogDetailsHeader + view.detailsText)).ScrollToBeginning()
+		view.details.SetText(dialogDetailsHeader + view.detailsText).ScrollToBeginning()
 	} else {
 		view.details.SetText("")
 	}
@@ -248,13 +262,22 @@ func (view *dialogView) size(maxWidth, maxHeight int) (int, int) {
 	if open := textWidth(view.detailsText); view.detailsOpen && open > natural {
 		natural = open
 	}
-	natural = max(natural, tview.TaggedStringWidth(view.title)+6, tview.TaggedStringWidth(view.baseHint))
+	natural = max(natural, tview.TaggedStringWidth(view.title)+6, tview.TaggedStringWidth(strings.Join(view.baseHint, dialogHintJoin)))
 	width := natural + 4 // border and side padding
 	if view.form != nil && width < dialogMinWidth {
 		width = dialogMinWidth
 	}
 	width = min(width, dialogMaxWidth, maxWidth)
 	inner := max(width-4, 1)
+	// Buttons too wide to sit side by side go one per row, so none is clipped
+	// (a clipped focused button loses its ▶ ◀ marker).
+	stackRows := 0
+	if view.formBox != nil {
+		view.formBox.stacked = dialogButtonRowWidth(view.form) > inner
+		if view.formBox.stacked {
+			stackRows = view.form.GetButtonCount() - 1
+		}
+	}
 
 	bodyWant := wrappedRows(view.bodyText, inner)
 	detailsWant := 0
@@ -268,10 +291,10 @@ func (view *dialogView) size(maxWidth, maxHeight int) (int, int) {
 		minText := min(bodyWant+detailsWant, 1)
 		if view.form != nil {
 			padding := 1
-			formRows = dialogFormHeight(view.form, padding)
+			formRows = dialogFormHeight(view.form, padding) + stackRows
 			if formRows+1+minText > left {
 				padding = 0
-				formRows = dialogFormHeight(view.form, padding)
+				formRows = dialogFormHeight(view.form, padding) + stackRows
 			}
 			view.form.SetItemPadding(padding)
 			formRows = max(min(formRows, left-minText), 1)
@@ -291,23 +314,91 @@ func (view *dialogView) size(maxWidth, maxHeight int) (int, int) {
 		}
 		return formRows, gap, bodyRows, detailsRows
 	}
-	formRows, gap, bodyRows, detailsRows := layout(1)
-	hint := view.baseHint
+	// The hint takes every row it needs (the keys are what makes the dialog
+	// usable), leaving at least one row for the rest; the text shrinks first.
+	hintRows := func(lines []string) int { return max(min(len(lines), avail-1), 1) }
+	hint := dialogHintLines(view.baseHint, inner)
+	formRows, gap, bodyRows, detailsRows := layout(hintRows(hint))
 	if bodyRows < bodyWant || detailsRows < detailsWant {
-		hint += dialogHintScroll
+		hint = dialogHintLines(append(append([]string(nil), view.baseHint...), dialogHintScroll), inner)
+		formRows, gap, bodyRows, detailsRows = layout(hintRows(hint))
 	}
-	hintRows := min(wrappedRows(hint, inner), 2)
-	if hintRows > 1 {
-		formRows, gap, bodyRows, detailsRows = layout(hintRows)
-	}
-	view.hint.SetText(hint)
+	view.hint.SetText(strings.Join(hint, "\n"))
 	view.root.ResizeItem(view.body, bodyRows+gap, 0)
 	view.root.ResizeItem(view.details, detailsRows, 0)
-	if view.form != nil {
-		view.root.ResizeItem(view.form, formRows, 0)
+	if view.formBox != nil {
+		view.root.ResizeItem(view.formBox, formRows, 0)
 	}
-	view.root.ResizeItem(view.hint, hintRows, 0)
-	return width, 2 + bodyRows + gap + detailsRows + formRows + hintRows
+	view.root.ResizeItem(view.hint, hintRows(hint), 0)
+	return width, 2 + bodyRows + gap + detailsRows + formRows + hintRows(hint)
+}
+
+// dialogHintLines lays the hint's parts out in rows of at most width cells,
+// joined by " · ", never splitting a part (a part wider than width gets a row of
+// its own and wraps there).
+func dialogHintLines(parts []string, width int) []string {
+	var lines []string
+	for _, part := range parts {
+		last := len(lines) - 1
+		if last >= 0 && tview.TaggedStringWidth(lines[last]+dialogHintJoin+part) <= width {
+			lines[last] += dialogHintJoin + part
+			continue
+		}
+		lines = append(lines, part)
+	}
+	return lines
+}
+
+// dialogButtonRowWidth is the width tview's form gives its buttons side by side:
+// each label plus four cells, one cell between buttons.
+func dialogButtonRowWidth(form *tview.Form) int {
+	width := -1
+	for index := 0; index < form.GetButtonCount(); index++ {
+		width += tview.TaggedStringWidth(form.GetButton(index).GetLabel()) + 5
+	}
+	return width
+}
+
+// dialogFormBox draws a dialog's form. tview lays a form's buttons out in one
+// row and clips whichever does not fit; when stacked is set (the row is wider
+// than the dialog) it draws them one per row instead, centred, in the rows the
+// dialog's layout added under the form. The buttons stay the form's own, so
+// focus, keys and mouse are unchanged.
+type dialogFormBox struct {
+	*tview.Form
+	stacked bool
+}
+
+func (b *dialogFormBox) Draw(screen tcell.Screen) {
+	count := b.GetButtonCount()
+	x, y, width, height := b.GetRect()
+	extra := count - 1
+	if !b.stacked || count < 2 || height-extra < 1 {
+		b.Form.Draw(screen)
+		return
+	}
+	// tview draws the form, its button row included, in the rows above the
+	// extra ones; the full rect is restored after, so a click on a stacked
+	// button still reaches the form.
+	b.Form.SetRect(x, y, width, height-extra)
+	b.Form.Draw(screen)
+	b.Form.SetRect(x, y, width, height)
+	_, row, _, _ := b.GetButton(0).GetRect()
+	if row < y || row >= y+height-extra {
+		return // the form has scrolled its buttons out of view
+	}
+	background := tcell.StyleDefault.Background(b.GetBackgroundColor())
+	for line := row; line <= row+extra; line++ {
+		for column := x; column < x+width; column++ {
+			screen.SetContent(column, line, ' ', nil, background)
+		}
+	}
+	for index := 0; index < count; index++ {
+		button := b.GetButton(index)
+		buttonWidth := min(tview.TaggedStringWidth(button.GetLabel())+4, width)
+		button.SetRect(x+(width-buttonWidth)/2, row+index, buttonWidth, 1)
+		button.Draw(screen)
+	}
 }
 
 // wrappedRows is how many rows text takes when word-wrapped at width, by the

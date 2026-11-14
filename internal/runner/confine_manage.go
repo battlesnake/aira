@@ -41,6 +41,14 @@ const (
 	CodeConfineResizeUsageUnevaluated = "U_CONFINE_RESIZE_USAGE_UNEVALUATED"
 )
 
+// The reasons a CodeConfineResizeUsageUnevaluated refusal ends with, shared so
+// a face can tell a permanent cause (ci-shim mode: no resize there at all) from
+// one a retry may clear. The daemon's wording is unchanged by sharing them.
+const (
+	ConfineUsageReasonShim    = "ci-shim mode has no per-job cgroup to read live memory use from"
+	ConfineUsageReasonNoScope = "the job's scope cgroup is not present (still launching, or already gone)"
+)
+
 // ConfineResizeMinimumReserve is the smallest reserve a resize may name. It is
 // the launch form's own --memory-reserve floor (parseConfineArgs), so the two
 // size languages are one.

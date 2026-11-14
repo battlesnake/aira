@@ -59,14 +59,21 @@ each dialog carries its own key line, and this section is the reference for it.
   `Details` panel, and a key hint.
 - Buttons: the focused one is reverse video and bold with `▶ label ◀`; the others are
   dim. Tab / Shift-Tab / ← / → move, Enter presses the marked button, Esc cancels.
-  Confirmations start on Cancel.
+  Confirmations start on Cancel. A dialog too narrow for its buttons side by side
+  stacks them one per row, so the focused label is never clipped.
 - Results: one or two sentences led by APPLIED, REJECTED, NOT SENT or UNEVALUATED. A
   daemon error shows its code, its message (byte counts as sizes, scope ids as job
   names) and a "What to do" line; it claims nothing about whether a change was made.
-  `d` opens and closes the raw reply.
+  A success of any other palette verb names its target, the id the daemon gave it
+  (a created ticket's) and the values sent (`set AIRA-1 succeeded (status = done)`).
+  A resize refused because the job's live use could not be read says, in ci-shim
+  mode, that resize is unavailable there; retry advice is only for the other causes.
+  `d` opens and closes the raw reply; all dialog text is shown verbatim (brackets
+  included).
 - Sizes print exactly when they are whole MiB (`2047M`, `2G`, `1.5G`) and with `~`
   when rounded (`~1177.4M`, a live memory reading).
 - On a short terminal the body and details shrink first, then the form drops its
   blank rows, then the form scrolls to the focused item; the hint stays inside the
   border, and whatever is cut off scrolls with PgUp/PgDn (the details when open,
-  else the body), which the hint then says.
+  else the body), which the hint then says. A hint too wide for one row wraps whole
+  keys onto further rows, never splitting one.

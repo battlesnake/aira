@@ -150,7 +150,7 @@ func (s *Server) scopeUsageReader() func(string) (int64, bool, string) {
 	}
 	if s.shimMode() {
 		return func(string) (int64, bool, string) {
-			return 0, false, "ci-shim mode has no per-job cgroup to read live memory use from"
+			return 0, false, runner.ConfineUsageReasonShim
 		}
 	}
 	return readConfineScopeUsage
@@ -166,7 +166,7 @@ func readConfineScopeUsage(dir string) (int64, bool, string) {
 		return value, true, ""
 	}
 	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
-		return 0, false, "the job's scope cgroup is not present (still launching, or already gone)"
+		return 0, false, runner.ConfineUsageReasonNoScope
 	}
 	return 0, false, "the job's scope memory.current could not be read or parsed"
 }

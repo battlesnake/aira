@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -28,15 +29,33 @@ import (
 // row action (or the input that feeds one) can produce. A code with no entry
 // gets no remedy line rather than a generic guess.
 var paletteRemedies = map[string]string{
-	runner.CodeConfineOwnerUnverified:        "it is another session's job (or this session's identity is not attested), so the change has to override the owner check: aira top does that when you confirm a job that is not yours; from the CLI add --steal.",
-	runner.CodeConfineNotFound:               "the job has finished, or left the queue, since the screen was drawn: refresh (r) and pick it again.",
-	runner.CodeConfineNotQueued:              "the job is no longer waiting (it has been admitted, or it is a sub-reservation that follows its parent), so there is nothing to push.",
-	runner.CodeConfineNotRunning:             "the job holds no reserve of its own to lower. If it is still waiting for admission, push it to the front (f) or wait until it runs; if it is a worker or sub-reservation, its reserve follows its parent job, so lower the parent's reserve instead.",
-	runner.CodeConfineResizeNotReduction:     "a resize only ever lowers a reserve: enter a size smaller than the job's current reserve.",
-	runner.CodeConfineResizeBelowUsage:       "the job already uses more than that: enter a size at or above its live memory use.",
-	runner.CodeConfineResizeUsageUnevaluated: "the daemon could not read the job's live memory use, so it refused rather than guess: try again in a moment.",
-	"E_CONFINE_ARGUMENT_INVALID":             "sizes look like 512M, 2G or 1.5G (the unit is required) and must be at least 1M.",
-	"E_TUI_INLINE_ROW_KIND":                  "f works on jobs still waiting in the queue, e on running jobs: pick a row of the right kind.",
+	runner.CodeConfineOwnerUnverified:    "it is another session's job (or this session's identity is not attested), so the change has to override the owner check: aira top does that when you confirm a job that is not yours; from the CLI add --steal.",
+	runner.CodeConfineNotFound:           "the job has finished, or left the queue, since the screen was drawn: refresh (r) and pick it again.",
+	runner.CodeConfineNotQueued:          "the job is no longer waiting (it has been admitted, or it is a sub-reservation that follows its parent), so there is nothing to push.",
+	runner.CodeConfineNotRunning:         "the job holds no reserve of its own to lower. If it is still waiting for admission, push it to the front (f) or wait until it runs; if it is a worker or sub-reservation, its reserve follows its parent job, so lower the parent's reserve instead.",
+	runner.CodeConfineResizeNotReduction: "a resize only ever lowers a reserve: enter a size smaller than the job's current reserve.",
+	runner.CodeConfineResizeBelowUsage:   "the job already uses more than that: enter a size at or above its live memory use.",
+	"E_CONFINE_ARGUMENT_INVALID":         "sizes look like 512M, 2G or 1.5G (the unit is required) and must be at least 1M.",
+	"E_TUI_INLINE_ROW_KIND":              "f works on jobs still waiting in the queue, e on running jobs: pick a row of the right kind.",
+}
+
+// paletteRemedy is what to do about a refusal: the code's entry, except for
+// the one code whose remedy depends on its cause. A resize refused for an
+// unreadable live memory use is permanent in ci-shim mode (no job has a cgroup
+// of its own there), so retrying is offered only for the causes a retry can
+// clear.
+func paletteRemedy(code, message string) string {
+	if code != runner.CodeConfineResizeUsageUnevaluated {
+		return paletteRemedies[code]
+	}
+	switch {
+	case strings.Contains(message, runner.ConfineUsageReasonShim):
+		return "this daemon runs in ci-shim mode, where jobs have no cgroup of their own, so it can never read a job's memory use: lowering a reserve is not available in this mode, and retrying will not help."
+	case strings.Contains(message, runner.ConfineUsageReasonNoScope):
+		return "the job is still starting or has just ended: refresh (r), and if it is still running, try again in a moment."
+	default:
+		return "the daemon could not read the job's live memory use this time, so it refused rather than guess: try again in a moment."
+	}
 }
 
 // appliedResult words a request the daemon applied; data is its reply payload.
@@ -89,7 +108,7 @@ func refusalText(label, effect, code, message string) string {
 	if message = humanizeDaemonMessage(code, message); message != "" {
 		out.WriteString("\n" + message)
 	}
-	if remedy := paletteRemedies[code]; remedy != "" {
+	if remedy := paletteRemedy(code, message); remedy != "" {
 		out.WriteString("\nWhat to do: " + remedy)
 	}
 	return out.String()
@@ -186,8 +205,8 @@ func humanSize(value int64) string {
 }
 
 // appliedSentence says what an applied request did. The two `aira top` row
-// actions say it in their own words; every other verb names itself and its
-// target, and its reply stays behind `d`.
+// actions say it in their own words; every other verb names itself, its target
+// and what it sent, and its reply stays behind `d`.
 func appliedSentence(request core.Request, data json.RawMessage) string {
 	switch request.Verb {
 	case "confine-resize":
@@ -213,12 +232,96 @@ func appliedSentence(request core.Request, data json.RawMessage) string {
 	if selector, ok := request.Args["selector"].(string); ok && selector != "" {
 		verb += " " + selector
 	}
-	// Any other verb's reply is a record, not a sentence: say that it succeeded
-	// and leave the reply itself to Details, never an outline of every field.
-	if len(bytes.TrimSpace(data)) == 0 {
-		return verb + " succeeded."
+	// Any other verb's reply is a record, not a sentence: one sentence names
+	// what the request was about (the id the daemon gave it, when that is not
+	// the selector already said, e.g. a created ticket's) and the values it
+	// sent, and the reply itself stays in Details, never an outline of it.
+	text := verb + " succeeded"
+	selector, _ := request.Args["selector"].(string)
+	if id := replyID(data); id != "" && id != selector {
+		text += ", id " + id
 	}
-	return verb + " succeeded. Press d to see what the daemon returned."
+	if change := requestChange(request.Args); change != "" {
+		text += " (" + change + ")"
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return text + "."
+	}
+	return text + ". Press d to see what the daemon returned."
+}
+
+// replyID is the id a reply names: its own "id", else its record's or
+// ticket's. Empty when it names none.
+func replyID(data json.RawMessage) string {
+	var reply struct {
+		ID     any `json:"id"`
+		Record struct {
+			ID any `json:"id"`
+		} `json:"record"`
+		Ticket struct {
+			ID any `json:"id"`
+		} `json:"ticket"`
+	}
+	if json.Unmarshal(data, &reply) != nil {
+		return ""
+	}
+	for _, id := range []any{reply.ID, reply.Record.ID, reply.Ticket.ID} {
+		if text, ok := id.(string); ok && strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+	}
+	return ""
+}
+
+// requestChange is what a request sent, as "name = value" pairs in name order:
+// `set`'s field and value read "status = done"; the selector and operation are
+// already named. Each value is on one line and at most requestValueRunes long.
+func requestChange(args map[string]any) string {
+	names := make([]string, 0, len(args))
+	for name := range args {
+		if name != "selector" && name != "subverb" && name != "field" && name != "value" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var pairs []string
+	if field, ok := args["field"].(string); ok && field != "" {
+		pairs = append(pairs, field+" = "+requestValue(args["value"]))
+	}
+	for _, name := range names {
+		pairs = append(pairs, name+" = "+requestValue(args[name]))
+	}
+	return strings.Join(pairs, ", ")
+}
+
+const requestValueRunes = 40
+
+func requestValue(value any) string {
+	var text string
+	switch typed := value.(type) {
+	case nil:
+		text = ""
+	case string:
+		text = typed
+	case []string:
+		text = strings.Join(typed, ",")
+	case []any:
+		parts := make([]string, len(typed))
+		for index, item := range typed {
+			parts[index] = fmt.Sprint(item)
+		}
+		text = strings.Join(parts, ",")
+	default:
+		text = fmt.Sprint(typed)
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if runes := []rune(text); len(runes) > requestValueRunes {
+		text = string(runes[:requestValueRunes-1]) + "…"
+	}
+	if text == "" || strings.ContainsAny(text, " ,()") {
+		return strconv.Quote(text)
+	}
+	return text
 }
 
 // prettyPayload is the raw payload for Details: indented JSON, which is what an
