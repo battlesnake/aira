@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -32,7 +31,7 @@ var paletteRemedies = map[string]string{
 	runner.CodeConfineOwnerUnverified:        "it is another session's job (or this session's identity is not attested), so the change has to override the owner check: aira top does that when you confirm a job that is not yours; from the CLI add --steal.",
 	runner.CodeConfineNotFound:               "the job has finished, or left the queue, since the screen was drawn: refresh (r) and pick it again.",
 	runner.CodeConfineNotQueued:              "the job is no longer waiting (it has been admitted, or it is a sub-reservation that follows its parent), so there is nothing to push.",
-	runner.CodeConfineNotRunning:             "the job is still waiting for admission and holds no reserve to lower yet: push it to the front (f) or wait until it runs.",
+	runner.CodeConfineNotRunning:             "the job holds no reserve of its own to lower. If it is still waiting for admission, push it to the front (f) or wait until it runs; if it is a worker or sub-reservation, its reserve follows its parent job, so lower the parent's reserve instead.",
 	runner.CodeConfineResizeNotReduction:     "a resize only ever lowers a reserve: enter a size smaller than the job's current reserve.",
 	runner.CodeConfineResizeBelowUsage:       "the job already uses more than that: enter a size at or above its live memory use.",
 	runner.CodeConfineResizeUsageUnevaluated: "the daemon could not read the job's live memory use, so it refused rather than guess: try again in a moment.",
@@ -45,9 +44,11 @@ func appliedResult(request core.Request, data json.RawMessage) paletteResult {
 	return paletteResult{Outcome: paletteApplied, Text: "APPLIED — " + appliedSentence(request, data), Details: prettyPayload(data)}
 }
 
-// rejectedResult words a provable refusal: effect says what that means ("nothing
-// was changed" for a daemon refusal, "nothing was sent" for a request that never
-// left this process).
+// rejectedResult words a refusal. effect is what the refusal establishes about
+// the request, and only that: "nothing was sent" for a request that never left
+// this process; empty for a daemon error, which establishes NOTHING about
+// whether a change was made (a handler may fail after its write, e.g. `set`
+// rereads the ticket after writing it), so no rollback is claimed.
 func rejectedResult(effect, code, message string) paletteResult {
 	return paletteResult{Outcome: paletteRejected, Text: refusalText("REJECTED", effect, code, message), Details: rawRefusal(code, message)}
 }
@@ -81,7 +82,10 @@ func refusalText(label, effect, code, message string) string {
 	if code != "" {
 		fmt.Fprintf(&out, " (%s)", code)
 	}
-	out.WriteString(": " + effect + ".")
+	if effect != "" {
+		out.WriteString(": " + effect)
+	}
+	out.WriteString(".")
 	if message = humanizeDaemonMessage(code, message); message != "" {
 		out.WriteString("\n" + message)
 	}
@@ -155,21 +159,27 @@ func humanizeDaemonMessage(code, message string) string {
 	})
 }
 
-// humanSize shows a byte count the way an operator types one: 512M, 2G, 1.5G.
+// humanSize shows a byte count the way an operator types one, and never hides a
+// difference: a whole or half GiB is 2G or 1.5G, any other whole MiB is 2047M,
+// and a count that is not a whole MiB (a live memory reading) is marked as
+// rounded, ~1177.4M. Two different MiB-aligned sizes therefore never print alike
+// ("2047M → 2046M", not "2G → 2G").
 func humanSize(value int64) string {
 	const (
+		kib = int64(1) << 10
 		mib = int64(1) << 20
 		gib = int64(1) << 30
 	)
 	switch {
-	case value >= gib:
-		whole := float64(value) / float64(gib)
-		text := strconv.FormatFloat(whole, 'f', 1, 64)
+	case value >= gib && value%(gib/2) == 0:
+		text := strconv.FormatFloat(float64(value)/float64(gib), 'f', 1, 64)
 		return strings.TrimSuffix(text, ".0") + "G"
+	case value >= mib && value%mib == 0:
+		return strconv.FormatInt(value/mib, 10) + "M"
 	case value >= mib:
-		return runner.FormatConfineMegabytes(value)
-	case value >= 1<<10:
-		return strconv.FormatInt(value>>10, 10) + "K"
+		return "~" + strconv.FormatFloat(float64(value)/float64(mib), 'f', 1, 64) + "M"
+	case value >= kib && value%kib == 0:
+		return strconv.FormatInt(value/kib, 10) + "K"
 	default:
 		return strconv.FormatInt(value, 10) + "B"
 	}
@@ -177,7 +187,7 @@ func humanSize(value int64) string {
 
 // appliedSentence says what an applied request did. The two `aira top` row
 // actions say it in their own words; every other verb names itself and its
-// target and lists what the daemon returned as a plain outline.
+// target, and its reply stays behind `d`.
 func appliedSentence(request core.Request, data json.RawMessage) string {
 	switch request.Verb {
 	case "confine-resize":
@@ -200,86 +210,15 @@ func appliedSentence(request core.Request, data json.RawMessage) string {
 	if operation, ok := request.Args["subverb"].(string); ok && operation != "" {
 		verb += " " + operation
 	}
-	text := verb + " succeeded"
 	if selector, ok := request.Args["selector"].(string); ok && selector != "" {
-		text = verb + " " + selector + " succeeded"
+		verb += " " + selector
 	}
-	if outline := plainOutline(data); outline != "" {
-		return text + ":\n" + outline
-	}
-	return text + "."
-}
-
-// plainOutline renders a JSON payload as indented "key: value" lines, with no
-// braces, quotes or commas: what a palette read returned, readable as text.
-func plainOutline(data json.RawMessage) string {
+	// Any other verb's reply is a record, not a sentence: say that it succeeded
+	// and leave the reply itself to Details, never an outline of every field.
 	if len(bytes.TrimSpace(data)) == 0 {
-		return ""
+		return verb + " succeeded."
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	var value any
-	if decoder.Decode(&value) != nil {
-		return ""
-	}
-	var out strings.Builder
-	writeOutline(&out, value, "")
-	return strings.TrimRight(out.String(), "\n")
-}
-
-func writeOutline(out *strings.Builder, value any, indent string) {
-	switch typed := value.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(typed))
-		for key := range typed {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			writeOutlineEntry(out, indent, key+":", typed[key])
-		}
-	case []any:
-		if len(typed) == 0 {
-			out.WriteString(indent + "(none)\n")
-		}
-		for _, item := range typed {
-			writeOutlineEntry(out, indent, "-", item)
-		}
-	default:
-		out.WriteString(indent + outlineScalar(typed) + "\n")
-	}
-}
-
-func writeOutlineEntry(out *strings.Builder, indent, label string, value any) {
-	switch typed := value.(type) {
-	case map[string]any:
-		if len(typed) == 0 {
-			out.WriteString(indent + label + " (none)\n")
-			return
-		}
-		out.WriteString(indent + label + "\n")
-		writeOutline(out, typed, indent+"  ")
-	case []any:
-		if len(typed) == 0 {
-			out.WriteString(indent + label + " (none)\n")
-			return
-		}
-		out.WriteString(indent + label + "\n")
-		writeOutline(out, typed, indent+"  ")
-	default:
-		out.WriteString(indent + label + " " + outlineScalar(typed) + "\n")
-	}
-}
-
-func outlineScalar(value any) string {
-	switch typed := value.(type) {
-	case nil:
-		return "(not set)"
-	case string:
-		return typed
-	default:
-		return fmt.Sprint(typed)
-	}
+	return verb + " succeeded. Press d to see what the daemon returned."
 }
 
 // prettyPayload is the raw payload for Details: indented JSON, which is what an

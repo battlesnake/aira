@@ -1290,7 +1290,8 @@ func paletteResultTitle(result paletteResult) string {
 	case paletteApplied:
 		return "Applied"
 	case paletteRejected:
-		return "Not applied"
+		// Not "not applied": a daemon error does not establish that (AIRA-342).
+		return "Rejected"
 	case paletteOutcomeUnknown:
 		return "Outcome unknown"
 	default:

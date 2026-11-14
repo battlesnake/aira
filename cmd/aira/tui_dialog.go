@@ -15,7 +15,12 @@ import (
 //   - a bordered, titled box, centred and clamped to the terminal (dialogFrame);
 //   - a plain-text body, an optional form (fields, a status line directly under
 //     them, buttons), an optional raw-details panel behind `d` (closed by
-//     default), and a one-line key hint;
+//     default), and a key hint;
+//   - on a short terminal the body and the details shrink first and the form
+//     next (its blank rows go, then it scrolls to the focused item), so the
+//     buttons stay reachable and the hint stays inside the border; whatever is
+//     cut off scrolls with PgUp/PgDn (the details when open, else the body),
+//     and the hint says so;
 //   - buttons whose focus reads without colour: the focused one is reverse video
 //     and bold AND carries a ▶ ◀ marker, the others are dim and unmarked; Tab,
 //     Shift-Tab, Left and Right move between them.
@@ -28,6 +33,9 @@ const (
 	dialogHintButtons = "Tab/←→ move · Enter presses ▶ · Esc cancels"
 	dialogHintResult  = "Esc closes"
 	dialogHintDetails = " · d details"
+	dialogHintScroll  = " · PgUp/PgDn scroll"
+	// dialogDetailsHeader heads the open details panel.
+	dialogDetailsHeader = "Details (d hides):\n"
 
 	// dialogMaxWidth is the widest a dialog grows to, whatever its content.
 	dialogMaxWidth = 84
@@ -98,15 +106,20 @@ func styleDialogForm(form *tview.Form) {
 	})
 }
 
-// dialogFormHeight is the rows a styled dialog form needs: each item takes its
-// own height plus one row of padding, and the button row follows.
-func dialogFormHeight(form *tview.Form) int {
+// dialogFormHeight is the rows a styled dialog form needs with padding blank
+// rows after each item: each item takes its own height plus the padding, and the
+// button row follows (after one blank row when the padding is zero, which is
+// how tview lays a vertical form out).
+func dialogFormHeight(form *tview.Form, padding int) int {
 	if form == nil {
 		return 0
 	}
 	rows := 1
+	if padding == 0 {
+		rows++
+	}
 	for index := 0; index < form.GetFormItemCount(); index++ {
-		rows += max(form.GetFormItem(index).GetFieldHeight(), 1) + 1
+		rows += max(form.GetFormItem(index).GetFieldHeight(), 1) + padding
 	}
 	return rows
 }
@@ -153,7 +166,10 @@ type dialogView struct {
 	bodyText    string
 	detailsText string
 	detailsOpen bool
-	focus       tview.Primitive
+	// baseHint is the key hint before the scroll suffix, which size adds only
+	// while something is cut off.
+	baseHint string
+	focus    tview.Primitive
 }
 
 func newDialog(spec dialogSpec, focusIsTextField func() bool) *dialogView {
@@ -171,18 +187,29 @@ func newDialog(spec dialogSpec, focusIsTextField func() bool) *dialogView {
 	if spec.Details != "" {
 		hint += dialogHintDetails
 	}
-	view.hint = tview.NewTextView().SetText(hint).SetTextStyle(tcell.StyleDefault.Dim(true))
+	view.baseHint = hint
+	view.hint = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetText(hint).SetTextStyle(tcell.StyleDefault.Dim(true))
 	view.root = tview.NewFlex().SetDirection(tview.FlexRow)
 	view.root.SetBorder(true).SetTitle(" "+strings.TrimSpace(spec.Title)+" ").SetBorderPadding(0, 0, 1, 1)
 	view.root.AddItem(view.body, 1, 0, spec.Form == nil)
 	view.root.AddItem(view.details, 0, 0, false)
 	if spec.Form != nil {
-		view.root.AddItem(spec.Form, dialogFormHeight(spec.Form), 0, true)
+		view.root.AddItem(spec.Form, dialogFormHeight(spec.Form, 1), 0, true)
 	}
 	view.root.AddItem(view.hint, 1, 0, false)
 	view.root.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyRune && event.Rune() == 'd' && view.detailsText != "" && (focusIsTextField == nil || !focusIsTextField()) {
 			view.toggleDetails()
+			return nil
+		}
+		if event.Key() == tcell.KeyPgUp || event.Key() == tcell.KeyPgDn {
+			// Whatever has the focus (a field, a button, the body), PgUp/PgDn
+			// scroll the text: the details when open, else the body.
+			target := view.body
+			if view.detailsOpen {
+				target = view.details
+			}
+			target.InputHandler()(event, func(tview.Primitive) {})
 			return nil
 		}
 		if event.Key() == tcell.KeyEscape && spec.Form == nil && spec.OnClose != nil {
@@ -205,21 +232,23 @@ func newDialog(spec dialogSpec, focusIsTextField func() bool) *dialogView {
 func (view *dialogView) toggleDetails() {
 	view.detailsOpen = !view.detailsOpen
 	if view.detailsOpen {
-		view.details.SetText(tview.Escape("Details (d hides):\n" + view.detailsText)).ScrollToBeginning()
+		view.details.SetText(tview.Escape(dialogDetailsHeader + view.detailsText)).ScrollToBeginning()
 	} else {
 		view.details.SetText("")
 	}
 }
 
 // size lays the dialog out for at most maxWidth x maxHeight cells and returns
-// the size it wants. The body and the details shrink (and scroll) first, so the
-// form, the status line and the hint are always on screen.
+// the size it wants, which always fits: the body and the details shrink (and
+// scroll) first, then the form loses its blank rows, then the form itself
+// shrinks and scrolls to its focused item, so the hint stays inside the border
+// and the buttons stay reachable.
 func (view *dialogView) size(maxWidth, maxHeight int) (int, int) {
 	natural := textWidth(view.bodyText)
-	if open := textWidth(view.detailsText) + 0; view.detailsOpen && open > natural {
+	if open := textWidth(view.detailsText); view.detailsOpen && open > natural {
 		natural = open
 	}
-	natural = max(natural, tview.TaggedStringWidth(view.title)+6, tview.TaggedStringWidth(view.hint.GetText(false)))
+	natural = max(natural, tview.TaggedStringWidth(view.title)+6, tview.TaggedStringWidth(view.baseHint))
 	width := natural + 4 // border and side padding
 	if view.form != nil && width < dialogMinWidth {
 		width = dialogMinWidth
@@ -227,29 +256,58 @@ func (view *dialogView) size(maxWidth, maxHeight int) (int, int) {
 	width = min(width, dialogMaxWidth, maxWidth)
 	inner := max(width-4, 1)
 
-	bodyRows := wrappedRows(view.bodyText, inner)
-	detailsRows := 0
+	bodyWant := wrappedRows(view.bodyText, inner)
+	detailsWant := 0
 	if view.detailsOpen {
-		detailsRows = wrappedRows("Details (d hides):\n"+view.detailsText, inner)
+		detailsWant = wrappedRows(dialogDetailsHeader+view.detailsText, inner)
 	}
-	formRows := dialogFormHeight(view.form)
-	gap := 0
-	if formRows > 0 {
-		gap = 1
-	}
-	fixed := 2 + formRows + 1 + gap
-	room := max(maxHeight-fixed, 1)
-	if bodyRows+detailsRows > room {
-		if detailsRows > 0 {
-			bodyRows = min(bodyRows, max(room/2, 1))
-			detailsRows = max(room-bodyRows, 0)
-		} else {
-			bodyRows = room
+	avail := max(maxHeight-2, 1) // inside the border
+	// lay out the form, the gap under the body and the text for hintRows of hint.
+	layout := func(hintRows int) (formRows, gap, bodyRows, detailsRows int) {
+		left := avail - hintRows
+		minText := min(bodyWant+detailsWant, 1)
+		if view.form != nil {
+			padding := 1
+			formRows = dialogFormHeight(view.form, padding)
+			if formRows+1+minText > left {
+				padding = 0
+				formRows = dialogFormHeight(view.form, padding)
+			}
+			view.form.SetItemPadding(padding)
+			formRows = max(min(formRows, left-minText), 1)
+			if bodyWant > 0 && formRows+1+bodyWant+detailsWant <= left {
+				gap = 1
+			}
 		}
+		room := max(left-formRows-gap, 0)
+		bodyRows, detailsRows = bodyWant, detailsWant
+		if bodyRows+detailsRows > room {
+			if detailsRows > 0 {
+				bodyRows = min(bodyRows, max(room/2, min(room, 1)))
+				detailsRows = max(room-bodyRows, 0)
+			} else {
+				bodyRows = room
+			}
+		}
+		return formRows, gap, bodyRows, detailsRows
 	}
+	formRows, gap, bodyRows, detailsRows := layout(1)
+	hint := view.baseHint
+	if bodyRows < bodyWant || detailsRows < detailsWant {
+		hint += dialogHintScroll
+	}
+	hintRows := min(wrappedRows(hint, inner), 2)
+	if hintRows > 1 {
+		formRows, gap, bodyRows, detailsRows = layout(hintRows)
+	}
+	view.hint.SetText(hint)
 	view.root.ResizeItem(view.body, bodyRows+gap, 0)
 	view.root.ResizeItem(view.details, detailsRows, 0)
-	return width, fixed - gap + bodyRows + gap + detailsRows
+	if view.form != nil {
+		view.root.ResizeItem(view.form, formRows, 0)
+	}
+	view.root.ResizeItem(view.hint, hintRows, 0)
+	return width, 2 + bodyRows + gap + detailsRows + formRows + hintRows
 }
 
 // wrappedRows is how many rows text takes when word-wrapped at width, by the

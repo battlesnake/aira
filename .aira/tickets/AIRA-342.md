@@ -48,3 +48,25 @@ intuitive."
 
 Not in scope: what any action does (resize, push-to-front, kill), daemon/protocol
 behaviour, AIRA-340 --priority. Client-only change.
+
+## As built: how the dialogs behave (the operator-facing reference)
+
+`aira top` has no dispatch-table help entry (`top` is in `verbsWithoutHelpEntry`), so
+each dialog carries its own key line, and this section is the reference for it.
+
+- Every dialog is one family (`cmd/aira/tui_dialog.go`): title, plain-text body, an
+  optional form (fields, a status line under them, buttons), an optional raw
+  `Details` panel, and a key hint.
+- Buttons: the focused one is reverse video and bold with `▶ label ◀`; the others are
+  dim. Tab / Shift-Tab / ← / → move, Enter presses the marked button, Esc cancels.
+  Confirmations start on Cancel.
+- Results: one or two sentences led by APPLIED, REJECTED, NOT SENT or UNEVALUATED. A
+  daemon error shows its code, its message (byte counts as sizes, scope ids as job
+  names) and a "What to do" line; it claims nothing about whether a change was made.
+  `d` opens and closes the raw reply.
+- Sizes print exactly when they are whole MiB (`2047M`, `2G`, `1.5G`) and with `~`
+  when rounded (`~1177.4M`, a live memory reading).
+- On a short terminal the body and details shrink first, then the form drops its
+  blank rows, then the form scrolls to the focused item; the hint stays inside the
+  border, and whatever is cut off scrolls with PgUp/PgDn (the details when open,
+  else the body), which the hint then says.

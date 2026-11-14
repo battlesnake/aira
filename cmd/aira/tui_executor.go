@@ -435,7 +435,7 @@ func classifyPaletteDispatch(request core.Request, attempt paletteDispatchAttemp
 		// send-evidence, a flattened error may be a committed-then-lost write, so it
 		// is outcome-unknown, never rejected (Sol P0).
 		if !attempt.Evidenceless && response.Code != "" && response.Code != "OK" {
-			return rejectedResult("nothing was changed", response.Code, response.Error)
+			return rejectedResult("", response.Code, response.Error)
 		}
 		return unknownResult("missing terminal daemon response")
 	}

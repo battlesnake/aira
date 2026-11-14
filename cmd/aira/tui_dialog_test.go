@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -215,9 +217,9 @@ func TestDialogRefusalIsPlainEnglishWithDetailsBehindD(t *testing.T) {
 	runtime, screen, keys := startTopDialogRuntime(t, dispatcher, 100, 32)
 	openResizeConfirmation(t, runtime, screen, keys, "9G")
 	keys.press(t, specialKey(tcell.KeyTab), specialKey(tcell.KeyEnter))
-	text := waitForSimulationText(t, runtime, screen, "Not applied")
+	text := waitForSimulationText(t, runtime, screen, "Rejected")
 	for _, want := range []string{
-		"REJECTED (" + runner.CodeConfineResizeNotReduction + "): nothing was changed.",
+		"REJECTED (" + runner.CodeConfineResizeNotReduction + ").",
 		"alpha reserves 8G; a resize must name a smaller reserve (asked for 9G)",
 		"What to do: a resize only ever lowers a reserve",
 		"Esc closes · d details",
@@ -226,8 +228,12 @@ func TestDialogRefusalIsPlainEnglishWithDetailsBehindD(t *testing.T) {
 			t.Fatalf("the refusal does not say %q:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "8589934592") || strings.Contains(text, "CONFINE-alpha") {
-		t.Fatalf("the refusal shows raw bytes or the scope id before d:\n%s", text)
+	if strings.Contains(text, "8589934592") || strings.Contains(text, "CONFINE-alpha") || strings.ContainsAny(text, "{}") {
+		t.Fatalf("the refusal shows raw bytes, the scope id or JSON braces before d:\n%s", text)
+	}
+	// A daemon error does not establish that nothing changed (AIRA-342 P1).
+	if strings.Contains(text, "nothing was changed") || strings.Contains(text, "Not applied") {
+		t.Fatalf("the refusal claims a rollback it cannot establish:\n%s", text)
 	}
 	keys.press(t, runeKey('d'))
 	text = simulationTextOnUI(t, runtime, screen)
@@ -392,4 +398,233 @@ func TestHumanizeDaemonMessage(t *testing.T) {
 	if got := humanizeDaemonMessage("E_X", "selector 2145998 matched nothing"); got != "selector 2145998 matched nothing" {
 		t.Fatalf("a bare number that is not a byte count was rewritten: %q", got)
 	}
+}
+
+// verifies: AIRA-342 — a daemon error claims no rollback. `set` writes the
+// ticket and then rereads it, so its error can follow a write that took effect
+// (internal/core: the "set" handler); the words must not say nothing changed.
+// A request that never left this process is the one refusal that may say so.
+func TestPaletteRefusalClaimsNoRollback(t *testing.T) {
+	request := core.Request{Verb: "set", Args: map[string]any{"selector": "AIRA-1", "field": "status", "value": "done"}}
+	result := classifyPaletteDispatch(request, paletteDispatchAttempt{
+		Response: core.Response{Code: "E_NOT_FOUND", Error: "E_NOT_FOUND: AIRA-1 vanished on reread"},
+		Send:     paletteSendMayHaveBeenSent,
+	})
+	if result.Outcome != paletteRejected {
+		t.Fatalf("outcome = %v, want rejected", result.Outcome)
+	}
+	for _, claim := range []string{"nothing was changed", "not applied", "Not applied", "rolled back"} {
+		if strings.Contains(result.Text, claim) || strings.Contains(paletteResultTitle(result), claim) {
+			t.Fatalf("a daemon error claims %q: title %q, text %q", claim, paletteResultTitle(result), result.Text)
+		}
+	}
+	if !strings.HasPrefix(result.Text, "REJECTED (E_NOT_FOUND).") {
+		t.Fatalf("text = %q, want the verdict and the code first", result.Text)
+	}
+	notSent := classifyPaletteDispatch(request, paletteDispatchAttempt{Err: errors.New("dial: refused"), Send: paletteSendNotSent})
+	if !strings.Contains(notSent.Text, "nothing was sent") {
+		t.Fatalf("a request that never left says %q, want nothing was sent", notSent.Text)
+	}
+}
+
+// verifies: AIRA-342 — an applied request of any verb other than the two `aira
+// top` row actions is ONE sentence; its reply (a ticket record and event
+// metadata, for set) is in Details only.
+func TestPaletteAppliedRecordIsASentence(t *testing.T) {
+	request := core.Request{Verb: "set", Args: map[string]any{"selector": "AIRA-1", "field": "status", "value": "done"}}
+	data := json.RawMessage(`{"record":{"id":"AIRA-1","title":"a ticket","status":"done"},"event":{"seq":7,"actor":"me"}}`)
+	result := classifyPaletteDispatch(request, paletteDispatchAttempt{Response: core.Response{OK: true, Code: "OK", RawData: data}, Send: paletteSendMayHaveBeenSent})
+	if want := "APPLIED — set AIRA-1 succeeded. Press d to see what the daemon returned."; result.Text != want {
+		t.Fatalf("text = %q, want %q", result.Text, want)
+	}
+	if !strings.Contains(result.Details, `"title": "a ticket"`) {
+		t.Fatalf("details = %q, want the reply", result.Details)
+	}
+	empty := classifyPaletteDispatch(request, paletteDispatchAttempt{Response: core.Response{OK: true, Code: "OK"}, Send: paletteSendMayHaveBeenSent})
+	if empty.Text != "APPLIED — set AIRA-1 succeeded." || empty.Details != "" {
+		t.Fatalf("an empty reply = %+v, want the bare sentence and no details", empty)
+	}
+}
+
+// verifies: AIRA-342 — a size never hides a difference: two different whole-MiB
+// sizes never print alike, and a count that is not a whole MiB is marked rounded.
+func TestHumanSizeNeverHidesADifference(t *testing.T) {
+	const mib = int64(1) << 20
+	for _, test := range []struct {
+		value int64
+		want  string
+	}{
+		{2 * gib, "2G"}, {3 * gib / 2, "1.5G"}, {13 * gib / 2, "6.5G"},
+		{2047 * mib, "2047M"}, {2046 * mib, "2046M"}, {1280 * mib, "1280M"}, {512 * mib, "512M"},
+		{1234567890, "~1177.4M"}, {512 << 10, "512K"}, {100, "100B"},
+	} {
+		if got := humanSize(test.value); got != test.want {
+			t.Errorf("humanSize(%d) = %q, want %q", test.value, got, test.want)
+		}
+	}
+	current := 2047 * mib
+	if _, line := topResizePreview(&topJob{Name: "alpha", Reserve: &current}, "2046M"); line != "2047M → 2046M, frees 1M for queued jobs" {
+		t.Fatalf("preview 2047M -> 2046M = %q", line)
+	}
+	usage := 2046*mib + 300<<10
+	if _, line := topResizePreview(&topJob{Name: "alpha", Reserve: &current, Usage: &usage}, "2046M"); line != "2046M is below the job's live use of ~2046.3M: the daemon will refuse it" {
+		t.Fatalf("below-usage preview = %q", line)
+	}
+}
+
+// verifies: AIRA-342 — E_CONFINE_NOT_RUNNING's remedy covers both refusals the
+// daemon gives with it: a job still queued, and a worker or sub-reservation.
+func TestNotRunningRemedyCoversWorkers(t *testing.T) {
+	result := rejectedResult("", runner.CodeConfineNotRunning, runner.CodeConfineNotRunning+": "+dialogTestJob+" is a sub-reservation or worker whose reserve follows its parent job; resize the parent job instead")
+	for _, want := range []string{"waiting for admission", "lower the parent's reserve"} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("remedy %q lacks %q", result.Text, want)
+		}
+	}
+}
+
+// dialogBox finds the dialog titled title on the simulated screen and returns
+// its rows from the top border to the bottom border, inclusive, cut to its own
+// columns. It fails when a border is missing, broken or drawn over.
+func dialogBox(t *testing.T, text, title string) []string {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	top, left, right := -1, -1, -1
+	for index, line := range lines {
+		at := strings.Index(line, title)
+		if at < 0 {
+			continue
+		}
+		runes := []rune(line)
+		titleAt := len([]rune(line[:at]))
+		for column := titleAt - 1; column >= 0 && left < 0; column-- {
+			if runes[column] == '╔' || runes[column] == '┌' {
+				left = column
+			}
+		}
+		for column := titleAt; column < len(runes) && right < 0; column++ {
+			if runes[column] == '╗' || runes[column] == '┐' {
+				right = column
+			}
+		}
+		top = index
+		break
+	}
+	if top < 0 || left < 1 || right < 0 {
+		t.Fatalf("the dialog %q is missing or clipped (top=%d left=%d right=%d):\n%s", title, top, left, right, text)
+	}
+	box := []string{string([]rune(lines[top])[left : right+1])}
+	for index := top + 1; index < len(lines); index++ {
+		runes := []rune(lines[index])
+		if right >= len(runes) {
+			break
+		}
+		row := string(runes[left : right+1])
+		box = append(box, row)
+		switch runes[left] {
+		case '╚', '└':
+			if strings.Trim(row, "═─╚╝└┘") != "" {
+				t.Fatalf("the bottom border of %q is drawn over: %q\n%s", title, row, text)
+			}
+			return box
+		case '║', '│':
+			if runes[right] != '║' && runes[right] != '│' {
+				t.Fatalf("the right border of %q is broken on row %d:\n%s", title, index, text)
+			}
+		default:
+			t.Fatalf("the left border of %q is broken on row %d:\n%s", title, index, text)
+		}
+	}
+	t.Fatalf("the bottom border of %q is not on screen:\n%s", title, text)
+	return nil
+}
+
+// verifies: AIRA-342 item 4 — the tallest palette forms (gate add, create) fit
+// 80x24: the bottom border is not drawn over, the key hint is inside the box,
+// and the buttons are reachable (Shift-Tab from the first field reaches Cancel,
+// which is then drawn inside the box, the form scrolling to it).
+func TestDialogTallPaletteFormsFitAn80By24Terminal(t *testing.T) {
+	for _, target := range []struct{ verb, operation string }{{"gate", "add"}, {"create", ""}} {
+		t.Run(target.verb, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			screen := tcell.NewSimulationScreen("UTF-8")
+			screen.SetSize(80, 24)
+			runtime := newTUIRuntime(ctx, &tuiMutationDispatcher{}, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
+			keys := trackKeys(runtime, screen)
+			done := make(chan error, 1)
+			go func() { done <- runtime.run() }()
+			defer func() { cancel(); <-done }()
+			resizeBoardScreen(t, runtime, screen, 80, 24)
+			entry := paletteEntryNamed(t, buildPalette(runtime.descriptors), target.verb, target.operation)
+			openPaletteEntryOnUI(t, runtime, entry)
+			title := entryKey(entry)
+			text := waitForSimulationText(t, runtime, screen, "Esc cancels")
+			box := dialogBox(t, text, title)
+			if inside := strings.Join(box, "\n"); !strings.Contains(inside, "Esc cancels") {
+				t.Fatalf("the key hint is not inside the box:\n%s", text)
+			}
+			// The form's blank rows go before it scrolls, so gate add shows its
+			// twelfth field without scrolling (with blank rows it shows about eight).
+			if inside := strings.Join(box, "\n"); target.verb == "gate" && !strings.Contains(inside, "mutation_kind") {
+				t.Fatalf("the tall form kept its blank rows instead of showing more fields:\n%s", text)
+			}
+			keys.press(t, specialKey(tcell.KeyBacktab))
+			text = simulationTextOnUI(t, runtime, screen)
+			box = dialogBox(t, text, title)
+			if inside := strings.Join(box, "\n"); !strings.Contains(inside, "▶ Cancel ◀") || !strings.Contains(inside, "Esc cancels") {
+				t.Fatalf("Shift-Tab did not bring a focused Cancel into the box:\n%s", text)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-342 — text cut off by a short terminal is reachable from the
+// keyboard: PgDn scrolls the open details of a result to the payload's last
+// line, and PgDn scrolls a clipped confirmation body while the focus stays on
+// its Cancel button. The hint says PgUp/PgDn only while something is cut off.
+func TestDialogPageKeysScrollClippedText(t *testing.T) {
+	dispatcher := &topDialogDispatcher{}
+	runtime, screen, keys := startTopDialogRuntime(t, dispatcher, 80, 24)
+	lines := make([]string, 60)
+	for index := range lines {
+		lines[index] = fmt.Sprintf("payload line %02d", index+1)
+	}
+	onUIDraw(t, runtime, func() struct{} {
+		runtime.showPaletteResult(paletteResult{Outcome: paletteApplied, Text: "APPLIED — a short sentence.", Details: strings.Join(lines, "\n")})
+		return struct{}{}
+	})
+	text := waitForSimulationText(t, runtime, screen, "Esc closes · d details")
+	if strings.Contains(text, "PgUp/PgDn") {
+		t.Fatalf("the hint offers scrolling when nothing is cut off:\n%s", text)
+	}
+	keys.press(t, runeKey('d'))
+	text = simulationTextOnUI(t, runtime, screen)
+	if !strings.Contains(text, "payload line 01") || strings.Contains(text, "payload line 60") || !strings.Contains(text, "PgUp/PgDn scroll") {
+		t.Fatalf("the open details are not clipped with a scroll hint:\n%s", text)
+	}
+	for range 6 {
+		keys.press(t, specialKey(tcell.KeyPgDn))
+	}
+	if text = simulationTextOnUI(t, runtime, screen); !strings.Contains(text, "payload line 60") {
+		t.Fatalf("PgDn did not reach the payload's last line:\n%s", text)
+	}
+	keys.press(t, specialKey(tcell.KeyEscape))
+
+	// A confirmation clipped by a 14-row terminal, focus on Cancel.
+	resizeBoardScreen(t, runtime, screen, 80, 14)
+	openResizeConfirmation(t, runtime, screen, keys, "2G")
+	const tail = "It is your job (session-a)."
+	text = simulationTextOnUI(t, runtime, screen)
+	if strings.Contains(text, tail) || !strings.Contains(text, "PgUp/PgDn scroll") {
+		t.Fatalf("the 14-row confirmation is not clipped with a scroll hint:\n%s", text)
+	}
+	for range 4 {
+		keys.press(t, specialKey(tcell.KeyPgDn))
+	}
+	text = simulationTextOnUI(t, runtime, screen)
+	if !strings.Contains(text, tail) {
+		t.Fatalf("PgDn did not scroll the confirmation body:\n%s", text)
+	}
+	assertFocusedButton(t, runtime, screen, "Cancel", "Confirm", "after PgDn")
 }
