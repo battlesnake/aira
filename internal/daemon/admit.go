@@ -3351,8 +3351,9 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// for and silently did not get is a fake pass. The client sends it ONLY when
 	// high, so a normal launch's wire is byte-identical to before. No protocol
 	// bump: this allowlist already REFUSES an unknown field, so an OLDER daemon
-	// answers a high request E_DAEMON_PROTOCOL ("unexpected admit field"), which
-	// the client treats as a terminal refusal — loud, never a silent normal.
+	// answers a high request E_DAEMON_PROTOCOL ("unexpected admit field"); the
+	// client re-asks once without the field and prints a notice that the job runs
+	// at NORMAL priority — visible, never a silent normal.
 	high := false
 	if raw, exists := args["priority"]; exists {
 		text, valid := raw.(string)

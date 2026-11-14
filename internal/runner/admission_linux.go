@@ -44,6 +44,21 @@ var errDetachKillIntent = errors.New("detached run has a pending kill intent")
 // class this slice closes). It never escapes admitThroughDaemon.
 var errAdmitReconnect = errors.New("aira: admission transport failed; reconnect")
 
+// errAdmitPriorityUnknown is an INTERNAL sentinel (AIRA-340): a `--priority high`
+// request met a daemon that predates the field (oldDaemonPriorityRefusal).
+// Priority is queue order only, never a safety property, so admitThroughDaemon
+// re-asks ONCE without the field and prints a visible notice that the job runs at
+// NORMAL priority: a hook or Makefile carrying `--priority high` keeps working
+// across a new-client / not-yet-restarted-daemon skew, and nothing claims a
+// priority the job did not get. It never escapes admitThroughDaemon.
+var errAdmitPriorityUnknown = errors.New("aira: the admission daemon predates --priority")
+
+// oldDaemonPriorityRefusal is the refusal an admission daemon that predates the
+// `priority` field (proto 15 before AIRA-340) answers a high request with, from
+// its admit-field allowlist. Matched exactly, so any OTHER protocol refusal of a
+// high request stays terminal.
+const oldDaemonPriorityRefusal = `unexpected admit field "priority"`
+
 func (result admissionResult) releaseAdmission() {
 	if result.release != nil {
 		_ = result.release.Close()
@@ -265,6 +280,17 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 			return admissionResult{}, false, err
 		}
 		result, granted, err := r.admitExchangeOnce(ctx, req, effectiveReserve, dial)
+		if errors.Is(err, errAdmitPriorityUnknown) {
+			// The refused request left no state on the daemon (the allowlist runs
+			// before any enqueue), so re-asking is a fresh, normal request. HighPriority
+			// is cleared on this local copy, so the re-ask and every later reconnect
+			// omit the field: exactly one degrade, never a loop.
+			req.HighPriority = false
+			if r.diagnostics != nil {
+				_, _ = fmt.Fprintln(r.diagnostics, "confine: notice: the admission daemon predates --priority high (it refused the field); this job queues at NORMAL priority. Run `systemctl --user restart aira-daemon.service` after installing this aira to enable it.")
+			}
+			continue
+		}
 		if !errors.Is(err, errAdmitReconnect) {
 			return result, granted, err
 		}
@@ -444,9 +470,9 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// AIRA-340. Sent ONLY when high, so a normal launch's wire is byte-identical to
 	// before and keeps working against an older daemon. This frame is rebuilt from
 	// req on every exchange, so a reconnect after a daemon restart re-sends it. An
-	// older daemon refuses the unknown field with E_DAEMON_PROTOCOL, which lands in
-	// the terminal refusal below: the launch is refused loudly, never run at a
-	// priority it did not get.
+	// older daemon refuses the unknown field with E_DAEMON_PROTOCOL; the refusal
+	// path below turns exactly that refusal into errAdmitPriorityUnknown, and
+	// admitThroughDaemon re-asks at normal priority with a visible notice.
 	if req.HighPriority {
 		frame.Request.Args["priority"] = ConfinePriorityHigh
 	}
@@ -641,11 +667,11 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		if message == "" {
 			message = "the daemon refused admission"
 		}
-		// AIRA-340. The one refusal a NEW client meets against an OLDER daemon:
-		// it does not know the `priority` field. Name the fix beside the daemon's
-		// own words; the launch is still refused, never retried at normal.
-		if req.HighPriority && response.Code == "E_DAEMON_PROTOCOL" {
-			message += " (--priority high needs an admission daemon that knows it: run `systemctl --user restart aira-daemon.service` after installing this aira, or drop --priority)"
+		// AIRA-340. The one refusal a NEW client meets against an OLDER daemon: it
+		// does not know the `priority` field. Handed back for one re-ask at normal
+		// priority (see errAdmitPriorityUnknown); every other refusal stays terminal.
+		if req.HighPriority && response.Code == "E_DAEMON_PROTOCOL" && strings.Contains(response.Error, oldDaemonPriorityRefusal) {
+			return admissionResult{}, false, errAdmitPriorityUnknown
 		}
 		return admissionResult{state: "refused", waitedMS: time.Since(admissionStarted).Milliseconds(), reserve: effectiveReserve, basis: "reject:daemon-refused"}, false,
 			fmt.Errorf("%s; refusing to launch ungoverned", message)

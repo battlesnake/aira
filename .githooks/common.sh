@@ -47,10 +47,13 @@ aira_hook_scrub_git_env() {
 # measured 6-10 s on the confine trailer's wall=, warm build cache; re-measure
 # with `aira confine -- make -C <worktree> fmt-check vet build`), so a
 # commit does not wait behind slow jobs on a busy box; `normal` for anything
-# long (`make ci`, the store tests). An installed aira that predates
-# `--priority` is detected from its own help and runs the step at normal
-# priority with a one-line note, instead of refusing every commit until the
-# binary is reinstalled.
+# long (`make ci`, the store tests). Version skew degrades, never refuses
+# commits: an installed CLIENT that predates `--priority` is detected from its
+# own help and the step runs at normal priority with a one-line note; a new
+# client whose admission DAEMON predates the field (installed, not yet
+# restarted) gets the daemon's refusal of the field, re-asks once at normal
+# priority and prints a `confine: notice:` line. Either way the commit runs;
+# only its queue position is normal until both are current.
 aira_hook_run_make() {
 	local hook_name="$1"
 	local priority="$2"

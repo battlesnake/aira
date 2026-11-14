@@ -116,19 +116,25 @@ func TestHighPriorityIsResentAfterAReconnect(t *testing.T) {
 	}
 }
 
+// oldDaemonPriorityRefusalFrame is the proto-15 daemon's exact refusal of the admit
+// field it predates (measured against the live daemon, 2026-11-14).
+const oldDaemonPriorityRefusalFrame = `E_DAEMON_PROTOCOL: unexpected admit field "priority"`
+
 // verifies: AIRA-340 wire compatibility, new client / OLD daemon — the old
-// daemon's allowlist refuses the unknown field with E_DAEMON_PROTOCOL; the
-// client refuses the launch terminally (no grant, no reconnect, no silent retry
-// at normal) and names the fix. Mutations: route E_DAEMON_PROTOCOL to the
-// reconnect path (a second dial); drop the hint.
-func TestHighPriorityAgainstAnOldDaemonIsRefusedLoudly(t *testing.T) {
+// daemon's allowlist refuses the unknown `priority` field with E_DAEMON_PROTOCOL.
+// The client re-asks ONCE without the field, prints a visible notice that the job
+// runs at NORMAL priority (never a silent normal), and is granted. A hook or
+// Makefile that carries `--priority high` therefore keeps working across a
+// client-installed / daemon-not-yet-restarted skew. Mutations: no retry (refused);
+// retry still carrying the field (second frame has it, refused again); drop the
+// notice.
+func TestHighPriorityAgainstAnOldDaemonDegradesToNormalWithANotice(t *testing.T) {
 	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
-	dials := 0
+	var diagnostics strings.Builder
+	r.diagnostics = &diagnostics
+	var mu sync.Mutex
+	var frames []map[string]any
 	r.admitDialFn = func(context.Context, string) (net.Conn, error) {
-		dials++
-		if dials > 1 {
-			return nil, errors.New("second dial: the refusal was retried")
-		}
 		client, server := net.Pipe()
 		go func() {
 			defer server.Close()
@@ -136,8 +142,14 @@ func TestHighPriorityAgainstAnOldDaemonIsRefusedLoudly(t *testing.T) {
 			if err := readRunnerAdmitFrame(server, &request); err != nil {
 				return
 			}
-			// The proto-15 daemon's exact refusal of an unknown admit field.
-			_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_PROTOCOL", Error: `E_DAEMON_PROTOCOL: unexpected admit field "priority"`})
+			mu.Lock()
+			frames = append(frames, request.Request.Args)
+			mu.Unlock()
+			if _, sent := request.Request.Args["priority"]; sent {
+				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_PROTOCOL", Error: oldDaemonPriorityRefusalFrame})
+				return
+			}
+			grantFrame(server)
 		}()
 		return client, nil
 	}
@@ -145,20 +157,87 @@ func TestHighPriorityAgainstAnOldDaemonIsRefusedLoudly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	result, err := r.admit(ctx, Request{MemoryReserveOverride: &reserve, HighPriority: true})
-	if err == nil {
-		result.releaseAdmission()
-		t.Fatal("a high request the daemon refused was admitted")
+	if err != nil {
+		t.Fatalf("a high request against an old daemon was refused instead of degraded: %v", err)
 	}
-	if dials != 1 {
-		t.Fatalf("dials=%d, want 1: the refusal must be terminal", dials)
+	defer result.releaseAdmission()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(frames) != 2 {
+		t.Fatalf("frames=%d, want 2 (the refused high request, then one re-ask at normal)", len(frames))
 	}
-	for _, want := range []string{"E_DAEMON_PROTOCOL", `unexpected admit field "priority"`, "restart aira-daemon.service", "refusing to launch"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal %q does not contain %q", err.Error(), want)
+	if frames[0]["priority"] != ConfinePriorityHigh {
+		t.Fatalf("first frame priority=%#v, want %q", frames[0]["priority"], ConfinePriorityHigh)
+	}
+	if _, sent := frames[1]["priority"]; sent {
+		t.Fatalf("the re-ask still carried priority=%#v", frames[1]["priority"])
+	}
+	for _, want := range []string{"--priority high", "NORMAL", "restart aira-daemon.service"} {
+		if !strings.Contains(diagnostics.String(), want) {
+			t.Fatalf("notice %q does not contain %q", diagnostics.String(), want)
 		}
 	}
-	if result.state != "refused" {
-		t.Fatalf("state=%q, want refused", result.state)
+}
+
+// verifies: AIRA-340 false-pass direction — the degrade is keyed on the old
+// daemon's refusal of the `priority` FIELD only. Any other E_DAEMON_PROTOCOL
+// refusal of a high request (another field, a bad value, an arg count) stays the
+// terminal refusal it always was: one dial, no re-ask, no notice. And a NORMAL
+// request never re-asks. Mutations: degrade on any E_DAEMON_PROTOCOL; drop the
+// HighPriority guard.
+func TestOnlyTheOldDaemonPriorityRefusalDegrades(t *testing.T) {
+	for _, tc := range []struct {
+		name, refusal string
+		high          bool
+	}{
+		{"another unknown field", `E_DAEMON_PROTOCOL: unexpected admit field "vram"`, true},
+		{"a bad priority value", `E_DAEMON_PROTOCOL: admit priority must be "high" or "normal"`, true},
+		{"normal request", oldDaemonPriorityRefusalFrame, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
+			var diagnostics strings.Builder
+			r.diagnostics = &diagnostics
+			dials := 0
+			r.admitDialFn = func(context.Context, string) (net.Conn, error) {
+				dials++
+				if dials > 1 {
+					return nil, errors.New("second dial: the refusal was retried")
+				}
+				client, server := net.Pipe()
+				go func() {
+					defer server.Close()
+					var request runnerAdmitRequestFrame
+					if err := readRunnerAdmitFrame(server, &request); err != nil {
+						return
+					}
+					_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_PROTOCOL", Error: tc.refusal})
+				}()
+				return client, nil
+			}
+			reserve := int64(1 << 20)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			result, err := r.admit(ctx, Request{MemoryReserveOverride: &reserve, HighPriority: tc.high})
+			if err == nil {
+				result.releaseAdmission()
+				t.Fatal("a refused request was admitted")
+			}
+			if dials != 1 {
+				t.Fatalf("dials=%d, want 1: this refusal must be terminal", dials)
+			}
+			for _, want := range []string{tc.refusal, "refusing to launch"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("refusal %q does not contain %q", err.Error(), want)
+				}
+			}
+			if result.state != "refused" {
+				t.Fatalf("state=%q, want refused", result.state)
+			}
+			if strings.Contains(diagnostics.String(), "NORMAL") {
+				t.Fatalf("a terminal refusal printed the degrade notice: %q", diagnostics.String())
+			}
+		})
 	}
 }
 
