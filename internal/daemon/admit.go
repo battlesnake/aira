@@ -144,6 +144,11 @@ const (
 // field ("saturated" uses) so the two rejection kinds stay parallel.
 const admitOutcomeFailfast = "failfast"
 
+// admitOutcomeCancelled marks a waiter an operator cancelled while it was still
+// QUEUED (`aira confine --kill`, AIRA-328); the render path answers it
+// U_ADMIT_CANCELLED. Same field, same parallel shape as admitOutcomeFailfast.
+const admitOutcomeCancelled = "cancelled"
+
 type admitWaiter struct {
 	seq     int64
 	reserve int64
@@ -1847,6 +1852,11 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if enqueueErr != nil {
 		if code == CodeAdmitTooLarge {
 			s.writeAdmitRejection(conn, code, admitRejection{Required: reserve, Ceiling: s.admitCeiling(path, maximum), Basis: basis})
+		} else if code == CodeAdmitCancelled {
+			// AIRA-328. A reconnect of a job already cancelled while queued (its
+			// first cancel reply was lost): the same terminal refusal, so the
+			// client stops instead of queueing afresh.
+			s.writeAdmitRejection(conn, code, admitRejection{Required: reserve, Ceiling: s.admitCeiling(path, maximum), Basis: "reject:cancelled"})
 		} else {
 			s.writeAdmitError(conn, code, enqueueErr.Error())
 		}
@@ -1918,6 +1928,15 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 			rejection := admitRejection{Required: reserve, Ceiling: ceiling, Basis: "reject:failfast"}
 			queue.mu.Unlock()
 			s.writeAdmitRejection(conn, CodeAdmitFailfastTripped, rejection)
+			return
+		}
+		// AIRA-328. An operator's `aira confine --kill` cancelled this waiter while
+		// it was queued. Placed before the exclusive arm, so a cancelled drainer is
+		// told it was cancelled rather than that its drain timed out.
+		if waiter.outcome == admitOutcomeCancelled {
+			rejection := admitRejection{Required: reserve, Ceiling: ceiling, Basis: "reject:cancelled"}
+			queue.mu.Unlock()
+			s.writeAdmitRejection(conn, CodeAdmitCancelled, rejection)
 			return
 		}
 		// The EXCLUSIVE requester's own expiry. Its state is already admitRejected
@@ -2093,6 +2112,14 @@ func (s *Server) enqueueReDeclare(path string, reserve int64, basis string, requ
 
 func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	s.admitRegistryMu.Lock()
+	// AIRA-328. FIRST, before the idempotent SET and its duplicate-scope refusal:
+	// an operator cancelled this scope while it was queued, and the cancel is
+	// terminal for the scope id. Without this a client whose cancel reply was
+	// lost would reconnect (same scope id) into a fresh queue position and run.
+	if s.scopeCancelledLocked(request.scopeID, s.admitNowTime()) {
+		s.admitRegistryMu.Unlock()
+		return nil, nil, CodeAdmitCancelled, fmt.Errorf("%s: scope %s was cancelled by `aira confine --kill` while queued", CodeAdmitCancelled, request.scopeID)
+	}
 	if s.admitQueues == nil {
 		s.admitQueues = make(map[string]*sliceQueue)
 	}
@@ -3098,6 +3125,11 @@ func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admit
 	// cause rather than any RAM figure — a trip is not a capacity condition.
 	if code == CodeAdmitFailfastTripped {
 		message = fmt.Sprintf("%s: a --fail-fast task in this slice failed; the CI gate is aborting, so no further jobs are admitted (basis=%s)", code, rejection.Basis)
+	}
+	// AIRA-328. Code-prefixed for the same extraction; names what happened and
+	// that nothing ran.
+	if code == CodeAdmitCancelled {
+		message = fmt.Sprintf("%s: this job was cancelled by `aira confine --kill` while it was still waiting for admission; nothing ran (basis=%s)", code, rejection.Basis)
 	}
 	frame := errorFrame(code, message)
 	frame.Data, _ = json.Marshal(rejection)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 
@@ -394,6 +393,21 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 	case "confine-kill":
 		selector := stringArg(request.Args, "selector")
 		steal, _ := request.Args["steal"].(bool)
+		// AIRA-328. A QUEUED job first: it has no cgroup scope for the kill below
+		// to find, so before this every `--kill` of a job `--list` showed as queued
+		// answered E_CONFINE_NOT_FOUND. Queue state, so it runs before the shim
+		// branch and works the same in ci-shim mode (the shim queue is keyed on the
+		// sentinel path resolved above). Not handled = no queued match: the
+		// running-job kill below runs unchanged, including for a job granted
+		// between the operator's `--list` and this kill. Ambiguity counts the
+		// daemon's granted waiters only; nothing is read from disk.
+		if cancelled, handled, cancelErr := s.cancelQueuedConfine(path, selector, callerOwner, steal); handled {
+			if cancelErr != nil {
+				return confineManagementError(cancelErr)
+			}
+			logConfineKill(callerOwner, steal, cancelled, path)
+			return core.Response{OK: true, Code: "OK", Data: cancelled}
+		}
 		if s.shimMode() {
 			// Never a fabricated "killed". cgroup.kill is the only mechanism that
 			// reaches a job's whole subtree atomically, and shim mode has no cgroup
@@ -404,6 +418,15 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		}
 		result, killErr := runner.KillConfine(ctx, path, selector, callerOwner, steal, registry)
 		if killErr != nil {
+			// AIRA-328. A job the daemon holds as granted whose scope does not exist
+			// yet (its launcher has not created it; or it was granted after the
+			// registry snapshot, the queued cancel falling through) finds nothing to
+			// kill: say "no running scope; retry", never "no such job".
+			if store.ErrorCode(killErr) == runner.CodeConfineNotFound {
+				if scopeID := s.grantedConfineMatch(path, selector); scopeID != "" {
+					return confineManagementError(fmt.Errorf("%s: selector %q names %s, which is admitted but has no running scope to kill; retry", runner.CodeConfineNotLaunched, selector, scopeID))
+				}
+			}
 			return confineManagementError(killErr)
 		}
 		// AIRA-70 finding #2: a cross-session `aira confine --kill` used to kill
@@ -412,8 +435,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// written only for a kill the daemon confirmed: a refused (owner
 		// unverified), not-launched, or unconfirmed kill kills nothing and must
 		// not leave a line claiming otherwise.
-		log.Printf("aira daemon: confine-kill: killer=%s steal=%v target-scope=%s target-name=%s target-owner=%s slice=%s",
-			callerOwner, steal, result.ScopeID, result.Name, result.Owner, path)
+		logConfineKill(callerOwner, steal, result, path)
 		// This is the daemon kill-drop release. The admit connection's later
 		// close reaches the same state-guarded releaseAdmitWaiter path.
 		s.releaseActiveConfine(path, result.ScopeID)

@@ -132,7 +132,17 @@ type Server struct {
 	// must keep refusing across that prune, so the master latch lives here and each
 	// queue takes a copy at creation. Only ever SET (a trip is terminal for the
 	// gate); a ci-shim daemon is ephemeral per CI run, so it is never cleared.
-	failfastTripped              map[string]bool
+	failfastTripped map[string]bool
+	// AIRA-328. Scope ids an operator cancelled while queued (`confine --kill`),
+	// guarded by admitRegistryMu like failfastTripped and for the same reason: the
+	// cancel must outlive the waiter. A cancel whose reply the client never reads
+	// (a dropped connection) sends the client back through its transport
+	// reconnect with the SAME scope id; without this the reconnect would queue
+	// afresh and run the job the operator was told was cancelled. Each id is
+	// forgotten cancelledScopeRetention after its cancel (cancelledScopeOrder is
+	// the insertion-ordered expiry list), see recordCancelledScopeLocked.
+	cancelledScopes              map[string]struct{}
+	cancelledScopeOrder          []cancelledScope
 	admitPriorMu                 sync.Mutex
 	admitPriorPeak               int64
 	admitPriorOK                 bool

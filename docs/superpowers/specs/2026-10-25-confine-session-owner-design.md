@@ -1,5 +1,7 @@
 # AIRA-313 — a Claude Code session owns its confine jobs, wherever it runs from
 
+**Superseded in part (AIRA-328, 2026-11-14):** `aira confine --kill` now cancels a job still waiting for admission (owner-checked the same way; reply `phase` `queued`, `status` `cancelled`; the launcher exits `ran=no code=U_ADMIT_CANCELLED admission=cancelled`, exit 3). The "Queued jobs" bullet below (`--kill` gives `E_CONFINE_NOT_FOUND`; end your own queued job with a plain `kill <supervisor pid>`) is retired, and the skill no longer teaches the plain kill.
+
 Ticket: AIRA-313 (bug, P2, v0.40). Rants: RANT-48, -49, -50, -51, -53.
 Related: AIRA-23 / AIRA-52 (owner chain, owner in the scope id), AIRA-302
 (retired: `@cwd` refusal is by design), AIRA-265 / AIRA-266 / AIRA-277 (SESSION

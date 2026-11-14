@@ -146,7 +146,14 @@ func startSaturatedAdmit(t *testing.T, server *Server, maximum int64, args map[s
 	}
 	t.Cleanup(func() {
 		_ = clientConn.Close()
-		<-done
+		// Bounded (AIRA-328): a code path that panics holding queue.mu leaves
+		// admitConnection blocked on that lock for ever, and an unbounded wait
+		// here would turn the panic into a whole-binary timeout.
+		select {
+		case <-done:
+		case <-testdeadline.After(5 * time.Second):
+			t.Error("admitConnection did not return after the client closed (a lock left held?)")
+		}
 	})
 
 	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))

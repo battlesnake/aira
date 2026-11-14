@@ -366,13 +366,24 @@ var ExitCodes = map[string]int{
 	// shape as E_LEASE_HELD and E_TRANSITION_INVALID, not the host-capacity shape
 	// of the 4s. Raised ONLY by a ci-shim daemon (the box daemon never trips), so
 	// it never reaches an interactive operator on the shared slice.
-	"E_ADMIT_FAILFAST_TRIPPED":   1,
+	"E_ADMIT_FAILFAST_TRIPPED": 1,
+	// AIRA-328. A queued job an operator cancelled with `aira confine --kill`
+	// before it was admitted. U_ and 3, mirroring U_RUN_DETACH_CANCELLED and
+	// U_CONFINE_DETACH_CANCELLED, the other "deliberately not run" verdicts: the
+	// command never executed, so it neither passed nor failed, and 1 would assert
+	// a failure that never happened.
+	"U_ADMIT_CANCELLED":          3,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
 	// AIRA-309. `confine --front` names a job that exists but is not waiting in
 	// the admission queue (already admitted, or a sub-reservation that follows
 	// its parent): the state is wrong, not the selector, so 1 — the same side of
 	// the rule as E_CONFINE_OWNER_UNVERIFIED.
 	"E_CONFINE_NOT_QUEUED": 1,
+	// AIRA-328. `confine --kill` names a queued aitest worker claim (a
+	// sub-reservation), which follows its suite and is not cancellable on its
+	// own: the target is wrong for the state, not malformed, so 1 like
+	// E_CONFINE_NOT_QUEUED. The remedy is to kill the owning suite's supervisor.
+	"E_CONFINE_KILL_WORKER_CLAIM": 1,
 	// AIRA-312. `confine --resize` names a job that is not a running job-level
 	// grant (still queued, or a sub-reservation/worker that follows its parent):
 	// the state is wrong, not the request, so 1 like E_CONFINE_NOT_QUEUED. A

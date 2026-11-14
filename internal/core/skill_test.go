@@ -1416,22 +1416,37 @@ func TestSkillTeachesTheClaudeSessionConfineOwner(t *testing.T) {
 			"`/clear` and `/resume` change this session's id",
 			"The `aira` MCP server keeps the id it was started with",
 			"never counts as ownership, so killing such a job always needs `--steal` even from the same directory",
-			"a job still waiting for admission gives `E_CONFINE_NOT_FOUND`",
-			"Only when that queued row's OWNER is yours",
-			"bypasses the ownership guard",
-			"`aira top` shows it on the greyed queued row, and `aira confine --list --json` carries it as `queued[].owner` with the supervisor pid as `queued[].supervisor_pid`; the plain `--list` table lists running jobs only",
+			// AIRA-328: --kill now cancels a queued job, so the plain-kill fallback
+			// is retired and the skill teaches the cancel instead.
+			"`--kill` also cancels a job that is still waiting for admission",
+			"`confine: ran=no code=U_ADMIT_CANCELLED ... admission=cancelled` (exit 3)",
+			// The reply is the JSON object (indented on a terminal), so the
+			// skill names its fields, pinned against the render in
+			// cmd/aira TestConfineKillRendersThePhase.
+			"the reply carries `\"phase\": \"queued\"` and `\"status\": \"cancelled\"`",
+			"a running job's reply carries `\"phase\": \"running\"` and `\"status\": \"killed\"`",
+			"A name that matches both a queued and a running job is refused as ambiguous",
+			"Do not end a queued job with a plain `kill <supervisor pid>`: it bypasses the ownership guard",
+			"`aira confine --list --json` carries them as `queued[].owner`, `queued[].name` and `queued[].supervisor_pid`; the plain `--list` table lists running jobs only",
 			"back to the default owner (your Claude Code session, else the worktree)",
 			"prefer the CLI face (Bash) for confine management then, or restart the MCP connection",
+			"`aira confine --kill` cancels a job still waiting for admission (its reply carries `\"phase\": \"queued\"`) exactly as on a real host, but it cannot kill a RUNNING job here",
+			"for a running job it REFUSES rather than reporting a kill it did not perform, and names the supervisor PID to signal instead",
 		} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("%s does not teach %q", name, want)
 			}
 		}
 		for _, stale := range []string{
+			"a job still waiting for admission gives `E_CONFINE_NOT_FOUND`",
+			"end it with plain `kill <supervisor pid>`",
 			"Set `AIRA_CONFINE_OWNER` to get a real, attested owner you can kill without `--steal`.",
 			"gives it a NEW session id",
 			"`aira confine --list` shows it, `--list --json` carries it as `queued[].owner`",
 			"back to unowned",
+			// AIRA-328: in ci-shim mode the queued cancel is pure queue state and
+			// works; only a RUNNING job is refused.
+			"but `aira confine --kill` CANNOT work here",
 		} {
 			if strings.Contains(text, stale) {
 				t.Fatalf("%s still says %q", name, stale)
