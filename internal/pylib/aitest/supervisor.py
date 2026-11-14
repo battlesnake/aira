@@ -1,4 +1,6 @@
+import collections
 import errno
+import heapq
 import json
 import os
 import select
@@ -9,7 +11,15 @@ import sys
 import time
 import urllib.parse
 
-from aitest.worker import _EVENT_LINE_PREFIX, _RECYCLE_SUFFIX, _exit_child, _untag_tuples, fork_worker, run_worker_loop
+from aitest.worker import (
+    _DISPATCH_WAIT_TOKEN,
+    _EVENT_LINE_PREFIX,
+    _RECYCLE_SUFFIX,
+    _exit_child,
+    _untag_tuples,
+    fork_worker,
+    run_worker_loop,
+)
 
 
 _STOP_LINE = "__stop__"
@@ -102,11 +112,77 @@ def _trace_args(record):
         "pid", "declared_rss_bytes", "peak_rss_bytes", "cgroup_peak_bytes",
         "cpu_user_s", "cpu_system_s", "io_read_bytes", "io_write_bytes",
         "scope_path", "oom",
+        # AIRA-344 (additive): this worker's measured wait for dispatch.
+        "dispatch_wait_s", "dispatches_measured",
     ):
         value = record.get(key)
         if value is not None:
             args[key] = value
     return args
+
+
+def _split_dispatch_wait(line):
+    """(line without the AIRA-344 wait token, the wait in µs or None).
+
+    Only the LAST space-separated field can be the token -- the worker puts it right
+    after the outcome -- so the token's text inside a nodeid is never mistaken for it.
+    A line without the token (a test double, an older fake) comes back unchanged with
+    None: unmeasured, never a 0 wait. A malformed value is stripped (it must not reach
+    the outcome field) and also reads None."""
+    head, sep, tail = line.rpartition(" ")
+    marker = _DISPATCH_WAIT_TOKEN.lstrip(" ")
+    if not sep or not tail.startswith(marker):
+        return line, None
+    value = tail[len(marker):]
+    # isascii() too: str.isdigit() accepts digits int() refuses (e.g. "²"), and a
+    # ValueError here would escape _drain_worker and end the whole run.
+    return head, (int(value) if value.isascii() and value.isdigit() else None)
+
+
+def _pool_occupancy(spans, run_start_us, run_end_us):
+    """(peak live workers, time-weighted mean live workers or None, run wall s or None)
+    over (start_us, end_us) worker spans. Ends sort before starts at the same instant, so
+    a retire-and-replace is one live worker, not two. Spans are clipped to the run window;
+    without a positive window the mean and wall are None (unevaluated)."""
+    edges = sorted([(start, 1) for start, _ in spans] + [(end, -1) for _, end in spans])
+    live = peak = 0
+    for _, delta in edges:
+        live += delta
+        peak = max(peak, live)
+    if run_start_us is None or run_end_us is None or run_end_us <= run_start_us:
+        return peak, None, None
+    busy_us = sum(max(0, min(end, run_end_us) - max(start, run_start_us)) for start, end in spans)
+    return peak, busy_us / (run_end_us - run_start_us), (run_end_us - run_start_us) / 1e6
+
+
+def format_pool_summary(spans, run_start_us, run_end_us, cpu_s, wait_us, measured, completed):
+    """The one-line pool summary (AIRA-344), PURE. spans: (start_us, end_us) per worker
+    life (ready to retired, wall-clock µs); the run window is [run_start_us, run_end_us];
+    cpu_s is the supervisor's own CPU over that window; wait_us/measured: the summed
+    worker-measured dispatch wait and how many completed tests carried one.
+
+    Honest: a figure that was not established reads "unevaluated", never 0 -- the mean
+    without a run window, the CPU when it was not read, the wait when no test was
+    measured. Peak counts a retire and a start at the same instant as a replacement
+    (ends sort before starts), not as two live workers."""
+    peak, mean, wall_s = _pool_occupancy(spans, run_start_us, run_end_us)
+    if mean is not None:
+        workers = "live workers peak %d, mean %.2f over %.1f s" % (peak, mean, wall_s)
+    else:
+        workers = "live workers peak %d, mean unevaluated" % peak
+    if cpu_s is None:
+        cpu = "supervisor CPU unevaluated"
+    elif wall_s:
+        cpu = "supervisor CPU %.1f s (%.0f%% of one core)" % (cpu_s, 100.0 * cpu_s / wall_s)
+    else:
+        cpu = "supervisor CPU %.1f s" % cpu_s
+    if measured:
+        wait = "workers idle waiting for dispatch %.1f s, %.1f ms per test (measured on %d of %d tests)" % (
+            wait_us / 1e6, wait_us / 1e3 / measured, measured, completed,
+        )
+    else:
+        wait = "workers idle waiting for dispatch unevaluated (measured on 0 of %d tests)" % completed
+    return "aitest: pool: %s; %s; %s" % (workers, cpu, wait)
 
 
 def build_worker_trace_events(records, pid, process_label):
@@ -858,6 +934,177 @@ def _drain_available_lines(fd, state):
     return lines
 
 
+class _ReadyQueue:
+    """The ready queue (AIRA-343): reads as the plain list of nodeids it replaced (iteration
+    in queue order, len, ``in``, ``==`` against a list, append, pop(0)/pop(), insert(0, x),
+    remove(x)), and also answers the dispatcher's pick -- the LPT test that fits a worker --
+    without scanning the whole queue.
+
+    Order. Every entry gets a sequence number that preserves the list order exactly: append
+    counts up from 0 and insert(0, x) (requeue_once's head insert) counts down from -1, so
+    a smaller sequence number is always an earlier list position, which is the old pick's
+    FIFO tiebreak (-index). ``_order`` (seq -> nodeid, an OrderedDict kept in seq order)
+    makes every list operation the dispatcher uses O(1). A nodeid may appear twice, as it
+    could in the list; remove(x) then takes its first occurrence, as list.remove did.
+
+    Pick index. Entries are grouped by class = (reservation need, cpu need); a class keeps
+    a min-heap of (-aira_time, seq, nodeid), so its top is its best entry under the old key
+    (aira_time DESC, then FIFO -- need is constant within a class). A pick visits only the
+    classes that FIT both dimensions (the old per-test fit rule, applied once per class)
+    and compares their tops under the full old key (aira_time, need, -seq): O(classes +
+    log n) per pick instead of O(n). Deletion is lazy: removing an entry drops its seq from
+    ``_order``, and a heap entry whose seq is no longer in ``_order`` is discarded when it
+    reaches the top. Liveness is judged by seq, never by nodeid, so a nodeid removed and
+    requeued cannot revive its stale entry.
+
+    The index is built lazily on the first pick and rebuilt whenever the need/cpu/time maps
+    (or the overhead every unsized nodeid falls back to) are REASSIGNED -- compared by
+    object identity -- so a test that sets the queue before the maps, or collect(), which
+    assigns the queue before them, still picks from the live values. Mutating one of those
+    maps in place is not detected; nothing does that (collect() builds fresh dicts)."""
+
+    __slots__ = ("_order", "_seqs", "_head", "_tail", "_classes", "_source", "_classify", "_source_of")
+
+    def __init__(self, nodeids, classify, source_of):
+        # classify(nodeid) -> (need, cpu, time); source_of() -> the objects classify reads.
+        self._classify = classify
+        self._source_of = source_of
+        self._order = collections.OrderedDict()  # seq -> nodeid, in list order
+        self._seqs = {}  # nodeid -> its live seqs, ascending (len 1 unless duplicated)
+        self._head = 0  # the last head-insert seq; the next is self._head - 1
+        self._tail = 0  # the next append seq
+        self._classes = None  # (need, cpu) -> heap; None until the first pick
+        self._source = None
+        for nodeid in nodeids:
+            self.append(nodeid)
+
+    # -- the list face ------------------------------------------------------------------
+
+    def __len__(self):
+        return len(self._order)
+
+    def __iter__(self):
+        return iter(self._order.values())
+
+    def __contains__(self, nodeid):
+        return nodeid in self._seqs
+
+    def __eq__(self, other):
+        if isinstance(other, (list, tuple, _ReadyQueue)):
+            return list(self) == list(other)
+        return NotImplemented
+
+    __hash__ = None
+
+    def __repr__(self):
+        return "_ReadyQueue(%r)" % (list(self),)
+
+    def append(self, nodeid):
+        seq = self._tail
+        self._tail += 1
+        self._order[seq] = nodeid
+        self._seqs.setdefault(nodeid, []).append(seq)
+        self._index(seq, nodeid)
+
+    def insert(self, index, nodeid):
+        if index != 0:
+            # The dispatcher only ever inserts at the head (requeue_once); a middle insert
+            # has no sequence number between its neighbours.
+            raise ValueError("_ReadyQueue.insert supports index 0 only, got %r" % (index,))
+        self._head -= 1
+        seq = self._head
+        self._order[seq] = nodeid
+        self._order.move_to_end(seq, last=False)
+        self._seqs.setdefault(nodeid, []).insert(0, seq)
+        self._index(seq, nodeid)
+
+    def pop(self, index=-1):
+        if not self._order:
+            raise IndexError("pop from empty list")
+        if index == 0:
+            seq = next(iter(self._order))
+        elif index == -1:
+            seq = next(reversed(self._order))
+        else:
+            raise ValueError("_ReadyQueue.pop supports index 0 or -1 only, got %r" % (index,))
+        return self._drop(seq)
+
+    def remove(self, nodeid):
+        seqs = self._seqs.get(nodeid)
+        if not seqs:
+            raise ValueError("list.remove(x): x not in list")
+        self._drop(seqs[0])
+
+    def _drop(self, seq):
+        # The heap entry is NOT touched: it is stale from here on, discarded at the top.
+        nodeid = self._order.pop(seq)
+        seqs = self._seqs[nodeid]
+        if len(seqs) == 1:
+            del self._seqs[nodeid]
+        else:
+            seqs.remove(seq)
+        return nodeid
+
+    # -- the pick index -----------------------------------------------------------------
+
+    def _index(self, seq, nodeid):
+        if self._classes is not None:
+            need, cpu, time_cost = self._classify(nodeid)
+            heapq.heappush(self._classes.setdefault((need, cpu), []), (-time_cost, seq, nodeid))
+
+    def _reindex(self, source):
+        classes = {}
+        for seq, nodeid in self._order.items():
+            need, cpu, time_cost = self._classify(nodeid)
+            classes.setdefault((need, cpu), []).append((-time_cost, seq, nodeid))
+        for heap in classes.values():
+            heapq.heapify(heap)
+        self._classes = classes
+        self._source = source
+
+    def pick(self, budget, cpu_budget, pop):
+        """The nodeid the old full scan picked: among entries whose need <= budget AND cpu
+        need <= cpu_budget, the highest (aira_time, need, earliest-queued); None if none
+        fits. pop=True also removes it (callers own the attempts increment)."""
+        source = self._source_of()
+        if self._classes is None or len(source) != len(self._source) or any(
+            new is not old for new, old in zip(source, self._source)
+        ):
+            self._reindex(source)
+        order = self._order
+        best_key = None
+        best_heap = None
+        emptied = None
+        for cls, heap in self._classes.items():
+            need, cpu = cls
+            # The old fit rule, per class instead of per test: skip, never block, a class
+            # that does not fit either dimension.
+            if need > budget or cpu > cpu_budget:
+                continue
+            while heap and heap[0][1] not in order:
+                heapq.heappop(heap)
+            if not heap:
+                if emptied is None:
+                    emptied = []
+                emptied.append(cls)
+                continue
+            neg_time, seq, _ = heap[0]
+            key = (-neg_time, need, -seq)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_heap = heap
+        if emptied is not None:
+            for cls in emptied:
+                del self._classes[cls]
+        if best_heap is None:
+            return None
+        _, seq, nodeid = best_heap[0]
+        if pop:
+            heapq.heappop(best_heap)
+            self._drop(seq)
+        return nodeid
+
+
 class Supervisor:
     """Owns collection, the pull dispatch queue, and worker-admit relaying.
     Never runs a test itself -- see worker.py for that."""
@@ -957,6 +1204,15 @@ class Supervisor:
         # is set. One span per worker (recycles are separate spans), interval-packed
         # into lanes at emit time.
         self._worker_trace_records = []
+        # AIRA-344: the default pool summary line's inputs. Kept on every run (they are
+        # one tuple per worker life and three counters), not only under the measure dir.
+        self._worker_spans = []  # (ready wall-µs, retired wall-µs) per worker life
+        self._tests_completed = 0  # result lines accepted
+        self._dispatches_measured = 0  # ...of which carried the worker's wait token
+        self._dispatch_wait_us = 0  # summed worker-measured wait over those
+        self._run_start_wall_us = None
+        self._run_end_wall_us = None
+        self._run_cpu_s = None
         # AIRA-64 growth probe bookkeeping.
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
@@ -1027,25 +1283,32 @@ class Supervisor:
 
         `budget`/`cpu_budget` are always numeric: a None-reservation (unconfined) worker never
         calls this -- its dispatch bypasses the fit filter entirely (Task 3)."""
-        best = None
-        best_key = None
-        for index, nodeid in enumerate(self.queue):
-            need = self._need_for(nodeid)
-            # Fit filter FIRST (both dimensions), so a heavy-time RAM/cpu-oversized test is
-            # excluded and can never block a fitting lighter one.
-            if need > budget or self._cpu_need_for(nodeid) > cpu_budget:
-                continue
-            # LPT primary, RAM bin-pack secondary, FIFO (-index, earliest wins) tertiary.
-            key = (self._time_for(nodeid), need, -index)
-            if best_key is None or key > best_key:
-                best = nodeid
-                best_key = key
-        if best is None:
-            return None
-        if pop:
-            self.queue.remove(best)
+        # AIRA-343: the queue's class index answers this in O(classes + log n) with exactly
+        # the order the full scan used to compute: fit filter FIRST (both dimensions, so a
+        # heavy-time oversized test can never block a fitting lighter one), then LPT primary,
+        # RAM bin-pack secondary, FIFO tertiary. See _ReadyQueue.
+        best = self.queue.pick(budget, cpu_budget, pop)
+        if best is not None and pop:
             self.attempts[best] = self.attempts.get(best, 0) + 1
         return best
+
+    @property
+    def queue(self):
+        """The ready queue, a _ReadyQueue (AIRA-343). Assigning any iterable of nodeids
+        replaces it, in that order -- collect() and test doubles both do."""
+        return self._queue
+
+    @queue.setter
+    def queue(self, nodeids):
+        self._queue = _ReadyQueue(nodeids, self._pick_class, self._pick_source)
+
+    def _pick_class(self, nodeid):
+        """(need, cpu need, aira_time) -- what the dispatch pick orders and filters by."""
+        return self._need_for(nodeid), self._cpu_need_for(nodeid), self._time_for(nodeid)
+
+    def _pick_source(self):
+        """The objects _pick_class reads; the queue re-indexes when any is reassigned."""
+        return (self.reservation_need, self.cpu_need, self.time_cost, self._worker_overhead_bytes)
 
     def _smallest_ready(self):
         """(nodeid, reservation_need, cpu_need) for the ready nodeid with the SMALLEST
@@ -2188,6 +2451,10 @@ class Supervisor:
         # child's rusage here — real even for a crashed/SIGKILLed worker — which is
         # the per-worker RSS/CPU/IO the Gantt trace records below.
         rusage = _reap_child(pid)
+        # AIRA-344: this worker's live span for the pool summary (ready -> retired).
+        ready_us = state.get("start_wall_us")
+        if ready_us is not None:
+            self._worker_spans.append((ready_us, _now_wall_us()))
         grant = state.get("grant")
         if grant is not None:
             # AIRA-180 §5s.1. The fold happens HERE, not beside
@@ -2322,6 +2589,12 @@ class Supervisor:
             "scope_path": scope,
             "cgroup_peak_bytes": _read_cgroup_int(os.path.join(scope, "memory.peak")) if scope else None,
             "oom": _scope_oom_group_killed(scope) if scope else None,
+            # AIRA-344: this worker's summed measured wait for dispatch (None when no
+            # result of its carried one -- absent from the span, never 0) and the count.
+            "dispatch_wait_s": (
+                state["dispatch_wait_us"] / 1e6 if state.get("dispatches_measured") else None
+            ),
+            "dispatches_measured": state.get("dispatches_measured", 0),
         }
         if rusage is not None:
             record["peak_rss_bytes"] = rusage.ru_maxrss * 1024  # Linux ru_maxrss is KiB
@@ -2502,6 +2775,9 @@ class Supervisor:
             "worker_budget": honest(self._pool_budget),
             "oom_group_killed": self._pool_peak_oom,
         }
+        # AIRA-344 (additive): the pool summary line's figures, unevaluated when the run
+        # window or the measurement was not established.
+        report.update(self._pool_summary_fields(honest))
         try:
             os.makedirs(measure_dir, exist_ok=True)
             with open(
@@ -2516,6 +2792,27 @@ class Supervisor:
                 "aira aitest: could not write measurement report under %s: %s\n"
                 % (measure_dir, exc)
             )
+
+    def _pool_summary_fields(self, honest):
+        peak, mean, wall_s = _pool_occupancy(self._worker_spans, self._run_start_wall_us, self._run_end_wall_us)
+        return {
+            "live_workers_peak": peak,
+            "live_workers_mean": honest(mean),
+            "run_wall_s": honest(wall_s),
+            "supervisor_cpu_s": honest(self._run_cpu_s),
+            "dispatch_wait_s": honest(self._dispatch_wait_us / 1e6 if self._dispatches_measured else None),
+            "dispatches_measured": self._dispatches_measured,
+            "tests_completed": self._tests_completed,
+        }
+
+    def pool_summary(self):
+        """The one-line pool summary (AIRA-344) printed after every run; see
+        format_pool_summary for what each figure means."""
+        return format_pool_summary(
+            self._worker_spans, self._run_start_wall_us, self._run_end_wall_us,
+            self._run_cpu_s, self._dispatch_wait_us, self._dispatches_measured,
+            self._tests_completed,
+        )
 
     def _forget_worker_scope(self, scope):
         """Remove one worker's cgroup scope directory, remembering it for a hygiene
@@ -2896,6 +3193,8 @@ class Supervisor:
             recycling = line.endswith(_RECYCLE_SUFFIX)
             if recycling:
                 line = line[: -len(_RECYCLE_SUFFIX)]
+            # AIRA-344: the worker-measured dispatch wait rides after the outcome.
+            line, waited_us = _split_dispatch_wait(line)
             # rpartition, not partition: a parametrized pytest nodeid can
             # legitimately contain a space (e.g. test_p[a b]) -- outcome
             # never does (always one of passed/failed/skipped/error), so
@@ -2939,6 +3238,14 @@ class Supervisor:
             # spawn; run() checks the flag after this drain and aborts the pool.
             self._record_result(nodeid, outcome)
             state["in_flight"] = None
+            # AIRA-344: counted only once the result is accepted (after the batch check),
+            # so a result taking the crash path above never counts as completed.
+            self._tests_completed += 1
+            if waited_us is not None:
+                self._dispatches_measured += 1
+                self._dispatch_wait_us += waited_us
+                state["dispatch_wait_us"] = state.get("dispatch_wait_us", 0) + waited_us
+                state["dispatches_measured"] = state.get("dispatches_measured", 0) + 1
             if recycling:
                 self._retire_worker(pid, state)
                 self._replace_worker()
@@ -3372,6 +3679,10 @@ class Supervisor:
         and every worker has retired. Recycle (Task 14), crash/retry (Task 15),
         the daemon-down fallback (Task 16), and the S15/S16 probe-sized pool
         growth extend this method in place."""
+        # AIRA-344: the pool summary's run window and the supervisor's own CPU over it
+        # (collection ran before this call and is not included).
+        self._run_start_wall_us = _now_wall_us()
+        cpu_start = time.process_time()
         self.bootstrap()
         import gc
         gc.freeze()
@@ -3489,6 +3800,8 @@ class Supervisor:
                     except BrokenPipeError:
                         pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
+        self._run_end_wall_us = _now_wall_us()
+        self._run_cpu_s = time.process_time() - cpu_start
         # AIRA-180. After the dispatch loop, so every worker has retired and
         # folded its usage in. Fail-open: see _report_pool_usage.
         self._report_pool_usage()

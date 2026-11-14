@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-225","project":"aira","title":"aira confine does not contain snap-packaged tools (gcloud/terraform re-parent into snap.*.scope); escape reported only in an unread field","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","containment","dogfood","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-225","project":"aira","title":"aira confine does not contain snap-packaged tools (gcloud/terraform re-parent into snap.*.scope); escape reported only in an unread field","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.45","labels":["confine","containment","dogfood","honesty"],"hold":true,"relations":[]}
 ---
 From RANT-37 (dogfood, 2026-09-09), verified by controlled experiment on this box.
 
@@ -12,3 +12,5 @@ The honesty machinery WORKS (it reports descendant-escaped every time) — the d
 OWNER DECISION (fork): does a snap-escape earn (a) a LOUD signal / non-zero-ish prominence (cf. AIRA-222 --require-containment), or (b) an outright refusal, or (c) documented-gap only? Plus: write down that any future cloud/offload verb must call the GCP REST API from Go, never shell out to a snap binary.
 
 refs: RANT-37. Relates to AIRA-222 (silent-ungoverned launch path).
+
+Owner decision 2026-11-14: (a) a LOUD signal when a job's memory escaped the scope (a prominent trailer line, not a per-run telemetry facet), AND (b) stop learning reserve history from escaped runs (the peak report is currently sent at confine_linux.go ~1446-1459 before the escape is classified at ~1462-1467, so snap gcloud/terraform runs feed the estimator a peak that excludes the escaped process). Not a refusal, not documented-gap-only. Held, milestone v0.45; build after AIRA-323 (same report lines). AIRA-334 already stops the misleading over-reserve hint on an escaped scope.

@@ -11,7 +11,6 @@ import (
 	"io"
 	"io/fs"
 	"math"
-	"math/bits"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -349,7 +348,7 @@ func resolveDefaultConfineSlice(deps confineDeps) (string, string, error) {
 	airaPath, airaErr := deps.resolveSlicePathExact(DefaultConfineSlice)
 	if airaErr == nil {
 		if !managed {
-			return DefaultConfineSlice, "", errors.New("aira.slice cgroup is active but its aira-managed unit is absent; re-run aira install")
+			return DefaultConfineSlice, "", unitAbsentError(DefaultConfineSlice)
 		}
 		return DefaultConfineSlice, airaPath, nil
 	}
@@ -369,16 +368,37 @@ func resolveDefaultConfineSlice(deps confineDeps) (string, string, error) {
 	return DefaultConfineSlice, "", errors.New("aira.slice not found (run 'aira install')")
 }
 
-func managedConfineUnitPresent(unit string) (bool, error) {
-	home := strings.TrimSpace(os.Getenv("HOME"))
+// managedConfineUnitFile is the unit file managedConfineUnitPresent checks and
+// the HOME it was resolved from.
+func managedConfineUnitFile(unit string) (path, home string, err error) {
+	home = strings.TrimSpace(os.Getenv("HOME"))
 	if home == "" {
-		var err error
 		home, err = os.UserHomeDir()
 		if err != nil {
-			return false, err
+			return "", "", err
 		}
 	}
-	path := filepath.Join(home, ".config", "systemd", "user", unit)
+	return filepath.Join(home, ".config", "systemd", "user", unit), home, nil
+}
+
+// unitAbsentError (AIRA-335) names the file checked and the HOME it came from:
+// under an overridden HOME the advice to re-run aira install would install into
+// the wrong HOME.
+func unitAbsentError(unit string) error {
+	path, home, err := managedConfineUnitFile(unit)
+	if err != nil {
+		path, home = "unevaluated", "unevaluated"
+	}
+	return fmt.Errorf("aira.slice cgroup is active but its aira-managed unit is absent: checked %s (HOME=%s); "+
+		"if HOME is overridden for this command, run aira with your real HOME and set the override inside the job "+
+		"(aira confine -- env HOME=... <cmd>); otherwise re-run aira install", path, home)
+}
+
+func managedConfineUnitPresent(unit string) (bool, error) {
+	path, _, err := managedConfineUnitFile(unit)
+	if err != nil {
+		return false, err
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
@@ -1523,7 +1543,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// interleave between them and reintroduce exactly the glue this fixes.
 	_, _ = fmt.Fprintf(diagnostics, "\n%s\n", FormatConfineStatus(result.Status))
 	// Only an OWN-limit OOM may reach the "job OOM-killed at its memory cap" line
-	// (AIRA-102). Its other branch -- peak RSS near the cap -- is unaffected.
+	// (AIRA-102).
 	// AIRA-184. CapBytes is the SLICE's own finite cap, established by deps.readCap
 	// before this job launched (and a launch precondition, so it is set on every
 	// path that can reach a kill here) -- deliberately not ScopeMemoryMax, which is
@@ -1830,12 +1850,13 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 				"re-run from it. Either way, splitting heavy work also helps."
 		}
 	}
-	// Overflow-safe threshold: never multiply a byte count that the input domain
-	// allows to approach MaxInt64. `scopeMemoryMax - scopeMemoryMax/10` is a
-	// conservative >=90% mark that never fires below 90% for a non-round cap.
-	if peakRSS != nil && *peakRSS >= scopeMemoryMax-scopeMemoryMax/10 {
-		return fmt.Sprintf("confine: peak RSS %s reached %d%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", peak, confinePercentOfCap(*peakRSS, scopeMemoryMax), FormatConfineBytes(scopeMemoryMax))
-	}
+	// AIRA-334. A run that was not OOM-killed gets no advisory, however close its
+	// peak came to the cap. peak-rss is the scope's memory.peak, which counts
+	// reclaimable page cache (the kernel holds a file-heavy job at memory.max by
+	// reclaiming it), and every scope has memory.swap.max=0, so a run that was not
+	// OOM-killed never needed more anonymous memory than its cap. The old ">= 90%
+	// of the reserved cap; consider a higher --memory-reserve" line was wrong advice
+	// that pushed file-heavy jobs to over-reserve the shared slice.
 	return ""
 }
 
@@ -1886,17 +1907,6 @@ func confineSuggestedReserve(scopeMemoryMax int64, peakRSS *int64) int64 {
 	return escalated
 }
 
-// confinePercentOfCap returns floor(peak*100/cap) exactly, for any peak and cap
-// in [1, MaxInt64], by doing the multiply in 128 bits so peak*100 never wraps.
-// cap is > 0 and peak > 0 at every call site; peak <= cap (a peak above the
-// enforced cap is an OOM, handled before this is reached), so the quotient is
-// <= 100 and bits.Div64 (which requires the quotient to fit in 64 bits) is safe.
-func confinePercentOfCap(peak, capBytes int64) int {
-	hi, lo := bits.Mul64(uint64(peak), 100)
-	quotient, _ := bits.Div64(hi, lo, uint64(capBytes))
-	return int(quotient)
-}
-
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {
 	maxWait := request.AdmissionMaxWait
 	if maxWait <= 0 {
@@ -1919,7 +1929,8 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		ConfineScopeID:       request.ScopeID,
 		ConfineName:          request.Name,
 		ConfineOwner:         request.Owner,
-		VRAMBytes:            request.VRAMBytes, // AIRA-268
+		VRAMBytes:            request.VRAMBytes,    // AIRA-268
+		HighPriority:         request.HighPriority, // AIRA-340
 		Exclusive:            request.Exclusive,
 		// AIRA-185. TRANSCRIBED, never resolved here: admitThroughDaemon puts it on
 		// the wire only alongside `exclusive`, which is the one place that guard

@@ -267,7 +267,27 @@ func TestConfineLaunchCheckDecisionTable(t *testing.T) {
 			t.Setenv("STUB_SERVICE_RUNTIME", filepath.Dir(filepath.Dir(filepath.Dir(own.SocketPath))))
 			return enabledUnit, own.StateHome
 		}},
-		{"enabled unit for another state: wait", false, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
+		// AIRA-335. Nothing answers or holds this state's lock and the installed
+		// service serves ANOTHER state: this process's XDG_STATE_HOME or HOME points
+		// away from the installed aira, so the socket will never be served.
+		{"enabled unit for another state, no holder: refuse", true, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
+			t.Setenv("STUB_SERVICE_RUNTIME", filepath.Dir(filepath.Dir(filepath.Dir(other.SocketPath))))
+			return enabledUnit, filepath.Join(t.TempDir(), "another-state")
+		}},
+		{"enabled unit for another state, something answers at this socket with no lock: wait", false, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
+			if err := os.MkdirAll(filepath.Dir(own.SocketPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("unix", own.SocketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			t.Setenv("STUB_SERVICE_RUNTIME", filepath.Dir(filepath.Dir(filepath.Dir(other.SocketPath))))
+			return enabledUnit, filepath.Join(t.TempDir(), "another-state")
+		}},
+		{"enabled unit for another state, this state's lock held at this socket: wait", false, func(t *testing.T, own, other daemon.Paths) (daemon.SystemctlRun, string) {
+			holdStateLock(t, own, own.SocketPath)
 			t.Setenv("STUB_SERVICE_RUNTIME", filepath.Dir(filepath.Dir(filepath.Dir(other.SocketPath))))
 			return enabledUnit, filepath.Join(t.TempDir(), "another-state")
 		}},
@@ -292,4 +312,87 @@ func TestConfineLaunchCheckDecisionTable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// verifies: AIRA-335 -- the foreign-state refusal names this process's state
+// home and socket, the service's state home, and the XDG_STATE_HOME and HOME
+// values it came from, so the cause is on the line.
+func TestConfineLaunchRefusalNamesBothStateHomesWhenTheServiceServesAnotherState(t *testing.T) {
+	own, err := daemon.PathsFromEnvironment(filepath.Join(t.TempDir(), "private-state"), shortRuntimeDir(t), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceState := filepath.Join(t.TempDir(), "installed-state")
+	t.Setenv("STUB_SERVICE_RUNTIME", shortRuntimeDir(t))
+	refusal := unreachableDaemonError(own, enabledServiceUnit, serviceReader(serviceState), func(name string) string {
+		switch name {
+		case "XDG_STATE_HOME":
+			return own.StateHome
+		case "HOME":
+			return "/home/agent"
+		}
+		return ""
+	})
+	if refusal == nil {
+		t.Fatal("a launch whose state no daemon will ever serve was not refused")
+	}
+	for _, want := range []string{daemon.CodeUnavailable, own.StateHome, own.SocketPath, serviceState, "XDG_STATE_HOME (" + own.StateHome + ")", "HOME (/home/agent)"} {
+		if !strings.Contains(refusal.Error(), want) {
+			t.Fatalf("refusal %q does not name %q", refusal, want)
+		}
+	}
+}
+
+// verifies: AIRA-335 (plan correction) -- the FALSE-REFUSAL direction. An
+// overridden XDG_STATE_HOME or HOME alone never refuses: with a daemon answering
+// at this process's own socket, the launch goes ahead even though the installed
+// service serves a different state. Many tests run aira under a private HOME or
+// XDG_STATE_HOME with their own daemon; a refusal keyed on the override would
+// break every one of them.
+func TestConfineLaunchWithAnOverriddenStateAndAReachableDaemonIsNotRefused(t *testing.T) {
+	for _, override := range []string{"XDG_STATE_HOME", "HOME"} {
+		t.Run(override, func(t *testing.T) {
+			dir := t.TempDir()
+			if override == "HOME" {
+				t.Setenv("HOME", dir)
+				unsetenvForTest(t, "XDG_STATE_HOME")
+			} else {
+				t.Setenv("XDG_STATE_HOME", dir)
+			}
+			t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+			own, err := daemon.PathsFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(own.StateHome, dir) {
+				t.Fatalf("fixture: state home %q is not under the overridden %s %q", own.StateHome, override, dir)
+			}
+			t.Setenv("STUB_SERVICE_RUNTIME", shortRuntimeDir(t))
+			read := serviceReader(filepath.Join(t.TempDir(), "installed-state"))
+			// Positive control: with no daemon, the same fixture IS refused, so the
+			// pass below is the reachable daemon's doing and not a dead fixture.
+			if refusal := unreachableDaemonError(own, enabledServiceUnit, read, os.Getenv); refusal == nil {
+				t.Fatal("fixture: without a daemon the foreign-state launch was not refused")
+			}
+			startCommandDaemon(t, daemon.NewServer(own))
+			if refusal := unreachableDaemonError(own, enabledServiceUnit, read, os.Getenv); refusal != nil {
+				t.Fatalf("a launch whose own daemon answers was refused for its %s override: %v", override, refusal)
+			}
+		})
+	}
+}
+
+// enabledServiceUnit answers systemctl like an enabled aira-daemon.service whose
+// socket directory comes from STUB_SERVICE_RUNTIME (the user manager's).
+func enabledServiceUnit(argv []string) ([]byte, error) {
+	if answer, ok := fragmentPathAnswer(argv); ok {
+		return answer, nil
+	}
+	switch strings.Join(argv, " ") {
+	case "systemctl --user is-enabled aira-daemon.service":
+		return []byte("enabled\n"), nil
+	case "systemctl --user show-environment":
+		return []byte("XDG_RUNTIME_DIR=" + os.Getenv("STUB_SERVICE_RUNTIME") + "\n"), nil
+	}
+	return nil, errors.New("unexpected: " + strings.Join(argv, " "))
 }

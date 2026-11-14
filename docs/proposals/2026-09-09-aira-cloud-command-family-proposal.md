@@ -235,6 +235,7 @@ and its descriptor lives deliberately outside the repo.
   exact shape everything here fits: *"the only remotes AIRA ever reaches are the git remotes you
   explicitly hand it"* → explicit user-supplied target, no discovery, no phone-home. **This
   contradiction is an owner decision and blocks even the thin version.**
+- **Non-goal (carried over from AIRA-226, 2026-11-14):** never wire a cloud-offload or escalation trigger to admission pressure. The demand for offload in the 2026-09 incident was manufactured by a sizing gap (a 14x over-reservation), not by a real local-compute shortage; an "offload when admission saturates" trigger would have spent money to work around a sizing bug. Over-reserve visibility is answered locally (the confine exit hint, `--resize`, the pinned-reserve charge discount).
 - Cloud work appears in **zero** of the (then) 219 tickets and 36 rants; every remedy anyone has
   asked for is local. This demand surfaced only through interviews.
 

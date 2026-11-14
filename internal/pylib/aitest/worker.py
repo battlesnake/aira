@@ -34,6 +34,17 @@ _WARNED_INVALID_ENV_VARS = set()
 # run_worker_loop's recycle branch above.
 _RECYCLE_SUFFIX = " __recycle_next__"
 
+# AIRA-344. Appended to every result line, after the outcome and before any
+# _RECYCLE_SUFFIX: "<nodeid> <outcome> __dispatch_wait_us__=<N>". N is how long
+# this worker waited for THIS test, in whole microseconds of CLOCK_MONOTONIC:
+# from the moment it began sending its previous result (or entered its loop,
+# for its first test) to the moment it had read this test's nodeid. Measured
+# here, in the worker, because only the worker sees a result that sits unread
+# in the pipe while the supervisor is busy. supervisor.py's _split_dispatch_wait
+# reads and strips it; a line without it (a test double) parses exactly as
+# before and counts as an unmeasured dispatch.
+_DISPATCH_WAIT_TOKEN = " __dispatch_wait_us__="
+
 # Every JSON event line a worker writes carries this explicit sentinel, and
 # supervisor.py's _drain_worker matches on it EXPLICITLY -- never on a bare
 # line.startswith("{") JSON-shape guess (Sol round-2: a pytest nodeid can in
@@ -554,12 +565,15 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
         break
     started_at = time.monotonic()
     completed_count = 0
+    # AIRA-344: when this worker last became free for a test (see _DISPATCH_WAIT_TOKEN).
+    free_since = time.monotonic()
     for line in pipe_in:
         nodeid = line.rstrip("\n")
         if nodeid == "":
             continue
         if nodeid == "__stop__":
             break
+        waited_us = max(0, int((time.monotonic() - free_since) * 1_000_000))
         item = items_by_nodeid[nodeid]
         outcome, events = run_one(item)
         completed_count += 1
@@ -583,10 +597,16 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
         # plugin applies str(propvalue) to a property value, so repr would
         # silently emit DIFFERENT XML than a plain, non-aitest run for any
         # object whose __str__/__repr__ differ.
-        for event in events:
-            pipe_out.write(
-                _EVENT_LINE_PREFIX + json.dumps(_tag_tuples(event), default=str) + "\n"
-            )
+        #
+        # AIRA-344: the whole message is built BEFORE free_since is stamped, so the
+        # next test's wait starts when this worker begins sending -- a write that
+        # blocks on a full pipe (the supervisor not reading) counts as waiting, and
+        # this worker's own serialization does not. One write of the joined payload
+        # is the same byte stream, still followed by ONE flush.
+        payload = [
+            _EVENT_LINE_PREFIX + json.dumps(_tag_tuples(event), default=str) + "\n"
+            for event in events
+        ]
         # The recycle decision rides in the SAME line as the result, not a
         # separate write -- two independent write()+flush() calls left a
         # real window (not just a buffering artifact; a genuine scheduling
@@ -596,10 +616,12 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
         # silently losing that dispatch with no crash/EOF to detect it by
         # (worker.py's own recycle check runs strictly after the result is
         # already sent). One atomic message removes the window entirely.
-        line = "%s %s" % (nodeid, outcome)
+        line = "%s %s%s%d" % (nodeid, outcome, _DISPATCH_WAIT_TOKEN, waited_us)
         if recycling:
             line += _RECYCLE_SUFFIX
-        pipe_out.write(line + "\n")
+        payload.append(line + "\n")
+        free_since = time.monotonic()
+        pipe_out.write("".join(payload))
         pipe_out.flush()
         if recycling:
             return

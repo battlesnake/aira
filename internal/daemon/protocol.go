@@ -176,6 +176,19 @@ import (
 // client from silently writing mod rows with no idempotency key to a NEW daemon. Same
 // atomic reinstall+restart requirement as 6-14; ARDR is sniffed BEFORE the version
 // check, so a suite's held worker leases still re-anchor across the upgrade.
+//
+// AIRA-340 added the optional `priority` field to the confine-admit REQUEST WITHOUT
+// a bump, deliberately. The vram entry above bumped so an old daemon would refuse a
+// new field loudly; here validateAdmitArgs' allowlist already does that per request,
+// so a bump would only add a refusal of EVERY confine during a client/daemon skew.
+// Measured 2026-11-14 against the live proto-15 daemon that predates the field:
+// `--priority high` -> `E_DAEMON_PROTOCOL: unexpected admit field "priority"`; a
+// launch without --priority ran normally (the client omits the field unless high).
+// The client answers exactly that refusal by re-asking once without the field and
+// printing a notice that the job queues at NORMAL priority, so a hook or Makefile
+// carrying `--priority high` keeps working until the daemon is restarted (queue
+// order is never a safety property; contrast `exclusive`, which refuses). An old
+// client never sends the field, and absent means normal.
 const (
 	ProtocolVersion = 15
 	MaxFrameBytes   = 16 << 20

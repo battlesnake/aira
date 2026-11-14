@@ -281,6 +281,17 @@ type admitWaiter struct {
 	pushSeq  int64
 	bypassed int64
 
+	// AIRA-340. high is the launch-time `aira confine --priority high`: a property
+	// of the REQUEST, copied here at enqueue and never written again. It changes
+	// ONLY the evaluation order (admitOrderLocked: after every --front push, before
+	// every normal waiter, FIFO among the high ones), never the head rule: a high
+	// head that does not fit is an ordinary (unpushed) head with the AIRA-307
+	// budget and backstop, so a misused `high` cannot wedge the slice the way a
+	// pushed head can. Because the client sends it on every admit request, a
+	// reconnect after a daemon restart re-enqueues the job still high (unlike a
+	// push, which the restart drops).
+	high bool
+
 	// S8 (restart/anchor state — design §3 compare-and-release, §4 restart).
 	//
 	// anchor is the connection that CURRENTLY owns this lease (design §3 Inv 4): a
@@ -388,11 +399,18 @@ func (w *admitWaiter) isSubReservation() bool {
 	return w != nil && w.parentScopeID != ""
 }
 
-// admitOrderLocked is THE admission evaluation order (AIRA-309), derived on
-// every call and never stored: pushed waiters first, LATEST push first
-// (descending pushSeq), then every other queued waiter in enqueue order — the
-// order queue.waiters already holds. queue.waiters itself is never reordered.
-// queue.mu must be held.
+// admitOrderLocked is THE admission evaluation order (AIRA-309, AIRA-340),
+// derived on every call and never stored, in three tiers:
+//
+//  1. pushed waiters (`aira confine --front`), LATEST push first (descending
+//     pushSeq);
+//  2. `--priority high` waiters, in ENQUEUE order (FIFO, not latest-first: with
+//     latest-first a box where every session marks its jobs high would degrade
+//     to newest-first and starve the older ones);
+//  3. every other queued waiter, in enqueue order.
+//
+// Enqueue order is the order queue.waiters already holds; queue.waiters itself
+// is never reordered. queue.mu must be held.
 //
 // It has three readers and must stay their only source, or the client's "queue
 // position N of M" line, the queued-ahead total and the `aira top` row order
@@ -400,16 +418,19 @@ func (w *admitWaiter) isSubReservation() bool {
 // admitSliceSnapshotFor (position, queued-ahead bytes, queuedEntries), which
 // feeds the AIRA-308 rows.
 func admitOrderLocked(queue *sliceQueue) []*admitWaiter {
-	var pushed, rest []*admitWaiter
+	var pushed, high, rest []*admitWaiter
 	for _, waiter := range queue.waiters {
 		if waiter == nil || waiter.state != admitQueued {
 			continue
 		}
-		if waiter.pushSeq > 0 {
+		switch {
+		case waiter.pushSeq > 0:
 			pushed = append(pushed, waiter)
-			continue
+		case waiter.high:
+			high = append(high, waiter)
+		default:
+			rest = append(rest, waiter)
 		}
-		rest = append(rest, waiter)
 	}
 	// pushSeq values are distinct (each push takes a fresh queue.seq), so this
 	// order is total; insertion sort keeps it allocation-free for the handful of
@@ -419,7 +440,7 @@ func admitOrderLocked(queue *sliceQueue) []*admitWaiter {
 			pushed[j], pushed[j-1] = pushed[j-1], pushed[j]
 		}
 	}
-	return append(pushed, rest...)
+	return append(append(pushed, high...), rest...)
 }
 
 // admitBypassBudget is the AIRA-307 budget of a head: half its own requested
@@ -863,6 +884,9 @@ type admitRequest struct {
 	exclusiveReason string
 	exclusiveHolder string
 	parentScopeID   string
+	// AIRA-340. high is the optional `priority` admit field: "high" sets it,
+	// "normal" or absence leaves it false. Queue order only (see admitWaiter.high).
+	high bool
 
 	// S8 (anchor). conn / clientPID / processStartTick / peerSameUID are resolved by
 	// admitConnection from the connection BEFORE the enqueue lock and carried here so
@@ -1286,7 +1310,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			// Values, never the waiter: the entry outlives queue.mu.
 			snapshot.queuedEntries = append(snapshot.queuedEntries, runner.ConfineQueuedEntry{
 				ScopeID: waiter.scopeID, ReserveBytes: waiter.reserve, VRAMBytes: waiter.vram,
-				Pushed: waiter.pushSeq > 0,
+				Pushed: waiter.pushSeq > 0, High: waiter.high,
 			})
 		}
 	}
@@ -1471,12 +1495,14 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 				read = s.db.ConfinePeakHistory
 			}
 			if read != nil {
+				readStart := time.Now()
 				stats, err := read(readCtx, request.signature)
 				if err != nil {
 					// The read itself could not be established (timeout / DB error).
 					// Distinguish this from genuine absence of history so the basis is
 					// honest; the reserve value still falls back safely below.
 					historyUnavailable = true
+					logAdmitHistoryReadFailure(request.signature, time.Since(readStart), readCtx.Err(), err)
 				} else {
 					own = stats
 					reserve := request.reserve
@@ -2289,7 +2315,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, vram: request.vram, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, vram: request.vram, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, high: request.high}
 	// Anchor the fresh lease to its connection through the same helper a re-declare
 	// uses, so the anchor identity is set uniformly. The connection's EOF release
 	// compares its own conn against this anchor.
@@ -3178,11 +3204,14 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// the count to 13. All prior additions were ADDITIVE: no existing field changed
 	// meaning, and (bar cpu, the second ledger resource) no admission, gate or
 	// emptiness decision reads the others.
-	if len(args) < 3 || len(args) > 14 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/vram/signature/pinned/exclusive/exclusive_holder/parent_scope_id/reason, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	// AIRA-340 added the optional `priority` field (widening the count to 15).
+	// Additive and absent-means-normal; see the parse below for why an OLDER
+	// daemon's refusal of it is the wire-compatibility story.
+	if len(args) < 3 || len(args) > 15 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/vram/signature/pinned/exclusive/exclusive_holder/parent_scope_id/reason/priority, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "cpu" && name != "vram" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" {
+		if name != "slice" && name != "reserve" && name != "cpu" && name != "vram" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" && name != "priority" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -3319,6 +3348,33 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 			}
 		}
 	}
+	// AIRA-340. `priority` is "high" or "normal"; anything else (another word, a
+	// non-string) is refused, never read as normal: a priority the caller asked
+	// for and silently did not get is a fake pass. The client sends it ONLY when
+	// high, so a normal launch's wire is byte-identical to before. No protocol
+	// bump: this allowlist already REFUSES an unknown field, so an OLDER daemon
+	// answers a high request E_DAEMON_PROTOCOL ("unexpected admit field"); the
+	// client re-asks once without the field and prints a notice that the job runs
+	// at NORMAL priority — visible, never a silent normal.
+	high := false
+	if raw, exists := args["priority"]; exists {
+		text, valid := raw.(string)
+		switch {
+		case !valid:
+			return admitRequest{}, fmt.Errorf("%s: admit priority must be a string", CodeProtocol)
+		case text == runner.ConfinePriorityHigh:
+			high = true
+		case text == runner.ConfinePriorityNormal:
+		default:
+			return admitRequest{}, fmt.Errorf("%s: admit priority must be %q or %q", CodeProtocol, runner.ConfinePriorityHigh, runner.ConfinePriorityNormal)
+		}
+	}
+	// A sub-reservation (`confine-reserve`, an aitest claim) has no launch flag
+	// and is already exempt from every freeze; a hand-crafted one may not claim
+	// the high tier either.
+	if high && parentScopeID != "" {
+		return admitRequest{}, fmt.Errorf("%s: admit priority high is for job-level launches and cannot accompany parent_scope_id", CodeProtocol)
+	}
 	// A SCOPED request is job-level work by definition, so it may not also declare
 	// itself somebody's sub-reservation: that combination would let a hand-crafted
 	// request claim the drain exemption while being exactly the new job-level work
@@ -3412,7 +3468,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID, high: high}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3425,7 +3481,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// exclusive requires the tuple refused just above), and it is transcribed
 	// anyway so that relaxing either rule later cannot silently drop the field
 	// instead of failing a test.
-	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
+	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID, high: high}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

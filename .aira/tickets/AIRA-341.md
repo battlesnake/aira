@@ -1,0 +1,10 @@
+---
+{"schema":1,"id":"AIRA-341","project":"aira","title":"admission: delete the machine-wide p90 prior (the estimate:p90-prior rung) and its history query/cache","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":"v0.43","labels":[],"hold":true,"relations":[]}
+---
+
+
+Owner decision 2026-11-14 (backlog plan B#3a, formerly AIRA-317 part 2): DELETE the machine-wide "p90 prior", the `estimate:p90-prior` rung of the unpinned-reserve estimator that sizes a never-seen command from the box-wide 90th-percentile peak. Reason: it misses its 250 ms admission deadline on this box (docs/superpowers/specs/2026-11-13-history-charge-design.md section 5.1, docs/dev/aira-329-cold-start-diagnosis.md), so 16,299 of 19,899 cold first runs got the 1 GiB default anyway; making it readable (AIRA-320, retired) would have raised roughly 96k signatures' cold-start reserves to about 1.7 GiB. AIRA-331 (coarse-key prediction, held) is the better-targeted replacement.
+
+Scope (from-scratch minimum = delete): remove the p90 rung in internal/daemon/admit.go (~1432, 1622-1668: cachedAdmitPeakP90 and the `estimate:p90-prior[,ceiling-fitted]` bases), the p90 history query in internal/store/confine_peak_history.go and the server.go plumbing, the related tests, and any docs/skill text that names `estimate:p90-prior`. Check what consumes the basis string (trailers, `--summary-file`, the budget classifier in internal/store/resource_budget.go, aira top) and keep them honest: a cold run must still say `fallback:no-history` (or the next rung's basis), never a stale basis. Verify the 1 GiB default behaviour for a cold run is unchanged (AIRA-304).
+Tests: a cold signature with the p90 rung gone sizes at the default and reports `fallback:no-history`; no remaining reference to the deleted basis (grep test); history reads for warm signatures unchanged.
+Correctness-critical (admission estimator): daemon change; two-loop. Held, milestone v0.43; release it with AIRA-228 (both simplify admission). Related: AIRA-317 (decided, retired), AIRA-320 (retired), AIRA-331, AIRA-273.

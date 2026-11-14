@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-335","project":"aira","title":"confine: refuse and name the path when HOME or XDG_STATE_HOME points away from the installed aira (no silent endless wait; 'unit absent' names HOME)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-335","project":"aira","title":"confine: refuse and name the path when HOME or XDG_STATE_HOME points away from the installed aira (no silent endless wait; 'unit absent' names HOME)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
 ---
 
 

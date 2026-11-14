@@ -40,6 +40,8 @@ type ConfineQueuedEntry struct {
 	VRAMBytes int64
 	// Pushed is whether an operator pushed this waiter to the front (AIRA-309).
 	Pushed bool
+	// High is whether the job was launched with `--priority high` (AIRA-340).
+	High bool
 }
 
 // queuedConfineRecord builds the facets of a queued row that need no live read,
@@ -69,7 +71,11 @@ func queuedConfineRecord(entry ConfineQueuedEntry, now time.Time) (ConfineRecord
 		Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid,
 		Worker:       IsAitestWorkerScopeName(name), // classified exactly as a live row is
 		ReserveBytes: &reserve, VRAMBytes: &vram, Pushed: entry.Pushed,
+		Priority:          ConfinePriorityNormal,
 		UnevaluatedFields: []string{"populated", "rss", "cap", "cpu", "supervisor_live"},
+	}
+	if entry.High {
+		record.Priority = ConfinePriorityHigh
 	}
 	if age := now.Sub(time.Unix(0, stamp)); age >= 0 {
 		seconds := int64(age / time.Second)

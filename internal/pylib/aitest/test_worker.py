@@ -13,6 +13,7 @@ from aitest.worker import fork_worker, place_self
 from aitest.worker import _DEFAULT_MAX_SECONDS, _DEFAULT_MAX_TESTS
 from aitest.worker import _EVENT_LINE_PREFIX, _exit_child, _tag_tuples, _untag_tuples
 from aitest.worker import _should_recycle, run_one, run_worker_loop
+from aitest.supervisor import _split_dispatch_wait
 
 
 def test_place_self_writes_pid_to_cgroup_procs(tmp_path):
@@ -216,7 +217,12 @@ def _split_worker_lines(pipe_out):
         if line.startswith(_EVENT_LINE_PREFIX):
             events.append(_untag_tuples(json.loads(line[len(_EVENT_LINE_PREFIX):])))
         else:
-            plain.append(line)
+            # AIRA-344: every result line also carries the worker's dispatch-wait token
+            # after the outcome; strip it (asserting it is there) so the Slice 1
+            # assertions below still read "<nodeid> <outcome>".
+            body, waited = _split_dispatch_wait(line)
+            assert waited is not None and waited >= 0, line
+            plain.append(body)
     return events, plain
 
 
@@ -236,7 +242,7 @@ def test_run_worker_loop_dispatch_and_result_round_trip(pytester):
     # nodeid, after every one of its events -- the supervisor's whole
     # stage-then-replay contract depends on that ordering.
     pipe_out.seek(0)
-    assert pipe_out.read().splitlines()[-1] == "%s passed" % nodeid
+    assert _split_dispatch_wait(pipe_out.read().splitlines()[-1])[0] == "%s passed" % nodeid
     assert [event["kind"] for event in events] == [
         "logstart", "report", "report", "report", "logfinish",
     ]
@@ -510,7 +516,7 @@ def test_run_worker_loop_serializes_a_non_json_user_property_via_str_not_repr(py
     pipe_out.seek(0)
     raw = pipe_out.read()
 
-    assert raw.splitlines()[-1] == "%s passed" % nodeid, (
+    assert _split_dispatch_wait(raw.splitlines()[-1])[0] == "%s passed" % nodeid, (
         "the worker must SURVIVE a non-JSON-serializable user property and "
         "still report the real outcome: %r" % raw
     )

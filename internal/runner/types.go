@@ -258,7 +258,13 @@ type Request struct {
 	// job's internal progress, which a drain must not block or it never converges.
 	Exclusive       bool   `json:"exclusive,omitempty"`
 	ExclusiveHolder string `json:"exclusive_holder,omitempty"`
-	ParentScopeID   string `json:"parent_scope_id,omitempty"`
+	// AIRA-340. HighPriority is `aira confine --priority high`: the admit request
+	// carries `priority: "high"`, which puts the job in the daemon's high tier of
+	// the admission queue (after --front pushes, before normal jobs, FIFO among
+	// themselves). Queue order only. Sent on EVERY admit exchange, so a reconnect
+	// after a daemon restart re-enqueues the job still high.
+	HighPriority  bool   `json:"high_priority,omitempty"`
+	ParentScopeID string `json:"parent_scope_id,omitempty"`
 	// AIRA-185. ExclusiveReason is the holder's free-text label for WHY the slice
 	// is being held ("deploy: slice-ceiling flip"), which ConfineName cannot carry
 	// (it must be a valid confine identity and must match the scope id). It is

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-197","project":"aira","title":"aira container run -- a restricted, admission-gated podman launcher so agents get containers into aira.slice without knowing podman, with the AIRA socket mapped in (run works; nested confine is cgroup-namespace blocked)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","container","daemon","podman"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-197","project":"aira","title":"aira container run -- a restricted, admission-gated podman launcher so agents get containers into aira.slice without knowing podman, with the AIRA socket mapped in (run works; nested confine is cgroup-namespace blocked)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"later","labels":["admission","confine","container","daemon","podman"],"hold":true,"relations":[]}
 ---
 
 Owner request (2026-09-09), verbatim: "Perhaps aira should have a

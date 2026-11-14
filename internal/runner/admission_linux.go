@@ -44,6 +44,21 @@ var errDetachKillIntent = errors.New("detached run has a pending kill intent")
 // class this slice closes). It never escapes admitThroughDaemon.
 var errAdmitReconnect = errors.New("aira: admission transport failed; reconnect")
 
+// errAdmitPriorityUnknown is an INTERNAL sentinel (AIRA-340): a `--priority high`
+// request met a daemon that predates the field (oldDaemonPriorityRefusal).
+// Priority is queue order only, never a safety property, so admitThroughDaemon
+// re-asks ONCE without the field and prints a visible notice that the job runs at
+// NORMAL priority: a hook or Makefile carrying `--priority high` keeps working
+// across a new-client / not-yet-restarted-daemon skew, and nothing claims a
+// priority the job did not get. It never escapes admitThroughDaemon.
+var errAdmitPriorityUnknown = errors.New("aira: the admission daemon predates --priority")
+
+// oldDaemonPriorityRefusal is the refusal an admission daemon that predates the
+// `priority` field (proto 15 before AIRA-340) answers a high request with, from
+// its admit-field allowlist. Matched exactly, so any OTHER protocol refusal of a
+// high request stays terminal.
+const oldDaemonPriorityRefusal = `unexpected admit field "priority"`
+
 func (result admissionResult) releaseAdmission() {
 	if result.release != nil {
 		_ = result.release.Close()
@@ -265,6 +280,17 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 			return admissionResult{}, false, err
 		}
 		result, granted, err := r.admitExchangeOnce(ctx, req, effectiveReserve, dial)
+		if errors.Is(err, errAdmitPriorityUnknown) {
+			// The refused request left no state on the daemon (the allowlist runs
+			// before any enqueue), so re-asking is a fresh, normal request. HighPriority
+			// is cleared on this local copy, so the re-ask and every later reconnect
+			// omit the field: exactly one degrade, never a loop.
+			req.HighPriority = false
+			if r.diagnostics != nil {
+				_, _ = fmt.Fprintln(r.diagnostics, "confine: notice: the admission daemon predates --priority high (it refused the field); this job queues at NORMAL priority. Run `systemctl --user restart aira-daemon.service` after installing this aira to enable it.")
+			}
+			continue
+		}
 		if !errors.Is(err, errAdmitReconnect) {
 			return result, granted, err
 		}
@@ -441,6 +467,15 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	if req.ParentScopeID != "" {
 		frame.Request.Args["parent_scope_id"] = req.ParentScopeID
 	}
+	// AIRA-340. Sent ONLY when high, so a normal launch's wire is byte-identical to
+	// before and keeps working against an older daemon. This frame is rebuilt from
+	// req on every exchange, so a reconnect after a daemon restart re-sends it. An
+	// older daemon refuses the unknown field with E_DAEMON_PROTOCOL; the refusal
+	// path below turns exactly that refusal into errAdmitPriorityUnknown, and
+	// admitThroughDaemon re-asks at normal priority with a visible notice.
+	if req.HighPriority {
+		frame.Request.Args["priority"] = ConfinePriorityHigh
+	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return fail()
 	}
@@ -467,6 +502,17 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		// E_DAEMON_PROTOCOL is included because that is precisely what an OLDER
 		// daemon answers to the unknown `exclusive` field: version skew must be
 		// loud, not a silently contended benchmark.
+		// AIRA-340. The one refusal a NEW client meets against an OLDER daemon: it
+		// does not know the `priority` field. Handed back for one re-ask at normal
+		// priority (see errAdmitPriorityUnknown); every other refusal stays terminal.
+		// Matched BEFORE the exclusive block, which makes every other
+		// E_DAEMON_PROTOCOL terminal for an exclusive request: an exclusive high
+		// request re-asks too, and the re-ask keeps `exclusive` (only HighPriority
+		// is cleared), so exclusivity is still granted or refused by the daemon.
+		if req.HighPriority && response.Code == "E_DAEMON_PROTOCOL" && strings.Contains(response.Error, oldDaemonPriorityRefusal) {
+			_ = conn.Close()
+			return admissionResult{}, false, errAdmitPriorityUnknown
+		}
 		if req.Exclusive {
 			switch response.Code {
 			case "E_ADMIT_EXCLUSIVE_ACTIVE", "U_ADMIT_EXCLUSIVE_UNESTABLISHED", "E_DAEMON_PROTOCOL", "E_DAEMON_BUSY":
@@ -696,7 +742,13 @@ func (r *Runner) warnDaemonWait(waited time.Duration) {
 	if r.diagnostics == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(r.diagnostics, "aira: waiting for the memory-admission daemon to become reachable (waited %s); the launch is held, not run ungoverned\n", waited.Round(time.Second))
+	// AIRA-335: name the socket dialled, so a wait on a socket no daemon serves
+	// (a private XDG_STATE_HOME or XDG_RUNTIME_DIR) diagnoses itself.
+	socket := r.admitSocketPath
+	if strings.TrimSpace(socket) == "" {
+		socket = "unevaluated"
+	}
+	_, _ = fmt.Fprintf(r.diagnostics, "aira: waiting for the memory-admission daemon to become reachable at %s (waited %s); the launch is held, not run ungoverned\n", socket, waited.Round(time.Second))
 }
 
 const mathMaxInt64 = int64(^uint64(0) >> 1)
