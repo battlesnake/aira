@@ -2116,7 +2116,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 	// an operator cancelled this scope while it was queued, and the cancel is
 	// terminal for the scope id. Without this a client whose cancel reply was
 	// lost would reconnect (same scope id) into a fresh queue position and run.
-	if s.scopeCancelledLocked(request.scopeID) {
+	if s.scopeCancelledLocked(request.scopeID, s.admitNowTime()) {
 		s.admitRegistryMu.Unlock()
 		return nil, nil, CodeAdmitCancelled, fmt.Errorf("%s: scope %s was cancelled by `aira confine --kill` while queued", CodeAdmitCancelled, request.scopeID)
 	}

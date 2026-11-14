@@ -152,12 +152,6 @@ const (
 	WorkerAdmitReasonParentScopeUnparseable = "parent-scope-unparseable"
 	WorkerAdmitReasonAdmitSlotsSaturated    = "admit-slots-saturated"
 	WorkerAdmitReasonSaturated              = "saturated"
-	// AIRA-328. An operator cancelled this QUEUED claim with `aira confine --kill
-	// <worker-scope-id>`. class=request-invalid: terminal (a retry would mint a
-	// fresh claim and undo the cancel) without stripping containment. The aitest
-	// supervisor treats it like any non-ceiling request-invalid: the suite's
-	// remaining queued tests are reported unevaluated.
-	WorkerAdmitReasonOperatorCancelled = "operator-cancelled"
 	// AIRA-123. The ledger-only (ci-shim) admission path's own conditions.
 	//
 	// AIRA-121 answered every shim-mode worker-admit with

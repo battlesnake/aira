@@ -138,10 +138,11 @@ type Server struct {
 	// cancel must outlive the waiter. A cancel whose reply the client never reads
 	// (a dropped connection) sends the client back through its transport
 	// reconnect with the SAME scope id; without this the reconnect would queue
-	// afresh and run the job the operator was told was cancelled. Bounded FIFO
-	// (cancelledScopeOrder), see recordCancelledScopeLocked.
+	// afresh and run the job the operator was told was cancelled. Each id is
+	// forgotten cancelledScopeRetention after its cancel (cancelledScopeOrder is
+	// the insertion-ordered expiry list), see recordCancelledScopeLocked.
 	cancelledScopes              map[string]struct{}
-	cancelledScopeOrder          []string
+	cancelledScopeOrder          []cancelledScope
 	admitPriorMu                 sync.Mutex
 	admitPriorPeak               int64
 	admitPriorOK                 bool

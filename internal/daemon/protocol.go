@@ -242,8 +242,10 @@ const (
 	// U_RUN_DETACH_CANCELLED / U_CONFINE_DETACH_CANCELLED precedent: the job was
 	// deliberately not run, so it has no verdict, and reporting it as failed would
 	// fabricate one. A DEDICATED code, like the refusals above, so the runner
-	// renders `ran=no code=U_ADMIT_CANCELLED admission=cancelled` and never
-	// reconnects into a fresh queue position.
+	// renders `ran=no code=U_ADMIT_CANCELLED admission=cancelled`; a runner that
+	// did not recognise it would still refuse terminally, only anonymously, as
+	// reject:daemon-refused. A reconnect carrying the cancelled scope id is
+	// refused with this code again (the daemon's cancelled-scope record).
 	CodeAdmitCancelled = "U_ADMIT_CANCELLED"
 
 	// CodeAdmitExclusiveUnestablished refuses an --exclusive request UP FRONT when

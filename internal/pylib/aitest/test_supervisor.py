@@ -281,9 +281,6 @@ CLASS_TO_EXCEPTION = [
     # with the S2a id-reseed -- worker ids are now unique by construction.)
     ("request-invalid", "worker-scope-create-failed", "denied", WorkerAdmitRequestInvalid),
     ("request-invalid", "parent-scope-unparseable", "denied", WorkerAdmitRequestInvalid),
-    # AIRA-328: an operator cancelled the queued claim (`aira confine --kill
-    # <worker-scope-id>`). Terminal, never retried, never unconfined.
-    ("request-invalid", "operator-cancelled", "denied", WorkerAdmitRequestInvalid),
     ("request-invalid", "some-future-permanent-condition", "denied", WorkerAdmitRequestInvalid),
     ("request-invalid", "estimated-bytes-out-of-range", "argument-invalid", WorkerAdmitRequestInvalid),
     ("admission-unusable", "dial-failed", "unavailable", WorkerAdmitUnavailable),

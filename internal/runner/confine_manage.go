@@ -17,6 +17,12 @@ const (
 	// that is not waiting in the admission queue: it is already admitted, or it is
 	// a sub-reservation, whose place follows its parent's.
 	CodeConfineNotQueued = "E_CONFINE_NOT_QUEUED"
+	// CodeConfineKillWorkerClaim refuses `aira confine --kill` (AIRA-328) of a
+	// sub-reservation (an aitest worker's claim) still waiting for admission. It
+	// IS queued, so E_CONFINE_NOT_QUEUED would misdescribe it; it cannot be
+	// cancelled on its own because the claim follows its suite, which is what to
+	// kill: the owning `aira confine` supervisor.
+	CodeConfineKillWorkerClaim = "E_CONFINE_KILL_WORKER_CLAIM"
 	// CodeConfineNotRunning refuses `aira confine --resize` (AIRA-312) for a job
 	// that does not hold a job-level grant: it is still waiting in the admission
 	// queue (use --front or --kill), or it is a sub-reservation or aitest worker,

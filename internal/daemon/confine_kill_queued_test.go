@@ -51,8 +51,8 @@ func requireUntouched(t *testing.T, waiter *admitWaiter, want admitWaiterState) 
 // ambiguous); ignore the discovered running scopes (the disk-only twin is
 // cancelled instead of ambiguous); count the queued job's own discovered scope
 // as a second job (its exact-id row answers ambiguous); let a name or pid reach
-// a worker (worker rows handled); refuse a sub-reservation by exact scope id
-// (its row answers not-OK); report handled for a granted-only match (the
+// a worker (worker rows handled); cancel a sub-reservation by exact scope id
+// (its row answers OK); report handled for a granted-only match (the
 // running job's kill would be swallowed).
 func TestConfineKillQueuedResolutionAndOwnerGuard(t *testing.T) {
 	type fixture struct {
@@ -116,8 +116,7 @@ func TestConfineKillQueuedResolutionAndOwnerGuard(t *testing.T) {
 			running: func(fixture) []string { return []string{"CONFINE-mine-7777-zz@s-1"} }},
 		{name: "discovery naming the queued job itself is one job", selector: func(f fixture) string { return f.mine.scopeID }, caller: "s-1", handled: true, want: "OK", target: func(f fixture) *admitWaiter { return f.mine },
 			running: func(f fixture) []string { return []string{f.mine.scopeID} }},
-		{name: "sub-reservation by exact scope id is cancelled", selector: func(f fixture) string { return f.sub.scopeID }, caller: "s-1", handled: true, want: "OK", target: func(f fixture) *admitWaiter { return f.sub }},
-		{name: "sub-reservation of another owner refused", selector: func(f fixture) string { return f.sub.scopeID }, caller: "s-2", handled: true, want: runner.CodeConfineOwnerUnverified, target: func(f fixture) *admitWaiter { return f.sub }},
+		{name: "sub-reservation by exact scope id is refused", selector: func(f fixture) string { return f.sub.scopeID }, caller: "s-1", steal: true, handled: true, want: runner.CodeConfineKillWorkerClaim, target: func(f fixture) *admitWaiter { return f.sub }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := build()
@@ -392,6 +391,43 @@ func TestConfineKillQueuedThroughTheHandler(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-328 review P3 — the handler's race window. The registry is
+// snapshotted before the queued cancel, so a job granted between the snapshot
+// and the cancel falls through to a scope kill that can find no scope yet (its
+// launcher has not created it). Through the real handler: a GRANTED waiter with
+// no scope on disk answers U_CONFINE_NOT_LAUNCHED ("retry"), never
+// E_CONFINE_NOT_FOUND, and kills nothing; a selector naming no job still answers
+// not-found. Mutation: drop the granted-match check after the scope kill -> the
+// granted row answers E_CONFINE_NOT_FOUND.
+func TestConfineKillJustGrantedJobAnswersNotLaunched(t *testing.T) {
+	now := time.Unix(66500, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	path := t.TempDir()
+	server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
+	granted := frontWaiter(1, "fresh", "s-1")
+	granted.state, granted.accounted = admitGranted, true
+	queue := queueOf(server, granted)
+	queue.path = path
+	server.admitQueues[path] = queue
+	kill := func(selector string) core.Request {
+		return core.Request{Verb: "confine-kill", Args: map[string]any{"slice": "aira.slice", "selector": selector, "owner": "s-1"}}
+	}
+	for _, selector := range []string{"fresh", granted.scopeID} {
+		var response core.Response
+		logged := captureDaemonLog(t, func() { response = server.confineManagement(t.Context(), kill(selector)) })
+		if response.OK || response.Code != runner.CodeConfineNotLaunched || !strings.Contains(response.Error, "retry") || !strings.Contains(response.Error, granted.scopeID) {
+			t.Fatalf("kill %q of a just-granted job: response=%+v, want %s naming %s with a retry", selector, response, runner.CodeConfineNotLaunched, granted.scopeID)
+		}
+		if strings.Contains(logged, "confine-kill") {
+			t.Fatalf("a not-launched answer left an audit line:\n%s", logged)
+		}
+		requireUntouched(t, granted, admitGranted)
+	}
+	if response := server.confineManagement(t.Context(), kill("nobody")); response.OK || response.Code != runner.CodeConfineNotFound {
+		t.Fatalf("kill of no job: response=%+v, want %s", response, runner.CodeConfineNotFound)
+	}
+}
+
 // verifies: AIRA-328 — the wire: a real admitConnection whose waiter is
 // cancelled answers its client U_ADMIT_CANCELLED with basis reject:cancelled
 // (not saturated, not fail-fast), then returns and its deferred release removes
@@ -479,8 +515,10 @@ func TestConfineKillQueuedWireRender(t *testing.T) {
 // iterations, genuinely concurrently. The reply and the
 // client frame always agree: a "cancelled" reply means the client got
 // U_ADMIT_CANCELLED and the waiter was never granted; a fall-through means it
-// was granted and the client got a grant. The client never hangs (every read is
-// bounded). Run with -race. Mutation: drop the `state == admitQueued` filter in
+// was granted and the client got a grant. The client never hangs: every read,
+// the racing pair's join and startSaturatedAdmit's cleanup are bounded, so a
+// wrong resolver fails in seconds rather than at the binary timeout. Run with
+// -race. Mutation: drop the `state == admitQueued` filter in
 // the resolver -> a granted waiter is "cancelled" (a second close of grantedCh
 // panics, or the reply and the frame disagree).
 func TestConfineKillQueuedRacesTheGrant(t *testing.T) {
@@ -535,7 +573,13 @@ func TestConfineKillQueuedRacesTheGrant(t *testing.T) {
 					cancel()
 				}()
 				close(start)
-				wg.Wait()
+				joined := make(chan struct{})
+				go func() { wg.Wait(); close(joined) }()
+				select {
+				case <-joined:
+				case <-testdeadline.After(5 * time.Second):
+					t.Fatal("the racing grant and cancel never both returned (a lock left held?)")
+				}
 			}
 			if order == 0 && !handled {
 				t.Fatal("a cancel that ran first was not handled: the queued job would run")

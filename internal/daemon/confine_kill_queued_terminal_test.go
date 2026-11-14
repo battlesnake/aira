@@ -12,6 +12,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/runner"
+	"aira/internal/store"
 	"aira/internal/testdeadline"
 )
 
@@ -95,11 +96,16 @@ func TestConfineKillQueuedCancelSurvivesALostReply(t *testing.T) {
 // verifies: AIRA-328 review P1 — the scope-id record at the enqueue, in the
 // window where the rejected waiter is still in queue.waiters (its connection
 // has not yet released it) and after; through the plain admit and the ARDR
-// re-declare entrypoints; a different scope id is not refused; and the record
-// is bounded. Mutations: drop the check -> the in-window row answers
-// E_DAEMON_PROTOCOL (duplicate scope), the post-release row queues; check after
-// the SET instead of first -> the in-window row answers E_DAEMON_PROTOCOL; drop
-// the eviction -> the bound row grows past the limit.
+// re-declare entrypoints; a different scope id is not refused; and retention is
+// by TIME: a churn of more than 1,024 later cancels inside the window still
+// refuses the target's reconnect, and the target is forgotten (and pruned) only
+// once cancelledScopeRetention has passed since its own cancel. Mutations: drop
+// the check -> the in-window row answers E_DAEMON_PROTOCOL (duplicate scope),
+// the post-release row queues; check after the SET instead of first -> the
+// in-window row answers E_DAEMON_PROTOCOL; evict by count (forget the oldest
+// past 1,024 ids) -> the churn row is granted a queue position; never prune ->
+// the after-window row is still refused; prune with > instead of >= -> the
+// exact-boundary row is still refused.
 func TestConfineKillQueuedCancelRefusesTheScopeAtEnqueue(t *testing.T) {
 	now := time.Unix(67000, 0)
 	server := queueOrderServer(t, 64*qGiB, &now)
@@ -107,6 +113,7 @@ func TestConfineKillQueuedCancelRefusesTheScopeAtEnqueue(t *testing.T) {
 	target, other := frontWaiter(1, "target", "s-1"), frontWaiter(2, "other", "s-1")
 	queue := queueOf(server, target, other)
 	server.admitQueues = map[string]*sliceQueue{"/slice": queue}
+	cancelledAt := now
 	if _, handled, err := server.cancelQueuedConfine("/slice", "target", "s-1", false, nil); !handled || err != nil {
 		t.Fatalf("cancel: handled=%v err=%v", handled, err)
 	}
@@ -128,16 +135,36 @@ func TestConfineKillQueuedCancelRefusesTheScopeAtEnqueue(t *testing.T) {
 		t.Fatalf("an uncancelled scope was refused: code=%q err=%v", code, err)
 	}
 
+	// Churn: 2,048 later cancels over ~17 minutes, all inside the target's window.
+	const churn = 2048
+	server.admitRegistryMu.Lock()
+	for i := 0; i < churn; i++ {
+		now = now.Add(500 * time.Millisecond)
+		server.recordCancelledScopeLocked(fmt.Sprintf("CONFINE-bulk-%d-zz@s-1", i), now)
+	}
+	server.admitRegistryMu.Unlock()
+	if _, waiter, code, err := server.enqueueResolvedConfineAdmit("/slice", qGiB, "pinned", 64*qGiB, request); code != CodeAdmitCancelled || waiter != nil {
+		t.Fatalf("reconnect after %d later cancels inside the window: code=%q waiter=%v err=%v, want %s: the cancelled job would run", churn, code, waiter != nil, err, CodeAdmitCancelled)
+	}
+	now = cancelledAt.Add(cancelledScopeRetention - time.Second)
+	if _, _, code, err := server.enqueueResolvedConfineAdmit("/slice", qGiB, "pinned", 64*qGiB, request); code != CodeAdmitCancelled {
+		t.Fatalf("reconnect one second before the window ends: code=%q err=%v, want %s", code, err, CodeAdmitCancelled)
+	}
+	now = cancelledAt.Add(cancelledScopeRetention)
+	if _, waiter, code, err := server.enqueueResolvedConfineAdmit("/slice", qGiB, "pinned", 64*qGiB, request); err != nil || waiter == nil {
+		t.Fatalf("the cancel was not forgotten once its window passed: code=%q err=%v", code, err)
+	}
 	server.admitRegistryMu.Lock()
 	defer server.admitRegistryMu.Unlock()
-	for i := 0; i < cancelledScopeLimit; i++ {
-		server.recordCancelledScopeLocked(fmt.Sprintf("CONFINE-bulk-%d-zz@s-1", i))
+	if server.scopeCancelledLocked(target.scopeID, now) {
+		t.Fatal("the target is still recorded after its window")
 	}
-	if len(server.cancelledScopes) != cancelledScopeLimit || len(server.cancelledScopeOrder) != cancelledScopeLimit {
-		t.Fatalf("record size=%d/%d, want bounded at %d", len(server.cancelledScopes), len(server.cancelledScopeOrder), cancelledScopeLimit)
+	if len(server.cancelledScopes) != churn || len(server.cancelledScopeOrder) != churn {
+		t.Fatalf("record size=%d/%d, want %d (only the target expired)", len(server.cancelledScopes), len(server.cancelledScopeOrder), churn)
 	}
-	if server.scopeCancelledLocked(target.scopeID) {
-		t.Fatal("the oldest record was not evicted at the bound")
+	now = now.Add(time.Hour)
+	if server.scopeCancelledLocked("CONFINE-bulk-0-zz@s-1", now) || len(server.cancelledScopes) != 0 || len(server.cancelledScopeOrder) != 0 {
+		t.Fatalf("an hour later the record still holds %d/%d ids: it must prune to empty", len(server.cancelledScopes), len(server.cancelledScopeOrder))
 	}
 }
 
@@ -199,16 +226,19 @@ func TestConfineKillQueuedAmbiguousWithADiskOnlyRunningScope(t *testing.T) {
 	requireUntouched(t, again, admitQueued)
 }
 
-// verifies: AIRA-328 review P2 — an aitest worker's QUEUED claim cancelled by
-// its exact scope id answers the claim a TERMINAL request-invalid /
-// operator-cancelled (a retriable denial would let the supervisor re-claim and
-// undo the cancel), returns, and leaves the ledger exactly as the running
-// worker charged it. Mutation: drop the cancelled arm in
-// workerAdmitConnection -> the claim is told contended/saturated.
-func TestConfineKillQueuedWorkerClaimIsTerminal(t *testing.T) {
+// verifies: AIRA-328 — an aitest worker's QUEUED claim is never cancelled. By
+// its exact scope id the kill is REFUSED E_CONFINE_KILL_WORKER_CLAIM, naming the
+// suite to kill instead; by its name or its (parent supervisor's) pid it is not
+// selected at all, so the kill falls through to the running-job path, where
+// `--kill <supervisor-pid>` reaches the suite. Every selector leaves the claim
+// queued, its connection unanswered and the ledger untouched, and the claim is
+// still LIVE: freeing the slice grants it. Mutations: drop the sub-reservation
+// refusal in cancelQueuedConfineLocked -> the exact-id kill answers OK and the
+// claim is rejected; let a name or pid reach a worker in confineFrontSelects ->
+// the pid row is handled.
+func TestConfineKillQueuedWorkerClaimIsRefusedAndKeepsWaiting(t *testing.T) {
 	server := workerAdmitServer(t, "/slice", 4*workerTestMiB)
-	first, firstClient, _ := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, 3*workerTestMiB, false, 0))
-	defer firstClient.Close()
+	first, firstClient, firstDone := startWorkerAdmit(t, server, workerArgs(workerTestOuterScope, 3*workerTestMiB, false, 0))
 	if first.State != runner.WorkerAdmitStateGranted {
 		t.Fatalf("first=%+v", first)
 	}
@@ -221,47 +251,84 @@ func TestConfineKillQueuedWorkerClaimIsTerminal(t *testing.T) {
 		defer serverConn.Close()
 		server.workerAdmitConnection(serverConn, workerArgs(workerTestOuterScope, 2*workerTestMiB, false, 0))
 	}()
-	var claim string
-	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
-	for claim == "" && time.Now().Before(deadline) {
-		server.admitRegistryMu.Lock()
-		queue := server.admitQueues["/slice"]
-		server.admitRegistryMu.Unlock()
-		if queue != nil {
-			queue.mu.Lock()
-			for _, waiter := range queue.waiters {
-				if waiter.state == admitQueued && waiter.isSubReservation() {
-					claim = waiter.scopeID
-				}
-			}
-			queue.mu.Unlock()
+	frames := make(chan ResponseFrame, 1)
+	errs := make(chan error, 1)
+	go func() {
+		var frame ResponseFrame
+		if err := readFrame(clientConn, &frame); err != nil {
+			errs <- err
+			return
 		}
-		time.Sleep(time.Millisecond)
-	}
-	if claim == "" {
-		t.Fatal("the second worker claim never queued")
-	}
-	if !runner.IsAitestWorkerScopeName(func() string { name, _, _, _, _ := runner.ParseConfineScopeID(claim); return name }()) {
-		t.Fatalf("precondition: %s is a worker scope id", claim)
+		frames <- frame
+	}()
+	var claim *admitWaiter
+	var queue *sliceQueue
+	testdeadline.Eventually(t, 5*time.Second, func() bool {
+		server.admitRegistryMu.Lock()
+		queue = server.admitQueues["/slice"]
+		server.admitRegistryMu.Unlock()
+		if queue == nil {
+			return false
+		}
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		for _, waiter := range queue.waiters {
+			if waiter.state == admitQueued && waiter.isSubReservation() {
+				claim = waiter
+			}
+		}
+		return claim != nil
+	}, "the second worker claim never queued")
+	name, pid, _, _, ok := runner.ParseConfineScopeID(claim.scopeID)
+	if !ok || !runner.IsAitestWorkerScopeName(name) {
+		t.Fatalf("precondition: %s is a worker scope id", claim.scopeID)
 	}
 
-	result, handled, err := server.cancelQueuedConfine("/slice", claim, "operator", true, nil)
-	if !handled || err != nil || result.Status != runner.ConfineKillStatusCancelled {
-		t.Fatalf("cancel by exact worker scope id: result=%+v handled=%v err=%v", result, handled, err)
+	for _, selector := range []string{claim.scopeID, name, fmt.Sprint(pid)} {
+		_, handled, err := server.cancelQueuedConfine("/slice", selector, "operator", true, nil)
+		if selector == claim.scopeID {
+			if !handled || store.ErrorCode(err) != runner.CodeConfineKillWorkerClaim {
+				t.Fatalf("kill by exact worker scope id: handled=%v err=%v, want %s", handled, err, runner.CodeConfineKillWorkerClaim)
+			}
+			if !strings.Contains(err.Error(), claim.parentScopeID) || !strings.Contains(err.Error(), "supervisor") {
+				t.Fatalf("the refusal must name the suite to kill instead: %v", err)
+			}
+		} else if handled || err != nil {
+			t.Fatalf("selector %q reached a worker claim: handled=%v err=%v", selector, handled, err)
+		}
+		queue.mu.Lock()
+		state, outcome := claim.state, claim.outcome
+		queue.mu.Unlock()
+		if state != admitQueued || outcome == admitOutcomeCancelled {
+			t.Fatalf("selector %q moved the worker claim to state=%v outcome=%q, want it untouched in the queue", selector, state, outcome)
+		}
+		requireAdmitQueued(t, claim)
+		select {
+		case frame := <-frames:
+			t.Fatalf("selector %q answered the worker claim: %+v", selector, frame)
+		case err := <-errs:
+			t.Fatalf("selector %q closed the worker claim: %v", selector, err)
+		default:
+		}
 	}
-	var frame ResponseFrame
-	if err := readFrame(clientConn, &frame); err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	var resp WorkerAdmitResponse
-	if err := json.Unmarshal(frame.Data, &resp); err != nil {
-		t.Fatalf("decode: %v (frame=%+v)", err, frame)
-	}
-	if resp.State != runner.WorkerAdmitStateDenied || resp.Class != runner.WorkerAdmitClassRequestInvalid || resp.Reason != runner.WorkerAdmitReasonOperatorCancelled {
-		t.Fatalf("response=%+v, want denied/request-invalid/operator-cancelled (terminal: never re-claimed)", resp)
-	}
-	awaitReturn(t, done, "the cancelled worker claim's handler")
 	if out, cpu, jobs := sliceLedger(t, server, "/slice"); out != 3*workerTestMiB || cpu != 1 || jobs != 1 {
-		t.Fatalf("ledger=%d/%d/%d after the cancel, want only the running worker (%d/1/1)", out, cpu, jobs, 3*workerTestMiB)
+		t.Fatalf("ledger=%d/%d/%d after the refusals, want only the running worker (%d/1/1)", out, cpu, jobs, 3*workerTestMiB)
 	}
+
+	// Still live: free the slice and the claim is granted.
+	_ = firstClient.Close()
+	awaitReturn(t, firstDone, "the first worker's handler")
+	select {
+	case frame := <-frames:
+		var resp WorkerAdmitResponse
+		if err := json.Unmarshal(frame.Data, &resp); err != nil || resp.State != runner.WorkerAdmitStateGranted {
+			t.Fatalf("the refused claim was not granted once the slice freed: %+v err=%v", frame, err)
+		}
+	case err := <-errs:
+		t.Fatalf("read: %v", err)
+	case <-testdeadline.After(5 * time.Second):
+		t.Fatal("the refused claim was never granted once the slice freed")
+	}
+	_ = clientConn.Close()
+	awaitReturn(t, done, "the second worker's handler")
 }

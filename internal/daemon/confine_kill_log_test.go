@@ -75,7 +75,17 @@ func TestConfineKillLogsTheKillerOnlyWhenItActuallyKills(t *testing.T) {
 				case <-time.After(time.Millisecond):
 				}
 				if data, err := os.ReadFile(filepath.Join(path, "cgroup.kill")); err == nil && strings.TrimSpace(string(data)) == "1" {
-					_ = os.WriteFile(filepath.Join(path, "cgroup.events"), []byte("populated 0\n"), 0o644)
+					// Overwrite IN PLACE, never truncate-then-write: os.WriteFile's
+					// O_TRUNC left a window where the kill's poll read an empty file
+					// ("cgroup.events lacks populated" -> unconfirmed, the flake).
+					// Not temp+rename either: the kill holds cgroup.events open
+					// across cgroup.kill and preads that fd, so a renamed-in file
+					// is never seen. The new line is the old one with one byte
+					// changed, so every read sees a whole, valid line.
+					if events, err := os.OpenFile(filepath.Join(path, "cgroup.events"), os.O_WRONLY, 0); err == nil {
+						_, _ = events.WriteAt([]byte("populated 0\n"), 0)
+						_ = events.Close()
+					}
 					return
 				}
 			}

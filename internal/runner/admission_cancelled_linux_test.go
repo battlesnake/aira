@@ -17,14 +17,15 @@ import (
 
 // verifies: AIRA-328, client side. A queued job an operator cancelled with
 // `aira confine --kill` is answered U_ADMIT_CANCELLED. The runner must treat it
-// as a dedicated TERMINAL refusal: exactly ONE dial (it must never reconnect,
-// which would re-queue the job the operator just cancelled), state "cancelled"
-// for the trailer's admission= facet, and the code-prefixed error the exit map
-// reads.
+// as a dedicated TERMINAL refusal: exactly ONE dial (never the transport
+// reconnect), state "cancelled" for the trailer's admission= facet, and the
+// code-prefixed error the exit map reads.
 //
-// Mutation: remove the U_ADMIT_CANCELLED block in admitExchangeOnce -> the code
+// Mutations: remove the U_ADMIT_CANCELLED block in admitExchangeOnce -> the code
 // falls through to the anonymous refusal (state "refused", basis
-// "reject:daemon-refused") and this test reds.
+// "reject:daemon-refused") and this test reds; route the code to fail() (the
+// transport-retry path) instead -> a second dial, which the stub answers by
+// cancelling the context so the loop ends, and the dial count reds.
 func TestAdmissionCancelledIsDistinctTerminalRefusal(t *testing.T) {
 	runner := &Runner{
 		memorySlice:      "/fake/finite.slice",
@@ -34,9 +35,16 @@ func TestAdmissionCancelledIsDistinctTerminalRefusal(t *testing.T) {
 		clock:            newInstantClock(),
 		sliceMemory:      func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" },
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var dials atomic.Int32
 	runner.admitDialFn = func(context.Context, string) (net.Conn, error) {
-		dials.Add(1)
+		if dials.Add(1) > 1 {
+			// A reconnect: end the loop so a wrong implementation fails the dial
+			// count below rather than spinning.
+			cancel()
+			return nil, errors.New("reconnect after a cancel")
+		}
 		client, server := net.Pipe()
 		go func() {
 			defer server.Close()
@@ -52,7 +60,7 @@ func TestAdmissionCancelledIsDistinctTerminalRefusal(t *testing.T) {
 		return client, nil
 	}
 
-	result, _, err := runner.admitThroughDaemon(context.Background(), Request{DaemonEstimateMemory: true}, DefaultConfineMemoryReserve)
+	result, _, err := runner.admitThroughDaemon(ctx, Request{DaemonEstimateMemory: true}, DefaultConfineMemoryReserve)
 	if err == nil {
 		t.Fatalf("a cancel produced no error (result=%+v): it must be a terminal refusal", result)
 	}

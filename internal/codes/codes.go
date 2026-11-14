@@ -379,6 +379,11 @@ var ExitCodes = map[string]int{
 	// its parent): the state is wrong, not the selector, so 1 — the same side of
 	// the rule as E_CONFINE_OWNER_UNVERIFIED.
 	"E_CONFINE_NOT_QUEUED": 1,
+	// AIRA-328. `confine --kill` names a queued aitest worker claim (a
+	// sub-reservation), which follows its suite and is not cancellable on its
+	// own: the target is wrong for the state, not malformed, so 1 like
+	// E_CONFINE_NOT_QUEUED. The remedy is to kill the owning suite's supervisor.
+	"E_CONFINE_KILL_WORKER_CLAIM": 1,
 	// AIRA-312. `confine --resize` names a job that is not a running job-level
 	// grant (still queued, or a sub-reservation/worker that follows its parent):
 	// the state is wrong, not the request, so 1 like E_CONFINE_NOT_QUEUED. A

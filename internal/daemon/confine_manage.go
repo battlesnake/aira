@@ -428,6 +428,16 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		}
 		result, killErr := runner.KillConfine(ctx, path, selector, callerOwner, steal, registry)
 		if killErr != nil {
+			// AIRA-328. registry was snapshotted before the queued cancel, so a job
+			// granted in between (the cancel fell through) can be missing from it and
+			// its scope not created yet: the scope kill then finds nothing. The daemon
+			// holds it as granted, so say "not launched yet; retry", never "no such
+			// job".
+			if store.ErrorCode(killErr) == runner.CodeConfineNotFound {
+				if scopeID := s.grantedConfineMatch(path, selector); scopeID != "" {
+					return confineManagementError(fmt.Errorf("%s: selector %q names %s, which was admitted a moment ago and has no running scope to kill yet; retry", runner.CodeConfineNotLaunched, selector, scopeID))
+				}
+			}
 			return confineManagementError(killErr)
 		}
 		// AIRA-70 finding #2: a cross-session `aira confine --kill` used to kill

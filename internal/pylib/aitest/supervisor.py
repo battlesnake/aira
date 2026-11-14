@@ -555,8 +555,6 @@ class WorkerAdmitRequestInvalid(WorkerAdmitTerminal):
     Current members: the daemon's exceeds-ceiling (this request's
     estimated-byte sizing can never fit under the outer scope's cap even
     with zero contention), its worker-scope-create-failed verdict, its
-    operator-cancelled verdict (AIRA-328: `aira confine --kill` named this
-    queued claim by its exact scope id), its
     protocol-level argument rejection, and the CLI's own pre-dial argument
     validation."""
     pass
