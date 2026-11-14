@@ -7,21 +7,23 @@ const hintGiB = int64(1) << 30
 
 func hintPeak(v int64) *int64 { return &v }
 
-// hintStatus is the eligible baseline: a real (enforced) run that ended normally,
-// charged exactly the declared 4 GiB, peaking at 310 MiB.
+// hintStatus is the eligible baseline: a real (enforced) run that ended normally
+// with its processes held in the scope, charged exactly the declared 4 GiB,
+// peaking at 310 MiB.
 func hintStatus() ConfineStatus {
 	return ConfineStatus{
-		Containment:  ConfineContainmentEnforced,
-		TerminatedBy: ConfineTerminatedNormal,
-		ReserveBytes: 4 * hintGiB,
-		PeakRSS:      hintPeak(310 * hintMiB),
+		Containment:    ConfineContainmentEnforced,
+		TerminatedBy:   ConfineTerminatedNormal,
+		ScopeIntegrity: ScopeContained,
+		ReserveBytes:   4 * hintGiB,
+		PeakRSS:        hintPeak(310 * hintMiB),
 	}
 }
 
 // verifies: AIRA-310 -- the eligible baseline prints the imperative line shape.
 func TestConfineReserveHintBaselineText(t *testing.T) {
 	got := formatConfineReserveHint(hintStatus(), 0, 4*hintGiB, false)
-	want := "confine: ACTION REQUIRED: over-reserved -- this job peaked at 310M, only 7% of the 4096M you pinned; an unused reserve like that can delay other jobs on the shared slice. Next run use --memory-reserve 512M, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
+	want := "confine: ACTION REQUIRED: over-reserved -- this run peaked at 310M, only 7% of the 4096M you pinned; an unused reserve like that can delay other jobs on the shared slice. Next run use --memory-reserve 512M (sized from this run alone; a command whose peak depends on a warm build cache needs its cold-run peak), or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
 	if got != want {
 		t.Fatalf("hint = %q\nwant  %q", got, want)
 	}
@@ -34,7 +36,7 @@ func TestConfineReserveHintPercentNeverReads60(t *testing.T) {
 	// 3070M of 5120M is 59.96%: rounding to nearest would print "(60%)".
 	status.ReserveBytes, status.PeakRSS = 5*hintGiB, hintPeak(3070*hintMiB)
 	got := formatConfineReserveHint(status, 0, 5*hintGiB, false)
-	want := "confine: ACTION REQUIRED: over-reserved -- this job peaked at 3070M, only 59% of the 5120M you pinned; an unused reserve like that can delay other jobs on the shared slice. Next run use --memory-reserve 4608M, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins 5120M"
+	want := "confine: ACTION REQUIRED: over-reserved -- this run peaked at 3070M, only 59% of the 5120M you pinned; an unused reserve like that can delay other jobs on the shared slice. Next run use --memory-reserve 4608M (sized from this run alone; a command whose peak depends on a warm build cache needs its cold-run peak), or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins 5120M"
 	if got != want {
 		t.Fatalf("hint = %q\nwant  %q", got, want)
 	}
@@ -115,6 +117,28 @@ func TestConfineReserveHintGates(t *testing.T) {
 		}, false},
 		{"podman split-injected (nested in the job scope) still hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
 			s.Container = ContainerPlacementPodmanSplitInjected
+		}, true},
+		// AIRA-334. The peak only counts what stayed in the scope, so a run whose
+		// processes left it (a snap tool that moves itself out) under-reads and the
+		// advice would under-size the next run. Only an integrity that shows the
+		// scope held the job may hint; an unset one is unevaluated, not contained.
+		{"descendant-escaped scope never hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.ScopeIntegrity = ScopeDescendantEscaped
+		}, false},
+		{"migrated leader never hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.ScopeIntegrity = ScopeMigrated
+		}, false},
+		{"handoff-unverified scope never hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.ScopeIntegrity = ScopeHandoffUnverified
+		}, false},
+		{"unset scope integrity never hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.ScopeIntegrity = ""
+		}, false},
+		{"unverified scope (placed, no escape witnessed) still hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.ScopeIntegrity = ScopeUnverified
+		}, true},
+		{"descendant-killed scope (the descendant was in the scope) still hints", func(s *ConfineStatus, _ *int, _ *int64, _ *bool) {
+			s.ScopeIntegrity = ScopeDescendantKilled
 		}, true},
 		{"suggestion not below the reserve never hints", func(s *ConfineStatus, _ *int, d *int64, _ *bool) {
 			// 59.96% of 2 GiB: 1.5x = 1842M, rounded up to 2048M == the reserve.

@@ -7,8 +7,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"aira/internal/cgrouptest"
 )
 
 // verifies: AIRA-310 -- end to end on the real (enforced) path: a job that pinned
@@ -62,7 +67,7 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 	// 2 GiB minimum and the 60% line, so ONLY the pinned-provenance gate can keep
 	// an unpinned run silent (build review P2: the 1 GiB default never reached it).
 	historyGrant := &admissionResult{state: "immediate", release: &confineCountingCloser{}, reserve: 4 << 30, basis: "estimate:history"}
-	const want = "confine: ACTION REQUIRED: over-reserved -- this job peaked at 300M, only 7% of the 4096M you pinned; an unused reserve like that can delay other jobs on the shared slice. Next run use --memory-reserve 512M, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
+	const want = "confine: ACTION REQUIRED: over-reserved -- this run peaked at 300M, only 7% of the 4096M you pinned; an unused reserve like that can delay other jobs on the shared slice. Next run use --memory-reserve 512M (sized from this run alone; a command whose peak depends on a warm build cache needs its cold-run peak), or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins 4096M"
 
 	t.Run("pinned 4G hints on stderr only", func(t *testing.T) {
 		t.Setenv(ConfineNoHintsEnv, "")
@@ -157,4 +162,60 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 			t.Fatalf("AIRA_CONFINE_NO_HINTS=0 silenced the hint: %q", stderr)
 		}
 	})
+}
+
+// verifies: AIRA-334 -- the RANT-73 shape on a real cgroup. A job that writes and
+// streams a file several times its pinned cap reads peak-rss at the cap (the
+// scope's memory.peak counts page cache, and the kernel holds usage at
+// memory.max by reclaiming it) yet exits 0 and was never OOM-killed. Such a run
+// needed no more than its cap (swap is off on every scope), so the trailer must
+// carry no "reached N% of the reserved cap" advisory.
+//
+// The peak-at-cap precondition is asserted, not assumed: on a host where the
+// stream did not drive the peak to the cap, the deleted line would not have
+// fired either, and the test would prove nothing.
+func TestConfineRealFileStreamAtCapGetsNoReserveAdvisory(t *testing.T) {
+	parent := confineMemoryParent(t, strconv.FormatInt(1<<30, 10))
+	const capBytes = int64(64) << 20
+	dir := t.TempDir()
+	// tmpfs pages are shmem: with memory.swap.max=0 they cannot be reclaimed, so
+	// streaming a file larger than the cap through one would OOM-kill the job
+	// instead of exercising page-cache reclaim. This test needs a disk-backed dir.
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(dir, &fs); err == nil && fs.Type == 0x01021994 {
+		t.Skipf("%s is tmpfs (shmem is not reclaimable with swap off); set TMPDIR to a disk-backed directory", dir)
+	}
+	file := filepath.Join(dir, "stream")
+	deps := defaultConfineDeps()
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "immediate"}, nil
+	}
+	// Never write this test's peak into the machine's shared reserve history.
+	deps.reportPeak = func(context.Context, ConfineRequest, ConfinePeakReport) error { return nil }
+	var stderr bytes.Buffer
+	// Written INSIDE the scope, so its page cache is charged to the scope rather
+	// than to the test process; then read back twice. 256 MiB is 4x the cap.
+	script := "dd if=/dev/zero of=\"$1\" bs=1M count=256 status=none && cat \"$1\" \"$1\" >/dev/null"
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: parent, Argv: []string{"/bin/sh", "-c", script, "sh", file},
+		MemoryReserve: capBytes, MemoryReservePinned: true,
+		SelfPath: os.Args[0], Stdout: &bytes.Buffer{}, Stderr: &stderr,
+		AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond,
+	}, deps)
+	if err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "confine file-stream fixture unavailable: %v", err)
+	}
+	if result.Exit != 0 || result.Status.TerminatedBy != ConfineTerminatedNormal {
+		t.Fatalf("exit=%d terminated-by=%q, want a clean run; stderr=%q", result.Exit, result.Status.TerminatedBy, stderr.String())
+	}
+	if result.Status.ScopeMemoryMax != capBytes {
+		t.Fatalf("scope-memory.max=%d, want the pinned %d; stderr=%q", result.Status.ScopeMemoryMax, capBytes, stderr.String())
+	}
+	if result.Status.PeakRSS == nil || *result.Status.PeakRSS < capBytes-capBytes/10 {
+		t.Fatalf("precondition: peak-rss=%v did not reach 90%% of the %d cap, so this run cannot show the at-cap line is gone; stderr=%q",
+			result.Status.PeakRSS, capBytes, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "reserved cap") || strings.Contains(stderr.String(), "consider a higher --memory-reserve") {
+		t.Fatalf("a clean, non-OOM run at its cap printed a reserve advisory: %q", stderr.String())
+	}
 }

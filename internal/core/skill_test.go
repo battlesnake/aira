@@ -1337,7 +1337,10 @@ func TestSkillTeachesTheReserveHint(t *testing.T) {
 	}
 	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
 		for _, want := range []string{
-			"`confine: ACTION REQUIRED: over-reserved -- this job peaked at 310M, only 7% of the 4096M you pinned`",
+			"`confine: ACTION REQUIRED: over-reserved -- this run peaked at 310M, only 7% of the 4096M you pinned`",
+			"`Next run use --memory-reserve 512M (sized from this run alone; a command whose peak depends on a warm build cache needs its cold-run peak), or drop",
+			"when the job's processes left its scope (`scope-integrity=descendant-escaped` or `migrated`",
+			"`peak-rss` is the scope's cgroup `memory.peak`, which includes reclaimable page cache, so it is an upper bound, not process RSS",
 			"It is an instruction, not an FYI",
 			"the percentage is truncated, so it never reads 60%",
 			"for a reserve pinned only by an inherited `AIRA_CONFINE_RESERVE`",
@@ -1345,10 +1348,33 @@ func TestSkillTeachesTheReserveHint(t *testing.T) {
 			"at least 2 GiB that the job used less than 60% of",
 			"peak plus 50% headroom, rounded up to a whole 256M, never below 256M",
 			"never prints for a history-estimated reserve",
-			"in ci-shim mode, or when `peak-rss=unevaluated`",
+			"in ci-shim mode, when the job's processes left its scope", "or when `peak-rss=unevaluated`",
 			"never goes to stdout",
 			"RAM only: confine measures no per-job peak VRAM",
 			"`AIRA_CONFINE_NO_HINTS=1`",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not teach %q", name, want)
+			}
+		}
+	}
+}
+
+// verifies: AIRA-279 (interim) and AIRA-195 (accepted gap) -- the skill says that
+// confine books one CPU slot per job and does not throttle CPU, so a parallel
+// build must set its own job count, and that an outer kill does not reach scopes
+// its children confined themselves, naming where to find and kill them.
+func TestSkillTeachesTheCPUSlotAndOuterKillGaps(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"Confine books one CPU slot per job however many threads the job runs",
+			"set `CARGO_BUILD_JOBS`, `make -j N` or the tool's equivalent explicitly, because aira does not throttle CPU",
+			"Killing an outer job does not reach scopes its children confined themselves",
+			"find them in `aira confine --list` as LIVE=unsupervised and kill them by scope id",
 		} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("%s does not teach %q", name, want)
