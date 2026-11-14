@@ -21,6 +21,10 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPLAY = os.path.join(HERE, "aira-history-charge-replay.py")
 
+# The two mask() rules whose ORDER is pinned (a token can match both).
+PATH_RULE = '    if "/" in t or t.endswith((".py", ".rs", ".sh", ".txt", ".json", ".toml")):\n        return "<p>"\n'
+DIGIT_RULE = '    if re.search(r"[0-9]{3,}", t):\n        return "<n>"\n'
+
 # (name, exact source text, replacement). Each source text must occur exactly once.
 MUTATIONS = [
     ("hex run 7+ -> 8+", "[0-9a-f]{7,}|", "[0-9a-f]{8,}|"),
@@ -55,6 +59,18 @@ MUTATIONS = [
     ("key_cmd from rest[0], flags included", '(pos[0] if pos else "")', '(rest[0] if rest else "")'),
     ("no repo prefix", "r = (LEGACY_REPO if repo is None else repo) + US", 'r = ""'),
     ("OOM veto dropped (coverage counterexample)", "if any(o for _p, o in h):", "if False:"),
+    # Plan-review round 2: the anchoring and matching choices a Python-to-Go port is most
+    # likely to get wrong (Go's regexp is unanchored by default; filepath.Base strips a
+    # trailing slash). Each was green against the 31-case table of round 1.
+    ("env NAME= unanchored (Go regexp default)", 're.match(r"[A-Za-z_][A-Za-z0-9_]*=", t)', 're.search(r"[A-Za-z_][A-Za-z0-9_]*=", t)'),
+    ("mask full match -> prefix match", 're.fullmatch(r"[0-9a-f]{7,}|[0-9]+", t)', 're.match(r"[0-9a-f]{7,}|[0-9]+", t)'),
+    ("hex rule case-insensitive", 're.fullmatch(r"[0-9a-f]{7,}|[0-9]+", t)', 're.fullmatch(r"[0-9a-f]{7,}|[0-9]+", t, re.I)'),
+    ("path suffix contained, not ending", 't.endswith((".py", ".rs", ".sh", ".txt", ".json", ".toml"))',
+     'any(s in t for s in (".py", ".rs", ".sh", ".txt", ".json", ".toml"))'),
+    ("env matched by basename", 'if t in ("env", "/usr/bin/env") or', 'if base(t) == "env" or'),
+    ("time matched by basename", 'if t in ("time", "/usr/bin/time"):', 'if base(t) == "time":'),
+    ("digit-run rule before path rule", PATH_RULE + DIGIT_RULE, DIGIT_RULE + PATH_RULE),
+    ("argv[0] base with filepath.Base semantics", 'return t.rsplit("/", 1)[-1]', 'return t.rstrip("/").rsplit("/", 1)[-1] or t'),
 ]
 
 

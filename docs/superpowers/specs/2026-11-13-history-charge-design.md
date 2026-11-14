@@ -70,11 +70,12 @@ after rev 2), and they gain sequence notes.
    holds by construction: every legacy key is a fixed prefix plus the unchanged rev-2
    expression, and the exact-signature level is untouched. So the grouping is unchanged; the
    printed numbers move only because the store keeps growing. The script gains `--self-test`
-   against a new committed golden table of 31 cases. Rev 2 promised that table but no file
+   against a new committed golden table of 39 cases. Rev 2 promised that table but no file
    existed. `--self-test` also refuses a table whose inputs break the wire rules (a repo that
    is not 16 hex digits or `none`), and a committed mutation check
-   (`docs/dev/aira-history-charge-key-mutations.py`) shows every boundary of the key function
-   is pinned by some case (section 11).
+   (`docs/dev/aira-history-charge-key-mutations.py`) shows that every **listed** mutation of
+   the key function (40) is pinned by some case (section 11). The table ties two
+   implementations by examples only, so it cannot pin every conceivable difference.
 10. **Interactions** with AIRA-340, 341, 228, 225, 321, 331 and 236 are recorded as sequence
     notes in section 10.
 11. **Plan-review round 1 fixes** (Sol and Fable findings, 2026-11-14):
@@ -89,6 +90,24 @@ after rev 2), and they gain sequence notes.
     - Five boundary cases added to the golden table; 32 mutations, all red (section 11).
     - Queued jobs at the protocol cutover are refused, not resumed; stated, and a rollout step
       added (5.1.6, section 6).
+12. **Plan-review round 2 fixes** (2026-11-14):
+    - The allowlist sentence named three new fields; it names all four, `started_at_ms`
+      included (5.1.2, T1). Leaving one out would refuse every new-client report.
+    - The restart matrix claimed every running job stays booked across the cutover. Only a
+      non-exclusive, scope-bearing lease re-declares; an exclusive job loses its booking and
+      its exclusivity (`exclusive=lost`), as on every restart (5.1.6).
+    - Validation has one owner, the handler, through three shared `runner` predicates. The
+      writer no longer re-validates, the new columns carry no SQL CHECK, and the false
+      precedent (the writer's existing checks repair a non-positive peak or budget, they do not
+      refuse) is withdrawn. T3 is a handler test and its mutations target the predicates and
+      the handler (5.1.2, 5.1.5, T3).
+    - Eight more golden cases (39 in all) and eight more mutations (40 in all), for the
+      anchoring and matching choices a Go port is likely to get wrong: unanchored env-name
+      match, prefix instead of full match, case-insensitive hex, suffix contained instead of
+      ending, `env` and `time` matched by basename, the digit-run rule before the path rule,
+      and `filepath.Base` semantics. Each was green against the 31-case table and is red
+      against the 39-case table. The 5.1.4 prose now states each of these choices, and "every
+      boundary" became "every listed mutation" (section 11, T6).
 
 ## 1. The problem, in plain terms
 
@@ -305,8 +324,11 @@ Client (`internal/runner`):
 - The client never sends a value the daemon would refuse. A duration or start time outside
   the bounds, such as a run longer than 366 days, is omitted (NULL), and the rest of the
   report, peak and OOM included, still goes out. Under refuse-never-repair, sending it would
-  lose the whole sample. The client applies the same bounds through one shared definition
-  (constants in `runner`, which the daemon and the store import), so the two cannot drift.
+  lose the whole sample. The rules have **one definition**: three predicates in `runner`,
+  `ValidReportDurationMS(int64) bool`, `ValidStartedAtMS(int64) bool` and
+  `ValidRepoIdentity(string) bool`. The client calls them to decide what to omit; the daemon's
+  handler calls the same three to decide what to refuse (`daemon` already imports `runner`,
+  e.g. `admit.go`). The client and the daemon cannot drift.
 - The confine launch site fills the four fields per section 5.1.1. Shim mode still sends no
   report (`confine_shim_linux.go:515`, unchanged).
 - `aira confine-report` (the aitest pool face, `cmd/aira/main.go:1405-1438`) is unchanged and
@@ -315,15 +337,25 @@ Client (`internal/runner`):
 
 Daemon (`internal/daemon/confine_report.go`):
 
-- `confineReportFields` (lines 17-20) gains `wall_ms`, `wait_ms` and `repo`. The count guard at
-  line 23 keeps `len(args) <= len(confineReportFields)`. The refusal text at line 24 names the
-  new optional fields.
+- `confineReportFields` (lines 17-20) gains **four** fields: `wall_ms`, `wait_ms`,
+  `started_at_ms` and `repo` (six today, ten after). The count guard at line 23 keeps
+  `len(args) <= len(confineReportFields)`. The refusal text at line 24 names all four new
+  optional fields beside the existing ones. Leaving any one of the four out of the allowlist
+  refuses every report from the new client; T1's allowlist mutations catch that.
 - Integers are parsed with `exactAdmitInt64` (`admit.go:3431`), as `peak_rss` and `budget` are.
   Its accepted forms are reused unchanged: an integer, an integral float64, a `json.Number`, or
   a decimal string.
+- **The handler is the one layer that validates the new fields** (type, bounds and the `repo`
+  pattern, through the three `runner` predicates). The store writer does not check them again
+  (below). Why the handler and not the writer: every existing rule on this frame (`peak_rss`
+  and `budget` positive, the budget pair, the basis family) is enforced in the handler
+  (`confine_report.go:60-93`), and only the handler answers `E_DAEMON_PROTOCOL`; an error from
+  the writer comes back as code `E_DAEMON_INTERNAL` ("record confine peak: ...",
+  `confine_report.go:99-104`, `CodeInternal` at `protocol.go:195`), the wrong code for a
+  client's bad value.
 - **Refuse, never repair.** A present field that fails its rule makes the handler refuse the
   whole report with `E_DAEMON_PROTOCOL`, and nothing is written. This is how every existing
-  field behaves (lines 60-93). The cost is that a client bug also loses that run's peak/OOM
+  field behaves in the handler (lines 60-93). The cost is that a client bug also loses that run's peak/OOM
   sample. That is accepted for three reasons. The only sender is the same-version binary. That
   sender never sends a value it could not establish (it omits the field instead). Test T1
   drives the real sender into the real handler. Accepting a frame with some fields dropped
@@ -333,14 +365,22 @@ Daemon (`internal/daemon/confine_report.go`):
 The store (`RecordConfinePeak`, `confine_peak_history.go:99`):
 
 - `ResourcePeakObservation` gains `WallMS`, `WaitMS`, `StartedAtMS *int64` and `Repo string`.
-- The writer validates them again with the same rules. Like the existing peak and budget checks
-  (lines 103-131), the Go check is the guard that binds both table shapes.
-- The writer derives the three keys, so every writer, tests included, gets the same keys.
-- **Who validates `repo`:** the writer, before it calls `CommandKeys`. `CommandKeys` does not
-  validate; its documented precondition is a `repo` that already passed the wire rule, and it
-  is called from nowhere else. (Validating twice inside one call chain would add a third copy
-  of the rule.) The golden table holds only inputs that pass the rule, and `--self-test`
-  refuses a table that does not, so a Go test can feed every case through the real handler.
+- **The writer does not validate the new fields.** Its doc comment states the precondition:
+  the four values already passed the wire rules. Its only production caller is the handler
+  (`confine_report.go:99`; verified, no other non-test call of `RecordConfinePeak`). The
+  writer's existing checks (kind, empty signature, the budget pair) and its existing repairs
+  (a non-positive peak or budget becomes NULL, `confine_peak_history.go:107-117`) are
+  pre-existing and untouched; they are **not** a precedent for the new fields, which are never
+  repaired. A store test that calls the writer directly must pass valid values.
+- The writer stores the four values as given (nil -> NULL) and derives the three keys, so
+  every writer, tests included, gets the same keys.
+- **Who validates `repo`:** the handler, with `runner.ValidRepoIdentity`, before the writer
+  calls `CommandKeys`. `CommandKeys` does not validate; its documented precondition is a `repo`
+  that already passed the wire rule, and the writer is its only caller. The golden table holds
+  only inputs that pass the rule, and `--self-test` refuses a table that does not, so a Go test
+  can feed every case through the real handler.
+- **No SQL CHECK on the new columns** (5.1.5): it would be a second, partial copy of the rule,
+  present in only one of the two table shapes and unreachable behind the handler.
 
 #### 5.1.3 Repo identity
 
@@ -403,16 +443,23 @@ The daemon (inside `RecordConfinePeak`) computes, for `kind = confine` rows with
 
 ```
 tokens  = signature split on NUL                     (runner.ResourceSignature joins on NUL)
-u       = unwrap(tokens): strip leading `env` / `/usr/bin/env` and `NAME=value` tokens, and
-          `time` / `/usr/bin/time` with only its known options (-o FILE, -f FMT, --output X,
-          --format X, -p, -v, -a, --portability, --verbose, --append); an unknown option, or
-          `time` with no command after it, leaves the argv as is; `aitest-parent`, `timeout`,
-          `nice`, `flock`, `uv run`, `make` are never unwrapped; an argv that unwraps to
-          nothing stays as is
-a0      = basename of u[0]
-rest    = mask(t) for t in u[1:]:   "<n>" if t is all hex (7+) or all digits;
-                                     "<p>" if t contains "/" or ends in .py .rs .sh .txt .json .toml;
-                                     "<n>" if t contains 3+ consecutive digits; else t
+u       = unwrap(tokens): strip leading tokens that are exactly `env` or `/usr/bin/env`
+          (whole-token equality, not by basename: `/bin/env` is kept) and tokens whose START
+          matches `[A-Za-z_][A-Za-z0-9_]*=` (anchored at the token start: `9x=1` is kept), and
+          a token exactly `time` or `/usr/bin/time` with only its known options (-o FILE,
+          -f FMT, --output X, --format X, -p, -v, -a, --portability, --verbose, --append); an
+          unknown option, or `time` with no command after it, leaves the argv as is;
+          `aitest-parent`, `timeout`, `nice`, `flock`, `uv run`, `make` are never unwrapped;
+          an argv that unwraps to nothing stays as is
+a0      = the text after the last "/" of u[0] (all of it when there is none; "" when u[0]
+          ends in "/"). NOT Go's filepath.Base or path.Base, which strip a trailing slash
+          and map "" to "."
+rest    = mask(t) for t in u[1:], rules tried IN THIS ORDER, first match wins:
+            "<n>" if the WHOLE token is 7+ lower-case hex digits or 1+ decimal digits
+                  (full match; case-sensitive: `DEADBEEF` is kept);
+            "<p>" if t contains "/" or ENDS in .py .rs .sh .txt .json .toml (`a.pyc` is kept);
+            "<n>" if t contains 3+ consecutive digits anywhere;
+            else t
 pos     = rest without tokens starting with "-"
 P       = repo + "\x1f"                              (unit separator)
 key_masked = P + a0 + "|" + join(rest[:14], " ")    argv[0] plus at most 14 arguments
@@ -421,8 +468,12 @@ key_cmd    = P + a0 + "|" + (pos[0] or "")          command and first positional
 ```
 
 The authority is `keys()` in the replay script (its `N1`, `N2` and `N3`) together with the golden
-table. A Go test and `--self-test` must both reproduce all 31 cases byte for byte. When the
-prose and the script disagree, the script and the table win, and the prose is fixed. The
+table. A Go test and `--self-test` must both reproduce all 39 cases byte for byte. When the
+prose and the script disagree, the script and the table win, and the prose is fixed. Porting
+notes, each pinned by a golden case: Python's `re.match` anchors at the start and
+`re.fullmatch` at both ends, while Go's `regexp.MatchString` is unanchored, so the Go patterns
+carry explicit `^` and `$`. The table ties the two implementations by examples only; it pins
+every mutation listed in section 11, not every conceivable difference. The
 argv part is rev 2's function unchanged. Collisions in it are possible (`a0` containing `|`, a
 token containing a space) and are accepted: a collision only merges two histories.
 
@@ -448,15 +499,13 @@ key_masked TEXT, key_first4 TEXT, key_cmd TEXT
 
 - `started_at_ms` is an integer (Unix milliseconds), not RFC3339 text like `at`, so it sorts
   chronologically (the `at` caveat in 5.1.1 does not apply to it).
-- In the `CREATE TABLE` DDL (`store.go:875-880`), with table checks
-  `CHECK(wall_ms IS NULL OR wall_ms>=0)`, `CHECK(wait_ms IS NULL OR wait_ms>=0)`,
-  `CHECK(started_at_ms IS NULL OR started_at_ms>0)` and
-  `CHECK(repo IS NULL OR length(repo)>0)`, following the AIRA-180 pattern. The exact bounds
-  live in Go, as for the existing columns.
+- In the `CREATE TABLE` DDL (`store.go:875-880`) as plain nullable columns, **with no CHECK**.
+  The rules have one owner, the handler (5.1.2). Following AIRA-180, a CHECK would sit in the
+  DDL shape only (its `budget` ALTER at `store.go:1315` carries none), and it would be
+  unreachable behind the handler, so no end-to-end test could pin it.
 - Added to the `ensureConfinePeakHistorySubject` list (`store.go:1313-1321`) through
-  `ensureColumnAdded`, as plain `ADD COLUMN <name> <type>`. That follows the AIRA-180 precedent,
-  whose `budget` ALTER also carries no CHECK. The Go validation in `RecordConfinePeak` is the
-  guard on both shapes.
+  `ensureColumnAdded`, as plain `ADD COLUMN <name> <type>`, the same text as the DDL column,
+  so both shapes are identical (T9).
 - **No data migration.** Existing rows read NULL in every new column, which means unevaluated,
   never 0. No reader in 323 selects them, and `scanResourceBudgetRow` is unchanged.
 - **No index in 323** (rev 3 change 5). A reader adds
@@ -514,12 +563,24 @@ visible sign would be the OOM advisory reading "unconfirmed". The AIRA-284 prece
     which `admitExchangeOnce` treats as a terminal refusal, "refusing to launch ungoverned"
     (`admission_linux.go:620-636`; an exclusive request takes the branch at 467-479). This
     corrects the backlog plan (rev 3 change 8).
-  - Jobs **already running** at cutover keep running and stay booked. Their lease keeper
-    re-declares through the frozen ARDR frame, which is sniffed before the version check
-    (`server.go`, the S7 magic sniff just above line 830). Their teardown `confine-report`
-    (proto 15) is refused, so **that run's row is lost**: peak, OOM bit and budget, the
-    estimator's input. The client prints any OOM advisory as unconfirmed (`peakAcknowledged`
-    false, `confine_linux.go:1440-1459`).
+  - Jobs **already running** at cutover keep running. Whether they stay **booked** depends on
+    the lease:
+    - A **non-exclusive** job with a scope id stays booked. Its lease keeper reconnects and
+      re-declares through the frozen ARDR frame, which is sniffed before the version check
+      (`server.go:798-819`, the S7 magic sniff). The keeper starts that reconnect loop only
+      for this case (`newLeaseKeeper`, `lease_keeper_linux.go:94-99`).
+    - An **exclusive** job is **not** re-booked and loses its exclusivity at the cutover, as
+      on every daemon restart, bump or not. Its keeper never reconnects (`lease_keeper_linux.go:94`;
+      pinned by `TestLeaseKeeperExclusiveReportsLossAndNeverReconnects`); `watchExclusive`
+      sees the closed lease, prints "exclusivity lost" (`lease_keeper_linux.go:326-344`), and
+      the trailer reports `exclusive=lost` (`confine_linux.go:1512`). The restarted daemon
+      neither books it nor holds other jobs back for it.
+    - A scope-less lease (the same `newLeaseKeeper` branch) is hold-only and is not re-booked
+      either.
+
+    Every running job's teardown `confine-report` (proto 15) is refused, so **that run's row is
+    lost**: peak, OOM bit and budget, the estimator's input. The client prints any OOM advisory
+    as unconfirmed (`peakAcknowledged` false, `confine_linux.go:1440-1459`).
   - Jobs **queued** (waiting for admission) at cutover are **refused, not resumed**. By code
     reading, not executed: the restart closes the waiter's connection, so its read fails and
     `fail()` returns `errAdmitReconnect` (`admission_linux.go:354-374`); the client then sits in
@@ -557,9 +618,9 @@ rather than adding a test for it.
 
 | Part | Files | Ships as |
 |---|---|---|
-| client | `runner/confine_linux.go` (`confineDeps` clock seam, timers and start time, repo at launch, report fields), `runner/confine_budget.go` (`ConfinePeakReport`), `runner/admission_linux.go` (`ReportPeakSample`, proto const), new `runner/repo_identity.go`, new `runner/command_key.go` (`CommandKeys`, called by the store) | client install |
+| client | `runner/confine_linux.go` (`confineDeps` clock seam, timers and start time, repo at launch, report fields), `runner/confine_budget.go` (`ConfinePeakReport`), `runner/admission_linux.go` (`ReportPeakSample`, proto const), new `runner/repo_identity.go`, new `runner/command_key.go` (`CommandKeys`, called by the store; and the three wire predicates `ValidReportDurationMS`, `ValidStartedAtMS`, `ValidRepoIdentity`, called by the client and the daemon handler) | client install |
 | wire | proto bump on both sides, new allowlist fields | lockstep; atomic install and restart |
-| daemon | `daemon/confine_report.go` (allowlist, validation), `daemon/protocol.go` | daemon restart |
+| daemon | `daemon/confine_report.go` (allowlist, the only validation of the new fields), `daemon/protocol.go` | daemon restart |
 | store | `store/store.go` (DDL, ALTER list), `store/confine_peak_history.go` (observation, writer, keys) | daemon restart; columns added at open |
 | docs | the replay script, the golden table and the key mutation check, already committed by this revision | none |
 
@@ -759,13 +820,17 @@ AIRA-323 (each names the mutation that must turn it red):
     handler directly and is not a model for this test.
   - Mutations:
     - drop a field from the sender: NULL, red;
-    - leave it out of the allowlist: refused, red;
+    - leave any one of `wall_ms`, `wait_ms`, `started_at_ms`, `repo` out of the allowlist
+      (four mutations): the whole report is refused, red;
     - copy the `> 0` idiom for `wait_ms`: a real 0 is lost, red;
     - the daemon derives `started_at_ms` as `at - wall_ms` instead of storing the sent value:
       red (off by an hour).
 - **T2. Absent means NULL.** A report without the new fields stores NULL in all seven columns,
   asserted with `IS NULL`. Mutation: store 0 for absent, red.
-- **T3. Validation table.**
+- **T3. Validation table**, at the handler, the one layer that validates (5.1.2). A
+  `daemon` test sends each `Request.Args` map to `Server.confineReport` over a temporary
+  store; the map is the test's input, not a copy of a client frame (T1 covers the real
+  sender).
   - Refused with `E_DAEMON_PROTOCOL` and no row written:
     - `wall_ms` of -1 or of 366 days + 1 ms;
     - `wait_ms` of -1;
@@ -776,7 +841,12 @@ AIRA-323 (each names the mutation that must turn it red):
   - Accepted (boundaries): 0, exactly 366 days, `started_at_ms` of 946,684,800,000 and of
     4,102,444,799,999, a `started_at_ms` later than the daemon's own clock (a clock step is
     not refused), `none`, 16 hex digits.
-  - Mutations: remove each bound in turn, red; refuse `started_at_ms` later than `at`, red.
+  - Mutations, each red: remove each bound in turn from its `runner` predicate; skip the
+    `ValidRepoIdentity` call in the handler; skip any one predicate call in the handler (the
+    writer does not re-check, so the bad value is stored and the "no row" assertion fails);
+    refuse `started_at_ms` later than `at`.
+  - The predicates' accept side is also driven from the client in T4 (omission), so a
+    predicate that is too narrow turns T4's accepted cases red as well as T3's.
 - **T4. Launch site** (fake `confineDeps` with the `wallNow`/`monoNow` seam of 5.1.1, captured
   `reportPeak`). Every expectation is on the client's own fake clocks; none compares the
   client's figure with the daemon's `waitedMS`.
@@ -819,13 +889,16 @@ AIRA-323 (each names the mutation that must turn it red):
   - Mutations, each red: hash the worktree's own `gitdir` instead of its `commondir`; skip
     the working-directory resolution (step 0), which gives `none` for the symlink case.
 - **T6. Key golden table.** A Go test loads `docs/dev/aira-history-charge-keys.golden.json` and
-  asserts `CommandKeys` on all 31 cases. `python3 -I docs/dev/aira-history-charge-replay.py
+  asserts `CommandKeys` on all 39 cases. `python3 -I docs/dev/aira-history-charge-replay.py
   --self-test` checks the same file, and refuses it if any input breaks the wire rules.
-  `python3 -I docs/dev/aira-history-charge-key-mutations.py` applies 32 one-line mutations to
-  the script's key function and checks each turns `--self-test` red (results in section 11).
+  `python3 -I docs/dev/aira-history-charge-key-mutations.py` applies 40 mutations to the
+  script's key function and checks each turns `--self-test` red (results in section 11).
   The Go test is mutated the same way at build time for at least: drop the repo prefix, hex
   run 7 -> 8, digit run 3 -> 2, drop one suffix, upper-case-only env names, drop
-  `--portability`.
+  `--portability`, and the eight porting mutations of round 2: env-name regexp without `^`,
+  the all-digit/hex regexp without `$` (prefix match), case-insensitive hex, suffix by
+  `strings.Contains`, `env` and `time` matched by `filepath.Base`, the digit-run rule before
+  the path rule, and `a0` by `filepath.Base`.
 - **T7. No key without established inputs.** `kind = pytest-worker` and absent `repo` give NULL
   keys. Mutation: key argv-only when `repo` is absent, red.
 - **T8. Nothing else moves.**
@@ -937,26 +1010,32 @@ Sequence notes (verified where marked):
 - **Rev 2 -> 3** (this revision, for AIRA-323's plan gate): see "Rev 3 changes" at the top.
   Verification run for it:
   - `python3 -I -m py_compile` on the script: exit 0.
-  - `--self-test` (after plan-review round 1): 31 cases, 0 mismatches, coverage
+  - `--self-test` (after plan-review round 2): 39 cases, 0 mismatches, coverage
     counterexample holds, exit 0. On the earlier 64-hex-digit table, the fixture validator
     reports 25 invalid inputs.
-  - `python3 -I docs/dev/aira-history-charge-key-mutations.py`, 2026-11-14, exit 0. Unmutated:
-    0 mismatches. Each mutation, with its mismatch count (all exit 1): hex run 7+ -> 8+ (1),
-    7+ -> 6+ (1); all-digits rule dropped (2); digit run 3+ -> 2+ (1); digit-run rule dropped
-    (3); `/` rule dropped (4); suffix dropped: `.py` (5), `.rs` (1), `.sh` (1), `.txt` (2),
-    `.json` (1), `.toml` (1); `.yaml` added (1); env names upper case only (1); `/usr/bin/env`
-    not unwrapped (1); each `time` option dropped, `-o -f --output --format -p -v -a
-    --portability --verbose --append` (1 each); unknown `time` option guessed past (1); no
-    basename (4); 13 arguments (1); first4 = `rest[:4]` (5); `key_cmd` from the first token
-    including flags (5); no repo prefix (31); OOM veto dropped (0 mismatches, red through the
-    coverage counterexample). Nine invalid tables (repo of 64, 15 or 17 hex digits, upper case,
-    `NONE`, empty; empty argv; a NUL in argv; a missing key) are each refused. Before the five
-    boundary cases were added, the plan review measured 0 mismatches for hex 7 -> 8, digit run
-    3 -> 2, dropping `.toml`, `.rs` or `.json`, upper-case-only env names, and dropping
-    `--portability` or `--output`. A weakened validator (repo `{16,64}`) makes the mutation
-    check exit 1.
-  - `part1`-`part3` and `keys()` are unchanged by round 1 (only the docstring and the
-    self-test changed), so the full-replay figures below stand without a re-run.
+  - `python3 -I docs/dev/aira-history-charge-key-mutations.py`, 2026-11-14, 39-case table,
+    exit 0. Unmutated: 0 mismatches. Each mutation, with its mismatch count (all exit 1): hex
+    run 7+ -> 8+ (1), 7+ -> 6+ (1); all-digits rule dropped (2); digit run 3+ -> 2+ (1);
+    digit-run rule dropped (3); `/` rule dropped (5); suffix dropped: `.py` (5), `.rs` (1),
+    `.sh` (1), `.txt` (2), `.json` (1), `.toml` (1); `.yaml` added (1); env names upper case
+    only (1); `/usr/bin/env` not unwrapped (1); each `time` option dropped, `-o -f --output
+    --format -p -v -a --portability --verbose --append` (1 each); unknown `time` option guessed
+    past (1); no basename (7); 13 arguments (1); first4 = `rest[:4]` (5); `key_cmd` from the
+    first token including flags (5); no repo prefix (39); OOM veto dropped (0 mismatches, red
+    through the coverage counterexample); round 2: env name unanchored (1), mask prefix match
+    (1), hex case-insensitive (1), suffix contained (1), `env` by basename (1), `time` by
+    basename (1), digit-run rule before path rule (1), `a0` with `filepath.Base` semantics (1).
+    Nine invalid tables (repo of 64, 15 or 17 hex digits, upper case, `NONE`, empty; empty
+    argv; a NUL in argv; a missing key) are each refused. Before the five round-1 boundary
+    cases were added, the plan review measured 0 mismatches for hex 7 -> 8, digit run 3 -> 2,
+    dropping `.toml`, `.rs` or `.json`, upper-case-only env names, and dropping
+    `--portability` or `--output`. The eight round-2 mutations, run by the same script against
+    the 31-case table (`git show e502db29:docs/dev/aira-history-charge-keys.golden.json`), each
+    gave exit 0 and 0 mismatches (green, not pinned). A weakened validator (repo `{16,64}`)
+    makes the mutation check exit 1.
+  - `part1`-`part3` and `keys()` are unchanged by rounds 1 and 2 (round 1 changed only the
+    docstring and the self-test; round 2 only the golden table, the mutation list and a
+    comment in `base()`), so the full-replay figures below stand without a re-run.
   - The full replay (`part1`-`part3`, which exercises the new `history_sql()` and the legacy
     keying) ran to completion on the live store under `aira confine` on 2026-11-14, exit 0. It
     read 51,102 pinned jobs since 2026-10-20, against rev 2's 50,006, because the store grew.

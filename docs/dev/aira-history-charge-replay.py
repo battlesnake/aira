@@ -56,6 +56,8 @@ LEGACY_REPO = "?"  # replay-only: a row written before AIRA-323 (repo unknown)
 
 
 def base(t):
+    # The text after the last "/" ("" for a trailing slash). Not Go's filepath.Base, which
+    # strips a trailing slash; a golden case pins the difference.
     return t.rsplit("/", 1)[-1]
 
 

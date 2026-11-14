@@ -475,6 +475,109 @@
     "key_first4": "3f1caaaaaaaaaaaa\u001fmake|ci",
     "key_cmd": "3f1caaaaaaaaaaaa\u001fmake|ci"
    }
+  },
+  {
+   "name": "env NAME= rule anchored at the token start",
+   "argv": [
+    "9x=1",
+    "make"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001f9x=1|make",
+    "key_first4": "none\u001f9x=1|make",
+    "key_cmd": "none\u001f9x=1|make"
+   }
+  },
+  {
+   "name": "mask: all-digit rule is a full match, not a prefix",
+   "argv": [
+    "tool",
+    "4G"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001ftool|4G",
+    "key_first4": "none\u001ftool|4G",
+    "key_cmd": "none\u001ftool|4G"
+   }
+  },
+  {
+   "name": "mask: hex rule is lower case only",
+   "argv": [
+    "tool",
+    "DEADBEEF"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001ftool|DEADBEEF",
+    "key_first4": "none\u001ftool|DEADBEEF",
+    "key_cmd": "none\u001ftool|DEADBEEF"
+   }
+  },
+  {
+   "name": "mask: path suffix is an ending, not a substring",
+   "argv": [
+    "tool",
+    "a.pyc"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001ftool|a.pyc",
+    "key_first4": "none\u001ftool|a.pyc",
+    "key_cmd": "none\u001ftool|a.pyc"
+   }
+  },
+  {
+   "name": "env matched as a whole token, not by basename",
+   "argv": [
+    "/bin/env",
+    "make"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001fenv|make",
+    "key_first4": "none\u001fenv|make",
+    "key_cmd": "none\u001fenv|make"
+   }
+  },
+  {
+   "name": "time matched as a whole token, not by basename",
+   "argv": [
+    "/bin/time",
+    "make"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001ftime|make",
+    "key_first4": "none\u001ftime|make",
+    "key_cmd": "none\u001ftime|make"
+   }
+  },
+  {
+   "name": "mask: path rule before digit-run rule",
+   "argv": [
+    "tool",
+    "build/1234/out"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001ftool|<p>",
+    "key_first4": "none\u001ftool|<p>",
+    "key_cmd": "none\u001ftool|<p>"
+   }
+  },
+  {
+   "name": "argv[0] trailing slash: text after the last slash, not filepath.Base",
+   "argv": [
+    "./scripts/"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001f|",
+    "key_first4": "none\u001f|",
+    "key_cmd": "none\u001f|"
+   }
   }
  ]
 }
