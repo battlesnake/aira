@@ -3359,11 +3359,11 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		switch {
 		case !valid:
 			return admitRequest{}, fmt.Errorf("%s: admit priority must be a string", CodeProtocol)
-		case text == "high":
+		case text == runner.ConfinePriorityHigh:
 			high = true
-		case text == "normal":
+		case text == runner.ConfinePriorityNormal:
 		default:
-			return admitRequest{}, fmt.Errorf("%s: admit priority must be \"high\" or \"normal\"", CodeProtocol)
+			return admitRequest{}, fmt.Errorf("%s: admit priority must be %q or %q", CodeProtocol, runner.ConfinePriorityHigh, runner.ConfinePriorityNormal)
 		}
 	}
 	// A sub-reservation (`confine-reserve`, an aitest claim) has no launch flag
