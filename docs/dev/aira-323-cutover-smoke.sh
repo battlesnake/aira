@@ -28,6 +28,8 @@ log_dir=${HOME}/tmp
 mkdir -p "$log_dir"
 
 fail=0
+columns=$(sqlite3 -readonly "$db" "select count(*) from pragma_table_info('confine_peak_history')
+	where name in ('wall_ms','wait_ms','started_at_ms','repo')")
 
 probe() {
 	local dir=$1 want_repo=$2
@@ -44,6 +46,17 @@ probe() {
 	fi
 	end_ms=$(date +%s%3N)
 	sig_sql="'sh'||char(0)||'-c'||char(0)||'sleep 1'||char(0)||'$nonce'"
+	if [ "$columns" != 4 ]; then
+		# The store has not been opened by a 323 daemon yet: show the row the
+		# probe wrote (the pre-323 shape) and fail.
+		row=$(sqlite3 -readonly -separator '|' "$db" \
+			"select count(*), coalesce(min(peak_rss),'NULL') from confine_peak_history
+			 where rowid > $before and kind='confine' and signature = $sig_sql")
+		echo "probe from $dir: count|peak_rss = $row; the store has no AIRA-323 columns (daemon not restarted)"
+		echo "FAIL ($dir): the daemon predates AIRA-323"
+		fail=1
+		return
+	fi
 	row=$(sqlite3 -readonly -separator '|' "$db" \
 		"select count(*), coalesce(min(wall_ms),'NULL'), coalesce(min(wait_ms),'NULL'),
 		        coalesce(min(started_at_ms),'NULL'), coalesce(min(repo),'NULL'), coalesce(min(peak_rss),'NULL')
