@@ -1,5 +1,5 @@
 {
- "comment": "Golden table for the AIRA-323 command key (spec docs/superpowers/specs/2026-11-13-history-charge-design.md section 5.1, rev 3). Each case: the effective argv (the confine signature is these tokens joined by NUL), the repo identity the client sent (64 lowercase hex digits, or \"none\"), and the three keys the daemon stores. The Go key function and the replay script's keys() (docs/dev/aira-history-charge-replay.py --self-test) must both reproduce every case byte for byte. \\u001f (unit separator) divides the repo identity from the argv part. A row with no repo identity gets no key (NULL) and is not a case here.",
+ "comment": "Golden table for the AIRA-323 command key (spec docs/superpowers/specs/2026-11-13-history-charge-design.md section 5.1, rev 3). Each case: the effective argv (the confine signature is these tokens joined by NUL), the repo identity the client sent (exactly 16 lowercase hex digits or \"none\", the wire rule of spec section 5.1.2; --self-test refuses a table whose inputs break it), and the three keys the daemon stores. The Go key function and the replay script's keys() (docs/dev/aira-history-charge-replay.py --self-test) must both reproduce every case byte for byte. \\u001f (unit separator) divides the repo identity from the argv part. A row with no repo identity gets no key (NULL) and is not a case here.",
  "cases": [
   {
    "name": "plain command",
@@ -7,11 +7,11 @@
     "make",
     "test"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|test",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|test",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|test"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fmake|test",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fmake|test",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fmake|test"
    }
   },
   {
@@ -19,11 +19,11 @@
    "argv": [
     "./runall.sh"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001frunall.sh|",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001frunall.sh|",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001frunall.sh|"
+    "key_masked": "3f1caaaaaaaaaaaa\u001frunall.sh|",
+    "key_first4": "3f1caaaaaaaaaaaa\u001frunall.sh|",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001frunall.sh|"
    }
   },
   {
@@ -31,11 +31,11 @@
    "argv": [
     "./runall.sh"
    ],
-   "repo": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "repo": "9e07bbbbbbbbbbbb",
    "want": {
-    "key_masked": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001frunall.sh|",
-    "key_first4": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001frunall.sh|",
-    "key_cmd": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001frunall.sh|"
+    "key_masked": "9e07bbbbbbbbbbbb\u001frunall.sh|",
+    "key_first4": "9e07bbbbbbbbbbbb\u001frunall.sh|",
+    "key_cmd": "9e07bbbbbbbbbbbb\u001frunall.sh|"
    }
   },
   {
@@ -59,11 +59,11 @@
     "test",
     "./..."
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test <p>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test <p>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fgo|test <p>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fgo|test <p>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fgo|test"
    }
   },
   {
@@ -74,11 +74,11 @@
     "-I",
     "x.py"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|-I <p>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|-I <p>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fpython3|-I <p>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fpython3|-I <p>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fpython3|<p>"
    }
   },
   {
@@ -88,11 +88,11 @@
     "sort",
     "big.txt"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fsort|<p>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fsort|<p>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fsort|<p>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fsort|<p>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fsort|<p>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fsort|<p>"
    }
   },
   {
@@ -106,11 +106,11 @@
     "--epochs",
     "30"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p> --epochs <n>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p> --epochs <n>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fpython3|<p> --epochs <n>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fpython3|<p> --epochs <n>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fpython3|<p>"
    }
   },
   {
@@ -122,11 +122,11 @@
     "make",
     "ci"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fmake|ci",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fmake|ci",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fmake|ci"
    }
   },
   {
@@ -137,11 +137,11 @@
     "make",
     "ci"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|--quiet make ci",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|--quiet make ci",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|make"
+    "key_masked": "3f1caaaaaaaaaaaa\u001ftime|--quiet make ci",
+    "key_first4": "3f1caaaaaaaaaaaa\u001ftime|--quiet make ci",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001ftime|make"
    }
   },
   {
@@ -152,11 +152,11 @@
     "make",
     "ci"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftimeout|<n> make ci",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftimeout|<n> make ci",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftimeout|<n>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001ftimeout|<n> make ci",
+    "key_first4": "3f1caaaaaaaaaaaa\u001ftimeout|<n> make ci",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001ftimeout|<n>"
    }
   },
   {
@@ -168,11 +168,11 @@
     "make",
     "build"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fnice|-n <n> make build",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fnice|-n <n> make",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fnice|<n>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fnice|-n <n> make build",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fnice|-n <n> make",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fnice|<n>"
    }
   },
   {
@@ -183,11 +183,11 @@
     "make",
     "deploy"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fflock|<p> make deploy",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fflock|<p> make deploy",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fflock|<p>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fflock|<p> make deploy",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fflock|<p> make deploy",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fflock|<p>"
    }
   },
   {
@@ -198,11 +198,11 @@
     "-q",
     "tests/unit"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001faitest-parent|pytest -q <p>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001faitest-parent|pytest -q <p>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001faitest-parent|pytest"
+    "key_masked": "3f1caaaaaaaaaaaa\u001faitest-parent|pytest -q <p>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001faitest-parent|pytest -q <p>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001faitest-parent|pytest"
    }
   },
   {
@@ -213,11 +213,11 @@
     "-k",
     "fast"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpytest|<p> -k fast",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpytest|<p> -k fast",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpytest|<p>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fpytest|<p> -k fast",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fpytest|<p> -k fast",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fpytest|<p>"
    }
   },
   {
@@ -229,11 +229,11 @@
     "--stat",
     "20261114"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgit|show <n> --stat <n>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgit|show <n> --stat",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgit|show"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fgit|show <n> --stat <n>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fgit|show <n> --stat",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fgit|show"
    }
   },
   {
@@ -245,11 +245,11 @@
     "TestAIRA323",
     "./internal/store"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test -run <n> <p>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test -run <n>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fgo|test -run <n> <p>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fgo|test -run <n>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fgo|test"
    }
   },
   {
@@ -258,11 +258,11 @@
     "python3",
     "replay.py"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fpython3|<p>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fpython3|<p>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fpython3|<p>"
    }
   },
   {
@@ -287,11 +287,11 @@
     "-Dxp",
     "-Dxq"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcc|-Dxa -Dxb -Dxc -Dxd -Dxe -Dxf -Dxg -Dxh -Dxi -Dxj -Dxk -Dxl -Dxm -Dxn",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcc|-Dxa -Dxb -Dxc",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcc|"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fcc|-Dxa -Dxb -Dxc -Dxd -Dxe -Dxf -Dxg -Dxh -Dxi -Dxj -Dxk -Dxl -Dxm -Dxn",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fcc|-Dxa -Dxb -Dxc",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fcc|"
    }
   },
   {
@@ -299,11 +299,11 @@
    "argv": [
     "env"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fenv|",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fenv|",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fenv|"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fenv|",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fenv|",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fenv|"
    }
   },
   {
@@ -314,11 +314,11 @@
     "build",
     "--release"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|--locked build --release",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|--locked build --release",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|build"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fcargo|--locked build --release",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fcargo|--locked build --release",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fcargo|build"
    }
   },
   {
@@ -331,11 +331,11 @@
     "make",
     "ci"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fmake|ci",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fmake|ci",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fmake|ci"
    }
   },
   {
@@ -347,11 +347,11 @@
     "go",
     "build"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|build",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|build",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|build"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fgo|build",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fgo|build",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fgo|build"
    }
   },
   {
@@ -359,11 +359,11 @@
    "argv": [
     "time"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|"
+    "key_masked": "3f1caaaaaaaaaaaa\u001ftime|",
+    "key_first4": "3f1caaaaaaaaaaaa\u001ftime|",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001ftime|"
    }
   },
   {
@@ -374,11 +374,11 @@
     "pytest",
     "-q"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fuv|run pytest -q",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fuv|run pytest -q",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fuv|run"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fuv|run pytest -q",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fuv|run pytest -q",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fuv|run"
    }
   },
   {
@@ -388,11 +388,92 @@
     "--seed=12345",
     "sim.py"
    ],
-   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "repo": "3f1caaaaaaaaaaaa",
    "want": {
-    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<n> <p>",
-    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<n> <p>",
-    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<n>"
+    "key_masked": "3f1caaaaaaaaaaaa\u001fpython3|<n> <p>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fpython3|<n> <p>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fpython3|<n>"
+   }
+  },
+  {
+   "name": "6-hex token kept, 7-hex token masked",
+   "argv": [
+    "git",
+    "log",
+    "c0ffee",
+    "deadbee"
+   ],
+   "repo": "3f1caaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaa\u001fgit|log c0ffee <n>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fgit|log c0ffee <n>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fgit|log"
+   }
+  },
+  {
+   "name": "2-digit run kept, 3-digit run masked",
+   "argv": [
+    "tool",
+    "v12",
+    "v123"
+   ],
+   "repo": "3f1caaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaa\u001ftool|v12 <n>",
+    "key_first4": "3f1caaaaaaaaaaaa\u001ftool|v12 <n>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001ftool|v12"
+   }
+  },
+  {
+   "name": "each listed file suffix masked, an unlisted one kept",
+   "argv": [
+    "tool",
+    "a.py",
+    "b.rs",
+    "c.sh",
+    "d.txt",
+    "e.json",
+    "f.toml",
+    "g.yaml"
+   ],
+   "repo": "3f1caaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaa\u001ftool|<p> <p> <p> <p> <p> <p> g.yaml",
+    "key_first4": "3f1caaaaaaaaaaaa\u001ftool|<p> <p> <p>",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001ftool|<p>"
+   }
+  },
+  {
+   "name": "lower-case var=value prefix unwrapped",
+   "argv": [
+    "foo=bar",
+    "make",
+    "x"
+   ],
+   "repo": "3f1caaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaa\u001fmake|x",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fmake|x",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fmake|x"
+   }
+  },
+  {
+   "name": "time long options --portability --verbose --append --output X unwrapped",
+   "argv": [
+    "time",
+    "--portability",
+    "--verbose",
+    "--append",
+    "--output",
+    "o.log",
+    "make",
+    "ci"
+   ],
+   "repo": "3f1caaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaa\u001fmake|ci",
+    "key_first4": "3f1caaaaaaaaaaaa\u001fmake|ci",
+    "key_cmd": "3f1caaaaaaaaaaaa\u001fmake|ci"
    }
   }
  ]

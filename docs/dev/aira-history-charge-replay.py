@@ -16,12 +16,15 @@ predicted only from jobs that finished EARLIER. Two parts:
           against history and the combination, on --memory-reserve pins only.
 
 Run (confined, ~1G):  aira confine --memory-reserve 1G -- python3 -I docs/dev/aira-history-charge-replay.py
-Key self-test (no database; checks keys() against the committed golden table that the Go key
-function must also reproduce, docs/dev/aira-history-charge-keys.golden.json):
+Key self-test (no database; validates the committed golden table's inputs against the wire
+rules, checks keys() against it, and checks the repo-split coverage counterexample; the Go key
+function must reproduce the same table, docs/dev/aira-history-charge-keys.golden.json):
                       python3 -I docs/dev/aira-history-charge-replay.py --self-test
+Mutation check of the table (each named mutation of keys() must turn --self-test red):
+                      python3 -I docs/dev/aira-history-charge-key-mutations.py
 
-Rev 3 (AIRA-323): the key carries the repo identity the client sends (`repo` column: 64 hex
-digits, or "none" outside any git repository). Rows written before AIRA-323 have no repo; the
+Rev 3 (AIRA-323): the key carries the repo identity the client sends (`repo` column: exactly
+16 lowercase hex digits, or "none" outside any git repository). Rows written before AIRA-323 have no repo; the
 replay keys them under the legacy placeholder "?", which groups them exactly as rev 2 did (every
 legacy key is "?" + US + the rev-2 key, by construction), so the rev-2 grouping is unchanged;
 printed numbers move only as the store grows.
@@ -34,7 +37,7 @@ is predicted from rows that finished while it was still running (optimistic, wor
 same-command bursts); (c) store retention is 20 rows per EXACT signature, so a coarse key
 sees more history here than the build's window query would. A peak is the cgroup's
 memory.peak. "Above" is not an OOM: the pin stays the hard cap. After AIRA-323, replay by
-started_at and weight by duration.
+started_at_ms and weight by duration.
 """
 import collections
 import json
@@ -280,10 +283,69 @@ def part3():
         stats("min(%.1f x pin, history)" % f, lambda b, pr, f=f: min(b * f, pr) if pr else b * f)
 
 
+REPO_RE = re.compile(r"[0-9a-f]{16}|none")  # the wire rule for `repo` (spec 5.1.2)
+WANT_KEYS = {"key_masked", "key_first4", "key_cmd"}
+
+
+def fixture_errors(golden):
+    """Every way the golden table's INPUTS break the wire contract; empty when the table is valid.
+    A case the real handler would refuse cannot be reproduced through it (spec T1), so it must
+    not be in the table."""
+    errs = []
+    cases = golden.get("cases") if isinstance(golden, dict) else None
+    if not isinstance(cases, list) or not cases:
+        return ["no cases"]
+    names = set()
+    for i, case in enumerate(cases):
+        name = case.get("name") if isinstance(case, dict) else None
+        tag = "case %d (%r)" % (i, name)
+        if not isinstance(case, dict) or set(case) != {"name", "argv", "repo", "want"}:
+            errs.append(tag + ": fields must be exactly name, argv, repo, want")
+            continue
+        if not isinstance(name, str) or not name or name in names:
+            errs.append(tag + ": name must be a non-empty unique string")
+        names.add(name)
+        argv = case["argv"]
+        if (not isinstance(argv, list) or not argv
+                or not all(isinstance(t, str) and t and "\x00" not in t for t in argv)):
+            errs.append(tag + ": argv must be a non-empty list of non-empty strings without NUL")
+        repo = case["repo"]
+        if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
+            errs.append(tag + ": repo %r is not 16 lowercase hex digits or none" % (repo,))
+        want = case["want"]
+        if not isinstance(want, dict) or set(want) != WANT_KEYS or not all(isinstance(v, str) for v in want.values()):
+            errs.append(tag + ": want must hold exactly key_masked, key_first4, key_cmd as strings")
+    return errs
+
+
+def coverage_counterexample():
+    """Spec section 2: splitting keys by repo does NOT only shrink coverage. One OOM by repo A
+    then three clean runs by repo B: the merged (argv-only) window is vetoed by the OOM, the
+    repo-B window is usable. Returns an error string, or None when the example holds."""
+    sig = "./runall.sh"
+    rows = [("aaaaaaaaaaaaaaaa", 6 << 30, True)] + [("bbbbbbbbbbbbbbbb", 2 << 30, False)] * 3
+    merged, split = collections.defaultdict(list), collections.defaultdict(list)
+    for repo, peak, oom in rows:
+        merged[keys(sig)["N3_cmd+sub"]].append((peak, oom))
+        split[keys(sig, repo)["N3_cmd+sub"]].append((peak, oom))
+    if usable(merged[keys(sig)["N3_cmd+sub"]]) is not None:
+        return "merged history should be vetoed by repo A's OOM"
+    if usable(split[keys(sig, "bbbbbbbbbbbbbbbb")["N3_cmd+sub"]]) is None:
+        return "repo B's split history should be usable"
+    return None
+
+
 def self_test():
-    """keys() against the committed golden table; exit status 0 only if every case matches."""
+    """Fixture validation, keys() against the committed golden table, and the coverage
+    counterexample; exit status 0 only if all hold."""
     with open(GOLDEN) as f:
         golden = json.load(f)
+    errs = fixture_errors(golden)
+    for e in errs:
+        print("INVALID FIXTURE " + e)
+    if errs:
+        print("self-test: %d invalid fixture inputs" % len(errs))
+        return 1
     bad = 0
     for case in golden["cases"]:
         sig = "\x00".join(case["argv"])
@@ -292,8 +354,12 @@ def self_test():
         if got != case["want"]:
             bad += 1
             print("MISMATCH %s: got %r want %r" % (case["name"], got, case["want"]))
-    print("self-test: %d cases, %d mismatches" % (len(golden["cases"]), bad))
-    return 1 if bad else 0
+    ce = coverage_counterexample()
+    if ce:
+        print("COUNTEREXAMPLE FAILED: " + ce)
+    print("self-test: %d cases, %d mismatches, coverage counterexample %s" % (
+        len(golden["cases"]), bad, "FAILED" if ce else "holds"))
+    return 1 if bad or ce else 0
 
 
 if __name__ == "__main__":

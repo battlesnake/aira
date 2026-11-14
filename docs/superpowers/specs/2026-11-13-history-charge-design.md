@@ -38,11 +38,14 @@ after rev 2), and they gain sequence notes.
    not a prefix of the others. Rev 3 stores the three levels as three columns. Rev 2 also
    described the finest level as "first 14 tokens", but the script uses argv[0] plus 14
    arguments. Rev 3 states what the script does. Section 5.1.4.
-4. **Cut: the `started_at` column and wire field.** The daemon stamps `at` when the report
-   arrives, and `wall_ms` is measured up to the moment the report is built, so the start time
-   is `at - wall_ms` to within one local socket write. Storing a third, derivable timestamp
-   would add a column, a field and a validation rule whose only possible new content is a
-   disagreement with the other two. Section 5.1.1.
+4. **`started_at` is a client-captured wall-clock reading, not derived.** The ticket asks for
+   the start time. Rev 2 named it but gave no boundary. Rev 3 defines it as the wall clock
+   (Unix milliseconds) read at the same instant the `wall_ms` timer starts, the return of the
+   admission call, and sends it as `started_at_ms`. It is not `at - wall_ms`: `at` is stamped
+   when the report reaches the daemon, after a dial, serialisation and scheduling whose delay
+   is unbounded and unmeasured, and a wall-clock step during the run shifts `at` but not the
+   monotonic `wall_ms`. (A draft of rev 3 cut the field as derivable; the plan review showed
+   it is not.) Section 5.1.1.
 5. **Cut from 323: the `(kind, key, at)` index and the 250 ms window-query test.** AIRA-323
    has no reader of the key. Each reader ticket (325, 326, 331) adds the index for the level it
    reads, in the same change as the query that uses it. Adding an index later needs no
@@ -50,12 +53,14 @@ after rev 2), and they gain sequence notes.
 6. **`wait_ms` is measured by the client across the whole admission call.** The coordinator's
    brief suggested relaying the grant's `waited_ms` (the trailer's figure). That figure
    restarts when the client reconnects mid-queue, because the daemon enqueues a fresh waiter.
-   So 323 measures the felt wait, which is what the fast-lane gate judges. It equals the
-   trailer's figure when there was no reconnect. Section 5.1.1.
+   So 323 measures the felt wait, which is what the fast-lane gate judges. It also includes
+   the dial and transport time, so it is not equal to the trailer's figure even without a
+   reconnect, and no test asserts that it is. Section 5.1.1.
 7. **Honest-evidence additions to section 2.** All rev-2 numbers were measured on argv-only
-   keys (no row has a repo), so repo-split coverage is at most the 72% measured. The share of
-   history under the 20-row cap was measured (6.2%). Failed runs are never recorded (AIRA-264).
-   Section 2.
+   keys (no row has a repo). Repo-split coverage is unmeasured and can move either way (the
+   OOM veto: a counterexample is in section 2 and in the script's `--self-test`). The share
+   of history under the 20-row cap was measured (6.2%). Failed runs are never recorded
+   (AIRA-264). Section 2.
 8. **Correction to the backlog plan** (`docs/plans/2026-11-14-backlog-plan.md`, line 171 and
    open item at line 196). With the protocol bump, a stale client does not just lose its peak
    report: **its new launches are refused** at admission. Only jobs already running at cutover
@@ -65,10 +70,25 @@ after rev 2), and they gain sequence notes.
    holds by construction: every legacy key is a fixed prefix plus the unchanged rev-2
    expression, and the exact-signature level is untouched. So the grouping is unchanged; the
    printed numbers move only because the store keeps growing. The script gains `--self-test`
-   against a new committed golden table of 26 cases. Rev 2 promised that table but no file
-   existed.
+   against a new committed golden table of 31 cases. Rev 2 promised that table but no file
+   existed. `--self-test` also refuses a table whose inputs break the wire rules (a repo that
+   is not 16 hex digits or `none`), and a committed mutation check
+   (`docs/dev/aira-history-charge-key-mutations.py`) shows every boundary of the key function
+   is pinned by some case (section 11).
 10. **Interactions** with AIRA-340, 341, 228, 225, 321, 331 and 236 are recorded as sequence
     notes in section 10.
+11. **Plan-review round 1 fixes** (Sol and Fable findings, 2026-11-14):
+    - The golden table's repos were 64 hex digits against the 16-digit wire rule; now 16, and
+      the self-test validates fixture inputs (5.1.2, 5.1.4).
+    - `started_at` restored as a client-captured field (change 4 above; 5.1.1, T1, T4).
+    - Repo discovery resolves the working directory's symlinks before walking upward; Go's
+      `os.Getwd` returns the logical `$PWD` (5.1.3, T5).
+    - T4 no longer equates the client's wait with the daemon's `waited_ms`; it uses explicit
+      client-clock expectations and a reconnect case (T4).
+    - The "72% is an upper bound" claim was wrong (OOM veto) and is withdrawn (section 2).
+    - Five boundary cases added to the golden table; 32 mutations, all red (section 11).
+    - Queued jobs at the protocol cutover are refused, not resumed; stated, and a rollout step
+      added (5.1.6, section 6).
 
 ## 1. The problem, in plain terms
 
@@ -141,10 +161,14 @@ Limits of this evidence, stated so no one reads more into it:
   window query must be what is measured (AIRA-325).
 - "Pinned" here is `cap:operator:--memory-reserve` rows only.
 - **(rev 3) Every key above is argv-only.** No stored row has a repo identity, so the replay
-  keys them all under one legacy placeholder, which is rev 2's grouping exactly. A repo
-  identity can only split keys, so the 72% history coverage is an **upper bound** on coverage
-  with repo-scoped keys. The real figure is unmeasured until AIRA-323 rows accrue. It is
-  assumed, not shown, that the split costs little.
+  keys them all under one legacy placeholder, which is rev 2's grouping exactly. Coverage
+  with repo-scoped keys is **unmeasured, in both directions**, until AIRA-323 rows accrue.
+  Splitting thins each key's history, which can lower coverage (fewer keys reach 3 clean
+  samples), but the OOM veto means it can also raise it. Counterexample: repo A's
+  `./runall.sh` OOMs once, then repo B's `./runall.sh` runs clean three times. The merged
+  argv-only window holds the OOM and is vetoed; repo B's split window has 3 clean samples and
+  is usable. (`--self-test` checks this example; dropping the veto turns it red.) The 72%
+  figure is therefore neither an upper nor a lower bound for repo-scoped keys.
 - **(rev 3) Retention removes rows, mostly for frequent commands.** Measured 2026-11-14 on the
   live store (`~/tmp` probe, read-only; the query is reproducible with the SQL in section
   5.1.5): 232,319 retained confine rows over 158,743 signatures. 720 signatures sit at the
@@ -198,11 +222,11 @@ against the minimum, and where it went:
   the flat discount is not enough.
 - **Reserved headroom for the fast lane**: not built; measure fast-class waits first.
 
-AIRA-323's own minimum is "for each finished job, record how long it waited, how long it ran,
-and which command it was, so a later reader can group jobs". Rev 3 keeps to that: the client
-sends three raw facts (two durations and a repo identity), and the daemon stores them with three
-key strings derived from the signature it already receives. A derivable start time, an index
-with no reader, and client-side key computation are all cut (rev 3 changes 4-5, section 5.1.3).
+AIRA-323's own minimum is "for each finished job, record when it started, how long it waited,
+how long it ran, and which command it was, so a later reader can group jobs". Rev 3 keeps to
+that: the client sends four raw facts (a start time, two durations and a repo identity), and the
+daemon stores them with three key strings derived from the signature it already receives. An
+index with no reader and client-side key computation are cut (rev 3 change 5, section 5.1.4).
 
 ## 5. Design
 
@@ -219,9 +243,27 @@ behave exactly as today.
 | `wall_ms` | client | Monotonic milliseconds from the return of the admission call (`deps.admit` in `confine_linux.go`, about line 744) to the construction of the `ConfinePeakReport` (about line 1456). It covers the run, scope setup and the teardown reads before the report. | Never absent on a confine report. A sub-millisecond run reports 0, which is a real 0. |
 | `wait_ms` | client | Monotonic milliseconds across the whole `deps.admit` call. | Sent **only** when the admission ended in a daemon grant. `deps.admit` is `admitConfine` (`confine_linux.go:1900`), which returns the package's `admissionResult` (`admission_linux.go:27-35`). The launch site is in the same package and tests `admission.release != nil`. `release` is set in exactly one place, the lease return at `admission_linux.go:689`, for every daemon grant: `immediate`, `waited`, and the daemon's own `unevaluated` grant. The client-local results carry no `release` and a `waitedMS` that is a Go zero value, not a measurement, so no wait is sent for them. Those results are `disabled` (`admission_linux.go:208`) and `unevaluated` with reason `no-daemon` (`:240`). They share the state name `unevaluated` with a daemon grant, and `release` is what tells them apart. `bypassed` (`:197`) needs `NoAdmit`, which `admitConfine` never sets. |
 | `repo` | client | Section 5.1.3, from the client's working directory at launch, computed once before admission. | Absent when the identity cannot be established (section 5.1.3). |
+| `started_at_ms` | client | The **wall** clock, as Unix milliseconds (UTC), read at the same instant the `wall_ms` timer starts: the return of `deps.admit`. This is rev 2's "grant time". | Never absent on a confine report, except when the reading is outside the wire bounds (a clock set before 2000 or after 2100), when it is omitted. |
 | `at` (existing) | daemon | `time.Now()` when the report is handled (`confine_report.go:101`). | Never. |
-| start time | nobody stores it | Readers compute `at - wall_ms`. The error is one local socket write plus the handler's entry, sub-millisecond to a few ms. | Absent when `wall_ms` is absent (pre-323 rows, pool rows). |
 | `key_masked`, `key_first4`, `key_cmd` | daemon (store writer) | Section 5.1.4, from the signature and `repo`. | NULL when `kind != confine` or `repo` is absent. |
+
+**The clock seam.** The launch site reads two clocks, and the build adds both to `confineDeps`
+(`confine_linux.go:207`; it has no clock today): `wallNow func() time.Time` (production
+`time.Now().Round(0)`, which drops the monotonic reading so only the wall clock is used) and
+`monoNow func() time.Duration` (production `time.Since(processEpoch)`, where `processEpoch` is a
+package variable set once from `time.Now()`, so the difference is monotonic). `wait_ms` and
+`wall_ms` are differences of `monoNow`; `started_at_ms` is `wallNow().UnixMilli()`. Tests replace
+the two independently, which is how T4 steps the wall clock without moving the monotonic one.
+
+**Why `started_at_ms` is sent, not derived as `at - wall_ms`.** `at` is stamped when the report
+is handled. Between the end of `wall_ms` (the report's construction) and that stamp lie the dial
+(`ReportPeakSample`, `admission_linux.go:809`), the frame write and the daemon's scheduling, with
+a 250 ms report deadline (`confine_linux.go:1447`) but no measured typical delay. And `wall_ms` is
+monotonic while `at` is wall clock, so a clock step during the run (NTP, a WSL resume) moves `at`
+and not `wall_ms`, shifting the derived start by the size of the step. A reader that has all
+three can check them: `at - (started_at_ms + wall_ms)` is the delivery delay plus any clock step
+during the run. A negative or large value flags a step. The daemon does not judge it, because a
+step makes a disagreement a true record of the clocks, and refusing it would lose the sample.
 
 Why `wait_ms` is client-measured and not the grant's `waited_ms`: the daemon measures
 `waited_ms` from **its** waiter's enqueue (`admit.go`, `waiter.waitedMS =
@@ -229,8 +271,12 @@ elapsedMilliseconds(waiter.enqueued, ...)`). A client that reconnects mid-queue
 (`errAdmitReconnect`, `admission_linux.go:45`) is enqueued afresh, so the figure restarts. A
 second admission timer (`admissionStarted`, `admission_linux.go:295`) is also local to one
 exchange. Measuring around `deps.admit` gives the wait the user felt. The trailer keeps printing
-the grant's figure, unchanged. The two agree when there was no reconnect, and the build tests
-that they agree (test T4).
+the grant's figure, unchanged. The two measure different intervals and are **not** expected to be
+equal: the client's interval contains the dial (up to the 500 ms `leaseKeeperDialTimeout`), the
+frame exchange and, after a reconnect, the earlier queue time and the 500 ms reconnect gaps
+(`leaseKeeperReconnectGap`, `lease_keeper_linux.go:24`; loop at `admission_linux.go:262-282`). An
+immediate grant has a daemon `waited_ms` of 0 and a client `wait_ms` of the transport time. No
+test equates them; T4 states its expectations on the client's own clock.
 
 `at` caveat for readers: `at` is RFC3339Nano text with trailing zeros trimmed, so sorting the
 text is not chronological below one second (`...03.98Z` sorts after `...03.984Z`). This is
@@ -246,19 +292,22 @@ New optional fields in `Request.Args` of the `confine-report` frame, sent by `Re
 |---|---|---|
 | `wall_ms` | integer | `0 <= wall_ms <= 31,622,400,000` (366 days in ms) |
 | `wait_ms` | integer | same bounds |
+| `started_at_ms` | integer | `946,684,800,000 <= started_at_ms < 4,102,444,800,000` (2000-01-01T00:00:00Z inclusive to 2100-01-01T00:00:00Z exclusive). **Not** compared with `at` or with the daemon's clock (section 5.1.1: a clock step makes a disagreement true). |
 | `repo` | string | exactly `none`, or exactly 16 lowercase hex digits (`^[0-9a-f]{16}$`) |
 
 Client (`internal/runner`):
 
-- `ConfinePeakReport` (`confine_budget.go:14`) gains `WallMS *int64`, `WaitMS *int64` and
-  `Repo string`. Nil or empty means not established.
+- `ConfinePeakReport` (`confine_budget.go:14`) gains `WallMS *int64`, `WaitMS *int64`,
+  `StartedAtMS *int64` and `Repo string`. Nil or empty means not established.
 - `ReportPeakSample` adds each field only when it is set. The `<= 0 -> omit` idiom used for
   `peak_rss` and `budget` must **not** be copied, because 0 is a real duration. Nil is the only
   "absent".
-- The client never sends a value the daemon would refuse. A duration outside the bounds, such
-  as a run longer than 366 days, is omitted (NULL), and the rest of the report, peak and OOM
-  included, still goes out. Under refuse-never-repair, sending it would lose the whole sample.
-- The confine launch site fills the three fields per section 5.1.1. Shim mode still sends no
+- The client never sends a value the daemon would refuse. A duration or start time outside
+  the bounds, such as a run longer than 366 days, is omitted (NULL), and the rest of the
+  report, peak and OOM included, still goes out. Under refuse-never-repair, sending it would
+  lose the whole sample. The client applies the same bounds through one shared definition
+  (constants in `runner`, which the daemon and the store import), so the two cannot drift.
+- The confine launch site fills the four fields per section 5.1.1. Shim mode still sends no
   report (`confine_shim_linux.go:515`, unchanged).
 - `aira confine-report` (the aitest pool face, `cmd/aira/main.go:1405-1438`) is unchanged and
   sends none of the new fields. Its rows are `kind = pytest-worker`, whose subject already
@@ -283,10 +332,15 @@ Daemon (`internal/daemon/confine_report.go`):
 
 The store (`RecordConfinePeak`, `confine_peak_history.go:99`):
 
-- `ResourcePeakObservation` gains `WallMS`, `WaitMS *int64` and `Repo string`.
+- `ResourcePeakObservation` gains `WallMS`, `WaitMS`, `StartedAtMS *int64` and `Repo string`.
 - The writer validates them again with the same rules. Like the existing peak and budget checks
   (lines 103-131), the Go check is the guard that binds both table shapes.
 - The writer derives the three keys, so every writer, tests included, gets the same keys.
+- **Who validates `repo`:** the writer, before it calls `CommandKeys`. `CommandKeys` does not
+  validate; its documented precondition is a `repo` that already passed the wire rule, and it
+  is called from nowhere else. (Validating twice inside one call chain would add a third copy
+  of the rule.) The golden table holds only inputs that pass the rule, and `--self-test`
+  refuses a table that does not, so a Go test can feed every case through the real handler.
 
 #### 5.1.3 Repo identity
 
@@ -307,7 +361,15 @@ path, but that DB already stores full argv, absolute paths included, in `signatu
 `runner.RepoIdentity(cwd string) (id string, ok bool)` in `internal/runner`. It cannot live in
 `internal/app`, which imports `runner`. Its input is `os.Getwd()` at launch.
 
-1. Walk from `cwd` up to `/`. At each directory, `os.Stat(dir + "/.git")`:
+0. `cwd = filepath.EvalSymlinks(cwd)`. An error is **unevaluated**. This step is required:
+   Go's `os.Getwd` returns `$PWD` when `$PWD` names the current directory, so it can return a
+   logical path through a symlink (documented: "Getwd may return any one of them"; Go's
+   implementation checks `$PWD` first). Confirmed 2026-11-14 with a throwaway `~/tmp` probe:
+   with `link -> repo/sub` and the shell in `link`, `os.Getwd` returned `.../link`, and the
+   parent of that path has no `.git`, so an unresolved walk misses the repository (giving
+   `none`, or an outer repository's identity). After resolution the walk starts at
+   `.../repo/sub`. T5's symlink case is the committed reproduction.
+1. Walk from the resolved `cwd` up to `/`. At each directory, `os.Stat(dir + "/.git")`:
    - not found (`ENOENT`/`ENOTDIR`): go to the parent;
    - any other error: **unevaluated**;
    - a directory: `gitdir` is that path;
@@ -359,7 +421,7 @@ key_cmd    = P + a0 + "|" + (pos[0] or "")          command and first positional
 ```
 
 The authority is `keys()` in the replay script (its `N1`, `N2` and `N3`) together with the golden
-table. A Go test and `--self-test` must both reproduce all 26 cases byte for byte. When the
+table. A Go test and `--self-test` must both reproduce all 31 cases byte for byte. When the
 prose and the script disagree, the script and the table win, and the prose is fixed. The
 argv part is rev 2's function unchanged. Collisions in it are possible (`a0` containing `|`, a
 token containing a space) and are accepted: a collision only merges two histories.
@@ -377,16 +439,20 @@ undoing the decision. Readers start from the rows 323 writes.
 
 #### 5.1.5 Schema and retention
 
-`confine_peak_history` gains six nullable columns:
+`confine_peak_history` gains seven nullable columns:
 
 ```
-wall_ms INTEGER, wait_ms INTEGER, repo TEXT,
+wall_ms INTEGER, wait_ms INTEGER, started_at_ms INTEGER, repo TEXT,
 key_masked TEXT, key_first4 TEXT, key_cmd TEXT
 ```
 
+- `started_at_ms` is an integer (Unix milliseconds), not RFC3339 text like `at`, so it sorts
+  chronologically (the `at` caveat in 5.1.1 does not apply to it).
 - In the `CREATE TABLE` DDL (`store.go:875-880`), with table checks
-  `CHECK(wall_ms IS NULL OR wall_ms>=0)`, `CHECK(wait_ms IS NULL OR wait_ms>=0)` and
-  `CHECK(repo IS NULL OR length(repo)>0)`, following the AIRA-180 pattern.
+  `CHECK(wall_ms IS NULL OR wall_ms>=0)`, `CHECK(wait_ms IS NULL OR wait_ms>=0)`,
+  `CHECK(started_at_ms IS NULL OR started_at_ms>0)` and
+  `CHECK(repo IS NULL OR length(repo)>0)`, following the AIRA-180 pattern. The exact bounds
+  live in Go, as for the existing columns.
 - Added to the `ensureConfinePeakHistorySubject` list (`store.go:1313-1321`) through
   `ensureColumnAdded`, as plain `ADD COLUMN <name> <type>`. That follows the AIRA-180 precedent,
   whose `budget` ALTER also carries no CHECK. The Go validation in `RecordConfinePeak` is the
@@ -454,8 +520,20 @@ visible sign would be the OOM advisory reading "unconfirmed". The AIRA-284 prece
     (proto 15) is refused, so **that run's row is lost**: peak, OOM bit and budget, the
     estimator's input. The client prints any OOM advisory as unconfirmed (`peakAcknowledged`
     false, `confine_linux.go:1440-1459`).
-  - Every other verb from a stale binary is refused too: `confine --list/--kill/--front`,
-    `aira top` and long-lived MCP servers, until they restart.
+  - Jobs **queued** (waiting for admission) at cutover are **refused, not resumed**. By code
+    reading, not executed: the restart closes the waiter's connection, so its read fails and
+    `fail()` returns `errAdmitReconnect` (`admission_linux.go:354-374`); the client then sits in
+    the reconnect loop of `admitThroughDaemon` (`admission_linux.go:261-284`, a 500 ms gap,
+    no deadline). Its first exchange with the new daemon sends proto 15
+    (`admitExchangeOnce`, frame built with `DaemonProtocolVersion`); the daemon answers
+    `protocolMismatchFrame` before any dispatch (`server.go:850-852`); the client treats that
+    well-formed refusal as terminal and exits "refusing to launch ungoverned"
+    (`admission_linux.go:620-636`). The job never runs, and its queue position is lost; the
+    operator must re-launch it with the new binary. An **exclusive** queued job is refused
+    already at the transport failure (`exclusive_unavailable`, `admission_linux.go:369-371`),
+    as on every daemon restart, bump or not. Section 1 reports queues of 20-30 jobs, so a
+    cutover under load fails every one of them, across all sessions. Rollout step 1
+    (section 6) handles it.
 - **Old (proto-15) daemon, new client:** the same in reverse. Launches are refused until the
   daemon restarts. The window is the gap between client install and daemon restart. The cutover
   is the existing atomic "install, then `systemctl --user restart aira-daemon.service`", as for
@@ -463,23 +541,27 @@ visible sign would be the OOM advisory reading "unconfirmed". The AIRA-284 prece
 - **Same version, fields absent:** only these senders omit fields, and the result is NULL:
   - the `aira confine-report` CLI face (pool rows, none of the new fields);
   - a confine run with no daemon grant (no `wait_ms`);
-  - a run whose repo identity was unevaluated (no `repo`, so NULL keys).
+  - a run whose repo identity was unevaluated (no `repo`, so NULL keys);
+  - a value outside its wire bounds, omitted by the client (5.1.2).
 
   A true old client never reaches the handler, so "old client gives NULL columns" is not a
   reachable case and needs no test beyond the version check's existing ones.
 
 **Unverified:** how many stale clients and MCP servers are alive at the cutover. Peers are warned
-to restart them (section 6).
+to restart them (section 6). The queued-waiter refusal above is established by code reading
+only; no test drives a queued proto-N client across a restart into a proto-N+1 daemon. It is
+generic to every protocol bump, not specific to 323, so this plan handles it in the rollout
+rather than adding a test for it.
 
 #### 5.1.7 What is client-only, daemon, wire and store
 
 | Part | Files | Ships as |
 |---|---|---|
-| client | `runner/confine_linux.go` (timers, repo at launch, report fields), `runner/confine_budget.go` (`ConfinePeakReport`), `runner/admission_linux.go` (`ReportPeakSample`, proto const), new `runner/repo_identity.go`, new `runner/command_key.go` (`CommandKeys`, called by the store) | client install |
+| client | `runner/confine_linux.go` (`confineDeps` clock seam, timers and start time, repo at launch, report fields), `runner/confine_budget.go` (`ConfinePeakReport`), `runner/admission_linux.go` (`ReportPeakSample`, proto const), new `runner/repo_identity.go`, new `runner/command_key.go` (`CommandKeys`, called by the store) | client install |
 | wire | proto bump on both sides, new allowlist fields | lockstep; atomic install and restart |
 | daemon | `daemon/confine_report.go` (allowlist, validation), `daemon/protocol.go` | daemon restart |
 | store | `store/store.go` (DDL, ALTER list), `store/confine_peak_history.go` (observation, writer, keys) | daemon restart; columns added at open |
-| docs | the replay script and the golden table, already committed by this revision | none |
+| docs | the replay script, the golden table and the key mutation check, already committed by this revision | none |
 
 Nothing is client-only: the whole of 323 ships in one release with one atomic install and
 restart.
@@ -557,7 +639,7 @@ out 0.9 then 0.8.
 in that key's window of 20, at the key level being used; such a key is charged its flat charge.
 At 0.8 it reaches 1.52x with a p99 of 0.92-0.93 (section 2, argv-only keys), a margin too thin
 to enable on the replay alone. Ships only if the enforce data on the flat discount, replayed by
-start time (`at - wall_ms`) on repo-keyed rows, shows headroom, and decided with a measured
+start time (`started_at_ms`) on repo-keyed rows, shows headroom, and decided with a measured
 exceedance target, not by default.
 
 ### 5.4 Fast-lane queue order (AIRA-326)
@@ -608,18 +690,26 @@ It fixes who gets freed memory first, not capacity; capacity comes from 5.2.
      open `aira top` must be restarted. Their launches and queries are refused until then
      (section 5.1.6).
    - Jobs straddling the cutover finish normally but lose their history row.
+   - **Queued jobs are refused at the cutover** (section 5.1.6). Restart only when `aira
+     confine --list` shows no queued job (its `queued` count is 0). If the queue does not
+     empty within a window the operator picks (the box often holds 20-30 queued jobs), the
+     operator restarts anyway and announces it first: every job queued at that moment exits
+     with `E_DAEMON_PROTOCOL ... refusing to launch ungoverned` and must be re-launched with
+     the new binary. It never runs ungoverned. The announcement names this message so peers
+     recognise it. The same applies to any later protocol bump (AIRA-324, 326, 340).
    - Smoke test after cutover: one small confined run in a git checkout, then
 
      ```
      sqlite3 -readonly ~/.local/state/aira/state.db \
-       "select wall_ms,wait_ms,repo,key_cmd from confine_peak_history order by rowid desc limit 1"
+       "select wall_ms,wait_ms,started_at_ms,repo,key_cmd from confine_peak_history
+        order by rowid desc limit 1"
      ```
 
      which must show non-NULL values. A run from `/` must show `repo = none`.
    - The branch follows Batch A, which edits the same report lines.
 2. AIRA-324 in observe for a week of normal load; then enforce at 0.9 for a week, then 0.8.
    **Gate to start enforce:** a counterfactual replay of the real arrival/start/end timeline
-   (start = `at - wall_ms`, arrival = start - `wait_ms`, from AIRA-323) that books jobs at the
+   (start = `started_at_ms`, arrival = start - `wait_ms`, from AIRA-323) that books jobs at the
    discounted charge, admits more jobs than before, and shows the concurrent total of
    `memory.peak` stays under 0.9 x the slice's `MemoryHigh` at the busiest hour, using
    burst-weighted and duration-weighted draws. The replay states the coverage limits of section
@@ -658,53 +748,84 @@ AIRA-323 (each names the mutation that must turn it red):
 - **T1. Real client-to-daemon frame.**
   - Setup: a test in package `daemon` starts a real `Server` on a temporary socket with a
     temporary store. It calls the real `runner.ReportPeakSample` with a `ConfinePeakReport`
-    carrying `WallMS`, `WaitMS` (including a real 0) and `Repo`, for an argv taken from the golden
-    table. It then reads the row back with SQL.
+    carrying `WallMS`, `WaitMS` (including a real 0), `StartedAtMS` and `Repo`, for an argv
+    and repo taken from the golden table (every golden repo passes the wire rule; `--self-test`
+    enforces that). It then reads the row back with SQL.
+  - **Delayed delivery:** `StartedAtMS` is set to one hour before the call and `WallMS` to
+    1 000, so `at - wall_ms` is about one hour away from `started_at_ms`. The stored
+    `started_at_ms` must equal the sent value exactly.
   - Pass: every value and all three keys equal the golden case. No frame is hand-built on either
     side. `TestConfineReportCarriesTheBudgetPair` (`confine_budget_test.go:159`) calls the
     handler directly and is not a model for this test.
   - Mutations:
     - drop a field from the sender: NULL, red;
     - leave it out of the allowlist: refused, red;
-    - copy the `> 0` idiom for `wait_ms`: a real 0 is lost, red.
-- **T2. Absent means NULL.** A report without the new fields stores NULL in all six columns,
+    - copy the `> 0` idiom for `wait_ms`: a real 0 is lost, red;
+    - the daemon derives `started_at_ms` as `at - wall_ms` instead of storing the sent value:
+      red (off by an hour).
+- **T2. Absent means NULL.** A report without the new fields stores NULL in all seven columns,
   asserted with `IS NULL`. Mutation: store 0 for absent, red.
 - **T3. Validation table.**
   - Refused with `E_DAEMON_PROTOCOL` and no row written:
     - `wall_ms` of -1 or of 366 days + 1 ms;
     - `wait_ms` of -1;
     - 1.5 and `"abc"`;
-    - `repo` of `""`, `"NONE"`, 15 or 17 hex digits, upper-case hex, or a path.
-  - Accepted (boundaries): 0, exactly 366 days, `none`, 16 hex digits.
-  - Mutations: remove each bound in turn, red.
-- **T4. Launch site** (fake `confineDeps`, captured `reportPeak`):
-  - `WaitMS` is set iff `deps.admit` returned a lease;
-  - it is nil for `bypassed`, `disabled` and `no-daemon`;
-  - `WallMS` covers an injected clock advance between admission return and report. Add a clock
-    seam to `confineDeps` if none exists.
-  - With no reconnect, `WaitMS` equals the grant's `waitedMS` within the fake clock's step.
-  - A daemon `unevaluated` grant (with a lease) sends `WaitMS`; the local `no-daemon`
-    `unevaluated` does not.
-  - A duration over 366 days is omitted by the client, not sent; the report still goes out.
+    - `started_at_ms` of 946,684,799,999, of 4,102,444,800,000, of 0 and of -1;
+    - `repo` of `""`, `"NONE"`, 15 or 17 hex digits, a 64-hex-digit value, upper-case hex, or
+      a path.
+  - Accepted (boundaries): 0, exactly 366 days, `started_at_ms` of 946,684,800,000 and of
+    4,102,444,799,999, a `started_at_ms` later than the daemon's own clock (a clock step is
+    not refused), `none`, 16 hex digits.
+  - Mutations: remove each bound in turn, red; refuse `started_at_ms` later than `at`, red.
+- **T4. Launch site** (fake `confineDeps` with the `wallNow`/`monoNow` seam of 5.1.1, captured
+  `reportPeak`). Every expectation is on the client's own fake clocks; none compares the
+  client's figure with the daemon's `waitedMS`.
+  - **Immediate grant:** the fake `admit` advances `monoNow` by 40 ms (dial and exchange) and
+    returns a lease with `waitedMS = 0`. `WaitMS` must be 40.
+  - **Reconnect:** the fake `admit` advances `monoNow` by 30 000 ms (12 000 ms queued, the
+    connection dropped, one 500 ms reconnect gap, 17 500 ms queued again) and returns a lease
+    with `waitedMS = 17 500`, the daemon's figure from the second enqueue. `WaitMS` must be
+    30 000.
+  - `WaitMS` is set iff `deps.admit` returned a lease; it is nil for `bypassed`, `disabled` and
+    `no-daemon`. A daemon `unevaluated` grant (with a lease) sends `WaitMS`; the local
+    `no-daemon` `unevaluated` does not.
+  - **Wall time:** `monoNow` advances 2 000 ms between the admission return and the report.
+    `WallMS` must be 2 000.
+  - **Start time and a clock step:** `wallNow` reads T at the admission return, then steps
+    back one hour before the report, while `monoNow` advances 2 000 ms. `StartedAtMS` must be
+    T (the pre-step reading), `WallMS` 2 000.
+  - A duration over 366 days, or a `wallNow` reading outside the `started_at_ms` bounds, is
+    omitted by the client, not sent; the report still goes out.
   - Mutations, each red:
+    - send `admission.waitedMS` for a granted admission (gives 17 500 in the reconnect case);
     - send `admission.waitedMS` (the Go zero) for a lease-less admission;
     - key the rule on `state == "unevaluated"` instead of `release`;
-    - send an out-of-range duration.
+    - read the start time at report time as `wallNow() - wall_ms` (gives T - 1 h);
+    - measure `wall_ms` as a difference of `wallNow` readings (gives a negative value);
+    - send an out-of-range duration or start time.
 - **T5. `RepoIdentity` on real temporary repositories:**
   - plain repo and a subdirectory: the same ID;
   - linked worktree: equals the main checkout;
   - submodule: distinct;
   - outside any repository: `none`;
-  - a symlinked working directory: equals the physical path;
+  - a symlink, **outside the repository**, that targets a **subdirectory** of it (`link ->
+    repo/sub`), passed as the logical path the way `os.Getwd` returns it: equals the repo's
+    ID. (A link to the repository root would pass without step 0, because `stat` follows the
+    link; it is not a sufficient case.)
+  - a working-directory path that no longer exists: unevaluated;
   - an unreadable or malformed `.git` file: unevaluated;
   - equality with `app` ProjectID's first 16 hex digits for a plain repo and a worktree (this
     check sits in an `app` package test, because `runner` cannot import `app`).
-  - Mutation: hash the worktree's own `gitdir` instead of its `commondir`, red.
+  - Mutations, each red: hash the worktree's own `gitdir` instead of its `commondir`; skip
+    the working-directory resolution (step 0), which gives `none` for the symlink case.
 - **T6. Key golden table.** A Go test loads `docs/dev/aira-history-charge-keys.golden.json` and
-  asserts `CommandKeys` on all 26 cases. `python3 -I docs/dev/aira-history-charge-replay.py
-  --self-test` checks the same file. Mutations (already run on the script, section 11): drop the
-  repo prefix (21 mismatches), 13 arguments instead of 14 (1), drop `-p` from the `time` flags
-  (1). Each is red.
+  asserts `CommandKeys` on all 31 cases. `python3 -I docs/dev/aira-history-charge-replay.py
+  --self-test` checks the same file, and refuses it if any input breaks the wire rules.
+  `python3 -I docs/dev/aira-history-charge-key-mutations.py` applies 32 one-line mutations to
+  the script's key function and checks each turns `--self-test` red (results in section 11).
+  The Go test is mutated the same way at build time for at least: drop the repo prefix, hex
+  run 7 -> 8, digit run 3 -> 2, drop one suffix, upper-case-only env names, drop
+  `--portability`.
 - **T7. No key without established inputs.** `kind = pytest-worker` and absent `repo` give NULL
   keys. Mutation: key argv-only when `repo` is absent, red.
 - **T8. Nothing else moves.**
@@ -760,8 +881,10 @@ AIRA-324-326 (unchanged from rev 2, except that test 7 moved to T6 and test 8 mo
   reads `effectiveCurrent`, which `checkedAvailable` already reads. No per-job read.
 - (323) The protocol bump refuses stale clients' launches during and after the cutover until they
   restart (section 5.1.6). Mitigation: the atomic cutover and the peer warning. Jobs straddling
-  the cutover lose their history row, a one-off loss.
-- (323) Repo-scoped keys can only shrink coverage. If the shrink is large, 326 and 331 have less
+  the cutover lose their history row, a one-off loss. Jobs queued at the cutover are refused
+  and must be re-launched; mitigation: restart on an empty queue, or announce (section 6).
+- (323) Repo-scoped keys change coverage in a direction not yet measured (section 2: the OOM
+  veto means a split can raise it as well as lower it). If it falls a lot, 326 and 331 have less
   to work with; that is measured on 323's data before either is built.
 - (323) **RANT-133 is not fixed by 323.** The estimator still keys on argv alone, so one
   `./runall.sh` OOM still escalates every repo's `./runall.sh` estimate. The reported 9 GiB
@@ -814,7 +937,26 @@ Sequence notes (verified where marked):
 - **Rev 2 -> 3** (this revision, for AIRA-323's plan gate): see "Rev 3 changes" at the top.
   Verification run for it:
   - `python3 -I -m py_compile` on the script: exit 0.
-  - `--self-test`: 26 cases, 0 mismatches, exit 0. The three mutations named in T6 each exit 1.
+  - `--self-test` (after plan-review round 1): 31 cases, 0 mismatches, coverage
+    counterexample holds, exit 0. On the earlier 64-hex-digit table, the fixture validator
+    reports 25 invalid inputs.
+  - `python3 -I docs/dev/aira-history-charge-key-mutations.py`, 2026-11-14, exit 0. Unmutated:
+    0 mismatches. Each mutation, with its mismatch count (all exit 1): hex run 7+ -> 8+ (1),
+    7+ -> 6+ (1); all-digits rule dropped (2); digit run 3+ -> 2+ (1); digit-run rule dropped
+    (3); `/` rule dropped (4); suffix dropped: `.py` (5), `.rs` (1), `.sh` (1), `.txt` (2),
+    `.json` (1), `.toml` (1); `.yaml` added (1); env names upper case only (1); `/usr/bin/env`
+    not unwrapped (1); each `time` option dropped, `-o -f --output --format -p -v -a
+    --portability --verbose --append` (1 each); unknown `time` option guessed past (1); no
+    basename (4); 13 arguments (1); first4 = `rest[:4]` (5); `key_cmd` from the first token
+    including flags (5); no repo prefix (31); OOM veto dropped (0 mismatches, red through the
+    coverage counterexample). Nine invalid tables (repo of 64, 15 or 17 hex digits, upper case,
+    `NONE`, empty; empty argv; a NUL in argv; a missing key) are each refused. Before the five
+    boundary cases were added, the plan review measured 0 mismatches for hex 7 -> 8, digit run
+    3 -> 2, dropping `.toml`, `.rs` or `.json`, upper-case-only env names, and dropping
+    `--portability` or `--output`. A weakened validator (repo `{16,64}`) makes the mutation
+    check exit 1.
+  - `part1`-`part3` and `keys()` are unchanged by round 1 (only the docstring and the
+    self-test changed), so the full-replay figures below stand without a re-run.
   - The full replay (`part1`-`part3`, which exercises the new `history_sql()` and the legacy
     keying) ran to completion on the live store under `aira confine` on 2026-11-14, exit 0. It
     read 51,102 pinned jobs since 2026-10-20, against rev 2's 50,006, because the store grew.
