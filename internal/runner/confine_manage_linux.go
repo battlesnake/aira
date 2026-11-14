@@ -848,5 +848,5 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	if err := deps.waitEmpty(ctx, scope, timeout); err != nil {
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s empty state unconfirmed: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
 	}
-	return ConfineKillResult{Status: "killed", ScopeID: record.ScopeID, Name: record.Name, Owner: owner}, nil
+	return ConfineKillResult{Status: ConfineKillStatusKilled, Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}, nil
 }

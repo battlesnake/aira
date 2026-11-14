@@ -2126,11 +2126,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-dump is a direct CLI-only verb")
 		}},
 		"confine-kill": {Name: "confine-kill", Usage: "confine --kill <name|supervisor-pid|scope-id> [--steal] [--slice S] [--owner ID]", Args: []ArgSpec{
-			stringSpec("selector", true, true, "Exact confine name, supervisor PID, or scope ID"),
+			stringSpec("selector", true, true, "Exact confine name, supervisor PID, or scope ID of a running job or of one still waiting in the admission queue"),
 			boolSpec("steal", false, false, "Override unknown or foreign ownership"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("owner", false, false, "Caller owner identity"),
-		}, MCPTool: "aira_confine_kill", Summary: "Kill one ownership-checked confine scope after populated-to-empty proof.", Safety: SafetyExecute, Destructive: true, Include: true, Example: []string{"job"}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+		}, MCPTool: "aira_confine_kill", Summary: "Kill one ownership-checked confine job: a running job's scope is cgroup.kill'ed after populated-to-empty proof (phase running, status killed); a job still waiting for admission is cancelled before it runs (phase queued, status cancelled; its launcher exits ran=no code=U_ADMIT_CANCELLED).", Safety: SafetyExecute, Destructive: true, Include: true, Example: []string{"job"}, Run: func(_ context.Context, args *argAccessor) (any, error) {
 			_ = stringArg(args, "selector")
 			_ = boolArg(args, "steal")
 			_ = stringArg(args, "slice")
@@ -2550,7 +2550,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// exclusion list below): the target file belongs to the invoking
 		// process's own filesystem.
 		"confine-dump":  {summary: "Write the daemon's admission/utilisation records as JSONL for CI archival", safety: SafetyRead, example: []string{}},
-		"confine-kill":  {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
+		"confine-kill":  {summary: "Kill one ownership-checked confine job: a running job's scope is cgroup.kill'ed after populated-to-empty proof (phase running, status killed); a job still waiting for admission is cancelled before it runs (phase queued, status cancelled; its launcher exits ran=no code=U_ADMIT_CANCELLED)", safety: SafetyExecute, destructive: true, example: []string{"job"}},
 		"confine-front": {summary: "Push one ownership-checked queued confine job to the front of the admission queue", safety: SafetyExecute, example: []string{"job"}},
 		// AIRA-312. The caveats live in the summary because this is the text every
 		// generated face publishes: ledger only, the cap is unchanged, the

@@ -366,7 +366,13 @@ var ExitCodes = map[string]int{
 	// shape as E_LEASE_HELD and E_TRANSITION_INVALID, not the host-capacity shape
 	// of the 4s. Raised ONLY by a ci-shim daemon (the box daemon never trips), so
 	// it never reaches an interactive operator on the shared slice.
-	"E_ADMIT_FAILFAST_TRIPPED":   1,
+	"E_ADMIT_FAILFAST_TRIPPED": 1,
+	// AIRA-328. A queued job an operator cancelled with `aira confine --kill`
+	// before it was admitted. U_ and 3, mirroring U_RUN_DETACH_CANCELLED and
+	// U_CONFINE_DETACH_CANCELLED, the other "deliberately not run" verdicts: the
+	// command never executed, so it neither passed nor failed, and 1 would assert
+	// a failure that never happened.
+	"U_ADMIT_CANCELLED":          3,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
 	// AIRA-309. `confine --front` names a job that exists but is not waiting in
 	// the admission queue (already admitted, or a sub-reservation that follows

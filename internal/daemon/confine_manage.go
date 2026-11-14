@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 
@@ -394,6 +393,20 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 	case "confine-kill":
 		selector := stringArg(request.Args, "selector")
 		steal, _ := request.Args["steal"].(bool)
+		// AIRA-328. A QUEUED job first: it has no cgroup scope for the kill below
+		// to find, so before this every `--kill` of a job `--list` showed as queued
+		// answered E_CONFINE_NOT_FOUND. Pure queue state, so it runs before the
+		// shim branch and works the same in ci-shim mode (the shim queue is keyed
+		// on the sentinel path resolved above). Not handled = no queued match: the
+		// running-job kill below runs unchanged, including for a job granted
+		// between the operator's `--list` and this kill.
+		if cancelled, handled, cancelErr := s.cancelQueuedConfine(path, selector, callerOwner, steal); handled {
+			if cancelErr != nil {
+				return confineManagementError(cancelErr)
+			}
+			logConfineKill(callerOwner, steal, cancelled, path)
+			return core.Response{OK: true, Code: "OK", Data: cancelled}
+		}
 		if s.shimMode() {
 			// Never a fabricated "killed". cgroup.kill is the only mechanism that
 			// reaches a job's whole subtree atomically, and shim mode has no cgroup
@@ -412,8 +425,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// written only for a kill the daemon confirmed: a refused (owner
 		// unverified), not-launched, or unconfirmed kill kills nothing and must
 		// not leave a line claiming otherwise.
-		log.Printf("aira daemon: confine-kill: killer=%s steal=%v target-scope=%s target-name=%s target-owner=%s slice=%s",
-			callerOwner, steal, result.ScopeID, result.Name, result.Owner, path)
+		logConfineKill(callerOwner, steal, result, path)
 		// This is the daemon kill-drop release. The admit connection's later
 		// close reaches the same state-guarded releaseAdmitWaiter path.
 		s.releaseActiveConfine(path, result.ScopeID)

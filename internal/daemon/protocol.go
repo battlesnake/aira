@@ -237,6 +237,15 @@ const (
 	// must NOT launch unaccounted. Raised ONLY by a ci-shim daemon.
 	CodeAdmitFailfastTripped = "E_ADMIT_FAILFAST_TRIPPED"
 
+	// CodeAdmitCancelled answers a QUEUED admission an operator cancelled with
+	// `aira confine --kill` before it was granted (AIRA-328). U_, exit 3, on the
+	// U_RUN_DETACH_CANCELLED / U_CONFINE_DETACH_CANCELLED precedent: the job was
+	// deliberately not run, so it has no verdict, and reporting it as failed would
+	// fabricate one. A DEDICATED code, like the refusals above, so the runner
+	// renders `ran=no code=U_ADMIT_CANCELLED admission=cancelled` and never
+	// reconnects into a fresh queue position.
+	CodeAdmitCancelled = "U_ADMIT_CANCELLED"
+
 	// CodeAdmitExclusiveUnestablished refuses an --exclusive request UP FRONT when
 	// the daemon cannot establish that the slice is empty (AIRA-101). After S14 it
 	// is raised in exactly two places, both before the request is queued: ci-shim

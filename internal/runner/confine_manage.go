@@ -927,12 +927,26 @@ const ConfineExclusiveReasonWireLimit = 512
 // terminal gets a line it can display beside the identity it qualifies.
 const ConfineExclusiveReasonLimit = 96
 
+// ConfineKillResult is the reply to `aira confine --kill`. Phase says which job
+// the selector reached (AIRA-328): a RUNNING job's scope was cgroup.kill'ed and
+// confirmed empty (status "killed"), or a QUEUED job's admission wait was
+// cancelled before it ran (status "cancelled"; nothing of it ever executed, and
+// its launcher exits with `ran=no code=U_ADMIT_CANCELLED`).
 type ConfineKillResult struct {
 	Status  string `json:"status"`
+	Phase   string `json:"phase"`
 	ScopeID string `json:"scope_id"`
 	Name    string `json:"name"`
 	Owner   string `json:"owner"`
 }
+
+// The --kill result vocabulary (AIRA-328). Exact-match tokens.
+const (
+	ConfineKillStatusKilled    = "killed"
+	ConfineKillStatusCancelled = "cancelled"
+	ConfineKillPhaseRunning    = "running"
+	ConfineKillPhaseQueued     = "queued"
+)
 
 // ConfineFrontResult is the reply to `aira confine --front` (AIRA-309): the job
 // pushed to the head of the admission queue. It carries no position: a push

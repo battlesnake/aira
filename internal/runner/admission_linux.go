@@ -513,6 +513,24 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 				basis:    "reject:failfast",
 			}, true, errors.New(message)
 		}
+		// AIRA-328. An operator cancelled this job with `aira confine --kill` while
+		// it was queued. TERMINAL and dedicated, beside the fail-fast block: it
+		// must never reach fail() (which reconnects, re-queueing the job the
+		// operator just cancelled), and its own state names it on the `ran=no`
+		// trailer (`admission=cancelled`) rather than the anonymous daemon-refused.
+		if response.Code == "U_ADMIT_CANCELLED" {
+			_ = conn.Close()
+			message := strings.TrimSpace(response.Error)
+			if message == "" {
+				message = response.Code + ": cancelled by `aira confine --kill` while waiting for admission; nothing ran"
+			}
+			return admissionResult{
+				state:    "cancelled",
+				waitedMS: time.Since(admissionStarted).Milliseconds(),
+				reserve:  effectiveReserve,
+				basis:    "reject:cancelled",
+			}, true, errors.New(message)
+		}
 		if response.Code == "E_ADMIT_TOO_LARGE" || response.Code == "E_ADMIT_SATURATED" || response.Code == "E_ADMIT_VRAM_TOO_LARGE" || response.Code == "E_ADMIT_VRAM_UNAVAILABLE" {
 			var rejection runnerAdmitRejection
 			if err := json.Unmarshal(response.Data, &rejection); err == nil && validRunnerAdmitRejection(response.Code, rejection) {
