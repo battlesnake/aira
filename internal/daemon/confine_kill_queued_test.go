@@ -509,6 +509,17 @@ func TestConfineKillQueuedWireRender(t *testing.T) {
 // the resolver -> a granted waiter is "cancelled" (a second close of grantedCh
 // panics, or the reply and the frame disagree).
 func TestConfineKillQueuedRacesTheGrant(t *testing.T) {
+	raceQueuedKillAgainstTheGrant(t, "")
+}
+
+// verifies: AIRA-340 — the same XOR for a `--priority high` waiter, admitted
+// through the real admit handler (so the wire field reaches the waiter: the
+// helper asserts waiter.high). Run with -race.
+func TestConfineKillQueuedHighRacesTheGrant(t *testing.T) {
+	raceQueuedKillAgainstTheGrant(t, "high")
+}
+
+func raceQueuedKillAgainstTheGrant(t *testing.T, priority string) {
 	const maximum = int64(1) << 30
 	sawCancel, sawGrant := 0, 0
 	for i := 0; i < 50; i++ {
@@ -517,7 +528,16 @@ func TestConfineKillQueuedRacesTheGrant(t *testing.T) {
 			server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, maximum, 0, true, "" }
 			scopeID := testConfineScopeID(t, "racer", 7400+i) + "@s-1"
 			args := map[string]any{"slice": "slice", "reserve": int64(1) << 20, "pinned": true, "scope_id": scopeID, "name": "racer", "owner": "s-1"}
+			if priority != "" {
+				args["priority"] = priority
+			}
 			run := startSaturatedAdmit(t, server, maximum, args)
+			run.queue.mu.Lock()
+			high := run.waiter.high
+			run.queue.mu.Unlock()
+			if high != (priority == "high") {
+				t.Fatalf("waiter.high=%v for priority %q: the admit field did not reach the waiter", high, priority)
+			}
 
 			// A third of the iterations FORCE the cancel first and a third force
 			// the grant first, so both outcomes are exercised deterministically

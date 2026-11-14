@@ -616,6 +616,11 @@ type ConfineRequest struct {
 	// into the line verbatim; it requires SummaryFile.
 	SummaryFile     string
 	SummaryTreeHash string
+	// AIRA-340. HighPriority is `--priority high`: queue order only, for SHORT
+	// automated steps (hooks, Makefile pre-gates). Transcribed onto every admit
+	// request; see Request.HighPriority. Exported so a detached supervisor, which
+	// receives the request through its control file, keeps it.
+	HighPriority bool
 	// AIRA-247. FailFast marks this task as a fail-fast trigger: if it exits
 	// non-zero, the client reports a "trip" to the daemon, which (ONLY in ci-shim
 	// mode) stops admitting new tasks and kills the running ones. Opt-in, default

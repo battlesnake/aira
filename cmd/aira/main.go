@@ -1156,6 +1156,12 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", err)
 		}
 	}
+	// AIRA-340. --priority is exactly `high` or `normal`, refused synchronously
+	// otherwise: an unknown word must never be read as normal (a priority asked
+	// for and silently not given) nor as high.
+	if raw, present := options["priority"]; present && raw != runner.ConfinePriorityHigh && raw != runner.ConfinePriorityNormal {
+		return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --priority must be %s or %s, not %q", runner.ConfinePriorityHigh, runner.ConfinePriorityNormal, raw)
+	}
 	if _, _, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID"); err != nil {
 		return nil, nil, err
 	}
@@ -1706,7 +1712,9 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		StdinConnect:   options["stdin-connect"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		VRAMBytes: vramBytes,
-		Timeout:   jobTimeout, CPUTimeout: jobCPUTimeout,
+		// AIRA-340. parseConfineArgs has refused every value but high and normal.
+		HighPriority: options["priority"] == runner.ConfinePriorityHigh,
+		Timeout:      jobTimeout, CPUTimeout: jobCPUTimeout,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {

@@ -1929,7 +1929,8 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		ConfineScopeID:       request.ScopeID,
 		ConfineName:          request.Name,
 		ConfineOwner:         request.Owner,
-		VRAMBytes:            request.VRAMBytes, // AIRA-268
+		VRAMBytes:            request.VRAMBytes,    // AIRA-268
+		HighPriority:         request.HighPriority, // AIRA-340
 		Exclusive:            request.Exclusive,
 		// AIRA-185. TRANSCRIBED, never resolved here: admitThroughDaemon puts it on
 		// the wire only alongside `exclusive`, which is the one place that guard

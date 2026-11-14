@@ -41,9 +41,25 @@ aira_hook_scrub_git_env() {
 
 # aira_hook_run_make runs the named make targets against the committing
 # worktree, confined, with a clean environment. It never returns.
+#
+# The second argument is the admission queue priority (AIRA-340): `high` only
+# for a SHORT step (the pre-commit quick checks, `make fmt-check vet build`:
+# the confine trailer's wall= measured about 9 s with a warm build cache, and
+# about 40 s on the first run in a new worktree on a loaded box, load average
+# about 65; re-measure with `aira confine -- make -C <worktree> fmt-check vet
+# build`). Both are under a minute, so `high` stays defensible: a commit does
+# not wait behind slow jobs on a busy box. `normal` for anything
+# long (`make ci`, the store tests). Version skew degrades, never refuses
+# commits: an installed CLIENT that predates `--priority` is detected from its
+# own help and the step runs at normal priority with a one-line note; a new
+# client whose admission DAEMON predates the field (installed, not yet
+# restarted) gets the daemon's refusal of the field, re-asks once at normal
+# priority and prints a `confine: notice:` line. Either way the commit runs;
+# only its queue position is normal until both are current.
 aira_hook_run_make() {
 	local hook_name="$1"
-	shift
+	local priority="$2"
+	shift 2
 
 	local root
 	if ! root="$(aira_hook_worktree_root)"; then
@@ -58,6 +74,18 @@ aira_hook_run_make() {
 		return 1
 	fi
 
+	local -a confine_opts=()
+	if [ "$priority" = high ]; then
+		# Captured, then matched: a `| grep -q` pipeline under pipefail can fail
+		# when grep exits early and the help writer takes SIGPIPE.
+		local help
+		help="$(aira confine --help 2>/dev/null)" || help=""
+		case "$help" in
+		*--priority*) confine_opts=(--priority high) ;;
+		*) printf '%s: the installed aira has no `confine --priority`; running at normal queue priority.\n' "$hook_name" >&2 ;;
+		esac
+	fi
+
 	aira_hook_scrub_git_env
-	exec aira confine -- make -C "$root" "$@"
+	exec aira confine "${confine_opts[@]}" -- make -C "$root" "$@"
 }

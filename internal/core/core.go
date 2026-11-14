@@ -1965,7 +1965,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--timeout D] [--cpu-timeout D] [--summary-file PATH] [--summary-tree-hash H] [--delegate-ram] [--exclusive] [--require-admission] [--fail-fast] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--priority high|normal] [--timeout D] [--cpu-timeout D] [--summary-file PATH] [--summary-tree-hash H] [--delegate-ram] [--exclusive] [--require-admission] [--fail-fast] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1974,6 +1974,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("vram", false, false, "GPU VRAM the job declares it needs (1024-based; e.g. 4G). The daemon gates admission on real free VRAM (a third resource dimension beside RAM and CPU); no GPU limit is written. Absent = not a GPU job (ungated). NVIDIA only"),
+			// AIRA-340. The description is the long agent guidance
+			// (ConfinePriorityGuidance), the same text as the skill's paragraph; the
+			// verb summary and the MCP instructions carry the short form
+			// (ConfinePrioritySummary). See the comment above those constants.
+			stringSpec("priority", false, false, ConfinePriorityGuidance, "high", "normal"),
 			// AIRA-138. The two timeout-suffixed options are disambiguated HERE, in the
 			// generated help, because --timeout reads as an overall deadline and is not
 			// one. Each says where its clock starts. (The admission WAIT was once bounded
@@ -1999,6 +2004,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_max")
 			_ = stringArg(args, "memory_high")
 			_ = stringArg(args, "vram")
+			_ = stringArg(args, "priority")
 			_ = stringArg(args, "timeout")
 			_ = stringArg(args, "cpu_timeout")
 			_ = boolArg(args, "delegate_ram")
@@ -2577,7 +2583,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
 		"run":             {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
-		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice. " + ConfinePrioritySummary, safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
 		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change", safety: SafetyRead, example: []string{}},
