@@ -11,7 +11,6 @@ import (
 	"io"
 	"io/fs"
 	"math"
-	"math/bits"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1830,12 +1829,13 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 				"re-run from it. Either way, splitting heavy work also helps."
 		}
 	}
-	// Overflow-safe threshold: never multiply a byte count that the input domain
-	// allows to approach MaxInt64. `scopeMemoryMax - scopeMemoryMax/10` is a
-	// conservative >=90% mark that never fires below 90% for a non-round cap.
-	if peakRSS != nil && *peakRSS >= scopeMemoryMax-scopeMemoryMax/10 {
-		return fmt.Sprintf("confine: peak RSS %s reached %d%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", peak, confinePercentOfCap(*peakRSS, scopeMemoryMax), FormatConfineBytes(scopeMemoryMax))
-	}
+	// AIRA-334. A run that was not OOM-killed gets no advisory, however close its
+	// peak came to the cap. peak-rss is the scope's memory.peak, which counts
+	// reclaimable page cache (the kernel holds a file-heavy job at memory.max by
+	// reclaiming it), and every scope has memory.swap.max=0, so a run that was not
+	// OOM-killed never needed more anonymous memory than its cap. The old ">= 90%
+	// of the reserved cap; consider a higher --memory-reserve" line was wrong advice
+	// that pushed file-heavy jobs to over-reserve the shared slice.
 	return ""
 }
 
@@ -1884,17 +1884,6 @@ func confineSuggestedReserve(scopeMemoryMax int64, peakRSS *int64) int64 {
 		}
 	}
 	return escalated
-}
-
-// confinePercentOfCap returns floor(peak*100/cap) exactly, for any peak and cap
-// in [1, MaxInt64], by doing the multiply in 128 bits so peak*100 never wraps.
-// cap is > 0 and peak > 0 at every call site; peak <= cap (a peak above the
-// enforced cap is an OOM, handled before this is reached), so the quotient is
-// <= 100 and bits.Div64 (which requires the quotient to fit in 64 bits) is safe.
-func confinePercentOfCap(peak, capBytes int64) int {
-	hi, lo := bits.Mul64(uint64(peak), 100)
-	quotient, _ := bits.Div64(hi, lo, uint64(capBytes))
-	return int(quotient)
 }
 
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {

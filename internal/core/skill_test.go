@@ -1337,7 +1337,10 @@ func TestSkillTeachesTheReserveHint(t *testing.T) {
 	}
 	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
 		for _, want := range []string{
-			"`confine: ACTION REQUIRED: over-reserved -- this job peaked at 310M, only 7% of the 4096M you pinned`",
+			"`confine: ACTION REQUIRED: over-reserved -- this run peaked at 310M, only 7% of the 4096M you pinned`",
+			"`Next run use --memory-reserve 512M (sized from this run alone; a command whose peak depends on a warm build cache needs its cold-run peak), or drop",
+			"when the job's processes left its scope (`scope-integrity=descendant-escaped` or `migrated`",
+			"`peak-rss` is the scope's cgroup `memory.peak`, which includes reclaimable page cache, so it is an upper bound, not process RSS",
 			"It is an instruction, not an FYI",
 			"the percentage is truncated, so it never reads 60%",
 			"for a reserve pinned only by an inherited `AIRA_CONFINE_RESERVE`",
@@ -1345,7 +1348,7 @@ func TestSkillTeachesTheReserveHint(t *testing.T) {
 			"at least 2 GiB that the job used less than 60% of",
 			"peak plus 50% headroom, rounded up to a whole 256M, never below 256M",
 			"never prints for a history-estimated reserve",
-			"in ci-shim mode, or when `peak-rss=unevaluated`",
+			"in ci-shim mode, when the job's processes left its scope", "or when `peak-rss=unevaluated`",
 			"never goes to stdout",
 			"RAM only: confine measures no per-job peak VRAM",
 			"`AIRA_CONFINE_NO_HINTS=1`",
