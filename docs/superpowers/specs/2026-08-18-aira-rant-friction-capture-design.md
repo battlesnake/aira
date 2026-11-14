@@ -1,5 +1,7 @@
 # RANT — agent friction capture + git-context provenance (design / plan)
 
+**Superseded in part (AIRA-327, 2026-11-14):** `rant ls --unreviewed` was replaced by `--status unreviewed|reviewed|all` (default `unreviewed`), and `rant ls` now returns a paged envelope (`rows`, `total`, `returned`, `truncated`, `next_since`) with compact rows; every `--unreviewed` mention below means that default. `--since <seq>` is unchanged.
+
 **Status:** v5 — APPROVED + operator forks resolved (2026-08-18): hook→skill-only; digest→owner-triggered/on-demand. Ready to build.
 **Milestone:** Phase 5 · rant (task #43). Follows D1–D6 (all merged; master `59596b5`).
 **Loop:** multi-model design → Fable final gate → committed spec → Sol plan-review → Fable plan-gate
