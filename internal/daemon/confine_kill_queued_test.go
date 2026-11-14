@@ -433,7 +433,8 @@ func TestConfineKillQueuedWireRender(t *testing.T) {
 }
 
 // verifies: AIRA-328 — grant XOR cancel. An evaluator pass that would GRANT
-// the waiter races the kill on queue.mu, over many iterations. The reply and the
+// the waiter meets the kill on queue.mu in both forced orders and, over many
+// iterations, genuinely concurrently. The reply and the
 // client frame always agree: a "cancelled" reply means the client got
 // U_ADMIT_CANCELLED and the waiter was never granted; a fall-through means it
 // was granted and the client got a grant. The client never hangs (every read is
@@ -451,34 +452,55 @@ func TestConfineKillQueuedRacesTheGrant(t *testing.T) {
 			args := map[string]any{"slice": "slice", "reserve": int64(1) << 20, "pinned": true, "scope_id": scopeID, "name": "racer", "owner": "s-1"}
 			run := startSaturatedAdmit(t, server, maximum, args)
 
-			// Both sides wait on one barrier, and alternate iterations yield on one
-			// side, so both orders actually occur (the counts are logged and
-			// asserted below: a race that only ever resolves one way proves
-			// nothing about the other).
-			start := make(chan struct{})
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				<-start
-				if i%2 == 0 {
-					runtime.Gosched()
-				}
-				run.pass()
-			}()
+			// A third of the iterations FORCE the cancel first and a third force
+			// the grant first, so both outcomes are exercised deterministically
+			// (a race that only ever resolves one way proves nothing about the
+			// other, and a scheduler-dependent "both seen" assertion would
+			// flake). The last third genuinely race on one barrier, which is
+			// what -race checks; those assert only the XOR below.
 			var result runner.ConfineKillResult
 			var handled bool
 			var err error
-			go func() {
-				defer wg.Done()
-				<-start
-				if i%2 == 1 {
-					runtime.Gosched()
-				}
+			cancel := func() {
 				result, handled, err = server.cancelQueuedConfine("/slice", "racer", "s-1", false)
-			}()
-			close(start)
-			wg.Wait()
+			}
+			order := i % 3
+			switch order {
+			case 0:
+				cancel()
+				run.pass()
+			case 1:
+				run.pass()
+				cancel()
+			default:
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					<-start
+					if i%2 == 0 {
+						runtime.Gosched()
+					}
+					run.pass()
+				}()
+				go func() {
+					defer wg.Done()
+					<-start
+					if i%2 == 1 {
+						runtime.Gosched()
+					}
+					cancel()
+				}()
+				close(start)
+				wg.Wait()
+			}
+			if order == 0 && !handled {
+				t.Fatal("a cancel that ran first was not handled: the queued job would run")
+			}
+			if order == 1 && handled {
+				t.Fatal("a kill after the grant reported a cancel: the job is running and was never cancelled")
+			}
 			if err != nil {
 				t.Fatalf("cancel error: %v", err)
 			}
