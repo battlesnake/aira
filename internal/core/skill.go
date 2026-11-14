@@ -307,6 +307,11 @@ func shellQuote(token string) string {
 // every face.
 const ConfinePriorityGuidance = "Admission QUEUE ORDER only, `high` or `normal` (default `normal`); it is not CPU, I/O or memory priority and does not change what a job reserves. A `high` job waits only behind jobs pushed with `aira confine --front` and EARLIER `high` jobs (high jobs go first-in first-out among themselves), ahead of every `normal` job. It exists so SHORT automated steps (pre-commit hooks, quick pre-gate checks) do not wait behind slow jobs, so it belongs in the hook or Makefile itself, decided once for the project, never chosen per call. Agents: do NOT pass `--priority high` in a direct `aira confine` call unless it is strongly justified, which should be rare (for example a human is blocked right now on a one-off short command that no hook or Makefile could carry). Never mark a long job `high` (a full test suite, a build, `make ci`): a `high` job that does not fit becomes the head of the queue and holds the jobs behind it, letting them past only up to half its own reserve, so a long or large `high` job stalls everyone. Queued `high` jobs show as `high` in `aira top` and carry `\"priority\": \"high\"` in `aira confine --list --json`; a daemon restart keeps a job's priority (the client re-sends it), unlike a `--front` push"
 
+// ConfinePrioritySummary is the short form of ConfinePriorityGuidance carried in
+// the confine verb's one-line summary, which is what `aira help confine` and
+// `aira confine --help` print (the option descriptions are not rendered there).
+const ConfinePrioritySummary = "--priority high|normal is admission queue order only: set it in a project's hooks or Makefiles for SHORT automated steps; agents avoid it in a direct `aira confine` call unless strongly justified (rare), and never use it for a long job such as a test suite, a build or `make ci`"
+
 func renderSkillMarkdown(actions []SkillAction, contract ResponseContractSpec) string {
 	var out strings.Builder
 	out.WriteString("---\nname: aira\ndescription: Machine-local coordination for AI agents: mandatory memory-confinement of heavy shell commands via `aira confine`, plus opt-in per-project tickets, gates, and telemetry.\nallowed-tools: Bash(aira *)\n---\n\n")

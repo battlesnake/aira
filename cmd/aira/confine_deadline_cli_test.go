@@ -131,7 +131,12 @@ func TestAIRA138ConfineFaceParity(t *testing.T) {
 		}
 		flag := "--" + strings.ReplaceAll(arg.Name, "_", "-")
 		argv := []string{flag}
-		if arg.Kind != core.ArgKindBool {
+		switch {
+		case len(arg.Enum) > 0:
+			// AIRA-340. An enumerated option (--priority) takes one of its own
+			// declared values.
+			argv = append(argv, arg.Enum[0])
+		case arg.Kind != core.ArgKindBool:
 			argv = append(argv, "1m")
 		}
 		// --memory-high is refused on its own by design (it is meaningless

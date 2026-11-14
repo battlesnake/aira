@@ -778,7 +778,8 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 //
 // RESERVATION and VRAM show what the job ASKED for, marked "req" so a request is
 // never read as a held charge. The LIVE column reads "pushed" for a job an
-// operator pushed to the front (AIRA-309), which then holds every job behind it.
+// operator pushed to the front (AIRA-309), which then holds every job behind it,
+// and "high" for a job launched with `--priority high` (AIRA-340).
 //
 // ID is the scope id, the same id the row keeps once admitted, so a queued row is
 // selectable (AIRA-309). It is marked Queued, and that ROW KIND is what keeps it
@@ -793,9 +794,15 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 	if showCwd {
 		lastText = record.Cwd
 	}
+	// "pushed" wins: a pushed job is ahead of every high one, and its freeze is
+	// the stronger fact. "high" (AIRA-340) marks a `--priority high` launch, so
+	// misuse of the flag is visible to every session watching the queue.
 	state := "queued"
-	if record.Pushed {
+	switch {
+	case record.Pushed:
 		state = "pushed"
+	case record.Priority == runner.ConfinePriorityHigh:
+		state = "high"
 	}
 	return tableRow{
 		ID: record.ScopeID, Queued: true,

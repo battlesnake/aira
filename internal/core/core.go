@@ -2581,7 +2581,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
 		"run":             {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
-		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice. " + ConfinePrioritySummary, safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
 		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change", safety: SafetyRead, example: []string{}},
