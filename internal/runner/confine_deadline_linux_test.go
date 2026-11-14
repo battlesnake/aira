@@ -252,10 +252,18 @@ func deadlineConfineDeps(t *testing.T, scope *deadlineConfineScope) confineDeps 
 // and for every sample while the leader lives, and goes far over budget only
 // once the KERNEL says the leader is gone. The fire therefore lands, by
 // construction, in the state the arbitration exists for, rather than by luck.
+//
+// "Gone" means REAPED, not merely dead (AIRA-337, the AIRA-148 class): a zombie
+// already reads processDead, but the fixture's leaf cgroup.procs still lists it
+// until the wait reaps it, so a fire in that window found a member and wrote
+// cgroup.kill (fired-kill-completed instead of fired-not-executed). Gating on an
+// empty member list as well fires only after the reap.
 func overBudgetOnceLeaderIsDead(scope *deadlineConfineScope) func(string) (time.Duration, bool) {
 	return func(string) (time.Duration, bool) {
 		if identity := scope.identity(); identity.PID > 0 && processLive(identity) == processDead {
-			return time.Hour, true
+			if members, err := scope.Members(); err == nil && len(members) == 0 {
+				return time.Hour, true
+			}
 		}
 		return 0, true
 	}
