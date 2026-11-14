@@ -221,42 +221,54 @@ func TestAdmitSnapshotFollowsTheHighTier(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-340 — cancelling a queued high HEAD (AIRA-328 `--kill`) leaves
-// no ghost: the next pass picks a new head, the ledger is unchanged, and the
-// jumper the dead head's budget held is granted. Mutation: a cancelled high
-// waiter kept in the order (state filter dropped for the high tier) -> it stays
-// the head.
-func TestConfineKillQueuedHighHeadLeavesNoGhost(t *testing.T) {
-	now := time.Unix(76000, 0)
-	server := queueOrderServer(t, 64*qGiB, &now)
-	held := heldLease(1, 44*qGiB)
-	head := highWaiter(2, "head", "s-1")
-	head.reserve = 24 * qGiB
-	jumper := queuedWaiter(3, 13*qGiB, now) // over the 12 GiB budget, fits the 20 GiB room
-	queue := queueOf(server, held, head, jumper)
-	server.evaluateAdmitQueue(queue)
-	requireAdmitQueued(t, jumper)
-	if queue.freezeHolderSeq != head.seq {
-		t.Fatalf("precondition: the high head is protected (holder=%d)", queue.freezeHolderSeq)
-	}
-	outstanding := queue.outstanding
+// verifies: AIRA-340 — a queued high HEAD that ends without a grant leaves no
+// ghost, whether it is cancelled (AIRA-328 `--kill`) or times out: it leaves
+// the evaluation order, the next pass grants the jumper its budget was holding,
+// it is no longer the recorded head, and the ledger holds only real grants.
+// Mutation: keep high waiters in the order regardless of state
+// (`waiter.state != admitQueued && !waiter.high`) -> it stays the head.
+func TestAdmitHighHeadEndingWithoutAGrantLeavesNoGhost(t *testing.T) {
+	for _, end := range []string{"cancelled", "timed out"} {
+		t.Run(end, func(t *testing.T) {
+			now := time.Unix(76000, 0)
+			server := queueOrderServer(t, 64*qGiB, &now)
+			held := heldLease(1, 44*qGiB)
+			head := highWaiter(2, "head", "s-1")
+			head.reserve = 24 * qGiB
+			jumper := queuedWaiter(3, 13*qGiB, now) // over the 12 GiB budget, fits the 20 GiB room
+			queue := queueOf(server, held, head, jumper)
+			server.evaluateAdmitQueue(queue)
+			requireAdmitQueued(t, jumper)
+			if queue.freezeHolderSeq != head.seq {
+				t.Fatalf("precondition: the high head is protected (holder=%d)", queue.freezeHolderSeq)
+			}
+			outstanding := queue.outstanding
 
-	if _, handled, err := cancelQueuedConfineLocked(queue, "head", "s-1", false, now); !handled || err != nil {
-		t.Fatalf("cancel high head: handled=%v err=%v", handled, err)
-	}
-	requireCancelled(t, head)
-	for _, waiter := range admitOrderLocked(queue) {
-		if waiter == head {
-			t.Fatal("the cancelled high waiter is still in the evaluation order")
-		}
-	}
-	server.evaluateAdmitQueue(queue)
-	waitAdmitGrant(t, jumper)
-	if queue.freezeHolderSeq == head.seq {
-		t.Fatal("the cancelled high head is still recorded as the protected head")
-	}
-	if queue.outstanding != outstanding+13*qGiB {
-		t.Fatalf("outstanding=%d, want %d (held + the granted jumper only)", queue.outstanding, outstanding+13*qGiB)
+			if end == "cancelled" {
+				if _, handled, err := cancelQueuedConfineLocked(queue, "head", "s-1", false, now); !handled || err != nil {
+					t.Fatalf("cancel high head: handled=%v err=%v", handled, err)
+				}
+				requireCancelled(t, head)
+			} else {
+				server.timeoutAdmitWaiter(queue, head)
+				if head.state != admitRejected {
+					t.Fatalf("timed-out head state=%v", head.state)
+				}
+			}
+			for _, waiter := range admitOrderLocked(queue) {
+				if waiter == head {
+					t.Fatal("the ended high waiter is still in the evaluation order")
+				}
+			}
+			server.evaluateAdmitQueue(queue)
+			waitAdmitGrant(t, jumper)
+			if queue.freezeHolderSeq == head.seq {
+				t.Fatal("the ended high head is still recorded as the protected head")
+			}
+			if queue.outstanding != outstanding+13*qGiB {
+				t.Fatalf("outstanding=%d, want %d (held + the granted jumper only)", queue.outstanding, outstanding+13*qGiB)
+			}
+		})
 	}
 }
 
