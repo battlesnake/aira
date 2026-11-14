@@ -29,7 +29,7 @@ LAUNCH = "internal/runner/confine_linux.go"
 IDENT = "internal/runner/repo_identity.go"
 
 T_STORE = ("./internal/store/", "Telemetry|RecordConfinePeakStoresTheTelemetryAsGiven")
-T_T1 = ("./internal/daemon/", "TestConfineReportCompletionFactsEndToEnd")
+T_T1 = ("./internal/daemon/", "TestConfineReportCompletionFactsEndToEnd|TestConfineReportCompletionZeroWallEndToEnd")
 T_T2 = ("./internal/daemon/", "TestConfineReportCompletionAbsentIsNullForEveryKind")
 T_T3 = ("./internal/daemon/", "TestConfineReportCompletionValidation")
 T_T9 = ("./internal/daemon/", "TestConfineReportVersionSkewResend")
@@ -86,17 +86,19 @@ MUTATIONS = [
     ("T3: started_at_ms later than the daemon clock refused", [(HANDLER, "value >= confineReportEndStartedAtMS {", "value >= confineReportEndStartedAtMS || value > time.Now().UnixMilli() {")], T_T3),
     # --- sender (T1, T9)
     ("T1: sender drops wall_ms", [(SENDER, "		args[\"wall_ms\"] = *report.WallMS\n", "")], T_T1),
+    ("T1: sender copies the > 0 idiom for wall_ms", [(SENDER, "if report.WallMS != nil {", "if report.WallMS != nil && *report.WallMS > 0 {")], T_T1),
     ("T1: sender copies the > 0 idiom for wait_ms", [(SENDER, "if report.WaitMS != nil {", "if report.WaitMS != nil && *report.WaitMS > 0 {")], T_T1),
     ("T9: no re-send", [(SENDER, RESEND, "")], T_T9),
-    ("T9: re-send matched on the allowlist text only", [(SENDER, "if response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) && strings.Contains(response.Error, \"unexpected confine-report field\") {")], T_T9),
+    ("T9: re-send matched on the allowlist text only", [(SENDER, "if !response.OK && response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if !response.OK && response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) && strings.Contains(response.Error, \"unexpected confine-report field\") {")], T_T9),
     ("T9: re-send keeps the new fields", [(SENDER, "confinePeakReportArgs(report, false))\n	}", "confinePeakReportArgs(report, true))\n	}")], T_T9),
     ("T9: re-send drops peak and budget", [(SENDER, "confinePeakReportArgs(report, false))\n	}", "map[string]any{\"signature\": report.Signature, \"oom\": report.OOM})\n	}")], T_T9),
     ("T9: re-send with oom false", [(SENDER, "confinePeakReportArgs(report, false))\n	}", "func() map[string]any { a := confinePeakReportArgs(report, false); a[\"oom\"] = false; return a }())\n	}")], T_T9),
     ("T9: re-send with oom true", [(SENDER, "confinePeakReportArgs(report, false))\n	}", "func() map[string]any { a := confinePeakReportArgs(report, false); a[\"oom\"] = true; return a }())\n	}")], T_T9),
-    ("T9: re-send when the frame carried no new field", [(SENDER, "if response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if response.Code == \"E_DAEMON_PROTOCOL\" {")], T_T9),
+    ("T9: re-send when the frame carried no new field", [(SENDER, "if !response.OK && response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if !response.OK && response.Code == \"E_DAEMON_PROTOCOL\" {")], T_T9),
     ("T9: re-send twice", [(SENDER, RESEND, "	if errors.Is(err, errReportCompletionFactsRefused) {\n		if again := reportPeakExchangeOnce(ctx, socketPath, confinePeakReportArgs(report, false)); again == nil {\n			return nil\n		}\n		return reportPeakExchangeOnce(ctx, socketPath, confinePeakReportArgs(report, false))\n	}")], T_T9),
     ("T9: re-send on a transport error", [(SENDER, RESEND, "	if err != nil {\n		return reportPeakExchangeOnce(ctx, socketPath, confinePeakReportArgs(report, false))\n	}")], T_T9),
-    ("T9(g): re-send on any refusal code", [(SENDER, "if response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if carriesCompletionFacts(args) {")], T_T9),
+    ("T9(g): re-send on any refusal code", [(SENDER, "if !response.OK && response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if !response.OK && carriesCompletionFacts(args) {")], T_T9),
+    ("T9(h): re-send on a contradictory ok=true envelope", [(SENDER, "if !response.OK && response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {")], T_T9),
     # --- launch site (T4, T6)
     ("T4: wall timer started before deps.admit", [(LAUNCH, WALL_END, "		wallMS := (deps.monoNow() - admitEntered).Milliseconds()")], T_T4),
     ("T4: wall timer started before repoIdentity", [(LAUNCH, REPO_CALL, "	preRepo := deps.monoNow()\n" + REPO_CALL), (LAUNCH, WALL_END, "		wallMS := (deps.monoNow() - preRepo).Milliseconds()")], T_T4),
@@ -123,6 +125,8 @@ MUTATIONS = [
     # --- RepoIdentity (T5)
     ("T5: worktree's own gitdir hashed, not its commondir", [(IDENT, "		common = named\n", "		_ = named\n")], T_T5),
     ("T5: step 0 (symlink resolution) skipped", [(IDENT, "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return \"\", false\n	}\n	resolved, err = filepath.Abs(resolved)", "	resolved, err := filepath.Abs(cwd)")], T_T5),
+    ("T5: git metadata opened blocking (a FIFO hangs the launch)", [(IDENT, "os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)", "os.OpenFile(path, os.O_RDONLY, 0)")], T_T5),
+    ("T5: git metadata read without a size bound", [(IDENT, "	if err != nil || len(data) > repoIdentityGitFileMax {\n		return nil, false, false\n	}\n	return data, false, true", "	if err != nil {\n		return nil, false, false\n	}\n	return data, false, true"), (IDENT, "io.ReadAll(io.LimitReader(file, repoIdentityGitFileMax+1))", "io.ReadAll(file)")], T_T5),
     ("T5: none returned on an error", [(IDENT, "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return \"\", false\n	}", "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return RepoIdentityNone, true\n	}")], T_T5),
 ]
 

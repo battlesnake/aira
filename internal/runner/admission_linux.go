@@ -946,7 +946,10 @@ func reportPeakExchangeOnce(ctx context.Context, socketPath string, args map[str
 		return err
 	}
 	if !response.OK || response.Code != "OK" {
-		if response.Code == "E_DAEMON_PROTOCOL" && carriesCompletionFacts(args) {
+		// Only a WELL-FORMED refusal (ok false AND the protocol code) is re-sent:
+		// a contradictory envelope such as ok=true with an error code establishes
+		// nothing, and the daemon may have committed before sending it.
+		if !response.OK && response.Code == "E_DAEMON_PROTOCOL" && carriesCompletionFacts(args) {
 			return errReportCompletionFactsRefused
 		}
 		if response.Error != "" {

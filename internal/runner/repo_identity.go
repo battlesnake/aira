@@ -17,7 +17,7 @@ import (
 const RepoIdentityNone = "none"
 
 // repoIdentityGitFileMax bounds the read of a `.git` FILE (a linked worktree's or
-// a submodule's `gitdir: <path>` pointer).
+// a submodule's `gitdir: <path>` pointer) and of a `commondir` file.
 const repoIdentityGitFileMax = 4096
 
 // RepoIdentity returns the repository identity of a working directory (AIRA-323,
@@ -72,16 +72,37 @@ func RepoIdentity(cwd string) (string, bool) {
 	}
 }
 
+// readSmallRegularFile reads at most repoIdentityGitFileMax bytes of a REGULAR
+// file. It never blocks and never reads unboundedly: the file is opened
+// non-blocking (a FIFO with no writer would otherwise hang the launch, since the
+// identity is computed before admission), anything that is not a regular file
+// (a FIFO, a device such as /dev/zero, a directory) is refused, and so is a file
+// over the bound. A missing file is reported as missing, not as an error.
+func readSmallRegularFile(path string) (data []byte, missing bool, ok bool) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, true, false
+	}
+	if err != nil {
+		return nil, false, false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, false, false
+	}
+	data, err = io.ReadAll(io.LimitReader(file, repoIdentityGitFileMax+1))
+	if err != nil || len(data) > repoIdentityGitFileMax {
+		return nil, false, false
+	}
+	return data, false, true
+}
+
 // readGitFilePointer reads a `.git` file: exactly one line `gitdir: <path>`, a
 // relative path resolving against the directory holding the file.
 func readGitFilePointer(path, dir string) (string, bool) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", false
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, repoIdentityGitFileMax+1))
-	if err != nil || len(data) > repoIdentityGitFileMax {
+	data, _, ok := readSmallRegularFile(path)
+	if !ok {
 		return "", false
 	}
 	text := strings.TrimSuffix(string(data), "\n")
@@ -103,9 +124,9 @@ func readGitFilePointer(path, dir string) (string, bool) {
 // gitDir/commondir names another) and hashes its canonical path.
 func repoIdentityFromGitDir(gitDir string) (string, bool) {
 	common := gitDir
-	data, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	data, missing, ok := readSmallRegularFile(filepath.Join(gitDir, "commondir"))
 	switch {
-	case err == nil:
+	case ok:
 		named := strings.TrimSpace(string(data))
 		if named == "" {
 			return "", false
@@ -114,7 +135,7 @@ func repoIdentityFromGitDir(gitDir string) (string, bool) {
 			named = filepath.Join(gitDir, named)
 		}
 		common = named
-	case errors.Is(err, fs.ErrNotExist):
+	case missing:
 	default:
 		return "", false
 	}

@@ -138,6 +138,28 @@ func TestConfineReportCompletionFactsEndToEnd(t *testing.T) {
 	}
 }
 
+// TestConfineReportCompletionZeroWallEndToEnd: a real 0 wall_ms (a
+// sub-millisecond run) survives the real sender and is stored as 0, not NULL.
+//
+// verifies: AIRA-323
+func TestConfineReportCompletionZeroWallEndToEnd(t *testing.T) {
+	paths, reports := completionServer(t)
+	report := runner.ConfinePeakReport{
+		Signature: "aira-323\x00zero-wall", OOM: false,
+		WallMS: ptr64(0), StartedAtMS: ptr64(time.Now().UnixMilli()), Repo: "none",
+	}
+	if err := runner.ReportPeakSample(reportCtx(t), paths.SocketPath, report); err != nil {
+		t.Fatal(err)
+	}
+	rows := readCompletionRows(t, paths.DBPath, report.Signature)
+	if len(rows) != 1 || !rows[0].wallMS.Valid || rows[0].wallMS.Int64 != 0 {
+		t.Fatalf("rows=%+v, want wall_ms stored as a real 0", rows)
+	}
+	if got := reports.Load(); got != 1 {
+		t.Fatalf("requests=%d, want exactly 1", got)
+	}
+}
+
 // TestConfineReportCompletionAbsentIsNullForEveryKind is T2.
 //
 // verifies: AIRA-323
@@ -415,6 +437,40 @@ func TestConfineReportVersionSkewResend(t *testing.T) {
 		err = runner.ReportPeakSample(reportCtx(t), socket, full("skew-f", false))
 		if err == nil {
 			t.Fatal("a missing reply must be an error")
+		}
+		_ = listener.Close()
+		if got := connections.Load(); got != 1 {
+			t.Fatalf("connections=%d, want exactly 1", got)
+		}
+	})
+	t.Run("(h) no re-send on a contradictory envelope", func(t *testing.T) {
+		// ok=true with the protocol code is not a well-formed refusal: the daemon
+		// may have committed, so a re-send could duplicate the row.
+		socket := filepath.Join(shortRuntimeDir(t), "s")
+		listener, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		var connections atomic.Int64
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				connections.Add(1)
+				var header [4]byte
+				if _, err := io.ReadFull(conn, header[:]); err == nil {
+					_, _ = io.CopyN(io.Discard, conn, int64(binary.BigEndian.Uint32(header[:])))
+				}
+				_ = writeFrame(conn, ResponseFrame{OK: true, Code: CodeProtocol, Error: CodeProtocol + ": contradictory"})
+				_ = conn.Close()
+			}
+		}()
+		err = runner.ReportPeakSample(reportCtx(t), socket, full("skew-h", false))
+		if err == nil {
+			t.Fatal("a contradictory reply must be an error")
 		}
 		_ = listener.Close()
 		if got := connections.Load(); got != 1 {

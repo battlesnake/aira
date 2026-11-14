@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // repoIdentityGit runs git with no inherited GIT_* environment (a hook or a
@@ -151,6 +153,63 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 		}
 		if id, ok := RepoIdentity(dir); id != "" || ok {
 			t.Fatalf("got (%q, %v), want (\"\", false)", id, ok)
+		}
+	})
+	t.Run("git metadata that is not a small regular file is unevaluated without blocking", func(t *testing.T) {
+		// The identity is computed BEFORE admission, so a read that blocks (a
+		// FIFO with no writer) or never ends (/dev/zero) would stall the launch.
+		for _, tc := range []struct {
+			name  string
+			setup func(t *testing.T, gitDir string)
+		}{
+			{"a FIFO commondir", func(t *testing.T, gitDir string) {
+				if err := syscall.Mkfifo(filepath.Join(gitDir, "commondir"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"a commondir linked to /dev/zero", func(t *testing.T, gitDir string) {
+				if err := os.Symlink("/dev/zero", filepath.Join(gitDir, "commondir")); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"an oversized commondir", func(t *testing.T, gitDir string) {
+				// Valid once trimmed: only the size bound refuses it.
+				if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../.."+strings.Repeat(" ", 5000)+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				root := filepath.Join(t.TempDir(), "checkout")
+				gitDir := filepath.Join(root, "..", "store", ".git", "worktrees", "w")
+				if err := os.MkdirAll(gitDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(root, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				tc.setup(t, gitDir)
+				type answer struct {
+					id string
+					ok bool
+				}
+				done := make(chan answer, 1)
+				go func() {
+					id, ok := RepoIdentity(root)
+					done <- answer{id, ok}
+				}()
+				select {
+				case got := <-done:
+					if got.id != "" || got.ok {
+						t.Fatalf("got (%q, %v), want (\"\", false)", got.id, got.ok)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("RepoIdentity blocked on git metadata")
+				}
+			})
 		}
 	})
 }
