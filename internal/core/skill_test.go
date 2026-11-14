@@ -1360,6 +1360,29 @@ func TestSkillTeachesTheReserveHint(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-279 (interim) and AIRA-195 (accepted gap) -- the skill says that
+// confine books one CPU slot per job and does not throttle CPU, so a parallel
+// build must set its own job count, and that an outer kill does not reach scopes
+// its children confined themselves, naming where to find and kill them.
+func TestSkillTeachesTheCPUSlotAndOuterKillGaps(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		for _, want := range []string{
+			"Confine books one CPU slot per job however many threads the job runs",
+			"set `CARGO_BUILD_JOBS`, `make -j N` or the tool's equivalent explicitly, because aira does not throttle CPU",
+			"Killing an outer job does not reach scopes its children confined themselves",
+			"find them in `aira confine --list` as LIVE=unsupervised and kill them by scope id",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not teach %q", name, want)
+			}
+		}
+	}
+}
+
 // verifies: AIRA-312 -- the skill and the generated verb summary both state the
 // resize honesty caveats: ledger only (cap unchanged), the OOM-steering budget
 // drops with the reserve, and any re-declare restores the original. Deleting any
