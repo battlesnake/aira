@@ -89,3 +89,58 @@ func TestConfineFunnelPrintsTheCancelledNeverRanLine(t *testing.T) {
 		t.Fatalf("stderr=%q lacks the never-ran line", stderr.String())
 	}
 }
+
+// verifies: AIRA-328 review P1, client half of the lost-reply sequence. The
+// first exchange loses its reply (the daemon side closes after reading the
+// request: the client reads EOF), so the client reconnects; the reconnect
+// carries the SAME scope id, which is what the daemon's cancelled-scope record
+// keys on, and its U_ADMIT_CANCELLED answer ends the loop with no third dial.
+// The daemon half (that the reconnect is answered U_ADMIT_CANCELLED rather
+// than queued) is TestConfineKillQueuedCancelSurvivesALostReply. Mutation: mint
+// the scope id per exchange -> the two dials carry different ids.
+func TestAdmissionCancelAfterALostReplyEndsOnTheReconnect(t *testing.T) {
+	runner := &Runner{
+		memorySlice:      "/fake/finite.slice",
+		memoryReserve:    DefaultConfineMemoryReserve,
+		admissionMaxWait: time.Second,
+		pollInterval:     time.Millisecond,
+		clock:            newInstantClock(),
+		sliceMemory:      func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" },
+	}
+	const scopeID = "CONFINE-lost-7502-zz@s-1"
+	var dials atomic.Int32
+	scopes := make(chan any, 4)
+	runner.admitDialFn = func(context.Context, string) (net.Conn, error) {
+		n := dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			var frame runnerAdmitRequestFrame
+			if err := readRunnerAdmitFrame(server, &frame); err != nil {
+				return
+			}
+			scopes <- frame.Request.Args["scope_id"]
+			if n == 1 {
+				return // the cancel reply is lost
+			}
+			_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{
+				Code:  "U_ADMIT_CANCELLED",
+				Error: "U_ADMIT_CANCELLED: this job was cancelled by `aira confine --kill` while it was still waiting for admission; nothing ran (basis=reject:cancelled)",
+			})
+		}()
+		return client, nil
+	}
+
+	result, _, err := runner.admitThroughDaemon(context.Background(), Request{DaemonEstimateMemory: true, ConfineScopeID: scopeID}, DefaultConfineMemoryReserve)
+	if err == nil || result.state != "cancelled" || confineErrorCode(err) != "U_ADMIT_CANCELLED" {
+		t.Fatalf("state=%q err=%v, want a terminal cancelled refusal", result.state, err)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("dialled %d times, want 2 (the lost exchange and the reconnect that learns of the cancel)", got)
+	}
+	for i := 0; i < 2; i++ {
+		if got := <-scopes; got != scopeID {
+			t.Fatalf("exchange %d carried scope_id %v, want %s on every reconnect", i+1, got, scopeID)
+		}
+	}
+}

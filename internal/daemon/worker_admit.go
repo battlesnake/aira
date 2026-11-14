@@ -506,12 +506,15 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		// AIRA-328. An operator cancelled this queued claim by its exact scope id
 		// (`aira confine --kill`). TERMINAL, not the retriable denial below: a
 		// retry would mint a fresh claim and undo the cancel. request-invalid is
-		// the terminal class that keeps containment (the supervisor reports the
-		// affected work unevaluated and runs nothing unconfined).
+		// the terminal class that keeps containment. Its consequence is SUITE-wide,
+		// not per-claim: the aitest supervisor answers any request-invalid other
+		// than exceeds-ceiling with _fail_queue_terminal, which marks every test
+		// still QUEUED in that suite unevaluated (workers already running finish;
+		// nothing runs unconfined, nothing is reported passed).
 		s.writeWorkerAdmitResponse(conn, start, WorkerAdmitResponse{
 			State: runner.WorkerAdmitStateDenied, Class: runner.WorkerAdmitClassRequestInvalid,
 			Reason: runner.WorkerAdmitReasonOperatorCancelled,
-			Detail: "this worker claim was cancelled by `aira confine --kill` while it was waiting for admission",
+			Detail: "this worker claim was cancelled by `aira confine --kill` while it was waiting for admission; the suite's remaining queued tests are reported unevaluated",
 		})
 		return
 	}
