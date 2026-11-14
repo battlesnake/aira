@@ -1,4 +1,6 @@
+import collections
 import errno
+import heapq
 import json
 import os
 import select
@@ -858,6 +860,177 @@ def _drain_available_lines(fd, state):
     return lines
 
 
+class _ReadyQueue:
+    """The ready queue (AIRA-343): reads as the plain list of nodeids it replaced (iteration
+    in queue order, len, ``in``, ``==`` against a list, append, pop(0)/pop(), insert(0, x),
+    remove(x)), and also answers the dispatcher's pick -- the LPT test that fits a worker --
+    without scanning the whole queue.
+
+    Order. Every entry gets a sequence number that preserves the list order exactly: append
+    counts up from 0 and insert(0, x) (requeue_once's head insert) counts down from -1, so
+    a smaller sequence number is always an earlier list position, which is the old pick's
+    FIFO tiebreak (-index). ``_order`` (seq -> nodeid, an OrderedDict kept in seq order)
+    makes every list operation the dispatcher uses O(1). A nodeid may appear twice, as it
+    could in the list; remove(x) then takes its first occurrence, as list.remove did.
+
+    Pick index. Entries are grouped by class = (reservation need, cpu need); a class keeps
+    a min-heap of (-aira_time, seq, nodeid), so its top is its best entry under the old key
+    (aira_time DESC, then FIFO -- need is constant within a class). A pick visits only the
+    classes that FIT both dimensions (the old per-test fit rule, applied once per class)
+    and compares their tops under the full old key (aira_time, need, -seq): O(classes +
+    log n) per pick instead of O(n). Deletion is lazy: removing an entry drops its seq from
+    ``_order``, and a heap entry whose seq is no longer in ``_order`` is discarded when it
+    reaches the top. Liveness is judged by seq, never by nodeid, so a nodeid removed and
+    requeued cannot revive its stale entry.
+
+    The index is built lazily on the first pick and rebuilt whenever the need/cpu/time maps
+    (or the overhead every unsized nodeid falls back to) are REASSIGNED -- compared by
+    object identity -- so a test that sets the queue before the maps, or collect(), which
+    assigns the queue before them, still picks from the live values. Mutating one of those
+    maps in place is not detected; nothing does that (collect() builds fresh dicts)."""
+
+    __slots__ = ("_order", "_seqs", "_head", "_tail", "_classes", "_source", "_classify", "_source_of")
+
+    def __init__(self, nodeids, classify, source_of):
+        # classify(nodeid) -> (need, cpu, time); source_of() -> the objects classify reads.
+        self._classify = classify
+        self._source_of = source_of
+        self._order = collections.OrderedDict()  # seq -> nodeid, in list order
+        self._seqs = {}  # nodeid -> its live seqs, ascending (len 1 unless duplicated)
+        self._head = 0  # the last head-insert seq; the next is self._head - 1
+        self._tail = 0  # the next append seq
+        self._classes = None  # (need, cpu) -> heap; None until the first pick
+        self._source = None
+        for nodeid in nodeids:
+            self.append(nodeid)
+
+    # -- the list face ------------------------------------------------------------------
+
+    def __len__(self):
+        return len(self._order)
+
+    def __iter__(self):
+        return iter(self._order.values())
+
+    def __contains__(self, nodeid):
+        return nodeid in self._seqs
+
+    def __eq__(self, other):
+        if isinstance(other, (list, tuple, _ReadyQueue)):
+            return list(self) == list(other)
+        return NotImplemented
+
+    __hash__ = None
+
+    def __repr__(self):
+        return "_ReadyQueue(%r)" % (list(self),)
+
+    def append(self, nodeid):
+        seq = self._tail
+        self._tail += 1
+        self._order[seq] = nodeid
+        self._seqs.setdefault(nodeid, []).append(seq)
+        self._index(seq, nodeid)
+
+    def insert(self, index, nodeid):
+        if index != 0:
+            # The dispatcher only ever inserts at the head (requeue_once); a middle insert
+            # has no sequence number between its neighbours.
+            raise ValueError("_ReadyQueue.insert supports index 0 only, got %r" % (index,))
+        self._head -= 1
+        seq = self._head
+        self._order[seq] = nodeid
+        self._order.move_to_end(seq, last=False)
+        self._seqs.setdefault(nodeid, []).insert(0, seq)
+        self._index(seq, nodeid)
+
+    def pop(self, index=-1):
+        if not self._order:
+            raise IndexError("pop from empty list")
+        if index == 0:
+            seq = next(iter(self._order))
+        elif index == -1:
+            seq = next(reversed(self._order))
+        else:
+            raise ValueError("_ReadyQueue.pop supports index 0 or -1 only, got %r" % (index,))
+        return self._drop(seq)
+
+    def remove(self, nodeid):
+        seqs = self._seqs.get(nodeid)
+        if not seqs:
+            raise ValueError("list.remove(x): x not in list")
+        self._drop(seqs[0])
+
+    def _drop(self, seq):
+        # The heap entry is NOT touched: it is stale from here on, discarded at the top.
+        nodeid = self._order.pop(seq)
+        seqs = self._seqs[nodeid]
+        if len(seqs) == 1:
+            del self._seqs[nodeid]
+        else:
+            seqs.remove(seq)
+        return nodeid
+
+    # -- the pick index -----------------------------------------------------------------
+
+    def _index(self, seq, nodeid):
+        if self._classes is not None:
+            need, cpu, time_cost = self._classify(nodeid)
+            heapq.heappush(self._classes.setdefault((need, cpu), []), (-time_cost, seq, nodeid))
+
+    def _reindex(self, source):
+        classes = {}
+        for seq, nodeid in self._order.items():
+            need, cpu, time_cost = self._classify(nodeid)
+            classes.setdefault((need, cpu), []).append((-time_cost, seq, nodeid))
+        for heap in classes.values():
+            heapq.heapify(heap)
+        self._classes = classes
+        self._source = source
+
+    def pick(self, budget, cpu_budget, pop):
+        """The nodeid the old full scan picked: among entries whose need <= budget AND cpu
+        need <= cpu_budget, the highest (aira_time, need, earliest-queued); None if none
+        fits. pop=True also removes it (callers own the attempts increment)."""
+        source = self._source_of()
+        if self._classes is None or len(source) != len(self._source) or any(
+            new is not old for new, old in zip(source, self._source)
+        ):
+            self._reindex(source)
+        order = self._order
+        best_key = None
+        best_heap = None
+        emptied = None
+        for cls, heap in self._classes.items():
+            need, cpu = cls
+            # The old fit rule, per class instead of per test: skip, never block, a class
+            # that does not fit either dimension.
+            if need > budget or cpu > cpu_budget:
+                continue
+            while heap and heap[0][1] not in order:
+                heapq.heappop(heap)
+            if not heap:
+                if emptied is None:
+                    emptied = []
+                emptied.append(cls)
+                continue
+            neg_time, seq, _ = heap[0]
+            key = (-neg_time, need, -seq)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_heap = heap
+        if emptied is not None:
+            for cls in emptied:
+                del self._classes[cls]
+        if best_heap is None:
+            return None
+        _, seq, nodeid = best_heap[0]
+        if pop:
+            heapq.heappop(best_heap)
+            self._drop(seq)
+        return nodeid
+
+
 class Supervisor:
     """Owns collection, the pull dispatch queue, and worker-admit relaying.
     Never runs a test itself -- see worker.py for that."""
@@ -1027,25 +1200,32 @@ class Supervisor:
 
         `budget`/`cpu_budget` are always numeric: a None-reservation (unconfined) worker never
         calls this -- its dispatch bypasses the fit filter entirely (Task 3)."""
-        best = None
-        best_key = None
-        for index, nodeid in enumerate(self.queue):
-            need = self._need_for(nodeid)
-            # Fit filter FIRST (both dimensions), so a heavy-time RAM/cpu-oversized test is
-            # excluded and can never block a fitting lighter one.
-            if need > budget or self._cpu_need_for(nodeid) > cpu_budget:
-                continue
-            # LPT primary, RAM bin-pack secondary, FIFO (-index, earliest wins) tertiary.
-            key = (self._time_for(nodeid), need, -index)
-            if best_key is None or key > best_key:
-                best = nodeid
-                best_key = key
-        if best is None:
-            return None
-        if pop:
-            self.queue.remove(best)
+        # AIRA-343: the queue's class index answers this in O(classes + log n) with exactly
+        # the order the full scan used to compute: fit filter FIRST (both dimensions, so a
+        # heavy-time oversized test can never block a fitting lighter one), then LPT primary,
+        # RAM bin-pack secondary, FIFO tertiary. See _ReadyQueue.
+        best = self.queue.pick(budget, cpu_budget, pop)
+        if best is not None and pop:
             self.attempts[best] = self.attempts.get(best, 0) + 1
         return best
+
+    @property
+    def queue(self):
+        """The ready queue, a _ReadyQueue (AIRA-343). Assigning any iterable of nodeids
+        replaces it, in that order -- collect() and test doubles both do."""
+        return self._queue
+
+    @queue.setter
+    def queue(self, nodeids):
+        self._queue = _ReadyQueue(nodeids, self._pick_class, self._pick_source)
+
+    def _pick_class(self, nodeid):
+        """(need, cpu need, aira_time) -- what the dispatch pick orders and filters by."""
+        return self._need_for(nodeid), self._cpu_need_for(nodeid), self._time_for(nodeid)
+
+    def _pick_source(self):
+        """The objects _pick_class reads; the queue re-indexes when any is reassigned."""
+        return (self.reservation_need, self.cpu_need, self.time_cost, self._worker_overhead_bytes)
 
     def _smallest_ready(self):
         """(nodeid, reservation_need, cpu_need) for the ready nodeid with the SMALLEST
