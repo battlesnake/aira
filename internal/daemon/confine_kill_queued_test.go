@@ -380,55 +380,82 @@ func TestConfineKillQueuedThroughTheHandler(t *testing.T) {
 // verifies: AIRA-328 — the wire: a real admitConnection whose waiter is
 // cancelled answers its client U_ADMIT_CANCELLED with basis reject:cancelled
 // (not saturated, not fail-fast), then returns and its deferred release removes
-// the waiter. Mutations: release the waiter in the kill instead of rejecting it
-// -> no frame (the client would see EOF and reconnect); drop the render arm ->
+// the waiter. The exclusive row is a real `--exclusive` / `aira drain wait`
+// requester still DRAINING behind a held lease: its cancel must not be reported
+// as the drain-timeout E_ADMIT_SATURATED (exclusive=draining), which the skill
+// tells agents to retry. Mutations: release the waiter in the kill instead of
+// rejecting it -> no frame (the client would see EOF and reconnect); drop the
+// render arm -> E_ADMIT_SATURATED; move the cancelled arm below the exclusive
+// arm (or skip it for exclusive waiters) -> the exclusive row gets
 // E_ADMIT_SATURATED.
 func TestConfineKillQueuedWireRender(t *testing.T) {
-	const maximum = int64(1) << 30
-	server := saturatedServer(t)
-	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, maximum, 0, true, "" }
-	scopeID := testConfineScopeID(t, "wired", 7301) + "@s-1"
-	args := map[string]any{"slice": "slice", "reserve": int64(1) << 20, "pinned": true, "scope_id": scopeID, "name": "wired", "owner": "s-1"}
-	run := startSaturatedAdmit(t, server, maximum, args)
+	for _, exclusive := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "exclusive-drainer"}[exclusive], func(t *testing.T) {
+			const maximum = int64(1) << 30
+			server := saturatedServer(t)
+			server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, maximum, 0, true, "" }
+			scopeID := testConfineScopeID(t, "wired", 7301) + "@s-1"
+			args := map[string]any{"slice": "slice", "reserve": int64(1) << 20, "pinned": true, "scope_id": scopeID, "name": "wired", "owner": "s-1"}
+			var seed []*admitWaiter
+			if exclusive {
+				args["exclusive"] = true
+				// A live lease keeps the slice non-empty, so the requester drains
+				// rather than being granted on its first pass.
+				seed = append(seed, heldLease(1, 1<<20))
+			}
+			run := startSaturatedAdmit(t, server, maximum, args, seed...)
+			if exclusive {
+				run.queue.mu.Lock()
+				draining := exclusiveGateLocked(run.queue).draining
+				run.queue.mu.Unlock()
+				if draining != run.waiter {
+					t.Fatal("precondition: the exclusive requester is draining the slice")
+				}
+			}
 
-	result, handled, err := server.cancelQueuedConfine("/slice", "wired", "s-1", false)
-	if !handled || err != nil || result.ScopeID != scopeID {
-		t.Fatalf("cancel: result=%+v handled=%v err=%v", result, handled, err)
-	}
-	select {
-	case frame := <-run.frames:
-		if frame.Code != CodeAdmitCancelled {
-			t.Fatalf("frame code=%q, want %s", frame.Code, CodeAdmitCancelled)
-		}
-		if !strings.HasPrefix(frame.Error, CodeAdmitCancelled+":") {
-			t.Fatalf("message %q must lead with the code so the client extracts it", frame.Error)
-		}
-		var rejection admitRejection
-		if err := json.Unmarshal(frame.Data, &rejection); err != nil {
-			t.Fatalf("rejection payload: %v", err)
-		}
-		if rejection.Basis != "reject:cancelled" {
-			t.Fatalf("basis=%q, want reject:cancelled", rejection.Basis)
-		}
-	case err := <-run.errs:
-		t.Fatalf("read: %v (the client saw EOF instead of a refusal: it would reconnect and re-queue)", err)
-	case <-testdeadline.After(5 * time.Second):
-		t.Fatal("no frame after the cancel")
-	}
-	select {
-	case <-run.done:
-	case <-testdeadline.After(5 * time.Second):
-		t.Fatal("admitConnection did not return after answering the cancel")
-	}
-	run.queue.mu.Lock()
-	defer run.queue.mu.Unlock()
-	for _, waiter := range run.queue.waiters {
-		if waiter == run.waiter {
-			t.Fatal("the cancelled waiter is still in queue.waiters after its connection ended")
-		}
-	}
-	if run.waiter.state != admitReleased {
-		t.Fatalf("waiter state=%v, want admitReleased", run.waiter.state)
+			result, handled, err := server.cancelQueuedConfine("/slice", "wired", "s-1", false)
+			if !handled || err != nil || result.ScopeID != scopeID {
+				t.Fatalf("cancel: result=%+v handled=%v err=%v", result, handled, err)
+			}
+			select {
+			case frame := <-run.frames:
+				if frame.Code != CodeAdmitCancelled {
+					t.Fatalf("frame code=%q, want %s (an operator cancel must not read as contention)", frame.Code, CodeAdmitCancelled)
+				}
+				if !strings.HasPrefix(frame.Error, CodeAdmitCancelled+":") {
+					t.Fatalf("message %q must lead with the code so the client extracts it", frame.Error)
+				}
+				var rejection admitRejection
+				if err := json.Unmarshal(frame.Data, &rejection); err != nil {
+					t.Fatalf("rejection payload: %v", err)
+				}
+				if rejection.Basis != "reject:cancelled" || rejection.Exclusive != "" {
+					t.Fatalf("basis=%q exclusive=%q, want reject:cancelled with no exclusive state", rejection.Basis, rejection.Exclusive)
+				}
+			case err := <-run.errs:
+				t.Fatalf("read: %v (the client saw EOF instead of a refusal: it would reconnect and re-queue)", err)
+			case <-testdeadline.After(5 * time.Second):
+				t.Fatal("no frame after the cancel")
+			}
+			select {
+			case <-run.done:
+			case <-testdeadline.After(5 * time.Second):
+				t.Fatal("admitConnection did not return after answering the cancel")
+			}
+			run.queue.mu.Lock()
+			defer run.queue.mu.Unlock()
+			for _, waiter := range run.queue.waiters {
+				if waiter == run.waiter {
+					t.Fatal("the cancelled waiter is still in queue.waiters after its connection ended")
+				}
+			}
+			if run.waiter.state != admitReleased {
+				t.Fatalf("waiter state=%v, want admitReleased", run.waiter.state)
+			}
+			if gate := exclusiveGateLocked(run.queue); gate.draining != nil || gate.holder != nil {
+				t.Fatal("the cancelled requester still holds the exclusive gate")
+			}
+		})
 	}
 }
 

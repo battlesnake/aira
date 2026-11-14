@@ -1430,6 +1430,8 @@ func TestSkillTeachesTheClaudeSessionConfineOwner(t *testing.T) {
 			"`aira confine --list --json` carries them as `queued[].owner`, `queued[].name` and `queued[].supervisor_pid`; the plain `--list` table lists running jobs only",
 			"back to the default owner (your Claude Code session, else the worktree)",
 			"prefer the CLI face (Bash) for confine management then, or restart the MCP connection",
+			"`aira confine --kill` cancels a job still waiting for admission (its reply carries `\"phase\": \"queued\"`) exactly as on a real host, but it cannot kill a RUNNING job here",
+			"for a running job it REFUSES rather than reporting a kill it did not perform, and names the supervisor PID to signal instead",
 		} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("%s does not teach %q", name, want)
@@ -1442,6 +1444,9 @@ func TestSkillTeachesTheClaudeSessionConfineOwner(t *testing.T) {
 			"gives it a NEW session id",
 			"`aira confine --list` shows it, `--list --json` carries it as `queued[].owner`",
 			"back to unowned",
+			// AIRA-328: in ci-shim mode the queued cancel is pure queue state and
+			// works; only a RUNNING job is refused.
+			"but `aira confine --kill` CANNOT work here",
 		} {
 			if strings.Contains(text, stale) {
 				t.Fatalf("%s still says %q", name, stale)
