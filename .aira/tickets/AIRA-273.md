@@ -33,3 +33,5 @@ A alone does not stop the restart cycle (4); B alone still costs ~8 kills per le
 
 ## Third instance (RANT-54, 2026-10-24, flavour-kernel; triage 2026-10-25)
 `cargo clippy -p fk-fixtures --all-targets`: estimate from three small warm-cache samples, then OOM-killed at 1.15x that max, escalating 1.5x per kill (80M -> 121M ...), ~5 kills to reach ~650M. Same censored-kill creep. Option A (escalation = max(1.5 x MaxOOMPeak, p90-prior)) would cut it to one kill but only helps once AIRA-314 fix 2 makes the p90 prior reliably readable. Still held: clearing it is the owner's call.
+
+Plan 2026-11-14: RANT-109 is another bimodal instance (stoner `cargo xtask arch-baseline check`: 1148M warm, 7.39G cold rebuild; OOM-killed at 1792M after the hint's single-run suggestion; AIRA-334 rewords that hint). Look at this after the p90 deletion and AIRA-331.

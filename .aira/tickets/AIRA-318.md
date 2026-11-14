@@ -10,3 +10,5 @@ Measured by the AIRA-314 plan review on a copy of the live state.db: 897 of 65,8
 Out of scope for AIRA-314; a later design question (e.g. estimate from anonymous memory / memory.stat anon+kernel, or discount a peak at the cap). Owner decision before any build.
 
 Example: pinned --memory-reserve 16G cache-heavy job, real anonymous need 2G, records peak 16G. With AIRA-314, run 2 gets 18.4G, run 3 21.2G, ...; before AIRA-314 the same climb starts at run 4.
+
+Plan 2026-11-14: the trailer/hint half is split to AIRA-334 (not the same fix). RANT-73/87/111 are further instances (RANT-73 reproduced 2026-11-14: a 2 MB-RSS file stream reads 100% of a 256M cap). Recommended cheap rule (owner may adopt): a clean run that reached its cap never grows the estimate beyond the cap it ran under (swap is off, so it fitted).

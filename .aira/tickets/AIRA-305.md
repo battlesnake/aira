@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-305","project":"aira","title":"Flaky: TestVRAMContendedJobIsHeldNotRefused reads the queue count before the saturated reply's queue is registered","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.35","labels":[],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-305","project":"aira","title":"Flaky: TestVRAMContendedJobIsHeldNotRefused reads the queue count before the saturated reply's queue is registered","status":"retired","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.35","labels":[],"hold":true,"relations":[]}
 ---
 
 
@@ -9,3 +9,5 @@ test passed 30/30 in isolation and in an earlier full `make ci` on the identical
 timing race: the test reads `len(server.admitQueues)` right after the non-blocking saturated reply
 frame, but the queue entry can already be gone (or not yet registered) by then. Fix by asserting on
 an event the server signals rather than sampling the registry after the reply.
+
+Retired 2026-11-14: the flake was fixed by 05dbc38c (AIRA-322): the test now samples at admitWriteFrame.

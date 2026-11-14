@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-236","project":"aira","title":"aira time-tracking: status-transition events + phase-time aggregation (Opt A) + persist/attribute confine timing (Opt B)","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":null,"labels":["telemetry"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-236","project":"aira","title":"aira time-tracking: status-transition events + phase-time aggregation (Opt A) + persist/attribute confine timing (Opt B)","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":"later","labels":["telemetry"],"hold":true,"relations":[]}
 ---
 Owner (2026-09-13) liked the feasibility options; DEFERRED behind aitest v0.7 S2b (AIRA-235). Capture so the good ideas are not lost. NOT started.
 
@@ -16,3 +16,5 @@ NOT sub-statuses (Option D): a sub-status models ticket STATE, not TIME; and tod
 Honest limit: all of this only captures time that flows through an aira verb (run/confine/spend/time). Pure think/read time between commands is not captured unless explicitly bracketed — 'ceremony' stays the fuzzy bucket.
 
 Existing surface to build on: the 6-value dev-loop phase enum {plan,plan-review,plan-fix,implement,work-review,work-fix} (compute.go:40); 'aira time --ticket --phase' records command_events.wall_ms; 'aira insights' (command-latency p50/p95, review-loop-economics SpendByPhase); 'aira commands/spend ls --by'.
+
+Plan 2026-11-14: held whole. AIRA-323 persists wall and wait time but NOT option B's --ticket/--phase/--label attribution, so 323 covers the timing half only.
