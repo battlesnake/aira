@@ -395,12 +395,23 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		steal, _ := request.Args["steal"].(bool)
 		// AIRA-328. A QUEUED job first: it has no cgroup scope for the kill below
 		// to find, so before this every `--kill` of a job `--list` showed as queued
-		// answered E_CONFINE_NOT_FOUND. Pure queue state, so it runs before the
-		// shim branch and works the same in ci-shim mode (the shim queue is keyed
-		// on the sentinel path resolved above). Not handled = no queued match: the
+		// answered E_CONFINE_NOT_FOUND. Queue state, so it runs before the shim
+		// branch and works the same in ci-shim mode (the shim queue is keyed on the
+		// sentinel path resolved above). Not handled = no queued match: the
 		// running-job kill below runs unchanged, including for a job granted
 		// between the operator's `--list` and this kill.
-		if cancelled, handled, cancelErr := s.cancelQueuedConfine(path, selector, callerOwner, steal); handled {
+		//
+		// Ambiguity counts the running scopes the kill below would see, found by
+		// its own discovery and selector rule, so a running scope the ledger does
+		// not hold still makes a shared name ambiguous. ci-shim has no scopes:
+		// its only running jobs are the granted waiters the cancel counts itself.
+		var runningScopes func() ([]string, error)
+		if !s.shimMode() {
+			runningScopes = func() ([]string, error) {
+				return runner.RunningConfineScopeIDs(ctx, path, selector, registry)
+			}
+		}
+		if cancelled, handled, cancelErr := s.cancelQueuedConfine(path, selector, callerOwner, steal, runningScopes); handled {
 			if cancelErr != nil {
 				return confineManagementError(cancelErr)
 			}

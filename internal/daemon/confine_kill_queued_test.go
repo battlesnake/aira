@@ -48,9 +48,12 @@ func requireUntouched(t *testing.T, waiter *admitWaiter, want admitWaiterState) 
 // fall-through. Each row builds a FRESH queue, because a cancel mutates it.
 // Mutations this reds against: drop the owner guard (foreign rows answer OK);
 // drop the granted-match count (queued+running twin is cancelled instead of
-// ambiguous); let a name or pid reach a worker (worker rows handled); cancel a
-// sub-reservation (scope-id row answers OK); report handled for a granted-only
-// match (the running job's kill would be swallowed).
+// ambiguous); ignore the discovered running scopes (the disk-only twin is
+// cancelled instead of ambiguous); count the queued job's own discovered scope
+// as a second job (its exact-id row answers ambiguous); let a name or pid reach
+// a worker (worker rows handled); refuse a sub-reservation by exact scope id
+// (its row answers not-OK); report handled for a granted-only match (the
+// running job's kill would be swallowed).
 func TestConfineKillQueuedResolutionAndOwnerGuard(t *testing.T) {
 	type fixture struct {
 		queue                                       *sliceQueue
@@ -90,6 +93,9 @@ func TestConfineKillQueuedResolutionAndOwnerGuard(t *testing.T) {
 		handled  bool
 		want     string
 		target   func(fixture) *admitWaiter
+		// running is what on-disk discovery reports for the selector: running
+		// scopes, including any the ledger does not hold.
+		running func(fixture) []string
 	}{
 		{name: "own job by name", selector: func(fixture) string { return "mine" }, caller: "s-1", handled: true, want: "OK", target: func(f fixture) *admitWaiter { return f.mine }},
 		{name: "own job by supervisor pid", selector: func(fixture) string { return "6001" }, caller: "s-1", handled: true, want: "OK", target: func(f fixture) *admitWaiter { return f.mine }},
@@ -106,7 +112,12 @@ func TestConfineKillQueuedResolutionAndOwnerGuard(t *testing.T) {
 		{name: "already cancelled falls through", selector: func(fixture) string { return "gone" }, caller: "s-1"},
 		{name: "worker by name is not a job-level selector", selector: func(fixture) string { return "aitest-w1" }, caller: "s-1"},
 		{name: "loose worker by pid is not a job-level selector", selector: func(fixture) string { return "6010" }, caller: "s-1"},
-		{name: "sub-reservation by scope id is refused", selector: func(f fixture) string { return f.sub.scopeID }, caller: "s-1", steal: true, handled: true, want: runner.CodeConfineNotQueued, target: func(f fixture) *admitWaiter { return f.sub }},
+		{name: "a queued job and a running scope only on disk are ambiguous", selector: func(fixture) string { return "mine" }, caller: "s-1", handled: true, want: "E_SELECTOR_AMBIGUOUS", target: func(f fixture) *admitWaiter { return f.mine },
+			running: func(fixture) []string { return []string{"CONFINE-mine-7777-zz@s-1"} }},
+		{name: "discovery naming the queued job itself is one job", selector: func(f fixture) string { return f.mine.scopeID }, caller: "s-1", handled: true, want: "OK", target: func(f fixture) *admitWaiter { return f.mine },
+			running: func(f fixture) []string { return []string{f.mine.scopeID} }},
+		{name: "sub-reservation by exact scope id is cancelled", selector: func(f fixture) string { return f.sub.scopeID }, caller: "s-1", handled: true, want: "OK", target: func(f fixture) *admitWaiter { return f.sub }},
+		{name: "sub-reservation of another owner refused", selector: func(f fixture) string { return f.sub.scopeID }, caller: "s-2", handled: true, want: runner.CodeConfineOwnerUnverified, target: func(f fixture) *admitWaiter { return f.sub }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := build()
@@ -114,7 +125,11 @@ func TestConfineKillQueuedResolutionAndOwnerGuard(t *testing.T) {
 			for _, waiter := range f.queue.waiters {
 				before[waiter] = waiter.state
 			}
-			result, handled, err := cancelQueuedConfineLocked(f.queue, test.selector(f), test.caller, test.steal, time.Unix(61010, 0))
+			var running []string
+			if test.running != nil {
+				running = test.running(f)
+			}
+			result, handled, err := cancelQueuedConfineLocked(f.queue, test.selector(f), test.caller, test.steal, running, time.Unix(61010, 0))
 			if handled != test.handled {
 				t.Fatalf("handled=%v (err=%v), want %v", handled, err, test.handled)
 			}
@@ -143,7 +158,7 @@ func TestConfineKillQueuedResolutionAndOwnerGuard(t *testing.T) {
 		})
 	}
 	f := build()
-	_, _, err := cancelQueuedConfineLocked(f.queue, "mixed", "s-1", false, time.Unix(61010, 0))
+	_, _, err := cancelQueuedConfineLocked(f.queue, "mixed", "s-1", false, nil, time.Unix(61010, 0))
 	if err == nil || !strings.Contains(err.Error(), f.queuedTwin.scopeID) || !strings.Contains(err.Error(), f.runningTwin.scopeID) {
 		t.Fatalf("ambiguity refusal must name both the queued and the running job: %v", err)
 	}
@@ -175,7 +190,7 @@ func TestConfineKillQueuedIsLedgerNeutralAndReleasesOnce(t *testing.T) {
 			t.Fatalf("%s: the derived ledger disagrees with the stored one: %d/%d/%d/%d", stage, o, c, v, j)
 		}
 	}
-	if _, handled, err := cancelQueuedConfineLocked(queue, "target", "s-1", false, now); !handled || err != nil {
+	if _, handled, err := cancelQueuedConfineLocked(queue, "target", "s-1", false, nil, now); !handled || err != nil {
 		t.Fatalf("cancel: handled=%v err=%v", handled, err)
 	}
 	requireCancelled(t, target)
@@ -227,7 +242,7 @@ func TestConfineKillQueuedHeadLeavesNoGhost(t *testing.T) {
 	}
 	armed := queue.freezeArmedAt
 
-	if _, handled, err := cancelQueuedConfineLocked(queue, "head", "s-1", false, now); !handled || err != nil {
+	if _, handled, err := cancelQueuedConfineLocked(queue, "head", "s-1", false, nil, now); !handled || err != nil {
 		t.Fatalf("cancel head: handled=%v err=%v", handled, err)
 	}
 	if !queue.freezeArmedAt.Equal(armed) {
@@ -259,7 +274,7 @@ func TestConfineKillQueuedPushedHead(t *testing.T) {
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, jumper)
 
-	if _, handled, err := cancelQueuedConfineLocked(queue, "pushed", "s-1", false, now); !handled || err != nil {
+	if _, handled, err := cancelQueuedConfineLocked(queue, "pushed", "s-1", false, nil, now); !handled || err != nil {
 		t.Fatalf("cancel pushed head: handled=%v err=%v", handled, err)
 	}
 	requireCancelled(t, pushed)
@@ -289,7 +304,7 @@ func TestConfineKillQueuedExclusiveDrainerClearsTheGate(t *testing.T) {
 		t.Fatal("precondition: the drainer holds the exclusive gate")
 	}
 
-	if _, handled, err := cancelQueuedConfineLocked(queue, "bench", "s-1", false, now); !handled || err != nil {
+	if _, handled, err := cancelQueuedConfineLocked(queue, "bench", "s-1", false, nil, now); !handled || err != nil {
 		t.Fatalf("cancel drainer: handled=%v err=%v", handled, err)
 	}
 	if gate := exclusiveGateLocked(queue); gate.draining != nil || gate.holder != nil {
@@ -413,7 +428,7 @@ func TestConfineKillQueuedWireRender(t *testing.T) {
 				}
 			}
 
-			result, handled, err := server.cancelQueuedConfine("/slice", "wired", "s-1", false)
+			result, handled, err := server.cancelQueuedConfine("/slice", "wired", "s-1", false, nil)
 			if !handled || err != nil || result.ScopeID != scopeID {
 				t.Fatalf("cancel: result=%+v handled=%v err=%v", result, handled, err)
 			}
@@ -489,7 +504,7 @@ func TestConfineKillQueuedRacesTheGrant(t *testing.T) {
 			var handled bool
 			var err error
 			cancel := func() {
-				result, handled, err = server.cancelQueuedConfine("/slice", "racer", "s-1", false)
+				result, handled, err = server.cancelQueuedConfine("/slice", "racer", "s-1", false, nil)
 			}
 			order := i % 3
 			switch order {

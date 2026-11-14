@@ -737,6 +737,22 @@ func parseConfineInt(data []byte) (int64, error) {
 	return value, nil
 }
 
+func runningConfineScopeIDs(ctx context.Context, slicePath, selector string, registry []ConfineRegistryEntry) ([]string, error) {
+	listed, err := listConfinesWithDeps(ctx, slicePath, registry, withoutPaneLookup(defaultConfineScanDeps()))
+	if err != nil {
+		return nil, err
+	}
+	if listed.Verdict == "unevaluated" {
+		return nil, fmt.Errorf("%s: confine slice discovery is unevaluated: %s", CodeConfineKillUnconfirmed, listed.Reason)
+	}
+	matches := ConfineKillMatches(listed.Scopes, selector)
+	ids := make([]string, 0, len(matches))
+	for _, record := range matches {
+		ids = append(ids, record.ScopeID)
+	}
+	return ids, nil
+}
+
 func killConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, timeout time.Duration) (ConfineKillResult, error) {
 	return killConfineWithDeps(ctx, slicePath, selector, callerOwner, steal, registry, timeout, defaultConfineScanDeps())
 }
@@ -750,30 +766,9 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 		return ConfineKillResult{}, fmt.Errorf("%s: confine slice discovery is unevaluated: %s", CodeConfineKillUnconfirmed, listed.Reason)
 	}
 	selector = strings.TrimSpace(selector)
-	var matches []ConfineRecord
-	for _, record := range listed.Scopes {
-		// An explicit scope-id always matches — the ONLY way to select a worker row
-		// (S2a Task 10 Step 1).
-		if selector == record.ScopeID {
-			matches = append(matches, record)
-			continue
-		}
-		// A worker scope embeds its PARENT supervisor's pid and a non-unique
-		// aitest-w<seq> name, so a job's sibling workers all match `<supervisor-pid>`
-		// and two suites both mint `aitest-w1`. Filtering worker rows out of the
-		// pid/name selector keeps `--kill <supervisor-pid>` resolving to the parent
-		// (unambiguous) while a worker stays reachable by its explicit scope-id above.
-		if IsAitestWorkerScopeName(record.Name) {
-			continue
-		}
-		pid := ""
-		if record.SupervisorPID != nil {
-			pid = strconv.Itoa(*record.SupervisorPID)
-		}
-		if selector == record.Name || selector == pid {
-			matches = append(matches, record)
-		}
-	}
+	// S2a Task 10 Step 1: an explicit scope-id is the only way to select a worker
+	// row. One rule, shared with the queued cancel's ambiguity check (AIRA-328).
+	matches := ConfineKillMatches(listed.Scopes, selector)
 	if len(matches) == 0 {
 		return ConfineKillResult{}, fmt.Errorf("%s: selector %q matched no confine scope", CodeConfineNotFound, selector)
 	}

@@ -17,13 +17,21 @@ import (
 // first, with --front's selector grammar (confineFrontSelects) and the one shared
 // ownership guard, and reuses the rejection machinery fail-fast built: the
 // waiter goes admitQueued -> admitRejected with admitOutcomeCancelled and its
-// grantedCh is closed, so its own admitConnection answers the client
-// U_ADMIT_CANCELLED and its deferred, state-guarded release removes it.
+// grantedCh is closed, so its own connection answers the client (an admit gets
+// U_ADMIT_CANCELLED, an aitest worker claim a terminal request-invalid
+// operator-cancelled) and its deferred, state-guarded release removes it.
 //
 // The kill never releases the waiter itself. A waiter removed here would wake
 // its admitConnection to a state that is neither granted nor rejected, which
 // returns without a frame; the client would read EOF and RECONNECT into a fresh
 // queue position — the opposite of a cancel.
+//
+// The cancel is also TERMINAL for the scope id, not only for the waiter: the
+// scope id is recorded (recordCancelledScopeLocked) and every later admission
+// carrying it is refused U_ADMIT_CANCELLED at enqueue. A client whose cancel
+// reply was lost reconnects with the same scope id, and without the record that
+// reconnect would queue afresh and run the job the operator was told was
+// cancelled.
 //
 // Ledger: a queued waiter is never granted && accounted, so it carries no
 // charge and the cancel discharges nothing. The head, its bypass budget and the
@@ -31,11 +39,61 @@ import (
 // waiter stops being any of them at once; the queue-level freeze anchor has
 // exactly two writers and this is not one of them.
 
-// cancelQueuedConfine is the locked wrapper: it resolves and cancels under
-// queue.mu and kicks the evaluator (outside the lock) after a cancel, so the job
-// behind the cancelled one is evaluated at once. handled is false when no QUEUED
+// cancelledScopeLimit bounds the cancelled-scope record. Scope ids are unique per
+// launch, so an entry only matters while its own client may still be
+// reconnecting; 1024 cancels later it is long settled. The bound keeps a
+// long-lived daemon's memory flat.
+const cancelledScopeLimit = 1024
+
+// recordCancelledScopeLocked records scopeID as cancelled. admitRegistryMu must
+// be held.
+func (s *Server) recordCancelledScopeLocked(scopeID string) {
+	if scopeID == "" {
+		return
+	}
+	if s.cancelledScopes == nil {
+		s.cancelledScopes = make(map[string]struct{})
+	}
+	if _, seen := s.cancelledScopes[scopeID]; seen {
+		return
+	}
+	s.cancelledScopes[scopeID] = struct{}{}
+	s.cancelledScopeOrder = append(s.cancelledScopeOrder, scopeID)
+	if len(s.cancelledScopeOrder) > cancelledScopeLimit {
+		delete(s.cancelledScopes, s.cancelledScopeOrder[0])
+		s.cancelledScopeOrder = s.cancelledScopeOrder[1:]
+	}
+}
+
+// scopeCancelledLocked reports whether scopeID was cancelled. admitRegistryMu
+// must be held; a nil map reads false.
+func (s *Server) scopeCancelledLocked(scopeID string) bool {
+	_, cancelled := s.cancelledScopes[scopeID]
+	return scopeID != "" && cancelled
+}
+
+// cancelQueuedConfine is the locked wrapper. handled is false when no QUEUED
 // waiter matched: the caller then runs the running-job kill unchanged.
-func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal bool) (runner.ConfineKillResult, bool, error) {
+//
+// runningScopes discovers the RUNNING scopes on disk the selector names (nil:
+// none exist outside the ledger, as in ci-shim mode). It is read only when a
+// queued waiter matches, and OUTSIDE the queue lock (it is filesystem I/O), so
+// the queued target is resolved again under the lock afterwards: a waiter
+// granted meanwhile is counted as running there, a waiter that left is simply
+// not found. A discovery that fails refuses the cancel rather than guessing the
+// selector is unambiguous.
+func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal bool, runningScopes func() ([]string, error)) (runner.ConfineKillResult, bool, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" || !s.queuedConfineMatches(path, selector) {
+		return runner.ConfineKillResult{}, false, nil
+	}
+	var running []string
+	if runningScopes != nil {
+		var err error
+		if running, err = runningScopes(); err != nil {
+			return runner.ConfineKillResult{}, true, err
+		}
+	}
 	s.admitRegistryMu.Lock()
 	queue := s.admitQueues[path]
 	if queue == nil {
@@ -43,7 +101,12 @@ func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal b
 		return runner.ConfineKillResult{}, false, nil
 	}
 	queue.mu.Lock()
-	result, handled, err := cancelQueuedConfineLocked(queue, selector, callerOwner, steal, s.admitNowTime())
+	result, handled, err := cancelQueuedConfineLocked(queue, selector, callerOwner, steal, running, s.admitNowTime())
+	if handled && err == nil {
+		// Under admitRegistryMu, which every enqueue takes first, so no
+		// reconnect can slip between the cancel and its record.
+		s.recordCancelledScopeLocked(result.ScopeID)
+	}
 	queue.mu.Unlock()
 	s.admitRegistryMu.Unlock()
 	if handled && err == nil {
@@ -52,20 +115,46 @@ func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal b
 	return result, handled, err
 }
 
+// queuedConfineMatches is the cheap pre-check: does selector name any QUEUED
+// waiter on path's queue right now?
+func (s *Server) queuedConfineMatches(path, selector string) bool {
+	s.admitRegistryMu.Lock()
+	defer s.admitRegistryMu.Unlock()
+	queue := s.admitQueues[path]
+	if queue == nil {
+		return false
+	}
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	for _, waiter := range queue.waiters {
+		if waiter != nil && waiter.state == admitQueued && confineFrontSelects(waiter, selector) {
+			return true
+		}
+	}
+	return false
+}
+
 // cancelQueuedConfineLocked is the resolution and the effect. queue.mu must be
 // held.
 //
-// Names are not unique, so a name that matches a queued job AND a running
-// (granted) job is AMBIGUOUS, never silently resolved to the queued one: before
-// AIRA-328 that selector killed the running job. Running jobs are counted from
-// the daemon's granted waiters, under the same lock. A selector matching only
-// running jobs is not handled here.
-func cancelQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, steal bool, now time.Time) (runner.ConfineKillResult, bool, error) {
+// Names are not unique, so a selector that matches a queued job AND any running
+// job is AMBIGUOUS, never silently resolved to the queued one: before AIRA-328
+// that selector killed the running job. Running jobs are the daemon's granted
+// waiters (under this lock) plus running, the scopes discovery found on disk,
+// which include any the ledger does not hold. Jobs are counted once per scope
+// id. A selector matching only running jobs is not handled here.
+//
+// An aitest worker's claim (a sub-reservation) is reached only by its exact
+// scope id (confineFrontSelects) and is cancelled like any other waiter; its
+// worker-admit connection renders the cancel as a terminal request-invalid, so
+// the claim is never retried.
+func cancelQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, steal bool, running []string, now time.Time) (runner.ConfineKillResult, bool, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
 		return runner.ConfineKillResult{}, false, nil
 	}
-	var queued, granted []*admitWaiter
+	var queued []*admitWaiter
+	matched := map[string]struct{}{}
 	for _, waiter := range queue.waiters {
 		if waiter == nil || !confineFrontSelects(waiter, selector) {
 			continue
@@ -73,29 +162,28 @@ func cancelQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, 
 		switch waiter.state {
 		case admitQueued:
 			queued = append(queued, waiter)
+			matched[waiter.scopeID] = struct{}{}
 		case admitGranted:
-			granted = append(granted, waiter)
+			matched[waiter.scopeID] = struct{}{}
 		}
 	}
 	if len(queued) == 0 {
 		return runner.ConfineKillResult{}, false, nil
 	}
-	if len(queued)+len(granted) > 1 {
-		ids := make([]string, 0, len(queued)+len(granted))
-		for _, waiter := range append(queued, granted...) {
-			ids = append(ids, waiter.scopeID)
+	for _, scopeID := range running {
+		if scopeID != "" {
+			matched[scopeID] = struct{}{}
+		}
+	}
+	if len(queued) > 1 || len(matched) > 1 {
+		ids := make([]string, 0, len(matched))
+		for scopeID := range matched {
+			ids = append(ids, scopeID)
 		}
 		sort.Strings(ids)
 		return runner.ConfineKillResult{}, true, fmt.Errorf("E_SELECTOR_AMBIGUOUS: selector %q matched %s", selector, strings.Join(ids, ", "))
 	}
 	target := queued[0]
-	if target.isSubReservation() {
-		// Reached only by its exact scope id (an aitest worker's claim). Its
-		// worker-admit path renders any non-grant as a retriable denial, so a
-		// cancel would only re-queue it; it follows its parent, which is what to
-		// kill.
-		return runner.ConfineKillResult{}, true, fmt.Errorf("%s: %s is a sub-reservation of %s; it follows its parent, so kill the parent job instead", runner.CodeConfineNotQueued, target.scopeID, target.parentScopeID)
-	}
 	name, _, _, owner, _ := runner.ParseConfineScopeID(target.scopeID)
 	if strings.TrimSpace(owner) == "" {
 		owner = runner.ConfineUnknownOwner

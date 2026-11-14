@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1030,4 +1031,44 @@ func ReadConfineCPUFrame(slicePath string) ConfineCPUFrame {
 
 func KillConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry) (ConfineKillResult, error) {
 	return killConfine(ctx, slicePath, selector, callerOwner, steal, registry, 2*time.Second)
+}
+
+// ConfineKillMatches is the running-job `--kill` selector rule over discovered
+// scope rows, shared by the kill itself and by the daemon's queued-cancel
+// ambiguity check (AIRA-328), so the two can never disagree about which running
+// jobs a selector names. An explicit scope id always matches, and is the ONLY way
+// to reach an aitest worker row: a worker embeds its parent supervisor's pid and
+// a non-unique aitest-w<seq> name, so letting pid or name reach it would make
+// `--kill <supervisor-pid>` ambiguous between a job and its own workers.
+func ConfineKillMatches(records []ConfineRecord, selector string) []ConfineRecord {
+	selector = strings.TrimSpace(selector)
+	var matches []ConfineRecord
+	for _, record := range records {
+		if selector == record.ScopeID {
+			matches = append(matches, record)
+			continue
+		}
+		if IsAitestWorkerScopeName(record.Name) {
+			continue
+		}
+		pid := ""
+		if record.SupervisorPID != nil {
+			pid = strconv.Itoa(*record.SupervisorPID)
+		}
+		if selector == record.Name || selector == pid {
+			matches = append(matches, record)
+		}
+	}
+	return matches
+}
+
+// RunningConfineScopeIDs returns the scope ids of the RUNNING confine scopes on
+// disk under slicePath that selector names, by the running kill's own discovery
+// and rule (AIRA-328). The daemon's queued cancel reads it so a name shared by a
+// queued job and a running scope the ledger does not hold (a job mid restart
+// recovery, say) is refused as ambiguous rather than resolved to the queued one.
+// A discovery that cannot be established is an error, never an empty list: an
+// empty list would read as "nothing else matches".
+func RunningConfineScopeIDs(ctx context.Context, slicePath, selector string, registry []ConfineRegistryEntry) ([]string, error) {
+	return runningConfineScopeIDs(ctx, slicePath, selector, registry)
 }

@@ -1852,6 +1852,11 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if enqueueErr != nil {
 		if code == CodeAdmitTooLarge {
 			s.writeAdmitRejection(conn, code, admitRejection{Required: reserve, Ceiling: s.admitCeiling(path, maximum), Basis: basis})
+		} else if code == CodeAdmitCancelled {
+			// AIRA-328. A reconnect of a job already cancelled while queued (its
+			// first cancel reply was lost): the same terminal refusal, so the
+			// client stops instead of queueing afresh.
+			s.writeAdmitRejection(conn, code, admitRejection{Required: reserve, Ceiling: s.admitCeiling(path, maximum), Basis: "reject:cancelled"})
 		} else {
 			s.writeAdmitError(conn, code, enqueueErr.Error())
 		}
@@ -2107,6 +2112,14 @@ func (s *Server) enqueueReDeclare(path string, reserve int64, basis string, requ
 
 func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	s.admitRegistryMu.Lock()
+	// AIRA-328. FIRST, before the idempotent SET and its duplicate-scope refusal:
+	// an operator cancelled this scope while it was queued, and the cancel is
+	// terminal for the scope id. Without this a client whose cancel reply was
+	// lost would reconnect (same scope id) into a fresh queue position and run.
+	if s.scopeCancelledLocked(request.scopeID) {
+		s.admitRegistryMu.Unlock()
+		return nil, nil, CodeAdmitCancelled, fmt.Errorf("%s: scope %s was cancelled by `aira confine --kill` while queued", CodeAdmitCancelled, request.scopeID)
+	}
 	if s.admitQueues == nil {
 		s.admitQueues = make(map[string]*sliceQueue)
 	}
