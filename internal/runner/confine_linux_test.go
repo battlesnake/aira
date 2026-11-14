@@ -3214,3 +3214,30 @@ func TestOOMAdvisoryOnlyClaimsRecordingForAnAcknowledgedPeak(t *testing.T) {
 		})
 	}
 }
+
+// verifies: AIRA-335 -- under an overridden HOME the unit-absent refusal names
+// the file it checked and the HOME it came from, and says to run aira with the
+// real HOME, because re-running `aira install` there would install into the
+// wrong HOME.
+func TestUnitAbsentRefusalNamesTheFileCheckedAndHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	deps := confineDeps{
+		managedUnitPresent:    func(string) (bool, error) { return false, nil },
+		resolveSlicePathExact: func(string) (string, error) { return "/cg/aira.slice", nil },
+	}
+	_, path, err := resolveDefaultConfineSlice(deps)
+	if err == nil || path != "" {
+		t.Fatalf("resolution=(%q,%v), want a refusal", path, err)
+	}
+	for _, want := range []string{
+		"aira-managed unit is absent",
+		"checked " + filepath.Join(home, ".config", "systemd", "user", "aira.slice"),
+		"(HOME=" + home + ")",
+		"run aira with your real HOME",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %q does not carry %q", err, want)
+		}
+	}
+}

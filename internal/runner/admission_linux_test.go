@@ -691,3 +691,14 @@ func TestRunSaturatedAdmissionIsTerminalBeforeScopeOrLedger(t *testing.T) {
 		t.Fatalf("terminal run rejection events=%d err=%v", len(events), err)
 	}
 }
+
+// verifies: AIRA-335 -- the daemon-wait line names the socket it dials, so a
+// wait on a socket no daemon serves diagnoses itself.
+func TestWarnDaemonWaitNamesTheSocket(t *testing.T) {
+	var buffer bytes.Buffer
+	runner := &Runner{diagnostics: &buffer, admitSocketPath: "/run/user/1000/aira/0123abcd/daemon.sock"}
+	runner.warnDaemonWait(30 * time.Second)
+	if !strings.Contains(buffer.String(), "reachable at /run/user/1000/aira/0123abcd/daemon.sock (waited 30s)") {
+		t.Fatalf("wait line %q does not name the socket", buffer.String())
+	}
+}

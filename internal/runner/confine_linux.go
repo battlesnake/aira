@@ -348,7 +348,7 @@ func resolveDefaultConfineSlice(deps confineDeps) (string, string, error) {
 	airaPath, airaErr := deps.resolveSlicePathExact(DefaultConfineSlice)
 	if airaErr == nil {
 		if !managed {
-			return DefaultConfineSlice, "", errors.New("aira.slice cgroup is active but its aira-managed unit is absent; re-run aira install")
+			return DefaultConfineSlice, "", unitAbsentError(DefaultConfineSlice)
 		}
 		return DefaultConfineSlice, airaPath, nil
 	}
@@ -368,16 +368,37 @@ func resolveDefaultConfineSlice(deps confineDeps) (string, string, error) {
 	return DefaultConfineSlice, "", errors.New("aira.slice not found (run 'aira install')")
 }
 
-func managedConfineUnitPresent(unit string) (bool, error) {
-	home := strings.TrimSpace(os.Getenv("HOME"))
+// managedConfineUnitFile is the unit file managedConfineUnitPresent checks and
+// the HOME it was resolved from.
+func managedConfineUnitFile(unit string) (path, home string, err error) {
+	home = strings.TrimSpace(os.Getenv("HOME"))
 	if home == "" {
-		var err error
 		home, err = os.UserHomeDir()
 		if err != nil {
-			return false, err
+			return "", "", err
 		}
 	}
-	path := filepath.Join(home, ".config", "systemd", "user", unit)
+	return filepath.Join(home, ".config", "systemd", "user", unit), home, nil
+}
+
+// unitAbsentError (AIRA-335) names the file checked and the HOME it came from:
+// under an overridden HOME the advice to re-run aira install would install into
+// the wrong HOME.
+func unitAbsentError(unit string) error {
+	path, home, err := managedConfineUnitFile(unit)
+	if err != nil {
+		path, home = "unevaluated", "unevaluated"
+	}
+	return fmt.Errorf("aira.slice cgroup is active but its aira-managed unit is absent: checked %s (HOME=%s); "+
+		"if HOME is overridden for this command, run aira with your real HOME and set the override inside the job "+
+		"(aira confine -- env HOME=... <cmd>); otherwise re-run aira install", path, home)
+}
+
+func managedConfineUnitPresent(unit string) (bool, error) {
+	path, _, err := managedConfineUnitFile(unit)
+	if err != nil {
+		return false, err
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil

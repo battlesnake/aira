@@ -696,7 +696,13 @@ func (r *Runner) warnDaemonWait(waited time.Duration) {
 	if r.diagnostics == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(r.diagnostics, "aira: waiting for the memory-admission daemon to become reachable (waited %s); the launch is held, not run ungoverned\n", waited.Round(time.Second))
+	// AIRA-335: name the socket dialled, so a wait on a socket no daemon serves
+	// (a private XDG_STATE_HOME or XDG_RUNTIME_DIR) diagnoses itself.
+	socket := r.admitSocketPath
+	if strings.TrimSpace(socket) == "" {
+		socket = "unevaluated"
+	}
+	_, _ = fmt.Fprintf(r.diagnostics, "aira: waiting for the memory-admission daemon to become reachable at %s (waited %s); the launch is held, not run ungoverned\n", socket, waited.Round(time.Second))
 }
 
 const mathMaxInt64 = int64(^uint64(0) >> 1)
