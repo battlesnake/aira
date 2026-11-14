@@ -92,8 +92,8 @@ func (s *recordingStore) CountFindings(string, string) (store.CountResult, error
 func (s *recordingStore) AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error) {
 	return store.RantAddResult{}, s.fail("AddRant")
 }
-func (s *recordingStore) ListRants(domain.RantListOptions) ([]domain.Rant, error) {
-	return nil, s.fail("ListRants")
+func (s *recordingStore) ListRants(domain.RantListOptions) (store.RantPage, error) {
+	return store.RantPage{}, s.fail("ListRants")
 }
 func (s *recordingStore) GetRant(string) (domain.Rant, error) {
 	return domain.Rant{}, s.fail("GetRant")

@@ -212,7 +212,7 @@ type gateActionInputStore interface {
 
 type rantStore interface {
 	AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error)
-	ListRants(domain.RantListOptions) ([]domain.Rant, error)
+	ListRants(domain.RantListOptions) (store.RantPage, error)
 	GetRant(string) (domain.Rant, error)
 	ReviewRant(context.Context, string, domain.RantReviewInput) (store.RantReviewResult, error)
 	RedactRant(context.Context, string) (store.EventKey, error)
@@ -796,8 +796,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
-		"rant": {Name: "rant", Usage: "rant [--project ID | --prefix P] <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls|get|review|redact ...", GitContext: true,
-			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", string(domain.RantSeverityPapercut), string(domain.RantSeverityAnnoyance), string(domain.RantSeverityBlocker)), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference"), stringSpec("project", false, false, "Target project: exact or unambiguous project ID"), stringSpec("prefix", false, false, "Target project: an ID prefix it owns")},
+		"rant": {Name: "rant", Usage: "rant [--project ID | --prefix P] <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls [--status unreviewed|reviewed|all --severity S|unset --tag T --actor A --grep TEXT --since SEQ --limit N --newest --full | --by tag|actor|severity] | rant get|review|redact ...", GitContext: true,
+			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", string(domain.RantSeverityPapercut), string(domain.RantSeverityAnnoyance), string(domain.RantSeverityBlocker)), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), stringSpec("severity_filter", false, false, "ls (CLI --severity): only rants with this severity; unset = rants that recorded none", string(domain.RantSeverityPapercut), string(domain.RantSeverityAnnoyance), string(domain.RantSeverityBlocker), domain.RantSeverityUnset), stringSpec("status", false, false, "ls: review status to list (default unreviewed, the work queue; reviewed = at least one review row)", domain.RantStatusUnreviewed, domain.RantStatusReviewed, domain.RantStatusAll), stringSpec("actor", false, false, "ls: exact recorded actor"), stringSpec("grep", false, false, "ls: literal substring of the body, case-insensitive (Unicode simple case folding; no wildcards). Redacted rants have no searchable text and are counted in unsearched_redacted, never as matches"), stringSpec("since", false, false, "ls: exclusive rant sequence cursor; pass the previous page's next_since to continue"), stringSpec("limit", false, false, "ls: rows per page, 1..200 (default 50)"), boolSpec("newest", false, false, "ls: take the LAST limit matches (still listed oldest first; no next_since)"), boolSpec("full", false, false, "ls: full rows (whole body, git context, reviews) instead of compact rows with a 240-rune body preview"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference"), stringSpec("project", false, false, "Target project: exact or unambiguous project ID"), stringSpec("prefix", false, false, "Target project: an ID prefix it owns")},
 			MCPTool: "aira_rant", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 				// A target selector names ANOTHER project's store, which only the
 				// daemon can resolve and build (AIRA-179): it owns the machine-wide
@@ -845,16 +845,27 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				case "ls", "list":
 					by := stringArg(args, "by")
 					tags := stringSlice(args, "tags")
-					unreviewed := boolArg(args, "unreviewed")
-					sinceRaw := stringArg(args, "since")
+					status, severity := stringArg(args, "status"), stringArg(args, "severity_filter")
+					actor, grep := strings.TrimSpace(stringArg(args, "actor")), stringArg(args, "grep")
+					sinceRaw, limitRaw := stringArg(args, "since"), stringArg(args, "limit")
+					newest, full := boolArg(args, "newest"), boolArg(args, "full")
 					if err := refuseTarget(); err != nil {
 						return nil, err
 					}
 					if by != "" {
 						// A distribution aggregates every rant; combining it with
-						// a filter would silently discard the filter.
-						if len(tags) > 0 || unreviewed || sinceRaw != "" {
-							return nil, errors.New(domain.CodeRantInvalid + ": --by aggregates every rant and cannot be combined with --tag/--unreviewed/--since")
+						// a filter or a page option would silently discard it.
+						given := []string{}
+						for _, option := range []struct {
+							name string
+							set  bool
+						}{{"--status", status != ""}, {"--severity", severity != ""}, {"--tag", len(tags) > 0}, {"--actor", actor != ""}, {"--grep", grep != ""}, {"--since", sinceRaw != ""}, {"--limit", limitRaw != ""}, {"--newest", newest}, {"--full", full}} {
+							if option.set {
+								given = append(given, option.name)
+							}
+						}
+						if len(given) > 0 {
+							return nil, fmt.Errorf("%s: rant ls --by aggregates every rant and cannot be combined with %s (--by refuses --status, --severity, --tag, --actor, --grep, --since, --limit, --newest and --full)", domain.CodeRantInvalid, strings.Join(given, " "))
 						}
 						return rants.CountRants("", by)
 					}
@@ -862,18 +873,42 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					if err != nil {
 						return nil, err
 					}
+					limit := 0
+					if trimmed := strings.TrimSpace(limitRaw); trimmed != "" {
+						parsed, err := strconv.Atoi(trimmed)
+						if err != nil || parsed < 1 || parsed > domain.MaxRantListLimit {
+							return nil, fmt.Errorf("%s: rant ls --limit %q is invalid; allowed: an integer 1..%d", domain.CodeRantInvalid, limitRaw, domain.MaxRantListLimit)
+						}
+						limit = parsed
+					}
 					tagFilter := ""
 					if len(tags) > 0 {
 						if len(tags) > 1 {
-							return nil, errors.New(domain.CodeRantInvalid + ": rant ls --tag accepts a single tag")
+							return nil, fmt.Errorf("%s: rant ls --tag accepts a single tag, got %d (%s)", domain.CodeRantInvalid, len(tags), strings.Join(tags, ", "))
 						}
 						// A tag that normalises to empty (e.g. "---") must not
 						// silently disable the filter and return every rant.
 						if tagFilter = domain.NormaliseRantTag(tags[0]); tagFilter == "" {
-							return nil, errors.New(domain.CodeRantInvalid + ": --tag filter is empty after normalisation")
+							return nil, fmt.Errorf("%s: rant ls --tag %q is empty after normalisation", domain.CodeRantInvalid, tags[0])
 						}
 					}
-					return rants.ListRants(domain.RantListOptions{Unreviewed: unreviewed, Since: since, Tag: tagFilter})
+					page, err := rants.ListRants(domain.RantListOptions{Status: status, Severity: severity, Tag: tagFilter, Actor: actor, Grep: grep, Since: since, Limit: limit, Newest: newest})
+					if err != nil {
+						return nil, err
+					}
+					var rows any = page.Rows
+					if !full {
+						summaries := make([]domain.RantSummary, 0, len(page.Rows))
+						for _, rant := range page.Rows {
+							summaries = append(summaries, rant.Summary())
+						}
+						rows = summaries
+					}
+					data := map[string]any{"rows": rows, "total": page.Total, "returned": len(page.Rows), "truncated": page.Truncated, "next_since": page.NextSince}
+					if page.UnsearchedRedacted != nil {
+						data["unsearched_redacted"] = *page.UnsearchedRedacted
+					}
+					return data, nil
 				case "get":
 					selector := stringArg(args, "selector")
 					if err := refuseTarget(); err != nil {
@@ -2508,7 +2543,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"create": {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
 		"rant": {summary: "Capture and review agent friction", safety: SafetyMutate, operations: []OperationSpec{
 			{Name: "capture", Summary: "Capture unfiltered friction", Safety: SafetyMutate, Args: []OperationArg{{Name: "text", Required: true}, {Name: "tags"}, {Name: "severity"}, {Name: "refs"}, {Name: "idempotency_key"}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"capture", "slow tests wasted a retry", "--tag", "slow-tests"}},
-			{Name: "ls", Summary: "List or aggregate recorded rants", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "unreviewed"}, {Name: "since"}, {Name: "tags"}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"ls", "--unreviewed"}},
+			{Name: "ls", Summary: "List one page of rants (default: unreviewed, oldest first, 50 compact rows) with total, truncated and next_since; or aggregate every rant with --by", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "status"}, {Name: "severity_filter"}, {Name: "tags"}, {Name: "actor"}, {Name: "grep"}, {Name: "since"}, {Name: "limit"}, {Name: "newest"}, {Name: "full"}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"ls", "--status", "all", "--grep", "flaky", "--limit", "20"}},
 			{Name: "get", Summary: "Read one rant including untrusted prose", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"get", "RANT-1"}},
 			{Name: "review", Summary: "Append a review observation", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "outcome"}, {Name: "note"}, {Name: "resolved_by"}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"review", "RANT-1", "--outcome", "planned"}},
 			{Name: "redact", Summary: "Tombstone a secret-bearing rant body", Safety: SafetyMutate, Destructive: true, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "project"}, {Name: "prefix"}}, Example: []string{"redact", "RANT-1"}},
@@ -2697,7 +2732,7 @@ func parseRantSince(value string) (int64, error) {
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed < 0 {
-		return 0, errors.New("E_RANT_INVALID: --since requires a non-negative integer")
+		return 0, fmt.Errorf("E_RANT_INVALID: rant ls --since %q is invalid; it requires a non-negative integer", value)
 	}
 	return parsed, nil
 }

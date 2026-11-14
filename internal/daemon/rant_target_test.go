@@ -71,7 +71,7 @@ func decodeRant(t *testing.T, response core.Response) domain.Rant {
 	return envelope.Rant
 }
 
-// decodeRantListing reads `rant ls`'s bare array, returning the raw JSON too so
+// decodeRantListing reads `rant ls`'s rows (AIRA-327 envelope), returning the raw JSON too so
 // a failure names what was actually listed rather than only a count.
 func decodeRantListing(t *testing.T, response core.Response) ([]domain.Rant, []byte) {
 	t.Helper()
@@ -82,11 +82,14 @@ func decodeRantListing(t *testing.T, response core.Response) ([]domain.Rant, []b
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rants []domain.Rant
-	if err := json.Unmarshal(raw, &rants); err != nil {
+	var listing struct {
+		Rows      []domain.Rant `json:"rows"`
+		Truncated bool          `json:"truncated"`
+	}
+	if err := json.Unmarshal(raw, &listing); err != nil || listing.Rows == nil || listing.Truncated {
 		t.Fatalf("decode rant listing %s: %v", raw, err)
 	}
-	return rants, raw
+	return listing.Rows, raw
 }
 
 func callerGitContext(scope WorktreeScope) gitcontext.GitContext {
@@ -157,7 +160,7 @@ func TestRantTargetSelectorFilesInTheTargetProject(t *testing.T) {
 	if !got.OK || decodeRant(t, got).OriginProjectID != caller.ProjectID {
 		t.Fatalf("targeted get: %+v", got)
 	}
-	local := rantExchange(t, paths, caller, core.Request{Verb: "rant", Args: map[string]any{"subverb": "ls"}})
+	local := rantExchange(t, paths, caller, core.Request{Verb: "rant", Args: map[string]any{"subverb": "ls", "status": "all"}})
 	if !local.OK {
 		t.Fatalf("local ls: %+v", local)
 	}
@@ -165,7 +168,7 @@ func TestRantTargetSelectorFilesInTheTargetProject(t *testing.T) {
 		t.Fatalf("the redirected rant also landed locally: %s", raw)
 	}
 	// And it is a first-class rant of the target's, numbered by the target.
-	targetRants, rawTarget := decodeRantListing(t, rantExchange(t, paths, target, core.Request{Verb: "rant", Args: map[string]any{"subverb": "ls"}}))
+	targetRants, rawTarget := decodeRantListing(t, rantExchange(t, paths, target, core.Request{Verb: "rant", Args: map[string]any{"subverb": "ls", "status": "all"}}))
 	if len(targetRants) != 1 || targetRants[0].ID != filed.ID || targetRants[0].OriginProjectID != caller.ProjectID {
 		t.Fatalf("target listing = %s", rawTarget)
 	}
@@ -227,7 +230,7 @@ func TestRantTargetSelectorRefusalsAreInherited(t *testing.T) {
 		}
 	}
 	// A refused target files nothing, anywhere.
-	local := rantExchange(t, paths, caller, core.Request{Verb: "rant", Args: map[string]any{"subverb": "ls"}})
+	local := rantExchange(t, paths, caller, core.Request{Verb: "rant", Args: map[string]any{"subverb": "ls", "status": "all"}})
 	if listing, raw := decodeRantListing(t, local); len(listing) != 0 {
 		t.Fatalf("a refused target still filed something locally: %s", raw)
 	}

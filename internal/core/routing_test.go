@@ -621,6 +621,9 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 			base["idempotency_key"] = ""
 			base["by"] = ""
 			base["since"] = "0"
+			// status is an ls filter enum on this verb (AIRA-327); the
+			// shared fixture's "planned" is another verb's vocabulary.
+			base["status"] = "all"
 		case "find":
 			base["selector"] = findingID
 			base["by"] = "source"

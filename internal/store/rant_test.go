@@ -402,11 +402,11 @@ func TestRantListUnreviewedSinceAndCountByActor(t *testing.T) {
 	if _, err := s.ReviewRant(context.Background(), one.Rant.ID, domain.RantReviewInput{Reviewer: "owner"}); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.ListRants(domain.RantListOptions{Unreviewed: true, Since: one.Rant.Seq})
+	page, err := s.ListRants(domain.RantListOptions{Status: domain.RantStatusUnreviewed, Since: one.Rant.Seq})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].ID != two.Rant.ID {
+	if rows := page.Rows; len(rows) != 1 || rows[0].ID != two.Rant.ID {
 		t.Fatalf("rows = %#v", rows)
 	}
 	count, err := s.CountRants("", "actor")
@@ -487,7 +487,8 @@ func TestRantListByTagAndCountBySeverity(t *testing.T) {
 
 	// ls --tag restricts to rants carrying the tag; a non-existent tag is an
 	// honest empty result, not the whole list.
-	infra, err := s.ListRants(domain.RantListOptions{Tag: "infra"})
+	infraPage, err := s.ListRants(domain.RantListOptions{Status: domain.RantStatusAll, Tag: "infra"})
+	infra := infraPage.Rows
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,15 +500,15 @@ func TestRantListByTagAndCountBySeverity(t *testing.T) {
 			t.Fatalf("ls --tag infra returned a rant without the tag: %#v", r.Tags)
 		}
 	}
-	if none, err := s.ListRants(domain.RantListOptions{Tag: "nonexistent"}); err != nil || len(none) != 0 {
-		t.Fatalf("ls --tag nonexistent = %v len=%d (want honest empty)", err, len(none))
+	if none, err := s.ListRants(domain.RantListOptions{Status: domain.RantStatusAll, Tag: "nonexistent"}); err != nil || len(none.Rows) != 0 || none.Total != 0 {
+		t.Fatalf("ls --tag nonexistent = %v %#v (want honest empty)", err, none)
 	}
 	// A filter typed "Slow Tests" matches the stored normalised "slow-tests".
 	if got := domain.NormaliseRantTag("Slow Tests"); got != "slow-tests" {
 		t.Fatalf("NormaliseRantTag(\"Slow Tests\") = %q, want slow-tests", got)
 	}
-	if slow, err := s.ListRants(domain.RantListOptions{Tag: domain.NormaliseRantTag("Slow Tests")}); err != nil || len(slow) != 1 {
-		t.Fatalf("ls --tag 'Slow Tests' = %v len=%d, want 1", err, len(slow))
+	if slow, err := s.ListRants(domain.RantListOptions{Status: domain.RantStatusAll, Tag: domain.NormaliseRantTag("Slow Tests")}); err != nil || len(slow.Rows) != 1 {
+		t.Fatalf("ls --tag 'Slow Tests' = %v %#v, want 1", err, slow)
 	}
 	// count --by severity groups honestly, including the empty-severity group.
 	count, err := s.CountRants("", "severity")
@@ -530,16 +531,16 @@ func TestRantListTagFilterComposesWithUnreviewedAndSince(t *testing.T) {
 		t.Fatal(err)
 	}
 	// tag AND unreviewed composes: only the unreviewed infra rant.
-	if rows, err := s.ListRants(domain.RantListOptions{Tag: "infra", Unreviewed: true}); err != nil || len(rows) != 1 || rows[0].ID != b.Rant.ID {
-		t.Fatalf("infra+unreviewed = %v %#v", err, rows)
+	if page, err := s.ListRants(domain.RantListOptions{Tag: "infra", Status: domain.RantStatusUnreviewed}); err != nil || len(page.Rows) != 1 || page.Rows[0].ID != b.Rant.ID {
+		t.Fatalf("infra+unreviewed = %v %#v", err, page)
 	}
 	// tag AND since composes: only the infra rant after a's seq.
-	if rows, err := s.ListRants(domain.RantListOptions{Tag: "infra", Since: a.Rant.Seq}); err != nil || len(rows) != 1 || rows[0].ID != b.Rant.ID {
-		t.Fatalf("infra+since = %v %#v", err, rows)
+	if page, err := s.ListRants(domain.RantListOptions{Status: domain.RantStatusAll, Tag: "infra", Since: a.Rant.Seq}); err != nil || len(page.Rows) != 1 || page.Rows[0].ID != b.Rant.ID {
+		t.Fatalf("infra+since = %v %#v", err, page)
 	}
 	// All three filters compose simultaneously.
-	if rows, err := s.ListRants(domain.RantListOptions{Tag: "infra", Unreviewed: true, Since: a.Rant.Seq}); err != nil || len(rows) != 1 || rows[0].ID != b.Rant.ID {
-		t.Fatalf("infra+unreviewed+since = %v %#v", err, rows)
+	if page, err := s.ListRants(domain.RantListOptions{Tag: "infra", Status: domain.RantStatusUnreviewed, Since: a.Rant.Seq}); err != nil || len(page.Rows) != 1 || page.Rows[0].ID != b.Rant.ID {
+		t.Fatalf("infra+unreviewed+since = %v %#v", err, page)
 	}
 }
 

@@ -835,7 +835,7 @@ var parseArgsAllowedOptions = map[string]map[string]bool{
 	"init":   {"project": true, "prefixes": true, "id-prefix": true},
 	"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
 	"create": {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
-	"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
+	"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "status": true, "actor": true, "grep": true, "since": true, "limit": true, "newest": true, "full": true, "outcome": true, "note": true, "resolved-by": true, "project": true, "prefix": true},
 	"new":    {"kind": true, "severity": true, "labels": true, "body": true, "milestone": true, "hold": true},
 	"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 	"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
@@ -941,7 +941,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		if name == "help" {
 			return nil, nil, &helpRequestError{flag: "--help"}
 		}
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || ((name == "reasoning-subset" || name == "resolve-ticket") && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") || (name == "hold" && (verb == "create" || verb == "new")) {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "tickets" && verb == "import") || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && (verb == "run-input" || verb == "confine-input")) || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && (verb == "run-log" || verb == "confine-log")) || ((name == "reasoning-subset" || name == "resolve-ticket") && verb == "spend") || (name == "all" && verb == "test-report") || ((name == "newest" || name == "full") && verb == "rant") || (name == "hold" && (verb == "create" || verb == "new")) {
 			options[name] = "true"
 			continue
 		}
@@ -2937,16 +2937,13 @@ func buildRequestArgs(verb string, positional []string, options map[string]strin
 			if len(positional) != 1 {
 				return core.Request{}, fmt.Errorf("rant ls accepts no positional arguments")
 			}
-			args["subverb"], args["by"], args["unreviewed"] = "ls", options["by"], options["unreviewed"] == "true"
+			// Every value is forwarded verbatim; the core owns parsing and the
+			// refusals, so the CLI and MCP faces refuse the same faults.
+			args["subverb"], args["by"], args["status"], args["severity_filter"] = "ls", options["by"], options["status"], options["severity"]
+			args["actor"], args["grep"], args["since"], args["limit"] = options["actor"], options["grep"], options["since"], options["limit"]
+			args["newest"], args["full"] = options["newest"] == "true", options["full"] == "true"
 			if tags := splitOptionList(options["tag"]); len(tags) > 0 {
 				args["tags"] = tags
-			}
-			if options["since"] != "" {
-				value, err := strconv.ParseInt(options["since"], 10, 64)
-				if err != nil || value < 0 {
-					return core.Request{}, fmt.Errorf("E_RANT_INVALID: --since requires a non-negative integer")
-				}
-				args["since"] = strconv.FormatInt(value, 10)
 			}
 		case "get":
 			if len(positional) != 2 {
@@ -3407,6 +3404,10 @@ func cliOptionArgumentNames(verb, option string) []string {
 		names = append(names, "refs")
 	case verb == "rant" && option == "idem":
 		names = append(names, "idempotency_key")
+	case verb == "rant" && option == "severity":
+		// capture records a severity; ls filters on one (and also accepts
+		// unset, which capture must not advertise), so they are two arguments.
+		names = append(names, "severity_filter")
 	case verb == "test-report" && option == "config-env":
 		names = append(names, "env_digest")
 	}
