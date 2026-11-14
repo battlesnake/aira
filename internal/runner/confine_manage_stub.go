@@ -30,10 +30,6 @@ func readConfineCPUFrame(string) ConfineCPUFrame {
 	return ConfineCPUFrame{}
 }
 
-func runningConfineScopeIDs(context.Context, string, string, []ConfineRegistryEntry) ([]string, error) {
-	return nil, errors.New("U_CONFINE_KILL_UNCONFIRMED: confine slice discovery requires Linux")
-}
-
 func killConfine(context.Context, string, string, string, bool, []ConfineRegistryEntry, time.Duration) (ConfineKillResult, error) {
 	return ConfineKillResult{}, errors.New("E_CONFINE_UNAVAILABLE: confine management requires Linux")
 }

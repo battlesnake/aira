@@ -32,7 +32,7 @@ func TestConfineKillQueuedCancelSurvivesALostReply(t *testing.T) {
 	args := map[string]any{"slice": "slice", "reserve": int64(1) << 20, "pinned": true, "scope_id": scopeID, "name": "lost", "owner": "s-1"}
 	run := startSaturatedAdmit(t, server, maximum, args, heldLease(1, 1<<20))
 
-	if _, handled, err := server.cancelQueuedConfine("/slice", "lost", "s-1", false, nil); !handled || err != nil {
+	if _, handled, err := server.cancelQueuedConfine("/slice", "lost", "s-1", false); !handled || err != nil {
 		t.Fatalf("cancel: handled=%v err=%v", handled, err)
 	}
 	// The first connection answers and ends; its frame is the reply the client
@@ -114,7 +114,7 @@ func TestConfineKillQueuedCancelRefusesTheScopeAtEnqueue(t *testing.T) {
 	queue := queueOf(server, target, other)
 	server.admitQueues = map[string]*sliceQueue{"/slice": queue}
 	cancelledAt := now
-	if _, handled, err := server.cancelQueuedConfine("/slice", "target", "s-1", false, nil); !handled || err != nil {
+	if _, handled, err := server.cancelQueuedConfine("/slice", "target", "s-1", false); !handled || err != nil {
 		t.Fatalf("cancel: handled=%v err=%v", handled, err)
 	}
 	request := admitRequest{scopeID: target.scopeID, peerSameUID: true}
@@ -168,62 +168,81 @@ func TestConfineKillQueuedCancelRefusesTheScopeAtEnqueue(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-328 review P2 — through the real handler in real mode, a name
-// shared by a QUEUED job and a RUNNING scope that exists only on disk (no
-// granted waiter: a job mid restart recovery) is AMBIGUOUS; the queued job is
-// untouched and no audit line is written. Its exact scope id still cancels it.
-// A discovery that cannot be established refuses the cancel rather than
-// assuming no running twin. Mutation: hand the cancel no on-disk discovery
-// (runningScopes nil in real mode) -> the name cancels the queued job.
-func TestConfineKillQueuedAmbiguousWithADiskOnlyRunningScope(t *testing.T) {
+// verifies: AIRA-328 review (Sol P1, round 4) — through the real handler in
+// real mode, a RUNNING job A (granted, scope on disk) and a QUEUED job B share a
+// name: `--kill <name>` is E_SELECTOR_AMBIGUOUS, names both, writes no audit
+// line, leaves B queued and never touches A's cgroup.kill. B's exact scope id
+// then cancels B, and A is still untouched. Resolution is one locked section
+// with nothing read from disk, so there is no window in which the cancel falls
+// through to the scope kill and kills A. Mutations: let an ambiguous match fall
+// through (handled=false) -> the scope kill writes A's cgroup.kill; stop
+// counting granted waiters -> the name cancels B.
+func TestConfineKillQueuedAndRunningTwinNeverKillsTheRunningJob(t *testing.T) {
 	now := time.Unix(68000, 0)
 	server := queueOrderServer(t, 64*qGiB, &now)
 	path := t.TempDir()
 	server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
-	running := testConfineScopeID(t, "mixed", 7601) + "@s-1"
-	if err := os.Mkdir(filepath.Join(path, ".aira-"+running), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	queued := frontWaiter(1, "mixed", "s-1")
-	queue := queueOf(server, queued)
+	running, queued := frontWaiter(1, "twin", "s-1"), frontWaiter(2, "twin", "s-1")
+	running.state, running.accounted = admitGranted, true
+	scope := writeConfineDaemonScope(t, path, running.scopeID, "populated 1\n")
+	queue := queueOf(server, running, queued)
 	queue.path = path
 	server.admitQueues = map[string]*sliceQueue{path: queue}
 	kill := func(selector string) core.Request {
 		return core.Request{Verb: "confine-kill", Args: map[string]any{"slice": "aira.slice", "selector": selector, "owner": "s-1"}}
 	}
+	runningUntouched := func(stage string) {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(scope, "cgroup.kill"))
+		if err != nil || len(data) != 0 {
+			t.Fatalf("%s: the running job's cgroup.kill=%q err=%v, want untouched", stage, data, err)
+		}
+		requireUntouched(t, running, admitGranted)
+	}
 
 	var response core.Response
-	logged := captureDaemonLog(t, func() { response = server.confineManagement(t.Context(), kill("mixed")) })
+	logged := captureDaemonLog(t, func() { response = server.confineManagement(t.Context(), kill("twin")) })
 	if response.OK || response.Code != "E_SELECTOR_AMBIGUOUS" {
-		t.Fatalf("response=%+v, want E_SELECTOR_AMBIGUOUS (the name also names a running job)", response)
+		t.Fatalf("response=%+v, want E_SELECTOR_AMBIGUOUS (the name names a running and a queued job)", response)
 	}
-	if !strings.Contains(response.Error, running) || !strings.Contains(response.Error, queued.scopeID) {
+	if !strings.Contains(response.Error, running.scopeID) || !strings.Contains(response.Error, queued.scopeID) {
 		t.Fatalf("the refusal must name both jobs: %q", response.Error)
 	}
 	if strings.Contains(logged, "confine-kill") {
 		t.Fatalf("an ambiguous kill left an audit line:\n%s", logged)
 	}
+	runningUntouched("after the ambiguous kill")
 	requireUntouched(t, queued, admitQueued)
 
 	response = server.confineManagement(t.Context(), kill(queued.scopeID))
-	if result, ok := response.Data.(runner.ConfineKillResult); !response.OK || !ok || result.Phase != runner.ConfineKillPhaseQueued || result.ScopeID != queued.scopeID {
+	if result, ok := response.Data.(runner.ConfineKillResult); !response.OK || !ok || result.Status != runner.ConfineKillStatusCancelled || result.ScopeID != queued.scopeID {
 		t.Fatalf("exact-id kill response=%+v, want the queued job cancelled", response)
 	}
 	requireCancelled(t, queued)
+	runningUntouched("after the exact-id cancel")
+}
 
-	// Discovery unestablished: the slice directory cannot be read.
-	again := frontWaiter(2, "again", "s-1")
-	queue.mu.Lock()
-	queue.waiters = append(queue.waiters, again)
-	queue.mu.Unlock()
-	if err := os.RemoveAll(path); err != nil {
-		t.Fatal(err)
+// verifies: AIRA-328 — the not-launched hint names a granted job only when the
+// selector names exactly ONE: two granted jobs sharing a name give no hint, so
+// it never names an arbitrary one of them. Mutation: drop the multi-match guard
+// in grantedConfineMatch -> the twin selector returns one of the two ids.
+func TestGrantedConfineMatchNamesOnlyAUniqueJob(t *testing.T) {
+	now := time.Unix(68500, 0)
+	server := queueOrderServer(t, 64*qGiB, &now)
+	first, second, single := frontWaiter(1, "twin", "s-1"), frontWaiter(2, "twin", "s-1"), frontWaiter(3, "single", "s-1")
+	for _, waiter := range []*admitWaiter{first, second, single} {
+		waiter.state, waiter.accounted = admitGranted, true
 	}
-	response = server.confineManagement(t.Context(), kill("again"))
-	if response.OK || response.Code != runner.CodeConfineKillUnconfirmed {
-		t.Fatalf("response=%+v, want %s when running scopes cannot be discovered", response, runner.CodeConfineKillUnconfirmed)
+	server.admitQueues = map[string]*sliceQueue{"/slice": queueOf(server, first, second, single)}
+	if got := server.grantedConfineMatch("/slice", "twin"); got != "" {
+		t.Fatalf("two granted twins: hint names %q, want none", got)
 	}
-	requireUntouched(t, again, admitQueued)
+	if got := server.grantedConfineMatch("/slice", "single"); got != single.scopeID {
+		t.Fatalf("one granted job: hint names %q, want %s", got, single.scopeID)
+	}
+	if got := server.grantedConfineMatch("/slice", second.scopeID); got != second.scopeID {
+		t.Fatalf("exact scope id: hint names %q, want %s", got, second.scopeID)
+	}
 }
 
 // verifies: AIRA-328 — an aitest worker's QUEUED claim is never cancelled. By
@@ -285,7 +304,7 @@ func TestConfineKillQueuedWorkerClaimIsRefusedAndKeepsWaiting(t *testing.T) {
 	}
 
 	for _, selector := range []string{claim.scopeID, name, fmt.Sprint(pid)} {
-		_, handled, err := server.cancelQueuedConfine("/slice", selector, "operator", true, nil)
+		_, handled, err := server.cancelQueuedConfine("/slice", selector, "operator", true)
 		if selector == claim.scopeID {
 			if !handled || store.ErrorCode(err) != runner.CodeConfineKillWorkerClaim {
 				t.Fatalf("kill by exact worker scope id: handled=%v err=%v, want %s", handled, err, runner.CodeConfineKillWorkerClaim)

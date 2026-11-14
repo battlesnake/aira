@@ -103,28 +103,15 @@ func (s *Server) scopeCancelledLocked(scopeID string, now time.Time) bool {
 	return scopeID != "" && cancelled
 }
 
-// cancelQueuedConfine is the locked wrapper. handled is false when no QUEUED
-// waiter matched: the caller then runs the running-job kill unchanged.
-//
-// runningScopes discovers the RUNNING scopes on disk the selector names (nil:
-// none exist outside the ledger, as in ci-shim mode). It is read only when a
-// queued waiter matches, and OUTSIDE the queue lock (it is filesystem I/O), so
-// the queued target is resolved again under the lock afterwards: a waiter
-// granted meanwhile is counted as running there, a waiter that left is simply
-// not found. A discovery that fails refuses the cancel rather than guessing the
-// selector is unambiguous.
-func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal bool, runningScopes func() ([]string, error)) (runner.ConfineKillResult, bool, error) {
-	selector = strings.TrimSpace(selector)
-	if selector == "" || !s.queuedConfineMatches(path, selector) {
-		return runner.ConfineKillResult{}, false, nil
-	}
-	var running []string
-	if runningScopes != nil {
-		var err error
-		if running, err = runningScopes(); err != nil {
-			return runner.ConfineKillResult{}, true, err
-		}
-	}
+// cancelQueuedConfine resolves and cancels in ONE locked section, under the
+// usual lock order (admitRegistryMu, then queue.mu): resolve the queued match,
+// count the daemon-held granted waiters, apply the owner guard, reject and wake
+// the waiter, record the cancelled scope id. Nothing is read from disk and
+// nothing is decided outside the lock, so no waiter can change state between
+// the resolution and the effect. handled is false when no QUEUED waiter
+// matched: the caller then runs the running-job kill unchanged, as before
+// AIRA-328.
+func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal bool) (runner.ConfineKillResult, bool, error) {
 	s.admitRegistryMu.Lock()
 	queue := s.admitQueues[path]
 	if queue == nil {
@@ -133,7 +120,7 @@ func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal b
 	}
 	queue.mu.Lock()
 	now := s.admitNowTime()
-	result, handled, err := cancelQueuedConfineLocked(queue, selector, callerOwner, steal, running, now)
+	result, handled, err := cancelQueuedConfineLocked(queue, selector, callerOwner, steal, now)
 	if handled && err == nil {
 		// Under admitRegistryMu, which every enqueue takes first, so no
 		// reconnect can slip between the cancel and its record.
@@ -145,25 +132,6 @@ func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal b
 		queue.signal()
 	}
 	return result, handled, err
-}
-
-// queuedConfineMatches is the cheap pre-check: does selector name any QUEUED
-// waiter on path's queue right now?
-func (s *Server) queuedConfineMatches(path, selector string) bool {
-	s.admitRegistryMu.Lock()
-	defer s.admitRegistryMu.Unlock()
-	queue := s.admitQueues[path]
-	if queue == nil {
-		return false
-	}
-	queue.mu.Lock()
-	defer queue.mu.Unlock()
-	for _, waiter := range queue.waiters {
-		if waiter != nil && waiter.state == admitQueued && confineFrontSelects(waiter, selector) {
-			return true
-		}
-	}
-	return false
 }
 
 // grantedConfineMatch returns the scope id of the one GRANTED waiter on path's
@@ -197,18 +165,19 @@ func (s *Server) grantedConfineMatch(path, selector string) string {
 // cancelQueuedConfineLocked is the resolution and the effect. queue.mu must be
 // held.
 //
-// Names are not unique, so a selector that matches a queued job AND any running
+// Names are not unique, so a selector that matches a queued job AND a running
 // job is AMBIGUOUS, never silently resolved to the queued one: before AIRA-328
 // that selector killed the running job. Running jobs are the daemon's granted
-// waiters (under this lock) plus running, the scopes discovery found on disk,
-// which include any the ledger does not hold. Jobs are counted once per scope
-// id. A selector matching only running jobs is not handled here.
+// waiters, under this same lock; a job that survived a daemon restart and has
+// not yet re-declared its lease is not one of them (an accepted gap). Jobs are
+// counted once per scope id. A selector matching only running jobs is not
+// handled here.
 //
 // An aitest worker's claim (a sub-reservation) is reached only by its exact
 // scope id (confineFrontSelects; a name or pid never selects one, so
 // `--kill <supervisor-pid>` still reaches the suite) and is REFUSED, never
 // cancelled: see the file comment.
-func cancelQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, steal bool, running []string, now time.Time) (runner.ConfineKillResult, bool, error) {
+func cancelQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, steal bool, now time.Time) (runner.ConfineKillResult, bool, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
 		return runner.ConfineKillResult{}, false, nil
@@ -235,12 +204,7 @@ func cancelQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, 
 			return runner.ConfineKillResult{}, true, fmt.Errorf("%s: %s is an aitest worker's claim (a sub-reservation of %s) waiting for admission; a claim follows its suite and cannot be cancelled on its own: kill the owning suite's `aira confine` supervisor instead (`aira confine --kill %s`)", runner.CodeConfineKillWorkerClaim, waiter.scopeID, waiter.parentScopeID, waiter.parentScopeID)
 		}
 	}
-	for _, scopeID := range running {
-		if scopeID != "" {
-			matched[scopeID] = struct{}{}
-		}
-	}
-	if len(queued) > 1 || len(matched) > 1 {
+	if len(matched) > 1 {
 		ids := make([]string, 0, len(matched))
 		for scopeID := range matched {
 			ids = append(ids, scopeID)

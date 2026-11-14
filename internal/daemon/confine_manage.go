@@ -399,19 +399,9 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// branch and works the same in ci-shim mode (the shim queue is keyed on the
 		// sentinel path resolved above). Not handled = no queued match: the
 		// running-job kill below runs unchanged, including for a job granted
-		// between the operator's `--list` and this kill.
-		//
-		// Ambiguity counts the running scopes the kill below would see, found by
-		// its own discovery and selector rule, so a running scope the ledger does
-		// not hold still makes a shared name ambiguous. ci-shim has no scopes:
-		// its only running jobs are the granted waiters the cancel counts itself.
-		var runningScopes func() ([]string, error)
-		if !s.shimMode() {
-			runningScopes = func() ([]string, error) {
-				return runner.RunningConfineScopeIDs(ctx, path, selector, registry)
-			}
-		}
-		if cancelled, handled, cancelErr := s.cancelQueuedConfine(path, selector, callerOwner, steal, runningScopes); handled {
+		// between the operator's `--list` and this kill. Ambiguity counts the
+		// daemon's granted waiters only; nothing is read from disk.
+		if cancelled, handled, cancelErr := s.cancelQueuedConfine(path, selector, callerOwner, steal); handled {
 			if cancelErr != nil {
 				return confineManagementError(cancelErr)
 			}
@@ -428,14 +418,13 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		}
 		result, killErr := runner.KillConfine(ctx, path, selector, callerOwner, steal, registry)
 		if killErr != nil {
-			// AIRA-328. registry was snapshotted before the queued cancel, so a job
-			// granted in between (the cancel fell through) can be missing from it and
-			// its scope not created yet: the scope kill then finds nothing. The daemon
-			// holds it as granted, so say "not launched yet; retry", never "no such
-			// job".
+			// AIRA-328. A job the daemon holds as granted whose scope does not exist
+			// yet (its launcher has not created it; or it was granted after the
+			// registry snapshot, the queued cancel falling through) finds nothing to
+			// kill: say "no running scope; retry", never "no such job".
 			if store.ErrorCode(killErr) == runner.CodeConfineNotFound {
 				if scopeID := s.grantedConfineMatch(path, selector); scopeID != "" {
-					return confineManagementError(fmt.Errorf("%s: selector %q names %s, which was admitted a moment ago and has no running scope to kill yet; retry", runner.CodeConfineNotLaunched, selector, scopeID))
+					return confineManagementError(fmt.Errorf("%s: selector %q names %s, which is admitted but has no running scope to kill; retry", runner.CodeConfineNotLaunched, selector, scopeID))
 				}
 			}
 			return confineManagementError(killErr)
