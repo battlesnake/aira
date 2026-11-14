@@ -1543,7 +1543,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// interleave between them and reintroduce exactly the glue this fixes.
 	_, _ = fmt.Fprintf(diagnostics, "\n%s\n", FormatConfineStatus(result.Status))
 	// Only an OWN-limit OOM may reach the "job OOM-killed at its memory cap" line
-	// (AIRA-102). Its other branch -- peak RSS near the cap -- is unaffected.
+	// (AIRA-102).
 	// AIRA-184. CapBytes is the SLICE's own finite cap, established by deps.readCap
 	// before this job launched (and a launch precondition, so it is set on every
 	// path that can reach a kill here) -- deliberately not ScopeMemoryMax, which is

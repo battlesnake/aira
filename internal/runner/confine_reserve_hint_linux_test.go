@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -176,7 +177,15 @@ func TestConfineReserveHintEndToEnd(t *testing.T) {
 func TestConfineRealFileStreamAtCapGetsNoReserveAdvisory(t *testing.T) {
 	parent := confineMemoryParent(t, strconv.FormatInt(1<<30, 10))
 	const capBytes = int64(64) << 20
-	file := filepath.Join(t.TempDir(), "stream")
+	dir := t.TempDir()
+	// tmpfs pages are shmem: with memory.swap.max=0 they cannot be reclaimed, so
+	// streaming a file larger than the cap through one would OOM-kill the job
+	// instead of exercising page-cache reclaim. This test needs a disk-backed dir.
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(dir, &fs); err == nil && fs.Type == 0x01021994 {
+		t.Skipf("%s is tmpfs (shmem is not reclaimable with swap off); set TMPDIR to a disk-backed directory", dir)
+	}
+	file := filepath.Join(dir, "stream")
 	deps := defaultConfineDeps()
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
 		return admissionResult{state: "immediate"}, nil

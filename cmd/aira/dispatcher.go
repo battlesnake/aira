@@ -989,7 +989,8 @@ func unreachableDaemonError(paths daemon.Paths, systemctl daemon.SystemctlRun, r
 		// The service serves this very socket and is starting or restarting: wait.
 		return nil
 	}
-	// AIRA-335. No daemon answers for this state and none holds its lock, while the
+	// AIRA-335. No daemon answers for this state and none is established as running for it
+	// (its lock is not held with a live, same-boot record), while the
 	// installed service serves ANOTHER state: this process's XDG_STATE_HOME (or the
 	// HOME it defaults from) points away from the installed aira, so no daemon will
 	// ever serve this socket. An override with a reachable daemon never gets here
