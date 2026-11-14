@@ -89,6 +89,12 @@ pinned: T9 runs its old-daemon cases with `OOM` true and false and asserts the s
 every bound of every field, so deleting only the `wait_ms` upper bound is red; and the rollout
 smoke test (section 6) checks a fresh-nonce probe's own new row instead of the latest row in
 the store, which another session's report could make a false pass or a false failure.
+Round 5 found T4 porous by construction: each of its cases moved one clock in one phase, so a
+launch site that started the wall timer, or read the wall clock, before `deps.admit` (folding
+the queue wait into `wall_ms` and shifting `started_at_ms` by it) passed every case. T4 is now
+one composite scenario in which the repo walk, the admission and the run each move both clocks
+by a distinct amount, with all three values asserted together, and the moved-start mutations
+listed; section 5.1.3 no longer claims T6 pins the timers.
 
 ## 1. The problem, in plain terms
 
@@ -403,7 +409,9 @@ or delays the launch.
 **The launch-site seam.** `confineDeps` gains `repoIdentity func() (string, bool)`. Production:
 `os.Getwd()`, then `RepoIdentity(cwd)`; a `Getwd` error is `("", false)`. The launch site calls
 it **once, before `deps.admit`**, so neither timed interval includes it, and copies the result
-into the report only when `ok` is true. T6 pins all three properties.
+into the report only when `ok` is true. T6 pins the single call, its place before admission
+and the copy rule; T4 pins that neither timed interval includes it (its fake `repoIdentity`
+moves both clocks, and a timer started before it is red).
 
 Detached launches: the confine supervisor is started by `spawnDetachedShim`
 (`confine_detach_linux.go:49-63`) with `cmd.Dir` and `cmd.Env` unset, so it inherits the
@@ -795,25 +803,37 @@ rev 3 changes):
 - **T4. Launch-site timing** (fake `confineDeps` with the `wallNow`/`monoNow` seam of 5.1.1,
   captured `reportPeak`). Every expectation is on the client's own fake clocks; none compares
   the client's figure with the daemon's `waitedMS`.
-  - **Immediate grant:** the fake `admit` advances `monoNow` by 40 ms and returns a lease with
-    `waitedMS = 0`. `WaitMS` must be 40.
-  - **Reconnect:** the fake `admit` advances `monoNow` by 30 000 ms (12 000 ms queued, the
-    connection dropped, one 500 ms reconnect gap, 17 500 ms queued again) and returns a lease
-    with `waitedMS = 17 500`. `WaitMS` must be 30 000.
+  - **One composite scenario, every phase moving both clocks by a distinct amount**, so each
+    interval's start and end points are pinned together rather than one property per case.
+    The fake clocks start at mono 0 and wall T0.
+    - Phase A, inside the fake `repoIdentity` (called before admission, 5.1.3): `monoNow`
+      advances 7 ms and `wallNow` advances 11 ms.
+    - Phase B, inside the fake `admit`: `monoNow` advances 30 000 ms (12 000 ms queued, the
+      connection dropped, one 500 ms reconnect gap, 17 500 ms queued again) and `wallNow`
+      advances 29 000 ms. It returns a lease with `waitedMS = 17 500`. Let T = T0 + 29 011,
+      the wall reading at the admission return.
+    - Phase C, inside the fake `start` (`deps.start`, `confine_linux.go:1229`, which runs
+      between the admission return at `:744` and the report at `:1456`): `monoNow` advances
+      2 000 ms and `wallNow` steps back one hour.
+    - Pass, all three asserted together on the one captured report: `WaitMS` = 30 000,
+      `WallMS` = 2 000, `StartedAtMS` = T (the pre-step reading at the admission return).
   - `WaitMS` is set iff `deps.admit` returned a lease; it is nil for `bypassed`, `disabled` and
     `no-daemon`. A daemon `unevaluated` grant (with a lease) sends `WaitMS`; the local
     `no-daemon` `unevaluated` does not.
-  - **Wall time:** `monoNow` advances 2 000 ms between the admission return and the report.
-    `WallMS` must be 2 000.
-  - **Start time and a clock step:** `wallNow` reads T at the admission return, then steps
-    back one hour before the report, while `monoNow` advances 2 000 ms. `StartedAtMS` must be
-    T (the pre-step reading), `WallMS` 2 000.
-  - Mutations, each red:
-    - send `admission.waitedMS` for a granted admission (gives 17 500 in the reconnect case);
-    - send `admission.waitedMS` (the Go zero) for a lease-less admission;
-    - key the rule on `state == "unevaluated"` instead of `release`;
-    - read the start time at report time as `wallNow() - wall_ms` (gives T - 1 h);
-    - measure `wall_ms` as a difference of `wallNow` readings (gives a negative value).
+  - Mutations, each red (the value in brackets is what the composite case then sees):
+    - start the wall timer before `deps.admit` (`WallMS` = 32 000), or before `repoIdentity`
+      (`WallMS` = 32 007);
+    - read `wallNow` for the start time before `deps.admit` (`StartedAtMS` = T - 29 000), or
+      before `repoIdentity` (T0 = T - 29 011);
+    - start the wait timer before `repoIdentity` (`WaitMS` = 30 007);
+    - end the wait timer at report time instead of at the admission return (`WaitMS` =
+      32 000);
+    - send `admission.waitedMS` for a granted admission (`WaitMS` = 17 500);
+    - read the start time at report time as `wallNow() - wall_ms` (`StartedAtMS` =
+      T - 3 600 000 - 2 000 = T - 3 602 000);
+    - measure `wall_ms` as a difference of `wallNow` readings (gives a negative value);
+    - send `admission.waitedMS` (the Go zero) for a lease-less admission (lease-less case);
+    - key the rule on `state == "unevaluated"` instead of `release` (lease-less case).
 - **T5. `RepoIdentity` on real temporary repositories:**
   - plain repo and a subdirectory: the same ID;
   - linked worktree: equals the main checkout;
