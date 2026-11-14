@@ -66,6 +66,53 @@ def test_worker_sends_the_wait_before_the_recycle_suffix(pytester, monkeypatch):
     assert isinstance(waited, int) and waited >= 0
 
 
+def test_worker_wait_counts_a_blocked_send_but_not_its_own_serialization(monkeypatch):
+    # A fake monotonic clock, advanced only by (a) json.dumps -- the worker's own
+    # serialization, which is NOT waiting -- and (b) pipe_out.write -- a send that blocks
+    # on a full pipe because the supervisor is not reading, which IS waiting. The second
+    # test's wait must be exactly the blocked write, never the serialization.
+    from aitest import worker
+
+    clock = SimpleNamespace(now=1000.0)
+    serialize_s = 3.0
+    blocked_write_s = 0.25  # exact in binary floating point
+    real_dumps = json.dumps
+
+    def slow_dumps(*args, **kwargs):
+        clock.now += serialize_s
+        return real_dumps(*args, **kwargs)
+
+    class _BlockingPipe:
+        def __init__(self):
+            self.text = ""
+
+        def write(self, data):
+            self.text += data
+            clock.now += blocked_write_s
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(worker, "json", SimpleNamespace(dumps=slow_dumps))
+    monkeypatch.setattr(worker, "_init_forked_child", lambda config: None)
+    monkeypatch.setattr(worker, "run_one", lambda item: ("passed", [{"kind": "logstart"}]))
+    items = {"pkg/t.py::a": SimpleNamespace(config=None), "pkg/t.py::b": SimpleNamespace(config=None)}
+    pipe_out = _BlockingPipe()
+    run_worker_loop(None, items, io.StringIO("pkg/t.py::a\npkg/t.py::b\n__stop__\n"), pipe_out)
+
+    results = [
+        _split_dispatch_wait(line)
+        for line in pipe_out.text.splitlines()
+        if not line.startswith(worker._EVENT_LINE_PREFIX)
+    ]
+    assert [body for body, _ in results] == ["pkg/t.py::a passed", "pkg/t.py::b passed"]
+    first, second = (waited for _, waited in results)
+    assert first == 0, "the clock did not move before the first test was read"
+    assert second >= blocked_write_s * 1_000_000, "a blocked send is waiting for dispatch"
+    assert second < serialize_s * 1_000_000, "the worker's own serialization is not waiting"
+
+
 # --- the supervisor's accumulation ------------------------------------------------------
 
 def _drain_one(line):
@@ -212,3 +259,8 @@ def test_a_real_fallback_run_measures_every_completed_test(pytester, monkeypatch
     line = sup.pool_summary()
     assert "(measured on 3 of 3 tests)" in line, line
     assert "live workers peak " in line and "peak 0," not in line, line
+    # The run window and the supervisor's own CPU were really read: a real run never
+    # reports them unevaluated, and a process that ran a pool used some CPU.
+    assert "CPU unevaluated" not in line, line
+    assert "mean unevaluated" not in line, line
+    assert sup._run_cpu_s is not None and sup._run_cpu_s > 0, sup._run_cpu_s

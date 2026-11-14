@@ -374,3 +374,8 @@ def test_continue_on_collection_errors_runs_the_pool_and_keeps_the_error_in_the_
 
     assert calls == [["test_ok.py::test_one"]], calls
     assert result.ret == pytest.ExitCode.TESTS_FAILED, result.stdout.str()
+    # AIRA-344: the pool summary line is printed exactly once, right after the count.
+    lines = result.stdout.lines
+    pool = [i for i, line in enumerate(lines) if line.startswith("aitest: pool: ")]
+    count = [i for i, line in enumerate(lines) if line.startswith("aitest: 1 passed, ")]
+    assert len(pool) == 1 and len(count) == 1 and pool[0] == count[0] + 1, result.stdout.str()

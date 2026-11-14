@@ -321,6 +321,18 @@ def test_map_reassignment_after_the_queue_is_seen_by_the_next_pick():
     assert sup._largest_fitting(1000, 1, pop=False) == "a"
 
 
+def test_an_overhead_only_reassignment_is_seen_by_the_next_pick():
+    # "a" is absent from reservation_need, so its need is the worker overhead. Reassigning
+    # ONLY the overhead (no map changes) must re-index: the differential test's remap op
+    # always reassigns the maps too, so it cannot tell whether the overhead is watched.
+    sup = _sup(["a", "b"], {"b": 300})
+    sup._worker_overhead_bytes = 100
+    assert sup._largest_fitting(1000, 1, pop=False) == "b"  # builds the index: a=100, b=300
+    sup._worker_overhead_bytes = 400
+    assert sup._largest_fitting(1000, 1, pop=False) == "a"
+    assert sup._largest_fitting(350, 1, pop=False) == "b", "a (400) no longer fits 350"
+
+
 def test_the_queue_still_reads_as_a_list():
     sup = _sup(["a", "b"], {})
     assert sup.queue == ["a", "b"]
@@ -362,11 +374,16 @@ def _bench_queue(n, seed=1):
 
 
 def _time_picks(picker, budgets, k):
+    # Every timed call must hand out a test: a call that finds nothing does no pop and
+    # would make a per-dispatch average look cheaper than a real dispatch.
+    picked = []
     start = time.perf_counter()
     for i in range(k):
         budget, cpu_budget = budgets[i % len(budgets)]
-        picker._largest_fitting(budget, cpu_budget, pop=True)
-    return (time.perf_counter() - start) / k
+        picked.append(picker._largest_fitting(budget, cpu_budget, pop=True))
+    elapsed = time.perf_counter() - start
+    assert None not in picked, "a timed pick returned no test"
+    return elapsed / k, picked
 
 
 @pytest.mark.skipif(not _BENCH, reason="benchmark: set AIRA_AITEST_BENCH=1 to run")
@@ -385,13 +402,16 @@ def test_bench_dispatch_old_vs_new():
         sup._largest_fitting(0, 0, pop=False)  # builds the index (once per queue/map set)
         build = time.perf_counter() - build_start
         classes = len({(need[x], cpu[x]) for x in names})
-        k_old = 100 if n > 30000 else 400
-        old_s = _time_picks(old, budgets, k_old)
-        new_s = _time_picks(sup, budgets, 20000)
+        # The SAME number of successful dispatches for both pickers, from the same queue
+        # and budgets (the old picker's cost sets k: ~25 ms per pick at 65k).
+        k = 200 if n > 50000 else 400 if n > 20000 else 1000
+        old_s, old_picked = _time_picks(old, budgets, k)
+        new_s, new_picked = _time_picks(sup, budgets, k)
+        assert new_picked == old_picked, "the two pickers must hand out the same tests"
         sys.stdout.write(
             "python %s queue=%d classes=%d: old %.3f ms/dispatch, new %.4f ms/dispatch "
-            "(index build %.1f ms once)\n"
-            % (sys.version.split()[0], n, classes, old_s * 1e3, new_s * 1e3, build * 1e3)
+            "over %d successful dispatches each (index build %.1f ms once)\n"
+            % (sys.version.split()[0], n, classes, old_s * 1e3, new_s * 1e3, k, build * 1e3)
         )
         if n == 65164:
             assert new_s < 0.1e-3, "acceptance: under 0.1 ms per dispatch at a 65k queue"

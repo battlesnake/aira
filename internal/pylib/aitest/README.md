@@ -29,14 +29,15 @@ number of classes, not on the number of queued tests. The order it picks in is
 exactly the old order, which `test_ready_queue.py` checks against the old
 full-scan picker over random queues and operation sequences. Measured with
 `AIRA_AITEST_BENCH=1 pytest -s test_ready_queue.py -k bench` (Python 3.12.3,
-65,164 queued tests in 20 classes): about 28 ms per pick before and 0.005 ms
-after. Building the index takes about 80 ms once per queue.
+65,164 queued tests in 20 classes, 200 successful picks timed for each picker):
+27-32 ms per pick before and about 0.01 ms after. Building the index takes
+80-110 ms once per queue.
 
 After the per-test lines and the `aitest: N passed, ...` count, every run
 prints one more line:
 
 ```text
-aitest: pool: live workers peak 64, mean 60.0 over 2020.1 s; supervisor CPU 1500.2 s (74% of one core); workers idle waiting for dispatch 812.3 s, 12.5 ms per test (measured on 65000 of 65164 tests)
+aitest: pool: live workers peak 64, mean 60.00 over 2020.1 s; supervisor CPU 1500.2 s (74% of one core); workers idle waiting for dispatch 812.3 s, 12.5 ms per test (measured on 65164 of 65164 tests)
 ```
 
 - **Live workers.** A worker counts as live from its ready signal to its
@@ -51,9 +52,13 @@ aitest: pool: live workers peak 64, mean 60.0 over 2020.1 s; supervisor CPU 1500
   has read the next test's id. So the figure includes the time a result sits
   unread while the supervisor is busy. A worker's wait before `__stop__` is not
   counted, because no test follows it. The worker sends the figure on the
-  result line. If a worker dies, the waits for its unfinished tests are lost.
-  That is why the line says how many tests were measured. If no test was
-  measured, the figure reads `unevaluated`, never 0.
+  result line, so the denominator in "measured on N of M tests" is the number
+  of completed results, and N is less than M only when a test double sends a
+  result line without the figure (a test whose worker died before reporting is
+  in neither count). If no test was measured, the figure reads `unevaluated`,
+  never 0. One case counts time that is not a dispatch delay: a worker that went
+  idle because the queue was empty, and later receives a test requeued after
+  another worker crashed, counts its whole idle period as waiting for dispatch.
 
 With `AIRA_AITEST_MEASURE_DIR` set, the same figures go into
 `pool-report-<pid>.json` (`live_workers_peak`, `live_workers_mean`,
