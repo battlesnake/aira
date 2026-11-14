@@ -1,0 +1,325 @@
+{
+ "comment": "Golden table for the AIRA-323 command key (spec docs/superpowers/specs/2026-11-13-history-charge-design.md section 5.1, rev 3). Each case: the effective argv (the confine signature is these tokens joined by NUL), the repo identity the client sent (64 lowercase hex digits, or \"none\"), and the three keys the daemon stores. The Go key function and the replay script's keys() (docs/dev/aira-history-charge-replay.py --self-test) must both reproduce every case byte for byte. \\u001f (unit separator) divides the repo identity from the argv part. A row with no repo identity gets no key (NULL) and is not a case here.",
+ "cases": [
+  {
+   "name": "plain command",
+   "argv": [
+    "make",
+    "test"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|test",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|test",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|test"
+   }
+  },
+  {
+   "name": "RANT-133: same script, repo A",
+   "argv": [
+    "./runall.sh"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001frunall.sh|",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001frunall.sh|",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001frunall.sh|"
+   }
+  },
+  {
+   "name": "RANT-133: same script, repo B splits",
+   "argv": [
+    "./runall.sh"
+   ],
+   "repo": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "want": {
+    "key_masked": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001frunall.sh|",
+    "key_first4": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001frunall.sh|",
+    "key_cmd": "9e07bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001frunall.sh|"
+   }
+  },
+  {
+   "name": "outside any git repository",
+   "argv": [
+    "./runall.sh"
+   ],
+   "repo": "none",
+   "want": {
+    "key_masked": "none\u001frunall.sh|",
+    "key_first4": "none\u001frunall.sh|",
+    "key_cmd": "none\u001frunall.sh|"
+   }
+  },
+  {
+   "name": "env and VAR=value unwrapped, relative path masked",
+   "argv": [
+    "env",
+    "GOFLAGS=-count=1",
+    "go",
+    "test",
+    "./..."
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test <p>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test <p>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test"
+   }
+  },
+  {
+   "name": "/usr/bin/env unwrapped",
+   "argv": [
+    "/usr/bin/env",
+    "python3",
+    "-I",
+    "x.py"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|-I <p>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|-I <p>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>"
+   }
+  },
+  {
+   "name": "bare VAR=value prefix unwrapped",
+   "argv": [
+    "LC_ALL=C",
+    "sort",
+    "big.txt"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fsort|<p>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fsort|<p>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fsort|<p>"
+   }
+  },
+  {
+   "name": "time with known value option -f",
+   "argv": [
+    "/usr/bin/time",
+    "-f",
+    "%M",
+    "python3",
+    "train.py",
+    "--epochs",
+    "30"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p> --epochs <n>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p> --epochs <n>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>"
+   }
+  },
+  {
+   "name": "time with known flags -p -v",
+   "argv": [
+    "time",
+    "-p",
+    "-v",
+    "make",
+    "ci"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci"
+   }
+  },
+  {
+   "name": "time with an unknown option is left as the command",
+   "argv": [
+    "time",
+    "--quiet",
+    "make",
+    "ci"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|--quiet make ci",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|--quiet make ci",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|make"
+   }
+  },
+  {
+   "name": "timeout is not unwrapped; number masked",
+   "argv": [
+    "timeout",
+    "600",
+    "make",
+    "ci"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftimeout|<n> make ci",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftimeout|<n> make ci",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftimeout|<n>"
+   }
+  },
+  {
+   "name": "nice is not unwrapped",
+   "argv": [
+    "nice",
+    "-n",
+    "10",
+    "make",
+    "build"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fnice|-n <n> make build",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fnice|-n <n> make",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fnice|<n>"
+   }
+  },
+  {
+   "name": "flock is not unwrapped; path masked",
+   "argv": [
+    "flock",
+    "/run/lock/x.lock",
+    "make",
+    "deploy"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fflock|<p> make deploy",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fflock|<p> make deploy",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fflock|<p>"
+   }
+  },
+  {
+   "name": "aitest-parent stays the first token",
+   "argv": [
+    "aitest-parent",
+    "pytest",
+    "-q",
+    "tests/unit"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001faitest-parent|pytest -q <p>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001faitest-parent|pytest -q <p>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001faitest-parent|pytest"
+   }
+  },
+  {
+   "name": "absolute argv[0] reduced to basename; temp path masked",
+   "argv": [
+    "/home/u/.venv/bin/pytest",
+    "/tmp/tmpq8x1/test_a.py",
+    "-k",
+    "fast"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpytest|<p> -k fast",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpytest|<p> -k fast",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpytest|<p>"
+   }
+  },
+  {
+   "name": "hex hash and long number masked",
+   "argv": [
+    "git",
+    "show",
+    "deadbeef1234",
+    "--stat",
+    "20261114"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgit|show <n> --stat <n>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgit|show <n> --stat",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgit|show"
+   }
+  },
+  {
+   "name": "token with 3+ digits masked",
+   "argv": [
+    "go",
+    "test",
+    "-run",
+    "TestAIRA323",
+    "./internal/store"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test -run <n> <p>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test -run <n>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|test"
+   }
+  },
+  {
+   "name": "file-suffix token masked",
+   "argv": [
+    "python3",
+    "replay.py"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<p>"
+   }
+  },
+  {
+   "name": "more than 14 arguments truncated",
+   "argv": [
+    "cc",
+    "-Dxa",
+    "-Dxb",
+    "-Dxc",
+    "-Dxd",
+    "-Dxe",
+    "-Dxf",
+    "-Dxg",
+    "-Dxh",
+    "-Dxi",
+    "-Dxj",
+    "-Dxk",
+    "-Dxl",
+    "-Dxm",
+    "-Dxn",
+    "-Dxo",
+    "-Dxp",
+    "-Dxq"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcc|-Dxa -Dxb -Dxc -Dxd -Dxe -Dxf -Dxg -Dxh -Dxi -Dxj -Dxk -Dxl -Dxm -Dxn",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcc|-Dxa -Dxb -Dxc",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcc|"
+   }
+  },
+  {
+   "name": "lone env keeps env",
+   "argv": [
+    "env"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fenv|",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fenv|",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fenv|"
+   }
+  },
+  {
+   "name": "first positional skips flags",
+   "argv": [
+    "cargo",
+    "--locked",
+    "build",
+    "--release"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|--locked build --release",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|--locked build --release",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|build"
+   }
+  }
+ ]
+}
