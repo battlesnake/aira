@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -125,10 +126,22 @@ const oldDaemonPriorityRefusalFrame = `E_DAEMON_PROTOCOL: unexpected admit field
 // The client re-asks ONCE without the field, prints a visible notice that the job
 // runs at NORMAL priority (never a silent normal), and is granted. A hook or
 // Makefile that carries `--priority high` therefore keeps working across a
-// client-installed / daemon-not-yet-restarted skew. Mutations: no retry (refused);
-// retry still carrying the field (second frame has it, refused again); drop the
-// notice.
+// client-installed / daemon-not-yet-restarted skew. The same holds for an
+// EXCLUSIVE high request: the priority degrade is matched before the exclusive
+// refusal block (which makes every other E_DAEMON_PROTOCOL terminal), and the
+// re-ask keeps `exclusive`. Mutations: no retry (refused); retry still carrying
+// the field (second frame has it, refused again); drop the notice; priority
+// degrade placed after the exclusive block (the exclusive case is refused
+// E_CONFINE_UNAVAILABLE); clear Exclusive on the re-ask.
 func TestHighPriorityAgainstAnOldDaemonDegradesToNormalWithANotice(t *testing.T) {
+	for _, exclusive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("exclusive=%t", exclusive), func(t *testing.T) {
+			highPriorityAgainstOldDaemon(t, exclusive)
+		})
+	}
+}
+
+func highPriorityAgainstOldDaemon(t *testing.T, exclusive bool) {
 	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
 	var diagnostics strings.Builder
 	r.diagnostics = &diagnostics
@@ -156,7 +169,7 @@ func TestHighPriorityAgainstAnOldDaemonDegradesToNormalWithANotice(t *testing.T)
 	reserve := int64(1 << 20)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	result, err := r.admit(ctx, Request{MemoryReserveOverride: &reserve, HighPriority: true})
+	result, err := r.admit(ctx, Request{MemoryReserveOverride: &reserve, HighPriority: true, Exclusive: exclusive})
 	if err != nil {
 		t.Fatalf("a high request against an old daemon was refused instead of degraded: %v", err)
 	}
@@ -171,6 +184,9 @@ func TestHighPriorityAgainstAnOldDaemonDegradesToNormalWithANotice(t *testing.T)
 	}
 	if _, sent := frames[1]["priority"]; sent {
 		t.Fatalf("the re-ask still carried priority=%#v", frames[1]["priority"])
+	}
+	if exclusive && frames[1]["exclusive"] != true {
+		t.Fatalf("the re-ask dropped exclusive: args=%#v", frames[1])
 	}
 	for _, want := range []string{"--priority high", "NORMAL", "restart aira-daemon.service"} {
 		if !strings.Contains(diagnostics.String(), want) {
@@ -187,12 +203,13 @@ func TestHighPriorityAgainstAnOldDaemonDegradesToNormalWithANotice(t *testing.T)
 // HighPriority guard.
 func TestOnlyTheOldDaemonPriorityRefusalDegrades(t *testing.T) {
 	for _, tc := range []struct {
-		name, refusal string
-		high          bool
+		name, refusal   string
+		high, exclusive bool
 	}{
-		{"another unknown field", `E_DAEMON_PROTOCOL: unexpected admit field "vram"`, true},
-		{"a bad priority value", `E_DAEMON_PROTOCOL: admit priority must be "high" or "normal"`, true},
-		{"normal request", oldDaemonPriorityRefusalFrame, false},
+		{"another unknown field", `E_DAEMON_PROTOCOL: unexpected admit field "vram"`, true, false},
+		{"a bad priority value", `E_DAEMON_PROTOCOL: admit priority must be "high" or "normal"`, true, false},
+		{"normal request", oldDaemonPriorityRefusalFrame, false, false},
+		{"exclusive high, another unknown field", `E_DAEMON_PROTOCOL: unexpected admit field "vram"`, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
@@ -218,7 +235,7 @@ func TestOnlyTheOldDaemonPriorityRefusalDegrades(t *testing.T) {
 			reserve := int64(1 << 20)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			result, err := r.admit(ctx, Request{MemoryReserveOverride: &reserve, HighPriority: tc.high})
+			result, err := r.admit(ctx, Request{MemoryReserveOverride: &reserve, HighPriority: tc.high, Exclusive: tc.exclusive})
 			if err == nil {
 				result.releaseAdmission()
 				t.Fatal("a refused request was admitted")
@@ -231,8 +248,13 @@ func TestOnlyTheOldDaemonPriorityRefusalDegrades(t *testing.T) {
 					t.Fatalf("refusal %q does not contain %q", err.Error(), want)
 				}
 			}
-			if result.state != "refused" {
-				t.Fatalf("state=%q, want refused", result.state)
+			wantState := "refused"
+			if tc.exclusive {
+				// An exclusive request's terminal refusal keeps its own name.
+				wantState = "exclusive_unavailable"
+			}
+			if result.state != wantState {
+				t.Fatalf("state=%q, want %s", result.state, wantState)
 			}
 			if strings.Contains(diagnostics.String(), "NORMAL") {
 				t.Fatalf("a terminal refusal printed the degrade notice: %q", diagnostics.String())

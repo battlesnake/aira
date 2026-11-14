@@ -502,6 +502,17 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		// E_DAEMON_PROTOCOL is included because that is precisely what an OLDER
 		// daemon answers to the unknown `exclusive` field: version skew must be
 		// loud, not a silently contended benchmark.
+		// AIRA-340. The one refusal a NEW client meets against an OLDER daemon: it
+		// does not know the `priority` field. Handed back for one re-ask at normal
+		// priority (see errAdmitPriorityUnknown); every other refusal stays terminal.
+		// Matched BEFORE the exclusive block, which makes every other
+		// E_DAEMON_PROTOCOL terminal for an exclusive request: an exclusive high
+		// request re-asks too, and the re-ask keeps `exclusive` (only HighPriority
+		// is cleared), so exclusivity is still granted or refused by the daemon.
+		if req.HighPriority && response.Code == "E_DAEMON_PROTOCOL" && strings.Contains(response.Error, oldDaemonPriorityRefusal) {
+			_ = conn.Close()
+			return admissionResult{}, false, errAdmitPriorityUnknown
+		}
 		if req.Exclusive {
 			switch response.Code {
 			case "E_ADMIT_EXCLUSIVE_ACTIVE", "U_ADMIT_EXCLUSIVE_UNESTABLISHED", "E_DAEMON_PROTOCOL", "E_DAEMON_BUSY":
@@ -666,12 +677,6 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		}
 		if message == "" {
 			message = "the daemon refused admission"
-		}
-		// AIRA-340. The one refusal a NEW client meets against an OLDER daemon: it
-		// does not know the `priority` field. Handed back for one re-ask at normal
-		// priority (see errAdmitPriorityUnknown); every other refusal stays terminal.
-		if req.HighPriority && response.Code == "E_DAEMON_PROTOCOL" && strings.Contains(response.Error, oldDaemonPriorityRefusal) {
-			return admissionResult{}, false, errAdmitPriorityUnknown
 		}
 		return admissionResult{state: "refused", waitedMS: time.Since(admissionStarted).Milliseconds(), reserve: effectiveReserve, basis: "reject:daemon-refused"}, false,
 			fmt.Errorf("%s; refusing to launch ungoverned", message)
