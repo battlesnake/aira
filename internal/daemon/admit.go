@@ -1495,12 +1495,14 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 				read = s.db.ConfinePeakHistory
 			}
 			if read != nil {
+				readStart := time.Now()
 				stats, err := read(readCtx, request.signature)
 				if err != nil {
 					// The read itself could not be established (timeout / DB error).
 					// Distinguish this from genuine absence of history so the basis is
 					// honest; the reserve value still falls back safely below.
 					historyUnavailable = true
+					logAdmitHistoryReadFailure(request.signature, time.Since(readStart), readCtx.Err(), err)
 				} else {
 					own = stats
 					reserve := request.reserve

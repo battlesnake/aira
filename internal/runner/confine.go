@@ -1173,6 +1173,8 @@ func confineReserveHintSuggestion(peak int64) int64 {
 //     charged and the cap is not operator:--memory-max (with --memory-max the
 //     ledger charges the max, so lowering --memory-reserve changes nothing, even
 //     when the two happen to be equal);
+//   - scope-integrity shows the scope held the job (contained, unverified or
+//     descendant-killed), so the peak is not missing an escaped process (AIRA-334);
 //   - no container outside the job scope: a docker container runs under the
 //     system docker daemon and a caller-placed podman container is not known to be
 //     nested, so peak-rss leaves the workload out and the advice would under-charge
@@ -1191,6 +1193,16 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 		return ""
 	}
 	if status.Container != "" && status.Container != ContainerPlacementPodmanSplitInjected {
+		return ""
+	}
+	// AIRA-334. peak-rss counts only what stayed in the scope, so a run whose
+	// processes left it (descendant-escaped, migrated) or whose placement is not
+	// established (handoff-unverified, unset) under-reads, and the advice would
+	// under-size the next run. Unverified (placed, no escape witnessed) and
+	// descendant-killed (the descendant was in the scope) still count.
+	switch status.ScopeIntegrity {
+	case ScopeContained, ScopeUnverified, ScopeDescendantKilled:
+	default:
 		return ""
 	}
 	reserve, peak := status.ReserveBytes, *status.PeakRSS
@@ -1219,8 +1231,12 @@ func formatConfineReserveHint(status ConfineStatus, exitCode int, declaredBytes 
 	// read succeeds (a fallback:history-unavailable basis means the read failed
 	// and the default was used) (AIRA-314; pinned by
 	// TestHintEligibleRunFloorsTheNextUnpinnedReserve).
-	return fmt.Sprintf("confine: ACTION REQUIRED: over-reserved -- this job peaked at %s, only %d%% of the %s you pinned; an unused reserve like that can delay other jobs on the shared slice. "+
-		"Next run use --memory-reserve %s, or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins %s",
+	//
+	// AIRA-334. The number comes from this ONE run's peak, so the line says so: a
+	// warm build peaking at 1148M was told 1792M and its cold rebuild was
+	// OOM-killed.
+	return fmt.Sprintf("confine: ACTION REQUIRED: over-reserved -- this run peaked at %s, only %d%% of the %s you pinned; an unused reserve like that can delay other jobs on the shared slice. "+
+		"Next run use --memory-reserve %s (sized from this run alone; a command whose peak depends on a warm build cache needs its cold-run peak), or drop --memory-reserve and let aira estimate it from this command's history; also fix the script, Makefile or agent brief that pins %s",
 		FormatConfineMegabytes(peak), percent, FormatConfineMegabytes(reserve), FormatConfineMegabytes(suggestion), FormatConfineMegabytes(reserve))
 }
 

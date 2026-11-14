@@ -198,9 +198,8 @@ func TestExternalCgroupKillProducesNoOOMAdvisory(t *testing.T) {
 	if strings.Contains(advisory, "OOM-killed") {
 		t.Fatalf("external cgroup kill misreported as a kernel OOM kill: %q", advisory)
 	}
-	// A `sleep` peaks at a few hundred KiB against a 128 MiB cap, far below the
-	// 90% mark, so the near-cap branch cannot fire either -- the advisory is
-	// empty, i.e. the run's trailer is byte-identical to a clean run's.
+	// A run that was not OOM-killed gets no advisory at all (AIRA-334 deleted the
+	// near-cap line), so the run's trailer is byte-identical to a clean run's.
 	if advisory != "" {
 		t.Fatalf("AIRA-91's gap has changed shape: advisory = %q, want empty. If this is Fix 5 landing, update this assertion (and the comment above it) deliberately.", advisory)
 	}

@@ -993,6 +993,20 @@ func TestConfineScanReadsTheSupervisorCommandAndSaysUnevaluatedWhenItCannot(t *t
 		_, _ = live.Process.Wait()
 	})
 	livePID := live.Process.Pid
+	// AIRA-337. Start() returns once the exec-status pipe closes, which can be
+	// before the kernel has filled the new image's argv, so /proc/<pid>/cmdline may
+	// still read empty. Wait, through the production reader, until the exec has
+	// landed; the scan below then reads a settled argv.
+	settleDeadline := time.Now().Add(aira126Scale(5 * time.Second))
+	for {
+		if cmdline, err := readProcCmdline(livePID); err == nil && strings.Contains(string(cmdline), "held-job") {
+			break
+		}
+		if time.Now().After(settleDeadline) {
+			t.Fatalf("pid %d's /proc cmdline never showed the held-job argv within %s", livePID, aira126Scale(5*time.Second))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	liveScope := confineTestScopeID("live-command", livePID, now.Add(-time.Minute).UnixNano())
 	writeConfineTestScope(t, slice, liveScope, strconv.Itoa(livePID)+"\n")
 

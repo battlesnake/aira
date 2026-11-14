@@ -600,9 +600,8 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 	peak95 := int64(95)
 	peak89 := int64(89)
 	peak40G := int64(40 << 30)
-	halfMax := int64(math.MaxInt64 / 2)
+	peak100 := int64(100)
 	maxPeak := int64(math.MaxInt64)
-	almostMax := int64(math.MaxInt64 - 1)
 	for _, test := range []struct {
 		name     string
 		cap      int64
@@ -801,43 +800,21 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 			name: "oom without enforced whole-job cap", cap: 0, peak: &peak95, oom: true,
 		},
 		{
-			name: "exactly ninety percent is near cap", cap: 100, peak: &peak90,
-			want: "confine: peak RSS 90 reached 90% of the reserved cap 100; consider a higher --memory-reserve or --delegate-ram for suites",
+			// AIRA-334. A run that was NOT OOM-killed says nothing, however close its
+			// peak came to the cap. peak-rss is the scope's memory.peak, which counts
+			// reclaimable page cache, and swap is off on every confine scope, so a
+			// file-heavy job reads at its cap without ever having needed more: the
+			// old ">= 90% of the reserved cap; consider a higher --memory-reserve"
+			// line pushed such jobs to over-reserve the shared slice.
+			name: "a non-OOM run at exactly its cap is quiet", cap: 100, peak: &peak100,
+			source: ConfineCapSourceMemoryReserve, sliceCap: 64 << 30, acked: true,
 		},
-		{
-			name: "above ninety percent reports floored percentage", cap: 100, peak: &peak95,
-			want: "confine: peak RSS 95 reached 95% of the reserved cap 100; consider a higher --memory-reserve or --delegate-ram for suites",
-		},
-		{
-			// Negative control: removing the threshold guard would make this
-			// sub-ninety-percent observation emit a dishonest advisory.
-			name: "below ninety percent is quiet", cap: 100, peak: &peak89,
-		},
+		{name: "a non-OOM run at ninety percent is quiet", cap: 100, peak: &peak90},
+		{name: "a non-OOM run at ninety-five percent is quiet", cap: 100, peak: &peak95, source: ConfineCapSourceDaemonReserve},
+		{name: "below ninety percent is quiet", cap: 100, peak: &peak89},
 		{name: "unreadable peak without oom is quiet", cap: 100},
 		{name: "zero cap is always quiet", cap: 0, peak: &peak95},
-		{
-			// Non-round cap: 90/101 = 89.1% must stay quiet under the conservative
-			// `cap - cap/10` threshold; the old `cap*9/10` floor wrongly fired here.
-			name: "just below ninety percent with a non-round cap is quiet", cap: 101, peak: &peak90,
-		},
-		{
-			// Overflow safety: a cap near MaxInt64 must not overflow the threshold
-			// nor fabricate a near-cap warning for a sub-threshold peak.
-			name: "huge sub-threshold cap stays quiet without overflow", cap: math.MaxInt64, peak: &halfMax,
-		},
-		{
-			// Overflow safety: peak == cap near MaxInt64 reports 100% without
-			// overflowing the percentage multiply.
-			name: "huge near-cap reports safe percentage", cap: math.MaxInt64, peak: &maxPeak,
-			want: fmt.Sprintf("confine: peak RSS %s reached 100%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", FormatConfineBytes(math.MaxInt64), FormatConfineBytes(math.MaxInt64)),
-		},
-		{
-			// Overflow safety, discriminating: peak = cap-1 near MaxInt64 has a huge
-			// remainder, so peak%cap*100 overflows int64; the 128-bit path must still
-			// floor to 99%. A split-division would wrap here and report a wrong value.
-			name: "huge just-below-cap reports 99 percent without overflow", cap: math.MaxInt64, peak: &almostMax,
-			want: fmt.Sprintf("confine: peak RSS %s reached 99%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", FormatConfineBytes(math.MaxInt64-1), FormatConfineBytes(math.MaxInt64)),
-		},
+		{name: "a huge non-OOM run at its cap is quiet", cap: math.MaxInt64, peak: &maxPeak},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := formatConfineReserveAdvisory(test.cap, test.peak, test.oom, test.source, test.sliceCap, test.acked); got != test.want {
@@ -3235,5 +3212,32 @@ func TestOOMAdvisoryOnlyClaimsRecordingForAnAcknowledgedPeak(t *testing.T) {
 				t.Fatalf("over-ceiling hedged advisory names a pin the slice cannot hold: %q", got)
 			}
 		})
+	}
+}
+
+// verifies: AIRA-335 -- under an overridden HOME the unit-absent refusal names
+// the file it checked and the HOME it came from, and says to run aira with the
+// real HOME, because re-running `aira install` there would install into the
+// wrong HOME.
+func TestUnitAbsentRefusalNamesTheFileCheckedAndHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	deps := confineDeps{
+		managedUnitPresent:    func(string) (bool, error) { return false, nil },
+		resolveSlicePathExact: func(string) (string, error) { return "/cg/aira.slice", nil },
+	}
+	_, path, err := resolveDefaultConfineSlice(deps)
+	if err == nil || path != "" {
+		t.Fatalf("resolution=(%q,%v), want a refusal", path, err)
+	}
+	for _, want := range []string{
+		"aira-managed unit is absent",
+		"checked " + filepath.Join(home, ".config", "systemd", "user", "aira.slice"),
+		"(HOME=" + home + ")",
+		"run aira with your real HOME",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %q does not carry %q", err, want)
+		}
 	}
 }
