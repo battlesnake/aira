@@ -1420,6 +1420,11 @@ func TestSkillTeachesTheClaudeSessionConfineOwner(t *testing.T) {
 			// is retired and the skill teaches the cancel instead.
 			"`--kill` also cancels a job that is still waiting for admission",
 			"`confine: ran=no code=U_ADMIT_CANCELLED ... admission=cancelled` (exit 3)",
+			// The reply is the JSON object (indented on a terminal), so the
+			// skill names its fields, pinned against the render in
+			// cmd/aira TestConfineKillRendersThePhase.
+			"the reply carries `\"phase\": \"queued\"` and `\"status\": \"cancelled\"`",
+			"a running job's reply carries `\"phase\": \"running\"` and `\"status\": \"killed\"`",
 			"A name that matches both a queued and a running job is refused as ambiguous",
 			"Do not end a queued job with a plain `kill <supervisor pid>`: it bypasses the ownership guard",
 			"`aira confine --list --json` carries them as `queued[].owner`, `queued[].name` and `queued[].supervisor_pid`; the plain `--list` table lists running jobs only",

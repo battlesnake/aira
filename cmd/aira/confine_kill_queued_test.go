@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -57,8 +58,26 @@ func TestConfineKillRendersThePhase(t *testing.T) {
 			if exit := runWithInputDispatcher(argv, &stdout, &stderr, strings.NewReader(""), dispatch); exit != 0 {
 				t.Fatalf("argv=%v exit=%d stderr=%q", argv, exit, stderr.String())
 			}
-			if !strings.Contains(stdout.String(), result.Phase) || !strings.Contains(stdout.String(), result.Status) {
-				t.Fatalf("argv=%v stdout=%q lacks phase %q and status %q", argv, stdout.String(), result.Phase, result.Status)
+			var envelope struct {
+				Data runner.ConfineKillResult `json:"data"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+				t.Fatalf("argv=%v stdout=%q is not the JSON envelope: %v", argv, stdout.String(), err)
+			}
+			if envelope.Data.Phase != result.Phase || envelope.Data.Status != result.Status {
+				t.Fatalf("argv=%v data=%+v, want phase %q status %q", argv, envelope.Data, result.Phase, result.Status)
+			}
+		}
+		// The human (terminal) render is the indented object: the field
+		// spelling the skill teaches (`"phase": "queued"`).
+		var terminal terminalBuffer
+		var stderr bytes.Buffer
+		if exit := runWithInputDispatcher([]string{"confine", "--kill", "job"}, &terminal, &stderr, strings.NewReader(""), dispatch); exit != 0 {
+			t.Fatalf("terminal exit=%d stderr=%q", exit, stderr.String())
+		}
+		for _, want := range []string{`"phase": "` + result.Phase + `"`, `"status": "` + result.Status + `"`} {
+			if !strings.Contains(terminal.String(), want) {
+				t.Fatalf("terminal render %q lacks %s", terminal.String(), want)
 			}
 		}
 	}
