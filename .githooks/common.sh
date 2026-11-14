@@ -41,9 +41,18 @@ aira_hook_scrub_git_env() {
 
 # aira_hook_run_make runs the named make targets against the committing
 # worktree, confined, with a clean environment. It never returns.
+#
+# The second argument is the admission queue priority (AIRA-340): `high` only
+# for a SHORT step (the pre-commit quick checks, measured at 6-10 s wall), so a
+# commit does not wait behind slow jobs on a busy box; `normal` for anything
+# long (`make ci`, the store tests). An installed aira that predates
+# `--priority` is detected from its own help and runs the step at normal
+# priority with a one-line note, instead of refusing every commit until the
+# binary is reinstalled.
 aira_hook_run_make() {
 	local hook_name="$1"
-	shift
+	local priority="$2"
+	shift 2
 
 	local root
 	if ! root="$(aira_hook_worktree_root)"; then
@@ -58,6 +67,15 @@ aira_hook_run_make() {
 		return 1
 	fi
 
+	local -a confine_opts=()
+	if [ "$priority" = high ]; then
+		if aira confine --help 2>/dev/null | grep -q -- '--priority'; then
+			confine_opts=(--priority high)
+		else
+			printf '%s: the installed aira has no `confine --priority`; running at normal queue priority.\n' "$hook_name" >&2
+		fi
+	fi
+
 	aira_hook_scrub_git_env
-	exec aira confine -- make -C "$root" "$@"
+	exec aira confine "${confine_opts[@]}" -- make -C "$root" "$@"
 }

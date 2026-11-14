@@ -76,9 +76,9 @@ docs)
 	;;
 tickets)
 	printf 'pre-push: every pushed path is Markdown under docs/ or .aira/tickets/ (against origin/master); running only the internal/store tests (AIRA-315).\n' >&2
-	aira_hook_run_make pre-push test-store
+	aira_hook_run_make pre-push normal test-store
 	;;
 *)
-	aira_hook_run_make pre-push ci
+	aira_hook_run_make pre-push normal ci
 	;;
 esac
