@@ -61,10 +61,12 @@ after rev 2), and they gain sequence notes.
    report: **its new launches are refused** at admission. Only jobs already running at cutover
    lose their row. Verified in section 5.1.6.
 9. **Replay script and golden table.** `keys()` takes the repo identity. Legacy rows (no repo)
-   are keyed under a replay-only placeholder, which groups them exactly as rev 2 did. This was
-   verified on every distinct confine signature in the live store: 158,747 signatures, 0
-   mismatches. The script gains `--self-test` against a new committed golden table of 21
-   cases. Rev 2 promised that table but no file existed.
+   are keyed under a replay-only placeholder, which groups them exactly as rev 2 did. This
+   holds by construction: every legacy key is a fixed prefix plus the unchanged rev-2
+   expression, and the exact-signature level is untouched. So the grouping is unchanged; the
+   printed numbers move only because the store keeps growing. The script gains `--self-test`
+   against a new committed golden table of 26 cases. Rev 2 promised that table but no file
+   existed.
 10. **Interactions** with AIRA-340, 341, 228, 225, 321, 331 and 236 are recorded as sequence
     notes in section 10.
 
@@ -215,7 +217,7 @@ behave exactly as today.
 | Value | Computed by | How | When it is absent |
 |---|---|---|---|
 | `wall_ms` | client | Monotonic milliseconds from the return of the admission call (`deps.admit` in `confine_linux.go`, about line 744) to the construction of the `ConfinePeakReport` (about line 1456). It covers the run, scope setup and the teardown reads before the report. | Never absent on a confine report. A sub-millisecond run reports 0, which is a real 0. |
-| `wait_ms` | client | Monotonic milliseconds across the whole `deps.admit` call. | Sent **only** when the admission ended in a daemon grant: the lease return at `admission_linux.go:689`, so `admission.release != nil`. The `bypassed`, `disabled` and `unevaluated`/`no-daemon` results (`admission_linux.go:197, 208, 240`) carry a zero `waitedMS` that is a Go zero value, not a measurement, so no wait is sent for them. |
+| `wait_ms` | client | Monotonic milliseconds across the whole `deps.admit` call. | Sent **only** when the admission ended in a daemon grant. `deps.admit` is `admitConfine` (`confine_linux.go:1900`), which returns the package's `admissionResult` (`admission_linux.go:27-35`). The launch site is in the same package and tests `admission.release != nil`. `release` is set in exactly one place, the lease return at `admission_linux.go:689`, for every daemon grant: `immediate`, `waited`, and the daemon's own `unevaluated` grant. The client-local results carry no `release` and a `waitedMS` that is a Go zero value, not a measurement, so no wait is sent for them. Those results are `disabled` (`admission_linux.go:208`) and `unevaluated` with reason `no-daemon` (`:240`). They share the state name `unevaluated` with a daemon grant, and `release` is what tells them apart. `bypassed` (`:197`) needs `NoAdmit`, which `admitConfine` never sets. |
 | `repo` | client | Section 5.1.3, from the client's working directory at launch, computed once before admission. | Absent when the identity cannot be established (section 5.1.3). |
 | `at` (existing) | daemon | `time.Now()` when the report is handled (`confine_report.go:101`). | Never. |
 | start time | nobody stores it | Readers compute `at - wall_ms`. The error is one local socket write plus the handler's entry, sub-millisecond to a few ms. | Absent when `wall_ms` is absent (pre-323 rows, pool rows). |
@@ -253,6 +255,9 @@ Client (`internal/runner`):
 - `ReportPeakSample` adds each field only when it is set. The `<= 0 -> omit` idiom used for
   `peak_rss` and `budget` must **not** be copied, because 0 is a real duration. Nil is the only
   "absent".
+- The client never sends a value the daemon would refuse. A duration outside the bounds, such
+  as a run longer than 366 days, is omitted (NULL), and the rest of the report, peak and OOM
+  included, still goes out. Under refuse-never-repair, sending it would lose the whole sample.
 - The confine launch site fills the three fields per section 5.1.1. Shim mode still sends no
   report (`confine_shim_linux.go:515`, unchanged).
 - `aira confine-report` (the aitest pool face, `cmd/aira/main.go:1405-1438`) is unchanged and
@@ -354,7 +359,7 @@ key_cmd    = P + a0 + "|" + (pos[0] or "")          command and first positional
 ```
 
 The authority is `keys()` in the replay script (its `N1`, `N2` and `N3`) together with the golden
-table. A Go test and `--self-test` must both reproduce all 21 cases byte for byte. When the
+table. A Go test and `--self-test` must both reproduce all 26 cases byte for byte. When the
 prose and the script disagree, the script and the table win, and the prose is fixed. The
 argv part is rev 2's function unchanged. Collisions in it are possible (`a0` containing `|`, a
 token containing a space) and are accepted: a collision only merges two histories.
@@ -678,7 +683,13 @@ AIRA-323 (each names the mutation that must turn it red):
   - `WallMS` covers an injected clock advance between admission return and report. Add a clock
     seam to `confineDeps` if none exists.
   - With no reconnect, `WaitMS` equals the grant's `waitedMS` within the fake clock's step.
-  - Mutation: send `admission.waitedMS` (the Go zero) for a lease-less admission, red.
+  - A daemon `unevaluated` grant (with a lease) sends `WaitMS`; the local `no-daemon`
+    `unevaluated` does not.
+  - A duration over 366 days is omitted by the client, not sent; the report still goes out.
+  - Mutations, each red:
+    - send `admission.waitedMS` (the Go zero) for a lease-less admission;
+    - key the rule on `state == "unevaluated"` instead of `release`;
+    - send an out-of-range duration.
 - **T5. `RepoIdentity` on real temporary repositories:**
   - plain repo and a subdirectory: the same ID;
   - linked worktree: equals the main checkout;
@@ -690,7 +701,7 @@ AIRA-323 (each names the mutation that must turn it red):
     check sits in an `app` package test, because `runner` cannot import `app`).
   - Mutation: hash the worktree's own `gitdir` instead of its `commondir`, red.
 - **T6. Key golden table.** A Go test loads `docs/dev/aira-history-charge-keys.golden.json` and
-  asserts `CommandKeys` on all 21 cases. `python3 -I docs/dev/aira-history-charge-replay.py
+  asserts `CommandKeys` on all 26 cases. `python3 -I docs/dev/aira-history-charge-replay.py
   --self-test` checks the same file. Mutations (already run on the script, section 11): drop the
   repo prefix (21 mismatches), 13 arguments instead of 14 (1), drop `-p` from the `time` flags
   (1). Each is red.
@@ -803,10 +814,13 @@ Sequence notes (verified where marked):
 - **Rev 2 -> 3** (this revision, for AIRA-323's plan gate): see "Rev 3 changes" at the top.
   Verification run for it:
   - `python3 -I -m py_compile` on the script: exit 0.
-  - `--self-test`: 21 cases, 0 mismatches, exit 0. The three mutations named in T6 each exit 1.
-  - The new `keys(sig, None)` equals `"?" + US + ` the rev-2 `keys(sig)` at every level, for all
-    158,747 distinct confine signatures in the live store: 0 mismatches. So every rev-2 number
-    reproduces unchanged.
+  - `--self-test`: 26 cases, 0 mismatches, exit 0. The three mutations named in T6 each exit 1.
+  - The full replay (`part1`-`part3`, which exercises the new `history_sql()` and the legacy
+    keying) ran to completion on the live store under `aira confine` on 2026-11-14, exit 0. It
+    read 51,102 pinned jobs since 2026-10-20, against rev 2's 50,006, because the store grew.
+    History coverage was 0.72, and flat 0.8 x pin gave 1.25x at a mixed p99 of 0.78 and a burst
+    p99 of 0.88. These are within noise of the section 2 table.
+  - Legacy neutrality is by construction (rev 3 change 9), not by a measurement.
   - Retention exposure: the query in section 5.1.5, 2026-11-14.
 - Rev 2 after confirmation review: re-declare reconstruction fixed (frozen ARDR record: live
   reconnect keeps the charge, restart charges the full pin); head eligibility needs full-pin

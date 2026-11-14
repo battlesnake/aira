@@ -320,6 +320,80 @@
     "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|--locked build --release",
     "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fcargo|build"
    }
+  },
+  {
+   "name": "time -o FILE -a unwrapped",
+   "argv": [
+    "/usr/bin/time",
+    "-o",
+    "out.txt",
+    "-a",
+    "make",
+    "ci"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fmake|ci"
+   }
+  },
+  {
+   "name": "time --format X unwrapped",
+   "argv": [
+    "time",
+    "--format",
+    "%e %M",
+    "go",
+    "build"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|build",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|build",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fgo|build"
+   }
+  },
+  {
+   "name": "bare time is left as the command",
+   "argv": [
+    "time"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001ftime|"
+   }
+  },
+  {
+   "name": "uv run is not unwrapped",
+   "argv": [
+    "uv",
+    "run",
+    "pytest",
+    "-q"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fuv|run pytest -q",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fuv|run pytest -q",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fuv|run"
+   }
+  },
+  {
+   "name": "a flag with 3+ digits is masked to <n> and becomes the first positional (pinned quirk)",
+   "argv": [
+    "python3",
+    "--seed=12345",
+    "sim.py"
+   ],
+   "repo": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "want": {
+    "key_masked": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<n> <p>",
+    "key_first4": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<n> <p>",
+    "key_cmd": "3f1caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fpython3|<n>"
+   }
   }
  ]
 }

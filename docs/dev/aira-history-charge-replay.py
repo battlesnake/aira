@@ -23,7 +23,8 @@ function must also reproduce, docs/dev/aira-history-charge-keys.golden.json):
 Rev 3 (AIRA-323): the key carries the repo identity the client sends (`repo` column: 64 hex
 digits, or "none" outside any git repository). Rows written before AIRA-323 have no repo; the
 replay keys them under the legacy placeholder "?", which groups them exactly as rev 2 did (every
-legacy key is "?" + US + the rev-2 key), so the rev-2 numbers in the spec reproduce unchanged.
+legacy key is "?" + US + the rev-2 key, by construction), so the rev-2 grouping is unchanged;
+printed numbers move only as the store grows.
 The Go build never writes a key for a row without a repo (it stores NULL); "?" is replay-only.
 
 Measured 2026-11-13/14 on the live box. LIMITS: the table holds job-END rows only (no
