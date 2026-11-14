@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-328","project":"aira","title":"confine --kill must resolve a QUEUED job (cancel the waiter) by name, supervisor pid and scope id","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.41","labels":["rant-triage"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-328","project":"aira","title":"confine --kill must resolve a QUEUED job (cancel the waiter) by name, supervisor pid and scope id","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.41","labels":["rant-triage"],"hold":false,"relations":[]}
 ---
 About 35 rants (RANT-61,66,71,75,79..101,103,110,113..127). aira confine --list shows a queued job with name+supervisor_pid+scope_id but --kill answers E_CONFINE_NOT_FOUND because KillConfine (internal/runner/confine_manage.go) resolves against cgroup scopes only and a queued job has none. --front already resolves queued waiters. Fix: daemon-side cancel of the queued waiter with the same ownership guard (--steal for another owner); ledger/queue invariants and the exclusive gate must hold; the client supervisor must exit with a distinct, honest trailer. Correctness-critical: full two-loop.
 
