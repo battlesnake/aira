@@ -83,7 +83,12 @@ Earlier rev-3 rounds (kept where the design still has the item): round 1 restore
 `started_at_ms` as a client-captured field, required symlink resolution of the working
 directory before the repo walk, and stopped T4 equating the client's wait with the daemon's;
 round 2 named every new field in the allowlist (now a T1 mutation) and moved all validation
-into the handler.
+into the handler. The review of the collapsed text (round 4) found three porous checks, now
+pinned: T9 runs its old-daemon cases with `OOM` true and false and asserts the stored `oom`
+(a re-send that reset the bit passed every earlier assertion); T3 has a refused case one past
+every bound of every field, so deleting only the `wait_ms` upper bound is red; and the rollout
+smoke test (section 6) checks a fresh-nonce probe's own new row instead of the latest row in
+the store, which another session's report could make a false pass or a false failure.
 
 ## 1. The problem, in plain terms
 
@@ -666,15 +671,35 @@ It fixes who gets freed memory first, not capacity; capacity comes from 5.2.
      between the two steps (section 5.1.6). Stale binaries and MCP servers keep writing rows
      with the four columns NULL until they are restarted; peers are told so, not warned of
      refusals.
-   - Smoke test after cutover: one small confined run in a git checkout, then
+   - Smoke test after cutover. Each probe run carries a fresh nonce in its argv, so its
+     signature (the effective argv joined with NUL, `ResourceSignature`,
+     `resource_estimate.go:82`) is its own, and the check counts only rows inserted after the
+     probe started. The daemon commits the row before it acknowledges the report, and the
+     report is sent before `aira confine` exits (`confine_linux.go:1445-1460`), so the row is
+     there when the command returns.
 
      ```
-     sqlite3 -readonly ~/.local/state/aira/state.db \
-       "select wall_ms,wait_ms,started_at_ms,repo from confine_peak_history
-        order by rowid desc limit 1"
+     db=~/.local/state/aira/state.db
+     nonce=aira-323-smoke-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+     before=$(sqlite3 -readonly "$db" "select coalesce(max(rowid),0) from confine_peak_history")
+     aira confine -- true "$nonce"      # from a git checkout
+     sqlite3 -readonly "$db" \
+       "select count(*), count(wall_ms), count(wait_ms), count(started_at_ms),
+               sum(repo glob '[0-9a-f]*' and length(repo)=16)
+        from confine_peak_history
+        where rowid > $before and instr(signature, '$nonce') > 0"
      ```
 
-     which must show four non-NULL values. A run from `/` must show `repo = none`.
+     The output must be exactly `1|1|1|1|1`: one new row for this probe, all four facts
+     non-NULL, a 16-hex-digit repo. The same probe with a second nonce, run from `/`, must give
+     `1|1|1|1|0`, and that row's `repo` must be `none`. `0|0|0|0|` (no row) is a failure: the
+     probe's report was lost or not sent.
+     The check must survive two interleavings, both of which fooled rev 3's
+     `order by rowid desc limit 1`: a stale client's report (NULL facts) landing after the
+     probe's row (rev 3 read the stale row: a false failure), and the probe's report suppressed
+     while another session's populated row is the latest (rev 3 read that row: a false pass).
+     The nonce and the `rowid > $before` bound make another session's row unable to match in
+     either case.
    - The branch follows Batch A, which edits the same report lines.
 2. AIRA-324 in observe for a week of normal load; then enforce at 0.9 for a week, then 0.8.
    **Gate to start enforce:** a counterfactual replay of the real arrival/start/end timeline
@@ -749,19 +774,24 @@ rev 3 changes):
 - **T3. Validation table**, at the handler, the one layer that validates (5.1.2). A `daemon`
   test sends each `Request.Args` map to `Server.confineReport` over a temporary store; the map
   is the test's input (T1 covers the real sender).
-  - Refused with `E_DAEMON_PROTOCOL` and no row written:
-    - `wall_ms` of -1 or of 366 days + 1 ms;
-    - `wait_ms` of -1;
-    - 1.5 and `"abc"`;
+  - Refused with `E_DAEMON_PROTOCOL` and no row written (every bound of every field has its own
+    case one past it, so a bound deleted from one field's check alone is red):
+    - `wall_ms` of -1 and of 31,622,400,001 (366 days + 1 ms);
+    - `wait_ms` of -1 and of 31,622,400,001;
+    - each of `wall_ms`, `wait_ms` and `started_at_ms` as 1.5 and as `"abc"`;
     - `started_at_ms` of 946,684,799,999, of 4,102,444,800,000, of 0 and of -1;
     - `repo` of `""`, `"NONE"`, 15 or 17 hex digits, a 64-hex-digit value, upper-case hex, or
       a path.
-  - Accepted (boundaries): 0, exactly 366 days, `started_at_ms` of 946,684,800,000 and of
-    4,102,444,799,999, a `started_at_ms` later than the daemon's own clock (a clock step is
-    not refused), `none`, 16 hex digits.
-  - Mutations, each red: remove each bound in turn; skip the check of any one field (the writer
-    does not re-check, so the bad value is stored and the "no row" assertion fails); refuse
-    `started_at_ms` later than `at`.
+  - Accepted (boundaries), each stored as sent: `wall_ms` and `wait_ms` each of 0 and of
+    31,622,400,000 (exactly 366 days); `started_at_ms` of 946,684,800,000 and of
+    4,102,444,799,999; a `started_at_ms` later than the daemon's own clock (a clock step is
+    not refused); `repo` of `none` and of 16 hex digits.
+  - Mutations, each red: remove each of the seven bounds in turn (lower and upper of
+    `wall_ms`, of `wait_ms` and of `started_at_ms`, and the `repo` pattern; deleting only the
+    `wait_ms` upper bound is caught by `wait_ms` = 31,622,400,001 alone); move any bound by one
+    (`<` for `<=` and the reverse, caught by the accepted boundaries); skip the check of any
+    one field (the writer does not re-check, so the bad value is stored and the "no row"
+    assertion fails); refuse `started_at_ms` later than `at`.
 - **T4. Launch-site timing** (fake `confineDeps` with the `wallNow`/`monoNow` seam of 5.1.1,
   captured `reportPeak`). Every expectation is on the client's own fake clocks; none compares
   the client's figure with the daemon's `waitedMS`.
@@ -823,12 +853,16 @@ rev 3 changes):
   refusal paths are master's. The swap is a package variable, so these cases do not run in
   parallel and restore the map with `t.Cleanup`.
   - (a) Old daemon, a report with peak, budget pair and the four facts (nine fields: the count
-    guard path): `ReportPeakSample` returns nil; the row holds the peak and the budget pair and
-    NULL facts; 2 requests.
+    guard path): `ReportPeakSample` returns nil; the row holds the peak, the budget pair, the
+    sent `oom` and NULL facts; 2 requests.
   - (b) Old daemon, a report with only `signature`, `oom`, `wall_ms` and `started_at_ms` (four
     fields: the unknown-field path): the same outcome.
-  - (c) New daemon, a report with `Repo = "NONE"` (the client does not pre-check): stored with
-    the peak and NULL facts; 2 requests.
+  - (a) and (b) each run twice, once with `OOM = true` and once with `OOM = false`, and assert
+    the stored `oom` column (1 and 0) on the row the re-send wrote. The estimator escalates on
+    a recorded OOM (`estimate:oom-escalated`, `admit.go:1548`), so the bit must survive the
+    re-send; the two values together catch a re-send that hard-codes either one.
+  - (c) New daemon, a report with `Repo = "NONE"` (the client does not pre-check) and
+    `OOM = true`: stored with the peak, `oom = 1` and NULL facts; 2 requests.
   - (d) New daemon, a report with no new field and an unknown `Kind`: refused, error returned,
     1 request.
   - (e) A report with an unknown `Kind` and `WallMS`: refused twice, error returned, exactly 2
@@ -839,8 +873,9 @@ rev 3 changes):
     (`internal/runner/protocol_pin_linux_test.go:25`) stays at 15, unchanged.
   - Mutations, each red: no re-send ((a), (b)); match only the "unexpected confine-report
     field" text ((a)); re-send keeping the new fields ((a), (b), (c)); re-send also dropping
-    peak or budget ((a)); re-send when the frame carried no new field ((d)); re-send until
-    success ((e)); re-send on a transport error ((f)).
+    peak or budget ((a)); re-send with `oom` false ((a), (b) and (c) with `OOM = true`);
+    re-send with `oom` true ((a), (b) with `OOM = false`); re-send when the frame carried no
+    new field ((d)); re-send until success ((e)); re-send on a transport error ((f)).
 
 AIRA-324-326 (unchanged from rev 2, except that test 7 moved to 323 and was then cut with the
 key (rev 3), and test 8 moved to the readers):
