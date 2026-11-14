@@ -1273,6 +1273,9 @@ func (r *tuiRuntime) showInlineMiniForm() {
 	form.AddButton("Cancel", r.closeInline)
 	form.SetCancelFunc(r.closeInline)
 	dialog := newDialog(inlineMiniFormTitle(pending), inlineMiniFormBody(pending), form, "")
+	for _, field := range fields {
+		field.SetChangedFunc(func(string) { dialog.setNotice("") }) // a refusal is about the value it judged
+	}
 	r.paletteSubmit = func() {
 		values := make(map[string]string, len(fields))
 		for name, field := range fields {

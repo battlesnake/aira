@@ -91,11 +91,10 @@ func newDialog(title, body string, form *tview.Form, details string) *dialog {
 		d.hintText += dialogHintDetails
 	}
 	d.hint = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetText(d.hintText).SetTextStyle(tcell.StyleDefault.Dim(true))
-	d.column = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(d.body, 0, 1, form == nil).
-		AddItem(d.notice, 0, 0, false)
+	d.column = tview.NewFlex().SetDirection(tview.FlexRow).AddItem(d.body, 0, 1, form == nil)
 	if form != nil {
-		d.column.AddItem(form, 1, 0, true)
+		// A blank row, then the notice (a refused value) above the form.
+		d.column.AddItem(nil, 1, 0, false).AddItem(d.notice, 0, 0, false).AddItem(form, 1, 0, true)
 	}
 	d.column.AddItem(d.hint, 1, 0, false)
 	d.column.SetBorder(true).SetTitle(" "+strings.TrimSpace(title)+" ").SetBorderPadding(0, 0, 1, 1)
@@ -125,7 +124,7 @@ func (d *dialog) fieldFocused() bool {
 }
 
 // setNotice shows text (a refused value, why) on its own full-width line above
-// the form; empty hides it.
+// the form; empty hides it. Only a dialog with a form has the line.
 func (d *dialog) setNotice(text string) { d.notice.SetText(text) }
 
 // page is the dialog centred on the terminal, sized to its content.
@@ -144,16 +143,16 @@ func (d *dialog) size(maxWidth, maxHeight int) (int, int) {
 	formRows := 0
 	if d.form != nil {
 		formRows = 1 // the button row
+		d.column.ResizeItem(d.notice, wrappedRows(d.notice.GetText(false), inner), 0)
 		for index := 0; index < d.form.GetFormItemCount(); index++ {
 			formRows += 2 // the field and the blank row under it
 		}
 		d.column.ResizeItem(d.form, formRows, 0)
+		formRows += 1 + wrappedRows(d.notice.GetText(false), inner) // the blank row and the notice
 	}
-	noticeRows := wrappedRows(d.notice.GetText(false), inner)
 	hintRows := wrappedRows(d.hintText, inner)
-	d.column.ResizeItem(d.notice, noticeRows, 0)
 	d.column.ResizeItem(d.hint, hintRows, 0)
-	return width, 2 + wrappedRows(d.body.GetText(false), inner) + noticeRows + formRows + hintRows
+	return width, 2 + wrappedRows(d.body.GetText(false), inner) + formRows + hintRows
 }
 
 // wrappedRows is how many rows text takes word-wrapped at width.

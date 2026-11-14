@@ -229,7 +229,8 @@ func TestDialogResultHidesJSONBehindD(t *testing.T) {
 }
 
 // verifies: AIRA-342 item 3 — a refused size is said on its own line above the
-// form, whole and inside the dialog, at 80 and at 28 columns; the form stays.
+// form, whole and inside the dialog, at 80 and at 28 columns; the form stays,
+// and editing the value clears the refusal.
 func TestDialogRefusedSizeIsShownAboveTheForm(t *testing.T) {
 	_, parseErr := runner.ParseConfineResizeReserve("2")
 	want := "E_CONFINE_ARGUMENT_INVALID: new reserve " + strconv.Quote("2") + ": " + parseErr.Error()
@@ -247,6 +248,12 @@ func TestDialogRefusedSizeIsShownAboveTheForm(t *testing.T) {
 			}
 			if page := onUI(t, runtime, func() string { name, _ := runtime.outerPages.GetFrontPage(); return name }); page != inlinePage {
 				t.Fatalf("a refused size left the form for %q", page)
+			}
+			// Editing the value retires the refusal, which was about the old value.
+			keys.typeText("G")
+			keys.barrier(t)
+			if text := simulationTextOnUI(t, runtime, screen); strings.Contains(text, "E_CONFINE") {
+				t.Fatalf("the refusal outlived the value it judged:\n%s", text)
 			}
 		})
 	}
