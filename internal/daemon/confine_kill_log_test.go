@@ -93,7 +93,11 @@ func TestConfineKillLogsTheKillerOnlyWhenItActuallyKills(t *testing.T) {
 		if response.Code != "OK" {
 			t.Fatalf("kill did not succeed: %+v", response)
 		}
-		for _, want := range []string{"confine-kill", "killer=session-a", "target-scope=" + id, "target-name=victim", "target-owner=session-a"} {
+		// AIRA-328: a running job's kill says so in the reply and the line.
+		if result, ok := response.Data.(runner.ConfineKillResult); !ok || result.Phase != runner.ConfineKillPhaseRunning || result.Status != runner.ConfineKillStatusKilled {
+			t.Fatalf("kill reply=%+v, want phase=%s status=%s", response.Data, runner.ConfineKillPhaseRunning, runner.ConfineKillStatusKilled)
+		}
+		for _, want := range []string{"confine-kill: phase=running", "killer=session-a", "target-scope=" + id, "target-name=victim", "target-owner=session-a"} {
 			if !strings.Contains(output, want) {
 				t.Fatalf("daemon log %q lacks %q", output, want)
 			}
