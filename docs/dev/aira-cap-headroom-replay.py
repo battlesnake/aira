@@ -24,15 +24,18 @@ Parts
   3  the AIRA-318 interaction: clean auto rows whose peak reached >= 95% of their cap (a cap the
      page cache filled). Under L = k x C such a run records a peak near k x C, and the estimator
      books 1.15 x that next time. Then, for each such row, what the NEXT retained row of the same
-     signature did (unestablished / does not follow the cap / ratchet-like / real growth), at the
-     95% and 99% thresholds: the evidence for how many signatures the ratchet establishes and for
-     what a learning rule alone at k = 1 would cost.
+     signature did (unestablished / does not follow the cap / candidate ratchet step / real
+     growth), at the 95% and 99% thresholds. Cap proximity cannot separate page cache filling a
+     cap from anonymous growth to it, so the ratchet pairs are CANDIDATES, not established
+     cache-fillers; the part also bounds what a learning rule alone at k = 1 would cost.
   4  the downside: 20 concurrent auto jobs (mixed, and 20 of one command+subcommand "burst",
      and bursts of commands that have an OOM on record), sum of use over sum of bookings, today
      and under k. With the ledger full, sum(bookings) ~ the ceiling, so P(ratio > 1) is the
      chance the slice would be driven over its ceiling by the jobs' own use.
-  5  the page-cache ratchet by arithmetic under three learning rules, and the one-time step of a
-     finite cache under the booking rule.
+  5  the page-cache ratchet by arithmetic under three learning rules (a hypothetical job whose
+     cache fills any limit), the one-time step of a finite cache under the booking rule and the
+     recommended limit (including a large booking, where the 1 GiB term binds), and a k lowered
+     after history was written at a higher k (rev 2's unconditional rule against rev 3's).
   6  the additive alternative L = min(k x C, C + H): killed caps by size, the within-k proxy at
      several H, and the total headroom it hands out relative to L = k x C.
 
@@ -264,20 +267,25 @@ def part3(rows):
         print("  clean auto rows at >= %.0f%% of cap: %s" % (100 * f, pct(sum(1 for r in cl if r[2] >= f * r[5]), len(cl))))
     # growth of the cap across CONSECUTIVE rows of one signature (a row of any source in between
     # breaks the pair) that are both clean auto rows at >= 95% of their cap.
+    # These are CANDIDATES only: cap proximity cannot tell page cache filling the cap from anonymous
+    # memory that grew ~15% per run to the next cap; the store holds no anon/cache split.
     prev = {}
     grow = []
+    pair_sigs = set()
     for _rid, sig, peak, oom, _at, bud, bb in rows:
         atcap = bb == AUTO and not oom and peak and bud and peak >= 0.95 * bud
         if atcap and sig in prev:
             grow.append(bud / prev[sig])
+            pair_sigs.add(sig)
         if atcap:
             prev[sig] = bud
         else:
             prev.pop(sig, None)
     if grow:
         grow.sort()
-        print("  consecutive at-cap clean runs of one signature: %d pairs, cap ratio median %.3f, p90 %.3f" % (
-            len(grow), grow[len(grow) // 2], grow[int(0.9 * len(grow))]))
+        print("  consecutive at-cap clean runs of one signature (candidate ratchet pairs; cache and anon growth"
+              " not separable): %d pairs over %d signatures, cap ratio median %.3f, p90 %.3f" % (
+                  len(grow), len(pair_sigs), grow[len(grow) // 2], grow[int(0.9 * len(grow))]))
     print("  where an at-cap row sits: peak >= 99.9%% of cap %d; 99-99.9%% %d; 95-99%% %d" % (
         sum(1 for r in at if r[2] >= 0.999 * r[5]),
         sum(1 for r in at if 0.99 * r[5] <= r[2] < 0.999 * r[5]),
@@ -316,7 +324,7 @@ def next_row(rows, thr):
             elif npeak <= bud:
                 out["f  next cap grew, next peak <= old cap (does not follow the cap)"] += 1
             elif npeak >= thr * nbud:
-                out["g  next peak > old cap and at its own new cap (ratchet-like)"] += 1
+                out["g  next peak > old cap and at its own new cap (candidate ratchet step: cache or anon growth)"] += 1
             else:
                 out["h  next peak > old cap, below thr of new cap (real growth; step 1 at k=1 risks a kill)"] += 1
                 risk.append(npeak / bud)
@@ -443,22 +451,70 @@ def part5():
                 c = est
                 seq.append(c)
             print("  k=%.0f %-8s %s" % (k, name, " ".join("%.2f" % v for v in seq)))
-    # A FINITE cache: the job reads 1.5 GiB of files once per run (anonymous need tiny), so its
-    # peak is min(limit, 1.5 GiB). Under the booking rule at k = 2 the first run's 1.5 GiB peak is
-    # below 95% of its 2 GiB limit, so it reads as a real peak: a one-time step to 1.15 x 1.5, then
-    # stable. The worst case is a finite cache just under 0.95 x k x C: one step to 1.15 x 0.95 x k.
-    for k, files in ((2.0, 1.5), (2.0, 1.89), (1.5, 1.42)):
-        c = 1.0
+    # A FINITE cache: the job reads F GiB of files once per run (anonymous need tiny), so its peak
+    # is min(limit, F), under the RECOMMENDED limit L = max(C, min(k x C, C + 1 GiB)). Under the
+    # booking rule the first run's F is below 95% of its limit, so it reads as a real peak: a
+    # one-time step to 1.15 x F, then stable. The worst case is F just under 0.95 x L: one step to
+    # 1.15 x 0.95 x L = 1.0925 x min(k x C, C + 1 GiB). The last case is a large booking, where the
+    # 1 GiB term binds and the step exceeds C + 1.15 GiB (C = 10 GiB steps to 12.01 GiB).
+    print("  finite cache under L = max(C, min(k x C, C + 1 GiB)); bound 1.0925 x L of the first run:")
+    for k, c0, files in ((2.0, 1.0, 1.5), (2.0, 1.0, 1.89), (1.5, 1.0, 1.42), (2.0, 10.0, 10.44)):
+        c = c0
         seq = []
         for _ in range(6):
-            limit = k * c
+            limit = rule_limit(c, k)
             peak = min(limit, files)
             est = 1.15 * peak
             if peak >= 0.95 * limit:
                 est = min(est, c)
             c = max(est, 0.0)
             seq.append(c)
-        print("  k=%.1f booking, finite cache %.2f GiB: %s" % (k, files, " ".join("%.2f" % v for v in seq)))
+        print("  k=%.1f C=%.0f GiB booking, finite cache %.2f GiB: %s (bound %.3f)" % (
+            k, c0, files, " ".join("%.3f" % v for v in seq), 1.0925 * rule_limit(c0, k)))
+    part5_rollback()
+
+
+def rule_limit(c, k):
+    """The recommended limit, in GiB: L = max(C, min(k x C, C + 1 GiB))."""
+    return max(c, min(k * c, c + 1.0))
+
+
+def part5_rollback():
+    """k lowered after history was written at a higher k (a rollback to k = 1, or 2 -> 1.5).
+    The job's need is ANONYMOUS and fixed at 1.95 GiB; C0 = 1 GiB. Three runs at k = 2, then three
+    at the lowered k. Each run records (reserve, budget = its limit, peak, oom). The estimate is
+    max over clean rows of 1.15 x effective peak, raised to 1.5 x the largest OOM peak when an
+    OOM is retained (D2), never below C0.
+      master     no headroom ever (k = 1 throughout): the reference
+      rev2       a clean row at >= 95% of a limit above its booking counts as at most its booking
+      rev3       the same, ONLY while the current rule's limit for that row's booking is at least
+                 the limit it ran under (rule_limit(reserve, k_now) >= budget); else read raw"""
+    need = 1.95
+    print("  k lowered after history written at k = 2 (anonymous need %.2f GiB, C0 = 1 GiB):" % need)
+    for k_low in (1.0, 1.5):
+        for name in ("master", "rev2", "rev3"):
+            hist = []
+            out = []
+            for i in range(6):
+                k_now = 1.0 if name == "master" else (2.0 if i < 3 else k_low)
+                est = 1.0
+                for reserve, budget, peak, oom in hist:
+                    if oom:
+                        continue
+                    eff = peak
+                    if name != "master" and reserve < budget and peak >= 0.95 * budget:
+                        if name == "rev2" or rule_limit(reserve, k_now) >= budget:
+                            eff = min(peak, reserve / 1.15)
+                    est = max(est, 1.15 * eff)
+                ooms = [p for _r, _b, p, o in hist if o]
+                if ooms:
+                    est = max(est, 1.5 * max(ooms))
+                limit = rule_limit(est, k_now)
+                oom = need > limit
+                peak = limit if oom else need
+                hist.append((est, limit, peak, oom))
+                out.append("%.2f/%.2f%s" % (est, limit, " OOM" if oom else ""))
+            print("    lowered to k=%.1f %-6s booking/limit per run: %s" % (k_low, name, "  ".join(out)))
 
 
 def part6(rows):

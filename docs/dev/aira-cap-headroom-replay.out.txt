@@ -1,7 +1,7 @@
 # Output of docs/dev/aira-cap-headroom-replay.py
 # snapshot: sqlite3 .backup of ~/.local/state/aira/state.db taken 2026-11-15T14:26Z; 234,630 confine rows; max(at) 2026-11-15T12:26:52.839079367Z
-# command: aira confine --name cap-headroom-fix-replay2 -- python3 -I docs/dev/aira-cap-headroom-replay.py --db ~/tmp/aira-cap-headroom-data/state-copy.db
-# exit code: 0 (confine trailer, last line: terminated-by=normal)
+# command: aira confine --name cap-headroom-fix3-replay -- python3 -I docs/dev/aira-cap-headroom-replay.py --db ~/tmp/aira-cap-headroom-data/state-copy.db
+# exit code: 0 (confine trailer, last line: terminated-by=normal); same snapshot copy as rev 2, so parts 1, 2, 4 and 6 are unchanged
 
 PART 1  the quoted evidence, re-derived (all cap sources)
   confine rows 234630; OOM rows 4425; OOM rows with a budget 4210
@@ -46,7 +46,7 @@ PART 3  AIRA-318 interaction: clean auto rows at >= 95% of their cap
   clean auto rows at >= 50% of cap: 16724 (18.9%)
   clean auto rows at >= 75% of cap: 9357 (10.6%)
   clean auto rows at >= 90% of cap: 2814 (3.2%)
-  consecutive at-cap clean runs of one signature: 136 pairs, cap ratio median 1.150, p90 1.150
+  consecutive at-cap clean runs of one signature (candidate ratchet pairs; cache and anon growth not separable): 136 pairs over 106 signatures, cap ratio median 1.150, p90 1.150
   where an at-cap row sits: peak >= 99.9% of cap 1511; 99-99.9% 95; 95-99% 390
   next retained row after a clean auto row at >= 95% of its cap (1996 rows):
     a  no later retained row (unestablished): 1114 (55.8%)
@@ -54,7 +54,7 @@ PART 3  AIRA-318 interaction: clean auto rows at >= 95% of their cap
     c  next row an auto OOM: 20 (1.0%)
     e  next cap did not grow (uninformative): 56 (2.8%)
     f  next cap grew, next peak <= old cap (does not follow the cap): 457 (22.9%)
-    g  next peak > old cap and at its own new cap (ratchet-like): 108 (5.4%)
+    g  next peak > old cap and at its own new cap (candidate ratchet step: cache or anon growth): 108 (5.4%)
     h  next peak > old cap, below thr of new cap (real growth; step 1 at k=1 risks a kill): 65 (3.3%)
     (h) next peak / old cap: median 1.026 p90 1.071 max 1.307; fit under 1.5 x old cap: 65 of 65
   next retained row after a clean auto row at >= 99% of its cap (1606 rows):
@@ -63,7 +63,7 @@ PART 3  AIRA-318 interaction: clean auto rows at >= 95% of their cap
     c  next row an auto OOM: 15 (0.9%)
     e  next cap did not grow (uninformative): 50 (3.1%)
     f  next cap grew, next peak <= old cap (does not follow the cap): 322 (20.0%)
-    g  next peak > old cap and at its own new cap (ratchet-like): 86 (5.4%)
+    g  next peak > old cap and at its own new cap (candidate ratchet step: cache or anon growth): 86 (5.4%)
     h  next peak > old cap, below thr of new cap (real growth; step 1 at k=1 risks a kill): 63 (3.9%)
     (h) next peak / old cap: median 1.042 p90 1.117 max 1.166; fit under 1.5 x old cap: 63 of 63
 
@@ -99,9 +99,18 @@ PART 5  page-cache ratchet, booking C over six runs from C=1 GiB (cache fills th
   k=2 today    2.30 5.29 12.17 27.98 64.36 148.04
   k=2 318-cap  2.00 4.00 8.00 16.00 32.00 64.00
   k=2 booking  1.00 1.00 1.00 1.00 1.00 1.00
-  k=2.0 booking, finite cache 1.50 GiB: 1.72 1.72 1.72 1.72 1.72 1.72
-  k=2.0 booking, finite cache 1.89 GiB: 2.17 2.17 2.17 2.17 2.17 2.17
-  k=1.5 booking, finite cache 1.42 GiB: 1.63 1.63 1.63 1.63 1.63 1.63
+  finite cache under L = max(C, min(k x C, C + 1 GiB)); bound 1.0925 x L of the first run:
+  k=2.0 C=1 GiB booking, finite cache 1.50 GiB: 1.725 1.725 1.725 1.725 1.725 1.725 (bound 2.185)
+  k=2.0 C=1 GiB booking, finite cache 1.89 GiB: 2.173 2.173 2.173 2.173 2.173 2.173 (bound 2.185)
+  k=1.5 C=1 GiB booking, finite cache 1.42 GiB: 1.633 1.633 1.633 1.633 1.633 1.633 (bound 1.639)
+  k=2.0 C=10 GiB booking, finite cache 10.44 GiB: 12.006 12.006 12.006 12.006 12.006 12.006 (bound 12.018)
+  k lowered after history written at k = 2 (anonymous need 1.95 GiB, C0 = 1 GiB):
+    lowered to k=1.0 master booking/limit per run: 1.00/1.00 OOM  1.50/1.50 OOM  2.25/2.25  2.25/2.25  2.25/2.25  2.25/2.25
+    lowered to k=1.0 rev2   booking/limit per run: 1.00/2.00  1.00/2.00  1.00/2.00  1.00/1.00 OOM  1.50/1.50 OOM  2.25/2.25
+    lowered to k=1.0 rev3   booking/limit per run: 1.00/2.00  1.00/2.00  1.00/2.00  2.24/2.24  2.24/2.24  2.24/2.24
+    lowered to k=1.5 master booking/limit per run: 1.00/1.00 OOM  1.50/1.50 OOM  2.25/2.25  2.25/2.25  2.25/2.25  2.25/2.25
+    lowered to k=1.5 rev2   booking/limit per run: 1.00/2.00  1.00/2.00  1.00/2.00  1.00/1.50 OOM  2.25/3.25  2.25/3.25
+    lowered to k=1.5 rev3   booking/limit per run: 1.00/2.00  1.00/2.00  1.00/2.00  2.24/3.24  2.24/3.24  2.24/3.24
 
 PART 6  additive alternative L = min(k x C, C + H): auto OOM rows by killed cap, and the within proxy
     killed cap <256M    288 (12.2%)
@@ -118,4 +127,4 @@ PART 6  additive alternative L = min(k x C, C + H): auto OOM rows by killed cap,
     within at L = min(2C, C + 2048M): 1053 (44.7%); 99.2% of the L = 2C figure
     auto jobs since 2026-10-20: 33013; total headroom sum(L - C) / sum(C): L = 2C 1.00; min(2C, C + 1G) 0.84; min(2C, C + 2G) 0.96
 
-confine: slice=aira.slice name=cap-headroom-fix-replay2 containment=enforced cap=enforced(64G) reserve=463312K reserve-basis=estimate:max=412549120,n=6,f=115 admission=waited scope=placed scope-integrity=contained oom.group=set priorities=applied cpu-weight=aging(100->10@30m0s) scope-memory.max=enforced=474431488 cap-source=auto:daemon-reserve binding=scope-limited effective=474431488 scope-swap.max=enforced terminated-by=normal peak-rss=278236K cpu=5.555051s+646.028ms wall=9.189285s
+confine: slice=aira.slice name=cap-headroom-fix3-replay containment=enforced cap=enforced(64G) reserve=463312K reserve-basis=estimate:max=412549120,n=7,f=115 admission=immediate scope=placed scope-integrity=contained oom.group=set priorities=applied cpu-weight=aging(100->10@30m0s) scope-memory.max=enforced=474431488 cap-source=auto:daemon-reserve binding=scope-limited effective=474431488 scope-swap.max=enforced terminated-by=normal peak-rss=208652K cpu=8.041912s+684.825ms wall=11.871432s
