@@ -65,3 +65,20 @@ func TestExpiredLeaseResponseCarriesDetailWithUnchangedCode(t *testing.T) {
 		}
 	}
 }
+
+// AIRA-338: the generated help (dispatch-table summaries) names the expiry
+// remedy for both lease verbs, not only the --steal argument description.
+func TestLeaseVerbHelpNamesExpiryRemedy(t *testing.T) {
+	found := map[string]string{}
+	for _, entry := range New(nil).Help() {
+		if entry["verb"] == "claim" || entry["verb"] == "heartbeat" {
+			found[entry["verb"]] = entry["summary"]
+		}
+	}
+	if s := found["claim"]; !strings.Contains(s, "expired") || !strings.Contains(s, "--steal") || !strings.Contains(s, "this worktree") {
+		t.Fatalf("claim help summary = %q", s)
+	}
+	if s := found["heartbeat"]; !strings.Contains(s, "E_LEASE_EXPIRED") || !strings.Contains(s, "claim --steal") {
+		t.Fatalf("heartbeat help summary = %q", s)
+	}
+}

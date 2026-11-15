@@ -2575,9 +2575,9 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"review":    {summary: "Assemble a review briefing", safety: SafetyRead, example: []string{"AIRA-1", "--paths", "internal/store/gate.go,docs/x.md"}},
 		"grep":      {summary: "Search indexed tickets, findings, and rants", safety: SafetyRead, example: []string{"ticket", "--kind", "ticket", "--by", "kind", "--fields", "id"}},
 		"import":    {summary: "Import findings, or id-preserving tickets with --tickets, from a JSONL file", safety: SafetyMutate, example: []string{"tickets.jsonl", "--tickets"}},
-		"claim":     {summary: "Claim a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--steal", "--actor", "codex"}},
+		"claim":     {summary: "Claim a ticket lease; an expired lease, even one this worktree held, needs --steal", safety: SafetyLease, example: []string{"AIRA-1", "--steal", "--actor", "codex"}},
 		"release":   {summary: "Release a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
-		"heartbeat": {summary: "Renew a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
+		"heartbeat": {summary: "Renew a ticket lease; once it has expired, heartbeat refuses E_LEASE_EXPIRED: re-take it with claim --steal", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
 		"lease": {summary: "List held ticket leases", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "ls", Summary: "List held ticket leases", Safety: SafetyRead, Args: nil, Example: []string{"ls"}},
 		}},

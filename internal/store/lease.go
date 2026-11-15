@@ -67,7 +67,8 @@ type LeaseExpiredDetail struct {
 	// LeaseState is "expired" (held, its TTL elapsed on this boot),
 	// "prior-boot" (held, heartbeated on an earlier boot), "liveness-unevaluated"
 	// (held, the clock sample precedes its last heartbeat), "free" (released or
-	// freed after lapsing) or "unclaimed" (never claimed).
+	// freed after lapsing) or "unclaimed" (no lease row is currently recorded:
+	// it says nothing about history, since eject removes a project's rows).
 	LeaseState string `json:"lease_state"`
 	// HolderActor is the holder's actor, cut to its first leaseHolderActorMax
 	// bytes (on a rune boundary) when HolderActorTruncated says so.
@@ -158,11 +159,11 @@ func (s *Store) leaseNotLiveError(ticketID string, held domain.HeldLease, bootID
 func (s *Store) leaseNotHeldError(ticketID, state string) *LeaseExpiredError {
 	id := s.displayID(ticketID)
 	detail := LeaseExpiredDetail{TicketID: id, LeaseState: state, Remedy: "aira claim " + id}
-	what := "is not held (released, or freed after it lapsed)"
+	what := "the lease on " + id + " is not held (released, or freed after it lapsed)"
 	if state == "unclaimed" {
-		what = "was never claimed"
+		what = "no lease is currently recorded for " + id
 	}
-	return &LeaseExpiredError{Detail: detail, message: fmt.Sprintf("the lease on %s %s; take it with `%s`", id, what, detail.Remedy)}
+	return &LeaseExpiredError{Detail: detail, message: fmt.Sprintf("%s; take it with `%s`", what, detail.Remedy)}
 }
 
 type LeaseClaim struct {

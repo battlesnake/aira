@@ -210,13 +210,42 @@ func TestHeartbeatOnFreeOrUnclaimedLeaseOffersPlainClaimAndNoHolder(t *testing.T
 	}
 	unclaimed := m3Ticket(t, s, "never claimed heartbeat detail")
 	token := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	// A lease that WAS claimed, then released, whose row eject removed: an
+	// absent row does not establish "never claimed", so neither may the text.
+	ejected := m3Ticket(t, s, "claimed before eject")
+	ejectedClaim, err := s.Claim(context.Background(), ejected.ID, false, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Release(context.Background(), ejected.ID, ejectedClaim.Token); err != nil {
+		t.Fatal(err)
+	}
+	ejectAndReadopt := func() {
+		if _, err := (&DB{db: s.db}).Eject(context.Background(), ProjectRegistration{ProjectID: s.projectID, Prefixes: []ProjectPrefix{{Prefix: "AIRA", Kind: "ticket"}}}, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.StageAdoption(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RegisterBootstrap(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Rebuild(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	for _, test := range []struct {
 		id, token, state string
+		before           func()
 	}{
-		{released.ID, claim.Token, "free"},
-		{unclaimed.ID, token, "unclaimed"},
+		{released.ID, claim.Token, "free", nil},
+		{unclaimed.ID, token, "unclaimed", nil},
+		{ejected.ID, ejectedClaim.Token, "unclaimed", ejectAndReadopt},
 	} {
+		if test.before != nil {
+			test.before()
+		}
 		_, err := s.Heartbeat(context.Background(), test.id, test.token)
 		detail := leaseExpiredDetail(t, err)
 		if detail.LeaseState != test.state || detail.Remedy != "aira claim "+test.id {
@@ -230,6 +259,10 @@ func TestHeartbeatOnFreeOrUnclaimedLeaseOffersPlainClaimAndNoHolder(t *testing.T
 		}
 		if strings.Contains(err.Error(), "--steal") || !strings.Contains(err.Error(), "`aira claim "+test.id+"`") {
 			t.Fatalf("%s message = %q", test.state, err.Error())
+		}
+		if strings.Contains(err.Error(), "never") ||
+			(test.state == "unclaimed" && !strings.Contains(err.Error(), "no lease is currently recorded for "+test.id)) {
+			t.Fatalf("%s message asserts history the read cannot establish: %q", test.state, err.Error())
 		}
 		if _, err := s.Claim(context.Background(), test.id, false, "alice"); err != nil {
 			t.Fatalf("%s: named remedy failed: %v", test.state, err)
