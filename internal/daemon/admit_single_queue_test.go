@@ -534,8 +534,10 @@ func TestAdmitIdleEvaluatorHoldsNoPollTimer(t *testing.T) {
 // populated again. A blocker that clears with no enqueue or release (the slice
 // ceiling rising, a memory read recovering, a freeze hold expiring) is seen only
 // by a poll. The evaluator goes quiet on the drained queue first, so the poll
-// has to come back, not merely never have stopped. Mutation: never re-enable
-// the poll once the queue has been empty -> the blocked job is never granted.
+// has to come back, not merely never have stopped. Mutations: never re-enable
+// the poll once the queue has been empty -> red; the same with every kick's
+// pass delayed 300 ms (so a pending kick could grant after the ceiling rises)
+// -> still red, since the ceiling rises only after the kicks are spent.
 func TestAdmitPollResumesAfterAnIdlePeriod(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
@@ -552,11 +554,31 @@ func TestAdmitPollResumesAfterAnIdlePeriod(t *testing.T) {
 	_, holder := enqueueOn(t, server, "/slice", 95)
 	waitAdmitGrant(t, holder)
 	_, blocked := enqueueOn(t, server, "/slice", 10)
-	time.Sleep(100 * time.Millisecond) // its own kick's pass has run and refused it
-	select {
-	case <-blocked.grantedCh:
+	// Synchronise on observed refusals at the old ceiling, never on a sleep: a
+	// kick still pending when the ceiling rises would grant the job with no poll
+	// at all. Without polling, at most two passes can ever see the blocked job
+	// (the single evaluator's one in-flight kick plus the one-slot kick buffer;
+	// the job's own enqueue kick is one of them or coalesces into them). So once
+	// a pass has refused it, two FURTHER passes prove the poll is live, and every
+	// later pass, including the one that grants it, is poll-originated.
+	var refusedAt int64
+	testdeadline.Eventually(t, 5*time.Second, func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		if blocked.state != admitQueued || !blocked.waited {
+			return false
+		}
+		refusedAt = passes.Load()
+		return true
+	}, "precondition: the second job was never evaluated and refused beside the holder")
+	testdeadline.Eventually(t, 5*time.Second, func() bool {
+		return passes.Load() >= refusedAt+2
+	}, "no pass ran after the enqueue kicks were spent: the evaluator is not polling a queue repopulated after an idle period")
+	queue.mu.Lock()
+	stillQueued := blocked.state == admitQueued
+	queue.mu.Unlock()
+	if !stillQueued {
 		t.Fatal("precondition: the second job must not fit beside the holder yet")
-	default:
 	}
 	// The ceiling rises with no enqueue and no release: only a poll can see it.
 	maximum.Store(1000)
