@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-271","project":"aira","title":"aira top: kill the selected confine job via double-uppercase K (KK, ownership-guarded) — a TUI kill action, follow-on to AIRA-269","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.44","labels":["feature"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-271","project":"aira","title":"aira top: kill the selected confine job via double-uppercase K (KK, ownership-guarded) — a TUI kill action, follow-on to AIRA-269","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.44","labels":["feature"],"hold":false,"relations":[]}
 ---
 
 ## Spec (the greenfield minimum)
@@ -53,3 +53,12 @@ No daemon, wire or protocol change; a client-only change.
 
 Not built: `--steal` from the TUI; a typed-name confirmation; a timer for the
 time-out (it rides the top refresh tick).
+
+Accepted gap (Sol round 2, P2, overridden with this reason): on a terminal
+without bracketed paste (e.g. a `vt100` terminfo), a pasted `KK<Tab><Enter>`
+still arrives as four keys and can confirm a kill. That is a deliberate
+four-key input carrying a Tab and an Enter, not a stray key; every modern
+terminal and tmux sends paste brackets; and the same exposure exists for every
+TUI confirmation (`f`, `e`, the palette) since before this ticket. Closing it
+would need a timing heuristic or a typed challenge, complexity not worth this
+case.
