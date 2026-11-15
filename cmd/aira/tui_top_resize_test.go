@@ -69,8 +69,8 @@ func topResizeOpen(t *testing.T, state tuiState) tuiState {
 func TestTopResizeKeyOnARunningRowConfirmsThenDispatchesTheExactRequest(t *testing.T) {
 	descriptors := core.New(nil).DispatchDescriptors()
 	state := topResizeOpen(t, topResizeState(t, "session-a"))
-	if title := inlineMiniFormTitle(state.InlineAction); !strings.Contains(title, "alpha") || !strings.Contains(title, "current reserve 8192M") {
-		t.Fatalf("size form title %q does not name the job and its reserve", title)
+	if body := inlineMiniFormBody(state.InlineAction); !strings.Contains(body, "alpha") || !strings.Contains(body, "current reserve 8192M") {
+		t.Fatalf("size form %q does not name the job and its reserve", body)
 	}
 	state, commands := onInlineMiniFormSubmit(state, map[string]string{"memory_reserve": " 2G "}, descriptors)
 	if len(commands) != 0 || state.InlineError != "" {

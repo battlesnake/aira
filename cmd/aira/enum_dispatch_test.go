@@ -249,8 +249,10 @@ func TestEnumRefusalIdenticalAcrossFaces(t *testing.T) {
 				return
 			}
 			result := executePaletteRequest(context.Background(), coreOutcomeDispatcher{c}, daemon.WorktreeScope{}, f.palette(t, entries))
-			if result.Outcome != paletteRejected || result.Text != "REJECTED E_ARGUMENT_INVALID\n"+cliText {
-				t.Fatalf("palette: outcome=%v text=%q\nwant REJECTED E_ARGUMENT_INVALID\\n%s", result.Outcome, result.Text, cliText)
+			// AIRA-342: the palette leads with its verdict and then shows the
+			// daemon's message exactly as the CLI prints it.
+			if result.Outcome != paletteRejected || result.Text != "REJECTED: the daemon refused the request.\n"+cliText {
+				t.Fatalf("palette: outcome=%v text=%q\nwant the REJECTED line then %s", result.Outcome, result.Text, cliText)
 			}
 		})
 	}

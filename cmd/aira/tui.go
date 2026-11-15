@@ -400,7 +400,7 @@ func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 	} else if key == 'x' && r.state.ExecuteOpen {
 		r.showExecuteList()
 	} else if r.state.InlineError != "" {
-		r.showPaletteResult("ERROR " + r.state.InlineError)
+		r.showPaletteResult("ERROR "+r.state.InlineError, "")
 	} else if r.state.InlineAction != nil {
 		switch {
 		case r.state.PaletteConfirm != nil:
@@ -502,7 +502,7 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 		// The result still drives controller convergence after the operator
 		// closes the flow, but must not pop a modal over the dashboard.
 		if r.state.PaletteOpen {
-			r.showPaletteResult(message.PaletteResult)
+			r.showPaletteResult(message.PaletteResult, message.PaletteDetails)
 		}
 	case msgDetailResult:
 		r.state, commands = onTUIDetailResult(r.state, message.Detail)
@@ -1017,7 +1017,7 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 	if len(entry.Args) == 0 {
 		request, err := parsePaletteRequest(entry, map[string]string{})
 		if err != nil {
-			r.showPaletteResult("ERROR " + err.Error())
+			r.showPaletteResult("ERROR "+err.Error(), "")
 			return
 		}
 		r.submitPaletteEntry(entry, request)
@@ -1052,7 +1052,7 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 		}
 		request, err := parsePaletteRequest(entry, values)
 		if err != nil {
-			r.showPaletteResult("ERROR " + err.Error())
+			r.showPaletteResult("ERROR "+err.Error(), "")
 			return
 		}
 		r.submitPaletteEntry(entry, request)
@@ -1060,6 +1060,7 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 	r.paletteSubmitButton = form.GetButton(0)
 	form.AddButton("Cancel", r.showPaletteList)
 	form.SetCancelFunc(r.showPaletteList)
+	styleDialogButtons(form)
 	r.outerPages.RemovePage(palettePage).AddPage(palettePage, centeredPrimitive(form, 80, len(entry.Args)+6), true, true)
 	r.app.SetFocus(form)
 }
@@ -1073,7 +1074,7 @@ func (r *tuiRuntime) submitPaletteEntry(entry paletteEntry, request core.Request
 		return
 	}
 	if len(commands) > 0 {
-		r.showPaletteResult("dispatching…")
+		r.showPaletteResult("dispatching…", "")
 	}
 }
 
@@ -1082,16 +1083,13 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	if confirm == nil || r.state.PaletteDispatching {
 		return
 	}
-	details := tview.NewTextView().SetWrap(true).SetText(paletteConfirmationText(confirm))
-	details.SetBorder(true).SetTitle(" Resolved request ")
 	form := tview.NewForm()
 	r.paletteSubmit = nil
 	r.paletteSubmitButton = nil
 	r.paletteConfirmForm = form
+	title := "Confirm mutation"
 	if confirm.Destructive {
-		form.SetBorder(true).SetTitle(" Confirm DESTRUCTIVE mutation ")
-	} else {
-		form.SetBorder(true).SetTitle(" Confirm mutation ")
+		title = "Confirm DESTRUCTIVE mutation"
 	}
 	var idField *tview.InputField
 	if confirm.Destructive && confirm.ConfirmIDTarget != "" {
@@ -1105,7 +1103,7 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 			return
 		}
 		r.submitCommands(commands)
-		r.showPaletteResult("dispatching…")
+		r.showPaletteResult("dispatching…", "")
 	}
 	r.paletteCancelAction = func() {
 		if r.state.InlineAction != nil {
@@ -1129,6 +1127,8 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	}
 	cancel := r.paletteCancelAction
 	form.SetCancelFunc(cancel)
+	dialog := newDialog(title, paletteConfirmationText(confirm), form, "")
+	previous := form.GetInputCapture()
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyRune && event.Rune() == 'n' {
 			cancel()
@@ -1138,21 +1138,23 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 		if event.Key() == tcell.KeyRune && event.Rune() == 'y' {
 			return nil
 		}
-		return event
+		return previous(event)
 	})
 	// Buttons follow form items. Confirm is first and Cancel second; focus Cancel
 	// so a stray/form-submit Enter cannot affirm the mutation.
 	form.SetFocus(form.GetFormItemCount() + 1)
-	content := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(details, 0, 1, false).
-		AddItem(form, form.GetFormItemCount()+6, 0, true) // border 2 + padding 2 + item + gap + buttons: one row short hides the focused-Cancel form's "Type <ID>:" input
 	r.outerPages.RemovePage(paletteConfirmPage).
-		AddPage(paletteConfirmPage, centeredPrimitive(content, 90, 26), true, true).
+		AddPage(paletteConfirmPage, dialog.page(), true, true).
 		SwitchToPage(paletteConfirmPage)
 	r.app.SetFocus(form)
 	r.app.SetFocus(form.GetButton(1))
 }
 
+// paletteConfirmationText is what a confirmation says: the Summary when there
+// is one (an `aira top` row action), then the request's exact arguments on one
+// `Sends:` line, each value at most confirmArgLimit runes. One line keeps the
+// arguments on an 80x24 screen where one line each did not fit; a longer body
+// scrolls with PgUp/PgDn (the form keeps the focus; AIRA-342).
 func paletteConfirmationText(confirm *paletteConfirm) string {
 	if confirm == nil {
 		return ""
@@ -1160,32 +1162,44 @@ func paletteConfirmationText(confirm *paletteConfirm) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "Safety: %s\nAction: %s\n", confirm.Safety, confirm.Verb)
 	if confirm.Summary != "" {
-		fmt.Fprintf(&out, "Summary: %s\n", confirm.Summary)
+		fmt.Fprintf(&out, "\n%s\n", confirm.Summary)
 	}
 	names := make([]string, 0, len(confirm.Request.Args))
 	for name := range confirm.Request.Args {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		fmt.Fprintf(&out, "%s → %v\n", name, confirm.Request.Args[name])
+	if len(names) > 0 {
+		out.WriteString("\nSends:")
+		for _, name := range names {
+			value := []rune(fmt.Sprint(confirm.Request.Args[name]))
+			if len(value) > confirmArgLimit {
+				value = append(value[:confirmArgLimit], '…')
+			}
+			fmt.Fprintf(&out, " %s=%s", name, string(value))
+		}
+		out.WriteString("\n")
 	}
 	if confirm.ConfirmBlockedReason != "" {
 		fmt.Fprintf(&out, "\n⚠ cannot confirm: %s\n", confirm.ConfirmBlockedReason)
 	}
-	return out.String()
+	return strings.TrimRight(out.String(), "\n")
 }
 
-func (r *tuiRuntime) showPaletteResult(text string) {
+// confirmArgLimit bounds each argument value a confirmation shows.
+const confirmArgLimit = 80
+
+// showPaletteResult shows what a palette or row action did; details (the raw
+// reply) only behind `d`.
+func (r *tuiRuntime) showPaletteResult(text, details string) {
 	r.paletteSubmit = nil
 	r.paletteSubmitButton = nil
 	r.paletteConfirmAction = nil
 	r.paletteCancelAction = nil
 	r.paletteConfirmButton = nil
 	r.paletteCancelButton = nil
-	result := tview.NewTextView().SetWrap(true).SetScrollable(true).SetText(text)
-	result.SetBorder(true).SetTitle(" Palette result (Esc to close) ")
-	result.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	dialog := newDialog("Result", text, nil, details)
+	dialog.body.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			r.closePalette()
 			return nil
@@ -1194,9 +1208,9 @@ func (r *tuiRuntime) showPaletteResult(text string) {
 	})
 	r.state.PaletteOpen = true
 	r.outerPages.RemovePage(paletteResultPage).
-		AddPage(paletteResultPage, centeredPrimitive(result, 90, 24), true, true).
+		AddPage(paletteResultPage, dialog.page(), true, true).
 		SwitchToPage(paletteResultPage)
-	r.app.SetFocus(result)
+	r.app.SetFocus(dialog.body)
 }
 
 func (r *tuiRuntime) closePalette() {
@@ -1231,7 +1245,7 @@ func (r *tuiRuntime) showInlinePicker() {
 			r.submitCommands(commands)
 			switch {
 			case r.state.InlineError != "":
-				r.showPaletteResult("ERROR " + r.state.InlineError)
+				r.showPaletteResult("ERROR "+r.state.InlineError, "")
 			case r.state.PaletteConfirm != nil:
 				r.showPaletteConfirmation()
 			case r.state.InlineAction != nil && r.state.InlineAction.Stage == inlineStageMiniForm:
@@ -1256,12 +1270,19 @@ func (r *tuiRuntime) showInlineMiniForm() {
 		return
 	}
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(inlineMiniFormTitle(pending))
 	fields := make(map[string]*tview.InputField, len(pending.FormArgs))
 	for _, name := range pending.FormArgs {
 		field := tview.NewInputField().SetLabel(inlineMiniFormLabel(pending, name))
 		fields[name] = field
 		form.AddFormItem(field)
+	}
+	form.AddButton("Continue", func() { r.paletteSubmit() })
+	r.paletteSubmitButton = form.GetButton(0)
+	form.AddButton("Cancel", r.closeInline)
+	form.SetCancelFunc(r.closeInline)
+	dialog := newDialog(inlineMiniFormTitle(pending), inlineMiniFormBody(pending), form, "")
+	for _, field := range fields {
+		field.SetChangedFunc(func(string) { dialog.setNotice("") }) // a refusal is about the value it judged
 	}
 	r.paletteSubmit = func() {
 		values := make(map[string]string, len(fields))
@@ -1271,19 +1292,20 @@ func (r *tuiRuntime) showInlineMiniForm() {
 		var commands []tuiCmd
 		r.state, commands = onInlineMiniFormSubmit(r.state, values, r.descriptors)
 		r.submitCommands(commands)
-		if r.state.InlineError != "" {
-			r.showPaletteResult("ERROR " + r.state.InlineError)
-			return
-		}
-		if r.state.PaletteConfirm != nil {
+		switch {
+		case r.state.InlineError != "" && r.state.InlineAction != nil && r.state.InlineAction.Stage == inlineStageMiniForm:
+			// A refused value is said above the form, which stays open with the
+			// field focused for another try (AIRA-342).
+			dialog.setNotice(r.state.InlineError)
+			form.SetFocus(0)
+			r.app.SetFocus(form)
+		case r.state.InlineError != "":
+			r.showPaletteResult("ERROR "+r.state.InlineError, "")
+		case r.state.PaletteConfirm != nil:
 			r.showPaletteConfirmation()
 		}
 	}
-	form.AddButton("Continue", func() { r.paletteSubmit() })
-	r.paletteSubmitButton = form.GetButton(0)
-	form.AddButton("Cancel", r.closeInline)
-	form.SetCancelFunc(r.closeInline)
-	r.outerPages.RemovePage(inlinePage).AddPage(inlinePage, centeredPrimitive(form, 80, len(fields)+6), true, true).SwitchToPage(inlinePage)
+	r.outerPages.RemovePage(inlinePage).AddPage(inlinePage, dialog.page(), true, true).SwitchToPage(inlinePage)
 	r.app.SetFocus(form)
 }
 
