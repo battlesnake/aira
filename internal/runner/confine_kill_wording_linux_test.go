@@ -35,7 +35,7 @@ func TestConfineKillDeliveredButUnconfirmedSaysSo(t *testing.T) {
 		if !errors.Is(err, ErrConfineKillDelivered) {
 			t.Fatalf("delivered-but-unconfirmed error lacks the delivered marker: %v", err)
 		}
-		for _, want := range []string{"SIGKILL delivered to every process in scope " + id, "cgroup.kill succeeded", "not yet confirmed empty after 2s", "may still be exiting", "aira confine --list", "scope did not become empty"} {
+		for _, want := range []string{"SIGKILL delivered to every process in scope " + id, "cgroup.kill succeeded", "could not be confirmed empty (scope did not become empty)", "may still be exiting", "aira confine --list"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("message %q lacks %q", err.Error(), want)
 			}
@@ -47,6 +47,30 @@ func TestConfineKillDeliveredButUnconfirmedSaysSo(t *testing.T) {
 			t.Fatalf("cgroup.kill=%q, want the kill written", data)
 		}
 	})
+	// waitEmpty can also end at once on a read error, or early on cancellation.
+	// SIGKILL was still delivered; no elapsed wait may be claimed.
+	for name, waitErr := range map[string]error{"wait-read-error": errors.New("cgroup.events lacks populated"), "wait-cancelled": context.Canceled} {
+		t.Run(name, func(t *testing.T) {
+			slice := t.TempDir()
+			id := confineTestOwnedScopeID("early", "owner", 4413, time.Now().UnixNano())
+			writeConfineTestScope(t, slice, id, "91\n")
+			deps := defaultConfineScanDeps()
+			deps.waitEmpty = func(context.Context, Scope, time.Duration) error { return waitErr }
+			result, err := killConfineWithDeps(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id}}, 2*time.Second, deps)
+			if err == nil || !strings.HasPrefix(err.Error(), CodeConfineKillUnconfirmed+":") || result.Status == ConfineKillStatusKilled {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if !errors.Is(err, ErrConfineKillDelivered) || !errors.Is(err, waitErr) {
+				t.Fatalf("err=%v, want both the delivered marker and the wait cause", err)
+			}
+			if !strings.Contains(err.Error(), "SIGKILL delivered") || !strings.Contains(err.Error(), waitErr.Error()) {
+				t.Fatalf("message %q lacks the delivery or its cause", err.Error())
+			}
+			if strings.Contains(err.Error(), " 2s") || strings.Contains(err.Error(), "after ") {
+				t.Fatalf("message %q claims an elapsed wait that may not have happened", err.Error())
+			}
+		})
+	}
 	t.Run("kill-write-error", func(t *testing.T) {
 		slice := t.TempDir()
 		id := confineTestOwnedScopeID("writefail", "owner", 4412, time.Now().UnixNano())
@@ -106,13 +130,13 @@ func TestConfineKillEmptyScopeWordingFollowsSupervisorLiveness(t *testing.T) {
 			}
 			message := err.Error()
 			if tc.ended {
-				for _, want := range []string{"is empty and its supervisor is gone", "the job has ended", "reaper removes"} {
+				for _, want := range []string{"is empty and its supervisor is gone", "the job has ended", "nothing to kill"} {
 					if !strings.Contains(message, want) {
 						t.Fatalf("dead-supervisor reply %q lacks %q", message, want)
 					}
 				}
-				if strings.Contains(message, "retry") {
-					t.Fatalf("dead-supervisor reply asks for a retry: %q", message)
+				if strings.Contains(message, "retry") || strings.Contains(message, "reaper") {
+					t.Fatalf("dead-supervisor reply asks for a retry or promises a cleanup: %q", message)
 				}
 				return
 			}
@@ -133,7 +157,7 @@ func TestConfineKillEmptyScopeWordingFollowsSupervisorLiveness(t *testing.T) {
 func TestFormatConfineTerminationAdvisoryIncludesOwnConfineKill(t *testing.T) {
 	quiet := cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}
 	advisory := formatConfineTerminationAdvisory(ConfineTerminatedUnattributedSIGKILL, quiet)
-	for _, want := range []string{"your own or another session's", "kill -9", "systemd-oomd", "cannot tell which"} {
+	for _, want := range []string{"`aira confine --kill` -- your own or another session's", "kill -9", "systemd-oomd", "cannot tell which"} {
 		if !strings.Contains(advisory, want) {
 			t.Fatalf("advisory %q lacks %q", advisory, want)
 		}

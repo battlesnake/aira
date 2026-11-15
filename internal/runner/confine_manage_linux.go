@@ -841,12 +841,13 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	if empty {
 		// AIRA-339 (from AIRA-319): wording only, the decision is unchanged. An
 		// empty scope whose supervisor is established DEAD has ended rather than
-		// not started, so "retry" would send the operator after nothing; the
-		// daemon's orphan reaper removes the scope. Liveness the listing could not
+		// not started, so "retry" would send the operator after nothing. No
+		// cleanup is promised: the orphan reaper covers only the default slice and
+		// can be disabled (Sol review). Liveness the listing could not
 		// establish (nil, including a dead probe vetoed by a held lease) keeps the
 		// retry reply: unestablished is never read as dead.
 		if record.SupervisorLive != nil && !*record.SupervisorLive {
-			return ConfineKillResult{}, fmt.Errorf("%s: scope %s is empty and its supervisor is gone: the job has ended and there is nothing to kill; the daemon's orphan reaper removes the empty scope", CodeConfineNotLaunched, record.ScopeID)
+			return ConfineKillResult{}, fmt.Errorf("%s: scope %s is empty and its supervisor is gone: the job has ended and there is nothing to kill", CodeConfineNotLaunched, record.ScopeID)
 		}
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s has nothing to kill yet; retry", CodeConfineNotLaunched, record.ScopeID)
 	}
@@ -860,8 +861,10 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 		// unchanged (never "killed", nothing released). The result carries only
 		// the target's identity, for the daemon's confirmed=false audit line.
 		target := ConfineKillResult{Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}
-		return target, fmt.Errorf("%s: %w in scope %s (cgroup.kill succeeded), but the scope was not yet confirmed empty after %s, so processes may still be exiting; check `aira confine --list`: %w",
-			CodeConfineKillUnconfirmed, ErrConfineKillDelivered, record.ScopeID, timeout, err)
+		// No elapsed time is claimed: waitEmpty also returns at once on a read
+		// error, and early on cancellation (Sol review).
+		return target, fmt.Errorf("%s: %w in scope %s (cgroup.kill succeeded), but the scope could not be confirmed empty (%w), so processes may still be exiting; check `aira confine --list`",
+			CodeConfineKillUnconfirmed, ErrConfineKillDelivered, record.ScopeID, err)
 	}
 	return ConfineKillResult{Status: ConfineKillStatusKilled, Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}, nil
 }

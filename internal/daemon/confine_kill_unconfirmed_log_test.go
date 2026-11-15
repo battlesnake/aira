@@ -61,16 +61,74 @@ func TestConfineKillDeliveredButUnconfirmedIsLoggedUnconfirmed(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-339 -- every confine-kill line carries confirmed=, and a kill
-// the daemon confirmed (running killed, or a queued cancel) says true.
-func TestLogConfineKillCarriesConfirmed(t *testing.T) {
-	result := runner.ConfineKillResult{Status: runner.ConfineKillStatusKilled, Phase: runner.ConfineKillPhaseRunning, ScopeID: "CONFINE-x-1-a@o", Name: "x", Owner: "o"}
-	output := captureDaemonLog(t, func() { logConfineKill("o", false, result, "/slice", true) })
-	if !strings.Contains(output, "confine-kill: phase=running") || !strings.HasSuffix(strings.TrimSpace(output), "confirmed=true") {
-		t.Fatalf("confirmed kill line %q, want a trailing confirmed=true", output)
-	}
-	output = captureDaemonLog(t, func() { logConfineKill("o", false, result, "/slice", false) })
-	if !strings.HasSuffix(strings.TrimSpace(output), "confirmed=false") {
-		t.Fatalf("unconfirmed kill line %q, want a trailing confirmed=false", output)
-	}
+// verifies: AIRA-339 -- the two kills the daemon confirms log confirmed=true
+// through the real handler: a running kill whose scope empties, and a queued
+// cancel. Driven through confineManagement, not the log helper, so a success
+// call site passing false is caught.
+func TestConfineKillConfirmedOutcomesLogConfirmedTrue(t *testing.T) {
+	t.Run("running-killed", func(t *testing.T) {
+		slice := t.TempDir()
+		server := NewServer(Paths{})
+		server.admitResolveSlice = func(string) (string, bool, string) { return slice, true, "" }
+		queue := &sliceQueue{path: slice, server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
+		id := "CONFINE-gone-5101-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "@session-a"
+		queue.waiters = []*admitWaiter{{
+			seq: 1, reserve: 64, state: admitGranted, accounted: true,
+			grantedCh: make(chan struct{}), enqueued: time.Now(), scopeID: id, name: "gone", owner: "session-a",
+		}}
+		queue.outstanding, queue.outstandingJobs = 64, 1
+		registerAdmitQueue(server, queue)
+		path := writeConfineDaemonScope(t, slice, id, "populated 1\n")
+		// Empty the fixture once cgroup.kill is written, in place (see the AIRA-70
+		// log test's emptyOnKill for why not truncate or rename).
+		stop, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Millisecond):
+				}
+				if data, err := os.ReadFile(filepath.Join(path, "cgroup.kill")); err == nil && strings.TrimSpace(string(data)) == "1" {
+					if events, err := os.OpenFile(filepath.Join(path, "cgroup.events"), os.O_WRONLY, 0); err == nil {
+						_, _ = events.WriteAt([]byte("populated 0\n"), 0)
+						_ = events.Close()
+					}
+					return
+				}
+			}
+		}()
+		t.Cleanup(func() { close(stop); <-done })
+		var response core.Response
+		output := captureDaemonLog(t, func() {
+			response = server.confineManagement(context.Background(), core.Request{Verb: "confine-kill", Args: map[string]any{"slice": "test.slice", "selector": id, "owner": "session-a"}})
+		})
+		if !response.OK {
+			t.Fatalf("kill did not succeed: %+v", response)
+		}
+		if !strings.Contains(output, "confine-kill: phase=running") || !strings.HasSuffix(strings.TrimSpace(output), "confirmed=true") {
+			t.Fatalf("confirmed running kill line %q, want a trailing confirmed=true", output)
+		}
+	})
+	t.Run("queued-cancelled", func(t *testing.T) {
+		now := time.Unix(66000, 0)
+		server := queueOrderServer(t, 64*qGiB, &now)
+		path := t.TempDir()
+		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
+		first, target := frontWaiter(1, "first", "s-1"), frontWaiter(2, "target", "s-1")
+		queue := queueOf(server, first, target)
+		queue.path = path
+		registerAdmitQueue(server, queue)
+		var response core.Response
+		output := captureDaemonLog(t, func() {
+			response = server.confineManagement(t.Context(), core.Request{Verb: "confine-kill", Args: map[string]any{"slice": "aira.slice", "selector": "target", "owner": "s-1"}})
+		})
+		if !response.OK {
+			t.Fatalf("cancel did not succeed: %+v", response)
+		}
+		if !strings.Contains(output, "confine-kill: phase=queued") || !strings.HasSuffix(strings.TrimSpace(output), "confirmed=true") {
+			t.Fatalf("queued cancel line %q, want a trailing confirmed=true", output)
+		}
+	})
 }
