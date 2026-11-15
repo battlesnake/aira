@@ -579,7 +579,13 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	data, err := spec.Run(ctx, args)
 	if err != nil {
 		code := store.ErrorCode(err)
-		return Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
+		response := Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
+		// AIRA-338: an E_LEASE_EXPIRED refusal carries its established detail.
+		var expired *store.LeaseExpiredError
+		if errors.As(err, &expired) {
+			response.Data = expired.Detail
+		}
+		return response
 	}
 	warnings := []string(nil)
 	verdict := ""
@@ -1517,7 +1523,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, nil
 		}},
-		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), boolSpec("steal", false, false, "Steal an expired lease"), stringSpec("actor", false, false, "Lease actor")}, MCPTool: "aira_claim", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), boolSpec("steal", false, false, "Re-take an expired lease (TTL lapsed or taken before this boot), even one this worktree held; recorded as lease.steal"), stringSpec("actor", false, false, "Lease actor")}, MCPTool: "aira_claim", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
