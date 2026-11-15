@@ -374,49 +374,46 @@ fact.
 machine's repositories. It is not secret: anyone who can read the state DB can confirm a guessed
 path, but that DB already stores full argv, absolute paths included, in `signature`.
 
-**Derivation, client-side, pure Go, no git subprocess.** A new function
+**Derivation, client-side, by git itself.** A new function
 `runner.RepoIdentity(cwd string) (id string, ok bool)` in `internal/runner`. It cannot live in
 `internal/app`, which imports `runner`. `ok` is false exactly when the identity is
 **unevaluated**; then `id` is `""`.
 
-0. `cwd = filepath.EvalSymlinks(cwd)`. An error is unevaluated. This step is required: Go's
-   `os.Getwd` returns `$PWD` when `$PWD` names the current directory, so it can return a logical
-   path through a symlink (documented: "Getwd may return any one of them"). Confirmed 2026-11-14
-   with a throwaway `~/tmp` probe: with `link -> repo/sub` and the shell in `link`, `os.Getwd`
-   returned `.../link`, whose parent has no `.git`, so an unresolved walk misses the repository.
-   T5's symlink case is the committed reproduction.
-1. Walk from the resolved `cwd` up to `/`. At each directory, `os.Stat(dir + "/.git")`:
-   - not found (`ENOENT`/`ENOTDIR`): go to the parent;
-   - any other error: unevaluated;
-   - a directory: `gitdir` is that path;
-   - a regular file: read at most 4 KiB. It must be one line `gitdir: <path>` (a relative path
-     resolves against `dir`). Anything else is unevaluated.
-2. The common dir is `gitdir`, unless the file `gitdir/commondir` exists. Then it is that file's
-   content minus trailing CR/LF, resolved against `gitdir` when relative. A read error other than not-found
-   is unevaluated.
-3. `filepath.EvalSymlinks(common)`. An error is unevaluated. This differs from
-   `app.gitIdentity`, which falls back to the unresolved path; here a fallback would silently
-   give one repository two identities.
-4. Reaching `/` with no `.git` gives `("none", true)`.
+It runs `git -C <cwd> rev-parse --path-format=absolute --git-common-dir` with every `GIT_*`
+variable removed (`gitcontext.ScrubbedEnvironment`) and `LC_ALL=C`:
 
-**Validity, as git tests it.** A git directory without a `HEAD` is not a git directory (git's
-`is_git_directory`). After step 1 resolves `gitdir` (symlinks resolved), a missing `gitdir/HEAD` is
-unevaluated. git itself skips such a `.git` and uses an enclosing repository; the function answers
-unevaluated instead of walking on, so it never hashes a directory git would not use and never
-guesses the enclosing one. The text of a `.git` file and of a `commondir` is taken as git takes
-it: verbatim after `gitdir: `, minus trailing CR and LF, with no other trimming; an empty pointer
-is unevaluated. The directory a `commondir` names is not checked (git checks its objects and refs;
-only a hand-corrupted worktree could name the wrong one). If a further divergence from
-`git rev-parse --git-common-dir` is found, the pure-Go walk is replaced by a git subprocess rather
-than patched again.
+- exit 0 with one absolute line: the identity is the hash of that path. The absolute format is
+  git's realpath, so the path is already canonical; without it git prints a `.git` symlink's own
+  relative path (measured, git 2.43). More than one line (an older git echoes the
+  `--path-format` it does not know) or a relative path is unevaluated;
+- a failure whose stderr starts `fatal: not a git repository (or any ` (git's discovery failure,
+  reaching `/` or a filesystem boundary): `("none", true)`;
+- any other failure (a broken `.git` pointer, which git reports as `not a git repository: <path>`;
+  dubious ownership; git missing; the timeout): unevaluated.
 
-`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CEILING_DIRECTORIES`, `GIT_COMMON_DIR` and bare repositories are
-ignored on purpose: the identity is a property of the directory. So a bare repository nested
-inside a checkout gets the enclosing checkout's identity, and a directory inside a bare repository
-with no enclosing checkout is `none`. Cost: one `stat` per ancestor plus at most
-two small file reads, against the 2-5 ms and retry loop of a `git rev-parse` subprocess
-(`gitValue`, `project.go:790`). Unevaluated sends no `repo` (NULL), never `none`, and never fails
-or delays the launch.
+**Why a subprocess.** Rev 3 first specified a pure-Go walk (stat `.git` up the tree, read a
+`.git` file and a `commondir`). Three review rounds each found a directory where it disagreed
+with git: an empty `.git` and an invalid nested `.git` (git skips them for the enclosing
+repository) and a `.git` holding only `HEAD` (a HEAD-existence check is not git's validity test,
+which also checks objects and refs). The rule agreed here was to stop patching instances after a
+further divergence, so git decides and the identity cannot disagree with it. `os.Getwd` may
+return a logical path through a symlink (`$PWD`); `git -C` changes into it and walks from the
+physical directory, so no resolution step is needed (T5's symlink case).
+
+**Bounds.** The identity is computed before admission and outside any confine scope, so git is
+bounded in time (3 s; a FIFO in its metadata blocks it) and in memory (`RLIMIT_AS` 256 MiB, set
+with `prlimit` on the started child: git reads metadata files whole, and a `commondir` linked to
+`/dev/zero` grows it by about 1 GiB every 0.6 s, measured; it runs in under 128 MiB). The cap
+lands once `Start` returns, so the bound is tight, not airtight. Cost: one subprocess, about
+2.5 ms (50 calls in 0.125 s, measured 2026-11-15), with no retry: a transient failure is an
+honest NULL.
+
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM` and
+`GIT_COMMON_DIR` are ignored on purpose (scrubbed): the identity is a property of the directory.
+Discovery therefore stops at a filesystem boundary (git's default; the result is `none`), and a
+bare repository is followed as git follows it, so a directory inside a bare repository nested in
+a checkout gets the bare repository's identity. Unevaluated sends no `repo` (NULL), never
+`none`, and never fails the launch.
 
 **The launch-site seam.** `confineDeps` gains `repoIdentity func() (string, bool)`. Production:
 `os.Getwd()`, then `RepoIdentity(cwd)`; a `Getwd` error is `("", false)`. The launch site calls
@@ -559,7 +556,7 @@ as above; T9 is the executable check of the two refusal paths.
 
 | Part | Files | Ships as |
 |---|---|---|
-| client | `runner/confine_linux.go` (`confineDeps`: `wallNow`, `monoNow`, `repoIdentity`; timers, start time, report fields), `runner/confine_budget.go` (`ConfinePeakReport`), `runner/admission_linux.go` (`ReportPeakSample`: optional fields and the once-only re-send), new `runner/repo_identity.go` | client install |
+| client | `runner/confine_linux.go` (`confineDeps`: `wallNow`, `monoNow`, `repoIdentity`; timers, start time, report fields), `runner/confine_budget.go` (`ConfinePeakReport`), `runner/admission_linux.go` (`ReportPeakSample`: optional fields and the once-only re-send), new `runner/repo_identity_linux.go` | client install |
 | daemon | `daemon/confine_report.go` (allowlist and the only validation of the new fields), `daemon/protocol.go` (history comment only; no bump) | daemon restart |
 | store | `store/store.go` (DDL, ALTER list), `store/confine_peak_history.go` (observation, writer) | daemon restart; columns added at open |
 
@@ -846,21 +843,32 @@ rev 3 changes):
     - measure `wall_ms` as a difference of `wallNow` readings (gives a negative value);
     - send `admission.waitedMS` (the Go zero) for a lease-less admission (lease-less case);
     - key the rule on `state == "unevaluated"` instead of `release` (lease-less case).
-- **T5. `RepoIdentity` on real temporary repositories:**
-  - plain repo and a subdirectory: the same ID;
-  - linked worktree: equals the main checkout;
-  - submodule: distinct;
-  - outside any repository: `("none", true)`;
-  - a symlink, **outside the repository**, that targets a **subdirectory** of it (`link ->
-    repo/sub`), passed as the logical path the way `os.Getwd` returns it: equals the repo's
-    ID. (A link to the repository root would pass without step 0, because `stat` follows the
-    link; it is not a sufficient case.)
-  - a working-directory path that no longer exists: `("", false)`;
-  - an unreadable or malformed `.git` file: `("", false)`;
+- **T5. `RepoIdentity` on real temporary repositories** (each odd fixture is first checked
+  against `git rev-parse --git-common-dir`):
+  - plain repo: the hash of its canonical `.git`, derived in the test without git; a
+    subdirectory, a linked worktree, and a symlink outside the repository to a subdirectory
+    (the logical path `os.Getwd` returns) give the same ID;
+  - symlinked components in a `.git` pointer and in a `commondir`, and a `.git` that is a
+    symlink: the canonical common directory;
+  - a `.git` git skips for the enclosing repository (only a `HEAD`; a nested repository whose
+    `HEAD` is not a ref; empty; ELOOP; a device): the enclosing repository's ID;
+  - a `.git` git refuses (`gitdir: ` alone, a trailing space, malformed, dangling, unreadable;
+    an empty or trailing-space `commondir`): `("", false)`, never `none`;
+  - a nested bare repository: its own ID; submodule: its git directory's ID;
+  - inherited `GIT_DIR` or `GIT_CEILING_DIRECTORIES`: ignored;
+  - outside any repository: `("none", true)`; a working directory that no longer exists:
+    `("", false)`;
+  - bounds: a FIFO `commondir` returns `("", false)` by the timeout; a `/dev/zero` `commondir`
+    returns `("", false)` before the timeout (the address-space cap ended git);
+  - stand-in `git` programs: two lines or a relative path refused, a broken pointer's
+    `not a git repository: <path>` unevaluated, the discovery failure under a foreign `LC_ALL`
+    still `none`, no git on `PATH` unevaluated;
   - equality with `app` ProjectID's first 16 hex digits for a plain repo and a worktree (this
     check sits in an `app` package test, because `runner` cannot import `app`).
-  - Mutations, each red: hash the worktree's own `gitdir` instead of its `commondir`; skip
-    step 0 (gives `none` for the symlink case); return `("none", true)` on an error.
+  - Mutations, each red (`docs/dev/aira-323-mutation-check.py`): `GIT_*` passed through; the C
+    locale not pinned; any failure, a broken pointer's message, or a git that cannot start
+    answered as `none`; no timeout; no address-space cap; the relative common dir asked for; a
+    relative path or more than one line accepted.
 - **T6. Repo identity at the launch site** (fake `confineDeps.repoIdentity`, captured
   `reportPeak`; the fake `admit` records how many times `repoIdentity` had been called when it
   was entered).

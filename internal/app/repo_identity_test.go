@@ -11,9 +11,10 @@ import (
 )
 
 // TestRepoIdentityIsAPrefixOfTheProjectID is T5's cross-check: the repo identity
-// AIRA-323 records (runner.RepoIdentity, pure Go) equals the first 16 hex digits
-// of the ProjectID `aira init` gives the same checkout (git rev-parse), for a
-// plain repository and for a linked worktree of it. It lives here because runner
+// AIRA-323 records (runner.RepoIdentity: git's absolute, realpath form of the
+// common dir) equals the first 16 hex digits of the ProjectID `aira init` gives
+// the same checkout (EvalSymlinks of git's plain form), for a plain repository
+// and for a linked worktree of it. It lives here because runner
 // cannot import app.
 //
 // verifies: AIRA-323

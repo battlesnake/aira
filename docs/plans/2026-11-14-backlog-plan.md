@@ -138,7 +138,7 @@ v0.41 and v0.42 do not sit on this path. The capacity gain from 324 at 0.8 arriv
 |---|---|---|
 | Batch A | runner/confine_linux.go, runner/confine.go, cmd/aira/dispatcher.go, runner/admission_linux.go, two runner tests, daemon/admit.go (332 log line only), core/skill.go | budget-bounded (skill.go); 323 (confine_linux.go and admission_linux.go): **land Batch A first, then branch 323** |
 | budget-bounded | cmd/aira/confine_budget_render.go, confine_history_client.go, main.go, daemon/confine_budget.go, core/core.go, core/skill.go | Batch A (skill.go); 323 (main.go: `ReportPeakSample` caller at main.go:1438) |
-| 323 | runner/admission_linux.go (frame), runner/confine_linux.go (report site), runner/confine_budget.go (`ConfinePeakReport`), runner/repo_identity.go, daemon/confine_report.go (allowlist), store/confine_peak_history.go, store/store.go | Batch A, budget-bounded; later 225 (same report lines) |
+| 323 | runner/admission_linux.go (frame), runner/confine_linux.go (report site), runner/confine_budget.go (`ConfinePeakReport`), runner/repo_identity_linux.go, daemon/confine_report.go (allowlist), store/confine_peak_history.go, store/store.go | Batch A, budget-bounded; later 225 (same report lines) |
 | 228 | **daemon/admit.go** (queue map, prune and recreate), reload.go | 332 (land first), 324, 326. **Never run in parallel with 324 or 326** |
 | lease-remedy | store/lease.go (CAS), its callers' error rendering | nothing scheduled |
 

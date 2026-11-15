@@ -5,4 +5,4 @@ Implements the owner decision recorded on AIRA-213 (2026-10-31): a confine estim
 
 Plan 2026-11-14: RANT-133 is measured evidence. The signature './runall.sh' holds 19 history rows from unrelated scripts across directories; a 6G-pinned OOM on 2026-11-10 made a first run of a different runall.sh reserve 9 GiB (estimate:oom-escalated, = 1.5 x 6 GiB). AIRA-323's new key column carries the repo identity (owner decision) but the ESTIMATOR subject is still argv-only until this ticket.
 
-Note 2026-11-15 (AIRA-323): runner.RepoIdentity follows git's HEAD-validity rule: a resolved git directory without HEAD (an empty `.git`, a pointer to the wrong place) is unevaluated, never a hash and never the enclosing repository; pointer text is taken verbatim minus trailing CR/LF. Reuse it unchanged.
+Note 2026-11-15 (AIRA-323): runner.RepoIdentity is `git rev-parse --path-format=absolute --git-common-dir` (GIT_* scrubbed, C locale, bounded in time and memory), so it cannot disagree with git; git's discovery failure is `none`, every other failure unevaluated. Reuse it unchanged.

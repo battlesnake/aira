@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -76,6 +78,13 @@ func gitCommonDir(t *testing.T, dir string) (string, bool) {
 
 var repoIdentityPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+// repoIdentityHash is the expected identity of a canonical common directory,
+// derived here independently of git: the first 16 hex digits of its SHA-256.
+func repoIdentityHash(common string) string {
+	sum := sha256.Sum256([]byte(common))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
 func mustRepoIdentity(t *testing.T, dir string) string {
 	t.Helper()
 	id, ok := RepoIdentity(dir)
@@ -95,6 +104,9 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 	}
 	main := newRepoIdentityRepo(t, base, "main")
 	mainID := mustRepoIdentity(t, main)
+	if want := repoIdentityHash(filepath.Join(main, ".git")); mainID != want {
+		t.Fatalf("main=%s, want the hash of its canonical common directory %s", mainID, want)
+	}
 
 	t.Run("a subdirectory has the repository's identity", func(t *testing.T) {
 		if got := mustRepoIdentity(t, filepath.Join(main, "sub")); got != mainID {
@@ -193,98 +205,116 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 			})
 		}
 	})
-	t.Run("a .git that cannot be classified is unevaluated, never the enclosing repository", func(t *testing.T) {
-		// Each fixture sits INSIDE main, so a walk that treats the error as
-		// "not here" reaches main's .git and returns mainID, not a vacuous none.
-		for _, tc := range []struct{ name, dir, target string }{
-			// stat fails with ELOOP: neither ENOENT nor ENOTDIR.
-			{"a self-referential .git symlink", "odd-loop", ".git"},
-			// stat succeeds on a character device: neither directory nor file.
-			{"a .git that is a device", "odd-device", "/dev/null"},
+	t.Run("a .git git skips gets the enclosing repository's identity, as git does", func(t *testing.T) {
+		// Each fixture sits INSIDE main and git skips its `.git` (no valid HEAD,
+		// or not a directory or gitfile it can use) for main. The first two are
+		// the review counterexamples to a HEAD-existence check: a `.git` with
+		// only a HEAD, and a real nested repository whose HEAD is not a ref.
+		for _, tc := range []struct {
+			name, dir string
+			setup     func(t *testing.T, dir string)
+		}{
+			{"a .git holding only a HEAD", "odd-head-only", func(t *testing.T, dir string) {
+				if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"a nested repository whose HEAD is not a ref", "odd-bad-head", func(t *testing.T, dir string) {
+				repoIdentityGit(t, dir, "init", "-q")
+				if err := os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("not-a-head\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"an empty .git directory", "odd-empty", func(t *testing.T, dir string) {
+				if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"a self-referential .git symlink", "odd-loop", func(t *testing.T, dir string) {
+				if err := os.Symlink(".git", filepath.Join(dir, ".git")); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"a .git that is a device", "odd-device", func(t *testing.T, dir string) {
+				if err := os.Symlink("/dev/null", filepath.Join(dir, ".git")); err != nil {
+					t.Fatal(err)
+				}
+			}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				dir := filepath.Join(main, tc.dir)
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Symlink(tc.target, filepath.Join(dir, ".git")); err != nil {
-					t.Fatal(err)
+				tc.setup(t, dir)
+				if common, ok := gitCommonDir(t, dir); !ok || common != filepath.Join(main, ".git") {
+					t.Fatalf("invalid fixture: git's common dir is (%q, %v), want %s", common, ok, filepath.Join(main, ".git"))
 				}
-				if id, ok := RepoIdentity(dir); id != "" || ok {
-					t.Fatalf("got (%q, %v), want (\"\", false); the enclosing repository is %s", id, ok, mainID)
+				if got := mustRepoIdentity(t, dir); got != mainID {
+					t.Fatalf("got %s, want the enclosing repository's %s", got, mainID)
 				}
 			})
 		}
 	})
-	t.Run("a .git git would not use is unevaluated, never a hash of it (git's HEAD rule)", func(t *testing.T) {
-		// git's validity test (is_git_directory) needs HEAD in the git
-		// directory. Each fixture is checked against git first: git either
-		// refuses it or skips it for the enclosing repository, so no answer
-		// but ("", false) can agree with git without a subprocess.
-		emptyDotGit := filepath.Join(main, "odd-empty")
-		if err := os.MkdirAll(filepath.Join(emptyDotGit, ".git"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		// `gitdir: ` and nothing else, in a directory that itself has a HEAD,
-		// so a join of the empty pointer would reach a "valid" git directory.
-		emptyPointer := filepath.Join(base, "empty-pointer")
-		if err := os.MkdirAll(emptyPointer, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(emptyPointer, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(emptyPointer, ".git"), []byte("gitdir: \n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		// A pointer with a trailing space: git takes the text verbatim and
-		// names a path that does not exist; a trimmed pointer names main.
-		spacedPointer := filepath.Join(base, "spaced-pointer")
-		if err := os.MkdirAll(spacedPointer, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(spacedPointer, ".git"), []byte("gitdir: "+filepath.Join(main, ".git")+" \n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		for _, tc := range []struct {
-			name, dir string
-			gitUses   string // "" = git refuses the directory
-		}{
-			{"an empty .git directory under a real repository", emptyDotGit, filepath.Join(main, ".git")},
-			{"a .git file holding only `gitdir: `", emptyPointer, ""},
-			{"a .git file whose pointer has a trailing space", spacedPointer, ""},
+	t.Run("a .git git refuses is unevaluated, never none and never another hash", func(t *testing.T) {
+		// git refuses each fixture with an error that is not its discovery
+		// failure, so the answer is ("", false): a classifier that maps every
+		// git failure to none is red here.
+		for _, tc := range []struct{ name, content string }{
+			{"a .git file holding only `gitdir: `", "gitdir: \n"},
+			{"a .git file whose pointer has a trailing space", "gitdir: " + filepath.Join(main, ".git") + " \n"},
+			{"a malformed .git file", "not a pointer\n"},
+			{"a .git file pointing nowhere", "gitdir: ../no-such-gitdir\n"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				common, ok := gitCommonDir(t, tc.dir)
-				if tc.gitUses == "" && ok {
+				dir, err := os.MkdirTemp(base, "refused-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".git"), []byte(tc.content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if common, ok := gitCommonDir(t, dir); ok {
 					t.Fatalf("invalid fixture: git accepts it with common dir %s", common)
 				}
-				if tc.gitUses != "" && (!ok || common != tc.gitUses) {
-					t.Fatalf("invalid fixture: git's common dir is (%q, %v), want %s", common, ok, tc.gitUses)
-				}
-				if id, ok := RepoIdentity(tc.dir); id != "" || ok {
-					t.Fatalf("got (%q, %v), want (\"\", false); the enclosing repository is %s", id, ok, mainID)
+				if id, ok := RepoIdentity(dir); id != "" || ok {
+					t.Fatalf("got (%q, %v), want (\"\", false)", id, ok)
 				}
 			})
 		}
-		for i, tc := range []struct{ name, content string }{
-			{"a worktree whose commondir file is empty", ""},
-			{"a worktree whose commondir has a trailing space", "../.. \n"},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
+		t.Run("an unreadable .git file", func(t *testing.T) {
+			if os.Geteuid() == 0 {
+				t.Skip("root reads a mode-000 file")
+			}
+			dir := filepath.Join(base, "unreadable")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+filepath.Join(main, ".git")+"\n"), 0o000); err != nil {
+				t.Fatal(err)
+			}
+			if id, ok := RepoIdentity(dir); id != "" || ok {
+				t.Fatalf("got (%q, %v), want (\"\", false)", id, ok)
+			}
+		})
+		for i, content := range []string{"", "../.. \n"} {
+			t.Run(fmt.Sprintf("a worktree whose commondir is %q", content), func(t *testing.T) {
 				worktree := filepath.Join(base, fmt.Sprintf("wt-commondir-%d", i))
 				repoIdentityGit(t, main, "worktree", "add", "-q", "-b", fmt.Sprintf("wt-commondir-%d", i), worktree)
 				pointer, err := os.ReadFile(filepath.Join(worktree, ".git"))
 				if err != nil {
 					t.Fatal(err)
 				}
-				gitDir := strings.TrimSuffix(strings.TrimPrefix(string(pointer), "gitdir: "), "\n")
-				original, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+				commondir := filepath.Join(strings.TrimSuffix(strings.TrimPrefix(string(pointer), "gitdir: "), "\n"), "commondir")
+				original, err := os.ReadFile(commondir)
 				if err != nil {
 					t.Fatal(err)
 				}
-				t.Cleanup(func() { _ = os.WriteFile(filepath.Join(gitDir, "commondir"), original, 0o644) })
-				if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte(tc.content), 0o644); err != nil {
+				t.Cleanup(func() { _ = os.WriteFile(commondir, original, 0o644) })
+				if err := os.WriteFile(commondir, []byte(content), 0o644); err != nil {
 					t.Fatal(err)
 				}
 				if common, ok := gitCommonDir(t, worktree); ok {
@@ -296,6 +326,45 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 			})
 		}
 	})
+	t.Run("a .git symlink resolves to the canonical common directory", func(t *testing.T) {
+		// git prints this checkout's common dir as `../.git` (the symlink)
+		// unless asked for the absolute (realpath) form.
+		store := newRepoIdentityRepo(t, base, "linked-store")
+		storeGit := filepath.Join(base, "linked-store.git")
+		if err := os.Rename(filepath.Join(store, ".git"), storeGit); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(storeGit, filepath.Join(store, ".git")); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := mustRepoIdentity(t, filepath.Join(store, "sub")), repoIdentityHash(storeGit); got != want {
+			t.Fatalf("got %s, want the hash of %s, %s", got, storeGit, want)
+		}
+	})
+	t.Run("a nested bare repository is followed as git follows it", func(t *testing.T) {
+		bare := filepath.Join(main, "nested.git")
+		repoIdentityGit(t, main, "init", "-q", "--bare", bare)
+		if common, ok := gitCommonDir(t, filepath.Join(bare, "refs")); !ok || common != bare {
+			t.Fatalf("invalid fixture: git's common dir is (%q, %v), want %s", common, ok, bare)
+		}
+		if got, want := mustRepoIdentity(t, filepath.Join(bare, "refs")), repoIdentityHash(bare); got != want {
+			t.Fatalf("got %s, want the bare repository's %s (main is %s)", got, want, mainID)
+		}
+	})
+	t.Run("an inherited GIT_* environment is ignored", func(t *testing.T) {
+		other := newRepoIdentityRepo(t, base, "other-env")
+		for _, tc := range []struct{ name, key, value string }{
+			{"GIT_DIR naming another repository", "GIT_DIR", filepath.Join(other, ".git")},
+			{"GIT_CEILING_DIRECTORIES above the working directory", "GIT_CEILING_DIRECTORIES", main},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Setenv(tc.key, tc.value)
+				if got := mustRepoIdentity(t, filepath.Join(main, "sub")); got != mainID {
+					t.Fatalf("got %s with %s=%s, want main's %s", got, tc.key, tc.value, mainID)
+				}
+			})
+		}
+	})
 	t.Run("a submodule has its own identity", func(t *testing.T) {
 		other := newRepoIdentityRepo(t, base, "other")
 		repoIdentityGit(t, main, "submodule", "add", "-q", other, "mod")
@@ -303,11 +372,17 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 		if modID == mainID {
 			t.Fatalf("submodule shares the superproject's identity %s", modID)
 		}
+		if want := repoIdentityHash(filepath.Join(main, ".git", "modules", "mod")); modID != want {
+			t.Fatalf("submodule=%s, want the hash of its git directory %s", modID, want)
+		}
 	})
 	t.Run("outside any repository is the established none", func(t *testing.T) {
 		outside := filepath.Join(base, "plain", "deeper")
 		if err := os.MkdirAll(outside, 0o755); err != nil {
 			t.Fatal(err)
+		}
+		if _, ok := gitCommonDir(t, outside); ok {
+			t.Fatal("invalid fixture: the temporary directory is inside a git repository")
 		}
 		if id, ok := RepoIdentity(outside); id != RepoIdentityNone || !ok {
 			t.Fatalf("got (%q, %v), want (none, true)", id, ok)
@@ -315,7 +390,6 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 	})
 	t.Run("a symlink outside the repo to a subdirectory resolves to the repo", func(t *testing.T) {
 		// link -> main/sub, passed as the LOGICAL path os.Getwd returns via $PWD.
-		// Its own parent (base) has no .git, so an unresolved walk says none.
 		link := filepath.Join(base, "link")
 		if err := os.Symlink(filepath.Join(main, "sub"), link); err != nil {
 			t.Fatal(err)
@@ -329,109 +403,128 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 			t.Fatalf("got (%q, %v), want (\"\", false)", id, ok)
 		}
 	})
-	t.Run("a malformed .git file is unevaluated", func(t *testing.T) {
-		dir := filepath.Join(base, "malformed")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+}
+
+// TestRepoIdentityBoundsGit is T5's bound on the git subprocess: the identity
+// is computed BEFORE admission, outside any confine scope, so a git that blocks
+// or grows without bound must neither hold the launch nor take the box's memory.
+// Each fixture is its own repository: a FIFO commondir also hangs every later
+// git command on the repository that holds it (measured: `git worktree add`).
+//
+// verifies: AIRA-323
+func TestRepoIdentityBoundsGit(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, tc := range []struct {
+		name  string
+		setup func(t *testing.T, commondir string)
+		// capped: the address-space cap, not the timeout, must end git.
+		capped bool
+	}{
+		// git blocks opening it: only the timeout ends the call.
+		{"a FIFO commondir", func(t *testing.T, commondir string) {
+			if err := syscall.Mkfifo(commondir, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		// git reads it whole, about 1 GiB per 0.6 s: only the address-space
+		// cap ends it before the timeout has let it take several GiB.
+		{"a commondir linked to /dev/zero", func(t *testing.T, commondir string) {
+			if err := os.Symlink("/dev/zero", commondir); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			main := newRepoIdentityRepo(t, base, fmt.Sprintf("bound-%d", i))
+			worktree := filepath.Join(base, fmt.Sprintf("bound-%d-wt", i))
+			repoIdentityGit(t, main, "worktree", "add", "-q", "-b", "wt", worktree)
+			commondir := filepath.Join(main, ".git", "worktrees", filepath.Base(worktree), "commondir")
+			if err := os.Remove(commondir); err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(t, commondir)
+			type answer struct {
+				id string
+				ok bool
+			}
+			done := make(chan answer, 1)
+			started := time.Now()
+			go func() {
+				id, ok := RepoIdentity(worktree)
+				done <- answer{id, ok}
+			}()
+			select {
+			case got := <-done:
+				if got.id != "" || got.ok {
+					t.Fatalf("got (%q, %v), want (\"\", false)", got.id, got.ok)
+				}
+				elapsed := time.Since(started)
+				if elapsed > repoIdentityTimeout+2*time.Second {
+					t.Fatalf("RepoIdentity took %s, past its %s bound", elapsed, repoIdentityTimeout)
+				}
+				// Reading 256 MiB of /dev/zero takes well under a second; a
+				// git that ran until the timeout was not capped, and grew by
+				// several GiB meanwhile.
+				if tc.capped && elapsed >= repoIdentityTimeout {
+					t.Fatalf("RepoIdentity took %s: the timeout, not the address-space cap, ended git", elapsed)
+				}
+			case <-time.After(repoIdentityTimeout + 10*time.Second):
+				t.Fatal("RepoIdentity blocked on git metadata")
+			}
+		})
+	}
+}
+
+// TestRepoIdentityReadsGitStrictly is T5's pin on how git's answer is read,
+// against stand-in `git` programs on PATH: output that is not one absolute
+// line is refused, a missing git is unevaluated, and the discovery failure is
+// matched in the C locale whatever the caller's locale.
+//
+// verifies: AIRA-323
+func TestRepoIdentityReadsGitStrictly(t *testing.T) {
+	fakeGit := func(t *testing.T, script string) {
+		t.Helper()
+		bin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("not a pointer\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		t.Setenv("PATH", bin)
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "rel"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, tc := range []struct {
+		name, script, locale string
+		wantID               string
+		wantOK               bool
+	}{
+		{"two absolute lines", "printf '%s\\n' /x/.git /y/.git\n", "", "", false},
+		// The directory exists relative to the working directory, so only
+		// the absolute-path test refuses it.
+		{"a relative path", "printf 'rel\\n'\n", "", "", false},
+		{"a broken pointer's not-a-repository", "echo 'fatal: not a git repository: /x/.git' >&2; exit 128\n", "", "", false},
+		{"the discovery failure under a foreign locale", "if [ \"$LC_ALL\" = C ]; then echo 'fatal: not a git repository (or any of the parent directories): .git' >&2; else echo 'fatal: kein Git-Repository' >&2; fi; exit 128\n", "de_DE.UTF-8", RepoIdentityNone, true},
+		{"one absolute line", "printf '/x/.git\\n'\n", "", repoIdentityHash("/x/.git"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeGit(t, tc.script)
+			if tc.locale != "" {
+				t.Setenv("LC_ALL", tc.locale)
+			}
+			if id, ok := RepoIdentity(dir); id != tc.wantID || ok != tc.wantOK {
+				t.Fatalf("got (%q, %v), want (%q, %v)", id, ok, tc.wantID, tc.wantOK)
+			}
+		})
+	}
+	t.Run("no git on PATH", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
 		if id, ok := RepoIdentity(dir); id != "" || ok {
 			t.Fatalf("got (%q, %v), want (\"\", false)", id, ok)
-		}
-	})
-	t.Run("an unreadable .git file is unevaluated", func(t *testing.T) {
-		if os.Geteuid() == 0 {
-			t.Skip("root reads a mode-000 file")
-		}
-		dir := filepath.Join(base, "unreadable")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		path := filepath.Join(dir, ".git")
-		if err := os.WriteFile(path, []byte("gitdir: "+filepath.Join(main, ".git")+"\n"), 0o000); err != nil {
-			t.Fatal(err)
-		}
-		if id, ok := RepoIdentity(dir); id != "" || ok {
-			t.Fatalf("got (%q, %v), want (\"\", false)", id, ok)
-		}
-	})
-	t.Run("a .git file pointing nowhere is unevaluated", func(t *testing.T) {
-		dir := filepath.Join(base, "dangling")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: ../no-such-gitdir\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if id, ok := RepoIdentity(dir); id != "" || ok {
-			t.Fatalf("got (%q, %v), want (\"\", false)", id, ok)
-		}
-	})
-	t.Run("git metadata that is not a small regular file is unevaluated without blocking", func(t *testing.T) {
-		// The identity is computed BEFORE admission, so a read that blocks (a
-		// FIFO with no writer) or never ends (/dev/zero) would stall the launch.
-		for _, tc := range []struct {
-			name  string
-			setup func(t *testing.T, gitDir string)
-		}{
-			{"a FIFO commondir", func(t *testing.T, gitDir string) {
-				if err := syscall.Mkfifo(filepath.Join(gitDir, "commondir"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}},
-			{"a commondir linked to /dev/zero", func(t *testing.T, gitDir string) {
-				if err := os.Symlink("/dev/zero", filepath.Join(gitDir, "commondir")); err != nil {
-					t.Fatal(err)
-				}
-			}},
-			{"an oversized commondir", func(t *testing.T, gitDir string) {
-				// A valid path (`./` repeated, then ../..): only the size
-				// bound refuses it.
-				if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte(strings.Repeat("./", 2500)+"../..\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				root := filepath.Join(t.TempDir(), "checkout")
-				gitDir := filepath.Join(root, "..", "store", ".git", "worktrees", "w")
-				if err := os.MkdirAll(gitDir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.MkdirAll(root, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				// A HEAD in both directories, so only the commondir read
-				// itself can refuse the fixture.
-				for _, dir := range []string{gitDir, filepath.Join(root, "..", "store", ".git")} {
-					if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-						t.Fatal(err)
-					}
-				}
-				tc.setup(t, gitDir)
-				type answer struct {
-					id string
-					ok bool
-				}
-				done := make(chan answer, 1)
-				go func() {
-					id, ok := RepoIdentity(root)
-					done <- answer{id, ok}
-				}()
-				select {
-				case got := <-done:
-					if got.id != "" || got.ok {
-						t.Fatalf("got (%q, %v), want (\"\", false)", got.id, got.ok)
-					}
-				case <-time.After(5 * time.Second):
-					t.Fatal("RepoIdentity blocked on git metadata")
-				}
-			})
 		}
 	})
 }

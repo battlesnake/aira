@@ -31,7 +31,7 @@ SCHEMA = "internal/store/store.go"
 HANDLER = "internal/daemon/confine_report.go"
 SENDER = "internal/runner/admission_linux.go"
 LAUNCH = "internal/runner/confine_linux.go"
-IDENT = "internal/runner/repo_identity.go"
+IDENT = "internal/runner/repo_identity_linux.go"
 
 T_STORE = ("./internal/store/", "Telemetry|RecordConfinePeakStoresTheTelemetryAsGiven")
 T_T1 = ("./internal/daemon/", "TestConfineReportCompletionFactsEndToEnd|TestConfineReportCompletionZeroWallEndToEnd|TestConfineReportCompletionPartialFactsEndToEnd")
@@ -40,7 +40,7 @@ T_T3 = ("./internal/daemon/", "TestConfineReportCompletionValidation")
 T_T9 = ("./internal/daemon/", "TestConfineReportVersionSkewResend")
 T_T4 = ("./internal/runner/", "TestConfineCompletionTimingComposite|TestConfineCompletionWaitOnlyForADaemonGrant")
 T_T4B = ("./internal/runner/", "TestConfineCompletionProductionSeams")
-T_T5 = ("./internal/runner/", "TestRepoIdentityOnRealRepositories")
+T_T5 = ("./internal/runner/", "TestRepoIdentity")
 T_T6 = ("./internal/runner/", "TestConfineCompletionRepoIdentity")
 T_WIRE = ("./internal/runner/", "TestConfineCompletionFactsReachTheWire")
 
@@ -135,22 +135,21 @@ MUTATIONS = [
     # --- launch site joined to the real sender (N2)
     ("wire: reportConfinePeak drops the four facts", [(SENDER, "		return errors.New(\"daemon report unavailable\")\n	}\n	return ReportPeakSample(ctx, request.AdmitSocketPath, report)", "		return errors.New(\"daemon report unavailable\")\n	}\n	report.WallMS, report.WaitMS, report.StartedAtMS, report.Repo = nil, nil, nil, \"\"\n	return ReportPeakSample(ctx, request.AdmitSocketPath, report)")], T_WIRE),
     ("T4b: wallNow keeps the monotonic reading", [(LAUNCH, "return time.Now().Round(0) }", "return time.Now() }")], T_T4B),
-    # --- RepoIdentity (T5)
-    ("T5: worktree's own gitdir hashed, not its commondir", [(IDENT, "		common = joinPhysical(gitDir, named)\n", "		_ = named\n")], T_T5),
-    ("T5: step 0 (symlink resolution) skipped", [(IDENT, "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return \"\", false\n	}\n	resolved, err = filepath.Abs(resolved)", "	resolved, err := filepath.Abs(cwd)")], T_T5),
-    ("T5: git metadata opened blocking (a FIFO hangs the launch)", [(IDENT, "os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)", "os.OpenFile(path, os.O_RDONLY, 0)")], T_T5),
-    ("T5: git metadata read without a size bound", [(IDENT, "	if err != nil || len(data) > repoIdentityGitFileMax {\n		return nil, false, false\n	}\n	return data, false, true", "	if err != nil {\n		return nil, false, false\n	}\n	return data, false, true"), (IDENT, "io.ReadAll(io.LimitReader(file, repoIdentityGitFileMax+1))", "io.ReadAll(file)")], T_T5),
-    ("T5: git directory not resolved before commondir is joined", [(IDENT, "	gitDir, err := filepath.EvalSymlinks(gitDir)\n	if err != nil {\n		return \"\", false\n	}\n", "	var err error\n")], T_T5),
-    ("T5: .git pointer joined lexically (cleaned before resolution)", [(IDENT, "	return joinPhysical(dir, target), true", "	return filepath.Clean(joinPhysical(dir, target)), true")], T_T5),
-    ("T5: commondir joined lexically (cleaned before resolution)", [(IDENT, "		common = joinPhysical(gitDir, named)", "		common = filepath.Clean(joinPhysical(gitDir, named))")], T_T5),
-    ("T5: a .git stat error (ELOOP) walks to the parent", [(IDENT, "		default:\n			return \"\", false\n		}\n		parent := filepath.Dir(dir)", "		default:\n		}\n		parent := filepath.Dir(dir)")], T_T5),
-    ("T5: a .git that is neither directory nor file walks to the parent", [(IDENT, "		case err == nil:\n			return \"\", false\n", "		case err == nil:\n")], T_T5),
-    ("T5: HEAD rule removed (an empty .git is hashed)", [(IDENT, "	if _, err := os.Lstat(filepath.Join(gitDir, \"HEAD\")); err != nil {\n		return \"\", false\n	}\n", "")], T_T5),
-    ("T5: an empty commondir accepted", [(IDENT, "		if named == \"\" {\n			return \"\", false\n		}\n", "")], T_T5),
-    ("T5: an empty gitdir pointer accepted", [(IDENT, "	if target == \"\" {\n		return \"\", false\n	}\n", "")], T_T5),
-    ("T5: .git pointer trimmed of spaces (not verbatim)", [(IDENT, "	target := strings.TrimPrefix(text, \"gitdir: \")", "	target := strings.TrimSpace(strings.TrimPrefix(text, \"gitdir: \"))")], T_T5),
-    ("T5: commondir trimmed of spaces (not verbatim)", [(IDENT, "		named := trimGitLineEnd(data)", "		named := strings.TrimSpace(string(data))")], T_T5),
-    ("T5: none returned on an error", [(IDENT, "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return \"\", false\n	}", "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return RepoIdentityNone, true\n	}")], T_T5),
+    # --- RepoIdentity (T5): git rev-parse --git-common-dir decides
+    ("T5: inherited GIT_* passed to git", [(IDENT, '	command.Env = append(gitcontext.ScrubbedEnvironment(), "LC_ALL=C")', '	command.Env = append(append(command.Environ(), "LC_ALL=C"), gitcontext.ScrubbedEnvironment()[:0]...)')], T_T5),
+    ("T5: C locale not pinned", [(IDENT, '	command.Env = append(gitcontext.ScrubbedEnvironment(), "LC_ALL=C")', '	command.Env = gitcontext.ScrubbedEnvironment()')], T_T5),
+    ("T5: any git failure answered as none", [(IDENT, "strings.HasPrefix(stderr.String(), repoIdentityNotARepository)", "true")], T_T5),
+    ("T5: a broken pointer's not-a-repository answered as none", [(IDENT, 'const repoIdentityNotARepository = "fatal: not a git repository (or any "', 'const repoIdentityNotARepository = "fatal: not a git repository"')], T_T5),
+    ("T5: a git that cannot start answered as none", [(IDENT, "	if err := command.Start(); err != nil {\n		return \"\", false, false\n	}", "	if err := command.Start(); err != nil {\n		return \"\", true, false\n	}")], T_T5),
+    ("T5: git not bounded in time", [(IDENT, "context.WithTimeout(context.Background(), repoIdentityTimeout)", "context.WithCancel(context.Background())")], T_T5),
+    # Run alone. Its unbounded git grows about 1 GiB per 0.6 s for the 3 s
+    # timeout: in a scope smaller than that the OOM kill of the whole scope is
+    # the red result (terminated-by=oom), and it kills this script before the
+    # restore, so put the Prlimit line back by hand afterwards (git diff).
+    ("T5: git not bounded in memory", [(IDENT, "	_ = unix.Prlimit(command.Process.Pid, unix.RLIMIT_AS, &limit, nil)", "	_ = limit")], T_T5),
+    ("T5: git asked for its relative common dir", [(IDENT, '"rev-parse", "--path-format=absolute", "--git-common-dir"', '"rev-parse", "--git-common-dir"')], T_T5),
+    ("T5: a relative path accepted", [(IDENT, ' || !filepath.IsAbs(text)', ' || filepath.IsAbs("")')], T_T5),
+    ("T5: more than one line accepted", [(IDENT, 'strings.ContainsAny(text, "\\r\\n") || ', '')], T_T5),
 ]
 
 
