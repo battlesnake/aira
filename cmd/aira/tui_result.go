@@ -41,12 +41,25 @@ func appliedResult(response core.Response, data json.RawMessage) paletteResult {
 // rejectedResult words a daemon refusal: its code and message as the CLI
 // prints them. It claims nothing about state: a handler may fail after a write.
 func rejectedResult(response core.Response, data json.RawMessage) paletteResult {
+	head := "REJECTED: the daemon refused the request.\n" + replyError(response)
+	return paletteResult{Outcome: paletteRejected, Text: replyText(head, data, response.Warnings), Details: rawReply(response)}
+}
+
+// unconfirmedResult words U_CONFINE_KILL_UNCONFIRMED (AIRA-271): the daemon
+// may have written cgroup.kill but could not prove the job ended, so this is
+// neither a refusal nor a kill. The outcome is unknown, so the views refresh.
+func unconfirmedResult(response core.Response, data json.RawMessage) paletteResult {
+	head := "UNEVALUATED — outcome unknown\n" + replyError(response)
+	return paletteResult{Outcome: paletteOutcomeUnknown, Text: replyText(head, data, response.Warnings), Details: rawReply(response)}
+}
+
+// replyError is a refusal's code and message as the CLI prints them.
+func replyError(response core.Response) string {
 	message := strings.TrimSpace(response.Error)
 	if !strings.HasPrefix(message, response.Code) {
 		message = strings.TrimSpace(response.Code + ": " + message)
 	}
-	head := "REJECTED: the daemon refused the request.\n" + message
-	return paletteResult{Outcome: paletteRejected, Text: replyText(head, data, response.Warnings), Details: rawReply(response)}
+	return message
 }
 
 // replyText is head, then one line per field the reply carries that an
@@ -63,7 +76,7 @@ func replyText(head string, data json.RawMessage, warnings []string) string {
 			}
 			lines = append(lines, "Name: "+name)
 		}
-		for _, key := range []string{"id", "status", "code", "message", "reason", "error", "hint"} {
+		for _, key := range []string{"id", "status", "phase", "code", "message", "reason", "error", "hint"} {
 			if value := replyString(fields, key); value != "" {
 				lines = append(lines, strings.ToUpper(key[:1])+key[1:]+": "+value)
 			}

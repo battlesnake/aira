@@ -10,6 +10,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -436,6 +437,9 @@ func classifyPaletteDispatch(attempt paletteDispatchAttempt) paletteResult {
 		// send-evidence, a flattened error may be a committed-then-lost write, so it
 		// is outcome-unknown, never rejected (Sol P0).
 		if !attempt.Evidenceless && response.Code != "" && response.Code != "OK" {
+			if response.Code == runner.CodeConfineKillUnconfirmed {
+				return unconfirmedResult(response, data)
+			}
 			return rejectedResult(response, data)
 		}
 		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmissing terminal daemon response"}

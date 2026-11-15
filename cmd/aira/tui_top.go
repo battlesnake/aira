@@ -695,6 +695,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 			// AIRA-312: what `e` (lower reserve) names on its mini-form and
 			// confirmation, as of this tick.
 			ConfirmText: fmt.Sprintf("%s (owner %s, current reserve %s, live usage %s)", record.Name, owner, reserve.String(), topRAMCell(record.RSSBytes)),
+			KillText:    topKillText(record),
 			Cells: []string{
 				fmt.Sprint(slot), record.Name, confineNum(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
@@ -805,7 +806,7 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 		state = "high"
 	}
 	return tableRow{
-		ID: record.ScopeID, Queued: true,
+		ID: record.ScopeID, Queued: true, KillText: topKillText(record),
 		ConfirmText: fmt.Sprintf("push %s (owner %s, requested %s, listed queue position %d) to the front of the admission queue",
 			record.Name, record.Owner, topQueuedBytesCell(record.ReserveBytes, "0M req"), position),
 		Colour: topColourQueued, Cells: []string{
@@ -1000,15 +1001,43 @@ func topUntrustedCell(text *string) string {
 	if text == nil {
 		return "unevaluated"
 	}
+	return tview.Escape(topPrintable(*text))
+}
+
+// topPrintable escapes text's non-printing runes, so another process's bytes
+// cannot rewrite the line they are shown on. Colour tags are left alone: a
+// dialog body shows text verbatim, and a tag-parsing surface escapes them.
+func topPrintable(text string) string {
 	var builder strings.Builder
-	for _, r := range *text {
+	for _, r := range text {
 		if r == unicode.ReplacementChar || !unicode.IsPrint(r) {
 			builder.WriteString(strconv.QuoteRune(r))
 			continue
 		}
 		builder.WriteRune(r)
 	}
-	return tview.Escape(builder.String())
+	return builder.String()
+}
+
+// topKillCommandHead is how many runes of the command a kill names.
+const topKillCommandHead = 60
+
+// topKillText names a job for the KK kill (AIRA-271): its name, owner and the
+// head of its command, printable, in the listing's own words ("unevaluated"
+// for a command the daemon could not read).
+func topKillText(record runner.ConfineRecord) string {
+	owner := record.Owner
+	if owner == "" {
+		owner = runner.ConfineUnknownOwner
+	}
+	command := "unevaluated"
+	if record.Command != nil {
+		command = topPrintable(*record.Command)
+		if runes := []rune(command); len(runes) > topKillCommandHead {
+			command = string(runes[:topKillCommandHead]) + "…"
+		}
+	}
+	return fmt.Sprintf("%s (owner %s, command %s)", topPrintable(record.Name), topPrintable(owner), command)
 }
 
 // topSessionCell renders the SESSION column: the session that launched the job,
