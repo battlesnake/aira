@@ -839,6 +839,15 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s population could not be established: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
 	}
 	if empty {
+		// AIRA-339 (from AIRA-319): wording only, the decision is unchanged. An
+		// empty scope whose supervisor is established DEAD has ended rather than
+		// not started, so "retry" would send the operator after nothing; the
+		// daemon's orphan reaper removes the scope. Liveness the listing could not
+		// establish (nil, including a dead probe vetoed by a held lease) keeps the
+		// retry reply: unestablished is never read as dead.
+		if record.SupervisorLive != nil && !*record.SupervisorLive {
+			return ConfineKillResult{}, fmt.Errorf("%s: scope %s is empty and its supervisor is gone: the job has ended and there is nothing to kill; the daemon's orphan reaper removes the empty scope", CodeConfineNotLaunched, record.ScopeID)
+		}
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s has nothing to kill yet; retry", CodeConfineNotLaunched, record.ScopeID)
 	}
 	if err := scope.Kill(); err != nil {
@@ -846,7 +855,13 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	}
 	scope.removedMeansEmpty = true
 	if err := deps.waitEmpty(ctx, scope, timeout); err != nil {
-		return ConfineKillResult{}, fmt.Errorf("%s: scope %s empty state unconfirmed: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
+		// AIRA-339: cgroup.kill was written, so SIGKILL is already delivered; say
+		// so rather than read as a failed kill. The code and the decision are
+		// unchanged (never "killed", nothing released). The result carries only
+		// the target's identity, for the daemon's confirmed=false audit line.
+		target := ConfineKillResult{Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}
+		return target, fmt.Errorf("%s: %w in scope %s (cgroup.kill succeeded), but the scope was not yet confirmed empty after %s, so processes may still be exiting; check `aira confine --list`: %w",
+			CodeConfineKillUnconfirmed, ErrConfineKillDelivered, record.ScopeID, timeout, err)
 	}
 	return ConfineKillResult{Status: ConfineKillStatusKilled, Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}, nil
 }
