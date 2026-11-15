@@ -446,6 +446,9 @@ func TestHooksQueuePriority(t *testing.T) {
 		{"pre-commit asks for high", nil, "high"},
 		{"caller overrides pre-commit to normal", []string{"AIRA_CONFINE_PRIORITY=normal"}, "normal"},
 		{"caller's empty value is replaced by the hook's high", []string{"AIRA_CONFINE_PRIORITY="}, "high"},
+		// A typo is handed through unchanged, so `aira confine` refuses it
+		// (loud), rather than the hook replacing it with high or dropping it.
+		{"caller's invalid value reaches aira unchanged", []string{"AIRA_CONFINE_PRIORITY=urgent"}, "urgent"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fx := newHookFixture(t)

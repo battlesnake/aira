@@ -225,6 +225,22 @@ func TestConfinePriorityFromTheEnvironment(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-348 — with --priority given the variable is not even read (the
+// --owner / AIRA_CONFINE_OWNER shape), so a stale or broken value cannot
+// matter. Mutation: read the variable before the flag check.
+func TestConfinePriorityFlagDoesNotReadTheEnvironment(t *testing.T) {
+	for _, flag := range []string{runner.ConfinePriorityHigh, runner.ConfinePriorityNormal} {
+		read := false
+		high, err := resolveConfinePriority(flag, func(key string) string {
+			read = read || key == runner.ConfinePriorityEnv
+			return "urgent"
+		})
+		if err != nil || read || high != (flag == runner.ConfinePriorityHigh) {
+			t.Fatalf("--priority %s: high=%v err=%v read=%v", flag, high, err, read)
+		}
+	}
+}
+
 // verifies: AIRA-348 — a set, non-blank AIRA_CONFINE_PRIORITY that is not
 // exactly `high` or `normal` is refused before anything runs, with the same
 // stable code as a bad --priority and naming the variable: a typo must neither

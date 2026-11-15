@@ -1194,14 +1194,15 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 // flag (parseConfineArgs has refused every value but high and normal), else
 // AIRA_CONFINE_PRIORITY, else normal; the same shape as --owner /
 // AIRA_CONFINE_OWNER, and like it the variable is not read when the flag is
-// given. A blank variable (unset, empty, whitespace) is absent, as the shell's
-// `${VAR:-default}` treats it. Any other value must be exactly high or normal
+// given. A blank variable (unset, empty or whitespace only) is absent, as
+// AIRA_CONFINE_OWNER treats it. Any other value must be exactly high or normal
 // and is otherwise refused: a typo must neither quietly demote a hook's `high`
 // nor promote anything.
-func resolveConfinePriority(flag, environment string) (bool, error) {
+func resolveConfinePriority(flag string, getenv func(string) string) (bool, error) {
 	if flag != "" {
 		return flag == runner.ConfinePriorityHigh, nil
 	}
+	environment := getenv(runner.ConfinePriorityEnv)
 	switch {
 	case strings.TrimSpace(environment) == "":
 		return false, nil
@@ -1654,7 +1655,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	if err != nil {
 		return refuseConfineLaunch(stderr, err)
 	}
-	highPriority, err := resolveConfinePriority(options["priority"], os.Getenv(runner.ConfinePriorityEnv))
+	highPriority, err := resolveConfinePriority(options["priority"], os.Getenv)
 	if err != nil {
 		return refuseConfineLaunch(stderr, err)
 	}

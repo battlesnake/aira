@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -43,5 +44,26 @@ func TestConfinedChildDoesNotInheritThePriorityVariable(t *testing.T) {
 	}
 	if !owner {
 		t.Fatal("AIRA_CONFINE_OWNER did not reach the child: the dump is not the child's real environment, so the absence above proves nothing")
+	}
+}
+
+// verifies: AIRA-348 — the same through the REAL-slice launch path (fake cgroup
+// seams, real child process). Mutation: build the real path's child env
+// without AppendConfineChildEnvironment's strip -> the child prints `high`.
+func TestRealSliceConfinedChildDoesNotInheritThePriorityVariable(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	var stdout bytes.Buffer
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Name: "prio",
+		Env:          []string{"PATH=" + os.Getenv("PATH"), ConfinePriorityEnv + "=high", "AIRA_CONFINE_OWNER=owner-propagates"},
+		Argv:         reportChildEnv(ConfinePriorityEnv, "AIRA_CONFINE_OWNER"),
+		HighPriority: true,
+		SelfPath:     os.Args[0], Stdout: &stdout, Stderr: io.Discard,
+	}, confineUnitDeps(&confineFakeScope{}))
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if got := stdout.String(); got != "|owner-propagates" {
+		t.Fatalf("child saw %s|AIRA_CONFINE_OWNER = %q, want \"|owner-propagates\" (priority stripped, owner kept)", ConfinePriorityEnv, got)
 	}
 }
