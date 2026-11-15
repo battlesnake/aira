@@ -9,17 +9,20 @@ Two steps.
 1. Learning fix, shippable alone at k=1: store the booking per row (nullable `reserve` column, optional report field, AIRA-323 re-send pattern); a clean run whose peak reached >=95% of its cap never raises the estimate above the booking it ran under. Without this, k=2 turns AIRA-318's 15%/run page-cache ratchet into a doubling per run (AIRA-318's own proposed cap-based rule also doubles at k>1). At k=1 it closes AIRA-318's ratchet.
 2. Headroom: booking C unchanged; limit L = clamp(ceiling - headroom - effectiveCurrent - bookings granted earlier in the pass, C, ceil(k x C)); grant carries an optional `limit` (omitted when L == C), client writes memory.max = limit. k is one daemon knob (1.0 = exactly today), rolled out 1.5 then 2. No observe mode. No protocol bump (old client ignores `limit`; ARDR re-declare still carries the booking).
 
-Conditions: step 1 first; OOM steering switched on before k>1 (it is OFF on this box, so a slice-level OOM kills the largest job, not the one using headroom; same gap in AIRA-324's spec); owner decision D1 on whether cold-start (no-history) grants are included.
+Conditions: step 1 first; AIRA-341 (delete the p90 prior, which reads raw peaks box-wide) before k>1; OOM steering switched on before k>1 (it is OFF on this box, so a slice-level OOM kills the largest job, not the one using headroom; same gap in AIRA-324's spec); owner decision D1 on whether cold-start (no-history) grants are included.
 
 ## Evidence (docs/dev/aira-cap-headroom-replay.py on a state.db copy; output committed)
 - Quoted figures re-derived (all cap sources): 4,210 OOM rows with a budget; 2,795 with a clean run; clean max <= 1.5x/2x/4x killed budget for 1,510/2,084/2,648; 3,517 signatures.
-- That test is not an estimate of kills saved (a clean peak at or below the killed cap says nothing about the killed run). Auto OOM rows (2,355), split by the largest clean peak above the cap, at k=2: 45.1% within k (lower bound saved), 19.3% beyond k, 35.6% undetermined (upper bound 80.7%).
+- That test is not an estimate of kills saved (a clean peak at or below the killed cap says nothing about the killed run). Auto OOM rows (2,355), split by the largest clean peak above the cap, at k=2: 45.1% within k, 19.3% beyond k, 35.6% undetermined: a proxy range of 45-81% (not bounds; the killed run's need is censored, and stored oom=1 also counts descendant/ancestor kills headroom cannot prevent).
 - 1,595 of 2,355 auto kills have no retained earlier row (cold start; 978 killed at the 1 GiB default). Only 760 are history-sized.
-- Downside, 20 concurrent auto jobs, total use over total booking: mixed p99 0.56 today, 0.65 at k=2, P(>1)=0; bursts of one OOM-prone command P(>1)=2.4%, p99 1.87 at k=2. Stacked with AIRA-324: burst p99 0.89 vs 0.87.
+- Downside scenario (20 concurrent auto jobs, total use over total booking, 4,000 draws): mixed p99 0.56 today, 0.65 at k=2, 0 draws over 1; bursts of one OOM-prone command 95/4000 over 1, p99 1.87 at k=2. Stacked with AIRA-324: burst p99 0.89 vs 0.87.
 - Caveats: peaks are memory.peak incl. page cache (AIRA-318); 20-row retention; censored kill need; clean runs after a kill ran under bigger caps; bimodal commands beyond k keep the creep; failed runs unrecorded; independent draws, no timeline (AIRA-323 rows too few); physical-fit term not replayable.
 
-## Supersedes, if D1 includes cold start
-AIRA-331 (cold-start booking increase) and AIRA-273 option A (escalate to the p90 prior, which AIRA-341 deletes). AIRA-273 option B (remember the big mode) still needed for modes beyond k.
+## Supersedes
+AIRA-273 option A (escalate to the p90 prior, which AIRA-341 deletes), if D1 includes cold start. AIRA-331 is NOT shown superseded (a doubled 1 GiB cap cannot hold a 3 GiB first run); keep it held and re-judge on step-2 enforce data. AIRA-273 option B (remember the big mode) is still needed for modes beyond k.
+
+## Review
+Sol (high): round 1 BLOCK (11), round 2 BLOCK (3 P2), round 3 APPROVE-WITH-NITS (1 P3, fixed). Fable review: not run by the spec author (no agent tool in that session).
 
 ## Sequence
 Build after AIRA-324; needs the owner un-hold. Step 1 does not depend on 324.
