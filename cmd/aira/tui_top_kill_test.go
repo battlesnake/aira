@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -495,8 +496,21 @@ func TestTopKillRuntimeShowsTheOwnerRefusal(t *testing.T) {
 	waitForSimulationText(t, runtime, screen, "Confirm DESTRUCTIVE")
 	keys.press(t, specialKey(tcell.KeyTab), specialKey(tcell.KeyEnter))
 	text := waitForSimulationText(t, runtime, screen, "REJECTED")
-	if !strings.Contains(text, runner.CodeConfineOwnerUnverified) || strings.Contains(text, "APPLIED") || strings.Contains(text, "killed") {
-		t.Fatalf("the refusal is not shown as the daemon's, or claims a kill:\n%s", text)
+	if strings.Contains(text, "APPLIED") || strings.Contains(text, "killed") {
+		t.Fatalf("the refusal claims a kill:\n%s", text)
+	}
+	// Sol round 3: placed, not merely present. A daemon refusal is AIRA-342's
+	// shared result (its notice line holds only a refused form value): the
+	// Result page, the REJECTED head, then the daemon's code on the very next
+	// line, exactly as `f` and `e` show theirs.
+	if page := frontPage(t, runtime); page != paletteResultPage {
+		t.Fatalf("the refusal is on page %q, want the shared Result page %q", page, paletteResultPage)
+	}
+	const head = "REJECTED: the daemon refused the request."
+	lines := strings.Split(text, "\n")
+	at := slices.IndexFunc(lines, func(line string) bool { return strings.Contains(line, head) })
+	if at < 0 || at+1 >= len(lines) || !strings.Contains(lines[at+1], runner.CodeConfineOwnerUnverified+":") {
+		t.Fatalf("the refusal is not the REJECTED head followed by the daemon's code line:\n%s", text)
 	}
 	if writes := dispatcher.writes(); len(writes) != 1 || writes[0].Args["steal"] != false || writes[0].Args["owner"] != "session-b" {
 		t.Fatalf("sent %+v, want one kill as session-b without steal", writes)

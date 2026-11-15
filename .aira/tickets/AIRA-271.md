@@ -68,3 +68,12 @@ terminal and tmux sends paste brackets; and the same exposure exists for every
 TUI confirmation (`f`, `e`, the palette) since before this ticket. Closing it
 would need a timing heuristic or a typed challenge, complexity not worth this
 case.
+
+Overridden (Sol round 4, P2, "the refusal belongs on the notice line"): the
+owner refusal is shown in the shared Result dialog, `REJECTED: the daemon
+refused the request.` then the daemon's `CODE: message`, exactly as `f`, `e`
+and the palette show a daemon refusal. AIRA-342's notice line holds only a
+refused form value (it exists only on a dialog with a form, and only the `e`
+mini-form sets it); a kill-only notice would be a second result style.
+`TestTopKillRuntimeShowsTheOwnerRefusal` asserts that placement (the Result
+page, the head, the code on the next line).
