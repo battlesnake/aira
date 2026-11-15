@@ -468,9 +468,7 @@ func TestOwnPeakFloorOverTheCeilingIsRefusedWithTheOwnHistoryAdvice(t *testing.T
 				path: "/slice", kick: make(chan struct{}, 1), stop: make(chan struct{}),
 				stopped: make(chan struct{}), poll: time.Hour, server: server,
 			}
-			server.admitRegistryMu.Lock()
-			server.admitQueues = map[string]*sliceQueue{"/slice": queue}
-			server.admitRegistryMu.Unlock()
+			registerAdmitQueue(server, queue)
 			server.admitAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
 
 			serverConn, clientConn := net.Pipe()

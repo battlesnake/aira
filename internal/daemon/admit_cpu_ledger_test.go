@@ -275,11 +275,8 @@ func TestS5PrunedQueueStalePassDoesNotEraseSuccessorCPU(t *testing.T) {
 	registerAdmitQueue(server, q1)
 	server.evaluateAdmitQueue(q1)
 	server.releaseAdmitWaiter(q1, lease1)
-	server.admitRegistryMu.Lock()
-	_, still := server.admitQueues["/P"]
-	server.admitRegistryMu.Unlock()
-	if still {
-		t.Fatal("precondition: q1 should have been pruned")
+	if live := liveAdmitQueueCount(server); live != 0 {
+		t.Fatalf("precondition: q1 should hold nothing once released (live queues=%d)", live)
 	}
 
 	// Q2, the successor on the SAME path, holds the whole ceiling (4 cores) and has a
@@ -356,11 +353,8 @@ func TestS5CPUOverCeilingRefusedNeverEnqueues(t *testing.T) {
 	if !(rej.Required > 0 && rej.Ceiling >= 0 && strings.TrimSpace(rej.Basis) != "") {
 		t.Fatalf("rejection payload {Required:%d Ceiling:%d Basis:%q} does not satisfy the client's terminal-refusal contract (Required>0 && Ceiling>=0 && Basis!=\"\"); the client would flock-fallback", rej.Required, rej.Ceiling, rej.Basis)
 	}
-	server.admitRegistryMu.Lock()
-	queues := len(server.admitQueues)
-	server.admitRegistryMu.Unlock()
-	if queues != 0 {
-		t.Fatalf("an impossible-cpu request must NEVER enqueue; %d queue(s) were created", queues)
+	if admitQueueCreated(server) {
+		t.Fatal("an impossible-cpu request must NEVER enqueue; a queue was created")
 	}
 	_ = clientConn.Close()
 }

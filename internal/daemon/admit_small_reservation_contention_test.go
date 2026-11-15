@@ -116,10 +116,7 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 	settle := func() {
 		t.Helper()
 		server.admitRegistryMu.Lock()
-		queues := make([]*sliceQueue, 0, len(server.admitQueues))
-		for _, queue := range server.admitQueues {
-			queues = append(queues, queue)
-		}
+		queues := allAdmitQueuesLocked(server)
 		server.admitRegistryMu.Unlock()
 		before := evaluations.Load()
 		for _, queue := range queues {
@@ -161,7 +158,7 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 	// backstop pass and the test would prove nothing about the freeze at all.
 	queuedNow := func() int {
 		server.admitRegistryMu.Lock()
-		queue := server.admitQueues["/slice"]
+		queue := admitQueueAtLocked(server, "/slice")
 		server.admitRegistryMu.Unlock()
 		if queue == nil {
 			return 0
@@ -213,7 +210,7 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 	}
 
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues["/slice"]
+	queue := admitQueueAtLocked(server, "/slice")
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		t.Fatal("admission queue disappeared")

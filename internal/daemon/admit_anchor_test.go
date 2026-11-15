@@ -411,7 +411,7 @@ func TestAdmitConnectionReDeclareReleaseLifecycle(t *testing.T) {
 	connB, doneB := admit() // re-declare SAME scope, re-anchored + granted (anchored to B)
 
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues["/slice"]
+	queue := admitQueueAtLocked(server, "/slice")
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		t.Fatal("no admit queue after two admits")
@@ -465,7 +465,7 @@ func TestAdmitConnectionReDeclareOtherUIDRefused(t *testing.T) {
 	admitGrantData(t, frameA)
 
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues["/slice"]
+	queue := admitQueueAtLocked(server, "/slice")
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		t.Fatal("no admit queue after A's admit")
@@ -528,7 +528,7 @@ func TestAdmitConnectionReDeclareUnreadableCredentialFailsClosed(t *testing.T) {
 	admitGrantData(t, frameA)
 
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues["/slice"]
+	queue := admitQueueAtLocked(server, "/slice")
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		t.Fatal("no admit queue after A's admit")

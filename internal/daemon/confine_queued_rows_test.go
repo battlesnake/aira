@@ -26,7 +26,7 @@ func queuedTestServer(t *testing.T, waiters []*admitWaiter) (*Server, string) {
 	server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, int64(64) << 30, 0, true, "" }
 	queue := &sliceQueue{path: path, server: server, waiters: waiters}
-	server.admitQueues[path] = queue
+	registerAdmitQueue(server, queue)
 	return server, path
 }
 
@@ -63,7 +63,8 @@ func TestConfineListPublishesQueuedWaitersInEnqueueOrder(t *testing.T) {
 		queuedRowWaiter(5, admitQueued, firstID, 5<<30, 0),
 		queuedRowWaiter(6, admitRejected, queuedTestID("rejected", 7104), 8<<30, 0),
 	})
-	server.admitQueues[path].outstanding, server.admitQueues[path].outstandingJobs = 4<<30, 1
+	queue := admitQueueAtLocked(server, path)
+	queue.outstanding, queue.outstandingJobs = 4<<30, 1
 
 	result := reserveListing(t, server)
 	if len(result.Queued) != 2 {
@@ -180,10 +181,10 @@ func TestConfineListNeverListsAScopeAsBothRunningAndQueued(t *testing.T) {
 	onDisk := reserveScopeID(t, "ondisk", os.Getpid())
 	reserveScopeDir(t, slice, onDisk, 1<<30, 1<<20)
 	waitingID := queuedTestID("waiting", 7301)
-	server.admitQueues[slice] = &sliceQueue{path: slice, server: server, waiters: []*admitWaiter{
+	registerAdmitQueue(server, &sliceQueue{path: slice, server: server, waiters: []*admitWaiter{
 		queuedRowWaiter(1, admitQueued, onDisk, 1<<30, 0),
 		queuedRowWaiter(2, admitQueued, waitingID, 2<<30, 0),
-	}}
+	}})
 	result := reserveListing(t, server)
 	if len(result.Queued) != 1 || result.Queued[0].ScopeID != waitingID {
 		t.Fatalf("queued=%+v, want only the job with no scope on disk", result.Queued)
@@ -235,7 +236,7 @@ func TestQueuedRowsAndCountComeFromOneLockedPass(t *testing.T) {
 		waiters = append(waiters, queuedRowWaiter(int64(i+1), admitQueued, queuedTestID("w"+strconv.Itoa(i), 9000+i), 1<<20, 0))
 	}
 	server, path := queuedTestServer(t, waiters)
-	queue := server.admitQueues[path]
+	queue := admitQueueAtLocked(server, path)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup

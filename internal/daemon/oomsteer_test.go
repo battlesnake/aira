@@ -348,7 +348,7 @@ func TestOOMSteerDoesNotSteerAnAitestParentWhoseChildrenHoldTheCharge(t *testing
 		{seq: 2, state: admitGranted, accounted: true, parentScopeID: steerDelegateScope, reserve: 16 << 30},
 		{seq: 3, state: admitGranted, accounted: true, parentScopeID: steerDelegateScope, reserve: 16 << 30},
 	}
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 
 	budgets := server.admitScopeBudgets("/slice")
 	want := int64(512<<20) + int64(32<<30)
@@ -387,7 +387,7 @@ func TestAdmitScopeBudgetsCountsOnlyWhatItCanEstablish(t *testing.T) {
 		// A sub-reservation whose parent is not a scope-backed waiter here.
 		{seq: 5, state: admitGranted, accounted: true, parentScopeID: orphanParent, reserve: 4 << 30},
 	}
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 
 	budgets := server.admitScopeBudgets("/slice")
 	if len(budgets) != 1 {

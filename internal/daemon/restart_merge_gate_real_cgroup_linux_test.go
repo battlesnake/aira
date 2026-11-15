@@ -129,10 +129,7 @@ func awaitGateShutdown(t *testing.T, done <-chan error) {
 // scope_id -> reserve. The gate uses one slice, so this is that slice's ledger.
 func gateLeases(server *Server) map[string]int64 {
 	server.admitRegistryMu.Lock()
-	queues := make([]*sliceQueue, 0, len(server.admitQueues))
-	for _, q := range server.admitQueues {
-		queues = append(queues, q)
-	}
+	queues := allAdmitQueuesLocked(server)
 	server.admitRegistryMu.Unlock()
 	out := map[string]int64{}
 	for _, q := range queues {

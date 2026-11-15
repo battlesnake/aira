@@ -51,7 +51,7 @@ func TestAdmitSnapshotSeparatesTheLedgerPopulations(t *testing.T) {
 	}
 	queue.outstanding = 20<<30 + 512<<20 + 1<<30 + 1<<30 + 512<<20
 	queue.outstandingJobs = 5
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 
 	snapshot := server.admitSliceSnapshot("/slice")
 
@@ -83,7 +83,7 @@ func TestAdmitSnapshotReportsJobResidualWhenTheCounterDesynchronises(t *testing.
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
 	queue.waiters = []*admitWaiter{populationTestWaiter(1, 4<<30, "")}
 	queue.outstanding, queue.outstandingJobs = 4<<30, 3 // two phantom jobs
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 
 	snapshot := server.admitSliceSnapshot("/slice")
 	if got := snapshot.residualJobs(); got != 2 {
@@ -107,7 +107,7 @@ func TestAdmitSnapshotReportsByteResidualIndependentlyOfJobs(t *testing.T) {
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
 	queue.waiters = []*admitWaiter{populationTestWaiter(1, 4<<30, "")}
 	queue.outstanding, queue.outstandingJobs = 6<<30, 1 // 2 GiB never discharged
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 
 	snapshot := server.admitSliceSnapshot("/slice")
 	if got := snapshot.residualBytes(); got != 2<<30 {

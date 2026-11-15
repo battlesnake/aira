@@ -63,9 +63,7 @@ func TestOverCeilingUnescalatedReserveIsRefusedTerminallyInsteadOfClamped(t *tes
 		path: "/slice", kick: make(chan struct{}, 1), stop: make(chan struct{}),
 		stopped: make(chan struct{}), poll: time.Hour, server: server,
 	}
-	server.admitRegistryMu.Lock()
-	server.admitQueues = map[string]*sliceQueue{"/slice": queue}
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 	// A wait window that never fires: a rejection produced by the deadline rather
 	// than by the ceiling boundary would be a different fact.
 	server.admitAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }

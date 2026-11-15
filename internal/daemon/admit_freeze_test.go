@@ -625,9 +625,7 @@ func TestAdmitQueueDiagnosticsReportQueuedAndFreezePhase(t *testing.T) {
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
 	small := queuedWaiter(2, 35, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
-	server.admitRegistryMu.Lock()
-	server.admitQueues["/slice"] = queue
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 
 	server.evaluateAdmitQueue(queue)
 	queued, phase := server.admitQueueDiagnostics("/slice")

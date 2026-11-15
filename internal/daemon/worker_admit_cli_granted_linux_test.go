@@ -172,7 +172,7 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 		// map read itself must hold that lock — mirror production's registry->queue
 		// lock dance. A bare read here is a data race against a live grant/release.
 		server.admitRegistryMu.Lock()
-		queue := server.admitQueues[slicePath]
+		queue := admitQueueAtLocked(server, slicePath)
 		server.admitRegistryMu.Unlock()
 		if queue == nil {
 			return 0

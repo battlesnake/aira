@@ -81,17 +81,15 @@ func TestFailfastTripRejectsQueuedWaiters(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-247 — the fail-fast latch is DURABLE across a queue prune. The
-// Server-level map outlives any single sliceQueue, so a queue rebuilt after the
-// trip emptied and pruned the old one is BORN tripped. Mutation: move the latch
-// onto the queue only (drop the queue-create copy) → the fresh queue is untripped
-// and the late leg is admitted.
+// verifies: AIRA-247 — the fail-fast latch is DURABLE: a trip that lands while
+// the daemon holds no admission for the slice still leaves the next queued
+// request BORN tripped. Mutation: latch only a queue that already holds a
+// waiter → the late leg is admitted. (TestFailfastTripOutlivesThePopulation
+// pins the trip-drain-admit order.)
 func TestFailfastLatchSurvivesQueuePrune(t *testing.T) {
 	now := time.Unix(900_000, 0)
 	server := failfastDirectServer(now)
-	// The durable latch is set (as tripFailfast sets it); the old queue has been
-	// pruned, so admitQueues holds nothing for this path.
-	server.failfastTripped = map[string]bool{"/slice": true}
+	server.tripFailfast("/slice", "")
 
 	queue, _, code, err := server.enqueueAdmitInternal("/slice", 1<<20, "", 0, false, admitRequest{})
 	if err != nil || code != "" {
@@ -136,9 +134,7 @@ func TestFailfastRealModeIsNoOp(t *testing.T) {
 		}},
 		outstanding: 1 << 20, outstandingJobs: 1,
 	}
-	server.admitRegistryMu.Lock()
-	server.admitQueues = map[string]*sliceQueue{"/slice": queue}
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 
 	resp := server.confineFailfast(map[string]any{"slice": "test", "scope_id": ""})
 	result, ok := resp.Data.(runner.FailfastTripResult)
@@ -190,9 +186,7 @@ func TestFailfastSweepSkipsTriggerSignalsSiblings(t *testing.T) {
 		},
 		outstanding: 3 << 20, outstandingJobs: 3,
 	}
-	server.admitRegistryMu.Lock()
-	server.admitQueues = map[string]*sliceQueue{"/slice": queue}
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 
 	var mu sync.Mutex
 	var signalled []int
@@ -226,9 +220,6 @@ func TestFailfastSweepSkipsTriggerSignalsSiblings(t *testing.T) {
 	queue.mu.Unlock()
 	if !tripped {
 		t.Fatal("tripFailfast must latch the queue so the evaluator refuses new admissions")
-	}
-	if !server.failfastTripped["/slice"] {
-		t.Fatal("tripFailfast must set the durable Server latch")
 	}
 }
 
@@ -332,9 +323,7 @@ func TestFailfastSweepIsBestEffortAndSkipsUnparseable(t *testing.T) {
 		},
 		outstanding: 3 << 20, outstandingJobs: 3,
 	}
-	server.admitRegistryMu.Lock()
-	server.admitQueues = map[string]*sliceQueue{"/slice": queue}
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 
 	var mu sync.Mutex
 	var signalled []int

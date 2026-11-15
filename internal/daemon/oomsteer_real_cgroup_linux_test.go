@@ -222,7 +222,7 @@ func TestRealCgroupOOMSteerFlipsTheFavouredVictimToTheOffender(t *testing.T) {
 		seq: 2, state: admitGranted, accounted: true, scopeID: compliantScope,
 		reserve: compliantRSS + (64 << 20),
 	}
-	server.admitQueues[slice] = &sliceQueue{path: slice, server: server, waiters: []*admitWaiter{offender, compliant}}
+	registerAdmitQueue(server, &sliceQueue{path: slice, server: server, waiters: []*admitWaiter{offender, compliant}})
 
 	// THE BEFORE STATE, read out of /proc rather than assumed: both scopes carry
 	// the single confine-class baseline, so it is the compliant neighbour's larger

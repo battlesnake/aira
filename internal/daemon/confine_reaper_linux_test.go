@@ -140,7 +140,7 @@ func staleLeaseTestWaiter(server *Server, path, scopeID string, enqueued, grante
 	}
 	queue.waiters = []*admitWaiter{waiter}
 	queue.outstanding, queue.outstandingJobs = 64, 1
-	server.admitQueues[path] = queue
+	registerAdmitQueue(server, queue)
 	return queue, waiter
 }
 
@@ -261,7 +261,7 @@ func TestStaleGrantedLeasesNeverReadsEnqueuedForItsAgeDecision(t *testing.T) {
 		scopeID: staleLeaseTestScopeID("control-old-grant"), name: "control-old-grant", owner: "session-a",
 	}
 	queue.waiters = []*admitWaiter{queuedLong, control}
-	server.admitQueues[path] = queue
+	registerAdmitQueue(server, queue)
 
 	candidates := server.staleGrantedLeases(15 * time.Minute)
 
@@ -330,7 +330,7 @@ func TestStaleGrantedLeasesSkipsAWaiterWithNoGrantedAtRecordEvenIfEnqueuedIsVery
 		scopeID: staleLeaseTestScopeID("control-old-grant"), name: "control-old-grant", owner: "session-a",
 	}
 	queue.waiters = []*admitWaiter{noRecord, control}
-	server.admitQueues[path] = queue
+	registerAdmitQueue(server, queue)
 
 	candidates := server.staleGrantedLeases(15 * time.Minute)
 

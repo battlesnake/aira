@@ -123,11 +123,8 @@ func TestVRAMEnqueueRefusalsAreClientTerminalAndNeverEnqueue(t *testing.T) {
 			if tc.wantReq && !(rej.Required > 0 && rej.Ceiling >= 0) {
 				t.Fatalf("too-large payload {Required:%d Ceiling:%d} must satisfy Required>0 && Ceiling>=0", rej.Required, rej.Ceiling)
 			}
-			server.admitRegistryMu.Lock()
-			queues := len(server.admitQueues)
-			server.admitRegistryMu.Unlock()
-			if queues != 0 {
-				t.Fatalf("a refused vram request must NEVER enqueue; %d queue(s) created", queues)
+			if admitQueueCreated(server) {
+				t.Fatal("a refused vram request must NEVER enqueue; a queue was created")
 			}
 			_ = clientConn.Close()
 		})
@@ -148,9 +145,7 @@ func TestVRAMContendedJobIsHeldNotRefused(t *testing.T) {
 	var queuesAtReply atomic.Int64
 	queuesAtReply.Store(-1)
 	server.admitWriteFrame = func(conn net.Conn, frame any) error {
-		server.admitRegistryMu.Lock()
-		queuesAtReply.Store(int64(len(server.admitQueues)))
-		server.admitRegistryMu.Unlock()
+		queuesAtReply.Store(int64(liveAdmitQueueCount(server)))
 		return writeFrame(conn, frame)
 	}
 	serverConn, clientConn := net.Pipe()

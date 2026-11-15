@@ -30,12 +30,7 @@ func injectCIDumpQueue(server *Server, path string, configure func(*sliceQueue))
 	if configure != nil {
 		configure(queue)
 	}
-	server.admitRegistryMu.Lock()
-	if server.admitQueues == nil {
-		server.admitQueues = map[string]*sliceQueue{}
-	}
-	server.admitQueues[path] = queue
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 	return queue
 }
 
@@ -248,7 +243,7 @@ func TestConfineDumpQueueLeavesAvailableUnevaluatedOnADegenerateCeiling(t *testi
 func queueOutstandingFor(server *Server, path string) int64 {
 	server.admitRegistryMu.Lock()
 	defer server.admitRegistryMu.Unlock()
-	queue := server.admitQueues[path]
+	queue := admitQueueAtLocked(server, path)
 	if queue == nil {
 		return 0
 	}

@@ -329,10 +329,7 @@ func waitForDrainedAdmitLedger(t *testing.T, server *Server) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		server.admitRegistryMu.Lock()
-		queues := make([]*sliceQueue, 0, len(server.admitQueues))
-		for _, queue := range server.admitQueues {
-			queues = append(queues, queue)
-		}
+		queues := allAdmitQueuesLocked(server)
 		server.admitRegistryMu.Unlock()
 		drained := true
 		for _, queue := range queues {

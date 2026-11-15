@@ -112,7 +112,7 @@ func TestConfineKillQueuedCancelRefusesTheScopeAtEnqueue(t *testing.T) {
 	server.admitManualEvaluation = true
 	target, other := frontWaiter(1, "target", "s-1"), frontWaiter(2, "other", "s-1")
 	queue := queueOf(server, target, other)
-	server.admitQueues = map[string]*sliceQueue{"/slice": queue}
+	registerAdmitQueue(server, queue)
 	cancelledAt := now
 	if _, handled, err := server.cancelQueuedConfine("/slice", "target", "s-1", false); !handled || err != nil {
 		t.Fatalf("cancel: handled=%v err=%v", handled, err)
@@ -187,7 +187,7 @@ func TestConfineKillQueuedAndRunningTwinNeverKillsTheRunningJob(t *testing.T) {
 	scope := writeConfineDaemonScope(t, path, running.scopeID, "populated 1\n")
 	queue := queueOf(server, running, queued)
 	queue.path = path
-	server.admitQueues = map[string]*sliceQueue{path: queue}
+	registerAdmitQueue(server, queue)
 	kill := func(selector string) core.Request {
 		return core.Request{Verb: "confine-kill", Args: map[string]any{"slice": "aira.slice", "selector": selector, "owner": "s-1"}}
 	}
@@ -233,7 +233,7 @@ func TestGrantedConfineMatchNamesOnlyAUniqueJob(t *testing.T) {
 	for _, waiter := range []*admitWaiter{first, second, single} {
 		waiter.state, waiter.accounted = admitGranted, true
 	}
-	server.admitQueues = map[string]*sliceQueue{"/slice": queueOf(server, first, second, single)}
+	registerAdmitQueue(server, queueOf(server, first, second, single))
 	if got := server.grantedConfineMatch("/slice", "twin"); got != "" {
 		t.Fatalf("two granted twins: hint names %q, want none", got)
 	}
@@ -284,7 +284,7 @@ func TestConfineKillQueuedWorkerClaimIsRefusedAndKeepsWaiting(t *testing.T) {
 	var queue *sliceQueue
 	testdeadline.Eventually(t, 5*time.Second, func() bool {
 		server.admitRegistryMu.Lock()
-		queue = server.admitQueues["/slice"]
+		queue = admitQueueAtLocked(server, "/slice")
 		server.admitRegistryMu.Unlock()
 		if queue == nil {
 			return false

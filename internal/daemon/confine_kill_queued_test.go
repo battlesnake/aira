@@ -324,7 +324,7 @@ func TestConfineKillQueuedThroughTheHandler(t *testing.T) {
 			first, target := frontWaiter(1, "first", "s-1"), frontWaiter(2, "target", "s-1")
 			queue := queueOf(server, first, target)
 			queue.path = path
-			server.admitQueues[path] = queue
+			registerAdmitQueue(server, queue)
 			kill := func(caller string) core.Request {
 				return core.Request{Verb: "confine-kill", Args: map[string]any{"slice": "aira.slice", "selector": "target", "owner": caller}}
 			}
@@ -395,7 +395,7 @@ func TestConfineKillJustGrantedJobAnswersNotLaunched(t *testing.T) {
 	granted.state, granted.accounted = admitGranted, true
 	queue := queueOf(server, granted)
 	queue.path = path
-	server.admitQueues[path] = queue
+	registerAdmitQueue(server, queue)
 	kill := func(selector string) core.Request {
 		return core.Request{Verb: "confine-kill", Args: map[string]any{"slice": "aira.slice", "selector": selector, "owner": "s-1"}}
 	}
