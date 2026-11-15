@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-228","project":"aira","title":"Admission core: delete inherited over-engineering / scope-creep (single-queue collapse + generality audit)","status":"in-review","kind":"chore","severity":"P3","assignee":null,"milestone":"v0.43","labels":["admission","simplify","tech-debt"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-228","project":"aira","title":"Admission core: delete inherited over-engineering / scope-creep (single-queue collapse + generality audit)","status":"done","kind":"chore","severity":"P3","assignee":null,"milestone":"v0.43","labels":["admission","simplify","tech-debt"],"hold":false,"relations":[]}
 ---
 Backlog cleanup (owner-directed 2026-09-11): after the admission-counter rebuild lands, remove generality the daemon carries for a multi-slice world that was never planned, and audit the admission/confine code for other scope-creep to delete.
 
