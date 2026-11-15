@@ -197,7 +197,9 @@ func TestTopKillConfirmationNamesTheJob(t *testing.T) {
 		t.Fatalf("queued confirmation worded as a kill: %q", summary)
 	}
 
-	long := strings.Repeat("x", 200) + "\x1b[2J"
+	// The control character is inside the head that is kept, so only the
+	// escaping (not the clip) can keep it off the screen.
+	long := "\x1b[2J" + strings.Repeat("x", 200)
 	record := topTestRecord(killTestAlpha, "alpha", 2*gib, gib)
 	record.Command = &long
 	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), record))
@@ -207,7 +209,7 @@ func TestTopKillConfirmationNamesTheJob(t *testing.T) {
 	live.Panels[viewTop] = panel
 	live, _ = topKillPress(t, live, 1, "KK")
 	summary = live.PaletteConfirm.Summary
-	if !strings.HasPrefix(summary, "Kill alpha (owner session-a, command "+strings.Repeat("x", 60)+"…)") || strings.Contains(summary, "\x1b") {
+	if !strings.HasPrefix(summary, "Kill alpha (owner session-a, command '\\x1b'[2J"+strings.Repeat("x", 51)+"…)") || strings.Contains(summary, "\x1b") {
 		t.Fatalf("live confirmation %q does not name alpha with a clipped, printable command head", summary)
 	}
 	if !strings.Contains(summary, "cgroup.kill") {
@@ -215,9 +217,10 @@ func TestTopKillConfirmationNamesTheJob(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-271 — the arm times out after topKillArmTicks top refreshes,
+// verifies: AIRA-271 — the arm times out after five top refreshes (about 5 s),
 // and drops at once when its job leaves the listing.
 func TestTopKillArmExpires(t *testing.T) {
+	const wantTicks = 5
 	listing := topQueuedListing(topQueuedTestRecord(killTestZulu, "zulu", 4*gib))
 	deliver := func(state tuiState, listing runner.ConfineListResult) tuiState {
 		state, _ = requestPanelRefresh(state, viewTop)
@@ -225,15 +228,15 @@ func TestTopKillArmExpires(t *testing.T) {
 		return state
 	}
 	state, _ := topKillPress(t, topKillState(t, "session-a"), 1, "K")
-	for tick := 1; tick < topKillArmTicks; tick++ {
+	for tick := 1; tick < wantTicks; tick++ {
 		state = deliver(state, listing)
 		if state.TopKill.ScopeID != killTestAlpha {
-			t.Fatalf("the arm dropped after %d refreshes, want %d", tick, topKillArmTicks)
+			t.Fatalf("the arm dropped after %d refreshes, want %d", tick, wantTicks)
 		}
 	}
 	state = deliver(state, listing)
 	if state.TopKill.ScopeID != "" {
-		t.Fatalf("the arm outlived %d refreshes: %+v", topKillArmTicks, state.TopKill)
+		t.Fatalf("the arm outlived %d refreshes: %+v", wantTicks, state.TopKill)
 	}
 
 	state, _ = topKillPress(t, topKillState(t, "session-a"), 1, "K")
@@ -459,5 +462,50 @@ func TestTopKillRuntimeCancelsAQueuedJob(t *testing.T) {
 	}
 	if writes := dispatcher.writes(); len(writes) != 1 || writes[0].Args["selector"] != killTestZulu || writes[0].Args["steal"] != false {
 		t.Fatalf("sent %+v, want one kill of zulu without steal", writes)
+	}
+}
+
+// verifies: AIRA-271 review (Sol P1) — a pasted block is text for the focused
+// widget, never keys: pasting "KK<Tab><Enter>" on the table arms nothing,
+// opens nothing and sends nothing.
+func TestTopKillPasteIsNotKeys(t *testing.T) {
+	dispatcher := &topDialogDispatcher{reply: core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{}`)}}
+	runtime, screen, keys := startTopKillRuntime(t, dispatcher, 100, 30, 1)
+	if err := screen.PostEvent(tcell.NewEventPaste(true)); err != nil {
+		t.Fatal(err)
+	}
+	keys.typeText("KK")
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	if err := screen.PostEvent(tcell.NewEventPaste(false)); err != nil {
+		t.Fatal(err)
+	}
+	keys.barrier(t)
+	keys.barrier(t)
+	if writes := dispatcher.writes(); len(writes) != 0 || frontPage(t, runtime) != dashboardPage {
+		t.Fatalf("a paste sent %+v or opened %q", writes, frontPage(t, runtime))
+	}
+	if armed := onUI(t, runtime, func() string { return runtime.state.TopKill.ScopeID }); armed != "" {
+		t.Fatalf("a paste armed %q", armed)
+	}
+}
+
+// verifies: AIRA-271 review (Sol P2) — on the full dashboard, whose tab row is
+// long, the armed kill starts the status line, so it is on screen at any width.
+func TestTopKillArmedStatusLeadsTheDashboardLine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runtime := newTUIRuntimeForViews(ctx, &topDialogDispatcher{}, nil, daemon.WorktreeScope{}, nil, nil, nil,
+		tcell.NewSimulationScreen("UTF-8"), allViews, dataViews, false, nil, nil)
+	runtime.state.Active = viewTop
+	runtime.state.TopKill = topKillArm{ScopeID: killTestAlpha, Job: "alpha (owner session-a, command go test)"}
+	runtime.render()
+	if line := runtime.tabs.GetText(true); !strings.HasPrefix(line, "KILL ARMED: alpha (owner session-a") {
+		t.Fatalf("the dashboard status line does not lead with the arm: %q", line)
+	}
+	runtime.state.TopKill = topKillArm{}
+	runtime.render()
+	if line := runtime.tabs.GetText(true); !strings.Contains(line, "KK kill job") || strings.Contains(line, "ARMED") {
+		t.Fatalf("the unarmed dashboard line: %q", line)
 	}
 }

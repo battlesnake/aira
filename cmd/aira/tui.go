@@ -165,6 +165,10 @@ func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher
 		stdin: stdin, stdout: stdout, stderr: stderr,
 	}
 	runtime.state.CanExecute = runtime.canExecute
+	// AIRA-271. Bracketed paste: a pasted block reaches the focused widget's
+	// paste handler as text, never the key handlers, so pasting "KK<Tab><Enter>"
+	// cannot arm, open and confirm a kill in one gesture.
+	runtime.app.EnablePaste(true)
 	// AIRA-309. Resolved once, like the CLI's own owner, so a push from `top` is
 	// attributed. An unresolvable identity (an invalid AIRA_CONFINE_OWNER) leaves
 	// it unknown, which the confirmation states and which always sends --steal.
@@ -613,18 +617,20 @@ func (r *tuiRuntime) render() {
 	}
 	if r.state.Active == viewTop {
 		// AIRA-276 / AIRA-309 / AIRA-312 / AIRA-271. Advertised only on the tab
-		// they work on. An armed kill replaces the legend, job first, so it is
-		// read even on a narrow terminal.
+		// they work on.
 		keys = "    c command/dir  f push queued job to front  e lower running job's reserve  KK kill job" + keys
-		if arm := r.state.TopKill; arm.ScopeID != "" {
-			action := "KILL"
-			if arm.Queued {
-				action = "CANCEL"
-			}
-			keys = "    [red::b]" + action + " ARMED:[-:-:-] " + tview.Escape(arm.Job) + " · K again to confirm, any other key cancels"
-		}
 	}
-	r.tabs.SetText(strings.Join(tabNames, "  ") + keys)
+	line := strings.Join(tabNames, "  ") + keys
+	if arm := r.state.TopKill; r.state.Active == viewTop && arm.ScopeID != "" {
+		// An armed kill replaces the whole line, tabs too, job first, so it is
+		// read on a narrow terminal and on the full dashboard's long tab row.
+		action := "KILL"
+		if arm.Queued {
+			action = "CANCEL"
+		}
+		line = "[red::b]" + action + " ARMED:[-:-:-] " + tview.Escape(arm.Job) + " · K again to confirm, any other key cancels"
+	}
+	r.tabs.SetText(line)
 	r.detachedStatus.SetText(r.state.DetachedReport)
 	r.panelPages.SwitchToPage(string(r.state.Active))
 	for _, view := range views {

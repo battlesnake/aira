@@ -37,7 +37,12 @@ No daemon, wire or protocol change; a client-only change.
 - `cmd/aira/tui_top.go`: `topKillText`, `topPrintable` (split out of
   `topUntrustedCell`).
 - `cmd/aira/tui.go`: the disarm on non-rune keys, the legend (`KK kill job`)
-  and the armed status line, the destructive title for `confine-kill`.
+  and the armed status line (it replaces the whole tab row, job first, so the
+  full dashboard's long tab row cannot push it off screen), the destructive
+  title for `confine-kill`, and bracketed paste on (Sol round 1: a pasted
+  `KK<Tab><Enter>` reached the key handlers as four keys and could confirm a
+  kill in one gesture; a paste now goes to the focused widget as text, on
+  every TUI face).
 - `cmd/aira/dispatcher.go`: `DispatchPalette` admits `confine-kill` through the
   one-exchange management arm `f` and `e` use (no old-daemon hint for it).
   With the daemon down the TUI says the request was not sent; the CLI's
