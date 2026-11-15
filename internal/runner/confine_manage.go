@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"aira/internal/pylib"
 )
 
 const (
@@ -318,6 +320,9 @@ type ConfineRecord struct {
 const (
 	ConfinePriorityHigh   = "high"
 	ConfinePriorityNormal = "normal"
+	// ConfinePriorityEnv (AIRA-348) takes the same two words when --priority is
+	// absent; the confined command never inherits it (pylib strips it).
+	ConfinePriorityEnv = pylib.ConfinePriorityEnv
 )
 
 // ConfineReserveFacet is the UnevaluatedFields name for an unestablished
