@@ -189,8 +189,16 @@ func TestNoLiveCodeOrDocNamesTheDeletedPrior(t *testing.T) {
 		}
 		rel, _ := filepath.Rel(root, path)
 		rel = filepath.ToSlash(rel)
+		if rel == ".git" {
+			// A directory in the main checkout, a `gitdir: ...` file naming the
+			// branch in a linked worktree: never a document either way.
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if entry.IsDir() {
-			if rel == ".git" || rel == "dist" || historical(rel+"/") {
+			if rel == "dist" || historical(rel+"/") {
 				return filepath.SkipDir
 			}
 			return nil
