@@ -266,57 +266,108 @@ func TestExpiredRefusalWritesNothing(t *testing.T) {
 	}
 }
 
-// A plain claimer racing a stealer on a lapsed lease: the decisions are the
-// ones the CAS always made (exactly one winner, the stealer; the plain
-// claimer is refused E_LEASE_EXPIRED or E_LEASE_HELD by order), and an
-// E_LEASE_EXPIRED detail names the incumbent row its own transaction read,
-// never the winner.
-func TestPlainClaimRacingStealKeepsDecisionAndNamesReadHolder(t *testing.T) {
-	orders := map[string]int{}
-	defer func() { t.Logf("plain-claimer outcomes over 20 races: %v", orders) }()
-	for i := 0; i < 20; i++ {
-		s, clock, base := m3Store(t)
-		ticket := m3Ticket(t, s, "plain vs steal race")
-		if _, err := s.Claim(context.Background(), ticket.ID, false, "incumbent"); err != nil {
-			t.Fatal(err)
-		}
-		clock.mono = 1000
-		plain, stealer := openLeaseSibling(t, base, "worktree-b", clock), openLeaseSibling(t, base, "worktree-c", clock)
-		start := make(chan struct{})
-		var wg sync.WaitGroup
-		var plainErr, stealErr error
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			<-start
-			_, plainErr = plain.Claim(context.Background(), ticket.ID, false, "plain")
-		}()
-		go func() {
-			defer wg.Done()
-			<-start
-			_, stealErr = stealer.Claim(context.Background(), ticket.ID, true, "stealer")
-		}()
-		close(start)
-		wg.Wait()
-		if stealErr != nil {
-			t.Fatalf("stealer lost: %v", stealErr)
-		}
-		orders[ErrorCode(plainErr)]++
-		switch ErrorCode(plainErr) {
-		case "E_LEASE_HELD":
-		case "E_LEASE_EXPIRED":
-			if d := leaseExpiredDetail(t, plainErr); d.HolderActor != "incumbent" || d.HolderWorktreeID != "worktree-a" {
-				t.Fatalf("plain claimer named a holder its transaction did not read: %#v", d)
+// A plain claimer and a stealer contend for a lapsed lease. Each order is
+// forced: the first claimer's afterLeaseBegin hook (it holds the writer lock)
+// releases the second, which then waits behind it. The decisions are the ones
+// the CAS always made (the stealer wins at generation 2; the plain claimer is
+// refused E_LEASE_EXPIRED when it decides first, E_LEASE_HELD after the
+// steal), and an E_LEASE_EXPIRED detail names the incumbent row the plain
+// claimer's own transaction read, not the stealer that commits after it.
+func TestPlainClaimContendingWithStealKeepsDecisionAndNamesReadHolder(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		plainFirst bool
+		wantPlain  string
+	}{
+		{"plain decides first", true, "E_LEASE_EXPIRED"},
+		{"steal decides first", false, "E_LEASE_HELD"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, clock, base := m3Store(t)
+			ticket := m3Ticket(t, s, "plain vs steal")
+			if _, err := s.Claim(context.Background(), ticket.ID, false, "incumbent"); err != nil {
+				t.Fatal(err)
 			}
-		default:
-			t.Fatalf("plain claimer = %v", plainErr)
-		}
-		lease, err := s.GetLease(context.Background(), ticket.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if held, ok := lease.Held(); !ok || held.Actor() != "stealer" || held.Generation() != 2 {
-			t.Fatalf("race outcome lease = %#v", lease)
-		}
+			clock.mono = 1000
+			plain, stealer := openLeaseSibling(t, base, "worktree-b", clock), openLeaseSibling(t, base, "worktree-c", clock)
+			first, release := plain, make(chan struct{})
+			if !test.plainFirst {
+				first = stealer
+			}
+			var once sync.Once
+			first.afterLeaseBegin = func() { once.Do(func() { close(release) }) }
+			var wg sync.WaitGroup
+			var plainErr, stealErr error
+			run := func(isFirst bool, claim func()) {
+				defer wg.Done()
+				if !isFirst {
+					<-release
+				}
+				claim()
+			}
+			wg.Add(2)
+			go run(test.plainFirst, func() { _, plainErr = plain.Claim(context.Background(), ticket.ID, false, "plain") })
+			go run(!test.plainFirst, func() { _, stealErr = stealer.Claim(context.Background(), ticket.ID, true, "stealer") })
+			wg.Wait()
+			if stealErr != nil {
+				t.Fatalf("stealer lost: %v", stealErr)
+			}
+			if ErrorCode(plainErr) != test.wantPlain {
+				t.Fatalf("plain claimer = %v, want %s", plainErr, test.wantPlain)
+			}
+			if test.wantPlain == "E_LEASE_EXPIRED" {
+				if d := leaseExpiredDetail(t, plainErr); d.HolderActor != "incumbent" || d.HolderWorktreeID != "worktree-a" || d.LeaseState != "expired" {
+					t.Fatalf("plain claimer named a holder its transaction did not read: %#v", d)
+				}
+			}
+			lease, err := s.GetLease(context.Background(), ticket.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if held, ok := lease.Held(); !ok || held.Actor() != "stealer" || held.Generation() != 2 {
+				t.Fatalf("outcome lease = %#v", lease)
+			}
+		})
+	}
+}
+
+// An actor is caller-supplied text. One that reads like an SQLite error must
+// not turn the refusal into E_DB_BUSY (withImmediate classifies error text).
+func TestLeaseRefusalNamingAnSQLiteLikeActorKeepsItsCode(t *testing.T) {
+	s, clock, base := m3Store(t)
+	ticket := m3Ticket(t, s, "hostile actor")
+	const actor = "database is locked"
+	claim, err := s.Claim(context.Background(), ticket.ID, false, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.mono = 5000
+	other := openLeaseSibling(t, base, "worktree-b", clock)
+	_, err = other.Claim(context.Background(), ticket.ID, false, "bob")
+	if d := leaseExpiredDetail(t, err); d.HolderActor != actor {
+		t.Fatalf("claim detail = %#v", d)
+	}
+	_, err = s.Heartbeat(context.Background(), ticket.ID, claim.Token)
+	if d := leaseExpiredDetail(t, err); d.HolderActor != actor {
+		t.Fatalf("heartbeat detail = %#v", d)
+	}
+}
+
+// Liveness is checked before the token: a well-formed token that is not the
+// holder's still gets the lapsed-lease detail, unchanged from the bare code.
+func TestExpiredHeartbeatWithAnotherTokenGetsTheLapseDetail(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	ticket := m3Ticket(t, s, "foreign token heartbeat")
+	if _, err := s.Claim(context.Background(), ticket.ID, false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	foreign := base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("x", 32)))
+	if _, err := s.Heartbeat(context.Background(), ticket.ID, foreign); ErrorCode(err) != "E_LEASE_TOKEN" {
+		t.Fatalf("live lease, foreign token = %v", err)
+	}
+	clock.mono = 5000
+	_, err := s.Heartbeat(context.Background(), ticket.ID, foreign)
+	if d := leaseExpiredDetail(t, err); d.HolderActor != "alice" || d.Remedy != "aira claim "+ticket.ID+" --steal" {
+		t.Fatalf("lapsed lease, foreign token detail = %#v", d)
 	}
 }
