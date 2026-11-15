@@ -24,6 +24,20 @@ type ConfinePeakReport struct {
 	OOM         bool
 	Budget      *int64
 	BudgetBasis string
+	// AIRA-323's four raw completion facts, filled only by the confine launch
+	// site. Nil or "" means not established and the field is left off the wire
+	// (stored NULL). Unlike Peak and Budget, 0 is a REAL value here (a
+	// sub-millisecond interval), so nil is the only "absent".
+	//
+	//   - WallMS: monotonic ms from the admission call's return to this report.
+	//   - WaitMS: monotonic ms across the whole admission call; set only for a
+	//     daemon grant (a lease), never for a client-local admission result.
+	//   - StartedAtMS: the wall clock, Unix ms UTC, at the admission call's return.
+	//   - Repo: RepoIdentity of the launch directory ("none" outside any repo).
+	WallMS      *int64
+	WaitMS      *int64
+	StartedAtMS *int64
+	Repo        string
 }
 
 // Budget-basis families. The two quantities a caller could mean by "the budget"

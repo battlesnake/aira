@@ -237,6 +237,32 @@ type confineDeps struct {
 	// distinguishable from "the probe's own timeout expired"; production uses
 	// confineQueueProbeTimeout.
 	admitQueueProbeTimeout time.Duration
+	// AIRA-323 completion-fact seams. wallNow is the WALL clock with no monotonic
+	// reading (started_at_ms); monoNow is a monotonic offset (wall_ms and
+	// wait_ms are differences of it). Two seams, so a test can step the wall
+	// clock without moving the monotonic one. repoIdentity is the launch
+	// directory's RepoIdentity, called once, before admission.
+	wallNow      func() time.Time
+	monoNow      func() time.Duration
+	repoIdentity func() (string, bool)
+}
+
+// processEpoch anchors defaultMonoNow: time.Since of a reading that carries a
+// monotonic clock is a monotonic difference.
+var processEpoch = time.Now()
+
+func defaultWallNow() time.Time { return time.Now().Round(0) }
+
+func defaultMonoNow() time.Duration { return time.Since(processEpoch) }
+
+// defaultRepoIdentity is RepoIdentity of the process's working directory; a
+// Getwd error is unevaluated, never "none".
+func defaultRepoIdentity() (string, bool) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	return RepoIdentity(cwd)
 }
 
 // defaultAdmitWaitDiagInterval is how often a blocked admission prints a
@@ -274,6 +300,9 @@ func defaultConfineDeps() confineDeps {
 		sendFailfastTrip:      SendFailfastTrip,
 		queuePosition:         confineQueuePositionFromDaemon,
 		resolveMode:           ResolveConfineMode,
+		wallNow:               defaultWallNow,
+		monoNow:               defaultMonoNow,
+		repoIdentity:          defaultRepoIdentity,
 	}
 }
 
@@ -332,6 +361,15 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	}
 	if deps.resolveMode == nil {
 		deps.resolveMode = defaults.resolveMode
+	}
+	if deps.wallNow == nil {
+		deps.wallNow = defaults.wallNow
+	}
+	if deps.monoNow == nil {
+		deps.monoNow = defaults.monoNow
+	}
+	if deps.repoIdentity == nil {
+		deps.repoIdentity = defaults.repoIdentity
 	}
 	return deps
 }
@@ -706,6 +744,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if diagInterval <= 0 {
 		diagInterval = defaultAdmitWaitDiagInterval
 	}
+	// AIRA-323. The repo identity is computed ONCE, before admission, so neither
+	// timed interval below includes it; an unevaluated identity is sent as
+	// absent (NULL), never as "none".
+	repoID, repoOK := deps.repoIdentity()
+	if !repoOK {
+		repoID = ""
+	}
 	admitWaitDone := make(chan struct{})
 	admitWaitStopped := make(chan struct{})
 	// AIRA-51: an unpinned request's `reserve` here is only the client's
@@ -761,7 +806,24 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			}
 		}
 	}()
+	admitEntered := deps.monoNow()
 	admission, err := deps.admit(ctx, path, request, reserve)
+	// AIRA-323. Both clocks are read at the admission return: wall_ms runs from
+	// here to the report, and started_at_ms is this wall reading (never derived
+	// later as `at - wall_ms`, which a clock step during the run would shift).
+	admitReturned := deps.monoNow()
+	startedAtMS := deps.wallNow().UnixMilli()
+	// The client's own wait across the whole admission call, sent only for a
+	// daemon grant: release is set exactly for a daemon lease (immediate, waited
+	// and the daemon's own unevaluated grant), while a client-local result
+	// (disabled, no-daemon unevaluated) carries a waitedMS that is a Go zero,
+	// not a measurement. The grant's waitedMS is NOT this figure: it restarts on
+	// a reconnect and excludes the transport.
+	var waitMS *int64
+	if admission.release != nil {
+		waited := (admitReturned - admitEntered).Milliseconds()
+		waitMS = &waited
+	}
 	close(admitWaitDone)
 	<-admitWaitStopped
 	resolvedReserve := reserve
@@ -1473,9 +1535,14 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// unevaluable. Read off result.Status rather than re-derived, so the
 		// reported budget is the same number the trailer prints.
 		budget, budgetBasis := ConfineBudgetTerm(result.Status)
+		// AIRA-323. wall_ms ends at the report's construction, after the
+		// teardown usage read; it is a monotonic difference, never a difference
+		// of wall readings.
+		wallMS := (deps.monoNow() - admitReturned).Milliseconds()
 		peakAcknowledged = deps.reportPeak(reportCtx, request, ConfinePeakReport{
 			Signature: signature, Peak: usage.PeakRSS, OOM: oom,
 			Budget: budget, BudgetBasis: budgetBasis,
+			WallMS: &wallMS, WaitMS: waitMS, StartedAtMS: &startedAtMS, Repo: repoID,
 		}) == nil
 		cancelReport()
 	}

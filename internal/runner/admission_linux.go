@@ -852,13 +852,82 @@ func reportConfinePeak(ctx context.Context, request ConfineRequest, report Confi
 // separately-named CLI relay; the CLI verb is now spelled the same as the wire
 // verb it always sent), and a second transport for the same frame is exactly
 // the kind of duplicate that drifts.
+//
+// AIRA-323 version skew, without a protocol bump. The four completion facts are
+// optional fields a daemon that predates them refuses (E_DAEMON_PROTOCOL, from
+// its count guard or its field allowlist, always before it writes). When a frame
+// that carried any of them is refused with that code, the report is re-sent
+// ONCE without them, so the peak/OOM/budget sample is kept and only the four
+// facts of this run are lost. The same rule keeps the sample when a new daemon
+// refuses one of the values. No re-send on a transport error, a missing reply
+// or any other code: the daemon commits before it replies, so re-sending after
+// a lost reply could write the row twice.
 func ReportPeakSample(ctx context.Context, socketPath string, report ConfinePeakReport) error {
 	if strings.TrimSpace(socketPath) == "" || report.Signature == "" {
 		return errors.New("daemon report unavailable")
 	}
-	request := ConfineRequest{AdmitSocketPath: socketPath}
+	err := reportPeakExchangeOnce(ctx, socketPath, confinePeakReportArgs(report, true))
+	if errors.Is(err, errReportCompletionFactsRefused) {
+		return reportPeakExchangeOnce(ctx, socketPath, confinePeakReportArgs(report, false))
+	}
+	return err
+}
+
+// errReportCompletionFactsRefused is an INTERNAL sentinel (AIRA-323), the
+// confine-report counterpart of errAdmitPriorityUnknown: the daemon answered a
+// frame carrying an AIRA-323 completion fact with an E_DAEMON_PROTOCOL refusal.
+// ReportPeakSample answers it with exactly one re-send without the facts. It is
+// matched on the CODE, not the text: a pre-323 daemon has two refusal texts (its
+// count guard and its allowlist), and a refused report is not a launch decision.
+// It never escapes ReportPeakSample.
+var errReportCompletionFactsRefused = errors.New("aira: the daemon refused this report's completion facts")
+
+// confinePeakReportCompletionFields are the four optional AIRA-323 frame fields.
+var confinePeakReportCompletionFields = []string{"wall_ms", "wait_ms", "started_at_ms", "repo"}
+
+// confinePeakReportArgs builds the confine-report Request.Args. With
+// withCompletion false it is the pre-323 frame, the re-send's shape: identical
+// to the first frame except that it lacks the four completion facts.
+func confinePeakReportArgs(report ConfinePeakReport, withCompletion bool) map[string]any {
+	args := map[string]any{"signature": report.Signature, "oom": report.OOM}
+	if report.Kind != "" {
+		args["kind"] = report.Kind
+	}
+	if report.Peak != nil && *report.Peak > 0 {
+		args["peak_rss"] = *report.Peak
+	}
+	// The pair travels together or not at all: the daemon refuses half of it,
+	// because a budget with no provenance is a quantity the classifier cannot
+	// compare with anything.
+	if report.Budget != nil && *report.Budget > 0 && report.BudgetBasis != "" {
+		args["budget"] = *report.Budget
+		args["budget_basis"] = report.BudgetBasis
+	}
+	if !withCompletion {
+		return args
+	}
+	// Nil is the only "absent": the `> 0` idiom above must NOT be copied, since
+	// 0 is a real duration. The values are sent as measured; the daemon's
+	// handler is the one layer that validates them.
+	if report.WallMS != nil {
+		args["wall_ms"] = *report.WallMS
+	}
+	if report.WaitMS != nil {
+		args["wait_ms"] = *report.WaitMS
+	}
+	if report.StartedAtMS != nil {
+		args["started_at_ms"] = *report.StartedAtMS
+	}
+	if report.Repo != "" {
+		args["repo"] = report.Repo
+	}
+	return args
+}
+
+// reportPeakExchangeOnce is one dial, one confine-report frame, one reply.
+func reportPeakExchangeOnce(ctx context.Context, socketPath string, args map[string]any) error {
 	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", request.AdmitSocketPath)
+	conn, err := dialer.DialContext(ctx, "unix", socketPath)
 	if err != nil {
 		return err
 	}
@@ -868,34 +937,44 @@ func ReportPeakSample(ctx context.Context, socketPath string, report ConfinePeak
 	}
 	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "confine-report"
-	frame.Request.Args = map[string]any{"signature": report.Signature, "oom": report.OOM}
-	if report.Kind != "" {
-		frame.Request.Args["kind"] = report.Kind
-	}
-	if report.Peak != nil && *report.Peak > 0 {
-		frame.Request.Args["peak_rss"] = *report.Peak
-	}
-	// The pair travels together or not at all: the daemon refuses half of it,
-	// because a budget with no provenance is a quantity the classifier cannot
-	// compare with anything.
-	if report.Budget != nil && *report.Budget > 0 && report.BudgetBasis != "" {
-		frame.Request.Args["budget"] = *report.Budget
-		frame.Request.Args["budget_basis"] = report.BudgetBasis
-	}
+	frame.Request.Args = args
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return err
 	}
-	var response runnerAdmitResponseFrame
+	// OK is a pointer so a missing or null `ok` is told apart from an explicit
+	// false: only the latter is a refusal.
+	var response struct {
+		OK    *bool  `json:"ok"`
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
 	if err := readRunnerAdmitFrame(conn, &response); err != nil {
 		return err
 	}
-	if !response.OK || response.Code != "OK" {
+	if response.OK == nil || !*response.OK || response.Code != "OK" {
+		// Only a WELL-FORMED refusal (ok present and false AND the protocol code)
+		// is re-sent: a contradictory envelope such as ok=true with an error code,
+		// or one with no ok at all, establishes nothing, and the daemon may have
+		// committed before sending it.
+		refused := response.OK != nil && !*response.OK
+		if refused && response.Code == "E_DAEMON_PROTOCOL" && carriesCompletionFacts(args) {
+			return errReportCompletionFactsRefused
+		}
 		if response.Error != "" {
 			return errors.New(response.Error)
 		}
 		return errors.New("daemon rejected confine report")
 	}
 	return nil
+}
+
+func carriesCompletionFacts(args map[string]any) bool {
+	for _, name := range confinePeakReportCompletionFields {
+		if _, present := args[name]; present {
+			return true
+		}
+	}
+	return false
 }
 
 // SendFailfastTrip tells the daemon a --fail-fast task in `slice` has FAILED

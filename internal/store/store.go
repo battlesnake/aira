@@ -868,6 +868,9 @@ func (s *Store) initDB(ctx context.Context) error {
 			PRIMARY KEY (project_id, run_id),
 			FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
+		// AIRA-323 adds wall_ms/wait_ms/started_at_ms/repo: plain nullable
+		// columns with NO CHECK -- their rules have one owner, the confine-report
+		// handler -- and NULL (never 0) on every row that predates them.
 		// AIRA-180 adds kind/budget/budget_basis. A database written before that
 		// reaches the same shape through ensureConfinePeakHistorySubject below;
 		// the column defaults here and there must stay identical, which is why
@@ -875,6 +878,7 @@ func (s *Store) initDB(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS confine_peak_history (
 		    signature TEXT NOT NULL, peak_rss INTEGER, oom INTEGER NOT NULL, at TEXT NOT NULL,
 		    kind TEXT NOT NULL DEFAULT 'confine', budget INTEGER, budget_basis TEXT,
+		    wall_ms INTEGER, wait_ms INTEGER, started_at_ms INTEGER, repo TEXT,
 		    CHECK(length(signature)>0), CHECK(peak_rss IS NULL OR peak_rss>0), CHECK(oom IN (0,1)),
 		    CHECK(length(kind)>0), CHECK(budget IS NULL OR budget>0)
 		)`,
@@ -1304,6 +1308,10 @@ func (s *Store) ensureRantOriginProjectID(ctx context.Context) error {
 // persisted nowhere, so any value invented here would be a fabricated fact, and
 // the classifier is built to report an unknown budget as unevaluated.
 //
+// AIRA-323's four completion facts (wall_ms, wait_ms, started_at_ms, repo) are
+// added the same way, each ALTER spelling exactly the DDL's column type with no
+// DEFAULT, so a pre-323 row reads NULL (unevaluated), never a fabricated 0.
+//
 // The index is created AFTER the columns, in this function rather than in the
 // DDL block, because the DDL block runs before any migration: naming `kind` in a
 // CREATE INDEX up there would fail on exactly the pre-AIRA-180 database this
@@ -1314,6 +1322,10 @@ func (s *Store) ensureConfinePeakHistorySubject(ctx context.Context) error {
 		{"kind", `ALTER TABLE confine_peak_history ADD COLUMN kind TEXT NOT NULL DEFAULT 'confine'`},
 		{"budget", `ALTER TABLE confine_peak_history ADD COLUMN budget INTEGER`},
 		{"budget_basis", `ALTER TABLE confine_peak_history ADD COLUMN budget_basis TEXT`},
+		{"wall_ms", `ALTER TABLE confine_peak_history ADD COLUMN wall_ms INTEGER`},
+		{"wait_ms", `ALTER TABLE confine_peak_history ADD COLUMN wait_ms INTEGER`},
+		{"started_at_ms", `ALTER TABLE confine_peak_history ADD COLUMN started_at_ms INTEGER`},
+		{"repo", `ALTER TABLE confine_peak_history ADD COLUMN repo TEXT`},
 	} {
 		if err := s.ensureColumnAdded(ctx, "confine_peak_history", column.name, column.ddl); err != nil {
 			return err
