@@ -33,3 +33,5 @@ Build after AIRA-324; needs the owner un-hold. Step 0 (install flags) does not d
 
 ## Related
 AIRA-324, AIRA-273, AIRA-318, AIRA-331, AIRA-325, AIRA-334, AIRA-345 (hint below a recent OOM peak), RANT-134, RANT-136.
+
+Review state 2026-11-15: spec is a DRAFT. Rounds blocked 9 -> 4 -> 8 P2 (Sol + Fable); 8 P2 open on rev 3 (learning-rule integer rounding; steering budget for delegated parents; H16 comparator; aira top must show the limit; steering reads cache-inclusive memory.current so a cache-filler becomes a false offender; rollback trigger median cannot fire; generated prose enumeration; non-convergence note). Non-convergence rule applied: do not patch further. First decide whether AIRA-318 (anonymous peak instead of cache-inclusive memory.peak) lands first; it removes the cache root cause. Needs the owner un-hold either way.

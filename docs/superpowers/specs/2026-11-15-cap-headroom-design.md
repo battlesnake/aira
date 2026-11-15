@@ -1,6 +1,6 @@
 # Cap headroom for auto-sized confine jobs: book the estimate, cap above it
 
-Ticket: AIRA-347 (held, milestone v0.45; AIRA-324 blocks it). Status: plan, not built.
+Ticket: AIRA-347 (held, milestone v0.45; AIRA-324 blocks it). Status: DRAFT, not gate-approved, not built. Three review rounds (Sol + Fable) blocked at 9, 4 and 8 P2 findings; rev 3 above took the round-3 findings, and 8 P2 findings on rev 3 are OPEN (listed in the ticket review log and the PR). The reviewers found no counterexample to the headroom rule itself; the open findings fall into two root causes (page cache counted as use; readers that take the cap for the booking). Recommended before any revision: decide whether the anonymous-peak work (AIRA-318, section 11) comes first, because it removes root cause A.
 Companion to [`2026-11-13-history-charge-design.md`](2026-11-13-history-charge-design.md)
 (AIRA-323..326), whose section 5.2 (AIRA-324) splits the booking from the cap for **pinned** jobs.
 This document does the same for **auto-sized** jobs. It is a separate file, not a fifth revision of
