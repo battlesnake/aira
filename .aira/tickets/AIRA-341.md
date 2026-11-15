@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-341","project":"aira","title":"admission: delete the machine-wide p90 prior (the estimate:p90-prior rung) and its history query/cache","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":"v0.43","labels":[],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-341","project":"aira","title":"admission: delete the machine-wide p90 prior (the estimate:p90-prior rung) and its history query/cache","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":"v0.43","labels":[],"hold":false,"relations":[]}
 ---
 
 
