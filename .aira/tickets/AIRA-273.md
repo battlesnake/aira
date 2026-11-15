@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-273","project":"aira","title":"confine estimator: a BIMODAL-memory command is OOM-killed repeatedly — 1.5x-per-kill creep + 20-row window forgets the big mode","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-273","project":"aira","title":"confine estimator: a BIMODAL-memory command is OOM-killed repeatedly — 1.5x-per-kill creep + 20-row window forgets the big mode","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":true,"relations":[{"kind":"relates","from":"AIRA-347","to":"AIRA-273"}]}
 ---
 
 REPORTED BY qual (2026-09-24/25), with a second instance from gap. qual has worked around it on the fastest-ee side (explicit `--memory-reserve 1G` pin, branch qual-mlint-reserve), so this is NOT blocking — held for a later release.
@@ -37,3 +37,5 @@ A alone does not stop the restart cycle (4); B alone still costs ~8 kills per le
 Plan 2026-11-14: RANT-109 is another bimodal instance (stoner `cargo xtask arch-baseline check`: 1148M warm, 7.39G cold rebuild; OOM-killed at 1792M after the hint's single-run suggestion; AIRA-334 rewords that hint). Look at this after the p90 deletion and AIRA-331.
 
 Further instance, 2026-11-15 (RANT-136, from a field session builder): `cargo clippy` on the stoner xtask was auto-estimated at ~320M and OOM-killed in scope; the measured cold need is ~1.2G. Same family: history of cheap runs under-sizes an expensive mode, and learning from the kill is 1.5x per kill. Workaround until this lands: pin `--memory-reserve 1536M` for cargo build/clippy on that tree. Owner may want this pulled forward from v0.45 because it kills a peer's builds.
+
+Cap headroom, 2026-11-15: AIRA-347 (docs/superpowers/specs/2026-11-15-cap-headroom-design.md) proposes a cgroup limit above the booking for auto-sized jobs (rev 2: L = min(k x C, C + 1 GiB), k = 2). On the store a proxy puts 42-78% of auto kills within reach of that limit (45-81% for a plain 2C; not bounds: the need of a killed run is censored), which is the censored-creep case of this ticket; a run that finishes under the higher limit records a real peak. It does NOT fix modes more than k apart (qual's 24x lint gate): option B here (remember the big mode longer than 20 rows) is still needed for those. Option A (escalate to the p90 prior) is superseded by AIRA-347 plus AIRA-341 if the owner includes cold-start grants (AIRA-347 decision D1).
