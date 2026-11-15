@@ -100,15 +100,19 @@ func TestConfineBudgetDefaultOutputIsBoundedOnALargeHistory(t *testing.T) {
 		if len(peer.requests) != 5 {
 			t.Fatalf("json=%v: %d page requests, want 5 (the whole history is still read)", jsonOutput, len(peer.requests))
 		}
-		for _, request := range peer.requests {
-			for _, key := range []string{"limit", "direction", "grep"} {
-				if _, sent := request[key]; sent {
-					t.Fatalf("the client-side selection argument %q reached the daemon: %v", key, request)
-				}
+	}
+	// The selection is the client's alone: it never reaches a daemon, so no
+	// daemon, old or new, can apply it twice or refuse an argument it predates.
+	peer := &historyPeer{t: t, pages: largeBudgetPages()}
+	runBudgetCLI(t, peer, true, "direction", "actionable", "limit", "50", "grep", "confine")
+	for _, request := range peer.requests {
+		for _, key := range []string{"limit", "direction", "grep"} {
+			if _, sent := request[key]; sent {
+				t.Fatalf("the client-side selection argument %q reached the daemon: %v", key, request)
 			}
 		}
 	}
-	peer := &historyPeer{t: t, pages: largeBudgetPages()}
+	peer = &historyPeer{t: t, pages: largeBudgetPages()}
 	_, out, _ := runBudgetCLI(t, peer, true)
 	result := decodeBudgetJSON(t, out)
 	if len(result.Subjects) != 50 || *result.Total != 10000 || *result.Matched != 500 || *result.Returned != 50 || !*result.Truncated || result.Next != nil || result.Paged {
