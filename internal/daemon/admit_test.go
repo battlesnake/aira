@@ -548,7 +548,7 @@ func TestAdmitGrantCommittedAtShutdownDeliveredOrReleasedOnce(t *testing.T) {
 		t.Fatal("shutdown did not release committed grant")
 	}
 	_ = clientConn.Close()
-	retireAdmitQueues(server)
+	server.retireAdmitQueue()
 	if admitQueueCreated(server) {
 		t.Fatal("shutdown left an admission queue in place")
 	}
@@ -582,7 +582,7 @@ func TestAdmitShutdownHandlerOwnsReleaseAndPrunesAfterDrain(t *testing.T) {
 		t.Fatalf("queued client read=%v, want EOF", err)
 	}
 	_ = clientConn.Close()
-	retireAdmitQueues(server)
+	server.retireAdmitQueue()
 	if admitQueueCreated(server) {
 		t.Fatal("shutdown left an admission queue in place")
 	}

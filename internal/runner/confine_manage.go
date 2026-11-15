@@ -524,11 +524,11 @@ type ConfineSliceReserve struct {
 	// GrantedEstablished is the honesty bit for the ledger-derived numbers on
 	// this struct (AIRA-220): GrantedBytes, Jobs, and the population split
 	// (ScopeJobs/ScopeBytes, ReservationJobs/ReservationBytes) are meaningful ONLY
-	// when it is true. Its precise meaning: a queue (ledger) object exists for the
-	// slice. It is false whenever the daemon holds no queue object at all, which
-	// is NOT only a fresh/restarted daemon before its first admission: a queue
-	// exists only while something is connection-held, so pruneAdmitQueue deletes
-	// it the moment the last waiter releases. A false bit must render as
+	// when it is true. Its precise meaning: the slice's queue (ledger) holds a
+	// waiter or lease. It is false whenever the daemon holds none, which is NOT
+	// only a fresh/restarted daemon before its first admission: the daemon reads
+	// its queue as absent from the moment the last waiter releases (AIRA-228; the
+	// queue object itself lives on, drained). A false bit must render as
 	// `unevaluated`, never as a `0B granted / 0 admitted jobs` that reads "the
 	// slice is empty, launch freely" while jobs are in fact live.
 	//

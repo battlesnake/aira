@@ -20,9 +20,8 @@ func formatInt64(value int64) string {
 	return strconv.FormatInt(value, 10)
 }
 
-// The helpers below are the ONLY place a test touches the server's admission
-// queue registry directly, so the registry's shape can change without every
-// test that needs a hand-built queue changing with it.
+// Shared helpers for the server's one admission queue (AIRA-228). A test that
+// only reads the queue takes server.admitQueue under admitRegistryMu directly.
 
 // registerAdmitQueue installs a hand-built queue as the server's admission
 // queue, under the lock the daemon itself uses, so admitSliceSnapshot resolves
@@ -40,15 +39,6 @@ func admitQueueAtLocked(server *Server, path string) *sliceQueue {
 		return queue
 	}
 	return nil
-}
-
-// allAdmitQueuesLocked returns the server's admission queue, if it has one, as
-// a list. admitRegistryMu must be held.
-func allAdmitQueuesLocked(server *Server) []*sliceQueue {
-	if server.admitQueue == nil {
-		return nil
-	}
-	return []*sliceQueue{server.admitQueue}
 }
 
 // admitQueueCreated reports whether the server has created an admission queue at
@@ -69,12 +59,6 @@ func liveAdmitQueueCount(server *Server) int {
 		return 1
 	}
 	return 0
-}
-
-// retireAdmitQueues is the shutdown-time retirement Serve runs once every
-// connection has drained.
-func retireAdmitQueues(server *Server) {
-	server.retireAdmitQueue()
 }
 
 // serveFixtureSlice makes an isolated real-cgroup fixture slice the one slice

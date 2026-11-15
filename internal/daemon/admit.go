@@ -761,12 +761,15 @@ type sliceQueue struct {
 	// unrestricted yield refilled the slice from the backlog and starved the
 	// 12 GiB heads it was meant to protect.
 	//
-	// There are exactly TWO writes, and neither can lengthen a hold:
+	// There are exactly THREE writes, and none can lengthen a hold:
 	//   1. the arm, guarded by derived phase == idle;
 	//   2. the completed-cycle clear, taken ONLY when the derived phase is already
 	//      idle (the hold is over), which forces one backfilling pass before the
 	//      next arm. Because it fires only from derived-idle it can shorten the
-	//      gap between cycles, never extend a freeze.
+	//      gap between cycles, never extend a freeze;
+	//   3. the drain reset in afterAdmitRelease (AIRA-228), taken ONLY once the
+	//      last waiter has left, so it can end a hold early but only when there
+	//      is nobody left for the hold to protect.
 	//
 	// A PUSHED head (AIRA-309) never arms and is never covered by the backstop:
 	// nothing but another push goes ahead of it.
@@ -2407,6 +2410,9 @@ func (q *sliceQueue) runEvaluator() {
 			tick = ticker.C
 		}
 		q.mu.Unlock()
+		if parking := q.server.admitEvaluatorParking; parking != nil {
+			parking(tick != nil)
+		}
 		select {
 		case <-q.kick:
 			q.server.evaluateAdmitQueue(q)

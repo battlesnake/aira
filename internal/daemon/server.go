@@ -233,6 +233,13 @@ type Server struct {
 	// can grant a waiter between the enqueue and the test seeding its precondition).
 	// Production never sets it.
 	admitManualEvaluation bool
+	// admitEvaluatorParking is a test seam, nil in production. The evaluator calls
+	// it each time it is about to block in its select, on its own goroutine and
+	// with no lock held, saying whether that select polls (true) or waits only for
+	// a kick (false). A test that holds the evaluator here can read the kick buffer
+	// while nothing can drain it, which proves quiescence where a quiet window
+	// cannot.
+	admitEvaluatorParking func(polling bool)
 	// AIRA-247. failfastSignalPID delivers the fail-fast cancellation to one
 	// victim SUPERVISOR (SIGUSR1 → the supervisor forwards to the job's process
 	// group; unhandled, SIGUSR1's default action is Term). Nil in production →

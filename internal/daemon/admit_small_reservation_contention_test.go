@@ -116,10 +116,10 @@ func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T)
 	settle := func() {
 		t.Helper()
 		server.admitRegistryMu.Lock()
-		queues := allAdmitQueuesLocked(server)
+		queue := server.admitQueue
 		server.admitRegistryMu.Unlock()
 		before := evaluations.Load()
-		for _, queue := range queues {
+		if queue != nil {
 			queue.signal()
 		}
 		deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))

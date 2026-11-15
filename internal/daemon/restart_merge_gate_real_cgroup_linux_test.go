@@ -127,22 +127,23 @@ func awaitGateShutdown(t *testing.T, done <-chan error) {
 	}
 }
 
-// gateLeases walks every admit queue and returns the granted+accounted leases as
-// scope_id -> reserve. The gate uses one slice, so this is that slice's ledger.
+// gateLeases returns the admission queue's granted+accounted leases as
+// scope_id -> reserve: the one slice's ledger.
 func gateLeases(server *Server) map[string]int64 {
 	server.admitRegistryMu.Lock()
-	queues := allAdmitQueuesLocked(server)
+	q := server.admitQueue
 	server.admitRegistryMu.Unlock()
 	out := map[string]int64{}
-	for _, q := range queues {
-		q.mu.Lock()
-		for _, w := range q.waiters {
-			if w != nil && w.state == admitGranted && w.accounted {
-				out[w.scopeID] = w.reserve
-			}
-		}
-		q.mu.Unlock()
+	if q == nil {
+		return out
 	}
+	q.mu.Lock()
+	for _, w := range q.waiters {
+		if w != nil && w.state == admitGranted && w.accounted {
+			out[w.scopeID] = w.reserve
+		}
+	}
+	q.mu.Unlock()
 	return out
 }
 

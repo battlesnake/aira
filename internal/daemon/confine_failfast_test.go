@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,7 +91,9 @@ func TestFailfastTripRejectsQueuedWaiters(t *testing.T) {
 func TestFailfastLatchSurvivesQueuePrune(t *testing.T) {
 	now := time.Unix(900_000, 0)
 	server := failfastDirectServer(now)
-	server.tripFailfast("/slice", "")
+	if _, err := server.tripFailfast("/slice", ""); err != nil {
+		t.Fatalf("trip: %v", err)
+	}
 
 	queue, _, code, err := server.enqueueAdmitInternal("/slice", 1<<20, "", 0, false, admitRequest{})
 	if err != nil || code != "" {
@@ -161,6 +165,48 @@ func TestFailfastRealModeIsNoOp(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-228 / AIRA-247 — a shim trip that could not be latched (the
+// queue serves another path, so admitQueueLocked refuses it) answers
+// Applied=false with the reason, signals nobody and latches nothing, rather than
+// reporting a trip nobody established. Unreachable through the shim resolver,
+// so the queue is planted at a foreign path. Mutation: answer Applied=true when
+// tripFailfast errors (the pre-fix behaviour) -> red.
+func TestFailfastTripNotLatchedIsNotApplied(t *testing.T) {
+	server := shimTestServer(t, 1<<30)
+	var signalled atomic.Int64
+	server.failfastSignalPID = func(int) error {
+		signalled.Add(1)
+		return nil
+	}
+	queue := &sliceQueue{
+		path: "/not-the-sentinel", server: server, kick: make(chan struct{}, 1),
+		waiters: []*admitWaiter{{
+			seq: 1, reserve: 1 << 20, state: admitGranted, accounted: true,
+			grantedCh: make(chan struct{}), scopeID: testConfineScopeID(t, "victim", 4321),
+		}},
+		outstanding: 1 << 20, outstandingJobs: 1,
+	}
+	registerAdmitQueue(server, queue)
+
+	resp := server.confineFailfast(map[string]any{"slice": "test", "scope_id": ""})
+	result, ok := resp.Data.(runner.FailfastTripResult)
+	if !ok {
+		t.Fatalf("confineFailfast Data=%T, want runner.FailfastTripResult", resp.Data)
+	}
+	if result.Applied || result.Mode != "shim" || !strings.Contains(result.Reason, admitSliceNotServed) {
+		t.Fatalf("an unlatched trip must answer Applied=false mode=shim with the %s reason: %+v", admitSliceNotServed, result)
+	}
+	if n := signalled.Load(); n != 0 || result.Signalled != 0 {
+		t.Fatalf("an unlatched trip signalled %d supervisor(s) (reported %d), want 0", n, result.Signalled)
+	}
+	queue.mu.Lock()
+	tripped := queue.failfastTripped
+	queue.mu.Unlock()
+	if tripped {
+		t.Fatal("an unlatched trip latched the foreign queue")
+	}
+}
+
 // verifies: AIRA-247 — the sweep SIGUSR1s the sibling supervisors but SKIPS the
 // trigger (the failed --fail-fast job, which keeps its real verdict), derives
 // each supervisor pid from the granted waiter's scope id, and latches the queue.
@@ -197,7 +243,10 @@ func TestFailfastSweepSkipsTriggerSignalsSiblings(t *testing.T) {
 		return nil
 	}
 
-	count := server.tripFailfast("/slice", triggerID)
+	count, err := server.tripFailfast("/slice", triggerID)
+	if err != nil {
+		t.Fatalf("trip: %v", err)
+	}
 
 	mu.Lock()
 	got := map[int]bool{}
@@ -337,7 +386,10 @@ func TestFailfastSweepIsBestEffortAndSkipsUnparseable(t *testing.T) {
 		return nil
 	}
 
-	count := server.tripFailfast("/slice", "")
+	count, err := server.tripFailfast("/slice", "")
+	if err != nil {
+		t.Fatalf("trip: %v", err)
+	}
 
 	if count != 1 {
 		t.Fatalf("tripFailfast counted %d, want 1 — only the good victim; an errored signal is best-effort (not counted) and an unparseable scope id is skipped", count)

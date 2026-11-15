@@ -263,7 +263,7 @@ func TestAdmitEvaluatorServesTheNextPopulation(t *testing.T) {
 			t.Fatalf("round %d: %d live queue(s) after the only waiter released", round, live)
 		}
 	}
-	retireAdmitQueues(server)
+	server.retireAdmitQueue()
 }
 
 // verifies: AIRA-228 / AIRA-247 — a fail-fast trip is not lost with the
@@ -285,7 +285,9 @@ func TestFailfastTripOutlivesThePopulation(t *testing.T) {
 
 	t.Run("trip before any admission", func(t *testing.T) {
 		server := manualQueueServer(1<<40, now)
-		server.tripFailfast("/slice", "")
+		if _, err := server.tripFailfast("/slice", ""); err != nil {
+			t.Fatalf("trip: %v", err)
+		}
 		rejected(t, server)
 	})
 
@@ -296,7 +298,9 @@ func TestFailfastTripOutlivesThePopulation(t *testing.T) {
 		if running.state != admitGranted {
 			t.Fatalf("precondition: running job state=%v", running.state)
 		}
-		server.tripFailfast("/slice", "")
+		if _, err := server.tripFailfast("/slice", ""); err != nil {
+			t.Fatalf("trip: %v", err)
+		}
 		server.releaseAdmitWaiter(queue, running)
 		if live := liveAdmitQueueCount(server); live != 0 {
 			t.Fatalf("precondition: the slice must be drained (live=%d)", live)
@@ -372,7 +376,7 @@ func TestAdmitRefusesARequestForAnotherSlice(t *testing.T) {
 		maximum.Store(1 << 40)
 		s := admitTestServer(&maximum)
 		s.admitResolveSlice = oneSliceResolver
-		t.Cleanup(func() { retireAdmitQueues(s) })
+		t.Cleanup(func() { s.retireAdmitQueue() })
 		return s
 	}
 	args := func(t *testing.T, slice string, exclusive bool) map[string]any {
@@ -439,7 +443,7 @@ func TestAdmitRefusesARequestForAnotherSlice(t *testing.T) {
 
 	t.Run("shim mode serves any slice name", func(t *testing.T) {
 		s := shimTestServer(t, 1<<30)
-		t.Cleanup(func() { retireAdmitQueues(s) })
+		t.Cleanup(func() { s.retireAdmitQueue() })
 		frame := admitOnce(t, s, args(t, "any-name.slice", false))
 		if grant := admitGrantData(t, frame); grant.State != "immediate" {
 			t.Fatalf("a ci-shim daemon maps every slice name onto its one sentinel: grant=%+v", grant)
@@ -480,9 +484,11 @@ func TestAdmitQueueRefusesASecondSlicePath(t *testing.T) {
 	server.releaseAdmitWaiter(queue, first)
 }
 
-// countEvaluatorPasses makes every evaluator pass countable: a pass reads the
-// admission clock once, as soon as it holds queue.mu. It must be installed
-// before the queue exists.
+// countEvaluatorPasses counts admission clock reads. A pass reads the clock once,
+// as soon as it holds queue.mu; so does every enqueue, and a grant reads it
+// again, so it counts passes only in a window with neither (see its one user,
+// TestAdmitPollResumesAfterAnIdlePeriod). It must be installed before the queue
+// exists.
 func countEvaluatorPasses(server *Server) *atomic.Int64 {
 	var passes atomic.Int64
 	server.admitNow = func() time.Time {
@@ -492,39 +498,102 @@ func countEvaluatorPasses(server *Server) *atomic.Int64 {
 	return &passes
 }
 
-// waitEvaluatorQuiet waits until a whole window passes with no evaluator pass
-// (no clock read at all), i.e. every pending kick has landed and no poll timer
-// is running. It fails the test if that never happens within budget.
-func waitEvaluatorQuiet(t *testing.T, passes *atomic.Int64, window, budget time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(testdeadline.Wait(budget))
-	for time.Now().Before(deadline) {
-		before := passes.Load()
-		time.Sleep(window)
-		if passes.Load() == before {
+// evaluatorParks watches the evaluator through the admitEvaluatorParking seam:
+// it counts every park (the evaluator about to block in its select), split by
+// whether that select polls, and can hold the evaluator at its next idle park.
+type evaluatorParks struct {
+	idle    atomic.Int64
+	polling atomic.Int64
+	hold    atomic.Pointer[parkHold]
+}
+
+// parkHold is one armed hold: held is closed once the evaluator is held, and the
+// evaluator waits for resume to be closed.
+type parkHold struct{ held, resume chan struct{} }
+
+func newParkHold() *parkHold {
+	return &parkHold{held: make(chan struct{}), resume: make(chan struct{})}
+}
+
+// watchEvaluatorParks installs the seam. It must be installed before the queue
+// exists.
+func watchEvaluatorParks(server *Server) *evaluatorParks {
+	parks := &evaluatorParks{}
+	server.admitEvaluatorParking = func(polling bool) {
+		if polling {
+			parks.polling.Add(1)
 			return
 		}
+		parks.idle.Add(1)
+		if hold := parks.hold.Swap(nil); hold != nil {
+			close(hold.held)
+			<-hold.resume
+		}
 	}
-	t.Fatalf("the evaluator never went quiet for %v within %v: something is still polling an idle queue", window, budget)
+	return parks
+}
+
+// drainAndQuiesce runs drain, an action that empties the queue and kicks it (a
+// release), and returns only once the evaluator is PROVABLY quiescent: blocked in
+// a select with no poll timer and no kick buffered, so that nothing but a new
+// kick can ever wake it again. A quiet window cannot prove that (a kick may be
+// buffered, or its pass delayed, for longer than any window); this does, by
+// construction:
+//
+//   - The hold is armed before drain, while the queue still holds a waiter, so
+//     every park until the drain polls and cannot take it. The drain's own kick
+//     guarantees at least one idle park after it, so the hold is always taken.
+//   - The evaluator is held at a park, i.e. after the pass of every kick it has
+//     already received, and while held it cannot receive another. So once drain
+//     has returned (every kick it sends is sent), an empty kick buffer read while
+//     the evaluator is held means no wake is pending. A full one means a kick
+//     arrived after that park: re-arm, release, and hold the next idle park.
+//
+// The test must send no other kick between drain and the action it measures.
+func drainAndQuiesce(t *testing.T, parks *evaluatorParks, queue *sliceQueue, drain func()) {
+	t.Helper()
+	deadline := testdeadline.After(5 * time.Second)
+	hold := newParkHold()
+	parks.hold.Store(hold)
+	drain()
+	for {
+		select {
+		case <-hold.held:
+		case <-deadline:
+			// Disarm it (or, if the evaluator took it just now, release it) so the
+			// cleanup's retirement is not left waiting on a held evaluator.
+			parks.hold.CompareAndSwap(hold, nil)
+			close(hold.resume)
+			t.Fatal("the evaluator never parked without a poll timer after the queue drained: an idle queue's evaluator is still polling")
+		}
+		if len(queue.kick) == 0 {
+			close(hold.resume)
+			return
+		}
+		next := newParkHold()
+		parks.hold.Store(next)
+		close(hold.resume)
+		hold = next
+	}
 }
 
 // verifies: AIRA-228 — an idle queue's evaluator holds no poll timer. The queue
 // outlives its population, so a ticker left running would wake an idle daemon
 // at the poll rate forever (before AIRA-228 an empty queue had no evaluator at
-// all). At a 1ms poll, a drained queue's evaluator must go quiet, and the next
+// all). At a 1ms poll, a drained queue's evaluator must park with no poll timer
+// (observed at the park itself, not inferred from a quiet window), and the next
 // enqueue must still be served. Mutation: keep the ticker running while idle ->
-// it never goes quiet.
+// it never parks without one.
 func TestAdmitIdleEvaluatorHoldsNoPollTimer(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
 	server.admitPollInterval = time.Millisecond
-	passes := countEvaluatorPasses(server)
-	t.Cleanup(func() { retireAdmitQueues(server) })
+	parks := watchEvaluatorParks(server)
+	t.Cleanup(func() { server.retireAdmitQueue() })
 	queue, waiter := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, waiter)
-	server.releaseAdmitWaiter(queue, waiter)
-	waitEvaluatorQuiet(t, passes, 50*time.Millisecond, 2*time.Second)
+	drainAndQuiesce(t, parks, queue, func() { server.releaseAdmitWaiter(queue, waiter) })
 	_, next := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, next)
 	server.releaseAdmitWaiter(queue, next)
@@ -533,22 +602,23 @@ func TestAdmitIdleEvaluatorHoldsNoPollTimer(t *testing.T) {
 // verifies: AIRA-228 — a drained queue's evaluator resumes polling once it is
 // populated again. A blocker that clears with no enqueue or release (the slice
 // ceiling rising, a memory read recovering, a freeze hold expiring) is seen only
-// by a poll. The evaluator goes quiet on the drained queue first, so the poll
-// has to come back, not merely never have stopped. Mutations: never re-enable
-// the poll once the queue has been empty -> red; the same with every kick's
-// pass delayed 300 ms (so a pending kick could grant after the ceiling rises)
-// -> still red, since the ceiling rises only after the kicks are spent.
+// by a poll. The evaluator is provably parked idle on the drained queue first
+// (drainAndQuiesce), so the poll has to come back, not merely never have
+// stopped. Mutations: never re-enable the poll once the queue has been empty ->
+// red; the same with every kick's pass delayed 300 ms (so a pending kick could
+// grant after the ceiling rises) -> still red, since the ceiling rises only
+// after the kicks are spent.
 func TestAdmitPollResumesAfterAnIdlePeriod(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
 	server.admitPollInterval = 5 * time.Millisecond
 	passes := countEvaluatorPasses(server)
-	t.Cleanup(func() { retireAdmitQueues(server) })
+	parks := watchEvaluatorParks(server)
+	t.Cleanup(func() { server.retireAdmitQueue() })
 	queue, first := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, first)
-	server.releaseAdmitWaiter(queue, first)
-	waitEvaluatorQuiet(t, passes, 50*time.Millisecond, 5*time.Second)
+	drainAndQuiesce(t, parks, queue, func() { server.releaseAdmitWaiter(queue, first) })
 
 	// A holder takes most of the slice, then a job that cannot fit beside it.
 	_, holder := enqueueOn(t, server, "/slice", 95)
@@ -560,7 +630,8 @@ func TestAdmitPollResumesAfterAnIdlePeriod(t *testing.T) {
 	// (the single evaluator's one in-flight kick plus the one-slot kick buffer;
 	// the job's own enqueue kick is one of them or coalesces into them). So once
 	// a pass has refused it, two FURTHER passes prove the poll is live, and every
-	// later pass, including the one that grants it, is poll-originated.
+	// later pass, including the one that grants it, is poll-originated. In this
+	// window nothing enqueues or grants, so each pass reads the clock once.
 	var refusedAt int64
 	testdeadline.Eventually(t, 5*time.Second, func() bool {
 		queue.mu.Lock()
@@ -588,26 +659,26 @@ func TestAdmitPollResumesAfterAnIdlePeriod(t *testing.T) {
 }
 
 // verifies: AIRA-228 — a re-declare that establishes a lease on an empty queue
-// wakes the evaluator, which then serves that queue again. While the queue is
+// wakes the evaluator, which then polls that queue again. While the queue is
 // empty the evaluator waits only for a kick, and an establish is the one
-// insertion that used to send none. Here the woken evaluator must retire an
-// elapsed fairness-freeze anchor (the next pass after a hold ends clears it); an
-// anchor left in place would instead hand the next arrivals a backfilling pass.
-// Mutation: drop the establish kick -> the elapsed anchor is never cleared. (This
-// test does not pin polling on its own, since the kick's pass may be the one
-// that clears the anchor; TestAdmitPollResumesAfterAnIdlePeriod pins that.)
+// insertion that used to send none. drainAndQuiesce first proves the evaluator
+// is blocked with no poll timer and no kick pending, so the establish's own kick
+// is the ONLY thing that can wake it: no release kick, delayed or not, can stand
+// in for it. The woken evaluator must park polling, and its passes must retire
+// an elapsed fairness-freeze anchor (the next pass after a hold ends clears it).
+// Mutation: drop the establish kick -> the evaluator never parks again and the
+// anchor stays (deterministically, not by timing).
 func TestAdmitEstablishGrantedWakesTheEvaluator(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
 	server.admitPollInterval = 5 * time.Millisecond
-	passes := countEvaluatorPasses(server)
-	t.Cleanup(func() { retireAdmitQueues(server) })
+	parks := watchEvaluatorParks(server)
+	t.Cleanup(func() { server.retireAdmitQueue() })
 	queue, first := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, first)
-	server.releaseAdmitWaiter(queue, first)
-	// Every pending kick has landed and the poll timer is stopped.
-	waitEvaluatorQuiet(t, passes, 50*time.Millisecond, 5*time.Second)
+	drainAndQuiesce(t, parks, queue, func() { server.releaseAdmitWaiter(queue, first) })
+	pollingBefore := parks.polling.Load()
 
 	// A restart survivor re-declares into the empty queue: no enqueue kick.
 	_, established, code, err := server.enqueueReDeclare("/slice", 10, "redeclare", admitRequest{scopeID: "CONFINE-survivor-1-a", peerSameUID: true})
@@ -618,6 +689,9 @@ func TestAdmitEstablishGrantedWakesTheEvaluator(t *testing.T) {
 	queue.mu.Lock()
 	queue.freezeArmedAt = time.Now().Add(-server.admitFreezeMaxHold - time.Minute)
 	queue.mu.Unlock()
+	testdeadline.Eventually(t, time.Second, func() bool {
+		return parks.polling.Load() > pollingBefore
+	}, "the evaluator never woke and parked polling after the establish: an establish into an empty queue sends no kick")
 	testdeadline.Eventually(t, time.Second, func() bool {
 		queue.mu.Lock()
 		defer queue.mu.Unlock()

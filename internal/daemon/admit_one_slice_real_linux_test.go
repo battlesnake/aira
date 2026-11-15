@@ -41,7 +41,7 @@ func TestAdmitOneSliceGuardAdmitsTheRealDefaultSlice(t *testing.T) {
 			// Only the memory read is injected: the ledger must not depend on how
 			// loaded the shared slice is right now. Resolution is the real one.
 			server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 1 << 40, 0, true, "" }
-			t.Cleanup(func() { retireAdmitQueues(server) })
+			t.Cleanup(func() { server.retireAdmitQueue() })
 			args := validAdmitArgs(1<<20, 1000)
 			args["slice"] = wire
 			if grant := admitGrantData(t, admitOnce(t, server, args)); grant.State != "immediate" {
