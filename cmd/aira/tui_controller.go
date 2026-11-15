@@ -111,6 +111,9 @@ type tableRow struct {
 	// (AIRA-312) its name, owner, current reserve and live usage. Display only;
 	// empty on every other view's rows.
 	ConfirmText string
+	// KillText names an `aira top` row's job for the KK kill (AIRA-271): its
+	// name, owner and command head, as printable text. Display only.
+	KillText string
 }
 
 type gaugeTile struct {
@@ -204,7 +207,25 @@ type tuiState struct {
 	// ConfineUnknownOwner. confine-list reads keep the fixed unknown marker: they
 	// filter nothing by owner.
 	ConfineOwner string
+	// TopKill is `aira top`'s armed kill (AIRA-271): the first K on a row arms
+	// it, a second K on the same row opens the confirmation, and anything else
+	// disarms it. The zero value is "nothing armed".
+	TopKill topKillArm
 }
+
+// topKillArm is the job the first K armed. ScopeID "" is nothing armed. Job
+// and Queued are for the status line; Ticks counts the top refreshes since
+// arming, for the time-out (topKillArmTicks).
+type topKillArm struct {
+	ScopeID string
+	Job     string
+	Queued  bool
+	Ticks   int
+}
+
+// topKillArmTicks is how many top refreshes (about one a second,
+// topRefreshInterval) an armed kill survives without its second K.
+const topKillArmTicks = 5
 
 // paletteConfirm is the immutable, resolved request snapshot displayed by the
 // confirmation page. TypedID is the sole mutable confirmation buffer.
@@ -541,12 +562,18 @@ func requestPanelRefresh(state tuiState, view tuiView) (tuiState, []tuiCmd) {
 
 func onTUIKey(state tuiState, key rune, descriptors []core.DispatchDescriptor) (tuiState, []tuiCmd) {
 	state = cloneTUIState(state)
+	// AIRA-271. Any key but K disarms an armed kill, and then does what it does.
+	if key != 'K' {
+		state.TopKill = topKillArm{}
+	}
 	if !state.PaletteOpen && !state.PaletteDispatching && state.Panels[state.Active].SelectedID != "" {
 		if action, ok := inlineActionFor(state.Active, key); ok {
 			return onInlineActionStart(state, action, descriptors)
 		}
 	}
 	switch key {
+	case 'K':
+		return onTopKillKey(state)
 	case 'q':
 		state.ShuttingDown = true
 		return state, []tuiCmd{{Kind: cmdQuit}}
@@ -751,6 +778,14 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 				panel.Model = state.Panels[result.View].Model
 			} else {
 				panel.Model, state.Top = topViewModel(state.Top, *result.Top)
+				// AIRA-271. An armed kill times out, and drops at once when its
+				// job has left the listing.
+				if state.TopKill.ScopeID != "" {
+					state.TopKill.Ticks++
+					if _, listed := inlineSelectedRow(panel, state.TopKill.ScopeID); !listed || state.TopKill.Ticks >= topKillArmTicks {
+						state.TopKill = topKillArm{}
+					}
+				}
 			}
 		}
 	}

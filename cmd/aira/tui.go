@@ -372,6 +372,12 @@ func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 		}
 		return event
 	}
+	// AIRA-271. A key that never reaches onTUIKey (an arrow, Esc, Enter) also
+	// disarms an armed kill, and then does what it does.
+	if r.state.TopKill.ScopeID != "" && event.Key() != tcell.KeyRune {
+		r.state = onTopKillDisarm(r.state)
+		r.render()
+	}
 	key := event.Rune()
 	if event.Key() == tcell.KeyTab {
 		key = '\t'
@@ -606,8 +612,17 @@ func (r *tuiRuntime) render() {
 		keys = "    r refresh  : palette  q quit"
 	}
 	if r.state.Active == viewTop {
-		// AIRA-276 / AIRA-309 / AIRA-312. Advertised only on the tab they work on.
-		keys = "    c command/dir  f push queued job to front  e lower running job's reserve" + keys
+		// AIRA-276 / AIRA-309 / AIRA-312 / AIRA-271. Advertised only on the tab
+		// they work on. An armed kill replaces the legend, job first, so it is
+		// read even on a narrow terminal.
+		keys = "    c command/dir  f push queued job to front  e lower running job's reserve  KK kill job" + keys
+		if arm := r.state.TopKill; arm.ScopeID != "" {
+			action := "KILL"
+			if arm.Queued {
+				action = "CANCEL"
+			}
+			keys = "    [red::b]" + action + " ARMED:[-:-:-] " + tview.Escape(arm.Job) + " · K again to confirm, any other key cancels"
+		}
 	}
 	r.tabs.SetText(strings.Join(tabNames, "  ") + keys)
 	r.detachedStatus.SetText(r.state.DetachedReport)
@@ -1088,7 +1103,7 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	r.paletteSubmitButton = nil
 	r.paletteConfirmForm = form
 	title := "Confirm mutation"
-	if confirm.Destructive {
+	if confirm.Destructive || confirm.Verb == "confine-kill" {
 		title = "Confirm DESTRUCTIVE mutation"
 	}
 	var idField *tview.InputField
