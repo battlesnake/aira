@@ -63,12 +63,11 @@ func (systemClock) Now() (string, uint64, error) {
 // transaction already read, after the CAS chose to refuse, so it never
 // changes a decision. A field is absent when that data does not establish it.
 type LeaseExpiredDetail struct {
-	TicketID string `json:"ticket_id"`
 	// LeaseState is "expired" (held, its TTL elapsed on this boot),
 	// "prior-boot" (held, heartbeated on an earlier boot), "liveness-unevaluated"
-	// (held, the clock sample precedes its last heartbeat), "free" (released or
-	// freed after lapsing) or "unclaimed" (no lease row is currently recorded:
-	// it says nothing about history, since eject removes a project's rows).
+	// (held, the clock sample precedes its last heartbeat) or "free" (no held
+	// lease is recorded: the row is free or absent, which says nothing about
+	// history, since eject removes a project's rows).
 	LeaseState string `json:"lease_state"`
 	// HolderActor is the holder's actor, cut to its first leaseHolderActorMax
 	// bytes (on a rune boundary) when HolderActorTruncated says so.
@@ -122,7 +121,7 @@ func (s *Store) leaseNotLiveError(ticketID string, held domain.HeldLease, bootID
 	// cannot add a line or a remedy to the message. The worktree id is already
 	// bounded: a claim writes its token under a directory of that name.
 	actor, cut := boundLeaseActor(held.Actor())
-	detail := LeaseExpiredDetail{TicketID: id, HolderActor: actor, HolderActorTruncated: cut, HolderWorktreeID: held.Worktree(), HolderIsThisWorktree: &this}
+	detail := LeaseExpiredDetail{HolderActor: actor, HolderActorTruncated: cut, HolderWorktreeID: held.Worktree(), HolderIsThisWorktree: &this}
 	shown := strconv.Quote(actor)
 	if cut {
 		shown += fmt.Sprintf(" (truncated to %d of its %d bytes)", len(actor), len(held.Actor()))
@@ -154,16 +153,12 @@ func (s *Store) leaseNotLiveError(ticketID string, held domain.HeldLease, bootID
 	return &LeaseExpiredError{Detail: detail, message: fmt.Sprintf("%s%s; re-take it with `%s` (recorded as lease.steal)", lapse, sameWorktree, detail.Remedy)}
 }
 
-// leaseNotHeldError describes a heartbeat on a lease row that is free
-// (state "free") or absent ("unclaimed"); no holder is recorded.
-func (s *Store) leaseNotHeldError(ticketID, state string) *LeaseExpiredError {
+// leaseNotHeldError describes a heartbeat on a lease row that is free or
+// absent; no holder is recorded.
+func (s *Store) leaseNotHeldError(ticketID string) *LeaseExpiredError {
 	id := s.displayID(ticketID)
-	detail := LeaseExpiredDetail{TicketID: id, LeaseState: state, Remedy: "aira claim " + id}
-	what := "the lease on " + id + " is not held (released, or freed after it lapsed)"
-	if state == "unclaimed" {
-		what = "no lease is currently recorded for " + id
-	}
-	return &LeaseExpiredError{Detail: detail, message: fmt.Sprintf("%s; take it with `%s`", what, detail.Remedy)}
+	detail := LeaseExpiredDetail{LeaseState: "free", Remedy: "aira claim " + id}
+	return &LeaseExpiredError{Detail: detail, message: fmt.Sprintf("no held lease is recorded for %s; take it with `%s`", id, detail.Remedy)}
 }
 
 type LeaseClaim struct {
@@ -642,7 +637,7 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		}
 		row, err := readLeaseRow(ctx, conn, s.projectID, ticketID)
 		if errors.Is(err, sql.ErrNoRows) {
-			refusal = s.leaseNotHeldError(ticketID, "unclaimed")
+			refusal = s.leaseNotHeldError(ticketID)
 			return ErrLeaseExpired
 		}
 		if err != nil {
@@ -654,7 +649,7 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		}
 		held, ok := lease.Held()
 		if !ok {
-			refusal = s.leaseNotHeldError(ticketID, "free")
+			refusal = s.leaseNotHeldError(ticketID)
 			return ErrLeaseExpired
 		}
 		if !held.IsLive(bootID, monoNS) {

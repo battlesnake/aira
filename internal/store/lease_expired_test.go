@@ -72,7 +72,7 @@ func TestExpiredClaimNamesHolderAgeAndStealRemedy(t *testing.T) {
 	other := openLeaseSibling(t, base, "worktree-b", clock)
 	_, err := other.Claim(context.Background(), ticket.ID, false, "bob")
 	detail := leaseExpiredDetail(t, err)
-	if detail.TicketID != ticket.ID || detail.LeaseState != "expired" || detail.HolderActor != "alice" || detail.HolderWorktreeID != "worktree-a" {
+	if detail.LeaseState != "expired" || detail.HolderActor != "alice" || detail.HolderWorktreeID != "worktree-a" {
 		t.Fatalf("detail = %#v", detail)
 	}
 	if detail.HolderIsThisWorktree == nil || *detail.HolderIsThisWorktree {
@@ -197,7 +197,7 @@ func TestExpiredHeartbeatNamesHolderAndStealRemedy(t *testing.T) {
 	}
 }
 
-func TestHeartbeatOnFreeOrUnclaimedLeaseOffersPlainClaimAndNoHolder(t *testing.T) {
+func TestHeartbeatOnFreeOrAbsentLeaseOffersPlainClaimAndNoHolder(t *testing.T) {
 	s, clock, _ := m3Store(t)
 	released := m3Ticket(t, s, "released heartbeat detail")
 	claim, err := s.Claim(context.Background(), released.ID, false, "alice")
@@ -236,36 +236,35 @@ func TestHeartbeatOnFreeOrUnclaimedLeaseOffersPlainClaimAndNoHolder(t *testing.T
 	}
 
 	for _, test := range []struct {
-		id, token, state string
-		before           func()
+		id, token, name string
+		before          func()
 	}{
-		{released.ID, claim.Token, "free", nil},
-		{unclaimed.ID, token, "unclaimed", nil},
-		{ejected.ID, ejectedClaim.Token, "unclaimed", ejectAndReadopt},
+		{released.ID, claim.Token, "released", nil},
+		{unclaimed.ID, token, "absent", nil},
+		{ejected.ID, ejectedClaim.Token, "absent after eject", ejectAndReadopt},
 	} {
 		if test.before != nil {
 			test.before()
 		}
 		_, err := s.Heartbeat(context.Background(), test.id, test.token)
 		detail := leaseExpiredDetail(t, err)
-		if detail.LeaseState != test.state || detail.Remedy != "aira claim "+test.id {
-			t.Fatalf("%s detail = %#v", test.state, detail)
+		if detail.LeaseState != "free" || detail.Remedy != "aira claim "+test.id {
+			t.Fatalf("%s detail = %#v", test.name, detail)
 		}
 		out := leaseExpiredJSON(t, detail)
 		for _, absent := range []string{"holder_actor", "holder_worktree_id", "holder_is_this_worktree", "expired_for_ns"} {
 			if _, present := out[absent]; present {
-				t.Fatalf("%s: unestablished %s present: %v", test.state, absent, out)
+				t.Fatalf("%s: unestablished %s present: %v", test.name, absent, out)
 			}
 		}
 		if strings.Contains(err.Error(), "--steal") || !strings.Contains(err.Error(), "`aira claim "+test.id+"`") {
-			t.Fatalf("%s message = %q", test.state, err.Error())
+			t.Fatalf("%s message = %q", test.name, err.Error())
 		}
-		if strings.Contains(err.Error(), "never") ||
-			(test.state == "unclaimed" && !strings.Contains(err.Error(), "no lease is currently recorded for "+test.id)) {
-			t.Fatalf("%s message asserts history the read cannot establish: %q", test.state, err.Error())
+		if strings.Contains(err.Error(), "never") || !strings.Contains(err.Error(), "no held lease is recorded for "+test.id) {
+			t.Fatalf("%s message asserts history the read cannot establish: %q", test.name, err.Error())
 		}
 		if _, err := s.Claim(context.Background(), test.id, false, "alice"); err != nil {
-			t.Fatalf("%s: named remedy failed: %v", test.state, err)
+			t.Fatalf("%s: named remedy failed: %v", test.name, err)
 		}
 	}
 }

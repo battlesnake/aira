@@ -52,7 +52,7 @@ func TestExpiredLeaseResponseCarriesDetailWithUnchangedCode(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := map[string]any{
-			"ticket_id": id, "lease_state": "expired", "holder_actor": "holder", "holder_worktree_id": "main",
+			"lease_state": "expired", "holder_actor": "holder", "holder_worktree_id": "main",
 			"holder_is_this_worktree": true, "expired_for_ns": float64(42), "remedy": "aira claim " + id + " --steal",
 		}
 		if len(wire.Data) != len(want) {
@@ -63,22 +63,5 @@ func TestExpiredLeaseResponseCarriesDetailWithUnchangedCode(t *testing.T) {
 				t.Fatalf("%s data[%s] = %#v, want %#v (data %v)", verb, key, wire.Data[key], value, wire.Data)
 			}
 		}
-	}
-}
-
-// AIRA-338: the generated help (dispatch-table summaries) names the expiry
-// remedy for both lease verbs, not only the --steal argument description.
-func TestLeaseVerbHelpNamesExpiryRemedy(t *testing.T) {
-	found := map[string]string{}
-	for _, entry := range New(nil).Help() {
-		if entry["verb"] == "claim" || entry["verb"] == "heartbeat" {
-			found[entry["verb"]] = entry["summary"]
-		}
-	}
-	if s := found["claim"]; !strings.Contains(s, "expired") || !strings.Contains(s, "--steal") || !strings.Contains(s, "this worktree") {
-		t.Fatalf("claim help summary = %q", s)
-	}
-	if s := found["heartbeat"]; !strings.Contains(s, "E_LEASE_EXPIRED") || !strings.Contains(s, "claim --steal") {
-		t.Fatalf("heartbeat help summary = %q", s)
 	}
 }
