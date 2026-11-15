@@ -11,7 +11,8 @@ import (
 // ErrConfineKillDelivered marks the one CodeConfineKillUnconfirmed outcome in
 // which the kill itself happened (AIRA-339): the cgroup.kill write succeeded, so
 // the kernel has already SIGKILLed every process in the scope, and only the
-// emptiness confirmation that follows timed out. The code stays unconfirmed (the
+// emptiness confirmation that follows failed (it timed out, could not read the
+// scope's population, or was cancelled). The code stays unconfirmed (the
 // scope was not seen empty); the marker lets the daemon audit-log the kill with
 // confirmed=false instead of leaving no record of it. A failed cgroup.kill write
 // never carries it: that delivered nothing.

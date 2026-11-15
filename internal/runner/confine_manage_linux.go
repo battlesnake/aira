@@ -843,7 +843,7 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 		// empty scope whose supervisor is established DEAD has ended rather than
 		// not started, so "retry" would send the operator after nothing. No
 		// cleanup is promised: the orphan reaper covers only the default slice and
-		// can be disabled (Sol review). Liveness the listing could not
+		// can be disabled. Liveness the listing could not
 		// establish (nil, including a dead probe vetoed by a held lease) keeps the
 		// retry reply: unestablished is never read as dead.
 		if record.SupervisorLive != nil && !*record.SupervisorLive {
@@ -862,7 +862,7 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 		// the target's identity, for the daemon's confirmed=false audit line.
 		target := ConfineKillResult{Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}
 		// No elapsed time is claimed: waitEmpty also returns at once on a read
-		// error, and early on cancellation (Sol review).
+		// error, and early on cancellation.
 		return target, fmt.Errorf("%s: %w in scope %s (cgroup.kill succeeded), but the scope could not be confirmed empty (%w), so processes may still be exiting; check `aira confine --list`",
 			CodeConfineKillUnconfirmed, ErrConfineKillDelivered, record.ScopeID, err)
 	}

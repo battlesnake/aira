@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-339","project":"aira","title":"confine --kill honesty (wording only): a delivered-but-unconfirmed kill says so; a dead-supervisor empty scope says it has ended, not 'retry'","status":"in-review","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.44","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-339","project":"aira","title":"confine --kill honesty (wording only): a delivered-but-unconfirmed kill says so; a dead-supervisor empty scope says it has ended, not 'retry'","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.44","labels":[],"hold":false,"relations":[]}
 ---
 
 
@@ -13,6 +13,9 @@ RANT-102's kill is logged by the daemon ('Nov 05 22:37:54 ... confine-kill: kill
 
 ## Minimum fix (from-scratch minimum)
 Wording and one log line only. (a) After cgroup.kill was written the 2s emptiness wait can time out: keep code U_CONFINE_KILL_UNCONFIRMED but say 'SIGKILL delivered to every process in <scope> (cgroup.kill succeeded); the scope was not yet empty after 2s, processes may still be exiting; check aira confine --list'. The daemon logs confine-kill with confirmed=false for that case (none if the cgroup.kill write itself failed); fix the misleading comment at internal/daemon/confine_manage.go:430-438. (b) The 'unattributed-sigkill' advisory lists its candidates as 'confine --kill, the memory watchdog, or an operator kill -9' without claiming which (no mechanism to tell). (c) Folded in from AIRA-319 (RANT-63/76): --kill on an empty scope whose supervisor is dead answers 'scope is empty and its supervisor is gone; the reaper removes it', not 'nothing to kill yet; retry' (internal/runner/confine_manage_linux.go ~841-842); AIRA-319's 'job may be queued' half is moot after AIRA-328. Deliberately NOT included: the xattr marker so the trailer could report terminated-by=confine-kill (a mechanism for one message; cgroupfs user xattrs on this kernel were probed once, not verified broadly), any daemon-to-supervisor protocol message.
+
+## As built (supersedes the wording above where they differ)
+Build review found two claims in the minimum-fix wording dishonest, so neither shipped. (a) says "the scope could not be confirmed empty (<cause>)", not "after 2s": waitEmpty also returns at once on a read error and early on cancellation, so no elapsed wait is claimed. (c) says "the job has ended and there is nothing to kill" with no reaper promise: the orphan reaper covers only the default slice and can be disabled. (b) names "an `aira confine --kill` -- your own or another session's" and omits the memory watchdog, which exempts capped confine scopes (internal/daemon/watchdog.go), so listing it would point at a ruled-out cause. Every confine-kill audit line carries confirmed=true|false.
 
 ## Tests
 Wording tests: an injected waitEmpty timeout gives the 'SIGKILL delivered' message and a confirmed=false daemon log line; an injected scope.Kill error gives neither. A dead-supervisor empty-scope --kill gives the 'has ended' reply and not the retry reply; the live granted-but-unscoped case from AIRA-328 still says retry. The unattributed advisory text lists the three candidates. Mutation-verify each.
