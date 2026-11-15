@@ -203,7 +203,14 @@ func topResizeConfirm(state tuiState, raw string) (tuiState, []tuiCmd) {
 	}
 	size, err := runner.ParseConfineResizeReserve(raw)
 	if err != nil {
-		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: new reserve " + strconv.Quote(raw) + ": " + err.Error()
+		// The refusal echoes the value at most 24 characters long (the parser's
+		// own message quotes it too), so a pasted run stays a short line.
+		shown := raw
+		if runes := []rune(raw); len(runes) > 24 {
+			shown = string(runes[:24]) + "…"
+		}
+		shown = strconv.Quote(shown)
+		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: new reserve " + shown + ": " + strings.ReplaceAll(err.Error(), strconv.Quote(raw), shown)
 		return state, nil
 	}
 	caller := topConfineCaller(state)
@@ -226,25 +233,33 @@ func topResizeConfirm(state tuiState, raw string) (tuiState, []tuiCmd) {
 	return state, nil
 }
 
-// inlineMiniFormTitle and inlineMiniFormLabel word the inline mini-form for
-// the action that opened it: `find set waived`'s reason/actor, or `aira top`'s
-// `e` new-reserve field (AIRA-312).
+// inlineMiniFormTitle, inlineMiniFormBody and inlineMiniFormLabel word the
+// inline mini-form for the action that opened it: `find set waived`'s
+// reason/actor, or `aira top`'s `e` new-reserve field (AIRA-312). The body
+// shows the job and its current reserve as of the keypress (AIRA-342).
 func inlineMiniFormTitle(pending *inlineActionState) string {
 	if pending.Action.Verb == "confine-resize" {
-		job := pending.Summary
-		if job == "" {
-			job = pending.TargetID
-		}
-		return " lower reserve: " + job + " "
+		return "Lower reserve"
 	}
-	return " waive " + pending.TargetID + " "
+	return "Waive " + pending.TargetID
+}
+
+func inlineMiniFormBody(pending *inlineActionState) string {
+	if pending.Action.Verb != "confine-resize" {
+		return "Give the reason for the waiver and who waives it."
+	}
+	job := pending.Summary
+	if job == "" {
+		job = pending.TargetID
+	}
+	return "Job: " + job + "\nType the new reserve the way the CLI takes it (512M, 2G, 1.5G). It must be smaller than the current reserve and not below the job's live memory use."
 }
 
 func inlineMiniFormLabel(pending *inlineActionState, name string) string {
 	if pending.Action.Verb == "confine-resize" && name == topResizeMemoryArg {
-		return "new reserve, e.g. 2G *: "
+		return "New reserve: "
 	}
-	return name + " *: "
+	return name + ": "
 }
 
 func onInlineActionStart(state tuiState, action inlineAction, descriptors []core.DispatchDescriptor) (tuiState, []tuiCmd) {
@@ -358,6 +373,8 @@ func onInlineMiniFormSubmit(state tuiState, values map[string]string, descriptor
 	if pending == nil || pending.Stage != inlineStageMiniForm {
 		return state, nil
 	}
+	// Each submit is judged afresh: a refusal from an earlier try is not this one's.
+	state.InlineError = ""
 	if pending.Action.Verb == "confine-resize" {
 		return topResizeConfirm(state, values[topResizeMemoryArg])
 	}

@@ -40,6 +40,7 @@ type tuiMessage struct {
 	Cursor         int64
 	Code           string
 	PaletteResult  string
+	PaletteDetails string
 	PaletteOutcome paletteOutcome
 	View           tuiView
 	Detail         detailResult
@@ -69,9 +70,12 @@ type paletteDispatchAttempt struct {
 	Evidenceless bool
 }
 
+// paletteResult is what a palette or row action did: Text is shown, Details
+// (the raw reply, AIRA-342) only behind the result dialog's `d`.
 type paletteResult struct {
 	Outcome paletteOutcome
 	Text    string
+	Details string
 }
 
 type paletteOutcomeDispatcher interface {
@@ -308,7 +312,7 @@ func (e *tuiExecutor) worker() {
 			}
 			if job.Palette != nil {
 				result := executePaletteRequest(e.ctx, e.dispatcher, e.scope, *job.Palette)
-				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: result.Text, PaletteOutcome: result.Outcome})
+				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: result.Text, PaletteDetails: result.Details, PaletteOutcome: result.Outcome})
 				continue
 			}
 			if job.Search != "" {
@@ -426,47 +430,40 @@ func classifyPaletteDispatch(attempt paletteDispatchAttempt) paletteResult {
 		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response"}
 	}
 	response := attempt.Response
+	data, ok := paletteResponseData(response)
 	if !response.OK {
 		// Only a send-evidenced daemon error Code is a provable rejection. Without
 		// send-evidence, a flattened error may be a committed-then-lost write, so it
 		// is outcome-unknown, never rejected (Sol P0).
 		if !attempt.Evidenceless && response.Code != "" && response.Code != "OK" {
-			return paletteResult{Outcome: paletteRejected, Text: fmt.Sprintf("REJECTED %s\n%s", response.Code, response.Error)}
+			return rejectedResult(response, data)
 		}
 		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmissing terminal daemon response"}
 	}
-	if response.Code != "OK" {
+	// A success carries OK, or a verdict in its place (core.Do: PASS, FAIL or
+	// UNEVALUATED, AIRA-342); any other code is a malformed reply.
+	if _, verdict := verdictMeaning[response.Code]; response.Code != "OK" && !verdict {
 		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response"}
 	}
-	formatted, ok := formatPaletteSuccess(response)
 	if !ok {
 		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response data"}
 	}
-	if formatted == "" {
-		return paletteResult{Outcome: paletteApplied, Text: "APPLIED"}
-	}
-	return paletteResult{Outcome: paletteApplied, Text: "APPLIED\n" + formatted}
+	return appliedResult(response, data)
 }
 
-func formatPaletteSuccess(response core.Response) (string, bool) {
+// paletteResponseData is a response's payload as JSON (nil when it has none),
+// or false when it is not valid JSON: then the outcome is unknown, never guessed.
+func paletteResponseData(response core.Response) (json.RawMessage, bool) {
 	data := response.RawData
 	if len(data) == 0 && response.Data != nil {
 		var err error
 		data, err = json.Marshal(response.Data)
 		if err != nil {
-			return "", false
+			return nil, false
 		}
 	}
-	if len(data) == 0 {
-		return "", true
+	if len(data) > 0 && !json.Valid(data) {
+		return nil, false
 	}
-	var value any
-	if json.Unmarshal(data, &value) != nil {
-		return "", false
-	}
-	pretty, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return "", false
-	}
-	return string(pretty), true
+	return data, true
 }
