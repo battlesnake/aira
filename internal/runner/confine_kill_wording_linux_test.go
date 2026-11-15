@@ -5,11 +5,18 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"aira/internal/cgrouptest"
 )
 
 // verifies: AIRA-339 (a) -- once cgroup.kill was written, SIGKILL is already
@@ -92,8 +99,10 @@ func TestConfineKillDeliveredButUnconfirmedSaysSo(t *testing.T) {
 }
 
 // verifies: AIRA-339 (c), folded in from AIRA-319 -- an empty scope whose
-// supervisor is established DEAD has ended: the reply says so and never asks the
-// operator to retry. Every other empty-scope reading (supervisor alive,
+// supervisor is established DEAD will not fill again: the reply says nothing
+// remains in this scope to kill and never asks the operator to retry. It claims
+// no more than the scope shows: never that the job has ended (an escaped
+// workload can outlive its supervisor; see the real-cgroup escape regression). Every other empty-scope reading (supervisor alive,
 // liveness unevaluated, or a dead probe vetoed by a still-held lease) keeps the
 // "retry" reply. The code and the no-kill decision are unchanged in all of them.
 func TestConfineKillEmptyScopeWordingFollowsSupervisorLiveness(t *testing.T) {
@@ -130,23 +139,90 @@ func TestConfineKillEmptyScopeWordingFollowsSupervisorLiveness(t *testing.T) {
 			}
 			message := err.Error()
 			if tc.ended {
-				for _, want := range []string{"is empty and its supervisor is gone", "the job has ended", "nothing to kill"} {
+				for _, want := range []string{"is empty and its supervisor is gone", "nothing remains in this scope to kill"} {
 					if !strings.Contains(message, want) {
 						t.Fatalf("dead-supervisor reply %q lacks %q", message, want)
 					}
 				}
-				if strings.Contains(message, "retry") || strings.Contains(message, "reaper") {
-					t.Fatalf("dead-supervisor reply asks for a retry or promises a cleanup: %q", message)
+				if strings.Contains(message, "retry") || strings.Contains(message, "reaper") || strings.Contains(message, "ended") {
+					t.Fatalf("dead-supervisor reply asks for a retry, promises a cleanup, or claims the job ended: %q", message)
 				}
 				return
 			}
 			if !strings.Contains(message, "nothing to kill yet; retry") {
 				t.Fatalf("reply %q lost the retry wording", message)
 			}
-			if strings.Contains(message, "has ended") {
-				t.Fatalf("reply %q claims the job ended without an established-dead supervisor", message)
+			if strings.Contains(message, "supervisor is gone") || strings.Contains(message, "nothing remains") {
+				t.Fatalf("reply %q reads the supervisor as dead without an established-dead supervisor", message)
 			}
 		})
+	}
+}
+
+// verifies: AIRA-339 (c) escape regression, from the Sol round-2 review -- an
+// empty scope plus a dead supervisor does NOT establish that the job ended. On a
+// real kernel a workload starts inside its scope, migrates out of it, and stays
+// alive after its supervisor is gone. --kill must still refuse to kill (same
+// code, the escaped process untouched), and its reply must claim only that
+// nothing remains in the scope, never that the job has ended.
+func TestConfineKillEmptyScopeDeadSupervisorEscapedWorkloadNeverReadsAsEnded(t *testing.T) {
+	parent := cgrouptest.IsolatedScopeParent(t)
+	backend := newDefaultBackend(parent)
+	if err := backend.Probe(context.Background()); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "real cgroup backend unavailable: %v", err)
+	}
+	// A real supervisor PID that is established dead (reaped, so ESRCH).
+	supervisor := exec.Command("/bin/true")
+	if err := supervisor.Run(); err != nil {
+		t.Fatalf("run stand-in supervisor: %v", err)
+	}
+	id := confineTestOwnedScopeID("escaped", "owner", supervisor.Process.Pid, time.Now().UnixNano())
+	scope, err := backend.Create(context.Background(), id)
+	if err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "real scope unavailable: %v", err)
+	}
+	// The escape target is a sibling outside every confine scan (not .aira-CONFINE-*).
+	outside := filepath.Join(parent, "escape-target")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "escape-target cgroup unavailable: %v", err)
+	}
+	scopeFD, err := syscall.Open(scope.Reference(), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "scope fd unavailable: %v", err)
+	}
+	defer syscall.Close(scopeFD)
+	workload := exec.Command("/bin/sleep", "60")
+	workload.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scopeFD}
+	if err := workload.Start(); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "start workload in scope: %v", err)
+	}
+	defer func() { _ = workload.Process.Kill(); _, _ = workload.Process.Wait() }()
+	if empty, err := scope.Empty(); err != nil || empty {
+		t.Fatalf("workload did not start inside its scope: empty=%v err=%v", empty, err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "cgroup.procs"), []byte(fmt.Sprint(workload.Process.Pid)), 0); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "migrate workload out of its scope: %v", err)
+	}
+	if empty, err := scope.Empty(); err != nil || !empty {
+		t.Fatalf("scope not empty after the workload migrated out: empty=%v err=%v", empty, err)
+	}
+	if live := probeSupervisorLive(supervisor.Process.Pid); live == nil || *live {
+		t.Fatalf("stand-in supervisor not established dead: %v", live)
+	}
+
+	result, err := KillConfine(context.Background(), parent, id, "owner", false, nil)
+	if err == nil || !strings.HasPrefix(err.Error(), CodeConfineNotLaunched+":") || result.Status == ConfineKillStatusKilled {
+		t.Fatalf("result=%+v err=%v, want %s", result, err, CodeConfineNotLaunched)
+	}
+	if err := unix.Kill(workload.Process.Pid, 0); err != nil {
+		t.Fatalf("the escaped workload was touched by an empty-scope --kill: %v", err)
+	}
+	message := err.Error()
+	if !strings.Contains(message, "supervisor is gone") || !strings.Contains(message, "nothing remains in this scope to kill") {
+		t.Fatalf("reply %q is not the dead-supervisor empty-scope reply", message)
+	}
+	if strings.Contains(message, "ended") || strings.Contains(message, "retry") {
+		t.Fatalf("reply %q claims the job ended (its escaped workload is alive) or asks for a retry", message)
 	}
 }
 

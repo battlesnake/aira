@@ -840,14 +840,16 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	}
 	if empty {
 		// AIRA-339 (from AIRA-319): wording only, the decision is unchanged. An
-		// empty scope whose supervisor is established DEAD has ended rather than
-		// not started, so "retry" would send the operator after nothing. No
-		// cleanup is promised: the orphan reaper covers only the default slice and
-		// can be disabled. Liveness the listing could not
+		// empty scope whose supervisor is established DEAD will not fill again, so
+		// "retry" would send the operator after nothing. It does NOT establish that
+		// the job ended: a workload that migrated out of the scope can outlive its
+		// supervisor, so the reply claims only what the scope shows. No cleanup is
+		// promised: the orphan reaper covers only the default slice and can be
+		// disabled. Liveness the listing could not
 		// establish (nil, including a dead probe vetoed by a held lease) keeps the
 		// retry reply: unestablished is never read as dead.
 		if record.SupervisorLive != nil && !*record.SupervisorLive {
-			return ConfineKillResult{}, fmt.Errorf("%s: scope %s is empty and its supervisor is gone: the job has ended and there is nothing to kill", CodeConfineNotLaunched, record.ScopeID)
+			return ConfineKillResult{}, fmt.Errorf("%s: scope %s is empty and its supervisor is gone: nothing remains in this scope to kill", CodeConfineNotLaunched, record.ScopeID)
 		}
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s has nothing to kill yet; retry", CodeConfineNotLaunched, record.ScopeID)
 	}
