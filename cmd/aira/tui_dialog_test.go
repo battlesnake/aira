@@ -12,9 +12,11 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/runner"
+	"aira/internal/store"
 	"aira/internal/testdeadline"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 // AIRA-342. The owner's complaint, made executable on a real `aira top` runtime
@@ -34,6 +36,16 @@ type topDialogDispatcher struct {
 	mu    sync.Mutex
 	reply core.Response
 	sent  []core.Request
+	// name and owner override the job's (alpha, session-a; dialogTestJob).
+	name, owner string
+}
+
+// job is the served job's scope id, name and owner.
+func (d *topDialogDispatcher) job() (scope, name, owner string) {
+	if d.name == "" {
+		return dialogTestJob, "alpha", "session-a"
+	}
+	return "CONFINE-" + d.name + "-101-aa@" + d.owner, d.name, d.owner
 }
 
 func (d *topDialogDispatcher) Dispatch(ctx context.Context, _ daemon.WorktreeScope, request core.Request) core.Response {
@@ -42,7 +54,10 @@ func (d *topDialogDispatcher) Dispatch(ctx context.Context, _ daemon.WorktreeSco
 		<-ctx.Done()
 		return core.Response{Code: daemon.CodeUnavailable, Error: ctx.Err().Error()}
 	case "confine-list":
-		data, _ := json.Marshal(topTestListing(topTestFrame(), topTestRecord(dialogTestJob, "alpha", 8*gib, gib)))
+		scope, name, owner := d.job()
+		record := topTestRecord(scope, name, 8*gib, gib)
+		record.Owner = owner
+		data, _ := json.Marshal(topTestListing(topTestFrame(), record))
 		return core.Response{OK: true, Code: "OK", RawData: data}
 	case "confine-resize":
 		d.mu.Lock()
@@ -67,7 +82,8 @@ func (d *topDialogDispatcher) writes() []core.Request {
 // the given size, as the job's own session, with alpha selected.
 func startTopDialogRuntime(t *testing.T, dispatcher *topDialogDispatcher, width, height int) (*tuiRuntime, tcell.SimulationScreen, *keyTracker) {
 	t.Helper()
-	t.Setenv("AIRA_CONFINE_OWNER", "session-a")
+	scope, _, owner := dispatcher.job()
+	t.Setenv("AIRA_CONFINE_OWNER", owner)
 	ctx, cancel := context.WithCancel(context.Background())
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(width, height)
@@ -86,7 +102,7 @@ func startTopDialogRuntime(t *testing.T, dispatcher *topDialogDispatcher, width,
 	resizeBoardScreen(t, runtime, screen, width, height)
 	eventuallyOnUI(t, runtime, testdeadline.Wait(10*time.Second), func() bool {
 		for index, row := range runtime.state.Panels[viewTop].Model.Rows {
-			if row.ID == dialogTestJob {
+			if row.ID == scope {
 				runtime.tables[viewTop].Select(index+1, 0)
 				return true
 			}
@@ -171,6 +187,26 @@ func TestDialogButtonFocusEnterAndEsc(t *testing.T) {
 		t.Fatalf("the confirmation carries no key hint:\n%s", text)
 	}
 	assertFocusedButton(t, runtime, screen, "Cancel", "Confirm", "initial focus")
+	// The whole short confirmation is on screen without scrolling, even after
+	// `d` (which a confirmation does not take).
+	keys.press(t, runeKey('d'))
+	keys.barrier(t)
+	body := onUI(t, runtime, func() string {
+		frame, _ := runtime.outerPages.GetPage(paletteConfirmPage).(*dialogFrame)
+		if frame == nil {
+			return ""
+		}
+		return frame.content.(*tview.Flex).GetItem(0).(*tview.TextView).GetText(true)
+	})
+	inside, _ := dialogInterior(t, runtime, screen, "")
+	if !strings.Contains(body, "Action: confine-resize") || !strings.Contains(inside, strings.Join(strings.Fields(body), "")) {
+		t.Fatalf("the confirmation %q is not whole inside the dialog:\n%s", body, simulationTextOnUI(t, runtime, screen))
+	}
+	// The request's exact arguments are in it, through the last one, and the
+	// hint offers no scrolling it does not need.
+	if !strings.Contains(inside, "Sends:memory_reserve=2Gowner=session-aselector="+dialogTestJob+"slice=") || !strings.Contains(inside, "steal=false") || strings.Contains(inside, "PgUp") {
+		t.Fatalf("the confirmation does not show the request's arguments through steal=false, or offers scrolling:\n%s", simulationTextOnUI(t, runtime, screen))
+	}
 	keys.press(t, specialKey(tcell.KeyLeft))
 	assertFocusedButton(t, runtime, screen, "Confirm", "Cancel", "after Left")
 	keys.press(t, specialKey(tcell.KeyRight))
@@ -259,6 +295,75 @@ func TestDialogRefusedSizeIsShownAboveTheForm(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-342 item 1 — with the longest job name (100) and owner (64)
+// the CLI accepts, the resize confirmation is taller than 80x24 allows: the
+// hint says PgUp/PgDn scroll, the buttons stay with Cancel focused, and PgDn
+// reaches the last argument (the form holds the focus; the keys go to the body).
+func TestDialogLongConfirmationScrollsToItsLastArgument(t *testing.T) {
+	dispatcher := &topDialogDispatcher{name: strings.Repeat("n", 100), owner: strings.Repeat("o", 64), reply: core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{}`)}}
+	runtime, screen, keys := startTopDialogRuntime(t, dispatcher, 80, 24)
+	openResizeConfirmation(t, runtime, screen, keys)
+	inside, _ := dialogInterior(t, runtime, screen, "")
+	if strings.Contains(inside, "steal=false") || !strings.Contains(inside, "PgUp/PgDnscroll") {
+		t.Fatalf("premise: the long confirmation fits, or the hint does not offer scrolling:\n%s", simulationTextOnUI(t, runtime, screen))
+	}
+	for press := 0; press < 10 && !strings.Contains(inside, "steal=false"); press++ {
+		keys.press(t, specialKey(tcell.KeyPgDn))
+		keys.barrier(t)
+		inside, _ = dialogInterior(t, runtime, screen, "")
+	}
+	if !strings.Contains(inside, "steal=false") {
+		t.Fatalf("PgDn never reached the last argument:\n%s", simulationTextOnUI(t, runtime, screen))
+	}
+	assertFocusedButton(t, runtime, screen, "Cancel", "Confirm", "after PgDn")
+	if writes := dispatcher.writes(); len(writes) != 0 {
+		t.Fatalf("scrolling sent %+v", writes)
+	}
+}
+
+// verifies: AIRA-342 item 3 — a refusal of a pasted 600-character value stays
+// inside the dialog at 80x24, 28x24 and a short 28x14: its code is above the
+// field, the value is echoed clipped (then the reason, where the rows allow),
+// and nothing is drawn above the dialog's top border.
+func TestDialogRefusalOfALongValueStaysInsideTheDialog(t *testing.T) {
+	long := strings.Repeat("x", 600)
+	for _, size := range [][2]int{{80, 24}, {28, 24}, {28, 14}} {
+		width, height := size[0], size[1]
+		t.Run(strconv.Itoa(width)+"x"+strconv.Itoa(height), func(t *testing.T) {
+			runtime, screen, keys := startTopDialogRuntime(t, &topDialogDispatcher{}, width, height)
+			openResizeForm(t, runtime, screen, keys, long)
+			keys.barrier(t)
+			text := simulationTextOnUI(t, runtime, screen)
+			inside, field := dialogInterior(t, runtime, screen, "New reserve")
+			code := strings.Index(inside, "E_CONFINE_ARGUMENT_INVALID:newreserve")
+			if code < 0 || field < 0 || code > field {
+				t.Fatalf("the refusal's code is not inside the dialog above the field:\n%s", text)
+			}
+			if height == 24 && !strings.Contains(inside, `"`+strings.Repeat("x", 24)+`…"must`) {
+				t.Fatalf("the refusal does not echo the value clipped, then its reason:\n%s", text)
+			}
+			if !strings.Contains(inside, "Continue") || !strings.Contains(inside, "Esccancels") {
+				t.Fatalf("the buttons or the hint left the dialog:\n%s", text)
+			}
+			rows := strings.Split(text, "\n")
+			for index, row := range rows {
+				if strings.Contains(row, "Lower reserve") {
+					if !strings.ContainsAny(row, "┌╔") {
+						t.Fatalf("the title row is not the dialog's top border: %q\n%s", row, text)
+					}
+					for _, above := range rows[:index] {
+						if strings.Contains(above, "xx") || strings.Contains(above, "E_CONFINE") {
+							t.Fatalf("the refusal is drawn above the dialog:\n%s", text)
+						}
+					}
+					return
+				}
+			}
+			t.Fatalf("the dialog's title row is not on screen:\n%s", text)
+		})
+	}
+}
+
 // dialogInterior is the text between the dialog's side borders, row after row,
 // with spaces removed (wrapping moves words between rows), and where marker
 // begins in it (-1 when absent).
@@ -288,6 +393,37 @@ func TestPaletteResultKeepsVerdictsAndInventsNothing(t *testing.T) {
 	}
 	if strings.Contains(verdict.Text, "malformed") || strings.Contains(verdict.Text, "APPLIED") {
 		t.Fatalf("verdict reply worded as something else: %q", verdict.Text)
+	}
+
+	// A verdict's reason sits in the report's nested results or findings: each
+	// is said, with only what it carries (no mismatch clause when none is set).
+	gateReport := store.GateCheckReport{Verdict: "unevaluated", Unevaluated: 2, Results: []store.GateCheckResult{
+		{GateID: "gate-a", Verdict: "unevaluated", Code: "U_GATE_PROOF_STALE", Mismatch: []string{"subject", "env"}},
+		{GateID: "gate-b", Verdict: "unevaluated", Code: "U_GATE_RUN_MISSING"},
+	}}
+	stale := classifyPaletteDispatch(paletteDispatchAttempt{Response: core.Response{OK: true, Code: "UNEVALUATED", Data: gateReport}})
+	for _, want := range []string{"• gate-a: unevaluated U_GATE_PROOF_STALE (does not match: subject, env)", "• gate-b: unevaluated U_GATE_RUN_MISSING\n"} {
+		if !strings.Contains(stale.Text+"\n", want) {
+			t.Fatalf("gate report text lacks %q:\n%s", want, stale.Text)
+		}
+	}
+	// Bounded: the verdict's reason comes before passes, at most five lines,
+	// then a count of the rest.
+	many := store.GateCheckReport{Verdict: "unevaluated", Unevaluated: 1, Passed: 6}
+	for index := range 6 {
+		many.Results = append(many.Results, store.GateCheckResult{GateID: "ok-" + strconv.Itoa(index), Verdict: "pass"})
+	}
+	many.Results = append(many.Results, store.GateCheckResult{GateID: "gate-z", Verdict: "unevaluated", Code: "U_GATE_PROOF_STALE", Mismatch: []string{"subject"}})
+	bounded := classifyPaletteDispatch(paletteDispatchAttempt{Response: core.Response{OK: true, Code: "UNEVALUATED", Data: many}})
+	if lines := strings.Split(bounded.Text, "\n"); !strings.HasPrefix(bounded.Text, "VERDICT UNEVALUATED") || len(lines) != 7 ||
+		lines[1] != "• gate-z: unevaluated U_GATE_PROOF_STALE (does not match: subject)" || lines[6] != "• … and 2 more (d shows them)" {
+		t.Fatalf("a long gate report is not the reason first, five lines, then the count:\n%s", bounded.Text)
+	}
+	check := store.CheckReport{Verdict: "fail", Findings: []store.CheckFinding{{Code: "E_RELATION_CYCLE", Subject: "AIRA-1", Message: "cycle through AIRA-2", Kind: "error"}},
+		Warnings: []store.CheckFinding{{Code: "E_COMPUTE_CONSERVATION", Subject: "AIRA-3", Kind: "warning"}}}
+	failed := classifyPaletteDispatch(paletteDispatchAttempt{Response: core.Response{OK: true, Code: "FAIL", Data: check}})
+	if !strings.Contains(failed.Text, "• AIRA-1: E_RELATION_CYCLE cycle through AIRA-2\n• warning: AIRA-3: E_COMPUTE_CONSERVATION") {
+		t.Fatalf("check report text lacks its finding, or does not label its warning:\n%s", failed.Text)
 	}
 
 	partial := classifyPaletteDispatch(paletteDispatchAttempt{Response: core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{"new_reserve_bytes":2147483648}`)}})

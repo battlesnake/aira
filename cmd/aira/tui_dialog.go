@@ -15,6 +15,7 @@ const (
 	dialogHintButtons = "Tab/←→ move · Enter presses ▶ · Esc cancels"
 	dialogHintResult  = "Esc closes"
 	dialogHintDetails = " · d details"
+	dialogHintScroll  = " · PgUp/PgDn scroll"
 	// dialogMaxWidth is the widest a dialog grows; dialogMinWidth the narrowest
 	// it shrinks to while the terminal has room, so a field and two buttons fit.
 	dialogMaxWidth = 80
@@ -75,7 +76,10 @@ type dialog struct {
 }
 
 // newDialog builds a dialog. form may be nil (a result); details, when not
-// empty, is shown under the body only after `d`.
+// empty, is shown under the body only after `d`. Only a result (no form) is
+// given details: its body has the focus, so its arrows and PgUp/PgDn scroll
+// what `d` revealed. With a form, the form keeps the focus and PgUp/PgDn are
+// passed to the body, so a body taller than the screen can still be read.
 func newDialog(title, body string, form *tview.Form, details string) *dialog {
 	d := &dialog{form: form, bodyText: body, details: details}
 	d.body = tview.NewTextView().SetWrap(true).SetWordWrap(true).SetScrollable(true).SetText(body)
@@ -99,7 +103,11 @@ func newDialog(title, body string, form *tview.Form, details string) *dialog {
 	d.column.AddItem(d.hint, 1, 0, false)
 	d.column.SetBorder(true).SetTitle(" "+strings.TrimSpace(title)+" ").SetBorderPadding(0, 0, 1, 1)
 	d.column.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyRune && event.Rune() == 'd' && d.details != "" && !d.fieldFocused() {
+		if d.form != nil && (event.Key() == tcell.KeyPgUp || event.Key() == tcell.KeyPgDn) {
+			d.body.InputHandler()(event, func(tview.Primitive) {})
+			return nil
+		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'd' && d.details != "" {
 			d.detailsOpen = !d.detailsOpen
 			text := d.bodyText
 			if d.detailsOpen {
@@ -113,16 +121,6 @@ func newDialog(title, body string, form *tview.Form, details string) *dialog {
 	return d
 }
 
-// fieldFocused reports whether a text field (not a button) has the focus, where
-// `d` is a letter being typed.
-func (d *dialog) fieldFocused() bool {
-	if d.form == nil {
-		return false
-	}
-	item, _ := d.form.GetFocusedItemIndex()
-	return item >= 0
-}
-
 // setNotice shows text (a refused value, why) on its own full-width line above
 // the form; empty hides it. Only a dialog with a form has the line.
 func (d *dialog) setNotice(text string) { d.notice.SetText(text) }
@@ -130,9 +128,11 @@ func (d *dialog) setNotice(text string) { d.notice.SetText(text) }
 // page is the dialog centred on the terminal, sized to its content.
 func (d *dialog) page() tview.Primitive { return newDialogFrame(d.column, d.size) }
 
-// size fits the dialog in maxWidth x maxHeight. The form, the notice and the
-// hint keep their rows; the body shrinks (and scrolls) first, so the buttons
-// and a refusal stay on screen.
+// size fits the dialog in maxWidth x maxHeight. The form and the hint keep
+// their rows; the notice gets what is left after them (its head, the code,
+// first); the body shrinks first, so the buttons and a refusal stay on screen
+// and nothing is drawn outside the box. When a form's body does not fit, the
+// hint says PgUp/PgDn scroll it.
 func (d *dialog) size(maxWidth, maxHeight int) (int, int) {
 	width := max(textWidth(d.body.GetText(false)), textWidth(d.hintText)) + 4
 	if d.form != nil {
@@ -140,19 +140,29 @@ func (d *dialog) size(maxWidth, maxHeight int) (int, int) {
 	}
 	width = min(width, dialogMaxWidth, maxWidth)
 	inner := max(width-4, 1)
+	rows := 2 // the border
+	bodyRows := wrappedRows(d.body.GetText(false), inner)
+	noticeRows := wrappedRows(d.notice.GetText(false), inner)
 	formRows := 0
 	if d.form != nil {
-		formRows = 1 // the button row
-		d.column.ResizeItem(d.notice, wrappedRows(d.notice.GetText(false), inner), 0)
-		for index := 0; index < d.form.GetFormItemCount(); index++ {
-			formRows += 2 // the field and the blank row under it
-		}
+		formRows = 1 + 2*d.form.GetFormItemCount() // each field and the blank row under it, then the buttons
 		d.column.ResizeItem(d.form, formRows, 0)
-		formRows += 1 + wrappedRows(d.notice.GetText(false), inner) // the blank row and the notice
+		rows += 1 + formRows // the blank row and the form
 	}
-	hintRows := wrappedRows(d.hintText, inner)
+	hint := d.hintText
+	if d.form != nil && rows+wrappedRows(hint, inner)+noticeRows+bodyRows > maxHeight {
+		hint += dialogHintScroll
+	}
+	d.hint.SetText(hint)
+	hintRows := wrappedRows(hint, inner)
 	d.column.ResizeItem(d.hint, hintRows, 0)
-	return width, 2 + wrappedRows(d.body.GetText(false), inner) + formRows + hintRows
+	rows += hintRows
+	if d.form != nil {
+		noticeRows = min(noticeRows, max(maxHeight-rows, 0))
+		d.column.ResizeItem(d.notice, noticeRows, 0)
+		rows += noticeRows
+	}
+	return width, rows + bodyRows
 }
 
 // wrappedRows is how many rows text takes word-wrapped at width.

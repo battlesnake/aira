@@ -1127,8 +1127,7 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	}
 	cancel := r.paletteCancelAction
 	form.SetCancelFunc(cancel)
-	body, args := paletteConfirmationText(confirm)
-	dialog := newDialog(title, body, form, args)
+	dialog := newDialog(title, paletteConfirmationText(confirm), form, "")
 	previous := form.GetInputCapture()
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyRune && event.Rune() == 'n' {
@@ -1151,35 +1150,44 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	r.app.SetFocus(form.GetButton(1))
 }
 
-// paletteConfirmationText is what a confirmation says, and the request's exact
-// arguments. A confirmation with a Summary (an `aira top` row action) already
-// says in words what its arguments carry, so they go behind `d` (AIRA-342);
-// without one they are the body.
-func paletteConfirmationText(confirm *paletteConfirm) (string, string) {
+// paletteConfirmationText is what a confirmation says: the Summary when there
+// is one (an `aira top` row action), then the request's exact arguments on one
+// `Sends:` line, each value at most confirmArgLimit runes. One line keeps the
+// arguments on an 80x24 screen where one line each did not fit; a longer body
+// scrolls with PgUp/PgDn (the form keeps the focus; AIRA-342).
+func paletteConfirmationText(confirm *paletteConfirm) string {
 	if confirm == nil {
-		return "", ""
+		return ""
 	}
-	var out, args strings.Builder
+	var out strings.Builder
 	fmt.Fprintf(&out, "Safety: %s\nAction: %s\n", confirm.Safety, confirm.Verb)
+	if confirm.Summary != "" {
+		fmt.Fprintf(&out, "\n%s\n", confirm.Summary)
+	}
 	names := make([]string, 0, len(confirm.Request.Args))
 	for name := range confirm.Request.Args {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		fmt.Fprintf(&args, "%s → %v\n", name, confirm.Request.Args[name])
-	}
-	if confirm.Summary != "" {
-		fmt.Fprintf(&out, "\n%s\n", confirm.Summary)
-	} else {
-		out.WriteString(args.String())
-		args.Reset()
+	if len(names) > 0 {
+		out.WriteString("\nSends:")
+		for _, name := range names {
+			value := []rune(fmt.Sprint(confirm.Request.Args[name]))
+			if len(value) > confirmArgLimit {
+				value = append(value[:confirmArgLimit], '…')
+			}
+			fmt.Fprintf(&out, " %s=%s", name, string(value))
+		}
+		out.WriteString("\n")
 	}
 	if confirm.ConfirmBlockedReason != "" {
 		fmt.Fprintf(&out, "\n⚠ cannot confirm: %s\n", confirm.ConfirmBlockedReason)
 	}
-	return strings.TrimRight(out.String(), "\n"), strings.TrimRight(args.String(), "\n")
+	return strings.TrimRight(out.String(), "\n")
 }
+
+// confirmArgLimit bounds each argument value a confirmation shows.
+const confirmArgLimit = 80
 
 // showPaletteResult shows what a palette or row action did; details (the raw
 // reply) only behind `d`.

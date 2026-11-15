@@ -59,18 +59,35 @@ behaviour. Client-only change.
   `REJECTED: the daemon refused the request.` plus the message exactly as the CLI
   prints it (`CODE: message`). Then one line per field the reply carries:
   `Name` (with owner), `Id`, `Status`, `Code`, `Message`, `Reason`, `Error`,
-  `Hint`, `Reserve: <old> → <new>` only when both byte counts are present, and the
-  reply's warnings. Details (`d`) is the reply envelope as indented JSON, closed by
-  default, shown in the same scrollable body. Outcome-unknown and not-sent results
+  `Hint`, `Reserve: <old> → <new>` only when both byte counts are present, then
+  one `• <gate or subject>: <verdict> <code> <message> (does not match: …)` line
+  per entry of the reply's `results` / `findings` / `unevaluated_findings` /
+  `warnings` lists (a verdict's reason lives there: a gate check's
+  `U_GATE_PROOF_STALE` with its `Mismatch`), each part only when the entry
+  carries it (a `warnings` entry is labelled `warning:`), those that are not a
+  pass first, at most five, then `• … and N
+  more (d shows them)`; then the reply's warnings. Details (`d`) is the reply
+  envelope as indented JSON, closed by default, shown in the same scrollable body. Outcome-unknown and not-sent results
   keep their existing wording; the classifier now accepts a verdict code in place
   of OK (the old `Code != "OK"` check made every verdict "malformed").
 - The `e` form says the job, its owner, current reserve and live use (as of the
   keypress) and the size syntax; a refused value (bad size, required field
   missing) is said above the form, which stays open with the field focused, and
-  editing the field clears it. Enter in the field moves to Continue; Enter there
-  submits. The confirmation puts the request's exact arguments behind `d` when it
-  has a Summary (the `aira top` row actions), and in the body otherwise (the
-  palette).
+  editing the field clears it; the refusal echoes the value at most 24
+  characters long, and the notice gets only the rows the form and the hint leave
+  (its head, the code, first), so a pasted run never draws outside the box.
+  Enter in the field moves to Continue; Enter there submits. Every
+  confirmation (row action or palette) says its Summary when it has one, then
+  the request's exact arguments on one `Sends: name=value …` line in the
+  always-visible body. Only a result takes `d` details: a confirmation's argument
+  list behind `d` (one per line) overflowed at 80x24 (round-4 review). A
+  confirmation's form keeps the focus, so the dialog passes PgUp/PgDn to the
+  body, and when the body does not fit (the longest job name, 100, and owner,
+  64, at 80x24) the hint adds `· PgUp/PgDn scroll` (round-5 review).
+- Accepted limits: a confirmation shows each argument value at most 80
+  characters long (then `…`); a reply shows at most five result/finding lines
+  (Details has the rest); a refusal echoes at most 24 characters of the refused
+  value, and on a very short screen the notice keeps only its first rows.
 - Accepted limit: below about 60 columns a dialog is clipped on the right (the
   button row) and its body may be cut short; at 80x24 the focused button, the
   notice and the hint are all on screen, and the notice stays whole down to 28
@@ -82,7 +99,16 @@ behaviour. Client-only change.
   and above the field at 80 and 28 columns, cleared by an edit; the verdict reply
   keeps `UNEVALUATED` and `U_GATE_SET_EMPTY`; a reply with only the new size
   claims no change. Each was mutation-checked: the implementation was broken and
-  the test went red.
+  the test went red. Round 4 added: a populated gate report (`U_GATE_PROOF_STALE`
+  with `Mismatch`) and a check finding are said; an entry without a mismatch gets
+  no mismatch clause; a long gate report shows its stale result first, five
+  lines, then the count of the rest; the whole confirmation body, its `Sends:`
+  line through `steal=false`, is inside the dialog at 80x24 even after `d`, with
+  no scroll hint; with a 100-character name and a 64-character owner the hint
+  offers PgUp/PgDn, PgDn reaches `steal=false`, Cancel keeps the focus and
+  nothing is sent; a check report's warning is labelled; a 600-character refused value keeps the code above the field,
+  the buttons and the hint inside, and nothing above the top border at 80x24,
+  28x24 and 28x14.
 
 ## Why collapsed
 

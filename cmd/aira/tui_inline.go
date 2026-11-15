@@ -203,7 +203,14 @@ func topResizeConfirm(state tuiState, raw string) (tuiState, []tuiCmd) {
 	}
 	size, err := runner.ParseConfineResizeReserve(raw)
 	if err != nil {
-		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: new reserve " + strconv.Quote(raw) + ": " + err.Error()
+		// The refusal echoes the value at most 24 characters long (the parser's
+		// own message quotes it too), so a pasted run stays a short line.
+		shown := raw
+		if runes := []rune(raw); len(runes) > 24 {
+			shown = string(runes[:24]) + "…"
+		}
+		shown = strconv.Quote(shown)
+		state.InlineError = "E_CONFINE_ARGUMENT_INVALID: new reserve " + shown + ": " + strings.ReplaceAll(err.Error(), strconv.Quote(raw), shown)
 		return state, nil
 	}
 	caller := topConfineCaller(state)
