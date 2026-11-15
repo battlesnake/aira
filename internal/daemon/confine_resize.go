@@ -18,8 +18,9 @@ import (
 // an operator can hand back the unused part of a job that is clearly massively
 // over-reserved without killing it.
 //
-// The whole effect is one field on the granted waiter (reserve) and the ledger
-// re-derived from it. Ledger only, by design (spec decision): the job's
+// The whole effect is one field on the granted waiter (its booking, charge, read
+// through ledgerCharge; AIRA-324 split it from the granted reserve, which stays
+// the pin) and the ledger re-derived from it. Ledger only, by design (spec decision): the job's
 // memory.max is NOT touched, so after a resize the ledger can under-count what
 // the job may legally use by up to old-new; the slice MemoryMax and the memory
 // watchdog stay the backstops. The OOM-steering budget reads the same reserve
@@ -27,8 +28,10 @@ import (
 //
 // A reduction is dropped by ANY re-declare of the lease: the client's lease
 // keeper re-declares the reserve it was GRANTED, and the re-anchoring SET in
-// enqueueAdmitInternal overwrites reserve with it (a reconnect without a daemon
-// restart), and a restarted daemon has no memory of the resize at all. That is
+// enqueueAdmitInternal re-derives the booking from it (a reconnect without a
+// daemon restart: back to the grant-time booking, the discounted charge for a
+// discounted lease), and a restarted daemon has no memory of the resize at all
+// (the full pin). That is
 // the fail-safe direction (back to larger), and no persistence machinery exists.
 //
 // Resolution runs against the daemon's own GRANTED waiters, under queue.mu, with
@@ -118,7 +121,11 @@ func resizeRunningConfineLocked(queue *sliceQueue, selector string, newReserve i
 	if err := runner.CheckConfineOwner(target.scopeID, owner, callerOwner, steal); err != nil {
 		return runner.ConfineResizeResult{}, 0, err
 	}
-	old := target.reserve
+	// AIRA-324. Judged against, and written to, the BOOKING (ledgerCharge), not
+	// the granted reserve: a discounted lease's booking is already below its pin,
+	// and "a smaller reserve" means smaller than what the ledger holds. The
+	// granted reserve (the pin, the cap) is left alone, as the cap always was.
+	old := target.ledgerCharge()
 	if newReserve >= old {
 		return runner.ConfineResizeResult{}, 0, fmt.Errorf("%s: %s reserves %d bytes; a resize must name a smaller reserve (asked for %d)", runner.CodeConfineResizeNotReduction, target.scopeID, old, newReserve)
 	}
@@ -129,7 +136,7 @@ func resizeRunningConfineLocked(queue *sliceQueue, selector string, newReserve i
 	if newReserve < usage {
 		return runner.ConfineResizeResult{}, 0, fmt.Errorf("%s: %s is using %d bytes right now; the new reserve (%d) may not be below it", runner.CodeConfineResizeBelowUsage, target.scopeID, usage, newReserve)
 	}
-	target.reserve = newReserve
+	target.charge = bookingField(newReserve, target.reserve)
 	// The one ledger writer, all four derived totals together. CPU and VRAM are
 	// unchanged by a resize, but they are re-derived beside RAM so the cache can
 	// never be left half-refreshed.

@@ -227,3 +227,32 @@ func TestTopBarDrawsAPendingAdmissionFromItsReserve(t *testing.T) {
 		t.Fatalf("claimed=%d, want %d", model.Bar.Claimed, int64(reserve))
 	}
 }
+
+// verifies: AIRA-324 section 5.4 — a discounted lease draws its BOOKING on the
+// bar (the ledger's number) and its RESERVATION cell shows the booking with the
+// pin beside it, labelled; a lease with no pin published shows the booking
+// alone. Mutations: rendering the pin as the cell's number, or dropping the
+// "(pin ...)" suffix, are red.
+func TestTopShowsTheBookingAndThePinOfADiscountedLease(t *testing.T) {
+	const (
+		pin     = 10 * gib
+		booking = 8 * gib
+	)
+	discounted := topDelegateRecord("CONFINE-pinned-101-aa", "pinned", pin, booking, gib)
+	pinned := int64(pin)
+	discounted.PinBytes = &pinned
+	plain := topDelegateRecord("CONFINE-plain-102-bb", "plain", 3*gib, 3*gib, gib)
+	model, _ := topViewModel(topTick{}, topTestListing(topTestFrame(), discounted, plain))
+
+	if got := topRegionsByLabel(model)["pinned"]; got.Size != booking {
+		t.Fatalf("pinned region=%+v, want the %d-byte booking", got, int64(booking))
+	}
+	cells := topReservationCells(model)
+	want := runner.FormatConfineMegabytes(booking) + " (pin " + runner.FormatConfineMegabytes(pin) + ")"
+	if got := cells["CONFINE-pinned-101-aa"]; got != want {
+		t.Fatalf("discounted RESERVATION cell=%q, want %q", got, want)
+	}
+	if got, want := cells["CONFINE-plain-102-bb"], runner.FormatConfineMegabytes(3*gib); got != want {
+		t.Fatalf("plain RESERVATION cell=%q, want %q", got, want)
+	}
+}

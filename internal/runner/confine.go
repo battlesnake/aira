@@ -263,19 +263,25 @@ type ConfineStatus struct {
 	// Containment is AIRA-121's kind-of-containment facet. Always rendered on
 	// the trailer (see FormatConfineStatus); empty reads as unevaluated, never
 	// as enforced.
-	Containment       ConfineContainment        `json:"containment,omitempty"`
-	Cap               ConfineCap                `json:"cap,omitempty"`
-	Admission         ConfineAdmission          `json:"admission,omitempty"`
-	AdmissionState    string                    `json:"admission_state,omitempty"`
-	AdmissionWaitedMS int64                     `json:"admission_waited_ms,omitempty"`
-	CapBytes          int64                     `json:"cap_bytes,omitempty"`
-	ReserveBytes      int64                     `json:"reserve_bytes,omitempty"`
-	Scope             ConfineScope              `json:"scope,omitempty"`
-	ScopeIntegrity    ScopeIntegrity            `json:"scope_integrity,omitempty"`
-	DescendantEscape  *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
-	OOMGroup          ConfineOOMGroup           `json:"oom_group,omitempty"`
-	Priorities        ConfinePriorities         `json:"priorities,omitempty"`
-	CPUWeight         ConfineCPUWeight          `json:"cpu_weight,omitempty"`
+	Containment       ConfineContainment `json:"containment,omitempty"`
+	Cap               ConfineCap         `json:"cap,omitempty"`
+	Admission         ConfineAdmission   `json:"admission,omitempty"`
+	AdmissionState    string             `json:"admission_state,omitempty"`
+	AdmissionWaitedMS int64              `json:"admission_waited_ms,omitempty"`
+	CapBytes          int64              `json:"cap_bytes,omitempty"`
+	ReserveBytes      int64              `json:"reserve_bytes,omitempty"`
+	// BookedBytes (AIRA-324) is the daemon's ledger booking for a DISCOUNTED
+	// grant: the operator's --memory-reserve pin (ReserveBytes, which is also the
+	// scope memory.max) booked at a fraction of itself. Zero (absent) for every
+	// other job, whose booking is ReserveBytes. Rendered as `booked=` on the
+	// trailer and `booked_bytes` in the summary, never folded into reserve=.
+	BookedBytes      int64                     `json:"booked_bytes,omitempty"`
+	Scope            ConfineScope              `json:"scope,omitempty"`
+	ScopeIntegrity   ScopeIntegrity            `json:"scope_integrity,omitempty"`
+	DescendantEscape *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
+	OOMGroup         ConfineOOMGroup           `json:"oom_group,omitempty"`
+	Priorities       ConfinePriorities         `json:"priorities,omitempty"`
+	CPUWeight        ConfineCPUWeight          `json:"cpu_weight,omitempty"`
 	// CPUWeightCurve is AIRA-208's record of the schedule that was ARMED (start
 	// weight written, decay goroutine started): "START->FLOOR@WHEN" with a
 	// ",schedule-rejected" suffix when AIRA_CONFINE_CPUWEIGHT_SCHEDULE did not
@@ -713,6 +719,12 @@ type ConfineRequest struct {
 	// bindConfineScopeID, because the scope-id grammar alone happily accepts an
 	// id naming a foreign pid, owner, or delegate class.
 	presetScopeID string
+
+	// discountable (AIRA-324) is decided by the real-cgroup launch path only
+	// (confineReserveDiscountable) and transcribed by admitConfine onto the admit
+	// request. UNEXPORTED so no face can set it: a caller-chosen flag would let
+	// any launch claim the discount. The ci-shim path never sets it.
+	discountable bool
 
 	// BeforeAdmit is invoked exactly once, immediately before admission, i.e.
 	// after every precondition confine checks synchronously (argv, reserve,
@@ -1273,6 +1285,11 @@ func FormatConfineStatus(status ConfineStatus) string {
 		line += " reserve=" + FormatConfineBytes(status.ReserveBytes)
 		if status.ReserveBasis != "" {
 			line += " reserve-basis=" + status.ReserveBasis
+		}
+		// AIRA-324. The booking of a discounted pin, beside the pin (reserve=)
+		// and the cap (scope-memory.max= below). Absent for every other job.
+		if status.BookedBytes > 0 && status.BookedBytes < status.ReserveBytes {
+			line += " booked=" + FormatConfineBytes(status.BookedBytes)
 		}
 	}
 	admissionFacet := confineAdmissionFacet(status)

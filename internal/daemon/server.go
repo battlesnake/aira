@@ -115,6 +115,12 @@ type Server struct {
 	admitSlots         chan struct{}
 	admitPollInterval  time.Duration
 	admitFreezeMaxHold time.Duration
+	// AIRA-324. The pinned-job charge discount's mode and factor (a whole
+	// percentage), read once in Serve and fixed for the daemon's lifetime. The zero
+	// value ("", 0) is off: a Server built without Serve (every unit test) books
+	// every waiter at its reserve.
+	pinChargeMode    pinChargeMode
+	pinChargePercent int64
 	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
 	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
 	// space by a new admission); injectable (default 2s) so tests drive timing via the
@@ -407,6 +413,20 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.admitFreezeMaxHold = admitFreezeMaxHold
+	pinMode, pinPercent, err := pinChargeConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	if s.shimMode() && pinMode != pinChargeOff {
+		// ci-shim has no physical reading, so it could never apply the physical-fit
+		// rule; pinChargeFor refuses to discount there anyway, and this keeps the
+		// startup line honest about it.
+		pinMode = pinChargeOff
+	}
+	s.pinChargeMode, s.pinChargePercent = pinMode, pinPercent
+	if pinMode != pinChargeOff {
+		log.Printf("aira daemon: pinned-job charge discount %s (factor %s)", pinMode, formatPinChargeFactor(pinPercent))
+	}
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one

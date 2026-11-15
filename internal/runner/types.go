@@ -265,6 +265,13 @@ type Request struct {
 	// after a daemon restart re-enqueues the job still high.
 	HighPriority  bool   `json:"high_priority,omitempty"`
 	ParentScopeID string `json:"parent_scope_id,omitempty"`
+	// AIRA-324. Discountable puts `discountable: true` on the admit request: this
+	// is a scope-backed confine job whose scope memory.max is the operator's own
+	// --memory-reserve (cap-source operator:--memory-reserve), so the daemon may
+	// BOOK it below that pin while the cap stays the pin. Set only by the confine
+	// launch path (confineReserveDiscountable); never for `aira run`,
+	// confine-reserve, --memory-max, --delegate-ram, --exclusive or ci-shim.
+	Discountable bool `json:"discountable,omitempty"`
 	// AIRA-185. ExclusiveReason is the holder's free-text label for WHY the slice
 	// is being held ("deploy: slice-ceiling flip"), which ConfineName cannot carry
 	// (it must be a valid confine identity and must match the scope id). It is

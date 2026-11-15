@@ -190,6 +190,20 @@ import (
 // order is never a safety property; contrast `exclusive`, which refuses). An old
 // client never sends the field, and absent means normal.
 //
+// AIRA-324 added the optional `discountable` field to the confine-admit REQUEST and
+// the optional `charge` field to its grant, WITHOUT a bump, on AIRA-340's pattern.
+// The client sends `discountable` only when true (a scope-backed job capped at the
+// operator's own --memory-reserve); a daemon that predates it refuses the frame in
+// validateAdmitArgs' allowlist, before any enqueue, with `E_DAEMON_PROTOCOL:
+// unexpected admit field "discountable"` (a discountable request carries at most
+// 12 fields, under the old 15-field count guard, so the allowlist is the only
+// path; measured against the live pre-324 daemon with
+// docs/dev/aira-324-old-daemon-probe.py). The client re-asks once without the
+// field, so the job is booked at its full pin, which is what that daemon books
+// every job at. The grant's `charge` is sent only for a discounted grant, which
+// only a request carrying `discountable` can get, so an old client (which never
+// sends it) never receives one. Neither side needs the other installed first.
+//
 // AIRA-323 added four optional fields to the confine-report REQUEST (`wall_ms`,
 // `wait_ms`, `started_at_ms`, `repo`: a finished job's run time, admission wait,
 // start time and repository identity) WITHOUT a bump, following AIRA-340. A daemon

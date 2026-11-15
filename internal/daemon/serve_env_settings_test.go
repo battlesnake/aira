@@ -70,6 +70,23 @@ func serveEnvSettingRows() []serveEnvSetting {
 			want:  91 * time.Second,
 			get:   func(s *Server) any { return s.admitFreezeMaxHold },
 		},
+		{
+			// AIRA-324: the raw default is off, so enforce is distinctive.
+			field: "pinChargeMode",
+			env:   "AIRA_DAEMON_PIN_CHARGE_MODE",
+			value: "enforce",
+			want:  pinChargeEnforce,
+			get:   func(s *Server) any { return s.pinChargeMode },
+		},
+		{
+			// AIRA-324: read only when the mode is not off (the row above sets
+			// enforce); 0.67 is neither the default 0.8 nor a bound.
+			field: "pinChargePercent",
+			env:   "AIRA_DAEMON_PIN_CHARGE_FACTOR",
+			value: "0.67",
+			want:  int64(67),
+			get:   func(s *Server) any { return s.pinChargePercent },
+		},
 	}
 }
 

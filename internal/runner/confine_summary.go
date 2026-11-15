@@ -73,16 +73,22 @@ type confineSummaryRecord struct {
 	Containment  string `json:"containment"`
 	Admission    string `json:"admission"`
 	ReserveBytes any    `json:"reserve_bytes"`
-	Code         any    `json:"code,omitempty"`
-	Exit         any    `json:"exit,omitempty"`
-	TerminatedBy any    `json:"terminated_by,omitempty"`
-	WallUS       any    `json:"wall_us,omitempty"`
-	PeakRSSBytes any    `json:"peak_rss_bytes,omitempty"`
-	CPUUserUS    any    `json:"cpu_user_us,omitempty"`
-	CPUSysUS     any    `json:"cpu_sys_us,omitempty"`
-	RusageUserUS any    `json:"rusage_user_us,omitempty"`
-	RusageSysUS  any    `json:"rusage_sys_us,omitempty"`
-	RusageMaxRSS any    `json:"rusage_maxrss_largest_process_bytes,omitempty"`
+	// AIRA-324. Present ONLY for a discounted job: booked_bytes is the daemon's
+	// ledger booking, below reserve_bytes (the operator's pin), and cap_bytes is
+	// the scope memory.max written for the job (the pin). Every other job's
+	// booking is reserve_bytes, and its line is unchanged.
+	BookedBytes  any `json:"booked_bytes,omitempty"`
+	CapBytes     any `json:"cap_bytes,omitempty"`
+	Code         any `json:"code,omitempty"`
+	Exit         any `json:"exit,omitempty"`
+	TerminatedBy any `json:"terminated_by,omitempty"`
+	WallUS       any `json:"wall_us,omitempty"`
+	PeakRSSBytes any `json:"peak_rss_bytes,omitempty"`
+	CPUUserUS    any `json:"cpu_user_us,omitempty"`
+	CPUSysUS     any `json:"cpu_sys_us,omitempty"`
+	RusageUserUS any `json:"rusage_user_us,omitempty"`
+	RusageSysUS  any `json:"rusage_sys_us,omitempty"`
+	RusageMaxRSS any `json:"rusage_maxrss_largest_process_bytes,omitempty"`
 }
 
 // summaryString spells an empty string as "unevaluated".
@@ -144,6 +150,15 @@ func FormatConfineSummary(request ConfineRequest, result ConfineResult, err erro
 	}
 	if status.ReserveBytes > 0 {
 		record.ReserveBytes = status.ReserveBytes
+	}
+	if status.BookedBytes > 0 && status.BookedBytes < status.ReserveBytes {
+		record.BookedBytes = status.BookedBytes
+		// The cap is what was WRITTEN, or unevaluated if nothing was (a discounted
+		// grant whose launch failed before the cap write): never the pin assumed.
+		record.CapBytes = confineSummaryUnevaluated
+		if status.ScopeMemoryMax > 0 {
+			record.CapBytes = status.ScopeMemoryMax
+		}
 	}
 	if err != nil {
 		record.Code = summaryString(confineErrorCode(err))

@@ -149,8 +149,27 @@ const admitOutcomeFailfast = "failfast"
 const admitOutcomeCancelled = "cancelled"
 
 type admitWaiter struct {
-	seq     int64
+	seq int64
+	// reserve is the lease's GRANTED reserve: the figure the grant echoes, the
+	// scope memory.max a confine client writes from it, the E_ADMIT_TOO_LARGE
+	// subject and the head-feasibility subject. It is NOT the ledger booking
+	// when charge says otherwise: every admission-arithmetic read of the booking
+	// goes through ledgerCharge() (AIRA-324; the allow-list guard in
+	// admit_pin_charge_guard_test.go fails on a new direct read).
 	reserve int64
+	// AIRA-324. charge is the ledger booking when it is BELOW reserve, and zero
+	// when the booking is reserve itself (every waiter that is neither discounted
+	// nor resized, and every hand-built test waiter). Two writers: the enqueue and
+	// the re-anchoring SET (pinChargeFor, the discount), and `confine --resize`
+	// (AIRA-312, a lowered booking). Read ONLY through ledgerCharge().
+	charge int64
+	// AIRA-324. discountable is the client's `discountable` admit field, frozen at
+	// enqueue: a scope-backed job whose cap is the operator's own --memory-reserve.
+	// It is eligibility only; whether the booking is discounted is decided by
+	// pinChargeFor (the mode). An ARDR re-declare cannot carry it (the frozen
+	// record has no such field), so a lease re-established after a daemon restart
+	// is never discountable and books its full pin (fail-safe).
+	discountable bool
 	// S5. cpu is this lease's declared CPU-core reservation, the second ledger
 	// resource beside reserve (RAM). {reserve, cpu} is the resource vector admission
 	// gates conjunctively (design §7). CPU is accounting-only: it charges the
@@ -331,11 +350,25 @@ type admitWaiter struct {
 // "outstanding == sum of ledgerCharge over granted && accounted waiters" is one
 // statement about one function, not an agreement between call sites that must
 // be maintained by hand.
+//
+// AIRA-324. The booking is charge when charge is set and below reserve (a
+// discounted operator pin, or a --resize), else reserve. It can never exceed
+// reserve, so a malformed charge can only fall back to today's booking.
 func (w *admitWaiter) ledgerCharge() int64 {
 	if w == nil {
 		return 0
 	}
+	if w.charge > 0 && w.charge < w.reserve {
+		return w.charge
+	}
 	return w.reserve
+}
+
+// discounted reports whether this waiter is booked below its reserve. For a
+// QUEUED waiter that can only be the AIRA-324 discount (a resize needs a granted
+// lease), which is what the physical-fit rule keys on. queue.mu must be held.
+func (w *admitWaiter) discounted() bool {
+	return w != nil && w.ledgerCharge() < w.reserve
 }
 
 // rederiveLedgerLocked recomputes the queue's ledger from its waiters: the sum
@@ -446,11 +479,14 @@ func admitOrderLocked(queue *sliceQueue) []*admitWaiter {
 // reserve, the owner's decision of 2026-10-13. Counted in RAM bytes for every
 // head, including one refused on CPU or VRAM — a documented proxy, the same
 // RAM-only simplification lastGrantable already makes.
+//
+// AIRA-324: in LEDGER (charge) bytes, as head.bypassed is accumulated, so a
+// discounted head's budget is half its booking, not half its pin.
 func admitBypassBudget(head *admitWaiter) int64 {
-	if head == nil || head.reserve <= 0 {
+	if head == nil || head.ledgerCharge() <= 0 {
 		return 0
 	}
-	return head.reserve / 2
+	return head.ledgerCharge() / 2
 }
 
 // exclusiveGate is the derived drain/hold state of one queue, recomputed under
@@ -847,6 +883,12 @@ type AdmitResponse struct {
 	// carries no field and older readers are unaffected.
 	Cpu   int64  `json:"cpu,omitempty"`
 	Basis string `json:"basis"`
+	// AIRA-324. Charge is the ledger booking when it is below Reserve (a
+	// discounted operator pin in enforce mode), and ABSENT otherwise, so every
+	// grant that is not discounted is byte-identical to before. Reserve stays the
+	// pin, which the client writes as the scope memory.max: the cap is unchanged.
+	// An older client ignores the field (json.Unmarshal drops unknown keys).
+	Charge int64 `json:"charge,omitempty"`
 }
 
 type admitRequest struct {
@@ -887,6 +929,10 @@ type admitRequest struct {
 	// AIRA-340. high is the optional `priority` admit field: "high" sets it,
 	// "normal" or absence leaves it false. Queue order only (see admitWaiter.high).
 	high bool
+	// AIRA-324. discountable is the optional `discountable` admit field (see
+	// admitWaiter.discountable). The daemon never infers it from `pinned`, which
+	// is also true for `aira run`, confine-reserve and container-raised reserves.
+	discountable bool
 
 	// S8 (anchor). conn / clientPID / processStartTick / peerSameUID are resolved by
 	// admitConnection from the connection BEFORE the enqueue lock and carried here so
@@ -1041,7 +1087,8 @@ type admitSnapshot struct {
 	// caller named its own scope id. queuePosition is 1-based and counts ONLY
 	// queued waiters, in evaluation order (admitOrderLocked: pushed jobs first,
 	// then enqueue order — AIRA-309); queuedAheadBytes
-	// is the sum of the reserves of the queued waiters ahead of it. Zero is
+	// is the sum of the ledger BOOKINGS (ledgerCharge; AIRA-324: below the pin for
+	// a discounted waiter) of the queued waiters ahead of it. Zero is
 	// "no position established" — the scope id is not a queued waiter here
 	// (granted, released, unknown, or never asked) — never "position zero".
 	//
@@ -1057,10 +1104,10 @@ type admitSnapshot struct {
 	// listed nowhere: len(queuedEntries) < queued is how a renderer sees that.
 	queuedEntries []runner.ConfineQueuedEntry
 	// AIRA-186. That same waiter's OWN resolved reserve — `waiter.reserve`, the
-	// figure admission is gating on, which is also the quantity queuedAheadBytes
-	// sums for the waiters in front. Taken at the SAME match, so "how much is
-	// ahead of me" and "how much am I asking for" cannot come from two different
-	// instants.
+	// figure its admission is gated on (AIRA-324: the PIN, which head feasibility
+	// and the physical-fit rule test, even where its booking is discounted). Taken
+	// at the SAME match, so "how much is ahead of me" and "how much am I asking
+	// for" cannot come from two different instants.
 	//
 	// Zero is "not established", on the same discipline as the position.
 	queuedReserveBytes int64
@@ -1151,6 +1198,10 @@ type admitSnapshot struct {
 	// Copied out as a fresh map, never a reference to queue state, for exactly the
 	// reason reservations above are copied by value.
 	scopeReserves map[string]int64
+	// AIRA-324. scope id -> the lease's granted reserve, only for a lease the
+	// ledger books BELOW it (see the snapshot walk). Same guard and same locked
+	// walk as scopeReserves.
+	scopePins map[string]int64
 }
 
 // boundedAdmitSignature bounds the DIAGNOSTIC copy of a client-supplied
@@ -1275,6 +1326,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
 		phase: phase, present: true,
 		scopeReserves:   make(map[string]int64, len(queue.waiters)),
+		scopePins:       map[string]int64{},
 		vramOutstanding: queue.vramOutstanding, // AIRA-269: the re-derived VRAM ledger total
 		scopeVRAM:       make(map[string]int64, len(queue.waiters)),
 	}
@@ -1303,9 +1355,16 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			// AIRA-186. Taken BEFORE queuedBytes absorbs this waiter's own
 			// reserve, from the matched waiter and not from the running sum:
 			// this is what THIS job is asking for, never what is ahead of it.
+			//
+			// AIRA-324: the RESERVE (the pin), not the booking. Its consumer
+			// compares it with the ceiling (can this job ever be granted?) and with
+			// the reserve the client sent (did the daemon resolve a different
+			// number?), and both questions are about the pin.
 			snapshot.queuedReserveBytes = waiter.reserve
 		}
-		queuedBytes = addClamp(queuedBytes, waiter.reserve)
+		// AIRA-324: what is AHEAD is counted in booking bytes, the quantity that
+		// will occupy the ledger when those waiters are granted.
+		queuedBytes = addClamp(queuedBytes, waiter.ledgerCharge())
 		if waiter.scopeID != "" && len(snapshot.queuedEntries) < runner.ConfineQueuedRowLimit {
 			// Values, never the waiter: the entry outlives queue.mu.
 			snapshot.queuedEntries = append(snapshot.queuedEntries, runner.ConfineQueuedEntry{
@@ -1350,7 +1409,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 				}
 			}
 			snapshot.reservations = append(snapshot.reservations, admitReservationRow{
-				signature: waiter.signature, reserve: waiter.reserve, heldMS: held,
+				signature: waiter.signature, reserve: waiter.ledgerCharge(), heldMS: held,
 			})
 			continue
 		}
@@ -1361,6 +1420,14 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// a waiter that contributes to scopeBytes contributes a row and one that
 		// does not contributes neither, and the two can never drift apart.
 		snapshot.scopeReserves[waiter.scopeID] = waiter.ledgerCharge()
+		// AIRA-324. The granted reserve (the pin, which a confine client writes as
+		// the scope memory.max) is published ONLY for a lease booked below it — a
+		// discounted pin, or a --resize — so a renderer can show the booking AND
+		// the pin without ever labelling one as the other. Absent means the
+		// booking is the granted reserve.
+		if waiter.discounted() {
+			snapshot.scopePins[waiter.scopeID] = waiter.reserve
+		}
 		// AIRA-269. The scope's declared --vram, INCLUDING 0 (= "declared no VRAM /
 		// not a GPU job"), so every scope row gets an established VRAMBytes rather
 		// than an unevaluated one. Same match, same guard as scopeReserves.
@@ -1965,6 +2032,11 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Cpu: waiter.cpu, Basis: waiter.basis}
+	// AIRA-324. The booking is echoed only when it is below the pin, so an
+	// undiscounted grant's frame is byte-identical to before.
+	if waiter.discounted() {
+		grant.Charge = waiter.ledgerCharge()
+	}
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -2246,6 +2318,14 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 				// anchorLeaseLocked overwrites the anchor atomically with this SET, which
 				// is what makes a concurrent stale old-connection EOF a no-op.
 				existing.reserve = reserve
+				// AIRA-324. The booking is re-derived from the lease's OWN eligibility
+				// (frozen at its enqueue; an ARDR frame carries none) and the
+				// re-declared reserve: a discounted lease keeps its discounted charge
+				// across a reconnect to this live daemon, and a --resize is dropped,
+				// back to that grant-time booking, exactly as it was before AIRA-324
+				// (the fail-safe direction confine_resize.go documents). In off and
+				// observe this is reserve itself, so the SET is today's SET.
+				existing.charge = bookingField(s.pinChargeFor(existing.discountable, reserve), reserve)
 				existing.cpu = request.cpu
 				existing.vram = request.vram // AIRA-268
 				anchorLeaseLocked(existing, request.conn, request.clientPID, request.processStartTick)
@@ -2333,7 +2413,11 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, cpu: request.cpu, vram: request.vram, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, high: request.high}
+	// AIRA-324. The booking is decided HERE, once, and frozen on the waiter: the
+	// mode and factor are fixed for the daemon's lifetime, so this is also the
+	// booking at grant. Off and observe give charge 0 (the booking is reserve).
+	charge := bookingField(s.pinChargeFor(request.discountable, reserve), reserve)
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, charge: charge, discountable: request.discountable, cpu: request.cpu, vram: request.vram, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, high: request.high}
 	// Anchor the fresh lease to its connection through the same helper a re-declare
 	// uses, so the anchor identity is set uniformly. The connection's EOF release
 	// compares its own conn against this anchor.
@@ -2564,7 +2648,24 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// sum across slices. grantedAt marks "the daemon just decided this job may
 		// proceed", deliberately separate from enqueued (a long queue wait is not launch
 		// abandonment — the AIRA-49 v3 defect); nothing but the grant below sets it.
-		ramFits := waiter.reserve <= available
+		// AIRA-324. The ledger is checked in BOOKING bytes (ledgerCharge: a
+		// discounted waiter's charge, else its reserve). A discounted waiter is
+		// also granted only if its FULL pin fits the slice's real free memory —
+		// ceiling − headroom − effectiveCurrent, the physical half of
+		// checkedAvailable with no ledger term — so as real use climbs a large
+		// pin stops being admitted before the discount can overcommit it. Never
+		// in ci-shim mode (no physical reading, and pinChargeFor never discounts
+		// there). For an undiscounted waiter the rule is implied by the ledger
+		// check above (available <= ceiling − effectiveCurrent), so it is not
+		// re-evaluated, and off/observe decide exactly as before.
+		physicalFree := int64(0)
+		if !s.shimMode() {
+			physicalFree = checkedAvailable(current, effectiveMaximum, reclaimable, 0, headroom)
+		}
+		ramFits := waiter.ledgerCharge() <= available
+		if waiter.discounted() && !s.shimMode() && waiter.reserve > physicalFree {
+			ramFits = false
+		}
 		cpuFits := waiter.cpu <= cpuAvailable(s.cpuCeiling(), queue.cpuOutstanding)
 		// AIRA-268. The third conjunctive resource. A vram==0 job fits vacuously
 		// (ungated). A vram>0 job fits only against a FRESH ceiling snapshot (read
@@ -2592,7 +2693,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			case head.pushSeq > 0:
 				fits = false
 			case phase == admitFreezeYield:
-			case addClamp(head.bypassed, waiter.reserve) > admitBypassBudget(head):
+			case addClamp(head.bypassed, waiter.ledgerCharge()) > admitBypassBudget(head):
 				fits = false
 				budgetWithheld = true
 			}
@@ -2612,8 +2713,10 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				// Every job-level grant past an unpushed head counts against its
 				// budget, the backstop pass's included (a pushed head grants nothing
 				// past itself, so it never reaches here).
-				head.bypassed = addClamp(head.bypassed, waiter.reserve)
+				head.bypassed = addClamp(head.bypassed, waiter.ledgerCharge())
 			}
+			// AIRA-324: the observe/enforce record of a discountable grant.
+			s.logPinChargeGrantLocked(waiter, physicalFree)
 			if waiter.waited {
 				waiter.outcome = "waited"
 				waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
@@ -2645,7 +2748,17 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		} else {
 			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 		}
-		waiter.noteGrantableLocked(available)
+		// AIRA-324. A discounted waiter's diagnosis is stated in PIN bytes, the
+		// unit the rejection's Required carries: the most it could be granted is
+		// the smaller of the ledger room plus its discount and the physical room.
+		grantable := available
+		if waiter.discounted() && !s.shimMode() {
+			grantable = available + (waiter.reserve - waiter.ledgerCharge())
+			if physicalFree < grantable {
+				grantable = physicalFree
+			}
+		}
+		waiter.noteGrantableLocked(grantable)
 		queuedAhead++
 		if budgetWithheld && maxHold > 0 && phase == admitFreezeIdle {
 			// The arm: one of the two anchor writes (see the struct). It fires only
@@ -2722,6 +2835,12 @@ func (s *Server) admitReportedPhaseLocked(queue *sliceQueue, now time.Time) stri
 //     reading means NOT a head — without this arm a pushed GPU job would freeze
 //     the whole machine for as long as nvidia-smi was failing, and a pushed head
 //     has no backstop.
+//
+// AIRA-324. RAM is judged on the PIN (reserve), never the booking: a discounted
+// waiter is head-eligible only if charge AND pin fit an empty slice, and since
+// charge <= pin the pin alone decides. A charge-only test would make a pin above
+// the throttled ceiling a head that the physical-fit rule can never grant, and
+// a pushed one would freeze the queue (TestPinChargeHeadEligibilityIsOnThePin).
 func (s *Server) admitCouldFitEmptyLocked(waiter *admitWaiter, effectiveMaximum int64) bool {
 	if waiter.reserve > subtractFloor(effectiveMaximum, s.admitSliceHeadroom(1)) {
 		return false
@@ -3241,11 +3360,15 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// AIRA-340 added the optional `priority` field (widening the count to 15).
 	// Additive and absent-means-normal; see the parse below for why an OLDER
 	// daemon's refusal of it is the wire-compatibility story.
-	if len(args) < 3 || len(args) > 15 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/vram/signature/pinned/exclusive/exclusive_holder/parent_scope_id/reason/priority, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	// AIRA-324 added the optional `discountable` field (16), on the same no-bump
+	// pattern: the client sends it only when true, and an older daemon's
+	// allow-list refusal of it is re-asked once without it (the job is then
+	// booked at its full pin, today's behaviour).
+	if len(args) < 3 || len(args) > 16 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, optional max_wait_ms/cpu/vram/signature/pinned/exclusive/exclusive_holder/parent_scope_id/reason/priority/discountable, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "cpu" && name != "vram" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" && name != "priority" {
+		if name != "slice" && name != "reserve" && name != "cpu" && name != "vram" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" && name != "reason" && name != "priority" && name != "discountable" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -3403,6 +3526,32 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 			return admitRequest{}, fmt.Errorf("%s: admit priority must be %q or %q", CodeProtocol, runner.ConfinePriorityHigh, runner.ConfinePriorityNormal)
 		}
 	}
+	// AIRA-324. `discountable` is a boolean, sent by the client only when true.
+	// It is refused, never ignored, on every request that is not a scope-backed,
+	// pinned, non-exclusive job-level launch: those are exactly the requests the
+	// discount must never reach (spec section 5.2, "who is discounted"), and a
+	// field accepted and then silently dropped would hide a client bug.
+	discountable := false
+	if raw, exists := args["discountable"]; exists {
+		value, valid := raw.(bool)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit discountable must be boolean", CodeProtocol)
+		}
+		discountable = value
+	}
+	if discountable {
+		switch {
+		case !pinned:
+			return admitRequest{}, fmt.Errorf("%s: admit discountable requires pinned: only an operator's own pin may be discounted", CodeProtocol)
+		case exclusive:
+			return admitRequest{}, fmt.Errorf("%s: admit discountable cannot be combined with exclusive", CodeProtocol)
+		case parentScopeID != "":
+			return admitRequest{}, fmt.Errorf("%s: admit discountable cannot be combined with parent_scope_id", CodeProtocol)
+		}
+		if _, hasScope := args["scope_id"]; !hasScope {
+			return admitRequest{}, fmt.Errorf("%s: admit discountable requires the scope_id, name and owner tuple: a scope-less reservation has no cap", CodeProtocol)
+		}
+	}
 	// A sub-reservation (`confine-reserve`, an aitest claim) has no launch flag
 	// and is already exempt from every freeze; a hand-crafted one may not claim
 	// the high tier either.
@@ -3502,7 +3651,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID, high: high}, nil
+		return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID, high: high, discountable: discountable}, nil
 	}
 	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
 	// to, reported by, and reaped through the holder's scope id: a scope-less
@@ -3515,7 +3664,7 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 	// exclusive requires the tuple refused just above), and it is transcribed
 	// anyway so that relaxing either rule later cannot silently drop the field
 	// instead of failing a test.
-	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID, high: high}, nil
+	return admitRequest{slice: slice, reserve: reserve, cpu: cpu, vram: vram, maxWait: maxWait, nonBlocking: nonBlocking, signature: signature, pinned: pinned, exclusiveReason: exclusiveReason, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID, high: high, discountable: discountable}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

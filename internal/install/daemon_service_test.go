@@ -282,7 +282,7 @@ func TestReexecDoesNotForwardUngivenDaemonModes(t *testing.T) {
 }
 
 func TestRenderDaemonUnitIsManagedBoundedAndIndependent(t *testing.T) {
-	unit, err := renderDaemonUnit("test-daemon.service", "/opt/aira bin", "/var/lib/aira state", "observe", 2*time.Second, "observe", "")
+	unit, err := renderDaemonUnit("test-daemon.service", "/opt/aira bin", "/var/lib/aira state", "observe", 2*time.Second, "observe", "observe", "0.8", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,6 +291,7 @@ func TestRenderDaemonUnitIsManagedBoundedAndIndependent(t *testing.T) {
 		"Environment=AIRA_DAEMON_MANAGED=1", "Environment=AIRA_DAEMON_WATCHDOG_MODE=observe",
 		"Environment=AIRA_DAEMON_WATCHDOG_INTERVAL=2s",
 		"Environment=AIRA_DAEMON_SLICE_CEILING_MODE=observe", `Environment=XDG_STATE_HOME="/var/lib/aira state"`,
+		"Environment=AIRA_DAEMON_PIN_CHARGE_MODE=observe", "Environment=AIRA_DAEMON_PIN_CHARGE_FACTOR=0.8",
 		"MemoryAccounting=yes", "MemoryMax=1G", "MemoryHigh=768M", "TasksMax=512",
 		"StartLimitIntervalSec=0", "Restart=always", "WantedBy=default.target",
 	} {
@@ -499,5 +500,69 @@ func TestInstallRefusesSocketIdentityDivergence(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(state.unitDir(), defaultDaemonUnit)); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("divergent install published daemon unit: %v", statErr)
+	}
+}
+
+// verifies: AIRA-324 install-record pattern for the pinned-job charge discount:
+// absent flags parse to the zero value; an omitted flag keeps what the installed
+// unit declares; with nothing installed the ship default is OBSERVE at 0.8
+// (never enforce: nothing in install turns the discount on); an unreadable or
+// invalid installed value falls back to that default; explicit flags win and are
+// forwarded by the sudo re-exec only when given; invalid values are refused.
+// Mutations: default mode enforce (or off); the omitted flag resets an installed
+// enforce; an invalid installed factor propagated; the re-exec forwards an
+// ungiven flag; a three-place factor accepted.
+func TestInstallPinChargeModeAndFactor(t *testing.T) {
+	opts, err := parseInstallArgs(nil)
+	if err != nil || opts.pinCharge != "" || opts.pinChargeFactor != "" {
+		t.Fatalf("absent options must parse to the zero value: %+v %v", opts, err)
+	}
+	opts, err = parseInstallArgs([]string{"--pin-charge", "enforce", "--pin-charge-factor=0.9"})
+	if err != nil || opts.pinCharge != "enforce" || opts.pinChargeFactor != "0.9" {
+		t.Fatalf("explicit=%+v err=%v", opts, err)
+	}
+	for _, args := range [][]string{
+		{"--pin-charge=on"}, {"--pin-charge"}, {"--pin-charge-factor=0.855"}, {"--pin-charge-factor=0.4"},
+		{"--pin-charge-factor=1.5"}, {"--status", "--pin-charge=off"}, {"--status", "--pin-charge-factor=0.8"},
+	} {
+		if _, err := parseInstallArgs(args); err == nil || !strings.Contains(err.Error(), CodeArgumentInvalid) {
+			t.Fatalf("args=%q err=%v", args, err)
+		}
+	}
+
+	resolved, err := resolveDaemonModes(installOpts{}, "")
+	if err != nil || resolved.pinCharge != "observe" || resolved.pinChargeFactor != "0.8" {
+		t.Fatalf("first install: pin charge %q factor %q, want observe 0.8: %v", resolved.pinCharge, resolved.pinChargeFactor, err)
+	}
+	installed := "# aira-managed: aira-daemon.service\n[Service]\n" +
+		"Environment=AIRA_DAEMON_PIN_CHARGE_MODE=enforce\n" +
+		"Environment=AIRA_DAEMON_PIN_CHARGE_FACTOR=0.9\n"
+	resolved, err = resolveDaemonModes(installOpts{}, installed)
+	if err != nil || resolved.pinCharge != "enforce" || resolved.pinChargeFactor != "0.9" {
+		t.Fatalf("omitted flags did not keep the installed enforce 0.9: %q %q %v", resolved.pinCharge, resolved.pinChargeFactor, err)
+	}
+	resolved, err = resolveDaemonModes(installOpts{pinCharge: "observe", pinChargeFactor: "0.8"}, installed)
+	if err != nil || resolved.pinCharge != "observe" || resolved.pinChargeFactor != "0.8" {
+		t.Fatalf("explicit flags lost to the installed unit: %q %q %v", resolved.pinCharge, resolved.pinChargeFactor, err)
+	}
+	garbled := "Environment=AIRA_DAEMON_PIN_CHARGE_MODE=turbo\nEnvironment=AIRA_DAEMON_PIN_CHARGE_FACTOR=0.1\n"
+	resolved, err = resolveDaemonModes(installOpts{}, garbled)
+	if err != nil || resolved.pinCharge != "observe" || resolved.pinChargeFactor != "0.8" {
+		t.Fatalf("an unrecognised installed value was propagated: %q %q %v", resolved.pinCharge, resolved.pinChargeFactor, err)
+	}
+
+	target := installTarget{uid: 1000, gid: 1000, home: "/home/someone", username: "someone"}
+	args := strings.Join(reexecRequestFor("/usr/bin/aira", target, installOpts{memoryMax: "16G"}).args, " ")
+	if strings.Contains(args, "--pin-charge") {
+		t.Fatalf("re-exec forwards an ungiven --pin-charge flag: %q", args)
+	}
+	args = strings.Join(reexecRequestFor("/usr/bin/aira", target, installOpts{pinCharge: "enforce", pinChargeFactor: "0.9"}).args, " ")
+	for _, want := range []string{"--pin-charge enforce", "--pin-charge-factor 0.9"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("re-exec argv %q drops %q", args, want)
+		}
+	}
+	if _, err := renderDaemonUnit("d.service", "/opt/aira", "/var/lib/aira", "observe", 2*time.Second, "observe", "observe", "0.855", ""); err == nil {
+		t.Fatal("rendered a unit with an invalid factor")
 	}
 }

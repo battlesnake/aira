@@ -203,6 +203,8 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// which for a --delegate-ram scope is a containment ceiling many times its
 		// real reserve, and is exactly the number AIRA-192 was raised for.
 		runner.ApplyConfineScopeReserves(result.Scopes, snapshot.scopeReserves)
+		// AIRA-324. The pin beside a booking below it, from the same snapshot.
+		runner.ApplyConfineScopePins(result.Scopes, snapshot.scopePins)
 		// AIRA-269. The VRAM twin, from the SAME locked snapshot: each granted
 		// scope's declared --vram (0 = "not a GPU job") onto its row, a scope the
 		// ledger holds no record for left unevaluated.

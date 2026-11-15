@@ -32,6 +32,10 @@ type admissionResult struct {
 	reserve  int64
 	ceiling  int64
 	basis    string
+	// AIRA-324. charge is the daemon's ledger booking for a discounted grant
+	// (strictly between 0 and reserve), and zero for every other result: the
+	// daemon sends it only when it booked below the pin.
+	charge int64
 }
 
 var errDetachKillIntent = errors.New("detached run has a pending kill intent")
@@ -58,6 +62,23 @@ var errAdmitPriorityUnknown = errors.New("aira: the admission daemon predates --
 // its admit-field allowlist. Matched exactly, so any OTHER protocol refusal of a
 // high request stays terminal.
 const oldDaemonPriorityRefusal = `unexpected admit field "priority"`
+
+// errAdmitDiscountUnknown is the AIRA-324 twin of errAdmitPriorityUnknown: a
+// discountable request met a daemon that predates the `discountable` field
+// (oldDaemonDiscountRefusal). admitThroughDaemon re-asks ONCE without it, so the
+// job is booked at its full pin, which is exactly what that daemon books every
+// job at. No notice is printed: the operator asked for nothing (the discount is
+// daemon policy), and the outcome is today's behaviour, which the trailer shows
+// by carrying no `booked=`. It never escapes admitThroughDaemon.
+var errAdmitDiscountUnknown = errors.New("aira: the admission daemon predates the discountable field")
+
+// oldDaemonDiscountRefusal is the allow-list refusal an admission daemon that
+// predates AIRA-324 answers a discountable request with. Matched exactly, with
+// the code, so any other protocol refusal stays terminal. A discountable request
+// carries at most 12 admit fields, below the old daemon's 15-field count guard,
+// so the allow-list loop is the only refusal path an old daemon can take
+// (measured: docs/dev/aira-324-old-daemon-probe.py).
+const oldDaemonDiscountRefusal = `unexpected admit field "discountable"`
 
 func (result admissionResult) releaseAdmission() {
 	if result.release != nil {
@@ -137,6 +158,11 @@ type runnerAdmitGrant struct {
 	// must never be read as an invalid grant.
 	Cpu   int64  `json:"cpu,omitempty"`
 	Basis string `json:"basis"`
+	// AIRA-324. Charge is the ledger booking of a discounted grant (absent
+	// otherwise). Reserve stays the pin: the scope memory.max and the re-declared
+	// RAM (newLeaseKeeper) are the pin, never this. Checked by
+	// validRunnerAdmitCharge.
+	Charge int64 `json:"charge,omitempty"`
 }
 
 type runnerAdmitRejection struct {
@@ -289,6 +315,13 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 			if r.diagnostics != nil {
 				_, _ = fmt.Fprintln(r.diagnostics, "confine: notice: the admission daemon predates --priority high (it refused the field); this job queues at NORMAL priority. Run `systemctl --user restart aira-daemon.service` after installing this aira to enable it.")
 			}
+			continue
+		}
+		if errors.Is(err, errAdmitDiscountUnknown) {
+			// AIRA-324. Refused in the allow-list, before any enqueue, so the re-ask
+			// is a fresh request; Discountable is cleared on this local copy, so the
+			// re-ask and every later reconnect omit the field: one degrade, no loop.
+			req.Discountable = false
 			continue
 		}
 		if !errors.Is(err, errAdmitReconnect) {
@@ -476,6 +509,11 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	if req.HighPriority {
 		frame.Request.Args["priority"] = ConfinePriorityHigh
 	}
+	// AIRA-324. Sent ONLY when true, so every other launch's wire is byte-identical
+	// to before; an older daemon's refusal of it is re-asked once without it.
+	if req.Discountable {
+		frame.Request.Args["discountable"] = true
+	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return fail()
 	}
@@ -512,6 +550,10 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 		if req.HighPriority && response.Code == "E_DAEMON_PROTOCOL" && strings.Contains(response.Error, oldDaemonPriorityRefusal) {
 			_ = conn.Close()
 			return admissionResult{}, false, errAdmitPriorityUnknown
+		}
+		if req.Discountable && response.Code == "E_DAEMON_PROTOCOL" && strings.Contains(response.Error, oldDaemonDiscountRefusal) {
+			_ = conn.Close()
+			return admissionResult{}, false, errAdmitDiscountUnknown
 		}
 		if req.Exclusive {
 			switch response.Code {
@@ -682,7 +724,7 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 			fmt.Errorf("%s; refusing to launch ungoverned", message)
 	}
 	var grant runnerAdmitGrant
-	if err := json.Unmarshal(response.Data, &grant); err != nil || !validRunnerAdmitGrant(grant) {
+	if err := json.Unmarshal(response.Data, &grant); err != nil || !validRunnerAdmitGrant(grant) || !validRunnerAdmitCharge(req, grant) {
 		if req.Exclusive {
 			_ = conn.Close()
 			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, false,
@@ -732,7 +774,20 @@ func (r *Runner) admitExchangeOnce(ctx context.Context, req Request, effectiveRe
 	// daemon reads as the lease-releasing EOF. No transport deadline was ever set on
 	// this conn, so a held lease that outlives its admission wait is never torn down.
 	keeper := newLeaseKeeper(conn, req, grant, dial, r.admitSocketPath)
-	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: keeper, reserve: grant.Reserve, basis: grant.Basis}, true, nil
+	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: keeper, reserve: grant.Reserve, basis: grant.Basis, charge: grant.Charge}, true, nil
+}
+
+// validRunnerAdmitCharge (AIRA-324) accepts a grant's `charge` only where it can
+// mean what it says: absent, or strictly between 0 and the granted reserve on a
+// request that asked to be discountable. A charge on any other grant is a daemon
+// fault, refused like every other malformed grant (refuse, never repair): a
+// client that wrote it into the trailer would claim a booking the daemon may not
+// hold.
+func validRunnerAdmitCharge(req Request, grant runnerAdmitGrant) bool {
+	if grant.Charge == 0 {
+		return true
+	}
+	return req.Discountable && grant.Charge > 0 && grant.Charge < grant.Reserve
 }
 
 // warnDaemonWait emits the periodic "waiting for the daemon" line while the client

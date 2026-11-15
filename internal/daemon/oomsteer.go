@@ -432,6 +432,19 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 // the over-count can therefore never flip it to an offender on any path, so
 // reconciling the fold buys nothing. Stated here rather than hidden.
 //
+// AIRA-324 RESTATES that bound: "memory.max <= charge" no longer holds for every
+// parent. A delegate parent is never discounted (the client never sends
+// `discountable` with --delegate-ram) and a --resize still lowers only the
+// booking, so for a delegate parent the argument above stands except after a
+// --resize (where it already did not hold before AIRA-324: the resize lowers the
+// charge, not the cap). For a DISCOUNTED job (enforce mode only) the cap is the
+// pin and the budget here is the charge, so at its grant memory.max <=
+// charge / factor (1.25 x at 0.8): such a job CAN read as over its budget while
+// still under its own cap, and that is the intended reading — the job over its
+// booking is the one steering should prefer when the slice runs short, since the
+// discount is what let the slice's caps exceed its limit. A discounted job is
+// never a delegate parent, so the fold above never meets one.
+//
 // A sub-reservation whose parent is not a scope-backed waiter here adds nothing:
 // without the parent's own charge there is no budget to add it to, and inventing
 // one would be a number nobody established. AIRA-115 removed the case that made

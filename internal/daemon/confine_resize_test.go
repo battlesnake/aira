@@ -53,7 +53,7 @@ func ledgerFingerprint(queue *sliceQueue) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "out=%d cpu=%d vram=%d jobs=%d seq=%d|", queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs, queue.seq)
 	for _, waiter := range queue.waiters {
-		fmt.Fprintf(&out, "%s:%d:%d:%d:%d:%v:%d:%d;", waiter.scopeID, waiter.state, waiter.reserve, waiter.cpu, waiter.vram, waiter.accounted, waiter.pushSeq, waiter.bypassed)
+		fmt.Fprintf(&out, "%s:%d:%d:%d:%d:%d:%v:%d:%d:%v;", waiter.scopeID, waiter.state, waiter.reserve, waiter.charge, waiter.cpu, waiter.vram, waiter.accounted, waiter.pushSeq, waiter.bypassed, waiter.discountable)
 	}
 	return out.String()
 }
@@ -150,8 +150,11 @@ func TestConfineResizeFloorIsInclusiveAndAcceptsAMeasuredZero(t *testing.T) {
 	}
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if exact.reserve != 3*qGiB || idle.reserve != 1<<20 || queue.outstanding != 3*qGiB+1<<20 {
-		t.Fatalf("reserves %d/%d outstanding=%d", exact.reserve, idle.reserve, queue.outstanding)
+	// AIRA-324: --resize lowers the booking (ledgerCharge); the granted reserve
+	// (the pin, the scope's memory.max) is untouched.
+	if exact.ledgerCharge() != 3*qGiB || idle.ledgerCharge() != 1<<20 || queue.outstanding != 3*qGiB+1<<20 ||
+		exact.reserve != 8*qGiB || idle.reserve != 8*qGiB {
+		t.Fatalf("bookings %d/%d pins %d/%d outstanding=%d", exact.ledgerCharge(), idle.ledgerCharge(), exact.reserve, idle.reserve, queue.outstanding)
 	}
 }
 
@@ -272,8 +275,8 @@ func TestConfineResizeOwnership(t *testing.T) {
 			if test.want == "OK" {
 				wantReserve = 2 * qGiB
 			}
-			if job.reserve != wantReserve || queue.outstanding != wantReserve {
-				t.Fatalf("reserve=%d outstanding=%d, want %d", job.reserve, queue.outstanding, wantReserve)
+			if job.ledgerCharge() != wantReserve || queue.outstanding != wantReserve || job.reserve != 8*qGiB {
+				t.Fatalf("booking=%d pin=%d outstanding=%d, want booking %d pin 8 GiB", job.ledgerCharge(), job.reserve, queue.outstanding, wantReserve)
 			}
 		})
 	}
@@ -494,10 +497,11 @@ func TestConfineResizeIsDroppedByAReDeclare(t *testing.T) {
 		queue.mu.Lock()
 		defer queue.mu.Unlock()
 		wantOut, wantCPU, wantVRAM, wantJobs := rederiveLedgerLocked(queue)
-		if lease.reserve != wantReserve || lease.state != wantState || queue.outstanding != wantOut || queue.cpuOutstanding != wantCPU ||
+		// AIRA-324: the resize is the booking; the pin stays the granted 8 GiB.
+		if lease.ledgerCharge() != wantReserve || lease.reserve != 8*gib || lease.state != wantState || queue.outstanding != wantOut || queue.cpuOutstanding != wantCPU ||
 			queue.vramOutstanding != wantVRAM || queue.outstandingJobs != wantJobs || queue.outstanding < 0 {
-			t.Fatalf("lease reserve=%d state=%v ledger %d/%d/%d/%d (rederived %d/%d/%d/%d), want reserve %d state %v",
-				lease.reserve, lease.state, queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs,
+			t.Fatalf("lease booking=%d pin=%d state=%v ledger %d/%d/%d/%d (rederived %d/%d/%d/%d), want booking %d state %v",
+				lease.ledgerCharge(), lease.reserve, lease.state, queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs,
 				wantOut, wantCPU, wantVRAM, wantJobs, wantReserve, wantState)
 		}
 	}

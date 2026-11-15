@@ -30,7 +30,7 @@ func (s *Server) GrantedLeasesForTest() map[string]int64 {
 		q.mu.Lock()
 		for _, w := range q.waiters {
 			if w != nil && w.state == admitGranted && w.accounted {
-				out[w.scopeID] = w.reserve
+				out[w.scopeID] = w.ledgerCharge() // AIRA-324: the booking, Σleases
 			}
 		}
 		q.mu.Unlock()
