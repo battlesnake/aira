@@ -1,7 +1,7 @@
 # Output of docs/dev/aira-cap-headroom-replay.py
 # snapshot: sqlite3 .backup of ~/.local/state/aira/state.db taken 2026-11-15T14:26Z; 234,630 confine rows; max(at) 2026-11-15T12:26:52.839079367Z
-# command: aira confine --name cap-headroom-replay2 --memory-reserve 384M -- python3 -I docs/dev/aira-cap-headroom-replay.py --db ~/tmp/aira-cap-headroom-data/state-copy.db
-# exit code: 0 (confine trailer: terminated-by=normal peak-rss=233800K)
+# command: aira confine --name cap-headroom-replay4 --memory-reserve 384M -- python3 -I docs/dev/aira-cap-headroom-replay.py --db ~/tmp/aira-cap-headroom-data/state-copy.db
+# exit code: 0 (confine trailer: terminated-by=normal; see the last line)
 
 PART 1  the quoted evidence, re-derived (all cap sources)
   confine rows 234630; OOM rows 4425; OOM rows with a budget 4210
@@ -33,45 +33,45 @@ PART 2  split by cap source, clean-run timing and cap, and (auto) estimator rung
     all auto                        2355 |  28.8%  35.6%  35.6% |  45.1%  19.3%  35.6% |  56.6%   7.8%  35.6%
     history rungs (own/max/oom-esc)   760 |  38.0%  37.6%  24.3% |  53.7%  22.0%  24.3% |  65.8%   9.9%  24.3%
     no retained earlier row         1595 |  24.4%  34.6%  41.0% |  41.0%  18.0%  41.0% |  52.2%   6.8%  41.0%
-  rung (walk-forward over RETAINED rows; 'no retained earlier row' includes evicted history):
+  retained-evidence category, NOT the estimator's actual basis (walk-forward over RETAINED rows; 'no retained earlier row' includes evicted history):
     no-earlier-row  1595
     own-max          110
     estimate:max     382
     oom-escalated    268
     no-earlier-row auto OOM rows killed at exactly 1 GiB (the client default): 978
-    auto OOM streaks ended by a clean run, by length: {1: 575, 2: 60, 3: 3, 4: 2}
+    auto-only OOM streaks ended by a clean run (any source), by length: {1: 1262, 2: 131, 3: 10, 4: 3, 5: 1}
 
 PART 3  AIRA-318 interaction: clean auto rows at >= 95% of their cap
   clean auto rows 88593; at >= 95% of cap 1996 (2.3%); signatures 1715; signatures with >= 2 such rows 205
   clean auto rows at >= 50% of cap: 16724 (18.9%)
   clean auto rows at >= 75% of cap: 9357 (10.6%)
   clean auto rows at >= 90% of cap: 2814 (3.2%)
-  consecutive at-cap clean runs of one signature: 150 pairs, cap ratio median 1.150, p90 1.151
+  consecutive at-cap clean runs of one signature: 136 pairs, cap ratio median 1.150, p90 1.150
 
 PART 4  downside: 20 concurrent auto jobs since 2026-10-20 (33013 jobs, 1488 OOM-killed)
   use under k: a clean run's peak unchanged (variant 'cache': a run at >= 95% of its cap fills k x C);
   an OOM run uses min(k x C, largest clean peak of its signature), or k x C when none is known.
-  k      cache  | mixed P(>1) p99 max | burst P(>1) p99 max | OOM-cmd burst P(>1) p99 max  (38 / 53 groups)
-  1.0    no     |  0.000  0.56  0.71 |  0.000  0.72  0.82 |  0.000  0.92  1.00
-  1.0    yes    |  0.000  0.56  0.66 |  0.000  0.71  0.81 |  0.000  0.92  1.00
-  1.5    no     |  0.000  0.59  0.75 |  0.000  0.76  0.88 |  0.018  1.37  1.50
-  1.5    yes    |  0.000  0.64  0.81 |  0.001  0.81  1.06 |  0.018  1.37  1.50
-  2.0    no     |  0.000  0.65  0.83 |  0.000  0.81  0.96 |  0.024  1.87  2.00
-  2.0    yes    |  0.001  0.79  1.16 |  0.005  0.95  1.24 |  0.025  1.82  1.96
-  3.0    no     |  0.000  0.76  0.96 |  0.005  0.95  1.45 |  0.022  2.54  2.82
-  3.0    yes    |  0.011  1.02  1.52 |  0.040  1.23  1.76 |  0.070  2.62  2.90
-  4.0    no     |  0.003  0.86  1.13 |  0.014  1.05  1.81 |  0.033  3.26  3.60
-  4.0    yes    |  0.033  1.26  1.87 |  0.079  1.50  2.16 |  0.121  3.30  3.63
+  k      cache  | mixed n>1/draws p99 max | burst n>1 p99 max | OOM-cmd burst n>1 p99 max  (38 / 53 groups)
+  1.0    no     |    0/4000  0.56  0.71 |    0/4000  0.72  0.82 |    0/4000  0.92  1.00
+  1.0    yes    |    0/4000  0.56  0.66 |    0/4000  0.71  0.81 |    0/4000  0.92  1.00
+  1.5    no     |    0/4000  0.59  0.75 |    0/4000  0.76  0.88 |   72/4000  1.37  1.50
+  1.5    yes    |    0/4000  0.64  0.81 |    2/4000  0.81  1.06 |   74/4000  1.37  1.50
+  2.0    no     |    0/4000  0.65  0.83 |    0/4000  0.81  0.96 |   95/4000  1.87  2.00
+  2.0    yes    |    3/4000  0.79  1.16 |   21/4000  0.95  1.24 |   98/4000  1.82  1.96
+  3.0    no     |    0/4000  0.76  0.96 |   20/4000  0.95  1.45 |   89/4000  2.54  2.82
+  3.0    yes    |   46/4000  1.02  1.52 |  159/4000  1.23  1.76 |  281/4000  2.62  2.90
+  4.0    no     |   12/4000  0.86  1.13 |   57/4000  1.05  1.81 |  130/4000  3.26  3.60
+  4.0    yes    |  130/4000  1.26  1.87 |  316/4000  1.50  2.16 |  484/4000  3.30  3.63
   20 mixed auto jobs book a median 20.6 GiB (p90 24.5): the ledger fills with ~43 such jobs at a 45 GiB ceiling
 
   stacked with AIRA-324 (pinned charge 0.8 x pin): 86854 jobs, 53841 pinned (62%)
-  k      324   | mixed P(>1) p99 max | burst P(>1) p99 max  (81 groups)
-  1.0    off   |  0.000  0.62  0.73 |  0.000  0.71  0.83
-  1.0    on    |  0.000  0.74  0.91 |  0.000  0.87  1.01
-  2.0    off   |  0.000  0.64  0.81 |  0.000  0.72  0.99
-  2.0    on    |  0.000  0.77  1.06 |  0.001  0.89  1.07
-  3.0    off   |  0.000  0.67  0.89 |  0.000  0.77  0.97
-  3.0    on    |  0.000  0.79  0.91 |  0.004  0.93  1.27
+  k      324   | mixed n>1/draws p99 max | burst n>1 p99 max  (81 groups)
+  1.0    off   |    0/4000  0.62  0.73 |    0/4000  0.71  0.83
+  1.0    on    |    0/4000  0.74  0.91 |    1/4000  0.87  1.01
+  2.0    off   |    0/4000  0.64  0.81 |    0/4000  0.72  0.99
+  2.0    on    |    1/4000  0.77  1.06 |    2/4000  0.89  1.07
+  3.0    off   |    0/4000  0.67  0.89 |    0/4000  0.77  0.97
+  3.0    on    |    0/4000  0.79  0.91 |   14/4000  0.93  1.27
 
 PART 5  page-cache ratchet, booking C over six runs from C=1 GiB (cache fills the limit)
   k=1 today    1.15 1.32 1.52 1.75 2.01 2.31
@@ -81,3 +81,4 @@ PART 5  page-cache ratchet, booking C over six runs from C=1 GiB (cache fills th
   k=2 318-cap  2.00 4.00 8.00 16.00 32.00 64.00
   k=2 booking  1.00 1.00 1.00 1.00 1.00 1.00
 
+confine: slice=aira.slice name=cap-headroom-replay4 containment=enforced cap=enforced(64G) reserve=384M reserve-basis=pinned:client admission=immediate scope=placed scope-integrity=contained oom.group=set priorities=applied cpu-weight=aging(100->10@30m0s) scope-memory.max=enforced=402653184 cap-source=operator:--memory-reserve binding=scope-limited effective=402653184 scope-swap.max=enforced terminated-by=normal peak-rss=204864K cpu=4.512221s+528.529ms wall=5.593533s

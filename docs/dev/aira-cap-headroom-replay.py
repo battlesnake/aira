@@ -225,22 +225,25 @@ def part2(rows, clean):
     split("history rungs (own/max/oom-esc)", hist_rungs)
     split("no retained earlier row", by.get("cold-start", []))
     one_gib = sum(1 for r in by.get("cold-start", []) if r[5] == GiB)
-    print("  rung (walk-forward over RETAINED rows; 'no retained earlier row' includes evicted history):")
+    print("  retained-evidence category, NOT the estimator's actual basis (walk-forward over RETAINED rows; 'no retained earlier row' includes evicted history):")
     for name in ("cold-start", "own-max", "estimate:max", "oom-escalated"):
         print("    %-14s %5d" % ("no-earlier-row" if name == "cold-start" else name, len(by.get(name, []))))
     print("    no-earlier-row auto OOM rows killed at exactly 1 GiB (the client default): %d" % one_gib)
-    # the 1.5x-per-kill creep, in kills: consecutive OOM rows of one signature
+    # the 1.5x-per-kill creep, in kills: consecutive OOM rows of one signature (EVERY cap source:
+    # an intervening row of any source breaks the streak), counted when the streak's rows are all
+    # auto and it ended with a clean row of any source.
     runs = collections.Counter()
-    streak = collections.Counter()
-    for _rid, sig, _p, oom, _at, _b, bb in rows:
-        if bb != AUTO:
-            continue
+    streak = {}                                      # sig -> [length, all_auto]
+    for _rid, sig, peak, oom, _at, _b, bb in rows:
         if oom:
-            streak[sig] += 1
-        elif streak[sig]:
-            runs[streak[sig]] += 1
-            streak[sig] = 0
-    print("    auto OOM streaks ended by a clean run, by length: %s" % dict(sorted(runs.items())))
+            st = streak.setdefault(sig, [0, True])
+            st[0] += 1
+            st[1] = st[1] and bb == AUTO
+            continue
+        st = streak.pop(sig, None)
+        if st and st[1] and peak:
+            runs[st[0]] += 1
+    print("    auto-only OOM streaks ended by a clean run (any source), by length: %s" % dict(sorted(runs.items())))
 
 
 def part3(rows):
@@ -252,15 +255,15 @@ def part3(rows):
         len(cl), pct(len(at), len(cl)), len(sigs), sum(1 for v in sigs.values() if v >= 2)))
     for f in (0.5, 0.75, 0.9):
         print("  clean auto rows at >= %.0f%% of cap: %s" % (100 * f, pct(sum(1 for r in cl if r[2] >= f * r[5]), len(cl))))
-    # growth of the booking across consecutive clean at-cap rows of one signature
+    # growth of the cap across CONSECUTIVE rows of one signature (a row of any source in between
+    # breaks the pair) that are both clean auto rows at >= 95% of their cap.
     prev = {}
     grow = []
     for _rid, sig, peak, oom, _at, bud, bb in rows:
-        if bb != AUTO or oom or not peak or not bud:
-            continue
-        if peak >= 0.95 * bud:
-            if sig in prev:
-                grow.append(bud / prev[sig])
+        atcap = bb == AUTO and not oom and peak and bud and peak >= 0.95 * bud
+        if atcap and sig in prev:
+            grow.append(bud / prev[sig])
+        if atcap:
             prev[sig] = bud
         else:
             prev.pop(sig, None)
@@ -307,16 +310,16 @@ def part4(rows, clean):
             s = pool_pick()
             r.append(sum(use(j, k, cache) for j in s) / sum(j[3] for j in s))
         r.sort()
-        return sum(v > 1 for v in r) / n, r[int(0.99 * n)], r[-1]
+        return "%d/%d" % (sum(v > 1 for v in r), n), r[int(0.99 * n)], r[-1]
 
-    print("  %-6s %-6s | mixed P(>1) p99 max | burst P(>1) p99 max | OOM-cmd burst P(>1) p99 max  (%d / %d groups)" % (
+    print("  %-6s %-6s | mixed n>1/draws p99 max | burst n>1 p99 max | OOM-cmd burst n>1 p99 max  (%d / %d groups)" % (
         "k", "cache", len(big), len(killers)))
     for k in KS:
         for cache in (False, True):
             m = mc(lambda: random.sample(jobs, 20), k, cache)
             b = mc(lambda: random.sample(random.choice(big), 20), k, cache)
             o = mc(lambda: random.sample(random.choice(killers), 20), k, cache)
-            print("  %-6.1f %-6s | %6.3f %5.2f %5.2f | %6.3f %5.2f %5.2f | %6.3f %5.2f %5.2f" % (
+            print("  %-6.1f %-6s | %9s %5.2f %5.2f | %9s %5.2f %5.2f | %9s %5.2f %5.2f" % (
                 k, "yes" if cache else "no", *m, *b, *o))
     sl = sorted(sum(j[3] for j in random.sample(jobs, 20)) / GiB for _ in range(2000))
     print("  20 mixed auto jobs book a median %.1f GiB (p90 %.1f): the ledger fills with ~%d such jobs at a 45 GiB ceiling" % (
@@ -347,17 +350,17 @@ def part4(rows, clean):
             s = pick()
             r.append(sum(use2(j, k, False) for j in s) / sum(charge2(j, f324) for j in s))
         r.sort()
-        return sum(v > 1 for v in r) / n, r[int(0.99 * n)], r[-1]
+        return "%d/%d" % (sum(v > 1 for v in r), n), r[int(0.99 * n)], r[-1]
 
     npin = sum(1 for j in both if j[0] == "pin")
     print("\n  stacked with AIRA-324 (pinned charge 0.8 x pin): %d jobs, %d pinned (%.0f%%)" % (
         len(both), npin, 100.0 * npin / len(both)))
-    print("  %-6s %-5s | mixed P(>1) p99 max | burst P(>1) p99 max  (%d groups)" % ("k", "324", len(bbig)))
+    print("  %-6s %-5s | mixed n>1/draws p99 max | burst n>1 p99 max  (%d groups)" % ("k", "324", len(bbig)))
     for k in (1.0, 2.0, 3.0):
         for f in (1.0, 0.8):
             m = mc2(lambda: random.sample(both, 20), k, f)
             b = mc2(lambda: random.sample(random.choice(bbig), 20), k, f)
-            print("  %-6.1f %-5s | %6.3f %5.2f %5.2f | %6.3f %5.2f %5.2f" % (k, "on" if f < 1 else "off", *m, *b))
+            print("  %-6.1f %-5s | %9s %5.2f %5.2f | %9s %5.2f %5.2f" % (k, "on" if f < 1 else "off", *m, *b))
 
 
 def part5():
