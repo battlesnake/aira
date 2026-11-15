@@ -40,7 +40,7 @@ LIMITS (stated in the spec, section "Evidence"):
   - draws are independent and not duration-weighted (no start times before AIRA-323; 323 rows
     began 2026-11-15 and are too few to replay a timeline).
   - the physical-fit term (L <= ceiling - headroom - real use at grant) cannot be replayed: the
-    store has no record of real use at each grant. Part 4 replays the fixed-k upper bound.
+    store has no record of real use at each grant. Part 4 is a fixed-k scenario without the physical-fit term.
 """
 import argparse
 import collections
