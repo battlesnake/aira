@@ -365,39 +365,50 @@ func TestAdmitQueueRefusesASecondSlicePath(t *testing.T) {
 	server.releaseAdmitWaiter(queue, first)
 }
 
+// countEvaluatorPasses makes every evaluator pass countable: a pass reads the
+// admission clock first. It must be installed before the queue exists.
+func countEvaluatorPasses(server *Server) *atomic.Int64 {
+	var passes atomic.Int64
+	server.admitNow = func() time.Time {
+		passes.Add(1)
+		return time.Now()
+	}
+	return &passes
+}
+
+// waitEvaluatorQuiet waits until a whole window passes with no evaluator pass
+// (no clock read at all), i.e. every pending kick has landed and no poll timer
+// is running. It fails the test if that never happens within budget.
+func waitEvaluatorQuiet(t *testing.T, passes *atomic.Int64, window, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(testdeadline.Wait(budget))
+	for time.Now().Before(deadline) {
+		before := passes.Load()
+		time.Sleep(window)
+		if passes.Load() == before {
+			return
+		}
+	}
+	t.Fatalf("the evaluator never went quiet for %v within %v: something is still polling an idle queue", window, budget)
+}
+
 // verifies: AIRA-228 — an idle queue's evaluator holds no poll timer. The queue
 // outlives its population, so a ticker left running would wake an idle daemon
 // at the poll rate forever (before AIRA-228 an empty queue had no evaluator at
-// all). With a 1ms poll and nothing queued, no pass may run; the next enqueue
-// must still be served. Mutation: keep the ticker running while idle -> idle
-// passes are counted.
+// all). At a 1ms poll, a drained queue's evaluator must go quiet, and the next
+// enqueue must still be served. Mutation: keep the ticker running while idle ->
+// it never goes quiet.
 func TestAdmitIdleEvaluatorHoldsNoPollTimer(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
 	server.admitPollInterval = time.Millisecond
-	// Every evaluator pass reads the clock first; count those reads only while
-	// the queue is idle.
-	var counting atomic.Bool
-	var passes atomic.Int64
-	server.admitNow = func() time.Time {
-		if counting.Load() {
-			passes.Add(1)
-		}
-		return time.Now()
-	}
+	passes := countEvaluatorPasses(server)
 	t.Cleanup(func() { retireAdmitQueues(server) })
 	queue, waiter := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, waiter)
 	server.releaseAdmitWaiter(queue, waiter)
-	// Let the release's own kick land before counting idle wakeups.
-	time.Sleep(50 * time.Millisecond)
-	counting.Store(true)
-	time.Sleep(100 * time.Millisecond)
-	counting.Store(false)
-	if n := passes.Load(); n != 0 {
-		t.Fatalf("an idle evaluator ran %d pass(es) in 100ms at a 1ms poll; it must hold no poll timer while the queue is empty", n)
-	}
+	waitEvaluatorQuiet(t, passes, 50*time.Millisecond, 2*time.Second)
 	_, next := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, next)
 	server.releaseAdmitWaiter(queue, next)
@@ -416,19 +427,20 @@ func TestAdmitEstablishGrantedResumesPolling(t *testing.T) {
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
 	server.admitPollInterval = 5 * time.Millisecond
+	passes := countEvaluatorPasses(server)
 	t.Cleanup(func() { retireAdmitQueues(server) })
 	queue, first := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, first)
 	server.releaseAdmitWaiter(queue, first)
-	time.Sleep(50 * time.Millisecond) // the evaluator sees the empty queue and stops polling
+	// Every pending kick has landed and the poll timer is stopped.
+	waitEvaluatorQuiet(t, passes, 50*time.Millisecond, 5*time.Second)
 
 	// A restart survivor re-declares into the empty queue: no enqueue kick.
 	_, established, code, err := server.enqueueReDeclare("/slice", 10, "redeclare", admitRequest{scopeID: "CONFINE-survivor-1-a", peerSameUID: true})
 	if err != nil || established.state != admitGranted {
 		t.Fatalf("establish: code=%q err=%v", code, err)
 	}
-	time.Sleep(20 * time.Millisecond)
-	// An elapsed hold on the now-populated queue: the next pass must retire it.
+	// An elapsed hold on the now-populated queue: a later pass must retire it.
 	queue.mu.Lock()
 	queue.freezeArmedAt = time.Now().Add(-server.admitFreezeMaxHold - time.Minute)
 	queue.mu.Unlock()

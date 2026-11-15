@@ -1967,7 +1967,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}},
 		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--vram S] [--priority high|normal] [--timeout D] [--cpu-timeout D] [--summary-file PATH] [--summary-tree-hash H] [--delegate-ram] [--exclusive] [--require-admission] [--fail-fast] [--detach] [--stdin-connect] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
-			stringSpec("slice", false, false, "Machine-wide cgroup slice. The daemon admits into aira.slice only: a slice that resolves anywhere else is refused (ran=no code=E_DAEMON_UNAVAILABLE, slice-not-served)"),
+			stringSpec("slice", false, false, "Machine-wide cgroup slice. The daemon admits into aira.slice only: a job whose slice resolves anywhere else is refused before it runs (reason slice-not-served)"),
 			stringSpec("name", false, false, "Scope name component"),
 			stringSpec("owner", false, false, "Cooperative owner (session) identity; the AIRA_CONFINE_OWNER env var sets the same thing (default: your Claude Code session (cc-<session id>), else the worktree of the current directory). A human-friendly name is shown in the SESSION column of `aira top` and in confine --list, attributing your jobs to your session"),
 			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB); a bare number is bytes. A --memory-reserve of 2G or more that a normally-ended exit-0 job used under 60% of gets one `confine: hint:` stderr line suggesting a smaller value (RAM only; not for AIRA_CONFINE_RESERVE or a docker container; silence with AIRA_CONFINE_NO_HINTS=1)"),
