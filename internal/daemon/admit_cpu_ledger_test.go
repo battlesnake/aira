@@ -249,7 +249,8 @@ func TestS5InPassGrantChargesCPUBeforeNextFit(t *testing.T) {
 }
 
 // verifies: S5 / P1 (Fable) — per-slice CPU self-containment. Q1 on /P is released
-// and pruned; Q2, a NEW queue on the SAME path, holds the whole ceiling; Q1's stale
+// (AIRA-228: a drained queue is no longer pruned and rebuilt, so this hand-built
+// two-object shape is now only a standing guard); Q2, a NEW queue on the SAME path, holds the whole ceiling; Q1's stale
 // evaluator pass runs; Q2 must still gate its own slice on its own intact
 // cpuOutstanding. This is GREEN by construction — each queue's CPU sum lives on the
 // queue, so nothing a pruned Q1 does can touch Q2.

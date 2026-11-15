@@ -187,8 +187,7 @@ func TestAdmitFreezeHolderChurnDoesNotExtendTheFreeze(t *testing.T) {
 
 	headA := queuedWaiter(1, 60, now.Add(-10*time.Second))
 	// A tail waiter keeps the queue non-empty, so releasing headA below does not
-	// trip pruneAdmitQueue into destroying the queue underneath the test — which
-	// would make this assert against a stale object rather than live behaviour.
+	// end the population (which takes its freeze anchor with it, AIRA-228).
 	// It does not fit either, so after headA leaves IT is the head (budget 35).
 	tail := queuedWaiter(99, 70, now.Add(-10*time.Second))
 	// 36 exceeds every head's budget in this test (30, then 35), so it is the
@@ -253,14 +252,17 @@ func TestAdmitFreezePhasePersistsWhenHeadBecomesFitting(t *testing.T) {
 		t.Fatalf("freezeHolderSeq=%d, want cleared once nothing froze", queue.freezeHolderSeq)
 	}
 
-	// Yield still begins on the original schedule.
-	server.releaseAdmitWaiter(queue, head)
-	server.releaseAdmitWaiter(queue, arming)
+	// Yield still begins on the original schedule. The new waiters arrive BEFORE
+	// the granted pair leaves, so the queue's population never drains: a drained
+	// population takes its anchor with it (AIRA-228,
+	// TestAdmitDrainedPopulationLeavesNoFreezeAnchor).
 	current = 50
 	now = armedAt.Add(40 * time.Second)
 	newHead := queuedWaiter(2, 60, now.Add(-40*time.Second))
 	fitting := queuedWaiter(3, 35, now)
 	queue.waiters = append(queue.waiters, newHead, fitting)
+	server.releaseAdmitWaiter(queue, head)
+	server.releaseAdmitWaiter(queue, arming)
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, fitting) // still inside the original hold
 

@@ -24,11 +24,11 @@ import (
 //
 // Positive control (Fable round-4, corrected by build-review): this package
 // had never resolved a slice via AIRA_CONFINE_SLICE before AIRA-49 — every
-// prior test keys admitQueues by whatever path it constructs, bypassing
+// prior test builds its queue on whatever path it constructs, bypassing
 // ResolveConfineManagementSlice entirely. releaseStaleGrantedLeasesPass itself
-// never calls that resolver (it iterates admitQueues directly, by design, to
-// cover every registered slice) -- but this helper still does, specifically so
-// the fixture's admitQueues KEY and its real, physically-created scope
+// never calls that resolver (it reads the admission queue directly, by design)
+// -- but this helper still does, specifically so
+// the fixture's queue PATH and its real, physically-created scope
 // directory PATH are provably the same path, comparing against what resolution
 // itself returns (it is EvalSymlinks-canonicalised, so the raw t.Setenv value
 // need not match byte-for-byte). A silent mismatch here would key the ledger
@@ -273,38 +273,31 @@ func TestStaleGrantedLeasesNeverReadsEnqueuedForItsAgeDecision(t *testing.T) {
 	}
 }
 
-// verifies: the sweep covers EVERY registered admission-queue slice, not just the
-// daemon's default one. Sol round-4: the single-slice draft silently missed every
-// lease admitted against an explicitly-specified --slice.
-func TestStaleGrantedLeasesCoversEveryRegisteredSliceNotJustTheDefault(t *testing.T) {
+// verifies: the sweep covers the admission queue's OWN slice, whatever path that
+// is, rather than re-resolving the daemon's default one. Sol round-4: the first
+// draft resolved the default and silently missed a lease on any other path.
+// AIRA-228 made the daemon keep one queue, so a second concurrent slice is no
+// longer representable; what is left to pin is that the sweep reads the queue's
+// own path.
+func TestStaleGrantedLeasesCoversTheQueuesOwnSliceNotAResolvedDefault(t *testing.T) {
 	now := time.Now()
 	server := staleLeaseTestServer(t, now, time.Second)
-	first := cgrouptest.IsolatedScopeParent(t)
-	second := cgrouptest.IsolatedScopeParent(t)
-	if first == second {
-		t.Fatalf("isolated parents collided: %s", first)
-	}
-	firstID := staleLeaseTestScopeID("slice-one")
-	secondID := staleLeaseTestScopeID("slice-two")
-	staleLeaseTestScope(t, first, firstID)
-	staleLeaseTestScope(t, second, secondID)
-	staleLeaseTestWaiter(server, first, firstID, now.Add(-2*time.Hour), now.Add(-time.Hour))
-	// staleLeaseTestWaiter keys by path, so the second registration is a second,
-	// distinct queue rather than an overwrite.
-	staleLeaseTestWaiter(server, second, secondID, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	server.admitResolveSlice = func(string) (string, bool, string) { return "/nonexistent/default.slice", true, "" }
+	slice := cgrouptest.IsolatedScopeParent(t)
+	scopeID := staleLeaseTestScopeID("slice-one")
+	staleLeaseTestScope(t, slice, scopeID)
+	staleLeaseTestWaiter(server, slice, scopeID, now.Add(-2*time.Hour), now.Add(-time.Hour))
 
 	candidates := server.staleGrantedLeases(time.Second)
 
-	for _, want := range []struct{ path, scopeID string }{{first, firstID}, {second, secondID}} {
-		found := false
-		for _, candidate := range candidates {
-			if candidate.path == want.path && candidate.scopeID == want.scopeID {
-				found = true
-			}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.path == slice && candidate.scopeID == scopeID {
+			found = true
 		}
-		if !found {
-			t.Fatalf("no candidate for slice %s scope %s; candidates=%+v", want.path, want.scopeID, candidates)
-		}
+	}
+	if !found {
+		t.Fatalf("no candidate for slice %s scope %s; candidates=%+v", slice, scopeID, candidates)
 	}
 }
 

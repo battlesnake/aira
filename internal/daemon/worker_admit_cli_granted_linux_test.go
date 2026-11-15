@@ -167,9 +167,8 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// on admitSlots — S15 releases the admission slot AFTER the grant (a held lease
 	// is not admission negotiation).
 	ledgerCharged := func() int64 {
-		// The daemon's connection goroutine creates (enqueueAdmitInternal) and
-		// deletes (pruneAdmitQueue) this map entry under admitRegistryMu, so the
-		// map read itself must hold that lock — mirror production's registry->queue
+		// The daemon's connection goroutine creates the queue (enqueueAdmitInternal)
+		// under admitRegistryMu, so the read itself must hold that lock — mirror production's registry->queue
 		// lock dance. A bare read here is a data race against a live grant/release.
 		server.admitRegistryMu.Lock()
 		queue := admitQueueAtLocked(server, slicePath)

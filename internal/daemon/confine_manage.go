@@ -61,7 +61,7 @@ func confineReservationRows(rows []admitReservationRow) []runner.ConfineReservat
 
 func (s *Server) activeConfines(path string) []runner.ConfineRegistryEntry {
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
 		return []runner.ConfineRegistryEntry{}
@@ -80,7 +80,7 @@ func (s *Server) activeConfines(path string) []runner.ConfineRegistryEntry {
 
 func (s *Server) releaseActiveConfine(path, scopeID string) {
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
 		return
@@ -238,11 +238,11 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 			queued, freezePhase := snapshot.queued, snapshot.phase
 			result.SliceReserve = &runner.ConfineSliceReserve{
 				GrantedBytes: outstanding,
-				// AIRA-220. present is false when no queue object exists for the
-				// slice, i.e. the daemon holds no admission ledger: a
-				// fresh/restarted daemon before its first admission, OR any slice
-				// with nothing connection-held right now (pruneAdmitQueue deletes
-				// the queue on the last release). The granted total, job count and
+				// AIRA-220. present is false when the daemon holds no live admission
+				// queue for the slice, i.e. no admission ledger: a fresh/restarted
+				// daemon before its first admission, OR any slice with nothing
+				// connection-held right now (admitQueueForLocked reads a drained
+				// queue as absent). The granted total, job count and
 				// population split below are then fabricated zeros and must be
 				// reported unevaluated, not as a confident empty slice.
 				//

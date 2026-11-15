@@ -23,13 +23,10 @@ func (s *Server) SetAdmitReadMemoryForTest(fn func(string) (int64, int64, int64,
 // unexported fields itself.
 func (s *Server) GrantedLeasesForTest() map[string]int64 {
 	s.admitRegistryMu.Lock()
-	queues := make([]*sliceQueue, 0, len(s.admitQueues))
-	for _, q := range s.admitQueues {
-		queues = append(queues, q)
-	}
+	q := s.liveAdmitQueueLocked()
 	s.admitRegistryMu.Unlock()
 	out := map[string]int64{}
-	for _, q := range queues {
+	if q != nil {
 		q.mu.Lock()
 		for _, w := range q.waiters {
 			if w != nil && w.state == admitGranted && w.accounted {

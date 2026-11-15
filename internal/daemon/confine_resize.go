@@ -52,7 +52,7 @@ func (s *Server) resizeRunningConfine(path, selector, rawReserve, callerOwner st
 	}
 	readUsage := s.scopeUsageReader()
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
 		return runner.ConfineResizeResult{}, 0, fmt.Errorf("%s: selector %q matched no running confine job (the daemon holds no admission for this slice)", runner.CodeConfineNotFound, selector)

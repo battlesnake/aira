@@ -67,7 +67,7 @@ func readReDeclareAck(t *testing.T, conn net.Conn) {
 	}
 }
 
-// reDeclareQueue returns the /slice admit queue, or nil if it was never built / was pruned.
+// reDeclareQueue returns the /slice admit queue, or nil if it was never built.
 func reDeclareQueue(server *Server) *sliceQueue {
 	server.admitRegistryMu.Lock()
 	defer server.admitRegistryMu.Unlock()

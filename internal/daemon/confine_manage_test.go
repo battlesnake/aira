@@ -363,7 +363,7 @@ func TestConfineListReserveUnevaluatedWhenLedgerAbsent(t *testing.T) {
 	server.shimReadMemTotal = func() (int64, bool) { return 48 << 30, true }
 	server.shimReadMemAvailable = func() (int64, bool, string) { return 20 << 30, true, "" }
 	// A readable ceiling — the memory read succeeds — while NO queue is registered:
-	// server.admitQueues stays empty, exactly the post-restart / idle state.
+	// The server holds no admission queue, exactly the post-restart / idle state.
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 5 << 30, maximum, 1 << 30, true, ""
 	}

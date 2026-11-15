@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"aira/internal/core"
 	"aira/internal/runner"
@@ -175,26 +174,24 @@ func waiterStateName(waiter *admitWaiter) string {
 // `available` is computed on the SAME signed arithmetic admission itself
 // uses (checkedAvailable/ledgerAvailable), never re-derived differently.
 //
-// Ordering is by slice path (sorted), so the dump is deterministic across
-// runs rather than depending on Go's randomised map iteration.
+// There is at most one queue row: the daemon keeps one admission queue
+// (AIRA-228), and a queue that holds nothing is not reported (it reads as
+// absent, as an emptied queue always has).
 func (s *Server) buildConfineDumpQueuesAndWaiters() ([]runner.ConfineDumpQueueRow, []runner.ConfineDumpWaiterRow) {
 	s.admitRegistryMu.Lock()
-	paths := make([]string, 0, len(s.admitQueues))
-	byPath := make(map[string]*sliceQueue, len(s.admitQueues))
-	for path, queue := range s.admitQueues {
-		paths = append(paths, path)
-		byPath[path] = queue
+	var queues []*sliceQueue
+	if queue := s.liveAdmitQueueLocked(); queue != nil {
+		queues = append(queues, queue)
 	}
 	s.admitRegistryMu.Unlock()
-	sort.Strings(paths)
 
 	now := s.admitNowTime()
 	readMemory := s.memoryReader()
 	shim := s.shimMode()
-	rows := make([]runner.ConfineDumpQueueRow, 0, len(paths))
+	rows := make([]runner.ConfineDumpQueueRow, 0, len(queues))
 	var waiterRows []runner.ConfineDumpWaiterRow
-	for _, path := range paths {
-		queue := byPath[path]
+	for _, queue := range queues {
+		path := queue.path
 		row := runner.ConfineDumpQueueRow{RecordType: runner.ConfineDumpRecordQueue, Slice: path}
 
 		queue.mu.Lock()

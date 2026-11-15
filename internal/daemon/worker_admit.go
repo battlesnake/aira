@@ -237,7 +237,7 @@ func (s *Server) workerAdmitSnapshot(path string, current, maximum, reclaimable 
 	var outstanding, cpuOutstanding int64
 	outstandingJobs := 0
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	s.admitRegistryMu.Unlock()
 	if queue != nil {
 		queue.mu.Lock()

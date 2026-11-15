@@ -18,7 +18,7 @@ import (
 // AIRA-247 fail-fast. These tests pin the four load-bearing properties and each
 // names the mutation it reds against:
 //   - a tripped slice REJECTS every queued waiter (would otherwise be granted);
-//   - the latch is DURABLE across a queue prune (a queue-level flag would evaporate);
+//   - the latch is DURABLE: it outlives the population it empties;
 //   - a real-cgroup daemon NEVER acts on a trip (the cross-session safety gate);
 //   - the sweep signals the SIBLINGS but SKIPS the trigger (which keeps its verdict).
 
@@ -101,7 +101,7 @@ func TestFailfastLatchSurvivesQueuePrune(t *testing.T) {
 	tripped := queue.failfastTripped
 	queue.mu.Unlock()
 	if !tripped {
-		t.Fatal("a queue rebuilt after a fail-fast trip must be born tripped (durable Server latch); mutation: queue-create copy removed → a late leg is admitted after the trip pruned the queue")
+		t.Fatal("a request queued after a fail-fast trip must be refused (durable latch); mutation: the trip latches only an existing queue → a late leg is admitted")
 	}
 }
 

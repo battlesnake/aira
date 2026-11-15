@@ -50,11 +50,11 @@ func (s *Server) confineFailfast(args map[string]any) core.Response {
 // after that handler has confirmed shim mode — the box daemon never trips (the
 // cross-session safety gate lives in the caller). Two effects:
 //
-//  1. The "no new tasks admitted" half. The DURABLE Server latch is set (it
-//     outlives any single sliceQueue, since pruneAdmitQueue deletes an emptied
-//     queue and the sweep below empties this one), the current queue's copy is
-//     set, and the evaluator is signalled — its next pass rejects every queued
-//     waiter with E_ADMIT_FAILFAST_TRIPPED and grants nothing.
+//  1. The "no new tasks admitted" half. The queue's latch is set — creating the
+//     queue if no admission has made it yet, so a trip that lands first is not
+//     lost; the one queue outlives the population the sweep below empties
+//     (AIRA-228) — and the evaluator is signalled: its next pass rejects every
+//     queued waiter with E_ADMIT_FAILFAST_TRIPPED and grants nothing.
 //
 //  2. The "existing ones are killed" half. Every GRANTED waiter is a live confine
 //     job whose supervisor PID is encoded in its scope id (ParseConfineScopeID;
@@ -73,11 +73,13 @@ func (s *Server) confineFailfast(args map[string]any) core.Response {
 // gate the evaluator and every admit path.
 func (s *Server) tripFailfast(path, triggerScopeID string) int {
 	s.admitRegistryMu.Lock()
-	if s.failfastTripped == nil {
-		s.failfastTripped = make(map[string]bool)
+	// Only a ci-shim daemon reaches here, and its resolver maps every slice name
+	// onto the one sentinel path, so a refusal (a path that is not the queue's)
+	// is unreachable; it is logged rather than silently dropped all the same.
+	queue, err := s.admitQueueLocked(path)
+	if err != nil {
+		log.Printf("aira daemon: confine-failfast: trip NOT latched: %v", err)
 	}
-	s.failfastTripped[path] = true
-	queue := s.admitQueues[path]
 	var victims []int
 	if queue != nil {
 		queue.mu.Lock()

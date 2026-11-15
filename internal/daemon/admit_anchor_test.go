@@ -149,7 +149,7 @@ func TestReconnectRaceBothLockOrders(t *testing.T) {
 	t.Run("old EOF first, re-declare re-inserts fresh", func(t *testing.T) {
 		server := anchorTestServer()
 		queue, lease, connA := grantedAnchorLease(server, "CONFINE-job-3-cccc", 2*gib)
-		// A filler lease keeps the queue from being pruned (and its evaluator untouched)
+		// A filler lease keeps the queue's population alive (and its evaluator untouched)
 		// after the scope-3 lease is released, so the re-declare below lands in THIS
 		// queue deterministically with no evaluator auto-granting.
 		filler := &admitWaiter{

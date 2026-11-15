@@ -446,13 +446,13 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 // the same fullness gate and the same overrun floor as everything else, and is
 // stated here rather than hidden.
 //
-// The two admission locks are taken SEQUENTIALLY, never nested, so this cannot
-// participate in a lock-order inversion at all; the queue pointer stays valid
-// after admitRegistryMu is released, and the map is copied out so nothing is
-// read from the queue afterwards.
+// The two admission locks are taken in the one fixed order (admitRegistryMu,
+// then queue.mu), and admitRegistryMu is released before the walk; the queue
+// pointer stays valid after it is released, and the map is copied out so
+// nothing is read from the queue afterwards.
 func (s *Server) admitScopeBudgets(path string) map[string]int64 {
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	s.admitRegistryMu.Unlock()
 	if queue == nil {
 		return nil

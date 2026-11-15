@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // AIRA-228 characterisation pins. They were written against the per-slice-path
@@ -199,5 +202,186 @@ func TestAdmitDrainedQueueManagementRefusalsAreNotFound(t *testing.T) {
 	}
 	if _, _, err := server.resizeRunningConfine("/slice", "job", "1G", "session-a", false); err == nil || !strings.Contains(err.Error(), "E_CONFINE_NOT_FOUND") {
 		t.Fatalf("resize on a drained queue: err=%v, want E_CONFINE_NOT_FOUND", err)
+	}
+}
+
+// oneSliceResolver is a name-sensitive slice resolver: aira.slice (by name or by
+// its absolute path) is the daemon's own slice, and two other names resolve to
+// real but different paths. The constant "/slice" resolver most tests use would
+// make the one-slice guard vacuous.
+func oneSliceResolver(name string) (string, bool, string) {
+	switch name {
+	case "aira.slice", "/sys/fs/cgroup/aira.slice":
+		return "/sys/fs/cgroup/aira.slice", true, ""
+	case "other.slice":
+		return "/sys/fs/cgroup/other.slice", true, ""
+	case "aira.slice/child":
+		return "/sys/fs/cgroup/aira.slice/child", true, ""
+	}
+	return "", false, "slice-not-found"
+}
+
+// admitOnce drives one real admitConnection over net.Pipe and returns its frame.
+func admitOnce(t *testing.T, server *Server, args map[string]any) ResponseFrame {
+	t.Helper()
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer serverConn.Close()
+		server.admitConnection(serverConn, args)
+	}()
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatalf("read admit frame: %v", err)
+	}
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-testdeadline.After(5 * time.Second):
+		t.Fatal("admit handler did not return")
+	}
+	return frame
+}
+
+// verifies: AIRA-228 — the one-slice guard. A request whose slice resolves
+// anywhere but the daemon's own slice is refused fail-closed (the stable
+// E_DAEMON_UNAVAILABLE, or U_ADMIT_EXCLUSIVE_UNESTABLISHED for an exclusive
+// request) and nothing is queued; aira.slice by name or by path is admitted.
+// Mutation: delete the guard in admitConnection -> the other-slice request
+// builds a queue for its own slice and is granted.
+func TestAdmitRefusesARequestForAnotherSlice(t *testing.T) {
+	server := func(t *testing.T) *Server {
+		var maximum atomic.Int64
+		maximum.Store(1 << 40)
+		s := admitTestServer(&maximum)
+		s.admitResolveSlice = oneSliceResolver
+		t.Cleanup(func() { retireAdmitQueues(s) })
+		return s
+	}
+	args := func(t *testing.T, slice string, exclusive bool) map[string]any {
+		a := validAdmitArgs(1<<20, 1000)
+		a["slice"] = slice
+		if exclusive {
+			// An exclusive request must carry a complete identity tuple.
+			scope := exclusiveScopeID(t, "bench", 4242)
+			delete(a, "pinned")
+			a["exclusive"] = true
+			a["scope_id"] = scope
+			a["name"] = "bench"
+			a["owner"] = exclusiveScopeOwner(scope)
+		}
+		return a
+	}
+
+	for _, test := range []struct {
+		slice     string
+		exclusive bool
+		wantCode  string
+	}{
+		{"other.slice", false, CodeUnavailable},
+		{"aira.slice/child", false, CodeUnavailable},
+		{"other.slice", true, CodeAdmitExclusiveUnestablished},
+	} {
+		t.Run(test.slice, func(t *testing.T) {
+			s := server(t)
+			frame := admitOnce(t, s, args(t, test.slice, test.exclusive))
+			if frame.OK || frame.Code != test.wantCode || !strings.Contains(frame.Error, admitSliceNotServed) {
+				t.Fatalf("a request for %s must be refused %s (%s): OK=%v code=%q error=%q", test.slice, test.wantCode, admitSliceNotServed, frame.OK, frame.Code, frame.Error)
+			}
+			if admitQueueCreated(s) {
+				t.Fatalf("a refused request for %s built an admission queue", test.slice)
+			}
+		})
+	}
+
+	for _, slice := range []string{"aira.slice", "/sys/fs/cgroup/aira.slice"} {
+		t.Run("served "+slice, func(t *testing.T) {
+			frame := admitOnce(t, server(t), args(t, slice, false))
+			if grant := admitGrantData(t, frame); grant.State != "immediate" {
+				t.Fatalf("a request for %s must be admitted: grant=%+v", slice, grant)
+			}
+		})
+	}
+
+	t.Run("daemon slice unresolvable", func(t *testing.T) {
+		s := server(t)
+		s.admitResolveSlice = func(name string) (string, bool, string) {
+			if name == "other.slice" {
+				return "/sys/fs/cgroup/other.slice", true, ""
+			}
+			return "", false, "slice-not-found"
+		}
+		frame := admitOnce(t, s, args(t, "other.slice", false))
+		if frame.OK || frame.Code != CodeUnavailable || !strings.Contains(frame.Error, admitSliceNotServed) {
+			t.Fatalf("with its own slice unresolvable the daemon must refuse: OK=%v code=%q error=%q", frame.OK, frame.Code, frame.Error)
+		}
+		if admitQueueCreated(s) {
+			t.Fatal("a refused request built an admission queue")
+		}
+	})
+
+	t.Run("shim mode serves any slice name", func(t *testing.T) {
+		s := shimTestServer(t, 1<<30)
+		t.Cleanup(func() { retireAdmitQueues(s) })
+		frame := admitOnce(t, s, args(t, "any-name.slice", false))
+		if grant := admitGrantData(t, frame); grant.State != "immediate" {
+			t.Fatalf("a ci-shim daemon maps every slice name onto its one sentinel: grant=%+v", grant)
+		}
+	})
+}
+
+// verifies: AIRA-228 — the backstop behind the guard. Every entry into the queue
+// (a fresh admission, a re-declare, a worker lease, a fail-fast trip) goes
+// through admitQueueLocked, which refuses a path that is not the queue's own
+// with a coded error rather than queueing it against the wrong ledger or
+// panicking. Mutation: drop the path check in admitQueueLocked -> the second
+// request joins the first slice's queue.
+func TestAdmitQueueRefusesASecondSlicePath(t *testing.T) {
+	server := manualQueueServer(1<<40, time.Unix(1_000_000, 0))
+	queue, first := enqueueOn(t, server, "/sys/fs/cgroup/aira.slice", 10)
+
+	_, waiter, code, err := server.enqueueAdmitInternal("/sys/fs/cgroup/other.slice", 10, "", 0, false, admitRequest{})
+	if err == nil || waiter != nil || code != CodeUnavailable || !strings.Contains(err.Error(), admitSliceNotServed) {
+		t.Fatalf("a second slice path must be refused %s (%s): waiter=%v code=%q err=%v", CodeUnavailable, admitSliceNotServed, waiter, code, err)
+	}
+	_, waiter, code, err = server.enqueueReDeclare("/sys/fs/cgroup/other.slice", 10, "redeclare", admitRequest{scopeID: "CONFINE-x-1-a", peerSameUID: true})
+	if err == nil || waiter != nil || code != CodeUnavailable {
+		t.Fatalf("a re-declare for a second slice path must be refused %s: waiter=%v code=%q err=%v", CodeUnavailable, waiter, code, err)
+	}
+	queue.mu.Lock()
+	waiters := len(queue.waiters)
+	queue.mu.Unlock()
+	if waiters != 1 {
+		t.Fatalf("the refused requests changed the queue: %d waiter(s), want 1", waiters)
+	}
+	server.admitRegistryMu.Lock()
+	same := server.admitQueue == queue && queue.path == "/sys/fs/cgroup/aira.slice"
+	server.admitRegistryMu.Unlock()
+	if !same {
+		t.Fatal("the refused requests replaced or retargeted the queue")
+	}
+	server.releaseAdmitWaiter(queue, first)
+}
+
+// verifies: AIRA-228 — an idle queue's evaluator pass reads nothing. The queue
+// now outlives its population, so its evaluator ticks while nothing is queued;
+// a pass over nobody must not read the slice's memory files. Mutation: drop the
+// empty-queue early return -> the idle pass reads the slice memory.
+func TestAdmitIdleEvaluatorPassReadsNoSliceMemory(t *testing.T) {
+	server := manualQueueServer(100, time.Unix(1_000_000, 0))
+	var reads atomic.Int64
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		reads.Add(1)
+		return 0, 100, 0, true, ""
+	}
+	queue, waiter := enqueueOn(t, server, "/slice", 10)
+	server.evaluateAdmitQueue(queue)
+	server.releaseAdmitWaiter(queue, waiter)
+	before := reads.Load()
+	server.evaluateAdmitQueue(queue)
+	if after := reads.Load(); after != before {
+		t.Fatalf("an idle pass read the slice memory %d time(s)", after-before)
 	}
 }

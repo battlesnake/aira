@@ -36,7 +36,7 @@ func (s *Server) pushQueuedConfine(path, selector, callerOwner string, steal boo
 		return runner.ConfineFrontResult{}, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: confine-front requires one selector")
 	}
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
 		return runner.ConfineFrontResult{}, fmt.Errorf("%s: selector %q matched no queued confine job (nothing is waiting for admission)", runner.CodeConfineNotFound, selector)

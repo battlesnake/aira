@@ -21,32 +21,31 @@ func formatInt64(value int64) string {
 // queue registry directly, so the registry's shape can change without every
 // test that needs a hand-built queue changing with it.
 
-// registerAdmitQueue installs a hand-built queue as the server's admission queue
-// for queue.path, under the lock the daemon itself uses, so admitSliceSnapshot
-// resolves it instead of returning the absent-queue zero.
+// registerAdmitQueue installs a hand-built queue as the server's admission
+// queue, under the lock the daemon itself uses, so admitSliceSnapshot resolves
+// it instead of returning the absent-queue zero.
 func registerAdmitQueue(server *Server, queue *sliceQueue) {
 	server.admitRegistryMu.Lock()
 	defer server.admitRegistryMu.Unlock()
-	if server.admitQueues == nil {
-		server.admitQueues = map[string]*sliceQueue{}
-	}
-	server.admitQueues[queue.path] = queue
+	server.admitQueue = queue
 }
 
-// admitQueueAtLocked returns the server's admission queue for path, or nil when
-// it has none. admitRegistryMu must be held.
+// admitQueueAtLocked returns the server's admission queue when it serves path,
+// whether or not it holds anything, else nil. admitRegistryMu must be held.
 func admitQueueAtLocked(server *Server, path string) *sliceQueue {
-	return server.admitQueues[path]
+	if queue := server.admitQueue; queue != nil && queue.path == path {
+		return queue
+	}
+	return nil
 }
 
-// allAdmitQueuesLocked returns every admission queue the server holds.
-// admitRegistryMu must be held.
+// allAdmitQueuesLocked returns the server's admission queue, if it has one, as
+// a list. admitRegistryMu must be held.
 func allAdmitQueuesLocked(server *Server) []*sliceQueue {
-	queues := make([]*sliceQueue, 0, len(server.admitQueues))
-	for _, queue := range server.admitQueues {
-		queues = append(queues, queue)
+	if server.admitQueue == nil {
+		return nil
 	}
-	return queues
+	return []*sliceQueue{server.admitQueue}
 }
 
 // admitQueueCreated reports whether the server has created an admission queue at
@@ -55,7 +54,7 @@ func allAdmitQueuesLocked(server *Server) []*sliceQueue {
 func admitQueueCreated(server *Server) bool {
 	server.admitRegistryMu.Lock()
 	defer server.admitRegistryMu.Unlock()
-	return len(server.admitQueues) != 0
+	return server.admitQueue != nil
 }
 
 // liveAdmitQueueCount counts the admission queues that still hold a waiter or a
@@ -63,19 +62,14 @@ func admitQueueCreated(server *Server) bool {
 func liveAdmitQueueCount(server *Server) int {
 	server.admitRegistryMu.Lock()
 	defer server.admitRegistryMu.Unlock()
-	live := 0
-	for _, queue := range server.admitQueues {
-		queue.mu.Lock()
-		if len(queue.waiters) != 0 {
-			live++
-		}
-		queue.mu.Unlock()
+	if server.liveAdmitQueueLocked() != nil {
+		return 1
 	}
-	return live
+	return 0
 }
 
 // retireAdmitQueues is the shutdown-time retirement Serve runs once every
 // connection has drained.
 func retireAdmitQueues(server *Server) {
-	server.pruneAdmitRegistry()
+	server.retireAdmitQueue()
 }
