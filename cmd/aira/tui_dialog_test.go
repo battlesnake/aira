@@ -387,12 +387,24 @@ func dialogInterior(t *testing.T, runtime *tuiRuntime, screen tcell.SimulationSc
 func TestPaletteResultKeepsVerdictsAndInventsNothing(t *testing.T) {
 	report, _ := json.Marshal(map[string]any{"Verdict": "unevaluated", "Code": "U_GATE_SET_EMPTY", "Results": []any{}})
 	verdict := classifyPaletteDispatch(paletteDispatchAttempt{Response: core.Response{OK: true, Code: "UNEVALUATED", RawData: report}})
-	if verdict.Outcome != paletteApplied || !strings.Contains(verdict.Text, "VERDICT UNEVALUATED: ") ||
-		!strings.Contains(verdict.Text, "not a pass and not a fail") || !strings.Contains(verdict.Text, "Code: U_GATE_SET_EMPTY") {
+	head, _, _ := strings.Cut(verdict.Text, "\n")
+	if verdict.Outcome != paletteApplied || head != "VERDICT UNEVALUATED: the daemon could not establish a result, so it is not a pass." ||
+		!strings.Contains(verdict.Text, "Code: U_GATE_SET_EMPTY") {
 		t.Fatalf("verdict reply = %#v", verdict)
 	}
 	if strings.Contains(verdict.Text, "malformed") || strings.Contains(verdict.Text, "APPLIED") {
 		t.Fatalf("verdict reply worded as something else: %q", verdict.Text)
+	}
+	// UNEVALUATED is also the code of a check that established a fail and could
+	// not establish the rest (core.Do; exit 1): the headline keeps that fail and
+	// never says "not a fail".
+	mixed := store.CheckReport{Verdict: "fail", Unevaluated: true,
+		Findings:            []store.CheckFinding{{Code: "E_RELATION_CYCLE", Subject: "AIRA-1", Kind: "error"}},
+		UnevaluatedFindings: []store.CheckFinding{{Code: "U_GATE_RUN_MISSING", Subject: "AIRA-2", Kind: "unevaluated"}}}
+	mixedResult := classifyPaletteDispatch(paletteDispatchAttempt{Response: core.Response{OK: true, Code: "UNEVALUATED", Data: mixed}})
+	if mixedHead, _, _ := strings.Cut(mixedResult.Text, "\n"); mixedHead != "VERDICT UNEVALUATED: the result is a fail, and the daemon could not establish the rest." ||
+		strings.Contains(mixedResult.Text, "not a fail") || !strings.Contains(mixedResult.Text, "• AIRA-1: E_RELATION_CYCLE") {
+		t.Fatalf("a fail-plus-unevaluated report loses its fail:\n%s", mixedResult.Text)
 	}
 
 	// A verdict's reason sits in the report's nested results or findings: each

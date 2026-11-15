@@ -55,7 +55,11 @@ behaviour. Client-only change.
   to the terminal less a one-cell margin; the body is what shrinks when rows run
   short, so the form, the notice and the hint keep their rows.
 - `cmd/aira/tui_result.go`: the one reply formatter. First line: `APPLIED: the
-  daemon accepted the request.`, `VERDICT <PASS|FAIL|UNEVALUATED>: <meaning>.` or
+  daemon accepted the request.`, `VERDICT <PASS|FAIL|UNEVALUATED>: <meaning>.` (an
+  UNEVALUATED reply means "not a pass", never "not a fail": a check that
+  established a fail and could not establish the rest also carries UNEVALUATED,
+  exit 1, and then reads `the result is a fail, and the daemon could not
+  establish the rest`, from the report's own `verdict`) or
   `REJECTED: the daemon refused the request.` plus the message exactly as the CLI
   prints it (`CODE: message`). Then one line per field the reply carries:
   `Name` (with owner), `Id`, `Status`, `Code`, `Message`, `Reason`, `Error`,

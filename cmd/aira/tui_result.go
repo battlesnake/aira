@@ -20,13 +20,19 @@ import (
 var verdictMeaning = map[string]string{
 	"PASS":        "the result is a pass",
 	"FAIL":        "the result is a fail",
-	"UNEVALUATED": "the daemon could not establish a result, so it is not a pass and not a fail",
+	"UNEVALUATED": "the daemon could not establish a result, so it is not a pass",
 }
 
-// appliedResult words a reply the daemon answered with OK or a verdict.
+// appliedResult words a reply the daemon answered with OK or a verdict. A
+// check that established a fail and could not establish the rest also carries
+// UNEVALUATED (core.Do, exit 1): its report's own verdict keeps the fail.
 func appliedResult(response core.Response, data json.RawMessage) paletteResult {
 	head := "APPLIED: the daemon accepted the request."
 	if meaning, ok := verdictMeaning[response.Code]; ok {
+		var fields map[string]json.RawMessage
+		if response.Code == "UNEVALUATED" && json.Unmarshal(data, &fields) == nil && strings.EqualFold(replyString(fields, "verdict"), "fail") {
+			meaning = "the result is a fail, and the daemon could not establish the rest"
+		}
 		head = "VERDICT " + response.Code + ": " + meaning + "."
 	}
 	return paletteResult{Outcome: paletteApplied, Text: replyText(head, data, response.Warnings), Details: rawReply(response)}
