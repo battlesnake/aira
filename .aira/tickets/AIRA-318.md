@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-318","project":"aira","title":"Peak-history estimator learns from cgroup memory.peak, which counts page cache: a cache-heavy job ratchets its reserve 15% per run","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":"later","labels":["admission","confine"],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-318","project":"aira","title":"Peak-history estimator learns from cgroup memory.peak, which counts page cache: a cache-heavy job ratchets its reserve 15% per run","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":"later","labels":["admission","confine"],"hold":true,"relations":[{"kind":"relates","from":"AIRA-347","to":"AIRA-318"}]}
 ---
 Captured from the AIRA-314 plan review/gate (2026-10-25). Pre-existing, not built by AIRA-314.
 

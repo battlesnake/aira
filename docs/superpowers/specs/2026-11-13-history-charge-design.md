@@ -995,6 +995,11 @@ Follow-ups, deliberately not in this plan:
 - Live per-job usage correction, only if the enforce data says the discount is not enough.
 - Held-back headroom for the fast lane, only if its wait target is missed.
 - aitest worker pools keep their own cost-ranked ordering (AIRA-261).
+- (2026-11-15) The same booking/cap split for **auto-sized** jobs (book the estimate, cap above
+  it): [`2026-11-15-cap-headroom-design.md`](2026-11-15-cap-headroom-design.md). Two of its
+  findings bear on 5.2: OOM steering, which 5.2 cites as biasing the victim, is **off** on this box
+  (`AIRA_DAEMON_OOM_STEER_MODE` unset, default off), so 324's enforce step should switch it on
+  first; and the grant-time bound of 5.2 is restated there for both features together.
 - (323 deferrals) Showing `wall_ms`/`wait_ms` in `confine --budget`, `confine --dump` or
   `aira top`; timing on the `aira confine-report` pool face; recording failed runs (AIRA-264
   decided against it); a printed notice when the re-send fires; any command key (hand-off

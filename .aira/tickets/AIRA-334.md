@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-334","project":"aira","title":"confine trailer hints: drop the non-OOM 'reached N% of the reserved cap' line, skip the over-reserve hint on an escaped scope, say the suggestion is from one run","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-334","project":"aira","title":"confine trailer hints: drop the non-OOM 'reached N% of the reserved cap' line, skip the over-reserve hint on an escaped scope, say the suggestion is from one run","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[{"kind":"relates","from":"AIRA-347","to":"AIRA-334"}]}
 ---
 
 

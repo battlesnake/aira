@@ -1,0 +1,83 @@
+# Output of docs/dev/aira-cap-headroom-replay.py
+# snapshot: sqlite3 .backup of ~/.local/state/aira/state.db taken 2026-11-15T14:26Z; 234,630 confine rows; max(at) 2026-11-15T12:26:52.839079367Z
+# command: aira confine --name cap-headroom-replay2 --memory-reserve 384M -- python3 -I docs/dev/aira-cap-headroom-replay.py --db ~/tmp/aira-cap-headroom-data/state-copy.db
+# exit code: 0 (confine trailer: terminated-by=normal peak-rss=233800K)
+
+PART 1  the quoted evidence, re-derived (all cap sources)
+  confine rows 234630; OOM rows 4425; OOM rows with a budget 4210
+  distinct signatures among all OOM rows 3708; among OOM rows with a budget 3517
+  OOM rows (with budget) whose signature has a clean run recorded: 2795 (66.4%)
+    clean max peak <= 1.5x killed budget: 1510 (54.0%) of those
+    clean max peak <= 2.0x killed budget: 2084 (74.6%) of those
+    clean max peak <= 4.0x killed budget: 2648 (94.7%) of those
+
+PART 2  split by cap source, clean-run timing and cap, and (auto) estimator rung
+  cap:auto:daemon-reserve      OOM rows  2355, with a clean run 1713 (72.7%); <=1.5x 875 (37.2%) <=2.0x 1259 (53.5%) <=4.0x 1604 (68.1%)
+  cap:operator:--memory-reserve OOM rows  1816, with a clean run 1064 (58.6%); <=1.5x 622 (34.3%) <=2.0x 810 (44.6%) <=4.0x 1027 (56.6%)
+  cap:operator:--memory-max    OOM rows    34, with a clean run 15 (44.1%); <=1.5x 10 (29.4%) <=2.0x 12 (35.3%) <=4.0x 14 (41.2%)
+  (other)                      OOM rows     5, with a clean run 3 (60.0%); <=1.5x 3 (60.0%) <=2.0x 3 (60.0%) <=4.0x 3 (60.0%)
+  auto OOM rows: share of ALL auto OOM rows 'saved' at k (largest clean peak of the signature <= k x killed budget)
+    subset                               rows | k=1.5  k=2.0  k=3.0  k=4.0
+    any clean run (as quoted)            2355 |  37.2%   53.5%   64.9%   68.1%
+    clean runs BEFORE the kill only      2355 |  25.4%   25.6%   25.9%   26.0%
+    clean runs AFTER the kill only       2355 |  34.1%   50.3%   61.7%   65.0%
+    clean, not at its own cap (<95%)     2355 |  36.0%   51.2%   61.4%   64.2%
+    (no clean run at all: 642 (27.3%) of auto OOM rows: unknowable, counted as not saved)
+    NOTE: a clean peak at or below the killed cap says nothing about the killed run (its need was
+    > cap), so the rows above are NOT the estimate. The three-way split below is.
+  three-way split of auto OOM rows by the largest clean peak P of the signature (any time):
+    within k   = P in (cap, k x cap]  -> lower bound of kills saved
+    beyond k   = P > k x cap          -> a mode of this command does not fit k x cap
+    undetermined = no clean P > cap   -> need censored; upper bound counts these as saved
+    population                      rows | k=1.5 within/beyond/undet | k=2.0 within/beyond/undet | k=3.0 within/beyond/undet
+    all auto                        2355 |  28.8%  35.6%  35.6% |  45.1%  19.3%  35.6% |  56.6%   7.8%  35.6%
+    history rungs (own/max/oom-esc)   760 |  38.0%  37.6%  24.3% |  53.7%  22.0%  24.3% |  65.8%   9.9%  24.3%
+    no retained earlier row         1595 |  24.4%  34.6%  41.0% |  41.0%  18.0%  41.0% |  52.2%   6.8%  41.0%
+  rung (walk-forward over RETAINED rows; 'no retained earlier row' includes evicted history):
+    no-earlier-row  1595
+    own-max          110
+    estimate:max     382
+    oom-escalated    268
+    no-earlier-row auto OOM rows killed at exactly 1 GiB (the client default): 978
+    auto OOM streaks ended by a clean run, by length: {1: 575, 2: 60, 3: 3, 4: 2}
+
+PART 3  AIRA-318 interaction: clean auto rows at >= 95% of their cap
+  clean auto rows 88593; at >= 95% of cap 1996 (2.3%); signatures 1715; signatures with >= 2 such rows 205
+  clean auto rows at >= 50% of cap: 16724 (18.9%)
+  clean auto rows at >= 75% of cap: 9357 (10.6%)
+  clean auto rows at >= 90% of cap: 2814 (3.2%)
+  consecutive at-cap clean runs of one signature: 150 pairs, cap ratio median 1.150, p90 1.151
+
+PART 4  downside: 20 concurrent auto jobs since 2026-10-20 (33013 jobs, 1488 OOM-killed)
+  use under k: a clean run's peak unchanged (variant 'cache': a run at >= 95% of its cap fills k x C);
+  an OOM run uses min(k x C, largest clean peak of its signature), or k x C when none is known.
+  k      cache  | mixed P(>1) p99 max | burst P(>1) p99 max | OOM-cmd burst P(>1) p99 max  (38 / 53 groups)
+  1.0    no     |  0.000  0.56  0.71 |  0.000  0.72  0.82 |  0.000  0.92  1.00
+  1.0    yes    |  0.000  0.56  0.66 |  0.000  0.71  0.81 |  0.000  0.92  1.00
+  1.5    no     |  0.000  0.59  0.75 |  0.000  0.76  0.88 |  0.018  1.37  1.50
+  1.5    yes    |  0.000  0.64  0.81 |  0.001  0.81  1.06 |  0.018  1.37  1.50
+  2.0    no     |  0.000  0.65  0.83 |  0.000  0.81  0.96 |  0.024  1.87  2.00
+  2.0    yes    |  0.001  0.79  1.16 |  0.005  0.95  1.24 |  0.025  1.82  1.96
+  3.0    no     |  0.000  0.76  0.96 |  0.005  0.95  1.45 |  0.022  2.54  2.82
+  3.0    yes    |  0.011  1.02  1.52 |  0.040  1.23  1.76 |  0.070  2.62  2.90
+  4.0    no     |  0.003  0.86  1.13 |  0.014  1.05  1.81 |  0.033  3.26  3.60
+  4.0    yes    |  0.033  1.26  1.87 |  0.079  1.50  2.16 |  0.121  3.30  3.63
+  20 mixed auto jobs book a median 20.6 GiB (p90 24.5): the ledger fills with ~43 such jobs at a 45 GiB ceiling
+
+  stacked with AIRA-324 (pinned charge 0.8 x pin): 86854 jobs, 53841 pinned (62%)
+  k      324   | mixed P(>1) p99 max | burst P(>1) p99 max  (81 groups)
+  1.0    off   |  0.000  0.62  0.73 |  0.000  0.71  0.83
+  1.0    on    |  0.000  0.74  0.91 |  0.000  0.87  1.01
+  2.0    off   |  0.000  0.64  0.81 |  0.000  0.72  0.99
+  2.0    on    |  0.000  0.77  1.06 |  0.001  0.89  1.07
+  3.0    off   |  0.000  0.67  0.89 |  0.000  0.77  0.97
+  3.0    on    |  0.000  0.79  0.91 |  0.004  0.93  1.27
+
+PART 5  page-cache ratchet, booking C over six runs from C=1 GiB (cache fills the limit)
+  k=1 today    1.15 1.32 1.52 1.75 2.01 2.31
+  k=1 318-cap  1.00 1.00 1.00 1.00 1.00 1.00
+  k=1 booking  1.00 1.00 1.00 1.00 1.00 1.00
+  k=2 today    2.30 5.29 12.17 27.98 64.36 148.04
+  k=2 318-cap  2.00 4.00 8.00 16.00 32.00 64.00
+  k=2 booking  1.00 1.00 1.00 1.00 1.00 1.00
+
