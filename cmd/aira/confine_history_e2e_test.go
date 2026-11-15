@@ -79,7 +79,9 @@ func TestConfineDumpAndBudgetCompleteOnAHistoryLargerThanOneFrame(t *testing.T) 
 
 	stdout.Reset()
 	stderr.Reset()
-	if exit := runWithInput([]string{"confine", "--budget", "--json"}, &stdout, &stderr, strings.NewReader("")); exit != 0 {
+	// AIRA-336: every seeded subject has one sample (unevaluated), outside the
+	// default actionable selection, so the whole history is asked for.
+	if exit := runWithInput([]string{"confine", "--budget", "--direction", "all", "--limit", "0", "--json"}, &stdout, &stderr, strings.NewReader("")); exit != 0 {
 		t.Fatalf("budget exit=%d stdout=%.300q stderr=%.300q", exit, stdout.String(), stderr.String())
 	}
 	var envelope struct {

@@ -2142,12 +2142,23 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// discovery would answer E_CONFIG_MISSING in most of the directories an
 		// operator sizing a job is standing in — which is exactly where the four
 		// sessions that motivated the ticket were standing.
-		"confine-budget": {Name: "confine-budget", Usage: "confine --budget [--slice S] [--owner ID] [--json]", Args: []ArgSpec{
+		//
+		// AIRA-336: bounded by default. The client selects while it joins the
+		// daemon's pages and returns {subjects,total,returned,truncated,
+		// distribution}; the whole history (180k subjects, 100 MB on one line,
+		// measured 2026-11-14) is --direction all --limit 0.
+		"confine-budget": {Name: "confine-budget", Usage: "confine --budget [--direction actionable|under|over|well|acceptable|unevaluated|all] [--limit N] [--grep TEXT] [--slice S] [--owner ID] [--json]", Args: []ArgSpec{
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("owner", false, false, "Caller owner identity"),
-		}, MCPTool: "aira_confine_budget", Summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change.", Safety: SafetyRead, Include: true, Example: []string{}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			stringSpec("direction", false, false, "Directions to list (default actionable = under-provisioned then over-provisioned); every direction is still counted in distribution", store.ConfineBudgetDirectionChoices()...),
+			stringSpec("limit", false, false, fmt.Sprintf("Rows to return, worst first (default %d; 0 = every selected row); hidden rows are counted in total/truncated", store.ConfineBudgetDefaultLimit)),
+			stringSpec("grep", false, false, "Literal, case-sensitive substring of the rendered subject (kind / argv); narrows total and distribution too"),
+		}, MCPTool: "aira_confine_budget", Summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change; the worst 50 actionable subjects by default.", Safety: SafetyRead, Include: true, Example: []string{}, Run: func(_ context.Context, args *argAccessor) (any, error) {
 			_ = stringArg(args, "slice")
 			_ = stringArg(args, "owner")
+			_ = stringArg(args, "direction")
+			_ = stringArg(args, "limit")
+			_ = stringArg(args, "grep")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-budget requires the project-less daemon transport")
 		}},
 		// AIRA (admission-counter rebuild) S18. A NEW verb, on the SAME
@@ -2586,7 +2597,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice. " + ConfinePrioritySummary, safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
-		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change", safety: SafetyRead, example: []string{}},
+		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change; the worst 50 actionable subjects by default", safety: SafetyRead, example: []string{}},
 		// AIRA (admission-counter rebuild) S18. CLI-only (see the Include
 		// exclusion list below): the target file belongs to the invoking
 		// process's own filesystem.

@@ -278,10 +278,16 @@ func budgetRow(subject, direction string, observed, budget *int64, unevaluated b
 	}
 }
 
-func dispatchBudget(t *testing.T, peer *historyPeer) runner.ConfineBudgetResult {
+// dispatchBudget joins the peer's pages; selection is direction/limit/grep
+// pairs added to the request (AIRA-336), none = the default selection.
+func dispatchBudget(t *testing.T, peer *historyPeer, selection ...string) runner.ConfineBudgetResult {
 	t.Helper()
+	args := map[string]any{"owner": "session-a"}
+	for i := 0; i+1 < len(selection); i += 2 {
+		args[selection[i]] = selection[i+1]
+	}
 	response := peer.dispatcher().Dispatch(context.Background(), daemon.WorktreeScope{},
-		core.Request{Verb: "confine-budget", Args: map[string]any{"owner": "session-a"}})
+		core.Request{Verb: "confine-budget", Args: args})
 	if !response.OK {
 		t.Fatalf("response = %+v", response)
 	}
@@ -313,7 +319,7 @@ func TestJoinedBudgetIsResortedAndKeepsHonesty(t *testing.T) {
 				budgetRow("d-nomeasure", "unevaluated", nil, nil, true),
 			}},
 	}}
-	result := dispatchBudget(t, peer)
+	result := dispatchBudget(t, peer, "direction", "all", "limit", "0")
 	var order []string
 	for _, row := range result.Subjects {
 		order = append(order, strings.TrimPrefix(row.Subject, "confine / "))

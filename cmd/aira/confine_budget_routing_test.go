@@ -122,7 +122,7 @@ func TestRenderConfineBudgetUnevaluatedDoesNotClaimAnEmptyHistory(t *testing.T) 
 	exit := renderConfineBudgetResponse(core.Response{OK: true, Code: "UNEVALUATED", Exit: 3, Data: runner.ConfineBudgetResult{
 		Verdict: "unevaluated",
 		Reason:  "the daemon is unreachable, and it is the only holder of the peak-RSS history",
-	}}, &stdout, &stderr)
+	}}, "", &stdout, &stderr)
 	if exit != 3 {
 		t.Fatalf("exit=%d, want 3 (unevaluated)", exit)
 	}

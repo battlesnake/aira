@@ -144,6 +144,18 @@ type ConfineBudgetResult struct {
 	Reason   string             `json:"reason,omitempty"`
 	Scope    string             `json:"scope"`
 	Subjects []ConfineBudgetRow `json:"subjects"`
+	// AIRA-336. The selection envelope the CLIENT writes after joining every
+	// page: the daemon never sets these, and an unevaluated answer carries none
+	// of them (absent, never a fabricated zero). Total is every subject matching
+	// --grep (every subject without it) and Distribution counts those same
+	// subjects by direction, so its counts sum to Total. Returned is
+	// len(Subjects) (the selected --direction set capped at --limit), and
+	// Truncated reports Returned < Total: a hidden row is always counted, never
+	// silently dropped.
+	Total        *int           `json:"total,omitempty"`
+	Returned     *int           `json:"returned,omitempty"`
+	Truncated    *bool          `json:"truncated,omitempty"`
+	Distribution map[string]int `json:"distribution,omitempty"`
 	// Next is set only on a PAGED reply (AIRA-280), exactly when at least one more
 	// subject existed when the page was read. The CLI joins the pages, so a joined
 	// result never carries it. Pages are separate reads, not one snapshot: a

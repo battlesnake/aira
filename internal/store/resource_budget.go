@@ -437,16 +437,46 @@ func resourceBudgetCell(verdict ResourceBudgetVerdict) GaugeCell {
 
 // SortResourceBudgetVerdicts orders worst-first for an operator surface:
 // under-provisioned (a job dies), then over-provisioned (a job holds headroom
-// eleven waiters need), then the quiet band, then unevaluated. Ties break on the
-// rendered subject so the order is stable.
+// eleven waiters need), then the quiet band, then unevaluated. Within a
+// direction the larger move first (AIRA-336): see resourceBudgetBefore. Ties
+// break on the rendered subject so the order is stable.
 func SortResourceBudgetVerdicts(verdicts []ResourceBudgetVerdict) {
 	sort.SliceStable(verdicts, func(i, j int) bool {
-		if resourceBudgetDirectionRank(verdicts[i].Direction) != resourceBudgetDirectionRank(verdicts[j].Direction) {
-			return resourceBudgetDirectionRank(verdicts[i].Direction) < resourceBudgetDirectionRank(verdicts[j].Direction)
-		}
-		return renderResourceBudgetSubject(verdicts[i].Kind, verdicts[i].Signature) <
-			renderResourceBudgetSubject(verdicts[j].Kind, verdicts[j].Signature)
+		a, b := verdicts[i], verdicts[j]
+		return resourceBudgetBefore(
+			a.Direction, resourceBudgetGap(a.CurrentBudget, a.RecommendedBudget), renderResourceBudgetSubject(a.Kind, a.Signature),
+			b.Direction, resourceBudgetGap(b.CurrentBudget, b.RecommendedBudget), renderResourceBudgetSubject(b.Kind, b.Signature))
 	})
+}
+
+// resourceBudgetBefore is the one worst-first order both sorts and the bounded
+// selection share: direction rank first, then the larger gap, then the rendered
+// subject. AIRA-336: a capped report (the first 50 of thousands) must show the
+// worst rows, and alphabetical order within a direction would show arbitrary
+// ones.
+func resourceBudgetBefore(directionA string, gapA int64, subjectA string, directionB string, gapB int64, subjectB string) bool {
+	if rankA, rankB := resourceBudgetDirectionRank(directionA), resourceBudgetDirectionRank(directionB); rankA != rankB {
+		return rankA < rankB
+	}
+	if gapA != gapB {
+		return gapA > gapB
+	}
+	return subjectA < subjectB
+}
+
+// resourceBudgetGap is how far the recommendation would move the budget, in
+// bytes: the shortfall of an under-provisioned subject, the reclaimable headroom
+// of an over-provisioned one. It is -1, sorting after every real gap, when
+// either figure is absent (the classifier withheld the recommendation, or the
+// direction has none): an absent figure is never treated as a zero gap.
+func resourceBudgetGap(budget, recommended *int64) int64 {
+	if budget == nil || recommended == nil {
+		return -1
+	}
+	if *recommended > *budget {
+		return *recommended - *budget
+	}
+	return *budget - *recommended
 }
 
 // resourceBudgetDirectionRank is the one worst-first rank both sorts share:
@@ -470,14 +500,14 @@ func resourceBudgetDirectionRank(direction string) int {
 }
 
 // SortConfineBudgetRows orders wire rows exactly as SortResourceBudgetVerdicts
-// orders the verdicts they came from (same rank, ties on the rendered subject,
-// stable), so a client that joins paged replies reproduces the unpaged order
-// (AIRA-280). Subject is the rendered subject the daemon wrote.
+// orders the verdicts they came from (same rank, same gap, ties on the rendered
+// subject, stable), so a client that joins paged replies reproduces the unpaged
+// order (AIRA-280). Subject is the rendered subject the daemon wrote.
 func SortConfineBudgetRows(rows []runner.ConfineBudgetRow) {
-	sort.SliceStable(rows, func(i, j int) bool {
-		if resourceBudgetDirectionRank(rows[i].Direction) != resourceBudgetDirectionRank(rows[j].Direction) {
-			return resourceBudgetDirectionRank(rows[i].Direction) < resourceBudgetDirectionRank(rows[j].Direction)
-		}
-		return rows[i].Subject < rows[j].Subject
-	})
+	sort.SliceStable(rows, func(i, j int) bool { return confineBudgetRowBefore(rows[i], rows[j]) })
+}
+
+func confineBudgetRowBefore(a, b runner.ConfineBudgetRow) bool {
+	return resourceBudgetBefore(a.Direction, resourceBudgetGap(a.Budget, a.RecommendedBudget), a.Subject,
+		b.Direction, resourceBudgetGap(b.Budget, b.RecommendedBudget), b.Subject)
 }
