@@ -15,23 +15,32 @@ Reproduction: `docs/dev/aira-cap-headroom-replay.py` on a copy of the state DB (
 file); its output is committed as `docs/dev/aira-cap-headroom-replay.out.txt` with the snapshot's
 identity.
 
-**Recommendation, in one paragraph.** Build it, in two steps, and only with three conditions met.
-The rule as proposed (book C, cap L = min(k x C, physical free), k = 2) is sound for the kills it
-targets: on this box's history a proxy puts 45-81% of auto-sized OOM kills within reach of
-k = 2 (a proxy range, not bounds: the killed run's own need is censored, section 2) without raising
-any booking. But as
-written it has one silent defect: **with the current estimator it turns AIRA-318's 15%-per-run
-page-cache ratchet into a doubling per run** (section 4.1, by arithmetic, and 1,715 signatures are
-exposed), and AIRA-318's own proposed rule does not stop it at k > 1. So step 1 is a learning fix
-(store the booking per row; a clean run that reached its limit never raises the booking above the
-booking it ran under), shippable alone at k = 1, where it also closes AIRA-318's ratchet. Step 2 is
-the headroom itself. Conditions: (a) step 1 first; (b) OOM steering switched on before k > 1 is
-enforced, because it is **off on this box** and without it a slice-level OOM kills the largest job,
-not the one using headroom (this applies to AIRA-324 too, whose spec cites steering as a
-mitigation); (c) the owner decides whether cold-start jobs are included (68% of auto kills have no
-retained earlier row, section 2). Also (d): AIRA-341 (delete the p90 prior, already un-held) lands
-before k > 1, because that prior reads raw maxima across every signature and would carry
-cache-filled peaks into cold-start bookings (section 4.2).
+**Recommendation, in one paragraph.** Build it, with one change to the proposed rule and only with
+its conditions met. Book C (the estimate, unchanged); cap at **L = min(k x C, C + 1 GiB)**, k = 2.
+The owner's proposed physical-fit term (cap L at the memory physically free at grant) is decision
+D4 and is **not recommended**: it does not protect the case it was credited with (a burst of one
+command granted before any member has allocated, section 5.3), it rarely binds on this box, and an
+additive 1 GiB bound does its other job (no 20 GiB job given a 40 GiB limit) with no grant-time
+read (section 3, option G). On this box's history a proxy puts 42-78% of auto-sized OOM kills
+within reach of the recommended rule (45-81% for a plain 2C; a proxy range, not bounds: the killed
+run's own need is censored, section 2). The rule has one silent defect as proposed: **with the
+current estimator, any k > 1 turns AIRA-318's 15%-per-run page-cache ratchet into 2.3x per run**
+for a job whose page cache fills any limit (section 4.1, by arithmetic; the ratchet is running today
+on at least 136 consecutive pairs over 205 signatures, and most at-cap rows are unestablished either
+way), and AIRA-318's own proposed rule still doubles per run. So the feature carries a learning rule
+(store the booking per row; a clean run that reached its limit **while its limit was above its
+booking** never raises the booking above the booking it ran under). The learning rule is inert at
+k = 1 and is never enabled apart from the headroom: alone at k = 1 it would trade the ratchet for
+OOM kills of jobs that genuinely grew (section 4.4, measured). One accepted cost remains: a job
+whose page cache is finite and lands below 95% of its new limit steps its booking up once, by at
+most 1.15 x 0.95 x k (section 4.3). Conditions: (a) a small step 0 first: install flags for k and
+for OOM steering, which today can only be set by hand-editing the unit; (b) OOM steering switched
+on (observe, then enforce) before k > 1, because it is **off on this box** and without it a
+slice-level OOM kills the largest job, not the one using headroom (this applies to AIRA-324 too,
+whose spec cites steering as a mitigation); (c) the owner decides whether cold-start jobs are
+included (68% of auto kills have no retained earlier row, section 2); (d) AIRA-341 (delete the p90
+prior, already un-held) lands before k > 1, because that prior reads raw maxima across every
+signature and would carry cache-filled peaks into cold-start bookings (section 4.2).
 
 ## 1. The problem, restated
 
@@ -95,7 +104,9 @@ run that ever completed, and a "beyond" kill may have been a small one.
 | history rungs (own-max, estimate:max, oom-escalated) | 760 | 38.0 / 37.6 / 24.3% | **53.7 / 22.0 / 24.3%** | 65.8 / 9.9 / 24.3% |
 | no retained earlier row ("cold start") | 1,595 | 24.4 / 34.6 / 41.0% | **41.0 / 18.0 / 41.0%** | 52.2 / 6.8 / 41.0% |
 
-So at k = 2 the proxy range is 45-81% of auto kills. The category is a **retained-evidence
+So at k = 2 the proxy range is 45-81% of auto kills; under the recommended L = min(2C, C + 1 GiB)
+it is 42.3% within, 22.1% beyond, 35.6% undetermined, a range of 42-78% (output, part 6: 97.7% of
+auto kills had a cap under 2 GiB, where the 1 GiB bound costs little). The category is a **retained-evidence
 category, not the estimator's actual basis** (the basis is not stored; the real escalation can lose
 to the ordinary estimate or the own-max floor): it is reconstructed walk-forward from **retained** rows (the store keeps 20 per signature), so "no
 retained earlier row" also contains runs whose history was evicted; 978 of its 1,595 rows were
@@ -137,7 +148,7 @@ had one kill, 131 two, 10 three, 3 four and 1 five. Multi-kill creep is real
   ancestor's limit (the slice); the trailer tells them apart (`confine_linux.go:1509-1518`) but the
   row does not. A larger scope cap cannot prevent the descendant kind and may not prevent the
   ancestor kind, so the kill rate and every "saved" figure above include kills headroom would not
-  have touched. Their share is **unmeasured**; the step-2 metric counts own-limit kills only
+  have touched. Their share is **unmeasured**; the rollout metric counts own-limit kills only
   (section 8).
 
 ### 2.4 The downside: the slice running over its ceiling
@@ -176,27 +187,29 @@ is 0.89 against 0.87 for AIRA-324 alone.
 Reading it: on ordinary mixes k = 2 costs almost nothing. The risk is concentrated where it is
 expected: **many concurrent instances of a command that is already being OOM-killed**, which
 today die one by one inside their own caps and with headroom would run together into the shared
-slack. That is the case the physical-fit term and steering exist for (section 5). Coverage limits:
-draws are independent and not duration-weighted (AIRA-323's timing columns began on 2026-11-15:
-720 rows, too few to replay a timeline); the physical-fit term cannot be replayed because the store
-has no record of real use at each grant, so this table models fixed k without that term; page
-cache is reclaimable, so in the "cache" rows the filled part is not memory a kill would be needed
-to recover.
+slack. Only steering limits that case once it happens (section 5.3); no grant-time term does.
+Coverage limits: draws are independent and not duration-weighted (AIRA-323's timing columns began
+on 2026-11-15: 720 rows, too few to replay a timeline); the table models a plain k x C, and under
+the recommended L = min(k x C, C + 1 GiB) every job's use is at most its k x C figure, so the k = 2
+rows are at or above what that rule gives; the physical-fit term (D4) cannot be replayed because
+the store has no record of real use at each grant; page cache is reclaimable, so in the "cache"
+rows the filled part is not memory a kill would be needed to recover.
 
 ## 3. The greenfield minimum, and the alternatives
 
 Only this problem: "an auto-sized job is killed at its estimate while the box has free memory."
 The from-scratch minimum is **set the cap higher than the booking**: one multiplication where the
 client writes `memory.max`, with the booking untouched. Everything else in this document is either
-a consequence the minimum would get wrong (the cache ratchet, the restart booking) or a safety term
-the owner asked for (physical fit).
+a consequence the minimum would get wrong (the cache ratchet, the restart booking), a bound on the
+largest jobs (the 1 GiB term), or the means to switch it on and off (step 0).
 
 | Option | Kills avoided | Booking (capacity) cost | New machinery | Verdict |
 |---|---|---|---|---|
-| A. Fixed k only, no physical-fit term | as B | none | one grant field | the from-scratch minimum; preserves the k-bound exactly; on a busy box a big job's headroom has nothing behind it |
-| **B. k with the physical-fit term (proposed)** | proxy 45-81% of auto kills at k = 2 | none | A + one `min` with a value admission already reads | **recommended**, with step 1; the physical term is the first thing the plan gate may cut (5.1) |
+| A. Fixed k only | proxy 45-81% at k = 2 | none | one grant field | the from-scratch minimum; a 20 GiB job gets a 40 GiB limit |
+| **G. L = min(k x C, C + 1 GiB)** | proxy 42-78% at k = 2 (93.8% of A's "within" kills; C + 2 GiB keeps 99.2%) | none | A + one constant | **recommended**, with the learning rule; total headroom over all auto jobs is 0.84 of A's (most jobs are under 1 GiB), so it bounds the big jobs, not the sum |
+| B. k with the physical-fit term (owner's proposal) | at most A's | none | A + a grant-time read of real use, its fit-bound state and tests | **D4, not recommended**: every grant of a burst made before the burst allocates sees the same free figure, so it does not limit the burst (5.3); it binds only when the slice's real use is high, when the ceiling throttle already cuts admission |
 | C. Fix the estimator only: AIRA-273 A+B, AIRA-331 cold-start cap | repeat kills only; never the first kill of a size not yet seen | raises bookings: AIRA-331 alone books ~2.9x the real peak for ~30% of cold runs | key chain, window rules | dominated for kills; partly superseded (below) |
-| D. Only raise `memory.max`, never the charge | this is B | - | - | B already never changes the charge |
+| D. Only raise `memory.max`, never the charge | this is G | - | - | G already never changes the charge |
 | E. No per-job cap for auto jobs (k = infinity), slice cap + steering only | all | none | none | rejected: gives up per-job containment; a slice-level OOM kills the largest process, and steering is off here |
 | F. `memory.high` = C, `memory.max` = k x C | kills become throttling | none | one more write | rejected: swap is off in every scope, so anonymous memory above `high` cannot be reclaimed and the job stalls; sustained reclaim PSI is what trips the oomd backstop (AIRA-91 Part B) |
 
@@ -204,19 +217,24 @@ the owner asked for (physical fit).
 
 - **AIRA-331** (size an unseen argv at max(1 GiB, coarse-key prediction)): **not shown to be
   superseded.** If D1 includes cold start, the proxy puts 41-82% of cold-start kills within k = 2
-  with no booking increase, against 331's ~34% at a 2.9x booking for ~30% of cold runs; but a
+  (most were killed at the 1 GiB default, where the recommended rule equals 2C) with no booking
+  increase, against 331's ~34% at a 2.9x booking for ~30% of cold runs; but a
   doubled 1 GiB cap cannot hold a 3 GiB first run that a coarse prediction would size correctly,
-  and the two figures come from different methods. Keep 331 held and re-judge it on step 2's
+  and the two figures come from different methods. Keep 331 held and re-judge it on the k > 1
   enforce data.
 - **AIRA-273 option A** (escalate a kill to the machine-wide p90 prior): the prior is being deleted
   (AIRA-341), and headroom covers the same within-k kills without over-booking the cheap mode.
   **Option B** (remember the big mode longer than 20 rows) is **not** superseded: it is the only
-  fix for the "beyond k" 19% (bimodal ratios above k).
+  fix for the "beyond k" 19% (22% under the 1 GiB bound; bimodal ratios above the limit).
 - **Observe mode**, which AIRA-324 has: cut here. An observe mode could only log the limit it
   would have written; the effect that matters (a kill that did not happen) is visible only in
-  enforce. One knob, `k`, with 1.0 meaning exactly today.
+  enforce. One knob, `k`, with 1.0 meaning exactly today; the 1 GiB term is a constant, not a knob.
+- **The physical-fit term**, if D4 declines it: the grant-time read of real use, the handling of
+  grants earlier in the same pass, a trailer state, test H2 (cut) and the AIRA-103 argument (5.1).
+- **A headroom label in the trailer** (`k` vs `fit-bound`): cut. The client sees only C and L and
+  cannot tell why L is what it is, so it reports the two numbers and no reason (section 6).
 
-**Decisions this rests on.** D1 is open; D2 and D3 are this document's.
+**Decisions this rests on.** D1 and D4 are open (owner); D2 and D3 are this document's.
 
 - **D1 (owner): which auto grants get headroom.** (i) Every daemon-sized auto grant
   (cap-source `auto:daemon-reserve`, all rungs including the 1 GiB default and, until AIRA-341
@@ -227,15 +245,27 @@ the owner asked for (physical fit).
   what a cold run may use (2 GiB at k = 2). **Recommended: (i).**
 - **D2: the OOM escalation stays as it is.** It is 1.5 x the peak recorded at the kill
   (`admit.go:1536-1541`), and that peak is now about L, so after a kill at L = 2C the booking
-  becomes 3C and the limit 6C. The alternative, 1.5 x the killed run's booking (needs step 1's
-  column), books less but takes more kills (and see 4.2: with cache-filled clean runs the 3C floor
+  becomes 3C and the limit min(6C, 3C + 1 GiB). The alternative, 1.5 x the killed run's booking (needs the learning rule's
+  column), books less but takes more kills (and see 4.3: with cache-filled clean runs the 3C floor
   outlives the OOM row): for RANT-136's clippy (auto ~320M, cold need ~1.2G)
   the kept rule kills once (L 640M, then C 960M, L 1.92G), the alternative twice, today four
   times. The over-booking lasts while the OOM row is in the 20-row window, as today.
 - **D3: user pins never get headroom.** A `--memory-reserve` or `--memory-max` is the operator's
   stated cap; AIRA-324 discounts its booking and leaves the cap alone.
+- **D4 (owner): the physical-fit term.** (i) Not built (recommended): L = min(k x C, C + 1 GiB).
+  (ii) Also clamp L at the memory physically free at grant, as the owner proposed (specified in
+  5.1). The owner asked for (ii) so that "on a busy box L shrinks to C". What it actually does: it
+  reads the slice's real use, which does not yet include jobs granted moments earlier, so all
+  members of a fast burst see the same free figure and get the full limit; and on this box the
+  ledger is often full while real use is far lower (`aira confine --list`, 2026-11-15T14:44Z:
+  46.7 GB booked against a 46.3 GB throttled ceiling, 12 jobs queued, while the slice's
+  `memory.current` was 28.3 GB of which 13.2 GB reclaimable, and `MemAvailable` 43.7 GB; the free
+  figure would have been about 31 GB less the headroom), so it would hand almost every job its full
+  limit. It does protect a box whose real use is already high, but that is when the ceiling
+  throttle cuts new admissions anyway. The additive bound G caps each job's extra at 1 GiB on any
+  box.
 
-## 4. Step 1: what the estimator learns when the cap is above the booking
+## 4. The learning rule: what the estimator learns when the cap is above the booking
 
 ### 4.1 The counterexample
 
@@ -250,10 +280,24 @@ up to `memory.max` before reclaiming it. The next booking is 1.15 x that peak. S
 | AIRA-318's proposed rule: never above the cap it ran under | stable at 1.00 | 2, 4, 8, 16, 32 GiB (**doubles per run**) |
 | **booking rule: never above the booking it ran under** | stable at 1.00 | **stable at 1.00** |
 
-Exposure today: 1,996 clean auto rows (2.3%) sit at >= 95% of their cap, over 1,715 signatures;
-136 consecutive at-cap pairs of one signature show the ratchet running now, cap ratio median 1.150
-(output, part 3). Under k = 2 each of those signatures would hit E_ADMIT_TOO_LARGE within about
-five runs. **The rule must not be enabled at k > 1 without the booking rule.**
+Exposure today (output, part 3): 1,996 clean auto rows (2.3%) sit at >= 95% of their cap, over
+1,715 signatures, but most of them do not establish a cache-filling job. **Established:** 136
+consecutive at-cap pairs of one signature (205 signatures have two or more at-cap rows) show the
+ratchet running now, cap ratio median 1.150; for those, k = 2 without the booking rule means 2.3x
+per run until E_ADMIT_TOO_LARGE. **Not established:** what the next retained row of the same
+signature did after each at-cap row:
+
+| Next retained row after a clean auto row at >= 95% of its cap | Rows | Share |
+|---|---|---|
+| none retained (unestablished) | 1,114 | 55.8% |
+| not an auto row / an auto OOM / cap did not grow | 176 / 20 / 56 | 12.6% |
+| cap grew, peak at or below the **old** cap (does not follow the cap: not a fills-any-limit job) | 457 | 22.9% |
+| peak above the old cap and at its own new cap (ratchet-like) | 108 | 5.4% |
+| peak above the old cap, below 95% of the new cap (real growth, section 4.4) | 65 | 3.3% |
+
+So the ratchet case is real for a minority (the RANT-73/87/111 cache-fillers) and its arithmetic is
+what matters: one such signature at k = 2 runs away in a few runs. **The headroom must not be
+enabled at k > 1 without the booking rule.**
 
 ### 4.2 The rule
 
@@ -261,34 +305,80 @@ five runs. **The rule must not be enabled at k > 1 without the booking rule.**
   (the booking the run held). `budget` keeps its meaning: the cap the run ran under
   (`memory.max`, cap-source in `budget_basis`), which is what censors its peak. The report gains
   an optional `reserve` field, sent only for a daemon-granted run.
-- **A clean run reached its limit** when its `budget_basis` is a kernel cap (`cap:*`) and its
-  peak is at least 95% of its `budget` (the criterion AIRA-318 measured). No new kernel read. A row
-  whose `budget` was not a kernel cap (`reserve:*`, an uncapped run, or an empty basis) is never
-  treated as censored: an uncapped 4 GiB peak under a 1 GiB booking is a real 4 GiB need.
+- **A clean run reached its limit with headroom** when its `budget_basis` is a kernel cap
+  (`cap:*`), its stored `reserve` is below its `budget` (it ran with a limit above its booking),
+  and its peak is at least 95% of its `budget` (the criterion AIRA-318 measured; 4.4 says why 95%
+  is kept). No new kernel read. Every other row is read exactly as today: a row with NULL `reserve`
+  (written before this lands, a pinned run, the pool face), a row whose `reserve` equals its
+  `budget` (k = 1, or a grant without headroom), and a row whose `budget` was not a kernel cap
+  (`reserve:*`, an uncapped run, or an empty basis; an uncapped 4 GiB peak under a 1 GiB booking is
+  a real 4 GiB need). So **the rule is inert at k = 1** and AIRA-318's k = 1 ratchet stays AIRA-318's
+  (section 4.4).
 - **Such a run never raises the estimate above the booking it ran under.** Its effective peak,
   for every reader of clean peaks (the ordinary `estimate:max` and AIRA-314's `own-max` floor;
   one place: the stats `ResourcePeakHistory` returns), is min(peak, reserve / 1.15), so the
-  estimate it produces is at most that `reserve`. A capped row with NULL `reserve` (written before
-  step 1, a pinned run, the pool face) uses `budget` in its place, which is exactly AIRA-318's rule.
+  estimate it produces is at most that `reserve`.
+- **The basis says so.** When an effective (reduced) peak is the value that set the reserve, the
+  basis prints that value as its peak and appends `,at-limit` (for example
+  `estimate:max=<effective peak>,n=5,f=115,at-limit` or `estimate:own-max=...,f=115,at-limit`),
+  meaning "the largest peak came from a run that reached a limit above its booking; it counts as at
+  most the booking it ran under". A basis without `,at-limit` keeps today's meaning: the printed
+  peak is a measured `memory.peak`. The token is added to the basis catalogue next to
+  `,oom-on-record` (`admit.go:1446-1571`, the trailing-token list at `admit.go:3073`).
+- **The guidance says so.** The skill guide's promise (`internal/core/skill.go:354`) that an
+  unpinned reserve "is never below 1.15x that peak while that peak is among its 20 most recent
+  records" becomes false for such a run. It is revised to: "...never below 1.15x that peak, except
+  a peak from a run that reached a limit set above its booking, which counts as at most that
+  booking (basis `,at-limit`)". `--budget`'s description of the "largest peak actually observed"
+  keeps the raw peak (it is a measurement) and gains the same one-line note. Both are prose
+  generated from `skill.go`; test H14 asserts them.
 - **The other reader of raw peaks.** `ConfinePeakP90` (`confine_peak_history.go`, the machine-wide
   p90 prior) takes raw maxima across every signature, so cache-filled enlarged caps would lift
   cold-start bookings for every command. AIRA-341 deletes it; it must land before k > 1 (condition
   (d)). If it has not, this rule applies to that reader too.
 - **OOM rows are unchanged** (D2).
 
-What it costs, accepted: a job whose anonymous need is between C and L and whose page cache also
-fills L is under-booked (booked C, using up to L) and survives. The converse also holds: a booking
-raised by an OOM escalation (C to 3C, D2) and followed by cache-filled clean runs keeps 3C in every
-replacement row, so it does **not** fade when the OOM row is evicted; it persists until a run
-finishes below 95% of its cap. Accepted (it is a floor, not growth); a decay rule is a deferral,
-and test H8 pins the persistence so a later change to it is deliberate. The under-booking is bounded by k,
-and the slice-level reading in `checkedAvailable` (the larger of real use and the ledger) sees its
-real use at every later admission.
+### 4.3 What it costs, accepted
 
-Step 1 ships alone at k = 1, where it changes only at-cap clean rows (2.3% of clean auto rows) and
-stops AIRA-318's ratchet; the AIRA-318 ticket's ratchet half is then done.
+- **Under-booking.** A job whose anonymous need is between C and 0.95 x L and whose page cache also
+  fills L is under-booked (booked C, using up to L) and survives. Bounded by L - C (at most 1 GiB
+  under the recommended rule), and the slice-level reading in `checkedAvailable` (the larger of
+  real use and the ledger) sees its real use at every later admission.
+- **A one-time step up for a finite cache.** A job whose page cache is finite (it reads F bytes of
+  files once per run, anonymous need tiny) with C < F < 0.95 x L records a real-looking peak F, so
+  its next booking is 1.15 x F with no real need behind it. It is one step, not a ratchet: the next
+  limit is above 1.15 x F, the cache still stops at F, and the booking stays at 1.15 x F (output,
+  part 5: F = 1.5 GiB from C = 1 GiB at k = 2 steps once to 1.72 GiB and stays). The bound is
+  1.15 x 0.95 x k x C: 2.19 C at k = 2, 1.64 C at k = 1.5, and at most C + 1.15 GiB in absolute
+  terms under the recommended rule. It is also the fixed point today's estimator reaches for the
+  same job at k = 1, in several 15% steps instead of one. The store cannot tell this job from a
+  genuine anonymous peak; the deferred anonymous-peak sampler (section 11) would. Test H8 pins it.
+- **A held-up floor after an OOM.** A booking raised by an OOM escalation (C to 3C, D2) and
+  followed by cache-filled clean runs keeps 3C in every replacement row, so it does **not** fade
+  when the OOM row is evicted; it persists until a run finishes below 95% of its limit. Accepted (it
+  is a floor, not growth); a decay rule is a deferral, and test H8 pins the persistence so a later
+  change to it is deliberate.
 
-## 5. Step 2: the headroom rule
+### 4.4 Why the learning rule is never enabled alone, and why 95% is kept
+
+At k = 1 a run's limit is its booking, so "never raise the booking past the one it ran under"
+would also stop jobs that genuinely grew a little. Measured (output, part 3, the next-row table):
+65 retained cases where a clean auto run at >= 95% of its cap was followed by a clean run peaking
+**above** the old cap but below 95% of the new one (next peak / old cap: median 1.026, p90 1.071,
+max 1.307). Under a k = 1 learning rule each would have kept the old booking and, if the growth was
+anonymous memory, been OOM-killed and then escalated 1.5x. That is the same order as the 108
+ratchet-like steps the rule stops. At k = 1.5 all 65 fit under the limit (their largest ratio is
+1.307). Hence the rule applies only to rows that ran with headroom (4.2), which makes it inert at
+k = 1, and it ships in the same build as the headroom. AIRA-318 keeps its k = 1 ratchet and its own
+ticket.
+
+95% rather than a tighter threshold: 485 of the 1,996 at-cap rows sit at 95-99.9% of their cap
+rather than at it (1,511 at >= 99.9%), so 95% also catches near-cap anonymous jobs. But at 99% the
+real-growth cases fall only from 65 to 63 (max ratio 1.166) while the ratchet-like steps the rule
+stops fall from 108 to 86 (output, part 3). The threshold does not separate the two populations;
+the headroom does, because it lets a real grower finish below 95% of its limit.
+
+## 5. The headroom rule
 
 ### 5.1 The rule
 
@@ -297,38 +387,61 @@ D1 decides which rungs):
 
 ```
 booking C = the reserve resolveAdmitReserve returns today (unchanged; the ledger charges C)
-free      = ceiling - headroom - effectiveCurrent - (sum of C granted earlier in this pass)
-limit  L  = clamp(free, C, ceil(k x C))      (page-floored; L == C when k == 1)
+limit   L = max(C, min(ceil(k x C), C + 1 GiB))      (bytes, no rounding; L == C when k == 1)
+```
+
+`k` is an install knob (`AIRA_DAEMON_CAP_HEADROOM`, written by step 0's `--cap-headroom` flag,
+default 1.0 at first release, raised to 1.5 then 2 by the rollout in section 8; the value must be
+in [1, 4]; read once at daemon start, so changing it means re-running install and restarting the
+daemon). The 1 GiB term is a constant (option G, section 3).
+
+**Rounding: the wire value and the enforced cap are different numbers, and only the wire value is
+the daemon's.** The daemon computes C and L in whole bytes and never page-rounds either; `ceil`
+applies only to the product k x C. The client validates the wire values (`limit >= reserve`,
+positive) and writes `limit` to `memory.max` unrounded, exactly as it writes `reserve` today
+(`writeScopeMemoryCap` writes the raw value and verifies against `floorMemoryPage`,
+`confine_linux.go:2239-2260`). The kernel floors both to a page, and flooring is monotone, so
+`floor(L) >= floor(C)`: an admissible grant can never become an invalid one through rounding. A
+daemon-side page floor is the bug this forbids: with 4096-byte pages, C = 1,073,741,825 and a
+bound of C + 1,000 would floor L to 1,073,741,824 < C and the client would refuse a grant that
+fitted (test H1/H6 use these unaligned values).
+
+**Who gets it.** Every grant whose cap the client takes from the daemon, which includes
+`--delegate-ram` parents: since S2a a delegate job is an ordinary confine job, the daemon reads no
+delegate flag (`protocol.go:129-132`, `admit.go:3202-3204`), its parent scope is sized for the
+supervisor while its pytest workers reserve as sibling scopes through `worker-admit`
+(`confine_linux.go:1115-1127`), and its signature prefix only namespaces its history. No reason
+to exclude it survives, and excluding it would need a new admit field an older daemon refuses
+(AIRA-340 pattern) or a daemon branch on a signature prefix. Not covered: pinned jobs (D3), aitest
+workers (their grants come from the separate `worker-admit` verb, whose response gains no field),
+ci-shim mode (it writes no kernel caps). Exclusive jobs are covered (they are alone on the slice).
+
+**If D4 keeps the physical-fit term** (not recommended), L gains one more term:
+
+```
+free = ceiling - headroom - effectiveCurrent
+L    = max(C, min(ceil(k x C), C + 1 GiB, free))
 ```
 
 `effectiveCurrent` is the slice's `memory.current` less reclaimable cache, the reading
 `checkedAvailable` already takes in the same pass; `ceiling` is the (possibly throttled) admission
-ceiling. Earlier grants of the same pass are subtracted by their booking because their use is not
-yet in `memory.current`. `k` is an install knob (`AIRA_DAEMON_CAP_HEADROOM`, default 1.0 at first
-release, raised to 1.5 then 2 by the rollout in section 8; the value must be in [1, 4]).
-
-Not covered: pinned jobs (D3), `--delegate-ram` parents and aitest workers (`worker_admit.go`
-sizes workers by its own rules; deferred), exclusive jobs are covered (they are alone on the
-slice, where headroom is safest), ci-shim mode gets none (no physical reading, as AIRA-324).
-
-**Why the physical term is kept, and what it is not.** It is not needed to solve the problem
-(option A is the minimum) and is the first thing the plan gate may cut; it is kept because the
-owner asked for it and it costs one `min` with a number the same pass already reads, and it is the only thing that stops a 20 GiB job being given a 40 GiB limit on
-a box with 25 GiB physically free. It is a **grant-time** snapshot: other jobs grow after the grant
-and nothing lowers L later. It is compatible with AIRA-103, whose rule keeps throttled values out
-of kernel-enforced numbers, for that rule's three reasons: the throttle can only take headroom
-away, never push L below the booking (so no admitted job is made to fail); L is written once, when
-the scope is created and before the job starts, never near `memory.current`; and nothing re-writes
-it, so there is no restore path. Lowering L on a running job is out of scope for exactly those
-reasons.
+ceiling. Earlier grants of the same pass are **not** subtracted: that would treat one arbitrary
+subset of granted-but-not-yet-allocated jobs differently from the jobs granted one pass earlier,
+which are equally absent from `memory.current`; subtracting all of them is subtracting the ledger,
+which removes the very headroom the owner asked for. The term is a grant-time snapshot, honestly
+described as such. It is compatible with AIRA-103 (which keeps throttled values out of
+kernel-enforced numbers) for that rule's three reasons: the throttle can only take headroom away,
+never push L below the booking; L is written once, before the job starts; nothing re-writes it, so
+there is no restore path. Lowering L on a running job is out of scope for exactly those reasons.
 
 ### 5.2 Retired invariant and the bound that replaces it
 
 Today, for auto jobs, `memory.max` = booking, so the fit check's `sum(booking) <= ceiling` also
-bounds their caps. After step 2 it bounds only the booking. What replaces it is a **grant-time
-bound, not a standing invariant**: at the instant an auto job is granted, its L <= k x C, so
-`sum(memory.max of auto jobs) <= k x sum(their booking)`. With AIRA-324:
-`sum(memory.max) <= max(k, 1/0.8) x sum(charge)` at grant. It is valid only while k is fixed and
+bounds their caps. With headroom it bounds only the booking. What replaces it is a **grant-time
+bound, not a standing invariant**: at the instant an auto job is granted, its
+L <= min(k x C, C + 1 GiB), so `sum(memory.max of auto jobs) <= sum(min(k x C, C + 1 GiB))
+<= k x sum(their booking)`. With AIRA-324: `sum(memory.max) <= max(k, 1/0.8) x sum(charge)` at
+grant. It is valid only while k is fixed and
 no exception applies: `--resize` (lowers the booking, not the cap), a ceiling that falls after the
 grant (the throttle), a restart re-declare charged above the ceiling, a change of k (new grants
 only). It is used to reason about how bad an overrun can be, never as a gate.
@@ -337,12 +450,12 @@ only). It is used to reason about how bad an overrun can be, never as a gate.
 
 | Failure | First symptom | What limits it |
 |---|---|---|
-| Jobs grow into headroom together and the slice passes its throttled ceiling | MemAvailable falls into the throttle's free-memory margin (`freeMin` 8 GiB); the ceiling throttle cuts new admissions | the throttle (new grants only), the physical term (grant time only) |
+| Jobs grow into headroom together and the slice passes its throttled ceiling | MemAvailable falls into the throttle's free-memory margin (`freeMin` 8 GiB); the ceiling throttle cuts new admissions | the throttle (new grants only); each job's extra is at most min(C, 1 GiB) |
 | ... and passes the slice's `MemoryHigh` (60G here) | `memory.high` reclaim and throttling of every job in the slice, cache first; PSI rises | page cache absorbs much of it; the rollback triggers in 8 |
 | ... and reaches the slice's `MemoryMax` (64G here) | **slice-level OOM**; with `memory.oom.group` set, the whole scope of the chosen task dies | the kernel picks the task with the highest badness (largest RSS) unless OOM steering raised the job in its headroom to 1000; **steering is off on this box** (no `AIRA_DAEMON_OOM_STEER_MODE` in the unit; default off, `paths.go:243`), so an innocent large job is the likely victim |
 | Outside-slice memory is large (the reason the ceiling is throttled) | the box, not the slice, runs short: swap use by processes outside the slice | the throttle, the watchdog (which exempts confined work, so it is no backstop here) |
-| Correlated burst of one OOM-prone command | section 2.4: 2.4% of 20-job bursts over the booking at k = 2, p99 1.87 | steering (once on) prefers the jobs in their headroom; the physical term cuts L for later grants of the burst |
-| Cache-filling job | ratchet (section 4.1) | step 1 |
+| Correlated burst of one OOM-prone command | section 2.4: 2.4% of 20-job bursts over the booking at k = 2, p99 1.87 | **steering is the only mitigation** once it happens (once on, it prefers the jobs in their headroom); the 1 GiB term bounds each member's extra. No grant-time term helps: members granted before any has allocated all see the same real use, so a physical-fit term (D4) would give each the full limit; it would cut L only for members granted after earlier ones have ramped up |
+| Cache-filling job | ratchet (section 4.1) | the learning rule (4.2) |
 
 Steering's budget is the booking (`admitScopeBudgets`, `oomsteer.go:453`, through
 `ledgerCharge`), so a job in its headroom reads as over budget, with two limits the build must
@@ -350,7 +463,12 @@ test before enforce: a scope counts as an offender only past its booking **plus 
 (`oomSteerOverrunFloorDefault`), so a small job using its headroom (32 MiB booked, 64 MiB cap) is
 never raised; and steering activates at 90% of the slice's **kernel** `memory.max` (64G here), not
 the throttled admission ceiling, so it does nothing while outside-slice pressure is the problem.
-No steering change is proposed; switching it on is the condition. Its doc comment already anticipates "any scope whose cap exceeds its
+No change to steering's logic is proposed. Switching it on is condition (b), and today it can only
+be done by hand-editing the unit: `AIRA_DAEMON_OOM_STEER_MODE` has no install flag
+(`install.go:53`, "forced off, with no flag yet"), the live unit carries no steering line, and the
+default is off (`paths.go:242-243`); a hand edit is overwritten by the next install that rewrites
+the unit. Step 0 (section 8) adds the flag. Steering has never run in enforce on this box, which is
+why the rollout runs it in observe first. Its doc comment already anticipates "any scope whose cap exceeds its
 reserve" (`oomsteer.go:23-26`) and needs only a pointer.
 
 ## 6. Every site that reads the booking or the cap
@@ -359,41 +477,51 @@ reserve" (`oomsteer.go:23-26`) and needs only a pointer.
 |---|---|
 | `resolveAdmitReserve`, `ledgerCharge`, fit check, head eligibility (`admitCouldFitEmptyLocked`), bypass budget, queue position, queued-ahead bytes | the booking C, unchanged. L never enters admission arithmetic. Head eligibility needs no change: L >= C is chosen at grant and cannot block. |
 | Grant frame | `reserve` stays C. New optional field `limit` = L, **omitted when L == C**. |
-| Client cap (`confine_linux.go:1125-1127`) | `memory.max` = `limit` when present and valid (`reserve <= limit`, positive), else `reserve`; an invalid `limit` makes the grant invalid (the existing `validRunnerAdmitGrant` path, refuse never repair). cap-source stays `auto:daemon-reserve`. |
+| Client cap (`confine_linux.go:1125-1127`) | `memory.max` = `limit` when present and valid (`reserve <= limit`, positive, both compared as the wire's whole bytes), else `reserve`; written unrounded, the kernel floors it (5.1, rounding); an invalid `limit` makes the grant invalid (the existing `validRunnerAdmitGrant` path, refuse never repair). cap-source stays `auto:daemon-reserve`. |
 | Re-declare after reconnect or daemon restart | unchanged: the frozen ARDR record carries `grant.Reserve` (`lease_keeper_linux.go:102`), which is C, so a restart books the booking, not the enlarged limit. The scope's `memory.max` (L) survives in the kernel. **Nothing in the daemon reads a scope's `memory.max` to rebuild a booking** (S12 deleted scan adoption; the daemon's `memory.max` reads are of the slice, `admit.go:3541`, `sliceceiling.go:402`, and the watchdog's `watchdog.go:836`); the build must not add one, and test H5 pins it. |
 | `--resize` (`confine_resize.go`) | lowers the booking only, as today; "must name a smaller reserve" is judged against C; the floor stays live use, which may now be above C. L is untouched. |
 | OOM steering (`admitScopeBudgets`) | the booking C (above). |
 | `--memory-max` / `--memory-high` | pinned paths; `--memory-high` requires `--memory-max` (`memory_size.go:88-91`), so neither meets headroom. |
 | AIRA-340 priority | none: priority orders the queue; L is computed at grant whatever the tier. |
 | `confine --list`, `aira top`, `ci_dump` | already show the scope's `memory.max` (`Cap`, read from the cgroup, `confine_manage_linux.go:318`) apart from the ledger's `ReserveBytes` (AIRA-192: summing caps over-states the claim). Keep them apart; sums use the booking; no renderer may label L as reserved. |
-| Trailer | `reserve=` stays C and `scope-memory.max=enforced=` is L (two keys exist already). New key `cap-headroom=` with `none` (L == C, whatever the reason), `k` (L = k x C) or `fit-bound` (the physical term set C < L < k x C). The OOM advisory names both: killed at the cap L, booked C. |
-| `--summary-file` | today's record has `reserve_bytes` and no cap field (`confine_summary.go:65-85`). Add `cap_bytes` (the scope's `memory.max`, or `unevaluated`) and `cap_headroom`; `reserve_bytes` keeps its meaning, the booking. |
-| Peak report and store | `budget` = L (the cap); new optional `reserve` = C (step 1). |
+| Trailer | `reserve=` stays C and `scope-memory.max=enforced=` is the kernel's L (two keys exist already). **No reason label**: the client receives only C and L and cannot tell whether L came from k, from the 1 GiB term or (under D4) from free memory, so it reports the two numbers and nothing that claims a cause. The OOM advisory names both: killed at its limit L, booked C. |
+| `--summary-file` | today's record has `reserve_bytes` and no cap field (`confine_summary.go:65-85`). Add `cap_bytes` (the scope's `memory.max`, or `unevaluated`); `reserve_bytes` keeps its meaning, the booking. No reason field, as for the trailer. |
+| Peak report and store | `budget` = L (the cap); new optional `reserve` = C (the learning rule). |
 | Hints (AIRA-334's over-reserve hint, AIRA-345's floor) | over-reservation is judged against the booking; AIRA-345's "recent OOM peak" is now about L, which is the right floor. |
-| Estimator | step 1 for clean at-limit rows; OOM escalation unchanged (D2). |
+| Estimator | the learning rule for clean rows that reached a limit above their booking; OOM escalation unchanged (D2). |
 
 ## 7. Interaction with AIRA-324, and order
 
-Shared: the idea that what the ledger charges and what the kernel enforces differ; the physical
-free figure (324 requires `pin <= ceiling - headroom - effectiveCurrent`; this uses the same
-quantity as an upper clamp), which should be one helper; the restated grant-time bound (5.2) and
-the steering comment. Not shared: 324 adds a `charge` on the waiter and a `discountable` admit
+Shared: the idea that what the ledger charges and what the kernel enforces differ; the restated
+grant-time bound (5.2); the steering comment; step 0's steering install flag, which AIRA-324's
+enforce also needs (whichever lands first carries it). Under D4 only, the physical free figure
+(324 requires `pin <= ceiling - headroom - effectiveCurrent`; D4 uses the same quantity as an
+upper clamp), which should then be one helper. Not shared: 324 adds a `charge` on the waiter and a `discountable` admit
 field and leaves the grant echo at the pin; this leaves the waiter's charge at the reserve and adds
 a `limit` to the grant. Neither changes the ARDR record.
 
 The one place they could conflict is the bound and OOM steering: with both, a pinned job's charge
 is 0.8 x pin and an auto job's is C, both below their caps, and steering ranks both by charge, so
 the conflict is only in the restated text, which whichever lands second updates. **Order: AIRA-324
-first** (owner's sequencing, and its enforce weeks calibrate the slack both spend), then step 1,
-then step 2. Step 1 does not depend on 324 and may land earlier.
+first** (owner's sequencing, and its enforce weeks calibrate the slack both spend), then this
+feature's build (the learning rule and the headroom together, section 4.4). Step 0 (the install
+flags) does not depend on 324 and may land earlier.
 
 ## 8. Rollout, gates and rollback
 
-1. **Step 1** (learning rule and the `reserve` column), k stays 1.0. Gate: none beyond tests; it
-   only stops the ratchet. Metric: the at-cap pair ratio of part 3 falls from 1.15 to 1.00.
-2. **Switch OOM steering on**: observe for a week (it logs who it would raise), then enforce. This
-   is also a precondition AIRA-324's enforce should state.
-3. **Step 2 at k = 1.5 for a week, then 2.** Gate to start: the replay of section 2.4 re-run on
+0. **Step 0: install flags.** `aira install --cap-headroom K` writes `AIRA_DAEMON_CAP_HEADROOM`
+   (refused outside [1, 4]) and `--oom-steer-mode off|observe|enforce` writes
+   `AIRA_DAEMON_OOM_STEER_MODE`, both following the existing slice-ceiling-mode pattern
+   (`resolveDaemonModes` keeps the installed value when the flag is omitted, so a later install
+   does not silently reset it; the daemon-mode report compares the live environment with the unit,
+   `install.go:2436`). Small and independent of everything else here; AIRA-324's enforce needs the
+   steering flag too, so whichever lands first carries it. Test H15.
+1. **Switch OOM steering on**: observe for a week (it logs who it would raise), then enforce. It has
+   never run in enforce on this box. This is also a precondition AIRA-324's enforce should state.
+2. **The build** (the learning rule, the `reserve` column and the headroom, after AIRA-324), shipped
+   at k = 1.0, where it is inert: grants and caps are byte-identical to master (H7) and the learning
+   rule reads every row as today (4.2).
+3. **k = 1.5 for a week, then 2.** Gate to start: the replay of section 2.4 re-run on
    AIRA-323's timeline (start = `started_at_ms`, end = start + `wall_ms`, two weeks of rows),
    duration-weighted, showing the concurrent total use stays under 0.9 x the slice's `MemoryHigh`
    at the busiest hour with the auto kills' censored use set to k x C. This replay is **advisory**:
@@ -407,18 +535,28 @@ then step 2. Step 1 does not depend on 324 and may land earlier.
    used); hourly **increments** of the slice's `memory.events.local` `high`, `max` and `oom` (the
    counters are cumulative, so only deltas over fixed windows are compared, and a counter that
    goes backwards, as after a slice re-creation, starts a new baseline); slice `memory.pressure`
-   `some avg10` (a moving average, compared as sampled); ceiling throttle cuts; steering raises.
+   `some avg10` (a moving average, compared as sampled); ceiling throttle cuts; steering raises;
+   the booking ratio of consecutive clean rows of one signature that reached a limit above their
+   booking (expected 1.00: the learning rule holding).
    Auto kills are counted only when the confine trailer attributes them to the scope's **own**
    limit (the runner already distinguishes own-limit, descendant and ancestor kills,
    `confine_linux.go:1509-1518`); the stored `oom` bit does not, so the store alone cannot give
    this metric (section 2.3).
 5. **Rollback** (any one sets k back to 1.0, which writes exactly today's caps for new grants, and
-   files a finding): any increment of aira.slice's own `memory.events.local` `oom` (the slice's
+   files a finding). **It is a manual check**, not automated: the agent driving the rollout reads
+   the triggers once a day during the k = 1.5 and k = 2 weeks and weekly after (an automatic
+   rollback is a deferral). **Changing k needs a daemon restart**: the knob is read at daemon
+   start, so a rollback is `aira install --cap-headroom 1` followed by an explicit
+   `systemctl --user restart aira-daemon.service` (an install alone may not restart it), after
+   `aira confine --list` and a heads-up to the sessions using the box. A restart is job-safe: live
+   leases re-declare their booking C and their scopes keep the L they were created with, so a
+   rollback stops new headroom and running jobs keep theirs until they end. Triggers: any increment of aira.slice's own `memory.events.local` `oom` (the slice's
    **own** limit was reached, the kernel's attribution, which a scope's local kill counter cannot
    give because a kill under an ancestor limit also counts in the victim scope); the hourly
    increment of the slice's `memory.events.local` `high`, or PSI `some avg10`, above its
-   pre-step-2 hourly 99th percentile for two consecutive hours; the median booking of repeat signatures growing more than 15% in a week (a
-   ratchet step 1 missed).
+   pre-headroom hourly 99th percentile for two consecutive hours (that baseline is recorded during
+   rollout steps 1-2); the median booking of repeat signatures growing more than 15% in a week (a
+   ratchet the learning rule missed).
 
 ## 9. Protocol and storage
 
@@ -434,41 +572,59 @@ No protocol bump. Each change follows a measured no-bump pattern:
   the build generalises it to every optional field added after master's six-field set, so the
   peak and OOM bit are still kept.
 - Store: one nullable column, in the DDL and the `ensureConfinePeakHistorySubject` list, no CHECK,
-  no data migration (old rows NULL, which step 1 reads as "use budget").
+  no data migration (old rows NULL, which the learning rule reads exactly as today).
 - ARDR re-declare record: unchanged.
+- Step 0's install flags: environment lines in the daemon unit, not protocol.
 
 ## 10. Tests required (each must fail against the wrong implementation)
 
-- **H1. Grant.** An auto grant with physical free above k x C carries `limit` = ceil(k x C); with
-  free between C and k x C, `limit` = free; with free below C, no `limit`; at k = 1, no `limit`.
-  Mutations, each red: ignore the physical term; let L fall below C; send `limit` == `reserve`.
-- **H2. Same pass.** Two auto grants in one evaluator pass: the second's free figure is reduced by
-  the first's booking. Mutation: not reduced (the second gets the same L).
-- **H3. Who gets it.** Pinned (`--memory-reserve`, `--memory-max`), delegate parent, aitest worker,
-  ci-shim: no `limit`. D1's choice pinned by one case per rung. Mutation: headroom for a pin.
+- **H1. Grant.** At k = 2: an auto grant with C = 512 MiB carries `limit` = 1 GiB (k bound); with
+  C = 3 GiB, `limit` = 4 GiB (1 GiB bound); at the crossover C = 1 GiB both give 2 GiB; at k = 1,
+  no `limit`. Unaligned bookings: C = 1,073,741,825 at k = 1.5 gives `limit` = ceil(1.5 x C) =
+  1,610,612,738, and at k = 2 gives C + 1 GiB = 2,147,483,649, each carried unrounded and each
+  >= `reserve`. Mutations, each red: page-floor L in the daemon (the unaligned case then sends
+  `limit` < `reserve` and H6 refuses it); drop the 1 GiB term; floor instead of ceil k x C; send
+  `limit` == `reserve`. **Under D4 only**, add: free between C and the k/1 GiB bound gives
+  `limit` = free, including free = C + 1,000 with the unaligned C above (must be >= C on the wire);
+  free below C gives no `limit`; mutation: ignore the physical term. (Test H2, the same-pass
+  subtraction, is cut with that subtraction, 5.1.)
+- **H3. Who gets it.** Pinned (`--memory-reserve`, `--memory-max`), aitest worker (`worker-admit`),
+  ci-shim: no `limit`. A `--delegate-ram` parent with no pin **does** get one, through the real
+  admit exchange, with no new admit field (the daemon refuses `delegate_ram`). D1's choice pinned
+  by one case per rung. Mutations: headroom for a pin; no headroom for the delegate parent.
 - **H4. Admission arithmetic never reads L.** A guard test (the same allow-list form as AIRA-324's
   `.reserve` guard) fails if the waiter's limit is read outside the grant echo and the display
   paths; ledger, fit, head eligibility, bypass and steering budgets equal C with L = 2C.
 - **H5. Restart.** After a daemon restart, the re-declared lease is booked C (not L) and the scope's
   `memory.max` is still L. Mutation: the keeper re-declares the limit.
 - **H6. Client.** `memory.max` = `limit` when present; = `reserve` when absent; a `limit` below
-  `reserve` or non-positive makes the grant invalid. Mutations: write `reserve` always; accept
-  `limit < reserve`.
+  `reserve` or non-positive makes the grant invalid. Unaligned: `reserve` = 1,073,741,825 with
+  `limit` = `reserve` + 1,000 is valid, written unrounded, and the kernel's `memory.max` reads back
+  `floorMemoryPage` of it (equal to the floor of `reserve`; the write must not be refused as a
+  mismatch). Mutations: write `reserve` always; accept `limit < reserve`; page-round before the
+  `limit >= reserve` comparison.
 - **H7. Kill switch.** At k = 1.0 the grant frames and every scope's `memory.max` are byte-identical
   to master's for a table of auto, pinned and fallback cases.
-- **H8. Step 1 learning.** The six-run cache-filling job of section 4.1 (as a unit test over
-  `ResourcePeakHistory` stats) stays at its booking at k = 1 and k = 2; a row with NULL `reserve`
-  uses `budget`; a clean run below 95% of its cap still raises the estimate to 1.15 x its peak; an
-  uncapped row (`reserve:*` or empty basis) at 4x its booking is not censored; an escalated 3C
-  booking followed by 20 cache-filled clean rows stays at 3C after the OOM row is evicted (4.2).
+- **H8. Learning rule** (unit tests over the `ResourcePeakHistory` stats). (a) The six-run
+  cache-filling job of section 4.1 stays at its booking at k = 1.5 and k = 2. (b) Rows with NULL
+  `reserve`, and rows with `reserve` == `budget` (k = 1), are read exactly as today: an at-cap
+  clean row at k = 1 still raises the estimate to 1.15 x its peak. (c) A clean run below 95% of its
+  limit still raises the estimate to 1.15 x its peak. (d) An uncapped row (`reserve:*` or empty
+  basis) at 4x its booking is not censored. (e) The finite-cache case of 4.3: a clean peak of
+  1.5 x C under `budget` = 2C, `reserve` = C gives the next estimate 1.725 C, and a second such row
+  under the new booking leaves it at 1.725 C (one step, pinned). (f) An escalated 3C booking
+  followed by 20 cache-filled clean rows stays at 3C after the OOM row is evicted (4.3).
   Mutations, each red: AIRA-318's cap-based rule (doubles at k = 2); no cap (2.3x per run); the cap
-  applied to OOM rows; the cap applied to rows below 95%; the cap applied to an uncapped row.
+  applied to rows with NULL `reserve` or `reserve` == `budget` (b goes red); the cap applied to OOM
+  rows; to rows below 95%; to an uncapped row.
 - **H9. Report and store.** `reserve` round-trips through the real `ReportPeakSample` and handler;
   absent is NULL; against an old daemon the re-send keeps the peak and the OOM bit and drops
   `reserve` (AIRA-323's T9 cases extended). Mutation: the re-send keeps the new field.
-- **H10. Honesty.** The trailer, `--summary-file` (`reserve_bytes`, new `cap_bytes`) and `--list` show `reserve` = C and the cap = L
-  with `cap-headroom=k`/`fit-bound`/`none`; the OOM advisory names both. Mutations: `reserve=` shows
-  L; `cap-headroom=k` when the physical term bound it.
+- **H10. Honesty.** The trailer, `--summary-file` (`reserve_bytes`, new `cap_bytes`) and `--list`
+  show `reserve` = C and the cap = L as two numbers, with no reason label; the OOM advisory names
+  both. Two grants with identical C and L (one bound by k, one by the 1 GiB term or, under D4, by
+  free memory) produce identical client output, through the real admit exchange. Mutations:
+  `reserve=` shows L; `cap_bytes` shows C.
 - **H11. Real cgroup** (skips without delegation): an auto job allocating 1.5 x its booking of
   anonymous memory completes at k = 2 and is OOM-killed at k = 1; the first run's recorded peak is
   about 1.5 x C and its `reserve` is C.
@@ -477,23 +633,49 @@ No protocol bump. Each change follows a measured no-bump pattern:
   kernel maximum; a 32 MiB-booked scope using 64 MiB is not (documents the floor's gap).
 - **H12. Escalation unchanged** (D2): a kill at L = 2C escalates to 3C. Mutation: escalate from the
   booking.
+- **H14. Basis and guidance.** An estimate set by an at-limit-with-headroom row carries
+  `,at-limit` and prints the effective peak; one set by an ordinary row does not. The generated
+  skill guide carries the revised own-max sentence and the `,at-limit` meaning, and no longer the
+  unqualified "never below 1.15x that peak" (asserted on the generated text, as the existing skill
+  tests do). Mutations: omit the token; keep the old sentence.
+- **H15. Install flags** (step 0). `--cap-headroom` and `--oom-steer-mode` write their unit lines;
+  out-of-range or unknown values are refused with a stable code; omitting a flag on a later install
+  keeps the installed value; the daemon-mode report shows a live value that differs from the unit.
+  Mutations: an omitted flag resets the value; k = 0.5 accepted.
 
 ## 11. Deferrals
 
-- Headroom for `--delegate-ram` parents and aitest workers (`worker_admit.go` has its own sizing).
+- Headroom for aitest workers (`worker_admit.go` has its own sizing).
+- An automatic rollback (the triggers of section 8 are read by hand).
+- The physical-fit term, if D4 declines it.
 - Lowering L on a running job when the box gets busy (AIRA-103's reasons, section 5.1).
 - An anonymous-memory peak (a sampler on the monitor tick) that would let a cache-filled run teach
-  its real need; step 1 accepts the bounded under-booking instead.
+  its real need, and would remove the finite-cache step of 4.3; the learning rule accepts the
+  bounded under-booking and that step instead.
 - Per-command k, or k learned from history.
-- A decay for a booking held up by cache-filled rows after an OOM escalation (4.2).
-- A complete job lifecycle log (grants, ends, failures) that would make the step-2 replay a
+- A decay for a booking held up by cache-filled rows after an OOM escalation (4.3).
+- A complete job lifecycle log (grants, ends, failures) that would make the rollout replay a
   binding gate (section 8).
 - AIRA-273 option B (remember the big mode longer), still needed for modes beyond k.
 - Recording failed runs (AIRA-264 decided against it).
-- The timeline replay itself: it needs two weeks of AIRA-323 rows and is the gate of step 2.
+- The timeline replay itself: it needs two weeks of AIRA-323 rows and is the advisory gate of
+  rollout step 3.
 
 ## 12. Change log
 
+- 2026-11-15, rev 2 after Fable round 1 (9 P2, all taken): recommended rule is now
+  L = min(k x C, C + 1 GiB), the physical-fit term moved to owner decision D4 (not recommended: it
+  does not limit a fast burst; the 5.3 burst row corrected) and its same-pass subtraction dropped;
+  page rounding defined (daemon sends whole bytes, the kernel floors both values; H1/H6 unaligned
+  cases); the trailer's `cap-headroom=` reason label and `cap_headroom` summary field cut (the
+  client cannot know the reason); `,at-limit` basis token and the revised skill-guide sentence
+  specified (H14); exposure restated as established (136 pairs, 205 signatures) with the next-row
+  table added to the script (part 3); the learning rule applies only to rows that ran with
+  headroom, so it is inert at k = 1 and ships with the headroom (4.4: alone at k = 1 it would turn
+  65 measured real-growth cases into likely kills; 95% kept, 99% does not separate the two); the
+  finite-cache one-time step stated as an accepted cost with its bound and pinned by H8(e); step 0
+  adds install flags for k and steering (H15), rollback stated as manual with a daemon restart;
+  `--delegate-ram` parents included (the daemon cannot tell them apart and there is no reason to).
 - 2026-11-15, rev 1 after Sol round 2 (BLOCK, 3 P2 + 3 P3, all taken): rollback keyed on the
   slice's own `memory.events.local` `oom`; cumulative counters compared as hourly deltas;
   unstored kill attribution stated as an evidence limit and the step-2 metric restricted to

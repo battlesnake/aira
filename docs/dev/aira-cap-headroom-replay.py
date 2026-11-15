@@ -9,8 +9,10 @@ slice, and what does it do to the estimator?
 Reads a COPY of the state DB, read-only. Never point it at the live file:
 
   sqlite3 -readonly ~/.local/state/aira/state.db ".backup $HOME/tmp/aira-cap-headroom-data/state-copy.db"
-  aira confine --memory-reserve 384M -- python3 -I docs/dev/aira-cap-headroom-replay.py \\
+  aira confine -- python3 -I docs/dev/aira-cap-headroom-replay.py \\
       --db ~/tmp/aira-cap-headroom-data/state-copy.db
+  (aira sizes the reserve from this command's history; a first run on a new box may pin
+  --memory-reserve 512M: the measured peak is about 400 MiB, mostly page cache of the DB copy.)
 
 Parts
   1  the owner's quoted evidence, re-derived (every cap source): OOM rows with a budget, how many
@@ -21,11 +23,18 @@ Parts
      touches; operator pins are AIRA-324's population.
   3  the AIRA-318 interaction: clean auto rows whose peak reached >= 95% of their cap (a cap the
      page cache filled). Under L = k x C such a run records a peak near k x C, and the estimator
-     books 1.15 x that next time.
+     books 1.15 x that next time. Then, for each such row, what the NEXT retained row of the same
+     signature did (unestablished / does not follow the cap / ratchet-like / real growth), at the
+     95% and 99% thresholds: the evidence for how many signatures the ratchet establishes and for
+     what a learning rule alone at k = 1 would cost.
   4  the downside: 20 concurrent auto jobs (mixed, and 20 of one command+subcommand "burst",
      and bursts of commands that have an OOM on record), sum of use over sum of bookings, today
      and under k. With the ledger full, sum(bookings) ~ the ceiling, so P(ratio > 1) is the
      chance the slice would be driven over its ceiling by the jobs' own use.
+  5  the page-cache ratchet by arithmetic under three learning rules, and the one-time step of a
+     finite cache under the booking rule.
+  6  the additive alternative L = min(k x C, C + H): killed caps by size, the within-k proxy at
+     several H, and the total headroom it hands out relative to L = k x C.
 
 LIMITS (stated in the spec, section "Evidence"):
   - peak is the scope's memory.peak, which counts page cache (AIRA-318), so a peak is an upper
@@ -269,6 +278,56 @@ def part3(rows):
         grow.sort()
         print("  consecutive at-cap clean runs of one signature: %d pairs, cap ratio median %.3f, p90 %.3f" % (
             len(grow), grow[len(grow) // 2], grow[int(0.9 * len(grow))]))
+    print("  where an at-cap row sits: peak >= 99.9%% of cap %d; 99-99.9%% %d; 95-99%% %d" % (
+        sum(1 for r in at if r[2] >= 0.999 * r[5]),
+        sum(1 for r in at if 0.99 * r[5] <= r[2] < 0.999 * r[5]),
+        sum(1 for r in at if r[2] < 0.99 * r[5])))
+    for thr in (0.95, 0.99):
+        next_row(rows, thr)
+
+
+def next_row(rows, thr):
+    """What the NEXT retained row of the same signature did after a clean auto row at >= thr of its
+    cap. Separates jobs that fill any limit (the ratchet step 1 stops) from jobs whose next run
+    genuinely needed more than the old cap (which step 1 at k = 1 would turn into an OOM kill if
+    the growth was anonymous memory; anon and cache are not separable in the store)."""
+    bysig = collections.defaultdict(list)
+    for r in rows:
+        bysig[r[1]].append(r)
+    out = collections.Counter()
+    risk = []
+    for rs in bysig.values():
+        for i, r in enumerate(rs):
+            _id, _s, peak, oom, _at, bud, bb = r
+            if not (bb == AUTO and not oom and peak and bud and peak >= thr * bud):
+                continue
+            if i + 1 >= len(rs):
+                out["a  no later retained row (unestablished)"] += 1
+                continue
+            _n, _s2, npeak, noom, _a2, nbud, nbb = rs[i + 1]
+            if nbb != AUTO:
+                out["b  next row not auto"] += 1
+            elif noom:
+                out["c  next row an auto OOM"] += 1
+            elif not npeak or not nbud:
+                out["d  next row has no peak/budget"] += 1
+            elif nbud <= bud * 1.01:
+                out["e  next cap did not grow (uninformative)"] += 1
+            elif npeak <= bud:
+                out["f  next cap grew, next peak <= old cap (does not follow the cap)"] += 1
+            elif npeak >= thr * nbud:
+                out["g  next peak > old cap and at its own new cap (ratchet-like)"] += 1
+            else:
+                out["h  next peak > old cap, below thr of new cap (real growth; step 1 at k=1 risks a kill)"] += 1
+                risk.append(npeak / bud)
+    tot = sum(out.values())
+    print("  next retained row after a clean auto row at >= %.0f%% of its cap (%d rows):" % (100 * thr, tot))
+    for key in sorted(out):
+        print("    %s: %s" % (key, pct(out[key], tot)))
+    if risk:
+        risk.sort()
+        print("    (h) next peak / old cap: median %.3f p90 %.3f max %.3f; fit under 1.5 x old cap: %d of %d" % (
+            risk[len(risk) // 2], risk[int(0.9 * len(risk))], risk[-1], sum(1 for v in risk if v <= 1.5), len(risk)))
 
 
 def part4(rows, clean):
@@ -384,6 +443,55 @@ def part5():
                 c = est
                 seq.append(c)
             print("  k=%.0f %-8s %s" % (k, name, " ".join("%.2f" % v for v in seq)))
+    # A FINITE cache: the job reads 1.5 GiB of files once per run (anonymous need tiny), so its
+    # peak is min(limit, 1.5 GiB). Under the booking rule at k = 2 the first run's 1.5 GiB peak is
+    # below 95% of its 2 GiB limit, so it reads as a real peak: a one-time step to 1.15 x 1.5, then
+    # stable. The worst case is a finite cache just under 0.95 x k x C: one step to 1.15 x 0.95 x k.
+    for k, files in ((2.0, 1.5), (2.0, 1.89), (1.5, 1.42)):
+        c = 1.0
+        seq = []
+        for _ in range(6):
+            limit = k * c
+            peak = min(limit, files)
+            est = 1.15 * peak
+            if peak >= 0.95 * limit:
+                est = min(est, c)
+            c = max(est, 0.0)
+            seq.append(c)
+        print("  k=%.1f booking, finite cache %.2f GiB: %s" % (k, files, " ".join("%.2f" % v for v in seq)))
+
+
+def part6(rows):
+    """The plan gate's alternative to the physical-fit term: an additive bound, L = min(k x C, C + H).
+    Uses the same within-k proxy as part 2 (largest clean peak above the killed cap)."""
+    MiB = 1 << 20
+    clean = collections.defaultdict(list)
+    for r in rows:
+        if not r[3] and r[2]:
+            clean[r[1]].append(r[2])
+    auto = [r for r in rows if r[3] and r[5] and r[6] == AUTO]
+    print("\nPART 6  additive alternative L = min(k x C, C + H): auto OOM rows by killed cap, and the within proxy")
+    edges = [(0, 256 * MiB, "<256M"), (256 * MiB, GiB, "256M-1G"), (GiB, GiB + 1, "==1G"),
+             (GiB + 1, 2 * GiB, "1G-2G"), (2 * GiB, 4 * GiB, "2G-4G"), (4 * GiB, 8 * GiB, "4G-8G"),
+             (8 * GiB, 1 << 62, ">=8G")]
+    for lo, hi, nm in edges:
+        sel = [r for r in auto if lo <= r[5] < hi]
+        print("    killed cap %-8s %s" % (nm, pct(len(sel), len(auto))))
+
+    def within(r, lim):
+        ps = [p for p in clean.get(r[1], []) if p > r[5]]
+        return bool(ps) and max(ps) <= lim
+
+    base_n = sum(1 for r in auto if within(r, 2 * r[5]))
+    print("    within at L = 2C: %s" % pct(base_n, len(auto)))
+    for h in (256 * MiB, 512 * MiB, GiB, 2 * GiB):
+        n = sum(1 for r in auto if within(r, min(2 * r[5], r[5] + h)))
+        print("    within at L = min(2C, C + %4dM): %s; %.1f%% of the L = 2C figure" % (
+            h // MiB, pct(n, len(auto)), 100.0 * n / base_n if base_n else 0))
+    jobs = [r for r in rows if r[6] == AUTO and r[5] and r[4] >= RECENT and (r[3] or r[2])]
+    sc = sum(r[5] for r in jobs)
+    print("    auto jobs since %s: %d; total headroom sum(L - C) / sum(C): L = 2C 1.00; min(2C, C + 1G) %.2f; min(2C, C + 2G) %.2f" % (
+        RECENT, len(jobs), sum(min(r[5], GiB) for r in jobs) / sc, sum(min(r[5], 2 * GiB) for r in jobs) / sc))
 
 
 def main():
@@ -396,6 +504,7 @@ def main():
     part3(rows)
     part4(rows, clean)
     part5()
+    part6(rows)
 
 
 if __name__ == "__main__":
