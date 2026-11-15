@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """AIRA-323 mutation check: every named mutation must turn its tests red.
 
+A point-in-time record of the AIRA-323 PR: the snippets match the source as
+merged by that PR and are not maintained afterwards, so a later change to these
+files makes mutations report UNAPPLIED. It is evidence for that review, not a
+standing gate.
+
 Each mutation replaces one exact snippet in one production file, runs the
 focused tests that are meant to catch it, and restores the file. A mutation
 whose tests still pass is a porous test and fails this script.
@@ -37,6 +42,7 @@ T_T4 = ("./internal/runner/", "TestConfineCompletionTimingComposite|TestConfineC
 T_T4B = ("./internal/runner/", "TestConfineCompletionProductionSeams")
 T_T5 = ("./internal/runner/", "TestRepoIdentityOnRealRepositories")
 T_T6 = ("./internal/runner/", "TestConfineCompletionRepoIdentity")
+T_WIRE = ("./internal/runner/", "TestConfineCompletionFactsReachTheWire")
 
 WAIT_RULE = """	if admission.release != nil {
 		waited := (admitReturned - admitEntered).Milliseconds()
@@ -125,6 +131,9 @@ MUTATIONS = [
     ("T4b: processEpoch never assigned", [(LAUNCH, "var processEpoch = time.Now()", "var processEpoch time.Time")], T_T4B),
     ("T4b: default repoIdentity returns unevaluated", [(LAUNCH, "	return RepoIdentity(cwd)\n}", "	_ = cwd\n	return \"\", false\n}")], T_T4B),
     ("T4b: wallNow in whole seconds", [(LAUNCH, "return time.Now().Round(0) }", "return time.Now().Round(0).Truncate(time.Second) }")], T_T4B),
+    ("T4b: a Getwd error answered as none", [(LAUNCH, "	cwd, err := os.Getwd()\n	if err != nil {\n		return \"\", false\n	}", "	cwd, err := os.Getwd()\n	if err != nil {\n		return RepoIdentityNone, true\n	}")], T_T4B),
+    # --- launch site joined to the real sender (N2)
+    ("wire: reportConfinePeak drops the four facts", [(SENDER, "		return errors.New(\"daemon report unavailable\")\n	}\n	return ReportPeakSample(ctx, request.AdmitSocketPath, report)", "		return errors.New(\"daemon report unavailable\")\n	}\n	report.WallMS, report.WaitMS, report.StartedAtMS, report.Repo = nil, nil, nil, \"\"\n	return ReportPeakSample(ctx, request.AdmitSocketPath, report)")], T_WIRE),
     ("T4b: wallNow keeps the monotonic reading", [(LAUNCH, "return time.Now().Round(0) }", "return time.Now() }")], T_T4B),
     # --- RepoIdentity (T5)
     ("T5: worktree's own gitdir hashed, not its commondir", [(IDENT, "		common = joinPhysical(gitDir, named)\n", "		_ = named\n")], T_T5),
@@ -136,6 +145,11 @@ MUTATIONS = [
     ("T5: commondir joined lexically (cleaned before resolution)", [(IDENT, "		common = joinPhysical(gitDir, named)", "		common = filepath.Clean(joinPhysical(gitDir, named))")], T_T5),
     ("T5: a .git stat error (ELOOP) walks to the parent", [(IDENT, "		default:\n			return \"\", false\n		}\n		parent := filepath.Dir(dir)", "		default:\n		}\n		parent := filepath.Dir(dir)")], T_T5),
     ("T5: a .git that is neither directory nor file walks to the parent", [(IDENT, "		case err == nil:\n			return \"\", false\n", "		case err == nil:\n")], T_T5),
+    ("T5: HEAD rule removed (an empty .git is hashed)", [(IDENT, "	if _, err := os.Lstat(filepath.Join(gitDir, \"HEAD\")); err != nil {\n		return \"\", false\n	}\n", "")], T_T5),
+    ("T5: an empty commondir accepted", [(IDENT, "		if named == \"\" {\n			return \"\", false\n		}\n", "")], T_T5),
+    ("T5: an empty gitdir pointer accepted", [(IDENT, "	if target == \"\" {\n		return \"\", false\n	}\n", "")], T_T5),
+    ("T5: .git pointer trimmed of spaces (not verbatim)", [(IDENT, "	target := strings.TrimPrefix(text, \"gitdir: \")", "	target := strings.TrimSpace(strings.TrimPrefix(text, \"gitdir: \"))")], T_T5),
+    ("T5: commondir trimmed of spaces (not verbatim)", [(IDENT, "		named := trimGitLineEnd(data)", "		named := strings.TrimSpace(string(data))")], T_T5),
     ("T5: none returned on an error", [(IDENT, "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return \"\", false\n	}", "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return RepoIdentityNone, true\n	}")], T_T5),
 ]
 

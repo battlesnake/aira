@@ -1,6 +1,6 @@
 # aira backlog plan, 2026-11-14 (revision 2)
 
-> **Superseded for AIRA-323 (2026-11-14, AIRA-323 build PR):** the history-charge spec rev 3 (`docs/superpowers/specs/2026-11-13-history-charge-design.md`, sections 5.1 and 5.1.6, as approved by its plan gate) supersedes every statement in this plan that AIRA-323 bumps the protocol, stores a normalised command key or adds a key index, or that an old client's report is "simply refused". AIRA-323 records four raw facts (`wall_ms`, `wait_ms`, `started_at_ms`, `repo`) as optional `confine-report` fields with **no protocol bump**: an old client's report is accepted with the four columns NULL, and a new client facing an old daemon re-sends once without them, so only those four facts are lost until the daemon restarts. The command key, its index and the golden fixtures move to the first reader ticket (spec section 10). The rows below are kept as written and marked where they are superseded.
+> **AIRA-323:** superseded by the history-charge spec rev 3 section 5.1 (`docs/superpowers/specs/2026-11-13-history-charge-design.md`); the 323 rows below carry only what was built.
 
 > **Ticket IDs for the plan's NEW items (filed 2026-11-14 in the same PR):** hint-honesty = AIRA-334, foreign-env-refusal = AIRA-335, budget-bounded = AIRA-336, runner-flakes = AIRA-337 (all unheld, v0.42); lease-remedy = AIRA-338 (held, v0.43); kill-attribution = AIRA-339 (held, v0.44). Nothing else in this plan has been actioned yet: retirements, milestone relabels, holds, tag v0.41 and un-holds await the owner's approval.
 
@@ -40,7 +40,7 @@ Surface: C means the client binary only, D means a daemon restart, W means the c
 | NEW runner-flakes | two internal/runner test races | P2 | — | v0.42 | tests only | no | S | — | **Yes.** Each flake costs a 10-minute `make ci` re-run |
 | 332 | log the error and elapsed time when the history read fails; re-measure after a reboot | P3 | no | v0.42 (label says v0.41) | D | no | S | — | **Yes.** The log line ships in v0.42. **Not done until** the first WSL restart after cutover has produced the line and its reading is recorded on the ticket. The ticket asks for this ("Then re-measure after a reboot", AIRA-332.md:4). Keep it in-review until then |
 | NEW lease-remedy | E_LEASE_EXPIRED names the holder and `--steal` | P3 | — | v0.43, held | D (store) | **yes** (lease CAS) | S | — | **Yes, but it is not wording only.** `ErrLeaseExpired` is returned as a bare sentinel inside the CAS (`internal/store/lease.go:275-276`). Naming the holder changes the error value at that point. Build it as its own PR, Opus building and Fable reading that hunk specifically, not inside the Terra batch |
-| 323 | history: wall, wait, start, key columns | P2 | yes | v0.43 (label says v0.41) | **C + D + W**, proto bump (superseded: no bump, see the note at the top) | yes | M | owner un-hold; Batch A merged first | **Yes.** It is the critical path for 324, 326 and 331. **Not daemon-only.** The daemon's report handler takes a closed allowlist (`internal/daemon/confine_report.go:17-20,27-29`: signature, peak_rss, oom, kind, budget, budget_basis) and rejects anything else with a protocol error. The client frame (`internal/runner/admission_linux.go:818-831`) carries no scope id, wall time, wait time or start time, so the daemon cannot join a report to its grant. The client must send `wall_ms`, `wait_ms`, `started_at` and the argv for the key. The client already holds the wait figure: `confine_linux.go:754` sets `AdmissionWaitedMS`, and the report is sent at `confine_linux.go:1446-1459`. A new client talking to an old daemon is refused, so bump `DaemonProtocolVersion` (now 15, `admission_linux.go:74`) together with the daemon's. Spec §5.1 says "written at the existing teardown site" and is silent on the wire, so revise the spec |
+| 323 | history: wall, wait, start time and repo identity | P2 | yes | v0.43 (label says v0.41) | **C + D + W**, no proto bump | yes | M | owner un-hold; Batch A merged first | **Yes.** It is the critical path for 324, 326 and 331. Built per spec rev 3 section 5.1: four raw facts as optional `confine-report` fields, a new client re-sends once without them to an old daemon |
 | 228 | collapse the per-slice queue map; generality audit | P3 | no | v0.43, to be held | D | yes | M | — | **Yes, before 324 and 326.** `admitQueues map[string]*sliceQueue` is still live (`internal/daemon/admit.go:2123, 2940`). Deleting it simplifies the code that 324 and 326 will touch |
 | 324 | 0.8 × pin charge plus a physical-fit rule | P2 | yes | v0.44 (label says v0.41) | D + W (`discountable`), proto bump | yes | L | build: 228 merged; enforce: 323 data | Yes. Build after 228; ship in observe mode, then enforce |
 | 326 | fast lane | P3 | yes | v0.45 (label says v0.41) | D | yes | M | 323 plus 2 weeks of `wall_ms`; independent of 324 and 325 (spec §6 item 4) | Yes. Its build follows 324's build in admit.go, but it does not wait for 324's rollout |
@@ -111,7 +111,7 @@ The v0.42 tickets (hint-honesty, foreign-env-refusal, budget-bounded, runner-fla
 |---|---|---|---|---|
 | **v0.41** (tag now) | What is already on master | 327, 328, 330, 322, plus docs (the 213 decision, the charge spec, the 329 diagnosis, the 333 proposal) | The daemon already runs 692cb252, so there is no restart. Proto unchanged at 15 (not re-verified against v0.40) | Tag and notify only. The notice states the 328 behaviour change |
 | **v0.42** | Honest messages and the stalls other projects are hitting | **Batch A**: hint-honesty, foreign-env-refusal, runner-flakes, 332, the 279 skill sentence, the 195 skill sentence. **budget-bounded**: its own PR | Restart needed (332, budget handler). Proto: budget-bounded adds one optional request argument. Decide in its plan whether that needs a bump; a new client sending the argument to an old daemon is the case to check | Batch A on one branch with one review. budget-bounded on its own branch with one review loop. Neither is correctness-critical |
-| **v0.43** | Measure first; simplify admission | 323 (with the repo key term if B#2a); 228; lease-remedy | Restart. **Proto bump** (323's frame; superseded: no bump, see the note at the top). Schema change with no migration | 323, 228 and lease-remedy each get their own two-loop |
+| **v0.43** | Measure first; simplify admission | 323 (with the raw repo column); 228; lease-remedy | Restart. No proto bump for 323. Schema change with no migration | 323, 228 and lease-remedy each get their own two-loop |
 | **v0.44** | Discounted charge in observe mode | 324 in observe mode (the moves to 0.9 and then 0.8 are mode changes and need no release); small batch: kill-attribution + 319, 271 | Restart. **Proto bump** (324's `discountable` field) | 324 gets a two-loop. The small batch is separate |
 | **v0.45** | Quick jobs first; cold start | 326; 331 if approved; the 318 rule and 273 | Restart | 326 and 331 each get a two-loop. 318 and 273 form one estimator track |
 | later | — | 325 (gated), 225, 236, 197, 306, 296, 300, 279 flag, 321, 248, 250, 260/272, 333 | — | Held |
@@ -138,7 +138,7 @@ v0.41 and v0.42 do not sit on this path. The capacity gain from 324 at 0.8 arriv
 |---|---|---|
 | Batch A | runner/confine_linux.go, runner/confine.go, cmd/aira/dispatcher.go, runner/admission_linux.go, two runner tests, daemon/admit.go (332 log line only), core/skill.go | budget-bounded (skill.go); 323 (confine_linux.go and admission_linux.go): **land Batch A first, then branch 323** |
 | budget-bounded | cmd/aira/confine_budget_render.go, confine_history_client.go, main.go, daemon/confine_budget.go, core/core.go, core/skill.go | Batch A (skill.go); 323 (main.go: `ReportPeakSample` caller at main.go:1438) |
-| 323 | runner/admission_linux.go (frame), runner/confine_linux.go (report site), runner/confine_budget.go (`ConfinePeakReport`), cmd/aira/main.go:1438, daemon/confine_report.go (allowlist), store/confine_peak_history.go, a new key function, the replay script and golden fixtures, both proto constants (superseded: no key function, no fixtures, no proto change; see the note at the top) | Batch A, budget-bounded; later 225 (same report lines) |
+| 323 | runner/admission_linux.go (frame), runner/confine_linux.go (report site), runner/confine_budget.go (`ConfinePeakReport`), runner/repo_identity.go, daemon/confine_report.go (allowlist), store/confine_peak_history.go, store/store.go | Batch A, budget-bounded; later 225 (same report lines) |
 | 228 | **daemon/admit.go** (queue map, prune and recreate), reload.go | 332 (land first), 324, 326. **Never run in parallel with 324 or 326** |
 | lease-remedy | store/lease.go (CAS), its callers' error rendering | nothing scheduled |
 
@@ -149,7 +149,7 @@ The hotspots are `internal/core/skill.go` (almost every item edits it, so land o
 | Class | Builder | Reviews |
 |---|---|---|
 | Batch A, budget-bounded, 271, kill-attribution | Terra (Codex, effort `high`), with a self-review before it returns | Sol `high` (both directions), then Fable as the final gate |
-| 323, 228, lease-remedy, 331, 318/273 | Opus, TDD | Fable two-loop in a throwaway detached worktree. Plan gate first: 323's revised spec (wire plus key) and a short spec for 228. For lease-remedy, Fable reads the `lease.go:275-276` hunk specifically |
+| 323, 228, lease-remedy, 331, 318/273 | Opus, TDD | Fable two-loop in a throwaway detached worktree. Plan gate first: 323's revised spec (rev 3) and a short spec for 228. For lease-remedy, Fable reads the `lease.go:275-276` hunk specifically |
 | 324, 326 | Opus, TDD | Spec already gated. Astra `xhigh` plus a Fable two-loop. 324 changes what the shared ledger charges |
 
 **Per-ticket pipeline:**
@@ -170,7 +170,7 @@ The hotspots are `internal/core/skill.go` (almost every item edits it, so land o
 4. Restart the daemon explicitly with `systemctl --user restart aira-daemon.service`. Installing alone skips the restart. v0.41 needs no restart.
 5. Run `aira skill install ~/.claude/skills/aira --force`.
 6. Confirm that `aira version` reports diverged=false.
-7. Smoke test: a small confined run, checking the new trailer lines. **On the proto bumps (v0.43 and v0.44)**, long-running MCP servers and old clients in other sessions keep speaking the old proto until they restart. With 323, an old client's peak report is simply refused, so its sample is lost, but its job still runs (not verified). (Superseded for 323: no bump; an old client's report is accepted with the four new columns NULL. See the note at the top.) Warn peers to restart their MCP servers.
+7. Smoke test: a small confined run, checking the new trailer lines. **On the proto bump (v0.44)**, long-running MCP servers and old clients in other sessions keep speaking the old proto until they restart. With 323 there is no bump: an old client's report is accepted with the four new columns NULL. Warn peers to restart their MCP servers.
 8. Tag `v0.N`. The tag push also runs `make ci`.
 9. Notify deploy, speed and subpipe (whoever is up in `ListAgents`) with the changelog, the proto, verb and schema changes, the sha256 sums and what comes next. Skip subpipe for releases that only change how output is displayed.
 10. **v0.42 only:** after the next WSL restart, read the 332 log line (error, elapsed ms, DB state), record it on AIRA-332, and only then move it to done.
@@ -189,7 +189,6 @@ The hotspots are `internal/core/skill.go` (almost every item edits it, so land o
 
 **Risks:**
 
-- 323's wire change plus the repo key term (B#2a) depart from the gated spec. The spec must be revised and re-gated before the build. The replay script and golden fixtures must change together.
 - After 324, a slice-level OOM can kill a job that is still under its own pin. The spec's rollback triggers are the control.
 - 228 refactors the queue code that 328 just changed. Fable should get the 328 race tests as fixtures.
 - lease-remedy touches the lease CAS. If naming the holder cannot be done without widening the CAS, drop it to "later": the bare code is honest, only unhelpful.
@@ -216,7 +215,7 @@ The hotspots are `internal/core/skill.go` (almost every item edits it, so land o
 
 Applied from the critique (each checked on master 692cb252):
 
-- **P1-1, 323 is not daemon-only: accepted.** Confirmed at `confine_report.go:17-29` (closed allowlist, refusal on unknown fields) and `admission_linux.go:818-831` (frame fields). 323 is now C + D + W with a proto bump, and B#2a carries an explicit spec revision and re-gate. The proto bump falls at **v0.43, not v0.42**, only because adopting "tag v0.41 now" renumbers the releases: 323 is still the first release after the honest-messages batch. The stale-MCP warning now names v0.43 and v0.44.
+- **P1-1, 323 is not daemon-only: accepted.** Confirmed at `confine_report.go:17-29` (closed allowlist, refusal on unknown fields) and `admission_linux.go:818-831` (frame fields). 323 is now C + D + W (no proto bump, per spec rev 3 section 5.1).
 - **P1-2, hold bookkeeping: accepted.** Confirmed that 323, 324, 325, 326, 331, 318, 273 and 319 are `hold:true`, and that 228 is `hold:false` with no milestone. B.2 adds one owner un-hold row per release. For 228 I chose "hold with milestone v0.43, released in B.2" over leaving it unheld, because the repo rule holds work that does not unblock another project until its release opens.
 - **P2-3, parallelism: accepted.** The report sender is `admission_linux.go:790-803`, it is wired at `confine_linux.go:274`, and it is called at `confine_linux.go:1456`. I also found the second caller at `cmd/aira/main.go:1438`, which budget-bounded's file list shares. Batch A lands first; 323's spec work runs in parallel.
 - **P2-4, 326 critical path: accepted.** Spec §6 item 4 makes it independent of 324 and 325. The builds are serialised, the rollouts are not, and 326 ships in week 3 to 4.

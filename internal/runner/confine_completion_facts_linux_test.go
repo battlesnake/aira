@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -295,4 +296,96 @@ func TestConfineCompletionProductionSeams(t *testing.T) {
 			t.Fatalf("repoIdentity()=(%q, %v), want (%q, true)", id, ok, want)
 		}
 	})
+	t.Run("repoIdentity of a removed working directory is unevaluated, never none", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "gone")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(dir)
+		if err := os.Remove(dir); err != nil {
+			t.Fatal(err)
+		}
+		if id, ok := deps.repoIdentity(); id != "" || ok {
+			t.Fatalf("repoIdentity()=(%q, %v) in a removed directory, want (\"\", false)", id, ok)
+		}
+	})
+}
+
+// TestConfineCompletionFactsReachTheWire joins the launch site to the real
+// sender: deps.reportPeak is left at its production default (reportConfinePeak)
+// and a test listener stands in for the daemon socket, so the four facts are
+// asserted on the frame the client actually writes, not on the seam's argument.
+//
+// verifies: AIRA-323
+func TestConfineCompletionFactsReachTheWire(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "admit.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	frames := make(chan runnerAdmitRequestFrame, 4)
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			var frame runnerAdmitRequestFrame
+			if readRunnerAdmitFrame(conn, &frame) == nil {
+				frames <- frame
+				_ = writeRunnerAdmitFrame(conn, map[string]any{"ok": true, "code": "OK"})
+			}
+			conn.Close()
+		}
+	}()
+
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	clock := &completionFakeClock{wall: t0}
+	deps := confineUnitDeps(&confineFakeScope{})
+	deps.wallNow = clock.wallNow
+	deps.monoNow = clock.monoNow
+	deps.repoIdentity = func() (string, bool) { return "0123456789abcdef", true }
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		clock.advance(250*time.Millisecond, 250*time.Millisecond)
+		return completionDaemonGrant(), nil
+	}
+	deps.readUsage = func(string) cgroupUsage {
+		clock.advance(40*time.Millisecond, 40*time.Millisecond)
+		return cgroupUsage{PeakRSS: int64ptr(4 << 20), OOMKill: int64ptr(0)}
+	}
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+	if deps.reportPeak != nil {
+		t.Fatal("confineUnitDeps sets reportPeak; this test needs the production default")
+	}
+	var diagnostics bytes.Buffer
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: &diagnostics,
+		AdmitSocketPath: socket,
+	}, deps); err != nil {
+		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
+	}
+	var report *runnerAdmitRequestFrame
+	for report == nil {
+		select {
+		case frame := <-frames:
+			if frame.Request.Verb == "confine-report" {
+				report = &frame
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no confine-report frame reached the socket")
+		}
+	}
+	args := report.Request.Args
+	want := map[string]any{
+		"wall_ms":       float64(40),
+		"wait_ms":       float64(250),
+		"started_at_ms": float64(t0.Add(250 * time.Millisecond).UnixMilli()),
+		"repo":          "0123456789abcdef",
+	}
+	for name, value := range want {
+		if args[name] != value {
+			t.Errorf("frame %s=%v (%T), want %v; args=%v", name, args[name], args[name], value, args)
+		}
+	}
 }

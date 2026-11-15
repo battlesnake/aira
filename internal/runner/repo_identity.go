@@ -29,10 +29,28 @@ const repoIdentityGitFileMax = 4096
 // own. Outside any repository it is ("none", true).
 //
 // ok is false exactly when the identity could not be established; id is then "".
-// It is pure Go with no git subprocess, and it ignores GIT_DIR, GIT_WORK_TREE,
-// GIT_CEILING_DIRECTORIES and bare repositories on purpose: the identity is a
-// property of the directory. AIRA-321 must reuse this function so the stored
-// repo and its estimator subject agree.
+// It is pure Go with no git subprocess. It follows `git rev-parse
+// --git-common-dir` for an ordinary checkout, a linked worktree and a submodule,
+// and where it cannot follow git it answers unevaluated, never another hash:
+//
+//   - A `.git` whose resolved git directory has no HEAD is not a git directory
+//     (git's own validity test, is_git_directory). git skips such a `.git` and
+//     uses an enclosing repository; this function answers ("", false) instead
+//     of walking on. The same rule refuses a `.git` file that names a
+//     directory without HEAD. The directory a commondir names is not checked
+//     (git checks its objects and refs): a worktree's commondir is written by
+//     git, and only a hand-corrupted one could name the wrong directory.
+//   - The text of a `.git` file and of a commondir is taken as git takes it:
+//     verbatim after `gitdir: `, minus trailing CR and LF. An empty pointer is
+//     refused; a pointer with a line break inside is refused (git would name a
+//     path containing it, which cannot resolve).
+//
+// Ignored on purpose, because the identity is a property of the directory:
+// GIT_DIR, GIT_WORK_TREE, GIT_CEILING_DIRECTORIES and GIT_COMMON_DIR, and bare
+// repositories. A bare repository nested inside a checkout therefore gets the
+// enclosing checkout's identity, and a directory inside a bare repository with
+// no enclosing checkout is "none". AIRA-321 must reuse this function so the
+// stored repo and its estimator subject agree.
 func RepoIdentity(cwd string) (string, bool) {
 	// Step 0. os.Getwd may return a logical path through a symlink ($PWD), whose
 	// ancestors are not the real directory's; walking it unresolved can miss the
@@ -98,6 +116,12 @@ func readSmallRegularFile(path string) (data []byte, missing bool, ok bool) {
 	return data, false, true
 }
 
+// trimGitLineEnd removes the trailing CR and LF characters git strips from a
+// `.git` file and a commondir, and nothing else.
+func trimGitLineEnd(data []byte) string {
+	return strings.TrimRight(string(data), "\r\n")
+}
+
 // readGitFilePointer reads a `.git` file: exactly one line `gitdir: <path>`, a
 // relative path resolving against the directory holding the file.
 func readGitFilePointer(path, dir string) (string, bool) {
@@ -105,12 +129,12 @@ func readGitFilePointer(path, dir string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	text := strings.TrimSuffix(string(data), "\n")
-	text = strings.TrimSuffix(text, "\r")
+	text := trimGitLineEnd(data)
 	if strings.ContainsAny(text, "\r\n") || !strings.HasPrefix(text, "gitdir: ") {
 		return "", false
 	}
-	target := strings.TrimSpace(strings.TrimPrefix(text, "gitdir: "))
+	// Verbatim, as git takes it (read_gitfile_gently): no space is trimmed.
+	target := strings.TrimPrefix(text, "gitdir: ")
 	if target == "" {
 		return "", false
 	}
@@ -141,11 +165,17 @@ func repoIdentityFromGitDir(gitDir string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	// git's validity test: a directory with no HEAD is not a git directory (an
+	// empty `.git`, or a pointer to the wrong place). Unevaluated, never a hash
+	// of a directory git would not use.
+	if _, err := os.Lstat(filepath.Join(gitDir, "HEAD")); err != nil {
+		return "", false
+	}
 	common := gitDir
 	data, missing, ok := readSmallRegularFile(filepath.Join(gitDir, "commondir"))
 	switch {
 	case ok:
-		named := strings.TrimSpace(string(data))
+		named := trimGitLineEnd(data)
 		if named == "" {
 			return "", false
 		}

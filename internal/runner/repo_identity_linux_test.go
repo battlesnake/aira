@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,6 +47,31 @@ func newRepoIdentityRepo(t *testing.T, parent, name string) string {
 	repoIdentityGit(t, root, "add", ".")
 	repoIdentityGit(t, root, "commit", "-q", "-m", "init")
 	return root
+}
+
+// gitCommonDir is `git rev-parse --git-common-dir` in dir, canonical, with no
+// inherited GIT_* environment; ok is false when git refuses the directory.
+func gitCommonDir(t *testing.T, dir string) (string, bool) {
+	t.Helper()
+	command := exec.Command("git", "-C", dir, "rev-parse", "--git-common-dir")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "GIT_") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	output, err := command.Output()
+	if err != nil {
+		return "", false
+	}
+	common := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(dir, common)
+	}
+	canonical, err := filepath.EvalSymlinks(common)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical, true
 }
 
 var repoIdentityPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -190,6 +216,86 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 			})
 		}
 	})
+	t.Run("a .git git would not use is unevaluated, never a hash of it (git's HEAD rule)", func(t *testing.T) {
+		// git's validity test (is_git_directory) needs HEAD in the git
+		// directory. Each fixture is checked against git first: git either
+		// refuses it or skips it for the enclosing repository, so no answer
+		// but ("", false) can agree with git without a subprocess.
+		emptyDotGit := filepath.Join(main, "odd-empty")
+		if err := os.MkdirAll(filepath.Join(emptyDotGit, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// `gitdir: ` and nothing else, in a directory that itself has a HEAD,
+		// so a join of the empty pointer would reach a "valid" git directory.
+		emptyPointer := filepath.Join(base, "empty-pointer")
+		if err := os.MkdirAll(emptyPointer, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(emptyPointer, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(emptyPointer, ".git"), []byte("gitdir: \n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// A pointer with a trailing space: git takes the text verbatim and
+		// names a path that does not exist; a trimmed pointer names main.
+		spacedPointer := filepath.Join(base, "spaced-pointer")
+		if err := os.MkdirAll(spacedPointer, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(spacedPointer, ".git"), []byte("gitdir: "+filepath.Join(main, ".git")+" \n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			name, dir string
+			gitUses   string // "" = git refuses the directory
+		}{
+			{"an empty .git directory under a real repository", emptyDotGit, filepath.Join(main, ".git")},
+			{"a .git file holding only `gitdir: `", emptyPointer, ""},
+			{"a .git file whose pointer has a trailing space", spacedPointer, ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				common, ok := gitCommonDir(t, tc.dir)
+				if tc.gitUses == "" && ok {
+					t.Fatalf("invalid fixture: git accepts it with common dir %s", common)
+				}
+				if tc.gitUses != "" && (!ok || common != tc.gitUses) {
+					t.Fatalf("invalid fixture: git's common dir is (%q, %v), want %s", common, ok, tc.gitUses)
+				}
+				if id, ok := RepoIdentity(tc.dir); id != "" || ok {
+					t.Fatalf("got (%q, %v), want (\"\", false); the enclosing repository is %s", id, ok, mainID)
+				}
+			})
+		}
+		for i, tc := range []struct{ name, content string }{
+			{"a worktree whose commondir file is empty", ""},
+			{"a worktree whose commondir has a trailing space", "../.. \n"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				worktree := filepath.Join(base, fmt.Sprintf("wt-commondir-%d", i))
+				repoIdentityGit(t, main, "worktree", "add", "-q", "-b", fmt.Sprintf("wt-commondir-%d", i), worktree)
+				pointer, err := os.ReadFile(filepath.Join(worktree, ".git"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				gitDir := strings.TrimSuffix(strings.TrimPrefix(string(pointer), "gitdir: "), "\n")
+				original, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.WriteFile(filepath.Join(gitDir, "commondir"), original, 0o644) })
+				if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte(tc.content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if common, ok := gitCommonDir(t, worktree); ok {
+					t.Fatalf("invalid fixture: git accepts it with common dir %s", common)
+				}
+				if id, ok := RepoIdentity(worktree); id != "" || ok {
+					t.Fatalf("got (%q, %v), want (\"\", false); the main checkout is %s", id, ok, mainID)
+				}
+			})
+		}
+	})
 	t.Run("a submodule has its own identity", func(t *testing.T) {
 		other := newRepoIdentityRepo(t, base, "other")
 		repoIdentityGit(t, main, "submodule", "add", "-q", other, "mod")
@@ -281,8 +387,9 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 				}
 			}},
 			{"an oversized commondir", func(t *testing.T, gitDir string) {
-				// Valid once trimmed: only the size bound refuses it.
-				if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../.."+strings.Repeat(" ", 5000)+"\n"), 0o644); err != nil {
+				// A valid path (`./` repeated, then ../..): only the size
+				// bound refuses it.
+				if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte(strings.Repeat("./", 2500)+"../..\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			}},
@@ -298,6 +405,13 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 				}
 				if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
 					t.Fatal(err)
+				}
+				// A HEAD in both directories, so only the commondir read
+				// itself can refuse the fixture.
+				for _, dir := range []string{gitDir, filepath.Join(root, "..", "store", ".git")} {
+					if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
 				}
 				tc.setup(t, gitDir)
 				type answer struct {

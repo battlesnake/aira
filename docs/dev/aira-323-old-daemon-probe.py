@@ -13,6 +13,10 @@ Against a pre-323 daemon both must be refused with E_DAEMON_PROTOCOL and write
 nothing (the client's once-only re-send relies on this). Against a 323 daemon
 both are accepted and two rows are written (signatures aira-323-probe-*).
 
+A point-in-time record of the AIRA-323 PR, measured 2026-11-15 against the
+live daemon at revision 1369bbe5 (before AIRA-323). Do NOT run it once the
+daemon runs AIRA-323: it would write two junk confine rows into the live store.
+
 Usage: python3 docs/dev/aira-323-old-daemon-probe.py [socket] [state.db]
 """
 import json

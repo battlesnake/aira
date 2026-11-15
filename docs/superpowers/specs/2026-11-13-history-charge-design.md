@@ -392,15 +392,28 @@ path, but that DB already stores full argv, absolute paths included, in `signatu
    - a regular file: read at most 4 KiB. It must be one line `gitdir: <path>` (a relative path
      resolves against `dir`). Anything else is unevaluated.
 2. The common dir is `gitdir`, unless the file `gitdir/commondir` exists. Then it is that file's
-   trimmed content, resolved against `gitdir` when relative. A read error other than not-found
+   content minus trailing CR/LF, resolved against `gitdir` when relative. A read error other than not-found
    is unevaluated.
 3. `filepath.EvalSymlinks(common)`. An error is unevaluated. This differs from
    `app.gitIdentity`, which falls back to the unresolved path; here a fallback would silently
    give one repository two identities.
 4. Reaching `/` with no `.git` gives `("none", true)`.
 
-`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CEILING_DIRECTORIES` and bare repositories are ignored on
-purpose: the identity is a property of the directory. Cost: one `stat` per ancestor plus at most
+**Validity, as git tests it.** A git directory without a `HEAD` is not a git directory (git's
+`is_git_directory`). After step 1 resolves `gitdir` (symlinks resolved), a missing `gitdir/HEAD` is
+unevaluated. git itself skips such a `.git` and uses an enclosing repository; the function answers
+unevaluated instead of walking on, so it never hashes a directory git would not use and never
+guesses the enclosing one. The text of a `.git` file and of a `commondir` is taken as git takes
+it: verbatim after `gitdir: `, minus trailing CR and LF, with no other trimming; an empty pointer
+is unevaluated. The directory a `commondir` names is not checked (git checks its objects and refs;
+only a hand-corrupted worktree could name the wrong one). If a further divergence from
+`git rev-parse --git-common-dir` is found, the pure-Go walk is replaced by a git subprocess rather
+than patched again.
+
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CEILING_DIRECTORIES`, `GIT_COMMON_DIR` and bare repositories are
+ignored on purpose: the identity is a property of the directory. So a bare repository nested
+inside a checkout gets the enclosing checkout's identity, and a directory inside a bare repository
+with no enclosing checkout is `none`. Cost: one `stat` per ancestor plus at most
 two small file reads, against the 2-5 ms and retry loop of a `git rev-parse` subprocess
 (`gitValue`, `project.go:790`). Unevaluated sends no `repo` (NULL), never `none`, and never fails
 or delays the launch.
@@ -538,9 +551,9 @@ Two residual losses, both unmeasured: if the first exchange plus the re-send exc
 report deadline, the row is lost (two local Unix-socket exchanges; the typical time is not
 measured); and runs that ended before the client was installed are as today.
 
-**Unverified:** the live daemon was not probed with a `confine-report` frame carrying a new
-field; the behaviour above is master's code, and AIRA-340's live measurement is of the analogous
-admit allowlist, not this one. T9 is the executable check of the two refusal paths.
+**Measured** 2026-11-15 against the live daemon at revision `1369bbe5` (pre-323) with
+`docs/dev/aira-323-old-daemon-probe.py`: both paths answered `E_DAEMON_PROTOCOL` and wrote no row,
+as above; T9 is the executable check of the two refusal paths.
 
 #### 5.1.7 What is client, daemon and store
 

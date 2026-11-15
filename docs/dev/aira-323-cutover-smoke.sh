@@ -24,7 +24,7 @@ set -euo pipefail
 aira_bin=${AIRA:-aira}
 db=${AIRA_STATE_DB:-"${XDG_STATE_HOME:-$HOME/.local/state}/aira/state.db"}
 checkout=${1:-$(git rev-parse --show-toplevel)}
-log_dir=${HOME}/tmp
+log_dir=${HOME}/tmp/aira-323-smoke
 mkdir -p "$log_dir"
 
 fail=0
