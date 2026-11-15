@@ -21,8 +21,8 @@ import (
 // job OOM-killed because its cold-start reserve under-provisioned it is
 //
 //  1. reported honestly rather than as a clean run, and
-//  2. attributed to its OWN command signature, so the very NEXT run of the same
-//     command is admitted at an escalated reserve with no operator action.
+//  2. attributed to its OWN command signature, so the very NEXT unpinned run of
+//     the same command is admitted at an escalated reserve.
 //
 // Why this test exists rather than another table row in confine_admit_test.go:
 // every existing test of the escalation stubs admitPeakHistory with synthetic
@@ -232,8 +232,9 @@ func TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission(t *testing.
 	}
 	oomPeak := *first.result.Status.PeakRSS
 
-	// PHASE 3 -- the self-heal. Same argv, therefore the same signature, and no
-	// operator action of any kind between the two runs.
+	// PHASE 3 -- the self-heal. Same argv, therefore the same signature; the only
+	// difference is that the first run's declared cap is dropped (since AIRA-341
+	// the fixture's under-provisioned first run is operator-capped, see above).
 	second := run("target", oomSelfHealTargetBytes, 0)
 	if second.err != nil {
 		t.Fatalf("second confine run: %v (stderr %q)", second.err, second.stderr)

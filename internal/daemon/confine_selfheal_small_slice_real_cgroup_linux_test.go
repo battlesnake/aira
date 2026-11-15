@@ -24,13 +24,14 @@ import (
 //
 //   - T9: the ladder converges. A command OOM-killed below what the slice can
 //     grant is re-admitted, unpinned, at the largest prior the slice can grant,
-//     and the very next identical invocation succeeds with no operator action --
+//     and the very next invocation of the same command succeeds --
 //     on a slice where master refused every unpinned job outright. (Until
 //     AIRA-341 the killed first run was itself unpinned, capped at the
 //     machine-wide prior; with that prior deleted an unpinned first run on this
 //     slice is already at the fit, so the first run here declares a smaller cap.
-//     An unpinned job that is OOM-killed AT the fit cannot be self-healed on
-//     this slice: its re-run is clamped to the same fit or refused.)
+//     An unpinned job that is OOM-killed AT the fit is usually not
+//     self-healed on this slice: its re-run is clamped to the fit at that
+//     moment or refused.)
 //   - T13: the ladder TERMINATES honestly. A command whose own recorded OOM peak
 //     is already at or above what the slice can grant is refused immediately with
 //     E_ADMIT_TOO_LARGE naming both numbers, rather than admitted onto an
@@ -129,8 +130,9 @@ func TestSmallSliceOOMSelfHealConvergesOnTheFittedBaseline(t *testing.T) {
 	// a lower ceiling instead of the fixture's.)
 	waitForDrainedAdmitLedger(t, server)
 
-	// PHASE 3 -- the self-heal. Same argv, therefore the same signature, and no
-	// operator action of any kind between the two runs.
+	// PHASE 3 -- the self-heal. Same argv, therefore the same signature; the only
+	// difference is that the first run's declared cap is dropped (since AIRA-341
+	// the fixture's under-provisioned first run is operator-capped, see above).
 	//
 	// The unpinned prior is over this slice's ceiling, so on master this request
 	// never reaches a scope at all. Here it is fitted to the largest prior the

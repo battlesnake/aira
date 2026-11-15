@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -160,8 +161,8 @@ func TestResolveAdmitReserveIsTheOldResolverWithThePriorMissing(t *testing.T) {
 // TestNoLiveCodeOrDocNamesTheDeletedPrior is the grep test: no Go source and no
 // live document may name the deleted rung, its basis or its reader. Historical
 // records -- dated specs, plans and reviews, the ticket store, and the dated
-// measurement write-ups and their repro scripts under docs/dev -- are left as
-// written. The needles are assembled at run time so this file does not match
+// AIRA-314 measurement script -- are left as written. Every other regular,
+// non-binary file in the tree is scanned. The needles are assembled at run time so this file does not match
 // itself.
 //
 // verifies: AIRA-341
@@ -177,7 +178,9 @@ func TestNoLiveCodeOrDocNamesTheDeletedPrior(t *testing.T) {
 		return strings.HasPrefix(rel, ".aira/") ||
 			strings.HasPrefix(rel, "docs/superpowers/") ||
 			strings.HasPrefix(rel, "docs/plans/") ||
-			strings.HasPrefix(rel, "docs/dev/aira-")
+			// The dated AIRA-314 measurement of the deleted read's cost; it runs
+			// sqlite3 against a copy of a state DB, not AIRA code.
+			rel == "docs/dev/aira-314-p90-index-measurement-repro.sh"
 	}
 	scanned := 0
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
@@ -195,14 +198,15 @@ func TestNoLiveCodeOrDocNamesTheDeletedPrior(t *testing.T) {
 		if historical(rel) {
 			return nil
 		}
-		switch filepath.Ext(rel) {
-		case ".go", ".md", ".sh", ".py", ".txt", ".json":
-		default:
+		if !entry.Type().IsRegular() {
 			return nil
 		}
 		body, err := os.ReadFile(path)
 		if err != nil {
 			return err
+		}
+		if bytes.IndexByte(body, 0) >= 0 {
+			return nil // a binary, not a document
 		}
 		scanned++
 		for _, needle := range needles {

@@ -760,7 +760,7 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 			"AIRA-151: the clamp applies only to the escalated value, so an over-ceiling reserve from any other term is refused terminally, and this names what to pass instead. AIRA-153 narrows its population — a PRIOR can no longer be over the ceiling — but the sentence stays true and stays the advice"},
 		{"an unpinned FIRST run is already capped at the largest reserve the slice can grant",
 			"AIRA-341: with the machine-wide prior gone, a small slice's unpinned first run is at the fit, not below it"},
-		{"the RE-RUN advice below cannot help a job OOM-killed AT that cap",
+		{"the RE-RUN advice below usually cannot help a job OOM-killed AT that cap",
 			"AIRA-153/341: the carve-out. An unqualified 'RE-RUN works on a small slice too' would be an honesty error — a job killed AT the fitted cap is clamped back to it or refused on re-run, never sized larger"},
 		{"On a small slice the RE-RUN advice below does self-heal a job killed BELOW that cap",
 			"AIRA-153: the self-heal that still works on a small slice, for a job killed under a smaller cap"},

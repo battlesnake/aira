@@ -1487,8 +1487,6 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 		if fit > 0 && request.reserve >= ceiling {
 			request.reserve, fitted = fit, ",ceiling-fitted"
 		}
-		readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
-		defer cancel()
 		historyUnavailable := false
 		insufficientSamples := false
 		if request.signature != "" {
@@ -1497,6 +1495,8 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 				read = s.db.ConfinePeakHistory
 			}
 			if read != nil {
+				readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
+				defer cancel()
 				readStart := time.Now()
 				stats, err := read(readCtx, request.signature)
 				if err != nil {
