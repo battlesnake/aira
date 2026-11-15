@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 
 	"aira/internal/codes"
 	"aira/internal/core"
@@ -56,7 +55,17 @@ func (d *daemonDispatcher) dispatchConfineHistory(ctx context.Context, request c
 	)
 	isDump := request.Verb == "confine-dump"
 	if !isDump {
-		filter, err := store.ParseConfineBudgetFilter(selectionArg(request.Args, "direction"), selectionArg(request.Args, "limit"), selectionArg(request.Args, "grep"))
+		var text [3]string
+		for i, key := range []string{"direction", "limit", "grep"} {
+			value, ok := request.Args[key].(string)
+			if !ok && request.Args[key] != nil {
+				// Every face sends text (MCP refuses a non-string before it gets
+				// here); anything else is refused, never read as the default.
+				return confineClientError(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s must be a string", key))
+			}
+			text[i] = value
+		}
+		filter, err := store.ParseConfineBudgetFilter(text[0], text[1], text[2])
 		if err != nil {
 			return confineClientError(err)
 		}
@@ -147,25 +156,6 @@ func joinedHistoryResponse(isDump bool, dump runner.ConfineDumpResult, budget ru
 	budget.Next, budget.Paged = nil, false
 	selector.Finish(&budget)
 	return core.Response{OK: true, Code: "OK", Data: budget}
-}
-
-// selectionArg reads a budget selection argument as text. The CLI sends
-// strings; an MCP caller may send a JSON number for --limit, which is read as
-// its integer spelling (a fractional or otherwise non-integral value stays
-// non-integral and is refused by the parser, never truncated to a default).
-func selectionArg(args map[string]any, key string) string {
-	switch value := args[key].(type) {
-	case nil:
-		return ""
-	case string:
-		return value
-	case float64:
-		return strconv.FormatFloat(value, 'f', -1, 64)
-	case json.Number:
-		return value.String()
-	default:
-		return fmt.Sprint(value)
-	}
 }
 
 // notPagedError refuses a later page that does not prove it was served as a page.

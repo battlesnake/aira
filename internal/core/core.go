@@ -2144,7 +2144,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// sessions that motivated the ticket were standing.
 		//
 		// AIRA-336: bounded by default. The client selects while it joins the
-		// daemon's pages and returns {subjects,total,matched,returned,truncated,
+		// daemon's pages and returns {subjects,total,returned,truncated,
 		// distribution}; the whole history (180k subjects, 100 MB on one line,
 		// measured 2026-11-14) is --direction all --limit 0.
 		"confine-budget": {Name: "confine-budget", Usage: "confine --budget [--direction actionable|under|over|well|acceptable|unevaluated|all] [--limit N] [--grep TEXT] [--slice S] [--owner ID] [--json]", Args: []ArgSpec{

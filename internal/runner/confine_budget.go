@@ -148,12 +148,11 @@ type ConfineBudgetResult struct {
 	// page: the daemon never sets these, and an unevaluated answer carries none
 	// of them (absent, never a fabricated zero). Total is every subject matching
 	// --grep (every subject without it) and Distribution counts those same
-	// subjects by direction, so its counts sum to Total. Matched is the subset in
-	// the selected --direction set, Returned is len(Subjects) (Matched capped at
-	// --limit), and Truncated reports Returned < Total: a hidden row is always
-	// counted, never silently dropped.
+	// subjects by direction, so its counts sum to Total. Returned is
+	// len(Subjects) (the selected --direction set capped at --limit), and
+	// Truncated reports Returned < Total: a hidden row is always counted, never
+	// silently dropped.
 	Total        *int           `json:"total,omitempty"`
-	Matched      *int           `json:"matched,omitempty"`
 	Returned     *int           `json:"returned,omitempty"`
 	Truncated    *bool          `json:"truncated,omitempty"`
 	Distribution map[string]int `json:"distribution,omitempty"`

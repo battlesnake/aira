@@ -115,9 +115,9 @@ func TestConfineBudgetDefaultOutputIsBoundedOnALargeHistory(t *testing.T) {
 	peer = &historyPeer{t: t, pages: largeBudgetPages()}
 	_, out, _ := runBudgetCLI(t, peer, true)
 	result := decodeBudgetJSON(t, out)
-	if len(result.Subjects) != 50 || *result.Total != 10000 || *result.Matched != 500 || *result.Returned != 50 || !*result.Truncated || result.Next != nil || result.Paged {
-		t.Fatalf("envelope: rows=%d total=%v matched=%v returned=%v truncated=%v next=%v paged=%v",
-			len(result.Subjects), *result.Total, *result.Matched, *result.Returned, *result.Truncated, result.Next, result.Paged)
+	if len(result.Subjects) != 50 || *result.Total != 10000 || *result.Returned != 50 || !*result.Truncated || result.Next != nil || result.Paged {
+		t.Fatalf("envelope: rows=%d total=%v returned=%v truncated=%v next=%v paged=%v",
+			len(result.Subjects), *result.Total, *result.Returned, *result.Truncated, result.Next, result.Paged)
 	}
 	// Worst first: every under-provisioned subject's raise is larger than any
 	// over-provisioned subject's, so the 50 are the 50 biggest raises.
@@ -144,7 +144,7 @@ func TestConfineBudgetHumanRenderCountsElidesAndFooters(t *testing.T) {
 	if want := "subjects: 10000 (under-provisioned 100, over-provisioned 400, acceptable 500, well-fitted 500, unevaluated 8500)"; lines[1] != want {
 		t.Fatalf("distribution line = %q, want %q", lines[1], want)
 	}
-	if want := "9950 more not shown (450 beyond --limit, 9500 in other directions); widen with --limit N (0 = all) and --direction D|all"; lines[len(lines)-1] != want {
+	if want := "9950 more not shown; widen with --limit N (0 = all) and/or --direction D|all"; lines[len(lines)-1] != want {
 		t.Fatalf("footer = %q, want %q", lines[len(lines)-1], want)
 	}
 	for _, line := range lines[2 : len(lines)-1] {
@@ -161,7 +161,7 @@ func TestConfineBudgetHumanRenderCountsElidesAndFooters(t *testing.T) {
 	// An unevaluated row's reason line is elided the same way.
 	_, out, _ = runBudgetCLI(t, &historyPeer{t: t, pages: largeBudgetPages()}, false, "direction", "unevaluated", "limit", "1")
 	if !strings.Contains(out, "… [+100 bytes; --json has it whole]: unevaluated — fallback:insufficient-samples:n=1") ||
-		!strings.Contains(out, "9999 more not shown (8499 beyond --limit, 1500 in other directions)") {
+		!strings.Contains(out, "9999 more not shown;") {
 		t.Fatalf("unevaluated selection:\n%s", out)
 	}
 }
@@ -213,23 +213,23 @@ func TestConfineBudgetOldDaemonSingleReplyIsSelected(t *testing.T) {
 	rows = append(rows, budgetRow("quiet", store.ResourceBudgetUnevaluated, nil, nil, true))
 	peer := &historyPeer{t: t, pages: []any{prePaging{runner.ConfineBudgetResult{Verdict: "ok", Scope: "s", Subjects: rows}}}}
 	result := dispatchBudget(t, peer)
-	if len(peer.requests) != 1 || len(result.Subjects) != 50 || *result.Total != 121 || *result.Matched != 120 || !*result.Truncated {
-		t.Fatalf("requests=%d rows=%d total=%v matched=%v", len(peer.requests), len(result.Subjects), *result.Total, *result.Matched)
+	if len(peer.requests) != 1 || len(result.Subjects) != 50 || *result.Total != 121 || !*result.Truncated {
+		t.Fatalf("requests=%d rows=%d total=%v", len(peer.requests), len(result.Subjects), *result.Total)
 	}
 }
 
 // verifies: AIRA-336 — a bad selection is refused with the stable argument code
-// before any daemon exchange; an MCP caller's JSON-number --limit is read as its
-// integer, and a fractional one is refused rather than truncated.
+// before any daemon exchange, including a non-string value (every face sends
+// text; one that did not must not be read as the default).
 func TestConfineBudgetSelectionArgumentsAreValidated(t *testing.T) {
 	rows := []any{runner.ConfineBudgetResult{Verdict: "ok", Scope: "s", Subjects: []runner.ConfineBudgetRow{
 		budgetRow("a", store.ResourceBudgetOverProvisioned, i64(1), i64(9), false),
 		budgetRow("b", store.ResourceBudgetOverProvisioned, i64(1), i64(9), false),
 	}}}
 	for name, args := range map[string]map[string]any{
-		"direction": {"direction": "sideways"},
-		"limit":     {"limit": "-3"},
-		"fraction":  {"limit": float64(1.5)},
+		"direction":  {"direction": "sideways"},
+		"limit":      {"limit": "-3"},
+		"non-string": {"limit": float64(1)},
 	} {
 		peer := &historyPeer{t: t, pages: rows}
 		args["owner"] = "session-a"
@@ -238,13 +238,8 @@ func TestConfineBudgetSelectionArgumentsAreValidated(t *testing.T) {
 			t.Fatalf("%s: ok=%v code=%q exit=%d requests=%d", name, response.OK, response.Code, response.Exit, len(peer.requests))
 		}
 	}
-	peer := &historyPeer{t: t, pages: rows}
-	response := peer.dispatcher().Dispatch(context.Background(), daemon.WorktreeScope{},
-		core.Request{Verb: "confine-budget", Args: map[string]any{"owner": "session-a", "limit": float64(1)}})
-	data, _ := json.Marshal(response.Data)
-	var result runner.ConfineBudgetResult
-	if err := json.Unmarshal(data, &result); err != nil || len(result.Subjects) != 1 {
-		t.Fatalf("numeric limit 1: ok=%v rows=%d err=%v", response.OK, len(result.Subjects), err)
+	if result := dispatchBudget(t, &historyPeer{t: t, pages: rows}, "limit", "1"); len(result.Subjects) != 1 || *result.Total != 2 {
+		t.Fatalf("limit 1: rows=%d total=%d", len(result.Subjects), *result.Total)
 	}
 }
 

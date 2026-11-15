@@ -82,8 +82,8 @@ func TestConfineBudgetDefaultSelectionIsTheWorstActionableRows(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("selection =\n%v\nwant\n%v", got, want)
 	}
-	if *result.Total != 640 || *result.Matched != 90 || *result.Returned != 50 || !*result.Truncated {
-		t.Fatalf("envelope total=%d matched=%d returned=%d truncated=%v", *result.Total, *result.Matched, *result.Returned, *result.Truncated)
+	if *result.Total != 640 || *result.Returned != 50 || !*result.Truncated {
+		t.Fatalf("envelope total=%d returned=%d truncated=%v", *result.Total, *result.Returned, *result.Truncated)
 	}
 	wantDistribution := map[string]int{ResourceBudgetUnderProvisioned: 20, ResourceBudgetOverProvisioned: 70,
 		ResourceBudgetAcceptable: 30, ResourceBudgetWellFitted: 20, ResourceBudgetUnevaluated: 500}
@@ -144,7 +144,7 @@ func TestConfineBudgetDirectionAndGrep(t *testing.T) {
 	for direction, want := range map[string]int{"under": 20, "over": 70, "well": 20, "acceptable": 30, "unevaluated": 500,
 		ResourceBudgetUnderProvisioned: 20, ResourceBudgetOverProvisioned: 70, ResourceBudgetWellFitted: 20, "actionable": 90, "all": 640} {
 		result := runSelection(t, direction, "0", "", seededBudgetRows())
-		if len(result.Subjects) != want || *result.Matched != want {
+		if len(result.Subjects) != want || *result.Returned != want {
 			t.Fatalf("--direction %s: %d rows, want %d", direction, len(result.Subjects), want)
 		}
 	}

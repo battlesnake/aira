@@ -94,9 +94,8 @@ func renderConfineBudgetResponse(response core.Response, grep string, stdout, st
 			_, _ = fmt.Fprintf(stdout, "  %s: unevaluated — %s\n", elideBudgetSubject(row.Subject), row.UnevaluatedReason)
 		}
 	}
-	if result.Truncated != nil && *result.Truncated && result.Total != nil && result.Matched != nil && result.Returned != nil {
-		_, _ = fmt.Fprintf(stdout, "%d more not shown (%d beyond --limit, %d in other directions); widen with --limit N (0 = all) and --direction D|all\n",
-			*result.Total-*result.Returned, *result.Matched-*result.Returned, *result.Total-*result.Matched)
+	if result.Truncated != nil && *result.Truncated && result.Total != nil && result.Returned != nil {
+		_, _ = fmt.Fprintf(stdout, "%d more not shown; widen with --limit N (0 = all) and/or --direction D|all\n", *result.Total-*result.Returned)
 	}
 	return 0
 }

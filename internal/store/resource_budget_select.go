@@ -85,7 +85,6 @@ type ConfineBudgetSelector struct {
 	filter       ConfineBudgetFilter
 	kept         confineBudgetHeap
 	total        int
-	matched      int
 	distribution map[string]int
 }
 
@@ -111,7 +110,6 @@ func (s *ConfineBudgetSelector) Add(rows []runner.ConfineBudgetRow) {
 		if s.filter.Directions != nil && !s.filter.Directions[row.Direction] {
 			continue
 		}
-		s.matched++
 		switch {
 		case s.filter.Limit == 0 || len(s.kept) < s.filter.Limit:
 			heap.Push(&s.kept, row)
@@ -131,10 +129,10 @@ func (s *ConfineBudgetSelector) Finish(result *runner.ConfineBudgetResult) {
 		rows = []runner.ConfineBudgetRow{}
 	}
 	SortConfineBudgetRows(rows)
-	total, matched, returned := s.total, s.matched, len(rows)
+	total, returned := s.total, len(rows)
 	truncated := returned < total
 	result.Subjects = rows
-	result.Total, result.Matched, result.Returned, result.Truncated = &total, &matched, &returned, &truncated
+	result.Total, result.Returned, result.Truncated = &total, &returned, &truncated
 	result.Distribution = s.distribution
 }
 
