@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -95,6 +97,120 @@ func TestConfineKillDeliveredButUnconfirmedSaysSo(t *testing.T) {
 		if errors.Is(err, ErrConfineKillDelivered) || strings.Contains(err.Error(), "SIGKILL delivered") {
 			t.Fatalf("a failed cgroup.kill write claims delivery: %v", err)
 		}
+	})
+}
+
+// runWithFsyncFailing runs fn on a fresh, locked OS thread whose every fsync(2)
+// fails EIO (a thread-local seccomp filter), so a cgroup.kill write succeeds and
+// only its sync fails. The goroutine exits still locked, which destroys the
+// thread and the filter with it; nothing else ever runs on that thread.
+func runWithFsyncFailing(t *testing.T, fn func()) {
+	t.Helper()
+	installErr := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			installErr <- err
+			return
+		}
+		filters := []unix.SockFilter{
+			{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0}, // seccomp_data.nr
+			{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: unix.SYS_FSYNC, Jf: 1},
+			{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | uint32(unix.EIO)},
+			{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+		}
+		program := unix.SockFprog{Len: uint16(len(filters)), Filter: &filters[0]}
+		if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&program)), 0, 0); err != nil {
+			installErr <- err
+			return
+		}
+		installErr <- nil
+		fn()
+		installErr <- nil
+	}()
+	if err := <-installErr; err != nil {
+		t.Skipf("unevaluated: cannot install a thread-local seccomp fsync filter: %v", err)
+	}
+	<-installErr
+}
+
+// verifies: AIRA-339 (a), Sol round-4 finding -- the cgroup.kill WRITE is the
+// kill (the kernel signals inside it), so a sync failure after a successful
+// write delivered SIGKILL too and must say so, with the delivered marker the
+// daemon's confirmed=false audit line keys on. The decision is unchanged: the
+// same unconfirmed code, never "killed", and no emptiness wait (the old path
+// returned straight from Kill's error). Its text is the sync error's own.
+func TestConfineKillSyncFailureAfterWriteSaysDelivered(t *testing.T) {
+	check := func(t *testing.T, result ConfineKillResult, err error, id string, waited bool) {
+		t.Helper()
+		if err == nil || !strings.HasPrefix(err.Error(), CodeConfineKillUnconfirmed+":") || result.Status == ConfineKillStatusKilled {
+			t.Fatalf("result=%+v err=%v, want %s and not killed", result, err, CodeConfineKillUnconfirmed)
+		}
+		if waited {
+			t.Fatal("a Kill error now proceeds to the emptiness wait: the decision changed")
+		}
+		if !errors.Is(err, ErrConfineKillDelivered) || !errors.Is(err, unix.EIO) {
+			t.Fatalf("err=%v, want the delivered marker and the sync cause (EIO)", err)
+		}
+		if !strings.Contains(err.Error(), "SIGKILL delivered to every process in scope "+id) || !strings.Contains(err.Error(), "sync cgroup.kill") {
+			t.Fatalf("message %q lacks the delivery or the sync cause", err.Error())
+		}
+		if result.ScopeID != id || result.Owner != "owner" || result.Phase != ConfineKillPhaseRunning {
+			t.Fatalf("result does not identify the target for the audit line: %+v", result)
+		}
+	}
+	t.Run("fake-slice", func(t *testing.T) {
+		slice := t.TempDir()
+		id := confineTestOwnedScopeID("syncfail", "owner", 4414, time.Now().UnixNano())
+		path := writeConfineTestScope(t, slice, id, "91\n")
+		deps := defaultConfineScanDeps()
+		waited := false
+		deps.waitEmpty = func(context.Context, Scope, time.Duration) error { waited = true; return nil }
+		var result ConfineKillResult
+		var err error
+		runWithFsyncFailing(t, func() {
+			result, err = killConfineWithDeps(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id}}, 2*time.Second, deps)
+		})
+		if data, _ := os.ReadFile(filepath.Join(path, "cgroup.kill")); string(data) != "1" {
+			t.Fatalf("cgroup.kill=%q, want the kill written", data)
+		}
+		check(t, result, err, id, waited)
+	})
+	// The reviewer's real-kernel counterexample: the workload is really dead.
+	t.Run("real-cgroup", func(t *testing.T) {
+		parent := cgrouptest.IsolatedScopeParent(t)
+		backend := newDefaultBackend(parent)
+		if err := backend.Probe(context.Background()); err != nil {
+			cgrouptest.SkipOrFailRealCgroup(t, "real cgroup backend unavailable: %v", err)
+		}
+		id := confineTestOwnedScopeID("syncfail", "owner", 5511, time.Now().UnixNano())
+		scope, err := backend.Create(context.Background(), id)
+		if err != nil {
+			cgrouptest.SkipOrFailRealCgroup(t, "real scope unavailable: %v", err)
+		}
+		fd, err := unix.Open(scope.Reference(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			cgrouptest.SkipOrFailRealCgroup(t, "scope fd unavailable: %v", err)
+		}
+		defer unix.Close(fd)
+		workload := exec.Command("/bin/sleep", "60")
+		workload.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: fd}
+		if err := workload.Start(); err != nil {
+			cgrouptest.SkipOrFailRealCgroup(t, "start workload in scope: %v", err)
+		}
+		defer func() { _ = workload.Process.Kill(); _ = workload.Wait() }()
+		deps := defaultConfineScanDeps()
+		waited := false
+		deps.waitEmpty = func(context.Context, Scope, time.Duration) error { waited = true; return nil }
+		var result ConfineKillResult
+		var killErr error
+		runWithFsyncFailing(t, func() {
+			result, killErr = killConfineWithDeps(context.Background(), parent, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id}}, 2*time.Second, deps)
+		})
+		if err := waitEmpty(context.Background(), scope, 5*time.Second); err != nil {
+			t.Fatalf("the cgroup.kill write did not kill the workload: %v", err)
+		}
+		check(t, result, killErr, id, waited)
 	})
 }
 
