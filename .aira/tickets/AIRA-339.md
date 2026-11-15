@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-339","project":"aira","title":"confine --kill honesty (wording only): a delivered-but-unconfirmed kill says so; a dead-supervisor empty scope says it has ended, not 'retry'","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.44","labels":[],"hold":true,"relations":[]}
+{"schema":1,"id":"AIRA-339","project":"aira","title":"confine --kill honesty (wording only): a delivered-but-unconfirmed kill says so; a dead-supervisor empty scope says it has ended, not 'retry'","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.44","labels":[],"hold":false,"relations":[]}
 ---
 
 
