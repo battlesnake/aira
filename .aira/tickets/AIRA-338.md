@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-338","project":"aira","title":"claim/heartbeat on an expired lease return bare E_LEASE_EXPIRED: name the holder and the remedy (--steal)","status":"in-review","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.43","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-338","project":"aira","title":"claim/heartbeat on an expired lease return bare E_LEASE_EXPIRED: name the holder and the remedy (--steal)","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.43","labels":[],"hold":false,"relations":[]}
 ---
 
 
