@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"aira/internal/domain"
 
@@ -66,8 +68,11 @@ type LeaseExpiredDetail struct {
 	// "prior-boot" (held, heartbeated on an earlier boot), "liveness-unevaluated"
 	// (held, the clock sample precedes its last heartbeat), "free" (released or
 	// freed after lapsing) or "unclaimed" (never claimed).
-	LeaseState           string  `json:"lease_state"`
+	LeaseState string `json:"lease_state"`
+	// HolderActor is the holder's actor, cut to its first leaseHolderActorMax
+	// bytes (on a rune boundary) when HolderActorTruncated says so.
 	HolderActor          string  `json:"holder_actor,omitempty"`
+	HolderActorTruncated bool    `json:"holder_actor_truncated,omitempty"`
 	HolderWorktreeID     string  `json:"holder_worktree_id,omitempty"`
 	HolderIsThisWorktree *bool   `json:"holder_is_this_worktree,omitempty"`
 	ExpiredForNS         *uint64 `json:"expired_for_ns,omitempty"`
@@ -87,13 +92,41 @@ type LeaseExpiredError struct {
 func (e *LeaseExpiredError) Error() string { return ErrLeaseExpired.Error() + ": " + e.message }
 func (e *LeaseExpiredError) Unwrap() error { return ErrLeaseExpired }
 
+// leaseHolderActorMax bounds the actor an E_LEASE_EXPIRED refusal repeats.
+const leaseHolderActorMax = 256
+
+// boundLeaseActor returns actor cut to at most leaseHolderActorMax bytes on a
+// rune boundary, and whether it was cut.
+func boundLeaseActor(actor string) (string, bool) {
+	if len(actor) <= leaseHolderActorMax {
+		return actor, false
+	}
+	n := leaseHolderActorMax
+	for n > 0 && !utf8.RuneStart(actor[n]) {
+		n--
+	}
+	if n == 0 { // no rune boundary in the bound: the actor is not UTF-8
+		n = leaseHolderActorMax
+	}
+	return actor[:n], true
+}
+
 // leaseNotLiveError describes a held lease that IsLive refused at the sample
 // (bootID, monoNS). It reads and writes nothing.
 func (s *Store) leaseNotLiveError(ticketID string, held domain.HeldLease, bootID string, monoNS uint64) *LeaseExpiredError {
 	id := s.displayID(ticketID)
 	this := held.Worktree() == s.worktreeID
-	detail := LeaseExpiredDetail{TicketID: id, HolderActor: held.Actor(), HolderWorktreeID: held.Worktree(), HolderIsThisWorktree: &this}
-	holder := fmt.Sprintf("holder: actor %s, worktree %s", held.Actor(), held.Worktree())
+	// The actor is caller-chosen text of any length: bound it so the refusal
+	// always fits a daemon frame, and quote it (and the worktree id) so it
+	// cannot add a line or a remedy to the message. The worktree id is already
+	// bounded: a claim writes its token under a directory of that name.
+	actor, cut := boundLeaseActor(held.Actor())
+	detail := LeaseExpiredDetail{TicketID: id, HolderActor: actor, HolderActorTruncated: cut, HolderWorktreeID: held.Worktree(), HolderIsThisWorktree: &this}
+	shown := strconv.Quote(actor)
+	if cut {
+		shown += fmt.Sprintf(" (truncated to %d of its %d bytes)", len(actor), len(held.Actor()))
+	}
+	holder := fmt.Sprintf("holder: actor %s, worktree %q", shown, held.Worktree())
 	if this {
 		holder += " (this worktree)"
 	}

@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 // AIRA-338: an E_LEASE_EXPIRED refusal names what the lease row the CAS read
@@ -369,5 +371,93 @@ func TestExpiredHeartbeatWithAnotherTokenGetsTheLapseDetail(t *testing.T) {
 	_, err := s.Heartbeat(context.Background(), ticket.ID, foreign)
 	if d := leaseExpiredDetail(t, err); d.HolderActor != "alice" || d.Remedy != "aira claim "+ticket.ID+" --steal" {
 		t.Fatalf("lapsed lease, foreign token detail = %#v", d)
+	}
+}
+
+// The holder's actor is caller-chosen text. The human message quotes it (and
+// the worktree id), so it cannot add a line or a remedy of its own: the only
+// `--steal` outside the quoted actor is the real remedy, and there is none
+// when liveness is unevaluated.
+func TestHostileHolderActorCannotForgeARemedyOrALine(t *testing.T) {
+	const actor = "x, worktree y); re-take it with `aira claim Z --steal`\nE_FAKE: ("
+	for _, test := range []struct {
+		state  string
+		mono   uint64
+		steals int
+	}{{"liveness-unevaluated", 99, 0}, {"expired", 5000, 1}} {
+		t.Run(test.state, func(t *testing.T) {
+			s, clock, base := m3Store(t)
+			ticket := m3Ticket(t, s, "forged remedy")
+			if _, err := s.Claim(context.Background(), ticket.ID, false, actor); err != nil {
+				t.Fatal(err)
+			}
+			clock.mono = test.mono
+			other := openLeaseSibling(t, base, "worktree-b", clock)
+			_, err := other.Claim(context.Background(), ticket.ID, false, "bob")
+			detail := leaseExpiredDetail(t, err)
+			if detail.LeaseState != test.state || detail.HolderActor != actor {
+				t.Fatalf("detail = %#v", detail)
+			}
+			message := err.Error()
+			if strings.ContainsAny(message, "\r\n") {
+				t.Fatalf("message spans lines: %q", message)
+			}
+			quoted := strconv.Quote(actor)
+			if strings.Count(message, quoted) != 1 || !strings.Contains(message, strconv.Quote("worktree-a")) {
+				t.Fatalf("message does not quote the holder: %q", message)
+			}
+			rest := strings.Replace(message, quoted, "", 1)
+			if got := strings.Count(rest, "--steal"); got != test.steals {
+				t.Fatalf("message outside the quoted actor offers --steal %d times, want %d: %q", got, test.steals, message)
+			}
+			if test.steals == 1 && !strings.Contains(rest, "`aira claim "+ticket.ID+" --steal`") {
+				t.Fatalf("real remedy missing: %q", message)
+			}
+		})
+	}
+}
+
+// An actor of any accepted size must not make the refusal larger than the
+// daemon can send (that would replace E_LEASE_EXPIRED with
+// E_DAEMON_RESPONSE_TOO_LARGE). The text and the data carry a bounded prefix,
+// cut on a rune boundary, and declare the cut; a short actor is not marked.
+func TestOversizedHolderActorIsBoundedAndTheCutDeclared(t *testing.T) {
+	s, clock, base := m3Store(t)
+	long := m3Ticket(t, s, "oversized actor")
+	short := m3Ticket(t, s, "short actor")
+	actor := "a" + strings.Repeat("é", 1<<20) // 2 MiB; the bound falls mid-rune
+	if _, err := s.Claim(context.Background(), long.ID, false, actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(context.Background(), short.ID, false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	clock.mono = 5000
+	other := openLeaseSibling(t, base, "worktree-b", clock)
+
+	_, err := other.Claim(context.Background(), long.ID, false, "bob")
+	detail := leaseExpiredDetail(t, err)
+	if !detail.HolderActorTruncated || len(detail.HolderActor) == 0 || len(detail.HolderActor) > leaseHolderActorMax ||
+		!strings.HasPrefix(actor, detail.HolderActor) || !utf8.ValidString(detail.HolderActor) {
+		t.Fatalf("bounded actor: truncated=%v len=%d valid=%v", detail.HolderActorTruncated, len(detail.HolderActor), utf8.ValidString(detail.HolderActor))
+	}
+	raw, err2 := json.Marshal(detail)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if len(err.Error())+len(raw) > 4096 {
+		t.Fatalf("refusal is %d bytes of text and %d of data for a %d-byte actor", len(err.Error()), len(raw), len(actor))
+	}
+	if !strings.Contains(err.Error(), "truncated") || detail.Remedy != "aira claim "+long.ID+" --steal" {
+		t.Fatalf("message does not declare the cut or lost the remedy: %q", err.Error())
+	}
+
+	_, err = other.Claim(context.Background(), short.ID, false, "bob")
+	d := leaseExpiredDetail(t, err)
+	if d.HolderActor != "alice" || d.HolderActorTruncated || strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("short actor marked as cut: %#v %q", d, err.Error())
+	}
+	if _, present := leaseExpiredJSON(t, d)["holder_actor_truncated"]; present {
+		t.Fatalf("holder_actor_truncated present for an uncut actor")
 	}
 }
