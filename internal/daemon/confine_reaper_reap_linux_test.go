@@ -174,9 +174,7 @@ func TestReleaseStaleGrantedLeasesPassDoesNotReleaseOrReapAReplacementWithTheSam
 	queue.waiters = append(queue.waiters, replacement)
 	queue.outstanding, queue.outstandingJobs = 4096, 1
 	queue.mu.Unlock()
-	server.admitRegistryMu.Lock()
-	server.admitQueues[slicePath] = queue
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 
 	for _, candidate := range candidates {
 		server.releaseStaleLeaseCandidate(candidate)
@@ -221,7 +219,7 @@ func TestStaleGrantedLeasesNeverSelectsAScopelessReservation(t *testing.T) {
 		scopeID: staleLeaseTestScopeID("control"), name: "control", owner: "session-a",
 	}
 	queue.waiters = []*admitWaiter{reservation, control}
-	server.admitQueues[path] = queue
+	registerAdmitQueue(server, queue)
 
 	candidates := server.staleGrantedLeases(15 * time.Minute)
 	if len(candidates) != 1 || candidates[0].waiter != control {

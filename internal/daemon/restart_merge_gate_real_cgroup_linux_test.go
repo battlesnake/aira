@@ -89,13 +89,15 @@ func mergeGateSlice(t *testing.T) string {
 	return slice
 }
 
-// startGateServer starts a daemon on paths with real slice resolution (runner.Confine
-// creates a real cgroup, so the daemon must read the real slice) and fixture-scaled
-// headroom. It returns the server plus a manual cancel+done so the test controls the A->B
-// restart itself; the caller is responsible for shutting it down.
-func startGateServer(t *testing.T, paths Paths) (*Server, context.CancelFunc, <-chan error) {
+// startGateServer starts a daemon on paths that serves the fixture slice as its one
+// slice (runner.Confine creates a real cgroup, so the daemon must read the real fixture;
+// AIRA-228's one-slice guard refuses any other slice) with fixture-scaled headroom. It
+// returns the server plus a manual cancel+done so the test controls the A->B restart
+// itself; the caller is responsible for shutting it down.
+func startGateServer(t *testing.T, paths Paths, slice string) (*Server, context.CancelFunc, <-chan error) {
 	t.Helper()
 	server := NewServer(paths)
+	serveFixtureSlice(t, server, slice)
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
 	server.admitPollInterval = 5 * time.Millisecond
@@ -125,25 +127,23 @@ func awaitGateShutdown(t *testing.T, done <-chan error) {
 	}
 }
 
-// gateLeases walks every admit queue and returns the granted+accounted leases as
-// scope_id -> reserve. The gate uses one slice, so this is that slice's ledger.
+// gateLeases returns the admission queue's granted+accounted leases as
+// scope_id -> reserve: the one slice's ledger.
 func gateLeases(server *Server) map[string]int64 {
 	server.admitRegistryMu.Lock()
-	queues := make([]*sliceQueue, 0, len(server.admitQueues))
-	for _, q := range server.admitQueues {
-		queues = append(queues, q)
-	}
+	q := server.admitQueue
 	server.admitRegistryMu.Unlock()
 	out := map[string]int64{}
-	for _, q := range queues {
-		q.mu.Lock()
-		for _, w := range q.waiters {
-			if w != nil && w.state == admitGranted && w.accounted {
-				out[w.scopeID] = w.reserve
-			}
-		}
-		q.mu.Unlock()
+	if q == nil {
+		return out
 	}
+	q.mu.Lock()
+	for _, w := range q.waiters {
+		if w != nil && w.state == admitGranted && w.accounted {
+			out[w.scopeID] = w.reserve
+		}
+	}
+	q.mu.Unlock()
 	return out
 }
 
@@ -191,7 +191,7 @@ func TestRestartMergeGateSurvivorReDeclaresNonSurvivorAbsent(t *testing.T) {
 	slice := mergeGateSlice(t)
 	paths := testPaths(t)
 
-	serverA, cancelA, doneA := startGateServer(t, paths)
+	serverA, cancelA, doneA := startGateServer(t, paths, slice)
 
 	confineReq := func(name string) runner.ConfineRequest {
 		return runner.ConfineRequest{
@@ -266,7 +266,7 @@ func TestRestartMergeGateSurvivorReDeclaresNonSurvivorAbsent(t *testing.T) {
 	awaitGateShutdown(t, doneA)
 
 	// Daemon B on the SAME socket: an EMPTY ledger with the 2s freeze armed at listen-ready.
-	serverB, cancelB, doneB := startGateServer(t, paths)
+	serverB, cancelB, doneB := startGateServer(t, paths, slice)
 	defer func() { cancelB(); awaitGateShutdown(t, doneB) }()
 
 	if pre := gateLeases(serverB); len(pre) != 0 {

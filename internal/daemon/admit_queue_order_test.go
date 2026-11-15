@@ -389,7 +389,7 @@ func TestAdmitSnapshotFollowsTheEvaluationOrder(t *testing.T) {
 	a, b, c := frontWaiter(1, "alpha", "s-1"), frontWaiter(2, "bravo", "s-1"), frontWaiter(3, "charlie", "s-1")
 	a.reserve, b.reserve, c.reserve = 1*qGiB, 2*qGiB, 3*qGiB
 	queue := queueOf(server, a, b, c)
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 	mustPush(t, queue, c.scopeID)
 
 	snapshot := server.admitSliceSnapshotFor("/slice", a.scopeID)
@@ -515,7 +515,7 @@ func TestConfineFrontHandlerLogsOnlyOnSuccessAndKicksTheQueue(t *testing.T) {
 			first, target := frontWaiter(1, "first", "s-1"), frontWaiter(2, "target", "s-1")
 			queue := queueOf(server, first, target)
 			queue.path = path
-			server.admitQueues[path] = queue
+			registerAdmitQueue(server, queue)
 			request := func(caller string) core.Request {
 				return core.Request{Verb: "confine-front", Args: map[string]any{"slice": "aira.slice", "selector": "target", "owner": caller}}
 			}
@@ -598,7 +598,7 @@ func TestAdmitRestartDropsPushesAndBudgets(t *testing.T) {
 	before := queueOrderServer(t, 64*qGiB, &now)
 	pushedWaiter := frontWaiter(1, "pushed", "s-1")
 	queue := queueOf(before, pushedWaiter)
-	before.admitQueues["/slice"] = queue
+	registerAdmitQueue(before, queue)
 	mustPush(t, queue, pushedWaiter.scopeID)
 
 	restarted := queueOrderServer(t, 64*qGiB, &now)
@@ -679,7 +679,7 @@ func TestAdmitPushedHeadIsReportedAsPushedPhase(t *testing.T) {
 			head.reserve = 24 * qGiB
 			small := frontWaiter(3, "small", "s-1")
 			queue := queueOf(server, held, head, small)
-			server.admitQueues["/slice"] = queue
+			registerAdmitQueue(server, queue)
 			mustPush(t, queue, head.scopeID)
 
 			server.evaluateAdmitQueue(queue)
@@ -774,7 +774,7 @@ func TestAdmitRejectedPushedHolderIsNotReportedAsPushed(t *testing.T) {
 	head := frontWaiter(2, "head", "s-1")
 	head.reserve = 24 * qGiB
 	queue := queueOf(server, heldLease(1, 44*qGiB), head)
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 	mustPush(t, queue, head.scopeID)
 	server.evaluateAdmitQueue(queue)
 	queue.mu.Lock()

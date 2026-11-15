@@ -249,7 +249,8 @@ func TestS5InPassGrantChargesCPUBeforeNextFit(t *testing.T) {
 }
 
 // verifies: S5 / P1 (Fable) — per-slice CPU self-containment. Q1 on /P is released
-// and pruned; Q2, a NEW queue on the SAME path, holds the whole ceiling; Q1's stale
+// (AIRA-228: a drained queue is no longer pruned and rebuilt, so this hand-built
+// two-object shape is now only a standing guard); Q2, a NEW queue on the SAME path, holds the whole ceiling; Q1's stale
 // evaluator pass runs; Q2 must still gate its own slice on its own intact
 // cpuOutstanding. This is GREEN by construction — each queue's CPU sum lives on the
 // queue, so nothing a pruned Q1 does can touch Q2.
@@ -275,11 +276,8 @@ func TestS5PrunedQueueStalePassDoesNotEraseSuccessorCPU(t *testing.T) {
 	registerAdmitQueue(server, q1)
 	server.evaluateAdmitQueue(q1)
 	server.releaseAdmitWaiter(q1, lease1)
-	server.admitRegistryMu.Lock()
-	_, still := server.admitQueues["/P"]
-	server.admitRegistryMu.Unlock()
-	if still {
-		t.Fatal("precondition: q1 should have been pruned")
+	if live := liveAdmitQueueCount(server); live != 0 {
+		t.Fatalf("precondition: q1 should hold nothing once released (live queues=%d)", live)
 	}
 
 	// Q2, the successor on the SAME path, holds the whole ceiling (4 cores) and has a
@@ -356,11 +354,8 @@ func TestS5CPUOverCeilingRefusedNeverEnqueues(t *testing.T) {
 	if !(rej.Required > 0 && rej.Ceiling >= 0 && strings.TrimSpace(rej.Basis) != "") {
 		t.Fatalf("rejection payload {Required:%d Ceiling:%d Basis:%q} does not satisfy the client's terminal-refusal contract (Required>0 && Ceiling>=0 && Basis!=\"\"); the client would flock-fallback", rej.Required, rej.Ceiling, rej.Basis)
 	}
-	server.admitRegistryMu.Lock()
-	queues := len(server.admitQueues)
-	server.admitRegistryMu.Unlock()
-	if queues != 0 {
-		t.Fatalf("an impossible-cpu request must NEVER enqueue; %d queue(s) were created", queues)
+	if admitQueueCreated(server) {
+		t.Fatal("an impossible-cpu request must NEVER enqueue; a queue was created")
 	}
 	_ = clientConn.Close()
 }

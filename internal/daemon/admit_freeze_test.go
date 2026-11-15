@@ -187,8 +187,7 @@ func TestAdmitFreezeHolderChurnDoesNotExtendTheFreeze(t *testing.T) {
 
 	headA := queuedWaiter(1, 60, now.Add(-10*time.Second))
 	// A tail waiter keeps the queue non-empty, so releasing headA below does not
-	// trip pruneAdmitQueue into destroying the queue underneath the test — which
-	// would make this assert against a stale object rather than live behaviour.
+	// end the population (which takes its freeze anchor with it, AIRA-228).
 	// It does not fit either, so after headA leaves IT is the head (budget 35).
 	tail := queuedWaiter(99, 70, now.Add(-10*time.Second))
 	// 36 exceeds every head's budget in this test (30, then 35), so it is the
@@ -625,9 +624,7 @@ func TestAdmitQueueDiagnosticsReportQueuedAndFreezePhase(t *testing.T) {
 	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
 	small := queuedWaiter(2, 35, now)
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
-	server.admitRegistryMu.Lock()
-	server.admitQueues["/slice"] = queue
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 
 	server.evaluateAdmitQueue(queue)
 	queued, phase := server.admitQueueDiagnostics("/slice")

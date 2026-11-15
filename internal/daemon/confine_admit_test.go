@@ -220,11 +220,8 @@ func TestPinnedTooLargeRejectedBeforeQueue(t *testing.T) {
 	}
 	_ = clientConn.Close()
 	<-done
-	server.admitRegistryMu.Lock()
-	queues := len(server.admitQueues)
-	server.admitRegistryMu.Unlock()
-	if queues != 0 {
-		t.Fatalf("too-large request created %d queues", queues)
+	if admitQueueCreated(server) {
+		t.Fatal("too-large request created a queue")
 	}
 }
 

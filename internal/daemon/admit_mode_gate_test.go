@@ -250,11 +250,9 @@ func TestS4AdmitConnectionFailsClosedWhenSliceUnreadable(t *testing.T) {
 				t.Fatalf("an unreadable slice must fail CLOSED with %s, not a grant-shaped response (code=%q data=%s)", tc.wantCode, frame.Code, frame.Data)
 			}
 			<-done
-			server.admitRegistryMu.Lock()
-			if len(server.admitQueues) != 0 {
-				t.Fatalf("a fail-closed refusal must not enqueue anything: %d", len(server.admitQueues))
+			if admitQueueCreated(server) {
+				t.Fatal("a fail-closed refusal must not enqueue anything")
 			}
-			server.admitRegistryMu.Unlock()
 		})
 	}
 }

@@ -50,7 +50,7 @@ func TestConfineKillLogsTheKillerOnlyWhenItActuallyKills(t *testing.T) {
 			grantedCh: make(chan struct{}), enqueued: time.Now(), scopeID: id, name: "victim", owner: owner,
 		}}
 		queue.outstanding, queue.outstandingJobs = 64, 1
-		server.admitQueues[slice] = queue
+		registerAdmitQueue(server, queue)
 		return server, id, queue
 	}
 	killReq := func(id, caller string) core.Request {

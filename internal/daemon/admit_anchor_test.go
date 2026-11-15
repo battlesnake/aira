@@ -149,7 +149,7 @@ func TestReconnectRaceBothLockOrders(t *testing.T) {
 	t.Run("old EOF first, re-declare re-inserts fresh", func(t *testing.T) {
 		server := anchorTestServer()
 		queue, lease, connA := grantedAnchorLease(server, "CONFINE-job-3-cccc", 2*gib)
-		// A filler lease keeps the queue from being pruned (and its evaluator untouched)
+		// A filler lease keeps the queue's population alive (and its evaluator untouched)
 		// after the scope-3 lease is released, so the re-declare below lands in THIS
 		// queue deterministically with no evaluator auto-granting.
 		filler := &admitWaiter{
@@ -411,7 +411,7 @@ func TestAdmitConnectionReDeclareReleaseLifecycle(t *testing.T) {
 	connB, doneB := admit() // re-declare SAME scope, re-anchored + granted (anchored to B)
 
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues["/slice"]
+	queue := admitQueueAtLocked(server, "/slice")
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		t.Fatal("no admit queue after two admits")
@@ -465,7 +465,7 @@ func TestAdmitConnectionReDeclareOtherUIDRefused(t *testing.T) {
 	admitGrantData(t, frameA)
 
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues["/slice"]
+	queue := admitQueueAtLocked(server, "/slice")
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		t.Fatal("no admit queue after A's admit")
@@ -528,7 +528,7 @@ func TestAdmitConnectionReDeclareUnreadableCredentialFailsClosed(t *testing.T) {
 	admitGrantData(t, frameA)
 
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues["/slice"]
+	queue := admitQueueAtLocked(server, "/slice")
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		t.Fatal("no admit queue after A's admit")

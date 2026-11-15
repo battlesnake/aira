@@ -123,20 +123,17 @@ type Server struct {
 	// because a concurrent evaluator pass may read it while listen-ready arms it.
 	restartFreeze           time.Duration
 	restartFreezeUntilNanos atomic.Int64
-	admitRegistryMu         sync.Mutex
-	admitQueues             map[string]*sliceQueue
-	// AIRA-247. The DURABLE fail-fast latch, keyed by slice path, guarded by
-	// admitRegistryMu (the mutex that already guards admitQueues, and the outer of
-	// the admitRegistryMu→queue.mu order pruneAdmitQueue establishes). It outlives
-	// any single sliceQueue: pruneAdmitQueue deletes an emptied queue, but a trip
-	// must keep refusing across that prune, so the master latch lives here and each
-	// queue takes a copy at creation. Only ever SET (a trip is terminal for the
-	// gate); a ci-shim daemon is ephemeral per CI run, so it is never cleared.
-	failfastTripped map[string]bool
+	// admitRegistryMu guards admitQueue and the cancelled-scope record below. It
+	// is the OUTER lock of the one fixed order in the admission code:
+	// admitRegistryMu, then queue.mu.
+	admitRegistryMu sync.Mutex
+	// admitQueue is the daemon's ONE admission queue (AIRA-228); nil until first
+	// use. See admitQueueLocked.
+	admitQueue *sliceQueue
 	// AIRA-328. Scope ids an operator cancelled while queued (`confine --kill`),
-	// guarded by admitRegistryMu like failfastTripped and for the same reason: the
-	// cancel must outlive the waiter. A cancel whose reply the client never reads
-	// (a dropped connection) sends the client back through its transport
+	// guarded by admitRegistryMu, because the cancel must outlive the waiter. A
+	// cancel whose reply the client never reads (a dropped connection) sends the
+	// client back through its transport
 	// reconnect with the SAME scope id; without this the reconnect would queue
 	// afresh and run the job the operator was told was cancelled. Each id is
 	// forgotten cancelledScopeRetention after its cancel (cancelledScopeOrder is
@@ -236,6 +233,13 @@ type Server struct {
 	// can grant a waiter between the enqueue and the test seeding its precondition).
 	// Production never sets it.
 	admitManualEvaluation bool
+	// admitEvaluatorParking is a test seam, nil in production. The evaluator calls
+	// it each time it is about to block in its select, on its own goroutine and
+	// with no lock held, saying whether that select polls (true) or waits only for
+	// a kick (false). A test that holds the evaluator here can read the kick buffer
+	// while nothing can drain it, which proves quiescence where a quiet window
+	// cannot.
+	admitEvaluatorParking func(polling bool)
 	// AIRA-247. failfastSignalPID delivers the fail-fast cancellation to one
 	// victim SUPERVISOR (SIGUSR1 → the supervisor forwards to the job's process
 	// group; unhandled, SIGUSR1's default action is Term). Nil in production →
@@ -287,7 +291,6 @@ func NewServer(paths Paths) *Server {
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
 		admitFreezeMaxHold:           defaultAdmitFreezeMaxHold,
 		restartFreeze:                defaultRestartFreeze,
-		admitQueues:                  map[string]*sliceQueue{},
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
@@ -643,7 +646,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	drained := make(chan struct{})
 	go func() {
 		connections.Wait()
-		s.pruneAdmitRegistry()
+		s.retireAdmitQueue()
 		<-reaperDone
 		<-flusherDone
 		<-discoveryDone

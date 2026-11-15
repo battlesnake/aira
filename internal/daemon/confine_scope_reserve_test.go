@@ -109,7 +109,7 @@ func TestConfineListPublishesTheLedgerChargeNotTheDelegateScopeCeiling(t *testin
 		seq: 1, reserve: charge, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
 		scopeID: scopeID, name: "suite", owner: "session-a",
 	}}
-	server.admitQueues[slice] = queue
+	registerAdmitQueue(server, queue)
 
 	record := reserveScopeByID(t, reserveListing(t, server), scopeID)
 	if record.ReserveBytes == nil {
@@ -142,7 +142,7 @@ func TestConfineListLeavesAnUnknownScopeReserveUnevaluated(t *testing.T) {
 	// A queue exists (so the snapshot is `present`) but knows nothing about this
 	// scope: the strictly harder case than no queue at all, because the daemon has
 	// state to answer from and must still decline.
-	server.admitQueues[slice] = &sliceQueue{path: slice, server: server}
+	registerAdmitQueue(server, &sliceQueue{path: slice, server: server})
 
 	record := reserveScopeByID(t, reserveListing(t, server), scopeID)
 	if record.ReserveBytes != nil {
@@ -179,7 +179,7 @@ func TestConfineListPublishesNoReserveForAnUnaccountedWaiter(t *testing.T) {
 		seq: 1, reserve: 4 << 30, state: admitGranted, accounted: false, grantedCh: make(chan struct{}),
 		scopeID: scopeID, name: "unaccounted", owner: "session-a",
 	}}
-	server.admitQueues[slice] = queue
+	registerAdmitQueue(server, queue)
 
 	result := reserveListing(t, server)
 	record := reserveScopeByID(t, result, scopeID)
@@ -227,7 +227,7 @@ func TestConfineListPerScopeReservesReconcileWithTheSliceLedger(t *testing.T) {
 			state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
 			scopeID: plainID, name: "build", owner: "session-a"},
 	}
-	server.admitQueues[slice] = queue
+	registerAdmitQueue(server, queue)
 
 	result := reserveListing(t, server)
 	if result.SliceReserve == nil {
@@ -282,7 +282,7 @@ func TestConfineListVRAMFrameAndPerScopeReconcile(t *testing.T) {
 		{seq: 2, reserve: 2 << 30, vram: 0, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
 			scopeID: plainID, name: "build", owner: "session-a"},
 	}
-	server.admitQueues[slice] = queue
+	registerAdmitQueue(server, queue)
 
 	result := reserveListing(t, server)
 	sr := result.SliceReserve

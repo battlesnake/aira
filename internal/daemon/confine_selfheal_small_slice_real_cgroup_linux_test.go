@@ -91,6 +91,7 @@ func TestSmallSliceOOMSelfHealConvergesOnTheFittedBaseline(t *testing.T) {
 	// ceiling, and a request over it is still terminally refused.
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
+	serveFixtureSlice(t, server, slice)
 	startServer(t, server)
 
 	run := smallSliceRunner(t, slice, paths)
@@ -194,6 +195,7 @@ func TestSmallSliceOOMAboveTheFittedCapIsTerminalAtTheKernel(t *testing.T) {
 	server := NewServer(paths)
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
+	serveFixtureSlice(t, server, slice)
 	startServer(t, server)
 
 	run := smallSliceRunner(t, slice, paths)
@@ -329,17 +331,12 @@ func waitForDrainedAdmitLedger(t *testing.T, server *Server) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		server.admitRegistryMu.Lock()
-		queues := make([]*sliceQueue, 0, len(server.admitQueues))
-		for _, queue := range server.admitQueues {
-			queues = append(queues, queue)
-		}
+		queue := server.admitQueue
 		server.admitRegistryMu.Unlock()
 		drained := true
-		for _, queue := range queues {
+		if queue != nil {
 			queue.mu.Lock()
-			if queue.outstandingJobs != 0 || queue.outstanding != 0 || len(queue.waiters) != 0 {
-				drained = false
-			}
+			drained = queue.outstandingJobs == 0 && queue.outstanding == 0 && len(queue.waiters) == 0
 			queue.mu.Unlock()
 		}
 		if drained {

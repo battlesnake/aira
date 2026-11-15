@@ -168,7 +168,7 @@ type staleLeaseCandidate struct {
 //     eventual close. Nobody should expect this sweep to close a live
 //     connection -- it only ever un-sticks the ledger's own bookkeeping.
 //   - Like reapOrphanedScopesPass, this only ever consults the ledger's own
-//     admitQueues. It makes no claim about any slice this daemon has never been
+//     admission queue. It makes no claim about any slice this daemon has never been
 //     asked to admit against; that is the sweep's defined scope, not a gap.
 //   - A job legitimately older than the grace can have a genuinely empty scope
 //     for a brief window on its OWN successful exit path too: after cmd.Wait()
@@ -186,25 +186,24 @@ type staleLeaseCandidate struct {
 //     sample from the estimate history a little early.
 func (s *Server) staleGrantedLeases(grace time.Duration) []staleLeaseCandidate {
 	s.admitRegistryMu.Lock()
-	queues := make(map[string]*sliceQueue, len(s.admitQueues))
-	for path, queue := range s.admitQueues {
-		queues[path] = queue
-	}
+	queue := s.liveAdmitQueueLocked()
 	s.admitRegistryMu.Unlock()
-	now := s.admitNowTime()
-	var stale []staleLeaseCandidate
-	for path, queue := range queues {
-		queue.mu.Lock()
-		for _, waiter := range queue.waiters {
-			if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" || waiter.grantedAt.IsZero() {
-				continue
-			}
-			if age := now.Sub(waiter.grantedAt); age >= grace {
-				stale = append(stale, staleLeaseCandidate{queue: queue, waiter: waiter, path: path, scopeID: waiter.scopeID, grantedFor: age})
-			}
-		}
-		queue.mu.Unlock()
+	if queue == nil {
+		return nil
 	}
+	now := s.admitNowTime()
+	path := queue.path
+	var stale []staleLeaseCandidate
+	queue.mu.Lock()
+	for _, waiter := range queue.waiters {
+		if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" || waiter.grantedAt.IsZero() {
+			continue
+		}
+		if age := now.Sub(waiter.grantedAt); age >= grace {
+			stale = append(stale, staleLeaseCandidate{queue: queue, waiter: waiter, path: path, scopeID: waiter.scopeID, grantedFor: age})
+		}
+	}
+	queue.mu.Unlock()
 	return stale
 }
 

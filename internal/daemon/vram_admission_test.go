@@ -123,11 +123,8 @@ func TestVRAMEnqueueRefusalsAreClientTerminalAndNeverEnqueue(t *testing.T) {
 			if tc.wantReq && !(rej.Required > 0 && rej.Ceiling >= 0) {
 				t.Fatalf("too-large payload {Required:%d Ceiling:%d} must satisfy Required>0 && Ceiling>=0", rej.Required, rej.Ceiling)
 			}
-			server.admitRegistryMu.Lock()
-			queues := len(server.admitQueues)
-			server.admitRegistryMu.Unlock()
-			if queues != 0 {
-				t.Fatalf("a refused vram request must NEVER enqueue; %d queue(s) created", queues)
+			if admitQueueCreated(server) {
+				t.Fatal("a refused vram request must NEVER enqueue; a queue was created")
 			}
 			_ = clientConn.Close()
 		})
@@ -143,14 +140,12 @@ func TestVRAMContendedJobIsHeldNotRefused(t *testing.T) {
 	server := vramAdmitServer(t, 14*G, 16*G, 3*G, true) // only 3G free → 2G available
 	// The queue count is sampled as the reply is written, on the handler goroutine:
 	// the waiter is released by a defer AFTER the handler returns, and releasing the
-	// last waiter prunes the now-empty queue, so counting after readFrame races that
-	// prune (AIRA-322: red under -race).
+	// last waiter leaves the queue empty (read as absent), so counting after
+	// readFrame races that release (AIRA-322: red under -race).
 	var queuesAtReply atomic.Int64
 	queuesAtReply.Store(-1)
 	server.admitWriteFrame = func(conn net.Conn, frame any) error {
-		server.admitRegistryMu.Lock()
-		queuesAtReply.Store(int64(len(server.admitQueues)))
-		server.admitRegistryMu.Unlock()
+		queuesAtReply.Store(int64(liveAdmitQueueCount(server)))
 		return writeFrame(conn, frame)
 	}
 	serverConn, clientConn := net.Pipe()

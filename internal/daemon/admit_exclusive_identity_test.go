@@ -66,8 +66,8 @@ func exclusiveOnTheWire(t *testing.T, server *Server) *runner.ConfineExclusiveSt
 //
 // The slice is deliberately kept OCCUPIED across the whole handover — there is
 // always at least one non-exclusive waiter on the queue — and that is what makes
-// the test non-porous rather than tidy. A queue with no waiters is pruned and its
-// object discarded, so any per-queue carry-over of the identity would be thrown
+// the test non-porous rather than tidy. A queue with no waiters starts its next
+// population afresh (before AIRA-228 its object was discarded), so any per-queue carry-over of the identity would be thrown
 // away with it and a cached-identity defect would go unnoticed. Keeping the SAME
 // sliceQueue alive from A's hold through B's is the only shape in which such a
 // defect is observable; verified by mutation (caching the first identity on the

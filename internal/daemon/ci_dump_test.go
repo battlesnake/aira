@@ -30,12 +30,14 @@ func injectCIDumpQueue(server *Server, path string, configure func(*sliceQueue))
 	if configure != nil {
 		configure(queue)
 	}
-	server.admitRegistryMu.Lock()
-	if server.admitQueues == nil {
-		server.admitQueues = map[string]*sliceQueue{}
+	if len(queue.waiters) == 0 {
+		// A queue that holds nothing reads as absent to every reader, the dump
+		// included (AIRA-228), so a fixture that sets only ledger fields gets one
+		// placeholder held lease to keep the queue live. It is granted (never
+		// counted as queued) and carries no reserve of its own.
+		queue.waiters = []*admitWaiter{{state: admitGranted, accounted: true}}
 	}
-	server.admitQueues[path] = queue
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 	return queue
 }
 
@@ -248,7 +250,7 @@ func TestConfineDumpQueueLeavesAvailableUnevaluatedOnADegenerateCeiling(t *testi
 func queueOutstandingFor(server *Server, path string) int64 {
 	server.admitRegistryMu.Lock()
 	defer server.admitRegistryMu.Unlock()
-	queue := server.admitQueues[path]
+	queue := admitQueueAtLocked(server, path)
 	if queue == nil {
 		return 0
 	}

@@ -32,7 +32,7 @@ const (
 func grantedWaiterScopeIDs(t *testing.T, server *Server, slicePath string) []string {
 	t.Helper()
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues[slicePath]
+	queue := admitQueueAtLocked(server, slicePath)
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		return nil
@@ -138,7 +138,7 @@ func sliceLedger(t *testing.T, server *Server, slicePath string) (outstanding, c
 	// its own goroutine) creates/deletes this map entry under admitRegistryMu, so
 	// the map read must hold that lock before dropping to the per-queue lock.
 	server.admitRegistryMu.Lock()
-	queue := server.admitQueues[slicePath]
+	queue := admitQueueAtLocked(server, slicePath)
 	server.admitRegistryMu.Unlock()
 	if queue == nil {
 		return 0, 0, 0

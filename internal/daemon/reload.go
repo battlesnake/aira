@@ -59,21 +59,18 @@ func (s *Server) runRestartFreeze(ctx context.Context) {
 		return
 	case <-after(s.restartFreeze):
 	}
-	s.signalAllAdmitQueues()
+	s.signalAdmitQueue()
 }
 
-// signalAllAdmitQueues kicks every live admit queue. Used at freeze-end so a waiter that
-// was blocked purely by the restart freeze re-evaluates at once. The queue set is
-// snapshotted under admitRegistryMu, which is released before signalling (queue.signal
-// is a non-blocking coalescing send).
-func (s *Server) signalAllAdmitQueues() {
+// signalAdmitQueue kicks the admission queue, if there is one. Used at freeze-end so a
+// waiter that was blocked purely by the restart freeze re-evaluates at once. The queue
+// is read under admitRegistryMu, which is released before signalling (queue.signal is
+// a non-blocking coalescing send).
+func (s *Server) signalAdmitQueue() {
 	s.admitRegistryMu.Lock()
-	queues := make([]*sliceQueue, 0, len(s.admitQueues))
-	for _, queue := range s.admitQueues {
-		queues = append(queues, queue)
-	}
+	queue := s.admitQueue
 	s.admitRegistryMu.Unlock()
-	for _, queue := range queues {
+	if queue != nil {
 		queue.signal()
 	}
 }

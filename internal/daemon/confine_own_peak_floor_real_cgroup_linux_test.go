@@ -50,6 +50,7 @@ func TestOwnPeakFloorRealCgroup(t *testing.T) {
 	server := NewServer(paths)
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
+	serveFixtureSlice(t, server, slice)
 	startServer(t, server)
 
 	run := func(reserve int64, pinned bool) oomSelfHealRun {

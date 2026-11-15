@@ -48,7 +48,7 @@ func TestConfineKillRetainedOutcomesDoNotReleaseReservation(t *testing.T) {
 		waiter := &admitWaiter{seq: 1, reserve: 64, state: admitGranted, accounted: true, grantedCh: make(chan struct{}), enqueued: time.Now(), scopeID: id, name: "held", owner: "session-a"}
 		queue.waiters = []*admitWaiter{waiter}
 		queue.outstanding, queue.outstandingJobs = 64, 1
-		server.admitQueues[slice] = queue
+		registerAdmitQueue(server, queue)
 		return server, id, queue, waiter
 	}
 	killReq := func(id string) core.Request {
@@ -93,7 +93,7 @@ func TestConfineRegistryLifetimeFreshLookupAndExactlyOnceRelease(t *testing.T) {
 	}
 	queue.waiters = []*admitWaiter{waiter}
 	queue.outstanding, queue.outstandingJobs = 64, 1
-	server.admitQueues[path] = queue
+	registerAdmitQueue(server, queue)
 
 	entries := server.activeConfines(path)
 	// AIRA-52: the registry now carries the scope id ALONE. Name and owner are
@@ -247,7 +247,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			{seq: 2, reserve: reservationBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
 				signature: "pytest:tools/test_x.py::test_y", grantedAt: frozen.Add(-90 * time.Second)},
 		}
-		server.admitQueues[path] = queue
+		registerAdmitQueue(server, queue)
 		return server, path
 	}
 	request := core.Request{Verb: "confine-list", Args: map[string]any{"slice": "test.slice", "owner": "session-a"}}
@@ -363,7 +363,7 @@ func TestConfineListReserveUnevaluatedWhenLedgerAbsent(t *testing.T) {
 	server.shimReadMemTotal = func() (int64, bool) { return 48 << 30, true }
 	server.shimReadMemAvailable = func() (int64, bool, string) { return 20 << 30, true, "" }
 	// A readable ceiling — the memory read succeeds — while NO queue is registered:
-	// server.admitQueues stays empty, exactly the post-restart / idle state.
+	// The server holds no admission queue, exactly the post-restart / idle state.
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 5 << 30, maximum, 1 << 30, true, ""
 	}

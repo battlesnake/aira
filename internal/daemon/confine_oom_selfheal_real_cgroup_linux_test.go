@@ -173,6 +173,7 @@ func TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission(t *testing.
 	// runner.DefaultConfineMemoryReserve (AIRA-139).
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
+	serveFixtureSlice(t, server, slice)
 	startServer(t, server)
 
 	run := func(token string, bytesWanted int64, declaredCap int64) oomSelfHealRun {

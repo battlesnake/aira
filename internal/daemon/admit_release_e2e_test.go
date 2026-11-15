@@ -43,8 +43,8 @@ func e2eDrainGrant(conn net.Conn) {
 //
 // The `present` requirement is load-bearing, not decoration. releaseAdmitWaiter
 // removes the waiter from queue.waiters and then re-derives the ledger from the
-// survivors, and pruneAdmitQueue then deletes a queue whose waiter list is
-// empty — so once the last client goes away the queue is gone and
+// survivors, and a queue whose waiter list is empty reads as absent (it was
+// deleted outright before AIRA-228) — so once the last client goes away
 // admitSliceSnapshot honestly reports the absent-queue zero. An earlier version
 // of these tests waited for (0 jobs, 0 bytes) after closing every client, which
 // that absent-queue zero satisfies WITHOUT the discharge ever running: mutation
@@ -197,7 +197,7 @@ func TestAdmitLedgerReleasesWhenAClientDiesWithoutClosingCleanly(t *testing.T) {
 	server.admitPollInterval = 5 * time.Millisecond
 
 	// Pinned, for the same reason as the test above: without it the killed
-	// client's release empties the queue, pruneAdmitQueue deletes it, and a
+	// client's release empties the queue, it reads as absent, and a
 	// ledger that never discharged at all reads as a clean zero.
 	pinReserve, closePin := e2ePinQueue(t, server)
 	defer closePin()

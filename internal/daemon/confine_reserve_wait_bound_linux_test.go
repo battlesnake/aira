@@ -77,6 +77,13 @@ func reserveWaitBoundFixture(t *testing.T, ceiling int64) (*Server, string) {
 	}
 	paths := testPaths(t)
 	server := NewServer(paths)
+	// The fixture slice is this daemon's ONE slice (AIRA-228): the daemon
+	// refuses admission into any slice but the one it resolves aira.slice to.
+	canonical, ok, reason := resolveAdmitSlicePath(slice)
+	if !ok {
+		t.Fatalf("resolve fixture slice %s: %s", slice, reason)
+	}
+	server.admitResolveSlice = func(string) (string, bool, string) { return canonical, true, "" }
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitPollInterval = 20 * time.Millisecond
@@ -422,8 +429,9 @@ func TestConfineReserveGrantOutlivesTheDeclaredBound(t *testing.T) {
 	// --- and it releases promptly on stdin EOF ---
 	//
 	// An ANCHOR reservation is opened first, and it is not decoration. When the
-	// last waiter leaves a queue, pruneAdmitQueue DELETES the queue outright, and
-	// admitSliceSnapshotFor answers an absent queue with an all-zero snapshot. So
+	// last waiter leaves a queue, the queue reads as ABSENT (before AIRA-228 it
+	// was deleted outright), and admitSliceSnapshotFor answers an absent queue
+	// with an all-zero snapshot. So
 	// "every counter reads zero after the release" is VACUOUS on its own — it is
 	// true of a correct discharge and equally true of a release that dropped the
 	// waiter while leaving queue.outstanding charged. Mutation testing proved

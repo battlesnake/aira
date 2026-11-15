@@ -355,11 +355,9 @@ func TestAdmitReleaseAndDeathLifecycle(t *testing.T) {
 	if queue.outstanding != 0 || granted.state != admitReleased {
 		t.Fatalf("after granted death outstanding=%d state=%v", queue.outstanding, granted.state)
 	}
-	server.admitRegistryMu.Lock()
-	if len(server.admitQueues) != 0 {
-		t.Fatalf("empty registry not pruned: %d", len(server.admitQueues))
+	if live := liveAdmitQueueCount(server); live != 0 {
+		t.Fatalf("a released queue still holds a waiter: %d", live)
 	}
-	server.admitRegistryMu.Unlock()
 }
 
 func TestAdmitFailedWriteAndCloseBetweenCommitAndWriteReleaseOnce(t *testing.T) {
@@ -392,11 +390,9 @@ func TestAdmitFailedWriteAndCloseBetweenCommitAndWriteReleaseOnce(t *testing.T) 
 			case <-testdeadline.After(time.Second):
 				t.Fatal("admit handler did not release after failed write")
 			}
-			server.admitRegistryMu.Lock()
-			if len(server.admitQueues) != 0 {
-				t.Fatalf("reservation leaked: queues=%d", len(server.admitQueues))
+			if live := liveAdmitQueueCount(server); live != 0 {
+				t.Fatalf("reservation leaked: live queues=%d", live)
 			}
-			server.admitRegistryMu.Unlock()
 		})
 	}
 }
@@ -486,7 +482,7 @@ func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 	// hiccup — a false fail in the very file this branch is hardening.
 	testdeadline.Eventually(t, time.Second, func() bool {
 		server.admitRegistryMu.Lock()
-		queue := server.admitQueues["/slice"]
+		queue := admitQueueAtLocked(server, "/slice")
 		server.admitRegistryMu.Unlock()
 		if queue == nil {
 			return false
@@ -552,12 +548,10 @@ func TestAdmitGrantCommittedAtShutdownDeliveredOrReleasedOnce(t *testing.T) {
 		t.Fatal("shutdown did not release committed grant")
 	}
 	_ = clientConn.Close()
-	server.pruneAdmitRegistry()
-	server.admitRegistryMu.Lock()
-	if len(server.admitQueues) != 0 {
-		t.Fatalf("shutdown left %d queues", len(server.admitQueues))
+	server.retireAdmitQueue()
+	if admitQueueCreated(server) {
+		t.Fatal("shutdown left an admission queue in place")
 	}
-	server.admitRegistryMu.Unlock()
 }
 
 func TestAdmitShutdownHandlerOwnsReleaseAndPrunesAfterDrain(t *testing.T) {
@@ -588,12 +582,10 @@ func TestAdmitShutdownHandlerOwnsReleaseAndPrunesAfterDrain(t *testing.T) {
 		t.Fatalf("queued client read=%v, want EOF", err)
 	}
 	_ = clientConn.Close()
-	server.pruneAdmitRegistry()
-	server.admitRegistryMu.Lock()
-	if len(server.admitQueues) != 0 {
-		t.Fatalf("shutdown registry=%d", len(server.admitQueues))
+	server.retireAdmitQueue()
+	if admitQueueCreated(server) {
+		t.Fatal("shutdown left an admission queue in place")
 	}
-	server.admitRegistryMu.Unlock()
 }
 
 // S4 (P3-3): an unresolvable slice fails CLOSED, symmetric with the
@@ -618,11 +610,9 @@ func TestAdmitUnresolvableSliceFailsClosedWithoutEnqueue(t *testing.T) {
 		t.Fatalf("an unresolvable slice must fail CLOSED with %s, not a grant-shaped response (code=%q data=%s)", CodeUnavailable, frame.Code, frame.Data)
 	}
 	<-done
-	server.admitRegistryMu.Lock()
-	if len(server.admitQueues) != 0 {
-		t.Fatalf("a fail-closed refusal must not enqueue: %d", len(server.admitQueues))
+	if admitQueueCreated(server) {
+		t.Fatal("a fail-closed refusal must not enqueue")
 	}
-	server.admitRegistryMu.Unlock()
 }
 
 func TestAdmitValidationAndCaps(t *testing.T) {
@@ -848,7 +838,7 @@ func TestGrantSetsGrantedAtDistinctFromEnqueuedUnderQueueingDelay(t *testing.T) 
 //
 // verifies: AIRA-33
 func TestAfterAdmitReleaseKicksTheQueue(t *testing.T) {
-	server := &Server{admitQueues: map[string]*sliceQueue{}}
+	server := &Server{}
 	queue := &sliceQueue{path: "/slice", kick: make(chan struct{}, 1)}
 	// Drain first, so the assertion cannot pass on a kick left over from setup.
 	select {

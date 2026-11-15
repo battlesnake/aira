@@ -214,7 +214,7 @@ func TestADaemonRestartReleasesExclusivityRatherThanWedgingTheSlice(t *testing.T
 	_ = socket
 
 	// A FRESH server over the same slice, exactly as a restart produces: a new
-	// process with an empty admitQueues map and no memory of anything.
+	// process with no admission queue and no memory of anything.
 	second := NewServer(Paths{})
 	second.stopping = make(chan struct{})
 	defer close(second.stopping)

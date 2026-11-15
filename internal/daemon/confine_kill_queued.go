@@ -113,7 +113,7 @@ func (s *Server) scopeCancelledLocked(scopeID string, now time.Time) bool {
 // AIRA-328.
 func (s *Server) cancelQueuedConfine(path, selector, callerOwner string, steal bool) (runner.ConfineKillResult, bool, error) {
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
 		return runner.ConfineKillResult{}, false, nil
@@ -144,7 +144,7 @@ func (s *Server) grantedConfineMatch(path, selector string) string {
 	}
 	s.admitRegistryMu.Lock()
 	defer s.admitRegistryMu.Unlock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		return ""
 	}

@@ -209,11 +209,8 @@ func TestAdmissionFollowsTheSlotsPerCoreRatio(t *testing.T) {
 		if frame.OK || frame.Code != CodeAdmitTooLarge {
 			t.Fatalf("7 slots over a ceiling of 6: frame OK=%v code=%q, want a terminal %s", frame.OK, frame.Code, CodeAdmitTooLarge)
 		}
-		server.admitRegistryMu.Lock()
-		queues := len(server.admitQueues)
-		server.admitRegistryMu.Unlock()
-		if queues != 0 {
-			t.Fatalf("a terminal cpu-too-large request enqueued %d queue(s)", queues)
+		if admitQueueCreated(server) {
+			t.Fatal("a terminal cpu-too-large request created a queue")
 		}
 		_ = clientConn.Close()
 	})

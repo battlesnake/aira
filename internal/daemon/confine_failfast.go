@@ -34,7 +34,16 @@ func (s *Server) confineFailfast(args map[string]any) core.Response {
 		return confineManagementError(err)
 	}
 	triggerScopeID := stringArg(args, "scope_id")
-	signalled := s.tripFailfast(path, triggerScopeID)
+	signalled, err := s.tripFailfast(path, triggerScopeID)
+	if err != nil {
+		// Unreachable in shim mode (its resolver maps every name onto the one
+		// sentinel path), but a trip that was not latched must not be reported as
+		// applied: that would be a pass nobody established.
+		log.Printf("aira daemon: confine-failfast: trip NOT latched: %v", err)
+		return core.Response{OK: true, Code: "OK", Data: runner.FailfastTripResult{
+			Applied: false, Mode: "shim", Reason: err.Error(),
+		}}
+	}
 	// A record of the trip, on the confine-kill logging precedent: a slice-wide
 	// teardown must not happen with no trace of who tripped it or how many jobs it
 	// reached. "signalled" is best-effort, stated as such.
@@ -50,11 +59,11 @@ func (s *Server) confineFailfast(args map[string]any) core.Response {
 // after that handler has confirmed shim mode — the box daemon never trips (the
 // cross-session safety gate lives in the caller). Two effects:
 //
-//  1. The "no new tasks admitted" half. The DURABLE Server latch is set (it
-//     outlives any single sliceQueue, since pruneAdmitQueue deletes an emptied
-//     queue and the sweep below empties this one), the current queue's copy is
-//     set, and the evaluator is signalled — its next pass rejects every queued
-//     waiter with E_ADMIT_FAILFAST_TRIPPED and grants nothing.
+//  1. The "no new tasks admitted" half. The queue's latch is set — creating the
+//     queue if no admission has made it yet, so a trip that lands first is not
+//     lost; the one queue outlives the population the sweep below empties
+//     (AIRA-228) — and the evaluator is signalled: its next pass rejects every
+//     queued waiter with E_ADMIT_FAILFAST_TRIPPED and grants nothing.
 //
 //  2. The "existing ones are killed" half. Every GRANTED waiter is a live confine
 //     job whose supervisor PID is encoded in its scope id (ParseConfineScopeID;
@@ -66,44 +75,47 @@ func (s *Server) confineFailfast(args map[string]any) core.Response {
 //
 // It returns the number of supervisors it signalled: a COUNT of best-effort
 // signals, never a claim of confirmed kills. A shim daemon has no cgroup to read
-// empty, so it cannot confirm a death and never asserts one.
+// empty, so it cannot confirm a death and never asserts one. It returns an
+// error, having latched and signalled nothing, when path is not the slice the
+// queue serves.
 //
 // The PIDs are collected UNDER the locks and signalled OUTSIDE them: a pidfd
 // open+send must not run while admitRegistryMu / queue.mu are held, since those
 // gate the evaluator and every admit path.
-func (s *Server) tripFailfast(path, triggerScopeID string) int {
+func (s *Server) tripFailfast(path, triggerScopeID string) (int, error) {
 	s.admitRegistryMu.Lock()
-	if s.failfastTripped == nil {
-		s.failfastTripped = make(map[string]bool)
+	// Only a ci-shim daemon reaches here, and its resolver maps every slice name
+	// onto the one sentinel path, so a refusal (a path that is not the queue's)
+	// is unreachable; it is returned to the caller all the same.
+	queue, err := s.admitQueueLocked(path)
+	if err != nil {
+		s.admitRegistryMu.Unlock()
+		return 0, err
 	}
-	s.failfastTripped[path] = true
-	queue := s.admitQueues[path]
 	var victims []int
-	if queue != nil {
-		queue.mu.Lock()
-		queue.failfastTripped = true
-		for _, waiter := range queue.waiters {
-			if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
-				continue
-			}
-			if waiter.scopeID == triggerScopeID {
-				// The trigger keeps its own verdict. Skipping it here is the
-				// deterministic guard; the supervisor's runEnded cut-off is the
-				// second, so a late SIGUSR1 could not restamp it even if this were
-				// removed. Both, because the property is load-bearing (the CI
-				// classifier distinguishes the trigger by its real exit).
-				continue
-			}
-			_, pid, _, _, ok := runner.ParseConfineScopeID(waiter.scopeID)
-			if !ok || pid <= 0 {
-				log.Printf("aira daemon: confine-failfast: scope %s carries no supervisor pid; not signalled", waiter.scopeID)
-				continue
-			}
-			victims = append(victims, pid)
+	queue.mu.Lock()
+	queue.failfastTripped = true
+	for _, waiter := range queue.waiters {
+		if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
+			continue
 		}
-		queue.mu.Unlock()
-		queue.signal()
+		if waiter.scopeID == triggerScopeID {
+			// The trigger keeps its own verdict. Skipping it here is the
+			// deterministic guard; the supervisor's runEnded cut-off is the
+			// second, so a late SIGUSR1 could not restamp it even if this were
+			// removed. Both, because the property is load-bearing (the CI
+			// classifier distinguishes the trigger by its real exit).
+			continue
+		}
+		_, pid, _, _, ok := runner.ParseConfineScopeID(waiter.scopeID)
+		if !ok || pid <= 0 {
+			log.Printf("aira daemon: confine-failfast: scope %s carries no supervisor pid; not signalled", waiter.scopeID)
+			continue
+		}
+		victims = append(victims, pid)
 	}
+	queue.mu.Unlock()
+	queue.signal()
 	s.admitRegistryMu.Unlock()
 
 	signal := s.failfastSignalPID
@@ -121,7 +133,7 @@ func (s *Server) tripFailfast(path, triggerScopeID string) int {
 		}
 		signalled++
 	}
-	return signalled
+	return signalled, nil
 }
 
 // resolveFailfastSignalPID is the production failfastSignalPID: it delivers

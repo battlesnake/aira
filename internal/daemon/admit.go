@@ -205,7 +205,7 @@ type admitWaiter struct {
 	// recomputed from queue.waiters on every pass. So exclusivity cannot outlive
 	// the waiter; the waiter cannot outlive its admission connection
 	// (admitConnection's deferred release runs on every return path) or its own
-	// max_wait; and a daemon restart begins with an empty admitQueues map, so
+	// max_wait; and a daemon restart begins with no admission queue, so
 	// nothing survives it — fail-OPEN. There is deliberately no state an operator
 	// could ever need to clear, because a wedge of this machine-wide slice must be
 	// UNREPRESENTABLE, not merely avoided by careful coding.
@@ -740,12 +740,9 @@ type sliceQueue struct {
 	// failed: while set, evaluateAdmitQueue rejects every QUEUED waiter with
 	// E_ADMIT_FAILFAST_TRIPPED and grants nothing (the "no new tasks admitted"
 	// half; running jobs are torn down separately by the SIGUSR1 sweep). Written
-	// under queue.mu. It is a per-queue COPY of the durable Server latch
-	// (Server.failfastTripped), not the master: an empty queue is deleted by
-	// pruneAdmitQueue, so a latch that lived only here would evaporate the instant
-	// the sweep emptied the slice — exactly when a late leg dials in. The Server
-	// map survives the prune and seeds this copy at queue creation, so a queue
-	// rebuilt after the trip is born tripped.
+	// under queue.mu. It is the durable latch (AIRA-228): the one queue outlives
+	// the population the sweep empties, so a late leg is still refused. Only ever
+	// SET; a ci-shim daemon is ephemeral per CI run, so it is never cleared.
 	failfastTripped bool
 
 	// AIRA-59 fairness-freeze duty cycle, held as a SINGLE anchor instant so the
@@ -764,12 +761,15 @@ type sliceQueue struct {
 	// unrestricted yield refilled the slice from the backlog and starved the
 	// 12 GiB heads it was meant to protect.
 	//
-	// There are exactly TWO writes, and neither can lengthen a hold:
+	// There are exactly THREE writes, and none can lengthen a hold:
 	//   1. the arm, guarded by derived phase == idle;
 	//   2. the completed-cycle clear, taken ONLY when the derived phase is already
 	//      idle (the hold is over), which forces one backfilling pass before the
 	//      next arm. Because it fires only from derived-idle it can shorten the
-	//      gap between cycles, never extend a freeze.
+	//      gap between cycles, never extend a freeze;
+	//   3. the drain reset in afterAdmitRelease (AIRA-228), taken ONLY once the
+	//      last waiter has left, so it can end a hold early but only when there
+	//      is nobody left for the hold to protect.
 	//
 	// A PUSHED head (AIRA-309) never arms and is never covered by the backstop:
 	// nothing but another push goes ahead of it.
@@ -785,8 +785,9 @@ type sliceQueue struct {
 	// merge-gates, or the retry loop AIRA-58 forced on callers) each claim a fresh
 	// full hold.
 	//
-	// Lifetime note: an empty queue is deleted by pruneAdmitQueue, so this anchor
-	// lives only as long as the queue. A hold cut short by quiescence is not a
+	// Lifetime note: this anchor lives only as long as the queue's POPULATION:
+	// afterAdmitRelease clears it (with freezeHolderSeq and freezeLogged) once the
+	// last waiter has left. A hold cut short by quiescence is not a
 	// fairness leak — an empty queue has nobody to starve.
 	freezeArmedAt   time.Time
 	freezeHolderSeq int64            // diagnostics only; never affects timing
@@ -1006,7 +1007,7 @@ func (s *Server) admitSliceHeadroom(jobs int) int64 {
 
 func (s *Server) admitOutstandingJobs(path string) int {
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
 		return 0
@@ -1256,15 +1257,15 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		phase = "disabled"
 	}
 	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
+	queue := s.admitQueueForLocked(path)
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
 		// An absent queue positively establishes that nothing is WAITING and that
 		// there is no exclusive holder — the diagnostics half (queued/phase) is a
 		// genuine idle zero and callers render it as such. But it says NOTHING
-		// about the granted LEDGER: pruneAdmitQueue deletes the queue once nothing
-		// is connection-held, so an absent queue is exactly "the ledger was never
-		// built or has been pruned". present stays false here precisely so a caller
+		// about the granted LEDGER: admitQueueForLocked reads a queue that holds
+		// nothing connection-held as absent, so an absent queue is exactly "the
+		// ledger was never built or holds nothing". present stays false here precisely so a caller
 		// reports the granted pair unevaluated rather than as a fabricated empty
 		// slice (AIRA-220). CeilingBytes is an independent memory read and is
 		// unaffected.
@@ -1831,6 +1832,20 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitFailClosed(conn, request.exclusive, reason)
 		return
 	}
+	// AIRA-228, the one-slice guard. The one ledger is for the slice
+	// runner.DefaultConfineSlice resolves to, which a re-declare and a worker
+	// admission also charge. A request resolving anywhere else (`--slice`,
+	// $AIRA_CONFINE_SLICE, whale.slice, a child of aira.slice) is refused
+	// fail-closed before anything is queued; so is any request when the daemon
+	// cannot resolve its own slice.
+	if served, servedOK, servedReason := resolve(runner.DefaultConfineSlice); !servedOK || served != path {
+		if !servedOK {
+			served = "unresolved (" + servedReason + ")"
+		}
+		s.writeAdmitFailClosed(conn, request.exclusive, fmt.Sprintf("%s: this daemon admits only into %s, %s; the request named %q, which resolves to %s",
+			admitSliceNotServed, runner.DefaultConfineSlice, served, request.slice, path))
+		return
+	}
 	readMemory := s.memoryReader()
 	_, maximum, _, ok, reason := readMemory(path)
 	if !ok {
@@ -2115,6 +2130,70 @@ func (s *Server) peerCredentialOf(conn net.Conn) (uid, pid int, err error) {
 	return credential(conn)
 }
 
+// admitSliceNotServed is the reason token carried by the fail-closed refusal of
+// a request for a slice this daemon does not admit into (AIRA-228).
+const admitSliceNotServed = "slice-not-served"
+
+// admitQueueLocked returns the daemon's ONE admission queue (AIRA-228),
+// creating it and starting its evaluator on first use. admitRegistryMu must be
+// held. The queue serves the slice runner.DefaultConfineSlice resolves to, lives
+// until Serve retires it, and is never pruned and rebuilt. A path that is not
+// the queue's own is REFUSED, never queued and never a panic: admitConnection
+// refuses such a request first, and this is the backstop for every other entry.
+// If a second concurrent slice is ever needed, per-slice queues come back here,
+// and CPU and VRAM must then become machine-wide sums (see cpuCeiling).
+func (s *Server) admitQueueLocked(path string) (*sliceQueue, error) {
+	if queue := s.admitQueue; queue != nil {
+		if queue.path != path {
+			return nil, fmt.Errorf("%s: %s: this daemon admits into one slice, %s; the request resolved to %s", CodeUnavailable, admitSliceNotServed, queue.path, path)
+		}
+		return queue, nil
+	}
+	poll := s.admitPollInterval
+	if poll <= 0 {
+		poll = defaultAdmitPollInterval
+	}
+	queue := &sliceQueue{path: path, kick: make(chan struct{}, 1), stop: make(chan struct{}), stopped: make(chan struct{}), poll: poll, server: s}
+	s.admitQueue = queue
+	if s.admitManualEvaluation {
+		// Test seam (unset in production): no evaluator goroutine, and stopped is
+		// closed so a caller's "the evaluator is gone" wait returns at once.
+		close(queue.stopped)
+	} else {
+		go queue.runEvaluator()
+	}
+	return queue, nil
+}
+
+// liveAdmitQueueLocked returns the admission queue while it holds a waiter or
+// lease, else nil. admitRegistryMu must be held; queue.mu is taken briefly.
+// A drained queue reads as ABSENT on purpose: before AIRA-228 an emptied queue
+// was deleted, and every reader (AIRA-220's `present` bit, the CI dump, the OOM
+// steer, the management verbs) answers exactly as it did then.
+func (s *Server) liveAdmitQueueLocked() *sliceQueue {
+	queue := s.admitQueue
+	if queue == nil {
+		return nil
+	}
+	queue.mu.Lock()
+	live := len(queue.waiters) != 0
+	queue.mu.Unlock()
+	if !live {
+		return nil
+	}
+	return queue
+}
+
+// admitQueueForLocked is liveAdmitQueueLocked for a reader that names a slice:
+// nil unless the live queue serves exactly that path. admitRegistryMu must be held.
+func (s *Server) admitQueueForLocked(path string) *sliceQueue {
+	queue := s.liveAdmitQueueLocked()
+	if queue == nil || queue.path != path {
+		return nil
+	}
+	return queue
+}
+
 func (s *Server) enqueueResolvedConfineAdmit(path string, reserve int64, basis string, maximum int64, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true, request)
 }
@@ -2146,31 +2225,10 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		s.admitRegistryMu.Unlock()
 		return nil, nil, CodeAdmitCancelled, fmt.Errorf("%s: scope %s was cancelled by `aira confine --kill` while queued", CodeAdmitCancelled, request.scopeID)
 	}
-	if s.admitQueues == nil {
-		s.admitQueues = make(map[string]*sliceQueue)
-	}
-	queue := s.admitQueues[path]
-	if queue == nil {
-		poll := s.admitPollInterval
-		if poll <= 0 {
-			poll = defaultAdmitPollInterval
-		}
-		queue = &sliceQueue{path: path, kick: make(chan struct{}, 1), stop: make(chan struct{}), stopped: make(chan struct{}), poll: poll, server: s}
-		// AIRA-247. A queue rebuilt after a fail-fast trip (the trip emptied the
-		// slice, pruneAdmitQueue deleted the old queue) is born tripped, so a late
-		// leg that dials into the fresh queue is still refused. s.failfastTripped is
-		// read under admitRegistryMu, held here; a nil map reads false.
-		if s.failfastTripped[path] {
-			queue.failfastTripped = true
-		}
-		s.admitQueues[path] = queue
-		if s.admitManualEvaluation {
-			// Test seam (unset in production): no evaluator goroutine, and stopped is
-			// closed so a caller's "the evaluator is gone" wait returns at once.
-			close(queue.stopped)
-		} else {
-			go queue.runEvaluator()
-		}
+	queue, err := s.admitQueueLocked(path)
+	if err != nil {
+		s.admitRegistryMu.Unlock()
+		return nil, nil, CodeUnavailable, err
 	}
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
@@ -2278,9 +2336,13 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
 			queue.waiters = append(queue.waiters, waiter)
 			// DERIVED, not incremented (the one ledger writer): folds in this lease's RAM
-			// and cores. An establish CONSUMES capacity, so no signal() is needed — unlike
-			// a re-anchor that may SHRINK the vector and free room for a waiter.
+			// and cores.
 			queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			// An establish CONSUMES capacity, so it frees room for nobody; the signal
+			// is for the evaluator's poll ticker, which is stopped while the queue is
+			// empty (AIRA-228, runEvaluator) and resumes only on a kick. Without it a
+			// queue populated only by establishes would go unpolled.
+			queue.signal()
 			return queue, waiter, "", nil
 		}
 	}
@@ -2336,10 +2398,25 @@ func (q *sliceQueue) runEvaluator() {
 	ticker := time.NewTicker(q.poll)
 	defer ticker.Stop()
 	for {
+		// AIRA-228. The queue outlives its population, so it polls only while it
+		// holds someone: while it is empty the loop selects on a nil channel, and
+		// an idle daemon takes no poll wakeups (since Go 1.23 a ticker is in the
+		// timer heap only while a receiver blocks on its channel), as when an
+		// empty queue had no evaluator at all. Every insertion signals kick, which
+		// brings the loop back here to poll again.
+		var tick <-chan time.Time
+		q.mu.Lock()
+		if len(q.waiters) != 0 {
+			tick = ticker.C
+		}
+		q.mu.Unlock()
+		if parking := q.server.admitEvaluatorParking; parking != nil {
+			parking(tick != nil)
+		}
 		select {
 		case <-q.kick:
 			q.server.evaluateAdmitQueue(q)
-		case <-ticker.C:
+		case <-tick:
 			q.signal()
 		case <-q.stop:
 			return
@@ -2360,10 +2437,13 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// S14 deleted the periodic cgroup scan that used to run here — emptiness is now
 	// derived from the signed ledger (sliceProvablyEmpty), so a pass touches only
 	// queue state.
-	now := s.admitNowTime()
-
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
+	// AIRA-228. The clock is read UNDER queue.mu: the queue outlives its
+	// population, so a pass that read it first and then waited for the lock
+	// could arm a population that arrived meanwhile with a pre-drain instant,
+	// and its fairness hold would read as already elapsed.
+	now := s.admitNowTime()
 	// AIRA-247. A tripped slice admits NOTHING: reject every queued waiter and
 	// return before the ceiling read, since no ceiling could let one through.
 	// Rejecting a QUEUED waiter is ledger-neutral — only granted && accounted
@@ -2371,8 +2451,8 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// and leaves the running jobs (torn down by the sweep) to release on their own
 	// connection close. This is the single-writer evaluator, so the state writes
 	// here need no extra synchronisation beyond queue.mu. A newly enqueued waiter
-	// re-signals the queue and is rejected on the next pass; the latch is durable
-	// (Server map) so a queue rebuilt after a prune is born tripped.
+	// re-signals the queue and is rejected on the next pass; the latch lives on
+	// the one queue, which outlives the population the sweep empties.
 	if queue.failfastTripped {
 		for _, waiter := range queue.waiters {
 			if waiter.state != admitQueued {
@@ -2930,9 +3010,8 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 	return true
 }
 
-// afterAdmitRelease runs the post-discharge work that must NOT hold queue.mu:
-// pruneAdmitQueue takes admitRegistryMu then queue.mu, so calling it under
-// queue.mu would invert the one fixed lock order in this file.
+// afterAdmitRelease runs the post-discharge work, after the caller has dropped
+// queue.mu.
 func (s *Server) afterAdmitRelease(queue *sliceQueue) {
 	// This is only the coalescing, lock-free signal: evaluateAdmitQueue must
 	// never be called synchronously from this release path, which has just held
@@ -2946,32 +3025,33 @@ func (s *Server) afterAdmitRelease(queue *sliceQueue) {
 	// sufficient to wake its own CPU-blocked waiters. No cross-queue signal: there is
 	// no machine-wide CPU ledger for another slice to be waiting on.
 	queue.signal()
-	s.pruneAdmitQueue(queue)
-}
-
-func (s *Server) pruneAdmitQueue(queue *sliceQueue) {
-	// Fixed lock order: registry then slice. Callers never retain queue.mu.
+	// AIRA-228. A population that has drained takes its fairness-freeze state
+	// with it, so the next one starts idle. This is the exact decision point the
+	// deleted pruneAdmitQueue used (registry lock, then queue lock, then "is it
+	// still empty?"), so a request that slipped in between the release and this
+	// check keeps the anchor, exactly as it kept the old queue.
 	s.admitRegistryMu.Lock()
-	queue.mu.Lock()
-	if len(queue.waiters) == 0 && s.admitQueues[queue.path] == queue {
-		delete(s.admitQueues, queue.path)
-		queue.stopOnce.Do(func() { close(queue.stop) })
-	}
-	queue.mu.Unlock()
-	s.admitRegistryMu.Unlock()
-}
-
-func (s *Server) pruneAdmitRegistry() {
-	s.admitRegistryMu.Lock()
-	for path, queue := range s.admitQueues {
+	if s.admitQueue == queue {
 		queue.mu.Lock()
 		if len(queue.waiters) == 0 {
-			delete(s.admitQueues, path)
-			queue.stopOnce.Do(func() { close(queue.stop) })
+			queue.freezeArmedAt, queue.freezeHolderSeq, queue.freezeLogged = time.Time{}, 0, admitFreezeIdle
 		}
 		queue.mu.Unlock()
 	}
 	s.admitRegistryMu.Unlock()
+}
+
+// retireAdmitQueue stops the admission queue's evaluator and forgets the queue.
+// Serve calls it once at shutdown, after every connection (and so every lease
+// and waiter) has drained.
+func (s *Server) retireAdmitQueue() {
+	s.admitRegistryMu.Lock()
+	queue := s.admitQueue
+	s.admitQueue = nil
+	s.admitRegistryMu.Unlock()
+	if queue != nil {
+		queue.stopOnce.Do(func() { close(queue.stop) })
+	}
 }
 
 // writeAdmitFrame writes one admit reply under admitWriteTimeout, through the

@@ -50,7 +50,7 @@ func TestConfineListReportsTheCallersOwnQueuePosition(t *testing.T) {
 			{seq: 3, reserve: 3 << 30, state: admitQueued, grantedCh: make(chan struct{}), scopeID: selfID, name: "self", owner: "session-c"},
 			{seq: 4, reserve: 1 << 30, state: admitQueued, grantedCh: make(chan struct{}), scopeID: tailID, name: "tail", owner: "session-d"},
 		}
-		server.admitQueues[path] = queue
+		registerAdmitQueue(server, queue)
 		return server
 	}
 	listFor := func(t *testing.T, server *Server, scopeID string) runner.ConfineSliceReserve {

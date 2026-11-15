@@ -857,7 +857,7 @@ func TestSliceCeilingSnapshotIsALeafUnderConcurrentEvaluation(t *testing.T) {
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
 	queue := &sliceQueue{path: "/slice", server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
-	server.admitQueues["/slice"] = queue
+	registerAdmitQueue(server, queue)
 	var wait sync.WaitGroup
 	stop := make(chan struct{})
 	wait.Add(2)

@@ -111,12 +111,7 @@ func startSaturatedAdmit(t *testing.T, server *Server, maximum int64, args map[s
 		stopped: make(chan struct{}), poll: time.Hour, server: server,
 	}
 	queue.waiters = append(queue.waiters, seed...)
-	server.admitRegistryMu.Lock()
-	if server.admitQueues == nil {
-		server.admitQueues = make(map[string]*sliceQueue)
-	}
-	server.admitQueues["/slice"] = queue
-	server.admitRegistryMu.Unlock()
+	registerAdmitQueue(server, queue)
 
 	fire := make(chan time.Time, 1)
 	server.admitAfter = func(time.Duration) <-chan time.Time { return fire }

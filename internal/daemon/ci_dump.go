@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"aira/internal/core"
 	"aira/internal/runner"
@@ -175,109 +174,103 @@ func waiterStateName(waiter *admitWaiter) string {
 // `available` is computed on the SAME signed arithmetic admission itself
 // uses (checkedAvailable/ledgerAvailable), never re-derived differently.
 //
-// Ordering is by slice path (sorted), so the dump is deterministic across
-// runs rather than depending on Go's randomised map iteration.
+// There is at most one queue row: the daemon keeps one admission queue
+// (AIRA-228), and a queue that holds nothing is not reported (it reads as
+// absent, as an emptied queue always has).
 func (s *Server) buildConfineDumpQueuesAndWaiters() ([]runner.ConfineDumpQueueRow, []runner.ConfineDumpWaiterRow) {
 	s.admitRegistryMu.Lock()
-	paths := make([]string, 0, len(s.admitQueues))
-	byPath := make(map[string]*sliceQueue, len(s.admitQueues))
-	for path, queue := range s.admitQueues {
-		paths = append(paths, path)
-		byPath[path] = queue
-	}
+	queue := s.liveAdmitQueueLocked()
 	s.admitRegistryMu.Unlock()
-	sort.Strings(paths)
+	if queue == nil {
+		return []runner.ConfineDumpQueueRow{}, nil
+	}
 
 	now := s.admitNowTime()
 	readMemory := s.memoryReader()
 	shim := s.shimMode()
-	rows := make([]runner.ConfineDumpQueueRow, 0, len(paths))
 	var waiterRows []runner.ConfineDumpWaiterRow
-	for _, path := range paths {
-		queue := byPath[path]
-		row := runner.ConfineDumpQueueRow{RecordType: runner.ConfineDumpRecordQueue, Slice: path}
+	path := queue.path
+	row := runner.ConfineDumpQueueRow{RecordType: runner.ConfineDumpRecordQueue, Slice: path}
 
-		queue.mu.Lock()
-		row.RAMOutstandingBytes = queue.outstanding
-		row.CPUOutstandingCores = queue.cpuOutstanding
-		// Captured under the lock, used for the headroom computation OUTSIDE
-		// it: this is the queue's OWN CURRENT job count, matching what the
-		// evaluator's fit-check charges for capacity already held (NOT
-		// jobs+1, which is admitConnection's own prospective-new-admission
-		// headroom for a job that has not arrived -- reporting that basis
-		// here would UNDER-headroom relative to what admission actually
-		// reserves, making `available` read more optimistic than reality).
-		outstandingJobsSnapshot := queue.outstandingJobs
-		var oldestWaitMS int64
-		for _, waiter := range queue.waiters {
-			if waiter == nil {
-				continue
-			}
-			if waiter.state == admitQueued {
-				row.QueuedCount++
-				if waited := elapsedMilliseconds(waiter.enqueued, now); waited > oldestWaitMS {
-					oldestWaitMS = waited
-				}
-			}
-			waiterRow := runner.ConfineDumpWaiterRow{
-				RecordType: runner.ConfineDumpRecordWaiter, Slice: path,
-				Name:    waiter.name, // AIRA-267: per-task name for CI attribution
-				ScopeID: waiter.scopeID, Signature: waiter.signature,
-				ReserveBytes: waiter.reserve, CPUCores: waiter.cpu,
-				State: waiterStateName(waiter), Outcome: waiterOutcomeName(waiter),
-			}
-			if waiter.state == admitQueued {
-				waiterRow.WaitMS = elapsedMilliseconds(waiter.enqueued, now)
-			} else {
-				waiterRow.WaitMS = waiter.waitedMS
-			}
-			waiterRows = append(waiterRows, waiterRow)
+	queue.mu.Lock()
+	row.RAMOutstandingBytes = queue.outstanding
+	row.CPUOutstandingCores = queue.cpuOutstanding
+	// Captured under the lock, used for the headroom computation OUTSIDE
+	// it: this is the queue's OWN CURRENT job count, matching what the
+	// evaluator's fit-check charges for capacity already held (NOT
+	// jobs+1, which is admitConnection's own prospective-new-admission
+	// headroom for a job that has not arrived -- reporting that basis
+	// here would UNDER-headroom relative to what admission actually
+	// reserves, making `available` read more optimistic than reality).
+	outstandingJobsSnapshot := queue.outstandingJobs
+	var oldestWaitMS int64
+	for _, waiter := range queue.waiters {
+		if waiter == nil {
+			continue
 		}
-		row.Phase = s.admitReportedPhaseLocked(queue, now)
-		queue.mu.Unlock()
-
-		if row.QueuedCount > 0 {
-			value := oldestWaitMS
-			row.OldestBlockedWaitMS = &value
-		}
-		row.RestartFrozen = s.restartFrozenAt(now)
-		row.CPUCeilingCores = s.cpuCeiling()
-
-		// Memory read OUTSIDE queue.mu, matching confine_manage.go's own ordering
-		// (it takes the ledger snapshot first, then reads memory unlocked). The
-		// raw memory.max is reported here, NOT the AIRA-103 pressure-throttled
-		// effective ceiling (sliceCeilingEffectiveMaximum) -- this dump is a
-		// signed-ledger observation, not a live admission decision, and pulling
-		// in that subsystem would be new surface this slice does not need.
-		current, maximum, reclaimable, ok, _ := readMemory(path)
-		jobsHeadroom := s.admitSliceHeadroom(outstandingJobsSnapshot)
-		if ok && maximum >= 0 {
-			value := maximum
-			row.RAMCeilingBytes = &value
-		}
-		// checkedAvailable/ledgerAvailable return exactly 0 for BOTH a
-		// genuinely-zero available AND an unusable/degenerate reading
-		// (maximum<=headroom, or a negative current/maximum/outstanding) --
-		// the two are indistinguishable from the return value alone (see its
-		// own doc comment). Replicate its guard here so this dump reports
-		// unevaluated rather than a possibly-fabricated 0/false in the
-		// degenerate case, instead of trusting the collapsed result. Kept
-		// SEPARATE from the ceiling guard above: a small ceiling relative to
-		// headroom makes "available" unusable, but the ceiling figure itself
-		// is still a real, established reading.
-		if ok && maximum >= 0 && current >= 0 && row.RAMOutstandingBytes >= 0 && jobsHeadroom >= 0 && maximum > jobsHeadroom {
-			var available int64
-			if shim {
-				available = ledgerAvailable(maximum, row.RAMOutstandingBytes, jobsHeadroom)
-			} else {
-				available = checkedAvailable(current, maximum, reclaimable, row.RAMOutstandingBytes, jobsHeadroom)
+		if waiter.state == admitQueued {
+			row.QueuedCount++
+			if waited := elapsedMilliseconds(waiter.enqueued, now); waited > oldestWaitMS {
+				oldestWaitMS = waited
 			}
-			availableValue := available
-			row.AvailableBytes = &availableValue
-			row.NegativeAvailable = available < 0
 		}
-
-		rows = append(rows, row)
+		waiterRow := runner.ConfineDumpWaiterRow{
+			RecordType: runner.ConfineDumpRecordWaiter, Slice: path,
+			Name:    waiter.name, // AIRA-267: per-task name for CI attribution
+			ScopeID: waiter.scopeID, Signature: waiter.signature,
+			ReserveBytes: waiter.reserve, CPUCores: waiter.cpu,
+			State: waiterStateName(waiter), Outcome: waiterOutcomeName(waiter),
+		}
+		if waiter.state == admitQueued {
+			waiterRow.WaitMS = elapsedMilliseconds(waiter.enqueued, now)
+		} else {
+			waiterRow.WaitMS = waiter.waitedMS
+		}
+		waiterRows = append(waiterRows, waiterRow)
 	}
-	return rows, waiterRows
+	row.Phase = s.admitReportedPhaseLocked(queue, now)
+	queue.mu.Unlock()
+
+	if row.QueuedCount > 0 {
+		value := oldestWaitMS
+		row.OldestBlockedWaitMS = &value
+	}
+	row.RestartFrozen = s.restartFrozenAt(now)
+	row.CPUCeilingCores = s.cpuCeiling()
+
+	// Memory read OUTSIDE queue.mu, matching confine_manage.go's own ordering
+	// (it takes the ledger snapshot first, then reads memory unlocked). The
+	// raw memory.max is reported here, NOT the AIRA-103 pressure-throttled
+	// effective ceiling (sliceCeilingEffectiveMaximum) -- this dump is a
+	// signed-ledger observation, not a live admission decision, and pulling
+	// in that subsystem would be new surface this slice does not need.
+	current, maximum, reclaimable, ok, _ := readMemory(path)
+	jobsHeadroom := s.admitSliceHeadroom(outstandingJobsSnapshot)
+	if ok && maximum >= 0 {
+		value := maximum
+		row.RAMCeilingBytes = &value
+	}
+	// checkedAvailable/ledgerAvailable return exactly 0 for BOTH a
+	// genuinely-zero available AND an unusable/degenerate reading
+	// (maximum<=headroom, or a negative current/maximum/outstanding) --
+	// the two are indistinguishable from the return value alone (see its
+	// own doc comment). Replicate its guard here so this dump reports
+	// unevaluated rather than a possibly-fabricated 0/false in the
+	// degenerate case, instead of trusting the collapsed result. Kept
+	// SEPARATE from the ceiling guard above: a small ceiling relative to
+	// headroom makes "available" unusable, but the ceiling figure itself
+	// is still a real, established reading.
+	if ok && maximum >= 0 && current >= 0 && row.RAMOutstandingBytes >= 0 && jobsHeadroom >= 0 && maximum > jobsHeadroom {
+		var available int64
+		if shim {
+			available = ledgerAvailable(maximum, row.RAMOutstandingBytes, jobsHeadroom)
+		} else {
+			available = checkedAvailable(current, maximum, reclaimable, row.RAMOutstandingBytes, jobsHeadroom)
+		}
+		availableValue := available
+		row.AvailableBytes = &availableValue
+		row.NegativeAvailable = available < 0
+	}
+
+	return []runner.ConfineDumpQueueRow{row}, waiterRows
 }
