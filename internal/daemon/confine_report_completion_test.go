@@ -443,38 +443,51 @@ func TestConfineReportVersionSkewResend(t *testing.T) {
 			t.Fatalf("connections=%d, want exactly 1", got)
 		}
 	})
-	t.Run("(h) no re-send on a contradictory envelope", func(t *testing.T) {
-		// ok=true with the protocol code is not a well-formed refusal: the daemon
-		// may have committed, so a re-send could duplicate the row.
-		socket := filepath.Join(shortRuntimeDir(t), "s")
-		listener, err := net.Listen("unix", socket)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = listener.Close() })
-		var connections atomic.Int64
-		go func() {
-			for {
-				conn, err := listener.Accept()
+	t.Run("(h) no re-send on an envelope that is not a well-formed refusal", func(t *testing.T) {
+		// Only an explicitly present ok=false with the protocol code is a
+		// refusal. ok=true with that code contradicts itself, and a missing or
+		// null ok establishes nothing: in each case the daemon may have
+		// committed, so a re-send could duplicate the row.
+		for _, tc := range []struct {
+			name  string
+			reply any
+		}{
+			{"contradictory ok=true", ResponseFrame{OK: true, Code: CodeProtocol, Error: CodeProtocol + ": contradictory"}},
+			{"ok missing", map[string]any{"code": CodeProtocol, "error": CodeProtocol + ": no ok"}},
+			{"ok null", map[string]any{"ok": nil, "code": CodeProtocol, "error": CodeProtocol + ": null ok"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				socket := filepath.Join(shortRuntimeDir(t), "s")
+				listener, err := net.Listen("unix", socket)
 				if err != nil {
-					return
+					t.Fatal(err)
 				}
-				connections.Add(1)
-				var header [4]byte
-				if _, err := io.ReadFull(conn, header[:]); err == nil {
-					_, _ = io.CopyN(io.Discard, conn, int64(binary.BigEndian.Uint32(header[:])))
+				t.Cleanup(func() { _ = listener.Close() })
+				var connections atomic.Int64
+				go func() {
+					for {
+						conn, err := listener.Accept()
+						if err != nil {
+							return
+						}
+						connections.Add(1)
+						var header [4]byte
+						if _, err := io.ReadFull(conn, header[:]); err == nil {
+							_, _ = io.CopyN(io.Discard, conn, int64(binary.BigEndian.Uint32(header[:])))
+						}
+						_ = writeFrame(conn, tc.reply)
+						_ = conn.Close()
+					}
+				}()
+				err = runner.ReportPeakSample(reportCtx(t), socket, full("skew-h", false))
+				if err == nil {
+					t.Fatal("a reply that is not a success must be an error")
 				}
-				_ = writeFrame(conn, ResponseFrame{OK: true, Code: CodeProtocol, Error: CodeProtocol + ": contradictory"})
-				_ = conn.Close()
-			}
-		}()
-		err = runner.ReportPeakSample(reportCtx(t), socket, full("skew-h", false))
-		if err == nil {
-			t.Fatal("a contradictory reply must be an error")
-		}
-		_ = listener.Close()
-		if got := connections.Load(); got != 1 {
-			t.Fatalf("connections=%d, want exactly 1", got)
+				_ = listener.Close()
+				if got := connections.Load(); got != 1 {
+					t.Fatalf("connections=%d, want exactly 1", got)
+				}
+			})
 		}
 	})
 	t.Run("(g) no re-send on another refusal code", func(t *testing.T) {

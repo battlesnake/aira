@@ -941,15 +941,23 @@ func reportPeakExchangeOnce(ctx context.Context, socketPath string, args map[str
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return err
 	}
-	var response runnerAdmitResponseFrame
+	// OK is a pointer so a missing or null `ok` is told apart from an explicit
+	// false: only the latter is a refusal.
+	var response struct {
+		OK    *bool  `json:"ok"`
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
 	if err := readRunnerAdmitFrame(conn, &response); err != nil {
 		return err
 	}
-	if !response.OK || response.Code != "OK" {
-		// Only a WELL-FORMED refusal (ok false AND the protocol code) is re-sent:
-		// a contradictory envelope such as ok=true with an error code establishes
-		// nothing, and the daemon may have committed before sending it.
-		if !response.OK && response.Code == "E_DAEMON_PROTOCOL" && carriesCompletionFacts(args) {
+	if response.OK == nil || !*response.OK || response.Code != "OK" {
+		// Only a WELL-FORMED refusal (ok present and false AND the protocol code)
+		// is re-sent: a contradictory envelope such as ok=true with an error code,
+		// or one with no ok at all, establishes nothing, and the daemon may have
+		// committed before sending it.
+		refused := response.OK != nil && !*response.OK
+		if refused && response.Code == "E_DAEMON_PROTOCOL" && carriesCompletionFacts(args) {
 			return errReportCompletionFactsRefused
 		}
 		if response.Error != "" {

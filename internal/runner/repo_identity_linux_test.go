@@ -82,6 +82,88 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 			t.Fatalf("worktree=%s main=%s", got, mainID)
 		}
 	})
+	t.Run("symlinks in git's pointers are resolved before a relative .. is applied", func(t *testing.T) {
+		// git resolves each pointer physically (realpath), so a `..` after a
+		// symlinked component climbs from the symlink's TARGET. A lexical join
+		// collapses the `..` first and names another directory. Each fixture is
+		// checked against git itself before RepoIdentity is asked.
+		worktree := filepath.Join(base, "wt-pointers")
+		repoIdentityGit(t, main, "worktree", "add", "-q", "-b", "wt-pointers", worktree)
+		gitFile := filepath.Join(worktree, ".git")
+		original, err := os.ReadFile(gitFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitDir := strings.TrimSpace(strings.TrimPrefix(string(original), "gitdir: "))
+		// alias -> main/.git/worktrees/wt-pointers: the worktree's commondir
+		// (`../..`) must climb from the target, not from alias's parent (base).
+		alias := filepath.Join(base, "alias-gitdir")
+		if err := os.Symlink(gitDir, alias); err != nil {
+			t.Fatal(err)
+		}
+		// hop -> base/deep/a, so hop/../.. is base physically but base's
+		// PARENT lexically.
+		if err := os.MkdirAll(filepath.Join(base, "deep", "a"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(base, "deep", "a"), filepath.Join(base, "hop")); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct{ name, pointer string }{
+			{"a .git naming a symlink to the worktree's git directory", "gitdir: " + alias + "\n"},
+			{"a relative .git pointer through a symlinked component", "gitdir: ../hop/../../main/.git/worktrees/wt-pointers\n"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if err := os.WriteFile(gitFile, []byte(tc.pointer), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.WriteFile(gitFile, original, 0o644) })
+				command := exec.Command("git", "-C", worktree, "rev-parse", "--git-common-dir")
+				for _, entry := range os.Environ() {
+					if !strings.HasPrefix(entry, "GIT_") {
+						command.Env = append(command.Env, entry)
+					}
+				}
+				output, err := command.CombinedOutput()
+				if err != nil {
+					t.Fatalf("invalid fixture: git rejects it: %v\n%s", err, output)
+				}
+				common, err := filepath.EvalSymlinks(strings.TrimSpace(string(output)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := filepath.Join(main, ".git"); common != want {
+					t.Fatalf("invalid fixture: git's common dir is %s, want %s", common, want)
+				}
+				if got := mustRepoIdentity(t, worktree); got != mainID {
+					t.Fatalf("worktree=%s main=%s", got, mainID)
+				}
+			})
+		}
+	})
+	t.Run("a .git that cannot be classified is unevaluated, never the enclosing repository", func(t *testing.T) {
+		// Each fixture sits INSIDE main, so a walk that treats the error as
+		// "not here" reaches main's .git and returns mainID, not a vacuous none.
+		for _, tc := range []struct{ name, dir, target string }{
+			// stat fails with ELOOP: neither ENOENT nor ENOTDIR.
+			{"a self-referential .git symlink", "odd-loop", ".git"},
+			// stat succeeds on a character device: neither directory nor file.
+			{"a .git that is a device", "odd-device", "/dev/null"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				dir := filepath.Join(main, tc.dir)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(tc.target, filepath.Join(dir, ".git")); err != nil {
+					t.Fatal(err)
+				}
+				if id, ok := RepoIdentity(dir); id != "" || ok {
+					t.Fatalf("got (%q, %v), want (\"\", false); the enclosing repository is %s", id, ok, mainID)
+				}
+			})
+		}
+	})
 	t.Run("a submodule has its own identity", func(t *testing.T) {
 		other := newRepoIdentityRepo(t, base, "other")
 		repoIdentityGit(t, main, "submodule", "add", "-q", other, "mod")

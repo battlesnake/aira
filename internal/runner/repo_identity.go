@@ -115,7 +115,11 @@ func readGitFilePointer(path, dir string) (string, bool) {
 		return "", false
 	}
 	if !filepath.IsAbs(target) {
-		target = filepath.Join(dir, target)
+		// Concatenated, not filepath.Join: Join cleans lexically, collapsing a
+		// `..` that follows a symlinked component before the symlink is resolved,
+		// where git (realpath) climbs from the symlink's target. The caller's
+		// EvalSymlinks resolves the components in order.
+		target = dir + string(filepath.Separator) + target
 	}
 	return target, true
 }
@@ -123,6 +127,14 @@ func readGitFilePointer(path, dir string) (string, bool) {
 // repoIdentityFromGitDir resolves gitDir's common directory (gitDir itself unless
 // gitDir/commondir names another) and hashes its canonical path.
 func repoIdentityFromGitDir(gitDir string) (string, bool) {
+	// Resolve gitDir first, as git does: a relative commondir (a linked
+	// worktree's `../..`) climbs from the real git directory, not from the
+	// parent of a symlink that names it, and a pointer's unresolved `..` (see
+	// readGitFilePointer) must not be cleaned lexically by the Join below.
+	gitDir, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		return "", false
+	}
 	common := gitDir
 	data, missing, ok := readSmallRegularFile(filepath.Join(gitDir, "commondir"))
 	switch {
