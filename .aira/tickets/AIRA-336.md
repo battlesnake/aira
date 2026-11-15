@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-336","project":"aira","title":"aira confine --budget prints the whole machine-wide history (100 MB, 180k rows, one JSON line): bound the default output and say so","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-336","project":"aira","title":"aira confine --budget prints the whole machine-wide history (100 MB, 180k rows, one JSON line): bound the default output and say so","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
 ---
 
 
