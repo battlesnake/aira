@@ -1,7 +1,7 @@
 # Output of docs/dev/aira-cap-headroom-replay.py
 # snapshot: sqlite3 .backup of ~/.local/state/aira/state.db taken 2026-11-15T14:26Z; 234,630 confine rows; max(at) 2026-11-15T12:26:52.839079367Z
-# command: aira confine --name cap-headroom-replay4 --memory-reserve 384M -- python3 -I docs/dev/aira-cap-headroom-replay.py --db ~/tmp/aira-cap-headroom-data/state-copy.db
-# exit code: 0 (confine trailer: terminated-by=normal; see the last line)
+# command: aira confine --name cap-headroom-replay5 --memory-reserve 384M -- python3 -I docs/dev/aira-cap-headroom-replay.py --db ~/tmp/aira-cap-headroom-data/state-copy.db
+# exit code: 0 (confine trailer, last line: terminated-by=normal)
 
 PART 1  the quoted evidence, re-derived (all cap sources)
   confine rows 234630; OOM rows 4425; OOM rows with a budget 4210
@@ -39,7 +39,7 @@ PART 2  split by cap source, clean-run timing and cap, and (auto) estimator rung
     estimate:max     382
     oom-escalated    268
     no-earlier-row auto OOM rows killed at exactly 1 GiB (the client default): 978
-    auto-only OOM streaks ended by a clean run (any source), by length: {1: 1262, 2: 131, 3: 10, 4: 3, 5: 1}
+    auto-only OOM streaks ended by a clean run (any source), by length: {1: 1267, 2: 131, 3: 10, 4: 3, 5: 1}
 
 PART 3  AIRA-318 interaction: clean auto rows at >= 95% of their cap
   clean auto rows 88593; at >= 95% of cap 1996 (2.3%); signatures 1715; signatures with >= 2 such rows 205
@@ -81,4 +81,4 @@ PART 5  page-cache ratchet, booking C over six runs from C=1 GiB (cache fills th
   k=2 318-cap  2.00 4.00 8.00 16.00 32.00 64.00
   k=2 booking  1.00 1.00 1.00 1.00 1.00 1.00
 
-confine: slice=aira.slice name=cap-headroom-replay4 containment=enforced cap=enforced(64G) reserve=384M reserve-basis=pinned:client admission=immediate scope=placed scope-integrity=contained oom.group=set priorities=applied cpu-weight=aging(100->10@30m0s) scope-memory.max=enforced=402653184 cap-source=operator:--memory-reserve binding=scope-limited effective=402653184 scope-swap.max=enforced terminated-by=normal peak-rss=204864K cpu=4.512221s+528.529ms wall=5.593533s
+confine: slice=aira.slice name=cap-headroom-replay5 containment=enforced cap=enforced(64G) reserve=384M reserve-basis=pinned:client admission=waited scope=placed scope-integrity=contained oom.group=set priorities=applied cpu-weight=aging(100->10@30m0s) scope-memory.max=enforced=402653184 cap-source=operator:--memory-reserve binding=scope-limited effective=402653184 scope-swap.max=enforced terminated-by=normal peak-rss=217188K cpu=4.744308s+617.463ms wall=9.140037s

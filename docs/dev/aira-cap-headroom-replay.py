@@ -229,20 +229,18 @@ def part2(rows, clean):
     for name in ("cold-start", "own-max", "estimate:max", "oom-escalated"):
         print("    %-14s %5d" % ("no-earlier-row" if name == "cold-start" else name, len(by.get(name, []))))
     print("    no-earlier-row auto OOM rows killed at exactly 1 GiB (the client default): %d" % one_gib)
-    # the 1.5x-per-kill creep, in kills: consecutive OOM rows of one signature (EVERY cap source:
-    # an intervening row of any source breaks the streak), counted when the streak's rows are all
-    # auto and it ended with a clean row of any source.
+    # the 1.5x-per-kill creep, in kills: a run of consecutive AUTO OOM rows of one signature, ended
+    # by a clean row of any source. A non-auto OOM row (or any other row) ends the auto run; a
+    # non-auto OOM starts no auto run, so a later auto OOM starts a fresh one.
     runs = collections.Counter()
-    streak = {}                                      # sig -> [length, all_auto]
+    streak = {}                                      # sig -> length of the current auto OOM run
     for _rid, sig, peak, oom, _at, _b, bb in rows:
-        if oom:
-            st = streak.setdefault(sig, [0, True])
-            st[0] += 1
-            st[1] = st[1] and bb == AUTO
+        if oom and bb == AUTO:
+            streak[sig] = streak.get(sig, 0) + 1
             continue
-        st = streak.pop(sig, None)
-        if st and st[1] and peak:
-            runs[st[0]] += 1
+        n = streak.pop(sig, 0)
+        if n and not oom and peak:
+            runs[n] += 1
     print("    auto-only OOM streaks ended by a clean run (any source), by length: %s" % dict(sorted(runs.items())))
 
 

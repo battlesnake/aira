@@ -109,7 +109,7 @@ peak of 658M. The killed run needed a few megabytes more than its estimate; k = 
 saved it, and its next booking would have stayed near 653M instead of 980M.
 
 The 1.5x-per-kill creep (AIRA-273), measured: of the runs of consecutive auto OOM rows of one
-signature that ended with a clean run (any cap source; any intervening row breaks a run), 1,262
+signature that ended with a clean run (any cap source ends a run; a non-auto OOM restarts it), 1,267
 had one kill, 131 two, 10 three, 3 four and 1 five. Multi-kill creep is real
 (RANT-136, RANT-109, qual's lint gate) but the commonest auto kill is a single one.
 
@@ -132,6 +132,13 @@ had one kill, 131 two, 10 three, 3 four and 1 five. Multi-kill creep is real
 - **Bimodal commands.** A command whose modes differ by more than k (qual's 17 MB vs 417 MB lint
   gate, 24x) is "beyond k" and keeps AIRA-273's creep, starting from a cap k times higher.
 - **Failed runs** are not recorded (AIRA-264); their need is invisible.
+- **Kill attribution is not stored.** `oom = 1` is recorded for any OOM kill under the scope,
+  including a kill under a descendant's own limit (a container's `--memory`) and a kill under an
+  ancestor's limit (the slice); the trailer tells them apart (`confine_linux.go:1509-1518`) but the
+  row does not. A larger scope cap cannot prevent the descendant kind and may not prevent the
+  ancestor kind, so the kill rate and every "saved" figure above include kills headroom would not
+  have touched. Their share is **unmeasured**; the step-2 metric counts own-limit kills only
+  (section 8).
 
 ### 2.4 The downside: the slice running over its ceiling
 
@@ -143,8 +150,10 @@ is full, total booking is about the admission ceiling, so the share of draws wit
 **model** of how often the jobs' own use would push a full slice above its (possibly throttled)
 ceiling. It is a model only: a draw is 20 arbitrary finished rows (a median 20.6 GiB of bookings),
 not a ceiling-saturated admitted population (about 43 such jobs at a 45 GiB ceiling); the ratio is
-scale-free, but the variance of 43 jobs is lower than that of 20, so these figures are conservative
-in that respect and say nothing about who was actually running together. "OOM-command burst" draws
+scale-free, but the spread of a 43-job total differs from a 20-job one in either direction (it
+narrows around the group's mean, which raises the exceedance when that mean is above 1), so the
+figures are scenario outputs under these assumptions, not bounds, and say nothing about who was
+actually running together. "OOM-command burst" draws
 20 jobs of one command+subcommand that has an OOM on record (53 such groups).
 
 Counts are draws over 1 out of 4,000; then p99 and max of the ratio.
@@ -170,8 +179,9 @@ today die one by one inside their own caps and with headroom would run together 
 slack. That is the case the physical-fit term and steering exist for (section 5). Coverage limits:
 draws are independent and not duration-weighted (AIRA-323's timing columns began on 2026-11-15:
 720 rows, too few to replay a timeline); the physical-fit term cannot be replayed because the store
-has no record of real use at each grant, so this table is the fixed-k upper bound; page cache is
-reclaimable, so the "cache" rows overstate the risk of a kill and understate nothing.
+has no record of real use at each grant, so this table models fixed k without that term; page
+cache is reclaimable, so in the "cache" rows the filled part is not memory a kill would be needed
+to recover.
 
 ## 3. The greenfield minimum, and the alternatives
 
@@ -241,7 +251,7 @@ up to `memory.max` before reclaiming it. The next booking is 1.15 x that peak. S
 | **booking rule: never above the booking it ran under** | stable at 1.00 | **stable at 1.00** |
 
 Exposure today: 1,996 clean auto rows (2.3%) sit at >= 95% of their cap, over 1,715 signatures;
-150 consecutive at-cap pairs of one signature show the ratchet running now, cap ratio median 1.150
+136 consecutive at-cap pairs of one signature show the ratchet running now, cap ratio median 1.150
 (output, part 3). Under k = 2 each of those signatures would hit E_ADMIT_TOO_LARGE within about
 five runs. **The rule must not be enabled at k > 1 without the booking rule.**
 
@@ -394,13 +404,20 @@ then step 2. Step 1 does not depend on 324 and may land earlier.
    included) would make the replay binding; it is a deferral.
 4. **Metrics**, weekly against the prior fortnight: auto OOM kills per 1,000 auto jobs (expected to
    fall by roughly half at k = 2); share of auto jobs whose peak exceeded their booking (headroom
-   used); slice-level `memory.events` `high`, `max` and `oom_kill` (the slice's own counters,
-   against the sum of scope-local kills); slice `memory.pressure` `some avg10`; ceiling throttle
-   cuts; steering raises.
+   used); hourly **increments** of the slice's `memory.events.local` `high`, `max` and `oom` (the
+   counters are cumulative, so only deltas over fixed windows are compared, and a counter that
+   goes backwards, as after a slice re-creation, starts a new baseline); slice `memory.pressure`
+   `some avg10` (a moving average, compared as sampled); ceiling throttle cuts; steering raises.
+   Auto kills are counted only when the confine trailer attributes them to the scope's **own**
+   limit (the runner already distinguishes own-limit, descendant and ancestor kills,
+   `confine_linux.go:1509-1518`); the stored `oom` bit does not, so the store alone cannot give
+   this metric (section 2.3).
 5. **Rollback** (any one sets k back to 1.0, which writes exactly today's caps for new grants, and
-   files a finding): a slice-level `oom_kill` (one not explained by a scope's own limit);
-   `memory.events` `high` or PSI `some avg10` above their pre-step-2 weekly 99th percentile for two
-   consecutive hours; the median booking of repeat signatures growing more than 15% in a week (a
+   files a finding): any increment of aira.slice's own `memory.events.local` `oom` (the slice's
+   **own** limit was reached, the kernel's attribution, which a scope's local kill counter cannot
+   give because a kill under an ancestor limit also counts in the victim scope); the hourly
+   increment of the slice's `memory.events.local` `high`, or PSI `some avg10`, above its
+   pre-step-2 hourly 99th percentile for two consecutive hours; the median booking of repeat signatures growing more than 15% in a week (a
    ratchet step 1 missed).
 
 ## 9. Protocol and storage
@@ -477,12 +494,17 @@ No protocol bump. Each change follows a measured no-bump pattern:
 
 ## 12. Change log
 
+- 2026-11-15, rev 1 after Sol round 2 (BLOCK, 3 P2 + 3 P3, all taken): rollback keyed on the
+  slice's own `memory.events.local` `oom`; cumulative counters compared as hourly deltas;
+  unstored kill attribution stated as an evidence limit and the step-2 metric restricted to
+  own-limit kills; streak loop restarts at a non-auto OOM (counts re-derived); 150 -> 136; the
+  Monte-Carlo "conservative" and "upper bound" claims removed.
 - 2026-11-15, rev 1 after Sol (high) review, verdict BLOCK, 11 findings, all taken: censoring only
   for kernel-capped rows; AIRA-341 before k > 1 (the p90 prior reads raw peaks); "lower/upper
   bound" renamed a proxy range; the timeline replay demoted to advisory with the live slice
   evidence as the binding gate; steering's 64 MiB floor and kernel-max trigger stated; Monte-Carlo
   counts printed and the model's sampling stated; the script's streak and at-cap-pair loops fixed to
-  break on a row of any source (streak counts changed from 575/60/3/2 to 1,262/131/10/3/1; pairs
+  break on a row of any source (streak counts changed from 575/60/3/2 to 1,262/131/10/3/1, then 1,267 after round 2; pairs
   150 to 136); the reconstruction renamed a retained-evidence category; the persistent 3C floor
   acknowledged; AIRA-331 no longer claimed superseded; the summary-file cap field specified.
 - 2026-11-15, rev 1: written from the owner's 2026-11-15 direction, with the challenge findings
