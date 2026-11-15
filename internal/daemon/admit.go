@@ -783,8 +783,8 @@ type sliceQueue struct {
 	// full hold.
 	//
 	// Lifetime note: this anchor lives only as long as the queue's POPULATION:
-	// releaseAdmitWaiterLocked clears it (with freezeHolderSeq and freezeLogged)
-	// when the last waiter leaves. A hold cut short by quiescence is not a
+	// afterAdmitRelease clears it (with freezeHolderSeq and freezeLogged) once the
+	// last waiter has left. A hold cut short by quiescence is not a
 	// fairness leak — an empty queue has nobody to starve.
 	freezeArmedAt   time.Time
 	freezeHolderSeq int64            // diagnostics only; never affects timing
@@ -2390,7 +2390,23 @@ func (q *sliceQueue) runEvaluator() {
 	}()
 	ticker := time.NewTicker(q.poll)
 	defer ticker.Stop()
+	ticking := true
 	for {
+		// AIRA-228. The queue outlives its population, so the poll ticker runs
+		// only while it holds someone: an idle daemon has no timer wakeups, as
+		// when an empty queue had no evaluator at all. Every enqueue signals kick,
+		// which brings the loop back here to resume polling.
+		q.mu.Lock()
+		populated := len(q.waiters) != 0
+		q.mu.Unlock()
+		if populated != ticking {
+			if populated {
+				ticker.Reset(q.poll)
+			} else {
+				ticker.Stop()
+			}
+			ticking = populated
+		}
 		select {
 		case <-q.kick:
 			q.server.evaluateAdmitQueue(q)
@@ -2419,8 +2435,9 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	// AIRA-228. The queue outlives its population, so this evaluator ticks while
-	// idle. A pass over nobody decides nothing: return before reading cgroup files.
+	// AIRA-228. The queue outlives its population. A pass over nobody (a kick
+	// that lands after the last release) decides nothing: return before reading
+	// cgroup files.
 	if len(queue.waiters) == 0 {
 		return
 	}
@@ -2975,12 +2992,6 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 			break
 		}
 	}
-	if len(queue.waiters) == 0 {
-		// AIRA-228. The population is over and its fairness-freeze state goes with
-		// it, so the next one starts idle, as it did when an emptied queue was
-		// deleted. This is the one place a waiter leaves the queue.
-		queue.freezeArmedAt, queue.freezeHolderSeq, queue.freezeLogged = time.Time{}, 0, admitFreezeIdle
-	}
 	waiter.state = admitReleased
 	// Discharge is a re-derive, not a subtraction: this waiter is now removed
 	// from queue.waiters AND marked admitReleased, so re-deriving over the
@@ -3011,6 +3022,20 @@ func (s *Server) afterAdmitRelease(queue *sliceQueue) {
 	// sufficient to wake its own CPU-blocked waiters. No cross-queue signal: there is
 	// no machine-wide CPU ledger for another slice to be waiting on.
 	queue.signal()
+	// AIRA-228. A population that has drained takes its fairness-freeze state
+	// with it, so the next one starts idle. This is the exact decision point the
+	// deleted pruneAdmitQueue used (registry lock, then queue lock, then "is it
+	// still empty?"), so a request that slipped in between the release and this
+	// check keeps the anchor, exactly as it kept the old queue.
+	s.admitRegistryMu.Lock()
+	if s.admitQueue == queue {
+		queue.mu.Lock()
+		if len(queue.waiters) == 0 {
+			queue.freezeArmedAt, queue.freezeHolderSeq, queue.freezeLogged = time.Time{}, 0, admitFreezeIdle
+		}
+		queue.mu.Unlock()
+	}
+	s.admitRegistryMu.Unlock()
 }
 
 // retireAdmitQueue stops the admission queue's evaluator and forgets the queue.

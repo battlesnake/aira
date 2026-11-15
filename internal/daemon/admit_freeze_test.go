@@ -252,17 +252,14 @@ func TestAdmitFreezePhasePersistsWhenHeadBecomesFitting(t *testing.T) {
 		t.Fatalf("freezeHolderSeq=%d, want cleared once nothing froze", queue.freezeHolderSeq)
 	}
 
-	// Yield still begins on the original schedule. The new waiters arrive BEFORE
-	// the granted pair leaves, so the queue's population never drains: a drained
-	// population takes its anchor with it (AIRA-228,
-	// TestAdmitDrainedPopulationLeavesNoFreezeAnchor).
+	// Yield still begins on the original schedule.
+	server.releaseAdmitWaiter(queue, head)
+	server.releaseAdmitWaiter(queue, arming)
 	current = 50
 	now = armedAt.Add(40 * time.Second)
 	newHead := queuedWaiter(2, 60, now.Add(-40*time.Second))
 	fitting := queuedWaiter(3, 35, now)
 	queue.waiters = append(queue.waiters, newHead, fitting)
-	server.releaseAdmitWaiter(queue, head)
-	server.releaseAdmitWaiter(queue, arming)
 	server.evaluateAdmitQueue(queue)
 	requireAdmitQueued(t, fitting) // still inside the original hold
 

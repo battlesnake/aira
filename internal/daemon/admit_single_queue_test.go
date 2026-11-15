@@ -385,3 +385,41 @@ func TestAdmitIdleEvaluatorPassReadsNoSliceMemory(t *testing.T) {
 		t.Fatalf("an idle pass read the slice memory %d time(s)", after-before)
 	}
 }
+
+// verifies: AIRA-228 — an idle queue's evaluator holds no poll timer. The queue
+// outlives its population, so a ticker left running would wake an idle daemon
+// at the poll rate forever (before AIRA-228 an empty queue had no evaluator at
+// all). With a 1ms poll and nothing queued, no pass may run; the next enqueue
+// must still be served. Mutation: keep the ticker running while idle -> idle
+// passes are counted.
+func TestAdmitIdleEvaluatorHoldsNoPollTimer(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	server := admitTestServer(&maximum)
+	server.admitPollInterval = time.Millisecond
+	// Every evaluator pass reads the clock first; count those reads only while
+	// the queue is idle.
+	var counting atomic.Bool
+	var passes atomic.Int64
+	server.admitNow = func() time.Time {
+		if counting.Load() {
+			passes.Add(1)
+		}
+		return time.Now()
+	}
+	t.Cleanup(func() { retireAdmitQueues(server) })
+	queue, waiter := enqueueOn(t, server, "/slice", 10)
+	waitAdmitGrant(t, waiter)
+	server.releaseAdmitWaiter(queue, waiter)
+	// Let the release's own kick land before counting idle wakeups.
+	time.Sleep(50 * time.Millisecond)
+	counting.Store(true)
+	time.Sleep(100 * time.Millisecond)
+	counting.Store(false)
+	if n := passes.Load(); n != 0 {
+		t.Fatalf("an idle evaluator ran %d pass(es) in 100ms at a 1ms poll; it must hold no poll timer while the queue is empty", n)
+	}
+	_, next := enqueueOn(t, server, "/slice", 10)
+	waitAdmitGrant(t, next)
+	server.releaseAdmitWaiter(queue, next)
+}
