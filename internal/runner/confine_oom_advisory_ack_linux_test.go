@@ -28,7 +28,7 @@ func daemonReserveOOMDiagnostics(t *testing.T, peak *int64, reportPeak func(cont
 		}
 	}
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "immediate", reserve: 32 << 20, basis: "estimate:p90-prior", release: &confineCountingCloser{}}, nil
+		return admissionResult{state: "immediate", reserve: 32 << 20, basis: "fallback:no-history", release: &confineCountingCloser{}}, nil
 	}
 	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
 	deps.reportPeak = reportPeak

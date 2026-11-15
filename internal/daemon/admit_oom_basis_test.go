@@ -25,16 +25,12 @@ import (
 // verifies: AIRA-149 §3.1 (the five-row table, value AND basis)
 
 // oomBasisServer is a server whose reserve resolution is entirely the test's:
-// the peak history is injected, and the machine-wide p90 prior must never be
-// consulted (every case below returns from inside the history block).
+// the peak history is injected (every case below returns from inside the
+// history block).
 func oomBasisServer(t *testing.T, stats runner.PeakRSSStats) *Server {
 	t.Helper()
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) {
-		t.Fatal("the machine-wide prior was consulted although the history block returned")
-		return 0, false, nil
-	}
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return stats, nil
 	}
@@ -265,7 +261,6 @@ func TestEveryOOMBranchBasisNamesTheOOMRecordAndOnlyTheOOMBranchDoes(t *testing.
 		} {
 			server := NewServer(Paths{})
 			server.stopping = make(chan struct{})
-			server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 			cleaned := without.apply(stats)
 			server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 				return cleaned, nil
@@ -325,8 +320,6 @@ func TestResolveAdmitReserveKeepsTheEstimatorsOwnFallbackBasis(t *testing.T) {
 func TestPostBlockInsufficientSamplesFallbackIsUnchanged(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
-	// No machine-wide prior, so the post-block chain is actually reached.
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 56360960}, nil
 	}

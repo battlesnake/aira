@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -25,13 +24,13 @@ func confineSample(t *testing.T, db *DB, signature string, peak int64, oom bool,
 	}
 }
 
-// TestConfinePeakP90IgnoresNonConfineKinds pins Decision 1's decisive term. The
-// p90 prior feeds LIVE admission for every job with no history of its own, and
-// it scans the table with no per-signature filter, so an unnamespaced aitest row
-// would silently drag the machine-wide prior.
+// TestConfinePeakHistoryIgnoresNonConfineKinds pins Decision 1's decisive term:
+// the per-signature reader that sizes LIVE admission must not see an aitest
+// worker row that shares a confine signature. (Until AIRA-341 this test also
+// pinned the deleted machine-wide p90 prior's kind filter.)
 //
 // verifies: AIRA-180
-func TestConfinePeakP90IgnoresNonConfineKinds(t *testing.T) {
+func TestConfinePeakHistoryIgnoresNonConfineKinds(t *testing.T) {
 	db := openConfineHistoryTestDB(t)
 	ctx := context.Background()
 	base := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
@@ -41,21 +40,8 @@ func TestConfinePeakP90IgnoresNonConfineKinds(t *testing.T) {
 				base.Add(time.Duration(index*10+sample)*time.Second))
 		}
 	}
-	before, ok, err := db.ConfinePeakP90(ctx)
-	if err != nil || !ok || before != 900 {
-		t.Fatalf("baseline p90=%d ok=%v err=%v", before, ok, err)
-	}
-	// Hundreds of small aitest worker rows are exactly the shape that would drag
-	// the prior down if the reader did not name a kind.
-	//
-	// The fixture SIZE is load-bearing, not decoration (final build-review,
-	// Fable 2026-09-09): the original 12 pools, 10 of which shared a confine
-	// signature, left an UNFILTERED reader with 12 per-signature maxima
-	// [1, 1, 100..1000], whose nearest-rank p90 index is (9*12+9)/10-1 = 10 —
-	// still 900. The mutant with the kind filter deleted passed. Thirty pools on
-	// DISTINCT signatures give the unfiltered reader 40 maxima [1×30, 100..1000]
-	// and index (9*40+9)/10-1 = 35, i.e. 600: a filter regression now moves the
-	// answer, so the assertion below can actually fail.
+	// Pytest-worker rows, one pool of which shares a confine signature outright —
+	// the collision the kind column exists to make impossible.
 	recordPool := func(signature string, samples int) {
 		for sample := 0; sample < samples; sample++ {
 			peak := int64(1)
@@ -69,18 +55,9 @@ func TestConfinePeakP90IgnoresNonConfineKinds(t *testing.T) {
 			}
 		}
 	}
-	for index := 0; index < 30; index++ {
-		recordPool(fmt.Sprintf("pool-%02d", index), 5)
-	}
-	// And one pool that shares a confine signature outright — the collision the
-	// kind column exists to make impossible.
+	recordPool("pool-00", 5)
 	recordPool("b", 5)
-	after, ok, err := db.ConfinePeakP90(ctx)
-	if err != nil || !ok || after != before {
-		t.Fatalf("p90 moved after aitest rows: before=%d after=%d ok=%v err=%v", before, after, ok, err)
-	}
-	// The confine reader must be namespaced in the same direction. Signature "b"
-	// now holds BOTH three confine rows (index 1 above) and five pytest-worker
+	// Signature "b" now holds BOTH three confine rows (index 1 above) and five pytest-worker
 	// rows (the shared pool above).
 	stats, err := db.ConfinePeakHistory(ctx, "b")
 	if err != nil {

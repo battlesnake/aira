@@ -132,14 +132,6 @@ func TestConfinePeakHistoryTelemetryChangesNothingElse(t *testing.T) {
 				t.Fatalf("%s: history with telemetry %+v (err %v) != without %+v", signature, got, err, want)
 			}
 		}
-		wantP90, wantOK, err := bare.ConfinePeakP90(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		gotP90, gotOK, err := populated.ConfinePeakP90(ctx)
-		if err != nil || gotP90 != wantP90 || gotOK != wantOK {
-			t.Fatalf("p90 with telemetry %d/%v (err %v) != without %d/%v", gotP90, gotOK, err, wantP90, wantOK)
-		}
 	})
 }
 

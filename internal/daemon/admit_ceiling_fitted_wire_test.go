@@ -156,8 +156,8 @@ func TestSmallSliceUnpinnedRequestIsAdmittedAndGrantedInsteadOfRefused(t *testin
 // the default is granted UNFITTED; the fit path itself is exercised on sub-GiB
 // slices by the tests above.
 //
-// The command here is NOVEL: no per-signature history and no machine-wide p90 at
-// all, so this row never touches the OOM branch.
+// The command here is NOVEL: no per-signature history at all, so this row never
+// touches the OOM branch.
 //
 // verifies: AIRA-153 §1.2, §6
 func TestDefaultInstallCeilingAdmitsANovelUnpinnedCommand(t *testing.T) {

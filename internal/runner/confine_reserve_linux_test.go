@@ -170,7 +170,7 @@ func TestConfineReservePinnedGrantHeldUntilCloseAndReleasedOnce(t *testing.T) {
 }
 
 // verifies: v1 requires a PINNED reserve — an unpinned request is refused BEFORE
-// any daemon dial (never sent to the estimate/p90 path). RED against dropping the
+// any daemon dial (never sent to the estimate path). RED against dropping the
 // !Pinned guard in validateConfineReserveRequest.
 func TestConfineReserveUnpinnedIsRefusedBeforeDial(t *testing.T) {
 	r := reserveTestRunner()

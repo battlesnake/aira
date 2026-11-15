@@ -140,10 +140,6 @@ type Server struct {
 	// the insertion-ordered expiry list), see recordCancelledScopeLocked.
 	cancelledScopes              map[string]struct{}
 	cancelledScopeOrder          []cancelledScope
-	admitPriorMu                 sync.Mutex
-	admitPriorPeak               int64
-	admitPriorOK                 bool
-	admitPriorAt                 time.Time
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
 
@@ -256,7 +252,6 @@ type Server struct {
 	admitWriteFrame      func(net.Conn, any) error
 	admitBeforeWrite     func(*admitWaiter)
 	admitPeakHistory     func(context.Context, string) (runner.PeakRSSStats, error)
-	admitPeakP90         func(context.Context) (int64, bool, error)
 	peerCredential       func(net.Conn) (int, int, error)
 	storeOpAppendTimeout time.Duration
 	storeOpHeavyTimeout  time.Duration

@@ -63,7 +63,6 @@ const (
 	// admitHistoryTimeout's hot-path
 	// callers.
 	dumpHistoryTimeout                        = 30 * time.Second
-	admitPriorRefresh                         = time.Minute
 	oomSteerIntervalCeiling                   = time.Second
 	admitSliceHeadroomBaseDefault       int64 = 2 << 30
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
@@ -1454,8 +1453,10 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 		// strictly tighter (AIRA-150) — so anything AIRA sizes for ITSELF is bounded
 		// by `fit`, never by `ceiling`.
 		//
-		// Three sites, below: the client's unpinned prior, the machine-wide p90
-		// prior, and AIRA-151's OOM-escalation clamp. `fit` is 0 when the slice is
+		// Two sites, below: the client's unpinned prior (SITE 1) and AIRA-151's
+		// OOM-escalation clamp (SITE 3). SITE 2 was the machine-wide p90 prior,
+		// deleted by AIRA-341: a command with no usable history of its own now
+		// gets SITE 1's prior, the client's default. `fit` is 0 when the slice is
 		// too small for any viable reserve, and every site then leaves the value
 		// alone so the existing terminal E_ADMIT_TOO_LARGE answers, naming both
 		// numbers.
@@ -1646,25 +1647,6 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 				}
 			}
 		}
-		if peak, ok := s.cachedAdmitPeakP90(readCtx); ok {
-			stats := runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: peak}
-			if reserve, usable, _ := runner.EstimateMemoryReserve(stats, 0); usable {
-				// SITE 2 — AIRA-153. The p90 is a PRIOR about commands OTHER than this
-				// one — it is consulted precisely because this signature has no history
-				// — so it is bounded exactly as the client's default is, and only where
-				// it would otherwise be refused or land on the ceiling.
-				//
-				// Without this, AIRA-128's cold start (which the agent guide teaches as
-				// `estimate:p90-prior`) is still terminally refused on any slice whose
-				// ceiling is below the box's p90 — the ordinary shape of a small ci-shim
-				// budget beside a large aira.slice, since one machine-wide state.db
-				// serves both.
-				if fit > 0 && reserve >= ceiling {
-					return fit, "estimate:p90-prior,ceiling-fitted"
-				}
-				return reserve, "estimate:p90-prior"
-			}
-		}
 		// The four post-block fallbacks each return the client's own hint verbatim,
 		// so each inherits SITE 1's fit and must name it (AIRA-153 §3.5).
 		if request.signature == "" {
@@ -1690,32 +1672,6 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 		floorBasis += ",oom-on-record"
 	}
 	return floor, floorBasis
-}
-
-func (s *Server) cachedAdmitPeakP90(ctx context.Context) (int64, bool) {
-	now := s.admitNowTime()
-	s.admitPriorMu.Lock()
-	if !s.admitPriorAt.IsZero() && now.Sub(s.admitPriorAt) < admitPriorRefresh {
-		peak, ok := s.admitPriorPeak, s.admitPriorOK
-		s.admitPriorMu.Unlock()
-		return peak, ok
-	}
-	s.admitPriorMu.Unlock()
-	read := s.admitPeakP90
-	if read == nil && s.db != nil {
-		read = s.db.ConfinePeakP90
-	}
-	if read == nil {
-		return 0, false
-	}
-	peak, ok, err := read(ctx)
-	if err != nil {
-		return 0, false
-	}
-	s.admitPriorMu.Lock()
-	s.admitPriorPeak, s.admitPriorOK, s.admitPriorAt = peak, ok, now
-	s.admitPriorMu.Unlock()
-	return peak, ok
 }
 
 // acquireAdmitSlot takes one of the admitGlobalMax concurrency slots, or
@@ -3148,9 +3104,9 @@ func saturatedDiagnosisLocked(waiter *admitWaiter, reserve, ceiling int64) admit
 // The case is decided by the basis TERM, never by comparing numbers, on the
 // AIRA-149 rule that a label names the term that ACTED: `pinned:client` is
 // returned at resolveAdmitReserve's first line and nowhere else,
-// `estimate:oom-escalated` only where the escalation strictly set the value, and
-// `estimate:p90-prior` is a machine-wide prior rather than this command's own
-// history despite its `estimate:` family. Trailing tokens (`,oom-on-record`,
+// and `estimate:oom-escalated` only where the escalation strictly set the value.
+// Every other `estimate:` term is this command's own history (AIRA-341 deleted
+// the one machine-wide `estimate:` prior). Trailing tokens (`,oom-on-record`,
 // `,ceiling-fitted`, `,ceiling-clamped`) qualify the term, they do not replace
 // it, so they are trimmed before the match rather than pattern-matched around.
 //
@@ -3196,8 +3152,6 @@ func tooLargeRefusalAdvice(basis string) string {
 		return "this reserve was PINNED on the client side, so AIRA neither sized it nor fitted it to this slice, and it is larger than this slice can grant; which pin is not established here -- it may be a --memory-reserve, --memory-max or --delegate-ram passed to confine, a `docker run --memory` limit AIRA charged for an otherwise unpinned job, or an `aira run` reserve (run.memory_reserve, or AIRA's own estimate, both of which aira run sends pinned); give it a reserve of at most cap_minus_headroom -- lower the one you passed, or set one -- or run where the slice is larger"
 	case term == "estimate:oom-escalated":
 		return "this command was OOM-killed here, and the reserve its own recorded peak justifies is larger than this slice can grant; it does not fit on this slice -- run where the slice is larger rather than retrying it unchanged"
-	case term == "estimate:p90-prior":
-		return "this number is a machine-wide PRIOR about other commands, not a measurement of this one, and this slice cannot grant even that; pin a --memory-reserve you know this command fits in, or run where the slice is larger"
 	case strings.HasPrefix(term, "estimate:"):
 		return "this is AIRA's estimate from this command's OWN measured peak history, and it exceeds what this slice can grant; pin a smaller --memory-reserve only if you know the real need is smaller, otherwise this command cannot run on this slice"
 	case strings.HasPrefix(term, "fallback:"):

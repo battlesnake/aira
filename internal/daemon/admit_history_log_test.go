@@ -31,7 +31,6 @@ func TestAdmitHistoryReadFailureIsLoggedWithoutTheArgv(t *testing.T) {
 				time.Sleep(2 * time.Millisecond)
 				return runner.PeakRSSStats{}, test.err
 			}
-			server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 			var basis string
 			logged := captureDaemonLog(t, func() {
 				_, basis = server.resolveAdmitReserve(admitRequest{reserve: 1 << 30, signature: signature}, 64<<30)
@@ -55,7 +54,6 @@ func TestAdmitHistoryReadFailureIsLoggedWithoutTheArgv(t *testing.T) {
 		server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 			return runner.PeakRSSStats{}, nil
 		}
-		server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 		logged := captureDaemonLog(t, func() {
 			server.resolveAdmitReserve(admitRequest{reserve: 1 << 30, signature: signature}, 64<<30)
 		})

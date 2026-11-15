@@ -32,8 +32,7 @@ const (
 	ResourceBudgetUnevaluated      = "unevaluated"
 )
 
-// resourceBudgetMinSamples mirrors runner's own memoryEstimateMinSamples and
-// ConfinePeakP90's HAVING COUNT(peak_rss)>=3. No new constant enters the
+// resourceBudgetMinSamples mirrors runner's own memoryEstimateMinSamples. No new constant enters the
 // codebase: this is the codebase's existing answer to "too little evidence".
 const resourceBudgetMinSamples = 3
 
