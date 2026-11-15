@@ -213,6 +213,12 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 		for _, tc := range []struct {
 			name, dir string
 			setup     func(t *testing.T, dir string)
+			// gitDependent marks a corner whose answer is git's own and has
+			// changed between git releases (the CI image's newer git refuses
+			// it rather than skipping it). RepoIdentity asks git, so it follows
+			// whichever git is installed; the fixture is only a usable oracle
+			// where this git skips the `.git`.
+			gitDependent bool
 		}{
 			{"a .git holding only a HEAD", "odd-head-only", func(t *testing.T, dir string) {
 				if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
@@ -221,28 +227,28 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, false},
 			{"a nested repository whose HEAD is not a ref", "odd-bad-head", func(t *testing.T, dir string) {
 				repoIdentityGit(t, dir, "init", "-q")
 				if err := os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("not-a-head\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, false},
 			{"an empty .git directory", "odd-empty", func(t *testing.T, dir string) {
 				if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, false},
 			{"a self-referential .git symlink", "odd-loop", func(t *testing.T, dir string) {
 				if err := os.Symlink(".git", filepath.Join(dir, ".git")); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, true},
 			{"a .git that is a device", "odd-device", func(t *testing.T, dir string) {
 				if err := os.Symlink("/dev/null", filepath.Join(dir, ".git")); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				dir := filepath.Join(main, tc.dir)
@@ -251,6 +257,9 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 				}
 				tc.setup(t, dir)
 				if common, ok := gitCommonDir(t, dir); !ok || common != filepath.Join(main, ".git") {
+					if tc.gitDependent {
+						t.Skipf("this git does not skip the .git (common dir (%q, %v)); the answer is git's own", common, ok)
+					}
 					t.Fatalf("invalid fixture: git's common dir is (%q, %v), want %s", common, ok, filepath.Join(main, ".git"))
 				}
 				if got := mustRepoIdentity(t, dir); got != mainID {
