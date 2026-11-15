@@ -26,9 +26,9 @@ PART 2  split by cap source, clean-run timing and cap, and (auto) estimator rung
     NOTE: a clean peak at or below the killed cap says nothing about the killed run (its need was
     > cap), so the rows above are NOT the estimate. The three-way split below is.
   three-way split of auto OOM rows by the largest clean peak P of the signature (any time):
-    within k   = P in (cap, k x cap]  -> lower bound of kills saved
+    within k   = P in (cap, k x cap]  -> proxy: counted as saved
     beyond k   = P > k x cap          -> a mode of this command does not fit k x cap
-    undetermined = no clean P > cap   -> need censored; upper bound counts these as saved
+    undetermined = no clean P > cap   -> need censored; the high end of the proxy range counts these as saved
     population                      rows | k=1.5 within/beyond/undet | k=2.0 within/beyond/undet | k=3.0 within/beyond/undet
     all auto                        2355 |  28.8%  35.6%  35.6% |  45.1%  19.3%  35.6% |  56.6%   7.8%  35.6%
     history rungs (own/max/oom-esc)   760 |  38.0%  37.6%  24.3% |  53.7%  22.0%  24.3% |  65.8%   9.9%  24.3%

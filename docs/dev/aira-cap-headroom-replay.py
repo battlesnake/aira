@@ -200,9 +200,9 @@ def part2(rows, clean):
         by[rung[r[0]]].append(r)
     hist_rungs = by.get("own-max", []) + by.get("estimate:max", []) + by.get("oom-escalated", [])
     print("  three-way split of auto OOM rows by the largest clean peak P of the signature (any time):")
-    print("    within k   = P in (cap, k x cap]  -> lower bound of kills saved")
+    print("    within k   = P in (cap, k x cap]  -> proxy: counted as saved")
     print("    beyond k   = P > k x cap          -> a mode of this command does not fit k x cap")
-    print("    undetermined = no clean P > cap   -> need censored; upper bound counts these as saved")
+    print("    undetermined = no clean P > cap   -> need censored; the high end of the proxy range counts these as saved")
     print("    %-30s %5s | %s" % ("population", "rows", " | ".join("k=%.1f within/beyond/undet" % k for k in (1.5, 2.0, 3.0))))
 
     def split(name, sel):
