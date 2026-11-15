@@ -425,7 +425,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	}
 	s.pinChargeMode, s.pinChargePercent = pinMode, pinPercent
 	if pinMode != pinChargeOff {
-		log.Printf("aira daemon: pinned-job charge discount %s (factor %s)", pinMode, formatPinChargeFactor(pinPercent))
+		log.Printf("aira daemon: pinned-job charge discount %s (factor %s)", pinMode, runner.FormatPinChargeFactor(pinPercent))
 	}
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In

@@ -140,11 +140,12 @@ func admitGrantCharge(waiter *admitWaiter) int64 {
 // largestDiscountedPin is the largest pin whose discounted booking fits
 // `available` ledger bytes at this factor: the inverse of discountedPinCharge.
 // For a pin above the floor, ceil(pin x percent / 100) <= available exactly when
-// pin <= floor(available x 100 / percent). Room at or below the floor (a pin
-// there books itself), a deficit, a factor of 1 or an out-of-range input states
-// the room unchanged.
+// pin <= floor(available x 100 / percent). Room below the floor (every pin that
+// fits it books itself), a deficit, a factor of 1 or an out-of-range input
+// states the room unchanged; room of exactly the floor fits a pin of
+// floor / factor, which books the floor.
 func largestDiscountedPin(available, percent int64) int64 {
-	if available <= pinChargeFloor || percent <= 0 || percent >= 100 || available > admitMaxReserve {
+	if available < pinChargeFloor || percent <= 0 || percent >= 100 || available > admitMaxReserve {
 		return available
 	}
 	pin := available * 100 / percent
@@ -184,14 +185,9 @@ func (s *Server) logPinChargeGrantLocked(waiter *admitWaiter, physicalFree int64
 	case pinChargeObserve:
 		log.Printf("aira daemon: pin-charge observe: scope=%s pin=%d charged=%d would-charge=%d factor=%s physical-free=%d physical-fit=%t",
 			waiter.scopeID, waiter.reserve, waiter.ledgerCharge(), discountedPinCharge(waiter.reserve, s.pinChargePercent),
-			formatPinChargeFactor(s.pinChargePercent), physicalFree, waiter.reserve <= physicalFree)
+			runner.FormatPinChargeFactor(s.pinChargePercent), physicalFree, waiter.reserve <= physicalFree)
 	case pinChargeEnforce:
 		log.Printf("aira daemon: pin-charge enforce: scope=%s pin=%d charged=%d factor=%s physical-free=%d physical-fit=%t",
-			waiter.scopeID, waiter.reserve, waiter.ledgerCharge(), formatPinChargeFactor(s.pinChargePercent), physicalFree, waiter.reserve <= physicalFree)
+			waiter.scopeID, waiter.reserve, waiter.ledgerCharge(), runner.FormatPinChargeFactor(s.pinChargePercent), physicalFree, waiter.reserve <= physicalFree)
 	}
-}
-
-// formatPinChargeFactor is runner.FormatPinChargeFactor, named for the log lines.
-func formatPinChargeFactor(percent int64) string {
-	return runner.FormatPinChargeFactor(percent)
 }

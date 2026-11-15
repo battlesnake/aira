@@ -135,6 +135,7 @@ MUTATIONS = [
     ("fit-grantable-ignores-the-discount", [(ADMIT, GRANTABLE, "			grantable = available")], T_FIT),
     ("fit-grantable-adds-the-own-discount", [(ADMIT, GRANTABLE, "			grantable = available + (waiter.reserve - waiter.ledgerCharge())")], T_FIT),
     ("fit-inverse-rounds-up", [(PIN, INVERSE, "	pin := (available*100 + percent - 1) / percent")], T_INVERSE),
+    ("fit-inverse-floor-boundary", [(PIN, "	if available < pinChargeFloor ||", "	if available <= pinChargeFloor ||")], T_INVERSE),
     # The factor and its clamp.
     ("factor-floor-not-ceil", [(PIN, CEIL, "	charge := (pin * percent) / 100")], T_FACTOR),
     ("factor-no-floor-clamp", [(PIN, CLAMP, "")], T_FACTOR),

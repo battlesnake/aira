@@ -798,11 +798,12 @@ func TestPinChargeConfineListShowsBookingAndPin(t *testing.T) {
 
 // verifies: AIRA-324 (Sol build r1 #3) — largestDiscountedPin is the exact
 // inverse of discountedPinCharge: for each room, the returned pin books within
-// the room and one byte more does not; a deficit, room at the floor and factor 1
+// the room and one byte more does not (room of exactly the 1 MiB floor included,
+// Sol build r2); a deficit, room below the floor and factor 1
 // state the room unchanged.
 func TestLargestDiscountedPinInvertsTheCharge(t *testing.T) {
 	const gi = int64(1) << 30
-	for _, room := range []int64{2<<20 + 1, 7*gi + 3, 6 * gi, 40*gi + 12345} {
+	for _, room := range []int64{1 << 20, 2<<20 + 1, 7*gi + 3, 6 * gi, 40*gi + 12345} {
 		for _, percent := range []int64{50, 67, 80, 99} {
 			pin := largestDiscountedPin(room, percent)
 			if discountedPinCharge(pin, percent) > room || discountedPinCharge(pin+1, percent) <= room {
@@ -811,7 +812,7 @@ func TestLargestDiscountedPinInvertsTheCharge(t *testing.T) {
 			}
 		}
 	}
-	for _, tc := range []struct{ room, percent int64 }{{-3 * gi, 80}, {0, 80}, {1 << 20, 80}, {5 * gi, 100}} {
+	for _, tc := range []struct{ room, percent int64 }{{-3 * gi, 80}, {0, 80}, {1<<20 - 1, 80}, {5 * gi, 100}} {
 		if got := largestDiscountedPin(tc.room, tc.percent); got != tc.room {
 			t.Fatalf("largestDiscountedPin(%d, %d) = %d, want the room unchanged", tc.room, tc.percent, got)
 		}

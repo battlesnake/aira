@@ -1139,7 +1139,9 @@ choice, each checked in the build review:
 6. **Faces.** The trailer adds ` booked=<X>` only for a discounted job (reserve= stays the pin);
    `--summary-file` adds `booked_bytes` and `cap_bytes` (or `unevaluated`) only then; `confine
    --list` adds `pin_bytes` only for a lease booked below its reserve (reserve_bytes stays the
-   booking); `aira top` renders `<booking> (pin <pin>)` in that case. A queued row's request
+   booking); `confine-dump`'s waiter row adds `pin_bytes` the same way; `aira top` renders
+   `<booking> (pin <pin>)` in that case. A grant frame carries `charge` only for a discountable
+   waiter (a resized lease's client never asked for one). A queued row's request
    stays the pin (deferred: showing a queued waiter's booking).
 7. **The guard.** `TestPinChargeReserveReadsAreAllowListed` scans the daemon's production files
    for every `.reserve` and `.charge` selector, keyed by enclosing function, with exact counts.
