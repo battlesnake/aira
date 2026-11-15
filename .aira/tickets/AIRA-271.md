@@ -15,7 +15,8 @@ No daemon, wire or protocol change; a client-only change.
   confirmation; `K` on another row arms that one instead. Any other key
   (arrows, Esc, Enter included) disarms and then does what it does. The arm
   times out after five top refreshes (about 5 s) and drops at once when its job
-  leaves the listing. `K` is not a key inside a dialog, the palette, the
+  leaves the listing or a refresh fails (an error, or a reply without a
+  listing). `K` is not a key inside a dialog, the palette, the
   execute launcher or while a request is in flight.
 - The confirmation is AIRA-342's dialog (title `Confirm DESTRUCTIVE mutation`,
   Cancel focused first, `y` does nothing): it names the job (name, owner,
@@ -36,7 +37,9 @@ No daemon, wire or protocol change; a client-only change.
   on any non-K rune, the time-out in the top fetch result, `tableRow.KillText`.
 - `cmd/aira/tui_top.go`: `topKillText`, `topPrintable` (split out of
   `topUntrustedCell`).
-- `cmd/aira/tui.go`: the disarm on non-rune keys, the legend (`KK kill job`)
+- `cmd/aira/tui.go`: the disarm on non-rune keys, the legend (`KK kill`,
+  first and terse: Sol round 2 found the long legend clipped KK off an
+  80-column row; the whole `aira top` legend now fits 80 and KK leads at 60)
   and the armed status line (it replaces the whole tab row, job first, so the
   full dashboard's long tab row cannot push it off screen), the destructive
   title for `confine-kill`, and bracketed paste on (Sol round 1: a pasted
@@ -52,7 +55,10 @@ No daemon, wire or protocol change; a client-only change.
 - `internal/core/skill.go`: the `--kill` sentence names `K` pressed twice.
 
 Not built: `--steal` from the TUI; a typed-name confirmation; a timer for the
-time-out (it rides the top refresh tick).
+time-out (it rides the top refresh tick, and a failed refresh drops the arm,
+so it never waits out a failure); an `aira help top` entry (`top`, like `board` and `tui`,
+is on the help table's no-entry list by the v0.31 small-fixes spec; the key
+legend and the generated skill are the surfaces that name KK).
 
 Accepted gap (Sol round 2, P2, overridden with this reason): on a terminal
 without bracketed paste (e.g. a `vt100` terminfo), a pasted `KK<Tab><Enter>`

@@ -617,8 +617,10 @@ func (r *tuiRuntime) render() {
 	}
 	if r.state.Active == viewTop {
 		// AIRA-276 / AIRA-309 / AIRA-312 / AIRA-271. Advertised only on the tab
-		// they work on.
-		keys = "    c command/dir  f push queued job to front  e lower running job's reserve  KK kill job" + keys
+		// they work on, kill first and terse, so the whole `aira top` legend fits
+		// 80 columns and KK is still on screen at 60 (each key's confirmation
+		// says in full what it does).
+		keys = "    KK kill  f to front  e lower reserve  c cmd/dir" + keys
 	}
 	line := strings.Join(tabNames, "  ") + keys
 	if arm := r.state.TopKill; r.state.Active == viewTop && arm.ScopeID != "" {

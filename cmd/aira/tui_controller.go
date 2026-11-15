@@ -789,6 +789,12 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 			}
 		}
 	}
+	if result.View == viewTop && panel.Status == panelError {
+		// AIRA-271. A refresh that failed, or landed without a listing, drops an
+		// armed kill at once: the job it named can no longer be re-read, so the
+		// arm must not wait out the failure and age only on good listings.
+		state.TopKill = topKillArm{}
+	}
 	dirty := panel.Dirty
 	panel.Dirty = false
 	state.Panels[result.View] = panel

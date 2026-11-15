@@ -246,6 +246,45 @@ func TestTopKillArmExpires(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-271 review round 2 (Sol P2) — a refresh that fails, or lands
+// without a listing, drops the arm at once: the listing that named the job can
+// no longer be re-read, so the arm cannot age on it. After K, any number of
+// failed refreshes and then a good one, a K arms afresh and opens nothing.
+func TestTopKillArmDropsOnAFailedRefresh(t *testing.T) {
+	listing := topQueuedListing(topQueuedTestRecord(killTestZulu, "zulu", 4*gib))
+	land := func(state tuiState, result fetchResult) tuiState {
+		state, _ = requestPanelRefresh(state, viewTop)
+		result.View, result.Generation = viewTop, state.Panels[viewTop].InFlightGeneration
+		state, _ = onTUIFetchResult(state, result)
+		return state
+	}
+	for _, failed := range []struct {
+		name   string
+		result fetchResult
+	}{
+		{"a daemon error", fetchResult{Code: daemon.CodeUnavailable}},
+		{"a reply without a listing", fetchResult{}},
+	} {
+		state, _ := topKillPress(t, topKillState(t, "session-a"), 1, "K")
+		if state.TopKill.ScopeID != killTestAlpha {
+			t.Fatalf("%s: K did not arm alpha: %+v", failed.name, state.TopKill)
+		}
+		state = land(state, failed.result)
+		if state.TopKill.ScopeID != "" {
+			t.Fatalf("%s: the arm survived the failed refresh: %+v", failed.name, state.TopKill)
+		}
+		for range topKillArmTicks {
+			state = land(state, failed.result)
+		}
+		state = land(state, fetchResult{Top: &listing})
+		state, commands := topKillPress(t, state, 1, "K")
+		assertNoKillOpened(t, state, commands, failed.name+", then a good refresh, then K")
+		if state.TopKill.ScopeID != killTestAlpha || state.TopKill.Ticks != 0 {
+			t.Fatalf("%s: K after the failures did not arm afresh: %+v", failed.name, state.TopKill)
+		}
+	}
+}
+
 // verifies: AIRA-271 — the reply is said from its own fields: a kill and a
 // queued cancel by status and phase, an unconfirmed kill as an unknown outcome
 // (never refused, never done), a refusal with its code, a missing field never
@@ -368,6 +407,27 @@ func frontPage(t *testing.T, runtime *tuiRuntime) string {
 	return onUI(t, runtime, func() string { name, _ := runtime.outerPages.GetFrontPage(); return name })
 }
 
+// verifies: AIRA-271 review round 2 (Sol P2) — the `aira top` key legend is one
+// row, so KK must be on screen at ordinary widths, not clipped off the end: at
+// 80 columns the whole legend fits, and at 60 KK still leads the top keys.
+func TestTopKillLegendFitsOrdinaryWidths(t *testing.T) {
+	for _, width := range []struct {
+		columns int
+		want    []string
+	}{
+		{80, []string{"KK kill", "f to front", "e lower reserve", "c cmd/dir", "r refresh", "q quit"}},
+		{60, []string{"KK kill"}},
+	} {
+		runtime, screen, _ := startTopDialogRuntime(t, &topDialogDispatcher{}, width.columns, 24)
+		text := simulationTextOnUI(t, runtime, screen)
+		for _, want := range width.want {
+			if !strings.Contains(text, want) {
+				t.Fatalf("at %d columns the legend does not show %q:\n%s", width.columns, want, text)
+			}
+		}
+	}
+}
+
 // verifies: AIRA-271 — on a real `aira top` runtime: the legend offers KK, one
 // K says what is armed on the status line and opens nothing, an arrow key in
 // between disarms, the confirmation starts on Cancel, and Enter on Cancel, Esc,
@@ -376,7 +436,7 @@ func TestTopKillRuntimeSendsNothingUnlessConfirmed(t *testing.T) {
 	data, _ := json.Marshal(runner.ConfineKillResult{Status: "killed", Phase: "running", ScopeID: dialogTestJob, Name: "alpha", Owner: "session-a"})
 	dispatcher := &topDialogDispatcher{reply: core.Response{OK: true, Code: "OK", RawData: data}}
 	runtime, screen, keys := startTopKillRuntime(t, dispatcher, 100, 30, 1)
-	if text := simulationTextOnUI(t, runtime, screen); !strings.Contains(text, "KK kill job") {
+	if text := simulationTextOnUI(t, runtime, screen); !strings.Contains(text, "KK kill") {
 		t.Fatalf("the legend does not offer KK:\n%s", text)
 	}
 	keys.press(t, runeKey('K'))
@@ -505,7 +565,7 @@ func TestTopKillArmedStatusLeadsTheDashboardLine(t *testing.T) {
 	}
 	runtime.state.TopKill = topKillArm{}
 	runtime.render()
-	if line := runtime.tabs.GetText(true); !strings.Contains(line, "KK kill job") || strings.Contains(line, "ARMED") {
+	if line := runtime.tabs.GetText(true); !strings.Contains(line, "KK kill") || strings.Contains(line, "ARMED") {
 		t.Fatalf("the unarmed dashboard line: %q", line)
 	}
 }
