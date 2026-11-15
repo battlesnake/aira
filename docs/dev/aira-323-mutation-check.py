@@ -29,7 +29,7 @@ LAUNCH = "internal/runner/confine_linux.go"
 IDENT = "internal/runner/repo_identity.go"
 
 T_STORE = ("./internal/store/", "Telemetry|RecordConfinePeakStoresTheTelemetryAsGiven")
-T_T1 = ("./internal/daemon/", "TestConfineReportCompletionFactsEndToEnd|TestConfineReportCompletionZeroWallEndToEnd")
+T_T1 = ("./internal/daemon/", "TestConfineReportCompletionFactsEndToEnd|TestConfineReportCompletionZeroWallEndToEnd|TestConfineReportCompletionPartialFactsEndToEnd")
 T_T2 = ("./internal/daemon/", "TestConfineReportCompletionAbsentIsNullForEveryKind")
 T_T3 = ("./internal/daemon/", "TestConfineReportCompletionValidation")
 T_T9 = ("./internal/daemon/", "TestConfineReportVersionSkewResend")
@@ -88,6 +88,9 @@ MUTATIONS = [
     ("T1: sender drops wall_ms", [(SENDER, "		args[\"wall_ms\"] = *report.WallMS\n", "")], T_T1),
     ("T1: sender copies the > 0 idiom for wall_ms", [(SENDER, "if report.WallMS != nil {", "if report.WallMS != nil && *report.WallMS > 0 {")], T_T1),
     ("T1: sender copies the > 0 idiom for wait_ms", [(SENDER, "if report.WaitMS != nil {", "if report.WaitMS != nil && *report.WaitMS > 0 {")], T_T1),
+    ("T1 (Y1): sender fabricates wait_ms=0 when absent", [(SENDER, "		args[\"wait_ms\"] = *report.WaitMS\n	}", "		args[\"wait_ms\"] = *report.WaitMS\n	} else if report.WallMS != nil {\n		args[\"wait_ms\"] = int64(0)\n	}")], T_T1),
+    ("T1 (Y2): sender fabricates repo=none when unevaluated", [(SENDER, "		args[\"repo\"] = report.Repo\n	}", "		args[\"repo\"] = report.Repo\n	} else if report.WallMS != nil {\n		args[\"repo\"] = \"none\"\n	}")], T_T1),
+    ("T1 (Y3): sender fabricates started_at_ms=now when absent", [(SENDER, "		args[\"started_at_ms\"] = *report.StartedAtMS\n	}", "		args[\"started_at_ms\"] = *report.StartedAtMS\n	} else if report.WallMS != nil {\n		args[\"started_at_ms\"] = time.Now().UnixMilli()\n	}")], T_T1),
     ("T9: no re-send", [(SENDER, RESEND, "")], T_T9),
     ("T9: re-send matched on the allowlist text only", [(SENDER, "if refused && response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) {", "if refused && response.Code == \"E_DAEMON_PROTOCOL\" && carriesCompletionFacts(args) && strings.Contains(response.Error, \"unexpected confine-report field\") {")], T_T9),
     ("T9: re-send keeps the new fields", [(SENDER, "confinePeakReportArgs(report, false))\n	}", "confinePeakReportArgs(report, true))\n	}")], T_T9),
@@ -124,12 +127,13 @@ MUTATIONS = [
     ("T4b: wallNow in whole seconds", [(LAUNCH, "return time.Now().Round(0) }", "return time.Now().Round(0).Truncate(time.Second) }")], T_T4B),
     ("T4b: wallNow keeps the monotonic reading", [(LAUNCH, "return time.Now().Round(0) }", "return time.Now() }")], T_T4B),
     # --- RepoIdentity (T5)
-    ("T5: worktree's own gitdir hashed, not its commondir", [(IDENT, "		common = named\n", "		_ = named\n")], T_T5),
+    ("T5: worktree's own gitdir hashed, not its commondir", [(IDENT, "		common = joinPhysical(gitDir, named)\n", "		_ = named\n")], T_T5),
     ("T5: step 0 (symlink resolution) skipped", [(IDENT, "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return \"\", false\n	}\n	resolved, err = filepath.Abs(resolved)", "	resolved, err := filepath.Abs(cwd)")], T_T5),
     ("T5: git metadata opened blocking (a FIFO hangs the launch)", [(IDENT, "os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)", "os.OpenFile(path, os.O_RDONLY, 0)")], T_T5),
     ("T5: git metadata read without a size bound", [(IDENT, "	if err != nil || len(data) > repoIdentityGitFileMax {\n		return nil, false, false\n	}\n	return data, false, true", "	if err != nil {\n		return nil, false, false\n	}\n	return data, false, true"), (IDENT, "io.ReadAll(io.LimitReader(file, repoIdentityGitFileMax+1))", "io.ReadAll(file)")], T_T5),
     ("T5: git directory not resolved before commondir is joined", [(IDENT, "	gitDir, err := filepath.EvalSymlinks(gitDir)\n	if err != nil {\n		return \"\", false\n	}\n", "	var err error\n")], T_T5),
-    ("T5: .git pointer joined lexically (filepath.Join)", [(IDENT, "target = dir + string(filepath.Separator) + target", "target = filepath.Join(dir, target)")], T_T5),
+    ("T5: .git pointer joined lexically (cleaned before resolution)", [(IDENT, "	return joinPhysical(dir, target), true", "	return filepath.Clean(joinPhysical(dir, target)), true")], T_T5),
+    ("T5: commondir joined lexically (cleaned before resolution)", [(IDENT, "		common = joinPhysical(gitDir, named)", "		common = filepath.Clean(joinPhysical(gitDir, named))")], T_T5),
     ("T5: a .git stat error (ELOOP) walks to the parent", [(IDENT, "		default:\n			return \"\", false\n		}\n		parent := filepath.Dir(dir)", "		default:\n		}\n		parent := filepath.Dir(dir)")], T_T5),
     ("T5: a .git that is neither directory nor file walks to the parent", [(IDENT, "		case err == nil:\n			return \"\", false\n", "		case err == nil:\n")], T_T5),
     ("T5: none returned on an error", [(IDENT, "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return \"\", false\n	}", "	resolved, err := filepath.EvalSymlinks(cwd)\n	if err != nil {\n		return RepoIdentityNone, true\n	}")], T_T5),

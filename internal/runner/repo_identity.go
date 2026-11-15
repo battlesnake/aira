@@ -114,14 +114,20 @@ func readGitFilePointer(path, dir string) (string, bool) {
 	if target == "" {
 		return "", false
 	}
-	if !filepath.IsAbs(target) {
-		// Concatenated, not filepath.Join: Join cleans lexically, collapsing a
-		// `..` that follows a symlinked component before the symlink is resolved,
-		// where git (realpath) climbs from the symlink's target. The caller's
-		// EvalSymlinks resolves the components in order.
-		target = dir + string(filepath.Separator) + target
+	return joinPhysical(dir, target), true
+}
+
+// joinPhysical resolves a git pointer's path (a `.git` file's gitdir or a
+// commondir) against the directory it is relative to, WITHOUT cleaning it.
+// filepath.Join cleans lexically, collapsing a `..` that follows a symlinked
+// component before the symlink is resolved, where git (realpath) climbs from
+// the symlink's target. The caller's EvalSymlinks then resolves the components
+// in order. An absolute path is returned as given.
+func joinPhysical(dir, path string) string {
+	if filepath.IsAbs(path) {
+		return path
 	}
-	return target, true
+	return dir + string(filepath.Separator) + path
 }
 
 // repoIdentityFromGitDir resolves gitDir's common directory (gitDir itself unless
@@ -129,8 +135,8 @@ func readGitFilePointer(path, dir string) (string, bool) {
 func repoIdentityFromGitDir(gitDir string) (string, bool) {
 	// Resolve gitDir first, as git does: a relative commondir (a linked
 	// worktree's `../..`) climbs from the real git directory, not from the
-	// parent of a symlink that names it, and a pointer's unresolved `..` (see
-	// readGitFilePointer) must not be cleaned lexically by the Join below.
+	// parent of a symlink that names it. The commondir is joined physically
+	// too (joinPhysical), for the same reason as the `.git` pointer.
 	gitDir, err := filepath.EvalSymlinks(gitDir)
 	if err != nil {
 		return "", false
@@ -143,10 +149,7 @@ func repoIdentityFromGitDir(gitDir string) (string, bool) {
 		if named == "" {
 			return "", false
 		}
-		if !filepath.IsAbs(named) {
-			named = filepath.Join(gitDir, named)
-		}
-		common = named
+		common = joinPhysical(gitDir, named)
 	case missing:
 	default:
 		return "", false

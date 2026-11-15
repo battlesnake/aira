@@ -109,15 +109,41 @@ func TestRepoIdentityOnRealRepositories(t *testing.T) {
 		if err := os.Symlink(filepath.Join(base, "deep", "a"), filepath.Join(base, "hop")); err != nil {
 			t.Fatal(err)
 		}
-		for _, tc := range []struct{ name, pointer string }{
-			{"a .git naming a symlink to the worktree's git directory", "gitdir: " + alias + "\n"},
-			{"a relative .git pointer through a symlinked component", "gitdir: ../hop/../../main/.git/worktrees/wt-pointers\n"},
+		// The commondir form: gitDir/hop -> base/deep/a, so gitDir/hop/../.. is
+		// base physically, but gitDir/.. (main/.git/worktrees) lexically.
+		commondir := filepath.Join(gitDir, "commondir")
+		originalCommondir, err := os.ReadFile(commondir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(base, "deep", "a"), filepath.Join(gitDir, "hop")); err != nil {
+			t.Fatal(err)
+		}
+		// The lexical collapse of the commondir below: absent, it makes a lexical
+		// join unevaluated; present, it makes a lexical join hash the wrong
+		// directory as an established identity.
+		lexicalCommon := filepath.Join(gitDir, "..", "main", ".git")
+		for _, tc := range []struct {
+			name, file, content string
+			original            []byte
+			lexicalDecoy        bool
+		}{
+			{"a .git naming a symlink to the worktree's git directory", gitFile, "gitdir: " + alias + "\n", original, false},
+			{"a relative .git pointer through a symlinked component", gitFile, "gitdir: ../hop/../../main/.git/worktrees/wt-pointers\n", original, false},
+			{"a relative commondir through a symlinked component", commondir, "hop/../../main/.git\n", originalCommondir, false},
+			{"a relative commondir through a symlinked component whose lexical collapse exists", commondir, "hop/../../main/.git\n", originalCommondir, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				if err := os.WriteFile(gitFile, []byte(tc.pointer), 0o644); err != nil {
+				if err := os.WriteFile(tc.file, []byte(tc.content), 0o644); err != nil {
 					t.Fatal(err)
 				}
-				t.Cleanup(func() { _ = os.WriteFile(gitFile, original, 0o644) })
+				t.Cleanup(func() { _ = os.WriteFile(tc.file, tc.original, 0o644) })
+				if tc.lexicalDecoy {
+					if err := os.MkdirAll(lexicalCommon, 0o755); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.RemoveAll(filepath.Dir(lexicalCommon)) })
+				}
 				command := exec.Command("git", "-C", worktree, "rev-parse", "--git-common-dir")
 				for _, entry := range os.Environ() {
 					if !strings.HasPrefix(entry, "GIT_") {

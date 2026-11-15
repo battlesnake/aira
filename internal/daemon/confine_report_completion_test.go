@@ -155,6 +155,39 @@ func TestConfineReportCompletionZeroWallEndToEnd(t *testing.T) {
 	if len(rows) != 1 || !rows[0].wallMS.Valid || rows[0].wallMS.Int64 != 0 {
 		t.Fatalf("rows=%+v, want wall_ms stored as a real 0", rows)
 	}
+	if rows[0].waitMS.Valid {
+		t.Fatalf("an absent wait_ms was stored as %d, want NULL", rows[0].waitMS.Int64)
+	}
+	if got := reports.Load(); got != 1 {
+		t.Fatalf("requests=%d, want exactly 1", got)
+	}
+}
+
+// TestConfineReportCompletionPartialFactsEndToEnd: the real sender against the
+// real daemon with only wall_ms established (a lease-less admission, an
+// unevaluated repo, an unread start). Each unestablished fact must be absent on
+// the wire and NULL in the store, never a fabricated 0, "none" or now, and the
+// new daemon must accept the partial frame first time (no re-send).
+//
+// verifies: AIRA-323
+func TestConfineReportCompletionPartialFactsEndToEnd(t *testing.T) {
+	paths, reports := completionServer(t)
+	report := runner.ConfinePeakReport{Signature: "aira-323\x00partial", OOM: false, WallMS: ptr64(250)}
+	if err := runner.ReportPeakSample(reportCtx(t), paths.SocketPath, report); err != nil {
+		t.Fatal(err)
+	}
+	rows := readCompletionRows(t, paths.DBPath, report.Signature)
+	if len(rows) != 1 {
+		t.Fatalf("rows=%+v", rows)
+	}
+	row := rows[0]
+	if !row.wallMS.Valid || row.wallMS.Int64 != 250 {
+		t.Fatalf("wall_ms=%+v, want 250", row.wallMS)
+	}
+	if row.waitMS.Valid || row.startedAtMS.Valid || row.repo.Valid {
+		t.Fatalf("unestablished facts were stored: wait_ms=%+v started_at_ms=%+v repo=%+v, want all NULL",
+			row.waitMS, row.startedAtMS, row.repo)
+	}
 	if got := reports.Load(); got != 1 {
 		t.Fatalf("requests=%d, want exactly 1", got)
 	}
