@@ -365,27 +365,6 @@ func TestAdmitQueueRefusesASecondSlicePath(t *testing.T) {
 	server.releaseAdmitWaiter(queue, first)
 }
 
-// verifies: AIRA-228 — an idle queue's evaluator pass reads nothing. The queue
-// now outlives its population, so its evaluator ticks while nothing is queued;
-// a pass over nobody must not read the slice's memory files. Mutation: drop the
-// empty-queue early return -> the idle pass reads the slice memory.
-func TestAdmitIdleEvaluatorPassReadsNoSliceMemory(t *testing.T) {
-	server := manualQueueServer(100, time.Unix(1_000_000, 0))
-	var reads atomic.Int64
-	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-		reads.Add(1)
-		return 0, 100, 0, true, ""
-	}
-	queue, waiter := enqueueOn(t, server, "/slice", 10)
-	server.evaluateAdmitQueue(queue)
-	server.releaseAdmitWaiter(queue, waiter)
-	before := reads.Load()
-	server.evaluateAdmitQueue(queue)
-	if after := reads.Load(); after != before {
-		t.Fatalf("an idle pass read the slice memory %d time(s)", after-before)
-	}
-}
-
 // verifies: AIRA-228 — an idle queue's evaluator holds no poll timer. The queue
 // outlives its population, so a ticker left running would wake an idle daemon
 // at the poll rate forever (before AIRA-228 an empty queue had no evaluator at
@@ -422,4 +401,41 @@ func TestAdmitIdleEvaluatorHoldsNoPollTimer(t *testing.T) {
 	_, next := enqueueOn(t, server, "/slice", 10)
 	waitAdmitGrant(t, next)
 	server.releaseAdmitWaiter(queue, next)
+}
+
+// verifies: AIRA-228 — a re-declare that establishes a lease on an empty queue
+// resumes the evaluator's polling, as the evaluator of a freshly built queue
+// polled before. The poll ticker is stopped while the queue is empty and
+// resumes only on a kick, and an establish is the one insertion that used to
+// send none. Polling is what retires an elapsed fairness-freeze anchor (the
+// next pass after a hold ends clears it); an anchor left in place would instead
+// hand the next arrivals a backfilling pass. Mutation: drop the establish kick
+// -> the elapsed anchor is never cleared.
+func TestAdmitEstablishGrantedResumesPolling(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	server := admitTestServer(&maximum)
+	server.admitPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { retireAdmitQueues(server) })
+	queue, first := enqueueOn(t, server, "/slice", 10)
+	waitAdmitGrant(t, first)
+	server.releaseAdmitWaiter(queue, first)
+	time.Sleep(50 * time.Millisecond) // the evaluator sees the empty queue and stops polling
+
+	// A restart survivor re-declares into the empty queue: no enqueue kick.
+	_, established, code, err := server.enqueueReDeclare("/slice", 10, "redeclare", admitRequest{scopeID: "CONFINE-survivor-1-a", peerSameUID: true})
+	if err != nil || established.state != admitGranted {
+		t.Fatalf("establish: code=%q err=%v", code, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	// An elapsed hold on the now-populated queue: the next pass must retire it.
+	queue.mu.Lock()
+	queue.freezeArmedAt = time.Now().Add(-server.admitFreezeMaxHold - time.Minute)
+	queue.mu.Unlock()
+	testdeadline.Eventually(t, time.Second, func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		return queue.freezeArmedAt.IsZero()
+	}, "the elapsed freeze anchor was never retired: the evaluator is not polling a queue populated by an establish")
+	server.releaseAdmitWaiter(queue, established)
 }

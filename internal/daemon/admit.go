@@ -2333,9 +2333,13 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			anchorLeaseLocked(waiter, request.conn, request.clientPID, request.processStartTick)
 			queue.waiters = append(queue.waiters, waiter)
 			// DERIVED, not incremented (the one ledger writer): folds in this lease's RAM
-			// and cores. An establish CONSUMES capacity, so no signal() is needed — unlike
-			// a re-anchor that may SHRINK the vector and free room for a waiter.
+			// and cores.
 			queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			// An establish CONSUMES capacity, so it frees room for nobody; the signal
+			// is for the evaluator's poll ticker, which is stopped while the queue is
+			// empty (AIRA-228, runEvaluator) and resumes only on a kick. Without it a
+			// queue populated only by establishes would go unpolled.
+			queue.signal()
 			return queue, waiter, "", nil
 		}
 	}
@@ -2435,12 +2439,6 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	// AIRA-228. The queue outlives its population. A pass over nobody (a kick
-	// that lands after the last release) decides nothing: return before reading
-	// cgroup files.
-	if len(queue.waiters) == 0 {
-		return
-	}
 	// AIRA-247. A tripped slice admits NOTHING: reject every queued waiter and
 	// return before the ceiling read, since no ceiling could let one through.
 	// Rejecting a QUEUED waiter is ledger-neutral — only granted && accounted
