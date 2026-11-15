@@ -221,6 +221,12 @@ func (s *Server) buildConfineDumpQueuesAndWaiters() ([]runner.ConfineDumpQueueRo
 			ReserveBytes: waiter.ledgerCharge(), CPUCores: waiter.cpu, // AIRA-324: the booking
 			State: waiterStateName(waiter), Outcome: waiterOutcomeName(waiter),
 		}
+		if waiter.discounted() {
+			// AIRA-324: the pin (the scope cap and the physical-fit subject)
+			// beside the booking, only when they differ; absent otherwise.
+			pin := waiter.reserve
+			waiterRow.PinBytes = &pin
+		}
 		if waiter.state == admitQueued {
 			waiterRow.WaitMS = elapsedMilliseconds(waiter.enqueued, now)
 		} else {

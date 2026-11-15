@@ -2032,11 +2032,9 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Cpu: waiter.cpu, Basis: waiter.basis}
-	// AIRA-324. The booking is echoed only when it is below the pin, so an
-	// undiscounted grant's frame is byte-identical to before.
-	if waiter.discounted() {
-		grant.Charge = waiter.ledgerCharge()
-	}
+	// AIRA-324. The booking is echoed only for a DISCOUNTED grant (see
+	// admitGrantCharge), so every other grant's frame carries no charge.
+	grant.Charge = admitGrantCharge(waiter)
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -2749,11 +2747,12 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			waiter.joinContentionLocked(soloReadingLocked(queue, queuedAhead))
 		}
 		// AIRA-324. A discounted waiter's diagnosis is stated in PIN bytes, the
-		// unit the rejection's Required carries: the most it could be granted is
-		// the smaller of the ledger room plus its discount and the physical room.
+		// unit the rejection's Required carries: the largest pin whose discounted
+		// booking fits the ledger room, capped by the physical room its full pin
+		// must also fit.
 		grantable := available
 		if waiter.discounted() && !s.shimMode() {
-			grantable = available + (waiter.reserve - waiter.ledgerCharge())
+			grantable = largestDiscountedPin(available, s.pinChargePercent)
 			if physicalFree < grantable {
 				grantable = physicalFree
 			}

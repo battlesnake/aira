@@ -38,11 +38,12 @@ var pinChargeReserveAllowList = map[string]struct {
 	// Pin sites: the grant echo, head feasibility, the physical-fit rule.
 	"admitConnection waiter.reserve":          {1, "the grant echoes the pin; the client writes it as memory.max"},
 	"admitCouldFitEmptyLocked waiter.reserve": {1, "head eligibility: the full pin must fit an empty slice"},
-	"evaluateAdmitQueue waiter.reserve":       {2, "the physical-fit rule and the pin-unit grantable diagnosis"},
+	"evaluateAdmitQueue waiter.reserve":       {1, "the physical-fit rule"},
 	// Display and diagnosis of the pin, never summed into the ledger.
-	"admitSliceSnapshotFor waiter.reserve":    {3, "queuedReserveBytes and the queued row's request (the pin), and the pin beside a booking below it"},
-	"logAdmitFreezeTransition holder.reserve": {1, "the head's request in a log line"},
-	"logPinChargeGrantLocked waiter.reserve":  {5, "the observe/enforce log line"},
+	"admitSliceSnapshotFor waiter.reserve":            {3, "queuedReserveBytes and the queued row's request (the pin), and the pin beside a booking below it"},
+	"logAdmitFreezeTransition holder.reserve":         {1, "the head's request in a log line"},
+	"buildConfineDumpQueuesAndWaiters waiter.reserve": {1, "ci_dump's pin beside a booking below it"},
+	"logPinChargeGrantLocked waiter.reserve":          {5, "the observe/enforce log line"},
 	// admitRequest.reserve: the client's request, before any waiter exists.
 	"resolveAdmitReserve request.reserve": {8, "resolving the request's reserve (AIRA-153 fit, AIRA-314 floor)"},
 	// admitReservationRow.reserve: a copied-out value, filled from ledgerCharge().

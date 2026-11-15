@@ -292,9 +292,11 @@ func TestPinChargePhysicalFitAndLedgerCharge(t *testing.T) {
 	})
 	t.Run("ledger-bound refusal: grantable is stated in pin bytes", func(t *testing.T) {
 		// Ledger room 6 GiB (58 GiB booked), physical room 24 GiB: the 8 GiB
-		// booking does not fit, and the most this job's PIN could be is the
-		// ledger room plus its 2 GiB discount = 8 GiB. Mutation: grantable left
-		// as the raw ledger room (6 GiB, a booking figure beside a pin Required).
+		// booking does not fit, and the largest PIN whose booking fits 6 GiB is
+		// 6 / 0.8 = 7.5 GiB (verified below: that pin books exactly 6 GiB and one
+		// byte more does not fit). Mutations: grantable left as the raw ledger
+		// room (6 GiB, a booking figure beside a pin Required); the requested
+		// job's own discount added to the room (8 GiB, Sol build r1 #3).
 		now := time.Unix(90170, 0)
 		current := 40 * gi
 		server := pinServer(t, pinChargeEnforce, 64*gi, &current, &now)
@@ -302,8 +304,12 @@ func TestPinChargePhysicalFitAndLedgerCharge(t *testing.T) {
 		queue := queueOf(server, heldLease(1, 58*gi), job)
 		server.evaluateAdmitQueue(queue)
 		requireAdmitQueued(t, job)
-		if job.lastGrantable == nil || *job.lastGrantable != 8*gi {
-			t.Fatalf("grantable=%v, want 8 GiB (ledger room + discount, in pin bytes)", job.lastGrantable)
+		want := 6 * gi * 100 / 80
+		if job.lastGrantable == nil || *job.lastGrantable != want {
+			t.Fatalf("grantable=%v, want %d (the largest pin whose booking fits 6 GiB)", job.lastGrantable, want)
+		}
+		if discountedPinCharge(want, 80) != 6*gi || discountedPinCharge(want+1, 80) <= 6*gi {
+			t.Fatalf("fixture: %d books %d and %d books %d", want, discountedPinCharge(want, 80), want+1, discountedPinCharge(want+1, 80))
 		}
 	})
 	t.Run("ci-shim never applies the rule or the discount", func(t *testing.T) {
@@ -787,5 +793,77 @@ func TestPinChargeConfineListShowsBookingAndPin(t *testing.T) {
 	other := reserveScopeByID(t, listing, plain)
 	if other.ReserveBytes == nil || *other.ReserveBytes != 3*gi || other.PinBytes != nil {
 		t.Fatalf("plain lease reserve=%v pin=%v, want 3 GiB and NO pin", other.ReserveBytes, other.PinBytes)
+	}
+}
+
+// verifies: AIRA-324 (Sol build r1 #3) — largestDiscountedPin is the exact
+// inverse of discountedPinCharge: for each room, the returned pin books within
+// the room and one byte more does not; a deficit, room at the floor and factor 1
+// state the room unchanged.
+func TestLargestDiscountedPinInvertsTheCharge(t *testing.T) {
+	const gi = int64(1) << 30
+	for _, room := range []int64{2<<20 + 1, 7*gi + 3, 6 * gi, 40*gi + 12345} {
+		for _, percent := range []int64{50, 67, 80, 99} {
+			pin := largestDiscountedPin(room, percent)
+			if discountedPinCharge(pin, percent) > room || discountedPinCharge(pin+1, percent) <= room {
+				t.Fatalf("room %d at %d%%: pin %d books %d, pin+1 books %d", room, percent, pin,
+					discountedPinCharge(pin, percent), discountedPinCharge(pin+1, percent))
+			}
+		}
+	}
+	for _, tc := range []struct{ room, percent int64 }{{-3 * gi, 80}, {0, 80}, {1 << 20, 80}, {5 * gi, 100}} {
+		if got := largestDiscountedPin(tc.room, tc.percent); got != tc.room {
+			t.Fatalf("largestDiscountedPin(%d, %d) = %d, want the room unchanged", tc.room, tc.percent, got)
+		}
+	}
+}
+
+// verifies: AIRA-324 (Sol build r1 #1) — a grant frame carries `charge` only for
+// a DISCOUNTABLE waiter booked below its reserve. A resized lease of a client
+// that never sent `discountable` (re-anchored and granted again) must not carry
+// one: that client refuses an unasked-for charge and would drop the lease.
+// Mutation: echo the charge for every waiter booked below its reserve.
+func TestPinChargeGrantChargeOnlyForADiscountableWaiter(t *testing.T) {
+	resized := &admitWaiter{reserve: 8 << 30, charge: 2 << 30}
+	if got := admitGrantCharge(resized); got != 0 {
+		t.Fatalf("a resized, non-discountable lease echoes charge %d, want none", got)
+	}
+	discounted := &admitWaiter{reserve: 10 << 30, charge: 8 << 30, discountable: true}
+	if got := admitGrantCharge(discounted); got != 8<<30 {
+		t.Fatalf("discounted grant charge = %d, want the 8 GiB booking", got)
+	}
+	plain := &admitWaiter{reserve: 10 << 30, discountable: true} // observe: eligible, not discounted
+	if got := admitGrantCharge(plain); got != 0 {
+		t.Fatalf("an undiscounted eligible grant echoes charge %d, want none", got)
+	}
+}
+
+// verifies: AIRA-324 (Sol build r1 #2) — confine-dump's waiter row keeps the
+// booking in reserve_bytes and adds pin_bytes only for a lease booked below its
+// reserve; an ordinary lease has no pin_bytes. Mutations: pin_bytes dropped;
+// pin_bytes on every row.
+func TestPinChargeDumpShowsBookingAndPin(t *testing.T) {
+	server := ciDumpTestServer(t)
+	injectCIDumpQueue(server, "/aira.slice", func(queue *sliceQueue) {
+		queue.waiters = []*admitWaiter{
+			{seq: 1, reserve: 10 << 30, charge: 8 << 30, discountable: true, state: admitGranted, accounted: true, scopeID: "CONFINE-pin-1-a"},
+			{seq: 2, reserve: 3 << 30, state: admitGranted, accounted: true, scopeID: "CONFINE-plain-2-a"},
+		}
+		queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+	})
+	response := server.confineDump(map[string]any{"owner": "session-a"})
+	if !response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	rows := map[string]runner.ConfineDumpWaiterRow{}
+	for _, row := range response.Data.(runner.ConfineDumpResult).Waiters {
+		rows[row.ScopeID] = row
+	}
+	pinned, plain := rows["CONFINE-pin-1-a"], rows["CONFINE-plain-2-a"]
+	if pinned.ReserveBytes != 8<<30 || pinned.PinBytes == nil || *pinned.PinBytes != 10<<30 {
+		t.Fatalf("discounted row reserve=%d pin=%v, want booking 8 GiB and pin 10 GiB", pinned.ReserveBytes, pinned.PinBytes)
+	}
+	if plain.ReserveBytes != 3<<30 || plain.PinBytes != nil {
+		t.Fatalf("plain row reserve=%d pin=%v, want 3 GiB and no pin", plain.ReserveBytes, plain.PinBytes)
 	}
 }

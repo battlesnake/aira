@@ -124,6 +124,36 @@ func (s *Server) pinChargeFor(discountable bool, reserve int64) int64 {
 	return discountedPinCharge(reserve, s.pinChargePercent)
 }
 
+// admitGrantCharge is the `charge` a grant frame carries: the booking, only for
+// a waiter that asked to be discountable and is booked below its reserve, else
+// zero (the field is omitted). A --resize also books a lease below its reserve,
+// but that lease's client never sent `discountable` and refuses a charge it did
+// not ask for (validRunnerAdmitCharge), so a re-anchored, resized lease that is
+// granted again must not carry one. queue.mu must be held.
+func admitGrantCharge(waiter *admitWaiter) int64 {
+	if waiter == nil || !waiter.discountable || !waiter.discounted() {
+		return 0
+	}
+	return waiter.ledgerCharge()
+}
+
+// largestDiscountedPin is the largest pin whose discounted booking fits
+// `available` ledger bytes at this factor: the inverse of discountedPinCharge.
+// For a pin above the floor, ceil(pin x percent / 100) <= available exactly when
+// pin <= floor(available x 100 / percent). Room at or below the floor (a pin
+// there books itself), a deficit, a factor of 1 or an out-of-range input states
+// the room unchanged.
+func largestDiscountedPin(available, percent int64) int64 {
+	if available <= pinChargeFloor || percent <= 0 || percent >= 100 || available > admitMaxReserve {
+		return available
+	}
+	pin := available * 100 / percent
+	if pin > admitMaxReserve {
+		pin = admitMaxReserve
+	}
+	return pin
+}
+
 // bookingField turns a booking into the waiter's stored charge: zero when the
 // booking is the reserve itself (the representation every non-discounted waiter,
 // and every hand-built test waiter, already has), else the booking.

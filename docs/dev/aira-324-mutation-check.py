@@ -44,6 +44,7 @@ ADMIT = "internal/daemon/admit.go"
 PIN = "internal/daemon/pin_charge.go"
 RESIZE = "internal/daemon/confine_resize.go"
 MANAGE = "internal/daemon/confine_manage.go"
+DUMP = "internal/daemon/ci_dump.go"
 SERVER = "internal/daemon/server.go"
 RPIN = "internal/runner/pin_charge.go"
 SENDER = "internal/runner/admission_linux.go"
@@ -67,7 +68,9 @@ T_REDECLARE = (D, "TestPinChargeReDeclareLifecycle|TestConfineResizeIsDroppedByA
 T_RESIZE = (D, "TestPinChargeResizeIsAgainstTheCharge|TestConfineResize")
 T_HEAD = (D, "TestPinChargeHeadEligibilityIsOnThePin")
 T_BYPASS = (D, "TestPinChargeBypassBudgetIsInChargeBytes")
-T_GRANT = (D, "TestPinChargeGrantEchoesThePinAndTheCharge")
+T_GRANT = (D, "TestPinChargeGrantEchoesThePinAndTheCharge|TestPinChargeGrantChargeOnlyForADiscountableWaiter")
+T_DUMP = (D, "TestPinChargeDumpShowsBookingAndPin")
+T_INVERSE = (D, "TestLargestDiscountedPinInvertsTheCharge|TestPinChargePhysicalFitAndLedgerCharge")
 T_VALIDATE = (D, "TestValidateAdmitArgsDiscountable")
 T_SNAPSHOT = (D, "TestPinChargeSnapshotShowsBookingAndPin")
 T_LIST = (D, "TestPinChargeConfineListShowsBookingAndPin")
@@ -98,14 +101,16 @@ HEAD = "	if waiter.reserve > subtractFloor(effectiveMaximum, s.admitSliceHeadroo
 BUDGET = "	return head.ledgerCharge() / 2"
 BYPASS_CHECK = "			case addClamp(head.bypassed, waiter.ledgerCharge()) > admitBypassBudget(head):"
 BYPASS_ADD = "				head.bypassed = addClamp(head.bypassed, waiter.ledgerCharge())"
-ECHO = """	if waiter.discounted() {
-		grant.Charge = waiter.ledgerCharge()
-	}"""
+ECHO = "	grant.Charge = admitGrantCharge(waiter)"
+GRANT_GATE = "	if waiter == nil || !waiter.discountable || !waiter.discounted() {"
+DUMP_PIN = """		if waiter.discounted() {
+			// AIRA-324: the pin (the scope cap and the physical-fit subject)"""
 QUEUED_BYTES = "		queuedBytes = addClamp(queuedBytes, waiter.ledgerCharge())"
 PINS = """		if waiter.discounted() {
 			snapshot.scopePins[waiter.scopeID] = waiter.reserve
 		}"""
-GRANTABLE = "			grantable = available + (waiter.reserve - waiter.ledgerCharge())"
+GRANTABLE = "			grantable = largestDiscountedPin(available, s.pinChargePercent)"
+INVERSE = "	pin := available * 100 / percent"
 NOT_PINNED = "		case !pinned:"
 SEND = """	if req.Discountable {
 		frame.Request.Args["discountable"] = true
@@ -128,6 +133,8 @@ MUTATIONS = [
     ("fit-rule-off-by-one", [(ADMIT, FIT_RULE, "		if waiter.discounted() && !s.shimMode() && waiter.reserve >= physicalFree {")], T_FIT),
     ("fit-ledger-check-on-the-pin", [(ADMIT, LEDGER_FIT, "		ramFits := waiter.reserve <= available")], T_FIT),
     ("fit-grantable-ignores-the-discount", [(ADMIT, GRANTABLE, "			grantable = available")], T_FIT),
+    ("fit-grantable-adds-the-own-discount", [(ADMIT, GRANTABLE, "			grantable = available + (waiter.reserve - waiter.ledgerCharge())")], T_FIT),
+    ("fit-inverse-rounds-up", [(PIN, INVERSE, "	pin := (available*100 + percent - 1) / percent")], T_INVERSE),
     # The factor and its clamp.
     ("factor-floor-not-ceil", [(PIN, CEIL, "	charge := (pin * percent) / 100")], T_FACTOR),
     ("factor-no-floor-clamp", [(PIN, CLAMP, "")], T_FACTOR),
@@ -156,8 +163,9 @@ MUTATIONS = [
     ("bypass-check-on-the-pin", [(ADMIT, BYPASS_CHECK, "			case addClamp(head.bypassed, waiter.reserve) > admitBypassBudget(head):")], T_BYPASS),
     ("bypass-accumulates-the-pin", [(ADMIT, BYPASS_ADD, "				head.bypassed = addClamp(head.bypassed, waiter.reserve)")], T_BYPASS),
     # The wire, both directions.
-    ("grant-echoes-the-booking-as-reserve", [(ADMIT, ECHO, "	if waiter.discounted() {\n		grant.Charge = waiter.ledgerCharge()\n		grant.Reserve = waiter.ledgerCharge()\n	}")], T_GRANT),
+    ("grant-echoes-the-booking-as-reserve", [(ADMIT, ECHO, ECHO + "\n	if grant.Charge > 0 {\n		grant.Reserve = grant.Charge\n	}")], T_GRANT),
     ("grant-charge-on-every-grant", [(ADMIT, ECHO, "	grant.Charge = waiter.ledgerCharge()")], T_GRANT),
+    ("grant-charge-for-a-resized-lease", [(PIN, GRANT_GATE, "	if waiter == nil || !waiter.discounted() {")], T_GRANT),
     ("validate-accepts-unpinned-discountable", [(ADMIT, NOT_PINNED, "		case false && !pinned:")], T_VALIDATE),
     ("client-never-sends-discountable", [(SENDER, SEND, "")], T_WIRE),
     ("client-no-old-daemon-reask", [(SENDER, REASK, "		if false && req.Discountable && response.Code == \"E_DAEMON_PROTOCOL\" && strings.Contains(response.Error, oldDaemonDiscountRefusal) {")], T_OLD),
@@ -174,6 +182,10 @@ MUTATIONS = [
     ("faces-summary-cap-is-the-booking", [(SUMMARY, SUMMARY_CAP, "			record.CapBytes = status.BookedBytes")], T_FACES),
     ("faces-snapshot-queued-on-the-pin", [(ADMIT, QUEUED_BYTES, "		queuedBytes = addClamp(queuedBytes, waiter.reserve)")], T_SNAPSHOT),
     ("faces-snapshot-pins-every-lease", [(ADMIT, PINS, "		snapshot.scopePins[waiter.scopeID] = waiter.reserve")], T_SNAPSHOT),
+    ("faces-dump-drops-the-pin", [(DUMP, DUMP_PIN, """		if false && waiter.discounted() {
+			// AIRA-324: the pin (the scope cap and the physical-fit subject)""")], T_DUMP),
+    ("faces-dump-pins-every-row", [(DUMP, DUMP_PIN, """		if true {
+			// AIRA-324: the pin (the scope cap and the physical-fit subject)""")], T_DUMP),
     ("faces-list-drops-the-pin", [(MANAGE, LIST_PINS, "")], T_LIST),
     ("faces-top-drops-the-pin", [(TOP, TOP_CELL, "	if false && reserve.State == topReserveSet && record.PinBytes != nil && *record.PinBytes > reserve.Bytes {")], T_TOP),
     # Install: observe by default, never enforce; shim off.
