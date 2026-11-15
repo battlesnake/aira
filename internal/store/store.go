@@ -3498,15 +3498,7 @@ func translateDBError(err error) error {
 	if err == nil {
 		return nil
 	}
-	message := err.Error()
-	// AIRA-338: a lease refusal's text carries recorded names (the actor is
-	// caller-supplied), so classify on the text the bare sentinel had: a
-	// name can never make a refusal read as SQLITE_BUSY.
-	var expired *LeaseExpiredError
-	if errors.As(err, &expired) {
-		message = strings.Replace(message, expired.Error(), ErrLeaseExpired.Error(), 1)
-	}
-	if errors.Is(err, ErrDBBusy) || strings.Contains(strings.ToLower(message), "database is locked") {
+	if errors.Is(err, ErrDBBusy) || strings.Contains(strings.ToLower(err.Error()), "database is locked") {
 		return fmt.Errorf("%w: %v", ErrDBBusy, err)
 	}
 	return err

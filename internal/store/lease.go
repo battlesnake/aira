@@ -303,6 +303,11 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	}
 	var result LeaseClaim
 	result.Token = clear
+	// refusal is the detail of the one E_LEASE_EXPIRED return below. The
+	// transaction still returns the bare sentinel, so its rollback and error
+	// classification are unchanged; the detail replaces it after the
+	// transaction has ended (AIRA-338).
+	var refusal *LeaseExpiredError
 	tokenLock, err := acquireLock(s.leaseTokenLock(ticketID))
 	if err != nil {
 		_ = os.Remove(tokenTemp)
@@ -349,7 +354,8 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 				return ErrLeaseHeld
 			}
 			if isHeld && !steal {
-				return s.leaseNotLiveError(ticketID, currentHeld, bootID, monoNS)
+				refusal = s.leaseNotLiveError(ticketID, currentHeld, bootID, monoNS)
+				return ErrLeaseExpired
 			}
 			generation := currentHeld.Generation() + 1
 			if !isHeld {
@@ -413,6 +419,9 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	})
 	if err != nil {
 		_ = os.Remove(tokenTemp)
+		if err == ErrLeaseExpired && refusal != nil {
+			return LeaseClaim{}, refusal
+		}
 		return LeaseClaim{}, err
 	}
 	held, ok := result.Lease.Held()
@@ -589,6 +598,9 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 	}
 	hash := sha256.Sum256(tokenBytes)
 	var result domain.Lease
+	// As in Claim: the transaction returns the bare sentinel and the detail
+	// replaces it afterwards (AIRA-338).
+	var refusal *LeaseExpiredError
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
 		bootID, monoNS, err := s.sampleClock()
 		if err != nil {
@@ -596,7 +608,8 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		}
 		row, err := readLeaseRow(ctx, conn, s.projectID, ticketID)
 		if errors.Is(err, sql.ErrNoRows) {
-			return s.leaseNotHeldError(ticketID, "unclaimed")
+			refusal = s.leaseNotHeldError(ticketID, "unclaimed")
+			return ErrLeaseExpired
 		}
 		if err != nil {
 			return err
@@ -607,10 +620,12 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		}
 		held, ok := lease.Held()
 		if !ok {
-			return s.leaseNotHeldError(ticketID, "free")
+			refusal = s.leaseNotHeldError(ticketID, "free")
+			return ErrLeaseExpired
 		}
 		if !held.IsLive(bootID, monoNS) {
-			return s.leaseNotLiveError(ticketID, held, bootID, monoNS)
+			refusal = s.leaseNotLiveError(ticketID, held, bootID, monoNS)
+			return ErrLeaseExpired
 		}
 		if held.HolderTokenHash() != hash {
 			return ErrLeaseToken
@@ -639,6 +654,9 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		}
 		return nil
 	})
+	if err == ErrLeaseExpired && refusal != nil {
+		return result, refusal
+	}
 	return result, err
 }
 
