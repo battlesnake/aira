@@ -39,7 +39,7 @@ func TestRenderConfineBudgetNeverFabricatesAndNamesEveryUnevaluatedReason(t *tes
 		"raw frame":  {OK: true, Code: "OK", RawData: mustJSON(t, result)},
 	} {
 		var stdout, stderr bytes.Buffer
-		if exit := renderConfineBudgetResponse(response, &stdout, &stderr); exit != 0 || stderr.Len() != 0 {
+		if exit := renderConfineBudgetResponse(response, "", &stdout, &stderr); exit != 0 || stderr.Len() != 0 {
 			t.Fatalf("%s: exit=%d stderr=%q", name, exit, stderr.String())
 		}
 		out := stdout.String()
@@ -85,7 +85,7 @@ func TestRenderConfineBudgetNeverFabricatesAndNamesEveryUnevaluatedReason(t *tes
 func TestRenderConfineBudgetEmptyHistoryIsAnAnswer(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	response := core.Response{OK: true, Code: "OK", Data: runner.ConfineBudgetResult{Verdict: "ok", Scope: store.ResourceBudgetUniverseScope()}}
-	if exit := renderConfineBudgetResponse(response, &stdout, &stderr); exit != 0 {
+	if exit := renderConfineBudgetResponse(response, "", &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
 	}
 	if !strings.HasPrefix(stdout.String(), "universe: ") || !strings.Contains(stdout.String(), "no usage history recorded yet") {
@@ -99,7 +99,7 @@ func TestRenderConfineBudgetEmptyHistoryIsAnAnswer(t *testing.T) {
 // verifies: AIRA-180
 func TestRenderConfineBudgetRefusesAnUnparseableFrame(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	exit := renderConfineBudgetResponse(core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{"subjects":"not-a-list"}`)}, &stdout, &stderr)
+	exit := renderConfineBudgetResponse(core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{"subjects":"not-a-list"}`)}, "", &stdout, &stderr)
 	if exit == 0 || !strings.Contains(stderr.String(), "invalid confine-budget response") {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}

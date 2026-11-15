@@ -872,7 +872,7 @@ var parseArgsAllowedOptions = map[string]map[string]bool{
 	"run-input":      {"close": true, "steal": true},
 	"run-log":        {"stream": true, "from": true, "tail": true, "follow": true, "full": true, "grep": true},
 	"confine-list":   {"slice": true, "owner": true},
-	"confine-budget": {"slice": true, "owner": true},
+	"confine-budget": {"slice": true, "owner": true, "limit": true, "direction": true, "grep": true},
 	// AIRA (admission-counter rebuild) S18.
 	"confine-dump": {"dump": true, "slice": true, "owner": true},
 	"confine-kill": {"steal": true, "slice": true, "owner": true},
@@ -1502,7 +1502,8 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 		// the value-required group: the archival target file path.
 		// AIRA-312 adds --resize and its required --memory-reserve (the new
 		// reserve), which is otherwise a launch option.
-		case "kill", "front", "resize", "memory-reserve", "slice", "owner", "dump":
+		// AIRA-336 adds --budget's selection: --limit, --direction and --grep.
+		case "kill", "front", "resize", "memory-reserve", "slice", "owner", "dump", "limit", "direction", "grep":
 			value := inline
 			if !hasInline {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
@@ -1565,6 +1566,13 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	}
 	if selected != 1 {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --budget, --dump <file>, --kill <selector>, --front <selector>, --resize <selector>, or --status [<selector>]")
+	}
+	// AIRA-336. The selection belongs to --budget alone; accepted anywhere else
+	// it would be silently discarded.
+	for _, name := range []string{"limit", "direction", "grep"} {
+		if _, present := options[name]; present && !budget {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s is valid only with --budget", name)
+		}
 	}
 	if !kill && !front && !resize && options["steal"] == "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill, --front or --resize")
@@ -2363,6 +2371,7 @@ func runConfineManagementCommand(ctx context.Context, options map[string]string,
 	args := map[string]any{"slice": options["slice"], "owner": owner}
 	if options["budget"] == "true" {
 		verb = "confine-budget"
+		args["limit"], args["direction"], args["grep"] = options["limit"], options["direction"], options["grep"]
 	}
 	if selector := options["kill"]; selector != "" {
 		verb = "confine-kill"
@@ -2402,7 +2411,8 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 		return renderConfineListResponse(response, stdout, stderr)
 	}
 	if request.Verb == "confine-budget" && !jsonOutput && response.OK {
-		return renderConfineBudgetResponse(response, stdout, stderr)
+		grep, _ := request.Args["grep"].(string)
+		return renderConfineBudgetResponse(response, grep, stdout, stderr)
 	}
 	return renderConfineManagement(response, jsonOutput, stdout, stderr)
 }
@@ -2761,13 +2771,14 @@ func buildRequestArgs(verb string, positional []string, options map[string]strin
 		args["slice"], args["owner"] = options["slice"], options["owner"]
 	case "confine-budget":
 		// No selector by design. A subject key is a NUL- or unit-separator-joined
-		// argv, which is not a thing anyone can type; v1 answers for every subject
-		// at once, worst-first, and the operator reads their own command off the
-		// SUBJECT column.
+		// argv, which is not a thing anyone can type; the operator narrows with
+		// --grep on the rendered subject and reads their own command off the
+		// SUBJECT column (AIRA-336).
 		if len(positional) != 0 {
 			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-budget accepts no selector")
 		}
 		args["slice"], args["owner"] = options["slice"], options["owner"]
+		args["limit"], args["direction"], args["grep"] = options["limit"], options["direction"], options["grep"]
 	case "confine-kill", "confine-front", "confine-resize":
 		if len(positional) != 1 || positional[0] == "" {
 			return core.Request{}, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s requires one selector", verb)

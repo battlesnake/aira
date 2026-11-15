@@ -244,18 +244,30 @@ func TestSortConfineBudgetRowsMatchesVerdictSort(t *testing.T) {
 	}
 	var verdicts []ResourceBudgetVerdict
 	for i, direction := range directions {
-		for _, signature := range []string{"b", "a", "B", "a\x00c"} {
+		for k, signature := range []string{"b", "a", "B", "a\x00c", "e", "f"} {
 			kind := ResourcePeakKindConfine
 			if i%2 == 1 {
 				kind = ResourcePeakKindPytestWorker
 			}
-			verdicts = append(verdicts, ResourceBudgetVerdict{Kind: kind, Signature: signature, Direction: direction})
+			verdict := ResourceBudgetVerdict{Kind: kind, Signature: signature, Direction: direction}
+			// AIRA-336: the gap term too — two rows with a figure (different
+			// gaps), one with only a budget, the rest with neither.
+			if k < 3 {
+				budget := int64(1000)
+				verdict.CurrentBudget = &budget
+			}
+			if k < 2 {
+				recommended := int64(2000 + 500*k)
+				verdict.RecommendedBudget = &recommended
+			}
+			verdicts = append(verdicts, verdict)
 		}
 	}
 	toRows := func(vs []ResourceBudgetVerdict) []runner.ConfineBudgetRow {
 		rows := make([]runner.ConfineBudgetRow, 0, len(vs))
 		for _, v := range vs {
-			rows = append(rows, runner.ConfineBudgetRow{Kind: string(v.Kind), Subject: RenderResourceBudgetSubject(v.Kind, v.Signature), Direction: v.Direction})
+			rows = append(rows, runner.ConfineBudgetRow{Kind: string(v.Kind), Subject: RenderResourceBudgetSubject(v.Kind, v.Signature), Direction: v.Direction,
+				Budget: v.CurrentBudget, RecommendedBudget: v.RecommendedBudget})
 		}
 		return rows
 	}
