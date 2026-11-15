@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"strconv"
+	"testing"
+
+	"aira/internal/runner"
 )
 
 // Byte-size units shared across the admission tests.
@@ -72,4 +75,25 @@ func liveAdmitQueueCount(server *Server) int {
 // connection has drained.
 func retireAdmitQueues(server *Server) {
 	server.retireAdmitQueue()
+}
+
+// serveFixtureSlice makes an isolated real-cgroup fixture slice the one slice
+// server admits into (AIRA-228's one-slice guard). The daemon's own default
+// resolves to the fixture, so a confine naming the fixture's path passes the
+// guard, and re-declares charge the same ledger. Every other name still
+// resolves as production does, so a request for any other slice is still
+// refused. Memory reads are untouched: the ledger reads the fixture's real
+// memory.max and memory.current.
+func serveFixtureSlice(t *testing.T, server *Server, slice string) {
+	t.Helper()
+	fixture, ok, reason := resolveAdmitSlicePath(slice)
+	if !ok {
+		t.Fatalf("fixture slice %s does not resolve: %s", slice, reason)
+	}
+	server.admitResolveSlice = func(name string) (string, bool, string) {
+		if name == runner.DefaultConfineSlice {
+			return fixture, true, ""
+		}
+		return resolveAdmitSlicePath(name)
+	}
 }

@@ -2394,27 +2394,23 @@ func (q *sliceQueue) runEvaluator() {
 	}()
 	ticker := time.NewTicker(q.poll)
 	defer ticker.Stop()
-	ticking := true
 	for {
-		// AIRA-228. The queue outlives its population, so the poll ticker runs
-		// only while it holds someone: an idle daemon has no timer wakeups, as
-		// when an empty queue had no evaluator at all. Every enqueue signals kick,
-		// which brings the loop back here to resume polling.
+		// AIRA-228. The queue outlives its population, so it polls only while it
+		// holds someone: while it is empty the loop selects on a nil channel, and
+		// an idle daemon takes no poll wakeups (since Go 1.23 a ticker is in the
+		// timer heap only while a receiver blocks on its channel), as when an
+		// empty queue had no evaluator at all. Every insertion signals kick, which
+		// brings the loop back here to poll again.
+		var tick <-chan time.Time
 		q.mu.Lock()
-		populated := len(q.waiters) != 0
-		q.mu.Unlock()
-		if populated != ticking {
-			if populated {
-				ticker.Reset(q.poll)
-			} else {
-				ticker.Stop()
-			}
-			ticking = populated
+		if len(q.waiters) != 0 {
+			tick = ticker.C
 		}
+		q.mu.Unlock()
 		select {
 		case <-q.kick:
 			q.server.evaluateAdmitQueue(q)
-		case <-ticker.C:
+		case <-tick:
 			q.signal()
 		case <-q.stop:
 			return
@@ -2435,10 +2431,13 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// S14 deleted the periodic cgroup scan that used to run here — emptiness is now
 	// derived from the signed ledger (sliceProvablyEmpty), so a pass touches only
 	// queue state.
-	now := s.admitNowTime()
-
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
+	// AIRA-228. The clock is read UNDER queue.mu: the queue outlives its
+	// population, so a pass that read it first and then waited for the lock
+	// could arm a population that arrived meanwhile with a pre-drain instant,
+	// and its fairness hold would read as already elapsed.
+	now := s.admitNowTime()
 	// AIRA-247. A tripped slice admits NOTHING: reject every queued waiter and
 	// return before the ceiling read, since no ceiling could let one through.
 	// Rejecting a QUEUED waiter is ledger-neutral — only granted && accounted

@@ -91,6 +91,7 @@ func TestSmallSliceOOMSelfHealConvergesOnTheFittedBaseline(t *testing.T) {
 	// ceiling, and a request over it is still terminally refused.
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
+	serveFixtureSlice(t, server, slice)
 	startServer(t, server)
 
 	run := smallSliceRunner(t, slice, paths)
@@ -194,6 +195,7 @@ func TestSmallSliceOOMAboveTheFittedCapIsTerminalAtTheKernel(t *testing.T) {
 	server := NewServer(paths)
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
+	serveFixtureSlice(t, server, slice)
 	startServer(t, server)
 
 	run := smallSliceRunner(t, slice, paths)

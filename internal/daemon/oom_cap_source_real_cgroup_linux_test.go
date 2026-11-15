@@ -75,6 +75,7 @@ func TestOOMTrailerDistinguishesAnEstimatedCapFromAnOperatorSuppliedOne(t *testi
 	// is 1 GiB, while production headroom would leave it no ceiling at all.
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
+	serveFixtureSlice(t, server, slice)
 	startServer(t, server)
 
 	run := func(token string, bytesWanted int64, declaredCap int64, declaredReserve int64) oomSelfHealRun {

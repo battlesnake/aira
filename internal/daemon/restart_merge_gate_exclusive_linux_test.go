@@ -46,7 +46,7 @@ func TestRestartMergeGateExclusiveLostAcrossRestart(t *testing.T) {
 	slice := mergeGateSlice(t)
 	paths := testPaths(t)
 
-	serverA, cancelA, doneA := startGateServer(t, paths)
+	serverA, cancelA, doneA := startGateServer(t, paths, slice)
 
 	exCtx, exCancel := context.WithCancel(context.Background())
 	defer exCancel()
@@ -99,7 +99,7 @@ func TestRestartMergeGateExclusiveLostAcrossRestart(t *testing.T) {
 
 	// Daemon B on the SAME socket: an EMPTY ledger with the 2s freeze armed. The
 	// exclusive holder never re-declares, so its lease must be ABSENT here.
-	serverB, cancelB, doneB := startGateServer(t, paths)
+	serverB, cancelB, doneB := startGateServer(t, paths, slice)
 	defer func() { cancelB(); awaitGateShutdown(t, doneB) }()
 
 	if pre := gateLeases(serverB); len(pre) != 0 {

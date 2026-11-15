@@ -81,6 +81,121 @@ func TestAdmitDrainedPopulationLeavesNoFreezeAnchor(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-228 — only a DRAINED population drops its fairness-freeze
+// state. A release that leaves waiters behind must keep an active hold, or every
+// release would cancel the AIRA-59/307 hold and let backfill past a protected
+// head (the 2026-10-12 starvation class). The queue is the server's registered
+// queue, so the release runs the real reset decision. Mutation: reset the anchor
+// on every release (`len(queue.waiters) == 0 || true`) -> the anchor is cleared.
+func TestAdmitReleaseWithSurvivorsKeepsTheFreezeAnchor(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	server := manualQueueServer(100, now)
+	queue, holder := enqueueOn(t, server, "/slice", 60)
+	_, head := enqueueOn(t, server, "/slice", 70)
+	_, small := enqueueOn(t, server, "/slice", 10)
+	server.evaluateAdmitQueue(queue)
+	server.admitRegistryMu.Lock()
+	registered := server.admitQueue == queue
+	server.admitRegistryMu.Unlock()
+	if !registered {
+		t.Fatal("precondition: the queue must be the server's registered queue, or the release never reaches the reset decision")
+	}
+	armed := now.Add(-time.Second)
+	queue.mu.Lock()
+	queue.freezeArmedAt, queue.freezeHolderSeq, queue.freezeLogged = armed, holder.seq, admitFreezeHold
+	queue.mu.Unlock()
+
+	server.releaseAdmitWaiter(queue, small)
+
+	queue.mu.Lock()
+	got, gotSeq, gotLogged := queue.freezeArmedAt, queue.freezeHolderSeq, queue.freezeLogged
+	queue.mu.Unlock()
+	if !got.Equal(armed) || gotSeq != holder.seq || gotLogged != admitFreezeHold {
+		t.Fatalf("a release that left waiters behind reset the active freeze: anchor=%v seq=%d logged=%v, want %v %d %v", got, gotSeq, gotLogged, armed, holder.seq, admitFreezeHold)
+	}
+	server.releaseAdmitWaiter(queue, head)
+	server.releaseAdmitWaiter(queue, holder)
+}
+
+// verifies: AIRA-228 — an evaluator pass reads its clock under queue.mu, so it
+// can never apply a timestamp taken before a drain to the population that
+// arrived after it. The queue now outlives its population, so a pass that read
+// the clock, then lost the CPU while the last job released and a new population
+// arrived, would arm the new head's fairness hold at the stale instant: the hold
+// would already read as elapsed and the next pass would backfill past the head
+// regardless of its bypass budget. (Before AIRA-228 the stale pass ran on the
+// pruned queue and could not touch the new one.) The test pauses a pass inside
+// its clock read; if the queue lock is free there, it slips the drain and the
+// next population in before resuming the pass. Mutation: read the clock before
+// taking queue.mu -> the small job is granted past the head on the next pass.
+func TestAdmitPassClockCannotCrossAPopulationDrain(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+	server := manualQueueServer(100, start)
+	server.admitFreezeMaxHold = time.Second
+	var nowNanos atomic.Int64
+	nowNanos.Store(start.UnixNano())
+	var pauseNext atomic.Bool
+	paused, resume := make(chan struct{}), make(chan struct{})
+	server.admitNow = func() time.Time {
+		now := time.Unix(0, nowNanos.Load())
+		if pauseNext.CompareAndSwap(true, false) {
+			close(paused)
+			<-resume
+		}
+		return now
+	}
+	queue, first := enqueueOn(t, server, "/slice", 10)
+	server.evaluateAdmitQueue(queue)
+	if first.state != admitGranted {
+		t.Fatalf("precondition: first job state=%v, want granted", first.state)
+	}
+
+	pauseNext.Store(true)
+	passDone := make(chan struct{})
+	go func() {
+		server.evaluateAdmitQueue(queue)
+		close(passDone)
+	}()
+	<-paused
+	// Population 2, two hold-lengths later: a holder that fits, a big head that
+	// cannot fit beside it, and a small job over the head's budget (70/2 = 35).
+	nextPopulation := func() (holder, head, small *admitWaiter) {
+		server.releaseAdmitWaiter(queue, first)
+		nowNanos.Store(start.Add(2 * time.Second).UnixNano())
+		_, holder = enqueueOn(t, server, "/slice", 60)
+		_, head = enqueueOn(t, server, "/slice", 70)
+		_, small = enqueueOn(t, server, "/slice", 38)
+		return holder, head, small
+	}
+	var holder, head, small *admitWaiter
+	if queue.mu.TryLock() {
+		// The paused pass does not hold the queue: the drain and the next
+		// population can land between its clock read and its work.
+		queue.mu.Unlock()
+		holder, head, small = nextPopulation()
+		close(resume)
+		<-passDone
+	} else {
+		close(resume)
+		<-passDone
+		holder, head, small = nextPopulation()
+	}
+	server.evaluateAdmitQueue(queue)
+	server.evaluateAdmitQueue(queue)
+	if holder.state != admitGranted || head.state != admitQueued {
+		t.Fatalf("precondition: holder=%v head=%v, want granted and queued", holder.state, head.state)
+	}
+	if small.state != admitQueued {
+		queue.mu.Lock()
+		anchor := queue.freezeArmedAt
+		queue.mu.Unlock()
+		t.Fatalf("small job state=%v, want queued behind the brand-new head's bypass budget: a pass armed the new population's hold with a clock read from before the drain (anchor=%v, now=%v)", small.state, anchor, time.Unix(0, nowNanos.Load()))
+	}
+	for _, waiter := range []*admitWaiter{small, head, holder} {
+		server.releaseAdmitWaiter(queue, waiter)
+	}
+}
+
 // verifies: AIRA-228 — every reader answers a drained queue exactly as it
 // answers a daemon that never admitted anything: no established ledger in the
 // snapshot (AIRA-220's honesty bit), no queue row in the CI dump, no budget map
@@ -366,7 +481,8 @@ func TestAdmitQueueRefusesASecondSlicePath(t *testing.T) {
 }
 
 // countEvaluatorPasses makes every evaluator pass countable: a pass reads the
-// admission clock first. It must be installed before the queue exists.
+// admission clock once, as soon as it holds queue.mu. It must be installed
+// before the queue exists.
 func countEvaluatorPasses(server *Server) *atomic.Int64 {
 	var passes atomic.Int64
 	server.admitNow = func() time.Time {
@@ -414,15 +530,51 @@ func TestAdmitIdleEvaluatorHoldsNoPollTimer(t *testing.T) {
 	server.releaseAdmitWaiter(queue, next)
 }
 
+// verifies: AIRA-228 — a drained queue's evaluator resumes polling once it is
+// populated again. A blocker that clears with no enqueue or release (the slice
+// ceiling rising, a memory read recovering, a freeze hold expiring) is seen only
+// by a poll. The evaluator goes quiet on the drained queue first, so the poll
+// has to come back, not merely never have stopped. Mutation: never re-enable
+// the poll once the queue has been empty -> the blocked job is never granted.
+func TestAdmitPollResumesAfterAnIdlePeriod(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	server := admitTestServer(&maximum)
+	server.admitPollInterval = 5 * time.Millisecond
+	passes := countEvaluatorPasses(server)
+	t.Cleanup(func() { retireAdmitQueues(server) })
+	queue, first := enqueueOn(t, server, "/slice", 10)
+	waitAdmitGrant(t, first)
+	server.releaseAdmitWaiter(queue, first)
+	waitEvaluatorQuiet(t, passes, 50*time.Millisecond, 5*time.Second)
+
+	// A holder takes most of the slice, then a job that cannot fit beside it.
+	_, holder := enqueueOn(t, server, "/slice", 95)
+	waitAdmitGrant(t, holder)
+	_, blocked := enqueueOn(t, server, "/slice", 10)
+	time.Sleep(100 * time.Millisecond) // its own kick's pass has run and refused it
+	select {
+	case <-blocked.grantedCh:
+		t.Fatal("precondition: the second job must not fit beside the holder yet")
+	default:
+	}
+	// The ceiling rises with no enqueue and no release: only a poll can see it.
+	maximum.Store(1000)
+	waitAdmitGrant(t, blocked)
+	server.releaseAdmitWaiter(queue, blocked)
+	server.releaseAdmitWaiter(queue, holder)
+}
+
 // verifies: AIRA-228 — a re-declare that establishes a lease on an empty queue
-// resumes the evaluator's polling, as the evaluator of a freshly built queue
-// polled before. The poll ticker is stopped while the queue is empty and
-// resumes only on a kick, and an establish is the one insertion that used to
-// send none. Polling is what retires an elapsed fairness-freeze anchor (the
-// next pass after a hold ends clears it); an anchor left in place would instead
-// hand the next arrivals a backfilling pass. Mutation: drop the establish kick
-// -> the elapsed anchor is never cleared.
-func TestAdmitEstablishGrantedResumesPolling(t *testing.T) {
+// wakes the evaluator, which then serves that queue again. While the queue is
+// empty the evaluator waits only for a kick, and an establish is the one
+// insertion that used to send none. Here the woken evaluator must retire an
+// elapsed fairness-freeze anchor (the next pass after a hold ends clears it); an
+// anchor left in place would instead hand the next arrivals a backfilling pass.
+// Mutation: drop the establish kick -> the elapsed anchor is never cleared. (This
+// test does not pin polling on its own, since the kick's pass may be the one
+// that clears the anchor; TestAdmitPollResumesAfterAnIdlePeriod pins that.)
+func TestAdmitEstablishGrantedWakesTheEvaluator(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
 	server := admitTestServer(&maximum)
