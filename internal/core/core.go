@@ -579,7 +579,13 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	data, err := spec.Run(ctx, args)
 	if err != nil {
 		code := store.ErrorCode(err)
-		return Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
+		response := Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
+		// AIRA-338: an E_LEASE_EXPIRED refusal carries its established detail.
+		var expired *store.LeaseExpiredError
+		if errors.As(err, &expired) {
+			response.Data = expired.Detail
+		}
+		return response
 	}
 	warnings := []string(nil)
 	verdict := ""
