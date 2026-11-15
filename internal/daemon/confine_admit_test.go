@@ -16,7 +16,6 @@ import (
 func TestConfineEstimatorAndOOMEscalationClamp(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 0, false, nil }
 	server.admitPeakHistory = func(_ context.Context, signature string) (runner.PeakRSSStats, error) {
 		switch signature {
 		case "ordinary":
@@ -52,10 +51,6 @@ func TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins(t *testing.T) {
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 10 << 30, OOMCount: 1, MaxOOMPeak: 10 << 30}, nil
 	}
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) {
-		t.Fatal("pinned request consulted history prior")
-		return 0, false, nil
-	}
 	// An OOM peak AT the ceiling: the guard refuses it, so the escalation stands
 	// unclamped and admitConnection refuses it terminally. AIRA-153 tightened the
 	// guard from `MaxOOMPeak < ceiling` to `MaxOOMPeak < FIT(ceiling)`, and
@@ -80,20 +75,6 @@ func TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins(t *testing.T) {
 	if clamped != 9336885426 || basis != "estimate:oom-escalated,ceiling-clamped" {
 		t.Fatalf("one-byte-under-the-fit reserve=%d basis=%q, want %d/%q — a clamped rung must be strictly above the peak that produced it and strictly below the ceiling",
 			clamped, basis, int64(9336885426), "estimate:oom-escalated,ceiling-clamped")
-	}
-}
-
-func TestConfineEstimatorP90PriorNotMedianOrFlat(t *testing.T) {
-	server := NewServer(Paths{})
-	server.stopping = make(chan struct{})
-	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
-		return runner.PeakRSSStats{}, nil
-	}
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) { return 50 << 30, true, nil }
-	reserve, basis := server.resolveAdmitReserve(admitRequest{reserve: 4 << 30, signature: "novel"}, 63<<30)
-	want := int64(50<<30) + int64(50<<30)*15/100
-	if reserve != want || basis != "estimate:p90-prior" || reserve == 4<<30 {
-		t.Fatalf("prior reserve=%d basis=%q want=%d", reserve, basis, want)
 	}
 }
 

@@ -22,10 +22,16 @@ import (
 // defect this ticket fixes lives and where AIRA-151 recorded the self-heal as
 // broken:
 //
-//   - T9: the ladder converges. A novel command is admitted at the largest prior
-//     the slice can grant, is OOM-killed there, and the very next identical
-//     invocation succeeds with no operator action -- on a slice where master
-//     refuses every unpinned job outright.
+//   - T9: the ladder converges. A command OOM-killed below what the slice can
+//     grant is re-admitted, unpinned, at the largest prior the slice can grant,
+//     and the very next invocation of the same command succeeds --
+//     on a slice where master refused every unpinned job outright. (Until
+//     AIRA-341 the killed first run was itself unpinned, capped at the
+//     machine-wide prior; with that prior deleted an unpinned first run on this
+//     slice is already at the fit, so the first run here declares a smaller cap.
+//     An unpinned job that is OOM-killed AT the fit is usually not
+//     self-healed on this slice: its re-run is clamped to the fit at that
+//     moment or refused.)
 //   - T13: the ladder TERMINATES honestly. A command whose own recorded OOM peak
 //     is already at or above what the slice can grant is refused immediately with
 //     E_ADMIT_TOO_LARGE naming both numbers, rather than admitted onto an
@@ -45,9 +51,9 @@ const (
 	smallSliceMax = runner.DefaultConfineMemoryReserve - (128 << 20) // 896 MiB
 	// The least ceiling-minus-fit slack the fixture may have. Phase 3's
 	// admission must not depend on the slice's residual charge, which is at most
-	// the cold-start run's own footprint at the kill: its cap is the seeds' p90
-	// prior, about 1.5x the 40 MiB seed plus a Go runtime. Not the 320 MiB target
-	// workload, which the cold start never reaches.
+	// the cold-start run's own footprint at the kill: its declared cap,
+	// oomSelfHealColdCap. Not the 320 MiB target workload, which the cold start
+	// never reaches.
 	smallSliceMinSlack = int64(96 << 20)
 	// The T9 entry ceiling and the reserve the fit produces for it, spelled out
 	// so a change to either constant fails against a number rather than against
@@ -96,30 +102,14 @@ func TestSmallSliceOOMSelfHealConvergesOnTheFittedBaseline(t *testing.T) {
 
 	run := smallSliceRunner(t, slice, paths)
 
-	// PHASE 1 -- establish a machine-wide p90 prior by actually running things.
-	for i := 0; i < 3; i++ {
-		seed := run("small-seed", oomSelfHealSeedBytes, 256<<20, 60*time.Second)
-		if seed.err != nil {
-			cgrouptest.SkipOrFailRealCgroup(t, "seeding confine run %d unavailable: %v (stderr %q)", i, seed.err, seed.stderr)
-		}
-		if seed.result.Exit != 0 || !strings.Contains(seed.stdout, oomSelfHealMarker) {
-			t.Fatalf("seed run %d: exit=%d stdout=%q stderr=%q, want a completed workload", i, seed.result.Exit, seed.stdout, seed.stderr)
-		}
-	}
-	server.admitPriorMu.Lock()
-	server.admitPriorAt = time.Time{}
-	server.admitPriorMu.Unlock()
-
-	// PHASE 2 -- the cold start, capped at the machine-wide prior, far below what
-	// the target needs. The prior itself is well under this slice's ceiling, so
-	// it is NOT fitted: the basis must still be the bare `estimate:p90-prior`.
-	first := run("small-target", oomSelfHealTargetBytes, 0, 90*time.Second)
+	// PHASE 2 -- the first run, capped far below what the target needs.
+	first := run("small-target", oomSelfHealTargetBytes, oomSelfHealColdCap, 90*time.Second)
 	if first.err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "cold-start confine run unavailable: %v (stderr %q)", first.err, first.stderr)
 	}
-	if first.result.Status.ReserveBasis != "estimate:p90-prior" {
-		t.Fatalf("cold-start reserve-basis=%q reserve=%d, want the UNFITTED p90 prior — a prior below the ceiling must not be touched (I4) (stderr %q)",
-			first.result.Status.ReserveBasis, first.result.Status.ReserveBytes, first.stderr)
+	if first.result.Status.ScopeMemoryMax != oomSelfHealColdCap {
+		t.Fatalf("first-run scope memory.max=%d (reserve-basis=%q), want the declared %d (stderr %q)",
+			first.result.Status.ScopeMemoryMax, first.result.Status.ReserveBasis, oomSelfHealColdCap, first.stderr)
 	}
 	if strings.Contains(first.stdout, oomSelfHealMarker) {
 		t.Fatalf("cold-start run printed its completion marker despite being capped at %d bytes: stdout=%q",
@@ -140,8 +130,9 @@ func TestSmallSliceOOMSelfHealConvergesOnTheFittedBaseline(t *testing.T) {
 	// a lower ceiling instead of the fixture's.)
 	waitForDrainedAdmitLedger(t, server)
 
-	// PHASE 3 -- the self-heal. Same argv, therefore the same signature, and no
-	// operator action of any kind between the two runs.
+	// PHASE 3 -- the self-heal. Same argv, therefore the same signature; the only
+	// difference is that the first run's declared cap is dropped (since AIRA-341
+	// the fixture's under-provisioned first run is operator-capped, see above).
 	//
 	// The unpinned prior is over this slice's ceiling, so on master this request
 	// never reaches a scope at all. Here it is fitted to the largest prior the
@@ -261,10 +252,6 @@ func TestSmallSliceSelfHealFixtureActuallyExercisesTheFitAndStaysOffTheCeiling(t
 	server.stopping = make(chan struct{})
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) {
-		t.Fatal("the OOM branch must resolve before the machine-wide prior is consulted")
-		return 0, false, nil
-	}
 
 	ceiling := smallSliceMax - server.admitSliceHeadroom(1)
 	if ceiling != smallSliceCeiling {
@@ -293,7 +280,7 @@ func TestSmallSliceSelfHealFixtureActuallyExercisesTheFitAndStaysOffTheCeiling(t
 	}
 
 	// (iii) the phase-3 resolution is exactly what T9 asserts, basis included.
-	peak := oomSelfHealSeedBytes + oomSelfHealSeedBytes/2
+	peak := oomSelfHealColdCap
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: peak, OOMCount: 1, MaxOOMPeak: peak}, nil
 	}

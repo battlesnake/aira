@@ -757,7 +757,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// no-history fallback hint (DefaultConfineMemoryReserve, or the delegate-ram
 	// overhead) sent to the daemon as a starting point — resolveAdmitReserve
 	// (internal/daemon/admit.go) resolves the real, admission-gating reserve from
-	// peak-RSS history or a machine-wide p90 prior before this job is even
+	// peak-RSS history (or keeps this hint, fitted to the slice) before this job is even
 	// queued, and that resolved figure is what the daemon actually grants. The
 	// client learns it only on the single blocking admit response (deferred
 	// AIRA-24: no mid-wait channel exists to poll it), so while unpinned this
@@ -1842,9 +1842,8 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 		case ConfineCapSourceDaemonReserve:
 			// AIRA-184. Deliberately NOT "from this command's peak-RSS history",
 			// which the previous wording asserted unconditionally and which is false
-			// for the commonest shape here: a cold start capped at the machine-wide
-			// `estimate:p90-prior`, or at a `fallback:` prior, where this command has
-			// no history at all. The trailer's own reserve-basis field, printed
+			// for the commonest shape here: a cold start capped at a `fallback:`
+			// prior, where this command has no history at all. The trailer's own reserve-basis field, printed
 			// directly above this line, says which term produced the number; this
 			// line claims only what every branch of that path has in common — AIRA
 			// chose it, the caller did not.
@@ -2960,8 +2959,7 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 
 // shouldRecordConfinePeak is AIRA-264: the send-gate for a peak-RSS learning
 // sample. AIRA sizes a signature's future memory reserve from the peaks of PAST
-// runs (ConfinePeakHistory -> EstimateMemoryReserve, and the machine-wide
-// ConfinePeakP90 cold-start prior), so a run whose WORKLOAD failed must not move
+// runs (ConfinePeakHistory -> EstimateMemoryReserve), so a run whose WORKLOAD failed must not move
 // a subsequent run's limit: a crash, a non-zero exit, a deadline kill or an
 // operator Ctrl-C says nothing trustworthy about how much memory the command
 // legitimately needs. Exactly two outcomes are trustworthy, and only two:

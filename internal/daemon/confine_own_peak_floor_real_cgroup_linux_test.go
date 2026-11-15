@@ -28,8 +28,8 @@ const ownPeakFloorTargetBytes = int64(1181116006)
 // is "insufficient") and OOM-killed; with the floor it is sized from its own
 // recorded peak and completes.
 //
-// No machine-wide prior is seeded, so the unfloored resolution is the 1 GiB
-// default, exactly as on a box where the p90 read times out (spec §1).
+// The unfloored resolution is the 1 GiB default (spec §1; since AIRA-341 there
+// is no machine-wide prior to differ from it).
 // Reuses the AIRA-128 fixture's workload, slice and headroom.
 //
 // verifies: AIRA-314 I1, T15

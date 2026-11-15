@@ -21,15 +21,14 @@ import (
 //
 // Every test here uses a REAL store: rows written through RecordConfinePeak (or
 // the daemon's own confine-report handler), `server.db = db`, and NO
-// admitPeakHistory / admitPeakP90 seam, so the real readers run. A hand-built
+// admitPeakHistory seam, so the real reader runs. A hand-built
 // seam fixture that omitted MaxCleanPeak would switch the floor off silently.
 //
 // Expected values are literals computed by hand (spec §7), never recomputed by a
 // copy of the algorithm.
 const (
 	ownFloorHint      = int64(1073741824) // the unpinned client default, H
-	ownFloorPriorPeak = int64(1610612736) // the seeded machine-wide p90
-	ownFloorPrior     = int64(1852204646) // p = p90 x 1.15
+	ownFloorOtherPeak = int64(1610612736) // the seeded OTHER signatures' clean peak
 	ownFloorCeiling   = int64(8589934592) // 8 GiB
 	ownFloorFit       = int64(7469508340) // FIT(8 GiB)
 
@@ -45,12 +44,13 @@ type ownFloorRow struct {
 	oom  bool
 }
 
-// ownFloorServer builds a FRESH store and a FRESH server (fresh p90 cache) per
-// call, so one cell's rows can never move another cell's machine-wide p90.
-// withPrior seeds ten other signatures with three 1.5 GiB clean rows each, which
-// the real ConfinePeakP90 turns into the prior p. Rows are written in order, one
-// second apart, under the signature "target".
-func ownFloorServer(t *testing.T, withPrior bool, rows ...ownFloorRow) (*Server, *store.DB) {
+// ownFloorServer builds a FRESH store and a FRESH server per call, so one cell's
+// rows can never reach another cell. withOthers seeds ten OTHER signatures with
+// three 1.5 GiB clean rows each: before AIRA-341 the real store turned them into
+// the machine-wide p90 prior; now they pin that other commands' history never
+// sizes "target". Rows are written in order, one second apart, under the
+// signature "target".
+func ownFloorServer(t *testing.T, withOthers bool, rows ...ownFloorRow) (*Server, *store.DB) {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := store.OpenDB(filepath.Join(dir, "state.db"), filepath.Join(dir, "registry.jsonl"))
@@ -60,10 +60,10 @@ func ownFloorServer(t *testing.T, withPrior bool, rows ...ownFloorRow) (*Server,
 	t.Cleanup(func() { _ = db.Close() })
 	ctx := context.Background()
 	base := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
-	if withPrior {
+	if withOthers {
 		for signature := 0; signature < 10; signature++ {
 			for sample := 0; sample < 3; sample++ {
-				peak := ownFloorPriorPeak
+				peak := ownFloorOtherPeak
 				if err := db.RecordConfinePeak(ctx, store.ResourcePeakObservation{
 					Kind: store.ResourcePeakKindConfine, Signature: fmt.Sprintf("prior-%d", signature),
 					Peak: &peak, At: base.Add(time.Duration(signature*10+sample) * time.Second),
@@ -133,27 +133,30 @@ type ownFloorWant struct {
 //
 // verifies: AIRA-314 I1, I2, I3, I4, I5, I6; T1
 func TestOwnPeakFloorTable(t *testing.T) {
-	p, h := ownFloorPrior, ownFloorHint
+	h := ownFloorHint
 	classes := []struct {
 		name string
 		peak int64
 	}{{"below", ownFloorBelow}, {"above", ownFloorAbove}, {"over-ceiling", ownFloorOver}}
 
 	t.Run("n=0", func(t *testing.T) {
+		// AIRA-341: with no machine-wide prior, zero samples get the unpinned
+		// default under the post-block fallback that names why.
 		for _, test := range []struct {
-			name string
-			rows []ownFloorRow
+			name  string
+			rows  []ownFloorRow
+			basis string
 		}{
-			{"no rows", nil},
-			{"one row with no peak", []ownFloorRow{{}}},
-			{"one OOM row with no peak", []ownFloorRow{{oom: true}}},
+			{"no rows", nil, "fallback:no-history"},
+			{"one row with no peak", []ownFloorRow{{}}, "fallback:insufficient-samples"},
+			{"one OOM row with no peak", []ownFloorRow{{oom: true}}, "fallback:insufficient-samples"},
 		} {
 			t.Run(test.name, func(t *testing.T) {
 				server, _ := ownFloorServer(t, true, test.rows...)
 				reserve, basis := ownFloorResolve(t, server, ownFloorCeiling)
-				if reserve != p || basis != "estimate:p90-prior" {
-					t.Fatalf("reserve=%d basis=%q, want %d/%q — zero samples must be byte-identical to today (I4)",
-						reserve, basis, p, "estimate:p90-prior")
+				if reserve != h || basis != test.basis {
+					t.Fatalf("reserve=%d basis=%q, want %d/%q — zero samples are sized by no floor (I4)",
+						reserve, basis, h, test.basis)
 				}
 			})
 		}
@@ -176,8 +179,8 @@ func TestOwnPeakFloorTable(t *testing.T) {
 	}
 	grid := map[string]map[int][3]ownFloorWant{
 		"clean": {
-			1:  {{p, "estimate:p90-prior"}, {3389617971, ownMax(ownFloorAbove, 1, false)}, {9261023232, ownMax(ownFloorOver, 1, false)}},
-			2:  {{p, "estimate:p90-prior"}, {3389617971, ownMax(ownFloorAbove, 2, false)}, {9261023232, ownMax(ownFloorOver, 2, false)}},
+			1:  {{h, "fallback:insufficient-samples"}, {3389617971, ownMax(ownFloorAbove, 1, false)}, {9261023232, ownMax(ownFloorOver, 1, false)}},
+			2:  {{h, "fallback:insufficient-samples"}, {3389617971, ownMax(ownFloorAbove, 2, false)}, {9261023232, ownMax(ownFloorOver, 2, false)}},
 			3:  {{602931200, estMax(ownFloorBelow, 3, false)}, {3389617971, estMax(ownFloorAbove, 3, false)}, {9261023232, estMax(ownFloorOver, 3, false)}},
 			20: {{602931200, estMax(ownFloorBelow, 20, false)}, {3389617971, estMax(ownFloorAbove, 20, false)}, {9261023232, estMax(ownFloorOver, 20, false)}},
 		},
@@ -190,7 +193,7 @@ func TestOwnPeakFloorTable(t *testing.T) {
 		"mixed": {
 			// n=1 mixed: the OOM row has no peak, so the OOM branch is not entered
 			// and the basis carries NO ,oom-on-record.
-			1:  {{p, "estimate:p90-prior"}, {3389617971, ownMax(ownFloorAbove, 1, false)}, {9261023232, ownMax(ownFloorOver, 1, false)}},
+			1:  {{h, "fallback:insufficient-samples"}, {3389617971, ownMax(ownFloorAbove, 1, false)}, {9261023232, ownMax(ownFloorOver, 1, false)}},
 			2:  {{h, "fallback:insufficient-samples:n=2,oom-on-record"}, {3389617971, ownMax(ownFloorAbove, 2, true)}, {9261023232, ownMax(ownFloorOver, 2, true)}},
 			3:  {{602931200, estMax(ownFloorBelow, 3, true)}, {3389617971, estMax(ownFloorAbove, 3, true)}, {9261023232, estMax(ownFloorOver, 3, true)}},
 			20: {{602931200, estMax(ownFloorBelow, 20, true)}, {3389617971, estMax(ownFloorAbove, 20, true)}, {9261023232, estMax(ownFloorOver, 20, true)}},
@@ -279,10 +282,12 @@ func TestOwnPeakFloorTable(t *testing.T) {
 			want: ownFloorWant{8643621683, "estimate:own-max=7516192768,n=3,f=115,oom-on-record"},
 		},
 		{
-			// F == p exactly: the strict tie-break keeps today's basis.
-			name: "X7 tie keeps the prior's basis",
-			rows: []ownFloorRow{{peak: ownFloorPriorPeak}},
-			want: ownFloorWant{ownFloorPrior, "estimate:p90-prior"},
+			// F == H exactly (933688543 + floor(933688543 x 15 / 100) =
+			// 1073741824): the strict tie-break keeps the default's basis. Until
+			// AIRA-341 this cell tied F with the machine-wide prior instead.
+			name: "X7 tie keeps the default's basis",
+			rows: []ownFloorRow{{peak: 933688543}},
+			want: ownFloorWant{ownFloorHint, "fallback:insufficient-samples"},
 		},
 		{
 			name:   "X8 pinned is untouched",
@@ -351,22 +356,11 @@ func TestOwnPeakFloorBeatsAnEscalationBelowTheCleanPeak(t *testing.T) {
 // verifies: AIRA-314 I6; T4
 func TestOwnPeakFloorReplacesAFittedPrior(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		withPrior bool
-		ceiling   int64
-		rows      []ownFloorRow
-		want      ownFloorWant
+		name    string
+		ceiling int64
+		rows    []ownFloorRow
+		want    ownFloorWant
 	}{
-		{
-			// Control: no own clean peak, so today's fitted p90 prior stands.
-			name: "SITE 2 control, no clean row", withPrior: true, ceiling: 1610612736,
-			want: ownFloorWant{1400532813, "estimate:p90-prior,ceiling-fitted"},
-		},
-		{
-			name: "SITE 2 fitted p90 prior", withPrior: true, ceiling: 1610612736,
-			rows: []ownFloorRow{{peak: 1288490188}},
-			want: ownFloorWant{1481763716, "estimate:own-max=1288490188,n=1,f=115"},
-		},
 		{
 			// Control: a clean peak whose F loses to the fitted default keeps the
 			// fitted basis byte-for-byte.
@@ -381,7 +375,7 @@ func TestOwnPeakFloorReplacesAFittedPrior(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			server, _ := ownFloorServer(t, test.withPrior, test.rows...)
+			server, _ := ownFloorServer(t, false, test.rows...)
 			reserve, basis := ownFloorResolve(t, server, test.ceiling)
 			if reserve != test.want.reserve || basis != test.want.basis {
 				t.Fatalf("reserve=%d basis=%q, want %d/%q", reserve, basis, test.want.reserve, test.want.basis)
@@ -550,9 +544,9 @@ func TestHintEligibleRunFloorsTheNextUnpinnedReserve(t *testing.T) {
 			t.Fatalf("confine-report: %+v", response)
 		}
 	}
-	for _, withPrior := range []bool{false, true} {
-		t.Run(fmt.Sprintf("prior=%v", withPrior), func(t *testing.T) {
-			server, _ := ownFloorServer(t, withPrior)
+	for _, withOthers := range []bool{false, true} {
+		t.Run(fmt.Sprintf("others=%v", withOthers), func(t *testing.T) {
+			server, _ := ownFloorServer(t, withOthers)
 			for runs := 1; runs <= 3; runs++ {
 				report(t, server, hintPeak, true)
 				reserve, basis := ownFloorResolve(t, server, ownFloorCeiling)

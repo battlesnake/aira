@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -23,18 +22,18 @@ import (
 
 // The distinctive phrase of each arm. They are asserted BOTH ways on every row
 // -- the right one present, all the others absent -- so the one-size-fits-all
-// regression this ticket exists to remove fails on four of five rows rather
-// than passing on the one it happens to describe.
+// regression this ticket exists to remove fails on three of four rows rather
+// than passing on the one it happens to describe. (AIRA-341 deleted a fifth arm,
+// the machine-wide p90 prior's.)
 const (
 	pinnedAdvicePhrase   = "was PINNED on the client side"
 	oomAdvicePhrase      = "this command was OOM-killed here"
 	measuredAdvicePhrase = "this command's OWN measured peak history"
-	p90AdvicePhrase      = "machine-wide PRIOR about other commands"
 	blindAdvicePhrase    = "blind default for a command it has not measured"
 )
 
 func allTooLargeAdvicePhrases() []string {
-	return []string{pinnedAdvicePhrase, oomAdvicePhrase, measuredAdvicePhrase, p90AdvicePhrase, blindAdvicePhrase}
+	return []string{pinnedAdvicePhrase, oomAdvicePhrase, measuredAdvicePhrase, blindAdvicePhrase}
 }
 
 // TestTooLargeRefusalAdviceIsCaseSplitByPopulation drives every population that
@@ -42,7 +41,7 @@ func allTooLargeAdvicePhrases() []string {
 // the operator-facing message names both numbers and the basis (unchanged, in
 // every case) AND carries the advice that is actually true of that population.
 //
-// The three AIRA-153 populations are rows 1-3. Rows 4 and 5 are the fourth arm:
+// The three AIRA-153 populations are rows 1-3. Row 4 is the fourth arm:
 // a PRIOR that reaches this refusal because the slice is too small for any
 // viable fitted reserve (FIT below runner.MinPinnedScopeCap, so AIRA-153's fit
 // deliberately does not fire and the honest answer is this refusal). Telling
@@ -61,7 +60,6 @@ func TestTooLargeRefusalAdviceIsCaseSplitByPopulation(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		history      runner.PeakRSSStats
-		p90          int64
 		pinned       bool
 		ceiling      int64
 		wantRequired int64
@@ -111,26 +109,10 @@ func TestTooLargeRefusalAdviceIsCaseSplitByPopulation(t *testing.T) {
 			wantBasis:    "fallback:no-history",
 			wantPhrase:   blindAdvicePhrase,
 		},
-		{
-			// The machine-wide p90 is a prior about OTHER commands, so it gets the
-			// prior's advice despite its `estimate:` family -- the one case where
-			// classifying on the family rather than the term would say the wrong
-			// thing.
-			name:         "the machine-wide p90 prior on a slice too small to fit it",
-			p90:          104857600,
-			ceiling:      degenerateCeiling,
-			wantRequired: 120586240,
-			wantBasis:    "estimate:p90-prior",
-			wantPhrase:   p90AdvicePhrase,
-		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := saturatedServer(t)
 			server.admitPeakHistory = staticPeakHistory(test.history)
-			if test.p90 > 0 {
-				peak := test.p90
-				server.admitPeakP90 = func(context.Context) (int64, bool, error) { return peak, true, nil }
-			}
 			maximum := smallMaximum
 			if test.ceiling != smallCeiling {
 				maximum = test.ceiling + server.admitSliceHeadroom(1)
@@ -238,8 +220,6 @@ func TestTooLargeAdviceIsDecidedByTheTermNotTheTrailingTokens(t *testing.T) {
 		{"pinned:client", pinnedAdvicePhrase},
 		{"estimate:oom-escalated", oomAdvicePhrase},
 		{"estimate:oom-escalated,ceiling-clamped", oomAdvicePhrase},
-		{"estimate:p90-prior", p90AdvicePhrase},
-		{"estimate:p90-prior,ceiling-fitted", p90AdvicePhrase},
 		{"estimate:max=2147483648,n=5,f=115", measuredAdvicePhrase},
 		{"estimate:max=2147483648,n=5,f=115,oom-on-record", measuredAdvicePhrase},
 		{"estimate:oom:max=2147483648,n=5,oom=1,f=115", measuredAdvicePhrase},
@@ -287,8 +267,8 @@ func TestTooLargeAdviceIsDecidedByTheTermNotTheTrailingTokens(t *testing.T) {
 // analysis must cover every population resolveAdmitReserve can ACTUALLY produce,
 // not the three the ticket happened to enumerate.
 //
-// It drives the resolver over the AIRA-153 grid of history shapes, ceilings, p90
-// states and both pinning arms, and asserts that whenever the resolved reserve
+// It drives the resolver over the AIRA-153 grid of history shapes, ceilings
+// and both pinning arms, and asserts that whenever the resolved reserve
 // would be refused (reserve > ceiling), the basis it carries lands on a real arm
 // rather than on the silent default. A new basis spelling that reaches this
 // refusal with no advice fails here rather than shipping a bare number.
@@ -312,25 +292,24 @@ func TestEveryRefusableResolutionGetsAdvice(t *testing.T) {
 	refusals := 0
 	for _, stats := range shapes {
 		for _, ceiling := range ceilings {
-			for _, p90 := range []int64{0, fittedP90Peak} {
-				for _, pinned := range []bool{false, true} {
-					server := fittedServer(t, staticHistory(stats), p90)
-					reserve, basis := server.resolveAdmitReserve(
-						admitRequest{reserve: fittedHint, signature: "sig", pinned: pinned}, ceiling)
-					if reserve <= ceiling {
-						continue
-					}
-					refusals++
-					if tooLargeRefusalAdvice(basis) == "" {
-						t.Fatalf("stats=%+v ceiling=%d p90=%d pinned=%v resolves to %d/%q, which is REFUSED with no advice at all",
-							stats, ceiling, p90, pinned, reserve, basis)
-					}
+			for _, pinned := range []bool{false, true} {
+				server := fittedServer(t, staticHistory(stats))
+				reserve, basis := server.resolveAdmitReserve(
+					admitRequest{reserve: fittedHint, signature: "sig", pinned: pinned}, ceiling)
+				if reserve <= ceiling {
+					continue
+				}
+				refusals++
+				if tooLargeRefusalAdvice(basis) == "" {
+					t.Fatalf("stats=%+v ceiling=%d pinned=%v resolves to %d/%q, which is REFUSED with no advice at all",
+						stats, ceiling, pinned, reserve, basis)
 				}
 			}
 		}
 	}
-	// A grid that stopped producing refusals would pass vacuously.
-	if refusals < 100 {
+	// A grid that stopped producing refusals would pass vacuously. (79 when
+	// AIRA-341 removed the machine-wide-prior axis that used to double the grid.)
+	if refusals < 70 {
 		t.Fatalf("only %d refusable resolutions in the grid; the fixture no longer exercises the population this advice exists for", refusals)
 	}
 }

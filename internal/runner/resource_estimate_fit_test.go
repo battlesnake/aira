@@ -9,8 +9,8 @@ import (
 //
 // SliceFittedReserve is the ONE number AIRA-153 uses wherever the daemon sizes a
 // value for ITSELF against a slice admission ceiling — the client's unpinned
-// prior, the machine-wide p90 prior, and AIRA-151's OOM-escalation clamp. Every
-// property the three call sites rely on is asserted here rather than at those
+// prior and AIRA-151's OOM-escalation clamp (a third, the machine-wide p90
+// prior, was deleted by AIRA-341). Every property the call sites rely on is asserted here rather than at those
 // sites, because they are properties of the quantity and not of any one use:
 //
 //   - it is the INVERSE of the estimator's own 15% growth margin, so no new

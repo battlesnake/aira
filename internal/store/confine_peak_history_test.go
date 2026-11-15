@@ -148,33 +148,3 @@ func TestResourcePeakHistoryReportsTheLargestCleanPeak(t *testing.T) {
 		}
 	})
 }
-
-func TestConfinePeakP90UsesPeakMaxAcrossUsableSignatures(t *testing.T) {
-	db := openConfineHistoryTestDB(t)
-	ctx := context.Background()
-	base := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
-	for signatureIndex := 1; signatureIndex <= 10; signatureIndex++ {
-		for sample := 0; sample < 3; sample++ {
-			peak := int64(signatureIndex * 100)
-			if err := db.RecordConfinePeak(ctx, ResourcePeakObservation{
-				Kind: ResourcePeakKindConfine, Signature: string(rune('a' + signatureIndex)), Peak: &peak,
-				At: base.Add(time.Duration(signatureIndex*10+sample) * time.Second),
-			}); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	// This heavy signature has only two usable rows and must not enter the prior.
-	for sample := 0; sample < 2; sample++ {
-		peak := int64(10_000)
-		if err := db.RecordConfinePeak(ctx, ResourcePeakObservation{
-			Kind: ResourcePeakKindConfine, Signature: "insufficient", Peak: &peak, At: base,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	peak, ok, err := db.ConfinePeakP90(ctx)
-	if err != nil || !ok || peak != 900 {
-		t.Fatalf("p90=%d ok=%v err=%v, want nearest-rank 900 (not median 500)", peak, ok, err)
-	}
-}

@@ -11,8 +11,8 @@ import (
 
 // logAdmitHistoryReadFailure (AIRA-332) records why a per-signature history read
 // failed, so an admission sized without its own history (basis
-// fallback:history-unavailable, or the p90 prior; for example the first one
-// after a reboot) can be diagnosed from the journal. It names the signature by a
+// fallback:history-unavailable; for example the first one after a reboot) can
+// be diagnosed from the journal. It names the signature by a
 // short hash, never the argv, which may carry secrets.
 func logAdmitHistoryReadFailure(signature string, elapsed time.Duration, ctxErr, err error) {
 	sum := sha256.Sum256([]byte(signature))

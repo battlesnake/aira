@@ -645,8 +645,8 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 			// the job, and hands over a concrete higher --memory-reserve rather than
 			// leaving the reader to derive one. The old wording additionally claimed
 			// the number came "from this command's peak-RSS history", which is false
-			// for the commonest shape here -- a cold start at the machine-wide
-			// `estimate:p90-prior`, where this command has no history at all.
+			// for the commonest shape here -- a cold start at a `fallback:` prior,
+			// where this command has no history at all.
 			name: "oom against a daemon-resolved reserve names the estimate, the slice cap and a pin", cap: 100, peak: &peak95, oom: true,
 			source: ConfineCapSourceDaemonReserve, sliceCap: 64 << 30, acked: true,
 			want: "confine: job OOM-killed at its memory cap 100 (peak RSS 95); cap-source=auto:daemon-reserve — " +
@@ -963,7 +963,7 @@ func TestOOMAdvisoryNamesTheSliceCapEstablishedAtLaunch(t *testing.T) {
 	// cap-source=auto:daemon-reserve. confineUnitDeps' readCap reports a 64G
 	// slice, which is the figure the advisory must name.
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "immediate", reserve: 96 << 20, basis: "estimate:p90-prior", release: &confineCountingCloser{}}, nil
+		return admissionResult{state: "immediate", reserve: 96 << 20, basis: "fallback:no-history", release: &confineCountingCloser{}}, nil
 	}
 	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
 	// The incident shape: the peak overshoots the estimated cap, and the kill is
@@ -1398,7 +1398,7 @@ func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
 	closer := &confineCountingCloser{}
 	deps := confineUnitDeps(scope)
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
-		return admissionResult{state: "immediate", reserve: 96 << 20, basis: "estimate:p90-prior", release: closer}, nil
+		return admissionResult{state: "immediate", reserve: 96 << 20, basis: "fallback:no-history", release: closer}, nil
 	}
 	var capWritten int64
 	deps.writeScopeMemoryCap = func(_ Scope, maximum, high int64, setOOM bool) error {
@@ -1564,7 +1564,7 @@ func TestConfineDelegateRAMTakesOrdinaryScopeCap(t *testing.T) {
 		deps.admit = func(_ context.Context, _ string, request ConfineRequest, reserve int64) (admissionResult, error) {
 			gotReserve, gotPinned = reserve, request.MemoryReservePinned
 			// An ordinary admitted grant: a history estimate, unpinned.
-			return admissionResult{state: "immediate", reserve: 2 << 30, basis: "estimate:p90-prior", release: closer}, nil
+			return admissionResult{state: "immediate", reserve: 2 << 30, basis: "estimate:max=1867780096,n=3,f=115", release: closer}, nil
 		}
 		var written int64
 		deps.writeScopeMemoryCap = func(_ Scope, maximum, high int64, setOOM bool) error {
@@ -2930,7 +2930,7 @@ func TestConfineAdmissionWaitDiagnosticHedgesUnpinnedReserve(t *testing.T) {
 	deps.admitWaitDiagInterval = 5 * time.Millisecond
 	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
 		<-proceed
-		return admissionResult{state: "waited", reserve: 232 << 20, basis: "estimate:p90-prior"}, nil
+		return admissionResult{state: "waited", reserve: 232 << 20, basis: "fallback:no-history"}, nil
 	}
 	done := make(chan struct{})
 	go func() {

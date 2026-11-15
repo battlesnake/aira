@@ -17,11 +17,9 @@ const confinePeakHistoryLimit = 20
 // AIRA-180 Decision 1. The discriminator is a COLUMN rather than a signature
 // prefix because a prefix is a convention a signature can in principle collide
 // with — a ResourceSignature for a one-element argv contains no NUL separator
-// (runner.ResourceSignature) — whereas a column cannot collide. It is not
-// polish: ConfinePeakP90 scans this table with no per-signature filter and its
-// answer feeds LIVE admission for every job with no history of its own, so
-// unnamespaced aitest worker rows (hundreds of small capped workers) would
-// silently drag the machine-wide admission prior down.
+// (runner.ResourceSignature) — whereas a column cannot collide. Every reader
+// filters on it: ConfinePeakHistory, which sizes live admission, reads only its
+// own kind.
 type ResourcePeakKind string
 
 const (
@@ -219,44 +217,6 @@ FROM confine_peak_history WHERE kind=? AND signature=?`, string(kind), signature
 		return runner.PeakRSSStats{}, translateDBError(err)
 	}
 	return stats, nil
-}
-
-// ConfinePeakP90 returns the nearest-rank p90 of per-signature peak maxima,
-// considering only CONFINE signatures with at least three usable observations.
-//
-// The kind filter is load-bearing rather than tidy: this answer is the
-// machine-wide prior live admission uses for a job with no history of its own,
-// so an aitest worker row entering it would be a behaviour change to the
-// admission path arriving through a report-only feature.
-func (db *DB) ConfinePeakP90(ctx context.Context) (int64, bool, error) {
-	if db == nil || db.db == nil {
-		return 0, false, errors.New("E_DAEMON_UNAVAILABLE: state database is unavailable")
-	}
-	rows, err := db.db.QueryContext(ctx, `SELECT MAX(peak_rss) AS peak_max
-FROM confine_peak_history WHERE kind=? AND peak_rss>0 GROUP BY signature HAVING COUNT(peak_rss)>=3
-ORDER BY peak_max ASC`, string(ResourcePeakKindConfine))
-	if err != nil {
-		return 0, false, translateDBError(err)
-	}
-	defer rows.Close()
-	var peaks []int64
-	for rows.Next() {
-		var peak sql.NullInt64
-		if err := rows.Scan(&peak); err != nil {
-			return 0, false, translateDBError(err)
-		}
-		if peak.Valid && peak.Int64 > 0 {
-			peaks = append(peaks, peak.Int64)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return 0, false, translateDBError(err)
-	}
-	if len(peaks) == 0 {
-		return 0, false, nil
-	}
-	index := (9*len(peaks)+9)/10 - 1
-	return peaks[index], true, nil
 }
 
 // ResourceBudgetSample is one persisted row as the classifier sees it. Every

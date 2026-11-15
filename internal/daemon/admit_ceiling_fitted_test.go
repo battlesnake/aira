@@ -13,8 +13,8 @@ import (
 
 // AIRA-153. ONE quantity -- the largest reserve the slice can actually GRANT one
 // job -- bounds every value resolveAdmitReserve sizes for ITSELF against the
-// admission ceiling: the client's unpinned prior, the machine-wide p90 prior,
-// and AIRA-151's OOM-escalation clamp.
+// admission ceiling: the client's unpinned prior and AIRA-151's OOM-escalation
+// clamp. (A third site, the machine-wide p90 prior, was deleted by AIRA-341.)
 //
 // The figures below are the plan's §0.1 table and are exact, not approximate.
 // FIT(c) = floor(100c/115), the inverse of the estimator's own 15% margin.
@@ -27,31 +27,18 @@ const (
 	fittedInstallCeiling = int64(4227858432)
 	fittedInstallFit     = int64(3676398636)
 	// The unpinned client hint every confine job carries.
-	fittedHint = runner.DefaultConfineMemoryReserve // 4294967296
-	// The machine-wide p90 prior built from a 4 GiB peak: EstimateMemoryReserve
-	// of PeakRSSStats{TotalCount:3, SampleCount:3, PeakMax: 4 GiB}.
-	fittedP90Peak  = int64(4294967296)
-	fittedP90Prior = int64(4939212390)
+	fittedHint = runner.DefaultConfineMemoryReserve
 )
 
 // fittedServer is a server whose reserve resolution is entirely the test's: the
-// per-signature history and the machine-wide p90 are both injected, so every row
-// below states exactly which route it drives.
-//
-// A nil `read` models the shape where no history reader exists at all; a p90 of
-// 0 models "no machine-wide prior", which is what makes the four post-block
-// fallbacks reachable.
-func fittedServer(t *testing.T, read func(context.Context, string) (runner.PeakRSSStats, error), p90 int64) *Server {
+// per-signature history is injected, so every row below states exactly which
+// route it drives. A nil `read` models the shape where no history reader exists
+// at all.
+func fittedServer(t *testing.T, read func(context.Context, string) (runner.PeakRSSStats, error)) *Server {
 	t.Helper()
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
 	server.admitPeakHistory = read
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) {
-		if p90 <= 0 {
-			return 0, false, nil
-		}
-		return p90, true, nil
-	}
 	return server
 }
 
@@ -59,40 +46,38 @@ func staticHistory(stats runner.PeakRSSStats) func(context.Context, string) (run
 	return func(context.Context, string) (runner.PeakRSSStats, error) { return stats, nil }
 }
 
-// fittedPriorRoute is one of the seven ways an auto-sized PRIOR can reach the
-// ceiling boundary. Six carry the client's own unpinned hint; the seventh is the
-// machine-wide p90.
+// fittedPriorRoute is one of the six ways an auto-sized PRIOR can reach the
+// ceiling boundary. All six carry the client's own unpinned hint (a seventh, the
+// machine-wide p90, was deleted by AIRA-341).
 type fittedPriorRoute struct {
 	name      string
 	signature string
 	read      func(context.Context, string) (runner.PeakRSSStats, error)
-	p90       int64
 	basis     string
-	// prior is what this route returns when the ceiling is above it: the client
-	// hint for six of them, the p90's own estimate for the seventh.
+	// prior is what this route returns when the ceiling is above it.
 	prior int64
 }
 
 func fittedClientHintRoutes() []fittedPriorRoute {
 	return []fittedPriorRoute{
 		{
-			name: "fallback:no-signature", signature: "", read: nil, p90: 0,
+			name: "fallback:no-signature", signature: "", read: nil,
 			basis: "fallback:no-signature", prior: fittedHint,
 		},
 		{
-			name: "fallback:history-unavailable", signature: "sig", p90: 0,
+			name: "fallback:history-unavailable", signature: "sig",
 			read: func(context.Context, string) (runner.PeakRSSStats, error) {
 				return runner.PeakRSSStats{}, errors.New("history read timed out")
 			},
 			basis: "fallback:history-unavailable", prior: fittedHint,
 		},
 		{
-			name: "fallback:insufficient-samples", signature: "sig", p90: 0,
+			name: "fallback:insufficient-samples", signature: "sig",
 			read:  staticHistory(runner.PeakRSSStats{TotalCount: 2, SampleCount: 2, PeakMax: 1 << 20}),
 			basis: "fallback:insufficient-samples", prior: fittedHint,
 		},
 		{
-			name: "fallback:no-history", signature: "sig", p90: 0,
+			name: "fallback:no-history", signature: "sig",
 			read:  staticHistory(runner.PeakRSSStats{}),
 			basis: "fallback:no-history", prior: fittedHint,
 		},
@@ -100,7 +85,7 @@ func fittedClientHintRoutes() []fittedPriorRoute {
 			// The SampleCount>=3 `!ok` return inside the history block -- a fifth
 			// site the hint escapes through, and one no other test drives against a
 			// small ceiling.
-			name: "fallback:malformed (the SampleCount>=3 !ok return)", signature: "sig", p90: 0,
+			name: "fallback:malformed (the SampleCount>=3 !ok return)", signature: "sig",
 			read:  staticHistory(runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 0}),
 			basis: "fallback:malformed", prior: fittedHint,
 		},
@@ -108,7 +93,7 @@ func fittedClientHintRoutes() []fittedPriorRoute {
 			// The OOM branch's rows (d)/(e): one sample, so no usable ordinary
 			// estimate, and a 1.5x escalation (84541440) far below the hint. This is
 			// the normal state immediately after a first OOM.
-			name: "fallback:insufficient-samples:n=1,oom-on-record", signature: "sig", p90: 0,
+			name: "fallback:insufficient-samples:n=1,oom-on-record", signature: "sig",
 			read: staticHistory(runner.PeakRSSStats{
 				TotalCount: 1, SampleCount: 1, PeakMax: 56360960, OOMCount: 1, MaxOOMPeak: 56360960,
 			}),
@@ -117,20 +102,12 @@ func fittedClientHintRoutes() []fittedPriorRoute {
 	}
 }
 
-func fittedP90Route() fittedPriorRoute {
-	return fittedPriorRoute{
-		name: "estimate:p90-prior", signature: "novel",
-		read: staticHistory(runner.PeakRSSStats{}), p90: fittedP90Peak,
-		basis: "estimate:p90-prior", prior: fittedP90Prior,
-	}
-}
-
 // TestEveryUnpinnedPriorAtOrOverTheCeilingIsFittedAndSaysSo is AIRA-153 T2.
 //
 // A PRIOR is a number with no relationship to this command or to this slice: the
-// compiled-in unpinned default runner.ResolveConfineReserve hands the daemon, and
-// the machine-wide p90 built from OTHER commands' peaks. Both are bounded by the
-// slice they are about to be admitted into; neither is bounded anywhere today, so
+// compiled-in unpinned default runner.ResolveConfineReserve hands the daemon. It
+// is bounded by the slice it is about to be admitted into; before AIRA-153 it was
+// not bounded anywhere, so
 // on any slice whose ceiling is at or below the 4 GiB default EVERY unpinned
 // confine job is refused E_ADMIT_TOO_LARGE at request entry -- including on a
 // DEFAULT `aira install` of an ordinary 8 GiB box (plan §1.2).
@@ -146,12 +123,12 @@ func fittedP90Route() fittedPriorRoute {
 func TestEveryUnpinnedPriorAtOrOverTheCeilingIsFittedAndSaysSo(t *testing.T) {
 	nonWhitespace := regexp.MustCompile(`^\S+$`)
 
-	routes := append(fittedClientHintRoutes(), fittedP90Route())
+	routes := fittedClientHintRoutes()
 
 	t.Run("fitted at a ceiling below the prior", func(t *testing.T) {
 		for _, route := range routes {
 			t.Run(route.name, func(t *testing.T) {
-				server := fittedServer(t, route.read, route.p90)
+				server := fittedServer(t, route.read)
 				reserve, basis := server.resolveAdmitReserve(
 					admitRequest{reserve: fittedHint, signature: route.signature}, fittedSmallCeiling)
 				if reserve != fittedSmallFit {
@@ -169,13 +146,11 @@ func TestEveryUnpinnedPriorAtOrOverTheCeilingIsFittedAndSaysSo(t *testing.T) {
 		}
 	})
 
-	// THE GATE (plan F3). Each route is taken at its OWN prior, because the two
-	// priors are different numbers and one shared ceiling could not put both on
-	// the boundary.
+	// THE GATE (plan F3). Each route is taken at its OWN prior.
 	t.Run("a prior that already fits is untouched", func(t *testing.T) {
-		for _, route := range append(fittedClientHintRoutes(), fittedP90Route()) {
+		for _, route := range fittedClientHintRoutes() {
 			t.Run(route.name, func(t *testing.T) {
-				server := fittedServer(t, route.read, route.p90)
+				server := fittedServer(t, route.read)
 				reserve, basis := server.resolveAdmitReserve(
 					admitRequest{reserve: fittedHint, signature: route.signature}, route.prior+1)
 				if reserve != route.prior || basis != route.basis {
@@ -187,9 +162,9 @@ func TestEveryUnpinnedPriorAtOrOverTheCeilingIsFittedAndSaysSo(t *testing.T) {
 	})
 
 	t.Run("the >= boundary fits", func(t *testing.T) {
-		for _, route := range append(fittedClientHintRoutes(), fittedP90Route()) {
+		for _, route := range fittedClientHintRoutes() {
 			t.Run(route.name, func(t *testing.T) {
-				server := fittedServer(t, route.read, route.p90)
+				server := fittedServer(t, route.read)
 				// A ceiling exactly equal to the prior: admissible today, but
 				// grantable only inside AIRA-150's residual band, so it is fitted
 				// strictly below rather than left on the ceiling.
@@ -226,7 +201,7 @@ func TestCeilingFittedNamesOnlyAPriorAndNeverAppearsBesideCeilingClamped(t *test
 		// the slice has, and the honest answer is the terminal refusal naming both
 		// numbers -- not a silently reduced cap.
 		server := fittedServer(t, staticHistory(
-			runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 2147483648}), 0)
+			runner.PeakRSSStats{TotalCount: 5, SampleCount: 5, PeakMax: 2147483648}))
 		reserve, basis := server.resolveAdmitReserve(
 			admitRequest{reserve: fittedHint, signature: "sig"}, fittedSmallCeiling)
 		if reserve != 2469606195 {
@@ -265,7 +240,7 @@ func TestCeilingFittedNamesOnlyAPriorAndNeverAppearsBesideCeilingClamped(t *test
 				server := fittedServer(t, staticHistory(runner.PeakRSSStats{
 					TotalCount: 1, SampleCount: 1, PeakMax: test.maxOOMPeak,
 					OOMCount: 1, MaxOOMPeak: test.maxOOMPeak,
-				}), 0)
+				}))
 				reserve, basis := server.resolveAdmitReserve(
 					admitRequest{reserve: fittedHint, signature: "sig"}, test.ceiling)
 				if reserve != test.want || basis != test.basis {
@@ -302,39 +277,37 @@ func TestCeilingFittedNamesOnlyAPriorAndNeverAppearsBesideCeilingClamped(t *test
 		ownMaxRows, ownMaxOOMRows := 0, 0
 		for _, stats := range shapes {
 			for _, ceiling := range ceilings {
-				for _, p90 := range []int64{0, fittedP90Peak} {
-					server := fittedServer(t, staticHistory(stats), p90)
-					_, basis := server.resolveAdmitReserve(
-						admitRequest{reserve: fittedHint, signature: "sig"}, ceiling)
-					if strings.Contains(basis, ",ceiling-fitted") && strings.Contains(basis, ",ceiling-clamped") {
-						t.Fatalf("stats=%+v ceiling=%d basis=%q carries BOTH tokens; they partition cleanly by construction",
-							stats, ceiling, basis)
+				server := fittedServer(t, staticHistory(stats))
+				_, basis := server.resolveAdmitReserve(
+					admitRequest{reserve: fittedHint, signature: "sig"}, ceiling)
+				if strings.Contains(basis, ",ceiling-fitted") && strings.Contains(basis, ",ceiling-clamped") {
+					t.Fatalf("stats=%+v ceiling=%d basis=%q carries BOTH tokens; they partition cleanly by construction",
+						stats, ceiling, basis)
+				}
+				if strings.Contains(basis, ",ceiling-fitted") && strings.HasPrefix(basis, "estimate:max=") {
+					t.Fatalf("stats=%+v ceiling=%d basis=%q fits an ORDINARY estimate; a measurement is never silently reduced (I2)",
+						stats, ceiling, basis)
+				}
+				if strings.Contains(basis, ",ceiling-fitted") && strings.Contains(basis, "oom-escalated") {
+					t.Fatalf("stats=%+v ceiling=%d basis=%q fits an escalation-determined value", stats, ceiling, basis)
+				}
+				// AIRA-314 I6: a floor win is neither the fitted prior nor the
+				// clamp, and names an OOM record only under the OOM branch's own
+				// entry condition.
+				if strings.HasPrefix(basis, "estimate:own-max=") {
+					ownMaxRows++
+					if strings.Contains(basis, ",ceiling-fitted") || strings.Contains(basis, ",ceiling-clamped") {
+						t.Fatalf("stats=%+v ceiling=%d basis=%q: a floor win carries a fit/clamp token", stats, ceiling, basis)
 					}
-					if strings.Contains(basis, ",ceiling-fitted") && strings.HasPrefix(basis, "estimate:max=") {
-						t.Fatalf("stats=%+v ceiling=%d basis=%q fits an ORDINARY estimate; a measurement is never silently reduced (I2)",
-							stats, ceiling, basis)
+					if strings.Contains(basis, ",oom-on-record") != (stats.OOMCount > 0 && stats.MaxOOMPeak > 0) {
+						t.Fatalf("stats=%+v ceiling=%d basis=%q: ,oom-on-record must appear iff OOMCount > 0 && MaxOOMPeak > 0", stats, ceiling, basis)
 					}
-					if strings.Contains(basis, ",ceiling-fitted") && strings.Contains(basis, "oom-escalated") {
-						t.Fatalf("stats=%+v ceiling=%d basis=%q fits an escalation-determined value", stats, ceiling, basis)
+					if strings.Contains(basis, ",oom-on-record") {
+						ownMaxOOMRows++
 					}
-					// AIRA-314 I6: a floor win is neither the fitted prior nor the
-					// clamp, and names an OOM record only under the OOM branch's own
-					// entry condition.
-					if strings.HasPrefix(basis, "estimate:own-max=") {
-						ownMaxRows++
-						if strings.Contains(basis, ",ceiling-fitted") || strings.Contains(basis, ",ceiling-clamped") {
-							t.Fatalf("stats=%+v ceiling=%d basis=%q: a floor win carries a fit/clamp token", stats, ceiling, basis)
-						}
-						if strings.Contains(basis, ",oom-on-record") != (stats.OOMCount > 0 && stats.MaxOOMPeak > 0) {
-							t.Fatalf("stats=%+v ceiling=%d basis=%q: ,oom-on-record must appear iff OOMCount > 0 && MaxOOMPeak > 0", stats, ceiling, basis)
-						}
-						if strings.Contains(basis, ",oom-on-record") {
-							ownMaxOOMRows++
-						}
-					}
-					if !nonWhitespace.MatchString(basis) {
-						t.Fatalf("basis=%q contains whitespace", basis)
-					}
+				}
+				if !nonWhitespace.MatchString(basis) {
+					t.Fatalf("basis=%q contains whitespace", basis)
 				}
 			}
 		}
@@ -347,9 +320,8 @@ func TestCeilingFittedNamesOnlyAPriorAndNeverAppearsBesideCeilingClamped(t *test
 }
 
 // masterAdmitReserve is master's resolveAdmitReserve for the shapes T4 drives:
-// an unpinned request with a signature and a readable history, with the
-// machine-wide prior unavailable so the four post-block fallbacks return the
-// hint verbatim. It is a transcription of the SHIPPED formula (admit.go's OOM
+// an unpinned request with a signature and a readable history, so the four
+// post-block fallbacks return the hint verbatim. It is a transcription of the SHIPPED formula (admit.go's OOM
 // branch and its clamp as AIRA-151 left them), kept here so I3 is checked
 // against master rather than against a restatement of the new code.
 func masterAdmitReserve(stats runner.PeakRSSStats, hint, ceiling int64) int64 {
@@ -463,7 +435,7 @@ func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 		}
 		for _, ceiling := range ceilings {
 			for _, hint := range hints {
-				server := fittedServer(t, staticHistory(stats), 0)
+				server := fittedServer(t, staticHistory(stats))
 				got, basis := server.resolveAdmitReserve(
 					admitRequest{reserve: hint, signature: "sig"}, ceiling)
 				master := masterAdmitReserve(stats, hint, ceiling)
@@ -523,7 +495,7 @@ func TestNoAdmissibleResolutionIsLargerThanMasters(t *testing.T) {
 	for _, stats := range exemptMalformedShapes {
 		for _, ceiling := range ceilings {
 			for _, hint := range hints {
-				server := fittedServer(t, staticHistory(stats), 0)
+				server := fittedServer(t, staticHistory(stats))
 				got, basis := server.resolveAdmitReserve(
 					admitRequest{reserve: hint, signature: "sig"}, ceiling)
 				master := masterAdmitReserve(stats, hint, ceiling)
@@ -585,7 +557,7 @@ func TestTheAcceptedR3BandReturnsMoreThanMasterAndIsRefused(t *testing.T) {
 				TotalCount: 1, SampleCount: 1, PeakMax: test.maxOOMPeak,
 				OOMCount: 1, MaxOOMPeak: test.maxOOMPeak,
 			}
-			server := fittedServer(t, staticHistory(stats), 0)
+			server := fittedServer(t, staticHistory(stats))
 			got, basis := server.resolveAdmitReserve(
 				admitRequest{reserve: fittedHint, signature: "sig"}, test.ceiling)
 			master := masterAdmitReserve(stats, fittedHint, test.ceiling)
@@ -638,7 +610,7 @@ func TestFittingNeverTouchesAPinnedRequest(t *testing.T) {
 			}
 			server := fittedServer(t, staticHistory(runner.PeakRSSStats{
 				TotalCount: 1, SampleCount: 1, PeakMax: 56360960, OOMCount: 1, MaxOOMPeak: 56360960,
-			}), fittedP90Peak)
+			}))
 			got, basis := server.resolveAdmitReserve(
 				admitRequest{reserve: reserve, signature: "sig", pinned: true}, fittedSmallCeiling)
 			if got != test.want || basis != "pinned:client" {
@@ -701,7 +673,7 @@ func TestTheOOMClampTargetsWhatTheSliceCanGrantNotTheCeiling(t *testing.T) {
 					server := fittedServer(t, staticHistory(runner.PeakRSSStats{
 						TotalCount: 1, SampleCount: 1, PeakMax: test.maxOOMPeak,
 						OOMCount: 1, MaxOOMPeak: test.maxOOMPeak,
-					}), 0)
+					}))
 					reserve, basis := server.resolveAdmitReserve(
 						admitRequest{reserve: fittedHint, signature: "sig"}, fixture.ceiling)
 					if reserve != test.want || basis != test.basis {
@@ -733,7 +705,7 @@ func TestTheOOMClampTargetsWhatTheSliceCanGrantNotTheCeiling(t *testing.T) {
 				}
 				server := fittedServer(t, staticHistory(runner.PeakRSSStats{
 					TotalCount: 1, SampleCount: 1, PeakMax: peak, OOMCount: 1, MaxOOMPeak: peak,
-				}), 0)
+				}))
 				reserve, basis := server.resolveAdmitReserve(
 					admitRequest{reserve: fittedHint, signature: "sig"}, ceiling)
 				if !strings.Contains(basis, ",ceiling-clamped") {

@@ -45,9 +45,11 @@ import (
 //
 // The two runs deliberately differ in ONE thing -- who chose the cap:
 //
-//	AUTO     : unpinned, no flags. The daemon resolves the cap from history
-//	           (here the machine-wide p90 prior), which is below what the
-//	           workload needs, and the kernel kills it.
+//	AUTO     : unpinned, no flags. The daemon resolves the cap from this
+//	           command's own history (three earlier clean runs of the same
+//	           argv with a smaller input), which is below what the workload
+//	           now needs, and the kernel kills it. (Until AIRA-341 the seeds
+//	           built a machine-wide prior under another signature instead.)
 //	OPERATOR : the same workload under an explicit --memory-max the caller
 //	           typed, also below what the workload needs, killed the same way.
 //
@@ -102,11 +104,13 @@ func TestOOMTrailerDistinguishesAnEstimatedCapFromAnOperatorSuppliedOne(t *testi
 		return oomSelfHealRun{result: result, err: err, stdout: stdout.String(), stderr: stderr.String()}
 	}
 
-	// Establish a machine-wide p90 prior the way a real box does: by running
-	// things. Without it an unpinned cold start has no resolvable reserve at all
-	// and the AUTO leg below would never reach a daemon-chosen cap.
+	// Give the AUTO leg's own signature a history the way a real box does: by
+	// running it. Three clean runs of the SAME argv with a smaller input (the
+	// workload size travels in the environment, not the argv) make the daemon's
+	// estimate for that signature about 1.15x their peak, well below what the
+	// AUTO leg's larger input then needs.
 	for i := 0; i < 3; i++ {
-		seed := run("cap-source-seed", capSourceSeedBytes, 128<<20, 0)
+		seed := run("cap-source-auto", capSourceSeedBytes, 128<<20, 0)
 		if seed.err != nil {
 			cgrouptest.SkipOrFailRealCgroup(t, "seeding confine run %d unavailable: %v (stderr %q)", i, seed.err, seed.stderr)
 		}
@@ -114,13 +118,9 @@ func TestOOMTrailerDistinguishesAnEstimatedCapFromAnOperatorSuppliedOne(t *testi
 			t.Fatalf("seed run %d: exit=%d stdout=%q stderr=%q, want a completed workload", i, seed.result.Exit, seed.stdout, seed.stderr)
 		}
 	}
-	server.admitPriorMu.Lock()
-	server.admitPriorAt = time.Time{}
-	server.admitPriorMu.Unlock()
-
 	// --- the AUTO leg -------------------------------------------------------
-	// Runs FIRST, and under its own signature token, so no observation made by
-	// the operator leg below can have influenced the cap it is given.
+	// Runs before the operator legs, and under its own signature token, so no
+	// observation made by them can have influenced the cap it is given.
 	auto := run("cap-source-auto", capSourceTargetBytes, 0, 0)
 	if auto.err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "auto-capped confine run unavailable: %v (stderr %q)", auto.err, auto.stderr)
@@ -132,6 +132,9 @@ func TestOOMTrailerDistinguishesAnEstimatedCapFromAnOperatorSuppliedOne(t *testi
 	if auto.result.Status.ScopeMemoryCapSource != runner.ConfineCapSourceDaemonReserve {
 		t.Fatalf("auto leg cap-source=%q (cap=%d reserve-basis=%q), want %q — an AIRA-chosen cap reported as anything else sends the reader after a flag they never set",
 			auto.result.Status.ScopeMemoryCapSource, auto.result.Status.ScopeMemoryMax, auto.result.Status.ReserveBasis, runner.ConfineCapSourceDaemonReserve)
+	}
+	if !strings.HasPrefix(auto.result.Status.ReserveBasis, "estimate:max=") {
+		t.Fatalf("auto leg reserve-basis=%q, want this command's own estimate — the seeds did not size it", auto.result.Status.ReserveBasis)
 	}
 	if runner.ConfineCapSourceIsOperator(auto.result.Status.ScopeMemoryCapSource) {
 		t.Fatalf("auto leg's cap classified as operator-supplied: %q", auto.result.Status.ScopeMemoryCapSource)

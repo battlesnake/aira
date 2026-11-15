@@ -724,8 +724,8 @@ func TestSkillNamesNothingFromTheCollapsedDelegateRAMModel(t *testing.T) {
 // of AIRA-128.
 //
 // The incident behind that ticket was NOT a broken estimator: a standalone
-// `aira confine -- make test-lite` was capped at the machine-wide p90 prior on
-// its first ever run, group-killed, and the CONSUMER's own wrapper reported the
+// `aira confine -- make test-lite` was capped at a cold-start prior on its
+// first ever run, group-killed, and the CONSUMER's own wrapper reported the
 // truncated pytest output as a large failure tally. Every AIRA-side signal that
 // would have said otherwise already existed and was correct — `terminated-by=oom`
 // on the trailer, exit 137, the OOM advisory — and the very next run of the same
@@ -751,17 +751,19 @@ func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
 		{"terminated-by=oom", "the trailer field that distinguishes an OOM kill from a real failure"},
 		{"exits `137`", "the exit code a consumer's own wrapper sees, so a swallowed status is checkable"},
 		{"UNEVALUATED run", "the honesty framing: a killed run has no result, it is not a failing result"},
-		{"estimate:p90-prior", "the basis a never-seen command's first run is capped at WHEN this box has a machine-wide p90 (AIRA-166 adds the case where it does not)"},
+		{"`reserve-basis=fallback:no-history` on a genuine first run", "the basis a never-seen command's first run is capped at (AIRA-341 deleted the machine-wide prior that used to name it on a box with history)"},
 		{"estimate:oom-escalated", "the basis when 1.5x the OOM peak IS the reserve"},
 		{",oom-on-record", "the token that proves the OOM was attributed to this signature even when another term set the number"},
 		{",ceiling-clamped", "the token that says the slice ceiling cut the reserve down"},
 		{",ceiling-fitted", "AIRA-153: the token that says an unpinned PRIOR was sized to the largest reserve this slice can grant — a job that RAN, not an error"},
 		{"refused immediately with `E_ADMIT_TOO_LARGE` naming `required` and `cap_minus_headroom` instead of waiting: pin `--memory-reserve` (or `--memory-max`) at or below the printed `cap_minus_headroom`",
 			"AIRA-151: the clamp applies only to the escalated value, so an over-ceiling reserve from any other term is refused terminally, and this names what to pass instead. AIRA-153 narrows its population — a PRIOR can no longer be over the ceiling — but the sentence stays true and stays the advice"},
-		{"On a small slice the RE-RUN advice below DOES self-heal, so long as the job fits under that fitted cap",
-			"AIRA-153: the sentence this REPLACES said the opposite, and would now tell an agent to give up on a case that works"},
-		{"The one case it cannot help is a job OOM-killed AT that cap",
-			"AIRA-153: the carve-out. An unqualified 'RE-RUN works on a small slice too' would be the opposite honesty error — a job killed AT the fitted cap is refused on re-run, not retried"},
+		{"an unpinned FIRST run is already capped at the largest reserve the slice can grant",
+			"AIRA-341: with the machine-wide prior gone, a small slice's unpinned first run is at the fit, not below it"},
+		{"the RE-RUN advice below usually cannot help a job OOM-killed AT that cap",
+			"AIRA-153/341: the carve-out. An unqualified 'RE-RUN works on a small slice too' would be an honesty error — a job killed AT the fitted cap is clamped back to it or refused on re-run, never sized larger"},
+		{"On a small slice the RE-RUN advice below does self-heal a job killed BELOW that cap",
+			"AIRA-153: the self-heal that still works on a small slice, for a job killed under a smaller cap"},
 		{"RE-RUN the identical command", "the correct response to a first-run OOM"},
 		{"pytest -n auto", "the input-nondeterminism case no per-signature estimate can learn"},
 	} {
@@ -821,7 +823,7 @@ func TestGuideHedgesTheOOMRerunPromiseOnTheAdvisoryRecordedClaim(t *testing.T) {
 			if !promises || strings.Contains(sentence, "says the kill was recorded") {
 				continue
 			}
-			if strings.Contains(sentence, "the RE-RUN advice below DOES self-heal") {
+			if strings.Contains(sentence, "the RE-RUN advice below") {
 				continue // cross-reference, not a promise
 			}
 			t.Errorf("%s makes an OOM re-run promise not conditional on the advisory saying the kill was recorded: %q", document.name, sentence)
@@ -842,7 +844,7 @@ func TestGuideHedgesTheOOMRerunPromiseOnTheAdvisoryRecordedClaim(t *testing.T) {
 // TestSkillTeachesBothColdStartBases is AIRA-166.
 //
 // The guide taught ONE cold-start basis — "a FIRST run ... is capped at a
-// machine-wide prior (`reserve-basis=estimate:p90-prior`)" — which is true only
+// machine-wide prior" (the basis AIRA-341 later deleted) — which was true only
 // where a machine-wide p90 EXISTS. It exists only once some signature in this
 // box's one shared state.db has three or more recorded peaks, so on a fresh box
 // or a fresh state.db resolveAdmitReserve falls through to one of its four
@@ -861,11 +863,10 @@ func TestSkillTeachesBothColdStartBases(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []struct{ text, why string }{
-		{"fallback:no-history", "the basis a genuine first run gets when this box has no machine-wide p90 at all"},
+		{"fallback:no-history", "the basis a genuine first run gets"},
 		{"fallback:no-signature", "the sibling for a launch that sent no signature"},
 		{"fallback:history-unavailable", "the sibling for a history read that could not be established"},
 		{"fallback:insufficient-samples", "the sibling for a signature with fewer than three usable samples"},
-		{"three or more recorded peaks", "WHEN the p90 exists at all — the condition the old sentence assumed silently"},
 		{"is NOT a sign that something is wrong", "the whole point: a fallback basis on a first run is the documented cold start"},
 		{"unpinned default (1 GiB)", "AIRA-166: what the fallback NUMBER actually is, not just what it is called"},
 		{"`,ceiling-fitted` form of it described below on a slice too small to grant the whole default",
@@ -880,15 +881,18 @@ func TestSkillTeachesBothColdStartBases(t *testing.T) {
 			}
 		}
 	}
-	// The RED direction: the exact claim AIRA-166 was filed against. A revert to
-	// the unconditional sentence fails here rather than silently returning an
-	// agent to the state where a fallback basis looks like a defect.
+	// The RED direction. AIRA-166 was filed against a guide that taught only the
+	// machine-wide prior's basis; AIRA-341 deleted that prior, so the guide must
+	// not name it or the machine-wide p90 at all. The needle is assembled so this
+	// file does not carry the deleted basis literally.
 	for _, document := range []struct{ name, body string }{
 		{"SKILL.md", string(artifacts.SkillMD)},
 		{"guide", string(artifacts.Guide)},
 	} {
-		if strings.Contains(document.body, "is capped at a machine-wide prior (`reserve-basis=estimate:p90-prior`)") {
-			t.Errorf("%s again claims every first run is capped at the machine-wide p90; that is true only when one EXISTS", document.name)
+		for _, stale := range []string{"estimate:p90" + "-prior", "machine-wide p90", "machine-wide guess"} {
+			if strings.Contains(document.body, stale) {
+				t.Errorf("%s still teaches %q; AIRA-341 deleted the machine-wide cold-start prior", document.name, stale)
+			}
 		}
 	}
 }
@@ -909,7 +913,6 @@ func TestSkillTeachesTheOwnPeakFloor(t *testing.T) {
 		{"estimate:own-max=<peak>,n=<samples>,f=115", "the basis the floor carries when it set the reserve"},
 		{"a recorded CLEAN peak — even one, including a run where you pinned `--memory-reserve` — its unpinned reserve is never below 1.15x that peak while that peak is among its 20 most recent records and its history read succeeds (a `fallback:history-unavailable` basis means the read failed and the default was used)",
 			"the floor applies from the first clean sample, and the guide states it only where it holds (history read succeeded, peak inside the 20-row window)"},
-		{"the machine-wide p90 could not be read within the admission deadline", "a fallback basis on a box with history"},
 		{"after even one or two clean runs whose peak x1.15 exceeds the ceiling", "the new E_ADMIT_TOO_LARGE population"},
 	} {
 		for _, document := range []struct{ name, body string }{

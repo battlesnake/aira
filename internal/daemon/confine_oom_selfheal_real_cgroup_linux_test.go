@@ -21,8 +21,8 @@ import (
 // job OOM-killed because its cold-start reserve under-provisioned it is
 //
 //  1. reported honestly rather than as a clean run, and
-//  2. attributed to its OWN command signature, so the very NEXT run of the same
-//     command is admitted at an escalated reserve with no operator action.
+//  2. attributed to its OWN command signature, so the very NEXT unpinned run of
+//     the same command is admitted at an escalated reserve.
 //
 // Why this test exists rather than another table row in confine_admit_test.go:
 // every existing test of the escalation stubs admitPeakHistory with synthetic
@@ -37,10 +37,15 @@ import (
 //	reportPeak over the admit socket -> RecordConfinePeak -> ConfinePeakHistory
 //	-> resolveAdmitReserve -> the next scope's memory.max
 //
-// The fixture reproduces the reported shape rather than an abstraction of it:
-// an unpinned command with no history of its own is capped at the machine-wide
-// p90 PRIOR (`estimate:p90-prior`, the basis the incident ran under), that cap
-// is below what the command actually needs, and the job is group-killed.
+// The incident ran under a machine-wide cold-start prior that capped an
+// unpinned command below what it needed. AIRA-341 deleted that prior: an
+// unpinned cold start is now the 1 GiB default (or that default fitted to a
+// small slice), so reproducing the incident's under-provisioned AUTO cap would
+// need a workload over 1 GiB on a shared box. What this fixture proves does not
+// depend on who chose the cap that killed the job -- the attribution chain below
+// is the same for every kill -- so the cold-start run here is capped by a
+// declared --memory-max (oomSelfHealColdCap) below the workload's need, and
+// the job is group-killed there. The re-run is UNPINNED, exactly as before.
 //
 // aira.slice is never touched: the whole fixture lives under a throwaway
 // cgrouptest.IsolatedScopeParent, torn down in t.Cleanup.
@@ -117,11 +122,11 @@ const (
 	// invariant so a future change to either constant fails loudly instead of
 	// reintroducing the flake.
 	oomSelfHealSliceMax = runner.DefaultConfineMemoryReserve + (2 << 30)
-	// What the seeding runs touch. Their peak becomes the machine-wide p90
-	// prior, which is what the target command's cold start is then capped at.
-	// It must leave a Go runtime room to start, and must be far below the
-	// target workload, or the cold start would not OOM at all.
-	oomSelfHealSeedBytes = int64(40 << 20)
+	// The cold-start run's declared cap. It must leave a Go runtime room to
+	// start, and must be far below the target workload, or the cold start would
+	// not OOM at all. (Until AIRA-341 this cap was the machine-wide prior built
+	// from three 40 MiB seed runs, about 1.15 x their peak.)
+	oomSelfHealColdCap = int64(64 << 20)
 	// What the target command touches: several times its cold-start cap.
 	oomSelfHealTargetBytes = int64(320 << 20)
 	// Printed by the workload only after every page is resident. Its ABSENCE on
@@ -195,36 +200,15 @@ func TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission(t *testing.
 		return oomSelfHealRun{result: result, err: err, stdout: stdout.String(), stderr: stderr.String()}
 	}
 
-	// PHASE 1 -- establish a machine-wide p90 prior, the way a real box does:
-	// by actually running things. Three real runs of one seed signature are the
-	// minimum ConfinePeakP90 will consider (COUNT(peak_rss) >= 3). They declare
-	// their own small cap only so they fit this fixture's ceiling; the peak they
-	// record is measured, not declared.
-	for i := 0; i < 3; i++ {
-		seed := run("seed", oomSelfHealSeedBytes, 256<<20)
-		if seed.err != nil {
-			cgrouptest.SkipOrFailRealCgroup(t, "seeding confine run %d unavailable: %v (stderr %q)", i, seed.err, seed.stderr)
-		}
-		if seed.result.Exit != 0 || !strings.Contains(seed.stdout, oomSelfHealMarker) {
-			t.Fatalf("seed run %d: exit=%d stdout=%q stderr=%q, want a completed workload", i, seed.result.Exit, seed.stdout, seed.stderr)
-		}
-	}
-	// The daemon caches the p90 for a minute. Expiring the cache is not faking
-	// the prior -- the value still comes from the three real observations above;
-	// it only spares the test a 60s sleep.
-	server.admitPriorMu.Lock()
-	server.admitPriorAt = time.Time{}
-	server.admitPriorMu.Unlock()
-
 	// PHASE 2 -- the cold start. The target command has no history of its own,
-	// so it is capped at the prior, which is far below what it needs.
-	first := run("target", oomSelfHealTargetBytes, 0)
+	// and its cap is far below what it needs.
+	first := run("target", oomSelfHealTargetBytes, oomSelfHealColdCap)
 	if first.err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "cold-start confine run unavailable: %v (stderr %q)", first.err, first.stderr)
 	}
-	if first.result.Status.ReserveBasis != "estimate:p90-prior" {
-		t.Fatalf("cold-start reserve-basis=%q reserve=%d, want the p90 prior — the fixture is not reproducing the reported shape (stderr %q)",
-			first.result.Status.ReserveBasis, first.result.Status.ReserveBytes, first.stderr)
+	if first.result.Status.ScopeMemoryMax != oomSelfHealColdCap {
+		t.Fatalf("cold-start scope memory.max=%d (reserve-basis=%q), want the declared %d — the fixture is not reproducing an under-provisioned first run (stderr %q)",
+			first.result.Status.ScopeMemoryMax, first.result.Status.ReserveBasis, oomSelfHealColdCap, first.stderr)
 	}
 	// The honesty half. A run the kernel killed must not look like a run that
 	// finished: no completion marker, a signalled exit, and a verdict that names
@@ -248,8 +232,9 @@ func TestRealOOMAttributesToItsSignatureAndEscalatesTheNextAdmission(t *testing.
 	}
 	oomPeak := *first.result.Status.PeakRSS
 
-	// PHASE 3 -- the self-heal. Same argv, therefore the same signature, and no
-	// operator action of any kind between the two runs.
+	// PHASE 3 -- the self-heal. Same argv, therefore the same signature; the only
+	// difference is that the first run's declared cap is dropped (since AIRA-341
+	// the fixture's under-provisioned first run is operator-capped, see above).
 	second := run("target", oomSelfHealTargetBytes, 0)
 	if second.err != nil {
 		t.Fatalf("second confine run: %v (stderr %q)", second.err, second.stderr)
@@ -317,17 +302,13 @@ func TestOOMSelfHealFixtureStaysOffTheCeilingClamp(t *testing.T) {
 	server.stopping = make(chan struct{})
 	server.admitSliceHeadroomBase = 32 << 20
 	server.admitSliceHeadroomSupervisor = 8 << 20
-	server.admitPeakP90 = func(context.Context) (int64, bool, error) {
-		t.Fatal("the OOM-escalation branch must resolve before the machine-wide prior is consulted")
-		return 0, false, nil
-	}
 	// Exactly the history the cold-start OOM leaves for the target signature:
 	// ONE observation, which is one OOM and no usable ordinary estimate. The
 	// peak's exact value is immaterial to what is asserted -- any peak whose
 	// 1.5x escalation is below the unpinned default reproduces the phase-3
-	// resolution -- so it is sized from the seed bytes the prior is built from
-	// rather than pinned to one host's measurement.
-	peak := oomSelfHealSeedBytes + oomSelfHealSeedBytes/2
+	// resolution -- so it is the cold-start cap the kill happens at rather than
+	// one host's measurement.
+	peak := oomSelfHealColdCap
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: peak, OOMCount: 1, MaxOOMPeak: peak}, nil
 	}
@@ -353,7 +334,7 @@ func TestOOMSelfHealFixtureStaysOffTheCeilingClamp(t *testing.T) {
 }
 
 // oomSelfHealArgv is the workload's launch argv. The trailing token is what
-// separates the seed signature from the target signature: ResourceSignature is
+// separates one run's signature from another's: ResourceSignature is
 // the effective argv joined, so two runs differ as signatures if and only if
 // their argv differs.
 func oomSelfHealArgv(token string) []string {

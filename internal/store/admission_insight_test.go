@@ -147,10 +147,11 @@ func TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation(t *testing.T) {
 	//
 	// AIRA-153 adds a `,ceiling-fitted` token and it must not move the population
 	// either. Every newly-producible string is either a `fallback:` one, which the
-	// gauge's `estimate%` predicate never selects at all, or
-	// `estimate:p90-prior,ceiling-fitted`, which fails the `$`-anchored matchers
-	// exactly as the shipped `estimate:p90-prior` already does and is counted
-	// malformed_basis + excluded. `estimate:oom-escalated,ceiling-clamped` is
+	// gauge's `estimate%` predicate never selects at all, or an `estimate:`
+	// PRIOR with the fit token, which fails the `$`-anchored matchers and is
+	// counted malformed_basis + excluded. (AIRA-341 deleted the one such prior;
+	// the row below keeps an unrecognised `estimate:` term with the token as a
+	// forward-defensive negative.) `estimate:oom-escalated,ceiling-clamped` is
 	// unchanged in spelling; only the number under it moves. The rows below marked
 	// PRODUCIBLE are ones resolveAdmitReserve can emit today; the rest are the
 	// same forward-defensive negatives as the AIRA-151 block above — a regression
@@ -176,13 +177,15 @@ func TestOOMBranchBasesStayOutsideTheAdmissionAdequacyPopulation(t *testing.T) {
 		"fallback:capture-unavailable,oom-on-record,ceiling-fitted",
 		"fallback:malformed,oom-on-record,ceiling-fitted",
 		"fallback:malformed,ceiling-fitted",
-		"estimate:p90-prior,ceiling-fitted",
 		// AIRA-153 forward-defensive negatives: an ORDINARY estimate is never
 		// fitted (I2) and the two tokens are mutually exclusive by construction
 		// (I8), so neither of these is producible. They are here so a regression
 		// that made one producible could not also make it evaluable unnoticed.
 		"estimate:max=42949672960,n=5,f=115,ceiling-fitted",
 		"estimate:oom-escalated,ceiling-clamped,ceiling-fitted",
+		// AIRA-341: no `estimate:` prior is producible any more; an unrecognised one
+		// with the fit token must still never be evaluable.
+		"estimate:unrecognised-prior,ceiling-fitted",
 	} {
 		if admissionMaxBasis.MatchString(basis) || admissionOOMMaxBasis.MatchString(basis) || basis == "estimate:capped" {
 			t.Fatalf("basis %q reaches an adequacy VERDICT; the OOM branch's rows have never been evaluable and this change must not move that population", basis)
