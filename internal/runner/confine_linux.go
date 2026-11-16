@@ -2010,12 +2010,17 @@ func confineOperatorReserveCap(scopeMemoryMax int64, declaredReserve bool, decla
 // number. A container outside the scope (docker: the container lives under the
 // docker daemon, not in this slice) disqualifies the job: its workload is not
 // under the cap, and the slice's physical reading the fit rule uses cannot see it.
+// A pin inherited only from AIRA_CONFINE_RESERVE (no --memory-reserve of the job's
+// own) disqualifies it too: the spec discounts a pin "the operator gave with
+// --memory-reserve", and the variable is shared by every nested confine, so it is
+// not this job's operator choice (the AIRA-310 hint excludes it for the same
+// reason). An explicit --memory-reserve beside the variable wins and is the job's.
 func confineReserveDiscountable(request ConfineRequest, declaredReserve bool, declaredReserveBytes, reserve int64, pinned, containerOutsideScope bool) bool {
 	capBytes, ok := confineOperatorReserveCap(request.ScopeMemoryMax, declaredReserve, declaredReserveBytes)
 	if !ok || !pinned || capBytes != reserve || containerOutsideScope {
 		return false
 	}
-	return !request.DelegateRAM && !request.Exclusive
+	return !request.DelegateRAM && !request.Exclusive && !request.MemoryReserveFromEnv
 }
 
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {

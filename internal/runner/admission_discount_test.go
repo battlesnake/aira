@@ -281,7 +281,8 @@ func TestAdmitGrantChargeIsValidatedAndNeverReDeclared(t *testing.T) {
 // container outside its scope; and whenever it is sent, the cap written is the
 // pin and the admit reserve is the pin. Mutations: send it for --memory-max; for
 // an undeclared (default) reserve; for --delegate-ram; for --exclusive; for
-// docker; derive it from MemoryReservePinned alone.
+// docker; for a pin inherited only from AIRA_CONFINE_RESERVE; derive it from
+// MemoryReservePinned alone.
 func TestConfineDiscountableIsTheOperatorReserveCap(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -297,6 +298,10 @@ func TestConfineDiscountableIsTheOperatorReserveCap(t *testing.T) {
 		{"a token reserve not declared", ConfineRequest{MemoryReserve: 12 << 20}, false, 12 << 20, 12 << 20},
 		{"--delegate-ram", ConfineRequest{MemoryReserve: 12 << 20, MemoryReservePinned: true, DelegateRAM: true}, false, 12 << 20, 12 << 20},
 		{"docker", ConfineRequest{MemoryReserve: 12 << 20, MemoryReservePinned: true, Argv: []string{"docker", "run", "--memory=8m", "img"}}, false, 12 << 20, 12 << 20},
+		// The CLI sets MemoryReserveFromEnv only when no --memory-reserve was given
+		// (TestConfineReserveFromEnvTranscription: an explicit flag beside the
+		// variable leaves it false, so that job is the "--memory-reserve" row above).
+		{"inherited AIRA_CONFINE_RESERVE only", ConfineRequest{MemoryReserve: 12 << 20, MemoryReservePinned: true, MemoryReserveFromEnv: true}, false, 12 << 20, 12 << 20},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scope := &confineFakeScope{}

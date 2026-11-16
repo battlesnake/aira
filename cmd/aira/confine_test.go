@@ -587,7 +587,9 @@ func TestConfineReserveTranscriptionAndResolvedChargeAcrossFlagsAndEnvironment(t
 
 // verifies: AIRA-310 the CLI records whether a pinned reserve came from the
 // AIRA_CONFINE_RESERVE environment rather than --memory-reserve, so the runner
-// can withhold the over-reservation hint from an inherited environment pin.
+// can withhold the over-reservation hint from an inherited environment pin, and
+// (AIRA-324) withhold the pin-charge discount from it; an explicit flag beside the
+// variable is the job's own pin and stays eligible.
 func TestConfineReserveFromEnvTranscription(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })

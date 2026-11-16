@@ -1388,7 +1388,8 @@ func TestSkillTeachesTheCPUSlotAndOuterKillGaps(t *testing.T) {
 
 // verifies: AIRA-312 -- the skill and the generated verb summary both state the
 // resize honesty caveats: ledger only (cap unchanged), the OOM-steering budget
-// drops with the reserve, and any re-declare restores the original. Deleting any
+// drops with the reserve, and any re-declare drops it (a reconnect back to the grant-time booking, a
+// restart to the full pin; AIRA-324). Deleting any
 // one of them from either reds this.
 func TestSkillAndSummaryStateTheResizeCaveats(t *testing.T) {
 	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
@@ -1402,7 +1403,7 @@ func TestSkillAndSummaryStateTheResizeCaveats(t *testing.T) {
 			"never below the job's live memory use",
 			"the job's `memory.max` cap is unchanged",
 			"lowers the job's OOM-steering budget",
-			"any re-declare of the lease (a daemon reconnect or restart) restores the original reserve",
+			"any re-declare of the lease drops the resize: a daemon reconnect restores the booking the job was granted with (for a job `--pin-charge enforce` booked below its pin, that discounted booking, not the pin), and a daemon restart books its full pin",
 			"keep the reserve it was admitted with",
 		} {
 			if !strings.Contains(text, want) {
@@ -1416,9 +1417,41 @@ func TestSkillAndSummaryStateTheResizeCaveats(t *testing.T) {
 			summary = descriptor.Summary
 		}
 	}
-	for _, want := range []string{"reduce only", "memory.max cap is unchanged", "OOM-steering budget drops", "any re-declare", "restores the original reserve"} {
+	for _, want := range []string{"reduce only", "memory.max cap is unchanged", "OOM-steering budget drops", "any re-declare",
+		"a daemon reconnect restores the booking the job was granted with (a pin-charge-discounted booking stays discounted)",
+		"a daemon restart books the full pin"} {
 		if !strings.Contains(summary, want) {
 			t.Fatalf("confine-resize summary %q does not state %q", summary, want)
+		}
+	}
+	if strings.Contains(summary, "restores the original reserve") {
+		t.Fatalf("confine-resize summary %q still conflates a reconnect with a restart", summary)
+	}
+}
+
+// verifies: AIRA-324 retired invariant — the generated guidance no longer
+// promises that a pinned job "never over-commits a neighbour" unconditionally:
+// it says the default books the job at its cap, and that under `--pin-charge
+// enforce` the caps can together exceed the slice's limit, so a slice-level OOM
+// can kill a neighbour under its own pin. Mutations: restore the old guarantee;
+// drop the enforce caveat.
+func TestSkillRestatesThePinChargeRetiredGuarantee(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"SKILL.md": string(artifacts.SkillMD), "guide": string(artifacts.Guide)} {
+		if strings.Contains(text, "never over-commits a neighbour") {
+			t.Fatalf("%s still states the guarantee the pin-charge discount retired", name)
+		}
+		for _, want := range []string{
+			"By default (`aira install --pin-charge off|observe`) the admission ledger books that job at R, its cap",
+			"under `--pin-charge enforce` a job pinned with its own `--memory-reserve` is booked below R (its trailer adds `booked=` beside `reserve=`, which stays the cap)",
+			"a slice-level OOM can then kill a neighbour that is still under its own pin",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s does not state %q", name, want)
+			}
 		}
 	}
 }

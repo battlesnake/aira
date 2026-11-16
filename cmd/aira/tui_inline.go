@@ -224,7 +224,7 @@ func topResizeConfirm(state tuiState, raw string) (tuiState, []tuiCmd) {
 		job = pending.TargetID
 	}
 	summary := fmt.Sprintf("lower the admission reserve of %s to %s (%d bytes). ", job, raw, size) +
-		"This edits the admission ledger only: the job's memory.max cap is unchanged; its OOM-steering budget drops to the new reserve, so an overrun past it makes the job the preferred OOM victim under pressure; and any re-declare (a daemon reconnect or restart) restores the original reserve. " +
+		"This edits the admission ledger only: the job's memory.max cap is unchanged; its OOM-steering budget drops to the new reserve, so an overrun past it makes the job the preferred OOM victim under pressure; and any re-declare drops it: a daemon reconnect restores the booking the job was granted with (a pin-charge-discounted booking stays discounted), a daemon restart books the full pin. " +
 		"The daemon refuses a size that is not smaller than the current reserve or is below the job's live memory use at that moment. " + clause
 	pending.Stage = inlineStageConfirm
 	state.InlineError = ""

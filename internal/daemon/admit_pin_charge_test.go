@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"reflect"
 	"strings"
@@ -311,6 +313,62 @@ func TestPinChargePhysicalFitAndLedgerCharge(t *testing.T) {
 		if discountedPinCharge(want, 80) != 6*gi || discountedPinCharge(want+1, 80) <= 6*gi {
 			t.Fatalf("fixture: %d books %d and %d books %d", want, discountedPinCharge(want, 80), want+1, discountedPinCharge(want+1, 80))
 		}
+	})
+	// The rule's other three terms: pin <= (effectiveMaximum - headroom) -
+	// (current - reclaimable). Each case is built so the ledger check (which takes
+	// the same terms) passes and only the rule's own use of the term decides.
+	t.Run("headroom: the pin must fit below the headroom", func(t *testing.T) {
+		// Mutation: physical-fit headroom -> 0 (the job is granted at 10 GiB of
+		// room the headroom does not have).
+		now := time.Unix(90180, 0)
+		current := 54 * gi
+		server := pinServer(t, pinChargeEnforce, 64*gi, &current, &now)
+		server.admitSliceHeadroomBase = gi
+		server.admitSliceHeadroomSupervisor = 512 << 20 // two jobs (the lease and this one): 2 GiB
+		job := pinWaiter(server, 2, 10*gi, now)         // charge 8 GiB fits the 62 - 54 = 8 GiB ledger room
+		queue := queueOf(server, heldLease(1, 20*gi), job)
+
+		server.evaluateAdmitQueue(queue)
+		requireAdmitQueued(t, job) // physical room 64 - 2 - 54 = 8 GiB < the 10 GiB pin
+
+		current = 52 * gi // room 10 GiB with the headroom: exactly the pin
+		server.evaluateAdmitQueue(queue)
+		waitAdmitGrant(t, job)
+	})
+	t.Run("reclaimable cache does not count as use", func(t *testing.T) {
+		// Mutation: physical-fit reclaimable -> 0 (60 GiB of current with 6 GiB of
+		// cache reads as 4 GiB of room, and the job is held).
+		now := time.Unix(90185, 0)
+		current := 60 * gi
+		server := pinServer(t, pinChargeEnforce, 64*gi, &current, &now)
+		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+			return current, 64 * gi, 6 * gi, true, ""
+		}
+		job := pinWaiter(server, 2, 10*gi, now) // room 64 - (60 - 6) = 10 GiB: exactly the pin
+		queue := queueOf(server, heldLease(1, 20*gi), job)
+
+		server.evaluateAdmitQueue(queue)
+		waitAdmitGrant(t, job)
+	})
+	t.Run("the throttled ceiling, not the static maximum", func(t *testing.T) {
+		// Mutation: physical-fit on the static maximum (64 - 40 = 24 GiB of room
+		// admits the 20 GiB pin the 56 GiB pressure ceiling has no room for).
+		now := time.Unix(90190, 0)
+		current := 40 * gi
+		server := pinServer(t, pinChargeEnforce, 64*gi, &current, &now)
+		server.publishSliceCeilingSnapshot(sliceCeilingSnapshot{
+			Mode: sliceCeilingEnforce, SlicePath: "/slice",
+			State: sliceCeilingThrottled, Ceiling: 56 * gi, StaticMax: 64 * gi,
+		})
+		job := pinWaiter(server, 2, 20*gi, now) // charge 16 GiB fits the 56 - 40 = 16 GiB ledger room
+		queue := queueOf(server, heldLease(1, 30*gi), job)
+
+		server.evaluateAdmitQueue(queue)
+		requireAdmitQueued(t, job)
+
+		current = 36 * gi // room 56 - 36 = 20 GiB: exactly the pin
+		server.evaluateAdmitQueue(queue)
+		waitAdmitGrant(t, job)
 	})
 	t.Run("ci-shim never applies the rule or the discount", func(t *testing.T) {
 		now := time.Unix(90200, 0)
@@ -750,6 +808,68 @@ func TestPinChargeObserveIsByteIdenticalToOff(t *testing.T) {
 	enforce := runPinScenario(t, pinChargeEnforce)
 	if reflect.DeepEqual(off, enforce) {
 		t.Fatal("enforce equals off on the same script: the differential proves nothing")
+	}
+}
+
+// verifies: AIRA-324 observe's only output — the per-grant `pin-charge observe:`
+// log line. One pass grants a discountable waiter and a non-discountable one. In
+// observe exactly one line is written, for the discountable grant, with the pin,
+// charged = the pin (observe books the pin), would-charge = the discounted
+// booking, the factor and the physical free figure; enforce writes its own line
+// with the booking it charged; off, ci-shim and the non-discountable grant write
+// none. Mutations: the call removed; would-charge printed as the pin; the line
+// for a non-discountable grant; the line in ci-shim mode.
+func TestPinChargeGrantLogLine(t *testing.T) {
+	const gi = int64(1) << 30
+	const pin = 10*gi + 3
+	var buffer bytes.Buffer
+	previousOutput, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buffer)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(previousOutput); log.SetFlags(previousFlags) })
+
+	run := func(mode pinChargeMode, shim bool) (string, *admitWaiter) {
+		buffer.Reset()
+		now := time.Unix(98000, 0)
+		current := 20 * gi // physical free 44 GiB
+		server := pinServer(t, mode, 64*gi, &current, &now)
+		if shim {
+			server.confineMode = runner.ConfineModeShim
+		}
+		job := pinWaiter(server, 2, pin, now)
+		plain := queuedWaiter(3, 2*gi, now)
+		plain.scopeID = "CONFINE-plain3-7003-a"
+		queue := queueOf(server, heldLease(1, 4*gi), job, plain)
+		server.evaluateAdmitQueue(queue)
+		waitAdmitGrant(t, job)
+		waitAdmitGrant(t, plain)
+		return buffer.String(), job
+	}
+
+	text, job := run(pinChargeObserve, false)
+	want := fmt.Sprintf("aira daemon: pin-charge observe: scope=%s pin=%d charged=%d would-charge=%d factor=%s physical-free=%d physical-fit=true\n",
+		job.scopeID, pin, pin, discountedPinCharge(pin, pinChargeFactorDefault), runner.FormatPinChargeFactor(pinChargeFactorDefault), 44*gi)
+	if text != want {
+		t.Fatalf("observe log:\n%q\nwant exactly:\n%q", text, want)
+	}
+	if discountedPinCharge(pin, pinChargeFactorDefault) == pin {
+		t.Fatal("fixture: the discounted booking equals the pin, so would-charge proves nothing")
+	}
+
+	text, job = run(pinChargeEnforce, false)
+	want = fmt.Sprintf("aira daemon: pin-charge enforce: scope=%s pin=%d charged=%d factor=%s physical-free=%d physical-fit=true\n",
+		job.scopeID, pin, discountedPinCharge(pin, pinChargeFactorDefault), runner.FormatPinChargeFactor(pinChargeFactorDefault), 44*gi)
+	if text != want {
+		t.Fatalf("enforce log:\n%q\nwant exactly:\n%q", text, want)
+	}
+
+	for _, tc := range []struct {
+		mode pinChargeMode
+		shim bool
+	}{{pinChargeOff, false}, {pinChargeObserve, true}, {pinChargeEnforce, true}} {
+		if text, _ := run(tc.mode, tc.shim); strings.Contains(text, "pin-charge") {
+			t.Fatalf("mode %s shim=%t logged a pin-charge line:\n%s", tc.mode, tc.shim, text)
+		}
 	}
 }
 

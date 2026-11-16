@@ -270,7 +270,8 @@ type Request struct {
 	// --memory-reserve (cap-source operator:--memory-reserve), so the daemon may
 	// BOOK it below that pin while the cap stays the pin. Set only by the confine
 	// launch path (confineReserveDiscountable); never for `aira run`,
-	// confine-reserve, --memory-max, --delegate-ram, --exclusive or ci-shim.
+	// confine-reserve, --memory-max, --delegate-ram, --exclusive, a pin inherited
+	// only from AIRA_CONFINE_RESERVE, or ci-shim.
 	Discountable bool `json:"discountable,omitempty"`
 	// AIRA-185. ExclusiveReason is the holder's free-text label for WHY the slice
 	// is being held ("deploy: slice-ceiling flip"), which ConfineName cannot carry

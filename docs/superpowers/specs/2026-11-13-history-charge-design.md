@@ -1151,5 +1151,15 @@ choice, each checked in the build review:
    grants in one pass each see the reading taken before the others (bounded by the pass, and
    the next pass's reading catches up).
 
+9. **Eligibility, review round 3.** A pin inherited only from `AIRA_CONFINE_RESERVE` (no
+   `--memory-reserve` of the job's own) is not discountable: it is not a pin "the operator gave with
+   `--memory-reserve`", and every nested confine shares the variable (the AIRA-310 hint excludes it
+   for the same reason). An explicit flag beside the variable is the job's own and stays eligible.
+10. **Generated guidance.** The skill no longer says a whole-job `--memory-reserve` scope "never
+    over-commits a neighbour" unconditionally: under enforce the caps can together exceed the slice's
+    limit, so a slice-level OOM can kill a neighbour under its own pin (the retired invariant above).
+    The `--resize` caveat now separates the two re-declares: a reconnect restores the grant-time
+    booking (the discounted one under enforce), a restart books the full pin.
+
 Every mutation named in section 8 is listed in `docs/dev/aira-324-mutation-check.py`; the build PR
 records that script's result.

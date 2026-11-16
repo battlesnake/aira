@@ -2617,7 +2617,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// AIRA-312. The caveats live in the summary because this is the text every
 		// generated face publishes: ledger only, the cap is unchanged, the
 		// OOM-steering budget drops with the reserve, and any re-declare undoes it.
-		"confine-resize": {summary: "Lower one ownership-checked running confine job's admission reserve (reduce only, never below its live memory use). Ledger only: its memory.max cap is unchanged, so the ledger can under-count what it may still use by up to the reduction; its OOM-steering budget drops with it, so a later overrun makes it the preferred OOM victim; any re-declare (a daemon reconnect or restart) restores the original reserve", safety: SafetyExecute, example: []string{"job", "--memory-reserve", "2G"}},
+		"confine-resize": {summary: "Lower one ownership-checked running confine job's admission reserve (reduce only, never below its live memory use). Ledger only: its memory.max cap is unchanged, so the ledger can under-count what it may still use by up to the reduction; its OOM-steering budget drops with it, so a later overrun makes it the preferred OOM victim; any re-declare drops it: a daemon reconnect restores the booking the job was granted with (a pin-charge-discounted booking stays discounted), a daemon restart books the full pin", safety: SafetyExecute, example: []string{"job", "--memory-reserve", "2G"}},
 		"confine-status": {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		// AIRA-196. Unlike confine/confine-status these ARE included: reading a
 		// captured file and writing to a job's stdin socket both have honest

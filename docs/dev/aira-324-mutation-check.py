@@ -75,6 +75,10 @@ T_VALIDATE = (D, "TestValidateAdmitArgsDiscountable")
 T_SNAPSHOT = (D, "TestPinChargeSnapshotShowsBookingAndPin")
 T_LIST = (D, "TestPinChargeConfineListShowsBookingAndPin")
 T_SERVE = (D, "TestServeAppliesParsedEnvSettings")
+T_LOG = (D, "TestPinChargeGrantLogLine")
+T_SKILL = ("./internal/core/", "TestSkillRestatesThePinChargeRetiredGuarantee|TestSkillAndSummaryStateTheResizeCaveats")
+SKILL = "internal/core/skill.go"
+CORE = "internal/core/core.go"
 T_WIRE = (R, "TestDiscountableReachesTheAdmitWire")
 T_OLD = (R, "TestDiscountableAgainstAnOldDaemonDegradesToTheFullPin")
 T_ONLYOLD = (R, "TestOnlyTheOldDaemonDiscountRefusalDegrades")
@@ -118,12 +122,16 @@ SEND = """	if req.Discountable {
 REASK = "		if req.Discountable && response.Code == \"E_DAEMON_PROTOCOL\" && strings.Contains(response.Error, oldDaemonDiscountRefusal) {"
 VALID_CHARGE = "	return req.Discountable && grant.Charge > 0 && grant.Charge < grant.Reserve"
 PRED_GATE = "	if !ok || !pinned || capBytes != reserve || containerOutsideScope {"
-PRED_TAIL = "	return !request.DelegateRAM && !request.Exclusive"
+PRED_TAIL = "	return !request.DelegateRAM && !request.Exclusive && !request.MemoryReserveFromEnv"
 BOOKED = "		result.Status.BookedBytes = admission.charge"
 TRAILER_LINE = "			line += \" booked=\" + FormatConfineBytes(status.BookedBytes)"
 SUMMARY_CAP = "			record.CapBytes = status.ScopeMemoryMax"
 TOP_CELL = "	if reserve.State == topReserveSet && record.PinBytes != nil && *record.PinBytes > reserve.Bytes {"
 LIST_PINS = "		runner.ApplyConfineScopePins(result.Scopes, snapshot.scopePins)"
+PHYSICAL_FREE = "			physicalFree = checkedAvailable(current, effectiveMaximum, reclaimable, 0, headroom)"
+LOG_CALL = "			s.logPinChargeGrantLocked(waiter, physicalFree)"
+LOG_WOULD = "			waiter.scopeID, waiter.reserve, waiter.ledgerCharge(), discountedPinCharge(waiter.reserve, s.pinChargePercent),"
+LOG_GATE = "	if waiter == nil || !waiter.discountable || s.shimMode() {"
 SERVE_ASSIGN = "	s.pinChargeMode, s.pinChargePercent = pinMode, pinPercent"
 
 MUTATIONS = [
@@ -131,6 +139,9 @@ MUTATIONS = [
     ("fit-rule-removed", [(ADMIT, FIT_RULE, "		if false && waiter.discounted() && !s.shimMode() && waiter.reserve > physicalFree {")], T_FIT),
     ("fit-rule-on-the-booking", [(ADMIT, FIT_RULE, "		if waiter.discounted() && !s.shimMode() && waiter.ledgerCharge() > physicalFree {")], T_FIT),
     ("fit-rule-off-by-one", [(ADMIT, FIT_RULE, "		if waiter.discounted() && !s.shimMode() && waiter.reserve >= physicalFree {")], T_FIT),
+    ("fit-headroom-dropped", [(ADMIT, PHYSICAL_FREE, "			physicalFree = checkedAvailable(current, effectiveMaximum, reclaimable, 0, 0)")], T_FIT),
+    ("fit-reclaimable-dropped", [(ADMIT, PHYSICAL_FREE, "			physicalFree = checkedAvailable(current, effectiveMaximum, 0, 0, headroom)")], T_FIT),
+    ("fit-static-maximum-not-the-throttle", [(ADMIT, PHYSICAL_FREE, "			physicalFree = checkedAvailable(current, maximum, reclaimable, 0, headroom)")], T_FIT),
     ("fit-ledger-check-on-the-pin", [(ADMIT, LEDGER_FIT, "		ramFits := waiter.reserve <= available")], T_FIT),
     ("fit-grantable-ignores-the-discount", [(ADMIT, GRANTABLE, "			grantable = available")], T_FIT),
     ("fit-grantable-adds-the-own-discount", [(ADMIT, GRANTABLE, "			grantable = available + (waiter.reserve - waiter.ledgerCharge())")], T_FIT),
@@ -150,6 +161,11 @@ MUTATIONS = [
     ("switch-ignores-eligibility", [(PIN, SWITCH, "	if s.pinChargeMode != pinChargeEnforce || s.shimMode() {")], T_FOR),
     ("switch-raw-default-not-off", [(PIN, "	if mode == \"\" {\n		return pinChargeOff, nil", "	if mode == \"\" {\n		return pinChargeEnforce, nil")], T_PARSE),
     ("switch-serve-drops-the-mode", [(SERVER, SERVE_ASSIGN, "	s.pinChargePercent = pinPercent")], T_SERVE),
+    # Observe's only output: the per-grant log line.
+    ("log-call-removed", [(ADMIT, LOG_CALL, "			_ = physicalFree")], T_LOG),
+    ("log-would-charge-is-the-pin", [(PIN, LOG_WOULD, "			waiter.scopeID, waiter.reserve, waiter.ledgerCharge(), waiter.reserve,")], T_LOG),
+    ("log-every-grant", [(PIN, LOG_GATE, "	if waiter == nil || s.shimMode() {")], T_LOG),
+    ("log-in-shim", [(PIN, LOG_GATE, "	if waiter == nil || !waiter.discountable {")], T_LOG),
     # The restart re-declare and the ARDR frozen record.
     ("redeclare-set-keeps-the-resize", [(ADMIT, SET, "")], T_REDECLARE),
     ("redeclare-set-drops-the-discount", [(ADMIT, SET, "				existing.charge = 0")], T_REDECLARE),
@@ -177,6 +193,12 @@ MUTATIONS = [
     ("predicate-ignores-cap-mismatch", [(LAUNCH, PRED_GATE, "	if !ok || !pinned || capBytes < 0 || containerOutsideScope {")], T_PRED),
     ("predicate-ignores-the-container", [(LAUNCH, PRED_GATE, "	if !ok || !pinned || capBytes != reserve {")], T_PRED),
     ("predicate-ignores-delegate-and-exclusive", [(LAUNCH, PRED_TAIL, "	return true")], T_PRED),
+    ("predicate-accepts-an-inherited-pin", [(LAUNCH, PRED_TAIL, "	return !request.DelegateRAM && !request.Exclusive")], T_PRED),
+    # The generated guidance: the retired guarantee and the re-declare split.
+    ("skill-restores-the-old-guarantee", [(SKILL, "one scope hard-capped at R (a runaway self-OOMs at R).", "one scope hard-capped at R (a runaway self-OOMs, never over-commits a neighbour).")], T_SKILL),
+    ("skill-drops-the-enforce-caveat", [(SKILL, " and a slice-level OOM can then kill a neighbour that is still under its own pin", "")], T_SKILL),
+    ("skill-redeclare-conflated", [(SKILL, "any re-declare of the lease drops the resize: a daemon reconnect restores the booking the job was granted with (for a job `--pin-charge enforce` booked below its pin, that discounted booking, not the pin), and a daemon restart books its full pin;", "any re-declare of the lease (a daemon reconnect or restart) restores the original reserve;")], T_SKILL),
+    ("summary-redeclare-conflated", [(CORE, "any re-declare drops it: a daemon reconnect restores the booking the job was granted with (a pin-charge-discounted booking stays discounted), a daemon restart books the full pin", "any re-declare (a daemon reconnect or restart) restores the original reserve")], T_SKILL),
     # The faces: booking and cap, never conflated.
     ("faces-booking-dropped", [(LAUNCH, BOOKED, "		_ = admission.charge")], T_FACES),
     ("faces-trailer-drops-booked", [(TRAILER, TRAILER_LINE, "			_ = line")], T_FACES),
