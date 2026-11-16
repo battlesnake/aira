@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -108,7 +109,7 @@ func TestConfinePriorityGuidanceIsOnEveryFace(t *testing.T) {
 	faces := map[string]string{
 		"confine help": help.String(),
 		"skill":        string(artifacts.SkillMD),
-		"mcp":          mcpServerInstructions,
+		"mcp":          mcpWireInstructions(t),
 	}
 	for face, text := range faces {
 		flat := strings.Join(strings.Fields(text), " ")
@@ -154,18 +155,38 @@ func TestTopQueuedRowMarksAHighPriorityJob(t *testing.T) {
 
 // AIRA-348. AIRA_CONFINE_PRIORITY supplies the same choice as --priority.
 
-// verifies: AIRA-348 — the precedence is flag, else AIRA_CONFINE_PRIORITY, else
-// normal, for a foreground and a detached launch. Unset, empty and
-// whitespace-only are absent. This is the only place the SOURCE of the priority
-// is known: from here on the request's HighPriority is the one input to the
-// admit wire field (TestAdmitConfineCarriesHighPriority), the daemon's queued
-// row (TestQueuedRowCarriesPriority) and `aira top`
-// (TestTopQueuedRowMarksAHighPriorityJob), so `--list` and top show the
-// effective priority whichever source chose it. Mutations: env read before the
-// flag (flag-normal + env-high gives high); env never read (env-high gives
-// normal); env read as "anything set means high" (env-normal gives high);
-// whitespace not treated as absent (refused).
-func TestConfinePriorityFromTheEnvironment(t *testing.T) {
+// setConfinePriorityEnv sets the variable for one subtest, or unsets it when
+// value is confinePriorityUnset (t.Setenv first, so the old value is restored).
+const confinePriorityUnset = "<unset>"
+
+func setConfinePriorityEnv(t *testing.T, value string) {
+	t.Helper()
+	t.Setenv(runner.ConfinePriorityEnv, "")
+	if value == confinePriorityUnset {
+		if err := os.Unsetenv(runner.ConfinePriorityEnv); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	t.Setenv(runner.ConfinePriorityEnv, value)
+}
+
+// verifies: AIRA-348 — the precedence (flag, else AIRA_CONFINE_PRIORITY, else
+// normal) for a foreground and a detached launch, carried through to the
+// priority `aira confine --list --json` and `aira top` display. For each source
+// the CLI's request is identical, field for field, to the one the same
+// --priority word produces with the variable unset, so nothing downstream can
+// tell the sources apart; that request's HighPriority is then rendered through
+// the real queued-row mapping (runner.ShimQueuedConfines), the --list JSON
+// encoding and top's LIVE cell. The one hop this test bridges by hand is the
+// daemon's (admit wire `priority` -> queued entry High); the wire side is
+// TestPrioritySourceReachesTheAdmitWireAndTheQueuedRow (runner) and the daemon
+// side TestValidateAdmitArgsPriority / TestAdmitSnapshotFollowsTheHighTier.
+// Mutations: env read before the flag (flag normal + env high gives high); env
+// never read (env high gives normal); "anything set means high" (env normal
+// gives high); whitespace not absent (refused); a field set only on the env
+// path (the requests differ); top or the queued mapping ignoring high.
+func TestConfinePrioritySourceDecidesTheDisplayedPriority(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
 	var seen runner.ConfineRequest
@@ -180,73 +201,81 @@ func TestConfinePriorityFromTheEnvironment(t *testing.T) {
 		seen, calls = request, calls+1
 		return &runner.ConfineDetachLaunch{ScopeID: "CONFINE-x-1-a@s", Acknowledge: func(bool) error { return nil }}, nil
 	}
-	const unset = "<unset>"
+	launch := func(t *testing.T, env string, detach bool, flag ...string) runner.ConfineRequest {
+		t.Helper()
+		setConfinePriorityEnv(t, env)
+		argv := []string{"confine"}
+		if detach {
+			argv = append(argv, "--detach")
+		}
+		argv = append(append(argv, flag...), "--", "true")
+		seen, calls = runner.ConfineRequest{}, 0
+		var stderr bytes.Buffer
+		if exit := runWithInput(argv, io.Discard, &stderr, strings.NewReader("")); exit != 0 || calls != 1 {
+			t.Fatalf("%v with %s=%q: exit=%d calls=%d stderr=%s", argv, runner.ConfinePriorityEnv, env, exit, calls, stderr.String())
+		}
+		request := seen
+		request.Stdin, request.Stdout, request.Stderr = nil, nil, nil
+		return request
+	}
 	for _, test := range []struct {
 		name string
 		env  string
 		flag []string
-		high bool
+		want string
 	}{
-		{"default", unset, nil, false},
-		{"env high", "high", nil, true},
-		{"env normal", "normal", nil, false},
-		{"env empty is absent", "", nil, false},
-		{"env whitespace is absent", " \t ", nil, false},
-		{"flag normal beats env high", "high", []string{"--priority", "normal"}, false},
-		{"flag high beats env normal", "normal", []string{"--priority", "high"}, true},
-		{"flag high with env unset", unset, []string{"--priority", "high"}, true},
-		{"flag wins without reading a bad env", "urgent", []string{"--priority", "normal"}, false},
+		{"default", confinePriorityUnset, nil, runner.ConfinePriorityNormal},
+		{"env high", "high", nil, runner.ConfinePriorityHigh},
+		{"env normal", "normal", nil, runner.ConfinePriorityNormal},
+		{"env whitespace is absent", " \t ", nil, runner.ConfinePriorityNormal},
+		{"flag high, env unset", confinePriorityUnset, []string{"--priority", "high"}, runner.ConfinePriorityHigh},
+		{"flag normal, env unset", confinePriorityUnset, []string{"--priority", "normal"}, runner.ConfinePriorityNormal},
+		{"flag normal beats env high", "high", []string{"--priority", "normal"}, runner.ConfinePriorityNormal},
+		{"flag high beats env normal", "normal", []string{"--priority", "high"}, runner.ConfinePriorityHigh},
+		{"flag wins without reading a bad env", "urgent", []string{"--priority", "normal"}, runner.ConfinePriorityNormal},
+		{"flag wins without reading an empty env", "", []string{"--priority", "high"}, runner.ConfinePriorityHigh},
 	} {
 		for _, detach := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/detach=%t", test.name, detach), func(t *testing.T) {
-				if test.env == unset {
-					t.Setenv(runner.ConfinePriorityEnv, "")
-					if err := os.Unsetenv(runner.ConfinePriorityEnv); err != nil {
-						t.Fatal(err)
-					}
-				} else {
-					t.Setenv(runner.ConfinePriorityEnv, test.env)
+				request := launch(t, test.env, detach, test.flag...)
+				if want := test.want == runner.ConfinePriorityHigh; request.HighPriority != want {
+					t.Fatalf("HighPriority=%v, want %v", request.HighPriority, want)
 				}
-				argv := []string{"confine"}
-				if detach {
-					argv = append(argv, "--detach")
+				if reference := launch(t, confinePriorityUnset, detach, "--priority", test.want); !reflect.DeepEqual(request, reference) {
+					t.Fatalf("the request differs from a plain --priority %s launch:\ngot:       %+v\nreference: %+v", test.want, request, reference)
 				}
-				argv = append(append(argv, test.flag...), "--", "true")
-				seen, calls = runner.ConfineRequest{}, 0
-				var stderr bytes.Buffer
-				if exit := runWithInput(argv, io.Discard, &stderr, strings.NewReader("")); exit != 0 || calls != 1 {
-					t.Fatalf("%v: exit=%d calls=%d stderr=%s", argv, exit, calls, stderr.String())
+				rows := runner.ShimQueuedConfines([]runner.ConfineQueuedEntry{{ScopeID: "CONFINE-job-42-abc@s-1", ReserveBytes: 1 << 20, High: request.HighPriority}})
+				if len(rows) != 1 || rows[0].Priority != test.want {
+					t.Fatalf("queued rows=%+v, want priority %q", rows, test.want)
 				}
-				if seen.HighPriority != test.high {
-					t.Fatalf("%v with %s=%q: HighPriority=%v, want %v", argv, runner.ConfinePriorityEnv, test.env, seen.HighPriority, test.high)
+				encoded, err := json.Marshal(rows[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := `"priority":"` + test.want + `"`; !strings.Contains(string(encoded), want) {
+					t.Fatalf("--list JSON row %s does not carry %s", encoded, want)
+				}
+				wantCell := "queued"
+				if test.want == runner.ConfinePriorityHigh {
+					wantCell = "high"
+				}
+				if cell := topQueuedRow(rows[0], false, 1).Cells[3]; cell != wantCell {
+					t.Fatalf("aira top LIVE cell=%q, want %q", cell, wantCell)
 				}
 			})
 		}
 	}
 }
 
-// verifies: AIRA-348 — with --priority given the variable is not even read (the
-// --owner / AIRA_CONFINE_OWNER shape), so a stale or broken value cannot
-// matter. Mutation: read the variable before the flag check.
-func TestConfinePriorityFlagDoesNotReadTheEnvironment(t *testing.T) {
-	for _, flag := range []string{runner.ConfinePriorityHigh, runner.ConfinePriorityNormal} {
-		read := false
-		high, err := resolveConfinePriority(flag, func(key string) string {
-			read = read || key == runner.ConfinePriorityEnv
-			return "urgent"
-		})
-		if err != nil || read || high != (flag == runner.ConfinePriorityHigh) {
-			t.Fatalf("--priority %s: high=%v err=%v read=%v", flag, high, err, read)
-		}
-	}
-}
-
-// verifies: AIRA-348 — a set, non-blank AIRA_CONFINE_PRIORITY that is not
-// exactly `high` or `normal` is refused before anything runs, with the same
-// stable code as a bad --priority and naming the variable: a typo must neither
-// quietly demote a hook's `high` nor promote anything. Mutations: ignore an
-// unknown value (runs at normal); trim or case-fold it (" high"/"HIGH" accepted);
-// drop the variable's name from the message.
+// verifies: AIRA-348 — a SET AIRA_CONFINE_PRIORITY that is not exactly `high`
+// or `normal` is refused before anything runs, with the same stable code as a
+// bad --priority and naming the variable: a typo, or an empty value (set but
+// blank, as `AIRA_CONFINE_PRIORITY=$P` with P unset gives), must neither quietly
+// demote a hook's `high` nor promote anything. Whitespace only is absent (see
+// TestConfinePrioritySourceDecidesTheDisplayedPriority). Mutations: ignore an
+// unknown value (runs at normal); trim or case-fold it (" high"/"HIGH"
+// accepted); Getenv instead of LookupEnv (empty runs at normal); drop the
+// variable's name from the message.
 func TestConfinePriorityEnvironmentRefusesAnUnknownValue(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
@@ -255,9 +284,9 @@ func TestConfinePriorityEnvironmentRefusesAnUnknownValue(t *testing.T) {
 		ran = true
 		return runner.ConfineResult{}, nil
 	}
-	for _, value := range []string{"urgent", "HIGH", "High", " high", "normal\n", "1", "true"} {
+	for _, value := range []string{"", "urgent", "HIGH", "High", " high", "normal\n", "1", "true"} {
 		t.Run(fmt.Sprintf("%q", value), func(t *testing.T) {
-			t.Setenv(runner.ConfinePriorityEnv, value)
+			setConfinePriorityEnv(t, value)
 			ran = false
 			var stderr bytes.Buffer
 			exit := runWithInput([]string{"confine", "--", "true"}, io.Discard, &stderr, strings.NewReader(""))
@@ -276,12 +305,47 @@ func TestConfinePriorityEnvironmentRefusesAnUnknownValue(t *testing.T) {
 	}
 }
 
+// mcpWireResult serves one JSON-RPC request through the real MCP server loop
+// and returns the encoded result exactly as a client receives it.
+func mcpWireResult(t *testing.T, method string) json.RawMessage {
+	t.Helper()
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
+		return core.New(nil), func() {}, nil
+	})
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"`+method+`","params":{}}`+"\n"), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var response mcpResponse
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil || response.Error != nil {
+		t.Fatalf("%s response=%s err=%v", method, out.String(), err)
+	}
+	return response.Result
+}
+
+// mcpWireInstructions is the `instructions` string of a real initialize reply.
+func mcpWireInstructions(t *testing.T) string {
+	t.Helper()
+	var result struct {
+		Instructions string `json:"instructions"`
+	}
+	if err := json.Unmarshal(mcpWireResult(t, "initialize"), &result); err != nil {
+		t.Fatal(err)
+	}
+	return result.Instructions
+}
+
 // verifies: AIRA-348 — every generated face names the variable, the precedence,
-// the refusal and the strip: the confine help (text and --json carry the verb
-// summary, ConfinePrioritySummary), the MCP server instructions (the same
-// summary) and the generated skill (the long ConfinePriorityGuidance, which
-// also carries the hook override example). Mutation: drop the sentence from
-// either constant -> red on the faces it feeds.
+// the refusal and the strip, read from what each face actually emits: the
+// confine help (text and --json carry the verb summary, ConfinePrioritySummary),
+// the MCP initialize reply's instructions as serialized on the wire (the same
+// summary) and the generated skill (the long ConfinePriorityGuidance, which also
+// carries the hook override example). And MCP's tools/list, the other half of
+// the MCP face, has NO confine launch tool and no `priority` input anywhere, as
+// the instructions say: a launch over MCP would be a second, undocumented
+// priority source. Mutations: drop the sentence from either constant; drop or
+// replace `instructions` in the initialize reply; add a launch tool or a
+// `priority` property to a tool schema -> red.
 func TestConfinePriorityEnvironmentIsDocumented(t *testing.T) {
 	var help, helpJSON bytes.Buffer
 	if exit := runConfineHelpCommand(false, &help, io.Discard); exit != 0 {
@@ -307,11 +371,12 @@ func TestConfinePriorityEnvironmentIsDocumented(t *testing.T) {
 	}{
 		{"confine help", help.String(), short},
 		{"confine help json", helpJSON.String(), short},
-		{"mcp", mcpServerInstructions, short},
+		{"mcp initialize", mcpWireInstructions(t), append([]string{"no tool that launches a confined job"}, short...)},
 		{"skill", string(artifacts.SkillMD), []string{
 			"`" + runner.ConfinePriorityEnv + "` environment variable",
 			"the flag wins",
-			"any other value is refused",
+			"whitespace-only means absent",
+			"any other value is refused, set-but-empty included",
 			"removed from the confined command's environment",
 			"AIRA_CONFINE_PRIORITY=normal git commit",
 		}},
@@ -323,44 +388,33 @@ func TestConfinePriorityEnvironmentIsDocumented(t *testing.T) {
 			}
 		}
 	}
-}
 
-// verifies: AIRA-348 — the variable only supplies the CLIENT's choice: the
-// request an env-sourced priority produces is identical, field for field, to
-// the one the same --priority flag produces, so nothing downstream can tell
-// the sources apart. The admit wire field, the one re-ask at normal with a
-// notice against an old daemon (TestHighPriorityAgainstAnOldDaemonDegradesToNormalWithANotice),
-// the re-send after a daemon restart (TestHighPriorityIsResentAfterAReconnect)
-// and the priority `--list` and `aira top` display all read only
-// request.HighPriority. Mutation: carry the source on the request (any new
-// field set only on the env path) or drop the env read -> the requests differ.
-func TestConfinePriorityFromTheEnvironmentIsIndistinguishableFromTheFlag(t *testing.T) {
-	original := runConfined
-	t.Cleanup(func() { runConfined = original })
-	var seen runner.ConfineRequest
-	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
-		seen = request
-		return runner.ConfineResult{}, nil
+	var tools struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			InputSchema struct {
+				Properties map[string]json.RawMessage `json:"properties"`
+			} `json:"inputSchema"`
+		} `json:"tools"`
 	}
-	launch := func(t *testing.T, env string, argv ...string) runner.ConfineRequest {
-		t.Helper()
-		t.Setenv(runner.ConfinePriorityEnv, env)
-		seen = runner.ConfineRequest{}
-		if exit := runWithInput(append(append([]string{"confine"}, argv...), "--", "true"), io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
-			t.Fatalf("%v with %s=%q: exit=%d", argv, runner.ConfinePriorityEnv, env, exit)
-		}
-		request := seen
-		request.Stdin, request.Stdout, request.Stderr = nil, nil, nil
-		return request
+	if err := json.Unmarshal(mcpWireResult(t, "tools/list"), &tools); err != nil {
+		t.Fatal(err)
 	}
-	for _, value := range []string{runner.ConfinePriorityHigh, runner.ConfinePriorityNormal} {
-		fromFlag := launch(t, "", "--priority", value)
-		fromEnv := launch(t, value)
-		if !reflect.DeepEqual(fromFlag, fromEnv) {
-			t.Fatalf("%s: the env-sourced request differs from the flag-sourced one:\nflag: %+v\nenv:  %+v", value, fromFlag, fromEnv)
+	withProperties := 0
+	for _, tool := range tools.Tools {
+		if len(tool.InputSchema.Properties) > 0 {
+			withProperties++
 		}
-		if fromEnv.HighPriority != (value == runner.ConfinePriorityHigh) {
-			t.Fatalf("%s: HighPriority=%v", value, fromEnv.HighPriority)
+	}
+	if withProperties == 0 {
+		t.Fatalf("no tools/list tool has input properties (%d tools): the absence checks below would prove nothing", len(tools.Tools))
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name == "aira_confine" || tool.Name == "aira_drain" {
+			t.Errorf("tools/list has a confine launch tool %q", tool.Name)
+		}
+		if _, ok := tool.InputSchema.Properties["priority"]; ok {
+			t.Errorf("tools/list tool %q takes a priority input", tool.Name)
 		}
 	}
 }

@@ -1190,31 +1190,6 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	return target, options, nil
 }
 
-// resolveConfinePriority is the launch priority chain (AIRA-348): the --priority
-// flag (parseConfineArgs has refused every value but high and normal), else
-// AIRA_CONFINE_PRIORITY, else normal; the same shape as --owner /
-// AIRA_CONFINE_OWNER, and like it the variable is not read when the flag is
-// given. A blank variable (unset, empty or whitespace only) is absent, as
-// AIRA_CONFINE_OWNER treats it. Any other value must be exactly high or normal
-// and is otherwise refused: a typo must neither quietly demote a hook's `high`
-// nor promote anything.
-func resolveConfinePriority(flag string, getenv func(string) string) (bool, error) {
-	if flag != "" {
-		return flag == runner.ConfinePriorityHigh, nil
-	}
-	environment := getenv(runner.ConfinePriorityEnv)
-	switch {
-	case strings.TrimSpace(environment) == "":
-		return false, nil
-	case environment == runner.ConfinePriorityHigh:
-		return true, nil
-	case environment == runner.ConfinePriorityNormal:
-		return false, nil
-	}
-	return false, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s must be %s or %s, not %q (unset it, or pass --priority, which wins over it)",
-		runner.ConfinePriorityEnv, runner.ConfinePriorityHigh, runner.ConfinePriorityNormal, environment)
-}
-
 // parseConfineJobBound parses one --timeout/--cpu-timeout value. It is the ONE
 // definition of what those options accept, shared by the parse-time refusal and
 // the request transcription, so the two cannot drift into accepting different
@@ -1655,7 +1630,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	if err != nil {
 		return refuseConfineLaunch(stderr, err)
 	}
-	highPriority, err := resolveConfinePriority(options["priority"], os.Getenv)
+	highPriority, err := runner.ResolveConfinePriority(options["priority"], os.LookupEnv)
 	if err != nil {
 		return refuseConfineLaunch(stderr, err)
 	}
