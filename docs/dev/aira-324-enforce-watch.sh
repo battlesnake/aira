@@ -11,8 +11,12 @@
 # writes ONLY under ~/tmp/aira-324-watch/ (or $AIRA_324_WATCH_DIR): state, samples and the
 # baseline. With --store it copies the store there, reads the copy and deletes it. It
 # changes nothing in aira, systemd or the store. Safe from cron or a loop, for example
-# every 5 minutes (the 2-hour triggers need samples at most 15 minutes apart):
-#   */5 * * * * /path/to/docs/dev/aira-324-enforce-watch.sh >> ~/tmp/aira-324-watch/watch.log 2>&1
+# every 5 minutes (the 2-hour triggers need samples at most 15 minutes apart). Cron gives
+# a bare environment: the script sets XDG_RUNTIME_DIR=/run/user/<uid> itself when it is
+# unset (systemctl --user and journalctl --user need it), and the cron line must put aira
+# on PATH (otherwise the queue fields read unevaluated):
+#   */5 * * * * PATH="$HOME/.local/bin:/usr/bin:/bin" /path/to/docs/dev/aira-324-enforce-watch.sh >> "$HOME/tmp/aira-324-watch/watch.log" 2>&1
+# A loop instead: while sleep 300; do docs/dev/aira-324-enforce-watch.sh; done >> ~/tmp/aira-324-watch/watch.log
 #
 # Fields (cumulative counters since the slice was created; d_* = change since the last
 # sample, "unevaluated" on the first sample or after a counter reset):
@@ -29,13 +33,22 @@
 #   some_avg10            memory.pressure (hierarchical: a job stalling at its own cap raises it).
 #   queued/running/granted_gib/ceiling_gib   from `aira confine --list` (ceiling = ledger ceiling;
 #                         the report's condition C4 fires when it stays above 57.6 GiB for an hour).
-#   observe/enforce/discounted/phys_unfit    daemon log lines in the last N minutes.
-#   above_charge (--store)  pinned rows (cap:operator:--memory-reserve) that STARTED in the
-#                         current enforce epoch (the run of enforce lines at the current
-#                         factor, back to the last observe line or factor change) and in the
-#                         last 7 days, whose peak exceeds ceil(factor x budget). OOM rows are
-#                         kept. Rows cannot tell a discountable pin from a delegate parent or
-#                         exclusive job, and failed or evicted runs have no row: stated, not fixed.
+#   observe/enforce/discounted/phys_unfit    daemon log lines in the last N minutes
+#                         ("unevaluated" if journalctl fails: never a fake 0).
+#   above_charge (--store)  the spec's 5% trigger on the DISCOUNTED grants themselves: every
+#                         `pin-charge enforce` line with charged < pin in the current enforce
+#                         epoch (the run of enforce lines at the current factor, back to the
+#                         last observe line or factor change) and the last 7 days, paired one
+#                         to one with the pinned row of the same pin started within 0.5 s
+#                         (the replay script's attribute(), selftested there). above = paired
+#                         rows whose peak exceeds the line's charge (OOM rows kept). Lines with
+#                         no row (failed, killed or still running) have unknown peaks, so the
+#                         share is the interval [above, above + unknown] / grants, compared in
+#                         integers: met above 5%, not met when even the upper end is <= 5%,
+#                         else unevaluated (the replay script's trigger_verdict()). Restart
+#                         survivors and ineligible jobs have no enforce line: excluded.
+#                         share_paired_estimate = above / paired is shown for the owner's
+#                         judgement only: it assumes the rowless grants peak like the paired.
 #   triggers              rollback triggers that are MET, plus the ones that are unevaluated.
 set -euo pipefail
 
@@ -57,22 +70,36 @@ dir="${AIRA_324_WATCH_DIR:-$HOME/tmp/aira-324-watch}"
 mkdir -p "$dir"
 # AIRA_324_WATCH_CGROUP points at another directory holding memory.events(.local) and
 # memory.pressure: a test seam (a fake cgroup), never needed in normal use.
-cg="${AIRA_324_WATCH_CGROUP:-/sys/fs/cgroup$(systemctl --user show aira.slice -p ControlGroup --value)}"
+# cron runs without XDG_RUNTIME_DIR; systemctl --user and journalctl --user need it.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [ -n "${AIRA_324_WATCH_CGROUP:-}" ]; then
+  cg="$AIRA_324_WATCH_CGROUP"
+else
+  slice_cg="$(systemctl --user show aira.slice -p ControlGroup --value 2> /dev/null)" || slice_cg=""
+  [ -n "$slice_cg" ] || { echo "cannot find aira.slice's cgroup (systemctl --user failed)" >&2; exit 3; }
+  cg="/sys/fs/cgroup$slice_cg"
+fi
 [ -r "$cg/memory.events.local" ] || { echo "cannot read $cg/memory.events.local" >&2; exit 3; }
-slice_since="$(systemctl --user show aira.slice -p ActiveEnterTimestamp --value)"
+slice_since="$(systemctl --user show aira.slice -p ActiveEnterTimestamp --value 2> /dev/null)" || slice_since="unevaluated"
 
 list_json="$dir/list.json"
 if ! aira confine --list > "$list_json" 2> /dev/null; then
   : > "$list_json"
 fi
 journal="$dir/journal.txt"
-journalctl --user -u aira-daemon.service --since "${minutes} min ago" -o cat > "$journal" 2> /dev/null || : > "$journal"
+journal_ok=1
+if ! journalctl --user -u aira-daemon.service --since "${minutes} min ago" -o cat > "$journal" 2> /dev/null; then
+  journal_ok=0
+  : > "$journal"
+fi
 pincharge="$dir/pincharge.txt"
+pincharge_ok=0
 : > "$pincharge"
 if [ "$store" -eq 1 ]; then
-  # Every pin-charge line of the unit, to find the current enforce epoch.
-  journalctl --user -u aira-daemon.service --since "8 days ago" -o short-unix 2> /dev/null \
-    | awk '/pin-charge (observe|enforce):/' > "$pincharge" || true
+  # The unit's journal for 8 days, to find the current enforce epoch and its grants.
+  if journalctl --user -u aira-daemon.service --since "8 days ago" -o short-unix > "$pincharge" 2> /dev/null; then
+    pincharge_ok=1
+  fi
   cp "$HOME/.local/state/aira/state.db" "$dir/state.db"
   if [ -e "$HOME/.local/state/aira/state.db-wal" ]; then
     cp "$HOME/.local/state/aira/state.db-wal" "$dir/state.db-wal"
@@ -81,10 +108,16 @@ if [ "$store" -eq 1 ]; then
   fi
 fi
 
-exec python3 -I - "$cg" "$dir" "$list_json" "$journal" "$minutes" "$store" "$baseline" "$pincharge" "$slice_since" <<'PY'
-import json, os, re, sqlite3, sys, time
+replay="$(dirname "$0")/aira-324-enforce-gate-replay.py"
+[ -r "$replay" ] || { echo "cannot read $replay (the 5% trigger arithmetic lives there)" >&2; exit 3; }
+exec python3 -I - "$cg" "$dir" "$list_json" "$journal" "$minutes" "$store" "$baseline" "$pincharge" "$slice_since" \
+  "$journal_ok" "$pincharge_ok" "$replay" <<'PY'
+import importlib.util, json, os, re, sqlite3, sys, time
 
-cg, d, list_json, journal, minutes, store, baseline, pincharge, slice_since = sys.argv[1:]
+cg, d, list_json, journal, minutes, store, baseline, pincharge, slice_since, journal_ok, pincharge_ok, replay = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("aira324replay", replay)
+R = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(R)
 now = time.time()
 MAX_GAP = 900          # samples further apart than this break a 1- or 2-hour window
 C4_CEILING = int(57.6 * 2**30)   # ledger ceiling above which L / 0.9 exceeds MemoryMax (64 GiB)
@@ -235,33 +268,54 @@ with open(journal, errors="replace") as f:
             disc += int(m.group(2)) < int(m.group(1))
         if "pin-charge" in l and "physical-fit=false" in l:
             unfit += 1
-line.update({"minutes": int(minutes), "observe": obs, "enforce": enf, "discounted": disc, "phys_unfit": unfit})
+if journal_ok == "1":
+    line.update({"minutes": int(minutes), "observe": obs, "enforce": enf, "discounted": disc, "phys_unfit": unfit})
+else:
+    line.update({"minutes": int(minutes), "observe": "unevaluated", "enforce": "unevaluated",
+                 "discounted": "unevaluated", "phys_unfit": "unevaluated"})
 
 if store == "1":
-    epoch, fac = None, None
+    epoch, fac, grants = None, None, []
     with open(pincharge, errors="replace") as f:
         for l in f:
-            m = re.search(r"pin-charge (observe|enforce): .*factor=([0-9.]+)", l)
+            m = re.search(r"pin-charge (observe|enforce): scope=\S+ pin=(\d+) charged=(\d+) .*factor=([0-9.]+)", l)
             if not m:
                 continue
             t = float(l.split(" ", 1)[0])
             if m.group(1) == "observe":
-                epoch, fac = None, None
-            elif fac != m.group(2):
-                epoch, fac = t, m.group(2)
-    if epoch is None:
+                epoch, fac, grants = None, None, []
+                continue
+            if fac != m.group(4):
+                epoch, fac, grants = t, m.group(4), []
+            if int(m.group(3)) < int(m.group(2)):          # discounted
+                grants.append((int(t * 1000), int(m.group(2)), int(m.group(3))))
+    if pincharge_ok != "1":
+        line["above_charge"] = "unevaluated (journalctl failed)"
+    elif epoch is None:
         line["above_charge"] = "unevaluated (the journal's latest pin-charge line is not enforce, or none in 8 days)"
     else:
-        pct = int(round(float(fac) * 100))
         lo = max(epoch, now - 7 * 86400)
+        lo_ms = int(lo * 1000)            # the same truncation as each grant's time: the epoch's first line counts
+        grants = [g for g in grants if g[0] >= lo_ms]
         c = sqlite3.connect("file:%s?mode=ro" % os.path.join(d, "state.db"), uri=True)
-        n, above, oom = c.execute(
-            "select count(*), sum(peak_rss > (budget * ? + 99) / 100), sum(oom) from confine_peak_history "
-            "where kind = 'confine' and budget_basis = 'cap:operator:--memory-reserve' and started_at_ms >= ?",
-            (pct, int(lo * 1000))).fetchone()
+        prow = c.execute(
+            "select started_at_ms, budget, coalesce(peak_rss, 0), oom from confine_peak_history "
+            "where kind = 'confine' and budget_basis = ? and started_at_ms >= ? and budget is not null",
+            (R.PIN_BASIS, lo_ms - 500)).fetchall()
         c.close()
-        line["above_charge"] = {"factor": float(fac), "since": int(lo), "rows": n, "above": above or 0,
-                                "oom": oom or 0, "share": round((above or 0) / n, 4) if n else "unevaluated"}
+        jobs = [R.Job(i, st, st, 0, pk, b, R.PIN_BASIS, oom) for i, (st, b, pk, oom) in enumerate(prow)]
+        att = R.attribute(grants, jobs)
+        above = sum(1 for i, j in att.items() if j.peak > grants[i][2])
+        unknown = len(grants) - len(att)
+        n = len(grants)
+        line["above_charge"] = {
+            "factor": float(fac), "since": int(lo), "grants": n, "paired": len(att), "unknown": unknown,
+            "above": above, "oom": sum(1 for i, j in att.items() if j.oom and j.peak > grants[i][2]),
+            "share_low": round(above / n, 4) if n else "unevaluated",
+            "share_high": round((above + unknown) / n, 4) if n else "unevaluated",
+            # an ESTIMATE that assumes the rowless grants peak like the paired ones; not the trigger
+            "share_paired_estimate": round(above / len(att), 4) if att else "unevaluated",
+            "trigger": R.trigger_verdict(above, unknown, n)}
 
 trig = []
 if isinstance(line["d_oom_local"], int) and line["d_oom_local"] > 0:
@@ -298,9 +352,18 @@ if os.path.exists(bl_path):
         trig.append("high: unevaluated (no baseline p99)")
 else:
     trig.append("pressure/high: unevaluated (run --baseline first)")
+if journal_ok != "1":
+    trig.append("daemon log: unevaluated (journalctl failed)")
 ac = line.get("above_charge")
-if isinstance(ac, dict) and isinstance(ac.get("share"), float) and ac["rows"] >= 100 and ac["share"] > 0.05:
-    trig.append("above-charge share > 5%")
+if isinstance(ac, dict) and ac["trigger"] == "met":
+    trig.append("above-charge share > 5% of discounted grants")
+elif isinstance(ac, str):
+    trig.append("above-charge: " + ac)
+elif isinstance(ac, dict) and ac["trigger"] == "unevaluated":
+    trig.append("above-charge: unevaluated (%s)" % (
+        "%d of %d discounted grants have no row, so the share is between %s and %s" % (
+            ac["unknown"], ac["grants"], ac["share_low"], ac["share_high"])
+        if ac["grants"] else "no discounted grant in the epoch"))
 line["triggers"] = trig
 
 with open(samples_path, "a") as f:
