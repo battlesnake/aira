@@ -5,14 +5,16 @@
 # Report: docs/dev/aira-324-enforce-gate-report.md (sections 8 to 10).
 #
 #   docs/dev/aira-324-enforce-watch.sh [--minutes N] [--store]   one sample, one JSON line
-#   docs/dev/aira-324-enforce-watch.sh --baseline                 write/print the pre-enforce baseline
+#   docs/dev/aira-324-enforce-watch.sh --baseline [--force-baseline]   write/print the pre-enforce baseline
 #
 # It reads aira.slice's cgroup files, /proc/meminfo, `aira confine --list`, the daemon's and
 # systemd-oomd's journal, and writes ONLY under ~/tmp/aira-324-watch/ (or $AIRA_324_WATCH_DIR):
-# samples, the baseline and the pinned rows it has seen (rows.tsv: start, pin, peak, oom and
-# run length; no command). With --store it copies the store there, reads the copy and deletes
-# it. It changes nothing in aira, systemd or the store, and it ROLLS NOTHING BACK: it prints
-# what is met, and the operator acts (report section 10). Safe from cron or a loop, every 5
+# samples.tsv, baseline.json, the pinned rows it has seen (rows.tsv: start, pin, peak (-1 =
+# unknown), oom and run length; no command), met.log and enforce-seen (below). Each run keeps
+# its journal excerpts, list and store copy in a private mktemp directory there, removed on
+# exit, so concurrent runs do not share scratch files. It changes nothing in aira, systemd or
+# the store, and it ROLLS NOTHING BACK: it prints what is met, and the operator acts (report
+# section 10). Safe from cron or a loop, every 5
 # minutes (the 2-hour triggers need samples at most 15 minutes apart), with --store once an
 # hour (the copy is about 340 MB). Cron gives a bare environment: the script sets
 # XDG_RUNTIME_DIR=/run/user/<uid> itself when it is unset (systemctl --user and journalctl
@@ -36,8 +38,8 @@
 #                         (watchdog.go watchdogLowMemAvailable) and acts on UNCONFINED processes.
 #   queued/running/granted_gib/ceiling_gib/ceiling_basis   from `aira confine --list`;
 #                         ceiling_basis "system-pressure" means host memory binds, not the slice.
-#   observe/enforce/discounted/phys_unfit/enforce_factors/watchdog_trips   daemon log lines in
-#                         the last N minutes ("unevaluated" if journalctl fails: never a fake 0).
+#   observe/enforce/discounted/enforce_factors/watchdog_trips   daemon log lines in the last N
+#                         minutes ("unevaluated" if journalctl fails: never a fake 0).
 #   oomd_kills, oomd_kills_aira   systemd-oomd `Killed` lines in the last N minutes (all / under
 #                         aira.slice); "unevaluated" if its journal cannot be read.
 #   above_charge (--store)  the spec's 5% trigger on the DISCOUNTED grants: every `pin-charge
@@ -48,22 +50,35 @@
 #                         [above_low, above_high]: grants with no row (failed, killed, still
 #                         running, or the row evicted by the 20-row retention before an hourly
 #                         --store saw it) and components that do not pair one to one widen it (the
-#                         replay script's attribute(), selftested there). met above 5% even at the
-#                         low end, not met when even the high end is <= 5%, else unevaluated.
-#                         share_one_to_one_estimate is for the owner's judgement only.
+#                         replay script's attribute(), selftested there). A row with no peak
+#                         (peak_rss NULL) is unknown too, never a 0-byte peak (unknown_peak).
+#                         share = [above_low, above_high] / grants, an interval. met above 5% even
+#                         at the low end, not met when even the high end is <= 5%, else unevaluated.
+#                         share_one_to_one_estimate (known one-to-one pairs only) is for the owner's
+#                         judgement, never the trigger.
 #   met                   rollback triggers that are MET: the operator rolls back (report 9 step 5).
+#                         Every run with a met trigger also APPENDS {"at", "met"} to met.log, which
+#                         nothing truncates: a trigger met at 02:00 is still there at 08:00, after the
+#                         10-minute journal window and the hourly watch.log tail have moved on.
 #   unevaluated           triggers that cannot be judged from this sample, each with its reason.
+#
+# enforce-seen: written (once, with the time) the first time a run sees a `pin-charge enforce`
+# line (a --baseline run checks its own journal read too). From then on --baseline refuses
+# (exit 4): a baseline taken after enforce started would describe enforce, not the state before
+# it. --force-baseline overrides that, on purpose only.
 set -euo pipefail
 
 minutes=10
 store=0
 baseline=0
+force_baseline=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --minutes) minutes="${2:-}"; shift 2 ;;
     --store) store=1; shift ;;
     --baseline) baseline=1; shift ;;
-    -h|--help) sed -n '2,56p' "$0"; exit 0 ;;
+    --force-baseline) force_baseline=1; shift ;;
+    -h|--help) sed -n '2,/^set -euo pipefail$/{/^set -euo/!p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -86,23 +101,25 @@ fi
 meminfo="${AIRA_324_WATCH_MEMINFO:-/proc/meminfo}"
 slice_since="$(systemctl --user show aira.slice -p ActiveEnterTimestamp --value 2> /dev/null)" || slice_since="unevaluated"
 
-list_json="$dir/list.json"
+scratch="$(mktemp -d "$dir/run.XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+list_json="$scratch/list.json"
 if ! aira confine --list > "$list_json" 2> /dev/null; then
   : > "$list_json"
 fi
-journal="$dir/journal.txt"
+journal="$scratch/journal.txt"
 journal_ok=1
 if ! journalctl --user -u aira-daemon.service --since "${minutes} min ago" -o cat > "$journal" 2> /dev/null; then
   journal_ok=0
   : > "$journal"
 fi
-oomd="$dir/oomd.txt"
+oomd="$scratch/oomd.txt"
 oomd_ok=1
 if ! journalctl -t systemd-oomd --since "${minutes} min ago" -o cat > "$oomd" 2> /dev/null; then
   oomd_ok=0
   : > "$oomd"
 fi
-pincharge="$dir/pincharge.txt"
+pincharge="$scratch/pincharge.txt"
 pincharge_ok=0
 : > "$pincharge"
 if [ "$store" -eq 1 ]; then
@@ -110,22 +127,21 @@ if [ "$store" -eq 1 ]; then
   if journalctl --user -u aira-daemon.service --since "8 days ago" -o short-unix > "$pincharge" 2> /dev/null; then
     pincharge_ok=1
   fi
-  cp "$HOME/.local/state/aira/state.db" "$dir/state.db"
+  cp "$HOME/.local/state/aira/state.db" "$scratch/state.db"
   if [ -e "$HOME/.local/state/aira/state.db-wal" ]; then
-    cp "$HOME/.local/state/aira/state.db-wal" "$dir/state.db-wal"
-  else
-    rm -f "$dir/state.db-wal"
+    cp "$HOME/.local/state/aira/state.db-wal" "$scratch/state.db-wal"
   fi
 fi
 
 replay="$(dirname "$0")/aira-324-enforce-gate-replay.py"
 [ -r "$replay" ] || { echo "cannot read $replay (the 5% trigger arithmetic lives there)" >&2; exit 3; }
-exec python3 -I - "$cg" "$dir" "$list_json" "$journal" "$minutes" "$store" "$baseline" "$pincharge" "$slice_since" \
-  "$journal_ok" "$pincharge_ok" "$replay" "$meminfo" "$oomd" "$oomd_ok" <<'PY'
+# not exec: the EXIT trap removes this run's scratch directory after python returns
+python3 -I - "$cg" "$dir" "$list_json" "$journal" "$minutes" "$store" "$baseline" "$pincharge" "$slice_since" \
+  "$journal_ok" "$pincharge_ok" "$replay" "$meminfo" "$oomd" "$oomd_ok" "$scratch" "$force_baseline" <<'PY'
 import importlib.util, json, os, re, sqlite3, sys, time
 
 (cg, d, list_json, journal, minutes, store, baseline, pincharge, slice_since, journal_ok, pincharge_ok, replay,
- meminfo, oomd, oomd_ok) = sys.argv[1:]
+ meminfo, oomd, oomd_ok, scratch, force_baseline) = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("aira324replay", replay)
 R = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(R)
@@ -136,15 +152,11 @@ TRIAL_FACTOR = "0.90"          # the only factor the report's trial covers
 COUNTERS = ("oom_local", "max_local", "oom_kill_local", "oom_kill", "high")
 samples_path = os.path.join(d, "samples.tsv")
 rows_path = os.path.join(d, "rows.tsv")
+met_log = os.path.join(d, "met.log")
+enforce_flag = os.path.join(d, "enforce-seen")
 PARENT = R.PARENT_PREFIX       # delegate-parent signatures: never discounted
-
-
-def cleanup():
-    # The list, the journal excerpts and the store copy name other sessions' commands: keep none.
-    for p in (list_json, journal, oomd, pincharge, os.path.join(d, "state.db"), os.path.join(d, "state.db-wal"),
-              os.path.join(d, "state.db-shm")):
-        if os.path.exists(p):
-            os.remove(p)
+# The list, the journal excerpts and the store copy name other sessions' commands: they live in
+# this run's scratch directory, which the shell's EXIT trap removes.
 
 
 def events(name):
@@ -226,6 +238,18 @@ a10 = avg10()
 rows = read_samples()
 
 if baseline == "1":
+    # enforce may have started since the last sample wrote enforce-seen: the journal read for
+    # this run counts too, and records the flag
+    with open(journal, errors="replace") as f:
+        if any("pin-charge enforce:" in l for l in f) and not os.path.exists(enforce_flag):
+            with open(enforce_flag, "w") as g:
+                g.write(time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)) + "\n")
+    if os.path.exists(enforce_flag) and force_baseline != "1":
+        with open(enforce_flag) as f:
+            seen_at = f.read().strip()
+        sys.stderr.write("refusing --baseline: enforce was first seen at %s (%s), so a baseline now would describe "
+                         "enforce; pass --force-baseline to overwrite on purpose\n" % (seen_at, enforce_flag))
+        sys.exit(4)
     out = {"at": int(now), "slice_active_since": slice_since}
     # Counters are cumulative since the slice was created: a cumulative 0 proves every
     # hourly delta since then was 0, so its p99 is 0 over that span (not the spec's week).
@@ -255,7 +279,6 @@ if baseline == "1":
     out["oom_local_since_slice_creation"] = cur["oom_local"]
     with open(os.path.join(d, "baseline.json"), "w") as f:
         json.dump(out, f)
-    cleanup()
     print(json.dumps(out))
     sys.exit(0)
 
@@ -284,7 +307,7 @@ try:
 except Exception:
     for k in ("queued", "running", "granted_gib", "ceiling_gib", "ceiling_basis"):
         line[k] = "unevaluated"
-obs = enf = disc = unfit = trips = 0
+obs = enf = disc = trips = 0
 factors = set()
 with open(journal, errors="replace") as f:
     for l in f:
@@ -295,16 +318,14 @@ with open(journal, errors="replace") as f:
             enf += 1
             disc += int(m.group(2)) < int(m.group(1))
             factors.add(m.group(3))
-        if "pin-charge" in l and "physical-fit=false" in l:
-            unfit += 1
         if "aira daemon: watchdog trip:" in l:
             trips += 1
 line["minutes"] = int(minutes)
 if journal_ok == "1":
-    line.update({"observe": obs, "enforce": enf, "discounted": disc, "phys_unfit": unfit,
+    line.update({"observe": obs, "enforce": enf, "discounted": disc,
                  "enforce_factors": sorted(factors), "watchdog_trips": trips})
 else:
-    for k in ("observe", "enforce", "discounted", "phys_unfit", "enforce_factors", "watchdog_trips"):
+    for k in ("observe", "enforce", "discounted", "enforce_factors", "watchdog_trips"):
         line[k] = "unevaluated"
 if oomd_ok == "1":
     with open(oomd, errors="replace") as f:
@@ -318,7 +339,7 @@ def pinned_rows():
     """Pinned non-parent rows of the last 8 days: the store copy's, unioned with every row an
     earlier --store run saw (rows are insert-only, so a row the 20-row retention has since
     evicted is still counted). Run on every --store, in an enforce epoch or not. rows.tsv
-    keeps 8 days and no command text."""
+    keeps 8 days and no command text. A NULL peak_rss is stored as -1 and stays UNKNOWN."""
     seen = set()
     if os.path.exists(rows_path):
         with open(rows_path) as f:
@@ -326,17 +347,18 @@ def pinned_rows():
                 p = l.split()
                 if len(p) == 5:
                     seen.add(tuple(map(int, p)))
-    c = sqlite3.connect("file:%s?mode=ro" % os.path.join(d, "state.db"), uri=True)
+    c = sqlite3.connect("file:%s?mode=ro" % os.path.join(scratch, "state.db"), uri=True)
     seen.update(c.execute(
-        "select started_at_ms, budget, coalesce(peak_rss, 0), oom, coalesce(wall_ms, -1) from confine_peak_history "
+        "select started_at_ms, budget, coalesce(peak_rss, -1), oom, coalesce(wall_ms, -1) from confine_peak_history "
         "where kind = 'confine' and budget_basis = ? and started_at_ms >= ? and budget is not null "
         "and instr(signature, ?) != 1",          # instr, not substr: the prefix ends in a NUL
         (R.PIN_BASIS, int((now - 8 * 86400) * 1000), PARENT)).fetchall())
     c.close()
     keep = sorted(r for r in seen if r[0] >= int((now - 8 * 86400) * 1000))
-    with open(rows_path + ".tmp", "w") as f:
+    tmp = "%s.tmp.%d" % (rows_path, os.getpid())     # private: concurrent --store runs
+    with open(tmp, "w") as f:
         f.writelines("%d %d %d %d %d\n" % r for r in keep)
-    os.replace(rows_path + ".tmp", rows_path)
+    os.replace(tmp, rows_path)
     return keep
 
 
@@ -365,16 +387,17 @@ if store == "1":
         lo_ms = int(lo * 1000)            # the same truncation as each grant's time: the epoch's first line counts
         grants = [g for g in grants if g[0] >= lo_ms]
         prow = [r for r in seen_rows if r[0] >= lo_ms - R.TOL]
-        jobs = [R.Job(i, st, st, 0, pk, b, R.PIN_BASIS, oom) for i, (st, b, pk, oom, _) in enumerate(prow)]
+        jobs = [R.Job(i, st, st, 0, pk if pk >= 0 else None, b, R.PIN_BASIS, oom)
+                for i, (st, b, pk, oom, _) in enumerate(prow)]
         charged = {g[1]: g[2] for g in grants}            # one factor per epoch: one charge per pin
         a = R.attribute(grants, jobs, charged.__getitem__)
         n = len(grants)
         line["above_charge"] = {
             "factor": float(fac), "since": int(lo), "grants": n, "paired": a["paired"], "rowless": a["rowless"],
-            "above_low": a["low"], "above_high": a["high"],
-            "share_low": round(a["low"] / n, 4) if n else "unevaluated",
-            "share_high": round(a["high"] / n, 4) if n else "unevaluated",
-            # an ESTIMATE over the one-to-one pairs only; not the trigger
+            "unknown_peak": a["unknown_peak"], "above_low": a["low"], "above_high": a["high"],
+            # an interval, never a point: rowless grants, unknown peaks and ambiguous pairs widen it
+            "share": [round(a["low"] / n, 4), round(a["high"] / n, 4)] if n else "unevaluated",
+            # an ESTIMATE over the one-to-one pairs with a known peak only; not the trigger
             "one_to_one": a["single"],
             "share_one_to_one_estimate": round(a["single_above"] / a["single"], 4) if a["single"] else "unevaluated",
             "rows_seen": len(prow),
@@ -396,7 +419,10 @@ if os.path.exists(bl_path):
     with open(bl_path) as f:
         bl = json.load(f)
     if isinstance(bl.get("some_avg10_p99"), (int, float)):
-        w = [r for r in allrows if r[0] >= now - 7200]
+        # the reading held at the window's left edge (the last sample at or before it) covers
+        # the start of the window, so it must be above the baseline too
+        held = at_or_before(allrows, now - 7200)
+        w = ([held] if held else []) + [r for r in allrows if r[0] > now - 7200]
         if not continuous(allrows, now - 7200, now):
             unev.append("pressure: unevaluated (samples do not cover the last 2 h)")
         elif all(r[2] > bl["some_avg10_p99"] for r in w):
@@ -432,13 +458,20 @@ elif isinstance(ac, str):
     unev.append("above-charge: " + ac)
 elif isinstance(ac, dict) and ac["trigger"] == "unevaluated":
     unev.append("above-charge: unevaluated (%s)" % (
-        "between %d and %d of %d discounted grants are above the charge (%d with no row)" % (
-            ac["above_low"], ac["above_high"], ac["grants"], ac["rowless"])
+        "between %d and %d of %d discounted grants are above the charge (%d with no row, %d rows with no peak)" % (
+            ac["above_low"], ac["above_high"], ac["grants"], ac["rowless"], ac["unknown_peak"])
         if ac["grants"] else "no discounted grant in the epoch"))
 line["met"], line["unevaluated"] = met, unev
+if met:
+    # LATCH: append-only, never truncated, so a trigger outlives the journal window and the tail
+    with open(met_log, "a") as f:
+        f.write(json.dumps({"at": line["at"], "met": met}) + "\n")
+seen_enforce = (journal_ok == "1" and enf > 0) or (isinstance(line.get("above_charge"), dict))
+if seen_enforce and not os.path.exists(enforce_flag):
+    with open(enforce_flag, "w") as f:
+        f.write(line["at"] + "\n")
 
 with open(samples_path, "a") as f:
     f.write("%.0f\t%s\t%s\n" % (now, "\t".join(str(cur[k]) for k in COUNTERS), a10))
-cleanup()
 print(json.dumps(line))
 PY

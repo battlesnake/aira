@@ -29,12 +29,18 @@ should not, or stays silent when it should fire, fails the case.
              low grant than its own row: unevaluated, never 'met'
   parent     a delegate-parent row (never discounted) 1 ms from the rowless grant's line is
              not taken for its row
+  null-peak  review P2-1: 3 of 40 above, the third's peak is NULL: [5%, 7.5%] unevaluated,
+             never 2 of 40 = 5% 'not met' (a NULL read as 0 is a known-safe sample)
   evicted    3 of 40 above; a second --store run after the retention evicted an above row
              still counts it (rows.tsv)
   no-log     journalctl fails: log fields and the trigger are unevaluated, never 0
 Trigger cases (one sample each): slice-level oom (first sample, rise, flat, reset), high
-(2 hours, 1 hour, reset, gap), pressure (2 hours, a dip, gap), MemAvailable (low, missing),
-a watchdog trip, a systemd-oomd kill or an unreadable oomd journal, an enforce factor of 0.80.
+(2 hours, 1 hour, reset, gap), pressure (2 hours, a dip, gap, and review P2-3: the reading held
+at the window's left edge below the baseline), MemAvailable (low, missing), a watchdog trip, a
+systemd-oomd kill or an unreadable oomd journal, an enforce factor of 0.80.
+Latching and housekeeping: a met trigger is appended to met.log and a quiet run writes none;
+--baseline refuses once enforce-seen exists unless --force-baseline, and works before; no run
+leaves scratch files behind.
 """
 import json
 import os
@@ -107,6 +113,8 @@ def build(root, now, c):
     recent = ["aira daemon: pin-charge observe: scope=A pin=1 charged=1 would-charge=1 factor=0.90 physical-free=1 physical-fit=true",
               "aira daemon: pin-charge enforce: scope=B pin=%d charged=%d factor=0.90 physical-free=1 physical-fit=true" % (PIN, CHARGE),
               "aira daemon: pin-charge enforce: scope=C pin=%d charged=%d factor=0.90 physical-free=1 physical-fit=false" % (PIN, PIN)]
+    if c.get("recent_only_observe"):
+        recent = recent[:1]
     recent += c.get("recent", [])
     (root / "recent.txt").write_text("\n".join(recent) + "\n")
     (root / "oomd.txt").write_text("".join(l + "\n" for l in c.get("oomd", [])))
@@ -120,7 +128,7 @@ def build(root, now, c):
     for g, t in enumerate(grant_times):
         if g in rowless:
             continue
-        peak = int(9.5 * GIB) if n < c.get("above", 0) else GIB
+        peak = None if g in c.get("null", ()) else int(9.5 * GIB) if n < c.get("above", 0) else GIB
         db.execute("insert into confine_peak_history values ('x', ?, 0, 'a', 'confine', ?, ?, 1, 0, ?, 'r')",
                    (peak, PIN, BASIS, int(t * 1000) + c.get("offset", {}).get(g, 1)))
         n += 1
@@ -147,11 +155,11 @@ def build(root, now, c):
     return home, cg, bin_, meminfo
 
 
-def invoke(watch, home, cg, bin_, meminfo, store):
+def invoke(watch, home, cg, bin_, meminfo, store, args=()):
     env = {"HOME": str(home), "PATH": "%s:/usr/bin:/bin" % bin_, "AIRA_324_WATCH_CGROUP": str(cg),
            "AIRA_324_WATCH_MEMINFO": str(meminfo)}
     p = subprocess.run(["env", "-i"] + ["%s=%s" % kv for kv in env.items()] + ["bash", str(watch)] +
-                       (["--store"] if store else []), capture_output=True, text=True)
+                       (["--store"] if store else []) + list(args), capture_output=True, text=True)
     out = p.stdout.strip().splitlines()
     return p.returncode, (json.loads(out[-1]) if out else None), p.stderr
 
@@ -189,12 +197,19 @@ def main():
             db.close()
             code, line, err = invoke(watch, home, cg, bin_, meminfo, store)
             check("%s: second run exit 0" % name, (code, err.strip()[:200] if code else ""), (0, ""))
-        return line or {"met": None, "unevaluated": None}
+        res: dict = line or {"met": None, "unevaluated": None}
+        wdir = home / "tmp/aira-324-watch"
+        ml = wdir / "met.log"
+        res["_metlog"] = [json.loads(x)["met"] for x in ml.read_text().splitlines()] if ml.exists() else []
+        res["_left"] = sorted(x.name for x in wdir.iterdir()
+                              if x.name not in ("samples.tsv", "rows.tsv", "baseline.json", "met.log", "enforce-seen"))
+        res["_ctx"] = (home, cg, bin_, meminfo)
+        return res
 
-    def ac(line):
+    def ac(line) -> tuple:
         a = line.get("above_charge")
         return (a["grants"], a["paired"], a["rowless"], a["above_low"], a["above_high"], a["trigger"]) \
-            if isinstance(a, dict) else a
+            if isinstance(a, dict) else (a,)
 
     def unev(line, prefix):
         return any(u.startswith(prefix) for u in line["unevaluated"] or [])
@@ -206,8 +221,11 @@ def main():
         check("met: 3 of 40 above, all paired, no row minimum", ac(m), (40, 40, 0, 3, 3, "met"))
         check("met: the only met trigger", m["met"], [AC_MET])
         check("met: log fields from the journal (XDG_RUNTIME_DIR set by the script)",
-              (m["observe"], m["enforce"], m["discounted"], m["phys_unfit"], m["enforce_factors"], m["watchdog_trips"]),
-              (1, 2, 1, 1, ["0.90"], 0))
+              (m["observe"], m["enforce"], m["discounted"], m["enforce_factors"], m["watchdog_trips"]),
+              (1, 2, 1, ["0.90"], 0))
+        check("met: the share is an interval", m["above_charge"]["share"], [0.075, 0.075])
+        check("met: latched in met.log", m["_metlog"], [[AC_MET]])
+        check("met: no scratch file left behind (store copy, journal excerpts, list)", m["_left"], [])
         check("met: queue fields from aira confine --list",
               (m["queued"], m["running"], m["ceiling_gib"], m["ceiling_basis"]), (3, 5, 48.0, "system-pressure"))
         check("met: host fields", (m["mem_available_gib"], m["oomd_kills"], m["oomd_kills_aira"]), (40.0, 0, 0))
@@ -215,6 +233,11 @@ def main():
         n = run("not-met", True, above=2)
         check("not-met: exactly 5%, ineligible row and undiscounted line left out", ac(n), (40, 40, 0, 2, 2, "not met"))
         check("not-met: nothing met or unevaluated", (n["met"], n["unevaluated"]), ([], []))
+        check("not-met: nothing latched", n["_metlog"], [])
+        nl = run("null-peak", True, above=2, null=(2,))
+        check("null-peak: a NULL peak is unknown, never a 0-byte peak", ac(nl) + (nl["above_charge"]["unknown_peak"],),
+              (40, 40, 0, 2, 3, "unevaluated", 1))
+        check("null-peak: the share is [5%, 7.5%], not met", (nl["above_charge"]["share"], nl["met"]), ([0.05, 0.075], []))
         s = run("straddle", True, above=2, rowless=(39,))
         check("straddle: one grant without a row is unevaluated", ac(s), (40, 39, 1, 2, 3, "unevaluated"))
         check("straddle: named unevaluated, not met", (s["met"], unev(s, "above-charge: unevaluated")), ([], True))
@@ -231,7 +254,7 @@ def main():
         check("evicted: a row seen by an earlier --store run still counts", ac(ev), (40, 40, 0, 3, 3, "met"))
         f = run("no-log", True, above=3, journal_fail=True)
         check("no-log: log fields unevaluated, not 0",
-              (f["observe"], f["enforce"], f["discounted"], f["phys_unfit"], f["watchdog_trips"]), ("unevaluated",) * 5)
+              (f["observe"], f["enforce"], f["discounted"], f["watchdog_trips"]), ("unevaluated",) * 4)
         check("no-log: above-charge unevaluated", f["above_charge"], "unevaluated (journalctl failed)")
         check("no-log: named unevaluated, nothing met",
               (f["met"], unev(f, "daemon log: unevaluated"), unev(f, "above-charge: unevaluated (journalctl")), ([], True, True))
@@ -241,7 +264,14 @@ def main():
         check("oom first sample: unevaluated, not silently dropped", (o["met"], unev(o, "slice-level oom: unevaluated")),
               ([], True))
         o = run("oom-rise", oom=1)
-        check("oom rise: met", o["met"], ["slice-level oom (memory.events.local oom rose; victim and its peak/pin unattributed)"])
+        OM = "slice-level oom (memory.events.local oom rose; victim and its peak/pin unattributed)"
+        check("oom rise: met", o["met"], [OM])
+        check("oom rise: latched in met.log", o["_metlog"], [[OM]])
+        home_, cg_, bin_, mi_ = o["_ctx"]
+        # the next sample sees no new rise: nothing met now, but met.log still holds the event
+        code, o2, _ = invoke(watch, home_, cg_, bin_, mi_, False)
+        ml2 = [json.loads(x)["met"] for x in (home_ / "tmp/aira-324-watch/met.log").read_text().splitlines()]
+        check("oom rise: a later quiet sample does not clear the latch", (code, (o2 or {}).get("met"), ml2), (0, [], [[OM]]))
         o = run("oom-flat", oom=1, samples=lambda now: history(now, oom=1))
         check("oom flat: neither met nor unevaluated", (o["met"], o["unevaluated"]), ([], []))
         o = run("oom-reset", oom=0, samples=lambda now: history(now, oom=2))
@@ -267,6 +297,37 @@ def main():
         check("pressure with one dip: neither met nor unevaluated", (p["met"], p["unevaluated"]), ([], []))
         p = run("pressure-gap", avg10=5.0, samples=lambda now: history(now, avg=lambda t: 5.0, drop=(now - 5000, now - 3000)))
         check("pressure with a gap: unevaluated", (p["met"], unev(p, "pressure: unevaluated")), ([], True))
+        # review P2-3: the reading held at the left edge (sample at now - 7200, just before the
+        # window) is below the baseline and the first one inside is ~115 minutes old: the window
+        # was not above the baseline for 2 hours
+        p = run("pressure-edge", avg10=5.0, samples=lambda now: history(now, avg=lambda t: 0.5 if t <= now - 7200 else 5.0))
+        check("pressure: a held reading below baseline at the left edge: not met", (p["met"], p["unevaluated"]), ([], []))
+
+        # ---- baseline refusal once enforce has been seen
+        b = run("baseline", baseline=False)
+        home_, cg_, bin_, mi_ = b["_ctx"]
+        bl_path = home_ / "tmp/aira-324-watch/baseline.json"
+        check("baseline: a run that sees an enforce line records enforce-seen",
+              (home_ / "tmp/aira-324-watch/enforce-seen").exists(), True)
+        code, _, err = invoke(watch, home_, cg_, bin_, mi_, False, ["--baseline"])
+        check("baseline: refused once enforce was seen, nothing written", (code, "refusing --baseline" in err, bl_path.exists()),
+              (4, True, False))
+        code, out, _ = invoke(watch, home_, cg_, bin_, mi_, False, ["--baseline", "--force-baseline"])
+        check("baseline: --force-baseline overrides", (code, bl_path.exists(), (out or {}).get("high_p99_per_hour")), (0, True, 0))
+        # enforce lines in this run's journal, with no earlier sample having recorded them: refused too
+        b1 = run("baseline-fresh", baseline=False)
+        home_, cg_, bin_, mi_ = b1["_ctx"]
+        (home_ / "tmp/aira-324-watch/enforce-seen").unlink()
+        code, _, err = invoke(watch, home_, cg_, bin_, mi_, False, ["--baseline"])
+        check("baseline: refused when this run's own journal shows enforce", (code, "refusing --baseline" in err,
+              (home_ / "tmp/aira-324-watch/baseline.json").exists(), (home_ / "tmp/aira-324-watch/enforce-seen").exists()),
+              (4, True, False, True))
+        b2 = run("baseline-before", samples=False, baseline=False, recent_only_observe=True)
+        home_, cg_, bin_, mi_ = b2["_ctx"]
+        check("baseline: a journal with observe lines only records no enforce-seen",
+              (home_ / "tmp/aira-324-watch/enforce-seen").exists(), False)
+        code, out, _ = invoke(watch, home_, cg_, bin_, mi_, False, ["--baseline"])
+        check("baseline: allowed before enforce was seen", (code, (out or {}).get("high_p99_per_hour")), (0, 0))
 
         # ---- host memory
         x = run("memavail-low", memavail_kib=7 * 1024 * 1024)

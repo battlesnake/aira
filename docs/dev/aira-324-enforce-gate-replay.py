@@ -85,11 +85,16 @@ def charge_for(pin, factor):
 
 
 class Job:
-    __slots__ = ("idx", "arrival", "start", "dur", "peak", "pin", "pin_class", "oom", "basis")
+    """One confine row. peak None (peak_rss NULL) is UNKNOWN: `known` is False and `peak` reads
+    0 in the timeline sums (excluded; the report states the effect), while attribute() and
+    above_charge() keep it as an unknown, never as a known-low sample."""
+    __slots__ = ("idx", "arrival", "start", "dur", "peak", "known", "pin", "pin_class", "oom", "basis")
 
     def __init__(self, idx, arrival, start, dur, peak, pin, basis, oom):
         self.idx, self.arrival, self.start, self.dur = idx, arrival, start, dur
-        self.peak, self.pin, self.basis, self.oom = peak, pin, basis, oom
+        self.known = peak is not None
+        self.peak = peak if peak is not None else 0
+        self.pin, self.basis, self.oom = pin, basis, oom
         self.pin_class = basis == PIN_BASIS
 
 
@@ -98,12 +103,12 @@ def load_jobs(db):
         sys.exit("refusing to read the live store; copy it to ~/tmp first")
     c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
     rows = c.execute(
-        "select rowid, started_at_ms, wait_ms, wall_ms, coalesce(peak_rss, 0), budget, budget_basis, oom "
+        "select rowid, started_at_ms, wait_ms, wall_ms, peak_rss, budget, budget_basis, oom "
         "from confine_peak_history where kind = 'confine' and started_at_ms is not null "
         "and wait_ms is not null and wall_ms is not null and budget is not null "
         "order by started_at_ms - wait_ms, rowid").fetchall()
     jobs = []
-    for i, (rid, st, wait, wall, peak, budget, basis, oom) in enumerate(rows):
+    for i, (_rid, st, wait, wall, peak, budget, basis, oom) in enumerate(rows):
         jobs.append(Job(i, st - wait, st, wall, peak, budget, basis, oom))
     extra = c.execute(
         "select kind, count(*) from confine_peak_history where at >= ? and at <= ? "
@@ -122,9 +127,13 @@ OBS_RE = re.compile(r"pin-charge observe: scope=\S+ pin=(\d+) charged=(\d+) woul
                     r"physical-free=(-?\d+) physical-fit=(\w+)")
 
 
+START_RE = re.compile(r"systemd\[\d+\]: Started aira-daemon\.service")
+
+
 def load_journal(path):
-    """(ceiling series [(ms, effective, sliceAnon)], observe lines [(ms, pin, would, free, fit)])."""
-    ceil, obs = [], []
+    """(ceiling series [(ms, effective, sliceAnon)], observe lines [(ms, pin, would, free, fit)],
+    daemon starts [ms] (systemd's 'Started aira-daemon.service' lines))."""
+    ceil, obs, starts = [], [], []
     with open(path, errors="replace") as f:
         for line in f:
             head = line.split(" ", 1)[0]
@@ -139,8 +148,11 @@ def load_journal(path):
             m = OBS_RE.search(line)
             if m:
                 obs.append((ms, int(m.group(1)), int(m.group(3)), int(m.group(4)), m.group(5) == "true"))
+                continue
+            if START_RE.search(line):
+                starts.append(ms)
     ceil.sort()
-    return ceil, obs
+    return ceil, obs, starts
 
 
 class Ceiling:
@@ -347,17 +359,19 @@ def level_at(st, t, keys=None):
     return st[i][1] if i >= 0 else 0
 
 
-def memory_view(jobs, start, lo, hi=None, common_hi=None):
+def memory_view(jobs, start, lo, hi=None, common_hi=None, busiest=None, value=None):
     """The spec's memory test: concurrent sum of memory.peak (each job holding its peak for
     its whole run), duration-weighted and job(burst)-weighted, over every minute and in the
     busiest clock hour (the hour with the highest duration-weighted mean).
     The window runs from lo to THIS timeline's final completion (hi, if not given): a replay
     that delays a job past the observed final completion must still see its peak.
     common_mean is the duration-weighted mean on [lo, common_hi), the same span for every
-    timeline, for comparison only."""
+    timeline, for comparison only. busiest (an hour start, ms) fixes the hour for every timeline
+    (the report fixes it once, by sliceAnon); None picks this timeline's own. value(j) replaces
+    j.peak (the unknown-peak bound counts a NULL peak at its pin)."""
     if hi is None:
         hi = max(start[j.idx] + j.dur for j in jobs)
-    st = step(jobs, start, lambda j: j.peak)
+    st = step(jobs, start, value or (lambda j: j.peak))
     hours = {}
     h = lo - lo % 3600000
     while h < hi:
@@ -366,7 +380,10 @@ def memory_view(jobs, start, lo, hi=None, common_hi=None):
     # busiest among WHOLE clock hours inside the window: a clipped first or last hour's mean
     # is over a shorter span and would win on a short burst (any hour if none is whole)
     whole = [k for k in hours if k >= lo and k + 3600000 <= hi] or list(hours)
-    busiest = max(whole, key=lambda k: hours[k][0])
+    if busiest is None:
+        busiest = max(whole, key=lambda k: hours[k][0])
+    elif busiest not in hours:
+        hours[busiest] = level_stats(st, busiest, busiest + 3600000)
     mm = minute_max(st, lo, hi)
     keys = [e[0] for e in st]
     at_grant = [level_at(st, start[j.idx], keys) for j in jobs if lo <= start[j.idx] < hi]
@@ -397,7 +414,7 @@ def queued(j):
     return j.start - j.arrival >= 1000
 
 
-def counterfactual(jobs, ce, pol, hid, fac, base, m_jobs, mlo, common_hi):
+def counterfactual(jobs, ce, pol, hid, fac, base, m_jobs, mlo, common_hi, busiest=None):
     """One factor row: the clairvoyant replay for the queue numbers (against the same
     config's baseline replay AND against the observed timeline), the blind replay for the
     memory view (its own window, through its own final completion)."""
@@ -407,15 +424,54 @@ def counterfactual(jobs, ce, pol, hid, fac, base, m_jobs, mlo, common_hi):
     e, l = moved(jobs, s, base)
     eq, _ = moved(jobs, s, base, queued)
     oe, ol = moved(jobs, s, obs)
+    _, olq = moved(jobs, s, obs, queued)
     blind = simulate(jobs, ce, fac, pol, "blind", hid)
     return {"start": s, "earlier": e, "later": l, "earlier_queued": eq, "obs_earlier": oe, "obs_later": ol,
+            "obs_later_queued": olq,
             "waits": [s[j.idx] - j.arrival for j in m_jobs], "stats": stt,
-            "mem": memory_view(jobs, blind, mlo, None, common_hi)}
+            "mem": memory_view(jobs, blind, mlo, None, common_hi, busiest), "blind": blind}
 
 
 def above_charge(pins, fac):
-    """(rows whose peak exceeds ceil(fac x pin), rows): the spec's 5% trigger arithmetic."""
-    return sum(1 for j in pins if j.peak > charge_for(j.pin, fac)), len(pins)
+    """(rows with a KNOWN peak over ceil(fac x pin), rows with an unknown peak, rows): the spec's
+    5% trigger arithmetic. The share lies in [above / n, (above + unknown) / n]."""
+    return (sum(1 for j in pins if j.known and j.peak > charge_for(j.pin, fac)),
+            sum(1 for j in pins if not j.known), len(pins))
+
+
+def busiest_anon_hour(ceil_series, lo, hi, min_lines=30):
+    """The clock hour (start, ms) with the highest mean sliceAnon over the journal's throttle
+    lines in [lo, hi], among hours with at least min_lines lines (one a minute: a clipped or
+    gappy hour shorter than 30 minutes is skipped). Fixed once: every memory row reports this
+    hour. None if no hour qualifies."""
+    hours = collections.defaultdict(list)
+    for t, _eff, anon in ceil_series:
+        if lo <= t <= hi:
+            hours[t - t % 3600000].append(anon)
+    ok = [h for h, v in hours.items() if len(v) >= min_lines]
+    return max(ok, key=lambda h: sum(hours[h]) / len(hours[h])) if ok else None
+
+
+def plus_anon(st, ceil_series, lo, hi):
+    """max over minutes of (the timeline's minute max + the slice's real sliceAnon in that
+    minute: the largest throttle line in it, else the last one before it). sliceAnon already
+    holds the visible jobs' real use, so this double counts them: an upper bound on 'the
+    visible replay plus everything the replay cannot see'. Minutes before the first line are
+    skipped."""
+    mm = minute_max(st, lo, hi)
+    ts = [c[0] for c in ceil_series]
+    best = 0
+    for m, lvl in mm.items():
+        a = bisect.bisect_left(ts, m)
+        b = bisect.bisect_left(ts, m + 60000)
+        if b > a:
+            anon = max(c[2] for c in ceil_series[a:b])
+        elif a > 0:
+            anon = ceil_series[a - 1][2]
+        else:
+            continue
+        best = max(best, lvl + anon)
+    return best
 
 
 def trigger_verdict(above, unknown, n):
@@ -444,12 +500,15 @@ def attribute(grants, jobs, charge, tol=TOL):
     nearest-first one-to-one matching pairs k grants (k is at most the largest possible
     matching). Whichever rows are really the grants' own, at least k - b and at most a of the
     k paired grants are above, and the G - k unpaired ones are unknown. So the component adds
-    max(0, k - b) to `low` and min(a, k) + G - k to `high`; a one-to-one component (one grant,
-    one row) is the only case where low == high without a rowless grant.
+    max(0, k - b - u) to `low` and min(a + u, k) + G - k to `high`, where u counts the rows whose
+    peak is unknown (peak_rss NULL): an unknown row may be either side of the charge. A one-to-one
+    component (one grant, one row) with a known peak is the only case where low == high without
+    a rowless grant.
     Not detectable, and so not covered: a grant whose own row is missing (failed, killed,
     still running, evicted) with an INELIGIBLE row of the same pin starting within tol of it
     looks exactly like a pair (the accepted gap; rows need the scope id to close it).
-    Returns {grants, paired, rowless, low, high, single, single_above, rows_used}."""
+    Returns {grants, paired, rowless, unknown_peak, low, high, single, single_above, rows_used};
+    single counts the one-to-one components with a known peak."""
     by = collections.defaultdict(list)
     for j in jobs:
         if j.pin_class:
@@ -477,21 +536,23 @@ def attribute(grants, jobs, charge, tol=TOL):
             continue
         match.add(i)
         used.add(k)
-    comps = collections.defaultdict(lambda: [[], {}])
+    comps = collections.defaultdict(lambda: ([], {}))      # component -> (grant indices, {row idx: row})
     for i in range(len(grants)):
         comps[find(("g", i))][0].append(i)
     for _, i, k, j in edges:
         comps[find(("g", i))][1][k] = j
-    out = {"grants": len(grants), "paired": len(match), "rowless": len(grants) - len(match), "low": 0, "high": 0,
-           "single": 0, "single_above": 0, "rows_used": set(k for _, _, k, _ in edges)}
+    out = {"grants": len(grants), "paired": len(match), "rowless": len(grants) - len(match), "unknown_peak": 0,
+           "low": 0, "high": 0, "single": 0, "single_above": 0, "rows_used": set(k for _, _, k, _ in edges)}
     for gs, rows in comps.values():
         c = charge(grants[gs[0]][1])
-        a = sum(1 for j in rows.values() if j.peak > c)
-        b = len(rows) - a
+        a = sum(1 for j in rows.values() if j.known and j.peak > c)
+        u = sum(1 for j in rows.values() if not j.known)
+        b = len(rows) - a - u
         k = sum(1 for i in gs if i in match)
-        out["low"] += max(0, k - b)
-        out["high"] += min(a, k) + len(gs) - k
-        if len(gs) == 1 and len(rows) == 1:
+        out["unknown_peak"] += u
+        out["low"] += max(0, k - b - u)
+        out["high"] += min(a + u, k) + len(gs) - k
+        if len(gs) == 1 and len(rows) == 1 and u == 0:
             out["single"] += 1
             out["single_above"] += a
     return out
@@ -544,7 +605,7 @@ def score_of(rep, obs):
     return sum(terms) / len(terms)
 
 
-def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
+def report(jobs, extra, ceil_series, obs, out, slice_peak=None, starts=()):
     P = lambda *a: print(*a, file=out)
     lo = min(j.arrival for j in jobs)
     hi = max(j.start + j.dur for j in jobs)
@@ -564,6 +625,11 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
         sum(j.oom for j in pins)))
     P("rows in the window WITHOUT a timeline (part of the hidden load): %s" % (
         ", ".join("%s=%d" % e for e in extra) or "none"))
+    unk = [j for j in jobs if not j.known]
+    P("rows with an UNKNOWN peak (peak_rss NULL): %d (pinned %d); the timeline sums count them as 0 (excluded), "
+      "part 3 bounds them at their pin, part 4 keeps them unknown" % (len(unk), sum(1 for j in unk if j.pin_class)))
+    P("daemon restarts in the window (systemd 'Started aira-daemon.service' lines): %d" %
+      sum(1 for t in starts if lo <= t <= hi))
     P("")
 
     # ---- part 0: what the journal and the store say directly
@@ -667,8 +733,9 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
     P("## 2. Counterfactual: pin rows booked at ceil(factor x pin), against the SAME config's baseline replay")
     P("AND against the observed timeline. earlier/later = jobs whose start moved by more than 1 s versus the")
     P("config's own baseline replay; e-queued = the earlier ones among jobs that REALLY queued (observed wait >= 1 s,")
-    P("%d jobs); obs-e/obs-l = earlier/later than the OBSERVED start. d = change in wait (s) versus the baseline" %
+    P("%d jobs); obs-e/obs-l = earlier/later than the OBSERVED start, obs-l-q = the later ones that REALLY queued" %
       sum(1 for j in jobs if queued(j)))
+    P("(the rest never queued: the minute-tick artifact). d = change in wait (s) versus the baseline")
     P("replay, metric window; >60s = share waiting over 60 s (observed %s). phys-held = grants the physical-fit" %
       pct(sum(1 for w in ow if w > 60000) / len(ow)))
     P("rule held back (clairvoyant reading).")
@@ -679,10 +746,12 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
     for pol in ("fifo", "bypass", "backfill"):
         targets.append((best[1], pol, best[3], best[4]))
     seen = set()
-    P("%-26s %-8s %4s %7s %6s %8s %6s %6s %7s %7s %7s %6s %9s %8s" % (
-        "ceiling", "policy", "fac", "earlier", "later", "e-queued", "obs-e", "obs-l", "p50 d", "p90 d", "p99 d",
-        ">60s", "phys-held", "cpu-held"))
+    P("%-26s %-8s %4s %7s %6s %8s %6s %6s %7s %7s %7s %7s %6s %9s %8s" % (
+        "ceiling", "policy", "fac", "earlier", "later", "e-queued", "obs-e", "obs-l", "obs-l-q", "p50 d", "p90 d",
+        "p99 d", ">60s", "phys-held", "cpu-held"))
     mem_rows = []
+    bh = busiest_anon_hour(ceil_series, mlo, hi) if ceil_series else None
+    best_blind = {}
     for name, pol, ce, hid in targets:
         if (name, pol) in seen:
             continue
@@ -691,26 +760,30 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
         base = simulate(jobs, ce, 1.0, pol, "clairvoyant", hid, stats=bst)
         bw = [base[j.idx] - j.arrival for j in m_jobs]
         oe, ol = moved(jobs, base, obs_start)
-        P("%-26s %-8s %4.1f %7s %6s %8s %6d %6d %7s %7s %7s %6s %9s %8d" % (
-            name, pol, 1.0, "-", "-", "-", oe, ol, "-", "-", "-", pct(sum(1 for x in bw if x > 60000) / len(bw)), "-",
-            bst["cpu_held"]))
-        mem_rows.append((name, pol, 1.0, memory_view(jobs, base, mlo, None, hi)))
+        P("%-26s %-8s %4.1f %7s %6s %8s %6d %6d %7d %7s %7s %7s %6s %9s %8d" % (
+            name, pol, 1.0, "-", "-", "-", oe, ol, moved(jobs, base, obs_start, queued)[1], "-", "-", "-",
+            pct(sum(1 for x in bw if x > 60000) / len(bw)), "-", bst["cpu_held"]))
+        mem_rows.append((name, pol, 1.0, memory_view(jobs, base, mlo, None, hi, bh)))
         for fac in (0.9, 0.8):
-            r = counterfactual(jobs, ce, pol, hid, fac, base, m_jobs, mlo, hi)
+            r = counterfactual(jobs, ce, pol, hid, fac, base, m_jobs, mlo, hi, bh)
+            if (name, pol) == (best[1], best[2]):
+                best_blind[fac] = r["blind"]
             cw = r["waits"]
-            P("%-26s %-8s %4.1f %7d %6d %8d %6d %6d %+7.1f %+7.1f %+7.1f %6s %9d %8d" % (
+            P("%-26s %-8s %4.1f %7d %6d %8d %6d %6d %7d %+7.1f %+7.1f %+7.1f %6s %9d %8d" % (
                 name, pol, fac, r["earlier"], r["later"], r["earlier_queued"], r["obs_earlier"], r["obs_later"],
+                r["obs_later_queued"],
                 wait_s(cw, .5) - wait_s(bw, .5), wait_s(cw, .9) - wait_s(bw, .9), wait_s(cw, .99) - wait_s(bw, .99),
                 pct(sum(1 for x in cw if x > 60000) / len(cw)), r["stats"]["phys_refused"], r["stats"]["cpu_held"]))
             mem_rows.append((name, pol, fac, r["mem"]))
     P("")
-    ov = memory_view(jobs, obs_start, mlo, hi, hi)
+    ov = memory_view(jobs, obs_start, mlo, hi, hi, bh)
     P("## 3. Memory in the replay: concurrent sum of memory.peak of the VISIBLE jobs, each holding its peak for")
     P("its whole run (blind physical reading), as a fraction of MemoryHigh (60 GiB). Each timeline is checked from")
     P("the metric start through ITS OWN final completion (mins = minutes checked; the observed timeline has %d)." %
       ov["minutes"])
-    P("dur = duration-weighted (a random instant); job = burst-weighted (the instant each job starts). busiest = the")
-    P("clock hour with the highest duration-weighted mean. over54 = minutes whose maximum exceeds 0.9 x MemoryHigh")
+    P("dur = duration-weighted (a random instant); job = burst-weighted (the instant each job starts). busiest = ONE")
+    P("clock hour for every row, fixed once: the hour with the highest mean sliceAnon (the real slice, all jobs)")
+    P("among hours with >= 30 throttle lines. over54 = minutes whose maximum exceeds 0.9 x MemoryHigh")
     P("(54 GiB). common = duration-weighted mean over the observed window only, the same span for every row.")
     P("%-26s %-8s %4s %-14s %8s %8s %8s %8s %9s %7s %6s %5s %6s" % (
         "ceiling", "policy", "fac", "busiest hour", "dur mean", "dur p99", "job p99", "hour max", "all job99",
@@ -720,6 +793,24 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
             name, pol, fac, m["busiest_hour"], m["hour_dur_mean"] / MEMORY_HIGH, m["hour_dur_p99"] / MEMORY_HIGH,
             m["hour_job_p99"] / MEMORY_HIGH, m["hour_max"] / MEMORY_HIGH, m["all_job_p99"] / MEMORY_HIGH,
             m["minute_max"] / MEMORY_HIGH, m["minutes_over_safe"], m["minutes"], m["common_mean"] / MEMORY_HIGH))
+    best_blind[1.0] = simulate(jobs, best[3], 1.0, best[2], "blind", best[4])
+    tl = [("observed timeline", 1.0, obs_start)] + [("best fit (%s, %s)" % (best[1], best[2]), f, best_blind[f])
+                                                    for f in (1.0, 0.9, 0.8)]
+    unk = [j for j in jobs if not j.known]
+    if unk:
+        at_pin = lambda j: j.peak if j.known else j.pin
+        P("unknown peaks: %d rows have no peak and count as 0 above (excluded). Bounded at their pin instead, the "
+          "minute max becomes: %s" % (len(unk), "; ".join(
+              "%s %.1f: %.3f" % (n, f, memory_view(jobs, s_, mlo, None, hi, bh, at_pin)["minute_max"] / MEMORY_HIGH)
+              for n, f, s_ in tl)))
+    else:
+        P("unknown peaks: none (every row in the window has a peak): the tables above exclude nothing")
+    if ceil_series:
+        P("visible replay PLUS the real slice (each minute's max of the timeline above + that minute's sliceAnon, "
+          "which already holds the visible jobs: a double-counting upper bound), max over minutes with a throttle "
+          "line, of MemoryHigh: %s" % "; ".join(
+              "%s %.1f: %.3f" % (n, f, plus_anon(step(jobs, s_, lambda j: j.peak), ceil_series, mlo, hi) / MEMORY_HIGH)
+              for n, f, s_ in tl))
     P("")
 
     # ---- part 4: the 5% trigger
@@ -727,14 +818,15 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
     P("4a. Proxy population: every pin row in the window (eligibility NOT established: a row cannot tell a")
     P("discountable grant from a delegate parent, an exclusive job or a restart survivor).")
     for fac in (0.9, 0.8):
-        above, n = above_charge(pins, fac)
+        above, unknown, n = above_charge(pins, fac)
         clean = [j for j in pins if not j.oom]
-        above_clean, nc = above_charge(clean, fac)
-        atpin = sum(1 for j in pins if j.peak >= j.pin)
-        P("factor %.1f: peak > charge %d of %d = %s; OOM rows excluded %d of %d = %s; "
-          "peak >= pin %d = %s (OOM rows among them %d)" % (
-              fac, above, n, pct(above / n), above_clean, nc, pct(above_clean / nc),
-              atpin, pct(atpin / len(pins)), sum(1 for j in pins if j.peak >= j.pin and j.oom)))
+        above_clean, unknown_clean, nc = above_charge(clean, fac)
+        atpin = sum(1 for j in pins if j.known and j.peak >= j.pin)
+        P("factor %.1f: peak > charge between %d and %d of %d = [%s, %s] (%d peaks unknown); OOM rows excluded "
+          "[%s, %s] of %d; peak >= pin %d = %s (OOM rows among them %d)" % (
+              fac, above, above + unknown, n, pct(above / n), pct((above + unknown) / n), unknown,
+              pct(above_clean / nc), pct((above_clean + unknown_clean) / nc), nc,
+              atpin, pct(atpin / len(pins)), sum(1 for j in pins if j.known and j.peak >= j.pin and j.oom)))
     if obs:
         o_lo = min(o[0] for o in obs)
         n = len(obs)
@@ -746,9 +838,10 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
           "line (measured offsets -39..+8 ms). Grants and rows linked that way form components; a one-to-one component "
           "is known, a component whose rows and grants do not pair one to one contributes an interval, and a grant "
           "with no row (failed, killed, still running at the copy, or its row evicted by the 20-row retention) is "
-          "unknown. Paired %d (%d in one-to-one components); %d grants with no row; %d pinned rows started since "
-          "have no line (not discountable, or a line more than %d ms away)." % (
-              TOL, a9["paired"], a9["single"], a9["rowless"], len(unmatched_rows), TOL))
+          "unknown, and so is a row with no peak (peak_rss NULL). Paired %d (%d in one-to-one components with a known "
+          "peak); %d grants with no row; %d linked rows with an unknown peak; %d pinned rows started since have no "
+          "line (not discountable, or a line more than %d ms away)." % (
+              TOL, a9["paired"], a9["single"], a9["rowless"], a9["unknown_peak"], len(unmatched_rows), TOL))
         for fac in (0.9, 0.8):
             a = attribute(obs, jobs, lambda pin: charge_for(pin, fac))
             P("factor %.1f: above the charge between %d and %d of %d grants = [%s, %s]: trigger %s; "
@@ -756,35 +849,39 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
                   fac, a["low"], a["high"], n, pct(a["low"] / n), pct(a["high"] / n),
                   trigger_verdict(a["low"], a["high"] - a["low"], n), a["single"], a["single_above"],
                   pct(a["single_above"] / a["single"]) if a["single"] else "n/a"))
-        P("the trigger counts discounted grants; a 25-hour figure on this population does not exist (observe began at %s)" %
-          iso(o_lo))
+        P("the trigger counts discounted grants; a whole-window figure on this population does not exist (observe "
+          "began at %s)" % iso(o_lo))
     by_hour = collections.defaultdict(lambda: [0, 0, 0])
     for j in pins:
+        if not j.known:
+            continue                           # unknown peak: in neither count
         h = by_hour[j.start // 3600000]
         h[0] += 1
         h[1] += j.peak > charge_for(j.pin, 0.9)
         h[2] += j.peak > charge_for(j.pin, 0.8)
     r9 = [v[1] / v[0] for v in by_hour.values() if v[0] >= 20]
     r8 = [v[2] / v[0] for v in by_hour.values() if v[0] >= 20]
-    P("per clock hour with >= 20 pin rows (%d hours): above-charge share at 0.9 median %s max %s; at 0.8 median %s max %s" % (
+    P("per clock hour with >= 20 pin rows with a known peak (%d hours): above-charge share at 0.9 median %s max %s; at 0.8 median %s max %s" % (
         len(r9), pct(statistics.median(r9)), pct(max(r9)), pct(statistics.median(r8)), pct(max(r8))))
-    ratio = sorted(j.peak / j.pin for j in pins if j.pin > 0)
+    ratio = sorted(j.peak / j.pin for j in pins if j.pin > 0 and j.known)
     P("pin rows peak/pin: p50 %.2f p90 %.2f p95 %.2f p99 %.2f" % (q(ratio, .5), q(ratio, .9), q(ratio, .95), q(ratio, .99)))
     P("")
 
     # ---- part 5: first-order counterfactual on the REAL slice
     if ceil_series:
-        first_order(jobs, ceil_series, mlo, hi, P)
+        first_order(jobs, ceil_series, mlo, hi, P, bh)
     return best
 
 
-def first_order(jobs, ceil_series, lo, hi, P):
+def first_order(jobs, ceil_series, lo, hi, P, busiest=None):
     """Minute by minute, on the observed state: the booking the discount frees from the visible
     running pin jobs, filled from the observed queue in arrival order (pins at their charge),
     and the peaks of the jobs it admits added to the REAL slice anon of that minute (all jobs,
     hidden ones included). A first-order estimate only, NOT a bound: it keeps the observed
     running set, and a discount changes which jobs overlap (two jobs that ran one after the
-    other may run together), which no per-minute addition to the observed level can see."""
+    other may run together), which no per-minute addition to the observed level can see.
+    busiest fixes the hour reported (the report's one hour); None picks the highest mean
+    sliceAnon among hours with >= 30 lines. A queued job with an unknown peak adds 0."""
     P("## 5. First-order estimate on the real slice (journal sliceAnon, every minute): NOT a bound")
     P("est = sliceAnon + peaks of the queued jobs the freed booking admits at that minute. It keeps the observed")
     P("running set, so it cannot see a discount making jobs overlap that ran apart: it can understate.")
@@ -803,6 +900,7 @@ def first_order(jobs, ceil_series, lo, hi, P):
               fac, fmt_g(Lmax), fmt_g(Lmax * (1 / fac - 1)),
               fmt_g(FREE_MIN + HEADROOM_BASE + HEADROOM_PER_JOB - Lmax * (1 / fac - 1))))
     rows = []
+    bh = busiest if busiest is not None else busiest_anon_hour(ceil_series, lo, hi)
     for fac in (0.9, 0.8):
         est, admitted_min, contended = [], 0, 0
         hours = collections.defaultdict(list)
@@ -827,13 +925,13 @@ def first_order(jobs, ceil_series, lo, hi, P):
             e = anon + extra
             est.append(e)
             hours[t // 3600000].append((anon, e))
-        busiest = max(hours, key=lambda h: sum(x[0] for x in hours[h]) / len(hours[h]))
-        hb = hours[busiest]
+        bk = bh // 3600000 if bh is not None else max(hours, key=lambda h: len(hours[h]))
+        hb = hours[bk]
         P("factor %.1f: contended minutes %d, with >= 1 waiter admitted at once %d (%s); "
           "est max %.3f of MemoryHigh; minutes over 54 GiB: est %d of %d; "
           "busiest hour %sZ (by sliceAnon): est mean %.3f max %.3f" % (
               fac, contended, admitted_min, pct(admitted_min / contended if contended else 0),
-              max(est) / MEMORY_HIGH, sum(1 for x in est if x > SAFE), len(est), iso(busiest * 3600000)[:13],
+              max(est) / MEMORY_HIGH, sum(1 for x in est if x > SAFE), len(est), iso(bk * 3600000)[:13],
               sum(x[1] for x in hb) / len(hb) / MEMORY_HIGH, max(x[1] for x in hb) / MEMORY_HIGH))
         rows.append((fac, max(est)))
     return rows
@@ -999,6 +1097,15 @@ def selftest():
     r = counterfactual(cf, c10, "bypass", 0, 1.0, base, cf, 0, 301000)
     check("counterfactual at 1.0: nothing moves, memory 3 GiB", (r["earlier"], r["obs_earlier"], r["mem"]["minute_max"]),
           (0, 0, 3 * G))
+    # later than observed, split by whether the job really queued: three 6 GiB jobs arrive at 0
+    # on a 10 GiB ledger (fifo, 1.0), so they run one after another (0, 100, 200 s). Job 1 never
+    # queued (observed start 0), job 2 did (observed start 50 s): both are later than observed,
+    # and only job 2 counts among the later ones that really queued
+    lq = [Job(0, 0, 0, 100000, G, 6 * G, "x", 0), Job(1, 0, 0, 100000, G, 6 * G, "x", 0),
+          Job(2, 0, 50000, 100000, G, 6 * G, "x", 0)]
+    rq = counterfactual(lq, c10, "fifo", 0, 1.0, simulate(lq, c10, 1.0, "fifo"), lq, 0, 300000)
+    check("counterfactual: later than observed, and the later ones that really queued",
+          (rq["obs_later"], rq["obs_later_queued"]), (2, 1))
     # 16. hidden load alone makes the second job wait: 4 + 4 booked + 4 hidden > 10 GiB
     hl = [Job(0, 0, 0, 100000, G, 4 * G, "x", 0), Job(1, 0, 0, 100000, G, 4 * G, "x", 0)]
     check("hidden load holds the second job", (simulate(hl, c10, 1.0, "fifo", "blind", 4 * G)[1],
@@ -1007,7 +1114,10 @@ def selftest():
     tp = [Job(i, 0, 0, 1000, pk, 10 * G, PIN_BASIS, 0) for i, pk in
           enumerate((int(9.5 * G), int(8.5 * G), G, 10 * G))]
     check("above charge at 0.9 and 0.8 (against the charge, not the pin)",
-          (above_charge(tp, 0.9), above_charge(tp, 0.8)), ((2, 4), (3, 4)))
+          (above_charge(tp, 0.9), above_charge(tp, 0.8)), ((2, 0, 4), (3, 0, 4)))
+    # an unknown peak (peak_rss NULL) is neither above nor below: it widens the interval
+    tpn = tp + [Job(4, 0, 0, 1000, None, 10 * G, PIN_BASIS, 0)]
+    check("above charge: an unknown peak is counted unknown, not as a 0-byte peak", above_charge(tpn, 0.9), (2, 1, 5))
     check("trigger: exactly 5% is not over; 2/39 is; 500/9992 is (no rounding); interval straddling; no rows",
           (trigger_verdict(1, 0, 20), trigger_verdict(2, 0, 39), trigger_verdict(500, 0, 9992),
            trigger_verdict(1, 2, 20), trigger_verdict(0, 0, 0)),
@@ -1035,6 +1145,22 @@ def selftest():
         a = attribute(gl, js, ch)
         return a["low"], a["high"], trigger_verdict(a["low"], a["high"] - a["low"], 40)
     check("attribution: 3 of 40 above, all one to one: met", pop(3, range(40)), (3, 3, "met"))
+    # review P2-1: 3 of 40 above, the third's peak is NULL: [5%, 7.5%] unevaluated, never 2 of 40
+    # = exactly 5% 'not met' (a NULL read as 0 is a known-safe sample)
+    gl40 = [(10000 * t, 10 * G) for t in range(40)]
+    jn = [Job(n, 0, 10000 * n + 1, 1, int(9.5 * G) if n < 2 else (None if n == 2 else G), 10 * G, PIN_BASIS, 0)
+          for n in range(40)]
+    an = attribute(gl40, jn, ch)
+    check("attribution: a NULL peak keeps the grant unknown: [2, 3] of 40, unevaluated",
+          (an["low"], an["high"], an["unknown_peak"], an["single"], trigger_verdict(an["low"], an["high"] - an["low"], 40)),
+          (2, 3, 1, 39, "unevaluated"))
+    # in a burst: two grants, rows one known below and one unknown: between 0 and 1 above
+    bu = attribute([(0, 10 * G)] * 2, [lo_(0), Job(1, 0, 1, 1, None, 10 * G, PIN_BASIS, 0)], ch)
+    check("attribution: an unknown row in a burst may be either side", (bu["low"], bu["high"]), (0, 1))
+    # ... and a burst of one known above and one unknown: at least 1, at most 2
+    ba = attribute([(0, 10 * G)] * 2, [Job(0, 0, 1, 1, int(9.5 * G), 10 * G, PIN_BASIS, 0),
+                                       Job(1, 0, 1, 1, None, 10 * G, PIN_BASIS, 0)], ch)
+    check("attribution: a known-above row stays above beside an unknown one", (ba["low"], ba["high"]), (1, 2))
     # review counterexample 1: two known above, the third above-charge job has no row, and
     # an INELIGIBLE low-peak row starts 300 ms from its grant: it must not stand in for the
     # missing row (the old 0.5 s pairing read 2 of 40 = 'not met' while the truth is 7.5%)
@@ -1057,6 +1183,62 @@ def selftest():
     check("attribution: an all-below burst is known", (b3["paired"], b3["low"], b3["high"], b3["single"]), (3, 0, 0, 0))
     b2 = attribute(burst, [lo_(0), Job(1, 0, 2, 1, int(9.5 * G), 10 * G, PIN_BASIS, 0)], ch)
     check("attribution: a burst with a missing row is an interval", (b2["paired"], b2["low"], b2["high"]), (2, 1, 2))
+    # load_jobs and load_journal on tiny files under ~/tmp: a NULL peak_rss stays unknown (not
+    # 0), and systemd's daemon start lines are counted
+    import shutil
+    import tempfile
+    base = os.path.expanduser("~/tmp")
+    os.makedirs(base, exist_ok=True)
+    td = tempfile.mkdtemp(prefix="aira-324-selftest-", dir=base)
+    try:
+        dbp = os.path.join(td, "s.db")
+        db = sqlite3.connect(dbp)
+        db.execute("create table confine_peak_history (kind text, started_at_ms integer, wait_ms integer, wall_ms integer, "
+                   "peak_rss integer, budget integer, budget_basis text, oom integer, at text)")
+        db.executemany("insert into confine_peak_history values ('confine', ?, 0, 1000, ?, ?, ?, 0, 'a')",
+                       [(1000, None, 10 * G, PIN_BASIS), (2000, 5 * G, 10 * G, PIN_BASIS)])
+        db.commit()
+        db.close()
+        lj, _ = load_jobs(dbp)
+        check("load_jobs: a NULL peak_rss is unknown, a real one known",
+              [(j.known, j.peak) for j in lj], [(False, 0), (True, 5 * G)])
+        jp = os.path.join(td, "j.txt")
+        with open(jp, "w") as f:
+            f.write("1000.5 host systemd[1]: Started aira-daemon.service - AIRA daemon\n"
+                    "2000.0 host systemd[1]: Stopped aira-daemon.service - AIRA daemon\n"
+                    "3000.0 host aira[2]: aira daemon: slice ceiling throttled (enforce): 5 effective / 9 configured, "
+                    "sliceAnon=3 MemAvailable=1\n")
+        jc, jo, js = load_journal(jp)
+        check("load_journal: daemon starts counted, ceiling lines read", (js, jc, jo), ([1000500], [(3000000, 5, 3)], []))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    # the unknown-peak bound: a value function replaces the peak (the default counts it as 0)
+    nu = [Job(0, 0, 0, 60000, None, 7 * G, "x", 0)]
+    check("memory view: an unknown peak is 0 by default, its pin under the bound",
+          (memory_view(nu, {0: 0}, 0)["minute_max"], memory_view(nu, {0: 0}, 0, value=lambda j: j.pin)["minute_max"]),
+          (0, 7 * G))
+    # review P2-2 counterexample: a THROTTLED 61 GiB ceiling (below the machine term) admits ten
+    # idle 6.45 GiB pins at 0.9 (charges 58.05 GiB + headroom 2.625 GiB <= 61): their caps sum
+    # to 64.5 GiB, over MemoryMax (64 GiB), so a slice-level OOM is reachable while throttled
+    tenp = [Job(i, 0, 0, 100000, 0, int(6.45 * G), PIN_BASIS, 0) for i in range(10)]
+    st10 = simulate(tenp, Ceiling(const=61 * G), 0.9, "fifo", "blind")
+    check("61 GiB throttled ceiling: all ten 6.45 GiB pins start at once at 0.9, caps over 64 GiB",
+          (sorted(set(st10.values())), sum(j.pin for j in tenp) > 64 * G), ([0], True))
+    # the busiest hour is fixed once by sliceAnon, among hours with >= 30 lines: hour 0 has 40
+    # lines at 10 GiB, hour 1 has 20 lines at 30 GiB (too short), hour 2 has 30 lines at 5 GiB
+    cs3 = ([(60000 * i, 50 * G, 10 * G) for i in range(40)] + [(3600000 + 60000 * i, 50 * G, 30 * G) for i in range(20)]
+           + [(7200000 + 60000 * i, 50 * G, 5 * G) for i in range(30)])
+    check("busiest hour by sliceAnon: the highest mean among hours >= 30 min long",
+          (busiest_anon_hour(cs3, 0, 10800000), busiest_anon_hour(cs3, 0, 10800000, min_lines=20)), (0, 3600000))
+    hv = [Job(0, 0, 0, 600000, 2 * G, 4 * G, "x", 0), Job(1, 3600000, 3600000, 600000, 9 * G, 10 * G, "x", 0)]
+    check("memory view: a fixed busiest hour is reported, not the timeline's own",
+          (memory_view(hv, {0: 0, 1: 3600000}, 0, 7200000, None, 0)["busiest_hour"],
+           memory_view(hv, {0: 0, 1: 3600000}, 0, 7200000)["busiest_hour"]), ("1970-01-01T00Z", "1970-01-01T01Z"))
+    # visible + real slice: minute 0 has a line (anon 5 GiB) and the replay at 3 GiB; minute 1
+    # has no line, so the last one is held (5 GiB), and the replay is at 4 GiB there
+    pa = [Job(0, 0, 0, 60000, 3 * G, 4 * G, "x", 0), Job(1, 60000, 60000, 60000, 4 * G, 4 * G, "x", 0)]
+    check("visible + sliceAnon: the last line's anon is held into a minute without one",
+          plus_anon(step(pa, {0: 0, 1: 60000}, lambda j: j.peak), [(1000, 50 * G, 5 * G)], 0, 120000), 9 * G)
     check("queued means an observed wait of at least 1 s",
           (queued(Job(0, 0, 999, 1, 0, G, "x", 0)), queued(Job(0, 0, 1000, 1, 0, G, "x", 0))), (False, True))
     print("selftest:", "PASS" if ok else "FAIL")
@@ -1078,8 +1260,8 @@ def main():
     if not jobs:
         print("no rows with AIRA-323 facts: unevaluated")
         return 3
-    ceil, obs = load_journal(a.journal) if a.journal else ([], [])
-    report(jobs, extra, ceil, obs, sys.stdout, a.slice_peak)
+    ceil, obs, starts = load_journal(a.journal) if a.journal else ([], [], [])
+    report(jobs, extra, ceil, obs, sys.stdout, a.slice_peak, starts)
     return 0
 
 

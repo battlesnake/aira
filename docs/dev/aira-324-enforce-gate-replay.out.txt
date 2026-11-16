@@ -1,126 +1,132 @@
 # AIRA-324 enforce-gate replay
-window 2026-11-15T08:56:52 .. 2026-11-16T10:20:22 UTC (25.4 h); metrics from 2026-11-15T09:56:52 (first hour dropped: warm-up)
-jobs 5332: pin(--memory-reserve) 3146, auto 2166, --memory-max 20; oom rows 151 (pin 65)
-rows in the window WITHOUT a timeline (part of the hidden load): confine=3, pytest-worker=1168
+window 2026-11-15T08:56:52 .. 2026-11-16T14:10:21 UTC (29.2 h); metrics from 2026-11-15T09:56:52 (first hour dropped: warm-up)
+jobs 5832: pin(--memory-reserve) 3386, auto 2418, --memory-max 28; oom rows 171 (pin 69)
+rows in the window WITHOUT a timeline (part of the hidden load): confine=3, pytest-worker=1349
+rows with an UNKNOWN peak (peak_rss NULL): 0 (pinned 0); the timeline sums count them as 0 (excluded), part 3 bounds them at their pin, part 4 keeps them unknown
+daemon restarts in the window (systemd 'Started aira-daemon.service' lines): 4
 
 ## 0. Observed facts (journal, store)
-observed, visible jobs: wait p50 4.5s p90 252.4s p99 854.6s; waited >60s 27.9%; concurrency mean 6.7 max 22; visible booked mean 20.1 max 45.0 GiB
-effective ceiling (throttle lines, one a minute, 1444 in the window): min 38.0 median 48.0 max 51.2 GiB (static 64 GiB; the ledger ceiling is this less 2 GiB + 64 MiB x (jobs + 1))
-slice anon memory (sliceAnon, same lines, ALL jobs incl. hidden): median 9.4 p99 19.0 max 21.4 GiB = max 0.357 of MemoryHigh
-held-peak sum of VISIBLE jobs / sliceAnon of ALL jobs, same minute: p10 0.45 median 1.50; sliceAnon above it in 406 of 1444 minutes (largest excess 20.3 GiB)
-residual = ledger ceiling - visible booked, in the 999 minutes a visible job was waiting >= 1 s: p10 10.9 median 25.1 p90 39.2 GiB (hidden jobs + idle-held capacity; the replay cannot see it)
-observe lines 958 (from 2026-11-16T03:34:04): physical-fit true 958; physical-free minus pin: min 20.5 p01 24.2 median 34.7 GiB
-discountable grants (observe lines) 958 vs pin rows started since 777: ratio 1.23. More grants than rows means at least 181 discountable grants left no row (failed, killed or still running runs)
+observed, visible jobs: wait p50 8.4s p90 296.6s p99 835.8s; waited >60s 31.8%; concurrency mean 6.5 max 22; visible booked mean 19.5 max 43.7 GiB
+effective ceiling (throttle lines, one a minute, 1668 in the window): min 38.0 median 48.0 max 51.2 GiB (static 64 GiB; the ledger ceiling is this less 2 GiB + 64 MiB x (jobs + 1))
+slice anon memory (sliceAnon, same lines, ALL jobs incl. hidden): median 9.4 p99 19.1 max 23.7 GiB = max 0.394 of MemoryHigh
+held-peak sum of VISIBLE jobs / sliceAnon of ALL jobs, same minute: p10 0.46 median 1.42; sliceAnon above it in 488 of 1668 minutes (largest excess 20.3 GiB)
+residual = ledger ceiling - visible booked, in the 1219 minutes a visible job was waiting >= 1 s: p10 13.7 median 25.6 p90 38.7 GiB (hidden jobs + idle-held capacity; the replay cannot see it)
+observe lines 1329 (from 2026-11-16T03:34:04): physical-fit true 1329; physical-free minus pin: min 14.7 p01 22.8 median 34.5 GiB
+discountable grants (observe lines) 1329 vs pin rows started since 1039: ratio 1.28. More grants than rows means at least 290 discountable grants left no row (failed, killed or still running runs)
 aira.slice memory.peak (anon + cache, since the slice was created): 39.6 GiB = 0.661 of MemoryHigh
 
 ## 1. Calibration: baseline (factor 1.0) replay of the same arrivals vs observed
 score = mean |log ratio| replayed/observed of wait p50, p90, p99 (+1 s) and the share waiting > 60 s (0 = exact). hour r = Pearson r of the hourly mean wait, replayed vs observed (1 = same hours busy).
 ceiling                    policy      p50 s    p90 s    p99 s    >60s  maxc hour r  score forced
-OBSERVED                   -             4.5    252.4    854.6   27.9%    22      -      -      -
-const 36 GiB               fifo          0.0      6.0    733.8    8.3%    24   0.22   1.66      0
-const 36 GiB               bypass        0.0      0.0    573.0    5.3%    22   0.26   2.32      0
-const 36 GiB               backfill      0.0      0.0    190.2    2.6%    21   0.21   2.77      0
-const 40 GiB               fifo          0.0      0.0    340.0    3.2%    22   0.21   2.58      0
-const 40 GiB               bypass        0.0      0.0    137.7    1.9%    22   0.22   2.92      0
-const 40 GiB               backfill      0.0      0.0     40.6    0.8%    24   0.23   3.44      0
-const 44 GiB               fifo          0.0      0.0    108.4    1.3%    23   0.21   3.07      0
-const 44 GiB               bypass        0.0      0.0     32.8    0.7%    23   0.22   3.50      0
-const 44 GiB               backfill      0.0      0.0     21.4    0.5%    23   0.21   3.66      0
-const 48 GiB               fifo          0.0      0.0     15.2    0.5%    25   0.18   3.75      0
-const 48 GiB               bypass        0.0      0.0      0.0    0.3%    26   0.19   4.58      0
-const 48 GiB               backfill      0.0      0.0      0.0    0.2%    26   0.20   4.67      0
-const 62 GiB               fifo          0.0      0.0      0.0    0.0%    27    nan   4.91      0
-const 62 GiB               bypass        0.0      0.0      0.0    0.0%    27    nan   4.91      0
-const 62 GiB               backfill      0.0      0.0      0.0    0.0%    27    nan   4.91      0
-journal, H=0 GiB           fifo          0.0      0.0     62.5    1.0%    23   0.14   3.26      0
-journal, H=0 GiB           bypass        0.0      0.0      0.4    0.4%    23   0.18   4.43      0
-journal, H=0 GiB           backfill      0.0      0.0      0.0    0.3%    23   0.21   4.54      0
-journal, H=8 GiB           fifo          0.0      0.0    410.5    5.4%    22   0.23   2.40      0
-journal, H=8 GiB           bypass        0.0      0.0    283.5    3.4%    21   0.22   2.61      0
-journal, H=8 GiB           backfill      0.0      0.0     91.4    1.4%    21   0.26   3.11      0
-journal, H=12 GiB          fifo          0.0    127.5    920.3   12.6%    23   0.19   0.81      0
-journal, H=12 GiB          bypass        0.0     17.5    632.5    7.9%    23   0.25   1.47      0
-journal, H=12 GiB          backfill      0.0      0.0    206.4    3.5%    20   0.17   2.67      0
-journal, H=16 GiB          fifo          0.0    783.1   1656.8   32.1%    31   0.05   0.91      0
-journal, H=16 GiB          bypass        0.0    412.3   1228.9   24.6%    25   0.06   0.67      0
-journal, H=16 GiB          backfill      0.0     62.7    736.3   10.4%    24   0.07   1.05      0
-journal - 0.50 x residual  fifo          0.0      0.0    386.9    4.3%    21   0.21   2.47      0
-journal - 0.50 x residual  bypass        0.0      0.0    143.3    2.5%    21   0.21   2.85      0
-journal - 0.50 x residual  backfill      0.0      0.0     78.3    1.2%    21   0.20   3.17      0
-journal - 0.75 x residual  fifo          0.0     95.0    636.4   12.5%    20   0.32   0.94      0
-journal - 0.75 x residual  bypass        0.0     34.7    300.3    7.4%    23   0.37   1.51      0
-journal - 0.75 x residual  backfill      0.0     11.8    176.2    4.4%    22   0.52   2.03      0
-journal - 1.00 x residual  fifo        501.1   1093.7   8337.1   98.2%    30  -0.12   2.38    143
-journal - 1.00 x residual  bypass      121.3    781.2   9812.8   64.5%    24  -0.15   1.88    156
-journal - 1.00 x residual  backfill     26.7    208.4    698.1   32.5%    19   0.78   0.54     18
-best fit by score: journal - 1.00 x residual, backfill (score 0.54, hour r 0.78)
-per job, best fit: of 2347 jobs that did NOT queue (observed wait < 1 s), 65.0% wait > 1 s in the baseline replay (their replayed wait p50 17.9s p90 128.6s): the residual is sampled once a minute, so the replay's capacity is the booking seen at the last tick and a job that started at once waits for the next tick. |replayed start - observed start|: p50 36.0s p90 227.8s
+OBSERVED                   -             8.4    296.6    835.8   31.8%    22      -      -      -
+const 36 GiB               fifo          0.0      0.0    575.4    5.5%    31   0.30   2.51      0
+const 36 GiB               bypass        0.0      0.0    370.8    3.2%    28   0.33   2.75      0
+const 36 GiB               backfill      0.0      0.0     57.6    1.0%    28   0.36   3.50      0
+const 40 GiB               fifo          0.0      0.0    101.0    1.5%    28   0.20   3.26      0
+const 40 GiB               bypass        0.0      0.0     32.6    0.7%    28   0.21   3.72      0
+const 40 GiB               backfill      0.0      0.0      0.0    0.4%    28   0.32   4.70      0
+const 44 GiB               fifo          0.0      0.0      7.4    0.5%    28   0.20   4.13      0
+const 44 GiB               bypass        0.0      0.0      0.0    0.4%    28   0.19   4.72      0
+const 44 GiB               backfill      0.0      0.0      0.0    0.3%    28   0.19   4.78      0
+const 48 GiB               fifo          0.0      0.0      0.0    0.1%    28   0.19   4.93      0
+const 48 GiB               bypass        0.0      0.0      0.0    0.0%    28   0.20   5.03      0
+const 48 GiB               backfill      0.0      0.0      0.0    0.0%    28   0.20   5.03      0
+const 62 GiB               fifo          0.0      0.0      0.0    0.0%    28    nan   5.11      0
+const 62 GiB               bypass        0.0      0.0      0.0    0.0%    28    nan   5.11      0
+const 62 GiB               backfill      0.0      0.0      0.0    0.0%    28    nan   5.11      0
+journal, H=0 GiB           fifo          0.0      0.0      8.2    0.2%    28   0.26   4.26      0
+journal, H=0 GiB           bypass        0.0      0.0      0.0    0.1%    28   0.25   4.91      0
+journal, H=0 GiB           backfill      0.0      0.0      0.0    0.1%    28   0.25   4.91      0
+journal, H=8 GiB           fifo          0.0      0.0    288.6    3.4%    28   0.31   2.81      0
+journal, H=8 GiB           bypass        0.0      0.0    157.8    2.0%    28   0.33   3.08      0
+journal, H=8 GiB           backfill      0.0      0.0     34.9    0.8%    28   0.38   3.67      0
+journal, H=12 GiB          fifo          0.0     25.4    620.8    8.4%    23   0.35   1.57      0
+journal, H=12 GiB          bypass        0.0      0.0    468.7    5.6%    24   0.38   2.56      0
+journal, H=12 GiB          backfill      0.0      0.0    151.2    2.3%    24   0.42   3.06      0
+journal, H=16 GiB          fifo          0.0    259.5   1096.0   19.4%    31   0.38   0.78      0
+journal, H=16 GiB          bypass        0.0    139.1    995.6   13.7%    25   0.33   1.00      0
+journal, H=16 GiB          backfill      0.0     27.5    425.6    6.9%    24   0.18   1.69      0
+journal - 0.50 x residual  fifo          0.0      0.0    399.7    3.9%    27   0.25   2.69      0
+journal - 0.50 x residual  bypass        0.0      0.0    258.5    2.3%    26   0.32   2.92      0
+journal - 0.50 x residual  backfill      0.0      0.0     66.7    1.0%    25   0.32   3.45      0
+journal - 0.75 x residual  fifo          0.0    110.7    621.8   12.6%    31   0.37   1.11      0
+journal - 0.75 x residual  bypass        0.0     37.1    409.3    7.9%    23   0.46   1.60      0
+journal - 0.75 x residual  backfill      0.0     11.3    203.3    4.8%    27   0.57   2.17      0
+journal - 1.00 x residual  fifo        489.6   1175.6   3488.2   97.7%    30   0.22   1.97     79
+journal - 1.00 x residual  bypass      138.0    960.5   2074.6   66.1%    29   0.26   1.38     41
+journal - 1.00 x residual  backfill     28.8    238.2    785.8   35.1%    25   0.72   0.38     16
+best fit by score: journal - 1.00 x residual, backfill (score 0.38, hour r 0.72)
+per job, best fit: of 2372 jobs that did NOT queue (observed wait < 1 s), 64.9% wait > 1 s in the baseline replay (their replayed wait p50 20.1s p90 140.0s): the residual is sampled once a minute, so the replay's capacity is the booking seen at the last tick and a job that started at once waits for the next tick. |replayed start - observed start|: p50 41.1s p90 253.1s
 
 ## 2. Counterfactual: pin rows booked at ceil(factor x pin), against the SAME config's baseline replay
 AND against the observed timeline. earlier/later = jobs whose start moved by more than 1 s versus the
 config's own baseline replay; e-queued = the earlier ones among jobs that REALLY queued (observed wait >= 1 s,
-2863 jobs); obs-e/obs-l = earlier/later than the OBSERVED start. d = change in wait (s) versus the baseline
-replay, metric window; >60s = share waiting over 60 s (observed 27.9%). phys-held = grants the physical-fit
+3338 jobs); obs-e/obs-l = earlier/later than the OBSERVED start, obs-l-q = the later ones that REALLY queued
+(the rest never queued: the minute-tick artifact). d = change in wait (s) versus the baseline
+replay, metric window; >60s = share waiting over 60 s (observed 31.8%). phys-held = grants the physical-fit
 rule held back (clairvoyant reading).
-ceiling                    policy    fac earlier  later e-queued  obs-e  obs-l   p50 d   p90 d   p99 d   >60s phys-held cpu-held
-journal - 1.00 x residual  backfill  1.0       -      -        -   1675   2759       -       -       -  32.5%         -        0
-journal - 1.00 x residual  backfill  0.9    2936    474     1627   2269   1305   -26.7  -117.6  -221.9  13.2%        11        0
-journal - 1.00 x residual  backfill  0.8    3203    292     1740   2454    901   -26.7  -152.2  -286.2   9.4%        36        0
-const 44 GiB               bypass    1.0       -      -        -   2844     22       -       -       -   0.7%         -        0
-const 44 GiB               bypass    0.9      62      5       59   2853     12    +0.0    +0.0   -32.8   0.5%         0        0
-const 44 GiB               bypass    0.8      78      3       74   2855      9    +0.0    +0.0   -32.8   0.3%         0        0
-const 48 GiB               bypass    1.0       -      -        -   2858      5       -       -       -   0.3%         -        0
-const 48 GiB               bypass    0.9      21      2       21   2863      0    +0.0    +0.0    +0.0   0.0%         0        0
-const 48 GiB               bypass    0.8      21      4       21   2863      0    +0.0    +0.0    +0.0   0.0%         0        0
-const 62 GiB               bypass    1.0       -      -        -   2863      0       -       -       -   0.0%         -        0
-const 62 GiB               bypass    0.9       0      0        0   2863      0    +0.0    +0.0    +0.0   0.0%         0        0
-const 62 GiB               bypass    0.8       0      0        0   2863      0    +0.0    +0.0    +0.0   0.0%         0        0
-journal - 1.00 x residual  bypass    1.0       -      -        -    616   4304       -       -       -  64.5%         -        0
-journal - 1.00 x residual  bypass    0.9    4222    265     2312   1892   1897  -120.2  -615.3 -9055.6  22.8%        14        0
-journal - 1.00 x residual  bypass    0.8    4427    178     2410   2207   1242  -121.3  -663.2 -8996.6  15.6%        75        9
-journal - 1.00 x residual  fifo      1.0       -      -        -     50   5264       -       -       -  98.2%         -        0
-journal - 1.00 x residual  fifo      0.9    5237      0     2823   1378   2877  -470.3  -774.9 -7113.3  37.6%         5        0
-journal - 1.00 x residual  fifo      0.8    5268      0     2834   1858   1924  -501.1  -859.0 -7209.8  24.6%        34        3
+ceiling                    policy    fac earlier  later e-queued  obs-e  obs-l obs-l-q   p50 d   p90 d   p99 d   >60s phys-held cpu-held
+journal - 1.00 x residual  backfill  1.0       -      -        -   1990   2928    1310       -       -       -  35.1%         -        0
+journal - 1.00 x residual  backfill  0.9    3111    657     1790   2650   1431     655   -28.8  -119.1  -277.5  16.5%        11        0
+journal - 1.00 x residual  backfill  0.8    3444    385     1964   2873    963     441   -28.8  -167.0  -349.3  11.1%        48        0
+const 44 GiB               bypass    1.0       -      -        -   3328     12      10       -       -       -   0.4%         -        0
+const 44 GiB               bypass    0.9      28      4       27   3329     11       9    +0.0    +0.0    +0.0   0.3%         0        0
+const 44 GiB               bypass    0.8      40      2       38   3330      9       8    +0.0    +0.0    +0.0   0.2%         0        0
+const 48 GiB               bypass    1.0       -      -        -   3334      4       4       -       -       -   0.0%         -        0
+const 48 GiB               bypass    0.9       9      0        9   3338      0       0    +0.0    +0.0    +0.0   0.0%         0        0
+const 48 GiB               bypass    0.8       9      0        9   3338      0       0    +0.0    +0.0    +0.0   0.0%         0        0
+const 62 GiB               bypass    1.0       -      -        -   3338      0       0       -       -       -   0.0%         -        0
+const 62 GiB               bypass    0.9       0      0        0   3338      0       0    +0.0    +0.0    +0.0   0.0%         0        0
+const 62 GiB               bypass    0.8       0      0        0   3338      0       0    +0.0    +0.0    +0.0   0.0%         0        0
+journal - 1.00 x residual  bypass    1.0       -      -        -    697   4710    2617       -       -       -  66.1%         -        0
+journal - 1.00 x residual  bypass    0.9    4635    313     2730   2061   2260    1238  -130.9  -719.7 -1281.4  27.9%        14        0
+journal - 1.00 x residual  bypass    0.8    4871    183     2850   2477   1489     820  -138.0  -787.8 -1317.2  19.9%        74        9
+journal - 1.00 x residual  fifo      1.0       -      -        -     56   5738    3282       -       -       -  97.7%         -        0
+journal - 1.00 x residual  fifo      0.9    5704      0     3284   1320   3486    1987  -442.3  -707.9 -2294.7  45.6%         5        0
+journal - 1.00 x residual  fifo      0.8    5733      0     3295   1907   2451    1393  -478.7  -830.1 -2371.6  32.9%        34        3
 
 ## 3. Memory in the replay: concurrent sum of memory.peak of the VISIBLE jobs, each holding its peak for
 its whole run (blind physical reading), as a fraction of MemoryHigh (60 GiB). Each timeline is checked from
-the metric start through ITS OWN final completion (mins = minutes checked; the observed timeline has 1465).
-dur = duration-weighted (a random instant); job = burst-weighted (the instant each job starts). busiest = the
-clock hour with the highest duration-weighted mean. over54 = minutes whose maximum exceeds 0.9 x MemoryHigh
+the metric start through ITS OWN final completion (mins = minutes checked; the observed timeline has 1695).
+dur = duration-weighted (a random instant); job = burst-weighted (the instant each job starts). busiest = ONE
+clock hour for every row, fixed once: the hour with the highest mean sliceAnon (the real slice, all jobs)
+among hours with >= 30 throttle lines. over54 = minutes whose maximum exceeds 0.9 x MemoryHigh
 (54 GiB). common = duration-weighted mean over the observed window only, the same span for every row.
 ceiling                    policy    fac busiest hour   dur mean  dur p99  job p99 hour max all job99  minmax over54  mins common
-OBSERVED                   -         1.0 2026-11-16T03Z    0.356    0.458    0.475    0.475     0.488   0.551      0  1465  0.230
-journal - 1.00 x residual  backfill  1.0 2026-11-16T05Z    0.350    0.455    0.454    0.483     0.467   0.558      0  1466  0.230
-journal - 1.00 x residual  backfill  0.9 2026-11-16T03Z    0.351    0.484    0.484    0.494     0.474   0.554      0  1464  0.230
-journal - 1.00 x residual  backfill  0.8 2026-11-16T05Z    0.337    0.524    0.524    0.583     0.478   0.583      0  1464  0.230
-const 44 GiB               bypass    1.0 2026-11-16T05Z    0.326    0.490    0.498    0.500     0.486   0.598      0  1464  0.230
-const 44 GiB               bypass    0.9 2026-11-16T05Z    0.326    0.509    0.524    0.526     0.495   0.598      0  1464  0.230
-const 44 GiB               bypass    0.8 2026-11-16T05Z    0.326    0.509    0.528    0.531     0.504   0.618      0  1464  0.230
-const 48 GiB               bypass    1.0 2026-11-16T05Z    0.326    0.516    0.528    0.531     0.497   0.623      0  1464  0.230
-const 48 GiB               bypass    0.9 2026-11-16T05Z    0.326    0.521    0.528    0.531     0.507   0.629      0  1464  0.230
-const 48 GiB               bypass    0.8 2026-11-16T05Z    0.326    0.574    0.579    0.585     0.513   0.629      0  1464  0.230
-const 62 GiB               bypass    1.0 2026-11-16T05Z    0.326    0.574    0.624    0.626     0.528   0.716      0  1464  0.230
-const 62 GiB               bypass    0.9 2026-11-16T05Z    0.326    0.574    0.624    0.626     0.528   0.716      0  1464  0.230
-const 62 GiB               bypass    0.8 2026-11-16T05Z    0.326    0.574    0.624    0.626     0.528   0.716      0  1464  0.230
-journal - 1.00 x residual  bypass    1.0 2026-11-16T03Z    0.361    0.451    0.484    0.484     0.483   0.553      0  1638  0.229
-journal - 1.00 x residual  bypass    0.9 2026-11-16T03Z    0.360    0.509    0.517    0.518     0.490   0.561      0  1465  0.230
-journal - 1.00 x residual  bypass    0.8 2026-11-16T03Z    0.356    0.462    0.474    0.475     0.519   0.560      0  1465  0.230
-journal - 1.00 x residual  fifo      1.0 2026-11-16T03Z    0.358    0.480    0.478    0.494     0.479   0.541      0  1613  0.229
-journal - 1.00 x residual  fifo      0.9 2026-11-16T03Z    0.359    0.511    0.501    0.515     0.485   0.554      0  1465  0.230
-journal - 1.00 x residual  fifo      0.8 2026-11-16T03Z    0.356    0.502    0.503    0.508     0.495   0.554      0  1465  0.230
+OBSERVED                   -         1.0 2026-11-16T13Z    0.299    0.515    0.516    0.522     0.494   0.551      0  1695  0.223
+journal - 1.00 x residual  backfill  1.0 2026-11-16T13Z    0.308    0.523    0.511    0.523     0.476   0.558      0  1703  0.223
+journal - 1.00 x residual  backfill  0.9 2026-11-16T13Z    0.316    0.500    0.502    0.504     0.479   0.554      0  1691  0.223
+journal - 1.00 x residual  backfill  0.8 2026-11-16T13Z    0.304    0.547    0.547    0.547     0.480   0.568      0  1691  0.223
+const 44 GiB               bypass    1.0 2026-11-16T13Z    0.278    0.498    0.511    0.521     0.511   0.598      0  1691  0.223
+const 44 GiB               bypass    0.9 2026-11-16T13Z    0.278    0.531    0.536    0.540     0.531   0.598      0  1691  0.223
+const 44 GiB               bypass    0.8 2026-11-16T13Z    0.278    0.534    0.548    0.548     0.536   0.618      0  1691  0.223
+const 48 GiB               bypass    1.0 2026-11-16T13Z    0.278    0.534    0.548    0.548     0.532   0.623      0  1691  0.223
+const 48 GiB               bypass    0.9 2026-11-16T13Z    0.278    0.534    0.548    0.548     0.536   0.629      0  1691  0.223
+const 48 GiB               bypass    0.8 2026-11-16T13Z    0.278    0.534    0.548    0.548     0.536   0.629      0  1691  0.223
+const 62 GiB               bypass    1.0 2026-11-16T13Z    0.278    0.534    0.548    0.548     0.537   0.716      0  1691  0.223
+const 62 GiB               bypass    0.9 2026-11-16T13Z    0.278    0.534    0.548    0.548     0.537   0.716      0  1691  0.223
+const 62 GiB               bypass    0.8 2026-11-16T13Z    0.278    0.534    0.548    0.548     0.537   0.716      0  1691  0.223
+journal - 1.00 x residual  bypass    1.0 2026-11-16T13Z    0.277    0.501    0.501    0.502     0.481   0.553      0  1780  0.220
+journal - 1.00 x residual  bypass    0.9 2026-11-16T13Z    0.314    0.528    0.528    0.531     0.496   0.561      0  1691  0.223
+journal - 1.00 x residual  bypass    0.8 2026-11-16T13Z    0.320    0.527    0.535    0.535     0.497   0.566      0  1691  0.223
+journal - 1.00 x residual  fifo      1.0 2026-11-16T13Z    0.288    0.477    0.479    0.490     0.479   0.541      0  1775  0.221
+journal - 1.00 x residual  fifo      0.9 2026-11-16T13Z    0.309    0.528    0.522    0.529     0.498   0.554      0  1694  0.223
+journal - 1.00 x residual  fifo      0.8 2026-11-16T13Z    0.322    0.539    0.542    0.546     0.505   0.554      0  1691  0.223
+unknown peaks: none (every row in the window has a peak): the tables above exclude nothing
+visible replay PLUS the real slice (each minute's max of the timeline above + that minute's sliceAnon, which already holds the visible jobs: a double-counting upper bound), max over minutes with a throttle line, of MemoryHigh: observed timeline 1.0: 0.855; best fit (journal - 1.00 x residual, backfill) 1.0: 0.856; best fit (journal - 1.00 x residual, backfill) 0.9: 0.849; best fit (journal - 1.00 x residual, backfill) 0.8: 0.873
 
 ## 4. Discounted jobs against their charge
 4a. Proxy population: every pin row in the window (eligibility NOT established: a row cannot tell a
 discountable grant from a delegate parent, an exclusive job or a restart survivor).
-factor 0.9: peak > charge 137 of 3146 = 4.4%; OOM rows excluded 72 of 3081 = 2.3%; peak >= pin 112 = 3.6% (OOM rows among them 65)
-factor 0.8: peak > charge 217 of 3146 = 6.9%; OOM rows excluded 152 of 3081 = 4.9%; peak >= pin 112 = 3.6% (OOM rows among them 65)
-4b. Eligible population: the 958 discountable grants the daemon logged (observe lines, from 2026-11-16T03:34:04). A row
-carries no scope id, so a grant's row is a guess: a pinned row of the same pin started within 100 ms of the line (measured offsets -39..+8 ms). Grants and rows linked that way form components; a one-to-one component is known, a component whose rows and grants do not pair one to one contributes an interval, and a grant with no row (failed, killed, still running at the copy, or its row evicted by the 20-row retention) is unknown. Paired 768 (714 in one-to-one components); 190 grants with no row; 9 pinned rows started since have no line (not discountable, or a line more than 100 ms away).
-factor 0.9: above the charge between 25 and 215 of 958 grants = [2.6%, 22.4%]: trigger unevaluated; among the 714 one-to-one pairs 22 = 3.1%
-factor 0.8: above the charge between 33 and 223 of 958 grants = [3.4%, 23.3%]: trigger unevaluated; among the 714 one-to-one pairs 28 = 3.9%
-the trigger counts discounted grants; a 25-hour figure on this population does not exist (observe began at 2026-11-16T03:34:04)
-per clock hour with >= 20 pin rows (26 hours): above-charge share at 0.9 median 4.6% max 13.8%; at 0.8 median 6.6% max 15.5%
-pin rows peak/pin: p50 0.17 p90 0.72 p95 0.88 p99 1.00
+factor 0.9: peak > charge between 152 and 152 of 3386 = [4.5%, 4.5%] (0 peaks unknown); OOM rows excluded [2.5%, 2.5%] of 3317; peak >= pin 125 = 3.7% (OOM rows among them 69)
+factor 0.8: peak > charge between 235 and 235 of 3386 = [6.9%, 6.9%] (0 peaks unknown); OOM rows excluded [5.0%, 5.0%] of 3317; peak >= pin 125 = 3.7% (OOM rows among them 69)
+4b. Eligible population: the 1329 discountable grants the daemon logged (observe lines, from 2026-11-16T03:34:04). A row
+carries no scope id, so a grant's row is a guess: a pinned row of the same pin started within 100 ms of the line (measured offsets -39..+8 ms). Grants and rows linked that way form components; a one-to-one component is known, a component whose rows and grants do not pair one to one contributes an interval, and a grant with no row (failed, killed, still running at the copy, or its row evicted by the 20-row retention) is unknown, and so is a row with no peak (peak_rss NULL). Paired 1029 (950 in one-to-one components with a known peak); 300 grants with no row; 0 linked rows with an unknown peak; 10 pinned rows started since have no line (not discountable, or a line more than 100 ms away).
+factor 0.9: above the charge between 40 and 340 of 1329 grants = [3.0%, 25.6%]: trigger unevaluated; among the 950 one-to-one pairs 36 = 3.8%
+factor 0.8: above the charge between 51 and 351 of 1329 grants = [3.8%, 26.4%]: trigger unevaluated; among the 950 one-to-one pairs 44 = 4.6%
+the trigger counts discounted grants; a whole-window figure on this population does not exist (observe began at 2026-11-16T03:34:04)
+per clock hour with >= 20 pin rows with a known peak (29 hours): above-charge share at 0.9 median 4.6% max 13.8%; at 0.8 median 6.8% max 15.5%
+pin rows peak/pin: p50 0.16 p90 0.72 p95 0.88 p99 1.00
 
 ## 5. First-order estimate on the real slice (journal sliceAnon, every minute): NOT a bound
 est = sliceAnon + peaks of the queued jobs the freed booking admits at that minute. It keeps the observed
@@ -131,5 +137,5 @@ conditional sum-of-caps bound, factor 0.9 (needs no timeline): at a grant sum(ch
 host terms, factor 0.9: extra caps beyond factor 1.0 at L = 49.2 GiB: 5.5 GiB; worst-case MemAvailable freeMin + headroom - extra = 4.6 GiB (watchdog trip 8 GiB)
 conditional sum-of-caps bound, factor 0.8 (needs no timeline): at a grant sum(charge) <= L, so with every running job at its full cap at once sum of caps <= L / f; at the window's largest ledger ceiling L = 49.2 GiB that is 61.5 GiB = 1.025 of MemoryHigh (MemoryMax 64 GiB = 1.067); at the static ceiling (throttle lifted, L = 61.9 GiB) 77.4 GiB. Valid only while L stays there; spec exceptions apply
 host terms, factor 0.8: extra caps beyond factor 1.0 at L = 49.2 GiB: 12.3 GiB; worst-case MemAvailable freeMin + headroom - extra = -2.2 GiB (watchdog trip 8 GiB)
-factor 0.9: contended minutes 999, with >= 1 waiter admitted at once 324 (32.4%); est max 0.364 of MemoryHigh; minutes over 54 GiB: est 0 of 1444; busiest hour 2026-11-16T04Z (by sliceAnon): est mean 0.223 max 0.357
-factor 0.8: contended minutes 999, with >= 1 waiter admitted at once 531 (53.2%); est max 0.390 of MemoryHigh; minutes over 54 GiB: est 0 of 1444; busiest hour 2026-11-16T04Z (by sliceAnon): est mean 0.244 max 0.390
+factor 0.9: contended minutes 1219, with >= 1 waiter admitted at once 338 (27.7%); est max 0.394 of MemoryHigh; minutes over 54 GiB: est 0 of 1668; busiest hour 2026-11-16T13Z (by sliceAnon): est mean 0.224 max 0.394
+factor 0.8: contended minutes 1219, with >= 1 waiter admitted at once 559 (45.9%); est max 0.394 of MemoryHigh; minutes over 54 GiB: est 0 of 1668; busiest hour 2026-11-16T13Z (by sliceAnon): est mean 0.231 max 0.394
