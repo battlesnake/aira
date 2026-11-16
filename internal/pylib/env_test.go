@@ -281,3 +281,17 @@ func TestAppendAitestChildEnvironmentSkipsEverythingOnExtractionFailure(t *testi
 		t.Fatalf("failure was not logged once: %q", diagnostics.String())
 	}
 }
+
+// verifies: AIRA-348 — AIRA_CONFINE_PRIORITY is in the strip set, so every
+// confine launch path (real slice and ci-shim both call
+// AppendConfineChildEnvironment) hands the confined command an environment
+// without it. Mutation: drop it from coordinationEnvironmentKeys.
+func TestAppendConfineChildEnvironmentStripsThePriorityVariable(t *testing.T) {
+	got := childEnvValues(t, AppendConfineChildEnvironment([]string{"PATH=/bin", ConfinePriorityEnv + "=high"}, "scope-1", "/s.slice"))
+	if value, present := got[ConfinePriorityEnv]; present {
+		t.Fatalf("%s=%q reached the confined command", ConfinePriorityEnv, value)
+	}
+	if got["PATH"] != "/bin" {
+		t.Fatalf("the strip took an unrelated variable with it: %v", got)
+	}
+}

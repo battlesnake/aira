@@ -1630,6 +1630,10 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	if err != nil {
 		return refuseConfineLaunch(stderr, err)
 	}
+	highPriority, err := runner.ResolveConfinePriority(options["priority"], os.LookupEnv)
+	if err != nil {
+		return refuseConfineLaunch(stderr, err)
+	}
 	reserveRaw, reservePinned := options["memory-reserve"]
 	reserveFromEnv := false
 	if !reservePinned {
@@ -1719,9 +1723,8 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		// false and the detached job's stdin is /dev/null, exactly as before.
 		StdinConnect:   options["stdin-connect"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
-		VRAMBytes: vramBytes,
-		// AIRA-340. parseConfineArgs has refused every value but high and normal.
-		HighPriority: options["priority"] == runner.ConfinePriorityHigh,
+		VRAMBytes:    vramBytes,
+		HighPriority: highPriority, // AIRA-340, AIRA-348
 		Timeout:      jobTimeout, CPUTimeout: jobCPUTimeout,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
