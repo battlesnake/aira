@@ -114,10 +114,10 @@ journal - 1.00 x residual  fifo      0.8 2026-11-16T03Z    0.356    0.502    0.5
 discountable grant from a delegate parent, an exclusive job or a restart survivor).
 factor 0.9: peak > charge 137 of 3146 = 4.4%; OOM rows excluded 72 of 3081 = 2.3%; peak >= pin 112 = 3.6% (OOM rows among them 65)
 factor 0.8: peak > charge 217 of 3146 = 6.9%; OOM rows excluded 152 of 3081 = 4.9%; peak >= pin 112 = 3.6% (OOM rows among them 65)
-4b. Eligible population: the 958 discountable grants the daemon logged (observe lines, from 2026-11-16T03:34:04), each paired
-one to one with the pinned row of the same pin started within 0.5 s of the line. Paired 768; 190 lines have no row (failed, killed or still running: peak unknown); 9 pinned rows started since have no line (not discountable).
-factor 0.9: paired rows above charge 25 of 768 = 3.3% (OOM rows among them 12); with the 190 unknown the share is in [2.6%, 22.4%] of 958 grants: trigger unevaluated
-factor 0.8: paired rows above charge 33 of 768 = 4.3% (OOM rows among them 12); with the 190 unknown the share is in [3.4%, 23.3%] of 958 grants: trigger unevaluated
+4b. Eligible population: the 958 discountable grants the daemon logged (observe lines, from 2026-11-16T03:34:04). A row
+carries no scope id, so a grant's row is a guess: a pinned row of the same pin started within 100 ms of the line (measured offsets -39..+8 ms). Grants and rows linked that way form components; a one-to-one component is known, a component whose rows and grants do not pair one to one contributes an interval, and a grant with no row (failed, killed, still running at the copy, or its row evicted by the 20-row retention) is unknown. Paired 768 (714 in one-to-one components); 190 grants with no row; 9 pinned rows started since have no line (not discountable, or a line more than 100 ms away).
+factor 0.9: above the charge between 25 and 215 of 958 grants = [2.6%, 22.4%]: trigger unevaluated; among the 714 one-to-one pairs 22 = 3.1%
+factor 0.8: above the charge between 33 and 223 of 958 grants = [3.4%, 23.3%]: trigger unevaluated; among the 714 one-to-one pairs 28 = 3.9%
 the trigger counts discounted grants; a 25-hour figure on this population does not exist (observe began at 2026-11-16T03:34:04)
 per clock hour with >= 20 pin rows (26 hours): above-charge share at 0.9 median 4.6% max 13.8%; at 0.8 median 6.6% max 15.5%
 pin rows peak/pin: p50 0.17 p90 0.72 p95 0.88 p99 1.00
@@ -126,7 +126,10 @@ pin rows peak/pin: p50 0.17 p90 0.72 p95 0.88 p99 1.00
 est = sliceAnon + peaks of the queued jobs the freed booking admits at that minute. It keeps the observed
 running set, so it cannot see a discount making jobs overlap that ran apart: it can understate.
 conditional sum-of-caps bound, factor 1.0 (needs no timeline): at a grant sum(charge) <= L, so with every running job at its full cap at once sum of caps <= L / f; at the window's largest ledger ceiling L = 49.2 GiB that is 49.2 GiB = 0.820 of MemoryHigh (MemoryMax 64 GiB = 1.067); at the static ceiling (throttle lifted, L = 61.9 GiB) 61.9 GiB. Valid only while L stays there; spec exceptions apply
+host terms, factor 1.0: extra caps beyond factor 1.0 at L = 49.2 GiB: 0.0 GiB; worst-case MemAvailable freeMin + headroom - extra = 10.1 GiB (watchdog trip 8 GiB)
 conditional sum-of-caps bound, factor 0.9 (needs no timeline): at a grant sum(charge) <= L, so with every running job at its full cap at once sum of caps <= L / f; at the window's largest ledger ceiling L = 49.2 GiB that is 54.7 GiB = 0.911 of MemoryHigh (MemoryMax 64 GiB = 1.067); at the static ceiling (throttle lifted, L = 61.9 GiB) 68.8 GiB. Valid only while L stays there; spec exceptions apply
+host terms, factor 0.9: extra caps beyond factor 1.0 at L = 49.2 GiB: 5.5 GiB; worst-case MemAvailable freeMin + headroom - extra = 4.6 GiB (watchdog trip 8 GiB)
 conditional sum-of-caps bound, factor 0.8 (needs no timeline): at a grant sum(charge) <= L, so with every running job at its full cap at once sum of caps <= L / f; at the window's largest ledger ceiling L = 49.2 GiB that is 61.5 GiB = 1.025 of MemoryHigh (MemoryMax 64 GiB = 1.067); at the static ceiling (throttle lifted, L = 61.9 GiB) 77.4 GiB. Valid only while L stays there; spec exceptions apply
+host terms, factor 0.8: extra caps beyond factor 1.0 at L = 49.2 GiB: 12.3 GiB; worst-case MemAvailable freeMin + headroom - extra = -2.2 GiB (watchdog trip 8 GiB)
 factor 0.9: contended minutes 999, with >= 1 waiter admitted at once 324 (32.4%); est max 0.364 of MemoryHigh; minutes over 54 GiB: est 0 of 1444; busiest hour 2026-11-16T04Z (by sliceAnon): est mean 0.223 max 0.357
 factor 0.8: contended minutes 999, with >= 1 waiter admitted at once 531 (53.2%); est max 0.390 of MemoryHigh; minutes over 54 GiB: est 0 of 1444; busiest hour 2026-11-16T04Z (by sliceAnon): est mean 0.244 max 0.390

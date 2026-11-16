@@ -41,9 +41,12 @@ Model (every simplification is listed in the report, section "What the replay ig
   * CPU: 32 slots (2 per core x 16 cores), one per job, hidden jobs not counted.
   * Part 5 adds a first-order estimate on the REAL slice (journal sliceAnon, which includes
     the hidden jobs; an estimate, not a bound) and the conditional sum-of-caps algebra.
-  * Part 4b pairs the daemon's discountable-grant lines with rows (same pin, start within
-    0.5 s, one to one) to get the eligible population of the 5% trigger; lines with no row
-    have unknown peaks, so the trigger is stated as an interval and may be unevaluated.
+  * Part 4b links the daemon's discountable-grant lines to rows (same pin, start within
+    100 ms; a row has no scope id, so a link is a guess) to get the eligible population of
+    the 5% trigger. attribute() keeps that uncertainty: lines with no row, and components
+    that do not pair one to one, widen an interval, and the trigger may be unevaluated.
+  * Part 5's sum-of-caps line is the slice-limit view. On this box host memory binds
+    (bound-by=system-pressure): the report, section 6.1, gives the host-terms worst case.
   * Order: three policies bound the daemon's real one (head protection, AIRA-307 bypass
     budget, --front pushes, priority tiers, the fairness freeze): 'fifo' (nothing passes a
     blocked head), 'bypass' (later jobs may pass a blocked head while their bookings sum
@@ -68,8 +71,10 @@ SAFE = 0.9 * MEMORY_HIGH        # the spec's 0.9 x MemoryHigh (54 GiB)
 CPU_SLOTS = 32
 HEADROOM_BASE = 2 * GIB         # admitSliceHeadroomBaseDefault
 HEADROOM_PER_JOB = 64 * MIB     # admitSliceHeadroomSupervisorDefault
+FREE_MIN = 8 * GIB              # the slice ceiling's freeMin on this box (journal: freeMin=8589934592)
 PIN_BASIS = "cap:operator:--memory-reserve"
 FLOOR = MIB                     # pinChargeFloor
+PARENT_PREFIX = "aitest-parent\x00"   # runner.AitestParentSignaturePrefix: a delegate parent, never discounted
 
 
 def charge_for(pin, factor):
@@ -314,18 +319,20 @@ def level_stats(st, lo, hi):
 
 
 def minute_max(st, lo, hi):
-    """{minute_start_ms: max level reached in that minute}."""
+    """{minute_start_ms: max level reached in that minute}, each minute clipped to [lo, hi):
+    a partial first or last minute sees only the part inside the window."""
     out = {}
     lvl = 0
     i = 0
     m = lo - lo % 60000
     while m < hi:
-        while i < len(st) and st[i][0] <= m:     # an event AT the boundary belongs to this minute's start
+        a, b = max(m, lo), min(m + 60000, hi)
+        while i < len(st) and st[i][0] <= a:     # an event AT the boundary belongs to this minute's start
             lvl = st[i][1]
             i += 1
         mx = lvl
         j = i
-        while j < len(st) and st[j][0] < m + 60000:
+        while j < len(st) and st[j][0] < b:
             mx = max(mx, st[j][1])
             j += 1
         out[m] = mx
@@ -425,28 +432,68 @@ def trigger_verdict(above, unknown, n):
     return "unevaluated"
 
 
-def attribute(obs, jobs, tol=500):
-    """Pair each discountable-grant journal line (ms, pin, ...) with the pinned row of the
-    same pin whose start is nearest, within tol ms, one to one (nearest pairs first). Returns
-    {line index: job}. Two jobs of the same pin started within tol may swap, which cannot
-    change an above-charge count (the charge depends on the pin alone)."""
+TOL = 100   # ms. Measured grant-line to row-start offsets: -39 to +8 ms over 768 pairs (median 1 ms)
+
+
+def attribute(grants, jobs, charge, tol=TOL):
+    """The above-charge count over discounted grants (journal lines (ms, pin, ...)), with the
+    attribution uncertainty kept. A row carries no scope id, so a grant's row can only be
+    guessed: a pinned row of the same pin whose start is within tol ms of the line. Grants
+    and rows linked that way form components (one pin each, so one charge(pin)). In a
+    component of G grants and rows of which a are above the charge and b are not, a
+    nearest-first one-to-one matching pairs k grants (k is at most the largest possible
+    matching). Whichever rows are really the grants' own, at least k - b and at most a of the
+    k paired grants are above, and the G - k unpaired ones are unknown. So the component adds
+    max(0, k - b) to `low` and min(a, k) + G - k to `high`; a one-to-one component (one grant,
+    one row) is the only case where low == high without a rowless grant.
+    Not detectable, and so not covered: a grant whose own row is missing (failed, killed,
+    still running, evicted) with an INELIGIBLE row of the same pin starting within tol of it
+    looks exactly like a pair (the accepted gap; rows need the scope id to close it).
+    Returns {grants, paired, rowless, low, high, single, single_above, rows_used}."""
     by = collections.defaultdict(list)
     for j in jobs:
         if j.pin_class:
             by[j.pin].append(j)
-    pairs = []
-    for i, o in enumerate(obs):
-        for j in by[o[1]]:
-            d = abs(j.start - o[0])
+    edges = []
+    for i, g in enumerate(grants):
+        for j in by[g[1]]:
+            d = abs(j.start - g[0])
             if d <= tol:
-                pairs.append((d, i, j.idx, j))
-    pairs.sort(key=lambda p: p[:3])
-    used, out = set(), {}
-    for _, i, k, j in pairs:
-        if i in out or k in used:
+                edges.append((d, i, j.idx, j))
+    parent = {}
+
+    def find(x):
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+    for _, i, k, _ in edges:
+        a, b = find(("g", i)), find(("r", k))
+        if a != b:
+            parent[a] = b
+    edges.sort(key=lambda e: e[:3])
+    used, match = set(), set()
+    for _, i, k, _ in edges:
+        if i in match or k in used:
             continue
-        out[i] = j
+        match.add(i)
         used.add(k)
+    comps = collections.defaultdict(lambda: [[], {}])
+    for i in range(len(grants)):
+        comps[find(("g", i))][0].append(i)
+    for _, i, k, j in edges:
+        comps[find(("g", i))][1][k] = j
+    out = {"grants": len(grants), "paired": len(match), "rowless": len(grants) - len(match), "low": 0, "high": 0,
+           "single": 0, "single_above": 0, "rows_used": set(k for _, _, k, _ in edges)}
+    for gs, rows in comps.values():
+        c = charge(grants[gs[0]][1])
+        a = sum(1 for j in rows.values() if j.peak > c)
+        b = len(rows) - a
+        k = sum(1 for i in gs if i in match)
+        out["low"] += max(0, k - b)
+        out["high"] += min(a, k) + len(gs) - k
+        if len(gs) == 1 and len(rows) == 1:
+            out["single"] += 1
+            out["single_above"] += a
     return out
 
 
@@ -690,23 +737,25 @@ def report(jobs, extra, ceil_series, obs, out, slice_peak=None):
               atpin, pct(atpin / len(pins)), sum(1 for j in pins if j.peak >= j.pin and j.oom)))
     if obs:
         o_lo = min(o[0] for o in obs)
-        att = attribute(obs, jobs)
-        unknown = len(obs) - len(att)
-        mjobs = list(att.values())
-        paired = set(j.idx for j in mjobs)
-        unmatched_rows = [j for j in pins if j.start >= o_lo - 500 and j.idx not in paired]
-        P("4b. Eligible population: the %d discountable grants the daemon logged (observe lines, from %s), each paired" %
-          (len(obs), iso(o_lo)))
-        P("one to one with the pinned row of the same pin started within 0.5 s of the line. Paired %d; %d lines have "
-          "no row (failed, killed or still running: peak unknown); %d pinned rows started since have no line "
-          "(not discountable)." % (len(att), unknown, len(unmatched_rows)))
+        n = len(obs)
+        a9 = attribute(obs, jobs, lambda pin: charge_for(pin, 0.9))
+        unmatched_rows = [j for j in pins if j.start >= o_lo - TOL and j.idx not in a9["rows_used"]]
+        P("4b. Eligible population: the %d discountable grants the daemon logged (observe lines, from %s). A row" %
+          (n, iso(o_lo)))
+        P("carries no scope id, so a grant's row is a guess: a pinned row of the same pin started within %d ms of the "
+          "line (measured offsets -39..+8 ms). Grants and rows linked that way form components; a one-to-one component "
+          "is known, a component whose rows and grants do not pair one to one contributes an interval, and a grant "
+          "with no row (failed, killed, still running at the copy, or its row evicted by the 20-row retention) is "
+          "unknown. Paired %d (%d in one-to-one components); %d grants with no row; %d pinned rows started since "
+          "have no line (not discountable, or a line more than %d ms away)." % (
+              TOL, a9["paired"], a9["single"], a9["rowless"], len(unmatched_rows), TOL))
         for fac in (0.9, 0.8):
-            a, m = above_charge(mjobs, fac)
-            P("factor %.1f: paired rows above charge %d of %d = %s (OOM rows among them %d); with the %d unknown the share "
-              "is in [%s, %s] of %d grants: trigger %s" % (
-                  fac, a, m, pct(a / m) if m else "n/a", sum(1 for j in mjobs if j.oom and j.peak > charge_for(j.pin, fac)),
-                  unknown, pct(a / len(obs)), pct((a + unknown) / len(obs)), len(obs),
-                  trigger_verdict(a, unknown, len(obs))))
+            a = attribute(obs, jobs, lambda pin: charge_for(pin, fac))
+            P("factor %.1f: above the charge between %d and %d of %d grants = [%s, %s]: trigger %s; "
+              "among the %d one-to-one pairs %d = %s" % (
+                  fac, a["low"], a["high"], n, pct(a["low"] / n), pct(a["high"] / n),
+                  trigger_verdict(a["low"], a["high"] - a["low"], n), a["single"], a["single_above"],
+                  pct(a["single_above"] / a["single"]) if a["single"] else "n/a"))
         P("the trigger counts discounted grants; a 25-hour figure on this population does not exist (observe began at %s)" %
           iso(o_lo))
     by_hour = collections.defaultdict(lambda: [0, 0, 0])
@@ -747,6 +796,12 @@ def first_order(jobs, ceil_series, lo, hi, P):
           "(throttle lifted, L = 61.9 GiB) %s GiB. Valid only while L stays there; spec exceptions apply" % (
               fac, fmt_g(Lmax), fmt_g(Lmax / fac), Lmax / fac / MEMORY_HIGH,
               fmt_g((64 * GIB - HEADROOM_BASE - HEADROOM_PER_JOB) / fac)))
+        # host terms (report 6.1): throttled, the ceiling is sliceAnon + MemAvailable - freeMin, so with
+        # every job at its cap MemAvailable falls to freeMin + headroom - L (1/f - 1)
+        P("host terms, factor %.1f: extra caps beyond factor 1.0 at L = %s GiB: %s GiB; worst-case MemAvailable "
+          "freeMin + headroom - extra = %s GiB (watchdog trip 8 GiB)" % (
+              fac, fmt_g(Lmax), fmt_g(Lmax * (1 / fac - 1)),
+              fmt_g(FREE_MIN + HEADROOM_BASE + HEADROOM_PER_JOB - Lmax * (1 / fac - 1))))
     rows = []
     for fac in (0.9, 0.8):
         est, admitted_min, contended = [], 0, 0
@@ -867,6 +922,13 @@ def selftest():
     edge = [Job(0, 0, 0, 60000, 3 * G, 6 * G, PIN_BASIS, 0)]
     mm = minute_max(step(edge, {0: 0}, lambda j: j.peak), 0, 120000)
     check("minute max: boundary end", (mm[0], mm[60000]), (3 * G, 0))
+    # the window's partial first and last minutes are clipped to [lo, hi): a 55 GiB job at
+    # 0..10 s is before a window opening at 30 s, and one at 100..110 s is after a window
+    # closing at 90 s, so neither minute (0, 60 s) reaches 54 GiB; inside the window they count
+    clip = [Job(0, 0, 0, 10000, 55 * G, 60 * G, "x", 0), Job(1, 100000, 100000, 10000, 55 * G, 60 * G, "x", 0)]
+    cst = step(clip, {0: 0, 1: 100000}, lambda j: j.peak)
+    check("minute max: clipped to [lo, hi) at both partial minutes", minute_max(cst, 30000, 90000), {0: 0, 60000: 0})
+    check("minute max: the same jobs inside the window count", minute_max(cst, 5000, 105000), {0: 55 * G, 60000: 55 * G})
     # a window that opens 50 min before the first job: 100 s at 3 GiB is 2.8% of the hour
     late = [Job(0, 3000000, 3000000, 100000, 3 * G, 6 * G, PIN_BASIS, 0)]
     check("memory: idle time before the first job is in the hour", memory_view(late, {0: 3000000}, 0, 3600000)["hour_dur_p99"], 3 * G)
@@ -950,14 +1012,51 @@ def selftest():
           (trigger_verdict(1, 0, 20), trigger_verdict(2, 0, 39), trigger_verdict(500, 0, 9992),
            trigger_verdict(1, 2, 20), trigger_verdict(0, 0, 0)),
           ("not met", "met", "met", "unevaluated", "unevaluated"))
-    # 18. attribution: same pin, start within 0.5 s, pinned rows only, one to one
+    # 18. attribution: same pin, start within TOL (100 ms), pinned rows only, one to one
     lines = [(1000, 6 * G), (1000, 6 * G), (5000, 2 * G), (9000, 6 * G)]
-    rws = [Job(0, 0, 1000, 1, 0, 6 * G, PIN_BASIS, 0), Job(1, 0, 1300, 1, 0, 6 * G, PIN_BASIS, 0),
-           Job(2, 0, 5000, 1, 0, 3 * G, PIN_BASIS, 0), Job(3, 0, 9700, 1, 0, 6 * G, PIN_BASIS, 0),
+    rws = [Job(0, 0, 1001, 1, 0, 6 * G, PIN_BASIS, 0), Job(1, 0, 1090, 1, 0, 6 * G, PIN_BASIS, 0),
+           Job(2, 0, 5000, 1, 0, 3 * G, PIN_BASIS, 0), Job(3, 0, 9150, 1, 0, 6 * G, PIN_BASIS, 0),
            Job(4, 0, 9000, 1, 0, 6 * G, "cap:auto:daemon-reserve", 0)]
-    att = attribute(lines, rws)
-    check("attribution: two pairs, no pin mismatch, nothing past 0.5 s, no auto row",
-          sorted((i, j.idx) for i, j in att.items()), [(0, 0), (1, 1)])
+    att = attribute(lines, rws, lambda pin: charge_for(pin, 0.9))
+    check("attribution: two pairs, no pin mismatch, nothing past 100 ms, no auto row",
+          (att["paired"], att["rowless"], sorted(att["rows_used"])), (2, 2, [0, 1]))
+    ch = lambda pin: charge_for(pin, 0.9)
+    lo_ = lambda i: Job(i, 0, 0, 1, G, 10 * G, PIN_BASIS, 0)
+
+    def pop(above, rows_at, extra=()):
+        """40 grants of 10 GiB 10 s apart; the row of grant t (if t in rows_at) starts 1 ms
+        after it, peaking 9.5 GiB (above the 9 GiB charge) for the first `above` of them."""
+        gl = [(10000 * t, 10 * G) for t in range(40)]
+        js = []
+        for n, t in enumerate(rows_at):
+            js.append(Job(n, 0, 10000 * t + 1, 1, int(9.5 * G) if n < above else G, 10 * G, PIN_BASIS, 0))
+        for st, pk in extra:
+            js.append(Job(len(js), 0, st, 1, pk, 10 * G, PIN_BASIS, 0))
+        a = attribute(gl, js, ch)
+        return a["low"], a["high"], trigger_verdict(a["low"], a["high"] - a["low"], 40)
+    check("attribution: 3 of 40 above, all one to one: met", pop(3, range(40)), (3, 3, "met"))
+    # review counterexample 1: two known above, the third above-charge job has no row, and
+    # an INELIGIBLE low-peak row starts 300 ms from its grant: it must not stand in for the
+    # missing row (the old 0.5 s pairing read 2 of 40 = 'not met' while the truth is 7.5%)
+    check("attribution: a nearby ineligible row does not hide a rowless grant",
+          pop(2, [t for t in range(40) if t != 39], [(10000 * 39 + 300, G)]), (2, 3, "unevaluated"))
+    # review counterexample 2: 2 of 40 above (exactly 5%), and an ineligible HIGH-peak row
+    # nearer to a low-peak grant than its own row: the old nearest pairing read 3 of 40 'met'
+    js2 = [Job(n, 0, 10000 * t + (5 if t == 39 else 1), 1, int(9.5 * G) if n < 2 else G, 10 * G, PIN_BASIS, 0)
+           for n, t in enumerate(range(40))]
+    js2.append(Job(40, 0, 10000 * 39 + 1, 1, int(9.9 * G), 10 * G, PIN_BASIS, 0))
+    a2 = attribute([(10000 * t, 10 * G) for t in range(40)], js2, ch)
+    check("attribution: a row that disagrees with the grant's other candidate keeps it unknown",
+          (a2["low"], a2["high"], a2["single"], trigger_verdict(a2["low"], a2["high"] - a2["low"], 40)),
+          (2, 3, 39, "unevaluated"))
+    # a burst: three grants of one pin in the same ms and three rows 1-3 ms later, all below:
+    # every grant is known below (not thrown to unknown); with only two rows, one above, the
+    # burst holds between 1 and 2 above
+    burst = [(0, 10 * G)] * 3
+    b3 = attribute(burst, [lo_(0), lo_(1), lo_(2)], ch)
+    check("attribution: an all-below burst is known", (b3["paired"], b3["low"], b3["high"], b3["single"]), (3, 0, 0, 0))
+    b2 = attribute(burst, [lo_(0), Job(1, 0, 2, 1, int(9.5 * G), 10 * G, PIN_BASIS, 0)], ch)
+    check("attribution: a burst with a missing row is an interval", (b2["paired"], b2["low"], b2["high"]), (2, 1, 2))
     check("queued means an observed wait of at least 1 s",
           (queued(Job(0, 0, 999, 1, 0, G, "x", 0)), queued(Job(0, 0, 1000, 1, 0, G, "x", 0))), (False, True))
     print("selftest:", "PASS" if ok else "FAIL")

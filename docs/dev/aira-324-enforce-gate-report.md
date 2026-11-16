@@ -8,8 +8,8 @@ so this report decides from the AIRA-323 data that already exists.
 
 | Factor | Spec gate | Recommendation |
 |---|---|---|
-| **0.9** | **Unevaluated** | **No evidence-based GO.** The replay cannot be validated (section 3), so its memory result is not evidence, and the 5% trigger cannot be computed on the right population (section 5). Enforce at 0.9 is defensible only as an **owner-waived, monitored and reversible trial** under conditions C1 to C5 (section 8). Without that waiver, NO-GO. |
-| **0.8** | **Unevaluated** | **NO-GO.** Its exposure is larger on every measure: the conditional sum-of-caps figure is 61.5 GiB (1.02 x MemoryHigh), and the trigger proxy reads 6.9% here and 6.1% in the spec's two-week replay. The spec also orders a clean week at 0.9 first. |
+| **0.9** | **Unevaluated** | **No evidence-based GO.** The replay cannot be validated (section 3), so its memory result is not evidence, and the 5% trigger cannot be computed on the right population (section 5). Enforce at 0.9 is defensible only as an **owner-waived, owner-risk-accepted, monitored and reversible trial** under conditions C0 to C4 (section 8). Without that waiver, NO-GO. |
+| **0.8** | **Unevaluated** | **NO-GO.** If every discounted job reached its full pin at once, the extra memory 0.8 admits (up to 12.3 GiB) exceeds the host's whole safety margin (about 10 GiB: the 8 GiB the ceiling keeps free plus the 2 GiB headroom), so host memory exhaustion is reachable (section 6.1). The trigger proxy also reads 6.9% here and 6.1% in the spec's two-week replay, and the spec orders a clean week at 0.9 first. |
 
 What the gate needs and what this data gives:
 
@@ -25,10 +25,18 @@ over the 25 hours, the most the slice ever used was 21.4 GiB of anonymous memory
 At 0.9, a pinned job books 90% of its pin, so more jobs fit. Whether that is safe cannot be shown from this data.
 About half of what is booked belongs to jobs the store has no timeline for. The only replay that matches the
 real queue gets there by copying the observed occupancy back in, so its "safe" answer is not independent
-evidence. What does hold, without any replay, is simple arithmetic: while the ledger ceiling stays at or below
-57.6 GiB, even every job at its full cap at once fits under the slice's hard limit (64 GiB) at 0.9. Today the
-ceiling peaks at 49.2 GiB. A 0.9 trial therefore rests on that arithmetic, on a watcher that reads the real
-slice, and on a rollback that takes one command and a restart. It does not rest on the replay.
+evidence.
+
+What the limit is. On this box the ceiling is set by host memory in every observed minute (`bound-by=system-pressure`):
+the daemon books at most `sliceAnon + MemAvailable - 8 GiB`, less a headroom of at least 2 GiB. So at factor 1.0,
+even if every job grew to its full cap at once, the host would keep about 10 GiB available. At 0.9 the same worst
+case uses up to `L x (1/0.9 - 1)` more, 5.5 GiB at today's largest booking (L = 49.2 GiB). That leaves about
+4.6 GiB available: above zero, but below the 8 GiB at which the daemon's memory watchdog starts killing
+**unconfined** processes. At 0.8 the extra is 12.3 GiB, more than the whole margin. Everything at its cap at once
+has not been seen (the slice's anonymous peak was 21.4 GiB against 38 to 51 GiB booked), so this is a worst case,
+not a forecast. A 0.9 trial therefore rests on the owner accepting that worst case, on a watcher that reads host
+memory as well as the slice, on an operator who reads it, and on a rollback that takes one command and a restart.
+It does not rest on the replay.
 
 ## 1. Data
 
@@ -69,10 +77,15 @@ still counted. The busiest hour is the whole clock hour with the highest duratio
 or last hour is not eligible, because its mean covers a shorter span). A separately labelled `common` column
 gives the mean over the observed window only, the same span for every row.
 
-5% trigger population (section 5): each `pin-charge observe` line, one per discountable grant, is paired one to
-one with the pinned row of the same pin whose start is within 0.5 s (the nearest pairs first; the median offset
-is 1 ms, and the count does not change between 0.25 s and 1 s). Two jobs with the same pin that start together
-may swap rows, which cannot change the count: the charge depends only on the pin.
+5% trigger population (section 5): each `pin-charge observe` line, one per discountable grant, is linked to the
+pinned rows of the same pin whose start is within 100 ms. Over the 768 pairs the offsets run from -39 to +8 ms
+(median 1 ms), and widening to 2 s pairs no more. A row carries no scope id, so a link is a guess, not an
+identity. The count keeps that uncertainty: linked grants and rows form components (one pin, so one charge,
+each); a component of one grant and one row is known; any other component contributes an interval (with k
+grants paired, a rows above the charge and b below, between `max(0, k - b)` and `min(a, k)` of the paired
+grants are above); a grant with no row is unknown. The one case this cannot see: a grant whose own row is
+missing while an ineligible row of the same pin started within 100 ms of it. That looks exactly like a pair
+(accepted gap; closing it needs the scope id on the row, deferred).
 
 ## 3. Calibration: does a baseline replay reproduce the real queue?
 
@@ -179,49 +192,76 @@ grant. So the trigger is computed two ways.
 
 | | Factor 0.9 | Factor 0.8 |
 |---|---|---|
-| Grants paired with a row | 768 | 768 |
-| Grants with no row (failed, killed or still running: peak unknown) | 190 | 190 |
-| Paired rows above the charge (OOM rows among them) | 25 = 3.3% of paired (12) | 33 = 4.3% of paired (12) |
-| True share, with the unknown peaks either way | between 2.6% and 22.4% | between 3.4% and 23.3% |
+| Grants paired with a row (of them in one-to-one components) | 768 (714) | 768 (714) |
+| Grants with no row (failed, killed, still running at the copy, or the row evicted by the 20-row retention: peak unknown) | 190 | 190 |
+| Grants above the charge, attribution uncertainty and unknown peaks included | between 25 and 215 = 2.6% to 22.4% | between 33 and 223 = 3.4% to 23.3% |
+| Above the charge among the one-to-one pairs (an estimate, not the trigger) | 22 of 714 = 3.1% | 28 of 714 = 3.9% |
 | Trigger | **unevaluated** | **unevaluated** |
 
 - Eligibility is measurable only in the observe window. There, 9 of the 777 pinned rows that started have no
-  grant line (not discountable). So in that window the proxy population is nearly the eligible one. A reviewer's
-  figure of 407 ineligible rows over the whole window (reported as) could not be reproduced: rows carry nothing
-  that marks eligibility, and before 03:34 UTC there are no grant lines to pair with.
+  grant line within 100 ms. Six are delegate parents (their signature starts with the `aitest-parent` prefix,
+  `runner.AitestParentSignaturePrefix`; never discounted), and the watcher now leaves those out. The other three
+  queued about 9 minutes and started 1 to 2 ms after a grant line of a different pin (one admission pass
+  granting several jobs); why they have no line of their own is not established. A reviewer's figure of 407
+  ineligible rows over the whole window (reported as) could not be reproduced: before 03:34 UTC there are no
+  grant lines to pair with.
 - **The trigger cannot be evaluated on this data.** One grant in five has no row, so the share could be anything
-  from 2.6% to 22.4% at 0.9. The 4.4% proxy no longer supports a GO.
-- Where the peak is known, the share is under 5% at both factors (3.3% and 4.3%). That holds only if the rowless
-  grants peak like the paired ones, which is not established: a failed run can stop at any point.
+  from 2.6% to 22.4% at 0.9. The 4.4% proxy no longer supports a GO. Keeping the attribution uncertainty
+  (section 2) widens no interval here: the 54 paired grants outside one-to-one components sit in bursts whose
+  rows all fall on the same side of the charge, so the low end stays at 25.
+- Where the peak is known, the share is under 5% at both factors. That holds only if the rowless grants peak like
+  the paired ones, which is not established: a failed run can stop at any point.
+- **Eviction is a measured cause of rowless grants.** A fresh copy taken 2.6 h after the replay's copy holds
+  166 fewer of the replay copy's 5,332 rows (3.1%; 51 of 3,146 pinned rows, 1.6%), and 11 rows the old copy
+  lacked (jobs still running when it was taken). 744 signatures sit at the 20-row cap. So the later a copy, the
+  more grants turn rowless: the watcher keeps every pinned row any `--store` run has seen (section 10), and a
+  row evicted between two hourly runs is still lost.
 - 0.8 reads over 5% on the 25-hour proxy and on the spec's two-week figure, and at 4.9% even without OOM rows.
 - 47 non-OOM pinned rows have a peak equal to their pin: page cache fills the cap (AIRA-318). They count as
   "above charge" at any factor. Measuring anonymous peaks (AIRA-318) would bring both rates down.
 
 The watcher (section 10) computes the trigger the same way under enforce, from the `pin-charge enforce` lines, and
-reports `met` only when the known-above grants alone exceed 5%.
+reports `met` only when the low end of the interval exceeds 5%.
 
 ## 6. Memory
 
-### 6.1 Conditional bound on the sum of caps (needs no timeline)
+### 6.1 Worst-case exposure in host terms (needs no timeline)
 
-At each grant, `sum(charge) <= L`, the ledger ceiling *at that grant*. A discounted job's cap is at most its
-charge divided by f, and every other job's cap is its charge. So at a grant the sum of all caps is at most
-`L / f`, with the spec's exceptions (`--resize`, a re-declare charged above the ceiling). Between grants jobs only
-end, so the sum only falls. Because each job's memory is held at or below its own cap, the sum of caps bounds the
-slice's job memory. This is **conditional algebra, not a forecast**: it holds only while the ledger ceiling stays
-where it was. Condition C4 makes that monitored.
+What binds on this box is host memory, not the slice. Every throttle line in the window says
+`bound-by=system-pressure`, for example `51271172096 effective / 68719476736 configured, sliceAnon=5756658168
+MemAvailable=53678776320 bound-by=system-pressure ... freeMin=8589934592`. The ceiling is then
+`sliceAnon + MemAvailable - freeMin` (`sliceceiling.go`, `sliceCeilingDesired`), with freeMin = 8 GiB, and admission
+keeps a further headroom of 2 GiB + 64 MiB per job (`admit.go`). The daemon's watchdog trips when MemAvailable
+falls under 8 GiB (`watchdog.go`, `watchdogLowMemAvailable`); it acts on unconfined processes.
 
-| Factor | Largest ledger ceiling in the window, L = 49.2 GiB | If the throttle lifts (static, L = 61.9 GiB) | Largest L that keeps the sum under MemoryMax (64 GiB) |
+At a grant, the charges of the running jobs sum to at most `L`, the ceiling at that grant less the headroom. A
+discounted job's cap is at most its charge / f; every other job's cap is its charge. If every running job then grew
+to its cap at once and nothing outside the slice changed, MemAvailable would fall to
+at least `freeMin + headroom - L x (1/f - 1)` (the last term is the most it can be: only the discounted jobs'
+share of L adds to it):
+
+| Factor | Extra beyond factor 1.0, at L = 49.2 GiB (window maximum) | Worst-case MemAvailable (margin 8 + 2.06 GiB) | Reaches |
 |---|---|---|---|
-| 1.0 (today) | 49.2 GiB = 0.82 x MemoryHigh | 61.9 GiB | 64 GiB |
-| **0.9** | **54.7 GiB = 0.91 x MemoryHigh** | 68.8 GiB, over MemoryMax | **57.6 GiB** |
-| 0.8 | 61.5 GiB = 1.02 x MemoryHigh | 77.4 GiB, over MemoryMax | 51.2 GiB |
+| 1.0 (today) | 0 | at least 10.1 GiB | nothing: above the watchdog trip |
+| **0.9** | **5.5 GiB** (6.9 GiB at the unthrottled L = 61.9 GiB) | **about 4.6 GiB** | **the watchdog trip (8 GiB), not exhaustion** |
+| 0.8 | 12.3 GiB | below 0 | **host memory exhaustion** |
 
-The ceiling was throttled in all 1,444 minutes (effective 38.0 to 51.2 GiB). At 0.9 the bound stays under
-MemoryMax while the ledger ceiling stays at or below 57.6 GiB. It does **not** stay under the gate's 54 GiB line
-(54.7 GiB is 0.911 x MemoryHigh). So it says a slice-level OOM needs the ceiling to rise or an exception. It does
-not say MemoryHigh will not be reached; that is what the `high` and pressure triggers watch. At 0.8 the
-largest safe L (51.2 GiB) is about where the ceiling already peaks.
+This is a worst case, not a forecast: every job at its full cap together has not been seen (the slice's anonymous
+peak over 25 hours was 21.4 GiB against 38 to 51 GiB booked). It is also not a bound. A ceiling that falls after
+a grant (memory used outside the slice grows) shrinks the margin at factor 1.0 as well; enforce adds only the extra
+in the table, on top of whatever exposure factor 1.0 already has. The spec's exceptions (`--resize`, a
+re-declare charged above the ceiling) are outside it.
+
+When the throttle lifts (the static cap binds, `ceiling_basis` no longer `system-pressure`), the slice's own
+limit binds first instead: the caps can sum to `L / f`, 68.8 GiB at 0.9 against MemoryMax 64 GiB, so a
+slice-level OOM becomes reachable. Then the kernel picks which job dies (OOM steering is off, C1).
+
+While throttled, the slice cannot hold more than `effective + freeMin` of anonymous memory before host
+MemAvailable reaches 0: at most 59.2 GiB in this window, below MemoryHigh (60 GiB) and MemoryMax (64 GiB). So
+the spec's `oom_kill` and `high` triggers cannot fire from job memory growth while the ceiling is system-pressure
+bound. Host memory gives out first, which is why the watcher reads MemAvailable, the watchdog's trips and
+systemd-oomd's kills (section 10). A `high` event in that state can only come from page cache, which the
+kernel reclaims at the slice's MemoryHigh.
 
 The earlier version of this report also added `L(1-f)/f` to the slice's observed peak, per minute and as a
 "cache-inclusive bound". **That was wrong and is removed**: a discount changes which jobs overlap. With a 10 GiB
@@ -269,14 +309,16 @@ relied on. Holding each peak for the whole run overstates use (the held-peak sum
   (AIRA-264 records only OOM or success), killed and cancelled runs (a job cancelled while queued is absent, both
   as a competitor and as a wait), jobs still running at the copy, and long-lived services. The calibrated model
   holds their booking fixed; the direction of that error is unknown.
-- **Evicted rows** (retention keeps 20 rows per exact signature): their runs are missing, and so are their
-  bookings, which also sit in the residual.
+- **Evicted rows** (retention keeps 20 rows per exact signature; measured, 3.1% of the rows gone 2.6 h later,
+  section 5b): their runs are missing, and so are their bookings, which also sit in the residual. In the trigger
+  population they turn grants rowless.
 - **OOM rows have censored peaks** (the peak is the cap, not the need). They count as "above charge", and their
   run length is the time until the kill.
 - **Cache-inclusive peaks** (AIRA-318): `memory.peak` includes page cache. It overstates real need and inflates
   the above-charge rate (47 pinned rows sit exactly at their pin).
 - **The ceiling varied** (38.0 to 51.2 GiB effective, throttled in every minute). The replay follows the
-  journal's per-minute series. A day when the throttle lifts breaks the conditional bound (6.1, C4).
+  journal's per-minute series. A day when the throttle lifts moves the binding limit from host memory to the
+  slice's MemoryMax (6.1).
 - **Order**: the replay brackets the daemon with fifo, bypass and backfill. It ignores the fairness-freeze duty
   cycle, `--front` pushes, the priority tiers and the exclusive gate. The best fit is backfill, which is
   optimistic about who passes a blocked head; the policies nearer the daemon's head protection do not calibrate.
@@ -295,80 +337,100 @@ relied on. Holding each peak for the whole run overstates use (the held-peak sum
 - **C0. The owner waives the gate explicitly.** The spec's gate is unevaluated on this data (sections 3 and 5).
   The owner already waived the observe week; this is a second, separate waiver and should be recorded as such
   (the PR or the ticket).
-- **C1. OOM steering: an explicit owner decision.** PR #248 lists "switch OOM steering on first" as enforce's
-  precondition. Steering is off on this box and has no install flag yet (AIRA-347 step 0); a drop-in
-  `Environment=AIRA_DAEMON_OOM_STEER_MODE=...` would set it. Steering only biases which job dies *in a
-  slice-level OOM*, which (section 6.1) needs the ledger ceiling above 57.6 GiB or a spec exception. Steering also
-  has an open P2 (AIRA-347 review: it reads cache-inclusive `memory.current`). Recommendation: waive it for 0.9,
-  tied to C4. The waiver is the owner's to give; without it, enforce waits for the drop-in.
+- **C1. The owner accepts two risks explicitly, by name.**
+  - *Host memory.* If every discounted job reached its full pin at once, host MemAvailable could fall to about
+    4.6 GiB (section 6.1): below the watchdog's 8 GiB trip, so the watchdog would act on **unconfined**
+    processes. Nothing in the daemon prevents those grants; the watcher only detects the result
+    (`mem_available_gib`, `watchdog_trips`, `oomd_kills`) after it happens.
+  - *No OOM steering.* PR #248 lists "switch OOM steering on first" as enforce's precondition. Steering is off
+    on this box and has no install flag yet (AIRA-347 step 0; a drop-in `Environment=AIRA_DAEMON_OOM_STEER_MODE=...`
+    would set it), and it has an open P2 (AIRA-347 review: it reads cache-inclusive `memory.current`). Steering
+    only chooses the victim of a slice-level OOM. While throttled that OOM is out of reach (section 6.1); if the
+    throttle lifts, the caps can exceed MemoryMax and the kernel chooses the victim. No monitor protects
+    against a grant made during a short rise of the ceiling: those jobs keep their caps after it falls.
+
+  Without both acceptances, enforce waits (for steering: the drop-in).
 - **C2. Start the watch sampler and record a short baseline before switching.** It has **not** been started yet
   (`~/tmp/aira-324-watch/` holds no samples). No history of `memory.pressure` exists, so its trigger is
-  unevaluated until the sampler has data. Run `docs/dev/aira-324-enforce-watch.sh` every 5 minutes for **at
-  least 2 hours** before the switch (the cron line in the script's header, or a loop), then run `--baseline`. A
-  baseline of a few hours is weaker than the spec's week. The `high` baseline is established: the cumulative
-  count has been 0 since the slice started.
+  unevaluated until the sampler has data. Run `docs/dev/aira-324-enforce-watch.sh` every 5 minutes, and with
+  `--store` hourly, for **at least 2 hours** before the switch (the cron lines in the script's header), then run
+  `--baseline`. A baseline of a few hours is weaker than the spec's week. The `high` baseline is established: the
+  cumulative count has been 0 since the slice started.
 - **C3. Daemon-restart care.** The switch restarts the shared daemon. Run `aira confine --list` and tell peers
   first. After the restart every surviving lease is re-declared at its full pin, so the ledger may sit above the
   ceiling until releases bring it back.
-- **C4. The ceiling condition.** If the ledger ceiling (`ceiling_gib` in the watch line) stays above
-  **57.6 GiB** for an hour, the conditional bound in section 6.1 no longer keeps the sum of caps under
-  MemoryMax. Then switch OOM steering on (a drop-in) or roll back. This adds to the spec's triggers.
-- **C5. Read the 5% trigger for what it is.** On the eligible population it is `unevaluated` whenever enough
-  grants have no row, which is the normal case (one in five today). The watcher rolls back automatically only
-  on `met`. If it stays `unevaluated` while `share_paired_estimate` (the share among grants with a row) is over
-  5% for the week, treat that as the trigger and roll back: it is the owner's call, and this report recommends
-  it.
+- **C4. A named operator reads the watcher, and acts.** The watcher is read-only: it rolls nothing back. The
+  session driving the trial (or the owner) reads its latest lines at least every hour while any session is
+  active, and first thing at each session start for the unattended hours since:
+  `tail -n 12 ~/tmp/aira-324-watch/watch.log | grep -v '"met": \[\]'` prints only lines with a met trigger. On any
+  `met` entry: roll back at once (section 9 step 5), then file a finding with the watch line. Between reads
+  nobody acts, so a met trigger can stand for up to the read interval (overnight, the whole night). For the 5%
+  trigger: it is `unevaluated` whenever enough grants have no row, the normal case (one in five today). If it
+  stays `unevaluated` for the week while `share_one_to_one_estimate` is over 5%, treat that as met: the owner's
+  call, which this report recommends.
 
-**Factor 0.8: NO-GO.** Reconsider after a clean week at 0.9 with the 5% trigger evaluated (enough grants with
-rows), OOM steering on (its safe ceiling, 51.2 GiB, is where the ceiling already peaks), and this replay re-run on
-the enforce week's rows.
+**Factor 0.8: NO-GO.** Its worst case (section 6.1) exceeds the host's whole margin. Reconsider only after a clean
+week at 0.9 with the 5% trigger evaluated, and with a control that acts before the grants (for example a
+physical-fit rule against the host, not the slice), not a monitor that sees the result.
 
 ## 9. Rollout (commands checked against `internal/install` and PR #248)
 
-1. Pre-checks (C0, C2, C3): the waiver is recorded; the sampler has run for at least 2 h; then
-   `docs/dev/aira-324-enforce-watch.sh --baseline`, then `aira confine --list`, then a heads-up to peers.
-2. Dry run: `aira install --dry-run --pin-charge enforce --pin-charge-factor 0.9`.
+1. Pre-checks (C0 to C4): the waiver and the risk acceptances are recorded; the sampler has run for at least 2 h;
+   then `docs/dev/aira-324-enforce-watch.sh --baseline`, then `aira confine --list`, then a heads-up to peers.
+2. Dry run: `aira install --dry-run --pin-charge enforce --pin-charge-factor 0.9`. Its daemon unit must show
+   `AIRA_DAEMON_PIN_CHARGE_FACTOR=0.9`.
 3. Switch: `aira install --pin-charge enforce --pin-charge-factor 0.9`, as the same non-root user (the daemon is
-   a user unit). Install renders `AIRA_DAEMON_PIN_CHARGE_MODE=enforce` and `AIRA_DAEMON_PIN_CHARGE_FACTOR=0.9`
-   into `~/.config/systemd/user/aira-daemon.service`, runs `systemctl --user daemon-reload`, and **restarts the
-   daemon itself when the unit content changed** (`install.go`, the `daemonPresent && daemonChanged` branch;
-   its log says `aira-daemon.service: updated`). Every other daemon mode keeps its installed value (the AIRA-106
+   a user unit). **`--pin-charge-factor 0.9` is mandatory.** The installed factor today is **0.8**
+   (`systemctl --user show aira-daemon.service -p Environment` reads `AIRA_DAEMON_PIN_CHARGE_FACTOR=0.8`), and
+   install keeps the installed value when the flag is left out (`install.go`, the `pinChargeFactorGiven` branch;
+   the shipped default is also 0.8), so a shortened `aira install --pin-charge enforce` enforces at the NO-GO
+   factor. Install renders `AIRA_DAEMON_PIN_CHARGE_MODE=enforce` and `AIRA_DAEMON_PIN_CHARGE_FACTOR=0.9` into
+   `~/.config/systemd/user/aira-daemon.service`, runs `systemctl --user daemon-reload`, and **restarts the daemon
+   itself when the unit content changed** (`install.go`, the `daemonPresent && daemonChanged` branch; its log says
+   `aira-daemon.service: updated`). Every other daemon mode keeps its installed value (the AIRA-106
    keep-what-is-installed rule). The drop-ins `sched-mode.conf` (`AIRA_SCHED_MODE`) and `vram-budget.conf`
-   (`AIRA_VRAM_BUDGET`) in `aira-daemon.service.d/` are not touched by install and stay in force.
-4. Verify the daemon really restarted:
+   (`AIRA_VRAM_BUDGET`) in `aira-daemon.service.d/` are not touched by install and stay in force. Afterwards
+   `aira install --status` must show `daemon pin charge factor` 0.9.
+4. Verify the daemon really restarted, at the right factor:
    - `systemctl --user show aira-daemon.service -p ActiveEnterTimestamp` is later than step 3.
    - `journalctl --user -u aira-daemon.service --since "10 min ago" | grep 'pin-charge'` shows
-     `pin-charge enforce: ... factor=0.90` lines and no new `observe` lines.
+     `pin-charge enforce: ... factor=0.90` lines and no new `observe` lines. **Any `pin-charge enforce` line with
+     `factor=0.80` means an immediate rollback** (step 5); the watcher reports it as met.
    - If the timestamp is older, run the restart PR #248 describes: `systemctl --user daemon-reload`, then
      `systemctl --user restart aira-daemon.service`.
 
-   Do not trust `aira install --status` for this check. It reads the unit's environment
+   `aira install --status` proves the unit's values, not the restart. It reads the unit's environment
    (`systemctl show -p Environment`), which shows the new mode as soon as the unit is reloaded, whether or not
    the daemon was restarted.
-5. **Rollback**: `aira install --pin-charge observe`, then the same verification. The factor stays recorded
-   (0.9), and a mode change applies to new grants only. After that restart, every lease is re-declared at its
-   full pin, which is the same as observe.
+5. **Rollback**: `aira install --pin-charge observe`, then the same verification (no new `enforce` lines). The
+   factor stays recorded (0.9), and a mode change applies to new grants only. After that restart, every lease is
+   re-declared at its full pin, which is the same as observe.
 
-## 10. Monitoring and the rollback triggers (spec section 6 item 2)
+## 10. Monitoring and the rollback triggers (spec section 6 item 2, plus host memory)
 
-Run `docs/dev/aira-324-enforce-watch.sh` every 5 minutes; it prints one JSON line. From cron, use the line in the
-script's header: the script sets `XDG_RUNTIME_DIR` itself when cron leaves it out, and the cron line puts `aira`
-on `PATH`. Run it with `--store` once a day; that copies the store to `~/tmp/aira-324-watch/`, never touches the
-live file, and deletes the copy after. A failed journal read shows as `unevaluated` and is named in `triggers`;
-it is never read as 0. Any one met trigger switches the mode back to observe (section 9 step 5) and files a
-finding.
+Run `docs/dev/aira-324-enforce-watch.sh` every 5 minutes and with `--store` every hour (the two cron lines in its
+header); each run prints one JSON line. The script sets `XDG_RUNTIME_DIR` itself when cron leaves it out, and the
+cron lines put `aira` on `PATH`. `--store` copies the store (about 340 MB) to `~/tmp/aira-324-watch/`, never touches
+the live file, deletes the copy after, and adds every pinned row it sees (start, pin, peak, oom, run length; no
+command) to `rows.tsv`, so a row the 20-row retention evicts later still counts. The line has two lists: `met`
+(act: C4) and `unevaluated` (each with its reason). A failed read is `unevaluated`, never 0.
 
-| Trigger (spec) | Watch field | Threshold |
+| Trigger | Watch field | Threshold |
 |---|---|---|
-| A slice-level `oom_kill` of a job under its pin | `d_oom_local` (the slice's `memory.events.local` `oom`) | Any increase rolls back. The kernel counts `oom` against the cgroup whose limit was hit and `oom_kill` against the victim's cgroup, so the slice-local `oom_kill` stays 0 even for a slice-level kill. Which job died, and whether its peak was under its pin, cannot be read from cgroup files, so any slice-level OOM counts (conservative). The hierarchical `oom_kill` also counts jobs killed at their own cap (about 12,000 since slice start) and is **not** a trigger. |
-| `memory.events` `high` over the pre-enforce weekly p99 for 2 consecutive hours | `high`, `d_high`; `triggers` | The baseline p99 is 0, so the trigger is any `high` event in each of 2 consecutive hours. Each hour's change is read from the last sample at or before each edge. A gap of more than 15 minutes between samples, or a counter reset, makes it `unevaluated`. |
-| `memory.pressure` `some avg10` over the pre-enforce weekly p99 for 2 consecutive hours | `some_avg10`; `triggers` | The p99 of the samples collected under C2; `unevaluated` until a baseline exists. Pressure is hierarchical (a job stalling at its own cap raises it), so the short baseline matters. |
-| More than 5% of discounted jobs above their charge in a week | `above_charge` (`--store`) | Population: the `pin-charge enforce` lines with `charged < pin` in the current enforce epoch (back to the last observe line or factor change) and the last 7 days, each paired with its row as in section 2. `above` compares the row's peak with the line's charge. `trigger` is `met` when `above / grants` is over 5% (integer comparison, no rounding, no minimum row count), `not met` when even `(above + unknown) / grants` is at most 5%, else `unevaluated`. Restart survivors and ineligible jobs have no enforce line, so they are left out. See C5 for a persistent `unevaluated`. |
+| Spec: a slice-level `oom_kill` of a job under its pin | `d_oom_local` (the slice's `memory.events.local` `oom`) | Any increase is met. The kernel counts `oom` against the cgroup whose limit was hit and `oom_kill` against the victim's cgroup, so the slice-local `oom_kill` stays 0 even for a slice-level kill. Which job died, and whether its peak was under its pin, cannot be read from cgroup files, so any slice-level OOM counts (conservative). The first sample and a counter reset are `unevaluated`. The hierarchical `oom_kill` also counts jobs killed at their own cap (about 12,600 since slice start) and is **not** a trigger. |
+| Spec: `memory.events` `high` over the pre-enforce weekly p99 for 2 consecutive hours | `high`, `d_high` | The baseline p99 is 0, so the trigger is any `high` event in each of 2 consecutive hours. Each hour's change is read from the last sample at or before each edge. A gap of more than 15 minutes between samples, or a counter reset, makes it `unevaluated`. |
+| Spec: `memory.pressure` `some avg10` over the pre-enforce weekly p99 for 2 consecutive hours | `some_avg10` | Every sample of the last 2 hours over the p99 of the samples collected under C2; `unevaluated` until a baseline exists or when samples have a gap. Pressure is hierarchical (a job stalling at its own cap raises it), so the short baseline matters. |
+| Spec: more than 5% of discounted jobs above their charge in a week | `above_charge` (`--store`) | Population: the `pin-charge enforce` lines with `charged < pin` in the current enforce epoch (back to the last observe line or factor change) and the last 7 days, linked to rows as in section 2 (delegate-parent rows left out). `[above_low, above_high]` keeps the attribution uncertainty and the rowless grants. `met` when `above_low / grants` is over 5% (integer comparison, no rounding, no minimum count), `not met` when even `above_high / grants` is at most 5%, else `unevaluated`. Restart survivors and ineligible jobs have no enforce line, so they are left out. See C4 for a persistent `unevaluated`. |
+| Host: MemAvailable under the watchdog's trip | `mem_available_gib` | Under 8 GiB in a sample is met. |
+| Host: the daemon's watchdog tripped | `watchdog_trips` (`aira daemon: watchdog trip:` lines in the last N minutes) | Any is met. None seen in the 8 days before this report. |
+| Host: systemd-oomd killed a cgroup | `oomd_kills`, `oomd_kills_aira` (`journalctl -t systemd-oomd` `Killed` lines) | Any is met. Base rate before enforce: 4 kills in 8 days, all of `aira.slice` jobs (2026-11-09 twice, 2026-11-11 twice), so a kill is not proof that enforce caused it; roll back first, then look. |
+| Rollout: enforce at the wrong factor | `enforce_factors` | Any enforce line whose factor is not 0.90 is met. |
 
-Condition C4 (not a spec trigger) is evaluated in the same line: `triggers` names C4 when every sample in a
-continuously sampled last hour is above 57.6 GiB. Watch without triggering on them: `phys_unfit` (physical-fit
-refusals; 0 so far), and `queued` and `granted_gib` against `ceiling_gib` (the queue the change is meant to
-shorten).
+**Which triggers can fire on this box.** While `ceiling_basis` is `system-pressure` (every minute observed so
+far), the slice-level `oom` and the `high` triggers cannot fire from job memory growth (section 6.1): host memory
+runs out first, so the host rows are the ones that can. They become live only when the throttle lifts. Watch
+without triggering on them: `phys_unfit` (physical-fit refusals; 0 so far), and `queued` and `granted_gib` against
+`ceiling_gib` (the queue the change is meant to shorten).
 
 ## 11. Reproduction and checks
 
@@ -382,13 +444,26 @@ TMPDIR=~/tmp/t aira confine --memory-reserve 128M -- python3 -I docs/dev/aira-32
 python3 -I docs/dev/aira-324-enforce-gate-replay.py --selftest
 python3 -I docs/dev/aira-324-enforce-watch-test.py
 TMPDIR=~/tmp/t aira confine --memory-reserve 64M -- python3 -I docs/dev/aira-324-enforce-gate-mutations.py
+# the eviction measurement (section 5b): a second copy taken later (here 2.6 h), both read-only.
+# Prints: replay-copy rows | of them gone later | later rows started before the replay copy's last start
+# that it lacked (still running then) | pinned rows gone. Measured: 5332|166|11|51
+cp ~/.local/state/aira/state.db ~/tmp/aira-324-later.db; cp ~/.local/state/aira/state.db-wal ~/tmp/aira-324-later.db-wal
+F="kind='confine' and wall_ms is not null and wait_ms is not null and started_at_ms is not null and repo is not null"
+K="started_at_ms, budget, coalesce(peak_rss, -1), oom, wall_ms"; old=~/tmp/aira-324-gate-state.db
+tmax=$(sqlite3 -readonly "$old" "select max(started_at_ms) from confine_peak_history where $F")
+sqlite3 -readonly ~/tmp/aira-324-later.db "attach '$old' as o; select
+  (select count(*) from o.confine_peak_history where $F),
+  (select count(*) from (select $K from o.confine_peak_history where $F except select $K from main.confine_peak_history where $F)),
+  (select count(*) from (select $K from main.confine_peak_history where $F and started_at_ms <= $tmax except select $K from o.confine_peak_history where $F)),
+  (select count(*) from (select $K from o.confine_peak_history where $F and budget_basis = 'cap:operator:--memory-reserve'
+     except select $K from main.confine_peak_history where $F));"
 ```
 
 | Check | Result |
 |---|---|
-| Replay on the copy (5,332 rows) | exit 0, peak RSS 69 MiB, about 9 s wall; output committed as `aira-324-enforce-gate-replay.out.txt` |
-| `--selftest` | exit 0, 42 checks |
-| `aira-324-enforce-watch-test.py` (fakes only: a tiny store, a fake cgroup, shims for `journalctl`, `systemctl`, `aira`; a cron-like environment) | exit 0, 15 checks; against the previous watch script it exits 1 (`Failed to connect to bus`) |
-| `aira-324-enforce-gate-mutations.py` (35 replay and 8 watch mutations, each on a copy under `~/tmp`) | exit 0: 43 red, 0 survived. One equivalent mutant is listed in the script |
+| Replay on the copy (5,332 rows) | exit 0, peak RSS 64 MiB, about 8 s wall; output committed as `aira-324-enforce-gate-replay.out.txt`. Clipping each minute to the window (round 5) changed no number in it; only part 4b's wording and counts moved |
+| `--selftest` | exit 0, 49 checks (both review counterexamples among them: each is red against the previous 0.5 s nearest pairing) |
+| `aira-324-enforce-watch-test.py` (fakes only: a tiny store, a fake cgroup and meminfo, back-dated samples, shims for `journalctl`, `systemctl`, `aira`; a cron-like environment) | exit 0, 61 checks across 31 cases: the 5% trigger (8 cases), slice-level oom, high and pressure (positive, negative, reset, gap), MemAvailable, the watchdog, systemd-oomd, the factor |
+| `aira-324-enforce-gate-mutations.py` (42 replay and 23 watch mutations, each on a copy under `~/tmp`) | exit 0: 65 red, 0 survived. Disabling any one trigger turns the watch test red. One equivalent mutant is listed in the script |
 
 A fresh copy taken later has more rows, so its numbers move a little.
