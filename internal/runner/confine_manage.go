@@ -2,10 +2,23 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"aira/internal/pylib"
 )
+
+// ErrConfineKillDelivered marks the one CodeConfineKillUnconfirmed outcome in
+// which the kill itself happened (AIRA-339): the cgroup.kill write succeeded, so
+// the kernel has already SIGKILLed every process in the scope, and only the
+// emptiness confirmation that follows failed (it timed out, could not read the
+// scope's population, or was cancelled). The code stays unconfirmed (the
+// scope was not seen empty); the marker lets the daemon audit-log the kill with
+// confirmed=false instead of leaving no record of it. A failed cgroup.kill write
+// never carries it: that delivered nothing.
+var ErrConfineKillDelivered = errors.New("SIGKILL delivered to every process")
 
 const (
 	CodeConfineOwnerUnverified = "E_CONFINE_OWNER_UNVERIFIED"
@@ -325,7 +338,39 @@ type ConfineRecord struct {
 const (
 	ConfinePriorityHigh   = "high"
 	ConfinePriorityNormal = "normal"
+	// ConfinePriorityEnv (AIRA-348) takes the same two words when --priority is
+	// absent; the confined command never inherits it (pylib strips it).
+	ConfinePriorityEnv = pylib.ConfinePriorityEnv
 )
+
+// ResolveConfinePriority is the launch priority chain (AIRA-348): the
+// --priority flag (the CLI parser has refused every value but high and
+// normal), else AIRA_CONFINE_PRIORITY, else normal; the same shape as --owner /
+// AIRA_CONFINE_OWNER, and like it the variable is not read when the flag is
+// given. An UNSET or whitespace-only variable is absent. Any other value,
+// set-but-empty included, must be exactly high or normal and is otherwise
+// refused: a typo, or an empty expansion such as `AIRA_CONFINE_PRIORITY=$P`
+// with P unset, must neither quietly demote a hook's `high` nor promote
+// anything. lookupEnv is os.LookupEnv in production; it must tell unset from
+// empty, which a getenv cannot.
+func ResolveConfinePriority(flag string, lookupEnv func(string) (string, bool)) (bool, error) {
+	if flag != "" {
+		return flag == ConfinePriorityHigh, nil
+	}
+	environment, set := lookupEnv(ConfinePriorityEnv)
+	switch {
+	case !set:
+		return false, nil
+	case environment == ConfinePriorityHigh:
+		return true, nil
+	case environment == ConfinePriorityNormal:
+		return false, nil
+	case environment != "" && strings.TrimSpace(environment) == "":
+		return false, nil
+	}
+	return false, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s must be %s or %s, not %q (unset it, or pass --priority, which wins over it)",
+		ConfinePriorityEnv, ConfinePriorityHigh, ConfinePriorityNormal, environment)
+}
 
 // ConfineReserveFacet is the UnevaluatedFields name for an unestablished
 // per-scope reserve, spelled once so the producer and every consumer cannot

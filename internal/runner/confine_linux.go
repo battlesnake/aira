@@ -3082,8 +3082,8 @@ func formatConfineTerminationAdvisory(verdict string, usage cgroupUsage) string 
 	// cause this verdict has already ruled out.
 	line := "confine: the job was SIGKILLed by something this supervisor cannot attribute: it sent no signal itself, " +
 		"and this scope's own memory.events.local records no OOM kill. Candidates: an external whole-cgroup kill " +
-		"(systemd-oomd under PSI pressure, another session's `aira confine --kill`, a direct cgroup.kill write), " +
-		"an external kill -9, or the job killing itself."
+		"(systemd-oomd under PSI pressure, an `aira confine --kill` -- your own or another session's, a direct cgroup.kill write), " +
+		"an external kill -9, or the job killing itself. A `--kill` is not reported to this supervisor, so it cannot tell which."
 	if usage.OOMKill != nil && *usage.OOMKill > 0 {
 		line += " Note that memory.events (which counts this scope AND everything below it) does record " +
 			strconv.FormatInt(*usage.OOMKill, 10) + " OOM kill(s): something in a cgroup BENEATH this scope was " +

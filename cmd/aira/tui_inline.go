@@ -143,6 +143,62 @@ func topFrontConfirm(state tuiState, row tableRow) (tuiState, []tuiCmd) {
 	return state, nil
 }
 
+// onTopKillKey is `aira top`'s K (AIRA-271). The first K on a row arms a kill
+// of that row's job and does nothing else; a second K on the SAME row (the row
+// highlighted at that keypress) opens the confirmation; K on another row arms
+// that one instead. It is not a key inside a dialog, the palette or the execute
+// launcher, nor while a request is in flight.
+func onTopKillKey(state tuiState) (tuiState, []tuiCmd) {
+	if state.Active != viewTop || state.PaletteOpen || state.PaletteDispatching || state.ExecuteOpen {
+		state.TopKill = topKillArm{}
+		return state, nil
+	}
+	panel := state.Panels[viewTop]
+	row, ok := inlineSelectedRow(panel, panel.SelectedID)
+	if panel.SelectedID == "" || !ok {
+		state.TopKill = topKillArm{}
+		return state, nil
+	}
+	if state.TopKill.ScopeID != row.ID {
+		state.TopKill = topKillArm{ScopeID: row.ID, Job: row.KillText, Queued: row.Queued}
+		return state, nil
+	}
+	state.TopKill = topKillArm{}
+	return topKillConfirm(state, row), nil
+}
+
+// topKillConfirm builds the confirmation page for KK (AIRA-271), directly
+// rather than through the palette, for the reason topFrontConfirm gives.
+//
+// It sends the CLI's own `confine --kill` (confine-kill) as the caller and
+// NEVER with steal: the daemon's owner check (runner.CheckConfineOwner) decides,
+// and refuses a job that is not the caller's. The page names the job as of this
+// keypress and says what the daemon does to a running and to a queued job.
+func topKillConfirm(state tuiState, row tableRow) tuiState {
+	caller := topConfineCaller(state)
+	request := core.Request{Verb: "confine-kill", Args: map[string]any{
+		"selector": row.ID, "steal": false,
+		"slice": runner.ResolveConfineSlice(""), "owner": caller,
+	}}
+	job := row.KillText
+	if job == "" {
+		job = row.ID
+	}
+	summary := "Kill " + job + ". Every process in its scope is killed at once (cgroup.kill), with no graceful shutdown."
+	if row.Queued {
+		summary = "Cancel " + job + ", still waiting for admission: it never starts, and its launcher exits with U_ADMIT_CANCELLED. If it is admitted before the request arrives, the daemon kills it instead."
+	}
+	summary += " Sent as " + caller + " without --steal: the daemon's owner check refuses a job that is not yours (to override it, run `aira confine --kill <scope id> --steal` in a shell)."
+	state.InlineError = ""
+	state.InlineAction = &inlineActionState{
+		Action:   inlineAction{Key: 'K', Label: "kill", Verb: "confine-kill", Safety: core.SafetyExecute, Destructive: true, ValueSource: inlineValueFixed},
+		TargetID: row.ID, Values: map[string]string{"selector": row.ID}, Stage: inlineStageConfirm, Summary: job,
+	}
+	state.PaletteOpen = true
+	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: "confine-kill"}
+	return state
+}
+
 // topConfineCaller is the identity a confine write from `aira top` is sent as:
 // the CLI's owner chain resolved at startup, or the unknown marker.
 func topConfineCaller(state tuiState) string {
@@ -489,4 +545,11 @@ func inlinePaletteEntry(descriptors []core.DispatchDescriptor, verb, operation s
 		}
 	}
 	return paletteEntry{}, false
+}
+
+// onTopKillDisarm drops an armed kill (AIRA-271).
+func onTopKillDisarm(state tuiState) tuiState {
+	state = cloneTUIState(state)
+	state.TopKill = topKillArm{}
+	return state
 }

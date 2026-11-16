@@ -4,6 +4,7 @@ set -euo pipefail
 # shellcheck source=common.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
-# AIRA-340: high queue priority; the three checks measured about 9 s wall warm and
+# AIRA-340: high queue priority (asked through AIRA_CONFINE_PRIORITY, so a caller
+# can override it, AIRA-348); the three checks measured about 9 s wall warm and
 # about 40 s on a first run in a new worktree (load ~65), under a minute (see common.sh).
 aira_hook_run_make pre-commit high fmt-check vet build

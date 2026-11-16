@@ -165,6 +165,10 @@ func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher
 		stdin: stdin, stdout: stdout, stderr: stderr,
 	}
 	runtime.state.CanExecute = runtime.canExecute
+	// AIRA-271. Bracketed paste: a pasted block reaches the focused widget's
+	// paste handler as text, never the key handlers, so pasting "KK<Tab><Enter>"
+	// cannot arm, open and confirm a kill in one gesture.
+	runtime.app.EnablePaste(true)
 	// AIRA-309. Resolved once, like the CLI's own owner, so a push from `top` is
 	// attributed. An unresolvable identity (an invalid AIRA_CONFINE_OWNER) leaves
 	// it unknown, which the confirmation states and which always sends --steal.
@@ -371,6 +375,12 @@ func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		}
 		return event
+	}
+	// AIRA-271. A key that never reaches onTUIKey (an arrow, Esc, Enter) also
+	// disarms an armed kill, and then does what it does.
+	if r.state.TopKill.ScopeID != "" && event.Key() != tcell.KeyRune {
+		r.state = onTopKillDisarm(r.state)
+		r.render()
 	}
 	key := event.Rune()
 	if event.Key() == tcell.KeyTab {
@@ -606,10 +616,23 @@ func (r *tuiRuntime) render() {
 		keys = "    r refresh  : palette  q quit"
 	}
 	if r.state.Active == viewTop {
-		// AIRA-276 / AIRA-309 / AIRA-312. Advertised only on the tab they work on.
-		keys = "    c command/dir  f push queued job to front  e lower running job's reserve" + keys
+		// AIRA-276 / AIRA-309 / AIRA-312 / AIRA-271. Advertised only on the tab
+		// they work on, kill first and terse, so the whole `aira top` legend fits
+		// 80 columns and KK is still on screen at 60 (each key's confirmation
+		// says in full what it does).
+		keys = "    KK kill  f to front  e lower reserve  c cmd/dir" + keys
 	}
-	r.tabs.SetText(strings.Join(tabNames, "  ") + keys)
+	line := strings.Join(tabNames, "  ") + keys
+	if arm := r.state.TopKill; r.state.Active == viewTop && arm.ScopeID != "" {
+		// An armed kill replaces the whole line, tabs too, job first, so it is
+		// read on a narrow terminal and on the full dashboard's long tab row.
+		action := "KILL"
+		if arm.Queued {
+			action = "CANCEL"
+		}
+		line = "[red::b]" + action + " ARMED:[-:-:-] " + tview.Escape(arm.Job) + " · K again to confirm, any other key cancels"
+	}
+	r.tabs.SetText(line)
 	r.detachedStatus.SetText(r.state.DetachedReport)
 	r.panelPages.SwitchToPage(string(r.state.Active))
 	for _, view := range views {
@@ -1088,7 +1111,7 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 	r.paletteSubmitButton = nil
 	r.paletteConfirmForm = form
 	title := "Confirm mutation"
-	if confirm.Destructive {
+	if confirm.Destructive || confirm.Verb == "confine-kill" {
 		title = "Confirm DESTRUCTIVE mutation"
 	}
 	var idField *tview.InputField

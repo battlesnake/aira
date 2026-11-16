@@ -49,6 +49,10 @@ func gitEnv(t *testing.T, home, extraPath string) []string {
 			continue
 		case name == "HOME" || name == "PATH":
 			continue
+		case name == "AIRA_CONFINE_PRIORITY":
+			// AIRA-348: the hook reads it; a value in the test's own
+			// environment would decide what the hooks under test ask for.
+			continue
 		}
 		env = append(env, kv)
 	}
@@ -117,7 +121,7 @@ exit 0
 `)
 	// `aira` records that it was asked to confine, then runs the real command
 	// so the hook's end-to-end shape (confine wrapping make) is exercised.
-	writeShim(t, filepath.Join(binDir, "aira"), airaShim(logPath, ""))
+	writeShim(t, filepath.Join(binDir, "aira"), airaShim(logPath))
 
 	env := gitEnv(t, home, binDir)
 	fx := hookFixture{primary: primary, worktree: worktree, log: logPath, env: env}
@@ -162,16 +166,13 @@ exit 0
 	return fx
 }
 
-// airaShim is the recording `aira`: it logs its argv and, for `confine`, runs
-// whatever follows `--` (skipping any confine options before it). help is what
-// `aira confine --help` prints: empty for an aira that predates --priority.
-func airaShim(logPath, help string) string {
+// airaShim is the recording `aira`: it logs its argv and the
+// AIRA_CONFINE_PRIORITY it was handed (AIRA-348), and, for `confine`, runs
+// whatever follows `--` (skipping any confine options before it).
+func airaShim(logPath string) string {
 	return `#!/usr/bin/env bash
-if [ "${1-}" = "confine" ] && [ "${2-}" = "--help" ]; then
-  printf '%s\n' '` + help + `'
-  exit 0
-fi
 echo "aira argv: $*" >> "` + logPath + `"
+echo "aira priority-env: ${AIRA_CONFINE_PRIORITY-<unset>}" >> "` + logPath + `"
 if [ "${1-}" = "confine" ]; then
   shift
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
@@ -180,19 +181,6 @@ if [ "${1-}" = "confine" ]; then
 fi
 exit 0
 `
-}
-
-// teachPriority replaces the fixture's `aira` with one whose confine help names
-// `--priority` (AIRA-340), i.e. an installed aira that supports it.
-func (fx hookFixture) teachPriority(t *testing.T) {
-	t.Helper()
-	binDir := ""
-	for _, kv := range fx.env {
-		if name, value, _ := strings.Cut(kv, "="); name == "PATH" {
-			binDir = strings.Split(value, string(os.PathListSeparator))[0]
-		}
-	}
-	writeShim(t, filepath.Join(binDir, "aira"), airaShim(fx.log, "confine [--vram S] [--priority high|normal] -- <argv...>"))
 }
 
 func (fx hookFixture) git(t *testing.T, dir string, args ...string) string {
@@ -404,41 +392,79 @@ func TestHooksRefuseWhenConfinementIsUnavailable(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-340 — with an aira that supports it, the pre-commit hook's
-// short checks run at `--priority high`, while both pre-push forms (`make ci`
-// and the store tests) stay at normal priority; with an aira that predates the
-// flag the pre-commit hook runs at normal priority rather than refusing every
-// commit. Mutations: drop `high` from the pre-commit call; pass high to
-// pre-push; drop the help probe (the old-aira case gets --priority).
+// verifies: AIRA-340, AIRA-348 — the pre-commit hook's short checks ask for
+// high priority through AIRA_CONFINE_PRIORITY, never through a flag, and only
+// when the caller has not set it, so `AIRA_CONFINE_PRIORITY=normal git commit`
+// overrides the hook; both pre-push forms (`make ci` and the store tests) ask
+// for nothing, so they run at normal unless the caller explicitly sets high.
+// Mutations: drop the export (pre-commit unset); `:-` removed so the hook
+// always forces high (the override is ignored); pre-push asks for high (unset
+// expected); pass `--priority high` again (argv line no longer plain).
 func TestHooksQueuePriority(t *testing.T) {
-	commit := func(t *testing.T, fx hookFixture) string {
+	commit := func(t *testing.T, fx hookFixture, extraEnv ...string) {
 		t.Helper()
 		if err := os.WriteFile(filepath.Join(fx.worktree, "change.txt"), []byte("change\n"), 0o644); err != nil {
 			t.Fatalf("write change: %v", err)
 		}
 		fx.git(t, fx.worktree, "add", "change.txt")
-		out := fx.git(t, fx.worktree, "commit", "-m", "linked change")
-		return out
+		fx.env = append(slices.Clone(fx.env), extraEnv...)
+		fx.git(t, fx.worktree, "commit", "-m", "linked change")
 	}
-	t.Run("pre-commit is high", func(t *testing.T) {
-		fx := newHookFixture(t)
-		fx.teachPriority(t)
-		commit(t, fx)
-		line, ok := findLine(fx.logLines(t), "aira argv: ")
-		if !ok || !strings.HasPrefix(line, "aira argv: confine --priority high -- make -C "+fx.worktree+" fmt-check vet build") {
-			t.Fatalf("pre-commit confine line=%q, want --priority high", line)
+	push := func(t *testing.T, fx hookFixture, extraEnv ...string) {
+		t.Helper()
+		remote := filepath.Join(filepath.Dir(fx.primary), "remote.git")
+		fx.git(t, fx.primary, "init", "-q", "--bare", remote)
+		fx.git(t, fx.worktree, "remote", "add", "origin", remote)
+		if err := os.WriteFile(filepath.Join(fx.worktree, "pushed.txt"), []byte("pushed\n"), 0o644); err != nil {
+			t.Fatalf("write pushed: %v", err)
 		}
+		fx.git(t, fx.worktree, "add", "pushed.txt")
+		fx.git(t, fx.worktree, "commit", "-q", "--no-verify", "-m", "to push")
+		if err := os.Remove(fx.log); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("reset log: %v", err)
+		}
+		fx.env = append(slices.Clone(fx.env), extraEnv...)
+		fx.git(t, fx.worktree, "push", "-q", "origin", "linked-branch")
+	}
+	expect := func(t *testing.T, fx hookFixture, argvPrefix, priority string) {
+		t.Helper()
+		lines := fx.logLines(t)
+		line, ok := findLine(lines, "aira argv: ")
+		if !ok || !strings.HasPrefix(line, argvPrefix) {
+			t.Fatalf("confine line=%q, want prefix %q (no --priority flag)", line, argvPrefix)
+		}
+		env, ok := findLine(lines, "aira priority-env: ")
+		if !ok || env != "aira priority-env: "+priority {
+			t.Fatalf("aira was handed %q, want AIRA_CONFINE_PRIORITY %s", env, priority)
+		}
+	}
+	for _, test := range []struct {
+		name     string
+		env      []string
+		priority string
+	}{
+		{"pre-commit asks for high", nil, "high"},
+		{"caller overrides pre-commit to normal", []string{"AIRA_CONFINE_PRIORITY=normal"}, "normal"},
+		{"caller's empty value is replaced by the hook's high", []string{"AIRA_CONFINE_PRIORITY="}, "high"},
+		// A typo is handed through unchanged, so `aira confine` refuses it
+		// (loud), rather than the hook replacing it with high or dropping it.
+		{"caller's invalid value reaches aira unchanged", []string{"AIRA_CONFINE_PRIORITY=urgent"}, "urgent"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fx := newHookFixture(t)
+			commit(t, fx, test.env...)
+			expect(t, fx, "aira argv: confine -- make -C "+fx.worktree+" fmt-check vet build", test.priority)
+		})
+	}
+	t.Run("pre-push asks for nothing", func(t *testing.T) {
+		fx := newHookFixture(t)
+		push(t, fx)
+		expect(t, fx, "aira argv: confine -- make -C "+fx.worktree+" ci", "<unset>")
 	})
-	t.Run("pre-commit on an aira without --priority runs normal", func(t *testing.T) {
+	t.Run("caller's explicit high reaches pre-push", func(t *testing.T) {
 		fx := newHookFixture(t)
-		out := commit(t, fx)
-		line, ok := findLine(fx.logLines(t), "aira argv: ")
-		if !ok || !strings.HasPrefix(line, "aira argv: confine -- make ") {
-			t.Fatalf("pre-commit confine line=%q, want plain confine", line)
-		}
-		if !strings.Contains(out, "running at normal queue priority") {
-			t.Fatalf("no note that priority was not applied; commit output:\n%s", out)
-		}
+		push(t, fx, "AIRA_CONFINE_PRIORITY=high")
+		expect(t, fx, "aira argv: confine -- make -C "+fx.worktree+" ci", "high")
 	})
 	t.Run("every pre-push step is normal", func(t *testing.T) {
 		// Both pre-push forms are long (`make ci`; the store tests measured
@@ -460,26 +486,6 @@ func TestHooksQueuePriority(t *testing.T) {
 		}
 		if calls != 2 {
 			t.Fatalf("found %d aira_hook_run_make calls in pre-push, want 2 (ci, test-store)", calls)
-		}
-	})
-	t.Run("pre-push stays normal", func(t *testing.T) {
-		fx := newHookFixture(t)
-		fx.teachPriority(t)
-		remote := filepath.Join(filepath.Dir(fx.primary), "remote.git")
-		fx.git(t, fx.primary, "init", "-q", "--bare", remote)
-		fx.git(t, fx.worktree, "remote", "add", "origin", remote)
-		if err := os.WriteFile(filepath.Join(fx.worktree, "pushed.txt"), []byte("pushed\n"), 0o644); err != nil {
-			t.Fatalf("write pushed: %v", err)
-		}
-		fx.git(t, fx.worktree, "add", "pushed.txt")
-		fx.git(t, fx.worktree, "commit", "-q", "--no-verify", "-m", "to push")
-		if err := os.Remove(fx.log); err != nil && !os.IsNotExist(err) {
-			t.Fatalf("reset log: %v", err)
-		}
-		fx.git(t, fx.worktree, "push", "-q", "origin", "linked-branch")
-		line, ok := findLine(fx.logLines(t), "aira argv: ")
-		if !ok || !strings.HasPrefix(line, "aira argv: confine -- make -C "+fx.worktree+" ci") {
-			t.Fatalf("pre-push confine line=%q, want plain confine of make ci", line)
 		}
 	})
 }

@@ -231,9 +231,11 @@ func cancelQueuedConfineLocked(queue *sliceQueue, selector, callerOwner string, 
 }
 
 // logConfineKill writes the audit line for a kill or cancel the daemon actually
-// performed. Called only after success: a refused or unconfirmed kill changed
-// nothing and must not leave a line claiming otherwise (AIRA-70 finding #2).
-func logConfineKill(callerOwner string, steal bool, result runner.ConfineKillResult, path string) {
-	log.Printf("aira daemon: confine-kill: phase=%s killer=%s steal=%v target-scope=%s target-name=%s target-owner=%s slice=%s",
-		result.Phase, callerOwner, steal, result.ScopeID, result.Name, result.Owner, path)
+// performed. A refused, not-launched, or failed-write kill changed nothing and
+// must not leave a line claiming otherwise (AIRA-70 finding #2). confirmed=false
+// is the one delivered-but-unconfirmed case (AIRA-339): cgroup.kill was written,
+// so the kill happened, but the scope was not seen empty in time.
+func logConfineKill(callerOwner string, steal bool, result runner.ConfineKillResult, path string, confirmed bool) {
+	log.Printf("aira daemon: confine-kill: phase=%s killer=%s steal=%v target-scope=%s target-name=%s target-owner=%s slice=%s confirmed=%v",
+		result.Phase, callerOwner, steal, result.ScopeID, result.Name, result.Owner, path, confirmed)
 }

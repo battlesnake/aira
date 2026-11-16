@@ -120,6 +120,15 @@ func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics i
 // An OUTPUT coordinate and an INPUT setting must not share a name.
 const ConfineParentSliceEnv = "AIRA_CONFINE_PARENT_SLICE"
 
+// ConfinePriorityEnv is the launch client's input form of `aira confine
+// --priority` (AIRA-348): read by the confine launch CLI only, below the flag
+// and above the default. Unlike AIRA_CONFINE_OWNER (which names the SESSION and
+// propagates on purpose, so every nested job is attributed alike) it is in the
+// strip set below: a priority is a property of ONE launch, and inherited it
+// would put every nested `aira confine`, aitest worker and make recursion inside
+// a `high` job ahead of every normal job on the box.
+const ConfinePriorityEnv = "AIRA_CONFINE_PRIORITY"
+
 // coordinationEnvironmentKeys is the STRIP set: launch coordination rather than
 // part of the tested child environment identity.
 //
@@ -144,6 +153,8 @@ const ConfineParentSliceEnv = "AIRA_CONFINE_PARENT_SLICE"
 var coordinationEnvironmentKeys = map[string]struct{}{
 	"AIRA_CONFINE_SCOPE_ID": {},
 	ConfineParentSliceEnv:   {},
+	// AIRA-348: an operator INPUT, stripped deliberately (see ConfinePriorityEnv).
+	ConfinePriorityEnv: {},
 
 	// Retired by AIRA-33: stripped, never set.
 	"AIRA_PY_LIB":                   {},

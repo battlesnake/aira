@@ -42,20 +42,27 @@ aira_hook_scrub_git_env() {
 # aira_hook_run_make runs the named make targets against the committing
 # worktree, confined, with a clean environment. It never returns.
 #
-# The second argument is the admission queue priority (AIRA-340): `high` only
-# for a SHORT step (the pre-commit quick checks, `make fmt-check vet build`:
-# the confine trailer's wall= measured about 9 s with a warm build cache, and
-# about 40 s on the first run in a new worktree on a loaded box, load average
-# about 65; re-measure with `aira confine -- make -C <worktree> fmt-check vet
-# build`). Both are under a minute, so `high` stays defensible: a commit does
-# not wait behind slow jobs on a busy box. `normal` for anything
-# long (`make ci`, the store tests). Version skew degrades, never refuses
-# commits: an installed CLIENT that predates `--priority` is detected from its
-# own help and the step runs at normal priority with a one-line note; a new
-# client whose admission DAEMON predates the field (installed, not yet
-# restarted) gets the daemon's refusal of the field, re-asks once at normal
-# priority and prints a `confine: notice:` line. Either way the commit runs;
-# only its queue position is normal until both are current.
+# The second argument is the admission queue priority the hook asks for
+# (AIRA-340): `high` only for a SHORT step (the pre-commit quick checks, `make
+# fmt-check vet build`: the confine trailer's wall= measured about 9 s with a
+# warm build cache, and about 40 s on the first run in a new worktree on a
+# loaded box, load average about 65; re-measure with `aira confine -- make -C
+# <worktree> fmt-check vet build`). Both are under a minute, so `high` stays
+# defensible: a commit does not wait behind slow jobs on a busy box. `normal`
+# for anything long (`make ci`, the store tests).
+#
+# AIRA-348: `high` is asked for through AIRA_CONFINE_PRIORITY, and only when the
+# caller has not set it, so the caller has the last word either way:
+# `AIRA_CONFINE_PRIORITY=normal git commit` runs the quick checks at normal
+# priority, and `AIRA_CONFINE_PRIORITY=high git push` runs `make ci` at high (an
+# explicit choice; keep it rare). `aira confine` validates the value (anything
+# but high/normal refuses the step, so a typo is loud) and removes the variable
+# from the job's environment, so nothing inside the step inherits it. Version
+# skew degrades, never refuses commits: an installed CLIENT that predates the
+# variable ignores it and the step queues at normal priority WITHOUT a note (the
+# old `confine --help` probe that printed one is gone); a new client whose
+# admission DAEMON predates priority re-asks once at normal priority and prints
+# a `confine: notice:` line. Either way the commit runs.
 aira_hook_run_make() {
 	local hook_name="$1"
 	local priority="$2"
@@ -74,18 +81,9 @@ aira_hook_run_make() {
 		return 1
 	fi
 
-	local -a confine_opts=()
-	if [ "$priority" = high ]; then
-		# Captured, then matched: a `| grep -q` pipeline under pipefail can fail
-		# when grep exits early and the help writer takes SIGPIPE.
-		local help
-		help="$(aira confine --help 2>/dev/null)" || help=""
-		case "$help" in
-		*--priority*) confine_opts=(--priority high) ;;
-		*) printf '%s: the installed aira has no `confine --priority`; running at normal queue priority.\n' "$hook_name" >&2 ;;
-		esac
-	fi
-
 	aira_hook_scrub_git_env
-	exec aira confine "${confine_opts[@]}" -- make -C "$root" "$@"
+	if [ "$priority" = high ]; then
+		export AIRA_CONFINE_PRIORITY="${AIRA_CONFINE_PRIORITY:-high}"
+	fi
+	exec aira confine -- make -C "$root" "$@"
 }

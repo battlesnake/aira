@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-340","project":"aira","title":"confine --priority high|normal: a job can enter the admission queue already at the front tier (launch-time counterpart of --front)","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-340","project":"aira","title":"confine --priority high|normal: a job can enter the admission queue already at the front tier (launch-time counterpart of --front)","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.42","labels":[],"hold":false,"relations":[{"kind":"relates","from":"AIRA-348","to":"AIRA-340"}]}
 ---
 
 
