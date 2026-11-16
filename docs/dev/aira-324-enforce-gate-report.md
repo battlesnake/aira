@@ -9,7 +9,7 @@ so this report decides from the AIRA-323 data that already exists.
 | Factor | Verdict | Why, in one line |
 |---|---|---|
 | **0.9** | **GO, with conditions C1 to C4 below, as a monitored and reversible trial** | The spec's test passes: the replayed concurrent `memory.peak` never exceeds 0.9 x MemoryHigh in any minute. Real use over 3 days peaked at 39.6 GiB with page cache (21.4 GiB anon over the 25 h). While the ledger ceiling stays at or below 57.6 GiB (it was at most 49.2 GiB), even every job at its full cap at once stays under MemoryMax. The rollback trigger reads 4.4% against its 5% limit. The *gain* estimate is weak (section 3). |
-| **0.8** | **NO-GO for now** | The spec's own 5% rollback trigger reads **6.9%** on today's data, and 6.1% on the spec's two-week replay, so it would fire in the first week on data we already have. The worst case also goes past MemoryHigh (61.5 GiB, 1.02x). Look again after a clean week at 0.9 (section 8). |
+| **0.8** | **NO-GO for now** | The spec's own 5% rollback trigger reads **6.9%** on today's data, and 6.1% on the spec's two-week replay, so it is likely to fire in the first week (the share is a population proxy, section 5). The conditional bound on the sum of caps also goes past MemoryHigh (61.5 GiB, 1.02x). Look again after a clean week at 0.9 (section 8). |
 
 Plain-English summary. Admission books each job's full pin until it ends. Real memory sits far below the
 bookings: over the 25 hours, the most the slice ever used was 21.4 GiB of anonymous memory, while 38 to 51 GiB
@@ -166,7 +166,7 @@ the store attributes it. The watch script makes the same approximation over the 
 
 Pinned rows' peak / pin: p50 0.17, p90 0.72, p95 0.88, p99 1.00.
 
-- **0.8 trips the trigger by construction**: 6.9% here and 6.1% over two weeks. Even with the OOM rows left out
+- **0.8 sits over the trigger on the data we have**: 6.9% here and 6.1% over two weeks (a population proxy, see above). Even with the OOM rows left out
   it reads 4.9%, right at the line. A trigger the data already exceeds is not a rollback signal, so 0.8 is a
   NO-GO until either the trigger or the data changes.
 - 0.9 is under 5% on both readings. The 25-hour figure (4.4%) is higher than the two-week one (2.9%), and single
@@ -176,7 +176,7 @@ Pinned rows' peak / pin: p50 0.17, p90 0.72, p95 0.88, p99 1.00.
 
 ## 6. Memory: does the concurrent total stay under 0.9 x MemoryHigh (54 GiB)?
 
-### 6.1 Hard bound (needs no timeline)
+### 6.1 Conditional bound on the sum of caps (needs no timeline)
 
 At each grant, `sum(charge) <= L`, the ledger ceiling *at that grant*. A discounted job's cap is at most its
 charge divided by f, and every other job's cap is its charge. So at a grant the sum of all caps is at most
@@ -251,7 +251,7 @@ hidden jobs are missing from it. That is why section 6.2 uses the slice's own co
 - **Cache-inclusive peaks** (AIRA-318): `memory.peak` includes page cache. It overstates real need and inflates
   the above-charge rate (47 pinned rows sit exactly at their pin).
 - **The ceiling varied** (38.0 to 51.2 GiB effective, system-pressure throttle in every minute). The replay
-  follows the journal's per-minute series. A day when the throttle lifts would raise the hard bound
+  follows the journal's per-minute series. A day when the throttle lifts would raise the conditional bound
   (section 6.1).
 - **Order**: the replay brackets the daemon with fifo, bypass and backfill. It ignores the fairness-freeze duty
   cycle, `--front` pushes, the priority tiers and the exclusive gate. The calibrated policy is backfill, which is
@@ -262,7 +262,7 @@ hidden jobs are missing from it. That is why section 6.2 uses the slice's own co
 - **CPU**: 32 slots, visible jobs only. Hidden workers also take slots, so under enforce CPU may bind before
   RAM does and give back part of the gain.
 - **Physical fit** is approximated by the running jobs' held peaks. The memory tables use the blind reading
-  (worst case). The per-pass reading in the daemon is not decremented between grants of one pass (PR #248
+  (the most permissive admission for these arrivals under the model; not a worst case over schedules). The per-pass reading in the daemon is not decremented between grants of one pass (PR #248
   deferral).
 - The discountable population is approximated as all pinned rows. Delegate parents and exclusive jobs are never
   discounted in reality, so this slightly overstates both the gain and the exposure.
@@ -300,7 +300,7 @@ hidden jobs are missing from it. That is why section 6.2 uses the slice's own co
 - or the trigger is redefined by the owner;
 - or new data reads under 5%.
 
-It also needs OOM steering on (its hard bound passes MemoryHigh), and this replay re-run on the enforce week's
+It also needs OOM steering on (its conditional bound passes MemoryHigh), and this replay re-run on the enforce week's
 rows.
 
 ## 9. Rollout (commands checked against `internal/install` and PR #248)
@@ -342,8 +342,11 @@ Any one trigger switches the mode back to observe (section 9 step 5) and files a
 | `memory.pressure` `some avg10` over the pre-enforce weekly p99 for 2 consecutive hours | `some_avg10`; `triggers` | the p99 of the samples collected under C2. It is `unevaluated` until a baseline exists. Pressure is hierarchical (a job stalling at its own cap raises it), so the short baseline matters. |
 | More than 5% of discounted jobs above their charge in a week | `above_charge.share` (`--store`) | Over 5% with at least 100 rows. Computed on pinned rows that started in the current enforce epoch (the run of `pin-charge enforce` lines at the current factor, back to the last observe line or factor change) and within the last 7 days. OOM rows are included, as the spec writes it. Ineligible pins are counted and failed runs are missing (section 5). Expect about 3 to 4.5%. |
 
-Also watch, without triggering on it: `phys_unfit` (physical-fit refusals; 0 so far), `ceiling_gib` (C4), and
-`queued` and `granted_gib` against `ceiling_gib` (the queue the change is meant to shorten).
+Condition C4 (not a spec trigger) is evaluated in the same line. The ledger ceiling is stored with each sample.
+`triggers` names C4 when every sample in a continuously sampled last hour is above 57.6 GiB, and the response
+is to switch OOM steering on or roll back. Watch without triggering on them: `phys_unfit` (physical-fit
+refusals; 0 so far), and `queued` and `granted_gib` against `ceiling_gib` (the queue the change is meant to
+shorten).
 
 ## 11. Reproduction
 

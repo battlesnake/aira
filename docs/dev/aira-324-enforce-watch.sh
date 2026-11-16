@@ -27,7 +27,8 @@
 #   oom_kill, high        hierarchical memory.events: oom_kill includes every job killed at
 #                         its own cap (daily, not a trigger); high is the MemoryHigh trigger.
 #   some_avg10            memory.pressure (hierarchical: a job stalling at its own cap raises it).
-#   queued/running/granted_gib/ceiling_gib   from `aira confine --list` (ceiling = ledger ceiling).
+#   queued/running/granted_gib/ceiling_gib   from `aira confine --list` (ceiling = ledger ceiling;
+#                         the report's condition C4 fires when it stays above 57.6 GiB for an hour).
 #   observe/enforce/discounted/phys_unfit    daemon log lines in the last N minutes.
 #   above_charge (--store)  pinned rows (cap:operator:--memory-reserve) that STARTED in the
 #                         current enforce epoch (the run of enforce lines at the current
@@ -85,7 +86,8 @@ import json, os, re, sqlite3, sys, time
 
 cg, d, list_json, journal, minutes, store, baseline, pincharge, slice_since = sys.argv[1:]
 now = time.time()
-MAX_GAP = 900          # samples further apart than this break a 2-hour window
+MAX_GAP = 900          # samples further apart than this break a 1- or 2-hour window
+C4_CEILING = int(57.6 * 2**30)   # ledger ceiling above which L / 0.9 exceeds MemoryMax (64 GiB)
 COUNTERS = ("oom_local", "max_local", "oom_kill_local", "oom_kill", "high")
 samples_path = os.path.join(d, "samples.tsv")
 
@@ -121,14 +123,15 @@ def p99(xs):
 
 
 def read_samples():
-    """[(t, {counter: value}, avg10)] in time order; lines of another format are skipped."""
+    """[(t, {counter: value}, avg10, ledger ceiling bytes or -1)] in time order; lines of
+    another format are skipped."""
     rows = []
     if os.path.exists(samples_path):
         with open(samples_path) as f:
             for line in f:
                 p = line.rstrip("\n").split("\t")
-                if len(p) == 2 + len(COUNTERS) and p[0][:1].isdigit():
-                    rows.append((float(p[0]), dict(zip(COUNTERS, map(int, p[1:-1]))), float(p[-1])))
+                if len(p) == 3 + len(COUNTERS) and p[0][:1].isdigit():
+                    rows.append((float(p[0]), dict(zip(COUNTERS, map(int, p[1:-2]))), float(p[-2]), int(p[-1])))
     rows.sort(key=lambda r: r[0])
     return rows
 
@@ -217,8 +220,10 @@ try:
     line["queued"], line["running"] = sr.get("queued"), sr.get("jobs")
     line["granted_gib"] = round(sr["granted_bytes"] / 2**30, 1)
     line["ceiling_gib"] = round(sr["ceiling_bytes"] / 2**30, 1)
+    ceiling = int(sr["ceiling_bytes"])
 except Exception:
     line["queued"] = line["running"] = line["granted_gib"] = line["ceiling_gib"] = "unevaluated"
+    ceiling = -1
 obs = enf = disc = unfit = 0
 with open(journal, errors="replace") as f:
     for l in f:
@@ -261,7 +266,13 @@ if store == "1":
 trig = []
 if isinstance(line["d_oom_local"], int) and line["d_oom_local"] > 0:
     trig.append("slice-level oom (memory.events.local oom rose; victim and its peak/pin unattributed)")
-allrows = rows + [(now, cur, a10)]
+allrows = rows + [(now, cur, a10, ceiling)]
+# C4 (report section 8): the ledger ceiling above 57.6 GiB for a whole, continuously sampled hour.
+hour = [r for r in allrows if r[0] >= now - 3600]
+if not continuous(allrows, now - 3600, now) or any(r[3] < 0 for r in hour):
+    trig.append("C4 ceiling: unevaluated (samples or ceiling readings do not cover the last hour)")
+elif all(r[3] > C4_CEILING for r in hour):
+    trig.append("C4: ledger ceiling above 57.6 GiB for 1 h (switch OOM steering on or roll back)")
 bl_path = os.path.join(d, "baseline.json")
 if os.path.exists(bl_path):
     with open(bl_path) as f:
@@ -291,7 +302,7 @@ if isinstance(ac, dict) and isinstance(ac.get("share"), float) and ac["rows"] >=
 line["triggers"] = trig
 
 with open(samples_path, "a") as f:
-    f.write("%.0f\t%s\t%s\n" % (now, "\t".join(str(cur[k]) for k in COUNTERS), a10))
+    f.write("%.0f\t%s\t%s\t%d\n" % (now, "\t".join(str(cur[k]) for k in COUNTERS), a10, ceiling))
 cleanup()
 print(json.dumps(line))
 PY

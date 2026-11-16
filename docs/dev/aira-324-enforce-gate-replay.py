@@ -39,7 +39,7 @@ Model (every simplification is listed in the report, section "What the replay ig
     memory.current) and 'blind' (0: every grant of a burst sees an idle box, the most
     permissive admission for these arrivals). The memory numbers are quoted for 'blind'.
   * CPU: 32 slots (2 per core x 16 cores), one per job, hidden jobs not counted.
-  * Part 5 adds a first-order estimate and a hard bound on the REAL slice (journal sliceAnon,
+  * Part 5 adds a first-order estimate and a conditional sum-of-caps bound on the REAL slice (journal sliceAnon,
     memory.peak), which include the hidden jobs.
   * Order: three policies bound the daemon's real one (head protection, AIRA-307 bypass
     budget, --front pushes, priority tiers, the fairness freeze): 'fifo' (nothing passes a
@@ -615,10 +615,11 @@ def first_order(jobs, ceil_series, lo, hi, P, slice_peak):
     a full ledger L can hold beyond today's, each at its full pin."""
     P("## 5. First-order counterfactual on the real slice (journal sliceAnon, every minute)")
     P("est = sliceAnon + peaks of the queued jobs the freed booking admits; bound = sliceAnon + L(1-f)/f.")
-    P("Neither is a proof: both keep the observed running set and add to it. The hard bound below is.")
+    P("Neither is a proof: both keep the observed running set and add to it. The bound below is conditional")
+    P("algebra at grant time (spec exceptions apply), valid only while the ledger ceiling stays at that L.")
     Lmax = max(c[1] for c in ceil_series if lo <= c[0] <= hi) - HEADROOM_BASE - HEADROOM_PER_JOB
     for fac in (1.0, 0.9, 0.8):
-        P("hard bound, factor %.1f: every running job at its full cap at once, sum of caps <= L / f; at the window's "
+        P("conditional bound, factor %.1f: every running job at its full cap at once, sum of caps <= L / f; at the window's "
           "largest ledger ceiling L = %s GiB that is %s GiB = %.3f of MemoryHigh (MemoryMax 64 GiB = 1.067); at the "
           "static ceiling (throttle lifted, L = 61.9 GiB) %s GiB" % (
               fac, fmt_g(Lmax), fmt_g(Lmax / fac), Lmax / fac / MEMORY_HIGH,
