@@ -10,7 +10,7 @@ Inputs (both read-only; never point --db at the live store):
   --journal  a saved `journalctl --user -u aira-daemon.service -o short-unix` dump;
              only the 'slice ceiling throttled' and 'pin-charge observe' lines are read
 
-Run (confined, measured peak 44M):
+Run (confined, measured peak 53M):
   cp ~/.local/state/aira/state.db ~/tmp/aira-324-gate-state.db
   cp ~/.local/state/aira/state.db-wal ~/tmp/aira-324-gate-state.db-wal
   journalctl --user -u aira-daemon.service --since "2026-11-15 08:00" -o short-unix \
@@ -34,9 +34,10 @@ Model (every simplification is listed in the report, section "What the replay ig
     the journal (ledger ceiling - visible booked); the calibration picks the model that
     reproduces the observed waits. Headroom is the daemon's 2 GiB + 64 MiB x (jobs + 1).
   * Physical fit (discounted waiters only): pin <= ceiling(t) - headroom - (peaks + H).
-    Two readings of 'peaks': 'clairvoyant' (running jobs' FUTURE peaks: the daemon cannot
-    see them, it reads memory.current) and 'blind' (0: every grant of a burst sees an idle
-    box). The real daemon sits between them; the safety numbers are quoted for 'blind'.
+    Two readings of 'peaks', used in BOTH the ledger max() and the physical-fit check:
+    'clairvoyant' (running jobs' FUTURE peaks: the daemon cannot see them, it reads
+    memory.current) and 'blind' (0: every grant of a burst sees an idle box, the most
+    permissive admission for these arrivals). The memory numbers are quoted for 'blind'.
   * CPU: 32 slots (2 per core x 16 cores), one per job, hidden jobs not counted.
   * Part 5 adds a first-order estimate and a hard bound on the REAL slice (journal sliceAnon,
     memory.peak), which include the hidden jobs.
@@ -190,13 +191,16 @@ def simulate(jobs, ceiling, factor=1.0, policy="bypass", phys="clairvoyant", hid
         for w in queue:
             n = len(running)
             ceil = ceiling.at(t, n)
-            avail = ceil - max(booked + hidden, peaks + hidden)
+            # the daemon's checkedAvailable: the larger of the ledger and the physical
+            # reading. 'blind' reads the physical term as 0 here too (an idle box).
+            seen = peaks if phys == "clairvoyant" else 0
+            avail = ceil - max(booked + hidden, seen + hidden)
             c = book[w.idx]
             fits = c <= avail and n < cpu_slots
             if c <= avail and n >= cpu_slots:
                 stats["cpu_held"] += 1
             if fits and disc[w.idx]:
-                physfree = ceil - ((peaks if phys == "clairvoyant" else 0) + hidden)
+                physfree = ceil - (seen + hidden)
                 fits = w.pin <= physfree
                 if not fits:
                     stats["phys_refused"] += 1
@@ -313,7 +317,7 @@ def minute_max(st, lo, hi):
     i = 0
     m = lo - lo % 60000
     while m < hi:
-        while i < len(st) and st[i][0] < m:
+        while i < len(st) and st[i][0] <= m:     # an event AT the boundary belongs to this minute's start
             lvl = st[i][1]
             i += 1
         mx = lvl
@@ -711,6 +715,10 @@ def selftest():
     check("0.8 clairvoyant: physical fit refuses", simulate(b, c10, 0.8, phys="clairvoyant")[1], 100000)
     # ... but the blind reading cannot see the running job's peak
     check("0.8 blind: admitted", simulate(b, c10, 0.8, phys="blind")[1], 0)
+    # 2b. blind also drops the physical term of the LEDGER check (checkedAvailable): two
+    # 6 GiB pins whose peaks are 6 GiB both fit an idle 10 GiB box at 0.8 (2 x 4.8)
+    bb = [Job(0, 0, 0, 100000, 6 * G, 6 * G, PIN_BASIS, 0), Job(1, 0, 0, 100000, 6 * G, 6 * G, PIN_BASIS, 0)]
+    check("0.8 blind: ledger check sees no peaks either", simulate(bb, c10, 0.8, phys="blind")[1], 0)
     # 3. auto rows are never discounted
     c = [Job(0, 0, 0, 100000, 3 * G, 6 * G, "cap:auto:daemon-reserve", 0),
          Job(1, 0, 0, 100000, 3 * G, 6 * G, "cap:auto:daemon-reserve", 0)]
@@ -740,6 +748,10 @@ def selftest():
     # 3450 s idle, 100 s at 3 GiB, 50 s at 6 GiB: the 99th percentile instant is in the 6 GiB stretch
     check("memory: duration-weighted p99 counts the idle time", mv["hour_dur_p99"], 6 * G)
     check("memory: minutes over 54 GiB", mv["minutes_over_safe"], 0)
+    # a level that ends exactly on a minute boundary does not count in the next minute
+    edge = [Job(0, 0, 0, 60000, 3 * G, 6 * G, PIN_BASIS, 0)]
+    mm = minute_max(step(edge, {0: 0}, lambda j: j.peak), 0, 120000)
+    check("minute max: boundary end", (mm[0], mm[60000]), (3 * G, 0))
     # a window that opens 50 min before the first job: 100 s at 3 GiB is 2.8% of the hour
     late = [Job(0, 3000000, 3000000, 100000, 3 * G, 6 * G, PIN_BASIS, 0)]
     check("memory: idle time before the first job is in the hour", memory_view(late, {0: 3000000}, 0, 3600000)["hour_dur_p99"], 3 * G)

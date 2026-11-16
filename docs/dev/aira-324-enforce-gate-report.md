@@ -8,15 +8,16 @@ so this report decides from the AIRA-323 data that already exists.
 
 | Factor | Verdict | Why, in one line |
 |---|---|---|
-| **0.9** | **GO, with conditions C1 to C4 below** | Even if every running job hit its full cap at the same moment, the total stays under the slice's hard limit (54.7 GiB, against MemoryMax 64 GiB). Real use peaked at 21.4 GiB anon and 39.6 GiB with page cache. The rollback trigger reads 4.4% against its 5% limit. |
+| **0.9** | **GO, with conditions C1 to C4 below, as a monitored and reversible trial** | The spec's test passes: the replayed concurrent `memory.peak` never exceeds 0.9 x MemoryHigh in any minute. Real use over 3 days peaked at 39.6 GiB with page cache (21.4 GiB anon over the 25 h). While the ledger ceiling stays at or below 57.6 GiB (it was at most 49.2 GiB), even every job at its full cap at once stays under MemoryMax. The rollback trigger reads 4.4% against its 5% limit. The *gain* estimate is weak (section 3). |
 | **0.8** | **NO-GO for now** | The spec's own 5% rollback trigger reads **6.9%** on today's data, and 6.1% on the spec's two-week replay, so it would fire in the first week on data we already have. The worst case also goes past MemoryHigh (61.5 GiB, 1.02x). Look again after a clean week at 0.9 (section 8). |
 
 Plain-English summary. Admission books each job's full pin until it ends. Real memory sits far below the
 bookings: over the 25 hours, the most the slice ever used was 21.4 GiB of anonymous memory, while 38 to 51 GiB
 was booked. At 0.9, a pinned job books 90% of its pin. In the calibrated replay, more than half the jobs start
 earlier, and the share of jobs that wait over a minute drops from about a third to about an eighth. How big that
-gain is, is the weakest part of the evidence (section 4). The safety case rests on a hard bound that needs no
-timeline (section 6.1), and rolling back takes one command and a restart.
+gain is, is the weakest part of the evidence (section 4). The safety case rests on the slice's own counters over 3 days,
+on a bound that holds only while the ceiling stays throttled (section 6.1, condition C4), and on rollback
+taking one command and a restart.
 
 ## 1. Data
 
@@ -45,8 +46,10 @@ answers are known by hand). How it builds the timeline:
   daemon's `effectiveCurrent` (the slice's `memory.current` less reclaimable cache) with the sum of the running
   jobs' peaks. That reading sees the future: the daemon cannot know a running job's peak, while the replay
   assumes each job holds its peak from start to end. The memory tables therefore use the **blind** reading
-  instead (physical term 0: every grant in a burst sees an idle box), which is the worst case. The `phys-held`
-  column counts the grants the clairvoyant reading held back.
+  instead: the physical term is 0 in both the ledger check (`checkedAvailable`'s max) and the physical-fit check,
+  so every grant in a burst sees an idle box. This is the most permissive admission for a fixed set of arrivals,
+  not a worst case over all possible schedules. The `phys-held` column counts the grants the clairvoyant
+  reading held back.
 - CPU: 32 slots (2 per core x 16 cores), one per job.
 - Order: three policies bracket the daemon's real one. `fifo`: nothing passes a blocked head. `bypass`: the
   AIRA-307 budget, where later jobs may pass while their bookings sum to at most half of the head's booking.
@@ -97,13 +100,19 @@ the `.out.txt`.
 - The model that does reproduce the queue puts the residual back as a time series: the hidden load is the
   observed residual at each minute. Under backfill it matches the hourly pattern (r 0.78) and the tail
   (p90 208 s against 252, p99 698 against 855, 32.5% against 27.9% waiting over 60 s). Its median is too high
-  (27 s against 4.5 s). **This fit is partly built in.** The model restores the observed occupancy, so it shows
-  that the replay's mechanics are sound given that occupancy. It does not independently confirm that occupancy.
-- Bound on the counterfactual. The residual is held fixed, with no discount and no time shift. In reality its
-  pinned share (failed and still-running pinned jobs, at least 181 grants) would also be discounted, and the
-  residual also contains capacity the daemon left idle (fairness-freeze hold, a blocked head). Holding it fixed
-  **understates** the gain in waits. It has no effect on the memory numbers in section 6.2, which use the
-  slice's measured memory and so include the hidden jobs.
+  (27 s against 4.5 s), and it needs 18 forced grants (waiters that never fit the reconstructed ledger,
+  admitted when nothing visible was running). **This fit is largely circular.** At fraction 1.0 the replay's
+  capacity is close to the observed visible booking itself, so the replay is an *occupancy-conditioned
+  sensitivity analysis*: given the occupancy we saw, how much does the discount free? It does not validate
+  the daemon model independently, and nothing measured here does.
+- The residual is held fixed, with no discount and no time shift. The error runs both ways:
+  - towards understating the gain: its pinned share (at least 181 grants) would also be discounted, and it
+    contains capacity the daemon left idle (fairness-freeze hold, a blocked head);
+  - towards overstating it: cancelled heads are missing, hidden jobs use CPU slots, and holding run lengths
+    and arrivals fixed ignores contention.
+
+  **The direction of the net error is unknown.** None of this touches the memory numbers in section 6.2,
+  which use the slice's measured memory and so include the hidden jobs.
 
 ## 4. Counterfactual: who starts earlier
 
@@ -131,16 +140,21 @@ Reading it:
 - The constant-ceiling rows do not reproduce the queue (section 3), so their near-zero gains are not evidence
   either way.
 - The physical-fit rule held back 11 grants at 0.9 and 36 at 0.8, and only under the clairvoyant reading, which
-  treats the hidden load as fully used. In the live observe log the physical-fit check passed at every one of
-  the 958 grants, with at least **20.5 GiB** to spare beyond the full pin (median 34.7 GiB). On this load the
-  rule never binds.
+  treats the hidden load as fully used. In observe, every grant passes the physical-fit check by construction:
+  it was already granted at the full pin. What the 958 log lines add is the **margin**: real free memory
+  exceeded the full pin by at least **20.5 GiB** (median 34.7 GiB). At those instants a discounted grant would
+  also have fitted physically. Whether the margin holds once enforce admits more is exactly what the triggers
+  watch.
 - No CPU limit binds in the calibrated config (`cpu-held` 0), although hidden jobs also use CPU slots
   (section 7).
 
 ## 5. The 5% rollback trigger (discounted jobs above their charge)
 
-Population: every pinned row. Under enforce, every discountable grant is discounted, and the rows cannot tell a
-discountable pin from a delegate parent or an exclusive job, so all pinned rows are counted.
+Population: every pinned row. Under enforce every discountable grant is discounted, but the rows cannot tell a
+discountable pin from a delegate parent or an exclusive job (counted here, though never discounted). Failed and
+evicted runs leave no row (missing here). Either gap can move the **share** in either direction, and nothing in
+the store attributes it. The watch script makes the same approximation over the current enforce epoch's last
+7 days (section 10).
 
 | | Factor 0.9 | Factor 0.8 |
 |---|---|---|
@@ -164,10 +178,12 @@ Pinned rows' peak / pin: p50 0.17, p90 0.72, p95 0.88, p99 1.00.
 
 ### 6.1 Hard bound (needs no timeline)
 
-At each grant, `sum(charge) <= L`, the ledger ceiling. A discounted job's cap is its charge divided by f, and
-every other job's cap is its charge. So the sum of all caps is at most `L / f`. This holds **even if every
-running job sits at its full cap at the same moment**. The listed exceptions are the spec's (`--resize`, a
-re-declare charged above the ceiling, a ceiling that falls after a grant).
+At each grant, `sum(charge) <= L`, the ledger ceiling *at that grant*. A discounted job's cap is at most its
+charge divided by f, and every other job's cap is its charge. So at a grant the sum of all caps is at most
+`L / f`, with the spec's exceptions (`--resize`, a re-declare charged above the ceiling, a ceiling that falls
+after a grant). This is **conditional algebra, not a guarantee**: a historical L does not constrain future
+grants. It holds only as long as the ledger ceiling stays where it was, and condition C4 turns that into
+something monitored.
 
 | Factor | Largest ledger ceiling in the window, L = 49.2 GiB | If the throttle lifts (static, L = 61.9 GiB) |
 |---|---|---|
@@ -175,10 +191,12 @@ re-declare charged above the ceiling, a ceiling that falls after a grant).
 | **0.9** | **54.7 GiB = 0.91 x MemoryHigh, under MemoryMax (64 GiB)** | 68.8 GiB, over MemoryMax |
 | 0.8 | 61.5 GiB = 1.02 x MemoryHigh, under MemoryMax | 77.4 GiB, over MemoryMax |
 
-While the ceiling stays throttled (it was throttled in all 1,444 minutes, between 38.0 and 51.2 GiB), even the
-worst case cannot cause a slice-level OOM at either factor. At 0.9 the worst case sits right at the 0.9 x
-MemoryHigh line. It needs every job at its full cap at once, while the typical pinned job peaks at 17% of its
-pin.
+The ceiling was throttled in all 1,444 minutes (effective 38.0 to 51.2 GiB). While the ledger ceiling stays
+at or below 57.6 GiB, the sum of all caps at 0.9 stays under MemoryMax (64 GiB). It does **not** stay under the
+gate's 54 GiB line: 54.7 GiB is 0.911 x MemoryHigh. So this bound does not pass the gate by itself; the replay
+and the measured slice (sections 6.2 and 6.3) do. Reaching it needs every job at its full cap at once, while
+the typical pinned job peaks at 17% of its pin. With the throttle lifted, 0.9 allows 68.8 GiB of caps, more
+than MemoryMax.
 
 ### 6.2 Measured slice, and the first-order estimate
 
@@ -189,7 +207,7 @@ The slice's own counters cover every job, hidden ones included:
 | `sliceAnon`, max over 25 h (journal, every minute) | 21.4 GiB (p99 19.0, median 9.4) | 0.357 |
 | `memory.peak` of `aira.slice` since 2026-11-13 13:09 (anon plus cache, about 3 days) | 39.6 GiB | 0.661 |
 | `memory.events` `high` since then | 0 | |
-| `memory.events.local` `oom_kill` (slice-level kills) since then | 0 | |
+| `memory.events.local` `oom` (the slice's own limit was hit) since then | 0 | |
 
 First-order counterfactual, minute by minute. At each minute, the booking the discount frees from the visible
 running pinned jobs admits queued jobs in FIFO order, and their peaks are added to that minute's real
@@ -223,8 +241,8 @@ hidden jobs are missing from it. That is why section 6.2 uses the slice's own co
 - **About half the booked load is invisible to the timeline** (section 3): aitest workers (no AIRA-323 facts on
   `pytest-worker` rows), **failed runs** (AIRA-264 records only OOM or success), killed and cancelled runs (a
   job cancelled while queued is absent, both as a competitor and as a wait), jobs still running at the copy,
-  and long-lived services. The calibrated model holds their booking fixed, which makes the gains conservative.
-  The memory verdict rests on slice counters that do include them.
+  and long-lived services. The calibrated model holds their booking fixed; the direction of that error is
+  unknown (section 3). The memory verdict rests on slice counters that do include them.
 - **Evicted rows** (retention keeps 20 rows per exact signature): in a 25-hour window this matters only for
   commands run more than 20 times a day. Their evicted runs are missing, and so are their bookings, which also
   sit in the residual.
@@ -255,12 +273,12 @@ hidden jobs are missing from it. That is why section 6.2 uses the slice's own co
 
 - **C1. OOM steering: an explicit owner decision.** PR #248 lists "switch OOM steering on first" as enforce's
   precondition. Steering is off on this box and has no install flag yet (AIRA-347 step 0); a drop-in
-  `Environment=AIRA_DAEMON_OOM_STEER_MODE=...` would set it. Recommendation: **waive it for 0.9**. Steering only
-  biases the victim *of a slice-level OOM*, and while the ceiling is throttled the hard bound (54.7 GiB) is
-  below MemoryMax (64 GiB), so no such OOM can occur even with every job at its cap. Steering also has an open
-  P2 (AIRA-347 review: it reads cache-inclusive `memory.current`, so a job that fills its cap with cache looks
-  like an offender). The waiver is the owner's to give. Without it, the condition stands and enforce waits for
-  the drop-in.
+  `Environment=AIRA_DAEMON_OOM_STEER_MODE=...` would set it. Steering only biases which job dies *in a
+  slice-level OOM*. That needs real use above MemoryMax (64 GiB), while measured use peaked at 39.6 GiB with
+  cache. Steering also has an open P2 (AIRA-347 review: it reads cache-inclusive `memory.current`, so a job
+  that fills its cap with cache looks like an offender). Recommendation: **waive it for 0.9, tied to C4.**
+  That rests on measured margin, not on a guarantee. The waiver is the owner's to give. Without it, the
+  condition stands and enforce waits for the drop-in.
 - **C2. Start the watch sampler now and record a short baseline before switching.** No history of
   `memory.pressure` exists, so its trigger is unevaluated until the sampler has data. Run
   `docs/dev/aira-324-enforce-watch.sh` every 5 minutes (cron or a loop) for **at least 2 hours** before the
@@ -271,9 +289,10 @@ hidden jobs are missing from it. That is why section 6.2 uses the slice's own co
   first (the shared daemon-restart care). After the restart every surviving lease is re-declared at its full
   pin, so the ledger may sit above the ceiling until releases bring it back. New admissions wait during that
   time, as they do on any restart.
-- **C4. Watch the throttle.** If the ledger ceiling (`ceiling_gib` in the watch line) rises above
-  **57.6 GiB**, then L / 0.9 exceeds MemoryMax and the hard bound no longer holds. This is not one of the spec's
-  triggers, but it is the one condition under which the 0.9 safety case gets weaker.
+- **C4. The ceiling condition.** If the ledger ceiling (`ceiling_gib` in the watch line) stays above
+  **57.6 GiB** for an hour, L / 0.9 exceeds MemoryMax and the conditional bound in section 6.1 no longer holds.
+  Then either switch OOM steering on (a drop-in) or roll back. This adds to the spec's triggers; it does not
+  replace one.
 
 **Factor 0.8: NO-GO now.** It becomes eligible after a clean week at 0.9 *and* one of the following:
 
@@ -318,10 +337,10 @@ Any one trigger switches the mode back to observe (section 9 step 5) and files a
 
 | Trigger (spec) | Watch field | Threshold |
 |---|---|---|
-| A slice-level `oom_kill` of a job under its pin | `d_oom_kill_local` (`memory.events.local`) | any increase. The hierarchical `oom_kill` also counts jobs killed at their own cap, which happens daily (11,804 since slice start) and is **not** a trigger. |
-| `memory.events` `high` over the pre-enforce weekly p99 for 2 consecutive hours | `high`, `d_high`; `triggers` | the baseline p99 is 0 (established), so any `high` event in each of 2 consecutive hours |
+| A slice-level `oom_kill` of a job under its pin | `d_oom_local` (the slice's `memory.events.local` `oom`) | Any increase rolls back. The kernel counts `oom` against the cgroup whose limit was hit, and `oom_kill` against the victim's cgroup, so the slice-local `oom_kill` stays 0 even for a slice-level kill. Which job died, and whether its peak was under its pin, cannot be attributed from cgroup files. Any slice-level OOM therefore counts as the trigger (conservative). The hierarchical `oom_kill` also counts jobs killed at their own cap, which happens daily (about 12,000 since slice start) and is **not** a trigger. |
+| `memory.events` `high` over the pre-enforce weekly p99 for 2 consecutive hours | `high`, `d_high`; `triggers` | The baseline p99 is 0 (established), so the trigger is any `high` event in each of 2 consecutive hours. Each hour's change is read from the last sample at or before each edge, so an increment next to a boundary is not lost. A gap of more than 15 minutes between samples, or a counter reset, makes it `unevaluated`. |
 | `memory.pressure` `some avg10` over the pre-enforce weekly p99 for 2 consecutive hours | `some_avg10`; `triggers` | the p99 of the samples collected under C2. It is `unevaluated` until a baseline exists. Pressure is hierarchical (a job stalling at its own cap raises it), so the short baseline matters. |
-| More than 5% of discounted jobs above their charge in a week | `above_charge.share` (`--store`) | over 5% with at least 100 rows. Computed on pinned rows that started after the first `pin-charge enforce` line, OOM rows included, as the spec writes it. Expect about 3 to 4.5% (section 5). |
+| More than 5% of discounted jobs above their charge in a week | `above_charge.share` (`--store`) | Over 5% with at least 100 rows. Computed on pinned rows that started in the current enforce epoch (the run of `pin-charge enforce` lines at the current factor, back to the last observe line or factor change) and within the last 7 days. OOM rows are included, as the spec writes it. Ineligible pins are counted and failed runs are missing (section 5). Expect about 3 to 4.5%. |
 
 Also watch, without triggering on it: `phys_unfit` (physical-fit refusals; 0 so far), `ceiling_gib` (C4), and
 `queued` and `granted_gib` against `ceiling_gib` (the queue the change is meant to shorten).
@@ -338,5 +357,5 @@ TMPDIR=~/tmp/t aira confine --memory-reserve 128M -- python3 -I docs/dev/aira-32
 python3 -I docs/dev/aira-324-enforce-gate-replay.py --selftest
 ```
 
-Measured run: exit 0, peak RSS 44 MiB, 9 s wall. Output committed as `aira-324-enforce-gate-replay.out.txt`.
-`--selftest`: exit 0, 26 checks. A fresh copy taken later has more rows, so its numbers move a little.
+Measured run: exit 0, peak RSS 53 MiB, about 9 s wall. Output committed as `aira-324-enforce-gate-replay.out.txt`.
+`--selftest`: exit 0, 28 checks. A fresh copy taken later has more rows, so its numbers move a little.
