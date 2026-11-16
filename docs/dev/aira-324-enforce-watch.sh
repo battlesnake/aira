@@ -6,6 +6,8 @@
 #
 #   docs/dev/aira-324-enforce-watch.sh [--minutes N] [--store]   one sample, one JSON line
 #   docs/dev/aira-324-enforce-watch.sh --baseline [--force-baseline]   write/print the pre-enforce baseline
+#   docs/dev/aira-324-enforce-watch.sh --read   the operator's read (report C4): everything new since
+#                         the previous --read, met.log first, then watch.log, every line verbatim
 #
 # It reads aira.slice's cgroup files, /proc/meminfo, `aira confine --list`, the daemon's and
 # systemd-oomd's journal, and writes ONLY under ~/tmp/aira-324-watch/ (or $AIRA_324_WATCH_DIR):
@@ -59,25 +61,33 @@
 #   met                   rollback triggers that are MET: the operator rolls back (report 9 step 5).
 #                         Every run with a met trigger also APPENDS {"at", "met"} to met.log, which
 #                         nothing truncates: a trigger met at 02:00 is still there at 08:00, after the
-#                         10-minute journal window and the hourly watch.log tail have moved on.
+#                         10-minute journal window has moved on.
 #   unevaluated           triggers that cannot be judged from this sample, each with its reason.
 #
 # enforce-seen: written (once, with the time) the first time a run sees a `pin-charge enforce`
 # line (a --baseline run checks its own journal read too). From then on --baseline refuses
 # (exit 4): a baseline taken after enforce started would describe enforce, not the state before
 # it. --force-baseline overrides that, on purpose only.
+#
+# --read: prints every complete line appended to met.log, then to watch.log, since the previous
+# --read (byte cursors read-cursor.met.log and read-cursor.watch.log in the watch directory),
+# met and unevaluated lines alike, and moves the cursors. A line still being written waits for
+# the next read; a log shorter than its cursor (replaced) is read from its start. One operator
+# owns the cursors: a second reader would consume the first one's lines.
 set -euo pipefail
 
 minutes=10
 store=0
 baseline=0
 force_baseline=0
+read=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --minutes) minutes="${2:-}"; shift 2 ;;
     --store) store=1; shift ;;
     --baseline) baseline=1; shift ;;
     --force-baseline) force_baseline=1; shift ;;
+    --read) read=1; shift ;;
     -h|--help) sed -n '2,/^set -euo pipefail$/{/^set -euo/!p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -86,8 +96,41 @@ case "$minutes" in ''|*[!0-9]*) echo "--minutes must be a whole number" >&2; exi
 
 dir="${AIRA_324_WATCH_DIR:-$HOME/tmp/aira-324-watch}"
 mkdir -p "$dir"
+if [ "$read" -eq 1 ]; then
+  exec python3 -I - "$dir" <<'PY'
+import os, sys
+d = sys.argv[1]
+for name in ("met.log", "watch.log"):
+    path, cur = os.path.join(d, name), os.path.join(d, "read-cursor." + name)
+    try:
+        with open(cur) as f:
+            o = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        o = 0
+    try:
+        with open(path, "rb") as f:
+            n = os.fstat(f.fileno()).st_size
+            note = ""
+            if o > n:
+                note, o = " (shorter than at the last read: replaced, read from its start)", 0
+            f.seek(o)
+            chunk = f.read(n - o)
+    except FileNotFoundError:
+        print("== %s: absent%s" % (name, " (nothing met yet)" if name == "met.log" else ""))
+        continue
+    chunk = chunk[:chunk.rfind(b"\n") + 1]          # a line still being written waits for the next read
+    lines = chunk.decode("utf-8", "replace").splitlines()
+    print("== %s: %d new line(s) since the last read%s" % (name, len(lines), note))
+    for l in lines:
+        print(l)
+    with open(cur + ".tmp", "w") as f:
+        f.write("%d\n" % (o + len(chunk)))
+    os.replace(cur + ".tmp", cur)
+PY
+fi
 # AIRA_324_WATCH_CGROUP (a directory holding memory.events(.local) and memory.pressure) and
-# AIRA_324_WATCH_MEMINFO (a meminfo file) are test seams, never needed in normal use.
+# AIRA_324_WATCH_MEMINFO (a meminfo file) and AIRA_324_WATCH_NOW (a frozen clock, epoch seconds)
+# are test seams, never needed in normal use.
 # cron runs without XDG_RUNTIME_DIR; systemctl --user and journalctl --user need it.
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 if [ -n "${AIRA_324_WATCH_CGROUP:-}" ]; then
@@ -145,7 +188,7 @@ import importlib.util, json, os, re, sqlite3, sys, time
 spec = importlib.util.spec_from_file_location("aira324replay", replay)
 R = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(R)
-now = time.time()
+now = float(os.environ.get("AIRA_324_WATCH_NOW") or time.time())   # test seam: a frozen clock
 MAX_GAP = 900                  # samples further apart than this break a 2-hour window
 WATCHDOG_TRIP = 8 * 2**30      # watchdog.go watchdogLowMemAvailable
 TRIAL_FACTOR = "0.90"          # the only factor the report's trial covers

@@ -36,9 +36,11 @@ should not, or stays silent when it should fire, fails the case.
   no-log     journalctl fails: log fields and the trigger are unevaluated, never 0
 Trigger cases (one sample each): slice-level oom (first sample, rise, flat, reset), high
 (2 hours, 1 hour, reset, gap), pressure (2 hours, a dip, gap, and review P2-3: the reading held
-at the window's left edge below the baseline), MemAvailable (low, missing), a watchdog trip, a
+at the window's left edge below the baseline, 30 s outside it, with its met control), MemAvailable (low, missing), a watchdog trip, a
 systemd-oomd kill or an unreadable oomd journal, an enforce factor of 0.80.
 Latching and housekeeping: a met trigger is appended to met.log and a quiet run writes none;
+--read prints every complete line since the last read (met.log first, met and unevaluated
+lines alike, a partial line held back, a replaced log read from its start);
 --baseline refuses once enforce-seen exists unless --force-baseline, and works before; no run
 leaves scratch files behind.
 """
@@ -99,7 +101,9 @@ def build(root, now, c):
     if c.get("baseline", True):
         (wdir / "baseline.json").write_text(json.dumps({"high_p99_per_hour": 0, "some_avg10_p99": 1.0}))
 
-    t1 = now - 3600
+    # a sub-millisecond fraction on purpose: the clock is frozen at whole seconds, and the epoch's
+    # first line must still count after the ms truncation (int(t * 1000), as each grant's time)
+    t1 = now - 3600 + 0.123457
     grant_times = [t1 + 10 * i for i in range(40)]
     pc = ["%.6f host aira[1]: aira daemon: pin-charge observe: scope=S0 pin=%d charged=%d would-charge=%d "
           "factor=0.90 physical-free=1 physical-fit=true" % (t1 - 100, PIN, PIN, CHARGE)]
@@ -155,9 +159,11 @@ def build(root, now, c):
     return home, cg, bin_, meminfo
 
 
-def invoke(watch, home, cg, bin_, meminfo, store, args=()):
+def invoke(watch, home, cg, bin_, meminfo, store, args=(), now=None):
     env = {"HOME": str(home), "PATH": "%s:/usr/bin:/bin" % bin_, "AIRA_324_WATCH_CGROUP": str(cg),
            "AIRA_324_WATCH_MEMINFO": str(meminfo)}
+    if now is not None:
+        env["AIRA_324_WATCH_NOW"] = "%d" % now      # the frozen clock: the watch's now IS the fixture's
     p = subprocess.run(["env", "-i"] + ["%s=%s" % kv for kv in env.items()] + ["bash", str(watch)] +
                        (["--store"] if store else []) + list(args), capture_output=True, text=True)
     out = p.stdout.strip().splitlines()
@@ -181,13 +187,13 @@ def main():
             print("ok   %s" % name)
 
     def run(name, store=False, **c):
-        now = time.time()
+        now = int(time.time())          # whole seconds, and handed to the watch: no rounding, no drift
         d = top / name
         d.mkdir()
         if callable(c.get("samples")):
             c["samples"] = c["samples"](now)
         home, cg, bin_, meminfo = build(d, now, c)
-        code, line, err = invoke(watch, home, cg, bin_, meminfo, store)
+        code, line, err = invoke(watch, home, cg, bin_, meminfo, store, now=now)
         check("%s: exit 0 in a cron-like environment" % name, (code, err.strip()[:200] if code else ""), (0, ""))
         if c.get("evict_then_rerun") and line:
             db = sqlite3.connect(str(home / ".local/state/aira/state.db"))
@@ -195,7 +201,7 @@ def main():
             db.execute("insert into confine_peak_history values ('x', 1, 0, 'a', 'confine', 1, ?, 1, 0, 1, 'r')", (BASIS,))
             db.commit()
             db.close()
-            code, line, err = invoke(watch, home, cg, bin_, meminfo, store)
+            code, line, err = invoke(watch, home, cg, bin_, meminfo, store, now=now + 1)
             check("%s: second run exit 0" % name, (code, err.strip()[:200] if code else ""), (0, ""))
         res: dict = line or {"met": None, "unevaluated": None}
         wdir = home / "tmp/aira-324-watch"
@@ -297,11 +303,18 @@ def main():
         check("pressure with one dip: neither met nor unevaluated", (p["met"], p["unevaluated"]), ([], []))
         p = run("pressure-gap", avg10=5.0, samples=lambda now: history(now, avg=lambda t: 5.0, drop=(now - 5000, now - 3000)))
         check("pressure with a gap: unevaluated", (p["met"], unev(p, "pressure: unevaluated")), ([], True))
-        # review P2-3: the reading held at the left edge (sample at now - 7200, just before the
-        # window) is below the baseline and the first one inside is ~115 minutes old: the window
-        # was not above the baseline for 2 hours
-        p = run("pressure-edge", avg10=5.0, samples=lambda now: history(now, avg=lambda t: 0.5 if t <= now - 7200 else 5.0))
-        check("pressure: a held reading below baseline at the left edge: not met", (p["met"], p["unevaluated"]), ([], []))
+        # review P2-3 (made deterministic in round 7: frozen clock, decisive sample 30 s outside):
+        # no sample at the boundary; the one held at the left edge is at now - 7230, below the
+        # baseline; the first one inside is at now - 6900 (115 min ago), and every one inside is
+        # over it. The window was not above the baseline for 2 hours: not met. The same layout with
+        # the held reading over the baseline is met (the control: only that reading decides).
+        def edge(held):
+            return lambda now: (history(now, avg=lambda t: 5.0, drop=(now - 7201, now - 7199)) +
+                                "%d\t0\t0\t0\t7\t0\t%s\n" % (now - 7230, held))
+        p = run("pressure-edge", avg10=5.0, samples=edge(0.5))
+        check("pressure: a held reading below baseline 30 s before the window: not met", (p["met"], p["unevaluated"]), ([], []))
+        p = run("pressure-edge-control", avg10=5.0, samples=edge(5.0))
+        check("pressure: the same layout with the held reading above baseline: met", p["met"], [PM])
 
         # ---- baseline refusal once enforce has been seen
         b = run("baseline", baseline=False)
@@ -347,6 +360,35 @@ def main():
                                       "physical-fit=true" % (PIN, 8 * GIB)])
         check("enforce at 0.80: met", (x["met"], x["enforce_factors"]),
               (["enforce at a factor other than 0.90 (the report covers 0.9 only)"], ["0.80", "0.90"]))
+
+        # ---- --read: the operator's read since the last read (review round 7)
+        rh = top / "read" / "home"
+        rw = rh / "tmp/aira-324-watch"
+        rw.mkdir(parents=True)
+
+        def read():
+            r = subprocess.run(["env", "-i", "HOME=%s" % rh, "PATH=/usr/bin:/bin", "bash", str(watch), "--read"],
+                               capture_output=True, text=True)
+            return r.returncode, r.stdout.splitlines()
+        check("read: nothing written yet", read(), (0, ["== met.log: absent (nothing met yet)", "== watch.log: absent"]))
+        MET = '{"at": "02:00", "met": ["slice-level oom"]}'
+        Q = '{"at": "02:05", "met": [], "unevaluated": ["above-charge: unevaluated (between 2 and 3 of 40)"]}'
+        (rw / "met.log").write_text(MET + "\n")
+        (rw / "watch.log").write_text(MET[:-1] + ', "unevaluated": []}\n' + Q + "\ncannot read x\n" + '{"at": "02:1')
+        check("read: every complete line, met and unevaluated alike, met.log first; a partial line waits", read(),
+              (0, ["== met.log: 1 new line(s) since the last read", MET,
+                   "== watch.log: 3 new line(s) since the last read", MET[:-1] + ', "unevaluated": []}', Q, "cannot read x"]))
+        check("read: a second read finds nothing new", read(),
+              (0, ["== met.log: 0 new line(s) since the last read", "== watch.log: 0 new line(s) since the last read"]))
+        with open(rw / "watch.log", "a") as f:
+            f.write('0", "met": []}\n' + Q + "\n")
+        check("read: the finished partial line and the next one", read(),
+              (0, ["== met.log: 0 new line(s) since the last read", "== watch.log: 2 new line(s) since the last read",
+                   '{"at": "02:10", "met": []}', Q]))
+        (rw / "watch.log").write_text(Q + "\n")
+        check("read: a log shorter than its cursor is read from its start", read(),
+              (0, ["== met.log: 0 new line(s) since the last read",
+                   "== watch.log: 1 new line(s) since the last read (shorter than at the last read: replaced, read from its start)", Q]))
     finally:
         shutil.rmtree(top, ignore_errors=True)
     print("watch test:", "PASS" if ok else "FAIL")

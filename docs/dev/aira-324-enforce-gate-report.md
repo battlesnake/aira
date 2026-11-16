@@ -9,19 +9,19 @@ so this report decides from the AIRA-323 data that already exists.
 | Factor | Spec gate | Recommendation |
 |---|---|---|
 | **0.9** | **Unevaluated** | **No evidence-based GO.** The replay cannot be validated (section 3), so its memory result is not evidence, and the 5% trigger cannot be computed on the right population (section 5). Enforce at 0.9 is defensible only as an **owner-waived, owner-risk-accepted, monitored and reversible trial** under conditions C0 to C4 (section 8). Without that waiver, NO-GO. |
-| **0.8** | **Unevaluated** | **NO-GO.** If every discounted job reached its full pin at once, the extra memory 0.8 admits (up to 12.3 GiB) exceeds the host's whole safety margin (about 10 GiB: the 8 GiB the ceiling keeps free plus the 2 GiB headroom), so host memory exhaustion is reachable (section 6.1). The trigger proxy also reads 6.9% here and 6.1% in the spec's two-week replay, and the spec orders a clean week at 0.9 first. |
+| **0.8** | **Unevaluated** | **NO-GO.** If every discounted job reached its full pin at once, the extra memory 0.8 admits (up to 12.3 GiB) exceeds the host's whole safety margin (about 10 GiB: the 8 GiB the ceiling keeps free plus the 2 GiB headroom), so host memory exhaustion is reachable (section 6.1). The trigger proxy also reads 7.1% here and 6.1% in the spec's two-week replay, and the spec orders a clean week at 0.9 first. |
 
 What the gate needs and what this data gives:
 
 | The gate asks for | What exists | Status |
 |---|---|---|
-| A replay of the real timeline that reproduces the queue | Only a model that puts the observed occupancy back in (circular), needs 16 forced grants, and misplaces single jobs (median 41 s off) | not established |
-| It admits more jobs | Under that model: the share waiting over 60 s falls from 35.1% (baseline replay; 31.8% observed) to 16.5% | weak |
-| Concurrent `memory.peak` under 0.9 x MemoryHigh at the busiest hour | Passes on the visible jobs: 0.504 in the busiest hour and 0.554 in the worst minute at 0.9, every minute under 54 GiB, in the same unvalidated model. Visible replay plus the real slice anon, a double-counting upper bound, peaks at 0.85 x MemoryHigh (section 6.3) | unevaluated |
-| More than 5% of discounted jobs above their charge | 300 of the 1,329 logged discountable grants have no row, so their peaks are unknown; the share lies between 3.0% and 25.6% | unevaluated |
+| A replay of the real timeline that reproduces the queue | Only a model that puts the observed occupancy back in (circular), needs 21 forced grants, follows the hourly pattern only weakly (r 0.41), and misplaces single jobs (median 42 s off) | not established |
+| It admits more jobs | Under that model: the share waiting over 60 s falls from 36.4% (baseline replay; 32.7% observed) to 17.1% | weak |
+| Concurrent `memory.peak` under 0.9 x MemoryHigh at the busiest hour | Passes on the visible jobs: 0.521 in the busiest hour and 0.554 in the worst minute at 0.9, every minute under 54 GiB, in the same unvalidated model. Visible replay plus the real slice anon, a double-counting upper bound, peaks at 0.865 x MemoryHigh at 0.9 (section 6.3) | unevaluated |
+| More than 5% of discounted jobs above their charge | 357 of the 1,572 logged discountable grants have no row, so their peaks are unknown; the share lies between 3.2% and 25.9% | unevaluated |
 
 Plain-English summary. Admission books each job's full pin until it ends. Real memory sits far below the bookings:
-over the 29 hours, the most the slice ever used was 23.7 GiB of anonymous memory, while 38 to 51 GiB was booked.
+over the 31 hours, the most the slice ever used was 23.7 GiB of anonymous memory, while 38 to 51 GiB was booked.
 At 0.9, a pinned job books 90% of its pin, so more jobs fit. Whether that is safe cannot be shown from this data.
 About half of what is booked belongs to jobs the store has no timeline for. The only replay that matches the
 real queue gets there by copying the observed occupancy back in, so its "safe" answer is not independent
@@ -42,18 +42,20 @@ It does not rest on the replay.
 
 | Source | What | Range |
 |---|---|---|
-| State store, a **copy** (`state.db` plus its WAL, copied to `~/tmp` at 2026-11-16 14:11 UTC; the live file was not opened) | 5,832 confine rows with all four AIRA-323 facts: 3,386 pinned (`cap:operator:--memory-reserve`), 2,418 auto-sized, 28 `--memory-max`; 171 OOM rows (69 of them pinned); 0 rows with an unknown peak (`peak_rss` NULL) | 2026-11-15 08:56 to 2026-11-16 14:10 UTC (29.2 h) |
-| Daemon journal (`journalctl --user -u aira-daemon.service -o short-unix`, saved) | 1,668 `slice ceiling throttled` lines in the window (one a minute: effective ceiling plus the slice's real anon memory `sliceAnon`), 1,329 `pin-charge observe` lines (one per discountable grant), 5 daemon starts | observe lines from 2026-11-16 03:34 UTC (10.6 h) |
+| State store, a **copy** (`state.db` plus its WAL, copied to `~/tmp` at 2026-11-16 16:01 UTC; the live file was not opened) | 6,144 confine rows with all four AIRA-323 facts: 3,572 pinned (`cap:operator:--memory-reserve`), 2,543 auto-sized, 29 `--memory-max`; 193 OOM rows (73 of them pinned); 0 rows with an unknown peak (`peak_rss` NULL) | 2026-11-15 08:56 to 2026-11-16 16:01 UTC (31.1 h) |
+| Daemon journal (`journalctl --user -u aira-daemon.service -o short-unix`, saved) | 1,777 `slice ceiling throttled` lines in the window (one a minute: effective ceiling plus the slice's real anon memory `sliceAnon`), 1,572 `pin-charge observe` lines (one per discountable grant), 5 daemon starts | observe lines from 2026-11-16 03:34 UTC (12.5 h) |
 | `aira.slice` cgroup, read once | `memory.peak` 42,564,481,024 B (39.6 GiB); `memory.events` `high 0`; `memory.events.local` `oom_kill 0`, `high 0` | since the slice started, 2026-11-13 13:09 EET |
 
-This round's numbers come from a fresh copy (5,832 rows); the previous round's copy, taken 3.8 h earlier, held
-5,332. Every direction is unchanged; the numbers moved a little.
+This round's numbers come from a fresh copy (6,144 rows); the previous round's copy, taken 1.8 h earlier, held
+5,832. Every verdict is unchanged. Two figures moved enough to name: the best-fit replay's hour r fell from 0.72 to
+0.41 (section 3: the calibration is weaker still), and at 0.8 the one-to-one estimate crossed 5% (5.4%, section 5).
 
 Two properties of the data bias every count below:
 
-- **Eviction.** Retention keeps 20 rows per exact signature (820 signatures sit at the cap). Measured between the
-  two copies, 3.8 h apart: 277 of the earlier copy's 5,332 rows are gone (5.2%, about 1.4% of all rows an hour),
-  85 of its 3,146 pinned rows (2.7%). The rows that go are the oldest of the busiest signatures, so the store
+- **Eviction.** Retention keeps 20 rows per exact signature (820 signatures sit at the cap). Measured between a
+  copy taken at 10:22 UTC and this one, 5.7 h apart: 332 of the earlier copy's 5,332 rows are gone (6.2%, about
+  1.1% of all rows an hour), 99 of its 3,146 pinned rows (3.1%). (The previous round measured 277 gone, 5.2%, at
+  3.8 h: about 1.4% an hour; the rate follows the load.) The rows that go are the oldest of the busiest signatures, so the store
   under-represents frequently run commands, and the later the copy, the more discountable grants turn rowless
   (section 5b). The watch's weekly above-charge share (section 10) has the same bias: its hourly `--store` keeps
   every row it sees, but a row evicted within an hour of its start (a signature run more than 20 times in that
@@ -65,7 +67,7 @@ Two properties of the data bias every count below:
 
 ## 2. Method
 
-`docs/dev/aira-324-enforce-gate-replay.py` (stdlib Python; `--selftest` runs 61 checks on synthetic timelines
+`docs/dev/aira-324-enforce-gate-replay.py` (stdlib Python; `--selftest` runs 62 checks on synthetic timelines
 whose answers are known by hand). How it builds the timeline:
 
 - Each row is one job. Arrival = `started_at_ms - wait_ms`, start = `started_at_ms`, end = start + `wall_ms`.
@@ -92,7 +94,7 @@ level at a random instant; **burst-weighted** is the level at the moment each jo
 from the metric start through **its own** final completion, so a job the replay delays past the observed end is
 still counted. The busiest hour is fixed **once** for every row: the clock hour with the highest mean `sliceAnon`
 (the real slice, hidden jobs included) among hours with at least 30 throttle lines, so a clipped or gappy hour
-is skipped. Here it is 2026-11-16 13:00 to 14:00 UTC. A separately labelled `common` column gives the mean over
+is skipped. Here it is 2026-11-16 13:00 to 14:00 UTC (unchanged from the previous copy). A separately labelled `common` column gives the mean over
 the observed window only, the same span for every row.
 
 5% trigger population (section 5): each `pin-charge observe` line, one per discountable grant, is linked to the
@@ -113,14 +115,14 @@ correlation of the hourly mean wait, replayed against observed.
 
 | Ceiling model | Best policy | p50 s | p90 s | p99 s | > 60 s | hour r | score | forced grants |
 |---|---|---|---|---|---|---|---|---|
-| **Observed** | | 8.4 | 297 | 836 | 31.8% | | | |
-| constant 36 GiB | fifo | 0.0 | 0.0 | 575 | 5.5% | 0.30 | 2.51 | 0 |
-| constant 44 GiB | fifo | 0.0 | 0.0 | 7.4 | 0.5% | 0.20 | 4.13 | 0 |
-| constant 62 GiB | any | 0.0 | 0.0 | 0.0 | 0.0% | n.a. | 5.11 | 0 |
-| journal ceiling, H = 0 | fifo | 0.0 | 0.0 | 8.2 | 0.2% | 0.26 | 4.26 | 0 |
-| journal ceiling, H = 16 GiB (best constant H) | fifo | 0.0 | 260 | 1,096 | 19.4% | 0.38 | 0.78 | 0 |
-| journal ceiling - 0.75 x residual | backfill | 0.0 | 11 | 203 | 4.8% | 0.57 | 2.17 | 0 |
-| **journal ceiling - 1.0 x residual** | **backfill** | 28.8 | 238 | 786 | 35.1% | **0.72** | **0.38** | 16 |
+| **Observed** | | 10.4 | 298 | 836 | 32.7% | | | |
+| constant 36 GiB | fifo | 0.0 | 0.0 | 553 | 6.4% | 0.32 | 2.54 | 0 |
+| constant 44 GiB | fifo | 0.0 | 0.0 | 16.2 | 0.5% | 0.20 | 4.02 | 0 |
+| constant 62 GiB | any | 0.0 | 0.0 | 0.0 | 0.0% | n.a. | 5.16 | 0 |
+| journal ceiling, H = 0 | fifo | 0.0 | 0.0 | 10.8 | 0.2% | 0.28 | 4.25 | 0 |
+| journal ceiling, H = 16 GiB (best constant H) | fifo | 0.0 | 403 | 1,328 | 22.0% | 0.36 | 0.90 | 0 |
+| journal ceiling - 0.75 x residual | backfill | 0.0 | 11 | 214 | 4.6% | 0.52 | 2.23 | 0 |
+| **journal ceiling - 1.0 x residual** | **backfill** | 30.3 | 242 | 782 | 36.4% | **0.41** | **0.35** | 21 |
 
 The full sweep (5 constant ceilings, 4 constant H values, 3 residual fractions, each under 3 policies) is in
 the `.out.txt`.
@@ -129,24 +131,26 @@ the `.out.txt`.
 
 - **A replay of the visible jobs alone does not reproduce reality.** With the real ceiling and no hidden load,
   the replay finds almost no queue (0.2% of jobs wait over a minute, against 32% observed). No constant ceiling
-  or constant hidden load reproduces *when* the queue forms: the hour r is at most 0.42.
-- The reason is measured. In the 1,219 minutes when a visible job was waiting, the ledger ceiling minus the
-  visible bookings (the **residual**) had a median of **25.6 GiB** (p10 13.7, p90 38.7). About half of what was
-  booked belongs to jobs the table cannot see: aitest workers (1,349 `pytest-worker` rows, none with a timeline),
+  or constant hidden load reproduces *when* the queue forms: the hour r is at most 0.43.
+- The reason is measured. In the 1,320 minutes when a visible job was waiting, the ledger ceiling minus the
+  visible bookings (the **residual**) had a median of **24.9 GiB** (p10 13.0, p90 38.5). About half of what was
+  booked belongs to jobs the table cannot see: aitest workers (1,390 `pytest-worker` rows, none with a timeline),
   failed or killed runs (AIRA-264 writes no row), jobs still running at the copy, and long-lived services. The
-  observe log confirms it: 300 of its 1,329 discountable grants have no row (section 5).
+  observe log confirms it: 357 of its 1,572 discountable grants have no row (section 5).
 - **The one model that reproduces the queue is circular.** It puts the residual back minute by minute. At
   fraction 1.0 the replay's capacity is then close to the observed visible booking itself. Under backfill it
-  matches the hourly pattern (r 0.72) and the tail (p90 238 s against 297, p99 786 against 836), but:
-  - **it needs 16 forced grants**: waiters that never fit the reconstructed ledger and are let in only when
+  matches the tail (p90 242 s against 298, p99 782 against 836) and has the best score (0.35), but:
+  - **it follows the hourly pattern only weakly**: hour r 0.41 on this copy (0.72 on the previous one, 1.8 h
+    shorter), below the 0.75-residual backfill row's 0.52;
+  - **it needs 21 forced grants**: waiters that never fit the reconstructed ledger and are let in only when
     nothing visible runs;
-  - **the policies closer to the daemon's head protection fail**: fifo and bypass queue 98% and 66% of jobs;
+  - **the policies closer to the daemon's head protection fail**: fifo and bypass queue 98% and 67% of jobs;
   - **it misplaces single jobs.** The residual is sampled once a minute (the journal's throttle line), so the
     replay's capacity is the booking seen at the last tick, and a job that really started at once waits for the
-    next tick. Of the 2,372 jobs in the metric window that did not queue (observed wait under 1 s), **64.9%
-    wait over 1 s in the baseline replay** (p50 20.1 s, p90 140.0 s). That is why the replayed median is 28.8 s
-    against 8.4 s observed. Per job, |replayed start - observed start| has a median of 41.1 s and a p90 of
-    253.1 s. Against the observed timeline, the baseline replay starts 1,990 jobs earlier and 2,928 later.
+    next tick. Of the 2,422 jobs in the metric window that did not queue (observed wait under 1 s), **65.4%
+    wait over 1 s in the baseline replay** (p50 22.2 s, p90 164.7 s). That is why the replayed median is 30.3 s
+    against 10.4 s observed. Per job, |replayed start - observed start| has a median of 42.3 s and a p90 of
+    256.0 s. Against the observed timeline, the baseline replay starts 2,131 jobs earlier and 3,088 later.
   - cancelled heads, failed runs and unfinished jobs are absent, both as competitors and as waits.
 - **So the calibration reproduces the shape of the wait distribution, not the system.** It is an
   occupancy-conditioned sensitivity analysis: given the occupancy we saw, how much would the discount free? It
@@ -157,35 +161,35 @@ the `.out.txt`.
 
 Each factor row is compared with the same config's baseline replay **and** with the observed timeline. "Earlier"
 and "later" mean the start moved by more than 1 s. "Earlier, queued" counts only jobs that really queued
-(observed wait at least 1 s; 3,338 jobs), because a job that never waited cannot start earlier.
+(observed wait at least 1 s; 3,600 jobs), because a job that never waited cannot start earlier.
 
 | Config | Factor | Earlier than baseline (all / queued) | Later than baseline | Earlier / later than observed | p90 change s | > 60 s | phys-held |
 |---|---|---|---|---|---|---|---|
-| **residual, backfill (best fit)** | 1.0 | | | 1,990 / 2,928 | | 35.1% (observed 31.8%) | |
-| | **0.9** | 3,111 / **1,790** | 657 | **2,650 / 1,431** | -119 | **16.5%** | 11 |
-| | 0.8 | 3,444 / 1,964 | 385 | 2,873 / 963 | -167 | 11.1% | 48 |
-| residual, bypass | 0.9 | 4,635 / 2,730 | 313 | 2,061 / 2,260 | -720 | 27.9% (baseline 66.1%) | 14 |
-| residual, fifo | 0.9 | 5,704 / 3,284 | 0 | 1,320 / 3,486 | -708 | 45.6% (baseline 97.7%) | 5 |
-| constant 44 GiB, bypass | 0.9 | 28 / 27 | 4 | 3,329 / 11 | 0 | 0.3% | 0 |
-| constant 48 GiB, bypass | 0.9 | 9 / 9 | 0 | 3,338 / 0 | 0 | 0.0% | 0 |
-| constant 62 GiB, bypass | 0.9 | 0 / 0 | 0 | 3,338 / 0 | 0 | 0.0% | 0 |
+| **residual, backfill (best fit)** | 1.0 | | | 2,131 / 3,088 | | 36.4% (observed 32.7%) | |
+| | **0.9** | 3,292 / **1,932** | 620 | **2,843 / 1,548** | -118 | **17.1%** | 11 |
+| | 0.8 | 3,628 / 2,110 | 438 | 3,017 / 1,102 | -144 | 13.0% | 50 |
+| residual, bypass | 0.9 | 4,930 / 2,975 | 315 | 2,141 / 2,474 | -765 | 29.7% (baseline 67.2%) | 14 |
+| residual, fifo | 0.9 | 6,017 / 3,547 | 0 | 1,302 / 3,826 | -636 | 49.2% (baseline 97.9%) | 5 |
+| constant 44 GiB, bypass | 0.9 | 41 / 39 | 4 | 3,591 / 11 | 0 | 0.3% | 0 |
+| constant 48 GiB, bypass | 0.9 | 9 / 9 | 0 | 3,600 / 0 | 0 | 0.0% | 0 |
+| constant 62 GiB, bypass | 0.9 | 0 / 0 | 0 | 3,600 / 0 | 0 | 0.0% | 0 |
 
 Reading it:
 
-- **An earlier version of this report overstated the gain.** "Jobs start earlier" (3,111 here) counts jobs the
-  baseline replay had itself delayed by the minute tick. Among the 3,338 jobs that really queued, 1,790 start
-  earlier than in the baseline replay at 0.9 (1,964 at 0.8).
-- Against what really happened, at 0.9 2,650 jobs start more than 1 s earlier than they did and 1,431 later.
-  Of the 1,431, 776 never queued at all: they are the tick artifact, not a cost of the discount. The rest (655)
+- **An earlier version of this report overstated the gain.** "Jobs start earlier" (3,292 here) counts jobs the
+  baseline replay had itself delayed by the minute tick. Among the 3,600 jobs that really queued, 1,932 start
+  earlier than in the baseline replay at 0.9 (2,110 at 0.8).
+- Against what really happened, at 0.9 2,843 jobs start more than 1 s earlier than they did and 1,548 later.
+  Of the 1,548, 823 never queued at all: they are the tick artifact, not a cost of the discount. The rest (725)
   are jobs that queued and start later, mostly where backfill lets a big job in ahead of them (the `obs-l-q`
   column of the `.out.txt`). **Per-job gains are not reliable**.
-- The gain headline that survives is the share of jobs that wait over a minute: 31.8% observed, 35.1% in the
-  baseline replay, **16.5% at 0.9** and 11.1% at 0.8. It is still **weak** evidence (section 3).
+- The gain headline that survives is the share of jobs that wait over a minute: 32.7% observed, 36.4% in the
+  baseline replay, **17.1% at 0.9** and 13.0% at 0.8. It is still **weak** evidence (section 3).
 - The `fifo` and `bypass` baselines are badly calibrated, so their large gains show how sensitive the result is
   to order. They are not a forecast. The constant-ceiling rows do not reproduce the queue, so their near-zero
   gains are not evidence either.
-- The physical-fit rule held back 11 grants at 0.9 and 48 at 0.8, under the clairvoyant reading. The 1,329
-  observe lines add a margin: real free memory exceeded the full pin by at least **14.7 GiB** (median 34.5 GiB)
+- The physical-fit rule held back 11 grants at 0.9 and 50 at 0.8, under the clairvoyant reading. The 1,572
+  observe lines add a margin: real free memory exceeded the full pin by at least **14.7 GiB** (median 34.3 GiB)
   at every observed discountable grant. Whether that margin holds once enforce admits more is what the watcher
   is for.
 
@@ -196,46 +200,47 @@ an exclusive job or an inherited reserve is not), nor, under enforce, whether it
 survives a daemon restart is re-declared at its full pin). The journal does say it: one line per discountable
 grant. So the trigger is computed two ways.
 
-**5a. Proxy: every pinned row (29 hours; eligibility not established).** No pinned row has an unknown peak in
+**5a. Proxy: every pinned row (31 hours; eligibility not established).** No pinned row has an unknown peak in
 this copy, so each interval is a single value; a NULL peak would widen it.
 
 | | Factor 0.9 | Factor 0.8 |
 |---|---|---|
-| Peak > charge, all pinned rows | 152 / 3,386 = 4.5% | 235 / 3,386 = 6.9% |
-| Same, leaving out the 69 OOM rows | 83 / 3,317 = 2.5% | 166 / 3,317 = 5.0% |
-| Per clock hour (29 hours with at least 20 pinned rows): median, max | 4.6%, 13.8% | 6.8%, 15.5% |
+| Peak > charge, all pinned rows | 162 / 3,572 = 4.5% | 253 / 3,572 = 7.1% |
+| Same, leaving out the 73 OOM rows | 89 / 3,499 = 2.5% | 180 / 3,499 = 5.1% |
+| Per clock hour (31 hours with at least 20 pinned rows): median, max | 4.6%, 13.8% | 7.3%, 16.7% |
 | Spec section 2, two weeks of history (reported as, for comparison) | 2.9% | 6.1% |
-| Peak >= pin (at their own cap; unaffected by the discount) | 125 = 3.7% (69 OOM) | same |
+| Peak >= pin (at their own cap; unaffected by the discount) | 133 = 3.7% (73 OOM) | same |
 
-**5b. The eligible population: the 1,329 discountable grants logged from 03:34 UTC (10.6 hours).**
+**5b. The eligible population: the 1,572 discountable grants logged from 03:34 UTC (12.5 hours).**
 
 | | Factor 0.9 | Factor 0.8 |
 |---|---|---|
-| Grants paired with a row (of them in one-to-one components with a known peak) | 1,029 (950) | 1,029 (950) |
-| Grants with no row (failed, killed, still running at the copy, or the row evicted by the 20-row retention: peak unknown) | 300 | 300 |
+| Grants paired with a row (of them in one-to-one components with a known peak) | 1,215 (1,124) | 1,215 (1,124) |
+| Grants with no row (failed, killed, still running at the copy, or the row evicted by the 20-row retention: peak unknown) | 357 | 357 |
 | Linked rows with an unknown peak (`peak_rss` NULL) | 0 | 0 |
-| Grants above the charge, attribution uncertainty and unknown peaks included | between 40 and 340 = 3.0% to 25.6% | between 51 and 351 = 3.8% to 26.4% |
-| Above the charge among the one-to-one pairs (an estimate, not the trigger) | 36 of 950 = 3.8% | 44 of 950 = 4.6% |
+| Grants above the charge, attribution uncertainty and unknown peaks included | between 50 and 407 = 3.2% to 25.9% | between 69 and 426 = 4.4% to 27.1% |
+| Above the charge among the one-to-one pairs (an estimate, not the trigger) | 45 of 1,124 = 4.0% | 61 of 1,124 = **5.4%** |
 | Trigger | **unevaluated** | **unevaluated** |
 
-- Eligibility is measurable only in the observe window. There, 10 of the 1,039 pinned rows that started have no
+- Eligibility is measurable only in the observe window. There, 10 of the 1,225 pinned rows that started have no
   grant line within 100 ms. Seven are delegate parents (their signature starts with the `aitest-parent` prefix,
   `runner.AitestParentSignaturePrefix`; never discounted), and the watcher leaves those out. Why the other three
   have no line of their own is not established. Before 03:34 UTC there are no grant lines to pair with, so a
   whole-window figure for ineligible rows does not exist.
 - **The trigger cannot be evaluated on this data.** More than one grant in five has no row, so the share could
-  be anything from 3.0% to 25.6% at 0.9. The 4.5% proxy does not support a GO. Keeping the attribution
-  uncertainty (section 2) widens no interval here: the 79 paired grants outside one-to-one components sit in
-  bursts whose rows all fall on the same side of the charge, so the low end (40) equals a nearest-first pairing's
-  count.
-- Where the peak is known, the share is under 5% at both factors. That holds only if the rowless grants peak like
-  the paired ones, which is not established: a failed run can stop at any point.
-- **Eviction is a measured cause of rowless grants** (section 1: 5.2% of rows gone in 3.8 h, 2.7% of pinned rows;
-  820 signatures at the 20-row cap). The later a copy, the more grants turn rowless: 190 of 958 (19.8%) in the
-  previous round's copy, 300 of 1,329 (22.6%) in this one. The watcher keeps every pinned row any `--store` run
+  be anything from 3.2% to 25.9% at 0.9. The 4.5% proxy does not support a GO. Keeping the attribution
+  uncertainty (section 2) widens no interval here: the 91 paired grants outside one-to-one components sit in
+  bursts whose rows all fall on the same side of the charge, so the low end (50) equals a nearest-first pairing's
+  count (50 at 0.9, 69 at 0.8).
+- Where the peak is known, the share is under 5% at 0.9 (4.0%) and over it at 0.8 (5.4%). The 0.9 figure holds
+  only if the rowless grants peak like the paired ones, which is not established: a failed run can stop at any
+  point.
+- **Eviction is a measured cause of rowless grants** (section 1: 6.2% of rows gone in 5.7 h, 3.1% of pinned rows;
+  820 signatures at the 20-row cap). The later a copy, the more grants turn rowless: 190 of 958 (19.8%) two
+  copies ago, 300 of 1,329 (22.6%) in the previous round's copy, 357 of 1,572 (22.7%) in this one. The watcher keeps every pinned row any `--store` run
   has seen (section 10); a row evicted between two hourly runs is still lost.
-- 0.8 reads over 5% on the 29-hour proxy and on the spec's two-week figure, and 5.0% (166 of 3,317, just over 5%) even without OOM rows.
-- 49 non-OOM pinned rows have a peak equal to their pin: page cache fills the cap (AIRA-318). They count as
+- 0.8 reads over 5% on the 31-hour proxy, on the spec's two-week figure and on the one-to-one pairs, and 5.1% (180 of 3,499) even without OOM rows.
+- 52 non-OOM pinned rows have a peak equal to their pin: page cache fills the cap (AIRA-318). They count as
   "above charge" at any factor. Measuring anonymous peaks (AIRA-318) would bring both rates down.
 
 The watcher (section 10) computes the trigger the same way under enforce, from the `pin-charge enforce` lines, and
@@ -268,7 +273,7 @@ share of L adds to it):
 | 0.8 | 12.3 GiB | below 0 | **host memory exhaustion** |
 
 This is a worst case, not a forecast: every job at its full cap together has not been seen (the slice's anonymous
-peak over 29 hours was 23.7 GiB against 38 to 51 GiB booked). It is also not a bound. A ceiling that falls after
+peak over 31 hours was 23.7 GiB against 38 to 51 GiB booked). It is also not a bound. A ceiling that falls after
 a grant (memory used outside the slice grows) shrinks the margin at factor 1.0 as well; enforce adds only the extra
 in the table, on top of whatever exposure factor 1.0 already has. The spec's exceptions (`--resize`, a
 re-declare charged above the ceiling) are outside it.
@@ -309,15 +314,15 @@ The slice's own counters cover every job, hidden ones included. They describe th
 
 | Measure | Value | Fraction of MemoryHigh |
 |---|---|---|
-| `sliceAnon`, max over 29 h (journal, every minute) | 23.7 GiB (p99 19.1, median 9.4) | 0.394 |
+| `sliceAnon`, max over 31 h (journal, every minute) | 23.7 GiB (p99 19.0, median 9.3) | 0.394 |
 | `memory.peak` of `aira.slice` since 2026-11-13 13:09 (anon plus cache, about 3 days) | 39.6 GiB | 0.661 |
 | `memory.events` `high` since then | 0 | |
 | `memory.events.local` `oom` (the slice's own limit was hit) since then | 0 | |
 
 First-order estimate, minute by minute: the booking the discount frees from the visible running pinned jobs admits
 queued jobs in FIFO order, and their peaks are added to that minute's real `sliceAnon`. Its maximum is 0.394 of
-MemoryHigh at both 0.9 and 0.8 (the minute of the slice's own maximum admits nothing more), with no minute over
-54 GiB. **It is not a bound**: it keeps the observed
+MemoryHigh at 0.9 (the minute of the slice's own maximum admits nothing more) and 0.423 at 0.8, with no minute
+over 54 GiB. **It is not a bound**: it keeps the observed
 running set, so it cannot see the overlap change described in 6.1, and it can understate.
 
 ### 6.3 Replay timeline (the section-3 model: visible jobs, each holding its peak for its whole run, blind reading)
@@ -326,30 +331,36 @@ One busiest hour for every row, fixed once by `sliceAnon` (section 2): **2026-11
 
 | Config | Factor | Busiest hour: duration-weighted mean / p99 | Busiest hour: burst-weighted p99 | Busiest hour: max | Minute max (whole run) | Minutes over 54 GiB | Minutes checked | Visible + real `sliceAnon` (upper bound), minute max |
 |---|---|---|---|---|---|---|---|---|
-| observed timeline | 1.0 | 0.299 / 0.515 | 0.516 | 0.522 | 0.551 | 0 | 1,695 | 0.855 |
-| residual, backfill | 1.0 | 0.308 / 0.523 | 0.511 | 0.523 | 0.558 | 0 | 1,703 | 0.856 |
-| residual, backfill | **0.9** | 0.316 / 0.500 | 0.502 | 0.504 | 0.554 | 0 | 1,691 | **0.849** |
-| residual, backfill | 0.8 | 0.304 / 0.547 | 0.547 | 0.547 | 0.568 | 0 | 1,691 | 0.873 |
-| constant 62 GiB, bypass (no throttle) | 0.8 | 0.278 / 0.534 | 0.548 | 0.548 | 0.716 | 0 | 1,691 | |
+| observed timeline | 1.0 | 0.386 / 0.515 | 0.516 | 0.522 | 0.551 | 0 | 1,806 | 0.855 |
+| residual, backfill | 1.0 | 0.373 / 0.491 | 0.491 | 0.494 | 0.558 | 0 | 1,811 | 0.849 |
+| residual, backfill | **0.9** | 0.395 / 0.520 | 0.521 | 0.521 | 0.554 | 0 | 1,806 | **0.865** |
+| residual, backfill | 0.8 | 0.436 / 0.515 | 0.508 | 0.515 | 0.569 | 0 | 1,806 | 0.850 |
+| constant 62 GiB, bypass (no throttle) | 0.8 | 0.415 / 0.546 | 0.601 | 0.606 | 0.716 | 0 | 1,806 | |
 
 On the visible jobs alone every row stays under 0.9 x MemoryHigh in every minute, each checked through its own
-final completion (the residual fifo and bypass baselines run 80 and 85 minutes past the observed end; their
+final completion (the residual fifo and bypass baselines run 91 and 139 minutes past the observed end; their
 maxima are in the `.out.txt`). This is the spec's test computed in a model section 3 could not validate, so it is
 reported, not relied on. Holding each peak for the whole run overstates use (the held-peak sum of the visible jobs
-is a median 1.42 x the slice's real `sliceAnon`), but the visible jobs are not all the jobs: in 488 of 1,668
+is a median 1.45 x the slice's real `sliceAnon`), but the visible jobs are not all the jobs: in 501 of 1,777
 minutes `sliceAnon` was higher (by up to 20.3 GiB) because the hidden jobs are missing.
 
 The last column adds each minute's real `sliceAnon` (every job, hidden ones included) to the replayed level of
-that minute. `sliceAnon` already holds the visible jobs' real use, so this double counts them: an upper bound in
-this model, not an estimate. It peaks at **0.85 x MemoryHigh** (0.849 at 0.9), under the 0.9 line but with
-little room, and slightly lower at 0.9 than at 1.0 because the discount moves which jobs overlap.
+that minute. A minute's `sliceAnon` is the largest of the reading held at its start (the last throttle line
+before it) and every line inside it, as the replayed level also carries the level held at the minute's start, so
+no instant of a covered minute is understated. `sliceAnon` already holds the visible jobs' real use, so this
+double counts them: an upper bound in this model, over the minutes the throttle lines cover, not an estimate. It
+peaks at **0.865 x MemoryHigh at 0.9** (0.849 to 0.855 in the other rows), under the 0.9 line but with little
+room. The previous round's column took only the lines inside a minute when it had one, dropping the held reading,
+which could understate (a review counterexample: 50 GiB held from 1 s and 0 from 90 s, with the replay at 10 GiB
+over 60 to 80 s, read 50 GiB while 60 GiB was reached; now a selftest). On this copy the correction moves the
+0.9 row from 0.854 to 0.865 and the 0.8 row from 0.848 to 0.850; the 1.0 rows do not move.
 
 Unknown peaks: none in this copy (every row has `peak_rss`), so the tables exclude nothing. When a copy has some,
 the `.out.txt` prints the minute maxima with each unknown peak bounded at its pin.
 
 ## 7. Coverage limits, and what the replay ignores
 
-- **29 hours only**: one weekday morning to the next afternoon; the eligible-population trigger has 10.6 hours.
+- **31 hours only**: one weekday morning to the next afternoon; the eligible-population trigger has 12.5 hours.
   A heavier day, a week of release work, or a different mix of peer sessions is not in it.
 - **5 daemon starts** (section 1): one opens the window, 4 fall inside it. Each re-declares the surviving leases
   at their full pin, writes no grant line for them, and resets nothing in the store; the replay does not model
@@ -358,13 +369,13 @@ the `.out.txt` prints the minute maxima with each unknown peak bounded at its pi
   (AIRA-264 records only OOM or success), killed and cancelled runs (a job cancelled while queued is absent, both
   as a competitor and as a wait), jobs still running at the copy, and long-lived services. The calibrated model
   holds their booking fixed; the direction of that error is unknown.
-- **Evicted rows** (retention keeps 20 rows per exact signature; measured, 5.2% of the rows gone 3.8 h later,
-  about 1.4% an hour, section 1): their runs are missing, and so are their bookings, which also sit in the
+- **Evicted rows** (retention keeps 20 rows per exact signature; measured, 6.2% of the rows gone 5.7 h later,
+  about 1.1% an hour, section 1): their runs are missing, and so are their bookings, which also sit in the
   residual. In the trigger population they turn grants rowless, and the watch's weekly share has the same bias.
 - **OOM rows have censored peaks** (the peak is the cap, not the need). They count as "above charge", and their
   run length is the time until the kill.
 - **Cache-inclusive peaks** (AIRA-318): `memory.peak` includes page cache. It overstates real need and inflates
-  the above-charge rate (47 pinned rows sit exactly at their pin).
+  the above-charge rate (52 non-OOM pinned rows sit exactly at their pin).
 - **The ceiling varied** (38.0 to 51.2 GiB effective, throttled in every minute). The replay follows the
   journal's per-minute series. A day with a higher ceiling (up to the machine term, about 62.5 GiB) moves the
   binding limit from host memory to the slice's MemoryHigh and MemoryMax (6.1).
@@ -372,7 +383,7 @@ the `.out.txt` prints the minute maxima with each unknown peak bounded at its pi
   cycle, `--front` pushes, the priority tiers and the exclusive gate. The best fit is backfill, which is
   optimistic about who passes a blocked head; the policies nearer the daemon's head protection do not calibrate.
 - **Minute sampling of the residual** delays jobs that started at once (section 3); per-job timing is off by a
-  median of 36 s.
+  median of 42 s.
 - **Arrival is client-measured** (`wait_ms` includes the dial and reconnect gaps), and run length is taken as
   independent of the start time (no contention slow-down).
 - **CPU**: 32 slots, visible jobs only. Hidden workers also take slots, so CPU may bind before RAM does.
@@ -416,13 +427,15 @@ the `.out.txt` prints the minute maxima with each unknown peak bounded at its pi
   ceiling until releases bring it back.
 - **C4. A named operator reads the watcher, and acts.** The watcher is read-only: it rolls nothing back. The
   session driving the trial (or the owner) reads it at least every hour while any session is active, and first
-  thing at each session start for the unattended hours since. **Read `met.log` first:**
-  `cat ~/tmp/aira-324-watch/met.log`. Every run with a met trigger appends a line there with its time, and nothing
-  truncates it, so an event at 02:00 is still there at 08:00 although the 10-minute journal window has moved on;
-  the file does not exist until something is met, and any line newer than the last read means act. Then read the
-  whole log since the last read, not a fixed tail (the cron lines write 13 lines an hour, so a 12-line tail misses
-  one): `grep -v '"met": \[\]' ~/tmp/aira-324-watch/watch.log | tail -n 20` prints the latest lines with a met
-  trigger. On any `met` entry: roll back at once (section 9 step 5), then file a finding with the watch line.
+  thing at each session start for the unattended hours since. The read is
+  `docs/dev/aira-324-enforce-watch.sh --read`: it prints every complete line written since the previous `--read`,
+  **`met.log` first**, then `watch.log`, and moves its two byte cursors (so it is one operator's read: a second
+  reader would consume the first one's lines). Every run with a met trigger appends a line to `met.log` with its
+  time, and nothing truncates it, so an event at 02:00 is still printed at 08:00 although the 10-minute journal
+  window has moved on; any `met.log` line means act. The `watch.log` part is the whole log since the last read,
+  never a fixed tail and never filtered: the runs with an empty `met` are kept, because their `unevaluated` list
+  is the evidence for the persistent-`unevaluated` rule below. On any `met` entry: roll back at once (section 9
+  step 5), then file a finding with the watch line.
   Between reads nobody acts, so a met trigger can stand for up to the read interval (overnight, the whole night). For the 5%
   trigger: it is `unevaluated` whenever enough grants have no row, the normal case (one in five today). If it
   stays `unevaluated` for the week while `share_one_to_one_estimate` is over 5%, treat that as met: the owner's
@@ -475,9 +488,10 @@ directory under `~/tmp/aira-324-watch/` (made by `mktemp`, removed on exit, so c
 file), never touches the live file, and adds every pinned row it sees (start, pin, peak with -1 for unknown, oom,
 run length; no command) to `rows.tsv`, so a row the 20-row retention evicts later still counts. The line has two
 lists: `met` (act: C4) and `unevaluated` (each with its reason). A failed read is `unevaluated`, never 0. Every
-`met` is also appended to `met.log` with its time, the latch the operator reads first (C4). The hourly read, in
-this order: `cat ~/tmp/aira-324-watch/met.log` (any line newer than the last read: act), then the whole log since
-the last read, never a fixed tail, `grep -v '"met": \[\]' ~/tmp/aira-324-watch/watch.log | tail -n 20`.
+`met` is also appended to `met.log` with its time, the latch the operator reads first (C4). The hourly read is
+`docs/dev/aira-324-enforce-watch.sh --read`: every complete line since the previous `--read`, `met.log` (any line:
+act) and then all of `watch.log`, the runs with an empty `met` and their `unevaluated` reasons included; a line
+still being written waits for the next read.
 
 | Trigger | Watch field | Threshold |
 |---|---|---|
@@ -510,10 +524,10 @@ TMPDIR=~/tmp/t aira confine --memory-reserve 128M -- python3 -I docs/dev/aira-32
 python3 -I docs/dev/aira-324-enforce-gate-replay.py --selftest
 python3 -I docs/dev/aira-324-enforce-watch-test.py
 TMPDIR=~/tmp/t aira confine --memory-reserve 128M -- python3 -I docs/dev/aira-324-enforce-gate-mutations.py
-# the eviction measurement (section 1): an earlier copy (here the previous round's, moved aside to
-# ~/tmp/aira-324-earlier-state.db) and one taken later (here 3.8 h), both read-only.
+# the eviction measurement (section 1): an earlier copy (here one taken at 10:22 UTC, moved aside to
+# ~/tmp/aira-324-earlier-state.db) and one taken later (here this report's, 16:01 UTC), both read-only.
 # Prints: earlier-copy rows | of them gone later | later rows started before the earlier copy's last start
-# that it lacked (still running then) | pinned rows gone. Measured: 5332|277|11|85 (pinned rows 3,146)
+# that it lacked (still running then) | pinned rows gone. Measured: 5332|332|8|99 (pinned rows 3,146)
 cp ~/.local/state/aira/state.db ~/tmp/aira-324-later.db; cp ~/.local/state/aira/state.db-wal ~/tmp/aira-324-later.db-wal
 F="kind='confine' and wall_ms is not null and wait_ms is not null and started_at_ms is not null and repo is not null"
 K="started_at_ms, budget, coalesce(peak_rss, -1), oom, wall_ms"; old=~/tmp/aira-324-earlier-state.db
@@ -528,10 +542,10 @@ sqlite3 -readonly ~/tmp/aira-324-later.db "attach '$old' as o; select
 
 | Check | Result |
 |---|---|
-| Replay on a fresh copy (5,832 rows, copied 2026-11-16 14:11 UTC; window 2026-11-15 08:56 to 2026-11-16 14:10 UTC) | exit 0, peak RSS 53 MiB, about 9 s wall; output committed as `aira-324-enforce-gate-replay.out.txt`; sections 1 to 6 quote it |
-| `--selftest` | exit 0, 61 checks (every review counterexample among them, including the NULL-peak interval and the 61 GiB throttled ceiling) |
-| `aira-324-enforce-watch-test.py` (fakes only: a tiny store, a fake cgroup and meminfo, back-dated samples, shims for `journalctl`, `systemctl`, `aira`; a cron-like environment) | exit 0, 81 checks across 30 cases: the 5% trigger (9 cases, a NULL peak among them), slice-level oom, high and pressure (positive, negative, reset, gap, the left-edge reading), MemAvailable, the watchdog, systemd-oomd, the factor, the `met.log` latch, the baseline guard, no scratch left behind |
-| `aira-324-enforce-gate-mutations.py` (56 replay and 32 watch mutations, each on a copy under `~/tmp`) | exit 0: 88 red, 0 survived. Disabling any one trigger, the latch or the baseline guard turns the watch test red. One equivalent mutant is listed in the script |
+| Replay on a fresh copy (6,144 rows, copied 2026-11-16 16:01 UTC; window 2026-11-15 08:56 to 2026-11-16 16:01 UTC) | exit 0, peak RSS 61 MiB, about 13 s wall; output committed as `aira-324-enforce-gate-replay.out.txt`; sections 1 to 6 quote it |
+| `--selftest` | exit 0, 62 checks (every review counterexample among them, including the NULL-peak interval, the 61 GiB throttled ceiling and the held `sliceAnon` reading) |
+| `aira-324-enforce-watch-test.py` (fakes only: a tiny store, a fake cgroup and meminfo, back-dated samples, shims for `journalctl`, `systemctl`, `aira`; a cron-like environment) | exit 0, 88 checks across 31 cases plus a `--read` sequence, on a frozen clock: the 5% trigger (9 cases, a NULL peak among them), slice-level oom, high and pressure (positive, negative, reset, gap, the left-edge reading 30 s outside the window and its control), MemAvailable, the watchdog, systemd-oomd, the factor, the `met.log` latch, `--read` (everything since the last read, met.log first, empty-`met` lines kept, a partial line held back, a replaced log), the baseline guard, no scratch left behind |
+| `aira-324-enforce-gate-mutations.py` (57 replay and 37 watch mutations, each on a copy under `~/tmp`) | exit 0: 94 red, 0 survived. Disabling any one trigger, the latch or the baseline guard turns the watch test red. One equivalent mutant is listed in the script |
 | `bash -n` and `shellcheck` on the watch | exit 0 and 0 |
 
 A fresh copy taken later has more rows, so its numbers move a little.

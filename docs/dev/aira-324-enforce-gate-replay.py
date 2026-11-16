@@ -454,23 +454,24 @@ def busiest_anon_hour(ceil_series, lo, hi, min_lines=30):
 
 def plus_anon(st, ceil_series, lo, hi):
     """max over minutes of (the timeline's minute max + the slice's real sliceAnon in that
-    minute: the largest throttle line in it, else the last one before it). sliceAnon already
-    holds the visible jobs' real use, so this double counts them: an upper bound on 'the
-    visible replay plus everything the replay cannot see'. Minutes before the first line are
-    skipped."""
+    minute). A minute's sliceAnon is the largest of the reading held at its start (the last
+    throttle line before it, which holds until the next line) and every line inside it, as
+    minute_max carries the level held at the minute's start: max of a sum <= sum of the
+    maxima, so no instant of the minute is understated. sliceAnon already holds the visible
+    jobs' real use, so this double counts them: an upper bound on 'the visible replay plus
+    everything the replay cannot see', over the minutes the lines cover. Minutes before the
+    first line are skipped, and in the minute of the first line only the lines inside it count
+    (nothing is known before it)."""
     mm = minute_max(st, lo, hi)
     ts = [c[0] for c in ceil_series]
     best = 0
     for m, lvl in mm.items():
         a = bisect.bisect_left(ts, m)
         b = bisect.bisect_left(ts, m + 60000)
-        if b > a:
-            anon = max(c[2] for c in ceil_series[a:b])
-        elif a > 0:
-            anon = ceil_series[a - 1][2]
-        else:
+        vals = [c[2] for c in ceil_series[max(a - 1, 0):b]]   # a - 1: the reading held at m
+        if not vals:
             continue
-        best = max(best, lvl + anon)
+        best = max(best, lvl + max(vals))
     return best
 
 
@@ -1239,6 +1240,13 @@ def selftest():
     pa = [Job(0, 0, 0, 60000, 3 * G, 4 * G, "x", 0), Job(1, 60000, 60000, 60000, 4 * G, 4 * G, "x", 0)]
     check("visible + sliceAnon: the last line's anon is held into a minute without one",
           plus_anon(step(pa, {0: 0, 1: 60000}, lambda j: j.peak), [(1000, 50 * G, 5 * G)], 0, 120000), 9 * G)
+    # review round 7: anon 50 GiB from 1 s, 0 from 90 s; the replay holds 10 GiB over 60-80 s.
+    # Over 60-90 s the held 50 GiB and the replay's 10 GiB coexist: 60 GiB, over SAFE (54 GiB).
+    # Taking only minute 1's own line (0) would report 50 GiB, under SAFE.
+    pc = [Job(0, 60000, 60000, 20000, 10 * G, 10 * G, "x", 0)]
+    got = plus_anon(step(pc, {0: 60000}, lambda j: j.peak), [(1000, 50 * G, 50 * G), (90000, 50 * G, 0)], 0, 120000)
+    check("visible + sliceAnon: a minute with a line still counts the reading held at its start",
+          (got, got > SAFE), (60 * G, True))
     check("queued means an observed wait of at least 1 s",
           (queued(Job(0, 0, 999, 1, 0, G, "x", 0)), queued(Job(0, 0, 1000, 1, 0, G, "x", 0))), (False, True))
     print("selftest:", "PASS" if ok else "FAIL")

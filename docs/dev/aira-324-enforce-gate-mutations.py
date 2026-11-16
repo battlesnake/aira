@@ -73,8 +73,11 @@ R = [
      "return min(ok, key=lambda h: sum(hours[h]) / len(hours[h])) if ok else None"),
     ("fixed busiest hour ignored", "    if busiest is None:\n        busiest = max(whole", "    if True:\n        busiest = max(whole"),
     ("unknown-peak bound ignored", "st = step(jobs, start, value or (lambda j: j.peak))", "st = step(jobs, start, lambda j: j.peak)"),
-    ("visible + slice: no held anon", "        elif a > 0:\n            anon = ceil_series[a - 1][2]",
-     "        elif False:\n            anon = 0"),
+    ("visible + slice: no held anon", "vals = [c[2] for c in ceil_series[max(a - 1, 0):b]]",
+     "vals = [c[2] for c in ceil_series[a:b]]"),
+    # round 7: a minute with a line must still count the reading held at its start
+    ("visible + slice: held anon only in a minute without a line", "vals = [c[2] for c in ceil_series[max(a - 1, 0):b]]",
+     "vals = [c[2] for c in (ceil_series[a:b] or ceil_series[max(a - 1, 0):a])]"),
     ("later-than-observed split ignores queued", "_, olq = moved(jobs, s, obs, queued)", "_, olq = moved(jobs, s, obs)"),
     ("daemon starts not counted", "            if START_RE.search(line):\n                starts.append(ms)", "            pass"),
     # earlier rounds
@@ -136,6 +139,13 @@ W = [
     ("baseline ignores this run's enforce lines", 'if any("pin-charge enforce:" in l for l in f) and not os.path.exists(enforce_flag):',
      "if False:"),
     ("scratch left behind", """trap 'rm -rf "$scratch"' EXIT""", ":"),
+    # round 7: --read, the operator's read since the last read
+    ("--read cursor never moves", '    os.replace(cur + ".tmp", cur)', "    pass"),
+    ("--read prints a partial line", '    chunk = chunk[:chunk.rfind(b"\\n") + 1]', "    chunk = chunk"),
+    ("--read drops the empty-met lines", "    for l in lines:\n        print(l)",
+     "    for l in lines:\n        if '\"met\": []' not in l:\n            print(l)"),
+    ("--read keeps a stale cursor past a replaced log", "            if o > n:", "            if False:"),
+    ("--read watch.log before met.log", 'for name in ("met.log", "watch.log"):', 'for name in ("watch.log", "met.log"):'),
 ]
 
 
