@@ -268,7 +268,9 @@ if isinstance(line["d_oom_local"], int) and line["d_oom_local"] > 0:
     trig.append("slice-level oom (memory.events.local oom rose; victim and its peak/pin unattributed)")
 allrows = rows + [(now, cur, a10, ceiling)]
 # C4 (report section 8): the ledger ceiling above 57.6 GiB for a whole, continuously sampled hour.
-hour = [r for r in allrows if r[0] >= now - 3600]
+# the sample at or before the hour's start counts too: the reading held until the next one
+start = at_or_before(allrows, now - 3600)
+hour = ([start] if start else []) + [r for r in allrows if r[0] > now - 3600]
 if not continuous(allrows, now - 3600, now) or any(r[3] < 0 for r in hour):
     trig.append("C4 ceiling: unevaluated (samples or ceiling readings do not cover the last hour)")
 elif all(r[3] > C4_CEILING for r in hour):
