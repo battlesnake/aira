@@ -405,7 +405,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 			if cancelErr != nil {
 				return confineManagementError(cancelErr)
 			}
-			logConfineKill(callerOwner, steal, cancelled, path)
+			logConfineKill(callerOwner, steal, cancelled, path, true)
 			return core.Response{OK: true, Code: "OK", Data: cancelled}
 		}
 		if s.shimMode() {
@@ -427,15 +427,22 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 					return confineManagementError(fmt.Errorf("%s: selector %q names %s, which is admitted but has no running scope to kill; retry", runner.CodeConfineNotLaunched, selector, scopeID))
 				}
 			}
+			// AIRA-339: cgroup.kill was written (SIGKILL delivered) but emptiness
+			// was not confirmed in time. That kill happened, so it gets an audit
+			// line, marked confirmed=false; the reply and the retained reservation
+			// are unchanged.
+			if errors.Is(killErr, runner.ErrConfineKillDelivered) {
+				logConfineKill(callerOwner, steal, result, path, false)
+			}
 			return confineManagementError(killErr)
 		}
 		// AIRA-70 finding #2: a cross-session `aira confine --kill` used to kill
 		// a job with no record anywhere of who did it -- this file had no log
-		// call at all. Reached only past KillConfine's error return, so it is
-		// written only for a kill the daemon confirmed: a refused (owner
-		// unverified), not-launched, or unconfirmed kill kills nothing and must
-		// not leave a line claiming otherwise.
-		logConfineKill(callerOwner, steal, result, path)
+		// call at all. Here the kill is confirmed. A refused (owner unverified),
+		// not-launched, or failed-cgroup.kill-write kill killed nothing and leaves
+		// no line; the one unconfirmed kill that DID deliver SIGKILL is logged
+		// above with confirmed=false.
+		logConfineKill(callerOwner, steal, result, path, true)
 		// This is the daemon kill-drop release. The admit connection's later
 		// close reaches the same state-guarded releaseAdmitWaiter path.
 		s.releaseActiveConfine(path, result.ScopeID)

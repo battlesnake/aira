@@ -38,6 +38,10 @@ type topDialogDispatcher struct {
 	sent  []core.Request
 	// name and owner override the job's (alpha, session-a; dialogTestJob).
 	name, owner string
+	// caller, when set, is the session the runtime runs as instead of the job's
+	// owner; queued is listed after the live job, still waiting (AIRA-271).
+	caller string
+	queued []runner.ConfineRecord
 }
 
 // job is the served job's scope id, name and owner.
@@ -57,9 +61,11 @@ func (d *topDialogDispatcher) Dispatch(ctx context.Context, _ daemon.WorktreeSco
 		scope, name, owner := d.job()
 		record := topTestRecord(scope, name, 8*gib, gib)
 		record.Owner = owner
-		data, _ := json.Marshal(topTestListing(topTestFrame(), record))
+		listing := topTestListing(topTestFrame(), record)
+		listing.Queued = d.queued
+		data, _ := json.Marshal(listing)
 		return core.Response{OK: true, Code: "OK", RawData: data}
-	case "confine-resize":
+	case "confine-resize", "confine-kill":
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		d.sent = append(d.sent, clonePaletteRequest(request))
@@ -83,6 +89,9 @@ func (d *topDialogDispatcher) writes() []core.Request {
 func startTopDialogRuntime(t *testing.T, dispatcher *topDialogDispatcher, width, height int) (*tuiRuntime, tcell.SimulationScreen, *keyTracker) {
 	t.Helper()
 	scope, _, owner := dispatcher.job()
+	if dispatcher.caller != "" {
+		owner = dispatcher.caller
+	}
 	t.Setenv("AIRA_CONFINE_OWNER", owner)
 	ctx, cancel := context.WithCancel(context.Background())
 	screen := tcell.NewSimulationScreen("UTF-8")

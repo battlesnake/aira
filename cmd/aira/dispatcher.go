@@ -520,15 +520,18 @@ func (d *daemonDispatcher) TUILeaseToken(scope daemon.WorktreeScope, ticketID st
 func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.WorktreeScope, request core.Request) paletteDispatchAttempt {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
-	if canonical == "confine-front" || canonical == "confine-resize" {
-		// AIRA-309. `aira top`'s `f` key (topFrontConfirm) and AIRA-312's `e` key
-		// (topResizeConfirm) are the confirmed row actions that are client-routed:
+	if canonical == "confine-front" || canonical == "confine-resize" || canonical == "confine-kill" {
+		// AIRA-309. `aira top`'s `f` key (topFrontConfirm), AIRA-312's `e` key
+		// (topResizeConfirm) and AIRA-271's KK (topKillConfirm) are the confirmed
+		// row actions that are client-routed:
 		// both verbs are project-less confine management and go through the same
 		// management exchange as the CLI's `confine --front` / `--resize`
 		// (dispatchConfineManagementOnce), never through a project store. The
 		// verbs are named exactly, so no other client-routed verb is admitted by
 		// this arm. Neither has a daemon-down fallback (the queue and the ledger
-		// exist only in the daemon), so it is one exchange, classified exactly like
+		// exist only in the daemon; the CLI's daemon-down kill fallback, a local
+		// cgroup.kill, is deliberately not reached from here: the TUI says the
+		// request was not sent), so it is one exchange, classified exactly like
 		// the routed path below: a transport failure keeps its send evidence, and
 		// only a daemon-answered error code is a rejection.
 		owner, _ := request.Args["owner"].(string)
@@ -537,7 +540,9 @@ func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.Wor
 		}
 		frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
 		attempt := paletteAttemptFrom(d.doExchange(ctx, frame))
-		if attempt.Err == nil {
+		// confine-kill predates every daemon this client can talk to, so the
+		// old-daemon hint (which names --front or --resize) is not for it.
+		if attempt.Err == nil && canonical != "confine-kill" {
 			attempt.Response = withOldDaemonManagementHint(canonical, attempt.Response)
 		}
 		return attempt

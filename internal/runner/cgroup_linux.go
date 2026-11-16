@@ -385,8 +385,20 @@ func (s *linuxScope) Kill() error {
 	if _, err := f.WriteString("1"); err != nil {
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return cgroupKillSyncError{err: err}
+	}
+	return nil
 }
+
+// cgroupKillSyncError is a Kill failure that came AFTER the cgroup.kill write
+// succeeded. The kernel performs the kill inside that write, so SIGKILL is
+// already delivered (AIRA-339); confine --kill uses the type to say so. Its
+// text and unwrap chain are the sync error's, so every other caller is unchanged.
+type cgroupKillSyncError struct{ err error }
+
+func (e cgroupKillSyncError) Error() string { return e.err.Error() }
+func (e cgroupKillSyncError) Unwrap() error { return e.err }
 func (s *linuxScope) Remove() error {
 	if empty, err := s.Empty(); err != nil {
 		return err
