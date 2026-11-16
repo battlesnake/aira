@@ -695,6 +695,10 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	request.ResourceSignature = signature
 	request.MemoryReserve = reserve
 	request.MemoryReservePinned = pinned
+	// AIRA-324. Decided here, from the same provenance the cap branch below uses,
+	// and transcribed onto the admit request by admitConfine.
+	request.discountable = confineReserveDiscountable(request, declaredReserve, declaredReserveBytes, reserve, pinned,
+		containerPlan.Detected() && !containerPlan.NestsInJobScope())
 	// AIRA-22: a DETACHED supervisor mints its own scope id before calling here,
 	// because the pid embedded in the cgroup directory name is what
 	// `confine --kill <pid>`, `--list`'s SupervisorPID column, and the orphan
@@ -831,6 +835,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		resolvedReserve = admission.reserve
 	}
 	result.Status.ReserveBytes = resolvedReserve
+	// AIRA-324. A discounted grant's booking, only when the grant echoed a charge
+	// below the reserve it granted (validRunnerAdmitCharge has already refused a
+	// charge on a request that did not ask for one).
+	if admission.charge > 0 && admission.charge < resolvedReserve {
+		result.Status.BookedBytes = admission.charge
+	}
 	result.Status.ReserveBasis = admission.basis
 	result.Status.AdmissionState = admission.state
 	result.Status.AdmissionWaitedMS = admission.waitedMS
@@ -1108,8 +1118,8 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// default rather than anything the caller said. A declared reserve too small
 	// to be a real cap was refused up front, so there is no silently-uncapped
 	// case left for this branch to hide.
-	if scopeMemoryMax <= 0 && declaredReserve {
-		scopeMemoryMax = declaredReserveBytes
+	if capBytes, ok := confineOperatorReserveCap(scopeMemoryMax, declaredReserve, declaredReserveBytes); ok {
+		scopeMemoryMax = capBytes
 		capSource = ConfineCapSourceMemoryReserve
 	}
 	// An UNPINNED reserve stays restricted to an ADMITTED (accounted) daemon
@@ -1973,6 +1983,46 @@ func confineSuggestedReserve(scopeMemoryMax int64, peakRSS *int64) int64 {
 	return escalated
 }
 
+// confineOperatorReserveCap is the ONE predicate for "the scope cap is the
+// operator's own --memory-reserve" (cap-source operator:--memory-reserve): no
+// --memory-max, and a declared, usable reserve. The cap branch and
+// confineReserveDiscountable both call it, so the discount can never be asked for
+// a job whose cap came from anywhere else.
+func confineOperatorReserveCap(scopeMemoryMax int64, declaredReserve bool, declaredReserveBytes int64) (int64, bool) {
+	if scopeMemoryMax > 0 || !declaredReserve || declaredReserveBytes <= 0 {
+		return 0, false
+	}
+	return declaredReserveBytes, true
+}
+
+// confineReserveDiscountable decides the AIRA-324 `discountable` admit field:
+// the job's cap is the operator's --memory-reserve AND that same number is the
+// reserve the ledger is asked to book, and it is neither a --delegate-ram parent,
+// an --exclusive job, nor a job whose container runs outside its scope (spec
+// section 5.2, "who is discounted"). Only called on the real-cgroup path:
+// ci-shim never discounts.
+//
+// The reserve == cap conjunct is what makes the trailer's claim true (the grant
+// echoes the reserve booked against, and the cap written is the pin). With
+// today's ResolveConfineReserve and ContainerPlan.ResolveReserve a declared pin is
+// never changed, so the conjunct cannot fail; it is kept so a future resolution
+// that moved the reserve cannot silently discount a job whose cap is a different
+// number. A container outside the scope (docker: the container lives under the
+// docker daemon, not in this slice) disqualifies the job: its workload is not
+// under the cap, and the slice's physical reading the fit rule uses cannot see it.
+// A pin inherited only from AIRA_CONFINE_RESERVE (no --memory-reserve of the job's
+// own) disqualifies it too: the spec discounts a pin "the operator gave with
+// --memory-reserve", and the variable is shared by every nested confine, so it is
+// not this job's operator choice (the AIRA-310 hint excludes it for the same
+// reason). An explicit --memory-reserve beside the variable wins and is the job's.
+func confineReserveDiscountable(request ConfineRequest, declaredReserve bool, declaredReserveBytes, reserve int64, pinned, containerOutsideScope bool) bool {
+	capBytes, ok := confineOperatorReserveCap(request.ScopeMemoryMax, declaredReserve, declaredReserveBytes)
+	if !ok || !pinned || capBytes != reserve || containerOutsideScope {
+		return false
+	}
+	return !request.DelegateRAM && !request.Exclusive && !request.MemoryReserveFromEnv
+}
+
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {
 	maxWait := request.AdmissionMaxWait
 	if maxWait <= 0 {
@@ -1997,6 +2047,7 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		ConfineOwner:         request.Owner,
 		VRAMBytes:            request.VRAMBytes,    // AIRA-268
 		HighPriority:         request.HighPriority, // AIRA-340
+		Discountable:         request.discountable, // AIRA-324
 		Exclusive:            request.Exclusive,
 		// AIRA-185. TRANSCRIBED, never resolved here: admitThroughDaemon puts it on
 		// the wire only alongside `exclusive`, which is the one place that guard

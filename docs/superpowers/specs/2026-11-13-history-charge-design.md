@@ -1109,3 +1109,57 @@ therefore stands, and T4b pins the production seams. Amendment 7: the cut machin
 are deleted above, and no count is carried forward. Every mutation named in section 8 and in
 the amendments is listed in `docs/dev/aira-323-mutation-check.py`, which applies each one, runs
 its tests and fails if any survives; the build PR records that script's result.
+
+Build record (AIRA-324 build, 2026-11-15). Decisions the build took where section 5.2 left a
+choice, each checked in the build review:
+
+1. **Wire: no protocol bump.** `discountable` is an optional admit-request field (sent only when
+   true) and `charge` an optional grant field (sent only when below the pin), on AIRA-340's
+   pattern. Evidence: `docs/dev/aira-324-old-daemon-probe.py` sent the minimal (8-field) and the
+   largest (13-field) discountable frame to the live proto-15 daemon at revision 97f3440f; both
+   were refused with exactly `E_DAEMON_PROTOCOL: unexpected admit field "discountable"`, before any
+   enqueue. The client matches that text only when it sent the field and re-asks once without it,
+   silently (the job is then booked at its full pin). The daemon's count guard is now 16 fields.
+2. **Modes.** The daemon's raw default is `off` (a daemon started outside the unit, and every
+   test, is unchanged); `aira install` renders `observe` (`--pin-charge off|observe|enforce`,
+   `--pin-charge-factor F`, F in [0.5, 1] with at most two decimals, default 0.8), preserved
+   across re-installs like the other install-record modes. ci-shim forces `off`. Observe books
+   every waiter at its reserve (`pinChargeFor` is the one place the mode is read for a booking),
+   and logs per discountable grant `pin-charge observe: scope= pin= charged= would-charge= factor=
+   physical-free= physical-fit=`. Enforce is built and tested; nothing turns it on.
+3. **Head eligibility** stays on the pin alone: `charge <= pin`, so the table's "charge AND pin
+   feasible on an empty slice" is the pin test; `admitCouldFitEmptyLocked` is unchanged.
+4. **`--resize`** now writes the booking (`charge`) and keeps the granted reserve (the pin):
+   the stated cap and the booking are no longer one field. A re-anchoring SET re-derives the
+   grant-time booking from the waiter's own eligibility, which drops a resize exactly as before.
+5. **Restart.** An established (re-declared after a restart) lease is never discountable: the
+   ARDR record carries no eligibility, so it books its full pin. The keeper re-declares
+   `grant.Reserve` (the pin), never the charge; the client refuses a grant whose `charge` it did
+   not ask for or that is not below the reserve.
+6. **Faces.** The trailer adds ` booked=<X>` only for a discounted job (reserve= stays the pin);
+   `--summary-file` adds `booked_bytes` and `cap_bytes` (or `unevaluated`) only then; `confine
+   --list` adds `pin_bytes` only for a lease booked below its reserve (reserve_bytes stays the
+   booking); `confine-dump`'s waiter row adds `pin_bytes` the same way; `aira top` renders
+   `<booking> (pin <pin>)` in that case. A grant frame carries `charge` only for a discountable
+   waiter (a resized lease's client never asked for one). A queued row's request
+   stays the pin (deferred: showing a queued waiter's booking).
+7. **The guard.** `TestPinChargeReserveReadsAreAllowListed` scans the daemon's production files
+   for every `.reserve` and `.charge` selector, keyed by enclosing function, with exact counts.
+8. **Deferred.** The `--oom-steer-mode` install flag (enforce's precondition: switch OOM steering
+   on before enforce; AIRA-347 step 0 or a follow-up carries it); the counterfactual replay
+   gate (section 6); a per-pass decrement of the physical free figure, so several discounted
+   grants in one pass each see the reading taken before the others (bounded by the pass, and
+   the next pass's reading catches up).
+
+9. **Eligibility, review round 3.** A pin inherited only from `AIRA_CONFINE_RESERVE` (no
+   `--memory-reserve` of the job's own) is not discountable: it is not a pin "the operator gave with
+   `--memory-reserve`", and every nested confine shares the variable (the AIRA-310 hint excludes it
+   for the same reason). An explicit flag beside the variable is the job's own and stays eligible.
+10. **Generated guidance.** The skill no longer says a whole-job `--memory-reserve` scope "never
+    over-commits a neighbour" unconditionally: under enforce the caps can together exceed the slice's
+    limit, so a slice-level OOM can kill a neighbour under its own pin (the retired invariant above).
+    The `--resize` caveat now separates the two re-declares: a reconnect restores the grant-time
+    booking (the discounted one under enforce), a restart books the full pin.
+
+Every mutation named in section 8 is listed in `docs/dev/aira-324-mutation-check.py`; the build PR
+records that script's result.

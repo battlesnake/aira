@@ -2238,13 +2238,15 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// AIRA-62 and were simply never described.) Omitting a mode flag PRESERVES
 		// whatever the installed unit declares rather than resetting it, which is
 		// why each description says so.
-		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--cpu-slots-per-core R] [--claude-usage-mod[=off]] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
+		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--pin-charge MODE] [--pin-charge-factor F] [--cpu-slots-per-core R] [--claude-usage-mod[=off]] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
 			stringSpec("memory_max", false, false, "aira.slice MemoryMax (<N>G)"),
 			boolSpec("ci", false, false, "Dedicated CI worker: size MemoryMax from a one-time MemAvailable snapshot with zero headroom; refuses with --memory-max"),
 			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
 			stringSpec("watchdog", false, false, "Memory-watchdog mode; omitted keeps the installed value", "off", "observe", "enforce"),
 			stringSpec("watchdog_interval", false, false, "Memory-watchdog sample interval in [1s,30s); omitted keeps the installed value"),
 			stringSpec("slice_ceiling", false, false, "Dynamic slice-ceiling mode; omitted keeps the installed value, or enforce when no installed value is readable", "off", "observe", "enforce"),
+			stringSpec("pin_charge", false, false, "Pinned-job charge discount (AIRA-324): enforce books a scope-backed --memory-reserve job at factor x its pin while its cap stays the pin, granting it only when the full pin fits real free memory; observe books the pin and logs what enforce would book; omitted keeps the installed value, or observe when no installed value is readable", "off", "observe", "enforce"),
+			stringSpec("pin_charge_factor", false, false, "Pinned-job charge factor, a decimal from 0.5 to 1 with at most two places (1 books the pin); omitted keeps the installed value, or 0.8"),
 			stringSpec("cpu_slots_per_core", false, false, "CPU admission slots per core R, 1-64 (default 2): the daemon's CPU ceiling is R x NumCPU; omitted keeps the recorded value; refused with --stage=start and --status"),
 			boolSpec("claude_usage_mod", false, false, "Opt in: install the fixed aira-usage Claude Code mod into ~/.claude/skills/aira-usage/ (--claude-usage-mod=off removes only the files aira wrote). The mod reports each turn's token counters and the session id (never prompts or file contents) to `aira spend add`; omitted leaves an installed mod untouched; refused with --stage=start and --status"),
 			boolSpec("allow_overcommit", false, false, "Acknowledge coexistence with capped whale.slice"),
@@ -2258,6 +2260,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "watchdog")
 			_ = stringArg(args, "watchdog_interval")
 			_ = stringArg(args, "slice_ceiling")
+			_ = stringArg(args, "pin_charge")
+			_ = stringArg(args, "pin_charge_factor")
 			_ = stringArg(args, "cpu_slots_per_core")
 			_ = boolArg(args, "claude_usage_mod")
 			_ = boolArg(args, "allow_overcommit")
@@ -2613,7 +2617,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// AIRA-312. The caveats live in the summary because this is the text every
 		// generated face publishes: ledger only, the cap is unchanged, the
 		// OOM-steering budget drops with the reserve, and any re-declare undoes it.
-		"confine-resize": {summary: "Lower one ownership-checked running confine job's admission reserve (reduce only, never below its live memory use). Ledger only: its memory.max cap is unchanged, so the ledger can under-count what it may still use by up to the reduction; its OOM-steering budget drops with it, so a later overrun makes it the preferred OOM victim; any re-declare (a daemon reconnect or restart) restores the original reserve", safety: SafetyExecute, example: []string{"job", "--memory-reserve", "2G"}},
+		"confine-resize": {summary: "Lower one ownership-checked running confine job's admission reserve (reduce only, never below its live memory use). Ledger only: its memory.max cap is unchanged, so the ledger can under-count what it may still use by up to the reduction; its OOM-steering budget drops with it, so a later overrun makes it the preferred OOM victim; any re-declare drops it: a daemon reconnect restores the booking the job was granted with (a pin-charge-discounted booking stays discounted), a daemon restart books the full pin", safety: SafetyExecute, example: []string{"job", "--memory-reserve", "2G"}},
 		"confine-status": {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		// AIRA-196. Unlike confine/confine-status these ARE included: reading a
 		// captured file and writing to a job's stdin socket both have honest

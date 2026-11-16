@@ -111,10 +111,14 @@ type ConfineDumpWaiterRow struct {
 	// carry it: admission rows are signature-keyed persisted history with no
 	// per-job name, and inventing one there would violate this file's
 	// no-fabrication rule.
-	Name         string `json:"name,omitempty"`
-	ScopeID      string `json:"scope_id,omitempty"`
-	Signature    string `json:"signature,omitempty"`
+	Name      string `json:"name,omitempty"`
+	ScopeID   string `json:"scope_id,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	// ReserveBytes is the ledger booking. PinBytes (AIRA-324) is the granted
+	// reserve, the scope cap, present only when the booking is below it (a
+	// discounted pin or a --resize); absent means the booking is the reserve.
 	ReserveBytes int64  `json:"reserve_bytes"`
+	PinBytes     *int64 `json:"pin_bytes,omitempty"`
 	CPUCores     int64  `json:"cpu_cores"`
 	State        string `json:"state"`
 	Outcome      string `json:"outcome"`

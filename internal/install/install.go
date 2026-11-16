@@ -54,6 +54,13 @@ const (
 	// flag yet).
 	defaultSliceCeilingMode = "enforce"
 	defaultWatchdogInterval = 2 * time.Second
+	// AIRA-324. The pinned-job charge discount ships INSTALLED as observe: it
+	// changes no admission decision (every job is booked at its reserve) and logs
+	// what enforce would book. Enforce is an explicit operator decision, gated on
+	// AIRA-323 data and a counterfactual replay (spec section 6), and nothing in
+	// install selects it. The daemon's own env default stays off.
+	defaultPinChargeMode   = "observe"
+	defaultPinChargeFactor = "0.8"
 
 	// minimumCeilingGiB is the MemoryMax floor validateSize enforces. Named so
 	// that --ci, which must refuse a snapshot it cannot express, refers to the
@@ -101,6 +108,8 @@ var (
 	installedWatchdogModeRE     = installedEnvironmentRE("AIRA_DAEMON_WATCHDOG_MODE")
 	installedWatchdogIntervalRE = installedEnvironmentRE("AIRA_DAEMON_WATCHDOG_INTERVAL")
 	installedSliceCeilingModeRE = installedEnvironmentRE("AIRA_DAEMON_SLICE_CEILING_MODE")
+	installedPinChargeModeRE    = installedEnvironmentRE("AIRA_DAEMON_PIN_CHARGE_MODE")
+	installedPinChargeFactorRE  = installedEnvironmentRE("AIRA_DAEMON_PIN_CHARGE_FACTOR")
 )
 
 const procInotifyMaxUserInstances = "/proc/sys/fs/inotify/max_user_instances"
@@ -142,6 +151,11 @@ type installOpts struct {
 	watchdog         string
 	watchdogInterval time.Duration
 	sliceCeiling     string
+	// AIRA-324. pinCharge is --pin-charge off|observe|enforce and pinChargeFactor
+	// --pin-charge-factor (a decimal such as 0.8). "" means NOT GIVEN: keep what the
+	// installed unit declares (the AIRA-106 rule), else the ship default.
+	pinCharge       string
+	pinChargeFactor string
 
 	// AIRA-120. --ci: size the slice's STATIC ceiling to MemAvailable as measured
 	// once, right now, with ZERO headroom subtracted, for a box dedicated entirely
@@ -201,6 +215,8 @@ type installOpts struct {
 func (o installOpts) watchdogGiven() bool         { return o.watchdog != "" }
 func (o installOpts) watchdogIntervalGiven() bool { return o.watchdogInterval != 0 }
 func (o installOpts) sliceCeilingGiven() bool     { return o.sliceCeiling != "" }
+func (o installOpts) pinChargeGiven() bool        { return o.pinCharge != "" }
+func (o installOpts) pinChargeFactorGiven() bool  { return o.pinChargeFactor != "" }
 
 type installTarget struct {
 	uid      int
@@ -452,7 +468,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				return opts, argumentInvalid("--stage must be build or start")
 			}
 			opts.stage = value
-		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core", "pin-charge", "pin-charge-factor":
 			if !hasValue {
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 					return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
@@ -464,6 +480,16 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
 			}
 			switch name {
+			case "pin-charge":
+				if !validDaemonMode(value) {
+					return opts, argumentInvalid("--pin-charge must be off, observe, or enforce")
+				}
+				opts.pinCharge = value
+			case "pin-charge-factor":
+				if _, ok := runner.ParsePinChargeFactor(value); !ok {
+					return opts, argumentInvalid(fmt.Sprintf("--pin-charge-factor must be a decimal from 0.5 to 1 with at most two places, such as 0.8, got %q", value))
+				}
+				opts.pinChargeFactor = strings.TrimSpace(value)
 			case "cpu-slots-per-core":
 				// AIRA-283. R < 1 would make every CPU request E_ADMIT_TOO_LARGE
 				// (invariant 3); 64 keeps R x NumCPU far below 2^31.
@@ -522,7 +548,8 @@ func parseInstallArgs(args []string) (installOpts, error) {
 	}
 	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || opts.ci ||
 		opts.ciValue != "" || opts.stage != "" ||
-		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"] || seen["cpu-slots-per-core"] || seen["claude-usage-mod"]) {
+		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"] || seen["cpu-slots-per-core"] || seen["claude-usage-mod"] ||
+		seen["pin-charge"] || seen["pin-charge-factor"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
 	}
 	// AIRA-283 (E8). The start stage never rewrites the install-mode record, so a
@@ -610,6 +637,18 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 			opts.sliceCeiling = mode
 		}
 	}
+	if !opts.pinChargeGiven() {
+		if mode := installedEnvironmentValue(installedDaemonUnit, installedPinChargeModeRE); validDaemonMode(mode) {
+			opts.pinCharge = mode
+		}
+	}
+	if !opts.pinChargeFactorGiven() {
+		if value := installedEnvironmentValue(installedDaemonUnit, installedPinChargeFactorRE); value != "" {
+			if _, ok := runner.ParsePinChargeFactor(value); ok {
+				opts.pinChargeFactor = value
+			}
+		}
+	}
 	if !opts.watchdogIntervalGiven() {
 		if value := installedEnvironmentValue(installedDaemonUnit, installedWatchdogIntervalRE); value != "" {
 			if interval, err := time.ParseDuration(value); err == nil && interval >= time.Second && interval < 30*time.Second {
@@ -649,6 +688,21 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	}
 	if !opts.watchdogIntervalGiven() {
 		opts.watchdogInterval = defaultWatchdogInterval
+	}
+	// AIRA-324: observe unless an operator chose otherwise (an unreadable or
+	// unrecognised installed line falls back here too: observe changes no
+	// admission decision, so it is the conservative answer).
+	if !opts.pinChargeGiven() {
+		opts.pinCharge = defaultPinChargeMode
+	}
+	if !opts.pinChargeFactorGiven() {
+		opts.pinChargeFactor = defaultPinChargeFactor
+	}
+	if !validDaemonMode(opts.pinCharge) {
+		return opts, errors.New("pin charge mode must be off, observe, or enforce")
+	}
+	if _, ok := runner.ParsePinChargeFactor(opts.pinChargeFactor); !ok {
+		return opts, errors.New("pin charge factor must be a decimal from 0.5 to 1 with at most two places")
 	}
 	if !validDaemonMode(opts.watchdog) {
 		return opts, errors.New("watchdog mode must be off, observe, or enforce")
@@ -833,6 +887,12 @@ func reexecRequestFor(executable string, target installTarget, opts installOpts)
 	if opts.sliceCeilingGiven() {
 		args = append(args, "--slice-ceiling", opts.sliceCeiling)
 	}
+	if opts.pinChargeGiven() {
+		args = append(args, "--pin-charge", opts.pinCharge)
+	}
+	if opts.pinChargeFactorGiven() {
+		args = append(args, "--pin-charge-factor", opts.pinChargeFactor)
+	}
 	if opts.allowOvercommit {
 		args = append(args, "--allow-overcommit")
 	}
@@ -1000,7 +1060,7 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	if err != nil {
 		return unavailable(fmt.Errorf("resolve daemon paths: %w", err))
 	}
-	daemonUnit, err := renderDaemonUnit(d.daemonUnit, executable, paths.StateHome, opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, d.daemonRuntimeDir)
+	daemonUnit, err := renderDaemonUnit(d.daemonUnit, executable, paths.StateHome, opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, opts.pinCharge, opts.pinChargeFactor, d.daemonRuntimeDir)
 	if err != nil {
 		return argumentInvalid(err.Error())
 	}
@@ -1076,10 +1136,11 @@ func runUserInstall(d installDeps, opts installOpts) error {
 			return argumentInvalid(resolveErr.Error())
 		}
 		if lockedOpts.watchdog != opts.watchdog || lockedOpts.sliceCeiling != opts.sliceCeiling ||
-			lockedOpts.watchdogInterval != opts.watchdogInterval {
+			lockedOpts.watchdogInterval != opts.watchdogInterval ||
+			lockedOpts.pinCharge != opts.pinCharge || lockedOpts.pinChargeFactor != opts.pinChargeFactor {
 			opts = lockedOpts
 			daemonUnit, err = renderDaemonUnit(d.daemonUnit, executable, paths.StateHome,
-				opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, d.daemonRuntimeDir)
+				opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, opts.pinCharge, opts.pinChargeFactor, d.daemonRuntimeDir)
 			if err != nil {
 				return argumentInvalid(err.Error())
 			}
@@ -1568,7 +1629,7 @@ func renderUnits(sliceUnit, anchorUnit, executable, maximum, high string, accept
 	return slice, anchor, nil
 }
 
-func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval time.Duration, sliceCeiling, runtimeDir string) (string, error) {
+func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval time.Duration, sliceCeiling, pinCharge, pinChargeFactor, runtimeDir string) (string, error) {
 	if strings.ContainsAny(unit, "\r\n/") || !strings.HasSuffix(unit, ".service") {
 		return "", errors.New("daemon unit name must end in .service and contain no path separators")
 	}
@@ -1583,6 +1644,12 @@ func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval tim
 	}
 	if interval < time.Second || interval >= 30*time.Second {
 		return "", errors.New("watchdog interval must be in [1s,30s)")
+	}
+	if !validDaemonMode(pinCharge) {
+		return "", errors.New("pin charge mode must be off, observe, or enforce")
+	}
+	if _, ok := runner.ParsePinChargeFactor(pinChargeFactor); !ok {
+		return "", errors.New("pin charge factor must be a decimal from 0.5 to 1 with at most two places")
 	}
 	template, err := assets.ReadFile("assets/aira-daemon.service.in")
 	if err != nil {
@@ -1600,6 +1667,7 @@ func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval tim
 		"@DAEMONUNIT@": unit, "@AIRABIN@": systemdExecPath(executable), "@STATEHOME@": systemdExecPath(stateHome),
 		"@WATCHDOG_MODE@": watchdog, "@WATCHDOG_INTERVAL@": interval.String(),
 		"@SLICE_CEILING_MODE@": sliceCeiling, "@RUNTIME_ENV@": runtimeEnvironment,
+		"@PIN_CHARGE_MODE@": pinCharge, "@PIN_CHARGE_FACTOR@": strings.TrimSpace(pinChargeFactor),
 	}
 	for placeholder, value := range replacements {
 		unitContent = strings.ReplaceAll(unitContent, placeholder, value)
@@ -2434,6 +2502,10 @@ func statusDaemonFacet(d installDeps, uid int, content []byte, unitErr error) {
 	// machine protected" must be able to see BOTH memory subsystems' modes, and
 	// because an absent line here is what an older daemon unit looks like.
 	reportDaemonMode(d, "daemon slice ceiling", "AIRA_DAEMON_SLICE_CEILING_MODE", string(liveEnvironment), liveErr, string(content))
+	// AIRA-324. The pinned-job charge discount, mode and factor: an operator
+	// checking whether enforce is on reads it here.
+	reportDaemonMode(d, "daemon pin charge", "AIRA_DAEMON_PIN_CHARGE_MODE", string(liveEnvironment), liveErr, string(content))
+	reportDaemonMode(d, "daemon pin charge factor", "AIRA_DAEMON_PIN_CHARGE_FACTOR", string(liveEnvironment), liveErr, string(content))
 	paths, pathsErr := d.daemonPaths()
 	if pathsErr != nil {
 		d.logf("daemon reachable: unevaluated (%v)", pathsErr)

@@ -113,7 +113,9 @@ func TestTopResizeConfirmationStatesTheJobAndTheCaveats(t *testing.T) {
 	summary := state.PaletteConfirm.Summary
 	for _, want := range []string{
 		"alpha", "owner session-a", "current reserve 8192M", "live usage 1024M", "to 2G (2147483648 bytes)",
-		"memory.max cap is unchanged", "OOM-steering budget drops", "any re-declare", "restores the original reserve",
+		"memory.max cap is unchanged", "OOM-steering budget drops", "any re-declare",
+		"a daemon reconnect restores the booking the job was granted with (a pin-charge-discounted booking stays discounted)",
+		"a daemon restart books the full pin",
 		"below the job's live memory use", "It is your job (session-a)",
 	} {
 		if !strings.Contains(summary, want) {

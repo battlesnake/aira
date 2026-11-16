@@ -592,6 +592,7 @@ func TestShimDaemonEnvironmentDisablesEveryCgroupSubsystem(t *testing.T) {
 		"AIRA_DAEMON_WATCHDOG_MODE=off",
 		"AIRA_DAEMON_SLICE_CEILING_MODE=off",
 		"AIRA_DAEMON_OOM_STEER_MODE=off",
+		"AIRA_DAEMON_PIN_CHARGE_MODE=off", // AIRA-324: shim never discounts; stated in the env too
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("shim daemon environment is missing %q:\n%s", want, joined)

@@ -294,6 +294,13 @@ type ConfineRecord struct {
 	// Summed over one listing's rows it reconciles with that listing's own
 	// ScopeBytes.
 	ReserveBytes *int64 `json:"reserve_bytes"`
+	// PinBytes (AIRA-324) is this scope's GRANTED reserve — the pin its grant
+	// echoed and a confine client wrote as its memory.max — present ONLY when the
+	// ledger books less than it (ReserveBytes): an operator pin booked at the
+	// discounted charge, or a job lowered with `confine --resize`. Absent means
+	// ReserveBytes is the granted reserve; it never stands in for ReserveBytes.
+	// Stamped only by ApplyConfineScopePins from the same locked snapshot.
+	PinBytes *int64 `json:"pin_bytes,omitempty"`
 	// VRAMBytes is this scope's declared GPU VRAM reservation (AIRA-269), stamped
 	// only by ApplyConfineScopeVRAM from the daemon's locked admission snapshot,
 	// exactly like ReserveBytes. nil is "the daemon holds no admission record for
@@ -387,6 +394,20 @@ const ConfineReserveFacet = "reserve"
 // covers: AIRA-192
 func ApplyConfineScopeReserves(scopes []ConfineRecord, reserves map[string]int64) {
 	applyConfineScopeCharge(scopes, reserves, ConfineReserveFacet, func(record *ConfineRecord) **int64 { return &record.ReserveBytes })
+}
+
+// ApplyConfineScopePins stamps PinBytes (AIRA-324) for the scopes the daemon's
+// ledger books below their granted reserve. Unlike the reserve, an absent pin is
+// not unevaluated: it states that the booking IS the granted reserve, so no
+// facet is added for it.
+func ApplyConfineScopePins(scopes []ConfineRecord, pins map[string]int64) {
+	for index := range scopes {
+		record := &scopes[index]
+		if value, ok := pins[record.ScopeID]; ok && record.ScopeID != "" {
+			pin := value
+			record.PinBytes = &pin
+		}
+	}
 }
 
 // applyConfineScopeCharge sets the field selected by field on each record from
@@ -610,9 +631,10 @@ type ConfineSliceReserve struct {
 	// first, latest push first, then enqueue sequence — AIRA-309), not a
 	// promise of grant order: a later, smaller waiter that fits can be admitted
 	// past a head that is still too large, within that head's AIRA-307 budget
-	// or in the backstop's backfilling pass. QueuedAheadBytes is the sum of the reserves
-	// of the queued waiters ahead — a fact about the queue, never an ETA,
-	// which the daemon cannot establish.
+	// or in the backstop's backfilling pass. QueuedAheadBytes is the sum of the ledger
+	// bookings of the queued waiters ahead (AIRA-324: a discounted pin counts at its
+	// discounted booking, the bytes it will hold once granted) — a fact about the
+	// queue, never an ETA, which the daemon cannot establish.
 	//
 	// Zero means "no position established", never "position zero": a reader
 	// must render its absence as an absence and print nothing.

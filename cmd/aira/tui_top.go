@@ -153,6 +153,18 @@ func topReserveFor(record runner.ConfineRecord) topReserve {
 	return topReserve{Bytes: *record.ReserveBytes, State: topReserveSet}
 }
 
+// topReservationCell is a live row's RESERVATION cell: the ledger booking, and,
+// when the daemon published the scope's granted reserve because the booking is
+// below it (AIRA-324: a discounted pin, or a --resize), that pin beside it, so a
+// discounted job shows what it is booked at AND its cap and neither is labelled
+// as the other. The bar keeps drawing the booking only (AIRA-192).
+func topReservationCell(record runner.ConfineRecord, reserve topReserve) string {
+	if reserve.State == topReserveSet && record.PinBytes != nil && *record.PinBytes > reserve.Bytes {
+		return reserve.String() + " (pin " + runner.FormatConfineMegabytes(*record.PinBytes) + ")"
+	}
+	return reserve.String()
+}
+
 func (r topReserve) String() string {
 	if r.State == topReserveSet {
 		return runner.FormatConfineMegabytes(r.Bytes)
@@ -698,7 +710,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 			KillText:    topKillText(record),
 			Cells: []string{
 				fmt.Sprint(slot), record.Name, confineNum(record.SupervisorPID),
-				topLiveCell(record), topAgeCell(record.AgeSeconds), reserve.String(),
+				topLiveCell(record), topAgeCell(record.AgeSeconds), topReservationCell(record, reserve),
 				topRAMCell(record.RSSBytes),
 				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record), topUntrustedCell(lastText),
 			},
