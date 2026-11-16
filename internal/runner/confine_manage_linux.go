@@ -839,14 +839,43 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s population could not be established: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
 	}
 	if empty {
+		// AIRA-339 (from AIRA-319): wording only, the decision is unchanged. An
+		// empty scope whose supervisor is established DEAD will not fill again, so
+		// "retry" would send the operator after nothing. It does NOT establish that
+		// the job ended: a workload that migrated out of the scope can outlive its
+		// supervisor, so the reply claims only what the scope shows. No cleanup is
+		// promised: the orphan reaper covers only the default slice and can be
+		// disabled. Liveness the listing could not
+		// establish (nil, including a dead probe vetoed by a held lease) keeps the
+		// retry reply: unestablished is never read as dead.
+		if record.SupervisorLive != nil && !*record.SupervisorLive {
+			return ConfineKillResult{}, fmt.Errorf("%s: scope %s is empty and its supervisor is gone: nothing remains in this scope to kill", CodeConfineNotLaunched, record.ScopeID)
+		}
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s has nothing to kill yet; retry", CodeConfineNotLaunched, record.ScopeID)
 	}
+	// AIRA-339: once the cgroup.kill write succeeded, SIGKILL is already
+	// delivered; an unconfirmed outcome after that says so rather than read as a
+	// failed kill. The code and the decision are unchanged (never "killed",
+	// nothing released). The result carries only the target's identity, for the
+	// daemon's confirmed=false audit line. No elapsed time is claimed: waitEmpty
+	// also returns at once on a read error, and early on cancellation.
+	deliveredUnconfirmed := func(cause error) (ConfineKillResult, error) {
+		target := ConfineKillResult{Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}
+		return target, fmt.Errorf("%s: %w in scope %s (cgroup.kill succeeded), but the scope could not be confirmed empty (%w), so processes may still be exiting; check `aira confine --list`",
+			CodeConfineKillUnconfirmed, ErrConfineKillDelivered, record.ScopeID, cause)
+	}
 	if err := scope.Kill(); err != nil {
+		// A sync failure after a successful write still delivered the kill; it
+		// returns at once exactly as before, only the wording differs.
+		var syncErr cgroupKillSyncError
+		if errors.As(err, &syncErr) {
+			return deliveredUnconfirmed(err)
+		}
 		return ConfineKillResult{}, fmt.Errorf("%s: cgroup.kill for %s: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
 	}
 	scope.removedMeansEmpty = true
 	if err := deps.waitEmpty(ctx, scope, timeout); err != nil {
-		return ConfineKillResult{}, fmt.Errorf("%s: scope %s empty state unconfirmed: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
+		return deliveredUnconfirmed(err)
 	}
 	return ConfineKillResult{Status: ConfineKillStatusKilled, Phase: ConfineKillPhaseRunning, ScopeID: record.ScopeID, Name: record.Name, Owner: owner}, nil
 }
