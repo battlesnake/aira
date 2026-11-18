@@ -68,15 +68,48 @@ tb-full    610s
 cum-min    210s
 cum-g      210s
 
-## W3 phase sweep: small jobs start at offset 0, 40, ..., 280 s (8 runs, horizon 3000 s)
-offset          0     40     80    120    160    200    240    280
-off          350s  never  never  never  never  never  never  never   starved in 7 of 8
-spec        never  never  never  never  never  never  never  never   starved in 8 of 8
-spec-fresh  never  never  never  never  never  never  never  never   starved in 8 of 8
-tb-min       605s   605s   605s   605s   605s   605s   605s   605s   starved in 0 of 8
-tb-full      605s   605s   605s   605s   605s   605s   605s   605s   starved in 0 of 8
-cum-min     never  never  never  never  never  never  never   350s   starved in 7 of 8
-cum-g       never  never  never  never  never  never  never   350s   starved in 7 of 8
+## W3 phase sweep: small jobs start at offset 0, 10, ..., 290 s (30 runs per design, horizon 3000 s)
+offset        off     spec  cum-min   tb-min
+0            350s    never    never     605s
+10          never    never    never     605s
+20          never    never    never     605s
+30          never    never    never     605s
+40          never    never    never     605s
+50          never    never    never     605s
+60          never    never    never     605s
+70          never    never    never     605s
+80          never    never    never     605s
+90          never    never    never     605s
+100         never    never    never     605s
+110         never    never    never     605s
+120         never    never    never     605s
+130         never    never    never     605s
+140         never    never    never     605s
+150         never    never    never     605s
+160         never    never    never     605s
+170         never    never    never     605s
+180         never    never    never     605s
+190         never    never    never     605s
+200         never    never    never     605s
+210         never    never    never     605s
+220         never    never    never     605s
+230         never    never    never     605s
+240         never    never    never     605s
+250         never    never    never     605s
+260         never    never    never     605s
+270         never    never     350s     605s
+280         never    never     350s     605s
+290         never    never     350s     605s
+off      starved in 29 of 30
+spec     starved in 30 of 30
+cum-min  starved in 27 of 30
+tb-min   starved in 0 of 30
+today grants, cum-min starves, at offsets: [0]
+today starves, cum-min grants, at offsets: [270, 280, 290]
+
+## W3 at offset 0 traced: hold arms, backstop passes and 5 GiB refills before the head
+off      0s arm, 300s backstop, 320s arm, 350s HEAD GRANTED
+cum-min  20s arm, 320s backstop, 320s refill, 350s arm, 650s backstop, 650s refill, 700s arm, 1000s backstop, 1000s refill, 1050s arm, ... head not granted
 
 ## W0 illustrative, the 13:55 queue on a model slice (not evidence)
 off        head 60s, 2154 240s, 2700 360s, small mean wait 157s

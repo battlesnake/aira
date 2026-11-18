@@ -266,6 +266,28 @@ def w3(design, offset=0, t_end=3000):
     return sim.run(t_end, jobs[3])
 
 
+def w3_trace(design, t_end=1300):
+    """W3 at offset 0, with the instants the hold arms and clears (a clear is a backstop pass)
+    and the 5 GiB refills granted, up to the head's grant or t_end."""
+    jobs = [Job("o1", 5120, 350, pre=True), Job("o2", 5120, 700, pre=True), Job("o3", 5120, 1050, pre=True),
+            Job("head", 8192, INF, spent=True)]
+    jobs += [Job("r%d" % k, 5120, 1050, arrive=1) for k in range(20)]
+    jobs += [Job("s%d" % k, 1024, 20, arrive=5 * k) for k in range(t_end // 5)]
+    sim = Sim(jobs, C=20480, design=DESIGNS[design])
+    events, armed = [], sim.armed
+    for t in range(t_end):
+        refills = [j for j in sim.live if j.name.startswith("r") and j.state == "queued"]
+        sim.step(t)
+        if sim.armed != armed:
+            events.append("%ds %s" % (t, "arm" if sim.armed is not None else "backstop"))
+            armed = sim.armed
+        events += ["%ds refill" % t for j in refills if j.state == "granted"]
+        if jobs[3].state == "granted":
+            events.append("%ds HEAD GRANTED" % t)
+            break
+    return ", ".join(events[:14]) + ("" if jobs[3].state == "granted" else ", ... head not granted")
+
+
 def w8(design, spent=True, pool=False):
     """Finding 8: ceiling 46 GiB, head 4 GiB; 44 x 1 GiB non-lane leases end one per 10 s; a
     1 GiB suite parent arrives every 60 s and lives 900 s. Without `pool`, each suite keeps 4
@@ -352,12 +374,24 @@ def main():
         for name in names:
             print("%-10s %s" % (name, fmt(fn(name), t_end)))
         print()
-    print("## W3 phase sweep: small jobs start at offset 0, 40, ..., 280 s (8 runs, horizon 3000 s)")
-    print("%-10s %s" % ("offset", " ".join("%6d" % off for off in range(0, 300, 40))))
-    for name in names:
-        res = [w3(name, off) for off in range(0, 300, 40)]
-        print("%-10s %s   starved in %d of 8" % (
-            name, " ".join("%6s" % ("never" if r is None else "%ds" % r) for r in res), sum(r is None for r in res)))
+    sweep = ("off", "spec", "cum-min", "tb-min")
+    offsets = list(range(0, 300, 10))
+    print("## W3 phase sweep: small jobs start at offset 0, 10, ..., 290 s (30 runs per design, horizon 3000 s)")
+    print("%-8s %s" % ("offset", " ".join("%8s" % name for name in sweep)))
+    table = {name: [w3(name, off) for off in offsets] for name in sweep}
+    for i, off in enumerate(offsets):
+        print("%-8d %s" % (off, " ".join("%8s" % ("never" if table[name][i] is None else "%ds" % table[name][i])
+                                         for name in sweep)))
+    for name in sweep:
+        print("%-8s starved in %d of %d" % (name, sum(r is None for r in table[name]), len(offsets)))
+    both = [off for i, off in enumerate(offsets) if table["off"][i] is not None and table["cum-min"][i] is None]
+    rev = [off for i, off in enumerate(offsets) if table["off"][i] is None and table["cum-min"][i] is not None]
+    print("today grants, cum-min starves, at offsets: %s" % (both or "-"))
+    print("today starves, cum-min grants, at offsets: %s" % (rev or "-"))
+    print()
+    print("## W3 at offset 0 traced: hold arms, backstop passes and 5 GiB refills before the head")
+    for name in ("off", "cum-min"):
+        print("%-8s %s" % (name, w3_trace(name)))
     print()
     print("## W0 illustrative, the 13:55 queue on a model slice (not evidence)")
     for name in names:

@@ -33,13 +33,29 @@ Code references are to the worktree at `ae446ef1` (master). Data:
     backstop refills, exempt workers, high-priority or pushed arrivals, and leases that never end.
   - In a band of width `x`, "granted today" therefore becomes "starved".
   - No guard on the lane's size closes that band, because the band exists exactly while the lane
-    is at its allowed size. Only a bound per head, in bytes or in time, closes it.
+    is at its allowed size. Only a bound per head, in bytes or in time, ends the lane's occupancy
+    in front of a head. Neither bounds the head's wait (next bullets).
 - **The collapse.** Small jobs pass a head within a **per-head allowance**: at most `x` bytes in
   total of jobs of at most `y` while that waiter is the head.
   - This is AIRA-307's own mechanism, a byte counter on the head waiter, with a second counter used
-    only by small jobs. AIRA-307's argument then applies unchanged (§3.3).
+    only by small jobs. AIRA-307's byte bound then applies unchanged (§3.3).
   - It deletes the lane-member flag, the derived lane sum, guard G with its RAM, per-job-headroom
     and CPU arms, the GPU exclusion (C3) and the child counting (C7).
+- **What the collapse does not fix.** It bounds the **bytes** that pass a head, not the head's
+  **wait**. Two round-2 P1 witnesses still show "today grants the head, this plan does not", in the
+  model:
+  - **Finding 3 at the reviewer's phase** (W3, offset 0): today grants the head at 350 s; under the
+    allowance it is never granted. Allowance grants do not arm the hold, so the first arm moves
+    from 0 s to 20 s, and the backstop pass from 300 s to 320 s. By then the allowance's small jobs
+    have ended, so the pass refills a 5 GiB lease 30 s before the release the head needed.
+    Across 30 phases, today starves this head in 29, the allowance in 27, and they differ in which
+    (§3.3.1).
+  - **Finding 8** (W8, W8c): with the head's budget spent, today grants it at 20 s. The allowance
+    lets suite parents pass after all, and the head waits 150 s with short-lived workers, or a
+    suite lifetime (900 s) with a long-lived worker pool. Today reaches the same 900 s only while
+    the head's budget is unspent.
+  - Neither design bounds the head's wait (queue-order spec §3.5). The allowance changes which heads
+    wait, and the owner should choose on these figures (§13 Q1).
 - **It changes an owner decision.** The owner asked for "small-lane **outstanding** bookings
   `<= x`", which is concurrent. The allowance is cumulative per head, so it needs the owner's yes.
   If the owner keeps concurrency, Alternative B (§3.8) bounds the lane in time instead: the lane
@@ -66,7 +82,7 @@ admission change.
 
 | Addition | Why it is needed | Size |
 |---|---|---|
-| `smallBypassed` on the head waiter, bounded by `x` | Bounds what small jobs take past each head, so AIRA-307's argument holds. | one field, one `case`, one increment |
+| `smallBypassed` on the head waiter, bounded by `x` | Bounds what small jobs take past each head, so AIRA-307's byte bound holds. | one field, one `case`, one increment |
 | Off in ci-shim mode | Owner decision. | one conjunct |
 | `x`, `y` set at install | Owner decision ("settable like `--pin-charge`"). | env and install plumbing, copied pattern |
 | Allowance figures and a per-waiter "held by" token | Without them, "held behind the head" cannot be told apart from "no room". | optional reply fields |
@@ -332,23 +348,34 @@ Both counters live on H's waiter and only grow.
 Sub-reservations are not job-level, and the exclusivity gate and the restart freeze precede the
 `switch` (`admit.go:2592-2621`). ∎ This is AIRA-307 invariant 2 with a second term.
 
-**What it means for H's wait.** Compared with today, H can find at most `x` more bytes of job-level
-bookings ahead of it, granted since it became head. Each is a lease that ends when its job ends. So
-the allowance delays H by at most the longer of:
-- the time those leases take to end;
-- the time the other bookings take to drain an extra `x`, when H would otherwise have fitted
-  sooner.
+**What it does not say: H's wait is not bounded.** An earlier draft of this round claimed the
+allowance delays H by at most the time its `x` bytes take to end or to drain. Its own model output
+contradicts that (W3 at offset 0), so the claim is withdrawn. Two effects defeat any such bound:
+- **The duty cycle moves.** Allowance grants never arm the hold (invariant 3). So with the
+  allowance, holds arm later or not at all, and every later backstop pass falls at a different
+  instant. A backstop pass grants every fit, and which waiters fit there depends on its instant.
+  So the allowance changes which refills land in front of H: in W3 that turns a head granted today
+  at 350 s into one that is never granted, and the reverse in 3 other phases.
+- **Suite parents.** After the budget is spent, the allowance still lets suite parents pass, and
+  their workers pass H for the suite's lifetime (premise 2).
+
+What remains is the byte bound above. Every job-level byte that passes H outside backstop passes is
+counted on H, and there are at most `reserve/2 + x` of them.
 
 **What it does not change.** These are the premises AIRA-307 already accepts (queue-order spec
 §3.5), now stated as premises rather than excluded:
-1. **Backstop passes grant every fit once per hold, ahead of the head.**
-   - In the model (W3), today's rules starve the reviewer's backstop-refill head in 7 of 8 phases.
-   - The allowance also starves it in 7 of 8 (a different phase is spared).
-   - The round-2 concurrent lane starves it in all 8.
+1. **Backstop passes grant every fit once per hold, ahead of the head.** In the model (W3, 30
+   phases):
+   - today's rules starve the reviewer's backstop-refill head in 29 of 30 phases, granting it only
+     at offset 0;
+   - the allowance starves it in 27 of 30, granting it only at offsets 270-290;
+   - the round-2 concurrent lane starves it in all 30.
 2. **Sub-reservations are exempt and uncounted.** A suite parent that passes H, through the budget
    today or through the allowance, brings its workers past H for the suite's lifetime.
-   - In the model, W8c (allowance) and W8d (today, fresh budget) both give 900 s.
-   - The allowance raises how many suite parents can pass a head (§9 R1).
+   - In the model, W8c (allowance) and W8d (today, fresh budget) both give 900 s. With the budget
+     spent, today gives 20 s, because no suite parent can pass.
+   - So the allowance re-opens this exposure for each head whose budget is spent, and raises how
+     many suite parents can pass a head (§9 R1).
    - **Measured:** 753 of 8349 small confine rows in the window (9.0%) are `aitest-parent` rows
      (`aira-350-round3-queries.out.txt` part 2). That is a lower bound on suite parents, because a
      `make test-engine` parent does not carry that signature.
@@ -357,14 +384,16 @@ the allowance delays H by at most the longer of:
 4. **Leases that never end, and the physical floor** in `checkedAvailable` (`admit.go:2906-2925`).
    Both are pre-existing.
 
-**What the allowance costs a head (estimated).**
-- **The drain.** The extra drain is at most `x` per head episode, and only when the allowance is
-  used and the head would otherwise have fitted sooner.
+**What the allowance costs a head (estimated, not a bound).**
+- **The drain, as an order of magnitude.** When H would fit once the other bookings fell by `x`, the
+  `x` bytes ahead of it cost the time to release `x`.
   - The window's average release rate is 2.71 GB a minute: 12711 GiB of bookings started in 84 h
     (`aira-350-round3-queries.out.txt` part 4).
   - That is a lower bound on the rate, since rows are lost.
-  - So `x = 4 GiB` is up to about 1.6 minutes.
+  - So `x = 4 GiB` is about 1.6 minutes.
   - The 3.6 GB a minute in the queue-order spec is from 2026-10-12 and is not used here.
+- **Starvation moved, not added or removed:** a head that today's duty cycle grants can starve
+  under the allowance's duty cycle, and the reverse (W3).
 - **A suite lifetime**, when a suite parent passes through the allowance (premise 2).
 - **The model only (W0, not evidence):**
   - on the 13:55 queue the head waits 240 s instead of 60 s;
@@ -387,7 +416,8 @@ designs are:
 |---|---|---|---|---|---|
 | W1 | Stale lane sum: a member's child grants inside the pass (1) | — | candidate granted, lane tree 5120 MiB over `x`, head plus tree 13312 MiB over a 12288 MiB ceiling | no lane sum exists | sum recomputed per decision |
 | W2 | Zero-VRAM lane parents with GPU children, VRAM-short head (2) | 30 s | 3016 s (arrivals stop at 3000 s) | 76 s | 616 s |
-| W3 | Backstop refill of rotating 5 GiB leases (3), phase sweep of 8 | starved in 7 of 8 | starved in 8 of 8 | starved in 7 of 8 | 605 s in all 8 |
+| W3 | Backstop refill of rotating 5 GiB leases (3), at the reviewer's phase (offset 0) | 350 s | never | **never** | 605 s |
+| W3 sweep | The same over 30 phases (offsets 0-290 s) | starved in 29; granted only at 0 | starved in 30 | starved in 27; granted only at 270-290 | 605 s in all 30 |
 | W8 | Lane-admitted suites with 4 short-lived workers (8) | 20 s (fresh budget: 140 s) | 70 s | 150 s | 150 s |
 | W8c | Suites with a long-lived 32-worker pool (8) | 20 s (fresh budget: 900 s) | 900 s | 900 s | 900 s |
 | W12 | 1.5 GiB of never-ending leases, 39 GiB head (12) | 210 s | never | 210 s | 610 s |
@@ -525,8 +555,9 @@ Draft text:
 - No G, C2, C3 or C7. In the model, adding all four (`tb-full`) changes one grant time (W8: 70 s
   against 150 s) and none of the bounds.
 
-**The bound.** Lane grants past H stop at `H.enqueued + T`. After that, H's wait is today's plus at
-most the lifetimes of the lane members granted before then, a suite lifetime included.
+**The bound.** Lane grants past H stop at `H.enqueued + T`, and the members granted before then
+end within their lifetimes, a suite lifetime included. From then on only today's rules act, but from
+a different state (the duty cycle has moved, as in §3.3), so this is not a bound on H's wait either.
 
 **Measured** (`docs/dev/aira-350-hold-age.out.txt`, 461 holds):
 - the head's age when its hold arms has a median of 154 s and a 90th percentile of 612 s;
@@ -535,8 +566,8 @@ most the lifetimes of the lane members granted before then, a suite lifetime inc
 
 The 13:16:07 head was already 6m10s old when its hold armed.
 
-**In the model:** W2 616 s, W3 605 s in all 8 phases, W12 610 s, against 30 s, 7 starved, and 210 s
-today. In W3 the time-box does better than today. The likely reason is that small jobs no longer arm
+**In the model:** W2 616 s, W3 605 s in all 30 phases, W12 610 s, against 30 s, 29 of 30 starved,
+and 210 s today. In W3 the time-box does better than today. The likely reason is that small jobs no longer arm
 holds, so fewer backstop passes refill the slice. That is a property of the model's witness, not
 established for production.
 
@@ -617,7 +648,7 @@ head.
 | **T11 sub-reservations** | A 2 GiB sub-reservation of a granted parent, queued behind a head; it fits. | Granted on fit. `smallBypassed` and `bypassed` are unchanged. | Route sub-reservations through the allowance, or count them: a counter changes. |
 | **T12 no arm from allowance grants** | Idle phase, only allowance grants. | `freezeArmedAt` stays zero. | Set `budgetWithheld` on the allowance path: armed. |
 | **T13 resize** | An allowance-admitted lease's `charge` is lowered to 256 MiB. | `smallBypassed` is unchanged and no extra grant is made. | Recompute the allowance from current charges: one extra grant. |
-| **T14 restart** | A head re-enqueued after a daemon restart (a fresh waiter through `enqueueAdmitInternal`), and a lease re-established through `enqueueReDeclare`. | The new head's `smallBypassed == 0`. The lease carries no lane state. | — |
+| **T14 the counter is the head's** | Five 1 GiB small waiters behind a head with an unused allowance. Room 8 GiB. | The first four are granted. The head's `smallBypassed == 4 GiB`, each granted waiter's own counter is 0, and the fifth is `small-lane-full`. | Add the booking to the granted waiter's counter instead of the head's: all five granted. |
 | **T15 diagnosis** | — | `heldBy` is set on refusal and cleared on a capacity refusal, and no decision reads it (the guard-test pattern of `admit_pin_charge_guard_test.go`). | A decision that reads `heldBy`. |
 | **T16 fall-through to the budget** | The allowance spent, the budget not. A 1 GiB small waiter. | Granted through the budget, and `bypassed` increases. | End the `switch` on an allowance refusal: withheld. |
 | **T17 exclusivity** | (a) An exclusive holder granted (hold). (b) An exclusive drain queued (drain). A small eligible waiter behind each. | The waiter is gate-blocked and not granted. No counter changes. | Evaluate the allowance before the gate: granted. |
@@ -633,9 +664,9 @@ model or the test before the gate, because the model is only a model.
 
 | Run | Shape (as the model's witness) | Assertion |
 |---|---|---|
-| **S1** | W12: 1.5 GiB of never-ending leases, 10 GiB of transient leases, a 39 GiB head, 512 MiB small jobs every 5 s. | The head is granted at the same pass with the allowance as with the lane off. The concurrent mutation (T6's) is still not granted after 6000 passes. |
-| **S2** | W2: a VRAM-short head, zero-VRAM 1 GiB parents with 1 GiB-VRAM children, staggered. | The head is granted once the 4 allowance-admitted parents have ended. The concurrent mutation is not granted while parents keep arriving. |
-| **S3** | W3: rotating 5 GiB leases refilled by backstop passes, 8 phases. | The allowance starves the head in no more phases than the lane-off run does. The concurrent mutation starves it in all 8. |
+| **S1** | W12: 1.5 GiB of never-ending leases, 10 GiB of transient leases, a 39 GiB head, 512 MiB small jobs every 5 s. | The head is granted at the same pass with the allowance as with the lane off. The concurrent mutation (T6's) is still not granted after 6000 passes (the model's nearest design, `spec`, never grants it). |
+| **S2** | W2: a VRAM-short head, zero-VRAM 1 GiB parents with 1 GiB-VRAM children, staggered. | The head is granted once the 4 allowance-admitted parents have ended (model: 76 s). The concurrent mutation is not granted while parents keep arriving (model `spec`: 3016 s, after arrivals stop). |
+| **S3** | W3: rotating 5 GiB leases refilled by backstop passes, at offsets 0 and 280. | The per-pass properties below hold in every pass. The head's grant pass (or "not granted by pass 3000") is recorded for the allowance, lane-off and concurrent-mutation runs, and pinned as a regression value. For allowance, lane-off and `spec` (the model's nearest design to the mutation), the model expects never, 350 s and never at offset 0, and 350 s, never and never at offset 280. No ordering between the designs is asserted, because none holds across phases. |
 | **S4** | W8c: suites with a long-lived worker pool. | With the head's budget spent, the allowance run grants the head at the same pass as the lane-off run with a fresh budget. This pins the suite residual as today's class (§3.3 premise 2). |
 
 **Property check after every pass, in every run:**
@@ -752,14 +783,15 @@ UTC; the journal holds 461 holds and 456 backstop passes):
 | Benefit: small waits associated with backstop passes | about 100 waits, about 5 wait-hours in 3.5 days, not all saveable | measured association (§7.1) |
 | Benefit: waits ended by a head's grant rather than a backstop pass | not caught by the script | unknown |
 | Benefit: the 13:55 queue, in the model | small mean wait 157 s down to 47 s | model (W0) |
-| Cost: a head episode in which the allowance is used | at most `x` of extra drain, about 1.6 minutes at 2.71 GB a minute | estimated (§3.3) |
-| Cost: across all 461 holds, if every head lost the full drain | at most about 12 head-hours | estimated upper bound |
+| Cost: a head episode in which the allowance is used | the drain of `x`, about 1.6 minutes at 2.71 GB a minute, as an order of magnitude | estimated (§3.3) |
+| Cost: across all 461 holds, if every head lost exactly that drain | about 12 head-hours | estimated, not a bound |
+| Cost: a head the moved duty cycle starves where today grants it (and the reverse) | unbounded for that head; 1 phase of 30 one way, 3 the other, in W3 | model |
 | Cost: a suite parent passing through the allowance | up to a suite lifetime for that head (W8c: 900 s) | model; today's class |
 | Cost: mid-size waiters (`y` < booking < head) | they lose room to allowance grants (W0: +60 s each) | model |
 
 **Best estimate.** The benefit is near the low end, a few wait-hours in 3.5 days, plus the waits
-that end at a head's grant, which the store cannot see. The worst-case cost bound is larger than
-that. **The evidence does not establish a net gain.** The case for building is:
+that end at a head's grant, which the store cannot see. The estimated cost is of the same order or
+larger, and its worst case is not bounded. **The evidence does not establish a net gain.** The case for building is:
 - the change is one counter;
 - it is switchable off (`aira install --small-lane off`);
 - §7.4 measures it after shipping.
@@ -806,7 +838,9 @@ for ordinary confine jobs and with pin-charge in observe.
   does the same (W8c and W8d). The allowance raises the number of suite parents that can pass each
   head, from about `R/2` to about `R/2 + x` of 1 GiB parents. 9.0% of small rows are suite parents,
   at least. §13 Q2.
-- **R2. Heads wait longer** by up to `x` of drain per episode (§3.3, §7.3). Watched by §7.4.
+- **R2. Heads can wait longer, without a bound.** At most `x` more bytes pass each head, but the
+  allowance also moves the duty cycle, so a head that today is granted can starve, and the reverse
+  (§3.3, W3). Watched by §7.4.
 - **R3. Mid-size waiters** (`y` < booking < head) lose room that allowance grants take, before the
   next backstop pass.
 - **R4. `y` is inclusive at 1 GiB, which is exactly the cold default.** Every unpinned first run
@@ -842,7 +876,7 @@ for ordinary confine jobs and with pin-charge in observe.
 | Counting a member's children (C7) | Did not stop the suite case (W8c: 900 s with it); induced findings 1, 2 and 13. |
 | Lane membership flags and a derived lane sum | Only a concurrent lane needs them. |
 | Eligibility and size on the pin (round-2 C1) | Reversed the approved contract (finding 4). |
-| Raise the AIRA-307 budget for every job (e.g. `max(R/2, 4 GiB)`) | Large jumpers would spend it too. The allowance is the same bound, kept for small jobs. |
+| Raise the AIRA-307 budget for every job (e.g. `max(R/2, 4 GiB)`) | Large jumpers would spend it too. **This round reverses the earlier cut of a cumulative allowance.** Rounds 1-2 cut it because the incident's small jobs exhaust it, and that is still partly true: of the ten jobs held at 13:18-13:21 (5788 MiB), about 1.6 GiB would still have waited (§1.2). The concurrent alternative turned out unsound. |
 | Alternative B as the primary design | More state, and a head pays up to `T` (§3.8). It is kept as the owner's option. |
 | Runtime-aware backfill (start a small job only if it ends before the head could fit) | Needs runtime predictions, a judgement AIRA does not make. |
 | A lane-grant column in history | Telemetry only; the journal line suffices (§7.4). |
@@ -870,7 +904,7 @@ is unchanged.
 
    | Option | What small jobs get | What heads pay | State |
    |---|---|---|---|
-   | (a) **Per-head allowance** (recommended) | Up to `x` past each head, then today's wait for a backstop pass | At most `x` per head, the AIRA-307 class | one counter on the head |
+   | (a) **Per-head allowance** (recommended) | Up to `x` past each head, then today's wait for a backstop pass | At most `x` more bytes ahead of each head. The wait is not bounded: in the model a head granted today at 350 s starves (W3, 1 phase of 30, and the reverse in 3), and a head with its budget spent waits a suite lifetime instead of 20 s (W8c). | one counter on the head |
    | (b) Concurrent lane closed `2 x maxHold` after the head's enqueue (§3.8) | Continuous passing for up to 10 minutes of each head's wait | Up to `T` plus lane members' lifetimes | member flag, derived sum, `T` |
    | (c) Do not build yet | Nothing | Nothing | none |
 
@@ -911,12 +945,12 @@ is unchanged.
 |---|---|---|---|---|
 | 1 | P1 | Confirmed | Children grant inside the pass at `admit.go:2688`/`2699`. Model W1: candidate granted, tree 5120 MiB. | Closed: no lane sum. |
 | 2 | P1 | Confirmed | `admit.go:3395-3402` accepts `vram` and `admit.go:3494-3500` accepts `parent_scope_id` on the same request. Model W2: `spec` 3016 s. | Closed: the allowance gives 76 s, and children pass a head as today's children of budget-admitted parents do. |
-| 3 | P1 | Confirmed for the concurrent lane (W3: 8 of 8 phases starved). Partly wrong: "without the lane the head fits at the first release" holds in 1 of 8 phases. | W3 phase sweep: today's rules starve 7 of 8, the backstop-refill class of queue-order §3.5. | Claim withdrawn. The allowance matches today (7 of 8). The cost bound is restated (§3.3). |
+| 3 | P1 | Confirmed: at the reviewer's phase the concurrent lane starves the head and today grants it at 350 s. Across 30 phases today also starves it in 29 (the backstop-refill class of queue-order §3.5). | W3 at offset 0 and the 30-phase sweep. | Claim withdrawn. **Not closed by the collapse:** at offset 0 the allowance also starves the head, because its grants do not arm the hold and the backstop pass moves (traced in the sim output). The wait bound is withdrawn too (§3.3); only the byte bound remains. |
 | 4 | P2 | Confirmed | `.aira/tickets/AIRA-350.md:4` says "ledger charge <= y". | C1 reverted to `ledgerCharge()`. T10 now asserts eligibility on the booking. |
 | 5 | P2 | Confirmed | Round-2 §6.2's property contradicted invariant 2. There were no exclusive, high-head or backstop tests. | Property rewritten (§6.2). T17, T18, T19 and T16 added. |
 | 6 | P2 | Confirmed | The script's own LIMITS (`:35`); the matched median wait is 130 s (`out.txt` part 2). | Relabelled an association. "Whole 5-minute hold" removed (§7.1). |
 | 7 | P2 | Confirmed | `protocol.go:129-136`, `confine_linux.go:1124-1131`; the `admit.go:1189-1193` comment is stale. | Premise corrected (§2.2). C7 deleted in any case. |
-| 8 | P1 | Confirmed | Model W8c: `spec` (with C7) 900 s against 20 s today with the budget spent. **Also:** today's rules with a fresh budget give the same 900 s (W8d). | The suite term is today's class, widened by the allowance. Stated as residual R1, and as §13 Q2. |
+| 8 | P1 | Confirmed | Model W8c: `spec` (with C7) 900 s against 20 s today with the budget spent. Today's rules with a fresh budget give the same 900 s (W8d). | **Not closed by the collapse:** with the budget spent, the allowance also gives 150 s (W8) or 900 s (W8c). It is today's class, re-opened for every head with a spent budget. Stated as residual R1, in the header, and as §13 Q1 and Q2. |
 | 9 | P2 | Mostly confirmed. One figure corrected: the snapshot shows 8 (not 9) of the 12 job-level small scopes older than 13 hours, and 5 (not 6) at about 5 days (ages 433762 x 4 and 432637; then 79205, 57496 and 50147 s). | `round3-queries` parts 2-4: small rows' run time, the `aitest-parent` share and the release rate. | Benefit and cost in one table (§7.3). Silting and a lane-closing suite do not apply to a per-head allowance. Mid-size waiters added to the cost (R3). |
 | 10 | P2 | Confirmed | Round-2 T6 mutations are equivalent at its numbers. The 6.2(a) steady state is below `x`. 6.2(d) had no pass number. | G is deleted, so its mutations are moot. New tests cover the head change, the backstop classification, exclusivity and high-priority heads. S1-S4 assert pass numbers against lane-off runs. |
 | 11 | P1 | Confirmed | Journal `confine-front` at 13:21:00 and 13:22:49. The yield line at 13:21:07 names 14816. History: 14816 granted at 13:21:47 after 317 s. One slot per job (`admission_linux.go:455`); `heldLease` has `cpu = 0`. | §1.2 rewritten as a timeline. T1 is built from 13:55 with one-slot leases, and T1b covers 32 leases. |
@@ -926,8 +960,13 @@ is unchanged.
 
 **Fix-induced findings:** 4 of 14 (1, 2, 8 and 13) came from the round-1 C7 fix.
 
-**Commands run this round** (all under `aira confine`; no `hint:` line appeared in any trailer):
-- the model (`docs/dev/aira-350-lane-sim.py`);
-- the hold-age script;
-- `docs/dev/aira-350-round3-queries.sql` against a store copy;
-- `journalctl` reads.
+**Commands run this round:**
+- under `aira confine`, with no `hint:` line in any trailer: the model
+  (`docs/dev/aira-350-lane-sim.py`), the hold-age script, the store copy, and
+  `docs/dev/aira-350-round3-queries.sql`;
+- not confined, as trivial reads: `journalctl` over a 16-minute window.
+
+**Within this round.** The first commit of round 3 still claimed a bound on the head's wait, which
+its own W3 output contradicted at offset 0. A second commit withdrew that claim, reported W3 per
+phase, and stated findings 3 and 8 as not closed. **The choice of collapse has not been reviewed
+independently of its author.**
