@@ -114,6 +114,7 @@ evaluator rows):
 | too-large: enqueue (`admit.go:2386`), `admitConnection` (`admit.go:1891-1898`), `admitCeiling` (`admit.go:1490`) | `maximum`, whole jobs | `maximum - x`, `J_m`; a reserve `<= laneReserveMax` is never too large |
 | worker probe (`worker_admit.go:244-254`); worker claims go through the evaluator | `available` | `min(W, P)` |
 | `CeilingBytes` (`confine_manage.go:261`) | `E - H(J+1)` | `(E - x) - H(J_m + 1)`, what a non-small job faces |
+| `CeilingWouldBeBytes` (`confine_manage.go:270`, `sliceCeilingWouldBeBytes`, `sliceceiling.go:795`; printed at `main.go:3884`) | the same less `H(J+1)` | headroom argument `H(J_m + 1) + x`, so it still equals `CeilingBytes` in enforce mode. `ceiling_effective_bytes` and the other `ceiling_*` fields stay whole-slice: they describe the throttle |
 | `GrantedBytes`, `Jobs`, `ScopeJobs`, `ScopeBytes` (`confine_manage.go:242-288`) | whole slice | main pool only; the lane in its own fields (§2.6) |
 | clients of `CeilingBytes`: the push hint (`confine_queue_position_linux.go:216`), the "N of M granted" clause (`:239-240`), the own-size note (`:259-261`), the exclusive wait (`:456-457`), `--list` (`cmd/aira/main.go:3752`, `3760`), the drain warning (`main.go:3902`), `aira top` (`cmd/aira/tui_top.go:1528-1532`) | — | unchanged code; each now compares main with main. One change: the own-size note is not printed for a reserve `<= lane_job_max_bytes` while `lane_capacity_bytes > 0` |
 | `ci_dump.go:196`, `205` | whole slice | unchanged (lane off in shim) |
@@ -136,8 +137,12 @@ available := W; if laneOn { available = min(W, P) }                 // the main 
 ... today's code from admit.go:2663 on, with `available` and, for the head, E - x
 ```
 
-**`laneEligible(w)`:** `!w.isSubReservation() && !w.exclusive && !w.suiteParent && w.ledgerCharge() <= y`.
-Eligibility is in booking bytes, as the ticket states.
+**`laneEligible(w)`:** `w.scopeID != "" && !w.isSubReservation() && !w.exclusive && !w.suiteParent &&
+w.ledgerCharge() <= y`. Eligibility is in booking bytes, as the ticket states. A scope-less waiter
+(`aira run`, or `confine-reserve` outside a confine scope, whose `ParentScopeID` is then empty,
+`internal/runner/confine_reserve_linux.go:117`, `confine_linux.go:2113-2115`) has no kernel cap
+(`admit.go:3551`), so its real use is not bounded by its reserve and the proof of §3 would fail: it
+is not eligible.
 
 **`laneFits`** needs all five. `cpuH` and `vramH` are the head's `cpu` and `vram` when this pass has
 found a head (`admit.go:2770-2779`), else 0.
@@ -155,6 +160,8 @@ depends on the lane (§3), so the term only closed the lane behind large heads.
 tries the lane first again (T19). **Placement:** lane grants pass an unpushed head's budget and hold,
 including in a backstop pass; lane-first applies with no head too (T21). **Inside the lane:** first
 fit in evaluation order (`admitOrderLocked`, `admit.go:452-476`), no lane-internal head rule (T20).
+A small job can be passed in the lane by smaller ones that fit the residue; it keeps the main path
+every pass.
 
 ### 2.3 Host protection
 
@@ -234,7 +241,7 @@ explicit `--small-lane` that large is refused.
   While the lane is on, `ceiling_bytes`, `granted_bytes`, `jobs`, `scope_jobs` and `scope_bytes`
   describe the main pool, so every client comparison of granted with ceiling stays like with like.
   Residuals stay whole-slice, so the identity `jobs = scope_jobs + reservation_jobs + residual` holds,
-  as lane leases are always scope jobs. An old client sees a consistent main pool and no lane.
+  as lane leases are always scope jobs (eligibility requires a scope id). An old client sees a consistent main pool and no lane.
 - **Per scope row:** `lane: true` (omitempty).
 - **For the named queued scope** (the AIRA-24 probe, `admit.go:1352-1364`): `lane_full` and
   `held_by_head` (omitempty), from diagnosis-only fields written beside `noteGrantableLocked`
@@ -284,7 +291,7 @@ at `core.go:2607` and the MCP instructions at `cmd/aira/mcp.go:29`).
 
 **Proof of 4.** `H(J+1) - H(J_m+1) = 64 MiB x laneJobs`, so
 `W - P = x - 64 MiB x laneJobs + B_m - max(effectiveCurrent, B_m + laneCharge)`. Lane scopes use at
-most `laneReserve` (each is capped at its reserve), the rest of the slice at most `B_m` (assumption),
+most `laneReserve` (every lane lease has a scope, and each scope's `memory.max` is its reserve), the rest of the slice at most `B_m` (assumption),
 and `laneCharge <= laneReserve`. So the max is at most `B_m + laneReserve`, and
 `W - P >= x - L >= 0`. Then `min(W, P) = P`. `E` does not move with lane growth either: the pressure term
 is invariant to the slice's own anon growth (`sliceceiling.go:228-230`). ∎
@@ -306,7 +313,9 @@ lane state does not move it further. The counterexamples, each pinned by a test:
   `x - L` plus the lane's unused cap, `W` binds and lane real use lowers `H`'s room. Possible only with
   discounted main leases (enforce, not installed) or use in the slice that no booking covers.
 - **CE5, restart silting** (T17): former main small leases and suite parents may take lane room after a
-  restart, with `L > x`, until they end.
+  restart, with `L > x`, until they end. The rollout restart is one: the snapshot's 12 small job-level
+  scopes (6.90 GiB of footprint, M) would all enter the lane, so `W` binds and main sees today's room
+  until the lane drains below `x`; the five long-lived ones (1.56 GiB) stay.
 - **CE6, a suite parent with an empty signature** (T14d): an argv that cannot be resolved makes a
   `--delegate-ram` parent eligible; not measurable from the store.
 - **CE7, the partition's cost** (T22d): a head that fits today's room but not `P` waits for the ceiling
@@ -334,8 +343,8 @@ lane state does not move it further. The counterexamples, each pinned by a test:
 `evaluateAdmitQueue`. Headroom is production (2 GiB + 64 MiB a job; `admitTestServer` zeroes it, so the
 helper restores it). CPU 32 slots; held leases carry `cpu = 1` (not `heldLease`'s 0,
 `admit_queue_order_test.go:37`). `memory.max` 65536 MiB, `x` 4096, `y` 1024, real use 12288 MiB, a hold
-pass (`freezeArmedAt = now - 60 s`, `maxHold` 5 min) and a head budget preset as spent, unless stated.
-Every test states `E` and asserts the granted set and each grant's `lane`. All sizes in MiB.
+pass (`freezeArmedAt = now - 60 s`, `maxHold` 5 min), a head budget preset as spent, and `E` 49152,
+unless stated. Every test asserts the granted set and each grant's `lane`. All sizes in MiB.
 
 | Test | Setup | Assertions | Wrong implementation it fails |
 |---|---|---|---|
@@ -354,7 +363,7 @@ Every test states `E` and asserts the granted set and each grant's `lane`. All s
 | **T11 backstop** | `freezeArmedAt = now - maxHold`; an eligible small waiter. | In the lane; `bypassed` unchanged. | Lane after the head `switch`. |
 | **T12 CE2** | Idle phase, budget spent. Pass 1: two small waiters, lane on; twin with lane off. Pass 2 (lane on): lane full, a small waiter that fits `P`. | Lane on: pass 1 no arm, pass 2 arms. Lane off: pass 1 arms. | An anchor write on a lane grant. |
 | **T13 CE1** | `E` 49152, `J_m` 10, `B_m` 34112 (`P` 8192; lane off `W` 12288). A 16384 head, `bypassed` 0. Four 1024 small, then a 5120. | Lane on: three in the lane, fourth and 5120 via the budget (`bypassed` 6144). Lane off: four via the budget, 5120 withheld. | Pinned residual; a build claiming to remove it changes this knowingly. |
-| **T14 aitest** | (a) A 512 sub-reservation. (b) Enqueue with `signature = AitestParentSignaturePrefix + "x"`, 1024, behind a held head. (c) Plain signature. (d) A `--delegate-ram` request with an empty signature. | (a) Main, `lane` false. (b) `suiteParent`, held. (c) Lane. (d) Lane (CE6 pinned). | (a) Ignoring `parentScopeID`. (b) Ignoring `suiteParent`. |
+| **T14 aitest, scope-less** | (a) A 512 sub-reservation. (b) Enqueue with `signature = AitestParentSignaturePrefix + "x"`, 1024, behind a held head. (c) Plain signature. (d) A `--delegate-ram` request with an empty signature. (e) A scope-less, parentless 512 reservation. | (a) Main, `lane` false. (b) `suiteParent`, held. (c) Lane. (d) Lane (CE6 pinned). (e) Main, `lane` false. | (a) Ignoring `parentScopeID`. (b) Ignoring `suiteParent`. (e) Ignoring `scopeID`. |
 | **T15 AIRA-324** | Enforce, 80%. (a) Pin 1228 booked at 983. (b) Pin 1024 booked at 820. | (a) In the lane, `L` 1292. (b) In the lane, `L` 1088. | Eligibility on `reserve`: (a) not in the lane. Occupancy on charge: `L` 1047, 884. |
 | **T16 resize** | A 1024 lane lease resized to 256. | `L`, `B_m`, `P` unchanged; `outstanding` down 768. | Occupancy on charge. `B_m` including lane charge. |
 | **T17 establish** | (a) Re-declare 512, no parent, empty queue. (b) `L` 3800, then the same. (c) With a parent. (d) A (lane server 1024) and B (former main 1024), both parentless, in both orders. (e) A suite parent 1024 and its parented worker. (f) Enforce: reserve `laneReserveMax`, and 1 MiB above. | (a) Lane. (b) Lane, `L` 4376; a new 256 small waiter is `laneFull`; `P` unchanged. (c) Main. (d) Both in the lane in both orders; identical `B_m`, `L`. (e) Parent lane, worker main. (f) Lane; main. | Room-limited (round 1): (b) main, (d) order-dependent. Always-main: (a). |
@@ -372,7 +381,7 @@ Every test states `E` and asserts the granted set and each grant's `lane`. All s
 | **T29 CE4** | `E` 49152; main 38784 with real use 42000; a lane server 1024; a 4096 head. Lane real use 1024, then 0. | Refused at 1024 (`W` 3888); granted at 0 (`W` 4912). | Pinned residual. |
 | **T30 readers** | A worker probe and a worker claim, `admitCeiling`, the enqueue and `admitConnection` too-large, with lane leases present. | Probe `AvailableBytes = min(W, P)`, unchanged by a lane grant while `P` binds; claim granted iff it fits `min(W, P)`; ceilings on `maximum - x` and `J_m`. | A site left on whole-slice values. |
 | **T31 suspension** | `memory.max` such that `maximum - x <= floor`, one lane lease. | No lane grant; `available = W`; one transition line. | No suspension: main room `P <= 0` freezes the slice. |
-| **T32 client** | Reply with the lane on: a 3 GiB job facing a 2.5 GiB `ceiling_bytes`; a 1 GiB job facing 0.8 GiB; lane leases with main below its ceiling. | First: no push hint, own-size note. Second: no own-size note. Third: no drain warning. | A whole-slice `ceiling_bytes` or `granted_bytes`. |
+| **T32 client** | Reply with the lane on: a 3 GiB job facing a 2.5 GiB `ceiling_bytes`; a 1 GiB job facing 0.8 GiB; lane leases with main below its ceiling; enforce mode. | First: no push hint, own-size note. Second: no own-size note. Third: no drain warning. `ceiling_would_be_bytes == ceiling_bytes`. | A whole-slice `ceiling_bytes`, `granted_bytes` or `ceiling_would_be_bytes`. |
 
 **Configuration and install.** Environment: `off`, `4G`; refused `0`, `9G`, `abc`, `x < y + 64M`; `y`
 ignored while off; shim forces off; the startup line. Install flags, kept value, ship defaults, re-exec
@@ -385,7 +394,7 @@ both wait clauses and their absence; the journal lines; `TestConfineSmallLaneGui
 `docs/dev/aira-350-mutation-check.py` on the `docs/dev/aira-324-mutation-check.py` pattern.
 - **False pass:** no 64 MiB (T1); lane without `W` (T5, T22b, T22c); no `cpuH` (T3, T3b, T1b); no
   `vramH` (T7); lane before rule 1 (T8), the gate (T10a) or the freeze (T27); eligibility ignoring
-  `parentScopeID` (T14a) or `suiteParent` (T14b); occupancy on charge (T15, T16); main on `W` alone
+  `parentScopeID` (T14a), `suiteParent` (T14b) or `scopeID` (T14e); occupancy on charge (T15, T16); main on `W` alone
   (T1, T22d); no `maximum - x` (T22a); on in shim (T23); emptiness on main jobs (T10b); an off-by-one
   that grants 1 MiB over the room (T28a, T28c).
 - **False fail:** lane deleted (T1, T2); lane in main headroom (T1, T4); lane in main's ledger (T4); main
@@ -531,7 +540,7 @@ parents excluded; lane first every pass; the order-independent restart rule; the
 
 ## 14. Review log
 
-**Round 1** (Codex Sol `xhigh` and a second reviewer; 19 findings, 7 P1). No finding was fix-induced:
+**Round 1** (Codex Sol `xhigh` and a second reviewer; 18 findings, 6 P1 and 12 P2). No finding was fix-induced:
 this was the first review of this spec. Grouped by root cause:
 
 | Family | Findings | Root cause | Disposition |
@@ -542,8 +551,12 @@ this was the first review of this spec. Grouped by root cause:
 | D. Units | P2: eligibility contradicts the ticket | Eligibility and protective accounting shared one unit. | Eligibility on `ledgerCharge()` (ticket); occupancy on the cap (proof). Ticket updated. |
 | E. Evidence | P2 x3: "upper bounds" unproven, yield not established, necessity under CPU | First fit is not monotone; no CPU gate; the incident was partly slot-bound. | Relabelled estimates; CPU sensitivity (§1e) gives 32-80%; gross, not net; `x` chosen on cost (§1f); acceptance screen defined; §0 states the slot-bound limit; T1b. |
 | F. Client wire | P2 x2: `ceiling_bytes` decisions | Round 1 grew `ceiling_bytes` by `x`, and the client decides on it. | The summary describes the main pool; every client consumer listed (§2.1); T32. |
-| G. Test plan | P2 x2: CE list not pinned, readers and boundaries untested | — | CE1-CE8 each pinned; T28, T30, T31 added; every test states `E`; the sim gained `fixed`, `fixed-add` and the control `off-x`. |
+| G. Test plan | P2 x2: CE list not pinned, readers and boundaries untested | — | CE1-CE8 each pinned; T28, T30, T31 added; `E` stated in the common settings and where it differs; the sim gained `fixed`, `fixed-add` and the control `off-x`. |
 | H. Configuration | P2: no daemon twin of the install floor; 4G default on a small slice | — | Per-pass suspension (T31); install renders `off` on a small slice. |
+
+**Found in the plan-fix pass, not by a reviewer:** a scope-less waiter can be parentless (`aira run`,
+or `confine-reserve` outside a confine scope), so round 1's eligibility admitted uncapped leases to
+the lane. Eligibility now requires a scope id (§2.2, T14e).
 
 **Non-convergence check.** Round 1 claimed that the lane "never takes main ledger room by construction".
 Family B's P1 is a blocker of that class, so the approach was re-evaluated rather than patched. The
