@@ -43,7 +43,7 @@ sum, derived by a walk. One ledger, one ceiling, and every reader of them unchan
 | The lane on top of the ceiling (round 3 rows A, D) | Owner 2026-11-19. It put worst-case MemAvailable inside the watchdog's 8 GiB band. |
 | The partition (rows B, C): main room `P`, whole-slice fit `W`, kernel cap `K`, `E_m`, overflow charge, parent-move fit, tiny-slice suspension, the reader table | With one ceiling, main's room is today's `available` and every reader stays correct. |
 | A second cgroup slice | Per-scope caps already bound use; every tool would learn a second slice. |
-| A stored per-lease pool flag | It needs a restart rule; the derived sum is restart-neutral. Cost at `x = 8`: 0 to 1 point (R8). |
+| A stored per-lease pool flag | It needs a restart rule; the derived sum is re-derived from whatever re-declares (I6). Cost at `x = 8`: 0 to 1 point (R8). |
 | The live-child clause (a lease with a live sub-reservation is not small) | Parents are not eligible. Counting them in `S` costs 0.0 points at `x = 8` (1.0 with silt) (E, replay 1h vs 1h'). |
 | Lane grants obeying the fairness hold; a lane-internal head rule; eviction or ageing | The first removes the benefit (holds held 73.5% of small wait, §1). The other two are not needed: the head is protected by G and the main path is today's. |
 | Exempting small waiters inside today's walk instead of a pre-pass | It gives no priority over an earlier main waiter that fits (the owner asked for priority; test T21). |
@@ -120,16 +120,14 @@ if laneOn && !restartFrozen {
 
 - **The reference waiter** `nextRef(order, k)`: the first index `>= k` whose waiter is queued, not a
   sub-reservation, not blocked by `gate`, and passes `admitCouldFitEmptyLocked(w, E)`
-  (`admit.go:2843`). It is derived from this pass's queue alone, before any grant: no state from an
-  earlier pass. Every waiter the pre-pass can grant is at or after it (a waiter that fits now could
-  fit an empty slice), so it changes only when the reference itself is granted. At the start of a
-  pass it is the waiter today's walk would make the head if it does not fit, or grant if it does.
-- **Pushed:** behind a pushed reference the lane is closed; a pushed eligible waiter that is itself
-  the reference is evaluated and may use the lane. A pushed reference that fits is granted by the
-  main walk, so the lane waits one pass.
-- **Priority:** the pre-pass runs before every main waiter, so freed room goes to small waiters
-  first even past an earlier main waiter that fits (T21). Inside the lane: first fit in evaluation
-  order; `--priority high` small waiters go first because the order does.
+  (`admit.go:2843`), derived from this pass's queue before any grant (no earlier-pass state). Every
+  waiter the pre-pass can grant is at or after it (one that fits now could fit an empty slice), so
+  it changes only when the reference itself is granted. It is the waiter today's walk would make
+  the head if it does not fit, or grant if it does.
+- **Pushed:** behind a pushed reference the lane is closed; a pushed eligible reference may use the
+  lane. A pushed reference that fits is granted by the main walk, so the lane waits one pass.
+- **Priority:** freed room goes to small waiters first, even past an earlier main waiter that fits
+  (T21). Inside the lane: first fit in evaluation order (`--priority high` first, as the order is).
 - **Lane full or kept back:** the waiter is an ordinary main waiter in today's walk: ceiling room,
   head rule, AIRA-307 budget, hold and backstop. Granted there, it is a small lease and counts in
   `S`. Still queued, it is tried in the lane again on every later pass.
@@ -163,11 +161,10 @@ never the pin). So:
   waits to end as well: at most `min(x, E - H - ref.reserve)` of bookings in RAM, and up to all but
   `ref.cpu` slots in CPU. Whether other leases end at all is today's question.
 
-**How often G binds (M, replay 1i):** in RAM, never in this window. Over 520 holds, at the ceiling
-sampled within 120 s before each, with the lane full at `x` and headroom for 33 jobs, the named head
-fitted with at least 11.36 GiB to spare at `x = 8` (15.36 at `x = 4`). G binds only for heads above
-about `E - 4 GiB - x`: about 26 GiB at the lowest ceiling (38.0 GiB) and `x = 8`, against a largest
-retained reserve of 25.3 GiB. The CPU and VRAM conjuncts are unmeasured (no per-instant record).
+**How often G binds (M, replay 1i):** never in RAM here. Over 520 holds, at the ceiling sampled within
+120 s before each, a lane full at `x` and headroom for 33 jobs, the named head had 11.36 GiB to spare
+at `x = 8` (15.36 at 4). G binds only above about `E - 4 GiB - x`, 26 GiB at the lowest ceiling
+(38.0), against a largest retained reserve of 25.3 GiB. CPU and VRAM: unmeasured.
 
 ### 2.4 Interactions
 
@@ -180,7 +177,7 @@ retained reserve of 25.3 GiB. The CPU and VRAM conjuncts are unmeasured (no per-
 | Fairness freeze, backstop | The pre-pass reads no phase. Lane grants never write `head.bypassed`, `budgetWithheld` or `freezeArmedAt`, so they never arm or spend a hold. The backstop pass is today's. | T11 |
 | Restart freeze (S11) | The pre-pass is skipped while `restartFrozen`, as every new admission is (`admit.go:2592`). | T10 |
 | AIRA-324 (enforce at 0.9 since 2026-11-19 00:10, R) | `y` and `x` are in bookings (`ledgerCharge`), so a pin up to `y` / factor is eligible: 1137 MiB at 0.9. G and the physical rule use pins. | T12 |
-| ARDR, restart (§3 I6) | An establish books the pin (`newEstablishedWaiter`, `admit.go:2114-2125`, sets no charge), so a discounted or resized small lease can only leave the small class; `S` is re-derived from the leases that re-declared. An in-place SET (`admit.go:2318-2335`) restores the grant-time booking, so it can only move a lease out, unless the client sends a different reserve (hand-made; then `S` may pass `x` and the lane shuts until it falls). | T13 |
+| ARDR, restart (§3 I6) | An establish books the pin (`newEstablishedWaiter`, `admit.go:2114-2125`, sets no charge), and an in-place SET (`admit.go:2318-2335`) restores the grant-time booking. So a discounted or resized lease whose pin is above `y` leaves `S`, and one whose pin is at most `y` stays and re-books higher: `S` is re-derived and may rise above `x`. The lane is then shut until `S` falls; the host is unaffected (I1). | T13 |
 | `confine --resize` | Lowers the booking (`confine_resize.go:128-142`), so `S` falls or a large lease becomes small. Either is a re-derive. | T14 |
 | Suite parents | Not eligible (`laneKind`). Granted in main, a parent of at most `y` counts in `S`. Its workers are head-exempt main sub-reservations, as today. A plain `make` wrapper that runs a nested `--delegate-ram` suite is eligible, but the workers name the nested parent: only `--delegate-ram` launches get worker-admit (`confine_linux.go:1233-1238`, `1255-1256`). | T15 |
 | ci-shim | `laneOn` is false (`s.shimMode()`); `install --ci` renders `off` (`internal/install/mode.go:321` pattern). | T17 |
@@ -242,18 +239,21 @@ Keywords: `small-job lane`, `1G`, `8G`, `ahead of larger`, `CI`, `--front`, `--d
   pass it, as today. The lane adds no host exposure. *Proof:* the pre-pass grants only through the
   fit that today's walk uses, after `rederiveLedgerLocked` has folded in every earlier grant.
 - **I2 Lane cap.** At every lane grant `S_after <= x`. `S` passes `x` only through main grants of
-  small waiters, a resize that makes a lease small, or a hand-made SET. Then no lane grant happens
+  small waiters, a resize that makes a lease small, or a re-booking (a restart or SET puts a
+  discounted or resized small lease back at its pin or grant value). Then no lane grant happens
   until it falls.
-- **I3 Priority is bounded by x.** The live bookings granted by the lane are at most `x` (after a
-  restart re-books discounted pins, at most `x` / factor). *Proof:* they are small leases, so in
-  `S`. At each lane grant `S <= x`; between lane grants that set only shrinks, and a booking only
-  falls (a resize) or returns to its grant value (a SET). **I4 G** (§2.3) holds at every lane grant.
+- **I3 Priority is bounded.** At each lane grant the small leases' bookings, the new one included,
+  are at most `x`. Afterwards lane-granted bookings grow only by re-booking, by at most their pins
+  less their bookings (I6). **I4 G** (§2.3) holds at every lane grant; it is on pins, which no
+  resize, SET or restart changes, so re-booking does not weaken it.
 - **I5 Head bookkeeping untouched.** Lane grants never change `bypassed`, `budgetWithheld`,
   `freezeArmedAt` or `freezeHolderSeq`; the main walk is today's code, so AIRA-307's bound on
   main grants past an unpushed head holds unchanged (`admit.go:485-490`).
-- **I6 Restart.** `S` is a function of the lease set: re-declaring the same leases in any order gives
-  the same `S`, less any lease whose booking rose to its pin (only outward). New lane grants after
-  it obey I2-I4; no bookings pass the ceiling beyond today's re-declare window (I1).
+- **I6 Restart.** After a restart `S` is the booking sum of the surviving leases whose pin is at most
+  `y`, independent of re-declare order. It can be above or below the old `S`: discounted pins at
+  0.9 re-book about 11% higher (a full `S = 8 GiB` becomes about 8.9 GiB, E), resized ones at their
+  reserve. While `S > x` no lane grant happens; no booking passes the ceiling beyond today's
+  re-declare window (I1).
 - **I7 Precedence:** fail-fast trip, slice read, restart freeze, exclusivity gate, pushed reference,
   lane cap, fit, G, then today's walk. **I8 Off is today:** with `laneOn` false the pre-pass does
   nothing, and every existing test passes unchanged.
@@ -264,6 +264,8 @@ Keywords: `small-job lane`, `1G`, `8G`, `ahead of larger`, `CI`, `--front`, `--d
   of other jobs' bookings to end than today. Small-lease occupancy: time-weighted mean 1.58 GiB,
   p90 3.5 GiB (E, replay 1i, `x = 8`). At the window's average release of about 2.7 GB/min (E,
   round-3 query part 4) that is about 0.6 min, 1.4 min and, with `x` full, 3.2 min per head (E).
+  Queued suite workers also see freed room go to the lane first, up to `x`. Seen as the head's
+  queue position with `small-job lane: S of x` in `--list`; lever: `--front` the head.
   *Accept this as the price of priority, or veto by lowering `x`.*
 - **R2 Heads that cannot fit beside the small leases already running** (above about `E - H - S`,
   mostly very large heads) wait for those to end; G keeps the lane shut past them meanwhile, so
@@ -273,7 +275,8 @@ Keywords: `small-job lane`, `1G`, `8G`, `ahead of larger`, `CI`, `--front`, `--d
   lane to about 6.4 GiB and are seen as `small` rows with a large age in `confine --list`.
   *Accept.*
 - **R4 CPU- or VRAM-bound heads.** Lane jobs take freed slots first, up to all but the head's
-  need. Such a head may then wait for every non-small slot to free. Unmeasured.
+  need. Such a head may then wait for every non-small slot to free. Unmeasured. Seen as many
+  `small` rows and small waiters `kept back`; lever: `--front` the head.
   *Accept, or veto for round 1's rule (leave the head's slots free now), which shuts the lane
   whenever the head is slot-bound, the incident's state.*
 - **R5 Pushed heads close the lane:** small jobs wait behind a `--front` job, which is also the
@@ -282,9 +285,10 @@ Keywords: `small-job lane`, `1G`, `8G`, `ahead of larger`, `CI`, `--front`, `--d
 - **R6 Suite parents never use the lane.** A hand-made `aira confine-reserve` inside a lane job
   gets head-exempt main sub-reservations, as any running job can today (`pylib/env.go:220-223`).
   *Accept.*
-- **R7 After a restart** re-declared small leases keep counting in `S`. A discounted or resized one
-  leaves it, which gives the lane more room. A push is dropped (AIRA-309), so a former pushed head
-  no longer closes the lane. *Accept.*
+- **R7 After a restart** small leases re-book at their pins: `S` can rise above `x` by up to about
+  0.9 GiB at `x = 8` (enforce at 0.9, E), plus any resize, and the lane stays shut until it falls
+  (`lane_used_bytes` above `lane_capacity_bytes` in `--list`). Leases with pins above `y` leave `S`.
+  Pushes are dropped (AIRA-309), so a former pushed head no longer closes the lane. *Accept.*
 - **R8 Overflow and parents count.** Small jobs granted in main (lane full, suite parents) count
   against `x`, so the lane reopens only as small leases end. Cost against a stored flag: 0.0 points
   at `x = 8` (1.0 with silt), 10.3 at `x = 4` (E, replay 1 vs 1h, round 3's footprint).
@@ -324,7 +328,7 @@ and `laneKind`; "main leases" book above `y`. Every test asserts the granted set
 | **T10 restart freeze** | Freeze active, room ample, a small waiter. | Not granted; `waited` set. | The pre-pass during the freeze. |
 | **T11 freeze and backstop** | (a) Idle phase, a head with its budget spent, small waiters that fit. Twin with the lane off. (b) Backstop pass. (c) Hold phase. | (a) Lane grants; `freezeArmedAt` stays zero. Twin: it arms. (b) The lane grants first, then today's backfill; `bypassed` counts only main grants. (c) Lane grants. | An anchor write or `bypassed` on a lane grant. |
 | **T12 AIRA-324** | Enforce, 90%. Pins 1137 and 1138 (bookings 1023.3 and 1024.2). | 1137 is eligible, `S` rises by its booking, G and the physical rule see 1137. 1138 is not eligible. | Eligibility on the pin; `S` on pins. |
-| **T13 restart** | Two lane-granted, one main-granted, one discounted (pin 1100) and one resized (4096 to 512) small lease, plus three main leases. Drop the leases and re-establish them by `enqueueReDeclare` in several orders. Separately, in-place SETs with the same reserve. | `S` before = the walk. After, in every order, `S` = before less the discounted and the resized lease. A SET of a lane-granted lease leaves `S` unchanged; of the resized one, removes it. | Any stored pool or counter; classification by arrival. |
+| **T13 restart** | Small leases: two lane-granted; one main-granted; discounted pin 1100 (booked 990) and pin 1000 (booked 900); resized 4096 to 512 and 1024 to 256. Three main leases. Drop the leases and re-establish them by `enqueueReDeclare` in several orders. Separately, in-place SETs with the same reserve. (b) `S` 7500 including the pin-1000 and 1024-to-256 leases, none that leave; a 256 small waiter. | After, in every order, `S` = before, less 990 and 512 (pins above `y` leave), plus 100 and 768 (re-booked at the pin). SETs: the same per lease. (b) The 256 fits before (7756); after, `S` is 8368 and it is `full`. | Any stored pool or counter; classification by arrival; "a restart only lowers `S`" (the 256 granted). |
 | **T14 resize** | A 1024 small lease resized to 256; a 4096 lease resized to 1024. | `S` falls 768; then rises 1024. | `S` on pins. |
 | **T15 parents** | Small waiters with the parent prefix, with an empty signature, and plain; a granted parent and its 512 worker. | Only the plain one is eligible. The parent counts in `S`; the worker does not, and is head-exempt. | Eligibility without the prefix or the signature check; workers in `S`. |
 | **T16 scope-less** | A scope-less, parentless 512 waiter. | Not eligible. | Eligibility without `scopeID`. |
@@ -372,24 +376,21 @@ The 2026-11-18 incident window, hold-gated (E): 16 small jobs that waited at lea
 min in total (M). The lane leaves 2.3 min at `x = 4` and 0.6 min at `x = 8`, assuming room and slots.
 
 - **Why the hold-gated row.** A hold is the one state in which today's evaluator withholds a job that
-  fits (`admit.go:2762-2769` arms only then). Outside holds a small job waits for room, a slot or a
-  push, and the lane can only reorder who gets freed room. The journal records no bookings or room
-  at grant, so no row gates on ceiling room.
+  fits (`admit.go:2762-2769`); outside holds the lane only reorders who gets freed room. The journal
+  records no bookings or room at grant, so no row gates on ceiling room.
 - **Biases. Upward:** no ceiling-room gate (a hold proves room for one withheld job, not for all the
   replay admits); no CPU gate in the first two rows; the 20-row retention cap thins small jobs (186
   signatures at the cap, M), so lane occupancy is understated; servers absent (replay 1b). G never
   bound in RAM (§2.3), so leaving it out biases nothing. **Downward:** in the hold-gated rows, small
   jobs taking freed room before earlier larger waiters outside holds; small jobs moved to the lane
   leave room for others. **Not modelled:** the cost to large jobs (R1).
-- **The CPU rows** use replay 1e's slot model: 5 retained jobs ran at the incident (M), 32 reported (R).
-- **`x = 8` against `x = 4`:** about 9-10 points more without a CPU limit, 4 at allowance 24, 0 at
-  27; R1's worst case doubles. The owner chose 8.
+- **CPU rows:** replay 1e's slot model (5 retained jobs ran at the incident, M; 32 reported, R).
+  `x = 8` buys 9-10 points over 4 without a CPU limit, 4 at 24 unseen slots, 0 at 27 (E).
 
 ## 8. Rollout, acceptance, deferrals
 
-Restart heads-up to peers; `aira install` (renders `8G`/`1G`, restarts the daemon) and `aira skill
-install`; check `--status`, the startup line and the `small-job lane:` line.
-**Acceptance after 7 days** of `confine_peak_history`, against this window (M: 63.9 s waited per
+Heads-up to peers; `aira install` (`8G`/`1G`, restarts the daemon), `aira skill install`; check
+`--status`, the startup line and `small-job lane:`. **Acceptance after 7 days** (M: 63.9 s waited per
 job over all jobs, small 49.7 s, large 113.3 s): keep the lane if small-job wait per job falls by
 at least 30% and large-job wait per job rises by at most 1.4 min (R1's p90). Otherwise report to
 the owner with the lane-grant count, the `lane_used_bytes` peak and the daemon starts. Load differs
