@@ -121,7 +121,9 @@ the independent judge of this collapse.
    cost includes the starvation class above.
 
 **This is a partial fix for the incident in any case.** At 13:21:07 the backstop pass was lost to a
-pushed head. No option here changes that (§8).
+pushed head. No option here changes that (§8). *Correction, 2026-11-18: restoring that pass would
+have changed no grant in the incident (`2026-11-18-admission-diagnostics-and-backstop-design.md`
+§2).*
 
 **Layout.** §M specifies the measurement, which can be built on the owner's yes. §0-§12 specify the
 allowance with round 3's findings fixed, so a trial can be built without another plan round if the
@@ -1217,7 +1219,9 @@ waiters and miss waiters that leave ungranted.
   measure-first, and blocked by this ticket.
 - **Waits** on an exclusive drain or hold, or behind a pushed head (by design, C5).
 - **The backstop pass lost to a pushed head** (round-3 finding 14). This was the incident's largest
-  single loss.
+  single loss. *Correction, 2026-11-18: it was not. Restoring that pass would have changed no grant
+  in the incident, because no hold armed between 13:21:08 and 13:22:22. See
+  `2026-11-18-admission-diagnostics-and-backstop-design.md` §2.*
   - At 13:21:07 the backstop pass ran with a pushed head in front and granted nothing behind it
     (`admit.go:2691-2692`).
   - The anchor is cleared at the start of that pass (`admit.go:2538`). So the next hold needs a

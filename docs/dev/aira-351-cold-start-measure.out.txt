@@ -1,0 +1,167 @@
+AIRA-351 step 0 measurement. DB=state-copy.db
+rows: confine=244476 pytest-worker=35666; repo era (first row with repo) = 2026-11-15T08:56:53.992000+00:00; last row = 2026-11-18T15:51:44.466000+00:00
+
+=== REPO WINDOW (AIRA-323 era): 11471 confine rows, 3.29 days, shape=k1 pool=repoK1
+unpinned (cap:auto) rows=5060  retention-ambiguous=103  cold=3210  cold OOM-killed=219 (6.8%)
+cold booking sizes (top): [('budget_MiB=1024', 3088), ('budget_MiB=1536', 45), ('budget_MiB=1177', 10), ('budget_MiB=2304', 4)]
+cold with a same-shape warm pool (>=3 samples, >=1 sibling signature) = covered: 250 (7.8% of cold)
+A-lower (max x1.15): lowered=107, would-be kills (peak>est or OOM)=13 (12.15% of lowered)
+  of those, NEW kills (job was NOT OOM-killed at its cold booking today): 8 (7.48% of lowered)
+A-lower (p90 x1.15): lowered=158, would-be kills=27 (17.09%)
+A-both (max x1.15): raised=143 (of which OOM-killed at their cold booking: 17)
+warm estimate / real peak, non-OOM covered jobs: median 2.32, p10 1.15, p90 3.65
+booked GiB-h: all confine rows 1250.9 (380.4/day); cold rows 110.7 (33.7/day); cold rows w/o wall_ms: 1
+UPPER BOUND for any cold-sizing scheme: sum (booked - real peak) x wall over non-OOM cold rows = 64.74 GiB-h (19.69/day)
+A-lower saved: max 2.16 GiB-h (0.66/day, 2.0% of cold GiB-h); p90 3.25 GiB-h (0.99/day)
+A-both: net saved -0.73 GiB-h (-0.22/day); raises add 2.90 GiB-h
+decision inputs: G1 coverage 7.8% (>=30); G2 0.66 GiB-h/day (>=24) and 2.0% of cold GiB-h (>=10); G3 kills 12.15% of lowered (<=1) and 3.95/day (<=2)
+by repo (cold, cold_oom, no_repo, covered, lowered, lowered_kill, saved_GiBh):
+  parent fastest-ee                    695   11     0     9     7    0     0.24
+  (not a git repo)                     542   16   542     0     0    0     0.00
+  flavour-kernel                       497   68     0     4     2    0     0.10
+  fastest-ee                           379   17     0    18    17    3     0.17
+  aira                                 201   13     0   106    39    2     0.45
+  stoner                               173   65     0    67    17    2     0.33
+  pikker-fw                            160    3     0    21     4    1     0.15
+  945b12a7b344e7de                     157    6     0     0     0    0     0.00
+  np-s2-clone                          131    5     0     5     4    1     0.13
+  tooling                              110    3     0     5     3    1     0.02
+  np-s4-clone                           46    0     0     1     1    0     0.02
+  raplaspace                            35    4     0    14    13    3     0.53
+  np-s4b-clone                          19    2     0     0     0    0     0.00
+  pikker                                14    0     0     0     0    0     0.00
+would-be kills (peak MiB, est MiB, booked MiB, K1 shape):
+  (1024, 799, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6.1-sol -c model_reasoning_effo')
+  (607, 562, 1024, '<wt>/mut.sh')
+  (1024, 561, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6-astra -c model_reasoning_effo')
+  (1024, 381, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6.1-sol -c model_reasoning_effo')
+  (122, 15, 1024, 'python3 <wt>')
+  (635, 436, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6-astra -c model_reasoning_effo')
+  (778, 707, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6.1-sol -c model_reasoning_effo')
+  (511, 432, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6.1-sol -c model_reasoning_effo')
+
+=== REPO WINDOW, loose shape (sensitivity): 11471 confine rows, 3.29 days, shape=k2 pool=repoK2
+unpinned (cap:auto) rows=5060  retention-ambiguous=103  cold=3210  cold OOM-killed=219 (6.8%)
+cold booking sizes (top): [('budget_MiB=1024', 3088), ('budget_MiB=1536', 45), ('budget_MiB=1177', 10), ('budget_MiB=2304', 4)]
+cold with a same-shape warm pool (>=3 samples, >=1 sibling signature) = covered: 1172 (36.5% of cold)
+A-lower (max x1.15): lowered=613, would-be kills (peak>est or OOM)=41 (6.69% of lowered)
+  of those, NEW kills (job was NOT OOM-killed at its cold booking today): 30 (4.89% of lowered)
+A-lower (p90 x1.15): lowered=946, would-be kills=94 (9.94%)
+A-both (max x1.15): raised=559 (of which OOM-killed at their cold booking: 30)
+warm estimate / real peak, non-OOM covered jobs: median 2.91, p10 1.18, p90 15.49
+booked GiB-h: all confine rows 1250.9 (380.4/day); cold rows 110.7 (33.7/day); cold rows w/o wall_ms: 1
+UPPER BOUND for any cold-sizing scheme: sum (booked - real peak) x wall over non-OOM cold rows = 64.74 GiB-h (19.69/day)
+A-lower saved: max 12.71 GiB-h (3.87/day, 11.5% of cold GiB-h); p90 22.42 GiB-h (6.82/day)
+A-both: net saved 2.59 GiB-h (0.79/day); raises add 10.12 GiB-h
+decision inputs: G1 coverage 36.5% (>=30); G2 3.87 GiB-h/day (>=24) and 11.5% of cold GiB-h (>=10); G3 kills 6.69% of lowered (<=1) and 12.47/day (<=2)
+by repo (cold, cold_oom, no_repo, covered, lowered, lowered_kill, saved_GiBh):
+  parent fastest-ee                    695   11     0   525   269   14     8.92
+  (not a git repo)                     542   16   542     0     0    0     0.00
+  flavour-kernel                       497   68     0    57    38    2     0.14
+  fastest-ee                           379   17     0   156    80    9     0.90
+  aira                                 201   13     0   146    58    3     0.58
+  stoner                               173   65     0    76    17    2     0.33
+  pikker-fw                            160    3     0   108    62    2     0.23
+  945b12a7b344e7de                     157    6     0    21    21    0     0.34
+  np-s2-clone                          131    5     0    15    14    1     0.13
+  tooling                              110    3     0    41    28    4     0.31
+  np-s4-clone                           46    0     0     2     2    0     0.02
+  raplaspace                            35    4     0    20    19    4     0.55
+  np-s4b-clone                          19    2     0     0     0    0     0.00
+  pikker                                14    0     0     5     5    0     0.01
+would-be kills (peak MiB, est MiB, booked MiB, K1 shape):
+  (1024, 799, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6.1-sol -c model_reasoning_effo')
+  (1024, 736, 1024, 'sh -c make ci > ~<wt>/ci.log 2>&1; echo make-ci-exit=$?')
+  (1024, 561, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6-astra -c model_reasoning_effo')
+  (1024, 381, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6.1-sol -c model_reasoning_effo')
+  (316, 312, 1024, 'aitest-parent make test-services TEST_PATHS=../../services/llm ../../compose/test_llm_two_hops.py ../../contra')
+  (221, 207, 1024, 'aitest-parent make test-site TEST_PATHS=/home/mark/heap/wt-s30-2a/fastest_ee/gateways/site/test_stateless_chec')
+  (226, 206, 1024, 'aitest-parent make test-services TEST_PATHS=../../services/llm ../../compose/test_llm_two_hops.py PYTEST_OPTS=')
+  (1024, 350, 1024, 'aitest-parent make test-engine TEST_PATHS=<wt>/fastest_ee/libs/engine/test_bl1485_ground_site_table.py')
+
+=== REPO WINDOW, repo-blind K1 (what canonicalisation alone buys): 11471 confine rows, 3.29 days, shape=k1 pool=blindK1
+unpinned (cap:auto) rows=5060  retention-ambiguous=103  cold=3210  cold OOM-killed=219 (6.8%)
+cold booking sizes (top): [('budget_MiB=1024', 3088), ('budget_MiB=1536', 45), ('budget_MiB=1177', 10), ('budget_MiB=2304', 4)]
+cold with a same-shape warm pool (>=3 samples, >=1 sibling signature) = covered: 444 (13.8% of cold)
+A-lower (max x1.15): lowered=81, would-be kills (peak>est or OOM)=10 (12.35% of lowered)
+  of those, NEW kills (job was NOT OOM-killed at its cold booking today): 8 (9.88% of lowered)
+A-lower (p90 x1.15): lowered=377, would-be kills=54 (14.32%)
+A-both (max x1.15): raised=363 (of which OOM-killed at their cold booking: 32)
+warm estimate / real peak, non-OOM covered jobs: median 4.43, p10 1.53, p90 10.83
+booked GiB-h: all confine rows 1250.9 (380.4/day); cold rows 110.7 (33.7/day); cold rows w/o wall_ms: 1
+UPPER BOUND for any cold-sizing scheme: sum (booked - real peak) x wall over non-OOM cold rows = 64.74 GiB-h (19.69/day)
+A-lower saved: max 3.56 GiB-h (1.08/day, 3.2% of cold GiB-h); p90 10.85 GiB-h (3.30/day)
+A-both: net saved -19.73 GiB-h (-6.00/day); raises add 23.29 GiB-h
+decision inputs: G1 coverage 13.8% (>=30); G2 1.08 GiB-h/day (>=24) and 3.2% of cold GiB-h (>=10); G3 kills 12.35% of lowered (<=1) and 3.04/day (<=2)
+by repo (cold, cold_oom, no_repo, covered, lowered, lowered_kill, saved_GiBh):
+  parent fastest-ee                    695   11     0    47    42    3     2.07
+  (not a git repo)                     542   16     0    40     0    0     0.00
+  flavour-kernel                       497   68     0    16     5    0     0.76
+  fastest-ee                           379   17     0    39     8    1     0.01
+  aira                                 201   13     0   132    16    3     0.63
+  stoner                               173   65     0    78     2    1     0.04
+  pikker-fw                            160    3     0    27     0    0     0.00
+  945b12a7b344e7de                     157    6     0     1     1    0     0.00
+  np-s2-clone                          131    5     0    17     2    0     0.00
+  tooling                              110    3     0    17     2    0     0.00
+  np-s4-clone                           46    0     0     4     0    0     0.00
+  raplaspace                            35    4     0    20     2    1     0.00
+  np-s4b-clone                          19    2     0     1     0    0     0.00
+  pikker                                14    0     0     0     0    0     0.00
+would-be kills (peak MiB, est MiB, booked MiB, K1 shape):
+  (1024, 434, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s workspace-write -m gpt-6.1-sol -c model_reasonin')
+  (1024, 279, 1024, 'aitest-parent make test-engine TEST_PATHS=<wt>/fastest_ee/libs/engine/test_bl1485_ground_site_table.py')
+  (203, 195, 1024, 'aitest-parent make test-engine TEST_PATHS=<wt>/fastest_ee/tools/quality/test_import_graph.py')
+  (146, 138, 1024, 'aitest-parent make test-engine TEST_PATHS=<wt>/fastest_ee/libs/report/test_place_details_render.py')
+  (100, 83, 1024, 'make t FILE=fastest_ee/libs/obs/test_orch_metrics.py')
+  (459, 355, 1024, 'codex exec --ephemeral --skip-git-repo-check --color never -s read-only -m gpt-6.1-sol -c model_reasoning_effo')
+  (94, 90, 1024, 'node calc/factory/build-site.js --out <wt>')
+  (514, 433, 1024, 'sqlite3 -readonly /home/mark/.local/state/aira/state.db .backup <wt>/state-copy.db')
+
+=== WHOLE HISTORY with a budget_basis, repo-blind K1 PROXY (no repo before 2026-11-15; no wall_ms -> counts only): 211482 confine rows, 70.65 days, shape=k1 pool=blindK1
+unpinned (cap:auto) rows=95237  retention-ambiguous=850  cold=78902  cold OOM-killed=2059 (2.6%)
+cold booking sizes (top): [('budget_MiB=1024', 26504), ('budget_MiB=1391', 2826), ('budget_MiB=1436', 2049), ('budget_MiB=1447', 1826)]
+cold with a same-shape warm pool (>=3 samples, >=1 sibling signature) = covered: 12755 (16.2% of cold)
+A-lower (max x1.15): lowered=7305, would-be kills (peak>est or OOM)=237 (3.24% of lowered)
+  of those, NEW kills (job was NOT OOM-killed at its cold booking today): 227 (3.11% of lowered)
+A-lower (p90 x1.15): lowered=7305, would-be kills=237 (3.24%)
+A-both (max x1.15): raised=5450 (of which OOM-killed at their cold booking: 104)
+warm estimate / real peak, non-OOM covered jobs: median 4.06, p10 1.31, p90 9.29
+by repo (cold, cold_oom, no_repo, covered, lowered, lowered_kill, saved_GiBh):
+  (no repo column)                   59938 1766     0 11222  6154  154     0.00
+  parent (no repo column)            15755   74     0  1089  1070   73     0.00
+  parent fastest-ee                    695   11     0    47    42    3     0.00
+  (not a git repo)                     542   16     0    40     0    0     0.00
+  flavour-kernel                       497   68     0    16     5    0     0.00
+  fastest-ee                           379   17     0    39     8    1     0.00
+  aira                                 201   13     0   132    16    3     0.00
+  stoner                               173   65     0    78     2    1     0.00
+  pikker-fw                            160    3     0    27     0    0     0.00
+  945b12a7b344e7de                     157    6     0     1     1    0     0.00
+  np-s2-clone                          131    5     0    17     2    0     0.00
+  tooling                              110    3     0    17     2    0     0.00
+  np-s4-clone                           46    0     0     4     0    0     0.00
+  raplaspace                            35    4     0    20     2    1     0.00
+would-be kills (peak MiB, est MiB, booked MiB, K1 shape):
+  (150, 139, 1217, 'libs/engine/.venv/bin/python -')
+  (68, 17, 1332, '<wt>/libs/engine/.venv/bin/python -')
+  (5, 4, 1345, '/usr/bin/ngspice -b <wt>')
+  (27, 21, 1345, 'timeout 60 python3 <wt>')
+  (840, 831, 1323, '/home/mark/.local/bin/go test ./...')
+  (23, 23, 1304, '<wt>/.venv/bin/python3 <wt>/-home-mark-claude-fly/07b74515-bd2b-4681-842b-ed654d2dd6c2/scratchpad/diag_flight.')
+  (28, 26, 1304, '<wt>/.venv/bin/python3 <wt>/-home-mark-claude-fly/07b74515-bd2b-4681-842b-ed654d2dd6c2/scratchpad/diag_flight.')
+  (76, 54, 1304, 'fastest_ee/libs/engine/.venv/bin/python <wt>')
+
+=== CONTEXT (not in the decision rule): repo window, all cold rows, lowering the cold default itself
+cold default 768 MiB instead of 1024: rows at 1024=3088, saved 7.23 GiB-h/day, would-be kills 364 (11.8%)
+cold default 512 MiB instead of 1024: rows at 1024=3088, saved 14.46 GiB-h/day, would-be kills 600 (19.4%)
+cold default 256 MiB instead of 1024: rows at 1024=3088, saved 21.69 GiB-h/day, would-be kills 1154 (37.4%)
+cold non-OOM real peak MiB: p10 12, p50 163, p90 677, p99 1428
+
+=== aitest WORKER pools (kind pytest-worker): NOT sized from history today (worker reserve = overhead env + @aira_mem), shown as context only
+repo window: pool runs=2961 distinct keys=2345 distinct rootdirs=173 distinct args (wt-masked)=2271; runs whose largest worker cap > 2x pool peak: 2418 of 2961; repo column set: 0; wall_ms set: 0
+  budget basis: [('cap:aitest:overhead-env:set', 2456), ('cap:aitest:overhead-env:default', 505)]
+  top (basis, largest worker cap MiB, rootdir wt-masked): [(('cap:aitest:overhead-env:set', 1024, '<wt>'), 1384), (('cap:aitest:overhead-env:set', 4096, '<wt>'), 222), (('cap:aitest:overhead-env:default', 512, '<wt>'), 169), (('cap:aitest:overhead-env:set', 3072, '<wt>'), 165), (('cap:aitest:overhead-env:set', 2048, '<wt>'), 140)]
+whole history: pool runs=35666 distinct keys=24420 distinct rootdirs=2745 distinct args (wt-masked)=21471; runs whose largest worker cap > 2x pool peak: 21798 of 26677; repo column set: 0; wall_ms set: 0
+  budget basis: [('cap:aitest:overhead-env:set', 21254), (None, 8989), ('cap:aitest:overhead-env:default', 5423)]
+  top (basis, largest worker cap MiB, rootdir wt-masked): [(('cap:aitest:overhead-env:set', 1024, '<wt>'), 9268), ((None, 0, '<wt>'), 6031), (('cap:aitest:overhead-env:default', 512, '<wt>'), 2560), (('cap:aitest:overhead-env:set', 4096, '<wt>'), 2045), (('cap:aitest:overhead-env:set', 3072, '<wt>/fastest_ee/gateways/site'), 1502)]
