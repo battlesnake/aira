@@ -1,0 +1,56 @@
+window 2026-11-15T08:56:52Z .. 2026-11-18T19:12:34Z (82.3 h); confine rows with wait/start/wall/budget: 11941
+limits: signatures at the 20-row cap whose oldest retained row is inside the window (older rows lost): 186; rows in the window without timing, by kind: {'confine': 2, 'pytest-worker': 3188}
+
+## 0 population (y = 1 GiB)
+small (all)    n=  9281 waited>=10s= 3285 wait-hours=  128.2 p50(>=10s)=72s
+small parents  n=   903 waited>=10s=  416 wait-hours=   20.4 p50(>=10s)=106s
+large          n=  2660 waited>=10s= 1428 wait-hours=   83.7 p50(>=10s)=129s
+eligible small jobs' peak/reserve: p50 0.17 p90 0.83 p99 1.00; run time p50 3s p90 93s; ran >= 1 h: 8
+
+## 1 lane replay, eligible (parents excluded)
+x GiB | jobs | wait-h | saved-h | saved/all-small | lane-adm (of which immediate) | overflow (waited>=10s, their wait-h) | waits>=10s fully/partly saved | occ mean/p50/p90/peak GiB | full-for-1G share | someone-waiting share | occ by jobs >=10m / >=1h | real(peak-rss sum) p50/p99/peak GiB | lane jobs p99/peak
+    2 | 8378 | 107.9 | 77.6 | 60.5% | 6418 (3552) | 1960 (658, 21.4) | 1788/423 of 2869 | 0.68/0.71/1.62/2.00 | 47.8% | 16.7% | 44.1% / 9.5% | 0.11/1.32/1.73 | 4/10
+    4 | 8378 | 107.9 | 101.9 | 79.5% | 7987 (4373) | 391 (107, 3.4) | 2570/192 of 2869 | 1.12/1.06/2.87/4.00 | 9.7% | 3.1% | 43.7% / 9.2% | 0.20/2.11/3.07 | 5/13
+    6 | 8378 | 107.9 | 107.6 | 83.9% | 8331 (4576) | 47 (6, 0.1) | 2829/34 of 2869 | 1.22/1.06/3.19/6.00 | 1.2% | 0.3% | 43.8% / 8.4% | 0.21/2.54/4.31 | 6/14
+    8 | 8378 | 107.9 | 107.9 | 84.1% | 8373 (4610) | 5 (0, 0.0) | 2868/1 of 2869 | 1.23/1.06/3.19/7.83 | 0.1% | 0.0% | 43.5% / 8.4% | 0.21/2.61/4.71 | 6/15
+
+## 1 lane replay, +parents
+x GiB | jobs | wait-h | saved-h | saved/all-small | lane-adm (of which immediate) | overflow (waited>=10s, their wait-h) | waits>=10s fully/partly saved | occ mean/p50/p90/peak GiB | full-for-1G share | someone-waiting share | occ by jobs >=10m / >=1h | real(peak-rss sum) p50/p99/peak GiB | lane jobs p99/peak
+    2 | 9281 | 128.2 | 73.9 | 57.6% | 6551 (3714) | 2730 (1101, 39.7) | 1610/574 of 3285 | 0.81/1.06/1.62/2.00 | 59.8% | 25.6% | 45.1% / 7.9% | 0.17/1.19/1.77 | 4/10
+    4 | 9281 | 128.2 | 111.9 | 87.3% | 8552 (4649) | 729 (264, 8.0) | 2606/415 of 3285 | 1.48/1.38/3.19/4.00 | 18.4% | 7.9% | 41.5% / 6.9% | 0.35/2.11/3.07 | 5/13
+    6 | 9281 | 128.2 | 126.3 | 98.5% | 9164 (4948) | 117 (32, 0.4) | 3108/145 of 3285 | 1.68/1.38/3.83/6.00 | 3.6% | 1.2% | 41.1% / 6.1% | 0.37/2.64/4.31 | 7/14
+    8 | 9281 | 128.2 | 128.2 | 100.0% | 9267 (5005) | 14 (0, 0.0) | 3267/18 of 3285 | 1.70/1.38/3.88/8.00 | 0.3% | 0.1% | 40.8% / 6.0% | 0.37/2.77/4.71 | 7/16
+
+## 1b eligible, with 1.56 GiB of the lane held throughout by long-lived jobs (the live snapshot's servers, section 3)
+x GiB | saved-h | saved/all-small | overflow (waited>=10s) | full-for-1G share
+    2 | 21.1 | 16.5% | 5309 (2059) | 100.0%
+    4 | 88.0 | 68.6% | 1525 (451) | 30.6%
+    6 | 104.3 | 81.3% | 322 (62) | 5.7%
+    8 | 107.8 | 84.0% | 37 (2) | 0.6%
+
+## 1c cut alternative: main first (a job granted within 1 s never enters the lane), eligible
+x GiB | lane jobs | saved-h | saved/all-small | occ mean/p90 GiB | occ by jobs >=10m / >=1h
+    2 | 3023 | 79.9 | 62.3% | 0.45/1.22 | 39.6% / 6.9%
+    4 | 3649 | 102.3 | 79.7% | 0.70/2.12 | 42.4% / 9.9%
+    6 | 3757 | 107.7 | 84.0% | 0.73/2.12 | 41.8% / 9.5%
+    8 | 3763 | 107.8 | 84.1% | 0.73/2.12 | 41.8% / 9.5%
+
+## 1d per UTC day, eligible (the 20-row cap drops the OLDEST rows of frequent commands, so earlier days can be thinner; daily load also varies)
+day        | elig rows/h | small wait-h | x=4: saved-h, full-for-1G, someone-waiting, occ mean | x=8: saved-h, full-for-1G, someone-waiting, occ mean
+2026-11-15 |       149.5 |         26.8 |  25.4, 17.6%,  5.1%, 1.63 |  26.8,  0.2%,  0.0%, 1.91
+2026-11-16 |        94.2 |         52.2 |  48.7,  9.9%,  4.5%, 1.11 |  52.2,  0.0%,  0.0%, 1.20
+2026-11-17 |       111.4 |         15.1 |  14.9,  5.6%,  0.4%, 1.11 |  15.1,  0.0%,  0.0%, 1.15
+2026-11-18 |        62.2 |         13.8 |  12.9,  8.3%,  3.3%, 0.73 |  13.8,  0.1%,  0.0%, 0.83
+
+## 2 the 2026-11-18 incident (11:09-11:30 UTC, 13:09-13:30 EET), eligible small jobs
+eligible jobs arriving in the window: 23; waited >= 10 s: 16, their wait 71.0 min, p50 317 s, max 523 s
+x=4 GiB: of those, lane-admitted 16; remaining wait 5.8 min, p50 0 s, max 207 s
+x=8 GiB: of those, lane-admitted 16; remaining wait 0.0 min, p50 0 s, max 0 s
+
+## 3 live snapshot (aggregates only)
+ledger granted 43.95 GiB of ceiling 44.56 GiB (effective 48.25); jobs 26; queued 2; phase hold; slice current-less-reclaimable 11.03 GiB; MemAvailable 45.76 GiB; ceiling basis system-pressure
+scopes 26: job-level 21, worker 5 (worker reserve 14.00 GiB)
+small job-level scopes (reserve <= y) older than  1 h: 5, lane footprint 1.56 GiB, rss now 0.16 GiB
+small job-level scopes (reserve <= y) older than 13 h: 5, lane footprint 1.56 GiB, rss now 0.16 GiB
+small job-level scopes (reserve <= y) older than 24 h: 5, lane footprint 1.56 GiB, rss now 0.16 GiB
+all small job-level scopes: 12, footprint 6.90 GiB, rss now 1.96 GiB

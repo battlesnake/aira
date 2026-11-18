@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Read-only replay of the fixed small-job lane (AIRA-350,
+docs/superpowers/specs/2026-11-18-fixed-small-lane-design.md, section 7).
+
+Question: had a separately booked lane of fixed size x (jobs whose reserve is at most y,
+lane first, overflow to the main pool) existed, how much small-job wait would it have
+removed, how full would it have been, and how much of it would long-lived jobs hold?
+
+Inputs (read-only; never point --db at the live file):
+
+  sqlite3 ~/.local/state/aira/state.db ".backup $HOME/tmp/aira-lane2-store/state-copy.db"
+  aira confine --list --json > ~/tmp/aira-lane2-store/snapshot.json      # optional
+  aira confine -- python3 -I docs/dev/aira-350-fixed-lane-replay.py \\
+      --db ~/tmp/aira-lane2-store/state-copy.db [--snapshot ~/tmp/aira-lane2-store/snapshot.json]
+
+The snapshot holds other sessions' job names and commands, so it is not committed; this
+script prints only aggregates from it.
+
+Model (one row of confine_peak_history = one finished confine job):
+  arrival a = started_at_ms - wait_ms; historical grant g = started_at_ms; hold = wall_ms;
+  lane footprint f = budget + 64 MiB (the per-job supervisor headroom, admit.go
+  admitSliceHeadroomSupervisorDefault). A job is ELIGIBLE when budget <= y and its
+  signature does not start with the --delegate-ram parent prefix "aitest-parent\\0"
+  (runner.AitestParentSignaturePrefix); the "+parents" variant drops that exclusion.
+  Every eligible job is tried in the lane first, at every instant from a to g, in arrival
+  order, first fit (a job that does not fit is skipped and a later smaller one may fit).
+  Admitted at t: it runs in the lane over [t, t + hold] and its wait becomes t - a.
+  Not admitted by g: it runs in the main pool at g as it historically did, and holds no
+  lane room. Ineligible jobs are untouched.
+
+Sections
+  0   population: small (reserve <= y) and large rows, wait-hours; peak/reserve and run time.
+  1   the replay at each x, parents excluded (the spec's eligibility) and included.
+  1b  the same with a constant lane occupancy held throughout (--silt), standing in for the
+      long-lived jobs (servers) the store cannot see because they have not ended.
+  1c  the cut alternative "main pool first": a job granted within 1 s never enters the lane.
+  1d  per UTC day, to show how the retention cap thins the earlier days.
+  2   the 2026-11-18 incident window.
+  3   aggregates from a live `aira confine --list --json` snapshot, if given.
+
+What the model leaves out (each makes the saving an UPPER bound unless stated):
+  - the CPU slot ceiling (32 slots on this box), the physical-room gate and the rule that a
+    lane grant must leave the main head's physical RAM, CPU and VRAM need: a lane grant
+    here needs only lane room;
+  - secondary effects: jobs leaving the main pool for the lane free main room for others
+    (this makes the saving a LOWER bound for jobs that stay in main);
+  - jobs still running when the store was copied (servers) have no row, so lane silting
+    by them is absent here; --snapshot reports what is running now;
+  - the store keeps 20 rows per (kind, signature) (internal/store/confine_peak_history.go:13),
+    so frequent commands lost rows: the population is the retained sample;
+  - pytest-worker rows carry no timing and are sub-reservations (never lane-eligible);
+  - budget is the scope cap, the reserve for an ordinary confine job; pin-charge is in
+    observe mode, so booking == reserve at grant.
+"""
+import argparse
+import heapq
+import json
+import sqlite3
+import statistics
+from datetime import datetime, timezone
+
+GIB = 1 << 30
+MIB = 1 << 20
+PER_JOB = 64 * MIB
+PARENT_PREFIX = "aitest-parent\x00"
+IMMEDIATE_MS = 1000  # a grant within 1 s of arrival counts as immediate
+UTC = timezone.utc
+
+
+def fmt_t(ms):
+    return datetime.fromtimestamp(ms / 1000, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pct(values, q):
+    if not values:
+        return float("nan")
+    values = sorted(values)
+    k = max(0, min(len(values) - 1, int(round(q / 100.0 * (len(values) - 1)))))
+    return values[k]
+
+
+def load(db):
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    rows = con.execute(
+        "SELECT budget, wait_ms, started_at_ms, wall_ms, peak_rss, signature FROM confine_peak_history "
+        "WHERE kind='confine' AND wait_ms IS NOT NULL AND started_at_ms IS NOT NULL "
+        "AND wall_ms IS NOT NULL AND budget IS NOT NULL").fetchall()
+    lost_sigs = con.execute(
+        "SELECT count(*) FROM (SELECT signature, count(*) c, min(started_at_ms) m FROM confine_peak_history "
+        "WHERE kind='confine' GROUP BY signature HAVING c >= 20 AND m >= "
+        "(SELECT min(started_at_ms) FROM confine_peak_history WHERE wait_ms IS NOT NULL))").fetchone()[0]
+    no_timing = con.execute(
+        "SELECT kind, count(*) FROM confine_peak_history WHERE at >= "
+        "(SELECT min(at) FROM confine_peak_history WHERE wait_ms IS NOT NULL) "
+        "AND (wait_ms IS NULL OR started_at_ms IS NULL OR wall_ms IS NULL) GROUP BY kind").fetchall()
+    con.close()
+    jobs = []
+    for budget, wait, start, wall, peak, sig in rows:
+        jobs.append(dict(budget=budget, wait=max(0, wait), g=start, a=start - max(0, wait),
+                         hold=max(0, wall), peak=peak or 0, parent=sig.startswith(PARENT_PREFIX)))
+    return jobs, lost_sigs, no_timing
+
+
+def simulate(jobs, x, y, include_parents, silt=0, main_first=False):
+    """Event-driven lane replay. Returns per-run metrics.
+
+    silt: a constant lane occupancy held throughout (long-lived jobs absent from the store).
+    main_first: the cut alternative; a job the main pool granted within 1 s never enters the lane."""
+    elig = [j for j in jobs if j["budget"] <= y and (include_parents or not j["parent"])
+            and not (main_first and j["wait"] < IMMEDIATE_MS)]
+    elig.sort(key=lambda j: (j["a"], j["g"]))
+    for idx, j in enumerate(elig):
+        j["_id"] = idx
+        j["_f"] = j["budget"] + PER_JOB
+    # events: (time, order, id); order 0 release, 1 arrival; deadlines are checked after the scan
+    events = []
+    for j in elig:
+        heapq.heappush(events, (j["a"], 1, j["_id"]))
+    waiting = []  # ids in arrival order
+    deadline_heap = []
+    occ = silt
+    residents = {}
+    admitted_at = {}
+    # occupancy integration
+    last_t = None
+    t0 = elig[0]["a"] if elig else 0
+    area = 0.0          # GiB*ms of occupancy
+    area_long = 0.0     # occupancy held by residents with hold >= 1 h
+    area_10m = 0.0
+    full_ms = 0         # time a 1 GiB job (y + 64 MiB) would not fit
+    blocked_ms = 0      # time an eligible job was waiting and fitted nowhere in the lane
+    peak_occ = 0
+    peak_real = 0
+    real_samples = []   # (duration, real) for a time-weighted p99
+    peak_count = 0
+    count_samples = []
+    occ_samples = []
+    segs = []           # (start, duration, occupancy, someone-waiting) for the per-day split
+
+    def account(t):
+        nonlocal last_t, area, area_long, area_10m, full_ms, blocked_ms
+        if last_t is not None and t > last_t:
+            dt = t - last_t
+            area += occ * dt
+            long_occ = sum(elig[i]["_f"] for i in residents if elig[i]["hold"] >= 3_600_000)
+            m10 = sum(elig[i]["_f"] for i in residents if elig[i]["hold"] >= 600_000)
+            area_long += long_occ * dt
+            area_10m += m10 * dt
+            if occ + y + PER_JOB > x:
+                full_ms += dt
+            if waiting:
+                blocked_ms += dt
+            real = sum(elig[i]["peak"] for i in residents)
+            real_samples.append((dt, real))
+            count_samples.append((dt, len(residents)))
+            occ_samples.append((dt, occ))
+            segs.append((last_t, dt, occ, bool(waiting)))
+        last_t = t
+
+    while events or deadline_heap:
+        t = min(events[0][0] if events else float("inf"), deadline_heap[0][0] if deadline_heap else float("inf"))
+        account(t)
+        # releases and arrivals at t
+        while events and events[0][0] == t:
+            _, kind, i = heapq.heappop(events)
+            if kind == 0:
+                occ -= elig[i]["_f"]
+                del residents[i]
+            else:
+                waiting.append(i)
+                heapq.heappush(deadline_heap, (elig[i]["g"], i))
+        # first-fit scan in arrival order
+        still = []
+        for i in waiting:
+            j = elig[i]
+            if occ + j["_f"] <= x:
+                occ += j["_f"]
+                residents[i] = True
+                admitted_at[i] = t
+                heapq.heappush(events, (t + j["hold"], 0, i))
+            else:
+                still.append(i)
+        waiting = still
+        peak_occ = max(peak_occ, occ)
+        peak_count = max(peak_count, len(residents))
+        peak_real = max(peak_real, sum(elig[i]["peak"] for i in residents))
+        # deadlines at or before t: still waiting -> main pool at g
+        while deadline_heap and deadline_heap[0][0] <= t:
+            _, i = heapq.heappop(deadline_heap)
+            if i not in admitted_at and i in waiting:
+                waiting.remove(i)
+
+    span = (last_t - t0) if last_t is not None else 0
+
+    def tw_pct(samples, q):
+        tot = sum(d for d, _ in samples)
+        if not tot:
+            return 0
+        acc = 0
+        for d, v in sorted(samples, key=lambda s: s[1]):
+            acc += d
+            if acc >= q / 100.0 * tot:
+                return v
+        return samples[-1][1]
+
+    waited = [j for j in elig if j["wait"] >= 10_000]
+    saved = sum(j["g"] - admitted_at[j["_id"]] for j in elig if j["_id"] in admitted_at)
+    full_saves = sum(1 for j in waited if admitted_at.get(j["_id"]) == j["a"])
+    part_saves = sum(1 for j in waited if j["_id"] in admitted_at and admitted_at[j["_id"]] != j["a"])
+    lane_immediate = sum(1 for j in elig if j["_id"] in admitted_at and j["wait"] < IMMEDIATE_MS)
+    overflow = [j for j in elig if j["_id"] not in admitted_at]
+    overflow_waited = sum(1 for j in overflow if j["wait"] >= 10_000)
+    return dict(
+        n=len(elig), wait_h=sum(j["wait"] for j in elig) / 3.6e6, saved_h=saved / 3.6e6,
+        admitted=len(admitted_at), lane_immediate=lane_immediate,
+        overflow=len(overflow), overflow_waited=overflow_waited, overflow_wait_h=sum(j["wait"] for j in overflow) / 3.6e6,
+        waited=len(waited), full_saves=full_saves, part_saves=part_saves,
+        mean_occ=area / span / GIB if span else 0, peak_occ=peak_occ / GIB,
+        p50_occ=tw_pct(occ_samples, 50) / GIB, p90_occ=tw_pct(occ_samples, 90) / GIB,
+        full_share=full_ms / span if span else 0, blocked_share=blocked_ms / span if span else 0,
+        long_share=area_long / area if area else 0, m10_share=area_10m / area if area else 0,
+        peak_real=peak_real / GIB, p99_real=tw_pct(real_samples, 99) / GIB, p50_real=tw_pct(real_samples, 50) / GIB,
+        peak_count=peak_count, p99_count=tw_pct(count_samples, 99), span_h=span / 3.6e6,
+        admitted_at=admitted_at, elig=elig, segs=segs)
+
+
+def per_day(jobs, xs, y):
+    """Per UTC day: retained rows per hour (the 20-row cap drops older rows of frequent
+    commands, so earlier days are thinner), and the lane's fill and saving that day."""
+    DAY = 86_400_000
+    runs = {x: simulate(jobs, x, y, False) for x in xs}
+    elig = runs[xs[0]]["elig"]
+    days = sorted({j["a"] // DAY for j in elig})
+    head = "day        | elig rows/h | small wait-h | " + " | ".join(
+        f"x={x / GIB:.0f}: saved-h, full-for-1G, someone-waiting, occ mean" for x in xs)
+    lines = [head]
+    for d in days:
+        lo, hi = d * DAY, (d + 1) * DAY
+        rows = [j for j in jobs if lo <= j["a"] < hi and j["budget"] <= y and not j["parent"]]
+        span_lo = max(lo, min(j["a"] for j in elig))
+        span_hi = min(hi, max(j["g"] for j in elig))
+        hours = max(1e-9, (span_hi - span_lo) / 3.6e6)
+        parts = []
+        for x in xs:
+            r = runs[x]
+            adm = r["admitted_at"]
+            saved = sum(j["g"] - adm[j["_id"]] for j in r["elig"] if lo <= j["a"] < hi and j["_id"] in adm)
+            tot = full = blk = area = 0
+            for st, dt, occ, w in r["segs"]:
+                a, b = max(st, lo), min(st + dt, hi)
+                if b <= a:
+                    continue
+                seg = b - a
+                tot += seg
+                area += occ * seg
+                if occ + y + PER_JOB > x:
+                    full += seg
+                if w:
+                    blk += seg
+            parts.append(f"{saved / 3.6e6:5.1f}, {full / tot if tot else 0:5.1%}, {blk / tot if tot else 0:5.1%}, "
+                         f"{area / tot / GIB if tot else 0:.2f}")
+        lines.append(f"{fmt_t(lo)[:10]} | {len(rows) / hours:11.1f} | {sum(j['wait'] for j in rows) / 3.6e6:12.1f} | " + " | ".join(parts))
+    return lines
+
+
+def incident(jobs, xs, y, lo, hi):
+    """The 2026-11-18 incident window, in UTC milliseconds [lo, hi)."""
+    out = []
+    sel = [j for j in jobs if lo <= j["a"] < hi and j["budget"] <= y and not j["parent"]]
+    waited = [j for j in sel if j["wait"] >= 10_000]
+    out.append(f"eligible jobs arriving in the window: {len(sel)}; waited >= 10 s: {len(waited)}, "
+               f"their wait {sum(j['wait'] for j in waited) / 60000:.1f} min, "
+               f"p50 {pct([j['wait'] for j in waited], 50) / 1000:.0f} s, max {max([j['wait'] for j in waited] or [0]) / 1000:.0f} s")
+    for x in xs:
+        r = simulate(jobs, x, y, include_parents=False)
+        adm = r["admitted_at"]
+        after = []
+        for j in r["elig"]:
+            if lo <= j["a"] < hi and j["wait"] >= 10_000:
+                after.append((j["g"] - adm[j["_id"]]) if j["_id"] in adm else 0)
+                # remaining wait
+        rem = []
+        for j in r["elig"]:
+            if lo <= j["a"] < hi and j["wait"] >= 10_000:
+                rem.append((adm[j["_id"]] - j["a"]) if j["_id"] in adm else j["wait"])
+        out.append(f"x={x / GIB:.0f} GiB: of those, lane-admitted {sum(1 for j in r['elig'] if lo <= j['a'] < hi and j['wait'] >= 10_000 and j['_id'] in adm)}; "
+                   f"remaining wait {sum(rem) / 60000:.1f} min, p50 {pct(rem, 50) / 1000:.0f} s, max {max(rem or [0]) / 1000:.0f} s")
+    return out
+
+
+def snapshot_report(path, y):
+    with open(path) as fh:
+        data = json.load(fh)["data"]
+    sr = data.get("slice_reserve") or {}
+    scopes = data.get("scopes") or []
+    lines = []
+    cur = sr.get("slice_current_bytes", 0) - sr.get("slice_reclaimable_bytes", 0)
+    lines.append(f"ledger granted {sr.get('granted_bytes', 0) / GIB:.2f} GiB of ceiling {sr.get('ceiling_bytes', 0) / GIB:.2f} GiB "
+                 f"(effective {sr.get('ceiling_effective_bytes', 0) / GIB:.2f}); jobs {sr.get('jobs')}; queued {sr.get('queued')}; "
+                 f"phase {sr.get('freeze_phase')}; slice current-less-reclaimable {cur / GIB:.2f} GiB; MemAvailable "
+                 f"{sr.get('system_mem_available_bytes', 0) / GIB:.2f} GiB; ceiling basis {sr.get('ceiling_basis')}")
+    job_level = [s for s in scopes if not s.get("worker")]
+    workers = [s for s in scopes if s.get("worker")]
+    small = [s for s in job_level if 0 < (s.get("reserve_bytes") or 0) <= y]
+    lines.append(f"scopes {len(scopes)}: job-level {len(job_level)}, worker {len(workers)} "
+                 f"(worker reserve {sum(s.get('reserve_bytes') or 0 for s in workers) / GIB:.2f} GiB)")
+    for age_h in (1, 13, 24):
+        old = [s for s in small if (s.get("age_seconds") or 0) >= age_h * 3600]
+        lines.append(f"small job-level scopes (reserve <= y) older than {age_h:>2} h: {len(old)}, "
+                     f"lane footprint {sum((s.get('reserve_bytes') or 0) + PER_JOB for s in old) / GIB:.2f} GiB, "
+                     f"rss now {sum(s.get('rss_bytes') or 0 for s in old) / GIB:.2f} GiB")
+    lines.append(f"all small job-level scopes: {len(small)}, footprint {sum((s.get('reserve_bytes') or 0) + PER_JOB for s in small) / GIB:.2f} GiB, "
+                 f"rss now {sum(s.get('rss_bytes') or 0 for s in small) / GIB:.2f} GiB")
+    return lines
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--snapshot")
+    ap.add_argument("--y", type=float, default=1.0, help="job size limit, GiB")
+    ap.add_argument("--x", type=float, nargs="+", default=[2, 4, 6, 8], help="lane sizes, GiB")
+    ap.add_argument("--silt", type=float, default=1.56, help="lane GiB held throughout by long-lived jobs (section 1b)")
+    args = ap.parse_args()
+    y = int(args.y * GIB)
+    xs = [int(v * GIB) for v in args.x]
+    jobs, lost_sigs, no_timing = load(args.db)
+    lo = min(j["a"] for j in jobs)
+    hi = max(j["g"] + j["hold"] for j in jobs)
+    print(f"window {fmt_t(lo)} .. {fmt_t(hi)} ({(hi - lo) / 3.6e6:.1f} h); confine rows with wait/start/wall/budget: {len(jobs)}")
+    print(f"limits: signatures at the 20-row cap whose oldest retained row is inside the window "
+          f"(older rows lost): {lost_sigs}; rows in the window without timing, by kind: {dict(no_timing)}")
+    small = [j for j in jobs if j["budget"] <= y]
+    large = [j for j in jobs if j["budget"] > y]
+    parents = [j for j in small if j["parent"]]
+    print(f"\n## 0 population (y = {args.y:g} GiB)")
+    for name, pop in (("small (all)", small), ("small parents", parents), ("large", large)):
+        w = [j["wait"] for j in pop]
+        print(f"{name:<14} n={len(pop):>6} waited>=10s={sum(1 for v in w if v >= 10_000):>5} wait-hours={sum(w) / 3.6e6:7.1f} "
+              f"p50(>=10s)={pct([v for v in w if v >= 10_000], 50) / 1000:.0f}s")
+    sw = [j for j in small if not j["parent"]]
+    ratios = [j["peak"] / j["budget"] for j in sw if j["peak"] and j["budget"]]
+    print(f"eligible small jobs' peak/reserve: p50 {pct(ratios, 50):.2f} p90 {pct(ratios, 90):.2f} p99 {pct(ratios, 99):.2f}; "
+          f"run time p50 {pct([j['hold'] for j in sw], 50) / 1000:.0f}s p90 {pct([j['hold'] for j in sw], 90) / 1000:.0f}s; "
+          f"ran >= 1 h: {sum(1 for j in sw if j['hold'] >= 3_600_000)}")
+    small_wait_h = sum(j["wait"] for j in small) / 3.6e6
+    for include_parents in (False, True):
+        label = "+parents" if include_parents else "eligible (parents excluded)"
+        print(f"\n## 1 lane replay, {label}")
+        print("x GiB | jobs | wait-h | saved-h | saved/all-small | lane-adm (of which immediate) | overflow (waited>=10s, their wait-h) "
+              "| waits>=10s fully/partly saved | occ mean/p50/p90/peak GiB | full-for-1G share | someone-waiting share "
+              "| occ by jobs >=10m / >=1h | real(peak-rss sum) p50/p99/peak GiB | lane jobs p99/peak")
+        for x in xs:
+            r = simulate(jobs, x, y, include_parents)
+            print(f"{x / GIB:>5.0f} | {r['n']} | {r['wait_h']:.1f} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | "
+                  f"{r['admitted']} ({r['lane_immediate']}) | {r['overflow']} ({r['overflow_waited']}, {r['overflow_wait_h']:.1f}) | "
+                  f"{r['full_saves']}/{r['part_saves']} of {r['waited']} | "
+                  f"{r['mean_occ']:.2f}/{r['p50_occ']:.2f}/{r['p90_occ']:.2f}/{r['peak_occ']:.2f} | {r['full_share']:.1%} | {r['blocked_share']:.1%} | "
+                  f"{r['m10_share']:.1%} / {r['long_share']:.1%} | {r['p50_real']:.2f}/{r['p99_real']:.2f}/{r['peak_real']:.2f} | "
+                  f"{r['p99_count']}/{r['peak_count']}")
+    silt = int(args.silt * GIB)
+    print(f"\n## 1b eligible, with {args.silt:g} GiB of the lane held throughout by long-lived jobs (the live snapshot's servers, section 3)")
+    print("x GiB | saved-h | saved/all-small | overflow (waited>=10s) | full-for-1G share")
+    for x in xs:
+        r = simulate(jobs, x, y, False, silt=silt)
+        print(f"{x / GIB:>5.0f} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | {r['overflow']} ({r['overflow_waited']}) | {r['full_share']:.1%}")
+    print("\n## 1c cut alternative: main first (a job granted within 1 s never enters the lane), eligible")
+    print("x GiB | lane jobs | saved-h | saved/all-small | occ mean/p90 GiB | occ by jobs >=10m / >=1h")
+    for x in xs:
+        r = simulate(jobs, x, y, False, main_first=True)
+        print(f"{x / GIB:>5.0f} | {r['admitted']} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | "
+              f"{r['mean_occ']:.2f}/{r['p90_occ']:.2f} | {r['m10_share']:.1%} / {r['long_share']:.1%}")
+    print("\n## 1d per UTC day, eligible (the 20-row cap drops the OLDEST rows of frequent commands, so earlier days can be thinner; daily load also varies)")
+    for line in per_day(jobs, [4 * GIB, 8 * GIB], y):
+        print(line)
+    print("\n## 2 the 2026-11-18 incident (11:09-11:30 UTC, 13:09-13:30 EET), eligible small jobs")
+    lo_i = int(datetime(2026, 11, 18, 11, 9, tzinfo=UTC).timestamp() * 1000)
+    hi_i = int(datetime(2026, 11, 18, 11, 30, tzinfo=UTC).timestamp() * 1000)
+    for line in incident(jobs, [4 * GIB, 8 * GIB], y, lo_i, hi_i):
+        print(line)
+    if args.snapshot:
+        print("\n## 3 live snapshot (aggregates only)")
+        for line in snapshot_report(args.snapshot, y):
+            print(line)
+
+
+if __name__ == "__main__":
+    main()
