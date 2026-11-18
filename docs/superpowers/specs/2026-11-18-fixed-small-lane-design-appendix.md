@@ -13,7 +13,8 @@ The withdrawn dynamic lane is `2026-11-18-small-job-lane-design.md` (four rounds
 | Fixed lane, round 1 | A pool of fixed size `x` on top of today's ceiling | Review: 6 P1, 12 P2. Host exposure (family A), head independence (B), restart (C). |
 | Fixed lane, round 2 | A partition: the lane out of the ceiling and gated on the whole-slice fit `W` | Review: 2 P1 and 6 P2, of which six of the eight substantive findings were fix-induced (families A, C). Sol was OOM-killed at its 1 GiB cap. |
 | Fixed lane, round 3 | The fork stated with a proof; rows A-D (below); derived pools; blocked on the owner | Superseded by the owner's 2026-11-19 decision. |
-| Round 4 | Priority and a cap of `x` inside the one ceiling, guard G | This spec. |
+| Round 4 | Priority and a cap of `x` inside the one ceiling, guard G | Review: 3 P1, 12 P2 (§A7). |
+| Round 5 | Round 4 with its review fixed; stop at a fitting sub-reservation | This spec. |
 
 ## A2. Why round 4 drops what it drops
 
@@ -89,3 +90,50 @@ and small jobs get priority.
   carry no parent id. Only `--delegate-ram` launches receive worker-admit
   (`internal/runner/confine_linux.go:1233-1238`, `1255-1256`), which points to the `uv run` job as the
   parent. Its 2 GiB is above `y` in any case.
+
+## A7. Round 4 review (15 findings: 3 P1, 12 P2) and round 5's disposition
+
+Every finding was checked against the code at `45f68afd` and the AIRA-354 spec at `e9077760`;
+every one held, none is rejected. Two pairs were duplicates (T3, T13). None was fix-induced:
+round 4 was the first review of the owner's design. Grouped by root cause:
+
+| Family | Findings | Root cause | Disposition (round 5) |
+|---|---|---|---|
+| P, the price of priority understated | P1 R1 (the head advances only on main releases; the minutes and the `x` bound wrong, headroom outside `x`); P2 a starved suite worker; P2 a `confine-reserve` hold timing out behind lane grants; P2 G guards only the reference | Round 4 priced priority with the all-jobs release rate and guarded one waiter | R1 restated without minutes; the take is `x` plus 64 MiB per small job (I3); a fitting sub-reservation ends the pre-pass (new, one conjunct) and R6 states the rest; R2 with T24 and a veto form |
+| G, model | P1 the VRAM term used `total` for `free`, but the fit charges a running job twice (`vram.go:53-63`, `191`) | Copied from head eligibility, where occupancy is zero | VRAM term `total - occ.vram`; T6 runs through release, ramp-up and a fresh snapshot and fails against round 4's form; R4 states undeclared use |
+| C, restart paths | P2 x 2: a SET keeps a discounted charge (`admit.go:2326`) | Establish and SET conflated | §2.4 has two rows; I2, I6, R7 and T13 split |
+| T, test oracles | P1 + P2 T3 contradicted the pre-pass; P2 physical fit and 354 untested; P2 the reference's derivation untested | Rows written against the intent, not the pseudo-code | T3 rewritten with passes; T23 (physical witness, room-parity contract); T25 (four reference cases); T26 |
+| W, wording | P2 generated text promised a total cap; P2 I1 omitted a falling ceiling (`sliceceiling.go:531`); P2 the 354 row was stale; P2 yield rows read as cause | Claims not checked against the code or the sibling spec | §2.7 rewritten with keyword checks; I1 at grant time and T2c; the 354 row against its spec; §7 names the supported rows (0-30%); replay label fixed |
+
+**Replay re-run** (`aira350-r5-replay`, `--memory-reserve 256M`, exit 0, no `hint:` line; peak-rss
+equalled the pin again, page cache of the store copy): only output line 91 changed, the hold-overlap
+label, now "94.2 h of their 107.9 h (87.3%); 73.5% of all 128.2 small wait-hours".
+
+**Non-convergence check.** Round 5 of the fixed-lane line, the first fix round for the owner's
+design. Three P1s again, but none shows the decided design unsound: the one ceiling, the cap and
+the host bound all hold. They show its price larger than round 4 stated. R1 is put to the owner as
+a residual with its witness, not patched.
+
+## A8. Material moved out of the spec in round 5
+
+- **Data** (not committed: they name other sessions' jobs): `~/tmp/aira-lane2-store/` (store copy
+  and `confine --list` snapshots of 2026-11-18 21:12 and 21:20 EET, journal from 11-15 00:00) and
+  `~/tmp/aira-350/live-snapshot-1355.json`.
+- **`--pin-charge` sites the install flags follow:** `internal/install/install.go:154-158`,
+  `218-219`, `471-492`, `552`, `640-650`, `695-706`, `890-895`, `1063`, `1140-1143`, `1632-1670`,
+  `2507-2508`; `cmd/aira/main.go:1039`; `internal/install/mode.go:321` (CI renders `off`); usage
+  `internal/core/core.go:2241`.
+- **Yield biases in full.** Upward: no ceiling-room gate (a hold proves room for one withheld job,
+  not for all the replay admits); no CPU gate in the first two rows; the 20-row retention cap thins
+  small jobs (186 signatures at the cap, M), so lane occupancy is understated; servers absent
+  (replay 1b). G never bound in RAM, so leaving it out biases nothing. Downward: in the hold-gated
+  rows, small jobs taking freed room before earlier larger waiters outside holds; small jobs moved
+  to the lane leave room for others. CPU rows: replay 1e's slot model (5 retained jobs ran at the
+  incident, M; 32 reported, R); `x = 8` buys 9-10 points over 4 without a CPU limit, 4 at 24 unseen
+  slots, 0 at 27 (E). Why the hold-gated row: a hold is the one state in which today's evaluator
+  withholds a job that fits (`admit.go:2762-2769`); outside holds the lane only reorders who gets
+  freed room. The journal records no bookings or room at grant, so no row gates on ceiling room.
+- **Round 4's R1 minutes, withdrawn:** 0.6, 1.4 and 3.2 min per head, from the window's all-jobs
+  release rate (about 2.7 GB/min, round-3 query part 4). They assumed small-job turnover reaches the
+  head, which the pre-pass prevents while small demand lasts. Round 4's acceptance threshold
+  ("large-job wait rises by at most 1.4 min, R1's p90") went with them.

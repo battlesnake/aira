@@ -88,7 +88,7 @@ largest: 25.3, 18.0, 14.0, 14.0, 14.0 GiB; rows >= 20 GiB: 1; >= 30 GiB: 0
 ## 1i round 4: the lane INSIDE the one ceiling, with priority (x caps bookings, no 64 MiB per job in x;
 ## derived S: every small job-level lease counts, however granted, suite parents included; no ceiling-room gate)
 hold intervals in the replay window: 507, 42.0 h of 82.3 h (51.1%)
-eligible small jobs' wait inside a hold: 94.2 h of 107.9 h (73.5% of all small wait-hours)
+eligible small jobs' wait that fell inside a hold (overlap, not cause): 94.2 h of their 107.9 h (87.3%); 73.5% of all 128.2 small wait-hours
 x GiB | gate | slot allowance | saved-h | saved/all-small | lane-adm | full-for-1G share | occ mean/p90/peak GiB
     4 | none  |              - | 95.5 | 74.5% | 7227 | 14.8% | 1.58/3.63/9.00
     4 | holds |              - | 90.0 | 70.2% | 4509 | 14.7% | 1.58/3.54/9.31

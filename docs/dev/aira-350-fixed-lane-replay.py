@@ -496,8 +496,10 @@ def round4(jobs, y, xs, holds, ceil, slots, allowances, small_wait_h, lo_i, hi_i
         return tot
     elig = [j for j in jobs if j["budget"] <= y and not j["parent"]]
     ov = sum(overlap(j["a"], j["g"]) for j in elig)
-    out.append(f"eligible small jobs' wait inside a hold: {ov / 3.6e6:.1f} h of {sum(j['wait'] for j in elig) / 3.6e6:.1f} h "
-               f"({ov / 3.6e6 / small_wait_h:.1%} of all small wait-hours)")
+    elig_wait_h = sum(j['wait'] for j in elig) / 3.6e6
+    out.append(f"eligible small jobs' wait that fell inside a hold (overlap, not cause): {ov / 3.6e6:.1f} h of their "
+               f"{elig_wait_h:.1f} h ({ov / 3.6e6 / elig_wait_h:.1%}); {ov / 3.6e6 / small_wait_h:.1%} of all "
+               f"{small_wait_h:.1f} small wait-hours")
     out.append("x GiB | gate | slot allowance | saved-h | saved/all-small | lane-adm | full-for-1G share | occ mean/p90/peak GiB")
     for x in xs:
         for label, g in (("none", None), ("holds", gate)):
