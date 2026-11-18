@@ -132,8 +132,16 @@ claude-mod-check:
 	(cd "$$stage/aira-usage" && claude plugin test .); \
 	echo "claude-mod-check: ok (plugin validate and plugin test passed on a copy of $(CLAUDE_MOD_SRC))"
 
-ci: fmt-check vet build test claude-mod-check
+# AIRA-355. The ci steps run in a sub-make under .githooks/ci-pass, which exits
+# with their status and, only when every step passed from a clean worktree
+# (same HEAD tree before and after, no flag or variable override), records a
+# pass for that tree under the git common dir. The pre-push hook skips its full
+# `make ci` when every pushed branch's tree has such a record.
+CI_STEPS := fmt-check vet build test claude-mod-check
+
+ci:
+	@bash .githooks/ci-pass run "$(origin GO)" $(MAKE) --no-print-directory $(CI_STEPS)
 
 install-hooks:
 	git config core.hooksPath .githooks
-	chmod +x .githooks/pre-commit .githooks/pre-push
+	chmod +x .githooks/pre-commit .githooks/pre-push .githooks/ci-pass

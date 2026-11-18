@@ -65,9 +65,76 @@ aira_prepush_scope() {
 	if [ "$tickets" -gt 0 ]; then echo tickets; else echo docs; fi
 }
 
+# AIRA-355: the FULL scope skips `make ci` only when every pushed ref line is a
+# well-formed branch update (the same field checks as above) whose commit's
+# tree has a recorded `make ci` pass on this machine (see common.sh and
+# .githooks/ci-pass). It prints one tree per line and returns 0 only when every
+# line is such an update; a deletion, a tag, an empty push or anything it
+# cannot resolve returns 1, and the caller then runs `make ci`.
+aira_prepush_pushed_trees() {
+	local root="$1" input _local_ref local_sha remote_ref remote_sha extra tree refs=0
+	input="$(cat)" || return 1
+	while IFS=' ' read -r _local_ref local_sha remote_ref remote_sha extra; do
+		[ -n "$remote_sha" ] && [ -z "$extra" ] || return 1
+		case "$remote_ref" in refs/heads/?*) ;; *) return 1 ;; esac
+		case "$local_sha" in "" | *[!0-9a-f]*) return 1 ;; esac
+		case "$local_sha" in *[!0]*) ;; *) return 1 ;; esac
+		[ "$(git -C "$root" cat-file -t "$local_sha" 2>/dev/null)" = commit ] || return 1
+		tree="$(git -C "$root" rev-parse --verify --quiet "$local_sha^{tree}")" || return 1
+		aira_ci_pass_is_hash "$tree" || return 1
+		printf '%s\n' "$tree"
+		refs=$((refs + 1))
+	done <<<"$input"
+	[ "$refs" -gt 0 ] || return 1
+}
+
+# `make ci` below tests the CHECKED-OUT tree, not the pushed commits, so its
+# pass is proof only for a pushed branch whose tree IS that tree.
+# aira_prepush_unproven <root> <head-tree> prints the first pushed branch
+# update whose tree is neither <head-tree> nor recorded as passed, and returns
+# 1; it returns 0 when there is none. Deletions and non-branch refs (tags) are
+# not judged here: they keep running `make ci` exactly as before. A branch line
+# whose local id is not hex or does not resolve is unproven.
+aira_prepush_unproven() {
+	local root="$1" head_tree="$2" input _local_ref local_sha remote_ref _rest tree
+	input="$(cat)" || {
+		echo "(unreadable push input)"
+		return 1
+	}
+	while IFS=' ' read -r _local_ref local_sha remote_ref _rest; do
+		case "$remote_ref" in refs/heads/?*) ;; *) continue ;; esac
+		case "$local_sha" in "" | *[!0-9a-f]*)
+			printf '%s (unparseable object id)\n' "$remote_ref"
+			return 1
+			;;
+		esac
+		case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+		if ! tree="$(git -C "$root" rev-parse --verify --quiet "$local_sha^{tree}")"; then
+			printf '%s (unresolvable commit %s)\n' "$remote_ref" "$local_sha"
+			return 1
+		fi
+		if [ -n "$head_tree" ] && [ "$tree" = "$head_tree" ]; then continue; fi
+		if aira_ci_pass_marker "$root" "$tree" >/dev/null; then continue; fi
+		printf '%s (tree %s)\n' "$remote_ref" "$tree"
+		return 1
+	done <<<"$input"
+}
+
+aira_prepush_head_tree() {
+	git -C "$1" rev-parse --verify --quiet 'HEAD^{tree}' 2>/dev/null || true
+}
+
+# All of stdin once: the fast-path classifier and the tree-pass checks each
+# read it from a here-string, which normalises it exactly as `$(cat)` inside
+# the classifier always did.
+input="$(cat)" || input=""
+
 scope=full
+root=""
 if root="$(aira_hook_worktree_root)"; then
-	scope="$(aira_prepush_scope "$root")" || scope=full
+	scope="$(aira_prepush_scope "$root" <<<"$input")" || scope=full
+else
+	root=""
 fi
 case "$scope" in
 docs)
@@ -78,7 +145,56 @@ tickets)
 	printf 'pre-push: every pushed path is Markdown under docs/ or .aira/tickets/ (against origin/master); running only the internal/store tests (AIRA-315).\n' >&2
 	aira_hook_run_make pre-push normal test-store
 	;;
-*)
-	aira_hook_run_make pre-push normal ci
-	;;
 esac
+
+head_tree=""
+if [ -n "$root" ]; then
+	if trees="$(aira_prepush_pushed_trees "$root" <<<"$input")"; then
+		proven=1
+		markers=""
+		while IFS= read -r tree; do
+			if marker="$(aira_ci_pass_marker "$root" "$tree")"; then
+				markers="$markers$tree $marker"$'\n'
+			else
+				proven=0
+				break
+			fi
+		done <<<"$trees"
+		if [ "$proven" -eq 1 ]; then
+			while IFS=' ' read -r tree marker; do
+				[ -n "$tree" ] || continue
+				when="$(date -u -r "$marker" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || when="an unknown time"
+				printf 'pre-push: tree %s already passed make ci on this machine at %s; skipped (AIRA-355).\n' "$tree" "$when" >&2
+			done <<<"$markers"
+			exit 0
+		fi
+	fi
+	head_tree="$(aira_prepush_head_tree "$root")"
+	if ! unproven="$(aira_prepush_unproven "$root" "$head_tree" <<<"$input")"; then
+		printf 'pre-push: refusing the push: %s is neither the checked-out tree (%s) nor recorded as passing make ci on this machine (AIRA-355).\n' "$unproven" "${head_tree:-none}" >&2
+		printf 'pre-push: make ci here would test only the checked-out tree. Run make ci in a clean worktree at that commit, or push from one.\n' >&2
+		exit 1
+	fi
+fi
+
+status=0
+(
+	aira_hook_run_make pre-push normal ci
+) || status=$?
+if [ "$status" -ne 0 ]; then
+	exit "$status"
+fi
+
+# The run proved the tree that was checked out when it started: refuse if HEAD
+# moved meanwhile, and re-check every pushed branch against the tree now.
+if [ -n "$root" ]; then
+	head_after="$(aira_prepush_head_tree "$root")"
+	if [ "$head_after" != "$head_tree" ]; then
+		printf 'pre-push: refusing the push: the checked-out tree changed during make ci (%s -> %s), so the run proves neither (AIRA-355).\n' "${head_tree:-none}" "${head_after:-none}" >&2
+		exit 1
+	fi
+	if ! unproven="$(aira_prepush_unproven "$root" "$head_after" <<<"$input")"; then
+		printf 'pre-push: refusing the push: %s has no make ci pass after the run (AIRA-355).\n' "$unproven" >&2
+		exit 1
+	fi
+fi
