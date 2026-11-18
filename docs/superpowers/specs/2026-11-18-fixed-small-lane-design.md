@@ -39,8 +39,7 @@ grants, one evaluator branch. Where its room comes from is the one decision (§2
 
 | Addition beyond the minimum | Failure it closes | Size |
 |---|---|---|
-| Lane occupancy counted at the cap (`reserve` + 64 MiB) | With occupancy at the discounted charge, lane real use could exceed `x` and reach main's room (§3). | unit choice |
-| Main headroom from main jobs only | Each lane job would add 64 MiB to main's headroom (`admitSliceHeadroom`, `admit.go:1041-1051`). | one subtraction |
+| Lane occupancy at the cap (`reserve` + 64 MiB); main headroom from main jobs only | At the discounted charge lane real use could exceed `x`; each lane job would add 64 MiB to main's headroom (`admit.go:1041-1051`). | units |
 | Overflow charged to main, `max(0, S - x)` (§2.1) | Without it the lane's accounting could exceed `x` after a restart or an overflow. | one term |
 | A lane grant leaves the head's CPU slots and VRAM (§2.2) | CPU and VRAM are one shared ledger, so a lane grant could take the slot a head waits for. | two conjuncts |
 | The kernel-cap conjunct `K` (§2.2) | Without it a fixed lane could push total bookings past the slice's `memory.max`, so an OOM could hit the slice instead of one scope. | one conjunct |
@@ -62,8 +61,9 @@ a lane-internal head rule, a lane in ci-shim mode. §10 lists the cuts.
 - **Small jobs' share** (M, replay §0, 82.3 h): 9281 retained small rows waited 128.2 h in total; 2660
   large rows waited 83.7 h.
 - **The ceiling** (M, `aira-350-ceiling-drop.out.txt`, 93.2 h): 4731 throttled samples (84.6% of the
-  minutes), all `bound-by=system-pressure`; effective 38.0-52.5 GiB, median 48.75. MemAvailable never
-  went below 29.44 GiB (p1 36.41). The daemon started 10 times.
+  minutes; what the other minutes were, static-bound, warm-up or unlogged, is not established), all
+  `bound-by=system-pressure`; effective 38.0-52.5 GiB, median 48.75. MemAvailable never went below
+  29.44 GiB (p1 36.41). The daemon started 10 times.
 
 ## 2. Design
 
@@ -162,8 +162,17 @@ if laneOn && laneEligible(w) {
     record laneFull or laneShut (diagnosis only)
 }
 available := W; if laneOn { available = min(W, P) }       // the main path, as today
-... today's code from admit.go:2663 on, with `available`, physicalFree_w and, for the head, E_m
+... today's code from admit.go:2663 on, with `available`, physicalFree_w and, for the head, E_m;
+    the RAM fit is `charge <= W` and the after-grant main fit (below)
 ```
+
+**Main fit is judged on the state after the grant:** `B_big' + max(0, S' - x) + H(J_big') <= E_m`,
+the primed sums derived as if `w` were granted (computed directly, not by a trial walk). For an
+ordinary waiter this is today's `w.ledgerCharge() <= P`. An overflowing small waiter is charged only
+its part above `x`. A sub-reservation whose parent is small with no other live child also carries
+the parent's move out of `S`. Without that term a suite's first worker would put its parent in main
+unchecked, and the freed lane room could be re-booked past `E_w`. With it, a worker's condition
+equals today's (`P` is larger by exactly the parent's booking), so no new wait or deadlock arises (T14g).
 
 **`laneEligible(w)`:** `w.scopeID != "" && !w.isSubReservation() && !w.exclusive && w.laneKind &&
 w.ledgerCharge() <= y`. A scope-less waiter has no kernel cap (`admit.go:3551`), so its real use is
@@ -184,7 +193,8 @@ tries the lane first again (T19), past an unpushed head's budget and hold, backs
 and with no head too (T21). **Inside the lane:** first fit in evaluation order (`admitOrderLocked`,
 `admit.go:452-476`), no lane-internal head rule (T20). **Overflow:** a small waiter granted in main
 counts in `S`; while `S > x` main is charged `S - x`, so freed lane room goes first to running
-overflow leases, not to new waiters (§6, replay §1h').
+overflow leases, not to new waiters (§6, replay §1h'). The bypass budget counts `w.ledgerCharge()`, as
+today.
 
 ### 2.3 Host protection, by row
 
@@ -208,6 +218,13 @@ overflow leases, not to new waiters (§6, replay §1h').
   is the one `sliceceiling.go:319-325` encodes for `freeMin`; there is no prior decision about a lane.
 - **Lane real use** is bounded by `S` (scope caps), and the pressure term does not move with the
   slice's own anon (`sliceceiling.go:224-230`), so lane growth does not lower `E`.
+- **Row A's physical floor is `E + x`, not `E`.** Main's physical term is the whole slice's, on
+  `E_w`. When real memory is short, main can therefore use up to `x` of physical room that today's
+  rule would refuse; the `E + x` bound is unchanged. Putting main's physical term on `E` would let
+  lane real use lower main's room (cut, §10).
+- **Every reclassification is checked or bounded:** a parent's move into main by the after-grant fit (§2.2); a
+  return to `S` only moves bookings; a late re-declare skips every gate, as today, and `K` bounds the
+  lane refill it can free (CE11).
 - **A ledger partition, not a second cgroup:** a real `aira-lane.slice` would make the client, `--list`,
   `--kill`, the reaper, `--resize`, the worker paths and the CPU and VRAM ledgers (`admit.go:742-757`)
   learn a second slice, for a cap the per-scope caps already give.
@@ -226,8 +243,7 @@ overflow leases, not to new waiters (§6, replay §1h').
 | `confine --resize` | Lowers `charge` only (`confine_resize.go:139`); `S` counts the cap, so lane room and `P` are unchanged. | T16 |
 | Long-lived lane jobs | First come, no eviction. Measured: 5 small job-level scopes about 128 h old, 1.56 GiB of footprint (M, replay §3). | §6 |
 | Overflowed waiter, lane room later | A queued waiter takes the lane on the next pass. A granted overflow lease is not moved, but its charge to main falls as `S - x` falls. | T19 |
-| Restart freeze | Before the lane: frozen waiters `continue` at `admit.go:2592-2595`. | T27 |
-| ci-shim mode | Off: Serve forces `x = 0` and `laneOn` checks `!s.shimMode()` (`shim.go:37`). | T23 |
+| Restart freeze; ci-shim | Frozen waiters `continue` before the lane (`admit.go:2592-2595`). Shim: Serve forces `x = 0` and `laneOn` checks `!s.shimMode()` (`shim.go:37`). | T27, T23 |
 
 **Deviations from the brief.** (1) Item 5's per-job pool: pools are derived in aggregate, so a row
 shows `small: true` and the summary `min(S, x)` in the lane, `max(0, S - x)` charged to main. Rows by
@@ -246,12 +262,10 @@ the lane as room frees. Only accounting moves; nothing is evicted.
   startup; `a` and `G` are build constants. **Suspension:** a pass with `M - x <=
   sliceCeilingUsableFloor()` is a lane-off pass, one journal line per transition.
 
-**Install** copies each pin-charge site (unchanged from round 2): flags `--small-lane SIZE|off` and
-`--small-lane-job-max SIZE` (`install.go:154-158`, `471-492`, `E_INSTALL_ARGUMENT_INVALID`), kept value
-(`640-650`), ship defaults `4G`/`1G` (`695-706`), re-exec forwarding (`890-895`), render re-validation
-(`1632`), unit placeholders, `--status` (`2507-2508`), `off` in the shim environment (`mode.go:321`),
-usage (`core.go:2241`). On a slice with `MemoryMax - x <= sliceCeilingUsableFloor()` (`install.go:68`
-allows 4 GiB) the default renders `off`, and an explicit value that large is refused.
+**Install** copies each pin-charge site, as round 2: `--small-lane SIZE|off`, `--small-lane-job-max SIZE`
+(`install.go:154-158`, `471-492`, `640-650`, `695-706`, `890-895`, `1632`, `2507-2508`; `mode.go:321`;
+`core.go:2241`), refused with `E_INSTALL_ARGUMENT_INVALID`, ship defaults `4G`/`1G`. Where `MemoryMax - x
+<= sliceCeilingUsableFloor()` (`install.go:68` allows 4 GiB) the default is `off`; an explicit value is refused.
 
 ### 2.6 Observability (minimal)
 
@@ -277,12 +291,10 @@ The AIRA-340 pattern (`internal/core/skill.go:305-318`): `ConfineSmallLaneGuidan
 `skill.go:338`, install help) and `ConfineSmallLaneSummary` (`confine` summary `core.go:2607`, MCP
 instructions `cmd/aira/mcp.go:29`), keywords pinned by `TestConfineSmallLaneGuidanceIsOnEveryFace`
 (`cmd/aira/confine_priority_test.go:100`). Long draft: "Small-job lane (default on, not in CI mode): a
-job booking at most 1G is admitted first from a fixed 4G small-job lane, without waiting behind larger
-queued jobs; when the lane is full it queues for the main pool as before. It still needs a free CPU
-slot and never takes the slot or GPU memory the head of the queue waits for. Keep small jobs small;
-give a long-running server an honest small reserve and stop it when done. `--delegate-ram` suites
-never use the lane." Short draft: "Jobs booking at most 1G are admitted from a separate small-job lane
-first, so keep short commands' reserves small."
+job booking at most 1G is admitted first from a fixed 4G lane, without waiting behind larger queued
+jobs; when it is full the job queues for the main pool. It still needs a CPU slot. Keep small jobs
+small; give a server an honest small reserve. `--delegate-ram` suites never use the lane." Short:
+"Jobs booking at most 1G use a separate small-job lane first, so keep short commands' reserves small."
 
 ## 3. Invariants
 
@@ -290,13 +302,12 @@ first, so keep short commands' reserves small."
    `S` can pass `x` only through main-path grants of small waiters and accounting changes such as a
    parent's last child ending; main is charged the excess.
 2. **Host bounds by row** (§2.3): at every main grant `outstanding + H(outstandingJobs) <= E_w`; at
-   every lane grant the same under `yield`, and `<= M` under `fixed`. Counting the new job, bookings
-   never pass `M` minus headroom.
-3. **`P` reads lane state only through `max(0, S - x)`.** A lane grant leaves that term at 0. Any
-   change that lowers `S` lowers or keeps it.
+   every lane grant the same under `yield`, and `<= M` under `fixed`. Only a re-declare passes `M`
+   minus headroom, as today (CE11).
+3. **`P` reads lane state only through `max(0, S - x)`**, which a lane grant leaves at 0.
 4. **Head independence.** While `S <= x` and the slice's real use outside small scopes is at most
-   `B_big`, a main waiter's RAM room is exactly `P`. No lane grant, release, real-use growth or resize
-   lowers it. Main grants (a sub-reservation moving its parent out of `S` included) lower it, as today.
+   `B_big`, a main waiter's RAM room is exactly `P`. No lane grant, release (observe mode), real-use
+   growth or resize lowers it; main grants lower it, as today, each within its after-grant fit.
 5. **Head CPU and VRAM.** A lane grant past head `H` leaves `H`'s slots and VRAM free, and never changes
    `H.bypassed`, `budgetWithheld` or `freezeArmedAt`.
 6. **AIRA-307's bound** on main grants past an unpushed head holds unchanged (`admit.go:485-490`).
@@ -338,7 +349,13 @@ A (below `M - x`). Each residual below is pinned by a test.
   for the ceiling or for main leases to end. In the sim's W12 the head is never granted under the
   partition while 1.5 GiB of never-ending main leases stand (210 s today).
 - **CE8, CE9:** while suspended, small leases are ordinary (T31); a pin-charge mode change across a
-  restart can move a discounted lease above `y` out of `S` (documented, not tested).
+  restart can move a discounted lease above `y` out of `S` (documented, not tested). In enforce mode
+  (not installed), a discounted parent returning to `S` while `S > x` raises main's charge by its
+  discount, so `P` can fall on a child's release; T25 runs in observe mode.
+- **CE11, late re-declares** (T17b): a re-declare skips every gate today. One arriving after the
+  restart freeze (a worker, or a SET with a changed reserve) can move a lease out of `S` unchecked, and
+  the freed lane room can then be re-booked. The overshoot is at most that lease's footprint, and `K`
+  keeps total bookings within `M`.
 - **CE10, ceiling falls** (T33): in row B, after main fills and `E` falls by more than `x - S`, the lane
   is shut (`laneShut`) with lane room free, until main drains. In rows A, C and D it stays open, and
   bookings can sit above the fallen ceiling (§2.3).
@@ -382,9 +399,10 @@ assertions (T5, T22, T33) state each row; head eligibility reads `E_m`.
 | **T12 CE2** | Idle phase, budget spent. Pass 1: two small waiters, lane on; twin lane off. Pass 2 (lane on): lane full, a small waiter that fits `P`. | Lane on: pass 1 no arm, pass 2 arms. Lane off: pass 1 arms. | An anchor write on a lane grant. |
 | **T13 CE1** | `J_big` 10, `B_big` 34112 (`P` 8192; lane off `W` 12288). A 16384 head, `bypassed` 0. Four 1024 small, then a 5120. | Lane on: three in the lane, the fourth and 5120 via the budget (`bypassed` 6144). Lane off: four via the budget, 5120 withheld. | Pinned residual. |
 | **T14 eligibility** | (a) A 512 sub-reservation. (b) `signature = AitestParentSignaturePrefix + "x"`, 1024, behind a held head. (c) Plain signature. (d) Empty signature. (e) Scope-less, parentless 512. (f) CE6: a lane lease, then a 512 sub-reservation naming it, behind a held head. | (a) Main, not small. (b) Held; once granted on the main path with no live child, small. (c) Lane. (d) Not eligible. (e) Main, not small. (f) The child is granted head-exempt in main, and the parent leaves `S` while it lives (`S` down 1088; `B_big` up 1024 plus the child's 512). | (a) Ignoring `parentScopeID`. (b) Eligibility without the prefix. (d) Eligibility without `signature != ""`. (e) Ignoring `scopeID`. (f) A small predicate without the child clause. |
+| **T14g parent move** | Row C. `J_big` 20, `B_big` 41152 (`P` 512); `S` 4096 over four small leases, one a childless 1024 parent. A 512 worker naming it, then a 1024 lane waiter. Twin: `B_big` 40064 (`P` 1600). | Worker refused (main after the grant 42688 + 3456 > 45056); the lane waiter `laneFull`. Twin: the worker is granted, then the lane waiter, and bookings plus headroom end at 49152 = `E_w`. | No parent term: the worker is granted, `P` goes to -1152, and the refill puts bookings plus headroom at 50240. |
 | **T15 AIRA-324** | Enforce, 80%. (a) Pin 1228 booked at 983. (b) Pin 1024 booked at 820. | (a) In the lane, `S` 1292. (b) In the lane, `S` 1088. | Eligibility on `reserve`: (a) not in the lane. Occupancy on charge: 1047, 884. |
 | **T16 resize** | A 1024 small lease resized to 256. | `S`, `B_big`, `P` unchanged; `outstanding` down 768. | Occupancy on charge. |
-| **T17 restart neutrality** | A lease set with two lane grants, an overflowed small lease, a small parent with a worker, an exclusive small lease and three main leases. Re-derive; then drop every lease and re-establish the scope-bearing, non-exclusive ones (`enqueueReDeclare`) in each of several orders. | `S`, `J_s`, `B_big`, `P` identical across orders. They equal the pre-restart values less the exclusive lease, which also leaves `outstanding` (as today). | Any stored pool flag; classification by arrival order or room. |
+| **T17 restart neutrality** | A lease set with two lane grants, an overflowed small lease, a small parent with a worker, an exclusive small lease and three main leases. Re-derive; then drop every lease and re-establish the scope-bearing, non-exclusive ones (`enqueueReDeclare`) in each of several orders. | `S`, `J_s`, `B_big`, `P` identical across orders. They equal the pre-restart values less the exclusive lease, which also leaves `outstanding` (as today). (b) CE11: the worker re-declared after the freeze: `P` falls by the parent's charge plus 64, and a lane refill stays within `K`. | Any stored pool flag; classification by arrival order or room. (b) No `K`. |
 | **T19 overflow retry** | Pass 1: `S` 4048, a 1024 small waiter held. A small lease ends. | Pass 2: in the lane. | A pool fixed at first evaluation. |
 | **T19b CE5** | `S` 4500 (an overflow lease of 1088 running). A small lease of 576 ends; a 1024 small waiter. | Not granted (`S` 3924 + 1088 > 4096); main's charge `max(0, S - x)` falls from 404 to 0, so `P` rises by 404. | Freed room to the new waiter first. |
 | **T20 first fit** | Lane residue 600; waiters 1024 then 256. | 256 in the lane; 1024 to main. | A lane head-of-line rule. |
@@ -392,7 +410,7 @@ assertions (T5, T22, T33) state each row; head eligibility reads `E_m`.
 | **T22 host** | (a) A 59392 waiter; on `memory.max` 8192 with 25 main jobs, a 1024 waiter. (b) A re-declared 64512 main lease, three 1024 small. (c) `E` 45056, main at `P = 0`, small waiters until the lane is full. (d) CE7: real use 1000, 2000 of main leases, a 42000 head. | (a) The first refused too large (`> 65536 - 4096 - 2112`); the second not. (b) None in the lane, `W < 0` (`yield`), `K < 0` (`fixed`). (c) After every grant, bookings plus headroom `<= E_w`. (d) Rows B, C: head refused (`P` 40880). | (a) No `M - x`; small reserves not exempt. (b) No `K` under `fixed`. (d) Main on `W` alone. |
 | **T23 ci-shim** | A shim server with the lane fields set. | No lane grant. | Without `!shimMode()`. |
 | **T24 off is today** | `x = 0`; a table of inputs, degenerate ones included. | `available`, `physicalFree`, grants equal today's; the existing suite passes. | Any leak when off. |
-| **T25 derived and bounded** | Random grant, release, establish, SET, resize, child grant and child end. | Sums equal a fresh walk. After every lane grant `S <= x`. While `S > x` no lane grant occurs. Invariant 2 holds after every grant. `P` never falls on a lane grant or a release. | An incremented counter; `P` lowered by a release. |
+| **T25 derived and bounded** | Observe mode; random grant, release, establish, SET, resize, child grant and child end. | Sums equal a fresh walk. After every lane grant `S <= x`. While `S > x` no lane grant occurs. Invariant 2 holds after every grant. `P` never falls on a lane grant or a release. | An incremented counter; `P` lowered by a release. |
 | **T26 guards** | Syntactic allow-lists on the `admit_pin_charge_guard_test.go` pattern. | Every selector of `outstanding`, `outstandingJobs` and the derived sums is classified (§2.1). No decision reads `laneFull`, `laneShut`, `heldByHead` or `signature`. | A new unclassified reader. |
 | **T27 restart freeze** | Freeze active, empty lane, an eligible waiter. | Not granted; `waited` set. | Lane before the freeze gate. |
 | **T28 boundaries** | (a) `S + f == x`, then `x` 1 MiB smaller. (b) `w.cpu + cpuH == cpuAvailable`. (c) A main waiter at `min(W, P)`, then 1 MiB over. | (a) Granted; `laneFull`. (b) Granted. (c) Granted; refused. | `<` for `<=`. |
@@ -402,13 +420,9 @@ assertions (T5, T22, T33) state each row; head eligibility reads `E_m`.
 | **T32 client** | Reply with the lane on: a 3 GiB job facing a 2.5 GiB `ceiling_bytes`; a 1 GiB job facing 0.8 GiB; small leases with main below its ceiling; enforce mode. | First: no push hint, own-size note. Second: no own-size note. Third: no drain warning. `ceiling_would_be_bytes == ceiling_bytes`. | A whole-slice summary field. |
 | **T33 CE10 ceiling fall** | Main fills `P` at `E` 49152 (`B_big` 41664, 20 jobs). `E` falls to 45056. Lane empty; a 1024 small waiter. Then main leases totalling 4096 end. | `yield`: refused, `laneShut`, not `laneFull`; granted after the releases. `fixed`: granted at once. With `B_big` 63000: `fixed` refused on `K`. | `G` swapped; `laneShut` reported as `laneFull`; no `K`. |
 
-**Configuration and install.** Environment: `off`, `4G`; refused `0`, `9G`, `abc`, `x < y + 64M`; `y`
-ignored while off; shim forces off; the startup line. Install flags, kept value, ship defaults, re-exec
-forwarding, render re-validation, `--status`, the shim environment, the small-slice default `off` and
-the refusal of an explicit value too large. **Observability and faces:** reply fields only while on;
-the `small` row flag; `lane_full`, `lane_shut` and `held_by_head` only for the named scope; the
-`--list` line with and without the over clause; the wait clauses and their absence; the journal lines;
-`TestConfineSmallLaneGuidanceIsOnEveryFace`.
+**Configuration, install, observability:** every §2.5 value, refusal and site (env `off`, `4G`; refused
+`0`, `9G`, `abc`, `x < y + 64M`; shim forces off); every §2.6 field, line and clause, present only
+while on and absent otherwise; `TestConfineSmallLaneGuidanceIsOnEveryFace`.
 
 **Mutations, by direction.** The gate runs each and records it RED with a committed
 `docs/dev/aira-350-mutation-check.py`, on the `docs/dev/aira-324-mutation-check.py` pattern.
@@ -416,7 +430,7 @@ the `small` row flag; `lane_full`, `lane_shut` and `held_by_head` only for the n
   no `vramH` (T7); lane before rule 1 (T8), the gate (T10a) or the freeze (T27); eligibility ignoring
   `parentScopeID` (T14a), the prefix (T14b), the empty signature (T14d) or `scopeID` (T14e); occupancy
   on charge (T15, T16); main on `W` alone (T1, T22d); no `M - x` (T22a); on in shim (T23); emptiness on
-  main jobs (T10b); off-by-one (T28).
+  main jobs (T10b); off-by-one (T28); the main fit without the parent's move (T14g).
 - **False fail:** lane deleted (T1, T2); lane in main headroom (T1, T4); small in main's ledger (T4);
   lane judged on `P` (T2); a head physical reservation (T6); high as pushed (T9); anchor write (T12);
   eligibility on `reserve` (T15a); a stored pool or order-dependent classification (T17); pool fixed
@@ -442,9 +456,10 @@ against `x` until it ends; suite parents with live workers do not.
 - **The derived form's cost** against round 2's stored flag: overflow first, 2.2 points at `x = 4`
   (8.9 with silting); counting parents would cost 10.3 (25.4), hence the child clause; nothing at
   `x = 8`. §1h' assumes a parent always has a live worker (overstated by its worker-less time).
-- **CPU (§1e, round 2's model):** the store misses about 18-27 of 32 slots (5 retained rows running at
-  the incident). At `x = 4` the saving falls to 79%, 71%, 32% at allowances 20, 24, 27. **Range at
-  `x = 4`: about 30-77%, and 0 in any instant with all 32 slots held.**
+- **CPU (§1e, round 2's per-lease model, not re-run with derived accounting):** the store misses about
+  18-27 of 32 slots (5 retained rows running at the incident). At `x = 4` the saving falls to 79%,
+  71%, 32% at allowances 20, 24, 27. **Range at `x = 4`: about 30-77% (the low end from that model),
+  and 0 in any instant with all 32 slots held.**
 - **The ceiling (`aira-350-ceiling-drop.out.txt`).** The replay has no ceiling series, and in row B a
   lane grant also needs `W`, which shuts once `E` falls below what main booked. With no booked-bytes
   series the journal bounds only the falls: `E` sat at least 2.88 GiB (`x` less a mean occupancy of about 1.1 GiB) below
@@ -453,11 +468,10 @@ against `x` until it ends; suite parents with live workers do not.
   about a fifth of the time a head waits (E), an unsized upward bias in its yield; A, C, D lack it.**
 - **Other biases.** Upward: no CPU gate in §1-§1d and §1h, no reservation of the head's CPU and VRAM,
   retention thinning (186 signatures at the cap). Downward: jobs leaving main free room for others.
-- **The sim** (`aira-350-lane-sim.out.txt`, round 2's rules; the head's room is the same in round 3
-  while `S <= x`). The partition (`fixed`) delays heads exactly as the control `off-x` (today's rules,
-  ceiling `x` lower): W0 240 s against 60 s today, W8 60 s against 20 s, W12 never against 210 s. The
-  additive form (`fixed-add`) keeps today's times. W0's small jobs wait 47 s on average under `fixed`,
-  66 s under `fixed-add`, 157 s today.
+- **The sim** (`aira-350-lane-sim.out.txt`, round 2's rules; the head's room is unchanged while `S <=
+  x`): the partition delays heads as the control `off-x` does (W0 240 s against 60 s today, W8 60 s
+  against 20 s, W12 never against 210 s); `fixed-add` keeps today's. W0's small jobs wait 47 s
+  (`fixed`), 66 s (`fixed-add`), 157 s today.
 - **Recommendation: `x = 4 GiB`, `y = 1 GiB`, in every row.** `x = 8` buys 6.8 points (24.3 with
   silting) but puts row A's worst case at 2 GiB + 64 MiB per job, or costs rows B and C 6.8 GiB of
   main room on average. The idle cost is booking room, not RAM: in rows B-D main's ceiling is `x - a`
@@ -482,13 +496,10 @@ daemon starts. Load differs between weeks: a screen, not a measurement of cause.
 
 ## 8. Risks
 
-- **R1. Host (row A):** the worst case reaches the watchdog's band (§2.3); watched through the
-  journal's MemAvailable. **R2. Main capacity (rows B-D):** up to `x - a` less room (CE7).
-- **R3. Silting and overflow** (1.56 GiB measured; CE5). **R4. Missed readers:** T26, T30.
-  **R5. The summary means the main pool** (§4).
-- **R6. Cold-default jobs** (1 GiB, `fallback:no-history`) are eligible at 1088 MiB, so three fill
-  `x = 4`; intended, they are the incident's population. **R7. CPU:** lane jobs hold slots (p99 5,
-  peak 13 at `x = 4`, E); rule 4 protects only the head.
+R1 host, row A's worst case in the watchdog band (§2.3; watch MemAvailable). R2 main capacity, `x - a`
+less room (CE7). R3 silting and overflow (1.56 GiB measured; CE5). R4 missed readers (T26, T30). R5 the
+summary means the main pool (§4). R6 cold-default 1 GiB jobs fill `x = 4` three at a time (intended:
+the incident's population). R7 lane jobs hold slots (p99 5, peak 13, E); rule 4 protects only the head.
 
 ## 9. Deferrals
 
@@ -505,7 +516,7 @@ CPU side and row B's shut time stay estimates).
 | The derived form without the child clause | Suite parents fill the lane: 10.3 points lost at `x = 4`, 25.4 with silting (§6). |
 | Per-row pool membership by first fit in sequence order | A release could then lower `P` (§2.4). |
 | A grant-provenance flag to strip a lane parent's children of the head exemption | It is stored state, lost on restart, and when `S > x` behind a pushed head it can deadlock a parent waiting on its own child. CE6 is hand-made only. |
-| Lane real use subtracted from the pressure term | It couples lane to main by real use: a lane server keeps a head out. |
+| Lane real use subtracted from the pressure term, or main's physical term on `E` in row A | Either couples lane to main by real use: a lane server keeps a head out. |
 | A physical reservation for the head (round 1 rule 3) | Not needed once main's room is `P`, and it shut the lane behind large heads. |
 | Lane occupancy at the booking (charge) | Lane real use could then exceed `x` and reach main's room (CE4's mechanism). |
 | Main first, lane as overflow | Small jobs within a head's budget would spend main room and the budget; the owner said lane first. |
@@ -514,16 +525,12 @@ CPU side and row B's shut time stay estimates).
 
 ## 11. Rollout
 
-1. **The owner answers Q1**; the spec is edited to that row's constants; the plan gate runs.
-2. Daemon-restart heads-up to peers after `aira confine --list`. `aira install` renders `4G`/`1G` (or
-   `off` on a small slice), restarting the daemon (`install.go:1287-1290`); then `aira skill install`.
-   The lane starts closed if the running small leases exceed `x` (CE5).
-3. Check `aira install --status`, the startup line and the `small-job lane:` line.
-4. After 7 days: rerun the replay and the ceiling-drop script with explicit window ends and apply
-   the acceptance screen (§6); report to the owner either way.
-
-Release notes: the install options, the reply fields and the summary's main-pool meaning, the
-journal lines, and where the lane's room comes from. Protocol 15 is unchanged.
+The owner answers Q1, the spec takes that row's constants, the plan gate runs. Then: restart heads-up
+to peers; `aira install` (`4G`/`1G`, or `off` on a small slice; restarts the daemon,
+`install.go:1287-1290`) and `aira skill install`; check `--status`, the startup line and the
+`small-job lane:` line (closed at first if running small leases exceed `x`, CE5). After 7 days rerun
+the replay and the ceiling-drop script and apply §6's screen. Release notes name the options, the
+reply fields, the summary's main-pool meaning and where the lane's room comes from; protocol 15.
 
 ## 12. Questions for the owner
 
@@ -533,11 +540,11 @@ with 26 jobs running.
 
 | | A: on top, always open (your words, provisional default) | B: out of the main pool, closes when RAM tightens (round 2) | C: out of the main pool, always open | D: 2 GiB on top + 2 GiB out of main, always open |
 |---|---|---|---|---|
-| Big jobs' room vs today | Same or more (small jobs move off it). With no memory pressure, up to 2.5 GiB less, to stay under the 64 GiB slice cap. | 2.8 GiB less on average (up to 4) | as B | about 0.8 GiB less on average (E) |
+| Big jobs' room vs today | Same or more (small jobs move off it). With no memory pressure, up to 2.5 GiB less, to stay under the 64 GiB slice cap. When RAM is short, main may use up to 4 GiB more real memory than today. | 2.8 GiB less on average (up to 4) | as B | about 0.8 GiB less on average (arithmetic, not modelled) |
 | Big job at the head, model cases (today 60 s / 210 s) | 60 s / 210 s | 240 s / never | 240 s / never | between (not simulated) |
 | Small-job lane open when free RAM has just dropped? | yes | no: shut for up to about a fifth of busy time (estimate) | yes | yes |
 | Free RAM if every job used its full booking at once | 7.6 GiB, below the 8 GiB at which AIRA's watchdog kills heavy programs outside AIRA (IDE, browser) | 11.6 GiB, as today | 11.6 GiB normally; after a sudden drop the lane can keep up to 4 GiB booked that today would drain | 9.6 GiB |
-| Free RAM, realistic (last 4 days' low was 29.4 GiB, M) | about 26 GiB | 29.4 GiB | about 29 GiB | about 28 GiB |
+| Free RAM, realistic (last 4 days' low was 29.4 GiB, M) | about 26 GiB | 29.4 GiB | about 29 GiB | about 28 GiB (arithmetic) |
 | Small-job wait removed (estimate, before CPU limits) | about 77% | lower than 77% by the shut time | about 77% | about 77% |
 
 Example, the 13:20 incident's shape in T1's sizes (about 3.4 GiB of room today, a 4 GiB head, 14
@@ -548,40 +555,32 @@ less in D. Every row's rules are in §2.2 and §2.3, so no further spec round is
 only changes `a`.
 
 **Q2. Pushed heads.** Default: no lane grant behind a `--front` head (AIRA-309). Opening it would cost
-the pushed head nothing in RAM, since main's room does not depend on the lane. It would cost only CPU
-and VRAM, which rules 4 and 5 reserve. About 23 push-related journal lines in 82 h (M).
-
-**Q3. `x`.** Recommended 4 GiB in every row (§6).
-
-Decided here, open to veto at the gate: eligibility on the booking, occupancy on the cap; suite
-parents and unsigned jobs excluded; lane first every pass; derived pools with the child clause;
-overflow returns first.
+the pushed head no RAM, only CPU and VRAM, which rules 4 and 5 reserve (about 23 push lines in 82 h, M).
+**Q3. `x`.** Recommended 4 GiB in every row (§6). Open to veto at the gate: eligibility on the
+booking, occupancy on the cap; suite parents and unsigned jobs excluded; lane first every pass;
+derived pools with the child clause; overflow returns first.
 
 ## 13. Provenance
 
-- **Under `aira confine`**, each named, exit 0, no `hint:` line in any trailer: round 1's store
-  queries; round 2's replay, concurrency probe and sim; round 3's replay (`aira350-replay-r3` to `-r3e`:
-  §1h and §1h' added, every other section byte-identical to round 2's), ceiling-drop script
-  (`aira350-r3-drop`, journal pinned to 2026-11-15 00:00 .. 2026-11-18 21:12 local) and signature count
-  (`aira350-r3-q1`: 0 of 244,929 confine rows have an empty signature; whether unsigned runs are
-  recorded at all was not checked).
-- **Trivial reads, not confined:** `journalctl` captures and greps, `systemctl --user show aira.slice`
-  (MemoryMax 64 GiB), `/proc/meminfo`, one read-only `aira confine --list --json`.
+Under `aira confine`, named, exit 0, no `hint:` line: rounds 1-2's queries, replay, probe and sim;
+round 3's replay (`aira350-replay-r3` to `-r3e`; §1h, §1h' added, all else byte-identical), ceiling-drop
+(`aira350-r3-drop`, journal pinned to 2026-11-15 00:00 .. 2026-11-18 21:12) and signature count
+(`aira350-r3-q1`: 0 of 244,929 confine rows unsigned; whether unsigned runs are recorded was not
+checked). Not confined: `journalctl`, `systemctl --user show aira.slice` (MemoryMax 64 GiB), one
+read-only `aira confine --list --json`.
 
 ## 14. Review log
 
-**Round 1** (Codex Sol `xhigh` and a second reviewer; 18 findings, 6 P1 and 12 P2, none
-fix-induced). The families were: A, host protection (P1 x4: `x` on top, a static-cap rule that ARDR
-deficits bypass), re-based to the partition with every grant on `W`. B, head independence (P1, P2 x2:
-main read lane real use), fixed with `min(W, P)` and the proof. C, restart (P1, P2 x2: an
-order-dependent establish), fixed with an order-independent rule. D-H were units, evidence, client
-wire, tests and configuration (P2 x9). Round 2 recorded the tripwire: "If round 2 finds a blocker in
-family A or B, the right next step is owner re-scoping, not a third patch."
+**Round 1** (Sol `xhigh` and a second reviewer; 6 P1, 12 P2, none fix-induced): A, host (lane on top;
+re-based to the partition, every grant on `W`); B, head independence (`min(W, P)`); C, restart (an
+order-independent establish); D-H, P2s. Round 2's tripwire: "If round 2 finds a blocker in family A or
+B, the right next step is owner re-scoping, not a third patch."
 
 **Round 2** (one reviewer; 9 findings: 2 P1, 6 P2, one process). Codex Sol was OOM-killed at its
 auto-sized 1 GiB cap (peak 1048752 KiB; the trailer suggests an identical re-run or `--memory-reserve
 1537M`), so round 2 had no Sol review and the next round re-runs it. By root cause, each finding
-checked against round 1 (`git show 955543c9:<spec>`):
+checked against round 1 (`git show 955543c9:<spec>`). Six of the eight substantive findings are
+fix-induced (families A and C):
 
 | Family | Findings | Root cause | Fix-induced? | Disposition |
 |---|---|---|---|---|
