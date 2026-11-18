@@ -89,12 +89,12 @@ ceiling, sliceAnon, MemAvailable), 168.2 h. A live `aira confine --list` sample 
 
 | Measure (replay section) | Value | Kind |
 |---|---|---|
-| Host MemAvailable over 7 days (§1) | min 29.44, p1 36.42, p50 47.38 GiB; 0 s below 20 GiB | measured |
-| Slice anon (§1) | p50 8.82, p99 19.34, max 25.14 GiB | measured |
-| Effective ceiling (§1) | 38.00 to 51.25 GiB, `bound-by=system-pressure` throughout | measured |
+| Host MemAvailable, 83 h window (§1) | min 29.44 (also the 168 h minimum), p1 36.42, p50 47.38 GiB; 0 s below 20 GiB | measured |
+| Slice anon, 83 h (§1) | p50 8.82, p99 19.34, max 25.14 GiB (also the 168 h maximum) | measured |
+| Effective ceiling, 83 h (§1) | 38.00 to 51.25 GiB, `bound-by=system-pressure` throughout; over 168 h 38.00 to 62.50 GiB (4 `machine-reserve` lines, all at daemon starts on 11-12 and 11-13) | measured |
 | Real use / bookings, every job (§6, live, 60 min) | p50 0.345, p90 0.384, max 0.451 | measured, short window |
 | Same, against full pins (AIRA-324 discount added back, §6) | p50 0.333, max 0.441 | measured |
-| sliceAnon / L, 7 days (§1; equals use/bookings while the ledger is full) | p50 0.190, p99 0.415, max 0.545 | measured |
+| sliceAnon / L, 83 h (§1; equals use/bookings while the ledger is full) | p50 0.190, p99 0.415, max 0.545 | measured |
 | Held peak / booking of visible concurrent sets (§2) | p50 0.699, p99 0.915 | measured, over-estimate |
 | Hour-block bootstrap of that p99 (§3a) | 90% interval [0.901, 0.932] | estimated |
 | Peaks redrawn from each signature's history (§3b) | p99 0.902, max 0.998 | estimated |
@@ -118,7 +118,9 @@ spec's two bounds the extra booking stops growing at about 15 GiB (the slice `me
 median `X` 15.00 GiB from 1.40 up), so every factor passes and the factor is no longer what
 limits it. The static worst case (every job at its cap at once, never observed: the highest
 slice anon in 7 days was 25.14 GiB against 38-51 GiB booked) is not bounded by any factor above
-about 1.2, and the spec does not claim it is (section 4).
+about 1.2, and the spec does not claim it is (section 4). Seconds below 10 GiB (floor plus
+margin) in W: 0 at every factor up to 1.40 under both rules, 300 s at 1.50 for the factor
+alone, 120 s at 1.75 and 2.00 under the spec's rule (replay §4).
 
 **Yield** (replay §5, visible jobs only, a static per-instant model that ignores the head rules;
 213.7 wait-hours in the window). RAM is not the only wall: live, 29 of 32 CPU slots were in use
@@ -168,7 +170,12 @@ What each term guarantees, at the instant of a grant, with memory outside the sl
 
 1. Each new job's full booking fits real free memory: `effectiveCurrent + charge <= L` (today's term).
 2. If every over-ceiling booked byte were used at once on top of today's real use, real use stays
-   at most `L`, so host MemAvailable stays at least `freeMin + headroom` (model W, by construction).
+   at most `L`, so host MemAvailable stays near `freeMin + headroom` (model W). This holds only to
+   within the ceiling's damping (the maximum of 3 samples 2 s apart, quantised down to 256 MiB,
+   `sliceceiling.go:52-61`): where the backed term binds, the replay's spec-rule rows reach
+   8.18 GiB, 120 s below 10 GiB, at factors 1.75 and 2.00. The replay uses `sliceAnon` for
+   `effectiveCurrent`; the daemon's figure is at least `sliceAnon` (it keeps reclaimable slab),
+   so the daemon's backed term is the tighter of the two. Measured, not closed by construction.
 3. The sum of bookings stays at most `memory.max - headroom`, so jobs growing inside caps equal
    to their bookings cannot fill the slice. The exceptions are today's: a `--resize` lowers the
    booking only, and a `--delegate-ram` parent's scope cap is a containment ceiling above its
@@ -193,9 +200,10 @@ four sites, so they cannot disagree.
 |---|---|
 | Fit check, `evaluateAdmitQueue` (`admit.go:2634-2666`) | the rule |
 | Worker-admit probe, `workerAdmitSnapshot` (`worker_admit.go:247-255`) | the same helper: the pool sizes itself on the room the evaluator will grant |
-| Worker-admit blocking claims | queued in the same queue, judged by the same pass (sub-reservations are exempt from head protection only, `admit.go:2688`) |
+| Worker-admit blocking claims | enqueued into the same slice queue (`enqueueResolvedConfineAdmit`, `worker_admit.go:475`) and granted by the same evaluator pass (`worker_admit.go:496`); sub-reservations are exempt from head protection only (`admit.go:2688`). The comment at `sliceceiling.go:723-726` ("nor does it reach evaluateWorkerAdmit") names a function that no longer exists and is amended in the build |
 | CI dump, `ci_dump.go:270-276` | the same helper |
 | `confine --list` ceiling, `confine_manage.go:261` | unchanged; a new `booking_limit_bytes` = `L + over` beside it (3.5) |
+| Client waiting line (`confine_queue_position_linux.go:240`, "N of M granted") | adds "booking limit X" when overbook is on, so granted above the ceiling does not read as an error |
 | Head eligibility, `admitCouldFitEmptyLocked` (`admit.go:2843-2858`) | unchanged, against `L`: a job larger than `L` can never pass term 1, so it must never become a head (a pushed one would freeze the queue) |
 | Terminal `E_ADMIT_TOO_LARGE` (`admit.go:2386`) | unchanged, against the unthrottled `maximum` |
 | Bypass budget, `head.bypassed` (`admit.go:2689-2698`, `2710-2715`) | unchanged, in charge bytes |
@@ -265,12 +273,16 @@ install (`--allow-overcommit`, `CodeOvercommit`, `install.go:2570-2571`, about t
 1. **Criterion:** host MemAvailable stays at or above 8 GiB (the watchdog trip) in model W, and
    at or above 10 GiB in model I, over every 10 s of the last 7 days of journal. Measured: met at
    1.10 and 1.25; the lowest W reading was 24.89 and 18.08 GiB, against the 8 GiB line.
-2. **By construction at each grant** (term 2): the over-ceiling bookings alone cannot take real
-   use above `L`. Term 3: in-cap growth cannot reach the slice's `memory.max`.
-3. **Not bounded:** every job reaching its cap at once. At k = 1.10 that floor is about 5.1 GiB
-   (the watchdog band, the same class as the 4.6 GiB the owner accepted for the 0.9 trial, gate
-   report section 6.1); at 1.25 it is below zero. Never seen: the slice's highest anon in 7 days
-   was 25.14 GiB against 38-51 GiB booked. **This retires the worst-case basis on which factor 0.8
+2. **At each grant** (term 2): the over-ceiling bookings alone cannot take real use above `L`,
+   to within the ceiling's damping (3.1 item 2; measured minimum 8.18 GiB in the replay). Term 3:
+   in-cap growth cannot reach the slice's `memory.max`. Term 3 equals `maximum -
+   effectiveMaximum`, so overbooking only reclaims what the pressure throttle cut: it is inert
+   where the slice ceiling is off, observe or unthrottled. The static floor is therefore lowest
+   at `L = (memory.max - headroom) / k`: 4.4 GiB at 1.10 and -2.3 GiB at 1.25 on this box.
+3. **Not bounded:** every job reaching its cap at once. At k = 1.10 that floor is 5.1 GiB at this
+   window's largest L and 4.4 GiB at the worst L the box allows (the watchdog band, the same class as the 4.6 GiB the owner accepted for the 0.9 trial, gate
+   report section 6.1); at 1.25 it is below zero. Never seen: the slice's highest anon in 168 h
+   was 25.14 GiB, while bookings sat at the 38-51 GiB ceiling. **This retires the worst-case basis on which factor 0.8
    was ruled NO-GO** (gate report section 6.1; owner 2026-11-17 "0.8 stays NO-GO"), for every job,
    in favour of the measured criterion above. That change is owner decision **D1**.
 4. **Residual:** a job admitted while the ceiling was high keeps its booking after the ceiling
@@ -398,7 +410,8 @@ overbooked confined job instead of an uncapped process (a behaviour change, its 
 **Risks:** a correlated burst larger than this week's (mitigated by term 2 and T1-T4); the live
 window is one hour and ran under 324 enforce; rollback stalls new admissions until releases; the
 factor is box-specific (the default 1.10 is safe only where the ceiling is pressure-bound with
-tens of GiB free, so other boxes stay in observe until their own replay).
+tens of GiB free, so other boxes stay in observe until their own replay; term 3 makes it inert
+where the ceiling is not throttled).
 
 **Expected yield:** measured live, k = 1.10 admits 1 more queued job at the median instant (max 4)
 and k = 1.25 admits 3 (max 8), against a median queue of 14. Estimated over 83 hours of visible
