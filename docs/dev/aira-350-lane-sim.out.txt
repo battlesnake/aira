@@ -1,0 +1,121 @@
+AIRA-350 lane model simulation (a model of the rules, not the Go evaluator)
+maxHold=300s x=4096M y=1024M time-box T=600s (tb-*), one pass per second
+
+## W1 finding 1 (one pass; spec designs only)
+spec       cand granted; lane tree 5120 MiB (x=4096); head+tree 13312 MiB vs ceiling 12288
+spec-fresh cand held; lane tree 4096 MiB (x=4096); head+tree 12288 MiB vs ceiling 12288
+
+## W2 finding 2, VRAM children of lane parents: the head's grant time
+off        30s
+spec       3016s
+spec-fresh 3016s
+tb-min     616s
+tb-full    616s
+cum-min    76s
+cum-g      76s
+
+## W3 finding 3, backstop refill of ordinary leases: the head's grant time
+off        350s
+spec       never (>3000s)
+spec-fresh never (>3000s)
+tb-min     605s
+tb-full    605s
+cum-min    never (>3000s)
+cum-g      never (>3000s)
+
+## W8 finding 8, lane-admitted suites (4 workers each), head budget spent: the head's grant time
+off        20s
+spec       70s
+spec-fresh 70s
+tb-min     150s
+tb-full    70s
+cum-min    150s
+cum-g      150s
+
+## W8b the same with the head's budget fresh (today's exposure): the head's grant time
+off        140s
+spec       150s
+spec-fresh 150s
+tb-min     150s
+tb-full    150s
+cum-min    150s
+cum-g      150s
+
+## W8c finding 8, suites with a long-lived 32-worker pool, head budget spent: the head's grant time
+off        20s
+spec       900s
+spec-fresh 900s
+tb-min     900s
+tb-full    900s
+cum-min    900s
+cum-g      900s
+
+## W8d the same with the head's budget fresh (today's exposure): the head's grant time
+off        900s
+spec       900s
+spec-fresh 900s
+tb-min     900s
+tb-full    900s
+cum-min    900s
+cum-g      900s
+
+## W12 finding 12, never-ending non-lane leases: the head's grant time
+off        210s
+spec       never (>6000s)
+spec-fresh never (>6000s)
+tb-min     610s
+tb-full    610s
+cum-min    210s
+cum-g      210s
+
+## W3 phase sweep: small jobs start at offset 0, 10, ..., 290 s (30 runs per design, horizon 3000 s)
+offset        off     spec  cum-min   tb-min
+0            350s    never    never     605s
+10          never    never    never     605s
+20          never    never    never     605s
+30          never    never    never     605s
+40          never    never    never     605s
+50          never    never    never     605s
+60          never    never    never     605s
+70          never    never    never     605s
+80          never    never    never     605s
+90          never    never    never     605s
+100         never    never    never     605s
+110         never    never    never     605s
+120         never    never    never     605s
+130         never    never    never     605s
+140         never    never    never     605s
+150         never    never    never     605s
+160         never    never    never     605s
+170         never    never    never     605s
+180         never    never    never     605s
+190         never    never    never     605s
+200         never    never    never     605s
+210         never    never    never     605s
+220         never    never    never     605s
+230         never    never    never     605s
+240         never    never    never     605s
+250         never    never    never     605s
+260         never    never    never     605s
+270         never    never     350s     605s
+280         never    never     350s     605s
+290         never    never     350s     605s
+off      starved in 29 of 30
+spec     starved in 30 of 30
+cum-min  starved in 27 of 30
+tb-min   starved in 0 of 30
+today grants, cum-min starves, at offsets: [0]
+today starves, cum-min grants, at offsets: [270, 280, 290]
+
+## W3 at offset 0 traced: hold arms, backstop passes and 5 GiB refills before the head
+off      0s arm, 300s backstop, 320s arm, 350s HEAD GRANTED
+cum-min  20s arm, 320s backstop, 320s refill, 350s arm, 650s backstop, 650s refill, 700s arm, 1000s backstop, 1000s refill, 1050s arm, ... head not granted
+
+## W0 illustrative, the 13:55 queue on a model slice (not evidence)
+off        head 60s, 2154 240s, 2700 360s, small mean wait 157s
+spec       head 240s, 2154 300s, 2700 420s, small mean wait 43s
+spec-fresh head 240s, 2154 300s, 2700 420s, small mean wait 43s
+tb-min     head 240s, 2154 300s, 2700 420s, small mean wait 43s
+tb-full    head 240s, 2154 300s, 2700 420s, small mean wait 43s
+cum-min    head 240s, 2154 300s, 2700 420s, small mean wait 47s
+cum-g      head 240s, 2154 300s, 2700 420s, small mean wait 47s

@@ -1,0 +1,23 @@
+window 2026-11-15T00:00 .. 2026-11-18T12:00; y=1.00 GiB x=4.00 GiB
+journal: 456 backstop passes (yield), 461 holds, 4311 ceiling samples
+
+## 1 population (retained rows with wait_ms + started_at_ms)
+small n= 8344 waited>=10s= 2874 (34.4%) >=60s= 1607 >=240s=  543 wait-hours=  115.6 p50(>=10s)=75s p90(>=10s)=352s
+large n= 2401 waited>=10s= 1267 (52.8%) >=60s=  920 >=240s=  391 wait-hours=   76.4 p50(>=10s)=132s p90(>=10s)=488s
+
+## 2 small jobs granted on a backstop pass (grant within [-1s,+3s] of a yield line)
+on-pass        130 of 2874 small waits >=10s (4.5%), their wait-hours=6.1 of 114.4, p50 wait=130s
+control+60s     25 of 2874 small waits >=10s (0.9%), their wait-hours=1.2 of 114.4, p50 wait=123s
+control-60s     34 of 2874 small waits >=10s (1.2%), their wait-hours=1.2 of 114.4, p50 wait=59s
+
+## 2b small-job wait spent while a fairness hold was active (upper bound on freeze-held time)
+small waits>=10s=2874: 2598 (90.4%) overlap a hold; wait-hours under a hold=100.6 of 114.4 (87.9%)
+large waits>=10s=1267: 1159 (91.5%) overlap a hold; wait-hours under a hold=66.9 of 76.2 (87.8%)
+
+## 3 per backstop pass: small jobs released and their lane cost (booking + 64 MiB)
+passes releasing >=1 small job: 85; jobs per pass p50=1 max=8; lane cost p50=1.06 GiB p90=2.12 GiB max=6.00 GiB; passes whose released small jobs fit x at once: 82 (96%)
+
+## 4 heads named by hold lines: budget vs lane, and guard G3
+holds=461 head reserve p50=4.00 GiB p90=10.90 GiB max=25.32 GiB; heads whose budget (R/2) is already >= x: 132 (29%); heads for which G3 closes the lane: 0
+most common head reserves (GiB: holds): 4.00: 97, 3.00: 55, 1.00: 33, 8.00: 28, 10.00: 28, 12.00: 21, 6.00: 18, 2.00: 15
+
