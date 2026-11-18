@@ -15,8 +15,10 @@ sessions' jobs: the journal extract `~/tmp/aira-350/freeze-journal.txt` and the 
 ## 0. Round 4: the non-convergence rule fired, and the re-base
 
 Rounds 1, 2 and 3 each ended with blockers, so this round re-bases the design instead of patching it.
-Round 3 raised 11 findings, two of them duplicates (§10). Seven were induced by round 2's fixes, three
-were there from the start, and one (finding 10) was structural. They fall into four families:
+Round 3 raised 11 findings, two of them duplicates (§10). By this round's classification, seven were
+induced by earlier fixes, three were there from the start, and one (finding 10) was structural. The
+three original ones are the `waited` gate, the self-test and the parser, all present in round 1
+(`29b751e8`). The findings fall into four families:
 
 | Family | Findings (round) | Re-base that makes the family impossible |
 |---|---|---|
@@ -80,7 +82,9 @@ No document says that a push consumes the backstop.
      and the next `hold` was at 13:22:22 (head 14800). This was re-checked in the journal extract.
    - So no pass from 13:21:08 to 13:22:22 withheld a fitting waiter on budget, since that would have
      armed a hold (`admit.go:2762`). The deferred clear would have landed on the 13:21:47 pass, which
-     granted 14816 and had nothing to backfill. Every grant in the incident is unchanged.
+     granted 14816 and had nothing to backfill. That pass is as reported in round 2: the extract
+     holds no grant lines, so it was not re-derived this round. Every grant in the incident is
+     unchanged.
 3. **Its yield is small, and only estimated.**
    - Of 456 backstop passes in 3.5 days, 8 are candidates (`aira-352-pushed-backstops.out.txt`).
    - The candidate rule cannot tell a push from a `--priority high` head
@@ -186,8 +190,8 @@ aira daemon: held-fit seq=<n> outcome=<granted|failfast|saturated|cancelled|remo
 |---|---|---|---|
 | T1 meaning, exact line | W (1 GiB, seq 3) is enqueued at t=-5 behind an unpushed head H with its budget spent. t=0: the memory read fails. t=5: refused on capacity. t=10: fits, and the budget withholds it. t=20: the memory read fails. t=25: withheld again. H is removed at t=27, and W is granted at t=30. | W's line is exactly `aira daemon: held-fit seq=3 outcome=granted booking=1073741824 waited-ms=35000 since-budget-ms=20000`. H's line has `outcome=removed since-budget-ms=0`. | M1 (35000), M2 (25000), M3 (5000), M12 (the literal). Per-pass crediting would give less than 20000. |
 | T2 push is not budget | W fits behind a pushed P at t=0 and t=10. P is granted at t=20, and an unpushed H with its budget spent withholds W at t=20. H is removed, and W is granted at t=30. | `waited-ms=30000 since-budget-ms=10000` | M4 (30000) |
-| T3 never-evaluated grant | W is enqueued at t=0. The memory read fails at t=10 and at t=20. W is granted at t=30, its first evaluated pass. | `outcome=granted waited-ms=30000 since-budget-ms=0`. The wire outcome is still `immediate` and `waitedMS` is 0 (unchanged). | M5 (no line); `waited-ms` read from `waitedMS` (0) |
-| T4 terminal paths, frozen | W is enqueued at t=-4, and the budget withholds it at t=0 and t=10. It ends by: (a) `timeoutAdmitWaiter` at t=14; (b) `cancelQueuedConfineLocked` at t=14; (c) the fail-fast latch at the t=14 pass; (d) client EOF at t=14. (a) to (c) are released at t=19. Separately, (e) W' is enqueued at t=0 and released at t=7 with no pass between; (f) W'' is enqueued at t=0, rejected by the fail-fast latch at the t=5 pass (its first), and released at t=9. | (a) to (d): `waited-ms=18000 since-budget-ms=14000`, outcome `saturated`, `cancelled`, `failfast` or `removed`. (e): `removed waited-ms=7000 since-budget-ms=0`. (f): `failfast waited-ms=5000 since-budget-ms=0`. One line each. | No removal line. M6 ((e), (f)). M10 (23000). A hard-coded rejection outcome. |
+| T3 never-evaluated grant | W is enqueued at t=0. The memory read fails at t=10 and at t=20. W is granted at t=30, its first evaluated pass. | `outcome=granted waited-ms=30000 since-budget-ms=0`. The wire outcome is still `immediate` and `waitedMS` is 0 (unchanged). | M5 (no line), M13 (0) |
+| T4 terminal paths, frozen | W is enqueued at t=-4, and the budget withholds it at t=0 and t=10. It ends by: (a) `timeoutAdmitWaiter` at t=14; (b) `cancelQueuedConfineLocked` at t=14; (c) the fail-fast latch at the t=14 pass; (d) client EOF at t=14. (a) to (c) are released at t=19. Separately, (e) W' is enqueued at t=0 and released at t=7 with no pass between; (f) W'' is enqueued at t=0, rejected by the fail-fast latch at the t=5 pass (its first), and released at t=9. | (a) to (d): `waited-ms=18000 since-budget-ms=14000`, outcome `saturated`, `cancelled`, `failfast` or `removed`. (e): `removed waited-ms=7000 since-budget-ms=0`. (f): `failfast waited-ms=5000 since-budget-ms=0`. One line each. | M14, M6 ((e), (f)), M10 (23000), M15 |
 | T5 one line per job-level waiter, none for sub-reservations | (a) An immediate grant. (b) A waited grant, released later. (c) A waited sub-reservation, granted and then released. (d) A sub-reservation rejected by the fail-fast latch, then released. (e) A sub-reservation released while still queued, on EOF. (f) A re-declared lease (`newEstablishedWaiter`), released. | Exactly two lines: (a) `waited-ms=0` and (b), both at their grant. | M7 (c), M8 ((d), (e)), M9 ((b), (f)), M5 ((a)) |
 | T6 guard, structural | An AST scan of the non-test files in `internal/daemon`, as in `admit_pin_charge_guard_test.go`. | Every `.firstBudgetAt` selector is in `noteBudgetHold` (exactly 2) or `logHeldFitLocked` (exactly 2). Neither function has a result. `noteBudgetHold` is called once, in `evaluateAdmitQueue`. `logHeldFitLocked` is called three times, once in `evaluateAdmitQueue` and twice in `releaseAdmitWaiterLocked`. | M11. A second `noteBudgetHold` call. A result added to either function. |
 | T7 guard, differential | One 52 GiB lease (room 12). H is 16 GiB with its budget spent; W1 is 1 GiB and W2 2 GiB. Passes at t=0 (arm), t=30 (hold) and t=61 (backstop: W1 and W2 granted). W3 (1 GiB) arrives at t=62 and re-arms. Run once as is, and once with every waiter's `firstBudgetAt` set to now - 1h before each pass. | The same granted set, `bypassed`, anchor and `freezeHolderSeq` after every pass. | M11, through any path |
@@ -209,6 +213,9 @@ aira daemon: held-fit seq=<n> outcome=<granted|failfast|saturated|cancelled|remo
 | M10 | A rejected waiter's `waited-ms` is recomputed at removal. |
 | M11 | `fits = fits && waiter.firstBudgetAt.IsZero()` in `evaluateAdmitQueue`. |
 | M12 | A field is renamed or reordered in the line. |
+| M13 | The grant site logs `waiter.waitedMS` instead of the elapsed time to `grantedAt`. |
+| M14 | The removal-site line is deleted. |
+| M15 | The rejection outcome is hard-coded instead of read from `waiter.outcome`. |
 
 The check also asserts that T1's literal appears verbatim in the script's self-test.
 
@@ -227,9 +234,12 @@ saved extract, and nothing else.
 **The rule.** The owner may change any number marked (O) before the cutover, never after.
 1. **Window.**
    - It opens at the first `Started` at or after the cutover.
-   - An unclean end reopens it at the next `Started`. An unclean end is a `Started` with no
-     `Stopped` since the previous `Started`, or any `Failed with result` message. Such an end loses
-     the first segment of every wait in flight, and nothing in the journal bounds that loss.
+   - An unclean end reopens it at the next `Started`. An unclean end is any of these: a `Started`
+     with no `Stopped` since the previous `Started`; a `Stopped` with no `Stopping` since the
+     previous `Started` (a stop not issued through systemd, such as `daemon.Stop` under
+     `Restart=always`, `cmd/aira/dispatcher.go:1068`, which rule 3's check could not see); or any
+     `Failed with result` message. Such an end can lose the first segment of every wait in flight,
+     and nothing in the journal bounds that loss.
    - It closes at U: the first `Stopped` at least 7 days (O) after the opening, with no
      `Failed with result` since the preceding `Started`. A drain timeout exits with status 1
      (`cmd/aira/daemon_command.go:71-73`, `121-124`), so systemd reports it as `Failed`.
@@ -249,7 +259,8 @@ saved extract, and nothing else.
 4. **`S_upper`.** It is S plus a term for every small line whose `start` is in [T, T + N] for some
    `Started` T in the window, the opening one included. N = 60 s (O). The term is
    `end - since-budget-ms - T_prev`, where `T_prev` is the latest `Stopped` before T, or the opening
-   instant if that is later.
+   instant if that is later. A line within N of several `Started` instants (back-to-back restarts)
+   counts once, against the earliest of them, which gives the larger term.
    - Why: a graceful stop logs each queued waiter as `removed`, which is its first segment.
    - The client reconnects every 500 ms, with no deadline (`internal/runner/admission_linux.go:283-341`;
      `leaseKeeperReconnectGap`, `lease_keeper_linux.go:24`). It re-enqueues as a new waiter within
@@ -290,6 +301,8 @@ are small class, and the window is 7 days with no restart unless stated.
 | V12 | W 100 h, S 9 h, and one graceful stop that wrote no `removed` line. A line starts 1 s after the next `Started` T, with `waited-ms` 2 h and `since-budget-ms` 0. Also the same input with that line at T + 61 s. | NONE (`S_upper` > 10 h and > 10%); DROP |
 | V13 | V12's second half, with a `removed` line written at the stop | UNEVALUATED (listening not shown within N) |
 | V14 | T1's literal, behind a journal prefix | its fields parse exactly |
+| V15 | Two graceful restarts 5 s apart (`Stopped` S1, `Started` T1, `Stopped` S2, `Started` T2). One line starts at T2 + 1 s. | `S_upper - S` is exactly that line's `end - since-budget-ms - S1` |
+| V16 | V7 with a `Stopped` at day 2 that has no `Stopping` before it | as V7 |
 
 **Script mutations** (the mutation check runs `--self-test` on each; each must go RED):
 
@@ -306,6 +319,8 @@ are small class, and the window is 7 days with no restart unless stated.
 | S9 | the old-binary check removed | V11 |
 | S10 | the successor window unbounded | V12, second half |
 | S11 | the listening check removed | V13 |
+| S12 | a multiply matched line counted against the latest `Started` | V15 |
+| S13 | a `Stopped` with no `Stopping` treated as graceful | V16 |
 
 **Not reused.** AIRA-350's association figure (about 5 of 115.6 small wait-hours, from
 retention-capped rows) is not a forecast. Nor are the suite-parent figures (round-3 finding f).
@@ -365,7 +380,7 @@ retention-capped rows) is not a forecast. Nor are the suite-parent figures (roun
 | Outcome `stopped` | Its only reader, the cut share, is gone. Rule 3 finds a drain's removals by journal time. |
 | The cut-share validity rule | It cannot bound missing data (findings 2 and 6). Replaced by rules 1 and 4. |
 | A "line starts before the window" check | It cannot happen. The window opens at a `Started`, and every wait is timed from an enqueue in that process. |
-| A per-pass log line | Passes reach 4 a second. The per-waiter line carries the totals. |
+| A per-pass log line | Passes reach 4 a second at the default 250 ms poll (`internal/daemon/paths.go:47`). The per-waiter line carries the totals. |
 | A store column or telemetry row | History rows are retention-capped and carry no scope id (round-3 finding b). |
 | A ci-shim branch | It has no reader. |
 | A daemon listen or shutdown line | systemd's messages, plus rule 3's check, cover it. |
@@ -398,7 +413,7 @@ retention-capped rows) is not a forecast. Nor are the suite-parent figures (roun
 | 2 | P1 | The cut share cannot bound missing data | spec r3 rule 3 | **Confirmed.** The cut share is deleted. An unclean end reopens the window (rule 1), and graceful splits go into `S_upper` (rule 4). |
 | 3 | P1 | AIRA-352 is unresolved for the requested release | the counterexample, re-traced in round 3 | **Confirmed. A plan fix cannot close it**: the owner's criterion is unmeetable. 352 is held at v0.47, and §2 is self-contained, with no build instruction. The release is 353-only, and Q2 records the conflict with the batch instruction. |
 | 4 | P2 | The `maxHold` saving cap is false | `admit.go:2674` | **Confirmed.** Removed from §2 and Q2. |
-| 5 | P2 | The analysis decision has no oracle | spec r3 §3.6 | **Confirmed.** V1-V14 with exact verdicts, integer comparisons, zero W UNEVALUATED, and script mutations S1-S11. |
+| 5 | P2 | The analysis decision has no oracle | spec r3 §3.6 | **Confirmed.** V1-V16 with exact verdicts, integer comparisons, zero W UNEVALUATED, and script mutations S1-S13. |
 | 6 | P2 | The split's S loss sits in the successor line | `admission_linux.go:283-341`, `admit.go:2418` | **Confirmed.** `S_upper` as hinted, plus the gap since the last `Stopped`, and the listening check (rule 3). Graceful stops are added to R3. The reviewer's 1.4-in-flight figure is an estimate and is not re-derived. |
 | 7, 11 | P2 | Removal-site conjuncts are unkilled | `worker_admit.go:365-371`, `494-512` | **Partly confirmed.** `!isSubReservation()` was unkilled; T5 (d) and (e) now kill it (M8). The cited path is wrong: a worker probe (`max_wait_ms=0`) answers from a snapshot and never enqueues (`worker_admit.go:365-371`). A sub-reservation is rejected only by the fail-fast latch. The `waited` conjunct is deleted (finding 1), so 7(b) and 11(b)'s "no line" is superseded: that waiter now writes one (T4 (e)). |
 | 8 | P2 | Nothing ties the line format to the parser | spec r3 §3.6 | **Confirmed.** T1's exact literal is V14, and the mutation check asserts it appears in both. A failed parse is UNEVALUATED, and parsed/total is reported. |
