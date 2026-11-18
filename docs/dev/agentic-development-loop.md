@@ -70,11 +70,17 @@ path is Markdown under `docs/` (`docs/**/*.md`) it skips `make ci`; when every
 path is Markdown under `docs/` or `.aira/tickets/` it runs only `make
 test-store` (the package that parses the repository's own tickets). The third
 is a recorded pass (AIRA-355): `make ci` that passes every step from a clean
-worktree (no staged, unstaged or untracked file, the same HEAD tree before and
-after, no make flag or variable override) writes a marker for that tree under
-the git common directory, so it is shared by every worktree on this machine;
-the hook skips when every pushed branch's tree has one, and says which tree and
-when. A merge or conflict resolution is a new tree and runs in full. Any doubt
+worktree (no staged, unstaged, untracked or assume-unchanged/skip-worktree
+file, the same HEAD tree before and after, no stop-or-ignore make flag
+(`-n -t -q -i`) or variable override, `GOFLAGS` empty) writes a marker for that
+tree under the git common directory, so it is shared by every worktree on this
+machine. The steps run in a sub-make with make's inherited flags removed, so a
+caller's `MAKE=`, `-i` or variable overrides cannot weaken what a marker proves.
+The hook skips when every pushed branch's tree has a marker, and says which tree
+and when. The marker proves the tree's content passed, not its ancestry: a
+merge or conflict resolution that produces a new tree runs in full, but a rebase
+that leaves the tree identical skips. Markers expire after 14 days or beyond the
+newest 200, after which the push runs in full. Any doubt
 (a tag, a deletion, a missing `origin/master`, a branch behind it, any other
 path or file type, such as a `.go` or `.sh` file under `docs/`, a tree with no
 marker) runs the full `make ci`. Because `make ci` tests the checked-out tree,

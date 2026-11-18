@@ -142,6 +142,9 @@ aira_ci_pass_clean_tree() {
 	[ "$(cd -- "$root" && pwd -P)" = "$(cd -- "$top" && pwd -P)" ] || return 1
 	status="$(git -C "$root" --no-optional-locks status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null)" || return 1
 	[ -z "$status" ] || return 1
+	# assume-unchanged / skip-worktree files hide edits from `status`: any index
+	# entry not in the plain cached state ('H') refuses the clean verdict.
+	if git -C "$root" --no-optional-locks ls-files -v 2>/dev/null | grep -q -v '^H '; then return 1; fi
 	tree="$(git -C "$root" rev-parse --verify --quiet 'HEAD^{tree}')" || return 1
 	aira_ci_pass_is_hash "$tree" || return 1
 	printf '%s\n' "$tree"

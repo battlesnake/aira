@@ -51,13 +51,31 @@ func (fx pushFixture) markerPath(t *testing.T, tree string) string {
 	return filepath.Join(common, "aira-ci-pass", tree)
 }
 
+// envWithFakeGo returns fx.env with a `go` shim first on PATH that answers
+// `go env GOFLAGS` with the empty string. The recorder asks that question, and
+// a real go would also write its telemetry files under the fixture's HOME while
+// the test's temp dir is being removed.
+func (fx pushFixture) envWithFakeGo(t *testing.T, goflags string) []string {
+	t.Helper()
+	dir := t.TempDir()
+	writeShim(t, filepath.Join(dir, "go"), "#!/usr/bin/env bash\nif [ \"${1-} ${2-}\" = \"env GOFLAGS\" ]; then echo '"+goflags+"'; exit 0; fi\nexit 0\n")
+	env := append([]string{}, fx.env...)
+	for i, kv := range env {
+		if rest, ok := strings.CutPrefix(kv, "PATH="); ok {
+			env[i] = "PATH=" + dir + string(os.PathListSeparator) + rest
+			return env
+		}
+	}
+	return append(env, "PATH="+dir)
+}
+
 // recordWith runs the REAL recorder from the linked worktree, wrapping argv as
 // `make ci` wraps its steps, with the given extra environment.
 func (fx pushFixture) recordWith(t *testing.T, goOrigin string, extraEnv []string, argv ...string) (string, error) {
 	t.Helper()
 	cmd := exec.Command("bash", append([]string{filepath.Join(fx.primary, ".githooks", "ci-pass"), "run", goOrigin}, argv...)...)
 	cmd.Dir = fx.worktree
-	cmd.Env = append(append([]string{}, fx.env...), extraEnv...)
+	cmd.Env = append(fx.envWithFakeGo(t, ""), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -396,6 +414,14 @@ func TestCIPassRecorder(t *testing.T) {
 			fx.git(t, fx.worktree, "config", "status.showUntrackedFiles", "no")
 			fx.write(t, "scratch.txt", "x\n")
 		}},
+		{name: "assume-unchanged-edit", origin: "file", argv: trueCmd, prepare: func(t *testing.T, fx pushFixture) {
+			fx.git(t, fx.worktree, "update-index", "--assume-unchanged", "src/thing.txt")
+			fx.write(t, "src/thing.txt", "changed behind the index\n")
+		}},
+		{name: "skip-worktree-edit", origin: "file", argv: trueCmd, prepare: func(t *testing.T, fx pushFixture) {
+			fx.git(t, fx.worktree, "update-index", "--skip-worktree", "src/thing.txt")
+			fx.write(t, "src/thing.txt", "changed behind the index\n")
+		}},
 		{name: "modified-tracked-file", origin: "file", argv: trueCmd, prepare: func(t *testing.T, fx pushFixture) {
 			fx.write(t, "src/thing.txt", "changed\n")
 		}},
@@ -467,7 +493,7 @@ func TestCIPassRecorder(t *testing.T) {
 		fx := newPushFixture(t)
 		cmd := exec.Command("bash", filepath.Join(fx.primary, ".githooks", "ci-pass"), "run", "file", "true")
 		cmd.Dir = filepath.Join(fx.worktree, "src")
-		cmd.Env = fx.env
+		cmd.Env = fx.envWithFakeGo(t, "")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("recorder: %v\n%s", err, out)
 		}
@@ -574,6 +600,7 @@ func newCIMakeFixture(t *testing.T) ciMakeFixture {
 		}
 	}
 	writeShim(t, filepath.Join(bin, "go"), `#!/usr/bin/env bash
+if [ "${1-} ${2-}" = "env GOFLAGS" ]; then echo "${FAKE_GOFLAGS-}"; exit 0; fi
 if [ "${1-}" = env ]; then echo "`+fx.goroot+`"; exit 0; fi
 echo "go $1" >> "`+fx.log+`"
 if [ -n "${FAKE_MARKER-}" ] && [ -e "$FAKE_MARKER" ]; then echo "marker present during go $1" >> "`+fx.log+`"; fi
@@ -676,6 +703,15 @@ func TestMakeCIRecordsOnlyAFullPass(t *testing.T) {
 		{name: "go-override", args: []string{"ci", "GO=" + "go"}},
 		{name: "parallel-pass", args: []string{"-j4", "ci"}, wantMark: true},
 		{name: "go-from-environment", env: []string{"GO=go"}, args: []string{"ci"}},
+		// Sol review 2026-11-19: these used to record a pass while running no step.
+		{name: "make-variable-overridden", args: []string{"ci", "MAKE=true"}},
+		// GNU make ignores an environment MAKE, so the steps really run and a
+		// pass is rightly recorded (guards against a wrongly-refusing check).
+		{name: "make-from-environment-harmless", env: []string{"MAKE=true"}, args: []string{"ci"}, wantMark: true},
+		{name: "goflags-subset", env: []string{"FAKE_GOFLAGS=-run=^$"}, args: []string{"ci"}},
+		// CI_STEPS no longer exists, and any command-line variable still refuses
+		// the record (the steps themselves run in a sanitised sub-make).
+		{name: "ci-steps-override-no-record", args: []string{"ci", "CI_STEPS="}},
 		// The steps ran with scratch.txt in the tree and the run removed it:
 		// the before-check must have been taken before the steps.
 		{name: "dirty-before-clean-after", scratch: true, args: []string{"ci"}},
@@ -706,7 +742,7 @@ func TestMakeCIRecordsOnlyAFullPass(t *testing.T) {
 				if statErr != nil {
 					t.Fatalf("no marker: %v\n%s", statErr, out)
 				}
-				for _, step := range []string{"gofmt", "go vet", "go build", "go test", "claude plugin validate"} {
+				for _, step := range []string{"gofmt", "go vet", "go build", "go test", "claude plugin validate", "claude plugin test"} {
 					if !strings.Contains(string(log), step) {
 						t.Fatalf("step %q never ran, yet a pass was recorded\nlog:\n%s\nout:\n%s", step, log, out)
 					}

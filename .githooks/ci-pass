@@ -13,6 +13,7 @@
 #   - make ran without a flag that stops recipes running or ignores their
 #     errors (-n, -t, -q, -i, ...): only k, s, w and the jobserver/output-sync
 #     options are accepted, anything unrecognised refuses the record;
+#   - GOFLAGS is empty (`go env GOFLAGS`), so go test ran everything;
 #   - no command-line variable override (`make ci GO=true` would pass
 #     every step without running one) and GO comes from the Makefile itself.
 #
@@ -57,11 +58,20 @@ root="$PWD"
 before=""
 why="the make invocation carries flags or variable overrides"
 if [ "$go_origin" = file ] && ci_pass_makeflags_ok; then
-	why="the worktree is not clean"
-	before="$(aira_ci_pass_clean_tree "$root")" || before=""
+	# GOFLAGS (environment or `go env -w`) can turn `go test` into a no-op
+	# (-run='^$') or a subset; neither make's flags nor GO's origin show it.
+	if goflags="$(go env GOFLAGS 2>/dev/null)" && [ -z "$goflags" ]; then
+		why="the worktree is not clean"
+		before="$(aira_ci_pass_clean_tree "$root")" || before=""
+	else
+		why="GOFLAGS is set or unreadable"
+	fi
 fi
 
-"$@"
+# The steps run with make's inherited flags and variable overrides removed: the
+# outer `make` (and any `MAKE=...`, `-i`, `CI_STEPS=` the caller gave it) cannot
+# reach them, so a recorded pass means the canonical steps themselves ran.
+env -u MAKEFLAGS -u MAKEOVERRIDES -u MFLAGS "$@"
 status=$?
 if [ "$status" -ne 0 ]; then
 	exit "$status"
