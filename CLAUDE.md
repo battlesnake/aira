@@ -55,6 +55,9 @@ process is mandatory for ID allocation, crash recovery, lease CAS, and other
 correctness-critical work. Purely trivial documentation or mechanical changes
 may use the lighter path described in
 [`docs/dev/agentic-development-loop.md`](docs/dev/agentic-development-loop.md).
+The owner-approved 2026-11-19 audit rules in that file (measure first, spec
+cap, round 3 as fix-2 verification, harness, merge and per-class minimums)
+refine this loop and win where they differ.
 
 ## Backlog and release buckets (this repo)
 
