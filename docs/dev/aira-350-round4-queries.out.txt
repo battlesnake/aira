@@ -1,0 +1,15 @@
+## 1 heads named by hold lines (n=461); one hold at 2.71 GB/min x 5 min = 12.62 GiB
+heads <= 1 GiB (y): 37 (8.0%)
+heads <= 2 GiB: 85 (18.4%)
+heads <= 4 GiB: 289 (62.7%)
+allowance min(0 GiB, R) taken in the hold: heads that need more than one hold from a full ledger: 8 (1.7%), smallest such head 14.00 GiB
+allowance min(2 GiB, R) taken in the hold: heads that need more than one hold from a full ledger: 55 (11.9%), smallest such head 10.80 GiB
+allowance min(4 GiB, R) taken in the hold: heads that need more than one hold from a full ledger: 103 (22.3%), smallest such head 9.00 GiB
+
+## 2 small confine rows n=8349; aitest-parent rows 753 (p=0.090)
+parent booking MiB: p10=231 p50=1024 p90=1024 max=1024; <= 512 MiB: 110; == 1024 MiB: 634
+k=1 small jobs past a head: P(at least one suite parent) >= 0.090
+k=2 small jobs past a head: P(at least one suite parent) >= 0.172
+k=4 small jobs past a head: P(at least one suite parent) >= 0.315
+k=8 small jobs past a head: P(at least one suite parent) >= 0.531
+
