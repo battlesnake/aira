@@ -19,13 +19,13 @@ reproduction is `docs/dev/aira-352-pushed-backstops.py`, with its output in
   fix delays that clear to the end of the pass and skips it when the pass's head is a pushed
   waiter. Net change: two lines, plus one conjunct on the transition log.
 - **Correction to AIRA-352 and to AIRA-350 §8.** Both call the 13:21:07 loss "the incident's
-  largest single loss". The fix would **not** have changed the 13:21:07 incident (§2.3). It would
-  have changed 3 backstop passes in the 3.5-day window, out of 456.
+  largest single loss". The fix would **not** have changed the 13:21:07 incident (§2.3). In the
+  3.5-day window it would have changed at least 3 of 456 backstop passes; 2 more are unresolved.
 - **The brief asks for a proof that no waiter granted today waits longer. That proof is false for
   this fix, and for any fix that restores the lost pass** (§2.6). The deferred pass is a backstop
   pass, and a backstop pass can delay the head it passes. That cost is the one AIRA-307 accepts.
   What is proved instead: nothing passes a pushed head, every pass decides exactly as today except
-  one, and there is still at most one backfilling pass per hold. B9 pins the residual.
+  one, and there is still at most one backfilling pass per hold. B9 and B12 pin the residuals.
 - **353.** One journal line per waited job-level waiter, at its grant or when it leaves: its
   booking, its total wait, its time held while fitting (by budget, by push) and its budget span
   (§3.4). A script reads the journal alone and applies the rule fixed in §3.6.
@@ -55,6 +55,9 @@ close, an open, and one line at the end.
 
 ### 2.1 What the backstop is documented to guarantee
 
+- **AIRA-59's origin** (`2026-09-03-aira58-59-admission-wait-and-freeze-plan.md` §5, guarantee 2):
+  fairness never blocks the queue for more than a bounded share of wall time, under any holder
+  churn. AIRA-307 replaced its yield window with the single backfilling pass.
 - **The AIRA-307 bounds** (queue-order spec §3.5):
   - "Head (unpushed): it is bypassed by at most H/2 bytes before strict protection begins. After
     that, only by one backfilling pass per `maxHold` of strict hold."
@@ -101,6 +104,9 @@ semantics, not the anchor clear.
   `maxHold` (5 minutes) earlier. The journal does not say how many waiters.
 - **4 unchanged**, the incident included (the next arm came 1.7-35 s after the head's start), and
   **1 has no retained row.**
+- **A floor, not a count.** The rule misses a pushed head whose older waiters had all left. Two
+  yields within seconds to minutes of a push fail the rule and stay unresolved: head 3791 at
+  11-16 00:51:11Z and head 6746 at 15:46:56Z.
 
 ### 2.4 The change
 
@@ -108,11 +114,9 @@ Delete the clear at `admit.go:2538`; the backstop branch then only sets `phase =
 After the waiter loop, before the transition log (`admit.go:2781`):
 
 ```go
-// AIRA-352. A backstop pass whose head is PUSHED admitted nothing past it (the pushed case precedes
-// the yield case), so it does not consume the hold: the anchor stays, every pass while the push
-// heads the queue derives as this same backstop, and the first pass with an unpushed head (or none)
-// is the one backfilling pass. phase == yield only on a backstop pass (admitFreezePhaseAt never
-// returns it, and the arm needs idle).
+// AIRA-352. A backstop pass whose head is PUSHED admitted nothing past it, so it does not consume
+// the hold: the first pass with an unpushed head (or none) is the one backfilling pass. phase ==
+// yield only on a backstop pass (admitFreezePhaseAt never returns it; the arm needs idle).
 deferred := phase == admitFreezeYield && head != nil && head.pushSeq > 0
 if phase == admitFreezeYield && !deferred {
 	queue.freezeArmedAt = time.Time{}
@@ -143,7 +147,7 @@ backfilling pass follows the hold"). `ci_dump.go` prints no anchor (lines 47 and
 |---|---|---|
 | Unpushed head | Unchanged: the pass is consumed. | `deferred` is false. |
 | `--priority high` head | Unchanged: consumed. | A high head is unpushed (AIRA-340, `admit.go:302-311`); B5c. |
-| Pushed waiter that cannot fit an empty slice | Not a head (`admit.go:2770`, `admitCouldFitEmptyLocked` `2843-2857`), so the pass is consumed past it, as AIRA-307 §3.3 documents today. | B5a |
+| Pushed waiter that cannot fit an empty slice | Not a head (`admit.go:2770`, `admitCouldFitEmptyLocked` `2843-2857`), so the pass is consumed past it, as AIRA-307 §3.3 documents today. During a deferral this includes a pushed head that stops being head-eligible for one pass (a ceiling dip, a stale VRAM snapshot): that pass becomes the backfill (§2.6). | B5a, B12 |
 | Pushed head granted in the backstop pass itself | It is not the head, so the next head decides. | B5b |
 | Pushed head that leaves (kill, EOF, timeout) | The next pass decides. | B6 |
 | Sub-reservations | Unchanged: exempt and granted on fit (`admit.go:2688`), in deferred passes too. | |
@@ -168,6 +172,11 @@ backstop pass whose head is not pushed.
   today's budget withholds behind D's head are granted: a backstop pass's grants. Today's code
   would have armed a fresh hold at D instead.
 - If D has no head, the phase decides nothing, and D equals today.
+- **D need not come after the push ends.** If the pushed waiter is still queued but cannot fit an
+  empty slice at one pass (a throttled-ceiling dip, an unevaluated VRAM snapshot), it is not the
+  head there. That pass is D, and it backfills past it. Today's code would grant there only within
+  the budget, and then arm. This matches AIRA-307 §3.3 (a waiter that cannot fit an empty slice
+  freezes nobody, pushed or not), but by the plain reading a pushed waiter is passed. B12 pins it.
 
 **J3. At most one backfilling pass per hold.** No anchor write is added, the arm guard is
 unchanged, and each arm is cleared exactly once. So delivered backfilling passes stay at least
@@ -201,6 +210,7 @@ so that pass is a backstop pass. "Today" means the code at `a7484074`.
 | B9 accepted residual (pinned) | Leases of 49, 6 and 3 GiB (room 6). P 7 GiB, H 8 GiB with its budget spent, W 1 GiB. The 6 GiB lease is released before t=20, the 3 GiB before t=30. | t=20: W granted (room 4). t=30: H queued (room 7 < 8). | Today: H granted at t=30. This pins the cost of §2.6. A build that claims to remove it must change this test knowingly. |
 | B10 ci-shim | B1 on a server with `confineMode = runner.ConfineModeShim` (`shim.go:37`). | The same as B1. | The deferral only outside shim: fails like today. |
 | B11 exclusive hold (pinned) | A granted exclusive holder. Backstop pass with fitting job-level waiters, all gate-blocked. | The anchor is cleared, as today. | Pins the §8 deferral. Keeping the anchor when everything was gate-blocked would turn this red. |
+| B12 head-eligibility blip (pinned) | One 20 GiB lease (room 44). P is pushed, 50 GiB. H is 46 GiB with its budget spent. W is 1 GiB. Deferred at t=0. Before t=10 the slice maximum is lowered to 48 GiB through the reader seam, so P cannot fit an empty slice (room 28; H can, and does not fit). | t=10: P is not the head, H is, W is backfilled and the anchor cleared. | Today: W withheld and the hold armed at t=10. Pins the §2.6 residual. |
 
 The existing pushed-head test (`admit_queue_order_test.go:170-203`, the `yield` case) passes
 unchanged: it does not assert the anchor after a yield.
@@ -223,6 +233,11 @@ All figures are per job-level waiter, and diagnosis only.
 - **Neither figure bounds a lane's net effect, in either direction.** A lane's grants take room
   from others, and lane jobs that end early free room early. Round 3's "upper bound" label is
   withdrawn.
+- **Both overcount, by up to the queue length.** Withheld waiters do not change `outstanding` or
+  `cpuOutstanding` within a pass, so every waiter behind the head is judged against the same room.
+  Ten 1 GiB waiters all "fit" 2 GiB, or one free CPU slot. This makes DROP on `S` safe, since it
+  errs toward keeping the lane, and makes TRIAL on `B` necessary but not sufficient (§3.6). A
+  room-consistent counter is an owner option (§8, §12).
 
 ### 3.2 The change
 
@@ -322,8 +337,9 @@ row join.
 2. **Population:** small jobs, `booking <= 1 GiB` (O): AIRA-350's `y`.
 3. **DROP the lane** (close AIRA-350 and report) if `S < 10%` of `W` (O) or `S < 10 h` (O). Even
    the generous first-order figure is small.
-4. **A TRIAL is supported** if `B >= 10%` of `W` (O) and `B >= 10 h` (O). The trial still needs
-   the owner's yes on AIRA-350's Q2-Q4.
+4. **A TRIAL may be considered** only if `B >= 10%` of `W` (O) and `B >= 10 h` (O). This is
+   necessary, not sufficient, because `B` overcounts (§3.1). The trial still needs the owner's yes
+   on AIRA-350's Q2-Q4.
 5. **Otherwise, the owner decides on the figures.** This spec recommends no build.
 
 **Not reused.** AIRA-350's association figure is not a forecast: about 5 of 115.6 small wait-hours,
@@ -337,53 +353,31 @@ from retention-capped rows. Nor are the suite-parent figures (round-3 finding f)
    is attributed at most once, and nothing is attributed after a pass that did not evaluate the
    waiter.
 3. **Exactly one line per waited job-level waiter**, at its grant or at its removal.
-4. **A pushed head is never bypassed** (AIRA-309 invariant 3; J1).
-5. **Decisions differ from today only at the pass D of §2.6**, and there by a backstop pass's grants
-   (J2).
-6. **At most one backfilling pass per arm** (J3). AIRA-352 adds no anchor write.
+4. **A pushed head is never bypassed while it can fit an empty slice** (AIRA-309 inv. 3; J1; B12).
+5. **Decisions differ from today only at the pass D of §2.6** (J2).
+6. **At most one backfilling pass per arm** (J3); AIRA-352 adds no anchor write.
 
 ## 5. Risks
 
-- **R1. A wedge from the deferral.** Impossible: a retained anchor derives as idle, so every pass it
-  covers backfills, never holds. B3 and B7 pin the clear.
-- **R2. The deferred backfill delays an unpushed head** (B9): the accepted AIRA-307 cost, 3 times
-  in 3.5 days.
-- **R3. Volume** (§3.4), and the rejection-to-release milliseconds counted in a departure's
-  `waited-ms`. **R4. Diagnosis leaking into decisions** (H6, H7).
+- **R1. A wedge from the deferral.** Impossible: a retained anchor derives as idle, so it never
+  makes a pass hold; it only marks the next pass without a pushed head as the backfill (B3, B7).
+- **R2.** The deferred backfill delays an unpushed head (B9; at least 3 times in 3.5 days).
+  **R3.** Volume (§3.4). **R4.** Diagnosis leaking into decisions (H6, H7).
 
-## 6. Mutation list, by direction (the gate runs each and records RED)
+## 6. Mutation list (the gate runs each and records RED)
 
-The pattern is `docs/dev/aira-324-mutation-check.py`; the new script is
-`docs/dev/aira-352-353-mutation-check.py`.
-
-- **False pass** (grants or backfills what must wait):
-  - the yield case before the pushed case (B4);
-  - keep the anchor when there is no head (B3);
-  - keep it while any pushed waiter is queued (B5a);
-  - treat `high` like pushed (B5c);
-  - never clear after a deferral (B7);
-  - keep the anchor until a backstop pass grants something (B2).
-- **False fail** (withholds what the fix must grant):
-  - today's clear at the top of the pass (B1);
-  - re-arm to `now` on a deferred pass (B1);
-  - clear only on P's grant (B6);
-  - the deferral only outside shim (B10).
-- **Diagnostics:**
-  - logging on the deferred pass (B8);
-  - right-endpoint attribution, held time counted from the first held pass, and span from enqueue
-    (H1);
-  - one counter (H2);
-  - closing inside the loop, or only in the branches (H3);
-  - no departure line, or a departure without the close (H4);
-  - a line on every grant, a second line at release, or sub-reservations logged (H5);
-  - a decision reading `heldFit` (H6, H7).
-- **Pinned residuals, not mutations:** B9 (§2.6) and B11 (§8).
+The B and H tables name each mutation beside the test that kills it. The gate script is
+`docs/dev/aira-352-353-mutation-check.py`, on the pattern of `docs/dev/aira-324-mutation-check.py`.
+- **False pass** (grants or backfills what must wait): B2, B3, B4, B5a, B5c, B7.
+- **False fail** (withholds what the fix must grant): B1 (today's clear, re-arm to `now`), B6, B10.
+- **Diagnostics:** B8, H1-H7.
+- **Pinned residuals, not mutations:** B9 and B12 (§2.6), and B11 (§8).
 
 ## 7. Expected yield
 
 | Change | What it addresses | Share | Basis |
 |---|---|---|---|
-| 352 | Backstop passes whose head is pushed and after which a fitting waiter was held for a fresh hold | 3 of 456 backstop passes in 3.5 days. Each saved its withheld waiters up to 5 minutes; the journal does not say how many waiters | measured count (`aira-352-pushed-backstops.out.txt`); saving estimated |
+| 352 | Backstop passes whose head is pushed and after which a fitting waiter was held for a fresh hold | At least 3 of 456 backstop passes in 3.5 days (2 unresolved). Their re-arm lines show 14, 32 and 28 also queued. If every one of those 74 waiters saved the full 5 minutes, that is at most 6.2 waiter-hours: 3.2% of the 192 retained wait-hours (115.6 small plus 76.4 large). Only fitting, withheld waiters gain, so the true figure is lower | count measured (floor); wait share estimated, upper |
 | 352 | The 13:21:07 incident | none | measured: no arm from 13:21:08 to 13:22:22 (§2.3) |
 | 353 | No decision changes. It measures `B`, `S` and `P` against `W`, so AIRA-350 is decided on the figures | — | — |
 
@@ -396,6 +390,10 @@ The pattern is `docs/dev/aira-324-mutation-check.py`; the new script is
 - **A CPU diagnostic for capacity refusals.** This is the pre-existing gap at `admit.go:2729-2735`:
   "other" time cannot yet be split into RAM, CPU and VRAM.
 - **Waits cut by a daemon restart:** accepted, and reported by the script.
+- **A room-consistent held counter** (owner option). A pass-local running total of the bookings,
+  cores and VRAM of the waiters already counted as held-fit in that pass. A later waiter counts only
+  if it fits net of that total. It is about 5 lines, diagnosis only, and makes `B` a joint-feasible
+  figure in evaluation order.
 
 ## 9. Cut list
 
@@ -432,7 +430,7 @@ The pattern is `docs/dev/aira-324-mutation-check.py`; the new script is
 | (b) Mixed populations: journal numerator, retention-capped store denominator | `confine_peak_history` has no scope id and keeps 20 rows per signature | The denominator is in the same line (§3.4); the script reads the journal only (§3.6) |
 | (c) Unevaluated outages counted as held | Early returns at `admit.go:2494-2517`; continues at `2592-2595` and `2604-2621` | The close at the start of every pass (§3.3); H3 |
 | (d) D5 could not fail; the single-review path | — | H6 (structural, exact counts) and H7 (differential); the mutations are recorded RED; the full two-loop |
-| (e) Accounting across passes | The old close sat inside the waiter loop, so a pass that returned early left the interval open | As (c); H3 kills the in-loop close |
+| (e) Accounting across passes | The review text was not available here; this is an interpretation. The old close sat inside the waiter loop, so a pass that returned early left the interval open | As (c); H3 kills the in-loop close |
 | (f) The 31% / 9% suite-parent figures | Retention-biased | Not reused |
 | Ungranted waiters lose their held time | `releaseAdmitWaiterLocked` is the one removal point | A line at departure (§3.2); H4 |
 
@@ -440,9 +438,12 @@ The pattern is `docs/dev/aira-324-mutation-check.py`; the new script is
 
 1. **The decision rule's numbers** (O in §3.6): 7 days, 1 GiB, 10% and 10 h for both thresholds.
 2. **AIRA-352 cannot meet "no waiter granted today waits longer"** (§2.6). It trades one fresh hold
-   for one backfilling pass, the AIRA-307 trade. That happened 3 times in 3.5 days, and it would
-   not have changed the 13:21 incident. **Build it (recommended)**, because it restores the
+   for one backfilling pass, the AIRA-307 trade. That happened at least 3 times in 3.5 days, and it would
+   not have changed the 13:21 incident. It also backfills during a one-pass head-eligibility blip
+   of a pushed waiter (B12). **Build it (recommended)**, because it restores the
    documented "one backfilling pass per `maxHold`" bound in two lines. **Or cut it**, because its
    measured yield is small.
 3. **The backstop lost to an exclusive drain or hold** stays deferred (§8) unless the owner wants it
    in this change.
+4. **The room-consistent held counter** (§8): add it now so that `B` can be sufficient as well as
+   necessary, or leave it out.
